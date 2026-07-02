@@ -4,28 +4,10 @@
 // telemetry client id) are injected via configureTmuxMux() — the wire format
 // itself is part of the thumbmux protocol.
 
-type OutputType = 'output' | 'history' | 'error';
+import type { MuxOutputType as OutputType, MuxClientInfo } from '@thumbmux/core';
+
 type Callback = (data: string, type?: OutputType) => void;
-type ClientInfo = {
-  href?: string;
-  pathname?: string;
-  userAgent?: string;
-  language?: string;
-  platform?: string;
-  visibilityState?: string;
-  /** Optional host-supplied id linking this WS connection to the host's
-   * activity telemetry (kemcortex: kx-ux-client-id → terminal size arbiter). */
-  uxClientId?: string;
-  viewport?: {
-    width?: number;
-    height?: number;
-    visualWidth?: number;
-    visualHeight?: number;
-    screenWidth?: number;
-    screenHeight?: number;
-    devicePixelRatio?: number;
-  };
-};
+type ClientInfo = MuxClientInfo & Record<string, unknown>;
 
 const PING_INTERVAL = 25_000;    // 25s — under most carrier NAT timeouts (30-60s)
 const PONG_TIMEOUT = 8_000;      // 8s — if no pong, assume dead

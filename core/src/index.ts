@@ -12,3 +12,4 @@ export * from './terminal-link';
 export * from './terminal-scroll';
 export * from './prompt-scan';
 export * from './surface';
+export * from './protocol';
