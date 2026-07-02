@@ -19,6 +19,9 @@ export type MuxClientMessage = {
     | "history_expand";
   session?: string;
   data?: string;
+  /** subscribe option: only stream the last N pane lines (thumbnail mode —
+   * full snapshots are 50-140KB, a tail is a few KB) */
+  tail?: number;
   cols?: number;
   rows?: number;
   beforeLine?: number | null;

@@ -143,6 +143,8 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private lastReconcileCapture = new Map<string, number>();
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
   private sessionListProvider: () => unknown[];
+  /** per-session, per-socket tail preference (undefined = full snapshots) */
+  private tails = new Map<string, Map<WS, number>>();
   private pipeDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pipeMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollCounter = 0;
@@ -172,7 +174,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.lastSessionsJson = "";
   }
 
-  subscribe(session: string, ws: WS, client?: unknown) {
+  subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number } = {}) {
     this.hooks.onSubscribe?.(session, ws, client);
     let set = this.subscribers.get(session);
     if (!set) {
@@ -181,11 +183,23 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
 
     set.add(ws);
+    // Tail mode (thumbnails): stream only the last N lines to this socket.
+    // A later full subscribe from the same socket upgrades it.
+    if (opts.tail && opts.tail > 0) {
+      let t = this.tails.get(session);
+      if (!t) { t = new Map(); this.tails.set(session, t); }
+      t.set(ws, Math.floor(opts.tail));
+    } else {
+      this.tails.get(session)?.delete(ws);
+    }
     const profile = this.profileOf(session);
     const cachedContent = this.contents.get(session);
     if (cachedContent !== undefined) {
       try {
-        ws.send(JSON.stringify({ channel: session, type: "output", data: cachedContent } satisfies MuxServerMessage));
+        ws.send(JSON.stringify({
+          channel: session, type: "output",
+          data: this.contentFor(session, ws, cachedContent),
+        } satisfies MuxServerMessage));
       } catch {}
       // Cached pane content is only a fast first paint. Always follow it with a
       // real capture so a reopened terminal cannot stay behind the live tmux pane
@@ -193,11 +207,13 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       // Widen the refresh back to the full live scrollback window; otherwise a
       // cache kept alive by another viewer can stay stuck on the small initial
       // capture window and make terminal scrolling feel truncated.
+      const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
       this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
-      this.queueCapture(session, { fullHistory: profile.archive && !this.archiveSeeded.has(session) });
+      this.queueCapture(session, { fullHistory: wantsArchive });
     } else {
+      const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
       this.captureStartLines.set(session, this.INITIAL_CAPTURE_START_LINE);
-      this.queueCapture(session, { fullHistory: profile.archive && !this.archiveSeeded.has(session) });
+      this.queueCapture(session, { fullHistory: wantsArchive });
     }
     this.ensurePolling();
     this.refreshSessionListSchedule();
@@ -210,6 +226,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   unsubscribe(session: string, ws: WS, client?: unknown) {
     this.hooks.onUnsubscribe?.(session, ws, client);
+    this.tails.get(session)?.delete(ws);
     const set = this.subscribers.get(session);
     if (set) {
       set.delete(ws);
@@ -224,6 +241,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   unsubscribeAll(ws: WS) {
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
+    for (const t of this.tails.values()) t.delete(ws);
     for (const [session, set] of this.subscribers) {
       set.delete(ws);
       if (set.size === 0) {
@@ -234,8 +252,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.refreshSessionListSchedule();
   }
 
+  /** Slice to a socket's tail preference (full content when none). */
+  private contentFor(session: string, ws: WS, content: string): string {
+    const tail = this.tails.get(session)?.get(ws);
+    if (!tail) return content;
+    const lines = content.split("\n");
+    return lines.length <= tail ? content : lines.slice(-tail).join("\n");
+  }
+
   private dropSessionState(session: string) {
     this.subscribers.delete(session);
+    this.tails.delete(session);
     this.contents.delete(session);
     this.hashes.delete(session);
     this.lastActivity.delete(session);
@@ -337,7 +364,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   handleMessage(msg: MuxClientMessage, ws: WS) {
     switch (msg.type) {
       case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
-      case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client); break;
+      case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail }); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
       case "keys": if (msg.session && msg.data !== undefined) this.handleKeys(msg.session, msg.data, ws, msg.client); break;
       case "resize": if (msg.session && msg.cols && msg.rows) this.handleResize(msg.session, msg.cols, msg.rows, ws, msg.client); break;
@@ -441,6 +468,11 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     if (viewers) {
       this.subscribers.set(newSession, viewers);
       this.subscribers.delete(oldSession);
+    }
+    const tails = this.tails.get(oldSession);
+    if (tails) {
+      this.tails.set(newSession, tails);
+      this.tails.delete(oldSession);
     }
     const hash = this.hashes.get(oldSession);
     if (hash) {
@@ -553,8 +585,23 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.contents.set(session, liveContent);
       if (hash === this.hashes.get(session)) return;
       this.hashes.set(session, hash);
-      const msg = JSON.stringify({ channel: session, type: "output", data: liveContent } satisfies MuxServerMessage);
+      const fullMsg = JSON.stringify({ channel: session, type: "output", data: liveContent } satisfies MuxServerMessage);
+      const tailMsgs = new Map<number, string>();
+      const tails = this.tails.get(session);
       for (const ws of viewers) {
+        const tail = tails?.get(ws);
+        if (!tail) {
+          try { ws.send(fullMsg); } catch {}
+          continue;
+        }
+        let msg = tailMsgs.get(tail);
+        if (!msg) {
+          msg = JSON.stringify({
+            channel: session, type: "output",
+            data: this.contentFor(session, ws, liveContent),
+          } satisfies MuxServerMessage);
+          tailMsgs.set(tail, msg);
+        }
         try { ws.send(msg); } catch {}
       }
     } catch {

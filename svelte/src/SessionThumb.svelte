@@ -33,7 +33,7 @@
       if (type === 'history' || type === 'error') return;
       connected = true;
       render(data);
-    });
+    }, { tail: maxLines + 10 }); // tail mode: a few KB per update, not the full window
   });
 
   onDestroy(() => {

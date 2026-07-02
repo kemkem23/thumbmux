@@ -26,6 +26,9 @@ export class TmuxMux {
   private opts: TmuxMuxOptions = {};
   private ws: WebSocket | null = null;
   private subs = new Map<string, Set<Callback>>();
+  /** per-callback tail preference; effective tail = undefined if ANY full subscriber */
+  private subTails = new Map<string, Map<Callback, number | undefined>>();
+  private sentTail = new Map<string, number | undefined>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,9 +129,32 @@ export class TmuxMux {
     return typeof document === 'undefined' || document.visibilityState !== 'hidden';
   }
 
+  private effectiveTail(session: string): number | undefined {
+    const tails = this.subTails.get(session);
+    if (!tails || tails.size === 0) return undefined;
+    let max = 0;
+    for (const t of tails.values()) {
+      if (t === undefined) return undefined; // a full viewer wins
+      if (t > max) max = t;
+    }
+    return max;
+  }
+
   private sendSubscribe(session: string) {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'subscribe', session, client: this.clientInfo() }));
+    const tail = this.effectiveTail(session);
+    this.sentTail.set(session, tail);
+    this.ws.send(JSON.stringify({ type: 'subscribe', session, tail, client: this.clientInfo() }));
+  }
+
+  /** Re-subscribe when the tail composition changes (e.g. a full viewer
+   * joins a session a thumbnail was already tailing). */
+  private refreshSubscription(session: string) {
+    if (!this.subs.has(session)) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.sentTail.get(session) !== this.effectiveTail(session)) {
+      this.sendSubscribe(session);
+    }
   }
 
   private sendResizeNow(session: string, geometry: { cols: number; rows: number }) {
@@ -278,30 +304,43 @@ export class TmuxMux {
   }
 
   /** Subscribe to a tmux session's output. Returns unsubscribe function. */
-  subscribe(session: string, callback: Callback): () => void {
+  subscribe(session: string, callback: Callback, opts: { tail?: number } = {}): () => void {
     let set = this.subs.get(session);
+    const isNew = !set;
     if (!set) {
       set = new Set();
       this.subs.set(session, set);
-      // Tell server we want this session
+    }
+    set.add(callback);
+    let tails = this.subTails.get(session);
+    if (!tails) { tails = new Map(); this.subTails.set(session, tails); }
+    tails.set(callback, opts.tail && opts.tail > 0 ? Math.floor(opts.tail) : undefined);
+
+    if (isNew) {
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.sendClientInfo('subscribe');
         this.sendSubscribe(session);
         this.flushResize(session);
       }
+    } else {
+      this.refreshSubscription(session);
     }
-    set.add(callback);
 
     this.ensureConnection();
 
     return () => {
       set!.delete(callback);
+      this.subTails.get(session)?.delete(callback);
       if (set!.size === 0) {
         this.subs.delete(session);
+        this.subTails.delete(session);
+        this.sentTail.delete(session);
         this.pendingResizeBySession.delete(session);
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: 'unsubscribe', session, client: this.clientInfo() }));
+          this.ws.send(JSON.stringify({ type: 'unsubscribe', session }));
         }
+      } else {
+        this.refreshSubscription(session);
       }
     };
   }
@@ -318,7 +357,9 @@ export class TmuxMux {
   /** Send keys to a session. */
   sendKeys(session: string, data: string) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'keys', session, data, client: this.clientInfo() }));
+      // No client blob here: a keystroke frame is hot-path (~60B vs ~520B) —
+      // the server already knows this socket from subscribe/client_info.
+      this.ws.send(JSON.stringify({ type: 'keys', session, data }));
     }
   }
 

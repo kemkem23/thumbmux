@@ -15,44 +15,21 @@ terminal we tried treats the phone as a tiny desktop — pinch, squint, mis-tap,
 rage. thumbmux treats the phone as the primary device: one-thumb controls,
 native scroll physics, and a keyboard that never fights the layout.
 
-![The same agent session in four surfaces — white (the default), black, blue, orange](docs/media/hero.png)
+## A hub of every terminal you're running
 
-**Why not ttyd / GoTTY / an xterm.js wrapper?** Those are excellent — and
-desktop-shaped. They hand your phone a terminal *emulator* that repaints on
-every scroll frame, plus an overlay keyboard bolted on top. thumbmux renders
-captured pane lines as plain DOM and scrolls them with compositor transforms,
-so a flick feels like a native app; input, layout and theming were designed
-thumb-first instead of ported from the desktop.
+<p align="center"><img src="docs/media/hub.png" width="420" alt="Session hub: a grid of live terminal miniatures plus a + terminal card" /></p>
 
-## The tour
+This is the front door: a grid of **live miniatures** — every card is the
+actual pane streaming in real time. Four agents crunching in parallel reads at
+a glance; tap a card to drop in, or tap **+ terminal** to launch another.
 
-### Scrolls like an app, not a canvas
+Miniatures are cheap by design: each one subscribes in **tail mode**, so the
+server slices the stream to the last ~40 pane lines for that socket. Measured
+on the production box: a full snapshot frame is 19–136 KB; a thumbnail frame
+is ~5 KB — and captures are shared server-side with any full viewer of the
+same session, so a ten-card hub adds no extra tmux work.
 
-<p align="center"><img src="docs/media/term-white.png" width="390" alt="Terminal viewer: an agent session with syntax-colored output and a wrapped, underlined URL" /></p>
-
-The viewer never runs a terminal emulator in the scroll path. Captured pane
-lines render into a virtualized DOM window, and a flick is a `translate3d`
-update — no reparse, no repaint of terminal cells — so scrolling runs at
-whatever refresh rate your display has. You get **real text selection** (it's
-a DOM), momentum and rubber-band physics tuned to feel like iOS — and older
-scrollback streams in as you pull down.
-
-**URLs are tappable** — including URLs that wrap across lines mid-output.
-In the shot above, the coverage link spans two pane lines; both fragments are
-live, underlined, and open the same URL. Links are reconstructed at the
-current pane width, so this survives resizes too.
-
-### A hub of every terminal you're running
-
-<p align="center"><img src="docs/media/hub.png" width="390" alt="Session hub: a grid of live terminal miniatures plus a + terminal card" /></p>
-
-Before you enter a terminal you see all of them: a grid of **live
-miniatures** — each card is the actual pane streaming through the same
-WebSocket mux (captures are shared server-side, and thumbnails never touch
-the pane's geometry). Four agents crunching in parallel reads at a glance;
-tap a card to drop in.
-
-### Launch presets that speak agent
+## Launch presets that speak agent
 
 <p align="center"><img src="docs/media/launcher.png" width="390" alt="Launcher sheet: seven presets with permission and model dropdowns" /></p>
 
@@ -65,6 +42,24 @@ and model** that go straight into the launch command. Generic hosts get a live
 command preview; hosts that build the command server-side (like the one in
 this shot) hide it and forward the choices to their spawn API. Presets are
 data (`DEFAULT_LAUNCH_PRESETS`) — bring your own.
+
+## The rest of the tour
+
+### Scrolls like an app, not a canvas
+
+<p align="center"><img src="docs/media/term-white.png" width="390" alt="Terminal viewer: an agent session with syntax-colored output and a wrapped, underlined URL" /></p>
+
+The viewer never runs a terminal emulator in the scroll path. Captured pane
+lines render into a virtualized DOM window, and a flick is a `translate3d`
+update — no reparse, no repaint of terminal cells — so scrolling runs at
+whatever refresh rate your display has. You get **real text selection** (it's
+real DOM), momentum and rubber-band physics tuned to feel like iOS — and older
+scrollback streams in as you pull down.
+
+**URLs are tappable** — including URLs that wrap across lines mid-output.
+In the shot above, the coverage link spans two pane lines; both fragments are
+live, underlined, and open the same URL. Links are reconstructed at the
+current pane width, so this survives resizes too.
 
 ### Everything behind one thumb
 
@@ -125,18 +120,87 @@ derived from the background's luminance, and the ANSI text palette swaps to
 contrast-picked variants for light vs dark backgrounds. No unreadable
 terminals, whatever color you land on.
 
-### Any base color, still readable
+<p align="center"><img src="docs/media/hero.png" width="98%" alt="The same agent session in four surfaces — white (the default), black, blue, orange" /></p>
+<p align="center"><sub>the same session on white (the default), black, blue and orange — one luminance formula, ANSI palette included</sub></p>
 
-<p align="center">
-  <img src="docs/media/term-black.png" width="31%" alt="Black surface" />
-  <img src="docs/media/term-blue.png" width="31%" alt="Blue surface" />
-  <img src="docs/media/term-orange.png" width="31%" alt="Orange surface" />
-</p>
+## Under the hood
 
-The same session on black, blue and orange bases — every one derived by the
-same luminance math, ANSI palette included. Hosts can also give each agent
-type its own identity surface (the extraction source paints Claude Code
-orange, Codex blue, Grok black) in light and dark modes.
+No terminal emulator in the browser's hot path, no polling storms, no
+per-frame parsing. The pipeline:
+
+```
+tmux pane ──pipe-pane──▶ dirty signal ──debounce 15ms (100ms max)──▶ capture-pane
+                                                                        │
+        fallback: adaptive poll (4 FPS idle → 10 FPS for 5s after keys) │
+                                                                        ▼
+                        content hash changed? ──no──▶ drop (nothing sent)
+                                │ yes
+                                ▼
+                 one WebSocket, many sessions ──▶ full viewers: full window
+                                              └─▶ thumbnails: last ~40 lines
+                                                                        │
+                                                                        ▼
+                    SGR→HTML incremental renderer (carried state per line)
+                                │
+                                ▼
+      virtualized DOM window · scroll = translate3d at the display's Hz
+```
+
+**Refresh behavior, concretely:**
+
+| stage | rate / size |
+|---|---|
+| output detection | `pipe-pane` dirty signals, debounced 15 ms (100 ms max wait); polling fallback at 4 FPS idle, 10 FPS for 5 s after a keystroke |
+| change dedupe | content hash per capture — an unchanged pane sends **zero bytes** |
+| full viewer frame | the live scrollback window (measured 19–136 KB on real agent sessions) |
+| thumbnail frame | tail mode, last ~40 lines (~5 KB measured — ~4–28× smaller) |
+| keystroke frame | ~60 bytes (`{type, session, data}` — no metadata blob on the hot path) |
+| scroll rendering | compositor transform only; DOM patches happen outside the gesture, at window edges |
+| keepalive | client ping every 25 s (under carrier NAT timeouts), reconnect with backoff, visibility-aware |
+
+**Technology:** TypeScript end-to-end. `core/` is zero-dependency (SGR state
+machine, wrapped-URL reconstruction, prompt scanning, luminance math, the WS
+protocol types). `svelte/` is Svelte 5 (runes) — the only runtime dependency
+of the UI. `server/` runs on Bun or Node against plain `tmux capture-pane` /
+`pipe-pane` / `send-keys`, with every host-specific decision (drivers, resize
+arbitration, telemetry, session profiles) injected. No xterm.js anywhere in
+the mobile path.
+
+## Getting started
+
+Pick your lane. (Reminder: source-first — not on npm yet.)
+
+**🤖 The agent way (easiest).** Paste this into Claude Code / Codex in your
+project:
+
+> Clone https://github.com/kemkem23/thumbmux into `vendor/thumbmux`, read its
+> README and the `core/`, `svelte/`, `server/` packages, then wire it into
+> this app: alias `@thumbmux/*` to the package `src/` dirs, mount `TmuxWsMux`
+> on a `/ws/tmux` WebSocket route with a driver for my tmux, and add a page
+> using `SessionGrid` + `LaunchSheet` + `TermView` + `ComposerDock`. Show me
+> the wiring plan before writing code.
+
+**🔒 The security-conscious way.** Same as above, but audit first — paste
+this before installing:
+
+> Read every file in https://github.com/kemkem23/thumbmux (core/, svelte/,
+> server/ — it's small). Flag anything that phones home, executes remote
+> content, touches files outside its packages, or handles keystrokes/session
+> content in a way I should not trust. Summarize what data flows where, then
+> wait for my go-ahead.
+
+(It's ~4k lines of TypeScript with zero runtime dependencies in `core/` —
+an agent reads it in one sitting. That's a deliberate design goal.)
+
+**🛠 The manual way.** Clone, then wire the two ends yourself:
+
+1. Alias the packages (tsconfig `paths` / Vite alias): `@thumbmux/core`,
+   `@thumbmux/svelte`, `@thumbmux/server` → each package's `src/`.
+2. Server: instantiate `TmuxWsMux` with your `TmuxDriver` (capture/keys/
+   resize/activity against your tmux) and route WS messages to
+   `mux.handleMessage` — snippet below.
+3. Client: `SessionGrid` for the hub, `TermView` + `ComposerDock` for the
+   terminal page — snippet below.
 
 ## What's inside
 
@@ -150,8 +214,8 @@ thumbmux/
 | package | what you get |
 |---|---|
 | **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
-| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
-| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling (4 FPS idle → 10 FPS after keystrokes), `pipe-pane` dirty signals, content-hash dedupe, scrollback history expansion, session-list pushes. Everything host-specific is injected. |
+| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
+| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected. |
 
 ### What the server wiring looks like
 
@@ -235,6 +299,7 @@ The lessons are encoded in the components so you don't have to relearn them:
 ## Roadmap
 
 - [x] Session hub: live-miniature grid + the seven launch presets
+- [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame instead of the full window)
 - [ ] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device
