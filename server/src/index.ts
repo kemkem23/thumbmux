@@ -16,3 +16,4 @@ export {
   type MuxHooks,
   type TmuxWsMuxOptions,
 } from './ws-mux';
+export { createBunTmuxDriver, spawnTmuxSession, killTmuxSession } from './bun-driver';

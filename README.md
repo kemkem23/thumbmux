@@ -6,8 +6,9 @@ sessions — especially AI coding agents — from your phone.
 ![MIT](https://img.shields.io/badge/license-MIT-orange) ![Svelte 5](https://img.shields.io/badge/svelte-5-ff3e00) ![Bun](https://img.shields.io/badge/runs%20on-bun%20%2F%20node-black)
 
 > **Status:** 0.x, source-first, extracted from a production system where it
-> drives real Claude Code / Codex / Grok sessions daily. **Not on npm yet** —
-> a runnable demo is the next roadmap item. Watch releases to catch it.
+> drives real Claude Code / Codex / Grok sessions daily. **Not on npm yet**,
+> but the demo runs in two minutes: `bun run demo` → scan the QR
+> ([jump to Getting started](#getting-started)).
 
 Born from a real itch: [Claude Code], Codex CLI and Grok CLI running in tmux on
 a server, and a human on a phone who still has to steer them. Every web
@@ -170,7 +171,23 @@ the mobile path.
 
 Pick your lane. (Reminder: source-first — not on npm yet.)
 
-**🤖 The agent way (easiest).** Paste this into Claude Code / Codex in your
+**⚡ Try it in two minutes (the demo).** On any machine with `tmux` and
+[Bun](https://bun.sh):
+
+```bash
+git clone https://github.com/kemkem23/thumbmux
+cd thumbmux && bun install
+bun run demo            # binds 127.0.0.1
+bun run demo -- --host  # expose on your LAN for the phone
+```
+
+It prints a QR code — scan it with your phone and you're looking at your own
+tmux sessions in the hub. The URL carries a random token (cookie'd on first
+visit): **anyone with that URL can type into your tmux**, so treat it like an
+SSH key. The demo is one Bun process: the built UI, the WebSocket mux, and a
+reference `TmuxDriver` against your local tmux.
+
+**🤖 The agent way.** Paste this into Claude Code / Codex in your
 project:
 
 > Clone https://github.com/kemkem23/thumbmux into `vendor/thumbmux`, read its
@@ -208,14 +225,15 @@ an agent reads it in one sitting. That's a deliberate design goal.)
 thumbmux/
 ├── core/    framework-free TypeScript, zero dependencies
 ├── svelte/  Svelte 5 components (everything in the tour)
-└── server/  Bun/Node WebSocket mux engine for tmux
+├── server/  Bun/Node WebSocket mux engine for tmux
+└── demo/    one-command demo (Bun server + reference driver + QR)
 ```
 
 | package | what you get |
 |---|---|
 | **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
 | **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
-| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected. |
+| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation. |
 
 ### What the server wiring looks like
 
@@ -300,7 +318,7 @@ The lessons are encoded in the components so you don't have to relearn them:
 
 - [x] Session hub: live-miniature grid + the seven launch presets
 - [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame instead of the full window)
-- [ ] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
+- [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device
 - [ ] Protocol doc + conformance tests for third-party servers
