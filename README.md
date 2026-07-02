@@ -8,6 +8,18 @@ server and living inside them from an iPhone over Tailscale. Every existing web
 terminal treated the phone as a tiny desktop. thumbmux treats the phone as the
 primary device.
 
+<p align="center">
+  <img src="docs/media/viewer.png" width="19%" alt="Terminal viewer — 120Hz compositor scrolling, tappable links" />
+  <img src="docs/media/menu.png" width="19%" alt="Single-launcher action menu with preset sends" />
+  <img src="docs/media/composer.png" width="19%" alt="Composer dock — the sheet never covers the terminal" />
+  <img src="docs/media/direct.png" width="19%" alt="DIRECT mode — the OS keyboard is the input" />
+  <img src="docs/media/theme.png" width="19%" alt="Theme sheet — full surface derived from one color" />
+</p>
+<p align="center"><sub>
+viewer · action menu · composer dock · DIRECT mode · theming — captured from the
+production UI (labels currently Thai; English defaults are on the roadmap)
+</sub></p>
+
 ## What's inside
 
 ```
