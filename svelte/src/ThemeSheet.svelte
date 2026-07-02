@@ -13,7 +13,7 @@
     onPick,
     onReset,
     customBg = $bindable('#000000'),
-    labels = { dark: '☾ มืด', light: '☀ สว่าง', def: 'เริ่มต้น', custom: 'เอง', close: 'ปิด' },
+    labels = { dark: '☾ Dark', light: '☀ Light', def: 'Default', custom: 'Pick', close: 'Close' },
   }: {
     open?: boolean;
     title: string;

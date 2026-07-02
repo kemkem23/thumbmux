@@ -46,12 +46,12 @@
     labels = {
       compose: 'COMPOSE',
       direct: 'DIRECT',
-      hintCompose: 'พิมพ์เก็บไว้ก่อน แล้วกด SEND',
-      hintDirect: 'คีย์บอร์ด = ส่งตรงเข้า terminal',
-      placeholder: 'พิมพ์ prompt… (ช่องนี้ขยายเองตามบรรทัด)',
+      hintCompose: 'Draft first, then hit SEND',
+      hintDirect: 'Keyboard goes straight to the terminal',
+      placeholder: 'Type a prompt… (the box grows with your text)',
       send: 'SEND',
-      close: 'ปิด',
-      directAria: 'ส่งคีย์ตรงเข้า terminal',
+      close: 'Close',
+      directAria: 'Send keys directly to the terminal',
     } as ComposerLabels,
   }: {
     open?: boolean;

@@ -331,9 +331,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   /** Route a parsed client message. Convenience for hosts whose WS handler
-   * is a thin switch — kemcortex keeps its own switch in web.ts instead. */
+   * is a thin switch — kemcortex keeps its own switch in web.ts instead.
+   * Answers client keepalive pings: the @thumbmux/svelte client closes the
+   * connection when a ping goes unanswered for 8s. */
   handleMessage(msg: MuxClientMessage, ws: WS) {
     switch (msg.type) {
+      case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
       case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
       case "keys": if (msg.session && msg.data !== undefined) this.handleKeys(msg.session, msg.data, ws, msg.client); break;

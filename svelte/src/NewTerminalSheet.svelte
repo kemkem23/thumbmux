@@ -12,11 +12,11 @@
     hint,
     agents,
     busy = false,
-    busyLabel = '⏳ กำลังเปิด session…',
+    busyLabel = '⏳ Opening session…',
     error = null,
     onPick,
     onClose,
-    closeAria = 'ปิด',
+    closeAria = 'Close',
   }: {
     open?: boolean;
     dark?: boolean;

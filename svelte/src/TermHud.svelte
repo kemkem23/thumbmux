@@ -13,7 +13,7 @@
     expanded = $bindable(false),
     onBack,
     onToggleExpand,
-    backAria = 'กลับหน้าหลัก',
+    backAria = 'Back',
     panel,
   }: {
     chip: string;

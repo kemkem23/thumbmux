@@ -20,7 +20,7 @@
     active = false,
     actions,
     onFab,
-    fabAria = 'เมนูคำสั่ง',
+    fabAria = 'Actions',
   }: {
     open?: boolean;
     /** rotate the FAB into ✕ posture (any sheet open) */
