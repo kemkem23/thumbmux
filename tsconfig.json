@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "lib": ["ESNext", "DOM"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@thumbmux/core": ["./core/src/index.ts"],
+      "@thumbmux/core/*": ["./core/src/*"],
+      "@thumbmux/server": ["./server/src/index.ts"],
+      "@thumbmux/server/*": ["./server/src/*"],
+      "@thumbmux/svelte": ["./svelte/src/index.ts"],
+      "@thumbmux/svelte/*": ["./svelte/src/*"]
+    }
+  }
+}

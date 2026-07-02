@@ -1,0 +1,9 @@
+{
+  "name": "thumbmux",
+  "version": "0.1.0",
+  "private": true,
+  "description": "tmux for thumbs — mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
+  "workspaces": ["core", "svelte", "server"],
+  "repository": "github:kemkem23/thumbmux",
+  "license": "MIT"
+}
