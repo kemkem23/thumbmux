@@ -15,7 +15,7 @@ terminal we tried treats the phone as a tiny desktop — pinch, squint, mis-tap,
 rage. thumbmux treats the phone as the primary device: one-thumb controls,
 native scroll physics, and a keyboard that never fights the layout.
 
-![thumbmux on an iPhone: an agent session, DIRECT keyboard mode, and the light theme](docs/media/hero.png)
+![The same agent session in four surfaces — white (the default), black, blue, orange](docs/media/hero.png)
 
 **Why not ttyd / GoTTY / an xterm.js wrapper?** Those are excellent — and
 desktop-shaped. They hand your phone a terminal *emulator* that repaints on
@@ -28,7 +28,7 @@ thumb-first instead of ported from the desktop.
 
 ### Scrolls like an app, not a canvas
 
-<p align="center"><img src="docs/media/viewer.png" width="390" alt="Terminal viewer: an agent session with syntax-colored output and a wrapped, underlined URL" /></p>
+<p align="center"><img src="docs/media/term-white.png" width="390" alt="Terminal viewer: an agent session with syntax-colored output and a wrapped, underlined URL" /></p>
 
 The viewer never runs a terminal emulator in the scroll path. Captured pane
 lines render into a virtualized DOM window, and a flick is a `translate3d`
@@ -41,6 +41,30 @@ scrollback streams in as you pull down.
 In the shot above, the coverage link spans two pane lines; both fragments are
 live, underlined, and open the same URL. Links are reconstructed at the
 current pane width, so this survives resizes too.
+
+### A hub of every terminal you're running
+
+<p align="center"><img src="docs/media/hub.png" width="390" alt="Session hub: a grid of live terminal miniatures plus a + terminal card" /></p>
+
+Before you enter a terminal you see all of them: a grid of **live
+miniatures** — each card is the actual pane streaming through the same
+WebSocket mux (captures are shared server-side, and thumbnails never touch
+the pane's geometry). Four agents crunching in parallel reads at a glance;
+tap a card to drop in.
+
+### Launch presets that speak agent
+
+<p align="center"><img src="docs/media/launcher.png" width="390" alt="Launcher sheet: seven presets with permission and model dropdowns" /></p>
+
+The **+ terminal** card opens a launcher with the stock seven: Claude Code,
+Codex and Grok — each plain or in an **isolated git worktree** — plus a blank
+shell. Every agent preset injects its own permission-bypass flag by default
+(`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
+`--permission-mode bypassPermissions`), with dropdowns for **permission mode
+and model** that go straight into the launch command. Generic hosts get a live
+command preview; hosts that build the command server-side (like the one in
+this shot) hide it and forward the choices to their spawn API. Presets are
+data (`DEFAULT_LAUNCH_PRESETS`) — bring your own.
 
 ### Everything behind one thumb
 
@@ -101,13 +125,18 @@ derived from the background's luminance, and the ANSI text palette swaps to
 contrast-picked variants for light vs dark backgrounds. No unreadable
 terminals, whatever color you land on.
 
-### Light and dark, per agent
+### Any base color, still readable
 
-<p align="center"><img src="docs/media/light.png" width="390" alt="The same session on the light theme: dark, readable syntax colors on cream" /></p>
+<p align="center">
+  <img src="docs/media/term-black.png" width="31%" alt="Black surface" />
+  <img src="docs/media/term-blue.png" width="31%" alt="Blue surface" />
+  <img src="docs/media/term-orange.png" width="31%" alt="Orange surface" />
+</p>
 
-Each agent type carries its own identity surface in both modes (the home
-system paints Claude Code orange, Codex blue, Grok black). Your host supplies
-the palette; thumbmux keeps it readable everywhere.
+The same session on black, blue and orange bases — every one derived by the
+same luminance math, ANSI palette included. Hosts can also give each agent
+type its own identity surface (the extraction source paints Claude Code
+orange, Codex blue, Grok black) in light and dark modes.
 
 ## What's inside
 
@@ -120,8 +149,8 @@ thumbmux/
 
 | package | what you get |
 |---|---|
-| **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `protocol` the WS message types |
-| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
+| **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
+| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
 | **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling (4 FPS idle → 10 FPS after keystrokes), `pipe-pane` dirty signals, content-hash dedupe, scrollback history expansion, session-list pushes. Everything host-specific is injected. |
 
 ### What the server wiring looks like
@@ -205,6 +234,7 @@ The lessons are encoded in the components so you don't have to relearn them:
 
 ## Roadmap
 
+- [x] Session hub: live-miniature grid + the seven launch presets
 - [ ] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device

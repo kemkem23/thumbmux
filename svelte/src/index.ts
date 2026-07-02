@@ -17,3 +17,6 @@ export { default as ThemeSheet } from './ThemeSheet.svelte';
 export { default as ActionFab, type FabAction } from './ActionFab.svelte';
 export { tmuxMux, configureTmuxMux, TmuxMux, type TmuxMuxOptions } from './ws-mux.svelte';
 export { default as NewTerminalSheet, type SpawnAgent } from './NewTerminalSheet.svelte';
+export { default as SessionThumb } from './SessionThumb.svelte';
+export { default as SessionGrid, type GridSession } from './SessionGrid.svelte';
+export { default as LaunchSheet, type LaunchContext } from './LaunchSheet.svelte';
