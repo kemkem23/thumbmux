@@ -18,3 +18,8 @@ jobs:
         run: bun test ./server/tests/
       - name: demo builds
         run: cd demo && bun run build
+      - name: packages build & pack (publish readiness)
+        run: |
+          (cd core && bun run build && bun pm pack)
+          (cd server && bun run build && bun pm pack)
+          (cd svelte && bun run build && bun pm pack)
