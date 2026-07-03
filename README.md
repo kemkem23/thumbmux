@@ -3,7 +3,7 @@
 **tmux for thumbs.** A mobile-first web terminal stack for driving tmux
 sessions — especially AI coding agents — from your phone.
 
-![MIT](https://img.shields.io/badge/license-MIT-orange) ![Svelte 5](https://img.shields.io/badge/svelte-5-ff3e00) ![Bun](https://img.shields.io/badge/runs%20on-bun%20%2F%20node-black)
+![ci](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg) ![MIT](https://img.shields.io/badge/license-MIT-orange) ![Svelte 5](https://img.shields.io/badge/svelte-5-ff3e00) ![Bun](https://img.shields.io/badge/runs%20on-bun%20%2F%20node-black)
 
 > **Status:** 0.x, source-first, extracted from a production system where it
 > drives real Claude Code / Codex / Grok sessions daily. **Not on npm yet**,
@@ -321,7 +321,7 @@ The lessons are encoded in the components so you don't have to relearn them:
 - [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device
-- [ ] Protocol doc + conformance tests for third-party servers
+- [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite (`server/tests/`)
 
 The screenshots above are the production UI this stack was extracted from,
 talking to a live tmux session — running a scripted demo transcript, so no

@@ -252,12 +252,18 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.refreshSessionListSchedule();
   }
 
-  /** Slice to a socket's tail preference (full content when none). */
+  /** Slice to a socket's tail preference (full content when none). Trailing
+   * blank viewport rows are trimmed first — a fresh 24-row pane ends in ~20
+   * empty lines, and slicing those would hand thumbnails pure blankness
+   * (caught by the conformance suite). */
   private contentFor(session: string, ws: WS, content: string): string {
     const tail = this.tails.get(session)?.get(ws);
     if (!tail) return content;
     const lines = content.split("\n");
-    return lines.length <= tail ? content : lines.slice(-tail).join("\n");
+    let end = lines.length;
+    while (end > 0 && (lines[end - 1] ?? "").trim() === "") end--;
+    if (end === 0) return "";
+    return lines.slice(Math.max(0, end - tail), end).join("\n");
   }
 
   private dropSessionState(session: string) {
