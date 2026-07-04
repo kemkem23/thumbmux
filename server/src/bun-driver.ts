@@ -63,6 +63,17 @@ export function createBunTmuxDriver(): TmuxDriver {
     hash(content) {
       return Bun.hash(content).toString(36);
     },
+    async getCursor(session) {
+      try {
+        const out = run(["display-message", "-t", session, "-p",
+          "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}"]).trim();
+        const [x, y, h, flag, inMode] = out.split("|").map((v) => Number(v));
+        if (![x, y, h].every(Number.isFinite)) return null;
+        return { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 };
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

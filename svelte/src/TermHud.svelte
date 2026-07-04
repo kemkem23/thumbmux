@@ -1,6 +1,12 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
+  /** Structurally-typed snippet: Svelte's `Snippet` carries a nominal brand
+   * (unique symbol), so in monorepos where the host and this package resolve
+   * different copies of svelte, `Snippet !== Snippet`. A callable type keeps
+   * the prop assignable from any copy; we brand it back at the render site. */
+  type PanelSnippet = (() => unknown) | Snippet;
+
   /** TermHud — pinned top bar: back, agent chip, session name + note, status
    * LED. Tapping the name toggles an expandable panel whose CONTENT the host
    * supplies (recent prompts, notes — host-specific). */
@@ -25,7 +31,7 @@
     onBack: () => void;
     onToggleExpand?: () => void;
     backAria?: string;
-    panel?: Snippet;
+    panel?: PanelSnippet;
   } = $props();
 </script>
 
@@ -45,8 +51,9 @@
 </div>
 
 {#if expanded && panel}
+  {@const panelSnippet = panel as Snippet}
   <div class="hud-panel" data-testid="hud-panel">
-    {@render panel()}
+    {@render panelSnippet()}
   </div>
 {/if}
 

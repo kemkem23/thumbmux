@@ -57,8 +57,13 @@
   .slots {
     position: absolute; right: 12px; bottom: calc(76px + env(safe-area-inset-bottom)); z-index: 39;
     display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+    /* long action lists must scroll, not walk off the top (issue #1) */
+    max-height: calc(100dvh - 150px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    overflow-y: auto;
+    overscroll-behavior: contain;
     pointer-events: none;
   }
+  .slots.open { pointer-events: auto; }
   .slot {
     min-height: 46px; padding: 0 16px;
     background: var(--hud); color: var(--hud-fg);

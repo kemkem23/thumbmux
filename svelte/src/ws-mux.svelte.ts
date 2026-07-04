@@ -4,9 +4,9 @@
 // telemetry client id) are injected via configureTmuxMux() — the wire format
 // itself is part of the thumbmux protocol.
 
-import type { MuxOutputType as OutputType, MuxClientInfo } from '@thumbmux/core';
+import type { MuxOutputType as OutputType, MuxClientInfo, MuxServerMessage } from '@thumbmux/core';
 
-type Callback = (data: string, type?: OutputType) => void;
+type Callback = (data: string, type?: OutputType, cursor?: MuxServerMessage['cursor']) => void;
 type ClientInfo = MuxClientInfo & Record<string, unknown>;
 
 const PING_INTERVAL = 25_000;    // 25s — under most carrier NAT timeouts (30-60s)
@@ -238,7 +238,7 @@ export class TmuxMux {
           const cbs = this.subs.get(msg.channel);
           if (cbs) {
             for (const cb of cbs) {
-              cb(msg.data, msg.type as OutputType);
+              cb(msg.data, msg.type as OutputType, msg.cursor);
             }
           }
         }

@@ -106,7 +106,7 @@
     style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
   >
     <div class="host">
-      <TermView {session} palette={PALETTE} bottomInsetPx={dockInset + kbInset} />
+      <TermView {session} palette={PALETTE} bottomInsetPx={dockInset + kbInset} onTap={() => composerRef?.openDock()} />
     </div>
     <TermHud
       chip="TMUX"

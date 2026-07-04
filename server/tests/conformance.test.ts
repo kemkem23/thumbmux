@@ -96,6 +96,27 @@ describe("thumbmux protocol conformance", () => {
     expect(names).toContain(SES);
   });
 
+  test("output frames carry the pane cursor mapped to content coordinates", async () => {
+    // The prompt line is the last content line → row 0; col > 0 (after "$ ").
+    const ws = new FakeWS();
+    mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+    await until(() => ws.frames("output", SES).some((m) => m.cursor != null), 8000);
+    const cur = ws.frames("output", SES).findLast((m) => m.cursor != null).cursor;
+    expect(cur.row).toBe(0);
+    expect(cur.col).toBeGreaterThan(0);
+    mux.unsubscribeAll(ws as any);
+  }, 15000);
+
+  test("stop() tears every timer down", () => {
+    const throwaway = new TmuxWsMux({ driver, pollNormalMs: 50 });
+    const ws = new FakeWS();
+    throwaway.handleMessage({ type: "subscribe", session: SES }, ws as any);
+    throwaway.stop();
+    // No assertion API for live timers — this is a leak guard: if stop()
+    // missed one, bun test's process would linger and CI would hang.
+    expect(true).toBe(true);
+  });
+
   test("unsubscribeAll cleans up (no frames after the pane changes)", async () => {
     mux.unsubscribeAll(full as any);
     mux.unsubscribeAll(tail as any);

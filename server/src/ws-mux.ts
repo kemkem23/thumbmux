@@ -29,6 +29,10 @@ export interface TmuxDriver {
   resizeWindow(session: string, cols: number, rows: number): void;
   /** content hash for change dedupe (host may pass a native hash, e.g. Bun.hash) */
   hash(content: string): string;
+  /** OPTIONAL: raw cursor state (tmux #{cursor_x}/#{cursor_y}/#{pane_height}/
+   * #{cursor_flag}/#{pane_in_mode}). When present, output frames carry a
+   * mapped { row, col } cursor for the viewer's caret overlay. */
+  getCursor?(session: string): Promise<{ x: number; y: number; paneHeight: number; visible: boolean } | null>;
 }
 
 export interface PipeManagerLike {
@@ -145,6 +149,9 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private sessionListProvider: () => unknown[];
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
+  /** last cursor broadcast per session — attached to cached first paints so
+   * a new viewer of a static pane still gets a caret */
+  private lastCursor = new Map<string, { row: number; col: number } | null>();
   private pipeDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pipeMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollCounter = 0;
@@ -199,6 +206,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
         ws.send(JSON.stringify({
           channel: session, type: "output",
           data: this.contentFor(session, ws, cachedContent),
+          cursor: this.lastCursor.get(session) ?? null,
         } satisfies MuxServerMessage));
       } catch {}
       // Cached pane content is only a fast first paint. Always follow it with a
@@ -252,6 +260,44 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.refreshSessionListSchedule();
   }
 
+  /** Map raw tmux cursor state onto the captured content: row = lines up
+   * from the last content line. Gotcha (thanks, issue #1): `capture-pane -p`
+   * ends with a trailing newline, so a naive split() yields a phantom ""
+   * that shifts the cursor up a row — strip exactly one trailing newline. */
+  private async mapCursor(session: string, capturedContent: string): Promise<{ row: number; col: number } | null> {
+    if (!this.driver.getCursor) return null;
+    try {
+      const raw = await this.driver.getCursor(session);
+      if (!raw || !raw.visible) return null;
+      const lines = capturedContent.replace(/\n$/, "").split("\n");
+      let last = lines.length;
+      while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
+      const trailingBlanks = lines.length - last;
+      let row = raw.paneHeight - 1 - trailingBlanks - raw.y;
+      if (row < 0) row = 0;
+      return { row, col: Math.max(0, raw.x) };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Tear down every timer this instance owns (poll, session list, burst,
+   * immediate captures, pipe debounces) and stop active pipes. For hosts
+   * that create short-lived muxes (tests, per-request servers). */
+  stop() {
+    if (this.interval) { clearInterval(this.interval); this.interval = null; }
+    if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
+    if (this.burstTimer) { clearTimeout(this.burstTimer); this.burstTimer = null; }
+    for (const t of this.immediateCaptureTimers.values()) clearTimeout(t);
+    this.immediateCaptureTimers.clear();
+    for (const t of this.pipeDebounceTimers.values()) clearTimeout(t);
+    this.pipeDebounceTimers.clear();
+    for (const t of this.pipeMaxTimers.values()) clearTimeout(t);
+    this.pipeMaxTimers.clear();
+    for (const session of this.piped) this.pipes?.stopPipe(session);
+    this.piped.clear();
+  }
+
   /** Slice to a socket's tail preference (full content when none). Trailing
    * blank viewport rows are trimmed first — a fresh 24-row pane ends in ~20
    * empty lines, and slicing those would hand thumbnails pure blankness
@@ -269,6 +315,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private dropSessionState(session: string) {
     this.subscribers.delete(session);
     this.tails.delete(session);
+    this.lastCursor.delete(session);
     this.contents.delete(session);
     this.hashes.delete(session);
     this.lastActivity.delete(session);
@@ -480,6 +527,10 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.tails.set(newSession, tails);
       this.tails.delete(oldSession);
     }
+    if (this.lastCursor.has(oldSession)) {
+      this.lastCursor.set(newSession, this.lastCursor.get(oldSession) ?? null);
+      this.lastCursor.delete(oldSession);
+    }
     const hash = this.hashes.get(oldSession);
     if (hash) {
       this.hashes.set(newSession, hash);
@@ -591,7 +642,9 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.contents.set(session, liveContent);
       if (hash === this.hashes.get(session)) return;
       this.hashes.set(session, hash);
-      const fullMsg = JSON.stringify({ channel: session, type: "output", data: liveContent } satisfies MuxServerMessage);
+      const cursor = await this.mapCursor(session, content);
+      this.lastCursor.set(session, cursor);
+      const fullMsg = JSON.stringify({ channel: session, type: "output", data: liveContent, cursor } satisfies MuxServerMessage);
       const tailMsgs = new Map<number, string>();
       const tails = this.tails.get(session);
       for (const ws of viewers) {
@@ -605,6 +658,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
           msg = JSON.stringify({
             channel: session, type: "output",
             data: this.contentFor(session, ws, liveContent),
+            cursor,
           } satisfies MuxServerMessage);
           tailMsgs.set(tail, msg);
         }

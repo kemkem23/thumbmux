@@ -34,6 +34,11 @@ export type MuxServerMessage = {
   channel: string;
   type: "output" | "sessions" | "history" | "error";
   data: string;
+  /** On output frames: the pane's real cursor, or null when hidden.
+   * `row` counts up from the LAST CONTENT line (trailing blank viewport rows
+   * trimmed), `col` is 0-based cells — the same convention for full and
+   * tail-sliced frames. */
+  cursor?: { row: number; col: number } | null;
 };
 
 export type MuxOutputType = "output" | "history" | "error";

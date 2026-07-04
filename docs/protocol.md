@@ -21,7 +21,7 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 
 | frame | semantics |
 |---|---|
-| `{channel, type:"output", data}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. |
+| `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices) or `null` when hidden; present when the driver implements `getCursor`. |
 | `{channel, type:"history", data}` | JSON `{lines, startLine, hasMore}` for `history_expand`. |
 | `{channel, type:"error", data}` | e.g. the session disappeared. |
 | `{channel:"__sessions", type:"sessions", data}` | JSON session list; pushed on subscribe and whenever the list changes (~5 s cadence). |
@@ -38,3 +38,14 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
   region in most states, but freshly-spawned panes carry trailing blank rows;
   tail slicing trims them (see conformance: "tail subscribe receives only the
   last N lines").
+
+## Deployment notes
+
+- **HTTP/2 and the WS upgrade:** WebSocket's `Upgrade` header does not exist
+  in HTTP/2, so `server.upgrade()`-style handshakes fail on connections a
+  reverse proxy negotiated as h2 (a curl probe with `-H "Upgrade: websocket"`
+  gets `200`, not `101`). Real browsers open WebSockets over HTTP/1.1, so
+  users are unaffected — but point automated health checks at HTTP/1.1.
+- **Wide glyphs:** cursor/link column math assumes 1 cell = 1 measured char
+  width. Exact for ASCII and box drawing; CJK double-width cells and Thai
+  combining marks can drift the caret on non-ASCII lines (known limitation).

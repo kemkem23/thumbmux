@@ -30,6 +30,7 @@
     minCols = 20,
     minRows = 15,
     bottomInsetPx = 0,
+    onTap = undefined,
     onLinesChange = undefined,
     onGeometryChange = undefined,
     onScrollStateChange = undefined,
@@ -43,6 +44,10 @@
      * Geometry math adds it back so the tmux pane is NEVER resized by a
      * transient overlay — only the scroll pin follows the shorter viewport. */
     bottomInsetPx?: number;
+    /** Fired on a CLEAN tap (short, low-movement, not a link, no selection) —
+     * call your composer's openDock() here, synchronously, so iOS raises the
+     * keyboard (gesture call stack). */
+    onTap?: () => void;
     onLinesChange?: (lines: string[]) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
@@ -57,6 +62,8 @@
   const MOMENTUM_GAIN = 1.25;
 
   let viewportEl = $state<HTMLDivElement | null>(null);
+  let cursor = $state<{ row: number; col: number } | null>(null);
+  let charW = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
   let viewH = $state(0);
   let lineH = $derived(Math.round(fontPx * LINE_RATIO));
@@ -313,6 +320,7 @@
     stopInertia();
     touching = true;
     pendingDragPx = 0;
+    tapStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: performance.now() };
     touchY = e.touches[0].clientY;
     touchAt = performance.now();
     touchVel = 0;
@@ -370,7 +378,29 @@
     springFrame = requestAnimationFrame(step);
   }
 
-  function onTouchEnd() {
+  let tapStart: { x: number; y: number; t: number } | null = null;
+  let lastTouchEndAt = 0;
+
+  function cleanTapTarget(target: EventTarget | null): boolean {
+    return !(target instanceof Element && target.closest('a'));
+  }
+
+  function maybeTap(e: TouchEvent | MouseEvent, x: number, y: number) {
+    if (!onTap || !tapStart) return;
+    const moved = Math.abs(x - tapStart.x) + Math.abs(y - tapStart.y);
+    const dur = performance.now() - tapStart.t;
+    const sel = window.getSelection?.();
+    if (dur < 350 && moved < 10 && (!sel || sel.isCollapsed) && cleanTapTarget(e.target)) {
+      onTap();
+    }
+  }
+
+  function onTouchEnd(e?: TouchEvent) {
+    lastTouchEndAt = performance.now();
+    if (e && e.changedTouches?.[0] && tapStart) {
+      maybeTap(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+    }
+    tapStart = null;
     if (selectionActive) {
       updateSelectionActive();
       touching = false;
@@ -416,7 +446,10 @@
   function measureCharWidth(): number {
     const c = document.createElement('canvas').getContext('2d');
     if (!c) return fontPx * 0.6;
-    c.font = `${fontPx}px 'JetBrains Mono', monospace`;
+    // Measure the font the DOM actually renders — hardcoding a family drifts
+    // the col math when that font isn't installed (issue #1).
+    const fam = (viewportEl && getComputedStyle(viewportEl).fontFamily) || "'JetBrains Mono', monospace";
+    c.font = `${fontPx}px ${fam}`;
     return c.measureText('MMMMMMMMMM').width / 10;
   }
 
@@ -427,7 +460,9 @@
     // docked composer shrinks what's visible, not the pane the agent runs in.
     const h = viewportEl.clientHeight + Math.max(0, bottomInsetPx);
     if (w <= 0 || h <= 0) return;
-    const cols = Math.max(minCols, Math.floor((w - 12) / measureCharWidth()));
+    const cw = measureCharWidth();
+    charW = cw;
+    const cols = Math.max(minCols, Math.floor((w - 12) / cw));
     const rows = Math.max(minRows, Math.min(60, Math.floor(h / lineH)));
     if (!opts.force && cols === lastPushedCols && rows === lastPushedRows) return;
     lastPushedCols = cols;
@@ -435,6 +470,23 @@
     tmuxMux.sendResize(session, cols, rows);
     onGeometryChange?.({ cols, rows });
   }
+
+  /** Re-measure and re-claim geometry (e.g. after a host font-size change —
+   * glyph resizes don't fire the ResizeObserver). */
+  export function refreshGeometry() {
+    lastPushedCols = 0;
+    pushGeometry({ force: true });
+    renderEpoch++;
+    applyScroll();
+  }
+
+  let lastFontPx = fontPx;
+  $effect(() => {
+    if (fontPx !== lastFontPx) {
+      lastFontPx = fontPx;
+      refreshGeometry();
+    }
+  });
 
   function onReturn() {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
@@ -447,13 +499,14 @@
 
   onMount(() => {
     viewH = viewportEl?.clientHeight ?? 0;
-    unsubscribe = tmuxMux.subscribe(session, (data: string, type?: string) => {
+    unsubscribe = tmuxMux.subscribe(session, (data: string, type?: string, cur?: { row: number; col: number } | null) => {
       if (type === 'history') {
         applyArchivedHistory(data);
         return;
       }
       if (type === 'error') return;
       connected = true;
+      if (cur !== undefined) cursor = cur;
       if (busy()) {
         pendingContent = data;
         return;
@@ -538,8 +591,14 @@
   ontouchstart={onTouchStart}
   ontouchmove={onTouchMove}
   ontouchend={onTouchEnd}
-  ontouchcancel={onTouchEnd}
+  ontouchcancel={() => { tapStart = null; onTouchEnd(); }}
   onwheel={onWheel}
+  onclick={(e) => {
+    if (!onTap) return;
+    if (performance.now() - lastTouchEndAt < 500) return; // synthesized click
+    const sel = window.getSelection?.();
+    if ((!sel || sel.isCollapsed) && cleanTapTarget(e.target)) onTap();
+  }}
 >
   <div bind:this={layerEl} class="mtv-layer">
     {#key renderEpoch}
@@ -547,6 +606,20 @@
         <div class="mtv-line">{@html htmlCache[winStart + i] ?? ' '}</div>
       {/each}
     {/key}
+    {#if cursor && connected && bottomOffsetPx <= lineH && charW > 0}
+      {@const lastContent = (() => { let i = total; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
+      {@const cline = lastContent - cursor.row}
+      {#if cline >= winStart && cline < winEnd}
+        <div
+          class="mtv-cursor"
+          style:top={`${(cline - winStart) * lineH}px`}
+          style:left={`${6 + cursor.col * charW}px`}
+          style:width={`${Math.max(2, charW)}px`}
+          style:height={`${lineH}px`}
+          data-testid="mtv-cursor"
+        ></div>
+      {/if}
+    {/if}
   </div>
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>
@@ -582,6 +655,14 @@
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
   }
+  .mtv-cursor {
+    position: absolute;
+    background: var(--tfg);
+    opacity: .75;
+    animation: mtv-blink 1.1s steps(1) infinite;
+    pointer-events: none;
+  }
+  @keyframes mtv-blink { 50% { opacity: .12; } }
   .mtv-wait {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
