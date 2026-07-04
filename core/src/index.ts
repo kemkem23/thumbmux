@@ -14,3 +14,4 @@ export * from './prompt-scan';
 export * from './surface';
 export * from './protocol';
 export * from './launch';
+export * from './upload';

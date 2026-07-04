@@ -20,3 +20,4 @@ export { default as NewTerminalSheet, type SpawnAgent } from './NewTerminalSheet
 export { default as SessionThumb } from './SessionThumb.svelte';
 export { default as SessionGrid, type GridSession } from './SessionGrid.svelte';
 export { default as LaunchSheet, type LaunchContext } from './LaunchSheet.svelte';
+export { default as UploadAction } from './UploadAction.svelte';

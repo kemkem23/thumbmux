@@ -2,7 +2,7 @@
   /** thumbmux demo — hub of your local tmux sessions + a full terminal view.
    * One Bun process serves this page, the WebSocket mux, and the spawn API. */
   import {
-    SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab,
+    SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab, UploadAction,
     tmuxMux, type GridSession, type FabAction,
   } from '@thumbmux/svelte';
   import { DEFAULT_LAUNCH_PRESETS, type LaunchSpec, type AnsiPalette } from '@thumbmux/core';
@@ -30,11 +30,15 @@
   // Terminal view state
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
   let composerOpen = $state(false);
+  let composerMode = $state<'compose' | 'direct'>('compose');
   let dockInset = $state(0);
   let dockFull = $state(0);
   let kbInset = $state(0);
   let slotsOpen = $state(false);
   let dpadOpen = $state(false);
+  let uploadRef = $state<ReturnType<typeof UploadAction> | null>(null);
+  let uploading = $state(false);
+  let composeText = $state('');
 
   let unsubSessions: (() => void) | null = null;
 
@@ -60,6 +64,7 @@
 
   let actions = $derived<FabAction[]>([
     { id: 'type', label: '⌨ Type', onTap: () => { slotsOpen = false; composerRef?.openDock(); } },
+    { id: 'upload', label: uploading ? '⏳ Uploading…' : '📎 Attach files', testid: 'demo-upload', onTap: () => { slotsOpen = false; uploadRef?.open(); } },
     { id: 'dpad', label: '✛ Arrows', onTap: () => { dpadOpen = !dpadOpen; slotsOpen = false; } },
   ]);
 
@@ -111,9 +116,17 @@
     />
     <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
     <DpadSheet bind:open={dpadOpen} onKey={(seq) => tmuxMux.sendKeys(session, seq)} />
+    <UploadAction
+      bind:this={uploadRef}
+      bind:busy={uploading}
+      onUploaded={(message) => { composeText = message; composerRef?.openDock(); }}
+      onError={(m) => { composeText = `Upload failed: ${m}`; composerRef?.openDock(); }}
+    />
     <ComposerDock
       bind:this={composerRef}
       bind:open={composerOpen}
+      bind:mode={composerMode}
+      bind:text={composeText}
       bind:dockInset bind:dockFull bind:kbInset
       onSend={(text) => { tmuxMux.sendKeys(session, text); setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
       onDirectText={(d) => tmuxMux.sendKeys(session, d)}

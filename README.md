@@ -97,10 +97,12 @@ the composer is **prefilled with the stored paths** (`Uploaded
 "design-mock.png" → uploads/design-mock.png`), so one SEND hands them straight
 to the agent.
 
-This flow is host wiring on top of two thumbmux primitives — an `ActionFab`
-action and the composer's bindable `text` — shown here as implemented in the
-system this stack came from. Point it at your own upload endpoint in a few
-lines.
+This ships turnkey: `UploadAction` (client — hidden picker, upload, prefill
+message) plus `createUploadHandler` (server — a fetch-style endpoint that
+stores files with sanitized, collision-proof names). The demo wires them in
+two lines each; agents like Claude Code can then open the uploaded image
+straight from the path you send. Hosts with their own storage (like the
+system in this shot) can still swap in a custom endpoint.
 
 ### DIRECT mode: the keyboard *is* the terminal
 
@@ -232,8 +234,8 @@ thumbmux/
 | package | what you get |
 |---|---|
 | **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
-| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
-| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation. |
+| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
+| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation, with `createUploadHandler()` for turnkey file attachments. |
 
 ### What the server wiring looks like
 

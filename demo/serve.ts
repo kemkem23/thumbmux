@@ -9,7 +9,7 @@
  * URL (cookie'd on first visit). Anyone with the URL can type into your
  * tmux; treat it like an SSH key.
  */
-import { TmuxWsMux, createBunTmuxDriver, spawnTmuxSession } from "@thumbmux/server";
+import { TmuxWsMux, createBunTmuxDriver, spawnTmuxSession, createUploadHandler } from "@thumbmux/server";
 import type { MuxClientMessage } from "@thumbmux/core";
 import qrcode from "qrcode-terminal";
 import { networkInterfaces } from "node:os";
@@ -20,6 +20,7 @@ const TOKEN = crypto.randomUUID().replace(/-/g, "");
 const DIST = new URL("./dist/", import.meta.url).pathname;
 
 const driver = createBunTmuxDriver();
+const handleUpload = createUploadHandler({ dir: "uploads" });
 const mux = new TmuxWsMux({ driver, log: console.log });
 
 function lanIp(): string {
@@ -51,6 +52,10 @@ Bun.serve<{ ok: true }>({
       return server.upgrade(req, { data: { ok: true } })
         ? undefined
         : new Response("upgrade failed", { status: 400 });
+    }
+
+    if (url.pathname === "/api/upload" && req.method === "POST") {
+      return handleUpload(req);
     }
 
     if (url.pathname === "/api/spawn" && req.method === "POST") {
