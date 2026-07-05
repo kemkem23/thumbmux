@@ -30,7 +30,7 @@
 
   onMount(() => {
     unsubscribe = tmuxMux.subscribe(session, (data, type) => {
-      if (type === 'history' || type === 'error') return;
+      if (type === 'history' || type === 'error' || type === 'cursor') return;
       connected = true;
       render(data);
     }, { tail: maxLines + 10 }); // tail mode: a few KB per update, not the full window

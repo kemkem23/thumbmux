@@ -107,6 +107,40 @@ describe("thumbmux protocol conformance", () => {
     mux.unsubscribeAll(ws as any);
   }, 15000);
 
+  test("arrow-key cursor move without content change → cursor-only frame", async () => {
+    const ws = new FakeWS();
+    mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+    await until(() => ws.frames("output", SES).length > 0);
+    // Type onto the prompt line (echo changes content → output frame with cursor)
+    mux.handleMessage({ type: "keys", session: SES, data: "abc" }, ws as any);
+    await until(() => {
+      const f = ws.frames("output", SES).at(-1);
+      return f?.cursor != null && String(f.data).includes("abc");
+    }, 8000);
+    const col0 = ws.frames("output", SES).at(-1).cursor.col;
+    // ← (the mobile D-pad sends the raw escape through the mux): the cursor
+    // moves over "c" but the content is identical — only the caret changes.
+    // NOTE: sent through the mux, not `tmux send-keys` directly — the poll's
+    // second-resolution activity gate can swallow out-of-band keys that land
+    // in the same second; mux keys trigger an immediate capture (like the
+    // phone), and piped production sessions catch pty echo via pipe signals.
+    mux.handleMessage({ type: "keys", session: SES, data: "\x1b[D" }, ws as any);
+    await until(() => ws.frames("cursor", SES).some((m) => m.cursor?.col === col0 - 1), 8000);
+    const cur = ws.frames("cursor", SES).at(-1);
+    expect(cur.data).toBeUndefined(); // caret-only — the pane is not re-sent
+    // cleanup: clear the pending line so later tests see a bare prompt
+    mux.handleMessage({ type: "keys", session: SES, data: "\x15" }, ws as any); // C-u
+    mux.unsubscribeAll(ws as any);
+  }, 30000);
+
+  test("bun driver: captureWithCursor matches capturePane and reports raw trailing blanks", async () => {
+    const combined = await driver.captureWithCursor!(SES, { startLine: -100 });
+    const plain = await driver.capturePane(SES, { startLine: -100 });
+    expect(combined.content).toBe(plain);
+    expect(combined.trailingBlanks).toBeGreaterThanOrEqual(0);
+    expect(combined.cursor).not.toBeNull();
+  }, 15000);
+
   test("stop() tears every timer down", () => {
     const throwaway = new TmuxWsMux({ driver, pollNormalMs: 50 });
     const ws = new FakeWS();

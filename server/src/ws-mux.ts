@@ -31,9 +31,32 @@ export interface TmuxDriver {
   hash(content: string): string;
   /** OPTIONAL: raw cursor state (tmux #{cursor_x}/#{cursor_y}/#{pane_height}/
    * #{cursor_flag}/#{pane_in_mode}). When present, output frames carry a
-   * mapped { row, col } cursor for the viewer's caret overlay. */
-  getCursor?(session: string): Promise<{ x: number; y: number; paneHeight: number; visible: boolean } | null>;
+   * mapped { row, col } cursor for the viewer's caret overlay.
+   * CAVEAT: this is a separate tmux call from capturePane, so the pair can
+   * desync during heavy TUI repaints, and the mux must infer trailing blank
+   * rows from the captured content — which is WRONG if your capturePane trims
+   * trailing blank lines. Implement captureWithCursor instead; it has neither
+   * problem. */
+  getCursor?(session: string): Promise<RawCursorState | null>;
+  /** OPTIONAL, preferred over getCursor: capture the pane AND sample the
+   * cursor in ONE tmux invocation (`tmux display-message ... \; capture-pane
+   * ...`) so the (content, cursor) pair can never desync — a stale mismatched
+   * pair would otherwise be frozen by hash dedupe for as long as the pane
+   * stays idle, misplacing every new viewer's caret.
+   * `trailingBlanks` = count of consecutive blank lines at the END of the RAW
+   * capture output (before any trimming your driver applies to `content`) —
+   * the mux needs it to anchor cursor rows, and it cannot recover the number
+   * itself once the content is trimmed. */
+  captureWithCursor?(
+    session: string,
+    opts: { startLine?: number; currentPaneOnly?: boolean },
+  ): Promise<{ content: string; cursor: RawCursorState | null; trailingBlanks: number }>;
 }
+
+/** tmux cursor sample: cell coords within the visible pane + visibility
+ * (#{cursor_flag} && !#{pane_in_mode} — hidden cursor or copy-mode = not
+ * visible, viewers draw no caret). */
+export type RawCursorState = { x: number; y: number; paneHeight: number; visible: boolean };
 
 export interface PipeManagerLike {
   startPipe(
@@ -260,25 +283,37 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.refreshSessionListSchedule();
   }
 
-  /** Map raw tmux cursor state onto the captured content: row = lines up
-   * from the last content line. Gotcha (thanks, issue #1): `capture-pane -p`
-   * ends with a trailing newline, so a naive split() yields a phantom ""
-   * that shifts the cursor up a row — strip exactly one trailing newline. */
-  private async mapCursor(session: string, capturedContent: string): Promise<{ row: number; col: number } | null> {
-    if (!this.driver.getCursor) return null;
-    try {
-      const raw = await this.driver.getCursor(session);
-      if (!raw || !raw.visible) return null;
-      const lines = capturedContent.replace(/\n$/, "").split("\n");
-      let last = lines.length;
-      while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
-      const trailingBlanks = lines.length - last;
-      let row = raw.paneHeight - 1 - trailingBlanks - raw.y;
-      if (row < 0) row = 0;
-      return { row, col: Math.max(0, raw.x) };
-    } catch {
-      return null;
-    }
+  /** Map a raw tmux cursor sample onto the content-anchored protocol
+   * convention: row = lines up from the last content line, so client buffers
+   * that trim trailing blanks still land the caret on the right line.
+   * `trailingBlanks` MUST be counted on the raw untrimmed capture (the
+   * captureWithCursor contract); deriving it from trimmed content yields 0
+   * and displaces the caret upward by the real blank-row count — the exact
+   * production bug this replaced. */
+  private mapRawCursor(raw: RawCursorState | null, trailingBlanks: number): { row: number; col: number } | null {
+    if (!raw || !raw.visible) return null;
+    // May go NEGATIVE (bounded below by -trailingBlanks): a cursor resting on
+    // a blank row below the last content line — a shell waiting after output
+    // that ended in \n, `read`, a heredoc — is |row| rows BELOW the anchor.
+    // Clamping to 0 here would silently draw the caret a row too high.
+    const row = raw.paneHeight - 1 - trailingBlanks - raw.y;
+    return { row, col: Math.max(0, raw.x) };
+  }
+
+  /** Trailing blank lines of a raw capture. Gotcha (thanks, issue #1):
+   * `capture-pane -p` ends with a trailing newline, so a naive split() yields
+   * a phantom "" that shifts the cursor up a row — strip exactly one. */
+  private countTrailingBlanks(rawCapture: string): number {
+    const lines = rawCapture.replace(/\n$/, "").split("\n");
+    let last = lines.length;
+    while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
+    return lines.length - last;
+  }
+
+  private cursorEq(a: { row: number; col: number } | null | undefined, b: { row: number; col: number } | null | undefined): boolean {
+    const x = a ?? null, y = b ?? null;
+    if (x === null || y === null) return x === y;
+    return x.row === y.row && x.col === y.col;
   }
 
   /** Tear down every timer this instance owns (poll, session list, burst,
@@ -619,10 +654,18 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.lastReconcileCapture.set(session, Date.now());
       const profile = this.profileOf(session);
       const useArchive = profile.archive && this.archive !== null;
-      const content = await this.driver.capturePane(
-        session,
-        profile.currentPaneOnly ? { currentPaneOnly: true } : { startLine },
-      );
+      const captureOpts = profile.currentPaneOnly ? { currentPaneOnly: true } : { startLine };
+      let content: string;
+      let rawCursor: RawCursorState | null = null;
+      let trailingBlanks: number | null = null;
+      if (this.driver.captureWithCursor) {
+        const combined = await this.driver.captureWithCursor(session, captureOpts);
+        content = combined.content;
+        rawCursor = combined.cursor;
+        trailingBlanks = combined.trailingBlanks;
+      } else {
+        content = await this.driver.capturePane(session, captureOpts);
+      }
       const liveContent = !useArchive
         ? content
         : this.archive!.ingestSnapshot(session, content, {
@@ -640,9 +683,35 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
       const hash = this.driver.hash(liveContent);
       this.contents.set(session, liveContent);
-      if (hash === this.hashes.get(session)) return;
+      if (hash === this.hashes.get(session)) {
+        // Content unchanged — but a cursor that moved anyway (arrow keys on a
+        // shell line) must still reach viewers, minus the pane re-send. Only
+        // the atomic driver path does this: with two-call sampling a mid-
+        // repaint cursor could spam spurious frames on every idle tick.
+        if (this.driver.captureWithCursor) {
+          const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
+          if (!this.cursorEq(cursor, this.lastCursor.get(session))) {
+            this.lastCursor.set(session, cursor);
+            const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor } satisfies MuxServerMessage);
+            for (const ws of viewers) {
+              try { ws.send(cursorMsg); } catch {}
+            }
+          }
+        }
+        return;
+      }
       this.hashes.set(session, hash);
-      const cursor = await this.mapCursor(session, content);
+      // Legacy two-call path samples the cursor only on content change (its
+      // pair is non-atomic anyway; don't pay a tmux call per idle tick).
+      if (!this.driver.captureWithCursor && this.driver.getCursor) {
+        try {
+          rawCursor = await this.driver.getCursor(session);
+        } catch {
+          rawCursor = null; // a cursor sampling failure must not kill the content frame
+        }
+        trailingBlanks = this.countTrailingBlanks(content);
+      }
+      const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
       const fullMsg = JSON.stringify({ channel: session, type: "output", data: liveContent, cursor } satisfies MuxServerMessage);
       const tailMsgs = new Map<number, string>();

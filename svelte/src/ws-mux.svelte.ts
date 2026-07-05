@@ -234,11 +234,13 @@ export class TmuxMux {
           }
           return;
         }
-        if (msg.type === 'output' || msg.type === 'history' || msg.type === 'error') {
+        if (msg.type === 'output' || msg.type === 'history' || msg.type === 'error' || msg.type === 'cursor') {
           const cbs = this.subs.get(msg.channel);
           if (cbs) {
             for (const cb of cbs) {
-              cb(msg.data, msg.type as OutputType, msg.cursor);
+              // "cursor" frames carry no data — callbacks that render output
+              // must check `type` before treating data as pane content.
+              cb(msg.data ?? '', msg.type as OutputType, msg.cursor);
             }
           }
         }

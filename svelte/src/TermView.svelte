@@ -506,6 +506,11 @@
       }
       if (type === 'error') return;
       connected = true;
+      if (type === 'cursor') {
+        // caret-only update — content unchanged, nothing else to repaint
+        if (cur !== undefined) cursor = cur;
+        return;
+      }
       if (cur !== undefined) cursor = cur;
       if (busy()) {
         pendingContent = data;
@@ -609,7 +614,10 @@
     {#if cursor && connected && bottomOffsetPx <= lineH && charW > 0}
       {@const lastContent = (() => { let i = total; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
-      {#if cline >= winStart && cline < winEnd}
+      {#if cline >= winStart && cline < winEnd + (cursor.row < 0 ? -cursor.row : 0)}
+        <!-- negative row = caret on a blank row BELOW the last content line;
+             the overlay is pixel-positioned, so it renders fine past the last
+             DOM row (a bottom-clipped caret just stays hidden, never wrong) -->
         <div
           class="mtv-cursor"
           style:top={`${(cline - winStart) * lineH}px`}

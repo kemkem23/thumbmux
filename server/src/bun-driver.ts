@@ -4,12 +4,18 @@
  * activity caches, worktree spawning, memory-scoped launches…) but this one
  * is complete and honest: every TmuxWsMux feature works against it.
  */
-import type { TmuxDriver } from "./ws-mux";
+import type { RawCursorState, TmuxDriver } from "./ws-mux";
 
 function run(args: string[]): string {
   const p = Bun.spawnSync(["tmux", ...args]);
   if (p.exitCode !== 0) throw new Error(p.stderr.toString().trim() || `tmux ${args[0]} failed`);
   return p.stdout.toString();
+}
+
+function parseCursorLine(line: string): RawCursorState | null {
+  const [x, y, h, flag, inMode] = line.split("|").map((v) => Number(v));
+  if (![x, y, h].every(Number.isFinite)) return null;
+  return { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 };
 }
 
 export function createBunTmuxDriver(): TmuxDriver {
@@ -67,12 +73,32 @@ export function createBunTmuxDriver(): TmuxDriver {
       try {
         const out = run(["display-message", "-t", session, "-p",
           "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}"]).trim();
-        const [x, y, h, flag, inMode] = out.split("|").map((v) => Number(v));
-        if (![x, y, h].every(Number.isFinite)) return null;
-        return { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 };
+        return parseCursorLine(out);
       } catch {
         return null;
       }
+    },
+    async captureWithCursor(session, opts) {
+      // ONE tmux invocation for both commands: the server runs them back to
+      // back, so the (content, cursor) pair cannot desync the way two
+      // separate calls can during a TUI repaint. display-message goes first —
+      // its single line is trivially split off the top of the output.
+      const args = ["display-message", "-t", session, "-p",
+        "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}",
+        ";", "capture-pane", "-t", session, "-p", "-e"];
+      if (!opts.currentPaneOnly && typeof opts.startLine === "number") {
+        args.push("-S", String(opts.startLine));
+      }
+      const p = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(p.stdout).text();
+      if ((await p.exited) !== 0) throw new Error(`capture-pane failed for ${session}`);
+      const nl = out.indexOf("\n");
+      const cursorLine = nl === -1 ? out : out.slice(0, nl);
+      const content = nl === -1 ? "" : out.slice(nl + 1);
+      const lines = content.replace(/\n$/, "").split("\n");
+      let last = lines.length;
+      while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
+      return { content, cursor: parseCursorLine(cursorLine.trim()), trailingBlanks: lines.length - last };
     },
   };
 }

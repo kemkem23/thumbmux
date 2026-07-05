@@ -21,7 +21,8 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 
 | frame | semantics |
 |---|---|
-| `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices) or `null` when hidden; present when the driver implements `getCursor`. |
+| `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
+| `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
 | `{channel, type:"history", data}` | JSON `{lines, startLine, hasMore}` for `history_expand`. |
 | `{channel, type:"error", data}` | e.g. the session disappeared. |
 | `{channel:"__sessions", type:"sessions", data}` | JSON session list; pushed on subscribe and whenever the list changes (~5 s cadence). |
@@ -38,6 +39,26 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
   region in most states, but freshly-spawned panes carry trailing blank rows;
   tail slicing trims them (see conformance: "tail subscribe receives only the
   last N lines").
+
+## Cursor sampling (drivers)
+
+Two driver hooks exist; implement `captureWithCursor` unless you cannot:
+
+- `captureWithCursor(session, opts)` → `{content, cursor, trailingBlanks}` —
+  capture and cursor sampled in ONE tmux invocation
+  (`tmux display-message … \; capture-pane …`), so the pair cannot desync
+  during a TUI repaint. This matters more than it looks: output frames are
+  hash-deduped, so a mismatched (content, cursor) pair sampled mid-repaint
+  would otherwise be **frozen** for as long as the pane stays idle, and every
+  new viewer would render a misplaced caret. `trailingBlanks` must be counted
+  on the RAW capture — if your `capturePane` trims trailing blank lines (a
+  reasonable bandwidth choice), the mux cannot recover the count from the
+  trimmed content, and a content-derived count of 0 displaces the caret
+  upward by the pane's real blank bottom rows (a production bug we shipped,
+  then unshipped).
+- `getCursor(session)` (legacy) — separate tmux call, sampled only when the
+  content changed. Correct ONLY for drivers whose `capturePane` preserves
+  trailing blank rows; no caret-only updates.
 
 ## Deployment notes
 
