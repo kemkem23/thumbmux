@@ -67,6 +67,10 @@ Two driver hooks exist; implement `captureWithCursor` unless you cannot:
   reverse proxy negotiated as h2 (a curl probe with `-H "Upgrade: websocket"`
   gets `200`, not `101`). Real browsers open WebSockets over HTTP/1.1, so
   users are unaffected — but point automated health checks at HTTP/1.1.
-- **Wide glyphs:** cursor/link column math assumes 1 cell = 1 measured char
-  width. Exact for ASCII and box drawing; CJK double-width cells and Thai
-  combining marks can drift the caret on non-ASCII lines (known limitation).
+- **Wide glyphs:** the caret column is pixel-accurate: the client maps the
+  cursor's cell column onto the line's characters with wcwidth-style cell
+  accounting (`@thumbmux/core` `prefixForCells` — Thai combining marks 0
+  cells, CJK/emoji 2) and then measures that prefix with the live font, so
+  the caret follows the DOM's real glyph advances even for Thai/CJK/emoji
+  lines. Link tap-target column math still assumes 1 cell = 1 char width
+  (remaining known limitation).

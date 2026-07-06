@@ -21,6 +21,7 @@
     type AnsiPalette, type SgrState, type LineLinkRange,
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
+    prefixForCells, stripAnsi,
   } from '@thumbmux/core';
 
   let {
@@ -443,14 +444,48 @@
   let lastPushedRows = $state(0);
   let connectedGeometryPushed = false;
 
-  function measureCharWidth(): number {
-    const c = document.createElement('canvas').getContext('2d');
-    if (!c) return fontPx * 0.6;
+  let measureCtx: CanvasRenderingContext2D | null = null;
+
+  function measureFontSpec(): string {
     // Measure the font the DOM actually renders — hardcoding a family drifts
     // the col math when that font isn't installed (issue #1).
     const fam = (viewportEl && getComputedStyle(viewportEl).fontFamily) || "'JetBrains Mono', monospace";
-    c.font = `${fontPx}px ${fam}`;
-    return c.measureText('MMMMMMMMMM').width / 10;
+    return `${fontPx}px ${fam}`;
+  }
+
+  function measureCharWidth(): number {
+    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+    if (!measureCtx) return fontPx * 0.6;
+    measureCtx.font = measureFontSpec();
+    return measureCtx.measureText('MMMMMMMMMM').width / 10;
+  }
+
+  // Pixel-accurate caret column: measure the ACTUAL text left of the cursor
+  // with the live font instead of multiplying col × charW — Thai combining
+  // vowels (0 cells), CJK (2 cells) and emoji make cell arithmetic drift
+  // from the DOM's real glyph advances. Memoized: scroll re-renders hit the
+  // cache (the key ignores winStart), only content/cursor changes re-measure.
+  let cursorPosCache = { key: '', left: 0, width: 0 };
+  function cursorPos(cline: number, col: number): { left: number; width: number } {
+    const raw = rawLines[cline] ?? '';
+    const key = `${col}|${fontPx}|${charW}|${raw}`;
+    if (cursorPosCache.key === key) return cursorPosCache;
+    if (!measureCtx) measureCharWidth();
+    let left = col * charW;
+    let width = charW;
+    if (measureCtx) {
+      const line = stripAnsi(raw);
+      const { prefix, cells } = prefixForCells(line, col);
+      measureCtx.font = measureFontSpec();
+      const prefixPx = measureCtx.measureText(prefix).width;
+      // cursor past the end of the text (blank cells) → pad with charW
+      left = prefixPx + Math.max(0, col - cells) * charW;
+      let nextChar: string | undefined;
+      for (const c of line.slice(prefix.length)) { nextChar = c; break; }
+      if (nextChar) width = measureCtx.measureText(prefix + nextChar).width - prefixPx;
+    }
+    cursorPosCache = { key, left, width };
+    return cursorPosCache;
   }
 
   function pushGeometry(opts: { force?: boolean } = {}) {
@@ -618,11 +653,12 @@
         <!-- negative row = caret on a blank row BELOW the last content line;
              the overlay is pixel-positioned, so it renders fine past the last
              DOM row (a bottom-clipped caret just stays hidden, never wrong) -->
+        {@const cpos = cursorPos(cline, cursor.col)}
         <div
           class="mtv-cursor"
           style:top={`${(cline - winStart) * lineH}px`}
-          style:left={`${6 + cursor.col * charW}px`}
-          style:width={`${Math.max(2, charW)}px`}
+          style:left={`${6 + cpos.left}px`}
+          style:width={`${Math.max(2, cpos.width)}px`}
           style:height={`${lineH}px`}
           data-testid="mtv-cursor"
         ></div>
