@@ -157,6 +157,16 @@ describe("thumbmux protocol conformance", () => {
     mux.unsubscribeAll(ws as any);
   }, 30000);
 
+  test("history_expand without an archive answers an explicit empty page", async () => {
+    const ws = new FakeWS();
+    mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+    mux.handleMessage({ type: "history_expand", session: SES }, ws as any);
+    await until(() => ws.frames("history", SES).length > 0);
+    const page = JSON.parse(ws.frames("history", SES)[0].data);
+    expect(page).toEqual({ lines: [], startLine: null, hasMore: false });
+    mux.unsubscribeAll(ws as any);
+  }, 15000);
+
   test("stop() tears every timer down", () => {
     const throwaway = new TmuxWsMux({ driver, pollNormalMs: 50 });
     const ws = new FakeWS();

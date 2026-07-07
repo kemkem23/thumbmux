@@ -77,13 +77,13 @@
   .modes { display: flex; align-items: center; gap: 0; margin-bottom: 8px; }
   .sheet-title { font: 700 12px var(--font-thai); color: var(--hud-fg); letter-spacing: .04em; }
   .mode-btn {
-    min-height: 36px; padding: 0 14px;
+    min-height: 44px; padding: 0 14px;
     border: 1px solid var(--hud-line); background: transparent; color: var(--hud-fg);
     opacity: .65; font: 700 10px var(--font-mono); letter-spacing: .06em; touch-action: manipulation;
   }
   .mode-btn + .mode-btn { border-left: none; }
   .mode-btn.on { background: var(--agent); color: var(--tstage); border-color: var(--agent); opacity: 1; }
-  .close { margin-left: auto; min-width: 38px; min-height: 36px; background: none; border: 1px solid var(--hud-line); color: var(--hud-fg); font: 700 13px var(--font-mono); touch-action: manipulation; }
+  .close { margin-left: auto; min-width: 44px; min-height: 44px; background: none; border: 1px solid var(--hud-line); color: var(--hud-fg); font: 700 13px var(--font-mono); touch-action: manipulation; }
   .theme-row { display: flex; margin-bottom: 10px; }
   .swatch-label { font: 600 10.5px var(--font-thai); color: var(--hud-fg); opacity: .7; margin-bottom: 6px; }
   .swatches { display: flex; flex-wrap: wrap; gap: 8px; }

@@ -133,6 +133,9 @@
           </label>
           {#if showCommand}
             <div class="cmd" data-testid="launch-command"><span class="ps1">$</span> {command}</div>
+            {#if selected.worktree}
+              <div class="wtnote" data-testid="launch-worktree-note">⎇ runs in a fresh git worktree the host creates before launch</div>
+            {/if}
           {/if}
         {/if}
         <button class="go" style:--accent={selected.color} disabled={busy} onclick={launch} data-testid="launch-go">
@@ -167,7 +170,8 @@
   }
   .head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
   .title { font: 700 13px var(--font-mono, ui-monospace, monospace); }
-  .close { margin-left: auto; min-width: 38px; min-height: 36px; background: none; border: 1px solid var(--l-ink); color: var(--l-ink); font: 700 13px inherit; touch-action: manipulation; flex: 0 0 auto; }
+  .wtnote { font: 600 10px var(--font-mono, ui-monospace, monospace); color: var(--l-ink2); margin-top: 4px; }
+  .close { margin-left: auto; min-width: 44px; min-height: 44px; background: none; border: 1px solid var(--l-ink); color: var(--l-ink); font: 700 13px inherit; touch-action: manipulation; flex: 0 0 auto; }
   .hint { font: 400 11.5px var(--font-thai, sans-serif); line-height: 1.6; color: var(--l-ink2); margin-bottom: 10px; }
   .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .preset {

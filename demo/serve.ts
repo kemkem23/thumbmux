@@ -64,7 +64,23 @@ Bun.serve<{ ok: true }>({
         const existing = new Set(driver.listSessions().map((s: any) => s.name));
         let name = "";
         do { name = `demo-${++spawnCounter}`; } while (existing.has(name));
-        spawnTmuxSession(name, process.cwd(), typeof body.command === "string" && body.command ? body.command : undefined);
+        let cwd = process.cwd();
+        if (body.worktree) {
+          // Worktree presets: isolate the session in a fresh git worktree of
+          // the repo the demo runs in (agents can't trample your checkout).
+          const top = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--show-toplevel"]);
+          if (top.exitCode !== 0) {
+            return Response.json({ error: "worktree preset needs the demo to run inside a git repository" }, { status: 400 });
+          }
+          const root = top.stdout.toString().trim();
+          const wt = `${root}-wt-${name}`;
+          const add = Bun.spawnSync(["git", "-C", root, "worktree", "add", "--detach", wt]);
+          if (add.exitCode !== 0) {
+            return Response.json({ error: `git worktree add failed: ${add.stderr.toString().trim()}` }, { status: 500 });
+          }
+          cwd = wt;
+        }
+        spawnTmuxSession(name, cwd, typeof body.command === "string" && body.command ? body.command : undefined);
         return Response.json({ ok: true, name }, { status: 201 });
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 500 });

@@ -439,7 +439,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
-    if (!this.archive) return;
+    if (!this.archive) {
+      // No archive configured (the demo's default) — answer with an explicit
+      // empty page instead of silence, so clients stop waiting/retrying.
+      try {
+        ws.send(JSON.stringify({
+          channel: session, type: "history",
+          data: JSON.stringify({ lines: [], startLine: null, hasMore: false }),
+        } satisfies MuxServerMessage));
+      } catch {}
+      return;
+    }
     const history = this.archive.readBefore(session, beforeLine ?? null, limit);
     try {
       ws.send(JSON.stringify({

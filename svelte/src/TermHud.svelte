@@ -21,6 +21,7 @@
     onToggleExpand,
     backAria = 'Back',
     panel,
+    barHeight = $bindable(0),
   }: {
     chip: string;
     title: string;
@@ -32,10 +33,13 @@
     onToggleExpand?: () => void;
     backAria?: string;
     panel?: PanelSnippet;
+    /** measured rendered height of the pinned bar (incl. safe-area padding) —
+     * bind it and inset your terminal host below the (opaque) HUD. */
+    barHeight?: number;
   } = $props();
 </script>
 
-<div class="hud-top">
+<div class="hud-top" bind:clientHeight={barHeight}>
   <button class="bk" onclick={onBack} aria-label={backAria}>‹</button>
   <span class="agchip">{chip}</span>
   <button class="hud-names" onclick={() => { expanded = !expanded; onToggleExpand?.(); }} aria-expanded={expanded} data-testid="hud-expand">
@@ -52,7 +56,7 @@
 
 {#if expanded && panel}
   {@const panelSnippet = panel as Snippet}
-  <div class="hud-panel" data-testid="hud-panel">
+  <div class="hud-panel" style:top={`${barHeight}px`} data-testid="hud-panel">
     {@render panelSnippet()}
   </div>
 {/if}

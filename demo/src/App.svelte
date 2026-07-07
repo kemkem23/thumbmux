@@ -70,6 +70,7 @@
   let slotsOpen = $state(false);
   let dpadOpen = $state(false);
   let uploadRef = $state<ReturnType<typeof UploadAction> | null>(null);
+  let hudHeight = $state(0);
   let uploading = $state(false);
   let composeText = $state('');
 
@@ -82,7 +83,7 @@
       const res = await fetch('/api/spawn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: spec.command }),
+        body: JSON.stringify({ command: spec.command, worktree: spec.worktree }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
@@ -148,7 +149,7 @@
     style:--tfg={surface.tfg} style:--hud={surface.hud} style:--hud-fg={surface.hudFg}
     style:--hud-line={surface.hudLine}
   >
-    <div class="host">
+    <div class="host" style:top={`${hudHeight}px`}>
       {#key `${bg}|${fontPx}`}
         <TermView {session} palette={termPalette} {fontPx} bottomInsetPx={dockInset + kbInset} onTap={() => composerRef?.openDock()} />
       {/key}
@@ -157,6 +158,7 @@
       chip="TMUX"
       title={session}
       status="live"
+      bind:barHeight={hudHeight}
       onBack={() => { composerRef?.closeDock(); view = { kind: 'hub' }; }}
     />
     <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
@@ -214,9 +216,11 @@
     background: var(--tstage); font-family: var(--font-mono);
   }
   .host {
+    /* top is set inline from TermHud's measured barHeight: the HUD is opaque,
+       so the terminal must START below it (absolute children ignore parent
+       padding — the old padding-top approach never worked). */
     position: absolute; top: 0; left: 0; right: 0;
     bottom: calc(var(--dock-inset, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom, 0px));
-    padding-top: calc(46px + env(safe-area-inset-top));
     background: var(--tbg);
   }
 </style>

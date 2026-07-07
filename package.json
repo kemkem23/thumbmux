@@ -13,7 +13,7 @@
   "license": "MIT",
   "scripts": {
     "demo": "bun run --cwd demo start",
-    "build:packages": "bun run --cwd core build && bun run --cwd server build",
+    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build",
     "prepare": "bun run build:packages"
   }
 }
