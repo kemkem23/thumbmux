@@ -39,7 +39,7 @@
   } = $props();
 </script>
 
-<div class="hud-top" bind:clientHeight={barHeight}>
+<div class="hud-top" bind:offsetHeight={barHeight}>
   <button class="bk" onclick={onBack} aria-label={backAria}>‹</button>
   <span class="agchip">{chip}</span>
   <button class="hud-names" onclick={() => { expanded = !expanded; onToggleExpand?.(); }} aria-expanded={expanded} data-testid="hud-expand">

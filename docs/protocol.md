@@ -23,9 +23,9 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 |---|---|
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
-| `{channel, type:"history", data}` | JSON `{lines, startLine, hasMore}` for `history_expand`. |
+| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. A mux with no archive answers `{lines:[], startLine:null, hasMore:false}` immediately (clients must not wait forever). |
 | `{channel, type:"error", data}` | e.g. the session disappeared. |
-| `{channel:"__sessions", type:"sessions", data}` | JSON session list; pushed on subscribe and whenever the list changes (~5 s cadence). |
+| `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
 
 ## Timing model
@@ -59,6 +59,15 @@ Two driver hooks exist; implement `captureWithCursor` unless you cannot:
 - `getCursor(session)` (legacy) — separate tmux call, sampled only when the
   content changed. Correct ONLY for drivers whose `capturePane` preserves
   trailing blank rows; no caret-only updates.
+
+## Upload endpoint (createUploadHandler)
+
+`POST /api/upload` (multipart, field `files`, ≤10 files) → `201 {ok:true, files:[{original,
+stored}]}`. Stored names are sanitized to `<epoch-ms>_<entropy>_<cleaned>` — path components
+stripped, `[^\w.-]` runs collapsed to `_`, leading dots/underscores removed, 80-char cap — so
+hostile filenames cannot escape the upload dir. Oversized → `413`; malformed form → `400`.
+`formatUploadMessage` turns the response into the composer prefill
+(`Uploaded "orig" → dir/stored`, one line per file).
 
 ## Deployment notes
 

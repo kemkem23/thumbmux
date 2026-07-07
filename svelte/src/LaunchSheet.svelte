@@ -188,7 +188,7 @@
   .field { display: flex; align-items: center; gap: 10px; }
   .field span { font: 700 9.5px var(--font-mono, ui-monospace, monospace); letter-spacing: .06em; color: var(--l-ink2); min-width: 92px; text-transform: uppercase; }
   .field select {
-    flex: 1; min-height: 42px; padding: 0 8px;
+    flex: 1; min-height: 44px; padding: 0 8px;
     border: 1px solid var(--l-line); background: var(--l-bg2); color: var(--l-ink);
     font: 600 13px var(--font-mono, ui-monospace, monospace);
     -webkit-appearance: none; appearance: none;
