@@ -197,7 +197,7 @@
   });
 </script>
 
-<div class="sheet dock" class:open class:kb={kbInset > 0} bind:clientHeight={sheetH} data-testid="input-sheet" style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}>
+<div class="sheet dock" class:open class:kb={kbInset > 0} bind:offsetHeight={sheetH} data-testid="input-sheet" style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}>
   <div class="modes">
     <button class="mode-btn" class:on={mode === 'compose'} onclick={() => switchMode('compose')}>{labels.compose}</button>
     <button class="mode-btn" class:on={mode === 'direct'} onclick={() => switchMode('direct')}>{labels.direct}</button>
@@ -242,10 +242,14 @@
     background: var(--hud); border-top: 1px solid var(--hud-line);
     padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
     transform: translateY(105%);
-    transition: transform .28s cubic-bezier(.25,1,.5,1);
+    /* closed = INVISIBLE, not merely translated: host insets can shift the
+       stage and drag a "closed" sheet's rect back into the viewport (fleet
+       finding). Delayed visibility keeps the slide-out animation intact. */
+    visibility: hidden;
+    transition: transform .28s cubic-bezier(.25,1,.5,1), visibility 0s .28s;
     font-family: var(--font-mono);
   }
-  .sheet.open { transform: translateY(0); }
+  .sheet.open { transform: translateY(0); visibility: visible; transition: transform .28s cubic-bezier(.25,1,.5,1); }
   /* ONLY this sheet rides the OS keyboard (VisualViewport-tracked). Closed
      sibling sheets must stay below the stage edge where overflow clips them —
      lifting them parks them visibly behind iOS's translucent keyboard. */

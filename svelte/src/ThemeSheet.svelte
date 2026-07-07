@@ -70,10 +70,11 @@
     background: var(--hud); border-top: 1px solid var(--hud-line);
     padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
     transform: translateY(105%);
-    transition: transform .28s cubic-bezier(.25,1,.5,1);
+    visibility: hidden;
+    transition: transform .28s cubic-bezier(.25,1,.5,1), visibility 0s .28s;
     font-family: var(--font-mono);
   }
-  .sheet.open { transform: translateY(0); }
+  .sheet.open { transform: translateY(0); visibility: visible; transition: transform .28s cubic-bezier(.25,1,.5,1); }
   .modes { display: flex; align-items: center; gap: 0; margin-bottom: 8px; }
   .sheet-title { font: 700 12px var(--font-thai); color: var(--hud-fg); letter-spacing: .04em; }
   .mode-btn {
