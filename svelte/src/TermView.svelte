@@ -515,12 +515,10 @@
     applyScroll();
   }
 
-  let lastFontPx = fontPx;
+  let lastFontPx: number | null = null;
   $effect(() => {
-    if (fontPx !== lastFontPx) {
-      lastFontPx = fontPx;
-      refreshGeometry();
-    }
+    if (lastFontPx !== null && fontPx !== lastFontPx) refreshGeometry();
+    lastFontPx = fontPx;
   });
 
   function onReturn() {
@@ -614,7 +612,7 @@
   });
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   bind:this={viewportEl}
   class="mtv"

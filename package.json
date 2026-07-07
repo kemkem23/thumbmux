@@ -12,6 +12,8 @@
   "repository": "github:kemkem23/thumbmux",
   "license": "MIT",
   "scripts": {
-    "demo": "bun run --cwd demo start"
+    "demo": "bun run --cwd demo start",
+    "build:packages": "bun run --cwd core build && bun run --cwd server build",
+    "prepare": "bun run build:packages"
   }
 }

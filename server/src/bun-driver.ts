@@ -45,11 +45,17 @@ export function createBunTmuxDriver(): TmuxDriver {
       run(["send-keys", "-t", session, "-l", "--", data]);
     },
     getSessionActivity() {
+      // window_activity, NOT session_activity: the session timestamp freezes
+      // for detached sessions (nobody attached = no client activity), so a
+      // pane writing output would never re-trigger the poll gate and hub
+      // thumbnails froze (fleet finding). Window activity bumps on output.
       const map = new Map<string, number>();
       try {
-        for (const line of run(["list-sessions", "-F", "#{session_name}|#{session_activity}"]).trim().split("\n")) {
+        for (const line of run(["list-windows", "-a", "-F", "#{session_name}|#{window_activity}"]).trim().split("\n")) {
           const [name, at] = line.split("|");
-          if (name) map.set(name, Number(at) || 0);
+          if (!name) continue;
+          const t = Number(at) || 0;
+          if (t > (map.get(name) ?? 0)) map.set(name, t);
         }
       } catch { /* no server */ }
       return map;

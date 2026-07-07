@@ -61,19 +61,23 @@
   .hud-top {
     position: absolute; top: 0; left: 0; right: 0; z-index: 10;
     display: flex; align-items: center; gap: 8px;
-    background: var(--hud); color: var(--hud-fg);
-    padding: calc(6px + env(safe-area-inset-top)) 10px 6px;
+    /* layer the (possibly translucent) hud tint over the opaque stage color —
+       terminal rows must never be readable through the bar (fleet finding) */
+    background: linear-gradient(var(--hud), var(--hud)), var(--tbg);
+    color: var(--hud-fg);
+    padding: calc(4px + env(safe-area-inset-top)) 10px 4px;
     border-bottom: 2px solid var(--agent);
     font-family: var(--font-mono);
   }
   .bk {
     font: 700 16px var(--font-mono); color: var(--hud-fg);
     background: none; border: 1px solid var(--hud-line);
-    min-width: 38px; min-height: 34px; touch-action: manipulation;
+    min-width: 44px; min-height: 44px; touch-action: manipulation;
   }
   .agchip { font: 700 8.5px var(--font-mono); letter-spacing: .05em; padding: 2px 6px; background: var(--agent); color: var(--tstage); flex: 0 0 auto; }
   .hud-names {
-    min-width: 0; flex: 1; text-align: left;
+    min-width: 0; flex: 1; text-align: left; min-height: 44px;
+    display: flex; flex-direction: column; justify-content: center;
     background: none; border: none; color: var(--hud-fg); padding: 0;
     touch-action: manipulation; cursor: pointer;
   }
@@ -87,8 +91,9 @@
 
   .hud-panel {
     position: absolute; left: 0; right: 0;
-    top: calc(46px + env(safe-area-inset-top)); z-index: 9;
-    background: var(--hud); color: var(--hud-fg);
+    top: calc(52px + env(safe-area-inset-top)); z-index: 9;
+    background: linear-gradient(var(--hud), var(--hud)), var(--tbg);
+    color: var(--hud-fg);
     border-bottom: 1px solid var(--agent);
     padding: 10px 12px calc(12px + 2px);
     max-height: 55dvh; overflow-y: auto;

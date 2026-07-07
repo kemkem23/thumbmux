@@ -2,10 +2,10 @@
   /** thumbmux demo — hub of your local tmux sessions + a full terminal view.
    * One Bun process serves this page, the WebSocket mux, and the spawn API. */
   import {
-    SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab, UploadAction,
+    SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab, ThemeSheet, UploadAction,
     tmuxMux, type GridSession, type FabAction,
   } from '@thumbmux/svelte';
-  import { DEFAULT_LAUNCH_PRESETS, type LaunchSpec, type AnsiPalette } from '@thumbmux/core';
+  import { DEFAULT_LAUNCH_PRESETS, deriveSurface, luminance, type TerminalSurface, type LaunchSpec, type AnsiPalette } from '@thumbmux/core';
   import { onMount, onDestroy } from 'svelte';
 
   const PALETTE: AnsiPalette = {
@@ -14,8 +14,41 @@
     defaultFg: '#e6e6e6',
     defaultBg: '#101014',
   };
-  // The demo skips the worktree presets (a generic host may not be a git repo).
-  const PRESETS = DEFAULT_LAUNCH_PRESETS.filter((p) => !p.worktree);
+  // All seven stock presets, worktree ones included — if the demo's cwd is
+  // not a git repo, git prints its own self-explanatory error in the pane.
+  const PRESETS = DEFAULT_LAUNCH_PRESETS;
+
+  // --- theme + font (persisted; ThemeSheet is pure presentation) ---
+  const BASE_SURFACE: TerminalSurface = {
+    agent: '#7dffa0', tbg: '#101014', tstage: '#0a0a0d', tfg: '#e6e6e6',
+    hud: 'rgba(16,16,20,.95)', hudFg: '#e6e6e6', hudLine: '#34343a',
+    badge: '#1a1a1a', badgeFg: '#e6e6e6', xterm: {},
+  };
+  const THEME_SWATCHES = ['#101014', '#000000', '#0b1c3d', '#b34700', '#f5f0e8', '#e6e6e6'];
+  let bg = $state('#101014');
+  let fontPx = $state(13);
+  let themeOpen = $state(false);
+  let customBg = $state('#101014');
+  let surface = $derived(deriveSurface(bg, BASE_SURFACE));
+  let termPalette = $derived<AnsiPalette>((() => {
+    const x = surface.xterm;
+    const b = [...PALETTE.base];
+    b[0] = x.black ?? b[0]; b[7] = x.white ?? b[7];
+    const idx = { red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6 } as const;
+    for (const [k, i] of Object.entries(idx)) {
+      if (x[k]) { b[i] = x[k]; b[i + 8] = x[('bright' + k[0].toUpperCase() + k.slice(1))] ?? x[k]; }
+    }
+    if (x.brightBlack) b[8] = x.brightBlack;
+    return { base: b, defaultFg: surface.tfg, defaultBg: surface.tbg };
+  })());
+  function setBg(hex: string) {
+    bg = hex; customBg = hex;
+    try { localStorage.setItem('thumbmux-bg', hex); } catch {}
+  }
+  function setFont(next: number) {
+    fontPx = Math.max(11, Math.min(18, next));
+    try { localStorage.setItem('thumbmux-font', String(fontPx)); } catch {}
+  }
 
   let view = $state<{ kind: 'hub' } | { kind: 'term'; name: string }>({ kind: 'hub' });
   let names = $state<string[]>([]);
@@ -66,9 +99,16 @@
     { id: 'type', label: '⌨ Type', onTap: () => { slotsOpen = false; composerRef?.openDock(); } },
     { id: 'upload', label: uploading ? '⏳ Uploading…' : '📎 Attach files', testid: 'demo-upload', onTap: () => { slotsOpen = false; uploadRef?.open(); } },
     { id: 'dpad', label: '✛ Arrows', onTap: () => { dpadOpen = !dpadOpen; slotsOpen = false; } },
+    { id: 'theme', label: '🎨 Theme', testid: 'demo-theme', onTap: () => { themeOpen = true; slotsOpen = false; } },
+    { id: 'font-up', label: 'A+ Bigger text', onTap: () => setFont(fontPx + 1) },
+    { id: 'font-down', label: 'A− Smaller text', onTap: () => setFont(fontPx - 1) },
   ]);
 
   onMount(() => {
+    try {
+      const b = localStorage.getItem('thumbmux-bg'); if (b) { bg = b; customBg = b; }
+      const f = Number(localStorage.getItem('thumbmux-font')); if (f >= 11 && f <= 18) fontPx = f;
+    } catch {}
     unsubSessions = tmuxMux.onSessions((rows: any[]) => {
       names = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
     });
@@ -104,9 +144,14 @@
     class="stage"
     style:--dock-inset={dockInset > 0 ? `${dockInset}px` : null}
     style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
+    style:--agent={surface.agent} style:--tbg={surface.tbg} style:--tstage={surface.tstage}
+    style:--tfg={surface.tfg} style:--hud={surface.hud} style:--hud-fg={surface.hudFg}
+    style:--hud-line={surface.hudLine}
   >
     <div class="host">
-      <TermView {session} palette={PALETTE} bottomInsetPx={dockInset + kbInset} onTap={() => composerRef?.openDock()} />
+      {#key `${bg}|${fontPx}`}
+        <TermView {session} palette={termPalette} {fontPx} bottomInsetPx={dockInset + kbInset} onTap={() => composerRef?.openDock()} />
+      {/key}
     </div>
     <TermHud
       chip="TMUX"
@@ -116,11 +161,24 @@
     />
     <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
     <DpadSheet bind:open={dpadOpen} onKey={(seq) => tmuxMux.sendKeys(session, seq)} />
+    <ThemeSheet
+      bind:open={themeOpen}
+      bind:customBg
+      title="THEME"
+      mode={luminance(bg) > 0.55 ? 'light' : 'dark'}
+      onToggleMode={(m) => setBg(m === 'light' ? '#f5f0e8' : '#101014')}
+      swatchLabel="Background"
+      swatches={THEME_SWATCHES}
+      currentBg={bg}
+      defaultBg="#101014"
+      onPick={setBg}
+      onReset={() => setBg('#101014')}
+    />
     <UploadAction
       bind:this={uploadRef}
       bind:busy={uploading}
-      onUploaded={(message) => { composeText = message; composerRef?.openDock(); }}
-      onError={(m) => { composeText = `Upload failed: ${m}`; composerRef?.openDock(); }}
+      onUploaded={(message) => { composeText = message; composerRef?.openCompose(); }}
+      onError={(m) => { composeText = `Upload failed: ${m}`; composerRef?.openCompose(); }}
     />
     <ComposerDock
       bind:this={composerRef}

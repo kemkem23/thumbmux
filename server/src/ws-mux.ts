@@ -125,7 +125,10 @@ export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
   pollBurstMs?: number;       // default 100 (10 FPS after keystroke)
   burstDurationMs?: number;   // default 5000
   sessionListIntervalMs?: number; // default 5000
-  pipeReconcileMs?: number;   // default 10000
+  pipeReconcileMs?: number;
+  /** unpiped sessions: max ms between reconcile captures when the
+   * (second-resolution) tmux activity gate reports no change */
+  pollReconcileMs?: number;   // default 3000
   log?: (...args: unknown[]) => void;
   logError?: (...args: unknown[]) => void;
 };
@@ -144,6 +147,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private BURST_DURATION: number;
   private SESSION_LIST_INTERVAL: number;
   private PIPE_RECONCILE_INTERVAL: number;
+  private POLL_RECONCILE: number;
   private INITIAL_CAPTURE_START_LINE: number;
   private DEFAULT_CAPTURE_START_LINE: number;
   private log: (...args: unknown[]) => void;
@@ -191,6 +195,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.BURST_DURATION = opts.burstDurationMs ?? 5000;
     this.SESSION_LIST_INTERVAL = opts.sessionListIntervalMs ?? 5000;
     this.PIPE_RECONCILE_INTERVAL = opts.pipeReconcileMs ?? 10_000;
+    this.POLL_RECONCILE = opts.pollReconcileMs ?? 3000;
     this.INITIAL_CAPTURE_START_LINE = -Math.min(250, this.liveLineLimit);
     this.DEFAULT_CAPTURE_START_LINE = -this.liveLineLimit;
     this.currentRate = this.POLL_NORMAL;
@@ -798,7 +803,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
         // Skip capture if activity timestamp hasn't changed (session is idle)
         if (currentActivity !== undefined && previousActivity !== undefined && currentActivity <= previousActivity) {
-          continue;
+          // …but not forever: tmux activity stamps are SECOND-resolution and
+          // can miss same-second writes entirely, so unpiped sessions also get
+          // a low-frequency reconcile capture (hash dedupe makes a truly idle
+          // pane cost one capture per interval, zero bytes on the wire).
+          const lastCap = this.lastReconcileCapture.get(session) ?? 0;
+          if (nowMs - lastCap < this.POLL_RECONCILE) continue;
         }
 
         // Update stored activity (new sessions or changed sessions)

@@ -141,6 +141,22 @@ describe("thumbmux protocol conformance", () => {
     expect(combined.cursor).not.toBeNull();
   }, 15000);
 
+  test("out-of-band pane writes reach a tail-only viewer (hub thumbnail liveness)", async () => {
+    // The regression this pins: session_activity FREEZES for detached
+    // sessions, so a driver keyed on it starves the poll gate and an
+    // already-open hub thumbnail never updates. window_activity + the
+    // unpiped reconcile capture must deliver the update even though the
+    // write bypasses the mux entirely (docker exec / another terminal).
+    const ws = new FakeWS();
+    mux.handleMessage({ type: "subscribe", session: SES, tail: 8 }, ws as any);
+    await until(() => ws.frames("output", SES).length > 0);
+    const marker = `oob${Date.now()}`;
+    Bun.spawnSync(["tmux", "send-keys", "-t", SES, "-l", "--", `echo ${marker}`]);
+    Bun.spawnSync(["tmux", "send-keys", "-t", SES, "Enter"]);
+    await until(() => ws.frames("output", SES).some((m) => String(m.data).includes(marker)), 8000);
+    mux.unsubscribeAll(ws as any);
+  }, 30000);
+
   test("stop() tears every timer down", () => {
     const throwaway = new TmuxWsMux({ driver, pollNormalMs: 50 });
     const ws = new FakeWS();

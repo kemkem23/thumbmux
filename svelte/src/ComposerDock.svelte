@@ -111,6 +111,14 @@
     }
   }
 
+  /** Open showing the COMPOSE field regardless of the current mode — for
+   * programmatic prefills (upload messages): in DIRECT there is no visible
+   * input, so a prefilled message would be invisible (fleet finding). */
+  export function openCompose() {
+    flushSync(() => { mode = 'compose'; });
+    openDock();
+  }
+
   export function closeDock() {
     open = false;
     // The ghost input is invisible — left focused it would keep the OS
@@ -247,14 +255,14 @@
   .sheet.kb { padding-bottom: 10px; }
   .modes { display: flex; align-items: center; gap: 0; margin-bottom: 8px; }
   .mode-btn {
-    min-height: 36px; padding: 0 14px;
+    min-height: 44px; padding: 0 14px;
     border: 1px solid var(--hud-line); background: transparent; color: var(--hud-fg);
     opacity: .65; font: 700 10px var(--font-mono); letter-spacing: .06em; touch-action: manipulation;
   }
   .mode-btn + .mode-btn { border-left: none; }
   .mode-btn.on { background: var(--agent); color: var(--tstage); border-color: var(--agent); opacity: 1; }
   .mode-hint { margin-left: 10px; font: 600 10.5px var(--font-thai); color: var(--hud-fg); opacity: .65; line-height: 1.5; }
-  .close { margin-left: auto; min-width: 38px; min-height: 36px; background: none; border: 1px solid var(--hud-line); color: var(--hud-fg); font: 700 13px var(--font-mono); touch-action: manipulation; }
+  .close { margin-left: auto; min-width: 44px; min-height: 44px; background: none; border: 1px solid var(--hud-line); color: var(--hud-fg); font: 700 13px var(--font-mono); touch-action: manipulation; }
   .crow { display: flex; align-items: flex-end; }
   .crow textarea {
     flex: 1; min-height: 46px; max-height: 142px;
