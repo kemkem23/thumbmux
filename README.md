@@ -55,7 +55,7 @@ lines render into a virtualized DOM window, and a flick is a `translate3d`
 update — no reparse, no repaint of terminal cells — so scrolling runs at
 whatever refresh rate your display has. You get **real text selection** (it's
 real DOM), momentum and rubber-band physics tuned to feel like iOS — and older
-scrollback streams in as you pull down.
+scrollback streams in as you pull down — unlimited when the host wires a history archive; the bare demo serves tmux's live window (~2,000 lines).
 
 **URLs are tappable** — including URLs that wrap across lines mid-output.
 In the shot above, the coverage link spans two pane lines; both fragments are

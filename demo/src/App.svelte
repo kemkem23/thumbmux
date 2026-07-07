@@ -212,7 +212,11 @@
   .stage {
     --agent: #7dffa0; --tbg: #101014; --tstage: #0a0a0d; --tfg: #e6e6e6;
     --hud: rgba(16,16,20,.95); --hud-fg: #e6e6e6; --hud-line: #34343a;
-    position: fixed; inset: 0; height: 100dvh; overflow: hidden;
+    /* clip, NOT hidden: sheets parked at translateY(105%) make the stage's
+       scrollable-overflow region taller than the viewport, and focus/caret
+       moves can then SCROLL the "unscrollable" fixed stage (hud measured at
+       top:-177 in fleet round 5). overflow:clip forbids all scrolling. */
+    position: fixed; inset: 0; height: 100dvh; overflow: clip;
     background: var(--tstage); font-family: var(--font-mono);
   }
   .host {
