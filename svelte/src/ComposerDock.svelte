@@ -43,6 +43,7 @@
     onSend,
     onDirectText,
     onDirectKey,
+    onPasteFiles,
     labels = {
       compose: 'COMPOSE',
       direct: 'DIRECT',
@@ -63,11 +64,22 @@
     onSend: (text: string) => void;
     onDirectText: (data: string) => void;
     onDirectKey: (seq: string) => void;
+    /** clipboard paste carrying FILES (screenshots, photos) — wire it to
+     * UploadAction.uploadFiles() for paste-a-picture → upload → prefill.
+     * Text pastes are untouched. */
+    onPasteFiles?: (files: File[]) => void;
     labels?: ComposerLabels;
   } = $props();
 
   let sheetH = $state(0);
   let safeBottom = $state(0);
+
+  function handlePaste(e: ClipboardEvent) {
+    const files = Array.from(e.clipboardData?.files ?? []);
+    if (files.length === 0 || !onPasteFiles) return; // plain text paste — default behavior
+    e.preventDefault();
+    onPasteFiles(files);
+  }
   let directInputEl = $state<HTMLInputElement | null>(null);
   let composeEl = $state<HTMLTextAreaElement | null>(null);
 
@@ -215,6 +227,7 @@
     data-testid="ghost-key"
     oninput={directInput}
     onkeydown={directKeydown}
+    onpaste={handlePaste}
     aria-label={labels.directAria}
     autocomplete="off"
     autocapitalize="off"
@@ -227,6 +240,7 @@
         bind:value={text}
         oninput={autoGrow}
         onkeydown={composeKeydown}
+        onpaste={handlePaste}
         rows="1"
         placeholder={labels.placeholder}
         lang="th"

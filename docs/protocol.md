@@ -69,6 +69,14 @@ hostile filenames cannot escape the upload dir. Oversized → `413`; malformed f
 `formatUploadMessage` turns the response into the composer prefill
 (`Uploaded "orig" → dir/stored`, one line per file).
 
+## Preferences endpoint (createPrefsHandler)
+
+`GET /api/prefs` → the whole prefs JSON (`{}` before first save). `PUT` (or POST) with a
+JSON object → shallow merge-patch (top-level keys replace), persisted with an atomic
+tmp+rename write; returns the merged result. `400` malformed/non-object, `413` >256 KB,
+`405` otherwise. Pair with `createServerPrefs()` from @thumbmux/svelte (localStorage
+cache + optimistic saves).
+
 ## Deployment notes
 
 - **HTTP/2 and the WS upgrade:** WebSocket's `Upgrade` header does not exist

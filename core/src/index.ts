@@ -17,3 +17,5 @@ export * from './protocol';
 export * from './launch';
 export * from './upload';
 export * from './cells';
+export * from './copy';
+export * from './prefs';

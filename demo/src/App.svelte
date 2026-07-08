@@ -3,9 +3,13 @@
    * One Bun process serves this page, the WebSocket mux, and the spawn API. */
   import {
     SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab, ThemeSheet, UploadAction,
+    ShortcutBar, ShortcutsSheet, NotePanel, PromptsPanel, createLocalPrefs,
     tmuxMux, type GridSession, type FabAction,
   } from '@thumbmux/svelte';
-  import { DEFAULT_LAUNCH_PRESETS, deriveSurface, luminance, type TerminalSurface, type LaunchSpec, type AnsiPalette } from '@thumbmux/core';
+  import {
+    DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, deriveSurface, luminance, extractRecentPrompts,
+    type TerminalSurface, type LaunchSpec, type AnsiPalette, type Shortcut,
+  } from '@thumbmux/core';
   import { onMount, onDestroy } from 'svelte';
 
   const PALETTE: AnsiPalette = {
@@ -25,10 +29,17 @@
     badge: '#1a1a1a', badgeFg: '#e6e6e6', xterm: {},
   };
   const THEME_SWATCHES = ['#101014', '#000000', '#0b1c3d', '#b34700', '#f5f0e8', '#e6e6e6'];
+  const prefs = createLocalPrefs('thumbmux-demo-prefs');
   let bg = $state('#101014');
   let fontPx = $state(13);
   let themeOpen = $state(false);
   let customBg = $state('#101014');
+  let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS);
+  let shortcutsOpen = $state(false);
+  let notes = $state<Record<string, string>>({});
+  let hudExpanded = $state(false);
+  let recentPrompts = $state<string[]>([]);
+  let termRef = $state<ReturnType<typeof TermView> | null>(null);
   let surface = $derived(deriveSurface(bg, BASE_SURFACE));
   let termPalette = $derived<AnsiPalette>((() => {
     const x = surface.xterm;
@@ -43,11 +54,19 @@
   })());
   function setBg(hex: string) {
     bg = hex; customBg = hex;
-    try { localStorage.setItem('thumbmux-bg', hex); } catch {}
+    prefs.save({ theme: { bg: hex } });
   }
   function setFont(next: number) {
     fontPx = Math.max(11, Math.min(18, next));
-    try { localStorage.setItem('thumbmux-font', String(fontPx)); } catch {}
+    prefs.save({ fontPx });
+  }
+  function setShortcuts(next: Shortcut[]) {
+    shortcuts = next;
+    prefs.save({ shortcuts: next });
+  }
+  function saveNote(session: string, text: string) {
+    notes = { ...notes, [session]: text };
+    prefs.save({ demoNotes: notes });
   }
 
   let view = $state<{ kind: 'hub' } | { kind: 'term'; name: string }>({ kind: 'hub' });
@@ -100,16 +119,20 @@
     { id: 'type', label: '⌨ Type', onTap: () => { slotsOpen = false; composerRef?.openDock(); } },
     { id: 'upload', label: uploading ? '⏳ Uploading…' : '📎 Attach files', testid: 'demo-upload', onTap: () => { slotsOpen = false; uploadRef?.open(); } },
     { id: 'dpad', label: '✛ Arrows', onTap: () => { dpadOpen = !dpadOpen; slotsOpen = false; } },
+    { id: 'copy', label: '⧉ Copy screen', testid: 'demo-copy', onTap: () => { slotsOpen = false; termRef?.copyAll(); } },
+    { id: 'shortcuts', label: '⚡ Shortcuts…', testid: 'demo-shortcuts', onTap: () => { shortcutsOpen = true; slotsOpen = false; } },
     { id: 'theme', label: '🎨 Theme', testid: 'demo-theme', onTap: () => { themeOpen = true; slotsOpen = false; } },
     { id: 'font-up', label: 'A+ Bigger text', onTap: () => setFont(fontPx + 1) },
     { id: 'font-down', label: 'A− Smaller text', onTap: () => setFont(fontPx - 1) },
   ]);
 
   onMount(() => {
-    try {
-      const b = localStorage.getItem('thumbmux-bg'); if (b) { bg = b; customBg = b; }
-      const f = Number(localStorage.getItem('thumbmux-font')); if (f >= 11 && f <= 18) fontPx = f;
-    } catch {}
+    prefs.load().then((p) => {
+      const b = p.theme?.bg; if (typeof b === 'string') { bg = b; customBg = b; }
+      const f = Number(p.fontPx); if (f >= 11 && f <= 18) fontPx = f;
+      if (Array.isArray(p.shortcuts)) shortcuts = p.shortcuts as Shortcut[];
+      if (p.demoNotes && typeof p.demoNotes === 'object') notes = p.demoNotes as Record<string, string>;
+    });
     unsubSessions = tmuxMux.onSessions((rows: any[]) => {
       names = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
     });
@@ -144,6 +167,7 @@
   <div
     class="stage"
     style:--dock-inset={dockInset > 0 ? `${dockInset}px` : null}
+    style:--dock-full={dockFull > 0 ? `${dockFull}px` : null}
     style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
     style:--agent={surface.agent} style:--tbg={surface.tbg} style:--tstage={surface.tstage}
     style:--tfg={surface.tfg} style:--hud={surface.hud} style:--hud-fg={surface.hudFg}
@@ -151,16 +175,42 @@
   >
     <div class="host" style:top={`${hudHeight}px`}>
       {#key `${bg}|${fontPx}`}
-        <TermView {session} palette={termPalette} {fontPx} bottomInsetPx={dockInset + kbInset} onTap={() => composerRef?.openDock()} />
+        <TermView
+          bind:this={termRef}
+          {session} palette={termPalette} {fontPx}
+          bottomInsetPx={dockInset + kbInset}
+          onTap={() => composerRef?.openDock()}
+          onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
+        />
       {/key}
     </div>
+    {#snippet hudPanel()}
+      <NotePanel
+        note={notes[session] ?? ''}
+        onSave={(t) => saveNote(session, t)}
+      />
+      <div style="height:10px"></div>
+      <PromptsPanel
+        prompts={recentPrompts}
+        onPick={(pr) => { composeText = pr; hudExpanded = false; composerRef?.openCompose(); }}
+      />
+    {/snippet}
     <TermHud
       chip="TMUX"
       title={session}
       status="live"
       bind:barHeight={hudHeight}
+      bind:expanded={hudExpanded}
+      panel={hudPanel}
       onBack={() => { composerRef?.closeDock(); view = { kind: 'hub' }; }}
     />
+    <ShortcutBar
+      {shortcuts}
+      visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen}
+      onSend={(sc) => { tmuxMux.sendKeys(session, sc.send); if (sc.submit !== false) setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
+      onManage={() => (shortcutsOpen = true)}
+    />
+    <ShortcutsSheet bind:open={shortcutsOpen} {shortcuts} onChange={setShortcuts} />
     <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
     <DpadSheet bind:open={dpadOpen} onKey={(seq) => tmuxMux.sendKeys(session, seq)} />
     <ThemeSheet
@@ -191,6 +241,7 @@
       onSend={(text) => { tmuxMux.sendKeys(session, text); setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
       onDirectText={(d) => tmuxMux.sendKeys(session, d)}
       onDirectKey={(seq) => tmuxMux.sendKeys(session, seq)}
+      onPasteFiles={(files) => uploadRef?.uploadFiles(files)}
     />
   </div>
 {/if}

@@ -11,3 +11,4 @@
 export * from './ws-mux';
 export * from './bun-driver';
 export * from './upload-handler';
+export * from "./prefs-handler";

@@ -21,3 +21,8 @@ export { default as SessionThumb } from './SessionThumb.svelte';
 export { default as SessionGrid, type GridSession } from './SessionGrid.svelte';
 export { default as LaunchSheet, type LaunchContext } from './LaunchSheet.svelte';
 export { default as UploadAction } from './UploadAction.svelte';
+export { default as ShortcutBar } from './ShortcutBar.svelte';
+export { default as ShortcutsSheet } from './ShortcutsSheet.svelte';
+export { default as NotePanel } from './NotePanel.svelte';
+export { default as PromptsPanel } from './PromptsPanel.svelte';
+export { createLocalPrefs, createServerPrefs } from './prefs.svelte';

@@ -21,7 +21,7 @@
     type AnsiPalette, type SgrState, type LineLinkRange,
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
-    prefixForCells, stripAnsi,
+    prefixForCells, stripAnsi, paneTextForCopy,
   } from '@thumbmux/core';
 
   let {
@@ -98,6 +98,42 @@
   let pendingDragPx = 0;
   let dragFrame: number | null = null;
   let pendingContent: string | null = null;
+
+  /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
+   * clipboard. Falls back to a hidden-textarea execCommand copy for
+   * non-secure origins (plain http on a LAN), where navigator.clipboard
+   * does not exist. Returns success. */
+  export async function copyAll(): Promise<boolean> {
+    return copyText(paneTextForCopy(rawLines));
+  }
+
+  /** Copy the current native text selection (or nothing → false). */
+  export async function copySelection(): Promise<boolean> {
+    const sel = typeof window !== 'undefined' ? window.getSelection?.() : null;
+    const text = sel && !sel.isCollapsed ? sel.toString() : '';
+    if (!text) return false;
+    return copyText(text);
+  }
+
+  async function copyText(text: string): Promise<boolean> {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch { /* fall through to the legacy path */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch { return false; }
+  }
 
   export function isScrolledUp(): boolean {
     return bottomOffsetPx > lineH;

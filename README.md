@@ -88,6 +88,35 @@ The part you can't see: none of this ever resizes the underlying tmux pane.
 Insets are computed against each host element's closed-state baseline so the
 math cancels exactly — other viewers of the same session never see a reflow.
 
+### Shortcut chips + a manager to edit them
+
+One-tap prompt chips above the composer ("continue", "run it", or your own in any
+language) — add, edit, reorder and delete them in a built-in ShortcutsSheet, persisted
+through the same preferences adapter as everything else.
+
+### Paste a picture, get it uploaded
+
+Paste an image into the composer (COMPOSE or DIRECT) and it rides the same upload
+pipeline as the attach button: stored with a sanitized name, composer prefilled with
+the paths, ready to send.
+
+### Session notes + recent prompts, one tap away
+
+Tap the session title: a panel drops with the session's note (edit in place; hosts can
+add actions like "distill with an LLM") and the last prompts extracted from the pane —
+tap one to prefill the composer for edit/resend.
+
+### Copy the screen like a text file
+
+One action copies the visible buffer — ANSI stripped, grid padding trimmed — via the
+clipboard API, with a fallback for plain-http LAN hosts.
+
+### Preferences that follow you
+
+Theme, font size, shortcuts and notes live behind a tiny PreferencesAdapter: localStorage
+for the demo, or a server-backed JSON file (`createPrefsHandler`) so your phone and
+laptop stay in sync.
+
 ### Attach files from your phone
 
 <p align="center"><img src="docs/media/upload.png" width="390" alt="Composer prefilled with uploaded file paths, ready to send to the agent" /></p>

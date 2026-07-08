@@ -29,9 +29,19 @@
     inputEl?.click();
   }
 
+  /** Programmatic path — clipboard-pasted images, drag-and-drop, share
+   * targets: same upload + prefill flow as the picker. */
+  export async function uploadFiles(files: File[] | FileList) {
+    await doUpload(Array.from(files));
+  }
+
   async function onChange() {
     const files = Array.from(inputEl?.files ?? []);
     if (inputEl) inputEl.value = '';
+    await doUpload(files);
+  }
+
+  async function doUpload(files: File[]) {
     if (files.length === 0) return;
     busy = true;
     try {
