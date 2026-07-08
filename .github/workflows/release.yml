@@ -27,6 +27,9 @@ jobs:
           # (which always runs prepare for git deps, unlike bun) doesn't try
           # to rebuild in consumer environments that lack bun/devDeps.
           npm pkg delete scripts.prepare
+          # npm packs git deps honoring .gitignore unless a files whitelist
+          # exists — without this, the committed dists never reach consumers.
+          npm pkg set files='["core","server","svelte","docs"]' --json
           git add -f core/dist server/dist svelte/dist package.json
           git commit -m "release: ${GITHUB_REF_NAME} + built dists (prepare stripped)"
           git tag "${GITHUB_REF_NAME}-dist"
