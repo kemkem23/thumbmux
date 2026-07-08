@@ -2,7 +2,7 @@
   /** thumbmux demo — hub of your local tmux sessions + a full terminal view.
    * One Bun process serves this page, the WebSocket mux, and the spawn API. */
   import {
-    SessionGrid, LaunchSheet, TermView, TermHud, ComposerDock, DpadSheet, ActionFab, ThemeSheet, UploadAction,
+    SessionGrid, LaunchSheet, TermView, DesktopKeys, TermHud, ComposerDock, DpadSheet, ActionFab, ThemeSheet, UploadAction,
     ShortcutBar, ShortcutsSheet, NotePanel, PromptsPanel, createLocalPrefs,
     tmuxMux, type GridSession, type FabAction,
   } from '@thumbmux/svelte';
@@ -93,8 +93,53 @@
   let shortcutBarH = $state(0);
   let uploading = $state(false);
   let composeText = $state('');
+  let isDesktop = $state(false);
+  let desktopKeysFocused = $state(false);
 
   let unsubSessions: (() => void) | null = null;
+  let unsubDesktopGate: (() => void) | null = null;
+  let unsubSessionUrl: (() => void) | null = null;
+
+  function sendKeysTo(session: string) {
+    return (data: string) => tmuxMux.sendKeys(session, data);
+  }
+
+  function sessionFromUrl(): string | null {
+    const url = new URL(window.location.href);
+    const value = url.searchParams.get('session');
+    return value && value.trim() ? value.trim() : null;
+  }
+
+  function setSessionUrl(name: string | null) {
+    const url = new URL(window.location.href);
+    if (name) url.searchParams.set('session', name);
+    else url.searchParams.delete('session');
+    history.replaceState(null, '', url);
+  }
+
+  function openSession(name: string) {
+    view = { kind: 'term', name };
+    setSessionUrl(name);
+  }
+
+  function showHub() {
+    composerRef?.closeDock();
+    view = { kind: 'hub' };
+    setSessionUrl(null);
+  }
+
+  function blurDesktopKeys() {
+    desktopKeysFocused = false;
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return;
+    const root = active.closest('.desktop-keys');
+    if (root instanceof HTMLElement) root.blur();
+  }
+
+  function setDesktopGate(next: boolean) {
+    if (isDesktop && !next) blurDesktopKeys();
+    isDesktop = next;
+  }
 
   async function launch(spec: LaunchSpec) {
     launching = true;
@@ -108,7 +153,7 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       launchOpen = false;
-      view = { kind: 'term', name: data.name };
+      openSession(String(data.name));
     } catch (e: any) {
       launchError = String(e?.message ?? e);
     } finally {
@@ -134,12 +179,29 @@
       if (Array.isArray(p.shortcuts)) shortcuts = p.shortcuts as Shortcut[];
       if (p.demoNotes && typeof p.demoNotes === 'object') notes = p.demoNotes as Record<string, string>;
     });
+    const initialSession = sessionFromUrl();
+    if (initialSession) view = { kind: 'term', name: initialSession };
+    const onPopState = () => {
+      const session = sessionFromUrl();
+      view = session ? { kind: 'term', name: session } : { kind: 'hub' };
+    };
+    window.addEventListener('popstate', onPopState);
+    unsubSessionUrl = () => window.removeEventListener('popstate', onPopState);
     unsubSessions = tmuxMux.onSessions((rows: any[]) => {
       names = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
     });
+    const query = window.matchMedia('(min-width: 1024px)');
+    setDesktopGate(query.matches);
+    const onChange = (event: MediaQueryListEvent) => setDesktopGate(event.matches);
+    query.addEventListener('change', onChange);
+    unsubDesktopGate = () => query.removeEventListener('change', onChange);
   });
 
-  onDestroy(() => unsubSessions?.());
+  onDestroy(() => {
+    unsubSessions?.();
+    unsubDesktopGate?.();
+    unsubSessionUrl?.();
+  });
 </script>
 
 {#if view.kind === 'hub'}
@@ -148,7 +210,7 @@
     <SessionGrid
       sessions={gridSessions}
       palette={PALETTE}
-      onOpen={(name) => (view = { kind: 'term', name })}
+      onOpen={openSession}
       onNew={() => { launchError = null; launchOpen = true; }}
       emptyLabel="No tmux sessions yet — tap + terminal"
     />
@@ -165,6 +227,7 @@
   </div>
 {:else}
   {@const session = view.name}
+  {@const sendKeys = sendKeysTo(session)}
   <div
     class="stage"
     style:--dock-inset={dockInset > 0 ? `${dockInset}px` : null}
@@ -176,13 +239,30 @@
   >
     <div class="host" style:top={`${hudHeight}px`}>
       {#key `${bg}|${fontPx}`}
-        <TermView
-          bind:this={termRef}
-          {session} palette={termPalette} {fontPx}
-          bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
-          onTap={() => composerRef?.openDock()}
-          onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
-        />
+        {#if isDesktop}
+          <DesktopKeys bind:focused={desktopKeysFocused} onKeys={sendKeys} ariaLabel={`Terminal ${session}`}>
+            <TermView
+              bind:this={termRef}
+              {session} palette={termPalette} {fontPx}
+              bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
+              claimGeometry={true}
+              altScreenMouse={false}
+              onKeys={sendKeys}
+              onTap={() => composerRef?.openDock()}
+              onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
+            />
+          </DesktopKeys>
+        {:else}
+          <TermView
+            bind:this={termRef}
+            {session} palette={termPalette} {fontPx}
+            bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
+            claimGeometry={true}
+            altScreenMouse={false}
+            onTap={() => composerRef?.openDock()}
+            onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
+          />
+        {/if}
       {/key}
     </div>
     {#snippet hudPanel()}
@@ -203,7 +283,7 @@
       bind:barHeight={hudHeight}
       bind:expanded={hudExpanded}
       panel={hudPanel}
-      onBack={() => { composerRef?.closeDock(); view = { kind: 'hub' }; }}
+      onBack={showHub}
     />
     <ShortcutBar
       bind:barHeight={shortcutBarH}
@@ -279,5 +359,10 @@
     position: absolute; top: 0; left: 0; right: 0;
     bottom: calc(var(--dock-inset, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom, 0px));
     background: var(--tbg);
+  }
+  .host :global(.desktop-keys) {
+    position: absolute;
+    inset: 0;
+    color: var(--tfg);
   }
 </style>

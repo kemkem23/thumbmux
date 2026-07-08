@@ -16,6 +16,11 @@ terminal we tried treats the phone as a tiny desktop — pinch, squint, mis-tap,
 rage. thumbmux treats the phone as the primary device: one-thumb controls,
 native scroll physics, and a keyboard that never fights the layout.
 
+It also grows up cleanly on desktop: click a terminal, type straight into the
+pane, select real DOM text, copy with the browser, paste through bracketed
+paste, and let full-screen TUIs receive SGR mouse clicks and wheel events when
+they ask for them.
+
 ## A hub of every terminal you're running
 
 <p align="center"><img src="docs/media/hub.png" width="420" alt="Session hub: a grid of live terminal miniatures plus a + terminal card" /></p>
@@ -142,6 +147,25 @@ input holds focus, the OS keyboard rises, and **every keystroke streams
 straight into tmux**: text (IME-composed scripts like Thai included) via input
 events, Enter/Esc/Tab/arrows via keydown. It feels like typing *in* the
 terminal, because effectively you are.
+
+### Desktop input: real keys, real selection
+
+On a laptop, the same terminal can be direct: click the pane, get a thin focus
+ring, and your physical keyboard streams into tmux. Browser shortcuts stay
+browser shortcuts, so tab navigation, text selection, copy, and link clicks keep
+working like normal web text. Ctrl+C sends SIGINT only when there is no terminal
+selection; if you've selected output, the browser copies it.
+
+Paste is bracketed paste, including context-menu paste. Large or multi-line
+pastes can ask for confirmation before they hit the pane, and IME-composed text
+such as Thai/CJK characters is sent after composition finishes, not as broken
+keydown fragments.
+
+For full-screen TUIs that enable SGR mouse tracking, `TermView` can switch wheel
+and click handling from local scroll to terminal mouse sequences. Links still
+win over mouse forwarding, and read-only surfaces can opt out of focus, keys,
+resize, and SGR forwarding entirely. See [docs/desktop.md](docs/desktop.md) for
+the frozen desktop interaction contract.
 
 ### Re-theme the whole surface from one color
 
@@ -293,8 +317,8 @@ thumbmux/
 
 | package | what you get |
 |---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
-| **`thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `keyboardEventToSequence` desktop key mapping · `bracketedPaste` · SGR mouse helpers for alt-screen TUIs · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
+| **`thumbmux/svelte`** | `TermView` the compositor-scroll viewer with geometry ownership controls (`claimGeometry`) and optional alt-screen SGR mouse forwarding · `DesktopKeys` focus/key/paste wrapper for desktop terminals · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
 | **`thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation, with `createUploadHandler()` for turnkey file attachments. |
 
 ### What the server wiring looks like
@@ -327,12 +351,14 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
 
 ```svelte
 <script>
-  import { TermView, ComposerDock, tmuxMux } from 'thumbmux/svelte';
+  import { TermView, DesktopKeys, ComposerDock, tmuxMux } from 'thumbmux/svelte';
   const palette = {  // ANSI 0-15 + defaults — or derive one via @thumbmux/core
     base: ['#000','#f66','#6f6','#ff6','#66f','#f6f','#6ff','#eee',
            '#888','#f88','#8f8','#ff8','#88f','#f8f','#8ff','#fff'],
     defaultFg: '#e6e6e6', defaultBg: '#101014',
   };
+  const session = 'my-session';
+  const sendKeys = (data) => tmuxMux.sendKeys(session, data);
   let composer = $state();  // openDock() must run inside the tap's call stack
   let dockFull = $state(0), kbInset = $state(0);
 </script>
@@ -341,7 +367,16 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
      height (dockFull); hosts whose baseline is env(safe-area-inset-bottom)
      use dockInset instead — see ComposerDock's header comment -->
 <div class="viewport" style:bottom={`${dockFull + kbInset}px`}>
-  <TermView session="my-session" {palette} bottomInsetPx={dockFull + kbInset} />
+  <DesktopKeys onKeys={sendKeys} ariaLabel="Terminal input">
+    <TermView
+      {session}
+      {palette}
+      bottomInsetPx={dockFull + kbInset}
+      claimGeometry={true}
+      altScreenMouse={false}
+      onKeys={sendKeys}
+    />
+  </DesktopKeys>
 </div>
 
 <button class="type" onclick={() => composer?.openDock()}>⌨</button>
@@ -349,9 +384,9 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
 <ComposerDock
   bind:this={composer}
   bind:dockFull bind:kbInset
-  onSend={(text) => tmuxMux.sendKeys('my-session', text + '\r')}
-  onDirectText={(d) => tmuxMux.sendKeys('my-session', d)}
-  onDirectKey={(seq) => tmuxMux.sendKeys('my-session', seq)}
+  onSend={(text) => { sendKeys(text); sendKeys('\r'); }}
+  onDirectText={sendKeys}
+  onDirectKey={sendKeys}
 />
 
 <style>
@@ -383,6 +418,8 @@ The lessons are encoded in the components so you don't have to relearn them:
 - [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [x] Installable releases without npm: immutable `vX.Y.Z-dist` GitHub tags
       with prebuilt dists (works with bun/npm/pnpm/yarn)
+- [x] Desktop keyboard wrapper: click-to-focus, browser copy, bracketed paste,
+      IME composition, and optional SGR mouse forwarding for alt-screen TUIs
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite (`server/tests/`)
