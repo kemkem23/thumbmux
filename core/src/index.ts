@@ -7,6 +7,8 @@
  * prompt-scan     extract the user's submitted prompts from raw pane text
  * surface         derive a full readable surface from one background color
  * cells           terminal cell widths (Thai/CJK/emoji) → cursor column math
+ * keys            desktop KeyboardEvent → terminal byte sequences (+ bracketed paste)
+ * sgr-mouse       SGR mouse-forwarding math for alt-screen TUIs (wheel/click/hit-test)
  */
 export * from './ansi-html';
 export * from './terminal-link';
@@ -19,3 +21,5 @@ export * from './upload';
 export * from './cells';
 export * from './copy';
 export * from './prefs';
+export * from './keys';
+export * from './sgr-mouse';
