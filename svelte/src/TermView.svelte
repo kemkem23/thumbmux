@@ -733,6 +733,11 @@
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
   }
+  /* Inline vertical padding does not move line boxes — it only extends the
+     paintable/tappable area, lifting terminal links to a ~40px touch target
+     without disturbing the grid (fleet finding: 20px anchors). */
+  .mtv-line :global(a) { padding: 10px 0; margin: -10px 0; }
+
   .mtv-cursor {
     position: absolute;
     background: var(--tfg);

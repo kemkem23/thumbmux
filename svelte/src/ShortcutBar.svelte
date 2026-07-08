@@ -11,6 +11,7 @@
     onSend,
     onManage,
     manageLabel = '⚙',
+    barHeight = $bindable(0),
   }: {
     shortcuts?: Shortcut[];
     visible?: boolean;
@@ -21,13 +22,18 @@
     /** optional gear chip that opens the host's ShortcutsSheet */
     onManage?: () => void;
     manageLabel?: string;
+    /** measured rendered height (0 when hidden) — add it to TermView's
+     * bottomInsetPx so the chips never cover the last terminal rows */
+    barHeight?: number;
   } = $props();
 
   let shown = $derived(shortcuts.filter((s) => !s.agent || !agent || s.agent === agent));
+  let rendered = $derived(visible && (shown.length > 0 || !!onManage));
+  $effect(() => { if (!rendered) barHeight = 0; });
 </script>
 
-{#if visible && (shown.length > 0 || onManage)}
-  <div class="scbar" data-testid="shortcut-bar">
+{#if rendered}
+  <div class="scbar" bind:offsetHeight={barHeight} data-testid="shortcut-bar">
     {#each shown as s (s.id)}
       <button class="chip" onclick={() => onSend(s)} data-testid="shortcut-chip">{s.label}</button>
     {/each}

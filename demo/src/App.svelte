@@ -90,6 +90,7 @@
   let dpadOpen = $state(false);
   let uploadRef = $state<ReturnType<typeof UploadAction> | null>(null);
   let hudHeight = $state(0);
+  let shortcutBarH = $state(0);
   let uploading = $state(false);
   let composeText = $state('');
 
@@ -178,7 +179,7 @@
         <TermView
           bind:this={termRef}
           {session} palette={termPalette} {fontPx}
-          bottomInsetPx={dockInset + kbInset}
+          bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
           onTap={() => composerRef?.openDock()}
           onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
         />
@@ -205,6 +206,7 @@
       onBack={() => { composerRef?.closeDock(); view = { kind: 'hub' }; }}
     />
     <ShortcutBar
+      bind:barHeight={shortcutBarH}
       {shortcuts}
       visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen}
       onSend={(sc) => { tmuxMux.sendKeys(session, sc.send); if (sc.submit !== false) setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
