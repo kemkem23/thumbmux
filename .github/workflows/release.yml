@@ -1,0 +1,29 @@
+# Release rail: push a source tag vX.Y.Z → this builds dists, runs the full
+# test suite, and publishes an immutable vX.Y.Z-dist tag that consumers pin:
+#   "thumbmux": "github:kemkem23/thumbmux#vX.Y.Z-dist"
+# (bun blocks git-dep postinstall and skips workspace devDeps, so dists must
+# ship inside the tag — build-on-install does not work for git dependencies.)
+name: release-dist
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+permissions:
+  contents: write
+jobs:
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: bun install
+      - run: bun run build:packages
+      - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts
+      - name: commit dists and push ${GITHUB_REF_NAME}-dist
+        run: |
+          git config user.name "thumbmux-release"
+          git config user.email "noreply@github.com"
+          git add -f core/dist server/dist svelte/dist
+          git commit -m "release: ${GITHUB_REF_NAME} + built dists"
+          git tag "${GITHUB_REF_NAME}-dist"
+          git push origin "${GITHUB_REF_NAME}-dist"
