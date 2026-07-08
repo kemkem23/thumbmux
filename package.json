@@ -2,7 +2,7 @@
   "name": "thumbmux",
   "version": "0.2.3",
   "private": true,
-  "description": "tmux for thumbs \u2014 mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
+  "description": "tmux for thumbs — mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
   "workspaces": [
     "core",
     "svelte",
@@ -13,8 +13,7 @@
   "license": "MIT",
   "scripts": {
     "demo": "bun run --cwd demo start",
-    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build",
-    "prepare": "bun run build:packages"
+    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build"
   },
   "exports": {
     "./core": {
@@ -30,5 +29,11 @@
       "svelte": "./svelte/dist/index.js"
     },
     "./package.json": "./package.json"
-  }
+  },
+  "files": [
+    "core",
+    "server",
+    "svelte",
+    "docs"
+  ]
 }
