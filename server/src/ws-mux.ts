@@ -4,7 +4,7 @@
  * (pipe-pane dirty signals when available), dedupes by content hash, and
  * multiplexes output/history/session-list messages per channel.
  *
- * Direct port of kemcortex's battle-tested TmuxPoller with the host touches
+ * Direct port of the production host's battle-tested poller with the host touches
  * turned into injection points:
  *   driver    how to talk to tmux (capture/keys/resize/activity/history-limit)
  *   pipes     optional pipe-pane manager (dirty signals instead of polling)
@@ -391,7 +391,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   /** Handle resize. Browser-authoritative geometry for resizable profiles;
-   * the host's onResizeRequest hook may suppress the request (e.g. kemcortex's
+   * the host's onResizeRequest hook may suppress the request (e.g. a
    * mobile-first size arbiter). */
   handleResize(session: string, cols: number, rows: number, ws?: WS, client?: unknown) {
     this.hooks.onResizeTelemetry?.(session, ws ?? null, { cols, rows }, client);
@@ -461,7 +461,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   /** Route a parsed client message. Convenience for hosts whose WS handler
-   * is a thin switch — kemcortex keeps its own switch in web.ts instead.
+   * is a thin switch — hosts with richer routing keep their own switch instead.
    * Answers client keepalive pings: the @thumbmux/svelte client closes the
    * connection when a ping goes unanswered for 8s. */
   handleMessage(msg: MuxClientMessage, ws: WS) {

@@ -1,6 +1,6 @@
 /**
  * Cursor mapping vs driver capture semantics — the production bug class this
- * pins down: a driver whose capturePane TRIMS trailing blank lines (kemcortex
+ * pins down: a driver whose capturePane TRIMS trailing blank lines (the production host
  * does, for bandwidth) makes content-derived trailing-blank counts read 0, so
  * the caret was displaced UP by the pane's real blank bottom rows. The
  * captureWithCursor contract fixes it by having the driver count blanks on
@@ -55,7 +55,7 @@ function baseDriver(state: State): TmuxDriver {
   };
 }
 
-/** Trimming driver (kemcortex-style): content loses trailing blanks, but the
+/** Trimming driver (production-host-style): content loses trailing blanks, but the
  * atomic contract reports how many the raw capture had. */
 function atomicTrimmingDriver(state: State): TmuxDriver {
   return {

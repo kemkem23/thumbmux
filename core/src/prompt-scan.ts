@@ -2,7 +2,7 @@
  * Prompt scanning — pull the user's recently SUBMITTED prompts out of raw
  * pane text (with or without ANSI). Single source of truth: both the browser
  * UI and the server pipeline import from here (previously two hand-synced
- * copies: brain-ui/utils/terminal-prompts.ts + src/integrations/prompt-extract.ts).
+ * copies: one in the web client, one in the server integration layer).
  *
  * Core problem: the agent composer draws its placeholder / ghost suggestion /
  * hint behind the same ❯/› marker a real echoed prompt uses. Two signals

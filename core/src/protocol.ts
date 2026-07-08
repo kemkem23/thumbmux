@@ -51,7 +51,7 @@ export type MuxServerMessage = {
 export type MuxOutputType = "output" | "history" | "error" | "cursor";
 
 /** Optional descriptor a client attaches to its messages — the server may
- * feed it to policy hooks (kemcortex: terminal size arbiter + UX telemetry). */
+ * feed it to policy hooks (e.g. a terminal-size arbiter + UX telemetry). */
 export type MuxClientInfo = {
   href?: string;
   pathname?: string;

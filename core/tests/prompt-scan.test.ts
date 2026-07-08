@@ -8,7 +8,7 @@ describe("terminal prompt extraction", () => {
       "output before",
       "› # AUTO-FIX TASK · user report (autonomous mode)",
       "",
-      "  You are an auto-fix agent dispatched by the kemcortex orchestrator.",
+      "  You are an auto-fix agent dispatched by the host orchestrator.",
       "",
       "  ## User report",
       "  codex recent prompt header is wrong, investigate and fix",
@@ -59,7 +59,7 @@ describe("terminal prompt extraction", () => {
   // .claude/grok-snapshots/run1 (2026-06-05).
   test("extracts grok echoed prompts: indent ~5, trailing clock stripped, response not glued", () => {
     const prompts = extractRecentPrompts([
-      "   main ~/kemcortex/cortex-orchestrator                        │ 33K / 512K │",
+      "   main ~/work/orchestrator-app                        │ 33K / 512K │",
       "",
       "     ❯ Reply with exactly GROK_SMOKE_OK and nothing else.            1:43 PM",
       "",
