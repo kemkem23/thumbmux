@@ -406,6 +406,8 @@ type DesktopKeysProps = {
   ariaLabel?: string;                // default "Terminal input"
   pasteWarningLines?: number;        // default 6; <=0 disables line threshold
   pasteWarningBytes?: number;        // default 4096; <=0 disables byte threshold
+  altIsMeta?: boolean;               // default auto: false on macOS-like platforms
+                                     // (Option composes characters), true elsewhere
   onKeys: (data: string) => void;
   onFocusChange?: (focused: boolean) => void;
   confirmPaste?: (info: DesktopPasteInfo) => boolean | Promise<boolean>;

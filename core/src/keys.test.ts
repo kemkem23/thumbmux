@@ -53,6 +53,58 @@ describe('keyboardEventToSequence printable keys', () => {
   });
 });
 
+describe('keyboardEventToSequence AltGr and Option handling', () => {
+  const altGrCases: Array<[string, string]> = [
+    ['[', '['],
+    [']', ']'],
+    ['\\', '\\'],
+    ['@', '@'],
+    ['{', '{'],
+    ['}', '}'],
+    ['~', '~'],
+    ['|', '|'],
+  ];
+
+  for (const [key, expected] of altGrCases) {
+    test(`returns AltGr printable ${JSON.stringify(key)} verbatim`, () => {
+      expect(keyboardEventToSequence({ key, ctrlKey: true, altKey: true })).toBe(expected);
+    });
+  }
+
+  const optionPrintableCases: Array<[string, KeyLike, { altIsMeta?: boolean } | undefined, string]> = [
+    ['default Alt printable prefixes escape', { key: 'a', altKey: true }, undefined, '\x1ba'],
+    ['explicit altIsMeta=true prefixes escape', { key: 'å', altKey: true }, { altIsMeta: true }, '\x1bå'],
+    ['altIsMeta=false sends composed character verbatim', { key: 'å', altKey: true }, { altIsMeta: false }, 'å'],
+    [
+      'altIsMeta=false keeps shifted composed character verbatim',
+      { key: 'Í', altKey: true, shiftKey: true },
+      { altIsMeta: false },
+      'Í',
+    ],
+  ];
+
+  for (const [name, event, opts, expected] of optionPrintableCases) {
+    test(name, () => {
+      expect(keyboardEventToSequence(event, opts)).toBe(expected);
+    });
+  }
+
+  const optionNamedCases: Array<[string, KeyLike, string | null]> = [
+    ['Alt+Delete keeps Alt modifier when altIsMeta=false', { key: 'Delete', altKey: true }, '\x1b[3;3~'],
+    ['Alt+F2 keeps Alt modifier when altIsMeta=false', { key: 'F2', altKey: true }, '\x1b[1;3Q'],
+    ['Alt+ArrowLeft keeps Alt modifier when altIsMeta=false', { key: 'ArrowLeft', altKey: true }, '\x1b[1;3D'],
+    ['Alt+Backspace keeps Alt prefix when altIsMeta=false', { key: 'Backspace', altKey: true }, '\x1b\x7f'],
+    ['Alt+Enter keeps Alt prefix when altIsMeta=false', { key: 'Enter', altKey: true }, '\x1b\r'],
+    ['Alt+Tab stays browser-handled when altIsMeta=false', { key: 'Tab', altKey: true }, null],
+  ];
+
+  for (const [name, event, expected] of optionNamedCases) {
+    test(name, () => {
+      expect(keyboardEventToSequence(event, { altIsMeta: false })).toBe(expected);
+    });
+  }
+});
+
 describe('keyboardEventToSequence named keys', () => {
   const cases: Array<[string, KeyLike, string | null]> = [
     ['Enter', { key: 'Enter' }, '\r'],
@@ -68,6 +120,42 @@ describe('keyboardEventToSequence named keys', () => {
     ['End', { key: 'End' }, '\x1b[F'],
     ['PageUp', { key: 'PageUp' }, '\x1b[5~'],
     ['PageDown', { key: 'PageDown' }, '\x1b[6~'],
+  ];
+
+  for (const [name, event, expected] of cases) {
+    test(`maps ${name}`, () => {
+      expect(keyboardEventToSequence(event)).toBe(expected);
+    });
+  }
+});
+
+describe('keyboardEventToSequence modified named keys', () => {
+  const cases: Array<[string, KeyLike, string | null]> = [
+    ['Shift+Backspace', { key: 'Backspace', shiftKey: true }, '\x7f'],
+    ['Alt+Backspace', { key: 'Backspace', altKey: true }, '\x1b\x7f'],
+    ['Ctrl+Backspace', { key: 'Backspace', ctrlKey: true }, '\x08'],
+    ['Alt+Ctrl+Backspace', { key: 'Backspace', altKey: true, ctrlKey: true }, '\x1b\x08'],
+    ['Alt+Escape', { key: 'Escape', altKey: true }, '\x1b'],
+    ['Ctrl+Escape', { key: 'Escape', ctrlKey: true }, '\x1b'],
+    ['Shift+Delete', { key: 'Delete', shiftKey: true }, '\x1b[3;2~'],
+    ['Alt+Delete', { key: 'Delete', altKey: true }, '\x1b[3;3~'],
+    ['Ctrl+Delete', { key: 'Delete', ctrlKey: true }, '\x1b[3;5~'],
+    [
+      'Shift+Alt+Ctrl+Delete',
+      { key: 'Delete', shiftKey: true, altKey: true, ctrlKey: true },
+      '\x1b[3;8~',
+    ],
+    ['Alt+PageUp', { key: 'PageUp', altKey: true }, '\x1b[5;3~'],
+    ['Ctrl+PageUp', { key: 'PageUp', ctrlKey: true }, '\x1b[5;5~'],
+    ['Shift+PageUp', { key: 'PageUp', shiftKey: true }, '\x1b[5;2~'],
+    ['Alt+PageDown', { key: 'PageDown', altKey: true }, '\x1b[6;3~'],
+    ['Ctrl+PageDown', { key: 'PageDown', ctrlKey: true }, '\x1b[6;5~'],
+    ['Shift+Alt+PageDown', { key: 'PageDown', shiftKey: true, altKey: true }, '\x1b[6;4~'],
+    ['Alt+Insert', { key: 'Insert', altKey: true }, '\x1b[2;3~'],
+    ['Ctrl+Insert', { key: 'Insert', ctrlKey: true }, null],
+    ['Shift+Insert', { key: 'Insert', shiftKey: true }, null],
+    ['Shift+Alt+Insert', { key: 'Insert', shiftKey: true, altKey: true }, null],
+    ['Ctrl+Alt+Insert', { key: 'Insert', ctrlKey: true, altKey: true }, null],
   ];
 
   for (const [name, event, expected] of cases) {
@@ -130,6 +218,29 @@ describe('keyboardEventToSequence function keys', () => {
   }
 });
 
+describe('keyboardEventToSequence modified function keys', () => {
+  const cases: Array<[string, KeyLike, string]> = [
+    ['Shift+F1', { key: 'F1', shiftKey: true }, '\x1b[1;2P'],
+    ['Alt+F2', { key: 'F2', altKey: true }, '\x1b[1;3Q'],
+    ['Ctrl+F3', { key: 'F3', ctrlKey: true }, '\x1b[1;5R'],
+    ['Shift+Alt+Ctrl+F4', { key: 'F4', shiftKey: true, altKey: true, ctrlKey: true }, '\x1b[1;8S'],
+    ['Shift+F5', { key: 'F5', shiftKey: true }, '\x1b[15;2~'],
+    ['Alt+F6', { key: 'F6', altKey: true }, '\x1b[17;3~'],
+    ['Ctrl+F7', { key: 'F7', ctrlKey: true }, '\x1b[18;5~'],
+    ['Shift+Alt+Ctrl+F8', { key: 'F8', shiftKey: true, altKey: true, ctrlKey: true }, '\x1b[19;8~'],
+    ['Shift+F9', { key: 'F9', shiftKey: true }, '\x1b[20;2~'],
+    ['Alt+F10', { key: 'F10', altKey: true }, '\x1b[21;3~'],
+    ['Ctrl+F11', { key: 'F11', ctrlKey: true }, '\x1b[23;5~'],
+    ['Shift+Alt+F12', { key: 'F12', shiftKey: true, altKey: true }, '\x1b[24;4~'],
+  ];
+
+  for (const [name, event, expected] of cases) {
+    test(`maps ${name}`, () => {
+      expect(keyboardEventToSequence(event)).toBe(expected);
+    });
+  }
+});
+
 describe('keyboardEventToSequence control keys', () => {
   for (let i = 0; i < 26; i++) {
     const letter = String.fromCharCode(97 + i);
@@ -138,6 +249,18 @@ describe('keyboardEventToSequence control keys', () => {
 
     test(`maps Ctrl+${letter.toUpperCase()} to control byte ${i + 1}`, () => {
       expect(keyboardEventToSequence({ key, ctrlKey: true })).toBe(expected);
+    });
+  }
+
+  const ctrlShiftLetterCases: Array<[string, KeyLike, string]> = [
+    ['Ctrl+Shift+A', { key: 'A', ctrlKey: true, shiftKey: true }, '\x01'],
+    ['Ctrl+Shift+M', { key: 'M', ctrlKey: true, shiftKey: true }, '\r'],
+    ['Ctrl+Shift+Z', { key: 'Z', ctrlKey: true, shiftKey: true }, '\x1a'],
+  ];
+
+  for (const [name, event, expected] of ctrlShiftLetterCases) {
+    test(`maps ${name} to the same C0 byte as Ctrl+letter`, () => {
+      expect(keyboardEventToSequence(event)).toBe(expected);
     });
   }
 
@@ -152,6 +275,25 @@ describe('keyboardEventToSequence control keys', () => {
   for (const [name, event, expected] of punctuationCases) {
     test(`maps ${name}`, () => {
       expect(keyboardEventToSequence(event)).toBe(expected);
+    });
+  }
+
+  const digitCases: Array<[string, string | null]> = [
+    ['0', null],
+    ['1', null],
+    ['2', '\x00'],
+    ['3', '\x1b'],
+    ['4', '\x1c'],
+    ['5', '\x1d'],
+    ['6', '\x1e'],
+    ['7', '\x1f'],
+    ['8', '\x7f'],
+    ['9', null],
+  ];
+
+  for (const [key, expected] of digitCases) {
+    test(`maps Ctrl+${key} with the xterm digit table`, () => {
+      expect(keyboardEventToSequence({ key, ctrlKey: true })).toBe(expected);
     });
   }
 

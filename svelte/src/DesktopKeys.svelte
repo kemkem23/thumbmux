@@ -12,6 +12,10 @@
     ariaLabel?: string;
     pasteWarningLines?: number;
     pasteWarningBytes?: number;
+    /** Alt/Option+printable → ESC prefix (PC style). Default: auto — true
+     * everywhere except macOS-like platforms, where Option composes characters
+     * that should be sent verbatim. */
+    altIsMeta?: boolean;
     onKeys: (data: string) => void;
     onFocusChange?: (focused: boolean) => void;
     confirmPaste?: (info: DesktopPasteInfo) => boolean | Promise<boolean>;
@@ -32,6 +36,7 @@
     ariaLabel = 'Terminal input',
     pasteWarningLines = 6,
     pasteWarningBytes = 4096,
+    altIsMeta = undefined,
     onKeys,
     onFocusChange = undefined,
     confirmPaste = undefined,
@@ -41,6 +46,13 @@
   let rootEl = $state<HTMLDivElement | null>(null);
   let nativeFocused = $state(false);
   let composing = $state(false);
+
+  // macOS Option is a character-composition modifier (third-level shift), not
+  // Meta — Option-composed printables must be sent verbatim there.
+  const macLikePlatform =
+    typeof navigator !== 'undefined' &&
+    /mac|iphone|ipad|ipod/i.test(navigator.platform || (navigator as { userAgentData?: { platform?: string } }).userAgentData?.platform || '');
+  const effectiveAltIsMeta = () => altIsMeta ?? !macLikePlatform;
 
   function nodeInsideRoot(node: Node | null): boolean {
     return !!(node && rootEl && (node === rootEl || rootEl.contains(node)));
@@ -195,7 +207,7 @@
       return;
     }
 
-    const sequence = keyboardEventToSequence(e);
+    const sequence = keyboardEventToSequence(e, { altIsMeta: effectiveAltIsMeta() });
     if (sequence === null) return;
     collapseTerminalSelection();
     e.preventDefault();
