@@ -23,7 +23,11 @@ jobs:
         run: |
           git config user.name "thumbmux-release"
           git config user.email "noreply@github.com"
-          git add -f core/dist server/dist svelte/dist
-          git commit -m "release: ${GITHUB_REF_NAME} + built dists"
+          # dists ship prebuilt in this tag — drop the prepare script so npm
+          # (which always runs prepare for git deps, unlike bun) doesn't try
+          # to rebuild in consumer environments that lack bun/devDeps.
+          npm pkg delete scripts.prepare
+          git add -f core/dist server/dist svelte/dist package.json
+          git commit -m "release: ${GITHUB_REF_NAME} + built dists (prepare stripped)"
           git tag "${GITHUB_REF_NAME}-dist"
           git push origin "${GITHUB_REF_NAME}-dist"
