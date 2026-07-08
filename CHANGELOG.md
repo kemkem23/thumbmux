@@ -1,9 +1,9 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:kemkem23/thumbmux#v0.2.3-dist`.
+scripts): `thumbmux@github:kemkem23/thumbmux#v0.3.0-dist`.
 
-## v0.3.0 (unreleased)
+## v0.3.0 — 2026-07-08
 - Desktop keyboard input: `DesktopKeys` adds click-to-focus key routing,
   browser-native copy behavior, bracketed paste, paste warnings, and IME-safe
   composition handling.

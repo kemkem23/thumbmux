@@ -232,9 +232,9 @@ install works with **bun, npm, pnpm or yarn** — no build step, no lifecycle
 scripts, nothing to trust:
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.2.3-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.3.0-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.2.3-dist
+npm i    github:kemkem23/thumbmux#v0.3.0-dist
 ```
 
 Then import through the meta-package's export map:
@@ -275,7 +275,7 @@ reference `TmuxDriver` against your local tmux.
 **🤖 The agent way.** Paste this into Claude Code / Codex in your
 project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.2.3-dist` in this project,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.3.0-dist` in this project,
 > read its README (the repo is https://github.com/kemkem23/thumbmux), then
 > wire it in: mount `TmuxWsMux` from `thumbmux/server` on a `/ws/tmux`
 > WebSocket route with a driver for my tmux, and add a page using
