@@ -310,6 +310,16 @@ Rationale:
   `null`; the wrapper's composition flag is the caller-side belt-and-suspenders
   guard.
 
+Known limitation:
+
+- Layouts that type characters directly (Thai, Latin, Cyrillic, …) work fully:
+  each keystroke arrives as a printable `e.key` and is sent as-is.
+- Composed IME input (Japanese/Chinese/Korean candidate windows) does not
+  activate on a non-editable wrapper in current browsers, so composed text
+  cannot be typed straight into the pane. Users type composed text through the
+  composer (a real textarea) instead. The composition listeners above are kept
+  so the wrapper stays correct in browsers/agents that do fire them.
+
 ## 10. Links
 
 Terminal URLs remain DOM links on desktop.

@@ -2,6 +2,7 @@
  * @thumbmux/svelte — Svelte 5 pieces of the thumbmux terminal stack.
  *
  * TermView     compositor-only 120Hz terminal viewer (virtualized, translate3d)
+ * DesktopKeys  desktop keyboard/IME/paste wrapper (focusable, keys → pane bytes)
  * ComposerDock docked input sheet (COMPOSE/DIRECT + OS-keyboard-aware insets)
  * TermHud      pinned top bar with host-supplied expandable panel
  * DpadSheet    arrow/enter/escape pad for TUI menus
@@ -10,6 +11,11 @@
  * ws-mux       multiplexed WebSocket client (subscribe/keys/resize/history)
  */
 export { default as TermView } from './TermView.svelte';
+export {
+  default as DesktopKeys,
+  type DesktopKeysProps,
+  type DesktopPasteInfo,
+} from './DesktopKeys.svelte';
 export { default as ComposerDock, type ComposerLabels } from './ComposerDock.svelte';
 export { default as TermHud } from './TermHud.svelte';
 export { default as DpadSheet } from './DpadSheet.svelte';

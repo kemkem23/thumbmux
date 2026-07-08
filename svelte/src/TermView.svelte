@@ -22,6 +22,8 @@
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
     prefixForCells, stripAnsi, paneTextForCopy,
+    contentCellFromPoint, wheelEventToLines, centerContentCell,
+    sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
   } from '@thumbmux/core';
 
   let {
@@ -31,6 +33,9 @@
     minCols = 20,
     minRows = 15,
     bottomInsetPx = 0,
+    claimGeometry = true,
+    altScreenMouse = false,
+    onKeys = undefined,
     onTap = undefined,
     onLinesChange = undefined,
     onGeometryChange = undefined,
@@ -45,6 +50,9 @@
      * Geometry math adds it back so the tmux pane is NEVER resized by a
      * transient overlay — only the scroll pin follows the shorter viewport. */
     bottomInsetPx?: number;
+    claimGeometry?: boolean;
+    altScreenMouse?: boolean;
+    onKeys?: (data: string) => void;
     /** Fired on a CLEAN tap (short, low-movement, not a link, no selection) —
      * call your composer's openDock() here, synchronously, so iOS raises the
      * keyboard (gesture call stack). */
@@ -142,6 +150,14 @@
   export function scrollToBottom() {
     stopInertia();
     bottomOffsetPx = 0;
+    if (altScreenMouse) {
+      const geom = currentGeometry();
+      if (geom) {
+        const composerRows = Math.max(0, Math.ceil(bottomInsetPx / Math.max(1, lineH)));
+        const { cx, cy } = centerContentCell(geom, { composerRows });
+        sendSgr(sgrSnapToBottom(cx, cy));
+      }
+    }
     applyScroll();
     flushPendingContent();
     emitScrollState();
@@ -335,6 +351,10 @@
   }
 
   function onWheel(e: WheelEvent) {
+    if (altScreenMouse) {
+      forwardAltWheel(e);
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     const delta = -wheelPixels(e);
@@ -343,10 +363,80 @@
     if (delta > 0) maybeRequestOlderHistory();
   }
 
+  let warnedMissingKeys = false;
+  function warnMissingOnKeys() {
+    if (warnedMissingKeys) return;
+    warnedMissingKeys = true;
+    const meta = import.meta as unknown as { env?: { DEV?: boolean } };
+    if (meta.env?.DEV) {
+      console.warn('TermView altScreenMouse requires onKeys; SGR mouse action ignored.');
+    }
+  }
+
+  function sendSgr(data: string) {
+    if (!onKeys) {
+      warnMissingOnKeys();
+      return;
+    }
+    onKeys(data);
+  }
+
+  function currentGeometry(): { cols: number; rows: number } | null {
+    if ((lastPushedCols <= 0 || lastPushedRows <= 0) && viewportEl) {
+      measureGeometry({ force: true });
+    }
+    if (lastPushedCols <= 0 || lastPushedRows <= 0) return null;
+    return { cols: lastPushedCols, rows: lastPushedRows };
+  }
+
+  function contentHitArea(): {
+    rect: { left: number; top: number; width: number; height: number };
+    geom: { cols: number; rows: number };
+  } | null {
+    if (!viewportEl) return null;
+    const geom = currentGeometry();
+    if (!geom) return null;
+    const bounds = viewportEl.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return null;
+    const cellW = Math.max(1, charW || measureCharWidth());
+    const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
+    const gridH = Math.min(Math.max(1, bounds.height), geom.rows * lineH);
+    return {
+      rect: { left: bounds.left + 6, top: bounds.top, width: gridW, height: gridH },
+      geom,
+    };
+  }
+
+  function forwardAltWheel(e: WheelEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const area = contentHitArea();
+    if (!area) return;
+    const hit = contentCellFromPoint(e.clientX, e.clientY, area.rect, area.geom);
+    if (!hit) return;
+    const lines = wheelEventToLines(e.deltaY, e.deltaMode, lineH, area.geom.rows);
+    if (lines === 0) return;
+    const count = Math.min(DEFAULT_WHEEL_MAX_PER_CALL, Math.max(1, Math.ceil(Math.abs(lines))));
+    sendSgr(sgrWheel(lines > 0 ? 'up' : 'down', hit.cx, hit.cy, count));
+  }
+
   function updateSelectionActive() {
     const sel = typeof window !== 'undefined' ? window.getSelection() : null;
     selectionActive = !!(
-      sel && !sel.isCollapsed && sel.anchorNode && viewportEl?.contains(sel.anchorNode)
+      sel && !sel.isCollapsed && viewportEl && (
+        (sel.anchorNode && viewportEl.contains(sel.anchorNode)) ||
+        (sel.focusNode && viewportEl.contains(sel.focusNode))
+      )
+    );
+  }
+
+  function hasSelectionInView(): boolean {
+    const sel = typeof window !== 'undefined' ? window.getSelection?.() : null;
+    return !!(
+      sel && !sel.isCollapsed && viewportEl && (
+        (sel.anchorNode && viewportEl.contains(sel.anchorNode)) ||
+        (sel.focusNode && viewportEl.contains(sel.focusNode))
+      )
     );
   }
 
@@ -417,19 +507,85 @@
 
   let tapStart: { x: number; y: number; t: number } | null = null;
   let lastTouchEndAt = 0;
+  let altPointerStart: {
+    x: number;
+    y: number;
+    pointerId: number;
+    target: EventTarget | null;
+    time: number;
+    hadSelection: boolean;
+  } | null = null;
+  let suppressClickUntil = 0;
+
+  function closestLink(target: EventTarget | null): HTMLAnchorElement | null {
+    return target instanceof Element ? target.closest('a') : null;
+  }
 
   function cleanTapTarget(target: EventTarget | null): boolean {
-    return !(target instanceof Element && target.closest('a'));
+    return !closestLink(target);
   }
 
   function maybeTap(e: TouchEvent | MouseEvent, x: number, y: number) {
-    if (!onTap || !tapStart) return;
+    if (altScreenMouse || !onTap || !tapStart) return;
     const moved = Math.abs(x - tapStart.x) + Math.abs(y - tapStart.y);
     const dur = performance.now() - tapStart.t;
     const sel = window.getSelection?.();
     if (dur < 350 && moved < 10 && (!sel || sel.isCollapsed) && cleanTapTarget(e.target)) {
       onTap();
     }
+  }
+
+  function hasPointerModifier(e: PointerEvent): boolean {
+    return e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+  }
+
+  function isPlainPrimaryPointer(e: PointerEvent): boolean {
+    return e.button === 0 && e.isPrimary !== false && !hasPointerModifier(e);
+  }
+
+  function onPointerDown(e: PointerEvent) {
+    if (!altScreenMouse || !isPlainPrimaryPointer(e)) return;
+    altPointerStart = {
+      x: e.clientX,
+      y: e.clientY,
+      pointerId: e.pointerId,
+      target: e.target,
+      time: performance.now(),
+      hadSelection: hasSelectionInView(),
+    };
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    if (!altScreenMouse || !altPointerStart || e.pointerId !== altPointerStart.pointerId) return;
+    const start = altPointerStart;
+    altPointerStart = null;
+    if (!isPlainPrimaryPointer(e)) return;
+    const cleanClick = Math.hypot(e.clientX - start.x, e.clientY - start.y) <= 6;
+    if (cleanClick && (closestLink(e.target) || closestLink(start.target))) return;
+    if (!cleanClick || start.hadSelection || hasSelectionInView()) return;
+    const area = contentHitArea();
+    if (!area) return;
+    const hit = contentCellFromPoint(e.clientX, e.clientY, area.rect, area.geom);
+    if (!hit) return;
+    sendSgr(sgrClick(hit.cx, hit.cy));
+    suppressClickUntil = performance.now() + 700;
+  }
+
+  function onClick(e: MouseEvent) {
+    if (altScreenMouse) {
+      if (suppressClickUntil > 0) {
+        if (performance.now() <= suppressClickUntil) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        suppressClickUntil = 0;
+      }
+      return;
+    }
+    if (!onTap) return;
+    if (performance.now() - lastTouchEndAt < 500) return; // synthesized click
+    const sel = window.getSelection?.();
+    if ((!sel || sel.isCollapsed) && cleanTapTarget(e.target)) onTap();
   }
 
   function onTouchEnd(e?: TouchEvent) {
@@ -524,22 +680,42 @@
     return cursorPosCache;
   }
 
-  function pushGeometry(opts: { force?: boolean } = {}) {
-    if (!viewportEl) return;
+  function canSendResize(): boolean {
+    return !!(
+      claimGeometry &&
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'visible'
+    );
+  }
+
+  function measureGeometry(opts: { force?: boolean } = {}): {
+    cols: number;
+    rows: number;
+    changed: boolean;
+  } | null {
+    if (!viewportEl) return null;
     const w = viewportEl.clientWidth;
+    const visibleH = viewportEl.clientHeight;
     // Rows always derive from the FULL host height (inset added back): the
     // docked composer shrinks what's visible, not the pane the agent runs in.
-    const h = viewportEl.clientHeight + Math.max(0, bottomInsetPx);
-    if (w <= 0 || h <= 0) return;
+    const h = visibleH + Math.max(0, bottomInsetPx);
+    if (w <= 0 || visibleH <= 0 || h <= 0) return null;
     const cw = measureCharWidth();
     charW = cw;
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
     const rows = Math.max(minRows, Math.min(60, Math.floor(h / lineH)));
-    if (!opts.force && cols === lastPushedCols && rows === lastPushedRows) return;
+    const changed = !!opts.force || cols !== lastPushedCols || rows !== lastPushedRows;
+    if (!changed) return { cols, rows, changed: false };
     lastPushedCols = cols;
     lastPushedRows = rows;
-    tmuxMux.sendResize(session, cols, rows);
     onGeometryChange?.({ cols, rows });
+    return { cols, rows, changed };
+  }
+
+  function pushGeometry(opts: { force?: boolean } = {}) {
+    const measured = measureGeometry(opts);
+    if (!measured?.changed || !canSendResize()) return;
+    tmuxMux.sendResize(session, measured.cols, measured.rows);
   }
 
   /** Re-measure and re-claim geometry (e.g. after a host font-size change —
@@ -555,6 +731,17 @@
   $effect(() => {
     if (lastFontPx !== null && fontPx !== lastFontPx) refreshGeometry();
     lastFontPx = fontPx;
+  });
+
+  let lastClaimGeometry = $state<boolean | null>(null);
+  $effect(() => {
+    if (lastClaimGeometry === null) {
+      lastClaimGeometry = claimGeometry;
+      return;
+    }
+    if (claimGeometry === lastClaimGeometry) return;
+    lastClaimGeometry = claimGeometry;
+    if (claimGeometry) refreshGeometry();
   });
 
   function onReturn() {
@@ -666,13 +853,10 @@
   ontouchmove={onTouchMove}
   ontouchend={onTouchEnd}
   ontouchcancel={() => { tapStart = null; onTouchEnd(); }}
+  onpointerdown={onPointerDown}
+  onpointerup={onPointerUp}
   onwheel={onWheel}
-  onclick={(e) => {
-    if (!onTap) return;
-    if (performance.now() - lastTouchEndAt < 500) return; // synthesized click
-    const sel = window.getSelection?.();
-    if ((!sel || sel.isCollapsed) && cleanTapTarget(e.target)) onTap();
-  }}
+  onclick={onClick}
 >
   <div bind:this={layerEl} class="mtv-layer">
     {#key renderEpoch}
