@@ -200,7 +200,37 @@ the mobile path.
 
 ## Getting started
 
-Pick your lane. (Reminder: source-first — not on npm yet.)
+Pick your lane.
+
+**📦 Use it in your app — plug and play.** Every release ships an immutable
+`vX.Y.Z-dist` tag with prebuilt `dist/` for all three packages, so a plain
+install works with **bun, npm, pnpm or yarn** — no build step, no lifecycle
+scripts, nothing to trust:
+
+```bash
+bun add  thumbmux@github:kemkem23/thumbmux#v0.2.3-dist
+# or
+npm i    github:kemkem23/thumbmux#v0.2.3-dist
+```
+
+Then import through the meta-package's export map:
+
+```ts
+import { TmuxWsMux, createBunTmuxDriver, createUploadHandler, createPrefsHandler } from 'thumbmux/server';
+import { deriveSurface, buildLaunchCommand, extractRecentPrompts } from 'thumbmux/core';
+```
+
+```svelte
+<script>
+  import { TermView, ComposerDock, SessionGrid, tmuxMux } from 'thumbmux/svelte';
+</script>
+```
+
+`thumbmux/svelte` resolves via the `svelte` export condition — Vite/SvelteKit
+pick it up automatically (it ships `.svelte` sources + `.d.ts`, compiled by
+YOUR bundler, which is how Svelte libraries work; importing it under plain
+node/bun fails by design). **Pin `-dist` tags only** — never `#main` — and
+updating is just bumping the tag and reinstalling.
 
 **⚡ Try it in two minutes (the demo).** On any machine with `tmux` and
 [Bun](https://bun.sh):
@@ -221,12 +251,12 @@ reference `TmuxDriver` against your local tmux.
 **🤖 The agent way.** Paste this into Claude Code / Codex in your
 project:
 
-> Clone https://github.com/kemkem23/thumbmux into `vendor/thumbmux`, read its
-> README and the `core/`, `svelte/`, `server/` packages, then wire it into
-> this app: alias `@thumbmux/*` to the package `src/` dirs, mount `TmuxWsMux`
-> on a `/ws/tmux` WebSocket route with a driver for my tmux, and add a page
-> using `SessionGrid` + `LaunchSheet` + `TermView` + `ComposerDock`. Show me
-> the wiring plan before writing code.
+> Install `thumbmux@github:kemkem23/thumbmux#v0.2.3-dist` in this project,
+> read its README (the repo is https://github.com/kemkem23/thumbmux), then
+> wire it in: mount `TmuxWsMux` from `thumbmux/server` on a `/ws/tmux`
+> WebSocket route with a driver for my tmux, and add a page using
+> `SessionGrid` + `LaunchSheet` + `TermView` + `ComposerDock` from
+> `thumbmux/svelte`. Show me the wiring plan before writing code.
 
 **🔒 The security-conscious way.** Same as above, but audit first — paste
 this before installing:
@@ -240,15 +270,16 @@ this before installing:
 (It's ~4k lines of TypeScript with zero runtime dependencies in `core/` —
 an agent reads it in one sitting. That's a deliberate design goal.)
 
-**🛠 The manual way.** Clone, then wire the two ends yourself:
+**🛠 The manual way.** Install the dist tag (top of this section), then wire
+the two ends yourself:
 
-1. Alias the packages (tsconfig `paths` / Vite alias): `@thumbmux/core`,
-   `@thumbmux/svelte`, `@thumbmux/server` → each package's `src/`.
-2. Server: instantiate `TmuxWsMux` with your `TmuxDriver` (capture/keys/
-   resize/activity against your tmux) and route WS messages to
-   `mux.handleMessage` — snippet below.
-3. Client: `SessionGrid` for the hub, `TermView` + `ComposerDock` for the
-   terminal page — snippet below.
+1. Server: instantiate `TmuxWsMux` (from `thumbmux/server`) with your
+   `TmuxDriver` (capture/keys/resize/activity against your tmux) and route
+   WS messages to `mux.handleMessage` — snippet below.
+2. Client: `SessionGrid` for the hub, `TermView` + `ComposerDock` (from
+   `thumbmux/svelte`) for the terminal page — snippet below.
+3. (Hacking on thumbmux itself? Clone and alias `@thumbmux/*` to each
+   package's `src/` — that's the dev loop, not the consumer path.)
 
 ## What's inside
 
@@ -262,14 +293,14 @@ thumbmux/
 
 | package | what you get |
 |---|---|
-| **`@thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
-| **`@thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
-| **`@thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation, with `createUploadHandler()` for turnkey file attachments. |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
+| **`thumbmux/svelte`** | `TermView` the compositor-scroll viewer · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
+| **`thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation, with `createUploadHandler()` for turnkey file attachments. |
 
 ### What the server wiring looks like
 
 ```ts
-import { TmuxWsMux } from '@thumbmux/server';
+import { TmuxWsMux } from 'thumbmux/server';
 
 const mux = new TmuxWsMux({
   driver,                     // how to talk to tmux: capture/keys/resize/activity
@@ -296,7 +327,7 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
 
 ```svelte
 <script>
-  import { TermView, ComposerDock, tmuxMux } from '@thumbmux/svelte';
+  import { TermView, ComposerDock, tmuxMux } from 'thumbmux/svelte';
   const palette = {  // ANSI 0-15 + defaults — or derive one via @thumbmux/core
     base: ['#000','#f66','#6f6','#ff6','#66f','#f6f','#6ff','#eee',
            '#888','#f88','#8f8','#ff8','#88f','#f8f','#8ff','#fff'],
@@ -350,6 +381,8 @@ The lessons are encoded in the components so you don't have to relearn them:
 - [x] Session hub: live-miniature grid + the seven launch presets
 - [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame instead of the full window)
 - [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
+- [x] Installable releases without npm: immutable `vX.Y.Z-dist` GitHub tags
+      with prebuilt dists (works with bun/npm/pnpm/yarn)
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
 - [ ] Scroll-feel GIF captured from a real device
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite (`server/tests/`)
