@@ -22,8 +22,9 @@
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
     prefixForCells, stripAnsi, paneTextForCopy,
-    contentCellFromPoint, wheelEventToLines, centerContentCell,
+    contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
+    wheelDeltaToLines, consumeWholeWheelLines,
   } from '@thumbmux/core';
 
   let {
@@ -407,6 +408,14 @@
     };
   }
 
+  // Trackpads emit dozens of sub-line pixel deltas per second — accumulate a
+  // fractional remainder and flush only WHOLE lines per animation frame (same
+  // scale + accumulation as the local-scroll wheel path), otherwise every
+  // micro-event would be inflated to a full SGR wheel line.
+  let altWheelRemainder = 0;
+  let altWheelFrame: number | null = null;
+  let altWheelCell: { cx: number; cy: number } | null = null;
+
   function forwardAltWheel(e: WheelEvent) {
     e.preventDefault();
     e.stopPropagation();
@@ -414,10 +423,27 @@
     if (!area) return;
     const hit = contentCellFromPoint(e.clientX, e.clientY, area.rect, area.geom);
     if (!hit) return;
-    const lines = wheelEventToLines(e.deltaY, e.deltaMode, lineH, area.geom.rows);
-    if (lines === 0) return;
-    const count = Math.min(DEFAULT_WHEEL_MAX_PER_CALL, Math.max(1, Math.ceil(Math.abs(lines))));
-    sendSgr(sgrWheel(lines > 0 ? 'up' : 'down', hit.cx, hit.cy, count));
+    // Full-screen TUIs ignore wheel events over their bottom composer box —
+    // keep the target row in the conversation area (same clamp as
+    // centerContentCell's composer margin).
+    altWheelCell = { cx: hit.cx, cy: Math.max(1, Math.min(hit.cy, area.geom.rows - 8)) };
+    altWheelRemainder += wheelDeltaToLines(e, lineH, area.geom.rows);
+    scheduleAltWheelFlush();
+  }
+
+  function scheduleAltWheelFlush() {
+    if (altWheelFrame !== null) return;
+    altWheelFrame = requestAnimationFrame(() => {
+      altWheelFrame = null;
+      const consumed = consumeWholeWheelLines(altWheelRemainder);
+      altWheelRemainder = consumed.remainder;
+      if (consumed.wholeLines !== 0 && altWheelCell) {
+        const count = Math.min(DEFAULT_WHEEL_MAX_PER_CALL, Math.abs(consumed.wholeLines));
+        // browser sign: positive deltaY = wheel toward the user = scroll down
+        sendSgr(sgrWheel(consumed.wholeLines > 0 ? 'down' : 'up', altWheelCell.cx, altWheelCell.cy, count));
+      }
+      if (Math.abs(altWheelRemainder) >= 1) scheduleAltWheelFlush();
+    });
   }
 
   function updateSelectionActive() {
@@ -792,6 +818,7 @@
     if (typeof window === 'undefined') return;
     stopInertia();
     if (dragFrame !== null) cancelAnimationFrame(dragFrame);
+    if (altWheelFrame !== null) { cancelAnimationFrame(altWheelFrame); altWheelFrame = null; }
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;

@@ -156,9 +156,11 @@
   }
 
   async function sendPasteText(text: string, event?: ClipboardEvent | KeyboardEvent, alreadyConsumed = false) {
-    if (!text) return;
+    if (!text || !enabled || !nativeFocused) return;
     const accepted = await confirmTextPaste(text);
-    if (!accepted || !enabled || !nativeFocused) return;
+    // A host confirm dialog steals wrapper focus while we await, so an
+    // accepted paste must not be gated on focus again (§4: send exactly once).
+    if (!accepted || !enabled) return;
     if (event && !alreadyConsumed) {
       event.preventDefault();
       event.stopPropagation();
@@ -207,7 +209,12 @@
     if (!data || clipboardHasFiles(data)) return;
     const text = data.getData('text/plain') || data.getData('text');
     if (!text) return;
-    void sendPasteText(text, e);
+    // Consume synchronously — a threshold confirm may await, and preventDefault
+    // after the dispatch turn is a no-op. Consumed-then-declined is sanctioned
+    // by the spec (§4).
+    e.preventDefault();
+    e.stopPropagation();
+    void sendPasteText(text, e, true);
   }
 
   function handlePointerDown(e: PointerEvent) {

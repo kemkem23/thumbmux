@@ -160,6 +160,10 @@ Multiline/large paste warning:
   `window.confirm()` with a short generic message. If confirmation returns
   false, do not send anything and do not prevent the browser default unless the
   event was already consumed by an explicit Clipboard API read.
+- Focus eligibility is evaluated when the paste event arrives. An async
+  confirm dialog may move focus off the wrapper while the decision is pending;
+  an ACCEPTED paste is still sent (exactly once) — never drop a confirmed
+  paste because the dialog itself took focus.
 
 ## 5. Scroll
 
@@ -183,11 +187,18 @@ moving local scroll:
    and visible content rect.
 3. Call `contentCellFromPoint(e.clientX, e.clientY, rect, geom)`. If it returns
    no hit, do not send anything.
-4. Call `wheelEventToLines(...)` with the wheel event and current row metrics.
-   If it returns zero lines, do not send anything.
-5. Send `onKeys(sgrWheel(dir, cx, cy, count))`, where `dir` is `"up"` for
-   wheel-up and `"down"` for wheel-down, `count` is a positive integer, and
-   `cx/cy` are 1-based terminal cells from the hit test.
+4. Accumulate the event's line delta (`wheelDeltaToLines`, which applies the
+   pixel-mode scale) into a fractional remainder, and flush at most once per
+   animation frame with `consumeWholeWheelLines` — only WHOLE lines are ever
+   sent and the fraction carries over. Precision trackpads emit dozens of
+   sub-line deltas per second; without accumulation every micro-event would
+   inflate to a full wheel line.
+5. On flush, send `onKeys(sgrWheel(dir, cx, cy, count))`, where `dir` is
+   `"up"` for wheel-up and `"down"` for wheel-down, `count` is the whole-line
+   count clamped to `DEFAULT_WHEEL_MAX_PER_CALL`, and `cx/cy` are 1-based
+   terminal cells from the hit test with the row clamped above the TUI's
+   bottom composer margin (full-screen TUIs ignore wheel events over their
+   composer box).
 
 Snap-to-bottom behavior:
 
