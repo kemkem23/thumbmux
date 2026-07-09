@@ -1,407 +1,259 @@
+<div align="center">
+
 # thumbmux
 
-**tmux for thumbs.** A mobile-first web terminal stack for driving tmux
-sessions — especially AI coding agents — from your phone.
+**tmux for thumbs — and now for desks.**
 
-> **Status:** 0.x, source-first, extracted from a production system where it
-> drives real agent TUI sessions daily. **Not on npm yet**,
-> but the demo runs in two minutes: `bun run demo` → scan the QR
-> ([jump to Getting started](#getting-started)).
+A batteries-included web terminal stack for driving tmux sessions — especially
+AI coding agents — from any screen: a compositor-scroll viewer that runs at
+your display's refresh rate, a keyboard-aware composer, a live session hub,
+and a multiplexed WebSocket engine. Three small packages you can wire into
+any app in an afternoon.
 
-Born from a real itch: agent TUIs running in tmux on a server, and a human on a
-phone who still has to steer them. Every web terminal we tried treats the phone
-as a tiny desktop — pinch, squint, mis-tap, rage. thumbmux treats the phone as
-the primary device: one-thumb controls, native scroll physics, and a keyboard
-that never fights the layout.
+[![CI](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/tag/kemkem23/thumbmux?filter=v*-dist&label=release&color=16a34a)](https://github.com/kemkem23/thumbmux/tags)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Svelte 5](https://img.shields.io/badge/Svelte-5_runes-ff3e00?logo=svelte&logoColor=white)
+![Bun](https://img.shields.io/badge/Bun-server_engine-black?logo=bun&logoColor=white)
+![zero deps](https://img.shields.io/badge/core-zero_runtime_deps-8b5cf6)
 
-It also grows up cleanly on desktop: click a terminal, type straight into the
-pane, select real DOM text, copy with the browser, paste through bracketed
-paste, and let full-screen TUIs receive SGR mouse clicks and wheel events when
-they ask for them.
+<img src="docs/media/hero.png" width="96%" alt="The same agent session in three themes — dark, deep blue, and cream" />
 
-## A hub of every terminal you're running
+<sub>Every screenshot in this README is the bundled demo running scripted
+transcripts in a clean container — reproduce them yourself with `bun run demo`.</sub>
 
-<p align="center"><img src="docs/media/hub.png" width="420" alt="Session hub: a grid of live terminal miniatures plus a + terminal card" /></p>
+</div>
 
-This is the front door: a grid of **live miniatures** — every card is the
-actual pane streaming in real time. Four agents crunching in parallel reads at
-a glance; tap a card to drop in, or tap **+ terminal** to launch another.
+---
 
-Miniatures are cheap by design: each one subscribes in **tail mode**, so the
-server slices the stream to the last ~40 pane lines for that socket. Measured
-on the production box: a full snapshot frame is 19–136 KB; a thumbnail frame
-is ~5 KB — and captures are shared server-side with any full viewer of the
-same session, so a ten-card hub adds no extra tmux work.
+## Why thumbmux
 
-## Launch presets that speak agent
+Born from a real itch: agent TUIs running in tmux on a server, and a human on
+a phone who still has to steer them. Every web terminal we tried treats the
+phone as a tiny desktop — pinch, squint, mis-tap, rage. thumbmux treats the
+phone as the primary device, and rebuilds the viewer around one idea:
+**during a gesture, the compositor should be the only thing working.**
 
-<p align="center"><img src="docs/media/launcher.png" width="390" alt="Launcher sheet with presets, permission, and model dropdowns" /></p>
+- **Scrolls at your display's refresh rate.** ANSI is parsed *off* the gesture
+  path into cached HTML; the scroll itself is `translate3d` over a virtualized
+  window of rows. While your finger is down, nothing parses, nothing reflows,
+  nothing repaints terminal cells — 60 Hz screens get 60, 120 Hz screens
+  get 120. Momentum, rubber-band and bottom-anchoring are re-implemented
+  px-true to iOS.
+- **Real DOM, real text.** Select it, copy it, tap URLs — even ones that wrap
+  across three lines. It's a document, not a picture of one.
+- **Input that respects the OS.** A composer dock that never covers the
+  terminal (and never resizes the pty), a DIRECT mode where the phone keyboard
+  *is* the terminal, and a desktop wrapper with xterm-parity key encoding —
+  AltGr, macOS Option, IME composition and all.
+- **One engine, every viewer.** The server polls each tmux session once no
+  matter how many browsers watch it — content-hash dedupe, cursor-only frames,
+  tail-mode thumbnails, and opt-in per-message deflate for cellular-friendly
+  traffic.
 
-The **+ terminal** card opens a launcher with stock agent-oriented presets:
-plain sessions, **isolated git worktrees**, and a blank shell. Agent presets can
-inject permission and model flags through dropdowns that go straight into the
-launch command. Generic hosts get a live command preview; hosts that build the
-command server-side can hide it and forward the choices to their spawn API.
-Presets are data (`DEFAULT_LAUNCH_PRESETS`) — bring your own.
+## The tour
 
-## The rest of the tour
+### A hub of everything you're running
 
-### Scrolls like an app, not a canvas
+Live miniatures — every card is the actual pane streaming in real time, so
+four agents crunching in parallel reads at a glance. Thumbnails subscribe in
+**tail mode**: ~5 KB per frame instead of the 19–136 KB full snapshot, and
+captures are shared server-side with any full viewer of the same session, so
+a ten-card hub adds no extra tmux work. Tap **+ terminal** for launch presets
+with permission and model dropdowns and **isolated git-worktree** options —
+presets are data, bring your own.
 
-<p align="center"><img src="docs/media/term-white.png" width="390" alt="Terminal viewer: an agent session with syntax-colored output and a wrapped, underlined URL" /></p>
+<p align="center">
+  <img src="docs/media/hub.png" width="360" alt="Session hub: four live terminal miniatures plus a + terminal card" />
+  <img src="docs/media/launcher.png" width="360" alt="Launcher sheet with presets, permission and model dropdowns" />
+</p>
 
-The viewer never runs a terminal emulator in the scroll path. Captured pane
-lines render into a virtualized DOM window, and a flick is a `translate3d`
-update — no reparse, no repaint of terminal cells — so scrolling runs at
-whatever refresh rate your display has. You get **real text selection** (it's
-real DOM), momentum and rubber-band physics tuned to feel like iOS — and older
-scrollback streams in as you pull down — unlimited when the host wires a history archive; the bare demo serves tmux's live window (~2,000 lines).
+### A terminal that reads like an app
 
-**URLs are tappable** — including URLs that wrap across lines mid-output.
-In the shot above, the coverage link spans two pane lines; both fragments are
-live, underlined, and open the same URL. Links are reconstructed at the
-current pane width, so this survives resizes too.
+Syntax colors survive the trip (incremental SGR→HTML with cross-line state),
+URLs are tappable `<a>` elements even when they wrap, and the caret sits
+exactly where tmux says it does — Thai/CJK/emoji width-aware. Pull down and
+older scrollback streams in (unlimited when the host wires a history archive).
 
-### Everything behind one thumb
+<p align="center">
+  <img src="docs/media/term-agent.png" width="360" alt="Agent session: colored diff, test results, tappable URL" />
+  <img src="docs/media/composer.png" width="360" alt="Composer dock open with the terminal tail still visible above it" />
+</p>
 
-<p align="center"><img src="docs/media/menu.png" width="390" alt="Action menu fanned out from the launcher: preset sends, arrows, type, upload, settings, theme" /></p>
+The composer **docks, never covers**: the viewport shrinks by exactly the
+sheet height and springs back — the pty is never resized by a transient
+overlay, so an agent's TUI layout never flaps. Prefer raw? **DIRECT mode**
+holds focus in an invisible input so the OS keyboard drives the pane
+keystroke-by-keystroke, Thai IME included.
 
-A single ❯ launcher fans out the whole control surface: **one-tap preset
-sends** (`continue` / `ship it` / `explain` — configurable), an **arrow pad**
-for TUI menus, typing, file upload, theming — and whatever your host app adds.
+### One-tap shortcuts, notes, uploads
 
-The `Session settings` entry in this shot isn't part of thumbmux: the host
-application injected it (agent roles, team links, auto-continue — from the
-system this stack was extracted from). Actions and sheets are plugin points,
-not hardcoded chrome.
+A shortcut bar above the dock (tap = send, per-agent filtering) with a manager
+sheet to add/edit/reorder — persisted through a `PreferencesAdapter` that can
+live in `localStorage` or sync through your server so every device shares one
+set. Session notes and recent prompts sit one tap away in the HUD panel
+(`NotePanel` / `PromptsPanel`), and `UploadAction` turns attach-or-paste-a-
+picture into an uploaded path prefilled in the composer.
 
-### A composer that never covers the terminal
+<p align="center">
+  <img src="docs/media/shortcuts.png" width="360" alt="Shortcut manager sheet" />
+  <img src="docs/media/theme.png" width="360" alt="Theme sheet: dark/light, swatches, custom color" />
+</p>
 
-<p align="center"><img src="docs/media/composer.png" width="390" alt="Composer dock open with the terminal tail still visible above it" /></p>
+Theming is one color: hand `deriveSurface()` any background hex and it derives
+foreground, HUD chrome, and a readable 16-color ANSI palette from luminance —
+the whole surface re-skins instantly.
 
-Opening the input sheet doesn't overlay the pane — the terminal viewport
-**docks above it**, so the agent's last lines stay visible while you type.
-When the OS keyboard rises, everything rides on top of that too
-(VisualViewport-tracked).
+### Desktop is first-class now
 
-The part you can't see: none of this ever resizes the underlying tmux pane.
-Insets are computed against each host element's closed-state baseline so the
-math cancels exactly — other viewers of the same session never see a reflow.
+`DesktopKeys` wraps any `TermView`: click to focus (thin `:focus-visible`
+ring), then just type. Keys route through an **xterm-parity encoder** —
+modified F-keys, Ctrl+digit control bytes, AltGr third-level shift, macOS
+Option via `altIsMeta`, IME composition guards — pinned by 155 unit tests.
+Ctrl+C copies when you have a selection and interrupts when you don't. Paste
+is bracketed, with size-warning thresholds and a confirm hook.
 
-### Shortcut chips + a manager to edit them
+<p align="center"><img src="docs/media/desktop-agent.png" width="86%" alt="Desktop: the same session wide, with composer" /></p>
 
-One-tap prompt chips above the composer ("continue", "run it", or your own in any
-language) — add, edit, reorder and delete them in a built-in ShortcutsSheet, persisted
-through the same preferences adapter as everything else.
+Full-screen TUIs that keep output in their own buffer? Set `altScreenMouse`
+and TermView forwards wheel, click **and touch drags** as SGR mouse
+sequences — with fractional-line accumulation so a precision trackpad doesn't
+send your pager flying, and a composer-row clamp so events land where the TUI
+actually listens.
 
-### Paste a picture, get it uploaded
+<p align="center"><img src="docs/media/desktop-htop.png" width="86%" alt="htop in the browser: alt-screen SGR mouse forwarding" /></p>
 
-Paste an image into the composer (COMPOSE or DIRECT) and it rides the same upload
-pipeline as the attach button: stored with a sanitized name, composer prefilled with
-the paths, ready to send.
+The complete interaction contract — focus model, key routing, copy/paste
+policy, geometry ownership, view-only surfaces — is specified in
+[docs/desktop.md](docs/desktop.md).
 
-### Session notes + recent prompts, one tap away
+## The numbers
 
-Tap the session title: a panel drops with the session's note (edit in place; hosts can
-add actions like "distill with an LLM") and the last prompts extracted from the pane —
-tap one to prefill the composer for edit/resend.
-
-### Copy the screen like a text file
-
-One action copies the visible buffer — ANSI stripped, grid padding trimmed — via the
-clipboard API, with a fallback for plain-http LAN hosts.
-
-### Preferences that follow you
-
-Theme, font size, shortcuts and notes live behind a tiny PreferencesAdapter: localStorage
-for the demo, or a server-backed JSON file (`createPrefsHandler`) so your phone and
-laptop stay in sync.
-
-### Attach files from your phone
-
-<p align="center"><img src="docs/media/upload.png" width="390" alt="Composer prefilled with uploaded file paths, ready to send to the agent" /></p>
-
-Pick photos, logs, anything — they upload into the session's workspace, and
-the composer is **prefilled with the stored paths** (`Uploaded
-"design-mock.png" → uploads/design-mock.png`), so one SEND hands them straight
-to the agent.
-
-This ships turnkey: `UploadAction` (client — hidden picker, upload, prefill
-message) plus `createUploadHandler` (server — a fetch-style endpoint that
-stores files with sanitized, collision-proof names). The demo wires them in
-two lines each; agent TUIs can then open the uploaded image straight from the
-path you send. Hosts with their own storage can still swap in a custom endpoint.
-
-### DIRECT mode: the keyboard *is* the terminal
-
-<p align="center"><img src="docs/media/direct.png" width="390" alt="DIRECT mode: just the mode bar — no visible input box" /></p>
-
-Switch to DIRECT and the visible input box disappears — an invisible ghost
-input holds focus, the OS keyboard rises, and **every keystroke streams
-straight into tmux**: text (IME-composed scripts like Thai included) via input
-events, Enter/Esc/Tab/arrows via keydown. It feels like typing *in* the
-terminal, because effectively you are.
-
-### Desktop input: real keys, real selection
-
-On a laptop, the same terminal can be direct: click the pane, get a thin focus
-ring, and your physical keyboard streams into tmux. Browser shortcuts stay
-browser shortcuts, so tab navigation, text selection, copy, and link clicks keep
-working like normal web text. Ctrl+C sends SIGINT only when there is no terminal
-selection; if you've selected output, the browser copies it.
-
-Paste is bracketed paste, including context-menu paste. Large or multi-line
-pastes can ask for confirmation before they hit the pane, and IME-composed text
-such as Thai/CJK characters is sent after composition finishes, not as broken
-keydown fragments.
-
-For full-screen TUIs that enable SGR mouse tracking, `TermView` can switch wheel
-and click handling from local scroll to terminal mouse sequences. Links still
-win over mouse forwarding, and read-only surfaces can opt out of focus, keys,
-resize, and SGR forwarding entirely. See [docs/desktop.md](docs/desktop.md) for
-the frozen desktop interaction contract.
-
-### Alt-screen TUIs
-
-For an alt-screen TUI that owns its own layout, keep the browser from resizing
-the pane and let `TermView` forward SGR mouse bytes:
-
-```svelte
-<script>
-  import { TermView, DesktopKeys, tmuxMux } from 'thumbmux/svelte';
-
-  const session = 'session';
-  const sendKeys = (data) => tmuxMux.sendKeys(session, data);
-</script>
-
-<DesktopKeys onKeys={sendKeys} ariaLabel="Terminal input">
-  <TermView
-    {session}
-    {palette}
-    claimGeometry={false}
-    altScreenMouse={true}
-    onKeys={sendKeys}
-  />
-</DesktopKeys>
-```
-
-The demo includes a reference preset that starts a tiny SGR-mouse probe:
-
-```ts
-const command = "printf '\\e[?1006h\\e[?1000h'; exec cat -v";
-```
-
-Wheel or click over that pane and the TUI receives `\x1b[<...M` sequences.
-
-### Re-theme the whole surface from one color
-
-<p align="center"><img src="docs/media/theme.png" width="390" alt="Theme sheet: dark/light toggle, background swatches, custom color picker" /></p>
-
-Pick a swatch — or any hex. Text color, HUD chrome, borders and accent are all
-derived from the background's luminance, and the ANSI text palette swaps to
-contrast-picked variants for light vs dark backgrounds. No unreadable
-terminals, whatever color you land on.
-
-<p align="center"><img src="docs/media/hero.png" width="98%" alt="The same agent session in four surfaces — white (the default), black, blue, orange" /></p>
-<p align="center"><sub>the same session on white (the default), black, blue and orange — one luminance formula, ANSI palette included</sub></p>
-
-## Under the hood
-
-No terminal emulator in the browser's hot path, no polling storms, no
-per-frame parsing. The pipeline:
-
-```
-tmux pane ──pipe-pane──▶ dirty signal ──debounce 15ms (100ms max)──▶ capture-pane
-                                                                        │
-        fallback: adaptive poll (4 FPS idle → 10 FPS for 5s after keys) │
-                                                                        ▼
-                        content hash changed? ──no──▶ drop (nothing sent)
-                                │ yes
-                                ▼
-                 one WebSocket, many sessions ──▶ full viewers: full window
-                                              └─▶ thumbnails: last ~40 lines
-                                                                        │
-                                                                        ▼
-                    SGR→HTML incremental renderer (carried state per line)
-                                │
-                                ▼
-      virtualized DOM window · scroll = translate3d at the display's Hz
-```
-
-**Refresh behavior, concretely:**
-
-| stage | rate / size |
+| | |
 |---|---|
-| output detection | `pipe-pane` dirty signals, debounced 15 ms (100 ms max wait); polling fallback at 4 FPS idle, 10 FPS for 5 s after a keystroke |
-| change dedupe | content hash per capture — an unchanged pane sends **zero bytes** |
-| full viewer frame | the live scrollback window (measured 19–136 KB on real agent sessions) |
-| thumbnail frame | tail mode, last ~40 lines (~5 KB measured — ~4–28× smaller) |
-| keystroke frame | ~60 bytes (`{type, session, data}` — no metadata blob on the hot path) |
-| scroll rendering | compositor transform only; DOM patches happen outside the gesture, at window edges |
-| keepalive | client ping every 25 s (under carrier NAT timeouts), reconnect with backoff, visibility-aware |
+| **Gesture path** | 0 parses, 0 reflows — `translate3d` over a ±60-row virtualized window; ANSI→HTML is incremental and cached off-gesture |
+| **Idle session, on the wire** | ~0 — adaptive polling backed by `pipe-pane` dirty signals + content-hash dedupe; unchanged panes send nothing |
+| **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in per-message deflate cuts a typical ~52 KB agent snapshot to ~9 KB |
+| **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
+| **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
+| **Tests** | 321 unit tests across the packages (keys 155 · SGR mouse 42 · paste/submit 40) + a WS protocol conformance suite + container e2e that installs from a clean image and types into a real pane |
+| **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
 
-**Technology:** TypeScript end-to-end. `core/` is zero-dependency (SGR state
-machine, wrapped-URL reconstruction, prompt scanning, luminance math, the WS
-protocol types). `svelte/` is Svelte 5 (runes) — the only runtime dependency
-of the UI. `server/` runs on Bun or Node against plain `tmux capture-pane` /
-`pipe-pane` / `send-keys`, with every host-specific decision (drivers, resize
-arbitration, telemetry, session profiles) injected. No xterm.js anywhere in
-the mobile path.
+## Get started
 
-## Getting started
-
-Pick your lane.
-
-**📦 Use it in your app — plug and play.** Every release ships an immutable
-`vX.Y.Z-dist` tag with prebuilt `dist/` for all three packages, so a plain
-install works with **bun, npm, pnpm or yarn** — no build step, no lifecycle
-scripts, nothing to trust:
+**📦 In your app — plug and play.** Every release ships an immutable
+`vX.Y.Z-dist` tag with prebuilt `dist/` for all three packages: plain install
+with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:<owner>/<repo>#v0.3.1-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.3.2-dist
 # or
-npm i    github:<owner>/<repo>#v0.3.1-dist
+npm i    github:kemkem23/thumbmux#v0.3.2-dist
 ```
-
-Then import through the meta-package's export map:
 
 ```ts
 import { TmuxWsMux, createBunTmuxDriver, createUploadHandler, createPrefsHandler } from 'thumbmux/server';
-import { deriveSurface, buildLaunchCommand, extractRecentPrompts } from 'thumbmux/core';
+import { deriveSurface, buildLaunchCommand, submitPlan } from 'thumbmux/core';
 ```
 
 ```svelte
 <script>
-  import { TermView, ComposerDock, SessionGrid, tmuxMux } from 'thumbmux/svelte';
+  import { TermView, DesktopKeys, ComposerDock, SessionGrid, tmuxMux } from 'thumbmux/svelte';
 </script>
 ```
 
 `thumbmux/svelte` resolves via the `svelte` export condition — Vite/SvelteKit
 pick it up automatically (it ships `.svelte` sources + `.d.ts`, compiled by
-YOUR bundler, which is how Svelte libraries work; importing it under plain
-node/bun fails by design). **Pin `-dist` tags only** — never `#main` — and
-updating is just bumping the tag and reinstalling.
+your bundler, which is how Svelte libraries work). **Pin `-dist` tags only** —
+updating is bumping the tag and reinstalling.
 
-**⚡ Try it in two minutes (the demo).** On any machine with `tmux` and Bun:
+**⚡ In two minutes — the demo.** On any machine with `tmux` and Bun:
 
 ```bash
-git clone <public-repo-url>
+git clone https://github.com/kemkem23/thumbmux
 cd thumbmux && bun install
 bun run demo            # binds loopback
 bun run demo -- --host  # expose on your LAN for the phone
 ```
 
-It prints a QR code — scan it with your phone and you're looking at your own
-tmux sessions in the hub. The URL carries a random token (cookie'd on first
-visit): **anyone with that URL can type into your tmux**, so treat it like an
-SSH key. The demo is one Bun process: the built UI, the WebSocket mux, and a
-reference `TmuxDriver` against your local tmux.
+It prints a QR code — scan it and you're looking at your own tmux sessions.
+The URL carries a random token (cookie'd on first visit): **anyone with that
+URL can type into your tmux**, so treat it like an SSH key. The demo includes
+an alt-screen preset so you can feel the SGR mouse forwarding immediately.
 
-**🤖 The agent way.** Paste this into an agent TUI in your project:
+**🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:<owner>/<repo>#v0.3.1-dist` in this project, read
-> its README, then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a
-> WebSocket route with a driver for my tmux, and add a page using `SessionGrid`
-> + `LaunchSheet` + `TermView` + `ComposerDock` from `thumbmux/svelte`. Show me
-> the wiring plan before writing code.
+> Install `thumbmux@github:kemkem23/thumbmux#v0.3.2-dist`, read its README,
+> then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
+> route with a driver for my tmux, and add a page using `SessionGrid` +
+> `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
+> `thumbmux/svelte`. Show me the wiring plan before writing code.
 
-**🔒 The security-conscious way.** Same as above, but audit first — paste
-this before installing:
+**🔒 The security-conscious way.** Same, but audit first:
 
 > Read every file in the thumbmux package (core/, svelte/, server/ — it's
-> small). Flag anything that phones home, executes remote content, touches files
-> outside its packages, or handles keystrokes/session content in a way I should
-> not trust. Summarize what data flows where, then wait for my go-ahead.
+> small). Flag anything that phones home, executes remote content, touches
+> files outside its packages, or handles keystrokes/session content in a way I
+> should not trust. Summarize what data flows where, then wait for my
+> go-ahead.
 
-(It's ~4k lines of TypeScript with zero runtime dependencies in `core/` —
-an agent reads it in one sitting. That's a deliberate design goal.)
+## Wiring
 
-**🛠 The manual way.** Install the dist tag (top of this section), then wire
-the two ends yourself:
-
-1. Server: instantiate `TmuxWsMux` (from `thumbmux/server`) with your
-   `TmuxDriver` (capture/keys/resize/activity against your tmux) and route
-   WS messages to `mux.handleMessage` — snippet below.
-2. Client: `SessionGrid` for the hub, `TermView` + `ComposerDock` (from
-   `thumbmux/svelte`) for the terminal page — snippet below.
-3. (Hacking on thumbmux itself? Clone and alias `@thumbmux/*` to each
-   package's `src/` — that's the dev loop, not the consumer path.)
-
-## What's inside
-
-```
-thumbmux/
-├── core/    framework-free TypeScript, zero dependencies
-├── svelte/  Svelte 5 components (everything in the tour)
-├── server/  Bun/Node WebSocket mux engine for tmux
-└── demo/    one-command demo (Bun server + reference driver + QR)
-```
-
-| package | what you get |
-|---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` extraction of *submitted* prompts from raw pane text (the composer's ghost/placeholder text is filtered by its SGR-2 faint styling) · `keyboardEventToSequence` desktop key mapping · `bracketedPaste` · SGR mouse helpers for alt-screen TUIs · `surface` one-color→full-surface derivation · `launch` launch presets + pure command builder · `protocol` the WS message types |
-| **`thumbmux/svelte`** | `TermView` the compositor-scroll viewer with geometry ownership controls (`claimGeometry`) and optional alt-screen SGR mouse forwarding · `DesktopKeys` focus/key/paste wrapper for desktop terminals · `ComposerDock` COMPOSE/DIRECT input sheet with dock/keyboard insets · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher (permission/model dropdowns) · `UploadAction` attach-files picker · `TermHud` pinned status bar with a host panel slot · `ActionFab` launcher + action slots · `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed WS client |
-| **`thumbmux/server`** | `TmuxWsMux` — one process serves every viewer: shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, scrollback history expansion, session-list pushes. Everything host-specific is injected — and `createBunTmuxDriver()` is a complete reference implementation, with `createUploadHandler()` for turnkey file attachments. |
-
-### What the server wiring looks like
+**Server** — one mux serves every viewer; everything host-specific is
+injected (`createBunTmuxDriver()` is a complete reference implementation):
 
 ```ts
 import { TmuxWsMux } from 'thumbmux/server';
 
 const mux = new TmuxWsMux({
-  driver,                     // how to talk to tmux: capture/keys/resize/activity
-                              // (bring your own today — a reference driver ships
-                              //  with the upcoming demo)
-  pipes,                      // optional: pipe-pane manager for instant dirty signals
-  archive,                    // optional: scrollback archive for history expansion
-  profile: (session) => ({    // per-session behavior
-    resize: true,             //   browser-authoritative geometry?
-    currentPaneOnly: false,   //   alt-screen TUI (capture screen, not scrollback)?
+  driver,                     // capture/keys/resize/activity against your tmux
+  pipes,                      // optional: pipe-pane manager → instant dirty signals
+  archive,                    // optional: scrollback archive → history expansion
+  compressFrames: true,       // optional: Bun per-message deflate (pair with
+                              //   perMessageDeflate: true on Bun.serve)
+  profile: (session) => ({
+    resize: true,             // browser-authoritative geometry?
+    currentPaneOnly: false,   // alt-screen TUI (capture screen, not scrollback)?
     archive: true,
   }),
-  hooks: {                    // your policy layer
+  hooks: {
     onResizeRequest: (session, ws, geo, client) => ({ apply: true }),
   },
 });
 
-// in your WS handler — handleMessage also answers client keepalive pings:
+// in your WS handler — handleMessage also answers keepalive pings and
+// session-list subscriptions:
 ws.onmessage = (e) => mux.handleMessage(JSON.parse(e.data), ws);
 ws.onclose  = () => mux.unsubscribeAll(ws);
 ```
 
-### What the client wiring looks like
+**Client** — a terminal page in ~30 lines:
 
 ```svelte
 <script>
   import { TermView, DesktopKeys, ComposerDock, tmuxMux } from 'thumbmux/svelte';
-  const palette = {  // ANSI 0-15 + defaults — or derive one via @thumbmux/core
-    base: ['#000','#f66','#6f6','#ff6','#66f','#f6f','#6ff','#eee',
-           '#888','#f88','#8f8','#ff8','#88f','#f8f','#8ff','#fff'],
-    defaultFg: '#e6e6e6', defaultBg: '#101014',
-  };
+  import { deriveSurface } from 'thumbmux/core';
+
   const session = 'my-session';
+  const surface = deriveSurface('#101014');    // one hex → full palette
   const sendKeys = (data) => tmuxMux.sendKeys(session, data);
-  let composer = $state();  // openDock() must run inside the tap's call stack
+  let composer = $state();                     // openDock() must run inside the tap
   let dockFull = $state(0), kbInset = $state(0);
 </script>
 
-<!-- this viewport's closed-state bottom is 0, so it docks by the FULL sheet
-     height (dockFull); hosts whose baseline is env(safe-area-inset-bottom)
-     use dockInset instead — see ComposerDock's header comment -->
 <div class="viewport" style:bottom={`${dockFull + kbInset}px`}>
   <DesktopKeys onKeys={sendKeys} ariaLabel="Terminal input">
     <TermView
       {session}
-      {palette}
+      palette={surface.palette}
       bottomInsetPx={dockFull + kbInset}
       claimGeometry={true}
       altScreenMouse={false}
       onKeys={sendKeys}
+      onTap={() => composer?.openDock()}
     />
   </DesktopKeys>
 </div>
-
-<button class="type" onclick={() => composer?.openDock()}>⌨</button>
 
 <ComposerDock
   bind:this={composer}
@@ -413,19 +265,38 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
 
 <style>
   .viewport { position: absolute; top: 0; left: 0; right: 0; }
-  .type { position: absolute; right: 12px; bottom: 12px; }
 </style>
 ```
 
-## iOS scar tissue
+## What's inside
 
-The lessons are encoded in the components so you don't have to relearn them:
+```
+thumbmux/
+├── core/    framework-free TypeScript, zero runtime dependencies
+├── svelte/  Svelte 5 components (everything in the tour)
+├── server/  Bun/Node WebSocket mux engine for tmux
+└── demo/    one-command demo (Bun server + reference driver + QR)
+```
 
-- iOS raises the keyboard **only** for `focus()` calls made synchronously inside
-  the tap's call stack. A `setTimeout` focus silently sets `activeElement` with
-  the keyboard down. (That's why `ComposerDock.openDock()` exists.)
+| package | what you get |
+|---|---|
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
+| **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`) · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+
+Docs: [desktop interaction contract](docs/desktop.md) ·
+[WS protocol](docs/protocol.md) · [release process](SPLIT.md)
+
+<details>
+<summary><b>iOS scar tissue</b> — lessons encoded in the components so you don't relearn them</summary>
+
+- iOS raises the keyboard **only** for `focus()` calls made synchronously
+  inside the tap's call stack. A `setTimeout` focus silently sets
+  `activeElement` with the keyboard down. (That's why
+  `ComposerDock.openDock()` exists.)
 - Safari will not scroll-to-reveal an invisible focused input — track
-  `visualViewport` yourself, subtract `offsetTop`, and guard against pinch-zoom.
+  `visualViewport` yourself, subtract `offsetTop`, and guard against
+  pinch-zoom.
 - An `opacity: 0` input is focusable; `display: none` is not. Keep it at
   `font-size: 16px`, or Safari zooms the page.
 - Never resize the pty because a transient overlay appeared. Compute insets
@@ -433,22 +304,19 @@ The lessons are encoded in the components so you don't have to relearn them:
   exactly and the pane geometry never flaps.
 - The iOS keyboard is translucent — anything parked behind it shows through.
 
+</details>
+
 ## Roadmap
 
 - [x] Session hub: live-miniature grid + launch presets
-- [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame instead of the full window)
-- [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
-- [x] Installable releases without npm: immutable `vX.Y.Z-dist` GitHub tags
-      with prebuilt dists (works with bun/npm/pnpm/yarn)
-- [x] Desktop keyboard wrapper: click-to-focus, browser copy, bracketed paste,
-      IME composition, and optional SGR mouse forwarding for alt-screen TUIs
+- [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame)
+- [x] Runnable demo + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
+- [x] Installable releases without npm: immutable `vX.Y.Z-dist` tags, prebuilt dists
+- [x] Desktop: `DesktopKeys`, xterm-parity encoder, alt-screen SGR forwarding (wheel/click/touch)
+- [x] Wire efficiency: cursor-only frames, tail mode, opt-in per-message deflate
+- [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite
 - [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
-- [ ] Scroll-feel GIF captured from a real device
-- [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite (`server/tests/`)
-
-The screenshots above are the production UI this stack was extracted from,
-talking to a live tmux session — running a scripted demo transcript, so no
-real project content leaks into the docs.
+- [ ] Scroll-feel video captured from a real device
 
 ## License
 
