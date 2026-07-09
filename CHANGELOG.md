@@ -3,6 +3,11 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
 
+## v0.3.2 — 2026-07-09
+- `TmuxWsMux` option `compressFrames`: opts outbound frames into Bun's
+  per-message deflate (`ws.send(data, true)`) — pairs with
+  `perMessageDeflate: true` on Bun.serve. Default off (engine-agnostic).
+
 ## v0.3.1 — 2026-07-09
 - `TermView` owns SGR touch forwarding when `altScreenMouse=true`; hosts no
   longer need to capture touch gestures for alt-screen TUIs.

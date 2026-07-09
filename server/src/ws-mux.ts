@@ -114,6 +114,12 @@ export interface MuxHooks<WS extends WsLike = WsLike> {
 }
 
 export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
+  /** Compress outbound frames (Bun ServerWebSocket only: passes `true` as
+   * ws.send's second argument — RSV1 per-message-deflate). Terminal snapshots
+   * are 50-140KB of highly compressible text; enable when the host also sets
+   * `perMessageDeflate: true` on Bun.serve's websocket config. Default false
+   * (other WS engines may not accept a boolean second argument). */
+  compressFrames?: boolean;
   driver: TmuxDriver;
   pipes?: PipeManagerLike | null;
   archive?: HistoryArchiveLike | null;
@@ -136,6 +142,13 @@ export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
 const DEFAULT_PROFILE: SessionProfile = { resize: true, currentPaneOnly: false, archive: true };
 
 export class TmuxWsMux<WS extends WsLike = WsLike> {
+  private compressFrames = false;
+
+  /** Send one frame; with compressFrames, opt into Bun's per-message deflate. */
+  private wsSend(ws: any, data: string) {
+    if (this.compressFrames) ws.send(data, true);
+    else ws.send(data);
+  }
   private driver: TmuxDriver;
   private pipes: PipeManagerLike | null;
   private archive: HistoryArchiveLike | null;
@@ -184,6 +197,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private pollCounter = 0;
 
   constructor(opts: TmuxWsMuxOptions<WS>) {
+    this.compressFrames = opts.compressFrames === true;
     this.driver = opts.driver;
     this.pipes = opts.pipes ?? null;
     this.archive = opts.archive ?? null;
@@ -231,7 +245,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     const cachedContent = this.contents.get(session);
     if (cachedContent !== undefined) {
       try {
-        ws.send(JSON.stringify({
+        this.wsSend(ws, JSON.stringify({
           channel: session, type: "output",
           data: this.contentFor(session, ws, cachedContent),
           cursor: this.lastCursor.get(session) ?? null,
@@ -378,7 +392,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
       this.lastSessionsJson = json;
-      ws.send(JSON.stringify({ channel: "__sessions", type: "sessions", data: json } satisfies MuxServerMessage));
+      this.wsSend(ws, JSON.stringify({ channel: "__sessions", type: "sessions", data: json } satisfies MuxServerMessage));
     } catch (e: any) {
       this.logError("[thumbmux-mux] subscribeSessions error:", e.message);
     }
@@ -417,7 +431,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     } catch (e: any) {
       this.logError(`[thumbmux-mux] resize error for "${session}" to ${cols}x${rows}:`, e.message);
       try {
-        ws?.send(JSON.stringify({
+        ws && this.wsSend(ws, JSON.stringify({
           channel: session,
           type: "error",
           data: e.message ?? String(e),
@@ -443,7 +457,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       // No archive configured (the demo's default) — answer with an explicit
       // empty page instead of silence, so clients stop waiting/retrying.
       try {
-        ws.send(JSON.stringify({
+        this.wsSend(ws, JSON.stringify({
           channel: session, type: "history",
           data: JSON.stringify({ lines: [], startLine: null, hasMore: false }),
         } satisfies MuxServerMessage));
@@ -452,7 +466,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
     const history = this.archive.readBefore(session, beforeLine ?? null, limit);
     try {
-      ws.send(JSON.stringify({
+      this.wsSend(ws, JSON.stringify({
         channel: session,
         type: "history",
         data: JSON.stringify(history),
@@ -709,7 +723,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
             this.lastCursor.set(session, cursor);
             const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor } satisfies MuxServerMessage);
             for (const ws of viewers) {
-              try { ws.send(cursorMsg); } catch {}
+              try { this.wsSend(ws, cursorMsg); } catch {}
             }
           }
         }
@@ -734,7 +748,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       for (const ws of viewers) {
         const tail = tails?.get(ws);
         if (!tail) {
-          try { ws.send(fullMsg); } catch {}
+          try { this.wsSend(ws, fullMsg); } catch {}
           continue;
         }
         let msg = tailMsgs.get(tail);
@@ -746,13 +760,13 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
           } satisfies MuxServerMessage);
           tailMsgs.set(tail, msg);
         }
-        try { ws.send(msg); } catch {}
+        try { this.wsSend(ws, msg); } catch {}
       }
     } catch {
       // Session gone — notify viewers
       const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
       for (const ws of viewers) {
-        try { ws.send(errMsg); } catch {}
+        try { this.wsSend(ws, errMsg); } catch {}
       }
     }
   }
@@ -854,13 +868,13 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const sent = new Set<WS>();
       for (const ws of this.sessionListSubscribers) {
         if (sent.has(ws)) continue;
-        try { ws.send(msg); } catch {}
+        try { this.wsSend(ws, msg); } catch {}
         sent.add(ws);
       }
       for (const viewers of this.subscribers.values()) {
         for (const ws of viewers) {
           if (!sent.has(ws)) {
-            try { ws.send(msg); } catch {}
+            try { this.wsSend(ws, msg); } catch {}
             sent.add(ws);
           }
         }
