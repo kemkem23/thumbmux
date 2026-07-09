@@ -144,6 +144,11 @@ function spanOpen(st: SgrState, palette: AnsiPalette): string {
 
 const SGR_RE = /\x1b\[([0-9;]*)m/g;
 const OTHER_ESC_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;?]*[A-LN-Za-ln-z]|[()][AB0-2]|[=>]|[78])/g;
+// Last-resort sweep for what the two regexes above can't represent: CSI
+// sequences with malformed/signed parameters (e.g. `ESC[38;2;300;-20;17m`),
+// sequences truncated by a capture cut (`ESC[31` at end of line — optional
+// final byte), and any stray bare ESC. Raw ESC bytes must never reach HTML.
+const LEFTOVER_ESC_RE = /\x1b\[[0-9;:?<=>\-]*[@-~]?|\x1b/g;
 
 /**
  * Render one line to HTML, mutating `st` to the state AFTER the line.
@@ -179,7 +184,12 @@ export function lineToHtml(line: string, st: SgrState, palette: AnsiPalette, lin
 
   // Split emitted runs at link boundaries so mid-line URLs (and slices of a
   // URL wrapped across lines) become real <a> elements.
-  const emit = (text: string) => {
+  const emit = (rawText: string) => {
+    // Valid SGR runs were consumed by the caller's SGR_RE walk and known
+    // escapes by OTHER_ESC_RE — anything ESC-ish left here is malformed or
+    // truncated. Strip it BEFORE column accounting so link ranges (computed
+    // over stripAnsi'd text) stay aligned.
+    const text = rawText.replace(LEFTOVER_ESC_RE, '');
     if (!text) return;
     if (!links || links.length === 0) {
       wrap(text, null);

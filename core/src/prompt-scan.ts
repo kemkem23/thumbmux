@@ -28,7 +28,11 @@ export function stripAnsi(text: string): string {
   return text
     .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
     .replace(/\x1b\][^\x07]*\x07/g, "")
-    .replace(/\x1b\][^\x1b]*\x1b\\/g, "");
+    .replace(/\x1b\][^\x1b]*\x1b\\/g, "")
+    // malformed/signed CSI params (ESC[38;2;300;-20;17m), sequences truncated
+    // by a capture cut (ESC[31 at end of input), and stray bare ESC bytes —
+    // keep in lockstep with ansi-html's LEFTOVER_ESC_RE so column math agrees.
+    .replace(/\x1b\[[0-9;:?<=>\-]*[@-~]?|\x1b/g, "");
 }
 
 // Faint/dim (SGR 2) state after applying one \x1b[...m parameter run. Extended
