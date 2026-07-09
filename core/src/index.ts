@@ -23,3 +23,5 @@ export * from './copy';
 export * from './prefs';
 export * from './keys';
 export * from './sgr-mouse';
+export * from './paste';
+export * from './submit';

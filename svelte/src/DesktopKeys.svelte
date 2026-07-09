@@ -25,7 +25,7 @@
 
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import { bracketedPaste, keyboardEventToSequence } from '@thumbmux/core';
+  import { bracketedPaste, keyboardEventToSequence, pasteInfo as corePasteInfo, type PasteInfo } from '@thumbmux/core';
 
   type ChildSnippet = (() => unknown) | Snippet;
   type RuntimeProps = Omit<DesktopKeysProps, 'children'> & { children?: ChildSnippet };
@@ -99,31 +99,14 @@
     return e.key === 'Insert' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
   }
 
-  function utf8ByteLength(text: string): number {
-    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(text).length;
-    let bytes = 0;
-    for (const ch of text) {
-      const cp = ch.codePointAt(0) ?? 0;
-      if (cp <= 0x7f) bytes += 1;
-      else if (cp <= 0x7ff) bytes += 2;
-      else if (cp <= 0xffff) bytes += 3;
-      else bytes += 4;
-    }
-    return bytes;
-  }
-
+  // Threshold logic lives in @thumbmux/core (pure + unit-tested); this is a
+  // thin bind of the component's warning props.
   function pasteInfo(text: string): DesktopPasteInfo | null {
-    const lineCount = text.split(/\r\n|\r|\n/).length;
-    const byteLength = utf8ByteLength(text);
-    const multiline = pasteWarningLines > 0 && lineCount >= pasteWarningLines;
-    const large = pasteWarningBytes > 0 && byteLength >= pasteWarningBytes;
-    if (!multiline && !large) return null;
-    return {
-      text,
-      lineCount,
-      byteLength,
-      reason: multiline && large ? 'multiline-large' : multiline ? 'multiline' : 'large',
-    };
+    const info: PasteInfo | null = corePasteInfo(text, {
+      warnLines: pasteWarningLines,
+      warnBytes: pasteWarningBytes,
+    });
+    return info;
   }
 
   function defaultConfirmPaste(info: DesktopPasteInfo): boolean {
@@ -185,9 +168,12 @@
     if (!enabled || !nativeFocused || composing || e.isComposing || targetIsInteractive(e.target)) return;
 
     if (isCopyShortcut(e)) {
-      if (e.metaKey || terminalSelectionActive()) return;
+      // Ctrl+Shift+C = browser convention (devtools / terminal-style copy) —
+      // never SIGINT. Plain Ctrl+C only reaches the pane without a selection.
+      if (e.metaKey || e.shiftKey || terminalSelectionActive()) return;
     }
 
+    // Ctrl(+Shift)+V / Cmd+V: browser paste pipeline owns these.
     if (isPasteShortcut(e)) return;
 
     if (isShiftInsert(e)) {

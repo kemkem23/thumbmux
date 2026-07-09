@@ -213,6 +213,10 @@ export class TmuxMux {
       for (const session of this.subs.keys()) {
         this.sendSubscribe(session);
       }
+      // Re-arm the session-list push across reconnects too.
+      if (this.sessionCallbacks.size > 0) {
+        this.ws?.send(JSON.stringify({ type: 'sessions_subscribe' }));
+      }
       this.flushPendingResizes();
     };
 
@@ -347,12 +351,22 @@ export class TmuxMux {
     };
   }
 
-  /** Subscribe to session list changes (pushed by server every 5s). */
+  /** Subscribe to session list changes (pushed by server every 5s).
+   * Sends `sessions_subscribe` itself — hosts do NOT need to auto-subscribe
+   * sockets server-side (v0.3.1 fix: previously only hosts that subscribed
+   * every socket on open ever delivered `__sessions` pushes). */
   onSessions(callback: (sessions: any[]) => void): () => void {
+    const first = this.sessionCallbacks.size === 0;
     this.sessionCallbacks.add(callback);
     this.ensureConnection();
+    if (first && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'sessions_subscribe' }));
+    }
     return () => {
       this.sessionCallbacks.delete(callback);
+      if (this.sessionCallbacks.size === 0 && this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'sessions_unsubscribe' }));
+      }
     };
   }
 

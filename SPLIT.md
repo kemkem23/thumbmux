@@ -1,4 +1,4 @@
-# Releasing to github.com/kemkem23/thumbmux
+# Releasing the public split
 
 The public repo is produced from the private host monorepo with `git subtree split`
 (history of commits touching `packages/thumbmux` is preserved; pre-extraction
@@ -7,7 +7,7 @@ history stays in the private repo).
 ```bash
 cd <monorepo-root>
 git subtree split --prefix=packages/thumbmux -b thumbmux-release
-git push git@github.com:kemkem23/thumbmux.git thumbmux-release:main
+git push <public-remote> thumbmux-release:main
 git branch -D thumbmux-release
 ```
 
@@ -22,7 +22,13 @@ Rules:
 ## Release tags (the consumer rail)
 
 After pushing main, cut a release: `git push <public> thumbmux-release:refs/tags/vX.Y.Z`.
-CI (release-dist.yml) builds dists, runs the suite, and publishes `vX.Y.Z-dist` —
-the ONLY ref consumers should pin (`"thumbmux": "github:kemkem23/thumbmux#vX.Y.Z-dist"`).
-The host monorepo consumes that pin in each consumer package.json — bump every pin
-together, then reinstall (npm consumers: `--include=dev` if your shell exports NODE_ENV=production).
+CI workflow file `.github/workflows/release.yml` (workflow name `release-dist`)
+builds dists, runs the suite, and publishes `vX.Y.Z-dist` — the ONLY ref
+consumers should pin (`"thumbmux": "github:<owner>/<repo>#vX.Y.Z-dist"`).
+
+Release checklist:
+- Bump root, core, server, and svelte `package.json` versions in lockstep.
+- Push main through the subtree split.
+- Push the `vX.Y.Z` source tag and let `release-dist` publish `vX.Y.Z-dist`.
+- Bump every consumer pin together, then reinstall (npm consumers:
+  `--include=dev` if your shell exports NODE_ENV=production).

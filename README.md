@@ -3,18 +3,16 @@
 **tmux for thumbs.** A mobile-first web terminal stack for driving tmux
 sessions — especially AI coding agents — from your phone.
 
-![ci](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg) ![MIT](https://img.shields.io/badge/license-MIT-orange) ![Svelte 5](https://img.shields.io/badge/svelte-5-ff3e00) ![Bun](https://img.shields.io/badge/runs%20on-bun%20%2F%20node-black)
-
 > **Status:** 0.x, source-first, extracted from a production system where it
-> drives real Claude Code / Codex / Grok sessions daily. **Not on npm yet**,
+> drives real agent TUI sessions daily. **Not on npm yet**,
 > but the demo runs in two minutes: `bun run demo` → scan the QR
 > ([jump to Getting started](#getting-started)).
 
-Born from a real itch: [Claude Code], Codex CLI and Grok CLI running in tmux on
-a server, and a human on a phone who still has to steer them. Every web
-terminal we tried treats the phone as a tiny desktop — pinch, squint, mis-tap,
-rage. thumbmux treats the phone as the primary device: one-thumb controls,
-native scroll physics, and a keyboard that never fights the layout.
+Born from a real itch: agent TUIs running in tmux on a server, and a human on a
+phone who still has to steer them. Every web terminal we tried treats the phone
+as a tiny desktop — pinch, squint, mis-tap, rage. thumbmux treats the phone as
+the primary device: one-thumb controls, native scroll physics, and a keyboard
+that never fights the layout.
 
 It also grows up cleanly on desktop: click a terminal, type straight into the
 pane, select real DOM text, copy with the browser, paste through bracketed
@@ -37,17 +35,14 @@ same session, so a ten-card hub adds no extra tmux work.
 
 ## Launch presets that speak agent
 
-<p align="center"><img src="docs/media/launcher.png" width="390" alt="Launcher sheet: seven presets with permission and model dropdowns" /></p>
+<p align="center"><img src="docs/media/launcher.png" width="390" alt="Launcher sheet with presets, permission, and model dropdowns" /></p>
 
-The **+ terminal** card opens a launcher with the stock seven: Claude Code,
-Codex and Grok — each plain or in an **isolated git worktree** — plus a blank
-shell. Every agent preset injects its own permission-bypass flag by default
-(`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
-`--permission-mode bypassPermissions`), with dropdowns for **permission mode
-and model** that go straight into the launch command. Generic hosts get a live
-command preview; hosts that build the command server-side (like the one in
-this shot) hide it and forward the choices to their spawn API. Presets are
-data (`DEFAULT_LAUNCH_PRESETS`) — bring your own.
+The **+ terminal** card opens a launcher with stock agent-oriented presets:
+plain sessions, **isolated git worktrees**, and a blank shell. Agent presets can
+inject permission and model flags through dropdowns that go straight into the
+launch command. Generic hosts get a live command preview; hosts that build the
+command server-side can hide it and forward the choices to their spawn API.
+Presets are data (`DEFAULT_LAUNCH_PRESETS`) — bring your own.
 
 ## The rest of the tour
 
@@ -134,9 +129,8 @@ to the agent.
 This ships turnkey: `UploadAction` (client — hidden picker, upload, prefill
 message) plus `createUploadHandler` (server — a fetch-style endpoint that
 stores files with sanitized, collision-proof names). The demo wires them in
-two lines each; agents like Claude Code can then open the uploaded image
-straight from the path you send. Hosts with their own storage (like the
-system in this shot) can still swap in a custom endpoint.
+two lines each; agent TUIs can then open the uploaded image straight from the
+path you send. Hosts with their own storage can still swap in a custom endpoint.
 
 ### DIRECT mode: the keyboard *is* the terminal
 
@@ -166,6 +160,38 @@ and click handling from local scroll to terminal mouse sequences. Links still
 win over mouse forwarding, and read-only surfaces can opt out of focus, keys,
 resize, and SGR forwarding entirely. See [docs/desktop.md](docs/desktop.md) for
 the frozen desktop interaction contract.
+
+### Alt-screen TUIs
+
+For an alt-screen TUI that owns its own layout, keep the browser from resizing
+the pane and let `TermView` forward SGR mouse bytes:
+
+```svelte
+<script>
+  import { TermView, DesktopKeys, tmuxMux } from 'thumbmux/svelte';
+
+  const session = 'session';
+  const sendKeys = (data) => tmuxMux.sendKeys(session, data);
+</script>
+
+<DesktopKeys onKeys={sendKeys} ariaLabel="Terminal input">
+  <TermView
+    {session}
+    {palette}
+    claimGeometry={false}
+    altScreenMouse={true}
+    onKeys={sendKeys}
+  />
+</DesktopKeys>
+```
+
+The demo includes a reference preset that starts a tiny SGR-mouse probe:
+
+```ts
+const command = "printf '\\e[?1006h\\e[?1000h'; exec cat -v";
+```
+
+Wheel or click over that pane and the TUI receives `\x1b[<...M` sequences.
 
 ### Re-theme the whole surface from one color
 
@@ -232,9 +258,9 @@ install works with **bun, npm, pnpm or yarn** — no build step, no lifecycle
 scripts, nothing to trust:
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.3.0-dist
+bun add  thumbmux@github:<owner>/<repo>#v0.3.1-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.3.0-dist
+npm i    github:<owner>/<repo>#v0.3.1-dist
 ```
 
 Then import through the meta-package's export map:
@@ -256,13 +282,12 @@ YOUR bundler, which is how Svelte libraries work; importing it under plain
 node/bun fails by design). **Pin `-dist` tags only** — never `#main` — and
 updating is just bumping the tag and reinstalling.
 
-**⚡ Try it in two minutes (the demo).** On any machine with `tmux` and
-[Bun](https://bun.sh):
+**⚡ Try it in two minutes (the demo).** On any machine with `tmux` and Bun:
 
 ```bash
-git clone https://github.com/kemkem23/thumbmux
+git clone <public-repo-url>
 cd thumbmux && bun install
-bun run demo            # binds 127.0.0.1
+bun run demo            # binds loopback
 bun run demo -- --host  # expose on your LAN for the phone
 ```
 
@@ -272,24 +297,21 @@ visit): **anyone with that URL can type into your tmux**, so treat it like an
 SSH key. The demo is one Bun process: the built UI, the WebSocket mux, and a
 reference `TmuxDriver` against your local tmux.
 
-**🤖 The agent way.** Paste this into Claude Code / Codex in your
-project:
+**🤖 The agent way.** Paste this into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.3.0-dist` in this project,
-> read its README (the repo is https://github.com/kemkem23/thumbmux), then
-> wire it in: mount `TmuxWsMux` from `thumbmux/server` on a `/ws/tmux`
-> WebSocket route with a driver for my tmux, and add a page using
-> `SessionGrid` + `LaunchSheet` + `TermView` + `ComposerDock` from
-> `thumbmux/svelte`. Show me the wiring plan before writing code.
+> Install `thumbmux@github:<owner>/<repo>#v0.3.1-dist` in this project, read
+> its README, then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a
+> WebSocket route with a driver for my tmux, and add a page using `SessionGrid`
+> + `LaunchSheet` + `TermView` + `ComposerDock` from `thumbmux/svelte`. Show me
+> the wiring plan before writing code.
 
 **🔒 The security-conscious way.** Same as above, but audit first — paste
 this before installing:
 
-> Read every file in https://github.com/kemkem23/thumbmux (core/, svelte/,
-> server/ — it's small). Flag anything that phones home, executes remote
-> content, touches files outside its packages, or handles keystrokes/session
-> content in a way I should not trust. Summarize what data flows where, then
-> wait for my go-ahead.
+> Read every file in the thumbmux package (core/, svelte/, server/ — it's
+> small). Flag anything that phones home, executes remote content, touches files
+> outside its packages, or handles keystrokes/session content in a way I should
+> not trust. Summarize what data flows where, then wait for my go-ahead.
 
 (It's ~4k lines of TypeScript with zero runtime dependencies in `core/` —
 an agent reads it in one sitting. That's a deliberate design goal.)
@@ -413,7 +435,7 @@ The lessons are encoded in the components so you don't have to relearn them:
 
 ## Roadmap
 
-- [x] Session hub: live-miniature grid + the seven launch presets
+- [x] Session hub: live-miniature grid + launch presets
 - [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame instead of the full window)
 - [x] Runnable demo app + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [x] Installable releases without npm: immutable `vX.Y.Z-dist` GitHub tags
@@ -430,6 +452,4 @@ real project content leaks into the docs.
 
 ## License
 
-MIT © [kemkem23](https://github.com/kemkem23)
-
-[Claude Code]: https://claude.com/claude-code
+MIT

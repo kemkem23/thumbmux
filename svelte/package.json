@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/svelte",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "description": "Svelte 5 components for the thumbmux mobile terminal stack: 120Hz compositor-scroll terminal viewer and multiplexed tmux WebSocket client.",
   "type": "module",
   "exports": {

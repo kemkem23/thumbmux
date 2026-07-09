@@ -1,7 +1,18 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:kemkem23/thumbmux#v0.3.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
+
+## v0.3.1 — 2026-07-09
+- `TermView` owns SGR touch forwarding when `altScreenMouse=true`; hosts no
+  longer need to capture touch gestures for alt-screen TUIs.
+- Core paste/submit helpers cover bracketed paste and delayed composer submit
+  plans, including two-step Enter flows.
+- `DesktopKeys` leaves Ctrl+Shift+C/V with the browser.
+- Demo launcher includes an alt-screen mouse preset showing
+  `claimGeometry=false`, `altScreenMouse=true`, and `onKeys` wiring.
+- Root, core, server, and svelte package versions are aligned for the
+  v0.3.1 dist rail.
 
 ## v0.3.0 — 2026-07-08
 - Desktop keyboard input: `DesktopKeys` adds click-to-focus key routing,

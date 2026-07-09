@@ -8,7 +8,7 @@
   } from '@thumbmux/svelte';
   import {
     DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, deriveSurface, luminance, extractRecentPrompts,
-    type TerminalSurface, type LaunchSpec, type AnsiPalette, type Shortcut,
+    type TerminalSurface, type LaunchPreset, type LaunchSpec, type AnsiPalette, type Shortcut,
   } from '@thumbmux/core';
   import { onMount, onDestroy } from 'svelte';
 
@@ -18,9 +18,19 @@
     defaultFg: '#e6e6e6',
     defaultBg: '#101014',
   };
-  // All seven stock presets, worktree ones included — if the demo's cwd is
-  // not a git repo, git prints its own self-explanatory error in the pane.
-  const PRESETS = DEFAULT_LAUNCH_PRESETS;
+  // Stock presets, worktree ones included — if the demo's cwd is not a git
+  // repo, git prints its own self-explanatory error in the pane.
+  const ALT_SCREEN_PRESET_ID = 'alt-screen-mouse';
+  const ALT_SCREEN_PRESET: LaunchPreset = {
+    id: ALT_SCREEN_PRESET_ID,
+    label: 'Alt-screen mouse test',
+    color: '#2f7d68',
+    agent: 'alt-screen',
+    baseCommand: "printf '\\e[?1006h\\e[?1000h'; exec cat -v",
+    permissionOptions: [{ value: 'none', label: 'No options', flag: '' }],
+    modelOptions: [{ value: 'none', label: 'No options', flag: '' }],
+  };
+  const PRESETS = [...DEFAULT_LAUNCH_PRESETS, ALT_SCREEN_PRESET];
 
   // --- theme + font (persisted; ThemeSheet is pure presentation) ---
   const BASE_SURFACE: TerminalSurface = {
@@ -74,6 +84,7 @@
   let launchOpen = $state(false);
   let launching = $state(false);
   let launchError = $state<string | null>(null);
+  let altScreenSessions = $state<Record<string, boolean>>({});
 
   let gridSessions = $derived<GridSession[]>(names.map((name) => ({
     name, chip: 'TMUX', color: '#1a1a1a', palette: PALETTE,
@@ -152,8 +163,10 @@
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const name = String(data.name);
+      altScreenSessions = { ...altScreenSessions, [name]: spec.presetId === ALT_SCREEN_PRESET_ID };
       launchOpen = false;
-      openSession(String(data.name));
+      openSession(name);
     } catch (e: any) {
       launchError = String(e?.message ?? e);
     } finally {
@@ -228,6 +241,7 @@
 {:else}
   {@const session = view.name}
   {@const sendKeys = sendKeysTo(session)}
+  {@const termUsesAltScreenMouse = !!altScreenSessions[session]}
   <div
     class="stage"
     style:--dock-inset={dockInset > 0 ? `${dockInset}px` : null}
@@ -245,8 +259,8 @@
               bind:this={termRef}
               {session} palette={termPalette} {fontPx}
               bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
-              claimGeometry={true}
-              altScreenMouse={false}
+              claimGeometry={!termUsesAltScreenMouse}
+              altScreenMouse={termUsesAltScreenMouse}
               onKeys={sendKeys}
               onTap={() => composerRef?.openDock()}
               onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
@@ -257,8 +271,9 @@
             bind:this={termRef}
             {session} palette={termPalette} {fontPx}
             bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
-            claimGeometry={true}
-            altScreenMouse={false}
+            claimGeometry={!termUsesAltScreenMouse}
+            altScreenMouse={termUsesAltScreenMouse}
+            onKeys={sendKeys}
             onTap={() => composerRef?.openDock()}
             onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
           />

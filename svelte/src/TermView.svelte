@@ -12,7 +12,9 @@
    *
    * Input still flows through tmuxMux (composer/D-pad/presets in the route);
    * this view also owns the tmux pane geometry (measured cols/rows → resize,
-   * re-claimed when the app returns to foreground).
+   * re-claimed when the app returns to foreground). With altScreenMouse on,
+   * wheel and touch-drag input are forwarded as SGR mouse events here, so
+   * hosts do not need a separate touch capture shim.
    */
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
@@ -52,6 +54,8 @@
      * transient overlay — only the scroll pin follows the shorter viewport. */
     bottomInsetPx?: number;
     claimGeometry?: boolean;
+    /** Forward wheel, clean click, and touch-drag gestures as SGR mouse input
+     * for alt-screen TUIs. */
     altScreenMouse?: boolean;
     onKeys?: (data: string) => void;
     /** Fired on a CLEAN tap (short, low-movement, not a link, no selection) —
@@ -106,6 +110,8 @@
   let touchAt = 0;
   let pendingDragPx = 0;
   let dragFrame: number | null = null;
+  let altTouchY: number | null = null;
+  let altTouchMoved = false;
   let pendingContent: string | null = null;
 
   /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
@@ -416,19 +422,24 @@
   let altWheelFrame: number | null = null;
   let altWheelCell: { cx: number; cy: number } | null = null;
 
-  function forwardAltWheel(e: WheelEvent) {
-    e.preventDefault();
-    e.stopPropagation();
+  function queueAltWheelDelta(clientX: number, clientY: number, delta: { deltaY: number; deltaMode: number }): boolean {
     const area = contentHitArea();
-    if (!area) return;
-    const hit = contentCellFromPoint(e.clientX, e.clientY, area.rect, area.geom);
-    if (!hit) return;
+    if (!area) return false;
+    const hit = contentCellFromPoint(clientX, clientY, area.rect, area.geom);
+    if (!hit) return false;
     // Full-screen TUIs ignore wheel events over their bottom composer box —
     // keep the target row in the conversation area (same clamp as
     // centerContentCell's composer margin).
     altWheelCell = { cx: hit.cx, cy: Math.max(1, Math.min(hit.cy, area.geom.rows - 8)) };
-    altWheelRemainder += wheelDeltaToLines(e, lineH, area.geom.rows);
+    altWheelRemainder += wheelDeltaToLines(delta, lineH, area.geom.rows);
     scheduleAltWheelFlush();
+    return true;
+  }
+
+  function forwardAltWheel(e: WheelEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    queueAltWheelDelta(e.clientX, e.clientY, e);
   }
 
   function scheduleAltWheelFlush() {
@@ -470,6 +481,15 @@
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
     if (selectionActive) return; // user is adjusting a selection — hands off
+    if (altScreenMouse) {
+      stopInertia();
+      tapStart = null;
+      touching = false;
+      altTouchMoved = false;
+      const touch = e.touches.item(0);
+      altTouchY = e.touches.length === 1 && touch ? touch.clientY : null;
+      return;
+    }
     stopInertia();
     touching = true;
     pendingDragPx = 0;
@@ -487,6 +507,29 @@
   }
 
   function onTouchMove(e: TouchEvent) {
+    if (altScreenMouse) {
+      if (selectionActive || altTouchY === null) {
+        updateSelectionActive();
+        if (selectionActive) {
+          altTouchY = null;
+          return; // let iOS drag the selection handles
+        }
+      }
+      const touch = e.touches.item(0);
+      if (e.touches.length !== 1 || !touch || altTouchY === null) {
+        altTouchY = null;
+        return;
+      }
+      e.stopPropagation();
+      if (e.cancelable) e.preventDefault();
+      const dy = touch.clientY - altTouchY;
+      altTouchY = touch.clientY;
+      if (dy !== 0) {
+        altTouchMoved = true;
+        queueAltWheelDelta(touch.clientX, touch.clientY, { deltaY: -dy, deltaMode: 0 });
+      }
+      return;
+    }
     if (selectionActive || !touching) {
       updateSelectionActive();
       if (selectionActive) return; // let iOS drag the selection handles
@@ -616,6 +659,17 @@
 
   function onTouchEnd(e?: TouchEvent) {
     lastTouchEndAt = performance.now();
+    if (altScreenMouse) {
+      if (altTouchMoved) {
+        e?.stopPropagation();
+        if (e?.cancelable) e.preventDefault();
+      }
+      tapStart = null;
+      altTouchY = null;
+      altTouchMoved = false;
+      touching = false;
+      return;
+    }
     if (e && e.changedTouches?.[0] && tapStart) {
       maybeTap(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
     }

@@ -165,6 +165,18 @@ Multiline/large paste warning:
   an ACCEPTED paste is still sent (exactly once) — never drop a confirmed
   paste because the dialog itself took focus.
 
+## Submitting composer text
+
+Composer SEND must avoid the paste-ingest/Enter race: some terminal apps ingest
+the submitted text asynchronously, so sending text and Enter back-to-back can
+submit an empty composer or only part of the text.
+
+Use the core `submitPlan()` helper for composer sends. The plan is ordered:
+send the text step first, send Enter after about 150 ms, and for two-step
+composer TUIs send a second Enter after about 1 s. Hosts that submit over a
+REST round trip usually satisfy the first delay naturally, but they should
+still use the same plan so local and remote submit paths behave identically.
+
 ## 5. Scroll
 
 Normal mode is local virtual scroll. `TermView` continues to own the existing
@@ -181,6 +193,11 @@ scroll engine:
 
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:
+
+v0.3.1 note: `TermView` owns touch forwarding under `altScreenMouse=true`.
+Hosts should not capture touch gestures for SGR forwarding; links, selection,
+local scroll fallback, and terminal mouse sequences are resolved inside
+`TermView`.
 
 1. Prevent default and stop propagation for wheel events inside the terminal.
 2. Compute the current terminal content geometry from the measured cols/rows
