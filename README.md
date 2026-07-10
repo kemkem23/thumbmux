@@ -308,15 +308,33 @@ Docs: [desktop interaction contract](docs/desktop.md) ·
 
 ## Roadmap
 
-- [x] Session hub: live-miniature grid + launch presets
+- [x] Session hub: live-miniature grid + launch presets, filters/search/grouping, state dots, keyboard nav (v0.3.3)
 - [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame)
 - [x] Runnable demo + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
 - [x] Installable releases without npm: immutable `vX.Y.Z-dist` tags, prebuilt dists
 - [x] Desktop: `DesktopKeys`, xterm-parity encoder, alt-screen SGR forwarding (wheel/click/touch)
 - [x] Wire efficiency: cursor-only frames, tail mode, opt-in per-message deflate
+- [x] Jank-free history expansion (state-convergent prepend, p95 16.7 ms) (v0.3.3)
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite
-- [ ] npm packages (`@thumbmux/core` / `svelte` / `server`)
-- [ ] Scroll-feel video captured from a real device
+
+**v0.3.4 — stability & wire perf (in progress)**
+- [ ] Selection survives live output while scrolled up
+- [ ] Live-window reflow when the pane width changes
+- [ ] Delta frames: line-diff updates instead of full snapshots
+- [ ] Demo hardening: scroll-to-bottom + new-content pill, selection-first copy, file-backed history archive reference
+
+**v0.4.0 — capability wave (planned)**
+- [ ] Search in scrollback (highlight + jump, archive-aware)
+- [ ] OSC 8 hyperlinks + modern underline styles
+- [ ] Session recording & playback (frame journal + scrubbable player)
+- [ ] Split view (two panes side by side)
+- [ ] Web-push notification scaffolding ("agent finished / needs input")
+- [ ] Hub pinning + activity badges
+- [ ] Token scopes for the demo server (read-only tokens, expiry)
+- [ ] PWA shell (installable, offline reconnect UX)
+
+**Later**: binary protocol (msgpack) / WebTransport, SSH-backed driver example,
+collaborative viewing, docs site, npm packages, scroll-feel video from a real device
 
 ## License
 
