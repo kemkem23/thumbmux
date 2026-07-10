@@ -53,7 +53,25 @@ describe("Bun tmux driver input delivery", () => {
     expect(bufferName).toMatch(/^thumbmux-input-/);
     expect(load!.command.slice(4)).toEqual(["-"]);
     expect(Array.from(load!.options!.stdin as Uint8Array)).toEqual(Array.from(new TextEncoder().encode(data)));
-    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-b", bufferName, "-t", "pane-large"]);
+    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "pane-large"]);
+    expect(cleanup!.command).toEqual(["tmux", "delete-buffer", "-b", bufferName]);
+  });
+
+  test("routes a short NUL key through stdin and preserves its bytes", () => {
+    const calls: SpawnCall[] = [];
+    const data = "a\0b";
+    withSpawnStub((command, options) => {
+      calls.push({ command, options });
+      return successProcess();
+    }, () => createBunTmuxDriver().sendKeys("pane-nul", data));
+
+    expect(calls).toHaveLength(3);
+    const [load, paste, cleanup] = calls;
+    expect(load!.command.slice(0, 3)).toEqual(["tmux", "load-buffer", "-b"]);
+    const bufferName = load!.command[3]!;
+    expect(load!.command.slice(4)).toEqual(["-"]);
+    expect(Array.from(load!.options!.stdin as Uint8Array)).toEqual([0x61, 0x00, 0x62]);
+    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "pane-nul"]);
     expect(cleanup!.command).toEqual(["tmux", "delete-buffer", "-b", bufferName]);
   });
 

@@ -160,4 +160,48 @@ describe("cursor mapping", () => {
       mux.stop();
     }
   });
+
+  test("legacy driver keeps its sampled cursor when an unchanged pane drains a pending full", async () => {
+    const state = makeState();
+    const driver: TmuxDriver = {
+      ...baseDriver(state),
+      getCursor: async () => ({ ...state.cursor }),
+    };
+    const mux = new TmuxWsMux({ driver, pollNormalMs: 25 });
+    const ws = new FakeWS();
+    try {
+      mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+      await until(() => ws.frames("output").length > 0);
+      expect(ws.frames("output").at(-1).cursor).toEqual({ row: 2, col: 5 });
+
+      const before = ws.frames("output").length;
+      (mux as any).requireFullOutput(SES, ws);
+      await until(() => ws.frames("output").length > before);
+      expect(ws.frames("output").at(-1).cursor).toEqual({ row: 2, col: 5 });
+      expect((mux as any).lastCursor.get(SES)).toEqual({ row: 2, col: 5 });
+    } finally {
+      mux.stop();
+    }
+  });
+
+  test("a pending full preserves an atomic hidden-cursor sample", async () => {
+    const state = makeState();
+    const mux = new TmuxWsMux({ driver: atomicTrimmingDriver(state), pollNormalMs: 25 });
+    const ws = new FakeWS();
+    try {
+      mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+      await until(() => ws.frames("output").length > 0);
+      expect(ws.frames("output").at(-1).cursor).toEqual({ row: 2, col: 5 });
+
+      const before = ws.frames("output").length;
+      (mux as any).requireFullOutput(SES, ws);
+      state.cursor = { ...state.cursor, visible: false };
+      await until(() => ws.frames("output").length > before);
+
+      expect(ws.frames("output").at(-1).cursor).toBeNull();
+      expect((mux as any).lastCursor.get(SES)).toBeNull();
+    } finally {
+      mux.stop();
+    }
+  });
 });

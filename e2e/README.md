@@ -1,34 +1,41 @@
 # thumbmux package demo e2e
 
-These Playwright specs drive the package demo against tmux sessions inside a disposable container. The suite only creates sessions whose names begin with `sim-` and kills those sessions after each test.
+The Playwright suite drives the package demo and real tmux sessions inside one
+disposable container. The canonical runner creates a unique container, asks
+Docker for an ephemeral localhost port, performs a frozen install, waits for
+the authenticated demo to answer, runs every `e2e/*.spec.ts`, and removes the
+container on success, failure, or interruption.
 
-## Container recipe
+The specs only create sessions whose names begin with `sim-` and clean up each
+session after the test.
 
-Replace the placeholder values with local choices before running:
+## Run the complete suite
 
-```bash
-export THUMBMUX_CONTAINER=thumbmux-sim
-export THUMBMUX_HOST_PORT=<host-port>
-export THUMBMUX_DEMO_PORT=<demo-port>
-export THUMBMUX_PACKAGE_DIR=<path-to-this-package>
-
-docker rm -f "$THUMBMUX_CONTAINER" 2>/dev/null || true
-docker run -d --name "$THUMBMUX_CONTAINER" -p "${THUMBMUX_HOST_PORT}:${THUMBMUX_DEMO_PORT}" oven/bun:1 sleep infinity
-docker exec "$THUMBMUX_CONTAINER" bash -lc 'apt-get update -qq && apt-get install -y -qq tmux procps'
-tar -C "$THUMBMUX_PACKAGE_DIR" --exclude=node_modules --exclude='*/node_modules' --exclude=dist -cf - . | docker exec -i "$THUMBMUX_CONTAINER" bash -lc 'mkdir -p /app && tar -C /app -xf -'
-docker exec "$THUMBMUX_CONTAINER" bash -lc 'cd /app && bun install'
-docker exec -d "$THUMBMUX_CONTAINER" bash -lc 'cd /app && bun run demo -- --host >/tmp/demo.log 2>&1'
-docker exec "$THUMBMUX_CONTAINER" bash -lc "grep -oE 't=[a-f0-9]+' /tmp/demo.log | head -1"
-```
-
-Set `DEMO_URL` to the printed demo URL before running the tests.
-
-## Test command
-
-From this directory:
+From the package root:
 
 ```bash
-NODE_PATH="$NODE_PATH" DEMO_URL="$DEMO_URL" THUMBMUX_CONTAINER="${THUMBMUX_CONTAINER:-thumbmux-sim}" npx playwright test --config=playwright.config.ts
+bun install --frozen-lockfile
+./node_modules/.bin/playwright install --with-deps chromium
+./e2e/run-container.sh
 ```
 
-The config is scoped to this directory and reads its base URL from `DEMO_URL`. Chromium clipboard tests require the normal Playwright browser installation.
+Docker, curl, tar, Bun, and the local Playwright Chromium installation are
+required on the host. Test traces, screenshots, the Playwright log, and a
+token-redacted demo log are retained in the artifacts directory printed by
+the runner.
+
+## Environment overrides
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `THUMBMUX_E2E_ARTIFACTS` | `$TMPDIR/<container>-artifacts` | Artifact output directory |
+| `THUMBMUX_E2E_IMAGE` | `oven/bun:1` | Disposable container image |
+| `THUMBMUX_E2E_READY_TIMEOUT` | `90` | Demo readiness timeout in seconds |
+| `THUMBMUX_CONTAINER` | Unique run-specific name | Explicit runner-owned container name |
+| `THUMBMUX_HOST_PORT` | Docker-assigned localhost port | Fixed host port when needed |
+| `THUMBMUX_DEMO_PORT` | `7681` | Demo port inside the container |
+| `THUMBMUX_PACKAGE_DIR` | Parent of this directory | Alternate package checkout |
+| `THUMBMUX_PLAYWRIGHT_BIN` | `node_modules/.bin/playwright` | Alternate local Playwright executable |
+
+An explicitly supplied container name is still owned and removed by this
+runner. Do not point it at a container that should remain alive.

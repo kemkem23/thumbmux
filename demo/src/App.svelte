@@ -214,14 +214,17 @@
     }
   }
 
-  function onTermLinesChange(lines: string[]) {
+  function onTermLinesChange(
+    lines: string[],
+    meta: { source: 'live' | 'prepend' | 'replace' },
+  ) {
     recentPrompts = extractRecentPrompts(lines, { targetCount: 5 });
-    if (termScrollState.scrolledUp) hasNewContent = true;
+    if (meta.source === 'live' && termScrollState.scrolledUp) hasNewContent = true;
   }
 
   function scrollToTerminalBottom() {
-    termRef?.scrollToBottom();
-    hasNewContent = false;
+    const moved = termRef?.scrollToBottom() ?? false;
+    if (moved && termRef && !termRef.isScrolledUp()) hasNewContent = false;
   }
 
   async function copyTerminal() {

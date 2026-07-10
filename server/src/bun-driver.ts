@@ -24,7 +24,9 @@ function sendLargeInput(session: string, bytes: Uint8Array) {
   const bufferName = `thumbmux-input-${crypto.randomUUID()}`;
   try {
     runWithStdin(["load-buffer", "-b", bufferName, "-"], bytes);
-    run(["paste-buffer", "-d", "-b", bufferName, "-t", session]);
+    // -r preserves LF bytes instead of translating them to tmux's separator
+    // (CR by default), keeping this path byte-identical to send-keys -l.
+    run(["paste-buffer", "-d", "-r", "-b", bufferName, "-t", session]);
   } finally {
     // -d covers successful pastes; this also clears a buffer if loading or
     // pasting fails midway.
@@ -63,7 +65,9 @@ export function createBunTmuxDriver(): TmuxDriver {
     },
     sendKeys(session, data) {
       const bytes = new TextEncoder().encode(data);
-      if (bytes.byteLength <= LARGE_INPUT_THRESHOLD_BYTES) {
+      // NUL cannot be represented in an argv entry (Bun/execve rejects it),
+      // so even a one-byte Ctrl-Space must travel through load-buffer stdin.
+      if (bytes.byteLength <= LARGE_INPUT_THRESHOLD_BYTES && !data.includes("\0")) {
         run(["send-keys", "-t", session, "-l", "--", data]);
         return;
       }

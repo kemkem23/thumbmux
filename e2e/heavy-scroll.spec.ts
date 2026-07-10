@@ -11,6 +11,7 @@ import {
   makeSessionName,
   openSession,
   runShellCommand,
+  selectVisibleLines,
   shellQuote,
   visibleTerminalLines,
   wheel,
@@ -86,6 +87,17 @@ test('survives a scroll storm and preserves the reader anchor during live append
     expect(lineNumbers(afterLines)[0]).toBe(beforeFirstNumber);
     await assertVirtualized(page);
 
+    const offsetBeforeSelectedClick = await bottomOffset(page);
+    const { selected } = await selectVisibleLines(page, 5);
+    expect(selected.split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(5);
+    await newContent.evaluate((button) => (button as HTMLButtonElement).click());
+    await expect.poll(() => bottomOffset(page)).toBe(offsetBeforeSelectedClick);
+    await expect(newContent).toBeVisible();
+
+    await page.evaluate(() => {
+      window.getSelection()?.removeAllRanges();
+      document.dispatchEvent(new Event('selectionchange'));
+    });
     await newContent.click();
     await expect.poll(() => bottomOffset(page)).toBe(0);
     await expect.poll(async () => (await visibleTerminalLines(page)).includes('HS live append 50')).toBe(true);

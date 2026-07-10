@@ -47,6 +47,14 @@ function utf8Size(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
+function normalizedCapturedPane(raw: string): string {
+  const terminated = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+  if (terminated === '') return '';
+  const lines = terminated.split('\n');
+  while (lines.length > 0 && lines.at(-1)!.trim() === '') lines.pop();
+  return lines.join('\n');
+}
+
 async function wireState(page: Page) {
   return page.evaluate(() => (window as any).__thumbmuxWire);
 }
@@ -197,7 +205,10 @@ test('delta wire converges, resyncs a stale base, and saves suffix-heavy bytes',
     expect(percent).toBeGreaterThanOrEqual(70);
 
     await expect.poll(() => capturePane(session, -250).includes(finalMarker), { timeout: 20_000 }).toBe(true);
-    expect(finalData).toBe(capturePane(session, -250));
+    // The archive removes capture-pane's record terminator and blank viewport
+    // rows before broadcasting; convergence is exact against that canonical
+    // live-pane representation, not tmux's transport newline.
+    expect(finalData).toBe(normalizedCapturedPane(capturePane(session, -250)));
   } finally {
     killSession(session);
   }

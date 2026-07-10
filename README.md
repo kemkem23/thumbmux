@@ -48,8 +48,8 @@ phone as the primary device, and rebuilds the viewer around one idea:
   AltGr, macOS Option, IME composition and all.
 - **One engine, every viewer.** The server polls each tmux session once no
   matter how many browsers watch it — content-hash dedupe, cursor-only frames,
-  tail-mode thumbnails, and opt-in per-message deflate for cellular-friendly
-  traffic.
+  tail-mode thumbnails, opt-in line-delta frames, and opt-in per-message
+  deflate for cellular-friendly traffic.
 
 ## The tour
 
@@ -74,6 +74,9 @@ Syntax colors survive the trip (incremental SGR→HTML with cross-line state),
 URLs are tappable `<a>` elements even when they wrap, and the caret sits
 exactly where tmux says it does — Thai/CJK/emoji width-aware. Pull down and
 older scrollback streams in (unlimited when the host wires a history archive).
+When the pane width changes, the live window reflows from tmux and arrives as
+a full reset; archived rows deliberately keep their original physical wrapping
+so history never gets silently rewritten ([details](docs/reflow.md)).
 
 <p align="center">
   <img src="docs/media/term-agent.png" width="360" alt="Agent session: colored diff, test results, tappable URL" />
@@ -133,10 +136,10 @@ policy, geometry ownership, view-only surfaces — is specified in
 |---|---|
 | **Gesture path** | 0 parses, 0 reflows — `translate3d` over a ±60-row virtualized window; ANSI→HTML is incremental and cached off-gesture |
 | **Idle session, on the wire** | ~0 — adaptive polling backed by `pipe-pane` dirty signals + content-hash dedupe; unchanged panes send nothing |
-| **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in per-message deflate cuts a typical ~52 KB agent snapshot to ~9 KB |
+| **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in validated line deltas cut suffix-heavy traffic by 95% vs equivalent full frames in the clean-container e2e; per-message deflate remains available |
 | **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
 | **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
-| **Tests** | 321 unit tests across the packages (keys 155 · SGR mouse 42 · paste/submit 40) + a WS protocol conformance suite + container e2e that installs from a clean image and types into a real pane |
+| **Tests** | 476 source tests across 31 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
 | **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
 
 ## Get started
@@ -146,9 +149,9 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.3.3-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.3.4-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.3.3-dist
+npm i    github:kemkem23/thumbmux#v0.3.4-dist
 ```
 
 ```ts
@@ -180,10 +183,13 @@ It prints a QR code — scan it and you're looking at your own tmux sessions.
 The URL carries a random token (cookie'd on first visit): **anyone with that
 URL can type into your tmux**, so treat it like an SSH key. The demo includes
 an alt-screen preset so you can feel the SGR mouse forwarding immediately.
+Scrollback storage is private and per-run by default. Setting
+`THUMBMUX_HISTORY_ROOT` explicitly opts into persistence keyed by tmux session
+name; reuse a name only for the same logical session.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.3.3-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.3.4-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
@@ -282,10 +288,11 @@ thumbmux/
 |---|---|
 | **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`) · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail mode, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
 
 Docs: [desktop interaction contract](docs/desktop.md) ·
-[WS protocol](docs/protocol.md) · [release process](SPLIT.md)
+[WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
+[release process](SPLIT.md)
 
 <details>
 <summary><b>iOS scar tissue</b> — lessons encoded in the components so you don't relearn them</summary>
@@ -317,11 +324,11 @@ Docs: [desktop interaction contract](docs/desktop.md) ·
 - [x] Jank-free history expansion (state-convergent prepend, p95 16.7 ms) (v0.3.3)
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite
 
-**v0.3.4 — stability & wire perf (in progress)**
-- [ ] Selection survives live output while scrolled up
-- [ ] Live-window reflow when the pane width changes
-- [ ] Delta frames: line-diff updates instead of full snapshots
-- [ ] Demo hardening: scroll-to-bottom + new-content pill, selection-first copy, file-backed history archive reference
+**v0.3.4 — stability & wire perf**
+- [x] Selection survives live output while scrolled up
+- [x] Live-window reflow when the pane width changes
+- [x] Validated opt-in line-delta frames with one-shot resync recovery
+- [x] Demo hardening: scroll-to-bottom + new-content pill, selection-first copy, private file-backed history archive reference
 
 **v0.4.0 — capability wave (planned)**
 - [ ] Search in scrollback (highlight + jump, archive-aware)

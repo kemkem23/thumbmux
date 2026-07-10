@@ -54,6 +54,33 @@ export function mergeCapturedLinesForStableScroll(
   };
 }
 
+/**
+ * Number of rows by which a scrolled reader's bottom offset should move when
+ * a live capture grows or shrinks. Terminal captures commonly rewrite the
+ * prompt plus one adjacent tail row while appending output; a stable common
+ * prefix through that two-row tail is sufficient to preserve the reader's
+ * anchor. Larger rewrites are treated as replacements and are not adjusted.
+ */
+export function readerAnchorLineDelta(
+  previousLines: string[],
+  nextLines: string[],
+  maxTailRewrite = 2,
+): number {
+  const lineDelta = nextLines.length - previousLines.length;
+  const minLength = Math.min(previousLines.length, nextLines.length);
+  if (lineDelta === 0 || minLength === 0) return 0;
+
+  let commonPrefix = 0;
+  while (
+    commonPrefix < minLength
+    && previousLines[commonPrefix] === nextLines[commonPrefix]
+  ) commonPrefix++;
+
+  const toleratedTail = Math.max(0, Math.floor(maxTailRewrite));
+  const requiredPrefix = Math.max(1, minLength - toleratedTail);
+  return commonPrefix >= requiredPrefix ? lineDelta : 0;
+}
+
 export function wheelDeltaToLines(
   event: WheelDeltaInput,
   lineHeightPx: number,

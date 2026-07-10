@@ -3,6 +3,7 @@ import {
   consumeWholeWheelLines,
   findLineOverlap,
   mergeCapturedLinesForStableScroll,
+  readerAnchorLineDelta,
   wheelDeltaToLines,
 } from "../src/terminal-scroll";
 
@@ -36,6 +37,38 @@ describe("terminal scroll helpers", () => {
 
     expect(merged.preservedPrefix).toBe(false);
     expect(merged.lines).toEqual(["ready", "", "other"]);
+  });
+
+  test("compensates a live append that rewrites at most two tail rows", () => {
+    const stable = numberedLines(1, 100);
+    const previous = [...stable, "progress 10%", "prompt old"];
+    const next = [...stable, "progress 20%", "prompt new", "result", "prompt newest"];
+
+    expect(readerAnchorLineDelta(previous, next)).toBe(2);
+  });
+
+  test("compensates a tail trim but rejects a rewrite beyond the safe tail", () => {
+    const stable = numberedLines(1, 100);
+    expect(readerAnchorLineDelta(
+      [...stable, "tail one", "tail two"],
+      [...stable, "tail one"],
+    )).toBe(-1);
+
+    expect(readerAnchorLineDelta(
+      [...stable, "old one", "old two", "old three"],
+      [...stable, "new one", "new two", "new three", "append"],
+    )).toBe(0);
+  });
+
+  test("uses the two-tail common-prefix rule for short captures", () => {
+    expect(readerAnchorLineDelta(
+      ["ready", "", "prompt"],
+      ["ready", "", "other", "new"],
+    )).toBe(1);
+    expect(readerAnchorLineDelta(
+      ["ready", "old", "prompt"],
+      ["other", "new", "prompt", "tail"],
+    )).toBe(0);
   });
 
   test("converts pixel wheel deltas into fractional line movement", () => {

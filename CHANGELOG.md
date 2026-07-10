@@ -3,6 +3,47 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
 
+## v0.3.4 — 2026-07-10
+- **Delta output frames (opt-in wire perf)**: a subscriber that sends
+  `delta: true` on subscribe receives replacement-suffix `type:"delta"`
+  frames instead of full pane retransmits — FNV-1a-32 prefix hash, strict
+  serialized-size gate (a delta is sent only when it is actually smaller),
+  per-(socket, session) bases advanced only after successful send, and a
+  one-shot coalesced `resync` recovery on any invalid/stale delta.
+  Subscribers that never opt in keep receiving classic full output frames —
+  bit-compatible with older servers/clients. Measured in the container e2e
+  on suffix-heavy updates: **95% fewer wire bytes** vs full frames.
+  The Svelte mux opts in automatically and still hands subscribers complete
+  strings (new optional 4th callback arg identifies full/delta + reset).
+- **Selection survives live output**: `TermView` defers content commits while
+  a selection or gesture is active (keeping only the newest capture — no
+  stale replay) and flushes once released; a drag-selection is byte-identical
+  across appends.
+- **Reflow on resize**: an accepted resize invalidates delta bases and the
+  next capture is a full `reset:'resize'` frame — the live window re-wraps to
+  the new width while archived history stays at its original wrapping
+  (documented in `docs/reflow.md`).
+- **Large paste hardening**: literal input over 8KB goes through
+  `tmux load-buffer`/`paste-buffer -r` instead of `send-keys` argv (no length
+  limits, no shell mangling or LF→CR rewrite); NUL-bearing control input uses
+  the same stdin path. A 300-line/20KB browser paste arrives intact.
+- **Demo hardening**: history archive extracted into a tested module; e2e
+  controls stabilized (testids for bottom/new-content), and the whole e2e
+  suite now hard-asserts previously known-gap behaviors (zero
+  `markKnownGap` branches remain).
+- **Adversarial closeout**: full/reset retries now survive true WebSocket
+  drops without misclassifying Bun's queued backpressure; cursor-only updates
+  recover per viewer; selection-gated resets keep replacement semantics
+  without hiding later live output; reader anchoring tolerates two rewritten
+  tail rows. The demo archive normalizes real tmux captures, rejects ambiguous
+  repaint overlaps, avoids duplicate history churn, and defaults to private
+  per-run storage (`0700` directory / `0600` files).
+- Custom WS routers must forward `delta` opt-in and `resync` together; the
+  protocol table now documents that recovery contract explicitly.
+- CI and `release-dist` both run the complete source suite, production builds,
+  and all 12 canonical clean-container e2e tests before packs or dist tags;
+  `@playwright/test` is a workspace dev dependency.
+
 ## v0.3.3 — 2026-07-10
 - **SessionGrid overhaul**: responsive column clamp with card-proportional
   thumbnail font (no more 6.5px on a 4K display), per-card state dots

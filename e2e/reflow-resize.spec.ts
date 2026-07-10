@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { createHash } from 'node:crypto';
 import {
   bottomOffset,
   capturePane,
@@ -31,6 +32,28 @@ const ARCHIVE_ROWS = 1200;
 const LIVE_ROWS = 1050;
 const ARCHIVE_PREFIX = 'RF archive';
 const LIVE_PREFIX = 'RF live';
+
+type ArchiveDataState = {
+  path: string;
+  sha256: string;
+  lineCount: number;
+  byteCount: number;
+};
+
+function archiveDataState(session: string): ArchiveDataState {
+  const key = createHash('sha256').update(session).digest('hex');
+  const path = dockerExec(
+    `find /tmp -type f -name ${shellQuote(`history-${key}.jsonl`)} -print -quit`,
+  ).trim();
+  expect(path).not.toBe('');
+  const sha256 = dockerExec(`sha256sum ${shellQuote(path)}`).trim().split(/\s+/)[0] ?? '';
+  const lineCount = Number(dockerExec(`wc -l < ${shellQuote(path)}`).trim());
+  const byteCount = Number(dockerExec(`wc -c < ${shellQuote(path)}`).trim());
+  expect(sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(Number.isSafeInteger(lineCount)).toBe(true);
+  expect(Number.isSafeInteger(byteCount)).toBe(true);
+  return { path, sha256, lineCount, byteCount };
+}
 
 function paneWidth(session: string): number {
   return Number(dockerExec(
@@ -144,9 +167,15 @@ test('resize reflows only the live tmux window without a delta, a seam duplicate
     expect(archivedBefore.slice(0, 10)).toEqual(
       Array.from({ length: 10 }, (_, index) => `${ARCHIVE_PREFIX} ${String(index + 1).padStart(4, '0')} retained`),
     );
+    const archiveDataBefore = archiveDataState(session);
+    expect(archiveDataBefore.lineCount).toBeGreaterThan(0);
 
     await returnToBottom(page);
     expect(await bottomOffset(page)).toBe(0);
+    await wheel(page, -1000, 12);
+    await expect.poll(() => bottomOffset(page)).toBeGreaterThan(0);
+    await expect(page.getByTestId('demo-scroll-bottom')).toBeVisible();
+    await expect(page.getByTestId('demo-new-content')).toHaveCount(0);
     await resetFrameLog(page);
 
     await page.setViewportSize({ width: 640, height: 800 });
@@ -165,9 +194,14 @@ test('resize reflows only the live tmux window without a delta, a seam duplicate
     expect(reflow!.data).not.toBe(initialLive!.data);
 
     const reflowMarkers = liveMarkers(reflow!.data!);
-    expect(reflowMarkers.length).toBeGreaterThan(100);
+    expect(reflowMarkers.length).toBeGreaterThan(50);
+    expect(reflowMarkers.length).toBeLessThan(initialMarkers.length);
     expect(reflowMarkers[0]).toBeGreaterThan(initialMarkers[0]!);
+    expect(reflowMarkers.at(-1)).toBe(LIVE_ROWS);
     expect(new Set(reflowMarkers).size).toBe(reflowMarkers.length);
+    expect(archiveDataState(session)).toEqual(archiveDataBefore);
+    await expect(page.getByTestId('demo-new-content')).toHaveCount(0);
+    await returnToBottom(page);
     expect(await bottomOffset(page)).toBe(0);
 
     const archivedAfter = await loadArchivePrefix(page);

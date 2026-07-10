@@ -19,7 +19,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
   import {
-    createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
+    contentLinesChangeSource, createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
+    updatePendingContentCursor,
     type ContentUpdate,
   } from './content-update-gate';
   import {
@@ -27,11 +28,16 @@
     type AnsiPalette, type SgrState, type LineLinkRange,
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
+    readerAnchorLineDelta,
     prefixForCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
   } from '@thumbmux/core';
+
+  type LinesChangeMeta = {
+    source: 'live' | 'prepend' | 'replace';
+  };
 
   let {
     session,
@@ -66,7 +72,7 @@
      * call your composer's openDock() here, synchronously, so iOS raises the
      * keyboard (gesture call stack). */
     onTap?: () => void;
-    onLinesChange?: (lines: string[]) => void;
+    onLinesChange?: (lines: string[], meta: LinesChangeMeta) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
   } = $props();
@@ -200,9 +206,9 @@
     return htmlCache[idx] ?? ' ';
   }
 
-  export function scrollToBottom() {
+  export function scrollToBottom(): boolean {
     updateSelectionActive();
-    if (selectionActive) return;
+    if (selectionActive) return false;
     stopInertia();
     bottomOffsetPx = 0;
     if (altScreenMouse) {
@@ -216,6 +222,7 @@
     applyScroll();
     flushPendingContent();
     emitScrollState();
+    return true;
   }
 
   function maxOffset(): number {
@@ -345,19 +352,24 @@
     }
   }
 
-  function commitLines(next: string[], opts: { preserveReaderAnchor?: boolean } = {}) {
+  function commitLines(next: string[], opts: {
+    preserveReaderAnchor?: boolean;
+    source: LinesChangeMeta['source'];
+  }) {
     // Find common prefix so unchanged history isn't re-parsed.
     let common = 0;
     const minLen = Math.min(rawLines.length, next.length);
     while (common < minLen && rawLines[common] === next[common]) common++;
+    const linesChanged = rawLines.length !== next.length || common !== minLen;
 
-    const pureAppend = opts.preserveReaderAnchor
-      && next.length >= rawLines.length
-      && common === rawLines.length;
-    if (bottomOffsetPx > 0 && pureAppend) {
-      // A retained full prefix means the reader's mounted row still has the
-      // same raw index. Compensate exactly for lines appended below it.
-      bottomOffsetPx += (next.length - rawLines.length) * lineH;
+    if (bottomOffsetPx > 0 && opts.preserveReaderAnchor) {
+      const lineDelta = readerAnchorLineDelta(rawLines, next);
+      if (lineDelta !== 0) {
+        // Live captures may rewrite the prompt and one adjacent tail row
+        // while appending. A stable prefix through that small tail keeps the
+        // same reader row under the finger without treating resets as appends.
+        bottomOffsetPx = Math.max(0, bottomOffsetPx + lineDelta * lineH);
+      }
     }
 
     rawLines = next;
@@ -367,12 +379,15 @@
     bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
     contentEpoch++;
     applyScroll();
-    onLinesChange?.(rawLines);
+    if (linesChanged) onLinesChange?.(rawLines, { source: opts.source });
     emitScrollState();
   }
 
-  function setLines(nextLive: string[], replace = false) {
-    let preserveReaderAnchor = false;
+  function setLines(
+    nextLive: string[],
+    replace = false,
+    source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
+  ) {
     if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width.
@@ -380,12 +395,14 @@
     } else if (bottomOffsetPx > 0 && liveLines.length > 0) {
       const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
       liveLines = merged.lines;
-      preserveReaderAnchor = merged.preservedPrefix;
       if (merged.appendedLineCount > 0) archiveExhausted = false;
     } else {
       liveLines = nextLive;
     }
-    commitLines([...archivedLines, ...liveLines], { preserveReaderAnchor });
+    commitLines([...archivedLines, ...liveLines], {
+      preserveReaderAnchor: !replace,
+      source,
+    });
   }
 
   function requestOlderHistory() {
@@ -496,7 +513,7 @@
     requestAnimationFrame(() => {
       emitHistoryPrependEvent(lineCount, existingCacheValid, before, after);
     });
-    onLinesChange?.(rawLines);
+    onLinesChange?.(rawLines, { source: 'prepend' });
     emitScrollState();
     finishArchiveRequest();
   }
@@ -587,7 +604,11 @@
 
   function applyContentDelivery(delivery: ContentUpdate) {
     if (delivery.cursor !== undefined) cursor = delivery.cursor;
-    setLines(delivery.data.replace(/\r/g, '').split('\n'), delivery.meta.replace);
+    setLines(
+      delivery.data.replace(/\r/g, '').split('\n'),
+      delivery.meta.replace,
+      contentLinesChangeSource(delivery),
+    );
   }
 
   function receiveLiveContent(
@@ -613,14 +634,19 @@
 
   function flushDeferredPresentation() {
     if (busy() || selectionActive) return;
+    let bumpRenderEpoch = false;
     if (paletteRefreshPending) {
       paletteRefreshPending = false;
-      if (rawLines.length) rebuildFrom(0);
+      if (rawLines.length) {
+        rebuildFrom(0);
+        bumpRenderEpoch = true;
+      }
     }
     if (renderRefreshPending) {
       renderRefreshPending = false;
-      renderEpoch++;
+      bumpRenderEpoch = true;
     }
+    if (bumpRenderEpoch) renderEpoch++;
     applyScroll();
   }
 
@@ -1192,7 +1218,10 @@
       connected = true;
       if (type === 'cursor') {
         // caret-only update — content unchanged, nothing else to repaint
-        if (cur !== undefined) cursor = cur;
+        if (cur !== undefined) {
+          contentUpdateGate = updatePendingContentCursor(contentUpdateGate, cur);
+          cursor = cur;
+        }
         return;
       }
       receiveLiveContent(data, cur, meta);

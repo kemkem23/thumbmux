@@ -18,6 +18,27 @@ test('drag selection survives append and copies clean text from keyboard and dem
   const session = makeSessionName(testInfo, 'copy');
   try {
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await page.addInitScript((sessionName) => {
+      const NativeWebSocket = window.WebSocket;
+      const frames: string[] = [];
+      (window as unknown as { __thumbmuxSelectionFrames: string[] }).__thumbmuxSelectionFrames = frames;
+      window.WebSocket = class SelectionRecordingWebSocket extends NativeWebSocket {
+        constructor(...args: ConstructorParameters<typeof NativeWebSocket>) {
+          super(...args);
+          this.addEventListener('message', (event) => {
+            if (typeof event.data !== 'string') return;
+            try {
+              const frame = JSON.parse(event.data);
+              if (frame?.channel === sessionName && (frame.type === 'output' || frame.type === 'delta')) {
+                frames.push(event.data);
+              }
+            } catch {
+              // Ignore non-protocol traffic.
+            }
+          });
+        }
+      };
+    }, session);
     createLineSession(session, 'CP', 180);
     await openSession(page, session);
     await assertVirtualized(page);
@@ -40,10 +61,15 @@ test('drag selection survives append and copies clean text from keyboard and dem
     const totalBeforeAppend = await dataTotal(page);
     const appended = `CP live append after selection ${Date.now().toString(36)}`;
     appendLines(session, [appended]);
-    await page.waitForTimeout(900);
+    await expect.poll(() => page.evaluate((marker) => (
+      (window as unknown as { __thumbmuxSelectionFrames?: string[] }).__thumbmuxSelectionFrames ?? []
+    ).some((frame) => frame.includes(marker)), appended), { timeout: 20_000 }).toBe(true);
+    // Let the application's message handler and Svelte flush run after the
+    // recorder proves the output frame reached this browser.
+    await page.waitForTimeout(100);
     const afterAppendSelection = normalizeText(await page.evaluate(() => window.getSelection()?.toString() || ''));
     expect(afterAppendSelection).toBe(selected);
-    await expect.poll(() => dataTotal(page)).toBe(totalBeforeAppend);
+    expect(await dataTotal(page)).toBe(totalBeforeAppend);
 
     await page.evaluate(() => {
       window.getSelection()?.removeAllRanges();

@@ -240,12 +240,15 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
     await page.getByTestId('grid-group-toggle').click();
     const firstCard = page.getByTestId('grid-card').first();
     await firstCard.focus();
+    let verifiedMoves = 0;
     for (const key of ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp']) {
       const expected = await expectedSpatialMove(page, key);
       if (!expected) continue;
       await page.keyboard.press(key);
       expect(await activeGridKey(page)).toBe(expected);
+      verifiedMoves++;
     }
+    expect(verifiedMoves).toBeGreaterThanOrEqual(2);
     await page.getByTestId('grid-search').focus();
     await page.keyboard.press('ArrowRight');
     expect(await activeGridKey(page)).toBe('grid-search');

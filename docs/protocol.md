@@ -13,6 +13,7 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `keys` | `session`, `data` | write raw bytes to the pane (IME text, control sequences — `\r`, `\x1b[A`, …). Deliberately carries no client blob: this is the hot path. |
 | `resize` | `session`, `cols`, `rows`, `client?` | request pane geometry. The host's `onResizeRequest` hook may veto (e.g. a phone holds the size). |
 | `history_expand` | `session`, `beforeLine?`, `limit?` | page older scrollback from the archive (if the host wired one). Reply: `history`. |
+| `resync` | `session` | after rejecting a missing/stale delta, request one complete output frame. The server replies with `reset:'resync'`. Hosts with a custom WS message switch **must** forward this message to `TmuxWsMux.handleMessage()` (or equivalent `handleResync` routing) whenever they forward `delta: true`; otherwise the viewer can remain frozen after its first rejected delta. |
 | `sessions_subscribe` / `sessions_unsubscribe` | — | join/leave the `__sessions` list channel. |
 | `ping` | — | keepalive; server replies `{"type":"pong"}`. Clients close after 8 s without a pong. |
 | `client_info` | `client` | refresh this socket's descriptor (visibility, viewport, host telemetry id). |
@@ -60,7 +61,9 @@ all numeric fields are integers, `prefix` is in bounds, and the prefix hash
 matches. A bad, missing, or stale delta changes neither content nor cursor;
 the client sends one coalesced `{type:'resync', session}` request, ignores more
 deltas for that session, and resumes only after a full frame. The resync reply
-is a full `output` frame with `reset:'resync'`.
+is a full `output` frame with `reset:'resync'`. A host that routes parsed client
+messages with its own switch must forward `resync` together with the subscribe
+`delta` flag; the two parts form one recovery contract.
 
 Servers compare the complete serialized JSON UTF-8 sizes, including `cursor`,
 and send a delta only when its prefix is non-zero and it is strictly smaller

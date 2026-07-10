@@ -22,7 +22,11 @@ const DIST = new URL("./dist/", import.meta.url).pathname;
 
 const driver = createBunTmuxDriver();
 const handleUpload = createUploadHandler({ dir: "uploads" });
-const archive = new FileHistoryArchive({ root: process.env.THUMBMUX_HISTORY_ROOT });
+// The default archive is a private, per-run temp root, so a recycled demo-N
+// name cannot inherit another demo process's scrollback. Setting this variable
+// is the explicit opt-in to persistence across runs.
+const configuredHistoryRoot = process.env.THUMBMUX_HISTORY_ROOT?.trim();
+const archive = new FileHistoryArchive(configuredHistoryRoot ? { root: configuredHistoryRoot } : {});
 const mux = new TmuxWsMux({ driver, archive, log: console.log });
 
 function lanIp(): string {

@@ -11,6 +11,7 @@ class FakeWS {
   attempts = 0;
   failSends = 0;
   droppedSends = 0;
+  backpressuredSends = 0;
 
   send(data: string) {
     this.attempts += 1;
@@ -23,6 +24,10 @@ class FakeWS {
       return 0;
     }
     this.sent.push(data);
+    if (this.backpressuredSends > 0) {
+      this.backpressuredSends -= 1;
+      return -1;
+    }
     return data.length;
   }
 
@@ -126,7 +131,7 @@ describe("server delta conformance", () => {
     }
   });
 
-  test("retains a failed-send base and clears bases on subscription lifecycle events", async () => {
+  test("retries a truly dropped frame as a full snapshot and clears bases on lifecycle events", async () => {
     const { mux, setContent } = makeHarness();
     const primary = new FakeWS();
     const witness = new FakeWS();
@@ -135,15 +140,14 @@ describe("server delta conformance", () => {
       mux.subscribe(SESSION, witness, undefined, { delta: true });
       await until(() => primary.frames().length === 1 && witness.frames().length === 1);
 
+      const recovered = `${longContent()}\nrecovered-after-drop`;
+      const beforeDrop = primary.frames().length;
+      const attemptsBeforeDrop = primary.attempts;
       primary.droppedSends = 1;
-      setContent(["missed", ...longContent("one").split("\n").slice(1)].join("\n"));
-      await until(() => primary.droppedSends === 0);
-      const beforeRecovery = primary.frames().length;
-      setContent(["missed", ...longContent("two").split("\n").slice(1)].join("\n"));
-      await until(() => primary.frames().length > beforeRecovery);
-      // If the failed delivery advanced the base, this would be a small delta
-      // against the missed snapshot. The last successful base has no prefix.
-      expect(primary.frames().at(-1).type).toBe("output");
+      setContent(recovered);
+      await until(() => primary.attempts >= attemptsBeforeDrop + 2
+        && primary.frames().length > beforeDrop);
+      expect(primary.frames().at(-1)).toMatchObject({ type: "output", data: recovered });
 
       mux.unsubscribe(SESSION, primary);
       const beforeResubscribe = primary.frames().length;
@@ -158,6 +162,83 @@ describe("server delta conformance", () => {
       expect(primary.frames().at(-1).type).toBe("output");
     } finally {
       mux.stop();
+    }
+  });
+
+  test("treats Bun -1 backpressure as a delivered frame and advances the delta base", async () => {
+    const initial = longContent();
+    const { mux, setContent } = makeHarness(initial);
+    const ws = new FakeWS();
+    try {
+      mux.subscribe(SESSION, ws, undefined, { delta: true });
+      await until(() => ws.frames().length === 1);
+
+      const firstAppend = `${initial}\none`;
+      ws.backpressuredSends = 1;
+      setContent(firstAppend);
+      await until(() => ws.frames().length === 2);
+      const firstDelta = ws.frames().at(-1);
+      expect(firstDelta.type).toBe("delta");
+      expect(applyMuxDelta(splitMuxOutputData(initial), firstDelta)).toEqual(splitMuxOutputData(firstAppend));
+
+      const secondAppend = `${firstAppend}\ntwo`;
+      setContent(secondAppend);
+      await until(() => ws.frames().length === 3);
+      const secondDelta = ws.frames().at(-1);
+      expect(secondDelta).toMatchObject({
+        type: "delta",
+        baseLength: splitMuxOutputData(firstAppend).length,
+      });
+      expect(applyMuxDelta(splitMuxOutputData(firstAppend), secondDelta)).toEqual(splitMuxOutputData(secondAppend));
+    } finally {
+      mux.stop();
+    }
+  });
+
+  test("a pending co-viewer cannot suppress a cursor-only update to an established viewer", async () => {
+    const { mux, cursor } = makeHarness();
+    const established = new FakeWS();
+    const pending = new FakeWS();
+    try {
+      mux.subscribe(SESSION, established, undefined, { delta: true });
+      mux.subscribe(SESSION, pending, undefined, { delta: true });
+      await until(() => established.frames().length === 1 && pending.frames().length === 1);
+
+      (mux as any).requireFullOutput(SESSION, pending);
+      cursor.x = 9;
+      await until(() => established.sent.map((data) => JSON.parse(data))
+        .some((frame) => frame.channel === SESSION && frame.type === "cursor" && frame.cursor?.col === 9));
+
+      const establishedCursor = established.sent.map((data) => JSON.parse(data))
+        .findLast((frame) => frame.channel === SESSION && frame.type === "cursor");
+      expect(establishedCursor.cursor).toEqual({ row: 0, col: 9 });
+      expect(pending.frames().at(-1)).toMatchObject({ type: "output", cursor: { row: 0, col: 9 } });
+    } finally {
+      mux.stop();
+    }
+  });
+
+  test("a dropped or thrown cursor-only send recovers that viewer with a full frame", async () => {
+    for (const failure of ["drop", "throw"] as const) {
+      const { mux, cursor } = makeHarness();
+      const ws = new FakeWS();
+      try {
+        mux.subscribe(SESSION, ws, undefined, { delta: true });
+        await until(() => ws.frames().length === 1);
+        const before = ws.frames().length;
+
+        if (failure === "drop") ws.droppedSends = 1;
+        else ws.failSends = 1;
+        cursor.x = failure === "drop" ? 10 : 11;
+
+        await until(() => ws.frames().length > before);
+        expect(ws.frames().at(-1)).toMatchObject({
+          type: "output",
+          cursor: { row: 0, col: cursor.x },
+        });
+      } finally {
+        mux.stop();
+      }
     }
   });
 
@@ -204,6 +285,7 @@ describe("server delta conformance", () => {
       const frames = legacy.frames();
       expect(frames.every((frame) => frame.type === "output")).toBe(true);
       expect(frames.at(-1)).toMatchObject({ type: "output", data: longContent("legacy update") });
+      expect((mux as any).outputBases.get(SESSION)?.has(legacy) ?? false).toBe(false);
     } finally {
       mux.stop();
     }

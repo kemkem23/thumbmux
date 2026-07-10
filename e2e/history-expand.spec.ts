@@ -71,6 +71,8 @@ test('repeated top expansion reaches the earliest archive range without moving t
       await expect.poll(() => dataTotal(page), { timeout: 30_000 })
         .toBeGreaterThan(totals[totals.length - 1]!);
       totals.push(await dataTotal(page));
+      await expect(page.getByTestId('demo-new-content')).toHaveCount(0);
+      await expect(page.getByTestId('demo-scroll-bottom')).toBeVisible();
       await assertVirtualized(page);
     }
 

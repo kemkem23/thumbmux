@@ -79,7 +79,13 @@ export interface HistoryArchiveLike {
   ingestSnapshot(
     session: string,
     content: string,
-    opts: { previousContent: string | null; fullHistory: boolean; liveLineLimit: number },
+    opts: {
+      previousContent: string | null;
+      fullHistory: boolean;
+      liveLineLimit: number;
+      /** Replace the live archive window in place after a pane reflow. */
+      replace?: boolean;
+    },
   ): { liveContent: string };
   readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
   renameSession(oldSession: string, newSession: string): void;
@@ -190,6 +196,15 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private queuedCapturesFullHistory = new Set<string>();
   private captureStartLines = new Map<string, number>();
   private archiveSeeded = new Set<string>();
+  /** Sessions whose next successful archive ingest must replace, not append,
+   * because accepted geometry changed tmux's physical line wrapping. Each
+   * resize gets a monotonic generation so stale in-flight captures cannot
+   * consume intent created after they started. */
+  private pendingArchiveReflows = new Map<string, number>();
+  /** Latest accepted geometry generation for each session. Captures snapshot
+   * this before awaiting the driver and discard themselves if it changes. */
+  private geometryGenerations = new Map<string, number>();
+  private geometryGeneration = 0;
   private lastReconcileCapture = new Map<string, number>();
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
   private sessionListProvider: () => unknown[];
@@ -262,7 +277,14 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.requireFullOutput(session, ws);
     const profile = this.profileOf(session);
     const cachedContent = this.contents.get(session);
-    if (cachedContent !== undefined) {
+    const resizeCapturePending = this.pendingArchiveReflows.has(session);
+    if (resizeCapturePending) {
+      // contents still describes the previous physical wrapping until the
+      // matching resize capture succeeds. Never establish a new viewer's base
+      // from that stale cache or consume its reset before the reflowed frame.
+      this.requireResetOutput(session, ws, "resize");
+    }
+    if (cachedContent !== undefined && !resizeCapturePending) {
       this.sendOutputFrame(session, ws, {
         channel: session,
         type: "output",
@@ -275,14 +297,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       // Widen the refresh back to the full live scrollback window; otherwise a
       // cache kept alive by another viewer can stay stuck on the small initial
       // capture window and make terminal scrolling feel truncated.
-      const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
       this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
-      this.queueCapture(session, { fullHistory: wantsArchive });
-    } else {
-      const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
+    } else if (!resizeCapturePending) {
       this.captureStartLines.set(session, this.INITIAL_CAPTURE_START_LINE);
-      this.queueCapture(session, { fullHistory: wantsArchive });
     }
+    const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
+    this.queueCapture(session, { fullHistory: wantsArchive });
     this.ensurePolling();
     this.refreshSessionListSchedule();
 
@@ -472,8 +492,9 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   /**
    * Serialize and send a full-or-delta output frame for exactly one viewer.
-   * The base advances only after send does not throw, so a failed delta can
-   * never make the following frame depend on data that did not leave the mux.
+   * The base advances only after Bun accepts the frame (including -1: queued
+   * under backpressure). A real drop/throw forces a complete retry, so a live
+   * socket cannot remain stale when the pane goes idle immediately afterward.
    */
   private sendOutputFrame(session: string, ws: WS, full: MuxFullOutputFrame): boolean {
     const reset = this.pendingOutputResets.get(session)?.get(ws);
@@ -487,17 +508,28 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const status = this.wsSend(ws, JSON.stringify(output));
       // Bun reports a dropped frame as 0 and backpressure as -1. Structural
       // adapters commonly return void, which remains a successful handoff.
-      if (typeof status === "number" && status <= 0) return false;
+      // A -1 frame is queued and delivered in order; treating it as a failure
+      // would leave the server base behind the client's delivered base.
+      if (status === 0) {
+        this.requireFullOutput(session, ws);
+        return false;
+      }
     } catch {
+      this.requireFullOutput(session, ws);
       return false;
     }
 
-    let bases = this.outputBases.get(session);
-    if (!bases) {
-      bases = new Map();
-      this.outputBases.set(session, bases);
+    // Full-only viewers can never consume a split base. If a later subscribe
+    // opts in, subscribe() invalidates and re-establishes the base with a
+    // forced full frame first.
+    if (this.isDeltaSubscriber(session, ws)) {
+      let bases = this.outputBases.get(session);
+      if (!bases) {
+        bases = new Map();
+        this.outputBases.set(session, bases);
+      }
+      bases.set(ws, splitMuxOutputData(frame.data));
     }
-    bases.set(ws, splitMuxOutputData(frame.data));
     const fulls = this.pendingOutputFulls.get(session);
     fulls?.delete(ws);
     if (fulls?.size === 0) this.pendingOutputFulls.delete(session);
@@ -505,6 +537,23 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     resets?.delete(ws);
     if (resets?.size === 0) this.pendingOutputResets.delete(session);
     return true;
+  }
+
+  /** A lost cursor-only frame must make that viewer eligible for a complete
+   * retry. lastCursor is session-global, so otherwise the next idle sample
+   * looks unchanged and the affected viewer can remain stale indefinitely. */
+  private sendCursorFrame(session: string, ws: WS, message: string): boolean {
+    try {
+      const status = this.wsSend(ws, message);
+      if (status === 0) {
+        this.requireFullOutput(session, ws);
+        return false;
+      }
+      return true;
+    } catch {
+      this.requireFullOutput(session, ws);
+      return false;
+    }
   }
 
   private sendPendingOutputFrames(
@@ -536,6 +585,8 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.hashes.delete(session);
     this.lastActivity.delete(session);
     this.captureStartLines.delete(session);
+    this.pendingArchiveReflows.delete(session);
+    this.geometryGenerations.delete(session);
     this.clearImmediateCapture(session);
     this.queuedCapturesPending.delete(session);
     this.queuedCapturesInFlight.delete(session);
@@ -587,6 +638,9 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       if (last?.cols === cols && last.rows === rows) return;
       this.driver.resizeWindow(session, cols, rows);
       this.lastAppliedGeometry.set(session, { cols, rows });
+      const generation = ++this.geometryGeneration;
+      this.geometryGenerations.set(session, generation);
+      this.pendingArchiveReflows.set(session, generation);
       this.invalidateOutputBases(session);
       for (const viewer of this.subscribers.get(session) ?? []) {
         this.requireResetOutput(session, viewer, "resize");
@@ -824,6 +878,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.lastAppliedGeometry.set(newSession, lastGeometry);
       this.lastAppliedGeometry.delete(oldSession);
     }
+    const geometryGeneration = this.geometryGenerations.get(oldSession);
+    this.geometryGenerations.delete(oldSession);
+    this.geometryGenerations.delete(newSession);
+    if (geometryGeneration !== undefined) {
+      this.geometryGenerations.set(newSession, geometryGeneration);
+    }
     if (this.immediateCaptureTimers.has(oldSession)) {
       this.clearImmediateCapture(oldSession);
       this.scheduleImmediateCapture(newSession);
@@ -836,6 +896,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
     if (this.archiveSeeded.delete(oldSession)) {
       this.archiveSeeded.add(newSession);
+    }
+    const pendingArchiveReflow = this.pendingArchiveReflows.get(oldSession);
+    this.pendingArchiveReflows.delete(oldSession);
+    this.pendingArchiveReflows.delete(newSession);
+    if (pendingArchiveReflow !== undefined) {
+      this.pendingArchiveReflows.set(newSession, pendingArchiveReflow);
     }
     this.archive?.renameSession(oldSession, newSession);
     // Handle pipe: stop old, restart with new name
@@ -875,6 +941,11 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     viewers: Set<WS>,
     opts: { fullHistory?: boolean } = {},
   ) {
+    // Snapshot before the first await. A resize accepted while this capture is
+    // in flight belongs to a later capture; the old physical wrapping must not
+    // mutate archive/content/base/reset state or reach any viewer.
+    const geometryGeneration = this.geometryGenerations.get(session);
+    const archiveReflowGeneration = this.pendingArchiveReflows.get(session);
     try {
       const previousContent = this.contents.get(session) ?? null;
       const startLine = opts.fullHistory
@@ -895,13 +966,33 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       } else {
         content = await this.driver.capturePane(session, captureOpts);
       }
+      if (this.geometryGenerations.get(session) !== geometryGeneration) {
+        // queueCapture coalesces work per session. If the invalidated capture
+        // owned the one-shot archive seed, hand that intent back to the queued
+        // current-generation lane instead of silently consuming it. Calling
+        // the queue also covers a direct capture whose resize recapture raced
+        // all the way to completion before this stale await settled.
+        if (opts.fullHistory) this.queueCapture(session, { fullHistory: true });
+        return;
+      }
       const liveContent = !useArchive
         ? content
         : this.archive!.ingestSnapshot(session, content, {
             previousContent,
             fullHistory: !!opts.fullHistory,
             liveLineLimit: this.liveLineLimit,
+            replace: archiveReflowGeneration !== undefined || undefined,
           }).liveContent;
+      // The synchronous ingest returned successfully. Only now consume the
+      // exact generation captured at entry. A throwing archive or a newer
+      // resize must keep its generation pending for another capture. When the
+      // profile has no active archive, consume the matching generation too:
+      // there is no archive replacement to defer and retaining it would leak
+      // one-shot state until a future profile change.
+      if (archiveReflowGeneration !== undefined
+        && this.pendingArchiveReflows.get(session) === archiveReflowGeneration) {
+        this.pendingArchiveReflows.delete(session);
+      }
       if (opts.fullHistory && useArchive) {
         this.archiveSeeded.add(session);
         this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
@@ -913,22 +1004,51 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const hash = this.driver.hash(liveContent);
       this.contents.set(session, liveContent);
       if (hash === this.hashes.get(session)) {
-        const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
+        const atomicCursor = this.driver.captureWithCursor
+          ? this.mapRawCursor(rawCursor, trailingBlanks ?? 0)
+          : undefined;
+        // null is an authoritative atomic sample (cursor hidden/copy-mode),
+        // while undefined means this legacy driver did not sample at all.
+        const cursor = atomicCursor !== undefined
+          ? atomicCursor
+          : (this.lastCursor.get(session) ?? null);
+        const cursorMoved = atomicCursor !== undefined
+          && !this.cursorEq(atomicCursor, this.lastCursor.get(session));
         if (this.hasPendingOutputFrame(session, viewers)) {
-          this.lastCursor.set(session, cursor);
+          // Remember who receives the complete pending frame before successful
+          // sends clear their markers. A coincident cursor move still has to
+          // reach every established viewer that did not need that full frame.
+          const pendingViewers = new Set<WS>();
+          const fulls = this.pendingOutputFulls.get(session);
+          const resets = this.pendingOutputResets.get(session);
+          for (const ws of viewers) {
+            if (fulls?.has(ws) || resets?.has(ws)) pendingViewers.add(ws);
+          }
+          if (cursorMoved) this.lastCursor.set(session, atomicCursor);
           this.sendPendingOutputFrames(session, viewers, liveContent, cursor);
+          if (cursorMoved) {
+            const cursorMsg = JSON.stringify({
+              channel: session,
+              type: "cursor",
+              cursor: atomicCursor,
+            } satisfies MuxServerMessage);
+            for (const ws of viewers) {
+              if (pendingViewers.has(ws)) continue;
+              this.sendCursorFrame(session, ws, cursorMsg);
+            }
+          }
           return;
         }
         // Content unchanged — but a cursor that moved anyway (arrow keys on a
         // shell line) must still reach viewers, minus the pane re-send. Only
         // the atomic driver path does this: with two-call sampling a mid-
         // repaint cursor could spam spurious frames on every idle tick.
-        if (this.driver.captureWithCursor) {
-          if (!this.cursorEq(cursor, this.lastCursor.get(session))) {
-            this.lastCursor.set(session, cursor);
-            const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor } satisfies MuxServerMessage);
+        if (atomicCursor !== undefined) {
+          if (cursorMoved) {
+            this.lastCursor.set(session, atomicCursor);
+            const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor: atomicCursor } satisfies MuxServerMessage);
             for (const ws of viewers) {
-              try { this.wsSend(ws, cursorMsg); } catch {}
+              this.sendCursorFrame(session, ws, cursorMsg);
             }
           }
         }
