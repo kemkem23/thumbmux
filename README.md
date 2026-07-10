@@ -139,7 +139,7 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in validated line deltas cut suffix-heavy traffic by 95% vs equivalent full frames in the clean-container e2e; per-message deflate remains available |
 | **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
 | **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
-| **Tests** | 476 source tests across 31 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
+| **Tests** | 478 source tests across 32 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
 | **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
 
 ## Get started
@@ -149,9 +149,9 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.3.4-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.3.5-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.3.4-dist
+npm i    github:kemkem23/thumbmux#v0.3.5-dist
 ```
 
 ```ts
@@ -189,7 +189,7 @@ name; reuse a name only for the same logical session.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.3.4-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.3.5-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from

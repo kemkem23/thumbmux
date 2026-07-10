@@ -97,6 +97,8 @@ tar -C "$PACKAGE_ROOT" \
   --exclude='*/node_modules' \
   --exclude=dist \
   --exclude='*/dist' \
+  --exclude=git-dist \
+  --exclude='*/git-dist' \
   -cf - . \
   | docker exec -i "$CONTAINER" bash -lc 'mkdir -p /app && tar -C /app -xf -'
 

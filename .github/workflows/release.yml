@@ -19,7 +19,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: install Playwright Chromium
         run: ./node_modules/.bin/playwright install --with-deps chromium
-      - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./demo/*.test.ts
+      - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
       - name: canonical container e2e
@@ -36,19 +36,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
       - name: build release dists
-        run: bun run build:packages
+        run: bun run build:git-dist
+      - name: root git-dist consumer smoke
+        run: bun run smoke:git-dist
       - name: commit dists and push ${GITHUB_REF_NAME}-dist
         run: |
           git config user.name "thumbmux-release"
           git config user.email "noreply@github.com"
-          # dists ship prebuilt in this tag — drop the prepare script so npm
-          # (which always runs prepare for git deps, unlike bun) doesn't try
-          # to rebuild in consumer environments that lack bun/devDeps.
-          npm pkg delete scripts.prepare
+          # Dists ship prebuilt in this tag. The root artifact is read-only:
+          # remove every lifecycle/demo/build script so no package manager
+          # rebuilds it or advertises commands whose sources are not shipped.
+          npm pkg delete scripts
           # npm packs git deps honoring .gitignore unless a files whitelist
           # exists — without this, the committed dists never reach consumers.
-          npm pkg set files='["core","server","svelte","docs"]' --json
-          git add -f core/dist server/dist svelte/dist package.json
-          git commit -m "release: ${GITHUB_REF_NAME} + built dists (prepare stripped)"
+          npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./package.json":"./package.json"}' --json
+          npm pkg set files='["git-dist","docs"]' --json
+          # Keep pristine scoped-package dists available to pack from this tag;
+          # the root files whitelist still installs only git-dist + docs.
+          git add -f core/dist server/dist svelte/dist git-dist package.json
+          git commit -m "release: ${GITHUB_REF_NAME} + prebuilt git dist"
           git tag "${GITHUB_REF_NAME}-dist"
           git push origin "${GITHUB_REF_NAME}-dist"

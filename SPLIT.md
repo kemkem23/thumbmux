@@ -25,6 +25,10 @@ After pushing main, cut a release: `git push <public> thumbmux-release:refs/tags
 CI workflow file `.github/workflows/release.yml` (workflow name `release-dist`)
 builds dists, runs the suite, and publishes `vX.Y.Z-dist` — the ONLY ref
 consumers should pin (`"thumbmux": "github:<owner>/<repo>#vX.Y.Z-dist"`).
+The release build copies package output to a root-only `git-dist/`, rewrites
+that aggregate's `@thumbmux/core` imports to relative paths, and points root
+exports at the copies. Original standalone subpackage output and packs keep
+their normal scoped-package dependency.
 
 Release checklist:
 - Bump root, core, server, and svelte `package.json` versions in lockstep.

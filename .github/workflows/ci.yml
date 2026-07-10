@@ -19,7 +19,7 @@ jobs:
       - name: protocol conformance (real tmux)
         run: bun test ./server/tests/
       - name: svelte + demo unit tests
-        run: bun test ./svelte/tests/ ./demo/*.test.ts
+        run: bun test ./svelte/tests/ ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
       - name: canonical container e2e
@@ -40,3 +40,5 @@ jobs:
           (cd core && bun run build && bun pm pack)
           (cd server && bun run build && bun pm pack)
           (cd svelte && bun run build && bun pm pack)
+      - name: root git-dist consumer smoke
+        run: bun run build:git-dist && bun run smoke:git-dist

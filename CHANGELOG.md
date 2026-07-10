@@ -3,6 +3,19 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
 
+## v0.3.5 — 2026-07-10
+- This tag supersedes `v0.3.4-dist`, which was generated during release
+  validation but failed the post-workflow TypeScript/Vite consumer smoke; no
+  GitHub Release was published for that ref.
+- **Self-contained root git dist**: the release rail now copies built package
+  output into a root-only `git-dist/`, rewrites that aggregate's internal core
+  imports to the relative core dist shipped beside it, and points root exports
+  at those copies. Fresh TypeScript, Node, Bun, and Vite/Svelte consumers no
+  longer need an unpublished `@thumbmux/core` workspace package.
+- Original core/server/Svelte dists stay byte-compatible with their standalone
+  scoped-package contract; focused tests fail closed on missing builds and pin
+  the aggregate rewrite without mutating package output.
+
 ## v0.3.4 — 2026-07-10
 - **Delta output frames (opt-in wire perf)**: a subscriber that sends
   `delta: true` on subscribe receives replacement-suffix `type:"delta"`

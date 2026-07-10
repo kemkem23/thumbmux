@@ -1,0 +1,17 @@
+{
+  "name": "thumbmux-git-dist-consumer-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc -p tsconfig.json && vite build && bun run runtime-smoke.mjs"
+  },
+  "dependencies": {
+    "svelte": "^5.51.0",
+    "thumbmux": "file:../thumbmux.tgz"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}
