@@ -65,11 +65,14 @@ export class TmuxMux {
       this.sendClientInfo('visibility');
       if (document.visibilityState === 'visible') {
         // Coming back to foreground — reconnect immediately if dead
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        if (!this.ws || (
+          this.ws.readyState !== WebSocket.OPEN
+          && this.ws.readyState !== WebSocket.CONNECTING
+        )) {
           this.cancelReconnect();
           this.reconnectDelay = RECONNECT_MIN;
-          this.connect();
-        } else {
+          this.ensureConnection();
+        } else if (this.ws.readyState === WebSocket.OPEN) {
           // Connection looks alive — verify with a ping
           this.sendPing();
           this.flushPendingResizes();
@@ -121,8 +124,24 @@ export class TmuxMux {
   }
 
   private sendClientInfo(_reason = 'client_info') {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'client_info', client: this.clientInfo() }));
+    this.send(this.ws, { type: 'client_info', client: this.clientInfo() });
+  }
+
+  /**
+   * Send only through the currently-owned open socket. Capturing `socket`
+   * before checking it prevents a callback from an older connection from
+   * accidentally sending through a newer socket stored in `this.ws`.
+   */
+  private send(socket: WebSocket | null, message: unknown): boolean {
+    if (!socket || this.ws !== socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(message));
+      return true;
+    } catch {
+      // readyState can change between the guard and send (for example while
+      // a page is being frozen). The close/error path owns reconnection.
+      return false;
+    }
   }
 
   private pageVisible(): boolean {
@@ -141,10 +160,10 @@ export class TmuxMux {
   }
 
   private sendSubscribe(session: string) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
     const tail = this.effectiveTail(session);
-    this.sentTail.set(session, tail);
-    this.ws.send(JSON.stringify({ type: 'subscribe', session, tail, client: this.clientInfo() }));
+    if (this.send(this.ws, { type: 'subscribe', session, tail, client: this.clientInfo() })) {
+      this.sentTail.set(session, tail);
+    }
   }
 
   /** Re-subscribe when the tail composition changes (e.g. a full viewer
@@ -158,14 +177,14 @@ export class TmuxMux {
   }
 
   private sendResizeNow(session: string, geometry: { cols: number; rows: number }) {
-    if (this.ws?.readyState !== WebSocket.OPEN || !this.pageVisible()) return;
-    this.ws.send(JSON.stringify({
+    if (!this.pageVisible()) return;
+    this.send(this.ws, {
       type: 'resize',
       session,
       cols: geometry.cols,
       rows: geometry.rows,
       client: this.clientInfo(),
-    }));
+    });
   }
 
   private flushResize(session: string) {
@@ -186,28 +205,51 @@ export class TmuxMux {
     if (typeof window === 'undefined') return;
     this.bindVisibility();
     this.bindViewport();
-    this.cleanup();
+
+    // Visibility/pageshow and reconnect timers can converge on the same tick.
+    // Never replace a healthy or in-flight connection with another one.
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    // A CLOSED/CLOSING socket may not have delivered its close callback (page
+    // freeze and mobile network transitions are common examples). Detach it
+    // before installing the replacement so late callbacks are harmless.
+    if (this.ws) {
+      this.releaseSocket(this.ws, true);
+    } else {
+      this.clearConnectionTimers();
+    }
+    this.connected = false;
+    this.cancelReconnect();
 
     const url = this.getUrl();
-    this.ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.ws = socket;
 
     // Connection timeout — if not open in 8s, kill and retry
-    this.connectTimer = setTimeout(() => {
+    const connectTimer = setTimeout(() => {
+      if (this.ws !== socket || this.connectTimer !== connectTimer) return;
       this.connectTimer = null;
-      if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
-        this.ws.close();
+      if (socket.readyState === WebSocket.CONNECTING) {
+        this.closeSocket(socket);
       }
     }, CONNECT_TIMEOUT);
+    this.connectTimer = connectTimer;
 
-    this.ws.onopen = () => {
-      if (this.connectTimer) {
+    socket.onopen = () => {
+      if (this.ws !== socket) {
+        this.releaseSocket(socket, true);
+        return;
+      }
+      if (this.connectTimer === connectTimer) {
         clearTimeout(this.connectTimer);
         this.connectTimer = null;
       }
       this.connected = true;
       this.reconnectDelay = RECONNECT_MIN; // reset backoff on success
       this.cancelReconnect();
-      this.startPing();
+      this.startPing(socket);
       this.sendClientInfo('open');
       // Re-subscribe all active sessions
       for (const session of this.subs.keys()) {
@@ -215,12 +257,13 @@ export class TmuxMux {
       }
       // Re-arm the session-list push across reconnects too.
       if (this.sessionCallbacks.size > 0) {
-        this.ws?.send(JSON.stringify({ type: 'sessions_subscribe' }));
+        this.send(socket, { type: 'sessions_subscribe' });
       }
       this.flushPendingResizes();
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       try {
         const msg = JSON.parse(event.data);
         // Handle pong from server
@@ -251,40 +294,65 @@ export class TmuxMux {
       } catch {}
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
       this.connected = false;
-      this.cleanup();
+      this.releaseSocket(socket);
       this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
+    socket.onerror = () => {
+      if (this.ws !== socket) return;
       this.connected = false;
-      this.ws?.close();
+      this.closeSocket(socket);
     };
   }
 
-  private cleanup() {
+  private clearConnectionTimers() {
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
     if (this.pongTimer) { clearTimeout(this.pongTimer); this.pongTimer = null; }
     if (this.connectTimer) { clearTimeout(this.connectTimer); this.connectTimer = null; }
-    this.ws = null;
   }
 
-  private startPing() {
+  private closeSocket(socket: WebSocket) {
+    if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING) return;
+    try {
+      socket.close();
+    } catch {
+      // Closing is best-effort; a late close callback is identity-guarded.
+    }
+  }
+
+  private releaseSocket(socket: WebSocket, close = false) {
+    const isCurrent = this.ws === socket;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    if (isCurrent) {
+      this.clearConnectionTimers();
+      this.ws = null;
+    }
+    if (close) this.closeSocket(socket);
+  }
+
+  private startPing(socket: WebSocket) {
+    if (this.ws !== socket) return;
     if (this.pingTimer) clearInterval(this.pingTimer);
-    this.pingTimer = setInterval(() => this.sendPing(), PING_INTERVAL);
+    this.pingTimer = setInterval(() => this.sendPing(socket), PING_INTERVAL);
   }
 
-  private sendPing() {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'ping', client: this.clientInfo() }));
+  private sendPing(socket: WebSocket | null = this.ws) {
+    if (!socket || !this.send(socket, { type: 'ping', client: this.clientInfo() })) return;
     // Expect pong within timeout
     if (this.pongTimer) clearTimeout(this.pongTimer);
-    this.pongTimer = setTimeout(() => {
+    const pongTimer = setTimeout(() => {
+      if (this.ws !== socket || this.pongTimer !== pongTimer) return;
       this.pongTimer = null;
       // No pong received — connection is dead
-      this.ws?.close();
+      this.closeSocket(socket);
     }, PONG_TIMEOUT);
+    this.pongTimer = pongTimer;
   }
 
   private cancelReconnect() {
@@ -301,12 +369,14 @@ export class TmuxMux {
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX);
 
-    this.reconnectTimer = setTimeout(() => {
+    const reconnectTimer = setTimeout(() => {
+      if (this.reconnectTimer !== reconnectTimer) return;
       this.reconnectTimer = null;
       if (this.subs.size > 0 || this.sessionCallbacks.size > 0) {
-        this.connect();
+        this.ensureConnection();
       }
     }, delay);
+    this.reconnectTimer = reconnectTimer;
   }
 
   /** Subscribe to a tmux session's output. Returns unsubscribe function. */
@@ -342,9 +412,7 @@ export class TmuxMux {
         this.subTails.delete(session);
         this.sentTail.delete(session);
         this.pendingResizeBySession.delete(session);
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: 'unsubscribe', session }));
-        }
+        this.send(this.ws, { type: 'unsubscribe', session });
       } else {
         this.refreshSubscription(session);
       }
@@ -360,23 +428,21 @@ export class TmuxMux {
     this.sessionCallbacks.add(callback);
     this.ensureConnection();
     if (first && this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'sessions_subscribe' }));
+      this.send(this.ws, { type: 'sessions_subscribe' });
     }
     return () => {
       this.sessionCallbacks.delete(callback);
       if (this.sessionCallbacks.size === 0 && this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'sessions_unsubscribe' }));
+        this.send(this.ws, { type: 'sessions_unsubscribe' });
       }
     };
   }
 
   /** Send keys to a session. */
   sendKeys(session: string, data: string) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      // No client blob here: a keystroke frame is hot-path (~60B vs ~520B) —
-      // the server already knows this socket from subscribe/client_info.
-      this.ws.send(JSON.stringify({ type: 'keys', session, data }));
-    }
+    // No client blob here: a keystroke frame is hot-path (~60B vs ~520B) —
+    // the server already knows this socket from subscribe/client_info.
+    this.send(this.ws, { type: 'keys', session, data });
   }
 
   /** Sync terminal size to tmux pane. */
@@ -388,9 +454,7 @@ export class TmuxMux {
 
   /** Expand capture history when the viewer scrolls to the top. */
   requestHistory(session: string, beforeLine?: number | null, limit = 500) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'history_expand', session, beforeLine: beforeLine ?? null, limit }));
-    }
+    this.send(this.ws, { type: 'history_expand', session, beforeLine: beforeLine ?? null, limit });
   }
 }
 
