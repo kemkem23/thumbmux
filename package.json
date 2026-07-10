@@ -3,7 +3,7 @@
   "version": "0.3.5",
   "private": true,
   "type": "module",
-  "description": "tmux for thumbs \u2014 mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
+  "description": "tmux for thumbs — mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
   "workspaces": [
     "core",
     "svelte",
@@ -12,29 +12,26 @@
   ],
   "repository": "github:kemkem23/thumbmux",
   "license": "MIT",
-  "scripts": {
-    "demo": "bun run --cwd demo start",
-    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build",
-    "build:git-dist": "bun run build:packages && bun run ./scripts/rewrite-git-dist-imports.ts",
-    "smoke:git-dist": "bash ./scripts/smoke-git-dist.sh",
-    "prepare": "bun run build:packages"
-  },
   "devDependencies": {
     "@playwright/test": "^1.61.1"
   },
   "exports": {
     "./core": {
-      "types": "./core/dist/index.d.ts",
-      "import": "./core/dist/index.js"
+      "types": "./git-dist/core/index.d.ts",
+      "import": "./git-dist/core/index.js"
     },
     "./server": {
-      "types": "./server/dist/index.d.ts",
-      "import": "./server/dist/index.js"
+      "types": "./git-dist/server/index.d.ts",
+      "import": "./git-dist/server/index.js"
     },
     "./svelte": {
-      "types": "./svelte/dist/index.d.ts",
-      "svelte": "./svelte/dist/index.js"
+      "types": "./git-dist/svelte/index.d.ts",
+      "svelte": "./git-dist/svelte/index.js"
     },
     "./package.json": "./package.json"
-  }
+  },
+  "files": [
+    "git-dist",
+    "docs"
+  ]
 }
