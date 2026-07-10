@@ -48,6 +48,8 @@ export type MuxClientMessage = MuxResyncRequest | {
   /** subscribe option: only stream the last N pane lines (thumbnail mode —
    * full snapshots are 50-140KB, a tail is a few KB) */
   tail?: number;
+  /** subscribe option: opt in to delta output frames for this session. */
+  delta?: boolean;
   cols?: number;
   rows?: number;
   beforeLine?: number | null;

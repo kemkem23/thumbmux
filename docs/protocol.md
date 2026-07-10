@@ -8,7 +8,7 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 
 | type | fields | semantics |
 |---|---|---|
-| `subscribe` | `session`, `tail?`, `client?` | start streaming a session to this socket. `tail: N` = slice frames to the last N **non-blank-trimmed** pane lines (thumbnail mode). Re-subscribing with a different `tail` updates the preference; omitting it upgrades to full frames. An immediate snapshot is sent (cached first, then a fresh capture). |
+| `subscribe` | `session`, `tail?`, `delta?`, `client?` | start streaming a session to this socket. `tail: N` = slice frames to the last N **non-blank-trimmed** pane lines (thumbnail mode). `delta: true` opts this subscription into delta output frames; without that opt-in, a subscriber receives classic full output frames forever. Re-subscribing with a different `tail` updates the preference; omitting it upgrades to full frames. An immediate snapshot is sent (cached first, then a fresh capture). |
 | `unsubscribe` | `session` | stop streaming; per-socket state for the session is dropped. |
 | `keys` | `session`, `data` | write raw bytes to the pane (IME text, control sequences — `\r`, `\x1b[A`, …). Deliberately carries no client blob: this is the hot path. |
 | `resize` | `session`, `cols`, `rows`, `client?` | request pane geometry. The host's `onResizeRequest` hook may veto (e.g. a phone holds the size). |
@@ -34,7 +34,8 @@ A full `output` frame establishes its raw base as `data.split('\n')`. That
 split is exact: a trailing empty element is part of the base and is never
 trimmed or normalised before hashing.
 
-After a full frame, a server may send:
+Only after a subscriber opts in with `delta: true`, a server may send after a
+full frame:
 
 ```ts
 {
@@ -71,8 +72,9 @@ with `reset:'resize'`; it is never a delta.
 - Output detection: `pipe-pane` dirty signals debounced 15 ms (100 ms max
   wait); polling fallback at 4 FPS idle, 10 FPS for 5 s after a keystroke.
 - The first snapshot for a subscription is a full state. Later output may use
-  a validated delta; an invalid or stale base is recovered by the resync
-  exchange above.
+  a validated delta only for subscribers that opted in with `delta: true`; a
+  subscriber without that opt-in receives classic full output frames forever.
+  An invalid or stale opted-in base is recovered by the resync exchange above.
 - `tmux capture-pane` output ends at the last non-blank line of the visible
   region in most states, but freshly-spawned panes carry trailing blank rows;
   tail slicing trims them (see conformance: "tail subscribe receives only the
