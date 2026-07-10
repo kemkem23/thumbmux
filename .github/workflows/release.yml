@@ -18,7 +18,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: bun install
       - run: bun run build:packages
-      - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts
+      - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./demo/*.test.ts
       - name: commit dists and push ${GITHUB_REF_NAME}-dist
         run: |
           git config user.name "thumbmux-release"

@@ -13,9 +13,11 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: bun install
       - name: core unit tests
-        run: bun test ./core/tests/ ./core/src/terminal-link.test.ts
+        run: bun test ./core/tests/ ./core/src/*.test.ts
       - name: protocol conformance (real tmux)
         run: bun test ./server/tests/
+      - name: svelte + demo unit tests
+        run: bun test ./svelte/tests/ ./demo/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
       - name: packages build & pack (publish readiness)

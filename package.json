@@ -16,6 +16,9 @@
     "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build",
     "prepare": "bun run build:packages"
   },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  },
   "exports": {
     "./core": {
       "types": "./core/dist/index.d.ts",
