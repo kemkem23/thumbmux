@@ -14,7 +14,13 @@
  *
  * The WS type is structural ({ send }) — Bun's ServerWebSocket satisfies it.
  */
-import type { MuxClientMessage, MuxServerMessage } from "@thumbmux/core";
+import {
+  chooseMuxOutputFrame,
+  splitMuxOutputData,
+  type MuxClientMessage,
+  type MuxFullOutputFrame,
+  type MuxServerMessage,
+} from "@thumbmux/core";
 
 export type WsLike = { send(data: string): unknown };
 
@@ -146,8 +152,8 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   /** Send one frame; with compressFrames, opt into Bun's per-message deflate. */
   private wsSend(ws: any, data: string) {
-    if (this.compressFrames) ws.send(data, true);
-    else ws.send(data);
+    if (this.compressFrames) return ws.send(data, true);
+    return ws.send(data);
   }
   private driver: TmuxDriver;
   private pipes: PipeManagerLike | null;
@@ -189,6 +195,14 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private sessionListProvider: () => unknown[];
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
+  /** Per-session viewers whose latest subscription opted into delta output frames. */
+  private deltaSubscribers = new Map<string, Set<WS>>();
+  /** Last successfully delivered raw base, after each viewer's tail slice. */
+  private outputBases = new Map<string, Map<WS, string[]>>();
+  /** Viewers which must receive a complete frame before a delta can resume. */
+  private pendingOutputFulls = new Map<string, Set<WS>>();
+  /** Complete frames whose reset marker must survive a failed send. */
+  private pendingOutputResets = new Map<string, Map<WS, "resize" | "resync">>();
   /** last cursor broadcast per session — attached to cached first paints so
    * a new viewer of a static pane still gets a caret */
   private lastCursor = new Map<string, { row: number; col: number } | null>();
@@ -223,7 +237,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.lastSessionsJson = "";
   }
 
-  subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number } = {}) {
+  subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number; delta?: boolean } = {}) {
     this.hooks.onSubscribe?.(session, ws, client);
     let set = this.subscribers.get(session);
     if (!set) {
@@ -241,16 +255,20 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     } else {
       this.tails.get(session)?.delete(ws);
     }
+    this.setDeltaSubscription(session, ws, opts.delta === true);
+    // A new subscription, reconnect, or tail preference change must establish
+    // its own raw (post-tail) full base before it can receive a delta.
+    this.invalidateOutputBase(session, ws);
+    this.requireFullOutput(session, ws);
     const profile = this.profileOf(session);
     const cachedContent = this.contents.get(session);
     if (cachedContent !== undefined) {
-      try {
-        this.wsSend(ws, JSON.stringify({
-          channel: session, type: "output",
-          data: this.contentFor(session, ws, cachedContent),
-          cursor: this.lastCursor.get(session) ?? null,
-        } satisfies MuxServerMessage));
-      } catch {}
+      this.sendOutputFrame(session, ws, {
+        channel: session,
+        type: "output",
+        data: this.contentFor(session, ws, cachedContent),
+        cursor: this.lastCursor.get(session) ?? null,
+      });
       // Cached pane content is only a fast first paint. Always follow it with a
       // real capture so a reopened terminal cannot stay behind the live tmux pane
       // if pipe-pane missed a signal while another viewer kept the cache alive.
@@ -277,6 +295,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   unsubscribe(session: string, ws: WS, client?: unknown) {
     this.hooks.onUnsubscribe?.(session, ws, client);
     this.tails.get(session)?.delete(ws);
+    this.forgetOutputViewer(session, ws);
     const set = this.subscribers.get(session);
     if (set) {
       set.delete(ws);
@@ -292,6 +311,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
     for (const t of this.tails.values()) t.delete(ws);
+    this.forgetOutputSocket(ws);
     for (const [session, set] of this.subscribers) {
       set.delete(ws);
       if (set.size === 0) {
@@ -366,9 +386,151 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     return lines.slice(Math.max(0, end - tail), end).join("\n");
   }
 
+  private outputBaseFor(session: string, ws: WS): string[] | undefined {
+    return this.outputBases.get(session)?.get(ws);
+  }
+
+  private setDeltaSubscription(session: string, ws: WS, enabled: boolean) {
+    if (!enabled) {
+      const viewers = this.deltaSubscribers.get(session);
+      viewers?.delete(ws);
+      if (viewers?.size === 0) this.deltaSubscribers.delete(session);
+      return;
+    }
+    let viewers = this.deltaSubscribers.get(session);
+    if (!viewers) {
+      viewers = new Set();
+      this.deltaSubscribers.set(session, viewers);
+    }
+    viewers.add(ws);
+  }
+
+  private isDeltaSubscriber(session: string, ws: WS): boolean {
+    return this.deltaSubscribers.get(session)?.has(ws) === true;
+  }
+
+  private invalidateOutputBase(session: string, ws: WS) {
+    const bases = this.outputBases.get(session);
+    if (!bases) return;
+    bases.delete(ws);
+    if (bases.size === 0) this.outputBases.delete(session);
+  }
+
+  private invalidateOutputBases(session: string) {
+    this.outputBases.delete(session);
+  }
+
+  private requireFullOutput(session: string, ws: WS) {
+    let viewers = this.pendingOutputFulls.get(session);
+    if (!viewers) {
+      viewers = new Set();
+      this.pendingOutputFulls.set(session, viewers);
+    }
+    viewers.add(ws);
+  }
+
+  private requireResetOutput(session: string, ws: WS, reset: "resize" | "resync") {
+    this.invalidateOutputBase(session, ws);
+    let resets = this.pendingOutputResets.get(session);
+    if (!resets) {
+      resets = new Map();
+      this.pendingOutputResets.set(session, resets);
+    }
+    resets.set(ws, reset);
+  }
+
+  private hasPendingOutputFrame(session: string, viewers: Iterable<WS>): boolean {
+    const fulls = this.pendingOutputFulls.get(session);
+    const resets = this.pendingOutputResets.get(session);
+    for (const ws of viewers) {
+      if (fulls?.has(ws) || resets?.has(ws)) return true;
+    }
+    return false;
+  }
+
+  private forgetOutputViewer(session: string, ws: WS) {
+    this.setDeltaSubscription(session, ws, false);
+    this.invalidateOutputBase(session, ws);
+    const fulls = this.pendingOutputFulls.get(session);
+    fulls?.delete(ws);
+    if (fulls?.size === 0) this.pendingOutputFulls.delete(session);
+    const resets = this.pendingOutputResets.get(session);
+    resets?.delete(ws);
+    if (resets?.size === 0) this.pendingOutputResets.delete(session);
+  }
+
+  private forgetOutputSocket(ws: WS) {
+    for (const session of new Set([
+      ...this.deltaSubscribers.keys(),
+      ...this.outputBases.keys(),
+      ...this.pendingOutputFulls.keys(),
+      ...this.pendingOutputResets.keys(),
+    ])) {
+      this.forgetOutputViewer(session, ws);
+    }
+  }
+
+  /**
+   * Serialize and send a full-or-delta output frame for exactly one viewer.
+   * The base advances only after send does not throw, so a failed delta can
+   * never make the following frame depend on data that did not leave the mux.
+   */
+  private sendOutputFrame(session: string, ws: WS, full: MuxFullOutputFrame): boolean {
+    const reset = this.pendingOutputResets.get(session)?.get(ws);
+    const forceFull = reset !== undefined || this.pendingOutputFulls.get(session)?.has(ws) === true;
+    const frame: MuxFullOutputFrame = reset ? { ...full, reset } : full;
+    const base = this.outputBaseFor(session, ws);
+    const output = !this.isDeltaSubscriber(session, ws) || forceFull || !base
+      ? frame
+      : chooseMuxOutputFrame(frame, base);
+    try {
+      const status = this.wsSend(ws, JSON.stringify(output));
+      // Bun reports a dropped frame as 0 and backpressure as -1. Structural
+      // adapters commonly return void, which remains a successful handoff.
+      if (typeof status === "number" && status <= 0) return false;
+    } catch {
+      return false;
+    }
+
+    let bases = this.outputBases.get(session);
+    if (!bases) {
+      bases = new Map();
+      this.outputBases.set(session, bases);
+    }
+    bases.set(ws, splitMuxOutputData(frame.data));
+    const fulls = this.pendingOutputFulls.get(session);
+    fulls?.delete(ws);
+    if (fulls?.size === 0) this.pendingOutputFulls.delete(session);
+    const resets = this.pendingOutputResets.get(session);
+    resets?.delete(ws);
+    if (resets?.size === 0) this.pendingOutputResets.delete(session);
+    return true;
+  }
+
+  private sendPendingOutputFrames(
+    session: string,
+    viewers: Iterable<WS>,
+    content: string,
+    cursor: { row: number; col: number } | null,
+  ) {
+    for (const ws of viewers) {
+      if (!this.pendingOutputFulls.get(session)?.has(ws) && !this.pendingOutputResets.get(session)?.has(ws)) continue;
+      this.sendOutputFrame(session, ws, {
+        channel: session,
+        type: "output",
+        data: this.contentFor(session, ws, content),
+        cursor,
+      });
+    }
+  }
+
   private dropSessionState(session: string) {
     this.subscribers.delete(session);
     this.tails.delete(session);
+    this.deltaSubscribers.delete(session);
+    this.outputBases.delete(session);
+    this.pendingOutputFulls.delete(session);
+    this.pendingOutputResets.delete(session);
     this.lastCursor.delete(session);
     this.contents.delete(session);
     this.hashes.delete(session);
@@ -425,6 +587,10 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       if (last?.cols === cols && last.rows === rows) return;
       this.driver.resizeWindow(session, cols, rows);
       this.lastAppliedGeometry.set(session, { cols, rows });
+      this.invalidateOutputBases(session);
+      for (const viewer of this.subscribers.get(session) ?? []) {
+        this.requireResetOutput(session, viewer, "resize");
+      }
       this.captureStartLines.set(session, this.INITIAL_CAPTURE_START_LINE);
       this.queueCapture(session, { fullHistory: false });
       this.refreshSessionListSchedule();
@@ -481,14 +647,29 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   handleMessage(msg: MuxClientMessage, ws: WS) {
     switch (msg.type) {
       case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
-      case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail }); break;
+      case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail, delta: msg.delta }); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
       case "keys": if (msg.session && msg.data !== undefined) this.handleKeys(msg.session, msg.data, ws, msg.client); break;
       case "resize": if (msg.session && msg.cols && msg.rows) this.handleResize(msg.session, msg.cols, msg.rows, ws, msg.client); break;
       case "sessions_subscribe": this.subscribeSessions(ws); break;
       case "sessions_unsubscribe": this.unsubscribeSessions(ws); break;
       case "history_expand": if (msg.session) this.expandHistory(msg.session, ws, msg.beforeLine, msg.limit); break;
+      case "resync": if (msg.session) this.handleResync(msg.session, ws); break;
     }
+  }
+
+  private handleResync(session: string, ws: WS) {
+    this.requireResetOutput(session, ws, "resync");
+    const cachedContent = this.contents.get(session);
+    if (cachedContent !== undefined) {
+      this.sendOutputFrame(session, ws, {
+        channel: session,
+        type: "output",
+        data: this.contentFor(session, ws, cachedContent),
+        cursor: this.lastCursor.get(session) ?? null,
+      });
+    }
+    this.queueCapture(session);
   }
 
   private scheduleImmediateCapture(session: string) {
@@ -591,6 +772,24 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.tails.set(newSession, tails);
       this.tails.delete(oldSession);
     }
+    const deltaSubscribers = this.deltaSubscribers.get(oldSession);
+    if (deltaSubscribers) {
+      this.deltaSubscribers.set(newSession, deltaSubscribers);
+      this.deltaSubscribers.delete(oldSession);
+    } else {
+      this.deltaSubscribers.delete(newSession);
+    }
+    // A channel rename changes the identity of every client-side raw base.
+    // Do not migrate them: the first new-channel output must be complete.
+    this.outputBases.delete(oldSession);
+    this.outputBases.delete(newSession);
+    this.pendingOutputFulls.delete(oldSession);
+    this.pendingOutputFulls.delete(newSession);
+    this.pendingOutputResets.delete(oldSession);
+    this.pendingOutputResets.delete(newSession);
+    if (viewers) {
+      for (const ws of viewers) this.requireFullOutput(newSession, ws);
+    }
     if (this.lastCursor.has(oldSession)) {
       this.lastCursor.set(newSession, this.lastCursor.get(oldSession) ?? null);
       this.lastCursor.delete(oldSession);
@@ -645,6 +844,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       this.piped.delete(oldSession);
       this.tryStartPipe(newSession);
     }
+    this.queueCapture(newSession);
   }
 
   /** Switch to burst polling for a bit after keystrokes, then back to normal */
@@ -713,12 +913,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const hash = this.driver.hash(liveContent);
       this.contents.set(session, liveContent);
       if (hash === this.hashes.get(session)) {
+        const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
+        if (this.hasPendingOutputFrame(session, viewers)) {
+          this.lastCursor.set(session, cursor);
+          this.sendPendingOutputFrames(session, viewers, liveContent, cursor);
+          return;
+        }
         // Content unchanged — but a cursor that moved anyway (arrow keys on a
         // shell line) must still reach viewers, minus the pane re-send. Only
         // the atomic driver path does this: with two-call sampling a mid-
         // repaint cursor could spam spurious frames on every idle tick.
         if (this.driver.captureWithCursor) {
-          const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
           if (!this.cursorEq(cursor, this.lastCursor.get(session))) {
             this.lastCursor.set(session, cursor);
             const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor } satisfies MuxServerMessage);
@@ -742,25 +947,13 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       }
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
-      const fullMsg = JSON.stringify({ channel: session, type: "output", data: liveContent, cursor } satisfies MuxServerMessage);
-      const tailMsgs = new Map<number, string>();
-      const tails = this.tails.get(session);
       for (const ws of viewers) {
-        const tail = tails?.get(ws);
-        if (!tail) {
-          try { this.wsSend(ws, fullMsg); } catch {}
-          continue;
-        }
-        let msg = tailMsgs.get(tail);
-        if (!msg) {
-          msg = JSON.stringify({
-            channel: session, type: "output",
-            data: this.contentFor(session, ws, liveContent),
-            cursor,
-          } satisfies MuxServerMessage);
-          tailMsgs.set(tail, msg);
-        }
-        try { this.wsSend(ws, msg); } catch {}
+        this.sendOutputFrame(session, ws, {
+          channel: session,
+          type: "output",
+          data: this.contentFor(session, ws, liveContent),
+          cursor,
+        });
       }
     } catch {
       // Session gone — notify viewers

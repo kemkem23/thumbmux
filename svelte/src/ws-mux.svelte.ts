@@ -4,9 +4,26 @@
 // telemetry client id) are injected via configureTmuxMux() — the wire format
 // itself is part of the thumbmux protocol.
 
-import type { MuxOutputType as OutputType, MuxClientInfo, MuxServerMessage } from '@thumbmux/core';
+import {
+  applyMuxDelta,
+  splitMuxOutputData,
+  validateMuxDeltaFrame,
+  type MuxClientInfo,
+  type MuxOutputType as OutputType,
+  type MuxServerMessage,
+} from '@thumbmux/core';
 
-type Callback = (data: string, type?: OutputType, cursor?: MuxServerMessage['cursor']) => void;
+export type MuxDeliveryMeta = {
+  source: 'full' | 'delta';
+  replace: boolean;
+};
+
+type Callback = (
+  data: string,
+  type?: OutputType,
+  cursor?: MuxServerMessage['cursor'],
+  meta?: MuxDeliveryMeta,
+) => void;
 type ClientInfo = MuxClientInfo & Record<string, unknown>;
 
 const PING_INTERVAL = 25_000;    // 25s — under most carrier NAT timeouts (30-60s)
@@ -29,6 +46,10 @@ export class TmuxMux {
   /** per-callback tail preference; effective tail = undefined if ANY full subscriber */
   private subTails = new Map<string, Map<Callback, number | undefined>>();
   private sentTail = new Map<string, number | undefined>();
+  /** Exact raw `data.split('\\n')` bases, scoped to the current socket and tail. */
+  private outputBases = new Map<string, string[]>();
+  /** A failed delta requests one full replacement; later deltas wait for it. */
+  private resyncingSessions = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -161,9 +182,36 @@ export class TmuxMux {
 
   private sendSubscribe(session: string) {
     const tail = this.effectiveTail(session);
-    if (this.send(this.ws, { type: 'subscribe', session, tail, client: this.clientInfo() })) {
+    // A subscribe can be an initial subscription, reconnect, or tail change.
+    // Each asks the server for a new full base before a delta is acceptable.
+    this.invalidateOutputBase(session);
+    if (this.send(this.ws, {
+      type: 'subscribe',
+      session,
+      tail,
+      delta: true,
+      client: this.clientInfo(),
+    })) {
       this.sentTail.set(session, tail);
     }
+  }
+
+  private invalidateOutputBase(session: string) {
+    this.outputBases.delete(session);
+    this.resyncingSessions.delete(session);
+  }
+
+  private invalidateAllOutputBases() {
+    this.outputBases.clear();
+    this.resyncingSessions.clear();
+    this.sentTail.clear();
+  }
+
+  private requestResync(session: string) {
+    if (this.resyncingSessions.has(session)) return;
+    this.outputBases.delete(session);
+    this.resyncingSessions.add(session);
+    this.send(this.ws, { type: 'resync', session });
   }
 
   /** Re-subscribe when the tail composition changes (e.g. a full viewer
@@ -281,14 +329,49 @@ export class TmuxMux {
           }
           return;
         }
-        if (msg.type === 'output' || msg.type === 'history' || msg.type === 'error' || msg.type === 'cursor') {
-          const cbs = this.subs.get(msg.channel);
-          if (cbs) {
-            for (const cb of cbs) {
-              // "cursor" frames carry no data — callbacks that render output
-              // must check `type` before treating data as pane content.
-              cb(msg.data ?? '', msg.type as OutputType, msg.cursor);
-            }
+        const cbs = typeof msg.channel === 'string' ? this.subs.get(msg.channel) : undefined;
+        if (!cbs) return;
+
+        if (msg.type === 'output') {
+          // A full frame establishes its raw base exactly; in particular, a
+          // trailing empty line and CR bytes remain part of future hashes.
+          if (typeof msg.data !== 'string') return;
+          this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
+          this.resyncingSessions.delete(msg.channel);
+          const meta: MuxDeliveryMeta = {
+            source: 'full',
+            replace: msg.reset === 'resize' || msg.reset === 'resync',
+          };
+          for (const cb of cbs) cb(msg.data, 'output', msg.cursor, meta);
+          return;
+        }
+
+        if (msg.type === 'delta') {
+          // Do not let an invalid, missing, or stale base leak either content
+          // or cursor to subscribers. The server answers one coalesced resync
+          // with a full output frame, which re-enables deltas above.
+          const base = this.outputBases.get(msg.channel);
+          const delta = base && !this.resyncingSessions.has(msg.channel)
+            ? validateMuxDeltaFrame(msg, base)
+            : null;
+          const next = delta && base ? applyMuxDelta(base, delta) : null;
+          if (!delta || !next) {
+            this.requestResync(msg.channel);
+            return;
+          }
+          const data = next.join('\n');
+          this.outputBases.set(msg.channel, next);
+          for (const cb of cbs) {
+            cb(data, 'output', delta.cursor, { source: 'delta', replace: false });
+          }
+          return;
+        }
+
+        if (msg.type === 'history' || msg.type === 'error' || msg.type === 'cursor') {
+          for (const cb of cbs) {
+            // "cursor" frames carry no data — callbacks that render output
+            // must check `type` before treating data as pane content.
+            cb(msg.data ?? '', msg.type as OutputType, msg.cursor);
           }
         }
       } catch {}
@@ -332,6 +415,7 @@ export class TmuxMux {
     if (isCurrent) {
       this.clearConnectionTimers();
       this.ws = null;
+      this.invalidateAllOutputBases();
     }
     if (close) this.closeSocket(socket);
   }
@@ -411,6 +495,7 @@ export class TmuxMux {
         this.subs.delete(session);
         this.subTails.delete(session);
         this.sentTail.delete(session);
+        this.invalidateOutputBase(session);
         this.pendingResizeBySession.delete(session);
         this.send(this.ws, { type: 'unsubscribe', session });
       } else {
