@@ -18,6 +18,53 @@
     defaultFg: '#e6e6e6',
     defaultBg: '#101014',
   };
+  type DemoKind = 'cc' | 'codex' | 'grok' | 'sh';
+  const DEMO_FILTERS = [
+    { value: 'cc', label: 'CC' },
+    { value: 'codex', label: 'CDX' },
+    { value: 'grok', label: 'GROK' },
+    { value: 'sh', label: 'SH' },
+  ] as const;
+  const DEMO_GROUPS = [
+    { key: 'design', label: 'Design' },
+    { key: 'build', label: 'Build' },
+    { key: 'review', label: 'Review' },
+    { key: 'ops', label: 'Ops' },
+  ] as const;
+  const DEMO_SURFACES: Record<DemoKind, { chip: string; color: string; palette: AnsiPalette }> = {
+    cc: {
+      chip: 'CC',
+      color: '#b45309',
+      palette: PALETTE,
+    },
+    codex: {
+      chip: 'CDX',
+      color: '#2563eb',
+      palette: {
+        ...PALETTE,
+        defaultFg: '#eef4ff',
+        defaultBg: '#08162f',
+      },
+    },
+    grok: {
+      chip: 'GROK',
+      color: '#047857',
+      palette: {
+        ...PALETTE,
+        defaultFg: '#e9fff3',
+        defaultBg: '#06231a',
+      },
+    },
+    sh: {
+      chip: 'SH',
+      color: '#475569',
+      palette: {
+        ...PALETTE,
+        defaultFg: '#f8fafc',
+        defaultBg: '#111827',
+      },
+    },
+  };
   // Stock presets, worktree ones included — if the demo's cwd is not a git
   // repo, git prints its own self-explanatory error in the pane.
   const ALT_SCREEN_PRESET_ID = 'alt-screen-mouse';
@@ -81,14 +128,54 @@
 
   let view = $state<{ kind: 'hub' } | { kind: 'term'; name: string }>({ kind: 'hub' });
   let names = $state<string[]>([]);
+  let sessionsLoaded = $state(false);
   let launchOpen = $state(false);
   let launching = $state(false);
   let launchError = $state<string | null>(null);
   let altScreenSessions = $state<Record<string, boolean>>({});
 
-  let gridSessions = $derived<GridSession[]>(names.map((name) => ({
-    name, chip: 'TMUX', color: '#1a1a1a', palette: PALETTE,
-  })));
+  function hashName(name: string): number {
+    let hash = 0;
+    for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+    return hash;
+  }
+
+  function demoKind(name: string): DemoKind {
+    const lower = name.toLowerCase();
+    if (lower.startsWith('cc-') || lower.startsWith('claude-') || lower.includes('-cc-')) return 'cc';
+    if (lower.startsWith('codex-') || lower.includes('-codex-')) return 'codex';
+    if (lower.startsWith('grok-') || lower.includes('-grok-')) return 'grok';
+    return 'sh';
+  }
+
+  function activityLabel(minutesAgo: number): string {
+    if (minutesAgo <= 0) return 'just now';
+    if (minutesAgo === 1) return '1 min ago';
+    if (minutesAgo < 60) return `${minutesAgo} mins ago`;
+    const hours = Math.floor(minutesAgo / 60);
+    return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+  }
+
+  let gridSessions = $derived<GridSession[]>(names.map((name, index) => {
+    const kind = demoKind(name);
+    const hash = hashName(name);
+    const group = DEMO_GROUPS[hash % DEMO_GROUPS.length];
+    const minutesAgo = (hash % 180) + index;
+    const state = hash % 3 === 0 ? 'idle' : 'working';
+    return {
+      name,
+      chip: DEMO_SURFACES[kind].chip,
+      color: DEMO_SURFACES[kind].color,
+      palette: DEMO_SURFACES[kind].palette,
+      filterValue: kind,
+      groupKey: group.key,
+      groupLabel: group.label,
+      state,
+      stateLabel: state === 'working' ? 'WORKING' : 'IDLE',
+      lastActivityAt: Date.now() - minutesAgo * 60_000,
+      lastActivityLabel: activityLabel(minutesAgo),
+    };
+  }));
 
   // Terminal view state
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
@@ -110,6 +197,7 @@
   let unsubSessions: (() => void) | null = null;
   let unsubDesktopGate: (() => void) | null = null;
   let unsubSessionUrl: (() => void) | null = null;
+  let pendingSessionTimer: ReturnType<typeof setTimeout> | null = null;
 
   function sendKeysTo(session: string) {
     return (data: string) => tmuxMux.sendKeys(session, data);
@@ -126,6 +214,11 @@
     if (name) url.searchParams.set('session', name);
     else url.searchParams.delete('session');
     history.replaceState(null, '', url);
+  }
+
+  function gridDelayMs(): number {
+    const value = Number(new URL(window.location.href).searchParams.get('gridDelayMs') ?? 0);
+    return Number.isFinite(value) ? Math.max(0, Math.min(2_000, value)) : 0;
   }
 
   function openSession(name: string) {
@@ -200,8 +293,24 @@
     };
     window.addEventListener('popstate', onPopState);
     unsubSessionUrl = () => window.removeEventListener('popstate', onPopState);
+    const initialGridDelay = gridDelayMs();
     unsubSessions = tmuxMux.onSessions((rows: any[]) => {
-      names = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
+      const nextNames = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
+      if (pendingSessionTimer) {
+        clearTimeout(pendingSessionTimer);
+        pendingSessionTimer = null;
+      }
+      if (!sessionsLoaded && initialGridDelay > 0) {
+        names = [];
+        pendingSessionTimer = setTimeout(() => {
+          names = nextNames;
+          sessionsLoaded = true;
+          pendingSessionTimer = null;
+        }, initialGridDelay);
+        return;
+      }
+      names = nextNames;
+      sessionsLoaded = true;
     });
     const query = window.matchMedia('(min-width: 1024px)');
     setDesktopGate(query.matches);
@@ -211,6 +320,7 @@
   });
 
   onDestroy(() => {
+    if (pendingSessionTimer) clearTimeout(pendingSessionTimer);
     unsubSessions?.();
     unsubDesktopGate?.();
     unsubSessionUrl?.();
@@ -226,6 +336,16 @@
       onOpen={openSession}
       onNew={() => { launchError = null; launchOpen = true; }}
       emptyLabel="No tmux sessions yet — tap + terminal"
+      loading={!sessionsLoaded}
+      searchable
+      searchLabel="Search sessions"
+      searchPlaceholder="Search sessions"
+      filterOptions={DEMO_FILTERS}
+      allFilterLabel="ALL"
+      groupable
+      groupToggleLabel="Group"
+      ungroupedLabel="Ungrouped"
+      order="recent"
     />
     <LaunchSheet
       open={launchOpen}

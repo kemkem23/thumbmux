@@ -146,9 +146,9 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.3.2-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.3.3-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.3.2-dist
+npm i    github:kemkem23/thumbmux#v0.3.3-dist
 ```
 
 ```ts
@@ -183,7 +183,7 @@ an alt-screen preset so you can feel the SGR mouse forwarding immediately.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.3.2-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.3.3-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from

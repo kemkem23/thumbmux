@@ -24,7 +24,14 @@ export { default as ActionFab, type FabAction } from './ActionFab.svelte';
 export { tmuxMux, configureTmuxMux, TmuxMux, type TmuxMuxOptions } from './ws-mux.svelte';
 export { default as NewTerminalSheet, type SpawnAgent } from './NewTerminalSheet.svelte';
 export { default as SessionThumb } from './SessionThumb.svelte';
-export { default as SessionGrid, type GridSession } from './SessionGrid.svelte';
+export { default as SessionGrid } from './SessionGrid.svelte';
+export type {
+  GridFilterOption,
+  GridOrder,
+  GridSession,
+  GridSessionState,
+  SessionGridProps,
+} from './session-grid';
 export { default as LaunchSheet, type LaunchContext } from './LaunchSheet.svelte';
 export { default as UploadAction } from './UploadAction.svelte';
 export { default as ShortcutBar } from './ShortcutBar.svelte';

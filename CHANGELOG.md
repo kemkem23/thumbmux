@@ -3,6 +3,21 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
 
+## v0.3.3 — 2026-07-10
+- **SessionGrid overhaul**: responsive column clamp with card-proportional
+  thumbnail font (no more 6.5px on a 4K display), per-card state dots
+  (universal green/gray via `--dot-working`/`--dot-idle`), filter chips +
+  search + group-by, `recent` ordering, loading skeletons, and full arrow-key
+  navigation. New public types in `session-grid` (GridSession, SessionGridProps, …).
+- **SessionThumb**: fit-width tail rendering with right-edge fade and a
+  readable thumbnail-only palette (contrast floor against the card surface).
+- **Jank-free history expansion**: prepending an older-history batch no longer
+  reparses the buffer or remounts rows — absolute row keys, state-convergent
+  prepend (`core/prepend.ts`), rAF-sliced parsing, and a 2-viewport prefetch.
+  Measured in the container e2e: p95 frame 16.7ms across three expansions.
+- ws-mux: reconnect hardening (CONNECTING guard, stale-socket-safe sends,
+  connect timeout, viewport-change client info).
+
 ## v0.3.2 — 2026-07-09
 - `TmuxWsMux` option `compressFrames`: opts outbound frames into Bun's
   per-message deflate (`ws.send(data, true)`) — pairs with

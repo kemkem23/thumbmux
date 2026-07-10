@@ -5,6 +5,7 @@
    * TermView, just tiny. Never sends keys or resizes the pane. */
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
+  import { deriveThumbnailPalette } from './session-grid';
   import { createSgrState, lineToHtml, type AnsiPalette } from '@thumbmux/core';
 
   let {
@@ -17,22 +18,24 @@
     maxLines?: number;
   } = $props();
 
-  let html = $state('');
+  let content = $state('');
   let connected = $state(false);
   let unsubscribe: (() => void) | null = null;
+  let thumbPalette = $derived(deriveThumbnailPalette(palette));
+  let html = $derived(renderContent(content, maxLines, thumbPalette));
 
-  function render(content: string) {
-    const lines = content.replace(/\r/g, '').split('\n');
-    const tail = lines.slice(-maxLines);
+  function renderContent(raw: string, linesToKeep: number, renderPalette: AnsiPalette) {
+    const lines = raw.replace(/\r/g, '').split('\n');
+    const tail = lines.slice(-linesToKeep);
     const st = createSgrState();
-    html = tail.map((l) => `<div>${lineToHtml(l, st, palette) || '&nbsp;'}</div>`).join('');
+    return tail.map((line) => `<div>${lineToHtml(line, st, renderPalette) || '&nbsp;'}</div>`).join('');
   }
 
   onMount(() => {
     unsubscribe = tmuxMux.subscribe(session, (data, type) => {
       if (type === 'history' || type === 'error' || type === 'cursor') return;
       connected = true;
-      render(data);
+      content = data;
     }, { tail: maxLines + 10 }); // tail mode: a few KB per update, not the full window
   });
 
@@ -41,7 +44,13 @@
   });
 </script>
 
-<div class="thumb" style:--tfg={palette.defaultFg} style:--tbg={palette.defaultBg} data-testid="session-thumb" data-live={connected}>
+<div
+  class="thumb"
+  style:--tfg={thumbPalette.defaultFg}
+  style:--tbg={thumbPalette.defaultBg}
+  data-testid="session-thumb"
+  data-live={connected}
+>
   {#if connected}
     <div class="tail">{@html html}</div>
   {:else}
@@ -51,21 +60,41 @@
 
 <style>
   .thumb {
-    position: absolute; inset: 0;
+    position: absolute;
+    inset: 0;
     overflow: hidden;
+    container-type: inline-size;
     background: var(--tbg);
     color: var(--tfg);
     font-family: var(--font-mono, ui-monospace, monospace);
     pointer-events: none;
   }
   .tail {
-    position: absolute; left: 6px; right: 2px; bottom: 4px;
-    font-size: 6.5px; line-height: 1.5;
+    position: absolute;
+    left: 6px;
+    right: 0;
+    bottom: 4px;
+    overflow: hidden;
+    font-size: 7px;
+    font-size: clamp(7px, 4.2cqw, 13px);
+    line-height: 1.38;
+    white-space: pre;
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - clamp(18px, 12cqw, 42px)), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - clamp(18px, 12cqw, 42px)), transparent);
+  }
+  .tail :global(div) {
+    width: max-content;
+    min-width: max-content;
+    max-width: none;
     white-space: pre;
   }
   .wait {
-    position: absolute; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 14px; opacity: .4;
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: clamp(14px, 9cqw, 24px);
+    opacity: .4;
   }
 </style>

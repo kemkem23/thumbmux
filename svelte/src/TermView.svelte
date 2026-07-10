@@ -71,7 +71,9 @@
   const OVERSCAN_ROWS = 60;
   const RUBBER_PX = 90;
   const HISTORY_BATCH_LINES = 2000;
-  const HISTORY_PREFETCH_ROWS = 8;
+  const HISTORY_PARSE_CHUNK_LINES = 300;
+  const HISTORY_LINK_SEAM_LINES = 12;
+  const ARCHIVE_OFFSET_START = 1 << 26;
   const MOMENTUM_TAU = 520;
   const MOMENTUM_GAIN = 1.25;
 
@@ -87,6 +89,7 @@
   let liveLines: string[] = [];
   let archivedLines: string[] = [];
   let htmlCache: string[] = [];          // rendered html per line
+  let stateBefore: SgrState[] = [];      // sgr state before each line
   let stateAfter: SgrState[] = [];        // sgr state after each line
   let total = $state(0);
   let connected = $state(false);
@@ -99,6 +102,8 @@
   let bottomOffsetPx = $state(0);
   let winStart = $state(0);
   let winEnd = $state(0);
+  let archiveOffset = $state(ARCHIVE_OFFSET_START);
+  let contentEpoch = $state(0);
   let renderEpoch = $state(0); // bump to force window re-render
 
   let touching = false;
@@ -113,6 +118,30 @@
   let altTouchY: number | null = null;
   let altTouchMoved = false;
   let pendingContent: string | null = null;
+  let prependParseFrame: number | null = null;
+  let prependCommitFrame: number | null = null;
+  let prependParseSeq = 0;
+
+  type PrependLinkPlan = {
+    batchLinks: (LineLinkRange[] | undefined)[];
+    seamLinks: Map<number, LineLinkRange[]>;
+  };
+
+  type PrependStage = {
+    seq: number;
+    lines: string[];
+    html: string[];
+    entryStates: SgrState[];
+    exitStates: SgrState[];
+    endState: SgrState;
+    linkPlan: PrependLinkPlan;
+  };
+
+  type HistoryPrependSnapshot = {
+    transform: string;
+    anchorText: string;
+    rowCount: number;
+  };
 
   /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
    * clipboard. Falls back to a hidden-textarea execCommand copy for
@@ -154,6 +183,11 @@
     return bottomOffsetPx > lineH;
   }
 
+  function cachedLineHtml(idx: number, epoch: number): string {
+    void epoch;
+    return htmlCache[idx] ?? ' ';
+  }
+
   export function scrollToBottom() {
     stopInertia();
     bottomOffsetPx = 0;
@@ -188,7 +222,7 @@
 
   /** URL detection — mid-line URLs and URLs that wrap across lines (segments
    * reconstructed at the pane width) all become tappable <a> ranges. */
-  function rebuildLinks() {
+  function rebuildAllLinks() {
     linksByLine = new Array(rawLines.length);
     const cols = lastPushedCols > 0 ? lastPushedCols : 60;
     try {
@@ -200,26 +234,110 @@
     } catch { /* never break rendering over a link parse */ }
   }
 
+  function addLinkRange(target: (LineLinkRange[] | undefined)[], idx: number, range: LineLinkRange) {
+    (target[idx] ??= []).push(range);
+  }
+
+  function addSeamLinkRange(target: Map<number, LineLinkRange[]>, idx: number, range: LineLinkRange) {
+    const existing = target.get(idx);
+    if (existing) existing.push(range);
+    else target.set(idx, [range]);
+  }
+
+  function mergeLineLinks(
+    primary: LineLinkRange[] | undefined,
+    secondary: LineLinkRange[] | undefined,
+  ): LineLinkRange[] | undefined {
+    if (!primary?.length) return secondary?.length ? [...secondary] : undefined;
+    if (!secondary?.length) return [...primary];
+    const out = [...primary];
+    for (const link of secondary) {
+      if (!out.some((x) => x.start === link.start && x.end === link.end && x.href === link.href)) {
+        out.push(link);
+      }
+    }
+    return out;
+  }
+
+  function planPrependLinks(batch: string[]): PrependLinkPlan {
+    const batchLinks: (LineLinkRange[] | undefined)[] = new Array(batch.length);
+    const seamLinks = new Map<number, LineLinkRange[]>();
+    if (batch.length === 0) return { batchLinks, seamLinks };
+
+    const cols = lastPushedCols > 0 ? lastPushedCols : 60;
+    const seam = rawLines.slice(0, HISTORY_LINK_SEAM_LINES);
+    const windowLines = [...batch, ...seam];
+    try {
+      for (const match of collectTerminalUrlSegments(windowLines, 0, batch.length, cols)) {
+        for (const seg of match.segments) {
+          const range = { start: seg.startCol, end: seg.endCol, href: match.url };
+          if (seg.lineIdx < batch.length) addLinkRange(batchLinks, seg.lineIdx, range);
+          else addSeamLinkRange(seamLinks, seg.lineIdx - batch.length, range);
+        }
+      }
+    } catch { /* never break rendering over a link parse */ }
+    return { batchLinks, seamLinks };
+  }
+
+  function linksAfterPrepend(stage: PrependStage): (LineLinkRange[] | undefined)[] {
+    const count = stage.lines.length;
+    const next: (LineLinkRange[] | undefined)[] = new Array(rawLines.length + count);
+    for (let i = 0; i < count; i++) next[i] = stage.linkPlan.batchLinks[i];
+    for (let i = 0; i < linksByLine.length; i++) {
+      const links = linksByLine[i];
+      if (links?.length) next[i + count] = links;
+    }
+    for (const [existingOffset, links] of stage.linkPlan.seamLinks) {
+      const idx = count + existingOffset;
+      if (idx >= count && idx < next.length) next[idx] = mergeLineLinks(links, next[idx]);
+    }
+    return next;
+  }
+
   function rebuildFrom(idx: number) {
     let st: SgrState = idx > 0 ? cloneSgrState(stateAfter[idx - 1]) : createSgrState();
     for (let i = idx; i < rawLines.length; i++) {
+      stateBefore[i] = cloneSgrState(st);
       htmlCache[i] = lineToHtml(rawLines[i], st, palette, linksByLine[i]);
       stateAfter[i] = cloneSgrState(st);
     }
     htmlCache.length = rawLines.length;
+    stateBefore.length = rawLines.length;
     stateAfter.length = rawLines.length;
   }
 
-  function commitLines(next: string[], opts: { prependedLineCount?: number } = {}) {
+  function reconcileExistingFrom(idx: number, entryState: SgrState): number {
+    let st = cloneSgrState(entryState);
+    for (let i = idx; i < rawLines.length; i++) {
+      const cachedEntry = stateBefore[i];
+      if (cachedEntry && sgrStateKey(st) === sgrStateKey(cachedEntry)) return i;
+      stateBefore[i] = cloneSgrState(st);
+      htmlCache[i] = lineToHtml(rawLines[i], st, palette, linksByLine[i]);
+      stateAfter[i] = cloneSgrState(st);
+    }
+    return rawLines.length;
+  }
+
+  function rerenderLineWithCachedEntry(idx: number) {
+    if (idx < 0 || idx >= rawLines.length) return;
+    const st = stateBefore[idx] ? cloneSgrState(stateBefore[idx]) : createSgrState();
+    htmlCache[idx] = lineToHtml(rawLines[idx], st, palette, linksByLine[idx]);
+  }
+
+  function rerenderPrependSeam(stage: PrependStage) {
+    const count = stage.lines.length;
+    for (const existingOffset of stage.linkPlan.seamLinks.keys()) {
+      rerenderLineWithCachedEntry(count + existingOffset);
+    }
+  }
+
+  function commitLines(next: string[]) {
     // Find common prefix so unchanged history isn't re-parsed.
     let common = 0;
     const minLen = Math.min(rawLines.length, next.length);
     while (common < minLen && rawLines[common] === next[common]) common++;
 
-    // Anchor: when reading history, keep the same content under the finger.
-    if (opts.prependedLineCount && bottomOffsetPx > 0) {
-      bottomOffsetPx += opts.prependedLineCount * lineH;
-    } else if (bottomOffsetPx > 0) {
+    if (bottomOffsetPx > 0) {
       const grewBy = next.length - rawLines.length;
       if (grewBy !== 0 && common >= minLen - 2) {
         // Pure append/trim at the tail — shift the offset to compensate.
@@ -229,10 +347,10 @@
 
     rawLines = next;
     total = next.length;
-    rebuildLinks();
+    rebuildAllLinks();
     rebuildFrom(common);
     bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
-    renderEpoch++;
+    contentEpoch++;
     applyScroll();
     onLinesChange?.(rawLines);
     emitScrollState();
@@ -260,10 +378,157 @@
     }, 5000);
   }
 
-  function maybeRequestOlderHistory() {
+  function historyPrefetchThreshold(): number {
+    return Math.max(2 * viewH, 24 * lineH);
+  }
+
+  function maybeRequestOlderHistory(projectedBottomOffset = bottomOffsetPx) {
     if (archiveLoading || archiveExhausted || total === 0) return;
-    const threshold = Math.max(lineH * HISTORY_PREFETCH_ROWS, viewH * 0.18);
-    if (bottomOffsetPx >= maxOffset() - threshold) requestOlderHistory();
+    if (projectedBottomOffset >= maxOffset() - historyPrefetchThreshold()) requestOlderHistory();
+  }
+
+  function historyPrependSnapshot(): HistoryPrependSnapshot {
+    const transform = layerEl?.style.transform ?? '';
+    let anchorText = '';
+    let rowCount = 0;
+    if (viewportEl) {
+      const viewport = viewportEl.getBoundingClientRect();
+      const centerY = viewport.top + viewport.height / 2;
+      let bestDistance = Infinity;
+      const rows = Array.from(viewportEl.querySelectorAll<HTMLElement>('.mtv-line'));
+      rowCount = rows.length;
+      for (const row of rows) {
+        const rect = row.getBoundingClientRect();
+        if (rect.bottom <= viewport.top + 1 || rect.top >= viewport.bottom - 1) continue;
+        const distance = Math.abs((rect.top + rect.bottom) / 2 - centerY);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          anchorText = (row.textContent || '').replace(/\u00a0/g, ' ').replace(/[ \t]+$/g, '');
+        }
+      }
+    }
+    return { transform, anchorText, rowCount };
+  }
+
+  function emitHistoryPrependEvent(
+    lineCount: number,
+    cacheValid: boolean,
+    before: HistoryPrependSnapshot,
+    after: HistoryPrependSnapshot,
+  ) {
+    viewportEl?.dispatchEvent(new CustomEvent('thumbmux-history-prepend', {
+      detail: {
+        lineCount,
+        cacheValid,
+        before,
+        after,
+        transformStable: before.transform === after.transform,
+      },
+    }));
+  }
+
+  function finishArchiveRequest() {
+    archiveLoading = false;
+    if (archiveRequestTimer) {
+      clearTimeout(archiveRequestTimer);
+      archiveRequestTimer = null;
+    }
+  }
+
+  function commitStagedPrepend(stage: PrependStage) {
+    if (stage.seq !== prependParseSeq || stage.lines.length === 0) {
+      finishArchiveRequest();
+      return;
+    }
+
+    const lineCount = stage.lines.length;
+    const before = historyPrependSnapshot();
+    const currentFirstState = stateBefore[0] ? cloneSgrState(stateBefore[0]) : createSgrState();
+    const existingCacheValid = sgrStateKey(stage.endState) === sgrStateKey(currentFirstState);
+
+    archivedLines = [...stage.lines, ...archivedLines];
+    rawLines = [...stage.lines, ...rawLines];
+    htmlCache = [...stage.html, ...htmlCache];
+    stateBefore = [...stage.entryStates, ...stateBefore];
+    stateAfter = [...stage.exitStates, ...stateAfter];
+    linksByLine = linksAfterPrepend(stage);
+
+    archiveOffset -= lineCount;
+    total = rawLines.length;
+    winStart += lineCount;
+    winEnd += lineCount;
+
+    if (!existingCacheValid) reconcileExistingFrom(lineCount, stage.endState);
+    rerenderPrependSeam(stage);
+
+    contentEpoch++;
+    applyScroll();
+    const after = historyPrependSnapshot();
+    const meta = import.meta as unknown as { env?: { DEV?: boolean } };
+    if (meta.env?.DEV) {
+      console.assert(
+        before.transform === after.transform,
+        'TermView history prepend changed the scroll transform',
+        { before: before.transform, after: after.transform, lineCount },
+      );
+    }
+    requestAnimationFrame(() => {
+      emitHistoryPrependEvent(lineCount, existingCacheValid, before, after);
+    });
+    onLinesChange?.(rawLines);
+    emitScrollState();
+    finishArchiveRequest();
+  }
+
+  function schedulePrependCommit(stage: PrependStage) {
+    if (prependCommitFrame !== null) cancelAnimationFrame(prependCommitFrame);
+    prependCommitFrame = requestAnimationFrame(() => {
+      prependCommitFrame = null;
+      commitStagedPrepend(stage);
+    });
+  }
+
+  function stageHistoryPrepend(lines: string[]) {
+    if (lines.length === 0) {
+      finishArchiveRequest();
+      return;
+    }
+
+    const seq = ++prependParseSeq;
+    const batch = [...lines];
+    const linkPlan = planPrependLinks(batch);
+    const html: string[] = new Array(batch.length);
+    const entryStates: SgrState[] = new Array(batch.length);
+    const exitStates: SgrState[] = new Array(batch.length);
+    const st = createSgrState();
+    let idx = 0;
+
+    const parseSlice = () => {
+      prependParseFrame = null;
+      if (seq !== prependParseSeq) return;
+      const stop = Math.min(batch.length, idx + HISTORY_PARSE_CHUNK_LINES);
+      for (; idx < stop; idx++) {
+        entryStates[idx] = cloneSgrState(st);
+        html[idx] = lineToHtml(batch[idx], st, palette, linkPlan.batchLinks[idx]);
+        exitStates[idx] = cloneSgrState(st);
+      }
+      if (idx < batch.length) {
+        prependParseFrame = requestAnimationFrame(parseSlice);
+        return;
+      }
+      const endState = cloneSgrState(st);
+      schedulePrependCommit({
+        seq,
+        lines: batch,
+        html,
+        entryStates,
+        exitStates,
+        endState,
+        linkPlan,
+      });
+    };
+
+    prependParseFrame = requestAnimationFrame(parseSlice);
   }
 
   function applyArchivedHistory(data: string) {
@@ -271,7 +536,6 @@
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
     }
-    archiveLoading = false;
 
     let payload: {
       lines?: string[];
@@ -281,16 +545,19 @@
     try {
       payload = JSON.parse(data);
     } catch {
+      finishArchiveRequest();
       return;
     }
 
     const lines = Array.isArray(payload?.lines) ? payload.lines : [];
     archiveBeforeLine = typeof payload?.startLine === 'number' ? payload.startLine : archiveBeforeLine;
     archiveExhausted = !payload?.hasMore || lines.length === 0;
-    if (lines.length === 0) return;
+    if (lines.length === 0) {
+      finishArchiveRequest();
+      return;
+    }
 
-    archivedLines = [...lines, ...archivedLines];
-    commitLines([...archivedLines, ...liveLines], { prependedLineCount: lines.length });
+    stageHistoryPrepend(lines);
   }
 
   function flushPendingContent() {
@@ -325,10 +592,9 @@
 
     // Extend the rendered window only when the view leaves it — a DOM patch,
     // never during a frame that's purely momentum inside the window.
-    if (startIdx < winStart || endIdx > winEnd) {
+    if (startIdx < winStart - 1 || endIdx > winEnd) {
       winStart = Math.max(0, startIdx - OVERSCAN_ROWS);
       winEnd = Math.min(total, endIdx + OVERSCAN_ROWS);
-      renderEpoch++;
     }
 
     if (layerEl) {
@@ -687,6 +953,7 @@
     if (Math.abs(vel) < 0.04) { flushPendingContent(); return; }
     const TAU = MOMENTUM_TAU;
     vel *= MOMENTUM_GAIN;
+    if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * MOMENTUM_TAU);
     let lastT = performance.now();
     const step = () => {
       const now = performance.now();
@@ -695,6 +962,7 @@
       const decay = Math.exp(-dt / TAU);
       scrollBy(vel * TAU * (1 - decay));
       vel *= decay;
+      if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * TAU);
       const m = maxOffset();
       if (bottomOffsetPx < 0 || bottomOffsetPx > m) {
         momentumFrame = null;
@@ -872,6 +1140,8 @@
     if (typeof window === 'undefined') return;
     stopInertia();
     if (dragFrame !== null) cancelAnimationFrame(dragFrame);
+    if (prependParseFrame !== null) { cancelAnimationFrame(prependParseFrame); prependParseFrame = null; }
+    if (prependCommitFrame !== null) { cancelAnimationFrame(prependCommitFrame); prependCommitFrame = null; }
     if (altWheelFrame !== null) { cancelAnimationFrame(altWheelFrame); altWheelFrame = null; }
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
@@ -923,6 +1193,7 @@
   data-testid="mtv"
   data-total={total}
   data-bottom-offset={Math.round(bottomOffsetPx)}
+  data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
   style:font-size={`${fontPx}px`}
@@ -941,8 +1212,9 @@
 >
   <div bind:this={layerEl} class="mtv-layer">
     {#key renderEpoch}
-      {#each { length: winEnd - winStart } as _, i (winStart + i)}
-        <div class="mtv-line">{@html htmlCache[winStart + i] ?? ' '}</div>
+      {#each { length: winEnd - winStart } as _, i (archiveOffset + winStart + i)}
+        {@const lineIdx = winStart + i}
+        <div class="mtv-line" data-line-id={archiveOffset + lineIdx}>{@html cachedLineHtml(lineIdx, contentEpoch)}</div>
       {/each}
     {/key}
     {#if cursor && connected && bottomOffsetPx <= lineH && charW > 0}

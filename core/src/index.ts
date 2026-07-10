@@ -25,3 +25,4 @@ export * from './keys';
 export * from './sgr-mouse';
 export * from './paste';
 export * from './submit';
+export * from './prepend';
