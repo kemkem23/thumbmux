@@ -9,9 +9,7 @@ import {
   lineHeight,
   lineNumbers,
   makeSessionName,
-  markKnownGap,
   openSession,
-  scrollToBottomByWheel,
   visibleTerminalLines,
   wheel,
 } from './helpers';
@@ -20,7 +18,8 @@ test('renders and scrolls a 5,000-line tmux buffer with bounded DOM rows', async
   const session = makeSessionName(testInfo, 'big');
   try {
     createLineSession(session, 'BD', 5000);
-    expect(capturePane(session, -5000).split('\n').filter((line) => line.includes('BD line')).length).toBeGreaterThanOrEqual(5000);
+    const newestLine = 'BD line 5000 payload';
+    expect(capturePane(session, -5000).split('\n').filter((line) => /^BD line \d{4} payload$/.test(line)).length).toBe(5000);
 
     await openSession(page, session);
     await assertVirtualized(page);
@@ -44,10 +43,12 @@ test('renders and scrolls a 5,000-line tmux buffer with bounded DOM rows', async
       await assertVirtualized(page);
     }
 
-    // Known gap E2E-GAP-001: the package demo currently has no visible scroll-to-bottom control.
-    markKnownGap(testInfo, 'E2E-GAP-001', 'No visible scroll-to-bottom control is exposed by the demo; wheel fallback verifies the tail state.');
-    await scrollToBottomByWheel(page);
-    expect(await bottomOffset(page)).toBe(0);
+    const scrollBottom = page.getByTestId('demo-scroll-bottom');
+    await expect(scrollBottom).toBeVisible();
+    await scrollBottom.click();
+    await expect.poll(() => bottomOffset(page)).toBe(0);
+    await expect.poll(async () => (await visibleTerminalLines(page)).includes(newestLine)).toBe(true);
+    await assertVirtualized(page);
   } finally {
     killSession(session);
   }

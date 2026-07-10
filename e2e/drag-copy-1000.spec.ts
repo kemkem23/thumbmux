@@ -2,9 +2,9 @@ import { expect, test } from '@playwright/test';
 import {
   assertVirtualized,
   createLineSession,
+  dataTotal,
   killSession,
   makeSessionName,
-  markKnownGap,
   normalizeText,
   openSession,
   readClipboard,
@@ -12,28 +12,23 @@ import {
 } from './helpers';
 
 /**
- * Deep drag-selection: what actually happens when a user tries to drag-select
- * a THOUSAND lines in a virtualized terminal.
- *
- * The renderer keeps only a bounded DOM window (~±60 rows) by design, so a
- * native selection can only anchor to mounted rows. This spec:
- *   1. measures the real ceiling of a hold-and-scroll drag selection,
- *   2. pins a hard floor so regressions in window-sized selection still fail,
- *   3. asserts the SUPPORTED path for grabbing 1,000+ lines — copyAll — is
- *      byte-exact across the whole buffer.
+ * Deep drag-selection: native selection remains bounded by the virtualized
+ * DOM, while copyAll provides the exact archive-backed whole-buffer path.
  */
-test('drag toward 1,000 lines: measured ceiling + byte-exact full-buffer copy', async ({ context, page }, testInfo) => {
-  test.setTimeout(120_000);
+test('native drag has a 30-line floor and copyAll returns the complete archive', async ({ context, page }, testInfo) => {
+  test.setTimeout(180_000);
   const session = makeSessionName(testInfo, 'kilo');
-  const TOTAL = 1200;
+  const TOTAL = 6200;
   try {
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
     createLineSession(session, 'KL', TOTAL);
     await openSession(page, session);
     await assertVirtualized(page);
 
-    // Scroll deep into history so there is ≥1,000 lines BELOW the start row.
-    await wheel(page, -240, 60); // up
+    // Move above the live tail while retaining well over 1,000 lines below
+    // the start row. Staying clear of the top avoids preloading archive pages
+    // before the explicit expansion proof below.
+    await wheel(page, -240, 8); // up
     await page.waitForTimeout(250);
 
     const mtv = page.locator('[data-testid="mtv"]');
@@ -72,30 +67,35 @@ test('drag toward 1,000 lines: measured ceiling + byte-exact full-buffer copy', 
     best = Math.max(best, finalSelected);
     testInfo.annotations.push({ type: 'measurement', description: `hold-and-scroll drag selection ceiling: ${best} lines (target 1000, buffer ${TOTAL})` });
 
-    // HARD floor: a window's worth of lines must always be drag-selectable.
+    // A mounted window's worth of text must remain natively selectable.
     expect(best).toBeGreaterThanOrEqual(30);
 
-    if (best >= 1000) {
-      // Native deep drag actually works — pin it hard.
-      await page.keyboard.press(process.platform === 'darwin' ? 'Meta+C' : 'Control+C');
-      const clip = normalizeText(await readClipboard(page));
-      expect(clip).toContain('KL line 0001 payload');
-      expect(clip.split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(1000);
-    } else {
-      // Virtualization bounds native selection — the documented reality.
-      markKnownGap(
-        testInfo,
-        'E2E-GAP-006',
-        `Native drag-selection is bounded by the virtualization window (measured ceiling ${best} lines); deep multi-page grabs go through copyAll.`,
-      );
+    // A native selection takes precedence over the demo action, so release it
+    // before asking the supported archive-backed copyAll path for all lines.
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+    await page.waitForTimeout(100);
+
+    // The initial live window is capped at 2,000 lines. Repeated real wheel
+    // expansion reaches the earliest archive page before invoking copyAll.
+    for (let pageIndex = 0; pageIndex < 3; pageIndex++) {
+      const previousTotal = await dataTotal(page);
+      await page.getByTestId('mtv').evaluate((mtv) => {
+        const rect = mtv.getBoundingClientRect();
+        for (let i = 0; i < 2; i++) {
+          mtv.dispatchEvent(new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            deltaY: -100000,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2,
+          }));
+        }
+      });
+      await expect.poll(() => dataTotal(page), { timeout: 30_000 }).toBeGreaterThan(previousTotal);
+      await assertVirtualized(page);
     }
 
-    // SUPPORTED path: copyAll = the ENTIRE LOADED buffer, byte-exact. In the
-    // bare demo (no history archive) the loaded depth is the initial capture
-    // window — so we assert copyAll==loaded exactly, and record that a true
-    // 1,000-line grab needs an archive-wired host (covered by the host
-    // journey suite).
-    const total = Number(await page.locator('[data-testid="mtv"]').getAttribute('data-total'));
+    await expect.poll(() => dataTotal(page), { timeout: 30_000 }).toBeGreaterThanOrEqual(TOTAL);
     await page.getByRole('button', { name: 'Actions' }).click();
     await page.getByTestId('demo-copy').click();
     let all = '';
@@ -104,21 +104,16 @@ test('drag toward 1,000 lines: measured ceiling + byte-exact full-buffer copy', 
         all = normalizeText(await readClipboard(page));
         return all.split('\n').filter((l) => /^KL line \d{4} payload/.test(l.trim())).length;
       }, { timeout: 10_000 })
-      .toBeGreaterThanOrEqual(Math.min(total, TOTAL) - 15); // prompt/blank tolerance
+      .toBeGreaterThanOrEqual(TOTAL);
     const lines = all.split('\n').filter((l) => /^KL line \d{4} payload/.test(l.trim()));
-    // the copy must reach the loaded window's edges byte-exactly
-    const firstLoaded = lines[0]?.trim();
-    const lastLoaded = lines[lines.length - 1]?.trim();
-    expect(firstLoaded).toMatch(/^KL line \d{4} payload$/);
-    expect(lastLoaded).toBe(`KL line ${String(TOTAL).padStart(4, '0')} payload`);
-    if (lines.length < 1000) {
-      markKnownGap(
-        testInfo,
-        'E2E-GAP-004b',
-        `copyAll covers the loaded buffer only (${lines.length} of ${TOTAL} lines loaded — the demo ships no history archive); full-depth kilo-line copy is exercised on archive-wired hosts.`,
-      );
-    }
-    // no ANSI garbage anywhere in a kilobuffer copy
+    const expected = Array.from(
+      { length: TOTAL },
+      (_, index) => `KL line ${String(index + 1).padStart(4, '0')} payload`,
+    );
+    expect(lines.map((line) => line.trim())).toEqual(expected);
+    expect(lines[0]?.trim()).toBe('KL line 0001 payload');
+    expect(lines[lines.length - 1]?.trim()).toBe(`KL line ${String(TOTAL).padStart(4, '0')} payload`);
+    // Copy output must be plain text, not terminal control sequences.
     expect(all.includes('')).toBe(false);
   } finally {
     killSession(session);

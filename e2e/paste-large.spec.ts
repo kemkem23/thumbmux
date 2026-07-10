@@ -2,14 +2,16 @@ import { expect, test } from '@playwright/test';
 import {
   capturePane,
   createShellSession,
+  dockerExec,
   killSession,
   makeSessionName,
-  markKnownGap,
   openSession,
+  runShellCommand,
 } from './helpers';
 
 test('DesktopKeys confirms and delivers a 300-line large paste as bracketed input', async ({ context, page }, testInfo) => {
   const session = makeSessionName(testInfo, 'paste');
+  const captureFile = `paste-capture-${session}.bin`;
   try {
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
     await page.addInitScript(() => {
@@ -32,6 +34,7 @@ test('DesktopKeys confirms and delivers a 300-line large paste as bracketed inpu
     });
     createShellSession(session);
     await openSession(page, session);
+    runShellCommand(session, `cat > ${captureFile}`);
 
     const lines = Array.from({ length: 300 }, (_, i) => `PL-${String(i + 1).padStart(3, '0')} ${'x'.repeat(64)}`);
     const payload = lines.join('\n');
@@ -58,16 +61,21 @@ test('DesktopKeys confirms and delivers a 300-line large paste as bracketed inpu
     expect(frame.data.split(/\r\n|\r|\n/).filter((line) => line.includes('PL-')).length).toBe(300);
     expect(Buffer.byteLength(frame.data, 'utf8')).toBeGreaterThan(20_000);
 
-    if (!capturePane(session, -700).includes(lines[299])) {
-      // Known gap E2E-GAP-006: the demo tmux driver rejects this payload size as one send-keys command.
-      markKnownGap(testInfo, 'E2E-GAP-006', 'Large bracketed paste is emitted as one browser keys frame, but the demo driver does not deliver it to tmux.');
-      return;
-    }
-    const pane = capturePane(session, -900);
-    const pastedLineCount = lines.filter((line) => pane.includes(line)).length;
-    expect(pastedLineCount).toBe(300);
-    expect(pane).not.toContain('command not found');
+    await page.keyboard.press('Enter');
+    const readCapturedInput = () => Buffer.from(
+      dockerExec(`test -f ${captureFile} && base64 -w0 -- ${captureFile} || true`).trim(),
+      'base64',
+    ).toString('utf8');
+    await expect.poll(readCapturedInput).toContain(lines[299]);
+    const delivered = readCapturedInput();
+    expect(delivered.replace(/\r\n|\r/g, '\n')).toContain(frame.data.replace(/\r\n|\r/g, '\n'));
+    expect(delivered.split(/\r\n|\r|\n/).filter((line) => line.includes('PL-')).length).toBe(300);
+    expect(capturePane(session, -120)).not.toMatch(/command not found|not recognized as an internal or external command/i);
   } finally {
-    killSession(session);
+    try {
+      dockerExec(`rm -f -- ${captureFile}`);
+    } finally {
+      killSession(session);
+    }
   }
 });
