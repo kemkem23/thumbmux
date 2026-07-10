@@ -13,6 +13,7 @@ import { TmuxWsMux, createBunTmuxDriver, spawnTmuxSession, createUploadHandler }
 import type { MuxClientMessage } from "@thumbmux/core";
 import qrcode from "qrcode-terminal";
 import { networkInterfaces } from "node:os";
+import { FileHistoryArchive } from "./history-archive";
 
 const HOST_ALL = process.argv.includes("--host");
 const PORT = Number(process.env.PORT || 7681);
@@ -21,7 +22,8 @@ const DIST = new URL("./dist/", import.meta.url).pathname;
 
 const driver = createBunTmuxDriver();
 const handleUpload = createUploadHandler({ dir: "uploads" });
-const mux = new TmuxWsMux({ driver, log: console.log });
+const archive = new FileHistoryArchive({ root: process.env.THUMBMUX_HISTORY_ROOT });
+const mux = new TmuxWsMux({ driver, archive, log: console.log });
 
 function lanIp(): string {
   for (const addrs of Object.values(networkInterfaces())) {

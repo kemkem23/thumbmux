@@ -6,10 +6,30 @@
  */
 import type { RawCursorState, TmuxDriver } from "./ws-mux";
 
+const LARGE_INPUT_THRESHOLD_BYTES = 8 * 1024;
+
 function run(args: string[]): string {
   const p = Bun.spawnSync(["tmux", ...args]);
   if (p.exitCode !== 0) throw new Error(p.stderr.toString().trim() || `tmux ${args[0]} failed`);
   return p.stdout.toString();
+}
+
+function runWithStdin(args: string[], stdin: Uint8Array): string {
+  const p = Bun.spawnSync(["tmux", ...args], { stdin, stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) throw new Error(p.stderr.toString().trim() || `tmux ${args[0]} failed`);
+  return p.stdout.toString();
+}
+
+function sendLargeInput(session: string, bytes: Uint8Array) {
+  const bufferName = `thumbmux-input-${crypto.randomUUID()}`;
+  try {
+    runWithStdin(["load-buffer", "-b", bufferName, "-"], bytes);
+    run(["paste-buffer", "-d", "-b", bufferName, "-t", session]);
+  } finally {
+    // -d covers successful pastes; this also clears a buffer if loading or
+    // pasting fails midway.
+    try { run(["delete-buffer", "-b", bufferName]); } catch { /* best effort */ }
+  }
 }
 
 function parseCursorLine(line: string): RawCursorState | null {
@@ -42,7 +62,12 @@ export function createBunTmuxDriver(): TmuxDriver {
       return out;
     },
     sendKeys(session, data) {
-      run(["send-keys", "-t", session, "-l", "--", data]);
+      const bytes = new TextEncoder().encode(data);
+      if (bytes.byteLength <= LARGE_INPUT_THRESHOLD_BYTES) {
+        run(["send-keys", "-t", session, "-l", "--", data]);
+        return;
+      }
+      sendLargeInput(session, bytes);
     },
     getSessionActivity() {
       // window_activity, NOT session_activity: the session timestamp freezes

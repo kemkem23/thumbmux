@@ -28,13 +28,51 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
 
+### Output deltas and resync
+
+A full `output` frame establishes its raw base as `data.split('\n')`. That
+split is exact: a trailing empty element is part of the base and is never
+trimmed or normalised before hashing.
+
+After a full frame, a server may send:
+
+```ts
+{
+  channel,
+  type: 'delta',
+  baseLength,
+  prefix,
+  prefixHash,
+  lines,
+  cursor?,
+}
+```
+
+`prefix` is the number of unchanged raw lines. `lines` is the complete
+replacement suffix, so a client reconstructs with
+`base.slice(0, prefix).concat(lines)`, including replacement and truncation
+cases. `prefixHash` is lowercase FNV-1a-32 over the UTF-8 bytes of
+`JSON.stringify(base.slice(0, prefix))`.
+
+Clients accept a delta only when `baseLength` equals their current base length,
+all numeric fields are integers, `prefix` is in bounds, and the prefix hash
+matches. A bad, missing, or stale delta changes neither content nor cursor;
+the client sends one coalesced `{type:'resync', session}` request, ignores more
+deltas for that session, and resumes only after a full frame. The resync reply
+is a full `output` frame with `reset:'resync'`.
+
+Servers compare the complete serialized JSON UTF-8 sizes, including `cursor`,
+and send a delta only when its prefix is non-zero and it is strictly smaller
+than the corresponding full frame. A resize response is always a full output
+with `reset:'resize'`; it is never a delta.
+
 ## Timing model
 
 - Output detection: `pipe-pane` dirty signals debounced 15 ms (100 ms max
   wait); polling fallback at 4 FPS idle, 10 FPS for 5 s after a keystroke.
-- Snapshots are idempotent full states, not deltas: a client can join, drop,
-  or lag at any time and the next frame fully reconciles it (crash-safe by
-  construction — there is no cursor to desync).
+- The first snapshot for a subscription is a full state. Later output may use
+  a validated delta; an invalid or stale base is recovered by the resync
+  exchange above.
 - `tmux capture-pane` output ends at the last non-blank line of the visible
   region in most states, but freshly-spawned panes carry trailing blank rows;
   tail slicing trims them (see conformance: "tail subscribe receives only the

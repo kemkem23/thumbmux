@@ -19,6 +19,10 @@
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
   import {
+    createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
+    type ContentUpdate,
+  } from './content-update-gate';
+  import {
     createSgrState, cloneSgrState, sgrStateKey, lineToHtml,
     type AnsiPalette, type SgrState, type LineLinkRange,
     collectTerminalUrlSegments,
@@ -117,7 +121,10 @@
   let dragFrame: number | null = null;
   let altTouchY: number | null = null;
   let altTouchMoved = false;
-  let pendingContent: string | null = null;
+  let contentUpdateGate = createContentUpdateGate();
+  let pendingContentFlushFrame: number | null = null;
+  let paletteRefreshPending = false;
+  let renderRefreshPending = false;
   let prependParseFrame: number | null = null;
   let prependCommitFrame: number | null = null;
   let prependParseSeq = 0;
@@ -141,6 +148,11 @@
     transform: string;
     anchorText: string;
     rowCount: number;
+  };
+
+  type MuxDeliveryMeta = {
+    source: 'full' | 'delta';
+    replace: boolean;
   };
 
   /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
@@ -189,6 +201,8 @@
   }
 
   export function scrollToBottom() {
+    updateSelectionActive();
+    if (selectionActive) return;
     stopInertia();
     bottomOffsetPx = 0;
     if (altScreenMouse) {
@@ -331,18 +345,19 @@
     }
   }
 
-  function commitLines(next: string[]) {
+  function commitLines(next: string[], opts: { preserveReaderAnchor?: boolean } = {}) {
     // Find common prefix so unchanged history isn't re-parsed.
     let common = 0;
     const minLen = Math.min(rawLines.length, next.length);
     while (common < minLen && rawLines[common] === next[common]) common++;
 
-    if (bottomOffsetPx > 0) {
-      const grewBy = next.length - rawLines.length;
-      if (grewBy !== 0 && common >= minLen - 2) {
-        // Pure append/trim at the tail — shift the offset to compensate.
-        bottomOffsetPx = Math.max(0, bottomOffsetPx + grewBy * lineH);
-      }
+    const pureAppend = opts.preserveReaderAnchor
+      && next.length >= rawLines.length
+      && common === rawLines.length;
+    if (bottomOffsetPx > 0 && pureAppend) {
+      // A retained full prefix means the reader's mounted row still has the
+      // same raw index. Compensate exactly for lines appended below it.
+      bottomOffsetPx += (next.length - rawLines.length) * lineH;
     }
 
     rawLines = next;
@@ -356,15 +371,21 @@
     emitScrollState();
   }
 
-  function setLines(nextLive: string[]) {
-    if (bottomOffsetPx > 0 && liveLines.length > 0) {
+  function setLines(nextLive: string[], replace = false) {
+    let preserveReaderAnchor = false;
+    if (replace) {
+      // Resize/resync captures reflow only the current live window. Archived
+      // rows remain physical history at their original width.
+      liveLines = nextLive;
+    } else if (bottomOffsetPx > 0 && liveLines.length > 0) {
       const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
       liveLines = merged.lines;
+      preserveReaderAnchor = merged.preservedPrefix;
       if (merged.appendedLineCount > 0) archiveExhausted = false;
     } else {
       liveLines = nextLive;
     }
-    commitLines([...archivedLines, ...liveLines]);
+    commitLines([...archivedLines, ...liveLines], { preserveReaderAnchor });
   }
 
   function requestOlderHistory() {
@@ -560,17 +581,62 @@
     stageHistoryPrepend(lines);
   }
 
+  function contentUpdateBlock() {
+    return { busy: busy(), selectionActive };
+  }
+
+  function applyContentDelivery(delivery: ContentUpdate) {
+    if (delivery.cursor !== undefined) cursor = delivery.cursor;
+    setLines(delivery.data.replace(/\r/g, '').split('\n'), delivery.meta.replace);
+  }
+
+  function receiveLiveContent(
+    data: string,
+    nextCursor: { row: number; col: number } | null | undefined,
+    meta?: MuxDeliveryMeta,
+  ) {
+    const result = receiveContentUpdate(contentUpdateGate, {
+      data,
+      cursor: nextCursor,
+      meta: meta ?? { source: 'full', replace: false },
+    }, contentUpdateBlock());
+    contentUpdateGate = result.gate;
+    if (result.delivery) applyContentDelivery(result.delivery);
+  }
+
   function flushPendingContent() {
-    if (busy()) return;
-    if (pendingContent !== null) {
-      const c = pendingContent;
-      pendingContent = null;
-      setLines(c.replace(/\r/g, '').split('\n'));
+    const result = flushContentUpdate(contentUpdateGate, contentUpdateBlock());
+    contentUpdateGate = result.gate;
+    if (result.delivery) applyContentDelivery(result.delivery);
+    flushDeferredPresentation();
+  }
+
+  function flushDeferredPresentation() {
+    if (busy() || selectionActive) return;
+    if (paletteRefreshPending) {
+      paletteRefreshPending = false;
+      if (rawLines.length) rebuildFrom(0);
     }
+    if (renderRefreshPending) {
+      renderRefreshPending = false;
+      renderEpoch++;
+    }
+    applyScroll();
+  }
+
+  function schedulePendingContentFlush() {
+    if (pendingContentFlushFrame !== null) return;
+    pendingContentFlushFrame = requestAnimationFrame(() => {
+      pendingContentFlushFrame = null;
+      flushPendingContent();
+    });
   }
 
   // --- virtual window + transform (the 120Hz hot path) ---
   function applyScroll() {
+    // The browser selection owns the currently mounted native text nodes.
+    // Do not move its virtual window until the selection has been released.
+    if (selectionActive) return;
     // Re-read the live visible height — Safari's dvh/URL-bar dance must never
     // leave the model taller than reality (= bottom rows below the fold).
     if (viewportEl) {
@@ -724,6 +790,7 @@
   }
 
   function updateSelectionActive() {
+    const wasActive = selectionActive;
     const sel = typeof window !== 'undefined' ? window.getSelection() : null;
     selectionActive = !!(
       sel && !sel.isCollapsed && viewportEl && (
@@ -731,6 +798,7 @@
         (sel.focusNode && viewportEl.contains(sel.focusNode))
       )
     );
+    if (wasActive && !selectionActive) schedulePendingContentFlush();
   }
 
   function hasSelectionInView(): boolean {
@@ -934,6 +1002,7 @@
       altTouchY = null;
       altTouchMoved = false;
       touching = false;
+      flushPendingContent();
       return;
     }
     if (e && e.changedTouches?.[0] && tapStart) {
@@ -943,6 +1012,7 @@
     if (selectionActive) {
       updateSelectionActive();
       touching = false;
+      flushPendingContent();
       return; // no momentum after a selection gesture
     }
     touching = false;
@@ -1071,6 +1141,10 @@
   export function refreshGeometry() {
     lastPushedCols = 0;
     pushGeometry({ force: true });
+    if (selectionActive) {
+      renderRefreshPending = true;
+      return;
+    }
     renderEpoch++;
     applyScroll();
   }
@@ -1103,7 +1177,13 @@
 
   onMount(() => {
     viewH = viewportEl?.clientHeight ?? 0;
-    unsubscribe = tmuxMux.subscribe(session, (data: string, type?: string, cur?: { row: number; col: number } | null) => {
+    updateSelectionActive();
+    unsubscribe = tmuxMux.subscribe(session, (
+      data: string,
+      type?: string,
+      cur?: { row: number; col: number } | null,
+      meta?: MuxDeliveryMeta,
+    ) => {
       if (type === 'history') {
         applyArchivedHistory(data);
         return;
@@ -1115,12 +1195,7 @@
         if (cur !== undefined) cursor = cur;
         return;
       }
-      if (cur !== undefined) cursor = cur;
-      if (busy()) {
-        pendingContent = data;
-        return;
-      }
-      setLines(data.replace(/\r/g, '').split('\n'));
+      receiveLiveContent(data, cur, meta);
     });
     pushGeometry({ force: true });
     requestAnimationFrame(() => pushGeometry({ force: true }));
@@ -1140,6 +1215,7 @@
     if (typeof window === 'undefined') return;
     stopInertia();
     if (dragFrame !== null) cancelAnimationFrame(dragFrame);
+    if (pendingContentFlushFrame !== null) cancelAnimationFrame(pendingContentFlushFrame);
     if (prependParseFrame !== null) { cancelAnimationFrame(prependParseFrame); prependParseFrame = null; }
     if (prependCommitFrame !== null) { cancelAnimationFrame(prependCommitFrame); prependCommitFrame = null; }
     if (altWheelFrame !== null) { cancelAnimationFrame(altWheelFrame); altWheelFrame = null; }
@@ -1160,6 +1236,10 @@
   $effect(() => {
     if (paletteKey !== lastPaletteKey) {
       lastPaletteKey = paletteKey;
+      if (selectionActive) {
+        paletteRefreshPending = true;
+        return;
+      }
       if (rawLines.length) {
         rebuildFrom(0);
         renderEpoch++;

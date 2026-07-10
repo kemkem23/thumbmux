@@ -184,6 +184,9 @@
   let dockInset = $state(0);
   let dockFull = $state(0);
   let kbInset = $state(0);
+  let scrollControlsHeight = $state(0);
+  let termScrollState = $state({ bottomOffset: 0, scrolledUp: false });
+  let hasNewContent = $state(false);
   let slotsOpen = $state(false);
   let dpadOpen = $state(false);
   let uploadRef = $state<ReturnType<typeof UploadAction> | null>(null);
@@ -201,6 +204,29 @@
 
   function sendKeysTo(session: string) {
     return (data: string) => tmuxMux.sendKeys(session, data);
+  }
+
+  function onTermScrollStateChange(state: { bottomOffset: number; scrolledUp: boolean }) {
+    termScrollState = state;
+    if (!state.scrolledUp) {
+      hasNewContent = false;
+      scrollControlsHeight = 0;
+    }
+  }
+
+  function onTermLinesChange(lines: string[]) {
+    recentPrompts = extractRecentPrompts(lines, { targetCount: 5 });
+    if (termScrollState.scrolledUp) hasNewContent = true;
+  }
+
+  function scrollToTerminalBottom() {
+    termRef?.scrollToBottom();
+    hasNewContent = false;
+  }
+
+  async function copyTerminal() {
+    const copiedSelection = await termRef?.copySelection();
+    if (copiedSelection === false) await termRef?.copyAll();
   }
 
   function sessionFromUrl(): string | null {
@@ -271,7 +297,7 @@
     { id: 'type', label: '⌨ Type', onTap: () => { slotsOpen = false; composerRef?.openDock(); } },
     { id: 'upload', label: uploading ? '⏳ Uploading…' : '📎 Attach files', testid: 'demo-upload', onTap: () => { slotsOpen = false; uploadRef?.open(); } },
     { id: 'dpad', label: '✛ Arrows', onTap: () => { dpadOpen = !dpadOpen; slotsOpen = false; } },
-    { id: 'copy', label: '⧉ Copy screen', testid: 'demo-copy', onTap: () => { slotsOpen = false; termRef?.copyAll(); } },
+    { id: 'copy', label: '⧉ Copy screen', testid: 'demo-copy', onTap: async () => { slotsOpen = false; await copyTerminal(); } },
     { id: 'shortcuts', label: '⚡ Shortcuts…', testid: 'demo-shortcuts', onTap: () => { shortcutsOpen = true; slotsOpen = false; } },
     { id: 'theme', label: '🎨 Theme', testid: 'demo-theme', onTap: () => { themeOpen = true; slotsOpen = false; } },
     { id: 'font-up', label: 'A+ Bigger text', onTap: () => setFont(fontPx + 1) },
@@ -378,24 +404,26 @@
             <TermView
               bind:this={termRef}
               {session} palette={termPalette} {fontPx}
-              bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
+              bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0) + (scrollControlsHeight > 0 ? scrollControlsHeight + 8 : 0)}
               claimGeometry={!termUsesAltScreenMouse}
               altScreenMouse={termUsesAltScreenMouse}
               onKeys={sendKeys}
               onTap={() => composerRef?.openDock()}
-              onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
+              onLinesChange={onTermLinesChange}
+              onScrollStateChange={onTermScrollStateChange}
             />
           </DesktopKeys>
         {:else}
           <TermView
             bind:this={termRef}
             {session} palette={termPalette} {fontPx}
-            bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0)}
+            bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0) + (scrollControlsHeight > 0 ? scrollControlsHeight + 8 : 0)}
             claimGeometry={!termUsesAltScreenMouse}
             altScreenMouse={termUsesAltScreenMouse}
             onKeys={sendKeys}
             onTap={() => composerRef?.openDock()}
-            onLinesChange={(lines) => { recentPrompts = extractRecentPrompts(lines, { targetCount: 5 }); }}
+            onLinesChange={onTermLinesChange}
+            onScrollStateChange={onTermScrollStateChange}
           />
         {/if}
       {/key}
@@ -423,10 +451,19 @@
     <ShortcutBar
       bind:barHeight={shortcutBarH}
       {shortcuts}
-      visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen}
+      visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
       onSend={(sc) => { tmuxMux.sendKeys(session, sc.send); if (sc.submit !== false) setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
       onManage={() => (shortcutsOpen = true)}
     />
+    {#if termScrollState.scrolledUp}
+      <div class="scroll-controls" bind:offsetHeight={scrollControlsHeight}>
+        {#if hasNewContent}
+          <button data-testid="demo-new-content" onclick={scrollToTerminalBottom}>New content</button>
+        {:else}
+          <button data-testid="demo-scroll-bottom" onclick={scrollToTerminalBottom}>Scroll to bottom</button>
+        {/if}
+      </div>
+    {/if}
     <ShortcutsSheet bind:open={shortcutsOpen} {shortcuts} onChange={setShortcuts} />
     <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
     <DpadSheet bind:open={dpadOpen} onKey={(seq) => tmuxMux.sendKeys(session, seq)} />
@@ -499,5 +536,21 @@
     position: absolute;
     inset: 0;
     color: var(--tfg);
+  }
+  .scroll-controls {
+    position: absolute;
+    right: 76px;
+    bottom: calc(var(--dock-full, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom) + 8px);
+    z-index: 31;
+  }
+  .scroll-controls button {
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--agent);
+    background: var(--hud);
+    color: var(--hud-fg);
+    font: 700 11px var(--font-mono);
+    letter-spacing: .04em;
+    touch-action: manipulation;
   }
 </style>
