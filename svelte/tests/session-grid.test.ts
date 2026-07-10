@@ -123,6 +123,19 @@ describe('display helpers', () => {
     expect(right.tail).toContain('tail-z83q');
     expect(`${left.head}…${left.tail}`).not.toBe(`${right.head}…${right.tail}`);
   });
+
+  test('tail reaches past a shared launcher stamp to the differing character', () => {
+    // Real launcher shape: sibling names differ just BEFORE a shared
+    // "<worker>-<timestamp>" stamp. The stamp alone is 10 chars, so a
+    // 10-char tail rendered both cards identically.
+    const stamp = '0-mrelqu8j';
+    const left = splitSessionName(`sim-cc-shared-prefix-tail-a19z-${stamp}`);
+    const right = splitSessionName(`sim-cc-shared-prefix-tail-z83q-${stamp}`);
+    expect(left.truncated).toBe(true);
+    expect(left.tail).toBe(`z-${stamp}`);
+    expect(right.tail).toBe(`q-${stamp}`);
+    expect(`${left.head}…${left.tail}`).not.toBe(`${right.head}…${right.tail}`);
+  });
 });
 
 describe('thumbnail contrast palette', () => {

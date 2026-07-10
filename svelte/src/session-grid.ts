@@ -145,10 +145,13 @@ export function displayStateLabel(session: GridSession): string | null {
 
 export function splitSessionName(name: string, options: { maxChars?: number; tailChars?: number } = {}): DisplaySessionName {
   // Defaults sized for the NARROWEST real cards (2-col phone grid ≈ 110-120px
-  // at 10.5px mono ≈ 17-19 chars): split earlier and keep a compact tail so
-  // sibling names that differ only at the end stay distinguishable.
+  // at 10.5px mono ≈ 17-19 chars): split earlier and keep the tail long enough
+  // that sibling names stay distinguishable. Launchers commonly append a
+  // shared ~10-char stamp (worker/timestamp), so the tail must reach PAST it
+  // to the first differing character — 12 keeps "…a-<stamp>" and "…b-<stamp>"
+  // apart where 10 would render both cards identically.
   const maxChars = Math.max(12, Math.floor(options.maxChars ?? 18));
-  const tailChars = Math.max(6, Math.min(maxChars - 4, Math.floor(options.tailChars ?? 10)));
+  const tailChars = Math.max(6, Math.min(maxChars - 4, Math.floor(options.tailChars ?? 12)));
   if (name.length <= maxChars) {
     return { full: name, truncated: false, head: name, tail: '' };
   }
