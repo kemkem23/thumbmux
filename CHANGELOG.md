@@ -1,7 +1,66 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.3.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.4.0-dist`.
+
+## v0.4.0 — 2026-07-27
+- **Scrollback search**: `core/src/search.ts` searches visible terminal text
+  (control sequences stripped) in plain and bounded regex-lite modes, with hard
+  caps on pattern length and match count. Svelte ships `TermSearch` plus
+  `term-search` key/index helpers; `TermView` mounts the overlay and jumps
+  matches without leaving the compositor path.
+- **Modern SGR + OSC 8 hyperlinks**: `ansi-html` renders underline styles
+  (`single` / `double` / `curly` / `dotted` / `dashed`), underline color, and
+  OSC 8 href ranges as real anchors. Search highlight uses the same line path
+  via overlay ranges (`search-match` / `search-active`).
+- **`SgrState` non-breaking widen**: optional `underlineStyle`,
+  `underlineColor`, and `osc8Href` were added. A v0.3.5 eight-field object
+  literal still type-checks; missing fields read as `null`.
+  `createSgrState` / `cloneSgrState` always materialise the full shape.
+- **Record / replay**: `core/src/replay.ts` parses strict full/delta NDJSON
+  journals and seeks with clamped floor semantics; `server` exports
+  `FrameJournal` (nonblocking canonical NDJSON recorder with per-session FIFO
+  queues). Svelte ships `RecordingPlayer` and pure `recording-player` helpers
+  (speed steps, seek, bounded frame-HTML cache).
+- **FrameJournal stabilization**: new aggregate `maxRootBytes` (default
+  256 MiB; `Infinity` disables) beside the existing per-session `maxBytes`
+  (default 64 MiB). Exported `DEFAULT_MAX_BYTES` /
+  `DEFAULT_MAX_ROOT_BYTES`. New `deleteSessionJournal(session)` frees the
+  durable file and root quota; `closeSession()` only drops in-memory state —
+  the file remains and still counts toward root quota. A failed torn-write
+  rollback now **fails closed** (session stops accepting until explicit
+  recovery) instead of appending past corrupt bytes. `onError` phase
+  `"limit"` covers both caps; `"drop"` covers `maxPendingWrites` saturation;
+  non-integer cursor or invalid `reset` are rejected at admission (never
+  persisted unreplayably).
+- **Agent notifications + PWA scaffolding**: pure
+  `normalizeAgentNotificationEvent` / `validateAgentNotificationEvent`
+  contract in core; Svelte `notifications` helpers, `NotificationPermission`
+  UI, and `service-worker` push/click handlers. Core does not deliver push —
+  hosts own transport and permission UX (see `docs/notifications.md`).
+- **Token guard**: `server/src/token-guard.ts` issues scoped, expiring
+  bearer-token principals (`read` | `interactive`) with optional session
+  allowlists, query bootstrap → host-only cookie, and HTTP/mux authorization
+  tables. Issued principals are **frozen**; every authorization decision
+  re-derives from the immutable grant snapshot, so mutating a principal
+  object cannot widen scope, sessions, or expiry (see `docs/security.md`).
+- **Svelte surface export**: `TermSearch`, `RecordingPlayer`,
+  `NotificationPermission`, and the related pure helpers
+  (`term-search`, `recording-player`, `notifications`, `service-worker`)
+  are exported from `@thumbmux/svelte`.
+- **Mount smoke tests**: Svelte components are mounted in a real DOM harness
+  (`svelte/tests/mount-smoke.test.ts`). Earlier suites only grepped
+  component source text and would not have caught a component that threw on
+  every browser mount.
+- **Dense search-overlay rendering is linear**: the previous per-boundary
+  overlay rescan was quadratic. Measured on this host for 10,000 unit
+  matches on one row: **482.75 ms → 7.44 ms**.
+- **Git-dist release gate**: `assertGitDistInvariants` now checks real
+  properties (zero unresolved quoted `@thumbmux/core` specifiers under
+  `git-dist/`, required artifact presence, resolvable rewrites) instead of
+  hardcoded file/replacement counts that broke whenever a module was added.
+- An experimental native-prompt delivery path was cut before release; it is
+  not part of this tag. Continue using `submitPlan` + Enter as before.
 
 ## v0.3.5 — 2026-07-10
 - This tag supersedes `v0.3.4-dist`, which was generated during release

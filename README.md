@@ -139,7 +139,8 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in validated line deltas cut suffix-heavy traffic by 95% vs equivalent full frames in the clean-container e2e; per-message deflate remains available |
 | **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
 | **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
-| **Tests** | 478 source tests across 32 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
+| **Tests** | 730 source tests across 42 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
+| **Search overlay** | dense highlight path is linear — 10,000 unit matches on one row measured **482.75 ms → 7.44 ms** after the v0.4 fix |
 | **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
 
 ## Get started
@@ -149,19 +150,42 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.3.5-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.4.0-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.3.5-dist
+npm i    github:kemkem23/thumbmux#v0.4.0-dist
 ```
 
 ```ts
-import { TmuxWsMux, createBunTmuxDriver, createUploadHandler, createPrefsHandler } from 'thumbmux/server';
-import { deriveSurface, buildLaunchCommand, submitPlan } from 'thumbmux/core';
+import {
+  TmuxWsMux,
+  createBunTmuxDriver,
+  createUploadHandler,
+  createPrefsHandler,
+  FrameJournal,
+  createTokenGuard,
+} from 'thumbmux/server';
+import {
+  deriveSurface,
+  buildLaunchCommand,
+  submitPlan,
+  searchLines,
+  parseReplayJournal,
+  normalizeAgentNotificationEvent,
+} from 'thumbmux/core';
 ```
 
 ```svelte
 <script>
-  import { TermView, DesktopKeys, ComposerDock, SessionGrid, tmuxMux } from 'thumbmux/svelte';
+  import {
+    TermView,
+    DesktopKeys,
+    ComposerDock,
+    SessionGrid,
+    TermSearch,
+    RecordingPlayer,
+    NotificationPermission,
+    tmuxMux,
+  } from 'thumbmux/svelte';
 </script>
 ```
 
@@ -189,7 +213,7 @@ name; reuse a name only for the same logical session.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.3.5-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.4.0-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
@@ -286,13 +310,14 @@ thumbmux/
 
 | package | what you get |
 |---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
-| **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`) · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
+| **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
 
 Docs: [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
-[release process](SPLIT.md)
+[recording journal](docs/recording.md) · [notifications](docs/notifications.md) ·
+[token guard](docs/security.md) · [release process](SPLIT.md)
 
 <details>
 <summary><b>iOS scar tissue</b> — lessons encoded in the components so you don't relearn them</summary>
@@ -324,23 +349,24 @@ Docs: [desktop interaction contract](docs/desktop.md) ·
 - [x] Jank-free history expansion (state-convergent prepend, p95 16.7 ms) (v0.3.3)
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite
 
-**v0.3.4 — stability & wire perf**
+**v0.3.4 / v0.3.5 — stability & wire perf**
 - [x] Selection survives live output while scrolled up
 - [x] Live-window reflow when the pane width changes
 - [x] Validated opt-in line-delta frames with one-shot resync recovery
 - [x] Demo hardening: scroll-to-bottom + new-content pill, selection-first copy, private file-backed history archive reference
+- [x] Self-contained root git-dist (no unpublished `@thumbmux/core` workspace needed)
 
-**v0.4.0 — capability wave (planned)**
-- [ ] Search in scrollback (highlight + jump, archive-aware)
-- [ ] OSC 8 hyperlinks + modern underline styles
-- [ ] Session recording & playback (frame journal + scrubbable player)
-- [ ] Split view (two panes side by side)
-- [ ] Web-push notification scaffolding ("agent finished / needs input")
-- [ ] Hub pinning + activity badges
-- [ ] Token scopes for the demo server (read-only tokens, expiry)
-- [ ] PWA shell (installable, offline reconnect UX)
+**v0.4.0 — capability wave (shipped)**
+- [x] Search in scrollback (visible-text + regex-lite, highlight + jump in TermView)
+- [x] OSC 8 hyperlinks + modern underline styles
+- [x] Session recording & playback (`FrameJournal` + `parseReplayJournal` + `RecordingPlayer`)
+- [x] Web-push / local notification scaffolding (core event contract + SW helpers + permission UI)
+- [x] Token scopes (`createTokenGuard` — read/interactive, expiry, session allowlists)
+- [x] PWA scaffolding (service-worker registration + notification click handlers)
+- [x] Linear dense search-overlay rendering + real Svelte mount smoke tests
 
-**Later**: binary protocol (msgpack) / WebTransport, SSH-backed driver example,
+**Later**: split view (two panes side by side), hub pinning + activity badges,
+binary protocol (msgpack) / WebTransport, SSH-backed driver example,
 collaborative viewing, docs site, npm packages, scroll-feel video from a real device
 
 ## License

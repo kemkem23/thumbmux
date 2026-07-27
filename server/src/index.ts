@@ -7,8 +7,12 @@
  *            hooks; the wire format lives in @thumbmux/core (protocol.ts).
  * bun-driver createBunTmuxDriver() — complete reference driver over the tmux
  *            CLI (Bun-only; the mux itself is runtime-agnostic).
+ * frame-journal nonblocking canonical full/delta NDJSON recorder.
+ * token-guard   scoped, expiring bearer-token authorization primitive.
  */
 export * from './ws-mux';
 export * from './bun-driver';
 export * from './upload-handler';
 export * from "./prefs-handler";
+export * from './frame-journal';
+export * from './token-guard';

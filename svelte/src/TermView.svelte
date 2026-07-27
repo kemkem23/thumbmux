@@ -18,14 +18,35 @@
    */
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
+  import TermSearch from './TermSearch.svelte';
   import {
     contentLinesChangeSource, createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
     updatePendingContentCursor,
     type ContentUpdate,
   } from './content-update-gate';
   import {
-    createSgrState, cloneSgrState, sgrStateKey, lineToHtml,
+    searchKeyIntent,
+    moveActiveIndex,
+    readSparseOverlay,
+    writeSparseOverlay,
+    nextGeneration,
+    createArchiveContinuationState,
+    beginArchiveContinuation,
+    settleArchiveContinuation,
+    searchJumpBottomOffset,
+    hasSearchOverlayState,
+    shouldDeferSearchWork,
+    rememberDeferredSearchRerun,
+    clearDeferredSearchRerun,
+    type SearchDirection,
+    type ArchiveContinuationState,
+    type ArchiveContinuationSettlement,
+  } from './term-search';
+  import {
+    createSgrState, cloneSgrState, sgrStateKey, lineToHtml, searchLines,
     type AnsiPalette, type SgrState, type LineLinkRange,
+    type LineOverlayRange,
+    type SearchMatch,
     collectTerminalUrlSegments,
     mergeCapturedLinesForStableScroll,
     readerAnchorLineDelta,
@@ -106,6 +127,13 @@
   let archiveBeforeLine: number | null = null;
   let archiveLoading = false;
   let archiveExhausted = false;
+  // Client-side request id for history_expand. The wire protocol has no token,
+  // so we only match "currently inflight" vs "stale/lost": a timeout clears
+  // the inflight id and allows a retry; a late reply with no inflight id is
+  // discarded without permanently disabling expansion.
+  let archiveRequestActive = false;
+  let archiveRequestSeq = 0;
+  let archiveInflightRequestId: number | null = null;
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
@@ -115,6 +143,25 @@
   let archiveOffset = $state(ARCHIVE_OFFSET_START);
   let contentEpoch = $state(0);
   let renderEpoch = $state(0); // bump to force window re-render
+
+  // --- search + matching overlay ---
+  let searchOpen = $state(false);
+  let searchQuery = $state('');
+  let searchMatches = $state<SearchMatch[]>([]);
+  let searchActiveIndex = $state(-1);
+  let searchError = $state<string | null>(null);
+  let searchLineByIndex = new Map<number, LineOverlayRange[]>();
+  let searchSparseCache = new Map<number, { generation: number; html: string }>();
+  let searchGeneration = $state(0);
+  let searchQueryGeneration = $state(0);
+  let searchPanelEl: HTMLDivElement | null = $state(null);
+  let searchComponent: ReturnType<typeof TermSearch> | null = $state(null);
+  let pendingSearchJumpLine: number | null = null;
+  let searchPresentationPending = false;
+  let searchRerunPending = false;
+  let pendingSearchRerunIdentity: SearchActiveIdentity | null = null;
+  let keydownCaptureHost: HTMLElement | null = $state(null);
+  let archiveContinuationState: ArchiveContinuationState = createArchiveContinuationState();
 
   let touching = false;
   let selectionActive = false; // native text selection in progress — scroll yields
@@ -161,6 +208,12 @@
     replace: boolean;
   };
 
+  type SearchActiveIdentity = {
+    rowId: number;
+    start: number;
+    end: number;
+  };
+
   /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
    * clipboard. Falls back to a hidden-textarea execCommand copy for
    * non-secure origins (plain http on a LAN), where navigator.clipboard
@@ -185,25 +238,215 @@
         return true;
       }
     } catch { /* fall through to the legacy path */ }
+    // Declare outside try so a failed select/execCommand still removes the
+    // node — plain HTTP has no navigator.clipboard, so this path is common
+    // and a multi-megabyte buffer must not leak a hidden textarea forever.
+    let ta: HTMLTextAreaElement | null = null;
     try {
-      const ta = document.createElement('textarea');
+      ta = document.createElement('textarea');
       ta.value = text;
       ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
       document.body.appendChild(ta);
       ta.select();
-      const ok = document.execCommand('copy');
-      ta.remove();
-      return ok;
-    } catch { return false; }
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      ta?.remove();
+    }
   }
 
   export function isScrolledUp(): boolean {
     return bottomOffsetPx > lineH;
   }
 
+  function isSearchTarget(target: EventTarget | null): boolean {
+    return !!(
+      keydownCaptureHost && target instanceof Node && keydownCaptureHost.contains(target)
+    );
+  }
+
+  function selectionInSearchPanel(selection: Selection | null): boolean {
+    if (!selection || !searchPanelEl) return false;
+    const anchor = selection.anchorNode;
+    const focus = selection.focusNode;
+    return (
+      (anchor && searchPanelEl.contains(anchor)) ||
+      (focus && searchPanelEl.contains(focus))
+    );
+  }
+
+  function invalidateSearchOverlayHtml() {
+    searchSparseCache = new Map();
+    searchGeneration = nextGeneration(searchGeneration);
+  }
+
+  function requestSearchPresentation() {
+    if (shouldDeferSearchWork({ busy: busy(), selectionActive })) {
+      searchPresentationPending = true;
+      return;
+    }
+    renderEpoch++;
+    applyScroll();
+  }
+
+  function clearSearchRerunDeferral() {
+    const cleared = clearDeferredSearchRerun<SearchActiveIdentity>();
+    searchRerunPending = cleared.pending;
+    pendingSearchRerunIdentity = cleared.identity;
+  }
+
+  function currentSearchActiveIdentity(): SearchActiveIdentity | null {
+    const active = searchActiveIndex >= 0 ? searchMatches[searchActiveIndex] : null;
+    if (!active) return null;
+    // This is identity preservation only.  Search spans and jump math always
+    // remain rawLines indexes plus visible UTF-16 offsets.
+    return { rowId: archiveOffset + active.line, start: active.start, end: active.end };
+  }
+
+  function requestSearchRerun(prependIdentity: SearchActiveIdentity | null = null) {
+    if (shouldDeferSearchWork({ busy: busy(), selectionActive })) {
+      const next = rememberDeferredSearchRerun(
+        { pending: searchRerunPending, identity: pendingSearchRerunIdentity },
+        prependIdentity,
+      );
+      searchRerunPending = next.pending;
+      pendingSearchRerunIdentity = next.identity;
+      return;
+    }
+
+    if (!searchQuery) {
+      searchMatches = [];
+      searchActiveIndex = -1;
+      searchError = null;
+      searchLineByIndex = new Map();
+      clearSearchRerunDeferral();
+      invalidateSearchOverlayHtml();
+      requestSearchPresentation();
+      return;
+    }
+
+    const result = searchLines(rawLines, searchQuery);
+    const previousActive = searchActiveIndex >= 0 ? searchMatches[searchActiveIndex] : null;
+    const nextMatches = result.matches;
+    searchMatches = nextMatches;
+
+    if (nextMatches.length === 0) {
+      searchActiveIndex = -1;
+    } else if (prependIdentity) {
+      let nextActive = -1;
+      for (let i = 0; i < nextMatches.length; i += 1) {
+        const current = nextMatches[i];
+        if (
+          archiveOffset + current.line === prependIdentity.rowId &&
+          current.start === prependIdentity.start &&
+          current.end === prependIdentity.end
+        ) {
+          nextActive = i;
+          break;
+        }
+      }
+      searchActiveIndex = nextActive >= 0 ? nextActive : 0;
+    } else if (previousActive) {
+      let nextActive = -1;
+      for (let i = 0; i < nextMatches.length; i += 1) {
+        const current = nextMatches[i];
+        if (
+          current.line === previousActive.line &&
+          current.start === previousActive.start &&
+          current.end === previousActive.end
+        ) {
+          nextActive = i;
+          break;
+        }
+      }
+      searchActiveIndex = nextActive >= 0 ? nextActive : 0;
+    } else {
+      searchActiveIndex = 0;
+    }
+
+    searchError = result.error?.message ?? null;
+
+    const nextRanges = new Map<number, LineOverlayRange[]>();
+    for (const match of nextMatches) {
+      const ranges = nextRanges.get(match.line) ?? [];
+      ranges.push({ start: match.start, end: match.end, kind: 'search-match' });
+      nextRanges.set(match.line, ranges);
+    }
+
+    if (searchActiveIndex >= 0 && searchActiveIndex < nextMatches.length) {
+      const active = nextMatches[searchActiveIndex];
+      const ranges = nextRanges.get(active.line) ?? [];
+      let promoted = false;
+      for (let i = 0; i < ranges.length; i += 1) {
+        if (ranges[i].start === active.start && ranges[i].end === active.end) {
+          ranges[i] = { ...ranges[i], kind: 'search-active' };
+          promoted = true;
+          break;
+        }
+      }
+      if (!promoted) {
+        ranges.push({ start: active.start, end: active.end, kind: 'search-active' });
+      }
+      nextRanges.set(active.line, ranges);
+    }
+
+    searchLineByIndex = nextRanges;
+    invalidateSearchOverlayHtml();
+    requestSearchPresentation();
+  }
+
+  function updateSearchActiveRange(nextIndex: number) {
+    if (nextIndex < 0 || nextIndex >= searchMatches.length || !searchQuery) {
+      searchActiveIndex = -1;
+      return;
+    }
+
+    searchActiveIndex = nextIndex;
+    const next = new Map<number, LineOverlayRange[]>();
+    for (const [line, ranges] of searchLineByIndex.entries()) {
+      next.set(line, ranges.map((range) =>
+        range.kind === 'search-active'
+          ? { ...range, kind: 'search-match' as const }
+          : range,
+      ));
+    }
+
+    const active = searchMatches[nextIndex];
+    const ranges = next.get(active.line) ?? [];
+    let applied = false;
+    for (let i = 0; i < ranges.length; i += 1) {
+      if (ranges[i].start === active.start && ranges[i].end === active.end) {
+        ranges[i] = { ...ranges[i], kind: 'search-active' };
+        applied = true;
+        break;
+      }
+    }
+    if (!applied) {
+      ranges.push({ start: active.start, end: active.end, kind: 'search-active' });
+    }
+    next.set(active.line, ranges);
+
+    searchLineByIndex = next;
+    invalidateSearchOverlayHtml();
+    requestSearchPresentation();
+  }
+
   function cachedLineHtml(idx: number, epoch: number): string {
     void epoch;
-    return htmlCache[idx] ?? ' ';
+    const base = htmlCache[idx] ?? ' ';
+    const ranges = searchLineByIndex.get(idx);
+    if (!ranges || ranges.length === 0) return base;
+
+    const cached = readSparseOverlay(searchSparseCache, idx, searchGeneration);
+    if (cached !== undefined) return cached;
+
+    const rawLine = rawLines[idx];
+    if (rawLine === undefined) return base;
+    const st = stateBefore[idx] ? cloneSgrState(stateBefore[idx]) : createSgrState();
+    const html = lineToHtml(rawLine, st, palette, linksByLine[idx], ranges);
+    writeSparseOverlay(searchSparseCache, idx, searchGeneration, html);
+    return html;
   }
 
   export function scrollToBottom(): boolean {
@@ -381,6 +624,123 @@
     applyScroll();
     if (linesChanged) onLinesChange?.(rawLines, { source: opts.source });
     emitScrollState();
+
+    if (searchQuery && linesChanged) {
+      requestSearchRerun();
+    } else if (
+      !searchQuery &&
+      hasSearchOverlayState({
+        matchCount: searchMatches.length,
+        rangeCount: searchLineByIndex.size,
+        activeIndex: searchActiveIndex,
+        hasError: searchError !== null,
+      })
+    ) {
+      searchLineByIndex = new Map();
+      searchMatches = [];
+      searchActiveIndex = -1;
+      searchError = null;
+      clearSearchRerunDeferral();
+      invalidateSearchOverlayHtml();
+      requestSearchPresentation();
+    }
+  }
+
+  /** Bump generation and settle any in-flight archive continuation as query-change. */
+  function settleSearchQueryChange(): void {
+    searchQueryGeneration = nextGeneration(searchQueryGeneration);
+
+    if (archiveContinuationState.pendingRequestToken !== null) {
+      const settled = settleArchiveContinuation(
+        archiveContinuationState,
+        archiveContinuationState.pendingRequestToken,
+        { kind: 'query-change' },
+      );
+      archiveContinuationState = settled.state;
+    }
+  }
+
+  function updateSearchOpen(on?: boolean): void {
+    searchOpen = !!on;
+    if (!searchOpen) {
+      // Closing the panel ends the search session: drop query, cancel
+      // archive continuation, and let the empty-query rerun path clear
+      // matches / highlights / presentation so closed search cannot keep
+      // painting overlays or re-scanning on every content delivery.
+      searchQuery = '';
+      settleSearchQueryChange();
+      pendingSearchJumpLine = null;
+      requestSearchRerun();
+      return;
+    }
+    requestAnimationFrame(() => searchComponent?.focusInput());
+  }
+
+  function updateSearchQuery(next: string): void {
+    searchQuery = next;
+    settleSearchQueryChange();
+    requestSearchRerun();
+  }
+
+  function beginSearchContinuation(): boolean {
+    if (archiveLoading || archiveExhausted) return false;
+    const transition = beginArchiveContinuation(archiveContinuationState, {
+      queryGeneration: searchQueryGeneration,
+      archiveLoading,
+      archiveExhausted,
+    });
+    archiveContinuationState = transition.state;
+    if (transition.requestToken === null) return false;
+    if (!requestOlderHistory()) {
+      settleArchiveContinuationRequest('timeout');
+      return false;
+    }
+    return true;
+  }
+
+  function settleArchiveContinuationRequest(kind: ArchiveContinuationSettlement['kind']) {
+    const token = archiveContinuationState.pendingRequestToken;
+    if (token === null) return false;
+    const settled = settleArchiveContinuation(
+      archiveContinuationState,
+      token,
+      kind === 'committed'
+        ? { kind, queryGeneration: searchQueryGeneration }
+        : { kind },
+    );
+    archiveContinuationState = settled.state;
+    return settled.shouldRerunSearch;
+  }
+
+  function jumpToSearchLine(line: number) {
+    if (selectionActive) {
+      pendingSearchJumpLine = line;
+      return;
+    }
+
+    if (line < 0 || total === 0) return;
+    // Cancel any in-flight flick before snapping — otherwise momentum scrolls
+    // straight past the match we just centred.
+    stopInertia();
+    bottomOffsetPx = searchJumpBottomOffset({ line, total, lineH, viewH });
+    applyScroll();
+  }
+
+  function onSearchNavigate(direction: SearchDirection) {
+    if (!searchQuery || searchMatches.length === 0) return;
+
+    const nextState = moveActiveIndex(searchActiveIndex, searchMatches.length, direction);
+    updateSearchActiveRange(nextState.activeIndex);
+    if (searchActiveIndex < 0) return;
+
+    const match = searchMatches[searchActiveIndex];
+    if (!match) return;
+
+    if (direction === 'previous' && nextState.wrapped) {
+      beginSearchContinuation();
+    }
+
+    jumpToSearchLine(match.line);
   }
 
   function setLines(
@@ -405,15 +765,27 @@
     });
   }
 
-  function requestOlderHistory() {
-    if (archiveLoading || archiveExhausted) return;
+  function requestOlderHistory(): boolean {
+    if (archiveLoading || archiveExhausted) return false;
+    const requestId = ++archiveRequestSeq;
+    archiveInflightRequestId = requestId;
     archiveLoading = true;
+    archiveRequestActive = true;
     tmuxMux.requestHistory(session, archiveBeforeLine, HISTORY_BATCH_LINES);
     if (archiveRequestTimer) clearTimeout(archiveRequestTimer);
     archiveRequestTimer = setTimeout(() => {
+      // Superseded by a newer request (or already finished) — ignore.
+      if (archiveInflightRequestId !== requestId) return;
+      const settled = settleArchiveContinuationRequest('timeout');
+      if (searchQuery && settled) {
+        requestSearchRerun();
+      }
       archiveLoading = false;
+      archiveRequestActive = false;
+      archiveInflightRequestId = null;
       archiveRequestTimer = null;
     }, 5000);
+    return true;
   }
 
   function historyPrefetchThreshold(): number {
@@ -465,8 +837,11 @@
     }));
   }
 
-  function finishArchiveRequest() {
+  function finishArchiveRequest(settlement?: ArchiveContinuationSettlement['kind']) {
+    if (settlement) settleArchiveContinuationRequest(settlement);
     archiveLoading = false;
+    archiveRequestActive = false;
+    archiveInflightRequestId = null;
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
@@ -475,11 +850,12 @@
 
   function commitStagedPrepend(stage: PrependStage) {
     if (stage.seq !== prependParseSeq || stage.lines.length === 0) {
-      finishArchiveRequest();
+      finishArchiveRequest('malformed');
       return;
     }
 
     const lineCount = stage.lines.length;
+    const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
     const currentFirstState = stateBefore[0] ? cloneSgrState(stateBefore[0]) : createSgrState();
     const existingCacheValid = sgrStateKey(stage.endState) === sgrStateKey(currentFirstState);
@@ -515,6 +891,10 @@
     });
     onLinesChange?.(rawLines, { source: 'prepend' });
     emitScrollState();
+    const shouldRerun = settleArchiveContinuationRequest('committed');
+    if (searchQuery || shouldRerun) {
+      requestSearchRerun(activeIdentity);
+    }
     finishArchiveRequest();
   }
 
@@ -528,7 +908,7 @@
 
   function stageHistoryPrepend(lines: string[]) {
     if (lines.length === 0) {
-      finishArchiveRequest();
+      finishArchiveRequest('empty');
       return;
     }
 
@@ -570,28 +950,50 @@
   }
 
   function applyArchivedHistory(data: string) {
+    // Only the currently inflight request may consume a reply. A timed-out or
+    // otherwise abandoned request leaves archiveInflightRequestId null, so a
+    // late/lost-then-replayed frame is discarded without locking retries out.
+    if (!archiveRequestActive || archiveInflightRequestId === null) return;
+
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
     }
 
-    let payload: {
-      lines?: string[];
-      startLine?: number;
-      hasMore?: boolean;
-    } | null = null;
+    let payload: unknown = null;
     try {
       payload = JSON.parse(data);
     } catch {
-      finishArchiveRequest();
+      finishArchiveRequest('malformed');
       return;
     }
 
-    const lines = Array.isArray(payload?.lines) ? payload.lines : [];
-    archiveBeforeLine = typeof payload?.startLine === 'number' ? payload.startLine : archiveBeforeLine;
-    archiveExhausted = !payload?.hasMore || lines.length === 0;
+    const candidate = payload as { lines?: unknown; startLine?: unknown; hasMore?: unknown };
+    const validStartLine = candidate.startLine === undefined || candidate.startLine === null || (
+      typeof candidate.startLine === 'number' &&
+      Number.isSafeInteger(candidate.startLine) &&
+      candidate.startLine >= 0
+    );
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      Array.isArray(payload) ||
+      !Array.isArray(candidate.lines) ||
+      !candidate.lines.every((line) => typeof line === 'string') ||
+      typeof candidate.hasMore !== 'boolean' ||
+      !validStartLine
+    ) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+
+    const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
+    const lines = history.lines;
+    if (typeof history.startLine === 'number') archiveBeforeLine = history.startLine;
+    archiveExhausted = !history.hasMore || lines.length === 0;
     if (lines.length === 0) {
-      finishArchiveRequest();
+      const settlement = archiveExhausted ? 'exhausted' : 'empty';
+      finishArchiveRequest(settlement);
       return;
     }
 
@@ -634,16 +1036,31 @@
 
   function flushDeferredPresentation() {
     if (busy() || selectionActive) return;
+
+    // Deferred search re-parse first (may itself request presentation).
+    if (searchRerunPending) {
+      const identity = pendingSearchRerunIdentity;
+      clearSearchRerunDeferral();
+      requestSearchRerun(identity);
+      // Rerun already presented when not re-deferred; drop a stale paint flag.
+      searchPresentationPending = false;
+    }
+
     let bumpRenderEpoch = false;
     if (paletteRefreshPending) {
       paletteRefreshPending = false;
       if (rawLines.length) {
         rebuildFrom(0);
+        invalidateSearchOverlayHtml();
         bumpRenderEpoch = true;
       }
     }
     if (renderRefreshPending) {
       renderRefreshPending = false;
+      bumpRenderEpoch = true;
+    }
+    if (searchPresentationPending) {
+      searchPresentationPending = false;
       bumpRenderEpoch = true;
     }
     if (bumpRenderEpoch) renderEpoch++;
@@ -819,18 +1236,25 @@
     const wasActive = selectionActive;
     const sel = typeof window !== 'undefined' ? window.getSelection() : null;
     selectionActive = !!(
-      sel && !sel.isCollapsed && viewportEl && (
+      sel && !sel.isCollapsed && !selectionInSearchPanel(sel) && viewportEl && (
         (sel.anchorNode && viewportEl.contains(sel.anchorNode)) ||
         (sel.focusNode && viewportEl.contains(sel.focusNode))
       )
     );
-    if (wasActive && !selectionActive) schedulePendingContentFlush();
+    if (wasActive && !selectionActive) {
+      const pendingJump = pendingSearchJumpLine;
+      pendingSearchJumpLine = null;
+      schedulePendingContentFlush();
+      if (pendingJump !== null) {
+        requestAnimationFrame(() => jumpToSearchLine(pendingJump));
+      }
+    }
   }
 
   function hasSelectionInView(): boolean {
     const sel = typeof window !== 'undefined' ? window.getSelection?.() : null;
     return !!(
-      sel && !sel.isCollapsed && viewportEl && (
+      sel && !sel.isCollapsed && !selectionInSearchPanel(sel) && viewportEl && (
         (sel.anchorNode && viewportEl.contains(sel.anchorNode)) ||
         (sel.focusNode && viewportEl.contains(sel.focusNode))
       )
@@ -948,6 +1372,54 @@
 
   function closestLink(target: EventTarget | null): HTMLAnchorElement | null {
     return target instanceof Element ? target.closest('a') : null;
+  }
+
+  function stopSearchOverlayEvent(event: Event) {
+    event.stopPropagation();
+  }
+
+  function isSearchEditableTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof Element)) return false;
+    return !!target.closest('input,textarea,select,button,a,[contenteditable]');
+  }
+
+  function resolveKeydownCaptureHost(): HTMLElement | null {
+    if (!viewportEl) return null;
+    return viewportEl.closest('.desktop-keys') ?? viewportEl;
+  }
+
+  function onTermViewKeydown(event: KeyboardEvent) {
+    const target = event.target;
+    if (!isSearchTarget(target)) return;
+
+    const intent = searchKeyIntent(event, 'terminal');
+    if (!intent) return;
+
+    if (intent === 'open') {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      updateSearchOpen(true);
+      return;
+    }
+
+    if (!searchOpen || isSearchEditableTarget(target)) return;
+
+    if (intent === 'close') {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      updateSearchOpen(false);
+      return;
+    }
+
+    if (intent === 'next' || intent === 'previous') {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      onSearchNavigate(intent);
+      return;
+    }
   }
 
   function cleanTapTarget(target: EventTarget | null): boolean {
@@ -1204,6 +1676,8 @@
   onMount(() => {
     viewH = viewportEl?.clientHeight ?? 0;
     updateSelectionActive();
+    keydownCaptureHost = resolveKeydownCaptureHost();
+    keydownCaptureHost?.addEventListener('keydown', onTermViewKeydown, { capture: true });
     unsubscribe = tmuxMux.subscribe(session, (
       data: string,
       type?: string,
@@ -1257,6 +1731,13 @@
     window.removeEventListener('pageshow', onReturn);
     document.removeEventListener('visibilitychange', onReturn);
     document.removeEventListener('selectionchange', updateSelectionActive);
+    keydownCaptureHost?.removeEventListener('keydown', onTermViewKeydown, { capture: true });
+    keydownCaptureHost = null;
+    // Drop deferred search work so a destroyed view cannot flush into a dead tree.
+    clearSearchRerunDeferral();
+    searchPresentationPending = false;
+    pendingSearchJumpLine = null;
+    settleArchiveContinuationRequest('destroy');
   });
 
   // Re-render everything when the palette changes (theme/bg switch).
@@ -1271,6 +1752,7 @@
       }
       if (rawLines.length) {
         rebuildFrom(0);
+        invalidateSearchOverlayHtml();
         renderEpoch++;
         applyScroll();
       }
@@ -1319,6 +1801,30 @@
   onwheel={onWheel}
   onclick={onClick}
 >
+  {#if searchOpen}
+    <div
+      bind:this={searchPanelEl}
+      class="mtv-search"
+      onpointerdown={stopSearchOverlayEvent}
+      onpointerup={stopSearchOverlayEvent}
+      ontouchstart={stopSearchOverlayEvent}
+      ontouchmove={stopSearchOverlayEvent}
+      ontouchend={stopSearchOverlayEvent}
+      onclick={stopSearchOverlayEvent}
+      onwheel={stopSearchOverlayEvent}
+    >
+      <TermSearch
+        bind:this={searchComponent}
+        query={searchQuery}
+        matchCount={searchMatches.length}
+        activeIndex={searchActiveIndex}
+        error={searchError}
+        onQueryChange={updateSearchQuery}
+        onNavigate={onSearchNavigate}
+        onClose={() => updateSearchOpen(false)}
+      />
+    </div>
+  {/if}
   <div bind:this={layerEl} class="mtv-layer">
     {#key renderEpoch}
       {#each { length: winEnd - winStart } as _, i (archiveOffset + winStart + i)}
@@ -1364,6 +1870,14 @@
     touch-action: none;
     -webkit-touch-callout: default;
   }
+  .mtv-search {
+    position: absolute;
+    top: 0.45rem;
+    left: 0.45rem;
+    z-index: 4;
+    max-width: min(24rem, calc(100% - 0.9rem));
+    pointer-events: auto;
+  }
   .mtv-layer {
     position: absolute; left: 0; right: 0; top: 0;
     will-change: transform;
@@ -1383,6 +1897,14 @@
      paintable/tappable area, lifting terminal links to a ~40px touch target
      without disturbing the grid (fleet finding: 20px anchors). */
   .mtv-line :global(a) { padding: 10px 0; margin: -10px 0; }
+  :global(.search-match) {
+    background: rgba(173, 216, 230, 0.23);
+  }
+  :global(.search-active) {
+    background: rgba(250, 224, 66, 0.26);
+    outline: 1px solid rgba(255, 255, 255, 0.2);
+    outline-offset: -1px;
+  }
 
   .mtv-cursor {
     position: absolute;

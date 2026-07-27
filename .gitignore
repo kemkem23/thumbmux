@@ -3,3 +3,6 @@ demo/dist/
 dist/
 git-dist/
 *.tgz
+
+# agent bookkeeping — never ship to the public repo
+.claude/approaches.jsonl

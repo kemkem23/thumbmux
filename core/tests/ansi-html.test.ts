@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { createSgrState, lineToHtml, type AnsiPalette } from "../src/ansi-html";
+import {
+  createSgrState,
+  lineToHtml,
+  sgrStateKey,
+  type AnsiPalette,
+  type SgrState,
+} from "../src/ansi-html";
 
 const pal: AnsiPalette = {
   base: ["#000", "#f00", "#0f0", "#ff0", "#00f", "#f0f", "#0ff", "#fff",
@@ -8,7 +14,60 @@ const pal: AnsiPalette = {
   defaultBg: "#101014",
 };
 
+/** v0.3.5 public shape — must remain a valid SgrState object literal. */
+function legacySgrState(overrides: Partial<SgrState> = {}): SgrState {
+  return {
+    fg: null,
+    bg: null,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    inverse: false,
+    strike: false,
+    ...overrides,
+  };
+}
+
 describe("ansi-html", () => {
+  test("legacy 8-field SgrState object literal still typechecks and renders identically", () => {
+    // Exactly the v0.3.5 public fields — no underlineStyle / underlineColor / osc8Href.
+    // If those three are required again, this assignment fails to typecheck on upgrade.
+    const legacy: SgrState = {
+      fg: null,
+      bg: null,
+      bold: false,
+      dim: false,
+      italic: false,
+      underline: false,
+      inverse: false,
+      strike: false,
+    };
+
+    expect(lineToHtml("hello", legacy, pal)).toBe(
+      lineToHtml("hello", createSgrState(), pal),
+    );
+    expect(lineToHtml("hello", legacy, pal)).toBe("hello");
+
+    expect(lineToHtml("\x1b[31mred\x1b[0m plain", legacySgrState(), pal)).toBe(
+      lineToHtml("\x1b[31mred\x1b[0m plain", createSgrState(), pal),
+    );
+    // Attribute-only: underline true without modern fields → single underline decoration.
+    expect(lineToHtml("under", legacySgrState({ underline: true }), pal)).toBe(
+      '<span style="color:#e6e6e6;text-decoration:underline">under</span>',
+    );
+
+    expect(sgrStateKey(legacy)).toBe(sgrStateKey(createSgrState()));
+    // createSgrState still materialises the full runtime shape for fresh states.
+    const fresh = createSgrState();
+    expect("underlineStyle" in fresh).toBe(true);
+    expect("underlineColor" in fresh).toBe(true);
+    expect("osc8Href" in fresh).toBe(true);
+    expect(fresh.underlineStyle).toBeNull();
+    expect(fresh.underlineColor).toBeNull();
+    expect(fresh.osc8Href).toBeNull();
+  });
+
   test("plain text is HTML-escaped and unwrapped", () => {
     const st = createSgrState();
     expect(lineToHtml("hello <world> & co", st, pal)).toBe("hello &lt;world&gt; &amp; co");
