@@ -7,9 +7,14 @@
  *      `compileModule` (runes → client JS)
  *    Bare `from "svelte"` is rewritten to the absolute client entry so mount
  *    works without a global `--conditions=browser` flag.
- * 2. Installs happy-dom browser globals ONLY when the invoked test path looks
- *    like the svelte suite. Package-wide happy-dom would overwrite Bun's
- *    Headers/Request via `globalThis.window` and break server tests.
+ * 2. Installs happy-dom browser globals for DOM mount tests. Do NOT gate this
+ *    on `process.argv`: Bun's test preload runs once per process, and argv for
+ *    a worker often contains only the first (or a single) test file path — so
+ *    a combined CI command like
+ *      bun test ./server/tests/*.test.ts … ./svelte/tests/*.test.ts
+ *    can leave happy-dom uninstalled even though svelte files are in the run.
+ *    Network primitives (Headers/Request/fetch/…) stay Bun-native so
+ *    server/core suites keep working under the same process.
  *
  * Wired from packages/thumbmux/bunfig.toml `[test].preload` so the plugin is
  * registered before any test file's static `.svelte` imports resolve (Bun
@@ -33,19 +38,6 @@ function rewriteSvelteBareImports(code: string): string {
   return code
     .replaceAll(/from\s*["']svelte["']/g, `from ${JSON.stringify(svelteClientEntry)}`)
     .replaceAll(/import\s*["']svelte["']/g, `import ${JSON.stringify(svelteClientEntry)}`);
-}
-
-/**
- * Detect svelte-suite runs so we do not install happy-dom for core/server.
- * Matches: `bun test ./svelte/tests/...`, absolute paths containing `/svelte/tests/`.
- */
-function shouldInstallDom(): boolean {
-  return process.argv.some(
-    (arg) =>
-      arg.includes("svelte/tests") ||
-      arg.includes("svelte\\tests") ||
-      arg.endsWith("mount-smoke.test.ts"),
-  );
 }
 
 async function installHappyDom(): Promise<void> {
@@ -246,6 +238,5 @@ if (!(g as { __thumbmuxSveltePlugin?: boolean }).__thumbmuxSveltePlugin) {
   (g as { __thumbmuxSveltePlugin?: boolean }).__thumbmuxSveltePlugin = true;
 }
 
-if (shouldInstallDom()) {
-  await installHappyDom();
-}
+// Always install — argv is not a reliable signal for which suites bun will load.
+await installHappyDom();

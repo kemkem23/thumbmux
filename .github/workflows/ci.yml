@@ -20,6 +20,12 @@ jobs:
         run: bun test ./server/tests/
       - name: svelte + demo unit tests
         run: bun test ./svelte/tests/ ./demo/*.test.ts ./scripts/*.test.ts
+      # Release-parity gate: must stay byte-identical to the unit-test command
+      # in release.yml. Split suite steps above give better failure locality;
+      # this combined process is what release-dist actually runs, and a
+      # DOM-harness / preload interaction can fail only under one process.
+      - name: release-parity combined unit tests
+        run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
       - name: canonical container e2e

@@ -1,8 +1,8 @@
 # Test runtime for the thumbmux monorepo package.
 #
 # Preload registers the Svelte compile plugin early (before parallel test-file
-# imports resolve `.svelte` paths). happy-dom DOM globals install only when the
-# argv path looks like the svelte suite — see svelte/tests/preload.ts — so
-# core/server keep Bun-native Headers/Request.
+# imports resolve `.svelte` paths) and installs happy-dom DOM globals for mount
+# tests. Network primitives stay Bun-native — see svelte/tests/preload.ts — so
+# core/server keep working when all suites share one `bun test` process.
 [test]
 preload = ["./svelte/tests/preload.ts"]

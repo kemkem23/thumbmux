@@ -12,8 +12,8 @@
  *
  * Infrastructure (packages/thumbmux/bunfig.toml + this file):
  *   - `[test].preload = ./svelte/tests/preload.ts` — registers the Svelte
- *     compile plugin before parallel test imports; happy-dom only when argv
- *     path is the svelte suite (core/server keep Bun Headers/Request)
+ *     compile plugin before parallel test imports and installs happy-dom
+ *     unconditionally (Bun network primitives preserved for core/server)
  *   - `./svelte-client.ts` — mount/unmount/flushSync from Svelte's client entry
  *     (Bun's default condition serves the server stub which has no mount)
  *
