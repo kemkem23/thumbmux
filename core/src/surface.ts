@@ -5,6 +5,8 @@
  * its own branded base surfaces and persistence.
  */
 
+import type { AnsiPalette } from './ansi-html';
+
 export type TerminalSurface = {
   /** accent for borders/LED/buttons */
   agent: string;
@@ -23,6 +25,33 @@ export type TerminalSurface = {
   /** xterm theme override (merged over the viewer's defaults) */
   xterm: Record<string, string>;
 };
+
+/** A complete surface that can be passed straight to the Svelte viewers. */
+export type TerminalSurfaceWithPalette = TerminalSurface & {
+  palette: AnsiPalette;
+};
+
+const DEFAULT_BASE_SURFACE: TerminalSurface = {
+  agent: '#7dffa0',
+  tbg: '#101014',
+  tstage: '#0a0a0d',
+  tfg: '#e6e6e6',
+  hud: 'rgba(16,16,20,.95)',
+  hudFg: '#e6e6e6',
+  hudLine: '#34343a',
+  badge: '#1a1a1a',
+  badgeFg: '#e6e6e6',
+  xterm: {},
+};
+
+const DEFAULT_ANSI_BASE = [
+  '#101014', '#ff7a7a', '#7dffa0', '#ffef9e',
+  '#c8b4ff', '#ff9ad5', '#9be9ff', '#e8e8e8',
+  '#8a8a92', '#ff9d9d', '#a0ffbe', '#fff5bd',
+  '#dcceff', '#ffbde4', '#c2f1ff', '#ffffff',
+];
+
+const ANSI_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'] as const;
 
 export function hexToRgb(hex: string): [number, number, number] | null {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
@@ -88,4 +117,38 @@ export function deriveSurface(bg: string, base: TerminalSurface): TerminalSurfac
       ...(isLightBg ? DERIVED_LIGHT_ANSI : DERIVED_DARK_ANSI),
     },
   };
+}
+
+function paletteForSurface(surface: TerminalSurface): AnsiPalette {
+  const colors = [...DEFAULT_ANSI_BASE];
+  const theme = surface.xterm;
+
+  colors[0] = theme.black ?? surface.tbg;
+  colors[7] = theme.white ?? surface.tfg;
+  colors[8] = theme.brightBlack ?? colors[8]!;
+  colors[15] = theme.brightWhite ?? surface.tfg;
+
+  for (let index = 0; index < ANSI_COLOR_NAMES.length; index++) {
+    const name = ANSI_COLOR_NAMES[index]!;
+    const normal = theme[name] ?? colors[index + 1]!;
+    const brightName = `bright${name[0]!.toUpperCase()}${name.slice(1)}`;
+    colors[index + 1] = normal;
+    colors[index + 9] = theme[brightName] ?? normal;
+  }
+
+  return {
+    base: colors,
+    defaultFg: surface.tfg,
+    defaultBg: surface.tbg,
+  };
+}
+
+/**
+ * Derive a complete, unbranded terminal surface from one background color.
+ * Unlike deriveSurface(), this includes the 16-color palette consumed by
+ * TermView, SessionGrid, and RecordingPlayer.
+ */
+export function defaultSurface(bg: string): TerminalSurfaceWithPalette {
+  const surface = deriveSurface(bg, DEFAULT_BASE_SURFACE);
+  return { ...surface, palette: paletteForSurface(surface) };
 }

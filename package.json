@@ -1,6 +1,6 @@
 {
   "name": "thumbmux",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "tmux for thumbs \u2014 mobile-first web terminal stack: 120Hz compositor-scroll viewer, keyboard-aware composer dock, and a multiplexed tmux WebSocket engine.",
@@ -21,6 +21,9 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1"
+  },
+  "peerDependencies": {
+    "svelte": "^5"
   },
   "exports": {
     "./core": {

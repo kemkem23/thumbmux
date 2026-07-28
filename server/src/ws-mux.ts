@@ -123,7 +123,48 @@ export interface MuxHooks<WS extends WsLike = WsLike> {
     geometry: { cols: number; rows: number },
     client: unknown,
   ): { apply: boolean };
+  /** Backpressure lifecycle for host telemetry/alerting. Never affects mux behaviour. */
+  onBackpressure?(ws: WS, event: "blocked" | "drained" | "closed", info: { blockedMs: number; bufferedBytes?: number }): void;
+  /** Per-principal session-list authorization. Called with the provider's rows for EVERY delivery to
+   * that socket — the initial `sessions_subscribe` reply, every push, and backpressure drain catch-up.
+   * Return the subset this socket may see (do not mutate the input array).
+   * Unset = every socket sees the provider list verbatim (pre-0.4 behaviour, unchanged).
+   * Throwing = FAIL CLOSED: that socket receives nothing this round.
+   * Hosts typically wire `guard.filterSessions(sessions, principalOf(ws))` into this hook. */
+  filterSessionList?(sessions: readonly unknown[], ws: WS, client: unknown): readonly unknown[];
 }
+
+/**
+ * Outbound-queue backpressure policy. Under Bun, `ws.send()` returning `-1`
+ * means the frame was ENQUEUED (delivered in order) but the peer is not
+ * draining. With this enabled the mux stops piling more server-pushed frames
+ * onto that socket until it resumes.
+ *
+ * Resume paths:
+ *   - FAST: host wires Bun's `websocket.drain(ws)` → `handleDrain(ws)`.
+ *   - SELF-HEAL: when the adapter can report buffered bytes, `shouldSkipServerPush`
+ *     auto-resumes as soon as `readBufferedAmount` is 0 (no host wiring required).
+ *     When the adapter cannot report (`undefined`), only `handleDrain` resumes.
+ *
+ * Boundary: client-requested REPLIES stay unconditional and are out of scope —
+ * `pong`, `history` (`expandHistory`), and `error` frames. They are small and
+ * a client is synchronously waiting on them. Only server-pushed traffic
+ * (output/delta, cursor-only, session-list) is suppressed while blocked.
+ */
+export type MuxBackpressureOptions<WS extends WsLike = WsLike> = {
+  /** Master switch. Default true. false = pre-0.4 behaviour (-1 keeps sending). */
+  enabled?: boolean;
+  /** Close a socket whose outbound buffer exceeds this. Default 8 * 1024 * 1024. */
+  maxBufferedBytes?: number;
+  /** Close a socket that has stayed blocked this long. Default 30_000 ms. */
+  maxBlockedMs?: number;
+  /** Read a socket's queued bytes. Default: duck-typed `ws.getBufferedAmount?.()`
+   *  (Bun's ServerWebSocket); undefined when the adapter cannot report. */
+  bufferedAmount?(ws: WS): number | undefined;
+  /** Shed a chronically slow socket. Default: duck-typed `ws.close?.(1013, reason)`
+   *  (1013 = Try Again Later). A no-op when the adapter has no close(). */
+  close?(ws: WS, reason: string): void;
+};
 
 export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
   /** Compress outbound frames (Bun ServerWebSocket only: passes `true` as
@@ -147,6 +188,8 @@ export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
   /** unpiped sessions: max ms between reconcile captures when the
    * (second-resolution) tmux activity gate reports no change */
   pollReconcileMs?: number;   // default 3000
+  /** Outbound backpressure. Default enabled — see MuxBackpressureOptions. */
+  backpressure?: MuxBackpressureOptions<WS>;
   log?: (...args: unknown[]) => void;
   logError?: (...args: unknown[]) => void;
 };
@@ -180,11 +223,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   private subscribers = new Map<string, Set<WS>>();
   private sessionListSubscribers = new Set<WS>();
+  /** Client hint remembered from the latest `sessions_subscribe` for this socket
+   * (fed to `filterSessionList` on every delivery). Cleared on unsubscribe. */
+  private sessionListClients = new Map<WS, unknown>();
   private contents = new Map<string, string>();
   private hashes = new Map<string, string>();
   private lastActivity = new Map<string, number>();
   private interval: ReturnType<typeof setInterval> | null = null;
   private sessionListInterval: ReturnType<typeof setInterval> | null = null;
+  /** Change-detection key for the UNFILTERED provider result only. Never store
+   * a filtered projection here — a narrow view would suppress a real global
+   * change for every other socket. */
   private lastSessionsJson = "";
   private inFlight = false;
   private currentRate: number;
@@ -225,6 +274,19 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private pipeMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollCounter = 0;
 
+  // ── Outbound backpressure (per SOCKET — one outbound queue per connection) ──
+  private bpEnabled: boolean;
+  private bpMaxBufferedBytes: number;
+  private bpMaxBlockedMs: number;
+  private bpBufferedAmount?: (ws: WS) => number | undefined;
+  private bpClose?: (ws: WS, reason: string) => void;
+  /** Sockets whose last send returned -1 and have not yet drained. */
+  private blockedSockets = new Map<WS, { since: number }>();
+  /** Chronically slow sockets we have already shed (never push again). */
+  private shedSockets = new Set<WS>();
+  /** Blocked sockets that missed a session-list push and need one on drain. */
+  private owedSessionList = new Set<WS>();
+
   constructor(opts: TmuxWsMuxOptions<WS>) {
     this.compressFrames = opts.compressFrames === true;
     this.driver = opts.driver;
@@ -245,6 +307,12 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.log = opts.log ?? (() => {});
     this.logError = opts.logError ?? console.error;
     this.sessionListProvider = () => this.driver.listSessions();
+    const bp = opts.backpressure ?? {};
+    this.bpEnabled = bp.enabled !== false;
+    this.bpMaxBufferedBytes = bp.maxBufferedBytes ?? 8 * 1024 * 1024;
+    this.bpMaxBlockedMs = bp.maxBlockedMs ?? 30_000;
+    this.bpBufferedAmount = bp.bufferedAmount;
+    this.bpClose = bp.close;
   }
 
   setSessionListProvider(provider?: () => unknown[]) {
@@ -299,7 +367,15 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       // capture window and make terminal scrolling feel truncated.
       this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
     } else if (!resizeCapturePending) {
-      this.captureStartLines.set(session, this.INITIAL_CAPTURE_START_LINE);
+      // With a real archive, a reopened session can bootstrap from a small live
+      // window because older lines remain available through history_expand.
+      // Without one, a completed seed is the only durable indication that this
+      // session should reopen directly at the normal live depth.
+      const canExpandFromArchive = profile.archive && this.archive !== null;
+      const startLine = this.archiveSeeded.has(session) && !canExpandFromArchive
+        ? this.DEFAULT_CAPTURE_START_LINE
+        : this.INITIAL_CAPTURE_START_LINE;
+      this.captureStartLines.set(session, startLine);
     }
     const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
     this.queueCapture(session, { fullHistory: wantsArchive });
@@ -330,8 +406,10 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   unsubscribeAll(ws: WS) {
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
+    this.sessionListClients.delete(ws);
     for (const t of this.tails.values()) t.delete(ws);
     this.forgetOutputSocket(ws);
+    this.clearBackpressureState(ws);
     for (const [session, set] of this.subscribers) {
       set.delete(ws);
       if (set.size === 0) {
@@ -340,6 +418,261 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
     this.maybeStopPolling();
     this.refreshSessionListSchedule();
+  }
+
+  /** True while this socket is being skipped because it has not drained. */
+  isBackpressured(ws: WS): boolean {
+    return this.blockedSockets.has(ws);
+  }
+
+  /**
+   * The socket drained — resume pushes and hand it CURRENT truth (never a replay).
+   *
+   * FAST path: hosts wire this from Bun's `websocket.drain(ws)` handler so the
+   * socket is unblocked the moment Bun reports an empty outbound buffer.
+   * The mux ALSO self-heals inside `shouldSkipServerPush` whenever the adapter
+   * can report a zero buffered amount — so a host that forgets the drain
+   * wiring still recovers on the next server-push (no forever-silent socket).
+   * When the adapter cannot report buffered bytes (`undefined`), only this
+   * method resumes the socket.
+   *
+   * Safe no-op for a socket that is not blocked, is already shed, or is unknown.
+   *
+   * Unlike auto-resume (which only clears the blocked mark and lets the current
+   * broadcast deliver via pending-full markers), this path runs outside any
+   * broadcast and therefore must push the current cached content itself.
+   */
+  handleDrain(ws: WS): void {
+    if (this.shedSockets.has(ws)) return;
+    if (!this.blockedSockets.has(ws)) return;
+
+    // Shared resume: clear blocked mark + fire "drained".
+    this.resumeBlockedSocket(ws, this.readBufferedAmount(ws));
+
+    // Explicit catch-up (handleDrain only): one frame per session from CURRENT
+    // cached state only for sessions where this socket still has a pending
+    // full/reset marker (set while we skipped pushes). No history replay.
+    // Auto-resume skips this loop — the in-flight broadcast already carries
+    // pendingOutputFulls and delivers a complete snapshot in that same pass.
+    for (const [session, viewers] of this.subscribers) {
+      if (!viewers.has(ws)) continue;
+      const pendingFull = this.pendingOutputFulls.get(session)?.has(ws) === true;
+      const pendingReset = this.pendingOutputResets.get(session)?.has(ws) === true;
+      if (!pendingFull && !pendingReset) continue;
+      const cached = this.contents.get(session);
+      if (cached === undefined) continue;
+      this.sendOutputFrame(session, ws, {
+        channel: session,
+        type: "output",
+        data: this.contentFor(session, ws, cached),
+        cursor: this.lastCursor.get(session) ?? null,
+      });
+      // If re-blocked mid catch-up, remaining sessions stay pending for the next drain.
+      if (this.blockedSockets.has(ws) || this.shedSockets.has(ws)) break;
+    }
+
+    // Session-list debt after catch-up (may re-block above → leave debt for next resume).
+    this.settleSessionListDebt(ws);
+  }
+
+  /**
+   * Shared "resume" core for handleDrain and auto-resume in shouldSkipServerPush.
+   * Clears the blocked mark and fires onBackpressure("drained") with the same
+   * shape so the two paths cannot drift. Does NOT push output catch-up frames
+   * and does NOT settle session-list debt — callers own those:
+   *   - handleDrain: catch-up loop, then settleSessionListDebt (after catch-up
+   *     may re-block)
+   *   - auto-resume: settleSessionListDebt immediately, then return false so
+   *     the in-flight broadcast delivers via pendingOutputFulls
+   *
+   * Returns false when the socket was not blocked (or is shed).
+   */
+  private resumeBlockedSocket(ws: WS, bufferedBytes: number | undefined): boolean {
+    if (this.shedSockets.has(ws)) return false;
+    const blocked = this.blockedSockets.get(ws);
+    if (!blocked) return false;
+
+    const blockedMs = Date.now() - blocked.since;
+    this.blockedSockets.delete(ws);
+    this.hooks.onBackpressure?.(ws, "drained", {
+      blockedMs,
+      bufferedBytes,
+    });
+    return true;
+  }
+
+  /** Push an owed session list if the socket is clear (not blocked / not shed). */
+  private settleSessionListDebt(ws: WS): void {
+    if (this.owedSessionList.has(ws) && !this.blockedSockets.has(ws) && !this.shedSockets.has(ws)) {
+      this.owedSessionList.delete(ws);
+      this.pushSessionListTo(ws);
+    }
+  }
+
+  /** Drop per-socket backpressure marks so a reused socket object starts clean. */
+  private clearBackpressureState(ws: WS) {
+    this.blockedSockets.delete(ws);
+    this.shedSockets.delete(ws);
+    this.owedSessionList.delete(ws);
+  }
+
+  private readBufferedAmount(ws: WS): number | undefined {
+    if (this.bpBufferedAmount) return this.bpBufferedAmount(ws);
+    const any = ws as any;
+    if (typeof any.getBufferedAmount === "function") {
+      try { return any.getBufferedAmount(); } catch { return undefined; }
+    }
+    return undefined;
+  }
+
+  private closeSlowSocket(ws: WS, reason: string) {
+    if (this.bpClose) {
+      try { this.bpClose(ws, reason); } catch {}
+      return;
+    }
+    const any = ws as any;
+    if (typeof any.close === "function") {
+      try { any.close(1013, reason); } catch {}
+    }
+  }
+
+  /**
+   * Mark a socket blocked after a -1 enqueue. Fires onBackpressure("blocked")
+   * once per blocked episode (not per frame). Then evaluate shed thresholds.
+   */
+  private markBlocked(ws: WS) {
+    if (!this.bpEnabled) return;
+    if (this.shedSockets.has(ws)) return;
+    if (!this.blockedSockets.has(ws)) {
+      this.blockedSockets.set(ws, { since: Date.now() });
+      this.hooks.onBackpressure?.(ws, "blocked", {
+        blockedMs: 0,
+        bufferedBytes: this.readBufferedAmount(ws),
+      });
+    }
+    this.maybeShed(ws, "backpressure");
+  }
+
+  /**
+   * Shed a chronically slow socket. Invokes close once, fires onBackpressure
+   * ("closed"), and records the socket so we never push to it again.
+   *
+   * Do NOT call unsubscribeAll here — the host's own socket-close handler owns
+   * that path (Bun's `websocket.close` / our `unsubscribeAll`). Calling it
+   * from shed would fire hooks.onSocketClose twice.
+   */
+  private shedSocket(ws: WS, reason: string) {
+    if (this.shedSockets.has(ws)) return;
+    const blocked = this.blockedSockets.get(ws);
+    const blockedMs = blocked ? Date.now() - blocked.since : 0;
+    const bufferedBytes = this.readBufferedAmount(ws);
+    this.shedSockets.add(ws);
+    this.blockedSockets.delete(ws);
+    this.closeSlowSocket(ws, reason);
+    this.hooks.onBackpressure?.(ws, "closed", { blockedMs, bufferedBytes });
+  }
+
+  /** Evaluate buffered-byte / blocked-duration thresholds. */
+  private maybeShed(ws: WS, why: string): boolean {
+    if (!this.bpEnabled) return false;
+    if (this.shedSockets.has(ws)) return true;
+    const buffered = this.readBufferedAmount(ws);
+    if (buffered !== undefined && buffered > this.bpMaxBufferedBytes) {
+      this.shedSocket(ws, `backpressure:buffered>${this.bpMaxBufferedBytes}`);
+      return true;
+    }
+    const blocked = this.blockedSockets.get(ws);
+    if (blocked && Date.now() - blocked.since >= this.bpMaxBlockedMs) {
+      this.shedSocket(ws, `backpressure:blocked>${this.bpMaxBlockedMs}ms`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * True when server-pushed frames to this socket must be SKIPPED (blocked or
+   * already shed). Evaluates shed thresholds for currently-blocked sockets.
+   * Client-requested replies (pong / history / error) do NOT consult this.
+   *
+   * Self-heal: when the socket is blocked and the adapter reports buffered
+   * amount === 0, treat it as drained (see resumeBlockedSocket) and return
+   * false so the frame currently being built is delivered right now. The
+   * socket already carries pendingOutputFulls from the frames it was skipped
+   * for, so it receives a complete snapshot in this broadcast — no separate
+   * catch-up pass. When the adapter cannot report (`undefined`), behaviour is
+   * unchanged: stay blocked until the host calls handleDrain.
+   * Shed always wins: thresholds are evaluated before auto-resume.
+   */
+  private shouldSkipServerPush(ws: WS): boolean {
+    if (!this.bpEnabled) return false;
+    if (this.shedSockets.has(ws)) return true;
+    if (!this.blockedSockets.has(ws)) return false;
+    // Shed check must win over auto-resume.
+    if (this.maybeShed(ws, "skip")) return true;
+    // Self-heal when the adapter can measure and the queue has fully drained.
+    const buffered = this.readBufferedAmount(ws);
+    if (buffered === 0) {
+      this.resumeBlockedSocket(ws, 0);
+      // Owed session list now — same settlement path as handleDrain, without
+      // the output catch-up loop (pendingOutputFulls already mark this socket
+      // so the frame being built becomes a complete snapshot).
+      this.settleSessionListDebt(ws);
+      return false;
+    }
+    // Positive buffer, or adapter cannot report (undefined) → stay blocked.
+    return true;
+  }
+
+  /**
+   * Wire `data` field for a `__sessions` frame for one socket.
+   * Returns null when that socket must receive nothing (filter threw = fail closed).
+   * No filter hook → returns `unfilteredJson` so the caller can reuse one shared
+   * serialized outer message. With a hook → filters then stringifies for this
+   * socket only. Per-socket dedupe of identical filtered pushes is deliberately
+   * OUT of scope: a filtered socket may receive a repeat of its unchanged view
+   * when the global list changes elsewhere.
+   *
+   * A throwing filter is logged once per occurrence via logError (message text
+   * only — never the sessions payload, which can contain names a principal must
+   * not see).
+   */
+  private sessionListDataFor(
+    ws: WS,
+    sessions: readonly unknown[],
+    unfilteredJson: string,
+    client: unknown,
+  ): string | null {
+    const filter = this.hooks.filterSessionList;
+    if (!filter) return unfilteredJson;
+    try {
+      return JSON.stringify(filter(sessions, ws, client));
+    } catch (e: any) {
+      // Fail closed + surface the failure on the same channel subscribeSessions /
+      // broadcastSessionList already use. Message text only — never the payload.
+      const msg = e && typeof e.message === "string" ? e.message : String(e);
+      this.logError("[thumbmux-mux] filterSessionList threw:", msg);
+      return null;
+    }
+  }
+
+  /** Best-effort session-list push for one socket (used on drain catch-up). */
+  private pushSessionListTo(ws: WS) {
+    try {
+      const sessions = this.sessionListProvider();
+      const unfilteredJson = JSON.stringify(sessions);
+      // Do NOT assign lastSessionsJson here — catch-up is a per-socket delivery
+      // and must not clobber global change-detection state. Reading a newer
+      // provider result during drain and storing it as "already broadcast"
+      // would suppress the next real broadcast for every other socket.
+      const dataJson = this.sessionListDataFor(
+        ws, sessions, unfilteredJson, this.sessionListClients.get(ws),
+      );
+      if (dataJson === null) return;
+      const status = this.wsSend(ws, JSON.stringify({
+        channel: "__sessions", type: "sessions", data: dataJson,
+      } satisfies MuxServerMessage));
+      if (status === -1) this.markBlocked(ws);
+    } catch {}
   }
 
   /** Map a raw tmux cursor sample onto the content-anchored protocol
@@ -491,64 +824,223 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   /**
+   * Group viewers by the inputs that determine on-the-wire bytes, build and
+   * serialize ONE frame per group, then fan the shared string out. Bookkeeping
+   * (base advance, pending full/reset clear) stays per-socket and matches the
+   * pre-grouping sendOutputFrame semantics exactly.
+   *
+   * Grouping key:
+   *   1. tail preference (undefined = full content)
+   *   2. pending reset marker (undefined / "resize" / "resync")
+   *   3. delta base identity — sockets that are not delta-eligible, have a
+   *      pending full/reset, or hold no base collapse into one "full" group
+   *      per (tail, reset). Bases compare by ARRAY REFERENCE (O(1)); equal
+   *      contents in distinct arrays just miss a share — never wrong.
+   */
+  private sendGroupedOutputFrames(
+    session: string,
+    viewers: Iterable<WS>,
+    content: string,
+    cursor: { row: number; col: number } | null,
+    opts: { onlyPending?: boolean; /** When set, use this data for every viewer (caller already sliced). */ fixedData?: string } = {},
+  ): Map<WS, boolean> {
+    type Group = {
+      tail: number | undefined;
+      reset: "resize" | "resync" | undefined;
+      /** Present only for delta-eligible groups that share this base by identity. */
+      base: string[] | undefined;
+      sockets: WS[];
+    };
+
+    const results = new Map<WS, boolean>();
+
+    // Full groups keyed by "tail\0reset"; delta groups nested base→group under
+    // the same tail (reset is always undefined on the delta path).
+    const fullGroups = new Map<string, Group>();
+    const deltaByTail = new Map<number | undefined, Map<string[], Group>>();
+
+    for (const ws of viewers) {
+      const reset = this.pendingOutputResets.get(session)?.get(ws);
+      const pendingFull = this.pendingOutputFulls.get(session)?.has(ws) === true;
+      // Evaluate onlyPending BEFORE backpressure skip: a blocked socket with
+      // NOTHING pending is left completely untouched (no requireFullOutput).
+      // A blocked socket that DOES have a pending marker still gets
+      // skip + requireFullOutput (no base advance) for drain catch-up.
+      if (opts.onlyPending && reset === undefined && !pendingFull) continue;
+
+      // Blocked/shed sockets are skipped out of the group so a slow peer never
+      // stops healthy peers from receiving the shared serialized frame. A skip
+      // must NOT advance base and must NOT clear pending full/reset markers —
+      // requireFullOutput so drain can hand CURRENT truth later.
+      if (this.shouldSkipServerPush(ws)) {
+        if (!this.shedSockets.has(ws)) this.requireFullOutput(session, ws);
+        results.set(ws, false);
+        continue;
+      }
+
+      const tail = opts.fixedData !== undefined ? undefined : this.tails.get(session)?.get(ws);
+      const forceFull = reset !== undefined || pendingFull;
+      const base = this.outputBaseFor(session, ws);
+      const useDelta = this.isDeltaSubscriber(session, ws) && !forceFull && base !== undefined;
+
+      if (!useDelta) {
+        const key = `${tail ?? ""}\0${reset ?? ""}`;
+        let group = fullGroups.get(key);
+        if (!group) {
+          group = { tail, reset, base: undefined, sockets: [] };
+          fullGroups.set(key, group);
+        }
+        group.sockets.push(ws);
+      } else {
+        let byBase = deltaByTail.get(tail);
+        if (!byBase) {
+          byBase = new Map();
+          deltaByTail.set(tail, byBase);
+        }
+        // base is defined on the useDelta path
+        const b = base!;
+        let group = byBase.get(b);
+        if (!group) {
+          group = { tail, reset: undefined, base: b, sockets: [] };
+          byBase.set(b, group);
+        }
+        group.sockets.push(ws);
+      }
+    }
+
+    // contentFor once per distinct tail value across all groups (any socket
+    // in the group shares that tail; contentFor only reads tails.get).
+    const dataByTail = new Map<number | undefined, string>();
+
+    // splitMuxOutputData once per distinct data string, and only if a delta
+    // subscriber in that group actually succeeds. The resulting array is
+    // SHARED across every successful viewer in the group — treat as immutable
+    // (chooseMuxOutputFrame / muxCommonPrefixLength only read; base.slice()
+    // copies). Do not mutate in place.
+    const nextBaseByData = new Map<string, string[]>();
+
+    const flushGroup = (group: Group) => {
+      let data: string;
+      if (opts.fixedData !== undefined) {
+        data = opts.fixedData;
+      } else {
+        const cached = dataByTail.get(group.tail);
+        if (cached !== undefined) {
+          data = cached;
+        } else {
+          data = this.contentFor(session, group.sockets[0]!, content);
+          dataByTail.set(group.tail, data);
+        }
+      }
+      const full: MuxFullOutputFrame = {
+        channel: session,
+        type: "output",
+        data,
+        cursor,
+      };
+      const frame: MuxFullOutputFrame = group.reset ? { ...full, reset: group.reset } : full;
+      const output = group.base === undefined
+        ? frame
+        : chooseMuxOutputFrame(frame, group.base);
+      const serialized = JSON.stringify(output);
+
+      for (const ws of group.sockets) {
+        let ok = true;
+        try {
+          const status = this.wsSend(ws, serialized);
+          // Bun reports a dropped frame as 0 and backpressure as -1. Structural
+          // adapters commonly return void, which remains a successful handoff.
+          //
+          // -1 means the frame WAS enqueued and WILL be delivered in order, so
+          // per-socket bookkeeping for THIS frame still advances (base, pending
+          // markers). We only mark the socket blocked so subsequent SERVER-PUSHED
+          // frames are skipped until handleDrain — never treat -1 as a drop.
+          // status === 0 is a real drop: force a full retry, do not advance base.
+          if (status === 0) {
+            this.requireFullOutput(session, ws);
+            ok = false;
+          } else if (status === -1) {
+            this.markBlocked(ws);
+          }
+        } catch {
+          this.requireFullOutput(session, ws);
+          ok = false;
+        }
+        results.set(ws, ok);
+        if (!ok) continue;
+
+        // Full-only viewers can never consume a split base. If a later subscribe
+        // opts in, subscribe() invalidates and re-establishes the base with a
+        // forced full frame first.
+        if (this.isDeltaSubscriber(session, ws)) {
+          let nextBase = nextBaseByData.get(data);
+          if (!nextBase) {
+            // Shared immutable next-base for every successful delta viewer that
+            // received this same `data` string in this broadcast.
+            nextBase = splitMuxOutputData(data);
+            nextBaseByData.set(data, nextBase);
+          }
+          let bases = this.outputBases.get(session);
+          if (!bases) {
+            bases = new Map();
+            this.outputBases.set(session, bases);
+          }
+          bases.set(ws, nextBase);
+        }
+        const fulls = this.pendingOutputFulls.get(session);
+        fulls?.delete(ws);
+        if (fulls?.size === 0) this.pendingOutputFulls.delete(session);
+        const resets = this.pendingOutputResets.get(session);
+        resets?.delete(ws);
+        if (resets?.size === 0) this.pendingOutputResets.delete(session);
+      }
+    };
+
+    for (const group of fullGroups.values()) flushGroup(group);
+    for (const byBase of deltaByTail.values()) {
+      for (const group of byBase.values()) flushGroup(group);
+    }
+    return results;
+  }
+
+  /**
    * Serialize and send a full-or-delta output frame for exactly one viewer.
+   * Implemented as a one-element call into the grouped helper so single-socket
+   * paths (subscribe, handleResync) share the same bookkeeping.
    * The base advances only after Bun accepts the frame (including -1: queued
    * under backpressure). A real drop/throw forces a complete retry, so a live
    * socket cannot remain stale when the pane goes idle immediately afterward.
    */
   private sendOutputFrame(session: string, ws: WS, full: MuxFullOutputFrame): boolean {
-    const reset = this.pendingOutputResets.get(session)?.get(ws);
-    const forceFull = reset !== undefined || this.pendingOutputFulls.get(session)?.has(ws) === true;
-    const frame: MuxFullOutputFrame = reset ? { ...full, reset } : full;
-    const base = this.outputBaseFor(session, ws);
-    const output = !this.isDeltaSubscriber(session, ws) || forceFull || !base
-      ? frame
-      : chooseMuxOutputFrame(frame, base);
-    try {
-      const status = this.wsSend(ws, JSON.stringify(output));
-      // Bun reports a dropped frame as 0 and backpressure as -1. Structural
-      // adapters commonly return void, which remains a successful handoff.
-      // A -1 frame is queued and delivered in order; treating it as a failure
-      // would leave the server base behind the client's delivered base.
-      if (status === 0) {
-        this.requireFullOutput(session, ws);
-        return false;
-      }
-    } catch {
-      this.requireFullOutput(session, ws);
-      return false;
-    }
-
-    // Full-only viewers can never consume a split base. If a later subscribe
-    // opts in, subscribe() invalidates and re-establishes the base with a
-    // forced full frame first.
-    if (this.isDeltaSubscriber(session, ws)) {
-      let bases = this.outputBases.get(session);
-      if (!bases) {
-        bases = new Map();
-        this.outputBases.set(session, bases);
-      }
-      bases.set(ws, splitMuxOutputData(frame.data));
-    }
-    const fulls = this.pendingOutputFulls.get(session);
-    fulls?.delete(ws);
-    if (fulls?.size === 0) this.pendingOutputFulls.delete(session);
-    const resets = this.pendingOutputResets.get(session);
-    resets?.delete(ws);
-    if (resets?.size === 0) this.pendingOutputResets.delete(session);
-    return true;
+    // full.data is already tail-sliced by the caller — pass as fixedData so the
+    // grouped helper does not re-apply the socket's tail preference.
+    const results = this.sendGroupedOutputFrames(
+      session,
+      [ws],
+      full.data,
+      full.cursor ?? null,
+      { fixedData: full.data },
+    );
+    return results.get(ws) === true;
   }
 
   /** A lost cursor-only frame must make that viewer eligible for a complete
    * retry. lastCursor is session-global, so otherwise the next idle sample
-   * looks unchanged and the affected viewer can remain stale indefinitely. */
+   * looks unchanged and the affected viewer can remain stale indefinitely.
+   * While backpressured, cursor-only frames are suppressed and the viewer is
+   * marked for a full output on drain (which carries the current cursor). */
   private sendCursorFrame(session: string, ws: WS, message: string): boolean {
+    if (this.shouldSkipServerPush(ws)) {
+      if (!this.shedSockets.has(ws)) this.requireFullOutput(session, ws);
+      return false;
+    }
     try {
       const status = this.wsSend(ws, message);
       if (status === 0) {
         this.requireFullOutput(session, ws);
         return false;
       }
+      if (status === -1) this.markBlocked(ws);
       return true;
     } catch {
       this.requireFullOutput(session, ws);
@@ -562,15 +1054,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     content: string,
     cursor: { row: number; col: number } | null,
   ) {
-    for (const ws of viewers) {
-      if (!this.pendingOutputFulls.get(session)?.has(ws) && !this.pendingOutputResets.get(session)?.has(ws)) continue;
-      this.sendOutputFrame(session, ws, {
-        channel: session,
-        type: "output",
-        data: this.contentFor(session, ws, content),
-        cursor,
-      });
-    }
+    this.sendGroupedOutputFrames(session, viewers, content, cursor, { onlyPending: true });
   }
 
   private dropSessionState(session: string) {
@@ -599,13 +1083,32 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
   }
 
-  subscribeSessions(ws: WS) {
+  subscribeSessions(ws: WS, client?: unknown) {
     this.sessionListSubscribers.add(ws);
+    this.sessionListClients.set(ws, client);
+    // Session-list is a server push. While blocked, remember the debt and
+    // catch up on handleDrain — do not enqueue more onto a slow outbound queue.
+    if (this.shouldSkipServerPush(ws)) {
+      if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+      this.refreshSessionListSchedule();
+      return;
+    }
     try {
       const sessions = this.sessionListProvider();
+      // lastSessionsJson is assigned from the UNFILTERED result (legacy quirk —
+      // preserve exactly; filtered projections never go here).
       const json = JSON.stringify(sessions);
       this.lastSessionsJson = json;
-      this.wsSend(ws, JSON.stringify({ channel: "__sessions", type: "sessions", data: json } satisfies MuxServerMessage));
+      const dataJson = this.sessionListDataFor(ws, sessions, json, client);
+      if (dataJson === null) {
+        // filterSessionList threw → fail closed: no frame this round.
+        this.refreshSessionListSchedule();
+        return;
+      }
+      const status = this.wsSend(ws, JSON.stringify({
+        channel: "__sessions", type: "sessions", data: dataJson,
+      } satisfies MuxServerMessage));
+      if (status === -1) this.markBlocked(ws);
     } catch (e: any) {
       this.logError("[thumbmux-mux] subscribeSessions error:", e.message);
     }
@@ -614,6 +1117,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   unsubscribeSessions(ws: WS) {
     this.sessionListSubscribers.delete(ws);
+    this.sessionListClients.delete(ws);
     this.refreshSessionListSchedule();
   }
 
@@ -705,7 +1209,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
       case "keys": if (msg.session && msg.data !== undefined) this.handleKeys(msg.session, msg.data, ws, msg.client); break;
       case "resize": if (msg.session && msg.cols && msg.rows) this.handleResize(msg.session, msg.cols, msg.rows, ws, msg.client); break;
-      case "sessions_subscribe": this.subscribeSessions(ws); break;
+      case "sessions_subscribe": this.subscribeSessions(ws, msg.client); break;
       case "sessions_unsubscribe": this.unsubscribeSessions(ws); break;
       case "history_expand": if (msg.session) this.expandHistory(msg.session, ws, msg.beforeLine, msg.limit); break;
       case "resync": if (msg.session) this.handleResync(msg.session, ws); break;
@@ -993,11 +1497,21 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
         && this.pendingArchiveReflows.get(session) === archiveReflowGeneration) {
         this.pendingArchiveReflows.delete(session);
       }
-      if (opts.fullHistory && useArchive) {
+      if (opts.fullHistory) {
+        // A successful bootstrap capture widens every later live capture and
+        // prevents late subscribers from repeating the expensive full-history
+        // read. This bookkeeping is required even when the host uses the
+        // default archive profile without providing an archive implementation.
         this.archiveSeeded.add(session);
         this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
-        try { this.driver.setSessionHistoryLimit(session, this.liveLineLimit); } catch (e: any) {
-          this.logError(`[thumbmux-mux] unable to lower history-limit for "${session}":`, e.message);
+        // A subscriber may have queued another full capture while this one was
+        // awaiting the driver. It is redundant now that the seed succeeded;
+        // leave the pending lane intact so it refreshes at normal live depth.
+        this.queuedCapturesFullHistory.delete(session);
+        if (useArchive) {
+          try { this.driver.setSessionHistoryLimit(session, this.liveLineLimit); } catch (e: any) {
+            this.logError(`[thumbmux-mux] unable to lower history-limit for "${session}":`, e.message);
+          }
         }
       }
 
@@ -1067,14 +1581,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       }
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
-      for (const ws of viewers) {
-        this.sendOutputFrame(session, ws, {
-          channel: session,
-          type: "output",
-          data: this.contentFor(session, ws, liveContent),
-          cursor,
-        });
-      }
+      this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
     } catch {
       // Session gone — notify viewers
       const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
@@ -1174,23 +1681,50 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
       if (json === this.lastSessionsJson) return;
+      // Unfiltered provider result only — never a filtered projection.
       this.lastSessionsJson = json;
 
-      const msg = JSON.stringify({ channel: "__sessions", type: "sessions", data: json } satisfies MuxServerMessage);
-      // Broadcast to all connected websockets (deduplicate)
+      // No filter hook: serialize ONCE and reuse the shared string for every
+      // socket (byte-identical to pre-0.4). With a filter: per-socket data.
+      const hasFilter = !!this.hooks.filterSessionList;
+      const sharedMsg = hasFilter
+        ? null
+        : JSON.stringify({ channel: "__sessions", type: "sessions", data: json } satisfies MuxServerMessage);
+
+      // Broadcast to all connected websockets (deduplicate). Blocked sockets
+      // are skipped and marked as owing a session list for drain catch-up.
+      // Per-socket dedupe of identical filtered pushes is OUT of scope — a
+      // filtered socket may receive a repeat of its unchanged view when the
+      // global list changes elsewhere (deliberate simplification).
       const sent = new Set<WS>();
-      for (const ws of this.sessionListSubscribers) {
-        if (sent.has(ws)) continue;
-        try { this.wsSend(ws, msg); } catch {}
+      const trySend = (ws: WS, client: unknown) => {
+        if (sent.has(ws)) return;
         sent.add(ws);
+        if (this.shouldSkipServerPush(ws)) {
+          if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+          return;
+        }
+        try {
+          let msg: string;
+          if (sharedMsg !== null) {
+            msg = sharedMsg;
+          } else {
+            const dataJson = this.sessionListDataFor(ws, sessions, json, client);
+            if (dataJson === null) return; // fail closed
+            msg = JSON.stringify({
+              channel: "__sessions", type: "sessions", data: dataJson,
+            } satisfies MuxServerMessage);
+          }
+          const status = this.wsSend(ws, msg);
+          if (status === -1) this.markBlocked(ws);
+        } catch {}
+      };
+      for (const ws of this.sessionListSubscribers) {
+        trySend(ws, this.sessionListClients.get(ws));
       }
       for (const viewers of this.subscribers.values()) {
-        for (const ws of viewers) {
-          if (!sent.has(ws)) {
-            try { this.wsSend(ws, msg); } catch {}
-            sent.add(ws);
-          }
-        }
+        // Pane-only sockets may have no remembered client → undefined.
+        for (const ws of viewers) trySend(ws, this.sessionListClients.get(ws));
       }
     } catch (e: any) {
       this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);

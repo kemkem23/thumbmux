@@ -165,7 +165,11 @@ describe("server delta conformance", () => {
     }
   });
 
-  test("treats Bun -1 backpressure as a delivered frame and advances the delta base", async () => {
+  test("Bun -1 enqueues the frame (base advances) then suppresses until handleDrain delivers latest truth", async () => {
+    // NEW backpressure contract: the -1 frame itself is delivered (enqueued),
+    // so the base advances and reconstruction works — but subsequent content
+    // changes produce NO frame until handleDrain, which hands CURRENT truth
+    // (never a replay of intermediates).
     const initial = longContent();
     const { mux, setContent } = makeHarness(initial);
     const ws = new FakeWS();
@@ -180,9 +184,88 @@ describe("server delta conformance", () => {
       const firstDelta = ws.frames().at(-1);
       expect(firstDelta.type).toBe("delta");
       expect(applyMuxDelta(splitMuxOutputData(initial), firstDelta)).toEqual(splitMuxOutputData(firstAppend));
+      expect(mux.isBackpressured(ws)).toBe(true);
+
+      // Next content change must produce NO frame while blocked.
+      const secondAppend = `${firstAppend}\ntwo`;
+      const beforeSecond = ws.frames().length;
+      setContent(secondAppend);
+      await until(() => {
+        // Healthy path would have advanced; we only need a poll tick to pass.
+        return true;
+      });
+      // Give the poller a few ticks to prove silence.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(ws.frames().length).toBe(beforeSecond);
+
+      // Drain → exactly one catch-up frame carrying LATEST content.
+      const beforeDrain = ws.frames().length;
+      mux.handleDrain(ws);
+      expect(mux.isBackpressured(ws)).toBe(false);
+      expect(ws.frames().length).toBe(beforeDrain + 1);
+      const catchUp = ws.frames().at(-1);
+      expect(catchUp).toMatchObject({ type: "output", data: secondAppend });
+
+      // Delta operation resumes from the catch-up base.
+      const third = `${secondAppend}\nthree`;
+      setContent(third);
+      await until(() => ws.frames().length === beforeDrain + 2);
+      const resumed = ws.frames().at(-1);
+      expect(resumed.type).toBe("delta");
+      expect(applyMuxDelta(splitMuxOutputData(secondAppend), resumed)).toEqual(splitMuxOutputData(third));
+    } finally {
+      mux.stop();
+    }
+  });
+
+  test("backpressure enabled:false keeps the pre-0.4 -1 keeps-sending contract", async () => {
+    // Escape hatch: with backpressure disabled, -1 advances the base AND the
+    // next content change is still delivered immediately (legacy behaviour).
+    const initial = longContent();
+    const contents = new Map([[SESSION, initial]]);
+    let activity = 0;
+    const cursor = { x: 4, y: 0, paneHeight: 1, visible: true };
+    const driver: TmuxDriver = {
+      listSessions: () => [...contents.keys()].map((name) => ({ name })),
+      capturePane: async (session) => contents.get(session) ?? "",
+      captureWithCursor: async (session) => ({
+        content: contents.get(session) ?? "",
+        cursor: { ...cursor },
+        trailingBlanks: 0,
+      }),
+      sendKeys: () => {},
+      getSessionActivity: () => {
+        activity += 1;
+        return new Map([...contents.keys()].map((session) => [session, activity]));
+      },
+      getHistoryLimit: () => 2000,
+      setSessionHistoryLimit: () => {},
+      resizeWindow: () => {},
+      hash: (content) => content,
+    };
+    const mux = new TmuxWsMux({
+      driver,
+      profile: () => ({ resize: true, currentPaneOnly: false, archive: false }),
+      pollNormalMs: 10,
+      pollReconcileMs: 10,
+      backpressure: { enabled: false },
+    });
+    const ws = new FakeWS();
+    try {
+      mux.subscribe(SESSION, ws, undefined, { delta: true });
+      await until(() => ws.frames().length === 1);
+
+      const firstAppend = `${initial}\none`;
+      ws.backpressuredSends = 1;
+      contents.set(SESSION, firstAppend);
+      await until(() => ws.frames().length === 2);
+      const firstDelta = ws.frames().at(-1);
+      expect(firstDelta.type).toBe("delta");
+      expect(applyMuxDelta(splitMuxOutputData(initial), firstDelta)).toEqual(splitMuxOutputData(firstAppend));
+      expect(mux.isBackpressured(ws)).toBe(false);
 
       const secondAppend = `${firstAppend}\ntwo`;
-      setContent(secondAppend);
+      contents.set(SESSION, secondAppend);
       await until(() => ws.frames().length === 3);
       const secondDelta = ws.frames().at(-1);
       expect(secondDelta).toMatchObject({

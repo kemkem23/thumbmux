@@ -20,6 +20,62 @@ describe("mux delta protocol", () => {
     expect(muxPrefixHash(["ไทย", "😀", ""])).toBe("fa3c1882");
   });
 
+  /**
+   * Wire-stable: client and server both call fnv1a32 on the same UTF-8 bytes
+   * and compare hex digests across the wire. A one-byte algorithm drift causes
+   * either a resync storm (always mismatch) or a false match (silent corruption).
+   * Vectors were captured from the pre-optimization iterator implementation
+   * (`for (const byte of new TextEncoder().encode(value))`) at HEAD so the
+   * indexed-loop rewrite must remain byte-identical on this corpus.
+   */
+  test("fnv1a32 is byte-identical to the pre-optimization iterator corpus", () => {
+    const corpus: Array<{ label: string; value: string; expected: string }> = [
+      { label: "empty", value: "", expected: "811c9dc5" },
+      { label: "ascii", value: "hello world", expected: "d58b3fa7" },
+      { label: "ascii_json", value: "[]", expected: "741638a5" },
+      { label: "ascii_json_a", value: '["a"]', expected: "ca0f9962" },
+      { label: "multiline", value: "line1\nline2\nline3", expected: "fb3c2175" },
+      { label: "thai multi-byte UTF-8", value: "ไทย", expected: "1426044f" },
+      { label: "emoji", value: "😀", expected: "33a29608" },
+      {
+        label: "mixed thai+emoji+empty via muxPrefixHash input",
+        value: JSON.stringify(["ไทย", "😀", ""]),
+        expected: "fa3c1882",
+      },
+      {
+        label: "astral / ZWJ skin-tone sequence",
+        value: "𝄞 music 🚀 and 👍🏽",
+        expected: "d1fc168f",
+      },
+      { label: "control bytes", value: "a\u0000b\u0007c", expected: "e67ec544" },
+      {
+        label: "large ~348 KB (real delta-base size)",
+        value: "x".repeat(348 * 1024),
+        expected: "d9db5dc5",
+      },
+    ];
+
+    for (const { label, value, expected } of corpus) {
+      expect(fnv1a32(value), label).toBe(expected);
+    }
+
+    // Cross-check against a frozen reference of the old iterator walk so a
+    // future "optimization" that changes the digest fails loudly here.
+    function fnv1a32IteratorReference(value: string): string {
+      let hash = 0x811c9dc5;
+      for (const byte of new TextEncoder().encode(value)) {
+        hash ^= byte;
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    }
+    for (const { label, value } of corpus) {
+      expect(fnv1a32(value), `${label} vs iterator reference`).toBe(
+        fnv1a32IteratorReference(value),
+      );
+    }
+  });
+
   test("keeps Unicode and a final empty line in the raw base", () => {
     const base = splitMuxOutputData("ไทย\n😀\n");
     const next = splitMuxOutputData("ไทย\n😀\nใหม่\n");

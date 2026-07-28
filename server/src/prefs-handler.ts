@@ -8,7 +8,7 @@
  * devices merge in order instead of losing updates.
  */
 import { mergePrefs, type ThumbmuxPrefs } from "@thumbmux/core";
-import { mkdirSync, renameSync } from "node:fs";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const MAX_BYTES = 256 * 1024; // prefs are small; anything bigger is a bug
@@ -28,7 +28,7 @@ export function createPrefsHandler(opts: { file: string }) {
 
   async function read(): Promise<ThumbmuxPrefs> {
     try {
-      const data = await Bun.file(file).json();
+      const data = JSON.parse(await readFile(file, "utf8"));
       return data && typeof data === "object" && !Array.isArray(data) ? data : {};
     } catch {
       return {}; // missing or unparsable → start fresh
@@ -53,10 +53,10 @@ export function createPrefsHandler(opts: { file: string }) {
       }
       const next = await serialized(async () => {
         const merged = mergePrefs(await read(), patch as Partial<ThumbmuxPrefs>);
-        mkdirSync(dirname(file), { recursive: true });
+        await mkdir(dirname(file), { recursive: true });
         const tmp = `${file}.tmp-${process.pid}-${++seq}`;
-        await Bun.write(tmp, JSON.stringify(merged, null, 2) + "\n");
-        renameSync(tmp, file);
+        await writeFile(tmp, JSON.stringify(merged, null, 2) + "\n");
+        await rename(tmp, file);
         return merged;
       });
       return Response.json(next);

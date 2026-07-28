@@ -5,9 +5,7 @@
 // itself is part of the thumbmux protocol.
 
 import {
-  applyMuxDelta,
   splitMuxOutputData,
-  validateMuxDeltaFrame,
   type MuxClientInfo,
   type MuxOutputType as OutputType,
   type MuxServerMessage,
@@ -26,17 +24,87 @@ type Callback = (
 ) => void;
 type ClientInfo = MuxClientInfo & Record<string, unknown>;
 
+type SubscribeOpts = {
+  tail?: number;
+  /**
+   * When every subscriber of a session supplies this probe and every probe
+   * returns true, raw delta frames are queued and coalesced until the view is
+   * no longer busy (or a safety valve trips). Opt-in: omit for today's
+   * synchronous delivery.
+   */
+  deferWhileBusy?: () => boolean;
+};
+
+/** Per-session streaming FNV states for muxPrefixHash of a base array. */
+type PrefixHashCache = {
+  /** Array identity of the base these states describe. */
+  base: string[];
+  /**
+   * states[0]  = FNV after "["
+   * states[k]  = FNV after "[" + json(l0) + "," + … + json(l_{k-1})
+   *              (separators between elements only; no trailing "]")
+   */
+  states: number[];
+};
+
+type DeferredQueue = {
+  frames: unknown[];
+  firstAt: number;
+};
+
 const PING_INTERVAL = 25_000;    // 25s — under most carrier NAT timeouts (30-60s)
 const PONG_TIMEOUT = 8_000;      // 8s — if no pong, assume dead
 const CONNECT_TIMEOUT = 8_000;   // 8s — max wait for initial connection
 const RECONNECT_MIN = 1_000;     // 1s
 const RECONNECT_MAX = 15_000;    // 15s
+const MAX_DEFER_MS = 250;
+const MAX_DEFERRED_FRAMES = 64;
+
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+const utf8 = new TextEncoder();
+const BYTES_OPEN = utf8.encode('[');
+const BYTES_CLOSE = utf8.encode(']');
+const BYTES_COMMA = utf8.encode(',');
+
+function fnvFeed(hash: number, bytes: Uint8Array): number {
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i]!;
+    hash = Math.imul(hash, FNV_PRIME);
+  }
+  return hash;
+}
+
+function finalizeFnv(hash: number): string {
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function defaultScheduleFrame(cb: () => void): void {
+  if (typeof globalThis.requestAnimationFrame === 'function') {
+    globalThis.requestAnimationFrame(() => cb());
+  } else {
+    setTimeout(cb, 16);
+  }
+}
+
+function isMuxCursor(value: unknown): value is MuxServerMessage['cursor'] {
+  if (value === null) return true;
+  if (typeof value !== 'object' || value === null) return false;
+  const cursor = value as Record<string, unknown>;
+  return Number.isInteger(cursor.row) && Number.isInteger(cursor.col);
+}
 
 export type TmuxMuxOptions = {
   /** WS endpoint; default: <ws(s)>://<host>/ws/tmux */
   getUrl?: () => string;
   /** Extra fields merged (top-level) into every client_info payload. */
   getClientMeta?: () => Partial<ClientInfo> | undefined;
+  /**
+   * Scheduler used by the busy-deferral settle loop. Defaults to
+   * requestAnimationFrame (or setTimeout(16) when rAF is unavailable).
+   * Tests inject a deterministic queue-driver here.
+   */
+  scheduleFrame?: (cb: () => void) => void;
 };
 
 export class TmuxMux {
@@ -45,9 +113,16 @@ export class TmuxMux {
   private subs = new Map<string, Set<Callback>>();
   /** per-callback tail preference; effective tail = undefined if ANY full subscriber */
   private subTails = new Map<string, Map<Callback, number | undefined>>();
+  /** per-callback busy probe; absence means "never defer for this session" */
+  private subDeferProbes = new Map<string, Map<Callback, (() => boolean) | undefined>>();
   private sentTail = new Map<string, number | undefined>();
   /** Exact raw `data.split('\\n')` bases, scoped to the current socket and tail. */
   private outputBases = new Map<string, string[]>();
+  /** Streaming FNV prefix-hash states bound to each base's array identity. */
+  private prefixHashCaches = new Map<string, PrefixHashCache>();
+  /** Raw delta frames held while every subscriber reports busy. */
+  private deferredDeltas = new Map<string, DeferredQueue>();
+  private settleScheduled = false;
   /** A failed delta requests one full replacement; later deltas wait for it. */
   private resyncingSessions = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -196,22 +271,257 @@ export class TmuxMux {
     }
   }
 
+  private discardDeferred(session: string) {
+    this.deferredDeltas.delete(session);
+  }
+
+  private discardPrefixHashCache(session: string) {
+    this.prefixHashCaches.delete(session);
+  }
+
   private invalidateOutputBase(session: string) {
     this.outputBases.delete(session);
     this.resyncingSessions.delete(session);
+    this.discardPrefixHashCache(session);
+    this.discardDeferred(session);
   }
 
   private invalidateAllOutputBases() {
     this.outputBases.clear();
     this.resyncingSessions.clear();
     this.sentTail.clear();
+    this.prefixHashCaches.clear();
+    this.deferredDeltas.clear();
   }
 
   private requestResync(session: string) {
     if (this.resyncingSessions.has(session)) return;
     this.outputBases.delete(session);
+    this.discardPrefixHashCache(session);
+    this.discardDeferred(session);
     this.resyncingSessions.add(session);
     this.send(this.ws, { type: 'resync', session });
+  }
+
+  /**
+   * Incremental muxPrefixHash(base.slice(0, prefix)), byte-identical to
+   * core's fnv1a32(JSON.stringify(...)). States are bound to the base's
+   * array identity — a mismatched reference rebuilds from scratch.
+   */
+  private prefixHash(session: string, base: string[], prefix: number): string {
+    let cache = this.prefixHashCaches.get(session);
+    if (!cache || cache.base !== base) {
+      cache = { base, states: [] };
+      this.prefixHashCaches.set(session, cache);
+    }
+    if (cache.states.length === 0) {
+      cache.states[0] = fnvFeed(FNV_OFFSET, BYTES_OPEN);
+    }
+    while (cache.states.length <= prefix) {
+      const k = cache.states.length;
+      let h = cache.states[k - 1]!;
+      if (k > 1) h = fnvFeed(h, BYTES_COMMA);
+      h = fnvFeed(h, utf8.encode(JSON.stringify(base[k - 1])));
+      cache.states[k] = h;
+    }
+    return finalizeFnv(fnvFeed(cache.states[prefix]!, BYTES_CLOSE));
+  }
+
+  /**
+   * Structural checks matching core validateMuxDeltaFrame accept/reject
+   * outcomes exactly, but hashing via the incremental cache so a one-line
+   * delta is O(changed lines) rather than O(whole base).
+   */
+  private validateDeltaLocal(
+    session: string,
+    frame: unknown,
+    base: string[],
+  ): {
+    prefix: number;
+    lines: string[];
+    cursor: MuxServerMessage['cursor'] | undefined;
+    cursorPresent: boolean;
+  } | null {
+    if (typeof frame !== 'object' || frame === null) return null;
+    const candidate = frame as Record<string, unknown>;
+    if (typeof candidate.channel !== 'string') return null;
+    if (candidate.type !== 'delta') return null;
+    const baseLength = candidate.baseLength;
+    const prefix = candidate.prefix;
+    // Range checks BEFORE hashing so a bogus prefix never indexes out of range
+    // or triggers a huge hash.
+    if (!Number.isInteger(baseLength) || baseLength !== base.length) return null;
+    if (!Number.isInteger(prefix) || (prefix as number) < 0 || (prefix as number) > base.length) {
+      return null;
+    }
+    const p = prefix as number;
+    if (typeof candidate.prefixHash !== 'string') return null;
+    if (candidate.prefixHash !== this.prefixHash(session, base, p)) return null;
+    if (!Array.isArray(candidate.lines) || !candidate.lines.every((line) => typeof line === 'string')) {
+      return null;
+    }
+    const cursorPresent = Object.prototype.hasOwnProperty.call(candidate, 'cursor');
+    if (cursorPresent && !isMuxCursor(candidate.cursor)) return null;
+
+    return {
+      prefix: p,
+      lines: candidate.lines as string[],
+      cursor: cursorPresent ? (candidate.cursor as MuxServerMessage['cursor']) : undefined,
+      cursorPresent,
+    };
+  }
+
+  /**
+   * Apply a validated delta: reconstruct next base, carry hash states
+   * [0..prefix], return delivery fields. Null on reject (no side effects
+   * other than possibly warming the hash cache up to a valid range check).
+   */
+  private applyValidatedDelta(
+    session: string,
+    frame: unknown,
+    base: string[],
+  ): {
+    next: string[];
+    cursor: MuxServerMessage['cursor'] | undefined;
+    cursorPresent: boolean;
+  } | null {
+    const delta = this.validateDeltaLocal(session, frame, base);
+    if (!delta) return null;
+    const next = base.slice(0, delta.prefix).concat(delta.lines);
+    const cache = this.prefixHashCaches.get(session);
+    if (cache && cache.base === base) {
+      this.prefixHashCaches.set(session, {
+        base: next,
+        states: cache.states.slice(0, delta.prefix + 1),
+      });
+    } else {
+      this.prefixHashCaches.delete(session);
+    }
+    return {
+      next,
+      cursor: delta.cursor,
+      cursorPresent: delta.cursorPresent,
+    };
+  }
+
+  private deliverDelta(
+    session: string,
+    next: string[],
+    cursor: MuxServerMessage['cursor'] | undefined,
+    cbs: Set<Callback>,
+  ) {
+    const data = next.join('\n');
+    this.outputBases.set(session, next);
+    for (const cb of cbs) {
+      cb(data, 'output', cursor, { source: 'delta', replace: false });
+    }
+  }
+
+  private sessionShouldDefer(session: string): boolean {
+    const cbs = this.subs.get(session);
+    if (!cbs || cbs.size === 0) return false;
+    const probes = this.subDeferProbes.get(session);
+    if (!probes) return false;
+    for (const cb of cbs) {
+      const probe = probes.get(cb);
+      if (!probe) return false;
+      try {
+        if (!probe()) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private scheduleSettle() {
+    if (this.settleScheduled) return;
+    if (this.deferredDeltas.size === 0) return;
+    this.settleScheduled = true;
+    const schedule = this.opts.scheduleFrame ?? defaultScheduleFrame;
+    schedule(() => {
+      this.settleScheduled = false;
+      this.settleDeferred();
+    });
+  }
+
+  private settleDeferred() {
+    let needReschedule = false;
+    // Snapshot keys — flush mutates the map.
+    for (const session of [...this.deferredDeltas.keys()]) {
+      const queue = this.deferredDeltas.get(session);
+      if (!queue) continue;
+      const age = Date.now() - queue.firstAt;
+      if (
+        !this.sessionShouldDefer(session)
+        || age >= MAX_DEFER_MS
+        || queue.frames.length >= MAX_DEFERRED_FRAMES
+      ) {
+        this.flushDeferred(session);
+      } else {
+        needReschedule = true;
+      }
+    }
+    if (needReschedule) this.scheduleSettle();
+  }
+
+  private enqueueDeferredDelta(session: string, frame: unknown) {
+    let queue = this.deferredDeltas.get(session);
+    if (!queue) {
+      queue = { frames: [], firstAt: Date.now() };
+      this.deferredDeltas.set(session, queue);
+    }
+    queue.frames.push(frame);
+    if (queue.frames.length >= MAX_DEFERRED_FRAMES) {
+      this.flushDeferred(session);
+      return;
+    }
+    this.scheduleSettle();
+  }
+
+  /**
+   * Apply queued raw deltas in order against successive bases, then deliver
+   * ONE coalesced callback with the final content. A rejected frame delivers
+   * any content already applied, drops the rest, and requests one resync.
+   */
+  private flushDeferred(session: string) {
+    const queue = this.deferredDeltas.get(session);
+    this.deferredDeltas.delete(session);
+    if (!queue || queue.frames.length === 0) return;
+
+    const cbs = this.subs.get(session);
+    if (!cbs || cbs.size === 0) return;
+
+    let base = this.outputBases.get(session);
+    if (!base || this.resyncingSessions.has(session)) {
+      this.requestResync(session);
+      return;
+    }
+
+    let lastCursor: MuxServerMessage['cursor'] | undefined;
+    let cursorPresent = false;
+    let applied = false;
+
+    for (const frame of queue.frames) {
+      const result = this.applyValidatedDelta(session, frame, base);
+      if (!result) {
+        if (applied) {
+          this.deliverDelta(session, base, cursorPresent ? lastCursor : undefined, cbs);
+        }
+        this.requestResync(session);
+        return;
+      }
+      base = result.next;
+      applied = true;
+      if (result.cursorPresent) {
+        lastCursor = result.cursor;
+        cursorPresent = true;
+      }
+    }
+
+    if (applied) {
+      this.deliverDelta(session, base, cursorPresent ? lastCursor : undefined, cbs);
+    }
   }
 
   /** Re-subscribe when the tail composition changes (e.g. a full viewer
@@ -335,7 +645,13 @@ export class TmuxMux {
         if (msg.type === 'output') {
           // A full frame establishes its raw base exactly; in particular, a
           // trailing empty line and CR bytes remain part of future hashes.
+          // Guard first: a non-string data field is a complete no-op for the
+          // session (do not drop a still-valid deferred queue or hash cache).
           if (typeof msg.data !== 'string') return;
+          // A full frame supersedes any deferred deltas for this session —
+          // discard without delivering them, then install the new base.
+          this.discardDeferred(msg.channel);
+          this.discardPrefixHashCache(msg.channel);
           this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
           this.resyncingSessions.delete(msg.channel);
           const meta: MuxDeliveryMeta = {
@@ -351,23 +667,46 @@ export class TmuxMux {
           // or cursor to subscribers. The server answers one coalesced resync
           // with a full output frame, which re-enables deltas above.
           const base = this.outputBases.get(msg.channel);
-          const delta = base && !this.resyncingSessions.has(msg.channel)
-            ? validateMuxDeltaFrame(msg, base)
-            : null;
-          const next = delta && base ? applyMuxDelta(base, delta) : null;
-          if (!delta || !next) {
+          if (!base || this.resyncingSessions.has(msg.channel)) {
             this.requestResync(msg.channel);
             return;
           }
-          const data = next.join('\n');
-          this.outputBases.set(msg.channel, next);
-          for (const cb of cbs) {
-            cb(data, 'output', delta.cursor, { source: 'delta', replace: false });
+          // Busy-deferral: queue raw frames, no validation/hash/join/callback.
+          if (this.sessionShouldDefer(msg.channel)) {
+            this.enqueueDeferredDelta(msg.channel, msg);
+            return;
           }
+          // A queue survives a busy-probe flip: the fast path would apply this frame
+          // against the un-advanced base and leave older frames to replay later
+          // against a newer base (silent revert). Enqueue-then-flush keeps every
+          // frame applied against its own successive base, in arrival order.
+          if (this.deferredDeltas.has(msg.channel)) {
+            this.enqueueDeferredDelta(msg.channel, msg);
+            this.flushDeferred(msg.channel);
+            return;
+          }
+          const applied = this.applyValidatedDelta(msg.channel, msg, base);
+          if (!applied) {
+            this.requestResync(msg.channel);
+            return;
+          }
+          this.deliverDelta(
+            msg.channel,
+            applied.next,
+            applied.cursorPresent ? applied.cursor : undefined,
+            cbs,
+          );
           return;
         }
 
         if (msg.type === 'history' || msg.type === 'error' || msg.type === 'cursor') {
+          // Flush deferred content first so caret/history never lands ahead
+          // of the pane state it belongs to.
+          if (this.deferredDeltas.has(msg.channel)) {
+            this.flushDeferred(msg.channel);
+          }
+          // Re-fetch cbs after flush (subscribers may have changed — unlikely
+          // mid-handler, but the set reference is stable for this path).
           for (const cb of cbs) {
             // "cursor" frames carry no data — callbacks that render output
             // must check `type` before treating data as pane content.
@@ -464,7 +803,7 @@ export class TmuxMux {
   }
 
   /** Subscribe to a tmux session's output. Returns unsubscribe function. */
-  subscribe(session: string, callback: Callback, opts: { tail?: number } = {}): () => void {
+  subscribe(session: string, callback: Callback, opts: SubscribeOpts = {}): () => void {
     let set = this.subs.get(session);
     const isNew = !set;
     if (!set) {
@@ -475,6 +814,9 @@ export class TmuxMux {
     let tails = this.subTails.get(session);
     if (!tails) { tails = new Map(); this.subTails.set(session, tails); }
     tails.set(callback, opts.tail && opts.tail > 0 ? Math.floor(opts.tail) : undefined);
+    let probes = this.subDeferProbes.get(session);
+    if (!probes) { probes = new Map(); this.subDeferProbes.set(session, probes); }
+    probes.set(callback, opts.deferWhileBusy);
 
     if (isNew) {
       if (this.ws?.readyState === WebSocket.OPEN) {
@@ -491,9 +833,11 @@ export class TmuxMux {
     return () => {
       set!.delete(callback);
       this.subTails.get(session)?.delete(callback);
+      this.subDeferProbes.get(session)?.delete(callback);
       if (set!.size === 0) {
         this.subs.delete(session);
         this.subTails.delete(session);
+        this.subDeferProbes.delete(session);
         this.sentTail.delete(session);
         this.invalidateOutputBase(session);
         this.pendingResizeBySession.delete(session);

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { deriveSurface, luminance, mix, hexToRgb, type TerminalSurface } from "../src/surface";
+import {
+  deriveSurface,
+  luminance,
+  mix,
+  hexToRgb,
+  type TerminalSurface,
+} from "../src/surface";
+import { defaultSurface } from "../src/index";
 
 const base: TerminalSurface = {
   agent: "#FFB36B", tbg: "#B05606", tstage: "#7e3d03", tfg: "#FFF4E8",
@@ -7,6 +14,41 @@ const base: TerminalSurface = {
 };
 
 describe("surface math", () => {
+  test("defaultSurface returns a ready-to-render 16-color palette", () => {
+    const surface = defaultSurface("#101014");
+
+    expect(surface.palette.defaultBg).toBe(surface.tbg);
+    expect(surface.palette.defaultFg).toBe(surface.tfg);
+    expect(surface.palette.base).toEqual([
+      surface.tbg,
+      "#ff7a7a",
+      "#7dffa0",
+      "#ffef9e",
+      "#c8b4ff",
+      "#ff9ad5",
+      "#9be9ff",
+      surface.tfg,
+      "#b9b2aa",
+      "#ff7a7a",
+      "#7dffa0",
+      "#ffef9e",
+      "#c8b4ff",
+      "#ff9ad5",
+      "#9be9ff",
+      surface.tfg,
+    ]);
+
+    const light = defaultSurface("#ffffff");
+    expect(light.palette.defaultBg).toBe("#ffffff");
+    expect(light.palette.defaultFg).toBe(light.tfg);
+    expect(light.palette.base[1]).toBe("#b3261e");
+    expect(light.palette.base[8]).toBe("#6e675f");
+
+    const another = defaultSurface("#101014");
+    expect(another.palette).not.toBe(surface.palette);
+    expect(another.palette.base).not.toBe(surface.palette.base);
+  });
+
   test("luminance orders black < mid < white", () => {
     expect(luminance("#000000")).toBe(0);
     expect(luminance("#ffffff")).toBeCloseTo(1, 5);

@@ -148,7 +148,7 @@ async function activeGridKey(page: Page): Promise<string | null> {
   });
 }
 
-test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, and focus', async ({ page }, testInfo) => {
+test('SessionGrid layout, honest metadata, controls, fade, contrast, names, skeletons, and focus', async ({ page }, testInfo) => {
   const fixtures = fixtureNames(testInfo);
   try {
     for (const fixture of fixtures) {
@@ -180,8 +180,10 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
       const metric = await gridMetrics(page);
       expect(viewport.columns).toContain(metric.columns);
       expect(metric.pageScrollWidth).toBeLessThanOrEqual(metric.innerWidth + 2);
-      expect(metric.stateCount).toBeGreaterThanOrEqual(fixtures.length);
-      expect(metric.activityCount).toBeGreaterThanOrEqual(fixtures.length);
+      // The demo mux does not report agent state or last activity. Unknown
+      // metadata must stay absent instead of being synthesized from a name.
+      expect(metric.stateCount).toBe(0);
+      expect(metric.activityCount).toBe(0);
       expect(metric.tailScrollWidth).toBeGreaterThan(metric.tailClientWidth);
       expect(metric.maskImage !== 'none' || metric.webkitMaskImage !== 'none').toBe(true);
       expect(metric.overflowX).toBe('hidden');
@@ -201,13 +203,18 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
     expect(desktop!.fontPx - phone!.fontPx).toBeGreaterThanOrEqual(2);
     console.log(`session-grid metrics=${JSON.stringify(metrics)}`);
 
-    const labels = await page.getByTestId('grid-filter').allTextContents();
-    expect(labels).toEqual(['ALL', 'CC', 'CDX', 'GROK', 'SH']);
-    await page.getByTestId('grid-filter').filter({ hasText: 'CDX' }).click();
-    const codexValues = await page.getByTestId('grid-card').evaluateAll((cards) => cards.map((card) => card.getAttribute('data-filter-value')));
-    expect(codexValues.length).toBeGreaterThan(0);
-    expect(codexValues.every((value) => value === 'codex')).toBe(true);
-    await page.getByTestId('grid-filter').filter({ hasText: 'ALL' }).click();
+    // A session name is real data, but parsing it is not proof of which agent
+    // owns the pane. The demo leaves agent metadata unknown too.
+    await expect(page.getByTestId('grid-filter')).toHaveCount(0);
+    await expect(page.locator('[data-testid="grid-card"] .chip')).toHaveCount(0);
+    const filterValues = await page.getByTestId('grid-card').evaluateAll((cards) => cards.map((card) => card.getAttribute('data-filter-value')));
+    expect(filterValues.every((value) => value === '')).toBe(true);
+
+    // Names are likewise not evidence for arbitrary workflow groups.
+    await expect(page.getByTestId('grid-group-toggle')).toHaveCount(0);
+    await expect(page.getByTestId('grid-group')).toHaveCount(0);
+    const groupKeys = await page.getByTestId('grid-card').evaluateAll((cards) => cards.map((card) => card.getAttribute('data-group-key')));
+    expect(groupKeys.every((value) => value === '')).toBe(true);
 
     const uniqueTail = fixtures[1].name.slice(-12);
     await page.getByTestId('grid-search').fill(uniqueTail);
@@ -215,11 +222,6 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
     await expect(page.getByTestId('grid-card').first()).toHaveAttribute('data-session', fixtures[1].name);
     await page.getByTestId('grid-search').fill('');
     await expect.poll(() => page.getByTestId('grid-card').count()).toBeGreaterThanOrEqual(fixtures.length);
-
-    await page.getByTestId('grid-group-toggle').click();
-    await expect(page.getByTestId('grid-group').first()).toBeVisible();
-    const groupedOrderOk = await page.getByTestId('grid-group').evaluateAll((groups) => groups.length > 0);
-    expect(groupedOrderOk).toBe(true);
 
     for (const fixture of fixtures.slice(0, 2)) {
       const card = page.locator(`[data-testid="grid-card"][data-session="${fixture.name}"]`);
@@ -237,7 +239,6 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
       expect(ratio).toBeGreaterThanOrEqual(4.5);
     }
 
-    await page.getByTestId('grid-group-toggle').click();
     const firstCard = page.getByTestId('grid-card').first();
     await firstCard.focus();
     let verifiedMoves = 0;
@@ -257,6 +258,21 @@ test('SessionGrid layout, metadata, controls, fade, contrast, names, skeletons, 
     const target = await firstCard.getAttribute('data-session');
     await page.keyboard.press('Enter');
     await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(target);
+
+    // Every transient overlay included in TermView's geometry add-back must
+    // also be removed from the visible host. Otherwise tmux gains rows that
+    // are physically behind the shortcut bar and the pane's top is clipped.
+    await expect(page.getByTestId('shortcut-bar')).toBeVisible();
+    const terminalLayout = await page.evaluate(() => {
+      const host = document.querySelector<HTMLElement>('.host');
+      const shortcuts = document.querySelector<HTMLElement>('[data-testid="shortcut-bar"]');
+      if (!host || !shortcuts) throw new Error('terminal inset layout unavailable');
+      return {
+        hostBottom: host.getBoundingClientRect().bottom,
+        shortcutsTop: shortcuts.getBoundingClientRect().top,
+      };
+    });
+    expect(terminalLayout.hostBottom).toBeLessThanOrEqual(terminalLayout.shortcutsTop + 1);
   } finally {
     for (const fixture of fixtures) killSession(fixture.name);
   }

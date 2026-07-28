@@ -84,11 +84,19 @@ export function splitMuxOutputData(data: string): string[] {
   return data.split("\n");
 }
 
-/** Portable lowercase FNV-1a-32 over the UTF-8 bytes of a string. */
+/** Reused across calls — TextEncoder is stateless for encode(). */
+const UTF8_ENCODER = new TextEncoder();
+
+/**
+ * Portable lowercase FNV-1a-32 over the UTF-8 bytes of a string.
+ * Indexed loop (not for-of) — for-of on Uint8Array allocates an iterator
+ * result object per byte and was the dominant cost on ~348 KB delta bases.
+ */
 export function fnv1a32(value: string): string {
+  const bytes = UTF8_ENCODER.encode(value);
   let hash = 0x811c9dc5;
-  for (const byte of new TextEncoder().encode(value)) {
-    hash ^= byte;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i]!;
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");

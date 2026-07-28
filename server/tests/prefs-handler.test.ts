@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createPrefsHandler } from "../src/prefs-handler";
-import { rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 
 const DIR = `/tmp/thumbmux-prefs-test-${process.pid}`;
 const FILE = `${DIR}/prefs.json`;
@@ -13,6 +14,55 @@ const put = (body: unknown) =>
 const get = () => handle(new Request("http://x/api/prefs"));
 
 describe("createPrefsHandler", () => {
+  test("GET and PUT preserve existing preferences on real Node", () => {
+    const nodeDir = `${DIR}/node-runtime`;
+    const nodeFile = `${nodeDir}/prefs.json`;
+    const initial = {
+      fontPx: 15,
+      shortcuts: [{ id: "deploy", label: "deploy", send: "deploy" }],
+    };
+    const expected = { ...initial, fontPx: 16, theme: { mode: "dark" } };
+    mkdirSync(nodeDir, { recursive: true });
+    writeFileSync(nodeFile, `${JSON.stringify(initial)}\n`);
+
+    const sourceUrl = new URL("../src/prefs-handler.ts", import.meta.url).href;
+    const script = `
+      import { readFile } from "node:fs/promises";
+      import { createPrefsHandler } from ${JSON.stringify(sourceUrl)};
+
+      const handle = createPrefsHandler({ file: ${JSON.stringify(nodeFile)} });
+      const get = () => handle(new Request("http://x/api/prefs"));
+      const getResponse = await get();
+      const before = await getResponse.json();
+      console.log(JSON.stringify({
+        runtime: process.release.name,
+        bun: typeof globalThis.Bun,
+        status: getResponse.status,
+        before,
+      }));
+
+      const put = await handle(new Request("http://x/api/prefs", {
+        method: "PUT",
+        body: JSON.stringify({ fontPx: 16, theme: { mode: "dark" } }),
+      }));
+      const after = await put.json();
+      const disk = JSON.parse(await readFile(${JSON.stringify(nodeFile)}, "utf8"));
+      console.log(JSON.stringify({ status: put.status, after, disk }));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+    });
+    if (result.status !== 0) {
+      throw new Error(
+        `Node prefs subprocess exited ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+    }
+
+    const [readLine, writeLine] = result.stdout.trim().split("\n").map(JSON.parse);
+    expect(readLine).toEqual({ runtime: "node", bun: "undefined", status: 200, before: initial });
+    expect(writeLine).toEqual({ status: 200, after: expected, disk: expected });
+  });
+
   test("GET before any save → {}", async () => {
     expect(await (await get()).json()).toEqual({});
   });

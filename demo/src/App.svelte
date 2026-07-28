@@ -8,7 +8,8 @@
   } from '@thumbmux/svelte';
   import {
     DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, deriveSurface, luminance, extractRecentPrompts,
-    type TerminalSurface, type LaunchPreset, type LaunchSpec, type AnsiPalette, type Shortcut,
+    submitPlan,
+    type TerminalSurface, type LaunchPreset, type LaunchSpec, type AnsiPalette, type Shortcut, type SubmitAgent,
   } from '@thumbmux/core';
   import { onMount, onDestroy } from 'svelte';
 
@@ -17,53 +18,6 @@
            '#8a8a92', '#ff9d9d', '#a0ffbe', '#fff5bd', '#dcCEff', '#ffbde4', '#c2f1ff', '#ffffff'],
     defaultFg: '#e6e6e6',
     defaultBg: '#101014',
-  };
-  type DemoKind = 'cc' | 'codex' | 'grok' | 'sh';
-  const DEMO_FILTERS = [
-    { value: 'cc', label: 'CC' },
-    { value: 'codex', label: 'CDX' },
-    { value: 'grok', label: 'GROK' },
-    { value: 'sh', label: 'SH' },
-  ] as const;
-  const DEMO_GROUPS = [
-    { key: 'design', label: 'Design' },
-    { key: 'build', label: 'Build' },
-    { key: 'review', label: 'Review' },
-    { key: 'ops', label: 'Ops' },
-  ] as const;
-  const DEMO_SURFACES: Record<DemoKind, { chip: string; color: string; palette: AnsiPalette }> = {
-    cc: {
-      chip: 'CC',
-      color: '#b45309',
-      palette: PALETTE,
-    },
-    codex: {
-      chip: 'CDX',
-      color: '#2563eb',
-      palette: {
-        ...PALETTE,
-        defaultFg: '#eef4ff',
-        defaultBg: '#08162f',
-      },
-    },
-    grok: {
-      chip: 'GROK',
-      color: '#047857',
-      palette: {
-        ...PALETTE,
-        defaultFg: '#e9fff3',
-        defaultBg: '#06231a',
-      },
-    },
-    sh: {
-      chip: 'SH',
-      color: '#475569',
-      palette: {
-        ...PALETTE,
-        defaultFg: '#f8fafc',
-        defaultBg: '#111827',
-      },
-    },
   };
   // Stock presets, worktree ones included — if the demo's cwd is not a git
   // repo, git prints its own self-explanatory error in the pane.
@@ -133,49 +87,12 @@
   let launching = $state(false);
   let launchError = $state<string | null>(null);
   let altScreenSessions = $state<Record<string, boolean>>({});
+  let launchedAgents = $state<Record<string, SubmitAgent>>({});
 
-  function hashName(name: string): number {
-    let hash = 0;
-    for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-    return hash;
-  }
-
-  function demoKind(name: string): DemoKind {
-    const lower = name.toLowerCase();
-    if (lower.startsWith('cc-') || lower.startsWith('claude-') || lower.includes('-cc-')) return 'cc';
-    if (lower.startsWith('codex-') || lower.includes('-codex-')) return 'codex';
-    if (lower.startsWith('grok-') || lower.includes('-grok-')) return 'grok';
-    return 'sh';
-  }
-
-  function activityLabel(minutesAgo: number): string {
-    if (minutesAgo <= 0) return 'just now';
-    if (minutesAgo === 1) return '1 min ago';
-    if (minutesAgo < 60) return `${minutesAgo} mins ago`;
-    const hours = Math.floor(minutesAgo / 60);
-    return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
-  }
-
-  let gridSessions = $derived<GridSession[]>(names.map((name, index) => {
-    const kind = demoKind(name);
-    const hash = hashName(name);
-    const group = DEMO_GROUPS[hash % DEMO_GROUPS.length];
-    const minutesAgo = (hash % 180) + index;
-    const state = hash % 3 === 0 ? 'idle' : 'working';
-    return {
-      name,
-      chip: DEMO_SURFACES[kind].chip,
-      color: DEMO_SURFACES[kind].color,
-      palette: DEMO_SURFACES[kind].palette,
-      filterValue: kind,
-      groupKey: group.key,
-      groupLabel: group.label,
-      state,
-      stateLabel: state === 'working' ? 'WORKING' : 'IDLE',
-      lastActivityAt: Date.now() - minutesAgo * 60_000,
-      lastActivityLabel: activityLabel(minutesAgo),
-    };
-  }));
+  // The demo mux currently reports no reliable agent state, last activity,
+  // workflow group, or agent identity. Keep those optional fields unknown;
+  // the live thumbnail and session name are the real data we can show.
+  let gridSessions = $derived<GridSession[]>(names.map((name) => ({ name })));
 
   // Terminal view state
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
@@ -196,6 +113,12 @@
   let composeText = $state('');
   let isDesktop = $state(false);
   let desktopKeysFocused = $state(false);
+  let terminalControlInset = $derived(Math.max(shortcutBarH, scrollControlsHeight));
+  let terminalBottomInset = $derived(
+    dockInset
+      + kbInset
+      + (terminalControlInset > 0 ? terminalControlInset + 8 : 0),
+  );
 
   let unsubSessions: (() => void) | null = null;
   let unsubDesktopGate: (() => void) | null = null;
@@ -204,6 +127,22 @@
 
   function sendKeysTo(session: string) {
     return (data: string) => tmuxMux.sendKeys(session, data);
+  }
+
+  function launchAgent(agent: string): SubmitAgent {
+    if (agent === 'cc') return 'claude';
+    if (agent === 'codex' || agent === 'grok') return agent;
+    return 'generic';
+  }
+
+  async function sendSubmission(session: string, text: string) {
+    const agent = launchedAgents[session] ?? 'generic';
+    for (const step of submitPlan(text, { agent })) {
+      if (step.delayBeforeMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, step.delayBeforeMs));
+      }
+      tmuxMux.sendKeys(session, step.keys);
+    }
   }
 
   function onTermScrollStateChange(state: { bottomOffset: number; scrolledUp: boolean }) {
@@ -287,6 +226,7 @@
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const name = String(data.name);
       altScreenSessions = { ...altScreenSessions, [name]: spec.presetId === ALT_SCREEN_PRESET_ID };
+      launchedAgents = { ...launchedAgents, [name]: launchAgent(spec.agent) };
       launchOpen = false;
       openSession(name);
     } catch (e: any) {
@@ -369,12 +309,6 @@
       searchable
       searchLabel="Search sessions"
       searchPlaceholder="Search sessions"
-      filterOptions={DEMO_FILTERS}
-      allFilterLabel="ALL"
-      groupable
-      groupToggleLabel="Group"
-      ungroupedLabel="Ungrouped"
-      order="recent"
     />
     <LaunchSheet
       open={launchOpen}
@@ -393,7 +327,7 @@
   {@const termUsesAltScreenMouse = !!altScreenSessions[session]}
   <div
     class="stage"
-    style:--dock-inset={dockInset > 0 ? `${dockInset}px` : null}
+    style:--terminal-bottom-inset={`${terminalBottomInset}px`}
     style:--dock-full={dockFull > 0 ? `${dockFull}px` : null}
     style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
     style:--agent={surface.agent} style:--tbg={surface.tbg} style:--tstage={surface.tstage}
@@ -407,7 +341,7 @@
             <TermView
               bind:this={termRef}
               {session} palette={termPalette} {fontPx}
-              bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0) + (scrollControlsHeight > 0 ? scrollControlsHeight + 8 : 0)}
+              bottomInsetPx={terminalBottomInset}
               claimGeometry={!termUsesAltScreenMouse}
               altScreenMouse={termUsesAltScreenMouse}
               onKeys={sendKeys}
@@ -420,7 +354,7 @@
           <TermView
             bind:this={termRef}
             {session} palette={termPalette} {fontPx}
-            bottomInsetPx={dockInset + kbInset + (shortcutBarH > 0 ? shortcutBarH + 8 : 0) + (scrollControlsHeight > 0 ? scrollControlsHeight + 8 : 0)}
+            bottomInsetPx={terminalBottomInset}
             claimGeometry={!termUsesAltScreenMouse}
             altScreenMouse={termUsesAltScreenMouse}
             onKeys={sendKeys}
@@ -445,7 +379,7 @@
     <TermHud
       chip="TMUX"
       title={session}
-      status="live"
+      status={tmuxMux.connected ? 'connected' : 'offline'}
       bind:barHeight={hudHeight}
       bind:expanded={hudExpanded}
       panel={hudPanel}
@@ -455,7 +389,7 @@
       bind:barHeight={shortcutBarH}
       {shortcuts}
       visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
-      onSend={(sc) => { tmuxMux.sendKeys(session, sc.send); if (sc.submit !== false) setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
+      onSend={(sc) => { if (sc.submit === false) tmuxMux.sendKeys(session, sc.send); else void sendSubmission(session, sc.send); }}
       onManage={() => (shortcutsOpen = true)}
     />
     {#if termScrollState.scrolledUp}
@@ -495,7 +429,7 @@
       bind:mode={composerMode}
       bind:text={composeText}
       bind:dockInset bind:dockFull bind:kbInset
-      onSend={(text) => { tmuxMux.sendKeys(session, text); setTimeout(() => tmuxMux.sendKeys(session, '\r'), 120); }}
+      onSend={(text) => { void sendSubmission(session, text); }}
       onDirectText={(d) => tmuxMux.sendKeys(session, d)}
       onDirectKey={(seq) => tmuxMux.sendKeys(session, seq)}
       onPasteFiles={(files) => uploadRef?.uploadFiles(files)}
@@ -532,7 +466,7 @@
        so the terminal must START below it (absolute children ignore parent
        padding — the old padding-top approach never worked). */
     position: absolute; top: 0; left: 0; right: 0;
-    bottom: calc(var(--dock-inset, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom, 0px));
+    bottom: calc(var(--terminal-bottom-inset, 0px) + env(safe-area-inset-bottom, 0px));
     background: var(--tbg);
   }
   .host :global(.desktop-keys) {

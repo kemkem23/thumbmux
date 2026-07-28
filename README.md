@@ -103,9 +103,10 @@ picture into an uploaded path prefilled in the composer.
   <img src="docs/media/theme.png" width="360" alt="Theme sheet: dark/light, swatches, custom color" />
 </p>
 
-Theming is one color: hand `deriveSurface()` any background hex and it derives
+Theming is one color: hand `defaultSurface()` any background hex and it derives
 foreground, HUD chrome, and a readable 16-color ANSI palette from luminance —
-the whole surface re-skins instantly.
+the whole surface re-skins instantly. Use `deriveSurface(bg, base)` when you
+want to preserve your own branded surface defaults.
 
 ### Desktop is first-class now
 
@@ -141,6 +142,8 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
 | **Tests** | 730 source tests across 42 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
 | **Search overlay** | dense highlight path is linear — 10,000 unit matches on one row measured **482.75 ms → 7.44 ms** after the v0.4 fix |
+| **Delta fan-out (v0.5)** | one changed line on a 2,000-row pane to 20 delta subscribers: **69.2 ms → 3.9 ms** at 160 KB (flat in viewer count — grouped serialize once, fan out) |
+| **Client delta apply (v0.5)** | **14.49 ms → 0.094 ms** median (~150×); ~88× under the 8.33 ms 120 Hz frame budget |
 | **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
 
 ## Get started
@@ -150,9 +153,9 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.4.0-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.5.0-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.4.0-dist
+npm i    github:kemkem23/thumbmux#v0.5.0-dist
 ```
 
 ```ts
@@ -165,7 +168,7 @@ import {
   createTokenGuard,
 } from 'thumbmux/server';
 import {
-  deriveSurface,
+  defaultSurface,
   buildLaunchCommand,
   submitPlan,
   searchLines,
@@ -213,7 +216,7 @@ name; reuse a name only for the same logical session.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.4.0-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.5.0-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
@@ -257,17 +260,36 @@ ws.onmessage = (e) => mux.handleMessage(JSON.parse(e.data), ws);
 ws.onclose  = () => mux.unsubscribeAll(ws);
 ```
 
-**Client** — a terminal page in ~30 lines:
+`PipeManagerLike` and `HistoryArchiveLike` are extension interfaces only;
+`thumbmux/server` does not ship implementations. Without `pipes`, live output
+still works through adaptive polling (250 ms normally, 100 ms for five seconds
+after input) instead of instant `pipe-pane` dirty signals. Without `archive`,
+live viewing still works, but history expansion returns an empty page, so older
+archived scrollback is unavailable.
+
+**Client** — a terminal page in ~40 lines. `submitPlan()` separates pasted text
+from Enter because agent TUIs can swallow an Enter sent in the same tick. Set
+the host-owned `agent` from launch/session metadata (it is not auto-detected)
+so the Codex-specific second Enter is included:
 
 ```svelte
-<script>
+<script lang="ts">
   import { TermView, DesktopKeys, ComposerDock, tmuxMux } from 'thumbmux/svelte';
-  import { deriveSurface } from 'thumbmux/core';
+  import { defaultSurface, submitPlan, type SubmitAgent } from 'thumbmux/core';
 
   const session = 'my-session';
-  const surface = deriveSurface('#101014');    // one hex → full palette
-  const sendKeys = (data) => tmuxMux.sendKeys(session, data);
-  let composer = $state();                     // openDock() must run inside the tap
+  const agent: SubmitAgent = 'generic'; // host-owned: 'claude', 'codex', or 'grok'
+  const surface = defaultSurface('#101014');   // one hex → full palette
+  const sendKeys = (data: string) => tmuxMux.sendKeys(session, data);
+  async function sendSubmission(text: string) {
+    for (const step of submitPlan(text, { agent })) {
+      if (step.delayBeforeMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, step.delayBeforeMs));
+      }
+      sendKeys(step.keys);
+    }
+  }
+  let composer = $state<ReturnType<typeof ComposerDock> | null>(null);
   let dockFull = $state(0), kbInset = $state(0);
 </script>
 
@@ -288,7 +310,7 @@ ws.onclose  = () => mux.unsubscribeAll(ws);
 <ComposerDock
   bind:this={composer}
   bind:dockFull bind:kbInset
-  onSend={(text) => { sendKeys(text); sendKeys('\r'); }}
+  onSend={(text) => { void sendSubmission(text); }}
   onDirectText={sendKeys}
   onDirectKey={sendKeys}
 />
@@ -364,6 +386,13 @@ Docs: [desktop interaction contract](docs/desktop.md) ·
 - [x] Token scopes (`createTokenGuard` — read/interactive, expiry, session allowlists)
 - [x] PWA scaffolding (service-worker registration + notification click handlers)
 - [x] Linear dense search-overlay rendering + real Svelte mount smoke tests
+
+**v0.5.0 — performance & safety (shipped)**
+- [x] Delta broadcast grouped by viewer identity — cost flat in viewer count
+- [x] Client delta apply ~150× faster (incremental prefix hash + skip re-validate)
+- [x] WebSocket backpressure on by default (`handleDrain` / auto-resume; legacy via `enabled: false`)
+- [x] `filterSessionList` hook on every session-list delivery path
+- [x] All-or-nothing multi-file uploads; quadratic wrapped-URL + capture-overlap fixes
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,
