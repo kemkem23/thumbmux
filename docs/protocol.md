@@ -106,11 +106,13 @@ Two driver hooks exist; implement `captureWithCursor` unless you cannot:
 ## Upload endpoint (createUploadHandler)
 
 `POST /api/upload` (multipart, field `files`, ≤10 files) → `201 {ok:true, files:[{original,
-stored}]}`. Stored names are sanitized to `<epoch-ms>_<entropy>_<cleaned>` — path components
-stripped, `[^\w.-]` runs collapsed to `_`, leading dots/underscores removed, 80-char cap — so
-hostile filenames cannot escape the upload dir. Oversized → `413`; malformed form → `400`.
-`formatUploadMessage` turns the response into the composer prefill
-(`Uploaded "orig" → dir/stored`, one line per file).
+stored}], dir}`. `dir` is the normalized absolute storage directory returned by
+`resolve(opts.dir)`, not the raw option supplied by the host. Stored names are sanitized to
+`<epoch-ms>_<entropy>_<cleaned>` — path components stripped, `[^\w.-]` runs collapsed to `_`,
+leading dots/underscores removed, 80-char cap — so hostile filenames cannot escape the upload
+dir. Oversized → `413`; malformed form → `400`. `formatUploadMessage(files, dir)` turns the
+returned mapping and directory into the composer prefill (`Uploaded "orig" → dir/stored`, one
+line per file).
 
 ## Preferences endpoint (createPrefsHandler)
 

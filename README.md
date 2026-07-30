@@ -494,7 +494,8 @@ thumbmux/
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
 | **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createSpawnHandler()` + `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
 
-Docs: [desktop interaction contract](docs/desktop.md) ·
+Docs: [session hub integration](docs/hub.md) ·
+[desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
 [recording journal](docs/recording.md) · [notifications](docs/notifications.md) ·
 [token guard](docs/security.md) · [release process](SPLIT.md)
