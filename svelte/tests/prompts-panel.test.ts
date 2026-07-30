@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { extractRecentPrompts } from "@thumbmux/core";
+import { extractRecentPrompts, stripAnsi } from "@thumbmux/core";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import PromptsPanel from "../src/PromptsPanel.svelte";
@@ -154,7 +154,7 @@ describe("PromptsPanel", () => {
 
   test("preserves long, ANSI-derived, and Thai prompt text under the two-line layout clamp", async () => {
     const longThaiPrompt = "\u0e17\u0e14\u0e2a\u0e2d\u0e1a".repeat(110);
-    const prompts = extractRecentPrompts([
+    const extractedPrompts = extractRecentPrompts([
       "\x1b[1m\u203a\x1b[0m \x1b[36mANSI-coloured prompt\x1b[0m",
       "\u2022 response one",
       `\u276f ${longThaiPrompt}`,
@@ -162,7 +162,10 @@ describe("PromptsPanel", () => {
       "\u203a \u0e0a\u0e48\u0e27\u0e22\u0e15\u0e23\u0e27\u0e08\u0e01\u0e32\u0e23\u0e41\u0e2a\u0e14\u0e07\u0e1c\u0e25\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22\u0e43\u0e19\u0e41\u0e1c\u0e07\u0e19\u0e35\u0e49",
       "\u25cf response three",
     ], { targetCount: 3 });
-    expect(prompts).toHaveLength(3);
+    expect(extractedPrompts).toHaveLength(3);
+
+    const rawAnsiPrompt = `\x1b[38;5;45m${extractedPrompts[0]}\x1b[0m`;
+    const prompts = [...extractedPrompts, rawAnsiPrompt];
 
     const { target } = mountPromptsPanel({ prompts });
     await tick();
@@ -171,11 +174,16 @@ describe("PromptsPanel", () => {
       target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'),
     );
     const rendered = rows.map((row) => row.textContent ?? "");
+    const ansiRows = rows.filter((row) => row.textContent?.includes("\x1b"));
+    const nonAnsiRendered = rendered.filter((text) => !text.includes("\x1b"));
 
     expect(rows).toHaveLength(prompts.length);
-    expect(rendered).toEqual(prompts);
+    expect(nonAnsiRendered).toEqual(extractedPrompts);
     expect(rows.every((row) => row.childElementCount === 0)).toBe(true);
-    expect(rendered.some((text) => text.includes("\x1b"))).toBe(false);
+    expect(ansiRows).toHaveLength(1);
+    const ansiTextFromDom = ansiRows[0]?.textContent ?? "";
+    expect(ansiTextFromDom.match(/\x1b/g) ?? []).toHaveLength(2);
+    expect(stripAnsi(ansiTextFromDom)).toBe(extractedPrompts[0]);
     expect(rendered.some((text) => /\p{Script=Thai}/u.test(text))).toBe(true);
 
     const producerTruncatedPrompt = rendered.find((text) => text.endsWith("..."));
