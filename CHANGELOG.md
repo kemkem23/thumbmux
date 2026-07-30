@@ -1,23 +1,28 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.6.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.7.0-dist`.
 
-## v0.6.0 — 2026-07-30
+## v0.7.0 — 2026-07-30
+
 Plug-and-play, finished. v0.5.0 shipped components a consumer could mount; this
 release makes the surrounding contract real — the pieces that were written but
 not exported, the fields that existed but were undiscoverable, and the docs that
-told outside readers to import names only this repo has.
+told outside readers to import names only this repo has. This is the first public
+release after v0.5.0, and this single entry covers the whole range since that tag.
 
-Four consumer-visible changes to know about. The first two close data-loss bugs:
+### Consumer-visible changes to read before upgrading
 
-1. **A malformed 2xx from the prefs endpoint now REJECTS** instead of resolving.
-   Callers that ignored the promise will see a rejection where they previously
-   saw silent success. The old behaviour is what let a `200 {}` replace a user's
-   saved shortcuts with nothing.
+The first two changes close data-loss bugs:
+
+1. **A prefs save whose 2xx body is unparseable or not a JSON object now REJECTS
+   and rolls back** instead of resolving with optimistic state stranded in the cache.
+   Callers that ignored the promise will now see a rejection. Separately, an empty
+   or key-missing background GET is ignored instead of replacing saved shortcuts.
 2. **`UploadAction` treats a 2xx whose body has no usable `files` as an error**
    and no longer calls `onUploaded` with empty values.
-3. **A custom `TmuxDriver` or session-list provider may stop compiling.**
+3. **A custom `TmuxDriver`, session-list provider, or session filter may stop
+   compiling.**
    `listSessions()` returns `SessionListItem[]` instead of `unknown[]`, and
    `activityAt` is required, so a TypeScript host that returns rows without it now
    fails to typecheck. Runtime is unaffected; add the field from your own activity
@@ -25,12 +30,57 @@ Four consumer-visible changes to know about. The first two close data-loss bugs:
 4. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
    flips, not on every offset change, and no callback reports the initial state. A
    host that mirrored the raw offset from this callback must read it another way.
+5. **Client-side scrollback now has a ceiling.** The retained-row and estimated-
+   storage budgets apply to both archive prepends and live captures. Once either
+   budget is full, older archive expansion (including search-driven expansion)
+   clamps instead of evicting rows the reader already traversed, matching the
+   functional ceiling of `tmux history-limit`. Dropped spans have visible row-count
+   markers; the mounted viewport plus overscan remains protected, so the limits are
+   intentionally soft when that window alone exceeds them.
+6. **Forward archive paging adds optional `HistoryArchiveLike.readAfter`.** Existing
+   custom archives still compile without it, but an `afterLine` request then returns
+   an explicit empty page instead of throwing or silently calling `readBefore`.
+   Upgrade the server/host before a custom client starts sending `afterLine`: an
+   older server interprets such a message as the previous backward-page request.
+   The stock `TermView` does not emit `afterLine` yet, so ordinary scrolling cannot
+   restore a span after the client has evicted it. A custom WebSocket router must
+   preserve `afterLine` and delegate through `handleMessage()`, or call
+   `expandHistoryAfter()` itself.
+7. **The assembled `git-dist` declarations for `thumbmux/core` and
+   `thumbmux/server` now support TypeScript `Node16` and `NodeNext` resolution.**
+   This does not extend plain-Node resolution to `thumbmux/svelte`, which still
+   requires a Svelte-aware Bundler/Vite toolchain.
+8. **The stock Grok picker no longer offers retired model IDs.** `GROK_MODELS` is
+   now public from `thumbmux/core`; retired or otherwise unknown model values passed
+   to the launch builders fall back to the no-flag default instead of forwarding a
+   dead flag.
+9. **Retained terminal rows use sparse derived state.** Raw row/link data and sparse
+   SGR checkpoints remain persistent, while rendered HTML and entry state are
+   bounded to the render window. A cold rebuild waits until an active gesture
+   settles; the public TypeScript API is unchanged.
+10. **Security and notification docs now contain concrete integration examples**
+    using the shipped package subpaths. They demonstrate the available building
+    blocks, not an end-to-end authentication or push service supplied by thumbmux.
+11. **Session activity now reaches the reference hub end to end.** Typed
+    `attached`/`activityAt` values flow through REST bootstrap and WebSocket pushes,
+    and the hub consumes the pushed rows. REST bootstrap makes at most one cold
+    activity/attachment attempt, remembers even an empty sample, and then relies on
+    normal mux polling for refreshes; its enrichment reuses the same session listing.
+12. **A fresh reference-host database no longer advertises standalone
+    `kem-distill-engine` runtime fields.** Existing databases are deliberately not
+    migrated. Production uses the in-process path; an executable legacy fallback
+    remains if that flag is unset and points at a service that no longer exists.
+13. **The reference Bun host now forwards `websocket.drain` to
+    `mux.handleDrain`.** The README, demo, and runbook document and exercise that
+    backpressure recovery fast path.
 
 ### Newly exported — code that existed but never shipped
+
 - **`FileHistoryArchive`** (`thumbmux/server`): a complete `HistoryArchiveLike`
   with 444 lines of tests, previously stranded in `demo/` and excluded from the
   release tag's `files` whitelist. Deep scrollback no longer requires writing
-  your own archive.
+  your own archive. Pass an explicit `root` when history must persist across
+  processes; the default root is private and per run.
 - **`createSpawnHandler`** (`thumbmux/server`): the route that accepts what
   `LaunchSheet`/`buildLaunchCommand` actually emit — naming, collision → 409,
   command assembly, cleanup on a failed spawn. Worktree creation stays a
@@ -46,6 +96,7 @@ Four consumer-visible changes to know about. The first two close data-loss bugs:
   option is byte-identical to before.
 
 ### Docs a reader can actually copy
+
 - `desktop.md`, `protocol.md` and `recording.md` told readers to import
   `@thumbmux/core` and `@thumbmux/svelte`. **Those names do not exist for
   consumers** — they are internal aliases of the host repo; the shipped subpaths
@@ -53,10 +104,10 @@ Four consumer-visible changes to know about. The first two close data-loss bugs:
   corrected, and `docs-snippets.test.ts` now checks every import specifier in the
   docs against `package.json` exports and parses every `json` fence, so this
   cannot silently return.
-- New **`docs/hub.md`**, including what the hub does *not* provide: agent-state
-  classification, durable prompt history, a deep-scrollback archive, host spawn
-  policy. A consumer expecting state dots for free would otherwise conclude the
-  hub is broken.
+- New **`docs/hub.md`** explains that hub thumbnails are bounded live tails and a
+  full terminal can wire `FileHistoryArchive`. The host still owns agent-state
+  classification, durable prompt history, and spawn policy; a consumer expecting
+  state dots for free would otherwise conclude the hub is broken.
 - Fixed: a Svelte example where `...` parsed as a boolean prop named `"..."`, a
   `json` block that failed `JSON.parse`, `TermView` signatures drifted from
   source, `security.md` documenting `revoke(token)` and then disclaiming
@@ -64,34 +115,170 @@ Four consumer-visible changes to know about. The first two close data-loss bugs:
   KB when it counts UTF-16 code units.
 
 ### TermView — the five hot-path defects deferred from v0.4.0
+
 Counted metrics below are measured before and after on the same fixtures and are
 reproducible from the shipped tests; where a wall-clock figure appears it is called
 out as a point measurement.
 - Viewport layout read on every scroll frame: **138 → 0** reads per gesture.
 - `data-bottom-offset` writes and host callbacks on every compositor frame:
   attribute mutations **114 → 1** and callbacks across an unchanged boundary
-  **137 → 0**, both reproducible from the shipped test. The wall-clock win on that
-  fling is smaller than these counts suggest and is **not** an end-state budget: an
-  independent re-measurement against the correct baseline gives ~2.2 → ~1.2 ms
-  isolated, while the shipped tree lands ~2.4-2.8 ms on the same fixture because a
-  later change trades some of it back to remove jank.
+  **137 → 0**, both reproducible from the shipped test. Wall-clock measurements for
+  this isolated change varied after later anti-jank work, so the counted mutations
+  and callbacks — not a timing claim — are the release guarantee.
 - Virtualized DOM rebuilt mid-momentum: key-set rebuilds **2 → 0**.
 - History parsed and measured during a fling: `getBoundingClientRect`
   **234 → 0**, DOM commits while busy **1 → 0**.
 - `getBoundingClientRect` per alt-screen touchmove: **10 → 1**, with the emitted
   SGR bytes pinned so grok's touch scrolling cannot drift.
-- **Retained history is now capped** with eviction, and per-page cost is flat
-  rather than linear: page-150/page-10 commit ratio **4.03× → 0.94×** on one run of
-  this host — a wall-clock point measurement that moves run to run, so treat the
-  direction as the claim, not the figures. Rows in
-  the viewport plus overscan are never evicted, even if they alone exceed the
-  budget. **Known limit, read this if you rely on deep scrollback:** past the cap the
-  view is spliced WITHOUT a marker — an older archive row can render directly above
-  the live tail, and the prepend-only protocol has no way to re-request the evicted
-  span, so scrolling back down does not restore it. A gap row and a scroll-back-down
-  test are next release. Still open too: sparse SGR checkpoints.
+- **Retained history is now capped.** On the original 500-row fixture, one run of
+  the cap changed the page-150/page-10 median commit ratio from **4.03× → 0.94×**;
+  that wall-clock point measurement moves run to run, so a deterministic counted-
+  work guard now carries the bounded per-page-cost claim. Rows in the viewport plus
+  overscan are never evicted, even if they alone exceed the budget. The completed
+  retention work covers live captures too, marks every retained-data discontinuity,
+  preserves archive rows already traversed, and stores derived render state sparsely.
+
+### TermView — bounded live retention and sparse rendering
+
+The new `10_000`-row and `8 * 1024 * 1024`-byte estimated retained-storage
+budgets are enforced after live capture commits as well as archive prepends. When
+trimming is necessary, TermView preserves the mounted viewport plus overscan and
+the newest live tail. The limits are intentionally soft when that protected window
+alone exceeds them, and the byte figure is a deterministic storage estimate rather
+than a browser-heap ceiling.
+
+Dropped spans render as `rows dropped` markers at their actual retained-row
+boundaries, including repeated discontinuities. The markers are presentational CSS
+chrome: they do not enter raw terminal rows, retained-byte accounting, search,
+copy, or `onLinesChange`, and the pseudo-element itself is not selectable.
+
+At saturation, a prepend can discard the oldest prefix of the incoming page but
+cannot evict archive rows the reader already traversed. The request gate also
+stops older-history fetches when either retained budget is full, even if a later
+live tick resets archive exhaustion.
+
+Persistent row storage is raw content/link data plus sparse SGR checkpoints and
+sparse discontinuity state. Rendered HTML and per-row entry state are Maps bounded
+to the mounted window instead of arrays spanning all retained rows. A cold-window
+rebuild waits for an active gesture to settle, and search is covered through a real
+TermView jump into a cold sparse window.
+
+On the final verification run, the same Chrome retained-shape fixture at
+`100_000` rows measured `42.49 MiB` for the legacy representation and `17.45 MiB`
+for the sparse representation. The selected checkpoint stride is `300`; its
+cold-window rebuild measured median/p95/max `0.60/0.90/1.10 ms` on that run.
+Treat these wall-clock values as run-local evidence, not universal device budgets.
+
+### Forward archive paging
+
+The public additions are:
+
+- `MuxClientMessage.afterLine?: number | null` on `history_expand`;
+- optional `HistoryArchiveLike.readAfter(session, afterLine, limit?)`;
+- `FileHistoryArchive.readAfter(session, afterLine, limit?)`; and
+- `TmuxWsMux.expandHistoryAfter(session, ws, afterLine, limit?)`.
+
+The reference host's `TerminalHistoryArchive` implements the matching adapter.
+`afterLine` is an exclusive anchor; `null` starts from the oldest row still held by
+the archive. Presence of the property selects forward paging, including `null` and
+`0`, and `afterLine` wins if both direction cursors are supplied. Rows remain in
+display order, `startLine` names the first row actually returned for a non-empty
+page, and `hasMore` means newer archived rows exist.
+
+An archive without `readAfter` returns an explicit empty page instead of throwing
+or silently calling `readBefore`. A request containing only `beforeLine` keeps the
+previous route. Custom WebSocket routers must preserve the new property and
+delegate it through `handleMessage()`, or call `expandHistoryAfter()` directly.
+
+### Published declarations under Node resolution
+
+The aggregate release builder adds `.js` to extensionless relative module
+specifiers in emitted declarations using TypeScript AST spans. The rewrite runs on
+the assembled `git-dist`, not the raw workspace `dist` directories, and leaves
+existing `.svelte` specifiers, comments, and plain strings alone.
+
+An exhaustive consumer guard imports the public declaration surface of
+`thumbmux/core` and `thumbmux/server`. The assembled package passes with
+`skipLibCheck: false` under both `Node16` and `NodeNext`, while the Bundler and
+Vite/Svelte consumer paths remain green. Plain `Node16`/`NodeNext` resolution is
+deliberately not claimed for `thumbmux/svelte`; use a Svelte-aware Bundler/Vite
+toolchain for that entrypoint.
+
+### Grok presets and public docs
+
+The stock `grok` and `grok-worktree` presets share a catalog containing the no-flag
+`default` choice and `grok-4.5` (`--model grok-4.5`). The retired `grok-build` and
+`grok-composer-2.5-fast` choices are removed. Because the launcher has no alias-
+rewrite layer, retired or unknown values passed to `buildLaunchCommand` or
+`buildLaunchSpec` fall back to `default`; they are not forwarded as aliases.
+`GROK_MODELS` is newly exported through `thumbmux/core`.
+
+`security.md` now demonstrates `createTokenGuard` with `TmuxWsMux` session-list
+filtering, browser mux configuration, and launch IDs derived from
+`DEFAULT_LAUNCH_PRESETS`. `notifications.md` demonstrates event validation and the
+browser permission, service-worker, and local-notification flow. Public JSDoc now
+uses the shipped `thumbmux/core`, `thumbmux/server`, and `thumbmux/svelte` subpaths
+rather than host-only aliases.
+
+These examples do not turn the helpers into an end-to-end security or push service.
+The host still owns authentication and authorization of parsed operations, cookie
+forwarding, service-worker delivery, subscription storage, and real push handling.
+
+### Host and operator fixes
+
+The reference host now carries typed `attached` and `activityAt` session fields
+through its provider, REST bootstrap, and WebSocket pushes; the hub consumes pushed
+rows and normalizes the activity timestamp for display. REST bootstrap takes at
+most one cold activity/attachment sample, remembers even an empty attempt, and then
+uses normal mux polling as the refresh path. The REST handler also reuses one mux
+session snapshot for orphan reconciliation and its response.
+
+A fresh database seed keeps the `kem-distill-engine` topic identity used for
+reconciliation but leaves its runtime fields empty. The seed is one-shot: existing
+topic rows are not migrated. Production uses the in-process distill path; if its
+flag is unset, executable legacy fallbacks still target the retired standalone
+service and can silently disable distillation.
+
+The reference Bun host now forwards `websocket.drain` to `mux.handleDrain`, and its
+README, demo, and runbook describe the same recovery fast path. The optional
+`filterSessionList` hook remains intentionally unwired in this single-user host:
+without an authenticated socket principal and authorization for the other mux
+operations, list-only filtering would imply isolation the host does not provide.
+
+### Known limits and upgrade order
+
+- **Forward paging is not end to end in the stock `TermView` yet.** The package
+  server and reference archive can answer a forward request, but the Svelte client
+  does not emit `afterLine`, so ordinary scrolling cannot re-request an evicted
+  span.
+- **Upgrade the server/host before a custom client sends `afterLine`.** A pre-change
+  server ignores that property and takes the old backward/newest-page route. A
+  custom WebSocket router must also preserve the field.
+- **Once the client retention budget is full, upward archive expansion clamps.**
+  This includes search-driven attempts to continue into older history. It is the
+  same functional ceiling a terminal user encounters with `tmux history-limit`.
+- **Gap markers are presentation, not terminal data.** Their counts are visible,
+  but the CSS marker itself cannot be copied or selected.
+- **Archive recovery covers only rows the configured archive still retains.**
+  There is no direct tmux re-capture fallback for an evicted logical range.
+- **The retention byte cap is estimated and the protected window can exceed the
+  nominal cap.** It is not a hard browser-heap ceiling.
+- **Plain `Node16`/`NodeNext` support is scoped to aggregate `git-dist`
+  declarations for core/server.** The Svelte entrypoint still needs Svelte-aware
+  resolution, and raw workspace dist output is not the released aggregate.
+- **An empty cold activity attempt is not retried by REST alone.** Without a mux
+  poll, placeholder metadata remains until a process restart permits another cold
+  attempt.
+- **The fresh-seed cleanup is not a migration or removal of legacy fallback code.**
+  Existing topic rows can retain old runtime fields, and unsetting the in-process
+  flag still reaches code targeting the absent standalone service.
+- **The security examples are building blocks, not deployed multi-user
+  isolation.** The reference host deliberately leaves `filterSessionList` unwired
+  until it has an authoritative ACL, authenticated socket principals, and matching
+  authorization for all mux operations.
 
 ### Correctness
+
 - **prefs**: an empty or key-missing GET no longer overwrites the cache; a failed
   PUT restores the previous snapshot instead of stranding optimistic state;
   overlapping PUTs serialize; a `load()` begun during a pending PUT no longer
@@ -107,6 +294,7 @@ out as a point measurement.
   headless browsers resolve `env(safe-area-*)` to 0, so no test can catch it.
 
 ### Tests
+
 - The four exported components that shipped with **zero** tests — `UploadAction`,
   `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 30 tests, each
   assertion group proven by mutating a throwaway copy until it fails. The earlier
@@ -117,11 +305,14 @@ out as a point measurement.
   expected surface from each subpackage index rather than a frozen list — a
   frozen list is the v0.4.0 defect in new clothes. It checks type declarations
   too, without which a type-only export is invisible. On its first run it found
-  the tree's git-dist missing 4 core and 7 server declarations.
+  missing public declarations in both core and server.
 - **`dogfooding.test.ts`** fails if the demo reimplements something the package
   ships, parsing import specifiers rather than substring-matching. The
-  plug-and-play audit found that pattern four separate times, each caught only by
-  a human reading code.
+  plug-and-play audit found that pattern repeatedly, previously only by a human
+  reading code.
+- **The release rail is exercised from the split package tree.** Its TypeScript
+  dependency and prompt-scan fixtures are package-local, so a release cannot pass
+  by borrowing either one from the parent monorepo and then publish an empty dist.
 
 ## v0.5.0 — 2026-07-28
 Performance and safety work on paths that already shipped in v0.3.5 / v0.4.0 —
