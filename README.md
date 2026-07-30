@@ -5,10 +5,10 @@
 **tmux for thumbs — and now for desks.**
 
 A batteries-included web terminal stack for driving tmux sessions — especially
-AI coding agents — from any screen: a compositor-scroll viewer that runs at
-your display's refresh rate, a keyboard-aware composer, a live session hub,
-and a multiplexed WebSocket engine. Three small packages you can wire into
-any app in an afternoon.
+AI coding agents — from phone and desktop browsers: a compositor-scroll
+viewer, a keyboard-aware composer, a live session hub, and a multiplexed
+WebSocket engine. Public core, Svelte, and server entrypoints are available for
+host applications to wire together.
 
 [![CI](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/tag/kemkem23/thumbmux?filter=v*-dist&label=release&color=16a34a)](https://github.com/kemkem23/thumbmux/tags)
@@ -19,8 +19,7 @@ any app in an afternoon.
 
 <img src="docs/media/hero.png" width="96%" alt="The same agent session in three themes — dark, deep blue, and cream" />
 
-<sub>Every screenshot in this README is the bundled demo running scripted
-transcripts in a clean container — reproduce them yourself with `bun run demo`.</sub>
+<sub>The screenshots in this README show the bundled demo.</sub>
 
 </div>
 
@@ -34,34 +33,31 @@ phone as a tiny desktop — pinch, squint, mis-tap, rage. thumbmux treats the
 phone as the primary device, and rebuilds the viewer around one idea:
 **during a gesture, the compositor should be the only thing working.**
 
-- **Scrolls at your display's refresh rate.** ANSI is parsed *off* the gesture
-  path into cached HTML; the scroll itself is `translate3d` over a virtualized
-  window of rows. While your finger is down, nothing parses, nothing reflows,
-  nothing repaints terminal cells — 60 Hz screens get 60, 120 Hz screens
-  get 120. Momentum, rubber-band and bottom-anchoring are re-implemented
-  px-true to iOS.
-- **Real DOM, real text.** Select it, copy it, tap URLs — even ones that wrap
-  across three lines. It's a document, not a picture of one.
-- **Input that respects the OS.** A composer dock that never covers the
-  terminal (and never resizes the pty), a DIRECT mode where the phone keyboard
-  *is* the terminal, and a desktop wrapper with xterm-parity key encoding —
-  AltGr, macOS Option, IME composition and all.
-- **One engine, every viewer.** The server polls each tmux session once no
-  matter how many browsers watch it — content-hash dedupe, cursor-only frames,
-  tail-mode thumbnails, opt-in line-delta frames, and opt-in per-message
-  deflate for cellular-friendly traffic.
+- **Compositor-driven scrolling.** ANSI parsing and row-window rebuilds are
+  deferred while a touch gesture is active; the scroll itself is
+  `translate3d` over a virtualized window of rows. Momentum, rubber-band and
+  bottom-anchoring are implemented in the client.
+- **Real DOM, real text.** Select it, copy it, and tap wrapped URLs. It's a
+  document, not a picture of one.
+- **Input that respects the OS.** The composer reports its occupied height so
+  the host can keep the terminal visible without resizing the pty. DIRECT mode
+  lets the phone keyboard drive the terminal, while the desktop wrapper handles
+  physical-keyboard layouts and composition guards.
+- **A shared per-session engine.** Viewers of the same tmux session share its
+  server-side polling and captures. The mux also provides content-hash dedupe,
+  cursor-only frames, tail-mode thumbnails, opt-in line-delta frames, and
+  opt-in per-message deflate.
 
 ## The tour
 
 ### A hub of everything you're running
 
-Live miniatures — every card is the actual pane streaming in real time, so
-four agents crunching in parallel reads at a glance. Thumbnails subscribe in
-**tail mode**: ~5 KB per frame instead of the 19–136 KB full snapshot, and
-captures are shared server-side with any full viewer of the same session, so
-a ten-card hub adds no extra tmux work. Tap **+ terminal** for launch presets
-with permission and model dropdowns and **isolated git-worktree** options —
-presets are data, bring your own.
+Live miniatures make parallel sessions readable at a glance. Each thumbnail
+subscribes in **tail mode**, and its capture is shared server-side with full
+viewers of the same session. Each distinct session still has its own poll and
+capture work. Tap **+ terminal** for launch presets with permission and model
+dropdowns and **isolated git-worktree** options — presets are data, bring your
+own.
 
 <p align="center">
   <img src="docs/media/hub.png" width="360" alt="Session hub: four live terminal miniatures plus a + terminal card" />
@@ -71,22 +67,30 @@ presets are data, bring your own.
 ### A terminal that reads like an app
 
 Syntax colors survive the trip (incremental SGR→HTML with cross-line state),
-URLs are tappable `<a>` elements even when they wrap, and the caret sits
-exactly where tmux says it does — Thai/CJK/emoji width-aware. Pull down and
-older scrollback streams in (unlimited when the host wires a history archive).
-When the pane width changes, the live window reflows from tmux and arrives as
-a full reset; archived rows deliberately keep their original physical wrapping
-so history never gets silently rewritten ([details](docs/reflow.md)).
+URLs are tappable `<a>` elements even when they wrap, and caret placement uses
+Thai/CJK/emoji-aware cell widths. Pull down and older scrollback streams in
+when the host wires a history archive. TermView keeps a built-in client
+retention budget of 10,000 rows or an estimated 8 MiB, whichever fills first;
+the mounted viewport and overscan are protected, so they may exceed the nominal
+budget. Once the budget is full, further upward archive expansion stops — like
+a finite tmux `history-limit` — even if the server still has older rows. When
+client retention drops a span, its boundary is labelled `N rows dropped`; the
+label is presentation chrome, not terminal text. These client budgets are
+separate from `FileHistoryArchive.maxLines` and are not currently configurable
+through TermView props. When the pane width changes, the live window reflows
+from tmux and arrives as a full reset; archived rows deliberately keep their
+original physical wrapping so history is not silently rewritten
+([details](docs/reflow.md)).
 
 <p align="center">
   <img src="docs/media/term-agent.png" width="360" alt="Agent session: colored diff, test results, tappable URL" />
   <img src="docs/media/composer.png" width="360" alt="Composer dock open with the terminal tail still visible above it" />
 </p>
 
-The composer **docks, never covers**: the viewport shrinks by exactly the
-sheet height and springs back — the pty is never resized by a transient
-overlay, so an agent's TUI layout never flaps. Prefer raw? **DIRECT mode**
-holds focus in an invisible input so the OS keyboard drives the pane
+With the documented bottom-inset wiring, the composer **docks**: the viewport
+shrinks by the reported sheet height and springs back. ComposerDock does not
+resize the pty for a transient overlay. Prefer raw? **DIRECT mode** holds focus
+in an invisible input so the OS keyboard drives the pane
 keystroke-by-keystroke, Thai IME included.
 
 ### One-tap shortcuts, notes, uploads
@@ -103,19 +107,22 @@ picture into an uploaded path prefilled in the composer.
   <img src="docs/media/theme.png" width="360" alt="Theme sheet: dark/light, swatches, custom color" />
 </p>
 
-Theming is one color: hand `defaultSurface()` any background hex and it derives
-foreground, HUD chrome, and a readable 16-color ANSI palette from luminance —
-the whole surface re-skins instantly. Use `deriveSurface(bg, base)` when you
-want to preserve your own branded surface defaults.
+Theming is one color: hand `defaultSurface()` a background hex and it derives
+foreground, HUD chrome, and a 16-color ANSI palette from luminance. Use
+`deriveSurface(bg, base)` when you want to preserve your own branded surface
+defaults.
 
 ### Desktop is first-class now
 
-`DesktopKeys` wraps any `TermView`: click to focus (thin `:focus-visible`
-ring), then just type. Keys route through an **xterm-parity encoder** —
-modified F-keys, Ctrl+digit control bytes, AltGr third-level shift, macOS
-Option via `altIsMeta`, IME composition guards — pinned by 155 unit tests.
-Ctrl+C copies when you have a selection and interrupts when you don't. Paste
-is bracketed, with size-warning thresholds and a confirm hook.
+`DesktopKeys` wraps a `TermView`: click to focus (thin `:focus-visible` ring),
+then type. Supported keys route through an xterm-compatible encoder — modified
+F-keys, Ctrl+digit control bytes, AltGr third-level shift, macOS Option via
+`altIsMeta`, and IME composition guards — covered by unit tests. Ctrl+C copies
+when you have a selection and interrupts when you don't. Paste is bracketed,
+with size-warning thresholds and a confirm hook. Direct-character desktop
+layouts such as Thai, Latin, and Cyrillic work in the pane; Japanese, Chinese,
+and Korean candidate-window IMEs use `ComposerDock` because the desktop wrapper
+is not an editable input.
 
 <p align="center"><img src="docs/media/desktop-agent.png" width="86%" alt="Desktop: the same session wide, with composer" /></p>
 
@@ -135,28 +142,27 @@ policy, geometry ownership, view-only surfaces — is specified in
 
 | | |
 |---|---|
-| **Gesture path** | 0 parses, 0 reflows — `translate3d` over a ±60-row virtualized window; ANSI→HTML is incremental and cached off-gesture |
-| **Idle session, on the wire** | ~0 — adaptive polling backed by `pipe-pane` dirty signals + content-hash dedupe; unchanged panes send nothing |
-| **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in validated line deltas cut suffix-heavy traffic by 95% vs equivalent full frames in the clean-container e2e; per-message deflate remains available |
-| **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
-| **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
-| **Tests** | 995 source tests across 61 files (including ~956k stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
-| **Search overlay** | dense highlight path is linear — 10,000 unit matches on one row measured **482.75 ms → 7.44 ms** after the v0.4 fix |
-| **Delta fan-out (v0.5)** | one changed line on a 2,000-row pane to 20 delta subscribers: **69.2 ms → 3.9 ms** at 160 KB (flat in viewer count — grouped serialize once, fan out) |
-| **Client delta apply (v0.5)** | **14.49 ms → 0.094 ms** median (~150×); ~88× under the 8.33 ms 120 Hz frame budget |
-| **Core weight** | `thumbmux/core` ≈ 4 k lines of TypeScript, **zero runtime dependencies** — you (or your agent) can audit it in one sitting |
+| **Gesture window** | `translate3d` over a virtualized row window with 60 rows of overscan on each side; ANSI parsing and window rebuilds are deferred during an active gesture |
+| **Client history retention** | nominally 10,000 rows or an estimated 8 MiB; the mounted viewport and overscan remain protected |
+| **Server archive default** | `FileHistoryArchive` retains up to 20,000 archived lines per session unless the host sets `maxLines` |
+| **README/distribution guards** | 23 passing tests across 2 files in the required scripts test command |
+| **Core source** | 4,827 lines of production TypeScript and **zero runtime dependencies** |
 
 ## Get started
 
-**📦 In your app — plug and play.** Every release ships an immutable
-`vX.Y.Z-dist` tag with prebuilt `dist/` for all three packages: plain install
-with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
+**📦 In your app — use a published dist tag.** List the public
+`vX.Y.Z-dist` tags, choose one that exists, and pin it:
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.6.0-dist
-# or
-npm i    github:kemkem23/thumbmux#v0.6.0-dist
+git ls-remote --tags https://github.com/kemkem23/thumbmux 'refs/tags/v*-dist'
+THUMBMUX_TAG=v0.5.0-dist # replace with the published tag you selected
+bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
+# npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"
 ```
+
+The selected tag's README is its API contract. This branch documents the
+current checkout and may include APIs newer than that tag; do not infer that a
+dist tag exists from the local `package.json` version.
 
 ```ts
 import {
@@ -195,10 +201,10 @@ import {
 
 `thumbmux/svelte` resolves via the `svelte` export condition — Vite/SvelteKit
 pick it up automatically (it ships `.svelte` sources + `.d.ts`, compiled by
-your bundler, which is how Svelte libraries work). **Pin `-dist` tags only** —
-updating is bumping the tag and reinstalling.
+your bundler). **Pin only a `-dist` tag that the listing command returns**;
+update by choosing another published tag and reinstalling.
 
-**⚡ In two minutes — the demo.** On any machine with `tmux` and Bun:
+**⚡ Run the demo.** On a machine with `tmux` and Bun:
 
 ```bash
 git clone https://github.com/kemkem23/thumbmux
@@ -215,18 +221,19 @@ Scrollback storage is private and per-run by default. Setting
 `THUMBMUX_HISTORY_ROOT` explicitly opts into persistence keyed by tmux session
 name; reuse a name only for the same logical session.
 
-**🤖 The agent way.** Paste into an agent TUI in your project:
+**🤖 The agent way for this checkout.** Paste into an agent TUI in your
+project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.6.0-dist`, read its README,
-> then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
-> route with a driver for my tmux, and add a page using `SessionGrid` +
-> `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
-> `thumbmux/svelte`. Show me the wiring plan before writing code.
+> Use the current thumbmux checkout and read its README. Then wire it in: mount
+> `TmuxWsMux` from `thumbmux/server` on a WebSocket route with a driver for my
+> tmux, and add a page using `SessionGrid` + `LaunchSheet` + `TermView` +
+> `DesktopKeys` + `ComposerDock` from `thumbmux/svelte`. Show me the wiring plan
+> before writing code.
 
 **🔒 The security-conscious way.** Same, but audit first:
 
-> Read every file in the thumbmux package (core/, svelte/, server/ — it's
-> small). Flag anything that phones home, executes remote content, touches
+> Read the source files in the thumbmux package (core/, svelte/, server/).
+> Flag anything that phones home, executes remote content, touches
 > files outside its packages, or handles keystrokes/session content in a way I
 > should not trust. Summarize what data flows where, then wait for my
 > go-ahead.
@@ -330,7 +337,7 @@ preset is authoritative. Custom presets should be supplied to both
 body: JSON.stringify({ command: spec.command, worktree: spec.worktree })
 ```
 
-Wire the fetch-style handler into any server route:
+Wire the fetch-style handler into a server route:
 
 ```ts
 import { createBunTmuxDriver, createSpawnHandler } from 'thumbmux/server';
@@ -425,7 +432,7 @@ For backpressure that stays enabled, `maxBlockedMs` (default 30 seconds) and
 are the controls for shedding a chronically slow peer instead of retaining it
 indefinitely.
 
-**Client** — a terminal page in ~40 lines. `submitPlan()` separates pasted text
+**Client** — a compact terminal page. `submitPlan()` separates pasted text
 from Enter because agent TUIs can swallow an Enter sent in the same tick. Set
 the host-owned `agent` from launch/session metadata (it is not auto-detected)
 so the Codex-specific second Enter is included:
@@ -490,9 +497,9 @@ thumbmux/
 
 | package | what you get |
 |---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createSpawnHandler()` + `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createSpawnHandler()` + `createUploadHandler()` + `createPrefsHandler()` fetch-style handler factories |
 
 Docs: [session hub integration](docs/hub.md) ·
 [desktop interaction contract](docs/desktop.md) ·
@@ -522,12 +529,12 @@ Docs: [session hub integration](docs/hub.md) ·
 ## Roadmap
 
 - [x] Session hub: live-miniature grid + launch presets, filters/search/grouping, state dots, keyboard nav (v0.3.3)
-- [x] Tail-mode subscriptions (thumbnails at ~5 KB/frame)
+- [x] Tail-mode subscriptions for thumbnails
 - [x] Runnable demo + reference `TmuxDriver` (clone → `bun run demo` → scan QR)
-- [x] Installable releases without npm: immutable `vX.Y.Z-dist` tags, prebuilt dists
-- [x] Desktop: `DesktopKeys`, xterm-parity encoder, alt-screen SGR forwarding (wheel/click/touch)
+- [x] Installable releases without npm: published `vX.Y.Z-dist` tags with prebuilt dists
+- [x] Desktop: `DesktopKeys`, terminal key encoder, alt-screen SGR forwarding (wheel/click/touch)
 - [x] Wire efficiency: cursor-only frames, tail mode, opt-in per-message deflate
-- [x] Jank-free history expansion (state-convergent prepend, p95 16.7 ms) (v0.3.3)
+- [x] State-convergent history prepend (v0.3.3)
 - [x] Protocol doc ([docs/protocol.md](docs/protocol.md)) + conformance suite
 
 **v0.3.4 / v0.3.5 — stability & wire perf**
@@ -548,21 +555,21 @@ Docs: [session hub integration](docs/hub.md) ·
 
 **v0.5.0 — performance & safety (shipped)**
 - [x] Delta broadcast grouped by viewer identity — cost flat in viewer count
-- [x] Client delta apply ~150× faster (incremental prefix hash + skip re-validate)
+- [x] Incremental client delta apply (prefix hash + skip re-validate)
 - [x] WebSocket backpressure on by default (`handleDrain` / auto-resume; legacy via `enabled: false`)
 - [x] `filterSessionList` hook on every session-list delivery path
 - [x] All-or-nothing multi-file uploads; quadratic wrapped-URL + capture-overlap fixes
 
-**v0.6.0 — plug-and-play, finished (shipped)**
+**Current v0.6.0 source (not published as `v0.6.0-dist`)**
 - [x] `FileHistoryArchive` and `createSpawnHandler` exported — no longer host-only code
 - [x] `SessionListItem` typed and documented, with `activityAt` (no extra tmux call)
-- [x] Prompt-scan matchers pluggable — the last host assumption out of the package
-- [x] Public docs import the shipped subpaths, enforced by a snippet test
+- [x] Prompt-scan matchers are pluggable
+- [x] Public docs import the package subpaths, enforced by a snippet test
 - [x] `docs/hub.md`, including what the hub does *not* give you
-- [x] Five deferred TermView hot-path defects closed, with before/after numbers
-- [x] Capped retained history; flat per-page prepend cost
-- [x] prefs/upload data-loss paths fixed; the four untested components covered
-- [x] `smoke:git-dist` checks every public export resolves for consumers (bundler resolution)
+- [x] Deferred TermView hot-path defects closed with benchmark coverage
+- [x] Bounded retained history with protected visible rows and explicit gap markers
+- [x] prefs/upload data-loss paths fixed and previously untested components covered
+- [x] `smoke:git-dist` checks source-derived core/server export parity for consumers
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,
