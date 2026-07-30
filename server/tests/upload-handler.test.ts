@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdir, rm, readdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, rm, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { createUploadHandler } from "../src/upload-handler";
 import { makeStoredName, formatUploadMessage } from "../../core/src/upload";
 
 const DIR = `/tmp/thumbmux-upload-test-${Date.now()}`;
-const handler = createUploadHandler({ dir: DIR, maxFiles: 2, maxBytesPerFile: 1024 });
+const CONFIGURED_DIR = relative(process.cwd(), DIR);
+const handler = createUploadHandler({ dir: CONFIGURED_DIR, maxFiles: 2, maxBytesPerFile: 1024 });
 
 function reqWith(files: Array<[string, string]>): Request {
   const form = new FormData();
@@ -25,14 +26,21 @@ async function freshDir(tag: string): Promise<string> {
 afterAll(async () => { await rm(DIR, { recursive: true, force: true }); });
 
 describe("upload handler", () => {
-  test("stores files and returns the original→stored mapping", async () => {
+  test("stores files and returns the storage directory with the original→stored mapping", async () => {
     const res = await handler(reqWith([["photo.png", "PNGDATA"], ["error.log", "boom"]]));
     expect(res.status).toBe(201);
     const data = await res.json();
+    expect(data.ok).toBe(true);
     expect(data.files.length).toBe(2);
     expect(data.files[0].original).toBe("photo.png");
+    expect(typeof data.files[0].stored).toBe("string");
+    expect(data.files[1].original).toBe("error.log");
+    expect(typeof data.files[1].stored).toBe("string");
     const onDisk = await readdir(DIR);
     expect(onDisk).toContain(data.files[0].stored);
+    const writtenPath = await realpath(join(DIR, data.files[0].stored));
+    expect(data.dir).toBeTruthy();
+    expect(data.dir).toBe(dirname(writtenPath));
     expect((await readFile(`${DIR}/${data.files[1].stored}`)).toString()).toBe("boom");
   });
 

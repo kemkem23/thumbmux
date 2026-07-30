@@ -4,11 +4,11 @@
  * ("files" fields), validates the whole request first, then stores every file
  * under `dir` with collision-proof sanitized names (all-or-nothing: a reject
  * or mid-write failure leaves zero orphans from this request). Returns
- * { ok, files: [{ original, stored }] } — the shape UploadAction and
+ * { ok, files: [{ original, stored }], dir } — the shape UploadAction and
  * formatUploadMessage expect.
  */
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { makeStoredName, type UploadedFile } from "@thumbmux/core";
 
 export type UploadHandlerOptions = {
@@ -25,6 +25,7 @@ export type UploadHandlerOptions = {
 };
 
 export function createUploadHandler(opts: UploadHandlerOptions) {
+  const dir = resolve(opts.dir);
   const maxFiles = opts.maxFiles ?? 10;
   const maxBytes = opts.maxBytesPerFile ?? 200 * 1024 * 1024;
   const maxTotal = opts.maxTotalBytes;
@@ -53,13 +54,13 @@ export function createUploadHandler(opts: UploadHandlerOptions) {
       }
     }
 
-    await mkdir(opts.dir, { recursive: true });
+    await mkdir(dir, { recursive: true });
     const stored: UploadedFile[] = [];
     const writtenPaths: string[] = [];
     try {
       for (const f of files) {
         const name = makeStoredName(f.name, Date.now(), Math.random().toString(36).slice(2, 8));
-        const dest = join(opts.dir, name);
+        const dest = join(dir, name);
         // Record before await so a half-written file is cleaned up too.
         writtenPaths.push(dest);
         await writeFile(dest, new Uint8Array(await f.arrayBuffer()));
@@ -72,6 +73,6 @@ export function createUploadHandler(opts: UploadHandlerOptions) {
       );
       throw err;
     }
-    return Response.json({ ok: true, files: stored }, { status: 201 });
+    return Response.json({ ok: true, files: stored, dir }, { status: 201 });
   };
 }
