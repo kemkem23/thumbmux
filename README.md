@@ -162,6 +162,7 @@ npm i    github:kemkem23/thumbmux#v0.5.0-dist
 import {
   TmuxWsMux,
   createBunTmuxDriver,
+  createSpawnHandler,
   createUploadHandler,
   createPrefsHandler,
   FrameJournal,
@@ -271,6 +272,100 @@ Without `pipes`, live output still works through adaptive polling (250 ms
 normally, 100 ms for five seconds after input) instead of instant `pipe-pane`
 dirty signals. Without `archive`, live viewing still works, but history
 expansion returns an empty page, so older archived scrollback is unavailable.
+
+### Spawn endpoint (`createSpawnHandler`)
+
+`LaunchSheet` does not choose an HTTP schema or make a request. Its
+`onLaunch(spec, contextId)` callback receives the `LaunchSpec` built by
+`buildLaunchSpec()`; a host can post that spec directly and map the separate
+`contextId` to its own cwd/workspace policy:
+
+```ts
+import type { LaunchSpec } from 'thumbmux/core';
+
+async function launch(spec: LaunchSpec, contextId: string | null) {
+  const response = await fetch('/api/spawn', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...spec,
+      cwd: workspaceFor(contextId),
+      // name: 'codex-project-1', // optional exact name
+      // autoName: true,         // suffix an explicit collision instead of 409
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error);
+  return result as { ok: true; name: string };
+}
+```
+
+The complete JSON contract is:
+
+```ts
+type SpawnPayload = {
+  // LaunchSpec fields
+  presetId?: string;  // known preset → server rebuilds command from selectors
+  agent?: string;     // naming/host hint
+  worktree?: boolean; // default false; true requires host prepare+cleanup hooks
+  permission?: string;
+  model?: string;
+  command?: string;   // direct-command fallback when presetId is omitted
+
+  // Host/session fields
+  name?: string;      // omitted → collision-free generated name
+  cwd?: string;       // omitted → configured handler cwd / process.cwd()
+  autoName?: boolean; // explicit duplicate: false/omitted → 409; true → suffix
+};
+```
+
+When `presetId` is present, it must exist in the handler's `presets` (the stock
+presets are the default). The handler calls `buildLaunchCommand(preset,
+permission, model)` and ignores submitted command text, so the server-side
+preset is authoritative. Custom presets should be supplied to both
+`LaunchSheet` and the handler. For the demo-compatible compact form, omit
+`presetId` and post the already-built command:
+
+```ts
+body: JSON.stringify({ command: spec.command, worktree: spec.worktree })
+```
+
+Wire the fetch-style handler into any server route:
+
+```ts
+import { createBunTmuxDriver, createSpawnHandler } from 'thumbmux/server';
+
+const driver = createBunTmuxDriver();
+const handleSpawn = createSpawnHandler({
+  driver,
+  cwd: process.cwd(),
+  namePrefix: 'term',
+  validateCwd: (cwd) => cwd.startsWith('/srv/workspaces/')
+    || 'cwd is outside the workspace root',
+  // Opt-in only: the host creates the isolated checkout and returns its cwd.
+  prepareWorktree: ({ name, cwd }) => createIsolatedCheckout({ name, cwd }),
+  cleanupWorktree: ({ worktreeCwd }) => removeIsolatedCheckout(worktreeCwd),
+});
+
+if (url.pathname === '/api/spawn' && req.method === 'POST') {
+  return handleSpawn(req);
+}
+```
+
+A success is `201 { ok: true, name }`; an exact-name collision is `409`;
+malformed payloads, invalid/non-directory cwd values, and worktree requests
+without both hooks are `400`. `createSpawnHandler` never runs `git worktree` on its
+own. Auto-named requests also retry if another tmux client wins the final
+spawn race. For worktree requests, `cleanupWorktree` rolls back the checkout
+after final-cwd validation or spawning fails, before a retry can use a new
+name. If `prepareWorktree` itself throws before returning a path, that hook
+owns any partial cleanup. A hook that needs a deliberate HTTP error can throw
+`SpawnHandlerError`.
+
+**This endpoint can execute caller-supplied shell commands in local tmux.**
+Protect it with authentication (for example `createTokenGuard()` with an
+interactive grant), restrict cwd with host policy, and never expose it as an
+unauthenticated route.
 
 ### Wiring backpressure
 
@@ -397,7 +492,7 @@ thumbmux/
 |---|---|
 | **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createSpawnHandler()` + `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
 
 Docs: [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·

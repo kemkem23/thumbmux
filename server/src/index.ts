@@ -12,6 +12,7 @@
  */
 export * from './ws-mux';
 export * from './bun-driver';
+export * from './spawn-handler';
 export * from './upload-handler';
 export * from "./prefs-handler";
 export * from './frame-journal';

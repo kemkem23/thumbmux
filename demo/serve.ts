@@ -13,8 +13,9 @@ import {
   FileHistoryArchive,
   TmuxWsMux,
   createBunTmuxDriver,
+  createSpawnHandler,
   createUploadHandler,
-  spawnTmuxSession,
+  SpawnHandlerError,
 } from "@thumbmux/server";
 import type { MuxClientMessage } from "@thumbmux/core";
 import qrcode from "qrcode-terminal";
@@ -51,6 +52,50 @@ function authorized(req: Request): boolean {
 }
 
 let spawnCounter = 0;
+const handleSpawn = createSpawnHandler({
+  driver,
+  // Keep the demo rooted where its server process was started. In particular,
+  // do not let an HTTP payload select an arbitrary server-side directory.
+  cwd: () => process.cwd(),
+  generateName: ({ existing }) => {
+    let name = "";
+    do { name = `demo-${++spawnCounter}`; } while (existing.has(name));
+    return name;
+  },
+  prepareWorktree: ({ name, cwd }) => {
+    // Worktree presets isolate the session in a fresh checkout. This policy is
+    // demo-specific; createSpawnHandler itself deliberately knows nothing
+    // about git and invokes this hook only when requested.
+    const top = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--show-toplevel"]);
+    if (top.exitCode !== 0) {
+      throw new SpawnHandlerError(
+        400,
+        "worktree preset needs the demo to run inside a git repository",
+      );
+    }
+    const root = top.stdout.toString().trim();
+    const worktreeCwd = `${root}-wt-${name}`;
+    const add = Bun.spawnSync(["git", "-C", root, "worktree", "add", "--detach", worktreeCwd]);
+    if (add.exitCode !== 0) {
+      throw new SpawnHandlerError(
+        500,
+        `git worktree add failed: ${add.stderr.toString().trim()}`,
+      );
+    }
+    return worktreeCwd;
+  },
+  cleanupWorktree: ({ cwd, worktreeCwd }) => {
+    const remove = Bun.spawnSync([
+      "git", "-C", cwd, "worktree", "remove", "--force", worktreeCwd,
+    ]);
+    if (remove.exitCode !== 0) {
+      throw new SpawnHandlerError(
+        500,
+        `git worktree rollback failed: ${remove.stderr.toString().trim()}`,
+      );
+    }
+  },
+});
 
 Bun.serve<{ ok: true }>({
   hostname: HOST_ALL ? "0.0.0.0" : "127.0.0.1",
@@ -70,32 +115,7 @@ Bun.serve<{ ok: true }>({
     }
 
     if (url.pathname === "/api/spawn" && req.method === "POST") {
-      try {
-        const body = await req.json().catch(() => ({}));
-        const existing = new Set(driver.listSessions().map((s: any) => s.name));
-        let name = "";
-        do { name = `demo-${++spawnCounter}`; } while (existing.has(name));
-        let cwd = process.cwd();
-        if (body.worktree) {
-          // Worktree presets: isolate the session in a fresh git worktree of
-          // the repo the demo runs in (agents can't trample your checkout).
-          const top = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--show-toplevel"]);
-          if (top.exitCode !== 0) {
-            return Response.json({ error: "worktree preset needs the demo to run inside a git repository" }, { status: 400 });
-          }
-          const root = top.stdout.toString().trim();
-          const wt = `${root}-wt-${name}`;
-          const add = Bun.spawnSync(["git", "-C", root, "worktree", "add", "--detach", wt]);
-          if (add.exitCode !== 0) {
-            return Response.json({ error: `git worktree add failed: ${add.stderr.toString().trim()}` }, { status: 500 });
-          }
-          cwd = wt;
-        }
-        spawnTmuxSession(name, cwd, typeof body.command === "string" && body.command ? body.command : undefined);
-        return Response.json({ ok: true, name }, { status: 201 });
-      } catch (e: any) {
-        return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
-      }
+      return handleSpawn(req);
     }
 
     // static: dist/ with an index fallback + token cookie
