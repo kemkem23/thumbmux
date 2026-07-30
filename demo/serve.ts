@@ -118,6 +118,9 @@ Bun.serve<{ ok: true }>({
     close(ws) {
       mux.unsubscribeAll(ws as any);
     },
+    drain(ws) {
+      mux.handleDrain(ws as any);
+    },
   },
 });
 

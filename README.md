@@ -267,6 +267,64 @@ after input) instead of instant `pipe-pane` dirty signals. Without `archive`,
 live viewing still works, but history expansion returns an empty page, so older
 archived scrollback is unavailable.
 
+### Wiring backpressure
+
+Backpressure is enabled by default. Bun reports a full outbound queue by
+returning `-1` from `ws.send()`; the mux then stops adding server-pushed frames
+to that socket. Forward Bun's `drain` event so the mux can resume immediately
+and send the peer its current state:
+
+```ts
+import type { MuxClientMessage } from 'thumbmux/core';
+
+Bun.serve<{ ok: true }>({
+  fetch(req, server) {
+    return server.upgrade(req, { data: { ok: true } })
+      ? undefined
+      : new Response('upgrade failed', { status: 400 });
+  },
+  websocket: {
+    open(ws) {
+      mux.subscribeSessions(ws);
+    },
+    message(ws, raw) {
+      try {
+        mux.handleMessage(JSON.parse(String(raw)) as MuxClientMessage, ws);
+      } catch {
+        // Ignore malformed client frames.
+      }
+    },
+    close(ws) {
+      mux.unsubscribeAll(ws);
+    },
+    drain(ws) {
+      mux.handleDrain(ws);
+    },
+  },
+});
+```
+
+Without `drain`, there is no fast resume path. Auto-resume works only when the
+WebSocket adapter can report its buffered amount (Bun sockets expose
+`getBufferedAmount()`), and a socket whose queue has emptied still waits until
+the next server broadcast before the mux observes that fact. An adapter that
+cannot report buffered bytes requires an explicit `handleDrain` call to resume.
+
+To keep the pre-v0.5.0 keep-sending behavior, use the escape hatch when you
+construct the mux:
+
+```ts
+const mux = new TmuxWsMux({
+  driver,
+  backpressure: { enabled: false },
+});
+```
+
+For backpressure that stays enabled, `maxBlockedMs` (default 30 seconds) and
+`maxBufferedBytes` (default 8 MiB, when buffered-byte reporting is available)
+are the controls for shedding a chronically slow peer instead of retaining it
+indefinitely.
+
 **Client** — a terminal page in ~40 lines. `submitPlan()` separates pasted text
 from Enter because agent TUIs can swallow an Enter sent in the same tick. Set
 the host-owned `agent` from launch/session metadata (it is not auto-detected)
