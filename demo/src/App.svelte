@@ -7,18 +7,12 @@
     tmuxMux, type GridSession, type FabAction,
   } from '@thumbmux/svelte';
   import {
-    DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, deriveSurface, luminance, extractRecentPrompts,
+    DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, defaultSurface, luminance, extractRecentPrompts,
     submitPlan,
-    type TerminalSurface, type LaunchPreset, type LaunchSpec, type AnsiPalette, type Shortcut, type SubmitAgent,
+    type LaunchPreset, type LaunchSpec, type Shortcut, type SubmitAgent,
   } from '@thumbmux/core';
   import { onMount, onDestroy } from 'svelte';
 
-  const PALETTE: AnsiPalette = {
-    base: ['#101014', '#ff7a7a', '#7dffa0', '#ffef9e', '#c8b4ff', '#ff9ad5', '#9be9ff', '#e8e8e8',
-           '#8a8a92', '#ff9d9d', '#a0ffbe', '#fff5bd', '#dcCEff', '#ffbde4', '#c2f1ff', '#ffffff'],
-    defaultFg: '#e6e6e6',
-    defaultBg: '#101014',
-  };
   // Stock presets, worktree ones included — if the demo's cwd is not a git
   // repo, git prints its own self-explanatory error in the pane.
   const ALT_SCREEN_PRESET_ID = 'alt-screen-mouse';
@@ -34,11 +28,6 @@
   const PRESETS = [...DEFAULT_LAUNCH_PRESETS, ALT_SCREEN_PRESET];
 
   // --- theme + font (persisted; ThemeSheet is pure presentation) ---
-  const BASE_SURFACE: TerminalSurface = {
-    agent: '#7dffa0', tbg: '#101014', tstage: '#0a0a0d', tfg: '#e6e6e6',
-    hud: 'rgba(16,16,20,.95)', hudFg: '#e6e6e6', hudLine: '#34343a',
-    badge: '#1a1a1a', badgeFg: '#e6e6e6', xterm: {},
-  };
   const THEME_SWATCHES = ['#101014', '#000000', '#0b1c3d', '#b34700', '#f5f0e8', '#e6e6e6'];
   const prefs = createLocalPrefs('thumbmux-demo-prefs');
   let bg = $state('#101014');
@@ -51,18 +40,7 @@
   let hudExpanded = $state(false);
   let recentPrompts = $state<string[]>([]);
   let termRef = $state<ReturnType<typeof TermView> | null>(null);
-  let surface = $derived(deriveSurface(bg, BASE_SURFACE));
-  let termPalette = $derived<AnsiPalette>((() => {
-    const x = surface.xterm;
-    const b = [...PALETTE.base];
-    b[0] = x.black ?? b[0]; b[7] = x.white ?? b[7];
-    const idx = { red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6 } as const;
-    for (const [k, i] of Object.entries(idx)) {
-      if (x[k]) { b[i] = x[k]; b[i + 8] = x[('bright' + k[0].toUpperCase() + k.slice(1))] ?? x[k]; }
-    }
-    if (x.brightBlack) b[8] = x.brightBlack;
-    return { base: b, defaultFg: surface.tfg, defaultBg: surface.tbg };
-  })());
+  let surface = $derived(defaultSurface(bg));
   function setBg(hex: string) {
     bg = hex; customBg = hex;
     prefs.save({ theme: { bg: hex } });
@@ -301,7 +279,7 @@
     <div class="bar"><span class="ttl">THUMBMUX · DEMO</span><span class="count">{names.length}</span></div>
     <SessionGrid
       sessions={gridSessions}
-      palette={PALETTE}
+      palette={surface.palette}
       onOpen={openSession}
       onNew={() => { launchError = null; launchOpen = true; }}
       emptyLabel="No tmux sessions yet — tap + terminal"
@@ -340,7 +318,7 @@
           <DesktopKeys bind:focused={desktopKeysFocused} onKeys={sendKeys} ariaLabel={`Terminal ${session}`}>
             <TermView
               bind:this={termRef}
-              {session} palette={termPalette} {fontPx}
+              {session} palette={surface.palette} {fontPx}
               bottomInsetPx={terminalBottomInset}
               claimGeometry={!termUsesAltScreenMouse}
               altScreenMouse={termUsesAltScreenMouse}
@@ -353,7 +331,7 @@
         {:else}
           <TermView
             bind:this={termRef}
-            {session} palette={termPalette} {fontPx}
+            {session} palette={surface.palette} {fontPx}
             bottomInsetPx={terminalBottomInset}
             claimGeometry={!termUsesAltScreenMouse}
             altScreenMouse={termUsesAltScreenMouse}
