@@ -109,6 +109,12 @@
   const HISTORY_BATCH_LINES = 2000;
   const HISTORY_PARSE_CHUNK_LINES = 300;
   const HISTORY_LINK_SEAM_LINES = 12;
+  const HISTORY_GAP_LINK_ROWS = 128;
+  const HISTORY_RETAINED_ROW_BUDGET = 10_000;
+  const HISTORY_RETAINED_BYTE_BUDGET = 8 * 1024 * 1024;
+  // Deterministic heap estimate for array slots, two full SGR state objects,
+  // and per-row bookkeeping. String payloads are counted separately below.
+  const HISTORY_ROW_OVERHEAD_BYTES = 384;
   const ARCHIVE_OFFSET_START = 1 << 26;
   const MOMENTUM_TAU = 520;
   const MOMENTUM_GAIN = 1.25;
@@ -127,6 +133,11 @@
   let htmlCache: string[] = [];          // rendered html per line
   let stateBefore: SgrState[] = [];      // sgr state before each line
   let stateAfter: SgrState[] = [];        // sgr state after each line
+  let rawEntryState: SgrState = createSgrState();
+  // When newer archived rows are evicted, the retained archive and live tail
+  // have a gap. Preserve the renderer state on the live side of that gap.
+  let liveGapEntryState: SgrState | null = null;
+  let retainedEstimatedBytes = $state(0);
   let total = $state(0);
   let connected = $state(false);
   let archiveBeforeLine: number | null = null;
@@ -202,6 +213,7 @@
 
   type PrependStage = {
     seq: number;
+    startLine: number | null;
     lines: string[];
     html: string[];
     entryStates: SgrState[];
@@ -504,11 +516,23 @@
   function rebuildAllLinks() {
     linksByLine = new Array(rawLines.length);
     const cols = lastPushedCols > 0 ? lastPushedCols : 60;
-    try {
-      for (const match of collectTerminalUrlSegments(rawLines, 0, rawLines.length, cols)) {
+    const collect = (lines: string[], targetOffset: number) => {
+      for (const match of collectTerminalUrlSegments(lines, 0, lines.length, cols)) {
         for (const seg of match.segments) {
-          (linksByLine[seg.lineIdx] ??= []).push({ start: seg.startCol, end: seg.endCol, href: match.url });
+          (linksByLine[targetOffset + seg.lineIdx] ??= []).push({
+            start: seg.startCol,
+            end: seg.endCol,
+            href: match.url,
+          });
         }
+      }
+    };
+    try {
+      if (liveGapEntryState && liveLines.length > 0) {
+        collect(archivedLines, 0);
+        collect(liveLines, archivedLines.length);
+      } else {
+        collect(rawLines, 0);
       }
     } catch { /* never break rendering over a link parse */ }
   }
@@ -558,24 +582,191 @@
     return { batchLinks, seamLinks };
   }
 
-  function linksAfterPrepend(stage: PrependStage): (LineLinkRange[] | undefined)[] {
-    const count = stage.lines.length;
-    const next: (LineLinkRange[] | undefined)[] = new Array(rawLines.length + count);
-    for (let i = 0; i < count; i++) next[i] = stage.linkPlan.batchLinks[i];
-    for (let i = 0; i < linksByLine.length; i++) {
-      const links = linksByLine[i];
-      if (links?.length) next[i + count] = links;
+  function prependColumn<T>(target: T[], values: T[]): void {
+    // Bound argument expansion even if a peer violates HISTORY_BATCH_LINES.
+    for (let end = values.length; end > 0;) {
+      const start = Math.max(0, end - HISTORY_PARSE_CHUNK_LINES);
+      target.splice(0, 0, ...values.slice(start, end));
+      end = start;
     }
+  }
+
+  function prependLinks(stage: PrependStage): void {
+    const count = stage.lines.length;
+    prependColumn(linksByLine, stage.linkPlan.batchLinks);
     for (const [existingOffset, links] of stage.linkPlan.seamLinks) {
       const idx = count + existingOffset;
-      if (idx >= count && idx < next.length) next[idx] = mergeLineLinks(links, next[idx]);
+      if (idx >= count && idx < linksByLine.length) {
+        linksByLine[idx] = mergeLineLinks(links, linksByLine[idx]);
+      }
     }
-    return next;
+  }
+
+  function estimatedLineStorageBytes(
+    raw: string,
+    html: string,
+    links: LineLinkRange[] | undefined,
+  ): number {
+    let bytes = HISTORY_ROW_OVERHEAD_BYTES + 2 * (raw.length + html.length);
+    if (links) {
+      for (const link of links) bytes += 64 + 2 * link.href.length;
+    }
+    return bytes;
+  }
+
+  function recalculateRetainedEstimatedBytes(): void {
+    let bytes = 0;
+    for (let i = 0; i < rawLines.length; i++) {
+      bytes += estimatedLineStorageBytes(
+        rawLines[i] ?? '',
+        htmlCache[i] ?? '',
+        linksByLine[i],
+      );
+    }
+    retainedEstimatedBytes = bytes;
+  }
+
+  type PrependRetentionPlan = {
+    keepFrom: number;
+    evictArchivedFrom: number;
+  };
+
+  function planPrependRetention(stage: PrependStage): PrependRetentionPlan {
+    let stageBytes = 0;
+    for (let i = 0; i < stage.lines.length; i++) {
+      stageBytes += estimatedLineStorageBytes(
+        stage.lines[i] ?? '',
+        stage.html[i] ?? '',
+        stage.linkPlan.batchLinks[i],
+      );
+    }
+
+    let projectedRows = rawLines.length + stage.lines.length;
+    let projectedBytes = retainedEstimatedBytes + stageBytes;
+
+    // History replies arrive while the reader is at (or searching toward) the
+    // old end of the archive. Prefer evicting the newest archived suffix below
+    // the mounted viewport+overscan so the incoming older page remains usable.
+    const protectedExistingEnd = Math.min(archivedLines.length, winEnd);
+    let evictArchivedFrom = archivedLines.length;
+    while (evictArchivedFrom > protectedExistingEnd && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      evictArchivedFrom--;
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        rawLines[evictArchivedFrom] ?? '',
+        htmlCache[evictArchivedFrom] ?? '',
+        linksByLine[evictArchivedFrom],
+      );
+    }
+
+    // A page can itself exceed the byte budget (or the protected/live suffix
+    // can leave too little room). In that case discard only as much of the
+    // incoming oldest prefix as is necessary; existing mounted rows stay safe.
+    let keepFrom = 0;
+    while (keepFrom < stage.lines.length && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        stage.lines[keepFrom] ?? '',
+        stage.html[keepFrom] ?? '',
+        stage.linkPlan.batchLinks[keepFrom],
+      );
+      keepFrom++;
+    }
+    return { keepFrom, evictArchivedFrom };
+  }
+
+  function slicePrependStage(stage: PrependStage, keepFrom: number): PrependStage {
+    if (keepFrom === 0) return stage;
+    return {
+      ...stage,
+      lines: stage.lines.slice(keepFrom),
+      html: stage.html.slice(keepFrom),
+      entryStates: stage.entryStates.slice(keepFrom),
+      exitStates: stage.exitStates.slice(keepFrom),
+      linkPlan: {
+        batchLinks: stage.linkPlan.batchLinks.slice(keepFrom),
+        seamLinks: stage.linkPlan.seamLinks,
+      },
+    };
+  }
+
+  /** Remove an archived suffix that is strictly below the mounted window.
+   * The live tail stays retained; its SGR entry checkpoint bridges the gap. */
+  function evictArchivedTail(from: number): number {
+    const archiveLength = archivedLines.length;
+    const evicted = Math.max(0, archiveLength - Math.max(0, from));
+    if (evicted === 0) return 0;
+
+    if (liveLines.length > 0) {
+      const liveEntry = stateBefore[archiveLength];
+      if (liveEntry) liveGapEntryState = cloneSgrState(liveEntry);
+    }
+
+    archivedLines.splice(from, evicted);
+    rawLines.splice(from, evicted);
+    htmlCache.splice(from, evicted);
+    stateBefore.splice(from, evicted);
+    stateAfter.splice(from, evicted);
+    linksByLine.splice(from, evicted);
+
+    // Removing rows below the reader lowers maxOffset. Reduce bottomOffset by
+    // the same height so scrollTop, transform, and mounted content stay fixed.
+    bottomOffsetPx = Math.max(0, bottomOffsetPx - evicted * lineH);
+    return evicted;
+  }
+
+  function dropRetainedPrependPrefix(count: number): void {
+    if (count <= 0) return;
+    const nextEntryState = stateBefore[count]
+      ? cloneSgrState(stateBefore[count])
+      : cloneSgrState(rawEntryState);
+    archivedLines.splice(0, count);
+    rawLines.splice(0, count);
+    htmlCache.splice(0, count);
+    stateBefore.splice(0, count);
+    stateAfter.splice(0, count);
+    linksByLine.splice(0, count);
+    rawEntryState = nextEntryState;
+    archiveOffset += count;
+    winStart = Math.max(0, winStart - count);
+    winEnd = Math.max(0, winEnd - count);
+  }
+
+  function tailEvictionStartForCurrentBudget(protectedEnd: number): number {
+    let projectedRows = rawLines.length;
+    let projectedBytes = retainedEstimatedBytes;
+    let from = archivedLines.length;
+    const minimum = Math.min(from, Math.max(0, protectedEnd));
+    while (from > minimum && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      from--;
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        rawLines[from] ?? '',
+        htmlCache[from] ?? '',
+        linksByLine[from],
+      );
+    }
+    return from;
   }
 
   function rebuildFrom(idx: number) {
-    let st: SgrState = idx > 0 ? cloneSgrState(stateAfter[idx - 1]) : createSgrState();
+    const gapIndex = liveGapEntryState ? archivedLines.length : -1;
+    let st: SgrState = gapIndex === idx && liveGapEntryState
+      ? cloneSgrState(liveGapEntryState)
+      : idx > 0
+        ? cloneSgrState(stateAfter[idx - 1])
+        : cloneSgrState(rawEntryState);
     for (let i = idx; i < rawLines.length; i++) {
+      if (i === gapIndex && liveGapEntryState) st = cloneSgrState(liveGapEntryState);
       stateBefore[i] = cloneSgrState(st);
       htmlCache[i] = lineToHtml(rawLines[i], st, palette, linksByLine[i]);
       stateAfter[i] = cloneSgrState(st);
@@ -583,11 +774,14 @@
     htmlCache.length = rawLines.length;
     stateBefore.length = rawLines.length;
     stateAfter.length = rawLines.length;
+    recalculateRetainedEstimatedBytes();
   }
 
   function reconcileExistingFrom(idx: number, entryState: SgrState): number {
     let st = cloneSgrState(entryState);
+    const gapIndex = liveGapEntryState ? archivedLines.length : -1;
     for (let i = idx; i < rawLines.length; i++) {
+      if (i === gapIndex && liveGapEntryState) st = cloneSgrState(liveGapEntryState);
       const cachedEntry = stateBefore[i];
       if (cachedEntry && sgrStateKey(st) === sgrStateKey(cachedEntry)) return i;
       stateBefore[i] = cloneSgrState(st);
@@ -608,6 +802,41 @@
     for (const existingOffset of stage.linkPlan.seamLinks.keys()) {
       rerenderLineWithCachedEntry(count + existingOffset);
     }
+  }
+
+  /** Clear link metadata that used to cross an evicted archive/live seam, then
+   * rebuild only the bounded continuation corridor on each side of the gap. */
+  function rebuildGapLinkSeam(): void {
+    if (!liveGapEntryState || liveLines.length === 0) return;
+    const gapIndex = archivedLines.length;
+    const clearStart = Math.max(0, gapIndex - HISTORY_GAP_LINK_ROWS);
+    const clearEnd = Math.min(rawLines.length, gapIndex + HISTORY_GAP_LINK_ROWS);
+    for (let i = clearStart; i < clearEnd; i++) linksByLine[i] = undefined;
+
+    const cols = lastPushedCols > 0 ? lastPushedCols : 60;
+    const collect = (lines: string[], targetOffset: number) => {
+      for (const match of collectTerminalUrlSegments(lines, 0, lines.length, cols)) {
+        for (const seg of match.segments) {
+          const idx = targetOffset + seg.lineIdx;
+          if (idx < clearStart || idx >= clearEnd) continue;
+          addLinkRange(linksByLine, idx, {
+            start: seg.startCol,
+            end: seg.endCol,
+            href: match.url,
+          });
+        }
+      }
+    };
+
+    try {
+      // Scan one additional max-continuation corridor so a valid link whose
+      // origin is just before clearStart can restore its retained segments.
+      const archiveScanStart = Math.max(0, clearStart - HISTORY_GAP_LINK_ROWS);
+      collect(archivedLines.slice(archiveScanStart), archiveScanStart);
+      collect(liveLines.slice(0, HISTORY_GAP_LINK_ROWS * 2), gapIndex);
+    } catch { /* malformed link text must not break history commit */ }
+
+    for (let i = clearStart; i < clearEnd; i++) rerenderLineWithCachedEntry(i);
   }
 
   function commitLines(next: string[], opts: {
@@ -907,18 +1136,45 @@
       return;
     }
 
-    const lineCount = stage.lines.length;
+    const receivedLineCount = stage.lines.length;
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
     const currentFirstState = stateBefore[0] ? cloneSgrState(stateBefore[0]) : createSgrState();
     const existingCacheValid = sgrStateKey(stage.endState) === sgrStateKey(currentFirstState);
 
-    archivedLines = [...stage.lines, ...archivedLines];
-    rawLines = [...stage.lines, ...rawLines];
-    htmlCache = [...stage.html, ...htmlCache];
-    stateBefore = [...stage.entryStates, ...stateBefore];
-    stateAfter = [...stage.exitStates, ...stateAfter];
-    linksByLine = linksAfterPrepend(stage);
+    const retention = planPrependRetention(stage);
+    const retainedStage = slicePrependStage(stage, retention.keepFrom);
+    let droppedIncomingPrefix = retention.keepFrom;
+    let lineCount = retainedStage.lines.length;
+
+    if (lineCount === 0) {
+      if (stage.startLine !== null) {
+        const reloadBeforeLine = stage.startLine + droppedIncomingPrefix;
+        if (Number.isSafeInteger(reloadBeforeLine)) {
+          archiveBeforeLine = reloadBeforeLine;
+        }
+      }
+      archiveExhausted = true;
+      const shouldRerun = settleArchiveContinuationRequest('committed');
+      if (searchQuery && shouldRerun) requestSearchRerun(activeIdentity);
+      finishArchiveRequest();
+      return;
+    }
+
+    // This suffix is below the mounted window by construction. Removing it
+    // makes room for the newly requested older page without losing the rows
+    // the reader is looking at (or turning page N into a no-op at the cap).
+    const gapChanged = evictArchivedTail(retention.evictArchivedFrom) > 0;
+
+    // Mutate the bounded columns in place: no prepend allocates/copies every
+    // accumulated row into a new array. Work is capped by the retained budget.
+    prependColumn(archivedLines, retainedStage.lines);
+    prependColumn(rawLines, retainedStage.lines);
+    prependColumn(htmlCache, retainedStage.html);
+    prependColumn(stateBefore, retainedStage.entryStates);
+    prependColumn(stateAfter, retainedStage.exitStates);
+    prependLinks(retainedStage);
+    rawEntryState = cloneSgrState(retainedStage.entryStates[0] ?? stage.endState);
 
     archiveOffset -= lineCount;
     total = rawLines.length;
@@ -926,7 +1182,72 @@
     winEnd += lineCount;
 
     if (!existingCacheValid) reconcileExistingFrom(lineCount, stage.endState);
-    rerenderPrependSeam(stage);
+    rerenderPrependSeam(retainedStage);
+    if (gapChanged) rebuildGapLinkSeam();
+    recalculateRetainedEstimatedBytes();
+
+    // Reconciliation can enlarge HTML (for example a persistent SGR state).
+    // Enforce the byte cap again using only rows below the protected window.
+    const postRenderTailStart = tailEvictionStartForCurrentBudget(winEnd);
+    if (postRenderTailStart < archivedLines.length) {
+      evictArchivedTail(postRenderTailStart);
+      rebuildGapLinkSeam();
+      total = rawLines.length;
+      recalculateRetainedEstimatedBytes();
+    }
+
+    // If the live/protected suffix leaves insufficient room, trim more of the
+    // incoming prefix. It is entirely above the pre-existing mounted window.
+    let extraPrefix = 0;
+    let projectedRows = rawLines.length;
+    let projectedBytes = retainedEstimatedBytes;
+    while (extraPrefix < lineCount && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        rawLines[extraPrefix] ?? '',
+        htmlCache[extraPrefix] ?? '',
+        linksByLine[extraPrefix],
+      );
+      extraPrefix++;
+    }
+    if (extraPrefix > 0) {
+      dropRetainedPrependPrefix(extraPrefix);
+      droppedIncomingPrefix += extraPrefix;
+      lineCount -= extraPrefix;
+      total = rawLines.length;
+      recalculateRetainedEstimatedBytes();
+    }
+
+    if (droppedIncomingPrefix > 0 && stage.startLine !== null) {
+      const reloadBeforeLine = stage.startLine + droppedIncomingPrefix;
+      if (Number.isSafeInteger(reloadBeforeLine)) {
+        archiveBeforeLine = reloadBeforeLine;
+        archiveExhausted = false;
+      }
+    }
+
+    if (lineCount === 0) {
+      // A page rejected in full must not recolor/relink retained rows through
+      // an invisible SGR/URL transition. Keep any safe off-window eviction,
+      // restore the retained model from its previous entry checkpoint, and do
+      // not emit a zero-row prepend event.
+      rawEntryState = currentFirstState;
+      archiveExhausted = true;
+      rebuildAllLinks();
+      rebuildFrom(0);
+      total = rawLines.length;
+      contentEpoch++;
+      applyScroll();
+      if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
+      emitScrollState();
+      const shouldRerun = settleArchiveContinuationRequest('committed');
+      if (searchQuery && shouldRerun) requestSearchRerun(activeIdentity);
+      finishArchiveRequest();
+      return;
+    }
 
     contentEpoch++;
     applyScroll();
@@ -936,13 +1257,13 @@
       console.assert(
         before.transform === after.transform,
         'TermView history prepend changed the scroll transform',
-        { before: before.transform, after: after.transform, lineCount },
+        { before: before.transform, after: after.transform, lineCount, receivedLineCount },
       );
     }
     requestAnimationFrame(() => {
       emitHistoryPrependEvent(lineCount, existingCacheValid, before, after);
     });
-    onLinesChange?.(rawLines, { source: 'prepend' });
+    if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
     emitScrollState();
     const shouldRerun = settleArchiveContinuationRequest('committed');
     if (searchQuery || shouldRerun) {
@@ -955,7 +1276,7 @@
     enqueuePrependWork(() => commitStagedPrepend(stage));
   }
 
-  function stageHistoryPrepend(lines: string[]) {
+  function stageHistoryPrepend(lines: string[], startLine: number | null) {
     if (lines.length === 0) {
       finishArchiveRequest('empty');
       return;
@@ -985,6 +1306,7 @@
       const endState = cloneSgrState(st);
       schedulePrependCommit({
         seq,
+        startLine,
         lines: batch,
         html,
         entryStates,
@@ -1027,15 +1349,18 @@
 
     const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
     const lines = history.lines;
-    if (typeof history.startLine === 'number') archiveBeforeLine = history.startLine;
-    archiveExhausted = !history.hasMore || lines.length === 0;
+    const historyStartLine = typeof history.startLine === 'number' ? history.startLine : null;
+    archiveBeforeLine = historyStartLine;
+    // A nonempty page without a numeric cursor can be rendered once, but it
+    // cannot be advanced safely: requesting before null would duplicate it.
+    archiveExhausted = historyStartLine === null || !history.hasMore || lines.length === 0;
     if (lines.length === 0) {
       const settlement = archiveExhausted ? 'exhausted' : 'empty';
       finishArchiveRequest(settlement);
       return;
     }
 
-    stageHistoryPrepend(lines);
+    stageHistoryPrepend(lines, historyStartLine);
   }
 
   function applyArchivedHistory(data: string) {
@@ -1946,6 +2271,8 @@
   class="mtv"
   data-testid="mtv"
   data-total={total}
+  data-retained-estimated-bytes={retainedEstimatedBytes}
+  data-retained-byte-budget={HISTORY_RETAINED_BYTE_BUDGET}
   data-bottom-offset={settledBottomOffsetPx}
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}

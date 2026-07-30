@@ -98,6 +98,7 @@ let frameCallbacks = new Map<number, FrameRequestCallback>();
 let nextIdleId = 1;
 let idleCallbacks = new Map<number, IdleRequestCallback>();
 let historyRequestCount = 0;
+let historyRequests: Array<{ beforeLine?: number | null; limit?: number }> = [];
 
 function requestControlledFrame(callback: FrameRequestCallback): number {
   const id = nextFrameId++;
@@ -231,9 +232,12 @@ function deliverOutput(lineCount: number): void {
   sessionCallback(data, "output", null, { source: "full", replace: true });
 }
 
-function deliverHistory(lines: string[]): void {
+function deliverHistory(
+  lines: string[],
+  { startLine = 0, hasMore = false }: { startLine?: number; hasMore?: boolean } = {},
+): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
-  sessionCallback(JSON.stringify({ lines, startLine: 0, hasMore: false }), "history");
+  sessionCallback(JSON.stringify({ lines, startLine, hasMore }), "history");
 }
 
 async function prepareScrollableTermView(
@@ -350,6 +354,96 @@ function mountedLineKeys(viewport: HTMLElement): number[] {
   }).sort((a, b) => a - b);
 }
 
+function mountedLineContent(viewport: HTMLElement): Map<number, string> {
+  return new Map(Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"), (row) => {
+    const value = row.getAttribute("data-line-id");
+    if (value === null) throw new Error("mounted terminal row is missing data-line-id");
+    const key = Number(value);
+    if (!Number.isFinite(key)) throw new Error(`invalid terminal row key: ${value}`);
+    const content = (row.textContent ?? "")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t]+$/g, "");
+    return [key, content] as const;
+  }));
+}
+
+function expectMountedContentPreserved(
+  before: Map<number, string>,
+  viewport: HTMLElement,
+): void {
+  const after = mountedLineContent(viewport);
+  for (const [key, content] of before) {
+    expect(after.get(key)).toBe(content);
+  }
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) throw new Error("cannot take the median of an empty sample");
+  const ordered = [...values].sort((a, b) => a - b);
+  return ordered[Math.floor(ordered.length / 2)]!;
+}
+
+/** Request, parse, and commit one history page under the controlled schedulers.
+ * The history-prepend event is queued by commitStagedPrepend itself, so the
+ * final idle batch before that event is the commit cost (not an ANSI slice). */
+function prependHistoryPage(
+  viewport: HTMLElement,
+  lines: string[],
+  initialUpperBound: number,
+  beforeDeliver?: () => void,
+): { commitNs: number; lineCount: number; startLine: number } {
+  const requestsBefore = historyRequestCount;
+  wheelTowardHistory(viewport, -1_000_000);
+  if (historyRequestCount !== requestsBefore + 1) {
+    throw new Error("history page was delivered without a matching request");
+  }
+  const request = historyRequests.at(-1);
+  const upperBound = typeof request?.beforeLine === "number"
+    ? request.beforeLine
+    : initialUpperBound;
+  const startLine = upperBound - lines.length;
+  beforeDeliver?.();
+
+  let committed = false;
+  let committedLineCount = -1;
+  const onPrepend = (event: Event) => {
+    committed = true;
+    committedLineCount = Number((event as CustomEvent<{ lineCount?: number }>).detail?.lineCount);
+  };
+  viewport.addEventListener("thumbmux-history-prepend", onPrepend);
+  deliverHistory(lines, { startLine, hasMore: true });
+
+  let lastIdleBatchNs = 0;
+  let batches = 0;
+  try {
+    while (!committed && batches < 100) {
+      let progressed = false;
+      if (idleCallbacks.size > 0) {
+        const started = process.hrtime.bigint();
+        runIdleCallbackBatch();
+        lastIdleBatchNs = Number(process.hrtime.bigint() - started);
+        progressed = true;
+      }
+      if (frameCallbacks.size > 0) {
+        runAnimationFrameBatch();
+        progressed = true;
+      }
+      if (!progressed) break;
+      batches++;
+    }
+  } finally {
+    viewport.removeEventListener("thumbmux-history-prepend", onPrepend);
+  }
+
+  if (!committed) throw new Error("history prepend did not commit");
+  if (lastIdleBatchNs <= 0) throw new Error("history prepend commit was not timed");
+  if (!Number.isSafeInteger(committedLineCount) || committedLineCount < 0) {
+    throw new Error("history prepend event did not report a valid retained line count");
+  }
+  drainScheduledWork();
+  return { commitNs: lastIdleBatchNs, lineCount: committedLineCount, startLine };
+}
+
 function visibleLineKeyBounds(
   viewport: HTMLElement,
   bottomOffset: number,
@@ -440,6 +534,7 @@ beforeEach(() => {
   nextIdleId = 1;
   idleCallbacks = new Map();
   historyRequestCount = 0;
+  historyRequests = [];
 
   originalSubscribe = tmuxMux.subscribe;
   originalRequestHistory = tmuxMux.requestHistory;
@@ -449,8 +544,9 @@ beforeEach(() => {
       if (sessionCallback === callback) sessionCallback = null;
     };
   }) as typeof tmuxMux.subscribe;
-  tmuxMux.requestHistory = (() => {
+  tmuxMux.requestHistory = ((_session: string, beforeLine?: number | null, limit?: number) => {
     historyRequestCount++;
+    historyRequests.push({ beforeLine, limit });
   }) as typeof tmuxMux.requestHistory;
 
   originalResizeObserver = globalThis.ResizeObserver;
@@ -870,4 +966,114 @@ describe("TermView history prepend scheduling", () => {
       baselineArchiveOffset - historyLines.length,
     );
   });
+});
+
+describe("TermView retained history budgets", () => {
+  test("page 150 commit stays within 3x page 10 after repeated prepends", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    const durations: number[] = [];
+
+    for (let page = 1; page <= 152; page++) {
+      const lines = Array.from(
+        { length: 500 },
+        (_, row) => `history-page-${page}-row-${row}`,
+      );
+      const committed = prependHistoryPage(
+        viewport,
+        lines,
+        1_000_000,
+      );
+      if (committed.lineCount !== lines.length) {
+        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
+      }
+      durations.push(committed.commitNs);
+    }
+
+    // Medians centred on the requested pages suppress GC/timer noise while
+    // preserving the page-10 versus page-150 asymptotic comparison.
+    const page10Ns = median(durations.slice(7, 12));
+    const page150Ns = median(durations.slice(147, 152));
+    expect(page150Ns / page10Ns).toBeLessThanOrEqual(3);
+  }, 120_000);
+
+  test("200 pages of 500 rows stay capped without evicting the mounted window", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    let finalWindow = new Map<number, string>();
+    let finalStartLine = -1;
+    const cappedTotals: number[] = [];
+
+    for (let page = 1; page <= 200; page++) {
+      const lines = Array.from(
+        { length: 500 },
+        (_, row) => `retained-page-${page}-row-${row}`,
+      );
+      let mountedBefore = new Map<number, string>();
+      const committed = prependHistoryPage(
+        viewport,
+        lines,
+        2_000_000,
+        page >= 20
+          ? () => { mountedBefore = mountedLineContent(viewport); }
+          : undefined,
+      );
+      if (committed.lineCount !== lines.length) {
+        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
+      }
+      if (page >= 20) {
+        expectMountedContentPreserved(mountedBefore, viewport);
+        cappedTotals.push(Number(viewport.getAttribute("data-total")));
+      }
+      if (page === 200) {
+        finalWindow = mountedBefore;
+        finalStartLine = committed.startLine;
+      }
+    }
+
+    expect(cappedTotals.length).toBeGreaterThan(0);
+    expect(cappedTotals.every((rows) => rows === 10_000)).toBe(true);
+    expect(finalWindow.size).toBeGreaterThan(60);
+
+    // The retained page remains reachable at the top, and the next request
+    // advances from its start instead of refetching/discarding the same page.
+    wheelTowardHistory(viewport, -1_000_000);
+    expect(Array.from(mountedLineContent(viewport).values()).some(
+      (content) => content.startsWith("retained-page-200-row-"),
+    )).toBe(true);
+    expect(historyRequests.at(-1)?.beforeLine).toBe(finalStartLine);
+  }, 120_000);
+
+  test("oversized history rows are bounded by bytes before the row cap", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    let mountedBefore = new Map<number, string>();
+    const longLines = Array.from(
+      { length: 500 },
+      (_, row) => `wide-history-${row}-${"x".repeat(12_000)}`,
+    );
+
+    const committed = prependHistoryPage(
+      viewport,
+      longLines,
+      3_000_000,
+      () => { mountedBefore = mountedLineContent(viewport); },
+    );
+
+    // 740 rows is below the row cap, so this can only pass when the byte
+    // budget evicts part of the oversized page.
+    const retainedRows = Number(viewport.getAttribute("data-total"));
+    const retainedBytes = Number(viewport.getAttribute("data-retained-estimated-bytes"));
+    const byteBudget = Number(viewport.getAttribute("data-retained-byte-budget"));
+    expect(committed.lineCount).toBeGreaterThan(0);
+    expect(committed.lineCount).toBeLessThan(longLines.length);
+    expect(retainedRows).toBeGreaterThan(240);
+    expect(retainedRows).toBeLessThan(740);
+    expect(byteBudget).toBe(8 * 1024 * 1024);
+    expect(retainedBytes).toBeGreaterThan(0);
+    expect(retainedBytes).toBeLessThanOrEqual(byteBudget);
+    expectMountedContentPreserved(mountedBefore, viewport);
+
+    wheelTowardHistory(viewport, -1_000_000);
+    expect(Array.from(mountedLineContent(viewport).values()).some(
+      (content) => content.startsWith("wide-history-"),
+    )).toBe(true);
+  }, 120_000);
 });
