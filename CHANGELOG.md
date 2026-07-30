@@ -23,10 +23,15 @@ The first two changes close data-loss bugs:
    and no longer calls `onUploaded` with empty values.
 3. **A custom `TmuxDriver`, session-list provider, or session filter may stop
    compiling.**
-   `listSessions()` returns `SessionListItem[]` instead of `unknown[]`, and
-   `activityAt` is required, so a TypeScript host that returns rows without it now
-   fails to typecheck. Runtime is unaffected; add the field from your own activity
-   source, or `0` if you have none.
+   `listSessions()` returns `SessionListItem[]` instead of `unknown[]`. Two
+   different causes, with different remedies:
+   - `activityAt` is required — add it from your own activity source, or `0` if you
+     have none.
+   - `SessionListItem` carries an index signature, so a row typed as an `interface`
+     fails with TS2322 "Index signature for type 'string' is missing" even when every
+     field is present. Use a type alias, add an index signature, or cast. Inferred
+     object literals — including the package's own `createBunTmuxDriver` — are fine.
+   Runtime is unaffected either way; this is a typecheck-time break only.
 4. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
    flips, not on every offset change, and no callback reports the initial state. A
    host that mirrored the raw offset from this callback must read it another way.
@@ -61,16 +66,22 @@ The first two changes close data-loss bugs:
 10. **Security and notification docs now contain concrete integration examples**
     using the shipped package subpaths. They demonstrate the available building
     blocks, not an end-to-end authentication or push service supplied by thumbmux.
-11. **Session activity now reaches the reference hub end to end.** Typed
+### Reference host — not part of the package
+
+These describe the reference application that consumes thumbmux, not the package
+itself. Nothing here changes what you install; they are recorded so the release is
+complete, not because a consumer must act on them.
+
+- **Session activity now reaches the reference hub end to end.** Typed
     `attached`/`activityAt` values flow through REST bootstrap and WebSocket pushes,
     and the hub consumes the pushed rows. REST bootstrap makes at most one cold
     activity/attachment attempt, remembers even an empty sample, and then relies on
     normal mux polling for refreshes; its enrichment reuses the same session listing.
-12. **A fresh reference-host database no longer advertises standalone
-    `kem-distill-engine` runtime fields.** Existing databases are deliberately not
+- **A fresh reference-host database no longer advertises standalone
+    a retired internal service runtime fields.** Existing databases are deliberately not
     migrated. Production uses the in-process path; an executable legacy fallback
     remains if that flag is unset and points at a service that no longer exists.
-13. **The reference Bun host now forwards `websocket.drain` to
+- **The reference Bun host now forwards `websocket.drain` to
     `mux.handleDrain`.** The README, demo, and runbook document and exercise that
     backpressure recovery fast path.
 
@@ -136,7 +147,8 @@ out as a point measurement.
   work guard now carries the bounded per-page-cost claim. Rows in the viewport plus
   overscan are never evicted, even if they alone exceed the budget. The completed
   retention work covers live captures too, marks every retained-data discontinuity,
-  preserves archive rows already traversed, and stores derived render state sparsely.
+  preserves archive rows already traversed **on archive prepends**, and stores
+  derived render state sparsely.
 
 ### TermView — bounded live retention and sparse rendering
 
@@ -154,7 +166,7 @@ copy, or `onLinesChange`, and the pseudo-element itself is not selectable.
 
 At saturation, a prepend can discard the oldest prefix of the incoming page but
 cannot evict archive rows the reader already traversed. The request gate also
-stops older-history fetches when either retained budget is full, even if a later
+stops older-history fetches when the retained-row budget is full, even if a later
 live tick resets archive exhaustion.
 
 Persistent row storage is raw content/link data plus sparse SGR checkpoints and

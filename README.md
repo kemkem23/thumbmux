@@ -560,7 +560,7 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] `filterSessionList` hook on every session-list delivery path
 - [x] All-or-nothing multi-file uploads; quadratic wrapped-URL + capture-overlap fixes
 
-**Current v0.6.0 source (not published as `v0.6.0-dist`)**
+**v0.7.0 — plug-and-play, finished (shipped)**
 - [x] `FileHistoryArchive` and `createSpawnHandler` exported — no longer host-only code
 - [x] `SessionListItem` typed and documented, with `activityAt` (no extra tmux call)
 - [x] Prompt-scan matchers are pluggable
