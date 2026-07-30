@@ -1,0 +1,190 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { extractRecentPrompts } from "@thumbmux/core";
+import { flushSync, mount, tick, unmount } from "./svelte-client";
+
+import PromptsPanel from "../src/PromptsPanel.svelte";
+
+type PromptsPanelProps = {
+  prompts?: string[];
+  loading?: boolean;
+  onPick: (prompt: string) => void;
+  labels?: { title: string; loading: string; none: string };
+};
+
+type Mounted = {
+  app: Record<string, unknown>;
+  target: HTMLElement;
+};
+
+const mounted: Mounted[] = [];
+
+function mountPromptsPanel(overrides: Partial<PromptsPanelProps> = {}): Mounted {
+  const target = document.createElement("div");
+  document.body.appendChild(target);
+
+  const props: PromptsPanelProps = {
+    onPick: () => {},
+    ...overrides,
+  };
+
+  let app!: Record<string, unknown>;
+  try {
+    flushSync(() => {
+      app = mount(PromptsPanel, { target, props }) as Record<string, unknown>;
+    });
+  } catch (error) {
+    target.remove();
+    throw error;
+  }
+
+  const entry = { app, target };
+  mounted.push(entry);
+  return entry;
+}
+
+function recentPromptsFromPane(): string[] {
+  return extractRecentPrompts([
+    "\x1b[1m\u203a\x1b[0m inspect the websocket reconnect path",
+    "\u2022 response one",
+    "\u276f add coverage for the touch controls",
+    "\u273b response two",
+    "\u203a verify the third callback payload",
+    "\u25cf response three",
+    "\u276f explain the release boundary",
+    "\u2022 response four",
+    "\u203a summarize the final diff",
+    "\u25cf response five",
+  ], { targetCount: 5 });
+}
+
+function promptAuthorStyle(prompt: HTMLButtonElement): CSSStyleDeclaration {
+  const scopeClass = Array.from(prompt.classList).find((name) => name.startsWith("svelte-"));
+  if (!scopeClass) throw new Error("mounted prompt has no Svelte scope class");
+
+  const expectedSelector = `.prompt.${scopeClass}`;
+  for (const sheet of Array.from(document.styleSheets)) {
+    let rules: CSSRule[];
+    try {
+      rules = Array.from(sheet.cssRules);
+    } catch {
+      continue;
+    }
+
+    for (const rule of rules) {
+      const styleRule = rule as CSSStyleRule;
+      const selectors = styleRule.selectorText?.split(",").map((selector) => selector.trim());
+      if (selectors?.includes(expectedSelector) && styleRule.style) return styleRule.style;
+    }
+  }
+
+  throw new Error(`mounted stylesheet has no ${expectedSelector} rule`);
+}
+
+afterEach(() => {
+  while (mounted.length > 0) {
+    const entry = mounted.pop()!;
+    try {
+      unmount(entry.app);
+    } catch {
+      // already torn down
+    }
+    entry.target.remove();
+  }
+});
+
+describe("PromptsPanel", () => {
+  test("mounts as a real Svelte component", async () => {
+    let result: Mounted | undefined;
+
+    expect(() => {
+      result = mountPromptsPanel();
+    }).not.toThrow();
+    await tick();
+
+    expect(result?.target.querySelectorAll('[data-testid="prompts-panel"]')).toHaveLength(1);
+  });
+
+  test("renders every extracted prompt in recency order", async () => {
+    const prompts = recentPromptsFromPane();
+    expect(prompts).toHaveLength(5);
+
+    const { target } = mountPromptsPanel({ prompts });
+    await tick();
+
+    const rows = Array.from(
+      target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'),
+    );
+    expect(rows).toHaveLength(prompts.length);
+    expect(rows.map((row) => row.textContent ?? "")).toEqual(prompts);
+  });
+
+  test("passes the DOM-selected third prompt to onPick exactly once", async () => {
+    const picked: string[] = [];
+    const { target } = mountPromptsPanel({
+      prompts: recentPromptsFromPane(),
+      onPick: (prompt) => picked.push(prompt),
+    });
+    await tick();
+
+    const rows = Array.from(
+      target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'),
+    );
+    const selected = rows[2];
+    if (!selected) throw new Error("PromptsPanel did not render a third prompt");
+    const selectedTextFromDom = selected.textContent ?? "";
+
+    flushSync(() => selected.click());
+    await tick();
+
+    expect(picked).toEqual([selectedTextFromDom]);
+  });
+
+  test("renders the empty state without a ghost prompt row", async () => {
+    let result: Mounted | undefined;
+
+    expect(() => {
+      result = mountPromptsPanel({ prompts: [] });
+    }).not.toThrow();
+    await tick();
+
+    expect(result?.target.querySelectorAll('[data-testid="prompts-panel"]')).toHaveLength(1);
+    expect(result?.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(0);
+    expect(result?.target.querySelector(".pnone")?.textContent).toBe("no prompts found yet");
+  });
+
+  test("preserves long, ANSI-derived, and Thai prompt text under the two-line layout clamp", async () => {
+    const longThaiPrompt = "\u0e17\u0e14\u0e2a\u0e2d\u0e1a".repeat(110);
+    const prompts = extractRecentPrompts([
+      "\x1b[1m\u203a\x1b[0m \x1b[36mANSI-coloured prompt\x1b[0m",
+      "\u2022 response one",
+      `\u276f ${longThaiPrompt}`,
+      "\u273b response two",
+      "\u203a \u0e0a\u0e48\u0e27\u0e22\u0e15\u0e23\u0e27\u0e08\u0e01\u0e32\u0e23\u0e41\u0e2a\u0e14\u0e07\u0e1c\u0e25\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22\u0e43\u0e19\u0e41\u0e1c\u0e07\u0e19\u0e35\u0e49",
+      "\u25cf response three",
+    ], { targetCount: 3 });
+    expect(prompts).toHaveLength(3);
+
+    const { target } = mountPromptsPanel({ prompts });
+    await tick();
+
+    const rows = Array.from(
+      target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'),
+    );
+    const rendered = rows.map((row) => row.textContent ?? "");
+
+    expect(rows).toHaveLength(prompts.length);
+    expect(rendered).toEqual(prompts);
+    expect(rows.every((row) => row.childElementCount === 0)).toBe(true);
+    expect(rendered.some((text) => text.includes("\x1b"))).toBe(false);
+    expect(rendered.some((text) => /\p{Script=Thai}/u.test(text))).toBe(true);
+
+    const producerTruncatedPrompt = rendered.find((text) => text.endsWith("..."));
+    expect(producerTruncatedPrompt?.length).toBe(500);
+
+    const authorStyle = promptAuthorStyle(rows[0]!);
+    expect(authorStyle.getPropertyValue("min-height").trim()).toBe("44px");
+    expect(authorStyle.getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
+    expect(authorStyle.getPropertyValue("-webkit-box-orient").trim()).toBe("vertical");
+    expect(authorStyle.getPropertyValue("overflow").trim()).toBe("hidden");
+  });
+});
