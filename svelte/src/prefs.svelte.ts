@@ -20,6 +20,33 @@ function writeCache(key: string, prefs: ThumbmuxPrefs) {
   try { localStorage.setItem(key, JSON.stringify(prefs)); } catch { /* quota/private mode */ }
 }
 
+function createQueuedEmitter(
+  key: string,
+  subs: Set<(p: ThumbmuxPrefs) => void>,
+  beforeEmit?: () => void,
+): (prefs: ThumbmuxPrefs) => void {
+  const queued: ThumbmuxPrefs[] = [];
+  let emitting = false;
+
+  return (prefs) => {
+    queued.push(prefs);
+    if (emitting) return;
+    emitting = true;
+    try {
+      while (queued.length > 0) {
+        const next = queued.shift()!;
+        beforeEmit?.();
+        writeCache(key, next);
+        // Queue instead of dropping reentrant saves: every subscriber finishes
+        // one snapshot before the next begins, without recursive notification.
+        for (const cb of subs) cb(next);
+      }
+    } finally {
+      emitting = false;
+    }
+  };
+}
+
 function isPrefsSnapshot(value: unknown): value is ThumbmuxPrefs {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -37,12 +64,12 @@ function canRefreshCache(cached: ThumbmuxPrefs, fresh: ThumbmuxPrefs): boolean {
 
 export function createLocalPrefs(key = 'thumbmux-prefs'): PreferencesAdapter {
   const subs = new Set<(p: ThumbmuxPrefs) => void>();
+  const emit = createQueuedEmitter(key, subs);
   return {
     async load() { return readCache(key); },
     async save(patch) {
       const next = mergePrefs(readCache(key), patch);
-      writeCache(key, next);
-      for (const cb of subs) cb(next);
+      emit(next);
     },
     subscribe(cb) { subs.add(cb); return () => subs.delete(cb); },
   };
@@ -57,10 +84,11 @@ export function createServerPrefs(opts: {
   const { url, cacheKey = 'thumbmux-prefs-cache' } = opts;
   const doFetch = opts.fetchFn ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const subs = new Set<(p: ThumbmuxPrefs) => void>();
-  const emit = (p: ThumbmuxPrefs) => { writeCache(cacheKey, p); for (const cb of subs) cb(p); };
-  // bump on every save so an in-flight background GET can't clobber newer
-  // local state with a stale server snapshot
+  // Each load gets a ticket, and every applied GET/optimistic save/PUT settle
+  // advances the mutation epoch. A response ticketed before a later mutation
+  // can therefore never overwrite that newer cache/subscriber snapshot.
   let generation = 0;
+  const emit = createQueuedEmitter(cacheKey, subs, () => { generation++; });
   type PendingPut = { patch: Partial<ThumbmuxPrefs>; body: string };
   let committed: ThumbmuxPrefs = {};
   const pendingPuts: PendingPut[] = [];
@@ -71,34 +99,37 @@ export function createServerPrefs(opts: {
   );
 
   async function runPut(pending: PendingPut): Promise<void> {
-    let accepted = false;
-    let saved: unknown = null;
+    let response: Response | undefined;
     try {
-      const r = await doFetch(url, {
+      response = await doFetch(url, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: pending.body,
       });
-      if (r.ok) {
-        accepted = true;
-        saved = await r.json().catch(() => null);
-      }
     } catch { /* network failure — remove this optimistic patch below */ }
 
-    if (accepted) {
-      // A successful endpoint normally returns the authoritative snapshot.
-      // Preserve the prior optimistic behavior if a 2xx response has no JSON.
-      committed = isPrefsSnapshot(saved) ? saved : mergePrefs(committed, pending.patch);
+    let invalidResponse: Error | undefined;
+    if (response?.ok) {
+      let saved: unknown;
+      try { saved = await response.json(); } catch { /* validated below */ }
+      if (isPrefsSnapshot(saved)) {
+        committed = saved;
+      } else {
+        invalidResponse = new Error(
+          'Invalid preferences response: expected a JSON object',
+        );
+      }
     }
     const index = pendingPuts.indexOf(pending);
     if (index !== -1) pendingPuts.splice(index, 1);
     emit(projectPending());
+    if (invalidResponse) throw invalidResponse;
   }
 
   return {
     async load() {
       const cached = readCache(cacheKey);
-      const gen = generation;
+      const gen = ++generation;
       // refresh in the background — subscribers get the authoritative copy
       doFetch(url).then(async (r) => {
         if (!r.ok || generation !== gen) return;
@@ -114,7 +145,6 @@ export function createServerPrefs(opts: {
       return cached;
     },
     async save(patch) {
-      generation++;
       if (pendingPuts.length === 0) committed = readCache(cacheKey);
       // deletes must survive JSON transport: undefined → null (RFC 7386 style)
       const wire: Record<string, unknown> = {};

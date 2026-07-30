@@ -93,6 +93,27 @@ function trackedBackgroundFetch(
   return { fetchFn, calls, done: completed.promise };
 }
 
+function trackedContinuation<T>(source: Promise<T>): { promise: Promise<T>; done: Promise<void> } {
+  const completed = deferred<void>();
+  const thenable = {
+    then(
+      onFulfilled?: ((value: T) => unknown) | null,
+      onRejected?: ((reason: unknown) => unknown) | null,
+    ): Promise<unknown> {
+      const chain = source.then(onFulfilled ?? undefined, onRejected ?? undefined);
+      void chain.then(
+        () => completed.resolve(),
+        () => completed.resolve(),
+      );
+      return chain;
+    },
+  };
+  return {
+    promise: thenable as unknown as Promise<T>,
+    done: completed.promise,
+  };
+}
+
 afterEach(() => {
   restoreGlobal("fetch", originalFetchDescriptor);
   restoreGlobal("localStorage", originalStorageDescriptor);
@@ -339,6 +360,153 @@ describe("createServerPrefs", () => {
     });
   });
 
+  test("discards a GET started during a pending PUT after that PUT settles", async () => {
+    const key = cacheKey("put-then-stale-get");
+    const cached = seedCache(key);
+    const patch: Partial<ThumbmuxPrefs> = {
+      fontPx: Number(cached.fontPx) + 5,
+      clientRevision: Number(cached.cacheRevision) + 1,
+    };
+    const authoritative = {
+      ...mergePrefs(cached, patch),
+      serverRevision: Number(cached.cacheRevision) + 2,
+    };
+    const stale = {
+      ...cached,
+      serverRevision: Number(cached.cacheRevision),
+    };
+    const putResponse = deferred<Response>();
+    const getResponse = deferred<Response>();
+    const trackedGet = trackedContinuation(getResponse.promise);
+    const putStarted = deferred<void>();
+    const requestMethods: string[] = [];
+    const fetchFn = ((_: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const method = init?.method ?? "GET";
+      requestMethods.push(method);
+      if (method === "PUT") {
+        putStarted.resolve();
+        return putResponse.promise;
+      }
+      return trackedGet.promise;
+    }) as typeof fetch;
+    const adapter = createServerPrefs({
+      url: `/prefs/${key}`,
+      cacheKey: key,
+      fetchFn,
+    });
+    const emissions: ThumbmuxPrefs[] = [];
+    let visible = cached;
+    adapter.subscribe?.((prefs) => {
+      emissions.push(prefs);
+      visible = prefs;
+    });
+
+    const saving = adapter.save(patch);
+    await putStarted.promise;
+    const loadedWhilePutWasPending = await adapter.load();
+
+    putResponse.resolve(Response.json(authoritative));
+    await saving;
+    getResponse.resolve(Response.json(stale));
+    await trackedGet.done;
+
+    expect(requestMethods).toEqual(["PUT", "GET"]);
+    expect(loadedWhilePutWasPending.fontPx).toBe(patch.fontPx);
+    expect(emissions).toHaveLength(2);
+    expect({ visible, stored: readStoredPrefs(key) }).toEqual({
+      visible: authoritative,
+      stored: authoritative,
+    });
+  });
+
+  test("does not let an older concurrent GET overwrite a newer GET snapshot", async () => {
+    const key = cacheKey("concurrent-loads");
+    const cached = seedCache(key);
+    const older = {
+      ...cached,
+      fontPx: Number(cached.fontPx) + 1,
+      serverRevision: Number(cached.cacheRevision) + 1,
+    };
+    const newer = {
+      ...cached,
+      fontPx: Number(cached.fontPx) + 2,
+      serverRevision: Number(cached.cacheRevision) + 2,
+    };
+    const responseGates = [deferred<Response>(), deferred<Response>()];
+    const trackedResponses = responseGates.map((gate) => trackedContinuation(gate.promise));
+    let requestCount = 0;
+    const fetchFn = (() => {
+      const response = trackedResponses[requestCount++];
+      if (!response) throw new Error("unexpected extra GET");
+      return response.promise;
+    }) as typeof fetch;
+    const adapter = createServerPrefs({
+      url: `/prefs/${key}`,
+      cacheKey: key,
+      fetchFn,
+    });
+    const emissions: ThumbmuxPrefs[] = [];
+    let visible = cached;
+    adapter.subscribe?.((prefs) => {
+      emissions.push(prefs);
+      visible = prefs;
+    });
+
+    await Promise.all([adapter.load(), adapter.load()]);
+    responseGates[1]!.resolve(Response.json(newer));
+    await trackedResponses[1]!.done;
+    responseGates[0]!.resolve(Response.json(older));
+    await trackedResponses[0]!.done;
+
+    expect(requestCount).toBe(2);
+    expect(emissions).toHaveLength(1);
+    expect({ visible, stored: readStoredPrefs(key) }).toEqual({
+      visible: newer,
+      stored: newer,
+    });
+  });
+
+  for (const malformed of [
+    {
+      name: "an empty body",
+      response: () => new Response("", { status: 200 }),
+    },
+    {
+      name: "an array snapshot",
+      response: () => Response.json([{ fontPx: 99 }]),
+    },
+  ]) {
+    test(`rolls back and rejects a successful PUT with ${malformed.name}`, async () => {
+      const key = cacheKey("malformed-put");
+      const cached = seedCache(key);
+      const patch: Partial<ThumbmuxPrefs> = {
+        fontPx: Number(cached.fontPx) + 7,
+      };
+      const adapter = createServerPrefs({
+        url: `/prefs/${key}`,
+        cacheKey: key,
+        fetchFn: (async () => malformed.response()) as typeof fetch,
+      });
+      const emissions: ThumbmuxPrefs[] = [];
+      let visible = cached;
+      adapter.subscribe?.((prefs) => {
+        emissions.push(prefs);
+        visible = prefs;
+      });
+
+      const saving = adapter.save(patch);
+      await expect(saving).rejects.toThrow(
+        "Invalid preferences response: expected a JSON object",
+      );
+
+      expect(emissions).toHaveLength(2);
+      expect({ visible, stored: readStoredPrefs(key) }).toEqual({
+        visible: cached,
+        stored: cached,
+      });
+    });
+  }
+
   test("uses fetchFn without touching the global fetch transport", async () => {
     const key = cacheKey("fetch-override");
     const cached = seedCache(key);
@@ -436,4 +604,59 @@ describe("createLocalPrefs", () => {
       rawAfter: rawBefore,
     });
   });
+
+  for (const kind of ["local", "server"] as const) {
+    test(`queues reentrant ${kind} subscriber emissions without nested callbacks`, async () => {
+      const key = cacheKey(`reentrant-${kind}`);
+      const cached = seedCache(key);
+      let serverSnapshot = cached;
+      const adapter = kind === "local"
+        ? createLocalPrefs(key)
+        : createServerPrefs({
+            url: `/prefs/${key}`,
+            cacheKey: key,
+            fetchFn: (async (_input, init) => {
+              const patch = JSON.parse(String(init?.body)) as Partial<ThumbmuxPrefs>;
+              serverSnapshot = mergePrefs(serverSnapshot, patch);
+              return Response.json(serverSnapshot);
+            }) as typeof fetch,
+          });
+      const firstFontPx = Number(cached.fontPx) + 1;
+      const trace: string[] = [];
+      const nestedSaves: Promise<void>[] = [];
+      let callbackDepth = 0;
+      let maxCallbackDepth = 0;
+      let reentrantSaveCount = 0;
+      const stopMutator = adapter.subscribe?.((prefs) => {
+        callbackDepth += 1;
+        maxCallbackDepth = Math.max(maxCallbackDepth, callbackDepth);
+        trace.push(`mutator:${String(prefs.fontPx)}`);
+        if (reentrantSaveCount < 3) {
+          reentrantSaveCount += 1;
+          nestedSaves.push(adapter.save({ fontPx: Number(prefs.fontPx) + 1 }));
+        }
+        callbackDepth -= 1;
+      });
+      const stopObserver = adapter.subscribe?.((prefs) => {
+        trace.push(`observer:${String(prefs.fontPx)}`);
+      });
+
+      const outerSave = adapter.save({ fontPx: firstFontPx });
+      stopMutator?.();
+      stopObserver?.();
+      await Promise.all([outerSave, ...nestedSaves]);
+
+      expect(maxCallbackDepth).toBe(1);
+      expect(trace).toEqual([
+        `mutator:${firstFontPx}`,
+        `observer:${firstFontPx}`,
+        `mutator:${firstFontPx + 1}`,
+        `observer:${firstFontPx + 1}`,
+        `mutator:${firstFontPx + 2}`,
+        `observer:${firstFontPx + 2}`,
+        `mutator:${firstFontPx + 3}`,
+        `observer:${firstFontPx + 3}`,
+      ]);
+    });
+  }
 });
