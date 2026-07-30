@@ -89,9 +89,9 @@ describe("UploadAction", () => {
     expect(input.multiple).toBe(true);
   });
 
-  test("uses the endpoint prop, uploads every selected file, and reports server paths", async () => {
+  test("uses the endpoint prop, uploads every selected file, and falls back to the prop dir", async () => {
     const endpoint = "/tenant/acme/attachments";
-    const dir = "remote-artifacts";
+    const fallbackDir = "remote-artifacts";
     const storedByServer: UploadedFile[] = [
       { original: "alpha note.txt", stored: "srv-a81_alpha-note.txt" },
       { original: "diagram.png", stored: "srv-b29_diagram.png" },
@@ -111,7 +111,7 @@ describe("UploadAction", () => {
 
     const { input } = mountUploadAction({
       endpoint,
-      dir,
+      dir: fallbackDir,
       onUploaded: (message, files) => {
         const result = { message, files };
         uploadResults.push(result);
@@ -136,8 +136,38 @@ describe("UploadAction", () => {
     expect(uploadResults).toHaveLength(1);
     expect(result.files).toEqual(storedByServer);
     for (const stored of storedByServer) {
-      expect(result.message).toContain(`${dir}/${stored.stored}`);
+      expect(result.message).toContain(`${fallbackDir}/${stored.stored}`);
     }
+  });
+
+  test("prefers the server dir over the fallback dir in the uploaded message", async () => {
+    const fallbackDir = "stale-client-dir";
+    const serverDir = "server-owned-dir";
+    const storedByServer: UploadedFile = {
+      original: "report.txt",
+      stored: "srv-report.txt",
+    };
+    const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
+
+    replaceFetch((async () =>
+      Response.json(
+        { ok: true, files: [storedByServer], dir: serverDir },
+        { status: 201 },
+      )) as typeof fetch);
+
+    const { app } = mountUploadAction({
+      dir: fallbackDir,
+      onUploaded: (message, files) => uploadResults.push({ message, files }),
+    });
+
+    await (app as UploadActionInstance).uploadFiles([
+      new File(["payload"], "report.txt", { type: "text/plain" }),
+    ]);
+
+    expect(uploadResults).toHaveLength(1);
+    expect(uploadResults[0]?.files).toEqual([storedByServer]);
+    expect(uploadResults[0]?.message).toContain(`${serverDir}/${storedByServer.stored}`);
+    expect(uploadResults[0]?.message).not.toContain(`${fallbackDir}/${storedByServer.stored}`);
   });
 
   for (const response of [

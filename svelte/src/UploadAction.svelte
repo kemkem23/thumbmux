@@ -14,11 +14,11 @@
     onError,
   }: {
     endpoint?: string;
-    /** display prefix used in the prefill message */
+    /** fallback prefix for prefill paths when the upload response omits `dir` */
     dir?: string;
     accept?: string;
     busy?: boolean;
-    /** message = formatUploadMessage(files, dir) — prefill your composer */
+    /** message uses the response `dir`, falling back to the `dir` prop */
     onUploaded: (message: string, files: UploadedFile[]) => void;
     onError: (message: string) => void;
   } = $props();
@@ -51,7 +51,8 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const stored: UploadedFile[] = data?.files ?? [];
-      onUploaded(formatUploadMessage(stored, dir), stored);
+      const messageDir = data?.dir ?? dir;
+      onUploaded(formatUploadMessage(stored, messageDir), stored);
     } catch (e: any) {
       onError(String(e?.message ?? e));
     } finally {
