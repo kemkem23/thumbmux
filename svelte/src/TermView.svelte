@@ -112,9 +112,13 @@
   const HISTORY_GAP_LINK_ROWS = 128;
   const HISTORY_RETAINED_ROW_BUDGET = 10_000;
   const HISTORY_RETAINED_BYTE_BUDGET = 8 * 1024 * 1024;
-  // Deterministic heap estimate for array slots, two full SGR state objects,
-  // and per-row bookkeeping. String payloads are counted separately below.
-  const HISTORY_ROW_OVERHEAD_BYTES = 384;
+  // The authorized 100k-row Chrome benchmark chose 300 over 256 to retain
+  // fewer states while keeping measured cold-window rebuild p95 below 1 ms.
+  const SGR_CHECKPOINT_INTERVAL = 300;
+  // Raw/archive/link array slots, string header, and the amortized sparse SGR
+  // checkpoint. Rendered HTML and per-line entry states exist only for the
+  // bounded DOM window and are not retained per history row.
+  const HISTORY_ROW_OVERHEAD_BYTES = 64;
   const ARCHIVE_OFFSET_START = 1 << 26;
   const MOMENTUM_TAU = 520;
   const MOMENTUM_GAIN = 1.25;
@@ -130,14 +134,25 @@
   let rawLines: string[] = [];
   let liveLines: string[] = [];
   let archivedLines: string[] = [];
-  let htmlCache: string[] = [];          // rendered html per line
-  let stateBefore: SgrState[] = [];      // sgr state before each line
-  let stateAfter: SgrState[] = [];        // sgr state after each line
+  let htmlCache = new Map<number, string>();
+  let renderEntryStates = new Map<number, SgrState>();
+  let sgrCheckpoints = new Map<number, SgrState>(); // state before sparse row
+  // Older discontinuities move inside archivedLines when another safe middle
+  // cut is needed. Keep only one SGR entry checkpoint and count per such gap;
+  // raw terminal rows and rendered HTML remain absent.
+  let archivedRetentionGaps = new Map<number, { rowCount: number; entryState: SgrState }>();
   let rawEntryState: SgrState = createSgrState();
   // When newer archived rows are evicted, the retained archive and live tail
   // have a gap. Preserve the renderer state on the live side of that gap.
   let liveGapEntryState: SgrState | null = null;
+  // Presentation-only metadata for that gap. It never enters rawLines, render
+  // caches, search/copy, byte accounting, or onLinesChange payloads.
+  let gapRowIndex = $state(-1);
+  let gapRowCount = $state(0);
   let retainedEstimatedBytes = $state(0);
+  let renderCacheRows = $state(0);
+  let sgrCheckpointCount = $state(0);
+  let renderCacheBuilds = $state(0);
   let total = $state(0);
   let connected = $state(false);
   let archiveBeforeLine: number | null = null;
@@ -185,6 +200,7 @@
   let archiveContinuationState: ArchiveContinuationState = createArchiveContinuationState();
 
   let touching = false;
+  let preparingMomentum = false;
   let selectionActive = false; // native text selection in progress — scroll yields
   let momentumFrame: number | null = null;
   let springFrame: number | null = null;
@@ -201,6 +217,7 @@
   let pendingContentFlushFrame: number | null = null;
   let paletteRefreshPending = false;
   let renderRefreshPending = false;
+  let renderWindowPending = false;
   let pendingPrependWork: (() => void) | null = null;
   let cancelPrependWorkTask: (() => void) | null = null;
   let prependParseSeq = 0;
@@ -215,9 +232,7 @@
     seq: number;
     startLine: number | null;
     lines: string[];
-    html: string[];
-    entryStates: SgrState[];
-    exitStates: SgrState[];
+    checkpoints: Map<number, SgrState>;
     endState: SgrState;
     linkPlan: PrependLinkPlan;
   };
@@ -459,7 +474,7 @@
 
   function cachedLineHtml(idx: number, epoch: number): string {
     void epoch;
-    const base = htmlCache[idx] ?? ' ';
+    const base = htmlCache.get(idx) ?? ' ';
     const ranges = searchLineByIndex.get(idx);
     if (!ranges || ranges.length === 0) return base;
 
@@ -468,7 +483,9 @@
 
     const rawLine = rawLines[idx];
     if (rawLine === undefined) return base;
-    const st = stateBefore[idx] ? cloneSgrState(stateBefore[idx]) : createSgrState();
+    const cachedEntry = renderEntryStates.get(idx);
+    if (!cachedEntry) return base;
+    const st = cloneSgrState(cachedEntry);
     const html = lineToHtml(rawLine, st, palette, linksByLine[idx], ranges);
     writeSparseOverlay(searchSparseCache, idx, searchGeneration, html);
     return html;
@@ -498,7 +515,7 @@
   }
 
   function busy(): boolean {
-    return touching || momentumFrame !== null || springFrame !== null;
+    return touching || preparingMomentum || momentumFrame !== null || springFrame !== null;
   }
 
   function stopInertia() {
@@ -528,12 +545,17 @@
       }
     };
     try {
-      if (liveGapEntryState && liveLines.length > 0) {
-        collect(archivedLines, 0);
-        collect(liveLines, archivedLines.length);
-      } else {
-        collect(rawLines, 0);
+      const boundaries = new Set<number>(archivedRetentionGaps.keys());
+      if (liveGapEntryState && liveLines.length > 0) boundaries.add(archivedLines.length);
+      let segmentStart = 0;
+      for (const boundary of [...boundaries].sort((a, b) => a - b)) {
+        const bounded = Math.max(segmentStart, Math.min(boundary, rawLines.length));
+        if (bounded > segmentStart) {
+          collect(rawLines.slice(segmentStart, bounded), segmentStart);
+        }
+        segmentStart = bounded;
       }
+      if (segmentStart < rawLines.length) collect(rawLines.slice(segmentStart), segmentStart);
     } catch { /* never break rendering over a link parse */ }
   }
 
@@ -604,10 +626,9 @@
 
   function estimatedLineStorageBytes(
     raw: string,
-    html: string,
     links: LineLinkRange[] | undefined,
   ): number {
-    let bytes = HISTORY_ROW_OVERHEAD_BYTES + 2 * (raw.length + html.length);
+    let bytes = HISTORY_ROW_OVERHEAD_BYTES + 2 * raw.length;
     if (links) {
       for (const link of links) bytes += 64 + 2 * link.href.length;
     }
@@ -619,7 +640,6 @@
     for (let i = 0; i < rawLines.length; i++) {
       bytes += estimatedLineStorageBytes(
         rawLines[i] ?? '',
-        htmlCache[i] ?? '',
         linksByLine[i],
       );
     }
@@ -631,12 +651,50 @@
     evictArchivedFrom: number;
   };
 
+  function recordRetentionGap(rowIndex: number, dropped: number): void {
+    if (dropped <= 0) return;
+    const extendsCurrent =
+      gapRowIndex === rowIndex ||
+      gapRowIndex === rowIndex + dropped;
+    gapRowCount = extendsCurrent ? gapRowCount + dropped : dropped;
+    gapRowIndex = rowIndex;
+  }
+
+  function clearRetentionGap(): void {
+    gapRowIndex = -1;
+    gapRowCount = 0;
+  }
+
+  function gapEntryStateAt(index: number): SgrState | null {
+    if (liveGapEntryState && index === archivedLines.length) return liveGapEntryState;
+    return archivedRetentionGaps.get(index)?.entryState ?? null;
+  }
+
+  function retentionGapRowsAt(index: number, epoch: number): number {
+    void epoch;
+    const archivedCount = archivedRetentionGaps.get(index)?.rowCount ?? 0;
+    const liveCount = index === gapRowIndex ? gapRowCount : 0;
+    return archivedCount + liveCount;
+  }
+
+  function archiveCurrentRetentionGap(): void {
+    if (gapRowIndex < 0 || gapRowCount <= 0) return;
+    const entryState = liveGapEntryState ?? (gapRowIndex === 0 ? rawEntryState : null);
+    if (!entryState) return;
+    const next = new Map(archivedRetentionGaps);
+    const existing = next.get(gapRowIndex);
+    next.set(gapRowIndex, {
+      rowCount: (existing?.rowCount ?? 0) + gapRowCount,
+      entryState: cloneSgrState(entryState),
+    });
+    archivedRetentionGaps = next;
+  }
+
   function planPrependRetention(stage: PrependStage): PrependRetentionPlan {
     let stageBytes = 0;
     for (let i = 0; i < stage.lines.length; i++) {
       stageBytes += estimatedLineStorageBytes(
         stage.lines[i] ?? '',
-        stage.html[i] ?? '',
         stage.linkPlan.batchLinks[i],
       );
     }
@@ -644,10 +702,10 @@
     let projectedRows = rawLines.length + stage.lines.length;
     let projectedBytes = retainedEstimatedBytes + stageBytes;
 
-    // History replies arrive while the reader is at (or searching toward) the
-    // old end of the archive. Prefer evicting the newest archived suffix below
-    // the mounted viewport+overscan so the incoming older page remains usable.
-    const protectedExistingEnd = Math.min(archivedLines.length, winEnd);
+    // Rows already retained may have been traversed earlier. Never destroy
+    // that known history to admit an older reply; only the incoming page may be
+    // shortened once the client-side budget is saturated.
+    const protectedExistingEnd = archivedLines.length;
     let evictArchivedFrom = archivedLines.length;
     while (evictArchivedFrom > protectedExistingEnd && (
       projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
@@ -657,7 +715,6 @@
       projectedRows--;
       projectedBytes -= estimatedLineStorageBytes(
         rawLines[evictArchivedFrom] ?? '',
-        htmlCache[evictArchivedFrom] ?? '',
         linksByLine[evictArchivedFrom],
       );
     }
@@ -673,7 +730,6 @@
       projectedRows--;
       projectedBytes -= estimatedLineStorageBytes(
         stage.lines[keepFrom] ?? '',
-        stage.html[keepFrom] ?? '',
         stage.linkPlan.batchLinks[keepFrom],
       );
       keepFrom++;
@@ -681,14 +737,194 @@
     return { keepFrom, evictArchivedFrom };
   }
 
+  function publishStorageDiagnostics(): void {
+    renderCacheRows = htmlCache.size;
+    sgrCheckpointCount = sgrCheckpoints.size;
+  }
+
+  function invalidateRenderedCache(): void {
+    htmlCache = new Map();
+    renderEntryStates = new Map();
+    renderCacheRows = 0;
+  }
+
+  function invalidateCheckpointsAfter(index: number): void {
+    for (const checkpoint of sgrCheckpoints.keys()) {
+      if (checkpoint > index) sgrCheckpoints.delete(checkpoint);
+    }
+    if (rawLines.length > 0 && !sgrCheckpoints.has(0)) {
+      sgrCheckpoints.set(0, cloneSgrState(rawEntryState));
+    }
+    sgrCheckpointCount = sgrCheckpoints.size;
+  }
+
+  function stateBeforeLine(index: number): SgrState {
+    const target = Math.max(0, Math.min(index, rawLines.length));
+    let checkpointIndex = 0;
+    let checkpointState = rawEntryState;
+    for (const [candidate, state] of sgrCheckpoints) {
+      if (candidate <= target && candidate >= checkpointIndex) {
+        checkpointIndex = candidate;
+        checkpointState = state;
+      }
+    }
+
+    for (const [gapIndex, gap] of archivedRetentionGaps) {
+      if (gapIndex >= checkpointIndex && gapIndex <= target) {
+        checkpointIndex = gapIndex;
+        checkpointState = gap.entryState;
+      }
+    }
+    const liveGapIndex = liveGapEntryState ? archivedLines.length : -1;
+    if (liveGapIndex >= checkpointIndex && liveGapIndex <= target && liveGapEntryState) {
+      checkpointIndex = liveGapIndex;
+      checkpointState = liveGapEntryState;
+    }
+    if (checkpointIndex > 0 || archivedRetentionGaps.has(0) || liveGapIndex === 0) {
+      sgrCheckpoints.set(checkpointIndex, cloneSgrState(checkpointState));
+    }
+
+    const state = cloneSgrState(checkpointState);
+    for (let i = checkpointIndex; i < target; i++) {
+      const gapEntry = gapEntryStateAt(i);
+      if (gapEntry) {
+        Object.assign(state, cloneSgrState(gapEntry));
+      }
+      if (i !== checkpointIndex && i % SGR_CHECKPOINT_INTERVAL === 0) {
+        sgrCheckpoints.set(i, cloneSgrState(state));
+      }
+      lineToHtml(rawLines[i] ?? '', state, palette);
+      if ((i + 1) % SGR_CHECKPOINT_INTERVAL === 0) {
+        sgrCheckpoints.set(i + 1, cloneSgrState(state));
+      }
+    }
+    sgrCheckpointCount = sgrCheckpoints.size;
+    return state;
+  }
+
+  function buildRenderedWindow(start: number, end: number): void {
+    const boundedStart = Math.max(0, Math.min(start, rawLines.length));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, rawLines.length));
+    const nextHtml = new Map<number, string>();
+    const nextEntries = new Map<number, SgrState>();
+    const state = stateBeforeLine(boundedStart);
+
+    for (let i = boundedStart; i < boundedEnd; i++) {
+      const gapEntry = gapEntryStateAt(i);
+      if (gapEntry) {
+        Object.assign(state, cloneSgrState(gapEntry));
+        sgrCheckpoints.set(i, cloneSgrState(state));
+      }
+      nextEntries.set(i, cloneSgrState(state));
+      nextHtml.set(i, lineToHtml(rawLines[i] ?? '', state, palette, linksByLine[i]));
+      if ((i + 1) % SGR_CHECKPOINT_INTERVAL === 0) {
+        sgrCheckpoints.set(i + 1, cloneSgrState(state));
+      }
+    }
+
+    htmlCache = nextHtml;
+    renderEntryStates = nextEntries;
+    renderCacheBuilds++;
+    renderWindowPending = false;
+    publishStorageDiagnostics();
+  }
+
+  function reindexSparseAfterRemoval(
+    start: number,
+    count: number,
+    boundaryState: SgrState | null,
+  ): void {
+    const end = start + count;
+    const nextCheckpoints = new Map<number, SgrState>();
+    for (const [index, state] of sgrCheckpoints) {
+      if (index < start) nextCheckpoints.set(index, state);
+      else if (index >= end) nextCheckpoints.set(index - count, state);
+    }
+    if (boundaryState && start <= rawLines.length) {
+      nextCheckpoints.set(start, cloneSgrState(boundaryState));
+    }
+    if (rawLines.length > 0 && !nextCheckpoints.has(0)) {
+      nextCheckpoints.set(0, cloneSgrState(rawEntryState));
+    }
+    sgrCheckpoints = nextCheckpoints;
+
+    const nextArchivedGaps = new Map<number, { rowCount: number; entryState: SgrState }>();
+    for (const [index, gap] of archivedRetentionGaps) {
+      if (index < start) nextArchivedGaps.set(index, gap);
+      else if (index >= end) nextArchivedGaps.set(index - count, gap);
+    }
+    archivedRetentionGaps = nextArchivedGaps;
+
+    const nextHtml = new Map<number, string>();
+    const nextEntries = new Map<number, SgrState>();
+    for (const [index, html] of htmlCache) {
+      if (index < start) nextHtml.set(index, html);
+      else if (index >= end) nextHtml.set(index - count, html);
+    }
+    for (const [index, state] of renderEntryStates) {
+      if (index < start) nextEntries.set(index, state);
+      else if (index >= end) nextEntries.set(index - count, state);
+    }
+    htmlCache = nextHtml;
+    renderEntryStates = nextEntries;
+    publishStorageDiagnostics();
+  }
+
+  function reindexSparseAfterPrepend(stage: PrependStage): void {
+    const count = stage.lines.length;
+    const nextCheckpoints = new Map<number, SgrState>();
+    for (const [index, state] of sgrCheckpoints) {
+      nextCheckpoints.set(index + count, state);
+    }
+    for (const [index, state] of stage.checkpoints) {
+      nextCheckpoints.set(index, cloneSgrState(state));
+    }
+    nextCheckpoints.set(count, cloneSgrState(stage.endState));
+    sgrCheckpoints = nextCheckpoints;
+
+    const nextArchivedGaps = new Map<number, { rowCount: number; entryState: SgrState }>();
+    for (const [index, gap] of archivedRetentionGaps) {
+      nextArchivedGaps.set(index + count, gap);
+    }
+    archivedRetentionGaps = nextArchivedGaps;
+
+    const nextHtml = new Map<number, string>();
+    const nextEntries = new Map<number, SgrState>();
+    for (const [index, html] of htmlCache) nextHtml.set(index + count, html);
+    for (const [index, state] of renderEntryStates) nextEntries.set(index + count, state);
+    htmlCache = nextHtml;
+    renderEntryStates = nextEntries;
+    publishStorageDiagnostics();
+  }
+
+  function stageStateBefore(stage: PrependStage, index: number): SgrState {
+    const target = Math.max(0, Math.min(index, stage.lines.length));
+    let checkpointIndex = 0;
+    let checkpointState = stage.checkpoints.get(0) ?? createSgrState();
+    for (const [candidate, state] of stage.checkpoints) {
+      if (candidate <= target && candidate >= checkpointIndex) {
+        checkpointIndex = candidate;
+        checkpointState = state;
+      }
+    }
+    const state = cloneSgrState(checkpointState);
+    for (let i = checkpointIndex; i < target; i++) {
+      lineToHtml(stage.lines[i] ?? '', state, palette);
+    }
+    return state;
+  }
+
   function slicePrependStage(stage: PrependStage, keepFrom: number): PrependStage {
     if (keepFrom === 0) return stage;
+    const checkpoints = new Map<number, SgrState>();
+    checkpoints.set(0, stageStateBefore(stage, keepFrom));
+    for (const [index, state] of stage.checkpoints) {
+      if (index > keepFrom) checkpoints.set(index - keepFrom, state);
+    }
     return {
       ...stage,
       lines: stage.lines.slice(keepFrom),
-      html: stage.html.slice(keepFrom),
-      entryStates: stage.entryStates.slice(keepFrom),
-      exitStates: stage.exitStates.slice(keepFrom),
+      checkpoints,
       linkPlan: {
         batchLinks: stage.linkPlan.batchLinks.slice(keepFrom),
         seamLinks: stage.linkPlan.seamLinks,
@@ -704,16 +940,19 @@
     if (evicted === 0) return 0;
 
     if (liveLines.length > 0) {
-      const liveEntry = stateBefore[archiveLength];
-      if (liveEntry) liveGapEntryState = cloneSgrState(liveEntry);
+      let absorbedGapRows = 0;
+      for (const [index, gap] of archivedRetentionGaps) {
+        if (index >= from && index < archiveLength) absorbedGapRows += gap.rowCount;
+      }
+      liveGapEntryState = stateBeforeLine(archiveLength);
+      recordRetentionGap(from, evicted);
+      gapRowCount += absorbedGapRows;
     }
 
     archivedLines.splice(from, evicted);
     rawLines.splice(from, evicted);
-    htmlCache.splice(from, evicted);
-    stateBefore.splice(from, evicted);
-    stateAfter.splice(from, evicted);
     linksByLine.splice(from, evicted);
+    reindexSparseAfterRemoval(from, evicted, liveGapEntryState);
 
     // Removing rows below the reader lowers maxOffset. Reduce bottomOffset by
     // the same height so scrollTop, transform, and mounted content stay fixed.
@@ -723,52 +962,64 @@
 
   function dropRetainedPrependPrefix(count: number): void {
     if (count <= 0) return;
-    const nextEntryState = stateBefore[count]
-      ? cloneSgrState(stateBefore[count])
-      : cloneSgrState(rawEntryState);
+    const nextEntryState = stateBeforeLine(count);
     const archivedCount = Math.min(count, archivedLines.length);
     const liveCount = count - archivedCount;
     archivedLines.splice(0, archivedCount);
     if (liveCount > 0) liveLines.splice(0, liveCount);
     rawLines.splice(0, count);
-    htmlCache.splice(0, count);
-    stateBefore.splice(0, count);
-    stateAfter.splice(0, count);
     linksByLine.splice(0, count);
     rawEntryState = nextEntryState;
+    reindexSparseAfterRemoval(0, count, nextEntryState);
     if (archivedLines.length === 0) liveGapEntryState = null;
     archiveOffset += count;
     winStart = Math.max(0, winStart - count);
     winEnd = Math.max(0, winEnd - count);
+    if (gapRowIndex >= 0) gapRowIndex = Math.max(0, gapRowIndex - count);
   }
 
-  /** Remove the oldest rows strictly below the mounted viewport+overscan while
-   * retaining the newest live tail. The two retained sides become the archive
-   * and live segments, with an explicit SGR checkpoint across their gap. */
+  /** Drop the oldest live rows immediately below the archive/live seam while
+   * retaining the newest live tail and its exact SGR entry state. */
+  function dropRetainedLivePrefix(count: number): void {
+    const bounded = Math.min(count, liveLines.length);
+    if (bounded <= 0) return;
+    const seam = archivedLines.length;
+    const suffixEntry = stateBeforeLine(seam + bounded);
+    liveLines.splice(0, bounded);
+    rawLines.splice(seam, bounded);
+    linksByLine.splice(seam, bounded);
+    liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
+    reindexSparseAfterRemoval(seam, bounded, liveGapEntryState);
+    if (liveLines.length > 0) recordRetentionGap(seam, bounded);
+    else clearRetentionGap();
+    bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
+  }
+
+  /** Split live capture around the oldest safe rows below the mounted window.
+   * The old seam becomes one sparse archived discontinuity, preserving both
+   * what the reader sees and the newest live tail across repeated cuts. */
   function dropRetainedMiddle(from: number, count: number): void {
     const start = Math.max(0, Math.min(from, rawLines.length));
     const bounded = Math.min(count, rawLines.length - start);
     if (bounded <= 0) return;
-    const suffixEntry = stateBefore[start + bounded]
-      ? cloneSgrState(stateBefore[start + bounded])
-      : null;
-    archivedLines = rawLines.slice(0, start);
-    liveLines = rawLines.slice(start + bounded);
+    const suffixEntry = stateBeforeLine(start + bounded);
+    archiveCurrentRetentionGap();
     rawLines.splice(start, bounded);
-    htmlCache.splice(start, bounded);
-    stateBefore.splice(start, bounded);
-    stateAfter.splice(start, bounded);
     linksByLine.splice(start, bounded);
-    liveGapEntryState = liveLines.length > 0 && suffixEntry ? suffixEntry : null;
-    // Removing rows below the reader lowers maxOffset. Lower bottomOffset by
-    // the same height so the mounted rows retain their exact transform.
+    archivedLines = rawLines.slice(0, start);
+    liveLines = rawLines.slice(start);
+    liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
+    reindexSparseAfterRemoval(start, bounded, liveGapEntryState);
+    if (liveGapEntryState) {
+      gapRowIndex = start;
+      gapRowCount = bounded;
+    } else clearRetentionGap();
     bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
-    if (liveGapEntryState) rebuildGapLinkSeam();
   }
 
   /** Enforce the same row/byte limits for live captures as history prepends.
    * The mounted window (including overscan) is inviolate: discard oldest rows
-   * above it first, then only an unmounted suffix if more room is required. */
+   * above it first, then the oldest safely representable rows below it. */
   function enforceLiveRetention(): void {
     let projectedRows = rawLines.length;
     let projectedBytes = retainedEstimatedBytes;
@@ -782,7 +1033,6 @@
       projectedRows--;
       projectedBytes -= estimatedLineStorageBytes(
         rawLines[prefixCount] ?? '',
-        htmlCache[prefixCount] ?? '',
         linksByLine[prefixCount],
       );
       prefixCount++;
@@ -790,85 +1040,126 @@
 
     if (prefixCount > 0) dropRetainedPrependPrefix(prefixCount);
 
-    let middleCount = 0;
     const protectedEnd = Math.max(0, Math.min(winEnd, rawLines.length));
-    while (protectedEnd + middleCount < rawLines.length && (
-      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
-      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
-    )) {
-      projectedRows--;
-      projectedBytes -= estimatedLineStorageBytes(
-        rawLines[protectedEnd + middleCount] ?? '',
-        htmlCache[protectedEnd + middleCount] ?? '',
-        linksByLine[protectedEnd + middleCount],
+    let lowerCount = 0;
+    if (protectedEnd <= archivedLines.length) {
+      const archiveLength = archivedLines.length;
+      let archiveFrom = archiveLength;
+      while (archiveFrom > protectedEnd && (
+        projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+        projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+      )) {
+        archiveFrom--;
+        projectedRows--;
+        projectedBytes -= estimatedLineStorageBytes(
+          rawLines[archiveFrom] ?? '',
+          linksByLine[archiveFrom],
+        );
+        lowerCount++;
+      }
+      let livePrefixCount = 0;
+      while (livePrefixCount < liveLines.length && (
+        projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+        projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+      )) {
+        const idx = archiveLength + livePrefixCount;
+        projectedRows--;
+        projectedBytes -= estimatedLineStorageBytes(
+          rawLines[idx] ?? '',
+          linksByLine[idx],
+        );
+        livePrefixCount++;
+        lowerCount++;
+      }
+      if (archiveFrom < archiveLength) evictArchivedTail(archiveFrom);
+      if (livePrefixCount > 0) dropRetainedLivePrefix(livePrefixCount);
+      if (lowerCount > 0 && liveGapEntryState) rebuildGapLinkSeam();
+    } else {
+      let middleEnd = protectedEnd;
+      // Keep a small newest overlap tail so the next capture can merge at the
+      // server head even if the protected rows themselves consume the budget.
+      const middleLimit = Math.max(
+        protectedEnd,
+        rawLines.length - HISTORY_LINK_SEAM_LINES,
       );
-      middleCount++;
+      while (middleEnd < middleLimit && (
+        projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+        projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+      )) {
+        projectedRows--;
+        projectedBytes -= estimatedLineStorageBytes(
+          rawLines[middleEnd] ?? '',
+          linksByLine[middleEnd],
+        );
+        middleEnd++;
+        lowerCount++;
+      }
+      if (lowerCount > 0) dropRetainedMiddle(protectedEnd, lowerCount);
     }
 
-    if (middleCount > 0) dropRetainedMiddle(protectedEnd, middleCount);
-    if (prefixCount > 0 || middleCount > 0) {
+    if (prefixCount > 0 || lowerCount > 0) {
       total = rawLines.length;
       recalculateRetainedEstimatedBytes();
     }
   }
 
-  function tailEvictionStartForCurrentBudget(protectedEnd: number): number {
-    let projectedRows = rawLines.length;
-    let projectedBytes = retainedEstimatedBytes;
-    let from = archivedLines.length;
-    const minimum = Math.min(from, Math.max(0, protectedEnd));
-    while (from > minimum && (
-      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
-      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
-    )) {
-      from--;
-      projectedRows--;
-      projectedBytes -= estimatedLineStorageBytes(
-        rawLines[from] ?? '',
-        htmlCache[from] ?? '',
-        linksByLine[from],
-      );
-    }
-    return from;
+  function tailEvictionStartForCurrentBudget(_protectedEnd: number): number {
+    // Sparse checkpoint/window reconstruction does not change retained bytes,
+    // and retained archive rows are immutable at this stage. The caller's
+    // incoming-prefix pass handles any excess without reopening a hole below
+    // the reader.
+    return archivedLines.length;
   }
 
   function rebuildFrom(idx: number) {
-    const gapIndex = liveGapEntryState ? archivedLines.length : -1;
-    let st: SgrState = gapIndex === idx && liveGapEntryState
-      ? cloneSgrState(liveGapEntryState)
-      : idx > 0
-        ? cloneSgrState(stateAfter[idx - 1])
-        : cloneSgrState(rawEntryState);
-    for (let i = idx; i < rawLines.length; i++) {
-      if (i === gapIndex && liveGapEntryState) st = cloneSgrState(liveGapEntryState);
-      stateBefore[i] = cloneSgrState(st);
-      htmlCache[i] = lineToHtml(rawLines[i], st, palette, linksByLine[i]);
-      stateAfter[i] = cloneSgrState(st);
+    if (idx <= 0) {
+      sgrCheckpoints = rawLines.length > 0
+        ? new Map([[0, cloneSgrState(rawEntryState)]])
+        : new Map();
+      sgrCheckpointCount = sgrCheckpoints.size;
+    } else {
+      invalidateCheckpointsAfter(idx);
     }
-    htmlCache.length = rawLines.length;
-    stateBefore.length = rawLines.length;
-    stateAfter.length = rawLines.length;
+    invalidateRenderedCache();
     recalculateRetainedEstimatedBytes();
   }
 
   function reconcileExistingFrom(idx: number, entryState: SgrState): number {
-    let st = cloneSgrState(entryState);
-    const gapIndex = liveGapEntryState ? archivedLines.length : -1;
-    for (let i = idx; i < rawLines.length; i++) {
-      if (i === gapIndex && liveGapEntryState) st = cloneSgrState(liveGapEntryState);
-      const cachedEntry = stateBefore[i];
-      if (cachedEntry && sgrStateKey(st) === sgrStateKey(cachedEntry)) return i;
-      stateBefore[i] = cloneSgrState(st);
-      htmlCache[i] = lineToHtml(rawLines[i], st, palette, linksByLine[i]);
-      stateAfter[i] = cloneSgrState(st);
+    const previous = new Map(sgrCheckpoints);
+    for (const checkpoint of sgrCheckpoints.keys()) {
+      if (checkpoint >= idx) sgrCheckpoints.delete(checkpoint);
     }
+    const state = cloneSgrState(entryState);
+    sgrCheckpoints.set(idx, cloneSgrState(state));
+    for (let i = idx; i < rawLines.length; i++) {
+      const gapEntry = gapEntryStateAt(i);
+      if (gapEntry) {
+        Object.assign(state, cloneSgrState(gapEntry));
+      }
+      const cachedEntry = previous.get(i);
+      if (i > idx && cachedEntry && sgrStateKey(state) === sgrStateKey(cachedEntry)) {
+        for (const [checkpoint, checkpointState] of previous) {
+          if (checkpoint >= i) sgrCheckpoints.set(checkpoint, checkpointState);
+        }
+        sgrCheckpointCount = sgrCheckpoints.size;
+        return i;
+      }
+      if (i === idx || i % SGR_CHECKPOINT_INTERVAL === 0) {
+        sgrCheckpoints.set(i, cloneSgrState(state));
+      }
+      lineToHtml(rawLines[i] ?? '', state, palette);
+    }
+    sgrCheckpoints.set(rawLines.length, cloneSgrState(state));
+    sgrCheckpointCount = sgrCheckpoints.size;
     return rawLines.length;
   }
 
   function rerenderLineWithCachedEntry(idx: number) {
     if (idx < 0 || idx >= rawLines.length) return;
-    const st = stateBefore[idx] ? cloneSgrState(stateBefore[idx]) : createSgrState();
-    htmlCache[idx] = lineToHtml(rawLines[idx], st, palette, linksByLine[idx]);
+    const cachedEntry = renderEntryStates.get(idx);
+    if (!cachedEntry || !htmlCache.has(idx)) return;
+    const state = cloneSgrState(cachedEntry);
+    htmlCache.set(idx, lineToHtml(rawLines[idx], state, palette, linksByLine[idx]));
   }
 
   function rerenderPrependSeam(stage: PrependStage) {
@@ -1090,6 +1381,10 @@
 
   function requestOlderHistory(): boolean {
     if (archiveLoading || archiveExhausted) return false;
+    if (
+      rawLines.length >= HISTORY_RETAINED_ROW_BUDGET ||
+      retainedEstimatedBytes >= HISTORY_RETAINED_BYTE_BUDGET
+    ) return false;
     const requestId = ++archiveRequestSeq;
     archiveInflightRequestId = requestId;
     archiveLoading = true;
@@ -1218,7 +1513,7 @@
     const receivedLineCount = stage.lines.length;
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
-    const currentFirstState = stateBefore[0] ? cloneSgrState(stateBefore[0]) : createSgrState();
+    const currentFirstState = cloneSgrState(rawEntryState);
     const existingCacheValid = sgrStateKey(stage.endState) === sgrStateKey(currentFirstState);
 
     const retention = planPrependRetention(stage);
@@ -1249,24 +1544,25 @@
     // accumulated row into a new array. Work is capped by the retained budget.
     prependColumn(archivedLines, retainedStage.lines);
     prependColumn(rawLines, retainedStage.lines);
-    prependColumn(htmlCache, retainedStage.html);
-    prependColumn(stateBefore, retainedStage.entryStates);
-    prependColumn(stateAfter, retainedStage.exitStates);
     prependLinks(retainedStage);
-    rawEntryState = cloneSgrState(retainedStage.entryStates[0] ?? stage.endState);
+    reindexSparseAfterPrepend(retainedStage);
+    rawEntryState = cloneSgrState(
+      retainedStage.checkpoints.get(0) ?? retainedStage.endState,
+    );
 
     archiveOffset -= lineCount;
     total = rawLines.length;
     winStart += lineCount;
     winEnd += lineCount;
+    if (gapRowIndex >= 0) gapRowIndex += lineCount;
 
     if (!existingCacheValid) reconcileExistingFrom(lineCount, stage.endState);
     rerenderPrependSeam(retainedStage);
     if (gapChanged) rebuildGapLinkSeam();
     recalculateRetainedEstimatedBytes();
 
-    // Reconciliation can enlarge HTML (for example a persistent SGR state).
-    // Enforce the byte cap again using only rows below the protected window.
+    // Keep the post-reconciliation retention gate explicit. With window-only
+    // HTML it normally short-circuits, but it must never evict retained rows.
     const postRenderTailStart = tailEvictionStartForCurrentBudget(winEnd);
     if (postRenderTailStart < archivedLines.length) {
       evictArchivedTail(postRenderTailStart);
@@ -1287,7 +1583,6 @@
       projectedRows--;
       projectedBytes -= estimatedLineStorageBytes(
         rawLines[extraPrefix] ?? '',
-        htmlCache[extraPrefix] ?? '',
         linksByLine[extraPrefix],
       );
       extraPrefix++;
@@ -1318,6 +1613,7 @@
       rebuildAllLinks();
       rebuildFrom(0);
       total = rawLines.length;
+      rebuildWindow(visibleRowRange(bottomOffsetPx));
       contentEpoch++;
       applyScroll();
       if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
@@ -1328,6 +1624,7 @@
       return;
     }
 
+    buildRenderedWindow(winStart, winEnd);
     contentEpoch++;
     applyScroll();
     const after = historyPrependSnapshot();
@@ -1364,19 +1661,19 @@
     const seq = ++prependParseSeq;
     const batch = [...lines];
     const linkPlan = planPrependLinks(batch);
-    const html: string[] = new Array(batch.length);
-    const entryStates: SgrState[] = new Array(batch.length);
-    const exitStates: SgrState[] = new Array(batch.length);
+    const checkpoints = new Map<number, SgrState>();
     const st = createSgrState();
+    checkpoints.set(0, cloneSgrState(st));
     let idx = 0;
 
     const parseSlice = () => {
       if (seq !== prependParseSeq) return;
       const stop = Math.min(batch.length, idx + HISTORY_PARSE_CHUNK_LINES);
       for (; idx < stop; idx++) {
-        entryStates[idx] = cloneSgrState(st);
-        html[idx] = lineToHtml(batch[idx], st, palette, linkPlan.batchLinks[idx]);
-        exitStates[idx] = cloneSgrState(st);
+        if (idx % SGR_CHECKPOINT_INTERVAL === 0) {
+          checkpoints.set(idx, cloneSgrState(st));
+        }
+        lineToHtml(batch[idx], st, palette, linkPlan.batchLinks[idx]);
       }
       if (idx < batch.length) {
         enqueuePrependWork(parseSlice);
@@ -1387,9 +1684,7 @@
         seq,
         startLine,
         lines: batch,
-        html,
-        entryStates,
-        exitStates,
+        checkpoints,
         endState,
         linkPlan,
       });
@@ -1514,10 +1809,15 @@
     if (paletteRefreshPending) {
       paletteRefreshPending = false;
       if (rawLines.length) {
-        rebuildFrom(0);
+        invalidateRenderedCache();
+        buildRenderedWindow(winStart, winEnd);
         invalidateSearchOverlayHtml();
         bumpRenderEpoch = true;
       }
+    }
+    if (renderWindowPending) {
+      rebuildWindow(visibleRowRange(bottomOffsetPx));
+      bumpRenderEpoch = true;
     }
     if (renderRefreshPending) {
       renderRefreshPending = false;
@@ -1550,9 +1850,17 @@
     };
   }
 
-  function rebuildWindow({ startIdx, endIdx }: VisibleRowRange) {
-    winStart = Math.max(0, startIdx - OVERSCAN_ROWS);
-    winEnd = Math.min(total, endIdx + OVERSCAN_ROWS);
+  function rebuildWindow({ startIdx, endIdx }: VisibleRowRange, force = false): boolean {
+    const nextStart = Math.max(0, startIdx - OVERSCAN_ROWS);
+    const nextEnd = Math.min(total, endIdx + OVERSCAN_ROWS);
+    if (busy() && !force) {
+      renderWindowPending = true;
+      return false;
+    }
+    buildRenderedWindow(nextStart, nextEnd);
+    winStart = nextStart;
+    winEnd = nextEnd;
+    return true;
   }
 
   function prebuildMomentumWindow(velocity: number) {
@@ -1560,16 +1868,19 @@
     // The exponential integrator's remaining displacement is strictly less
     // than velocity * tau, so this uncapped corridor covers every normal frame.
     const projected = visibleRowRange(bottomOffsetPx + velocity * MOMENTUM_TAU);
-    winStart = Math.max(0, Math.min(
+    const nextStart = Math.max(0, Math.min(
       winStart,
       current.startIdx - OVERSCAN_ROWS,
       projected.startIdx - OVERSCAN_ROWS,
     ));
-    winEnd = Math.min(total, Math.max(
+    const nextEnd = Math.min(total, Math.max(
       winEnd,
       current.endIdx + OVERSCAN_ROWS,
       projected.endIdx + OVERSCAN_ROWS,
     ));
+    buildRenderedWindow(nextStart, nextEnd);
+    winStart = nextStart;
+    winEnd = nextEnd;
     momentumWindowFrozen = true;
   }
 
@@ -1600,7 +1911,7 @@
       // another momentum/spring frame.
       stopInertia();
       momentumWindowFrozen = false;
-      rebuildWindow({ startIdx, endIdx });
+      rebuildWindow({ startIdx, endIdx }, true);
       windowCovered = false;
     }
 
@@ -1611,7 +1922,7 @@
         momentumWindowFrozen = false;
         rebuildWindow({ startIdx, endIdx });
       } else if (!momentumWindowFrozen && outsideWindow) {
-        rebuildWindow({ startIdx, endIdx });
+        windowCovered = rebuildWindow({ startIdx, endIdx });
       }
     }
 
@@ -2070,9 +2381,12 @@
     }
     const TAU = MOMENTUM_TAU;
     vel *= MOMENTUM_GAIN;
-    prebuildMomentumWindow(vel);
-    applyScroll();
+    // The gesture is over before any cold corridor reconstruction. Momentum
+    // then consumes only the fully prepared cache until it settles.
     touching = false;
+    prebuildMomentumWindow(vel);
+    preparingMomentum = true;
+    applyScroll();
     if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * MOMENTUM_TAU);
     let lastT = performance.now();
     const step = () => {
@@ -2102,6 +2416,7 @@
       momentumFrame = requestAnimationFrame(step);
     };
     momentumFrame = requestAnimationFrame(step);
+    preparingMomentum = false;
   }
 
   // --- tmux pane ownership (measured, exact) ---
@@ -2347,12 +2662,13 @@
   $effect(() => {
     if (paletteKey !== lastPaletteKey) {
       lastPaletteKey = paletteKey;
-      if (selectionActive) {
+      if (selectionActive || busy()) {
         paletteRefreshPending = true;
         return;
       }
       if (rawLines.length) {
-        rebuildFrom(0);
+        invalidateRenderedCache();
+        buildRenderedWindow(winStart, winEnd);
         invalidateSearchOverlayHtml();
         renderEpoch++;
         applyScroll();
@@ -2386,6 +2702,10 @@
   data-total={total}
   data-retained-estimated-bytes={retainedEstimatedBytes}
   data-retained-byte-budget={HISTORY_RETAINED_BYTE_BUDGET}
+  data-sgr-checkpoint-count={sgrCheckpointCount}
+  data-sgr-checkpoint-interval={SGR_CHECKPOINT_INTERVAL}
+  data-render-cache-rows={renderCacheRows}
+  data-render-cache-builds={renderCacheBuilds}
   data-bottom-offset={settledBottomOffsetPx}
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
@@ -2432,7 +2752,13 @@
     {#key renderEpoch}
       {#each { length: winEnd - winStart } as _, i (archiveOffset + winStart + i)}
         {@const lineIdx = winStart + i}
-        <div class="mtv-line" data-line-id={archiveOffset + lineIdx}>{@html cachedLineHtml(lineIdx, contentEpoch)}</div>
+        {@const droppedRows = retentionGapRowsAt(lineIdx, contentEpoch)}
+        <div
+          class="mtv-line"
+          class:mtv-gap={droppedRows > 0}
+          data-line-id={archiveOffset + lineIdx}
+          data-gap-rows={droppedRows > 0 ? droppedRows : undefined}
+        >{@html cachedLineHtml(lineIdx, contentEpoch)}</div>
       {/each}
     {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
@@ -2495,6 +2821,21 @@
        rows shoved the tail ~90px below the fold. height beats glyph extents. */
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
+  }
+  .mtv-gap {
+    position: relative;
+    overflow: visible;
+  }
+  .mtv-gap::before {
+    content: '── ' attr(data-gap-rows) ' rows dropped ──';
+    position: absolute;
+    left: 0;
+    bottom: 100%;
+    z-index: 2;
+    color: color-mix(in srgb, var(--tfg) 62%, transparent);
+    background: var(--tbg);
+    pointer-events: none;
+    user-select: none;
   }
   /* Inline vertical padding does not move line boxes — it only extends the
      paintable/tappable area, lifting terminal links to a ~40px touch target

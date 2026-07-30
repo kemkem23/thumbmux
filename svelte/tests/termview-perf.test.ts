@@ -8,6 +8,8 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium } from "@playwright/test";
 import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
@@ -37,6 +39,10 @@ type TermViewOverrides = {
   altScreenMouse?: boolean;
   bottomInsetPx?: number;
   onKeys?: (data: string) => void;
+  onLinesChange?: (
+    lines: string[],
+    meta: { source: "live" | "prepend" | "replace" },
+  ) => void;
 };
 
 type MutableViewportLayout = {
@@ -244,10 +250,16 @@ function deliverOutput(lineCount: number): void {
   sessionCallback(data, "output", null, { source: "full", replace: true });
 }
 
-function deliverLiveAppend(lineCount: number): void {
+function deliverLiveAppend(previousLastLine: number, appendedLineCount: number): number {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
-  const data = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join("\n");
+  const nextLastLine = previousLastLine + appendedLineCount;
+  const captureStart = Math.max(0, previousLastLine - 7);
+  const data = Array.from(
+    { length: nextLastLine - captureStart + 1 },
+    (_, i) => `line-${captureStart + i}`,
+  ).join("\n");
   sessionCallback(data, "output", null, { source: "full", replace: false });
+  return nextLastLine;
 }
 
 function deliverHistory(
@@ -261,8 +273,9 @@ function deliverHistory(
 async function prepareScrollableTermView(
   onScrollStateChange?: (state: ScrollState) => void,
   lineCount = 240,
+  overrides: TermViewOverrides = {},
 ): Promise<Mounted & { viewport: HTMLElement }> {
-  const mountedView = mountTermView(onScrollStateChange);
+  const mountedView = mountTermView(onScrollStateChange, overrides);
   const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
   if (!viewport) throw new Error("TermView root not found");
 
@@ -401,6 +414,17 @@ function median(values: number[]): number {
   return ordered[Math.floor(ordered.length / 2)]!;
 }
 
+function percentile(values: number[], quantile: number): number {
+  if (values.length === 0) throw new Error("cannot take a percentile of an empty sample");
+  const ordered = [...values].sort((a, b) => a - b);
+  const index = Math.min(ordered.length - 1, Math.ceil(ordered.length * quantile) - 1);
+  return ordered[index]!;
+}
+
+function heapMiB(bytes: number): number {
+  return bytes / (1024 * 1024);
+}
+
 /** Count a conservative lower bound on array elements moved by a commit.
  * Current prepends shift retained columns with splice; the push hook also
  * catches a full-array rebuild that clears and repopulates those columns. */
@@ -498,8 +522,8 @@ function prependHistoryPage(
   }
   drainScheduledWork();
   // These benchmark rows have no links. The one byte-estimate rescan on this
-  // commit path reads rawLines, htmlCache, and linksByLine once per row.
-  const retainedByteRecalculationTouches = measureElementTouches ? retainedRows * 3 : 0;
+  // commit path reads rawLines and linksByLine once per row.
+  const retainedByteRecalculationTouches = measureElementTouches ? retainedRows * 2 : 0;
   return {
     commitNs: lastIdleBatchNs,
     elementTouches: lastIdleElementTouches + retainedByteRecalculationTouches,
@@ -1184,15 +1208,82 @@ describe("TermView history prepend scheduling", () => {
 });
 
 describe("TermView retained history budgets", () => {
+  test("repeated live-only overflow preserves mounted rows and the newest tail", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+    const mountedBefore = mountedLineContent(viewport);
+
+    let liveLastLine = deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBeLessThanOrEqual(10_000);
+    expectMountedContentPreserved(mountedBefore, viewport);
+    expect(retainedLines.at(-1)).toBe(`line-${liveLastLine}`);
+
+    // Cross the first retention seam while the oldest overscan still starts at
+    // row zero. A second overflow must introduce another presentational gap,
+    // not discard the newest suffix merely because one gap already exists.
+    wheelTowardHistory(viewport, 20);
+    const mountedBeforeSecondAppend = mountedLineContent(viewport);
+    liveLastLine = deliverLiveAppend(liveLastLine, 400);
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBeLessThanOrEqual(10_000);
+    expectMountedContentPreserved(mountedBeforeSecondAppend, viewport);
+    expect(retainedLines.at(-1)).toBe(`line-${liveLastLine}`);
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    deliverLiveAppend(liveLastLine, 0);
+    flushSync();
+    drainScheduledWork();
+    const gapCounts = Array.from(
+      viewport.querySelectorAll<HTMLElement>(".mtv-gap"),
+      (row) => Number(row.getAttribute("data-gap-rows")),
+    ).sort((a, b) => a - b);
+    expect(gapCounts).toEqual([400, 400]);
+  }, 120_000);
+
   test("live append stays within retention budgets without changing mounted rows", async () => {
-    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
-    wheelTowardHistory(viewport, -4_000);
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+
+    for (let page = 1; page <= 20; page++) {
+      const lines = Array.from(
+        { length: 500 },
+        (_, row) => `live-budget-page-${page}-row-${row}`,
+      );
+      prependHistoryPage(viewport, lines, 1_000_000);
+    }
+
     const mountedBefore = mountedLineContent(viewport);
 
     expect(mountedBefore.size).toBeGreaterThan(60);
     expect(Number(viewport.getAttribute("data-total"))).toBe(10_000);
 
-    deliverLiveAppend(22_000);
+    let liveLastLine = 239;
+    for (let tickIndex = 1; tickIndex <= 30; tickIndex++) {
+      liveLastLine = deliverLiveAppend(liveLastLine, 400);
+      flushSync();
+      drainScheduledWork();
+      const mountedAfterTick = mountedLineContent(viewport);
+      for (const key of mountedBefore.keys()) {
+        if (!mountedAfterTick.has(key)) {
+          throw new Error(
+            `mounted key ${key} disappeared on live tick ${tickIndex}; ` +
+            `archiveOffset=${viewport.getAttribute("data-archive-offset")} ` +
+            `bottomOffset=${viewport.getAttribute("data-bottom-offset")}`,
+          );
+        }
+      }
+    }
     await tick();
     drainScheduledWork();
     flushSync();
@@ -1203,127 +1294,278 @@ describe("TermView retained history budgets", () => {
     expect(retainedRows).toBeLessThanOrEqual(10_000);
     expect(retainedBytes).toBeLessThanOrEqual(byteBudget);
     expectMountedContentPreserved(mountedBefore, viewport);
+    expect(retainedLines.at(-1)).toBe("line-12239");
   }, 120_000);
 
-  test("page 150 commit touches at most 2x page 10 after repeated prepends", async () => {
+  test("marks the exact dropped-row gap without adding terminal content", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    let priorGapRows = 0;
+
+    for (let page = 1; page <= 20; page++) {
+      const beforeTotal = Number(viewport.getAttribute("data-total"));
+      const committed = prependHistoryPage(
+        viewport,
+        Array.from(
+          { length: 500 },
+          (_, row) => `gap-page-${page}-row-${row}`,
+        ),
+        1_000_000,
+      );
+      const afterTotal = Number(viewport.getAttribute("data-total"));
+      priorGapRows += Math.max(0, committed.lineCount - (afterTotal - beforeTotal));
+    }
+
+    const totalBeforeLive = Number(viewport.getAttribute("data-total"));
+    const archiveOffsetBeforeLive = Number(viewport.getAttribute("data-archive-offset"));
+    let liveLastLine = 239;
+    for (let tickIndex = 0; tickIndex < 2; tickIndex++) {
+      liveLastLine = deliverLiveAppend(liveLastLine, 400);
+      flushSync();
+      drainScheduledWork();
+    }
+
+    const totalAfterLive = Number(viewport.getAttribute("data-total"));
+    const archiveOffsetAfterLive = Number(viewport.getAttribute("data-archive-offset"));
+    const prefixRowsDropped = archiveOffsetAfterLive - archiveOffsetBeforeLive;
+    const liveRowsAppended = liveLastLine - 239;
+    const liveGapRows = totalBeforeLive + liveRowsAppended - totalAfterLive - prefixRowsDropped;
+    const expectedGapRows = priorGapRows + liveGapRows;
+    expect(expectedGapRows).toBeGreaterThan(0);
+
+    const gapIndex = retainedLines.findIndex((line) => /^line-\d+$/.test(line));
+    expect(gapIndex).toBeGreaterThan(0);
+    const total = Number(viewport.getAttribute("data-total"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const maxOffset = Math.max(0, total * lineHeight - viewport.clientHeight);
+    const desiredScrollTop = Math.max(0, (gapIndex - 5) * lineHeight);
+    const desiredBottomOffset = maxOffset - desiredScrollTop;
+    const currentBottomOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    wheelTowardHistory(viewport, currentBottomOffset - desiredBottomOffset);
+
+    const marker = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(marker).not.toBeNull();
+    expect(marker?.classList.contains("mtv-line")).toBe(true);
+    expect(Number(marker?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+    expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(1);
+    expect(retainedLines).toHaveLength(totalAfterLive);
+    expect(retainedLines.some((line) => line.includes("rows dropped"))).toBe(false);
+
+    deliverLiveAppend(liveLastLine, 0);
+    flushSync();
+    drainScheduledWork();
+    expect(Number(
+      viewport.querySelector<HTMLElement>(".mtv-gap")?.getAttribute("data-gap-rows"),
+    )).toBe(expectedGapRows);
+  }, 120_000);
+
+  test("retains sparse SGR checkpoints and HTML for only the mounted window", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
+    const checkpointAttr = viewport.getAttribute("data-sgr-checkpoint-count");
+    const intervalAttr = viewport.getAttribute("data-sgr-checkpoint-interval");
+    const cacheAttr = viewport.getAttribute("data-render-cache-rows");
+
+    expect(checkpointAttr).not.toBeNull();
+    expect(intervalAttr).not.toBeNull();
+    expect(cacheAttr).not.toBeNull();
+
+    const checkpointCount = Number(checkpointAttr);
+    const checkpointInterval = Number(intervalAttr);
+    const cacheRowsAtBottom = Number(cacheAttr);
+    const mountedRowsAtBottom = viewport.querySelectorAll(".mtv-line").length;
+    expect(checkpointInterval).toBeGreaterThan(1);
+    expect(checkpointCount).toBeGreaterThan(1);
+    expect(checkpointCount).toBeLessThanOrEqual(Math.ceil(10_000 / checkpointInterval) + 2);
+    expect(cacheRowsAtBottom).toBeLessThanOrEqual(mountedRowsAtBottom);
+    expect(cacheRowsAtBottom).toBeLessThan(10_000 / 10);
+
+    wheelTowardHistory(viewport, -1_000_000);
+    const cacheRowsAtTop = Number(viewport.getAttribute("data-render-cache-rows"));
+    const mountedRowsAtTop = viewport.querySelectorAll(".mtv-line").length;
+    expect(cacheRowsAtTop).toBeLessThanOrEqual(mountedRowsAtTop);
+    expect(cacheRowsAtTop).toBeLessThan(10_000 / 10);
+  }, 120_000);
+
+  test("search rebuilds and highlights a cold sparse window", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
+    wheelTowardHistory(viewport, -1_000_000);
+
+    viewport.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    drainAnimationFrames();
+
+    const input = viewport.querySelector<HTMLInputElement>(
+      '[data-testid="term-search-input"]',
+    );
+    expect(input).not.toBeNull();
+    if (!input) throw new Error("terminal search input did not open");
+    input.value = "line-9999";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    drainAnimationFrames();
+
+    expect(
+      viewport.querySelector('[data-testid="term-search-match"]')?.textContent,
+    ).toContain("1 matches");
+    input.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    drainAnimationFrames();
+
+    const active = viewport.querySelector<HTMLElement>(".search-active");
+    expect(active).not.toBeNull();
+    expect(active?.textContent).toBe("line-9999");
+  }, 120_000);
+
+  test("defers a cold render-cache rebuild until the touch gesture ends", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    const buildAttr = viewport.getAttribute("data-render-cache-builds");
+    expect(buildAttr).not.toBeNull();
+    const buildsBeforeTouch = Number(buildAttr);
+
+    const endY = startTouchFling(viewport, 1_600);
+    runAnimationFrameBatch();
+    expect(Number(viewport.getAttribute("data-render-cache-builds"))).toBe(buildsBeforeTouch);
+
+    releaseTouchFling(viewport, endY);
+    flushSync();
+    const buildsAfterTouch = Number(viewport.getAttribute("data-render-cache-builds"));
+    expect(buildsAfterTouch).toBeGreaterThan(buildsBeforeTouch);
+    const settledMirrorBeforeMomentum = viewport.getAttribute("data-bottom-offset");
+
+    for (let frame = 0; frame < 10 && frameCallbacks.size > 0; frame++) {
+      runAnimationFrameBatch();
+      if (viewport.getAttribute("data-bottom-offset") !== settledMirrorBeforeMomentum) break;
+      expect(Number(viewport.getAttribute("data-render-cache-builds"))).toBe(buildsAfterTouch);
+    }
+    drainAnimationFrames();
+  }, 120_000);
+
+  test("last accepted prepend touches at most 2x page 10 before saturation", async () => {
     const { viewport } = await prepareScrollableTermView(undefined, 240);
     const elementTouches: number[] = [];
 
-    for (let page = 1; page <= 152; page++) {
+    for (let page = 1; page <= 25; page++) {
       const lines = Array.from(
         { length: 500 },
         (_, row) => `history-page-${page}-row-${row}`,
       );
-      const samplePage = (page >= 8 && page <= 12) || page >= 148;
+      const beforeTotal = Number(viewport.getAttribute("data-total"));
       const committed = prependHistoryPage(
         viewport,
         lines,
         1_000_000,
         undefined,
-        samplePage,
+        true,
       );
-      if (committed.lineCount !== lines.length) {
-        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
-      }
+      const afterTotal = Number(viewport.getAttribute("data-total"));
+      // Accepted rows are the whole growth: a prepend may reject part of its
+      // incoming oldest prefix, but it must never make room by deleting rows
+      // that were retained before this request.
+      expect(afterTotal - beforeTotal).toBe(committed.lineCount);
       elementTouches.push(committed.elementTouches);
+      if (afterTotal >= 10_000) break;
     }
 
-    // Prefer this deterministic work invariant to a tighter timing gate: GC
-    // can move wall-clock medians, but cannot hide an archive growing from
-    // 5,240 rows around page 10 to 75,240 rows around page 150. The 10,000-row
-    // cap keeps both prepend movement and the byte-estimate scan below 2x.
-    //
-    // Numbers, so a future failure is diagnosable instead of just red. This
-    // ratio is deterministic — measured 1.9183258733343622 on five consecutive
-    // runs, identical to 16 digits, because it counts element touches and not
-    // time. The two regressions this replaced a 3x wall-clock gate to catch sit
-    // at 14.51 (both caps removed) and 14.19 (both caps removed plus the
-    // full-array recopy restored, every round). Removing ONLY the row budget
-    // and leaving the byte budget in place still measures 3.37, so a partial
-    // regression is caught too — which is the case the previous 3x wall-clock
-    // gate would have let through on a good run.
-    //
-    // Reading a failure: anything from ~3 upward is the retention guard giving
-    // way. A ratio just over 2 is not that — it means work per commit shifted a
-    // few percent, e.g. someone changed HISTORY_RETAINED_ROW_BUDGET or the
-    // overscan window on purpose. Then re-derive the expected value and move
-    // this bound deliberately; do not widen it to make a red test go away.
+    expect(elementTouches.length).toBeGreaterThanOrEqual(15);
     const page10Touches = median(elementTouches.slice(7, 12));
-    const page150Touches = median(elementTouches.slice(147, 152));
-    expect(page150Touches / page10Touches).toBeLessThanOrEqual(2);
+    const terminalTouches = median(elementTouches.slice(-5));
+    expect(terminalTouches / page10Touches).toBeLessThanOrEqual(2);
   }, 120_000);
 
-  test("page 150 wall-clock commit stays within 3x page 10", async () => {
+  test("last accepted wall-clock commit stays within 3x page 10", async () => {
     const { viewport } = await prepareScrollableTermView(undefined, 240);
     const durations: number[] = [];
 
-    for (let page = 1; page <= 152; page++) {
+    for (let page = 1; page <= 25; page++) {
       const lines = Array.from(
         { length: 500 },
         (_, row) => `history-page-${page}-row-${row}`,
       );
+      const beforeTotal = Number(viewport.getAttribute("data-total"));
       const committed = prependHistoryPage(
         viewport,
         lines,
         1_000_000,
       );
-      if (committed.lineCount !== lines.length) {
-        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
-      }
+      const afterTotal = Number(viewport.getAttribute("data-total"));
+      expect(afterTotal - beforeTotal).toBe(committed.lineCount);
       durations.push(committed.commitNs);
+      if (afterTotal >= 10_000) break;
     }
 
-    // Medians centred on the requested pages suppress GC/timer noise while
-    // preserving the page-10 versus page-150 asymptotic comparison.
+    expect(durations.length).toBeGreaterThanOrEqual(15);
     const page10Ns = median(durations.slice(7, 12));
-    const page150Ns = median(durations.slice(147, 152));
-    expect(page150Ns / page10Ns).toBeLessThanOrEqual(3);
+    const terminalNs = median(durations.slice(-5));
+    expect(terminalNs / page10Ns).toBeLessThanOrEqual(3);
   }, 120_000);
 
-  test("200 pages of 500 rows stay capped without evicting the mounted window", async () => {
-    const { viewport } = await prepareScrollableTermView(undefined, 240);
-    let finalWindow = new Map<number, string>();
-    let finalStartLine = -1;
-    const cappedTotals: number[] = [];
+  test("saturation preserves traversed rows and blocks six futile refetch ticks", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    let mountedAtCap = new Map<number, string>();
 
-    for (let page = 1; page <= 200; page++) {
+    for (let page = 1; page <= 25; page++) {
       const lines = Array.from(
         { length: 500 },
         (_, row) => `retained-page-${page}-row-${row}`,
       );
-      let mountedBefore = new Map<number, string>();
+      const beforeTotal = Number(viewport.getAttribute("data-total"));
       const committed = prependHistoryPage(
         viewport,
         lines,
         2_000_000,
-        page >= 20
-          ? () => { mountedBefore = mountedLineContent(viewport); }
-          : undefined,
       );
-      if (committed.lineCount !== lines.length) {
-        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
-      }
-      if (page >= 20) {
-        expectMountedContentPreserved(mountedBefore, viewport);
-        cappedTotals.push(Number(viewport.getAttribute("data-total")));
-      }
-      if (page === 200) {
-        finalWindow = mountedBefore;
-        finalStartLine = committed.startLine;
+      const afterTotal = Number(viewport.getAttribute("data-total"));
+      expect(afterTotal - beforeTotal).toBe(committed.lineCount);
+      if (afterTotal >= 10_000) {
+        mountedAtCap = mountedLineContent(viewport);
+        break;
       }
     }
 
-    expect(cappedTotals.length).toBeGreaterThan(0);
-    expect(cappedTotals.every((rows) => rows === 10_000)).toBe(true);
-    expect(finalWindow.size).toBeGreaterThan(60);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(10_000);
+    expect(retainedLines).toHaveLength(10_000);
+    expect(mountedAtCap.size).toBeGreaterThan(60);
+    const retainedAtCap = new Set(retainedLines);
+    for (const content of mountedAtCap.values()) expect(retainedAtCap.has(content)).toBe(true);
+    const requestsAtCap = historyRequestCount;
+    let liveLastLine = 239;
 
-    // The retained page remains reachable at the top, and the next request
-    // advances from its start instead of refetching/discarding the same page.
-    wheelTowardHistory(viewport, -1_000_000);
-    expect(Array.from(mountedLineContent(viewport).values()).some(
-      (content) => content.startsWith("retained-page-200-row-"),
-    )).toBe(true);
-    expect(historyRequests.at(-1)?.beforeLine).toBe(finalStartLine);
+    for (let tickIndex = 1; tickIndex <= 6; tickIndex++) {
+      liveLastLine = deliverLiveAppend(liveLastLine, 1);
+      flushSync();
+      drainScheduledWork();
+      const requestsBeforeWheel = historyRequestCount;
+      wheelTowardHistory(viewport, -1_000_000);
+      if (historyRequestCount > requestsBeforeWheel) {
+        const beforeLine = historyRequests.at(-1)?.beforeLine;
+        const upperBound = typeof beforeLine === "number" ? beforeLine : 2_000_000;
+        deliverHistory(
+          Array.from(
+            { length: 500 },
+            (_, row) => `futile-page-${tickIndex}-row-${row}`,
+          ),
+          { startLine: Math.max(0, upperBound - 500), hasMore: true },
+        );
+        drainScheduledWork();
+        flushSync();
+      }
+    }
+
+    expect(historyRequestCount - requestsAtCap).toBe(0);
   }, 120_000);
 
   test("oversized history rows are bounded by bytes before the row cap", async () => {
@@ -1359,5 +1601,199 @@ describe("TermView retained history budgets", () => {
     expect(Array.from(mountedLineContent(viewport).values()).some(
       (content) => content.startsWith("wide-history-"),
     )).toBe(true);
+  }, 120_000);
+});
+
+describe("TermView sparse retained-storage benchmark", () => {
+  test("100k-row Chrome heap, cold rebuild, and search stay within measured gates", async () => {
+    const browser = await chromium.launch({
+      executablePath: "/usr/bin/google-chrome",
+      headless: true,
+      args: ["--js-flags=--expose-gc"],
+    });
+
+    try {
+      const page = await browser.newPage();
+      const client = await page.context().newCDPSession(page);
+      const coreDistPath = join(
+        dirname(fileURLToPath(import.meta.url)),
+        "../../core/dist/index.js",
+      );
+      const coreSource = await Bun.file(coreDistPath).text();
+      await page.addScriptTag({
+        type: "module",
+        content: `${coreSource}\n;globalThis.__thumbmuxBench = { createSgrState, cloneSgrState, lineToHtml, searchLines };`,
+      });
+      await page.waitForFunction(() => Boolean((globalThis as Record<string, unknown>).__thumbmuxBench));
+
+      await page.evaluate(() => {
+        const api = (globalThis as Record<string, any>).__thumbmuxBench;
+        const palette = {
+          defaultFg: "#eeeeee",
+          defaultBg: "#111111",
+          base: Array.from({ length: 16 }, (_, i) => `#${i.toString(16).repeat(6)}`),
+        };
+        const state = api.createSgrState();
+        for (let i = 0; i < 2_000; i++) {
+          api.lineToHtml(`\u001b[38;5;${i % 256}mWARM-${i}\u001b[0m`, state, palette);
+        }
+        api.searchLines(["warm-search-line"], "search");
+      });
+
+      const collectGarbage = async () => {
+        await client.send("HeapProfiler.collectGarbage");
+        await client.send("HeapProfiler.collectGarbage");
+      };
+      const heapUsed = async () => {
+        const usage = await client.send("Runtime.getHeapUsage") as { usedSize: number };
+        return usage.usedSize;
+      };
+
+      const measureShape = async (mode: "legacy" | "sparse") => {
+        await page.evaluate(() => { (globalThis as Record<string, any>).__retainedModel = null; });
+        await collectGarbage();
+        const baseline = await heapUsed();
+        const result = await page.evaluate((shape) => {
+          const api = (globalThis as Record<string, any>).__thumbmuxBench;
+          const palette = {
+            defaultFg: "#eeeeee",
+            defaultBg: "#111111",
+            base: [
+              "#000000", "#aa0000", "#00aa00", "#aa5500",
+              "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
+              "#555555", "#ff5555", "#55ff55", "#ffff55",
+              "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
+            ],
+          };
+          const rowCount = 100_000;
+          const payload = "x".repeat(112);
+          const raw = Array.from(
+            { length: rowCount },
+            (_, i) => `\u001b[38;5;${i % 256}mROW-${i}-${payload}\u001b[0m`,
+          );
+          const archived = raw.slice(0, rowCount - 240);
+          const live = raw.slice(rowCount - 240);
+          const links = new Array(rowCount);
+
+          if (shape === "legacy") {
+            const html = new Array(rowCount);
+            const stateBefore = new Array(rowCount);
+            const stateAfter = new Array(rowCount);
+            const state = api.createSgrState();
+            for (let i = 0; i < rowCount; i++) {
+              stateBefore[i] = api.cloneSgrState(state);
+              html[i] = api.lineToHtml(raw[i], state, palette);
+              stateAfter[i] = api.cloneSgrState(state);
+            }
+            (globalThis as Record<string, any>).__retainedModel = {
+              raw, archived, live, links, html, stateBefore, stateAfter,
+            };
+          } else {
+            const stride = 300;
+            const checkpoints = new Map<number, unknown>();
+            const html = new Map<number, string>();
+            const stateBefore = new Map<number, unknown>();
+            const state = api.createSgrState();
+            const windowStart = rowCount - 132;
+            for (let i = 0; i < rowCount; i++) {
+              if (i % stride === 0) checkpoints.set(i, api.cloneSgrState(state));
+              if (i >= windowStart) stateBefore.set(i, api.cloneSgrState(state));
+              const rendered = api.lineToHtml(raw[i], state, palette);
+              if (i >= windowStart) html.set(i, rendered);
+            }
+            checkpoints.set(rowCount, api.cloneSgrState(state));
+            (globalThis as Record<string, any>).__retainedModel = {
+              raw, archived, live, links, checkpoints, html, stateBefore,
+            };
+          }
+
+          const searchDurations: number[] = [];
+          let searchMatches = 0;
+          for (let run = 0; run < 9; run++) {
+            const started = performance.now();
+            const search = api.searchLines(raw, "ROW-99991-");
+            searchDurations.push(performance.now() - started);
+            searchMatches += search.matches.length;
+          }
+          return { searchDurations, searchMatches };
+        }, mode);
+        await collectGarbage();
+        const used = await heapUsed();
+        return { ...result, heapBytes: Math.max(0, used - baseline) };
+      };
+
+      const legacy = await measureShape("legacy");
+      const sparse = await measureShape("sparse");
+      const rebuild = await page.evaluate(() => {
+        const api = (globalThis as Record<string, any>).__thumbmuxBench;
+        const model = (globalThis as Record<string, any>).__retainedModel;
+        const raw = model.raw as string[];
+        const palette = {
+          defaultFg: "#eeeeee",
+          defaultBg: "#111111",
+          base: [
+            "#000000", "#aa0000", "#00aa00", "#aa5500",
+            "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
+            "#555555", "#ff5555", "#55ff55", "#ffff55",
+            "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
+          ],
+        };
+        const result: Record<string, { median: number; p95: number; max: number }> = {};
+        for (const stride of [128, 256, 300, 512]) {
+          const checkpoints = new Map<number, unknown>();
+          const checkpointState = api.createSgrState();
+          for (let i = 0; i < raw.length; i++) {
+            if (i % stride === 0) checkpoints.set(i, api.cloneSgrState(checkpointState));
+            api.lineToHtml(raw[i], checkpointState, palette);
+          }
+
+          const durations: number[] = [];
+          for (let sample = 0; sample < 25; sample++) {
+            const start = 1_000 + ((sample * 3_791) % (raw.length - 1_300));
+            const checkpoint = Math.floor(start / stride) * stride;
+            const state = api.cloneSgrState(checkpoints.get(checkpoint));
+            const started = performance.now();
+            let checksum = 0;
+            for (let i = checkpoint; i < Math.min(raw.length, start + 132); i++) {
+              const html = api.lineToHtml(raw[i], state, palette);
+              if (i >= start) checksum += html.length;
+            }
+            if (checksum <= 0) throw new Error("cold render produced no HTML");
+            durations.push(performance.now() - started);
+          }
+          durations.sort((a, b) => a - b);
+          result[String(stride)] = {
+            median: durations[Math.floor(durations.length / 2)]!,
+            p95: durations[Math.ceil(durations.length * 0.95) - 1]!,
+            max: durations.at(-1)!,
+          };
+        }
+        return result;
+      });
+
+      const legacySearchP95 = percentile(legacy.searchDurations.slice(1), 0.95);
+      const sparseSearchP95 = percentile(sparse.searchDurations.slice(1), 0.95);
+      const selectedRebuild = rebuild["300"]!;
+      const candidateP95 = [128, 256, 300, 512]
+        .map((stride) => `${stride}:${rebuild[String(stride)]!.p95.toFixed(2)}`)
+        .join(",");
+      console.log(
+        `[W1-S4 benchmark] heap ${heapMiB(legacy.heapBytes).toFixed(2)} MiB -> ` +
+        `${heapMiB(sparse.heapBytes).toFixed(2)} MiB; ` +
+        `stride300 rebuild median/p95/max ${selectedRebuild.median.toFixed(2)}/` +
+        `${selectedRebuild.p95.toFixed(2)}/${selectedRebuild.max.toFixed(2)} ms; ` +
+        `candidate p95 ms ${candidateP95}; ` +
+        `search p95 ${legacySearchP95.toFixed(2)} -> ${sparseSearchP95.toFixed(2)} ms`,
+      );
+
+      expect(legacy.searchMatches).toBeGreaterThan(0);
+      expect(sparse.searchMatches).toBe(legacy.searchMatches);
+      expect(sparse.heapBytes).toBeLessThan(legacy.heapBytes * 0.5);
+      expect(selectedRebuild.p95).toBeLessThan(12);
+      expect(selectedRebuild.max).toBeLessThan(25);
+      expect(sparseSearchP95).toBeLessThanOrEqual(legacySearchP95 * 1.5 + 5);
+    } finally {
+      await browser.close();
+    }
   }, 120_000);
 });
