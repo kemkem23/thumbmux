@@ -1,8 +1,102 @@
 import { describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
-import { extractRecentPrompts, stripAnsi } from "../src/prompt-scan";
+import {
+  extractRecentPrompts,
+  extractRecentPromptsFromPane,
+  stripAnsi,
+} from "../src/prompt-scan";
+
+const HOST_PANE_FIXTURES = join(import.meta.dir, "../../../../tests/fixtures/panes");
+
+const CUSTOM_PROMPT_MATCHERS = {
+  promptPayload(line: string): string | null {
+    return /^\s*::\s*(.+)$/.exec(line)?.[1]?.trim() ?? null;
+  },
+  isFaintPayload(rawLine: string): boolean {
+    return rawLine.includes("[ghost]");
+  },
+  isStatusLine(trimmedLine: string): boolean {
+    return trimmedLine === "READY";
+  },
+  isPromptTerminator(line: string): boolean {
+    return line.trim() === "END";
+  },
+};
 
 describe("terminal prompt extraction", () => {
+  test("replaces the complete default matcher set through both scanning APIs", () => {
+    const lines = [
+      "› default-only prompt",
+      "• default response",
+      ":: custom prompt",
+      "  continued on the next line",
+      "END",
+      ":: [ghost] custom composer suggestion",
+      "END",
+      ":: unsent custom composer text",
+      "READY",
+    ];
+    const expected = ["custom prompt continued on the next line"];
+
+    expect({
+      lines: extractRecentPrompts(lines, { matchers: CUSTOM_PROMPT_MATCHERS }),
+      pane: extractRecentPromptsFromPane(lines.join("\n"), 5, {
+        matchers: CUSTOM_PROMPT_MATCHERS,
+      }),
+    }).toEqual({ lines: expected, pane: expected });
+  });
+
+  test("exports the named default matcher set from the public core entry point", async () => {
+    const core = await import("../src/index");
+
+    expect({
+      promptPayload: typeof core.DEFAULT_PROMPT_MATCHERS.promptPayload,
+      isFaintPayload: typeof core.DEFAULT_PROMPT_MATCHERS.isFaintPayload,
+      isStatusLine: typeof core.DEFAULT_PROMPT_MATCHERS.isStatusLine,
+      isPromptTerminator: typeof core.DEFAULT_PROMPT_MATCHERS.isPromptTerminator,
+      frozen: Object.isFrozen(core.DEFAULT_PROMPT_MATCHERS),
+    }).toEqual({
+      promptPayload: "function",
+      isFaintPayload: "function",
+      isStatusLine: "function",
+      isPromptTerminator: "function",
+      frozen: true,
+    });
+  });
+
+  test("keeps byte-exact default outputs for the host pane fixture corpus", async () => {
+    const expectedByFixture = {
+      "cc-approval.txt": [],
+      "cc-idle.txt": [],
+      "cc-thinking.txt": [],
+      "codex-approval.txt": [],
+      "codex-idle.txt": [],
+      "codex-working.txt": [],
+      "grok-idle.txt": ["Reply with exactly GROK_SMOKE_OK and nothing else."],
+      "grok-welcome.txt": [],
+      "grok-working.txt": ["Reply with exactly GROK_SMOKE_OK and nothing else."],
+    } satisfies Record<string, string[]>;
+
+    const outputs = Object.fromEntries(await Promise.all(
+      Object.entries(expectedByFixture).map(async ([fixture]) => {
+        const content = await readFile(join(HOST_PANE_FIXTURES, fixture), "utf8");
+        return [fixture, {
+          lines: extractRecentPrompts(content.split("\n")),
+          pane: extractRecentPromptsFromPane(content),
+        }];
+      }),
+    ));
+
+    expect(outputs).toEqual(Object.fromEntries(
+      Object.entries(expectedByFixture).map(([fixture, prompts]) => [
+        fixture,
+        { lines: prompts, pane: prompts },
+      ]),
+    ));
+  });
+
   test("extracts codex auto-fix user report instead of the generic wrapper heading", () => {
     const prompts = extractRecentPrompts([
       "output before",

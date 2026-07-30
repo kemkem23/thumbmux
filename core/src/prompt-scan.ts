@@ -11,10 +11,27 @@
  * the status/model line, whereas a real prompt always has response output
  * between it and that line.
  */
+/** A complete set of agent-specific prompt scanning heuristics. */
+export type PromptMatcherSet = Readonly<{
+  /** Return the submitted prompt payload, or null when the line is not a prompt. */
+  promptPayload: (line: string) => string | null;
+  /** Inspect the original ANSI-bearing line and reject non-submitted prompt chrome. */
+  isFaintPayload: (rawLine: string) => boolean;
+  /** Match a normalized, trimmed status line that can sit below a composer. */
+  isStatusLine: (trimmedLine: string) => boolean;
+  /** Match an ANSI-free response line that ends a multi-line prompt block. */
+  isPromptTerminator: (line: string) => boolean;
+}>;
+
 export type ExtractRecentPromptsOptions = {
   targetCount?: number;
   initialScanLines?: number;
   maxScanLines?: number;
+  matchers?: PromptMatcherSet;
+};
+
+export type ExtractRecentPromptsFromPaneOptions = {
+  matchers?: PromptMatcherSet;
 };
 
 const DEFAULT_TARGET_COUNT = 5;
@@ -95,20 +112,6 @@ export function isFaintPayload(rawLine: string): boolean {
   return false; // no payload (empty composer) — the length filter handles it
 }
 
-function promptPayload(line: string): string | null {
-  const normalized = line.replace(/\u00a0/g, " ").trimStart();
-  const marker = normalized[0];
-  if (!marker || !PROMPT_MARKERS.has(marker)) return null;
-
-  // CC/codex echo prompts sit at indent 0-2; grok echoes its sent prompts as
-  // "     \u276f <text>            1:43 PM" at indent ~5. Composer lines inside the
-  // grok box start with "\u2502" so they never reach this check.
-  const leading = line.length - line.trimStart().length;
-  if (leading > 6) return null;
-
-  return stripTrailingClock(normalized.slice(1).trim());
-}
-
 // Grok right-aligns a "1:43 PM"-style clock on echoed prompt lines \u2014 visual
 // metadata, not prompt text. Require \u22652 spaces before it so a prompt that
 // genuinely ends with a time ("remind me at 1:43 PM") survives.
@@ -126,19 +129,41 @@ export function isClaudeStatusLine(trimmed: string): boolean {
     /\b(tokens|permissions|effort|5h|week)\b/i.test(trimmed);
 }
 
-function isPromptTerminator(line: string): boolean {
-  const trimmed = line.replace(/\u00a0/g, " ").trim();
-  if (!trimmed) return false;
-  if (promptPayload(line) !== null) return true;
-  // ◆ (grok thought), ❙ (grok scroll bar), ┃ (grok stream bar), ⠀-⣿ (grok
-  // braille spinner) join the cc/codex marker set so a grok response never
-  // glues onto its echoed prompt block.
-  if (/^[●•◦✻⎿■⚠╭╰│─◆❙┃⠀-⣿]/.test(trimmed)) return true;
-  if (/^(?:Tip:|OpenAI Codex\b)/i.test(trimmed)) return true;
-  if (/^(?:Turn completed in\s|Shift\+Tab:mode|Enter:send)/.test(trimmed)) return true;
-  if (isCodexStatusLine(trimmed) || isClaudeStatusLine(trimmed)) return true;
-  return false;
-}
+/**
+ * Built-in heuristics tuned for Claude Code, Codex, and Grok pane output.
+ * Consumers scanning another agent (for example aider, cline, or a plain shell)
+ * should pass their own complete matcher set instead of relying on these defaults.
+ */
+export const DEFAULT_PROMPT_MATCHERS: PromptMatcherSet = Object.freeze({
+  promptPayload(line: string): string | null {
+    const normalized = line.replace(/\u00a0/g, " ").trimStart();
+    const marker = normalized[0];
+    if (!marker || !PROMPT_MARKERS.has(marker)) return null;
+
+    // CC/codex echo prompts sit at indent 0-2; grok echoes its sent prompts as
+    // "     \u276f <text>            1:43 PM" at indent ~5. Composer lines inside the
+    // grok box start with "\u2502" so they never reach this check.
+    const leading = line.length - line.trimStart().length;
+    if (leading > 6) return null;
+
+    return stripTrailingClock(normalized.slice(1).trim());
+  },
+  isFaintPayload,
+  isStatusLine(trimmedLine: string): boolean {
+    return isCodexStatusLine(trimmedLine) || isClaudeStatusLine(trimmedLine);
+  },
+  isPromptTerminator(line: string): boolean {
+    const trimmed = line.replace(/\u00a0/g, " ").trim();
+    if (!trimmed) return false;
+    // ◆ (grok thought), ❙ (grok scroll bar), ┃ (grok stream bar), ⠀-⣿ (grok
+    // braille spinner) join the cc/codex marker set so a grok response never
+    // glues onto its echoed prompt block.
+    if (/^[●•◦✻⎿■⚠╭╰│─◆❙┃⠀-⣿]/.test(trimmed)) return true;
+    if (/^(?:Tip:|OpenAI Codex\b)/i.test(trimmed)) return true;
+    if (/^(?:Turn completed in\s|Shift\+Tab:mode|Enter:send)/.test(trimmed)) return true;
+    return false;
+  },
+});
 
 function cleanPromptLine(line: string): string {
   return line
@@ -177,14 +202,14 @@ function normalizePromptBlock(lines: string[]): string {
   return truncatePrompt(source.replace(/\s+/g, " ").trim());
 }
 
-function collectPrompts(lines: string[], start: number): string[] {
+function collectPrompts(lines: string[], start: number, matchers: PromptMatcherSet): string[] {
   const prompts: string[] = [];
   let i = start;
 
   while (i < lines.length) {
     const raw = lines[i] ?? "";
     const line = stripAnsi(raw).trimEnd();
-    const firstLine = promptPayload(line);
+    const firstLine = matchers.promptPayload(line);
     if (firstLine === null) {
       i++;
       continue;
@@ -192,7 +217,7 @@ function collectPrompts(lines: string[], start: number): string[] {
 
     // The composer's placeholder / ghost / autocomplete text carries the same
     // ❯/› marker as a real echo but is rendered faint — never a submitted prompt.
-    if (isFaintPayload(raw)) {
+    if (matchers.isFaintPayload(raw)) {
       i++;
       continue;
     }
@@ -201,8 +226,13 @@ function collectPrompts(lines: string[], start: number): string[] {
     i++;
 
     while (i < lines.length) {
-      const continuationLine = stripAnsi(lines[i]).trimEnd();
-      if (isPromptTerminator(continuationLine)) break;
+      const continuationLine = stripAnsi(lines[i] ?? "").trimEnd();
+      const trimmedContinuation = continuationLine.replace(/\u00a0/g, " ").trim();
+      if (
+        matchers.promptPayload(continuationLine) !== null ||
+        matchers.isPromptTerminator(continuationLine) ||
+        (trimmedContinuation !== "" && matchers.isStatusLine(trimmedContinuation))
+      ) break;
       block.push(continuationLine);
       i++;
     }
@@ -215,7 +245,7 @@ function collectPrompts(lines: string[], start: number): string[] {
     const terminator = i < lines.length
       ? stripAnsi(lines[i] ?? "").replace(/\u00a0/g, " ").trim()
       : "";
-    if (terminator && (isCodexStatusLine(terminator) || isClaudeStatusLine(terminator))) {
+    if (terminator && matchers.isStatusLine(terminator)) {
       continue;
     }
 
@@ -237,13 +267,14 @@ export function extractRecentPrompts(
   const targetCount = options.targetCount ?? DEFAULT_TARGET_COUNT;
   const initialScanLines = options.initialScanLines ?? DEFAULT_INITIAL_SCAN_LINES;
   const maxScanLines = options.maxScanLines ?? DEFAULT_MAX_SCAN_LINES;
+  const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;
   const boundedMaxScanLines = Math.min(lines.length, maxScanLines);
   let scanLines = Math.min(lines.length, initialScanLines, boundedMaxScanLines);
-  let prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines));
+  let prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
 
   while (prompts.length < targetCount && scanLines < boundedMaxScanLines) {
     scanLines = Math.min(boundedMaxScanLines, scanLines * 2);
-    prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines));
+    prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
   }
 
   return dedupeKeepLatest(prompts).slice(-targetCount);
@@ -252,10 +283,15 @@ export function extractRecentPrompts(
 /** Pane content (one string, \n-joined) → last N submitted prompts. The
  * server-side entry point: the caller already bounded how much pane it read,
  * so there is no progressive deepening here. */
-export function extractRecentPromptsFromPane(content: string, targetCount = 5): string[] {
+export function extractRecentPromptsFromPane(
+  content: string,
+  targetCount = 5,
+  options: ExtractRecentPromptsFromPaneOptions = {},
+): string[] {
   const lines = content.split("\n");
   if (lines.length === 0) return [];
-  return dedupeKeepLatest(collectPrompts(lines, 0)).slice(-targetCount);
+  const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;
+  return dedupeKeepLatest(collectPrompts(lines, 0, matchers)).slice(-targetCount);
 }
 
 function dedupeKeepLatest(prompts: string[]): string[] {
