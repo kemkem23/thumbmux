@@ -1080,12 +1080,6 @@
     // The browser selection owns the currently mounted native text nodes.
     // Do not move its virtual window until the selection has been released.
     if (selectionActive) return;
-    // Re-read the live visible height — Safari's dvh/URL-bar dance must never
-    // leave the model taller than reality (= bottom rows below the fold).
-    if (viewportEl) {
-      const vh = viewportEl.clientHeight;
-      if (vh > 0 && vh !== viewH) viewH = vh;
-    }
     const mo = maxOffset();
     // Viewport growth (composer dock closing, URL-bar dance) can drop
     // maxOffset below the model offset while the pane is idle — nothing else
