@@ -395,6 +395,34 @@ function median(values: number[]): number {
   return ordered[Math.floor(ordered.length / 2)]!;
 }
 
+/** Count a conservative lower bound on array elements moved by a commit.
+ * Current prepends shift retained columns with splice; the push hook also
+ * catches a full-array rebuild that clears and repopulates those columns. */
+function measureArrayElementTouches(run: () => void): number {
+  const originalSplice = Array.prototype.splice;
+  const originalPush = Array.prototype.push;
+  let touches = 0;
+
+  Array.prototype.splice = function (this: unknown[], ...args: unknown[]) {
+    if (args[0] === 0 && args[1] === 0 && args.length > 2) {
+      touches += this.length + args.length - 2;
+    }
+    return Reflect.apply(originalSplice, this, args);
+  } as typeof Array.prototype.splice;
+  Array.prototype.push = function (this: unknown[], ...items: unknown[]) {
+    touches += items.length;
+    return Reflect.apply(originalPush, this, items);
+  } as typeof Array.prototype.push;
+
+  try {
+    run();
+  } finally {
+    Array.prototype.splice = originalSplice;
+    Array.prototype.push = originalPush;
+  }
+  return touches;
+}
+
 /** Request, parse, and commit one history page under the controlled schedulers.
  * The history-prepend event is queued by commitStagedPrepend itself, so the
  * final idle batch before that event is the commit cost (not an ANSI slice). */
@@ -403,7 +431,8 @@ function prependHistoryPage(
   lines: string[],
   initialUpperBound: number,
   beforeDeliver?: () => void,
-): { commitNs: number; lineCount: number; startLine: number } {
+  measureElementTouches = false,
+): { commitNs: number; elementTouches: number; lineCount: number; startLine: number } {
   const requestsBefore = historyRequestCount;
   wheelTowardHistory(viewport, -1_000_000);
   if (historyRequestCount !== requestsBefore + 1) {
@@ -426,13 +455,18 @@ function prependHistoryPage(
   deliverHistory(lines, { startLine, hasMore: true });
 
   let lastIdleBatchNs = 0;
+  let lastIdleElementTouches = 0;
   let batches = 0;
   try {
     while (!committed && batches < 100) {
       let progressed = false;
       if (idleCallbacks.size > 0) {
         const started = process.hrtime.bigint();
-        runIdleCallbackBatch();
+        if (measureElementTouches) {
+          lastIdleElementTouches = measureArrayElementTouches(runIdleCallbackBatch);
+        } else {
+          runIdleCallbackBatch();
+        }
         lastIdleBatchNs = Number(process.hrtime.bigint() - started);
         progressed = true;
       }
@@ -452,8 +486,20 @@ function prependHistoryPage(
   if (!Number.isSafeInteger(committedLineCount) || committedLineCount < 0) {
     throw new Error("history prepend event did not report a valid retained line count");
   }
+  const retainedRows = Number(viewport.getAttribute("data-total"));
+  if (!Number.isSafeInteger(retainedRows) || retainedRows < 0) {
+    throw new Error("history prepend commit did not report a valid retained row count");
+  }
   drainScheduledWork();
-  return { commitNs: lastIdleBatchNs, lineCount: committedLineCount, startLine };
+  // These benchmark rows have no links. The one byte-estimate rescan on this
+  // commit path reads rawLines, htmlCache, and linksByLine once per row.
+  const retainedByteRecalculationTouches = measureElementTouches ? retainedRows * 3 : 0;
+  return {
+    commitNs: lastIdleBatchNs,
+    elementTouches: lastIdleElementTouches + retainedByteRecalculationTouches,
+    lineCount: committedLineCount,
+    startLine,
+  };
 }
 
 function visibleLineKeyBounds(
@@ -1132,7 +1178,55 @@ describe("TermView history prepend scheduling", () => {
 });
 
 describe("TermView retained history budgets", () => {
-  test("page 150 commit stays within 3x page 10 after repeated prepends", async () => {
+  test("page 150 commit touches at most 2x page 10 after repeated prepends", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    const elementTouches: number[] = [];
+
+    for (let page = 1; page <= 152; page++) {
+      const lines = Array.from(
+        { length: 500 },
+        (_, row) => `history-page-${page}-row-${row}`,
+      );
+      const samplePage = (page >= 8 && page <= 12) || page >= 148;
+      const committed = prependHistoryPage(
+        viewport,
+        lines,
+        1_000_000,
+        undefined,
+        samplePage,
+      );
+      if (committed.lineCount !== lines.length) {
+        throw new Error(`page ${page} retained ${committed.lineCount}/${lines.length} rows`);
+      }
+      elementTouches.push(committed.elementTouches);
+    }
+
+    // Prefer this deterministic work invariant to a tighter timing gate: GC
+    // can move wall-clock medians, but cannot hide an archive growing from
+    // 5,240 rows around page 10 to 75,240 rows around page 150. The 10,000-row
+    // cap keeps both prepend movement and the byte-estimate scan below 2x.
+    //
+    // Numbers, so a future failure is diagnosable instead of just red. This
+    // ratio is deterministic — measured 1.9183258733343622 on five consecutive
+    // runs, identical to 16 digits, because it counts element touches and not
+    // time. The two regressions this replaced a 3x wall-clock gate to catch sit
+    // at 14.51 (both caps removed) and 14.19 (both caps removed plus the
+    // full-array recopy restored, every round). Removing ONLY the row budget
+    // and leaving the byte budget in place still measures 3.37, so a partial
+    // regression is caught too — which is the case the previous 3x wall-clock
+    // gate would have let through on a good run.
+    //
+    // Reading a failure: anything from ~3 upward is the retention guard giving
+    // way. A ratio just over 2 is not that — it means work per commit shifted a
+    // few percent, e.g. someone changed HISTORY_RETAINED_ROW_BUDGET or the
+    // overscan window on purpose. Then re-derive the expected value and move
+    // this bound deliberately; do not widen it to make a red test go away.
+    const page10Touches = median(elementTouches.slice(7, 12));
+    const page150Touches = median(elementTouches.slice(147, 152));
+    expect(page150Touches / page10Touches).toBeLessThanOrEqual(2);
+  }, 120_000);
+
+  test("page 150 wall-clock commit stays within 3x page 10", async () => {
     const { viewport } = await prepareScrollableTermView(undefined, 240);
     const durations: number[] = [];
 
