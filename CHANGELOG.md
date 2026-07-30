@@ -108,7 +108,7 @@ out as a point measurement.
 
 ### Tests
 - The four exported components that shipped with **zero** tests — `UploadAction`,
-  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 28 tests, each
+  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 30 tests, each
   assertion group proven by mutating a throwaway copy until it fails. The earlier
   mount smoke asserted the `.svelte` file was text, which is how a component that
   throws on mount once passed.
