@@ -140,7 +140,7 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Busy session, on the wire** | cursor-only frames (~60 B) when just the caret moved; opt-in validated line deltas cut suffix-heavy traffic by 95% vs equivalent full frames in the clean-container e2e; per-message deflate remains available |
 | **Thumbnails** | tail mode: ~5 KB/frame vs the 19–136 KB full snapshot; captures shared across all viewers of a session |
 | **Keystrokes** | ~60 B hot-path frames — client metadata attaches once per connection, not per key |
-| **Tests** | 730 source tests across 42 files (including 890k+ stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
+| **Tests** | 991 source tests across 61 files (including ~956k stress assertions) + 12 canonical clean-container e2e tests against real tmux panes |
 | **Search overlay** | dense highlight path is linear — 10,000 unit matches on one row measured **482.75 ms → 7.44 ms** after the v0.4 fix |
 | **Delta fan-out (v0.5)** | one changed line on a 2,000-row pane to 20 delta subscribers: **69.2 ms → 3.9 ms** at 160 KB (flat in viewer count — grouped serialize once, fan out) |
 | **Client delta apply (v0.5)** | **14.49 ms → 0.094 ms** median (~150×); ~88× under the 8.33 ms 120 Hz frame budget |
@@ -562,7 +562,7 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] Five deferred TermView hot-path defects closed, with before/after numbers
 - [x] Capped retained history; flat per-page prepend cost
 - [x] prefs/upload data-loss paths fixed; the four untested components covered
-- [x] `smoke:git-dist` proves every public export reaches consumers
+- [x] `smoke:git-dist` checks every public export resolves for consumers (bundler resolution)
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,

@@ -17,10 +17,13 @@ Two behaviour changes a consumer must know about, both closing data-loss bugs:
    saved shortcuts with nothing.
 2. **`UploadAction` treats a 2xx whose body has no usable `files` as an error**
    and no longer calls `onUploaded` with empty values.
+3. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
+   flips, not on every offset change, and no callback reports the initial state. A
+   host that mirrored the raw offset from this callback must read it another way.
 
 ### Newly exported — code that existed but never shipped
 - **`FileHistoryArchive`** (`thumbmux/server`): a complete `HistoryArchiveLike`
-  with 432 lines of tests, previously stranded in `demo/` and excluded from the
+  with 444 lines of tests, previously stranded in `demo/` and excluded from the
   release tag's `files` whitelist. Deep scrollback no longer requires writing
   your own archive.
 - **`createSpawnHandler`** (`thumbmux/server`): the route that accepts what
@@ -69,8 +72,11 @@ All measured before and after on the same fixtures:
 - **Retained history is now capped** with eviction, and per-page cost is flat
   rather than linear: page-150/page-10 commit ratio **4.03× → 0.94×**. Rows in
   the viewport plus overscan are never evicted, even if they alone exceed the
-  budget. Still open: sparse SGR checkpoints, and protocol backfill for an
-  evicted newer tail.
+  budget. **Known limit, read this if you rely on deep scrollback:** past the cap the
+  view is spliced WITHOUT a marker — an older archive row can render directly above
+  the live tail, and the prepend-only protocol has no way to re-request the evicted
+  span, so scrolling back down does not restore it. A gap row and a scroll-back-down
+  test are next release. Still open too: sparse SGR checkpoints.
 
 ### Correctness
 - **prefs**: an empty or key-missing GET no longer overwrites the cache; a failed
@@ -89,11 +95,12 @@ All measured before and after on the same fixtures:
 
 ### Tests
 - The four exported components that shipped with **zero** tests — `UploadAction`,
-  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 20 tests, each
+  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 21 tests, each
   assertion group proven by mutating a throwaway copy until it fails. The earlier
   mount smoke asserted the `.svelte` file was text, which is how a component that
   throws on mount once passed.
-- **`smoke:git-dist` proves every public export reaches consumers**, deriving the
+- **`smoke:git-dist` checks every public export resolves for a consumer** under the
+  documented `bundler` resolution, deriving the
   expected surface from each subpackage index rather than a frozen list — a
   frozen list is the v0.4.0 defect in new clothes. It checks type declarations
   too, without which a type-only export is invisible. On its first run it found

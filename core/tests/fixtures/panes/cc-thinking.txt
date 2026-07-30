@@ -1,0 +1,3 @@
+Researching project structure...
+
+✻ Reading src/integrations/tmux.ts

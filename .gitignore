@@ -6,3 +6,7 @@ git-dist/
 
 # agent bookkeeping — never ship to the public repo
 .claude/
+
+# Playwright run state — never ship this; one of these literally read {"status":"failed"}
+test-results/
+**/test-results/

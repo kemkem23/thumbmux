@@ -1,0 +1,24 @@
+
+   main ~/kemcortex/cortex-orchestrator                        │ 33K / 512K │
+
+
+     ❯ Reply with exactly GROK_SMOKE_OK and nothing else.            1:43 PM
+
+
+     ◆ Thought for 1.0s
+
+     GROK_SMOKE_OK                                                   1:43 PM
+
+     Turn completed in 4.1s.
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰──────────────────────────────────────────── Grok Build · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+.:shortcuts
+

@@ -8,7 +8,11 @@ import {
   stripAnsi,
 } from "../src/prompt-scan";
 
-const HOST_PANE_FIXTURES = join(import.meta.dir, "../../../../tests/fixtures/panes");
+// Vendored into the package: this test used to read the private monorepo's corpus
+// via ../../../../, which does not exist in the split tree the public tag is built
+// from. A skip-when-absent guard was rejected — it would make this vacuous in exactly
+// the environment that ships. The host keeps its own copy, so the two can drift.
+const HOST_PANE_FIXTURES = join(import.meta.dir, "fixtures/panes");
 
 const CUSTOM_PROMPT_MATCHERS = {
   promptPayload(line: string): string | null {

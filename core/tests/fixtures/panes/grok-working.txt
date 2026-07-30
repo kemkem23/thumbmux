@@ -1,0 +1,24 @@
+
+   main ~/kemcortex/cortex-orchestrator                       │ ⠸ MCP (0/2) │
+
+
+     ❯ Reply with exactly GROK_SMOKE_OK and nothing else.            1:43 PM
+
+
+
+
+
+
+
+
+
+
+
+    ⠸ Waiting…                                                        0.1s [✗]
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰──────────────────────────────────────────── Grok Build · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+Enter:interject  │  Ctrl+.:
+

@@ -20,7 +20,8 @@
     "prepare": "bun run build:packages"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1"
+    "@playwright/test": "^1.61.1",
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "svelte": "^5"

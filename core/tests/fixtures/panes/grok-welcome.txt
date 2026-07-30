@@ -1,0 +1,24 @@
+
+   main ~/kemcortex/cortex-orchestrator/
+
+
+               [ New worktree                            ctrl-w  ]
+               [ Resume session                          ctrl-s  ]
+               [ Quit                                    ctrl-q  ]
+
+                Changelog                           [See all C-l]
+
+                 • Authentication errors with static API keys now…
+                 • allowed_models in config.toml now restricts wh…
+                 • Code navigation now returns correct results fo…
+
+
+
+  Tip: Press Ctrl-W to start a parallel task in its own worktree.
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰──────────────────────────────────────────── Grok Build · always-approve ─╯
+
+                                                       Grok Build  0.2.22 Beta
+
