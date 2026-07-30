@@ -1,6 +1,6 @@
 /**
  * thumbmux WS protocol — the message shapes exchanged between the browser
- * mux client (@thumbmux/svelte ws-mux) and the server mux (@thumbmux/server).
+ * mux client (thumbmux/svelte ws-mux) and the server mux (thumbmux/server).
  * One connection multiplexes many sessions; `channel` = session name, with
  * the reserved `__sessions` channel carrying session-list pushes.
  */

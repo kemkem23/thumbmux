@@ -1225,7 +1225,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
 
   /** Route a parsed client message. Convenience for hosts whose WS handler
    * is a thin switch — hosts with richer routing keep their own switch instead.
-   * Answers client keepalive pings: the @thumbmux/svelte client closes the
+   * Answers client keepalive pings: the thumbmux/svelte client closes the
    * connection when a ping goes unanswered for 8s. */
   handleMessage(msg: MuxClientMessage, ws: WS) {
     switch (msg.type) {
