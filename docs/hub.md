@@ -105,7 +105,8 @@ contract now requires zero state dots when no classifier is wired.
 `SessionGrid` can render `state: 'working' | 'idle'`, but thumbmux does not
 decide which state an agent is in. Reliable classification is agent-specific
 and belongs in the host. In a production host this can be a substantial
-subsystem: kemcortex's classifier and state machinery spans thousands of lines.
+subsystem: in the reference host it spans thousands of lines of classifier and
+state machinery.
 Supply both `state` and a host-localized `stateLabel` when your classifier has a
 result; omit them when it does not. Do not treat `attached` or recent
 `activityAt` as a WORKING/IDLE classifier.
@@ -116,7 +117,7 @@ result; omit them when it does not. Do not treat `attached` or recent
 can extract recent submitted prompts from pane lines. Neither is a durable
 prompt database. If prompts must survive capture limits, session exit, or a
 server restart, persist them in a host-owned store and pass the retrieved values
-to the UI. For example, kemcortex uses SQLite for this durable layer.
+to the UI. The reference host uses SQLite for that durable layer.
 
 ### A deep-scrollback archive
 
