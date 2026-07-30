@@ -12,7 +12,7 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `unsubscribe` | `session` | stop streaming; per-socket state for the session is dropped. |
 | `keys` | `session`, `data` | write raw bytes to the pane (IME text, control sequences — `\r`, `\x1b[A`, …). Deliberately carries no client blob: this is the hot path. |
 | `resize` | `session`, `cols`, `rows`, `client?` | request pane geometry. The host's `onResizeRequest` hook may veto (e.g. a phone holds the size). |
-| `history_expand` | `session`, `beforeLine?`, `limit?` | page older scrollback from the archive (if the host wired one). Reply: `history`. |
+| `history_expand` | `session`, `beforeLine?`, `afterLine?`, `limit?` | page archived scrollback backward or forward (if the host wired that direction). Reply: `history`. |
 | `resync` | `session` | after rejecting a missing/stale delta, request one complete output frame. The server replies with `reset:'resync'`. Hosts with a custom WS message switch **must** forward this message to `TmuxWsMux.handleMessage()` (or equivalent `handleResync` routing) whenever they forward `delta: true`; otherwise the viewer can remain frozen after its first rejected delta. |
 | `sessions_subscribe` / `sessions_unsubscribe` | — | join/leave the `__sessions` list channel. |
 | `ping` | — | keepalive; server replies `{"type":"pong"}`. Clients close after 8 s without a pong. |
@@ -24,10 +24,36 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 |---|---|
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
-| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. A mux with no archive answers `{lines:[], startLine:null, hasMore:false}` immediately (clients must not wait forever). |
+| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. A mux with no archive, or a forward request whose archive has no `readAfter`, answers `{lines:[], startLine:null, hasMore:false}` immediately (clients must not wait forever). |
 | `{channel, type:"error", data}` | e.g. the session disappeared. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
+
+### Archive history paging
+
+A request should carry one direction cursor. `beforeLine: N` returns up to
+`limit` archived rows whose logical line numbers are `< N`, ending nearest the
+anchor. A null or omitted `beforeLine` reads the newest archived page before
+the live window. This is the original paging behavior and remains unchanged
+for existing clients.
+
+`afterLine: N` returns the first archived rows whose logical line numbers are
+`> N`; `afterLine: null` starts at the oldest row the archive still retains.
+The presence of `afterLine` selects forward paging, including when its value is
+null or zero. If a malformed request supplies both cursors, `afterLine` takes
+precedence.
+
+Rows are always returned in display order. `startLine` is the actual logical
+number of the first returned row and can be greater than `afterLine + 1` when
+the archive has evicted an older prefix. `hasMore` is relative to the requested
+direction: older rows for `beforeLine`, newer archived rows for `afterLine`.
+
+Custom hosts remain source-compatible because `HistoryArchiveLike.readAfter`
+is optional. A host must implement it to support forward paging; otherwise the
+mux sends the explicit empty page above without throwing, while before-only
+requests still call `readBefore` exactly as before. Hosts with a custom
+WebSocket switch must preserve `afterLine` and route the message through
+`TmuxWsMux.handleMessage()` or call `expandHistoryAfter()` themselves.
 
 ### Output deltas and resync
 

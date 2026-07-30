@@ -72,7 +72,10 @@ export type MuxClientMessage = MuxResyncRequest | {
   delta?: boolean;
   cols?: number;
   rows?: number;
+  /** Exclusive upper anchor for backward archive paging. */
   beforeLine?: number | null;
+  /** Exclusive lower anchor for forward archive paging; presence selects that direction. */
+  afterLine?: number | null;
   limit?: number;
   client?: unknown;
 };

@@ -292,6 +292,39 @@ export class FileHistoryArchive implements HistoryArchiveLike {
     };
   }
 
+  readAfter(session: string, afterLine: number | null, limit = 500): HistoryPage {
+    const state = this.stateFor(session);
+    if (state.disabled || state.entries.length === 0) {
+      return { lines: [], startLine: null, hasMore: false };
+    }
+
+    let first = 0;
+    if (Number.isSafeInteger(afterLine)) {
+      // Loaded entries are validated as ordered and contiguous, so find the
+      // exclusive lower bound without scanning every retained archive row.
+      let low = 0;
+      let high = state.entries.length;
+      while (low < high) {
+        const middle = low + Math.floor((high - low) / 2);
+        if (state.entries[middle]!.line <= afterLine!) low = middle + 1;
+        else high = middle;
+      }
+      first = low;
+    }
+    if (first >= state.entries.length) {
+      return { lines: [], startLine: null, hasMore: false };
+    }
+
+    const pageLimit = limitAtLeastOne(limit, 500);
+    const end = Math.min(first + pageLimit, state.entries.length);
+    const page = state.entries.slice(first, end);
+    return {
+      lines: page.map((entry) => entry.text),
+      startLine: page[0]!.line,
+      hasMore: end < state.entries.length,
+    };
+  }
+
   renameSession(oldSession: string, newSession: string): void {
     if (oldSession === newSession) return;
 

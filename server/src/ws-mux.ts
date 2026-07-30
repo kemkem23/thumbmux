@@ -89,6 +89,8 @@ export interface HistoryArchiveLike {
     },
   ): { liveContent: string };
   readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
+  /** Optional forward archive paging. `afterLine` is an exclusive anchor. */
+  readAfter?(session: string, afterLine: number | null, limit?: number): unknown;
   renameSession(oldSession: string, newSession: string): void;
 }
 
@@ -1199,6 +1201,28 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     } catch {}
   }
 
+  expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
+    if (!this.archive?.readAfter) {
+      // A host-provided archive may predate forward paging. Match the no-
+      // archive response exactly rather than throwing or reading backward.
+      try {
+        this.wsSend(ws, JSON.stringify({
+          channel: session, type: "history",
+          data: JSON.stringify({ lines: [], startLine: null, hasMore: false }),
+        } satisfies MuxServerMessage));
+      } catch {}
+      return;
+    }
+    const history = this.archive.readAfter(session, afterLine, limit);
+    try {
+      this.wsSend(ws, JSON.stringify({
+        channel: session,
+        type: "history",
+        data: JSON.stringify(history),
+      } satisfies MuxServerMessage));
+    } catch {}
+  }
+
   /** Route a parsed client message. Convenience for hosts whose WS handler
    * is a thin switch — hosts with richer routing keep their own switch instead.
    * Answers client keepalive pings: the @thumbmux/svelte client closes the
@@ -1212,7 +1236,10 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       case "resize": if (msg.session && msg.cols && msg.rows) this.handleResize(msg.session, msg.cols, msg.rows, ws, msg.client); break;
       case "sessions_subscribe": this.subscribeSessions(ws, msg.client); break;
       case "sessions_unsubscribe": this.unsubscribeSessions(ws); break;
-      case "history_expand": if (msg.session) this.expandHistory(msg.session, ws, msg.beforeLine, msg.limit); break;
+      case "history_expand": if (msg.session) {
+        if (msg.afterLine !== undefined) this.expandHistoryAfter(msg.session, ws, msg.afterLine, msg.limit);
+        else this.expandHistory(msg.session, ws, msg.beforeLine, msg.limit);
+      } break;
       case "resync": if (msg.session) this.handleResync(msg.session, ws); break;
     }
   }
