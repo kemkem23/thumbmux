@@ -46,6 +46,7 @@ bun "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
   bun install
   bun run check
+  ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs
   bun run runtime-export-guard.mjs
   bun run runtime-svelte-export-guard.mjs
@@ -58,6 +59,7 @@ bun "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer" "$EXPECTED_SOURCE
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
   npm install --include=dev --ignore-scripts
   npm run check
+  ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs
   node runtime-export-guard.mjs
   node runtime-svelte-export-guard.mjs

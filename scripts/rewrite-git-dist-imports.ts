@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, extname, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
@@ -362,8 +362,11 @@ function namedImports(
   });
 }
 
-function renderTypeExportGuard(manifests: GitDistExportManifests): string {
-  const sections = PACKAGES.map((packageName) => {
+function renderTypeExportGuard(
+  manifests: GitDistExportManifests,
+  packageNames: readonly PublicSubpackage[] = PACKAGES,
+): string {
+  const sections = packageNames.map((packageName) => {
     const manifest = manifests[packageName];
     const runtimeNames = new Set(manifest.runtime);
     const valueImports = namedImports(manifest.runtime, packageName, "value");
@@ -496,6 +499,11 @@ export function writeGitDistConsumerGuards(
     "utf8",
   );
   writeFileSync(
+    resolve(consumerRoot, "type-export-guard.nodenext.ts"),
+    renderTypeExportGuard(manifests, ["core", "server"]),
+    "utf8",
+  );
+  writeFileSync(
     resolve(consumerRoot, "runtime-export-guard.mjs"),
     renderNodeRuntimeGuard(manifests),
     "utf8",
@@ -552,6 +560,68 @@ function distFiles(root: string): string[] {
       || path.endsWith(".ts")
       || path.endsWith(".svelte"));
   }).sort();
+}
+
+function isExtensionlessRelativeSpecifier(specifier: string): boolean {
+  return (specifier.startsWith("./") || specifier.startsWith("../"))
+    && !specifier.endsWith("/")
+    && !specifier.includes("?")
+    && !specifier.includes("#")
+    && extname(specifier) === "";
+}
+
+function isDeclarationModuleSpecifier(node: ts.StringLiteral): boolean {
+  const parent = node.parent;
+  if (
+    (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent))
+    && parent.moduleSpecifier === node
+  ) {
+    return true;
+  }
+  if (
+    ts.isLiteralTypeNode(parent)
+    && parent.literal === node
+    && ts.isImportTypeNode(parent.parent)
+  ) {
+    return true;
+  }
+  if (ts.isExternalModuleReference(parent) && parent.expression === node) return true;
+  if (ts.isModuleDeclaration(parent) && parent.name === node) return true;
+  return ts.isCallExpression(parent)
+    && parent.expression.kind === ts.SyntaxKind.ImportKeyword
+    && parent.arguments[0] === node;
+}
+
+/** Add the runtime `.js` extension Node16/NodeNext expect, using AST spans. */
+function rewriteDeclarationModuleSpecifiers(
+  source: string,
+  fileName: string,
+): { source: string; replacements: number } {
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.ESNext,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const insertions: number[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isStringLiteral(node)
+      && isDeclarationModuleSpecifier(node)
+      && isExtensionlessRelativeSpecifier(node.text)
+    ) {
+      insertions.push(node.getEnd() - 1);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  let rewritten = source;
+  for (const offset of insertions.sort((a, b) => b - a)) {
+    rewritten = `${rewritten.slice(0, offset)}.js${rewritten.slice(offset)}`;
+  }
+  return { source: rewritten, replacements: insertions.length };
 }
 
 function digest(path: string): string {
@@ -697,7 +767,7 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
   }
   const coreJs = resolve(gitDistRoot, "core/index.js");
 
-  const files: string[] = [];
+  const files = new Set<string>();
   const rewrittenSpecifiers: RewrittenSpecifier[] = [];
   let replacements = 0;
   for (const path of distFiles(root)) {
@@ -712,11 +782,24 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
     writeFileSync(path, rewritten, "utf8");
     replacements += fileReplacements;
     const rel = relative(root, path).split(sep).join("/");
-    files.push(rel);
+    files.add(rel);
     rewrittenSpecifiers.push({ file: rel, specifier });
   }
 
-  const result: GitDistRewriteResult = { files, replacements, rewrittenSpecifiers };
+  for (const path of filesBelow(gitDistRoot).filter((file) => file.endsWith(".d.ts"))) {
+    const source = readFileSync(path, "utf8");
+    const rewritten = rewriteDeclarationModuleSpecifiers(source, path);
+    if (rewritten.replacements === 0) continue;
+    writeFileSync(path, rewritten.source, "utf8");
+    replacements += rewritten.replacements;
+    files.add(relative(root, path).split(sep).join("/"));
+  }
+
+  const result: GitDistRewriteResult = {
+    files: [...files].sort(),
+    replacements,
+    rewrittenSpecifiers,
+  };
   assertGitDistInvariants(root, result);
 
   for (const [path, before] of sourceDigests) {
@@ -747,10 +830,10 @@ if (import.meta.main) {
     throw new Error(`unknown command: ${command}`);
   } else {
     const result = rewriteGitDistImports();
-    // Counts are diagnostic only — they grow whenever new modules import core.
+    // Counts are diagnostic only — they grow whenever new module edges appear.
     // The fail-closed invariants above are what gate the release build.
     console.log(
-      `rewrote ${result.replacements} core imports across ${result.files.length} git-dist files (counts informational)`,
+      `rewrote ${result.replacements} module specifiers across ${result.files.length} git-dist files (counts informational)`,
     );
   }
 }

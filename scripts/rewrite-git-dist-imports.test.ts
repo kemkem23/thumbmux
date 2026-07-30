@@ -8,6 +8,7 @@ import {
   findBareCoreSpecifiers,
   requiredGitDistArtifacts,
   rewriteGitDistImports,
+  writeGitDistConsumerGuards,
 } from "./rewrite-git-dist-imports";
 
 const roots: string[] = [];
@@ -205,6 +206,66 @@ function writeExportSurface(
 }
 
 describe("git-dist import rewriting", () => {
+  test("adds .js to extensionless relative declaration specifiers in every package", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "core/dist/index.d.ts"),
+      [
+        "export * from './protocol';",
+        'export type ProtocolImport = import("./protocol").Protocol;',
+        "export type DocumentationExample = './protocol';",
+        "// export * from './comment-only';",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(root, "core/dist/protocol.d.ts"), "export interface Protocol {}\n");
+    writeFileSync(
+      join(root, "server/dist/index.d.ts"),
+      'export type { ServerDriver } from "./ws-mux";\n',
+    );
+    writeFileSync(join(root, "server/dist/ws-mux.d.ts"), "export interface ServerDriver {}\n");
+    writeFileSync(
+      join(root, "svelte/dist/index.d.ts"),
+      [
+        "export type { Helper } from './nested/helper';",
+        "export { default as View } from './View.svelte';",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(root, "svelte/dist/nested/helper.d.ts"), "export interface Helper {}\n");
+    writeFileSync(join(root, "svelte/dist/View.svelte.d.ts"), "declare const View: unknown; export default View;\n");
+
+    const originalCore = readFileSync(join(root, "core/dist/index.d.ts"), "utf8");
+    const originalServer = readFileSync(join(root, "server/dist/index.d.ts"), "utf8");
+    const originalSvelte = readFileSync(join(root, "svelte/dist/index.d.ts"), "utf8");
+
+    const result = rewriteGitDistImports(root);
+
+    expect(result.files).toEqual([
+      "git-dist/core/index.d.ts",
+      "git-dist/server/index.d.ts",
+      "git-dist/svelte/index.d.ts",
+    ]);
+    expect(result.replacements).toBe(4);
+    expect(readFileSync(join(root, "git-dist/core/index.d.ts"), "utf8")).toBe([
+      "export * from './protocol.js';",
+      'export type ProtocolImport = import("./protocol.js").Protocol;',
+      "export type DocumentationExample = './protocol';",
+      "// export * from './comment-only';",
+      "",
+    ].join("\n"));
+    expect(readFileSync(join(root, "git-dist/server/index.d.ts"), "utf8"))
+      .toBe('export type { ServerDriver } from "./ws-mux.js";\n');
+    expect(readFileSync(join(root, "git-dist/svelte/index.d.ts"), "utf8")).toBe([
+      "export type { Helper } from './nested/helper.js';",
+      "export { default as View } from './View.svelte';",
+      "",
+    ].join("\n"));
+    expect(readFileSync(join(root, "core/dist/index.d.ts"), "utf8")).toBe(originalCore);
+    expect(readFileSync(join(root, "server/dist/index.d.ts"), "utf8")).toBe(originalServer);
+    expect(readFileSync(join(root, "svelte/dist/index.d.ts"), "utf8")).toBe(originalSvelte);
+  });
+
   test("rewrites built JS, declarations, and Svelte sources relative to the shipped core dist", () => {
     const root = fixture();
     writeFileSync(join(root, "server/dist/index.js"), 'export { value } from "@thumbmux/core";\n');
@@ -347,6 +408,25 @@ describe("git-dist import rewriting", () => {
 });
 
 describe("git-dist public export guard", () => {
+  test("writes a core/server-only type guard for the NodeNext smoke", () => {
+    const root = fixture();
+    writeExportSurface(root);
+    const consumer = join(root, "consumer");
+    mkdirSync(join(consumer, "src"), { recursive: true });
+    writeFileSync(
+      join(consumer, "tsconfig.json"),
+      JSON.stringify({ include: ["smoke.ts"] }),
+    );
+    writeFileSync(join(consumer, "src/main.ts"), "export {};\n");
+
+    writeGitDistConsumerGuards(consumer, root);
+
+    const guard = readFileSync(join(consumer, "type-export-guard.nodenext.ts"), "utf8");
+    expect(guard).toContain('from "thumbmux/core";');
+    expect(guard).toContain('from "thumbmux/server";');
+    expect(guard).not.toContain('from "thumbmux/svelte";');
+  });
+
   test("derives the public declaration/runtime surface and accepts a complete dist", () => {
     const root = fixture();
     writeExportSurface(root);
