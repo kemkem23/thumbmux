@@ -10,9 +10,22 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
+import ts from "typescript";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
 const PACKAGES = ["core", "server", "svelte"] as const;
+export type PublicSubpackage = (typeof PACKAGES)[number];
+
+export type PublicExportManifest = {
+  /** Every public symbol, including type-only exports. */
+  declarations: string[];
+  /** Public symbols with a JavaScript runtime value. */
+  runtime: string[];
+  /** Runtime exports whose source value has a call/construct signature. */
+  callable: string[];
+};
+
+export type GitDistExportManifests = Record<PublicSubpackage, PublicExportManifest>;
 const REWRITE_ROOTS = ["git-dist/server", "git-dist/svelte"] as const;
 /**
  * Quoted bare package specifier (`"…"`, `'…'`, or `` `…` ``). Comments that
@@ -35,6 +48,484 @@ export type GitDistRewriteResult = {
   replacements: number;
   rewrittenSpecifiers: RewrittenSpecifier[];
 };
+
+type InspectedEntry = PublicExportManifest & {
+  path: string;
+};
+
+function compilerOptions(allowJs: boolean): ts.CompilerOptions {
+  return {
+    allowArbitraryExtensions: true,
+    allowJs,
+    checkJs: false,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    noEmit: true,
+    noLib: true,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ESNext,
+    types: [],
+  };
+}
+
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  return ts.canHaveModifiers(node)
+    && Boolean(ts.getModifiers(node)?.some((modifier) => modifier.kind === kind));
+}
+
+function bindingNames(name: ts.BindingName, names: string[]): void {
+  if (ts.isIdentifier(name)) {
+    names.push(name.text);
+    return;
+  }
+  for (const element of name.elements) {
+    if (!ts.isOmittedExpression(element)) bindingNames(element.name, names);
+  }
+}
+
+function directlyExportedNames(statement: ts.Statement): string[] {
+  if (!hasModifier(statement, ts.SyntaxKind.ExportKeyword)) return [];
+  const isDefault = hasModifier(statement, ts.SyntaxKind.DefaultKeyword);
+  if (ts.isVariableStatement(statement)) {
+    const names: string[] = [];
+    for (const declaration of statement.declarationList.declarations) {
+      bindingNames(declaration.name, names);
+    }
+    return names;
+  }
+  if (
+    ts.isClassDeclaration(statement)
+    || ts.isFunctionDeclaration(statement)
+    || ts.isInterfaceDeclaration(statement)
+    || ts.isTypeAliasDeclaration(statement)
+    || ts.isEnumDeclaration(statement)
+    || ts.isModuleDeclaration(statement)
+    || ts.isImportEqualsDeclaration(statement)
+  ) {
+    if (isDefault) return ["default"];
+    return statement.name ? [statement.name.text] : [];
+  }
+  return [];
+}
+
+function referencedSourceFile(
+  checker: ts.TypeChecker,
+  moduleSpecifier: ts.Expression,
+): ts.SourceFile | undefined {
+  const moduleSymbol = checker.getSymbolAtLocation(moduleSpecifier);
+  if (!moduleSymbol) return undefined;
+  const target = resolveAlias(checker, moduleSymbol);
+  return target.declarations?.find(ts.isSourceFile)
+    ?? (target.valueDeclaration && ts.isSourceFile(target.valueDeclaration)
+      ? target.valueDeclaration
+      : undefined);
+}
+
+/** Follow live value-export paths; type-only paths contribute declarations only. */
+function runtimeExportsFromSourceFile(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+  cache = new Map<ts.SourceFile, Set<string>>(),
+  visiting = new Set<ts.SourceFile>(),
+): Set<string> {
+  const cached = cache.get(sourceFile);
+  if (cached) return new Set(cached);
+  if (visiting.has(sourceFile)) return new Set();
+  visiting.add(sourceFile);
+
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) {
+    visiting.delete(sourceFile);
+    return new Set();
+  }
+  const symbols = checker.getExportsOfModule(moduleSymbol);
+  const byName = new Map(symbols.map((symbol) => [symbol.getName(), symbol]));
+  const runtime = new Set<string>();
+  const addValue = (name: string): void => {
+    const symbol = byName.get(name);
+    if (symbol && (resolveAlias(checker, symbol).flags & ts.SymbolFlags.Value)) {
+      runtime.add(name);
+    }
+  };
+
+  for (const statement of sourceFile.statements) {
+    for (const name of directlyExportedNames(statement)) addValue(name);
+    if (ts.isExportAssignment(statement)) {
+      addValue(statement.isExportEquals ? "export=" : "default");
+      continue;
+    }
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
+
+    if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const specifier of statement.exportClause.elements) {
+        if (specifier.isTypeOnly) continue;
+        const isSvelteDefault = Boolean(
+          statement.moduleSpecifier
+          && ts.isStringLiteral(statement.moduleSpecifier)
+          && statement.moduleSpecifier.text.endsWith(".svelte")
+          && specifier.propertyName?.text === "default",
+        );
+        if (isSvelteDefault) runtime.add(specifier.name.text);
+        else addValue(specifier.name.text);
+      }
+      continue;
+    }
+
+    if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) {
+      runtime.add(statement.exportClause.name.text);
+      continue;
+    }
+
+    if (!statement.moduleSpecifier) continue;
+    const targetFile = referencedSourceFile(checker, statement.moduleSpecifier);
+    if (targetFile) {
+      for (const name of runtimeExportsFromSourceFile(targetFile, checker, cache, visiting)) {
+        if (name !== "default" && byName.has(name)) runtime.add(name);
+      }
+      continue;
+    }
+    const targetSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
+    if (targetSymbol) {
+      for (const symbol of checker.getExportsOfModule(resolveAlias(checker, targetSymbol))) {
+        if (symbol.getName() !== "default"
+          && (resolveAlias(checker, symbol).flags & ts.SymbolFlags.Value)
+          && byName.has(symbol.getName())) {
+          runtime.add(symbol.getName());
+        }
+      }
+    }
+  }
+
+  visiting.delete(sourceFile);
+  cache.set(sourceFile, runtime);
+  return new Set(runtime);
+}
+
+function componentDefaultExports(sourceFile: ts.SourceFile): Set<string> {
+  const names = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
+    if (!statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    if (!statement.moduleSpecifier.text.endsWith(".svelte")) continue;
+    if (!statement.exportClause || !ts.isNamedExports(statement.exportClause)) continue;
+    for (const specifier of statement.exportClause.elements) {
+      if (specifier.isTypeOnly) continue;
+      if (specifier.propertyName?.text === "default") names.add(specifier.name.text);
+    }
+  }
+  return names;
+}
+
+function resolveAlias(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol {
+  if (!(symbol.flags & ts.SymbolFlags.Alias)) return symbol;
+  try {
+    return checker.getAliasedSymbol(symbol);
+  } catch {
+    return symbol;
+  }
+}
+
+function symbolIsCallable(checker: ts.TypeChecker, symbol: ts.Symbol): boolean {
+  const target = resolveAlias(checker, symbol);
+  if (target.flags & (ts.SymbolFlags.Function | ts.SymbolFlags.Class)) return true;
+  const declaration = target.valueDeclaration ?? target.declarations?.[0];
+  if (!declaration) return false;
+  try {
+    const type = checker.getTypeOfSymbolAtLocation(target, declaration);
+    return checker.getSignaturesOfType(type, ts.SignatureKind.Call).length > 0
+      || checker.getSignaturesOfType(type, ts.SignatureKind.Construct).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function inspectEntry(path: string, javascriptRuntime = false): InspectedEntry {
+  if (!existsSync(path)) throw new Error(`missing public export entrypoint: ${path}`);
+  const program = ts.createProgram([path], compilerOptions(javascriptRuntime));
+  const sourceFile = program.getSourceFile(path);
+  if (!sourceFile) throw new Error(`could not load public export entrypoint: ${path}`);
+  const checker = program.getTypeChecker();
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) throw new Error(`could not inspect public export entrypoint: ${path}`);
+
+  const symbols = checker.getExportsOfModule(moduleSymbol);
+  const declarations = symbols.map((symbol) => symbol.getName()).sort();
+  const runtime = javascriptRuntime
+    ? [...declarations]
+    : [...runtimeExportsFromSourceFile(sourceFile, checker)].sort();
+  const runtimeSet = new Set(runtime);
+  const callable = new Set(componentDefaultExports(sourceFile));
+  for (const symbol of symbols) {
+    if (runtimeSet.has(symbol.getName()) && symbolIsCallable(checker, symbol)) {
+      callable.add(symbol.getName());
+    }
+  }
+
+  return {
+    path,
+    declarations,
+    runtime,
+    callable: [...callable].filter((name) => runtimeSet.has(name)).sort(),
+  };
+}
+
+/**
+ * Read the canonical source barrel rather than maintaining an export-name
+ * inventory. TypeScript's checker follows `export *`, named aliases, and
+ * type-only symbols, so every future public export automatically joins the
+ * contract that git-dist must preserve.
+ */
+export function derivePublicExportManifest(
+  sourceRoot: string,
+  packageName: PublicSubpackage,
+): PublicExportManifest {
+  const entry = resolve(sourceRoot, packageName, "src/index.ts");
+  const { declarations, runtime, callable } = inspectEntry(entry);
+  return { declarations, runtime, callable };
+}
+
+function missingNames(expected: readonly string[], actual: readonly string[]): string[] {
+  const actualNames = new Set(actual);
+  return expected.filter((name) => !actualNames.has(name));
+}
+
+/**
+ * Compare canonical source barrels with the assembled aggregate, including
+ * declaration-only exports and JavaScript callability. This is deliberately
+ * name-list-free: the barrels are the single source of truth.
+ */
+export function assertGitDistExportParity(
+  distRoot = PACKAGE_ROOT,
+  sourceRoot = distRoot,
+): GitDistExportManifests {
+  const manifests = {} as GitDistExportManifests;
+  for (const packageName of PACKAGES) {
+    const expected = derivePublicExportManifest(sourceRoot, packageName);
+    manifests[packageName] = expected;
+
+    const declarations = inspectEntry(
+      resolve(distRoot, "git-dist", packageName, "index.d.ts"),
+    );
+    const runtime = inspectEntry(
+      resolve(distRoot, "git-dist", packageName, "index.js"),
+      true,
+    );
+
+    const missingDeclarations = missingNames(expected.declarations, declarations.declarations);
+    if (missingDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} declaration exports missing from git-dist: ${missingDeclarations.join(", ")}`,
+      );
+    }
+
+    const missingValueDeclarations = missingNames(expected.runtime, declarations.runtime);
+    if (missingValueDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} value declarations missing from git-dist: ${missingValueDeclarations.join(", ")}`,
+      );
+    }
+
+    const missingCallableDeclarations = missingNames(expected.callable, declarations.callable);
+    if (missingCallableDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} callable declarations are not callable in git-dist: ${missingCallableDeclarations.join(", ")}`,
+      );
+    }
+
+    const missingRuntime = missingNames(expected.runtime, runtime.runtime);
+    if (missingRuntime.length > 0) {
+      throw new Error(
+        `${packageName} runtime exports missing from git-dist: ${missingRuntime.join(", ")}`,
+      );
+    }
+
+    const missingCallable = missingNames(expected.callable, runtime.callable);
+    if (missingCallable.length > 0) {
+      throw new Error(
+        `${packageName} callable exports are not callable in git-dist: ${missingCallable.join(", ")}`,
+      );
+    }
+  }
+  return manifests;
+}
+
+function namedImports(
+  names: readonly string[],
+  packageName: PublicSubpackage,
+  kind = "export",
+): Array<{ imported: string; local: string }> {
+  return names.map((imported, index) => {
+    if (!/^[$A-Z_a-z][$\w]*$/.test(imported)) {
+      throw new Error(`unsupported non-identifier export name in ${packageName}: ${imported}`);
+    }
+    return { imported, local: `__thumbmux_${packageName}_${kind}_${index}` };
+  });
+}
+
+function renderTypeExportGuard(manifests: GitDistExportManifests): string {
+  const sections = PACKAGES.map((packageName) => {
+    const manifest = manifests[packageName];
+    const runtimeNames = new Set(manifest.runtime);
+    const valueImports = namedImports(manifest.runtime, packageName, "value");
+    const typeImports = namedImports(
+      manifest.declarations.filter((name) => !runtimeNames.has(name)),
+      packageName,
+      "type",
+    );
+    const specifier = JSON.stringify(`thumbmux/${packageName}`);
+    return [
+      ...(valueImports.length > 0
+        ? [
+          "import {",
+          ...valueImports.map(({ imported, local }) => `  ${imported} as ${local},`),
+          `} from ${specifier};`,
+        ]
+        : []),
+      ...(typeImports.length > 0
+        ? [
+          "import type {",
+          ...typeImports.map(({ imported, local }) => `  ${imported} as ${local},`),
+          `} from ${specifier};`,
+        ]
+        : []),
+      "void [",
+      ...valueImports.map(({ local }) => `  ${local},`),
+      "];",
+    ].join("\n");
+  });
+  return `${sections.join("\n\n")}\n\nexport {};\n`;
+}
+
+function renderNodeRuntimeGuard(manifests: GitDistExportManifests): string {
+  const expected = Object.fromEntries(
+    (["core", "server"] as const).map((packageName) => [packageName, {
+      runtime: manifests[packageName].runtime,
+      callable: manifests[packageName].callable,
+    }]),
+  );
+  return [
+    'import * as core from "thumbmux/core";',
+    'import * as server from "thumbmux/server";',
+    "",
+    `const expected = ${JSON.stringify(expected)};`,
+    "const modules = { core, server };",
+    "for (const [packageName, contract] of Object.entries(expected)) {",
+    "  const loaded = modules[packageName];",
+    "  for (const name of contract.runtime) {",
+    "    if (!Object.prototype.hasOwnProperty.call(loaded, name)) {",
+    "      throw new Error(`${packageName} runtime export missing from installed git-dist: ${name}`);",
+    "    }",
+    "  }",
+    "  for (const name of contract.callable) {",
+    "    if (typeof loaded[name] !== \"function\") {",
+    "      throw new Error(`${packageName} export is not callable from installed git-dist: ${name}`);",
+    "    }",
+    "  }",
+    "}",
+    "console.log(JSON.stringify({ exportGuard: { core: Object.keys(core).length, server: Object.keys(server).length } }));",
+    "",
+  ].join("\n");
+}
+
+function renderSvelteRuntimeGuard(manifest: PublicExportManifest): string {
+  const imports = namedImports(manifest.runtime, "svelte");
+  const callable = new Set(manifest.callable);
+  return [
+    "import {",
+    ...imports.map(({ imported, local }) => `  ${imported} as ${local},`),
+    '} from "thumbmux/svelte";',
+    "",
+    "const checks: Array<readonly [string, unknown, boolean]> = [",
+    ...imports.map(({ imported, local }) =>
+      `  [${JSON.stringify(imported)}, ${local}, ${callable.has(imported)}],`),
+    "];",
+    "for (const [name, value, mustBeCallable] of checks) {",
+    "  if (value === undefined) throw new Error(`svelte runtime export missing from installed git-dist: ${name}`);",
+    "  if (mustBeCallable && typeof value !== \"function\") {",
+    "    throw new Error(`svelte export is not callable from installed git-dist: ${name}`);",
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+}
+
+function renderSvelteRuntimeRunner(): string {
+  return [
+    'import { fileURLToPath } from "node:url";',
+    'import { createServer } from "vite";',
+    "",
+    'const root = fileURLToPath(new URL(".", import.meta.url));',
+    "const vite = await createServer({",
+    "  root,",
+    '  configFile: fileURLToPath(new URL("./vite.config.ts", import.meta.url)),',
+    '  appType: "custom",',
+    "  server: { hmr: false, middlewareMode: true },",
+    "  ssr: { noExternal: [/^thumbmux(?:\\/|$)/] },",
+    "});",
+    "try {",
+    '  await vite.ssrLoadModule("/src/git-dist-export-guard.ts");',
+    '  console.log(JSON.stringify({ exportGuard: { svelte: "runtime-loaded" } }));',
+    "} finally {",
+    "  await vite.close();",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/** Generate exhaustive guards only inside the throwaway packed-package consumer. */
+export function writeGitDistConsumerGuards(
+  consumerRoot: string,
+  sourceRoot = PACKAGE_ROOT,
+): void {
+  const manifests = Object.fromEntries(
+    PACKAGES.map((packageName) => [
+      packageName,
+      derivePublicExportManifest(sourceRoot, packageName),
+    ]),
+  ) as GitDistExportManifests;
+
+  const tsconfigPath = resolve(consumerRoot, "tsconfig.json");
+  const mainPath = resolve(consumerRoot, "src/main.ts");
+  if (!existsSync(tsconfigPath) || !existsSync(mainPath)) {
+    throw new Error(`consumer fixture is incomplete: ${consumerRoot}`);
+  }
+
+  writeFileSync(
+    resolve(consumerRoot, "type-export-guard.ts"),
+    renderTypeExportGuard(manifests),
+    "utf8",
+  );
+  writeFileSync(
+    resolve(consumerRoot, "runtime-export-guard.mjs"),
+    renderNodeRuntimeGuard(manifests),
+    "utf8",
+  );
+  writeFileSync(
+    resolve(consumerRoot, "src/git-dist-export-guard.ts"),
+    renderSvelteRuntimeGuard(manifests.svelte),
+    "utf8",
+  );
+  writeFileSync(
+    resolve(consumerRoot, "runtime-svelte-export-guard.mjs"),
+    renderSvelteRuntimeRunner(),
+    "utf8",
+  );
+
+  const tsconfig = JSON.parse(readFileSync(tsconfigPath, "utf8")) as {
+    include?: string[];
+    [key: string]: unknown;
+  };
+  const include = new Set(tsconfig.include ?? []);
+  include.add("type-export-guard.ts");
+  tsconfig.include = [...include];
+  writeFileSync(tsconfigPath, `${JSON.stringify(tsconfig, null, 2)}\n`, "utf8");
+
+  const main = readFileSync(mainPath, "utf8");
+  const guardImport = 'import "./git-dist-export-guard";';
+  if (!main.includes(guardImport)) {
+    writeFileSync(mainPath, `${guardImport}\n${main}`, "utf8");
+  }
+}
 
 function filesBelow(root: string): string[] {
   const files: string[] = [];
@@ -236,10 +727,30 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
 }
 
 if (import.meta.main) {
-  const result = rewriteGitDistImports();
-  // Counts are diagnostic only — they grow whenever new modules import core.
-  // The fail-closed invariants above are what gate the release build.
-  console.log(
-    `rewrote ${result.replacements} core imports across ${result.files.length} git-dist files (counts informational)`,
-  );
+  const [command, ...args] = process.argv.slice(2);
+  if (command === "check-exports") {
+    const distRoot = resolve(args[0] ?? PACKAGE_ROOT);
+    const sourceRoot = resolve(args[1] ?? distRoot);
+    const manifests = assertGitDistExportParity(distRoot, sourceRoot);
+    console.log(
+      `git-dist export parity passed: ${PACKAGES.map((packageName) =>
+        `${packageName} ${manifests[packageName].declarations.length} declarations/${manifests[packageName].runtime.length} runtime`)
+        .join(", ")}`,
+    );
+  } else if (command === "write-consumer-guards") {
+    const consumerRoot = args[0];
+    if (!consumerRoot) throw new Error("write-consumer-guards requires a consumer root");
+    const sourceRoot = resolve(args[1] ?? PACKAGE_ROOT);
+    writeGitDistConsumerGuards(resolve(consumerRoot), sourceRoot);
+    console.log(`wrote source-derived git-dist consumer guards: ${resolve(consumerRoot)}`);
+  } else if (command) {
+    throw new Error(`unknown command: ${command}`);
+  } else {
+    const result = rewriteGitDistImports();
+    // Counts are diagnostic only — they grow whenever new modules import core.
+    // The fail-closed invariants above are what gate the release build.
+    console.log(
+      `rewrote ${result.replacements} core imports across ${result.files.length} git-dist files (counts informational)`,
+    );
+  }
 }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertGitDistInvariants,
+  assertGitDistExportParity,
   findBareCoreSpecifiers,
   requiredGitDistArtifacts,
   rewriteGitDistImports,
@@ -54,6 +55,153 @@ function writeExportsMap(root: string): void {
   writeFileSync(join(root, "server/dist/index.d.ts"), "export type { Value } from '@thumbmux/core';\n");
   writeFileSync(join(root, "svelte/dist/index.js"), 'export { value } from "@thumbmux/core";\n');
   writeFileSync(join(root, "svelte/dist/index.d.ts"), "export type { Value } from '@thumbmux/core';\n");
+}
+
+function writeExportSurface(
+  root: string,
+  options: {
+    coreTypeStar?: boolean;
+    coreTypeStarValueOverride?: boolean;
+    nestedCoreTypeStar?: boolean;
+    omitCoreType?: boolean;
+    omitFakeServerDeclaration?: boolean;
+    omitFakeServerRuntime?: boolean;
+    makeFakeServerDeclarationNonCallable?: boolean;
+    makeFakeServerDeclarationTypeOnly?: boolean;
+    makeFakeServerRuntimeNonCallable?: boolean;
+  } = {},
+): void {
+  for (const packageName of ["core", "server", "svelte"]) {
+    mkdirSync(join(root, packageName, "src"), { recursive: true });
+    mkdirSync(join(root, "git-dist", packageName), { recursive: true });
+  }
+
+  writeFileSync(
+    join(root, "core/src/index.ts"),
+    [
+      options.nestedCoreTypeStar
+        ? "export * from './middle';"
+        : options.coreTypeStar || options.coreTypeStarValueOverride
+          ? "export type * from './protocol';"
+          : "export * from './protocol';",
+      ...(options.coreTypeStarValueOverride
+        ? ["export { erasedByTypeStar } from './protocol';"]
+        : []),
+      "export const coreValue = 1;",
+      "export function coreFunction(): number { return coreValue; }",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "core/src/protocol.ts"),
+    [
+      "export type CoreShape = { value: string };",
+      ...(options.coreTypeStar || options.coreTypeStarValueOverride || options.nestedCoreTypeStar
+        ? ["export const erasedByTypeStar = 1;"]
+        : []),
+      "",
+    ].join("\n"),
+  );
+  if (options.nestedCoreTypeStar) {
+    writeFileSync(
+      join(root, "core/src/middle.ts"),
+      "export type * from './protocol';\n",
+    );
+  }
+  writeFileSync(
+    join(root, "git-dist/core/index.d.ts"),
+    [
+      options.nestedCoreTypeStar
+        ? "export * from './middle';"
+        : options.coreTypeStar || options.coreTypeStarValueOverride
+          ? "export type * from './protocol';"
+          : "export * from './protocol';",
+      ...(options.coreTypeStarValueOverride
+        ? ["export { erasedByTypeStar } from './protocol';"]
+        : []),
+      "export declare const coreValue = 1;",
+      "export declare function coreFunction(): number;",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/core/protocol.d.ts"),
+    options.omitCoreType
+      ? "export {};\n"
+      : [
+        "export type CoreShape = { value: string };",
+        ...(options.coreTypeStar || options.coreTypeStarValueOverride || options.nestedCoreTypeStar
+          ? ["export declare const erasedByTypeStar = 1;"]
+          : []),
+        "",
+      ].join("\n"),
+  );
+  if (options.nestedCoreTypeStar) {
+    writeFileSync(
+      join(root, "git-dist/core/middle.d.ts"),
+      "export type * from './protocol';\n",
+    );
+  }
+  writeFileSync(
+    join(root, "git-dist/core/index.js"),
+    "export const coreValue = 1; export function coreFunction() { return coreValue; }\n",
+  );
+
+  writeFileSync(
+    join(root, "server/src/index.ts"),
+    [
+      "export const stableServerExport = true;",
+      "export function fakeDistGuardExport(): string { return 'guard'; }",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/server/index.d.ts"),
+    [
+      "export declare const stableServerExport = true;",
+      ...(options.omitFakeServerDeclaration
+        ? []
+        : options.makeFakeServerDeclarationTypeOnly
+          ? ["export type fakeDistGuardExport = string;"]
+          : options.makeFakeServerDeclarationNonCallable
+            ? ["export declare const fakeDistGuardExport: string;"]
+            : ["export declare function fakeDistGuardExport(): string;"]),
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/server/index.js"),
+    [
+      "export const stableServerExport = true;",
+      ...(options.omitFakeServerRuntime
+        ? []
+        : options.makeFakeServerRuntimeNonCallable
+          ? ["export const fakeDistGuardExport = 'guard';"]
+          : ["export function fakeDistGuardExport() { return 'guard'; }"]),
+      "",
+    ].join("\n"),
+  );
+
+  writeFileSync(
+    join(root, "svelte/src/index.ts"),
+    [
+      "export type SvelteShape = { active: boolean };",
+      "export function svelteFunction(): boolean { return true; }",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/svelte/index.d.ts"),
+    [
+      "export type SvelteShape = { active: boolean };",
+      "export declare function svelteFunction(): boolean;",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/svelte/index.js"),
+    "export function svelteFunction() { return true; }\n",
+  );
 }
 
 describe("git-dist import rewriting", () => {
@@ -195,5 +343,93 @@ describe("git-dist import rewriting", () => {
     expect(body).toContain("// lives in @thumbmux/core (docs only)");
     expect(body).toContain('from "../core/index.js"');
     expect(findBareCoreSpecifiers(root)).toEqual([]);
+  });
+});
+
+describe("git-dist public export guard", () => {
+  test("derives the public declaration/runtime surface and accepts a complete dist", () => {
+    const root = fixture();
+    writeExportSurface(root);
+
+    expect(() => assertGitDistExportParity(root)).not.toThrow();
+  });
+
+  test("fails when a source-derived export is absent from assembled declarations", () => {
+    const root = fixture();
+    writeExportSurface(root, { omitFakeServerDeclaration: true });
+
+    // This is the task brief's adversarial fallback: the canonical source
+    // advertises a new export while the already-built aggregate omits it.
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "server declaration exports missing from git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("fails when a source-derived runtime export is absent from assembled JavaScript", () => {
+    const root = fixture();
+    writeExportSurface(root, { omitFakeServerRuntime: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "server runtime exports missing from git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("fails when a runtime export is represented as type-only in declarations", () => {
+    const root = fixture();
+    writeExportSurface(root, { makeFakeServerDeclarationTypeOnly: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "server value declarations missing from git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("fails when a callable export has non-callable declarations", () => {
+    const root = fixture();
+    writeExportSurface(root, { makeFakeServerDeclarationNonCallable: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "server callable declarations are not callable in git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("fails when an exported callable is replaced by a non-callable value", () => {
+    const root = fixture();
+    writeExportSurface(root, { makeFakeServerRuntimeNonCallable: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "server callable exports are not callable in git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("follows export-star declarations and catches a missing type-only export", () => {
+    const root = fixture();
+    writeExportSurface(root, { omitCoreType: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "core declaration exports missing from git-dist: CoreShape",
+    );
+  });
+
+  test("does not classify values behind export type-star as runtime exports", () => {
+    const root = fixture();
+    writeExportSurface(root, { coreTypeStar: true });
+
+    expect(() => assertGitDistExportParity(root)).not.toThrow();
+  });
+
+  test("keeps an explicit value export that overrides export type-star", () => {
+    const root = fixture();
+    writeExportSurface(root, { coreTypeStarValueOverride: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "core runtime exports missing from git-dist: erasedByTypeStar",
+    );
+  });
+
+  test("does not leak runtime values through a nested export type-star", () => {
+    const root = fixture();
+    writeExportSurface(root, { nestedCoreTypeStar: true });
+
+    expect(() => assertGitDistExportParity(root)).not.toThrow();
   });
 });
