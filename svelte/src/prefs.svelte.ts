@@ -20,6 +20,21 @@ function writeCache(key: string, prefs: ThumbmuxPrefs) {
   try { localStorage.setItem(key, JSON.stringify(prefs)); } catch { /* quota/private mode */ }
 }
 
+function isPrefsSnapshot(value: unknown): value is ThumbmuxPrefs {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function canRefreshCache(cached: ThumbmuxPrefs, fresh: ThumbmuxPrefs): boolean {
+  const cachedKeys = Object.keys(cached);
+  const freshKeys = Object.keys(fresh);
+  // Host-defined keys are valid prefs, so there is no fixed required-key list.
+  // Reject empty/unrelated payloads without blocking authoritative deletions.
+  return freshKeys.length > 0 && (
+    cachedKeys.length === 0
+    || cachedKeys.some((key) => Object.prototype.hasOwnProperty.call(fresh, key))
+  );
+}
+
 export function createLocalPrefs(key = 'thumbmux-prefs'): PreferencesAdapter {
   const subs = new Set<(p: ThumbmuxPrefs) => void>();
   return {
@@ -46,6 +61,39 @@ export function createServerPrefs(opts: {
   // bump on every save so an in-flight background GET can't clobber newer
   // local state with a stale server snapshot
   let generation = 0;
+  type PendingPut = { patch: Partial<ThumbmuxPrefs>; body: string };
+  let committed: ThumbmuxPrefs = {};
+  const pendingPuts: PendingPut[] = [];
+  let putTail: Promise<void> = Promise.resolve();
+  const projectPending = () => pendingPuts.reduce(
+    (prefs, pending) => mergePrefs(prefs, pending.patch),
+    committed,
+  );
+
+  async function runPut(pending: PendingPut): Promise<void> {
+    let accepted = false;
+    let saved: unknown = null;
+    try {
+      const r = await doFetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: pending.body,
+      });
+      if (r.ok) {
+        accepted = true;
+        saved = await r.json().catch(() => null);
+      }
+    } catch { /* network failure — remove this optimistic patch below */ }
+
+    if (accepted) {
+      // A successful endpoint normally returns the authoritative snapshot.
+      // Preserve the prior optimistic behavior if a 2xx response has no JSON.
+      committed = isPrefsSnapshot(saved) ? saved : mergePrefs(committed, pending.patch);
+    }
+    const index = pendingPuts.indexOf(pending);
+    if (index !== -1) pendingPuts.splice(index, 1);
+    emit(projectPending());
+  }
 
   return {
     async load() {
@@ -56,28 +104,29 @@ export function createServerPrefs(opts: {
         if (!r.ok || generation !== gen) return;
         const fresh = await r.json().catch(() => null);
         if (generation !== gen) return; // a save() won while we were fetching
-        if (fresh && typeof fresh === 'object' && JSON.stringify(fresh) !== JSON.stringify(readCache(cacheKey))) emit(fresh);
+        const current = readCache(cacheKey);
+        if (
+          isPrefsSnapshot(fresh)
+          && canRefreshCache(current, fresh)
+          && JSON.stringify(fresh) !== JSON.stringify(current)
+        ) emit(fresh);
       }).catch(() => { /* offline — cache serves */ });
       return cached;
     },
     async save(patch) {
       generation++;
-      emit(mergePrefs(readCache(cacheKey), patch)); // optimistic
+      if (pendingPuts.length === 0) committed = readCache(cacheKey);
       // deletes must survive JSON transport: undefined → null (RFC 7386 style)
       const wire: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(patch)) wire[k] = v === undefined ? null : v;
-      const gen = generation;
-      try {
-        const r = await doFetch(url, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(wire),
-        });
-        if (r.ok && generation === gen) {
-          const saved = await r.json().catch(() => null);
-          if (saved && typeof saved === 'object' && generation === gen) emit(saved);
-        }
-      } catch { /* offline — optimistic local copy stands until next sync */ }
+      const body = JSON.stringify(wire);
+      const stablePatch = JSON.parse(body) as Partial<ThumbmuxPrefs>;
+      const pending = { patch: stablePatch, body };
+      pendingPuts.push(pending);
+      const result = putTail.then(() => runPut(pending), () => runPut(pending));
+      putTail = result.then(() => {}, () => {});
+      emit(projectPending()); // optimistic
+      await result;
     },
     subscribe(cb) { subs.add(cb); return () => subs.delete(cb); },
   };
