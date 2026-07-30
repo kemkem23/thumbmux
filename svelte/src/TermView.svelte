@@ -184,9 +184,10 @@
   let pendingContentFlushFrame: number | null = null;
   let paletteRefreshPending = false;
   let renderRefreshPending = false;
-  let prependParseFrame: number | null = null;
-  let prependCommitFrame: number | null = null;
+  let pendingPrependWork: (() => void) | null = null;
+  let cancelPrependWorkTask: (() => void) | null = null;
   let prependParseSeq = 0;
+  let destroyed = false;
 
   type PrependLinkPlan = {
     batchLinks: (LineLinkRange[] | undefined)[];
@@ -483,8 +484,10 @@
   }
 
   function stopInertia() {
+    const stopped = momentumFrame !== null || springFrame !== null;
     if (momentumFrame !== null) { cancelAnimationFrame(momentumFrame); momentumFrame = null; }
     if (springFrame !== null) { cancelAnimationFrame(springFrame); springFrame = null; }
+    if (stopped) schedulePendingPrependWork();
   }
 
   // --- ANSI render bookkeeping (incremental, off the scroll path) ---
@@ -854,6 +857,44 @@
     }
   }
 
+  function cancelScheduledPrependWork() {
+    const cancel = cancelPrependWorkTask;
+    cancelPrependWorkTask = null;
+    cancel?.();
+  }
+
+  /** Run history parsing and commit only in background time after scrolling
+   * settles. The callback checks busy again because a new gesture may begin
+   * after the task was scheduled but before the browser invokes it. */
+  function schedulePendingPrependWork() {
+    if (destroyed || busy() || pendingPrependWork === null || cancelPrependWorkTask) return;
+
+    const run = () => {
+      cancelPrependWorkTask = null;
+      if (destroyed || busy() || pendingPrependWork === null) return;
+      const work = pendingPrependWork;
+      pendingPrependWork = null;
+      work();
+    };
+
+    if (typeof requestIdleCallback === 'function') {
+      const taskId = requestIdleCallback(run, { timeout: 250 });
+      cancelPrependWorkTask = () => {
+        if (typeof cancelIdleCallback === 'function') cancelIdleCallback(taskId);
+      };
+      return;
+    }
+
+    const taskId = setTimeout(run, 0);
+    cancelPrependWorkTask = () => clearTimeout(taskId);
+  }
+
+  function enqueuePrependWork(work: () => void) {
+    if (destroyed) return;
+    pendingPrependWork = work;
+    schedulePendingPrependWork();
+  }
+
   function commitStagedPrepend(stage: PrependStage) {
     if (stage.seq !== prependParseSeq || stage.lines.length === 0) {
       finishArchiveRequest('malformed');
@@ -905,11 +946,7 @@
   }
 
   function schedulePrependCommit(stage: PrependStage) {
-    if (prependCommitFrame !== null) cancelAnimationFrame(prependCommitFrame);
-    prependCommitFrame = requestAnimationFrame(() => {
-      prependCommitFrame = null;
-      commitStagedPrepend(stage);
-    });
+    enqueuePrependWork(() => commitStagedPrepend(stage));
   }
 
   function stageHistoryPrepend(lines: string[]) {
@@ -928,7 +965,6 @@
     let idx = 0;
 
     const parseSlice = () => {
-      prependParseFrame = null;
       if (seq !== prependParseSeq) return;
       const stop = Math.min(batch.length, idx + HISTORY_PARSE_CHUNK_LINES);
       for (; idx < stop; idx++) {
@@ -937,7 +973,7 @@
         exitStates[idx] = cloneSgrState(st);
       }
       if (idx < batch.length) {
-        prependParseFrame = requestAnimationFrame(parseSlice);
+        enqueuePrependWork(parseSlice);
         return;
       }
       const endState = cloneSgrState(st);
@@ -952,20 +988,10 @@
       });
     };
 
-    prependParseFrame = requestAnimationFrame(parseSlice);
+    enqueuePrependWork(parseSlice);
   }
 
-  function applyArchivedHistory(data: string) {
-    // Only the currently inflight request may consume a reply. A timed-out or
-    // otherwise abandoned request leaves archiveInflightRequestId null, so a
-    // late/lost-then-replayed frame is discarded without locking retries out.
-    if (!archiveRequestActive || archiveInflightRequestId === null) return;
-
-    if (archiveRequestTimer) {
-      clearTimeout(archiveRequestTimer);
-      archiveRequestTimer = null;
-    }
-
+  function processArchivedHistory(data: string) {
     let payload: unknown = null;
     try {
       payload = JSON.parse(data);
@@ -1006,6 +1032,27 @@
     stageHistoryPrepend(lines);
   }
 
+  function applyArchivedHistory(data: string) {
+    // Only the currently inflight request may consume a reply. A timed-out or
+    // otherwise abandoned request leaves archiveInflightRequestId null, so a
+    // late/lost-then-replayed frame is discarded without locking retries out.
+    if (!archiveRequestActive || archiveInflightRequestId === null) return;
+
+    if (archiveRequestTimer) {
+      clearTimeout(archiveRequestTimer);
+      archiveRequestTimer = null;
+    }
+
+    // Claim the wire reply immediately so a duplicate cannot overwrite the
+    // queued raw page. Keep archiveLoading true until validation/commit ends.
+    const requestId = archiveInflightRequestId;
+    archiveRequestActive = false;
+    enqueuePrependWork(() => {
+      if (archiveInflightRequestId !== requestId || !archiveLoading) return;
+      processArchivedHistory(data);
+    });
+  }
+
   function contentUpdateBlock() {
     return { busy: busy(), selectionActive };
   }
@@ -1038,6 +1085,7 @@
     contentUpdateGate = result.gate;
     if (result.delivery) applyContentDelivery(result.delivery);
     flushDeferredPresentation();
+    schedulePendingPrependWork();
   }
 
   function flushDeferredPresentation() {
@@ -1800,11 +1848,13 @@
   onDestroy(() => {
     // Svelte 5 runs onDestroy during SSR too — guard all browser APIs.
     if (typeof window === 'undefined') return;
+    destroyed = true;
     stopInertia();
     if (dragFrame !== null) cancelAnimationFrame(dragFrame);
     if (pendingContentFlushFrame !== null) cancelAnimationFrame(pendingContentFlushFrame);
-    if (prependParseFrame !== null) { cancelAnimationFrame(prependParseFrame); prependParseFrame = null; }
-    if (prependCommitFrame !== null) { cancelAnimationFrame(prependCommitFrame); prependCommitFrame = null; }
+    cancelScheduledPrependWork();
+    pendingPrependWork = null;
+    prependParseSeq++;
     if (altWheelFrame !== null) { cancelAnimationFrame(altWheelFrame); altWheelFrame = null; }
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);

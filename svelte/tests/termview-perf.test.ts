@@ -74,10 +74,17 @@ let originalRequestAnimationFrame: typeof requestAnimationFrame;
 let originalCancelAnimationFrame: typeof cancelAnimationFrame;
 let originalWindowRequestAnimationFrame: typeof window.requestAnimationFrame;
 let originalWindowCancelAnimationFrame: typeof window.cancelAnimationFrame;
+let originalRequestIdleCallbackDescriptor: PropertyDescriptor | undefined;
+let originalCancelIdleCallbackDescriptor: PropertyDescriptor | undefined;
+let originalWindowRequestIdleCallbackDescriptor: PropertyDescriptor | undefined;
+let originalWindowCancelIdleCallbackDescriptor: PropertyDescriptor | undefined;
 
 let frameNow = 0;
 let nextFrameId = 1;
 let frameCallbacks = new Map<number, FrameRequestCallback>();
+let nextIdleId = 1;
+let idleCallbacks = new Map<number, IdleRequestCallback>();
+let historyRequestCount = 0;
 
 function requestControlledFrame(callback: FrameRequestCallback): number {
   const id = nextFrameId++;
@@ -109,6 +116,49 @@ function drainAnimationFrames(limit = 500): void {
   }
   if (frameCallbacks.size > 0) {
     throw new Error(`animation frame queue did not settle after ${limit} batches`);
+  }
+}
+
+function requestControlledIdle(callback: IdleRequestCallback): number {
+  const id = nextIdleId++;
+  idleCallbacks.set(id, callback);
+  return id;
+}
+
+function cancelControlledIdle(id: number): void {
+  idleCallbacks.delete(id);
+}
+
+function restoreOwnProperty(
+  target: object,
+  property: string,
+  descriptor: PropertyDescriptor | undefined,
+): void {
+  if (descriptor) Object.defineProperty(target, property, descriptor);
+  else Reflect.deleteProperty(target, property);
+}
+
+function runIdleCallbackBatch(): number {
+  const callbacks = [...idleCallbacks.values()];
+  idleCallbacks.clear();
+  const deadline: IdleDeadline = {
+    didTimeout: false,
+    timeRemaining: () => 50,
+  };
+  for (const callback of callbacks) callback(deadline);
+  flushSync();
+  return callbacks.length;
+}
+
+function drainScheduledWork(limit = 1_000): void {
+  let batches = 0;
+  while ((frameCallbacks.size > 0 || idleCallbacks.size > 0) && batches < limit) {
+    if (frameCallbacks.size > 0) runAnimationFrameBatch();
+    if (idleCallbacks.size > 0) runIdleCallbackBatch();
+    batches++;
+  }
+  if (frameCallbacks.size > 0 || idleCallbacks.size > 0) {
+    throw new Error(`scheduled work did not settle after ${limit} batches`);
   }
 }
 
@@ -162,6 +212,11 @@ function deliverOutput(lineCount: number): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
   const data = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join("\n");
   sessionCallback(data, "output", null, { source: "full", replace: true });
+}
+
+function deliverHistory(lines: string[]): void {
+  if (!sessionCallback) throw new Error("subscribe was not invoked");
+  sessionCallback(JSON.stringify({ lines, startLine: 0, hasMore: false }), "history");
 }
 
 async function prepareScrollableTermView(
@@ -313,6 +368,9 @@ beforeEach(() => {
   frameNow = 0;
   nextFrameId = 1;
   frameCallbacks = new Map();
+  nextIdleId = 1;
+  idleCallbacks = new Map();
+  historyRequestCount = 0;
 
   originalSubscribe = tmuxMux.subscribe;
   originalRequestHistory = tmuxMux.requestHistory;
@@ -322,7 +380,9 @@ beforeEach(() => {
       if (sessionCallback === callback) sessionCallback = null;
     };
   }) as typeof tmuxMux.subscribe;
-  tmuxMux.requestHistory = (() => {}) as typeof tmuxMux.requestHistory;
+  tmuxMux.requestHistory = (() => {
+    historyRequestCount++;
+  }) as typeof tmuxMux.requestHistory;
 
   originalResizeObserver = globalThis.ResizeObserver;
   originalWindowResizeObserver = window.ResizeObserver;
@@ -337,6 +397,26 @@ beforeEach(() => {
   globalThis.cancelAnimationFrame = cancelControlledFrame;
   window.requestAnimationFrame = requestControlledFrame;
   window.cancelAnimationFrame = cancelControlledFrame;
+  originalRequestIdleCallbackDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "requestIdleCallback",
+  );
+  originalCancelIdleCallbackDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "cancelIdleCallback",
+  );
+  originalWindowRequestIdleCallbackDescriptor = Object.getOwnPropertyDescriptor(
+    window,
+    "requestIdleCallback",
+  );
+  originalWindowCancelIdleCallbackDescriptor = Object.getOwnPropertyDescriptor(
+    window,
+    "cancelIdleCallback",
+  );
+  globalThis.requestIdleCallback = requestControlledIdle;
+  globalThis.cancelIdleCallback = cancelControlledIdle;
+  window.requestIdleCallback = requestControlledIdle;
+  window.cancelIdleCallback = cancelControlledIdle;
   jest.spyOn(performance, "now").mockImplementation(() => frameNow);
 });
 
@@ -359,7 +439,12 @@ afterEach(() => {
   globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
   window.requestAnimationFrame = originalWindowRequestAnimationFrame;
   window.cancelAnimationFrame = originalWindowCancelAnimationFrame;
+  restoreOwnProperty(globalThis, "requestIdleCallback", originalRequestIdleCallbackDescriptor);
+  restoreOwnProperty(globalThis, "cancelIdleCallback", originalCancelIdleCallbackDescriptor);
+  restoreOwnProperty(window, "requestIdleCallback", originalWindowRequestIdleCallbackDescriptor);
+  restoreOwnProperty(window, "cancelIdleCallback", originalWindowCancelIdleCallbackDescriptor);
   frameCallbacks.clear();
+  idleCallbacks.clear();
   jest.restoreAllMocks();
 });
 
@@ -575,5 +660,83 @@ describe("TermView momentum virtual window", () => {
     const settledOffset = Number(viewport.getAttribute("data-bottom-offset"));
     expect(compositorBottomOffset(viewport)).toBe(settledOffset);
     expectMountedLinesCover(viewport, mountedLineKeys(viewport), settledOffset);
+  });
+});
+
+describe("TermView history prepend scheduling", () => {
+  test("defers history parse, layout reads, and commit until momentum settles", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    const baselineTotal = Number(viewport.getAttribute("data-total"));
+    const baselineArchiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const maxOffset = Math.max(0, baselineTotal * lineHeight - viewport.clientHeight);
+
+    // Stop 900px short of the archive threshold. The fling projection crosses
+    // it, so the request is issued as momentum starts rather than by the wheel.
+    wheelTowardHistory(viewport, -(maxOffset - 900));
+    expect(historyRequestCount).toBe(0);
+    const endY = startTouchFling(viewport, 60);
+    runAnimationFrameBatch();
+    releaseTouchFling(viewport, endY);
+    flushSync();
+    expect(historyRequestCount).toBe(1);
+
+    const settledMirrorBeforeFling = viewport.getAttribute("data-bottom-offset");
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
+    let historyRectReads = 0;
+    jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
+      if (this === viewport || this.classList.contains("mtv-line")) historyRectReads++;
+      return originalGetBoundingClientRect.call(this);
+    });
+
+    const historyLines = Array.from(
+      { length: 2_000 },
+      (_, i) => `\u001b[31mhistory-${i}\u001b[0m`,
+    );
+    deliverHistory(historyLines);
+
+    // The old implementation finishes seven 300-row ANSI slices and commits
+    // on frame eight. Exercise idle callbacks too: each one must re-check busy.
+    for (let frame = 0; frame < 12; frame++) {
+      expect(frameCallbacks.size).toBeGreaterThan(0);
+      runAnimationFrameBatch();
+      if (idleCallbacks.size > 0) runIdleCallbackBatch();
+      expect(viewport.getAttribute("data-bottom-offset")).toBe(settledMirrorBeforeFling);
+    }
+
+    expect(historyRectReads).toBe(0);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(baselineTotal);
+    expect(Number(viewport.getAttribute("data-archive-offset"))).toBe(baselineArchiveOffset);
+
+    drainScheduledWork();
+    flushSync();
+
+    expect(historyRectReads).toBeGreaterThan(0);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(
+      baselineTotal + historyLines.length,
+    );
+    expect(Number(viewport.getAttribute("data-archive-offset"))).toBe(
+      baselineArchiveOffset - historyLines.length,
+    );
+  });
+
+  test("starts an idle history response without waiting for a settle transition", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    const baselineTotal = Number(viewport.getAttribute("data-total"));
+    const baselineArchiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const historyLines = ["\u001b[32molder-a\u001b[0m", "older-b", "older-c"];
+
+    wheelTowardHistory(viewport, -1_000_000);
+    expect(historyRequestCount).toBe(1);
+    deliverHistory(historyLines);
+    drainScheduledWork();
+    flushSync();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(
+      baselineTotal + historyLines.length,
+    );
+    expect(Number(viewport.getAttribute("data-archive-offset"))).toBe(
+      baselineArchiveOffset - historyLines.length,
+    );
   });
 });
