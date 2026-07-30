@@ -20,12 +20,13 @@ import {
   type MuxClientMessage,
   type MuxFullOutputFrame,
   type MuxServerMessage,
+  type SessionListItem,
 } from "@thumbmux/core";
 
 export type WsLike = { send(data: string): unknown };
 
 export interface TmuxDriver {
-  listSessions(): unknown[];
+  listSessions(): SessionListItem[];
   capturePane(session: string, opts: { startLine?: number; currentPaneOnly?: boolean }): Promise<string>;
   sendKeys(session: string, data: string): void;
   /** session → last-activity timestamp (one tmux call for all sessions) */
@@ -131,7 +132,7 @@ export interface MuxHooks<WS extends WsLike = WsLike> {
    * Unset = every socket sees the provider list verbatim (pre-0.4 behaviour, unchanged).
    * Throwing = FAIL CLOSED: that socket receives nothing this round.
    * Hosts typically wire `guard.filterSessions(sessions, principalOf(ws))` into this hook. */
-  filterSessionList?(sessions: readonly unknown[], ws: WS, client: unknown): readonly unknown[];
+  filterSessionList?(sessions: readonly SessionListItem[], ws: WS, client: unknown): readonly SessionListItem[];
 }
 
 /**
@@ -256,7 +257,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private geometryGeneration = 0;
   private lastReconcileCapture = new Map<string, number>();
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
-  private sessionListProvider: () => unknown[];
+  private sessionListProvider: () => readonly SessionListItem[];
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
   /** Per-session viewers whose latest subscription opted into delta output frames. */
@@ -315,7 +316,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.bpClose = bp.close;
   }
 
-  setSessionListProvider(provider?: () => unknown[]) {
+  setSessionListProvider(provider?: () => readonly SessionListItem[]) {
     this.sessionListProvider = provider ?? (() => this.driver.listSessions());
     this.lastSessionsJson = "";
   }
@@ -638,7 +639,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
    */
   private sessionListDataFor(
     ws: WS,
-    sessions: readonly unknown[],
+    sessions: readonly SessionListItem[],
     unfilteredJson: string,
     client: unknown,
   ): string | null {

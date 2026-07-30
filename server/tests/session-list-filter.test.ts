@@ -7,6 +7,7 @@
  * fails closed for that socket alone.
  */
 import { describe, expect, test } from "bun:test";
+import type { SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
 
 const PANE = "pane-s";
@@ -63,7 +64,19 @@ async function until(predicate: () => boolean, timeoutMs = 2_000) {
   throw new Error("condition not met before timeout");
 }
 
-type SessionRow = { name: string; owner?: string };
+type SessionRow = SessionListItem & { owner?: string };
+
+function sessionRow(name: string, owner?: string): SessionRow {
+  const row: SessionRow = {
+    name,
+    created: "0",
+    windows: 1,
+    attached: false,
+    activityAt: 0,
+  };
+  if (owner !== undefined) row.owner = owner;
+  return row;
+}
 
 function makeHarness(opts: {
   sessions?: () => SessionRow[];
@@ -72,9 +85,9 @@ function makeHarness(opts: {
   pollNormalMs?: number;
 } = {}) {
   let sessionList: SessionRow[] = [
-    { name: "alpha", owner: "A" },
-    { name: "beta", owner: "B" },
-    { name: "gamma", owner: "C" },
+    sessionRow("alpha", "A"),
+    sessionRow("beta", "B"),
+    sessionRow("gamma", "C"),
   ];
   const contents = new Map([[PANE, "line-0"]]);
   let activity = 0;
@@ -117,13 +130,13 @@ function makeHarness(opts: {
 
 /** Filter by principal id stored on the client object `{ principal: "A" }`. */
 function principalFilter(
-  sessions: readonly unknown[],
+  sessions: readonly SessionListItem[],
   _ws: unknown,
   client: unknown,
-): readonly unknown[] {
+): readonly SessionListItem[] {
   const principal = (client as { principal?: string } | undefined)?.principal;
   if (!principal) return [];
-  return (sessions as SessionRow[]).filter((s) => s.owner === principal || s.name === principal);
+  return (sessions as readonly SessionRow[]).filter((s) => s.owner === principal || s.name === principal);
 }
 
 describe("session-list filter (DEFECT C)", () => {
@@ -161,7 +174,7 @@ describe("session-list filter (DEFECT C)", () => {
       expect(paneSocket.sessionListFrames().length).toBe(beforePane);
 
       // A real change pushes once more, still identical.
-      setSessions([{ name: "alpha" }, { name: "beta" }, { name: "delta" }]);
+      setSessions([sessionRow("alpha"), sessionRow("beta"), sessionRow("delta")]);
       (mux as any).broadcastSessionList();
       expect(listSocket.sessionListFrames().length).toBe(before + 1);
       expect(paneSocket.sessionListFrames().length).toBe(beforePane + 1);
@@ -177,8 +190,8 @@ describe("session-list filter (DEFECT C)", () => {
       hooks: {
         filterSessionList: (sessions, ws, client) => {
           const tag = (ws as FakeWS & { tag?: string }).tag;
-          if (tag === "A") return (sessions as SessionRow[]).filter((s) => s.name === "alpha");
-          if (tag === "B") return (sessions as SessionRow[]).filter((s) => s.name === "beta");
+          if (tag === "A") return (sessions as readonly SessionRow[]).filter((s) => s.name === "alpha");
+          if (tag === "B") return (sessions as readonly SessionRow[]).filter((s) => s.name === "beta");
           return [];
         },
       },
@@ -202,15 +215,15 @@ describe("session-list filter (DEFECT C)", () => {
       expect(rawB0).toContain("beta");
       expect(rawB0).not.toContain("alpha");
       expect(rawB0).not.toContain("gamma");
-      expect(JSON.parse(JSON.parse(rawA0).data)).toEqual([{ name: "alpha", owner: "A" }]);
-      expect(JSON.parse(JSON.parse(rawB0).data)).toEqual([{ name: "beta", owner: "B" }]);
+      expect(JSON.parse(JSON.parse(rawA0).data)).toEqual([sessionRow("alpha", "A")]);
+      expect(JSON.parse(JSON.parse(rawB0).data)).toEqual([sessionRow("beta", "B")]);
 
       // Later push still isolated.
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "gamma", owner: "C" },
-        { name: "alpha-2", owner: "A" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("gamma", "C"),
+        sessionRow("alpha-2", "A"),
       ]);
       // The filter only matches exact name "alpha" for A — still no beta.
       (mux as any).broadcastSessionList();
@@ -255,8 +268,8 @@ describe("session-list filter (DEFECT C)", () => {
       mux.subscribe(PANE, paneOnly);
       // Force a broadcast so paneOnly receives a list push.
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
       ]);
       (mux as any).broadcastSessionList();
       await until(() => paneOnly.sessionListFrames().length >= 1);
@@ -271,9 +284,9 @@ describe("session-list filter (DEFECT C)", () => {
       phase = "push";
       const before = seen.filter((s) => s.ws === listSocket).length;
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "gamma", owner: "C" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("gamma", "C"),
       ]);
       (mux as any).broadcastSessionList();
       await until(() => seen.filter((s) => s.ws === listSocket).length > before);
@@ -310,17 +323,17 @@ describe("session-list filter (DEFECT C)", () => {
       await until(() => good.sessionListFrames().length >= 1);
       expect(good.sessionListFrames().length).toBe(1);
       expect(JSON.parse(good.sessionListFrames()[0]!.data)).toEqual([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "gamma", owner: "C" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("gamma", "C"),
       ]);
       expect(bad.sessionListFrames().length).toBe(0);
 
       // Push round: bad still silent, good still receives.
-      setSessions([{ name: "only" }]);
+      setSessions([sessionRow("only")]);
       expect(() => (mux as any).broadcastSessionList()).not.toThrow();
       expect(good.sessionListFrames().length).toBe(2);
-      expect(JSON.parse(good.sessionListFrames().at(-1)!.data)).toEqual([{ name: "only" }]);
+      expect(JSON.parse(good.sessionListFrames().at(-1)!.data)).toEqual([sessionRow("only")]);
       expect(bad.sessionListFrames().length).toBe(0);
     } finally {
       mux.stop();
@@ -332,8 +345,8 @@ describe("session-list filter (DEFECT C)", () => {
     // Inject logError through the constructor option — same channel
     // subscribeSessions / broadcastSessionList already use.
     let sessionList: SessionRow[] = [
-      { name: "alpha", owner: "A" },
-      { name: "beta", owner: "B" },
+      sessionRow("alpha", "A"),
+      sessionRow("beta", "B"),
     ];
     const contents = new Map([[PANE, "line-0"]]);
     let activity = 0;
@@ -394,7 +407,7 @@ describe("session-list filter (DEFECT C)", () => {
       hooks: {
         filterSessionList: (sessions, ws) => {
           const tag = (ws as FakeWS & { tag?: string }).tag;
-          if (tag === "A") return (sessions as SessionRow[]).filter((s) => s.name === "alpha");
+          if (tag === "A") return (sessions as readonly SessionRow[]).filter((s) => s.name === "alpha");
           return sessions;
         },
       },
@@ -411,9 +424,9 @@ describe("session-list filter (DEFECT C)", () => {
       expect(socketA.sessionListRaw()[0]!).not.toContain("beta");
 
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "omega", owner: "Z" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("omega", "Z"),
       ]);
       // Wait for the real poll loop to fire broadcastSessionList (not a direct call).
       await until(() => socketA.sessionListFrames().length > afterReply, 3_000);
@@ -430,7 +443,7 @@ describe("session-list filter (DEFECT C)", () => {
     const { mux, setSessions } = makeHarness({
       hooks: {
         filterSessionList: (sessions) =>
-          (sessions as SessionRow[]).filter((s) => s.name === "alpha"),
+          (sessions as readonly SessionRow[]).filter((s) => s.name === "alpha"),
       },
     });
     const ws = new FakeWS();
@@ -449,10 +462,10 @@ describe("session-list filter (DEFECT C)", () => {
       // to per-socket-dedupe). Its view must not be corrupted with the other
       // principal's rows.
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "gamma", owner: "C" },
-        { name: "beta-extra", owner: "B" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("gamma", "C"),
+        sessionRow("beta-extra", "B"),
       ]);
       (mux as any).broadcastSessionList();
       expect(ws.sessionListFrames().length).toBe(n0 + 1);
@@ -461,7 +474,7 @@ describe("session-list filter (DEFECT C)", () => {
       expect(raw).not.toContain("beta");
       expect(raw).not.toContain("gamma");
       expect(raw).not.toContain("beta-extra");
-      expect(JSON.parse(JSON.parse(raw).data)).toEqual([{ name: "alpha", owner: "A" }]);
+      expect(JSON.parse(JSON.parse(raw).data)).toEqual([sessionRow("alpha", "A")]);
     } finally {
       mux.stop();
     }
@@ -472,7 +485,7 @@ describe("session-list filter (DEFECT C)", () => {
       hooks: {
         filterSessionList: (sessions, ws) => {
           const tag = (ws as FakeWS & { tag?: string }).tag;
-          if (tag === "A") return (sessions as SessionRow[]).filter((s) => s.name === "alpha");
+          if (tag === "A") return (sessions as readonly SessionRow[]).filter((s) => s.name === "alpha");
           return sessions;
         },
       },
@@ -493,9 +506,9 @@ describe("session-list filter (DEFECT C)", () => {
 
       // Session list changes while blocked — broadcast skips, marks owed.
       setSessions([
-        { name: "alpha", owner: "A" },
-        { name: "beta", owner: "B" },
-        { name: "secret", owner: "Z" },
+        sessionRow("alpha", "A"),
+        sessionRow("beta", "B"),
+        sessionRow("secret", "Z"),
       ]);
       (mux as any).broadcastSessionList();
       expect(ws.sessionListFrames().length).toBe(listBefore);
@@ -506,14 +519,14 @@ describe("session-list filter (DEFECT C)", () => {
       expect(catchUp).toContain("alpha");
       expect(catchUp).not.toContain("beta");
       expect(catchUp).not.toContain("secret");
-      expect(JSON.parse(JSON.parse(catchUp).data)).toEqual([{ name: "alpha", owner: "A" }]);
+      expect(JSON.parse(JSON.parse(catchUp).data)).toEqual([sessionRow("alpha", "A")]);
     } finally {
       mux.stop();
     }
   });
 
   test("8. lastSessionsJson is not clobbered by catch-up (fix 4a)", async () => {
-    let sessionList: SessionRow[] = [{ name: "a" }];
+    let sessionList: SessionRow[] = [sessionRow("a")];
     const { mux, setContent } = makeHarness({
       sessions: () => sessionList,
     });
@@ -541,7 +554,7 @@ describe("session-list filter (DEFECT C)", () => {
       // List change while A blocked — B receives it, A is owed.
       const healthyListBefore = healthy.sessionListFrames().length;
       const blockedListBefore = blocked.sessionListFrames().length;
-      sessionList = [{ name: "a" }, { name: "b" }];
+      sessionList = [sessionRow("a"), sessionRow("b")];
       (mux as any).broadcastSessionList();
       expect(healthy.sessionListFrames().length).toBe(healthyListBefore + 1);
       expect(JSON.parse(healthy.sessionListFrames().at(-1)!.data)).toEqual(sessionList);
@@ -555,7 +568,7 @@ describe("session-list filter (DEFECT C)", () => {
       // NEXT global change must still reach B (and A).
       const healthyAfterDrain = healthy.sessionListFrames().length;
       const blockedAfterDrain = blocked.sessionListFrames().length;
-      sessionList = [{ name: "a" }, { name: "b" }, { name: "c" }];
+      sessionList = [sessionRow("a"), sessionRow("b"), sessionRow("c")];
       (mux as any).broadcastSessionList();
       expect(healthy.sessionListFrames().length).toBe(healthyAfterDrain + 1);
       expect(blocked.sessionListFrames().length).toBe(blockedAfterDrain + 1);

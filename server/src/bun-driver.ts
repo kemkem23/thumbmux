@@ -41,13 +41,24 @@ function parseCursorLine(line: string): RawCursorState | null {
 }
 
 export function createBunTmuxDriver(): TmuxDriver {
+  // Refreshed by getSessionActivity(), which the mux already calls once per
+  // poll. listSessions() reuses this sample so adding activityAt never adds a
+  // second list-windows invocation to a poll.
+  let latestActivity = new Map<string, number>();
+
   return {
     listSessions() {
       try {
         return run(["list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}"])
           .trim().split("\n").filter(Boolean).map((line) => {
             const [name, created, windows, attached] = line.split("|");
-            return { name, created, windows: Number(windows) || 1, attached: attached === "1" };
+            return {
+              name,
+              created,
+              windows: Number(windows) || 1,
+              attached: attached === "1",
+              activityAt: latestActivity.get(name!) ?? 0,
+            };
           });
       } catch {
         return []; // no server running yet
@@ -87,6 +98,7 @@ export function createBunTmuxDriver(): TmuxDriver {
           if (t > (map.get(name) ?? 0)) map.set(name, t);
         }
       } catch { /* no server */ }
+      latestActivity = map;
       return map;
     },
     getHistoryLimit() {

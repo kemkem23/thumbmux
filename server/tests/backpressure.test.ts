@@ -7,10 +7,14 @@
  * Client-requested replies (pong / history / error) stay unconditional.
  */
 import { describe, expect, test } from "bun:test";
-import { applyMuxDelta, splitMuxOutputData } from "../../core/src/protocol";
+import { applyMuxDelta, splitMuxOutputData, type SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "sim-bp";
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 type Frame = Record<string, any>;
 
@@ -125,14 +129,14 @@ function makeHarness(opts: {
   initial?: string;
   backpressure?: ConstructorParameters<typeof TmuxWsMux>[0]["backpressure"];
   hooks?: ConstructorParameters<typeof TmuxWsMux>[0]["hooks"];
-  sessions?: () => unknown[];
+  sessions?: () => SessionListItem[];
 } = {}) {
   const initial = opts.initial ?? Array.from({ length: 40 }, (_, i) => `row-${i}`).join("\n");
   const contents = new Map([[SESSION, initial]]);
   let activity = 0;
   const cursor = { x: 0, y: 0, paneHeight: 1, visible: true };
   const driver: TmuxDriver = {
-    listSessions: opts.sessions ?? (() => [...contents.keys()].map((name) => ({ name }))),
+    listSessions: opts.sessions ?? (() => [...contents.keys()].map(sessionListItem)),
     capturePane: async (session) => contents.get(session) ?? "",
     captureWithCursor: async (session) => ({
       content: contents.get(session) ?? "",
@@ -163,7 +167,7 @@ function makeHarness(opts: {
     cursor,
     initial,
     setContent: (content: string) => contents.set(SESSION, content),
-    setSessions: (list: unknown[]) => {
+    setSessions: (list: SessionListItem[]) => {
       (driver as any)._sessions = list;
     },
   };
@@ -490,7 +494,7 @@ describe("backpressure — skip / drain / shed", () => {
   });
 
   test("10. session-list pushes suppressed while blocked and re-pushed on drain", async () => {
-    let sessionList: unknown[] = [{ name: "a" }];
+    let sessionList: SessionListItem[] = [sessionListItem("a")];
     const { mux, setContent, initial } = makeHarness({
       sessions: () => sessionList,
     });
@@ -506,7 +510,7 @@ describe("backpressure — skip / drain / shed", () => {
       await until(() => ws.frames().length === 2 && mux.isBackpressured(ws));
 
       // Change the session list while blocked — broadcast must skip this socket.
-      sessionList = [{ name: "a" }, { name: "b" }];
+      sessionList = [sessionListItem("a"), sessionListItem("b")];
       // Force a broadcast by waiting for the poller session-list tick, or call privately.
       (mux as any).lastSessionsJson = "";
       (mux as any).broadcastSessionList();
@@ -764,7 +768,7 @@ describe("backpressure — skip / drain / shed", () => {
   });
 
   test("17. auto-resume settles session-list debt exactly once", async () => {
-    let sessionList: unknown[] = [{ name: "a" }];
+    let sessionList: SessionListItem[] = [sessionListItem("a")];
     const events: string[] = [];
     const { mux, setContent, initial } = makeHarness({
       sessions: () => sessionList,
@@ -786,7 +790,7 @@ describe("backpressure — skip / drain / shed", () => {
       await until(() => ws.frames().length === 2 && mux.isBackpressured(ws));
 
       // List change while blocked → skipped, debt recorded.
-      sessionList = [{ name: "a" }, { name: "b" }];
+      sessionList = [sessionListItem("a"), sessionListItem("b")];
       (mux as any).lastSessionsJson = "";
       (mux as any).broadcastSessionList();
       expect(ws.sessionListFrames().length).toBe(listBefore);

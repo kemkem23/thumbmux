@@ -10,10 +10,14 @@
  * until the refactor lands; enable it in the same change that groups sends.
  */
 import { describe, expect, test } from "bun:test";
-import { applyMuxDelta, splitMuxOutputData } from "../../core/src/protocol";
+import { applyMuxDelta, splitMuxOutputData, type SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "sim-delta-group";
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 type Frame = Record<string, any>;
 
@@ -88,7 +92,7 @@ function makeHarness(initial = "line-0\nline-1\nline-2\nline-3") {
   let activity = 0;
   const cursor = { x: 0, y: 0, paneHeight: 1, visible: true };
   const driver: TmuxDriver = {
-    listSessions: () => [...contents.keys()].map((name) => ({ name })),
+    listSessions: () => [...contents.keys()].map(sessionListItem),
     capturePane: async (session) => contents.get(session) ?? "",
     captureWithCursor: async (session) => ({
       content: contents.get(session) ?? "",

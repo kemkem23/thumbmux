@@ -7,6 +7,26 @@
 
 export type MuxCursor = { row: number; col: number };
 
+/**
+ * One row inside the JSON-encoded `data` of a `__sessions` frame.
+ * `createBunTmuxDriver()` supplies every field below; hosts that provide a
+ * custom `TmuxDriver` or session-list provider must supply the same fields.
+ */
+export type SessionListItem = {
+  /** Package-filled tmux session name; custom hosts must supply it. */
+  name: string;
+  /** Package-filled tmux creation timestamp (epoch seconds as a string); custom hosts must supply it. */
+  created: string;
+  /** Package-filled window count; custom hosts must supply it. */
+  windows: number;
+  /** Package-filled attachment state; custom hosts must supply it. */
+  attached: boolean;
+  /** Package-filled latest window-activity timestamp (epoch seconds, or `0` before a sample); custom hosts must supply it. */
+  activityAt: number;
+  /** Host-added metadata is allowed and is preserved on the session-list wire. */
+  [key: string]: unknown;
+};
+
 /** A complete output base. `data.split("\n")` is the exact delta base. */
 export type MuxFullOutputFrame = {
   channel: string;
@@ -61,7 +81,8 @@ export type MuxClientMessage = MuxResyncRequest | {
 export type MuxServerMessage = MuxOutputFrame | {
   channel: string;
   type: "sessions" | "history" | "error" | "cursor";
-  /** Absent on "cursor" frames — they update only the caret. */
+  /** Absent on "cursor" frames — they update only the caret. On a
+   * `__sessions` frame this is JSON-encoded `SessionListItem[]`. */
   data?: string;
   /** On output frames: the pane's real cursor, or null when hidden.
    * `row` counts up from the LAST CONTENT line (trailing blank viewport rows

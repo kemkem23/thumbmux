@@ -9,9 +9,14 @@
  * Scripted fake driver — no tmux needed.
  */
 import { describe, expect, test } from "bun:test";
+import type { SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver, type RawCursorState } from "../src";
 
 const SES = "fake-session";
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 class FakeWS {
   sent: string[] = [];
@@ -43,7 +48,7 @@ type State = ReturnType<typeof makeState>;
 
 function baseDriver(state: State): TmuxDriver {
   return {
-    listSessions: () => [{ name: SES }],
+    listSessions: () => [sessionListItem(SES)],
     // UNTRIMMED, like the reference bun driver (trailing viewport blanks kept)
     capturePane: async () => state.viewport.join("\n") + "\n",
     sendKeys: () => {},

@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import type { SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "scrollback-depth";
 const HISTORY_LIMIT = 6_000;
 const LIVE_LINE_LIMIT = 2_000;
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 class FakeWS {
   sent: string[] = [];
@@ -33,7 +38,7 @@ function makeHarness() {
   const lines = Array.from({ length: HISTORY_LIMIT }, (_, index) => `line-${index + 1}`);
   const captureStarts: Array<number | undefined> = [];
   const driver: TmuxDriver = {
-    listSessions: () => [{ name: SESSION }],
+    listSessions: () => [sessionListItem(SESSION)],
     capturePane: async (_session, opts) => {
       captureStarts.push(opts.startLine);
       const startLine = opts.startLine ?? -LIVE_LINE_LIMIT;
@@ -147,7 +152,7 @@ describe("scrollback depth without a history archive", () => {
     let releaseFirstCapture!: () => void;
     const firstCaptureGate = new Promise<void>((resolve) => { releaseFirstCapture = resolve; });
     const driver: TmuxDriver = {
-      listSessions: () => [{ name: SESSION }],
+      listSessions: () => [sessionListItem(SESSION)],
       capturePane: async (_session, opts) => {
         captureStarts.push(opts.startLine);
         if (captureStarts.length === 1) await firstCaptureGate;

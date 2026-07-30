@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import type { SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "sim-resize";
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 class FakeWS {
   sent: string[] = [];
@@ -27,7 +32,7 @@ describe("resize recapture", () => {
     const resizes: Array<{ cols: number; rows: number }> = [];
     let activity = 0;
     const driver: TmuxDriver = {
-      listSessions: () => [{ name: SESSION }],
+      listSessions: () => [sessionListItem(SESSION)],
       capturePane: async () => content,
       captureWithCursor: async () => ({
         content,
@@ -76,7 +81,7 @@ describe("resize recapture", () => {
     const content = Array.from({ length: 80 }, (_, index) => `line-${index}`).join("\n");
     let activity = 0;
     const driver: TmuxDriver = {
-      listSessions: () => [{ name: SESSION }],
+      listSessions: () => [sessionListItem(SESSION)],
       capturePane: async () => content,
       captureWithCursor: async () => ({
         content,
@@ -158,7 +163,7 @@ describe("resize recapture", () => {
     let captureCount = 0;
     const resizes: Array<{ cols: number; rows: number }> = [];
     const driver: TmuxDriver = {
-      listSessions: () => [{ name: SESSION }],
+      listSessions: () => [sessionListItem(SESSION)],
       capturePane: async () => "",
       captureWithCursor: async () => {
         const next = deferred[captureCount++];

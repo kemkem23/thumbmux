@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { applyMuxDelta, splitMuxOutputData } from "../../core/src/protocol";
+import { applyMuxDelta, splitMuxOutputData, type SessionListItem } from "../../core/src/protocol";
 import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "sim-delta";
+
+function sessionListItem(name: string): SessionListItem {
+  return { name, created: "0", windows: 1, attached: false, activityAt: 0 };
+}
 
 type Frame = Record<string, any>;
 
@@ -56,7 +60,7 @@ function makeHarness(initial = longContent()) {
   let activity = 0;
   const cursor = { x: 4, y: 0, paneHeight: 1, visible: true };
   const driver: TmuxDriver = {
-    listSessions: () => [...contents.keys()].map((name) => ({ name })),
+    listSessions: () => [...contents.keys()].map(sessionListItem),
     capturePane: async (session) => contents.get(session) ?? "",
     captureWithCursor: async (session) => ({
       content: contents.get(session) ?? "",
@@ -226,7 +230,7 @@ describe("server delta conformance", () => {
     let activity = 0;
     const cursor = { x: 4, y: 0, paneHeight: 1, visible: true };
     const driver: TmuxDriver = {
-      listSessions: () => [...contents.keys()].map((name) => ({ name })),
+      listSessions: () => [...contents.keys()].map(sessionListItem),
       capturePane: async (session) => contents.get(session) ?? "",
       captureWithCursor: async (session) => ({
         content: contents.get(session) ?? "",
