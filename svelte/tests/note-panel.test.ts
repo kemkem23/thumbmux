@@ -73,6 +73,20 @@ describe("NotePanel", () => {
     expect(rendered.split("\n")).toHaveLength(3);
   });
 
+  test("prefills the draft with the saved note when editing starts", async () => {
+    const note = "saved first line\nsaved second line";
+    const { target } = mountNotePanel({ note });
+
+    const edit = target.querySelector<HTMLButtonElement>('[data-testid="note-edit"]');
+    if (!edit) throw new Error("NotePanel did not render its edit button");
+    flushSync(() => edit.click());
+    await tick();
+
+    const draft = target.querySelector<HTMLTextAreaElement>('[data-testid="note-draft"]');
+    if (!draft) throw new Error("NotePanel did not render its draft textarea");
+    expect(draft.value).toBe(note);
+  });
+
   test("sends the value entered in the DOM exactly once when saved", async () => {
     const saved: string[] = [];
     const { target } = mountNotePanel({
@@ -101,6 +115,34 @@ describe("NotePanel", () => {
 
     expect(saved).toHaveLength(1);
     expect(saved[0]).toBe(valueEnteredInDom);
+  });
+
+  test("trims surrounding whitespace before saving", async () => {
+    const saved: string[] = [];
+    const { target } = mountNotePanel({
+      note: "original note",
+      onSave: (text) => saved.push(text),
+    });
+
+    const edit = target.querySelector<HTMLButtonElement>('[data-testid="note-edit"]');
+    if (!edit) throw new Error("NotePanel did not render its edit button");
+    flushSync(() => edit.click());
+    await tick();
+
+    const draft = target.querySelector<HTMLTextAreaElement>('[data-testid="note-draft"]');
+    if (!draft) throw new Error("NotePanel did not render its draft textarea");
+    flushSync(() => {
+      draft.value = "  padded  ";
+      draft.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await tick();
+
+    const save = target.querySelector<HTMLButtonElement>('[data-testid="note-save"]');
+    if (!save) throw new Error("NotePanel did not render its save button");
+    flushSync(() => save.click());
+    await tick();
+
+    expect(saved).toEqual(["padded"]);
   });
 
   test("mounts safely for empty and undefined notes", async () => {
