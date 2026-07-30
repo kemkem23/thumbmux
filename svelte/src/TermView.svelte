@@ -172,6 +172,7 @@
   let selectionActive = false; // native text selection in progress — scroll yields
   let momentumFrame: number | null = null;
   let springFrame: number | null = null;
+  let momentumWindowFrozen = false;
   let touchY = 0;
   let touchVel = 0;
   let touchAt = 0;
@@ -1080,11 +1081,45 @@
     });
   }
 
+  type VisibleRowRange = { startIdx: number; endIdx: number };
+
+  function visibleRowRange(bottomOffset: number): VisibleRowRange {
+    const mo = maxOffset();
+    const scrollTop = mo - Math.max(0, Math.min(bottomOffset, mo));
+    return {
+      endIdx: Math.min(total, Math.ceil((scrollTop + viewH) / lineH) + 1),
+      startIdx: Math.max(0, Math.floor(scrollTop / lineH) - 1),
+    };
+  }
+
+  function rebuildWindow({ startIdx, endIdx }: VisibleRowRange) {
+    winStart = Math.max(0, startIdx - OVERSCAN_ROWS);
+    winEnd = Math.min(total, endIdx + OVERSCAN_ROWS);
+  }
+
+  function prebuildMomentumWindow(velocity: number) {
+    const current = visibleRowRange(bottomOffsetPx);
+    // The exponential integrator's remaining displacement is strictly less
+    // than velocity * tau, so this uncapped corridor covers every normal frame.
+    const projected = visibleRowRange(bottomOffsetPx + velocity * MOMENTUM_TAU);
+    winStart = Math.max(0, Math.min(
+      winStart,
+      current.startIdx - OVERSCAN_ROWS,
+      projected.startIdx - OVERSCAN_ROWS,
+    ));
+    winEnd = Math.min(total, Math.max(
+      winEnd,
+      current.endIdx + OVERSCAN_ROWS,
+      projected.endIdx + OVERSCAN_ROWS,
+    ));
+    momentumWindowFrozen = true;
+  }
+
   // --- virtual window + transform (the 120Hz hot path) ---
-  function applyScroll() {
+  function applyScroll(): boolean {
     // The browser selection owns the currently mounted native text nodes.
     // Do not move its virtual window until the selection has been released.
-    if (selectionActive) return;
+    if (selectionActive) return true;
     const mo = maxOffset();
     // Viewport growth (composer dock closing, URL-bar dance) can drop
     // maxOffset below the model offset while the pane is idle — nothing else
@@ -1098,11 +1133,28 @@
     const endIdx = Math.min(total, Math.ceil((scrollTop + viewH) / lineH) + 1);
     const startIdx = Math.max(0, Math.floor(scrollTop / lineH) - 1);
 
-    // Extend the rendered window only when the view leaves it — a DOM patch,
-    // never during a frame that's purely momentum inside the window.
-    if (startIdx < winStart - 1 || endIdx > winEnd) {
-      winStart = Math.max(0, startIdx - OVERSCAN_ROWS);
-      winEnd = Math.min(total, endIdx + OVERSCAN_ROWS);
+    const outsideWindow = startIdx < winStart - 1 || endIdx > winEnd;
+    let windowCovered = true;
+    if (momentumWindowFrozen && busy() && outsideWindow) {
+      // Geometry/content invalidated the projected corridor. End inertia and
+      // rebuild at the true offset in this callback, before the browser can
+      // paint an uncovered transform. The owner sees false and does not queue
+      // another momentum/spring frame.
+      stopInertia();
+      momentumWindowFrozen = false;
+      rebuildWindow({ startIdx, endIdx });
+      windowCovered = false;
+    }
+
+    if (windowCovered) {
+      // Momentum owns a prebuilt corridor and must never reconcile keyed rows.
+      // Once idle, force-shrink that corridor around the actual settled view.
+      if (momentumWindowFrozen && !busy()) {
+        momentumWindowFrozen = false;
+        rebuildWindow({ startIdx, endIdx });
+      } else if (!momentumWindowFrozen && outsideWindow) {
+        rebuildWindow({ startIdx, endIdx });
+      }
     }
 
     if (layerEl) {
@@ -1111,12 +1163,15 @@
     }
     emitScrollState();
     if (!busy()) settledBottomOffsetPx = Math.round(bottomOffsetPx);
+    if (!windowCovered && !busy()) schedulePendingContentFlush();
+    return windowCovered;
   }
 
-  function scrollBy(dyPx: number) {
+  function scrollBy(dyPx: number): boolean {
     bottomOffsetPx += dyPx;
-    applyScroll();
+    const windowCovered = applyScroll();
     if (dyPx > 0) maybeRequestOlderHistory();
+    return windowCovered;
   }
 
   function emitScrollState() {
@@ -1270,6 +1325,7 @@
     if (selectionActive) return; // user is adjusting a selection — hands off
     if (altScreenMouse) {
       stopInertia();
+      if (momentumWindowFrozen) applyScroll();
       tapStart = null;
       touching = false;
       altTouchMoved = false;
@@ -1278,6 +1334,7 @@
       return;
     }
     stopInertia();
+    if (momentumWindowFrozen) applyScroll();
     touching = true;
     pendingDragPx = 0;
     tapStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: performance.now() };
@@ -1348,7 +1405,13 @@
     const step = () => {
       const k = Math.min(1, (performance.now() - t0) / D);
       bottomOffsetPx = target + (from - target) * (1 - k) * (1 - k);
-      applyScroll();
+      const windowCovered = applyScroll();
+      if (!windowCovered) {
+        springFrame = null;
+        bottomOffsetPx = Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+        flushPendingContent();
+        return;
+      }
       if (k >= 1) {
         springFrame = null;
         bottomOffsetPx = target;
@@ -1520,13 +1583,23 @@
     // Keep the final queued drag inside the gesture. Otherwise applyScroll()
     // would publish an intermediate diagnostic value immediately before
     // momentum starts, producing two settle mutations for one fling.
-    touching = false;
     const mo = maxOffset();
-    if (bottomOffsetPx < 0 || bottomOffsetPx > mo) { springBack(); return; }
+    if (bottomOffsetPx < 0 || bottomOffsetPx > mo) {
+      touching = false;
+      springBack();
+      return;
+    }
     let vel = touchVel;
-    if (Math.abs(vel) < 0.04) { flushPendingContent(); return; }
+    if (Math.abs(vel) < 0.04) {
+      touching = false;
+      flushPendingContent();
+      return;
+    }
     const TAU = MOMENTUM_TAU;
     vel *= MOMENTUM_GAIN;
+    prebuildMomentumWindow(vel);
+    applyScroll();
+    touching = false;
     if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * MOMENTUM_TAU);
     let lastT = performance.now();
     const step = () => {
@@ -1534,8 +1607,13 @@
       const dt = Math.min(64, Math.max(1, now - lastT));
       lastT = now;
       const decay = Math.exp(-dt / TAU);
-      scrollBy(vel * TAU * (1 - decay));
+      const windowCovered = scrollBy(vel * TAU * (1 - decay));
       vel *= decay;
+      if (!windowCovered) {
+        momentumFrame = null;
+        flushPendingContent();
+        return;
+      }
       if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * TAU);
       const m = maxOffset();
       if (bottomOffsetPx < 0 || bottomOffsetPx > m) {

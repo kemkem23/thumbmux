@@ -166,6 +166,7 @@ function deliverOutput(lineCount: number): void {
 
 async function prepareScrollableTermView(
   onScrollStateChange?: (state: ScrollState) => void,
+  lineCount = 240,
 ): Promise<Mounted & { viewport: HTMLElement }> {
   const mountedView = mountTermView(onScrollStateChange);
   const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
@@ -179,7 +180,7 @@ async function prepareScrollableTermView(
   const resizeObserver = ControlledResizeObserver.latest;
   if (!resizeObserver) throw new Error("TermView did not observe its viewport");
   resizeObserver.fire();
-  deliverOutput(240);
+  deliverOutput(lineCount);
   await tick();
   drainAnimationFrames();
   flushSync();
@@ -200,16 +201,61 @@ function wheelTowardHistory(viewport: HTMLElement, deltaY = -120): void {
   drainAnimationFrames();
 }
 
-function startTouchFling(viewport: HTMLElement): void {
-  viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 80 }]));
+function startTouchFling(viewport: HTMLElement, travelPx = 60): number {
+  const startY = 80;
+  const endY = startY + travelPx;
+  viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: startY }]));
   frameNow += 16;
-  viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 140 }]));
+  viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: endY }]));
+  return endY;
 }
 
-function releaseTouchFling(viewport: HTMLElement): void {
+function releaseTouchFling(viewport: HTMLElement, endY = 140): void {
   viewport.dispatchEvent(
-    touchEvent("touchend", [], [{ clientX: 40, clientY: 140 }]),
+    touchEvent("touchend", [], [{ clientX: 40, clientY: endY }]),
   );
+}
+
+function mountedLineKeys(viewport: HTMLElement): number[] {
+  return Array.from(viewport.querySelectorAll(".mtv-line"), (row) => {
+    const value = row.getAttribute("data-line-id");
+    if (value === null) throw new Error("mounted terminal row is missing data-line-id");
+    const key = Number(value);
+    if (!Number.isFinite(key)) throw new Error(`invalid terminal row key: ${value}`);
+    return key;
+  }).sort((a, b) => a - b);
+}
+
+function visibleLineKeyBounds(
+  viewport: HTMLElement,
+  bottomOffset: number,
+): { first: number; last: number } {
+  const total = Number(viewport.getAttribute("data-total"));
+  const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+  const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+  const maxOffset = Math.max(0, total * lineHeight - viewport.clientHeight);
+  const scrollTop = maxOffset - Math.max(0, Math.min(bottomOffset, maxOffset));
+  return {
+    first: archiveOffset + Math.max(0, Math.floor(scrollTop / lineHeight)),
+    last: archiveOffset + Math.min(
+      total - 1,
+      Math.ceil((scrollTop + viewport.clientHeight) / lineHeight) - 1,
+    ),
+  };
+}
+
+function expectMountedLinesCover(
+  viewport: HTMLElement,
+  keys: number[],
+  bottomOffset: number,
+): void {
+  const visible = visibleLineKeyBounds(viewport, bottomOffset);
+  const mountedKeys = new Set(keys);
+  expect(keys[0]).toBeLessThanOrEqual(visible.first);
+  expect(keys.at(-1)).toBeGreaterThanOrEqual(visible.last);
+  for (let key = visible.first; key <= visible.last; key++) {
+    expect(mountedKeys.has(key)).toBe(true);
+  }
 }
 
 function compositorBottomOffset(viewport: HTMLElement): number {
@@ -445,5 +491,89 @@ describe("TermView compositor scroll diagnostics", () => {
 
     expect(scrollStates.some((state) => state.scrolledUp)).toBe(true);
     expect(scrollStates).toHaveLength(1);
+  });
+});
+
+describe("TermView momentum virtual window", () => {
+  test("keeps mounted row keys fixed during long momentum, then rebuilds at settle", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    const endY = startTouchFling(viewport, 320);
+
+    // Flush the queued drag while the touch is still active. The subsequent
+    // distance measurement therefore covers momentum rather than typed input.
+    runAnimationFrameBatch();
+    const offsetAtRelease = compositorBottomOffset(viewport);
+
+    releaseTouchFling(viewport, endY);
+    flushSync();
+    const preSettleOffset = viewport.getAttribute("data-bottom-offset");
+    const momentumSnapshots: number[][] = [];
+    let settled = false;
+
+    for (let frame = 0; frame < 500 && frameCallbacks.size > 0; frame++) {
+      runAnimationFrameBatch();
+      if (viewport.getAttribute("data-bottom-offset") === preSettleOffset) {
+        const keys = mountedLineKeys(viewport);
+        expectMountedLinesCover(viewport, keys, compositorBottomOffset(viewport));
+        momentumSnapshots.push(keys);
+      } else {
+        settled = true;
+        break;
+      }
+    }
+
+    expect(settled).toBe(true);
+    expect(momentumSnapshots.length).toBeGreaterThan(1);
+    const firstMomentumKeys = momentumSnapshots[0]!;
+    const momentumWindowRebuilds = momentumSnapshots.slice(1).filter((keys, i) => {
+      const previous = momentumSnapshots[i]!;
+      return keys.length !== previous.length || keys.some((key, keyIndex) => key !== previous[keyIndex]);
+    }).length;
+    const changedMomentumFrames = momentumSnapshots.slice(1).filter(
+      (keys) => keys.length !== firstMomentumKeys.length || keys.some((key, i) => key !== firstMomentumKeys[i]),
+    ).length;
+    expect(momentumWindowRebuilds).toBe(0);
+    expect(changedMomentumFrames).toBe(0);
+    for (const keys of momentumSnapshots) expect(keys).toEqual(firstMomentumKeys);
+
+    drainAnimationFrames();
+    flushSync();
+    const finalKeys = mountedLineKeys(viewport);
+    const finalOffset = compositorBottomOffset(viewport);
+    const settledOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    expect(finalOffset).toBe(settledOffset);
+    expect(finalOffset - offsetAtRelease).toBeGreaterThan(60 * lineHeight);
+    expect(finalKeys).not.toEqual(firstMomentumKeys);
+    expectMountedLinesCover(viewport, finalKeys, settledOffset);
+  });
+
+  test("settles and rebuilds before paint if resize leaves the projected window", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    const endY = startTouchFling(viewport, 320);
+    runAnimationFrameBatch();
+    releaseTouchFling(viewport, endY);
+    flushSync();
+    runAnimationFrameBatch();
+
+    Object.defineProperty(viewport, "clientHeight", {
+      configurable: true,
+      get: () => 5_000,
+    });
+    const resizeObserver = ControlledResizeObserver.latest;
+    if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+    resizeObserver.fire();
+    flushSync();
+
+    // The resize invalidates the prebuilt corridor. The same callback must
+    // stop inertia and mount the newly visible rows, not paint a blank gap.
+    const interruptedKeys = mountedLineKeys(viewport);
+    expectMountedLinesCover(viewport, interruptedKeys, compositorBottomOffset(viewport));
+
+    drainAnimationFrames();
+    flushSync();
+    const settledOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    expect(compositorBottomOffset(viewport)).toBe(settledOffset);
+    expectMountedLinesCover(viewport, mountedLineKeys(viewport), settledOffset);
   });
 });
