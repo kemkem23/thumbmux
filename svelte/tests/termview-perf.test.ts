@@ -244,6 +244,12 @@ function deliverOutput(lineCount: number): void {
   sessionCallback(data, "output", null, { source: "full", replace: true });
 }
 
+function deliverLiveAppend(lineCount: number): void {
+  if (!sessionCallback) throw new Error("subscribe was not invoked");
+  const data = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join("\n");
+  sessionCallback(data, "output", null, { source: "full", replace: false });
+}
+
 function deliverHistory(
   lines: string[],
   { startLine = 0, hasMore = false }: { startLine?: number; hasMore?: boolean } = {},
@@ -1178,6 +1184,27 @@ describe("TermView history prepend scheduling", () => {
 });
 
 describe("TermView retained history budgets", () => {
+  test("live append stays within retention budgets without changing mounted rows", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
+    wheelTowardHistory(viewport, -4_000);
+    const mountedBefore = mountedLineContent(viewport);
+
+    expect(mountedBefore.size).toBeGreaterThan(60);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(10_000);
+
+    deliverLiveAppend(22_000);
+    await tick();
+    drainScheduledWork();
+    flushSync();
+
+    const retainedRows = Number(viewport.getAttribute("data-total"));
+    const retainedBytes = Number(viewport.getAttribute("data-retained-estimated-bytes"));
+    const byteBudget = Number(viewport.getAttribute("data-retained-byte-budget"));
+    expect(retainedRows).toBeLessThanOrEqual(10_000);
+    expect(retainedBytes).toBeLessThanOrEqual(byteBudget);
+    expectMountedContentPreserved(mountedBefore, viewport);
+  }, 120_000);
+
   test("page 150 commit touches at most 2x page 10 after repeated prepends", async () => {
     const { viewport } = await prepareScrollableTermView(undefined, 240);
     const elementTouches: number[] = [];

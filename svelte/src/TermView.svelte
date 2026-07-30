@@ -726,16 +726,90 @@
     const nextEntryState = stateBefore[count]
       ? cloneSgrState(stateBefore[count])
       : cloneSgrState(rawEntryState);
-    archivedLines.splice(0, count);
+    const archivedCount = Math.min(count, archivedLines.length);
+    const liveCount = count - archivedCount;
+    archivedLines.splice(0, archivedCount);
+    if (liveCount > 0) liveLines.splice(0, liveCount);
     rawLines.splice(0, count);
     htmlCache.splice(0, count);
     stateBefore.splice(0, count);
     stateAfter.splice(0, count);
     linksByLine.splice(0, count);
     rawEntryState = nextEntryState;
+    if (archivedLines.length === 0) liveGapEntryState = null;
     archiveOffset += count;
     winStart = Math.max(0, winStart - count);
     winEnd = Math.max(0, winEnd - count);
+  }
+
+  /** Remove the oldest rows strictly below the mounted viewport+overscan while
+   * retaining the newest live tail. The two retained sides become the archive
+   * and live segments, with an explicit SGR checkpoint across their gap. */
+  function dropRetainedMiddle(from: number, count: number): void {
+    const start = Math.max(0, Math.min(from, rawLines.length));
+    const bounded = Math.min(count, rawLines.length - start);
+    if (bounded <= 0) return;
+    const suffixEntry = stateBefore[start + bounded]
+      ? cloneSgrState(stateBefore[start + bounded])
+      : null;
+    archivedLines = rawLines.slice(0, start);
+    liveLines = rawLines.slice(start + bounded);
+    rawLines.splice(start, bounded);
+    htmlCache.splice(start, bounded);
+    stateBefore.splice(start, bounded);
+    stateAfter.splice(start, bounded);
+    linksByLine.splice(start, bounded);
+    liveGapEntryState = liveLines.length > 0 && suffixEntry ? suffixEntry : null;
+    // Removing rows below the reader lowers maxOffset. Lower bottomOffset by
+    // the same height so the mounted rows retain their exact transform.
+    bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
+    if (liveGapEntryState) rebuildGapLinkSeam();
+  }
+
+  /** Enforce the same row/byte limits for live captures as history prepends.
+   * The mounted window (including overscan) is inviolate: discard oldest rows
+   * above it first, then only an unmounted suffix if more room is required. */
+  function enforceLiveRetention(): void {
+    let projectedRows = rawLines.length;
+    let projectedBytes = retainedEstimatedBytes;
+    let prefixCount = 0;
+    const protectedStart = Math.max(0, Math.min(winStart, rawLines.length));
+
+    while (prefixCount < protectedStart && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        rawLines[prefixCount] ?? '',
+        htmlCache[prefixCount] ?? '',
+        linksByLine[prefixCount],
+      );
+      prefixCount++;
+    }
+
+    if (prefixCount > 0) dropRetainedPrependPrefix(prefixCount);
+
+    let middleCount = 0;
+    const protectedEnd = Math.max(0, Math.min(winEnd, rawLines.length));
+    while (protectedEnd + middleCount < rawLines.length && (
+      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
+      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
+    )) {
+      projectedRows--;
+      projectedBytes -= estimatedLineStorageBytes(
+        rawLines[protectedEnd + middleCount] ?? '',
+        htmlCache[protectedEnd + middleCount] ?? '',
+        linksByLine[protectedEnd + middleCount],
+      );
+      middleCount++;
+    }
+
+    if (middleCount > 0) dropRetainedMiddle(protectedEnd, middleCount);
+    if (prefixCount > 0 || middleCount > 0) {
+      total = rawLines.length;
+      recalculateRetainedEstimatedBytes();
+    }
   }
 
   function tailEvictionStartForCurrentBudget(protectedEnd: number): number {
@@ -863,6 +937,11 @@
     total = next.length;
     rebuildAllLinks();
     rebuildFrom(common);
+    bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
+    // Content delivery is already gated outside gestures. Establish the exact
+    // protected viewport+overscan for the enlarged model before trimming it.
+    rebuildWindow(visibleRowRange(bottomOffsetPx));
+    enforceLiveRetention();
     bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
     contentEpoch++;
     applyScroll();
