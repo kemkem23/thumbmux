@@ -21,9 +21,16 @@ type Mounted = {
   input: HTMLInputElement;
   target: HTMLElement;
 };
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
 
 const mounted: Mounted[] = [];
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+const malformedSuccessError =
+  "Invalid upload response: expected a non-empty files array with stored paths";
 
 function replaceFetch(fetchImpl: typeof fetch): void {
   Object.defineProperty(globalThis, "fetch", {
@@ -33,7 +40,20 @@ function replaceFetch(fetchImpl: typeof fetch): void {
   });
 }
 
-function mountUploadAction(overrides: Partial<UploadActionProps> = {}): Mounted {
+function deferred<T>(): Deferred<T> {
+  let resolve!: Deferred<T>["resolve"];
+  let reject!: Deferred<T>["reject"];
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function mountUploadAction(
+  overrides: Partial<UploadActionProps> = {},
+  configureProps?: (props: UploadActionProps) => void,
+): Mounted {
   const target = document.createElement("div");
   document.body.appendChild(target);
 
@@ -42,6 +62,7 @@ function mountUploadAction(overrides: Partial<UploadActionProps> = {}): Mounted 
     onError: () => {},
     ...overrides,
   };
+  configureProps?.(props);
 
   let app!: Record<string, unknown>;
   flushSync(() => {
@@ -135,6 +156,10 @@ describe("UploadAction", () => {
 
     expect(uploadResults).toHaveLength(1);
     expect(result.files).toEqual(storedByServer);
+    expect(result.message).toBe(
+      'Uploaded "alpha note.txt" → remote-artifacts/srv-a81_alpha-note.txt\n' +
+        'Uploaded "diagram.png" → remote-artifacts/srv-b29_diagram.png',
+    );
     for (const stored of storedByServer) {
       expect(result.message).toContain(`${fallbackDir}/${stored.stored}`);
     }
@@ -169,6 +194,119 @@ describe("UploadAction", () => {
     expect(uploadResults[0]?.message).toContain(`${serverDir}/${storedByServer.stored}`);
     expect(uploadResults[0]?.message).not.toContain(`${fallbackDir}/${storedByServer.stored}`);
   });
+
+  for (const malformed of [
+    { name: "a missing files key", body: { ok: true } },
+    { name: "null files", body: { ok: true, files: null } },
+    { name: "an empty files array", body: { ok: true, files: [] } },
+    { name: "non-array files", body: { ok: true, files: { stored: "not-an-array.txt" } } },
+    {
+      name: "a file item without stored",
+      body: {
+        ok: true,
+        files: [
+          { original: "valid.txt", stored: "stored-valid.txt" },
+          { original: "missing-stored.txt" },
+        ],
+      },
+    },
+  ]) {
+    test(`rejects a successful response with ${malformed.name}`, async () => {
+      const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
+      const surfacedErrors: string[] = [];
+
+      replaceFetch((async () => Response.json(malformed.body, { status: 201 })) as typeof fetch);
+
+      const { app } = mountUploadAction({
+        onUploaded: (message, files) => uploadResults.push({ message, files }),
+        onError: (message) => surfacedErrors.push(message),
+      });
+
+      await (app as UploadActionInstance).uploadFiles([
+        new File(["payload"], "malformed-response.txt", { type: "text/plain" }),
+      ]);
+
+      expect(surfacedErrors).toEqual([malformedSuccessError]);
+      expect(uploadResults).toHaveLength(0);
+    });
+  }
+
+  for (const scenario of [
+    { outcome: "success", settlementOrder: [0, 1], orderName: "start order" },
+    { outcome: "failure", settlementOrder: [1, 0], orderName: "reverse order" },
+  ] as const) {
+    test(`keeps busy true until concurrent uploads settle with ${scenario.outcome} in ${scenario.orderName}`, async () => {
+      const requests = [deferred<Response>(), deferred<Response>()];
+      const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
+      const surfacedErrors: string[] = [];
+      let fetchIndex = 0;
+      let boundBusy = false;
+      const labels = ["first", "second"] as const;
+
+      replaceFetch((async () => requests[fetchIndex++]!.promise) as typeof fetch);
+
+      const { app } = mountUploadAction(
+        {
+          onUploaded: (message, files) => uploadResults.push({ message, files }),
+          onError: (message) => surfacedErrors.push(message),
+        },
+        (props) => {
+          Object.defineProperty(props, "busy", {
+            configurable: true,
+            enumerable: true,
+            get: () => boundBusy,
+            set: (value: boolean) => {
+              boundBusy = value;
+            },
+          });
+        },
+      );
+      const instance = app as UploadActionInstance;
+
+      const uploads = [
+        instance.uploadFiles([new File(["first"], "first.txt")]),
+        instance.uploadFiles([new File(["second"], "second.txt")]),
+      ];
+      const busyWithBothRequestsPending = boundBusy;
+      const fetchCountWithBothRequestsPending = fetchIndex;
+
+      const settle = (request: Deferred<Response>, label: (typeof labels)[number]) => {
+        if (scenario.outcome === "success") {
+          request.resolve(
+            Response.json(
+              {
+                ok: true,
+                files: [{ original: `${label}.txt`, stored: `stored-${label}.txt` }],
+              },
+              { status: 201 },
+            ),
+          );
+        } else {
+          request.reject(new Error(`${label} upload failed`));
+        }
+      };
+
+      const firstSettledIndex = scenario.settlementOrder[0];
+      settle(requests[firstSettledIndex]!, labels[firstSettledIndex]);
+      await uploads[firstSettledIndex];
+      const busyWhileOtherRequestWasPending = boundBusy;
+
+      const lastSettledIndex = scenario.settlementOrder[1];
+      settle(requests[lastSettledIndex]!, labels[lastSettledIndex]);
+      await uploads[lastSettledIndex];
+
+      expect(fetchCountWithBothRequestsPending).toBe(2);
+      expect(busyWithBothRequestsPending).toBe(true);
+      expect(busyWhileOtherRequestWasPending).toBe(true);
+      expect(boundBusy).toBe(false);
+      expect(uploadResults).toHaveLength(scenario.outcome === "success" ? 2 : 0);
+      expect(surfacedErrors).toEqual(
+        scenario.outcome === "failure"
+          ? scenario.settlementOrder.map((index) => `${labels[index]} upload failed`)
+          : [],
+      );
+    });
+  }
 
   for (const response of [
     {

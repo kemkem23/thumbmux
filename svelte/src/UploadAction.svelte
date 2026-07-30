@@ -24,6 +24,10 @@
   } = $props();
 
   let inputEl = $state<HTMLInputElement | null>(null);
+  // Count overlapping picker/programmatic uploads instead of dropping later
+  // calls: uploadFiles has no feedback channel for a rejected call, so a guard
+  // could make an attach/paste action silently disappear.
+  let uploadsInFlight = 0;
 
   export function open() {
     inputEl?.click();
@@ -43,6 +47,7 @@
 
   async function doUpload(files: File[]) {
     if (files.length === 0) return;
+    uploadsInFlight += 1;
     busy = true;
     try {
       const form = new FormData();
@@ -50,13 +55,30 @@
       const res = await fetch(endpoint, { method: 'POST', body: form });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
-      const stored: UploadedFile[] = data?.files ?? [];
+      const responseFiles = data?.files;
+      const hasUsableFiles =
+        Array.isArray(responseFiles) &&
+        responseFiles.length > 0 &&
+        responseFiles.every(
+          (file) =>
+            typeof file === 'object' &&
+            file !== null &&
+            typeof file.stored === 'string' &&
+            file.stored.length > 0,
+        );
+      if (!hasUsableFiles) {
+        throw new Error(
+          'Invalid upload response: expected a non-empty files array with stored paths',
+        );
+      }
+      const stored = responseFiles as UploadedFile[];
       const messageDir = data?.dir ?? dir;
       onUploaded(formatUploadMessage(stored, messageDir), stored);
     } catch (e: any) {
       onError(String(e?.message ?? e));
     } finally {
-      busy = false;
+      uploadsInFlight -= 1;
+      busy = uploadsInFlight > 0;
     }
   }
 </script>
