@@ -1,5 +1,5 @@
 
-   main ~/kemcortex/cortex-orchestrator                        │ 33K / 512K │
+   main ~/myproject/terminal-workspaces                        │ 33K / 512K │
 
 
      ❯ Reply with exactly GROK_SMOKE_OK and nothing else.            1:43 PM

@@ -1,5 +1,5 @@
 
-   main ~/kemcortex/cortex-orchestrator/
+   main ~/myproject/terminal-workspaces/
 
 
                [ New worktree                            ctrl-w  ]
