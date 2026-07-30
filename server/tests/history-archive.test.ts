@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileHistoryArchive, type HistoryPage } from "./history-archive";
+import { FileHistoryArchive, type HistoryPage } from "../src/index";
 
 const roots: string[] = [];
 
@@ -64,6 +64,18 @@ function storedPaths(root: string, session: string): { data: string; meta: strin
 function permissions(path: string): number {
   return statSync(path).mode & 0o777;
 }
+
+test("exports a usable FileHistoryArchive from the server package", () => {
+  const root = mkdtempSync(join(tmpdir(), "thumbmux-history-export-test-"));
+  roots.push(root);
+  const archive = new FileHistoryArchive({ root });
+
+  expect(archive.readBefore("new-session", null)).toEqual({
+    lines: [],
+    startLine: null,
+    hasMore: false,
+  });
+});
 
 describe("FileHistoryArchive", () => {
   test("splits a 4,000+ line initial history into archive and live windows", () => {

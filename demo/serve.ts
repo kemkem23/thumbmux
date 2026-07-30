@@ -9,11 +9,16 @@
  * URL (cookie'd on first visit). Anyone with the URL can type into your
  * tmux; treat it like an SSH key.
  */
-import { TmuxWsMux, createBunTmuxDriver, spawnTmuxSession, createUploadHandler } from "@thumbmux/server";
+import {
+  FileHistoryArchive,
+  TmuxWsMux,
+  createBunTmuxDriver,
+  createUploadHandler,
+  spawnTmuxSession,
+} from "@thumbmux/server";
 import type { MuxClientMessage } from "@thumbmux/core";
 import qrcode from "qrcode-terminal";
 import { networkInterfaces } from "node:os";
-import { FileHistoryArchive } from "./history-archive";
 
 const HOST_ALL = process.argv.includes("--host");
 const PORT = Number(process.env.PORT || 7681);

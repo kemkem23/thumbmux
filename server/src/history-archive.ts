@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import type { HistoryArchiveLike } from "@thumbmux/server";
+import type { HistoryArchiveLike } from "./ws-mux";
 
 export type HistoryPage = {
   lines: string[];

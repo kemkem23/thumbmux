@@ -236,7 +236,12 @@ name; reuse a name only for the same logical session.
 injected (`createBunTmuxDriver()` is a complete reference implementation):
 
 ```ts
-import { TmuxWsMux } from 'thumbmux/server';
+import { FileHistoryArchive, TmuxWsMux } from 'thumbmux/server';
+
+const archive = new FileHistoryArchive({
+  root: '.thumbmux-history', // omit for a private per-run temp directory
+  maxLines: 20_000,
+});
 
 const mux = new TmuxWsMux({
   driver,                     // capture/keys/resize/activity against your tmux
@@ -260,12 +265,12 @@ ws.onmessage = (e) => mux.handleMessage(JSON.parse(e.data), ws);
 ws.onclose  = () => mux.unsubscribeAll(ws);
 ```
 
-`PipeManagerLike` and `HistoryArchiveLike` are extension interfaces only;
-`thumbmux/server` does not ship implementations. Without `pipes`, live output
-still works through adaptive polling (250 ms normally, 100 ms for five seconds
-after input) instead of instant `pipe-pane` dirty signals. Without `archive`,
-live viewing still works, but history expansion returns an empty page, so older
-archived scrollback is unavailable.
+`PipeManagerLike` remains an extension interface, while `thumbmux/server` ships
+`FileHistoryArchive` as its ready-to-use `HistoryArchiveLike` implementation.
+Without `pipes`, live output still works through adaptive polling (250 ms
+normally, 100 ms for five seconds after input) instead of instant `pipe-pane`
+dirty signals. Without `archive`, live viewing still works, but history
+expansion returns an empty page, so older archived scrollback is unavailable.
 
 ### Wiring backpressure
 
@@ -392,7 +397,7 @@ thumbmux/
 |---|---|
 | **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` xterm-parity key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
+| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createUploadHandler()` + `createPrefsHandler()` turnkey endpoints |
 
 Docs: [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
