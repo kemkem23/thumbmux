@@ -18,6 +18,34 @@ This contract documents `AgentNotificationEvent` as a pure validation and normal
 
 The core rejects non-object input and any object with non-string keys, missing required keys, or any field outside this set.
 
+Use the public `validateAgentNotificationEvent` export from `thumbmux/core` at
+the host boundary. It returns the normalized `AgentNotificationEvent` or throws
+`AgentNotificationValidationError`:
+
+```ts
+import {
+  validateAgentNotificationEvent,
+  type AgentNotificationEvent,
+} from "thumbmux/core";
+
+const event: AgentNotificationEvent = validateAgentNotificationEvent({
+  id: crypto.randomUUID(),
+  session: "agent-42",
+  state: "finished",
+  occurredAt: Date.now(),
+  title: "Agent finished",
+  body: "Review its output.",
+  url: "/sessions/agent-42?tab=output",
+  tag: "agent-42-finished",
+}, { origin: window.location.origin });
+
+console.log(event.url); // canonical same-origin path, query, and hash only
+```
+
+`normalizeAgentNotificationEvent` exposes the same normalization contract, and
+`sameOriginNotificationUrl` is available when a host needs to check a candidate
+URL separately.
+
 ## 2) Bounded, NFC-normalized validation posture
 
 - `id`: NFC+trim, length `1..128` code points.
@@ -69,6 +97,51 @@ Core behavior is intentionally transport-agnostic and does not provide end-to-en
 
 - Browser notification permission should be requested only on a **real user gesture** by host UI code.
 - Demo or local `showNotification` calls are local browser-side behavior only and are **not proof of real push delivery**.
+
+The browser helpers are exported from `thumbmux/svelte`. This module can be
+copied into a browser entry point; the permission call remains synchronous with
+the click before its first internal `await`:
+
+```ts
+import {
+  registerServiceWorker,
+  requestNotificationPermission,
+  showLocalNotification,
+} from "thumbmux/svelte";
+
+const button = document.querySelector<HTMLButtonElement>("#enable-notifications");
+if (!button) throw new Error("Missing #enable-notifications button");
+
+button.addEventListener("click", async () => {
+  const permission = await requestNotificationPermission();
+  if (!permission.ok || permission.value !== "granted") return;
+
+  const worker = await registerServiceWorker({
+    scriptURL: "/notification-service-worker.js",
+    options: { scope: "/" },
+  });
+  if (!worker.ok) throw new Error(worker.error.message);
+
+  const shown = await showLocalNotification({
+    registration: worker.value.registration,
+    payload: {
+      id: crypto.randomUUID(),
+      session: "agent-42",
+      state: "finished",
+      occurredAt: Date.now(),
+      title: "Agent finished",
+      body: "Review its output.",
+      url: "/sessions/agent-42",
+      tag: "agent-42-finished",
+    },
+  });
+  if (!shown.ok) throw new Error(shown.error.message);
+});
+```
+
+The host must ship the referenced service-worker script. This example displays
+a local notification only; real push additionally needs a provider, subscription
+storage, delivery, and service-worker push handling.
 
 ## 6) Explicit exclusions for this module
 

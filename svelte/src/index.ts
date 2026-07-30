@@ -1,5 +1,5 @@
 /**
- * @thumbmux/svelte — Svelte 5 pieces of the thumbmux terminal stack.
+ * thumbmux/svelte — Svelte 5 pieces of the thumbmux terminal stack.
  *
  * TermView                 compositor-only 120Hz terminal viewer (virtualized, translate3d)
  * DesktopKeys              desktop keyboard/IME/paste wrapper (focusable, keys → pane bytes)

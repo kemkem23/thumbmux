@@ -99,7 +99,7 @@
     return e.key === 'Insert' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
   }
 
-  // Threshold logic lives in @thumbmux/core (pure + unit-tested); this is a
+  // Threshold logic lives in thumbmux/core (pure + unit-tested); this is a
   // thin bind of the component's warning props.
   function pasteInfo(text: string): DesktopPasteInfo | null {
     const info: PasteInfo | null = corePasteInfo(text, {

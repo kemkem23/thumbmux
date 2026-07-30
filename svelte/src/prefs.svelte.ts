@@ -1,7 +1,7 @@
 /**
  * PreferencesAdapter implementations for browsers:
  *   createLocalPrefs   — localStorage only (the demo / single-device hosts)
- *   createServerPrefs  — server-backed JSON endpoint (@thumbmux/server
+ *   createServerPrefs  — server-backed JSON endpoint (thumbmux/server
  *                        createPrefsHandler) with a localStorage cache so
  *                        first paint never waits on the network and offline
  *                        reads still work; saves are optimistic.
@@ -76,7 +76,7 @@ export function createLocalPrefs(key = 'thumbmux-prefs'): PreferencesAdapter {
 }
 
 export function createServerPrefs(opts: {
-  /** e.g. '/api/prefs' (host mounts @thumbmux/server createPrefsHandler there) */
+  /** e.g. '/api/prefs' (host mounts thumbmux/server createPrefsHandler there) */
   url: string;
   cacheKey?: string;
   fetchFn?: typeof fetch;

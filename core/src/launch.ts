@@ -107,10 +107,11 @@ const GROK_PERMISSIONS: LaunchOption[] = [
   { value: 'ask', label: 'Ask every time', flag: '' },
 ];
 
-const GROK_MODELS: LaunchOption[] = [
+/** Current Grok CLI catalog. Retired IDs are not aliases here because the
+ * launcher forwards each flag verbatim; it has no alias-rewrite layer. */
+export const GROK_MODELS: LaunchOption[] = [
   { value: 'default', label: 'Default model', flag: '' },
-  { value: 'grok-build', label: 'Grok Build', flag: '--model grok-build' },
-  { value: 'grok-composer-2.5-fast', label: 'Composer 2.5 fast', flag: '--model grok-composer-2.5-fast' },
+  { value: 'grok-4.5', label: 'Grok 4.5', flag: '--model grok-4.5' },
 ];
 
 /** The stock seven: three agents × plain/worktree, plus a blank shell. */

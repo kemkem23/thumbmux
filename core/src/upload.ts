@@ -1,7 +1,7 @@
 /**
  * Upload plumbing shared by client and server: safe stored names and the
  * composer prefill message. Pure — the actual I/O lives in
- * @thumbmux/server (createUploadHandler) and @thumbmux/svelte (UploadAction).
+ * thumbmux/server (createUploadHandler) and thumbmux/svelte (UploadAction).
  */
 
 export type UploadedFile = { original: string; stored: string };

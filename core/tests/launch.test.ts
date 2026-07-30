@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_LAUNCH_PRESETS, buildLaunchCommand, buildLaunchSpec } from "../src/launch";
+import {
+  DEFAULT_LAUNCH_PRESETS,
+  GROK_MODELS,
+  buildLaunchCommand,
+  buildLaunchSpec,
+} from "../src/launch";
 
 const byId = (id: string) => {
   const p = DEFAULT_LAUNCH_PRESETS.find((p) => p.id === id);
@@ -22,6 +27,20 @@ describe("default presets", () => {
     expect(buildLaunchCommand(byId("codex-worktree"))).toBe("codex --dangerously-bypass-approvals-and-sandbox");
     expect(buildLaunchCommand(byId("grok"))).toBe("grok --permission-mode bypassPermissions");
     expect(buildLaunchCommand(byId("grok-worktree"))).toBe("grok --permission-mode bypassPermissions");
+  });
+
+  test("every Grok preset points to the active model catalog", () => {
+    const grokPresets = DEFAULT_LAUNCH_PRESETS.filter(({ agent }) => agent === "grok");
+    const catalogValues = new Set(GROK_MODELS.map(({ value }) => value));
+
+    expect(grokPresets).toHaveLength(2);
+    expect(GROK_MODELS.filter(({ flag }) => flag)).toHaveLength(1);
+    for (const preset of grokPresets) {
+      expect(preset.modelOptions).toBe(GROK_MODELS);
+      for (const option of preset.modelOptions) {
+        expect(catalogValues.has(option.value)).toBe(true);
+      }
+    }
   });
 
   test("blank preset injects nothing", () => {
@@ -58,8 +77,10 @@ describe("dropdown combinations inject the right flags", () => {
 
   test("grok: permission and models", () => {
     const p = byId("grok");
-    expect(buildLaunchCommand(p, "bypass", "grok-build")).toBe("grok --permission-mode bypassPermissions --model grok-build");
-    expect(buildLaunchCommand(p, "ask", "grok-composer-2.5-fast")).toBe("grok --model grok-composer-2.5-fast");
+    for (const option of GROK_MODELS) {
+      const expected = ["grok", option.flag].filter(Boolean).join(" ");
+      expect(buildLaunchCommand(p, "ask", option.value)).toBe(expected);
+    }
   });
 
   test("unknown dropdown values fall back to the first (default) option", () => {

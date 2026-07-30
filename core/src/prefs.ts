@@ -2,7 +2,7 @@
  * Preferences — one typed bag for everything a viewer wants remembered
  * (theme, font size, shortcuts, per-session notes…), behind an adapter so
  * the HOST decides where it lives: localStorage on a laptop, a JSON file on
- * a server (see @thumbmux/server createPrefsHandler), a database, anything.
+ * a server (see thumbmux/server createPrefsHandler), a database, anything.
  * Save semantics are MERGE-PATCH: pass only the keys you changed.
  */
 

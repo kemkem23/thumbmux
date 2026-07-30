@@ -1,5 +1,5 @@
 /**
- * @thumbmux/core — framework-free primitives of the thumbmux terminal stack.
+ * thumbmux/core — framework-free primitives of the thumbmux terminal stack.
  *
  * ansi-html       SGR → HTML incremental renderer (the 120Hz engine's parser)
  * search          bounded visible-text and regex-lite terminal search

@@ -16,6 +16,68 @@ only the scope, expiry, and allowlist. An omitted `sessions` property is
 unrestricted. A present allowlist, including an empty one, restricts access to
 its exact session names.
 
+`createTokenGuard` is exported from `thumbmux/server`. This complete server-side
+example stores the authenticated, token-free principal outside client-controlled
+metadata and wires the `filterSessionList` hook on `TmuxWsMux`:
+
+```ts
+import {
+  TmuxWsMux,
+  createBunTmuxDriver,
+  createTokenGuard,
+  type TokenPrincipal,
+  type WsLike,
+} from "thumbmux/server";
+
+const token = process.env.THUMBMUX_TOKEN;
+if (!token) throw new Error("THUMBMUX_TOKEN is required");
+
+const guard = createTokenGuard({
+  grants: [{
+    token,
+    scope: "interactive",
+    expiresAt: Date.now() + 60 * 60 * 1000,
+    sessions: ["agent-1"],
+  }],
+});
+
+type AppSocket = WsLike;
+const principals = new WeakMap<AppSocket, TokenPrincipal>();
+
+export function bindAuthenticatedSocket(
+  socket: AppSocket,
+  principal: TokenPrincipal,
+): void {
+  principals.set(socket, guard.sanitizePrincipal(principal));
+}
+
+export const mux = new TmuxWsMux<AppSocket>({
+  driver: createBunTmuxDriver(),
+  hooks: {
+    filterSessionList(sessions, socket) {
+      const principal = principals.get(socket);
+      return principal
+        ? guard.filterSessions(sessions, principal, ({ name }) => name)
+        : [];
+    },
+    onSocketClose(socket) {
+      principals.delete(socket);
+    },
+  },
+});
+```
+
+Call `bindAuthenticatedSocket` only with the `principal` returned by a successful
+`guard.authenticate(request)`, after authorizing the WebSocket upgrade. Also
+forward its `setCookie` header when a query token bootstraps a cookie.
+`filterSessionList` is a `MuxHooks` option, not a standalone export. The mux
+invokes it for the initial list, every pushed update, and backpressure catch-up.
+Its input must not be mutated. A missing principal returns no rows above; omitting
+the hook would expose the provider's full list. The third `client` argument is
+client-supplied telemetry and must never be used as an authorization principal.
+Filtering lists also does not replace `authorizeMuxMessage` checks for parsed
+WebSocket operations.
+
 ## Bootstrap and cookies
 
 With the default configuration, exactly one `t` query parameter can bootstrap
@@ -36,6 +98,30 @@ That cookie is host-only: it uses `Path=/`, `HttpOnly`, and
 host-configured secure deployment. After bootstrap, the browser client should
 remove `t` from its history. History scrubbing and routing are host/demo
 integration responsibilities, not behavior this guard can perform alone.
+
+The shared browser mux is configured once at application startup with
+`configureTmuxMux`, exported from `thumbmux/svelte`. The default endpoint is
+already same-origin `/ws/tmux`; this example makes that choice explicit and
+adds a stable telemetry ID:
+
+```ts
+import { configureTmuxMux } from "thumbmux/svelte";
+
+const clientId = crypto.randomUUID();
+
+configureTmuxMux({
+  getUrl: () => {
+    const url = new URL("/ws/tmux", window.location.href);
+    url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  },
+  getClientMeta: () => ({ clientId }),
+});
+```
+
+`getClientMeta` is telemetry only. Do not put bearer tokens or other secrets in
+it, and do not trust those fields on the server; normal same-origin cookie rules
+carry the guard cookie on the WebSocket handshake.
 
 ## Principal immutability
 
@@ -89,6 +175,32 @@ Hosts should authorize named, parsed operations and session inputs, including
 body-derived sessions, rather than guessing from raw URL substring matches.
 This keeps route parsing and authorization explicit and prevents a route or
 parameter spelling from becoming an accidental bypass.
+
+## Stock launch preset IDs
+
+The seven `presetId` values in `DEFAULT_LAUNCH_PRESETS` are `claude`,
+`claude-worktree`, `codex`, `codex-worktree`, `grok`, `grok-worktree`, and
+`blank`. Read the shipped list from `thumbmux/core` when validating a picker or
+request instead of copying it into application code:
+
+```ts
+import { DEFAULT_LAUNCH_PRESETS } from "thumbmux/core";
+
+const stockPresetIds = new Set(
+  DEFAULT_LAUNCH_PRESETS.map(({ id }) => id),
+);
+
+export function isStockPresetId(value: string): boolean {
+  return stockPresetIds.has(value);
+}
+```
+
+`createSpawnHandler` uses these presets by default; passing its `presets` option
+replaces the stock set. For a known preset, the server rebuilds the command and
+does not trust submitted command text. Worktree presets require both host
+prepare and cleanup hooks, `blank` produces no command, and the six agent
+presets default to permission-bypass modes. Treat spawning as an interactive,
+privileged operation.
 
 ## Logging and deployment limits
 
