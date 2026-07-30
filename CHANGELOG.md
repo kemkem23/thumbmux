@@ -9,7 +9,7 @@ release makes the surrounding contract real — the pieces that were written but
 not exported, the fields that existed but were undiscoverable, and the docs that
 told outside readers to import names only this repo has.
 
-Two behaviour changes a consumer must know about, both closing data-loss bugs:
+Four consumer-visible changes to know about. The first two close data-loss bugs:
 
 1. **A malformed 2xx from the prefs endpoint now REJECTS** instead of resolving.
    Callers that ignored the promise will see a rejection where they previously
@@ -17,7 +17,12 @@ Two behaviour changes a consumer must know about, both closing data-loss bugs:
    saved shortcuts with nothing.
 2. **`UploadAction` treats a 2xx whose body has no usable `files` as an error**
    and no longer calls `onUploaded` with empty values.
-3. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
+3. **A custom `TmuxDriver` or session-list provider may stop compiling.**
+   `listSessions()` returns `SessionListItem[]` instead of `unknown[]`, and
+   `activityAt` is required, so a TypeScript host that returns rows without it now
+   fails to typecheck. Runtime is unaffected; add the field from your own activity
+   source, or `0` if you have none.
+4. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
    flips, not on every offset change, and no callback reports the initial state. A
    host that mirrored the raw offset from this callback must read it another way.
 
@@ -59,18 +64,26 @@ Two behaviour changes a consumer must know about, both closing data-loss bugs:
   KB when it counts UTF-16 code units.
 
 ### TermView — the five hot-path defects deferred from v0.4.0
-All measured before and after on the same fixtures:
+Counted metrics below are measured before and after on the same fixtures and are
+reproducible from the shipped tests; where a wall-clock figure appears it is called
+out as a point measurement.
 - Viewport layout read on every scroll frame: **138 → 0** reads per gesture.
 - `data-bottom-offset` writes and host callbacks on every compositor frame:
-  fling **2.392 → 0.890 ms**, attribute mutations **114 → 1**, callbacks across
-  an unchanged boundary **137 → 0**.
+  attribute mutations **114 → 1** and callbacks across an unchanged boundary
+  **137 → 0**, both reproducible from the shipped test. The wall-clock win on that
+  fling is smaller than these counts suggest and is **not** an end-state budget: an
+  independent re-measurement against the correct baseline gives ~2.2 → ~1.2 ms
+  isolated, while the shipped tree lands ~2.4-2.8 ms on the same fixture because a
+  later change trades some of it back to remove jank.
 - Virtualized DOM rebuilt mid-momentum: key-set rebuilds **2 → 0**.
 - History parsed and measured during a fling: `getBoundingClientRect`
   **234 → 0**, DOM commits while busy **1 → 0**.
 - `getBoundingClientRect` per alt-screen touchmove: **10 → 1**, with the emitted
   SGR bytes pinned so grok's touch scrolling cannot drift.
 - **Retained history is now capped** with eviction, and per-page cost is flat
-  rather than linear: page-150/page-10 commit ratio **4.03× → 0.94×**. Rows in
+  rather than linear: page-150/page-10 commit ratio **4.03× → 0.94×** on one run of
+  this host — a wall-clock point measurement that moves run to run, so treat the
+  direction as the claim, not the figures. Rows in
   the viewport plus overscan are never evicted, even if they alone exceed the
   budget. **Known limit, read this if you rely on deep scrollback:** past the cap the
   view is spliced WITHOUT a marker — an older archive row can render directly above
@@ -95,7 +108,7 @@ All measured before and after on the same fixtures:
 
 ### Tests
 - The four exported components that shipped with **zero** tests — `UploadAction`,
-  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 21 tests, each
+  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 28 tests, each
   assertion group proven by mutating a throwaway copy until it fails. The earlier
   mount smoke asserted the `.svelte` file was text, which is how a component that
   throws on mount once passed.
