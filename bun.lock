@@ -6,11 +6,15 @@
       "name": "thumbmux",
       "devDependencies": {
         "@playwright/test": "^1.61.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5",
       },
     },
     "core": {
       "name": "@thumbmux/core",
-      "version": "0.4.0",
+      "version": "0.6.0",
       "devDependencies": {
         "typescript": "^5.9.3",
       },
@@ -29,7 +33,7 @@
     },
     "server": {
       "name": "@thumbmux/server",
-      "version": "0.4.0",
+      "version": "0.6.0",
       "dependencies": {
         "@thumbmux/core": "^0.3.5",
       },
@@ -40,7 +44,7 @@
     },
     "svelte": {
       "name": "@thumbmux/svelte",
-      "version": "0.4.0",
+      "version": "0.6.0",
       "dependencies": {
         "@thumbmux/core": "^0.4.0",
       },
