@@ -535,7 +535,7 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] Live-window reflow when the pane width changes
 - [x] Validated opt-in line-delta frames with one-shot resync recovery
 - [x] Demo hardening: scroll-to-bottom + new-content pill, selection-first copy, private file-backed history archive reference
-- [x] Self-contained root git-dist (no unpublished `@thumbmux/core` workspace needed)
+- [x] Self-contained root git-dist (no unpublished workspace package needed)
 
 **v0.4.0 — capability wave (shipped)**
 - [x] Search in scrollback (visible-text + regex-lite, highlight + jump in TermView)

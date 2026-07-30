@@ -1,8 +1,8 @@
 # Recording journal specification
 
 This document describes the server-side `FrameJournal` NDJSON recorder as a
-host-neutral recording primitive. Its package-barrel export and any host
-integration are separate controller work.
+host-neutral recording primitive. `FrameJournal` is exported from
+`thumbmux/server`; host integration remains separate controller work.
 
 No existing route, mux transport, demo UI, or replay player wiring is claimed by this document.
 
@@ -11,7 +11,17 @@ No existing route, mux transport, demo UI, or replay player wiring is claimed by
 Journal files are line-oriented NDJSON. Each complete line must be a JSON object with exactly:
 
 ```json
-{ "v": 1, "session": "...", "at": 1700000000000, "frame": { ... } }
+{
+  "v": 1,
+  "session": "demo",
+  "at": 1700000000000,
+  "frame": {
+    "channel": "demo",
+    "type": "output",
+    "data": "hello\n",
+    "cursor": { "row": 0, "col": 0 }
+  }
+}
 ```
 
 `frame` is either:
@@ -33,7 +43,7 @@ Both recorder and replay parsers are strict:
 
 ## Protocol compatibility notes (full/delta)
 
-- A replay parser accepts both full and delta frames using the same `@thumbmux/core` frame types.
+- A replay parser accepts both full and delta frames using the same `thumbmux/core` frame types.
 - Delta replay is only applied when it validates against the canonical base:
   - base-length match
   - `prefix` in bounds
@@ -81,7 +91,9 @@ The concrete runtime seam is:
 - Delta persistence still requires strict protocol-size compatibility (same rule as wire delta selection): non-zero prefix and strictly smaller serialized frame size than the equivalent full frame.
 - If the chosen delta is not usable against current canonical base, persistence falls back to full frame and the delta run resets.
 - `checkpointCadence` defaults to `64` and is configurable; it must be a positive integer.
-- Parsed journals that exceed the cadence between full checkpoints are rejected.
+- `FrameJournal` recovery rejects journals that exceed the cadence between
+  full checkpoints. The standalone `parseReplayJournal` parser does not enforce
+  this recorder recovery policy.
 
 ## Canonical per-session base and session safety
 

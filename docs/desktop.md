@@ -11,8 +11,17 @@ optional SGR mouse forwarding for full-screen TUIs.
 terminal view and renders exactly one tab stop when enabled:
 
 ```svelte
+<script lang="ts">
+  import { defaultSurface } from 'thumbmux/core';
+  import { DesktopKeys, TermView, tmuxMux } from 'thumbmux/svelte';
+
+  const session = 'my-session';
+  const palette = defaultSurface('#101014').palette;
+  const sendKeys = (data: string) => tmuxMux.sendKeys(session, data);
+</script>
+
 <DesktopKeys onKeys={sendKeys}>
-  <TermView ... />
+  <TermView {session} {palette} onKeys={sendKeys} />
 </DesktopKeys>
 ```
 
@@ -50,7 +59,7 @@ Concrete rules:
 
 ## 2. Key routing
 
-`DesktopKeys` calls `keyboardEventToSequence(e)` from `@thumbmux/core` for
+`DesktopKeys` calls `keyboardEventToSequence(e)` from `thumbmux/core` for
 terminal keyboard input. That helper is the source of truth for key encodings:
 `null` means the browser handles the key; `null` is also returned while IME
 composition is active; Meta combinations return `null`; Ctrl+C returns `\x03`
@@ -75,16 +84,17 @@ Policy table:
 | Enter, Backspace, Tab, Escape, arrows, Home/End, PageUp/PageDown, Insert/Delete, F-keys | send helper result when mapped | yes, only when helper returns a string |
 | Ctrl+C with no terminal selection | send `\x03` from helper | yes |
 | Ctrl+C with active terminal selection | browser copy | no |
-| Cmd/Ctrl+C outside terminal selection | browser copy or browser shortcut | no unless helper returns a sequence after selection policy |
-| Ctrl+V, Cmd+V, context-menu paste | browser emits `paste`; paste handler sends bracketed paste | paste handler prevents default after reading text |
-| Shift+Insert | paste path, not terminal key path | yes only if DesktopKeys reads clipboard itself; otherwise let browser try paste |
+| Ctrl+Shift+C or Cmd+C | browser copy or browser shortcut | no |
+| Ctrl+V, Cmd+V, context-menu paste | browser emits `paste`; paste handler sends bracketed paste | eligible text paste is consumed before any async confirmation |
+| Shift+Insert | explicit Clipboard API paste path when available; otherwise browser | yes when `readText()` is available, even if the read later fails or is empty |
 | Meta/Cmd combinations | browser | no |
 | helper returns `null` for any Ctrl/Alt/browser shortcut | browser | no |
 | keydown while `e.isComposing` or internal composition flag is true | IME/browser | no |
 
 `preventDefault()` must never be used just because the terminal is focused. It
-is allowed only for an actual terminal byte sequence or for a paste event that
-will be sent to the pane.
+is allowed for an actual terminal byte sequence, for an eligible non-empty
+text paste consumed before confirmation, or for the explicit Shift+Insert
+Clipboard API path.
 
 ## 3. Copy
 
@@ -125,7 +135,7 @@ programmatic copy helpers. They do not change the Ctrl+C routing policy above.
 
 ## 4. Paste
 
-All terminal text paste paths send `bracketedPaste(text)` from `@thumbmux/core`
+All terminal text paste paths send `bracketedPaste(text)` from `thumbmux/core`
 through `onKeys`.
 
 Paste sources:
@@ -133,19 +143,23 @@ Paste sources:
 - Ctrl+V / Cmd+V: do not route through `keyboardEventToSequence`. Allow the
   browser to emit a `paste` event on the focused wrapper, then handle it.
 - Context-menu paste: handle the same `paste` event.
-- Shift+Insert: if `navigator.clipboard.readText()` is available and allowed,
-  `DesktopKeys` reads text itself, prevents default, and sends bracketed paste.
-  Otherwise it leaves the key event alone and relies on the browser to emit a
-  `paste` event.
+- Shift+Insert: if `navigator.clipboard.readText()` is available,
+  `DesktopKeys` consumes the key event before awaiting the read. A failed or
+  empty read sends nothing, but browser fallback is already consumed. If the
+  API is unavailable, it leaves the key event alone and lets the browser try
+  its paste path.
 
 Paste handler rules:
 
-- If clipboard text is empty, return without side effects.
+- If a `paste` event has no clipboard data or its text is empty, return without
+  side effects.
 - If the paste contains files, do not handle them in `DesktopKeys`; file paste
   belongs to the composer/upload path when that UI has focus.
 - Do not trim text and do not append Enter.
-- After a paste is accepted, call `preventDefault()`, collapse any terminal
-  selection, and send `onKeys(bracketedPaste(text))` exactly once.
+- For an eligible, non-empty text `paste` event, call `preventDefault()` and
+  `stopPropagation()` synchronously before awaiting confirmation.
+- After a paste is accepted, collapse any terminal selection and send
+  `onKeys(bracketedPaste(text))` exactly once.
 - Composer interaction is focus-based: when the composer textarea or mobile
   DIRECT input is focused, paste stays with `ComposerDock`. `DesktopKeys` must
   ignore those events.
@@ -158,8 +172,9 @@ Multiline/large paste warning:
   adjust the thresholds. A value `<= 0` disables that threshold.
 - `confirmPaste(info)` may be supplied by the host. If absent, use
   `window.confirm()` with a short generic message. If confirmation returns
-  false, do not send anything and do not prevent the browser default unless the
-  event was already consumed by an explicit Clipboard API read.
+  false, throws, or rejects, do not send anything. Eligible text paste events
+  and explicit Shift+Insert reads remain consumed because confirmation may be
+  asynchronous.
 - Focus eligibility is evaluated when the paste event arrives. An async
   confirm dialog may move focus off the wrapper while the decision is pending;
   an ACCEPTED paste is still sent (exactly once) — never drop a confirmed
@@ -310,8 +325,9 @@ Rules:
 
 ## 9. IME / composition
 
-Desktop IME input must work for Thai, CJK, and other composed text without
-breaking DOM selection.
+Direct-character desktop layouts (including Thai, Latin, and Cyrillic) work
+without breaking DOM selection. `DesktopKeys` also handles composition events
+when the browser emits them; candidate-window IMEs have the limitation below.
 
 Recommended `DesktopKeys` implementation:
 
@@ -372,6 +388,8 @@ Terminal URLs remain DOM links on desktop.
 Existing props and callbacks remain. New/changed desktop props:
 
 ```ts
+import type { AnsiPalette } from 'thumbmux/core';
+
 type TermViewProps = {
   session: string;
   palette: AnsiPalette;
@@ -383,7 +401,10 @@ type TermViewProps = {
   altScreenMouse?: boolean;        // default false
   onKeys?: (data: string) => void; // required when altScreenMouse=true
   onTap?: () => void;
-  onLinesChange?: (lines: string[]) => void;
+  onLinesChange?: (
+    lines: string[],
+    meta: { source: 'live' | 'prepend' | 'replace' },
+  ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
@@ -395,14 +416,20 @@ reconnect, visibility return, font changes, or ResizeObserver changes.
 `altScreenMouse=true` requires `onKeys`. If `onKeys` is absent, SGR mouse
 actions are no-ops and should warn in development builds only.
 
+`onScrollStateChange` is a boundary notification: it fires when `scrolledUp`
+changes, and `bottomOffset` is the offset at that transition. It is not
+per-frame scroll telemetry.
+
 Public methods keep their names:
 
 ```ts
-copyAll(): Promise<boolean>;
-copySelection(): Promise<boolean>;
-isScrolledUp(): boolean;
-scrollToBottom(): void; // sends sgrSnapToBottom when altScreenMouse=true
-refreshGeometry(): void; // no-op for resize sending when claimGeometry=false
+type TermViewHandle = {
+  copyAll(): Promise<boolean>;
+  copySelection(): Promise<boolean>;
+  isScrolledUp(): boolean;
+  scrollToBottom(): boolean; // false when an active selection blocks scrolling
+  refreshGeometry(): void;   // no resize send when claimGeometry=false
+};
 ```
 
 ### `DesktopKeys.svelte`

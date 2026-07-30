@@ -97,11 +97,12 @@ guard's redaction helper can reduce accidental exposure in guard-controlled
 diagnostics, but it does not make external application logs, browser history,
 or reverse-proxy logs safe.
 
-This is demo bearer-token hardening, not user identity or authentication,
-revocation, CSRF protection, replay protection, encrypted transport/TLS, or a
-session-isolation guarantee beyond the configured allowlists. It is not a
-substitute for TLS, secure proxy configuration, network exposure control, or
-server-side routing enforcement.
+This is demo bearer-token authentication and authorization with in-memory
+revocation scoped to one guard instance. It is not user identity, a durable or
+cross-instance revocation service, CSRF protection, replay protection,
+encrypted transport/TLS, or a session-isolation guarantee beyond the
+configured allowlists. It is not a substitute for TLS, secure proxy
+configuration, network exposure control, or server-side routing enforcement.
 
 ## Required later integration
 

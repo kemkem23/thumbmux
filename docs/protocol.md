@@ -1,7 +1,7 @@
 # The thumbmux WS protocol
 
 One WebSocket multiplexes every session. All frames are JSON. Types live in
-`@thumbmux/core` (`protocol.ts`); server behavior is enforced by
+`thumbmux/core` (`protocol.ts`); server behavior is enforced by
 `server/tests/conformance.test.ts`, which any alternative server can reuse.
 
 ## Client → server
@@ -39,15 +39,19 @@ Only after a subscriber opts in with `delta: true`, a server may send after a
 full frame:
 
 ```ts
-{
-  channel,
+import { muxPrefixHash, type MuxDeltaFrame } from 'thumbmux/core';
+
+const base = Array.from({ length: 2_000 }, (_, line) => `line ${line}`);
+const prefix = base.length - 1;
+const deltaFrame: MuxDeltaFrame = {
+  channel: 'my-session',
   type: 'delta',
-  baseLength,
+  baseLength: base.length,
   prefix,
-  prefixHash,
-  lines,
-  cursor?,
-}
+  prefixHash: muxPrefixHash(base.slice(0, prefix)),
+  lines: ['updated final line'],
+  cursor: null,
+};
 ```
 
 `prefix` is the number of unchanged raw lines. `lines` is the complete
@@ -118,9 +122,10 @@ line per file).
 
 `GET /api/prefs` → the whole prefs JSON (`{}` before first save). `PUT` (or POST) with a
 JSON object → shallow merge-patch (top-level keys replace), persisted with an atomic
-tmp+rename write; returns the merged result. `400` malformed/non-object, `413` >256 KB,
-`405` otherwise. Pair with `createServerPrefs()` from @thumbmux/svelte (localStorage
-cache + optimistic saves).
+tmp+rename write; returns the merged result. `400` malformed/non-object; `413` when the
+decoded request text exceeds 262,144 UTF-16 code units (this is not a byte limit); `405`
+otherwise. Pair with `createServerPrefs()` from `thumbmux/svelte` (localStorage cache +
+optimistic saves).
 
 ## Deployment notes
 
@@ -131,7 +136,7 @@ cache + optimistic saves).
   users are unaffected — but point automated health checks at HTTP/1.1.
 - **Wide glyphs:** the caret column is pixel-accurate: the client maps the
   cursor's cell column onto the line's characters with wcwidth-style cell
-  accounting (`@thumbmux/core` `prefixForCells` — Thai combining marks 0
+  accounting (`thumbmux/core` `prefixForCells` — Thai combining marks 0
   cells, CJK/emoji 2) and then measures that prefix with the live font, so
   the caret follows the DOM's real glyph advances even for Thai/CJK/emoji
   lines. Link tap-target column math still assumes 1 cell = 1 char width
