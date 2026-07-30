@@ -153,9 +153,9 @@ policy, geometry ownership, view-only surfaces — is specified in
 with **bun, npm, pnpm or yarn** — no build step, no lifecycle scripts.
 
 ```bash
-bun add  thumbmux@github:kemkem23/thumbmux#v0.5.0-dist
+bun add  thumbmux@github:kemkem23/thumbmux#v0.6.0-dist
 # or
-npm i    github:kemkem23/thumbmux#v0.5.0-dist
+npm i    github:kemkem23/thumbmux#v0.6.0-dist
 ```
 
 ```ts
@@ -217,7 +217,7 @@ name; reuse a name only for the same logical session.
 
 **🤖 The agent way.** Paste into an agent TUI in your project:
 
-> Install `thumbmux@github:kemkem23/thumbmux#v0.5.0-dist`, read its README,
+> Install `thumbmux@github:kemkem23/thumbmux#v0.6.0-dist`, read its README,
 > then wire it in: mount `TmuxWsMux` from `thumbmux/server` on a WebSocket
 > route with a driver for my tmux, and add a page using `SessionGrid` +
 > `LaunchSheet` + `TermView` + `DesktopKeys` + `ComposerDock` from
@@ -552,6 +552,17 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] WebSocket backpressure on by default (`handleDrain` / auto-resume; legacy via `enabled: false`)
 - [x] `filterSessionList` hook on every session-list delivery path
 - [x] All-or-nothing multi-file uploads; quadratic wrapped-URL + capture-overlap fixes
+
+**v0.6.0 — plug-and-play, finished (shipped)**
+- [x] `FileHistoryArchive` and `createSpawnHandler` exported — no longer host-only code
+- [x] `SessionListItem` typed and documented, with `activityAt` (no extra tmux call)
+- [x] Prompt-scan matchers pluggable — the last host assumption out of the package
+- [x] Public docs import the shipped subpaths, enforced by a snippet test
+- [x] `docs/hub.md`, including what the hub does *not* give you
+- [x] Five deferred TermView hot-path defects closed, with before/after numbers
+- [x] Capped retained history; flat per-page prepend cost
+- [x] prefs/upload data-loss paths fixed; the four untested components covered
+- [x] `smoke:git-dist` proves every public export reaches consumers
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,

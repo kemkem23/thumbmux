@@ -1,7 +1,107 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.5.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.6.0-dist`.
+
+## v0.6.0 — 2026-07-30
+Plug-and-play, finished. v0.5.0 shipped components a consumer could mount; this
+release makes the surrounding contract real — the pieces that were written but
+not exported, the fields that existed but were undiscoverable, and the docs that
+told outside readers to import names only this repo has.
+
+Two behaviour changes a consumer must know about, both closing data-loss bugs:
+
+1. **A malformed 2xx from the prefs endpoint now REJECTS** instead of resolving.
+   Callers that ignored the promise will see a rejection where they previously
+   saw silent success. The old behaviour is what let a `200 {}` replace a user's
+   saved shortcuts with nothing.
+2. **`UploadAction` treats a 2xx whose body has no usable `files` as an error**
+   and no longer calls `onUploaded` with empty values.
+
+### Newly exported — code that existed but never shipped
+- **`FileHistoryArchive`** (`thumbmux/server`): a complete `HistoryArchiveLike`
+  with 432 lines of tests, previously stranded in `demo/` and excluded from the
+  release tag's `files` whitelist. Deep scrollback no longer requires writing
+  your own archive.
+- **`createSpawnHandler`** (`thumbmux/server`): the route that accepts what
+  `LaunchSheet`/`buildLaunchCommand` actually emit — naming, collision → 409,
+  command assembly, cleanup on a failed spawn. Worktree creation stays a
+  host-supplied hook rather than hardcoded git. Two real cases the tests forced
+  out: a name taken between check and spawn, and a leaked reservation.
+- **`SessionListItem`** (`thumbmux/core`): the `__sessions` payload was
+  `unknown[]`, so its fields were undiscoverable without reading the driver. Now
+  typed and documented per field, with **`activityAt`** added from the activity
+  sample the poll already takes — no extra tmux call per poll, asserted by test.
+- **`DEFAULT_PROMPT_MATCHERS`** + a `matchers` option on the prompt-scan APIs.
+  The cc/codex/grok composer heuristics were the one place a host's assumptions
+  were baked into the package; they are now a swappable default. Omitting the
+  option is byte-identical to before.
+
+### Docs a reader can actually copy
+- `desktop.md`, `protocol.md` and `recording.md` told readers to import
+  `@thumbmux/core` and `@thumbmux/svelte`. **Those names do not exist for
+  consumers** — they are internal aliases of the host repo; the shipped subpaths
+  are `thumbmux/core`, `thumbmux/server`, `thumbmux/svelte`. Every snippet is
+  corrected, and `docs-snippets.test.ts` now checks every import specifier in the
+  docs against `package.json` exports and parses every `json` fence, so this
+  cannot silently return.
+- New **`docs/hub.md`**, including what the hub does *not* provide: agent-state
+  classification, durable prompt history, a deep-scrollback archive, host spawn
+  policy. A consumer expecting state dots for free would otherwise conclude the
+  hub is broken.
+- Fixed: a Svelte example where `...` parsed as a boolean prop named `"..."`, a
+  `json` block that failed `JSON.parse`, `TermView` signatures drifted from
+  source, `security.md` documenting `revoke(token)` and then disclaiming
+  revocation (now scoped to one guard instance), and the prefs limit described in
+  KB when it counts UTF-16 code units.
+
+### TermView — the five hot-path defects deferred from v0.4.0
+All measured before and after on the same fixtures:
+- Viewport layout read on every scroll frame: **138 → 0** reads per gesture.
+- `data-bottom-offset` writes and host callbacks on every compositor frame:
+  fling **2.392 → 0.890 ms**, attribute mutations **114 → 1**, callbacks across
+  an unchanged boundary **137 → 0**.
+- Virtualized DOM rebuilt mid-momentum: key-set rebuilds **2 → 0**.
+- History parsed and measured during a fling: `getBoundingClientRect`
+  **234 → 0**, DOM commits while busy **1 → 0**.
+- `getBoundingClientRect` per alt-screen touchmove: **10 → 1**, with the emitted
+  SGR bytes pinned so grok's touch scrolling cannot drift.
+- **Retained history is now capped** with eviction, and per-page cost is flat
+  rather than linear: page-150/page-10 commit ratio **4.03× → 0.94×**. Rows in
+  the viewport plus overscan are never evicted, even if they alone exceed the
+  budget. Still open: sparse SGR checkpoints, and protocol backfill for an
+  evicted newer tail.
+
+### Correctness
+- **prefs**: an empty or key-missing GET no longer overwrites the cache; a failed
+  PUT restores the previous snapshot instead of stranding optimistic state;
+  overlapping PUTs serialize; a `load()` begun during a pending PUT no longer
+  accepts the stale GET; a subscriber writing back during its own notification no
+  longer re-enters.
+- **`UploadAction`**: `busy` releases when the last request settles, not the
+  first, and the response's `dir` wins over the client prop so a server-side path
+  change cannot silently produce a message pointing at nothing.
+- **Upload response carries `dir`** — the resolved absolute directory, not the
+  caller's raw option.
+- **`bottomInsetPx` warns in dev** when it is fractional, negative, NaN/Infinity,
+  or ≥ viewport height. Being 8px wrong silently deletes the top row, and
+  headless browsers resolve `env(safe-area-*)` to 0, so no test can catch it.
+
+### Tests
+- The four exported components that shipped with **zero** tests — `UploadAction`,
+  `PromptsPanel`, `NotePanel`, `ShortcutsSheet` — now have 20 tests, each
+  assertion group proven by mutating a throwaway copy until it fails. The earlier
+  mount smoke asserted the `.svelte` file was text, which is how a component that
+  throws on mount once passed.
+- **`smoke:git-dist` proves every public export reaches consumers**, deriving the
+  expected surface from each subpackage index rather than a frozen list — a
+  frozen list is the v0.4.0 defect in new clothes. It checks type declarations
+  too, without which a type-only export is invisible. On its first run it found
+  the tree's git-dist missing 4 core and 7 server declarations.
+- **`dogfooding.test.ts`** fails if the demo reimplements something the package
+  ships, parsing import specifiers rather than substring-matching. The
+  plug-and-play audit found that pattern four separate times, each caught only by
+  a human reading code.
 
 ## v0.5.0 — 2026-07-28
 Performance and safety work on paths that already shipped in v0.3.5 / v0.4.0 —
