@@ -466,6 +466,53 @@ describe("createServerPrefs", () => {
     });
   });
 
+  test("does not let an older concurrent GET resolving first win over a newer GET", async () => {
+    const key = cacheKey("concurrent-loads-older-first");
+    const cached = seedCache(key);
+    const older = {
+      ...cached,
+      fontPx: Number(cached.fontPx) + 1,
+      serverRevision: Number(cached.cacheRevision) + 1,
+    };
+    const newer = {
+      ...cached,
+      fontPx: Number(cached.fontPx) + 2,
+      serverRevision: Number(cached.cacheRevision) + 2,
+    };
+    const responseGates = [deferred<Response>(), deferred<Response>()];
+    const trackedResponses = responseGates.map((gate) => trackedContinuation(gate.promise));
+    let requestCount = 0;
+    const fetchFn = (() => {
+      const response = trackedResponses[requestCount++];
+      if (!response) throw new Error("unexpected extra GET");
+      return response.promise;
+    }) as typeof fetch;
+    const adapter = createServerPrefs({
+      url: `/prefs/${key}`,
+      cacheKey: key,
+      fetchFn,
+    });
+    const emissions: ThumbmuxPrefs[] = [];
+    let visible = cached;
+    adapter.subscribe?.((prefs) => {
+      emissions.push(prefs);
+      visible = prefs;
+    });
+
+    await Promise.all([adapter.load(), adapter.load()]);
+    responseGates[0]!.resolve(Response.json(older));
+    await trackedResponses[0]!.done;
+    responseGates[1]!.resolve(Response.json(newer));
+    await trackedResponses[1]!.done;
+
+    expect(requestCount).toBe(2);
+    expect(emissions).toHaveLength(1);
+    expect({ visible, stored: readStoredPrefs(key) }).toEqual({
+      visible: newer,
+      stored: newer,
+    });
+  });
+
   for (const malformed of [
     {
       name: "an empty body",
