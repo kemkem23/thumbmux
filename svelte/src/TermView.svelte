@@ -60,6 +60,11 @@
     source: 'live' | 'prepend' | 'replace';
   };
 
+  type ContentHitArea = {
+    rect: { left: number; top: number; width: number; height: number };
+    geom: { cols: number; rows: number };
+  };
+
   let {
     session,
     palette,
@@ -180,6 +185,7 @@
   let dragFrame: number | null = null;
   let altTouchY: number | null = null;
   let altTouchMoved = false;
+  let altTouchHitArea: ContentHitArea | null = null;
   let contentUpdateGate = createContentUpdateGate();
   let pendingContentFlushFrame: number | null = null;
   let paletteRefreshPending = false;
@@ -1277,10 +1283,7 @@
     return { cols: lastPushedCols, rows: lastPushedRows };
   }
 
-  function contentHitArea(): {
-    rect: { left: number; top: number; width: number; height: number };
-    geom: { cols: number; rows: number };
-  } | null {
+  function contentHitArea(): ContentHitArea | null {
     if (!viewportEl) return null;
     const geom = currentGeometry();
     if (!geom) return null;
@@ -1295,6 +1298,11 @@
     };
   }
 
+  function refreshAltTouchHitArea() {
+    if (altTouchY === null) return;
+    altTouchHitArea = contentHitArea();
+  }
+
   // Trackpads emit dozens of sub-line pixel deltas per second — accumulate a
   // fractional remainder and flush only WHOLE lines per animation frame (same
   // scale + accumulation as the local-scroll wheel path), otherwise every
@@ -1303,8 +1311,12 @@
   let altWheelFrame: number | null = null;
   let altWheelCell: { cx: number; cy: number } | null = null;
 
-  function queueAltWheelDelta(clientX: number, clientY: number, delta: { deltaY: number; deltaMode: number }): boolean {
-    const area = contentHitArea();
+  function queueAltWheelDelta(
+    clientX: number,
+    clientY: number,
+    delta: { deltaY: number; deltaMode: number },
+    area: ContentHitArea | null = contentHitArea(),
+  ): boolean {
     if (!area) return false;
     const hit = contentCellFromPoint(clientX, clientY, area.rect, area.geom);
     if (!hit) return false;
@@ -1379,6 +1391,7 @@
       altTouchMoved = false;
       const touch = e.touches.item(0);
       altTouchY = e.touches.length === 1 && touch ? touch.clientY : null;
+      altTouchHitArea = altTouchY === null ? null : contentHitArea();
       return;
     }
     stopInertia();
@@ -1404,12 +1417,14 @@
         updateSelectionActive();
         if (selectionActive) {
           altTouchY = null;
+          altTouchHitArea = null;
           return; // let iOS drag the selection handles
         }
       }
       const touch = e.touches.item(0);
       if (e.touches.length !== 1 || !touch || altTouchY === null) {
         altTouchY = null;
+        altTouchHitArea = null;
         return;
       }
       e.stopPropagation();
@@ -1418,7 +1433,12 @@
       altTouchY = touch.clientY;
       if (dy !== 0) {
         altTouchMoved = true;
-        queueAltWheelDelta(touch.clientX, touch.clientY, { deltaY: -dy, deltaMode: 0 });
+        queueAltWheelDelta(
+          touch.clientX,
+          touch.clientY,
+          { deltaY: -dy, deltaMode: 0 },
+          altTouchHitArea,
+        );
       }
       return;
     }
@@ -1612,6 +1632,7 @@
       }
       tapStart = null;
       altTouchY = null;
+      altTouchHitArea = null;
       altTouchMoved = false;
       touching = false;
       flushPendingContent();
@@ -1804,6 +1825,7 @@
 
   let unsubscribe: (() => void) | null = null;
   let resizeObs: ResizeObserver | null = null;
+  let observedVisualViewport: VisualViewport | null = null;
 
   onMount(() => {
     viewH = viewportEl?.clientHeight ?? 0;
@@ -1837,9 +1859,13 @@
     resizeObs = new ResizeObserver(() => {
       viewH = viewportEl?.clientHeight ?? viewH;
       pushGeometry();
+      refreshAltTouchHitArea();
       applyScroll();
     });
     if (viewportEl) resizeObs.observe(viewportEl);
+    observedVisualViewport = window.visualViewport;
+    observedVisualViewport?.addEventListener('resize', refreshAltTouchHitArea, { passive: true });
+    observedVisualViewport?.addEventListener('scroll', refreshAltTouchHitArea, { passive: true });
     window.addEventListener('pageshow', onReturn);
     document.addEventListener('visibilitychange', onReturn);
     document.addEventListener('selectionchange', updateSelectionActive);
@@ -1862,6 +1888,9 @@
     }
     if (unsubscribe) unsubscribe();
     resizeObs?.disconnect();
+    observedVisualViewport?.removeEventListener('resize', refreshAltTouchHitArea);
+    observedVisualViewport?.removeEventListener('scroll', refreshAltTouchHitArea);
+    observedVisualViewport = null;
     window.removeEventListener('pageshow', onReturn);
     document.removeEventListener('visibilitychange', onReturn);
     document.removeEventListener('selectionchange', updateSelectionActive);

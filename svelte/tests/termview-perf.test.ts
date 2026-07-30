@@ -22,6 +22,19 @@ type MuxCallback = (
 
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 type ScrollState = { bottomOffset: number; scrolledUp: boolean };
+type TermViewOverrides = {
+  altScreenMouse?: boolean;
+  onKeys?: (data: string) => void;
+};
+
+type MutableViewportLayout = {
+  clientWidth: number;
+  clientHeight: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
@@ -184,7 +197,10 @@ function touchEvent(
   return event;
 }
 
-function mountTermView(onScrollStateChange?: (state: ScrollState) => void): Mounted {
+function mountTermView(
+  onScrollStateChange?: (state: ScrollState) => void,
+  overrides: TermViewOverrides = {},
+): Mounted {
   const target = document.createElement("div");
   target.style.cssText = "position:relative;width:320px;height:240px;";
   document.body.appendChild(target);
@@ -199,6 +215,7 @@ function mountTermView(onScrollStateChange?: (state: ScrollState) => void): Moun
         claimGeometry: false,
         fontPx: 13,
         onScrollStateChange,
+        ...overrides,
       },
     }) as Record<string, unknown>;
   });
@@ -241,6 +258,58 @@ async function prepareScrollableTermView(
   flushSync();
 
   return { ...mountedView, viewport };
+}
+
+function viewportRect(layout: MutableViewportLayout): DOMRect {
+  return {
+    x: layout.left,
+    y: layout.top,
+    left: layout.left,
+    top: layout.top,
+    right: layout.left + layout.width,
+    bottom: layout.top + layout.height,
+    width: layout.width,
+    height: layout.height,
+    toJSON: () => ({}),
+  } as DOMRect;
+}
+
+async function prepareAltScreenTermView(onKeys: (data: string) => void) {
+  const mountedView = mountTermView(undefined, { altScreenMouse: true, onKeys });
+  const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+  if (!viewport) throw new Error("TermView root not found");
+
+  const layout: MutableViewportLayout = {
+    clientWidth: 168,
+    clientHeight: 420,
+    left: 10,
+    top: 20,
+    width: 168,
+    height: 420,
+  };
+  Object.defineProperties(viewport, {
+    clientWidth: {
+      configurable: true,
+      get: () => layout.clientWidth,
+    },
+    clientHeight: {
+      configurable: true,
+      get: () => layout.clientHeight,
+    },
+  });
+  const rectSpy = jest
+    .spyOn(viewport, "getBoundingClientRect")
+    .mockImplementation(() => viewportRect(layout));
+
+  const resizeObserver = ControlledResizeObserver.latest;
+  if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+  resizeObserver.fire();
+  await tick();
+  drainAnimationFrames();
+  flushSync();
+  rectSpy.mockClear();
+
+  return { ...mountedView, viewport, layout, rectSpy, resizeObserver };
 }
 
 function wheelTowardHistory(viewport: HTMLElement, deltaY = -120): void {
@@ -499,6 +568,68 @@ describe("TermView compositor scroll layout reads", () => {
     viewportHeight = 320;
     resizeObserver.fire();
     expect(clientHeightReads).toBeGreaterThan(scrollSequenceReads);
+  });
+});
+
+describe("TermView alt-screen touch hit testing", () => {
+  test("reads the viewport rect at most once while preserving the per-point SGR corpus", async () => {
+    const sgrCorpus: string[] = [];
+    const { viewport, rectSpy } = await prepareAltScreenTermView((data) => sgrCorpus.push(data));
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 55, clientY: 400 }]));
+    for (let index = 1; index <= 10; index++) {
+      frameNow += 16;
+      viewport.dispatchEvent(
+        touchEvent("touchmove", [{ clientX: 55, clientY: 400 - index * 35 }]),
+      );
+      runAnimationFrameBatch();
+    }
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 55, clientY: 50 }]),
+    );
+
+    expect(sgrCorpus).toEqual([
+      "\x1b[<65;6;12M",
+      "\x1b[<65;6;12M",
+      "\x1b[<65;6;12M",
+      "\x1b[<65;6;12M",
+      "\x1b[<65;6;10M",
+      "\x1b[<65;6;9M",
+      "\x1b[<65;6;7M",
+      "\x1b[<65;6;5M",
+      "\x1b[<65;6;4M",
+      "\x1b[<65;6;2M",
+    ]);
+    expect(rectSpy.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  test("refreshes the cached rect and geometry when ResizeObserver fires mid-gesture", async () => {
+    const sgrCorpus: string[] = [];
+    const { viewport, layout, rectSpy, resizeObserver } = await prepareAltScreenTermView(
+      (data) => sgrCorpus.push(data),
+    );
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 55, clientY: 260 }]));
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 55, clientY: 225 }]));
+    runAnimationFrameBatch();
+
+    layout.clientWidth = 324;
+    layout.left = 100;
+    layout.top = 100;
+    layout.width = 324;
+    resizeObserver.fire();
+
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 139, clientY: 190 }]));
+    runAnimationFrameBatch();
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 139, clientY: 190 }]),
+    );
+
+    expect(sgrCorpus).toEqual([
+      "\x1b[<65;6;10M",
+      "\x1b[<65;5;5M",
+    ]);
+    expect(rectSpy).toHaveBeenCalledTimes(2);
   });
 });
 
