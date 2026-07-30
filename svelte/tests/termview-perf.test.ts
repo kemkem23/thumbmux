@@ -6,12 +6,23 @@
  * attributes, or host callbacks all move fling work back to the main thread.
  */
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
 import { tmuxMux } from "../src/ws-mux.svelte";
 import type { AnsiPalette } from "@thumbmux/core";
+
+const require = createRequire(import.meta.url);
+const svelteClientInternals = join(
+  dirname(require.resolve("svelte/package.json")),
+  "src/internal/client/index.js",
+);
+const { proxy } = (await import(svelteClientInternals)) as {
+  proxy: <T extends object>(value: T) => T;
+};
 
 type MuxCallback = (
   data: string,
@@ -24,6 +35,7 @@ type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 type ScrollState = { bottomOffset: number; scrolledUp: boolean };
 type TermViewOverrides = {
   altScreenMouse?: boolean;
+  bottomInsetPx?: number;
   onKeys?: (data: string) => void;
 };
 
@@ -611,6 +623,157 @@ afterEach(() => {
   frameCallbacks.clear();
   idleCallbacks.clear();
   jest.restoreAllMocks();
+});
+
+describe("TermView bottomInsetPx development warnings", () => {
+  const VIEWPORT_HEIGHT = 240;
+
+  function withDevWarnings(run: () => void): void {
+    const originalDev = process.env.DEV;
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    process.env.DEV = "true";
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: VIEWPORT_HEIGHT,
+    });
+    try {
+      run();
+    } finally {
+      restoreOwnProperty(window, "innerHeight", originalInnerHeight);
+      if (originalDev === undefined) delete process.env.DEV;
+      else process.env.DEV = originalDev;
+    }
+  }
+
+  function mountWithViewportHeight(bottomInsetPx: number): void {
+    const { target } = mountTermView(undefined, { bottomInsetPx });
+    const viewport = target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+    if (!viewport) throw new Error("TermView root not found");
+    Object.defineProperty(viewport, "clientHeight", {
+      configurable: true,
+      // Deliberately smaller than the browser viewport: the prop contract is
+      // bounded by the whole viewport, not the already-shrunken terminal box.
+      get: () => VIEWPORT_HEIGHT / 2,
+    });
+
+    const resizeObserver = ControlledResizeObserver.latest;
+    if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+    resizeObserver.fire();
+    flushSync();
+  }
+
+  test("warns for every invalid category and identifies the received value", () => {
+    withDevWarnings(() => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const invalidValues = [12.5, -1, VIEWPORT_HEIGHT, Number.NaN, Number.POSITIVE_INFINITY];
+
+      for (const value of invalidValues) mountWithViewportHeight(value);
+
+      const messages = warn.mock.calls.map((args) => args.map(String).join(" "));
+      expect(messages).toHaveLength(invalidValues.length);
+      for (const value of invalidValues) {
+        expect(messages.filter((message) => message.includes(`bottomInsetPx=${String(value)}`)))
+          .toHaveLength(1);
+      }
+      expect(messages.every((message) =>
+        message.includes("only the portion") && message.includes("exceeds the safe-area")
+      )).toBe(true);
+    });
+  });
+
+  test("does not warn for valid inset values", () => {
+    withDevWarnings(() => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+      for (const value of [0, 12, VIEWPORT_HEIGHT - 1]) {
+        mountWithViewportHeight(value);
+      }
+
+      expect(warn).not.toHaveBeenCalled();
+    });
+  });
+
+  test("does not warn for invalid values outside development builds", () => {
+    const originalDev = process.env.DEV;
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    delete process.env.DEV;
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: VIEWPORT_HEIGHT,
+    });
+    try {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+      for (const value of [12.5, -1, VIEWPORT_HEIGHT, Number.NaN, Number.POSITIVE_INFINITY]) {
+        mountWithViewportHeight(value);
+      }
+
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      restoreOwnProperty(window, "innerHeight", originalInnerHeight);
+      if (originalDev === undefined) delete process.env.DEV;
+      else process.env.DEV = originalDev;
+    }
+  });
+
+  test("revalidates against the new viewport height on window resize", () => {
+    withDevWarnings(() => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      mountWithViewportHeight(120);
+      expect(warn).not.toHaveBeenCalled();
+
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: 100,
+      });
+      window.dispatchEvent(new Event("resize"));
+      flushSync();
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.map(String).join(" ")).toContain("bottomInsetPx=120");
+    });
+  });
+
+  test("warns only once when the same invalid value is checked five times", () => {
+    withDevWarnings(() => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const target = document.createElement("div");
+      target.style.cssText = "position:relative;width:320px;height:240px;";
+      document.body.appendChild(target);
+      const props = proxy({
+        session: SESSION,
+        palette,
+        claimGeometry: false,
+        fontPx: 13,
+        bottomInsetPx: 0,
+      });
+      let app: Record<string, unknown>;
+      flushSync(() => {
+        app = mount(TermView as Component, { target, props }) as Record<string, unknown>;
+      });
+      mounted.push({ app: app!, target });
+
+      const viewport = target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+      if (!viewport) throw new Error("TermView root not found");
+      Object.defineProperty(viewport, "clientHeight", {
+        configurable: true,
+        get: () => VIEWPORT_HEIGHT / 2,
+      });
+
+      const resizeObserver = ControlledResizeObserver.latest;
+      if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+      resizeObserver.fire();
+      flushSync();
+
+      for (let check = 0; check < 5; check++) {
+        flushSync(() => { props.bottomInsetPx = 500; });
+        flushSync(() => { props.bottomInsetPx = 0; });
+      }
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.map(String).join(" ")).toContain("bottomInsetPx=500");
+    });
+  });
 });
 
 describe("TermView compositor scroll layout reads", () => {

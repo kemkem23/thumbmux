@@ -2131,6 +2131,36 @@
     lastFontPx = fontPx;
   });
 
+  const warnedBottomInsetValues = new Set<number>();
+  function warnInvalidBottomInset(value: number) {
+    if (!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) return;
+    const viewportHeight = typeof window === 'undefined' ? 0 : window.innerHeight;
+    const invalid =
+      !Number.isFinite(value) ||
+      !Number.isInteger(value) ||
+      value < 0 ||
+      (viewportHeight > 0 && value >= viewportHeight);
+    if (!invalid || warnedBottomInsetValues.has(value)) return;
+    warnedBottomInsetValues.add(value);
+    console.warn(
+      `TermView received invalid bottomInsetPx=${String(value)}. ` +
+      'It must be a finite, non-negative integer smaller than the viewport height and ' +
+      'only the portion of the composer dock that exceeds the safe-area inset.',
+    );
+  }
+
+  function revalidateBottomInset() {
+    warnInvalidBottomInset(bottomInsetPx);
+  }
+
+  $effect(() => {
+    // Re-check after terminal-box resizes without adding a fresh layout read:
+    // viewH is populated by the existing ResizeObserver. A window listener
+    // below covers layout-viewport changes that leave this box unchanged.
+    void viewH;
+    revalidateBottomInset();
+  });
+
   let lastClaimGeometry = $state<boolean | null>(null);
   $effect(() => {
     if (lastClaimGeometry === null) {
@@ -2191,6 +2221,9 @@
     observedVisualViewport = window.visualViewport;
     observedVisualViewport?.addEventListener('resize', refreshAltTouchHitArea, { passive: true });
     observedVisualViewport?.addEventListener('scroll', refreshAltTouchHitArea, { passive: true });
+    if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+      window.addEventListener('resize', revalidateBottomInset, { passive: true });
+    }
     window.addEventListener('pageshow', onReturn);
     document.addEventListener('visibilitychange', onReturn);
     document.addEventListener('selectionchange', updateSelectionActive);
@@ -2216,6 +2249,7 @@
     observedVisualViewport?.removeEventListener('resize', refreshAltTouchHitArea);
     observedVisualViewport?.removeEventListener('scroll', refreshAltTouchHitArea);
     observedVisualViewport = null;
+    window.removeEventListener('resize', revalidateBottomInset);
     window.removeEventListener('pageshow', onReturn);
     document.removeEventListener('visibilitychange', onReturn);
     document.removeEventListener('selectionchange', updateSelectionActive);
