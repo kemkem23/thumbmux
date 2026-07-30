@@ -137,7 +137,12 @@
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
-  let bottomOffsetPx = $state(0);
+  // Keep the per-frame compositor offset out of Svelte reactivity. Diagnostics
+  // get a settled mirror, while the only reactive hot-path state is the coarse
+  // scrolled-up boundary needed by the cursor and host controls.
+  let bottomOffsetPx = 0;
+  let settledBottomOffsetPx = $state(0);
+  let scrollStateScrolledUp = $state(false);
   let winStart = $state(0);
   let winEnd = $state(0);
   let archiveOffset = $state(ARCHIVE_OFFSET_START);
@@ -1105,6 +1110,7 @@
       layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
     }
     emitScrollState();
+    if (!busy()) settledBottomOffsetPx = Math.round(bottomOffsetPx);
   }
 
   function scrollBy(dyPx: number) {
@@ -1114,9 +1120,12 @@
   }
 
   function emitScrollState() {
+    const scrolledUp = bottomOffsetPx > lineH;
+    if (scrolledUp === scrollStateScrolledUp) return;
+    scrollStateScrolledUp = scrolledUp;
     onScrollStateChange?.({
       bottomOffset: Math.round(bottomOffsetPx),
-      scrolledUp: bottomOffsetPx > lineH,
+      scrolledUp,
     });
   }
 
@@ -1507,8 +1516,11 @@
       flushPendingContent();
       return; // no momentum after a selection gesture
     }
-    touching = false;
     if (dragFrame !== null) { cancelAnimationFrame(dragFrame); flushDrag(); }
+    // Keep the final queued drag inside the gesture. Otherwise applyScroll()
+    // would publish an intermediate diagnostic value immediately before
+    // momentum starts, producing two settle mutations for one fling.
+    touching = false;
     const mo = maxOffset();
     if (bottomOffsetPx < 0 || bottomOffsetPx > mo) { springBack(); return; }
     let vel = touchVel;
@@ -1777,7 +1789,7 @@
   class="mtv"
   data-testid="mtv"
   data-total={total}
-  data-bottom-offset={Math.round(bottomOffsetPx)}
+  data-bottom-offset={settledBottomOffsetPx}
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
@@ -1826,7 +1838,7 @@
         <div class="mtv-line" data-line-id={archiveOffset + lineIdx}>{@html cachedLineHtml(lineIdx, contentEpoch)}</div>
       {/each}
     {/key}
-    {#if cursor && connected && bottomOffsetPx <= lineH && charW > 0}
+    {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
       {@const lastContent = (() => { let i = total; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
       {#if cline >= winStart && cline < winEnd + (cursor.row < 0 ? -cursor.row : 0)}

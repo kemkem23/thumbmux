@@ -1,8 +1,9 @@
 /**
  * Regression coverage for the TermView compositor-scroll hot path.
  *
- * A scroll gesture must consume the height cached by ResizeObserver. Reading
- * clientHeight from applyScroll() forces layout on every animation frame.
+ * A scroll gesture must consume the height cached by ResizeObserver and keep
+ * diagnostics off the compositor hot path. Per-frame layout reads, diagnostic
+ * attributes, or host callbacks all move fling work back to the main thread.
  */
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import type { Component } from "svelte";
@@ -20,6 +21,7 @@ type MuxCallback = (
 ) => void;
 
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
+type ScrollState = { bottomOffset: number; scrolledUp: boolean };
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
@@ -87,13 +89,22 @@ function cancelControlledFrame(id: number): void {
   frameCallbacks.delete(id);
 }
 
+function runAnimationFrameBatch(): number {
+  const callbacks = [...frameCallbacks.values()];
+  frameCallbacks.clear();
+  frameNow += 16;
+  for (const callback of callbacks) callback(frameNow);
+  // A real browser flushes Svelte's queued DOM work between animation frames.
+  // Keep the controlled clock equally observable so hot-path mutations cannot
+  // be hidden by batching the entire fling into one synchronous task.
+  flushSync();
+  return callbacks.length;
+}
+
 function drainAnimationFrames(limit = 500): void {
   let batches = 0;
   while (frameCallbacks.size > 0 && batches < limit) {
-    const callbacks = [...frameCallbacks.values()];
-    frameCallbacks.clear();
-    frameNow += 16;
-    for (const callback of callbacks) callback(frameNow);
+    runAnimationFrameBatch();
     batches++;
   }
   if (frameCallbacks.size > 0) {
@@ -123,7 +134,7 @@ function touchEvent(
   return event;
 }
 
-function mountTermView(): Mounted {
+function mountTermView(onScrollStateChange?: (state: ScrollState) => void): Mounted {
   const target = document.createElement("div");
   target.style.cssText = "position:relative;width:320px;height:240px;";
   document.body.appendChild(target);
@@ -137,6 +148,7 @@ function mountTermView(): Mounted {
         palette,
         claimGeometry: false,
         fontPx: 13,
+        onScrollStateChange,
       },
     }) as Record<string, unknown>;
   });
@@ -150,6 +162,103 @@ function deliverOutput(lineCount: number): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
   const data = Array.from({ length: lineCount }, (_, i) => `line-${i}`).join("\n");
   sessionCallback(data, "output", null, { source: "full", replace: true });
+}
+
+async function prepareScrollableTermView(
+  onScrollStateChange?: (state: ScrollState) => void,
+): Promise<Mounted & { viewport: HTMLElement }> {
+  const mountedView = mountTermView(onScrollStateChange);
+  const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+  if (!viewport) throw new Error("TermView root not found");
+
+  Object.defineProperty(viewport, "clientHeight", {
+    configurable: true,
+    get: () => 240,
+  });
+
+  const resizeObserver = ControlledResizeObserver.latest;
+  if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+  resizeObserver.fire();
+  deliverOutput(240);
+  await tick();
+  drainAnimationFrames();
+  flushSync();
+
+  return { ...mountedView, viewport };
+}
+
+function wheelTowardHistory(viewport: HTMLElement, deltaY = -120): void {
+  viewport.dispatchEvent(
+    new WheelEvent("wheel", {
+      deltaY,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  flushSync();
+  drainAnimationFrames();
+}
+
+function startTouchFling(viewport: HTMLElement): void {
+  viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 80 }]));
+  frameNow += 16;
+  viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 140 }]));
+}
+
+function releaseTouchFling(viewport: HTMLElement): void {
+  viewport.dispatchEvent(
+    touchEvent("touchend", [], [{ clientX: 40, clientY: 140 }]),
+  );
+}
+
+function compositorBottomOffset(viewport: HTMLElement): number {
+  const layer = viewport.querySelector(".mtv-layer") as HTMLElement | null;
+  const firstLine = layer?.querySelector(".mtv-line") as HTMLElement | null;
+  if (!layer || !firstLine) throw new Error("TermView compositor rows not found");
+
+  const translateMatch = layer.style.transform.match(
+    /translate3d\(0(?:px)?,\s*(-?\d+(?:\.\d+)?)px,\s*0(?:px)?\)/,
+  );
+  if (!translateMatch?.[1]) throw new Error(`unexpected transform: ${layer.style.transform}`);
+
+  const totalAttr = viewport.getAttribute("data-total");
+  const archiveOffsetAttr = viewport.getAttribute("data-archive-offset");
+  const firstLineIdAttr = firstLine.getAttribute("data-line-id");
+  if (totalAttr === null || archiveOffsetAttr === null || firstLineIdAttr === null) {
+    throw new Error("TermView compositor diagnostics are missing");
+  }
+
+  const total = Number(totalAttr);
+  const archiveOffset = Number(archiveOffsetAttr);
+  const firstLineId = Number(firstLineIdAttr);
+  const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+  if (![total, archiveOffset, firstLineId, lineHeight].every(Number.isFinite)) {
+    throw new Error("TermView compositor diagnostics are not numeric");
+  }
+  const maxOffset = Math.max(0, total * lineHeight - viewport.clientHeight);
+  const winStart = firstLineId - archiveOffset;
+  return Math.round(maxOffset + Number(translateMatch[1]) - winStart * lineHeight);
+}
+
+function observeBottomOffset(viewport: HTMLElement): {
+  observer: MutationObserver;
+  takeCount: () => number;
+} {
+  const delivered: MutationRecord[] = [];
+  const observer = new MutationObserver((records) => delivered.push(...records));
+  observer.observe(viewport, {
+    attributes: true,
+    attributeFilter: ["data-bottom-offset"],
+  });
+
+  return {
+    observer,
+    takeCount: () => {
+      const records = [...delivered.splice(0), ...observer.takeRecords()];
+      return records.filter((record) => record.attributeName === "data-bottom-offset").length;
+    },
+  };
 }
 
 beforeEach(() => {
@@ -259,5 +368,82 @@ describe("TermView compositor scroll layout reads", () => {
     viewportHeight = 320;
     resizeObserver.fire();
     expect(clientHeightReads).toBeGreaterThan(scrollSequenceReads);
+  });
+});
+
+describe("TermView compositor scroll diagnostics", () => {
+  test("bottom offset is mirrored once at settle, never during a fling", async () => {
+    const { app, viewport } = await prepareScrollableTermView();
+    wheelTowardHistory(viewport);
+
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    expect(isScrolledUp?.()).toBe(true);
+
+    const { observer, takeCount } = observeBottomOffset(viewport);
+    let duringFlingMutations = 0;
+    let settleMutations = 0;
+
+    try {
+      startTouchFling(viewport);
+      runAnimationFrameBatch();
+      duringFlingMutations += takeCount();
+      releaseTouchFling(viewport);
+
+      let batches = 0;
+      while (frameCallbacks.size > 0 && batches < 500) {
+        runAnimationFrameBatch();
+        const mutations = takeCount();
+        if (frameCallbacks.size > 0) duringFlingMutations += mutations;
+        else settleMutations += mutations;
+        batches++;
+      }
+      if (frameCallbacks.size > 0) {
+        throw new Error("touch fling did not settle after 500 animation frames");
+      }
+
+      expect(duringFlingMutations).toBe(0);
+      expect(settleMutations).toBe(1);
+      const mirroredOffsetAttr = viewport.getAttribute("data-bottom-offset");
+      if (mirroredOffsetAttr === null) throw new Error("settled bottom offset is missing");
+      const mirroredOffset = Number(mirroredOffsetAttr);
+      expect(Number.isFinite(mirroredOffset)).toBe(true);
+      expect(mirroredOffset).toBe(compositorBottomOffset(viewport));
+    } finally {
+      observer.disconnect();
+    }
+  });
+
+  test("an unchanged scrolled-up flag does not notify the host during a fling", async () => {
+    const scrollStates: ScrollState[] = [];
+    const { app, viewport } = await prepareScrollableTermView((state) => scrollStates.push(state));
+    wheelTowardHistory(viewport);
+
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    expect(isScrolledUp?.()).toBe(true);
+    scrollStates.length = 0;
+
+    startTouchFling(viewport);
+    runAnimationFrameBatch();
+    releaseTouchFling(viewport);
+    drainAnimationFrames();
+
+    expect(isScrolledUp?.()).toBe(true);
+    expect(scrollStates).toHaveLength(0);
+  });
+
+  test("crossing the scrolled-up boundary notifies the host", async () => {
+    const scrollStates: ScrollState[] = [];
+    const { app, viewport } = await prepareScrollableTermView((state) => scrollStates.push(state));
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    expect(isScrolledUp?.()).toBe(false);
+    scrollStates.length = 0;
+
+    startTouchFling(viewport);
+    runAnimationFrameBatch();
+    releaseTouchFling(viewport);
+    drainAnimationFrames();
+
+    expect(scrollStates.some((state) => state.scrolledUp)).toBe(true);
+    expect(scrollStates).toHaveLength(1);
   });
 });
