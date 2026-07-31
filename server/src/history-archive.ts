@@ -98,7 +98,13 @@ function commonPrefixLength(left: readonly string[], right: readonly string[]): 
   return common;
 }
 
-function looksLikeTailRepaint(previous: readonly string[], next: readonly string[]): boolean {
+/**
+ * Classify consecutive live terminal captures that most likely changed in
+ * place instead of scrolling. A stable prefix with at most two rewritten tail
+ * rows is treated as a prompt/status repaint so callers do not manufacture
+ * phantom history from a coincidental suffix-to-prefix match.
+ */
+export function looksLikeTailRepaint(previous: readonly string[], next: readonly string[]): boolean {
   const shortest = Math.min(previous.length, next.length);
   if (shortest === 0) return true;
   // Captures frequently rewrite the prompt and one adjacent tail row. A
@@ -126,7 +132,13 @@ function emptyState(): ArchiveState {
   };
 }
 
-function stableOverlap(previous: readonly string[], next: readonly string[]): number {
+/**
+ * Return the largest exact overlap between the suffix of one terminal capture
+ * and the prefix of the next. The overlap is a reconciliation signal, not
+ * proof of scrolling; callers should apply repaint and reliability checks
+ * before archiving rows that appear to have departed.
+ */
+export function stableOverlap(previous: readonly string[], next: readonly string[]): number {
   const longest = Math.min(previous.length, next.length);
   for (let size = longest; size > 0; size--) {
     let matches = true;

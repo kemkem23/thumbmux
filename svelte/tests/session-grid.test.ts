@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { AnsiPalette } from '@thumbmux/core';
+import { activityDatetime } from '../src/session-grid';
 import {
-  activityDatetime,
   buildSessionGridModel,
   contrastRatio,
   deriveThumbnailPalette,
@@ -9,7 +9,7 @@ import {
   readableColorOn,
   splitSessionName,
   type GridSession,
-} from '../src/session-grid';
+} from '../src/index';
 
 const palette: AnsiPalette = {
   base: [

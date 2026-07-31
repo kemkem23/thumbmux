@@ -11,7 +11,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileHistoryArchive, type HistoryPage } from "../src/index";
+import {
+  FileHistoryArchive,
+  looksLikeTailRepaint,
+  stableOverlap,
+  type HistoryPage,
+} from "../src/index";
 
 const roots: string[] = [];
 
@@ -74,6 +79,26 @@ test("exports a usable FileHistoryArchive from the server package", () => {
     lines: [],
     startLine: null,
     hasMore: false,
+  });
+});
+
+describe("public terminal-capture reconciliation helpers", () => {
+  test("finds the longest exact suffix-to-prefix overlap", () => {
+    const previous = ["prompt", "repeat", "tail-a", "tail-b"] as const;
+    const next = ["tail-a", "tail-b", "next"] as const;
+
+    expect(stableOverlap(previous, next)).toBe(2);
+    expect(stableOverlap(previous, ["unrelated"] as const)).toBe(0);
+  });
+
+  test("distinguishes a rewritten tail from a shifted live window", () => {
+    const previous = ["shell", "working", "status", "prompt>"] as const;
+    const repainted = ["shell", "working", "status updated", "prompt>x"] as const;
+    const shifted = ["status", "prompt>", "next", "prompt>"] as const;
+
+    expect(looksLikeTailRepaint(previous, repainted)).toBe(true);
+    expect(looksLikeTailRepaint(previous, shifted)).toBe(false);
+    expect(looksLikeTailRepaint(previous, [] as const)).toBe(true);
   });
 });
 

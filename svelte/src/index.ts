@@ -39,6 +39,14 @@ export type {
   GridSessionState,
   SessionGridProps,
 } from './session-grid';
+export {
+  displayStateLabel,
+  splitSessionName,
+  buildSessionGridModel,
+  contrastRatio,
+  readableColorOn,
+  deriveThumbnailPalette,
+} from './session-grid';
 export { default as LaunchSheet, type LaunchContext } from './LaunchSheet.svelte';
 export { default as UploadAction } from './UploadAction.svelte';
 export { default as ShortcutBar } from './ShortcutBar.svelte';
