@@ -16,6 +16,18 @@ import type { Snippet } from 'svelte';
 
 /** Host-owned behavior and policy seams for the mountable application shell. */
 export interface AppAdapters {
+  /** REST prefix the shell calls, the client half of
+   * `createAppRoutes({ basePath })`. Defaults to `/api`, the same default the
+   * server normalizes to. Hardcoding it on either side would mean the two
+   * halves of one package could be configured into disagreement. The websocket
+   * path is fixed at `/ws/tmux` and is deliberately not derived from this. */
+  basePath?: string;
+  /** Replace the session-list bootstrap outright. Absent, the shell calls
+   * `GET {basePath}/sessions`. This exists because a host is not required to
+   * serve its sessions through `createAppRoutes` at all — the reference
+   * consumer keeps its own server and mounts only the client shell — so the
+   * path shape is not something the package gets to assume. */
+  fetchSessions?: () => Promise<SessionListItem[]>;
   sendKeys?: (session: string, keys: string) => void;
   submitAgent?: (session: string) => SubmitAgent;
   routes?: {
