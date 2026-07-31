@@ -18,3 +18,4 @@ export * from "./prefs-handler";
 export * from './frame-journal';
 export * from './token-guard';
 export * from './history-archive';
+export * from './app-routes';
