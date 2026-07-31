@@ -4,6 +4,12 @@ This document describes the standalone, host-instantiated `createTokenGuard`
 style guard. It is a pure authorization component: it does not itself wire the
 demo server, WebSocket mux, browser routing, or response output.
 
+**If you are starting fresh, you probably want `createAppRoutes` instead.** Hand
+it a `guard` and it performs the wiring this document describes — see
+"The paved road" at the end. Read the rest of this page when you drive
+`TmuxWsMux` yourself, or when you need to know exactly what is being enforced
+on your behalf.
+
 ## Scope and grants
 
 A host configures grants with a bearer token, a `read` or `interactive` scope,
@@ -375,9 +381,40 @@ encrypted transport/TLS, or a session-isolation guarantee beyond the
 configured allowlists. It is not a substitute for TLS, secure proxy
 configuration, network exposure control, or server-side routing enforcement.
 
-## Required later integration
+## The paved road: `createAppRoutes`
 
-Later host/demo integration must retain the token-free principal at WebSocket
-upgrade, recheck its expiry for every message, and apply the session-list
-filter hook to every list output. Until that wiring is present, this module
-alone does not protect demo or mux traffic.
+`createAppRoutes({ guard, ... })` from `thumbmux/server` performs every step
+below, so a host that uses it does not assemble authorization by hand:
+
+- authenticates the WebSocket **upgrade** and holds the token-free principal
+  server-side, keyed to the socket
+- authorizes **every** mux message, not only the ones that look sensitive, and
+  rechecks expiry per message; a denied message gets
+  `{ type: "auth_error", status, code }` rather than silence
+- filters the session list on **every** path that emits one — the initial push,
+  subsequent pushes, drain catch-up, and the HTTP list — with the guard's
+  projection applied last, so a host hook can neither see rows the principal may
+  not have nor widen what it returns
+- maps each HTTP route to a named operation (`sessions-list`, `sessions-spawn`,
+  `upload`, `prefs-read`, `prefs-write`, `sessions-kill`) and authorizes before
+  the handler runs, answering `405` with `Allow` on the wrong method
+- requires the explicit `sessions-kill` permission for kill, which existing
+  interactive grants do not carry
+
+Pass no `guard` and it behaves exactly as before — unauthenticated, as the demo
+and single-user setups expect.
+
+**Still yours, regardless:** who receives which grant, `Origin`/CSRF/TLS, spawn
+policy (cwd allowlist, naming, worktrees), per-user storage, and owning the
+process and listener.
+
+## Doing it yourself
+
+Driving `TmuxWsMux` directly means taking on the first four bullets above:
+retain the token-free principal at WebSocket upgrade, recheck its expiry for
+every message, authorize every message rather than filtering the list, and apply
+the projection to every list output. Filtering alone is not isolation — a client
+that a filtered list hides a session from can still name that session directly
+in a `subscribe` or `keys` frame. That is a demonstrated leak, not a theoretical
+one, and it is pinned by a test that watches the marker arrive in the forbidden
+pane when per-message authorization is removed.

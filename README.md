@@ -4,12 +4,12 @@
 
 **tmux for thumbs — and now for desks.**
 
-A reusable set of web-terminal components and a server engine for driving tmux
-sessions — especially AI coding agents — from phone and desktop browsers: a
-compositor-scroll viewer, a keyboard-aware composer, a live session hub, and a
-multiplexed WebSocket engine. Published dist tags provide public core, Svelte,
-and server entrypoints for a host application to wire together; they do not
-install a runnable application or demo.
+A reusable web-terminal shell and server engine for driving tmux sessions —
+especially AI coding agents — from phone and desktop browsers: a compositor-
+scroll viewer, a keyboard-aware composer, a live session hub, and a multiplexed
+WebSocket engine. The current 0.8.0 checkout exposes public core, Svelte,
+server, and assembled app entrypoints. It still needs a host process; it is not
+a standalone executable or an installed copy of the repository demo.
 
 [![CI](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/tag/kemkem23/thumbmux?filter=v*-dist&label=release&color=16a34a)](https://github.com/kemkem23/thumbmux/tags)
@@ -147,29 +147,90 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Gesture window** | `translate3d` over a virtualized row window with 60 rows of overscan on each side; ANSI parsing and window rebuilds are deferred during an active gesture |
 | **Client history retention** | nominally 10,000 rows or an estimated 8 MiB; the mounted viewport and overscan remain protected |
 | **Server archive default** | `FileHistoryArchive` retains up to 20,000 archived lines per session unless the host sets `maxLines` |
-| **README/distribution guards** | 23 passing tests across 2 files in the required scripts test command |
-| **Core source** | 4,827 lines of production TypeScript and **zero runtime dependencies** |
+| **Core source** | 4,862 measured lines of production TypeScript and **zero runtime dependencies** |
 
 ## Get started
 
-**📦 In your app — use a published dist tag.** List the public
-`vX.Y.Z-dist` tags, choose one that exists, and pin it:
+**📦 In your app — use a published dist tag.** The app-shell quickstart needs
+the 0.8.x surface. List the public 0.8.x tags, select the newest exact tag that
+actually exists, and pin it:
 
 ```bash
-git ls-remote --tags https://github.com/kemkem23/thumbmux 'refs/tags/v*-dist'
-THUMBMUX_TAG=v0.7.1-dist # replace with the published tag you selected
-bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
-# npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"
+THUMBMUX_TAG="$(git ls-remote --tags https://github.com/kemkem23/thumbmux \
+  'refs/tags/v0.8.*-dist' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+if test -z "$THUMBMUX_TAG"; then
+  echo "No published v0.8.x-dist tag found" >&2
+else
+  bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
+  # npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"
+fi
 ```
 
-The selected tag's README is its API contract. This branch documents the
-current checkout and may include APIs newer than that tag; do not infer that a
-dist tag exists from the local `package.json` version.
+If the listing has no match, the block prints a message and installs nothing;
+do not guess a tag. The selected tag's README describes that artifact, while the
+[compatibility contract](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md)
+defines the current tier policy. This branch documents the current checkout
+and may include APIs newer than a published tag; do not infer that a dist tag
+exists from the local `package.json` version.
 
-A dist-tag install contains the prebuilt `thumbmux/core`, `thumbmux/server`,
-and `thumbmux/svelte` library entrypoints plus these docs. It contains no app
-entrypoint, demo directory, or package scripts; the surrounding application is
-host code.
+A matching 0.8.x dist-tag install contains the prebuilt `thumbmux/core`,
+`thumbmux/server`, `thumbmux/svelte`, and `thumbmux/app` entrypoints plus the
+supporting docs. It contains no standalone listener, demo directory, or package
+scripts; the surrounding process and deployment remain host code.
+
+## Quickstart
+
+This pair uses the stock tmux driver, the assembled HTTP/WebSocket routes, and
+the assembled Svelte shell. It requires Bun and tmux on the server. The listener
+is loopback-only because this minimal example has no guard; do not expose an
+unguarded terminal server to a network.
+
+**Server (`server.ts`)** — `createAppRoutes()` supplies `GET /api/sessions`,
+`POST /api/spawn`, `DELETE /api/sessions/:name`, and the fixed `/ws/tmux` mux.
+The host owns the listener and the fallback response.
+
+<!-- quickstart:server -->
+```ts
+import { createAppRoutes } from "thumbmux/server";
+
+const routes = createAppRoutes();
+const server = Bun.serve({
+  hostname: "127.0.0.1",
+  port: Number(Bun.env.PORT ?? 3000),
+  async fetch(request, bunServer) {
+    return await routes.fetch(request, bunServer)
+      ?? new Response("Not found", { status: 404 });
+  },
+  websocket: routes.websocket,
+});
+console.log(`thumbmux listening on http://127.0.0.1:${server.port}`);
+```
+
+**Client (`src/main.ts`)** — start from a Svelte 5 + Vite app configured with
+`@sveltejs/vite-plugin-svelte`, and keep the usual `<div id="app"></div>` in
+`index.html`. The empty adapter selects the matching same-origin defaults.
+
+<!-- quickstart:client -->
+```ts
+import { mount } from "svelte";
+import { ThumbmuxApp, type AppAdapters } from "thumbmux/app";
+
+const target = document.getElementById("app");
+if (!target) throw new Error("Missing #app");
+
+const adapters: AppAdapters = {};
+mount(ThumbmuxApp, { target, props: { adapters } });
+```
+
+The server fence is a complete Bun program. The client fence is a complete
+Vite entry module; `ThumbmuxApp` renders its hub immediately and switches to a
+session through the `?session=` query parameter. See the full
+[application-shell guide](docs/app.md) before adding authentication, uploads,
+server preferences, custom routes, or host-owned panels.
+
+## Lower-level building blocks
+
+The four public subpaths can also be composed below the assembled shell:
 
 ```ts
 import {
@@ -206,10 +267,10 @@ import {
 </script>
 ```
 
-`thumbmux/svelte` resolves via the `svelte` export condition — Vite/SvelteKit
-pick it up automatically (it ships `.svelte` sources + `.d.ts`, compiled by
-your bundler). **Pin only a `-dist` tag that the listing command returns**;
-update by choosing another published tag and reinstalling.
+`thumbmux/svelte` and `thumbmux/app` resolve via the `svelte` export condition —
+Vite/SvelteKit pick them up automatically (they ship Svelte sources + `.d.ts`,
+compiled by your bundler). **Pin only a `-dist` tag that the listing command
+returns**; update by choosing another published tag and reinstalling.
 
 **⚡ Run the demo.** On a machine with `tmux` and Bun:
 
@@ -232,40 +293,50 @@ name; reuse a name only for the same logical session.
 project:
 
 > Use the current thumbmux checkout and read its README. Then wire it in: mount
-> `TmuxWsMux` from `thumbmux/server` on a WebSocket route with a driver for my
-> tmux, and add a page using `SessionGrid` + `LaunchSheet` + `TermView` +
-> `DesktopKeys` + `ComposerDock` from `thumbmux/svelte`. Show me the wiring plan
-> before writing code.
+> `ThumbmuxApp` from `thumbmux/app`, pair it with `createAppRoutes()` from
+> `thumbmux/server`, and list the host-owned listener, authentication, session,
+> storage, and deployment policies that still need decisions. Show me the
+> wiring plan before writing code.
 
 **🔒 The security-conscious way.** Same, but audit first:
 
 > Read the source files in the cloned thumbmux repository (core/, svelte/,
-> server/).
+> server/, app/).
 > Flag anything that phones home, executes remote content, touches
 > files outside its packages, or handles keystrokes/session content in a way I
 > should not trust. Summarize what data flows where, then wait for my
 > go-ahead.
 
-## What the host supplies
+## What the host still supplies
 
-The installed package is the component and engine layer. A host application
-still owns these integration points:
+`ThumbmuxApp` now provides the application shell, and `createAppRoutes()` now
+provides the matching HTTP handlers and WebSocket mux. A host does not need to
+reassemble those layers, but it still owns these integration points:
 
-- **Application shell.** Supply the pages, navigation, WebSocket/HTTP routes,
-  process lifecycle, and the policy that maps users and workspaces to tmux
-  sessions. The runnable demo is a repository example, not an installed
-  entrypoint.
-- **Kill control.** `killTmuxSession()` is exported as a server primitive, but
-  thumbmux does not install a kill button or HTTP route. Supply both the UI
-  control and a protected route that authorizes the exact session before
-  calling it.
-- **Authorization on every mux message.** `createTokenGuard()` can authenticate
-  an upgrade request and authorize a parsed message with
-  `authorizeMuxMessage()`, but
-  `TmuxWsMux.handleMessage()` does not call the guard. Retain the authenticated
-  principal on the socket, authorize every parsed client message before handing
-  it to the mux, and filter every session-list delivery; see
-  [the token-guard contract](docs/security.md).
+- **Process, listener, and outer routing.** Start Bun, choose the port and TLS
+  termination, serve the client bundle, and handle every request for which
+  `createAppRoutes.fetch()` returns `null`. A framework host also owns its page
+  routes; split `HubView` and `SessionView` mounts delegate navigation back to
+  that router. The repository demo remains an example, not an installed
+  executable.
+- **Identity and authorization policy.** Passing a `guard` to
+  `createAppRoutes({ guard })` makes the package authenticate every owned HTTP
+  operation and WebSocket upgrade, authorize every mux message, and filter
+  session-list delivery. The host still issues grants, maps its identities and
+  workspaces to session allowlists, handles its origin/CSRF policy, and protects
+  fallthrough routes. Hosts using `TmuxWsMux` directly must perform that wiring
+  themselves; see [the token-guard contract](docs/security.md).
+- **Session lifecycle policy and kill UI.** `createAppRoutes()` provides the
+  spawn endpoint and `DELETE {basePath}/sessions/:name` kill route by default;
+  both must be treated as privileged operations. The stock shell has no kill
+  action. Constrain cwd, names, commands, and worktree hooks, then either disable
+  the kill route or add a control. With a guard, killing also requires
+  `sessions-kill` permission and an allowlist containing the exact session.
+- **Host data and multi-user persistence.** The route assembler can enable
+  upload and single-document preferences handlers, while the shell can use
+  local preferences. The host still chooses durable storage and supplies
+  identity-backed notes, prompts, per-user preferences, upload retention, and
+  any application-specific metadata.
 - **Recording storage and routes.** `FrameJournal`, `parseReplayJournal()`, and
   `RecordingPlayer` provide recording, replay, and playback building blocks, and
   `MuxHooks.onOutput` taps the canonical full frame after each capture so the
@@ -276,7 +347,8 @@ still owns these integration points:
 - **“Agent needs a human” detection.** The notification contract validates
   host-supplied `finished` / `waiting` events, and the browser helpers can show
   them. The host must detect agent state transitions and supply, persist, and
-  deliver those events; see [the notification contract](docs/notifications.md).
+  deliver those events. It also supplies agent classification, labels, and any
+  notification provider; see [the notification contract](docs/notifications.md).
 
 ## Wiring
 
@@ -533,25 +605,46 @@ node_modules/thumbmux/
 ├── git-dist/core/    prebuilt framework-free TypeScript entrypoint
 ├── git-dist/svelte/  Svelte 5 components, sources, and declarations
 ├── git-dist/server/  prebuilt Bun/Node WebSocket engine entrypoint
-└── docs/             seven supporting Markdown documents and their media
+├── git-dist/app/     assembled Svelte 5 application shell
+└── docs/             eight supporting Markdown documents and their media
 ```
 
 The package export map exposes those implementation directories as
-`thumbmux/core`, `thumbmux/svelte`, and `thumbmux/server`. The runnable demo
-and its app shell remain in the source repository.
+`thumbmux/core`, `thumbmux/svelte`, `thumbmux/server`, and `thumbmux/app`.
+The runnable demo remains in the source repository; the assembled app shell is
+an installable component, not a listener or executable.
 
 | package | what you get |
 |---|---|
 | **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `TmuxWsMux` — shared adaptive polling, `pipe-pane` dirty signals, content-hash dedupe, per-socket tail + delta modes, cursor-only frames, history expansion, session-list pushes, opt-in frame compression · `FileHistoryArchive` bounded file-backed scrollback archive · `FrameJournal` nonblocking NDJSON session recorder · `createTokenGuard()` scoped expiring bearer-token authorization · `createBunTmuxDriver()` reference driver · `createSpawnHandler()` + `createUploadHandler()` + `createPrefsHandler()` fetch-style handler factories |
+| **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
+| **`thumbmux/app`** | `ThumbmuxApp` assembled hub/session shell · separate `HubView`, `SessionView`, and chromeless `EmbedView` mounts · typed `AppAdapters` for routing, session metadata, launch, content, preferences, theme, labels, and host extension slots |
 
-Docs: [session hub integration](docs/hub.md) ·
+Docs: [application shell](docs/app.md) ·
+[session hub integration](docs/hub.md) ·
 [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
 [recording journal](docs/recording.md) · [notifications](docs/notifications.md) ·
 [token guard](docs/security.md) ·
+[CONTRACT.md](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md) ·
 [release process](https://github.com/kemkem23/thumbmux/blob/main/SPLIT.md)
+
+## Compatibility checks
+
+The public policy is the 0.8.x
+[compatibility contract](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md).
+In a source checkout, after `bun run build:git-dist`, `bun run contract`
+compares the built `core`, `server`, `svelte`, and `app` declarations with their
+checked-in tier manifests. That command is the surface gate; it does not run
+consumer fixtures.
+
+`bash scripts/contract-fixtures.sh` separately packs the same `git-dist`
+artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
+and `app-host`. They compile and exercise the low-level host, guarded route
+composition, and Svelte app mount respectively. `thumbmux/app` and
+`createAppRoutes` remain **S — stabilizing** throughout 0.8.x; these checks are
+evidence for the published tiers, not a claim of 1.0 compatibility.
 
 <details>
 <summary><b>iOS scar tissue</b> — lessons encoded in the components so you don't relearn them</summary>
@@ -616,6 +709,12 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] Bounded retained history with protected visible rows and explicit gap markers
 - [x] prefs/upload data-loss paths fixed and previously untested components covered
 - [x] `smoke:git-dist` checks source-derived core/server export parity for consumers
+
+**v0.8.0 — assembled host surface (current checkout)**
+- [x] Mountable `ThumbmuxApp` plus hub, session, and embed views under `thumbmux/app`
+- [x] `createAppRoutes()` composition for the matching HTTP and WebSocket surface
+- [x] Four-subpath contract gate plus three separate frozen consumer fixtures
+- [x] Copyable server/client quickstart executed from a packed `git-dist` consumer
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,
