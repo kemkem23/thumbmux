@@ -42,6 +42,12 @@ export interface PreferencesAdapter {
 export function mergePrefs(base: ThumbmuxPrefs, patch: Partial<ThumbmuxPrefs>): ThumbmuxPrefs {
   const next: ThumbmuxPrefs = { ...base };
   for (const [k, v] of Object.entries(patch)) {
+    // `JSON.parse` gives "__proto__" as a real own key, but assigning to it
+    // runs the Object.prototype setter and swaps this object's prototype
+    // instead of storing a value. A host would then read a preference that is
+    // not an own property and vanishes on stringify — present at runtime,
+    // absent once saved. It is never a legitimate preference name, so drop it.
+    if (k === '__proto__') continue;
     if (v === undefined || v === null) delete next[k];
     else next[k] = v;
   }

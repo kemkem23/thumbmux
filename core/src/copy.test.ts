@@ -29,4 +29,17 @@ describe("mergePrefs", () => {
     expect(next).toEqual({ fontPx: 15, theme: { bg: "#000" } });
     expect(base.fontPx).toBe(13); // no mutation
   });
+
+  test("a __proto__ key in the patch cannot reach the result's prototype", () => {
+    // JSON.parse produces "__proto__" as a real own key, so a hostile PUT body
+    // reaches the merge. Assigning it used to swap the result's prototype: the
+    // host could read a preference it never stored, and stringify dropped it.
+    const hostile = JSON.parse(String.raw`{"__proto__":{"hostFlag":"inherited"}}`);
+    const merged = mergePrefs({ fontPx: 13 }, hostile);
+
+    expect((merged as Record<string, unknown>).hostFlag).toBeUndefined();
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
+    expect(JSON.parse(JSON.stringify(merged))).toEqual({ fontPx: 13 });
+    expect(({} as Record<string, unknown>).hostFlag).toBeUndefined();
+  });
 });

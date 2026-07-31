@@ -311,6 +311,15 @@ decoded request text exceeds 262,144 UTF-16 code units (this is not a byte limit
 otherwise. Pair with `createServerPrefs()` from `thumbmux/svelte` (localStorage cache +
 optimistic saves).
 
+**One handler stores one shared document, and it authenticates nobody.** This is a
+deliberate single-tenant boundary, not an oversight: `TokenPrincipal` carries no stable
+subject, so the guard cannot partition storage per user. Mounting this handler directly on
+a multi-user deployment shares every viewer's preferences with every other viewer. Protect
+it with the `prefs-read` / `prefs-write` operations — see
+[the token-guard contract](security.md) — and treat authorization as protecting one shared
+resource rather than as separating data. A `__proto__` key in the patch body is dropped
+rather than merged.
+
 ## Deployment notes
 
 - **HTTP/2 and the WS upgrade:** WebSocket's `Upgrade` header does not exist
