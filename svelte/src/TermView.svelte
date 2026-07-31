@@ -48,6 +48,7 @@
     type LineOverlayRange,
     type SearchMatch,
     collectTerminalUrlSegments,
+    findLineOverlap,
     mergeCapturedLinesForStableScroll,
     readerAnchorLineDelta,
     prefixForCells, stripAnsi, paneTextForCopy,
@@ -1342,6 +1343,34 @@
     jumpToSearchLine(match.line);
   }
 
+  /** Exact content is the only row identity available across a reset. An
+   * in-place resize/resync can retain same-position prefix/suffix rows, while
+   * an advanced capture retains an old suffix at the new prefix. Keep the
+   * stronger exact continuity proof. Every scan is bounded linear time; only
+   * the shared matcher's KMP fallback allocates O(nextLive.length) scratch. */
+  function replaceRetainedOverlapRows(previousLive: string[], nextLive: string[]): number {
+    const alignedLimit = Math.min(previousLive.length, nextLive.length);
+    let alignedPrefix = 0;
+    while (
+      alignedPrefix < alignedLimit &&
+      previousLive[alignedPrefix] === nextLive[alignedPrefix]
+    ) {
+      alignedPrefix++;
+    }
+    if (alignedPrefix === alignedLimit) return alignedPrefix;
+
+    let alignedSuffix = 0;
+    while (
+      alignedPrefix + alignedSuffix < alignedLimit &&
+      previousLive[previousLive.length - 1 - alignedSuffix] ===
+        nextLive[nextLive.length - 1 - alignedSuffix]
+    ) {
+      alignedSuffix++;
+    }
+    const inPlaceOverlap = alignedPrefix + alignedSuffix;
+    return Math.max(inPlaceOverlap, findLineOverlap(previousLive, nextLive));
+  }
+
   function setLines(
     nextLive: string[],
     replace = false,
@@ -1349,9 +1378,11 @@
   ) {
     if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
-      // rows remain physical history at their original width.
+      // rows remain physical history at their original width. A resync can
+      // replay the same cached content, so count only old rows not covered by
+      // exact content continuity proven across both live windows.
       const discardedLiveRows = gapRowIndex >= 0 && gapRowCount > 0
-        ? liveLines.length
+        ? liveLines.length - replaceRetainedOverlapRows(liveLines, nextLive)
         : 0;
       liveLines = nextLive;
       if (discardedLiveRows > 0) {

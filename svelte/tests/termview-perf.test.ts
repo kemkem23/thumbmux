@@ -1325,6 +1325,207 @@ describe("TermView retained history budgets", () => {
     expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
   }, 120_000);
 
+  test("keeps the gap count stable for a byte-identical replace", async () => {
+    let retainedLines: string[] = [];
+    let lineChangeCalls = 0;
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => {
+        retainedLines = [...lines];
+        lineChangeCalls++;
+      },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const totalBefore = Number(viewport.getAttribute("data-total"));
+    const markerIndex = markerLineId - archiveOffset;
+    const liveTail = retainedLines.slice(markerIndex);
+    const callsBefore = lineChangeCalls;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(liveTail.join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+    });
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -1_000_000);
+    wheelTowardHistory(viewport, 70 * lineHeight);
+
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore);
+    expect(lineChangeCalls).toBe(callsBefore);
+    expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
+    expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(gapRowsBefore);
+  }, 120_000);
+
+  test("counts only rows absent after a suffix-overlap replace", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const markerIndex = markerLineId - archiveOffset;
+    const oldLiveTail = retainedLines.slice(markerIndex);
+    const replacement = oldLiveTail.slice(-100);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(replacement.join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+    });
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -1_000_000);
+    wheelTowardHistory(viewport, 70 * lineHeight);
+
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    const liveRowsAfter = retainedLines.length - markerIndex;
+    const expectedGapRows = gapRowsBefore + oldLiveTail.length - liveRowsAfter;
+    expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
+    expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+  }, 120_000);
+
+  test("counts a bottom-aligned unchanged suffix as retained on replace", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const markerIndex = markerLineId - archiveOffset;
+    const oldLiveTail = retainedLines.slice(markerIndex);
+    const replacement = [
+      ...oldLiveTail.slice(0, -100).map((_, row) => `reflowed-row-${row}`),
+      ...oldLiveTail.slice(-100),
+    ];
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(replacement.join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+    });
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -1_000_000);
+    wheelTowardHistory(viewport, 70 * lineHeight);
+
+    const newLiveTail = retainedLines.slice(markerIndex);
+    let retainedSuffixRows = 0;
+    while (
+      retainedSuffixRows < Math.min(oldLiveTail.length, newLiveTail.length) &&
+      oldLiveTail[oldLiveTail.length - 1 - retainedSuffixRows] ===
+        newLiveTail[newLiveTail.length - 1 - retainedSuffixRows]
+    ) {
+      retainedSuffixRows++;
+    }
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    const expectedGapRows = gapRowsBefore + oldLiveTail.length - retainedSuffixRows;
+    expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
+    expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+  }, 120_000);
+
+  test("retains an unchanged prefix when replace repaints only the live tail", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const markerIndex = markerLineId - archiveOffset;
+    const oldLiveTail = retainedLines.slice(markerIndex);
+    const replacement = [...oldLiveTail.slice(0, -1), "repainted-live-tail"];
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(replacement.join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+    });
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -1_000_000);
+    wheelTowardHistory(viewport, 70 * lineHeight);
+
+    const newLiveTail = retainedLines.slice(markerIndex);
+    let retainedPrefixRows = 0;
+    while (
+      retainedPrefixRows < Math.min(oldLiveTail.length, newLiveTail.length) &&
+      oldLiveTail[retainedPrefixRows] === newLiveTail[retainedPrefixRows]
+    ) {
+      retainedPrefixRows++;
+    }
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    const expectedGapRows = gapRowsBefore + oldLiveTail.length - retainedPrefixRows;
+    expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
+    expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+  }, 120_000);
+
+  test("does not create a retention-gap marker on replace without an existing gap", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(0);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      Array.from({ length: 12 }, (_, row) => `no-gap-replacement-${row}`).join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -1_000_000);
+
+    expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(0);
+  }, 120_000);
+
   test("live append stays within retention budgets without changing mounted rows", async () => {
     let retainedLines: string[] = [];
     const { viewport } = await prepareScrollableTermView(undefined, 240, {
