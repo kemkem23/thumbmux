@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdir, rm, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, rm, readdir, readFile, readlink, realpath, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createUploadHandler } from "../src/upload-handler";
 import { makeStoredName, formatUploadMessage } from "../../core/src/upload";
@@ -59,10 +59,136 @@ describe("upload handler", () => {
     expect((await handler(new Request("http://x", { method: "POST", body: "junk" }))).status).toBe(400);
   });
 
+  test("rejects undocumented upload methods before parsing", async () => {
+    const dir = await freshDir("method");
+    let parsed = 0;
+    try {
+      const h = createUploadHandler({ dir });
+      const request = {
+        method: "PUT",
+        formData: async () => {
+          parsed += 1;
+          const form = new FormData();
+          form.append("files", new File(["data"], "put.txt"));
+          return form;
+        },
+      } as unknown as Request;
+
+      const res = await h(request);
+      expect(res.status).toBe(405);
+      expect(res.headers.get("allow")).toBe("POST");
+      expect(parsed).toBe(0);
+      expect(await listDir(dir)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("maxTotalBytes counts non-file parts as UTF-8 bytes", async () => {
+    const dir = await freshDir("total-field");
+    try {
+      const h = createUploadHandler({ dir, maxTotalBytes: 8 });
+      const form = new FormData();
+      form.append("metadata", "ก".repeat(2)); // 6 UTF-8 bytes, despite 2 JS code units.
+      form.append("files", new File(["xyz"], "tiny.txt")); // Combined decoded payload = 9 bytes.
+
+      const res = await h(new Request("http://x/api/upload", { method: "POST", body: form }));
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({ error: "request total exceeds 8 bytes" });
+      expect(await listDir(dir)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("file count and per-file byte limits cover files in every form field", async () => {
+    const countDir = await freshDir("all-file-count");
+    const sizeDir = await freshDir("all-file-size");
+    try {
+      const countForm = new FormData();
+      countForm.append("files", new File(["a"], "accepted.txt"));
+      countForm.append("extra-a", new File(["b"], "ignored-a.txt"));
+      countForm.append("extra-b", new File(["c"], "ignored-b.txt"));
+      const countHandler = createUploadHandler({ dir: countDir, maxFiles: 2 });
+      const countRes = await countHandler(new Request("http://x/api/upload", { method: "POST", body: countForm }));
+      expect(countRes.status).toBe(413);
+      expect(await countRes.json()).toEqual({ error: "max 2 files" });
+      expect(await listDir(countDir)).toEqual([]);
+
+      const sizeForm = new FormData();
+      sizeForm.append("files", new File(["a"], "accepted.txt"));
+      sizeForm.append("extra", new File(["oversized"], "ignored-big.txt"));
+      const sizeHandler = createUploadHandler({ dir: sizeDir, maxBytesPerFile: 4 });
+      const sizeRes = await sizeHandler(new Request("http://x/api/upload", { method: "POST", body: sizeForm }));
+      expect(sizeRes.status).toBe(413);
+      expect(await sizeRes.json()).toEqual({ error: '"ignored-big.txt" exceeds 4 bytes' });
+      expect(await listDir(sizeDir)).toEqual([]);
+    } finally {
+      await rm(countDir, { recursive: true, force: true });
+      await rm(sizeDir, { recursive: true, force: true });
+    }
+  });
+
   test("stored-name sanitizer and composer message format", () => {
     expect(makeStoredName("../we ird/名前 file.png", 1000, "abc")).toBe("1000_abc_file.png");
+    expect(makeStoredName("..\\..\\.secret", 1000, "abc")).toBe("1000_abc_secret");
     expect(formatUploadMessage([{ original: "a.png", stored: "1_x_a.png" }]))
       .toBe('Uploaded "a.png" → uploads/1_x_a.png');
+  });
+
+  test("very long names are capped and duplicate names never collide", async () => {
+    const dir = await freshDir("names");
+    const originalNow = Date.now;
+    const originalRandom = Math.random;
+    try {
+      Date.now = () => 1_000;
+      Math.random = () => 0.5;
+      const h = createUploadHandler({ dir });
+      const longName = `${"a".repeat(300)}.txt`;
+      const res = await h(reqWith([[longName, "first"], [longName, "second"]]));
+      expect(res.status).toBe(201);
+      const data = await res.json() as { files: Array<{ stored: string }> };
+      expect(data.files).toHaveLength(2);
+      expect(new Set(data.files.map((file) => file.stored)).size).toBe(2);
+      for (const file of data.files) {
+        expect(file.stored).not.toContain("/");
+        expect(file.stored.split("_").at(-1)?.length).toBeLessThanOrEqual(80);
+      }
+      expect((await readFile(join(dir, data.files[0].stored))).toString()).toBe("first");
+      expect((await readFile(join(dir, data.files[1].stored))).toString()).toBe("second");
+    } finally {
+      Date.now = originalNow;
+      Math.random = originalRandom;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a pre-existing destination symlink is never followed or removed", async () => {
+    const dir = await freshDir("symlink");
+    const outside = `${dir}-outside.txt`;
+    const originalNow = Date.now;
+    const originalRandom = Math.random;
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(outside, "outside-sentinel");
+      await symlink(outside, join(dir, "1000_i_victim.txt"));
+      Date.now = () => 1_000;
+      Math.random = () => 0.5;
+
+      const h = createUploadHandler({ dir });
+      const res = await h(reqWith([["victim.txt", "uploaded"]]));
+      expect(res.status).toBe(201);
+      const data = await res.json() as { files: Array<{ stored: string }> };
+      expect(data.files[0].stored).not.toBe("1000_i_victim.txt");
+      expect((await readFile(outside)).toString()).toBe("outside-sentinel");
+      expect(await readlink(join(dir, "1000_i_victim.txt"))).toBe(outside);
+      expect((await readFile(join(dir, data.files[0].stored))).toString()).toBe("uploaded");
+    } finally {
+      Date.now = originalNow;
+      Math.random = originalRandom;
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { force: true });
+    }
   });
 
   test("all-or-nothing: 2 files, second oversized leaves zero on disk", async () => {
@@ -128,16 +254,40 @@ describe("upload handler", () => {
     }
   });
 
+  test("default maxFiles accepts ten files and rejects eleven", async () => {
+    const acceptedDir = await freshDir("default-count-ok");
+    const rejectedDir = await freshDir("default-count-reject");
+    const ten = Array.from({ length: 10 }, (_, i): [string, string] => [`${i}.txt`, `${i}`]);
+    try {
+      const accepted = createUploadHandler({ dir: acceptedDir });
+      const acceptedRes = await accepted(reqWith(ten));
+      expect(acceptedRes.status).toBe(201);
+      expect((await acceptedRes.json()).files).toHaveLength(10);
+
+      const rejected = createUploadHandler({ dir: rejectedDir });
+      const rejectedRes = await rejected(reqWith([...ten, ["10.txt", "10"]]));
+      expect(rejectedRes.status).toBe(413);
+      expect(await rejectedRes.json()).toEqual({ error: "max 10 files" });
+      expect(await listDir(rejectedDir)).toEqual([]);
+    } finally {
+      await rm(acceptedDir, { recursive: true, force: true });
+      await rm(rejectedDir, { recursive: true, force: true });
+    }
+  });
+
   test("write failure mid-request cleans up and rethrows original error", async () => {
     const dir = await freshDir("write-fail");
     try {
       const h = createUploadHandler({ dir });
+      const parts = [
+        { name: "good.txt", size: 4, arrayBuffer: async () => new TextEncoder().encode("good").buffer },
+        { name: "bad.txt", size: 4, arrayBuffer: async () => { throw new Error("boom"); } },
+      ];
       const fakeReq = {
+        method: "POST",
         formData: async () => ({
-          getAll: () => [
-            { name: "good.txt", size: 4, arrayBuffer: async () => new TextEncoder().encode("good").buffer },
-            { name: "bad.txt", size: 4, arrayBuffer: async () => { throw new Error("boom"); } },
-          ],
+          getAll: () => parts,
+          values: () => parts.values(),
         }),
       } as unknown as Request;
 
@@ -183,13 +333,16 @@ describe("upload handler", () => {
     const dir = await freshDir("malformed");
     try {
       const h = createUploadHandler({ dir });
+      const parts = [
+        { name: "good.txt", size: 4, arrayBuffer: async () => new TextEncoder().encode("good").buffer },
+        // Bun's multipart parser can hand back a nameless Blob for a zero-byte part.
+        { name: undefined as unknown as string, size: 0, arrayBuffer: async () => new ArrayBuffer(0) },
+      ];
       const fakeReq = {
+        method: "POST",
         formData: async () => ({
-          getAll: () => [
-            { name: "good.txt", size: 4, arrayBuffer: async () => new TextEncoder().encode("good").buffer },
-            // Bun's multipart parser can hand back a nameless Blob for a zero-byte part.
-            { name: undefined as unknown as string, size: 0, arrayBuffer: async () => new ArrayBuffer(0) },
-          ],
+          getAll: () => parts,
+          values: () => parts.values(),
         }),
       } as unknown as Request;
 

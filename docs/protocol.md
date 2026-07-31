@@ -279,14 +279,28 @@ and fnmatch resolution; use it only when that behavior is deliberate.
 
 ## Upload endpoint (createUploadHandler)
 
-`POST /api/upload` (multipart, field `files`, ≤10 files) → `201 {ok:true, files:[{original,
-stored}], dir}`. `dir` is the normalized absolute storage directory returned by
-`resolve(opts.dir)`, not the raw option supplied by the host. Stored names are sanitized to
+`POST /api/upload` (multipart; File values in field `files`) → `201 {ok:true,
+files:[{original, stored}], dir}`. Other methods return `405` with `Allow: POST`. Only `files`
+values are persisted, but the resource limits cover the whole decoded form: `maxFiles` defaults
+to 10 and counts File/Blob values in every field, and `maxBytesPerFile` defaults to 200 MiB and
+checks each of them. Optional `maxTotalBytes` (unlimited when omitted) sums every decoded value —
+UTF-8 bytes for strings plus File/Blob byte sizes — but excludes multipart boundaries and headers.
+Count and per-file errors take precedence over the total and return `413`. For an otherwise-valid
+upload, exceeding the total also returns `413`; malformed forms or no usable `files` return `400`.
+All of these checks happen before the handler creates an upload file.
+
+The platform's native `request.formData()` must parse/buffer the multipart body before those
+decoded sizes are available. Consequently `maxTotalBytes` is not a pre-parse raw-body or memory
+limit; hosts that need one must also enforce a wire-body limit in their HTTP server or reverse
+proxy. `dir` is the normalized absolute path returned by `resolve(opts.dir)`, not the raw option.
+The configured directory and its parent path are a host-controlled trust boundary (parent
+symlinks are followed). Within it, stored names are sanitized to
 `<epoch-ms>_<entropy>_<cleaned>` — path components stripped, `[^\w.-]` runs collapsed to `_`,
-leading dots/underscores removed, 80-char cap — so hostile filenames cannot escape the upload
-dir. Oversized → `413`; malformed form → `400`. `formatUploadMessage(files, dir)` turns the
-returned mapping and directory into the composer prefill (`Uploaded "orig" → dir/stored`, one
-line per file).
+leading dots/underscores removed, 80-char cleaned-name cap. Files are created exclusively and
+name collisions are retried, so attacker filenames cannot traverse out of `dir` and an existing
+leaf file or symlink is neither followed nor overwritten.
+`formatUploadMessage(files, dir)` turns the returned mapping and directory into the composer
+prefill (`Uploaded "orig" → dir/stored`, one line per file).
 
 ## Preferences endpoint (createPrefsHandler)
 
