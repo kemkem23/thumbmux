@@ -16,7 +16,7 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `resync` | `session` | after rejecting a missing/stale delta, request one complete output frame. The server replies with `reset:'resync'`. Hosts with a custom WS message switch **must** forward this message to `TmuxWsMux.handleMessage()` (or equivalent `handleResync` routing) whenever they forward `delta: true`; otherwise the viewer can remain frozen after its first rejected delta. |
 | `sessions_subscribe` / `sessions_unsubscribe` | — | join/leave the `__sessions` list channel. |
 | `ping` | — | keepalive; server replies `{"type":"pong"}`. Clients close after 8 s without a pong. |
-| `client_info` | `client` | refresh this socket's descriptor (visibility, viewport, host telemetry id). |
+| `client_info` | `client` | forward this socket's descriptor (visibility, viewport, host telemetry id) to the host's optional `onClientInfo` hook; the mux does not retain it. |
 
 ## Server → client
 

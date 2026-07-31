@@ -118,6 +118,8 @@ export interface MuxHooks<
   WS extends WsLike = WsLike,
   SessionRow extends SessionListRow = SessionListItem,
 > {
+  /** Refresh host-owned descriptor state for this socket. */
+  onClientInfo?(ws: WS, client: unknown): void;
   onSubscribe?(session: string, ws: WS, client: unknown): void;
   onUnsubscribe?(session: string, ws: WS, client: unknown): void;
   /** socket closed — release any per-socket state (size holds, telemetry) */
@@ -1324,6 +1326,7 @@ export class TmuxWsMux<
   handleMessage(msg: MuxClientMessage, ws: WS) {
     switch (msg.type) {
       case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
+      case "client_info": this.hooks.onClientInfo?.(ws, msg.client); break;
       case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail, delta: msg.delta }); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
       case "keys": if (msg.session && msg.data !== undefined) this.handleKeys(msg.session, msg.data, ws, msg.client); break;
