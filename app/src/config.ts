@@ -5,6 +5,7 @@ import type {
   PreferencesAdapter,
   SessionListItem,
   SubmitAgent,
+  TerminalSurfaceWithPalette,
 } from '@thumbmux/core';
 import type {
   FabAction,
@@ -24,7 +25,13 @@ export interface AppAdapters {
   spawn?: {
     presets?: readonly LaunchPreset[];
     contexts?: () => Promise<LaunchContext[]>;
-    launch?: (spec: LaunchSpec) => Promise<{ name: string }>;
+    /** `contextId` is the workspace the viewer picked, or null when the host
+     * supplied no `contexts`. It is a separate argument rather than a field on
+     * `LaunchSpec` because the spec describes the command to run and the
+     * context describes where to run it — `buildLaunchSpec` has no business
+     * knowing about workspaces. Dropping it would leave the picker visible and
+     * inert. */
+    launch?: (spec: LaunchSpec, contextId: string | null) => Promise<{ name: string }>;
   };
   sessionMeta?: (rows: SessionListItem[]) => GridSession[];
   notes?: {
@@ -43,11 +50,28 @@ export interface AppAdapters {
     palette: AnsiPalette;
     fontPx: number;
   }>;
+  /** The host owns theme state; the shell only reads it and reports intent.
+   * `ThemeSheet` is pure presentation — it has no store of its own — so a
+   * read-only seam leaves its dark/light toggle and its swatches wired to
+   * nothing. Omit the whole block and the shell falls back to its own local
+   * state; supply it and every mutation goes to the host. */
   theme?: {
     defaultBg?: string;
     swatches?: string[];
     storageKey?: string;
     bgFor?: (session: string) => string | null;
+    /** Current mode, read on each render. */
+    mode?: () => 'dark' | 'light';
+    /** Full surface for one session. When present this wins over
+     * `termProps.palette`, because the stage, HUD and terminal have to agree —
+     * a host that derives all of them together should not have to hand them
+     * over through two seams that could disagree. */
+    surfaceFor?: (session: string) => TerminalSurfaceWithPalette | null;
+    onToggleMode?: (mode: 'dark' | 'light') => void;
+    /** `session` is passed so a host that themes per agent can derive the
+     * target from the name; a host with one global theme ignores it. */
+    onPick?: (session: string, hex: string) => void;
+    onReset?: (session: string) => void;
   };
   labels?: Partial<AppLabels>;
   extraActions?: (session: string) => FabAction[];
