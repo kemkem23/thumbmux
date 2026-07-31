@@ -196,6 +196,28 @@ describe("createTokenGuard query and cookie bootstrap", () => {
         ],
       }),
     ).toThrow("invalid grant configuration");
+
+    expect(() =>
+      createTokenGuardWithClock({
+        grants: [{
+          token: "unknown-permission",
+          scope: "interactive",
+          expiresAt: 5000,
+          permissions: ["sessions-delete"] as any,
+        }],
+      }),
+    ).toThrow("invalid grant configuration");
+
+    expect(() =>
+      createTokenGuardWithClock({
+        grants: [{
+          token: "non-array-permission",
+          scope: "interactive",
+          expiresAt: 5000,
+          permissions: null as any,
+        }],
+      }),
+    ).toThrow("invalid grant configuration");
   });
 });
 
@@ -428,6 +450,149 @@ describe("HTTP matrix with body/path context", () => {
     expect(
       guard.authorizeHttp(new Request("https://x/api/recordings?session=denied-session"), principal),
     ).toMatchObject({ ok: false, status: 403, code: "forbidden_session" });
+  });
+
+  test("session kill is interactive, session-scoped, and denied by default", () => {
+    const withKillPermission = (
+      scope: "read" | "interactive",
+      token: string,
+      sessions?: readonly string[],
+    ) => ({
+      ...makeGrant(scope, token, 5000, sessions),
+      permissions: ["sessions-kill"] as const,
+    }) as TokenGrant;
+    const guard = createTokenGuardWithClock({
+      grants: [
+        withKillPermission("read", "kill-read"),
+        makeGrant("interactive", "kill-ungranted", 5000),
+        { ...makeGrant("interactive", "kill-empty", 5000), permissions: [] },
+        withKillPermission("interactive", "kill-unrestricted"),
+        withKillPermission("interactive", "kill-restricted", ["allowed-session"]),
+      ],
+    });
+    const read = principalFromAuthentication(authenticateQuery(guard, "kill-read"));
+    const ungranted = principalFromAuthentication(authenticateQuery(guard, "kill-ungranted"));
+    const empty = principalFromAuthentication(authenticateQuery(guard, "kill-empty"));
+    const unrestricted = principalFromAuthentication(authenticateQuery(guard, "kill-unrestricted"));
+    const restricted = principalFromAuthentication(authenticateQuery(guard, "kill-restricted"));
+    const request = new Request("https://x/api/sessions/allowed-session", { method: "DELETE" });
+
+    expect(
+      guard.authorizeHttp(request, read, {
+        operation: "sessions-kill",
+        session: "allowed-session",
+      }),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_scope" });
+    expect(
+      guard.authorizeHttp(request, empty, {
+        operation: "sessions-kill",
+        session: "allowed-session",
+      }),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_scope" });
+    expect("permissions" in unrestricted).toBe(false);
+    expect("permissions" in guard.sanitizePrincipal(unrestricted)).toBe(false);
+    expect(
+      guard.authorizeHttp(request, ungranted, {
+        operation: "sessions-kill",
+        session: "allowed-session",
+      }),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_scope" });
+    expect(
+      guard.authorizeHttp(request, unrestricted, {
+        operation: "sessions-kill",
+        session: "allowed-session",
+      }),
+    ).toMatchObject({
+      ok: true,
+      status: 200,
+      operation: "sessions-kill",
+      session: "allowed-session",
+    });
+    expect(
+      guard.authorizeHttp(request, restricted, {
+        operation: "sessions-kill",
+        session: "allowed-session",
+      }),
+    ).toMatchObject({ ok: true, status: 200, operation: "sessions-kill", session: "allowed-session" });
+    expect(
+      guard.authorizeHttp(
+        new Request("https://x/api/sessions/denied-session", { method: "DELETE" }),
+        restricted,
+        { operation: "sessions-kill", session: "denied-session" },
+      ),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_session" });
+    expect(
+      guard.authorizeHttp(request, unrestricted, { operation: "sessions-kill" }),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_operation" });
+  });
+
+  test("single-tenant preferences have separate read and write authorization", () => {
+    const guard = createTokenGuardWithClock({
+      grants: [
+        makeGrant("read", "prefs-read-only", 5000),
+        makeGrant("interactive", "prefs-interactive", 5000),
+      ],
+    });
+    const read = principalFromAuthentication(authenticateQuery(guard, "prefs-read-only"));
+    const interactive = principalFromAuthentication(authenticateQuery(guard, "prefs-interactive"));
+
+    expect(guard.authorizeHttp(new Request("https://x/api/prefs"), read)).toMatchObject({
+      ok: true,
+      status: 200,
+      operation: "prefs-read",
+    });
+    expect(
+      guard.authorizeHttp(new Request("https://x/api/prefs", { method: "PUT" }), interactive),
+    ).toMatchObject({ ok: true, status: 200, operation: "prefs-write" });
+    expect(
+      guard.authorizeHttp(new Request("https://x/api/prefs", { method: "POST" }), interactive),
+    ).toMatchObject({ ok: true, status: 200, operation: "prefs-write" });
+    expect(
+      guard.authorizeHttp(new Request("https://x/api/prefs", { method: "PUT" }), read),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_scope" });
+    expect(
+      guard.authorizeHttp(new Request("https://x/custom/preferences"), read, {
+        operation: "prefs-read",
+      }),
+    ).toMatchObject({ ok: true, status: 200, operation: "prefs-read" });
+    expect(
+      guard.authorizeHttp(new Request("https://x/api/prefs", { method: "DELETE" }), interactive),
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_operation" });
+  });
+
+  test("session-kill permissions are snapshotted against caller mutation", () => {
+    const laterAdded: Array<"sessions-kill"> = [];
+    const laterRemoved: Array<"sessions-kill"> = ["sessions-kill"];
+    const guard = createTokenGuardWithClock({
+      grants: [
+        {
+          ...makeGrant("interactive", "kill-permission-added", 5000),
+          permissions: laterAdded,
+        },
+        {
+          ...makeGrant("interactive", "kill-permission-removed", 5000),
+          permissions: laterRemoved,
+        },
+      ],
+    });
+    const added = principalFromAuthentication(authenticateQuery(guard, "kill-permission-added"));
+    const removed = principalFromAuthentication(authenticateQuery(guard, "kill-permission-removed"));
+    laterAdded.push("sessions-kill");
+    laterRemoved.length = 0;
+    const request = new Request("https://x/api/sessions/agent", { method: "DELETE" });
+    const context = { operation: "sessions-kill" as const, session: "agent" };
+
+    expect(guard.authorizeHttp(request, added, context)).toMatchObject({
+      ok: false,
+      status: 403,
+      code: "forbidden_scope",
+    });
+    expect(guard.authorizeHttp(request, removed, context)).toMatchObject({
+      ok: true,
+      status: 200,
+      operation: "sessions-kill",
+      session: "agent",
+    });
   });
 
   test("missing, mismatched, duplicate session selections and invalid route forms are 403", () => {

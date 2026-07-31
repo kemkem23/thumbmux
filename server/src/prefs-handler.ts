@@ -1,11 +1,15 @@
 /**
- * createPrefsHandler — a tiny "config file" REST endpoint for viewer
- * preferences (theme, font, shortcuts…): GET returns the JSON file,
+ * createPrefsHandler — a tiny single-tenant "config file" REST endpoint for
+ * shared viewer preferences (theme, font, shortcuts…): GET returns the JSON file,
  * PUT/POST merge-patches it (null deletes a key — RFC 7386 style) with an
  * atomic tmp+rename write, so a crash mid-save never leaves a torn file
  * (the very last save may be lost on power failure — prefs are cheap).
  * Writes are serialized per handler instance: concurrent PUTs from two
  * devices merge in order instead of losing updates.
+ *
+ * This handler does not authenticate requests or partition data by principal:
+ * one handler/file is one trusted tenant. A host must authorize `prefs-read`
+ * and `prefs-write` before calling it, or provide its own per-user store.
  */
 import { mergePrefs, type ThumbmuxPrefs } from "@thumbmux/core";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -13,7 +17,12 @@ import { dirname } from "node:path";
 
 const MAX_BYTES = 256 * 1024; // prefs are small; anything bigger is a bug
 
-export function createPrefsHandler(opts: { file: string }) {
+export type PrefsHandlerOptions = {
+  /** One JSON file shared by every request in this trusted tenant. */
+  file: string;
+};
+
+export function createPrefsHandler(opts: PrefsHandlerOptions) {
   const { file } = opts;
   let seq = 0;
   let chain: Promise<unknown> = Promise.resolve();

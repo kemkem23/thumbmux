@@ -11,6 +11,12 @@ an expiry time, and an optional `sessions` allowlist. A grant is active only
 while its expiry is later than the guard's current time; equality with the
 expiry is expired.
 
+Destructive operations can also require an explicit grant permission. The
+current permission is `sessions-kill`; omitting `permissions` (or passing an
+empty list) denies kill even to an otherwise unrestricted `interactive` grant.
+This permission is snapshotted internally and is not added to the token-free
+principal surface.
+
 When authentication succeeds, the guard returns a token-free principal holding
 only the scope, expiry, and allowlist. An omitted `sessions` property is
 unrestricted. A present allowlist, including an empty one, restricts access to
@@ -136,15 +142,18 @@ snapshot (via an internal weak map). Authorization always re-reads the grant:
   sessions, or expiry — even if the host somehow unfreezes or clones fields
 - `sanitizePrincipal` / `createSocketPrincipal` re-mint from the grant and
   never copy caller-held privilege fields
+- destructive-operation permissions are read from the bound immutable grant,
+  not from caller-controlled principal fields
 - `revoke(token)` invalidates both new authentications and any live principal
   minted from that grant
 
 ## Authorization decisions
 
 Missing, malformed, invalid, or expired credentials are `401`. A valid,
-unexpired principal denied by scope, session allowlist, or a malformed/unknown
-operation is `403`. The guard checks expiry for every authorization decision
-against the grant snapshot, including every WebSocket message after upgrade.
+unexpired principal denied by scope or operation permission, session allowlist,
+or a malformed/unknown operation is `403`. The guard checks expiry for every
+authorization decision against the grant snapshot, including every WebSocket
+message after upgrade.
 
 | Capability | `read` | `interactive` | Additional rule |
 | --- | --- | --- | --- |
@@ -154,6 +163,9 @@ against the grant snapshot, including every WebSocket message after upgrade.
 | `ping`, `client_info`, session-list subscribe/unsubscribe | allowed | allowed | Pushed session lists still require filtering. |
 | `subscribe`, `unsubscribe`, `history_expand`, `resync` | allowed | allowed | Require a nonempty, exactly allowed session. |
 | `keys`, `resize` | denied | allowed | Require a nonempty, exactly allowed session. |
+| Preference read | allowed | allowed | `createPrefsHandler` is one shared single-tenant store; authorization does not partition its data. |
+| Preference write | denied | allowed | Authorize `prefs-write` before calling the handler. |
+| Session kill | denied | denied unless explicitly granted | Require `permissions: ["sessions-kill"]` and a nonempty, exactly allowed session. |
 | Spawn, upload, recording start, recording stop | denied | allowed | Recording actions require a nonempty, exactly allowed session. Restricted grants never spawn. |
 
 Every session-bearing HTTP or WebSocket operation must use an exact session in
@@ -177,18 +189,151 @@ principal-bound message and route checks described above.
 
 ## Host routes and parsed input
 
-The current demo-facing operations include:
+HTTP operations the guard recognizes or lets a host name explicitly include:
 
 - `POST /api/spawn`
 - `POST /api/upload`
+- `GET /api/prefs` (`prefs-read`) and `PUT`/`POST /api/prefs`
+  (`prefs-write`)
 - `POST /api/recordings/start` and `POST /api/recordings/stop`, with a parsed
   session payload
 - `GET /api/recordings?session=...`
+- a host-defined kill route using `sessions-kill` plus its parsed session name
 
 Hosts should authorize named, parsed operations and session inputs, including
 body-derived sessions, rather than guessing from raw URL substring matches.
 This keeps route parsing and authorization explicit and prevents a route or
 parameter spelling from becoming an accidental bypass.
+
+`sessions-kill` is denied by default. A grant must be `interactive`, include
+`permissions: ["sessions-kill"]`, and name a nonempty session allowed by its
+allowlist; adding the operation name alone grants nothing. There is no packaged
+kill handler or canonical kill URL, so a host must pass the parsed operation
+and session explicitly before calling `killTmuxSession()` and then invalidate
+the mux lifecycle.
+
+The example below uses `DELETE /api/sessions/:name` as a host-owned route. It
+also guards the packaged preferences handler instead of mounting it directly.
+The principal must have been authenticated by the returned guard.
+
+<!-- B2-GUARDED-HTTP-SNIPPET:START -->
+```ts
+import {
+  createPrefsHandler,
+  createTokenGuard,
+  killTmuxSession,
+  type HttpAuthorizationContext,
+  type TokenPrincipal,
+} from "thumbmux/server";
+
+type SessionInvalidator = {
+  invalidateSession(session: string): unknown;
+};
+
+export function createProtectedOperations(options: {
+  token: string;
+  prefsFile: string;
+  mux: SessionInvalidator;
+}) {
+  const guard = createTokenGuard({
+    grants: [{
+      token: options.token,
+      scope: "interactive",
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      sessions: ["agent-1"],
+      permissions: ["sessions-kill"],
+    }],
+  });
+  const handlePrefs = createPrefsHandler({ file: options.prefsFile });
+
+  const denied = (decision: {
+    status: number;
+    code: string;
+    message: string;
+  }) => Response.json(
+    { ok: false, code: decision.code, message: decision.message },
+    { status: decision.status },
+  );
+
+  async function handle(req: Request, principal: TokenPrincipal): Promise<Response> {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/api/prefs") {
+      const operation = req.method === "GET"
+        ? "prefs-read"
+        : req.method === "PUT" || req.method === "POST"
+          ? "prefs-write"
+          : undefined;
+      if (!operation) return new Response("method not allowed", { status: 405 });
+
+      const context: HttpAuthorizationContext = { operation };
+      const decision = guard.authorizeHttp(req, principal, context);
+      return decision.ok ? handlePrefs(req) : denied(decision);
+    }
+
+    const match = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
+    if (req.method === "DELETE" && match) {
+      let session: string;
+      try {
+        session = decodeURIComponent(match[1]!);
+      } catch {
+        return new Response("invalid session", { status: 400 });
+      }
+
+      const context: HttpAuthorizationContext = {
+        operation: "sessions-kill",
+        session,
+      };
+      const decision = guard.authorizeHttp(req, principal, context);
+      if (!decision.ok) return denied(decision);
+
+      killTmuxSession(session);
+      options.mux.invalidateSession(session);
+      return Response.json({ ok: true, session });
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+
+  return { guard, handle };
+}
+```
+<!-- B2-GUARDED-HTTP-SNIPPET:END -->
+
+## Preferences are deliberately single-tenant
+
+`createPrefsHandler({ file })` performs no authentication and stores one JSON
+object for every request reaching that handler. One handler/file therefore
+means one trusted tenant, not one user. `prefs-read` and `prefs-write` let the
+host protect that shared resource, but they do not turn it into per-user
+storage. Mounting the handler directly lets every caller read and merge the
+same data.
+
+This contract stays single-tenant because `TokenPrincipal` intentionally has
+no token or stable user/subject identifier. Using scope, expiry, or a session
+allowlist as a pretend user key would collide between people and change across
+grant rotation. A real per-user handler would need a new identity contract,
+storage-key rules, migration behavior, and traversal-safe persistence API;
+silently inventing those semantics here would be worse than exposing the
+single-tenant boundary honestly. Multi-user hosts must provide their own
+identity-backed preferences store.
+
+## Packaged handler operation coverage
+
+Every fetch-style handler factory exported from `thumbmux/server` has a named
+guard operation. The guard remains host-composed: factories do not call it
+automatically.
+
+| Exported handler factory | Handler methods | `HttpOperation` | Coverage |
+| --- | --- | --- | --- |
+| `createSpawnHandler` | POST | `sessions-spawn` | covered |
+| `createUploadHandler` | POST | `upload` | covered |
+| `createPrefsHandler` | GET / PUT / POST | `prefs-read` / `prefs-write` | covered (single-tenant) |
+
+`killTmuxSession` is an exported destructive primitive rather than a handler
+factory; it is covered separately by `sessions-kill`. `TmuxWsMux`,
+`FrameJournal`, and `FileHistoryArchive` are host-composed engines/primitives,
+not HTTP handler factories.
 
 ## Stock launch preset IDs
 

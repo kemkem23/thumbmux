@@ -11,11 +11,16 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 export type TokenScope = "read" | "interactive";
 
+/** Explicit opt-ins for operations that no scope receives by default. */
+export type TokenPermission = "sessions-kill";
+
 export type TokenGrant = {
   token: string;
   scope: TokenScope;
   expiresAt: number;
   sessions?: readonly string[];
+  /** Destructive operations are denied unless explicitly listed here. */
+  permissions?: readonly TokenPermission[];
 };
 
 export type TokenPrincipal = {
@@ -36,6 +41,9 @@ export type HttpOperation =
   | "ws-upgrade"
   | "sessions-list"
   | "sessions-spawn"
+  | "sessions-kill"
+  | "prefs-read"
+  | "prefs-write"
   | "recordings-list"
   | "recordings-download"
   | "recording-start"
@@ -210,6 +218,7 @@ type InternalGrant = {
   scope: TokenScope;
   expiresAt: number;
   sessions: readonly string[] | undefined;
+  permissions: readonly TokenPermission[] | undefined;
   digest: Buffer;
   revoked: boolean;
 };
@@ -403,9 +412,18 @@ function isTokenScope(value: unknown): value is TokenScope {
   return value === "read" || value === "interactive";
 }
 
+function isTokenPermission(value: unknown): value is TokenPermission {
+  return value === "sessions-kill";
+}
+
 function hasValidSessions(value: unknown): value is readonly string[] | undefined {
   return value === undefined
     || (Array.isArray(value) && value.every((session) => typeof session === "string" && session.length > 0));
+}
+
+function hasValidPermissions(value: unknown): value is readonly TokenPermission[] | undefined {
+  return value === undefined
+    || (Array.isArray(value) && value.every(isTokenPermission));
 }
 
 function isValidGrant(value: unknown): value is TokenGrant {
@@ -416,7 +434,8 @@ function isValidGrant(value: unknown): value is TokenGrant {
     && !/[\r\n]/.test(grant.token)
     && isTokenScope(grant.scope)
     && Number.isFinite(grant.expiresAt)
-    && hasValidSessions(grant.sessions);
+    && hasValidSessions(grant.sessions)
+    && hasValidPermissions(grant.permissions);
 }
 
 function isValidPrincipal(value: unknown): value is TokenPrincipal {
@@ -459,11 +478,13 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
     const scope = grant.scope;
     const expiresAt = grant.expiresAt;
     const sessions = grant.sessions;
+    const permissions = grant.permissions;
     const snapshot = {
       token,
       scope,
       expiresAt,
       sessions: sessions === undefined ? undefined : Object.freeze([...sessions]),
+      permissions: permissions === undefined ? undefined : Object.freeze([...permissions]),
       digest: tokenDigest(token),
       get revoked(): boolean {
         return revokedState.get(this as InternalGrant) ?? false;
@@ -556,6 +577,9 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
     return grant.sessions.includes(session);
   };
 
+  const hasPermission = (principal: TokenPrincipal, permission: TokenPermission): boolean =>
+    resolveActiveGrant(principal)?.permissions?.includes(permission) === true;
+
   const sanitizePrincipal = (principal: TokenPrincipal): TokenPrincipal => {
     // Integrity first: unknown / mismatched / revoked principals throw.
     // A successful sanitize always re-derives from the grant snapshot.
@@ -574,7 +598,7 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
 
   const createSocketPrincipal = (grant: TokenGrant): TokenPrincipal => {
     // Accept a caller TokenGrant only as a locator key; use the SNAPSHOT's
-    // scope/expiresAt/sessions/token — never the caller's (possibly mutated) fields.
+    // scope/expiry/sessions/permissions/token — never caller-mutated fields.
     const configuredGrant = isValidGrant(grant)
       ? findGrantByToken(grant.token)
       : undefined;
@@ -758,6 +782,10 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
         operation = "sessions-list";
       } else if (method === "POST" && (path === "/api/spawn" || path === "/api/sessions")) {
         operation = "sessions-spawn";
+      } else if (method === "GET" && path === "/api/prefs") {
+        operation = "prefs-read";
+      } else if ((method === "PUT" || method === "POST") && path === "/api/prefs") {
+        operation = "prefs-write";
       } else if (method === "POST" && (path === "/api/upload" || path === "/api/uploads")) {
         operation = "upload";
       } else if (method === "GET" && path === "/api/recordings") {
@@ -786,6 +814,7 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
       || operation === "auth-description"
       || operation === "ws-upgrade"
       || operation === "sessions-list"
+      || operation === "prefs-read"
     ) {
       return { ok: true, status: 200, operation };
     }
@@ -793,6 +822,23 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
     if (operation === "sessions-spawn") {
       if (safePrincipal.scope !== "interactive") return fail403("forbidden_scope");
       if (safePrincipal.sessions !== undefined) return fail403("forbidden_scope");
+      return { ok: true, status: 200, operation };
+    }
+
+    if (operation === "sessions-kill") {
+      if (!isNonEmptySession(context.session)) return fail403("forbidden_operation");
+      if (
+        safePrincipal.scope !== "interactive"
+        || !hasPermission(safePrincipal, "sessions-kill")
+      ) {
+        return fail403("forbidden_scope");
+      }
+      if (!isSessionAllowed(safePrincipal, context.session)) return fail403("forbidden_session");
+      return { ok: true, status: 200, operation, session: context.session };
+    }
+
+    if (operation === "prefs-write") {
+      if (safePrincipal.scope !== "interactive") return fail403("forbidden_scope");
       return { ok: true, status: 200, operation };
     }
 
