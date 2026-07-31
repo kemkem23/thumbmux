@@ -8,22 +8,31 @@
 export type MuxCursor = { row: number; col: number };
 
 /**
- * One row inside the JSON-encoded `data` of a `__sessions` frame.
- * `createBunTmuxDriver()` supplies every field below; hosts that provide a
- * custom `TmuxDriver` or session-list provider must supply the same fields.
+ * Minimum row inside the JSON-encoded `data` of a `__sessions` frame.
+ *
+ * Only `name` is required by the protocol. Server APIs use this no-index-
+ * signature type as their generic constraint, so interface-declared host rows
+ * may carry any additional metadata without casts or invented tmux fields.
  */
-export type SessionListItem = {
-  /** Package-filled tmux session name; custom hosts must supply it. */
+export type SessionListRow = {
   name: string;
-  /** Package-filled tmux creation timestamp (epoch seconds as a string); custom hosts must supply it. */
+};
+
+/**
+ * Complete row emitted by `createBunTmuxDriver()`.
+ * Custom drivers/providers may select their own `SessionListRow` subtype via
+ * the server API generics instead of manufacturing these tmux-owned fields.
+ */
+export type SessionListItem = SessionListRow & {
+  /** Package-filled tmux creation timestamp (epoch seconds as a string). */
   created: string;
-  /** Package-filled window count; custom hosts must supply it. */
+  /** Package-filled tmux window count. */
   windows: number;
-  /** Package-filled attachment state; custom hosts must supply it. */
+  /** Package-filled tmux attachment state. */
   attached: boolean;
-  /** Package-filled latest window-activity timestamp (epoch seconds, or `0` before a sample); custom hosts must supply it. */
+  /** Package-filled latest tmux window activity (epoch seconds, or `0` before a sample). */
   activityAt: number;
-  /** Host-added metadata is allowed and is preserved on the session-list wire. */
+  /** Additional metadata is preserved on the stock session-list wire type. */
   [key: string]: unknown;
 };
 
@@ -85,7 +94,8 @@ export type MuxServerMessage = MuxOutputFrame | {
   channel: string;
   type: "sessions" | "history" | "error" | "cursor";
   /** Absent on "cursor" frames — they update only the caret. On a
-   * `__sessions` frame this is JSON-encoded `SessionListItem[]`. */
+   * `__sessions` frame this is JSON-encoded `SessionListRow[]`; the bundled
+   * tmux driver emits the richer `SessionListItem[]` shape. */
   data?: string;
   /** On output frames: the pane's real cursor, or null when hidden.
    * `row` counts up from the LAST CONTENT line (trailing blank viewport rows

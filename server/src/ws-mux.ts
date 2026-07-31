@@ -21,12 +21,13 @@ import {
   type MuxFullOutputFrame,
   type MuxServerMessage,
   type SessionListItem,
+  type SessionListRow,
 } from "@thumbmux/core";
 
 export type WsLike = { send(data: string): unknown };
 
-export interface TmuxDriver {
-  listSessions(): SessionListItem[];
+export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem> {
+  listSessions(): SessionRow[];
   capturePane(session: string, opts: { startLine?: number; currentPaneOnly?: boolean }): Promise<string>;
   sendKeys(session: string, data: string): void;
   /** session → last-activity timestamp (one tmux call for all sessions) */
@@ -104,7 +105,10 @@ export type SessionProfile = {
   archive: boolean;
 };
 
-export interface MuxHooks<WS extends WsLike = WsLike> {
+export interface MuxHooks<
+  WS extends WsLike = WsLike,
+  SessionRow extends SessionListRow = SessionListItem,
+> {
   onSubscribe?(session: string, ws: WS, client: unknown): void;
   onUnsubscribe?(session: string, ws: WS, client: unknown): void;
   /** socket closed — release any per-socket state (size holds, telemetry) */
@@ -134,7 +138,7 @@ export interface MuxHooks<WS extends WsLike = WsLike> {
    * Unset = every socket sees the provider list verbatim (pre-0.4 behaviour, unchanged).
    * Throwing = FAIL CLOSED: that socket receives nothing this round.
    * Hosts typically wire `guard.filterSessions(sessions, principalOf(ws))` into this hook. */
-  filterSessionList?(sessions: readonly SessionListItem[], ws: WS, client: unknown): readonly SessionListItem[];
+  filterSessionList?(sessions: readonly SessionRow[], ws: WS, client: unknown): readonly SessionRow[];
 }
 
 /**
@@ -169,17 +173,20 @@ export type MuxBackpressureOptions<WS extends WsLike = WsLike> = {
   close?(ws: WS, reason: string): void;
 };
 
-export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
+export type TmuxWsMuxOptions<
+  WS extends WsLike = WsLike,
+  SessionRow extends SessionListRow = SessionListItem,
+> = {
   /** Compress outbound frames (Bun ServerWebSocket only: passes `true` as
    * ws.send's second argument — RSV1 per-message-deflate). Terminal snapshots
    * are 50-140KB of highly compressible text; enable when the host also sets
    * `perMessageDeflate: true` on Bun.serve's websocket config. Default false
    * (other WS engines may not accept a boolean second argument). */
   compressFrames?: boolean;
-  driver: TmuxDriver;
+  driver: TmuxDriver<SessionRow>;
   pipes?: PipeManagerLike | null;
   archive?: HistoryArchiveLike | null;
-  hooks?: MuxHooks<WS>;
+  hooks?: MuxHooks<WS, SessionRow>;
   profile?: (session: string) => SessionProfile;
   /** live scrollback window (lines) kept in the fast path */
   liveLineLimit?: number;
@@ -200,7 +207,10 @@ export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
 const DEFAULT_PROFILE: SessionProfile = { resize: true, currentPaneOnly: false, archive: true };
 const EMPTY_HISTORY_PAGE = { lines: [], startLine: null, hasMore: false };
 
-export class TmuxWsMux<WS extends WsLike = WsLike> {
+export class TmuxWsMux<
+  WS extends WsLike = WsLike,
+  SessionRow extends SessionListRow = SessionListItem,
+> {
   private compressFrames = false;
 
   /** Send one frame; with compressFrames, opt into Bun's per-message deflate. */
@@ -208,10 +218,10 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     if (this.compressFrames) return ws.send(data, true);
     return ws.send(data);
   }
-  private driver: TmuxDriver;
+  private driver: TmuxDriver<SessionRow>;
   private pipes: PipeManagerLike | null;
   private archive: HistoryArchiveLike | null;
-  private hooks: MuxHooks<WS>;
+  private hooks: MuxHooks<WS, SessionRow>;
   private profileOf: (session: string) => SessionProfile;
   private liveLineLimit: number;
   private POLL_NORMAL: number;
@@ -260,7 +270,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   private geometryGeneration = 0;
   private lastReconcileCapture = new Map<string, number>();
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
-  private sessionListProvider: () => readonly SessionListItem[];
+  private sessionListProvider: () => readonly SessionRow[];
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
   /** Per-session viewers whose latest subscription opted into delta output frames. */
@@ -291,7 +301,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   /** Blocked sockets that missed a session-list push and need one on drain. */
   private owedSessionList = new Set<WS>();
 
-  constructor(opts: TmuxWsMuxOptions<WS>) {
+  constructor(opts: TmuxWsMuxOptions<WS, SessionRow>) {
     this.compressFrames = opts.compressFrames === true;
     this.driver = opts.driver;
     this.pipes = opts.pipes ?? null;
@@ -319,7 +329,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     this.bpClose = bp.close;
   }
 
-  setSessionListProvider(provider?: () => readonly SessionListItem[]) {
+  setSessionListProvider(provider?: () => readonly SessionRow[]) {
     this.sessionListProvider = provider ?? (() => this.driver.listSessions());
     this.lastSessionsJson = "";
   }
@@ -642,7 +652,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
    */
   private sessionListDataFor(
     ws: WS,
-    sessions: readonly SessionListItem[],
+    sessions: readonly SessionRow[],
     unfilteredJson: string,
     client: unknown,
   ): string | null {
