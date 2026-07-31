@@ -25,9 +25,13 @@ export function exactTmuxTarget(name: string): string {
   return `=${name}`;
 }
 
-/** Pane/window commands need an explicit empty suffix after the exact session
- * name. Without `:`, tmux 3.4 does not resolve `=session` as a target pane. */
-function exactTmuxPaneTarget(name: string): string {
+/**
+ * Exact target-pane/window syntax. Pane operations such as `send-keys` and
+ * `capture-pane` reject a bare exact-session target (`=name`), even though
+ * `kill-session` accepts it. Keep both the leading `=` and trailing `:`:
+ * without `=`, tmux may silently prefix-match a different session.
+ */
+export function exactTmuxPaneTarget(name: string): string {
   return `${exactTmuxTarget(name)}:`;
 }
 
