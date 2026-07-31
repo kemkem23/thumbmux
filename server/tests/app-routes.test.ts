@@ -6,14 +6,27 @@ import { createAppRoutes } from "../src/app-routes";
 import {
   createBunTmuxDriver,
   killTmuxSession,
+  spawnTmuxSession,
 } from "../src/bun-driver";
 import { FileHistoryArchive } from "../src/history-archive";
+import {
+  createTokenGuard,
+  type HttpAuthorizationContext,
+} from "../src/token-guard";
 import type { TmuxDriver, WsLike } from "../src/ws-mux";
 
 type WireFrame = {
   channel?: string;
   type?: string;
   data?: string;
+  status?: number;
+  code?: string;
+  message?: string;
+};
+
+type CapturingSocket = WsLike & {
+  data: unknown;
+  frames: WireFrame[];
 };
 
 let sequence = 0;
@@ -25,6 +38,19 @@ function appRoutesPrefix(label: string): string {
 
 function hasTmuxSession(name: string): boolean {
   return Bun.spawnSync(["tmux", "has-session", "-t", `=${name}`]).exitCode === 0;
+}
+
+function paneContains(name: string, expected: string): boolean {
+  const capture = Bun.spawnSync([
+    "tmux",
+    "capture-pane",
+    "-t",
+    `=${name}:`,
+    "-p",
+    "-S",
+    "-100",
+  ]);
+  return capture.exitCode === 0 && capture.stdout.toString().includes(expected);
 }
 
 function killQuietly(name: string | null): void {
@@ -60,6 +86,26 @@ function collectFrames(ws: WebSocket): WireFrame[] {
     }
   });
   return frames;
+}
+
+function createCapturingSocket(data: unknown): CapturingSocket {
+  const frames: WireFrame[] = [];
+  return {
+    data,
+    frames,
+    send(raw) {
+      frames.push(JSON.parse(raw) as WireFrame);
+      return raw.length;
+    },
+  };
+}
+
+function sessionNames(frame: WireFrame | undefined): string[] {
+  if (frame?.type !== "sessions" || typeof frame.data !== "string") return [];
+  const rows = JSON.parse(frame.data) as Array<{ name?: unknown }>;
+  return rows
+    .map((row) => row.name)
+    .filter((name): name is string => typeof name === "string");
 }
 
 async function closeWebSocket(ws: WebSocket | null): Promise<void> {
@@ -490,6 +536,544 @@ describe("createAppRoutes", () => {
       expect(upgrades).toBe(1);
     } finally {
       routes.mux.stop();
+    }
+  });
+
+  test("blocks the filter-only cross-session subscribe and keys attack", async () => {
+    const driver = createBunTmuxDriver();
+    const allowedSession = appRoutesPrefix("guard-a");
+    const deniedSession = appRoutesPrefix("guard-b");
+    const allowedSeed = `APPROUTES_ALLOWED_${Date.now()}`;
+    const deniedSeed = `APPROUTES_HIDDEN_${Date.now()}`;
+    const attemptedMarker = `APPROUTES_DENIED_KEYS_${Date.now()}`;
+    const token = `app-routes-guard-${process.pid}-${Date.now()}`;
+    const guard = createTokenGuard({
+      grants: [{
+        token,
+        scope: "interactive",
+        expiresAt: Date.now() + 60_000,
+        sessions: [allowedSession],
+      }],
+    });
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 30,
+        pollBurstMs: 15,
+        pollReconcileMs: 30,
+        sessionListIntervalMs: 30,
+      },
+    });
+    let server: ReturnType<typeof Bun.serve> | null = null;
+    let ws: WebSocket | null = null;
+
+    try {
+      spawnTmuxSession(
+        allowedSession,
+        "/tmp",
+        `printf '${allowedSeed}\\n'`,
+      );
+      spawnTmuxSession(
+        deniedSession,
+        "/tmp",
+        `printf '${deniedSeed}\\n'`,
+      );
+      await until(
+        () => paneContains(allowedSession, allowedSeed)
+          && paneContains(deniedSession, deniedSeed),
+        "guard attack fixtures did not reach their tmux panes",
+      );
+
+      server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req, bunServer) {
+          return await routes.fetch(req, bunServer)
+            ?? new Response("host fallback", { status: 418 });
+        },
+        websocket: routes.websocket,
+      });
+      ws = new WebSocket(
+        `ws://127.0.0.1:${server.port}/ws/tmux?t=${encodeURIComponent(token)}`,
+      );
+      const frames = collectFrames(ws);
+      await until(
+        () => ws?.readyState === WebSocket.OPEN,
+        "guarded websocket did not open",
+      );
+
+      ws.send(JSON.stringify({ type: "subscribe", session: allowedSession }));
+      await until(
+        () => frames.some((frame) => (
+          frame.type === "output"
+          && frame.channel === allowedSession
+          && frame.data?.includes(allowedSeed)
+        )),
+        "guarded principal could not read its allowed session",
+      );
+
+      const subscribeErrorsBefore = frames.filter((frame) => frame.type === "auth_error").length;
+      ws.send(JSON.stringify({ type: "subscribe", session: deniedSession }));
+      await until(
+        () => frames.filter((frame) => frame.type === "auth_error").length > subscribeErrorsBefore
+          || frames.some((frame) => frame.type === "output" && frame.channel === deniedSession),
+        "cross-session subscribe produced neither a denial nor leaked output",
+      );
+
+      const keyErrorsBefore = frames.filter((frame) => frame.type === "auth_error").length;
+      ws.send(JSON.stringify({
+        type: "keys",
+        session: deniedSession,
+        data: `printf '${attemptedMarker}\\n'\r`,
+      }));
+      await until(
+        () => frames.filter((frame) => frame.type === "auth_error").length > keyErrorsBefore
+          || paneContains(deniedSession, attemptedMarker),
+        "cross-session keys produced neither a denial nor a pane write",
+      );
+
+      expect(paneContains(deniedSession, attemptedMarker)).toBe(false);
+      expect(frames.some((frame) => (
+        frame.type === "output" && frame.channel === deniedSession
+      ))).toBe(false);
+      const authErrors = frames.filter((frame) => frame.type === "auth_error");
+      expect(authErrors.slice(-2)).toEqual([
+        { type: "auth_error", status: 403, code: "forbidden_session" },
+        { type: "auth_error", status: 403, code: "forbidden_session" },
+      ]);
+      const listFrame = frames.find((frame) => (
+        frame.type === "sessions" && frame.channel === "__sessions"
+      ));
+      expect(sessionNames(listFrame)).toEqual([allowedSession]);
+    } finally {
+      await closeWebSocket(ws);
+      if (server) await server.stop(true);
+      routes.mux.stop();
+      killQuietly(allowedSession);
+      killQuietly(deniedSession);
+    }
+  }, 30_000);
+
+  test("authenticates upgrades, filters pushed lists, and rechecks expiry per message", async () => {
+    const allowedSession = appRoutesPrefix("fake-a");
+    const deniedSession = appRoutesPrefix("fake-b");
+    const token = `app-routes-fake-${process.pid}-${Date.now()}`;
+    const expiresAt = 2_000;
+    let now = 1_000;
+    let rows: ReturnType<TmuxDriver["listSessions"]> = [
+      {
+        name: allowedSession,
+        created: "1",
+        windows: 1,
+        attached: false,
+        activityAt: 1,
+      },
+      {
+        name: deniedSession,
+        created: "1",
+        windows: 1,
+        attached: false,
+        activityAt: 1,
+      },
+    ];
+    const driver = inertDriver();
+    driver.listSessions = () => rows;
+    let keyCalls = 0;
+    driver.sendKeys = () => { keyCalls += 1; };
+    const guard = createTokenGuard({
+      grants: [{
+        token,
+        scope: "interactive",
+        expiresAt,
+        sessions: [allowedSession],
+      }],
+      now: () => now,
+    });
+    const hostFilterInputs: string[][] = [];
+    let hostCloseCalls = 0;
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        sessionListIntervalMs: 20,
+        hooks: {
+          filterSessionList(sessions) {
+            hostFilterInputs.push(sessions.map(({ name }) => name));
+            return [...sessions, rows.find(({ name }) => name === deniedSession)!];
+          },
+          onSocketClose() {
+            hostCloseCalls += 1;
+            throw new Error("host cleanup failed");
+          },
+        },
+      },
+    });
+    let upgradeCalls = 0;
+    let upgradeOptions: {
+      data?: unknown;
+      headers?: Record<string, string>;
+    } | undefined;
+    const acceptsUpgrade = {
+      upgrade(_req: Request, options?: unknown) {
+        upgradeCalls += 1;
+        upgradeOptions = options as typeof upgradeOptions;
+        return true;
+      },
+    };
+    let socket: CapturingSocket | null = null;
+
+    try {
+      const missing = await routes.fetch(
+        new Request("http://app.test/ws/tmux"),
+        acceptsUpgrade,
+      );
+      expect(missing?.status).toBe(401);
+      expect(await missing?.json()).toMatchObject({
+        ok: false,
+        status: 401,
+        code: "missing_credential",
+      });
+      expect(upgradeCalls).toBe(0);
+
+      const accepted = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        acceptsUpgrade,
+      );
+      expect(accepted?.status).toBe(204);
+      expect(upgradeCalls).toBe(1);
+      expect(upgradeOptions?.data).toBeDefined();
+      expect(JSON.stringify(upgradeOptions?.data)).not.toContain(token);
+      expect(upgradeOptions?.headers?.["set-cookie"]).toContain("HttpOnly");
+
+      socket = createCapturingSocket(upgradeOptions?.data);
+      routes.websocket.open(socket);
+      const initialLists = socket.frames.filter((frame) => frame.type === "sessions");
+      expect(initialLists).toHaveLength(1);
+      expect(sessionNames(initialLists[0])).toEqual([allowedSession]);
+
+      rows = [
+        rows[0]!,
+        { ...rows[1]!, activityAt: 2 },
+      ];
+      await until(
+        () => socket!.frames.filter((frame) => frame.type === "sessions").length >= 2,
+        "guarded fake socket did not receive the changed session-list push",
+      );
+      const pushedLists = socket.frames.filter((frame) => frame.type === "sessions");
+      expect(pushedLists.every((frame) => (
+        JSON.stringify(sessionNames(frame)) === JSON.stringify([allowedSession])
+      ))).toBe(true);
+      expect(hostFilterInputs.length).toBeGreaterThanOrEqual(2);
+      expect(hostFilterInputs.every((names) => (
+        JSON.stringify(names) === JSON.stringify([allowedSession])
+      ))).toBe(true);
+
+      const malformedBefore = socket.frames.length;
+      routes.websocket.message(socket, "not json");
+      expect(socket.frames.slice(malformedBefore)).toEqual([
+        { type: "auth_error", status: 403, code: "forbidden_operation" },
+      ]);
+
+      routes.websocket.message(socket, JSON.stringify({
+        type: "keys",
+        session: allowedSession,
+        data: "before-expiry",
+      }));
+      expect(keyCalls).toBe(1);
+
+      now = expiresAt;
+      routes.websocket.message(socket, JSON.stringify({
+        type: "keys",
+        session: allowedSession,
+        data: "after-expiry",
+      }));
+      expect(keyCalls).toBe(1);
+      expect(socket.frames.at(-1)).toEqual({
+        type: "auth_error",
+        status: 401,
+        code: "expired_credential",
+      });
+
+      routes.websocket.close(socket);
+      expect(hostCloseCalls).toBe(1);
+      socket = null;
+    } finally {
+      if (socket) routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("requires explicit sessions-kill permission and kills the exact session when granted", async () => {
+    const session = appRoutesPrefix("kill-guard");
+    const deniedToken = `app-routes-kill-denied-${process.pid}-${Date.now()}`;
+    const allowedToken = `app-routes-kill-allowed-${process.pid}-${Date.now()}`;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token: deniedToken,
+          scope: "interactive",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: allowedToken,
+          scope: "interactive",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+          permissions: ["sessions-kill"],
+        },
+      ],
+    });
+    const authorizeHttp = guard.authorizeHttp.bind(guard);
+    const authorizedOperations: Array<HttpAuthorizationContext["operation"]> = [];
+    guard.authorizeHttp = (req, principal, context) => {
+      authorizedOperations.push(context?.operation);
+      return authorizeHttp(req, principal, context);
+    };
+    const routes = createAppRoutes({
+      driver: createBunTmuxDriver(),
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+    });
+    const noUpgrade = { upgrade: () => false };
+
+    try {
+      spawnTmuxSession(session, "/tmp");
+      expect(hasTmuxSession(session)).toBe(true);
+
+      const denied = await routes.fetch(
+        new Request(
+          `http://app.test/api/sessions/${encodeURIComponent(session)}?t=${encodeURIComponent(deniedToken)}`,
+          { method: "DELETE" },
+        ),
+        noUpgrade,
+      );
+      expect(denied?.status).toBe(403);
+      expect(await denied?.json()).toMatchObject({
+        ok: false,
+        status: 403,
+        code: "forbidden_scope",
+      });
+      expect(hasTmuxSession(session)).toBe(true);
+
+      const allowed = await routes.fetch(
+        new Request(
+          `http://app.test/api/sessions/${encodeURIComponent(session)}?t=${encodeURIComponent(allowedToken)}`,
+          { method: "DELETE" },
+        ),
+        noUpgrade,
+      );
+      expect(allowed?.status).toBe(200);
+      expect(await allowed?.json()).toEqual({ ok: true, name: session });
+      expect(hasTmuxSession(session)).toBe(false);
+      expect(authorizedOperations).toContain("sessions-kill");
+    } finally {
+      routes.mux.stop();
+      killQuietly(session);
+    }
+  });
+
+  test("guards every HTTP operation on custom paths before invoking handlers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "thumbmux-app-routes-guard-http-"));
+    const uploadDir = join(root, "uploads");
+    const prefsFile = join(root, "prefs", "thumbmux.json");
+    const visibleSession = appRoutesPrefix("http-visible");
+    const hiddenSession = appRoutesPrefix("http-hidden");
+    const spawnedSession = appRoutesPrefix("http-spawned");
+    const readToken = `app-routes-http-read-${process.pid}-${Date.now()}`;
+    const interactiveToken = `app-routes-http-interactive-${process.pid}-${Date.now()}`;
+    const expiresAt = Date.now() + 60_000;
+    const driver = inertDriver([
+      {
+        name: visibleSession,
+        created: "1",
+        windows: 1,
+        attached: false,
+        activityAt: 1,
+      },
+      {
+        name: hiddenSession,
+        created: "1",
+        windows: 1,
+        attached: false,
+        activityAt: 1,
+      },
+    ]);
+    let spawnCalls = 0;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token: readToken,
+          scope: "read",
+          expiresAt,
+          sessions: [visibleSession],
+        },
+        {
+          token: interactiveToken,
+          scope: "interactive",
+          expiresAt,
+          permissions: ["sessions-kill"],
+        },
+      ],
+    });
+    const authorizeHttp = guard.authorizeHttp.bind(guard);
+    const authorizedOperations: Array<HttpAuthorizationContext["operation"]> = [];
+    guard.authorizeHttp = (req, principal, context) => {
+      authorizedOperations.push(context?.operation);
+      return authorizeHttp(req, principal, context);
+    };
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      basePath: "/thumbmux",
+      spawn: {
+        cwd: root,
+        spawn: () => { spawnCalls += 1; },
+      },
+      upload: { dir: uploadDir },
+      prefs: { file: prefsFile },
+    });
+    const noUpgrade = { upgrade: () => false };
+    const tokenUrl = (path: string, token: string): string => {
+      const separator = path.includes("?") ? "&" : "?";
+      return `http://app.test${path}${separator}t=${encodeURIComponent(token)}`;
+    };
+
+    try {
+      const missingSpawn = await routes.fetch(
+        new Request("http://app.test/thumbmux/spawn", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: spawnedSession }),
+        }),
+        noUpgrade,
+      );
+      expect(missingSpawn?.status).toBe(401);
+      expect(spawnCalls).toBe(0);
+
+      const deniedSpawn = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/spawn", readToken), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: spawnedSession }),
+        }),
+        noUpgrade,
+      );
+      expect(deniedSpawn?.status).toBe(403);
+      expect(await deniedSpawn?.json()).toMatchObject({ code: "forbidden_scope" });
+      expect(spawnCalls).toBe(0);
+
+      const allowedSpawn = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/spawn", interactiveToken), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: spawnedSession }),
+        }),
+        noUpgrade,
+      );
+      expect(allowedSpawn?.status).toBe(201);
+      expect(spawnCalls).toBe(1);
+      expect(allowedSpawn?.headers.get("set-cookie")).toContain("HttpOnly");
+
+      const list = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/sessions", readToken)),
+        noUpgrade,
+      );
+      expect(list?.status).toBe(200);
+      expect((await list?.json() as Array<{ name?: string }>).map(({ name }) => name))
+        .toEqual([visibleSession]);
+
+      const deniedUpload = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/upload", readToken), {
+          method: "POST",
+          body: new FormData(),
+        }),
+        noUpgrade,
+      );
+      expect(deniedUpload?.status).toBe(403);
+      expect(await deniedUpload?.json()).toMatchObject({ code: "forbidden_scope" });
+
+      const form = new FormData();
+      form.append("files", new File(["guarded-upload"], "guarded.txt"));
+      const allowedUpload = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/upload", interactiveToken), {
+          method: "POST",
+          body: form,
+        }),
+        noUpgrade,
+      );
+      expect(allowedUpload?.status).toBe(201);
+      expect(await readdir(uploadDir)).toHaveLength(1);
+
+      const deniedPrefs = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/prefs", readToken), {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fontPx: 99 }),
+        }),
+        noUpgrade,
+      );
+      expect(deniedPrefs?.status).toBe(403);
+      expect(await deniedPrefs?.json()).toMatchObject({ code: "forbidden_scope" });
+
+      const allowedPrefs = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/prefs", interactiveToken), {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fontPx: 21 }),
+        }),
+        noUpgrade,
+      );
+      expect(allowedPrefs?.status).toBe(200);
+      const readPrefs = await routes.fetch(
+        new Request(tokenUrl("/thumbmux/prefs", readToken)),
+        noUpgrade,
+      );
+      expect(await readPrefs?.json()).toEqual({ fontPx: 21 });
+
+      const wrongMethods = [
+        ["/thumbmux/spawn", "GET", "POST"],
+        ["/thumbmux/upload", "GET", "POST"],
+        ["/thumbmux/prefs", "POST", "GET, PUT"],
+        ["/thumbmux/sessions", "POST", "GET"],
+        [`/thumbmux/sessions/${encodeURIComponent(visibleSession)}`, "GET", "DELETE"],
+        ["/ws/tmux", "POST", "GET"],
+      ] as const;
+      for (const [path, method, allow] of wrongMethods) {
+        const response = await routes.fetch(
+          new Request(`http://app.test${path}`, { method }),
+          noUpgrade,
+        );
+        expect(response?.status).toBe(405);
+        expect(response?.headers.get("allow")).toBe(allow);
+      }
+      for (const operation of [
+        "sessions-list",
+        "sessions-spawn",
+        "upload",
+        "prefs-read",
+        "prefs-write",
+      ] as const) {
+        expect(authorizedOperations).toContain(operation);
+      }
+    } finally {
+      routes.mux.stop();
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
