@@ -155,3 +155,9 @@ The core contract is specifically not responsible for:
 - persistence,
 - network delivery,
 - any real-push claim.
+
+## 7) Worked app-shell integration
+
+For a host detector → `sessionMeta` → normalized event → browser-helper recipe,
+see [Agent needs a human](app.md#4-agent-needs-a-human-feature-12). The provider,
+subscription storage, persistence, and delivery boundaries above still apply.
