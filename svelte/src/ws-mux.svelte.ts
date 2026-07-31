@@ -79,12 +79,34 @@ function finalizeFnv(hash: number): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-function defaultScheduleFrame(cb: () => void): void {
-  if (typeof globalThis.requestAnimationFrame === 'function') {
-    globalThis.requestAnimationFrame(() => cb());
-  } else {
-    setTimeout(cb, 16);
+function defaultScheduleFrame(cb: () => void): () => void {
+  let active = true;
+  if (
+    typeof globalThis.requestAnimationFrame === 'function'
+    && typeof globalThis.cancelAnimationFrame === 'function'
+  ) {
+    const frame = globalThis.requestAnimationFrame(() => {
+      if (!active) return;
+      active = false;
+      cb();
+    });
+    return () => {
+      if (!active) return;
+      active = false;
+      globalThis.cancelAnimationFrame(frame);
+    };
   }
+
+  const timer = setTimeout(() => {
+    if (!active) return;
+    active = false;
+    cb();
+  }, 16);
+  return () => {
+    if (!active) return;
+    active = false;
+    clearTimeout(timer);
+  };
 }
 
 function isMuxCursor(value: unknown): value is MuxServerMessage['cursor'] {
@@ -123,6 +145,7 @@ export class TmuxMux {
   /** Raw delta frames held while every subscriber reports busy. */
   private deferredDeltas = new Map<string, DeferredQueue>();
   private settleScheduled = false;
+  private settleCancel: (() => void) | null = null;
   /** A failed delta requests one full replacement; later deltas wait for it. */
   private resyncingSessions = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -132,12 +155,20 @@ export class TmuxMux {
   private sessionCallbacks = new Set<(sessions: any[]) => void>();
   private pendingResizeBySession = new Map<string, { cols: number; rows: number }>();
   private reconnectDelay = RECONNECT_MIN;
+  private disposed = false;
   private visibilityBound = false;
+  private visibilityDocument: Document | null = null;
+  private visibilityWindow: Window | null = null;
+  private visibilityHandler: (() => void) | null = null;
   private viewportBound = false;
+  private viewportWindow: Window | null = null;
+  private boundVisualViewport: VisualViewport | null = null;
+  private viewportHandler: (() => void) | null = null;
   private clientInfoTimer: ReturnType<typeof setTimeout> | null = null;
   connected = $state(false);
 
   configure(opts: TmuxMuxOptions) {
+    if (this.disposed) return;
     this.opts = { ...this.opts, ...opts };
   }
 
@@ -148,6 +179,7 @@ export class TmuxMux {
   }
 
   private ensureConnection() {
+    if (this.disposed) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
@@ -155,11 +187,14 @@ export class TmuxMux {
   }
 
   private bindVisibility() {
-    if (this.visibilityBound || typeof document === 'undefined') return;
+    if (this.disposed || this.visibilityBound || typeof document === 'undefined') return;
     this.visibilityBound = true;
+    const boundDocument = document;
+    const boundWindow = typeof window === 'undefined' ? null : window;
     const handleVisible = () => {
+      if (this.disposed) return;
       this.sendClientInfo('visibility');
-      if (document.visibilityState === 'visible') {
+      if (boundDocument.visibilityState === 'visible') {
         // Coming back to foreground — reconnect immediately if dead
         if (!this.ws || (
           this.ws.readyState !== WebSocket.OPEN
@@ -175,25 +210,56 @@ export class TmuxMux {
         }
       }
     };
-    document.addEventListener('visibilitychange', handleVisible);
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pageshow', handleVisible);
+    this.visibilityDocument = boundDocument;
+    this.visibilityWindow = boundWindow;
+    this.visibilityHandler = handleVisible;
+    boundDocument.addEventListener('visibilitychange', handleVisible);
+    boundWindow?.addEventListener('pageshow', handleVisible);
+  }
+
+  private unbindVisibility() {
+    if (this.visibilityHandler) {
+      this.visibilityDocument?.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityWindow?.removeEventListener('pageshow', this.visibilityHandler);
     }
+    this.visibilityDocument = null;
+    this.visibilityWindow = null;
+    this.visibilityHandler = null;
+    this.visibilityBound = false;
   }
 
   private bindViewport() {
-    if (this.viewportBound || typeof window === 'undefined') return;
+    if (this.disposed || this.viewportBound || typeof window === 'undefined') return;
     this.viewportBound = true;
+    const boundWindow = window;
+    const boundVisualViewport = boundWindow.visualViewport;
     const schedule = () => {
+      if (this.disposed) return;
       if (this.clientInfoTimer) clearTimeout(this.clientInfoTimer);
       this.clientInfoTimer = setTimeout(() => {
         this.clientInfoTimer = null;
+        if (this.disposed) return;
         this.sendClientInfo('viewport');
       }, 250);
     };
-    window.addEventListener('resize', schedule, { passive: true });
-    window.visualViewport?.addEventListener('resize', schedule, { passive: true });
-    window.visualViewport?.addEventListener('scroll', schedule, { passive: true });
+    this.viewportWindow = boundWindow;
+    this.boundVisualViewport = boundVisualViewport;
+    this.viewportHandler = schedule;
+    boundWindow.addEventListener('resize', schedule, { passive: true });
+    boundVisualViewport?.addEventListener('resize', schedule, { passive: true });
+    boundVisualViewport?.addEventListener('scroll', schedule, { passive: true });
+  }
+
+  private unbindViewport() {
+    if (this.viewportHandler) {
+      this.viewportWindow?.removeEventListener('resize', this.viewportHandler);
+      this.boundVisualViewport?.removeEventListener('resize', this.viewportHandler);
+      this.boundVisualViewport?.removeEventListener('scroll', this.viewportHandler);
+    }
+    this.viewportWindow = null;
+    this.boundVisualViewport = null;
+    this.viewportHandler = null;
+    this.viewportBound = false;
   }
 
   private clientInfo(): ClientInfo {
@@ -220,6 +286,7 @@ export class TmuxMux {
   }
 
   private sendClientInfo(_reason = 'client_info') {
+    if (this.disposed) return;
     this.send(this.ws, { type: 'client_info', client: this.clientInfo() });
   }
 
@@ -229,7 +296,7 @@ export class TmuxMux {
    * accidentally sending through a newer socket stored in `this.ws`.
    */
   private send(socket: WebSocket | null, message: unknown): boolean {
-    if (!socket || this.ws !== socket || socket.readyState !== WebSocket.OPEN) return false;
+    if (this.disposed || !socket || this.ws !== socket || socket.readyState !== WebSocket.OPEN) return false;
     try {
       socket.send(JSON.stringify(message));
       return true;
@@ -435,17 +502,27 @@ export class TmuxMux {
   }
 
   private scheduleSettle() {
+    if (this.disposed) return;
     if (this.settleScheduled) return;
     if (this.deferredDeltas.size === 0) return;
     this.settleScheduled = true;
-    const schedule = this.opts.scheduleFrame ?? defaultScheduleFrame;
-    schedule(() => {
+    const settle = () => {
+      this.settleCancel = null;
       this.settleScheduled = false;
+      if (this.disposed) return;
       this.settleDeferred();
-    });
+    };
+    if (this.opts.scheduleFrame) {
+      // An injected scheduler owns its own queue; the callback's disposed
+      // guard makes already-queued work inert.
+      this.opts.scheduleFrame(settle);
+    } else {
+      this.settleCancel = defaultScheduleFrame(settle);
+    }
   }
 
   private settleDeferred() {
+    if (this.disposed) return;
     let needReschedule = false;
     // Snapshot keys — flush mutates the map.
     for (const session of [...this.deferredDeltas.keys()]) {
@@ -560,7 +637,7 @@ export class TmuxMux {
   }
 
   private connect() {
-    if (typeof window === 'undefined') return;
+    if (this.disposed || typeof window === 'undefined') return;
     this.bindVisibility();
     this.bindViewport();
 
@@ -582,7 +659,15 @@ export class TmuxMux {
     this.cancelReconnect();
 
     const url = this.getUrl();
+    // getUrl is host-controlled and may dispose this mux reentrantly.
+    if (this.disposed) return;
     const socket = new WebSocket(url);
+    // Native WebSocket construction is synchronous and non-reentrant, but a
+    // host polyfill may dispose the mux from its constructor.
+    if (this.disposed) {
+      this.closeSocket(socket);
+      return;
+    }
     this.ws = socket;
 
     // Connection timeout — if not open in 8s, kill and retry
@@ -760,7 +845,7 @@ export class TmuxMux {
   }
 
   private startPing(socket: WebSocket) {
-    if (this.ws !== socket) return;
+    if (this.disposed || this.ws !== socket) return;
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.pingTimer = setInterval(() => this.sendPing(socket), PING_INTERVAL);
   }
@@ -786,6 +871,7 @@ export class TmuxMux {
   }
 
   private scheduleReconnect() {
+    if (this.disposed) return;
     if (this.reconnectTimer) return;
     if (this.subs.size === 0 && this.sessionCallbacks.size === 0) return;
 
@@ -802,8 +888,54 @@ export class TmuxMux {
     this.reconnectTimer = reconnectTimer;
   }
 
+  /**
+   * Permanently release every resource owned by this mux. Disposal is
+   * idempotent; a disposed instance deliberately cannot reconnect or accept
+   * new subscriptions.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+
+    this.unbindVisibility();
+    this.unbindViewport();
+    this.cancelReconnect();
+    if (this.clientInfoTimer) {
+      clearTimeout(this.clientInfoTimer);
+      this.clientInfoTimer = null;
+    }
+    if (this.settleCancel) {
+      try {
+        this.settleCancel();
+      } catch {
+        // Browser frame/timer cancellation is best-effort.
+      }
+      this.settleCancel = null;
+    }
+    this.settleScheduled = false;
+
+    const socket = this.ws;
+    if (socket) {
+      this.releaseSocket(socket, true);
+    } else {
+      this.clearConnectionTimers();
+      this.invalidateAllOutputBases();
+    }
+    this.connected = false;
+
+    for (const callbacks of this.subs.values()) callbacks.clear();
+    this.subs.clear();
+    this.subTails.clear();
+    this.subDeferProbes.clear();
+    this.sessionCallbacks.clear();
+    this.pendingResizeBySession.clear();
+    this.deferredDeltas.clear();
+    this.opts = {};
+  }
+
   /** Subscribe to a tmux session's output. Returns unsubscribe function. */
   subscribe(session: string, callback: Callback, opts: SubscribeOpts = {}): () => void {
+    if (this.disposed) return () => {};
     let set = this.subs.get(session);
     const isNew = !set;
     if (!set) {
@@ -857,6 +989,7 @@ export class TmuxMux {
    * sockets server-side (v0.3.1 fix: previously only hosts that subscribed
    * every socket on open ever delivered `__sessions` pushes). */
   onSessions(callback: (sessions: any[]) => void): () => void {
+    if (this.disposed) return () => {};
     const first = this.sessionCallbacks.size === 0;
     this.sessionCallbacks.add(callback);
     this.ensureConnection();
@@ -876,6 +1009,7 @@ export class TmuxMux {
 
   /** Send keys to a session. */
   sendKeys(session: string, data: string) {
+    if (this.disposed) return;
     // No client blob here: a keystroke frame is hot-path (~60B vs ~520B) —
     // the server already knows this socket from subscribe/client_info.
     this.send(this.ws, { type: 'keys', session, data });
@@ -883,6 +1017,7 @@ export class TmuxMux {
 
   /** Sync terminal size to tmux pane. */
   sendResize(session: string, cols: number, rows: number) {
+    if (this.disposed) return;
     this.pendingResizeBySession.set(session, { cols, rows });
     this.ensureConnection();
     this.sendResizeNow(session, { cols, rows });
@@ -890,6 +1025,7 @@ export class TmuxMux {
 
   /** Expand capture history when the viewer scrolls to the top. */
   requestHistory(session: string, beforeLine?: number | null, limit = 500) {
+    if (this.disposed) return;
     this.send(this.ws, { type: 'history_expand', session, beforeLine: beforeLine ?? null, limit });
   }
 }

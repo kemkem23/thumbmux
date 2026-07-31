@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
+import { createMuxDeltaFrame } from '@thumbmux/core';
 
 const originalState = Object.getOwnPropertyDescriptor(globalThis, '$state');
 Object.defineProperty(globalThis, '$state', {
@@ -24,6 +25,10 @@ class FakeEventTarget {
 
   removeEventListener(type: string, listener: Listener) {
     this.listeners.get(type)?.delete(listener);
+  }
+
+  listenerCount(type: string) {
+    return this.listeners.get(type)?.size ?? 0;
   }
 
   emit(type: string) {
@@ -85,7 +90,14 @@ class FakeWebSocket {
   }
 }
 
-const globalNames = ['window', 'document', 'navigator', 'WebSocket'] as const;
+const globalNames = [
+  'window',
+  'document',
+  'navigator',
+  'WebSocket',
+  'requestAnimationFrame',
+  'cancelAnimationFrame',
+] as const;
 const originalGlobals = new Map(
   globalNames.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
 );
@@ -121,6 +133,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  jest.useRealTimers();
   for (const name of globalNames) {
     const descriptor = originalGlobals.get(name);
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -131,6 +144,146 @@ afterEach(() => {
 afterAll(() => {
   if (originalState) Object.defineProperty(globalThis, '$state', originalState);
   else delete (globalThis as Record<string, unknown>).$state;
+});
+
+describe('TmuxMux disposal', () => {
+  test('removes the exact five browser listeners and is idempotent', () => {
+    jest.useFakeTimers();
+    const visualViewport = Object.assign(new FakeEventTarget(), {
+      width: 390,
+      height: 844,
+    });
+    fakeWindow.visualViewport = visualViewport;
+
+    const mux = new TmuxMux();
+    mux.onSessions(() => {});
+    const socket = FakeWebSocket.instances[0]!;
+    expect(jest.getTimerCount()).toBe(1); // connect timeout
+
+    const listenerCounts = () => [
+      fakeDocument.listenerCount('visibilitychange'),
+      fakeWindow.listenerCount('pageshow'),
+      fakeWindow.listenerCount('resize'),
+      visualViewport.listenerCount('resize'),
+      visualViewport.listenerCount('scroll'),
+    ];
+
+    expect(listenerCounts()).toEqual([1, 1, 1, 1, 1]);
+
+    // Teardown must target the viewport that was originally bound, even if a
+    // browser replaces window.visualViewport in the meantime.
+    fakeWindow.visualViewport = new FakeEventTarget();
+    mux.dispose();
+    expect(listenerCounts()).toEqual([0, 0, 0, 0, 0]);
+    expect(socket.closeCalls).toBe(1);
+    expect(jest.getTimerCount()).toBe(0);
+
+    mux.dispose();
+    expect(listenerCounts()).toEqual([0, 0, 0, 0, 0]);
+    expect(socket.closeCalls).toBe(1);
+  });
+
+  test('stops an open socket ping timer', () => {
+    jest.useFakeTimers();
+    const mux = new TmuxMux();
+    mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    expect(jest.getTimerCount()).toBe(1); // ping interval
+
+    jest.advanceTimersByTime(25_000);
+    expect(socket.frames().filter((frame) => frame.type === 'ping')).toHaveLength(1);
+    expect(jest.getTimerCount()).toBe(2); // ping interval + pong timeout
+
+    fakeWindow.emit('resize');
+    expect(jest.getTimerCount()).toBe(3); // plus client-info debounce
+
+    mux.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+    jest.advanceTimersByTime(100_000);
+
+    expect(socket.frames().filter((frame) => frame.type === 'ping')).toHaveLength(1);
+    expect(socket.closeCalls).toBe(1);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  test('cancels the default deferred-delta settle timer', () => {
+    jest.useFakeTimers();
+    setGlobal('requestAnimationFrame', undefined);
+    setGlobal('cancelAnimationFrame', undefined);
+
+    const deliveries: string[] = [];
+    const mux = new TmuxMux();
+    mux.subscribe('work', (data, type) => {
+      if (type === 'output') deliveries.push(data);
+    }, { deferWhileBusy: () => true });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.receive({ channel: 'work', type: 'output', data: 'base' });
+    socket.receive(createMuxDeltaFrame('work', ['base'], ['next']));
+
+    expect(deliveries).toEqual(['base']);
+    expect(jest.getTimerCount()).toBe(2); // ping interval + settle timeout
+
+    mux.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+    jest.advanceTimersByTime(1_000);
+
+    expect(deliveries).toEqual(['base']);
+    expect(socket.frames().filter((frame) => frame.type === 'resync')).toEqual([]);
+  });
+
+  test('cancels reconnect and cannot be reused after disposal', () => {
+    jest.useFakeTimers();
+    const mux = new TmuxMux();
+    mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    const staleClose = socket.onclose!;
+
+    // Closing with an active subscription arms the 1s reconnect first.
+    socket.finishClose();
+    expect(jest.getTimerCount()).toBe(1);
+    mux.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+
+    staleClose({ type: 'close' });
+    expect(jest.getTimerCount()).toBe(0);
+
+    const stopOutput = mux.subscribe('late', () => {});
+    const stopSessions = mux.onSessions(() => {});
+    mux.sendResize('late', 80, 24);
+    jest.advanceTimersByTime(60_000);
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(mux.connected).toBe(false);
+    expect(() => {
+      stopOutput();
+      stopSessions();
+      mux.dispose();
+    }).not.toThrow();
+  });
+
+  test('does not finish connecting when a host hook disposes reentrantly', () => {
+    jest.useFakeTimers();
+    const mux = new TmuxMux();
+    mux.configure({
+      getUrl: () => {
+        mux.dispose();
+        return 'wss://thumbmux.test/ws/tmux';
+      },
+    });
+
+    const stop = mux.subscribe('work', () => {});
+
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(() => {
+      stop();
+      mux.dispose();
+    }).not.toThrow();
+  });
 });
 
 describe('TmuxMux socket ownership', () => {
