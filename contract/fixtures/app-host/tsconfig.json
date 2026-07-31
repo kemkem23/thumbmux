@@ -1,0 +1,18 @@
+/*
+ * FROZEN CONSUMER FIXTURE (RULES §9).
+ * Changes require a matching contract manifest change and the CONTRACT.md
+ * deprecation procedure.
+ */
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "customConditions": ["svelte"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "skipLibCheck": false,
+    "noEmit": true
+  },
+  "include": ["type-contract.ts"]
+}
