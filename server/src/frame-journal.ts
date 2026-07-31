@@ -18,7 +18,7 @@ export interface FrameJournalRecordV1 {
   readonly frame: MuxFullOutputFrame | MuxDeltaFrame;
 }
 
-/** Frozen C05 spelling; kept structurally identical to the persisted record. */
+/** @deprecated since v0.8.0 — use FrameJournalRecordV1; removal no earlier than v0.9.0 */
 export type JournalRecordV1 = FrameJournalRecordV1;
 
 /** Error callback payload for isolated, session-scoped failures. */

@@ -32,3 +32,4 @@ export * from './sgr-mouse';
 export * from './paste';
 export * from './submit';
 export * from './prepend';
+export * from './deprecate';
