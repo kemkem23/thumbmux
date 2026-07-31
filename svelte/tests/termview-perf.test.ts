@@ -1425,6 +1425,13 @@ describe("TermView retained history budgets", () => {
     expect(marker).not.toBeNull();
     expect(marker?.classList.contains("mtv-line")).toBe(true);
     expect(Number(marker?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+    const expectedGapLabel = `${expectedGapRows} rows dropped before this row`;
+    expect(marker?.getAttribute("title")).toBe(expectedGapLabel);
+    const semanticMarker = marker?.previousElementSibling as HTMLElement | null;
+    expect(semanticMarker?.matches('.mtv-gap-marker[role="note"]')).toBe(true);
+    expect(semanticMarker?.getAttribute("aria-label")).toBe(expectedGapLabel);
+    expect(semanticMarker?.textContent).toBe("");
+    expect(viewport.querySelectorAll(".mtv-gap-marker")).toHaveLength(1);
     expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(1);
     expect(retainedLines).toHaveLength(totalAfterLive);
     expect(retainedLines.some((line) => line.includes("rows dropped"))).toBe(false);

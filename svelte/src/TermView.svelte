@@ -2738,11 +2738,19 @@
       {#each { length: winEnd - winStart } as _, i (archiveOffset + winStart + i)}
         {@const lineIdx = winStart + i}
         {@const droppedRows = retentionGapRowsAt(lineIdx, contentEpoch)}
+        {#if droppedRows > 0}<span
+            class="mtv-gap-marker"
+            role="note"
+            aria-label={`${droppedRows} rows dropped before this row`}
+            data-gap-marker-rows={droppedRows}
+            style:top={`${i * lineH}px`}
+          ></span>{/if}
         <div
           class="mtv-line"
           class:mtv-gap={droppedRows > 0}
           data-line-id={archiveOffset + lineIdx}
           data-gap-rows={droppedRows > 0 ? droppedRows : undefined}
+          title={droppedRows > 0 ? `${droppedRows} rows dropped before this row` : undefined}
         >{@html cachedLineHtml(lineIdx, contentEpoch)}</div>
       {/each}
     {/key}
@@ -2807,18 +2815,22 @@
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
   }
-  .mtv-gap {
-    position: relative;
-    overflow: visible;
-  }
-  .mtv-gap::before {
-    content: '── ' attr(data-gap-rows) ' rows dropped ──';
+  /* Keep the virtual row stride exactly N * lineH. Moving the old text label
+     to top:0 would only cover this row instead; doubling the row would break
+     scroll/prepend geometry; and an inline badge can collide with an
+     arbitrarily long terminal line. This absolute bracket is a sibling in the
+     6px layer gutter reserved outside terminal column geometry, so it changes
+     no box size and cannot paint any glyph. The exact count remains in the
+     row title and the named semantic note. */
+  .mtv-gap-marker {
     position: absolute;
-    left: 0;
-    bottom: 100%;
+    left: 1px;
+    width: 4px;
+    height: var(--mtv-lineh);
+    box-sizing: border-box;
     z-index: 2;
-    color: color-mix(in srgb, var(--tfg) 62%, transparent);
-    background: var(--tbg);
+    border: 1px solid color-mix(in srgb, var(--tfg) 62%, transparent);
+    border-right: 0;
     pointer-events: none;
     user-select: none;
   }
