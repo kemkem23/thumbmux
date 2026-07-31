@@ -908,7 +908,25 @@ describe("TermView compositor scroll layout reads", () => {
   });
 });
 
-describe("TermView alt-screen touch hit testing", () => {
+describe("TermView alt-screen pointer and touch hit testing", () => {
+  test("forwards a clean primary pointer pair as one computed SGR click", async () => {
+    const sgrCorpus: string[] = [];
+    const { viewport } = await prepareAltScreenTermView((data) => sgrCorpus.push(data));
+
+    const pointer = {
+      button: 0,
+      isPrimary: true,
+      pointerId: 7,
+      clientX: 55,
+      clientY: 225,
+      bubbles: true,
+    };
+    viewport.dispatchEvent(new PointerEvent("pointerdown", pointer));
+    viewport.dispatchEvent(new PointerEvent("pointerup", pointer));
+
+    expect(sgrCorpus).toEqual(["\x1b[<0;6;10M\x1b[<0;6;10m"]);
+  });
+
   test("reads the viewport rect at most once while preserving the per-point SGR corpus", async () => {
     const sgrCorpus: string[] = [];
     const { viewport, rectSpy } = await prepareAltScreenTermView((data) => sgrCorpus.push(data));
