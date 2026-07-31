@@ -118,7 +118,7 @@
       launchOpen = false;
       openSession(name);
     } catch (error) {
-      if (viewActive) launchError = `${labels.launchFailed}: ${errorMessage(error)}`;
+      if (viewActive) launchError = labels.launchFailed(errorMessage(error));
     } finally {
       if (viewActive) launching = false;
     }

@@ -8,6 +8,7 @@ export default defineConfig({
   plugins: [svelte()],
   resolve: {
     alias: {
+      '@thumbmux/app': r('../app/src'),
       '@thumbmux/core': r('../core/src'),
       '@thumbmux/svelte': r('../svelte/src'),
     },

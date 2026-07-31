@@ -1,20 +1,17 @@
 <script lang="ts">
-  /** thumbmux demo — hub of your local tmux sessions + a full terminal view.
-   * One Bun process serves this page, the WebSocket mux, and the spawn API. */
+  /** The demo is a thin host: policy lives here, while the UI lives in app. */
+  import { ThumbmuxApp, type AppAdapters } from '@thumbmux/app';
   import {
-    SessionGrid, LaunchSheet, TermView, DesktopKeys, TermHud, ComposerDock, DpadSheet, ActionFab, ThemeSheet, UploadAction,
-    ShortcutBar, ShortcutsSheet, NotePanel, PromptsPanel, createLocalPrefs,
-    tmuxMux, type GridSession, type FabAction,
-  } from '@thumbmux/svelte';
-  import {
-    DEFAULT_LAUNCH_PRESETS, DEFAULT_SHORTCUTS, defaultSurface, luminance, extractRecentPrompts,
-    submitPlan,
-    type LaunchPreset, type LaunchSpec, type Shortcut, type SubmitAgent,
+    DEFAULT_LAUNCH_PRESETS, defaultSurface, extractRecentPrompts, luminance,
+    type LaunchPreset, type LaunchSpec, type SessionListItem, type SubmitAgent, type ThumbmuxPrefs,
   } from '@thumbmux/core';
-  import { onMount, onDestroy } from 'svelte';
+  import { createLocalPrefs, tmuxMux } from '@thumbmux/svelte';
+  import { onMount } from 'svelte';
 
-  // Stock presets, worktree ones included — if the demo's cwd is not a git
-  // repo, git prints its own self-explanatory error in the pane.
+  const PREFS_KEY = 'thumbmux-demo-prefs';
+  const DARK_BG = '#101014';
+  const LIGHT_BG = '#f5f0e8';
+  const THEME_SWATCHES = [DARK_BG, '#000000', '#0b1c3d', '#b34700', LIGHT_BG, '#e6e6e6'];
   const ALT_SCREEN_PRESET_ID = 'alt-screen-mouse';
   const ALT_SCREEN_PRESET: LaunchPreset = {
     id: ALT_SCREEN_PRESET_ID,
@@ -26,446 +23,124 @@
     modelOptions: [{ value: 'none', label: 'No options', flag: '' }],
   };
   const PRESETS = [...DEFAULT_LAUNCH_PRESETS, ALT_SCREEN_PRESET];
+  const prefs = createLocalPrefs(PREFS_KEY);
+  const gridDelayMs = (() => {
+    const value = Number(new URL(window.location.href).searchParams.get('gridDelayMs') ?? 0);
+    return Number.isFinite(value) ? Math.max(0, Math.min(2_000, value)) : 0;
+  })();
 
-  // --- theme + font (persisted; ThemeSheet is pure presentation) ---
-  const THEME_SWATCHES = ['#101014', '#000000', '#0b1c3d', '#b34700', '#f5f0e8', '#e6e6e6'];
-  const prefs = createLocalPrefs('thumbmux-demo-prefs');
-  let bg = $state('#101014');
-  let fontPx = $state(13);
-  let themeOpen = $state(false);
-  let customBg = $state('#101014');
-  let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS);
-  let shortcutsOpen = $state(false);
-  let notes = $state<Record<string, string>>({});
-  let hudExpanded = $state(false);
-  let recentPrompts = $state<string[]>([]);
-  let termRef = $state<ReturnType<typeof TermView> | null>(null);
-  let surface = $derived(defaultSurface(bg));
-  function setBg(hex: string) {
-    bg = hex; customBg = hex;
-    prefs.save({ theme: { bg: hex } });
-  }
-  function setFont(next: number) {
-    fontPx = Math.max(11, Math.min(18, next));
-    prefs.save({ fontPx });
-  }
-  function setShortcuts(next: Shortcut[]) {
-    shortcuts = next;
-    prefs.save({ shortcuts: next });
-  }
-  function saveNote(session: string, text: string) {
-    notes = { ...notes, [session]: text };
-    prefs.save({ demoNotes: notes });
-  }
-
-  let view = $state<{ kind: 'hub' } | { kind: 'term'; name: string }>({ kind: 'hub' });
-  let names = $state<string[]>([]);
-  let sessionsLoaded = $state(false);
-  let launchOpen = $state(false);
-  let launching = $state(false);
-  let launchError = $state<string | null>(null);
+  let bg = $state(DARK_BG);
   let altScreenSessions = $state<Record<string, boolean>>({});
   let launchedAgents = $state<Record<string, SubmitAgent>>({});
 
-  // The demo mux currently reports no reliable agent state, last activity,
-  // workflow group, or agent identity. Keep those optional fields unknown;
-  // the live thumbnail and session name are the real data we can show.
-  let gridSessions = $derived<GridSession[]>(names.map((name) => ({ name })));
-
-  // Terminal view state
-  let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
-  let composerOpen = $state(false);
-  let composerMode = $state<'compose' | 'direct'>('compose');
-  let dockInset = $state(0);
-  let dockFull = $state(0);
-  let kbInset = $state(0);
-  let scrollControlsHeight = $state(0);
-  let termScrollState = $state({ bottomOffset: 0, scrolledUp: false });
-  let hasNewContent = $state(false);
-  let slotsOpen = $state(false);
-  let dpadOpen = $state(false);
-  let uploadRef = $state<ReturnType<typeof UploadAction> | null>(null);
-  let hudHeight = $state(0);
-  let shortcutBarH = $state(0);
-  let uploading = $state(false);
-  let composeText = $state('');
-  let isDesktop = $state(false);
-  let desktopKeysFocused = $state(false);
-  let terminalControlInset = $derived(Math.max(shortcutBarH, scrollControlsHeight));
-  let terminalBottomInset = $derived(
-    dockInset
-      + kbInset
-      + (terminalControlInset > 0 ? terminalControlInset + 8 : 0),
-  );
-
-  let unsubSessions: (() => void) | null = null;
-  let unsubDesktopGate: (() => void) | null = null;
-  let unsubSessionUrl: (() => void) | null = null;
-  let pendingSessionTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function sendKeysTo(session: string) {
-    return (data: string) => tmuxMux.sendKeys(session, data);
+  function delayInitialSessionPush(delayMs: number): () => void {
+    if (delayMs === 0) return () => {};
+    const original = tmuxMux.onSessions;
+    const patched: typeof tmuxMux.onSessions = (callback) => {
+      if (tmuxMux.onSessions === patched) tmuxMux.onSessions = original;
+      let pending: unknown[] = [];
+      let delivered = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const unsubscribe = original.call(tmuxMux, (rows) => {
+        if (delivered) { callback(rows); return; }
+        pending = rows;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { delivered = true; callback(pending); }, delayMs);
+      });
+      return () => { if (timer) clearTimeout(timer); unsubscribe(); };
+    };
+    tmuxMux.onSessions = patched;
+    return () => { if (tmuxMux.onSessions === patched) tmuxMux.onSessions = original; };
   }
+  const restoreSessionHook = delayInitialSessionPush(gridDelayMs);
+
+  async function fetchSessions(): Promise<SessionListItem[]> {
+    const response = await fetch('/api/sessions');
+    const data: unknown = await response.json().catch(() => null);
+    if (gridDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, gridDelayMs));
+    if (!response.ok || !Array.isArray(data)) throw new Error(`HTTP ${response.status}`);
+    return data as SessionListItem[];
+  }
+
+  function noteMap(snapshot: ThumbmuxPrefs): Record<string, string> {
+    const notes = snapshot.demoNotes;
+    return notes && typeof notes === 'object' && !Array.isArray(notes)
+      ? notes as Record<string, string> : {};
+  }
+  const notes = {
+    async load(session: string) { return noteMap(await prefs.load())[session] ?? ''; },
+    async save(session: string, text: string) {
+      await prefs.save({ demoNotes: { ...noteMap(await prefs.load()), [session]: text } });
+    },
+  };
 
   function launchAgent(agent: string): SubmitAgent {
     if (agent === 'cc') return 'claude';
     if (agent === 'codex' || agent === 'grok') return agent;
     return 'generic';
   }
-
-  async function sendSubmission(session: string, text: string) {
-    const agent = launchedAgents[session] ?? 'generic';
-    for (const step of submitPlan(text, { agent })) {
-      if (step.delayBeforeMs > 0) {
-        await new Promise<void>((resolve) => setTimeout(resolve, step.delayBeforeMs));
-      }
-      tmuxMux.sendKeys(session, step.keys);
-    }
+  async function launch(spec: LaunchSpec): Promise<{ name: string }> {
+    const response = await fetch('/api/spawn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: spec.command, worktree: spec.worktree }),
+    });
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error ?? `HTTP ${response.status}`);
+    const name = String(data?.name ?? '').trim();
+    if (!name) throw new Error('spawn response did not include a session name');
+    altScreenSessions = { ...altScreenSessions, [name]: spec.presetId === ALT_SCREEN_PRESET_ID };
+    launchedAgents = { ...launchedAgents, [name]: launchAgent(spec.agent) };
+    return { name };
   }
 
-  function onTermScrollStateChange(state: { bottomOffset: number; scrolledUp: boolean }) {
-    termScrollState = state;
-    if (!state.scrolledUp) {
-      hasNewContent = false;
-      scrollControlsHeight = 0;
-    }
+  async function loadPrompts(session: string): Promise<string[]> {
+    const response = await fetch(`/api/prompts?session=${encodeURIComponent(session)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return extractRecentPrompts((await response.text()).split('\n'), { targetCount: 5 });
   }
-
-  function onTermLinesChange(
-    lines: string[],
-    meta: { source: 'live' | 'prepend' | 'replace' },
-  ) {
-    recentPrompts = extractRecentPrompts(lines, { targetCount: 5 });
-    if (meta.source === 'live' && termScrollState.scrolledUp) hasNewContent = true;
-  }
-
-  function scrollToTerminalBottom() {
-    const moved = termRef?.scrollToBottom() ?? false;
-    if (moved && termRef && !termRef.isScrolledUp()) hasNewContent = false;
-  }
-
-  async function copyTerminal() {
-    const copiedSelection = await termRef?.copySelection();
-    if (copiedSelection === false) await termRef?.copyAll();
-  }
-
-  function sessionFromUrl(): string | null {
-    const url = new URL(window.location.href);
-    const value = url.searchParams.get('session');
-    return value && value.trim() ? value.trim() : null;
-  }
-
-  function setSessionUrl(name: string | null) {
-    const url = new URL(window.location.href);
-    if (name) url.searchParams.set('session', name);
-    else url.searchParams.delete('session');
-    history.replaceState(null, '', url);
-  }
-
-  function gridDelayMs(): number {
-    const value = Number(new URL(window.location.href).searchParams.get('gridDelayMs') ?? 0);
-    return Number.isFinite(value) ? Math.max(0, Math.min(2_000, value)) : 0;
-  }
-
-  function openSession(name: string) {
-    view = { kind: 'term', name };
-    setSessionUrl(name);
-  }
-
-  function showHub() {
-    composerRef?.closeDock();
-    view = { kind: 'hub' };
-    setSessionUrl(null);
-  }
-
-  function blurDesktopKeys() {
-    desktopKeysFocused = false;
-    const active = document.activeElement;
-    if (!(active instanceof HTMLElement)) return;
-    const root = active.closest('.desktop-keys');
-    if (root instanceof HTMLElement) root.blur();
-  }
-
-  function setDesktopGate(next: boolean) {
-    if (isDesktop && !next) blurDesktopKeys();
-    isDesktop = next;
-  }
-
-  async function launch(spec: LaunchSpec) {
-    launching = true;
-    launchError = null;
-    try {
-      const res = await fetch('/api/spawn', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: spec.command, worktree: spec.worktree }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
-      const name = String(data.name);
-      altScreenSessions = { ...altScreenSessions, [name]: spec.presetId === ALT_SCREEN_PRESET_ID };
-      launchedAgents = { ...launchedAgents, [name]: launchAgent(spec.agent) };
-      launchOpen = false;
-      openSession(name);
-    } catch (e: any) {
-      launchError = String(e?.message ?? e);
-    } finally {
-      launching = false;
-    }
-  }
-
-  let actions = $derived<FabAction[]>([
-    { id: 'type', label: '⌨ Type', onTap: () => { slotsOpen = false; composerRef?.openDock(); } },
-    { id: 'upload', label: uploading ? '⏳ Uploading…' : '📎 Attach files', testid: 'demo-upload', onTap: () => { slotsOpen = false; uploadRef?.open(); } },
-    { id: 'dpad', label: '✛ Arrows', onTap: () => { dpadOpen = !dpadOpen; slotsOpen = false; } },
-    { id: 'copy', label: '⧉ Copy screen', testid: 'demo-copy', onTap: async () => { slotsOpen = false; await copyTerminal(); } },
-    { id: 'shortcuts', label: '⚡ Shortcuts…', testid: 'demo-shortcuts', onTap: () => { shortcutsOpen = true; slotsOpen = false; } },
-    { id: 'theme', label: '🎨 Theme', testid: 'demo-theme', onTap: () => { themeOpen = true; slotsOpen = false; } },
-    { id: 'font-up', label: 'A+ Bigger text', onTap: () => setFont(fontPx + 1) },
-    { id: 'font-down', label: 'A− Smaller text', onTap: () => setFont(fontPx - 1) },
-  ]);
+  function setBg(next: string) { bg = next; void prefs.save({ theme: { bg: next } }); }
 
   onMount(() => {
-    prefs.load().then((p) => {
-      const b = p.theme?.bg; if (typeof b === 'string') { bg = b; customBg = b; }
-      const f = Number(p.fontPx); if (f >= 11 && f <= 18) fontPx = f;
-      if (Array.isArray(p.shortcuts)) shortcuts = p.shortcuts as Shortcut[];
-      if (p.demoNotes && typeof p.demoNotes === 'object') notes = p.demoNotes as Record<string, string>;
+    let active = true;
+    void prefs.load().then((snapshot) => {
+      const stored = snapshot.theme?.bg;
+      if (active && typeof stored === 'string') bg = stored;
     });
-    const initialSession = sessionFromUrl();
-    if (initialSession) view = { kind: 'term', name: initialSession };
-    const onPopState = () => {
-      const session = sessionFromUrl();
-      view = session ? { kind: 'term', name: session } : { kind: 'hub' };
-    };
-    window.addEventListener('popstate', onPopState);
-    unsubSessionUrl = () => window.removeEventListener('popstate', onPopState);
-    const initialGridDelay = gridDelayMs();
-    unsubSessions = tmuxMux.onSessions((rows: any[]) => {
-      const nextNames = rows.map((r) => String(r?.name ?? '')).filter(Boolean);
-      if (pendingSessionTimer) {
-        clearTimeout(pendingSessionTimer);
-        pendingSessionTimer = null;
-      }
-      if (!sessionsLoaded && initialGridDelay > 0) {
-        names = [];
-        pendingSessionTimer = setTimeout(() => {
-          names = nextNames;
-          sessionsLoaded = true;
-          pendingSessionTimer = null;
-        }, initialGridDelay);
-        return;
-      }
-      names = nextNames;
-      sessionsLoaded = true;
-    });
-    const query = window.matchMedia('(min-width: 1024px)');
-    setDesktopGate(query.matches);
-    const onChange = (event: MediaQueryListEvent) => setDesktopGate(event.matches);
-    query.addEventListener('change', onChange);
-    unsubDesktopGate = () => query.removeEventListener('change', onChange);
+    const markHost = () => document.querySelector('.mtv-host')?.classList.add('host');
+    markHost();
+    const observer = new MutationObserver(markHost);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => { active = false; restoreSessionHook(); observer.disconnect(); };
   });
 
-  onDestroy(() => {
-    if (pendingSessionTimer) clearTimeout(pendingSessionTimer);
-    unsubSessions?.();
-    unsubDesktopGate?.();
-    unsubSessionUrl?.();
+  let adapters = $derived.by((): AppAdapters => {
+    const altScreens = altScreenSessions;
+    const agents = launchedAgents;
+    const surface = defaultSurface(bg);
+    return {
+      fetchSessions, prefs, notes, prompts: loadPrompts,
+      spawn: { presets: PRESETS, launch },
+      upload: { endpoint: () => '/api/upload', dir: 'uploads' },
+      submitAgent: (session) => agents[session] ?? 'generic',
+      termProps: (session) => ({
+        claimGeometry: !altScreens[session], altScreenMouse: !!altScreens[session],
+      }),
+      theme: {
+        defaultBg: DARK_BG, swatches: THEME_SWATCHES, storageKey: PREFS_KEY,
+        surfaceFor: () => surface,
+        mode: () => luminance(surface.tbg) > 0.55 ? 'light' : 'dark',
+        onToggleMode: (mode) => setBg(mode === 'light' ? LIGHT_BG : DARK_BG),
+        onPick: (_session, color) => setBg(color),
+        onReset: () => setBg(DARK_BG),
+      },
+      labels: {
+        hubTitle: 'THUMBMUX · DEMO', hubCount: String,
+        gridEmpty: 'No tmux sessions yet — tap + terminal',
+        launchHint: 'Pick an agent — the exact launch command is shown before you run it.',
+        noteEmpty: 'no note yet',
+      },
+    };
   });
 </script>
 
-{#if view.kind === 'hub'}
-  <div class="hub">
-    <div class="bar"><span class="ttl">THUMBMUX · DEMO</span><span class="count">{names.length}</span></div>
-    <SessionGrid
-      sessions={gridSessions}
-      palette={surface.palette}
-      onOpen={openSession}
-      onNew={() => { launchError = null; launchOpen = true; }}
-      emptyLabel="No tmux sessions yet — tap + terminal"
-      loading={!sessionsLoaded}
-      searchable
-      searchLabel="Search sessions"
-      searchPlaceholder="Search sessions"
-    />
-    <LaunchSheet
-      open={launchOpen}
-      presets={PRESETS}
-      showCommand={true}
-      busy={launching}
-      error={launchError}
-      onLaunch={launch}
-      onClose={() => { if (!launching) launchOpen = false; }}
-      hint="Pick an agent — the exact launch command is shown before you run it."
-    />
-  </div>
-{:else}
-  {@const session = view.name}
-  {@const sendKeys = sendKeysTo(session)}
-  {@const termUsesAltScreenMouse = !!altScreenSessions[session]}
-  <div
-    class="stage"
-    style:--terminal-bottom-inset={`${terminalBottomInset}px`}
-    style:--dock-full={dockFull > 0 ? `${dockFull}px` : null}
-    style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
-    style:--agent={surface.agent} style:--tbg={surface.tbg} style:--tstage={surface.tstage}
-    style:--tfg={surface.tfg} style:--hud={surface.hud} style:--hud-fg={surface.hudFg}
-    style:--hud-line={surface.hudLine}
-  >
-    <div class="host" style:top={`${hudHeight}px`}>
-      {#key `${bg}|${fontPx}`}
-        {#if isDesktop}
-          <DesktopKeys bind:focused={desktopKeysFocused} onKeys={sendKeys} ariaLabel={`Terminal ${session}`}>
-            <TermView
-              bind:this={termRef}
-              {session} palette={surface.palette} {fontPx}
-              bottomInsetPx={terminalBottomInset}
-              claimGeometry={!termUsesAltScreenMouse}
-              altScreenMouse={termUsesAltScreenMouse}
-              onKeys={sendKeys}
-              onTap={() => composerRef?.openDock()}
-              onLinesChange={onTermLinesChange}
-              onScrollStateChange={onTermScrollStateChange}
-            />
-          </DesktopKeys>
-        {:else}
-          <TermView
-            bind:this={termRef}
-            {session} palette={surface.palette} {fontPx}
-            bottomInsetPx={terminalBottomInset}
-            claimGeometry={!termUsesAltScreenMouse}
-            altScreenMouse={termUsesAltScreenMouse}
-            onKeys={sendKeys}
-            onTap={() => composerRef?.openDock()}
-            onLinesChange={onTermLinesChange}
-            onScrollStateChange={onTermScrollStateChange}
-          />
-        {/if}
-      {/key}
-    </div>
-    {#snippet hudPanel()}
-      <NotePanel
-        note={notes[session] ?? ''}
-        onSave={(t) => saveNote(session, t)}
-      />
-      <div style="height:10px"></div>
-      <PromptsPanel
-        prompts={recentPrompts}
-        onPick={(pr) => { composeText = pr; hudExpanded = false; composerRef?.openCompose(); }}
-      />
-    {/snippet}
-    <TermHud
-      chip="TMUX"
-      title={session}
-      status={tmuxMux.connected ? 'connected' : 'offline'}
-      bind:barHeight={hudHeight}
-      bind:expanded={hudExpanded}
-      panel={hudPanel}
-      onBack={showHub}
-    />
-    <ShortcutBar
-      bind:barHeight={shortcutBarH}
-      {shortcuts}
-      visible={!slotsOpen && !themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
-      onSend={(sc) => { if (sc.submit === false) tmuxMux.sendKeys(session, sc.send); else void sendSubmission(session, sc.send); }}
-      onManage={() => (shortcutsOpen = true)}
-    />
-    {#if termScrollState.scrolledUp}
-      <div class="scroll-controls" bind:offsetHeight={scrollControlsHeight}>
-        {#if hasNewContent}
-          <button data-testid="demo-new-content" onclick={scrollToTerminalBottom}>New content</button>
-        {:else}
-          <button data-testid="demo-scroll-bottom" onclick={scrollToTerminalBottom}>Scroll to bottom</button>
-        {/if}
-      </div>
-    {/if}
-    <ShortcutsSheet bind:open={shortcutsOpen} {shortcuts} onChange={setShortcuts} />
-    <ActionFab bind:open={slotsOpen} active={slotsOpen || composerOpen} {actions} onFab={(e) => { e.stopPropagation(); if (composerOpen) composerRef?.closeDock(); else slotsOpen = !slotsOpen; }} />
-    <DpadSheet bind:open={dpadOpen} onKey={(seq) => tmuxMux.sendKeys(session, seq)} />
-    <ThemeSheet
-      bind:open={themeOpen}
-      bind:customBg
-      title="THEME"
-      mode={luminance(bg) > 0.55 ? 'light' : 'dark'}
-      onToggleMode={(m) => setBg(m === 'light' ? '#f5f0e8' : '#101014')}
-      swatchLabel="Background"
-      swatches={THEME_SWATCHES}
-      currentBg={bg}
-      defaultBg="#101014"
-      onPick={setBg}
-      onReset={() => setBg('#101014')}
-    />
-    <UploadAction
-      bind:this={uploadRef}
-      bind:busy={uploading}
-      onUploaded={(message) => { composeText = message; composerRef?.openCompose(); }}
-      onError={(m) => { composeText = `Upload failed: ${m}`; composerRef?.openCompose(); }}
-    />
-    <ComposerDock
-      bind:this={composerRef}
-      bind:open={composerOpen}
-      bind:mode={composerMode}
-      bind:text={composeText}
-      bind:dockInset bind:dockFull bind:kbInset
-      onSend={(text) => { void sendSubmission(session, text); }}
-      onDirectText={(d) => tmuxMux.sendKeys(session, d)}
-      onDirectKey={(seq) => tmuxMux.sendKeys(session, seq)}
-      onPasteFiles={(files) => uploadRef?.uploadFiles(files)}
-    />
-  </div>
-{/if}
-
-<style>
-  .hub {
-    --hub-card: #ffffff; --hub-line: #d8d2c8; --hub-ink: #1a1a1a; --hub-ink2: #6b6560;
-    position: fixed; inset: 0; overflow-y: auto; background: #f5f2ec;
-    font-family: var(--font-mono);
-  }
-  .bar {
-    position: sticky; top: 0; z-index: 5;
-    display: flex; align-items: center; gap: 10px;
-    background: #ffffff; color: #1a1a1a; border-bottom: 1px solid #d8d2c8;
-    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
-    font: 700 12px var(--font-mono); letter-spacing: .12em;
-  }
-  .count { margin-left: auto; color: #6b6560; }
-  .stage {
-    --agent: #7dffa0; --tbg: #101014; --tstage: #0a0a0d; --tfg: #e6e6e6;
-    --hud: rgba(16,16,20,.95); --hud-fg: #e6e6e6; --hud-line: #34343a;
-    /* clip, NOT hidden: sheets parked at translateY(105%) make the stage's
-       scrollable-overflow region taller than the viewport, and focus/caret
-       moves can then SCROLL the "unscrollable" fixed stage (hud measured at
-       top:-177 in fleet round 5). overflow:clip forbids all scrolling. */
-    position: fixed; inset: 0; height: 100dvh; overflow: clip;
-    background: var(--tstage); font-family: var(--font-mono);
-  }
-  .host {
-    /* top is set inline from TermHud's measured barHeight: the HUD is opaque,
-       so the terminal must START below it (absolute children ignore parent
-       padding — the old padding-top approach never worked). */
-    position: absolute; top: 0; left: 0; right: 0;
-    bottom: calc(var(--terminal-bottom-inset, 0px) + env(safe-area-inset-bottom, 0px));
-    background: var(--tbg);
-  }
-  .host :global(.desktop-keys) {
-    position: absolute;
-    inset: 0;
-    color: var(--tfg);
-  }
-  .scroll-controls {
-    position: absolute;
-    right: 76px;
-    bottom: calc(var(--dock-full, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom) + 8px);
-    z-index: 31;
-  }
-  .scroll-controls button {
-    min-height: 44px;
-    padding: 0 14px;
-    border: 1px solid var(--agent);
-    background: var(--hud);
-    color: var(--hud-fg);
-    font: 700 11px var(--font-mono);
-    letter-spacing: .04em;
-    touch-action: manipulation;
-  }
-</style>
+<ThumbmuxApp {adapters} />

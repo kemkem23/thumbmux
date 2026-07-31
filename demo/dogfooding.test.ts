@@ -32,6 +32,22 @@ function namedImportSpecifiers(source: string, importedName: string): string[] {
     .map(({ specifier }) => specifier);
 }
 
+function namedImports(source: string, specifier: string): string[] {
+  return parseImports(source)
+    .filter((entry) => entry.specifier === specifier)
+    .flatMap(({ clause }) => {
+      const namedBindings = clause.match(/\{([\s\S]*?)\}/)?.[1];
+      if (!namedBindings) return [];
+      return namedBindings.split(",").map((binding) => (
+        binding
+          .trim()
+          .replace(/^type\s+/, "")
+          .split(/\s+as\s+/)[0]
+          ?.trim() ?? ""
+      )).filter(Boolean);
+    });
+}
+
 function countCalls(source: string, identifier: string): number {
   const codeOnly = source.replace(
     /\/\*[\s\S]*?\*\/|\/\/[^\r\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g,
@@ -41,8 +57,36 @@ function countCalls(source: string, identifier: string): number {
   return [...codeOnly.matchAll(new RegExp(`\\b${escapedIdentifier}\\s*\\(`, "g"))].length;
 }
 
+function countConstructions(source: string, identifier: string): number {
+  const codeOnly = source.replace(
+    /\/\*[\s\S]*?\*\/|\/\/[^\r\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g,
+    " ",
+  );
+  const escapedIdentifier = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return [...codeOnly.matchAll(new RegExp(`\\bnew\\s+${escapedIdentifier}\\s*\\(`, "g"))].length;
+}
+
 const serveSource = await readFile(new URL("./serve.ts", import.meta.url), "utf8");
 const appSource = await readFile(new URL("./src/App.svelte", import.meta.url), "utf8");
+
+test("demo mounts the packaged app shell without importing its UI pieces directly", () => {
+  expect(namedImportSpecifiers(appSource, "ThumbmuxApp")).toEqual(["@thumbmux/app"]);
+  expect(namedImportSpecifiers(appSource, "AppAdapters")).toEqual(["@thumbmux/app"]);
+  expect(appSource.match(/<ThumbmuxApp(?:\s|\/>)/g)).toHaveLength(1);
+
+  const allowedSvelteInfrastructure = new Set(["createLocalPrefs", "tmuxMux"]);
+  const directSvelteUi = namedImports(appSource, "@thumbmux/svelte")
+    .filter((name) => !allowedSvelteInfrastructure.has(name))
+    .sort();
+  expect(directSvelteUi).toEqual([]);
+});
+
+test("demo delegates the server surface to createAppRoutes", () => {
+  expect(namedImportSpecifiers(serveSource, "createAppRoutes")).toEqual(["@thumbmux/server"]);
+  expect(countCalls(serveSource, "createAppRoutes")).toBe(1);
+  expect(namedImportSpecifiers(serveSource, "TmuxWsMux")).toEqual([]);
+  expect(countConstructions(serveSource, "TmuxWsMux")).toBe(0);
+});
 
 test("demo imports FileHistoryArchive through the server package", () => {
   expect(namedImportSpecifiers(serveSource, "FileHistoryArchive")).toEqual(["@thumbmux/server"]);

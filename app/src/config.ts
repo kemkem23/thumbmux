@@ -12,6 +12,7 @@ import type {
   FabAction,
   GridSession,
   LaunchContext,
+  TmuxMux,
 } from '@thumbmux/svelte';
 import type { Snippet } from 'svelte';
 
@@ -29,6 +30,12 @@ export interface AppAdapters {
    * consumer keeps its own server and mounts only the client shell — so the
    * path shape is not something the package gets to assume. */
   fetchSessions?: () => Promise<SessionListItem[]>;
+  /** The live session stream, the other half of `fetchSessions`. Defaults to the
+   * `@thumbmux/svelte` singleton. Overriding only the bootstrap would let a host
+   * redirect where the first list comes from while every update after it still
+   * arrived from a connection the host never chose — one source of truth,
+   * configurable at one end only. */
+  mux?: TmuxMux;
   sendKeys?: (session: string, keys: string) => void;
   submitAgent?: (session: string) => SubmitAgent;
   routes?: {
@@ -140,7 +147,9 @@ export interface AppLabels {
   launchModel: string;
   launchAction: string;
   launchBusy: string;
-  launchFailed: string;
+  /** Takes the message so a host can replace the whole line, not just a
+   * prefix. Mirrors `uploadFailed`, which already worked this way. */
+  launchFailed: (message: string) => string;
 
   hudBack: string;
   hudChip: string;
@@ -218,7 +227,7 @@ export const DEFAULT_APP_LABELS = Object.freeze({
   launchModel: 'Model',
   launchAction: 'Launch',
   launchBusy: '⏳ Opening session…',
-  launchFailed: 'Launch failed',
+  launchFailed: (message: string) => `Launch failed: ${message}`,
 
   hudBack: 'Back',
   hudChip: 'TMUX',
