@@ -32,6 +32,13 @@ The first two changes close data-loss bugs:
      field is present. Use a type alias, add an index signature, or cast. Inferred
      object literals — including the package's own `createBunTmuxDriver` — are fine.
    Runtime is unaffected either way; this is a typecheck-time break only.
+   > **Superseded by the next release — do not follow this advice on a newer tag.**
+   > The cast was the right workaround for v0.7.0 and the wrong shape overall:
+   > adding an index signature to your own alias does not help, because TypeScript
+   > grants implicit index signatures to aliases and never to interfaces. The
+   > constraint is now `SessionListRow` (`{ name: string }`, no index signature),
+   > so an `interface` row carrying only what your host actually knows compiles
+   > with no cast and no invented `created`/`windows`.
 4. **`onScrollStateChange` is boundary-only.** It fires when the scrolled-up flag
    flips, not on every offset change, and no callback reports the initial state. A
    host that mirrored the raw offset from this callback must read it another way.

@@ -8,20 +8,33 @@ session's live tail.
 
 ## Session-list fields and ownership
 
-The wire type is [`SessionListItem`](../core/src/protocol.ts). The bundled
-`createBunTmuxDriver()` fills all five standard fields. If you replace that
-driver's `listSessions()` or call `setSessionListProvider()`, your host must
-return those same fields. Extra host metadata is allowed and survives the wire,
-but thumbmux does not invent it or map it to `SessionGrid` props for you.
+Two types, and the distinction is the point.
+[`SessionListRow`](../core/src/protocol.ts) is the **minimum the protocol
+requires** — `{ name: string }`, no index signature — and it is the generic
+constraint on `TmuxDriver`, `setSessionListProvider()` and
+`MuxHooks.filterSessionList`. [`SessionListItem`](../core/src/protocol.ts) is
+the **full tmux row** the bundled `createBunTmuxDriver()` produces, and it stays
+the default type parameter, so existing code compiles unchanged.
 
-| Field or desired metadata | Package fills it with `createBunTmuxDriver()` | Host responsibility with a custom driver/provider | Not in the standard item |
-|---|---|---|---|
-| `name: string` | Yes — tmux session name | Required | — |
-| `created: string` | Yes — tmux creation time, epoch seconds encoded as a string | Required | — |
-| `windows: number` | Yes — tmux window count | Required | — |
-| `attached: boolean` | Yes — whether a tmux client is attached | Required | — |
-| `activityAt: number` | Yes — latest tmux window activity in epoch seconds; `0` before the first activity sample | Required | — |
-| Extra keys (`[key: string]: unknown`) | No | Optional — add and interpret them in the host | No fixed fields are defined |
+A host with its own source of truth returns whatever it actually knows. It does
+**not** have to invent `created` or `windows` to satisfy a type — no component
+in this package reads them, and a fabricated value is worse than an absent one
+because it looks like data. Extra host metadata is allowed and survives the
+wire, but thumbmux does not invent it or map it to `SessionGrid` props for you.
+
+| Field | `createBunTmuxDriver()` fills it | Required of a custom driver/provider |
+|---|---|---|
+| `name: string` | Yes — tmux session name | **Yes** — the only required field |
+| `created: string` | Yes — tmux creation time, epoch seconds as a string | No |
+| `windows: number` | Yes — tmux window count | No |
+| `attached: boolean` | Yes — whether a tmux client is attached | No |
+| `activityAt: number` | Yes — latest tmux window activity in epoch seconds; `0` before the first sample | No |
+| Extra keys | No | Optional — add and interpret them in the host |
+
+Declare your row as an `interface` if you like; that is the case the constraint
+exists for. TypeScript grants implicit index signatures to type aliases and not
+to interfaces, so an interface could never satisfy the old index-signature-
+bearing type no matter how many fields it had.
 | Agent `state` / `stateLabel` | No | Classify it and map it to `GridSession` if you want a state dot | Yes |
 | `chip`, filter, group, color, and localized activity labels | No | Enrich the `GridSession` in the host | Yes |
 | Durable prompt history | No | Store and query it in the host | Yes |
