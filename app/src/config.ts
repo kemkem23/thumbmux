@@ -6,6 +6,7 @@ import type {
   SessionListItem,
   SubmitAgent,
   TerminalSurfaceWithPalette,
+  UploadedFile,
 } from '@thumbmux/core';
 import type {
   FabAction,
@@ -54,6 +55,11 @@ export interface AppAdapters {
   upload?: {
     endpoint(session: string): string | null;
     dir?: string;
+    /** Replace the composer prefill written after a successful upload. Mirrors
+     * `formatUploadMessage(files, dir)` from core, so a host that only wants to
+     * decorate the default can call that itself. Without this, extraction would
+     * silently replace a host's own wording — including its language. */
+    formatPrefill?: (files: UploadedFile[], dir: string) => string;
   };
   prefs?: PreferencesAdapter;
   termProps?: (session: string) => Partial<{
@@ -86,10 +92,31 @@ export interface AppAdapters {
     onReset?: (session: string) => void;
   };
   labels?: Partial<AppLabels>;
-  extraActions?: (session: string) => FabAction[];
+  /** `FabAction.onTap` takes no arguments, so a host action had no way to reach
+   * the composer — a `/clear` that must go through the shell's agent-aware
+   * submit, or a failed action that wants to hand the text back to the user,
+   * could only be built by copying the shell's own glue. The context is the
+   * shell lending its composer rather than the host rebuilding one. */
+  extraActions?: (session: string, context: SessionActionContext) => FabAction[];
   extraPanel?: Snippet<[string]>;
   extraSheets?: Snippet<[string]>;
+  /** Dismiss any open host overlay; returns whether one was dismissed. This is
+   * a command — calling it closes things. */
   extraDismissables?: () => boolean;
+  /** Ask whether a host overlay is open, without closing it. Needed because
+   * `extraDismissables` cannot answer the question: it dismisses as a side
+   * effect of being called, so using it as a query would close the very sheet
+   * the shell was checking for. */
+  extraOverlayOpen?: () => boolean;
+}
+
+/** What the shell lends to a host-supplied action. */
+export interface SessionActionContext {
+  /** Send through the shell's own submit path, so agent-specific submit
+   * quirks stay in one place. */
+  submit(text: string): void;
+  /** Put text in the composer and open it, without sending. */
+  prefill(text: string): void;
 }
 
 /** English-by-default copy used by the stock hub and session shells. */
