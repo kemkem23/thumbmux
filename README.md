@@ -155,7 +155,7 @@ policy, geometry ownership, view-only surfaces — is specified in
 
 ```bash
 git ls-remote --tags https://github.com/kemkem23/thumbmux 'refs/tags/v*-dist'
-THUMBMUX_TAG=v0.5.0-dist # replace with the published tag you selected
+THUMBMUX_TAG=v0.7.1-dist # replace with the published tag you selected
 bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
 # npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"
 ```

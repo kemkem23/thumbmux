@@ -108,8 +108,8 @@ anchor. A one-row minimum lets pagination make progress without turning an
 invalid or sentinel-sized request into an unexpectedly large response.
 
 `limit` is an upper bound the server may lower. An implementation is allowed to
-cap a page below what the client asked for — kemcortex's archive caps at 2000
-rows so one request cannot pull an unbounded slab off disk — and it signals the
+cap a page below what the client asked for — a host archive might cap at, say,
+2000 rows so one request cannot pull an unbounded slab off disk — and it signals the
 remainder through `hasMore`, not through the returned row count. So a client
 **must not** treat `lines.length < limit` as end-of-archive: `hasMore` is the
 only authority. The two reference archives differ here (`FileHistoryArchive`

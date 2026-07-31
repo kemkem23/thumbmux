@@ -1,7 +1,57 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.7.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
+
+## v0.7.1 — 2026-07-31
+
+Nineteen fixes found by two rounds of trying to break v0.7.0 rather than confirm
+it. Nothing here changes the wire format, and no existing call site needs
+editing. Two of them are worth reading before you upgrade, because they change
+behaviour you may have been working around.
+
+### Read before upgrading
+
+1. **A tmux target is now matched exactly.** Every driver operation addresses
+   `=<name>:0.0` instead of a bare name, so tmux can no longer fall through to
+   prefix matching. Before this, if a session had died and a longer sibling was
+   still alive — `agent` gone, `agent-2` running — the operation silently
+   succeeded against the sibling. A viewer could be handed another session's
+   pane, and a kill could take the wrong one. If you relied on prefix matching to
+   address sessions by a shortened name, that no longer works, and it was never
+   safe.
+2. **The two history paging methods now return `boolean`.** `requestHistory` and
+   the new `requestHistoryAfter` return `false` when the frame was not written —
+   disposed mux, closed socket, or another request already outstanding for that
+   session. Callers that set local "loading" state before the call must roll it
+   back on `false`. History frames carry no request token, so only one request
+   per session can be attributed at a time; `recoverHistoryRequest(session)`
+   abandons one that never got a reply.
+
+### Fixed
+
+- A lost history reply no longer freezes that session's scrollback until the
+  connection happens to be replaced. The serialization gate can now be abandoned
+  explicitly, fenced by socket identity so settling a stale lease cannot retire
+  the wire another session is using.
+- A standalone `client_info` reaches the host through the new optional
+  `MuxHooks.onClientInfo`. It previously had no case in the message switch and
+  was discarded.
+- `createSpawnHandler` is generic over the session row, matching `TmuxDriver`.
+  A host row carrying only `name` compiles again.
+- `dispose()` detaches its listeners, instead of relying on a `destroy()` no
+  caller invoked.
+- A killed session is retired rather than being captured four times a second
+  until something notices.
+- A stale teardown no longer kills a live subscription.
+- A throwing archive, or a throwing logger inside the archive's error path, can
+  no longer leave a client waiting forever for a reply that will never come.
+- The gap marker reports where and how much accurately, and sits in its own
+  gutter rather than eating the row it was placed on.
+- The gap count compares content instead of assuming the whole window departed.
+- Eight helpers hosts were rewriting by hand are exported, and a test proves they
+  reach the published artifact.
+- The heap benchmark no longer hardcodes a browser path into a release gate.
 
 ## v0.7.0 — 2026-07-30
 
