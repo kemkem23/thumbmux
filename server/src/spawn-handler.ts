@@ -16,6 +16,8 @@ import {
   buildLaunchCommand,
   type LaunchPreset,
   type LaunchSpec,
+  type SessionListItem,
+  type SessionListRow,
 } from "@thumbmux/core";
 import { createBunTmuxDriver, spawnTmuxSession } from "./bun-driver";
 import type { TmuxDriver } from "./ws-mux";
@@ -48,9 +50,11 @@ export type SpawnWorktreeCleanupContext = SpawnWorktreeContext & {
   cause: unknown;
 };
 
-export type SpawnHandlerOptions = {
+export type SpawnHandlerOptions<
+  SessionRow extends SessionListRow = SessionListItem,
+> = {
   /** Session inventory used for collision checks. Defaults to the Bun driver. */
-  driver?: Pick<TmuxDriver, "listSessions">;
+  driver?: Pick<TmuxDriver<SessionRow>, "listSessions">;
   /** Static fallback cwd, or an authoritative host resolver. Defaults to process.cwd(). */
   cwd?: string | ((payload: SpawnPayload) => MaybePromise<string>);
   /** Server-authoritative presets. Defaults to DEFAULT_LAUNCH_PRESETS. */
@@ -177,7 +181,9 @@ async function resolveDirectory(
   return cwd;
 }
 
-export function createSpawnHandler(opts: SpawnHandlerOptions = {}) {
+export function createSpawnHandler<
+  SessionRow extends SessionListRow = SessionListItem,
+>(opts: SpawnHandlerOptions<SessionRow> = {}) {
   const driver = opts.driver ?? createBunTmuxDriver();
   const presets = opts.presets ?? DEFAULT_LAUNCH_PRESETS;
   const spawn = opts.spawn ?? spawnTmuxSession;
