@@ -76,6 +76,10 @@ class FakeWebSocket {
     this.onclose?.({ type: 'close' });
   }
 
+  receive(frame: unknown) {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+
   frames() {
     return this.sent.map((frame) => JSON.parse(frame));
   }
@@ -203,5 +207,126 @@ describe('TmuxMux socket ownership', () => {
 
     unsubscribe();
     second.finishClose();
+  });
+});
+
+describe('TmuxMux subscription teardown', () => {
+  test('a stale session teardown cannot remove a later subscriber or unsubscribe it on the wire', () => {
+    const mux = new TmuxMux();
+    const firstStop = mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    firstStop();
+
+    const deliveries: string[] = [];
+    const secondStop = mux.subscribe('work', (data, type) => {
+      if (type === 'output') deliveries.push(data);
+    });
+
+    firstStop();
+    socket.receive({ channel: 'work', type: 'output', data: 'still subscribed' });
+
+    expect(deliveries).toEqual(['still subscribed']);
+    expect(socket.frames().filter((frame) => frame.type === 'unsubscribe')).toEqual([
+      { type: 'unsubscribe', session: 'work' },
+    ]);
+
+    secondStop();
+    socket.finishClose();
+  });
+
+  test('the session active guard protects a callback re-added while its captured set stays current', () => {
+    const mux = new TmuxMux();
+    const reusedDeliveries: string[] = [];
+    const keeperDeliveries: string[] = [];
+    const reusedCallback = (data: string, type?: string) => {
+      if (type === 'output') reusedDeliveries.push(data);
+    };
+    const firstStop = mux.subscribe('work', reusedCallback);
+    const keeperStop = mux.subscribe('work', (data, type) => {
+      if (type === 'output') keeperDeliveries.push(data);
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    firstStop();
+    const laterStop = mux.subscribe('work', reusedCallback);
+    firstStop();
+    socket.receive({ channel: 'work', type: 'output', data: 'both active' });
+
+    expect(reusedDeliveries).toEqual(['both active']);
+    expect(keeperDeliveries).toEqual(['both active']);
+
+    laterStop();
+    keeperStop();
+    socket.finishClose();
+  });
+
+  test('the session set-identity guard rejects an active teardown that captured a replaced set', () => {
+    const mux = new TmuxMux();
+    const sharedCallback = () => {};
+    const firstStop = mux.subscribe('work', sharedCallback);
+    const duplicateStop = mux.subscribe('work', sharedCallback);
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    // Set de-duplication lets this sibling teardown empty and retire the set
+    // while firstStop itself remains active and still captures that old set.
+    duplicateStop();
+    const deliveries: string[] = [];
+    const laterStop = mux.subscribe('work', (data, type) => {
+      if (type === 'output') deliveries.push(data);
+    });
+    firstStop();
+    socket.receive({ channel: 'work', type: 'output', data: 'replacement survived' });
+
+    expect(deliveries).toEqual(['replacement survived']);
+    expect(socket.frames().filter((frame) => frame.type === 'unsubscribe')).toEqual([
+      { type: 'unsubscribe', session: 'work' },
+    ]);
+
+    laterStop();
+    socket.finishClose();
+  });
+
+  test('a stale session-list teardown cannot remove a later registration of the same callback', () => {
+    const mux = new TmuxMux();
+    const deliveries: unknown[][] = [];
+    const callback = (sessions: unknown[]) => deliveries.push(sessions);
+    const firstStop = mux.onSessions(callback);
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    firstStop();
+    const secondStop = mux.onSessions(callback);
+    firstStop();
+    socket.receive({ channel: '__sessions', type: 'sessions', data: '[{"name":"work"}]' });
+
+    expect(deliveries).toEqual([[{ name: 'work' }]]);
+    expect(socket.frames().filter((frame) => frame.type === 'sessions_unsubscribe')).toEqual([
+      { type: 'sessions_unsubscribe' },
+    ]);
+
+    secondStop();
+    socket.finishClose();
+  });
+
+  test('the session-list delete-result guard rejects a sibling teardown after Set de-duplication', () => {
+    const mux = new TmuxMux();
+    const callback = () => {};
+    const firstStop = mux.onSessions(callback);
+    const duplicateStop = mux.onSessions(callback);
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    duplicateStop();
+    firstStop();
+
+    expect(socket.frames().filter((frame) => frame.type === 'sessions_unsubscribe')).toEqual([
+      { type: 'sessions_unsubscribe' },
+    ]);
+
+    socket.finishClose();
   });
 });

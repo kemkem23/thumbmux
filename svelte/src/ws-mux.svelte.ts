@@ -830,7 +830,11 @@ export class TmuxMux {
 
     this.ensureConnection();
 
+    let active = true;
     return () => {
+      if (!active) return;
+      active = false;
+      if (this.subs.get(session) !== set) return;
       set!.delete(callback);
       this.subTails.get(session)?.delete(callback);
       this.subDeferProbes.get(session)?.delete(callback);
@@ -859,8 +863,11 @@ export class TmuxMux {
     if (first && this.ws?.readyState === WebSocket.OPEN) {
       this.send(this.ws, { type: 'sessions_subscribe' });
     }
+    let active = true;
     return () => {
-      this.sessionCallbacks.delete(callback);
+      if (!active) return;
+      active = false;
+      if (!this.sessionCallbacks.delete(callback)) return;
       if (this.sessionCallbacks.size === 0 && this.ws?.readyState === WebSocket.OPEN) {
         this.send(this.ws, { type: 'sessions_unsubscribe' });
       }
