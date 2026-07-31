@@ -1615,7 +1615,15 @@ export class TmuxWsMux<
         : (this.captureStartLines.get(session) ?? this.DEFAULT_CAPTURE_START_LINE);
       this.lastReconcileCapture.set(session, Date.now());
       const profile = this.profileOf(session);
-      const useArchive = profile.archive && this.archive !== null;
+      // A bounded thumbnail capture is not an archive bootstrap. Feeding it
+      // into a fresh FileHistoryArchive initializes an empty archive whose
+      // live window can make the later full capture look unchanged, so the
+      // older rows are never seeded. Keep serving that bounded capture
+      // directly until a full-history capture establishes the archive; all
+      // subsequent live captures resume normal archive reconciliation.
+      const useArchive = profile.archive
+        && this.archive !== null
+        && (!!opts.fullHistory || this.archiveSeeded.has(session));
       const captureOpts = profile.currentPaneOnly ? { currentPaneOnly: true } : { startLine };
       let content: string;
       let rawCursor: RawCursorState | null = null;
