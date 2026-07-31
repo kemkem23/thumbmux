@@ -1286,6 +1286,45 @@ describe("TermView retained history budgets", () => {
     expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(0);
   }, 120_000);
 
+  test("adds the discarded live tail to the gap count on replace", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const totalBeforeReplace = Number(viewport.getAttribute("data-total"));
+    const markerIndex = markerLineId - archiveOffset;
+    const discardedLiveRows = totalBeforeReplace - markerIndex;
+    expect(discardedLiveRows).toBeGreaterThan(0);
+    const expectedGapRows = gapRowsBefore + discardedLiveRows;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      Array.from({ length: 12 }, (_, row) => `replacement-row-${row}`).join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, 1_000_000);
+
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerAfter).not.toBeNull();
+    expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
+    expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(expectedGapRows);
+  }, 120_000);
+
   test("live append stays within retention budgets without changing mounted rows", async () => {
     let retainedLines: string[] = [];
     const { viewport } = await prepareScrollableTermView(undefined, 240, {

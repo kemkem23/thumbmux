@@ -1350,7 +1350,13 @@
     if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width.
+      const discardedLiveRows = gapRowIndex >= 0 && gapRowCount > 0
+        ? liveLines.length
+        : 0;
       liveLines = nextLive;
+      if (discardedLiveRows > 0) {
+        recordRetentionGap(archivedLines.length, discardedLiveRows);
+      }
     } else if (bottomOffsetPx > 0 && liveLines.length > 0) {
       const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
       liveLines = merged.lines;
