@@ -13,7 +13,7 @@ import { dirname, extname, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
-const PACKAGES = ["core", "server", "svelte"] as const;
+const PACKAGES = ["core", "server", "svelte", "app"] as const;
 export type PublicSubpackage = (typeof PACKAGES)[number];
 
 export type PublicExportManifest = {
@@ -26,14 +26,16 @@ export type PublicExportManifest = {
 };
 
 export type GitDistExportManifests = Record<PublicSubpackage, PublicExportManifest>;
-const REWRITE_ROOTS = ["git-dist/server", "git-dist/svelte"] as const;
+const REWRITE_ROOTS = ["git-dist/server", "git-dist/svelte", "git-dist/app"] as const;
+const REWRITE_TARGETS = ["core", "svelte"] as const;
+type RewriteTarget = (typeof REWRITE_TARGETS)[number];
 /**
  * Quoted bare package specifier (`"…"`, `'…'`, or `` `…` ``). Comments that
  * mention the package name without quotes are intentionally ignored — those
  * are documentation, not import graph edges a consumer must resolve.
  */
-const BARE_CORE_SPECIFIER = /(["'`])@thumbmux\/core\1/g;
-/** Text-ish extensions scanned for leftover bare core imports under git-dist. */
+const BARE_WORKSPACE_SPECIFIER = /(["'`])@thumbmux\/(core|svelte)\1/g;
+/** Text-ish extensions scanned for leftover bare workspace imports under git-dist. */
 const SCAN_EXTENSIONS = /\.(?:[cm]?[jt]sx?|d\.ts|svelte|map|json|css|html|mts|cts)$/i;
 
 export type RewrittenSpecifier = {
@@ -317,11 +319,23 @@ export function assertGitDistExportParity(
         `${packageName} declaration exports missing from git-dist: ${missingDeclarations.join(", ")}`,
       );
     }
+    const unexpectedDeclarations = missingNames(declarations.declarations, expected.declarations);
+    if (unexpectedDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} declaration exports unexpectedly present in git-dist: ${unexpectedDeclarations.join(", ")}`,
+      );
+    }
 
     const missingValueDeclarations = missingNames(expected.runtime, declarations.runtime);
     if (missingValueDeclarations.length > 0) {
       throw new Error(
         `${packageName} value declarations missing from git-dist: ${missingValueDeclarations.join(", ")}`,
+      );
+    }
+    const unexpectedValueDeclarations = missingNames(declarations.runtime, expected.runtime);
+    if (unexpectedValueDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} value declarations unexpectedly present in git-dist: ${unexpectedValueDeclarations.join(", ")}`,
       );
     }
 
@@ -331,6 +345,12 @@ export function assertGitDistExportParity(
         `${packageName} callable declarations are not callable in git-dist: ${missingCallableDeclarations.join(", ")}`,
       );
     }
+    const unexpectedCallableDeclarations = missingNames(declarations.callable, expected.callable);
+    if (unexpectedCallableDeclarations.length > 0) {
+      throw new Error(
+        `${packageName} callable declarations unexpectedly present in git-dist: ${unexpectedCallableDeclarations.join(", ")}`,
+      );
+    }
 
     const missingRuntime = missingNames(expected.runtime, runtime.runtime);
     if (missingRuntime.length > 0) {
@@ -338,11 +358,23 @@ export function assertGitDistExportParity(
         `${packageName} runtime exports missing from git-dist: ${missingRuntime.join(", ")}`,
       );
     }
+    const unexpectedRuntime = missingNames(runtime.runtime, expected.runtime);
+    if (unexpectedRuntime.length > 0) {
+      throw new Error(
+        `${packageName} runtime exports unexpectedly present in git-dist: ${unexpectedRuntime.join(", ")}`,
+      );
+    }
 
     const missingCallable = missingNames(expected.callable, runtime.callable);
     if (missingCallable.length > 0) {
       throw new Error(
         `${packageName} callable exports are not callable in git-dist: ${missingCallable.join(", ")}`,
+      );
+    }
+    const unexpectedCallable = missingNames(runtime.callable, expected.callable);
+    if (unexpectedCallable.length > 0) {
+      throw new Error(
+        `${packageName} callable exports unexpectedly present in git-dist: ${unexpectedCallable.join(", ")}`,
       );
     }
   }
@@ -430,22 +462,30 @@ function renderNodeRuntimeGuard(manifests: GitDistExportManifests): string {
   ].join("\n");
 }
 
-function renderSvelteRuntimeGuard(manifest: PublicExportManifest): string {
-  const imports = namedImports(manifest.runtime, "svelte");
-  const callable = new Set(manifest.callable);
+function renderSvelteRuntimeGuard(manifests: GitDistExportManifests): string {
+  const packages = (["svelte", "app"] as const).map((packageName) => ({
+    packageName,
+    imports: namedImports(manifests[packageName].runtime, packageName),
+    callable: new Set(manifests[packageName].callable),
+  }));
   return [
-    "import {",
-    ...imports.map(({ imported, local }) => `  ${imported} as ${local},`),
-    '} from "thumbmux/svelte";',
+    ...packages.flatMap(({ packageName, imports }) => [
+      "import {",
+      ...imports.map(({ imported, local }) => `  ${imported} as ${local},`),
+      `} from "thumbmux/${packageName}";`,
+      "",
+    ]),
     "",
-    "const checks: Array<readonly [string, unknown, boolean]> = [",
-    ...imports.map(({ imported, local }) =>
-      `  [${JSON.stringify(imported)}, ${local}, ${callable.has(imported)}],`),
+    "const checks: Array<readonly [string, string, unknown, boolean]> = [",
+    ...packages.flatMap(({ packageName, imports, callable }) => {
+      return imports.map(({ imported, local }) =>
+        `  [${JSON.stringify(packageName)}, ${JSON.stringify(imported)}, ${local}, ${callable.has(imported)}],`);
+    }),
     "];",
-    "for (const [name, value, mustBeCallable] of checks) {",
-    "  if (value === undefined) throw new Error(`svelte runtime export missing from installed git-dist: ${name}`);",
+    "for (const [packageName, name, value, mustBeCallable] of checks) {",
+    "  if (value === undefined) throw new Error(`${packageName} runtime export missing from installed git-dist: ${name}`);",
     "  if (mustBeCallable && typeof value !== \"function\") {",
-    "    throw new Error(`svelte export is not callable from installed git-dist: ${name}`);",
+    "    throw new Error(`${packageName} export is not callable from installed git-dist: ${name}`);",
     "  }",
     "}",
     "",
@@ -467,7 +507,7 @@ function renderSvelteRuntimeRunner(): string {
     "});",
     "try {",
     '  await vite.ssrLoadModule("/src/git-dist-export-guard.ts");',
-    '  console.log(JSON.stringify({ exportGuard: { svelte: "runtime-loaded" } }));',
+    '  console.log(JSON.stringify({ exportGuard: { svelte: "runtime-loaded", app: "runtime-loaded" } }));',
     "} finally {",
     "  await vite.close();",
     "}",
@@ -510,7 +550,7 @@ export function writeGitDistConsumerGuards(
   );
   writeFileSync(
     resolve(consumerRoot, "src/git-dist-export-guard.ts"),
-    renderSvelteRuntimeGuard(manifests.svelte),
+    renderSvelteRuntimeGuard(manifests),
     "utf8",
   );
   writeFileSync(
@@ -639,17 +679,17 @@ function isScannable(path: string): boolean {
 
 /**
  * Find every file under `git-dist/` that still contains a quoted bare
- * `@thumbmux/core` specifier. Returns package-root-relative POSIX paths.
+ * internal workspace specifier. Returns package-root-relative POSIX paths.
  */
-export function findBareCoreSpecifiers(root = PACKAGE_ROOT): string[] {
+export function findBareWorkspaceSpecifiers(root = PACKAGE_ROOT): string[] {
   const gitDistRoot = resolve(root, "git-dist");
   if (!existsSync(gitDistRoot)) return [];
   const offenders: string[] = [];
   for (const path of filesBelow(gitDistRoot)) {
     if (!isScannable(path)) continue;
     const source = readFileSync(path, "utf8");
-    BARE_CORE_SPECIFIER.lastIndex = 0;
-    if (BARE_CORE_SPECIFIER.test(source)) {
+    BARE_WORKSPACE_SPECIFIER.lastIndex = 0;
+    if (BARE_WORKSPACE_SPECIFIER.test(source)) {
       offenders.push(relative(root, path).split(sep).join("/"));
     }
   }
@@ -659,14 +699,16 @@ export function findBareCoreSpecifiers(root = PACKAGE_ROOT): string[] {
 /**
  * Derive the git-dist entrypoints consumers must receive from the monorepo
  * package.json `exports` map. Workspace layout is `./pkg/dist/file`; the
- * aggregate copies that as `git-dist/pkg/file`. Always includes the core
- * rewrite target (`git-dist/core/index.js` + `.d.ts`) so the invariant holds
+ * aggregate copies that as `git-dist/pkg/file`. Always includes the rewrite
+ * targets (`git-dist/{core,svelte}/index.js` + `.d.ts`) so the invariant holds
  * even for fixtures without an exports map.
  */
 export function requiredGitDistArtifacts(root = PACKAGE_ROOT): string[] {
   const required = new Set<string>([
     "git-dist/core/index.js",
     "git-dist/core/index.d.ts",
+    "git-dist/svelte/index.js",
+    "git-dist/svelte/index.d.ts",
   ]);
   const pkgPath = resolve(root, "package.json");
   if (!existsSync(pkgPath)) return [...required].sort();
@@ -696,21 +738,21 @@ export function requiredGitDistArtifacts(root = PACKAGE_ROOT): string[] {
 /**
  * Fail-closed post-conditions for a usable git-dist aggregate.
  *
- * 1. Zero quoted bare `@thumbmux/core` anywhere under git-dist.
+ * 1. Zero quoted bare internal workspace specifiers anywhere under git-dist.
  * 2. Required entrypoints exist and are non-empty.
  * 3. Every rewritten relative specifier resolves to a real file on disk.
  *
  * File/replacement *counts* are intentionally not asserted — they grow when
- * legitimate new modules import core. Log them; never gate on their value.
+ * legitimate new modules import core/Svelte. Log them; never gate on their value.
  */
 export function assertGitDistInvariants(
   root = PACKAGE_ROOT,
   result?: Pick<GitDistRewriteResult, "rewrittenSpecifiers">,
 ): void {
-  const offenders = findBareCoreSpecifiers(root);
+  const offenders = findBareWorkspaceSpecifiers(root);
   if (offenders.length > 0) {
     throw new Error(
-      `bare @thumbmux/core remains in git-dist (${offenders.length}): ${offenders.join(", ")}`,
+      `bare @thumbmux workspace specifier remains in git-dist (${offenders.length}): ${offenders.join(", ")}`,
     );
   }
 
@@ -738,18 +780,20 @@ export function assertGitDistInvariants(
 }
 
 /**
- * The source workspaces intentionally import the standalone package name
- * `@thumbmux/core`. The immutable git-dist tag, however, is installed as one
- * root `thumbmux` package and package managers do not install its nested
- * workspace dependency. Rewrite only built server/Svelte artifacts so their
- * runtime and declaration imports resolve a copied core dist shipped beside
- * them. Original workspace dists remain byte-identical for standalone packs.
+ * Source workspaces intentionally import standalone `@thumbmux/*` packages.
+ * The immutable git-dist tag, however, is installed as one root `thumbmux`
+ * package and package managers do not install its nested workspace dependencies.
+ * Rewrite built server/Svelte/app artifacts so internal runtime and declaration
+ * imports resolve copied sibling dists. Original workspace dists remain
+ * byte-identical for standalone packs.
  */
 export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult {
-  const coreSourceJs = resolve(root, "core/dist/index.js");
-  const coreSourceTypes = resolve(root, "core/dist/index.d.ts");
-  if (!existsSync(coreSourceJs) || !existsSync(coreSourceTypes)) {
-    throw new Error("missing built core dist entrypoints");
+  for (const packageName of REWRITE_TARGETS) {
+    const sourceJs = resolve(root, `${packageName}/dist/index.js`);
+    const sourceTypes = resolve(root, `${packageName}/dist/index.d.ts`);
+    if (!existsSync(sourceJs) || !existsSync(sourceTypes)) {
+      throw new Error(`missing built ${packageName} dist entrypoints`);
+    }
   }
   const sourceDigests = new Map<string, string>();
   for (const packageName of PACKAGES) {
@@ -765,25 +809,38 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
     const source = resolve(root, packageName, "dist");
     cpSync(source, resolve(gitDistRoot, packageName), { recursive: true });
   }
-  const coreJs = resolve(gitDistRoot, "core/index.js");
+  const rewriteTargets = Object.fromEntries(
+    REWRITE_TARGETS.map((packageName) => [
+      packageName,
+      resolve(gitDistRoot, packageName, "index.js"),
+    ]),
+  ) as Record<RewriteTarget, string>;
 
   const files = new Set<string>();
   const rewrittenSpecifiers: RewrittenSpecifier[] = [];
   let replacements = 0;
   for (const path of distFiles(root)) {
     const source = readFileSync(path, "utf8");
-    const specifier = moduleSpecifier(path, coreJs);
+    const specifiers = new Set<string>();
     let fileReplacements = 0;
-    const rewritten = source.replace(BARE_CORE_SPECIFIER, (_match, quote: string) => {
-      fileReplacements++;
-      return `${quote}${specifier}${quote}`;
-    });
+    BARE_WORKSPACE_SPECIFIER.lastIndex = 0;
+    const rewritten = source.replace(
+      BARE_WORKSPACE_SPECIFIER,
+      (_match, quote: string, packageName: RewriteTarget) => {
+        const specifier = moduleSpecifier(path, rewriteTargets[packageName]);
+        fileReplacements++;
+        specifiers.add(specifier);
+        return `${quote}${specifier}${quote}`;
+      },
+    );
     if (fileReplacements === 0) continue;
     writeFileSync(path, rewritten, "utf8");
     replacements += fileReplacements;
     const rel = relative(root, path).split(sep).join("/");
     files.add(rel);
-    rewrittenSpecifiers.push({ file: rel, specifier });
+    for (const specifier of [...specifiers].sort()) {
+      rewrittenSpecifiers.push({ file: rel, specifier });
+    }
   }
 
   for (const path of filesBelow(gitDistRoot).filter((file) => file.endsWith(".d.ts"))) {
@@ -798,7 +855,8 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
   const result: GitDistRewriteResult = {
     files: [...files].sort(),
     replacements,
-    rewrittenSpecifiers,
+    rewrittenSpecifiers: rewrittenSpecifiers.sort((a, b) =>
+      a.file.localeCompare(b.file) || a.specifier.localeCompare(b.specifier)),
   };
   assertGitDistInvariants(root, result);
 

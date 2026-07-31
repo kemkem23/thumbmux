@@ -8,13 +8,14 @@
     "core",
     "svelte",
     "server",
+    "app",
     "demo"
   ],
   "repository": "github:kemkem23/thumbmux",
   "license": "MIT",
   "scripts": {
     "demo": "bun run --cwd demo start",
-    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build",
+    "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build && bun run --cwd app build",
     "build:git-dist": "bun run build:packages && bun run ./scripts/rewrite-git-dist-imports.ts",
     "smoke:git-dist": "bash ./scripts/smoke-git-dist.sh",
     "prepare": "bun run build:packages"
@@ -38,6 +39,10 @@
     "./svelte": {
       "types": "./svelte/dist/index.d.ts",
       "svelte": "./svelte/dist/index.js"
+    },
+    "./app": {
+      "types": "./app/dist/index.d.ts",
+      "svelte": "./app/dist/index.js"
     },
     "./package.json": "./package.json"
   }

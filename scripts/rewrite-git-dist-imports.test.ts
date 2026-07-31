@@ -5,7 +5,7 @@ import { join } from "node:path";
 import {
   assertGitDistInvariants,
   assertGitDistExportParity,
-  findBareCoreSpecifiers,
+  findBareWorkspaceSpecifiers,
   requiredGitDistArtifacts,
   rewriteGitDistImports,
   writeGitDistConsumerGuards,
@@ -20,11 +20,17 @@ afterEach(() => {
 function fixture(): string {
   const root = mkdtempSync(join(tmpdir(), "thumbmux-git-dist-test-"));
   roots.push(root);
-  for (const directory of ["core/dist", "server/dist", "svelte/dist/nested"]) {
+  for (const directory of ["core/dist", "server/dist", "svelte/dist/nested", "app/dist"]) {
     mkdirSync(join(root, directory), { recursive: true });
   }
   writeFileSync(join(root, "core/dist/index.js"), "export const core = true;\n");
   writeFileSync(join(root, "core/dist/index.d.ts"), "export declare const core: true;\n");
+  writeFileSync(join(root, "server/dist/index.js"), "export const server = true;\n");
+  writeFileSync(join(root, "server/dist/index.d.ts"), "export declare const server: true;\n");
+  writeFileSync(join(root, "svelte/dist/index.js"), "export const svelte = true;\n");
+  writeFileSync(join(root, "svelte/dist/index.d.ts"), "export declare const svelte: true;\n");
+  writeFileSync(join(root, "app/dist/index.js"), "export const app = true;\n");
+  writeFileSync(join(root, "app/dist/index.d.ts"), "export declare const app: true;\n");
   return root;
 }
 
@@ -47,6 +53,10 @@ function writeExportsMap(root: string): void {
           types: "./svelte/dist/index.d.ts",
           svelte: "./svelte/dist/index.js",
         },
+        "./app": {
+          types: "./app/dist/index.d.ts",
+          svelte: "./app/dist/index.js",
+        },
         "./package.json": "./package.json",
       },
     }),
@@ -56,6 +66,14 @@ function writeExportsMap(root: string): void {
   writeFileSync(join(root, "server/dist/index.d.ts"), "export type { Value } from '@thumbmux/core';\n");
   writeFileSync(join(root, "svelte/dist/index.js"), 'export { value } from "@thumbmux/core";\n');
   writeFileSync(join(root, "svelte/dist/index.d.ts"), "export type { Value } from '@thumbmux/core';\n");
+  writeFileSync(
+    join(root, "app/dist/index.js"),
+    'export { value } from "@thumbmux/core"; export { view } from "@thumbmux/svelte";\n',
+  );
+  writeFileSync(
+    join(root, "app/dist/index.d.ts"),
+    "export type { Value } from '@thumbmux/core'; export type { View } from '@thumbmux/svelte';\n",
+  );
 }
 
 function writeExportSurface(
@@ -70,9 +88,10 @@ function writeExportSurface(
     makeFakeServerDeclarationNonCallable?: boolean;
     makeFakeServerDeclarationTypeOnly?: boolean;
     makeFakeServerRuntimeNonCallable?: boolean;
+    omitAppSourceExport?: boolean;
   } = {},
 ): void {
-  for (const packageName of ["core", "server", "svelte"]) {
+  for (const packageName of ["core", "server", "svelte", "app"]) {
     mkdirSync(join(root, packageName, "src"), { recursive: true });
     mkdirSync(join(root, "git-dist", packageName), { recursive: true });
   }
@@ -203,6 +222,29 @@ function writeExportSurface(
     join(root, "git-dist/svelte/index.js"),
     "export function svelteFunction() { return true; }\n",
   );
+
+  writeFileSync(
+    join(root, "app/src/index.ts"),
+    [
+      "export type AppShape = { label: string };",
+      ...(options.omitAppSourceExport
+        ? []
+        : ["export const defaultAppLabel = 'Terminals';"]),
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/app/index.d.ts"),
+    [
+      "export type AppShape = { label: string };",
+      "export declare const defaultAppLabel = \"Terminals\";",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "git-dist/app/index.js"),
+    "export const defaultAppLabel = 'Terminals';\n",
+  );
 }
 
 describe("git-dist import rewriting", () => {
@@ -234,19 +276,28 @@ describe("git-dist import rewriting", () => {
     );
     writeFileSync(join(root, "svelte/dist/nested/helper.d.ts"), "export interface Helper {}\n");
     writeFileSync(join(root, "svelte/dist/View.svelte.d.ts"), "declare const View: unknown; export default View;\n");
+    writeFileSync(
+      join(root, "app/dist/index.d.ts"),
+      'export type { AppConfig } from "./config";\n',
+    );
+    writeFileSync(join(root, "app/dist/config.d.ts"), "export interface AppConfig {}\n");
 
     const originalCore = readFileSync(join(root, "core/dist/index.d.ts"), "utf8");
     const originalServer = readFileSync(join(root, "server/dist/index.d.ts"), "utf8");
     const originalSvelte = readFileSync(join(root, "svelte/dist/index.d.ts"), "utf8");
+    const originalApp = readFileSync(join(root, "app/dist/index.d.ts"), "utf8");
 
     const result = rewriteGitDistImports(root);
 
     expect(result.files).toEqual([
+      "git-dist/app/index.d.ts",
       "git-dist/core/index.d.ts",
       "git-dist/server/index.d.ts",
       "git-dist/svelte/index.d.ts",
     ]);
-    expect(result.replacements).toBe(4);
+    expect(result.replacements).toBe(5);
+    expect(readFileSync(join(root, "git-dist/app/index.d.ts"), "utf8"))
+      .toBe('export type { AppConfig } from "./config.js";\n');
     expect(readFileSync(join(root, "git-dist/core/index.d.ts"), "utf8")).toBe([
       "export * from './protocol.js';",
       'export type ProtocolImport = import("./protocol.js").Protocol;',
@@ -264,32 +315,52 @@ describe("git-dist import rewriting", () => {
     expect(readFileSync(join(root, "core/dist/index.d.ts"), "utf8")).toBe(originalCore);
     expect(readFileSync(join(root, "server/dist/index.d.ts"), "utf8")).toBe(originalServer);
     expect(readFileSync(join(root, "svelte/dist/index.d.ts"), "utf8")).toBe(originalSvelte);
+    expect(readFileSync(join(root, "app/dist/index.d.ts"), "utf8")).toBe(originalApp);
   });
 
-  test("rewrites built JS, declarations, and Svelte sources relative to the shipped core dist", () => {
+  test("rewrites core and Svelte imports to their shipped sibling dists", () => {
     const root = fixture();
     writeFileSync(join(root, "server/dist/index.js"), 'export { value } from "@thumbmux/core";\n');
     writeFileSync(join(root, "server/dist/index.d.ts"), "export type { Value } from '@thumbmux/core';\n");
     writeFileSync(join(root, "svelte/dist/View.svelte"), "<script>import { value } from '@thumbmux/core';</script>\n");
     writeFileSync(join(root, "svelte/dist/nested/helper.js"), 'import { value } from "@thumbmux/core";\n');
+    writeFileSync(
+      join(root, "app/dist/index.js"),
+      'import { value } from "@thumbmux/core"; import { view } from "@thumbmux/svelte";\n',
+    );
+    writeFileSync(
+      join(root, "app/dist/index.d.ts"),
+      "import type { Value } from '@thumbmux/core'; import type { View } from '@thumbmux/svelte';\n",
+    );
 
     const originalServerJs = readFileSync(join(root, "server/dist/index.js"), "utf8");
     const originalSvelte = readFileSync(join(root, "svelte/dist/View.svelte"), "utf8");
+    const originalAppJs = readFileSync(join(root, "app/dist/index.js"), "utf8");
 
     const result = rewriteGitDistImports(root);
     expect(result.files).toEqual([
+      "git-dist/app/index.d.ts",
+      "git-dist/app/index.js",
       "git-dist/server/index.d.ts",
       "git-dist/server/index.js",
       "git-dist/svelte/View.svelte",
       "git-dist/svelte/nested/helper.js",
     ]);
-    expect(result.replacements).toBe(4);
+    expect(result.replacements).toBe(8);
     expect(result.rewrittenSpecifiers).toEqual([
+      { file: "git-dist/app/index.d.ts", specifier: "../core/index.js" },
+      { file: "git-dist/app/index.d.ts", specifier: "../svelte/index.js" },
+      { file: "git-dist/app/index.js", specifier: "../core/index.js" },
+      { file: "git-dist/app/index.js", specifier: "../svelte/index.js" },
       { file: "git-dist/server/index.d.ts", specifier: "../core/index.js" },
       { file: "git-dist/server/index.js", specifier: "../core/index.js" },
-      { file: "git-dist/svelte/View.svelte", specifier: "../core/index.js" },
       { file: "git-dist/svelte/nested/helper.js", specifier: "../../core/index.js" },
+      { file: "git-dist/svelte/View.svelte", specifier: "../core/index.js" },
     ]);
+    expect(readFileSync(join(root, "git-dist/app/index.js"), "utf8"))
+      .toContain('from "../core/index.js"');
+    expect(readFileSync(join(root, "git-dist/app/index.js"), "utf8"))
+      .toContain('from "../svelte/index.js"');
     expect(readFileSync(join(root, "git-dist/server/index.js"), "utf8"))
       .toContain('from "../core/index.js"');
     expect(readFileSync(join(root, "git-dist/server/index.d.ts"), "utf8"))
@@ -300,10 +371,11 @@ describe("git-dist import rewriting", () => {
       .toContain('from "../../core/index.js"');
     expect(readFileSync(join(root, "server/dist/index.js"), "utf8")).toBe(originalServerJs);
     expect(readFileSync(join(root, "svelte/dist/View.svelte"), "utf8")).toBe(originalSvelte);
+    expect(readFileSync(join(root, "app/dist/index.js"), "utf8")).toBe(originalAppJs);
 
     // Re-running rebuilds the aggregate from pristine package dists and is
     // deterministic instead of stacking a second relative rewrite.
-    expect(rewriteGitDistImports(root).replacements).toBe(4);
+    expect(rewriteGitDistImports(root).replacements).toBe(8);
   });
 
   test("fails closed when the core dist entrypoints were not built", () => {
@@ -325,7 +397,7 @@ describe("git-dist import rewriting", () => {
     const result = rewriteGitDistImports(root);
     expect(result.files.length).toBe(30);
     expect(result.replacements).toBe(30);
-    expect(findBareCoreSpecifiers(root)).toEqual([]);
+    expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
   });
 
   test("fails closed when a bare @thumbmux/core specifier survives under git-dist", () => {
@@ -338,9 +410,23 @@ describe("git-dist import rewriting", () => {
       join(root, "git-dist/server/planted.js"),
       'import { value } from "@thumbmux/core";\n',
     );
-    expect(findBareCoreSpecifiers(root)).toEqual(["git-dist/server/planted.js"]);
+    expect(findBareWorkspaceSpecifiers(root)).toEqual(["git-dist/server/planted.js"]);
     expect(() => assertGitDistInvariants(root)).toThrow(
-      /bare @thumbmux\/core remains in git-dist \(1\): git-dist\/server\/planted\.js/,
+      /bare @thumbmux workspace specifier remains in git-dist \(1\): git-dist\/server\/planted\.js/,
+    );
+  });
+
+  test("fails closed when a bare @thumbmux/svelte specifier survives under git-dist", () => {
+    const root = fixture();
+    rewriteGitDistImports(root);
+
+    writeFileSync(
+      join(root, "git-dist/app/planted.js"),
+      'import { view } from "@thumbmux/svelte";\n',
+    );
+    expect(findBareWorkspaceSpecifiers(root)).toEqual(["git-dist/app/planted.js"]);
+    expect(() => assertGitDistInvariants(root)).toThrow(
+      /bare @thumbmux workspace specifier remains in git-dist \(1\): git-dist\/app\/planted\.js/,
     );
   });
 
@@ -349,13 +435,13 @@ describe("git-dist import rewriting", () => {
     writeExportsMap(root);
     // Drop only the JS entry so the aggregate lacks one mapped export path.
     // (types entry remains — assert reports the first missing path it finds.)
-    rmSync(join(root, "svelte/dist/index.js"));
-    // Still need *some* svelte dist content so the package copy succeeds.
-    writeFileSync(join(root, "svelte/dist/View.svelte"), "<script></script>\n");
+    rmSync(join(root, "app/dist/index.js"));
+    // Still need *some* app dist content so the package copy succeeds.
+    writeFileSync(join(root, "app/dist/config.js"), "export {};\n");
 
-    expect(requiredGitDistArtifacts(root)).toContain("git-dist/svelte/index.js");
+    expect(requiredGitDistArtifacts(root)).toContain("git-dist/app/index.js");
     expect(() => rewriteGitDistImports(root)).toThrow(
-      "missing git-dist entrypoint: git-dist/svelte/index.js",
+      "missing git-dist entrypoint: git-dist/app/index.js",
     );
   });
 
@@ -379,6 +465,8 @@ describe("git-dist import rewriting", () => {
     const root = fixture();
     writeExportsMap(root);
     expect(requiredGitDistArtifacts(root)).toEqual([
+      "git-dist/app/index.d.ts",
+      "git-dist/app/index.js",
       "git-dist/core/index.d.ts",
       "git-dist/core/index.js",
       "git-dist/server/index.d.ts",
@@ -403,7 +491,7 @@ describe("git-dist import rewriting", () => {
     const body = readFileSync(join(root, "git-dist/server/index.js"), "utf8");
     expect(body).toContain("// lives in @thumbmux/core (docs only)");
     expect(body).toContain('from "../core/index.js"');
-    expect(findBareCoreSpecifiers(root)).toEqual([]);
+    expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
   });
 });
 
@@ -425,6 +513,16 @@ describe("git-dist public export guard", () => {
     expect(guard).toContain('from "thumbmux/core";');
     expect(guard).toContain('from "thumbmux/server";');
     expect(guard).not.toContain('from "thumbmux/svelte";');
+    expect(guard).not.toContain('from "thumbmux/app";');
+
+    const bundlerGuard = readFileSync(join(consumer, "type-export-guard.ts"), "utf8");
+    expect(bundlerGuard).toContain('from "thumbmux/app";');
+    const svelteRuntimeGuard = readFileSync(
+      join(consumer, "src/git-dist-export-guard.ts"),
+      "utf8",
+    );
+    expect(svelteRuntimeGuard).toContain('from "thumbmux/svelte";');
+    expect(svelteRuntimeGuard).toContain('from "thumbmux/app";');
   });
 
   test("derives the public declaration/runtime surface and accepts a complete dist", () => {
@@ -442,6 +540,15 @@ describe("git-dist public export guard", () => {
     // advertises a new export while the already-built aggregate omits it.
     expect(() => assertGitDistExportParity(root)).toThrow(
       "server declaration exports missing from git-dist: fakeDistGuardExport",
+    );
+  });
+
+  test("fails when assembled app declarations retain an export removed from source", () => {
+    const root = fixture();
+    writeExportSurface(root, { omitAppSourceExport: true });
+
+    expect(() => assertGitDistExportParity(root)).toThrow(
+      "app declaration exports unexpectedly present in git-dist: defaultAppLabel",
     );
   });
 

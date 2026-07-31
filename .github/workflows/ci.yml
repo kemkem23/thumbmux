@@ -18,14 +18,14 @@ jobs:
         run: bun test ./core/tests/ ./core/src/*.test.ts
       - name: protocol conformance (real tmux)
         run: bun test ./server/tests/
-      - name: svelte + demo unit tests
-        run: bun test ./svelte/tests/ ./demo/*.test.ts ./scripts/*.test.ts
+      - name: svelte + app + demo unit tests
+        run: bun test ./svelte/tests/ ./app/tests/ ./demo/*.test.ts ./scripts/*.test.ts
       # Release-parity gate: must stay byte-identical to the unit-test command
       # in release.yml. Split suite steps above give better failure locality;
       # this combined process is what release-dist actually runs, and a
       # DOM-harness / preload interaction can fail only under one process.
       - name: release-parity combined unit tests
-        run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
+        run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
       - name: canonical container e2e
@@ -46,5 +46,6 @@ jobs:
           (cd core && bun run build && bun pm pack)
           (cd server && bun run build && bun pm pack)
           (cd svelte && bun run build && bun pm pack)
+          (cd app && bun run build && bun pm pack)
       - name: root git-dist consumer smoke
         run: bun run build:git-dist && bun run smoke:git-dist

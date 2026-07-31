@@ -1,0 +1,214 @@
+import type {
+  AnsiPalette,
+  LaunchPreset,
+  LaunchSpec,
+  PreferencesAdapter,
+  SessionListItem,
+  SubmitAgent,
+} from '@thumbmux/core';
+import type {
+  FabAction,
+  GridSession,
+  LaunchContext,
+} from '@thumbmux/svelte';
+import type { Snippet } from 'svelte';
+
+/** Host-owned behavior and policy seams for the mountable application shell. */
+export interface AppAdapters {
+  sendKeys?: (session: string, keys: string) => void;
+  submitAgent?: (session: string) => SubmitAgent;
+  routes?: {
+    openSession(name: string): void;
+    showHub(): void;
+  };
+  spawn?: {
+    presets?: readonly LaunchPreset[];
+    contexts?: () => Promise<LaunchContext[]>;
+    launch?: (spec: LaunchSpec) => Promise<{ name: string }>;
+  };
+  sessionMeta?: (rows: SessionListItem[]) => GridSession[];
+  notes?: {
+    load(session: string): Promise<string>;
+    save(session: string, text: string): Promise<void>;
+  };
+  prompts?: (session: string) => Promise<string[]>;
+  upload?: {
+    endpoint(session: string): string | null;
+    dir?: string;
+  };
+  prefs?: PreferencesAdapter;
+  termProps?: (session: string) => Partial<{
+    claimGeometry: boolean;
+    altScreenMouse: boolean;
+    palette: AnsiPalette;
+    fontPx: number;
+  }>;
+  theme?: {
+    defaultBg?: string;
+    swatches?: string[];
+    storageKey?: string;
+    bgFor?: (session: string) => string | null;
+  };
+  labels?: Partial<AppLabels>;
+  extraActions?: (session: string) => FabAction[];
+  extraPanel?: Snippet<[string]>;
+  extraSheets?: Snippet<[string]>;
+  extraDismissables?: () => boolean;
+}
+
+/** English-by-default copy used by the stock hub and session shells. */
+export interface AppLabels {
+  hubTitle: string;
+  hubCount: (count: number) => string;
+
+  gridNew: string;
+  gridEmpty: string;
+  gridLoading: string;
+  gridAll: string;
+  gridSearchLabel: string;
+  gridSearchPlaceholder: string;
+  gridGroup: string;
+  gridUngrouped: string;
+
+  launchTitle: string;
+  launchHint: string;
+  launchContext: string;
+  launchPermission: string;
+  launchModel: string;
+  launchAction: string;
+  launchBusy: string;
+  launchFailed: string;
+
+  hudBack: string;
+  hudChip: string;
+  hudConnected: string;
+  hudOffline: string;
+  terminalAria: (session: string) => string;
+  fabAria: string;
+
+  actionType: string;
+  actionUpload: string;
+  actionUploading: string;
+  actionDpad: string;
+  actionCopy: string;
+  actionShortcuts: string;
+  actionTheme: string;
+  actionFontUp: string;
+  actionFontDown: string;
+
+  scrollNewContent: string;
+  scrollBottom: string;
+  uploadFailed: (message: string) => string;
+
+  noteEmpty: string;
+  noteEdit: string;
+  noteSave: string;
+  noteCancel: string;
+
+  promptsTitle: string;
+  promptsLoading: string;
+  promptsEmpty: string;
+
+  shortcutsTitle: string;
+  shortcutAdd: string;
+  shortcutLabel: string;
+  shortcutSend: string;
+  shortcutDelete: string;
+  shortcutUp: string;
+  shortcutDown: string;
+
+  themeTitle: string;
+  themeBackground: string;
+  themeDark: string;
+  themeLight: string;
+  themeDefault: string;
+  themeCustom: string;
+
+  composerCompose: string;
+  composerDirect: string;
+  composerHintCompose: string;
+  composerHintDirect: string;
+  composerPlaceholder: string;
+  composerSend: string;
+  composerDirectAria: string;
+
+  close: string;
+}
+
+export const DEFAULT_APP_LABELS = Object.freeze({
+  hubTitle: 'TERMINALS',
+  hubCount: (count: number) => `${count} ${count === 1 ? 'session' : 'sessions'}`,
+
+  gridNew: '+ terminal',
+  gridEmpty: 'No sessions yet — tap + terminal to start one',
+  gridLoading: 'Loading sessions…',
+  gridAll: 'ALL',
+  gridSearchLabel: 'Search sessions',
+  gridSearchPlaceholder: 'Search sessions',
+  gridGroup: 'Group',
+  gridUngrouped: 'Ungrouped',
+
+  launchTitle: 'New terminal',
+  launchHint: 'Pick an agent — permissions and model are injected into the launch command.',
+  launchContext: 'Workspace',
+  launchPermission: 'Permissions',
+  launchModel: 'Model',
+  launchAction: 'Launch',
+  launchBusy: '⏳ Opening session…',
+  launchFailed: 'Launch failed',
+
+  hudBack: 'Back',
+  hudChip: 'TMUX',
+  hudConnected: 'connected',
+  hudOffline: 'offline',
+  terminalAria: (session: string) => `Terminal ${session}`,
+  fabAria: 'Actions',
+
+  actionType: '⌨ Type',
+  actionUpload: '📎 Attach files',
+  actionUploading: '⏳ Uploading…',
+  actionDpad: '✛ Arrows',
+  actionCopy: '⧉ Copy screen',
+  actionShortcuts: '⚡ Shortcuts…',
+  actionTheme: '🎨 Theme',
+  actionFontUp: 'A+ Bigger text',
+  actionFontDown: 'A− Smaller text',
+
+  scrollNewContent: 'New content',
+  scrollBottom: 'Scroll to bottom',
+  uploadFailed: (message: string) => `Upload failed: ${message}`,
+
+  noteEmpty: 'No note for this session yet',
+  noteEdit: '✎ edit',
+  noteSave: 'save',
+  noteCancel: 'cancel',
+
+  promptsTitle: 'RECENT PROMPTS — tap to edit/resend',
+  promptsLoading: 'scanning…',
+  promptsEmpty: 'no prompts found yet',
+
+  shortcutsTitle: 'SHORTCUTS',
+  shortcutAdd: '+ add',
+  shortcutLabel: 'label',
+  shortcutSend: 'sends',
+  shortcutDelete: '✕',
+  shortcutUp: '↑',
+  shortcutDown: '↓',
+
+  themeTitle: 'THEME',
+  themeBackground: 'Background',
+  themeDark: '☾ Dark',
+  themeLight: '☀ Light',
+  themeDefault: 'Default',
+  themeCustom: 'Pick',
+
+  composerCompose: 'COMPOSE',
+  composerDirect: 'DIRECT',
+  composerHintCompose: 'Draft first, then hit SEND',
+  composerHintDirect: 'Keyboard goes straight to the terminal',
+  composerPlaceholder: 'Type a prompt… (the box grows with your text)',
+  composerSend: 'SEND',
+  composerDirectAria: 'Send keys directly to the terminal',
+
+  close: 'Close',
+} satisfies AppLabels);

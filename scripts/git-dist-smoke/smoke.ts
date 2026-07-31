@@ -12,12 +12,19 @@ import {
   type WsLike,
 } from "thumbmux/server";
 import type { GridSession, TmuxMuxOptions } from "thumbmux/svelte";
+import {
+  DEFAULT_APP_LABELS,
+  type AppAdapters,
+  type AppLabels,
+} from "thumbmux/app";
 
 const request: MuxClientMessage = { type: "subscribe", session: "smoke", delta: true };
 const driver = null as unknown as TmuxDriver;
 const socket = null as unknown as WsLike;
 const grid = null as unknown as GridSession;
 const options = null as unknown as TmuxMuxOptions;
+const adapters = null as unknown as AppAdapters;
+const labels: AppLabels = DEFAULT_APP_LABELS;
 const base = splitMuxOutputData("one\ntwo");
 const delta = createMuxDeltaFrame("smoke", base, ["one", "three"], null);
 const reconstructed = applyMuxDelta(base, delta);
@@ -27,6 +34,8 @@ void driver;
 void socket;
 void grid;
 void options;
+void adapters;
+void labels;
 void reconstructed;
 void TmuxWsMux;
 void createPrefsHandler;

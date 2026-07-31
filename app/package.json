@@ -1,0 +1,41 @@
+{
+  "name": "@thumbmux/app",
+  "version": "0.7.1",
+  "description": "Mountable Svelte application shell for the thumbmux mobile terminal stack.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "svelte": "^5"
+  },
+  "license": "MIT",
+  "svelte": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "svelte-package -i src -o dist"
+  },
+  "dependencies": {
+    "@thumbmux/core": "^0.7.1",
+    "@thumbmux/svelte": "^0.7.1"
+  },
+  "devDependencies": {
+    "@sveltejs/package": "^2.5.4",
+    "svelte": "^5.51.0",
+    "svelte2tsx": "^0.7.57",
+    "typescript": "^5.9.3"
+  },
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kemkem23/thumbmux",
+    "directory": "app"
+  }
+}
