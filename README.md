@@ -4,11 +4,12 @@
 
 **tmux for thumbs — and now for desks.**
 
-A batteries-included web terminal stack for driving tmux sessions — especially
-AI coding agents — from phone and desktop browsers: a compositor-scroll
-viewer, a keyboard-aware composer, a live session hub, and a multiplexed
-WebSocket engine. Public core, Svelte, and server entrypoints are available for
-host applications to wire together.
+A reusable set of web-terminal components and a server engine for driving tmux
+sessions — especially AI coding agents — from phone and desktop browsers: a
+compositor-scroll viewer, a keyboard-aware composer, a live session hub, and a
+multiplexed WebSocket engine. Published dist tags provide public core, Svelte,
+and server entrypoints for a host application to wire together; they do not
+install a runnable application or demo.
 
 [![CI](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/tag/kemkem23/thumbmux?filter=v*-dist&label=release&color=16a34a)](https://github.com/kemkem23/thumbmux/tags)
@@ -19,7 +20,8 @@ host applications to wire together.
 
 <img src="docs/media/hero.png" width="96%" alt="The same agent session in three themes — dark, deep blue, and cream" />
 
-<sub>The screenshots in this README show the bundled demo.</sub>
+<sub>The screenshots come from the repository demo. Clone the repository to run it;
+the demo is not part of a dist-tag install.</sub>
 
 </div>
 
@@ -164,6 +166,11 @@ The selected tag's README is its API contract. This branch documents the
 current checkout and may include APIs newer than that tag; do not infer that a
 dist tag exists from the local `package.json` version.
 
+A dist-tag install contains the prebuilt `thumbmux/core`, `thumbmux/server`,
+and `thumbmux/svelte` library entrypoints plus these docs. It contains no app
+entrypoint, demo directory, or package scripts; the surrounding application is
+host code.
+
 ```ts
 import {
   TmuxWsMux,
@@ -232,11 +239,42 @@ project:
 
 **🔒 The security-conscious way.** Same, but audit first:
 
-> Read the source files in the thumbmux package (core/, svelte/, server/).
+> Read the source files in the cloned thumbmux repository (core/, svelte/,
+> server/).
 > Flag anything that phones home, executes remote content, touches
 > files outside its packages, or handles keystrokes/session content in a way I
 > should not trust. Summarize what data flows where, then wait for my
 > go-ahead.
+
+## What the host supplies
+
+The installed package is the component and engine layer. A host application
+still owns these integration points:
+
+- **Application shell.** Supply the pages, navigation, WebSocket/HTTP routes,
+  process lifecycle, and the policy that maps users and workspaces to tmux
+  sessions. The runnable demo is a repository example, not an installed
+  entrypoint.
+- **Kill control.** `killTmuxSession()` is exported as a server primitive, but
+  thumbmux does not install a kill button or HTTP route. Supply both the UI
+  control and a protected route that authorizes the exact session before
+  calling it.
+- **Authorization on every mux message.** `createTokenGuard()` can authenticate
+  an upgrade request and authorize a parsed message with
+  `authorizeMuxMessage()`, but
+  `TmuxWsMux.handleMessage()` does not call the guard. Retain the authenticated
+  principal on the socket, authorize every parsed client message before handing
+  it to the mux, and filter every session-list delivery; see
+  [the token-guard contract](docs/security.md).
+- **Recording connection.** `FrameJournal`, `parseReplayJournal()`, and
+  `RecordingPlayer` provide recording, replay, and playback building blocks.
+  `TmuxWsMux` has no output-recording hook, so the host must feed each observed
+  full output frame to `FrameJournal.capture()` and own the recording routes
+  and player data loading; see [the recording contract](docs/recording.md).
+- **“Agent needs a human” detection.** The notification contract validates
+  host-supplied `finished` / `waiting` events, and the browser helpers can show
+  them. The host must detect agent state transitions and supply, persist, and
+  deliver those events; see [the notification contract](docs/notifications.md).
 
 ## Wiring
 
@@ -487,13 +525,18 @@ so the Codex-specific second Enter is included:
 
 ## What's inside
 
+```text
+node_modules/thumbmux/
+├── README.md         installed integration guide
+├── git-dist/core/    prebuilt framework-free TypeScript entrypoint
+├── git-dist/svelte/  Svelte 5 components, sources, and declarations
+├── git-dist/server/  prebuilt Bun/Node WebSocket engine entrypoint
+└── docs/             seven supporting Markdown documents and their media
 ```
-thumbmux/
-├── core/    framework-free TypeScript, zero runtime dependencies
-├── svelte/  Svelte 5 components (everything in the tour)
-├── server/  Bun/Node WebSocket mux engine for tmux
-└── demo/    one-command demo (Bun server + reference driver + QR)
-```
+
+The package export map exposes those implementation directories as
+`thumbmux/core`, `thumbmux/svelte`, and `thumbmux/server`. The runnable demo
+and its app shell remain in the source repository.
 
 | package | what you get |
 |---|---|
@@ -505,7 +548,8 @@ Docs: [session hub integration](docs/hub.md) ·
 [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
 [recording journal](docs/recording.md) · [notifications](docs/notifications.md) ·
-[token guard](docs/security.md) · [release process](SPLIT.md)
+[token guard](docs/security.md) ·
+[release process](https://github.com/kemkem23/thumbmux/blob/main/SPLIT.md)
 
 <details>
 <summary><b>iOS scar tissue</b> — lessons encoded in the components so you don't relearn them</summary>
@@ -560,7 +604,7 @@ Docs: [session hub integration](docs/hub.md) ·
 - [x] `filterSessionList` hook on every session-list delivery path
 - [x] All-or-nothing multi-file uploads; quadratic wrapped-URL + capture-overlap fixes
 
-**v0.7.0 — plug-and-play, finished (shipped)**
+**v0.7.0 — consumer building-block milestone (shipped)**
 - [x] `FileHistoryArchive` and `createSpawnHandler` exported — no longer host-only code
 - [x] `SessionListItem` typed and documented, with `activityAt` (no extra tmux call)
 - [x] Prompt-scan matchers are pluggable

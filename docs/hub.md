@@ -9,10 +9,10 @@ session's live tail.
 ## Session-list fields and ownership
 
 Two types, and the distinction is the point.
-[`SessionListRow`](../core/src/protocol.ts) is the **minimum the protocol
+[`SessionListRow`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is the **minimum the protocol
 requires** — `{ name: string }`, no index signature — and it is the generic
 constraint on `TmuxDriver`, `setSessionListProvider()` and
-`MuxHooks.filterSessionList`. [`SessionListItem`](../core/src/protocol.ts) is
+`MuxHooks.filterSessionList`. [`SessionListItem`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is
 the **full tmux row** the bundled `createBunTmuxDriver()` produces, and it stays
 the default type parameter, so existing code compiles unchanged.
 
