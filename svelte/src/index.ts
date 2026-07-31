@@ -150,3 +150,16 @@ export {
   type SearchKeyScope,
   type SearchKeyIntent,
 } from './term-search';
+export {
+  contentLinesChangeSource,
+  createContentUpdateGate,
+  flushContentUpdate,
+  receiveContentUpdate,
+  updatePendingContentCursor,
+  type ContentLinesChangeSource,
+  type ContentUpdate,
+  type ContentUpdateBlock,
+  type ContentUpdateGate,
+  type ContentUpdateGateResult,
+  type ContentUpdateMeta,
+} from './content-update-gate';

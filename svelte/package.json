@@ -20,7 +20,7 @@
     "src"
   ],
   "scripts": {
-    "build": "svelte-package -i src -o dist"
+    "build": "rm -rf dist && svelte-package -i src -o dist"
   },
   "dependencies": {
     "@thumbmux/core": "^0.7.1"
