@@ -6,6 +6,7 @@
  * attributes, or host callbacks all move fling work back to the main thread.
  */
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1249,6 +1250,42 @@ describe("TermView retained history budgets", () => {
     expect(gapCounts).toEqual([400, 400]);
   }, 120_000);
 
+  test("clears a retention-gap marker when its marked row is evicted", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000);
+    wheelTowardHistory(viewport, -1_000_000);
+
+    let liveLastLine = deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const marker = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(marker).not.toBeNull();
+    const markerLineId = Number(marker?.getAttribute("data-line-id"));
+    const archiveOffsetBefore = Number(viewport.getAttribute("data-archive-offset"));
+    expect(markerLineId).toBeGreaterThan(archiveOffsetBefore);
+
+    // Move the protected window below the marked row, then overflow again so
+    // prefix retention evicts the row that used to carry the marker.
+    wheelTowardHistory(viewport, 700 * lineHeight);
+    liveLastLine = deliverLiveAppend(liveLastLine, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const archiveOffsetAfter = Number(viewport.getAttribute("data-archive-offset"));
+    expect(archiveOffsetAfter).toBeGreaterThan(markerLineId);
+
+    wheelTowardHistory(viewport, -1_000_000);
+    const firstRetainedRow = viewport.querySelector<HTMLElement>(
+      `[data-line-id="${archiveOffsetAfter}"]`,
+    );
+    expect(firstRetainedRow).not.toBeNull();
+    expect(firstRetainedRow?.classList.contains("mtv-gap")).toBe(false);
+    expect(firstRetainedRow?.getAttribute("data-gap-rows")).toBeNull();
+    expect(viewport.querySelectorAll(".mtv-gap")).toHaveLength(0);
+  }, 120_000);
+
   test("live append stays within retention budgets without changing mounted rows", async () => {
     let retainedLines: string[] = [];
     const { viewport } = await prepareScrollableTermView(undefined, 240, {
@@ -1605,9 +1642,16 @@ describe("TermView retained history budgets", () => {
 });
 
 describe("TermView sparse retained-storage benchmark", () => {
-  test("100k-row Chrome heap, cold rebuild, and search stay within measured gates", async () => {
+  const playwrightChromiumPath = chromium.executablePath();
+  const playwrightChromiumAvailable = existsSync(playwrightChromiumPath);
+  const chromiumBenchmarkTest = playwrightChromiumAvailable ? test : test.skip;
+  const chromiumBenchmarkName = playwrightChromiumAvailable
+    ? "100k-row Chrome heap, cold rebuild, and search stay within measured gates"
+    : "100k-row Chrome heap, cold rebuild, and search stay within measured gates " +
+      `(skipped: Playwright Chromium is not installed at ${playwrightChromiumPath})`;
+
+  chromiumBenchmarkTest(chromiumBenchmarkName, async () => {
     const browser = await chromium.launch({
-      executablePath: "/usr/bin/google-chrome",
       headless: true,
       args: ["--js-flags=--expose-gc"],
     });
