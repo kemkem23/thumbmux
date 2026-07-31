@@ -1,0 +1,409 @@
+[
+  {
+    "name": "AppRoutes",
+    "kind": "type",
+    "signature": "38641ac3ccf525443fe09979b805e136093126d48c98f9d0991de6abb03ed1ee",
+    "tier": "S"
+  },
+  {
+    "name": "AppRoutesOptions",
+    "kind": "type",
+    "signature": "7c180d447f1bd159a74cea274b558fa75be0fe9fad0eb0f396336451ea12a8fd",
+    "tier": "S"
+  },
+  {
+    "name": "createAppRoutes",
+    "kind": "value",
+    "signature": "20fe4f5386fcf42bc737cbc99000f3d3a8704723846184220523430cd57eed7c",
+    "tier": "S"
+  },
+  {
+    "name": "createBunTmuxDriver",
+    "kind": "value",
+    "signature": "58f60edb5f5c779ebfbb855955c973236951894c11513cc3505416340602c59d",
+    "tier": "F"
+  },
+  {
+    "name": "createPrefsHandler",
+    "kind": "value",
+    "signature": "bfcf22f39a7afdb70d29a2d294527c9cea11fdec86bec91f05352243abcc1cb1",
+    "tier": "F"
+  },
+  {
+    "name": "createSpawnHandler",
+    "kind": "value",
+    "signature": "034a65b16434eb5735164819daa92667845ac14d7920b2ca579408b41a90cc66",
+    "tier": "F"
+  },
+  {
+    "name": "createTokenGuard",
+    "kind": "value",
+    "signature": "e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a",
+    "tier": "F"
+  },
+  {
+    "name": "createUploadHandler",
+    "kind": "value",
+    "signature": "2c344274715e9c0142ee46f031e52e46a74da6e38a74ab26b4d2482d3f866a28",
+    "tier": "F"
+  },
+  {
+    "name": "DEFAULT_MAX_BYTES",
+    "kind": "value",
+    "signature": "e29d79e7cb2b203715722d22a1ebbad115ba92a29b81c9d203f50c74515453f3",
+    "tier": "D"
+  },
+  {
+    "name": "DEFAULT_MAX_ROOT_BYTES",
+    "kind": "value",
+    "signature": "08e2cd06a84a469e01729514b799b79b3b9fe09bed80c0a686ba5a18bedd5517",
+    "tier": "D"
+  },
+  {
+    "name": "exactTmuxPaneTarget",
+    "kind": "value",
+    "signature": "9450364fef99d3856cf3670274772742808aea99de0ec947a668833fb8b64d27",
+    "tier": "F"
+  },
+  {
+    "name": "exactTmuxTarget",
+    "kind": "value",
+    "signature": "26925b4f8d5a3933894d2f1b4b64c0eb0d902ec70d1a20d563e539d547febc0a",
+    "tier": "F"
+  },
+  {
+    "name": "FileHistoryArchive",
+    "kind": "value",
+    "signature": "e26ac7a89e3596e963c1376c86f5ec09aa86c45cad26b45d5eeb4a744ed0d180",
+    "tier": "F"
+  },
+  {
+    "name": "FileHistoryArchiveOptions",
+    "kind": "type",
+    "signature": "8b5657222100d0e2271a7f79fcf5095ddd57c8b058250a17bee4f611330c6c9d",
+    "tier": "F"
+  },
+  {
+    "name": "FrameJournal",
+    "kind": "value",
+    "signature": "fa5a9ce23b0ca8a8afd5be8893dfc1bfbd3ce58d9d9378f6f84d729e2e01a9cc",
+    "tier": "F"
+  },
+  {
+    "name": "FrameJournalErrorReport",
+    "kind": "type",
+    "signature": "8052be33bcfc363cf11bfd8fef5adc98465596659461509825f01019f6b112e8",
+    "tier": "F"
+  },
+  {
+    "name": "FrameJournalOptions",
+    "kind": "type",
+    "signature": "f0657e3ca19ac67e564aab6a18667ad8e87df2b6dd3e2e8ce808f645b0d6002c",
+    "tier": "F"
+  },
+  {
+    "name": "FrameJournalRecordV1",
+    "kind": "type",
+    "signature": "0063a376f89ca1e53a721bfeebe65526526b324713e51f4210f8e873e16626f3",
+    "tier": "F"
+  },
+  {
+    "name": "FrameJournalStorage",
+    "kind": "type",
+    "signature": "fff53622125082ee6da0aaaa36d78000451bd996aac53ee16364bbc66e19edc6",
+    "tier": "F"
+  },
+  {
+    "name": "HistoryArchiveLike",
+    "kind": "type",
+    "signature": "94e8d1e7584ca42b059c6f2ccaf1f49924d6d51bf2a615f4e3ca5e340d2e56cf",
+    "tier": "F"
+  },
+  {
+    "name": "HistoryPage",
+    "kind": "type",
+    "signature": "9e1470a9e75f6f3d4ea84079f5fbffb3ceb2b041bd5983c6fe84ad13a44afa34",
+    "tier": "F"
+  },
+  {
+    "name": "HttpAuthFailure",
+    "kind": "type",
+    "signature": "411dfbe933cfc716d4c82a79fd44ea92114dc77f24be9fcc2f55e754e14cf062",
+    "tier": "F"
+  },
+  {
+    "name": "HttpAuthorizationContext",
+    "kind": "type",
+    "signature": "1e3b65e8d9cd5fd7a0a636508eef28d488d84748b3f1fd045c3802cc703511cc",
+    "tier": "F"
+  },
+  {
+    "name": "HttpAuthResult",
+    "kind": "type",
+    "signature": "d82b5cf01a39412e58efcb996d2ce765def3e23eaf376679cc092003081fae90",
+    "tier": "F"
+  },
+  {
+    "name": "HttpAuthSuccess",
+    "kind": "type",
+    "signature": "7e584837c9d903163c82941c5dada8defd1b4cd93b0f8db29111e588e6963a65",
+    "tier": "F"
+  },
+  {
+    "name": "HttpOperation",
+    "kind": "type",
+    "signature": "bc0c7b28c9a74368016c90ba58ef5d9d79da55d9574e2e5d98b83101e9e24c5b",
+    "tier": "F"
+  },
+  {
+    "name": "InvalidateSessionOptions",
+    "kind": "type",
+    "signature": "1730e36ec4251d587e6d18985ede5ffde16f34f458a2d89c1cdbb2fcd0fb9a62",
+    "tier": "F"
+  },
+  {
+    "name": "JournalRecordV1",
+    "kind": "type",
+    "signature": "b7f07d5cd2aed9bafb8085b4cee44e809807437b44f97ae454c3c373612e01fe",
+    "tier": "F",
+    "deprecated": {
+      "since": "0.8.0",
+      "removeNoEarlierThan": "0.9.0",
+      "replacement": "FrameJournalRecordV1"
+    }
+  },
+  {
+    "name": "killTmuxSession",
+    "kind": "value",
+    "signature": "5da2f4ccbc6c1f7588ea43411e332b4e803f6b3377f11f6333ad45770766b79f",
+    "tier": "F"
+  },
+  {
+    "name": "looksLikeTailRepaint",
+    "kind": "value",
+    "signature": "db3e52c8fdf50520a271782667617a90534b510641ddb05a5d2154fe5ce93fa2",
+    "tier": "X"
+  },
+  {
+    "name": "MuxAuthFailure",
+    "kind": "type",
+    "signature": "7ca7e0bb688fcbeb40f5a0b3d696257bd7b3b0ed235c8e4e3aa7e892dd82c169",
+    "tier": "F"
+  },
+  {
+    "name": "MuxAuthResult",
+    "kind": "type",
+    "signature": "92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9",
+    "tier": "F"
+  },
+  {
+    "name": "MuxAuthSuccess",
+    "kind": "type",
+    "signature": "7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40",
+    "tier": "F"
+  },
+  {
+    "name": "MuxBackpressureOptions",
+    "kind": "type",
+    "signature": "33f126b3cd7ec49b0fdb0fdb8b933ea7ff05fe01a6486b3e582f0875cc45e13f",
+    "tier": "F"
+  },
+  {
+    "name": "MuxHooks",
+    "kind": "type",
+    "signature": "668365a16242fad5251ad3bdcd0b83500c39c6d3f8508e2051404a87c4cd056a",
+    "tier": "F"
+  },
+  {
+    "name": "PipeManagerLike",
+    "kind": "type",
+    "signature": "849b31438e5efa7ae50b5d0442880f2f47d700286fc7f215131234f8d3e948a6",
+    "tier": "F"
+  },
+  {
+    "name": "PrefsHandlerOptions",
+    "kind": "type",
+    "signature": "357dc9487b56d6544972e7840d8d810d895dff4bf49111da39b7f653b10110bc",
+    "tier": "F"
+  },
+  {
+    "name": "RawCursorState",
+    "kind": "type",
+    "signature": "e3408b6f523f1821118def89a0e288ff503891abf1229ac7b1fc70d8a4a76cb4",
+    "tier": "F"
+  },
+  {
+    "name": "RecoveredSessionState",
+    "kind": "type",
+    "signature": "bcd4777df5c92f7d08bca2687a72854e4ddce8d82e004683988ced180f44199d",
+    "tier": "F"
+  },
+  {
+    "name": "SessionProfile",
+    "kind": "type",
+    "signature": "a40fe8a0eddf98ceb5c3defaf4e7db969b5282c712babbaad3d5aa68d7060613",
+    "tier": "F"
+  },
+  {
+    "name": "SessionRow",
+    "kind": "type",
+    "signature": "68e9c4983c7a7862e5c6b0d64f68f6fd591ff6ccb9262dabb3314f027ee7c1ff",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnHandlerError",
+    "kind": "value",
+    "signature": "5d68bd28733fd9526f17f2eacf3feb18de0c6189da0007ff7d3e0d8abf77b798",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnHandlerOptions",
+    "kind": "type",
+    "signature": "4bb3333c6570c4f23f086e39ec01f7aa363fa84c11fb569cdcafb4928d4fe43d",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnNameContext",
+    "kind": "type",
+    "signature": "7cbb188b007ff904d24da2a9da523f41ed779165ca05e9f1da147308dd7e2ae7",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnPayload",
+    "kind": "type",
+    "signature": "35e8aa249369c4ac95690dd28def6ef301fed877c273706661e867bcfd3c6278",
+    "tier": "F"
+  },
+  {
+    "name": "spawnTmuxSession",
+    "kind": "value",
+    "signature": "57023d14b6d393a4f0df1ca8a39707fb9b28a5f197f6a44a5f265b7a8cb31ec8",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnWorktreeCleanupContext",
+    "kind": "type",
+    "signature": "9154c829319372ae230474daab4fcba31deaed13119e798297f6bef54565ae76",
+    "tier": "F"
+  },
+  {
+    "name": "SpawnWorktreeContext",
+    "kind": "type",
+    "signature": "afe4ef3422551a0d776b941034b03b2dafd0831fd52407664b23310f061e0b3e",
+    "tier": "F"
+  },
+  {
+    "name": "stableOverlap",
+    "kind": "value",
+    "signature": "0ca24172cae09520bf59ad50f59474a77e3425e0ab141dc58f02ec2d92e7caad",
+    "tier": "X"
+  },
+  {
+    "name": "TmuxDriver",
+    "kind": "type",
+    "signature": "24bc3378896f96d60b02f619a3a0307625fa76338351447ccff4d7186fadf903",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxTargetMode",
+    "kind": "type",
+    "signature": "54a1e133a009de696ce42dceaaa1be0843a25bfe72e34722734c12c4ba6fda4c",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxTargetOptions",
+    "kind": "type",
+    "signature": "13a1aa638a6314517376056450f08eb2b4f511758ea5c36aab5f90ade9a42434",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxWsMux",
+    "kind": "value",
+    "signature": "75a3c00cd4d79abdf8fe8d434b8cf7dafefdcebfc3a9c775de42036fb8901d49",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxWsMuxOptions",
+    "kind": "type",
+    "signature": "5532e34aaf2e9bdca082d376f02cb0f91d72b446d5d2003704976e5235be2431",
+    "tier": "F"
+  },
+  {
+    "name": "TokenAuthFailure",
+    "kind": "type",
+    "signature": "d7db3d9a01d70bdea329155328765d2c6ed6eae51db06a85967c92719ed936fd",
+    "tier": "F"
+  },
+  {
+    "name": "TokenAuthResult",
+    "kind": "type",
+    "signature": "5e6332dff2c933606d3ef1ab59650623d5f0d07138b05399cbe2c78ab12a558e",
+    "tier": "F"
+  },
+  {
+    "name": "TokenAuthSource",
+    "kind": "type",
+    "signature": "ff5f75415b9cc06c2d3d0cfc14d08bf86b0a781b0c8db5d4512f9975dd197e20",
+    "tier": "F"
+  },
+  {
+    "name": "TokenAuthSuccess",
+    "kind": "type",
+    "signature": "effbe68e5945cb8278fddad4cc30a26d07783f647997c3d87dcf15dce41a933b",
+    "tier": "F"
+  },
+  {
+    "name": "TokenGrant",
+    "kind": "type",
+    "signature": "bac4ade8b681eff7cfd2d85a2ffb44faa335ea58d707a6062fa848db01d160e1",
+    "tier": "F"
+  },
+  {
+    "name": "TokenGuard",
+    "kind": "type",
+    "signature": "1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630",
+    "tier": "F"
+  },
+  {
+    "name": "TokenGuardErrorCode",
+    "kind": "type",
+    "signature": "078f9bd3fad08b708b39379177248fab97268d52699315de9d55be3b79285cdf",
+    "tier": "F"
+  },
+  {
+    "name": "TokenGuardOptions",
+    "kind": "type",
+    "signature": "64dc336fffa59e820cf148f1cf000c23af9829fe29e5b72fe4df6c594bc18273",
+    "tier": "F"
+  },
+  {
+    "name": "TokenPermission",
+    "kind": "type",
+    "signature": "330887c7caf89058ae440ec6983120be3133dd5dc46b2dacdda4af31b0928410",
+    "tier": "F"
+  },
+  {
+    "name": "TokenPrincipal",
+    "kind": "type",
+    "signature": "72ca03bdf9f25aafa27a652fa1f6e7075b1c4a3f6300e09162b51a4ebb443088",
+    "tier": "F"
+  },
+  {
+    "name": "TokenScope",
+    "kind": "type",
+    "signature": "1256447bc3a084844ebcbc0a38cfe92af8e6fbf8ecd5aec9aaf750d2837a57cf",
+    "tier": "F"
+  },
+  {
+    "name": "UploadHandlerOptions",
+    "kind": "type",
+    "signature": "cdde461be9595c9f82ac220106bc67c4e926b83d2a267f4ab3db62b5850454ef",
+    "tier": "F"
+  },
+  {
+    "name": "WsLike",
+    "kind": "type",
+    "signature": "8e30dca8557d5e820580a72db3d928b7bea037fb28841d896b60fff0cb111aa0",
+    "tier": "F"
+  }
+]

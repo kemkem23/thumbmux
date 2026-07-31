@@ -39,6 +39,11 @@ jobs:
         run: bun run build:git-dist
       - name: root git-dist consumer smoke
         run: bun run smoke:git-dist
+      - name: public API contract gate
+        # Last gate before the -dist tag is pushed. A release that changes a
+        # frozen signature, or adds a public name with no declared tier, must
+        # not reach a consumer — this is the promise CONTRACT.md makes.
+        run: bun run contract
       - name: commit dists and push ${GITHUB_REF_NAME}-dist
         run: |
           git config user.name "thumbmux-release"

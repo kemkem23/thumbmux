@@ -1,0 +1,818 @@
+[
+  {
+    "name": "ActionFab",
+    "kind": "component",
+    "signature": "fc40c190d9fe50748a489d9a0077218518fb0c75db260b6f3287bdd1218232d6",
+    "tier": "F"
+  },
+  {
+    "name": "BrowserLocationLike",
+    "kind": "type",
+    "signature": "7902c14a6e5e23dd28d3131979deb6e85dd499a010e0724000329fdcd3483224",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserNavigatorLike",
+    "kind": "type",
+    "signature": "b20d007194b4e40f55abc6949331e606f411e34d0981eea123e7059be7841112",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserNotificationApiLike",
+    "kind": "type",
+    "signature": "c3e3320c8868b216d7460e964bb1808961f9c79f498e6c72a30f5e915eb18515",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserNotificationEnvironment",
+    "kind": "type",
+    "signature": "da4e96d70bd10b68af17adad122b7ecd9cb89629c657126e9ce545d75186c207",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserServiceWorkerContainerLike",
+    "kind": "type",
+    "signature": "6dc2806c301a2ee4d6d7d038aa5c87b21aad147de43942b29a88f4d771487822",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserServiceWorkerRegistrationLike",
+    "kind": "type",
+    "signature": "b3b74e66fa8f247bb506a8830fffc313a694572255de937f9a4e0adce745877f",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserServiceWorkerRegistrationOptions",
+    "kind": "type",
+    "signature": "ee67a8eec855d454e4b1137e34a03368ff45938f48bbe6cf8dc7e3f3247e8ced",
+    "tier": "S"
+  },
+  {
+    "name": "BrowserServiceWorkerShowOptions",
+    "kind": "type",
+    "signature": "03d494aa54ee40c5c1c2a97dca36ccf6c79be5db38901574c308376379247aa8",
+    "tier": "S"
+  },
+  {
+    "name": "buildSessionGridModel",
+    "kind": "value",
+    "signature": "71d621256604002e483d06a6bf0799e8f235052b65cbeba5d7b5cb654b4c0383",
+    "tier": "S"
+  },
+  {
+    "name": "clampPlaybackElapsed",
+    "kind": "value",
+    "signature": "e078ed1b9d39b724911dbc9f5078d8ef563b3c12733ca2dae584c188501afce1",
+    "tier": "S"
+  },
+  {
+    "name": "ClickContext",
+    "kind": "type",
+    "signature": "3a4a9cc7f2ba59930a0f64b9eb62e557289c6320e7db55d32a473b940f56752c",
+    "tier": "S"
+  },
+  {
+    "name": "ClickErrorCode",
+    "kind": "type",
+    "signature": "81de08ad27b8884f92ae79b9064199e41949cf1b44aa266dd068e7c3c8cb02ec",
+    "tier": "S"
+  },
+  {
+    "name": "ClickResult",
+    "kind": "type",
+    "signature": "d1c9696163a955cd17d83705c8133dd142b68649291e35aea4e4507ded9f0d81",
+    "tier": "S"
+  },
+  {
+    "name": "ClientHost",
+    "kind": "type",
+    "signature": "414323c432d8cf25751457b36d3ab8c29e30cbd59d68f6bf1ae771b9e37f52fe",
+    "tier": "S"
+  },
+  {
+    "name": "ComposerDock",
+    "kind": "component",
+    "signature": "a355f9edc5e226d70dbba06013078252ba33e5e1692b62dc7f44ea6830ca4ee0",
+    "tier": "F"
+  },
+  {
+    "name": "ComposerLabels",
+    "kind": "type",
+    "signature": "7abb256124182f8adbb309fd56dcbf42243181647e2f3ce1d336a0fe5eb975ae",
+    "tier": "F"
+  },
+  {
+    "name": "configureTmuxMux",
+    "kind": "value",
+    "signature": "dc2d1c0faa490e65144307f9f2f4f83ec167a2c91b1fef6e5c182bca97eb00fa",
+    "tier": "F"
+  },
+  {
+    "name": "contentLinesChangeSource",
+    "kind": "value",
+    "signature": "e25a6915170749b17983c0a4775eb1fadd2372080c9793920912cfa4c9c446bc",
+    "tier": "X"
+  },
+  {
+    "name": "ContentLinesChangeSource",
+    "kind": "type",
+    "signature": "dcd3817fec8f8751cf4c89edbea683b6b77f9699155811049626f884e55f22cf",
+    "tier": "X"
+  },
+  {
+    "name": "ContentUpdate",
+    "kind": "type",
+    "signature": "282d3b898b3a77f7c9241da754a523eec80925ff9deab2b786e83f969635f1ea",
+    "tier": "X"
+  },
+  {
+    "name": "ContentUpdateBlock",
+    "kind": "type",
+    "signature": "b57d2adbdfd46fb49979607a7b157e4d6971c98ec62e395f8bdbb75fa64503c1",
+    "tier": "X"
+  },
+  {
+    "name": "ContentUpdateGate",
+    "kind": "type",
+    "signature": "d959df883d6489fd2d4dea6851e4287adbf4ede786e257ddd1951f0548fc43e4",
+    "tier": "X"
+  },
+  {
+    "name": "ContentUpdateGateResult",
+    "kind": "type",
+    "signature": "a154c9266b7c4532af4fae9286694418be29c71314dc535ba727b536a8cadc25",
+    "tier": "X"
+  },
+  {
+    "name": "ContentUpdateMeta",
+    "kind": "type",
+    "signature": "11d505f4c6264720108a90513c54825ba535248b976caf369e589cbef467116c",
+    "tier": "X"
+  },
+  {
+    "name": "contrastRatio",
+    "kind": "value",
+    "signature": "81d06a51df353a2f33807e3795c47b6926a326e6162383dd5d4ab84911cbd4da",
+    "tier": "S"
+  },
+  {
+    "name": "createContentUpdateGate",
+    "kind": "value",
+    "signature": "f7dc5c4b652480cc3cdd141d85c300ad50ea3c5776cf998ffc4c1dd6a25e7fce",
+    "tier": "X"
+  },
+  {
+    "name": "createFrameHtmlCache",
+    "kind": "value",
+    "signature": "835c9be1561a549ba25537f075961e902e851d35ac5d32b0cdc99914f75b8514",
+    "tier": "S"
+  },
+  {
+    "name": "CreateFrameHtmlCacheOptions",
+    "kind": "type",
+    "signature": "cca326c3a1f2ee9fe6b495891a5928547461f055b34ced3925c696738d2ea4af",
+    "tier": "S"
+  },
+  {
+    "name": "createLocalPrefs",
+    "kind": "value",
+    "signature": "f9cea87f60e4df421eb79df998e08d12168e2e78788831fb98219866543780a7",
+    "tier": "F"
+  },
+  {
+    "name": "createPlaybackController",
+    "kind": "value",
+    "signature": "714e214f8f2e6e09ccf3b7fe3cb45e4d30b2f41d12b5e897917ab8b0ac39ac51",
+    "tier": "S"
+  },
+  {
+    "name": "createServerPrefs",
+    "kind": "value",
+    "signature": "98e551da1523ad42a9c1806c2fbfd7be18da85c4c52f990289087d6e0698079c",
+    "tier": "F"
+  },
+  {
+    "name": "deriveThumbnailPalette",
+    "kind": "value",
+    "signature": "fb10b7a5688cfaaa86825e86fa03644829c4ebf95a0e21e321f14f468e43d42c",
+    "tier": "S"
+  },
+  {
+    "name": "DesktopKeys",
+    "kind": "component",
+    "signature": "7c3920146f2823974a76b992f4b397a6458724fdce911f190440f2f00a5d4e92",
+    "tier": "F"
+  },
+  {
+    "name": "DesktopKeysProps",
+    "kind": "type",
+    "signature": "961044864d8aae45b6a234d8c0705d5b91d8cd20764690861af686379309572e",
+    "tier": "F"
+  },
+  {
+    "name": "DesktopPasteInfo",
+    "kind": "type",
+    "signature": "6dcde53684f2822a6889b4100d602300bfe4f423b24a3305a90a9fcaa2559910",
+    "tier": "F"
+  },
+  {
+    "name": "displayStateLabel",
+    "kind": "value",
+    "signature": "520c0e728959e8c3ba7c6121fd1147202cdf06e35f47264daee7b96ed7fe5937",
+    "tier": "S"
+  },
+  {
+    "name": "DpadSheet",
+    "kind": "component",
+    "signature": "8478de8dfd787418acd2e7395db1b4e2913bee37639933381eb0d0150f2988b0",
+    "tier": "F"
+  },
+  {
+    "name": "FabAction",
+    "kind": "type",
+    "signature": "c082b6f93e05ca56ac03b02c0c7b98b56ccd98128a99d4445a3b5cffbf28008f",
+    "tier": "F"
+  },
+  {
+    "name": "flushContentUpdate",
+    "kind": "value",
+    "signature": "08790304f09c01066e1dd9576148e8009109cbb1f995f642d8d1fe64f1699a90",
+    "tier": "X"
+  },
+  {
+    "name": "FRAME_HTML_CACHE_LIMIT",
+    "kind": "value",
+    "signature": "05907d9f7c912864e75fed15a2543212fa373692f89a833396d5053ae200f095",
+    "tier": "S"
+  },
+  {
+    "name": "FrameHtmlCache",
+    "kind": "type",
+    "signature": "9f98450727c35d3946490d6eb0ce75d0be5c2b4db4a16c69ef02cd0b55a1cca6",
+    "tier": "S"
+  },
+  {
+    "name": "FrameHtmlCacheInput",
+    "kind": "type",
+    "signature": "124c75e0c43e83e8c30945e11a263afa1e57bd2260189a026070e4328e3a0d97",
+    "tier": "S"
+  },
+  {
+    "name": "FrameHtmlLineToHtml",
+    "kind": "type",
+    "signature": "1676a299ea5c940c7a5c6658db3c62561fc1a1fb7116a24dbb52db626bcc6fbd",
+    "tier": "S"
+  },
+  {
+    "name": "GridFilterOption",
+    "kind": "type",
+    "signature": "ce23c189ae059c1e862fc51be93f4e3e5786fd89f0d8f69a5668918f5954920e",
+    "tier": "F"
+  },
+  {
+    "name": "GridOrder",
+    "kind": "type",
+    "signature": "0fbc1f9e7ca47b5908fca1f52719f755cbe57f94448304f3663f2cc175afd9f2",
+    "tier": "F"
+  },
+  {
+    "name": "GridSession",
+    "kind": "type",
+    "signature": "5b4f76c025f66f18c9ef20fe8052e8c279d95ed4ae2085c148ef03d4d3326bef",
+    "tier": "F"
+  },
+  {
+    "name": "GridSessionState",
+    "kind": "type",
+    "signature": "91306b7386a24a74ed8b607353bbf92eb45230af37d36bab87fd79e9bc730a18",
+    "tier": "F"
+  },
+  {
+    "name": "handleNotificationClickEvent",
+    "kind": "value",
+    "signature": "5bfa2edf775cfdb91df1972d0ef45c492ec5d950d9cc4d30a3d3e0e7069e3231",
+    "tier": "S"
+  },
+  {
+    "name": "handlePushNotificationEvent",
+    "kind": "value",
+    "signature": "695da7dcd41d35cd8fff0684e0a15d038930901ed89e9ba632cf4c791c57f6b5",
+    "tier": "S"
+  },
+  {
+    "name": "LaunchContext",
+    "kind": "type",
+    "signature": "18425b4c30298446c98b8a74fbebf0a9f22ced016461b31c6fef768a53f34044",
+    "tier": "F"
+  },
+  {
+    "name": "LaunchSheet",
+    "kind": "component",
+    "signature": "72a942fcf4398230c2cbe2e2a0581a679b186cbc4db4d8ab2fccbf773a36c927",
+    "tier": "F"
+  },
+  {
+    "name": "ListenerContext",
+    "kind": "type",
+    "signature": "41c3cd6cb49b90fd6371054eaa0f821171f3ffce4c3563c6fbee1b660628c95a",
+    "tier": "S"
+  },
+  {
+    "name": "LocalNotificationResult",
+    "kind": "type",
+    "signature": "2f779c251d361d4437860aa370cb3c5ac86e8ba707668ee5040a232c25a68b1b",
+    "tier": "S"
+  },
+  {
+    "name": "lookupReplayFrame",
+    "kind": "value",
+    "signature": "0cbda698ac24c79ee706e47efabf65ee51f462304812e37181f06bc7931911e3",
+    "tier": "S"
+  },
+  {
+    "name": "moveActiveIndex",
+    "kind": "value",
+    "signature": "02f3016ea5c376b74b862d9861a0537286a33eaed223fe4305a36ab20a550605",
+    "tier": "S"
+  },
+  {
+    "name": "NewTerminalSheet",
+    "kind": "component",
+    "signature": "7daf03819a7919f20c5287660f94c467680cae869c626da7370f3b6dac1ae2c3",
+    "tier": "F"
+  },
+  {
+    "name": "NotePanel",
+    "kind": "component",
+    "signature": "3f40b3e6f3c298def933506d359e6e9010d8954818a4447579f4348c62d87ff7",
+    "tier": "F"
+  },
+  {
+    "name": "NotificationClickEventLike",
+    "kind": "type",
+    "signature": "420601e2b1e571b26fbb68e492c4c7e8fbc2c3029cfc652ceb5b9bb7a7ee7d59",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationLike",
+    "kind": "type",
+    "signature": "20c2897e8b616e8f97a0a4997a48103591d55da4e2160d41bec1cd6aa9b330ab",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationListeners",
+    "kind": "type",
+    "signature": "9784a192d06d4c6699f2386dd9bd792866f5f5cbb26ea555aad150bc67b6ef91",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationPermission",
+    "kind": "component",
+    "signature": "812e92014da0250dc41295e8dc92b31be31fb715032a81e78e8834c6cabee872",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationPermissionError",
+    "kind": "type",
+    "signature": "c46722ce1449c0f8c171eebfe59fc50b419a11e9d562f98574a15aded9d25741",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationPermissionErrorPhase",
+    "kind": "type",
+    "signature": "08e360cbfd23ede8f9da3bd3e482f5624a984aaab38cca05b599e6de4766f5d1",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationPermissionProps",
+    "kind": "type",
+    "signature": "cee6465ef861afd266816113175e3b969fa322b7a0107a51f6164f915930a404",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationPermissionState",
+    "kind": "type",
+    "signature": "f71a1f2a0a1cb3d38fa3d3cc155f652b42c3ce815f556bb52901c289b1d881e6",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationResult",
+    "kind": "type",
+    "signature": "9716ded43730e4b0dc9f525752c9b907e65a932209c878900a94247c19916c47",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationResultError",
+    "kind": "type",
+    "signature": "4d5686832cc31d5ac5e43e262a266ba1d5d05fec172d52908ee8c3482fe296ae",
+    "tier": "S"
+  },
+  {
+    "name": "NotificationResultSuccess",
+    "kind": "type",
+    "signature": "2f224f7057d8a647e1b7a58590033e7b4bfd2ecb15346ac9d67075fa5d78b375",
+    "tier": "S"
+  },
+  {
+    "name": "parseNotificationPayload",
+    "kind": "value",
+    "signature": "23c468b42709f8b07eaa234db4cc4ef12bce70cdba82a2d1e67f6fc1ff842b1c",
+    "tier": "S"
+  },
+  {
+    "name": "ParsePayloadErrorCode",
+    "kind": "type",
+    "signature": "ba9bc005689dc2d99821fef5148c2666f5541647b9690adbc99c3f8d72bb9436",
+    "tier": "S"
+  },
+  {
+    "name": "ParsePayloadOptions",
+    "kind": "type",
+    "signature": "35376de029c533880b7e0ac6247fbf12d93e13baf4be4f1f2af59c7032004056",
+    "tier": "S"
+  },
+  {
+    "name": "ParsePayloadResult",
+    "kind": "type",
+    "signature": "c851b6077d23d3b9ce72babeef98f2654794e2852e8ae470d2f8beef16b99b33",
+    "tier": "S"
+  },
+  {
+    "name": "PermissionRequestResult",
+    "kind": "type",
+    "signature": "ca62e28b0f2f571319e6a7410b61ba6f6736ae81d994a633276b3f31552ba54e",
+    "tier": "S"
+  },
+  {
+    "name": "PLAYBACK_SPEEDS",
+    "kind": "value",
+    "signature": "b5c78c1ec2dd7894e71be071fc881617ac8b98a46753bdf97f64d2cdc73a8ec1",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackCanceller",
+    "kind": "type",
+    "signature": "2f92be3b097e818be9b65c1128aeb66e22943f95bfed83d434130548ad4eaf03",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackChangeObserver",
+    "kind": "type",
+    "signature": "e0d4e587dfce0ae0bd4cb2b03efeaf26e6adc5511a81d1daf3d80f3a9c676954",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackControllerOptions",
+    "kind": "type",
+    "signature": "f656b926e8cddffb1a492acfce867c47510e9a6155654bee77f6ac71dc253323",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackNow",
+    "kind": "type",
+    "signature": "733fcbb9ff178d5781bf02ff375d0e337c6244cc8b19764c0871a9585d19df65",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackScheduler",
+    "kind": "type",
+    "signature": "08954c981ac0650ae524c7b58a02b3fd09a4cdf78a2d582963a00d361aeb9ee0",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackSnapshot",
+    "kind": "type",
+    "signature": "119f83e5af3b7bd5bbb9c77df07cb40e27dec775ed8b33f57f83910c4e1fa585",
+    "tier": "S"
+  },
+  {
+    "name": "PlaybackSpeed",
+    "kind": "type",
+    "signature": "3c1391cb6443afde8b3c0a885193c87404acda1ec053bc2c2213a178baa28ac8",
+    "tier": "S"
+  },
+  {
+    "name": "PromptsPanel",
+    "kind": "component",
+    "signature": "4a4559a0a842d1ad77d32395d5ffb4708ece31f9bdd67084b90a943a6f3753ac",
+    "tier": "F"
+  },
+  {
+    "name": "PushContext",
+    "kind": "type",
+    "signature": "4852cb107c9e1c948829adb7f69cf44d75e3d76dc00e67a2383b4bfba1301404",
+    "tier": "S"
+  },
+  {
+    "name": "PushErrorCode",
+    "kind": "type",
+    "signature": "c4d82eaa56e9c12df2959feb523bb10e473b86b491594c07cefc270bdcc04354",
+    "tier": "S"
+  },
+  {
+    "name": "PushEventLike",
+    "kind": "type",
+    "signature": "59804806f47160976c14a5f629f2c518106c91d35c45543830731da36a6b5c03",
+    "tier": "S"
+  },
+  {
+    "name": "PushPayloadDataLike",
+    "kind": "type",
+    "signature": "50489e03d26d3798df7a44722a685441be09936ccfd8edf2ef57c0244f1614e7",
+    "tier": "S"
+  },
+  {
+    "name": "PushResult",
+    "kind": "type",
+    "signature": "82bbb4e6249e2b4ea25cee57bd4a20ee3128590a73d48adb2e76a9e2bf40f1a1",
+    "tier": "S"
+  },
+  {
+    "name": "readableColorOn",
+    "kind": "value",
+    "signature": "503269d4043dcdad50943dd1b78e9f066446fbc242f587803d5c5e4db20a3e0a",
+    "tier": "S"
+  },
+  {
+    "name": "receiveContentUpdate",
+    "kind": "value",
+    "signature": "d6e3d5860a8100d30e1516cec8410cadd2f6daf2388145314cc89e662724ace0",
+    "tier": "X"
+  },
+  {
+    "name": "RECORDING_PLAYER_TEST_IDS",
+    "kind": "value",
+    "signature": "6fd3fa00b55d302a5c86e8f690d26842c47c70b2660975b7728d446dff366737",
+    "tier": "S"
+  },
+  {
+    "name": "RecordingPlaybackController",
+    "kind": "type",
+    "signature": "d486cfbbe8ed8f83370ec211428029d8e1cd9effdab30e21fef4d9e3c996e1d1",
+    "tier": "S"
+  },
+  {
+    "name": "RecordingPlayer",
+    "kind": "component",
+    "signature": "75302dd611437457c7730f8b8598468d61443a24b0faa818c46d7726755e34b9",
+    "tier": "S"
+  },
+  {
+    "name": "registerNotificationServiceWorkerHandlers",
+    "kind": "value",
+    "signature": "427f9502f890c1caa36d7874c26b71c58b509d87782b0ccc9eeaa2314a06b781",
+    "tier": "S"
+  },
+  {
+    "name": "registerServiceWorker",
+    "kind": "value",
+    "signature": "8bd245b19f8449ab7d1cc0d5c1a8189e350e6365c8af684db51d5753a6adef4c",
+    "tier": "S"
+  },
+  {
+    "name": "RegisterServiceWorkerInput",
+    "kind": "type",
+    "signature": "13b663dba6813f1e77bde455c89acd24ce0431bb523c21dc8a28d64e218dc979",
+    "tier": "S"
+  },
+  {
+    "name": "RegistrationErrorCode",
+    "kind": "type",
+    "signature": "465d22db1cb47823e078596dc4275aae09793f591e2f2995298303302a3b9ca1",
+    "tier": "S"
+  },
+  {
+    "name": "RegistrationForPush",
+    "kind": "type",
+    "signature": "8d2d04c5f49933987cdd7e798cf9d5e6906a67c45834aaa124da170fc8a0b812",
+    "tier": "S"
+  },
+  {
+    "name": "RegistrationResult",
+    "kind": "type",
+    "signature": "5f7d137072cdf17141bf351d1a5933785bb880e73e1dee93106a4e6dbff26681",
+    "tier": "S"
+  },
+  {
+    "name": "ReplayJournalLike",
+    "kind": "type",
+    "signature": "c11b7cc142655bb2f596d990bf4715f6a78a7d018c5805139245a1da234e7e19",
+    "tier": "S"
+  },
+  {
+    "name": "requestNotificationPermission",
+    "kind": "value",
+    "signature": "ab8070151cf5221def66040e428ae74e9c6067c267ec783b5afa315b47185f0b",
+    "tier": "S"
+  },
+  {
+    "name": "ResolvedBrowserNotificationEnvironment",
+    "kind": "type",
+    "signature": "29188c58cac3e1f42cacf629eac0ccb6bf5f70bfd0a42ef695ca55268ec27e5e",
+    "tier": "S"
+  },
+  {
+    "name": "resolveNotificationEnvironment",
+    "kind": "value",
+    "signature": "7d06b76f64856fdab1d6217a0defe5577a6b467c6a09b055687237d59979f4a9",
+    "tier": "S"
+  },
+  {
+    "name": "resolveNotificationPermissionState",
+    "kind": "value",
+    "signature": "d44f0323736012db798d6983083cdfb58bc03215f94baab1743fd8104aff7931",
+    "tier": "S"
+  },
+  {
+    "name": "resolveReplayFrame",
+    "kind": "value",
+    "signature": "8e22d4d0a13cf437c148c40fe1cd4d2c04e98ddbf5afff265412878134e996ab",
+    "tier": "S"
+  },
+  {
+    "name": "ResolveReplayFrameCode",
+    "kind": "type",
+    "signature": "1cabe571b321fd20199c199da966483764cd353c27a0620f108faee22d3e1bcf",
+    "tier": "S"
+  },
+  {
+    "name": "ResolveReplayFrameFailure",
+    "kind": "type",
+    "signature": "ea5dc0948915fc0c6a7e09c839509c3b8a9d63befe740fae31a2f5c0a739f0ac",
+    "tier": "S"
+  },
+  {
+    "name": "ResolveReplayFrameResult",
+    "kind": "type",
+    "signature": "bb04d15573407ec297031da8856264cd7b70ac5cbde8c5610f78598857112005",
+    "tier": "S"
+  },
+  {
+    "name": "ResolveReplayFrameSuccess",
+    "kind": "type",
+    "signature": "9da84e12c591f2933dacbc8a6dd8482868979f60d682141623a881b17515170a",
+    "tier": "S"
+  },
+  {
+    "name": "SearchDirection",
+    "kind": "type",
+    "signature": "828c0006bd9ea290749e94c06cc116ea6deb5a679df0dba880c8022247e09750",
+    "tier": "X"
+  },
+  {
+    "name": "searchKeyIntent",
+    "kind": "value",
+    "signature": "0535791c9d3ce4495797d58c77367157ec5b64cedc988df24f4450ca81386c9a",
+    "tier": "S"
+  },
+  {
+    "name": "SearchKeyIntent",
+    "kind": "type",
+    "signature": "56e145ee22924f0fe4d2be914be052a79341977f99bcad5b727ce6fa3224d065",
+    "tier": "X"
+  },
+  {
+    "name": "SearchKeyScope",
+    "kind": "type",
+    "signature": "9f9cd5e6303fa5e25c6bc39f4cf1501e3713dde611bbe0fa279b9117fa8132dc",
+    "tier": "X"
+  },
+  {
+    "name": "ServiceWorkerListenerHost",
+    "kind": "type",
+    "signature": "ef53fa5c4b9dbb4aa350306dec0745114da4a37a2053b9f07bb022a0abc411d1",
+    "tier": "S"
+  },
+  {
+    "name": "ServiceWorkerRegistrationResult",
+    "kind": "type",
+    "signature": "0eb20ea53a5c7a4bc10959f359e5740baa831674f8ee5f73dcd8fd50f4486639",
+    "tier": "S"
+  },
+  {
+    "name": "ServiceWorkerResult",
+    "kind": "type",
+    "signature": "0eccc68d1878fc8be98b18b2e75f42881d424406712749e62eaf9f21094bdcc1",
+    "tier": "S"
+  },
+  {
+    "name": "ServiceWorkerResultError",
+    "kind": "type",
+    "signature": "d559a43e64f3ff728e60369b8deac933e1aeb4fa8263bfc70a8fdac08c0e7cfb",
+    "tier": "S"
+  },
+  {
+    "name": "ServiceWorkerResultSuccess",
+    "kind": "type",
+    "signature": "87fec549504884936c5573ed2bfc4f3b7e5de9331783824a8801c57b297e43ea",
+    "tier": "S"
+  },
+  {
+    "name": "SessionGrid",
+    "kind": "component",
+    "signature": "07e0338cb79d483e2f3d14cab24cd2e4a6b0ba3f561c8265a7743c45a0ea699e",
+    "tier": "F"
+  },
+  {
+    "name": "SessionGridProps",
+    "kind": "type",
+    "signature": "fc59cfe5951244dfa1e21838e7a9e3a88312062fe421cf2b60b18f21f2074a8d",
+    "tier": "F"
+  },
+  {
+    "name": "SessionThumb",
+    "kind": "component",
+    "signature": "391ada68b9cbc61a9f3893f58616201f79f090d22af50da9a8b15386b5987e8e",
+    "tier": "F"
+  },
+  {
+    "name": "ShortcutBar",
+    "kind": "component",
+    "signature": "337b9bba6a511aef4234b1b8ce262325d907abfba8b4c6f21a755f289796757e",
+    "tier": "F"
+  },
+  {
+    "name": "ShortcutsSheet",
+    "kind": "component",
+    "signature": "e88f9401547be437ab4f0d218ca64f238f622ca060f499233d15f00a46acb6b4",
+    "tier": "F"
+  },
+  {
+    "name": "showLocalNotification",
+    "kind": "value",
+    "signature": "e0dbadf8707f6ba90d52c0c8271ed19a4413527fb1e675d97a6eb0030bd85a4a",
+    "tier": "S"
+  },
+  {
+    "name": "ShowLocalNotificationInput",
+    "kind": "type",
+    "signature": "9a216f03aea977fe3c3fb4f00aa43e4fb7d69d9f7d75ba7a62bab76ef84df1c1",
+    "tier": "S"
+  },
+  {
+    "name": "SpawnAgent",
+    "kind": "type",
+    "signature": "ff88a016d8f7c05f40b878d7b5c97deaad366fe217401b025f169ba700698111",
+    "tier": "F"
+  },
+  {
+    "name": "splitSessionName",
+    "kind": "value",
+    "signature": "29ec7b61c0682b89f5a9803aff1d0fd1f13b4fd29e85083a6cc550db7c47107d",
+    "tier": "S"
+  },
+  {
+    "name": "TermHud",
+    "kind": "component",
+    "signature": "f9d7c9e959c1426dae06f738fd802e5847b2ac7a8a814db6d292bd4e95e17447",
+    "tier": "F"
+  },
+  {
+    "name": "TermSearch",
+    "kind": "component",
+    "signature": "ae48c1fa1f1057231ad8610a9188a35b68a67daf6c554776c12ab59277f1b8ed",
+    "tier": "F"
+  },
+  {
+    "name": "TermView",
+    "kind": "component",
+    "signature": "1f9e2afbe2ca8be6f8b78260013856f85947b92f11d4ef9ceb853747b24fa50b",
+    "tier": "F"
+  },
+  {
+    "name": "ThemeSheet",
+    "kind": "component",
+    "signature": "22de8ffd76e1268ff3054bee5416114d2b9c3fd76d7b6b28ad0da6cba11b3678",
+    "tier": "F"
+  },
+  {
+    "name": "tmuxMux",
+    "kind": "value",
+    "signature": "587723da723d760c8865dee1928d95c2514d9dcab0d2b8ecc65f28b8b62462bd",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxMux",
+    "kind": "value",
+    "signature": "ac42ca240c4658fd119ecae1752ce10a0756f26cc1ed137395b3007251b27400",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxMuxOptions",
+    "kind": "type",
+    "signature": "0dc449d701dc8c296d7df3c0c4e051596bc35078afc6923bcad3e6a93b8ccfc7",
+    "tier": "F"
+  },
+  {
+    "name": "updatePendingContentCursor",
+    "kind": "value",
+    "signature": "d212a20052a647864a22493b154e78ea4b540fc96cb7e1eaa99387bb620151ab",
+    "tier": "X"
+  },
+  {
+    "name": "UploadAction",
+    "kind": "component",
+    "signature": "58a630ab493b65ada8e0825dc76da4a33bb35a31c16ad449bdaddeffef58f77c",
+    "tier": "F"
+  }
+]
