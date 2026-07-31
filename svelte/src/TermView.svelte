@@ -648,7 +648,6 @@
 
   type PrependRetentionPlan = {
     keepFrom: number;
-    evictArchivedFrom: number;
   };
 
   function recordRetentionGap(rowIndex: number, dropped: number): void {
@@ -702,23 +701,6 @@
     let projectedRows = rawLines.length + stage.lines.length;
     let projectedBytes = retainedEstimatedBytes + stageBytes;
 
-    // Rows already retained may have been traversed earlier. Never destroy
-    // that known history to admit an older reply; only the incoming page may be
-    // shortened once the client-side budget is saturated.
-    const protectedExistingEnd = archivedLines.length;
-    let evictArchivedFrom = archivedLines.length;
-    while (evictArchivedFrom > protectedExistingEnd && (
-      projectedRows > HISTORY_RETAINED_ROW_BUDGET ||
-      projectedBytes > HISTORY_RETAINED_BYTE_BUDGET
-    )) {
-      evictArchivedFrom--;
-      projectedRows--;
-      projectedBytes -= estimatedLineStorageBytes(
-        rawLines[evictArchivedFrom] ?? '',
-        linksByLine[evictArchivedFrom],
-      );
-    }
-
     // A page can itself exceed the byte budget (or the protected/live suffix
     // can leave too little room). In that case discard only as much of the
     // incoming oldest prefix as is necessary; existing mounted rows stay safe.
@@ -734,7 +716,7 @@
       );
       keepFrom++;
     }
-    return { keepFrom, evictArchivedFrom };
+    return { keepFrom };
   }
 
   function publishStorageDiagnostics(): void {
@@ -975,7 +957,10 @@
     archiveOffset += count;
     winStart = Math.max(0, winStart - count);
     winEnd = Math.max(0, winEnd - count);
-    if (gapRowIndex >= 0) gapRowIndex = Math.max(0, gapRowIndex - count);
+    if (gapRowIndex >= 0) {
+      if (gapRowIndex < count) clearRetentionGap();
+      else gapRowIndex -= count;
+    }
   }
 
   /** Drop the oldest live rows immediately below the archive/live seam while
@@ -1535,11 +1520,6 @@
       return;
     }
 
-    // This suffix is below the mounted window by construction. Removing it
-    // makes room for the newly requested older page without losing the rows
-    // the reader is looking at (or turning page N into a no-op at the cap).
-    const gapChanged = evictArchivedTail(retention.evictArchivedFrom) > 0;
-
     // Mutate the bounded columns in place: no prepend allocates/copies every
     // accumulated row into a new array. Work is capped by the retained budget.
     prependColumn(archivedLines, retainedStage.lines);
@@ -1558,7 +1538,6 @@
 
     if (!existingCacheValid) reconcileExistingFrom(lineCount, stage.endState);
     rerenderPrependSeam(retainedStage);
-    if (gapChanged) rebuildGapLinkSeam();
     recalculateRetainedEstimatedBytes();
 
     // Keep the post-reconciliation retention gate explicit. With window-only
