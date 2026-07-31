@@ -24,29 +24,46 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 |---|---|
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
-| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. A mux with no archive, or a forward request whose archive has no `readAfter`, answers `{lines:[], startLine:null, hasMore:false}` immediately (clients must not wait forever). |
+| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A mux with no archive, or a forward request whose archive has no `readAfter`, answers `{lines:[], startLine:null, hasMore:false}` immediately (clients must not wait forever). |
 | `{channel, type:"error", data}` | e.g. the session disappeared. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
 
 ### Archive history paging
 
-A request should carry one direction cursor. `beforeLine: N` returns up to
-`limit` archived rows whose logical line numbers are `< N`, ending nearest the
-anchor. A null or omitted `beforeLine` reads the newest archived page before
-the live window. This is the original paging behavior and remains unchanged
-for existing clients.
+A request selects one direction. Include `afterLine` (even when null) for
+forward paging; otherwise the request pages backward and may include
+`beforeLine`. `beforeLine: N` returns the archived rows nearest the anchor whose
+logical line numbers are `< N`, up to the effective page limit. A null or
+omitted `beforeLine` reads the newest archived page before the live window.
+This is the original paging behavior and remains unchanged for existing
+clients.
 
 `afterLine: N` returns the first archived rows whose logical line numbers are
-`> N`; `afterLine: null` starts at the oldest row the archive still retains.
-The presence of `afterLine` selects forward paging, including when its value is
-null or zero. If a malformed request supplies both cursors, `afterLine` takes
-precedence.
+`> N`, up to the effective page limit; `afterLine: null` starts at the oldest
+row the archive still retains. The presence of `afterLine` selects forward
+paging, including when its value is null or zero. If a malformed request
+supplies both cursors, `afterLine` takes precedence.
 
 Rows are always returned in display order. `startLine` is the actual logical
 number of the first returned row and can be greater than `afterLine + 1` when
 the archive has evicted an older prefix. `hasMore` is relative to the requested
 direction: older rows for `beforeLine`, newer archived rows for `afterLine`.
+
+`limit` is a page-size budget. When it is omitted, the effective limit is 500.
+When a client supplies `limit <= 0`, archive implementations **must** use an
+effective limit of 1 in both directions; they must not replace it with the
+500-row default. The result can still be empty when no row exists beyond the
+anchor. A one-row minimum lets pagination make progress without turning an
+invalid or sentinel-sized request into an unexpectedly large response.
+
+The current `history` frame has no direction marker, echoed anchor, or request
+token. A client that can page in both directions must therefore keep at most
+one `history_expand` request outstanding per session on a WebSocket: remember
+its direction locally, wait for that session's `history` reply, and only then
+request the other direction. Do not issue concurrent before/after requests or
+try to infer their direction from `startLine`, `hasMore`, or row order; those
+fields are valid in both directions.
 
 Custom hosts remain source-compatible because `HistoryArchiveLike.readAfter`
 is optional. A host must implement it to support forward paging; otherwise the

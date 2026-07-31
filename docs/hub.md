@@ -128,6 +128,15 @@ terminal view, wire the shipped
 live viewing still works but `history_expand` returns an empty page. The archive
 does not turn `SessionThumb` into a deep-history viewer.
 
+A full viewer that requests both older and newer archive pages must serialize
+those requests per session on the shared WebSocket: the current `history` reply
+identifies the session but carries no direction marker or request token. An
+omitted page limit means 500 rows, while a supplied non-positive limit is
+normalized to an effective one-row page rather than expanded to the default.
+See the
+[archive paging contract](protocol.md#archive-history-paging) for the cursor and
+reply rules.
+
 ### A spawn contract or host policy
 
 `SessionGrid` only calls `onNew`. `LaunchSheet` only builds a `LaunchSpec` and
