@@ -1,0 +1,16 @@
+# source: tag=v0.7.1-dist commit=82e00cabd515fcda821c236215334e95bffd2faf tree=fb5e888706d2d850029ecbe973795c2cfc83e3e9
+# policy: This file may change only at a major bump or by appending new lines (additive). Changing an existing line is a breaking change and must follow CONTRACT.md.
+{"type":"subscribe","session":"golden-v071","delta":true,"client":{"visibilityState":"hidden","uxClientId":"client-7","viewport":{"width":390,"height":844}}}
+{"type":"subscribe","session":"golden-v071","tail":8,"delta":true,"client":{"visibilityState":"hidden","uxClientId":"client-7","viewport":{"width":390,"height":844}}}
+{"type":"unsubscribe","session":"golden-v071"}
+{"type":"keys","session":"golden-v071","data":"printf golden\r"}
+{"type":"resize","session":"golden-v071","cols":120,"rows":40,"client":{"visibilityState":"hidden","uxClientId":"client-7","viewport":{"width":390,"height":844}}}
+{"type":"history_expand","session":"golden-v071","beforeLine":null,"limit":500}
+{"type":"history_expand","session":"golden-v071","beforeLine":100,"limit":25}
+{"type":"history_expand","session":"golden-v071","afterLine":null}
+{"type":"history_expand","session":"golden-v071","afterLine":41,"limit":17}
+{"type":"ping","client":{"visibilityState":"hidden","uxClientId":"client-7","viewport":{"width":390,"height":844}}}
+{"type":"client_info","client":{"visibilityState":"hidden","uxClientId":"client-7","viewport":{"width":390,"height":844}}}
+{"type":"sessions_subscribe"}
+{"type":"sessions_unsubscribe"}
+{"type":"resync","session":"golden-v071"}

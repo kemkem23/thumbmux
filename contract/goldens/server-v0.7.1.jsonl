@@ -1,0 +1,11 @@
+# source: tag=v0.7.1-dist commit=82e00cabd515fcda821c236215334e95bffd2faf tree=fb5e888706d2d850029ecbe973795c2cfc83e3e9
+# policy: This file may change only at a major bump or by appending new lines (additive). Changing an existing line is a breaking change and must follow CONTRACT.md.
+{"channel":"golden-v071","type":"output","data":"line 1\nold line","cursor":{"row":0,"col":8}}
+{"channel":"golden-v071","type":"output","data":"line 1\nreflowed","cursor":{"row":0,"col":8},"reset":"resize"}
+{"channel":"golden-v071","type":"output","data":"line 1\nresynced","cursor":{"row":0,"col":8},"reset":"resync"}
+{"channel":"golden-v071","type":"delta","baseLength":2,"prefix":1,"prefixHash":"01dc73c8","lines":["new line"],"cursor":{"row":0,"col":8}}
+{"channel":"golden-v071","type":"cursor","cursor":{"row":-1,"col":3}}
+{"channel":"golden-v071","type":"history","data":"{\"lines\":[\"old line\"],\"startLine\":40,\"hasMore\":true}"}
+{"channel":"__sessions","type":"sessions","data":"[{\"name\":\"golden-v071\",\"created\":\"1720000000\",\"windows\":1,\"attached\":false,\"activityAt\":0}]"}
+{"type":"pong"}
+{"channel":"golden-v071","type":"error","data":"Session not found"}
