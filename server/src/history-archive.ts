@@ -356,6 +356,12 @@ export class FileHistoryArchive implements HistoryArchiveLike {
     }
   }
 
+  dropSession(session: string): void {
+    this.states.delete(session);
+    if (!this.storageReady) return;
+    this.removeFiles(this.paths(session));
+  }
+
   private stateFor(session: string): ArchiveState {
     const cached = this.states.get(session);
     if (cached) return cached;

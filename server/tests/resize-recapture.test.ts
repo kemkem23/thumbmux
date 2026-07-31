@@ -132,8 +132,9 @@ describe("resize recapture", () => {
       mux.handleMessage({ type: "resize", session: SESSION, cols: 100, rows: 31 }, ws);
       await until(() => attempts.length === 1 && !(mux as any).queuedCapturesInFlight.has(SESSION));
 
-      await (mux as any).captureAndBroadcastAsync(SESSION, new Set([ws]));
-      await (mux as any).captureAndBroadcastAsync(SESSION, new Set([ws]));
+      const viewers = (mux as any).subscribers.get(SESSION);
+      await (mux as any).captureAndBroadcastAsync(SESSION, viewers);
+      await (mux as any).captureAndBroadcastAsync(SESSION, viewers);
 
       expect(attempts).toEqual([true, true, undefined]);
       expect(successful).toEqual([true, undefined]);

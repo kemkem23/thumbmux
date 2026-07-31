@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -443,6 +444,30 @@ describe("FileHistoryArchive", () => {
     const restarted = new FileHistoryArchive({ root });
     expect(page(restarted, "beta", null).lines).toEqual(capture(0, 6).split("\n"));
     expect(page(restarted, "alpha", null)).toEqual({ lines: [], startLine: null, hasMore: false });
+  });
+
+  test("drops cached and persisted state idempotently", () => {
+    const { archive, root } = makeArchive();
+    ingest(archive, "alpha", capture(0, 8), true, 2);
+    const paths = storedPaths(root, "alpha");
+    expect(existsSync(paths.data)).toBe(true);
+    expect(existsSync(paths.meta)).toBe(true);
+
+    archive.dropSession("alpha");
+
+    expect(page(archive, "alpha", null)).toEqual({
+      lines: [],
+      startLine: null,
+      hasMore: false,
+    });
+    expect(existsSync(paths.data)).toBe(false);
+    expect(existsSync(paths.meta)).toBe(false);
+    expect(page(new FileHistoryArchive({ root }), "alpha", null)).toEqual({
+      lines: [],
+      startLine: null,
+      hasMore: false,
+    });
+    expect(() => archive.dropSession("alpha")).not.toThrow();
   });
 
   test("hashes hostile session names into safe storage filenames", () => {

@@ -25,9 +25,59 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
 | `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive, an unsupported forward read, or an archive read that throws uses `{lines:[], startLine:null, hasMore:false}` as a synchronous fallback. Archive-error logging is best effort: a throwing host logger cannot suppress the mux's single reply attempt. Delivery still depends on `ws.send` succeeding, so clients should retain their own request timeout and recovery. |
-| `{channel, type:"error", data}` | e.g. the session disappeared. |
+| `{channel, type:"error", data}` | e.g. the session disappeared. A host-driven `invalidateSession()` makes one final send attempt to each affected WebSocket subscriber before that session lifecycle goes quiet. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
+
+### Host-driven session invalidation
+
+Deleting a tmux pane/session is a host lifecycle event, not a client protocol
+message. The deletion path should tell the mux explicitly:
+
+```ts
+const affectedViewers = mux.invalidateSession(session, {
+  reason: 'Session terminated by host',
+  purgeArchive: true,
+});
+```
+
+`invalidateSession(session, opts?)` returns the number of unique WebSocket
+subscribers that were attached when it was called. It always detaches those
+subscribers and makes one final send attempt to each of them with a
+`{channel, type:"error", data: reason}` frame; the default reason is
+`Session not found`. It also stops that session's pipe and
+timers, discards queued work, and fences already-running captures so they
+cannot send a late frame or populate a new session that later reuses the same
+name. After the method returns, the invalidated lifecycle produces no more
+capture attempts, output frames, cursor frames, or repeated error frames.
+
+This is a wire-level terminal signal, subject to the WebSocket adapter's normal
+delivery semantics: a `-1` result is tracked as queued backpressure, while a
+throwing transport cannot be made to deliver. UI integrations must surface
+`error` frames if an operator needs a visible message; the bundled Svelte
+terminal and thumbnail components currently discard them. Invalidation also
+does not synthesize `onUnsubscribe`: the mux does not retain each
+subscription's `client` argument. A host that keeps policy or accounting state
+in that hook should release it alongside its own session-deletion operation.
+
+The public options are deliberately limited to `reason` and `purgeArchive`.
+Notification and detachment are invariants rather than switches: allowing
+`notify:false` would make the terminal disappear silently, while
+`detach:false` would preserve the capture/error loop this API exists to stop.
+`purgeArchive` defaults to `false` because deleting durable history is a
+destructive decision. When it is true, the mux calls the optional
+`HistoryArchiveLike.dropSession(session)`; `FileHistoryArchive` implements it
+by clearing both cached state and persisted data. Older custom archives remain
+compatible because the method is optional, and archive deletion failure does
+not undo viewer teardown or suppress the final signal.
+
+There is intentionally no `onCaptureError` hook or `errorFrameMode` option in
+this change. A generic capture failure does not prove that a session is dead:
+tmux reloads, transient process errors, and temporary resource pressure must
+retain the existing per-attempt error behavior. The host, which owns the
+terminal deletion operation, is the component that can identify a terminal
+lifecycle event and call `invalidateSession()` without changing defaults for
+current consumers.
 
 ### Archive history paging
 
@@ -73,6 +123,17 @@ its direction locally, wait for that session's `history` reply, and only then
 request the other direction. Do not issue concurrent before/after requests or
 try to infer their direction from `startLine`, `hasMore`, or row order; those
 fields are valid in both directions.
+
+The bundled `TmuxMux` applies that rule to both public paging methods:
+`requestHistory(session, beforeLine?, limit?)` pages backward and
+`requestHistoryAfter(session, afterLine, limit?)` pages forward. They share a
+per-session gate on the current socket. A same-session call made while either
+direction is outstanding is not sent; other sessions remain independent. The
+gate opens when that session's `history` reply arrives and is discarded when
+the socket is replaced, so recovery from a lost reply requires connection
+recovery rather than starting an ambiguous second request on the same socket.
+`TmuxMux` deliberately does not expire this gate while that socket stays live:
+a late tokenless reply could otherwise be mistaken for the retry's response.
 
 Custom hosts remain source-compatible because `HistoryArchiveLike.readAfter`
 is optional. A host must implement it to support forward paging; otherwise the

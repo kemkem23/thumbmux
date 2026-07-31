@@ -93,7 +93,16 @@ export interface HistoryArchiveLike {
   /** Optional forward archive paging. `afterLine` is an exclusive anchor. */
   readAfter?(session: string, afterLine: number | null, limit?: number): unknown;
   renameSession(oldSession: string, newSession: string): void;
+  /** Optional durable-history purge used when a host invalidates a session. */
+  dropSession?(session: string): void;
 }
+
+export type InvalidateSessionOptions = {
+  /** Final error-frame text. Defaults to the capture-error wording. */
+  reason?: string;
+  /** Also remove durable archived history. Default false. */
+  purgeArchive?: boolean;
+};
 
 export type SessionProfile = {
   /** browser-authoritative geometry: apply resize requests to the tmux window */
@@ -257,6 +266,9 @@ export class TmuxWsMux<
   private queuedCapturesInFlight = new Set<string>();
   private queuedCapturesPending = new Set<string>();
   private queuedCapturesFullHistory = new Set<string>();
+  /** Viewer-set owners currently consuming a full-history queue intent. A
+   * WeakSet keeps that intent attached to the async lifecycle across rename. */
+  private fullHistoryCaptureOwners = new WeakSet<Set<WS>>();
   private captureStartLines = new Map<string, number>();
   private archiveSeeded = new Set<string>();
   /** Sessions whose next successful archive ingest must replace, not append,
@@ -1071,8 +1083,59 @@ export class TmuxWsMux<
     this.sendGroupedOutputFrames(session, viewers, content, cursor, { onlyPending: true });
   }
 
+  /**
+   * End one server-owned session lifecycle. Every current viewer receives one
+   * final error frame and is detached, so later poll ticks cannot capture or
+   * report the dead pane again. Durable history is retained unless explicitly
+   * purged; notification and detachment are intentionally not optional.
+   */
+  invalidateSession(session: string, opts: InvalidateSessionOptions = {}): number {
+    const viewers = [...(this.subscribers.get(session) ?? [])];
+    this.dropSessionState(session);
+    // Unlike an ordinary last-viewer unsubscribe, invalidation ends the tmux
+    // lifecycle. A future session reusing this name must bootstrap afresh even
+    // when the host deliberately retains its durable archive.
+    this.archiveSeeded.delete(session);
+    if (opts.purgeArchive) {
+      try {
+        this.archive?.dropSession?.(session);
+      } catch (error: unknown) {
+        try {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logError(`[thumbmux-mux] archive dropSession error for "${session}":`, message);
+        } catch {
+          // Archive purge is best effort. A throwing logger must not undo the
+          // already-completed viewer/session teardown.
+        }
+      }
+    }
+    // These collaborators may invoke host-provided logging. Invalidation has
+    // already detached the lifecycle, so housekeeping failures must not hide
+    // the terminal frame or change the public return value.
+    try { this.maybeStopPolling(); } catch {}
+    try { this.refreshSessionListSchedule(); } catch {}
+
+    const message = JSON.stringify({
+      channel: session,
+      type: "error",
+      data: opts.reason ?? "Session not found",
+    } satisfies MuxServerMessage);
+    for (const ws of viewers) {
+      try {
+        const status = this.wsSend(ws, message);
+        if (status === -1) this.markBlocked(ws);
+      } catch {}
+    }
+    return viewers.length;
+  }
+
   private dropSessionState(session: string) {
+    const viewers = this.subscribers.get(session);
     this.subscribers.delete(session);
+    // In-flight captures hold this Set by reference. Emptying it prevents a
+    // late result from reaching detached sockets even before its identity
+    // guard observes that the map now owns a different lifecycle.
+    viewers?.clear();
     this.tails.delete(session);
     this.deltaSubscribers.delete(session);
     this.outputBases.delete(session);
@@ -1089,11 +1152,20 @@ export class TmuxWsMux<
     this.queuedCapturesPending.delete(session);
     this.queuedCapturesInFlight.delete(session);
     this.queuedCapturesFullHistory.delete(session);
+    this.clearPipeCaptureTimers(session);
     this.lastReconcileCapture.delete(session);
     this.lastAppliedGeometry.delete(session);
-    if (this.piped.has(session)) {
-      this.pipes?.stopPipe(session);
-      this.piped.delete(session);
+    if (this.piped.delete(session)) {
+      try {
+        this.pipes?.stopPipe(session);
+      } catch (error: unknown) {
+        try {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logError(`[thumbmux-mux] stopPipe error for "${session}":`, message);
+        } catch {
+          // Pipe teardown is best effort; mux lifecycle teardown is not.
+        }
+      }
     }
   }
 
@@ -1295,6 +1367,15 @@ export class TmuxWsMux<
     this.immediateCaptureTimers.delete(session);
   }
 
+  private clearPipeCaptureTimers(session: string) {
+    const debounce = this.pipeDebounceTimers.get(session);
+    if (debounce) clearTimeout(debounce);
+    this.pipeDebounceTimers.delete(session);
+    const maxWait = this.pipeMaxTimers.get(session);
+    if (maxWait) clearTimeout(maxWait);
+    this.pipeMaxTimers.delete(session);
+  }
+
   private queueCapture(session: string, opts: { fullHistory?: boolean } = {}) {
     const viewers = this.subscribers.get(session);
     if (!viewers || viewers.size === 0) return;
@@ -1306,17 +1387,22 @@ export class TmuxWsMux<
     }
 
     this.queuedCapturesInFlight.add(session);
-    void this.runQueuedCapture(session);
+    void this.runQueuedCapture(session, viewers);
   }
 
-  private async runQueuedCapture(session: string) {
+  private async runQueuedCapture(session: string, viewers: Set<WS>) {
     try {
-      const viewers = this.subscribers.get(session);
-      if (viewers && viewers.size > 0) {
+      if (this.ownsSessionLifecycle(session, viewers)) {
         const fullHistory = this.queuedCapturesFullHistory.delete(session);
+        if (fullHistory) this.fullHistoryCaptureOwners.add(viewers);
         await this.captureAndBroadcastAsync(session, viewers, { fullHistory });
       }
     } finally {
+      this.fullHistoryCaptureOwners.delete(viewers);
+      // invalidate → subscribe may start a new capture lane under the same
+      // string key while this old Promise is still settling. The viewer Set is
+      // the ownership token: an old finally must not erase the new lane.
+      if (!this.ownsSessionLifecycle(session, viewers)) return;
       this.queuedCapturesInFlight.delete(session);
       if (this.queuedCapturesPending.delete(session)) {
         this.queueCapture(session);
@@ -1327,11 +1413,16 @@ export class TmuxWsMux<
   // Debounce pipe signals with max wait: captures 15ms after last signal OR 100ms max
   private tryStartPipe(session: string) {
     if (!this.pipes) return;
+    const viewers = this.subscribers.get(session);
+    if (!viewers || viewers.size === 0) return;
+    const ownsLifecycle = () => this.ownsSessionLifecycle(session, viewers);
     const started = this.pipes.startPipe(
       session,
       // onData: pipe-pane data = "dirty signal" → debounce with max wait
       (_data: string) => {
+        if (!ownsLifecycle()) return;
         const doCapture = () => {
+          if (!ownsLifecycle()) return;
           const d = this.pipeDebounceTimers.get(session);
           if (d) clearTimeout(d);
           this.pipeDebounceTimers.delete(session);
@@ -1351,26 +1442,34 @@ export class TmuxWsMux<
       },
       // onBroken: pipe died → resume polling (polling loop will pick it up)
       () => {
-        this.log(`[thumbmux-mux] Pipe broken for "${session}" — resuming poll fallback`);
+        if (!ownsLifecycle()) return;
         this.piped.delete(session);
         this.queueCapture(session);
+        try { this.log(`[thumbmux-mux] Pipe broken for "${session}" — resuming poll fallback`); } catch {}
       },
       // onRestarted: pipe recovered → just re-add to piped set
       () => {
-        this.log(`[thumbmux-mux] Pipe restarted for "${session}"`);
+        if (!ownsLifecycle()) return;
         this.piped.add(session);
+        try { this.log(`[thumbmux-mux] Pipe restarted for "${session}"`); } catch {}
       },
     );
 
-    if (started) {
+    if (started && ownsLifecycle()) {
       this.piped.add(session);
-      this.log(`[thumbmux-mux] Pipe active for "${session}" — using as change trigger`);
+      try { this.log(`[thumbmux-mux] Pipe active for "${session}" — using as change trigger`); } catch {}
     }
   }
 
   handleSessionRename(oldSession: string, newSession: string) {
     // Always migrate subscribers (works for both piped and polled sessions)
-    const viewers = this.subscribers.get(oldSession);
+    const previousViewers = this.subscribers.get(oldSession);
+    const fullHistoryInFlight = previousViewers
+      ? this.fullHistoryCaptureOwners.has(previousViewers)
+      : false;
+    // A fresh Set is the monotonic lifecycle owner. Reusing the old Set would
+    // let an A→B→A rename make A's pre-rename capture current again.
+    const viewers = previousViewers ? new Set(previousViewers) : undefined;
     if (viewers) {
       this.subscribers.set(newSession, viewers);
       this.subscribers.delete(oldSession);
@@ -1442,11 +1541,16 @@ export class TmuxWsMux<
       this.clearImmediateCapture(oldSession);
       this.scheduleImmediateCapture(newSession);
     }
-    if (this.queuedCapturesPending.delete(oldSession) || this.queuedCapturesInFlight.delete(oldSession)) {
+    this.clearPipeCaptureTimers(oldSession);
+    // Do not short-circuit these deletes: an owned in-flight capture can have
+    // a pending successor, and its old-name marker must not survive the rename.
+    const hadQueuedCapture = this.queuedCapturesPending.delete(oldSession);
+    const hadCaptureInFlight = this.queuedCapturesInFlight.delete(oldSession);
+    const needsFullHistory = this.queuedCapturesFullHistory.delete(oldSession)
+      || fullHistoryInFlight;
+    if (needsFullHistory) this.queuedCapturesFullHistory.add(newSession);
+    if (hadQueuedCapture || hadCaptureInFlight) {
       this.queueCapture(newSession);
-    }
-    if (this.queuedCapturesFullHistory.delete(oldSession)) {
-      this.queuedCapturesFullHistory.add(newSession);
     }
     if (this.archiveSeeded.delete(oldSession)) {
       this.archiveSeeded.add(newSession);
@@ -1495,6 +1599,7 @@ export class TmuxWsMux<
     viewers: Set<WS>,
     opts: { fullHistory?: boolean } = {},
   ) {
+    if (!this.ownsSessionLifecycle(session, viewers)) return;
     // Snapshot before the first await. A resize accepted while this capture is
     // in flight belongs to a later capture; the old physical wrapping must not
     // mutate archive/content/base/reset state or reach any viewer.
@@ -1520,6 +1625,7 @@ export class TmuxWsMux<
       } else {
         content = await this.driver.capturePane(session, captureOpts);
       }
+      if (!this.ownsSessionLifecycle(session, viewers)) return;
       if (this.geometryGenerations.get(session) !== geometryGeneration) {
         // queueCapture coalesces work per session. If the invalidated capture
         // owned the one-shot archive seed, hand that intent back to the queued
@@ -1629,16 +1735,22 @@ export class TmuxWsMux<
         }
         trailingBlanks = this.countTrailingBlanks(content);
       }
+      if (!this.ownsSessionLifecycle(session, viewers)) return;
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
     } catch {
+      if (!this.ownsSessionLifecycle(session, viewers)) return;
       // Session gone — notify viewers
       const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
       for (const ws of viewers) {
         try { this.wsSend(ws, errMsg); } catch {}
       }
     }
+  }
+
+  private ownsSessionLifecycle(session: string, viewers: Set<WS>): boolean {
+    return viewers.size > 0 && this.subscribers.get(session) === viewers;
   }
 
   private ensurePolling() {
