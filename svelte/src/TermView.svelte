@@ -224,6 +224,22 @@
   let cancelPrependWorkTask: (() => void) | null = null;
   let prependParseSeq = 0;
   let destroyed = false;
+  const deferredFrames = new Set<number>();
+
+  function scheduleDeferredFrame(callback: FrameRequestCallback): void {
+    if (destroyed) return;
+    let frameId = 0;
+    frameId = requestAnimationFrame((timestamp) => {
+      deferredFrames.delete(frameId);
+      if (!destroyed) callback(timestamp);
+    });
+    deferredFrames.add(frameId);
+  }
+
+  function cancelDeferredFrames(): void {
+    for (const frameId of deferredFrames) cancelAnimationFrame(frameId);
+    deferredFrames.clear();
+  }
 
   type PrependLinkPlan = {
     batchLinks: (LineLinkRange[] | undefined)[];
@@ -1274,7 +1290,7 @@
       requestSearchRerun();
       return;
     }
-    requestAnimationFrame(() => searchComponent?.focusInput());
+    scheduleDeferredFrame(() => searchComponent?.focusInput());
   }
 
   function updateSearchQuery(next: string): void {
@@ -1679,7 +1695,7 @@
         { before: before.transform, after: after.transform, lineCount, receivedLineCount },
       );
     }
-    requestAnimationFrame(() => {
+    scheduleDeferredFrame(() => {
       emitHistoryPrependEvent(lineCount, existingCacheValid, before, after);
     });
     if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
@@ -2122,7 +2138,7 @@
       pendingSearchJumpLine = null;
       schedulePendingContentFlush();
       if (pendingJump !== null) {
-        requestAnimationFrame(() => jumpToSearchLine(pendingJump));
+        scheduleDeferredFrame(() => jumpToSearchLine(pendingJump));
       }
     }
   }
@@ -2647,7 +2663,7 @@
       receiveLiveContent(data, cur, meta);
     });
     pushGeometry({ force: true });
-    requestAnimationFrame(() => pushGeometry({ force: true }));
+    scheduleDeferredFrame(() => pushGeometry({ force: true }));
     resizeObs = new ResizeObserver(() => {
       viewH = viewportEl?.clientHeight ?? viewH;
       pushGeometry();
@@ -2670,6 +2686,7 @@
     // Svelte 5 runs onDestroy during SSR too — guard all browser APIs.
     if (typeof window === 'undefined') return;
     destroyed = true;
+    cancelDeferredFrames();
     stopInertia();
     if (dragFrame !== null) cancelAnimationFrame(dragFrame);
     if (pendingContentFlushFrame !== null) cancelAnimationFrame(pendingContentFlushFrame);
@@ -2733,7 +2750,7 @@
   // applyScroll after the window re-renders (layerEl content changed).
   $effect(() => {
     renderEpoch;
-    requestAnimationFrame(() => applyScroll());
+    scheduleDeferredFrame(() => applyScroll());
   });
 
   $effect(() => {
@@ -2744,7 +2761,7 @@
     }
     if (connectedGeometryPushed) return;
     connectedGeometryPushed = true;
-    requestAnimationFrame(() => pushGeometry({ force: true }));
+    scheduleDeferredFrame(() => pushGeometry({ force: true }));
   });
 </script>
 

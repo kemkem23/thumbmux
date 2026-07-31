@@ -17,6 +17,7 @@ import {
 } from '../../svelte/tests/svelte-client';
 import { derivePublicExportManifest } from '../../scripts/rewrite-git-dist-imports';
 import * as app from '../src';
+import SessionView from '../src/SessionView.svelte';
 import ThumbmuxApp from '../src/ThumbmuxApp.svelte';
 import type {
   AppAdapters,
@@ -26,6 +27,7 @@ import type {
 import { createQueryParamNav } from '../src/navigation';
 
 type ThumbmuxAppProps = { adapters: AppAdapters };
+type SessionViewProps = { session: string; adapters: AppAdapters };
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 type MuxSurface = {
   onSessions(callback: (rows: SessionListItem[]) => void): () => void;
@@ -101,6 +103,21 @@ function mountApp(adapters: AppAdapters): Mounted {
   return entry;
 }
 
+function mountSessionView(session: string, adapters: AppAdapters): Mounted {
+  const target = document.createElement('div');
+  document.body.appendChild(target);
+  let instance!: Record<string, unknown>;
+  flushSync(() => {
+    instance = mount(SessionView as Component<SessionViewProps>, {
+      target,
+      props: { session, adapters },
+    }) as Record<string, unknown>;
+  });
+  const entry = { app: instance, target };
+  mounted.push(entry);
+  return entry;
+}
+
 function click(target: HTMLElement, selector: string): void {
   const element = target.querySelector<HTMLButtonElement>(selector);
   if (!element) throw new Error(`missing button: ${selector}`);
@@ -152,6 +169,88 @@ afterEach(() => {
   restoreProperty(history, 'replaceState', originalReplaceState);
   history.replaceState(null, '', '/');
   document.body.replaceChildren();
+});
+
+describe('SessionView submission failure handling', () => {
+  test('restores the composer only when the submission transport fails', async () => {
+    let context: SessionActionContext | undefined;
+    let transportCalls = 0;
+    history.replaceState(null, '', '/?session=transport-failure');
+    const { target } = mountApp(adaptersFor('transport-failure', {
+      sendKeys: () => {
+        transportCalls += 1;
+        throw new Error('transport unavailable');
+      },
+      extraActions: (_session, supplied) => {
+        context = supplied;
+        return [];
+      },
+    }));
+    await settleUi();
+
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!context || !composer) throw new Error('submission context did not mount');
+    expect(composer.classList.contains('open')).toBe(false);
+
+    context.submit('recover this draft');
+    await settleUi();
+
+    expect(transportCalls).toBe(1);
+    expect(composer.classList.contains('open')).toBe(true);
+  });
+
+  test('uses the same transport recovery for shortcut submissions', async () => {
+    let transportCalls = 0;
+    history.replaceState(null, '', '/?session=shortcut-failure');
+    const { target } = mountApp(adaptersFor('shortcut-failure', {
+      sendKeys: () => {
+        transportCalls += 1;
+        throw new Error('transport unavailable');
+      },
+    }));
+    await settleUi();
+
+    const shortcut = target.querySelector<HTMLButtonElement>('[data-testid="shortcut-chip"]');
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!shortcut || !composer) throw new Error('shortcut submission UI did not mount');
+    expect(composer.classList.contains('open')).toBe(false);
+
+    flushSync(() => shortcut.click());
+    await settleUi();
+
+    expect(transportCalls).toBe(1);
+    expect(composer.classList.contains('open')).toBe(true);
+  });
+
+  test('surfaces submission setup errors instead of treating them as transport failures', async () => {
+    let context: SessionActionContext | undefined;
+    const setupError = new Error('submission transport getter failed');
+    const adapters = adaptersFor('setup-failure', {
+      extraActions: (_session, supplied) => {
+        context = supplied;
+        return [];
+      },
+    });
+    Object.defineProperty(adapters, 'sendKeys', {
+      configurable: true,
+      get() {
+        throw setupError;
+      },
+    });
+
+    mountSessionView('setup-failure', adapters);
+    await settleUi();
+    if (!context) throw new Error('submission context did not mount');
+
+    let surfaced: unknown;
+    try {
+      context.submit('must surface');
+    } catch (error) {
+      surfaced = error;
+    }
+
+    expect(surfaced).toBe(setupError);
+  });
 });
 
 describe('ThumbmuxApp navigation', () => {

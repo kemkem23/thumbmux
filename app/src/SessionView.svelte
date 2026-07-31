@@ -185,20 +185,38 @@
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
   }
 
-  async function sendSubmission(text: string): Promise<void> {
-    if (!text) return;
+  async function deliverSubmission(
+    targetSession: string,
+    transport: (name: string, keys: string) => void,
+    steps: ReturnType<typeof submitPlan>,
+  ): Promise<boolean> {
+    for (const step of steps) {
+      if (step.delayBeforeMs > 0) await wait(step.delayBeforeMs);
+      try {
+        transport(targetSession, step.keys);
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function sendSubmission(text: string): Promise<boolean> {
+    if (!text) return Promise.resolve(true);
     const targetSession = session;
     const targetAgent = sessionAgent;
     const transport = adapters.sendKeys
       ?? ((name: string, keys: string) => tmuxMux.sendKeys(name, keys));
-    for (const step of submitPlan(text, { agent: targetAgent })) {
-      if (step.delayBeforeMs > 0) await wait(step.delayBeforeMs);
-      transport(targetSession, step.keys);
-    }
+    const steps = submitPlan(text, { agent: targetAgent });
+    return deliverSubmission(targetSession, transport, steps);
+  }
+
+  function recoverTransportFailure(sent: boolean, text: string): void {
+    if (!sent) prefillOnError(composer, text);
   }
 
   function submitDraft(text: string): void {
-    void sendSubmission(text).catch(() => prefillOnError(composer, text));
+    void sendSubmission(text).then((sent) => recoverTransportFailure(sent, text));
   }
 
   function prefillComposer(text: string): void {
@@ -583,7 +601,7 @@
     visible={!overlay.fabOpen && !overlay.themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
     onSend={(shortcut) => {
       if (shortcut.submit === false) sendKeys(shortcut.send);
-      else void sendSubmission(shortcut.send).catch(() => prefillOnError(composer, shortcut.send));
+      else submitDraft(shortcut.send);
     }}
     onManage={() => { shortcutsOpen = true; }}
   />
