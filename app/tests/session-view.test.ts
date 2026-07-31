@@ -170,6 +170,45 @@ describe('mountable terminal views', () => {
     expect(embed.target.querySelectorAll('[data-testid="shortcuts-sheet"]')).toHaveLength(0);
   });
 
+  test('sessionMeta gets the host mux and millisecond timestamps, exactly as the hub does', async () => {
+    // The store normalizes protocol seconds to milliseconds before handing rows
+    // to sessionMeta. SessionView subscribed straight to the singleton, so one
+    // host callback saw two different units depending on which view called it —
+    // and never saw a mux the host supplied at all.
+    let push: ((rows: unknown[]) => void) | null = null;
+    const hostMux = {
+      subscribe: () => () => {},
+      onSessions: (callback: (rows: unknown[]) => void) => {
+        push = callback;
+        callback([]);
+        return () => {};
+      },
+    } as unknown as AppAdapters['mux'];
+
+    const seen: Array<number | undefined> = [];
+    mountView(SessionView, {
+      session: 'sh-units',
+      adapters: {
+        mux: hostMux,
+        termProps: () => ({ claimGeometry: false }),
+        sessionMeta: (rows) => {
+          for (const row of rows) seen.push(row.activityAt);
+          return [];
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    expect(push).not.toBeNull();
+    push!([{ name: 'sh-units', activityAt: 1_700_000_000 }]);
+    await tick();
+
+    // 1_700_000_000 is a second-scale stamp; the hub would have reported it as
+    // 1_700_000_000_000. Assert on what the view handed the callback.
+    expect(seen).toContain(1_700_000_000_000);
+    expect(seen).not.toContain(1_700_000_000);
+  });
+
   test('optional panels and upload UI render only when their adapters are supplied', async () => {
     const omitted = mountView(SessionView, {
       session: 'sh-no-notes',

@@ -35,6 +35,13 @@ function normalizeActivityAt(row: SessionListItem): SessionListItem {
   return { ...row };
 }
 
+/** Protocol rows carry `activityAt` in seconds on some servers and milliseconds
+ * on others. Every view that hands rows to `sessionMeta` must apply this, or one
+ * host callback receives two different units depending on which view called it. */
+export function normalizeSessionRows(rows: SessionListItem[]): SessionListItem[] {
+  return rows.map(normalizeActivityAt);
+}
+
 function normalizeRows(rows: SessionListItem[]): SessionListItem[] {
   return rows.map(normalizeActivityAt);
 }

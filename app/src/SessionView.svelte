@@ -38,6 +38,7 @@
     type OverlayTransition,
     type OverlayState,
   } from './overlay';
+  import { normalizeSessionRows } from './sessions-store';
 
   let {
     session,
@@ -479,8 +480,8 @@
       if (!destroyed && loadGeneration === prefsGeneration) applyPrefs(snapshot);
     }).catch(() => {});
 
-    const unsubscribeSessions = tmuxMux.onSessions((rows) => {
-      sessionRows = rows as SessionListItem[];
+    const unsubscribeSessions = (adapters.mux ?? tmuxMux).onSessions((rows) => {
+      sessionRows = normalizeSessionRows(rows as SessionListItem[]);
     });
     const query = window.matchMedia('(min-width: 1024px)');
     setDesktopGate(query.matches);
