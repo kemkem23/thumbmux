@@ -636,6 +636,7 @@ beforeEach(() => {
   tmuxMux.requestHistory = ((_session: string, beforeLine?: number | null, limit?: number) => {
     historyRequestCount++;
     historyRequests.push({ beforeLine, limit });
+    return true;
   }) as typeof tmuxMux.requestHistory;
 
   originalResizeObserver = globalThis.ResizeObserver;

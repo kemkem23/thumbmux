@@ -108,6 +108,7 @@
   const OVERSCAN_ROWS = 60;
   const RUBBER_PX = 90;
   const HISTORY_BATCH_LINES = 2000;
+  const HISTORY_REPLY_TIMEOUT_MS = 5_000;
   const HISTORY_PARSE_CHUNK_LINES = 300;
   const HISTORY_LINK_SEAM_LINES = 12;
   const HISTORY_GAP_LINK_ROWS = 128;
@@ -159,13 +160,13 @@
   let archiveBeforeLine: number | null = null;
   let archiveLoading = false;
   let archiveExhausted = false;
-  // Client-side request id for history_expand. The wire protocol has no token,
-  // so we only match "currently inflight" vs "stale/lost": a timeout clears
-  // the inflight id and allows a retry; a late reply with no inflight id is
-  // discarded without permanently disabling expansion.
+  // Client-side request ids guard local deferred work, not wire identity: the
+  // protocol echoes no token. On timeout the mux retires the old socket before
+  // this state allows a retry, fencing any late reply from the abandoned wire.
   let archiveRequestActive = false;
   let archiveRequestSeq = 0;
   let archiveInflightRequestId: number | null = null;
+  let archiveInflightSession: string | null = null;
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
@@ -1408,14 +1409,25 @@
       retainedEstimatedBytes >= HISTORY_RETAINED_BYTE_BUDGET
     ) return false;
     const requestId = ++archiveRequestSeq;
+    const requestSession = session;
     archiveInflightRequestId = requestId;
+    archiveInflightSession = requestSession;
     archiveLoading = true;
     archiveRequestActive = true;
-    tmuxMux.requestHistory(session, archiveBeforeLine, HISTORY_BATCH_LINES);
     if (archiveRequestTimer) clearTimeout(archiveRequestTimer);
     archiveRequestTimer = setTimeout(() => {
-      // Superseded by a newer request (or already finished) — ignore.
-      if (archiveInflightRequestId !== requestId) return;
+      // Superseded, finished, or already claimed by a reply — ignore. A timer
+      // task can still run after clearTimeout when it was already queued.
+      if (archiveInflightRequestId !== requestId || !archiveRequestActive) return;
+      // A tokenless late reply cannot be distinguished from a retry on the
+      // same wire. Retire that wire first; all mux subscriptions re-arm on the
+      // replacement connection and the next eligible scroll can retry safely.
+      try {
+        tmuxMux.recoverHistoryRequest(requestSession);
+      } catch {
+        // Recovery detaches the ambiguous wire before it attempts a new
+        // connection. A host URL/socket failure must not strand local state.
+      }
       const settled = settleArchiveContinuationRequest('timeout');
       if (searchQuery && settled) {
         requestSearchRerun();
@@ -1423,8 +1435,22 @@
       archiveLoading = false;
       archiveRequestActive = false;
       archiveInflightRequestId = null;
+      archiveInflightSession = null;
       archiveRequestTimer = null;
-    }, 5000);
+    }, HISTORY_REPLY_TIMEOUT_MS);
+
+    // Mux rejection (another request owns this session, no open socket, or a
+    // failed send) must not leave a phantom request that consumes another
+    // caller's broadcast history reply or waits through a pointless timeout.
+    if (!tmuxMux.requestHistory(requestSession, archiveBeforeLine, HISTORY_BATCH_LINES)) {
+      if (archiveRequestTimer) clearTimeout(archiveRequestTimer);
+      archiveRequestTimer = null;
+      archiveLoading = false;
+      archiveRequestActive = false;
+      archiveInflightRequestId = null;
+      archiveInflightSession = null;
+      return false;
+    }
     return true;
   }
 
@@ -1482,6 +1508,7 @@
     archiveLoading = false;
     archiveRequestActive = false;
     archiveInflightRequestId = null;
+    archiveInflightSession = null;
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
@@ -1754,9 +1781,9 @@
   }
 
   function applyArchivedHistory(data: string) {
-    // Only the currently inflight request may consume a reply. A timed-out or
-    // otherwise abandoned request leaves archiveInflightRequestId null, so a
-    // late/lost-then-replayed frame is discarded without locking retries out.
+    // Only a locally accepted request may consume a reply. Timeout recovery
+    // replaces the socket before clearing this id, so an abandoned wire cannot
+    // later satisfy a different local request.
     if (!archiveRequestActive || archiveInflightRequestId === null) return;
 
     if (archiveRequestTimer) {
@@ -2650,6 +2677,17 @@
     pendingPrependWork = null;
     prependParseSeq++;
     if (altWheelFrame !== null) { cancelAnimationFrame(altWheelFrame); altWheelFrame = null; }
+    // Unmount can abandon an accepted tokenless request before its timeout.
+    // Fence that request's wire now so a later viewer of the same session is
+    // neither blocked forever nor able to consume the abandoned reply.
+    if (archiveRequestActive && archiveInflightRequestId !== null) {
+      try {
+        tmuxMux.recoverHistoryRequest(archiveInflightSession ?? session);
+      } catch {
+        // Teardown must continue even if host connection setup throws after
+        // the abandoned wire has already been detached.
+      }
+    }
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;

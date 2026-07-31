@@ -127,13 +127,40 @@ fields are valid in both directions.
 The bundled `TmuxMux` applies that rule to both public paging methods:
 `requestHistory(session, beforeLine?, limit?)` pages backward and
 `requestHistoryAfter(session, afterLine, limit?)` pages forward. They share a
-per-session gate on the current socket. A same-session call made while either
-direction is outstanding is not sent; other sessions remain independent. The
-gate opens when that session's `history` reply arrives and is discarded when
-the socket is replaced, so recovery from a lost reply requires connection
-recovery rather than starting an ambiguous second request on the same socket.
-`TmuxMux` deliberately does not expire this gate while that socket stays live:
-a late tokenless reply could otherwise be mistaken for the retry's response.
+per-session lease that records the socket on which the request was written.
+Both return `true` only when the frame was written to that socket. They return
+`false` when the mux is disposed, the socket is not open or rejects the send,
+or another history request for that session is outstanding. A caller may
+establish local state before the call to tolerate a synchronous test double,
+but it must roll that state back on `false`; rejected calls are not queued.
+Different sessions can page concurrently during normal operation.
+
+If an accepted request times out, call `recoverHistoryRequest(session)` before
+retrying. It returns `false` when that session has no request to abandon.
+Only the caller whose paging method returned `true` may recover that lease; a
+caller rejected with `false` does not own it and must not cancel it.
+When the request still belongs to the current shared socket, recovery detaches
+and closes that socket and attempts to start a replacement connection. Every
+active session briefly reconnects and re-subscribes because one WebSocket
+carries them all. When an unrelated disconnect already retired the request's
+socket, recovery only settles that stale lease; it does not close the
+replacement. Either path returns `true`, and retry must wait until a socket is
+open.
+
+A retired socket's leases deliberately survive until their original callers
+recover. This prevents a still-active caller from consuming a new caller's
+broadcast reply after reconnect, including when a different session forced the
+shared socket replacement. Late frames from the retired socket are fenced by
+both handler detachment and socket identity checks. `TermView` performs
+recovery after its 5-second archive-reply timeout and when it unmounts with an
+accepted request still outstanding.
+
+The socket boundary is deliberate. Expiring the gate on the same socket, or
+relying only on a component-local request id, cannot correlate a tokenless late
+reply once a retry is active. That reply could belong to a different anchor or
+direction and be applied as the retry; merely reporting rejection would expose
+the deadlock without restoring progress. Connection recovery plus the boolean
+acceptance result preserves both unambiguous attribution and retry liveness.
 
 Custom hosts remain source-compatible because `HistoryArchiveLike.readAfter`
 is optional. A host must implement it to support forward paging; otherwise the

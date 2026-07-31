@@ -483,3 +483,219 @@ describe('TmuxMux subscription teardown', () => {
     socket.finishClose();
   });
 });
+
+describe('TmuxMux archive history paging', () => {
+  test('sends an explicit forward anchor and limit on the wire', () => {
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    mux.requestHistoryAfter('work', 41, 17);
+
+    expect(socket.frames().filter((frame) => frame.type === 'history_expand')).toEqual([
+      { type: 'history_expand', session: 'work', afterLine: 41, limit: 17 },
+    ]);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('preserves a null forward anchor and omits an unspecified limit', () => {
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    mux.requestHistoryAfter('work', null);
+
+    expect(socket.frames().filter((frame) => frame.type === 'history_expand')).toEqual([
+      { type: 'history_expand', session: 'work', afterLine: null },
+    ]);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('serializes backward and forward requests per session until each history reply', () => {
+    const mux = new TmuxMux();
+    const unsubscribeWork = mux.subscribe('work', () => {});
+    const unsubscribeOther = mux.subscribe('other', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    mux.requestHistory('work', 100, 25);
+    mux.requestHistoryAfter('work', 40, 10);
+    mux.requestHistoryAfter('other', null);
+
+    const historyFrames = () => socket.frames().filter((frame) => frame.type === 'history_expand');
+    expect(historyFrames()).toEqual([
+      { type: 'history_expand', session: 'work', beforeLine: 100, limit: 25 },
+      { type: 'history_expand', session: 'other', afterLine: null },
+    ]);
+
+    socket.receive({
+      channel: 'work',
+      type: 'history',
+      data: '{"lines":[],"startLine":null,"hasMore":false}',
+    });
+    mux.requestHistoryAfter('work', 40, 10);
+    mux.requestHistory('work', 30, 5);
+
+    expect(historyFrames()).toEqual([
+      { type: 'history_expand', session: 'work', beforeLine: 100, limit: 25 },
+      { type: 'history_expand', session: 'other', afterLine: null },
+      { type: 'history_expand', session: 'work', afterLine: 40, limit: 10 },
+    ]);
+
+    socket.receive({
+      channel: 'work',
+      type: 'history',
+      data: '{"lines":[],"startLine":null,"hasMore":false}',
+    });
+    mux.requestHistory('work', 30, 5);
+
+    expect(historyFrames().at(-1)).toEqual({
+      type: 'history_expand',
+      session: 'work',
+      beforeLine: 30,
+      limit: 5,
+    });
+
+    unsubscribeWork();
+    unsubscribeOther();
+    socket.finishClose();
+  });
+
+  test('reports accepted, blocked, and pre-open history requests to the caller', () => {
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+
+    expect(mux.requestHistory('work', 100, 25)).toBe(false);
+    socket.open();
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    expect(mux.requestHistoryAfter('work', 40, 10)).toBe(false);
+
+    // Generic errors cover unrelated operations and cannot be correlated to
+    // this tokenless request, so they must not release its wire lease.
+    socket.receive({ channel: 'work', type: 'error', data: 'unrelated failure' });
+    expect(mux.requestHistoryAfter('work', 40, 10)).toBe(false);
+
+    socket.receive({
+      channel: 'work',
+      type: 'history',
+      data: '{"lines":[],"startLine":null,"hasMore":false}',
+    });
+    expect(mux.requestHistoryAfter('work', 40, 10)).toBe(true);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('retries on a replacement socket so a late different-anchor reply is fenced', () => {
+    const deliveries: string[] = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type) => {
+      if (type === 'history') deliveries.push(data);
+    });
+    const first = FakeWebSocket.instances[0]!;
+    first.open();
+
+    expect(mux.recoverHistoryRequest('work')).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    const staleMessage = first.onmessage!;
+    expect(mux.recoverHistoryRequest('work')).toBe(true);
+
+    const replacement = FakeWebSocket.instances[1]!;
+    expect(first.readyState).toBe(FakeWebSocket.CLOSING);
+    expect(first.onmessage).toBeNull();
+    replacement.open();
+    expect(mux.requestHistoryAfter('work', 40, 10)).toBe(true);
+
+    // Model an event already queued by the browser before handler detachment.
+    staleMessage({
+      data: JSON.stringify({
+        channel: 'work',
+        type: 'history',
+        data: 'old-before-100',
+      }),
+    });
+    expect(deliveries).toEqual([]);
+    expect(replacement.frames().filter((frame) => frame.type === 'history_expand')).toEqual([
+      { type: 'history_expand', session: 'work', afterLine: 40, limit: 10 },
+    ]);
+
+    replacement.receive({
+      channel: 'work',
+      type: 'history',
+      data: 'new-after-40',
+    });
+    expect(deliveries).toEqual(['new-after-40']);
+
+    unsubscribe();
+    replacement.finishClose();
+  });
+
+  test('keeps other-session leases tied to the retired socket during recovery', () => {
+    const mux = new TmuxMux();
+    const unsubscribeWork = mux.subscribe('work', () => {});
+    const unsubscribeOther = mux.subscribe('other', () => {});
+    const first = FakeWebSocket.instances[0]!;
+    first.open();
+
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    expect(mux.requestHistory('other', 200, 25)).toBe(true);
+    expect(mux.recoverHistoryRequest('work')).toBe(true);
+
+    const replacement = FakeWebSocket.instances[1]!;
+    replacement.open();
+
+    // `other` still has a local caller waiting for the request sent on first.
+    // Do not admit a new request whose broadcast reply that caller could steal.
+    expect(mux.requestHistoryAfter('other', 40, 10)).toBe(false);
+
+    // Once that caller settles, its already-retired wire is safe to release.
+    // This must not close the unrelated replacement created by `work`.
+    expect(mux.recoverHistoryRequest('other')).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(replacement.readyState).toBe(FakeWebSocket.OPEN);
+    expect(mux.requestHistoryAfter('other', 40, 10)).toBe(true);
+    expect(replacement.frames().filter((frame) => frame.type === 'history_expand')).toEqual([
+      { type: 'history_expand', session: 'other', afterLine: 40, limit: 10 },
+    ]);
+
+    replacement.receive({
+      channel: 'other',
+      type: 'history',
+      data: 'new-after-40',
+    });
+    unsubscribeWork();
+    unsubscribeOther();
+    replacement.finishClose();
+  });
+
+  test('reports a fenced request even when replacement setup throws', () => {
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', () => {});
+    const first = FakeWebSocket.instances[0]!;
+    first.open();
+
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    mux.configure({
+      getUrl: () => {
+        throw new Error('replacement URL unavailable');
+      },
+    });
+
+    expect(mux.recoverHistoryRequest('work')).toBe(true);
+    expect(first.readyState).toBe(FakeWebSocket.CLOSING);
+    expect(first.onmessage).toBeNull();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(mux.requestHistory('work', 80, 25)).toBe(false);
+
+    unsubscribe();
+    mux.dispose();
+  });
+});

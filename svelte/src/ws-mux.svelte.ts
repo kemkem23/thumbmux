@@ -148,6 +148,8 @@ export class TmuxMux {
   private settleCancel: (() => void) | null = null;
   /** A failed delta requests one full replacement; later deltas wait for it. */
   private resyncingSessions = new Set<string>();
+  /** Session leases mapped to the socket that owns the tokenless reply. */
+  private historyInflight = new Map<string, WebSocket>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -724,6 +726,17 @@ export class TmuxMux {
           }
           return;
         }
+        // History replies have no request token or direction marker. Release
+        // the per-session wire gate before subscriber callbacks so a callback
+        // can request the next page synchronously. Do this before the no-subs
+        // return too: a reply racing an unsubscribe still settles the request.
+        if (
+          msg.type === 'history'
+          && typeof msg.channel === 'string'
+          && this.historyInflight.get(msg.channel) === socket
+        ) {
+          this.historyInflight.delete(msg.channel);
+        }
         const cbs = typeof msg.channel === 'string' ? this.subs.get(msg.channel) : undefined;
         if (!cbs) return;
 
@@ -930,6 +943,7 @@ export class TmuxMux {
     this.sessionCallbacks.clear();
     this.pendingResizeBySession.clear();
     this.deferredDeltas.clear();
+    this.historyInflight.clear();
     this.opts = {};
   }
 
@@ -1023,10 +1037,72 @@ export class TmuxMux {
     this.sendResizeNow(session, { cols, rows });
   }
 
+  private sendHistoryRequest(
+    session: string,
+    cursor: { beforeLine: number | null } | { afterLine: number | null },
+    limit?: number,
+  ): boolean {
+    if (this.disposed || this.historyInflight.has(session)) return false;
+    const socket = this.ws;
+    if (!socket) return false;
+
+    // Mark before send so even a synchronous WebSocket test double cannot
+    // deliver the reply before the gate exists. Roll back a dropped/failed
+    // send; only frames actually written to this socket count as in-flight.
+    this.historyInflight.set(session, socket);
+    if (!this.send(socket, {
+      type: 'history_expand',
+      session,
+      ...cursor,
+      ...(limit === undefined ? {} : { limit }),
+    })) {
+      if (this.historyInflight.get(session) === socket) {
+        this.historyInflight.delete(session);
+      }
+      return false;
+    }
+    return true;
+  }
+
   /** Expand capture history when the viewer scrolls to the top. */
-  requestHistory(session: string, beforeLine?: number | null, limit = 500) {
-    if (this.disposed) return;
-    this.send(this.ws, { type: 'history_expand', session, beforeLine: beforeLine ?? null, limit });
+  requestHistory(session: string, beforeLine?: number | null, limit = 500): boolean {
+    return this.sendHistoryRequest(session, { beforeLine: beforeLine ?? null }, limit);
+  }
+
+  /** Page archived capture history forward from an exclusive line anchor. */
+  requestHistoryAfter(session: string, afterLine: number | null, limit?: number): boolean {
+    return this.sendHistoryRequest(session, { afterLine }, limit);
+  }
+
+  /**
+   * Fence an abandoned tokenless history request before its caller retries.
+   * If its socket is still current, replace the whole multiplexed socket;
+   * otherwise that socket is already fenced and only its stale lease remains.
+   */
+  recoverHistoryRequest(session: string): boolean {
+    if (this.disposed) return false;
+    const requestSocket = this.historyInflight.get(session);
+    if (!requestSocket) return false;
+    this.historyInflight.delete(session);
+
+    // A normal disconnect may already have fenced the request's wire. Its
+    // lease deliberately survived that replacement so another caller could
+    // not consume a new reply while the original caller still considered its
+    // request active. Settling that stale lease must not retire the new wire.
+    if (this.ws !== requestSocket) return true;
+
+    this.connected = false;
+    this.cancelReconnect();
+    this.releaseSocket(requestSocket, true);
+    this.reconnectDelay = RECONNECT_MIN;
+    try {
+      this.ensureConnection();
+    } catch {
+      // The ambiguous wire is already fenced and its lease is settled. Treat
+      // replacement setup as best-effort so the boolean recovery contract
+      // remains represented even when a host URL/socket factory throws.
+    }
+    return true;
   }
 }
 
