@@ -212,3 +212,97 @@ test("a beforeLine-only client still selects readBefore when both archive direct
     mux.stop();
   }
 });
+
+test("a throwing readAfter still returns the no-archive page and logs the failure", () => {
+  const logs: unknown[][] = [];
+  const archive: HistoryArchiveLike = {
+    ingestSnapshot: (_session, content) => ({ liveContent: content }),
+    readBefore: () => ({ lines: [], startLine: null, hasMore: false }),
+    readAfter: () => {
+      throw new Error("readAfter exploded");
+    },
+    renameSession: () => {},
+  };
+  const mux = new TmuxWsMux({
+    driver: fakeDriver(),
+    archive,
+    logError: (...args: unknown[]) => { logs.push(args); },
+  });
+  const noArchiveMux = new TmuxWsMux({ driver: fakeDriver() });
+  const ws = new FakeWS();
+  const noArchiveWs = new FakeWS();
+  const request: MuxClientMessage = {
+    type: "history_expand",
+    session: SESSION,
+    afterLine: 41,
+    limit: 2,
+  };
+  let thrown: unknown;
+
+  try {
+    try {
+      mux.handleMessage(request, ws);
+    } catch (error) {
+      thrown = error;
+    }
+    noArchiveMux.handleMessage(request, noArchiveWs);
+
+    expect(ws.sent).toEqual(noArchiveWs.sent);
+    expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+    expect(thrown).toBeUndefined();
+    expect(logs).toEqual([[
+      `[thumbmux-mux] archive readAfter error for "${SESSION}":`,
+      "readAfter exploded",
+    ]]);
+  } finally {
+    mux.stop();
+    noArchiveMux.stop();
+  }
+});
+
+test("a throwing readBefore still returns the no-archive page and logs the failure", () => {
+  const logs: unknown[][] = [];
+  const archive: HistoryArchiveLike = {
+    ingestSnapshot: (_session, content) => ({ liveContent: content }),
+    readBefore: () => {
+      throw new Error("readBefore exploded");
+    },
+    readAfter: () => ({ lines: [], startLine: null, hasMore: false }),
+    renameSession: () => {},
+  };
+  const mux = new TmuxWsMux({
+    driver: fakeDriver(),
+    archive,
+    logError: (...args: unknown[]) => { logs.push(args); },
+  });
+  const noArchiveMux = new TmuxWsMux({ driver: fakeDriver() });
+  const ws = new FakeWS();
+  const noArchiveWs = new FakeWS();
+  const request: MuxClientMessage = {
+    type: "history_expand",
+    session: SESSION,
+    beforeLine: 42,
+    limit: 7,
+  };
+  let thrown: unknown;
+
+  try {
+    try {
+      mux.handleMessage(request, ws);
+    } catch (error) {
+      thrown = error;
+    }
+    noArchiveMux.handleMessage(request, noArchiveWs);
+
+    expect(ws.sent).toEqual(noArchiveWs.sent);
+    expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+    expect(thrown).toBeUndefined();
+    expect(logs).toEqual([[
+      `[thumbmux-mux] archive readBefore error for "${SESSION}":`,
+      "readBefore exploded",
+    ]]);
+  } finally {
+    mux.stop();
+    noArchiveMux.stop();
+  }
+});

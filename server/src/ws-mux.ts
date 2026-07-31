@@ -198,6 +198,7 @@ export type TmuxWsMuxOptions<WS extends WsLike = WsLike> = {
 };
 
 const DEFAULT_PROFILE: SessionProfile = { resize: true, currentPaneOnly: false, archive: true };
+const EMPTY_HISTORY_PAGE = { lines: [], startLine: null, hasMore: false };
 
 export class TmuxWsMux<WS extends WsLike = WsLike> {
   private compressFrames = false;
@@ -1180,18 +1181,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
-    if (!this.archive) {
-      // No archive configured (the demo's default) — answer with an explicit
-      // empty page instead of silence, so clients stop waiting/retrying.
+    let history: unknown = EMPTY_HISTORY_PAGE;
+    if (this.archive) {
       try {
-        this.wsSend(ws, JSON.stringify({
-          channel: session, type: "history",
-          data: JSON.stringify({ lines: [], startLine: null, hasMore: false }),
-        } satisfies MuxServerMessage));
-      } catch {}
-      return;
+        history = this.archive.readBefore(session, beforeLine ?? null, limit);
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        this.logError(`[thumbmux-mux] archive readBefore error for "${session}":`, message);
+      }
     }
-    const history = this.archive.readBefore(session, beforeLine ?? null, limit);
+    // No archive (or a failed archive read) answers with an explicit empty
+    // page so the client stops waiting. The two cases stay wire-identical.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,
@@ -1202,18 +1202,17 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
   }
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
-    if (!this.archive?.readAfter) {
-      // A host-provided archive may predate forward paging. Match the no-
-      // archive response exactly rather than throwing or reading backward.
+    let history: unknown = EMPTY_HISTORY_PAGE;
+    if (this.archive?.readAfter) {
       try {
-        this.wsSend(ws, JSON.stringify({
-          channel: session, type: "history",
-          data: JSON.stringify({ lines: [], startLine: null, hasMore: false }),
-        } satisfies MuxServerMessage));
-      } catch {}
-      return;
+        history = this.archive.readAfter(session, afterLine, limit);
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        this.logError(`[thumbmux-mux] archive readAfter error for "${session}":`, message);
+      }
     }
-    const history = this.archive.readAfter(session, afterLine, limit);
+    // A legacy archive without forward paging, a missing archive, and a
+    // failed forward read all use the established empty-page wire response.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,
