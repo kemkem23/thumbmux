@@ -37,11 +37,17 @@
   let basePath = $derived(normalizeBasePath(adapters.basePath));
   let palette = $derived(defaultSurface(adapters.theme?.defaultBg ?? '#101014').palette);
   let presets = $derived([...(adapters.spawn?.presets ?? DEFAULT_LAUNCH_PRESETS)]);
-  let gridSessions = $derived.by((): GridSession[] => (
-    adapters.sessionMeta
+  let gridSessions = $derived.by((): GridSession[] => {
+    const sessions = adapters.sessionMeta
       ? adapters.sessionMeta(rows)
-      : rows.map((row) => ({ name: row.name }))
-  ));
+      : rows.map((row) => ({ name: row.name }));
+    const surfaceFor = adapters.theme?.surfaceFor;
+    if (!surfaceFor) return sessions;
+    return sessions.map((session) => {
+      const surface = surfaceFor(session.name);
+      return surface ? { ...session, palette: surface.palette } : session;
+    });
+  });
 
   function normalizeBasePath(value: string | undefined): string {
     const path = (value ?? '/api').trim();
@@ -128,7 +134,7 @@
     let active = true;
     viewActive = true;
     const sessions = createSessionsStore({
-      mux: tmuxMux,
+      mux: adapters.mux ?? tmuxMux,
       fetchSessions: adapters.fetchSessions ?? (() => fetchDefaultSessions(basePath)),
     });
     const unsubscribe = sessions.subscribe((snapshot) => {

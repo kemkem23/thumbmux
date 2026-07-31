@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { LaunchPreset, LaunchSpec, SessionListItem } from '@thumbmux/core';
+import {
+  defaultSurface,
+  type LaunchPreset,
+  type LaunchSpec,
+  type SessionListItem,
+} from '@thumbmux/core';
 import { tmuxMux } from '@thumbmux/svelte';
 import type { Component } from 'svelte';
 import { flushSync, mount, tick, unmount } from '../../svelte/tests/svelte-client';
@@ -120,6 +125,64 @@ afterEach(() => {
 });
 
 describe('HubView', () => {
+  test('renders authoritative rows pushed through the host mux adapter', async () => {
+    let pushRows: (rows: SessionListItem[]) => void = () => {};
+    const adapterMux = {
+      connected: true,
+      onSessions(callback: (rows: SessionListItem[]) => void) {
+        pushRows = callback;
+        return () => {
+          pushRows = () => {};
+        };
+      },
+    } as unknown as NonNullable<AppAdapters['mux']>;
+    const { target } = mountHub({
+      adapters: {
+        mux: adapterMux,
+        fetchSessions: async () => [],
+      },
+    });
+    await settleUi();
+
+    flushSync(() => pushRows([
+      session('adapter-push-one'),
+      session('adapter-push-two'),
+    ]));
+    await settleUi();
+
+    expect(target.querySelectorAll('[data-testid="grid-card"][data-session^="adapter-push-"]')).toHaveLength(2);
+    expect(target.querySelector('[data-testid="hub-count"]')?.textContent).toBe('2 sessions');
+  });
+
+  test('renders thumbnail colors from the current host surface', async () => {
+    const hostSurface = defaultSurface('#e4d3c2');
+    const fallbackSurface = defaultSurface('#101014');
+    const { target } = mountHub({
+      adapters: {
+        fetchSessions: async () => [
+          session('surface-session'),
+          session('fallback-session'),
+        ],
+        theme: {
+          defaultBg: fallbackSurface.tbg,
+          surfaceFor: (name) => name === 'surface-session' ? hostSurface : null,
+        },
+      },
+    });
+    await settleUi();
+
+    const thumbnail = target.querySelector<HTMLElement>(
+      '[data-testid="grid-card"][data-session="surface-session"] [data-testid="session-thumb"]',
+    );
+    expect(thumbnail?.style.getPropertyValue('--tbg')).toBe(hostSurface.palette.defaultBg);
+    expect(thumbnail?.style.getPropertyValue('--tfg')).toBe(hostSurface.palette.defaultFg);
+    expect(thumbnail?.style.getPropertyValue('--tbg')).not.toBe(fallbackSurface.palette.defaultBg);
+    const fallbackThumbnail = target.querySelector<HTMLElement>(
+      '[data-testid="grid-card"][data-session="fallback-session"] [data-testid="session-thumb"]',
+    );
+    expect(fallbackThumbnail?.style.getPropertyValue('--tbg')).toBe(fallbackSurface.palette.defaultBg);
+  });
+
   test('mounts the real grid and renders metadata computed from normalized rows', async () => {
     const sourceRow = session('session-one', {
       windows: 3,
@@ -242,13 +305,20 @@ describe('HubView', () => {
     expect(opened).toEqual(['launched-session']);
   });
 
-  test('keeps the launcher open, clears busy state, and surfaces launch errors', async () => {
+  test('lets a host label replace the complete launch error line', async () => {
+    const labelMessages: string[] = [];
     const adapters: AppAdapters = {
       fetchSessions: async () => [],
       spawn: {
         presets: [preset],
         launch: async () => {
           throw new Error('policy rejected request');
+        },
+      },
+      labels: {
+        launchFailed: (message) => {
+          labelMessages.push(message);
+          return message.toUpperCase();
         },
       },
     };
@@ -260,7 +330,8 @@ describe('HubView', () => {
     await settleUi();
 
     expect(target.querySelector('[data-testid="launch-sheet"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="launch-sheet"] .err')?.textContent?.trim().length).toBeGreaterThan(0);
+    expect(labelMessages).toEqual(['policy rejected request']);
+    expect(target.querySelector('[data-testid="launch-sheet"] .err')?.textContent?.trim()).toBe('POLICY REJECTED REQUEST');
     expect(button(target, '[data-testid="launch-go"]').disabled).toBe(false);
   });
 
