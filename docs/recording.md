@@ -2,9 +2,66 @@
 
 This document describes the server-side `FrameJournal` NDJSON recorder as a
 host-neutral recording primitive. `FrameJournal` is exported from
-`thumbmux/server`; host integration remains separate controller work.
+`thumbmux/server`. `TmuxWsMux` exposes its canonical output through the
+optional `hooks.onOutput` seam; the host still owns recording lifecycle,
+authorization, routes, and replay-player data loading.
 
-No existing route, mux transport, demo UI, or replay player wiring is claimed by this document.
+No recording route, demo UI, or replay-player wiring is claimed by this document.
+
+## Connect a journal to `TmuxWsMux`
+
+`onOutput(session, frame)` receives one canonical, untailored **full** snapshot
+for each fresh visual state the mux captures. It is intentionally not the
+per-viewer wire frame: viewers may receive different tail slices or deltas,
+while `FrameJournal.capture()` accepts a full `output` frame and chooses its own
+strictly-smaller deltas and checkpoints for storage.
+
+A cursor-only wire update is included. The hook receives the current full data
+again with the new cursor, so replay preserves caret movement without a second
+tmux capture. A session-wide resize reset remains on the full frame; a
+viewer-local resync/cached/backpressure catch-up does not create a duplicate
+journal event. A throwing hook is logged and isolated from every viewer.
+
+The following is a complete typed connection using the reference Bun driver.
+`closeSession()` drains admitted writes, retains the file, and lets a later
+start append a new full boundary. Use `recoverSession()` instead of
+`startSession()` when a process restart must recover an existing journal base.
+
+<!-- recording-hook-example -->
+```ts
+import { createBunTmuxDriver, FrameJournal, TmuxWsMux } from "thumbmux/server";
+
+const activeRecordings = new Set<string>();
+const journal = new FrameJournal({ rootDir: ".thumbmux-recordings" });
+
+export const mux = new TmuxWsMux({
+  driver: createBunTmuxDriver(),
+  hooks: {
+    onOutput(session, frame) {
+      if (activeRecordings.has(session)) journal.capture(session, frame);
+    },
+  },
+});
+
+export function startRecording(session: string): void {
+  journal.startSession(session);
+  activeRecordings.add(session);
+}
+
+export async function stopRecording(session: string): Promise<void> {
+  activeRecordings.delete(session);
+  await journal.closeSession(session);
+}
+
+export async function shutdown(): Promise<void> {
+  mux.stop();
+  activeRecordings.clear();
+  await journal.stop();
+}
+```
+
+The mux only captures sessions that currently have viewers. The hook reuses
+those mux captures; it does not start a separate headless polling loop.
 
 ## Persisted schema
 

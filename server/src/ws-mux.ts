@@ -143,6 +143,15 @@ export interface MuxHooks<
   ): { apply: boolean };
   /** Backpressure lifecycle for host telemetry/alerting. Never affects mux behaviour. */
   onBackpressure?(ws: WS, event: "blocked" | "drained" | "closed", info: { blockedMs: number; bufferedBytes?: number }): void;
+  /**
+   * Canonical pane state after a fresh mux capture. The frame is always a
+   * complete, unsliced `output` snapshot even when viewers receive tail-sliced
+   * or delta wire frames. Cursor-only changes repeat the current data with the
+   * new cursor so recorders can preserve the complete visual timeline.
+   *
+   * This is a telemetry tap: throwing is isolated from viewer delivery.
+   */
+  onOutput?(session: string, frame: MuxFullOutputFrame): void;
   /** Per-principal session-list authorization. Called with the provider's rows for EVERY delivery to
    * that socket — the initial `sessions_subscribe` reply, every push, and backpressure drain catch-up.
    * Return the subset this socket may see (do not mutate the input array).
@@ -734,6 +743,38 @@ export class TmuxWsMux<
     const x = a ?? null, y = b ?? null;
     if (x === null || y === null) return x === y;
     return x.row === y.row && x.col === y.col;
+  }
+
+  /**
+   * Best-effort canonical output tap. Keep the absent-hook path allocation-free:
+   * the frame object only exists for hosts that explicitly install the seam.
+   * Hook and logger failures are both contained here so neither can fall into
+   * captureAndBroadcastAsync's session-gone catch and disturb viewers.
+   */
+  private emitOutputHook(
+    session: string,
+    data: string,
+    cursor: { row: number; col: number } | null,
+    reset?: "resize" | "resync",
+  ): void {
+    const hook = this.hooks.onOutput;
+    if (!hook) return;
+    const frame: MuxFullOutputFrame = {
+      channel: session,
+      type: "output",
+      data,
+      cursor: cursor ? { ...cursor } : null,
+      ...(reset ? { reset } : {}),
+    };
+    try {
+      hook(session, frame);
+    } catch (cause: any) {
+      let message = "unknown error";
+      try {
+        message = cause && typeof cause.message === "string" ? cause.message : String(cause);
+      } catch {}
+      try { this.logError("[thumbmux-mux] onOutput threw:", message); } catch {}
+    }
   }
 
   /** Tear down every timer this instance owns (poll, session list, burst,
@@ -1706,6 +1747,14 @@ export class TmuxWsMux<
             if (fulls?.has(ws) || resets?.has(ws)) pendingViewers.add(ws);
           }
           if (cursorMoved) this.lastCursor.set(session, atomicCursor);
+          if ((cursorMoved || archiveReflowGeneration !== undefined) && this.hooks.onOutput) {
+            this.emitOutputHook(
+              session,
+              liveContent,
+              cursor,
+              archiveReflowGeneration !== undefined ? "resize" : undefined,
+            );
+          }
           this.sendPendingOutputFrames(session, viewers, liveContent, cursor);
           if (cursorMoved) {
             const cursorMsg = JSON.stringify({
@@ -1727,6 +1776,7 @@ export class TmuxWsMux<
         if (atomicCursor !== undefined) {
           if (cursorMoved) {
             this.lastCursor.set(session, atomicCursor);
+            if (this.hooks.onOutput) this.emitOutputHook(session, liveContent, atomicCursor);
             const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor: atomicCursor } satisfies MuxServerMessage);
             for (const ws of viewers) {
               this.sendCursorFrame(session, ws, cursorMsg);
@@ -1749,6 +1799,14 @@ export class TmuxWsMux<
       if (!this.ownsSessionLifecycle(session, viewers)) return;
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
+      if (this.hooks.onOutput) {
+        this.emitOutputHook(
+          session,
+          liveContent,
+          cursor,
+          archiveReflowGeneration !== undefined ? "resize" : undefined,
+        );
+      }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
     } catch {
       if (!this.ownsSessionLifecycle(session, viewers)) return;

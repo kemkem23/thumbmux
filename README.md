@@ -266,11 +266,13 @@ still owns these integration points:
   principal on the socket, authorize every parsed client message before handing
   it to the mux, and filter every session-list delivery; see
   [the token-guard contract](docs/security.md).
-- **Recording connection.** `FrameJournal`, `parseReplayJournal()`, and
-  `RecordingPlayer` provide recording, replay, and playback building blocks.
-  `TmuxWsMux` has no output-recording hook, so the host must feed each observed
-  full output frame to `FrameJournal.capture()` and own the recording routes
-  and player data loading; see [the recording contract](docs/recording.md).
+- **Recording storage and routes.** `FrameJournal`, `parseReplayJournal()`, and
+  `RecordingPlayer` provide recording, replay, and playback building blocks, and
+  `MuxHooks.onOutput` taps the canonical full frame after each capture so the
+  host does not have to poll a second time. The host still decides what to
+  record, owns the journal's storage, and supplies the start/stop/download
+  routes and the player's data loading; see
+  [the recording contract](docs/recording.md).
 - **“Agent needs a human” detection.** The notification contract validates
   host-supplied `finished` / `waiting` events, and the browser helpers can show
   them. The host must detect agent state transitions and supply, persist, and
