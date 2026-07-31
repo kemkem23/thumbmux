@@ -306,3 +306,62 @@ test("a throwing readBefore still returns the no-archive page and logs the failu
     noArchiveMux.stop();
   }
 });
+
+for (const direction of ["before", "after"] as const) {
+  const method = direction === "before" ? "readBefore" : "readAfter";
+
+  test(`a throwing ${method} and throwing logger still produce exactly one empty history frame`, () => {
+    let archiveCalls = 0;
+    const logs: unknown[][] = [];
+    const archive: HistoryArchiveLike = {
+      ingestSnapshot: (_session, content) => ({ liveContent: content }),
+      readBefore: () => {
+        if (direction === "before") {
+          archiveCalls += 1;
+          throw new Error("readBefore exploded");
+        }
+        return { lines: [], startLine: null, hasMore: false };
+      },
+      readAfter: () => {
+        if (direction === "after") {
+          archiveCalls += 1;
+          throw new Error("readAfter exploded");
+        }
+        return { lines: [], startLine: null, hasMore: false };
+      },
+      renameSession: () => {},
+    };
+    const mux = new TmuxWsMux({
+      driver: fakeDriver(),
+      archive,
+      logError: (...args: unknown[]) => {
+        logs.push(args);
+        throw new Error("error logger exploded");
+      },
+    });
+    const ws = new FakeWS();
+    const request: MuxClientMessage = direction === "after"
+      ? { type: "history_expand", session: SESSION, afterLine: 41, limit: 2 }
+      : { type: "history_expand", session: SESSION, beforeLine: 42, limit: 7 };
+    let thrown: unknown;
+
+    try {
+      try {
+        mux.handleMessage(request, ws);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(archiveCalls).toBe(1);
+      expect(logs).toEqual([[
+        `[thumbmux-mux] archive ${method} error for "${SESSION}":`,
+        `${method} exploded`,
+      ]]);
+      expect(ws.sent).toHaveLength(1);
+      expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+      expect(thrown).toBeUndefined();
+    } finally {
+      mux.stop();
+    }
+  });
+}

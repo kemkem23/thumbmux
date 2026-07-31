@@ -1180,14 +1180,28 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
     }
   }
 
+  private reportArchiveReadErrorBestEffort(
+    method: "readBefore" | "readAfter",
+    session: string,
+    error: unknown,
+  ): void {
+    try {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logError(`[thumbmux-mux] archive ${method} error for "${session}":`, message);
+    } catch {
+      // The archive failure is represented by the empty-page reply below.
+      // Logging is observability-only; retrying or using another logger could
+      // throw recursively, so a logger failure must not replace that reply.
+    }
+  }
+
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
     if (this.archive) {
       try {
         history = this.archive.readBefore(session, beforeLine ?? null, limit);
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : String(e);
-        this.logError(`[thumbmux-mux] archive readBefore error for "${session}":`, message);
+        this.reportArchiveReadErrorBestEffort("readBefore", session, e);
       }
     }
     // No archive (or a failed archive read) answers with an explicit empty
@@ -1207,8 +1221,7 @@ export class TmuxWsMux<WS extends WsLike = WsLike> {
       try {
         history = this.archive.readAfter(session, afterLine, limit);
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : String(e);
-        this.logError(`[thumbmux-mux] archive readAfter error for "${session}":`, message);
+        this.reportArchiveReadErrorBestEffort("readAfter", session, e);
       }
     }
     // A legacy archive without forward paging, a missing archive, and a
