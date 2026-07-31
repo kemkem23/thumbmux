@@ -161,6 +161,20 @@ the allowlist. Session lists must be filtered before both their initial output
 and every pushed update; authorization to subscribe to a list does not by
 itself filter the list payload.
 
+The reference `createBunTmuxDriver()` also uses exact tmux targets by default.
+This closes tmux's bare-target prefix/fnmatch fallback after an allowed session
+dies—for example, an operation authorized for `agent` cannot silently land on
+`agent-2`. The same default applies to `spawnTmuxSession()` command delivery
+and `killTmuxSession()`. Names beginning with `=` remain literal; callers pass
+the name unchanged and the driver produces the doubled exact marker required by
+tmux. See [Reference Bun driver target resolution](protocol.md#reference-bun-driver-target-resolution)
+for syntax and the explicit `targetMode: "legacy"` compatibility option.
+
+Exact driver targeting is defense in depth, not authorization: it prevents a
+requested name from resolving to a different session, but it does not decide
+whether the requester may access the exact session in the first place. Keep the
+principal-bound message and route checks described above.
+
 ## Host routes and parsed input
 
 The current demo-facing operations include:

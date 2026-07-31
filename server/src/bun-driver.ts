@@ -8,6 +8,40 @@ import type { RawCursorState, TmuxDriver } from "./ws-mux";
 
 const LARGE_INPUT_THRESHOLD_BYTES = 8 * 1024;
 
+export type TmuxTargetMode = "exact" | "legacy";
+
+export type TmuxTargetOptions = {
+  /**
+   * `exact` (default) prevents tmux from falling through to prefix/fnmatch
+   * resolution. `legacy` passes names through unchanged for hosts that
+   * deliberately depend on tmux's native target matching.
+   */
+  targetMode?: TmuxTargetMode;
+};
+
+/** Exact target-session syntax. A name beginning with `=` is escaped by the
+ * added marker: `=agent` becomes `==agent`. */
+export function exactTmuxTarget(name: string): string {
+  return `=${name}`;
+}
+
+/** Pane/window commands need an explicit empty suffix after the exact session
+ * name. Without `:`, tmux 3.4 does not resolve `=session` as a target pane. */
+function exactTmuxPaneTarget(name: string): string {
+  return `${exactTmuxTarget(name)}:`;
+}
+
+function targetResolvers(options: TmuxTargetOptions): {
+  pane(name: string): string;
+  session(name: string): string;
+} {
+  const legacy = options.targetMode === "legacy";
+  return {
+    pane: legacy ? (name) => name : exactTmuxPaneTarget,
+    session: legacy ? (name) => name : exactTmuxTarget,
+  };
+}
+
 function run(args: string[]): string {
   const p = Bun.spawnSync(["tmux", ...args]);
   if (p.exitCode !== 0) throw new Error(p.stderr.toString().trim() || `tmux ${args[0]} failed`);
@@ -20,13 +54,13 @@ function runWithStdin(args: string[], stdin: Uint8Array): string {
   return p.stdout.toString();
 }
 
-function sendLargeInput(session: string, bytes: Uint8Array) {
+function sendLargeInput(target: string, bytes: Uint8Array) {
   const bufferName = `thumbmux-input-${crypto.randomUUID()}`;
   try {
     runWithStdin(["load-buffer", "-b", bufferName, "-"], bytes);
     // -r preserves LF bytes instead of translating them to tmux's separator
     // (CR by default), keeping this path byte-identical to send-keys -l.
-    run(["paste-buffer", "-d", "-r", "-b", bufferName, "-t", session]);
+    run(["paste-buffer", "-d", "-r", "-b", bufferName, "-t", target]);
   } finally {
     // -d covers successful pastes; this also clears a buffer if loading or
     // pasting fails midway.
@@ -40,11 +74,12 @@ function parseCursorLine(line: string): RawCursorState | null {
   return { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 };
 }
 
-export function createBunTmuxDriver(): TmuxDriver {
+export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver {
   // Refreshed by getSessionActivity(), which the mux already calls once per
   // poll. listSessions() reuses this sample so adding activityAt never adds a
   // second list-windows invocation to a poll.
   let latestActivity = new Map<string, number>();
+  const target = targetResolvers(options);
 
   return {
     listSessions() {
@@ -65,7 +100,7 @@ export function createBunTmuxDriver(): TmuxDriver {
       }
     },
     async capturePane(session, opts) {
-      const args = ["capture-pane", "-t", session, "-p", "-e"];
+      const args = ["capture-pane", "-t", target.pane(session), "-p", "-e"];
       if (!opts.currentPaneOnly && typeof opts.startLine === "number") {
         args.push("-S", String(opts.startLine));
       }
@@ -79,10 +114,10 @@ export function createBunTmuxDriver(): TmuxDriver {
       // NUL cannot be represented in an argv entry (Bun/execve rejects it),
       // so even a one-byte Ctrl-Space must travel through load-buffer stdin.
       if (bytes.byteLength <= LARGE_INPUT_THRESHOLD_BYTES && !data.includes("\0")) {
-        run(["send-keys", "-t", session, "-l", "--", data]);
+        run(["send-keys", "-t", target.pane(session), "-l", "--", data]);
         return;
       }
-      sendLargeInput(session, bytes);
+      sendLargeInput(target.pane(session), bytes);
     },
     getSessionActivity() {
       // window_activity, NOT session_activity: the session timestamp freezes
@@ -108,17 +143,17 @@ export function createBunTmuxDriver(): TmuxDriver {
       } catch { return 2000; }
     },
     setSessionHistoryLimit(session, limit) {
-      run(["set-option", "-t", session, "history-limit", String(limit)]);
+      run(["set-option", "-t", target.pane(session), "history-limit", String(limit)]);
     },
     resizeWindow(session, cols, rows) {
-      run(["resize-window", "-t", session, "-x", String(cols), "-y", String(rows)]);
+      run(["resize-window", "-t", target.pane(session), "-x", String(cols), "-y", String(rows)]);
     },
     hash(content) {
       return Bun.hash(content).toString(36);
     },
     async getCursor(session) {
       try {
-        const out = run(["display-message", "-t", session, "-p",
+        const out = run(["display-message", "-t", target.pane(session), "-p",
           "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}"]).trim();
         return parseCursorLine(out);
       } catch {
@@ -130,9 +165,10 @@ export function createBunTmuxDriver(): TmuxDriver {
       // back, so the (content, cursor) pair cannot desync the way two
       // separate calls can during a TUI repaint. display-message goes first —
       // its single line is trivially split off the top of the output.
-      const args = ["display-message", "-t", session, "-p",
+      const paneTarget = target.pane(session);
+      const args = ["display-message", "-t", paneTarget, "-p",
         "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}",
-        ";", "capture-pane", "-t", session, "-p", "-e"];
+        ";", "capture-pane", "-t", paneTarget, "-p", "-e"];
       if (!opts.currentPaneOnly && typeof opts.startLine === "number") {
         args.push("-S", String(opts.startLine));
       }
@@ -151,12 +187,18 @@ export function createBunTmuxDriver(): TmuxDriver {
 }
 
 /** Spawn a session (optionally running a command inside a fresh shell). */
-export function spawnTmuxSession(name: string, cwd: string, command?: string) {
+export function spawnTmuxSession(
+  name: string,
+  cwd: string,
+  command?: string,
+  options: TmuxTargetOptions = {},
+) {
+  const target = targetResolvers(options).pane(name);
   run(["new-session", "-d", "-s", name, "-c", cwd]);
-  if (command) run(["send-keys", "-t", name, "-l", "--", command]);
-  if (command) run(["send-keys", "-t", name, "Enter"]);
+  if (command) run(["send-keys", "-t", target, "-l", "--", command]);
+  if (command) run(["send-keys", "-t", target, "Enter"]);
 }
 
-export function killTmuxSession(name: string) {
-  run(["kill-session", "-t", name]);
+export function killTmuxSession(name: string, options: TmuxTargetOptions = {}) {
+  run(["kill-session", "-t", targetResolvers(options).session(name)]);
 }

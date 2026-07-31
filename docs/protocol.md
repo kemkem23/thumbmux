@@ -159,6 +159,36 @@ Two driver hooks exist; implement `captureWithCursor` unless you cannot:
   content changed. Correct ONLY for drivers whose `capturePane` preserves
   trailing blank rows; no caret-only updates.
 
+### Reference Bun driver target resolution
+
+`createBunTmuxDriver()` treats every session name as an exact tmux target by
+default. This matters after a session disappears: tmux normally resolves a bare
+target by exact name, then prefix, then fnmatch, so a stale request for `agent`
+could otherwise operate on `agent-2`. The exact policy also covers the command
+delivery performed by `spawnTmuxSession()` and the destructive
+`killTmuxSession()` helper.
+
+tmux uses different target grammars internally. Pane/window operations receive
+`=name:` while `kill-session` receives `=name`. Callers still pass the ordinary
+session name returned by `listSessions()`; do not add either marker yourself. A
+literal session name beginning with `=` is supported: `=agent` becomes
+`==agent:` for pane/window operations and `==agent` for `kill-session`, which
+selects the leading-equals name exactly.
+
+Hosts that intentionally use tmux prefix or pattern resolution can opt out
+explicitly:
+
+```ts
+const driver = createBunTmuxDriver({ targetMode: "legacy" });
+spawnTmuxSession(name, cwd, command, { targetMode: "legacy" });
+killTmuxSession(name, { targetMode: "legacy" });
+```
+
+The option is per driver or per helper call, rather than mutable module state,
+so exact and legacy integrations can coexist without changing one another.
+`legacy` passes the name through unchanged and therefore restores both prefix
+and fnmatch resolution; use it only when that behavior is deliberate.
+
 ## Upload endpoint (createUploadHandler)
 
 `POST /api/upload` (multipart, field `files`, ≤10 files) → `201 {ok:true, files:[{original,
