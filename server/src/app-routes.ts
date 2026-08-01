@@ -61,6 +61,68 @@ export interface AppRoutes<WS> {
 
 const WS_PATH = "/ws/tmux";
 const decoder = new TextDecoder();
+const LIVE_AUTHORIZATION_RECHECK_MS = 100;
+const LIVE_AUTHORIZATION_PROBE: MuxClientMessage = Object.freeze({ type: "ping" });
+
+type RevokeObserver = () => void;
+type RevokeObserverEntry = {
+  original: TokenGuard["revoke"];
+  wrapped: TokenGuard["revoke"];
+  observers: Set<RevokeObserver>;
+};
+
+const revokeObservers = new WeakMap<TokenGuard, RevokeObserverEntry>();
+
+function observeRevocations(guard: TokenGuard, observer: RevokeObserver): () => void {
+  let entry = revokeObservers.get(guard);
+  if (!entry) {
+    let original: TokenGuard["revoke"];
+    try {
+      original = guard.revoke;
+    } catch {
+      return () => {};
+    }
+    const observers = new Set<RevokeObserver>();
+    const wrapped: TokenGuard["revoke"] = (token) => {
+      const revoked = Reflect.apply(original, guard, [token]) as boolean;
+      if (revoked) {
+        for (const notify of [...observers]) {
+          try {
+            notify();
+          } catch {
+            // Revocation must not fail because one route cannot clean up.
+          }
+        }
+      }
+      return revoked;
+    };
+    try {
+      guard.revoke = wrapped;
+      if (guard.revoke !== wrapped) return () => {};
+    } catch {
+      // A read-only custom guard still gets bounded expiry/revocation polling.
+      return () => {};
+    }
+    entry = { original, wrapped, observers };
+    revokeObservers.set(guard, entry);
+  }
+
+  entry.observers.add(observer);
+  return () => {
+    entry!.observers.delete(observer);
+    if (entry!.observers.size > 0) return;
+    try {
+      if (guard.revoke === entry!.wrapped) {
+        guard.revoke = entry!.original;
+        if (guard.revoke !== entry!.original) return;
+      }
+    } catch {
+      // Keep the inert wrapper registered if a custom guard became read-only.
+      return;
+    }
+    revokeObservers.delete(guard);
+  };
+}
 
 function normalizeBasePath(value: string | undefined): string {
   const path = (value ?? "/api").trim();
@@ -180,10 +242,87 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
     ? new FileHistoryArchive({})
     : options.archive;
   const guard = options.guard;
-  const socketPrincipals = new WeakMap<WsLike, TokenPrincipal>();
+  // Revocation is event-driven; expiry uses a bounded per-socket check. Neither
+  // path adds authorization work to the mux's per-frame broadcast hot path.
+  const socketPrincipals = new Map<WsLike, TokenPrincipal>();
+  const authorizationTimers = new Map<WsLike, ReturnType<typeof setTimeout>>();
+  const socketCleanupNotified = new WeakSet<WsLike>();
+  const withdrawingSockets = new WeakSet<WsLike>();
+  let stopObservingRevocations: (() => void) | null = null;
+  let stopped = false;
+  let mux: TmuxWsMux;
   // The websocket receives only an opaque, server-created object. Its
   // token-free principal stays in this closure until open binds the socket.
   const upgradePrincipals = new WeakMap<object, TokenPrincipal>();
+
+  const clearAuthorizationTimer = (ws: WsLike): void => {
+    const timer = authorizationTimers.get(ws);
+    if (timer) clearTimeout(timer);
+    authorizationTimers.delete(ws);
+  };
+
+  const stopRevocationObserverIfIdle = (): void => {
+    if (socketPrincipals.size > 0 || !stopObservingRevocations) return;
+    const stop = stopObservingRevocations;
+    stopObservingRevocations = null;
+    stop();
+  };
+
+  const forgetSocketAuthorization = (ws: WsLike): void => {
+    clearAuthorizationTimer(ws);
+    socketPrincipals.delete(ws);
+    stopRevocationObserverIfIdle();
+  };
+
+  const principalIsActive = (principal: TokenPrincipal): boolean => {
+    if (!guard) return true;
+    try {
+      return guard.authorizeMuxMessage(LIVE_AUTHORIZATION_PROBE, principal).ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const withdrawSocket = (ws: WsLike): void => {
+    if (!socketPrincipals.has(ws)) return;
+    // WsLike does not promise close(), so revoke application-level access by
+    // removing every pane, session-list, and drain subscription instead.
+    withdrawingSockets.add(ws);
+    try {
+      mux.unsubscribeAll(ws);
+    } finally {
+      withdrawingSockets.delete(ws);
+    }
+  };
+
+  const sweepRevokedSockets = (): void => {
+    for (const [ws, principal] of [...socketPrincipals]) {
+      if (!principalIsActive(principal)) withdrawSocket(ws);
+    }
+  };
+
+  const ensureRevocationObserver = (): void => {
+    if (!guard || stopped || stopObservingRevocations) return;
+    stopObservingRevocations = observeRevocations(guard, sweepRevokedSockets);
+  };
+
+  const armAuthorizationCheck = (ws: WsLike, principal: TokenPrincipal): void => {
+    if (stopped) return;
+    clearAuthorizationTimer(ws);
+    const timer = setTimeout(() => {
+      if (authorizationTimers.get(ws) !== timer) return;
+      authorizationTimers.delete(ws);
+      if (socketPrincipals.get(ws) !== principal) return;
+      if (!principalIsActive(principal)) {
+        withdrawSocket(ws);
+        return;
+      }
+      armAuthorizationCheck(ws, principal);
+    }, LIVE_AUTHORIZATION_RECHECK_MS);
+    authorizationTimers.set(ws, timer);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  };
+
   const hostHooks = options.mux?.hooks;
   const muxHooks: MuxHooks | undefined = guard
     ? {
@@ -207,8 +346,20 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
             ({ name }) => name,
           );
         },
+        canSubscribe(session, ws, client) {
+          if (hostHooks?.canSubscribe?.(session, ws, client) === false) {
+            return false;
+          }
+          const principal = socketPrincipals.get(ws);
+          if (principal && principalIsActive(principal)) return true;
+          withdrawSocket(ws);
+          return false;
+        },
         onSocketClose(ws) {
-          socketPrincipals.delete(ws);
+          forgetSocketAuthorization(ws);
+          if (withdrawingSockets.has(ws)) return;
+          if (socketCleanupNotified.has(ws)) return;
+          socketCleanupNotified.add(ws);
           // TmuxWsMux performs the rest of its socket teardown after this
           // callback, so a host cleanup failure must not strand subscribers.
           try {
@@ -222,7 +373,7 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
   const muxLog = options.log
     ? (...args: unknown[]) => options.log!(args.map(String).join(" "))
     : options.mux?.log;
-  const mux = new TmuxWsMux({
+  mux = new TmuxWsMux({
     ...options.mux,
     driver,
     archive,
@@ -230,6 +381,27 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
     ...(muxHooks ? { hooks: muxHooks } : {}),
     ...(muxLog ? { log: muxLog } : {}),
   });
+
+  if (guard) {
+    const stopMux = mux.stop.bind(mux);
+    mux.stop = () => {
+      if (stopped) {
+        stopMux();
+        return;
+      }
+      stopped = true;
+      for (const ws of [...socketPrincipals.keys()]) withdrawSocket(ws);
+      for (const timer of authorizationTimers.values()) clearTimeout(timer);
+      authorizationTimers.clear();
+      socketPrincipals.clear();
+      if (stopObservingRevocations) {
+        const stop = stopObservingRevocations;
+        stopObservingRevocations = null;
+        stop();
+      }
+      stopMux();
+    };
+  }
 
   const spawnHandler = options.spawn === false
     ? null
@@ -266,6 +438,9 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
           // Bun ignores this response after hijacking the request. A non-null
           // sentinel keeps "null" unambiguously reserved for host-owned routes.
           return new Response(null, { status: 204 });
+        }
+        if (stopped) {
+          return new Response("websocket unavailable", { status: 503 });
         }
 
         const authorization = authenticateAndAuthorize(
@@ -409,7 +584,11 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
         }
         const decision = guard.authorizeMuxMessage(message, principal);
         if (!decision.ok) {
-          sendAuthError(ws, decision);
+          try {
+            sendAuthError(ws, decision);
+          } finally {
+            if (decision.status === 401) withdrawSocket(ws);
+          }
           return;
         }
         if (!message) {
@@ -421,6 +600,13 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
       open(ws): void {
         if (guard) {
           const data = (ws as WsLike & { data?: unknown }).data;
+          if (stopped) {
+            if (typeof data === "object" && data !== null) {
+              upgradePrincipals.delete(data);
+            }
+            return;
+          }
+          socketCleanupNotified.delete(ws);
           const principal = typeof data === "object" && data !== null
             ? upgradePrincipals.get(data)
             : undefined;
@@ -429,7 +615,17 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
             return;
           }
           upgradePrincipals.delete(data as object);
+          const decision = guard.authorizeMuxMessage(
+            LIVE_AUTHORIZATION_PROBE,
+            principal,
+          );
+          if (!decision.ok) {
+            sendAuthError(ws, decision);
+            return;
+          }
           socketPrincipals.set(ws, principal);
+          ensureRevocationObserver();
+          armAuthorizationCheck(ws, principal);
         }
         mux.subscribeSessions(ws);
       },
@@ -444,6 +640,13 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
         mux.unsubscribeAll(ws);
       },
       drain(ws): void {
+        if (guard) {
+          const principal = socketPrincipals.get(ws);
+          if (!principal || !principalIsActive(principal)) {
+            withdrawSocket(ws);
+            return;
+          }
+        }
         mux.handleDrain(ws);
       },
     },

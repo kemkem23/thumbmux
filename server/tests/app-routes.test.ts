@@ -660,6 +660,344 @@ describe("createAppRoutes", () => {
     }
   }, 30_000);
 
+  test("V1 attack: an expired token stops an already-subscribed output stream", async () => {
+    const driver = createBunTmuxDriver();
+    const session = appRoutesPrefix("expiry-stream");
+    const initialMarker = `APPROUTES_BEFORE_EXPIRY_${Date.now()}`;
+    const afterMarker = `APPROUTES_AFTER_EXPIRY_${Date.now()}`;
+    const token = `app-routes-expiry-stream-${process.pid}-${Date.now()}`;
+    const controlToken = `app-routes-expiry-control-${process.pid}-${Date.now()}`;
+    const expiresAt = 2_000;
+    let now = 1_000;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token,
+          scope: "read",
+          expiresAt,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: 10_000,
+          sessions: [session],
+        },
+      ],
+      now: () => now,
+    });
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 30,
+        pollBurstMs: 15,
+        pollReconcileMs: 30,
+        sessionListIntervalMs: 30,
+      },
+    });
+    let server: ReturnType<typeof Bun.serve> | null = null;
+    let ws: WebSocket | null = null;
+    let controlWs: WebSocket | null = null;
+
+    try {
+      spawnTmuxSession(session, "/tmp", `printf '${initialMarker}\\n'`);
+      await until(
+        () => paneContains(session, initialMarker),
+        "expiry attack fixture did not reach its tmux pane",
+      );
+      server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req, bunServer) {
+          return await routes.fetch(req, bunServer)
+            ?? new Response("host fallback", { status: 418 });
+        },
+        websocket: routes.websocket,
+      });
+      ws = new WebSocket(
+        `ws://127.0.0.1:${server.port}/ws/tmux?t=${encodeURIComponent(token)}`,
+      );
+      const frames = collectFrames(ws);
+      await until(() => ws?.readyState === WebSocket.OPEN, "expiry websocket did not open");
+      ws.send(JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => frames.some((frame) => frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(initialMarker)),
+        "allowed pre-expiry output did not arrive",
+      );
+      controlWs = new WebSocket(
+        `ws://127.0.0.1:${server.port}/ws/tmux?t=${encodeURIComponent(controlToken)}`,
+      );
+      const controlFrames = collectFrames(controlWs);
+      await until(
+        () => controlWs?.readyState === WebSocket.OPEN,
+        "expiry control websocket did not open",
+      );
+      controlWs.send(JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => controlFrames.some((frame) => frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(initialMarker)),
+        "expiry control did not receive the authorized baseline",
+      );
+
+      now = expiresAt;
+      await Bun.sleep(250);
+      const typed = Bun.spawnSync([
+        "tmux", "send-keys", "-t", `=${session}:`, "-l",
+        `printf '${afterMarker}\\n'`,
+      ]);
+      expect(typed.exitCode).toBe(0);
+      const submitted = Bun.spawnSync(["tmux", "send-keys", "-t", `=${session}:`, "Enter"]);
+      expect(submitted.exitCode).toBe(0);
+      await until(
+        () => paneContains(session, afterMarker),
+        "post-expiry marker did not reach the pane",
+      );
+      await until(
+        () => controlFrames.some((frame) => frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(afterMarker)),
+        "unexpired control did not receive post-expiry output",
+      );
+      await Bun.sleep(25);
+
+      const leaked = frames.some((frame) => frame.channel === session
+        && frame.data?.includes(afterMarker));
+      console.log(`V1_EXPIRY_ATTACK leakedAfterExpiry=${leaked}`);
+      expect(leaked).toBe(false);
+    } finally {
+      await closeWebSocket(ws);
+      await closeWebSocket(controlWs);
+      if (server) await server.stop(true);
+      routes.mux.stop();
+      killQuietly(session);
+    }
+  }, 30_000);
+
+  test("V1 attack: revoked subscribed socket stops receiving fresh pane output", async () => {
+    const session = appRoutesPrefix("v1-revoke");
+    const beforeMarker = `V1_BEFORE_REVOKE_${Date.now()}`;
+    const afterMarker = `V1_AFTER_REVOKE_${Date.now()}`;
+    const token = `v1-revoke-${process.pid}-${Date.now()}`;
+    const controlToken = `v1-revoke-control-${process.pid}-${Date.now()}`;
+    const driver = createBunTmuxDriver();
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+      ],
+    });
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 20,
+        pollBurstMs: 10,
+        pollReconcileMs: 25,
+        sessionListIntervalMs: 25,
+      },
+    });
+    let server: ReturnType<typeof Bun.serve> | null = null;
+    let ws: WebSocket | null = null;
+    let controlWs: WebSocket | null = null;
+
+    try {
+      spawnTmuxSession(session, "/tmp", `printf '${beforeMarker}\\n'`);
+      await until(
+        () => paneContains(session, beforeMarker),
+        "V1 revoke fixture did not reach its pane",
+      );
+      server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req, bunServer) {
+          return await routes.fetch(req, bunServer)
+            ?? new Response("host fallback", { status: 418 });
+        },
+        websocket: routes.websocket,
+      });
+      ws = new WebSocket(
+        `ws://127.0.0.1:${server.port}/ws/tmux?t=${encodeURIComponent(token)}`,
+      );
+      const frames = collectFrames(ws);
+      await until(
+        () => ws?.readyState === WebSocket.OPEN,
+        "V1 revoked-output socket did not open",
+      );
+      ws.send(JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => frames.some((frame) => (
+          frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(beforeMarker)
+        )),
+        "V1 revoked-output socket did not receive the authorized baseline",
+      );
+      controlWs = new WebSocket(
+        `ws://127.0.0.1:${server.port}/ws/tmux?t=${encodeURIComponent(controlToken)}`,
+      );
+      const controlFrames = collectFrames(controlWs);
+      await until(
+        () => controlWs?.readyState === WebSocket.OPEN,
+        "V1 revoke control websocket did not open",
+      );
+      controlWs.send(JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => controlFrames.some((frame) => (
+          frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(beforeMarker)
+        )),
+        "V1 revoke control did not receive the authorized baseline",
+      );
+
+      expect(guard.revoke(token)).toBe(true);
+      driver.sendKeys(session, `printf '${afterMarker}\\n'\\r`);
+      await until(
+        () => paneContains(session, afterMarker),
+        "V1 post-revoke marker did not reach the pane",
+      );
+      await until(
+        () => controlFrames.some((frame) => (
+          frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(afterMarker)
+        )),
+        "unrevoked control did not receive post-revoke output",
+      );
+      await Bun.sleep(25);
+
+      const leaked = frames.some((frame) => (
+        frame.type === "output"
+        && frame.channel === session
+        && frame.data?.includes(afterMarker)
+      ));
+      console.log(`V1_REVOKE_ATTACK leakedAfterRevoke=${leaked}`);
+      expect(leaked).toBe(false);
+    } finally {
+      await closeWebSocket(ws);
+      await closeWebSocket(controlWs);
+      if (server) await server.stop(true);
+      routes.mux.stop();
+      killQuietly(session);
+    }
+  }, 30_000);
+
+  test("V1 revoke attack: revocation during subscribe blocks cached output", async () => {
+    const session = appRoutesPrefix("revoke-subscribe");
+    const marker = `V1_CACHED_BEFORE_REVOKE_${Date.now()}`;
+    const token = `v1-revoke-subscribe-${process.pid}-${Date.now()}`;
+    const controlToken = `v1-revoke-subscribe-control-${process.pid}-${Date.now()}`;
+    const driver = inertDriver();
+    driver.capturePane = async () => marker;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+      ],
+    });
+    let revokeResult: boolean | null = null;
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 20,
+        pollReconcileMs: 20,
+        hooks: {
+          onSubscribe(_session, _ws, client) {
+            if ((client as { revoke?: boolean } | undefined)?.revoke) {
+              revokeResult = guard.revoke(token);
+            }
+          },
+        },
+      },
+    });
+    const upgrade = async (credential: string): Promise<unknown> => {
+      let data: unknown;
+      const response = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(credential)}`),
+        {
+          upgrade(_req, options) {
+            data = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(response?.status).toBe(204);
+      return data;
+    };
+    const control = createCapturingSocket(await upgrade(controlToken));
+    const attacker = createCapturingSocket(await upgrade(token));
+
+    try {
+      routes.websocket.open(control);
+      routes.websocket.message(control, JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => control.frames.some((frame) => frame.type === "output"
+          && frame.channel === session
+          && frame.data?.includes(marker)),
+        "control did not seed cached output before the subscribe-time revoke",
+      );
+
+      routes.websocket.open(attacker);
+      attacker.frames.length = 0;
+      routes.websocket.message(attacker, JSON.stringify({
+        type: "subscribe",
+        session,
+        client: { revoke: true },
+      }));
+
+      const leaked = attacker.frames.some((frame) => frame.type === "output"
+        && frame.channel === session
+        && frame.data?.includes(marker));
+      console.log(`V1_SUBSCRIBE_REVOKE_ATTACK leakedCachedOutput=${leaked}`);
+      expect(revokeResult).toBe(true);
+      expect(leaked).toBe(false);
+    } finally {
+      routes.websocket.close(attacker);
+      routes.websocket.close(control);
+      routes.mux.stop();
+    }
+  });
+
   test("authenticates upgrades, filters pushed lists, and rechecks expiry per message", async () => {
     const allowedSession = appRoutesPrefix("fake-a");
     const deniedSession = appRoutesPrefix("fake-b");

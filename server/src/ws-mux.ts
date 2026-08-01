@@ -121,6 +121,9 @@ export interface MuxHooks<
   /** Refresh host-owned descriptor state for this socket. */
   onClientInfo?(ws: WS, client: unknown): void;
   onSubscribe?(session: string, ws: WS, client: unknown): void;
+  /** Final admission check after onSubscribe side effects. false leaves every
+   * mux subscription/cache structure untouched for this request. */
+  canSubscribe?(session: string, ws: WS, client: unknown): boolean;
   onUnsubscribe?(session: string, ws: WS, client: unknown): void;
   /** socket closed — release any per-socket state (size holds, telemetry) */
   onSocketClose?(ws: WS): void;
@@ -359,6 +362,7 @@ export class TmuxWsMux<
 
   subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number; delta?: boolean } = {}) {
     this.hooks.onSubscribe?.(session, ws, client);
+    if (this.hooks.canSubscribe?.(session, ws, client) === false) return;
     let set = this.subscribers.get(session);
     if (!set) {
       set = new Set();
