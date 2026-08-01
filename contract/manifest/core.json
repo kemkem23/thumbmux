@@ -336,6 +336,12 @@
     "tier": "X"
   },
   {
+    "name": "MuxAuthErrorFrame",
+    "kind": "type",
+    "signature": "d05f3bbad2d06b845059de1819835ff1411cd3f7d554ec178f6253f8acab7d67",
+    "tier": "S"
+  },
+  {
     "name": "MuxClientInfo",
     "kind": "type",
     "signature": "23f405fbb93420256be16c348629bc520fde802f42541b83c7c94d30abfe5c49",
@@ -396,9 +402,15 @@
     "tier": "F"
   },
   {
+    "name": "MuxServerFrame",
+    "kind": "type",
+    "signature": "6994738cd7106bbe764621c2de8ba4e3dee74a0408c594decee15de895c0b5b7",
+    "tier": "S"
+  },
+  {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "13c7d5ac607111d329b1feb013cc9e4964989e97d64243647205c5f461f6a1a4",
+    "signature": "391d0b900c47671287fe820a5d48e7fc5546162b3755f056d6feca3fb0bb860f",
     "tier": "F"
   },
   {
@@ -426,15 +438,15 @@
     "tier": "F"
   },
   {
-    "name": "pasteInfo",
-    "kind": "value",
-    "signature": "384c7c89321b4fa0559006682a0f0ff5301aef174f3190bc5a3191e12a485b96",
-    "tier": "X"
-  },
-  {
     "name": "PasteInfo",
     "kind": "type",
     "signature": "9f3ba62e8ad7ea4fda2b0aa27d5d68f16ed55c011348794a94db47301205179a",
+    "tier": "X"
+  },
+  {
+    "name": "pasteInfo",
+    "kind": "value",
+    "signature": "384c7c89321b4fa0559006682a0f0ff5301aef174f3190bc5a3191e12a485b96",
     "tier": "X"
   },
   {

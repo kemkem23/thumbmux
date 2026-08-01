@@ -788,13 +788,13 @@
   {
     "name": "tmuxMux",
     "kind": "value",
-    "signature": "ce54ac43feca14b96901d5cbafe5e17e67fb044c38e88d4ef5d8951c81cdf919",
+    "signature": "587723da723d760c8865dee1928d95c2514d9dcab0d2b8ecc65f28b8b62462bd",
     "tier": "F"
   },
   {
     "name": "TmuxMux",
     "kind": "value",
-    "signature": "175ef9dd441d396a8bb322ac36afe137f53712d0d9398397b6fc1aeccf9a954a",
+    "signature": "ac42ca240c4658fd119ecae1752ce10a0756f26cc1ed137395b3007251b27400",
     "tier": "F"
   },
   {
