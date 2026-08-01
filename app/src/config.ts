@@ -30,12 +30,14 @@ export interface AppAdapters {
    * consumer keeps its own server and mounts only the client shell — so the
    * path shape is not something the package gets to assume. */
   fetchSessions?: () => Promise<SessionListItem[]>;
-  /** The live session stream, the other half of `fetchSessions`. Defaults to the
-   * `@thumbmux/svelte` singleton. Overriding only the bootstrap would let a host
-   * redirect where the first list comes from while every update after it still
-   * arrived from a connection the host never chose — one source of truth,
-   * configurable at one end only. */
+  /** Override the live session-list stream used by `HubView` and `SessionView`
+   * after bootstrap. Defaults to the `@thumbmux/svelte` singleton. This seam
+   * does not replace `TermView`'s pane output, history, resize, or connection
+   * state; it also does not select the default key transport. Those stay on the
+   * shared singleton. `EmbedView` has no session list and does not read `mux`. */
   mux?: TmuxMux;
+  /** Override input independently of the session-list mux. Absent, direct keys
+   * and composer submissions use the shared `@thumbmux/svelte` singleton. */
   sendKeys?: (session: string, keys: string) => void;
   submitAgent?: (session: string) => SubmitAgent;
   routes?: {

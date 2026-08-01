@@ -21,9 +21,6 @@
     minRows?: number;
   } = $props();
 
-  /** One connection for this view: keys must not go somewhere the host did not choose. */
-  const viewMux = adapters.mux ?? tmuxMux;
-
   let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let configuredTermProps = $derived(adapters.termProps?.(session) ?? {});
   let configuredBg = $derived(
@@ -54,7 +51,7 @@
 
   function sendKeysTo(targetSession: string, data: string): void {
     if (adapters.sendKeys) adapters.sendKeys(targetSession, data);
-    else viewMux.sendKeys(targetSession, data);
+    else tmuxMux.sendKeys(targetSession, data);
   }
 
   function sendKeys(data: string): void {
@@ -71,7 +68,7 @@
     const targetSession = session;
     const agent = adapters.submitAgent?.(targetSession) ?? 'generic';
     const transport = adapters.sendKeys
-      ?? ((name: string, keys: string) => viewMux.sendKeys(name, keys));
+      ?? ((name: string, keys: string) => tmuxMux.sendKeys(name, keys));
     for (const step of submitPlan(text, { agent })) {
       if (step.delayBeforeMs > 0) await wait(step.delayBeforeMs);
       transport(targetSession, step.keys);

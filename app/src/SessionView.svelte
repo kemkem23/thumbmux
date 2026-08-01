@@ -55,7 +55,7 @@
   const hostOwnsThemeState = !!adapters.theme;
   const prefs = adapters.prefs ?? createLocalPrefs(adapters.theme?.storageKey ?? LOCAL_PREFS_KEY);
 
-  const sessionMux = adapters.mux ?? tmuxMux;
+  const liveSessionsMux = adapters.mux ?? tmuxMux;
   let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
   let storedFontPx = $state(13);
@@ -132,7 +132,7 @@
   let hudStatus = $derived(
     currentMeta?.stateLabel
       ?? currentMeta?.state
-      ?? (sessionMux.connected ? labels.hudConnected : labels.hudOffline),
+      ?? (tmuxMux.connected ? labels.hudConnected : labels.hudOffline),
   );
   let hasHudPanel = $derived(!!(adapters.notes || adapters.prompts || adapters.extraPanel));
   let uploadEndpoint = $derived(adapters.upload?.endpoint(session) ?? null);
@@ -175,7 +175,7 @@
 
   function sendKeysTo(targetSession: string, data: string): void {
     if (adapters.sendKeys) adapters.sendKeys(targetSession, data);
-    else sessionMux.sendKeys(targetSession, data);
+    else tmuxMux.sendKeys(targetSession, data);
   }
 
   function sendKeys(data: string): void {
@@ -208,7 +208,7 @@
     const targetSession = session;
     const targetAgent = sessionAgent;
     const transport = adapters.sendKeys
-      ?? ((name: string, keys: string) => sessionMux.sendKeys(name, keys));
+      ?? ((name: string, keys: string) => tmuxMux.sendKeys(name, keys));
     const steps = submitPlan(text, { agent: targetAgent });
     return deliverSubmission(targetSession, transport, steps);
   }
@@ -481,7 +481,7 @@
       if (!destroyed && loadGeneration === prefsGeneration) applyPrefs(snapshot);
     }).catch(() => {});
 
-    const unsubscribeSessions = sessionMux.onSessions((rows) => {
+    const unsubscribeSessions = liveSessionsMux.onSessions((rows) => {
       sessionRows = normalizeSessionRows(rows as SessionListItem[]);
     });
     const query = window.matchMedia('(min-width: 1024px)');
