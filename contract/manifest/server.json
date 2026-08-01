@@ -2,19 +2,19 @@
   {
     "name": "AppRoutes",
     "kind": "type",
-    "signature": "38641ac3ccf525443fe09979b805e136093126d48c98f9d0991de6abb03ed1ee",
+    "signature": "e22c213ba975cc023e553a87a93a95c7e924322c255de2b66d31461bfc270bb5",
     "tier": "S"
   },
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "7c180d447f1bd159a74cea274b558fa75be0fe9fad0eb0f396336451ea12a8fd",
+    "signature": "a72d3fd998c2d9b7a0bf29b261f89b524b3f001158523757c4c242ce96eb1f35",
     "tier": "S"
   },
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "20fe4f5386fcf42bc737cbc99000f3d3a8704723846184220523430cd57eed7c",
+    "signature": "75d0ec3ac17231495e7d7fb359fbcfe369e4a4a2204478d6ed809803cdd969ea",
     "tier": "S"
   },
   {
@@ -211,7 +211,7 @@
   {
     "name": "MuxHooks",
     "kind": "type",
-    "signature": "668365a16242fad5251ad3bdcd0b83500c39c6d3f8508e2051404a87c4cd056a",
+    "signature": "37c32e1dce730fbacfcfebdd53214bf127a121754249fdca2a903ad86eecfbc7",
     "tier": "F"
   },
   {
@@ -319,13 +319,13 @@
   {
     "name": "TmuxWsMux",
     "kind": "value",
-    "signature": "75a3c00cd4d79abdf8fe8d434b8cf7dafefdcebfc3a9c775de42036fb8901d49",
+    "signature": "4a86aa4e4632961ca32de53ba0597f5d5b09d16dd096858c681f5490a5dd73f8",
     "tier": "F"
   },
   {
     "name": "TmuxWsMuxOptions",
     "kind": "type",
-    "signature": "5532e34aaf2e9bdca082d376f02cb0f91d72b446d5d2003704976e5235be2431",
+    "signature": "473015c7b059df28e78fe798ca5528eb0ce5237047de95f02c16823ba8f59ff1",
     "tier": "F"
   },
   {
