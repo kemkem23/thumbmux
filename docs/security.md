@@ -398,7 +398,20 @@ below, so a host that uses it does not assemble authorization by hand:
   server-side, keyed to the socket
 - authorizes **every inbound client** mux message, not only the ones that look
   sensitive, and rechecks expiry per message; on the raw WebSocket a denied
-  message receives `{ type: "auth_error", status, code }`
+  message receives `{ type: "auth_error", status, code }`.
+  That frame carries no `channel`, so the packaged browser client cannot route it
+  to a session panel. It re-emits it as a `thumbmux:auth-error` `CustomEvent` on
+  `window`, with the frame as `detail`, so a host can react instead of watching a
+  panel go quiet:
+
+  ```ts
+  window.addEventListener("thumbmux:auth-error", (event) => {
+    const { status, code } = (event as CustomEvent).detail;
+    // 401 -> the credential is gone; 403 -> this principal may not do that
+  });
+  ```
+
+  A host driving a raw WebSocket reads the frame directly and needs none of this.
 - filters the session list on **every** path that emits one — the initial push,
   subsequent pushes, drain catch-up, and the HTTP list — with the guard's
   projection applied last, so a host hook can neither see rows the principal may

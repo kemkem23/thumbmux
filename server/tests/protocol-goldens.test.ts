@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   TmuxWsMux,
   type HistoryArchiveLike,
@@ -24,6 +25,7 @@ const SESSION = "golden-v071";
 const GOLDEN_COMMIT = "82e00cabd515fcda821c236215334e95bffd2faf";
 const CLIENT_GOLDEN_PATH = join(import.meta.dir, "../../contract/goldens/client-v0.7.1.jsonl");
 const SERVER_GOLDEN_PATH = join(import.meta.dir, "../../contract/goldens/server-v0.7.1.jsonl");
+const AUTH_ERROR_GOLDEN_PATH = join(import.meta.dir, "../../contract/goldens/server-v0.8.0.jsonl");
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -53,6 +55,7 @@ function readGolden(path: string): GoldenFile {
 
 const clientGolden = readGolden(CLIENT_GOLDEN_PATH);
 const serverGolden = readGolden(SERVER_GOLDEN_PATH);
+const authErrorGolden = readGolden(AUTH_ERROR_GOLDEN_PATH);
 
 class RecordingWS {
   sent: string[] = [];
@@ -565,5 +568,162 @@ describe("v0.7.1 wire goldens", () => {
 
     const additiveReader = new V071ServerReader();
     expect(frames.map((frame) => additiveReader.read(withUnknownFields(frame)))).toEqual(EXPECTED_SERVER_VARIANTS);
+  });
+});
+
+describe("v0.8.0 additive server wire goldens", () => {
+  test("pins the guarded-route auth_error frame reported by the V1 attack", () => {
+    expect(authErrorGolden.headers.join(" ")).toContain("v0.8.0");
+    expect(authErrorGolden.headers.join(" ")).toContain("appending new lines (additive)");
+    expect(authErrorGolden.lines.map(({ value }) => value)).toEqual([
+      { type: "auth_error", status: 403, code: "forbidden_session" },
+    ]);
+  });
+
+  test("V1 attack: auth_error is assignable to MuxServerMessage", () => {
+    const root = mkdtempSync(join(tmpdir(), "thumbmux-auth-error-typecheck-"));
+    const attackPath = join(root, "auth-error-contract.ts");
+    const protocolPath = resolve(import.meta.dir, "../../core/src/protocol.ts");
+    const frame = authErrorGolden.lines[0]?.value;
+    try {
+      writeFileSync(attackPath, [
+        `import type { MuxServerMessage } from ${JSON.stringify(protocolPath)};`,
+        `const frame: MuxServerMessage = ${JSON.stringify(frame)};`,
+        `const cursor: MuxServerMessage["cursor"] = undefined;`,
+        "void frame;",
+        "void cursor;",
+        "",
+      ].join("\n"));
+      const result = Bun.spawnSync([
+        resolve(import.meta.dir, "../../node_modules/.bin/tsc"),
+        "--noEmit",
+        "--strict",
+        "--target", "ESNext",
+        "--module", "Preserve",
+        "--moduleResolution", "bundler",
+        "--lib", "ESNext,DOM",
+        "--allowImportingTsExtensions",
+        attackPath,
+      ]);
+      const diagnostics = `${result.stdout.toString()}${result.stderr.toString()}`;
+      expect(diagnostics).toBe("");
+      expect(result.exitCode).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("V1 attack: packaged client exposes channel-less auth_error to the host", async () => {
+    type HostListener = (event: { type: string; detail?: unknown }) => void;
+    class HostEventTarget {
+      private listeners = new Map<string, Set<HostListener>>();
+
+      addEventListener(type: string, listener: HostListener): void {
+        let listeners = this.listeners.get(type);
+        if (!listeners) {
+          listeners = new Set();
+          this.listeners.set(type, listeners);
+        }
+        listeners.add(listener);
+      }
+
+      removeEventListener(type: string, listener: HostListener): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      dispatchEvent(event: { type: string; detail?: unknown }): boolean {
+        for (const listener of this.listeners.get(event.type) ?? []) listener(event);
+        return true;
+      }
+    }
+
+    class AuthErrorWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static instances: AuthErrorWebSocket[] = [];
+
+      readyState = AuthErrorWebSocket.CONNECTING;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      sent: string[] = [];
+
+      constructor(_url: string) {
+        AuthErrorWebSocket.instances.push(this);
+      }
+
+      send(data: string): void {
+        this.sent.push(data);
+      }
+
+      close(): void {
+        this.readyState = AuthErrorWebSocket.CLOSING;
+      }
+
+      open(): void {
+        this.readyState = AuthErrorWebSocket.OPEN;
+        this.onopen?.();
+      }
+
+      receive(frame: unknown): void {
+        this.onmessage?.({ data: JSON.stringify(frame) });
+      }
+    }
+
+    const globalNames = ["window", "document", "navigator", "WebSocket", "$state"] as const;
+    const originals = new Map(
+      globalNames.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+    );
+    const setGlobal = (name: typeof globalNames[number], value: unknown): void => {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    };
+    const fakeWindow = Object.assign(new HostEventTarget(), {
+      location: {
+        protocol: "https:",
+        host: "thumbmux.test",
+        href: "https://thumbmux.test/terminal",
+        pathname: "/terminal",
+      },
+      innerWidth: 390,
+      innerHeight: 844,
+      devicePixelRatio: 3,
+      screen: { width: 390, height: 844 },
+      visualViewport: undefined,
+    });
+    const fakeDocument = Object.assign(new HostEventTarget(), { visibilityState: "visible" });
+
+    try {
+      AuthErrorWebSocket.instances = [];
+      setGlobal("$state", <T>(value: T) => value);
+      setGlobal("window", fakeWindow);
+      setGlobal("document", fakeDocument);
+      setGlobal("navigator", { userAgent: "test", language: "en", platform: "test" });
+      setGlobal("WebSocket", AuthErrorWebSocket);
+
+      const { TmuxMux } = await import("../../svelte/src/ws-mux.svelte");
+      const received: unknown[] = [];
+      fakeWindow.addEventListener("thumbmux:auth-error", (event) => received.push(event.detail));
+
+      const mux = new TmuxMux();
+      const stopSessions = mux.onSessions(() => {});
+      const socket = AuthErrorWebSocket.instances[0]!;
+      socket.open();
+      socket.receive({ type: "auth_error", status: 403, code: "forbidden_session" });
+
+      expect(received).toEqual([
+        { type: "auth_error", status: 403, code: "forbidden_session" },
+      ]);
+
+      stopSessions();
+      mux.dispose();
+    } finally {
+      for (const name of globalNames) {
+        const descriptor = originals.get(name);
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete (globalThis as Record<string, unknown>)[name];
+      }
+    }
   });
 });

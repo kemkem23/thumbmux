@@ -116,6 +116,18 @@ function isMuxCursor(value: unknown): value is MuxServerMessage['cursor'] {
   return Number.isInteger(cursor.row) && Number.isInteger(cursor.col);
 }
 
+const AUTH_ERROR_EVENT = 'thumbmux:auth-error';
+
+function isMuxAuthError(
+  value: unknown,
+): value is Extract<MuxServerMessage, { type: 'auth_error' }> {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.type === 'auth_error'
+    && (candidate.status === 401 || candidate.status === 403)
+    && typeof candidate.code === 'string';
+}
+
 export type TmuxMuxOptions = {
   /** WS endpoint; default: <ws(s)>://<host>/ws/tmux */
   getUrl?: () => string;
@@ -716,6 +728,15 @@ export class TmuxMux {
           if (this.pongTimer) {
             clearTimeout(this.pongTimer);
             this.pongTimer = null;
+          }
+          return;
+        }
+        if (isMuxAuthError(msg)) {
+          // Guard denials are connection-scoped and deliberately have no
+          // channel. Surface them before channel routing so browser hosts can
+          // observe the denial instead of receiving silence.
+          if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+            window.dispatchEvent(new CustomEvent(AUTH_ERROR_EVENT, { detail: msg }));
           }
           return;
         }

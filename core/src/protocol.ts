@@ -89,8 +89,14 @@ export type MuxClientMessage = MuxResyncRequest | {
   client?: unknown;
 };
 
-/** Server → client (plus `{type:"pong"}` replies to pings). */
+/** Server → client session frames plus channel-less authorization denials. */
 export type MuxServerMessage = MuxOutputFrame | {
+  type: "auth_error";
+  status: 401 | 403;
+  code: string;
+  /** Authorization denials never carry terminal cursor data. */
+  cursor?: never;
+} | {
   channel: string;
   type: "sessions" | "history" | "error" | "cursor";
   /** Absent on "cursor" frames — they update only the caret. On a
