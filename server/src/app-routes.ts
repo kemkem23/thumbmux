@@ -294,7 +294,11 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
     } finally {
       withdrawingSockets.delete(ws);
       try {
-        ws.close?.();
+        // Duck-typed rather than declared on WsLike: a host adapter may already
+        // carry the standard `close(code, reason)` and declaring a zero-arg
+        // `close?()` on the frozen type makes such a host stop compiling. Same
+        // shape the shed path already uses.
+        (ws as { close?: (...args: never[]) => unknown }).close?.();
       } catch {
         // Transport closure is best effort; subscription withdrawal is not.
       }

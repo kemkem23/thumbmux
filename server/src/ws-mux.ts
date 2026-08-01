@@ -27,7 +27,6 @@ import {
 
 export type WsLike = {
   send(data: string): unknown;
-  close?(): void;
 };
 
 export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem> {
