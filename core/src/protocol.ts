@@ -89,14 +89,8 @@ export type MuxClientMessage = MuxResyncRequest | {
   client?: unknown;
 };
 
-/** Server → client session frames plus channel-less authorization denials. */
+/** Server → client (plus `{type:"pong"}` replies to pings). */
 export type MuxServerMessage = MuxOutputFrame | {
-  type: "auth_error";
-  status: 401 | 403;
-  code: string;
-  /** Authorization denials never carry terminal cursor data. */
-  cursor?: never;
-} | {
   channel: string;
   type: "sessions" | "history" | "error" | "cursor";
   /** Absent on "cursor" frames — they update only the caret. On a
@@ -115,6 +109,18 @@ export type MuxServerMessage = MuxOutputFrame | {
    * re-sent. */
   cursor?: MuxCursor | null;
 };
+
+/** A channel-less authorization denial sent by guarded routes. */
+export type MuxAuthErrorFrame = {
+  type: "auth_error";
+  status: 401 | 403;
+  code: string;
+  /** Authorization denials never carry terminal cursor data. */
+  cursor?: never;
+};
+
+/** All typed server frames, including guarded-route authorization denials. */
+export type MuxServerFrame = MuxServerMessage | MuxAuthErrorFrame;
 
 /** Delivery types exposed to existing mux subscribers (wire deltas reconstruct as output). */
 export type MuxOutputType = "output" | "history" | "error" | "cursor";

@@ -399,6 +399,9 @@ below, so a host that uses it does not assemble authorization by hand:
 - authorizes **every inbound client** mux message, not only the ones that look
   sensitive, and rechecks expiry per message; on the raw WebSocket a denied
   message receives `{ type: "auth_error", status, code }`.
+  The channel-less denial is typed as `MuxAuthErrorFrame`; raw consumers that
+  handle both session messages and denials can use the additive `MuxServerFrame`
+  union. `MuxServerMessage` remains the session-frame union from v0.7.1.
   That frame carries no `channel`, so the packaged browser client cannot route it
   to a session panel. It re-emits it as a `thumbmux:auth-error` `CustomEvent` on
   `window`, with the frame as `detail`, so a host can react instead of watching a
@@ -421,6 +424,16 @@ below, so a host that uses it does not assemble authorization by hand:
   the handler runs, answering `405` with `Allow` on the wrong method
 - requires the explicit `sessions-kill` permission for kill, which existing
   interactive grants do not carry
+
+Live authorization withdrawal is bounded, not universally synchronous. While at
+least one guarded socket is open, calls through the guard's currently installed
+`revoke` property sweep its live subscriptions in that call. A method reference
+saved before that observer was installed, or a custom guard whose method cannot
+be wrapped, instead relies on the per-socket check scheduled every 100 ms; it is
+withdrawn by the next check while the event loop remains responsive. A sweep
+removes the socket from live subscription sets, but does not cancel an output
+frame already captured in an in-progress grouped fan-out: that current frame may
+arrive, while the next broadcast must not. Expiry uses the same scheduled check.
 
 Pass no `guard` and it behaves exactly as before — unauthenticated, as the demo
 and single-user setups expect.

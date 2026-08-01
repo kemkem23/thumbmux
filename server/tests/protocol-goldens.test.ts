@@ -572,6 +572,71 @@ describe("v0.7.1 wire goldens", () => {
 });
 
 describe("v0.8.0 additive server wire goldens", () => {
+  test("V2 attack: v0.7.1 MuxServerMessage consumers compile against the current declaration", () => {
+    const root = mkdtempSync(join(tmpdir(), "thumbmux-v071-source-compat-"));
+    const declarationRoot = join(root, "current-declaration");
+    const declarationPath = join(declarationRoot, "protocol.d.ts");
+    const consumerPath = join(root, "consumer.ts");
+    const protocolPath = resolve(import.meta.dir, "../../core/src/protocol.ts");
+    const tscPath = resolve(import.meta.dir, "../../node_modules/.bin/tsc");
+
+    try {
+      const emit = Bun.spawnSync([
+        tscPath,
+        "--declaration",
+        "--emitDeclarationOnly",
+        "--strict",
+        "--target", "ESNext",
+        "--module", "Preserve",
+        "--moduleResolution", "bundler",
+        "--lib", "ESNext,DOM",
+        "--outDir", declarationRoot,
+        protocolPath,
+      ]);
+      const emitDiagnostics = `${emit.stdout.toString()}${emit.stderr.toString()}`;
+      expect(emitDiagnostics).toBe("");
+      expect(emit.exitCode).toBe(0);
+
+      writeFileSync(consumerPath, [
+        `import type { MuxServerMessage } from ${JSON.stringify(declarationPath)};`,
+        "export function route(frame: MuxServerMessage): string {",
+        "  const channel: string = frame.channel;",
+        "  switch (frame.type) {",
+        "    case \"output\":",
+        "    case \"delta\":",
+        "    case \"sessions\":",
+        "    case \"history\":",
+        "    case \"error\":",
+        "    case \"cursor\":",
+        "      return channel;",
+        "    default: {",
+        "      const exhaustive: never = frame;",
+        "      return exhaustive;",
+        "    }",
+        "  }",
+        "}",
+        "",
+      ].join("\n"));
+
+      const result = Bun.spawnSync([
+        tscPath,
+        "--noEmit",
+        "--strict",
+        "--target", "ESNext",
+        "--module", "Preserve",
+        "--moduleResolution", "bundler",
+        "--lib", "ESNext,DOM",
+        "--allowImportingTsExtensions",
+        consumerPath,
+      ]);
+      const diagnostics = `${result.stdout.toString()}${result.stderr.toString()}`;
+      expect(diagnostics).toBe("");
+      expect(result.exitCode).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("pins the guarded-route auth_error frame reported by the V1 attack", () => {
     expect(authErrorGolden.headers.join(" ")).toContain("v0.8.0");
     expect(authErrorGolden.headers.join(" ")).toContain("appending new lines (additive)");
@@ -580,16 +645,18 @@ describe("v0.8.0 additive server wire goldens", () => {
     ]);
   });
 
-  test("V1 attack: auth_error is assignable to MuxServerMessage", () => {
+  test("V1 attack: auth_error is exposed through additive server frame types", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-auth-error-typecheck-"));
     const attackPath = join(root, "auth-error-contract.ts");
     const protocolPath = resolve(import.meta.dir, "../../core/src/protocol.ts");
     const frame = authErrorGolden.lines[0]?.value;
     try {
       writeFileSync(attackPath, [
-        `import type { MuxServerMessage } from ${JSON.stringify(protocolPath)};`,
-        `const frame: MuxServerMessage = ${JSON.stringify(frame)};`,
-        `const cursor: MuxServerMessage["cursor"] = undefined;`,
+        `import type { MuxAuthErrorFrame, MuxServerFrame } from ${JSON.stringify(protocolPath)};`,
+        `const denial: MuxAuthErrorFrame = ${JSON.stringify(frame)};`,
+        "const frame: MuxServerFrame = denial;",
+        "const cursor: MuxAuthErrorFrame[\"cursor\"] = undefined;",
+        "void denial;",
         "void frame;",
         "void cursor;",
         "",

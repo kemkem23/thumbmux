@@ -6,6 +6,7 @@
 
 import {
   splitMuxOutputData,
+  type MuxAuthErrorFrame,
   type MuxClientInfo,
   type MuxOutputType as OutputType,
   type MuxServerMessage,
@@ -120,7 +121,7 @@ const AUTH_ERROR_EVENT = 'thumbmux:auth-error';
 
 function isMuxAuthError(
   value: unknown,
-): value is Extract<MuxServerMessage, { type: 'auth_error' }> {
+): value is MuxAuthErrorFrame {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return candidate.type === 'auth_error'
