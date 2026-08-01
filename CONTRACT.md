@@ -18,7 +18,7 @@ not complete unless one of these layers can expose a violation.
 | --- | --- | --- |
 | Surface gate | `contract/manifest/core.json`, `server.json`, `svelte.json`, and `app.json`, checked by `scripts/contract-check.ts` against declarations from a freshly built `git-dist` | A missing or changed F/S export, a new export with no intentional tier, or removal before a recorded deprecation date makes the check fail. The manifest records each name, kind, tier, declaration signature, and deprecation metadata. |
 | Frozen consumers | `contract/fixtures/minimal-host`, `guarded-host`, and `app-host`, run by `scripts/contract-fixtures.sh` against the packed `git-dist` artifact | Public types that no longer compile and integration behavior that no longer works make a representative consumer fail. |
-| Wire compatibility | `contract/goldens/*.jsonl` and `server/tests/protocol-goldens.test.ts`, supplemented by `server/tests/conformance.test.ts` | A current server that rejects an old client message, a change to any frame shape an old reader parses today, or a pinned protocol semantic that changes makes a test fail. It does **not** claim that no new frame kind may appear: a reader that rejects unknown kinds outright is outside what these goldens verify. `auth_error` is exactly that case — emitted only when a host opts into a guard, ignored safely by the bundled client of any version, and shape-gated like every other frame, but a strict custom reader must tolerate unknown kinds before enabling a guard. |
+| Wire compatibility | `contract/goldens/*.jsonl` and `server/tests/protocol-goldens.test.ts`, supplemented by `server/tests/conformance.test.ts` | A current server that rejects a recorded old client message, a change to any frame shape recorded in the goldens, or a pinned protocol semantic that changes makes a test fail. The goldens pin what they record — a frame kind or field never recorded is not covered by them, only by the surface gate. It does **not** claim that no new frame kind may appear: a reader that rejects unknown kinds outright is outside what these goldens verify. `auth_error` is exactly that case — emitted only when a host opts into a guard, ignored safely by the bundled client of any version, and shape-gated like every other frame, but a strict custom reader must tolerate unknown kinds before enabling a guard. |
 | Deprecation ceremony | Emitted `.d.ts` JSDoc, manifest metadata, the `Deprecated` section of `CHANGELOG.md`, `core/src/deprecate.test.ts`, and the frozen-fixture review rule below | A missing stamp, malformed runtime warning, early removal, or unsupported old spelling blocks the release. |
 | Distribution rail | `.github/workflows/release.yml`, `scripts/smoke-git-dist.sh`, and the resolved commit in a consumer lockfile | The release workflow builds and tests the artifact, consumer smoke tests its public entry points, and each release creates a new exact `-dist` tag rather than changing an older pin. |
 
@@ -90,6 +90,21 @@ For an F-tier Svelte component, the frozen surface is the set and declaration
 of its existing props. Adding an optional prop is an additive minor change;
 removing or changing an existing prop is breaking. Component declaration hashes
 in the surface gate and the frozen app consumer check this distinction.
+
+The same rule applies to an F-tier interface a host implements or supplies, such
+as `MuxHooks` and `TmuxDriver`. **Adding an optional member is additive**;
+removing one, renaming one, or changing the signature of an existing one is
+breaking. This is a deliberate decision, not an oversight. These interfaces exist
+to be extended — an extension point that can never gain a member without a major
+release is not an extension point — and every hook this package has added since
+v0.7.1 is optional, so no host implementing the old shape has to change anything.
+
+The known cost, stated rather than hidden: a consumer that enumerates the
+interface exhaustively — `Record<keyof MuxHooks, ...>`, or a mapped type over its
+keys — does stop compiling when a member is added. That pattern is asserting the
+member list is complete, which is the one thing an extension point cannot promise.
+Such a consumer should key off the members it actually uses. If you need the
+complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes.
 
 ## Deprecation policy
 

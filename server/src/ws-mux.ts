@@ -12,8 +12,10 @@
  *   hooks     host policy: telemetry taps + resize arbitration
  *   profile   per-session behavior (resizable? capture mode? archive?)
  *
- * The WS type is structural ({ send, optional close }) — Bun's
- * ServerWebSocket satisfies it.
+ * The WS type is structural ({ send }) — Bun's ServerWebSocket satisfies it.
+ * `close` is deliberately NOT declared here: an adapter may already carry the
+ * standard `close(code, reason)`, and a zero-arg `close?()` on this type would
+ * stop such a host compiling. Callers duck-type it instead.
  */
 import {
   chooseMuxOutputFrame,
