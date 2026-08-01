@@ -54,3 +54,7 @@ jobs:
         # the contract is what a consumer receives. Fails when a public name
         # changes signature or appears without a declared tier.
         run: bun run contract
+      - name: frozen consumer contract gate
+        # Packs that same git-dist and exercises all frozen consumers. Chromium
+        # was installed above for the app-host runtime fixture.
+        run: bash scripts/contract-fixtures.sh

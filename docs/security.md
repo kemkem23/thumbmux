@@ -150,16 +150,18 @@ snapshot (via an internal weak map). Authorization always re-reads the grant:
   never copy caller-held privilege fields
 - destructive-operation permissions are read from the bound immutable grant,
   not from caller-controlled principal fields
-- `revoke(token)` invalidates both new authentications and any live principal
-  minted from that grant
+- `revoke(token)` rejects new authentication and causes subsequent
+  authorization decisions using principals minted from that grant to fail
 
 ## Authorization decisions
 
 Missing, malformed, invalid, or expired credentials are `401`. A valid,
 unexpired principal denied by scope or operation permission, session allowlist,
-or a malformed/unknown operation is `403`. The guard checks expiry for every
-authorization decision against the grant snapshot, including every WebSocket
-message after upgrade.
+or a malformed/unknown operation is `403`. The guard checks expiry whenever an
+authorization method is invoked against the grant snapshot. Integrations must
+invoke it at each one-shot boundary and arrange for already-authorized live
+subscriptions to stop when the grant is no longer active; the standalone guard
+does not schedule socket or subscription teardown by itself.
 
 | Capability | `read` | `interactive` | Additional rule |
 | --- | --- | --- | --- |
@@ -204,7 +206,8 @@ HTTP operations the guard recognizes or lets a host name explicitly include:
 - `POST /api/recordings/start` and `POST /api/recordings/stop`, with a parsed
   session payload
 - `GET /api/recordings?session=...`
-- a host-defined kill route using `sessions-kill` plus its parsed session name
+- `DELETE {basePath}/sessions/:name` in `createAppRoutes`, or a host-defined
+  kill route using `sessions-kill` plus its parsed session name
 
 Hosts should authorize named, parsed operations and session inputs, including
 body-derived sessions, rather than guessing from raw URL substring matches.
@@ -213,14 +216,17 @@ parameter spelling from becoming an accidental bypass.
 
 `sessions-kill` is denied by default. A grant must be `interactive`, include
 `permissions: ["sessions-kill"]`, and name a nonempty session allowed by its
-allowlist; adding the operation name alone grants nothing. There is no packaged
-kill handler or canonical kill URL, so a host must pass the parsed operation
-and session explicitly before calling `killTmuxSession()` and then invalidate
-the mux lifecycle.
+allowlist; adding the operation name alone grants nothing. `createAppRoutes`
+owns `DELETE {basePath}/sessions/:name` by default. It parses the session,
+authorizes `sessions-kill` when a guard is present, calls `killTmuxSession()`,
+and invalidates the mux lifecycle. Set `kill: { enabled: false }` to return that
+path to the host.
 
-The example below uses `DELETE /api/sessions/:name` as a host-owned route. It
-also guards the packaged preferences handler instead of mounting it directly.
-The principal must have been authenticated by the returned guard.
+The manual-composition example below shows the equivalent host-owned
+`DELETE /api/sessions/:name` route for a host that does not use
+`createAppRoutes`. It also guards the packaged preferences handler instead of
+mounting it directly. The principal must have been authenticated by the
+returned guard.
 
 <!-- B2-GUARDED-HTTP-SNIPPET:START -->
 ```ts
@@ -336,10 +342,12 @@ automatically.
 | `createUploadHandler` | POST | `upload` | covered |
 | `createPrefsHandler` | GET / PUT / POST | `prefs-read` / `prefs-write` | covered (single-tenant) |
 
-`killTmuxSession` is an exported destructive primitive rather than a handler
-factory; it is covered separately by `sessions-kill`. `TmuxWsMux`,
-`FrameJournal`, and `FileHistoryArchive` are host-composed engines/primitives,
-not HTTP handler factories.
+`killTmuxSession` is an exported destructive primitive rather than a standalone
+handler factory. `createAppRoutes` wraps it in the packaged
+`DELETE {basePath}/sessions/:name` route and covers that route with
+`sessions-kill`; manually composed hosts must apply the same authorization.
+`TmuxWsMux`, `FrameJournal`, and `FileHistoryArchive` are host-composed
+engines/primitives, not HTTP handler factories.
 
 ## Stock launch preset IDs
 
@@ -388,9 +396,9 @@ below, so a host that uses it does not assemble authorization by hand:
 
 - authenticates the WebSocket **upgrade** and holds the token-free principal
   server-side, keyed to the socket
-- authorizes **every** mux message, not only the ones that look sensitive, and
-  rechecks expiry per message; a denied message gets
-  `{ type: "auth_error", status, code }` rather than silence
+- authorizes **every inbound client** mux message, not only the ones that look
+  sensitive, and rechecks expiry per message; on the raw WebSocket a denied
+  message receives `{ type: "auth_error", status, code }`
 - filters the session list on **every** path that emits one — the initial push,
   subsequent pushes, drain catch-up, and the HTTP list — with the guard's
   projection applied last, so a host hook can neither see rows the principal may
@@ -410,11 +418,12 @@ process and listener.
 
 ## Doing it yourself
 
-Driving `TmuxWsMux` directly means taking on the first four bullets above:
-retain the token-free principal at WebSocket upgrade, recheck its expiry for
-every message, authorize every message rather than filtering the list, and apply
-the projection to every list output. Filtering alone is not isolation — a client
-that a filtered list hides a session from can still name that session directly
-in a `subscribe` or `keys` frame. That is a demonstrated leak, not a theoretical
-one, and it is pinned by a test that watches the marker arrive in the forbidden
-pane when per-message authorization is removed.
+Driving `TmuxWsMux` directly means owning the WebSocket responsibilities above:
+retain the token-free principal at upgrade, keep authorization current for
+inbound messages and live outbound subscriptions, authorize messages rather
+than relying on list filtering, and apply the projection to every list output.
+Filtering alone is not isolation — a client that a filtered list hides a
+session from can still name that session directly in a `subscribe` or `keys`
+frame. That is a demonstrated leak, not a theoretical one, and it is pinned by
+a test that watches the marker arrive in the forbidden pane when per-message
+authorization is removed.

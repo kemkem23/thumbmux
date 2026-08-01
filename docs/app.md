@@ -147,7 +147,8 @@ omitting an entire nested block.
 | --- | --- | --- |
 | `basePath` | `"/api"`. The shell trims it, adds a leading slash, removes trailing slashes, and treats `""` or `"/"` as the root. It changes only the default sessions and spawn HTTP calls, not the WebSocket, upload, or preferences URLs. | `basePath: "/terminal-api"` |
 | `fetchSessions` | Calls `GET {basePath}/sessions`. A custom function replaces only that bootstrap; authoritative session-list WebSocket pushes still update the store and win a race with an older HTTP response. A failed bootstrap ends the loading state with the current rows. | `fetchSessions: async () => fetch("/host/sessions").then(readSessions)` |
-| `sendKeys` | Calls the shared `tmuxMux.sendKeys(session, keys)`. Both direct keys and the steps produced by composer submission use this transport. Replacing it does not replace the singleton used for session inventory and terminal output subscriptions. | `sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys)` |
+| `mux` | The shared `tmuxMux`. It supplies authoritative session-list pushes to `HubView` and `SessionView`; `SessionView` also uses its connection state for the fallback HUD status. An override replaces those reads and the default `sendKeys` fallback, so rows, HUD status and keys all follow the connection the host chose. It does not replace the shared terminal transport inside `TermView`. | `mux: tmuxMux` |
+| `sendKeys` | Calls `sendKeys` on the selected mux — `adapters.mux` when supplied, the shared `tmuxMux` otherwise. Both direct keys and the steps produced by composer submission use this transport. Replacing it does not replace `adapters.mux`, nor the shared terminal transport inside `TermView`. | `sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys)` |
 | `submitAgent` | Returns `"generic"`. The value is passed to `submitPlan`; the shell never infers an agent kind from the session name. | `submitAgent: () => "generic"` |
 | `routes` | In `ThumbmuxApp`, omission selects the internal `?session=` adapter. Standalone `HubView` and `SessionView` should receive host routes; their limited fallbacks are not a two-page router. | `routes: { openSession, showHub }` |
 | `routes.openSession` | No external callback by default. `HubView` invokes it with the exact selected name when routes are supplied. | `openSession: (name) => void goto("/terminals/" + encodeURIComponent(name))` |
@@ -198,6 +199,7 @@ async function postLaunch(
 export const transportAdapters = {
   basePath: "/terminal-api",
   fetchSessions: () => fetch("/host/sessions").then(readSessions),
+  mux: tmuxMux,
   sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys),
   submitAgent: () => "generic",
   spawn: {
@@ -464,17 +466,17 @@ host must own that upgrade route and forward its socket lifecycle to
 
 | Route | Server default | Stock shell expectation | What happens when it is disabled or omitted |
 | --- | --- | --- | --- |
-| `GET /ws/tmux` | Always owned; path is fixed. | Session inventory, pane output, keys, resize, and history all use the shared mux. | There is no `AppAdapters` off switch. Provide the route, or configure the singleton to another authorized WebSocket endpoint. |
-| `GET {basePath}/sessions` | Always owned. | Default HTTP bootstrap, followed by WebSocket pushes. | Supply `fetchSessions` if another host route owns bootstrap. The WebSocket session-list subscription remains active. |
+| `GET /ws/tmux` | Always owned; path is fixed. | By default, session inventory, pane output, keys, resize, and history use the shared mux. `adapters.mux` replaces the live session-list stream, the fallback HUD connection state, and the default key transport; the terminal transport inside `TermView` remains on the shared mux. | Supply `adapters.mux` for a host-owned live session stream. Every mux still in use must connect to an authorized WebSocket endpoint; configure the shared singleton separately while `TermView`'s transport remains on it. |
+| `GET {basePath}/sessions` | Always owned. | Default HTTP bootstrap, followed by WebSocket pushes. | Supply `fetchSessions` if another host route owns bootstrap. The selected mux's session-list subscription remains active. |
 | `POST {basePath}/spawn` | Enabled; set `spawn: false` on the server to leave the path to the host. | Default `spawn.launch`. | Disabling the server route does **not** hide the new-terminal card or launcher. Supply a custom client `spawn.launch`; there is currently no adapter that removes the launcher. |
 | `POST {basePath}/upload` | Disabled until server `upload` options are supplied. | Used only by `adapters.upload.endpoint`. | Omit the client `upload` block, or return `null` for a session, to hide the upload action and file-paste hook. Server configuration alone never advertises the route to the client. |
 | `GET` / `PUT {basePath}/prefs` | Disabled until server `prefs` options are supplied. | Used only by a supplied server preferences adapter. | Omit client `prefs` to fall back to local storage. Theme, font, and shortcut UI remains visible. |
 | `DELETE {basePath}/sessions/:name` | Enabled; set `kill: { enabled: false }` to leave it to the host. | The stock shell has no kill action. | Nothing is hidden. A host-added action must omit or disable its own kill control. |
 
 When a `guard` is supplied to `createAppRoutes`, it authenticates and
-authorizes every owned HTTP operation and every mux message. Issuing grants,
-choosing which principal may see which session, and protecting host routes
-that receive a `null` fallthrough remain host policy.
+authorizes every owned HTTP operation and every inbound mux message. Issuing
+grants, choosing which principal may see which session, and protecting host
+routes that receive a `null` fallthrough remain host policy.
 
 ## 4. Agent needs a human: feature 12
 
