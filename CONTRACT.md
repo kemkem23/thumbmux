@@ -18,7 +18,7 @@ not complete unless one of these layers can expose a violation.
 | --- | --- | --- |
 | Surface gate | `contract/manifest/core.json`, `server.json`, `svelte.json`, and `app.json`, checked by `scripts/contract-check.ts` against declarations from a freshly built `git-dist` | A missing or changed F/S export, a new export with no intentional tier, or removal before a recorded deprecation date makes the check fail. The manifest records each name, kind, tier, declaration signature, and deprecation metadata. |
 | Frozen consumers | `contract/fixtures/minimal-host`, `guarded-host`, and `app-host`, run by `scripts/contract-fixtures.sh` against the packed `git-dist` artifact | Public types that no longer compile and integration behavior that no longer works make a representative consumer fail. |
-| Wire compatibility | `contract/goldens/*.jsonl` and `server/tests/protocol-goldens.test.ts`, supplemented by `server/tests/conformance.test.ts` | A current server that rejects a recorded old client message, a change to any frame shape recorded in the goldens, or a pinned protocol semantic that changes makes a test fail. The goldens pin what they record — a frame kind or field never recorded is not covered by them, only by the surface gate. It does **not** claim that no new frame kind may appear: a reader that rejects unknown kinds outright is outside what these goldens verify. `auth_error` is exactly that case — emitted only when a host opts into a guard, ignored safely by the bundled client of any version, and shape-gated like every other frame, but a strict custom reader must tolerate unknown kinds before enabling a guard. |
+| Wire compatibility | `contract/goldens/*.jsonl` and `server/tests/protocol-goldens.test.ts`, supplemented by `server/tests/conformance.test.ts` | A current server that rejects a recorded old client message, a change to any frame shape recorded in the goldens, or a pinned protocol semantic that changes makes a test fail. The goldens pin what they record — a frame kind or field never recorded is not covered by them, only by the surface gate. It does **not** claim that no new frame kind may appear: a reader that rejects unknown kinds outright is outside what these goldens verify. `auth_error` is exactly that case — emitted only when a host opts into a guard, safe for every bundled client — versions before v0.8.0 drop it because it carries no channel, and v0.8.0 re-emits it as a `thumbmux:auth-error` window event, and shape-gated like every other frame, but a strict custom reader must tolerate unknown kinds before enabling a guard. |
 | Deprecation ceremony | Emitted `.d.ts` JSDoc, manifest metadata, the `Deprecated` section of `CHANGELOG.md`, `core/src/deprecate.test.ts`, and the frozen-fixture review rule below | A missing stamp, malformed runtime warning, early removal, or unsupported old spelling blocks the release. |
 | Distribution rail | `.github/workflows/release.yml`, `scripts/smoke-git-dist.sh`, and the resolved commit in a consumer lockfile | The release workflow builds and tests the artifact, consumer smoke tests its public entry points, and each release creates a new exact `-dist` tag rather than changing an older pin. |
 
@@ -97,7 +97,13 @@ removing one, renaming one, or changing the signature of an existing one is
 breaking. This is a deliberate decision, not an oversight. These interfaces exist
 to be extended — an extension point that can never gain a member without a major
 release is not an extension point — and every hook this package has added since
-v0.7.1 is optional, so no host implementing the old shape has to change anything.
+v0.7.1 is optional, so a host that does not implement the new name is unaffected.
+
+One case is not covered by that, and it is the same one that bit `WsLike.close`:
+if a host already has a member of the new name with an incompatible shape, adding
+it here stops that host compiling. Optional does not help — the conflict is the
+name, not the presence. A release adding a hook should therefore prefer a name
+unlikely to collide, and treat a report of such a collision as a real break.
 
 The known cost, stated rather than hidden: a consumer that enumerates the
 interface exhaustively — `Record<keyof MuxHooks, ...>`, or a mapped type over its

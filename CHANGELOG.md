@@ -44,7 +44,10 @@ than merely stated.
 - **`JournalRecordV1`** (`thumbmux/server`) — since v0.8.0, use
   `FrameJournalRecordV1`; removal no earlier than v0.9.0. The two names describe
   the same shape, and the old one collides with an unrelated `JournalRecordV1` in
-  `thumbmux/core`. The alias still works and warns once per process.
+  `thumbmux/core`. The alias still works. It carries the JSDoc stamp, the manifest
+  entry and this changelog entry, but no runtime warning — it is a type alias, so
+  nothing survives compilation to warn from. `warnDeprecated` covers functions and
+  classes, which is what CONTRACT.md's deprecation policy already says.
 
 ### Fixed
 

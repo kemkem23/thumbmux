@@ -147,7 +147,7 @@ policy, geometry ownership, view-only surfaces — is specified in
 | **Gesture window** | `translate3d` over a virtualized row window with 60 rows of overscan on each side; ANSI parsing and window rebuilds are deferred during an active gesture |
 | **Client history retention** | nominally 10,000 rows or an estimated 8 MiB; the mounted viewport and overscan remain protected |
 | **Server archive default** | `FileHistoryArchive` retains up to 20,000 archived lines per session unless the host sets `maxLines` |
-| **Core source** | 4,862 measured lines of production TypeScript and **zero runtime dependencies** |
+| **Core source** | 4,919 measured lines of production TypeScript and **zero runtime dependencies** |
 
 ## Get started
 
