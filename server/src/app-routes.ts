@@ -242,8 +242,9 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
     ? new FileHistoryArchive({})
     : options.archive;
   const guard = options.guard;
-  // Revocation is event-driven; expiry uses a bounded per-socket check. Neither
-  // path adds authorization work to the mux's per-frame broadcast hot path.
+  // Calls through the observed guard.revoke property sweep live sockets in-call.
+  // Saved references, read-only guards, and expiry fall back to each socket's
+  // scheduled authorization check. Neither path adds work to the frame hot path.
   const socketPrincipals = new Map<WsLike, TokenPrincipal>();
   const authorizationTimers = new Map<WsLike, ReturnType<typeof setTimeout>>();
   const socketCleanupNotified = new WeakSet<WsLike>();

@@ -998,6 +998,240 @@ describe("createAppRoutes", () => {
     }
   });
 
+  test("V2 saved-reference probe: stale revoke references stop output by the next bounded check", async () => {
+    const session = appRoutesPrefix("v2-saved-revoke");
+    const targetToken = `v2-saved-target-${process.pid}-${Date.now()}`;
+    const controlToken = `v2-saved-control-${process.pid}-${Date.now()}`;
+    let content = "before";
+    const driver = inertDriver([{
+      name: session,
+      created: "1",
+      windows: 1,
+      attached: false,
+      activityAt: 1,
+    }]);
+    driver.capturePane = async () => content;
+    driver.hash = (value) => value;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token: targetToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+      ],
+    });
+    const savedRevoke = guard.revoke;
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 2,
+        pollBurstMs: 2,
+        pollReconcileMs: 2,
+      },
+    });
+    const upgrade = async (token: string): Promise<unknown> => {
+      let data: unknown;
+      const response = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_request, options) {
+            data = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(response?.status).toBe(204);
+      return data;
+    };
+    const target = createCapturingSocket(await upgrade(targetToken));
+    const control = createCapturingSocket(await upgrade(controlToken));
+
+    try {
+      routes.websocket.open(target);
+      routes.websocket.message(target, JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => target.frames.some((frame) => frame.type === "output" && frame.data === "before"),
+        "V2 saved-reference target did not receive its baseline",
+      );
+      routes.websocket.open(control);
+      routes.websocket.message(control, JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === "before"),
+        "V2 saved-reference control did not receive its baseline",
+      );
+
+      const revokeResult = savedRevoke(targetToken);
+      content = "inside-100ms-window";
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === content),
+        "V2 saved-reference control did not receive the in-window frame",
+      );
+      const leakedInsideBound = target.frames.some((frame) => (
+        frame.type === "output" && frame.data === content
+      ));
+
+      await Bun.sleep(125);
+      content = "after-100ms-bound";
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === content),
+        "V2 saved-reference control did not receive the bounded frame",
+      );
+      const leakedAfterBound = target.frames.some((frame) => (
+        frame.type === "output" && frame.data === content
+      ));
+      console.log("V2_SAVED_REVOKE_PROBE", JSON.stringify({
+        revokeResult,
+        leakedInsideBound,
+        leakedAfterBound,
+      }));
+
+      expect(revokeResult).toBe(true);
+      expect(leakedAfterBound).toBe(false);
+    } finally {
+      routes.websocket.close(target);
+      routes.websocket.close(control);
+      routes.mux.stop();
+    }
+  });
+
+  test("V2 reentrant probe: revoke during grouped send permits no later broadcast", async () => {
+    const session = appRoutesPrefix("v2-reentrant-revoke");
+    const attackerToken = `v2-reentrant-attacker-${process.pid}-${Date.now()}`;
+    const controlToken = `v2-reentrant-control-${process.pid}-${Date.now()}`;
+    let content = "before";
+    const driver = inertDriver([{
+      name: session,
+      created: "1",
+      windows: 1,
+      attached: false,
+      activityAt: 1,
+    }]);
+    driver.capturePane = async () => content;
+    driver.hash = (value) => value;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token: attackerToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+      ],
+    });
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: { pollNormalMs: 10, pollReconcileMs: 10 },
+    });
+    const upgrade = async (token: string): Promise<unknown> => {
+      let data: unknown;
+      const response = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_request, options) {
+            data = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(response?.status).toBe(204);
+      return data;
+    };
+    let revokeResult: boolean | null = null;
+    const controlFrames: WireFrame[] = [];
+    const control: CapturingSocket = {
+      data: await upgrade(controlToken),
+      frames: controlFrames,
+      send(raw) {
+        const frame = JSON.parse(raw) as WireFrame;
+        controlFrames.push(frame);
+        if (frame.type === "output" && frame.data === "after" && revokeResult === null) {
+          revokeResult = guard.revoke(attackerToken);
+        }
+        return raw.length;
+      },
+    };
+    const attacker = createCapturingSocket(await upgrade(attackerToken));
+
+    try {
+      routes.websocket.open(control);
+      routes.websocket.message(control, JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === "before"),
+        "V2 reentrant control did not receive its baseline",
+      );
+      routes.websocket.open(attacker);
+      routes.websocket.message(attacker, JSON.stringify({ type: "subscribe", session }));
+      await until(
+        () => attacker.frames.some((frame) => frame.type === "output" && frame.data === "before"),
+        "V2 reentrant attacker did not receive its baseline",
+      );
+
+      content = "after";
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === content),
+        "V2 reentrant control did not receive the revoking frame",
+      );
+      await Bun.sleep(20);
+      const leakedAfterSynchronousRevoke = attacker.frames.some((frame) => (
+        frame.type === "output" && frame.data === content
+      ));
+
+      content = "after-next-broadcast";
+      await until(
+        () => control.frames.some((frame) => frame.type === "output" && frame.data === content),
+        "V2 reentrant control did not receive the next broadcast",
+      );
+      await Bun.sleep(20);
+      const leakedOnNextBroadcast = attacker.frames.some((frame) => (
+        frame.type === "output" && frame.data === content
+      ));
+      const postRevokeOutputCount = attacker.frames.filter((frame) => (
+        frame.type === "output"
+        && (frame.data === "after" || frame.data === "after-next-broadcast")
+      )).length;
+      console.log("V2_REENTRANT_REVOKE_PROBE", JSON.stringify({
+        revokeResult,
+        leakedAfterSynchronousRevoke,
+        leakedOnNextBroadcast,
+        postRevokeOutputCount,
+      }));
+
+      expect(revokeResult).toBe(true);
+      expect(postRevokeOutputCount).toBeLessThanOrEqual(1);
+      expect(leakedOnNextBroadcast).toBe(false);
+    } finally {
+      routes.websocket.close(attacker);
+      routes.websocket.close(control);
+      routes.mux.stop();
+    }
+  });
+
   test("authenticates upgrades, filters pushed lists, and rechecks expiry per message", async () => {
     const allowedSession = appRoutesPrefix("fake-a");
     const deniedSession = appRoutesPrefix("fake-b");
