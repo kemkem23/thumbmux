@@ -2,10 +2,14 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 
 import { resetDeprecationWarnings, warnDeprecated } from './deprecate';
 
-const WARNING_FORMAT = /^\[thumbmux\] [^\n]+ is deprecated since v\d+\.\d+\.\d+ — [^\n]+; removal no earlier than v\d+\.\d+\.\d+$/;
+const WARNING_FORMAT = /^\[thumbmux\] [^\r\n]+ is deprecated since v\d+\.\d+\.\d+ — use [^\r\n]+; removal no earlier than v\d+\.\d+\.\d+$/;
 
-function messageFor(key: string, replacement: string): string {
-  return `[thumbmux] ${key} is deprecated since v0.8.0 — use ${replacement}; removal no earlier than v0.9.0`;
+function detailsFor(replacement: string) {
+  return {
+    since: '0.8.0',
+    replacement,
+    removeNoEarlierThan: '0.9.0',
+  } as const;
 }
 
 beforeEach(resetDeprecationWarnings);
@@ -16,7 +20,7 @@ describe('warnDeprecated', () => {
     const key = 'LegacyThing';
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      warnDeprecated(key, messageFor(key, 'CurrentThing'), (message) => warnings.push(message));
+      warnDeprecated(key, detailsFor('CurrentThing'), (message) => warnings.push(message));
     }
 
     expect(warnings).toHaveLength(1);
@@ -25,8 +29,8 @@ describe('warnDeprecated', () => {
   test('warns separately for distinct keys', () => {
     const warnings: string[] = [];
 
-    warnDeprecated('LegacyOne', messageFor('LegacyOne', 'CurrentOne'), (message) => warnings.push(message));
-    warnDeprecated('LegacyTwo', messageFor('LegacyTwo', 'CurrentTwo'), (message) => warnings.push(message));
+    warnDeprecated('LegacyOne', detailsFor('CurrentOne'), (message) => warnings.push(message));
+    warnDeprecated('LegacyTwo', detailsFor('CurrentTwo'), (message) => warnings.push(message));
 
     expect(warnings).toHaveLength(2);
   });
@@ -34,14 +38,14 @@ describe('warnDeprecated', () => {
   test('warns again after warning state is reset', () => {
     const warnings: string[] = [];
     const key = 'LegacyThing';
-    const message = messageFor(key, 'CurrentThing');
+    const details = detailsFor('CurrentThing');
     const log = (warning: string): void => {
       warnings.push(warning);
     };
 
-    warnDeprecated(key, message, log);
+    warnDeprecated(key, details, log);
     resetDeprecationWarnings();
-    warnDeprecated(key, message, log);
+    warnDeprecated(key, details, log);
 
     expect(warnings).toHaveLength(2);
   });
@@ -51,11 +55,27 @@ describe('warnDeprecated', () => {
 
     warnDeprecated(
       'JournalRecordV1',
-      messageFor('JournalRecordV1', 'FrameJournalRecordV1'),
+      detailsFor('FrameJournalRecordV1'),
       (message) => warnings.push(message),
     );
 
     expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toBe(
+      '[thumbmux] JournalRecordV1 is deprecated since v0.8.0 — use FrameJournalRecordV1; removal no earlier than v0.9.0',
+    );
     expect(warnings[0]).toMatch(WARNING_FORMAT);
+  });
+
+  test('V1 attack: rejects an unstructured warning message', () => {
+    const warnings: string[] = [];
+
+    expect(() => {
+      warnDeprecated(
+        'LegacyThing',
+        'migrate whenever' as never,
+        (message) => warnings.push(message),
+      );
+    }).toThrow('warnDeprecated details must be an object');
+    expect(warnings).toHaveLength(0);
   });
 });
