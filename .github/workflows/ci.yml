@@ -14,6 +14,13 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: install Playwright Chromium
         run: ./node_modules/.bin/playwright install --with-deps chromium
+      # The suite includes tests that assert properties of the shipped artifact
+      # (dist hygiene, the README quickstart pack). They need git-dist to exist
+      # before they run. On a developer machine it is usually lying around from
+      # an earlier build, which is exactly how they passed locally for the whole
+      # of v0.8.0 while failing on the first clean checkout CI ever gave them.
+      - name: build git-dist for the artifact tests
+        run: bun run build:git-dist
       - name: core unit tests
         run: bun test ./core/tests/ ./core/src/*.test.ts
       - name: protocol conformance (real tmux)

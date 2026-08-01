@@ -19,6 +19,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: install Playwright Chromium
         run: ./node_modules/.bin/playwright install --with-deps chromium
+      # Artifact tests in the suite below read git-dist. Build it first — see the
+      # matching comment in ci.yml. The later "build release dists" step rebuilds
+      # it deterministically, so this does not change what ships.
+      - name: build git-dist for the artifact tests
+        run: bun run build:git-dist
       - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build

@@ -1,7 +1,22 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+// Must stay inside the package. Reaching for a parent directory's node_modules
+// resolves against whatever repo happens to be hosting the sources — it passed
+// for a year against the private monorepo's root and failed the moment the
+// public checkout, where the package IS the root, ran it.
+function bunTypeRoot(packageRoot: string): string {
+  const candidates = [
+    join(packageRoot, "node_modules/@types"),
+    join(packageRoot, "server/node_modules/@types"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "bun"))) return candidate;
+  }
+  throw new Error(`@types/bun not found under the package; looked in ${candidates.join(", ")}`);
+}
 
 test("the guarded kill and preferences security snippet type-checks against source exports", () => {
   const packageRoot = resolve(import.meta.dir, "../..");
@@ -23,7 +38,7 @@ test("the guarded kill and preferences security snippet type-checks against sour
         skipLibCheck: true,
         noEmit: true,
         types: ["bun"],
-        typeRoots: [resolve(packageRoot, "../../node_modules/@types")],
+        typeRoots: [bunTypeRoot(packageRoot)],
         baseUrl: packageRoot,
         paths: {
           "thumbmux/server": ["server/src/index.ts"],

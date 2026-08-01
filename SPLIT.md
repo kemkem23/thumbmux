@@ -40,9 +40,17 @@ Release checklist:
   cross the minor: `^0.7.1` means `>=0.7.1 <0.8.0`, so the moment `core`
   becomes `0.8.0` the range stops matching the workspace, bun falls through to
   the public registry, and the install dies on `404 @thumbmux/core`. The
-  version bump alone is not a release; it is half of one. Verify with the CI
-  command itself, in a clean tree:
-  `bun install --frozen-lockfile`.
+  version bump alone is not a release; it is half of one.
+- **Run `bash scripts/ci-parity.sh` before pushing the tag.** The workflows in
+  `.github/` only fire in the public repo, so a package developed inside the
+  private monorepo can accumulate commits that CI has never seen — v0.8.0
+  reached 51 of them, and the first thing CI ever said about that work was
+  "no", twice, at the moment of release. The script exports the committed tree
+  to a clean directory, installs from the lockfile, builds `git-dist`, and runs
+  the same suite CI runs. It catches what a working-tree `bun test` cannot: a
+  test reading a stale `git-dist` left over from an earlier build, a path that
+  escapes the package and resolves against the host repo, and anything the
+  lockfile installs differently from your incremental `node_modules`.
 - Push main through the subtree split.
 - Push the `vX.Y.Z` source tag and let `release-dist` publish `vX.Y.Z-dist`.
 - Bump every consumer pin together, then reinstall (npm consumers:
