@@ -31,7 +31,9 @@ exports at the copies. Original standalone subpackage output and packs keep
 their normal scoped-package dependency.
 
 Release checklist:
-- Bump root, core, server, and svelte `package.json` versions in lockstep.
+- Bump root, core, server, svelte, **and app** `package.json` versions in lockstep —
+  five files. `app` joined in v0.8.0; a bump that misses it ships a workspace
+  claiming the previous version.
 - Push main through the subtree split.
 - Push the `vX.Y.Z` source tag and let `release-dist` publish `vX.Y.Z-dist`.
 - Bump every consumer pin together, then reinstall (npm consumers:

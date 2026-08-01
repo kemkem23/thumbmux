@@ -35,7 +35,7 @@ cp -R "$PACKAGE_ROOT/docs" "$PACKAGE_ROOT/git-dist" "$WORK/package/"
   cd "$WORK/package"
   npm pkg delete scripts
   npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./app":{"types":"./git-dist/app/index.d.ts","svelte":"./git-dist/app/index.js"},"./package.json":"./package.json"}' --json
-  npm pkg set files='["git-dist","docs"]' --json
+  npm pkg set files='["git-dist","docs","CONTRACT.md","contract/manifest"]' --json
   npm pack --pack-destination "$WORK" --silent >/dev/null
 )
 

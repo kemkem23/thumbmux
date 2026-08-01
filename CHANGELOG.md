@@ -3,6 +3,75 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
+## v0.8.0 — 2026-08-01
+
+thumbmux stops being a box of parts. `thumbmux/app` mounts the whole application —
+hub, fullscreen terminal, and the navigation between them — and this release also
+installs the machinery that makes "upgrading will not break you" checkable rather
+than merely stated.
+
+### Read before upgrading
+
+1. **`thumbmux/app` is a new subpath.** `import { ThumbmuxApp } from "thumbmux/app"`
+   gives you the session grid, the terminal view, and query-parameter navigation.
+   Everything a host must decide — where to spawn, where uploads go, what the
+   copy says, what a session's state means — arrives through one `adapters`
+   object. Nothing in the existing subpaths changed to make room for it.
+2. **`createAppRoutes` assembles the server side.** Hand it a driver and it
+   returns `fetch`, WebSocket handlers, and the mux, with spawn, upload, prefs,
+   sessions and kill already routed. `fetch` returns `null` for paths that are
+   not its own, so your routes keep working. Hand it a `guard` and every mux
+   message and HTTP operation is authorized for you — filtering the session list
+   alone was never isolation, and now you do not have to know that.
+3. **The public surface is under contract.** `CONTRACT.md` ships with the package
+   and `contract/manifest/*.json` records every public name with a tier. CI fails
+   if a frozen signature changes or a new export appears without a declared tier.
+   `thumbmux/app` is entirely `S` — it will freeze at 1.0, after a real consumer
+   has been through it, not before.
+
+### Added
+
+- `thumbmux/app`: `ThumbmuxApp`, `HubView`, `SessionView`, `EmbedView`,
+  `createSessionsStore`, `createQueryParamNav`, `nextStageOverlay`,
+  `prefillOnError`, `AppAdapters`, `AppLabels`, `SessionActionContext`
+- `thumbmux/server`: `createAppRoutes`, `exactTmuxPaneTarget`
+- `thumbmux/core`: `warnDeprecated`, `resetDeprecationWarnings`,
+  `MuxAuthErrorFrame`, `MuxServerFrame`
+- `MuxHooks.canSubscribe` and `MuxHooks.onOutput`, both optional
+
+### Deprecated
+
+- **`JournalRecordV1`** (`thumbmux/server`) — since v0.8.0, use
+  `FrameJournalRecordV1`; removal no earlier than v0.9.0. The two names describe
+  the same shape, and the old one collides with an unrelated `JournalRecordV1` in
+  `thumbmux/core`. The alias still works and warns once per process.
+
+### Fixed
+
+- **TermView left animation frames running after unmount.** Six fire-and-forget
+  frames were never cancelled, so after a view was destroyed they still ran and
+  read state that no longer existed. Present in every prior release; visible only
+  once something unmounted a terminal in earnest.
+- **An expired or revoked grant kept receiving output.** Authorization ran on
+  inbound messages only, so a viewer who subscribed and then stayed silent read
+  on. Losing a grant now withdraws the socket's subscriptions.
+- **Scrollback was lost moving from a thumbnail to a full view.** A bounded
+  capture initialized an empty archive, so the older rows were never seeded.
+- **A withdrawn feature's declaration shipped in every release.** The build never
+  cleared `dist`, so a file that stopped being generated stopped existing only in
+  source. Every workspace cleans before building, and a test now fails on any
+  orphan.
+- Upload handlers reject the wrong method with 405, count every part toward the
+  size limit, and no longer overwrite on a name collision.
+- `mergePrefs` no longer lets a `__proto__` key in a patch reach the result's
+  prototype.
+- Kill requires an explicit `sessions-kill` permission; existing interactive
+  grants do not carry it.
+
+### Changed defaults
+
+None.
+
 ## v0.7.1 — 2026-07-31
 
 Nineteen fixes found by two rounds of trying to break v0.7.0 rather than confirm
