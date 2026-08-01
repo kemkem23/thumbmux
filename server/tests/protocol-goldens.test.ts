@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createAppRoutes } from "../src/app-routes";
+import { createTokenGuard } from "../src/token-guard";
 import {
   TmuxWsMux,
   type HistoryArchiveLike,
@@ -58,6 +60,7 @@ const serverGolden = readGolden(SERVER_GOLDEN_PATH);
 const authErrorGolden = readGolden(AUTH_ERROR_GOLDEN_PATH);
 
 class RecordingWS {
+  data?: unknown;
   sent: string[] = [];
 
   send(data: string): number {
@@ -113,6 +116,7 @@ function initialContent(): string {
 
 function createHarness(): {
   calls: HarnessCalls;
+  driver: TmuxDriver;
   mux: TmuxWsMux<RecordingWS>;
   state: HarnessState;
   ws: RecordingWS;
@@ -199,7 +203,7 @@ function createHarness(): {
     sessionListIntervalMs: 60_000,
     logError: () => {},
   });
-  return { calls, mux, state, ws: new RecordingWS() };
+  return { calls, driver, mux, state, ws: new RecordingWS() };
 }
 
 async function until(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
@@ -375,9 +379,75 @@ function withUnknownFields(frame: JsonObject): JsonObject {
   return extended;
 }
 
+async function produceGuardedRouteAuthError(driver: TmuxDriver): Promise<JsonObject> {
+  const now = 1_720_000_000_000;
+  const token = "golden-guard-token";
+  const guard = createTokenGuard({
+    grants: [{
+      token,
+      scope: "read",
+      expiresAt: now + 60_000,
+      sessions: [SESSION],
+    }],
+    now: () => now,
+  });
+  const routes = createAppRoutes({
+    driver,
+    archive: null,
+    guard,
+    spawn: false,
+    upload: false,
+    prefs: false,
+    kill: { enabled: false },
+    mux: {
+      pollNormalMs: 60_000,
+      pollBurstMs: 60_000,
+      burstDurationMs: 60_000,
+      pollReconcileMs: 60_000,
+      sessionListIntervalMs: 60_000,
+      logError: () => {},
+    },
+  });
+  const ws = new RecordingWS();
+  let opened = false;
+
+  try {
+    let socketData: unknown;
+    const response = await routes.fetch(
+      new Request(`http://localhost/ws/tmux?t=${encodeURIComponent(token)}`),
+      {
+        upgrade(_request, options) {
+          socketData = (options as { data?: unknown } | undefined)?.data;
+          return true;
+        },
+      },
+    );
+    if (response?.status !== 204 || !isObject(socketData)) {
+      throw new Error("guarded route did not produce an authorized websocket upgrade");
+    }
+
+    ws.data = socketData;
+    routes.websocket.open(ws);
+    opened = true;
+    ws.clear();
+    routes.websocket.message(ws, JSON.stringify({
+      type: "subscribe",
+      session: "golden-denied",
+    }));
+    const frames = ws.frames("auth_error");
+    if (frames.length !== 1) {
+      throw new Error(`guarded route produced ${frames.length} auth_error frames instead of one`);
+    }
+    return frames[0]!;
+  } finally {
+    if (opened) routes.websocket.close(ws);
+    routes.mux.stop();
+  }
+}
+
 async function produceCurrentServerFrames(): Promise<JsonObject[]> {
   const harness = createHarness();
-  const { mux, state, ws } = harness;
+  const { driver, mux, state, ws } = harness;
   try {
     dispatch(mux, { type: "subscribe", session: SESSION, delta: true }, ws);
     await until(() => ws.frames("output").length > 0, "initial full output");
@@ -424,8 +494,9 @@ async function produceCurrentServerFrames(): Promise<JsonObject[]> {
 
     expect(mux.invalidateSession(SESSION)).toBe(1);
     const error = ws.frames("error").at(-1)!;
+    const authError = await produceGuardedRouteAuthError(driver);
 
-    return [full, resize, resync, delta, cursor, history, sessions, pong, error];
+    return [full, resize, resync, delta, cursor, history, sessions, pong, error, authError];
   } finally {
     mux.stop();
   }
@@ -561,8 +632,8 @@ describe("v0.7.1 wire goldens", () => {
     expect(() => new V071ServerReader().read(frame)).toThrow("v0.7.1 output.data must be a string");
   });
 
-  test("every current mux frame remains readable by the unknown-field-tolerant v0.7.1 reader", async () => {
-    const frames = await produceCurrentServerFrames();
+  test("every current legacy mux frame remains readable by the unknown-field-tolerant v0.7.1 reader", async () => {
+    const frames = (await produceCurrentServerFrames()).filter((frame) => frame.type !== "auth_error");
     const reader = new V071ServerReader();
     expect(frames.map((frame) => reader.read(frame))).toEqual(EXPECTED_SERVER_VARIANTS);
 
@@ -572,6 +643,13 @@ describe("v0.7.1 wire goldens", () => {
 });
 
 describe("v0.8.0 additive server wire goldens", () => {
+  test("V3 probe: the current-frame producer includes guarded-route auth_error", async () => {
+    const frames = await produceCurrentServerFrames();
+    expect(frames.filter((frame) => frame.type === "auth_error")).toEqual(
+      authErrorGolden.lines.map(({ value }) => value),
+    );
+  });
+
   test("V2 attack: v0.7.1 MuxServerMessage consumers compile against the current declaration", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-v071-source-compat-"));
     const declarationRoot = join(root, "current-declaration");

@@ -28,6 +28,24 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `{channel, type:"error", data}` | e.g. the session disappeared. A host-driven `invalidateSession()` makes one final send attempt to each affected WebSocket subscriber before that session lifecycle goes quiet. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
+| `{type:"auth_error", status, code}` | Authorization denial from the packaged guarded route. `createAppRoutes({ guard })` emits it on an established WebSocket when the socket cannot be bound to an active principal or the guard rejects an inbound mux message. `status` is `401` or `403`; `code` is the guard's machine-readable reason. `createAppRoutes()` with no `guard`, and a bare `TmuxWsMux`, do not emit it. |
+
+`auth_error` deliberately has no `channel`. The denial belongs to the
+WebSocket or attempted operation, not to an authorized session stream, and
+some denials occur before there is a valid session-scoped message to route.
+The bundled v0.7.1 client parses and safely discards this channel-less frame
+without invoking a subscriber or throwing. The current bundled client handles
+a valid `auth_error` before channel routing and, in a browser, dispatches
+`thumbmux:auth-error` on `window`, with the frame in `CustomEvent.detail`.
+
+Custom WebSocket readers used with a guarded route must dispatch on `type`
+before requiring fields that belong only to known frame kinds, such as
+`channel`. If `type` is unknown, ignore the complete frame; do not reject it as
+a malformed known frame. Readers that support this denial can use
+`MuxAuthErrorFrame`, or `MuxServerFrame` when they handle both session frames
+and authorization denials. A strict custom reader must adopt this rule before
+its host uses a guarded `createAppRoutes`; without the `guard` option, the
+packaged route never emits `auth_error`.
 
 ### Host-driven session invalidation
 
