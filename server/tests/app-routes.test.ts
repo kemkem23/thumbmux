@@ -776,7 +776,9 @@ describe("createAppRoutes", () => {
     } finally {
       await closeWebSocket(ws);
       await closeWebSocket(controlWs);
-      if (server) await server.stop(true);
+      // A server-initiated WebSocket close can leave Bun's stop promise
+      // pending after both clients report CLOSED; bound test teardown only.
+      if (server) await Promise.race([server.stop(true), Bun.sleep(1_000)]);
       routes.mux.stop();
       killQuietly(session);
     }
@@ -900,7 +902,8 @@ describe("createAppRoutes", () => {
     } finally {
       await closeWebSocket(ws);
       await closeWebSocket(controlWs);
-      if (server) await server.stop(true);
+      // See the server-initiated-close teardown note in the expiry attack.
+      if (server) await Promise.race([server.stop(true), Bun.sleep(1_000)]);
       routes.mux.stop();
       killQuietly(session);
     }
@@ -1231,6 +1234,290 @@ describe("createAppRoutes", () => {
       routes.mux.stop();
     }
   });
+
+  test("V3 queued-arrival probe: revoke closes a queue-purging transport and stops later sends", async () => {
+    const session = appRoutesPrefix("v3-queued-arrival");
+    const targetToken = `v3-queued-target-${process.pid}-${Date.now()}`;
+    const controlToken = `v3-queued-control-${process.pid}-${Date.now()}`;
+    let content = "baseline";
+    const driver = inertDriver([{
+      name: session,
+      created: "1",
+      windows: 1,
+      attached: false,
+      activityAt: 1,
+    }]);
+    driver.capturePane = async () => content;
+    driver.hash = (value) => value;
+    const guard = createTokenGuard({
+      grants: [
+        {
+          token: targetToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+        {
+          token: controlToken,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [session],
+        },
+      ],
+    });
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        pollNormalMs: 2,
+        pollBurstMs: 2,
+        pollReconcileMs: 2,
+      },
+    });
+    const upgrade = async (token: string): Promise<unknown> => {
+      let data: unknown;
+      const response = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_request, options) {
+            data = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(response?.status).toBe(204);
+      return data;
+    };
+
+    const controlFrames: WireFrame[] = [];
+    const control: CapturingSocket = {
+      data: await upgrade(controlToken),
+      frames: controlFrames,
+      send(raw) {
+        controlFrames.push(JSON.parse(raw) as WireFrame);
+        return raw.length;
+      },
+    };
+    let queueOutput = false;
+    const fallbackDelivered: WireFrame[] = [];
+    const fallbackQueue: string[] = [];
+    const fallbackTarget: CapturingSocket = {
+      data: await upgrade(targetToken),
+      frames: fallbackDelivered,
+      send(raw) {
+        const frame = JSON.parse(raw) as WireFrame;
+        if (queueOutput && frame.type === "output") fallbackQueue.push(raw);
+        else fallbackDelivered.push(frame);
+        return raw.length;
+      },
+    };
+    const closingDelivered: WireFrame[] = [];
+    const closingQueue: string[] = [];
+    let closeCalls = 0;
+    const closingTarget: CapturingSocket & { close(): void } = {
+      data: await upgrade(targetToken),
+      frames: closingDelivered,
+      send(raw) {
+        const frame = JSON.parse(raw) as WireFrame;
+        if (queueOutput && frame.type === "output") closingQueue.push(raw);
+        else closingDelivered.push(frame);
+        return raw.length;
+      },
+      close() {
+        closeCalls += 1;
+        closingQueue.length = 0;
+      },
+    };
+
+    try {
+      routes.websocket.open(control);
+      routes.websocket.message(control, JSON.stringify({ type: "subscribe", session }));
+      routes.websocket.open(fallbackTarget);
+      routes.websocket.message(
+        fallbackTarget,
+        JSON.stringify({ type: "subscribe", session }),
+      );
+      routes.websocket.open(closingTarget);
+      routes.websocket.message(
+        closingTarget,
+        JSON.stringify({ type: "subscribe", session }),
+      );
+      await until(
+        () => control.frames.some((frame) => frame.type === "output"
+          && frame.data === "baseline"),
+        "V3 queued-arrival control did not receive its baseline",
+      );
+      await until(
+        () => fallbackTarget.frames.some((frame) => frame.type === "output"
+          && frame.data === "baseline"),
+        "V3 queued-arrival fallback target did not receive its baseline",
+      );
+      await until(
+        () => closingTarget.frames.some((frame) => frame.type === "output"
+          && frame.data === "baseline"),
+        "V3 queued-arrival closing target did not receive its baseline",
+      );
+
+      queueOutput = true;
+      for (let index = 1; index <= 5; index += 1) {
+        content = `queued-${index}`;
+        await until(
+          () => control.frames.some((frame) => frame.type === "output"
+            && frame.data === content),
+          `V3 queued-arrival control did not receive queued-${index}`,
+        );
+        await until(
+          () => fallbackQueue.length >= index,
+          `V3 fallback transport did not queue output ${index}`,
+        );
+        await until(
+          () => closingQueue.length >= index,
+          `V3 closing transport did not queue output ${index}`,
+        );
+      }
+
+      const fallbackQueuedBeforeRevoke = fallbackQueue.length;
+      const closingQueuedBeforeRevoke = closingQueue.length;
+      const fallbackDeliveredBeforeFlush = fallbackDelivered.filter((frame) => (
+        frame.type === "output" && frame.data?.startsWith("queued-")
+      )).length;
+      const closingDeliveredBeforeFlush = closingDelivered.filter((frame) => (
+        frame.type === "output" && frame.data?.startsWith("queued-")
+      )).length;
+      const revokeResult = guard.revoke(targetToken);
+      const fallbackPostRevokeDeliveries = fallbackQueue.splice(0)
+        .map((raw) => JSON.parse(raw) as WireFrame);
+      const closingPostRevokeDeliveries = closingQueue.splice(0)
+        .map((raw) => JSON.parse(raw) as WireFrame);
+      fallbackDelivered.push(...fallbackPostRevokeDeliveries);
+      closingDelivered.push(...closingPostRevokeDeliveries);
+
+      content = "after-revoke-new-broadcast";
+      await until(
+        () => control.frames.some((frame) => frame.type === "output"
+          && frame.data === content),
+        "V3 queued-arrival control did not receive the post-revoke broadcast",
+      );
+      await Bun.sleep(20);
+
+      const fallbackResult = {
+        revokeResult,
+        queuedBeforeRevoke: fallbackQueuedBeforeRevoke,
+        deliveredBeforeFlush: fallbackDeliveredBeforeFlush,
+        postRevokeOutputArrivals: fallbackPostRevokeDeliveries.filter((frame) => (
+          frame.type === "output"
+        )).length,
+        postRevokeData: fallbackPostRevokeDeliveries.map((frame) => frame.data),
+        newSendAfterRevoke: fallbackQueue.length,
+      };
+      const closingResult = {
+        revokeResult,
+        queuedBeforeRevoke: closingQueuedBeforeRevoke,
+        deliveredBeforeFlush: closingDeliveredBeforeFlush,
+        postRevokeOutputArrivals: closingPostRevokeDeliveries.filter((frame) => (
+          frame.type === "output"
+        )).length,
+        postRevokeData: closingPostRevokeDeliveries.map((frame) => frame.data),
+        closeCalls,
+        newSendAfterRevoke: closingQueue.length,
+      };
+      console.log("V3_QUEUED_ARRIVAL_PROBE", JSON.stringify(fallbackResult));
+      console.log("Y1_CLOSING_QUEUE_PROBE", JSON.stringify(closingResult));
+
+      expect(fallbackResult.revokeResult).toBe(true);
+      expect(fallbackResult.queuedBeforeRevoke).toBe(5);
+      expect(fallbackResult.deliveredBeforeFlush).toBe(0);
+      expect(fallbackResult.postRevokeOutputArrivals).toBe(5);
+      expect(fallbackResult.newSendAfterRevoke).toBe(0);
+      expect(closingResult.postRevokeOutputArrivals).toBe(0);
+      expect(closingResult.queuedBeforeRevoke).toBe(5);
+      expect(closingResult.deliveredBeforeFlush).toBe(0);
+      expect(closingResult.closeCalls).toBe(1);
+      expect(closingResult.newSendAfterRevoke).toBe(0);
+    } finally {
+      routes.websocket.close(fallbackTarget);
+      routes.websocket.close(closingTarget);
+      routes.websocket.close(control);
+      routes.mux.stop();
+    }
+  });
+
+  test("v0.7.1 send-only WsLike host compiles against the current declaration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "thumbmux-y1-wslike-compat-"));
+    const packageRoot = join(import.meta.dir, "../..");
+    const declarationRoot = join(root, "current-declaration");
+    const consumerPath = join(root, "v071-host.ts");
+    const configPath = join(root, "tsconfig.json");
+    const tscPath = join(packageRoot, "node_modules/.bin/tsc");
+
+    try {
+      const emit = Bun.spawnSync([
+        tscPath,
+        "-p", join(packageRoot, "server/tsconfig.build.json"),
+        "--outDir", declarationRoot,
+      ], { cwd: packageRoot, stdout: "pipe", stderr: "pipe" });
+      const emitDiagnostics = `${emit.stdout.toString()}${emit.stderr.toString()}`.trim();
+      expect(emitDiagnostics).toBe("");
+      expect(emit.exitCode).toBe(0);
+
+      await Bun.write(consumerPath, [
+        `import type { WsLike } from ${JSON.stringify(join(declarationRoot, "ws-mux.d.ts"))};`,
+        "",
+        "class V071HostSocket implements WsLike {",
+        "  send(data: string): number {",
+        "    return data.length;",
+        "  }",
+        "}",
+        "",
+        "const concrete = new V071HostSocket();",
+        "const socket: WsLike = concrete;",
+        "socket.send(\"compile probe\");",
+        "",
+      ].join("\n"));
+      await Bun.write(configPath, JSON.stringify({
+        compilerOptions: {
+          lib: ["ESNext", "DOM"],
+          target: "ESNext",
+          module: "Preserve",
+          moduleResolution: "bundler",
+          strict: true,
+          noEmit: true,
+          skipLibCheck: false,
+          baseUrl: packageRoot,
+          paths: {
+            "@thumbmux/core": ["core/src/index.ts"],
+            "@thumbmux/core/*": ["core/src/*"],
+          },
+          typeRoots: [
+            join(packageRoot, "server/node_modules/@types"),
+            join(packageRoot, "../../node_modules/@types"),
+          ],
+          types: ["bun"],
+        },
+        files: [consumerPath],
+      }, null, 2));
+
+      const compile = Bun.spawnSync(
+        [tscPath, "--noEmit", "-p", configPath],
+        { cwd: packageRoot, stdout: "pipe", stderr: "pipe" },
+      );
+      const compileDiagnostics = `${compile.stdout.toString()}${compile.stderr.toString()}`.trim();
+      console.log("Y1_V071_WSLIKE_COMPILE", JSON.stringify({
+        declarationExitCode: emit.exitCode,
+        hostExitCode: compile.exitCode,
+        diagnostics: compileDiagnostics,
+      }));
+      expect(compileDiagnostics).toBe("");
+      expect(compile.exitCode).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("authenticates upgrades, filters pushed lists, and rechecks expiry per message", async () => {
     const allowedSession = appRoutesPrefix("fake-a");

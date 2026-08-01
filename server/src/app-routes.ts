@@ -286,13 +286,18 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
 
   const withdrawSocket = (ws: WsLike): void => {
     if (!socketPrincipals.has(ws)) return;
-    // WsLike does not promise close(), so revoke application-level access by
-    // removing every pane, session-list, and drain subscription instead.
+    // Always revoke application-level access. A host may additionally expose
+    // close() so its adapter can apply transport-specific queue semantics.
     withdrawingSockets.add(ws);
     try {
       mux.unsubscribeAll(ws);
     } finally {
       withdrawingSockets.delete(ws);
+      try {
+        ws.close?.();
+      } catch {
+        // Transport closure is best effort; subscription withdrawal is not.
+      }
     }
   };
 

@@ -430,10 +430,22 @@ least one guarded socket is open, calls through the guard's currently installed
 `revoke` property sweep its live subscriptions in that call. A method reference
 saved before that observer was installed, or a custom guard whose method cannot
 be wrapped, instead relies on the per-socket check scheduled every 100 ms; it is
-withdrawn by the next check while the event loop remains responsive. A sweep
-removes the socket from live subscription sets, but does not cancel an output
-frame already captured in an in-progress grouped fan-out: that current frame may
-arrive, while the next broadcast must not. Expiry uses the same scheduled check.
+withdrawn by the next check while the event loop remains responsive. Expiry uses
+the same scheduled check.
+
+A sweep removes the socket from live subscription sets. An in-progress grouped
+fan-out may already include that socket and may still call its `send()` for the
+current output frame, but subsequent live broadcasts do not call its `send()`.
+This is a server-side handoff bound, not a client-delivery bound: the transport
+may deliver multiple frames that it accepted into its outbound queue before
+withdrawal after the token has been revoked.
+
+`WsLike.close()` is optional, so send-only adapters remain supported. When it is
+present, `createAppRoutes` calls it during withdrawal so the adapter can close
+the transport. Whether closing discards already accepted frames is defined by
+that transport. Without `close()`, thumbmux can only remove subscriptions. A
+host that requires immediate peer cutoff must provide a close implementation,
+or an equivalent adapter action, that discards its outbound queue.
 
 Pass no `guard` and it behaves exactly as before — unauthenticated, as the demo
 and single-user setups expect.

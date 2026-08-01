@@ -12,7 +12,8 @@
  *   hooks     host policy: telemetry taps + resize arbitration
  *   profile   per-session behavior (resizable? capture mode? archive?)
  *
- * The WS type is structural ({ send }) — Bun's ServerWebSocket satisfies it.
+ * The WS type is structural ({ send, optional close }) — Bun's
+ * ServerWebSocket satisfies it.
  */
 import {
   chooseMuxOutputFrame,
@@ -24,7 +25,10 @@ import {
   type SessionListRow,
 } from "@thumbmux/core";
 
-export type WsLike = { send(data: string): unknown };
+export type WsLike = {
+  send(data: string): unknown;
+  close?(): void;
+};
 
 export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem> {
   listSessions(): SessionRow[];
