@@ -17,7 +17,11 @@ set -euo pipefail
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$package_dir"
 
+# `git archive HEAD:<path>` resolves <path> against the CURRENT directory, not
+# the repo root — running it from inside the package yields an empty archive
+# and exit 0, so the whole gate silently tests nothing. Archive from the top.
 prefix="$(git rev-parse --show-prefix)"     # "" in the public repo, "packages/thumbmux/" in the monorepo
+repo_root="$(git rev-parse --show-toplevel)"
 if [ -n "$prefix" ]; then
   archive_ref="HEAD:${prefix%/}"
 else
@@ -29,8 +33,13 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
 echo "ci-parity: exporting $archive_ref -> $work"
-git archive "$archive_ref" | tar -x -C "$work"
+git -C "$repo_root" archive "$archive_ref" | tar -x -C "$work"
 cd "$work"
+
+# Fail loudly rather than run a green suite over an empty directory.
+for required in package.json bun.lock core/package.json server/package.json svelte/package.json app/package.json; do
+  [ -f "$required" ] || { echo "ci-parity: export is missing $required — refusing to report a result" >&2; exit 1; }
+done
 
 echo "ci-parity: bun install --frozen-lockfile"
 bun install --frozen-lockfile
