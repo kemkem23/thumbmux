@@ -34,6 +34,15 @@ Release checklist:
 - Bump root, core, server, svelte, **and app** `package.json` versions in lockstep —
   five files. `app` joined in v0.8.0; a bump that misses it ships a workspace
   claiming the previous version.
+- **Bump the internal `@thumbmux/*` ranges in the same commit** — `server`,
+  `svelte` and `app` each depend on `@thumbmux/core` (and `app` on
+  `@thumbmux/svelte`) with a caret range. On a `0.x` version a caret does not
+  cross the minor: `^0.7.1` means `>=0.7.1 <0.8.0`, so the moment `core`
+  becomes `0.8.0` the range stops matching the workspace, bun falls through to
+  the public registry, and the install dies on `404 @thumbmux/core`. The
+  version bump alone is not a release; it is half of one. Verify with the CI
+  command itself, in a clean tree:
+  `bun install --frozen-lockfile`.
 - Push main through the subtree split.
 - Push the `vX.Y.Z` source tag and let `release-dist` publish `vX.Y.Z-dist`.
 - Bump every consumer pin together, then reinstall (npm consumers:

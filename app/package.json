@@ -23,8 +23,8 @@
     "build": "rm -rf dist && svelte-package -i src -o dist"
   },
   "dependencies": {
-    "@thumbmux/core": "^0.7.1",
-    "@thumbmux/svelte": "^0.7.1"
+    "@thumbmux/core": "^0.8.0",
+    "@thumbmux/svelte": "^0.8.0"
   },
   "devDependencies": {
     "@sveltejs/package": "^2.5.4",
