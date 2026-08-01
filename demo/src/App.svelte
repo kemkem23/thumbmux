@@ -137,6 +137,7 @@
         hubTitle: 'THUMBMUX · DEMO', hubCount: String,
         gridEmpty: 'No tmux sessions yet — tap + terminal',
         launchHint: 'Pick an agent — the exact launch command is shown before you run it.',
+        launchFailed: String,
         noteEmpty: 'no note yet',
       },
     };

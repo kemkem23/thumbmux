@@ -29,6 +29,7 @@ import type { AppAdapters, SessionActionContext } from '../src/config';
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 
 const mounted: Mounted[] = [];
+let originalConnected = false;
 let originalSubscribe: PropertyDescriptor | undefined;
 let originalOnSessions: PropertyDescriptor | undefined;
 const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
@@ -116,8 +117,10 @@ function palette(background: string): AnsiPalette {
 
 beforeEach(() => {
   localStorage.clear();
+  originalConnected = tmuxMux.connected;
   originalSubscribe = Object.getOwnPropertyDescriptor(tmuxMux, 'subscribe');
   originalOnSessions = Object.getOwnPropertyDescriptor(tmuxMux, 'onSessions');
+  tmuxMux.connected = false;
   tmuxMux.subscribe = (() => () => {}) as typeof tmuxMux.subscribe;
   tmuxMux.onSessions = ((callback: (rows: unknown[]) => void) => {
     callback([]);
@@ -136,6 +139,7 @@ afterEach(() => {
     }
     entry.target.remove();
   }
+  tmuxMux.connected = originalConnected;
   restoreProperty(tmuxMux, 'subscribe', originalSubscribe);
   restoreProperty(tmuxMux, 'onSessions', originalOnSessions);
   restoreProperty(globalThis, 'fetch', originalFetch);
@@ -207,6 +211,95 @@ describe('mountable terminal views', () => {
     // 1_700_000_000_000. Assert on what the view handed the callback.
     expect(seen).toContain(1_700_000_000_000);
     expect(seen).not.toContain(1_700_000_000);
+  });
+
+  test('HUD follows the host mux connection while the singleton is offline', async () => {
+    const hostMux = {
+      connected: true,
+      onSessions(callback: (rows: unknown[]) => void) {
+        callback([]);
+        return () => {};
+      },
+    } as unknown as NonNullable<AppAdapters['mux']>;
+    const { target } = mountView(SessionView, {
+      session: 'audit-host-mux',
+      adapters: {
+        mux: hostMux,
+        termProps: () => ({ claimGeometry: false }),
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    expect(target.querySelector('.st')?.textContent?.trim()).toBe('CONNECTED');
+  });
+
+  test('keys reach the host mux, not the singleton, when only adapters.mux is given', async () => {
+    // adapters.mux and adapters.sendKeys are independently optional. A host that
+    // supplies only the mux had its rows read from that connection while its
+    // keystrokes went to the singleton — the same split brain as the HUD, one
+    // layer down.
+    const hostKeys: Array<[string, string]> = [];
+    const singletonKeys: Array<[string, string]> = [];
+    const sessionName = 'sh-key-routing';
+    const hostMux = {
+      connected: true,
+      subscribe: () => () => {},
+      onSessions: (cb: (rows: unknown[]) => void) => { cb([]); return () => {}; },
+      sendKeys: (session: string, data: string) => { hostKeys.push([session, data]); },
+    } as unknown as AppAdapters['mux'];
+
+    const originalSendKeys = Object.getOwnPropertyDescriptor(tmuxMux, 'sendKeys');
+    tmuxMux.sendKeys = ((session: string, data: string) => {
+      singletonKeys.push([session, data]);
+    }) as typeof tmuxMux.sendKeys;
+
+    try {
+      const { target } = mountView(SessionView, {
+        session: sessionName,
+        adapters: { mux: hostMux, termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+      });
+      await tick();
+
+      const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+      if (!terminal) throw new Error('SessionView did not render TermView');
+      flushSync(() => terminal.click());
+      await tick();
+
+      const input = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+      const send = target.querySelector<HTMLButtonElement>('[data-testid="input-sheet"] .snd');
+      if (!input || !send) throw new Error('SessionView did not open ComposerDock');
+      flushSync(() => {
+        input.value = 'routed';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await tick();
+      flushSync(() => send.click());
+
+      expect(hostKeys.map(([name]) => name)).toEqual([sessionName]);
+      expect(singletonKeys).toEqual([]);
+
+      // EmbedView carries the same two seams and must not disagree either.
+      hostKeys.length = 0;
+      const embed = mountView(EmbedView, {
+        session: sessionName,
+        adapters: { mux: hostMux, termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+      });
+      await tick();
+      const embedInput = embed.target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+      const embedSend = embed.target.querySelector<HTMLButtonElement>('[data-testid="input-sheet"] .snd');
+      if (embedInput && embedSend) {
+        flushSync(() => {
+          embedInput.value = 'embedded';
+          embedInput.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        await tick();
+        flushSync(() => embedSend.click());
+        expect(hostKeys.map(([name]) => name)).toEqual([sessionName]);
+      }
+      expect(singletonKeys).toEqual([]);
+    } finally {
+      restoreProperty(tmuxMux, 'sendKeys', originalSendKeys);
+    }
   });
 
   test('optional panels and upload UI render only when their adapters are supplied', async () => {
