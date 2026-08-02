@@ -10,6 +10,8 @@ import type {
 } from '@thumbmux/core';
 import type {
   FabAction,
+  GridFilterOption,
+  GridOrder,
   GridSession,
   LaunchContext,
   TmuxMux,
@@ -22,6 +24,17 @@ export type SubmissionTransport = (
   session: string,
   keys: string,
 ) => void | Promise<void>;
+
+/** Optional presentation choices for the hub's grid and launcher. Omitted
+ * members retain the presentation components' stock defaults. Hub launcher
+ * color mode remains on `AppAdapters.theme.mode`, alongside the shell's other
+ * theme state, instead of creating a second source of truth here. */
+export interface HubPresentationOptions {
+  filterOptions?: readonly GridFilterOption[];
+  groupable?: boolean;
+  order?: GridOrder;
+  showCommand?: boolean;
+}
 
 /** Host-owned behavior and policy seams for the mountable application shell. */
 export interface AppAdapters {
@@ -71,6 +84,9 @@ export interface AppAdapters {
     launch?: (spec: LaunchSpec, contextId: string | null) => Promise<{ name: string }>;
   };
   sessionMeta?: (rows: SessionListItem[]) => GridSession[];
+  /** Presentation-only hub options. Session metadata remains in `sessionMeta`,
+   * and launcher theme mode remains in `theme.mode`. */
+  hubPresentation?: HubPresentationOptions;
   notes?: {
     load(session: string): Promise<string>;
     save(session: string, text: string): Promise<void>;

@@ -22,6 +22,7 @@ import ThumbmuxApp from '../src/ThumbmuxApp.svelte';
 import type {
   AppAdapters,
   AppLabels,
+  HubPresentationOptions,
   SessionActionContext,
   SubmissionTransport,
 } from '../src';
@@ -53,6 +54,7 @@ const REQUIRED_RUNTIME_EXPORTS = [
 const REQUIRED_TYPE_EXPORTS = [
   'AppAdapters',
   'AppLabels',
+  'HubPresentationOptions',
   'SessionActionContext',
   'SubmissionTransport',
 ] as const;
@@ -62,6 +64,7 @@ const REQUIRED_TYPE_EXPORTS = [
 type ConfigExports = [
   AppAdapters,
   AppLabels,
+  HubPresentationOptions,
   SessionActionContext,
   SubmissionTransport,
 ];

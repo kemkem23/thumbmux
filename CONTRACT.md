@@ -123,6 +123,17 @@ submission path and its byte order remain in use. The app view tests pin both
 routes, and the frozen app consumer omits the adapter to exercise the additive
 case.
 
+`AppAdapters.hubPresentation` is the optional hub-presentation block. Its `filterOptions`,
+`groupable`, and `order` members feed `SessionGrid`, while `showCommand` feeds
+`LaunchSheet`. Each member is optional. Omitting one preserves the presentation
+component's existing default: no filter choices, grouping disabled, input order,
+and command preview shown. Launcher color mode deliberately reuses the existing
+`AppAdapters.theme.mode` seam instead of introducing a second theme setting;
+`dark` is true only when that callback returns `dark`, and an absent theme or
+mode retains the light launcher. The app view tests pin both the configured and
+fully omitted routes, and the unchanged frozen app consumer exercises the
+additive omitted route.
+
 ## Deprecation policy
 
 1. **Apply all stamps in one release.** A deprecated name must receive all of

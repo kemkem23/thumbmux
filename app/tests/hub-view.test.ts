@@ -227,6 +227,98 @@ describe('HubView', () => {
     expect(opened).toEqual(['session-one']);
   });
 
+  test('forwards host hub presentation options to the grid and launcher', async () => {
+    const adapters = {
+      fetchSessions: async () => [
+        session('older-session'),
+        session('newer-session'),
+      ],
+      sessionMeta: (rows) => rows.map((row) => ({
+        name: row.name,
+        filterValue: 'tool',
+        groupKey: 'workspace',
+        groupLabel: 'Workspace',
+        lastActivityAt: row.name === 'newer-session' ? 200 : 100,
+      })),
+      spawn: { presets: [preset] },
+      theme: { mode: () => 'dark' as const },
+      hubPresentation: {
+        filterOptions: [{ value: 'tool', label: 'TOOL' }],
+        groupable: true,
+        order: 'recent' as const,
+        showCommand: false,
+      },
+    } satisfies AppAdapters;
+    const { target } = mountHub({ adapters });
+    await settleUi();
+
+    click(target, '[data-testid="grid-new"]');
+    click(target, '[data-testid="launch-preset"][data-preset="worker"]');
+
+    expect({
+      filterValues: Array.from(
+        target.querySelectorAll<HTMLElement>('[data-testid="grid-filter"]'),
+        (element) => element.dataset.filterValue,
+      ),
+      groupable: target.querySelector('[data-testid="grid-group-toggle"]') !== null,
+      order: Array.from(
+        target.querySelectorAll<HTMLElement>('[data-testid="grid-card"]'),
+        (element) => element.dataset.session,
+      ),
+      commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
+      darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
+    }).toEqual({
+      filterValues: ['', 'tool'],
+      groupable: true,
+      order: ['newer-session', 'older-session'],
+      commandPreview: false,
+      darkLauncher: true,
+    });
+  });
+
+  test('retains every hub presentation default when the host supplies no options', async () => {
+    const { target } = mountHub({
+      adapters: {
+        fetchSessions: async () => [
+          session('input-first'),
+          session('input-second'),
+        ],
+        sessionMeta: (rows) => rows.map((row) => ({
+          name: row.name,
+          filterValue: 'tool',
+          groupKey: 'workspace',
+          groupLabel: 'Workspace',
+          lastActivityAt: row.name === 'input-second' ? 200 : 100,
+        })),
+        spawn: { presets: [preset] },
+      },
+    });
+    await settleUi();
+
+    click(target, '[data-testid="grid-new"]');
+    click(target, '[data-testid="launch-preset"][data-preset="worker"]');
+
+    expect({
+      filterValues: Array.from(
+        target.querySelectorAll<HTMLElement>('[data-testid="grid-filter"]'),
+        (element) => element.dataset.filterValue,
+      ),
+      groupable: target.querySelector('[data-testid="grid-group-toggle"]') !== null,
+      order: Array.from(
+        target.querySelectorAll<HTMLElement>('[data-testid="grid-card"]'),
+        (element) => element.dataset.session,
+      ),
+      commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
+      darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
+    }).toEqual({
+      filterValues: [],
+      groupable: false,
+      order: ['input-first', 'input-second'],
+      commandPreview: true,
+      darkLauncher: false,
+    });
+  });
+
   test('emits the onOpen callback when no host route adapter is present', async () => {
     const opened: string[] = [];
     const { target } = mountHub({

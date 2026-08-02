@@ -7,6 +7,7 @@ export { DEFAULT_APP_LABELS } from './config';
 export type {
   AppAdapters,
   AppLabels,
+  HubPresentationOptions,
   SessionActionContext,
   SubmissionTransport,
 } from './config';

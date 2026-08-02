@@ -36,6 +36,8 @@
   let labels = $derived({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let basePath = $derived(normalizeBasePath(adapters.basePath));
   let palette = $derived(defaultSurface(adapters.theme?.defaultBg ?? '#101014').palette);
+  let hubPresentation = $derived(adapters.hubPresentation);
+  let launcherDark = $derived(adapters.theme?.mode?.() === 'dark');
   let presets = $derived([...(adapters.spawn?.presets ?? DEFAULT_LAUNCH_PRESETS)]);
   let gridSessions = $derived.by((): GridSession[] => {
     const sessions = adapters.sessionMeta
@@ -183,12 +185,17 @@
     searchPlaceholder={labels.gridSearchPlaceholder}
     groupToggleLabel={labels.gridGroup}
     ungroupedLabel={labels.gridUngrouped}
+    filterOptions={hubPresentation?.filterOptions}
+    groupable={hubPresentation?.groupable}
+    order={hubPresentation?.order}
   />
 
   <LaunchSheet
     open={launchOpen}
+    dark={launcherDark}
     {presets}
     {contexts}
+    showCommand={hubPresentation?.showCommand}
     busy={launching}
     error={launchError}
     onLaunch={launch}

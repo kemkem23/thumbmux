@@ -3,6 +3,18 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
+## v0.8.3 (unreleased)
+
+### Added
+
+- **`HubView` now accepts host-owned grid and launcher presentation choices.**
+  The optional `AppAdapters.hubPresentation` block uses the new public
+  `HubPresentationOptions` type to forward filter choices, grouping, ordering,
+  and command-preview visibility. Every member is optional; omitted members
+  retain the stock empty-filter, ungrouped, input-order, and visible-command
+  behavior. Launcher dark mode reuses `AppAdapters.theme.mode`, so theme state
+  stays on the existing seam; an absent theme or mode remains light.
+
 ## v0.8.2 — 2026-08-02
 
 ### Added

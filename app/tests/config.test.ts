@@ -84,6 +84,12 @@ const plannedAdapters = {
     launch: async () => ({ name: 'generated-session' }),
   },
   sessionMeta: () => [],
+  hubPresentation: {
+    filterOptions: [{ value: 'tool', label: 'Tool' }],
+    groupable: true,
+    order: 'recent',
+    showCommand: false,
+  },
   notes: { load: async () => '', save: async () => {} },
   prompts: async () => [],
   upload: { endpoint: () => '/upload', dir: 'uploads' },
