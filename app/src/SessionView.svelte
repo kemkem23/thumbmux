@@ -120,7 +120,11 @@
     },
   });
 
-  let controlInset = $derived(Math.max(shortcutBarHeight, scrollControlsHeight));
+  let showShortcutBar = $derived(adapters.sessionPresentation?.showShortcutBar ?? true);
+  let controlInset = $derived(Math.max(
+    showShortcutBar ? shortcutBarHeight : 0,
+    scrollControlsHeight,
+  ));
   let terminalDockInset = $derived(
     dockInset + (controlInset > 0 ? controlInset + 8 : 0),
   );
@@ -254,9 +258,13 @@
     composerRef?.openCompose();
   }
 
-  const actionContext: SessionActionContext = {
+  const legacyActionContext: SessionActionContext = {
     submit: submitDraft,
     prefill: prefillComposer,
+  };
+  const actionContext: SessionActionContext = {
+    ...legacyActionContext,
+    copyAll: copyAllTerminal,
   };
 
   function openComposer(): void {
@@ -333,9 +341,13 @@
     setLocalBg(themeDefaultBg);
   }
 
+  async function copyAllTerminal(): Promise<boolean> {
+    return (await termRef?.copyAll()) ?? false;
+  }
+
   async function copyTerminal(): Promise<void> {
     const copiedSelection = await termRef?.copySelection();
-    if (copiedSelection === false) await termRef?.copyAll();
+    if (copiedSelection === false) await copyAllTerminal();
   }
 
   function onTermScrollStateChange(state: { bottomOffset: number; scrolledUp: boolean }): void {
@@ -416,6 +428,16 @@
     isDesktop = next;
   }
 
+  function dismissingHostAction(action: FabAction): FabAction {
+    return {
+      ...action,
+      onTap: () => {
+        overlay.fabOpen = false;
+        action.onTap();
+      },
+    };
+  }
+
   let actions = $derived.by((): FabAction[] => {
     const stock: FabAction[] = [
       { id: 'type', label: labels.actionType, onTap: openComposer },
@@ -463,14 +485,16 @@
         onTap: () => setFont(storedFontPx - 1),
       },
     );
-    const extras = (adapters.extraActions?.(session, actionContext) ?? []).map((action) => ({
-      ...action,
-      onTap: () => {
-        overlay.fabOpen = false;
-        action.onTap();
-      },
-    }));
-    return [...stock, ...extras];
+    const extras = (adapters.extraActions?.(session, legacyActionContext) ?? [])
+      .map(dismissingHostAction);
+    const defaults = [...stock, ...extras];
+    const compose = adapters.sessionPresentation?.actions;
+    if (!compose) return defaults;
+
+    const defaultActions = new Set(defaults);
+    return compose(session, actionContext, defaults).map((action) => (
+      defaultActions.has(action) ? action : dismissingHostAction(action)
+    ));
   });
 
   let noteRequest = 0;
@@ -563,6 +587,7 @@
 <div
   class="stage"
   data-testid="session-view"
+  data-state={currentMeta?.state}
   style:--agent={surface.agent}
   style:--tbg={surface.tbg}
   style:--tstage={surface.tstage}
@@ -622,17 +647,19 @@
     panel={hasHudPanel ? hudPanel : undefined}
   />
 
-  <ShortcutBar
-    bind:barHeight={shortcutBarHeight}
-    {shortcuts}
-    agent={sessionAgent}
-    visible={!overlay.fabOpen && !overlay.themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
-    onSend={(shortcut) => {
-      if (shortcut.submit === false) sendKeys(shortcut.send);
-      else submitDraft(shortcut.send);
-    }}
-    onManage={() => { shortcutsOpen = true; }}
-  />
+  {#if showShortcutBar}
+    <ShortcutBar
+      bind:barHeight={shortcutBarHeight}
+      {shortcuts}
+      agent={sessionAgent}
+      visible={!overlay.fabOpen && !overlay.themeOpen && !shortcutsOpen && !dpadOpen && !termScrollState.scrolledUp}
+      onSend={(shortcut) => {
+        if (shortcut.submit === false) sendKeys(shortcut.send);
+        else submitDraft(shortcut.send);
+      }}
+      onManage={() => { shortcutsOpen = true; }}
+    />
+  {/if}
 
   {#if termScrollState.scrolledUp}
     <div class="scroll-controls" bind:offsetHeight={scrollControlsHeight}>
@@ -717,7 +744,13 @@
     onSend={submitDraft}
     onDirectText={sendKeys}
     onDirectKey={sendKeys}
-    onPasteFiles={uploadEndpoint ? (files) => { void uploadRef?.uploadFiles(files); } : undefined}
+    onPasteFiles={
+      uploadEndpoint
+        ? (files) => { void uploadRef?.uploadFiles(files); }
+        : adapters.upload?.onUnavailable
+          ? (files) => { adapters.upload?.onUnavailable?.(session, files, actionContext); }
+          : undefined
+    }
     labels={{
       compose: labels.composerCompose,
       direct: labels.composerDirect,

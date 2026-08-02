@@ -134,6 +134,27 @@ mode retains the light launcher. The app view tests pin both the configured and
 fully omitted routes, and the unchanged frozen app consumer exercises the
 additive omitted route.
 
+`AppAdapters.sessionPresentation` is the optional `SessionView` presentation
+block. Its `actions` callback receives the complete default FAB list in order:
+stock actions followed by the existing `extraActions`; the returned list is the
+final list, so a host can replace, remove, or reorder any entry. New actions the
+callback creates receive the same FAB auto-dismiss behavior as legacy extra
+actions.
+`showShortcutBar: false` removes the persistent bar without removing its manager
+sheet or stock FAB action; omission keeps the bar. Copy does not get a second
+policy adapter: the opt-in action transformer receives optional
+`SessionActionContext.copyAll`, while legacy `extraActions` keeps its original
+two-member runtime context and the untouched stock copy action remains
+selection-first with whole-buffer fallback. File-paste unavailability likewise
+stays on the existing upload adapter: when `upload.endpoint(session)` is null,
+optional `upload.onUnavailable` receives that session, the pasted files, and the
+enhanced action context. With an endpoint, paste still uploads; with neither an
+endpoint nor the callback, the browser keeps the paste. Separately, the session
+stage mirrors the current mapped metadata's exact `state` as `data-state`; this
+forwards an existing value and adds no adapter. The app view tests pin each
+configured route separately and pin all omitted defaults, while the unchanged
+frozen app consumer exercises the additive omitted route.
+
 ## Deprecation policy
 
 1. **Apply all stamps in one release.** A deprecated name must receive all of

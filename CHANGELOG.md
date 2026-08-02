@@ -3,7 +3,7 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
-## v0.8.3 (unreleased)
+## v0.8.3 — 2026-08-02
 
 ### Added
 
@@ -14,6 +14,23 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
   retain the stock empty-filter, ungrouped, input-order, and visible-command
   behavior. Launcher dark mode reuses `AppAdapters.theme.mode`, so theme state
   stays on the existing seam; an absent theme or mode remains light.
+
+- **`SessionView` now lets a host compose its FAB and suppress the persistent
+  shortcut bar.** The optional `AppAdapters.sessionPresentation` block exposes
+  the complete stock-plus-extra action list to a final transformer and can hide
+  `ShortcutBar`; its manager sheet and stock FAB entry remain unless the action
+  transformer removes that entry. Actions returned by the transformer can use
+  the new optional `SessionActionContext.copyAll` operation when selection-first
+  copy is not the desired policy, and topicless file pastes can be handled by the
+  new optional `upload.onUnavailable` callback on the existing upload adapter.
+  Omitting these members retains the stock action set and order with legacy
+  extras appended, the persistent shortcut bar, selection-first copy with
+  whole-buffer fallback, endpoint-backed paste uploads, and browser-owned paste
+  when no endpoint exists.
+
+  The session stage now also forwards mapped session `state` to its root
+  `data-state` attribute; it reuses the metadata already shown by the HUD and
+  introduces no adapter.
 
 ## v0.8.2 — 2026-08-02
 

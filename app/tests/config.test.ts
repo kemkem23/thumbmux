@@ -90,9 +90,17 @@ const plannedAdapters = {
     order: 'recent',
     showCommand: false,
   },
+  sessionPresentation: {
+    actions: (_session, _context, defaults) => defaults,
+    showShortcutBar: false,
+  },
   notes: { load: async () => '', save: async () => {} },
   prompts: async () => [],
-  upload: { endpoint: () => '/upload', dir: 'uploads' },
+  upload: {
+    endpoint: () => '/upload',
+    dir: 'uploads',
+    onUnavailable: (_session, _files, context) => { void context.copyAll?.(); },
+  },
   termProps: () => ({ claimGeometry: false }),
   theme: { defaultBg: '#101014' },
   labels: { hubTitle: 'Custom' },

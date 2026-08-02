@@ -9,6 +9,7 @@ export type {
   AppLabels,
   HubPresentationOptions,
   SessionActionContext,
+  SessionPresentationOptions,
   SubmissionTransport,
 } from './config';
 export { createQueryParamNav } from './navigation';

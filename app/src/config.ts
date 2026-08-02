@@ -36,6 +36,22 @@ export interface HubPresentationOptions {
   showCommand?: boolean;
 }
 
+/** Optional presentation choices for one mounted session. Omitted members
+ * retain `SessionView`'s stock controls. */
+export interface SessionPresentationOptions {
+  /** Compose the complete FAB list after stock actions and legacy
+   * `extraActions` have been assembled. Returning the supplied actions by
+   * reference preserves their existing behavior; newly created actions are
+   * given the same FAB auto-dismiss behavior as legacy extra actions. */
+  actions?: (
+    session: string,
+    context: SessionActionContext,
+    defaults: readonly FabAction[],
+  ) => readonly FabAction[];
+  /** Render the persistent shortcut chips and manage button. Defaults true. */
+  showShortcutBar?: boolean;
+}
+
 /** Host-owned behavior and policy seams for the mountable application shell. */
 export interface AppAdapters {
   /** REST prefix the shell calls, the client half of
@@ -87,6 +103,9 @@ export interface AppAdapters {
   /** Presentation-only hub options. Session metadata remains in `sessionMeta`,
    * and launcher theme mode remains in `theme.mode`. */
   hubPresentation?: HubPresentationOptions;
+  /** Presentation-only session controls. Upload policy remains in `upload`,
+   * and terminal operations remain on `SessionActionContext`. */
+  sessionPresentation?: SessionPresentationOptions;
   notes?: {
     load(session: string): Promise<string>;
     save(session: string, text: string): Promise<void>;
@@ -100,6 +119,14 @@ export interface AppAdapters {
      * decorate the default can call that itself. Without this, extraction would
      * silently replace a host's own wording — including its language. */
     formatPrefill?: (files: UploadedFile[], dir: string) => string;
+    /** Handle a composer file paste when `endpoint(session)` is null. The
+     * shell has no upload destination in that state, so the existing action
+     * context lets the host explain or recover through the composer. */
+    onUnavailable?: (
+      session: string,
+      files: readonly File[],
+      context: SessionActionContext,
+    ) => void;
   };
   prefs?: PreferencesAdapter;
   termProps?: (session: string) => Partial<{
@@ -157,6 +184,12 @@ export interface SessionActionContext {
   submit(text: string): void;
   /** Put text in the composer and open it, without sending. */
   prefill(text: string): void;
+  /** Copy the complete terminal buffer, ignoring any native selection.
+   * Optional so existing code that constructs this public context type keeps
+   * compiling. `SessionView` supplies it to the opt-in session-presentation
+   * and unavailable-upload callbacks; legacy `extraActions` receives its
+   * original two-member runtime context. */
+  copyAll?: () => Promise<boolean>;
 }
 
 /** English-by-default copy used by the stock hub and session shells. */

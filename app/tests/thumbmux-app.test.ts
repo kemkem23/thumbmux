@@ -24,6 +24,7 @@ import type {
   AppLabels,
   HubPresentationOptions,
   SessionActionContext,
+  SessionPresentationOptions,
   SubmissionTransport,
 } from '../src';
 import { createQueryParamNav } from '../src/navigation';
@@ -56,6 +57,7 @@ const REQUIRED_TYPE_EXPORTS = [
   'AppLabels',
   'HubPresentationOptions',
   'SessionActionContext',
+  'SessionPresentationOptions',
   'SubmissionTransport',
 ] as const;
 
@@ -66,6 +68,7 @@ type ConfigExports = [
   AppLabels,
   HubPresentationOptions,
   SessionActionContext,
+  SessionPresentationOptions,
   SubmissionTransport,
 ];
 void (undefined as unknown as ConfigExports);

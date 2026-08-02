@@ -206,6 +206,23 @@ async function sendDirectText(target: HTMLElement, text: string): Promise<void> 
   await tick();
 }
 
+function pasteFiles(target: Element, files: File[]): Event {
+  const event = new Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    configurable: true,
+    value: { files },
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
+async function openFab(target: HTMLElement): Promise<void> {
+  const fab = target.querySelector<HTMLButtonElement>('.fab');
+  if (!fab) throw new Error('SessionView did not render ActionFab');
+  flushSync(() => fab.click());
+  await tick();
+}
+
 beforeEach(() => {
   localStorage.clear();
   originalConnected = tmuxMux.connected;
@@ -678,6 +695,374 @@ describe('mountable terminal views', () => {
     await tick();
     expect(hostActionCalls).toBe(1);
     expect(slots.classList.contains('open')).toBe(false);
+  });
+
+  test('host can replace and reorder the complete FAB action list', async () => {
+    let defaultIds: string[] = [];
+    let presetCalls = 0;
+    const { target } = mountView(SessionView, {
+      session: 'sh-composed-actions',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        extraActions: () => [{
+          id: 'legacy-extra',
+          label: 'Legacy extra',
+          testid: 'legacy-extra',
+          onTap: () => {},
+        }],
+        sessionPresentation: {
+          actions: (_session, _context, defaults) => {
+            defaultIds = defaults.map((action) => action.id);
+            const copy = defaults.find((action) => action.id === 'copy');
+            const legacy = defaults.find((action) => action.id === 'legacy-extra');
+            if (!copy || !legacy) throw new Error('complete default actions were not supplied');
+            return [
+              {
+                id: 'host-preset',
+                label: 'Host preset',
+                testid: 'host-preset',
+                onTap: () => {
+                  presetCalls += 1;
+                },
+              },
+              copy,
+              legacy,
+            ];
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    expect(defaultIds).toEqual([
+      'type',
+      'dpad',
+      'copy',
+      'shortcuts',
+      'theme',
+      'font-up',
+      'font-down',
+      'legacy-extra',
+    ]);
+    await openFab(target);
+    const actions = Array.from(target.querySelectorAll<HTMLButtonElement>('.slots .slot'));
+    expect(actions.map((action) => action.dataset.testid ?? null)).toEqual([
+      'host-preset',
+      'demo-copy',
+      'legacy-extra',
+    ]);
+
+    const preset = target.querySelector<HTMLButtonElement>('[data-testid="host-preset"]');
+    const slots = target.querySelector<HTMLElement>('.slots');
+    if (!preset || !slots) throw new Error('composed FAB actions did not render');
+    flushSync(() => preset.click());
+    await tick();
+    expect(presetCalls).toBe(1);
+    expect(slots.classList.contains('open')).toBe(false);
+  });
+
+  test('host can suppress the persistent shortcut bar', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-no-shortcut-bar',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sessionPresentation: { showShortcutBar: false },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    expect(target.querySelectorAll('[data-testid="shortcut-bar"]')).toHaveLength(0);
+    expect(target.querySelectorAll('[data-testid="shortcuts-sheet"]')).toHaveLength(1);
+    await openFab(target);
+    expect(target.querySelectorAll('[data-testid="demo-shortcuts"]')).toHaveLength(1);
+  });
+
+  test('host actions can copy the whole buffer even when text is selected', async () => {
+    type OutputCallback = (
+      data: string,
+      type?: string,
+      cursor?: { row: number; col: number } | null,
+      meta?: { source: 'full' | 'delta'; replace: boolean },
+    ) => void;
+    let deliverOutput: OutputCallback | undefined;
+    tmuxMux.subscribe = ((_session: string, callback: OutputCallback) => {
+      deliverOutput = callback;
+      return () => {};
+    }) as typeof tmuxMux.subscribe;
+
+    const writes: string[] = [];
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const selectionDescriptor = Object.getOwnPropertyDescriptor(window, 'getSelection');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (text: string) => { writes.push(text); } },
+    });
+    Object.defineProperty(window, 'getSelection', {
+      configurable: true,
+      value: () => ({ isCollapsed: false, toString: () => 'selected fragment' }),
+    });
+
+    try {
+      const { target } = mountView(SessionView, {
+        session: 'sh-copy-all-context',
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          sessionPresentation: {
+            actions: (_session, context, defaults) => [
+              ...defaults.filter((action) => action.id !== 'copy'),
+              {
+                id: 'host-copy-all',
+                label: 'Copy all',
+                testid: 'host-copy-all',
+                onTap: () => { void context.copyAll?.(); },
+              },
+            ],
+          },
+        } satisfies AppAdapters,
+      });
+      await tick();
+      if (!deliverOutput) throw new Error('TermView did not subscribe for output');
+      deliverOutput('whole first line\nwhole second line', 'output', null, {
+        source: 'full',
+        replace: true,
+      });
+      await tick();
+
+      await openFab(target);
+      const copyAll = target.querySelector<HTMLButtonElement>('[data-testid="host-copy-all"]');
+      if (!copyAll) throw new Error('host copy-all action did not render');
+      flushSync(() => copyAll.click());
+      await flushPromises();
+
+      expect(writes).toEqual(['whole first line\nwhole second line']);
+    } finally {
+      restoreProperty(navigator, 'clipboard', clipboardDescriptor);
+      restoreProperty(window, 'getSelection', selectionDescriptor);
+    }
+  });
+
+  test('topicless file pastes reach the upload adapter with action context', async () => {
+    const calls: Array<{ session: string; files: File[] }> = [];
+    const { target } = mountView(SessionView, {
+      session: 'sh-topicless-paste',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        upload: {
+          endpoint: () => null,
+          onUnavailable: (session, files, context) => {
+            calls.push({ session, files: [...files] });
+            context.prefill('Choose a topic before attaching files');
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    if (!textarea) throw new Error('SessionView did not render the composer textarea');
+    const file = new File(['image'], 'topicless.png', { type: 'image/png' });
+    const event = pasteFiles(textarea, [file]);
+    await tick();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(calls).toEqual([{ session: 'sh-topicless-paste', files: [file] }]);
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    expect(composer?.classList.contains('open')).toBe(true);
+    expect(textarea.value).toBe('Choose a topic before attaching files');
+  });
+
+  test('forwards current session state to the stage', async () => {
+    let push: ((rows: unknown[]) => void) | undefined;
+    const mux = {
+      subscribe: () => () => {},
+      onSessions: (callback: (rows: unknown[]) => void) => {
+        push = callback;
+        callback([]);
+        return () => {};
+      },
+    } as unknown as NonNullable<AppAdapters['mux']>;
+    const { target } = mountView(SessionView, {
+      session: 'sh-stage-state',
+      adapters: {
+        mux,
+        termProps: () => ({ claimGeometry: false }),
+        sessionMeta: (rows) => rows.map((row) => ({
+          name: row.name,
+          state: 'working',
+          stateLabel: 'BUSY NOW',
+        })),
+      } satisfies AppAdapters,
+    });
+    await tick();
+    if (!push) throw new Error('SessionView did not subscribe to session rows');
+    push([{ name: 'sh-stage-state' }]);
+    await tick();
+
+    expect(target.querySelector('[data-testid="session-view"]')?.getAttribute('data-state'))
+      .toBe('working');
+  });
+
+  test('omitted session presentation keeps the complete stock FAB order', async () => {
+    let legacyContextKeys: string[] = [];
+    const { target } = mountView(SessionView, {
+      session: 'sh-stock-actions',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        upload: { endpoint: () => '/upload' },
+        extraActions: (_session, context) => {
+          legacyContextKeys = Object.keys(context);
+          return [{
+            id: 'legacy-extra',
+            label: 'Legacy extra',
+            onTap: () => {},
+          }];
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+    await openFab(target);
+
+    expect(legacyContextKeys).toEqual(['submit', 'prefill']);
+    const labels = Array.from(target.querySelectorAll<HTMLButtonElement>('.slots .slot'))
+      .map((action) => action.textContent?.trim());
+    expect(labels).toEqual([
+      '⌨ Type',
+      '📎 Attach files',
+      '✛ Arrows',
+      '⧉ Copy screen',
+      '⚡ Shortcuts…',
+      '🎨 Theme',
+      'A+ Bigger text',
+      'A− Smaller text',
+      'Legacy extra',
+    ]);
+  });
+
+  test('omitted shortcut option keeps the stock shortcut bar', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-stock-shortcut-bar',
+      adapters: { termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+    });
+    await tick();
+
+    expect(target.querySelectorAll('[data-testid="shortcut-bar"]')).toHaveLength(1);
+    expect(target.querySelectorAll('[data-testid="shortcut-chip"]').length).toBeGreaterThan(0);
+    expect(target.querySelectorAll('[data-testid="shortcut-manage"]')).toHaveLength(1);
+  });
+
+  test('omitted copy control keeps stock selection-first behavior', async () => {
+    type OutputCallback = (
+      data: string,
+      type?: string,
+      cursor?: { row: number; col: number } | null,
+      meta?: { source: 'full' | 'delta'; replace: boolean },
+    ) => void;
+    let deliverOutput: OutputCallback | undefined;
+    tmuxMux.subscribe = ((_session: string, callback: OutputCallback) => {
+      deliverOutput = callback;
+      return () => {};
+    }) as typeof tmuxMux.subscribe;
+
+    const writes: string[] = [];
+    let selectedText: string | null = 'selected fragment';
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const selectionDescriptor = Object.getOwnPropertyDescriptor(window, 'getSelection');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (text: string) => { writes.push(text); } },
+    });
+    Object.defineProperty(window, 'getSelection', {
+      configurable: true,
+      value: () => ({
+        isCollapsed: selectedText === null,
+        toString: () => selectedText ?? '',
+      }),
+    });
+
+    try {
+      const { target } = mountView(SessionView, {
+        session: 'sh-stock-copy',
+        adapters: { termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+      });
+      await tick();
+      if (!deliverOutput) throw new Error('TermView did not subscribe for output');
+      deliverOutput('whole fallback buffer', 'output', null, {
+        source: 'full',
+        replace: true,
+      });
+      await tick();
+      await openFab(target);
+      const copy = target.querySelector<HTMLButtonElement>('[data-testid="demo-copy"]');
+      if (!copy) throw new Error('stock copy action did not render');
+      flushSync(() => copy.click());
+      await flushPromises();
+
+      expect(writes).toEqual(['selected fragment']);
+
+      selectedText = null;
+      await openFab(target);
+      flushSync(() => copy.click());
+      await flushPromises();
+      expect(writes).toEqual(['selected fragment', 'whole fallback buffer']);
+    } finally {
+      restoreProperty(navigator, 'clipboard', clipboardDescriptor);
+      restoreProperty(window, 'getSelection', selectionDescriptor);
+    }
+  });
+
+  test('omitted unavailable hook keeps endpoint-backed paste upload behavior', async () => {
+    const storedFiles: UploadedFile[] = [{ original: 'pasted.png', stored: 'stored-paste.png' }];
+    let fetchCalls = 0;
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: (async () => {
+        fetchCalls += 1;
+        return Response.json({ files: storedFiles }, { status: 201 });
+      }) as typeof fetch,
+    });
+    const { target } = mountView(SessionView, {
+      session: 'sh-stock-paste-upload',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        upload: {
+          endpoint: () => '/upload',
+          formatPrefill: (files) => `uploaded:${files[0]?.stored}`,
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    if (!textarea) throw new Error('SessionView did not render the composer textarea');
+    const event = pasteFiles(textarea, [new File(['image'], 'pasted.png', { type: 'image/png' })]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await flushPromises();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(fetchCalls).toBe(1);
+    expect(textarea.value).toBe('uploaded:stored-paste.png');
+  });
+
+  test('topicless paste stays browser-owned when the unavailable hook is omitted', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-stock-topicless-paste',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        upload: { endpoint: () => null },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!textarea || !composer) throw new Error('SessionView did not render ComposerDock');
+    const event = pasteFiles(textarea, [new File(['image'], 'topicless.png')]);
+    await tick();
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(composer.classList.contains('open')).toBe(false);
+    expect(textarea.value).toBe('');
   });
 
   test('host actions receive canonical submit and composer-prefill controls', async () => {
