@@ -6,7 +6,12 @@
     TermView,
     tmuxMux,
   } from '@thumbmux/svelte';
-  import { DEFAULT_APP_LABELS, type AppAdapters, type AppLabels } from './config';
+  import {
+    DEFAULT_APP_LABELS,
+    type AppAdapters,
+    type AppLabels,
+    type SubmissionTransport,
+  } from './config';
   import { prefillOnError } from './overlay';
 
   let {
@@ -63,13 +68,35 @@
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
   }
 
+  async function deliverHostSubmission(
+    targetSession: string,
+    transport: SubmissionTransport,
+    steps: ReturnType<typeof submitPlan>,
+  ): Promise<void> {
+    let previousStepAcknowledged = false;
+    for (const step of steps) {
+      if (!previousStepAcknowledged && step.delayBeforeMs > 0) {
+        await wait(step.delayBeforeMs);
+      }
+      const acknowledgement = transport(targetSession, step.keys);
+      previousStepAcknowledged = acknowledgement !== undefined;
+      if (acknowledgement !== undefined) await acknowledgement;
+    }
+  }
+
   async function sendSubmission(text: string): Promise<void> {
     if (!text) return;
     const targetSession = session;
     const agent = adapters.submitAgent?.(targetSession) ?? 'generic';
+    const steps = submitPlan(text, { agent });
+    const submissionTransport = adapters.sendSubmissionKeys;
+    if (submissionTransport) {
+      await deliverHostSubmission(targetSession, submissionTransport, steps);
+      return;
+    }
     const transport = adapters.sendKeys
       ?? ((name: string, keys: string) => tmuxMux.sendKeys(name, keys));
-    for (const step of submitPlan(text, { agent })) {
+    for (const step of steps) {
       if (step.delayBeforeMs > 0) await wait(step.delayBeforeMs);
       transport(targetSession, step.keys);
     }

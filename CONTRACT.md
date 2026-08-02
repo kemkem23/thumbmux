@@ -112,6 +112,17 @@ member list is complete, which is the one thing an extension point cannot promis
 Such a consumer should key off the members it actually uses. If you need the
 complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes.
 
+`AppAdapters.sendSubmissionKeys` is the optional composer-submission transport.
+`SessionView` and `EmbedView` use it for `submitPlan` steps only; raw terminal,
+desktop-key, direct-mode, D-pad, and non-submitting shortcut input stays on
+`sendKeys` or its singleton fallback. The shell awaits each promise returned by
+the submission transport before starting the next step. That acknowledgement
+satisfies the following planned delay, while a synchronous return retains the
+delay. When the adapter is omitted, the existing delayed `sendKeys`/singleton
+submission path and its byte order remain in use. The app view tests pin both
+routes, and the frozen app consumer omits the adapter to exercise the additive
+case.
+
 ## Deprecation policy
 
 1. **Apply all stamps in one release.** A deprecated name must receive all of

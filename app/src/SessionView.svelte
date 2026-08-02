@@ -31,6 +31,7 @@
     type AppAdapters,
     type AppLabels,
     type SessionActionContext,
+    type SubmissionTransport,
   } from './config';
   import {
     nextStageOverlay,
@@ -187,7 +188,7 @@
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
   }
 
-  async function deliverSubmission(
+  async function deliverLegacySubmission(
     targetSession: string,
     transport: (name: string, keys: string) => void,
     steps: ReturnType<typeof submitPlan>,
@@ -203,14 +204,39 @@
     return true;
   }
 
+  async function deliverHostSubmission(
+    targetSession: string,
+    transport: SubmissionTransport,
+    steps: ReturnType<typeof submitPlan>,
+  ): Promise<boolean> {
+    let previousStepAcknowledged = false;
+    for (const step of steps) {
+      if (!previousStepAcknowledged && step.delayBeforeMs > 0) {
+        await wait(step.delayBeforeMs);
+      }
+      try {
+        const acknowledgement = transport(targetSession, step.keys);
+        previousStepAcknowledged = acknowledgement !== undefined;
+        if (acknowledgement !== undefined) await acknowledgement;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
   function sendSubmission(text: string): Promise<boolean> {
     if (!text) return Promise.resolve(true);
     const targetSession = session;
     const targetAgent = sessionAgent;
+    const steps = submitPlan(text, { agent: targetAgent });
+    const submissionTransport = adapters.sendSubmissionKeys;
+    if (submissionTransport) {
+      return deliverHostSubmission(targetSession, submissionTransport, steps);
+    }
     const transport = adapters.sendKeys
       ?? ((name: string, keys: string) => tmuxMux.sendKeys(name, keys));
-    const steps = submitPlan(text, { agent: targetAgent });
-    return deliverSubmission(targetSession, transport, steps);
+    return deliverLegacySubmission(targetSession, transport, steps);
   }
 
   function recoverTransportFailure(sent: boolean, text: string): void {

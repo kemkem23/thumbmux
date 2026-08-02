@@ -75,6 +75,7 @@ const EXPECTED_LABEL_KEYS = [
 
 const plannedAdapters = {
   sendKeys: (_session: string, _keys: string) => {},
+  sendSubmissionKeys: async (_session: string, _keys: string) => {},
   submitAgent: () => 'generic',
   routes: { openSession: (_name: string) => {}, showHub: () => {} },
   spawn: {

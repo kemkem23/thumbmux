@@ -3,6 +3,29 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
+## v0.8.2 — 2026-08-02
+
+### Added
+
+- **`thumbmux/app` can give composer submissions their own transport.** The new
+  optional `AppAdapters.sendSubmissionKeys` callback uses the public
+  `SubmissionTransport` type. `SessionView` and `EmbedView` send each
+  `submitPlan` step through it and settle a returned promise before starting the
+  next step; raw key paths remain on `sendKeys`. Existing hosts that omit the
+  callback need no adapter changes: the shell retains its previous
+  `sendKeys`/singleton transport, planned delays, and byte order.
+
+  A host with a request/response transport wanted both halves and could have
+  neither: one seam carried raw keys and submissions together, so choosing REST
+  for a submit meant one request per keypress. `submitPlan` already documented
+  that an awaited round trip can stand in for its planned delay — this is the
+  door that lets a host say so. An acknowledged step satisfies the next step's
+  delay; a synchronous transport keeps it.
+
+### Changed defaults
+
+None.
+
 ## v0.8.1 — 2026-08-02
 
 ### Fixed
@@ -23,11 +46,6 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
   No behaviour changes after the first half-second, and the double-fire guard
   this protects is unchanged and covered by its own test.
-
-### Unchanged
-
-- No public name, signature, or wire shape moved. `contract check` reports the
-  same 342 across core / server / svelte / app.
 
 ## v0.8.0 — 2026-08-01
 

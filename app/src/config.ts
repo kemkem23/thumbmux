@@ -16,6 +16,13 @@ import type {
 } from '@thumbmux/svelte';
 import type { Snippet } from 'svelte';
 
+/** Delivers one composer-submission step through a host-owned transport.
+ * A returned promise is settled before the shell starts the next step. */
+export type SubmissionTransport = (
+  session: string,
+  keys: string,
+) => void | Promise<void>;
+
 /** Host-owned behavior and policy seams for the mountable application shell. */
 export interface AppAdapters {
   /** REST prefix the shell calls, the client half of
@@ -36,9 +43,17 @@ export interface AppAdapters {
    * state; it also does not select the default key transport. Those stay on the
    * shared singleton. `EmbedView` has no session list and does not read `mux`. */
   mux?: TmuxMux;
-  /** Override input independently of the session-list mux. Absent, direct keys
-   * and composer submissions use the shared `@thumbmux/svelte` singleton. */
+  /** Override raw input independently of the session-list mux. Absent, raw
+   * input and the legacy composer-submission fallback use the shared
+   * `@thumbmux/svelte` singleton. */
   sendKeys?: (session: string, keys: string) => void;
+  /** Override composer submissions without moving raw input off `sendKeys`.
+   * The shell invokes this once for each `submitPlan` step and awaits a returned
+   * promise before invoking the next one. A promise acknowledgement satisfies
+   * the following step's planned delay; a synchronous transport keeps that
+   * delay. Absent, submissions retain the existing `sendKeys` transport and
+   * timer sequence. */
+  sendSubmissionKeys?: SubmissionTransport;
   submitAgent?: (session: string) => SubmitAgent;
   routes?: {
     openSession(name: string): void;

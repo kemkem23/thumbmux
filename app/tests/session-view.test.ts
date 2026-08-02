@@ -444,7 +444,7 @@ describe('mountable terminal views', () => {
     expect(terminal.style.fontSize).toBe('17px');
   });
 
-  test('submitAgent drives every sendKeys step produced by submitPlan', async () => {
+  test('submitAgent drives every legacy sendKeys step produced by submitPlan', async () => {
     const keyCalls: Array<[string, string]> = [];
     const agentCalls: string[] = [];
     const agent = ['co', 'dex'].join('') as SubmitAgent;
@@ -492,6 +492,119 @@ describe('mountable terminal views', () => {
     jest.advanceTimersByTime(expected[2]!.delayBeforeMs);
     await flushPromises();
     expect(keyCalls).toEqual(expected.map((step) => [sessionName, step.keys]));
+  });
+
+  test('routes submission steps separately from raw keys in both terminal shells', async () => {
+    jest.useFakeTimers();
+    for (const [label, component] of [
+      ['session', SessionView],
+      ['embed', EmbedView],
+    ] as const) {
+      const sessionName = `sh-${label}-split-transport`;
+      const rawCalls: Array<[string, string]> = [];
+      const submissionCalls: Array<[string, string]> = [];
+      const { target } = mountView(component, {
+        session: sessionName,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          sendKeys: (session, keys) => { rawCalls.push([session, keys]); },
+          sendSubmissionKeys: async (session: string, keys: string) => {
+            submissionCalls.push([session, keys]);
+          },
+        } satisfies AppAdapters,
+      });
+      await tick();
+
+      // Deliberately invert the byte-shape heuristic a host used to need:
+      // the composed submission is one character, while raw input is longer.
+      await composeAndSend(target, 'q');
+      await flushPromises();
+      await sendDirectText(target, 'raw');
+      jest.advanceTimersByTime(1_000);
+      await flushPromises();
+
+      expect(submissionCalls).toEqual(
+        submitPlan('q').map((step) => [sessionName, step.keys]),
+      );
+      expect(rawCalls).toEqual([[sessionName, 'raw']]);
+    }
+  });
+
+  test('preserves every legacy submission byte when the new seam is omitted', async () => {
+    jest.useFakeTimers();
+    const agent = ['co', 'dex'].join('') as SubmitAgent;
+    for (const [label, component] of [
+      ['session', SessionView],
+      ['embed', EmbedView],
+    ] as const) {
+      const sessionName = `sh-${label}-legacy-submit`;
+      const draft = `${label} fallback`;
+      const keyCalls: Array<[string, string]> = [];
+      const expected = submitPlan(draft, { agent });
+      const { target } = mountView(component, {
+        session: sessionName,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          submitAgent: () => agent,
+          sendKeys: (session, keys) => { keyCalls.push([session, keys]); },
+        } satisfies AppAdapters,
+      });
+      await tick();
+
+      await composeAndSend(target, draft);
+      expect(keyCalls).toEqual([[sessionName, expected[0]!.keys]]);
+      jest.advanceTimersByTime(expected[1]!.delayBeforeMs);
+      await flushPromises();
+      jest.advanceTimersByTime(expected[2]!.delayBeforeMs);
+      await flushPromises();
+
+      expect(keyCalls).toEqual(expected.map((step) => [sessionName, step.keys]));
+    }
+  });
+
+  test('waits for each asynchronous submission step before starting the next', async () => {
+    jest.useFakeTimers();
+    for (const [label, component] of [
+      ['session', SessionView],
+      ['embed', EmbedView],
+    ] as const) {
+      const sessionName = `sh-${label}-await-submit`;
+      const calls: Array<[string, string]> = [];
+      let releaseFirst!: () => void;
+      const firstRoundTrip = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const { target } = mountView(component, {
+        session: sessionName,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          sendKeys: () => {
+            throw new Error('submission leaked to the raw-key transport');
+          },
+          sendSubmissionKeys: (session: string, keys: string) => {
+            calls.push([session, keys]);
+            return calls.length === 1 ? firstRoundTrip : Promise.resolve();
+          },
+        } satisfies AppAdapters,
+      });
+      await tick();
+
+      await composeAndSend(target, 'blocked');
+      expect(calls).toEqual([[sessionName, 'blocked']]);
+
+      // A timer cannot stand in for transport acknowledgement. Even a large
+      // clock jump must not allow Enter to overtake the unresolved bulk step.
+      jest.advanceTimersByTime(10_000);
+      await flushPromises();
+      expect(calls).toEqual([[sessionName, 'blocked']]);
+
+      releaseFirst();
+      await flushPromises();
+      expect(calls).toEqual([
+        [sessionName, 'blocked'],
+        [sessionName, '\r'],
+      ]);
+    }
   });
 
   test('a stage tap dismisses the host before it opens the composer', async () => {

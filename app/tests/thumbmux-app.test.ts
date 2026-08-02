@@ -23,6 +23,7 @@ import type {
   AppAdapters,
   AppLabels,
   SessionActionContext,
+  SubmissionTransport,
 } from '../src';
 import { createQueryParamNav } from '../src/navigation';
 
@@ -53,11 +54,17 @@ const REQUIRED_TYPE_EXPORTS = [
   'AppAdapters',
   'AppLabels',
   'SessionActionContext',
+  'SubmissionTransport',
 ] as const;
 
 // Keep the compiler-facing imports live in this test source. The manifest
 // assertion below is what verifies them at runtime, since Bun erases types.
-type ConfigExports = [AppAdapters, AppLabels, SessionActionContext];
+type ConfigExports = [
+  AppAdapters,
+  AppLabels,
+  SessionActionContext,
+  SubmissionTransport,
+];
 void (undefined as unknown as ConfigExports);
 
 const muxSurface = tmuxMux as unknown as MuxSurface;
@@ -219,6 +226,36 @@ describe('SessionView submission failure handling', () => {
     await settleUi();
 
     expect(transportCalls).toBe(1);
+    expect(composer.classList.contains('open')).toBe(true);
+  });
+
+  test('restores the composer after an asynchronous submission transport rejects', async () => {
+    let context: SessionActionContext | undefined;
+    let submissionCalls = 0;
+    let rawCalls = 0;
+    history.replaceState(null, '', '/?session=async-transport-failure');
+    const { target } = mountApp(adaptersFor('async-transport-failure', {
+      sendKeys: () => { rawCalls += 1; },
+      sendSubmissionKeys: async () => {
+        submissionCalls += 1;
+        throw new Error('submission request rejected');
+      },
+      extraActions: (_session, supplied) => {
+        context = supplied;
+        return [];
+      },
+    }));
+    await settleUi();
+
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!context || !composer) throw new Error('submission context did not mount');
+    expect(composer.classList.contains('open')).toBe(false);
+
+    context.submit('recover rejected draft');
+    await settleUi();
+
+    expect(submissionCalls).toBe(1);
+    expect(rawCalls).toBe(0);
     expect(composer.classList.contains('open')).toBe(true);
   });
 
