@@ -37,7 +37,12 @@ test('mobile DIRECT ghost input sends text per keystroke', async ({ browser }, t
     const payload = 'directMode_AbC123!?';
 
     await page.getByTestId('mtv').click();
-    await page.getByRole('button', { name: 'DIRECT' }).click();
+    // Scoped to the composer. The HUD's title button carries the session name,
+    // which this test names "…direct…", so an unscoped role query matches both
+    // — and used to match only one because the tap that opens the composer was
+    // being swallowed on a page younger than 500ms (v0.8.1). The test passed by
+    // clicking the HUD instead and driving the ghost input straight from JS.
+    await page.getByTestId('input-sheet').getByRole('button', { name: 'DIRECT' }).click();
     await page.getByTestId('ghost-key').evaluate((el, text) => {
       const input = el as HTMLInputElement;
       for (const ch of text) {

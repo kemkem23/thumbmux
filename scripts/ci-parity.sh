@@ -58,4 +58,17 @@ bun run contract
 echo "ci-parity: bun run smoke:git-dist"
 bun run smoke:git-dist
 
+# The unit suite runs in happy-dom; this is the only gate that drives a real
+# browser against a real tmux. v0.8.1 shipped a one-line fix that the unit
+# suite proved and this caught: unblocking an early tap made a composer button
+# appear, which turned an unscoped role query in one spec into a strict-mode
+# violation. Skipping this step is why that reached CI instead of stopping here.
+# Set THUMBMUX_SKIP_E2E=1 only when Docker is genuinely unavailable, and say so.
+if [ "${THUMBMUX_SKIP_E2E:-0}" = "1" ]; then
+  echo "ci-parity: WARNING — container e2e SKIPPED by THUMBMUX_SKIP_E2E=1; CI still runs it"
+else
+  echo "ci-parity: ./e2e/run-container.sh"
+  ./e2e/run-container.sh
+fi
+
 echo "ci-parity: PASSED against the committed tree"
