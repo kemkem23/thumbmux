@@ -71,4 +71,7 @@ else
   ./e2e/run-container.sh
 fi
 
+echo "ci-parity: bash scripts/contract-fixtures.sh"
+bash scripts/contract-fixtures.sh
+
 echo "ci-parity: PASSED against the committed tree"
