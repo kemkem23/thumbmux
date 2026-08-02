@@ -162,17 +162,6 @@
     "tier": "F"
   },
   {
-    "name": "JournalRecordV1",
-    "kind": "type",
-    "signature": "b7f07d5cd2aed9bafb8085b4cee44e809807437b44f97ae454c3c373612e01fe",
-    "tier": "F",
-    "deprecated": {
-      "since": "0.8.0",
-      "removeNoEarlierThan": "0.9.0",
-      "replacement": "FrameJournalRecordV1"
-    }
-  },
-  {
     "name": "killTmuxSession",
     "kind": "value",
     "signature": "5da2f4ccbc6c1f7588ea43411e332b4e803f6b3377f11f6333ad45770766b79f",

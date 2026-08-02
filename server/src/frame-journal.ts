@@ -18,9 +18,6 @@ export interface FrameJournalRecordV1 {
   readonly frame: MuxFullOutputFrame | MuxDeltaFrame;
 }
 
-/** @deprecated since v0.8.0 — use FrameJournalRecordV1; removal no earlier than v0.9.0 */
-export type JournalRecordV1 = FrameJournalRecordV1;
-
 /** Error callback payload for isolated, session-scoped failures. */
 export interface FrameJournalErrorReport {
   /** Session name this error belongs to. */

@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/core",
-  "version": "0.8.3",
+  "version": "0.9.0",
   "description": "Framework-free primitives for the thumbmux mobile terminal stack: ANSI→HTML rendering, terminal link detection, stable scroll merging, prompt scanning, surface color derivation.",
   "type": "module",
   "exports": {

@@ -58,9 +58,9 @@ must pass first:
    HOST WORK, and no new GAP. The archived re-audit report is the evidence, and
    any contrary probe result keeps this gate closed.
 3. At least one name has completed the whole deprecation lifecycle from warning
-   through removal. The server-side `JournalRecordV1` alias is the first planned
-   exercise; its declaration history, manifest dates, changelog entries, and
-   warning/removal checks are the evidence.
+   through removal. The server-side `JournalRecordV1` alias completed that
+   exercise for v0.9.0; its declaration history, manifest dates, changelog
+   entries, and warning/removal checks are the evidence.
 4. The surface gate and all three frozen consumer fixtures have remained green
    throughout the compatibility line, and mutation proof has demonstrated at
    least once that each layer catches a real breaking change. CI history and the

@@ -3,6 +3,14 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
+## v0.9.0 — 2026-08-02
+
+### Removed
+
+- **Breaking: `JournalRecordV1` is no longer exported from `thumbmux/server`.**
+  Replace server-side imports with `FrameJournalRecordV1`. The unrelated
+  `JournalRecordV1` type exported from `thumbmux/core` remains available.
+
 ## v0.8.3 — 2026-08-02
 
 ### Added
