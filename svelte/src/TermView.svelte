@@ -2267,7 +2267,11 @@
   }
 
   let tapStart: { x: number; y: number; t: number } | null = null;
-  let lastTouchEndAt = 0;
+  // Not 0. This is compared against performance.now(), which counts from when
+  // the document started — so on a page younger than the 500ms suppression
+  // window, zero reads as "a touch just ended" and every click is thrown away
+  // as its echo. A sentinel has to be a value the clock cannot produce.
+  let lastTouchEndAt = Number.NEGATIVE_INFINITY;
   let altPointerStart: {
     x: number;
     y: number;

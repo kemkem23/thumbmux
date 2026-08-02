@@ -3,6 +3,32 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
 
+## v0.8.1 — 2026-08-02
+
+### Fixed
+
+- **A click in the first 500ms of a page's life no longer disappears.**
+  `TermView` ignores a click that arrives within 500ms of a `touchend`, because
+  mobile browsers synthesize one and reporting a single finger as two taps is
+  worse than reporting it as none. The last-touch timestamp started at `0` and
+  is compared against `performance.now()`, which counts from when the document
+  started — so on a page younger than the window, `0` reads as *a touch just
+  ended* and every click was discarded as its echo. A page that has never seen
+  a finger now says so, and the sentinel is a value the clock cannot produce.
+
+  Reaching a host's composer by tapping the terminal is the only route
+  `thumbmux/app`'s `EmbedView` offers, so an embed opened and clicked
+  immediately would not open its composer at all. Found by migrating a real
+  consumer page onto `EmbedView` rather than by review.
+
+  No behaviour changes after the first half-second, and the double-fire guard
+  this protects is unchanged and covered by its own test.
+
+### Unchanged
+
+- No public name, signature, or wire shape moved. `contract check` reports the
+  same 342 across core / server / svelte / app.
+
 ## v0.8.0 — 2026-08-01
 
 thumbmux stops being a box of parts. `thumbmux/app` mounts the whole application —
