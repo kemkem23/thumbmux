@@ -7,7 +7,7 @@
 A reusable web-terminal shell and server engine for driving tmux sessions —
 especially AI coding agents — from phone and desktop browsers: a compositor-
 scroll viewer, a keyboard-aware composer, a live session hub, and a multiplexed
-WebSocket engine. The current 0.8.0 checkout exposes public core, Svelte,
+WebSocket engine. The current 0.9.x checkout exposes public core, Svelte,
 server, and assembled app entrypoints. It still needs a host process; it is not
 a standalone executable or an installed copy of the repository demo.
 
@@ -152,14 +152,14 @@ policy, geometry ownership, view-only surfaces — is specified in
 ## Get started
 
 **📦 In your app — use a published dist tag.** The app-shell quickstart needs
-the 0.8.x surface. List the public 0.8.x tags, select the newest exact tag that
+the 0.9.x surface. List the public 0.9.x tags, select the newest exact tag that
 actually exists, and pin it:
 
 ```bash
 THUMBMUX_TAG="$(git ls-remote --tags https://github.com/kemkem23/thumbmux \
-  'refs/tags/v0.8.*-dist' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+  'refs/tags/v0.9.*-dist' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
 if test -z "$THUMBMUX_TAG"; then
-  echo "No published v0.8.x-dist tag found" >&2
+  echo "No published v0.9.x-dist tag found" >&2
 else
   bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
   # npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"
@@ -173,7 +173,7 @@ defines the current tier policy. This branch documents the current checkout
 and may include APIs newer than a published tag; do not infer that a dist tag
 exists from the local `package.json` version.
 
-A matching 0.8.x dist-tag install contains the prebuilt `thumbmux/core`,
+A matching 0.9.x dist-tag install contains the prebuilt `thumbmux/core`,
 `thumbmux/server`, `thumbmux/svelte`, and `thumbmux/app` entrypoints plus the
 supporting docs. It contains no standalone listener, demo directory, or package
 scripts; the surrounding process and deployment remain host code.
@@ -632,7 +632,7 @@ Docs: [application shell](docs/app.md) ·
 
 ## Compatibility checks
 
-The public policy is the 0.8.x
+The public policy is the 0.8.x-0.9.x
 [compatibility contract](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md).
 In a source checkout, after `bun run build:git-dist`, `bun run contract`
 compares the built `core`, `server`, `svelte`, and `app` declarations with their
@@ -643,7 +643,7 @@ consumer fixtures.
 artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
 and `app-host`. They compile and exercise the low-level host, guarded route
 composition, and Svelte app mount respectively. `thumbmux/app` and
-`createAppRoutes` remain **S — stabilizing** throughout 0.8.x; these checks are
+`createAppRoutes` remain **S — stabilizing** throughout 0.8.x-0.9.x; these checks are
 evidence for the published tiers, not a claim of 1.0 compatibility.
 
 <details>

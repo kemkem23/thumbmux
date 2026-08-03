@@ -802,7 +802,7 @@ parts.
 
 ## 5. Compatibility tier
 
-`thumbmux/app` is **S — stabilizing throughout 0.8.x**. It is not frozen before
+`thumbmux/app` is **S — stabilizing throughout 0.8.x-0.9.x**. It is not frozen before
 1.0. An app export may change only at a minor boundary while preserving the old
 route through the alias and deprecation policy. See the compatibility
 contract's [app-shell notice](../CONTRACT.md#known-non-guarantees) and

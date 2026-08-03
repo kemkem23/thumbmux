@@ -1,7 +1,36 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.7.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.9.1-dist`.
+
+## v0.9.1 — 2026-08-03
+
+No API change. The manifests, declaration signatures, wire goldens and frozen
+consumer fixtures are byte-identical to v0.9.0; this release corrects shipped
+documentation that a tag cannot fix in place.
+
+### Fixed
+
+- **The install instructions pointed at the previous line.** `README.md` selected
+  tags matching `refs/tags/v0.8.*-dist`, so following the documented Get Started
+  produced a v0.8.x install and could never reach v0.9.0. The glob, the "current
+  0.8.0 checkout" line, and the surrounding 0.8.x references now name 0.9.x.
+- **`CONTRACT.md` still declared itself the policy for the 0.8.x line** while
+  shipping inside v0.9.0 artifacts. It now covers 0.8.x and 0.9.x, and the F-tier
+  promise, the no-retroactive-demotion rule, the app-shell S notice and the
+  cookie-name pin all state the wider range they already held to.
+- **The removal-window rule only protected names deprecated in 0.8.x.** It named
+  0.8.x and v0.9.0 as its terms rather than as its example, which left a name
+  deprecated in 0.9.x with no stated window. The rule is now general and keeps
+  `JournalRecordV1` as the worked example.
+- **The demo derived one prop from the other.** `termProps` returned
+  `claimGeometry: !altScreens[session]` alongside `altScreenMouse:
+  !!altScreens[session]`, so in the reference app a full-screen TUI's primary
+  terminal never owned its pane size. `claimGeometry` asks who owns the pane
+  size and `altScreenMouse` asks where pointer input goes; they are independent,
+  and `docs/desktop.md` now says so where the two are described. The v0.3.1 entry
+  below recorded that preset accurately at the time — it is left as written,
+  because a changelog that edits its own history stops being evidence.
 
 ## v0.9.0 — 2026-08-02
 

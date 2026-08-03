@@ -290,6 +290,19 @@ the mux.
   placement, and optional read-only scroll.
 - It adapts to whatever geometry the server streams for the pane.
 
+`claimGeometry` and `altScreenMouse` are independent:
+
+- They answer different questions. `claimGeometry` asks **who owns the pane
+  size**; `altScreenMouse` asks **where pointer input goes**. Neither is the
+  other's inverse, and an alt-screen TUI needs a correctly sized pty exactly as
+  much as a normal one does.
+- The pairing is easy to misread because on view-only surfaces both are `false`
+  together (section 8). That is the two rules agreeing, not one rule.
+- A primary interactive terminal for a full-screen TUI is
+  `claimGeometry=true, altScreenMouse=true`. Deriving one from the other —
+  `claimGeometry={!isAltScreen}` — silently gives that terminal whatever size
+  some other viewer last asked for, and nothing reports it.
+
 Multiple viewers:
 
 - The server arbitrates simultaneous resize requests. Clients must not depend

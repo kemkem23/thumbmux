@@ -122,8 +122,15 @@
       spawn: { presets: PRESETS, launch },
       upload: { endpoint: () => '/api/upload', dir: 'uploads' },
       submitAgent: (session) => agents[session] ?? 'generic',
+      // These two answer different questions and neither is the other's inverse.
+      // claimGeometry asks who owns the pane size; altScreenMouse asks where
+      // pointer input goes. termProps configures SessionView, the primary
+      // interactive terminal, so it claims geometry for every session — an
+      // alt-screen TUI needs a correctly sized pty exactly as much as any other.
+      // The surfaces that must not claim (EmbedView, thumbnails) force it off
+      // themselves rather than trusting a host to remember.
       termProps: (session) => ({
-        claimGeometry: !altScreens[session], altScreenMouse: !!altScreens[session],
+        claimGeometry: true, altScreenMouse: !!altScreens[session],
       }),
       theme: {
         defaultBg: DARK_BG, swatches: THEME_SWATCHES, storageKey: PREFS_KEY,
