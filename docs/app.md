@@ -345,6 +345,29 @@ A Svelte wrapper can keep host-owned theme state reactive:
 These slots extend `SessionView`. `EmbedView` does not render the stock FAB,
 HUD panel, host sheets, or these extension slots.
 
+### Three ways to remove the shortcut editor without meaning to
+
+`SessionView` mounts `ShortcutBar` and `ShortcutsSheet` by default, and falls back
+to `localStorage` when no `prefs` adapter is supplied — so a bare `ThumbmuxApp`
+mount can already edit its composer presets, with no wiring. Three supported
+choices take that away, and none of them announces it:
+
+1. **`sessionPresentation.actions` replaces the FAB list; it does not extend it.**
+   The `defaults` argument exists so you can keep what you want, but the return
+   value is the whole list. A host that builds its own array — even a reasonable
+   one — drops the `shortcuts` action, and with it the only way to open the editor.
+   To add to the FAB rather than rebuild it, use `extraActions`, or spread:
+   `actions: (session, ctx, defaults) => [...defaults, mine]`.
+2. **`sessionPresentation.showShortcutBar: false`** hides the bar. The editor is
+   still reachable from the FAB, so the presets remain editable but invisible until
+   opened — which reads as "the feature is gone" to anyone who does not know it is
+   behind the FAB.
+3. **`EmbedView` has no FAB at all**, by design. Embeds are read-mostly surfaces; if
+   you want preset editing, you want `SessionView`.
+
+If presets are missing in a host you did not write, check those three before
+concluding the package omits the feature.
+
 | Field | Default and omission behavior | Concrete implementation example |
 | --- | --- | --- |
 | `extraActions` | Adds nothing. Returned actions are appended after the stock actions, and the shell closes the FAB before invoking one. | `extraActions: (session, context) => [{ id: "help", label: "Help", onTap: () => context.prefill("Help with " + session) }]` |
