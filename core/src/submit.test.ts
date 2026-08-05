@@ -18,9 +18,39 @@ describe('submitPlan', () => {
     expect(submitPlan('')).toEqual([{ keys: '\r', delayBeforeMs: 150 }]);
   });
 
-  test('preserves bulk text exactly', () => {
+  test('preserves bulk text content without bare CR in the text step', () => {
+    // Multline / CR host text must not put a bare Enter inside the text step —
+    // that submits early (A2-2). Content is preserved via bracketed paste.
     const text = 'first line\r\nsecond\tline\n';
-    expect(submitPlan(text)[0]).toEqual({ keys: text, delayBeforeMs: 0 });
+    const plan = submitPlan(text);
+    const textStep = plan[0];
+    expect(textStep.delayBeforeMs).toBe(0);
+    // Planned Enter remains a separate delayed step.
+    expect(plan.some((s) => s.keys === '\r' && s.delayBeforeMs > 0)).toBe(true);
+    // No bare CR outside paste delimiters.
+    const outsidePaste = textStep.keys.replace(/\x1b\[200~[\s\S]*?\x1b\[201~/g, '');
+    expect(outsidePaste.includes('\r')).toBe(false);
+    // Payload still carries both lines and the tab.
+    expect(textStep.keys.includes('first line')).toBe(true);
+    expect(textStep.keys.includes('second\tline')).toBe(true);
+  });
+
+  test('text step never contains a bare CR that would submit early (A2-2)', () => {
+    const plan = submitPlan('first\rsecond');
+    expect(plan.length).toBeGreaterThanOrEqual(2);
+    // Final planned Enter is still present and delayed.
+    expect(plan.at(-1)).toEqual({ keys: '\r', delayBeforeMs: 150 });
+    const textSteps = plan.filter((s) => s.keys !== '\r');
+    expect(textSteps.length).toBe(1);
+    const keys = textSteps[0].keys;
+    // Bare "first\rsecond" as a single keystroke batch is the bug: the embedded
+    // CR submits `first` before `second` lands. The text step must either drop
+    // that CR or quarantine it inside bracketed-paste delimiters.
+    expect(keys).not.toBe('first\rsecond');
+    const outsidePaste = keys.replace(/\x1b\[200~[\s\S]*?\x1b\[201~/g, '');
+    expect(outsidePaste.includes('\r')).toBe(false);
+    expect(keys.includes('first')).toBe(true);
+    expect(keys.includes('second')).toBe(true);
   });
 
   test('generic agent uses the default two-step plan', () => {

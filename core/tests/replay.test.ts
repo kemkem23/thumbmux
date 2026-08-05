@@ -107,6 +107,37 @@ describe("ReplayJournal", () => {
     expect(journal.getFrameAt(250).data.endsWith("\n")).toBe(true);
   });
 
+  test("equal timestamps: seek(endAt) returns the last record, not the first (A2-3)", () => {
+    // Recorder wall-clock ms can stamp two full frames with the same `at`.
+    // durationMs becomes 0 and startAt === endAt; a player clamped to the
+    // timeline must still be able to display the final state at endAt.
+    const session = "equal-ts";
+    const records: JournalRecordV1[] = [
+      fullRecord(session, 100, "first"),
+      fullRecord(session, 100, "second"),
+    ];
+    const journal = parseReplayJournal(toSource(records));
+
+    expect(journal.startAt).toBe(100);
+    expect(journal.endAt).toBe(100);
+    expect(journal.durationMs).toBe(0);
+    expect(journal.count).toBe(2);
+
+    // Before the timeline: still clamps to the first record.
+    expect(journal.seek(99).recordIndex).toBe(0);
+    expect(journal.getLinesAt(99)).toEqual(["first"]);
+
+    // At endAt (and startAt): latest record with at <= time — the final state.
+    const atEnd = journal.seek(journal.endAt);
+    expect(atEnd.recordIndex).toBe(1);
+    expect(atEnd.lines).toEqual(["second"]);
+    expect(journal.getLinesAt(100)).toEqual(["second"]);
+
+    // Past endAt: still the last record.
+    expect(journal.seek(101).recordIndex).toBe(1);
+    expect(journal.getLinesAt(101)).toEqual(["second"]);
+  });
+
   test("uses later full frames as checkpoints and preserves reset semantics in seeks", () => {
     const session = "checkpoint-reset";
     const firstBase = [

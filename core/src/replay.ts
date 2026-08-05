@@ -6,9 +6,13 @@
  *
  * `at` is treated as an ordered wall-clock timeline (milliseconds or any finite
  * numeric domain with ordering), and lookup uses clamped floor semantics:
- *  - `time <= first.at` clamps to the first record,
+ *  - `time < first.at` clamps to the first record,
  *  - `time >= last.at` clamps to the last record,
  *  - otherwise we seek the latest record with `record.at <= time`.
+ *
+ * Equal timestamps are legal (wall-clock ms collisions). When `first.at ===
+ * last.at`, `time >= last.at` wins so `seek(endAt)` returns the final record —
+ * a duration-zero player at elapsed zero must still show the last state.
  */
 import {
   applyMuxDelta,
@@ -209,7 +213,11 @@ export class ReplayJournal {
   }
 
   private findRecordIndexByTime(time: number): number {
-    if (time <= this.firstAt) return 0;
+    // Strict `<` for the early clamp: when firstAt === lastAt (equal wall-clock
+    // stamps, durationMs === 0), `time >= lastAt` must win so seek(endAt) is the
+    // final record. `<= firstAt` used to return record 0 and made the last
+    // state unreachable on the advertised timeline.
+    if (time < this.firstAt) return 0;
     if (time >= this.lastAt) return this.records.length - 1;
 
     let low = 0;
