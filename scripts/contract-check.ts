@@ -1330,8 +1330,28 @@ export function evaluateBaseline(
     ) {
       continue;
     }
+    // A patch may carry an addition every existing consumer ignores — CONTRACT.md
+    // "Additive changes may ride a patch on this line". The permission is not the
+    // boundary, it is `isMinorOptionalAddition`: a structural proof that the new
+    // declaration is the old one plus optional members, with nothing removed,
+    // renamed or narrowed. A change that cannot prove that still fails here,
+    // whatever its version number.
+    //
+    // Know what this predicate does NOT prove. It treats a new union variant as
+    // an addition, and a union variant can break a consumer: v0.8.0 added one,
+    // saw only added lines, called it additive, and every consumer reading
+    // `frame.channel` failed with TS2339. So this branch is not the safety
+    // argument for a union change — the frozen consumer fixtures are, which is
+    // what CONTRACT.md means by behaviour that declarations cannot express.
+    // Never let a union change through on this predicate alone.
+    //
+    // 0.9.2 is the worked example: `MuxServerFrame` gained `MuxPongFrame`, which
+    // is channel-less exactly like the v0.8.0 case — but the union already
+    // contained channel-less `MuxAuthErrorFrame`, so any consumer reading
+    // `channel` already had to narrow first, and the fixtures confirmed it
+    // compiles and runs.
     if (
-      boundary === "minor"
+      (boundary === "minor" || boundary === "patch" || boundary === "same")
       && !kindChanged
       && (previous.tier === "F" || previous.tier === "S")
       && isMinorOptionalAddition(previousLive, nextLive)
