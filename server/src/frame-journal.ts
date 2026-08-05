@@ -198,6 +198,18 @@ export class FrameJournal {
   private rootBytesKnown = false;
   /** Bytes reserved by admitted-but-not-yet-persisted captures across sessions. */
   private rootReservedBytes = 0;
+  /**
+   * Sessions whose durable journal is mid-delete. Captures are rejected for the
+   * whole await of `storage.remove` so a same-name re-create cannot land a frame
+   * that the pending remove then wipes (A3-1).
+   */
+  private readonly deletingSessions = new Set<string>();
+  /**
+   * Last durable `at` retained across `closeSession` so the documented reopen
+   * path cannot write a decreasing timestamp when the wall clock steps back
+   * (A3-10). Cleared by `deleteSessionJournal` / `stop`.
+   */
+  private readonly closedLastAt = new Map<string, number>();
 
   public constructor(options: FrameJournalOptions = {}) {
     this.rootDir = resolve(options.rootDir ?? DEFAULT_ROOT);
@@ -235,8 +247,12 @@ export class FrameJournal {
    * expected or after a clean startup path.
    */
   public startSession(session: string): RecoveredSessionState {
+    if (this.deletingSessions.has(session)) {
+      throw new Error(`Session "${session}" journal is being deleted.`);
+    }
     const state = this.getOrCreateState(session);
-    if (!state.recoveryFailed) state.accepting = true;
+    // Honor stopRequested so a mid-delete tombstone cannot be re-armed.
+    if (!state.recoveryFailed && !state.stopRequested) state.accepting = true;
     return this.snapshotState(state);
   }
 
@@ -342,6 +358,10 @@ export class FrameJournal {
    */
   public capture(session: string, frame: MuxFullOutputFrame, at?: number): boolean {
     if (this.stopped) return false;
+    // Reject while deleteSessionJournal is awaiting storage.remove — otherwise a
+    // same-name capture re-creates the session, appends, then the pending remove
+    // deletes that new file and leaves phantom rootBytes (A3-1).
+    if (this.deletingSessions.has(session)) return false;
     const state = this.getOrCreateState(session);
     if (state.stopRequested || !state.accepting || state.recoveryFailed) return false;
     const fullFrame = normalizeFullFrame(session, frame);
@@ -469,6 +489,10 @@ export class FrameJournal {
     state.stopRequested = true;
     state.accepting = false;
     await state.queue;
+    // Keep the last durable timestamp so a later bare capture() on the same
+    // name still normalizes `at` (A3-10). Without this, a wall-clock step-back
+    // writes a decreasing on-disk timeline that recoverSession rejects.
+    if (state.lastAt !== null) this.closedLastAt.set(session, state.lastAt);
     this.sessions.delete(session);
   }
 
@@ -480,37 +504,48 @@ export class FrameJournal {
    */
   public async deleteSessionJournal(session: string): Promise<boolean> {
     await this.rootReady;
-    const path = this.makeSessionPath(session);
-    const existing = this.sessions.get(session);
-    let knownBytes: number | null = null;
-    if (existing) {
-      existing.stopRequested = true;
-      existing.accepting = false;
-      await existing.queue;
-      if (existing.bytesKnown) knownBytes = existing.bytes;
-      this.sessions.delete(session);
-    }
-
     if (!this.storage.remove) {
       throw new Error("storage.remove is unavailable; cannot delete session journal.");
     }
 
-    let removedBytes = knownBytes;
-    if (removedBytes === null) {
-      removedBytes = await this.measureFileBytes(path);
-    }
-
+    // Fence the whole delete against same-name re-create (A3-1). Held through
+    // the awaited storage.remove so a mid-delete capture cannot land a frame
+    // that the pending unlink then wipes.
+    this.deletingSessions.add(session);
     try {
-      await this.storage.remove(path);
-    } catch (cause) {
-      if (!isFileNotFound(cause)) throw cause;
-      return false;
-    }
+      const path = this.makeSessionPath(session);
+      const existing = this.sessions.get(session);
+      let knownBytes: number | null = null;
+      if (existing) {
+        existing.stopRequested = true;
+        existing.accepting = false;
+        await existing.queue;
+        if (existing.bytesKnown) knownBytes = existing.bytes;
+        this.sessions.delete(session);
+      }
+      // A closedLastAt from a prior closeSession is no longer meaningful once
+      // the durable file is gone (or about to be).
+      this.closedLastAt.delete(session);
 
-    if (removedBytes > 0) {
-      this.adjustRootBytes(-removedBytes);
+      let removedBytes = knownBytes;
+      if (removedBytes === null) {
+        removedBytes = await this.measureFileBytes(path);
+      }
+
+      try {
+        await this.storage.remove(path);
+      } catch (cause) {
+        if (!isFileNotFound(cause)) throw cause;
+        return false;
+      }
+
+      if (removedBytes > 0) {
+        this.adjustRootBytes(-removedBytes);
+      }
+      return true;
+    } finally {
+      this.deletingSessions.delete(session);
     }
-    return true;
   }
 
   /** Flush all pending writes, stop accepting new writes, and release session state. */
@@ -522,6 +557,8 @@ export class FrameJournal {
     }
     await this.flushAll();
     this.sessions.clear();
+    this.closedLastAt.clear();
+    this.deletingSessions.clear();
   }
 
   private getOrCreateState(session: string): SessionState {
@@ -529,12 +566,15 @@ export class FrameJournal {
     if (existing) return existing;
 
     const path = this.makeSessionPath(session);
+    // Seed lastAt from a prior closeSession so reopen with a backward clock
+    // still produces a non-decreasing on-disk timeline (A3-10).
+    const preservedLastAt = this.closedLastAt.get(session) ?? null;
     const state: SessionState = {
       session,
       path,
       base: null,
       deltasSinceCheckpoint: 0,
-      lastAt: null,
+      lastAt: preservedLastAt,
       recordCount: 0,
       accepting: true,
       recoveryFailed: false,
@@ -755,15 +795,25 @@ export class FrameJournal {
       this.refuseSessionLimit(state, recordAt, "maxBytes exceeded; session recording stopped.");
       return;
     }
-    if (this.maxRootBytes !== Infinity && this.rootBytes + lineBytes > this.maxRootBytes) {
-      this.reportRootLimit(state, recordAt);
-      return;
+    // Claim aggregate root quota BEFORE any await so concurrent session queues
+    // cannot both pass against the same pre-append rootBytes and overshoot the
+    // hard cap (A3-3). Single-threaded JS makes this check+adjust atomic with
+    // respect to other session queues; rollback on append failure.
+    let claimedRoot = 0;
+    if (this.maxRootBytes !== Infinity) {
+      if (this.rootBytes + lineBytes > this.maxRootBytes) {
+        this.reportRootLimit(state, recordAt);
+        return;
+      }
+      this.adjustRootBytes(lineBytes);
+      claimedRoot = lineBytes;
     }
 
     await this.storage.ensureDirectory(dirname(state.path));
     try {
       await this.storage.appendText(state.path, line);
     } catch (cause) {
+      if (claimedRoot > 0) this.adjustRootBytes(-claimedRoot);
       // Self-heal a partial append (e.g. ENOSPC) so a torn record cannot poison
       // the durable file. If rollback is unavailable or itself fails, fail closed:
       // leave accepting=false and recoveryFailed=true so the next capture cannot
@@ -785,7 +835,8 @@ export class FrameJournal {
     }
 
     state.bytes += lineBytes;
-    this.adjustRootBytes(lineBytes);
+    // rootBytes already claimed above when the aggregate cap is enabled.
+    if (claimedRoot === 0) this.adjustRootBytes(lineBytes);
     state.base = nextBase;
     state.deltasSinceCheckpoint = nextDeltaCount;
     state.lastAt = recordAt;

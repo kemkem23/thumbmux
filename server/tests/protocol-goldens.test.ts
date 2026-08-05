@@ -567,13 +567,10 @@ describe("v0.7.1 wire goldens", () => {
             break;
           case "history_expand":
             dispatch(mux, message, ws);
-            if (Object.prototype.hasOwnProperty.call(message, "afterLine")) {
-              expect(calls.historyAfter).toHaveLength(1);
-              expect(calls.historyBefore).toHaveLength(0);
-            } else {
-              expect(calls.historyBefore).toHaveLength(1);
-              expect(calls.historyAfter).toHaveLength(0);
-            }
+            // Harness profile has archive:false — history_expand must NOT
+            // consult the archive (A3-6). Wire still answers with a history page.
+            expect(calls.historyAfter).toHaveLength(0);
+            expect(calls.historyBefore).toHaveLength(0);
             expect(ws.frames("history")).toHaveLength(1);
             expect(() => JSON.parse(String(ws.frames("history")[0]?.data))).not.toThrow();
             break;

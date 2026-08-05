@@ -285,6 +285,8 @@ export class TmuxWsMux<
   private queuedCapturesInFlight = new Set<string>();
   private queuedCapturesPending = new Set<string>();
   private queuedCapturesFullHistory = new Set<string>();
+  /** Tail promise per session so callers (poll) can await the whole chain. */
+  private queuedCaptureTails = new Map<string, Promise<void>>();
   /** Viewer-set owners currently consuming a full-history queue intent. A
    * WeakSet keeps that intent attached to the async lifecycle across rename. */
   private fullHistoryCaptureOwners = new WeakSet<Set<WS>>();
@@ -331,6 +333,12 @@ export class TmuxWsMux<
   private shedSockets = new Set<WS>();
   /** Blocked sockets that missed a session-list push and need one on drain. */
   private owedSessionList = new Set<WS>();
+  /**
+   * Per-socket timer that enforces `maxBlockedMs` as a real timeout (A3-9).
+   * Cleared on drain/shed/unsubscribe. Without this, a blocked peer that never
+   * receives another server push stays open forever.
+   */
+  private blockedTimeouts = new Map<WS, ReturnType<typeof setTimeout>>();
 
   constructor(opts: TmuxWsMuxOptions<WS, SessionRow>) {
     this.compressFrames = opts.compressFrames === true;
@@ -490,34 +498,40 @@ export class TmuxWsMux<
    */
   handleDrain(ws: WS): void {
     if (this.shedSockets.has(ws)) return;
-    if (!this.blockedSockets.has(ws)) return;
 
-    // Shared resume: clear blocked mark + fire "drained".
-    this.resumeBlockedSocket(ws, this.readBufferedAmount(ws));
+    // A3-5: a real drop (status 0) records session-list debt without marking
+    // the socket blocked. Allow drain to settle that debt even when there is
+    // no blocked episode to resume — otherwise the only recovery path is a
+    // provider-list change.
+    if (this.blockedSockets.has(ws)) {
+      // Shared resume: clear blocked mark + fire "drained".
+      this.resumeBlockedSocket(ws, this.readBufferedAmount(ws));
 
-    // Explicit catch-up (handleDrain only): one frame per session from CURRENT
-    // cached state only for sessions where this socket still has a pending
-    // full/reset marker (set while we skipped pushes). No history replay.
-    // Auto-resume skips this loop — the in-flight broadcast already carries
-    // pendingOutputFulls and delivers a complete snapshot in that same pass.
-    for (const [session, viewers] of this.subscribers) {
-      if (!viewers.has(ws)) continue;
-      const pendingFull = this.pendingOutputFulls.get(session)?.has(ws) === true;
-      const pendingReset = this.pendingOutputResets.get(session)?.has(ws) === true;
-      if (!pendingFull && !pendingReset) continue;
-      const cached = this.contents.get(session);
-      if (cached === undefined) continue;
-      this.sendOutputFrame(session, ws, {
-        channel: session,
-        type: "output",
-        data: this.contentFor(session, ws, cached),
-        cursor: this.lastCursor.get(session) ?? null,
-      });
-      // If re-blocked mid catch-up, remaining sessions stay pending for the next drain.
-      if (this.blockedSockets.has(ws) || this.shedSockets.has(ws)) break;
+      // Explicit catch-up (handleDrain only): one frame per session from CURRENT
+      // cached state only for sessions where this socket still has a pending
+      // full/reset marker (set while we skipped pushes). No history replay.
+      // Auto-resume skips this loop — the in-flight broadcast already carries
+      // pendingOutputFulls and delivers a complete snapshot in that same pass.
+      for (const [session, viewers] of this.subscribers) {
+        if (!viewers.has(ws)) continue;
+        const pendingFull = this.pendingOutputFulls.get(session)?.has(ws) === true;
+        const pendingReset = this.pendingOutputResets.get(session)?.has(ws) === true;
+        if (!pendingFull && !pendingReset) continue;
+        const cached = this.contents.get(session);
+        if (cached === undefined) continue;
+        this.sendOutputFrame(session, ws, {
+          channel: session,
+          type: "output",
+          data: this.contentFor(session, ws, cached),
+          cursor: this.lastCursor.get(session) ?? null,
+        });
+        // If re-blocked mid catch-up, remaining sessions stay pending for the next drain.
+        if (this.blockedSockets.has(ws) || this.shedSockets.has(ws)) break;
+      }
     }
 
     // Session-list debt after catch-up (may re-block above → leave debt for next resume).
+    // Also settles drop-without-block debt (status 0 on list send).
     this.settleSessionListDebt(ws);
   }
 
@@ -539,6 +553,7 @@ export class TmuxWsMux<
     if (!blocked) return false;
 
     const blockedMs = Date.now() - blocked.since;
+    this.clearBlockedTimeout(ws);
     this.blockedSockets.delete(ws);
     this.hooks.onBackpressure?.(ws, "drained", {
       blockedMs,
@@ -557,9 +572,30 @@ export class TmuxWsMux<
 
   /** Drop per-socket backpressure marks so a reused socket object starts clean. */
   private clearBackpressureState(ws: WS) {
+    this.clearBlockedTimeout(ws);
     this.blockedSockets.delete(ws);
     this.shedSockets.delete(ws);
     this.owedSessionList.delete(ws);
+  }
+
+  private clearBlockedTimeout(ws: WS) {
+    const timer = this.blockedTimeouts.get(ws);
+    if (timer) clearTimeout(timer);
+    this.blockedTimeouts.delete(ws);
+  }
+
+  /** Arm a one-shot shed timer so maxBlockedMs is enforced without a next push. */
+  private armBlockedTimeout(ws: WS) {
+    this.clearBlockedTimeout(ws);
+    if (!this.bpEnabled) return;
+    if (!(this.bpMaxBlockedMs > 0) || !Number.isFinite(this.bpMaxBlockedMs)) return;
+    const timer = setTimeout(() => {
+      this.blockedTimeouts.delete(ws);
+      if (this.shedSockets.has(ws)) return;
+      if (!this.blockedSockets.has(ws)) return;
+      this.maybeShed(ws, "timeout");
+    }, this.bpMaxBlockedMs);
+    this.blockedTimeouts.set(ws, timer);
   }
 
   private readBufferedAmount(ws: WS): number | undefined {
@@ -595,6 +631,8 @@ export class TmuxWsMux<
         blockedMs: 0,
         bufferedBytes: this.readBufferedAmount(ws),
       });
+      // Real timeout — not only "check on next push" (A3-9).
+      this.armBlockedTimeout(ws);
     }
     this.maybeShed(ws, "backpressure");
   }
@@ -613,6 +651,7 @@ export class TmuxWsMux<
     const blockedMs = blocked ? Date.now() - blocked.since : 0;
     const bufferedBytes = this.readBufferedAmount(ws);
     this.shedSockets.add(ws);
+    this.clearBlockedTimeout(ws);
     this.blockedSockets.delete(ws);
     this.closeSlowSocket(ws, reason);
     this.hooks.onBackpressure?.(ws, "closed", { blockedMs, bufferedBytes });
@@ -717,7 +756,12 @@ export class TmuxWsMux<
       const status = this.wsSend(ws, JSON.stringify({
         channel: "__sessions", type: "sessions", data: dataJson,
       } satisfies MuxServerMessage));
-      if (status === -1) this.markBlocked(ws);
+      if (status === 0) {
+        // Real drop on catch-up: re-owe so a later drain can try again (A3-5).
+        if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+      } else if (status === -1) {
+        this.markBlocked(ws);
+      }
     } catch {}
   }
 
@@ -799,6 +843,8 @@ export class TmuxWsMux<
     this.pipeDebounceTimers.clear();
     for (const t of this.pipeMaxTimers.values()) clearTimeout(t);
     this.pipeMaxTimers.clear();
+    for (const t of this.blockedTimeouts.values()) clearTimeout(t);
+    this.blockedTimeouts.clear();
     for (const session of this.piped) this.pipes?.stopPipe(session);
     this.piped.clear();
   }
@@ -1204,6 +1250,7 @@ export class TmuxWsMux<
     this.queuedCapturesPending.delete(session);
     this.queuedCapturesInFlight.delete(session);
     this.queuedCapturesFullHistory.delete(session);
+    this.queuedCaptureTails.delete(session);
     this.clearPipeCaptureTimers(session);
     this.lastReconcileCapture.delete(session);
     this.lastAppliedGeometry.delete(session);
@@ -1233,10 +1280,10 @@ export class TmuxWsMux<
     }
     try {
       const sessions = this.sessionListProvider();
-      // lastSessionsJson is assigned from the UNFILTERED result (legacy quirk —
-      // preserve exactly; filtered projections never go here).
+      // lastSessionsJson is assigned only after a successful handoff (A3-5).
+      // A real drop (status 0) must not advance the global dedupe key or a hub
+      // stays empty until the provider list happens to change.
       const json = JSON.stringify(sessions);
-      this.lastSessionsJson = json;
       const dataJson = this.sessionListDataFor(ws, sessions, json, client);
       if (dataJson === null) {
         // filterSessionList threw → fail closed: no frame this round.
@@ -1246,7 +1293,15 @@ export class TmuxWsMux<
       const status = this.wsSend(ws, JSON.stringify({
         channel: "__sessions", type: "sessions", data: dataJson,
       } satisfies MuxServerMessage));
-      if (status === -1) this.markBlocked(ws);
+      if (status === 0) {
+        // Real drop: keep debt so drain/retry can deliver; do not touch lastSessionsJson.
+        if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+      } else if (status === -1) {
+        this.markBlocked(ws);
+        this.lastSessionsJson = json;
+      } else {
+        this.lastSessionsJson = json;
+      }
     } catch (e: any) {
       this.logError("[thumbmux-mux] subscribeSessions error:", e.message);
     }
@@ -1256,6 +1311,9 @@ export class TmuxWsMux<
   unsubscribeSessions(ws: WS) {
     this.sessionListSubscribers.delete(ws);
     this.sessionListClients.delete(ws);
+    // Opt-out must cancel list debt — otherwise handleDrain redelivers after
+    // the principal left the subscription (A3-8).
+    this.owedSessionList.delete(ws);
     this.refreshSessionListSchedule();
   }
 
@@ -1331,7 +1389,10 @@ export class TmuxWsMux<
 
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
-    if (this.archive) {
+    // SessionProfile.archive gates history_expand as well as capture feed
+    // (A3-6). A current-pane-only / non-archived profile must not surface
+    // durable rows retained under the same session name.
+    if (this.archive && this.profileOf(session).archive) {
       try {
         history = this.archive.readBefore(session, beforeLine ?? null, limit);
       } catch (e: unknown) {
@@ -1351,7 +1412,7 @@ export class TmuxWsMux<
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
-    if (this.archive?.readAfter) {
+    if (this.archive?.readAfter && this.profileOf(session).archive) {
       try {
         history = this.archive.readAfter(session, afterLine, limit);
       } catch (e: unknown) {
@@ -1429,24 +1490,30 @@ export class TmuxWsMux<
     this.pipeMaxTimers.delete(session);
   }
 
-  private queueCapture(session: string, opts: { fullHistory?: boolean } = {}) {
+  private queueCapture(session: string, opts: { fullHistory?: boolean } = {}): Promise<void> {
     const viewers = this.subscribers.get(session);
-    if (!viewers || viewers.size === 0) return;
+    if (!viewers || viewers.size === 0) return Promise.resolve();
     if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
 
     if (this.queuedCapturesInFlight.has(session)) {
       this.queuedCapturesPending.add(session);
-      return;
+      // Return the tail so awaiters see the pending successor too.
+      return this.queuedCaptureTails.get(session) ?? Promise.resolve();
     }
 
     this.queuedCapturesInFlight.add(session);
-    void this.runQueuedCapture(session, viewers);
+    const run = this.runQueuedCapture(session, viewers);
+    this.queuedCaptureTails.set(session, run);
+    return run;
   }
 
   private async runQueuedCapture(session: string, viewers: Set<WS>) {
     try {
       if (this.ownsSessionLifecycle(session, viewers)) {
-        const fullHistory = this.queuedCapturesFullHistory.delete(session);
+        // Peek the one-shot full-history intent; do NOT delete it here.
+        // captureAndBroadcastAsync consumes it only on success (A3-4). A
+        // transient driver/archive failure must leave the intent for retry.
+        const fullHistory = this.queuedCapturesFullHistory.has(session);
         if (fullHistory) this.fullHistoryCaptureOwners.add(viewers);
         await this.captureAndBroadcastAsync(session, viewers, { fullHistory });
       }
@@ -1455,10 +1522,19 @@ export class TmuxWsMux<
       // invalidate → subscribe may start a new capture lane under the same
       // string key while this old Promise is still settling. The viewer Set is
       // the ownership token: an old finally must not erase the new lane.
-      if (!this.ownsSessionLifecycle(session, viewers)) return;
+      if (!this.ownsSessionLifecycle(session, viewers)) {
+        this.queuedCaptureTails.delete(session);
+        return;
+      }
       this.queuedCapturesInFlight.delete(session);
       if (this.queuedCapturesPending.delete(session)) {
-        this.queueCapture(session);
+        // Chain the successor onto the same tail promise so poll awaiters
+        // that grabbed this run still wait for the pending capture.
+        const successor = this.queueCapture(session);
+        this.queuedCaptureTails.set(session, successor);
+        await successor;
+      } else {
+        this.queuedCaptureTails.delete(session);
       }
     }
   }
@@ -1696,14 +1772,30 @@ export class TmuxWsMux<
         if (opts.fullHistory) this.queueCapture(session, { fullHistory: true });
         return;
       }
-      const liveContent = !useArchive
-        ? content
-        : this.archive!.ingestSnapshot(session, content, {
+      let liveContent: string;
+      if (!useArchive) {
+        liveContent = content;
+      } else {
+        // A3-4: isolate archive failures from driver failures. A transient
+        // ingest throw must NOT be reported as "Session not found" (the pane
+        // is live) and must leave the full-history seed intent for retry.
+        try {
+          liveContent = this.archive!.ingestSnapshot(session, content, {
             previousContent,
             fullHistory: !!opts.fullHistory,
             liveLineLimit: this.liveLineLimit,
             replace: archiveReflowGeneration !== undefined || undefined,
           }).liveContent;
+        } catch (archiveCause) {
+          if (!this.ownsSessionLifecycle(session, viewers)) return;
+          const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
+          try {
+            this.logError(`[thumbmux-mux] archive ingest error for "${session}":`, message);
+          } catch {}
+          if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
+          return;
+        }
+      }
       // The synchronous ingest returned successfully. Only now consume the
       // exact generation captured at entry. A throwing archive or a newer
       // resize must keep its generation pending for another capture. When the
@@ -1806,6 +1898,14 @@ export class TmuxWsMux<
         trailingBlanks = this.countTrailingBlanks(content);
       }
       if (!this.ownsSessionLifecycle(session, viewers)) return;
+      // A3-7: recheck geometry generation after the legacy getCursor await.
+      // Without this, a resize accepted during that second await installs a
+      // reset marker that this stale capture then consumes with pre-resize
+      // wrapping as the authoritative resize base.
+      if (this.geometryGenerations.get(session) !== geometryGeneration) {
+        if (opts.fullHistory) this.queueCapture(session, { fullHistory: true });
+        return;
+      }
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
       if (this.hooks.onOutput) {
@@ -1817,9 +1917,14 @@ export class TmuxWsMux<
         );
       }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
-    } catch {
+    } catch (cause) {
       if (!this.ownsSessionLifecycle(session, viewers)) return;
-      // Session gone — notify viewers
+      // Driver / outer failure — established wire contract for an unreachable
+      // pane. Archive failures are handled above and never reach here (A3-4).
+      try {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        this.logError(`[thumbmux-mux] capture error for "${session}":`, message);
+      } catch {}
       const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
       for (const ws of viewers) {
         try { this.wsSend(ws, errMsg); } catch {}
@@ -1870,7 +1975,12 @@ export class TmuxWsMux<
       // Single tmux call to get activity timestamps for all sessions
       const activity = this.driver.getSessionActivity();
 
-      // Only capture sessions whose activity timestamp changed (or first-time seen)
+      // Only capture sessions whose activity timestamp changed (or first-time seen).
+      // A3-2: always enter through queueCapture so a slow prior capture cannot be
+      // overtaken by a poll/pipe reconcile that finishes first and then loses to
+      // the older result (stale pane regression for every viewer). Await the
+      // returned queue tail so this poll tick still paces like the pre-queue
+      // path (session-list cadence and inFlight gating stay meaningful).
       const tasks: Promise<void>[] = [];
       const nowMs = Date.now();
       for (const [session, viewers] of this.subscribers) {
@@ -1878,7 +1988,7 @@ export class TmuxWsMux<
         if (this.piped.has(session)) {
           const lastReconcile = this.lastReconcileCapture.get(session) ?? 0;
           if (nowMs - lastReconcile < this.PIPE_RECONCILE_INTERVAL) continue;
-          tasks.push(this.captureAndBroadcastAsync(session, viewers));
+          tasks.push(this.queueCapture(session));
           continue;
         }
 
@@ -1900,7 +2010,7 @@ export class TmuxWsMux<
           this.lastActivity.set(session, currentActivity);
         }
 
-        tasks.push(this.captureAndBroadcastAsync(session, viewers));
+        tasks.push(this.queueCapture(session));
       }
       if (tasks.length > 0) {
         await Promise.allSettled(tasks);
@@ -1921,8 +2031,6 @@ export class TmuxWsMux<
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
       if (json === this.lastSessionsJson) return;
-      // Unfiltered provider result only — never a filtered projection.
-      this.lastSessionsJson = json;
 
       // No filter hook: serialize ONCE and reuse the shared string for every
       // socket (byte-identical to pre-0.4). With a filter: per-socket data.
@@ -1936,12 +2044,19 @@ export class TmuxWsMux<
       // Per-socket dedupe of identical filtered pushes is OUT of scope — a
       // filtered socket may receive a repeat of its unchanged view when the
       // global list changes elsewhere (deliberate simplification).
+      //
+      // A3-5: advance lastSessionsJson only when the change is *accounted for*
+      // — a successful/enqueued send, or a blocked socket that took list debt.
+      // A pure status-0 drop is NOT accounted for: leave the dedupe key alone
+      // so the unchanged provider list is retried, and record per-socket debt.
       const sent = new Set<WS>();
+      let anyAccounted = false;
       const trySend = (ws: WS, client: unknown) => {
         if (sent.has(ws)) return;
         sent.add(ws);
         if (this.shouldSkipServerPush(ws)) {
           if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+          anyAccounted = true; // debt will deliver current list on drain
           return;
         }
         try {
@@ -1956,7 +2071,16 @@ export class TmuxWsMux<
             } satisfies MuxServerMessage);
           }
           const status = this.wsSend(ws, msg);
-          if (status === -1) this.markBlocked(ws);
+          if (status === 0) {
+            // Real drop: not enqueued. Debt for retry; do not count as accounted
+            // so an all-drop broadcast can re-run without a provider change.
+            if (!this.shedSockets.has(ws)) this.owedSessionList.add(ws);
+          } else if (status === -1) {
+            this.markBlocked(ws);
+            anyAccounted = true; // enqueued under backpressure — will be delivered
+          } else {
+            anyAccounted = true;
+          }
         } catch {}
       };
       for (const ws of this.sessionListSubscribers) {
@@ -1966,6 +2090,8 @@ export class TmuxWsMux<
         // Pane-only sockets may have no remembered client → undefined.
         for (const ws of viewers) trySend(ws, this.sessionListClients.get(ws));
       }
+      // Unfiltered provider result only — never a filtered projection.
+      if (anyAccounted) this.lastSessionsJson = json;
     } catch (e: any) {
       this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);
     }
