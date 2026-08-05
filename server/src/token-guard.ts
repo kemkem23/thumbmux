@@ -307,6 +307,16 @@ function extractQueryCredential(
     const name = safeDecode(rawName);
     const value = safeDecode(rawValue);
     if (name === null || value === null || !name) {
+      // The token param is present and its value is unusable. Recording that only
+      // in `malformed` loses it: `hasQueryToken` stays false, the `absent` return
+      // below fires first, and the caller falls back to whatever cookie the browser
+      // happened to send — so a credential the request explicitly supplied and we
+      // explicitly rejected is replaced by an ambient one. Bail the same way a bare
+      // `t` with no `=` already does a few lines up.
+      //
+      // A name that fails to decode cannot be the token param, because the param
+      // name would have to survive decoding to match it.
+      if (name === tokenParam) return { kind: "invalid" };
       malformed = true;
       continue;
     }

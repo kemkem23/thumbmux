@@ -106,6 +106,33 @@ describe("createTokenGuard query and cookie bootstrap", () => {
     expect(result).toMatchObject({ ok: false, status: 401 });
   });
 
+  // The case above uses a duplicated t, which is malformed in a way the parser
+  // notices while still recording that a token was present. A t whose value cannot
+  // be percent-decoded is malformed in a way that leaves nothing recorded, so the
+  // request reads as having no query credential at all and the cookie is consulted.
+  // Every case in this table supplies a valid cookie, so a pass means the explicit
+  // credential was honoured as a rejection rather than skipped.
+  for (const [label, query] of [
+    ["undecodable value", "?t=%ZZ"],
+    ["truncated escape", "?t=%E0%A"],
+    ["undecodable among others", "?foo=bar&t=%ZZ&baz=1"],
+  ] as const) {
+    test(`explicit t with an ${label} does not fall back to the cookie`, () => {
+      const guard = createTokenGuardWithClock({
+        grants: [
+          makeGrant("read", "read-query-token", 5000),
+          makeGrant("read", "read-cookie-token", 5000),
+        ],
+      });
+
+      const result = guard.authenticate(new Request(`https://x/${query}`, {
+        headers: { cookie: cookieHeader("tmux_demo_t", "read-cookie-token") },
+      }));
+
+      expect(result).toMatchObject({ ok: false, status: 401 });
+    });
+  }
+
   test("cookie bootstrap accepts exact encoded and exact decoded values", () => {
     const token = "cookie-value+plus/segment";
     const encoded = encodeURIComponent(token);
