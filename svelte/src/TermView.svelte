@@ -2065,7 +2065,14 @@
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     const cellW = Math.max(1, charW || measureCharWidth());
     const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
-    const gridH = Math.min(Math.max(1, bounds.height), geom.rows * lineH);
+    // contentCellFromPoint scales the rect across geom.rows, so the rect it gets
+    // must be the box those rows actually occupy — rows * lineH — not the box the
+    // user can currently see. Those are the same number until a docked composer
+    // sets bottomInsetPx, at which point rows keep deriving from visibleH + inset
+    // (measureGeometry) while bounds.height shrinks, and clamping to the smaller
+    // one silently rescales every row. The rect may extend under the dock; a click
+    // cannot land there, so no reachable point maps outside the grid.
+    const gridH = Math.max(1, geom.rows * lineH);
     return {
       rect: { left: bounds.left + 6, top: bounds.top, width: gridW, height: gridH },
       geom,

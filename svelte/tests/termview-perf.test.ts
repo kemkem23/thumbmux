@@ -310,8 +310,11 @@ function viewportRect(layout: MutableViewportLayout): DOMRect {
   } as DOMRect;
 }
 
-async function prepareAltScreenTermView(onKeys: (data: string) => void) {
-  const mountedView = mountTermView(undefined, { altScreenMouse: true, onKeys });
+async function prepareAltScreenTermView(
+  onKeys: (data: string) => void,
+  extraProps: { bottomInsetPx?: number } = {},
+) {
+  const mountedView = mountTermView(undefined, { altScreenMouse: true, onKeys, ...extraProps });
   const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
   if (!viewport) throw new Error("TermView root not found");
 
@@ -925,6 +928,33 @@ describe("TermView alt-screen pointer and touch hit testing", () => {
     viewport.dispatchEvent(new PointerEvent("pointerup", pointer));
 
     expect(sgrCorpus).toEqual(["\x1b[<0;6;10M\x1b[<0;6;10m"]);
+  });
+
+  // A docked composer covers the bottom of the pane. It does not move the rows
+  // that are still on screen, so the same pixel must still address the same row.
+  //
+  // Asserting equality against the no-inset case rather than a literal row keeps
+  // this honest: rows come from visibleH + inset while the hit rect came from the
+  // shrunken visible height, and any expected number written here would have to be
+  // derived from whichever of those two the code currently uses — which is the
+  // thing under test.
+  test("a docked inset does not move which row a pixel addresses", async () => {
+    const clickAt = async (bottomInsetPx: number) => {
+      const seen: string[] = [];
+      const { viewport } = await prepareAltScreenTermView(
+        (data) => seen.push(data),
+        { bottomInsetPx },
+      );
+      const pointer = {
+        button: 0, isPrimary: true, pointerId: 7,
+        clientX: 55, clientY: 225, bubbles: true,
+      };
+      viewport.dispatchEvent(new PointerEvent("pointerdown", pointer));
+      viewport.dispatchEvent(new PointerEvent("pointerup", pointer));
+      return seen;
+    };
+
+    expect(await clickAt(140)).toEqual(await clickAt(0));
   });
 
   test("reads the viewport rect at most once while preserving the per-point SGR corpus", async () => {
