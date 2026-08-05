@@ -71,6 +71,8 @@ function countConstructions(source: string, identifier: string): number {
 
 const serveSource = await readFile(new URL("./serve.ts", import.meta.url), "utf8");
 const appSource = await readFile(new URL("./src/App.svelte", import.meta.url), "utf8");
+const policySource = await readFile(new URL("./policy.ts", import.meta.url), "utf8");
+const serverPolicySource = await readFile(new URL("./server-policy.ts", import.meta.url), "utf8");
 
 function restoreProperty(
   target: object,
@@ -112,6 +114,27 @@ test("demo delegates the server surface to createAppRoutes", () => {
   expect(countCalls(serveSource, "createAppRoutes")).toBe(1);
   expect(namedImportSpecifiers(serveSource, "TmuxWsMux")).toEqual([]);
   expect(countConstructions(serveSource, "TmuxWsMux")).toBe(0);
+});
+
+test("demo projects launch policy into session rows for reloads and other clients", () => {
+  expect(serveSource).toContain("projectSessionList");
+  expect(policySource).toContain("demoSubmitAgent");
+  expect(policySource).toContain("demoAltScreenMouse");
+  expect(appSource).toContain("demoSubmitAgent");
+  expect(appSource).toContain("sessionMetadataFromRows");
+  expect(appSource).toContain("metadata.altScreens");
+});
+
+test("demo decodes its dist filesystem URL", () => {
+  expect(serveSource).toContain("demoDistPath");
+  expect(serverPolicySource).toContain("fileURLToPath");
+  expect(serveSource).not.toContain('new URL("./dist/", import.meta.url).pathname');
+});
+
+test("demo session and worktree identities do not repeat across server runs", () => {
+  expect(serveSource).toContain("createDemoSessionPolicy");
+  expect(serveSource).not.toContain("cleanupStaleDemoWorktrees");
+  expect(serveSource).not.toContain("`demo-${++spawnCounter}`");
 });
 
 test("demo imports FileHistoryArchive through the server package", () => {
@@ -177,6 +200,119 @@ test("demo preserves the pre-extraction raw launch error line", async () => {
     target.remove();
     restoreProperty(mux, "onSessions", originalOnSessions);
     restoreProperty(mux, "subscribe", originalSubscribe);
+    restoreProperty(globalThis, "fetch", originalFetch);
+    localStorage.clear();
+    history.replaceState(null, "", "/");
+    document.body.replaceChildren();
+  }
+});
+
+test("deep-link session hydrates from later mux pushes when REST bootstrap fails", async () => {
+  mock.module("@thumbmux/app", () => import("../app/src/index.ts"));
+  const { default: App } = await import("./src/App.svelte");
+  const mux = tmuxMux as unknown as {
+    onSessions(callback: (rows: unknown[]) => void): () => void;
+    subscribe(...args: unknown[]): () => void;
+    sendKeys(session: string, keys: string): void;
+  };
+  const originalOnSessions = Object.getOwnPropertyDescriptor(mux, "onSessions");
+  const originalSubscribe = Object.getOwnPropertyDescriptor(mux, "subscribe");
+  const originalSendKeys = Object.getOwnPropertyDescriptor(mux, "sendKeys");
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+  const callbacks = new Set<(rows: unknown[]) => void>();
+  const keyCalls: Array<[string, string]> = [];
+  const target = document.createElement("div");
+  let registrations = 0;
+  let instance: Record<string, unknown> | undefined;
+
+  try {
+    history.replaceState(null, "", "/?session=deep-link-session");
+    localStorage.clear();
+    document.body.appendChild(target);
+    mux.onSessions = (callback) => {
+      registrations += 1;
+      callbacks.add(callback);
+      return () => { callbacks.delete(callback); };
+    };
+    mux.subscribe = () => () => {};
+    mux.sendKeys = (session, keys) => { keyCalls.push([session, keys]); };
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (url === "/api/sessions") {
+        return Response.json({ error: "bootstrap unavailable" }, { status: 500 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    flushSync(() => {
+      instance = mount(App as Component, { target }) as Record<string, unknown>;
+    });
+    await settleUi();
+    expect(target.querySelector('[data-testid="session-view"]')).not.toBeNull();
+    expect(registrations).toBeGreaterThanOrEqual(2);
+
+    const liveRows = [{
+      name: "deep-link-session",
+      created: "1",
+      windows: 1,
+      attached: false,
+      activityAt: 1,
+      demoSubmitAgent: "codex",
+      demoAltScreenMouse: false,
+    }];
+    for (const callback of [...callbacks]) callback(liveRows);
+    await settleUi();
+
+    click(target, '[data-testid="mtv"]');
+    await settleUi();
+    const input = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    const send = target.querySelector<HTMLButtonElement>('[data-testid="input-sheet"] .snd');
+    if (!input || !send) throw new Error("deep-link composer did not mount");
+    flushSync(() => {
+      input.value = "deep link metadata";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await settleUi();
+    flushSync(() => send.click());
+    await Bun.sleep(1_250);
+
+    expect(keyCalls).toEqual([
+      ["deep-link-session", "deep link metadata"],
+      ["deep-link-session", "\r"],
+      ["deep-link-session", "\r"],
+    ]);
+
+    // The next authoritative list removes the row. A recycled/dead name must
+    // not keep the prior codex submission policy in the client maps.
+    for (const callback of [...callbacks]) callback([]);
+    await settleUi();
+    keyCalls.length = 0;
+    click(target, '[data-testid="mtv"]');
+    await settleUi();
+    const nextInput = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    const nextSend = target.querySelector<HTMLButtonElement>('[data-testid="input-sheet"] .snd');
+    if (!nextInput || !nextSend) throw new Error("reopened deep-link composer did not mount");
+    flushSync(() => {
+      nextInput.value = "after removal";
+      nextInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await settleUi();
+    flushSync(() => nextSend.click());
+    await Bun.sleep(1_250);
+    expect(keyCalls).toEqual([
+      ["deep-link-session", "after removal"],
+      ["deep-link-session", "\r"],
+    ]);
+  } finally {
+    if (instance) unmount(instance);
+    target.remove();
+    restoreProperty(mux, "onSessions", originalOnSessions);
+    restoreProperty(mux, "subscribe", originalSubscribe);
+    restoreProperty(mux, "sendKeys", originalSendKeys);
     restoreProperty(globalThis, "fetch", originalFetch);
     localStorage.clear();
     history.replaceState(null, "", "/");

@@ -493,6 +493,140 @@ describe("git-dist import rewriting", () => {
     expect(body).toContain('from "../core/index.js"');
     expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
   });
+
+  test("rewrites only module edges and preserves quoted documentation and data", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/index.js"),
+      [
+        "/** Consumers import \"@thumbmux/core\" from the public package. */",
+        'export const packageName = "@thumbmux/core";',
+        'export { value } from "@thumbmux/core";',
+        "",
+      ].join("\n"),
+    );
+
+    const result = rewriteGitDistImports(root);
+    const body = readFileSync(join(root, "git-dist/server/index.js"), "utf8");
+
+    expect(result.replacements).toBe(1);
+    expect(body).toContain('/** Consumers import "@thumbmux/core" from the public package. */');
+    expect(body).toContain('export const packageName = "@thumbmux/core";');
+    expect(body).toContain('export { value } from "../core/index.js";');
+    expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
+  });
+
+  test("parses TSX and JSX without treating JSX attribute data as module edges", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/View.tsx"),
+      [
+        'const view = <Widget packageName="@thumbmux/core" />;',
+        'export { value } from "@thumbmux/core";',
+        "void view;",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(root, "app/dist/View.jsx"),
+      [
+        'const view = <Widget packageName="@thumbmux/svelte" />;',
+        'export { value } from "@thumbmux/svelte";',
+        "void view;",
+        "",
+      ].join("\n"),
+    );
+
+    const result = rewriteGitDistImports(root);
+    const tsx = readFileSync(join(root, "git-dist/server/View.tsx"), "utf8");
+    const jsx = readFileSync(join(root, "git-dist/app/View.jsx"), "utf8");
+
+    expect(result.replacements).toBe(2);
+    expect(tsx).toContain('packageName="@thumbmux/core"');
+    expect(tsx).toContain('from "../core/index.js"');
+    expect(jsx).toContain('packageName="@thumbmux/svelte"');
+    expect(jsx).toContain('from "../svelte/index.js"');
+  });
+
+  test("rewrites global CommonJS and resolver module edges", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/loaders.cjs"),
+      [
+        'const core = require("@thumbmux/core");',
+        'const corePath = require.resolve("@thumbmux/core");',
+        'const moduleCore = module.require("@thumbmux/core");',
+        'const resolvedCore = import.meta.resolve("@thumbmux/core");',
+        "void core; void corePath; void moduleCore; void resolvedCore;",
+        "",
+      ].join("\n"),
+    );
+
+    const result = rewriteGitDistImports(root);
+    const body = readFileSync(join(root, "git-dist/server/loaders.cjs"), "utf8");
+
+    expect(result.replacements).toBe(4);
+    expect(body.match(/\.\.\/core\/index\.js/g)).toHaveLength(4);
+    expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
+  });
+
+  test("preserves calls through lexically shadowed require and module bindings", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/shadowed.ts"),
+      [
+        "function read(require: (name: string) => string) {",
+        '  return require("@thumbmux/core");',
+        "}",
+        "function locate(require: { resolve(name: string): string }) {",
+        '  return require.resolve("@thumbmux/core");',
+        "}",
+        "function fromObject(module: { require(name: string): unknown }) {",
+        '  return module.require("@thumbmux/core");',
+        "}",
+        'export { value } from "@thumbmux/core";',
+        "void read; void locate; void fromObject;",
+        "",
+      ].join("\n"),
+    );
+
+    const result = rewriteGitDistImports(root);
+    const body = readFileSync(join(root, "git-dist/server/shadowed.ts"), "utf8");
+
+    expect(result.replacements).toBe(1);
+    expect(body.match(/"@thumbmux\/core"/g)).toHaveLength(3);
+    expect(body).toContain('from "../core/index.js"');
+    expect(findBareWorkspaceSpecifiers(root)).toEqual([]);
+  });
+
+  test("fails closed on triple-slash workspace type references", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/reference.d.ts"),
+      '/// <reference types="@thumbmux/core" />\nexport {};\n',
+    );
+
+    expect(() => rewriteGitDistImports(root)).toThrow(
+      /bare @thumbmux workspace specifier remains in git-dist.*reference\.d\.ts/,
+    );
+  });
+
+  test("fails closed on unsupported workspace package and subpath module edges", () => {
+    const root = fixture();
+    writeFileSync(
+      join(root, "server/dist/index.js"),
+      [
+        'import { internal } from "@thumbmux/core/internal";',
+        'export { app } from "@thumbmux/app";',
+        "void internal; void app;",
+        "",
+      ].join("\n"),
+    );
+
+    expect(() => rewriteGitDistImports(root)).toThrow(
+      /bare @thumbmux workspace specifier remains in git-dist/,
+    );
+  });
 });
 
 describe("git-dist public export guard", () => {

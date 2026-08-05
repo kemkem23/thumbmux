@@ -8,27 +8,35 @@ PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 PACKAGE_SOURCE="${THUMBMUX_CONTRACT_PACKAGE_ROOT:-$PACKAGE_ROOT}"
 FIXTURES_ROOT="${THUMBMUX_CONTRACT_FIXTURES_ROOT:-$PACKAGE_ROOT/contract/fixtures}"
 ONLY_FIXTURE="${THUMBMUX_CONTRACT_ONLY:-}"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/thumbmux-contract-fixtures.XXXXXX")"
+if [[ -n "${TMUX:-}" ]]; then
+  tmux_socket="${TMUX%%,*}"
+  LOCK_FILE="$(dirname -- "$tmux_socket")/.thumbmux-contract-fixtures-$(basename -- "$tmux_socket").lock"
+else
+  LOCK_FILE="${TMUX_TMPDIR:-/tmp}/thumbmux-contract-fixtures-${UID}.lock"
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "contract fixtures: another runner owns $LOCK_FILE" >&2
+  exit 1
+fi
 
 fixture_sessions() {
   tmux list-sessions -F '#S' 2>/dev/null | awk '/^ctrfix-/' || true
 }
 
 cleanup() {
-  local name
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    tmux kill-session -t "=$name" 2>/dev/null || true
-  done < <(fixture_sessions)
-  rm -rf "$WORK"
+  [[ -z "${WORK:-}" ]] || rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
 
 if [[ -n "$(fixture_sessions)" ]]; then
   echo "contract fixtures: refusing to start while ctrfix-* sessions already exist" >&2
   fixture_sessions >&2
   exit 1
 fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/thumbmux-contract-fixtures.XXXXXX")"
+trap cleanup EXIT INT TERM
 
 case "$ONLY_FIXTURE" in
   ""|minimal-host|guarded-host|app-host) ;;
@@ -89,6 +97,7 @@ install_consumer() {
       npm pkg set \
         'devDependencies.@playwright/test=^1.61.1' \
         'devDependencies.@sveltejs/vite-plugin-svelte=^6.2.1' \
+        'devDependencies.svelte-check=^4.3.4' \
         'devDependencies.vite=^7.3.1'
     fi
 
@@ -114,6 +123,11 @@ install_consumer() {
     fi
 
     if [[ "$fixture" == "app-host" ]]; then
+      cp "$SCRIPT_DIR/contract-app-host-probe.svelte" src/ContractProbe.svelte
+      cp "$SCRIPT_DIR/contract-app-host-tsconfig.json" contract-app-host-tsconfig.json
+      ./node_modules/.bin/svelte-check \
+        --tsconfig ./contract-app-host-tsconfig.json \
+        --fail-on-warnings
       ./node_modules/.bin/vite build
       if [[ -z "${CHROMIUM_PATH:-}" ]]; then
         for browser_command in google-chrome-stable google-chrome chromium chromium-browser; do

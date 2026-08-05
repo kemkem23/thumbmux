@@ -29,14 +29,7 @@ export type GitDistExportManifests = Record<PublicSubpackage, PublicExportManife
 const REWRITE_ROOTS = ["git-dist/server", "git-dist/svelte", "git-dist/app"] as const;
 const REWRITE_TARGETS = ["core", "svelte"] as const;
 type RewriteTarget = (typeof REWRITE_TARGETS)[number];
-/**
- * Quoted bare package specifier (`"…"`, `'…'`, or `` `…` ``). Comments that
- * mention the package name without quotes are intentionally ignored — those
- * are documentation, not import graph edges a consumer must resolve.
- */
-const BARE_WORKSPACE_SPECIFIER = /(["'`])@thumbmux\/(core|svelte)\1/g;
-/** Text-ish extensions scanned for leftover bare workspace imports under git-dist. */
-const SCAN_EXTENSIONS = /\.(?:[cm]?[jt]sx?|d\.ts|svelte|map|json|css|html|mts|cts)$/i;
+const WORKSPACE_SPECIFIER = /^@thumbmux\/(core|server|svelte|app)(?:\/.*)?$/;
 
 export type RewrittenSpecifier = {
   /** Path relative to package root, POSIX separators. */
@@ -593,12 +586,7 @@ function distFiles(root: string): string[] {
   return REWRITE_ROOTS.flatMap((distRoot) => {
     const absoluteRoot = resolve(root, distRoot);
     if (!existsSync(absoluteRoot)) throw new Error(`missing built dist: ${distRoot}`);
-    return filesBelow(absoluteRoot).filter((path) =>
-      path.endsWith(".js")
-      || path.endsWith(".mjs")
-      || path.endsWith(".cjs")
-      || path.endsWith(".ts")
-      || path.endsWith(".svelte"));
+    return filesBelow(absoluteRoot).filter(isModuleSource);
   }).sort();
 }
 
@@ -610,7 +598,29 @@ function isExtensionlessRelativeSpecifier(specifier: string): boolean {
     && extname(specifier) === "";
 }
 
-function isDeclarationModuleSpecifier(node: ts.StringLiteral): boolean {
+function isUnboundIdentifier(
+  node: ts.Expression,
+  name: string,
+  checker: ts.TypeChecker,
+): node is ts.Identifier {
+  if (!ts.isIdentifier(node) || node.text !== name) return false;
+  // TypeScript synthesizes a declaration-less `require` symbol for direct
+  // CommonJS calls in .cjs files. Real lexical bindings always have a source
+  // declaration, so keep the former global and exclude the latter.
+  const symbol = checker.getSymbolAtLocation(node);
+  return !symbol?.declarations?.length;
+}
+
+function isImportMeta(node: ts.Expression): boolean {
+  return ts.isMetaProperty(node)
+    && node.keywordToken === ts.SyntaxKind.ImportKeyword
+    && node.name.text === "meta";
+}
+
+function isModuleSpecifierLiteral(
+  node: ts.StringLiteralLike,
+  checker: ts.TypeChecker,
+): boolean {
   const parent = node.parent;
   if (
     (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent))
@@ -627,9 +637,132 @@ function isDeclarationModuleSpecifier(node: ts.StringLiteral): boolean {
   }
   if (ts.isExternalModuleReference(parent) && parent.expression === node) return true;
   if (ts.isModuleDeclaration(parent) && parent.name === node) return true;
-  return ts.isCallExpression(parent)
-    && parent.expression.kind === ts.SyntaxKind.ImportKeyword
-    && parent.arguments[0] === node;
+  if (!ts.isCallExpression(parent) || parent.arguments[0] !== node) return false;
+  if (parent.expression.kind === ts.SyntaxKind.ImportKeyword) return true;
+  if (isUnboundIdentifier(parent.expression, "require", checker)) return true;
+  if (!ts.isPropertyAccessExpression(parent.expression)) return false;
+
+  const receiver = parent.expression.expression;
+  const method = parent.expression.name.text;
+  return (method === "resolve" && isUnboundIdentifier(receiver, "require", checker))
+    || (method === "require" && isUnboundIdentifier(receiver, "module", checker))
+    || (method === "resolve" && isImportMeta(receiver));
+}
+
+type ModuleSpecifierSpan = {
+  start: number;
+  end: number;
+  text: string;
+  /** Triple-slash references are graph edges, but are never silently rewritten. */
+  rewriteable: boolean;
+};
+
+function scriptKindFor(fileName: string): ts.ScriptKind {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".tsx")) return ts.ScriptKind.TSX;
+  if (lower.endsWith(".jsx")) return ts.ScriptKind.JSX;
+  if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) {
+    return ts.ScriptKind.JS;
+  }
+  return ts.ScriptKind.TS;
+}
+
+function parseModuleSource(
+  source: string,
+  fileName: string,
+  scriptKind: ts.ScriptKind,
+): { checker: ts.TypeChecker; sourceFile: ts.SourceFile } {
+  const options: ts.CompilerOptions = {
+    allowJs: true,
+    checkJs: false,
+    module: ts.ModuleKind.ESNext,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.ESNext,
+    types: [],
+  };
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.ESNext,
+    true,
+    scriptKind,
+  );
+  const baseHost = ts.createCompilerHost(options);
+  const canonicalFileName = baseHost.getCanonicalFileName(fileName);
+  const host: ts.CompilerHost = {
+    ...baseHost,
+    fileExists(path) {
+      return baseHost.getCanonicalFileName(path) === canonicalFileName;
+    },
+    readFile(path) {
+      return baseHost.getCanonicalFileName(path) === canonicalFileName ? source : undefined;
+    },
+    getSourceFile(path) {
+      return baseHost.getCanonicalFileName(path) === canonicalFileName ? sourceFile : undefined;
+    },
+  };
+  const program = ts.createProgram([fileName], options, host);
+  const parsed = program.getSourceFile(fileName)!;
+  const diagnostics = program.getSyntacticDiagnostics(parsed);
+  if (diagnostics.length > 0) {
+    const messages = diagnostics
+      .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, " "))
+      .join("; ");
+    throw new Error(`could not parse module source ${fileName}: ${messages}`);
+  }
+  return { checker: program.getTypeChecker(), sourceFile: parsed };
+}
+
+function moduleSpecifierSpans(source: string, fileName: string): ModuleSpecifierSpan[] {
+  const regions: Array<{ source: string; offset: number; scriptKind: ts.ScriptKind }> = [];
+  if (fileName.endsWith(".svelte")) {
+    const scripts = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+    for (const match of source.matchAll(scripts)) {
+      const body = match[1] ?? "";
+      const bodyOffset = (match.index ?? 0) + match[0].indexOf(body);
+      regions.push({ source: body, offset: bodyOffset, scriptKind: ts.ScriptKind.TS });
+    }
+  } else {
+    regions.push({ source, offset: 0, scriptKind: scriptKindFor(fileName) });
+  }
+
+  const spans: ModuleSpecifierSpan[] = [];
+  for (const region of regions) {
+    const virtualFileName = fileName.endsWith(".svelte") ? `${fileName}.ts` : fileName;
+    const { checker, sourceFile } = parseModuleSource(
+      region.source,
+      virtualFileName,
+      region.scriptKind,
+    );
+    for (const reference of [
+      ...sourceFile.typeReferenceDirectives,
+      ...sourceFile.referencedFiles,
+    ]) {
+      spans.push({
+        start: region.offset + reference.pos,
+        end: region.offset + reference.end,
+        text: reference.fileName,
+        rewriteable: false,
+      });
+    }
+    const visit = (node: ts.Node): void => {
+      if (
+        (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+        && isModuleSpecifierLiteral(node, checker)
+      ) {
+        spans.push({
+          start: region.offset + node.getStart(sourceFile) + 1,
+          end: region.offset + node.getEnd() - 1,
+          text: node.text,
+          rewriteable: true,
+        });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+  return spans.sort((left, right) => left.start - right.start);
 }
 
 /** Add the runtime `.js` extension Node16/NodeNext expect, using AST spans. */
@@ -637,25 +770,9 @@ function rewriteDeclarationModuleSpecifiers(
   source: string,
   fileName: string,
 ): { source: string; replacements: number } {
-  const sourceFile = ts.createSourceFile(
-    fileName,
-    source,
-    ts.ScriptTarget.ESNext,
-    true,
-    ts.ScriptKind.TS,
-  );
-  const insertions: number[] = [];
-  const visit = (node: ts.Node): void => {
-    if (
-      ts.isStringLiteral(node)
-      && isDeclarationModuleSpecifier(node)
-      && isExtensionlessRelativeSpecifier(node.text)
-    ) {
-      insertions.push(node.getEnd() - 1);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
+  const insertions = moduleSpecifierSpans(source, fileName)
+    .filter(({ rewriteable, text }) => rewriteable && isExtensionlessRelativeSpecifier(text))
+    .map(({ end }) => end);
 
   let rewritten = source;
   for (const offset of insertions.sort((a, b) => b - a)) {
@@ -673,23 +790,22 @@ function moduleSpecifier(fromFile: string, target: string): string {
   return path.startsWith(".") ? path : `./${path}`;
 }
 
-function isScannable(path: string): boolean {
-  return SCAN_EXTENSIONS.test(path) || path.endsWith(".d.ts");
+function isModuleSource(path: string): boolean {
+  return /\.(?:[cm]?[jt]sx?|mts|cts|svelte)$/i.test(path) || path.endsWith(".d.ts");
 }
 
 /**
- * Find every file under `git-dist/` that still contains a quoted bare
- * internal workspace specifier. Returns package-root-relative POSIX paths.
+ * Find every file under `git-dist/` whose actual module graph still contains
+ * an internal workspace specifier. Documentation/data strings are not edges.
  */
 export function findBareWorkspaceSpecifiers(root = PACKAGE_ROOT): string[] {
   const gitDistRoot = resolve(root, "git-dist");
   if (!existsSync(gitDistRoot)) return [];
   const offenders: string[] = [];
   for (const path of filesBelow(gitDistRoot)) {
-    if (!isScannable(path)) continue;
+    if (!isModuleSource(path)) continue;
     const source = readFileSync(path, "utf8");
-    BARE_WORKSPACE_SPECIFIER.lastIndex = 0;
-    if (BARE_WORKSPACE_SPECIFIER.test(source)) {
+    if (moduleSpecifierSpans(source, path).some(({ text }) => WORKSPACE_SPECIFIER.test(text))) {
       offenders.push(relative(root, path).split(sep).join("/"));
     }
   }
@@ -738,7 +854,7 @@ export function requiredGitDistArtifacts(root = PACKAGE_ROOT): string[] {
 /**
  * Fail-closed post-conditions for a usable git-dist aggregate.
  *
- * 1. Zero quoted bare internal workspace specifiers anywhere under git-dist.
+ * 1. Zero bare internal workspace module edges anywhere under git-dist.
  * 2. Required entrypoints exist and are non-empty.
  * 3. Every rewritten relative specifier resolves to a real file on disk.
  *
@@ -822,18 +938,21 @@ export function rewriteGitDistImports(root = PACKAGE_ROOT): GitDistRewriteResult
   for (const path of distFiles(root)) {
     const source = readFileSync(path, "utf8");
     const specifiers = new Set<string>();
-    let fileReplacements = 0;
-    BARE_WORKSPACE_SPECIFIER.lastIndex = 0;
-    const rewritten = source.replace(
-      BARE_WORKSPACE_SPECIFIER,
-      (_match, quote: string, packageName: RewriteTarget) => {
-        const specifier = moduleSpecifier(path, rewriteTargets[packageName]);
-        fileReplacements++;
-        specifiers.add(specifier);
-        return `${quote}${specifier}${quote}`;
-      },
-    );
+    const edits = moduleSpecifierSpans(source, path).flatMap(({ start, end, text, rewriteable }) => {
+      if (!rewriteable) return [];
+      const match = text.match(/^@thumbmux\/(core|svelte)$/);
+      if (!match) return [];
+      const packageName = match[1] as RewriteTarget;
+      const specifier = moduleSpecifier(path, rewriteTargets[packageName]);
+      specifiers.add(specifier);
+      return [{ start, end, specifier }];
+    });
+    const fileReplacements = edits.length;
     if (fileReplacements === 0) continue;
+    let rewritten = source;
+    for (const edit of edits.sort((left, right) => right.start - left.start)) {
+      rewritten = `${rewritten.slice(0, edit.start)}${edit.specifier}${rewritten.slice(edit.end)}`;
+    }
     writeFileSync(path, rewritten, "utf8");
     replacements += fileReplacements;
     const rel = relative(root, path).split(sep).join("/");

@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: bun install --frozen-lockfile
@@ -35,6 +37,10 @@ jobs:
         run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
+      - name: reject focused Playwright tests
+        run: ./node_modules/.bin/playwright test --config=e2e/playwright.config.ts --list --forbid-only
+        env:
+          DEMO_URL: http://127.0.0.1:1
       - name: canonical container e2e
         timeout-minutes: 20
         run: ./e2e/run-container.sh
@@ -56,6 +62,12 @@ jobs:
           (cd app && bun run build && bun pm pack)
       - name: root git-dist consumer smoke
         run: bun run build:git-dist && bun run smoke:git-dist
+      - name: materialize immutable prior contract
+        run: |
+          baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
+          bun scripts/materialize-contract-baseline.ts "$baseline_root"
+          echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+          echo "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1" >> "$GITHUB_ENV"
       - name: public API contract gate
         # Runs against the git-dist built in the step above, not against source:
         # the contract is what a consumer receives. Fails when a public name

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import ts from "typescript";
 import {
   assertGitDistExportParity,
@@ -23,7 +23,19 @@ export type ContractDeprecation = {
 export type LiveContractEntry = {
   name: string;
   kind: ContractKind;
+  /** Legacy digest recorded in contract/manifest. */
   signature: string;
+  /** Rich release-to-release digest; deliberately not stored in the mutable manifest. */
+  compatibilitySignature?: string;
+  /** Structural proof used to distinguish additive optional members at a minor boundary. */
+  optionalAddition?: {
+    baseSignature: string;
+    members: string[];
+  };
+  /** Rich digest with only the two reviewed v0.9.2 optional additions erased. */
+  v092CompatibilitySignature?: string;
+  /** Raw text after the emitted declaration's @deprecated tag. */
+  deprecatedDeclaration?: string;
 };
 
 export type ContractEntry = LiveContractEntry & {
@@ -43,7 +55,18 @@ export type ContractDiagnosticCode =
   | "experimental-removal"
   | "deprecated-early-removal"
   | "deprecated-removal-eligible"
-  | "deprecated-removal-due";
+  | "deprecated-removal-due"
+  | "deprecated-declaration-missing"
+  | "deprecated-declaration-mismatch"
+  | "deprecated-manifest-missing"
+  | "deprecated-since-version-mismatch"
+  | "deprecated-replacement-missing"
+  | "deprecated-replacement-incompatible"
+  | "deprecated-window-invalid"
+  | "baseline-protected-removal"
+  | "baseline-signature-change"
+  | "baseline-tier-weakening"
+  | "baseline-patch-change";
 
 export type ContractDiagnostic = {
   code: ContractDiagnosticCode;
@@ -66,6 +89,8 @@ export type ContractCheckResult = ContractEvaluation & {
 
 export type ContractCheckOptions = {
   packageRoot?: string;
+  /** Immutable prior release artifact (package.json + git-dist + manifests). */
+  baselinePackageRoot?: string;
   subpackages?: readonly PublicSubpackage[];
   /** Unit fixtures can omit source barrels and runtime JS. The release gate cannot. */
   validateExportParity?: boolean;
@@ -226,7 +251,10 @@ function signatureTraversalNodes(declaration: ts.Declaration): readonly ts.Node[
   return [declaration];
 }
 
-function supportingDeclaration(declaration: ts.Declaration): boolean {
+function supportingDeclaration(declaration: ts.Declaration, rich = false): boolean {
+  if (rich && (ts.isModuleDeclaration(declaration) || ts.isSourceFile(declaration))) {
+    return true;
+  }
   if (
     ts.isTypeAliasDeclaration(declaration)
     || ts.isInterfaceDeclaration(declaration)
@@ -246,12 +274,26 @@ function declarationInside(declaration: ts.Declaration, declarationRoot: string)
   return file === declarationRoot || file.startsWith(`${declarationRoot}${sep}`);
 }
 
-function referencedTypeSymbol(checker: ts.TypeChecker, node: ts.Node): ts.Symbol | undefined {
+function referencedTypeSymbol(
+  checker: ts.TypeChecker,
+  node: ts.Node,
+  rich = false,
+): ts.Symbol | undefined {
   let location: ts.Node | undefined;
   if (ts.isTypeReferenceNode(node)) location = node.typeName;
   else if (ts.isExpressionWithTypeArguments(node)) location = node.expression;
   else if (ts.isTypeQueryNode(node)) location = node.exprName;
-  else if (ts.isImportTypeNode(node)) location = node.qualifier;
+  else if (ts.isImportTypeNode(node)) {
+    location = node.qualifier;
+    if (
+      rich
+      && !location
+      && ts.isLiteralTypeNode(node.argument)
+      && ts.isStringLiteral(node.argument.literal)
+    ) {
+      location = node.argument.literal;
+    }
+  }
   if (!location) return undefined;
   const symbol = checker.getSymbolAtLocation(location);
   return symbol ? resolveAlias(checker, symbol) : undefined;
@@ -261,31 +303,53 @@ function declarationKey(declaration: ts.Declaration): string {
   return `${declaration.getSourceFile().fileName}:${declaration.pos}:${declaration.end}`;
 }
 
+function moduleExportDeclarations(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+): ts.Declaration[] {
+  // TypeScript exposes unmodified top-level ambient declarations from an
+  // external .d.ts module through both named imports and `typeof import()`.
+  // `getExportsOfModule` is the authority here; filtering by an explicit
+  // `export` modifier would under-hash that real consumer-visible surface.
+  return checker.getExportsOfModule(symbol).flatMap((entry) =>
+    resolveAlias(checker, entry).declarations ?? []);
+}
+
 function signatureWithDependencies(
   checker: ts.TypeChecker,
   rootDeclarations: readonly ts.Declaration[],
   rootTexts: readonly string[],
   traversalRoots: readonly ts.Node[],
   declarationRoot: string,
+  rich = false,
+  surfaceText: (declaration: ts.Declaration) => string = declarationSurfaceText,
+  ignoreNode: (node: ts.Node) => boolean = () => false,
+  onDeclaration: (declaration: ts.Declaration) => void = () => {},
 ): string {
   const rootKeys = new Set(rootDeclarations.map(declarationKey));
+  for (const declaration of rootDeclarations) onDeclaration(declaration);
   const dependencies = new Map<string, ts.Declaration>();
   const pending: ts.Node[] = [...traversalRoots];
   for (let index = 0; index < pending.length; index++) {
     const node = pending[index];
-    const symbol = referencedTypeSymbol(checker, node);
+    if (ignoreNode(node)) continue;
+    const symbol = referencedTypeSymbol(checker, node, rich);
     if (symbol) {
-      for (const declaration of symbol.declarations ?? []) {
+      const declarations = rich && (symbol.flags & ts.SymbolFlags.Module)
+        ? moduleExportDeclarations(checker, symbol)
+        : symbol.declarations ?? [];
+      for (const declaration of declarations) {
         const key = declarationKey(declaration);
         if (
           rootKeys.has(key)
           || dependencies.has(key)
-          || !supportingDeclaration(declaration)
+          || !supportingDeclaration(declaration, rich)
           || !declarationInside(declaration, declarationRoot)
         ) {
           continue;
         }
         dependencies.set(key, declaration);
+        onDeclaration(declaration);
         pending.push(...signatureTraversalNodes(declaration));
       }
     }
@@ -298,8 +362,357 @@ function signatureWithDependencies(
     .sort((left, right) =>
       left.getSourceFile().fileName.localeCompare(right.getSourceFile().fileName)
       || left.pos - right.pos)
-    .map(declarationSurfaceText);
+    .map(surfaceText);
   return signatureHash([...rootTexts, ...dependencyTexts]);
+}
+
+function directPropertyOwner(
+  node: ts.Node,
+): ts.InterfaceDeclaration | ts.TypeAliasDeclaration | undefined {
+  if (ts.isInterfaceDeclaration(node.parent)) return node.parent;
+  if (
+    ts.isTypeLiteralNode(node.parent)
+    && ts.isTypeAliasDeclaration(node.parent.parent)
+    && node.parent.parent.type === node.parent
+  ) {
+    return node.parent.parent;
+  }
+  return undefined;
+}
+
+function directOptionalProperties(declaration: ts.Declaration): ts.PropertySignature[] {
+  const members: readonly ts.TypeElement[] = ts.isInterfaceDeclaration(declaration)
+    ? declaration.members
+    : ts.isTypeAliasDeclaration(declaration) && ts.isTypeLiteralNode(declaration.type)
+      ? declaration.type.members
+      : [];
+  return members.filter((member): member is ts.PropertySignature =>
+    ts.isPropertySignature(member) && Boolean(member.questionToken));
+}
+
+function isDirectOptionalProperty(node: ts.Node): node is ts.PropertySignature {
+  return ts.isPropertySignature(node)
+    && Boolean(node.questionToken)
+    && directPropertyOwner(node) !== undefined;
+}
+
+function stripDirectOptionalProperties(declaration: ts.Declaration): string {
+  const members = directOptionalProperties(declaration);
+  if (members.length === 0) return declarationSurfaceText(declaration);
+  const base = declaration.getStart();
+  let text = declaration.getText();
+  for (const member of [...members].sort((left, right) => right.getStart() - left.getStart())) {
+    text = `${text.slice(0, member.getStart() - base)}${text.slice(member.getEnd() - base)}`;
+  }
+  return text;
+}
+
+function optionalAdditionModel(
+  checker: ts.TypeChecker,
+  rootDeclarations: readonly ts.Declaration[],
+  rootTexts: readonly string[],
+  traversalRoots: readonly ts.Node[],
+  declarationRoot: string,
+  allowedOwnerKeys: ReadonlySet<string>,
+): NonNullable<LiveContractEntry["optionalAddition"]> {
+  const declarations = new Map<string, ts.Declaration>();
+  const baseSignature = signatureWithDependencies(
+    checker,
+    rootDeclarations,
+    rootTexts,
+    traversalRoots,
+    declarationRoot,
+    true,
+    (declaration) => allowedOwnerKeys.has(declarationKey(declaration))
+      ? stripDirectOptionalProperties(declaration)
+      : declarationSurfaceText(declaration),
+    (node) => {
+      if (!isDirectOptionalProperty(node)) return false;
+      const owner = directPropertyOwner(node);
+      return Boolean(owner && allowedOwnerKeys.has(declarationKey(owner)));
+    },
+    (declaration) => declarations.set(declarationKey(declaration), declaration),
+  );
+  const members = [...declarations.values()].flatMap((declaration) => {
+    if (!allowedOwnerKeys.has(declarationKey(declaration))) return [];
+    const owner = ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration)
+      ? declaration.name.text
+      : "";
+    const file = relative(declarationRoot, declaration.getSourceFile().fileName)
+      .split(sep).join("/");
+    return directOptionalProperties(declaration).map((member) => {
+      const memberSignature = signatureWithDependencies(
+        checker,
+        [],
+        [member.getText().replace(/;\s*$/, "")],
+        [member],
+        declarationRoot,
+        true,
+      );
+      return `${file}:${owner}:${memberSignature}`;
+    });
+  }).sort();
+  return { baseSignature, members };
+}
+
+function exactOptionalProperty(
+  node: ts.Node,
+  declarationName: string | null,
+  propertyName: string,
+  propertyType: string,
+  allowedOwnerKeys?: ReadonlySet<string>,
+): node is ts.PropertySignature {
+  if (
+    !ts.isPropertySignature(node)
+    || !node.questionToken
+    || node.name?.getText() !== propertyName
+    || !node.type
+    || normalizeDeclarationText(node.type.getText()) !== normalizeDeclarationText(propertyType)
+  ) {
+    return false;
+  }
+  const owner = directPropertyOwner(node);
+  if (!owner) return false;
+  if (declarationName && owner.name.text !== declarationName) return false;
+  return !allowedOwnerKeys || allowedOwnerKeys.has(declarationKey(owner));
+}
+
+function stripExactOptionalProperty(
+  declaration: ts.Declaration,
+  declarationName: string | null,
+  propertyName: string,
+  propertyType: string,
+  allowedOwnerKeys?: ReadonlySet<string>,
+): string {
+  if (!ts.isInterfaceDeclaration(declaration) && !ts.isTypeAliasDeclaration(declaration)) {
+    return declarationSurfaceText(declaration);
+  }
+  if (declarationName && declaration.name.text !== declarationName) {
+    return declarationSurfaceText(declaration);
+  }
+  const matches: ts.PropertySignature[] = [];
+  const visit = (node: ts.Node): void => {
+    if (exactOptionalProperty(
+      node,
+      declarationName,
+      propertyName,
+      propertyType,
+      allowedOwnerKeys,
+    )) {
+      matches.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(declaration);
+  if (matches.length !== 1) return declarationSurfaceText(declaration);
+
+  const base = declaration.getStart();
+  let text = declaration.getText();
+  const member = matches[0]!;
+  text = `${text.slice(0, member.getStart() - base)}${text.slice(member.getEnd() - base)}`;
+  return text;
+}
+
+function componentTypeArgumentNodes(typeNode: ts.TypeNode | undefined): readonly ts.TypeNode[] {
+  if (!typeNode) return [];
+  if (ts.isImportTypeNode(typeNode)) {
+    const moduleName = ts.isLiteralTypeNode(typeNode.argument)
+      && ts.isStringLiteral(typeNode.argument.literal)
+      ? typeNode.argument.literal.text
+      : null;
+    if (moduleName === "svelte" && typeNode.qualifier?.getText() === "Component") {
+      return typeNode.typeArguments ?? [];
+    }
+  }
+  if (ts.isTypeReferenceNode(typeNode) && typeNode.typeName.getText() === "Component") {
+    return typeNode.typeArguments ?? [];
+  }
+  return [];
+}
+
+function compatibilityComponentSignature(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  exportName: string,
+  declarationRoot: string,
+): string {
+  for (const declaration of symbol.declarations ?? []) {
+    if (!ts.isVariableDeclaration(declaration)) continue;
+    const typeArguments = componentTypeArgumentNodes(declaration.type);
+    if (typeArguments.length === 0) continue;
+    return signatureWithDependencies(
+      checker,
+      [],
+      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments,
+      declarationRoot,
+      true,
+    );
+  }
+  throw new Error(`could not read Svelte component declaration for ${exportName}`);
+}
+
+function componentOptionalAdditionModel(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  exportName: string,
+  declarationRoot: string,
+): NonNullable<LiveContractEntry["optionalAddition"]> {
+  for (const declaration of symbol.declarations ?? []) {
+    if (!ts.isVariableDeclaration(declaration)) continue;
+    const typeArguments = componentTypeArgumentNodes(declaration.type);
+    if (typeArguments.length === 0) continue;
+    const propsSymbol = typeReferenceSymbol(checker, typeArguments[0]!);
+    const allowedOwnerKeys = new Set(
+      (propsSymbol?.declarations ?? []).map(declarationKey),
+    );
+    return optionalAdditionModel(
+      checker,
+      [],
+      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments,
+      declarationRoot,
+      allowedOwnerKeys,
+    );
+  }
+  throw new Error(`could not read Svelte component declaration for ${exportName}`);
+}
+
+function v092EmbedViewCompatibilitySignature(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  declarationRoot: string,
+): string | undefined {
+  for (const declaration of symbol.declarations ?? []) {
+    if (!ts.isVariableDeclaration(declaration)) continue;
+    const typeArguments = componentTypeArgumentNodes(declaration.type);
+    if (typeArguments.length === 0) continue;
+    const propsSymbol = typeReferenceSymbol(checker, typeArguments[0]!);
+    const allowedOwnerKeys = new Set(
+      (propsSymbol?.declarations ?? []).map(declarationKey),
+    );
+    return signatureWithDependencies(
+      checker,
+      [],
+      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments,
+      declarationRoot,
+      true,
+      (dependency) => stripExactOptionalProperty(
+        dependency,
+        null,
+        "claimGeometry",
+        "boolean",
+        allowedOwnerKeys,
+      ),
+      (node) => exactOptionalProperty(
+        node,
+        null,
+        "claimGeometry",
+        "boolean",
+        allowedOwnerKeys,
+      ),
+    );
+  }
+  return undefined;
+}
+
+function compatibilityDeclarationSignature(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  declarationRoot: string,
+): string {
+  const declarations = [...(symbol.declarations ?? [])].sort((left, right) =>
+    left.getSourceFile().fileName.localeCompare(right.getSourceFile().fileName)
+    || left.pos - right.pos);
+  if (declarations.length === 0) {
+    throw new Error(`public symbol has no declaration: ${symbol.getName()}`);
+  }
+  const parts = [...new Set(declarations.map(declarationSurfaceText))];
+  return signatureWithDependencies(
+    checker,
+    declarations,
+    parts,
+    declarations.flatMap(signatureTraversalNodes),
+    declarationRoot,
+    true,
+  );
+}
+
+function declarationOptionalAdditionModel(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  declarationRoot: string,
+): NonNullable<LiveContractEntry["optionalAddition"]> {
+  const declarations = [...(symbol.declarations ?? [])].sort((left, right) =>
+    left.getSourceFile().fileName.localeCompare(right.getSourceFile().fileName)
+    || left.pos - right.pos);
+  if (declarations.length === 0) {
+    throw new Error(`public symbol has no declaration: ${symbol.getName()}`);
+  }
+  const allowedOwnerKeys = new Set(
+    declarations.filter(ts.isInterfaceDeclaration).map(declarationKey),
+  );
+  const parts = [...new Set(declarations.map((declaration) =>
+    allowedOwnerKeys.has(declarationKey(declaration))
+      ? stripDirectOptionalProperties(declaration)
+      : declarationSurfaceText(declaration)))];
+  return optionalAdditionModel(
+    checker,
+    declarations,
+    parts,
+    declarations.flatMap(signatureTraversalNodes),
+    declarationRoot,
+    allowedOwnerKeys,
+  );
+}
+
+function v092ServerCompatibilitySignature(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  declarationRoot: string,
+): string {
+  const declarations = [...(symbol.declarations ?? [])].sort((left, right) =>
+    left.getSourceFile().fileName.localeCompare(right.getSourceFile().fileName)
+    || left.pos - right.pos);
+  const surfaceText = (declaration: ts.Declaration) => stripExactOptionalProperty(
+    declaration,
+    "AppRoutesOptions",
+    "projectSessionList",
+    "(sessions: readonly SessionListItem[]) => readonly SessionListItem[]",
+  );
+  return signatureWithDependencies(
+    checker,
+    declarations,
+    declarations.map(surfaceText),
+    declarations.flatMap(signatureTraversalNodes),
+    declarationRoot,
+    true,
+    surfaceText,
+    (node) => exactOptionalProperty(
+      node,
+      "AppRoutesOptions",
+      "projectSessionList",
+      "(sessions: readonly SessionListItem[]) => readonly SessionListItem[]",
+    ),
+  );
+}
+
+function deprecatedDeclarationText(symbol: ts.Symbol): string | undefined {
+  const comments = (symbol.declarations ?? []).flatMap((declaration) => {
+    const nodes: ts.Node[] = [];
+    for (let node: ts.Node | undefined = declaration;
+      node && !ts.isSourceFile(node);
+      node = node.parent) {
+      nodes.push(node);
+    }
+    return nodes.flatMap((node) => ts.getJSDocTags(node))
+      .filter((tag): tag is ts.JSDocDeprecatedTag => ts.isJSDocDeprecatedTag(tag))
+      .map((tag) => typeof tag.comment === "string"
+        ? tag.comment.trim()
+        : tag.comment?.map((part) => part.getText()).join("").trim() ?? "");
+  });
+  return comments.find((comment) => comment.length > 0);
 }
 
 function componentPropsSignature(
@@ -404,12 +817,30 @@ export function deriveGitDistReport(
         : (runtime?.has(name) ?? Boolean(symbol.flags & ts.SymbolFlags.Value))
           ? "value"
           : "type";
+      // Deprecation belongs to the exported spelling. Resolving an alias first
+      // would inspect the replacement declaration and lose the stamp attached
+      // to `export { replacement as oldName }`.
+      const deprecatedDeclaration = deprecatedDeclarationText(exportedSymbol);
+      const optionalAddition = isComponent
+        ? componentOptionalAdditionModel(checker, symbol, name, declarationRoot)
+        : declarationOptionalAdditionModel(checker, symbol, declarationRoot);
+      const v092CompatibilitySignature = isComponent && subpath === "app" && name === "EmbedView"
+        ? v092EmbedViewCompatibilitySignature(checker, symbol, declarationRoot)
+        : subpath === "server" && (name === "AppRoutesOptions" || name === "createAppRoutes")
+          ? v092ServerCompatibilitySignature(checker, symbol, declarationRoot)
+          : undefined;
       return {
         name,
         kind,
         signature: isComponent
           ? componentPropsSignature(checker, symbol, name, declarationRoot)
           : declarationSignature(checker, symbol, declarationRoot),
+        compatibilitySignature: isComponent
+          ? compatibilityComponentSignature(checker, symbol, name, declarationRoot)
+          : compatibilityDeclarationSignature(checker, symbol, declarationRoot),
+        optionalAddition,
+        ...(v092CompatibilitySignature ? { v092CompatibilitySignature } : {}),
+        ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}),
       };
     }).sort((left, right) => left.name.localeCompare(right.name));
 
@@ -527,6 +958,23 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
+function validDeprecationWindow(since: string, removeNoEarlierThan: string): boolean {
+  let from: ParsedSemver;
+  let until: ParsedSemver;
+  try {
+    from = parseSemver(since);
+    until = parseSemver(removeNoEarlierThan);
+  } catch {
+    return false;
+  }
+  if (compareVersions(removeNoEarlierThan, since) <= 0) return false;
+  if (from.core[0] < 1) {
+    return until.core[0] > from.core[0]
+      || (until.core[0] === from.core[0] && until.core[1] > from.core[1]);
+  }
+  return until.core[0] > from.core[0];
+}
+
 function diagnostic(
   code: ContractDiagnosticCode,
   subpath: PublicSubpackage,
@@ -555,6 +1003,72 @@ export function evaluateManifest(
     }
     manifestNames.add(expected.name);
     const actual = liveByName.get(expected.name);
+    if (expected.deprecated) {
+      const metadata = expected.deprecated;
+      if (!validDeprecationWindow(metadata.since, metadata.removeNoEarlierThan)) {
+        errors.push(diagnostic(
+          "deprecated-window-invalid",
+          subpath,
+          expected,
+          `deprecated export "${expected.name}" has an invalid removal window ${metadata.since} → ${metadata.removeNoEarlierThan}`,
+        ));
+      }
+      if (
+        metadata.replacement === expected.name
+        || !liveByName.has(metadata.replacement)
+      ) {
+        errors.push(diagnostic(
+          "deprecated-replacement-missing",
+          subpath,
+          expected,
+          `deprecated export "${expected.name}" replacement "${metadata.replacement}" is not a live distinct export`,
+        ));
+      }
+      const replacement = liveByName.get(metadata.replacement);
+      if (
+        actual
+        && replacement
+        && metadata.replacement !== expected.name
+        && compareVersions(metadata.since, currentVersion) === 0
+        && (
+          replacement.kind !== actual.kind
+          || (replacement.compatibilitySignature ?? replacement.signature)
+            !== (actual.compatibilitySignature ?? actual.signature)
+        )
+      ) {
+        errors.push(diagnostic(
+          "deprecated-replacement-incompatible",
+          subpath,
+          expected,
+          `newly deprecated export "${expected.name}" replacement "${metadata.replacement}" does not preserve its kind and declaration shape`,
+        ));
+      }
+      if (actual) {
+        const stamp = `since v${metadata.since} — use ${metadata.replacement}; removal no earlier than v${metadata.removeNoEarlierThan}`;
+        if (!actual.deprecatedDeclaration) {
+          errors.push(diagnostic(
+            "deprecated-declaration-missing",
+            subpath,
+            expected,
+            `deprecated export "${expected.name}" has no emitted @deprecated declaration stamp`,
+          ));
+        } else if (actual.deprecatedDeclaration !== stamp) {
+          errors.push(diagnostic(
+            "deprecated-declaration-mismatch",
+            subpath,
+            expected,
+            `deprecated export "${expected.name}" declaration stamp does not match its manifest metadata`,
+          ));
+        }
+      }
+    } else if (actual?.deprecatedDeclaration) {
+      errors.push(diagnostic(
+        "deprecated-manifest-missing",
+        subpath,
+        expected,
+        `deprecated export "${expected.name}" has an emitted declaration stamp but no manifest metadata`,
+      ));
+    }
     if (!actual) {
       if (expected.deprecated) {
         if (compareVersions(currentVersion, expected.deprecated.removeNoEarlierThan) < 0) {
@@ -634,6 +1148,250 @@ export function evaluateManifest(
   return { errors, warnings, summaries };
 }
 
+function releaseBoundary(
+  fromVersion: string,
+  toVersion: string,
+): "same" | "patch" | "minor" | "major" | "retag" {
+  const from = parseSemver(fromVersion);
+  const to = parseSemver(toVersion);
+  if (compareVersions(toVersion, fromVersion) < 0) {
+    throw new Error(`contract version moved backwards: ${fromVersion} → ${toVersion}`);
+  }
+  if (from.core[0] === 0 && to.core[0] === 1 && to.core[1] === 0 && to.core[2] === 0) {
+    return "retag";
+  }
+  if (from.core[0] !== to.core[0]) return "major";
+  if (from.core[1] !== to.core[1]) return "minor";
+  if (from.core[2] !== to.core[2]) return "patch";
+  return "same";
+}
+
+function isV092PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.9.1" || currentVersion !== "0.9.2") return false;
+  const namedException = (subpath === "app" && name === "EmbedView")
+    || (subpath === "server" && (name === "AppRoutesOptions" || name === "createAppRoutes"));
+  return namedException
+    && currentLive.v092CompatibilitySignature !== undefined
+    && currentLive.v092CompatibilitySignature
+      === (baselineLive.compatibilitySignature ?? baselineLive.signature);
+}
+
+function isMinorOptionalAddition(
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  const baseline = baselineLive.optionalAddition;
+  const current = currentLive.optionalAddition;
+  if (!baseline || !current || baseline.baseSignature !== current.baseSignature) return false;
+  const remaining = new Map<string, number>();
+  for (const member of current.members) {
+    remaining.set(member, (remaining.get(member) ?? 0) + 1);
+  }
+  for (const member of baseline.members) {
+    const count = remaining.get(member) ?? 0;
+    if (count === 0) return false;
+    remaining.set(member, count - 1);
+  }
+  return true;
+}
+
+/**
+ * Compare the current mutable manifest/artifact with an immutable prior release.
+ * This is the authorization boundary missing from a current-tree-only snapshot.
+ */
+export function evaluateBaseline(
+  subpath: PublicSubpackage,
+  baselineManifest: readonly ContractEntry[],
+  currentManifest: readonly ContractEntry[],
+  baselineLive: readonly LiveContractEntry[],
+  currentLive: readonly LiveContractEntry[],
+  baselineVersion: string,
+  currentVersion: string,
+): ContractEvaluation {
+  const errors: ContractDiagnostic[] = [];
+  const warnings: ContractDiagnostic[] = [];
+  const summaries: ContractDiagnostic[] = [];
+  const boundary = releaseBoundary(baselineVersion, currentVersion);
+  const baselineLiveByName = new Map(baselineLive.map((entry) => [entry.name, entry]));
+  const currentLiveByName = new Map(currentLive.map((entry) => [entry.name, entry]));
+  const currentManifestByName = new Map(currentManifest.map((entry) => [entry.name, entry]));
+  const baselineManifestNames = new Set(baselineManifest.map((entry) => entry.name));
+
+  for (const previous of baselineManifest) {
+    const previousLive = baselineLiveByName.get(previous.name);
+    if (!previousLive) {
+      throw new Error(`${subpath} immutable baseline is missing declared export ${previous.name}`);
+    }
+    const next = currentManifestByName.get(previous.name);
+    const nextLive = currentLiveByName.get(previous.name);
+    const eligibleDeprecatedRemoval = Boolean(
+      (boundary === "minor" || boundary === "major")
+      &&
+      previous.deprecated
+      && compareVersions(currentVersion, previous.deprecated.removeNoEarlierThan) >= 0,
+    );
+    const postOneMajor = boundary === "major"
+      && parseSemver(baselineVersion).core[0] >= 1;
+
+    if (!next || !nextLive) {
+      if (eligibleDeprecatedRemoval) {
+        summaries.push(diagnostic(
+          "deprecated-removal-eligible",
+          subpath,
+          previous,
+          `baseline deprecated export "${previous.name}" is absent at an eligible removal version`,
+        ));
+      } else if (previous.tier === "F" && postOneMajor) {
+        // F freezes one post-1.0 major line at a time. A new major is the
+        // documented boundary at which that name may break or disappear.
+      } else if (previous.tier === "X" && (boundary === "minor" || boundary === "major")) {
+        summaries.push(diagnostic(
+          "experimental-removal",
+          subpath,
+          previous,
+          `baseline X export "${previous.name}" was removed at a ${boundary} boundary`,
+        ));
+      } else {
+        errors.push(diagnostic(
+          "baseline-protected-removal",
+          subpath,
+          previous,
+          `immutable baseline ${previous.tier} export "${previous.name}" was removed from the manifest or artifact`,
+        ));
+      }
+      continue;
+    }
+
+    const weakened = previous.tier === "F"
+      ? next.tier !== "F"
+      : previous.tier === "S"
+        ? next.tier === "X" || next.tier === "D"
+        : previous.tier === "D"
+          ? next.tier !== "D" && next.tier !== "F"
+          : false;
+    if (weakened) {
+      errors.push(diagnostic(
+        "baseline-tier-weakening",
+        subpath,
+        previous,
+        `immutable baseline tier ${previous.tier} for "${previous.name}" was changed to ${next.tier}`,
+      ));
+    }
+    if (
+      !previous.deprecated
+      && next.deprecated
+      && compareVersions(next.deprecated.since, currentVersion) !== 0
+    ) {
+      errors.push(diagnostic(
+        "deprecated-since-version-mismatch",
+        subpath,
+        previous,
+        `new deprecation metadata for "${previous.name}" says ${next.deprecated.since}, expected ${currentVersion}`,
+      ));
+    }
+
+    if (
+      (previous.deprecated || boundary === "retag")
+      && JSON.stringify(previous.deprecated) !== JSON.stringify(next.deprecated)
+    ) {
+      errors.push(diagnostic(
+        "baseline-tier-weakening",
+        subpath,
+        previous,
+        `immutable deprecation metadata for "${previous.name}" was removed or changed`,
+      ));
+    }
+
+    const signatureChanged = (
+      previousLive.compatibilitySignature ?? previousLive.signature
+    ) !== (
+      nextLive.compatibilitySignature ?? nextLive.signature
+    );
+    const kindChanged = previousLive.kind !== nextLive.kind;
+    if (!signatureChanged && !kindChanged) continue;
+
+    if (
+      (boundary === "same" || boundary === "patch")
+      && isV092PatchException(
+        baselineVersion,
+        currentVersion,
+        subpath,
+        previous.name,
+        previousLive,
+        nextLive,
+      )
+    ) {
+      continue;
+    }
+    if (
+      boundary === "minor"
+      && !kindChanged
+      && (previous.tier === "F" || previous.tier === "S")
+      && isMinorOptionalAddition(previousLive, nextLive)
+    ) {
+      continue;
+    }
+
+    // S changes are introduced by adding a replacement route while the old
+    // declaration remains intact and enters the deprecation window. Replacing
+    // the old declaration in place would erase the compatibility alias.
+    if (previous.tier === "F" && postOneMajor) {
+      continue;
+    }
+    if (previous.tier === "F" || previous.tier === "S" || previous.tier === "D") {
+      errors.push(diagnostic(
+        "baseline-signature-change",
+        subpath,
+        previous,
+        `immutable baseline ${previous.tier} export "${previous.name}" changed its public declaration`,
+      ));
+      continue;
+    }
+    if (boundary === "same" || boundary === "patch" || boundary === "retag") {
+      errors.push(diagnostic(
+        "baseline-patch-change",
+        subpath,
+        previous,
+        `immutable baseline ${previous.tier} export "${previous.name}" changed without a minor boundary`,
+      ));
+    }
+  }
+  for (const next of currentManifest) {
+    if (
+      baselineManifestNames.has(next.name)
+      || !next.deprecated
+      || compareVersions(next.deprecated.since, currentVersion) === 0
+    ) {
+      continue;
+    }
+    errors.push(diagnostic(
+      "deprecated-since-version-mismatch",
+      subpath,
+      next,
+      `new deprecated export "${next.name}" says ${next.deprecated.since}, expected ${currentVersion}`,
+    ));
+  }
+  if (boundary === "same" || boundary === "patch" || boundary === "retag") {
+    for (const next of currentManifest) {
+      if (baselineManifestNames.has(next.name)) continue;
+      errors.push(diagnostic(
+        "baseline-patch-change",
+        subpath,
+        next,
+        `new ${next.tier} export "${next.name}" was declared without a minor boundary`,
+      ));
+    }
+  }
+  return { errors, warnings, summaries };
+}
+
 /** Run the checked-in surface gate against a built package root. */
 export function checkContract(options: ContractCheckOptions = {}): ContractCheckResult {
   const packageRoot = resolve(options.packageRoot ?? PACKAGE_ROOT);
@@ -667,6 +1425,32 @@ export function checkContract(options: ContractCheckOptions = {}): ContractCheck
     result.warnings.push(...evaluation.warnings);
     result.summaries.push(...evaluation.summaries);
   }
+  if (options.baselinePackageRoot) {
+    const baselinePackageRoot = resolve(options.baselinePackageRoot);
+    const baselinePkg = JSON.parse(
+      readFileSync(resolve(baselinePackageRoot, "package.json"), "utf8"),
+    ) as { version?: unknown };
+    if (typeof baselinePkg.version !== "string") {
+      throw new Error("baseline package.json version must be a string");
+    }
+    parseSemver(baselinePkg.version);
+    const baselineLive = deriveGitDistReport(baselinePackageRoot, subpackages);
+    for (const subpath of subpackages) {
+      const baselineManifest = readContractManifest(baselinePackageRoot, subpath);
+      const baselineEvaluation = evaluateBaseline(
+        subpath,
+        baselineManifest,
+        manifests[subpath],
+        baselineLive[subpath],
+        live[subpath],
+        baselinePkg.version,
+        pkg.version,
+      );
+      result.errors.push(...baselineEvaluation.errors);
+      result.warnings.push(...baselineEvaluation.warnings);
+      result.summaries.push(...baselineEvaluation.summaries);
+    }
+  }
   return { ...result, currentVersion: pkg.version, live, manifests };
 }
 
@@ -686,7 +1470,13 @@ function tierSummary(
 
 if (import.meta.main) {
   try {
-    const result = checkContract();
+    const baselinePackageRoot = process.env.THUMBMUX_CONTRACT_BASELINE_ROOT?.trim();
+    if (process.env.THUMBMUX_CONTRACT_REQUIRE_BASELINE === "1" && !baselinePackageRoot) {
+      throw new Error("contract check requires THUMBMUX_CONTRACT_BASELINE_ROOT");
+    }
+    const result = checkContract({
+      ...(baselinePackageRoot ? { baselinePackageRoot } : {}),
+    });
     for (const item of result.summaries) console.log(`[contract summary] ${item.message}`);
     for (const item of result.warnings) console.warn(`[contract warning] ${item.message}`);
     if (result.errors.length > 0) {

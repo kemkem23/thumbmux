@@ -14,6 +14,11 @@
 # Run before pushing a release tag. Exits non-zero on the first failure.
 set -euo pipefail
 
+if [ "${THUMBMUX_SKIP_E2E:-0}" = "1" ]; then
+  echo "ci-parity: INCOMPLETE — THUMBMUX_SKIP_E2E=1 cannot produce a passing parity result" >&2
+  exit 1
+fi
+
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$package_dir"
 
@@ -32,9 +37,23 @@ work="$(mktemp -d -t thumbmux-ci-parity-XXXXXX)"
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
+if [ -n "${THUMBMUX_CONTRACT_REMOTE_URL:-}" ]; then
+  contract_remote_url="$THUMBMUX_CONTRACT_REMOTE_URL"
+elif git -C "$repo_root" remote get-url thumbmux-public >/dev/null 2>&1; then
+  contract_remote_url="$(git -C "$repo_root" remote get-url thumbmux-public)"
+else
+  contract_remote_url="$(git -C "$repo_root" remote get-url origin)"
+fi
+
 echo "ci-parity: exporting $archive_ref -> $work"
 git -C "$repo_root" archive "$archive_ref" | tar -x -C "$work"
 cd "$work"
+
+baseline_root="$work/.contract-baseline"
+THUMBMUX_CONTRACT_REMOTE_URL="$contract_remote_url" \
+  bun scripts/materialize-contract-baseline.ts "$baseline_root"
+export THUMBMUX_CONTRACT_BASELINE_ROOT="$baseline_root"
+export THUMBMUX_CONTRACT_REQUIRE_BASELINE=1
 
 # Fail loudly rather than run a green suite over an empty directory.
 for required in package.json bun.lock core/package.json server/package.json svelte/package.json app/package.json; do
@@ -52,6 +71,15 @@ echo "ci-parity: unit suite (release-parity command)"
 bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts \
   ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
 
+echo "ci-parity: demo builds"
+(cd demo && bun run build)
+
+echo "ci-parity: packages build & pack (publish readiness)"
+(cd core && bun run build && bun pm pack)
+(cd server && bun run build && bun pm pack)
+(cd svelte && bun run build && bun pm pack)
+(cd app && bun run build && bun pm pack)
+
 echo "ci-parity: bun run contract"
 bun run contract
 
@@ -63,13 +91,13 @@ bun run smoke:git-dist
 # suite proved and this caught: unblocking an early tap made a composer button
 # appear, which turned an unscoped role query in one spec into a strict-mode
 # violation. Skipping this step is why that reached CI instead of stopping here.
-# Set THUMBMUX_SKIP_E2E=1 only when Docker is genuinely unavailable, and say so.
-if [ "${THUMBMUX_SKIP_E2E:-0}" = "1" ]; then
-  echo "ci-parity: WARNING — container e2e SKIPPED by THUMBMUX_SKIP_E2E=1; CI still runs it"
-else
-  echo "ci-parity: ./e2e/run-container.sh"
-  ./e2e/run-container.sh
-fi
+# A committed test.only must fail before the container can report a partial suite.
+echo "ci-parity: reject focused Playwright tests"
+DEMO_URL="${DEMO_URL:-http://127.0.0.1:1}" \
+  ./node_modules/.bin/playwright test --config=e2e/playwright.config.ts --list --forbid-only
+
+echo "ci-parity: ./e2e/run-container.sh"
+./e2e/run-container.sh
 
 echo "ci-parity: bash scripts/contract-fixtures.sh"
 bash scripts/contract-fixtures.sh

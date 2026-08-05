@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { chromium } from "@playwright/test";
 
 setDefaultTimeout(120_000);
 
@@ -210,6 +211,18 @@ function writeClientProject(code: string): void {
     "",
   ].join("\n"));
   writeFileSync(join(CONSUMER_ROOT, "src", "main.ts"), `${code}\n`);
+  writeFileSync(join(CONSUMER_ROOT, "tsconfig.client.json"), `${JSON.stringify({
+    compilerOptions: {
+      target: "ES2022",
+      module: "ESNext",
+      moduleResolution: "Bundler",
+      lib: ["ES2022", "DOM", "DOM.Iterable"],
+      strict: true,
+      skipLibCheck: false,
+      noEmit: true,
+    },
+    include: ["src/main.ts"],
+  }, null, 2)}\n`);
   writeFileSync(join(CONSUMER_ROOT, "vite.config.ts"), [
     'import { svelte } from "@sveltejs/vite-plugin-svelte";',
     'import { defineConfig } from "vite";',
@@ -217,6 +230,72 @@ function writeClientProject(code: string): void {
     "export default defineConfig({ plugins: [svelte()] });",
     "",
   ].join("\n"));
+}
+
+function typecheckClient(): CommandResult {
+  return command([
+    join(CONSUMER_ROOT, "node_modules", ".bin", "tsc"),
+    "-p",
+    "tsconfig.client.json",
+  ], CONSUMER_ROOT);
+}
+
+function buildClient(): CommandResult {
+  return command([
+    join(CONSUMER_ROOT, "node_modules", ".bin", "vite"),
+    "build",
+  ], CONSUMER_ROOT);
+}
+
+async function waitForHttp(origin: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(origin);
+      if (response.ok) return;
+    } catch { /* preview is still starting */ }
+    await Bun.sleep(25);
+  }
+  throw new Error(`Vite preview did not start at ${origin}`);
+}
+
+async function executeBuiltClient(): Promise<string[]> {
+  const port = await reservePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const preview = Bun.spawn({
+    cmd: [
+      join(CONSUMER_ROOT, "node_modules", ".bin", "vite"),
+      "preview",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--strictPort",
+    ],
+    cwd: CONSUMER_ROOT,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const errors: string[] = [];
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  try {
+    await waitForHttp(origin);
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(origin, { waitUntil: "domcontentloaded" });
+    try {
+      await page.locator('[data-testid="hub-view"]').waitFor({ timeout: 5_000 });
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+    await page.waitForTimeout(100);
+  } finally {
+    await browser?.close();
+    preview.kill();
+    await preview.exited;
+  }
+  return errors;
 }
 
 async function reservePort(): Promise<number> {
@@ -227,6 +306,7 @@ async function reservePort(): Promise<number> {
   });
   const port = reservation.port;
   await reservation.stop(true);
+  if (typeof port !== "number") throw new Error("Bun did not allocate a preview port");
   return port;
 }
 
@@ -329,14 +409,30 @@ describe("README quickstart", () => {
     }
   });
 
-  test("builds the client fence with Svelte 5 and Vite", () => {
+  test("type-checks, builds, and executes the client fence with Svelte 5 and Vite", async () => {
     const { code } = extractQuickstart("client");
     writeClientProject(code);
-    const result = command([
-      join(CONSUMER_ROOT, "node_modules", ".bin", "vite"),
-      "build",
-    ], CONSUMER_ROOT);
+    const typecheck = typecheckClient();
+    expect(`${typecheck.stdout}${typecheck.stderr}`).toBe("");
+    expect(typecheck.exitCode).toBe(0);
+    const result = buildClient();
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(CONSUMER_ROOT, "dist", "index.html"))).toBe(true);
+    expect(await executeBuiltClient()).toEqual([]);
+  });
+
+  test("client gate rejects semantic TypeScript errors", () => {
+    const { code } = extractQuickstart("client");
+    writeClientProject(`${code}\nconst incompatible: string = 1;`);
+    const result = typecheckClient();
+
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  test("client gate rejects a bundle that throws during startup", async () => {
+    writeClientProject('throw new Error("quickstart startup mutation");');
+    expect(typecheckClient().exitCode).toBe(0);
+    expect(buildClient().exitCode).toBe(0);
+    expect(await executeBuiltClient()).toContain("quickstart startup mutation");
   });
 });

@@ -17,14 +17,21 @@ import {
 } from "@thumbmux/server";
 import qrcode from "qrcode-terminal";
 import { networkInterfaces } from "node:os";
+import {
+  createDemoSessionPolicy,
+  validateDemoSpawnCwd,
+} from "./policy";
+import { demoDistPath } from "./server-policy";
 
 const HOST_ALL = process.argv.includes("--host");
 const PORT = Number(process.env.PORT || 7681);
 const TOKEN = crypto.randomUUID().replace(/-/g, "");
-const DIST = new URL("./dist/", import.meta.url).pathname;
+const RUN_ID = crypto.randomUUID().replace(/-/g, "");
+const DIST = demoDistPath(import.meta.url);
 
 const driver = createBunTmuxDriver();
-// The default archive is a private, per-run temp root, so a recycled demo-N
+const demoSessions = createDemoSessionPolicy(RUN_ID);
+// The default archive is a private, per-run temp root, so a recycled session
 // name cannot inherit another demo process's scrollback. Setting this variable
 // is the explicit opt-in to persistence across runs.
 const configuredHistoryRoot = process.env.THUMBMUX_HISTORY_ROOT?.trim();
@@ -46,19 +53,16 @@ function authorized(req: Request): boolean {
   return cookie.includes(`tmux_demo_t=${TOKEN}`);
 }
 
-let spawnCounter = 0;
 const routes = createAppRoutes({
   driver,
   archive,
+  projectSessionList: demoSessions.project,
   spawn: {
     // Keep the demo rooted where its server process was started. In particular,
     // do not let an HTTP payload select an arbitrary server-side directory.
     cwd: () => process.cwd(),
-    generateName: ({ existing }) => {
-      let name = "";
-      do { name = `demo-${++spawnCounter}`; } while (existing.has(name));
-      return name;
-    },
+    validateCwd: validateDemoSpawnCwd,
+    generateName: demoSessions.allocate,
     prepareWorktree: ({ name, cwd }) => {
       // Worktree presets isolate the session in a fresh checkout. This policy
       // is demo-specific; the packaged spawn handler only invokes the hooks.

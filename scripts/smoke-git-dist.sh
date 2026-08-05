@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 FIXTURE="$SCRIPT_DIR/git-dist-smoke"
 EXPORT_GUARD="$SCRIPT_DIR/rewrite-git-dist-imports.ts"
+RELEASE_MANIFEST="$SCRIPT_DIR/prepare-release-package.ts"
 EXPECTED_SOURCE_ROOT="${THUMBMUX_EXPORT_SOURCE_ROOT:-$PACKAGE_ROOT}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/thumbmux-git-dist-smoke.XXXXXX")"
 
@@ -21,7 +22,12 @@ for path in \
   "$PACKAGE_ROOT/git-dist/svelte/index.js" \
   "$PACKAGE_ROOT/git-dist/svelte/index.d.ts" \
   "$PACKAGE_ROOT/git-dist/app/index.js" \
-  "$PACKAGE_ROOT/git-dist/app/index.d.ts"; do
+  "$PACKAGE_ROOT/git-dist/app/index.d.ts" \
+  "$PACKAGE_ROOT/CONTRACT.md" \
+  "$PACKAGE_ROOT/contract/manifest/core.json" \
+  "$PACKAGE_ROOT/contract/manifest/server.json" \
+  "$PACKAGE_ROOT/contract/manifest/svelte.json" \
+  "$PACKAGE_ROOT/contract/manifest/app.json"; do
   [[ -f "$path" ]] || { echo "git-dist smoke: missing $path" >&2; exit 1; }
 done
 
@@ -30,23 +36,41 @@ bun "$EXPORT_GUARD" check-exports "$PACKAGE_ROOT" "$EXPECTED_SOURCE_ROOT"
 mkdir -p "$WORK/package" "$WORK/bun-consumer" "$WORK/npm-consumer"
 cp "$PACKAGE_ROOT/package.json" "$PACKAGE_ROOT/README.md" "$PACKAGE_ROOT/LICENSE" "$WORK/package/"
 cp -R "$PACKAGE_ROOT/docs" "$PACKAGE_ROOT/git-dist" "$WORK/package/"
+cp "$PACKAGE_ROOT/CONTRACT.md" "$WORK/package/"
+mkdir -p "$WORK/package/contract"
+cp -R "$PACKAGE_ROOT/contract/manifest" "$WORK/package/contract/"
 
 (
   cd "$WORK/package"
-  npm pkg delete scripts
-  npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./app":{"types":"./git-dist/app/index.d.ts","svelte":"./git-dist/app/index.js"},"./package.json":"./package.json"}' --json
-  npm pkg set files='["git-dist","docs","CONTRACT.md","contract/manifest"]' --json
+  bun "$RELEASE_MANIFEST" .
   npm pack --pack-destination "$WORK" --silent >/dev/null
 )
 
 PACKAGE_TARBALL="$(find "$WORK" -maxdepth 1 -name 'thumbmux-*.tgz' -print -quit)"
 [[ -n "$PACKAGE_TARBALL" ]] || { echo "git-dist smoke: npm pack produced no tarball" >&2; exit 1; }
+PACKAGE_CONTENTS="$(tar -tzf "$PACKAGE_TARBALL")"
+for asset in \
+  package/CONTRACT.md \
+  package/contract/manifest/core.json \
+  package/contract/manifest/server.json \
+  package/contract/manifest/svelte.json \
+  package/contract/manifest/app.json; do
+  grep -Fxq "$asset" <<<"$PACKAGE_CONTENTS" || {
+    echo "git-dist smoke: packed artifact is missing $asset" >&2
+    exit 1
+  }
+done
 cp -R "$FIXTURE/." "$WORK/bun-consumer/"
 bun "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE_ROOT"
 (
   cd "$WORK/bun-consumer"
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
   bun install
+  test -f node_modules/thumbmux/CONTRACT.md
+  test -f node_modules/thumbmux/contract/manifest/core.json
+  test -f node_modules/thumbmux/contract/manifest/server.json
+  test -f node_modules/thumbmux/contract/manifest/svelte.json
+  test -f node_modules/thumbmux/contract/manifest/app.json
   bun run check
   ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs
@@ -60,6 +84,11 @@ bun "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer" "$EXPECTED_SOURCE
   cd "$WORK/npm-consumer"
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
   npm install --include=dev --ignore-scripts
+  test -f node_modules/thumbmux/CONTRACT.md
+  test -f node_modules/thumbmux/contract/manifest/core.json
+  test -f node_modules/thumbmux/contract/manifest/server.json
+  test -f node_modules/thumbmux/contract/manifest/svelte.json
+  test -f node_modules/thumbmux/contract/manifest/app.json
   npm run check
   ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs

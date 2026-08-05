@@ -14,7 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
+      - name: release tag matches package manifests
+        run: bun scripts/check-release-version.ts
+      - name: 1.0 is a no-code-delta retag
+        run: bun scripts/check-release-retag.ts
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: bun install --frozen-lockfile
       - name: install Playwright Chromium
@@ -27,6 +33,10 @@ jobs:
       - run: bun test ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
+      - name: reject focused Playwright tests
+        run: ./node_modules/.bin/playwright test --config=e2e/playwright.config.ts --list --forbid-only
+        env:
+          DEMO_URL: http://127.0.0.1:1
       - name: canonical container e2e
         timeout-minutes: 20
         run: ./e2e/run-container.sh
@@ -44,6 +54,12 @@ jobs:
         run: bun run build:git-dist
       - name: root git-dist consumer smoke
         run: bun run smoke:git-dist
+      - name: materialize immutable prior contract
+        run: |
+          baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
+          bun scripts/materialize-contract-baseline.ts "$baseline_root"
+          echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+          echo "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1" >> "$GITHUB_ENV"
       - name: public API contract gate
         # Check the surface of the release artifact before exercising the
         # frozen consumers that depend on it.
@@ -59,11 +75,9 @@ jobs:
           # Dists ship prebuilt in this tag. The root artifact is read-only:
           # remove every lifecycle/demo/build script so no package manager
           # rebuilds it or advertises commands whose sources are not shipped.
-          npm pkg delete scripts
-          # npm packs git deps honoring .gitignore unless a files whitelist
-          # exists — without this, the committed dists never reach consumers.
-          npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./app":{"types":"./git-dist/app/index.d.ts","svelte":"./git-dist/app/index.js"},"./package.json":"./package.json"}' --json
-          npm pkg set files='["git-dist","docs","CONTRACT.md","contract/manifest"]' --json
+          # The smoke rail calls this same helper before npm pack, so its
+          # advertised files/exports cannot drift from the released manifest.
+          bun scripts/prepare-release-package.ts .
           # Keep pristine scoped-package dists available to pack from this tag;
           # the root files whitelist still installs only git-dist + docs.
           git add -f core/dist server/dist svelte/dist app/dist git-dist package.json
