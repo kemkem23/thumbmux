@@ -10,7 +10,7 @@ import {
   killTmuxSession,
   spawnTmuxSession,
 } from "../src/bun-driver";
-import { createSpawnHandler } from "../src/spawn-handler";
+import { createSpawnHandler, SpawnHandlerError } from "../src/spawn-handler";
 
 let sequence = 0;
 const driver = createBunTmuxDriver();
@@ -155,6 +155,91 @@ describe("createSpawnHandler", () => {
     expect(spawnNames.length).toBe(2);
     expect(new Set(spawnNames).size).toBe(2);
     expect(body.name).toBe(spawnNames[1]);
+  });
+
+  test("rejects NUL command text before spawning a session", async () => {
+    let spawnCalls = 0;
+    const handle = createSpawnHandler({
+      driver: { listSessions: () => [] },
+      cwd: "/tmp",
+      spawn: (_name, _cwd, command) => {
+        spawnCalls += 1;
+        throw new Error(`command delivery failed: ${command}`);
+      },
+    });
+
+    const response = await handle(post({
+      command: "already exists\0x",
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "command must not contain NUL" });
+    expect(spawnCalls).toBe(0);
+  });
+
+  test("rejects NUL in a host preset command before spawning a session", async () => {
+    let spawnCalls = 0;
+    const preset = {
+      ...launchPreset("spawn-handler-nul-preset"),
+      baseCommand: "already exists\0x",
+    };
+    const handle = createSpawnHandler({
+      driver: { listSessions: () => [] },
+      cwd: "/tmp",
+      presets: [preset],
+      spawn: (_name, _cwd, command) => {
+        spawnCalls += 1;
+        throw new Error(`command delivery failed: ${command}`);
+      },
+    });
+
+    const response = await handle(post({ presetId: preset.id }));
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "launch preset command must not contain NUL" });
+    expect(spawnCalls).toBe(0);
+  });
+
+  test("does not retry arbitrary failures that merely mention an existing resource", async () => {
+    let spawnCalls = 0;
+    const message = "backend workspace already exists but session was created";
+    const handle = createSpawnHandler({
+      driver: { listSessions: () => [] },
+      cwd: "/tmp",
+      spawn: () => {
+        spawnCalls += 1;
+        throw new Error(message);
+      },
+    });
+
+    const response = await handle(post({ command: "printf must-not-run" }));
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: message });
+    expect(spawnCalls).toBe(1);
+  });
+
+  test("preserves SpawnHandlerError status when its message resembles a duplicate", async () => {
+    let prepareCalls = 0;
+    const handle = createSpawnHandler({
+      driver: { listSessions: () => [] },
+      cwd: "/tmp",
+      prepareWorktree: () => {
+        prepareCalls += 1;
+        throw new SpawnHandlerError(422, "worktree already exists");
+      },
+      cleanupWorktree: () => {},
+      spawn: () => { throw new Error("must not spawn"); },
+    });
+
+    const response = await handle(post({
+      command: "printf must-not-run",
+      worktree: true,
+    }));
+
+    expect(response.status).toBe(422);
+    expect(await response.json()).toEqual({ error: "worktree already exists" });
+    expect(prepareCalls).toBe(1);
   });
 
   test("rolls back a prepared worktree before retrying a late duplicate", async () => {

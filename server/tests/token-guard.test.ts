@@ -246,6 +246,22 @@ describe("createTokenGuard query and cookie bootstrap", () => {
       }),
     ).toThrow("invalid grant configuration");
   });
+
+  test("rejects explicitly empty credential channel names", () => {
+    expect(() =>
+      createTokenGuardWithClock({
+        grants: [],
+        queryParamName: "",
+      }),
+    ).toThrow("invalid queryParamName");
+
+    expect(() =>
+      createTokenGuardWithClock({
+        grants: [],
+        cookieName: "",
+      }),
+    ).toThrow("invalid cookieName");
+  });
 });
 
 describe("createTokenGuard token hygiene", () => {
@@ -529,12 +545,7 @@ describe("HTTP matrix with body/path context", () => {
         operation: "sessions-kill",
         session: "allowed-session",
       }),
-    ).toMatchObject({
-      ok: true,
-      status: 200,
-      operation: "sessions-kill",
-      session: "allowed-session",
-    });
+    ).toMatchObject({ ok: false, status: 403, code: "forbidden_session" });
     expect(
       guard.authorizeHttp(request, restricted, {
         operation: "sessions-kill",
@@ -593,11 +604,11 @@ describe("HTTP matrix with body/path context", () => {
     const guard = createTokenGuardWithClock({
       grants: [
         {
-          ...makeGrant("interactive", "kill-permission-added", 5000),
+          ...makeGrant("interactive", "kill-permission-added", 5000, ["agent"]),
           permissions: laterAdded,
         },
         {
-          ...makeGrant("interactive", "kill-permission-removed", 5000),
+          ...makeGrant("interactive", "kill-permission-removed", 5000, ["agent"]),
           permissions: laterRemoved,
         },
       ],

@@ -462,12 +462,15 @@ function tokenDigest(token: string): Buffer {
 
 export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
   const grants = options.grants ?? [];
-  const queryParamName = options.queryParamName || DEFAULT_QUERY_PARAM;
-  const cookieName = options.cookieName || DEFAULT_COOKIE_NAME;
+  const queryParamName = options.queryParamName ?? DEFAULT_QUERY_PARAM;
+  const cookieName = options.cookieName ?? DEFAULT_COOKIE_NAME;
   const now = options.now ?? Date.now;
   const redactionPlaceholder = options.redactionPlaceholder ?? DEFAULT_QUERY_COOKIE_SAFE;
 
-  if (!SAFE_COOKIE_NAME.test(cookieName) || !queryParamName || /[\r\n]/.test(queryParamName)) {
+  if (!queryParamName || /[\r\n]/.test(queryParamName)) {
+    throw new Error("token guard: invalid queryParamName");
+  }
+  if (!SAFE_COOKIE_NAME.test(cookieName)) {
     throw new Error("token guard: invalid cookieName");
   }
   if (!Array.isArray(grants) || grants.some((grant) => !isValidGrant(grant))) {
@@ -843,7 +846,14 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
       ) {
         return fail403("forbidden_scope");
       }
-      if (!isSessionAllowed(safePrincipal, context.session)) return fail403("forbidden_session");
+      // Destructive session mutation is fail-closed: unlike read/input
+      // operations, an omitted allowlist must not mean every session.
+      if (
+        safePrincipal.sessions === undefined
+        || !isSessionAllowed(safePrincipal, context.session)
+      ) {
+        return fail403("forbidden_session");
+      }
       return { ok: true, status: 200, operation, session: context.session };
     }
 

@@ -113,8 +113,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function isDuplicateSessionError(error: unknown): boolean {
-  return /duplicate session|already exists/i.test(errorMessage(error));
+function isDuplicateSessionError(error: unknown, reservedName: string): boolean {
+  return errorMessage(error).trim().toLowerCase()
+    === `duplicate session: ${reservedName}`.toLowerCase();
 }
 
 function parsePayload(value: unknown): SpawnPayload {
@@ -267,6 +268,14 @@ export function createSpawnHandler<
         command = buildLaunchCommand(preset, payload.permission, payload.model) || undefined;
         worktree = !!preset.worktree;
       }
+      if (command?.includes("\0")) {
+        throw new SpawnHandlerError(
+          preset ? 500 : 400,
+          preset
+            ? "launch preset command must not contain NUL"
+            : "command must not contain NUL",
+        );
+      }
 
       const rawCwd = typeof opts.cwd === "function"
         ? await opts.cwd(payload)
@@ -314,7 +323,10 @@ export function createSpawnHandler<
               cause: error,
             });
           }
-          if (!isDuplicateSessionError(error)) throw error;
+          // A hook's deliberate HTTP status always wins over text that merely
+          // resembles tmux's duplicate-session diagnostic.
+          if (error instanceof SpawnHandlerError) throw error;
+          if (!isDuplicateSessionError(error, reservedName)) throw error;
           if (!canAutoName) {
             throw new SpawnHandlerError(409, `tmux session already exists: ${reservedName}`);
           }
