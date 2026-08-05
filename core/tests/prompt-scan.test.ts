@@ -225,6 +225,34 @@ describe("terminal prompt extraction", () => {
       ])).toEqual([]);
     });
 
+    // The case above puts the status line directly under the marker, which is the
+    // shape the terminator guard was written against. Current Claude draws a rule
+    // between them, and the walk stops at that rule because a box-drawing character
+    // is a response terminator — so the guard reads the border instead of the
+    // chrome, and the block is admitted.
+    //
+    // Text the user typed but has not sent is not faint, so the faint check cannot
+    // help here. This is a real draft, and the only thing that distinguishes it
+    // from a submitted prompt is that nothing but composer chrome sits below it.
+    test("drops a typed-but-unsent draft separated from the status line by the composer border", () => {
+      expect(extractRecentPrompts([
+        "\x1b[39m❯ half-written thought",
+        "\x1b[38;5;244m────────────────────────────────\x1b[39m",
+        "  opus5·max|ctx:63%|5h-Wk 15%(4H)-96%(2D)                629719 tokens",
+        "  ⏵⏵ bypass permissions on · 1 shell",
+      ])).toEqual([]);
+    });
+
+    test("keeps a submitted prompt that has real output under it in the same pane", () => {
+      expect(extractRecentPrompts([
+        "\x1b[39m❯ actually submitted prompt",
+        "● Done in 4s",
+        "\x1b[39m❯ half-written thought",
+        "\x1b[38;5;244m────────────────\x1b[39m",
+        "  opus5·max|ctx:63%|5h-Wk 15%(4H)-96%(2D)                629719 tokens",
+      ])).toEqual(["actually submitted prompt"]);
+    });
+
     test("keeps bright 256-color prompts and does not misread color-index-2 as faint", () => {
       expect(extractRecentPrompts([
         "\x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231mReal bright prompt\x1b[39m",

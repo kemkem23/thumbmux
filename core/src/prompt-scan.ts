@@ -125,8 +125,14 @@ export function isCodexStatusLine(trimmed: string): boolean {
 }
 
 export function isClaudeStatusLine(trimmed: string): boolean {
-  return /\b(new task\?|\/clear to save|bypass permissions|opus|sonnet|haiku)\b/i.test(trimmed) &&
-    /\b(tokens|permissions|effort|5h|week)\b/i.test(trimmed);
+  // No trailing \b on the model names. Claude writes its version glued to the
+  // name — `opus5·max|ctx:63%`, `opus4.8·max` — and \b between `s` and `5` does
+  // not exist, so requiring one made this blind to the status line every current
+  // Claude pane ends with. That blindness is load-bearing: the composer-draft
+  // guard decides by asking whether the chrome is below a block, so a status line
+  // it cannot see is a draft it cannot reject.
+  return /\b(new task\?|\/clear to save|bypass permissions|opus|sonnet|haiku)/i.test(trimmed) &&
+    /\b(tokens|permissions|effort|5h|week|ctx:)/i.test(trimmed);
 }
 
 /**
@@ -242,8 +248,24 @@ function collectPrompts(lines: string[], start: number, matchers: PromptMatcherS
     // block terminated by the status line is the composer itself — its current
     // placeholder, or a stale empty-composer snapshot frozen in scrollback (which
     // can render plain, escaping the faint check above). Never a submitted prompt.
-    const terminator = i < lines.length
-      ? stripAnsi(lines[i] ?? "").replace(/\u00a0/g, " ").trim()
+    // The walk stops at whatever terminated the block, and for a composer that is
+    // the rule or box border drawn around it \u2014 a box-drawing character is itself a
+    // response terminator. Reading `lines[i]` therefore asks the border whether it
+    // is chrome, which it never is, and a draft the user typed but never sent is
+    // admitted. Step past rows that are nothing but box drawing or blank to reach
+    // the line that actually decides.
+    //
+    // Only a row made entirely of box drawing is skipped, so a response body that
+    // begins with a bar (grok's \u2503/\u2502 stream rails) still terminates the block: those
+    // rows carry text after the bar.
+    let decisive = i;
+    while (decisive < lines.length) {
+      const row = stripAnsi(lines[decisive] ?? "").replace(/\u00a0/g, " ").trim();
+      if (row !== "" && !/^[\u2500-\u257f\s]+$/.test(row)) break;
+      decisive++;
+    }
+    const terminator = decisive < lines.length
+      ? stripAnsi(lines[decisive] ?? "").replace(/\u00a0/g, " ").trim()
       : "";
     if (terminator && matchers.isStatusLine(terminator)) {
       continue;
