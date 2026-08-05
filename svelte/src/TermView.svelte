@@ -1337,8 +1337,11 @@
 
     if (line < 0 || total === 0) return;
     // Cancel any in-flight flick before snapping — otherwise momentum scrolls
-    // straight past the match we just centred.
+    // straight past the match we just centred. Stopping inertia removes the
+    // settle callback that would have flushed deferred live content, so flush
+    // here or the command's final output can stay invisible under the match.
     stopInertia();
+    flushPendingContent();
     bottomOffsetPx = searchJumpBottomOffset({ line, total, lineH, viewH });
     applyScroll();
   }
@@ -1374,18 +1377,36 @@
     ) {
       alignedPrefix++;
     }
-    if (alignedPrefix === alignedLimit) return alignedPrefix;
 
-    let alignedSuffix = 0;
-    while (
-      alignedPrefix + alignedSuffix < alignedLimit &&
-      previousLive[previousLive.length - 1 - alignedSuffix] ===
-        nextLive[nextLive.length - 1 - alignedSuffix]
-    ) {
-      alignedSuffix++;
+    let overlap: number;
+    if (alignedPrefix === alignedLimit) {
+      overlap = alignedPrefix;
+    } else {
+      let alignedSuffix = 0;
+      while (
+        alignedPrefix + alignedSuffix < alignedLimit &&
+        previousLive[previousLive.length - 1 - alignedSuffix] ===
+          nextLive[nextLive.length - 1 - alignedSuffix]
+      ) {
+        alignedSuffix++;
+      }
+      const inPlaceOverlap = alignedPrefix + alignedSuffix;
+      overlap = Math.max(inPlaceOverlap, findLineOverlap(previousLive, nextLive));
     }
-    const inPlaceOverlap = alignedPrefix + alignedSuffix;
-    return Math.max(inPlaceOverlap, findLineOverlap(previousLive, nextLive));
+
+    // Repetitive content can match on a full shorter-window overlap that does
+    // not prove continuity. Keep one row of churn when shrinking a repeated
+    // run so a real discard is still recorded in the retention gap.
+    if (
+      alignedLimit > 1 &&
+      previousLive.length > nextLive.length &&
+      overlap === alignedLimit &&
+      previousLive[previousLive.length - alignedLimit - 1] === nextLive[0]
+    ) {
+      overlap -= 1;
+    }
+
+    return overlap;
   }
 
   function setLines(
@@ -1393,13 +1414,16 @@
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
   ) {
+    const replaceRetainedRows = replace
+      ? replaceRetainedOverlapRows(liveLines, nextLive)
+      : 0;
     if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width. A resync can
       // replay the same cached content, so count only old rows not covered by
       // exact content continuity proven across both live windows.
       const discardedLiveRows = gapRowIndex >= 0 && gapRowCount > 0
-        ? liveLines.length - replaceRetainedOverlapRows(liveLines, nextLive)
+        ? liveLines.length - replaceRetainedRows
         : 0;
       liveLines = nextLive;
       if (discardedLiveRows > 0) {
@@ -1413,7 +1437,9 @@
       liveLines = nextLive;
     }
     commitLines([...archivedLines, ...liveLines], {
-      preserveReaderAnchor: !replace,
+      // A reset-tagged capture with a proven common prefix is still a live
+      // growth/shrink from the reader's point of view — keep their row.
+      preserveReaderAnchor: !replace || replaceRetainedRows > 0,
       source,
     });
   }
@@ -1539,13 +1565,20 @@
 
   /** Run history parsing and commit only in background time after scrolling
    * settles. The callback checks busy again because a new gesture may begin
-   * after the task was scheduled but before the browser invokes it. */
+   * after the task was scheduled but before the browser invokes it. Native
+   * selection also owns the mounted nodes — same deferral as live content. */
   function schedulePendingPrependWork() {
-    if (destroyed || busy() || pendingPrependWork === null || cancelPrependWorkTask) return;
+    if (
+      destroyed ||
+      busy() ||
+      selectionActive ||
+      pendingPrependWork === null ||
+      cancelPrependWorkTask
+    ) return;
 
     const run = () => {
       cancelPrependWorkTask = null;
-      if (destroyed || busy() || pendingPrependWork === null) return;
+      if (destroyed || busy() || selectionActive || pendingPrependWork === null) return;
       const work = pendingPrependWork;
       pendingPrependWork = null;
       work();
@@ -1963,7 +1996,12 @@
 
     const outsideWindow = startIdx < winStart - 1 || endIdx > winEnd;
     let windowCovered = true;
-    if (momentumWindowFrozen && busy() && outsideWindow) {
+    if (busy() && touching && outsideWindow) {
+      // Touch can outrun the fixed overscan corridor. Force a rebuild under the
+      // finger so the transform never paints blank space over unmounted rows.
+      // Unlike momentum, the gesture continues — window is covered after force.
+      rebuildWindow({ startIdx, endIdx }, true);
+    } else if (momentumWindowFrozen && busy() && outsideWindow) {
       // Geometry/content invalidated the projected corridor. End inertia and
       // rebuild at the true offset in this callback, before the browser can
       // paint an uncovered transform. The owner sees false and does not queue
@@ -2019,6 +2057,9 @@
   }
 
   function onWheel(e: WheelEvent) {
+    updateSelectionActive();
+    if (selectionActive) return;
+
     if (altScreenMouse) {
       forwardAltWheel(e);
       return;
@@ -2143,6 +2184,8 @@
     if (wasActive && !selectionActive) {
       const pendingJump = pendingSearchJumpLine;
       pendingSearchJumpLine = null;
+      // Selection blocked history prepend commits; re-arm idle work now.
+      schedulePendingPrependWork();
       schedulePendingContentFlush();
       if (pendingJump !== null) {
         scheduleDeferredFrame(() => jumpToSearchLine(pendingJump));
@@ -2160,6 +2203,17 @@
     );
   }
 
+  function abortTouchGesture() {
+    if (dragFrame !== null) {
+      cancelAnimationFrame(dragFrame);
+      dragFrame = null;
+    }
+    pendingDragPx = 0;
+    touching = false;
+    tapStart = null;
+    touchVel = 0;
+  }
+
   // --- gesture physics (px-true, no quantization, iOS decel curve) ---
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
@@ -2171,16 +2225,25 @@
       touching = false;
       altTouchMoved = false;
       const touch = e.touches.item(0);
-      altTouchY = e.touches.length === 1 && touch ? touch.clientY : null;
-      altTouchHitArea = altTouchY === null ? null : contentHitArea();
+      if (e.touches.length !== 1 || !touch) {
+        altTouchY = null;
+        altTouchHitArea = null;
+        return;
+      }
+      altTouchY = touch.clientY;
+      altTouchHitArea = contentHitArea();
       return;
     }
     stopInertia();
     if (momentumWindowFrozen) applyScroll();
+    const touch = e.touches.item(0);
+    // Multi-finger starts never establish a scroll gesture — leave touchY/At
+    // alone so a later move cannot compute dy from the zero sentinels.
+    if (e.touches.length !== 1 || !touch) return;
     touching = true;
     pendingDragPx = 0;
-    tapStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: performance.now() };
-    touchY = e.touches[0].clientY;
+    tapStart = { x: touch.clientX, y: touch.clientY, t: performance.now() };
+    touchY = touch.clientY;
     touchAt = performance.now();
     touchVel = 0;
   }
@@ -2226,9 +2289,18 @@
     if (selectionActive || !touching) {
       updateSelectionActive();
       if (selectionActive) return; // let iOS drag the selection handles
+      // Selection collapsed mid-move without an accepted touchstart — do not
+      // fall through into dy math against the zero/stale touchY/touchAt sentinels.
+      if (!touching) return;
+    }
+    if (e.touches.length !== 1) {
+      abortTouchGesture();
+      return;
     }
     e.preventDefault();
-    const y = e.touches[0].clientY;
+    const touch = e.touches.item(0);
+    if (!touch) return;
+    const y = touch.clientY;
     const dy = y - touchY;
     touchY = y;
     const now = performance.now();
@@ -2423,12 +2495,25 @@
       flushPendingContent();
       return;
     }
+    if (!touching) {
+      // Multi-touch abort or a start that never accepted this contact — drop
+      // any queued drag so a partial end cannot scroll from stale state.
+      abortTouchGesture();
+      return;
+    }
     if (e && e.changedTouches?.[0] && tapStart) {
       maybeTap(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
     }
     tapStart = null;
     if (selectionActive) {
       updateSelectionActive();
+      // Cancel the queued drag frame before it mutates the offset behind a
+      // selection the user still thinks is frozen.
+      if (dragFrame !== null) {
+        cancelAnimationFrame(dragFrame);
+        dragFrame = null;
+      }
+      pendingDragPx = 0;
       touching = false;
       flushPendingContent();
       return; // no momentum after a selection gesture
@@ -2623,6 +2708,20 @@
     // below covers layout-viewport changes that leave this box unchanged.
     void viewH;
     revalidateBottomInset();
+  });
+
+  // A5-2: bottomInsetPx is a geometry input but does not change the observed
+  // box size, so ResizeObserver never fires. Re-measure only when the prop
+  // itself changes — never call refreshGeometry() from the viewH effect
+  // (that loops via renderEpoch / lastPushedCols $state writes).
+  let lastBottomInsetPx: number | null = null;
+  $effect(() => {
+    const inset = bottomInsetPx;
+    warnInvalidBottomInset(inset);
+    if (lastBottomInsetPx !== null && lastBottomInsetPx !== inset) {
+      pushGeometry({ force: true });
+    }
+    lastBottomInsetPx = inset;
   });
 
   let lastClaimGeometry = $state<boolean | null>(null);

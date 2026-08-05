@@ -39,11 +39,14 @@ type ScrollState = { bottomOffset: number; scrolledUp: boolean };
 type TermViewOverrides = {
   altScreenMouse?: boolean;
   bottomInsetPx?: number;
+  claimGeometry?: boolean;
   onKeys?: (data: string) => void;
   onLinesChange?: (
     lines: string[],
     meta: { source: "live" | "prepend" | "replace" },
   ) => void;
+  onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
+  minRows?: number;
 };
 
 type MutableViewportLayout = {
@@ -855,6 +858,58 @@ describe("TermView bottomInsetPx development warnings", () => {
       expect(warn.mock.calls[0]?.map(String).join(" ")).toContain("bottomInsetPx=500");
     });
   });
+
+  // A5-2: bottomInsetPx alone does not fire ResizeObserver; row math must still
+  // re-measure so a staggered host update (box first, inset later) does not leave
+  // the pty short of visibleH + inset.
+  test("refreshes measured geometry when bottomInsetPx changes without resizing", () => {
+    const geometryCalls: Array<{ cols: number; rows: number }> = [];
+    const target = document.createElement("div");
+    target.style.cssText = "position:relative;width:320px;height:240px;";
+    document.body.appendChild(target);
+
+    const props = proxy({
+      session: SESSION,
+      palette,
+      claimGeometry: true,
+      fontPx: 13,
+      minRows: 1,
+      onGeometryChange: (geometry: { cols: number; rows: number }) => {
+        geometryCalls.push(geometry);
+      },
+      bottomInsetPx: 0,
+    });
+    let app: Record<string, unknown>;
+    flushSync(() => {
+      app = mount(TermView as Component, {
+        target,
+        props,
+      }) as Record<string, unknown>;
+    });
+    mounted.push({ app: app!, target });
+
+    const viewport = target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+    if (!viewport) throw new Error("TermView root not found");
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, get: () => 320 },
+      clientHeight: { configurable: true, get: () => 240 },
+    });
+
+    const resizeObserver = ControlledResizeObserver.latest;
+    if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+    resizeObserver.fire();
+    flushSync();
+
+    expect(geometryCalls.length).toBe(1);
+    const baseRows = geometryCalls[0]!.rows;
+
+    flushSync(() => { props.bottomInsetPx = 20; });
+    flushSync();
+
+    expect(geometryCalls).toHaveLength(2);
+    expect(geometryCalls[0]!.cols).toBe(geometryCalls[1]!.cols);
+    expect(geometryCalls[1]!.rows).toBe(baseRows + 1);
+  });
 });
 
 describe("TermView compositor scroll layout reads", () => {
@@ -1093,6 +1148,89 @@ describe("TermView compositor scroll diagnostics", () => {
     expect(scrollStates.some((state) => state.scrolledUp)).toBe(true);
     expect(scrollStates).toHaveLength(1);
   });
+
+  // A5-3: search navigation stopInertia must flush content deferred while
+  // momentum is still the busy source. Do not drain the fling to settle —
+  // settle would flush itself and hide the missing call. Open search and
+  // build matches while idle first so navigate reaches jumpToSearchLine.
+  test("flushes deferred content when search navigation cancels momentum", async () => {
+    const { viewport } = await prepareScrollableTermView();
+
+    viewport.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    const input = viewport.querySelector<HTMLInputElement>(
+      '[data-testid="term-search-input"]',
+    );
+    expect(input).not.toBeNull();
+    if (!input) throw new Error("terminal search input did not open");
+    input.value = "line-10";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    drainAnimationFrames();
+
+    const endY = startTouchFling(viewport, 320);
+    runAnimationFrameBatch();
+    releaseTouchFling(viewport, endY);
+    runAnimationFrameBatch();
+    // Momentum must still be scheduled; otherwise this is not the reported path.
+    expect(frameCallbacks.size).toBeGreaterThan(0);
+
+    const totalBefore = Number(viewport.getAttribute("data-total"));
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    deliverLiveAppend(239, 1);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore);
+
+    input.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore + 1);
+  });
+
+  // A5-5: wheel must not mutate the scroll model while a native selection is
+  // active — otherwise release teleports to a position the user never saw.
+  test("ignores wheel deltas while a native selection is active", async () => {
+    const { viewport } = await prepareScrollableTermView();
+    wheelTowardHistory(viewport, -200);
+
+    const beforeOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    const selection = window.getSelection();
+    if (!selection) throw new Error("window selection was unavailable");
+
+    const range = document.createRange();
+    range.selectNodeContents(viewport);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    // selectionchange is what TermView listens for
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+
+    viewport.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -400,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    drainAnimationFrames();
+
+    // Still selected: settled mirror stays put either way. Clear selection and
+    // require no teleport from a hidden model mutation.
+    selection.removeAllRanges();
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+    drainAnimationFrames();
+
+    expect(Number(viewport.getAttribute("data-bottom-offset"))).toBe(beforeOffset);
+  });
 });
 
 describe("TermView momentum virtual window", () => {
@@ -1177,6 +1315,63 @@ describe("TermView momentum virtual window", () => {
     expect(compositorBottomOffset(viewport)).toBe(settledOffset);
     expectMountedLinesCover(viewport, mountedLineKeys(viewport), settledOffset);
   });
+
+  // A5-8: a long touch drag can leave the fixed overscan corridor; rebuild
+  // while the finger is still down so the transform never paints blank rows.
+  test("rebuilds the rendered corridor when a touch gesture leaves it", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    const beforeDrag = compositorBottomOffset(viewport);
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 80 }]));
+    frameNow += 16;
+    // Drag far past OVERSCAN_ROWS in one frame so the virtual window cannot
+    // cover the new visible range without a forced rebuild mid-gesture.
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 80 + 2_000 }]));
+    runAnimationFrameBatch();
+
+    const afterDrag = compositorBottomOffset(viewport);
+    expect(afterDrag).toBeGreaterThan(beforeDrag);
+    const keys = mountedLineKeys(viewport);
+    expectMountedLinesCover(viewport, keys, afterDrag);
+  });
+
+  // A5-4: multi-touch after a single-finger start must not apply the pending
+  // single-finger drag distance (or a second-contact dy) as a real scroll.
+  test("drops stale touch drag distance on a multi-touch transition", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 2_000);
+    wheelTowardHistory(viewport, -200);
+    const beforeOffset = compositorBottomOffset(viewport);
+
+    // Control: a clean single-finger drag does move the compositor.
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 80 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 200 }]));
+    runAnimationFrameBatch();
+    const afterSingleDrag = compositorBottomOffset(viewport);
+    expect(afterSingleDrag).toBeGreaterThan(beforeOffset);
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 200 }]),
+    );
+    runAnimationFrameBatch();
+    drainAnimationFrames();
+
+    const baseline = compositorBottomOffset(viewport);
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 80 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 200 }]));
+    // Second contact before the drag frame flushes — abort, do not apply dy.
+    viewport.dispatchEvent(touchEvent("touchmove", [
+      { clientX: 40, clientY: 200 },
+      { clientX: 120, clientY: 160 },
+    ]));
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 200 }]),
+    );
+    runAnimationFrameBatch();
+    drainAnimationFrames();
+
+    expect(compositorBottomOffset(viewport)).toBe(baseline);
+  });
 });
 
 describe("TermView history prepend scheduling", () => {
@@ -1254,6 +1449,43 @@ describe("TermView history prepend scheduling", () => {
     expect(Number(viewport.getAttribute("data-archive-offset"))).toBe(
       baselineArchiveOffset - historyLines.length,
     );
+  });
+
+  // A5-7: history prepend must not rebuild mounted DOM while a native selection
+  // owns those nodes (same deferral policy as live content / search).
+  test("defers history prepend commits while a selection is active", async () => {
+    const { viewport } = await prepareScrollableTermView(undefined, 240);
+    wheelTowardHistory(viewport, -1_000_000);
+    const totalBefore = Number(viewport.getAttribute("data-total"));
+    expect(historyRequestCount).toBeGreaterThan(0);
+
+    const selection = window.getSelection();
+    if (!selection) throw new Error("window selection was unavailable");
+    const range = document.createRange();
+    range.selectNodeContents(viewport);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+
+    const onPrepend = jest.fn();
+    viewport.addEventListener("thumbmux-history-prepend", onPrepend);
+
+    deliverHistory(["\u001b[31mdeferred-older-1", "\u001b[32mdeferred-older-2"]);
+    runAnimationFrameBatch();
+    drainScheduledWork();
+
+    expect(onPrepend).not.toHaveBeenCalled();
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore);
+
+    selection.removeAllRanges();
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+    // Idle task armed on selection release; drain both idle and rAF paths.
+    drainScheduledWork();
+
+    expect(onPrepend).toHaveBeenCalledTimes(1);
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore + 2);
   });
 });
 
@@ -1417,6 +1649,88 @@ describe("TermView retained history budgets", () => {
     expect(lineChangeCalls).toBe(callsBefore);
     expect(Number(markerAfter?.getAttribute("data-line-id"))).toBe(markerLineId);
     expect(Number(markerAfter?.getAttribute("data-gap-rows"))).toBe(gapRowsBefore);
+  }, 120_000);
+
+  // A5-6: replace=true with a stable common prefix must still shift the reader
+  // anchor so the same physical row stays under the finger.
+  test("preserves the reader anchor when replace keeps a stable prefix", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -200);
+    const beforeOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      [...retainedLines, "replacement-tail-line"].join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    const afterOffset = Number(viewport.getAttribute("data-bottom-offset"));
+    expect(afterOffset - beforeOffset).toBeCloseTo(lineHeight, 5);
+  }, 120_000);
+
+  // A5-9 (replace path): full-window identical overlap must not claim every
+  // shortened row as "already retained" — keep one row of churn so gap math
+  // still records a real discard when a repetitive live window shrinks.
+  test("keeps at least one churn row when an identical capture shortens by one", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 10_000, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1_000_000);
+
+    deliverLiveAppend(9_999, 400);
+    flushSync();
+    drainScheduledWork();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    wheelTowardHistory(viewport, 70 * lineHeight);
+    const markerBefore = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerBefore).not.toBeNull();
+
+    const markerLineId = Number(markerBefore?.getAttribute("data-line-id"));
+    const gapRowsBefore = Number(markerBefore?.getAttribute("data-gap-rows"));
+    const archiveOffset = Number(viewport.getAttribute("data-archive-offset"));
+    const markerIndex = markerLineId - archiveOffset;
+    const oldTail = retainedLines.slice(markerIndex);
+    expect(oldTail.length).toBeGreaterThan(1);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      Array.from({ length: oldTail.length }, () => "repetitive-row").join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    const markerAfterNormalize = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerAfterNormalize).not.toBeNull();
+    const gapRowsAfterNormalize = Number(markerAfterNormalize?.getAttribute("data-gap-rows"));
+
+    sessionCallback(
+      Array.from({ length: oldTail.length - 1 }, () => "repetitive-row").join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    const markerAfter = viewport.querySelector<HTMLElement>(".mtv-gap");
+    expect(markerAfter).not.toBeNull();
+    const gapRowsAfter = Number(markerAfter?.getAttribute("data-gap-rows"));
+    expect(gapRowsAfter - gapRowsAfterNormalize).toBe(2);
+    // silence unused - marker identity is the gap seam, not re-asserted here
+    expect(gapRowsBefore).toBeGreaterThanOrEqual(0);
   }, 120_000);
 
   test("counts only rows absent after a suffix-overlap replace", async () => {
@@ -1766,7 +2080,10 @@ describe("TermView retained history budgets", () => {
     expect(buildAttr).not.toBeNull();
     const buildsBeforeTouch = Number(buildAttr);
 
-    const endY = startTouchFling(viewport, 1_600);
+    // A short drag stays inside the overscan corridor: no mid-gesture rebuild.
+    // (A long drag that leaves the corridor is free to force-rebuild — A5-8 —
+    // so this pin must use a travel that does not exit the window.)
+    const endY = startTouchFling(viewport, 80);
     runAnimationFrameBatch();
     expect(Number(viewport.getAttribute("data-render-cache-builds"))).toBe(buildsBeforeTouch);
 
