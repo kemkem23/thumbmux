@@ -28,11 +28,30 @@ import type { AppAdapters, SessionActionContext } from '../src/config';
 
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 
+class ControlledResizeObserver implements ResizeObserver {
+  static latest: ControlledResizeObserver | null = null;
+
+  constructor(private readonly callback: ResizeObserverCallback) {
+    ControlledResizeObserver.latest = this;
+  }
+
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+
+  fire(): void {
+    this.callback([], this);
+  }
+}
+
 const mounted: Mounted[] = [];
 let originalConnected = false;
 let originalSubscribe: PropertyDescriptor | undefined;
 let originalOnSessions: PropertyDescriptor | undefined;
 let originalSendKeys: PropertyDescriptor | undefined;
+let originalSendResize: PropertyDescriptor | undefined;
+let originalResizeObserver: PropertyDescriptor | undefined;
+let originalWindowResizeObserver: PropertyDescriptor | undefined;
 const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
 
 const SELF_INVALIDATING_MARKERS = [
@@ -229,6 +248,9 @@ beforeEach(() => {
   originalSubscribe = Object.getOwnPropertyDescriptor(tmuxMux, 'subscribe');
   originalOnSessions = Object.getOwnPropertyDescriptor(tmuxMux, 'onSessions');
   originalSendKeys = Object.getOwnPropertyDescriptor(tmuxMux, 'sendKeys');
+  originalSendResize = Object.getOwnPropertyDescriptor(tmuxMux, 'sendResize');
+  originalResizeObserver = Object.getOwnPropertyDescriptor(globalThis, 'ResizeObserver');
+  originalWindowResizeObserver = Object.getOwnPropertyDescriptor(window, 'ResizeObserver');
   tmuxMux.connected = false;
   tmuxMux.subscribe = (() => () => {}) as typeof tmuxMux.subscribe;
   tmuxMux.onSessions = ((callback: (rows: unknown[]) => void) => {
@@ -252,6 +274,9 @@ afterEach(() => {
   restoreProperty(tmuxMux, 'subscribe', originalSubscribe);
   restoreProperty(tmuxMux, 'onSessions', originalOnSessions);
   restoreProperty(tmuxMux, 'sendKeys', originalSendKeys);
+  restoreProperty(tmuxMux, 'sendResize', originalSendResize);
+  restoreProperty(globalThis, 'ResizeObserver', originalResizeObserver);
+  restoreProperty(window, 'ResizeObserver', originalWindowResizeObserver);
   restoreProperty(globalThis, 'fetch', originalFetch);
   document.body.replaceChildren();
 });
@@ -302,6 +327,75 @@ describe('mountable terminal views', () => {
     expect(embed.target.querySelectorAll('[data-testid="hud-expand"]')).toHaveLength(0);
     expect(embed.target.querySelectorAll('.fab')).toHaveLength(0);
     expect(embed.target.querySelectorAll('[data-testid="shortcuts-sheet"]')).toHaveLength(0);
+  });
+
+  test('EmbedView omitted claimGeometry stays non-owning even when termProps requests geometry', async () => {
+    ControlledResizeObserver.latest = null;
+    globalThis.ResizeObserver = ControlledResizeObserver;
+    window.ResizeObserver = ControlledResizeObserver;
+
+    const resizeFrames: Array<{ session: string; cols: number; rows: number }> = [];
+    tmuxMux.sendResize = ((session: string, cols: number, rows: number) => {
+      resizeFrames.push({ session, cols, rows });
+    }) as typeof tmuxMux.sendResize;
+
+    const session = 'sh-embed-default-geometry';
+    const { target } = mountView(EmbedView, {
+      session,
+      adapters: {
+        termProps: () => ({ claimGeometry: true }),
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('EmbedView did not render TermView');
+    Object.defineProperties(terminal, {
+      clientWidth: { configurable: true, value: 640 },
+      clientHeight: { configurable: true, value: 320 },
+    });
+    const observer = ControlledResizeObserver.latest;
+    if (!observer) throw new Error('TermView did not observe its viewport');
+    observer.fire();
+    await tick();
+
+    expect(resizeFrames.filter((frame) => frame.session === session)).toHaveLength(0);
+  });
+
+  test('EmbedView direct claimGeometry owns geometry even when termProps declines it', async () => {
+    ControlledResizeObserver.latest = null;
+    globalThis.ResizeObserver = ControlledResizeObserver;
+    window.ResizeObserver = ControlledResizeObserver;
+
+    const resizeFrames: Array<{ session: string; cols: number; rows: number }> = [];
+    tmuxMux.sendResize = ((session: string, cols: number, rows: number) => {
+      resizeFrames.push({ session, cols, rows });
+    }) as typeof tmuxMux.sendResize;
+
+    const session = 'sh-embed-owned-geometry';
+    const { target } = mountView(EmbedView, {
+      session,
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+      } satisfies AppAdapters,
+      claimGeometry: true,
+    });
+    await tick();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('EmbedView did not render TermView');
+    Object.defineProperties(terminal, {
+      clientWidth: { configurable: true, value: 640 },
+      clientHeight: { configurable: true, value: 320 },
+    });
+    const observer = ControlledResizeObserver.latest;
+    if (!observer) throw new Error('TermView did not observe its viewport');
+    observer.fire();
+    await tick();
+
+    const ownedFrames = resizeFrames.filter((frame) => frame.session === session);
+    expect(ownedFrames.length).toBeGreaterThan(0);
+    expect(ownedFrames.every((frame) => frame.cols > 0 && frame.rows > 0)).toBe(true);
   });
 
   test('sessionMeta gets the host mux and millisecond timestamps, exactly as the hub does', async () => {

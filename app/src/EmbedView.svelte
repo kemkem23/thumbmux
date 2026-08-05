@@ -19,11 +19,13 @@
     adapters,
     fontPx = undefined,
     minRows = 14,
+    claimGeometry = false,
   }: {
     session: string;
     adapters: AppAdapters;
     fontPx?: number;
     minRows?: number;
+    claimGeometry?: boolean;
   } = $props();
 
   let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
@@ -138,7 +140,7 @@
           {palette}
           fontPx={effectiveFontPx}
           {minRows}
-          claimGeometry={false}
+          {claimGeometry}
           altScreenMouse={configuredTermProps.altScreenMouse ?? false}
           bottomInsetPx={dockFull + kbInset}
           onKeys={sendKeys}

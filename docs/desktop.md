@@ -308,8 +308,12 @@ Multiple viewers:
 - The server arbitrates simultaneous resize requests. Clients must not depend
   on last-writer-wins behavior.
 - Client contract: set `claimGeometry=true` only for a visible, interactive,
-  primary terminal surface. Thumbnails, popovers, embeds, background tabs, and
-  duplicate viewers of the same session use `claimGeometry=false`.
+  primary terminal surface. Thumbnails, popovers, secondary or duplicate
+  embeds, background tabs, and duplicate viewers of the same session use
+  `claimGeometry=false`.
+- `EmbedView` defaults its direct `claimGeometry` prop to `false` and does not
+  inherit `termProps.claimGeometry`. Pass `claimGeometry={true}` only when that
+  contained embed is the one visible, interactive, primary geometry owner.
 - When a terminal becomes hidden or disabled, it stops claiming. When it
   becomes visible again, it may force one re-claim if `claimGeometry=true`.
 
