@@ -257,6 +257,26 @@ afterEach(() => {
 });
 
 describe('mountable terminal views', () => {
+  // `termProps` returns a Partial, so `() => ({ palette: maybePalette })` with an
+  // `AnsiPalette | undefined` in hand is type-correct and is what a host with a
+  // conditional theme actually writes. Spreading that over the defaults copies the
+  // explicit undefined and erases the fallback, and TermView declares palette as
+  // required and reads it unguarded — so the view dies at mount with no diagnostic
+  // pointing anywhere near the adapter. EmbedView resolves the same value with ??
+  // and has always been fine; both are asserted so the two cannot drift apart again.
+  test('an explicitly undefined termProps value falls back instead of erasing the default', async () => {
+    for (const [label, view] of [['SessionView', SessionView], ['EmbedView', EmbedView]] as const) {
+      const mounted = mountView(view, {
+        session: `sh-undefined-${label.toLowerCase()}`,
+        adapters: {
+          termProps: () => ({ palette: undefined, fontPx: undefined, claimGeometry: undefined }),
+        } satisfies AppAdapters,
+      });
+      await tick();
+      expect(mounted.target.querySelectorAll('[data-testid="mtv"]'), label).toHaveLength(1);
+    }
+  });
+
   test('SessionView and EmbedView mount real package UI with the expected chrome', async () => {
     const session = mountView(SessionView, {
       session: 'sh-session-mount',

@@ -68,13 +68,19 @@
   let configuredBg = $derived(adapters.theme?.bgFor?.(session) ?? localBg);
   let fallbackSurface = $derived(defaultSurface(configuredBg));
   let surface = $derived(hostSurface ?? fallbackSurface);
+  // Spread last would let an explicit `undefined` from the adapter overwrite the
+  // default beside it — object spread copies a key whose value is undefined, unlike
+  // a key that is simply absent. `termProps` returns a Partial, so
+  // `() => ({ palette: maybePalette })` is type-correct and reaches a required
+  // TermView prop as undefined. Resolve each known key with ?? instead, which is
+  // what EmbedView has always done; the spread stays first so unknown keys a host
+  // passes through still arrive.
   let resolvedTermProps = $derived({
-    claimGeometry: true,
-    altScreenMouse: false,
-    palette: fallbackSurface.palette,
-    fontPx: storedFontPx,
     ...configuredTermProps,
-    ...(hostSurface ? { palette: hostSurface.palette } : {}),
+    claimGeometry: configuredTermProps.claimGeometry ?? true,
+    altScreenMouse: configuredTermProps.altScreenMouse ?? false,
+    palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
+    fontPx: configuredTermProps.fontPx ?? storedFontPx,
   });
   let themeMode = $derived(
     adapters.theme?.mode?.() ?? (luminance(surface.tbg) > 0.55 ? 'light' : 'dark'),
