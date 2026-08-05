@@ -415,10 +415,23 @@ below, so a host that uses it does not assemble authorization by hand:
   ```
 
   A host driving a raw WebSocket reads the frame directly and needs none of this.
-- filters the session list on **every** path that emits one — the initial push,
-  subsequent pushes, drain catch-up, and the HTTP list — with the guard's
-  projection applied last, so a host hook can neither see rows the principal may
-  not have nor widen what it returns
+- applies the guard's projection to the session list on **every** path that emits
+  one — the initial push, subsequent pushes, drain catch-up, and the HTTP list
+- runs the host's `filterSessionList` hook on the **socket paths only**, between
+  two guard projections, so a host hook can neither see rows the principal may not
+  have nor widen what it returns.
+
+  It does **not** run on `GET {basePath}/sessions`. The hook's signature takes the
+  `WS` it is filtering for, and an HTTP request has no socket to pass; calling it
+  with a fabricated one would hand hosts that key off socket identity a lie. The
+  consequence is load-bearing and is stated here rather than left to be discovered:
+  **a host hook that hides rows from a socket does not hide them from the HTTP
+  list.** Any policy that must hold on both belongs in the grant — scopes and
+  per-grant `sessions` are enforced by the guard, which does run on every path.
+
+  Closing this properly needs a session-list hook that is not socket-scoped. That
+  is an API addition, so it waits for a minor release rather than being smuggled
+  into a patch.
 - maps each HTTP route to a named operation (`sessions-list`, `sessions-spawn`,
   `upload`, `prefs-read`, `prefs-write`, `sessions-kill`) and authorizes before
   the handler runs, answering `405` with `Allow` on the wrong method
