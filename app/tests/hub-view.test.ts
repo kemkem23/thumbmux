@@ -509,4 +509,106 @@ describe('HubView', () => {
     });
     expect(opened).toEqual(['default-spawn-result']);
   });
+
+  // A7-3: contexts() is async but the launcher stays usable with contexts=[].
+  // A custom spawn.launch then receives null (contract: "no contexts") while
+  // the host-supplied list is still in flight. HubView marks the sheet busy
+  // for that window so Launch cannot fire with null.
+  test('does not launch while contexts are still loading for custom spawn', async () => {
+    let resolveContexts!: (value: Array<{ id: string; label: string }>) => void;
+    const contexts = new Promise<Array<{ id: string; label: string }>>((resolve) => {
+      resolveContexts = resolve;
+    });
+    const launches: Array<{ spec: LaunchSpec; contextId: string | null }> = [];
+    const adapters: AppAdapters = {
+      fetchSessions: async () => [],
+      routes: {
+        openSession: () => {},
+        showHub: () => {},
+      },
+      spawn: {
+        presets: [preset],
+        contexts: async () => contexts,
+        launch: (spec, contextId) => {
+          launches.push({ spec, contextId });
+          return Promise.resolve({ name: 'launched-session' });
+        },
+      },
+    };
+
+    const { target } = mountHub({ adapters });
+    await settleUi();
+    click(target, '[data-testid="grid-new"]');
+    // Sheet is busy while contexts load — presets/go stay disabled, so a
+    // click must not reach the custom launch callback with null.
+    expect(button(target, '[data-testid="launch-preset"][data-preset="worker"]').disabled).toBe(true);
+    click(target, '[data-testid="launch-preset"][data-preset="worker"]');
+    expect(launches).toHaveLength(0);
+    expect(target.querySelector('[data-testid="launch-sheet"]')).toBeTruthy();
+
+    resolveContexts([{ id: 'workspace-a', label: 'Workspace A' }]);
+    await settleUi();
+
+    // After settle the sheet is interactive again; pick preset + context and launch.
+    click(target, '[data-testid="launch-preset"][data-preset="worker"]');
+    const context = target.querySelector<HTMLSelectElement>('[data-testid="launch-context"]');
+    if (!context) throw new Error('context picker did not render after contexts loaded');
+    const nativeQuerySelector = context.querySelector.bind(context);
+    Object.defineProperty(context, 'querySelector', {
+      configurable: true,
+      value: (selector: string) => selector === ':checked'
+        ? context.options.item(context.selectedIndex)
+        : nativeQuerySelector(selector),
+    });
+    try {
+      flushSync(() => {
+        context.value = 'workspace-a';
+        context.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    } finally {
+      delete (context as HTMLSelectElement & { querySelector?: unknown }).querySelector;
+    }
+
+    click(target, '[data-testid="launch-go"]');
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.contextId).toBe('workspace-a');
+  });
+
+  // A7-5: default spawn boundary coerces non-string names with String(...),
+  // turning {malformed:true} into "[object Object]" and navigating there.
+  test('rejects malformed session names returned by default launch endpoints', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, init });
+      if ((init?.method ?? 'GET') === 'POST') {
+        return Response.json({ name: { malformed: true } });
+      }
+      return Response.json([]);
+    }) as typeof fetch;
+    const opened: string[] = [];
+    const { target } = mountHub({
+      adapters: {
+        fetchSessions: async () => [],
+        routes: {
+          openSession: (name) => opened.push(name),
+          showHub: () => {},
+        },
+        spawn: { presets: [preset] },
+      },
+    });
+    await settleUi();
+
+    click(target, '[data-testid="grid-new"]');
+    click(target, '[data-testid="launch-preset"][data-preset="worker"]');
+    click(target, '[data-testid="launch-go"]');
+    await settleUi();
+
+    expect(opened).toHaveLength(0);
+    expect(target.querySelector('[data-testid="launch-sheet"]')).toBeTruthy();
+    const spawnCall = calls.find((call) => call.init?.method === 'POST');
+    expect(spawnCall).toBeTruthy();
+    expect(target.querySelector('[data-testid="launch-sheet"] .err')?.textContent?.trim())
+      .toContain('spawn response did not include a session name');
+  });
 });

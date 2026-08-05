@@ -376,6 +376,9 @@
     if (moved && termRef && !termRef.isScrolledUp()) hasNewContent = false;
   }
 
+  // Shared generation for note load and note save so a late load cannot
+  // overwrite a save that began (or finished) after that load started.
+  // Session-change invalidates both by bumping the same counter.
   let noteSaveRequest = 0;
   async function saveNote(text: string): Promise<void> {
     const noteAdapter = adapters.notes;
@@ -392,6 +395,20 @@
       if (request === noteSaveRequest && targetSession === session) noteSaving = false;
     }
   }
+
+  // Upload completion is fenced the same way: epoch advances on session
+  // change; arming records the epoch at the moment UploadAction goes busy
+  // (upload start). A completion whose arm does not match is from a prior
+  // session and must not prefill the current composer.
+  let uploadEpoch = 0;
+  let armedUploadEpoch = -1;
+  $effect(() => {
+    session;
+    uploadEpoch += 1;
+  });
+  $effect(() => {
+    if (uploading) armedUploadEpoch = uploadEpoch;
+  });
 
   let promptRequest = 0;
   async function loadPrompts(): Promise<void> {
@@ -508,12 +525,20 @@
     const noteAdapter = adapters.notes;
     const requestedSession = session;
     const request = ++noteRequest;
-    noteSaveRequest += 1;
+    // Capture the save generation at load start. saveNote and a later session
+    // switch both bump noteSaveRequest, so a stale load cannot land after them.
+    const loadGeneration = ++noteSaveRequest;
     note = '';
     noteSaving = false;
     if (!noteAdapter) return;
     void noteAdapter.load(requestedSession).then((loaded) => {
-      if (request === noteRequest && requestedSession === session) note = loaded;
+      if (
+        request === noteRequest
+        && requestedSession === session
+        && loadGeneration === noteSaveRequest
+      ) {
+        note = loaded;
+      }
     }).catch(() => {});
     return () => { noteRequest += 1; };
   });
@@ -733,9 +758,13 @@
       endpoint={uploadEndpoint}
       dir={uploadDir}
       onUploaded={(message, files) => {
+        if (armedUploadEpoch !== uploadEpoch) return;
         prefillComposer(adapters.upload?.formatPrefill?.(files, uploadDir) ?? message);
       }}
-      onError={(message) => { prefillOnError(composer, labels.uploadFailed(message)); }}
+      onError={(message) => {
+        if (armedUploadEpoch !== uploadEpoch) return;
+        prefillOnError(composer, labels.uploadFailed(message));
+      }}
     />
   {/if}
 

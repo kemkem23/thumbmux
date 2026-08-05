@@ -14,6 +14,11 @@ import type {
 } from '@thumbmux/core';
 import { submitPlan } from '@thumbmux/core';
 import type { Component } from 'svelte';
+// Svelte 5 mount() tracks prop updates only when the props bag is a reactive
+// proxy — plain object mutation is a no-op and $set is a removed legacy stub.
+// Tests that switch the live session prop use this so the same instance stays
+// mounted while async work from the prior session can still resolve.
+import { proxy as reactiveProps } from 'svelte/internal/client';
 import { tmuxMux } from '@thumbmux/svelte';
 import {
   flushSync,
@@ -1283,5 +1288,110 @@ describe('mountable terminal views', () => {
     const textarea = composer?.querySelector<HTMLTextAreaElement>('textarea');
     expect(composer?.classList.contains('open')).toBe(true);
     expect(textarea?.value).toBe('session-files:stored-note.txt');
+  });
+
+  // A7-2: UploadAction completion has no session/generation fence. A pending
+  // upload started in session A can resolve after the host navigates to session
+  // B and write A's paths into B's composer (and run formatPrefill against B).
+  test('does not apply upload completion from a prior session after switching the mounted session', async () => {
+    let resolveUpload!: (response: Response) => void;
+    const storedFiles = [{ original: 'staged.txt', stored: 'staged-upload.txt' }];
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: (() => new Promise<Response>((resolve) => {
+        resolveUpload = resolve;
+      })) as typeof fetch,
+    });
+
+    const props = reactiveProps({
+      session: 'sh-upload-race-before',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        upload: {
+          endpoint: (name: string) => `/upload/${name}`,
+          formatPrefill: () => 'A-prior-session-upload',
+        },
+      } satisfies AppAdapters,
+    });
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    let app!: Record<string, unknown>;
+    flushSync(() => {
+      app = mount(SessionView as Component, { target, props }) as Record<string, unknown>;
+    });
+    mounted.push({ app, target });
+    await tick();
+
+    const input = target.querySelector<HTMLInputElement>('[data-testid="upload-input"]');
+    if (!input?.files) throw new Error('SessionView did not render UploadAction');
+    (input.files as unknown as File[]).push(new File(['payload'], 'payload.txt'));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await flushPromises();
+
+    flushSync(() => {
+      props.session = 'sh-upload-race-after';
+    });
+    await tick();
+
+    resolveUpload(Response.json({ files: storedFiles }, { status: 201 }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await flushPromises();
+    await tick();
+
+    const composer = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    const textarea = composer?.querySelector<HTMLTextAreaElement>('textarea');
+    expect(composer?.classList.contains('open')).toBe(false);
+    expect(textarea?.value).toBe('');
+  });
+
+  // A7-4: note load generation is independent of save generation. A slow initial
+  // load can resolve after a successful save and replace the committed note.
+  test('does not let a late note load overwrite a newer successful save in the same session', async () => {
+    let resolveLoad!: (value: string) => void;
+    const noteLoad = new Promise<string>((resolve) => {
+      resolveLoad = resolve;
+    });
+    const { target } = mountView(SessionView, {
+      session: 'sh-note-load-race',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        notes: {
+          load: async () => noteLoad,
+          save: async (_session, _text) => {},
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const expand = target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render the HUD toggle');
+    flushSync(() => expand.click());
+    await tick();
+
+    const edit = target.querySelector<HTMLButtonElement>('[data-testid="note-edit"]');
+    if (!edit) throw new Error('SessionView did not render note edit');
+    flushSync(() => edit.click());
+    await tick();
+
+    const draft = target.querySelector<HTMLTextAreaElement>('[data-testid="note-draft"]');
+    if (!draft) throw new Error('SessionView did not render the note draft');
+    flushSync(() => {
+      draft.value = 'new note';
+      draft.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const save = target.querySelector<HTMLButtonElement>('[data-testid="note-save"]');
+    if (!save) throw new Error('SessionView did not render note save');
+    flushSync(() => save.click());
+    await flushPromises();
+
+    resolveLoad('old note');
+    await flushPromises();
+    await tick();
+
+    const noteText = target.querySelector<HTMLElement>('[data-testid="note-text"]');
+    if (!noteText) throw new Error('SessionView did not render note text');
+    expect(noteText.textContent).toBe('new note');
   });
 });

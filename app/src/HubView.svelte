@@ -31,6 +31,10 @@
   let launching = $state(false);
   let launchError = $state<string | null>(null);
   let contexts = $state<LaunchContext[]>([]);
+  // True only while a host-supplied contexts() promise is in flight. Distinct
+  // from "contexts is empty" — empty after settle means the host has no
+  // workspaces (null is correct); empty while loading must not launch yet.
+  let contextsLoading = $state(false);
   let viewActive = false;
 
   let labels = $derived({ ...DEFAULT_APP_LABELS, ...adapters.labels });
@@ -88,9 +92,12 @@
     });
     const data: unknown = await response.json().catch(() => null);
     if (!response.ok) throw new Error(responseError(data, `HTTP ${response.status}`));
-    const name = data && typeof data === 'object' && 'name' in data
-      ? String((data as { name?: unknown }).name ?? '').trim()
-      : '';
+    // Reject non-string names instead of coercing via String(...) — a malformed
+    // payload like { name: { malformed: true } } must not become "[object Object]".
+    const rawName = data && typeof data === 'object' && 'name' in data
+      ? (data as { name?: unknown }).name
+      : undefined;
+    const name = typeof rawName === 'string' ? rawName.trim() : '';
     if (!name) throw new Error('spawn response did not include a session name');
     return { name };
   }
@@ -114,6 +121,9 @@
 
   async function launch(spec: LaunchSpec, contextId: string | null): Promise<void> {
     if (launching) return;
+    // Host supplied contexts() but it has not settled — null would mean
+    // "no contexts" per the contract, which is wrong while still loading.
+    if (adapters.spawn?.contexts && adapters.spawn.launch && contextsLoading) return;
     launching = true;
     launchError = null;
     try {
@@ -121,7 +131,7 @@
         ? await adapters.spawn.launch(spec, contextId)
         : await launchDefault(basePath, spec);
       if (!viewActive) return;
-      const name = String(result.name ?? '').trim();
+      const name = typeof result.name === 'string' ? result.name.trim() : '';
       if (!name) throw new Error('launcher did not return a session name');
       launchOpen = false;
       openSession(name);
@@ -145,12 +155,19 @@
     });
 
     if (adapters.spawn?.contexts && adapters.spawn.launch) {
+      contextsLoading = true;
       void adapters.spawn.contexts().then(
         (nextContexts) => {
-          if (active) contexts = nextContexts;
+          if (active) {
+            contexts = nextContexts;
+            contextsLoading = false;
+          }
         },
         () => {
-          if (active) contexts = [];
+          if (active) {
+            contexts = [];
+            contextsLoading = false;
+          }
         },
       );
     }
@@ -196,7 +213,7 @@
     {presets}
     {contexts}
     showCommand={hubPresentation?.showCommand}
-    busy={launching}
+    busy={launching || contextsLoading}
     error={launchError}
     onLaunch={launch}
     onClose={closeLauncher}
