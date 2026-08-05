@@ -108,6 +108,12 @@
     "tier": "X"
   },
   {
+    "name": "contrastRatio",
+    "kind": "value",
+    "signature": "c6fa0a91f703b0274a0190707069ecfa24c15938cc837429f081ccc33f0eba3a",
+    "tier": "X"
+  },
+  {
     "name": "createMuxDeltaFrame",
     "kind": "value",
     "signature": "567cb0c82a485a8064e224c51c34233e27fd6bad91f62cefe2f1beff35d97d07",
@@ -390,6 +396,12 @@
     "tier": "F"
   },
   {
+    "name": "MuxPongFrame",
+    "kind": "type",
+    "signature": "1aa4511668a2efe45def4628dc87bd910dd16af9659dd7455fa88797674a8611",
+    "tier": "S"
+  },
+  {
     "name": "muxPrefixHash",
     "kind": "value",
     "signature": "a095de06716f6ff436f2bc61580a8df9cb432cf7580ea74e5fa509d4d3330302",
@@ -404,20 +416,32 @@
   {
     "name": "MuxServerFrame",
     "kind": "type",
-    "signature": "6994738cd7106bbe764621c2de8ba4e3dee74a0408c594decee15de895c0b5b7",
+    "signature": "505d0ad0b1644fb339560e4ee1907ce472775ff411e637f2b9327b9e456dad44",
     "tier": "S"
   },
   {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "391d0b900c47671287fe820a5d48e7fc5546162b3755f056d6feca3fb0bb860f",
+    "signature": "ada9787a0f58320733a535ca8d1ee87d3963fdbbceb90d50c4474ca0bb12f715",
     "tier": "F"
+  },
+  {
+    "name": "MuxStrictClientMessage",
+    "kind": "type",
+    "signature": "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7",
+    "tier": "S"
   },
   {
     "name": "normalizeAgentNotificationEvent",
     "kind": "value",
     "signature": "db15cc28c1c80056c126b4c9bad5b9df82c47214e48e98fc610e3b3fd6a6236f",
     "tier": "F"
+  },
+  {
+    "name": "normalizeHexColor",
+    "kind": "value",
+    "signature": "3f2170d942fd01299fb07791fb608f7e9a2706f2e78b7c97bc7f6d1b7fc02e9d",
+    "tier": "X"
   },
   {
     "name": "paneTextForCopy",

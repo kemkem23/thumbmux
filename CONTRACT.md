@@ -38,8 +38,28 @@ that declarations cannot express.
 
 An exact published `vX.Y.Z-dist` tag identifies an immutable consumer artifact.
 Minor releases may make only the tier-specific changes described below, and
-patch releases may not be used to bypass a tier's minor-release ceremony. The
-distribution rail and the manifest diff make both decisions reviewable.
+patch releases may not be used to bypass a tier's **deprecation** ceremony — an
+alias may not be dropped, an F name may not be narrowed, and a D default may not
+change, in a patch. The distribution rail and the manifest diff make both
+decisions reviewable.
+
+**Additive changes may ride a patch on this line.** An addition that every
+existing consumer ignores — a new optional prop, a new optional interface
+member, a new exported name — is permitted in a patch release, provided the
+frozen consumers still compile and run against the built artifact and the
+manifest entry is added intentionally. This is stated because the alternative
+was already false: v0.8.2 added `AppAdapters.sendSubmissionKeys` and v0.8.3
+added `hubPresentation` and `sessionPresentation`, both optional, both in patch
+releases, while this document said patches could not carry them. A policy the
+releases do not follow protects nobody; it only makes the gate's verdict
+ambiguous when it fires.
+
+What a patch still may not do is exactly what makes a change breaking: remove or
+rename an existing name, change the signature of an existing member, narrow a
+type consumers already construct, or demote a tier. Those remain minor-boundary
+work with the full ceremony, and the surface gate plus the frozen consumers are
+what tell the two apart — a declaration hash changing is the gate asking for a
+decision, not evidence of a break.
 
 ### The gate to 1.0
 

@@ -8,13 +8,13 @@
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "a72d3fd998c2d9b7a0bf29b261f89b524b3f001158523757c4c242ce96eb1f35",
+    "signature": "bd351265349fbccee37f7cf3dd75998e8599ad59ce98fe312adc1d1ad8e41cbd",
     "tier": "S"
   },
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "75d0ec3ac17231495e7d7fb359fbcfe369e4a4a2204478d6ed809803cdd969ea",
+    "signature": "37668fd89f19fac9dff3932c330321b4ec32c0198d78eaf7e34cf02fb05cc664",
     "tier": "S"
   },
   {

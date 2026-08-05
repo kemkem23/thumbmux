@@ -108,15 +108,15 @@
     "tier": "F"
   },
   {
-    "name": "contentLinesChangeSource",
-    "kind": "value",
-    "signature": "e25a6915170749b17983c0a4775eb1fadd2372080c9793920912cfa4c9c446bc",
-    "tier": "X"
-  },
-  {
     "name": "ContentLinesChangeSource",
     "kind": "type",
     "signature": "dcd3817fec8f8751cf4c89edbea683b6b77f9699155811049626f884e55f22cf",
+    "tier": "X"
+  },
+  {
+    "name": "contentLinesChangeSource",
+    "kind": "value",
+    "signature": "e25a6915170749b17983c0a4775eb1fadd2372080c9793920912cfa4c9c446bc",
     "tier": "X"
   },
   {
@@ -344,7 +344,7 @@
   {
     "name": "NotePanel",
     "kind": "component",
-    "signature": "3f40b3e6f3c298def933506d359e6e9010d8954818a4447579f4348c62d87ff7",
+    "signature": "5fee64824a8bf6508aa8a382da468ce3afb8b93eb0ebda228dd4cb22988c2a8c",
     "tier": "F"
   },
   {
@@ -660,16 +660,16 @@
     "tier": "X"
   },
   {
-    "name": "searchKeyIntent",
-    "kind": "value",
-    "signature": "0535791c9d3ce4495797d58c77367157ec5b64cedc988df24f4450ca81386c9a",
-    "tier": "S"
-  },
-  {
     "name": "SearchKeyIntent",
     "kind": "type",
     "signature": "56e145ee22924f0fe4d2be914be052a79341977f99bcad5b727ce6fa3224d065",
     "tier": "X"
+  },
+  {
+    "name": "searchKeyIntent",
+    "kind": "value",
+    "signature": "0535791c9d3ce4495797d58c77367157ec5b64cedc988df24f4450ca81386c9a",
+    "tier": "S"
   },
   {
     "name": "SearchKeyScope",
@@ -786,15 +786,15 @@
     "tier": "F"
   },
   {
-    "name": "tmuxMux",
+    "name": "TmuxMux",
     "kind": "value",
-    "signature": "587723da723d760c8865dee1928d95c2514d9dcab0d2b8ecc65f28b8b62462bd",
+    "signature": "f51c63dd581f91e8a366f6710116d1d4c91687622bbc1d90cc05c94a9249e1be",
     "tier": "F"
   },
   {
-    "name": "TmuxMux",
+    "name": "tmuxMux",
     "kind": "value",
-    "signature": "ac42ca240c4658fd119ecae1752ce10a0756f26cc1ed137395b3007251b27400",
+    "signature": "7c31ac83c8f6d7b16801a26b2dec0b91d02043302791eb356ec4ca067901439b",
     "tier": "F"
   },
   {
