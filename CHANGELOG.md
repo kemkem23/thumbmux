@@ -1,7 +1,85 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.9.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.9.2-dist`.
+
+## v0.9.2 — 2026-08-05
+
+The release after an adversarial audit. Ten lanes read the 0.9.1 tree and
+returned 122 findings; every one was triaged, and the ones that survived a
+failing test were fixed. Two optional additions close seams that consumers could
+not work around, and both default to today's behaviour.
+
+**Security.** A host-supplied palette entry was interpolated into `style="..."`
+on rendered spans with no validation that it was a colour. `safeCssColor` now
+accepts only `#rgb`, `#rrggbb` and `#rrggbbaa`, so a crafted palette cannot
+close the attribute and inject markup.
+
+### Added
+
+- `EmbedView` takes a direct `claimGeometry?: boolean` prop, default `false`. It
+  deliberately does not inherit `termProps.claimGeometry` — a contained embed
+  that owns pane size must say so explicitly. Omitting it is unchanged.
+- `AppRoutesOptions.projectSessionList` — a transport-neutral session-list
+  projection that runs on the HTTP list *and* the socket paths. It takes no
+  socket, which is why it composes into both; `MuxHooks.filterSessionList` is
+  unchanged and stays socket-only. The guard's own projection still runs last on
+  every path, so a projection that returns rows outside its input has them
+  stripped rather than leaked, and both transports fail closed if it throws.
+  This closes the gap v0.9.1 documented instead of fixing.
+
+### Fixed
+
+- **Terminal columns are cells, not UTF-16 offsets.** Link start/end columns
+  went through `utf16ToCellOffset` (CJK 2 cells, combining marks 0), so a link
+  after Thai, CJK or emoji text is hittable where it is drawn. The URL grammar
+  also stopped truncating balanced parentheses and IPv6 hosts, and a hard
+  newline near the pane edge is no longer glued to the preceding URL.
+- **`ComposerDock` never checked `isComposing`.** IME preedit state and
+  candidate-selection keys leaked into the pane — invisible to any ASCII
+  keystroke test.
+- **`submitPlan` left `\r` inside its text step**, so a prompt containing a line
+  terminator submitted early and then again on the planned delayed Enter. Line
+  terminators are now quarantined in bracketed paste; single-line text is
+  byte-identical.
+- **Kill authorization matches the README.** A grant that omitted `sessions` was
+  implicitly allowed to kill any session, while the documented rule requires an
+  allowlist containing the exact session.
+- **Mux ordering.** A journal delete could wipe a session re-created mid-await;
+  poll and pipe captures bypassed the per-session queue so an older capture
+  could overwrite a newer one; a failed full-history bootstrap was consumed as
+  success and reported as "Session not found"; `maxBlockedMs` had no timer and
+  could retain a peer indefinitely.
+- **Promises outliving their caller.** An upload begun in one session prefilled
+  another's composer; a late note load overwrote a newer successful save; the
+  launcher could call a host's `spawn.launch` with `null` while contexts were
+  still loading.
+- **Compositor state read after its owner moved on** — wheel deltas applied
+  under a live selection, stale touch-drag distance across a multi-touch
+  transition, history prepends committing during a selection, the reader anchor
+  dropped on a replace that kept a stable prefix, and geometry not remeasured
+  when `bottomInsetPx` changes without a resize.
+- **`initialScanLines: 0` looped forever**, hanging the caller synchronously.
+
+### Fixed — the checks that could not fail
+
+- `THUMBMUX_SKIP_E2E=1` took a warning branch and returned success, so the
+  parity gate could pass while skipping the stage it exists for.
+- The contract gate compared the current manifest against itself, so an
+  immutable removal, an F-tier signature change, an F demotion and a patch-level
+  drift all reported no error. `materialize-contract-baseline.ts` gives it an
+  immutable prior contract, which is what makes it capable of failing.
+- The release workflow accepted any `vX.Y.Z`-shaped ref without comparing it to
+  the five package manifests. `check-release-version.ts` now checks the tag
+  against every manifest version and every declared `@thumbmux/*` range.
+
+### Documentation
+
+Seven documents described code that did something else, and the prose was
+narrowed to what the code guarantees rather than the reverse: `ping` carries a
+`client` descriptor the protocol table never listed, `output` frames are not
+sent only on a hash change, and reflow follows the mounted view only while that
+view owns geometry and the server accepts the resize.
 
 ## v0.9.1 — 2026-08-03
 
