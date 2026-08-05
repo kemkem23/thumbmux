@@ -5,7 +5,8 @@ This contract documents `AgentNotificationEvent` as a pure validation and normal
 
 ## 1) Exact payload shape
 
-`AgentNotificationEvent` is an object with **exactly eight fields**:
+`AgentNotificationEvent` always includes four required fields and up to four optional
+fields:
 
 - `id` (`string`, required)
 - `session` (`string`, required)
@@ -16,7 +17,8 @@ This contract documents `AgentNotificationEvent` as a pure validation and normal
 - `url` (`string`, optional)
 - `tag` (`string`, optional)
 
-The core rejects non-object input and any object with non-string keys, missing required keys, or any field outside this set.
+The core rejects non-object input, non-string keys, missing required keys, and
+any field outside this required-plus-optional set.
 
 Use the public `validateAgentNotificationEvent` export from `thumbmux/core` at
 the host boundary. It returns the normalized `AgentNotificationEvent` or throws

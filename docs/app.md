@@ -148,7 +148,8 @@ omitting an entire nested block.
 | `basePath` | `"/api"`. The shell trims it, adds a leading slash, removes trailing slashes, and treats `""` or `"/"` as the root. It changes only the default sessions and spawn HTTP calls, not the WebSocket, upload, or preferences URLs. | `basePath: "/terminal-api"` |
 | `fetchSessions` | Calls `GET {basePath}/sessions`. A custom function replaces only that bootstrap; authoritative session-list WebSocket pushes still update the store and win a race with an older HTTP response. A failed bootstrap ends the loading state with the current rows. | `fetchSessions: async () => fetch("/host/sessions").then(readSessions)` |
 | `mux` | The shared `tmuxMux`. This seam supplies only authoritative session-list pushes to `HubView` and `SessionView`; `EmbedView` does not read it. An override does not replace the fallback HUD connection state, default key transport, or the pane output, history, resize, and connection observation inside `TermView`. Those remain on the shared singleton. | `mux: tmuxMux` |
-| `sendKeys` | Calls `sendKeys` on the shared `tmuxMux`. Both direct keys and the steps produced by composer submission use this transport. Supply this adapter to replace input independently; changing `mux` changes only live session rows and does not redirect keys or `TermView`. | `sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys)` |
+| `sendKeys` | Calls `sendKeys` on the shared `tmuxMux`. Both direct keys and the steps produced by composer submission use this transport by default. Supply this adapter to replace input independently; changing `mux` changes only live session rows and does not redirect keys or `TermView`. | `sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys)` |
+| `sendSubmissionKeys` | Optional transport for composer-submission steps (`submitPlan` output). If present, the shell awaits each step before the next one and uses this path instead of `sendKeys` for composer submissions only. | `sendSubmissionKeys: (session, keys) => void` |
 | `submitAgent` | Returns `"generic"`. The value is passed to `submitPlan`; the shell never infers an agent kind from the session name. | `submitAgent: () => "generic"` |
 | `routes` | In `ThumbmuxApp`, omission selects the internal `?session=` adapter. Standalone `HubView` and `SessionView` should receive host routes; their limited fallbacks are not a two-page router. | `routes: { openSession, showHub }` |
 | `routes.openSession` | No external callback by default. `HubView` invokes it with the exact selected name when routes are supplied. | `openSession: (name) => void goto("/terminals/" + encodeURIComponent(name))` |
@@ -156,7 +157,9 @@ omitting an entire nested block.
 | `spawn` | Omission keeps the launcher enabled with stock presets and the default HTTP launch. The block configures launcher policy; it is not an enable flag. | `spawn: { presets, contexts, launch }` |
 | `spawn.presets` | `DEFAULT_LAUNCH_PRESETS`. Passing `[]` makes the sheet empty but does not remove the new-terminal card. | `presets: DEFAULT_LAUNCH_PRESETS` |
 | `spawn.contexts` | No contexts and no workspace picker. It is loaded only when a custom `spawn.launch` also exists; rejection becomes an empty list. | `contexts: async () => [{ id: "default", label: "Default workspace" }]` |
-| `spawn.launch` | `POST {basePath}/spawn` with the `LaunchSpec` only and requires a JSON object containing a nonblank string `name`. A custom function receives `(spec, contextId)` and must return the same `{ name }` shape. Failure leaves the sheet open and shows the error. | `launch: async (spec, contextId) => postLaunch(spec, contextId)` |
+| `spawn.launch` | `POST {basePath}/spawn` with the `LaunchSpec` only. A custom function receives `(spec, contextId)` and must return `{ name }`. The shell applies `String(name)` before closing the launcher, so strict-name enforcement belongs in your launch endpoint (not just adapter typing). A launch failure leaves the sheet open and shows the error. | `launch: async (spec, contextId) => postLaunch(spec, contextId)` |
+| `hubPresentation` | Optional hub-only presentation controls (filter chips, grouping, ordering, and whether command text is shown). A supplied object only changes stock `HubView` visuals; it does not gate launch, notes, uploads, or sessions policy. | `hubPresentation: { showCommand: true, groupable: true, order: "name" }` |
+| `sessionPresentation` | Optional session-only presentation controls. `actions` receives shell `SessionActionContext` and default action list; return your preferred list composition. `showShortcutBar` can hide the shortcut tile row but does not touch other stages. | `sessionPresentation: { showShortcutBar: false }` |
 
 Here is a complete implementation of the examples that use ordinary HTTP and
 the shared mux:
@@ -230,13 +233,14 @@ fields.
 | `prompts` | No prompt load and no `PromptsPanel`. There is no automatic pane scanner in the app shell. With an adapter, loading begins when the HUD expands. | `prompts: (session) => fetchJson("/host/prompts/" + encodeURIComponent(session))` |
 | `upload` | No upload action, hidden file input, or composer file-paste handler. Supplying the block enables those only for sessions whose endpoint is a non-empty string. | `upload: { endpoint, dir, formatPrefill }` |
 | `upload.endpoint` | Required inside `upload`. Return `null` to intentionally hide upload UI for a session; an empty string is also treated as hidden. `basePath` does not fill this field. | `endpoint: (session) => "/terminal-api/upload?session=" + encodeURIComponent(session)` |
+| `upload.onUnavailable` | Still called when paste files are submitted while `endpoint(session)` is `null` and can route to `ActionContext`-driven fallback behavior (`prefill`, message, local upload UX, etc.). | `onUnavailable: (session, files, context) => context.prefill("Save these files as notes")` |
 | `upload.dir` | `"uploads"`. Without `formatPrefill`, `UploadAction` uses the upload response's `dir`, falling back to this value, when it builds the composer message. | `dir: "/srv/app/uploads"` |
 | `upload.formatPrefill` | Absent, the shell uses the message built by `UploadAction`. Present, it replaces that prefill and receives `(files, configuredDir)`; the second argument is `upload.dir` or `"uploads"`, not the response's `dir`. | `formatPrefill: (files, dir) => "Review " + files.length + " file(s) in " + dir` |
 | `prefs` | `createLocalPrefs(theme.storageKey ?? "thumbmux-app-prefs")`. Omitting it does not hide theme, font, or shortcut controls; it stores them locally. | `prefs: createServerPrefs({ url: "/terminal-api/prefs" })` |
 | `termProps` | Returns no overrides. `SessionView` starts with geometry claims on, alt-screen mouse off, font size 13 (then preferences), and a palette derived from the background. | `termProps: () => ({ claimGeometry: true, altScreenMouse: false, fontPx: 14 })` |
 | `termProps().claimGeometry` | `true` in `SessionView`. `EmbedView` always forces `false`, even if the adapter returns `true`. | `claimGeometry: false` for a secondary full view. |
 | `termProps().altScreenMouse` | `false`. Enable only for a session whose full-screen application expects SGR mouse input. | `altScreenMouse: session === "monitor"` |
-| `termProps().palette` | The palette derived from the active background. A non-null `theme.surfaceFor` palette takes precedence. | `palette: defaultSurface("#101014").palette` |
+| `termProps().palette` | The palette preference is derived from `theme.surfaceFor(session).palette` first (when present), then the background fallback. A `theme.surfaceFor`-derived palette may still be preserved when `termProps` omits or returns `undefined`. | `palette: defaultSurface("#101014").palette` |
 | `termProps().fontPx` | The stored font size, initially 13. The explicit `EmbedView` `fontPx` prop takes precedence over this adapter value. | `fontPx: 14` |
 
 The following helpers make the notes, prompts, upload, and preferences examples
@@ -297,7 +301,7 @@ supply the read functions and callbacks as one coherent adapter.
 | `theme.swatches` | The stock dark, black, blue, orange, light, and gray swatches. | `swatches: ["#101014", "#f5f0e8"]` |
 | `theme.storageKey` | `"thumbmux-app-prefs"` when the shell creates its local preferences adapter. It does not affect a supplied `prefs`. | `storageKey: "terminal-shell-prefs"` |
 | `theme.bgFor` | Falls back to the current local/default background. Returning `null` selects that fallback. | `bgFor: (session) => backgrounds[session] ?? null` |
-| `theme.mode` | Derives `"light"` or `"dark"` from the current surface luminance. | `mode: () => mode` |
+| `theme.mode` | In `SessionView`, omitted callbacks fall back to surface luminance; in `HubView`, omitted callbacks are still host-owned and default to `false` (light-mode token contrast on the dark shell default), so host policy must pass it explicitly when hub contrast depends on a callback. | `mode: () => mode` |
 | `theme.surfaceFor` | Derives a full surface with `defaultSurface(bgFor(session))`. Returning `null` keeps that fallback. A returned surface, including its palette, wins over `termProps().palette`. | `surfaceFor: (session) => defaultSurface(backgrounds[session] ?? "#101014")` |
 | `theme.onToggleMode` | With no `theme` block the shell updates local state. With a block but no callback, the visible toggle is a no-op. | `onToggleMode: (next) => { mode = next; }` |
 | `theme.onPick` | With no `theme` block the shell stores the selected background. With a block but no callback, swatch selection is a no-op. | `onPick: (session, hex) => { backgrounds[session] = hex; }` |
@@ -352,11 +356,10 @@ to `localStorage` when no `prefs` adapter is supplied — so a bare `ThumbmuxApp
 mount can already edit its composer presets, with no wiring. Three supported
 choices take that away, and none of them announces it:
 
-1. **`sessionPresentation.actions` replaces the FAB list; it does not extend it.**
-   The `defaults` argument exists so you can keep what you want, but the return
-   value is the whole list. A host that builds its own array — even a reasonable
-   one — drops the `shortcuts` action, and with it the only way to open the editor.
-   To add to the FAB rather than rebuild it, use `extraActions`, or spread:
+1. **`sessionPresentation.actions` is final unless you include the `defaults` argument.**
+   The callback receives existing stock+extra actions and must choose whether to
+   keep or replace them; when this callback returns a custom list, that is the
+   final FAB. To preserve stock actions, spread them:
    `actions: (session, ctx, defaults) => [...defaults, mine]`.
 2. **`sessionPresentation.showShortcutBar: false`** hides the bar. The editor is
    still reachable from the FAB, so the presets remain editable but invisible until
@@ -371,8 +374,9 @@ concluding the package omits the feature.
 | Field | Default and omission behavior | Concrete implementation example |
 | --- | --- | --- |
 | `extraActions` | Adds nothing. Returned actions are appended after the stock actions, and the shell closes the FAB before invoking one. | `extraActions: (session, context) => [{ id: "help", label: "Help", onTap: () => context.prefill("Help with " + session) }]` |
-| `SessionActionContext.submit` | Available only inside `extraActions`; it uses the shell's agent-aware `submitPlan` path. | `onTap: () => context.submit("status")` |
-| `SessionActionContext.prefill` | Available only inside `extraActions`; it opens the composer with editable text and does not send it. | `onTap: () => context.prefill("Explain the last command")` |
+| `SessionActionContext.submit` | Available inside `sessionPresentation.actions` and `extraActions`; it uses the shell's agent-aware `submitPlan` path. | `onTap: () => context.submit("status")` |
+| `SessionActionContext.prefill` | Available inside `sessionPresentation.actions` and `extraActions`; it opens the composer with editable text and does not send it. | `onTap: () => context.prefill("Explain the last command")` |
+| `SessionActionContext.copyAll` | Available in `sessionPresentation.actions` and paste-unavailable upload fallback callbacks. It returns `Promise<boolean>` and indicates whether terminal copy succeeded. | `onTap: () => void context.copyAll().then((ok) => ok || context.prefill("copy failed"))` |
 | `extraPanel` | Renders nothing. A supplied `Snippet<[string]>` is appended to the expanded HUD panel and receives the session name. | `{#snippet extraPanel(session)}...{/snippet}` |
 | `extraSheets` | Renders nothing. A supplied `Snippet<[string]>` is rendered at the end of the session stage and receives the session name. The host owns its styling and open state. | `{#snippet extraSheets(session)}...{/snippet}` |
 | `extraDismissables` | Behaves as `() => false`. This is a command: close one host overlay and return `true`; do not use it to query state. A `true` result consumes that stage/FAB interaction. | `extraDismissables: () => { if (!helpOpen) return false; helpOpen = false; return true; }` |

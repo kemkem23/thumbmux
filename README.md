@@ -330,8 +330,10 @@ reassemble those layers, but it still owns these integration points:
   spawn endpoint and `DELETE {basePath}/sessions/:name` kill route by default;
   both must be treated as privileged operations. The stock shell has no kill
   action. Constrain cwd, names, commands, and worktree hooks, then either disable
-  the kill route or add a control. With a guard, killing also requires
-  `sessions-kill` permission and an allowlist containing the exact session.
+  the kill route or add a control. With a guard, the principal must have
+  `sessions-kill`; the same route can still target any non-empty session when
+  their grant does not restrict `sessions`, and no host-supplied allowlist can be
+  interpreted when it is omitted.
 - **Host data and multi-user persistence.** The route assembler can enable
   upload and single-document preferences handlers, while the shell can use
   local preferences. The host still chooses durable storage and supplies
@@ -339,8 +341,10 @@ reassemble those layers, but it still owns these integration points:
   any application-specific metadata.
 - **Recording storage and routes.** `FrameJournal`, `parseReplayJournal()`, and
   `RecordingPlayer` provide recording, replay, and playback building blocks, and
-  `MuxHooks.onOutput` taps the canonical full frame after each capture so the
-  host does not have to poll a second time. The host still decides what to
+  `MuxHooks.onOutput` usually taps the canonical full frame when content or
+  cursor-relevant state changes, so the host does not have to poll a second time
+  to learn those changes. In cursor-only or unchanged-content states, the hook may
+  emit only a cursor update.
   record, owns the journal's storage, and supplies the start/stop/download
   routes and the player's data loading; see
   [the recording contract](docs/recording.md).
@@ -440,10 +444,10 @@ type SpawnPayload = {
 
 When `presetId` is present, it must exist in the handler's `presets` (the stock
 presets are the default). The handler calls `buildLaunchCommand(preset,
-permission, model)` and ignores submitted command text, so the server-side
-preset is authoritative. Custom presets should be supplied to both
-`LaunchSheet` and the handler. For the demo-compatible compact form, omit
-`presetId` and post the already-built command:
+permission, model)` and uses `preset.worktree` as the effective worktree flag; a
+submitted `worktree` field is ignored in that path. Custom presets should be
+supplied to both `LaunchSheet` and the handler. For the demo-compatible compact
+form, omit `presetId` and post the already-built command:
 
 ```ts
 body: JSON.stringify({ command: spec.command, worktree: spec.worktree })
@@ -541,8 +545,9 @@ const mux = new TmuxWsMux({
 
 For backpressure that stays enabled, `maxBlockedMs` (default 30 seconds) and
 `maxBufferedBytes` (default 8 MiB, when buffered-byte reporting is available)
-are the controls for shedding a chronically slow peer instead of retaining it
-indefinitely.
+control slow-peer shedding. The implementation evaluates blocked durations when it
+attempts to send again (for output, list, or resume checks), so a peer can remain
+in a blocked state longer than `maxBlockedMs` if no subsequent send path runs it.
 
 **Client** — a compact terminal page. `submitPlan()` separates pasted text
 from Enter because agent TUIs can swallow an Enter sent in the same tick. Set
@@ -710,7 +715,7 @@ evidence for the published tiers, not a claim of 1.0 compatibility.
 - [x] prefs/upload data-loss paths fixed and previously untested components covered
 - [x] `smoke:git-dist` checks source-derived core/server export parity for consumers
 
-**v0.8.0 — assembled host surface (current checkout)**
+**v0.9.x — current checkout**
 - [x] Mountable `ThumbmuxApp` plus hub, session, and embed views under `thumbmux/app`
 - [x] `createAppRoutes()` composition for the matching HTTP and WebSocket surface
 - [x] Four-subpath contract gate plus three separate frozen consumer fixtures

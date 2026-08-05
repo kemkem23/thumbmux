@@ -9,12 +9,11 @@ session's live tail.
 ## Session-list fields and ownership
 
 Two types, and the distinction is the point.
-[`SessionListRow`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is the **minimum the protocol
-requires** — `{ name: string }`, no index signature — and it is the generic
-constraint on `TmuxDriver`, `setSessionListProvider()` and
-`MuxHooks.filterSessionList`. [`SessionListItem`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is
-the **full tmux row** the bundled `createBunTmuxDriver()` produces, and it stays
-the default type parameter, so existing code compiles unchanged.
+[`SessionListRow`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is the
+**minimum protocol requirement** — `{ name: string }`, no index signature — and it is the generic
+constraint on `TmuxDriver`, `setSessionListProvider()`, and `MuxHooks.filterSessionList`.
+[`SessionListItem`](https://github.com/kemkem23/thumbmux/blob/v0.7.1-dist/git-dist/core/protocol.d.ts) is
+the **richer** row shape produced by the default bundled driver for host metadata.
 
 A host with its own source of truth returns whatever it actually knows. It does
 **not** have to invent `created` or `windows` to satisfy a type — no component
@@ -98,8 +97,9 @@ host uses another endpoint.
 ```
 
 The cast is currently necessary because `tmuxMux.onSessions()` exposes its
-callback rows as `any[]`; the server-side wire contract is
-`SessionListItem[]`. The `activityAt > 0` guard keeps the pre-sample sentinel
+callback rows as `any[]`; the wire contract is `SessionListRow[]`, while `SessionListItem`
+casts are used when your source includes richer host metadata. The `activityAt > 0`
+guard keeps the pre-sample sentinel
 out of the 1970 date range. The mapped time drives `order="recent"`; the grid
 still omits its visible state row and timestamp until the host supplies a
 `state`. `onOpen` should route to the selected terminal, and `onNew` should open

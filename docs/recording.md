@@ -119,12 +119,15 @@ The concrete runtime seam is:
 2. `recoverSession(session)` for restart/recover paths that need persisted base/metadata.
 3. `capture(session, fullOutputFrame, at?)` for each host-provided output snapshot.
 4. `flushSession(session)` for per-session durability guarantees.
-5. `stopSession(session)` disables future captures for that session and waits for in-flight admitted writes (file retained).
+5. `stopSession(session)` disables future captures for that session and waits for in-flight admitted writes (file retained). If no active in-memory session exists yet, it is a no-op and a later `capture(session, ...)` can recreate state from a fresh base.
 6. `closeSession(session)` stops accepting, drains the queue, and drops **in-memory** state only. The durable journal file is **not** deleted and its bytes still count toward the aggregate root quota. A later `capture` for the same name starts a fresh in-memory session that appends to the same file beginning with a full frame.
 7. `deleteSessionJournal(session)` stops accepting, flushes, deletes the durable `*.ndjson` file, releases root-quota accounting, and drops in-memory state. Requires `storage.remove`. Returns `false` when the file is already absent.
 8. `stop()` disables all sessions globally, flushes every queue, and clears in-memory handles (files retained until deleted).
 
-`capture` writes in the background and is nonblocking by design; it returns a boolean admission result immediately (`false` when stopped, not accepting, over a size cap, or saturated on `maxPendingWrites`).
+`capture` writes in the background and is nonblocking by design; it returns a
+boolean admission result immediately (`false` when stopped, not accepting, or
+saturated on `maxPendingWrites`). Size checks and write durability can still fail
+after a provisional `true` on the async persist path.
 
 ## Capture behavior and order
 
@@ -161,8 +164,11 @@ The concrete runtime seam is:
 ## Recovery and rejected records
 
 - Recovery parses NDJSON by complete lines only.
-- A final unterminated line (no trailing newline) is ignored.
-- Any complete malformed JSON line, wrong key set, invalid record shape, bad delta candidate, time disorder, first-line delta, session/channel mismatch, or strict-size/cadence violation rejects recovery.
+- A final unterminated line (no trailing newline) is repaired by truncating when
+  storage supports that rollback path; otherwise recovery fails and the session is
+  marked non-accepting.
+- Any complete malformed JSON line, wrong key set, invalid record shape, bad delta
+  candidate, time disorder, first-line delta, session/channel mismatch, or strict-size/cadence violation rejects recovery.
 - On recover failure, the session is marked not accepting, further captures are rejected, and error reporting is injected.
 - Missing file is treated as an empty session.
 
@@ -196,8 +202,11 @@ The concrete runtime seam is:
 - `flushSession(session)` resolves when that session’s queued work is drained.
 - `flushAll()` (used by stop) resolves when all active sessions’ queues drain.
 - `stopSession(session)` disables future captures for that session and waits for in-flight admitted writes.
+- If no in-memory state exists yet, this is a no-op and does not create a stop
+  tombstone.
 - `closeSession(session)` is the memory-release counterpart: drain + drop the
-  handle without deleting the file (root quota unchanged).
+  handle without deleting the file (root quota unchanged). If `session` was not
+  in memory, this still returns immediately.
 - `deleteSessionJournal(session)` is the disk-release counterpart: drain +
   delete file + free root quota.
 - `stop()` disables all sessions globally and then flushes every queue.
@@ -216,6 +225,8 @@ The concrete runtime seam is:
   (`DEFAULT_MAX_ROOT_BYTES`); set `Infinity` to disable. Hitting the root cap
   reports `phase: "limit"` without sticky-stopping other sessions that may
   free space later (only `deleteSessionJournal` reclaims root quota for a
-  closed file).
+  closed file). Startup accounting assumes complete startup file enumeration;
+  if storage omits or throws in `listNames`/`byteLength`, existing bytes can be
+  missed and the hard cap is effectively soft until those paths are available.
 - Pending-write backpressure: `maxPendingWrites` defaults to `128`; saturation
   reports `phase: "drop"` and returns `false` from `capture`.

@@ -15,14 +15,14 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 | `history_expand` | `session`, `beforeLine?`, `afterLine?`, `limit?` | page archived scrollback backward or forward (if the host wired that direction). Reply: `history`. |
 | `resync` | `session` | after rejecting a missing/stale delta, request one complete output frame. The server replies with `reset:'resync'`. Hosts with a custom WS message switch **must** forward this message to `TmuxWsMux.handleMessage()` (or equivalent `handleResync` routing) whenever they forward `delta: true`; otherwise the viewer can remain frozen after its first rejected delta. |
 | `sessions_subscribe` / `sessions_unsubscribe` | — | join/leave the `__sessions` list channel. |
-| `ping` | — | keepalive; server replies `{"type":"pong"}`. Clients close after 8 s without a pong. |
+| `ping` | `client` | keepalive; client sends optional browser descriptor (`{ type:"ping", client }`) and server replies `{"type":"pong"}`. Clients close after 8 s without a pong. |
 | `client_info` | `client` | forward this socket's descriptor (visibility, viewport, host telemetry id) to the host's optional `onClientInfo` hook; the mux does not retain it. |
 
 ## Server → client
 
 | frame | semantics |
 |---|---|
-| `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). Sent only when the content hash changed — an idle pane costs zero bytes. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
+| `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). In the regular path it is sent when the content hash changed, but cached startup snapshots and cache-driven resync/catch-up replies can also send full output without a hash delta; a resize or resync path also emits reset output frames. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
 | `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive, an unsupported forward read, or an archive read that throws uses `{lines:[], startLine:null, hasMore:false}` as a synchronous fallback. Archive-error logging is best effort: a throwing host logger cannot suppress the mux's single reply attempt. Delivery still depends on `ws.send` succeeding, so clients should retain their own request timeout and recovery. |
 | `{channel, type:"error", data}` | e.g. the session disappeared. A host-driven `invalidateSession()` makes one final send attempt to each affected WebSocket subscriber before that session lifecycle goes quiet. |
@@ -345,10 +345,12 @@ rather than merged.
   reverse proxy negotiated as h2 (a curl probe with `-H "Upgrade: websocket"`
   gets `200`, not `101`). Real browsers open WebSockets over HTTP/1.1, so
   users are unaffected — but point automated health checks at HTTP/1.1.
-- **Wide glyphs:** the caret column is pixel-accurate: the client maps the
-  cursor's cell column onto the line's characters with wcwidth-style cell
-  accounting (`thumbmux/core` `prefixForCells` — Thai combining marks 0
-  cells, CJK/emoji 2) and then measures that prefix with the live font, so
-  the caret follows the DOM's real glyph advances even for Thai/CJK/emoji
-  lines. Link tap-target column math still assumes 1 cell = 1 char width
-  (remaining known limitation).
+- **Wide glyphs:** caret placement is best-effort with mixed-width and emoji
+  sequences: `prefixForCells` uses an approximate width table (`thumbmux/core`)
+  and does not preserve every ZWJ/variation-sequence grapheme as a unit. The
+  client still measures the reconstructed prefix with the live font, but some
+  Thai/CJK/emoji combinations can remain approximate. Link tap-target columns are
+  **no longer** among them: `collectTerminalUrlSegments` and `findTerminalUrlAtCell`
+  convert UTF-16 offsets to cell columns (`utf16ToCellOffset`, CJK 2 cells,
+  combining marks 0), so a link after wide or combining text is hittable where it
+  is drawn.
