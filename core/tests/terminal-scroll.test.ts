@@ -246,6 +246,27 @@ describe("findLineOverlap contract pins", () => {
     }
   });
 
+  test("period-2 sliding window under-appends without capture identity (A2-4 documented)", () => {
+    // String-only max-overlap cannot distinguish a chronological shift of 2 (or
+    // 3) rows when the fixed capture window is a period-2 blank/text pattern:
+    // slide-by-2 is byte-identical (appended 0); slide-by-3 finds max overlap
+    // N-1 (appended 1) even though three rows arrived. A generation/sequence
+    // seam would fix this; pure content merge cannot. This test pins the
+    // limitation so a future API change has a red to drive.
+    const make = (start: number, count: number) =>
+      Array.from({ length: count }, (_, idx) => ((start + idx) % 2 === 0 ? "" : "none"));
+
+    const slide2 = mergeCapturedLinesForStableScroll(make(0, 100), make(2, 100));
+    expect(slide2.preservedPrefix).toBe(true);
+    expect(slide2.appendedLineCount).toBe(0);
+
+    const slide3 = mergeCapturedLinesForStableScroll(make(0, 100), make(3, 100));
+    expect(slide3.preservedPrefix).toBe(true);
+    expect(slide3.appendedLineCount).toBe(1);
+    // Chronological truth would be 3; content-only algorithm yields 1.
+    expect(slide3.appendedLineCount).not.toBe(3);
+  });
+
   test("merge-level contract pins (shipped quirky arithmetic)", () => {
     expect(mergeCapturedLinesForStableScroll(["a", "b"], [])).toEqual({
       appendedLineCount: 0,

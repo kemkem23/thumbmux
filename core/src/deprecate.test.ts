@@ -78,4 +78,20 @@ describe('warnDeprecated', () => {
     }).toThrow('warnDeprecated details must be an object');
     expect(warnings).toHaveLength(0);
   });
+
+  test('a throwing logger does not permanently suppress the warning (A2-9)', () => {
+    const key = 'ThrowThenRetry';
+    const details = detailsFor('CurrentThing');
+
+    expect(() => {
+      warnDeprecated(key, details, () => {
+        throw new Error('log transport failed');
+      });
+    }).toThrow('log transport failed');
+
+    const warnings: string[] = [];
+    warnDeprecated(key, details, (message) => warnings.push(message));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(WARNING_FORMAT);
+  });
 });

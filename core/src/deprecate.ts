@@ -51,10 +51,12 @@ export function warnDeprecated(
 
   if (warnedDeprecations.has(key)) return;
 
-  warnedDeprecations.set(key, true);
+  // Record the key only after a successful log. A throwing logger must not
+  // permanently suppress the migration warning for the module lifetime.
   log(
     `[thumbmux] ${key} is deprecated since v${details.since} — use ${details.replacement}; removal no earlier than v${details.removeNoEarlierThan}`,
   );
+  warnedDeprecations.set(key, true);
 }
 
 /** Clear process-local warning state. Intended for deterministic tests. */

@@ -97,6 +97,12 @@ export function isFaintPayload(rawLine: string): boolean {
       }
       const osc = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(rawLine.slice(i));
       if (osc) { i += osc[0].length; continue; }
+      // Private-mode / non-SGR CSI (e.g. ESC[?25l hide cursor). Skipping only
+      // ESC+[ leaves "?25l" as fake marker/payload text and defeats faint
+      // detection — the exact autocomplete false-positive this function exists
+      // to reject. Consume a full CSI when present (same class stripAnsi uses).
+      const otherCsi = /^\x1b\[[0-9;:?<=>\-]*[@-~]/.exec(rawLine.slice(i));
+      if (otherCsi) { i += otherCsi[0].length; continue; }
       i += 2; // unknown escape — skip ESC + the following byte
       continue;
     }
@@ -195,7 +201,15 @@ function extractMarkdownSection(lines: string[], title: string): string | null {
 
 function truncatePrompt(text: string): string {
   if (text.length <= MAX_PROMPT_DISPLAY_CHARS) return text;
-  return `${text.slice(0, MAX_PROMPT_DISPLAY_CHARS - 3).trimEnd()}...`;
+  let end = MAX_PROMPT_DISPLAY_CHARS - 3;
+  // Never leave an unpaired UTF-16 surrogate at the cut. A high surrogate kept
+  // without its low half (or a lone low half) is not a Unicode scalar and
+  // surfaces as U+FFFD / garbage in every consumer that persists the prompt.
+  if (end > 0 && end <= text.length) {
+    const last = text.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1; // orphan high surrogate
+  }
+  return `${text.slice(0, end).trimEnd()}...`;
 }
 
 function normalizePromptBlock(lines: string[]): string {
@@ -287,19 +301,29 @@ export function extractRecentPrompts(
   if (lines.length === 0) return [];
 
   const targetCount = options.targetCount ?? DEFAULT_TARGET_COUNT;
-  const initialScanLines = options.initialScanLines ?? DEFAULT_INITIAL_SCAN_LINES;
+  // targetCount 0 (or negative) means "return none" — not "return everything".
+  // Array#slice(-0) === slice(0) would otherwise hand back the full scan.
+  if (targetCount <= 0) return [];
+
+  const initialScanLines = Math.max(0, options.initialScanLines ?? DEFAULT_INITIAL_SCAN_LINES);
   const maxScanLines = options.maxScanLines ?? DEFAULT_MAX_SCAN_LINES;
   const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;
   const boundedMaxScanLines = Math.min(lines.length, maxScanLines);
   let scanLines = Math.min(lines.length, initialScanLines, boundedMaxScanLines);
   let prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
+  // Stop on unique count, not raw collect count: two echoes of the same prompt
+  // must not freeze the progressive window short of an older distinct entry.
+  let unique = dedupeKeepLatest(prompts);
 
-  while (prompts.length < targetCount && scanLines < boundedMaxScanLines) {
-    scanLines = Math.min(boundedMaxScanLines, scanLines * 2);
+  while (unique.length < targetCount && scanLines < boundedMaxScanLines) {
+    // initialScanLines: 0 used to leave scanLines at 0 forever (0*2 === 0) and
+    // hang the event loop. Always make forward progress when deepening.
+    scanLines = Math.min(boundedMaxScanLines, scanLines <= 0 ? 1 : scanLines * 2);
     prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
+    unique = dedupeKeepLatest(prompts);
   }
 
-  return dedupeKeepLatest(prompts).slice(-targetCount);
+  return unique.slice(-targetCount);
 }
 
 /** Pane content (one string, \n-joined) → last N submitted prompts. The
@@ -310,6 +334,7 @@ export function extractRecentPromptsFromPane(
   targetCount = 5,
   options: ExtractRecentPromptsFromPaneOptions = {},
 ): string[] {
+  if (targetCount <= 0) return [];
   const lines = content.split("\n");
   if (lines.length === 0) return [];
   const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;

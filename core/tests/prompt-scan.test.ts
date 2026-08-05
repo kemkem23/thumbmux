@@ -274,5 +274,84 @@ describe("terminal prompt extraction", () => {
         "       gpt-5.5 xhigh · 5h 99% left · weekly 80% left · Context 52% used",
       ])).toEqual([]);
     });
+
+    test("private CSI before the marker does not defeat faint-ghost rejection (A2-8)", () => {
+      // ESC[?25l is a private-mode CSI (hide cursor). Skipping only ESC+[ leaves
+      // "?25l" as fake text and returns isFaint=false for a faint ghost payload.
+      const ghost = "\x1b[?25l❯ \x1b[2mghost suggestion\x1b[0m";
+      expect(extractRecentPromptsFromPane(`${ghost}\n● real response body here\n`)).toEqual([]);
+    });
+  });
+
+  test("initialScanLines: 0 does not hang the event loop (A2-5)", () => {
+    // Sync infinite loop would freeze bun test itself — probe in a subprocess
+    // with a hard timeout so a regression fails as exit 124, not a stuck suite.
+    const script = [
+      'import { extractRecentPrompts } from "./core/src/prompt-scan.ts";',
+      'const r = extractRecentPrompts(',
+      '  ["❯ one xx","r","❯ two yy","m"],',
+      '  { targetCount: 1, initialScanLines: 0, maxScanLines: 2 },',
+      ");",
+      "console.log(JSON.stringify(r));",
+    ].join("");
+    const proc = Bun.spawnSync({
+      cmd: ["timeout", "1", "bun", "-e", script],
+      cwd: join(import.meta.dir, "../.."),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).not.toBe(124);
+    expect(proc.exitCode).toBe(0);
+    const out = new TextDecoder().decode(proc.stdout).trim();
+    // With initial 0, progressive deepen must still reach the recent prompt.
+    expect(JSON.parse(out)).toEqual(["two yy m"]);
+  });
+
+  test("progressive deepen uses post-dedupe count so repeats do not underfill (A2-6)", () => {
+    const lines = [
+      "❯ older unique xx",
+      "● response to older",
+      "❯ repeat ok here",
+      "● response A",
+      "❯ repeat ok here",
+      "● response B",
+    ];
+    // Initial window of 4 lines sees two raw "repeat ok here" matches; stopping
+    // on pre-dedupe count freezes at one unique entry and never deepens to
+    // "older unique xx" even though maxScanLines still has room.
+    expect(
+      extractRecentPrompts(lines, {
+        targetCount: 2,
+        initialScanLines: 4,
+        maxScanLines: 6,
+      }),
+    ).toEqual(["older unique xx", "repeat ok here"]);
+  });
+
+  test("targetCount: 0 returns no prompts from either API (A2-7)", () => {
+    const lines = [
+      "❯ aaa one",
+      "● r1",
+      "❯ bbb two",
+      "● r2",
+      "❯ ccc three",
+      "● r3",
+    ];
+    expect(extractRecentPrompts(lines, { targetCount: 0 })).toEqual([]);
+    expect(extractRecentPromptsFromPane(lines.join("\n"), 0)).toEqual([]);
+  });
+
+  test("truncatePrompt never returns an unpaired high surrogate (A2-10)", () => {
+    // 496 ASCII + emoji (2 UTF-16 units) + "tail" crosses the 500-unit cap with
+    // the cut mid-emoji when naively slicing at 497.
+    const long = `${"a".repeat(496)}😀tail`;
+    const prompts = extractRecentPromptsFromPane(`❯ ${long}\n● response body here enough\n`);
+    expect(prompts.length).toBe(1);
+    const text = prompts[0]!;
+    expect(text.endsWith("...")).toBe(true);
+    // No high surrogate without a following low surrogate.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(text)).toBe(false);
+    // No low surrogate without a preceding high surrogate.
+    expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)).toBe(false);
   });
 });
