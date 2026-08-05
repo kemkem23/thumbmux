@@ -1,3 +1,5 @@
+import { charCellWidth, stringCells } from './cells';
+
 export interface TerminalLinkSegment {
   lineIdx: number;
   startCol: number;
@@ -10,9 +12,11 @@ export interface TerminalLinkMatch {
 }
 
 const urlStartRe = /https?:\/\//g;
-const terminalTokenRe = /^[^\s<>"')\]}{]+/;
+// Allow `)` and `]` in tokens so wiki Foo_(bar) and IPv6 [::1] survive matching;
+// balanced trailing-trim below drops unopened closers only.
+const terminalTokenRe = /^[^\s<>"{}]+/;
 // Sticky token match at a known scheme start — avoids slicing the rest of the line.
-const urlTokenStickyRe = /https?:\/\/[^\s<>"')\]}{]+/y;
+const urlTokenStickyRe = /https?:\/\/[^\s<>"{}]+/y;
 // Anchored scheme detector for continuation rows; never shares lastIndex with urlStartRe.
 const urlSchemeAtStartRe = /^https?:\/\//;
 // Trailing query/form context: the next token is a parameter value (or the next
@@ -37,6 +41,25 @@ const MAX_CONTINUATION_ROWS = 128;
  */
 function isMidParameterContext(urlSoFar: string): boolean {
   return midParameterContextRe.test(urlSoFar);
+}
+
+type SegmentBuild = TerminalLinkSegment & {
+  rawText: string;
+};
+
+/** Convert a UTF-16 string offset into terminal cell columns (CJK=2, combining=0). */
+function utf16ToCellOffset(text: string, utf16Offset: number): number {
+  if (utf16Offset <= 0) return 0;
+  if (utf16Offset >= text.length) return stringCells(text);
+  let cols = 0;
+  let i = 0;
+  for (const ch of text) {
+    const next = i + ch.length;
+    if (next > utf16Offset) break;
+    cols += charCellWidth(ch.codePointAt(0)!);
+    i = next;
+  }
+  return cols;
 }
 
 export function collectTerminalUrlSegments(rawLines: string[], startLine: number, endLine: number, cols: number): TerminalLinkMatch[] {
@@ -74,21 +97,34 @@ export function collectTerminalUrlSegments(rawLines: string[], startLine: number
       const urlOnLine = urlTokenStickyRe.exec(stripped);
       if (!urlOnLine) continue;
 
-      let fullUrl = urlOnLine[0];
-      const segments: TerminalLinkSegment[] = [{
+      let fullUrl = urlOnLine[0]!;
+      const segments: SegmentBuild[] = [{
         lineIdx: wi,
-        startCol: match.index,
-        endCol: match.index + urlOnLine[0].length,
+        startCol: utf16ToCellOffset(stripped, match.index),
+        endCol: utf16ToCellOffset(stripped, match.index + fullUrl.length),
+        rawText: fullUrl,
       }];
 
       let curIdx = wi;
       let curEndPos = segments[0].endCol;
+      // Soft-wrap heuristic (A1-04):
+      // Continue only when the CURRENT ROW looks soft-wrapped:
+      //   - row fills the pane within 1 cell (trimEnd may drop a trailing space), OR
+      //   - the URL itself overflows the pane width (capture wider than cols).
+      // The old `curEndPos >= cols - 2` fired on hard newlines that merely ended
+      // near the edge (e.g. 38/40) and glued the next line's token onto the URL.
       while (
-        curEndPos >= cols - 2 &&
-        curEndPos > 10 &&
+        // ≥10 (not >10): a pane-filling 10-col URL at the edge is a real soft wrap.
+        curEndPos >= 10 &&
         curIdx + 1 < continuationLimit &&
         segments.length - 1 < MAX_CONTINUATION_ROWS
       ) {
+        const curLineCells = stringCells(getStripped(curIdx));
+        const looksSoftWrapped =
+          cols > 0 &&
+          (curLineCells >= cols - 1 || curEndPos >= cols);
+        if (!looksSoftWrapped) break;
+
         const nextStripped = getStripped(curIdx + 1);
         const trimmed = nextStripped.trimStart();
         if (trimmed.length === 0) break;
@@ -98,51 +134,62 @@ export function collectTerminalUrlSegments(rawLines: string[], startLine: number
         const cont = trimmed.match(terminalTokenRe);
         if (!cont) break;
 
-        fullUrl += cont[0];
+        const continuationText = cont[0]!;
+        fullUrl += continuationText;
         curIdx++;
-        const indent = nextStripped.length - trimmed.length;
+        const indent = nextStripped.slice(0, nextStripped.length - trimmed.length);
+        const indentCols = stringCells(indent);
         segments.push({
           lineIdx: curIdx,
-          startCol: indent,
-          endCol: indent + cont[0].length,
+          startCol: indentCols,
+          endCol: indentCols + stringCells(continuationText),
+          rawText: continuationText,
         });
         curEndPos = segments[segments.length - 1].endCol;
       }
 
       let trailingTrim = 0;
-      while (fullUrl.length > 1 && /[.,;:!?)}\]>]$/.test(fullUrl)) {
+      while (fullUrl.length > 1 && /[.,;:!?)}>\]]$/.test(fullUrl)) {
         if (fullUrl.endsWith(')') && fullUrl.includes('(')) break;
+        // Keep balanced IPv6 / bracket hosts: `http://[::1]:3000/x`
+        if (fullUrl.endsWith(']') && fullUrl.includes('[')) break;
         fullUrl = fullUrl.slice(0, -1);
         trailingTrim += 1;
       }
 
       let remainingTrim = trailingTrim;
       while (remainingTrim > 0 && segments.length > 0) {
-        const last = segments[segments.length - 1];
-        const segmentLen = last.endCol - last.startCol;
-        if (segmentLen > remainingTrim) {
-          last.endCol -= remainingTrim;
-          remainingTrim = 0;
-        } else {
+        const last = segments[segments.length - 1]!;
+        const remove = Math.min(remainingTrim, last.rawText.length);
+        if (last.rawText.length <= remainingTrim) {
+          remainingTrim -= last.rawText.length;
           segments.pop();
-          remainingTrim -= segmentLen;
+          continue;
         }
+        const dropText = last.rawText.slice(last.rawText.length - remove);
+        last.rawText = last.rawText.slice(0, last.rawText.length - remove);
+        last.endCol -= stringCells(dropText);
+        remainingTrim = 0;
       }
 
       if (segments.length === 0 || !segments.some((segment) => segment.endCol > segment.startCol)) {
         continue;
       }
+      const publicSegments = segments.map((segment) => {
+        const { rawText: _rawText, ...publicSegment } = segment;
+        return publicSegment;
+      });
 
       // Mark absorbed continuation rows (not the origin) after trim; only survivors count.
       for (let si = 1; si < segments.length; si++) {
-        const seg = segments[si];
+        const seg = segments[si]!;
         const prev = consumedEndCol.get(seg.lineIdx) ?? 0;
         consumedEndCol.set(seg.lineIdx, Math.max(prev, seg.endCol));
       }
 
       matches.push({
         url: fullUrl,
-        segments,
+        segments: publicSegments,
       });
     }
   }
@@ -154,10 +201,14 @@ export function findTerminalUrlAtCell(rawLines: string[], lineIdx: number, col: 
   if (!Number.isFinite(lineIdx) || !Number.isFinite(col) || !Number.isFinite(cols)) return null;
   const targetLine = Math.floor(lineIdx);
   const targetCol = Math.floor(col);
+  // col is 0-based cells; reject out-of-pane and negative coordinates.
   if (targetLine < 0 || targetLine >= rawLines.length || targetCol < 0 || cols <= 0) return null;
+  if (targetCol >= cols) return null;
 
-  const windowStart = Math.max(0, targetLine - 10);
-  const windowEnd = Math.min(rawLines.length, targetLine + 11);
+  // Search window must cover the full continuation budget so a tap on the tail
+  // of a long wrap still finds the origin (A1-11).
+  const windowStart = Math.max(0, targetLine - MAX_CONTINUATION_ROWS);
+  const windowEnd = Math.min(rawLines.length, targetLine + MAX_CONTINUATION_ROWS + 1);
   for (const match of collectTerminalUrlSegments(rawLines, windowStart, windowEnd, cols)) {
     for (const segment of match.segments) {
       if (
@@ -177,7 +228,9 @@ function stripAnsi(text: string): string {
   // Every pattern below needs an ESC byte; skip three regex passes when there is none.
   if (text.indexOf('\x1b') < 0) return text;
   return text
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    // Include colon-form SGR parameters (`4:3`, `58:2::r:g:b`) — semicolon-only
+    // left modern underline/color codes as "visible" columns and shifted links.
+    .replace(/\x1b\[[0-9:;]*[a-zA-Z]/g, '')
     .replace(/\x1b\][^\x07]*\x07/g, '')
     .replace(/\x1b\][^\x1b]*\x1b\\/g, '');
 }

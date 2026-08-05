@@ -120,12 +120,21 @@ describe("mux delta protocol", () => {
       { ...delta, prefixHash: "00000000" },
       { ...delta, lines: ["three", 4] },
       { ...delta, cursor: { row: 0.5, col: 1 } },
+      // Negative col is 0-based-cells contract violation (A1-12).
+      { ...delta, cursor: { row: 0, col: -1 } },
     ];
 
     for (const frame of invalid) {
       expect(validateMuxDeltaFrame(frame, base)).toBeNull();
       expect(applyMuxDelta(base, frame)).toBeNull();
     }
+  });
+
+  test("accepts a valid non-negative cursor on a delta", () => {
+    const base = ["one", "two"];
+    const delta = createMuxDeltaFrame("terminal", base, ["one", "three"], { row: -2, col: 0 });
+    expect(validateMuxDeltaFrame(delta, base)).not.toBeNull();
+    expect(applyMuxDelta(base, delta)).toEqual(["one", "three"]);
   });
 
   test("chooses only a strict smaller delta and never turns reset output into one", () => {

@@ -60,7 +60,15 @@ export type MuxOutputFrame = MuxFullOutputFrame | MuxDeltaFrame;
 
 export type MuxResyncRequest = { type: "resync"; session: string };
 
-/** Client → server. */
+/**
+ * Client → server.
+ *
+ * Fields beyond `type` stay optional on the frozen shape so 0.9.1 consumers that
+ * construct partial literals still typecheck (A1-10 is a real gap; narrowing
+ * here would be a breaking type change deferred past 0.9.2). Runtime still
+ * validates required fields per op. Prefer {@link MuxStrictClientMessage} for
+ * new typed clients.
+ */
 export type MuxClientMessage = MuxResyncRequest | {
   type:
     | "ping"
@@ -89,14 +97,45 @@ export type MuxClientMessage = MuxResyncRequest | {
   client?: unknown;
 };
 
-/** Server → client (plus `{type:"pong"}` replies to pings). */
+/**
+ * Additive stricter client-message union (A1-10). Existing {@link MuxClientMessage}
+ * stays loose for back-compat; new code should prefer this shape.
+ */
+export type MuxStrictClientMessage =
+  | MuxResyncRequest
+  | { type: "ping"; client?: unknown }
+  | { type: "client_info"; client?: unknown }
+  | { type: "subscribe" | "unsubscribe"; session: string; tail?: number; delta?: boolean; client?: unknown }
+  | { type: "keys"; session: string; data: string; client?: unknown }
+  | { type: "resize"; session: string; cols: number; rows: number; client?: unknown }
+  | { type: "sessions_subscribe" | "sessions_unsubscribe"; client?: unknown }
+  | {
+      type: "history_expand";
+      session: string;
+      beforeLine?: number | null;
+      afterLine?: number | null;
+      limit?: number;
+      client?: unknown;
+    };
+
+/**
+ * Server → client channel-bearing frames (session stream).
+ *
+ * `sessions` / `history` / `error` require `data` (JSON string / page / message).
+ * `cursor` updates only the caret and never carries `data`.
+ * `{type:"pong"}` is channel-less — see {@link MuxPongFrame} on {@link MuxServerFrame}.
+ */
 export type MuxServerMessage = MuxOutputFrame | {
   channel: string;
-  type: "sessions" | "history" | "error" | "cursor";
-  /** Absent on "cursor" frames — they update only the caret. On a
-   * `__sessions` frame this is JSON-encoded `SessionListRow[]`; the bundled
-   * tmux driver emits the richer `SessionListItem[]` shape. */
-  data?: string;
+  type: "sessions" | "history" | "error";
+  /** On a `__sessions` frame this is JSON-encoded `SessionListRow[]`; the bundled
+   * tmux driver emits the richer `SessionListItem[]` shape. History pages and
+   * error strings are also required non-optional payloads. */
+  data: string;
+  cursor?: MuxCursor | null;
+} | {
+  channel: string;
+  type: "cursor";
   /** On output frames: the pane's real cursor, or null when hidden.
    * `row` counts up from the LAST CONTENT line (trailing blank viewport rows
    * trimmed), `col` is 0-based cells — the same convention for full and
@@ -110,6 +149,9 @@ export type MuxServerMessage = MuxOutputFrame | {
   cursor?: MuxCursor | null;
 };
 
+/** Reply to `{type:"ping"}` — channel-less keepalive acknowledgement. */
+export type MuxPongFrame = { type: "pong" };
+
 /** A channel-less authorization denial sent by guarded routes. */
 export type MuxAuthErrorFrame = {
   type: "auth_error";
@@ -119,8 +161,8 @@ export type MuxAuthErrorFrame = {
   cursor?: never;
 };
 
-/** All typed server frames, including guarded-route authorization denials. */
-export type MuxServerFrame = MuxServerMessage | MuxAuthErrorFrame;
+/** All typed server frames, including pong and guarded-route authorization denials. */
+export type MuxServerFrame = MuxServerMessage | MuxPongFrame | MuxAuthErrorFrame;
 
 /** Delivery types exposed to existing mux subscribers (wire deltas reconstruct as output). */
 export type MuxOutputType = "output" | "history" | "error" | "cursor";
@@ -185,7 +227,14 @@ function isMuxCursor(value: unknown): value is MuxCursor | null {
   if (value === null) return true;
   if (typeof value !== "object" || value === null) return false;
   const cursor = value as Record<string, unknown>;
-  return Number.isInteger(cursor.row) && Number.isInteger(cursor.col);
+  // `col` is 0-based cells (never negative); `row` may be negative (caret below
+  // the last content line). Rejecting negative col keeps malformed carets from
+  // applying silently (A1-12).
+  return (
+    Number.isInteger(cursor.row) &&
+    Number.isInteger(cursor.col) &&
+    (cursor.col as number) >= 0
+  );
 }
 
 /**

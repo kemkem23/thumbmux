@@ -53,6 +53,20 @@ const BEL = '\u0007';
 const ESC = '\u001b';
 const ST = '\\';
 
+/**
+ * Palette / theme colors are host-supplied and land inside `style="..."`.
+ * Only accept hex forms that cannot break out of the attribute or inject markup.
+ * Returns a lowercased `#rgb` / `#rrggbb` / `#rrggbbaa`, or null when unsafe.
+ */
+function safeCssColor(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const t = value.trim();
+  if (/^#[0-9a-fA-F]{3}$/.test(t) || /^#[0-9a-fA-F]{6}$/.test(t) || /^#[0-9a-fA-F]{8}$/.test(t)) {
+    return t.toLowerCase();
+  }
+  return null;
+}
+
 export function createSgrState(): SgrState {
   return {
     fg: null,
@@ -121,11 +135,14 @@ function xterm256(n: number): string {
 
 function colorFor(palette: AnsiPalette, spec: string | null): string | null {
   if (spec === null) return null;
-  if (/^#[0-9a-f]{6}$/i.test(spec)) return spec;
+  // Direct hex (truecolor / already-resolved) — must be a safe CSS color.
+  const direct = safeCssColor(spec);
+  if (direct) return direct;
   if (!/^\d+$/.test(spec)) return null;
   const n = Number(spec);
   if (!Number.isSafeInteger(n) || n < 0 || n > 255) return null;
-  if (n < 16) return palette.base[n] ?? null;
+  // Host palette entries are untrusted — never interpolate raw strings into style=.
+  if (n < 16) return safeCssColor(palette.base[n] ?? null);
   return xterm256(n);
 }
 
@@ -370,10 +387,14 @@ function isDefaultSgrState(st: SgrState): boolean {
 }
 
 function styleDeclarations(st: SgrState, palette: AnsiPalette, linkUnderline = false): string[] {
-  let fg = colorFor(palette, st.fg) ?? palette.defaultFg;
+  // defaultFg/defaultBg are host-supplied too — sanitize before any style use.
+  const defaultFg = safeCssColor(palette.defaultFg) ?? '#e6e6e6';
+  const defaultBg = safeCssColor(palette.defaultBg) ?? '#000000';
+  let fg = colorFor(palette, st.fg) ?? defaultFg;
+  // Keep bg null when no SGR bg is set so we do not paint a forced background.
   let bg = colorFor(palette, st.bg);
   if (st.inverse) {
-    const realBg = bg ?? palette.defaultBg;
+    const realBg = bg ?? defaultBg;
     bg = fg;
     fg = realBg;
   }

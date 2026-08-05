@@ -80,7 +80,15 @@ const GOLDEN: GoldenCase[] = [
     name: "paren balanced kept",
     cols: 80,
     lines: ["see https://example.com/wiki/Foo_(bar)"],
-    expected: [{"url":"https://example.com/wiki/Foo_(bar","segments":[{"lineIdx":0,"startCol":4,"endCol":37}]}],
+    // Closing `)` kept when an open `(` exists (A1-05). Prior golden pinned the
+    // truncated form and silently encoded the bug the name denied.
+    expected: [{"url":"https://example.com/wiki/Foo_(bar)","segments":[{"lineIdx":0,"startCol":4,"endCol":38}]}],
+  },
+  {
+    name: "ipv6 host",
+    cols: 80,
+    lines: ["http://[::1]:3000/x"],
+    expected: [{"url":"http://[::1]:3000/x","segments":[{"lineIdx":0,"startCol":0,"endCol":19}]}],
   },
   {
     name: "trailing multi punct",
@@ -157,8 +165,10 @@ const GOLDEN: GoldenCase[] = [
   {
     name: "many rows all wrap",
     cols: 80,
-    lines: ["https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","d end"],
-    expected: [{"url":"https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd","segments":[{"lineIdx":0,"startCol":0,"endCol":80},{"lineIdx":1,"startCol":0,"endCol":78},{"lineIdx":2,"startCol":0,"endCol":78},{"lineIdx":3,"startCol":0,"endCol":1}]}],
+    // Continuations fill cols-1 so the soft-wrap gate (row width ≥ cols-1) fires;
+    // 78-char rows with cols=80 are hard newlines under the A1-04 heuristic.
+    lines: ["https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","d end"],
+    expected: [{"url":"https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd","segments":[{"lineIdx":0,"startCol":0,"endCol":80},{"lineIdx":1,"startCol":0,"endCol":79},{"lineIdx":2,"startCol":0,"endCol":79},{"lineIdx":3,"startCol":0,"endCol":1}]}],
   },
   {
     name: "last row wraps off the end",
@@ -170,7 +180,30 @@ const GOLDEN: GoldenCase[] = [
     name: "unicode",
     cols: 80,
     lines: ["ดูที่ https://example.com/ไทย/path","ต่อ"],
-    expected: [{"url":"https://example.com/ไทย/path","segments":[{"lineIdx":0,"startCol":6,"endCol":34}]}],
+    // startCol/endCol are terminal cell columns, not UTF-16 offsets (A1-03).
+    // "ดูที่ " is 3 cells (combining marks = 0); the URL is 28 cells.
+    expected: [{"url":"https://example.com/ไทย/path","segments":[{"lineIdx":0,"startCol":3,"endCol":31}]}],
+  },
+  {
+    name: "unicode cell continuation",
+    cols: 20,
+    lines: ["界界界https://exampl", "e.com/path"],
+    // 3×CJK = 6 cells + scheme fills the 20-cell pane → soft-wrap continues.
+    expected: [{"url":"https://example.com/path","segments":[{"lineIdx":0,"startCol":6,"endCol":20},{"lineIdx":1,"startCol":0,"endCol":10}]}],
+  },
+  {
+    name: "near-edge hard break not glued",
+    cols: 40,
+    lines: ["12345678901234https://example.com/path", "ERROR details"],
+    // Row is 38 cells wide on a 40-col pane — hard newline, not soft wrap (A1-04).
+    expected: [{"url":"https://example.com/path","segments":[{"lineIdx":0,"startCol":14,"endCol":38}]}],
+  },
+  {
+    name: "colon-form CSI",
+    cols: 80,
+    lines: ["\u001b[4:3mhttps://x.dev"],
+    // stripAnsi must drop colon-form SGR so the link starts at cell 0 (A1-06).
+    expected: [{"url":"https://x.dev","segments":[{"lineIdx":0,"startCol":0,"endCol":13}]}],
   },
   {
     name: "tab separated",
@@ -295,9 +328,12 @@ describe('deterministic corpus digest', () => {
     return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
   }
 
+  // Digests recomputed after A1-04 soft-wrap gate (row width ≥ cols-1, not
+  // curEndPos ≥ cols-2). seed=1 and seed=3 unchanged; seed=2 gains one segment
+  // from a full-width wrap that the old false-positive edge case mishandled.
   const CORPUS: { seed: number; cols: number; matches: number; segments: number; digest: string }[] = [
     { seed: 1, cols: 80, matches: 22, segments: 60, digest: '0123e95c181b7400' },
-    { seed: 2, cols: 40, matches: 30, segments: 96, digest: '39e275b881229000' },
+    { seed: 2, cols: 40, matches: 30, segments: 97, digest: '899699d4ed39ba00' },
     { seed: 3, cols: 120, matches: 25, segments: 56, digest: '9332c7d0d2a9dc00' },
   ];
 
@@ -380,6 +416,8 @@ describe('findTerminalUrlAtCell — pinned contract', () => {
     'trailing period',
     'markdown link',
     'paren balanced kept',
+    'unicode',
+    'unicode cell continuation',
   ]);
 
   for (const g of GOLDEN) {
@@ -387,10 +425,12 @@ describe('findTerminalUrlAtCell — pinned contract', () => {
 
     test(g.name, () => {
       // Build cell → url map from golden expected segments.
+      // Only in-pane cells (col < cols) are hittable (A1-03 / A1-12 geometry).
       const cover = new Map<string, string>();
       for (const m of g.expected) {
         for (const seg of m.segments) {
-          for (let col = seg.startCol; col < seg.endCol; col++) {
+          const end = g.cols > 0 ? Math.min(seg.endCol, g.cols) : seg.endCol;
+          for (let col = seg.startCol; col < end; col++) {
             cover.set(`${seg.lineIdx},${col}`, m.url);
           }
         }
@@ -405,4 +445,14 @@ describe('findTerminalUrlAtCell — pinned contract', () => {
       }
     });
   }
+
+  test('long continuation windows remain hittable >10 rows after start', () => {
+    const url = `https://example.com/${'x'.repeat(120)}`;
+    const lines: string[] = [];
+    for (let i = 0; i < url.length; i += 10) {
+      lines.push(url.slice(i, i + 10));
+    }
+    // Origin is more than 10 rows above the tail — old window missed it (A1-11).
+    expect(findTerminalUrlAtCell(lines, 11, 2, 10)).toBe(url);
+  });
 });

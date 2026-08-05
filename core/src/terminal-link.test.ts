@@ -268,7 +268,8 @@ describe('collectTerminalUrlSegments', () => {
 
   test('a link may absorb at most MAX_CONTINUATION_ROWS continuation rows (c)', () => {
     const cols = 80;
-    const token = 'a'.repeat(78);
+    // cols-1 so each continuation row still trips the soft-wrap gate.
+    const token = 'a'.repeat(cols - 1);
     const lines = ['https://example.com/' + 'a'.repeat(cols - 'https://example.com/'.length)];
     for (let i = 0; i < 399; i++) lines.push(token);
     const matches = collectTerminalUrlSegments(lines, 0, lines.length, cols);

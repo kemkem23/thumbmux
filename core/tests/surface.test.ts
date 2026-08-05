@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  contrastRatio,
   deriveSurface,
   luminance,
   mix,
   hexToRgb,
+  normalizeHexColor,
   type TerminalSurface,
 } from "../src/surface";
 import { defaultSurface } from "../src/index";
@@ -52,13 +54,38 @@ describe("surface math", () => {
   test("luminance orders black < mid < white", () => {
     expect(luminance("#000000")).toBe(0);
     expect(luminance("#ffffff")).toBeCloseTo(1, 5);
+    // WCAG mid-grey is ~0.216 (gamma-correct); the old linear formula gave ~0.5.
     expect(luminance("#808080")).toBeGreaterThan(0.2);
     expect(luminance("#808080")).toBeLessThan(0.8);
   });
 
-  test("hexToRgb rejects junk, mix interpolates", () => {
+  test("hexToRgb rejects junk, mix interpolates, shorthand expands", () => {
     expect(hexToRgb("nope")).toBeNull();
+    expect(hexToRgb("#fff")).toEqual([255, 255, 255]);
+    expect(hexToRgb("fff")).toEqual([255, 255, 255]);
+    expect(normalizeHexColor("#fff")).toBe("#ffffff");
     expect(mix("#000000", "#ffffff", 0.5)).toBe("#808080");
+  });
+
+  test("defaultSurface normalizes shorthand and falls back on malformed themes", () => {
+    const shorthand = defaultSurface("#fff");
+    expect(shorthand.tbg).toBe("#ffffff");
+    expect(shorthand.palette.defaultBg).toBe("#ffffff");
+    expect(contrastRatio(shorthand.tfg, shorthand.tbg)).toBeGreaterThanOrEqual(4.5);
+
+    const invalid = defaultSurface("totally-not-a-hex");
+    expect(invalid.tbg).toBe("#101014");
+    expect(invalid.palette.defaultBg).toBe("#101014");
+
+    const hashless = defaultSurface("ffffff");
+    expect(hashless.tbg).toBe("#ffffff");
+  });
+
+  test("derived surfaces stay readable on tricky accepted inputs", () => {
+    // #00c400 previously emitted ~2:1 main text (A1-01).
+    const green = defaultSurface("#00c400");
+    expect(contrastRatio(green.tfg, green.tbg)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(green.agent, green.tbg)).toBeGreaterThanOrEqual(3);
   });
 
   test("light background derives dark ink + light-ANSI variants", () => {
@@ -71,7 +98,9 @@ describe("surface math", () => {
   test("dark background derives light ink + bright-ANSI variants", () => {
     const s = deriveSurface("#0e0e10", base);
     expect(luminance(s.tfg)).toBeGreaterThan(0.6);
-    expect(luminance(s.xterm.red!)).toBeGreaterThan(0.4);
+    // WCAG luminance of #ff7a7a is ~0.37 (was ~0.55 under the linear formula).
+    expect(luminance(s.xterm.red!)).toBeGreaterThan(0.3);
+    expect(contrastRatio(s.tfg, s.tbg)).toBeGreaterThanOrEqual(4.5);
   });
 
   test("accent falls back when it would blend into the background", () => {

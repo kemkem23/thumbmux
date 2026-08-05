@@ -53,10 +53,28 @@ const DEFAULT_ANSI_BASE = [
 
 const ANSI_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'] as const;
 
-export function hexToRgb(hex: string): [number, number, number] | null {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+/** Minimum WCAG-style contrast for main text vs background. */
+const MIN_TEXT_CONTRAST = 4.5;
+/** Minimum contrast for accent (borders/LED) vs background. */
+const MIN_ACCENT_CONTRAST = 3;
+
+/**
+ * Expand / validate a CSS hex color. Accepts `#rgb`, `#rrggbb`, optional `#`,
+ * and returns lowercased `#rrggbb`. Invalid input → null (caller falls back).
+ */
+export function normalizeHexColor(raw: string): string | null {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(raw.trim());
   if (!m || !m[1]) return null;
-  const n = parseInt(m[1], 16);
+  if (m[1].length === 3) {
+    return `#${m[1].split('').map((d) => `${d}${d}`).join('')}`.toLowerCase();
+  }
+  return `#${m[1].toLowerCase()}`;
+}
+
+export function hexToRgb(hex: string): [number, number, number] | null {
+  const normalized = normalizeHexColor(hex);
+  if (!normalized) return null;
+  const n = parseInt(normalized.slice(1), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
@@ -76,11 +94,42 @@ export function mix(hexA: string, hexB: string, ratioB: number): string {
   );
 }
 
+/**
+ * Relative luminance (WCAG). Channel values are gamma-encoded sRGB and must be
+ * linearized before the 0.2126/0.7152/0.0722 weights — applying the weights to
+ * gamma-encoded channels under-estimates contrast on saturated mid-tones.
+ */
 export function luminance(hex: string): number {
   const rgb = hexToRgb(hex);
   if (!rgb) return 0;
-  const [r, g, b] = rgb.map((v) => v / 255) as [number, number, number];
+  const linearize = (channel: number) => {
+    const c = channel / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const [r, g, b] = rgb.map(linearize) as [number, number, number];
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+export function contrastRatio(hexA: string, hexB: string): number {
+  const l1 = luminance(hexA);
+  const l2 = luminance(hexB);
+  const high = Math.max(l1, l2);
+  const low = Math.min(l1, l2);
+  return (high + 0.05) / (low + 0.05);
+}
+
+function readableFallback(hexBg: string): string {
+  return contrastRatio('#ffffff', hexBg) >= contrastRatio('#000000', hexBg)
+    ? '#ffffff'
+    : '#000000';
+}
+
+/** If `hex` fails min contrast against `bg`, swap to black or white. */
+function enforceContrast(hex: string, bg: string, minContrast: number): string {
+  const normalized = normalizeHexColor(hex);
+  if (!normalized) return readableFallback(bg);
+  if (contrastRatio(normalized, bg) >= minContrast) return normalized;
+  return readableFallback(bg);
 }
 
 const DERIVED_DARK_ANSI = {
@@ -95,25 +144,29 @@ const DERIVED_LIGHT_ANSI = {
 };
 
 export function deriveSurface(bg: string, base: TerminalSurface): TerminalSurface {
-  const isLightBg = luminance(bg) > 0.55;
-  const fg = isLightBg ? '#1f1812' : mix('#ffffff', bg, 0.08);
-  const stage = mix(bg, '#000000', isLightBg ? 0.12 : 0.4);
-  const hudSolid = isLightBg ? mix(bg, '#ffffff', 0.25) : mix(bg, '#000000', 0.55);
-  const accentOk = Math.abs(luminance(base.agent) - luminance(bg)) > 0.25;
-  const accent = accentOk ? base.agent : (isLightBg ? '#1A1A1A' : '#FFFFFF');
+  // Invalid / shorthand-invalid inputs fall back to the unbranded dark surface
+  // rather than emitting CSS-illegal or unreadable (1:1) colors.
+  const normalizedBg = normalizeHexColor(bg) ?? DEFAULT_BASE_SURFACE.tbg;
+  const isLightBg = luminance(normalizedBg) > 0.55;
+  const candidateFg = isLightBg ? '#1f1812' : mix('#ffffff', normalizedBg, 0.08);
+  const fg = enforceContrast(candidateFg, normalizedBg, MIN_TEXT_CONTRAST);
+  const stage = mix(normalizedBg, '#000000', isLightBg ? 0.12 : 0.4);
+  const hudSolid = isLightBg ? mix(normalizedBg, '#ffffff', 0.25) : mix(normalizedBg, '#000000', 0.55);
+  const agentCandidate = normalizeHexColor(base.agent) ?? DEFAULT_BASE_SURFACE.agent;
+  const accent = enforceContrast(agentCandidate, normalizedBg, MIN_ACCENT_CONTRAST);
   const rgb = hexToRgb(hudSolid) ?? [20, 20, 20];
   return {
     ...base,
     agent: accent,
-    tbg: bg,
+    tbg: normalizedBg,
     tstage: stage,
     tfg: fg,
     hud: `rgba(${rgb[0]},${rgb[1]},${rgb[2]},.94)`,
     hudFg: fg,
-    hudLine: mix(bg, fg, 0.4),
+    hudLine: mix(normalizedBg, fg, 0.4),
     xterm: {
-      background: bg, foreground: fg, cursor: fg, cursorAccent: bg,
-      selectionBackground: stage, black: bg, white: fg, brightWhite: fg,
+      background: normalizedBg, foreground: fg, cursor: fg, cursorAccent: normalizedBg,
+      selectionBackground: stage, black: normalizedBg, white: fg, brightWhite: fg,
       ...(isLightBg ? DERIVED_LIGHT_ANSI : DERIVED_DARK_ANSI),
     },
   };
@@ -123,6 +176,10 @@ function paletteForSurface(surface: TerminalSurface): AnsiPalette {
   const colors = [...DEFAULT_ANSI_BASE];
   const theme = surface.xterm;
 
+  // Do NOT contrast-gate palette ANSI entries against the background: index 0 is
+  // the background itself (1:1 by design), and replacing yellow/red with black/
+  // white would destroy the color meaning. Readability of SGR colors is a
+  // separate concern; A1-01 gates main text + accent only.
   colors[0] = theme.black ?? surface.tbg;
   colors[7] = theme.white ?? surface.tfg;
   colors[8] = theme.brightBlack ?? colors[8]!;

@@ -110,4 +110,37 @@ describe("ansi-html", () => {
     expect(lineToHtml("\x1b[38;2;10;20;30my\x1b[0m", st, pal)).toContain("<span");
     expect(lineToHtml("\x1b[999mgarbage\x1b[0m ok", st, pal)).toContain("ok");
   });
+
+  test("palette values are sanitized before style injection (A1-02)", () => {
+    // Host-supplied palette entry that breaks out of style="..." into markup.
+    const maliciousPalette: AnsiPalette = {
+      base: [
+        'red"><img src=x onerror=alert(1)><span style="color:red',
+        "#f00", "#0f0", "#ff0", "#00f", "#f0f", "#0ff", "#fff",
+        "#111", "#f11", "#1f1", "#ff1", "#11f", "#f1f", "#1ff", "#eee",
+      ],
+      defaultFg: "#e6e6e6",
+      defaultBg: "#101014",
+    };
+    const st = createSgrState();
+    const html = lineToHtml("\x1b[30mX\x1b[0m", st, maliciousPalette);
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("onerror");
+    expect(html).not.toContain('red">');
+    // Unsafe palette index falls back to sanitized defaultFg.
+    expect(html).toContain("color:#e6e6e6");
+    expect(html).toContain(">X</span>");
+
+    // Malicious defaultFg itself must not execute either (bold forces a span
+    // that pulls color from defaultFg when no explicit fg is set).
+    const badDefaults: AnsiPalette = {
+      base: [...maliciousPalette.base],
+      defaultFg: 'x" onmouseover="alert(1)',
+      defaultBg: "#101014",
+    };
+    const html2 = lineToHtml("\x1b[1mbold", createSgrState(), badDefaults);
+    expect(html2).not.toContain("onmouseover");
+    expect(html2).toContain("color:#e6e6e6");
+    expect(html2).toContain("font-weight:700");
+  });
 });
