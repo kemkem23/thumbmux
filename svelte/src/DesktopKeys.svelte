@@ -46,6 +46,11 @@
   let rootEl = $state<HTMLDivElement | null>(null);
   let nativeFocused = $state(false);
   let composing = $state(false);
+  // A6-4: async paste confirm can outlive this instance (unmount or {#key}
+  // remount when the host session changes). Bump on destroy so a late accept
+  // never calls onKeys into a pane the user has left.
+  let pasteGeneration = 0;
+  let destroyed = false;
 
   // macOS Option is a character-composition modifier (third-level shift), not
   // Meta — Option-composed printables must be sent verbatim there.
@@ -151,11 +156,13 @@
   }
 
   async function sendPasteText(text: string, event?: ClipboardEvent | KeyboardEvent, alreadyConsumed = false) {
-    if (!text || !enabled || !nativeFocused) return;
+    if (!text || !enabled || !nativeFocused || destroyed) return;
+    const gen = pasteGeneration;
     const accepted = await confirmTextPaste(text);
     // A host confirm dialog steals wrapper focus while we await, so an
     // accepted paste must not be gated on focus again (§4: send exactly once).
-    if (!accepted || !enabled) return;
+    // A6-4: drop if this instance was destroyed or remounted while we waited.
+    if (!accepted || !enabled || destroyed || gen !== pasteGeneration) return;
     if (event && !alreadyConsumed) {
       event.preventDefault();
       event.stopPropagation();
@@ -269,6 +276,14 @@
     } else if (!focused && document.activeElement === rootEl) {
       rootEl.blur();
     }
+  });
+
+  $effect(() => {
+    destroyed = false;
+    return () => {
+      destroyed = true;
+      pasteGeneration += 1;
+    };
   });
 </script>
 

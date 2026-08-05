@@ -75,7 +75,8 @@ describe("NotePanel", () => {
 
   test("prefills the draft with the saved note when editing starts", async () => {
     const note = "saved first line\nsaved second line";
-    const { target } = mountNotePanel({ note });
+    // A6-15: edit UI only appears when onSave is wired
+    const { target } = mountNotePanel({ note, onSave: () => {} });
 
     const edit = target.querySelector<HTMLButtonElement>('[data-testid="note-edit"]');
     if (!edit) throw new Error("NotePanel did not render its edit button");

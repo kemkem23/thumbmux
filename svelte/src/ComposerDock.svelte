@@ -101,6 +101,7 @@
 
   /** env() is CSS-only — read the real safe-area pixel value via a probe. */
   function measureSafeBottom(): number {
+    if (typeof document === 'undefined') return 0;
     const el = document.createElement('div');
     el.style.cssText =
       'position:fixed;left:0;bottom:0;width:1px;height:env(safe-area-inset-bottom,0px);pointer-events:none;visibility:hidden;';
@@ -109,6 +110,20 @@
     el.remove();
     return h;
   }
+
+  // A6-5: measure safe-area whenever the sheet is open — covers bindable
+  // open=true (no openDock() call) and orientation changes while open.
+  $effect(() => {
+    if (!open || typeof window === 'undefined') return;
+    safeBottom = measureSafeBottom();
+    const remeasure = () => { safeBottom = measureSafeBottom(); };
+    window.addEventListener('resize', remeasure);
+    window.visualViewport?.addEventListener('resize', remeasure);
+    return () => {
+      window.removeEventListener('resize', remeasure);
+      window.visualViewport?.removeEventListener('resize', remeasure);
+    };
+  });
 
   /** Open from a user gesture (tap handler call stack — see iOS rules). */
   export function openDock() {
@@ -170,6 +185,8 @@
   });
 
   function composeKeydown(e: KeyboardEvent) {
+    // A6-2: IME candidate accept uses Enter while isComposing — must not SEND.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendCompose();
@@ -178,7 +195,9 @@
 
   // DIRECT mode — every keystroke goes straight out. Text (incl. Thai IME)
   // arrives via input events; control keys via keydown.
+  // A6-2: skip interim composition text and candidate-control keys.
   function directInput(e: Event) {
+    if (e instanceof InputEvent && e.isComposing) return;
     const el = e.target as HTMLInputElement;
     if (el.value) {
       onDirectText(el.value);
@@ -192,6 +211,7 @@
   };
 
   function directKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     const seq = DIRECT_KEYS[e.key];
     if (seq) {
       e.preventDefault();

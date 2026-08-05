@@ -114,7 +114,14 @@ function isMuxCursor(value: unknown): value is MuxServerMessage['cursor'] {
   if (value === null) return true;
   if (typeof value !== 'object' || value === null) return false;
   const cursor = value as Record<string, unknown>;
-  return Number.isInteger(cursor.row) && Number.isInteger(cursor.col);
+  // Keep lockstep with core protocol.ts isMuxCursor (A1-12: col is 0-based
+  // cells, never negative; row may be negative below the last content line).
+  // validateDeltaLocal claims to match validateMuxDeltaFrame accept/reject.
+  return (
+    Number.isInteger(cursor.row)
+    && Number.isInteger(cursor.col)
+    && (cursor.col as number) >= 0
+  );
 }
 
 const AUTH_ERROR_EVENT = 'thumbmux:auth-error';
@@ -163,6 +170,14 @@ export class TmuxMux {
   private resyncingSessions = new Set<string>();
   /** Session leases mapped to the socket that owns the tokenless reply. */
   private historyInflight = new Map<string, WebSocket>();
+  /**
+   * A6-14: after the last subscriber leaves while a history request is still
+   * outstanding, late tokenless replies must not be handed to a later
+   * subscriber of the same session name. Cleared on the next requestHistory.
+   * Unsolicited history (no prior request / no fence) still delivers so
+   * flush-before-history ordering stays intact.
+   */
+  private historyFenced = new Set<string>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -280,7 +295,7 @@ export class TmuxMux {
   private clientInfo(): ClientInfo {
     if (typeof window === 'undefined') return {};
     const vv = window.visualViewport;
-    return {
+    const base: ClientInfo = {
       href: window.location.href,
       pathname: window.location.pathname,
       userAgent: navigator.userAgent,
@@ -296,8 +311,24 @@ export class TmuxMux {
         screenHeight: window.screen?.height,
         devicePixelRatio: window.devicePixelRatio,
       },
-      ...(this.opts.getClientMeta?.() ?? {}),
     };
+    // A6-3: getClientMeta throw or non-JSON-safe values must not abort onopen
+    // (which would leave an OPEN socket with no pane resubscribe) and must not
+    // make JSON.stringify fail inside send() (which drops subscribe frames).
+    let meta: Partial<ClientInfo> = {};
+    try {
+      const raw = this.opts.getClientMeta?.();
+      if (raw && typeof raw === 'object') {
+        try {
+          meta = JSON.parse(JSON.stringify(raw)) as Partial<ClientInfo>;
+        } catch {
+          meta = {};
+        }
+      }
+    } catch {
+      meta = {};
+    }
+    return { ...base, ...meta };
   }
 
   private sendClientInfo(_reason = 'client_info') {
@@ -752,12 +783,18 @@ export class TmuxMux {
         // the per-session wire gate before subscriber callbacks so a callback
         // can request the next page synchronously. Do this before the no-subs
         // return too: a reply racing an unsubscribe still settles the request.
-        if (
-          msg.type === 'history'
-          && typeof msg.channel === 'string'
-          && this.historyInflight.get(msg.channel) === socket
-        ) {
-          this.historyInflight.delete(msg.channel);
+        // A6-14: if the last subscriber left while a request was outstanding,
+        // historyFenced drops late replies so they cannot land on a later
+        // subscriber. Unsolicited history (no fence) still delivers — the
+        // deferred-queue flush-before-history contract depends on that.
+        if (msg.type === 'history' && typeof msg.channel === 'string') {
+          const wasInflight = this.historyInflight.get(msg.channel) === socket;
+          if (wasInflight) this.historyInflight.delete(msg.channel);
+          if (!wasInflight && this.historyFenced.has(msg.channel)) {
+            return;
+          }
+          // A matched inflight reply consumes any fence for this generation.
+          if (wasInflight) this.historyFenced.delete(msg.channel);
         }
         const cbs = typeof msg.channel === 'string' ? this.subs.get(msg.channel) : undefined;
         if (!cbs) return;
@@ -966,6 +1003,7 @@ export class TmuxMux {
     this.pendingResizeBySession.clear();
     this.deferredDeltas.clear();
     this.historyInflight.clear();
+    this.historyFenced.clear();
     this.opts = {};
   }
 
@@ -1013,6 +1051,12 @@ export class TmuxMux {
         this.sentTail.delete(session);
         this.invalidateOutputBase(session);
         this.pendingResizeBySession.delete(session);
+        // A6-14: if a history request is still outstanding, fence late replies
+        // so they cannot deliver into a later subscriber of this session name.
+        if (this.historyInflight.has(session)) {
+          this.historyFenced.add(session);
+        }
+        this.historyInflight.delete(session);
         this.send(this.ws, { type: 'unsubscribe', session });
       } else {
         this.refreshSubscription(session);
@@ -1071,6 +1115,8 @@ export class TmuxMux {
     // Mark before send so even a synchronous WebSocket test double cannot
     // deliver the reply before the gate exists. Roll back a dropped/failed
     // send; only frames actually written to this socket count as in-flight.
+    // A new request also lifts an A6-14 fence from a prior generation.
+    this.historyFenced.delete(session);
     this.historyInflight.set(session, socket);
     if (!this.send(socket, {
       type: 'history_expand',

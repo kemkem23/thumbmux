@@ -31,9 +31,20 @@
   } = $props();
 </script>
 
-<div class="slots" class:open>
+<div class="slots" class:open aria-hidden={!open}>
   {#each actions as a (a.id)}
-    <button class="slot" class:prim={a.primary} lang="th" onclick={a.onTap} data-testid={a.testid}>
+    <!-- A6-12: closed slots stay mounted for the open animation but must not
+         be tab stops or activatable via Enter/Space while hidden. -->
+    <button
+      class="slot"
+      class:prim={a.primary}
+      lang="th"
+      onclick={() => { if (open) a.onTap(); }}
+      data-testid={a.testid}
+      tabindex={open ? 0 : -1}
+      disabled={!open}
+      aria-hidden={!open}
+    >
       {a.label}
       {#if a.tag}<small>{a.tag}</small>{/if}
     </button>

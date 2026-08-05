@@ -15,7 +15,7 @@
     placeholder?: string;
     editable?: boolean;
     saving?: boolean;
-    onSave?: (text: string) => void;
+    onSave?: (text: string) => void | Promise<void>;
     /** host actions rendered as buttons, e.g. { label: '✨ distill', onTap, busy } */
     actions?: { label: string; onTap: () => void; busy?: boolean }[];
     labels?: { edit: string; save: string; cancel: string };
@@ -24,8 +24,21 @@
   let editing = $state(false);
   let draft = $state('');
 
+  // A6-15: editable without onSave used to show Save that discarded the draft.
+  // Only offer the editor when a save handler is actually wired.
+  const canEdit = $derived(editable && typeof onSave === 'function');
+
   function startEdit() { draft = note; editing = true; }
-  function save() { onSave?.(draft.trim()); editing = false; }
+  async function save() {
+    if (!onSave) return;
+    const next = draft.trim();
+    try {
+      await onSave(next);
+      editing = false;
+    } catch {
+      // Keep the draft and stay in edit mode so a rejected save is recoverable.
+    }
+  }
 </script>
 
 <div class="notep" data-testid="note-panel">
@@ -38,7 +51,7 @@
   {:else}
     <div class="text" class:empty={!note} data-testid="note-text">{note || placeholder}</div>
     <div class="ops">
-      {#if editable}
+      {#if canEdit}
         <button class="op" onclick={startEdit} data-testid="note-edit">{labels.edit}</button>
       {/if}
       {#each actions as a (a.label)}

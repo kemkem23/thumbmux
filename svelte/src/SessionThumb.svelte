@@ -3,7 +3,6 @@
    * through the shared ws-mux (captures are shared server-side with any full
    * viewer) and renders the pane tail with the same ANSI renderer as
    * TermView, just tiny. Never sends keys or resizes the pane. */
-  import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
   import { deriveThumbnailPalette } from './session-grid';
   import { createSgrState, lineToHtml, type AnsiPalette } from '@thumbmux/core';
@@ -20,36 +19,55 @@
 
   let content = $state('');
   let connected = $state(false);
-  let unsubscribe: (() => void) | null = null;
   let thumbPalette = $derived(deriveThumbnailPalette(palette));
   let html = $derived(renderContent(content, maxLines, thumbPalette));
 
+  /** Advance SGR/OSC through the full tail first, then keep only the last
+   * linesToKeep for display — otherwise a color/link opened in the discarded
+   * +10 context lines is lost on the visible suffix (A6-19). */
   function renderContent(raw: string, linesToKeep: number, renderPalette: AnsiPalette) {
     const lines = raw.replace(/\r/g, '').split('\n');
-    const tail = lines.slice(-linesToKeep);
+    const start = Math.max(0, lines.length - linesToKeep);
     const st = createSgrState();
-    return tail.map((line) => `<div>${lineToHtml(line, st, renderPalette) || '&nbsp;'}</div>`).join('');
+    for (let i = 0; i < start; i++) {
+      lineToHtml(lines[i]!, st, renderPalette);
+    }
+    return lines
+      .slice(start)
+      .map((line) => `<div>${lineToHtml(line, st, renderPalette) || '&nbsp;'}</div>`)
+      .join('');
   }
 
-  onMount(() => {
-    unsubscribe = tmuxMux.subscribe(session, (data, type) => {
+  // A6-10: resubscribe when session or maxLines changes (not only on mount).
+  $effect(() => {
+    const name = session;
+    const tail = maxLines + 10;
+    let active = true;
+    content = '';
+    connected = false;
+    const unsubscribe = tmuxMux.subscribe(name, (data, type) => {
+      if (!active) return;
       if (type === 'history' || type === 'error' || type === 'cursor') return;
       connected = true;
       content = data;
-    }, { tail: maxLines + 10 }); // tail mode: a few KB per update, not the full window
-  });
-
-  onDestroy(() => {
-    unsubscribe?.();
+    }, { tail });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   });
 </script>
 
+<!-- A6-11: read-only miniature — inert + aria-hidden so OSC-8 anchors inside
+     grid cards are never keyboard-focusable and do not join the card name. -->
 <div
   class="thumb"
   style:--tfg={thumbPalette.defaultFg}
   style:--tbg={thumbPalette.defaultBg}
   data-testid="session-thumb"
   data-live={connected}
+  inert
+  aria-hidden="true"
 >
   {#if connected}
     <div class="tail">{@html html}</div>

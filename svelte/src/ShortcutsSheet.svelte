@@ -27,7 +27,12 @@
   $effect(() => {
     if (!open || typeof window === 'undefined' || !window.visualViewport) { kbOffset = 0; return; }
     const vv = window.visualViewport;
-    const measure = () => { kbOffset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop); };
+    // A6-16: same scale guard as ComposerDock — pinch-zoom shrinks vv.height
+    // without a keyboard; lifting the sheet then hides its header.
+    const measure = () => {
+      if (vv.scale && Math.abs(vv.scale - 1) > 0.01) { kbOffset = 0; return; }
+      kbOffset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    };
     measure();
     vv.addEventListener('resize', measure);
     vv.addEventListener('scroll', measure);

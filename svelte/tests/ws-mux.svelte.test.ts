@@ -699,3 +699,87 @@ describe('TmuxMux archive history paging', () => {
     mux.dispose();
   });
 });
+
+describe('A6-3 getClientMeta failure must not leave OPEN socket unsubscribed', () => {
+  test('throwing getClientMeta still resubscribes panes on open', () => {
+    const mux = new TmuxMux();
+    mux.configure({
+      getClientMeta: () => {
+        throw new Error('meta boom');
+      },
+    });
+    const unsub = mux.subscribe('pane-a', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    expect(() => socket.open()).not.toThrow();
+
+    const frames = socket.frames();
+    const types = frames.map((f: { type: string }) => f.type);
+    // Must still send subscribe even when client meta throws
+    expect(types).toContain('subscribe');
+    expect(frames.some((f: { type: string; session?: string }) =>
+      f.type === 'subscribe' && f.session === 'pane-a',
+    )).toBe(true);
+    expect(mux.connected).toBe(true);
+
+    unsub();
+    socket.finishClose();
+    mux.dispose();
+  });
+
+  test('non-JSON-safe getClientMeta still resubscribes panes', () => {
+    const mux = new TmuxMux();
+    mux.configure({
+      getClientMeta: () => ({ bad: 1n } as never),
+    });
+    const unsub = mux.subscribe('pane-b', () => {});
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    const frames = socket.frames();
+    expect(frames.some((f: { type: string; session?: string }) =>
+      f.type === 'subscribe' && f.session === 'pane-b',
+    )).toBe(true);
+
+    unsub();
+    socket.finishClose();
+    mux.dispose();
+  });
+});
+
+describe('A6-14 history reply after final unsubscribe is not delivered to a new subscriber', () => {
+  test('orphan history after unsub does not land on a later subscriber of the same session', () => {
+    const mux = new TmuxMux();
+    const aDeliveries: string[] = [];
+    const unsubA = mux.subscribe('shared', (data, type) => {
+      if (type === 'history') aDeliveries.push(data);
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    expect(mux.requestHistory('shared', 50, 10)).toBe(true);
+
+    // Capture the handler, then A leaves entirely.
+    const pending = socket.onmessage!;
+    unsubA();
+
+    const bDeliveries: string[] = [];
+    const unsubB = mux.subscribe('shared', (data, type) => {
+      if (type === 'history') bDeliveries.push(data);
+    });
+
+    // Late reply that was meant for A
+    pending({
+      data: JSON.stringify({
+        channel: 'shared',
+        type: 'history',
+        data: 'history-for-A-only',
+      }),
+    });
+
+    expect(aDeliveries).toEqual([]);
+    expect(bDeliveries).toEqual([]);
+
+    unsubB();
+    socket.finishClose();
+    mux.dispose();
+  });
+});

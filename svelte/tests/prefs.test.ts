@@ -155,18 +155,61 @@ describe("createServerPrefs", () => {
     });
   });
 
+  // A6-13: authoritative {} (server file missing / all keys deleted) and fully
+  // disjoint snapshots must replace the local cache — not be rejected.
+  test("A6-13 applies authoritative empty object from GET (complete deletion)", async () => {
+    const key = cacheKey("a6-13-empty");
+    const cached = seedCache(key);
+    const tracked = trackedBackgroundFetch(() => Response.json({}));
+    const adapter = createServerPrefs({
+      url: `/prefs/${key}`,
+      cacheKey: key,
+      fetchFn: tracked.fetchFn,
+    });
+    const emissions: ThumbmuxPrefs[] = [];
+    let visible = cached;
+    adapter.subscribe?.((prefs) => {
+      emissions.push(prefs);
+      visible = prefs;
+    });
+
+    const immediate = await adapter.load();
+    await tracked.done;
+
+    expect(immediate).toEqual(cached);
+    expect(emissions).toHaveLength(1);
+    expect(visible).toEqual({});
+    expect(readStoredPrefs(key)).toEqual({});
+  });
+
+  test("A6-13 applies a fully-disjoint authoritative snapshot", async () => {
+    const key = cacheKey("a6-13-disjoint");
+    const cached = seedCache(key);
+    const fresh = { serverRevision: 1, hostOnlyKey: "x" };
+    const tracked = trackedBackgroundFetch(() => Response.json(fresh));
+    const adapter = createServerPrefs({
+      url: `/prefs/${key}`,
+      cacheKey: key,
+      fetchFn: tracked.fetchFn,
+    });
+    const emissions: ThumbmuxPrefs[] = [];
+    adapter.subscribe?.((prefs) => {
+      emissions.push(prefs);
+    });
+
+    await adapter.load();
+    await tracked.done;
+
+    expect(emissions).toHaveLength(1);
+    expect(emissions[0]).toEqual(fresh);
+    expect(readStoredPrefs(key)).toEqual(fresh);
+    expect(Object.keys(cached).some((k) => k in (emissions[0] as object))).toBe(false);
+  });
+
   for (const emptyCase of [
-    {
-      name: "an empty object",
-      response: () => Response.json({}),
-    },
     {
       name: "an empty body",
       response: () => new Response("", { status: 200 }),
-    },
-    {
-      name: "an object missing the cached preference keys",
-      response: () => Response.json({ serverRevision: 1 }),
     },
   ]) {
     test(`keeps the existing cache when GET returns ${emptyCase.name}`, async () => {

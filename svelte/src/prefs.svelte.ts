@@ -51,15 +51,12 @@ function isPrefsSnapshot(value: unknown): value is ThumbmuxPrefs {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function canRefreshCache(cached: ThumbmuxPrefs, fresh: ThumbmuxPrefs): boolean {
-  const cachedKeys = Object.keys(cached);
-  const freshKeys = Object.keys(fresh);
-  // Host-defined keys are valid prefs, so there is no fixed required-key list.
-  // Reject empty/unrelated payloads without blocking authoritative deletions.
-  return freshKeys.length > 0 && (
-    cachedKeys.length === 0
-    || cachedKeys.some((key) => Object.prototype.hasOwnProperty.call(fresh, key))
-  );
+function canRefreshCache(_cached: ThumbmuxPrefs, fresh: ThumbmuxPrefs): boolean {
+  // A6-13: any valid object snapshot is authoritative, including `{}`
+  // (server file missing / every key deleted) and fully-disjoint host keys.
+  // Non-object / failed JSON is rejected earlier via isPrefsSnapshot.
+  // Keep the helper so the load() call site documents the decision.
+  return isPrefsSnapshot(fresh);
 }
 
 export function createLocalPrefs(key = 'thumbmux-prefs'): PreferencesAdapter {
