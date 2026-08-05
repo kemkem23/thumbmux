@@ -416,22 +416,53 @@ below, so a host that uses it does not assemble authorization by hand:
 
   A host driving a raw WebSocket reads the frame directly and needs none of this.
 - applies the guard's projection to the session list on **every** path that emits
-  one — the initial push, subsequent pushes, drain catch-up, and the HTTP list
-- runs the host's `filterSessionList` hook on the **socket paths only**, between
-  two guard projections, so a host hook can neither see rows the principal may not
-  have nor widen what it returns.
+  one — initial and explicit subscription, changed push/poll, pane-only fanout,
+  drain catch-up, and the HTTP list
+- composes the optional transport-neutral `AppRoutesOptions.projectSessionList`
+  projection with the legacy socket-only `MuxHooks.filterSessionList` hook.
 
-  It does **not** run on `GET {basePath}/sessions`. The hook's signature takes the
-  `WS` it is filtering for, and an HTTP request has no socket to pass; calling it
-  with a fabricated one would hand hosts that key off socket identity a lie. The
-  consequence is load-bearing and is stated here rather than left to be discovered:
-  **a host hook that hides rows from a socket does not hide them from the HTTP
-  list.** Any policy that must hold on both belongs in the grant — scopes and
-  per-grant `sessions` are enforced by the guard, which does run on every path.
+  Let `G` be `guard.filterSessions`, `L` be `filterSessionList`, `P` be
+  `projectSessionList`, and `provider` be the driver's session rows:
 
-  Closing this properly needs a session-list hook that is not socket-scoped. That
-  is an API addition, so it waits for a minor release rather than being smuggled
-  into a patch.
+  | Path | Pipeline |
+  | --- | --- |
+  | Unguarded HTTP, omitted `P` | existing `provider` exactly |
+  | Unguarded WebSocket, omitted `P` and `L` | existing `provider` exactly |
+  | Guarded HTTP, omitted `P` | existing `G(provider)` exactly |
+  | Guarded HTTP, with `P` | `G(provider) -> P -> G` |
+  | Guarded WebSocket, legacy `L` only | existing `G -> L(real ws, client) -> G` exactly |
+  | Guarded WebSocket, `P` only | `G -> P -> G` |
+  | Guarded WebSocket, both | `G -> L(real ws, client) -> G -> P -> G` |
+  | Unguarded HTTP, with `P` | `provider -> P` |
+  | Unguarded WebSocket, `P` only | `provider -> P` |
+  | Unguarded WebSocket, legacy `L` only | existing `provider -> L(real ws, client)` exactly |
+  | Unguarded WebSocket, both | `provider -> L(real ws, client) -> P` |
+
+  In guarded socket composition, the middle `G` prevents `P` from observing a
+  denied row reintroduced by `L`, and the final `G` prevents `P` from widening
+  the grant. Keeping `L` before `P` preserves the legacy hook's existing input
+  and real socket/client identity.
+
+  `projectSessionList` is synchronous and context-free. It runs on
+  `GET {basePath}/sessions` and every WebSocket session-list delivery; omitting
+  it preserves the existing behavior, and it must not mutate its input.
+  `filterSessionList` remains unchanged, runs only on WebSocket paths, and
+  receives the real socket and client. It may therefore narrow WebSocket rows
+  further: the API promises one common projection stage, not identical final
+  lists across transports.
+
+  On WebSocket, either `L` or `P` throwing keeps the existing fail-closed hook
+  behavior: it logs the exception message only and emits no session-list frame
+  for that round. On HTTP, only `P` runs; if it throws, the route returns status
+  `500` with exactly `{"error":"session list projection failed"}` and retains
+  any successful authentication `Set-Cookie`. It never falls back to
+  unprojected rows.
+
+  `projectSessionList` is a presentation transform that may hide, reorder, or
+  decorate rows; `filterSessionList` remains the legacy socket-only narrowing
+  filter. Neither hook authorizes `subscribe`, `keys`, `resize`, `history`,
+  `spawn`, or `kill`. Authorization and tenant isolation live in guard grants
+  and per-message checks. A filtered list is not tenant isolation.
 - maps each HTTP route to a named operation (`sessions-list`, `sessions-spawn`,
   `upload`, `prefs-read`, `prefs-write`, `sessions-kill`) and authorizes before
   the handler runs, answering `405` with `Allow` on the wrong method

@@ -29,6 +29,8 @@ type CapturingSocket = WsLike & {
   frames: WireFrame[];
 };
 
+type AppSessionRow = ReturnType<TmuxDriver["listSessions"]>[number];
+
 let sequence = 0;
 
 function appRoutesPrefix(label: string): string {
@@ -88,15 +90,28 @@ function collectFrames(ws: WebSocket): WireFrame[] {
   return frames;
 }
 
-function createCapturingSocket(data: unknown): CapturingSocket {
+function createCapturingSocket(
+  data: unknown,
+  sendStatus?: (raw: string) => number | undefined,
+): CapturingSocket {
   const frames: WireFrame[] = [];
   return {
     data,
     frames,
     send(raw) {
       frames.push(JSON.parse(raw) as WireFrame);
-      return raw.length;
+      return sendStatus?.(raw) ?? raw.length;
     },
+  };
+}
+
+function appSessionRow(name: string, activityAt = 1): AppSessionRow {
+  return {
+    name,
+    created: "1",
+    windows: 1,
+    attached: false,
+    activityAt,
   };
 }
 
@@ -386,6 +401,606 @@ describe("createAppRoutes", () => {
     } finally {
       routes.mux.stop();
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("applies one host session-list projection to HTTP and WebSocket", async () => {
+    const visible = appSessionRow("visible");
+    const hidden = appSessionRow("hidden", 2);
+    const rows = [visible, hidden];
+    const calls: Array<{ stage: "L" | "P"; names: string[] }> = [];
+    const project = (sessions: readonly AppSessionRow[]) => {
+      calls.push({ stage: "P", names: sessions.map(({ name }) => name) });
+      return sessions.filter(({ name }) => name !== hidden.name);
+    };
+    const routes = createAppRoutes({
+      driver: inertDriver(rows),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList: project,
+      mux: {
+        hooks: {
+          // On the old source this equivalent socket-only stage makes the
+          // transport gap observable: the common projection is ignored by HTTP.
+          filterSessionList(sessions) {
+            calls.push({ stage: "L", names: sessions.map(({ name }) => name) });
+            return sessions.filter(({ name }) => name !== hidden.name);
+          },
+        },
+      },
+    });
+    const socket = createCapturingSocket(undefined);
+
+    try {
+      routes.websocket.open(socket);
+      expect(sessionNames(socket.frames[0])).toEqual([visible.name]);
+
+      const response = await routes.fetch(
+        new Request("http://app.test/api/sessions"),
+        { upgrade: () => false },
+      );
+      expect((await response?.json() as typeof rows).map(({ name }) => name))
+        .toEqual([visible.name]);
+      expect(calls).toEqual([
+        { stage: "L", names: [visible.name, hidden.name] },
+        { stage: "P", names: [visible.name] },
+        { stage: "P", names: [visible.name, hidden.name] },
+      ]);
+    } finally {
+      routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("keeps the guard last around both list hooks on every delivery path", async () => {
+    const allowedA = appSessionRow("allowed-a");
+    const allowedB = appSessionRow("allowed-b");
+    const deniedC = appSessionRow("denied-c");
+    const originalRows = [allowedA, allowedB, deniedC];
+    const originalSnapshot = structuredClone(originalRows);
+    let providerRows = originalRows;
+    const token = `projection-guard-${process.pid}-${Date.now()}`;
+    const guard = createTokenGuard({
+      grants: [{
+        token,
+        scope: "interactive",
+        expiresAt: Date.now() + 60_000,
+        sessions: [allowedA.name, allowedB.name],
+      }],
+    });
+    const legacyCalls: Array<{
+      names: string[];
+      ws: WsLike;
+      client: unknown;
+    }> = [];
+    const projectionInputs: string[][] = [];
+    const driver = inertDriver();
+    driver.listSessions = () => providerRows;
+    const routes = createAppRoutes({
+      driver,
+      archive: null,
+      guard,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList(sessions) {
+        projectionInputs.push(sessions.map(({ name }) => name));
+        const a = sessions.find(({ name }) => name === allowedA.name);
+        // Try to widen the projection with C. The final guard must remove it.
+        return a ? [a, deniedC] : [deniedC];
+      },
+      mux: {
+        sessionListIntervalMs: 20,
+        pollNormalMs: 10,
+        pollReconcileMs: 10,
+        hooks: {
+          filterSessionList(sessions, ws, client) {
+            legacyCalls.push({
+              names: sessions.map(({ name }) => name),
+              ws,
+              client,
+            });
+            // Try to widen the legacy hook with C. The middle guard must remove
+            // it before the common projection can observe the rows.
+            return [...sessions, deniedC];
+          },
+        },
+      },
+    });
+    const noUpgrade = { upgrade: () => false };
+    let primary: CapturingSocket | null = null;
+    let paneOnly: CapturingSocket | null = null;
+    let blockNextPrimarySend = false;
+
+    const openSocket = async (
+      sendStatus?: (raw: string) => number | undefined,
+    ): Promise<CapturingSocket> => {
+      let socketData: unknown;
+      const response = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_req, options) {
+            socketData = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(response?.status).toBe(204);
+      const socket = createCapturingSocket(socketData, sendStatus);
+      routes.websocket.open(socket);
+      return socket;
+    };
+
+    try {
+      const http = await routes.fetch(
+        new Request(`http://app.test/api/sessions?t=${encodeURIComponent(token)}`),
+        noUpgrade,
+      );
+      expect(http?.status).toBe(200);
+      expect((await http?.json() as AppSessionRow[]).map(({ name }) => name))
+        .toEqual([allowedA.name]);
+      expect(legacyCalls).toHaveLength(0);
+      expect(projectionInputs).toEqual([[allowedA.name, allowedB.name]]);
+
+      primary = await openSocket(() => {
+        if (!blockNextPrimarySend) return undefined;
+        blockNextPrimarySend = false;
+        return -1;
+      });
+      expect(sessionNames(primary.frames.at(-1))).toEqual([allowedA.name]);
+      expect(legacyCalls.at(-1)?.ws).toBe(primary);
+      expect(legacyCalls.at(-1)?.client).toBeUndefined();
+
+      const client = { principal: "client-hint" };
+      routes.mux.handleMessage({
+        type: "sessions_subscribe",
+        client,
+      }, primary);
+      expect(sessionNames(primary.frames.at(-1))).toEqual([allowedA.name]);
+      expect(legacyCalls.at(-1)?.ws).toBe(primary);
+      expect(legacyCalls.at(-1)?.client).toBe(client);
+
+      const beforePoll = primary.frames.filter(({ type }) => type === "sessions").length;
+      providerRows = [allowedA, { ...allowedB, activityAt: 2 }, deniedC];
+      await until(
+        () => primary!.frames.filter(({ type }) => type === "sessions").length > beforePoll,
+        "common projection did not run on the changed-list poll",
+      );
+      expect(sessionNames(primary.frames.at(-1))).toEqual([allowedA.name]);
+
+      paneOnly = await openSocket();
+      routes.mux.unsubscribeSessions(paneOnly);
+      routes.websocket.message(paneOnly, JSON.stringify({
+        type: "subscribe",
+        session: allowedA.name,
+      }));
+      const paneListsBefore = paneOnly.frames.filter(({ type }) => type === "sessions").length;
+      const legacyCallsBeforePaneFanout = legacyCalls.length;
+      providerRows = [allowedA, { ...allowedB, activityAt: 3 }, deniedC];
+      (routes.mux as unknown as { broadcastSessionList(): void })
+        .broadcastSessionList();
+      expect(paneOnly.frames.filter(({ type }) => type === "sessions")).toHaveLength(
+        paneListsBefore + 1,
+      );
+      const paneList = paneOnly.frames.filter(({ type }) => type === "sessions").at(-1);
+      expect(sessionNames(paneList)).toEqual([allowedA.name]);
+      const paneFanoutCalls = legacyCalls.slice(legacyCallsBeforePaneFanout)
+        .filter(({ ws }) => ws === paneOnly);
+      expect(paneFanoutCalls.length).toBeGreaterThan(0);
+      expect(paneFanoutCalls.every(({ client }) => client === undefined)).toBe(true);
+
+      blockNextPrimarySend = true;
+      providerRows = [allowedA, { ...allowedB, activityAt: 4 }, deniedC];
+      (routes.mux as unknown as { broadcastSessionList(): void })
+        .broadcastSessionList();
+      expect(routes.mux.isBackpressured(primary)).toBe(true);
+      const primaryListsWhileBlocked = primary.frames
+        .filter(({ type }) => type === "sessions").length;
+
+      providerRows = [allowedA, { ...allowedB, activityAt: 5 }, deniedC];
+      (routes.mux as unknown as { broadcastSessionList(): void })
+        .broadcastSessionList();
+      expect(primary.frames.filter(({ type }) => type === "sessions")).toHaveLength(
+        primaryListsWhileBlocked,
+      );
+      routes.websocket.drain(primary);
+      expect(primary.frames.filter(({ type }) => type === "sessions")).toHaveLength(
+        primaryListsWhileBlocked + 1,
+      );
+      expect(sessionNames(primary.frames.at(-1))).toEqual([allowedA.name]);
+
+      for (const socket of [primary, paneOnly]) {
+        const deliveredLists = socket.frames.filter(({ type }) => type === "sessions");
+        expect(deliveredLists.length).toBeGreaterThan(0);
+        expect(deliveredLists.every((frame) => (
+          JSON.stringify(sessionNames(frame)) === JSON.stringify([allowedA.name])
+        ))).toBe(true);
+      }
+      expect(legacyCalls.length).toBeGreaterThan(0);
+      expect(legacyCalls.every(({ names }) => (
+        JSON.stringify(names) === JSON.stringify([allowedA.name, allowedB.name])
+      ))).toBe(true);
+      expect(projectionInputs.length).toBeGreaterThan(0);
+      expect(projectionInputs.every((names) => (
+        JSON.stringify(names) === JSON.stringify([allowedA.name, allowedB.name])
+      ))).toBe(true);
+
+      // Composition may pass the original references but must not mutate them.
+      expect(originalRows).toEqual(originalSnapshot);
+      expect(originalRows[0]).toBe(allowedA);
+      expect(originalRows[1]).toBe(allowedB);
+      expect(originalRows[2]).toBe(deniedC);
+    } finally {
+      if (paneOnly) routes.websocket.close(paneOnly);
+      if (primary) routes.websocket.close(primary);
+      routes.mux.stop();
+    }
+  });
+
+  test("applies the common projection without a guard or legacy socket hook", async () => {
+    const first = appSessionRow("first");
+    const second = appSessionRow("second");
+    const projectionInputs: string[][] = [];
+    const routes = createAppRoutes({
+      driver: inertDriver([first, second]),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList(sessions) {
+        projectionInputs.push(sessions.map(({ name }) => name));
+        return [sessions[1]!];
+      },
+    });
+    const socket = createCapturingSocket(undefined);
+
+    try {
+      routes.websocket.open(socket);
+      expect(sessionNames(socket.frames[0])).toEqual([second.name]);
+      const response = await routes.fetch(
+        new Request("http://app.test/api/sessions"),
+        { upgrade: () => false },
+      );
+      expect((await response?.json() as AppSessionRow[]).map(({ name }) => name))
+        .toEqual([second.name]);
+      expect(projectionInputs).toEqual([
+        [first.name, second.name],
+        [first.name, second.name],
+      ]);
+    } finally {
+      routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("keeps the guard last with only the common socket projection", async () => {
+    const allowed = appSessionRow("guarded-common-allowed");
+    const denied = appSessionRow("guarded-common-denied");
+    const token = `guarded-common-${process.pid}-${Date.now()}`;
+    const projectionInputs: string[][] = [];
+    const routes = createAppRoutes({
+      driver: inertDriver([allowed, denied]),
+      archive: null,
+      guard: createTokenGuard({
+        grants: [{
+          token,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [allowed.name],
+        }],
+      }),
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList(sessions) {
+        projectionInputs.push(sessions.map(({ name }) => name));
+        return [...sessions, denied];
+      },
+    });
+    let socket: CapturingSocket | null = null;
+
+    try {
+      let socketData: unknown;
+      const upgrade = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_req, options) {
+            socketData = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(upgrade?.status).toBe(204);
+      socket = createCapturingSocket(socketData);
+      routes.websocket.open(socket);
+      expect(projectionInputs).toEqual([[allowed.name]]);
+      expect(sessionNames(socket.frames.at(-1))).toEqual([allowed.name]);
+    } finally {
+      if (socket) routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("keeps omitted session-list projection bytes unchanged on both transports", async () => {
+    const rows = [appSessionRow("unchanged-a"), appSessionRow("unchanged-b")];
+    const routes = createAppRoutes({
+      driver: inertDriver(rows),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+    });
+    const rawFrames: string[] = [];
+    const socket: WsLike = {
+      send(raw) {
+        rawFrames.push(raw);
+        return raw.length;
+      },
+    };
+
+    try {
+      routes.websocket.open(socket);
+      expect(rawFrames).toEqual([JSON.stringify({
+        channel: "__sessions",
+        type: "sessions",
+        data: JSON.stringify(rows),
+      })]);
+
+      const response = await routes.fetch(
+        new Request("http://app.test/api/sessions"),
+        { upgrade: () => false },
+      );
+      expect(await response?.text()).toBe(JSON.stringify(rows));
+    } finally {
+      routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("preserves the legacy socket-only filter when the common projection is omitted", async () => {
+    const visible = appSessionRow("legacy-visible");
+    const hidden = appSessionRow("legacy-hidden");
+    let legacyCalls = 0;
+    const routes = createAppRoutes({
+      driver: inertDriver([visible, hidden]),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      mux: {
+        hooks: {
+          filterSessionList(sessions) {
+            legacyCalls += 1;
+            return sessions.filter(({ name }) => name === visible.name);
+          },
+        },
+      },
+    });
+    const socket = createCapturingSocket(undefined);
+
+    try {
+      routes.websocket.open(socket);
+      expect(sessionNames(socket.frames.at(-1))).toEqual([visible.name]);
+      expect(legacyCalls).toBe(1);
+
+      const response = await routes.fetch(
+        new Request("http://app.test/api/sessions"),
+        { upgrade: () => false },
+      );
+      expect((await response?.json() as AppSessionRow[]).map(({ name }) => name))
+        .toEqual([visible.name, hidden.name]);
+      expect(legacyCalls).toBe(1);
+    } finally {
+      routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("fails closed when an unguarded WebSocket common projection throws", () => {
+    const secret = appSessionRow("unguarded-socket-secret");
+    const logs: unknown[][] = [];
+    const routes = createAppRoutes({
+      driver: inertDriver([secret]),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList() {
+        throw new Error("unguarded projection exploded");
+      },
+      mux: {
+        logError: (...args) => { logs.push(args); },
+      },
+    });
+    const socket = createCapturingSocket(undefined);
+
+    try {
+      expect(() => routes.websocket.open(socket)).not.toThrow();
+      expect(socket.frames.filter(({ type }) => type === "sessions")).toHaveLength(0);
+      expect(logs).toEqual([[
+        "[thumbmux-mux] filterSessionList threw:",
+        "unguarded projection exploded",
+      ]]);
+      expect(JSON.stringify(logs)).not.toContain(secret.name);
+    } finally {
+      routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+  });
+
+  test("fails closed when the common projection throws on HTTP or WebSocket", async () => {
+    const secretA = appSessionRow("secret-a");
+    const secretB = appSessionRow("secret-b");
+    const token = `projection-throw-${process.pid}-${Date.now()}`;
+    const logs: unknown[][] = [];
+    const routes = createAppRoutes({
+      driver: inertDriver([secretA, secretB]),
+      archive: null,
+      guard: createTokenGuard({
+        grants: [{
+          token,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [secretA.name, secretB.name],
+        }],
+      }),
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList() {
+        throw new Error("projection exploded");
+      },
+      mux: {
+        logError: (...args) => { logs.push(args); },
+      },
+    });
+    let socket: CapturingSocket | null = null;
+
+    try {
+      const response = await routes.fetch(
+        new Request(`http://app.test/api/sessions?t=${encodeURIComponent(token)}`),
+        { upgrade: () => false },
+      );
+      expect(response?.status).toBe(500);
+      expect(await response?.text()).toBe('{"error":"session list projection failed"}');
+      expect(response?.headers.get("set-cookie")).toContain("HttpOnly");
+      expect(logs[0]).toEqual([
+        "[thumbmux-app-routes] projectSessionList threw:",
+        "projection exploded",
+      ]);
+
+      let socketData: unknown;
+      const upgrade = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_req, options) {
+            socketData = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(upgrade?.status).toBe(204);
+      socket = createCapturingSocket(socketData);
+      routes.websocket.open(socket);
+      expect(socket.frames.filter(({ type }) => type === "sessions")).toHaveLength(0);
+      expect(logs[1]).toEqual([
+        "[thumbmux-mux] filterSessionList threw:",
+        "projection exploded",
+      ]);
+      expect(logs).toHaveLength(2);
+
+      const serializedLogs = JSON.stringify(logs);
+      expect(serializedLogs).not.toContain(secretA.name);
+      expect(serializedLogs).not.toContain(secretB.name);
+      expect(serializedLogs).not.toContain(token);
+      expect(serializedLogs).not.toContain("http://app.test");
+      expect(serializedLogs).not.toContain("/api/sessions");
+    } finally {
+      if (socket) routes.websocket.close(socket);
+      routes.mux.stop();
+    }
+
+    const fallbackLogs: unknown[][] = [];
+    const consoleError = spyOn(console, "error").mockImplementation((...args) => {
+      fallbackLogs.push(args);
+      throw new Error("reporter failed");
+    });
+    const reporterFailureRoutes = createAppRoutes({
+      driver: inertDriver([secretA]),
+      archive: null,
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList() {
+        throw new Error("still deterministic");
+      },
+    });
+    try {
+      const response = await reporterFailureRoutes.fetch(
+        new Request("http://app.test/api/sessions"),
+        { upgrade: () => false },
+      );
+      expect(response?.status).toBe(500);
+      expect(await response?.text()).toBe('{"error":"session list projection failed"}');
+      expect(fallbackLogs).toEqual([[
+        "[thumbmux-app-routes] projectSessionList threw:",
+        "still deterministic",
+      ]]);
+    } finally {
+      reporterFailureRoutes.mux.stop();
+      consoleError.mockRestore();
+    }
+  });
+
+  test("does not run the common projection after a legacy socket hook throws", async () => {
+    const allowed = appSessionRow("allowed-before-legacy-throw");
+    const token = `legacy-throw-${process.pid}-${Date.now()}`;
+    const logs: unknown[][] = [];
+    let projectionCalls = 0;
+    const routes = createAppRoutes({
+      driver: inertDriver([allowed]),
+      archive: null,
+      guard: createTokenGuard({
+        grants: [{
+          token,
+          scope: "read",
+          expiresAt: Date.now() + 60_000,
+          sessions: [allowed.name],
+        }],
+      }),
+      spawn: false,
+      upload: false,
+      prefs: false,
+      kill: { enabled: false },
+      projectSessionList(sessions) {
+        projectionCalls += 1;
+        return sessions;
+      },
+      mux: {
+        logError: (...args) => { logs.push(args); },
+        hooks: {
+          filterSessionList() {
+            throw new Error("legacy exploded");
+          },
+        },
+      },
+    });
+    let socket: CapturingSocket | null = null;
+
+    try {
+      let socketData: unknown;
+      const upgrade = await routes.fetch(
+        new Request(`http://app.test/ws/tmux?t=${encodeURIComponent(token)}`),
+        {
+          upgrade(_req, options) {
+            socketData = (options as { data?: unknown } | undefined)?.data;
+            return true;
+          },
+        },
+      );
+      expect(upgrade?.status).toBe(204);
+      socket = createCapturingSocket(socketData);
+      routes.websocket.open(socket);
+      expect(socket.frames.filter(({ type }) => type === "sessions")).toHaveLength(0);
+      expect(projectionCalls).toBe(0);
+      expect(logs).toEqual([[
+        "[thumbmux-mux] filterSessionList threw:",
+        "legacy exploded",
+      ]]);
+    } finally {
+      if (socket) routes.websocket.close(socket);
+      routes.mux.stop();
     }
   });
 

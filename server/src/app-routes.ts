@@ -1,4 +1,4 @@
-import type { MuxClientMessage } from "@thumbmux/core";
+import type { MuxClientMessage, SessionListItem } from "@thumbmux/core";
 import {
   createBunTmuxDriver,
   killTmuxSession,
@@ -42,6 +42,14 @@ export interface AppRoutesOptions {
   basePath?: string;
   /** Polling, profile, hook, compression, and backpressure overrides. */
   mux?: Partial<TmuxWsMuxOptions>;
+  /**
+   * Transport-neutral, synchronous presentation projection applied to HTTP
+   * and WebSocket session-list deliveries. Do not mutate the input.
+   * Omitted = identity.
+   */
+  projectSessionList?: (
+    sessions: readonly SessionListItem[],
+  ) => readonly SessionListItem[];
   log?: (line: string) => void;
 }
 
@@ -242,6 +250,23 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
     ? new FileHistoryArchive({})
     : options.archive;
   const guard = options.guard;
+  const projectSessionList = options.projectSessionList;
+  const reportSessionListProjectionFailure = (error: unknown): void => {
+    let message = "unknown error";
+    try {
+      message = errorMessage(error);
+    } catch {
+      // Keep the HTTP failure deterministic even for an exotic thrown value.
+    }
+    try {
+      (options.mux?.logError ?? console.error)(
+        "[thumbmux-app-routes] projectSessionList threw:",
+        message,
+      );
+    } catch {
+      // A reporter failure must not turn the deterministic response into a throw.
+    }
+  };
   // Calls through the observed guard.revoke property sweep live sockets in-call.
   // Saved references, read-only guards, and expiry fall back to each socket's
   // scheduled authorization check. Neither path adds work to the frame hot path.
@@ -345,13 +370,28 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
             principal,
             ({ name }) => name,
           );
-          const projected = hostHooks?.filterSessionList
-            ? hostHooks.filterSessionList(allowed, ws, client)
+          if (!projectSessionList) {
+            const projected = hostHooks?.filterSessionList
+              ? hostHooks.filterSessionList(allowed, ws, client)
+              : allowed;
+            // Preserve the existing omitted-option composition exactly.
+            return guard.filterSessions(
+              projected,
+              principal,
+              ({ name }) => name,
+            );
+          }
+          const projectInput = hostHooks?.filterSessionList
+            ? guard.filterSessions(
+                hostHooks.filterSessionList(allowed, ws, client),
+                principal,
+                ({ name }) => name,
+              )
             : allowed;
-          // The final projection remains guard-owned even when a host hook
-          // accidentally returns rows outside its input.
+          // The final projection remains guard-owned even when the common
+          // presentation stage accidentally returns rows outside its input.
           return guard.filterSessions(
-            projected,
+            projectSessionList(projectInput),
             principal,
             ({ name }) => name,
           );
@@ -379,7 +419,17 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
           }
         },
       }
-    : hostHooks;
+    : projectSessionList
+      ? {
+          ...hostHooks,
+          filterSessionList(sessions, ws, client) {
+            const legacyProjected = hostHooks?.filterSessionList
+              ? hostHooks.filterSessionList(sessions, ws, client)
+              : sessions;
+            return projectSessionList(legacyProjected);
+          },
+        }
+      : hostHooks;
   const muxLog = options.log
     ? (...args: unknown[]) => options.log!(args.map(String).join(" "))
     : options.mux?.log;
@@ -528,13 +578,55 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
         if (req.method !== "GET") {
           return guard ? methodNotAllowed("GET") : null;
         }
-        if (!guard) return Response.json(driver.listSessions());
+        if (!guard) {
+          const sessions = driver.listSessions();
+          if (!projectSessionList) return Response.json(sessions);
+          let projected: readonly SessionListItem[];
+          try {
+            projected = projectSessionList(sessions);
+          } catch (error) {
+            reportSessionListProjectionFailure(error);
+            return Response.json(
+              { error: "session list projection failed" },
+              { status: 500 },
+            );
+          }
+          return Response.json(projected);
+        }
         const authorization = authenticateAndAuthorize(
           guard,
           req,
           { operation: "sessions-list" },
         );
         if (!authorization.ok) return authorization.response;
+        if (projectSessionList) {
+          const allowed = guard.filterSessions(
+            driver.listSessions(),
+            authorization.principal,
+            ({ name }) => name,
+          );
+          let projected: readonly SessionListItem[];
+          try {
+            projected = projectSessionList(allowed);
+          } catch (error) {
+            reportSessionListProjectionFailure(error);
+            return withSetCookie(
+              Response.json(
+                { error: "session list projection failed" },
+                { status: 500 },
+              ),
+              authorization.setCookie,
+            );
+          }
+          return withSetCookie(
+            Response.json(guard.filterSessions(
+              projected,
+              authorization.principal,
+              ({ name }) => name,
+            )),
+            authorization.setCookie,
+          );
+        }
         return withSetCookie(
           Response.json(guard.filterSessions(
             driver.listSessions(),
