@@ -105,9 +105,20 @@ export function keyboardEventToSequence(e: KeyLike, opts: KeyboardSequenceOption
   return null;
 }
 
-/** Wrap text for bracketed paste; normalize \r\n and \n to \r (like xterm.js). */
+/**
+ * Wrap text for bracketed paste; normalize \r\n and \n to \r, and strip ESC —
+ * both like xterm.js.
+ *
+ * The ESC strip is the load-bearing half. Clipboard content is not trusted input:
+ * a payload carrying its own ESC[201~ closes paste mode wherever the author of
+ * that text chose, and every byte after it reaches the pty as live keys, carriage
+ * returns included. Delimiting without sanitizing hands an attacker the ability
+ * to end the quoting they are inside of, which is the same shape as any other
+ * injection. xterm.js removes ESC for exactly this reason.
+ */
 export function bracketedPaste(text: string): string {
-  return `${ESC}[200~${text.replace(/\r\n|\n/g, '\r')}${ESC}[201~`;
+  const body = text.replace(/\r\n|\n/g, '\r').replace(/\x1b/g, '');
+  return `${ESC}[200~${body}${ESC}[201~`;
 }
 
 function modifiedCsi(final: string, shift: boolean, alt: boolean, ctrl: boolean): string {

@@ -335,4 +335,22 @@ describe('bracketedPaste', () => {
   test('preserves existing carriage returns', () => {
     expect(bracketedPaste('a\rb')).toBe('\x1b[200~a\rb\x1b[201~');
   });
+
+  // Clipboard content is not trusted input. A payload carrying its own ESC[201~
+  // ends paste mode where the attacker chose, and everything after it reaches the
+  // pty as live keys — including the carriage returns that submit them. Asserting
+  // on the whole string rather than "contains" is deliberate: it also pins that
+  // nothing was appended after the closing delimiter.
+  test('an embedded terminator cannot end paste mode early', () => {
+    expect(bracketedPaste('ok\x1b[201~\necho OWNED\n'))
+      .toBe('\x1b[200~ok[201~\recho OWNED\r\x1b[201~');
+  });
+
+  test('no ESC survives inside the delimiters, wherever it appears', () => {
+    for (const payload of ['\x1b', 'a\x1bb', '\x1b[200~nested\x1b[201~', 'tail\x1b']) {
+      const wrapped = bracketedPaste(payload);
+      const body = wrapped.slice('\x1b[200~'.length, -'\x1b[201~'.length);
+      expect(body).not.toContain('\x1b');
+    }
+  });
 });
