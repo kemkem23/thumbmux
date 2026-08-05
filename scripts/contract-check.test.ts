@@ -257,18 +257,27 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", "frozen"]);
   });
 
-  test("new declared exports require a minor boundary", () => {
+  test("a patch may declare a new export", () => {
     const baseline = fixture("0.8.4");
     writeBaselineManifest(baseline);
 
+    // A name no prior artifact exported cannot be referenced by any consumer
+    // compiled against it, so a patch carrying one breaks nothing. This rule
+    // changed in 0.9.2 — it previously required a minor boundary, which the
+    // releases had not followed since 0.8.2.
     const patch = fixture("0.8.5");
     writeCoreDeclarations(patch, [
       readFileSync(join(patch, "git-dist/core/index.d.ts"), "utf8").trimEnd(),
-      "export declare const additiveButTooSoon: string;",
+      "export declare const additiveInPatch: string;",
     ]);
     writeBaselineManifest(patch);
     expect(runFixture(patch, baseline).errors.map(({ code, name }) => [code, name]))
-      .toContainEqual(["baseline-patch-change", "additiveButTooSoon"]);
+      .not.toContainEqual(["baseline-patch-change", "additiveInPatch"]);
+
+    // The other direction — a retag must stay byte-identical because 1.0 claims
+    // exactly that — is pinned by "the 1.0 boundary is an exact no-surface-delta
+    // retag" below, which expects `onePointZeroSurprise` to error. Asserting it
+    // twice would only give two places to update and one to forget.
 
     const minor = fixture("0.9.0");
     writeCoreDeclarations(minor, [

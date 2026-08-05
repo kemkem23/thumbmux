@@ -54,12 +54,35 @@ releases, while this document said patches could not carry them. A policy the
 releases do not follow protects nobody; it only makes the gate's verdict
 ambiguous when it fires.
 
+A **new export** is the narrowest case of this and is permitted in a patch: a
+name no published artifact exported cannot be referenced by any consumer
+compiled against one, so there is nothing to break. It still has to enter the
+manifest with a tier — the gate refuses an undeclared export — and a new name
+should not enter at F, because freezing something no consumer has used is the
+mistake the 1.0 gate exists to prevent.
+
 What a patch still may not do is exactly what makes a change breaking: remove or
 rename an existing name, change the signature of an existing member, narrow a
 type consumers already construct, or demote a tier. Those remain minor-boundary
 work with the full ceremony, and the surface gate plus the frozen consumers are
 what tell the two apart — a declaration hash changing is the gate asking for a
 decision, not evidence of a break.
+
+Two boundaries stay closed to additions of any kind. A **retag** must be
+byte-identical, because that claim is the whole of the 1.0 gate. And a release
+that does **not bump the version at all** may not add anything either — the
+published `vX.Y.Z-dist` tag is supposed to identify one artifact, and two
+artifacts answering to one version is the failure that immutability exists to
+prevent.
+
+When a change is additive for consumers but not in a shape the gate can prove —
+a widened return type, for instance, which every existing caller still satisfies
+— the reviewed exception table in `scripts/contract-check.ts` is where that
+decision is recorded. Each entry pins both the baseline digest and the reviewed
+digest, so any further change stops matching and the gate fires again, and the
+table is scoped to one release so it expires on its own. The evidence behind
+such an entry must be a frozen consumer fixture that compiled and ran, never an
+argument that it looks safe.
 
 ### The gate to 1.0
 
