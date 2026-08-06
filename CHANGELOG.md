@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.11.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.11.1-dist`.
+
+## v0.11.1 — 2026-08-06
+
+No runtime change. `v0.11.0-dist` published from a commit whose `ci` was red, and
+a dist tag cannot be made to mean something else, so this is that code plus one
+test-harness fix under a number nobody has pinned.
+
+The fix: `executeBuiltClient` ended with `preview.kill()` followed by an unbounded
+`await preview.exited`. If the preview server declines SIGTERM the suite waits
+forever. On the two-core runner that is what happened — 479 tests passed and the
+one remaining burned its entire 600s budget *after* its assertions were already
+satisfied, so a teardown hang was reported as a failure of the bundle it was
+testing. Teardown now escalates to SIGKILL and stops waiting either way.
 
 ## v0.11.0 — 2026-08-06
 

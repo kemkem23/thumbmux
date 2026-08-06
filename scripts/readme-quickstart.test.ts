@@ -303,10 +303,35 @@ async function executeBuiltClient(): Promise<string[]> {
     await page.waitForTimeout(100);
   } finally {
     await browser?.close();
-    preview.kill();
-    await preview.exited;
+    await stopPreview(preview);
   }
   return errors;
+}
+
+/** Stop the preview server without an unbounded wait on its exit.
+ *
+ * `preview.kill()` sends SIGTERM and `await preview.exited` waits forever if the
+ * process declines to take it. On the two-core CI runner this is exactly what
+ * happened: 479 tests passed and this one alone burned the whole 600s budget
+ * after its assertions were already satisfied, so the failure looked like the
+ * bundle test and was really the teardown. Escalate to SIGKILL, and stop waiting
+ * either way — a leaked preview process is a smaller problem than a suite that
+ * never returns, and the runner reaps it when the job ends.
+ */
+async function stopPreview(preview: { kill: (signal?: number | NodeJS.Signals) => void; exited: Promise<number> }): Promise<void> {
+  const settled = async (ms: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
+    try {
+      return await Promise.race([preview.exited.then(() => true as const), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  preview.kill();
+  if (await settled(5_000)) return;
+  preview.kill("SIGKILL");
+  await settled(5_000);
 }
 
 async function reservePort(): Promise<number> {
