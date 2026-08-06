@@ -77,7 +77,12 @@
     bottomInsetPx = 0,
     claimGeometry = true,
     altScreenMouse = false,
-    screen = null,
+    /**
+     * Default is `undefined` (host did not pass the prop) so live screen mode
+     * from mux meta can drive routing. An explicit `null` or object wins —
+     * hosts that know better (demo, static alt-screen surfaces) stay in charge.
+     */
+    screen = undefined,
     onKeys = undefined,
     onTap = undefined,
     onLinesChange = undefined,
@@ -98,10 +103,11 @@
      * for alt-screen TUIs. Ignored for pointer routing when `screen` is set —
      * then `screen.mouseSgr` wins. */
     altScreenMouse?: boolean;
-    /** Live pane screen mode from the host (tmux #{alternate_on} /
-     * #{mouse_sgr_flag} / #{mouse_any_flag}). When present, wins over the
-     * static altScreenMouse boolean for pointer routing and gates scrollback
-     * when alt is true. Structural inline type so this file compiles alone. */
+    /** Explicit host override of pane screen mode (tmux #{alternate_on} /
+     * #{mouse_sgr_flag} / #{mouse_any_flag}). When the prop is omitted
+     * (`undefined`), live `meta.screen` from the mux subscription is used.
+     * An explicit `null` or object always wins over the wire. Structural
+     * inline type so this file compiles alone. */
     screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
     onKeys?: (data: string) => void;
     /** Fired on a CLEAN tap (short, low-movement, not a link, no selection) —
@@ -113,10 +119,27 @@
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
   } = $props();
 
-  /** Pointer routing: live screen.mouseSgr wins; otherwise static altScreenMouse. */
-  const useSgrMouse = $derived(screen != null ? screen.mouseSgr : altScreenMouse);
+  /**
+   * Screen mode sampled from the last mux delivery that carried `meta.screen`.
+   * Only used when the host did not pass the `screen` prop explicitly.
+   */
+  let liveScreen = $state<{ alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null>(null);
+  let liveScreenSeen = $state(false);
+
+  /**
+   * Effective screen mode: explicit prop (including null) wins; otherwise the
+   * sticky live value from wire meta when one has been observed.
+   */
+  const resolvedScreen = $derived(
+    screen !== undefined
+      ? screen
+      : (liveScreenSeen ? liveScreen : null),
+  );
+
+  /** Pointer routing: live/explicit screen.mouseSgr wins; otherwise static altScreenMouse. */
+  const useSgrMouse = $derived(resolvedScreen != null ? resolvedScreen.mouseSgr : altScreenMouse);
   /** Alternate screen has no scrollback — suppress history expand/prepend. */
-  const noScrollback = $derived(screen != null && screen.alt);
+  const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
 
   const LINE_RATIO = 1.6;
   const OVERSCAN_ROWS = 60;
@@ -278,6 +301,7 @@
   type MuxDeliveryMeta = {
     source: 'full' | 'delta';
     replace: boolean;
+    screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
   };
 
   type SearchActiveIdentity = {
@@ -2836,6 +2860,12 @@
       cur?: { row: number; col: number } | null,
       meta?: MuxDeliveryMeta,
     ) => {
+      // Apply screen mode even when content is gated (busy/selection): pointer
+      // routing and scrollback policy must track the pane, not the paint queue.
+      if (meta && Object.prototype.hasOwnProperty.call(meta, 'screen')) {
+        liveScreen = meta.screen ?? null;
+        liveScreenSeen = true;
+      }
       if (type === 'history') {
         applyArchivedHistory(data);
         return;
