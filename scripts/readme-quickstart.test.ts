@@ -48,13 +48,24 @@ function command(
   cwd: string,
   env: Record<string, string | undefined> = process.env,
 ): CommandResult {
+  // Every synchronous shell-out in this file goes through here — installs,
+  // typechecks, bundler builds — and an unbounded spawnSync is how a runner
+  // waiting on a network fetch becomes a job that never ends. Three v0.9.2
+  // release attempts died on this step with nothing named, because a wait
+  // inside a child is invisible to bun's own --timeout. Ten minutes is far past
+  // any of these commands; exceeding it is a failure worth reading, not a wait
+  // worth continuing.
   const result = Bun.spawnSync({
     cmd,
     cwd,
     env,
     stdout: "pipe",
     stderr: "pipe",
+    timeout: 600_000,
   });
+  if (result.exitCode === null) {
+    throw new Error(`quickstart command timed out after 600s: ${cmd.join(" ")} (cwd ${cwd})`);
+  }
   return {
     exitCode: result.exitCode,
     stdout: result.stdout.toString(),
