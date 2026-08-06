@@ -43,6 +43,10 @@ type CommandResult = {
   stdout: string;
 };
 
+/** Bounds one shell-out. Must stay well under BUILD_AND_BROWSE_TIMEOUT_MS so a
+ *  hung command names itself instead of expiring together with its test. */
+const COMMAND_TIMEOUT_MS = 240_000;
+
 function command(
   cmd: string[],
   cwd: string,
@@ -50,21 +54,28 @@ function command(
 ): CommandResult {
   // Every synchronous shell-out in this file goes through here — installs,
   // typechecks, bundler builds — and an unbounded spawnSync is how a runner
-  // waiting on a network fetch becomes a job that never ends. Three v0.9.2
-  // release attempts died on this step with nothing named, because a wait
-  // inside a child is invisible to bun's own --timeout. Ten minutes is far past
-  // any of these commands; exceeding it is a failure worth reading, not a wait
-  // worth continuing.
+  // waiting on a network fetch becomes a job that never ends. A wait inside a
+  // child is invisible to bun's own --timeout, so the child needs its own.
+  //
+  // It must be MEANINGFULLY SMALLER than the per-test budget. It was 600_000,
+  // the same number as BUILD_AND_BROWSE_TIMEOUT_MS, so the test always expired
+  // first and the message below — written precisely to name which command hung —
+  // was unreachable. Two releases were spent reading "this test timed out after
+  // 600000ms", which says nothing, while the sentence that would have said
+  // everything sat one layer down and never fired. A bound equal to the bound
+  // above it is not a bound; it is a slower way to learn nothing.
   const result = Bun.spawnSync({
     cmd,
     cwd,
     env,
     stdout: "pipe",
     stderr: "pipe",
-    timeout: 600_000,
+    timeout: COMMAND_TIMEOUT_MS,
   });
   if (result.exitCode === null) {
-    throw new Error(`quickstart command timed out after 600s: ${cmd.join(" ")} (cwd ${cwd})`);
+    throw new Error(
+      `quickstart command timed out after ${COMMAND_TIMEOUT_MS / 1000}s: ${cmd.join(" ")} (cwd ${cwd})`,
+    );
   }
   return {
     exitCode: result.exitCode,
@@ -271,6 +282,9 @@ async function waitForHttp(origin: string): Promise<void> {
 }
 
 async function executeBuiltClient(): Promise<string[]> {
+  const started = performance.now();
+  const mark = (phase: string) =>
+    console.log(`[quickstart] ${phase} at ${Math.round(performance.now() - started)}ms`);
   const port = await reservePort();
   const origin = `http://127.0.0.1:${port}`;
   const preview = Bun.spawn({
@@ -290,8 +304,11 @@ async function executeBuiltClient(): Promise<string[]> {
   const errors: string[] = [];
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   try {
+    mark("preview-spawned");
     await waitForHttp(origin);
+    mark("preview-listening");
     browser = await chromium.launch({ headless: true });
+    mark("browser-launched");
     const page = await browser.newPage();
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(origin, { waitUntil: "domcontentloaded" });
@@ -301,11 +318,32 @@ async function executeBuiltClient(): Promise<string[]> {
       errors.push(error instanceof Error ? error.message : String(error));
     }
     await page.waitForTimeout(100);
+    mark("page-settled");
   } finally {
-    await browser?.close();
+    // Both teardown steps are bounded. This test's assertions are satisfied
+    // before we get here, so anything that stalls now turns a passing test into
+    // a timeout that names the wrong thing — which is exactly what shipped a
+    // red release twice. `browser.close()` on a page that threw during startup
+    // is the second candidate after the preview server, and neither is worth a
+    // suite that never returns.
+    await bounded(browser?.close(), 15_000, "browser.close");
     await stopPreview(preview);
   }
   return errors;
+}
+
+/** Await a promise, or give up after ms. Never rejects — teardown failures must
+ *  not mask the assertion result the caller already has. */
+async function bounded<T>(work: Promise<T> | undefined, ms: number, label: string): Promise<void> {
+  if (!work) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); });
+  try {
+    await Promise.race([work.then(() => undefined, () => undefined), expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  void label;
 }
 
 /** Stop the preview server without an unbounded wait on its exit.
