@@ -7,7 +7,7 @@
 A reusable web-terminal shell and server engine for driving tmux sessions —
 especially AI coding agents — from phone and desktop browsers: a compositor-
 scroll viewer, a keyboard-aware composer, a live session hub, and a multiplexed
-WebSocket engine. The current 0.9.x checkout exposes public core, Svelte,
+WebSocket engine. The current 0.11.x checkout exposes public core, Svelte,
 server, and assembled app entrypoints. It still needs a host process; it is not
 a standalone executable or an installed copy of the repository demo.
 
@@ -175,7 +175,7 @@ defines the current tier policy. This branch documents the current checkout
 and may include APIs newer than a published tag; do not infer that a dist tag
 exists from the local `package.json` version.
 
-A matching 0.9.x dist-tag install contains the prebuilt `thumbmux/core`,
+A matching dist-tag install contains the prebuilt `thumbmux/core`,
 `thumbmux/server`, `thumbmux/svelte`, and `thumbmux/app` entrypoints plus the
 supporting docs. It contains no standalone listener, demo directory, or package
 scripts; the surrounding process and deployment remain host code.
@@ -639,7 +639,7 @@ Docs: [application shell](docs/app.md) ·
 
 ## Compatibility checks
 
-The public policy is the 0.8.x-0.9.x
+The public policy is the pre-1.0
 [compatibility contract](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md).
 In a source checkout, after `bun run build:git-dist`, `bun run contract`
 compares the built `core`, `server`, `svelte`, and `app` declarations with their
@@ -650,7 +650,7 @@ consumer fixtures.
 artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
 and `app-host`. They compile and exercise the low-level host, guarded route
 composition, and Svelte app mount respectively. `thumbmux/app` and
-`createAppRoutes` remain **S — stabilizing** throughout 0.8.x-0.9.x; these checks are
+`createAppRoutes` remain **S — stabilizing** throughout the pre-1.0 line; these checks are
 evidence for the published tiers, not a claim of 1.0 compatibility.
 
 <details>
@@ -717,7 +717,7 @@ evidence for the published tiers, not a claim of 1.0 compatibility.
 - [x] prefs/upload data-loss paths fixed and previously untested components covered
 - [x] `smoke:git-dist` checks source-derived core/server export parity for consumers
 
-**v0.9.x — current checkout**
+**v0.11.x — current checkout**
 - [x] Mountable `ThumbmuxApp` plus hub, session, and embed views under `thumbmux/app`
 - [x] `createAppRoutes()` composition for the matching HTTP and WebSocket surface
 - [x] Four-subpath contract gate plus three separate frozen consumer fixtures
