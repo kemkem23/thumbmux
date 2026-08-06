@@ -152,14 +152,16 @@ policy, geometry ownership, view-only surfaces — is specified in
 ## Get started
 
 **📦 In your app — use a published dist tag.** The app-shell quickstart needs
-the 0.9.x surface. List the public 0.9.x tags, select the newest exact tag that
-actually exists, and pin it:
+the 0.8.0-or-later surface. List the public dist tags, select the newest exact
+tag that actually exists, and pin it. The glob deliberately does not name a
+minor: v0.9.1 shipped a quickstart pinned to `v0.8.*-dist`, so everyone who
+followed it landed on 0.8.3 and had no route forward.
 
 ```bash
 THUMBMUX_TAG="$(git ls-remote --tags https://github.com/kemkem23/thumbmux \
-  'refs/tags/v0.9.*-dist' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+  'refs/tags/v0.*-dist' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
 if test -z "$THUMBMUX_TAG"; then
-  echo "No published v0.9.x-dist tag found" >&2
+  echo "No published v0.x-dist tag found" >&2
 else
   bun add "thumbmux@github:kemkem23/thumbmux#${THUMBMUX_TAG}"
   # npm i "github:kemkem23/thumbmux#${THUMBMUX_TAG}"

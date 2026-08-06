@@ -42,90 +42,6 @@
     "tier": "F"
   },
   {
-    "name": "applyMuxDelta",
-    "kind": "value",
-    "signature": "8c5e618ae98c993d7563ed44f88e78d2e57a659454a77dbd716f2c3bd0926ec6",
-    "tier": "F"
-  },
-  {
-    "name": "bracketedPaste",
-    "kind": "value",
-    "signature": "33338b6459bc9c9a677f7986ceb5821be3061827b8b2483432ca24d037b9f5ca",
-    "tier": "F"
-  },
-  {
-    "name": "buildLaunchCommand",
-    "kind": "value",
-    "signature": "719a3355bc74edc5f5a36ea3ee4b6e97a01ae7734dd7a364c1a6d8d5385a5224",
-    "tier": "F"
-  },
-  {
-    "name": "buildLaunchSpec",
-    "kind": "value",
-    "signature": "3e7f3a97be0901399e56dc6dc2508a7172d3afc43b3f09b74e05eb1cfae8f4ad",
-    "tier": "F"
-  },
-  {
-    "name": "centerContentCell",
-    "kind": "value",
-    "signature": "f275beaa9ec31920fce475f2bdae474f0eed00a5b1877687fadc610d99cd135d",
-    "tier": "X"
-  },
-  {
-    "name": "charCellWidth",
-    "kind": "value",
-    "signature": "c591c3e2c0d64278af351ce9a656eaa0338fdc9f5c1bcf7750ca22f5c3475f08",
-    "tier": "F"
-  },
-  {
-    "name": "chooseMuxOutputFrame",
-    "kind": "value",
-    "signature": "eb8e46d560ed58b68cf6a6a95f3b00c70340b938252b87f1ef16bca03521595d",
-    "tier": "F"
-  },
-  {
-    "name": "cloneSgrState",
-    "kind": "value",
-    "signature": "55bd791336656c9f7f4d05cdf0d9c0602878a1bdfc7e4a012d0704020d5caebb",
-    "tier": "X"
-  },
-  {
-    "name": "collectTerminalUrlSegments",
-    "kind": "value",
-    "signature": "dc4266a8e047706a22e5c7fc95640fe348ba766ab65cdc9c4a20336d30ec58db",
-    "tier": "X"
-  },
-  {
-    "name": "consumeWholeWheelLines",
-    "kind": "value",
-    "signature": "4cdd699851539ffe8e318b8a1d13da9f5b15b73358617341b3add5411fdee453",
-    "tier": "X"
-  },
-  {
-    "name": "contentCellFromPoint",
-    "kind": "value",
-    "signature": "d4672a7a259f8bef49ecd310177a4b5885f3c981031ffc9fa635189208c63645",
-    "tier": "X"
-  },
-  {
-    "name": "contrastRatio",
-    "kind": "value",
-    "signature": "c6fa0a91f703b0274a0190707069ecfa24c15938cc837429f081ccc33f0eba3a",
-    "tier": "X"
-  },
-  {
-    "name": "createMuxDeltaFrame",
-    "kind": "value",
-    "signature": "567cb0c82a485a8064e224c51c34233e27fd6bad91f62cefe2f1beff35d97d07",
-    "tier": "F"
-  },
-  {
-    "name": "createSgrState",
-    "kind": "value",
-    "signature": "5e477cb6158c1c9d88efcacb4c85e9ab291a9edb0c74c65117df011a9b79cc65",
-    "tier": "F"
-  },
-  {
     "name": "DEFAULT_LAUNCH_PRESETS",
     "kind": "value",
     "signature": "733fcab5ce3d47945fbb58ac0d6b492800c34378f544d8a60d3654356937d073",
@@ -156,30 +72,6 @@
     "tier": "X"
   },
   {
-    "name": "defaultSurface",
-    "kind": "value",
-    "signature": "31a18d01a32831c447a0f19afd5e9b40a4338f4f77d2fabd853f68af1a699962",
-    "tier": "F"
-  },
-  {
-    "name": "deriveSurface",
-    "kind": "value",
-    "signature": "b6b6467a572fb20601b6ca930331dd82cc54a45b97cee5d3fac28f7d6a038a49",
-    "tier": "F"
-  },
-  {
-    "name": "extractRecentPrompts",
-    "kind": "value",
-    "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
-    "tier": "F"
-  },
-  {
-    "name": "extractRecentPromptsFromPane",
-    "kind": "value",
-    "signature": "ae8ce06a4c2692ebfda72f1b299e990b0b680e590c6ae9ac2d6b7de5dcc0c708",
-    "tier": "F"
-  },
-  {
     "name": "ExtractRecentPromptsFromPaneOptions",
     "kind": "type",
     "signature": "442b68363aba9d42fd8aef87ab18ef4ad2ae69a745b84d54ae69a081c42f232b",
@@ -192,81 +84,27 @@
     "tier": "F"
   },
   {
-    "name": "findLineOverlap",
-    "kind": "value",
-    "signature": "1e478b710f7fbec6d53c5816075f587856ea5fc78157f2b23c6a2f3fb0ceea97",
-    "tier": "X"
-  },
-  {
-    "name": "findTerminalUrlAtCell",
-    "kind": "value",
-    "signature": "5741c9d42bdce4d43349ebce571222df07cb9aa143f829321b73c203605e8932",
-    "tier": "X"
-  },
-  {
-    "name": "fnv1a32",
-    "kind": "value",
-    "signature": "ac6c56ba1d8a265689c2255f241232a685c48da95d22317a561d51748568b855",
-    "tier": "F"
-  },
-  {
-    "name": "formatUploadMessage",
-    "kind": "value",
-    "signature": "daae9f266cde939b99f78baada207a59f6db7f8d198a28d49f06943300c369ec",
-    "tier": "F"
-  },
-  {
     "name": "GROK_MODELS",
     "kind": "value",
     "signature": "5a763fd95220b003bb364dfb71143ee56ecac025eee177b53d1f33c1dbc99dbd",
     "tier": "D"
   },
   {
-    "name": "hexToRgb",
-    "kind": "value",
-    "signature": "4ca5411b6c153faf68a277d61452f220e91b8de9621626aadc1482983cd63059",
-    "tier": "X"
-  },
-  {
-    "name": "isClaudeStatusLine",
-    "kind": "value",
-    "signature": "d0de74ccb1b4a91796a9f3097a66f290ca8c1c4e0fe0f72662d54ae7dd992362",
-    "tier": "X"
-  },
-  {
-    "name": "isCodexStatusLine",
-    "kind": "value",
-    "signature": "83347e127e8daf5fe1ec88849ffe0efe8a0fdf58641cb23153760bc4728089b4",
-    "tier": "X"
-  },
-  {
-    "name": "isFaintPayload",
-    "kind": "value",
-    "signature": "14f3c592ee97345f6c124f4479d931ff6e0417fe8eb6cd99721c81663172bee8",
-    "tier": "X"
-  },
-  {
     "name": "JournalRecordV1",
     "kind": "type",
-    "signature": "00a59df6c8ce026a6ded3a4f3a48a5da9dbf05ab25f1ce0fd2d64dd5753aa9a0",
-    "tier": "F"
-  },
-  {
-    "name": "keyboardEventToSequence",
-    "kind": "value",
-    "signature": "8a0f42dbba0dde3b2b00e4a0901fe015e4df2ae5984046f4118f3e746d4d783c",
-    "tier": "F"
-  },
-  {
-    "name": "KeyboardSequenceOptions",
-    "kind": "type",
-    "signature": "2b72e1dc239b057791ffc8fb6eecaea8ed5fee5201f948dbbd21d3824e19abf5",
+    "signature": "0a656ab5b897149fd91089dc967ae831428515e755a2dd19fa31ec878dbd0388",
     "tier": "F"
   },
   {
     "name": "KeyLike",
     "kind": "type",
     "signature": "a2ed9899bbb5a62d0c3679b861d420a91e3adcf044ac6a9778987bac3abbfd0f",
+    "tier": "F"
+  },
+  {
+    "name": "KeyboardSequenceOptions",
+    "kind": "type",
+    "signature": "aaea63b88ae9adad17e227b9b948749fb2864184d10a88d21b90abbf485df66a",
     "tier": "F"
   },
   {
@@ -300,45 +138,9 @@
     "tier": "F"
   },
   {
-    "name": "lineToHtml",
-    "kind": "value",
-    "signature": "c23c88b073b1ccd6f15c62fe19e9ce6166487194d594b83677bd2916ba5213f5",
-    "tier": "F"
-  },
-  {
-    "name": "luminance",
-    "kind": "value",
-    "signature": "09b8c684c34e5783b45ad0ea48549d1c5c875a5b91e822523c6cd1756068683f",
-    "tier": "F"
-  },
-  {
-    "name": "makeStoredName",
-    "kind": "value",
-    "signature": "24b902ae0157416841ed13ecaf7dc46ac0ad913dd2374ee1a938512866783942",
-    "tier": "F"
-  },
-  {
     "name": "MAX_WHEEL_LINES_PER_FRAME",
     "kind": "value",
     "signature": "790c0ed394e468a29dc2e64c7378036128db7ffad56dc9ae2fe4bc2891b55e96",
-    "tier": "X"
-  },
-  {
-    "name": "mergeCapturedLinesForStableScroll",
-    "kind": "value",
-    "signature": "e80b465c145d501a81c75ec7d4aaf6d9b1742ea1af54d1d6b7b5308fab2da7dc",
-    "tier": "X"
-  },
-  {
-    "name": "mergePrefs",
-    "kind": "value",
-    "signature": "5d2a629ee4d8244573efc5488973ee7ddee732a24f40e7ae8541549afa2ba41f",
-    "tier": "F"
-  },
-  {
-    "name": "mix",
-    "kind": "value",
-    "signature": "ccdf373c30752f636ce131e203f6ff32df70211c3fa4cc6d138b77b4e4071223",
     "tier": "X"
   },
   {
@@ -360,12 +162,6 @@
     "tier": "F"
   },
   {
-    "name": "muxCommonPrefixLength",
-    "kind": "value",
-    "signature": "4091c61c198273a16a7573def365296a14da32c51fae43e38d90834b0c0f2ee0",
-    "tier": "F"
-  },
-  {
     "name": "MuxCursor",
     "kind": "type",
     "signature": "82353d628003683ed8ecf58ba85e67b7f1f8c046579b726b2e6d38927f1c1d2b",
@@ -374,19 +170,19 @@
   {
     "name": "MuxDeltaFrame",
     "kind": "type",
-    "signature": "69755d525c4713fe9d35aec21b88b921a3cb842e33d34c5945e6e833cdc90e49",
+    "signature": "6b9dd2dd08a154158fe2dc1eac7a088628c1eb7bf7716f6069f394bc187bc292",
     "tier": "F"
   },
   {
     "name": "MuxFullOutputFrame",
     "kind": "type",
-    "signature": "64f06e0081f994e6310c4f1755c9f7054d3ab7c72e1c83ce7b26a7c81cbecd09",
+    "signature": "34c415db8e45207f430cd2b1906895fa9bb2c43a16737bdf6a869965f1a2dea9",
     "tier": "F"
   },
   {
     "name": "MuxOutputFrame",
     "kind": "type",
-    "signature": "209ba3ffe5bb8e13b8fce3622f10aeeabd9b4a5959c9225a92198e66dcec247c",
+    "signature": "e8a96fc037e350c0441b9a211c0a3ce070773babc1f439e763e7779aa9affa08",
     "tier": "F"
   },
   {
@@ -396,16 +192,16 @@
     "tier": "F"
   },
   {
+    "name": "MuxPaneScreen",
+    "kind": "type",
+    "signature": "574ca0e3a7a8006bc554896e575bdb37b5b8a9da2255b8ffa73d2f8a78bd42fa",
+    "tier": "F"
+  },
+  {
     "name": "MuxPongFrame",
     "kind": "type",
     "signature": "1aa4511668a2efe45def4628dc87bd910dd16af9659dd7455fa88797674a8611",
     "tier": "S"
-  },
-  {
-    "name": "muxPrefixHash",
-    "kind": "value",
-    "signature": "a095de06716f6ff436f2bc61580a8df9cb432cf7580ea74e5fa509d4d3330302",
-    "tier": "F"
   },
   {
     "name": "MuxResyncRequest",
@@ -416,13 +212,13 @@
   {
     "name": "MuxServerFrame",
     "kind": "type",
-    "signature": "505d0ad0b1644fb339560e4ee1907ce472775ff411e637f2b9327b9e456dad44",
+    "signature": "65893d1d037e45422d63492b6d67a2cb2e242db174c24e11477014d79aac8af5",
     "tier": "S"
   },
   {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "ada9787a0f58320733a535ca8d1ee87d3963fdbbceb90d50c4474ca0bb12f715",
+    "signature": "dcf8bcb375cbd6569f7a640e3a0ee008e208a7189960e145c425f31203a6c276",
     "tier": "F"
   },
   {
@@ -432,33 +228,9 @@
     "tier": "S"
   },
   {
-    "name": "normalizeAgentNotificationEvent",
-    "kind": "value",
-    "signature": "db15cc28c1c80056c126b4c9bad5b9df82c47214e48e98fc610e3b3fd6a6236f",
-    "tier": "F"
-  },
-  {
-    "name": "normalizeHexColor",
-    "kind": "value",
-    "signature": "3f2170d942fd01299fb07791fb608f7e9a2706f2e78b7c97bc7f6d1b7fc02e9d",
-    "tier": "X"
-  },
-  {
-    "name": "paneTextForCopy",
-    "kind": "value",
-    "signature": "1b6bedccce4ee43ea21c0068cf5c7bda1b5569325f147f6648fe667292305288",
-    "tier": "F"
-  },
-  {
     "name": "ParsedReplayRecord",
     "kind": "type",
-    "signature": "08b80d04f3a4e9374944ff447790d2cd2f6af1a523524d5ff235ec998c0b73ea",
-    "tier": "F"
-  },
-  {
-    "name": "parseReplayJournal",
-    "kind": "value",
-    "signature": "3a5785f79979457fc100c9bdb30a1ae69747e786eabb50967b823707753e55db",
+    "signature": "dbfefd0994c7b368017b42e594c7a7495e7372d645854c5f3dc7066b348d4f38",
     "tier": "F"
   },
   {
@@ -468,21 +240,9 @@
     "tier": "X"
   },
   {
-    "name": "pasteInfo",
-    "kind": "value",
-    "signature": "384c7c89321b4fa0559006682a0f0ff5301aef174f3190bc5a3191e12a485b96",
-    "tier": "X"
-  },
-  {
     "name": "PasteInfoOptions",
     "kind": "type",
     "signature": "affde442c8bc74f5417f3a481ffa810443c5ac7cc2fbceea3934eb63ef793a7f",
-    "tier": "X"
-  },
-  {
-    "name": "planPrepend",
-    "kind": "value",
-    "signature": "ce2114cf1f279f5cbe9aa76dfeeec5bfad9cb07290d6eb934089d8f19d35bc9c",
     "tier": "X"
   },
   {
@@ -492,58 +252,34 @@
     "tier": "F"
   },
   {
-    "name": "prefixForCells",
-    "kind": "value",
-    "signature": "7317016c15250832563c0fb5cde557efa980e23d767db545fed7b0c33b1432bb",
-    "tier": "F"
-  },
-  {
     "name": "PromptMatcherSet",
     "kind": "type",
     "signature": "77136da059e5dfb51cee0d161fdd38297a7954903f052be393c38cac33c205bb",
     "tier": "F"
   },
   {
-    "name": "readerAnchorLineDelta",
-    "kind": "value",
-    "signature": "f6d9e1e1070c19e751a40ea032e9a5240c0cf4387a96cd69d3ae27ba35b3156d",
-    "tier": "X"
-  },
-  {
     "name": "ReplayFullCheckpoint",
     "kind": "type",
-    "signature": "50d3442a35d68baf00d70f3c564ce7ced7585c205715dd6fe49a5a461761c0fa",
+    "signature": "81edfe1faac98eed5e7075c27847ba44fe58e51696641686fefef12ac24035dc",
     "tier": "F"
   },
   {
     "name": "ReplayJournal",
     "kind": "value",
-    "signature": "88539163299a0bccdd7c5cf3ec383396d9d2f07b81aa488c9eff005eb073ae3f",
+    "signature": "5744f5c32016f2eb4a9e7da8fdb0662d056b4cbdb17aa10ff54fa03130912173",
     "tier": "F"
   },
   {
     "name": "ReplayLookup",
     "kind": "type",
-    "signature": "f86c4d04bfdad17f0336d929a049bfc9fb6b8b659b634c24e04149e2d1e2aa7f",
+    "signature": "90fd8b16398b32258e7094d011befda6ee71191b9b11a63397297bec9aded1a0",
     "tier": "F"
   },
   {
-    "name": "resetDeprecationWarnings",
+    "name": "SNAP_BOTTOM_EVENTS",
     "kind": "value",
-    "signature": "3842c51e81cc9ab8e10e613ef059ff784b3b81424759b42f47052e81b56ca2b2",
+    "signature": "90a925962d3d1e2234f70a495bf5a13f0d7e62c99023a67a243feda9265a80f3",
     "tier": "X"
-  },
-  {
-    "name": "rgbToHex",
-    "kind": "value",
-    "signature": "8e36ee07e9206425d7295f8adc68ddc90402ff91309eabfd5622ed24d6ff47ec",
-    "tier": "X"
-  },
-  {
-    "name": "sameOriginNotificationUrl",
-    "kind": "value",
-    "signature": "3f76d2bf664ac77eb31058101615443c37aa80c7d1975e8a63a96fff6362a3f8",
-    "tier": "F"
   },
   {
     "name": "SearchError",
@@ -555,12 +291,6 @@
     "name": "SearchErrorCode",
     "kind": "type",
     "signature": "9f3c6f8f41b1862c5c0cafb1e96069eef43b06024a0e966b815a66e7694ca848",
-    "tier": "F"
-  },
-  {
-    "name": "searchLines",
-    "kind": "value",
-    "signature": "f541b70676aed5f1498d91e1f4b4ca5f4c31447f09c094574671b4c407d977de",
     "tier": "F"
   },
   {
@@ -588,12 +318,6 @@
     "tier": "F"
   },
   {
-    "name": "serializedMuxFrameSize",
-    "kind": "value",
-    "signature": "118aacfe4fe71e4f2e944355b2654185d70a6957d8b86c470beb0223f6afbb0c",
-    "tier": "F"
-  },
-  {
     "name": "SessionListItem",
     "kind": "type",
     "signature": "dc958ade8d053983cdb526049faf4cc87a69a0e9ffff87045e08b9418c7e21fa",
@@ -606,57 +330,15 @@
     "tier": "F"
   },
   {
-    "name": "sgrClick",
-    "kind": "value",
-    "signature": "dcd29a6b77160b44b2242a99982ed26fa4b05dba2af0e8c6ebc1f877f21e8027",
-    "tier": "X"
-  },
-  {
-    "name": "sgrSnapToBottom",
-    "kind": "value",
-    "signature": "008c814ff9a8bd68ecf00961c5933ce542b0398b6e480eb58dc273f1e0f1d42b",
-    "tier": "X"
-  },
-  {
     "name": "SgrState",
     "kind": "type",
     "signature": "662969434d321c728bcf221e251ca7dc2ee532e6624baaeeaab6784e1c3c029a",
     "tier": "F"
   },
   {
-    "name": "sgrStateKey",
-    "kind": "value",
-    "signature": "e2f6b907853ff5ca832adcb04a7552e80bf72a6c569898be010bfc5cc276b439",
-    "tier": "X"
-  },
-  {
-    "name": "sgrWheel",
-    "kind": "value",
-    "signature": "e5045c27d86d84034a56628f4c49a664fe9c52595a86c3517b1ff04859f88a4e",
-    "tier": "X"
-  },
-  {
     "name": "Shortcut",
     "kind": "type",
     "signature": "dec457fb389de40caf9f10bcd50054ffc7d37e8214cedb3d44e6eb3a9bb28946",
-    "tier": "F"
-  },
-  {
-    "name": "shouldUseMuxDelta",
-    "kind": "value",
-    "signature": "b2563c2b13079a24bb8d7491557c3e5d6d3fce5c74b1fa294789255460a3e5f7",
-    "tier": "F"
-  },
-  {
-    "name": "SNAP_BOTTOM_EVENTS",
-    "kind": "value",
-    "signature": "90a925962d3d1e2234f70a495bf5a13f0d7e62c99023a67a243feda9265a80f3",
-    "tier": "X"
-  },
-  {
-    "name": "splitMuxOutputData",
-    "kind": "value",
-    "signature": "a432636eb6b7d6888a6b2bbf46c156b4c23c8c7e06823d5529cf1708657ca8ba",
     "tier": "F"
   },
   {
@@ -666,27 +348,9 @@
     "tier": "X"
   },
   {
-    "name": "stringCells",
-    "kind": "value",
-    "signature": "5868bdc45807a72b7e60b2d3e37b0a802bb8aea1e73269a8e536c971f42cb19c",
-    "tier": "F"
-  },
-  {
-    "name": "stripAnsi",
-    "kind": "value",
-    "signature": "6a25897783375cbf12e0baef9971230d59d850f496852c4dab28f7acc6c2bca5",
-    "tier": "F"
-  },
-  {
     "name": "SubmitAgent",
     "kind": "type",
     "signature": "291af78d4e337d6a5fb9786ea5ea293227eeaaa54bdee2fc8fc83411879957a8",
-    "tier": "F"
-  },
-  {
-    "name": "submitPlan",
-    "kind": "value",
-    "signature": "e0393d1b984730c03237088f72aa3f4971a15baa377abd6a1ca06a3f3db58208",
     "tier": "F"
   },
   {
@@ -744,6 +408,354 @@
     "tier": "F"
   },
   {
+    "name": "WheelDeltaInput",
+    "kind": "type",
+    "signature": "5b9673290823027e3ab0bb9dfc5fc66b8b8535809605940a55518a6f47628f37",
+    "tier": "X"
+  },
+  {
+    "name": "applyMuxDelta",
+    "kind": "value",
+    "signature": "8c5e618ae98c993d7563ed44f88e78d2e57a659454a77dbd716f2c3bd0926ec6",
+    "tier": "F"
+  },
+  {
+    "name": "bracketedPaste",
+    "kind": "value",
+    "signature": "33338b6459bc9c9a677f7986ceb5821be3061827b8b2483432ca24d037b9f5ca",
+    "tier": "F"
+  },
+  {
+    "name": "buildLaunchCommand",
+    "kind": "value",
+    "signature": "719a3355bc74edc5f5a36ea3ee4b6e97a01ae7734dd7a364c1a6d8d5385a5224",
+    "tier": "F"
+  },
+  {
+    "name": "buildLaunchSpec",
+    "kind": "value",
+    "signature": "3e7f3a97be0901399e56dc6dc2508a7172d3afc43b3f09b74e05eb1cfae8f4ad",
+    "tier": "F"
+  },
+  {
+    "name": "centerContentCell",
+    "kind": "value",
+    "signature": "f275beaa9ec31920fce475f2bdae474f0eed00a5b1877687fadc610d99cd135d",
+    "tier": "X"
+  },
+  {
+    "name": "charCellWidth",
+    "kind": "value",
+    "signature": "c591c3e2c0d64278af351ce9a656eaa0338fdc9f5c1bcf7750ca22f5c3475f08",
+    "tier": "F"
+  },
+  {
+    "name": "chooseMuxOutputFrame",
+    "kind": "value",
+    "signature": "6847f33bfd780fe6a31907e6ce2883b0af11d026138551d4af5be48fadd9ead9",
+    "tier": "F"
+  },
+  {
+    "name": "cloneSgrState",
+    "kind": "value",
+    "signature": "55bd791336656c9f7f4d05cdf0d9c0602878a1bdfc7e4a012d0704020d5caebb",
+    "tier": "X"
+  },
+  {
+    "name": "collectTerminalUrlSegments",
+    "kind": "value",
+    "signature": "dc4266a8e047706a22e5c7fc95640fe348ba766ab65cdc9c4a20336d30ec58db",
+    "tier": "X"
+  },
+  {
+    "name": "consumeWholeWheelLines",
+    "kind": "value",
+    "signature": "4cdd699851539ffe8e318b8a1d13da9f5b15b73358617341b3add5411fdee453",
+    "tier": "X"
+  },
+  {
+    "name": "contentCellFromPoint",
+    "kind": "value",
+    "signature": "d4672a7a259f8bef49ecd310177a4b5885f3c981031ffc9fa635189208c63645",
+    "tier": "X"
+  },
+  {
+    "name": "contrastRatio",
+    "kind": "value",
+    "signature": "c6fa0a91f703b0274a0190707069ecfa24c15938cc837429f081ccc33f0eba3a",
+    "tier": "X"
+  },
+  {
+    "name": "createMuxDeltaFrame",
+    "kind": "value",
+    "signature": "a30d7c65cac9c1f6a4bcb317104ad340a2a7edcf12ad76b25c49c86420f7e41c",
+    "tier": "F"
+  },
+  {
+    "name": "createSgrState",
+    "kind": "value",
+    "signature": "5e477cb6158c1c9d88efcacb4c85e9ab291a9edb0c74c65117df011a9b79cc65",
+    "tier": "F"
+  },
+  {
+    "name": "defaultSurface",
+    "kind": "value",
+    "signature": "31a18d01a32831c447a0f19afd5e9b40a4338f4f77d2fabd853f68af1a699962",
+    "tier": "F"
+  },
+  {
+    "name": "deriveSurface",
+    "kind": "value",
+    "signature": "b6b6467a572fb20601b6ca930331dd82cc54a45b97cee5d3fac28f7d6a038a49",
+    "tier": "F"
+  },
+  {
+    "name": "extractRecentPrompts",
+    "kind": "value",
+    "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
+    "tier": "F"
+  },
+  {
+    "name": "extractRecentPromptsFromPane",
+    "kind": "value",
+    "signature": "ae8ce06a4c2692ebfda72f1b299e990b0b680e590c6ae9ac2d6b7de5dcc0c708",
+    "tier": "F"
+  },
+  {
+    "name": "findLineOverlap",
+    "kind": "value",
+    "signature": "1e478b710f7fbec6d53c5816075f587856ea5fc78157f2b23c6a2f3fb0ceea97",
+    "tier": "X"
+  },
+  {
+    "name": "findTerminalUrlAtCell",
+    "kind": "value",
+    "signature": "5741c9d42bdce4d43349ebce571222df07cb9aa143f829321b73c203605e8932",
+    "tier": "X"
+  },
+  {
+    "name": "fnv1a32",
+    "kind": "value",
+    "signature": "ac6c56ba1d8a265689c2255f241232a685c48da95d22317a561d51748568b855",
+    "tier": "F"
+  },
+  {
+    "name": "formatUploadMessage",
+    "kind": "value",
+    "signature": "daae9f266cde939b99f78baada207a59f6db7f8d198a28d49f06943300c369ec",
+    "tier": "F"
+  },
+  {
+    "name": "hexToRgb",
+    "kind": "value",
+    "signature": "4ca5411b6c153faf68a277d61452f220e91b8de9621626aadc1482983cd63059",
+    "tier": "X"
+  },
+  {
+    "name": "isClaudeStatusLine",
+    "kind": "value",
+    "signature": "d0de74ccb1b4a91796a9f3097a66f290ca8c1c4e0fe0f72662d54ae7dd992362",
+    "tier": "X"
+  },
+  {
+    "name": "isCodexStatusLine",
+    "kind": "value",
+    "signature": "83347e127e8daf5fe1ec88849ffe0efe8a0fdf58641cb23153760bc4728089b4",
+    "tier": "X"
+  },
+  {
+    "name": "isFaintPayload",
+    "kind": "value",
+    "signature": "14f3c592ee97345f6c124f4479d931ff6e0417fe8eb6cd99721c81663172bee8",
+    "tier": "X"
+  },
+  {
+    "name": "keyboardEventToSequence",
+    "kind": "value",
+    "signature": "b684c548100331321cc6a7890d5e8c9b493cdd18e0f666c48f0434095f47e287",
+    "tier": "F"
+  },
+  {
+    "name": "lineToHtml",
+    "kind": "value",
+    "signature": "c23c88b073b1ccd6f15c62fe19e9ce6166487194d594b83677bd2916ba5213f5",
+    "tier": "F"
+  },
+  {
+    "name": "luminance",
+    "kind": "value",
+    "signature": "09b8c684c34e5783b45ad0ea48549d1c5c875a5b91e822523c6cd1756068683f",
+    "tier": "F"
+  },
+  {
+    "name": "makeStoredName",
+    "kind": "value",
+    "signature": "24b902ae0157416841ed13ecaf7dc46ac0ad913dd2374ee1a938512866783942",
+    "tier": "F"
+  },
+  {
+    "name": "mergeCapturedLinesForStableScroll",
+    "kind": "value",
+    "signature": "e80b465c145d501a81c75ec7d4aaf6d9b1742ea1af54d1d6b7b5308fab2da7dc",
+    "tier": "X"
+  },
+  {
+    "name": "mergePrefs",
+    "kind": "value",
+    "signature": "5d2a629ee4d8244573efc5488973ee7ddee732a24f40e7ae8541549afa2ba41f",
+    "tier": "F"
+  },
+  {
+    "name": "mix",
+    "kind": "value",
+    "signature": "ccdf373c30752f636ce131e203f6ff32df70211c3fa4cc6d138b77b4e4071223",
+    "tier": "X"
+  },
+  {
+    "name": "muxCommonPrefixLength",
+    "kind": "value",
+    "signature": "4091c61c198273a16a7573def365296a14da32c51fae43e38d90834b0c0f2ee0",
+    "tier": "F"
+  },
+  {
+    "name": "muxPrefixHash",
+    "kind": "value",
+    "signature": "a095de06716f6ff436f2bc61580a8df9cb432cf7580ea74e5fa509d4d3330302",
+    "tier": "F"
+  },
+  {
+    "name": "normalizeAgentNotificationEvent",
+    "kind": "value",
+    "signature": "db15cc28c1c80056c126b4c9bad5b9df82c47214e48e98fc610e3b3fd6a6236f",
+    "tier": "F"
+  },
+  {
+    "name": "normalizeHexColor",
+    "kind": "value",
+    "signature": "3f2170d942fd01299fb07791fb608f7e9a2706f2e78b7c97bc7f6d1b7fc02e9d",
+    "tier": "X"
+  },
+  {
+    "name": "paneTextForCopy",
+    "kind": "value",
+    "signature": "1b6bedccce4ee43ea21c0068cf5c7bda1b5569325f147f6648fe667292305288",
+    "tier": "F"
+  },
+  {
+    "name": "parseReplayJournal",
+    "kind": "value",
+    "signature": "4f0141a0717d3ccd6b9a52f205d17e0fe57099b838ecbf27940405341f54e1eb",
+    "tier": "F"
+  },
+  {
+    "name": "pasteInfo",
+    "kind": "value",
+    "signature": "384c7c89321b4fa0559006682a0f0ff5301aef174f3190bc5a3191e12a485b96",
+    "tier": "X"
+  },
+  {
+    "name": "planPrepend",
+    "kind": "value",
+    "signature": "ce2114cf1f279f5cbe9aa76dfeeec5bfad9cb07290d6eb934089d8f19d35bc9c",
+    "tier": "X"
+  },
+  {
+    "name": "prefixForCells",
+    "kind": "value",
+    "signature": "7317016c15250832563c0fb5cde557efa980e23d767db545fed7b0c33b1432bb",
+    "tier": "F"
+  },
+  {
+    "name": "readerAnchorLineDelta",
+    "kind": "value",
+    "signature": "f6d9e1e1070c19e751a40ea032e9a5240c0cf4387a96cd69d3ae27ba35b3156d",
+    "tier": "X"
+  },
+  {
+    "name": "resetDeprecationWarnings",
+    "kind": "value",
+    "signature": "3842c51e81cc9ab8e10e613ef059ff784b3b81424759b42f47052e81b56ca2b2",
+    "tier": "X"
+  },
+  {
+    "name": "rgbToHex",
+    "kind": "value",
+    "signature": "8e36ee07e9206425d7295f8adc68ddc90402ff91309eabfd5622ed24d6ff47ec",
+    "tier": "X"
+  },
+  {
+    "name": "sameOriginNotificationUrl",
+    "kind": "value",
+    "signature": "3f76d2bf664ac77eb31058101615443c37aa80c7d1975e8a63a96fff6362a3f8",
+    "tier": "F"
+  },
+  {
+    "name": "searchLines",
+    "kind": "value",
+    "signature": "f541b70676aed5f1498d91e1f4b4ca5f4c31447f09c094574671b4c407d977de",
+    "tier": "F"
+  },
+  {
+    "name": "serializedMuxFrameSize",
+    "kind": "value",
+    "signature": "e7aa70f1d8fb6f6c693c59e126d28eaf963a3408c12c31cf3b88582fba9935dc",
+    "tier": "F"
+  },
+  {
+    "name": "sgrClick",
+    "kind": "value",
+    "signature": "dcd29a6b77160b44b2242a99982ed26fa4b05dba2af0e8c6ebc1f877f21e8027",
+    "tier": "X"
+  },
+  {
+    "name": "sgrSnapToBottom",
+    "kind": "value",
+    "signature": "008c814ff9a8bd68ecf00961c5933ce542b0398b6e480eb58dc273f1e0f1d42b",
+    "tier": "X"
+  },
+  {
+    "name": "sgrStateKey",
+    "kind": "value",
+    "signature": "e2f6b907853ff5ca832adcb04a7552e80bf72a6c569898be010bfc5cc276b439",
+    "tier": "X"
+  },
+  {
+    "name": "sgrWheel",
+    "kind": "value",
+    "signature": "e5045c27d86d84034a56628f4c49a664fe9c52595a86c3517b1ff04859f88a4e",
+    "tier": "X"
+  },
+  {
+    "name": "shouldUseMuxDelta",
+    "kind": "value",
+    "signature": "0ff9bbbd584209463d47968caa04570e652381a887fe0e4d9eff744430610538",
+    "tier": "F"
+  },
+  {
+    "name": "splitMuxOutputData",
+    "kind": "value",
+    "signature": "a432636eb6b7d6888a6b2bbf46c156b4c23c8c7e06823d5529cf1708657ca8ba",
+    "tier": "F"
+  },
+  {
+    "name": "stringCells",
+    "kind": "value",
+    "signature": "5868bdc45807a72b7e60b2d3e37b0a802bb8aea1e73269a8e536c971f42cb19c",
+    "tier": "F"
+  },
+  {
+    "name": "stripAnsi",
+    "kind": "value",
+    "signature": "6a25897783375cbf12e0baef9971230d59d850f496852c4dab28f7acc6c2bca5",
+    "tier": "F"
+  },
+  {
+    "name": "submitPlan",
+    "kind": "value",
+    "signature": "e0393d1b984730c03237088f72aa3f4971a15baa377abd6a1ca06a3f3db58208",
+    "tier": "F"
+  },
+  {
     "name": "utf8ByteLength",
     "kind": "value",
     "signature": "b7591b5793e00df21358f2a082a079447e6c856788efd4cff253cd67ca7f4176",
@@ -758,19 +770,13 @@
   {
     "name": "validateMuxDeltaFrame",
     "kind": "value",
-    "signature": "df85bf91b9844bac5365f03eba63aa27ceb85587d15eb07526ca3535a1efeab3",
+    "signature": "d010349a53ca343a3a38c1e32285882edcbf2719cdf67018327fd5af88c7005e",
     "tier": "F"
   },
   {
     "name": "warnDeprecated",
     "kind": "value",
     "signature": "55147f742bb9904ddc3e03497bfe9831a0e471c7c76d998af86b8af3f1de8644",
-    "tier": "X"
-  },
-  {
-    "name": "WheelDeltaInput",
-    "kind": "type",
-    "signature": "5b9673290823027e3ab0bb9dfc5fc66b8b8535809605940a55518a6f47628f37",
     "tier": "X"
   },
   {

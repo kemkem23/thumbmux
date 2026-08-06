@@ -33,7 +33,6 @@ export type LiveContractEntry = {
     members: string[];
   };
   /** Rich digest with only the two reviewed v0.9.2 optional additions erased. */
-  v092CompatibilitySignature?: string;
   /** Raw text after the emitted declaration's @deprecated tag. */
   deprecatedDeclaration?: string;
 };
@@ -578,45 +577,6 @@ function componentOptionalAdditionModel(
   throw new Error(`could not read Svelte component declaration for ${exportName}`);
 }
 
-function v092EmbedViewCompatibilitySignature(
-  checker: ts.TypeChecker,
-  symbol: ts.Symbol,
-  declarationRoot: string,
-): string | undefined {
-  for (const declaration of symbol.declarations ?? []) {
-    if (!ts.isVariableDeclaration(declaration)) continue;
-    const typeArguments = componentTypeArgumentNodes(declaration.type);
-    if (typeArguments.length === 0) continue;
-    const propsSymbol = typeReferenceSymbol(checker, typeArguments[0]!);
-    const allowedOwnerKeys = new Set(
-      (propsSymbol?.declarations ?? []).map(declarationKey),
-    );
-    return signatureWithDependencies(
-      checker,
-      [],
-      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
-      typeArguments,
-      declarationRoot,
-      true,
-      (dependency) => stripExactOptionalProperty(
-        dependency,
-        null,
-        "claimGeometry",
-        "boolean",
-        allowedOwnerKeys,
-      ),
-      (node) => exactOptionalProperty(
-        node,
-        null,
-        "claimGeometry",
-        "boolean",
-        allowedOwnerKeys,
-      ),
-    );
-  }
-  return undefined;
-}
-
 function compatibilityDeclarationSignature(
   checker: ts.TypeChecker,
   symbol: ts.Symbol,
@@ -664,37 +624,6 @@ function declarationOptionalAdditionModel(
     declarations.flatMap(signatureTraversalNodes),
     declarationRoot,
     allowedOwnerKeys,
-  );
-}
-
-function v092ServerCompatibilitySignature(
-  checker: ts.TypeChecker,
-  symbol: ts.Symbol,
-  declarationRoot: string,
-): string {
-  const declarations = [...(symbol.declarations ?? [])].sort((left, right) =>
-    left.getSourceFile().fileName.localeCompare(right.getSourceFile().fileName)
-    || left.pos - right.pos);
-  const surfaceText = (declaration: ts.Declaration) => stripExactOptionalProperty(
-    declaration,
-    "AppRoutesOptions",
-    "projectSessionList",
-    "(sessions: readonly SessionListItem[]) => readonly SessionListItem[]",
-  );
-  return signatureWithDependencies(
-    checker,
-    declarations,
-    declarations.map(surfaceText),
-    declarations.flatMap(signatureTraversalNodes),
-    declarationRoot,
-    true,
-    surfaceText,
-    (node) => exactOptionalProperty(
-      node,
-      "AppRoutesOptions",
-      "projectSessionList",
-      "(sessions: readonly SessionListItem[]) => readonly SessionListItem[]",
-    ),
   );
 }
 
@@ -824,11 +753,6 @@ export function deriveGitDistReport(
       const optionalAddition = isComponent
         ? componentOptionalAdditionModel(checker, symbol, name, declarationRoot)
         : declarationOptionalAdditionModel(checker, symbol, declarationRoot);
-      const v092CompatibilitySignature = isComponent && subpath === "app" && name === "EmbedView"
-        ? v092EmbedViewCompatibilitySignature(checker, symbol, declarationRoot)
-        : subpath === "server" && (name === "AppRoutesOptions" || name === "createAppRoutes")
-          ? v092ServerCompatibilitySignature(checker, symbol, declarationRoot)
-          : undefined;
       return {
         name,
         kind,
@@ -839,7 +763,6 @@ export function deriveGitDistReport(
           ? compatibilityComponentSignature(checker, symbol, name, declarationRoot)
           : compatibilityDeclarationSignature(checker, symbol, declarationRoot),
         optionalAddition,
-        ...(v092CompatibilitySignature ? { v092CompatibilitySignature } : {}),
         ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}),
       };
     }).sort((left, right) => left.name.localeCompare(right.name));
@@ -1166,67 +1089,6 @@ function releaseBoundary(
   return "same";
 }
 
-/**
- * Declarations reviewed by hand for the 0.9.1 -> 0.9.2 release, each pinned to
- * BOTH the baseline digest it was reviewed against and the digest it was
- * reviewed as. Entries are `subpath:name:baseline:current`.
- *
- * Why a table and not a rule: these changes are additive for consumers but not
- * in a shape `isMinorOptionalAddition` can prove. Most are widenings — the
- * clearest is `NotePanel`'s `onSave?: (text: string) => void` becoming
- * `=> void | Promise<void>`, which every existing caller still satisfies while
- * the declaration digest necessarily changes. Teaching the gate to reason about
- * variance is real work and getting it subtly wrong makes the gate wave a break
- * through; a pinned review does not carry that risk.
- *
- * What makes this safe rather than a bypass:
- *  - it applies only when the release is exactly 0.9.1 -> 0.9.2, so it expires
- *    by itself and cannot silently cover a later release
- *  - each entry pins the exact pair of digests, so ANY further change to one of
- *    these declarations stops matching and the gate fires again
- *  - the evidence behind every entry is the frozen consumer fixtures: the packed
- *    0.9.2 tarball installs into the app-host fixture with 0 ERRORS, builds, and
- *    runs a real session end to end. Declarations cannot express that; fixtures
- *    can, which is what CONTRACT.md means by behaviour the gate delegates.
- *
- * Do not add a row here to make a red gate green. Add one only after a fixture
- * has proven the change, and delete the table when the release ships.
- */
-const V092_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
-  "core:MuxServerFrame:6994738cd7106bbe764621c2de8ba4e3dee74a0408c594decee15de895c0b5b7:505d0ad0b1644fb339560e4ee1907ce472775ff411e637f2b9327b9e456dad44",
-  "core:MuxServerMessage:391d0b900c47671287fe820a5d48e7fc5546162b3755f056d6feca3fb0bb860f:ada9787a0f58320733a535ca8d1ee87d3963fdbbceb90d50c4474ca0bb12f715",
-  "server:AppRoutesOptions:a72d3fd998c2d9b7a0bf29b261f89b524b3f001158523757c4c242ce96eb1f35:bd351265349fbccee37f7cf3dd75998e8599ad59ce98fe312adc1d1ad8e41cbd",
-  "server:createAppRoutes:75d0ec3ac17231495e7d7fb359fbcfe369e4a4a2204478d6ed809803cdd969ea:37668fd89f19fac9dff3932c330321b4ec32c0198d78eaf7e34cf02fb05cc664",
-  "svelte:NotePanel:259b87b06774f30d21560719f07d80445efb2ad2c9c0cb71f210290fa31691c7:b5b44dfec8af58477f497e748ac1d59e2437c5217080f1995ae7e420c571d3e1",
-  "svelte:tmuxMux:587723da723d760c8865dee1928d95c2514d9dcab0d2b8ecc65f28b8b62462bd:7c31ac83c8f6d7b16801a26b2dec0b91d02043302791eb356ec4ca067901439b",
-  "svelte:TmuxMux:ac42ca240c4658fd119ecae1752ce10a0756f26cc1ed137395b3007251b27400:f51c63dd581f91e8a366f6710116d1d4c91687622bbc1d90cc05c94a9249e1be",
-  "app:AppAdapters:4384598241cd208a23f74ca702bcb257a8d475a1e2ff5121f0301842014ae3cd:a6124c94dd5559f6f96dea8111af755f50793b9a41c8d965c7b3dd5b0b99dc45",
-  "app:createSessionsStore:d3cdfbcc7d80c9bb8b14ee613920b34f6b1d36a846d185ce762f35abd12794dc:333222166072736bbefc989070749a1e05a66c857f67d8d98378c2ef0cd269c3",
-  "app:EmbedView:2cd074cf078a30d6dc345c4df33996d8473297b6dc7b20fc71fc72acfdf3ea6f:a3032409e432333b952b9e22dfde7509b193ec49a36af87b7bbc32da900154a9",
-  "app:HubView:18fda695f852ffa91f0b94d13cc2dc8a38870dc832ce2c63a1d31f60889f1f91:5661d05d98f05077d25c3941234fbc5e6e974d0928fe2d1a06f8911ab754f56e",
-  "app:SessionView:464f3bddd277488c9e86f5cd648e8916d7c82c731cacf77c0478d9a1619af8a5:1e087ea65f121f0d92c58e0dd34be581b61187d39d1aa4031ae51faae6262f6d",
-  "app:ThumbmuxApp:52c401674c0f1ed3d48e7ed26af61a71ad944ea6bf54f7200831962f3c78ff48:a0948b0a0e912db50d1c70d20bccf1f6cd8b541eeb46aa8f72a64dd90b085f31",
-]);
-
-function isV092PatchException(
-  baselineVersion: string,
-  currentVersion: string,
-  subpath: PublicSubpackage,
-  name: string,
-  baselineLive: LiveContractEntry,
-  currentLive: LiveContractEntry,
-): boolean {
-  if (baselineVersion !== "0.9.1" || currentVersion !== "0.9.2") return false;
-  const reviewedKey = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
-  if (V092_REVIEWED_ADDITIONS.has(reviewedKey)) return true;
-  const namedException = (subpath === "app" && name === "EmbedView")
-    || (subpath === "server" && (name === "AppRoutesOptions" || name === "createAppRoutes"));
-  return namedException
-    && currentLive.v092CompatibilitySignature !== undefined
-    && currentLive.v092CompatibilitySignature
-      === (baselineLive.compatibilitySignature ?? baselineLive.signature);
-}
-
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1360,20 +1222,6 @@ export function evaluateBaseline(
     );
     const kindChanged = previousLive.kind !== nextLive.kind;
     if (!signatureChanged && !kindChanged) continue;
-
-    if (
-      (boundary === "same" || boundary === "patch")
-      && isV092PatchException(
-        baselineVersion,
-        currentVersion,
-        subpath,
-        previous.name,
-        previousLive,
-        nextLive,
-      )
-    ) {
-      continue;
-    }
     // A patch may carry an addition every existing consumer ignores — CONTRACT.md
     // "Additive changes may ride a patch on this line". The permission is not the
     // boundary, it is `isMinorOptionalAddition`: a structural proof that the new

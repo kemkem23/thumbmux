@@ -1,10 +1,12 @@
 # thumbmux compatibility contract
 
-Status: this is the public compatibility policy for the 0.8.x and 0.9.x lines. It installs
+Status: this is the public compatibility policy for the whole pre-1.0 line, from 0.8.0
+onward — 0.8.x, 0.9.x, 0.10.x and any further minor before 1.0. It installs
 the gates needed to earn a 1.0 release; it does not declare those gates passed.
 
 This contract covers the public exports of `thumbmux/core`, `thumbmux/server`,
-`thumbmux/svelte`, and `thumbmux/app` in published `v0.8.x-dist` and `v0.9.x-dist` tags, together
+`thumbmux/svelte`, and `thumbmux/app` in every published `v0.x-dist` tag from `v0.8.0-dist`
+onward, together
 with their documented wire behavior and defaults. The manifest at the matching
 release tag, not a list copied into prose, is the source of truth for which
 names are covered and which tier each name occupies.
@@ -28,9 +30,9 @@ itself a contract event and must follow the policy below.
 
 ## Versioning model
 
-### The 0.8.x-0.9.x line
+### The pre-1.0 line, from 0.8.0 on
 
-The 0.8.x-0.9.x line uses an explicit compatibility policy that is stricter than the
+This line uses an explicit compatibility policy that is stricter than the
 usual freedom available to pre-1.0 software: an F-tier name does not receive a
 breaking change anywhere in that line. The surface gate checks names and declaration
 signatures; frozen consumers, wire goldens, and conformance tests check behavior
@@ -116,7 +118,7 @@ not claim that thumbmux is "SemVer 1.0 compliant".
 
 | Tier | Contract | Enforcement |
 | --- | --- | --- |
-| F — frozen | No breaking change anywhere in 0.8.x-0.9.x. After 1.0, an F name may break only in a new major release. | The surface gate pins its exported name, kind, and declaration signature; the relevant frozen consumer, golden, or conformance test pins behavior. |
+| F — frozen | No breaking change anywhere in the pre-1.0 line from 0.8.0 on. After 1.0, an F name may break only in a new major release. | The surface gate pins its exported name, kind, and declaration signature; the relevant frozen consumer, golden, or conformance test pins behavior. |
 | S — stabilizing | A change is allowed only at a minor boundary and must preserve the old route through the alias and deprecation policy. The goal is to promote surviving S surface to F for 1.0. | The manifest marks the name S; the surface gate and deprecation metadata keep both spellings and the removal date visible. Frozen consumers continue to use the old route during the window. |
 | X — experimental | An X name may change or be removed in a minor release without an alias or warning. Public documentation that mentions it must call it experimental. | An intentional `tier: "X"` manifest entry is the machine-readable warning; the surface gate reports X drift instead of treating it as an F/S break, and release review rejects an unmarked public mention. |
 | D — data-default | D applies only to an exported default's value. The value may change in a minor release, never a patch. D does not permit removing or renaming the export or changing its declared shape. | The manifest pins the name and shape and identifies the value as D; the release must add a `Changed defaults` changelog entry. Relevant default tests or frozen consumers pin the old value until that ceremony occurs. |
@@ -125,7 +127,7 @@ The manifest files under `contract/manifest/` are the only tier inventory. This
 document deliberately does not duplicate the hundreds of public names. A new
 export makes `scripts/contract-check.ts` fail until its name, kind, signature,
 and tier are added intentionally. Changing the manifest cannot retroactively
-weaken an existing promise: an F entry cannot be demoted to S or X within 0.8.x-0.9.x
+weaken an existing promise: an F entry cannot be demoted to S or X before 1.0
 to authorize a change that would otherwise be breaking. The manifest diff and
 release review enforce that rule.
 
@@ -220,7 +222,7 @@ frozen app consumer exercises the additive omitted route.
    minor line cannot be removed before the next minor and must remain usable with
    its warning for at least one complete minor line. The `JournalRecordV1` alias
    deprecated in 0.8.x and removed in v0.9.0 is the worked example, not the extent
-   of the rule: a name deprecated in 0.9.x carries the same window. After 1.0, removal is allowed only in
+   of the rule: a name deprecated in any pre-1.0 minor carries the same window. After 1.0, removal is allowed only in
    the next major, and that major cannot ship until at least two minor releases
    have shipped after the deprecation. The manifest's `since` and
    `removeNoEarlierThan` fields make early removal fail the surface gate; tag and
@@ -295,7 +297,7 @@ lockfile remain outside it.
 ## Known non-guarantees
 
 - **`thumbmux/app` is stabilizing.** Every export in that subpath is S for the
-  whole 0.8.x-0.9.x line, so it is not frozen before 1.0. It may change only at a minor
+  whole pre-1.0 line, so it is not frozen before 1.0. It may change only at a minor
   boundary under the S alias/deprecation rule. The surviving app surface is
   intended to freeze only after the reference consumer's migration gate above
   passes. The app manifest and surface gate expose any earlier or unannounced
@@ -315,7 +317,7 @@ lockfile remain outside it.
   `594b87c` make this boundary auditable.
 - **The cookie name is not permanent across majors.** `createTokenGuard`
   currently defaults `cookieName` to `tmux_demo_t`. Changing that default would
-  break existing hosts, so it remains pinned through 0.8.x-0.9.x and 1.x and is only a
+  break existing hosts, so it remains pinned through the pre-1.0 line and 1.x and is only a
   candidate for reconsideration at 2.0, not a promise that 2.0 will change it.
   Hosts may set `cookieName` explicitly now. `server/tests/token-guard.test.ts`
   pins the current default; the documented-default rule makes an earlier change
