@@ -135,7 +135,8 @@ describe('keyboardEventToSequence modified named keys', () => {
     ['Alt+Backspace', { key: 'Backspace', altKey: true }, '\x1b\x7f'],
     ['Ctrl+Backspace', { key: 'Backspace', ctrlKey: true }, '\x08'],
     ['Alt+Ctrl+Backspace', { key: 'Backspace', altKey: true, ctrlKey: true }, '\x1b\x08'],
-    ['Alt+Escape', { key: 'Escape', altKey: true }, '\x1b'],
+    // A6-17: xterm sends ESC ESC for Alt+Escape; Shift+PageUp/Down scroll locally.
+    ['Alt+Escape', { key: 'Escape', altKey: true }, '\x1b\x1b'],
     ['Ctrl+Escape', { key: 'Escape', ctrlKey: true }, '\x1b'],
     ['Shift+Delete', { key: 'Delete', shiftKey: true }, '\x1b[3;2~'],
     ['Alt+Delete', { key: 'Delete', altKey: true }, '\x1b[3;3~'],
@@ -147,9 +148,10 @@ describe('keyboardEventToSequence modified named keys', () => {
     ],
     ['Alt+PageUp', { key: 'PageUp', altKey: true }, '\x1b[5;3~'],
     ['Ctrl+PageUp', { key: 'PageUp', ctrlKey: true }, '\x1b[5;5~'],
-    ['Shift+PageUp', { key: 'PageUp', shiftKey: true }, '\x1b[5;2~'],
+    ['Shift+PageUp', { key: 'PageUp', shiftKey: true }, null],
     ['Alt+PageDown', { key: 'PageDown', altKey: true }, '\x1b[6;3~'],
     ['Ctrl+PageDown', { key: 'PageDown', ctrlKey: true }, '\x1b[6;5~'],
+    ['Shift+PageDown', { key: 'PageDown', shiftKey: true }, null],
     ['Shift+Alt+PageDown', { key: 'PageDown', shiftKey: true, altKey: true }, '\x1b[6;4~'],
     ['Alt+Insert', { key: 'Insert', altKey: true }, '\x1b[2;3~'],
     ['Ctrl+Insert', { key: 'Insert', ctrlKey: true }, null],
@@ -179,6 +181,22 @@ describe('keyboardEventToSequence arrows and modified navigation', () => {
     });
   }
 
+  // A6-6: DECCKM application-cursor mode — unmodified arrows/Home/End use SS3.
+  const appCursorCases: Array<[string, string]> = [
+    ['ArrowUp', '\x1bOA'],
+    ['ArrowDown', '\x1bOB'],
+    ['ArrowRight', '\x1bOC'],
+    ['ArrowLeft', '\x1bOD'],
+    ['Home', '\x1bOH'],
+    ['End', '\x1bOF'],
+  ];
+
+  for (const [key, expected] of appCursorCases) {
+    test(`applicationCursorKeys maps unmodified ${key} to SS3`, () => {
+      expect(keyboardEventToSequence({ key }, { applicationCursorKeys: true })).toBe(expected);
+    });
+  }
+
   const modifiedCases: Array<[string, KeyLike, string]> = [
     ['Ctrl+Right', { key: 'ArrowRight', ctrlKey: true }, '\x1b[1;5C'],
     ['Shift+Up', { key: 'ArrowUp', shiftKey: true }, '\x1b[1;2A'],
@@ -193,6 +211,15 @@ describe('keyboardEventToSequence arrows and modified navigation', () => {
       expect(keyboardEventToSequence(event)).toBe(expected);
     });
   }
+
+  test('applicationCursorKeys keeps modified arrows as CSI-with-modifier', () => {
+    expect(
+      keyboardEventToSequence({ key: 'ArrowUp', shiftKey: true }, { applicationCursorKeys: true }),
+    ).toBe('\x1b[1;2A');
+    expect(
+      keyboardEventToSequence({ key: 'Home', ctrlKey: true }, { applicationCursorKeys: true }),
+    ).toBe('\x1b[1;5H');
+  });
 });
 
 describe('keyboardEventToSequence function keys', () => {
@@ -251,6 +278,18 @@ describe('keyboardEventToSequence control keys', () => {
       expect(keyboardEventToSequence({ key, ctrlKey: true })).toBe(expected);
     });
   }
+
+  // A6-7: physical code wins so non-Latin layouts still produce C0 control bytes.
+  test('maps Ctrl+letter from physical e.code when key is non-Latin', () => {
+    expect(keyboardEventToSequence({ key: 'с', code: 'KeyC', ctrlKey: true })).toBe('\x03');
+    expect(keyboardEventToSequence({ key: 'ф', code: 'KeyA', ctrlKey: true })).toBe('\x01');
+    expect(keyboardEventToSequence({ key: 'я', code: 'KeyZ', ctrlKey: true })).toBe('\x1a');
+  });
+
+  test('falls back to e.key when e.code is absent or not KeyA–KeyZ', () => {
+    expect(keyboardEventToSequence({ key: 'c', ctrlKey: true })).toBe('\x03');
+    expect(keyboardEventToSequence({ key: 'c', code: 'Unidentified', ctrlKey: true })).toBe('\x03');
+  });
 
   const ctrlShiftLetterCases: Array<[string, KeyLike, string]> = [
     ['Ctrl+Shift+A', { key: 'A', ctrlKey: true, shiftKey: true }, '\x01'],
