@@ -257,6 +257,101 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", "frozen"]);
   });
 
+  test("an optional member added to a type alias is as additive as one on an interface", () => {
+    // The proof strips optional properties and requires the rest to be identical.
+    // `type X = { a?: T }` is the same contract as `interface X { a?: T }`, and it
+    // was rejected for years only because the owner filter read interfaces alone.
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string; cursor?: number; screen?: boolean };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .not.toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("a type alias that gains a REQUIRED member is still a break", () => {
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string; cursor?: number; screen: boolean };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("dropping an optional member from a type alias is still a break", () => {
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("an optional member added to a REFERENCED type alias is additive too", () => {
+    // A dependency was never strippable, so a dependent could not be proven
+    // additive when the type it referenced gained an optional member.
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "type Payload = { channel: string; cursor?: number };",
+      "export type frozen = Payload | { type: \"pong\" };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "type Payload = { channel: string; cursor?: number; screen?: boolean };",
+      "export type frozen = Payload | { type: \"pong\" };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .not.toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
   test("a patch may declare a new export", () => {
     const baseline = fixture("0.8.4");
     writeBaselineManifest(baseline);
@@ -358,140 +453,6 @@ describe("contract surface policy", () => {
     writeBaselineManifest(minor);
     expect(runFixture(minor, baseline).errors.map(({ code, name }) => [code, name]))
       .toContainEqual(["baseline-signature-change", "frozen"]);
-  });
-
-  test("v0.9.2 exceptions erase only the two exact optional additions", () => {
-    const rootsFor = (subpath: "server" | "app") => {
-      const baseline = mkdtempSync(join(tmpdir(), `thumbmux-${subpath}-baseline-`));
-      const current = mkdtempSync(join(tmpdir(), `thumbmux-${subpath}-current-`));
-      roots.push(baseline, current);
-      mkdirSync(join(baseline, `git-dist/${subpath}`), { recursive: true });
-      mkdirSync(join(current, `git-dist/${subpath}`), { recursive: true });
-      return { baseline, current };
-    };
-    const manifestFor = (entries: ReturnType<typeof deriveGitDistReport>["server"]) =>
-      entries.map(({ name, kind, signature }) => ({ name, kind, signature, tier: "S" as const }));
-
-    const server = rootsFor("server");
-    const writeServer = (root: string, member: string) => writeFileSync(
-      join(root, "git-dist/server/index.d.ts"),
-      [
-        `export interface AppRoutesOptions { basePath?: string; ${member} }`,
-        "export declare function createAppRoutes(options?: AppRoutesOptions): void;",
-        "",
-      ].join("\n"),
-    );
-    writeServer(server.baseline, "");
-    writeServer(
-      server.current,
-      "projectSessionList?: (sessions: readonly SessionListItem[]) => readonly SessionListItem[];",
-    );
-    writeFileSync(
-      join(server.baseline, "git-dist/server/session.d.ts"),
-      "export interface SessionListItem { name: string }\n",
-    );
-    writeFileSync(
-      join(server.current, "git-dist/server/session.d.ts"),
-      "export interface SessionListItem { name: string }\n",
-    );
-    // Keep the fixture self-contained while retaining the exact reviewed type text.
-    for (const root of [server.baseline, server.current]) {
-      const path = join(root, "git-dist/server/index.d.ts");
-      writeFileSync(path, `interface SessionListItem { name: string }\n${readFileSync(path, "utf8")}`);
-    }
-    const oldServer = deriveGitDistReport(server.baseline, ["server"]).server;
-    const newServer = deriveGitDistReport(server.current, ["server"]).server;
-    expect(evaluateBaseline(
-      "server",
-      manifestFor(oldServer),
-      manifestFor(newServer),
-      oldServer,
-      newServer,
-      "0.9.1",
-      "0.9.2",
-    ).errors).toEqual([]);
-
-    writeServer(server.baseline, "nested?: { keep?: boolean; };");
-    const nestedOldServer = deriveGitDistReport(server.baseline, ["server"]).server;
-    writeServer(
-      server.current,
-      "nested?: { keep?: boolean; projectSessionList?: (sessions: readonly SessionListItem[]) => readonly SessionListItem[]; };",
-    );
-    const nestedServer = deriveGitDistReport(server.current, ["server"]).server;
-    expect(evaluateBaseline(
-      "server",
-      manifestFor(nestedOldServer),
-      manifestFor(nestedServer),
-      nestedOldServer,
-      nestedServer,
-      "0.9.1",
-      "0.9.2",
-    ).errors).not.toEqual([]);
-
-    writeServer(server.current, "projectSessionList?: string;");
-    const badServer = deriveGitDistReport(server.current, ["server"]).server;
-    expect(evaluateBaseline(
-      "server",
-      manifestFor(oldServer),
-      manifestFor(badServer),
-      oldServer,
-      badServer,
-      "0.9.1",
-      "0.9.2",
-    ).errors).not.toEqual([]);
-
-    const app = rootsFor("app");
-    const writeApp = (root: string, extra: string) => {
-      writeFileSync(
-        join(root, "git-dist/app/index.d.ts"),
-        "export { default as EmbedView } from './EmbedView.svelte';\n",
-      );
-      writeFileSync(join(root, "git-dist/app/EmbedView.svelte.d.ts"), [
-        `type Props = { session: string; ${extra} };`,
-        "declare const EmbedView: import('svelte').Component<Props, {}, ''>;",
-        "export default EmbedView;",
-        "",
-      ].join("\n"));
-    };
-    writeApp(app.baseline, "");
-    writeApp(app.current, "claimGeometry?: boolean;");
-    const oldApp = deriveGitDistReport(app.baseline, ["app"]).app;
-    const newApp = deriveGitDistReport(app.current, ["app"]).app;
-    expect(evaluateBaseline(
-      "app",
-      manifestFor(oldApp),
-      manifestFor(newApp),
-      oldApp,
-      newApp,
-      "0.9.1",
-      "0.9.2",
-    ).errors).toEqual([]);
-
-    writeApp(app.baseline, "nested?: { keep?: boolean };");
-    const nestedOldApp = deriveGitDistReport(app.baseline, ["app"]).app;
-    writeApp(app.current, "nested?: { keep?: boolean; claimGeometry?: boolean };");
-    const nestedApp = deriveGitDistReport(app.current, ["app"]).app;
-    expect(evaluateBaseline(
-      "app",
-      manifestFor(nestedOldApp),
-      manifestFor(nestedApp),
-      nestedOldApp,
-      nestedApp,
-      "0.9.1",
-      "0.9.2",
-    ).errors).not.toEqual([]);
-
-    writeApp(app.current, "claimGeometry: boolean;");
-    const badApp = deriveGitDistReport(app.current, ["app"]).app;
-    expect(evaluateBaseline(
-      "app",
-      manifestFor(oldApp),
-      manifestFor(badApp),
-      oldApp,
-      badApp,
-      "0.9.1",
-      "0.9.2",
-    ).errors).not.toEqual([]);
   });
 
   test("rejects missing F names and changed S signatures", () => {

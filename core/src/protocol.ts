@@ -7,6 +7,9 @@
 
 export type MuxCursor = { row: number; col: number };
 
+/** tmux pane screen-mode sample: alternate buffer + SGR / any-event mouse. */
+export interface MuxPaneScreen { alt: boolean; mouseSgr: boolean; mouseAny: boolean; }
+
 /**
  * Minimum row inside the JSON-encoded `data` of a `__sessions` frame.
  *
@@ -42,6 +45,8 @@ export type MuxFullOutputFrame = {
   type: "output";
   data: string;
   cursor?: MuxCursor | null;
+  /** Present when the driver samples pane screen mode (alt buffer + mouse). */
+  screen?: MuxPaneScreen | null;
   reset?: "resize" | "resync";
 };
 
@@ -54,6 +59,8 @@ export type MuxDeltaFrame = {
   prefixHash: string;
   lines: string[];
   cursor?: MuxCursor | null;
+  /** Present when the driver samples pane screen mode (alt buffer + mouse). */
+  screen?: MuxPaneScreen | null;
 };
 
 export type MuxOutputFrame = MuxFullOutputFrame | MuxDeltaFrame;
@@ -237,6 +244,17 @@ function isMuxCursor(value: unknown): value is MuxCursor | null {
   );
 }
 
+function isMuxPaneScreen(value: unknown): value is MuxPaneScreen | null {
+  if (value === null) return true;
+  if (typeof value !== "object" || value === null) return false;
+  const screen = value as Record<string, unknown>;
+  return (
+    typeof screen.alt === "boolean" &&
+    typeof screen.mouseSgr === "boolean" &&
+    typeof screen.mouseAny === "boolean"
+  );
+}
+
 /**
  * Validate a received delta against its current raw base. Invalid deltas must
  * not update either content or cursor; callers can request one resync instead.
@@ -258,6 +276,9 @@ export function validateMuxDeltaFrame(
   if (!Array.isArray(candidate.lines) || !candidate.lines.every((line) => typeof line === "string")) return null;
 
   if (Object.prototype.hasOwnProperty.call(candidate, "cursor") && !isMuxCursor(candidate.cursor)) {
+    return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(candidate, "screen") && !isMuxPaneScreen(candidate.screen)) {
     return null;
   }
 
@@ -303,6 +324,11 @@ export function chooseMuxOutputFrame(
     splitMuxOutputData(full.data),
     full.cursor,
   );
+  // Rides on the frame rather than through a fifth parameter: `screen` is an
+  // optional field on an already-optional-bearing wire shape, and widening a
+  // frozen factory's signature to carry it would be a declaration change the
+  // additive proof cannot express — for a value this call site already holds.
+  if (full.screen !== undefined) delta.screen = full.screen;
   return shouldUseMuxDelta(full, delta) ? delta : full;
 }
 

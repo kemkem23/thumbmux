@@ -12,9 +12,11 @@
    *
    * Input still flows through tmuxMux (composer/D-pad/presets in the route);
    * this view also owns the tmux pane geometry (measured cols/rows → resize,
-   * re-claimed when the app returns to foreground). With altScreenMouse on,
+   * re-claimed when the app returns to foreground). With SGR mouse routing on
+   * (static altScreenMouse, or live screen.mouseSgr when screen is present),
    * wheel and touch-drag input are forwarded as SGR mouse events here, so
-   * hosts do not need a separate touch capture shim.
+   * hosts do not need a separate touch capture shim. A live `screen` prop also
+   * suppresses scrollback when screen.alt is true (alternate screen has none).
    */
   import { onMount, onDestroy } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
@@ -75,6 +77,12 @@
     bottomInsetPx = 0,
     claimGeometry = true,
     altScreenMouse = false,
+    /**
+     * Default is `undefined` (host did not pass the prop) so live screen mode
+     * from mux meta can drive routing. An explicit `null` or object wins —
+     * hosts that know better (demo, static alt-screen surfaces) stay in charge.
+     */
+    screen = undefined,
     onKeys = undefined,
     onTap = undefined,
     onLinesChange = undefined,
@@ -92,8 +100,15 @@
     bottomInsetPx?: number;
     claimGeometry?: boolean;
     /** Forward wheel, clean click, and touch-drag gestures as SGR mouse input
-     * for alt-screen TUIs. */
+     * for alt-screen TUIs. Ignored for pointer routing when `screen` is set —
+     * then `screen.mouseSgr` wins. */
     altScreenMouse?: boolean;
+    /** Explicit host override of pane screen mode (tmux #{alternate_on} /
+     * #{mouse_sgr_flag} / #{mouse_any_flag}). When the prop is omitted
+     * (`undefined`), live `meta.screen` from the mux subscription is used.
+     * An explicit `null` or object always wins over the wire. Structural
+     * inline type so this file compiles alone. */
+    screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
     onKeys?: (data: string) => void;
     /** Fired on a CLEAN tap (short, low-movement, not a link, no selection) —
      * call your composer's openDock() here, synchronously, so iOS raises the
@@ -103,6 +118,28 @@
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
   } = $props();
+
+  /**
+   * Screen mode sampled from the last mux delivery that carried `meta.screen`.
+   * Only used when the host did not pass the `screen` prop explicitly.
+   */
+  let liveScreen = $state<{ alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null>(null);
+  let liveScreenSeen = $state(false);
+
+  /**
+   * Effective screen mode: explicit prop (including null) wins; otherwise the
+   * sticky live value from wire meta when one has been observed.
+   */
+  const resolvedScreen = $derived(
+    screen !== undefined
+      ? screen
+      : (liveScreenSeen ? liveScreen : null),
+  );
+
+  /** Pointer routing: live/explicit screen.mouseSgr wins; otherwise static altScreenMouse. */
+  const useSgrMouse = $derived(resolvedScreen != null ? resolvedScreen.mouseSgr : altScreenMouse);
+  /** Alternate screen has no scrollback — suppress history expand/prepend. */
+  const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
 
   const LINE_RATIO = 1.6;
   const OVERSCAN_ROWS = 60;
@@ -264,6 +301,7 @@
   type MuxDeliveryMeta = {
     source: 'full' | 'delta';
     replace: boolean;
+    screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
   };
 
   type SearchActiveIdentity = {
@@ -514,7 +552,7 @@
     if (selectionActive) return false;
     stopInertia();
     bottomOffsetPx = 0;
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       const geom = currentGeometry();
       if (geom) {
         const composerRows = Math.max(0, Math.ceil(bottomInsetPx / Math.max(1, lineH)));
@@ -1445,6 +1483,8 @@
   }
 
   function requestOlderHistory(): boolean {
+    // Alternate screen has no scrollback — never expand history into it.
+    if (noScrollback) return false;
     if (archiveLoading || archiveExhausted) return false;
     if (
       rawLines.length >= HISTORY_RETAINED_ROW_BUDGET ||
@@ -1786,6 +1826,11 @@
   }
 
   function processArchivedHistory(data: string) {
+    // A late history reply must not prepend into an alternate-screen buffer.
+    if (noScrollback) {
+      finishArchiveRequest('empty');
+      return;
+    }
     let payload: unknown = null;
     try {
       payload = JSON.parse(data);
@@ -2060,7 +2105,7 @@
     updateSelectionActive();
     if (selectionActive) return;
 
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       forwardAltWheel(e);
       return;
     }
@@ -2078,7 +2123,7 @@
     warnedMissingKeys = true;
     const meta = import.meta as unknown as { env?: { DEV?: boolean } };
     if (meta.env?.DEV) {
-      console.warn('TermView altScreenMouse requires onKeys; SGR mouse action ignored.');
+      console.warn('TermView SGR mouse routing requires onKeys; SGR mouse action ignored.');
     }
   }
 
@@ -2218,7 +2263,7 @@
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
     if (selectionActive) return; // user is adjusting a selection — hands off
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       stopInertia();
       if (momentumWindowFrozen) applyScroll();
       tapStart = null;
@@ -2256,7 +2301,7 @@
   }
 
   function onTouchMove(e: TouchEvent) {
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       if (selectionActive || altTouchY === null) {
         updateSelectionActive();
         if (selectionActive) {
@@ -2418,7 +2463,7 @@
   }
 
   function maybeTap(e: TouchEvent | MouseEvent, x: number, y: number) {
-    if (altScreenMouse || !onTap || !tapStart) return;
+    if (useSgrMouse || !onTap || !tapStart) return;
     const moved = Math.abs(x - tapStart.x) + Math.abs(y - tapStart.y);
     const dur = performance.now() - tapStart.t;
     const sel = window.getSelection?.();
@@ -2436,7 +2481,7 @@
   }
 
   function onPointerDown(e: PointerEvent) {
-    if (!altScreenMouse || !isPlainPrimaryPointer(e)) return;
+    if (!useSgrMouse || !isPlainPrimaryPointer(e)) return;
     altPointerStart = {
       x: e.clientX,
       y: e.clientY,
@@ -2448,7 +2493,7 @@
   }
 
   function onPointerUp(e: PointerEvent) {
-    if (!altScreenMouse || !altPointerStart || e.pointerId !== altPointerStart.pointerId) return;
+    if (!useSgrMouse || !altPointerStart || e.pointerId !== altPointerStart.pointerId) return;
     const start = altPointerStart;
     altPointerStart = null;
     if (!isPlainPrimaryPointer(e)) return;
@@ -2464,7 +2509,7 @@
   }
 
   function onClick(e: MouseEvent) {
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       if (suppressClickUntil > 0) {
         if (performance.now() <= suppressClickUntil) {
           e.preventDefault();
@@ -2482,7 +2527,7 @@
 
   function onTouchEnd(e?: TouchEvent) {
     lastTouchEndAt = performance.now();
-    if (altScreenMouse) {
+    if (useSgrMouse) {
       if (altTouchMoved) {
         e?.stopPropagation();
         if (e?.cancelable) e.preventDefault();
@@ -2735,6 +2780,65 @@
     if (claimGeometry) refreshGeometry();
   });
 
+  /** Drop compositor scroll offset + in-flight history when screen.alt flips.
+   * A viewer scrolled up in normal scrollback must not keep a stale offset on
+   * the alternate screen (and the reverse). First observation is not a flip. */
+  function resetScrollForScreenMode() {
+    stopInertia();
+    if (dragFrame !== null) {
+      cancelAnimationFrame(dragFrame);
+      dragFrame = null;
+    }
+    pendingDragPx = 0;
+    touching = false;
+    tapStart = null;
+    altTouchY = null;
+    altTouchHitArea = null;
+    altTouchMoved = false;
+    altPointerStart = null;
+    altWheelRemainder = 0;
+    if (altWheelFrame !== null) {
+      cancelAnimationFrame(altWheelFrame);
+      altWheelFrame = null;
+    }
+    cancelScheduledPrependWork();
+    pendingPrependWork = null;
+    prependParseSeq++;
+    if (archiveRequestActive && archiveInflightRequestId !== null) {
+      try {
+        tmuxMux.recoverHistoryRequest(archiveInflightSession ?? session);
+      } catch {
+        // Mode flip must continue even if recovery throws.
+      }
+    }
+    if (archiveRequestTimer) {
+      clearTimeout(archiveRequestTimer);
+      archiveRequestTimer = null;
+    }
+    archiveLoading = false;
+    archiveRequestActive = false;
+    archiveInflightRequestId = null;
+    archiveInflightSession = null;
+    bottomOffsetPx = 0;
+    applyScroll();
+    emitScrollState();
+    settledBottomOffsetPx = 0;
+  }
+
+  let screenAltObserved = false;
+  let lastScreenAlt = false;
+  $effect(() => {
+    const alt = noScrollback;
+    if (!screenAltObserved) {
+      screenAltObserved = true;
+      lastScreenAlt = alt;
+      return;
+    }
+    if (alt === lastScreenAlt) return;
+    lastScreenAlt = alt;
+    resetScrollForScreenMode();
+  });
+
   function onReturn() {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
     lastPushedCols = 0; // force re-claim — desktop may have resized while hidden
@@ -2756,6 +2860,12 @@
       cur?: { row: number; col: number } | null,
       meta?: MuxDeliveryMeta,
     ) => {
+      // Apply screen mode even when content is gated (busy/selection): pointer
+      // routing and scrollback policy must track the pane, not the paint queue.
+      if (meta && Object.prototype.hasOwnProperty.call(meta, 'screen')) {
+        liveScreen = meta.screen ?? null;
+        liveScreenSeen = true;
+      }
       if (type === 'history') {
         applyArchivedHistory(data);
         return;

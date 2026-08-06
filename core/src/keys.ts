@@ -18,6 +18,12 @@ export type KeyboardSequenceOptions = {
    * AltGr input is always sent verbatim.
    */
   altIsMeta?: boolean;
+  /**
+   * DECCKM application-cursor mode. When true, unmodified ArrowUp/Down/Right/Left
+   * and Home/End emit SS3 (`ESC O A`/`B`/`C`/`D`, `ESC O H`, `ESC O F`) instead of
+   * CSI (`ESC [ …`). Modified forms still use CSI-with-modifier.
+   */
+  applicationCursorKeys?: boolean;
 };
 
 const arrowFinals: Record<string, string> = {
@@ -67,6 +73,7 @@ export function keyboardEventToSequence(e: KeyLike, opts: KeyboardSequenceOption
   if (e.isComposing || e.metaKey) return null;
 
   const altIsMeta = opts.altIsMeta ?? true;
+  const applicationCursorKeys = !!opts.applicationCursorKeys;
   const key = e.key;
   const shifted = !!e.shiftKey;
   const alt = !!e.altKey;
@@ -76,14 +83,18 @@ export function keyboardEventToSequence(e: KeyLike, opts: KeyboardSequenceOption
   if (arrowFinal) {
     return shifted || alt || ctrl
       ? modifiedCsi(arrowFinal, shifted, alt, ctrl)
-      : `${ESC}[${arrowFinal}`;
+      : applicationCursorKeys
+        ? `${ESC}O${arrowFinal}`
+        : `${ESC}[${arrowFinal}`;
   }
 
   const homeEndFinal = homeEndFinals[key];
   if (homeEndFinal) {
     return shifted || alt || ctrl
       ? modifiedCsi(homeEndFinal, shifted, alt, ctrl)
-      : `${ESC}[${homeEndFinal}`;
+      : applicationCursorKeys
+        ? `${ESC}O${homeEndFinal}`
+        : `${ESC}[${homeEndFinal}`;
   }
 
   if (key === 'Enter') return alt ? `${ESC}\r` : '\r';
@@ -136,7 +147,8 @@ function namedKeySequence(key: string, shift: boolean, alt: boolean, ctrl: boole
     return alt ? `${ESC}${base}` : base;
   }
 
-  if (key === 'Escape') return ESC;
+  // A6-17: Alt+Escape is ESC ESC (xterm parity); bare Escape stays single ESC.
+  if (key === 'Escape') return alt ? `${ESC}${ESC}` : ESC;
 
   if (key === 'Insert') {
     if (shift || ctrl) return null;
@@ -145,6 +157,11 @@ function namedKeySequence(key: string, shift: boolean, alt: boolean, ctrl: boole
 
   const tildeCode = tildeNamedKeys[key];
   if (tildeCode) {
+    // A6-17: Shift+PageUp/PageDown alone scroll the local viewport in xterm —
+    // do not emit CSI; any extra modifier (Alt/Ctrl) still goes to the pane.
+    if (shift && !alt && !ctrl && (key === 'PageUp' || key === 'PageDown')) {
+      return null;
+    }
     const modifier = modifierValue(shift, alt, ctrl);
     return modifier > 1 ? `${ESC}[${tildeCode};${modifier}~` : `${ESC}[${tildeCode}~`;
   }
@@ -177,12 +194,24 @@ function ctrlSequence(e: KeyLike): string | null {
   if (e.key === '\\') return '\x1c';
   if (e.key === ']') return '\x1d';
 
+  // A6-7: prefer physical KeyA–KeyZ so non-Latin layouts (key='с', code='KeyC')
+  // still produce the C0 control byte. Fall back to e.key when code is absent.
+  const fromCode = ctrlLetterFromCode(e.code);
+  if (fromCode !== null) return fromCode;
+
   const lower = e.key.toLowerCase();
   if (lower.length === 1 && lower >= 'a' && lower <= 'z') {
     return String.fromCharCode(lower.charCodeAt(0) - 96);
   }
 
   return null;
+}
+
+function ctrlLetterFromCode(code: string | undefined): string | null {
+  if (!code || code.length !== 4 || !code.startsWith('Key')) return null;
+  const letter = code.charAt(3);
+  if (letter < 'A' || letter > 'Z') return null;
+  return String.fromCharCode(letter.charCodeAt(0) - 64);
 }
 
 const ctrlDigitSequences: Record<string, string | null> = {

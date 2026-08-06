@@ -9,12 +9,15 @@ import {
   type MuxAuthErrorFrame,
   type MuxClientInfo,
   type MuxOutputType as OutputType,
+  type MuxPaneScreen,
   type MuxServerMessage,
 } from '@thumbmux/core';
 
 export type MuxDeliveryMeta = {
   source: 'full' | 'delta';
   replace: boolean;
+  /** Live pane screen mode from the wire (sticky across deltas that omit it). */
+  screen?: MuxPaneScreen | null;
 };
 
 type Callback = (
@@ -164,6 +167,12 @@ export class TmuxMux {
   private prefixHashCaches = new Map<string, PrefixHashCache>();
   /** Raw delta frames held while every subscriber reports busy. */
   private deferredDeltas = new Map<string, DeferredQueue>();
+  /**
+   * Last known pane screen mode per channel. A delta (or full frame) that
+   * omits `screen` reuses this so unchanged repaints do not look like the pane
+   * left fullscreen. Cleared with the other per-channel caches.
+   */
+  private lastScreen = new Map<string, MuxPaneScreen | null>();
   private settleScheduled = false;
   private settleCancel: (() => void) | null = null;
   /** A failed delta requests one full replacement; later deltas wait for it. */
@@ -392,11 +401,53 @@ export class TmuxMux {
     this.prefixHashCaches.delete(session);
   }
 
+  private discardLastScreen(session: string) {
+    this.lastScreen.delete(session);
+  }
+
+  /**
+   * When a full/delta frame carries `screen`, remember it for this channel.
+   * Malformed values are ignored so a bad sample cannot poison the sticky
+   * last-known mode.
+   */
+  private rememberScreen(session: string, frame: unknown): void {
+    if (typeof frame !== 'object' || frame === null) return;
+    if (!Object.prototype.hasOwnProperty.call(frame, 'screen')) return;
+    const screen = (frame as { screen: unknown }).screen;
+    if (screen === null) {
+      this.lastScreen.set(session, null);
+      return;
+    }
+    if (
+      typeof screen === 'object'
+      && screen !== null
+      && typeof (screen as MuxPaneScreen).alt === 'boolean'
+      && typeof (screen as MuxPaneScreen).mouseSgr === 'boolean'
+      && typeof (screen as MuxPaneScreen).mouseAny === 'boolean'
+    ) {
+      this.lastScreen.set(session, screen as MuxPaneScreen);
+    }
+  }
+
+  /** Build delivery meta, attaching last-known screen when one exists. */
+  private deliveryMeta(
+    source: 'full' | 'delta',
+    replace: boolean,
+    session: string,
+  ): MuxDeliveryMeta {
+    const meta: MuxDeliveryMeta = { source, replace };
+    if (this.lastScreen.has(session)) {
+      meta.screen = this.lastScreen.get(session);
+    }
+    return meta;
+  }
+
   private invalidateOutputBase(session: string) {
     this.outputBases.delete(session);
     this.resyncingSessions.delete(session);
     this.discardPrefixHashCache(session);
     this.discardDeferred(session);
+    this.discardLastScreen(session);
   }
 
   private invalidateAllOutputBases() {
@@ -405,6 +456,7 @@ export class TmuxMux {
     this.sentTail.clear();
     this.prefixHashCaches.clear();
     this.deferredDeltas.clear();
+    this.lastScreen.clear();
   }
 
   private requestResync(session: string) {
@@ -412,6 +464,7 @@ export class TmuxMux {
     this.outputBases.delete(session);
     this.discardPrefixHashCache(session);
     this.discardDeferred(session);
+    this.discardLastScreen(session);
     this.resyncingSessions.add(session);
     this.send(this.ws, { type: 'resync', session });
   }
@@ -525,8 +578,9 @@ export class TmuxMux {
   ) {
     const data = next.join('\n');
     this.outputBases.set(session, next);
+    const meta = this.deliveryMeta('delta', false, session);
     for (const cb of cbs) {
-      cb(data, 'output', cursor, { source: 'delta', replace: false });
+      cb(data, 'output', cursor, meta);
     }
   }
 
@@ -634,6 +688,7 @@ export class TmuxMux {
         this.requestResync(session);
         return;
       }
+      this.rememberScreen(session, frame);
       base = result.next;
       applied = true;
       if (result.cursorPresent) {
@@ -811,10 +866,12 @@ export class TmuxMux {
           this.discardPrefixHashCache(msg.channel);
           this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
           this.resyncingSessions.delete(msg.channel);
-          const meta: MuxDeliveryMeta = {
-            source: 'full',
-            replace: msg.reset === 'resize' || msg.reset === 'resync',
-          };
+          this.rememberScreen(msg.channel, msg);
+          const meta = this.deliveryMeta(
+            'full',
+            msg.reset === 'resize' || msg.reset === 'resync',
+            msg.channel,
+          );
           for (const cb of cbs) cb(msg.data, 'output', msg.cursor, meta);
           return;
         }
@@ -829,6 +886,8 @@ export class TmuxMux {
             return;
           }
           // Busy-deferral: queue raw frames, no validation/hash/join/callback.
+          // Screen is remembered at flush time (with each applied frame) so a
+          // deferred delta still updates sticky mode before delivery.
           if (this.sessionShouldDefer(msg.channel)) {
             this.enqueueDeferredDelta(msg.channel, msg);
             return;
@@ -847,6 +906,7 @@ export class TmuxMux {
             this.requestResync(msg.channel);
             return;
           }
+          this.rememberScreen(msg.channel, msg);
           this.deliverDelta(
             msg.channel,
             applied.next,

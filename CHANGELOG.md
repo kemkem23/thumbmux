@@ -1,7 +1,94 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.9.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.10.0-dist`.
+
+## v0.10.0 — 2026-08-06
+
+Fullscreen TUIs work now, and the keyboard survives places focus can land.
+
+Both Claude Code (`tui: "fullscreen"`) and Grok (`--fullscreen`) run on the
+terminal's alternate screen. Rendering them was never the problem — tmux
+`capture-pane` returns the alternate screen just fine. The problem was that the
+viewer had to be *told* which mode it was in, through one static `altScreenMouse`
+boolean supplied by the host, and that boolean answers two questions that are not
+the same question: who owns the pane's geometry, and where pointer events go.
+Probed on a live session, a Grok launched with `--no-alt-screen` reports
+`alternate_on=0` and `mouse_sgr_flag=1` — the two signals disagree in production,
+and there was one prop to hold both.
+
+tmux reports each separately, so the package samples them instead of guessing.
+
+### Added
+
+- `MuxPaneScreen` (core, tier F): `{alt, mouseSgr, mouseAny}`, sampled from tmux
+  `#{alternate_on}`, `#{mouse_sgr_flag}` and `#{mouse_any_flag}`.
+- Optional `screen?: MuxPaneScreen | null` on `MuxFullOutputFrame` and
+  `MuxDeltaFrame`, carried beside `cursor`. The bundled driver adds the three
+  fields to the format string the combined `display-message ; capture-pane`
+  already sends — the same single tmux invocation, so screen state cannot tear
+  against the content it describes.
+- `MuxDeliveryMeta.screen`, sticky per channel: a delta that omits `screen`
+  delivers the last known sample rather than `undefined`. Entering fullscreen
+  usually repaints identical bytes, and an unchanged repaint must not read as
+  "left fullscreen".
+- `TermView` prop `screen`. When present it wins over `altScreenMouse` for
+  pointer routing; when absent, the live value from the wire is used; when the
+  wire has said nothing either, behaviour is exactly 0.9.2. An explicit prop
+  still wins, because a host that knows better must be able to say so.
+
+### Fixed
+
+- **A Ctrl chord is a physical key, not whatever the layout printed on it.**
+  `ctrlSequence` read `e.key`, so on a Thai Kedmanee keyboard Ctrl+C arrives as
+  `{key:'แ'}` and on Cyrillic as `{key:'с'}` — neither is in `a-z`, so the chord
+  was dropped and no control byte reached the pane. Ctrl+C, Ctrl+X, Ctrl+R: gone,
+  on every non-Latin layout. It prefers `e.code` when that names a physical
+  `KeyA`–`KeyZ`, and falls back to `e.key`, so nothing that worked before
+  changes. `DesktopKeys` had the same bug in `isCopyShortcut` / `isPasteShortcut`
+  and was fixed the same way.
+- **A link the terminal drew is not a form.** `DesktopKeys.targetIsInteractive`
+  bailed on `input,textarea,select,button,a,[contenteditable]` — while
+  `ansi-html` renders OSC-8 and detected URLs as real `<a>` elements *inside the
+  pane*. Clicking a URL in your terminal stopped typing, with nothing on screen
+  to explain it, until you clicked the background again. The bail is real text
+  entry only; focus landing on in-pane surface reclaims the wrapper and still
+  forwards the key. Pointer-down on a link is untouched, so navigation works.
+- `Alt+Escape` emits `ESC ESC` rather than a bare `ESC`. `Shift+PageUp` and
+  `Shift+PageDown` return `null` — xterm scrolls those locally and never sends
+  them — while `Shift+Alt` and `Shift+Ctrl` forms still encode, which is the
+  distinction a Shift-only guard gets wrong.
+- On the alternate screen there is no scrollback to reach, so `TermView` refuses
+  history expansion instead of attempting it, drops a reply that was already in
+  flight when the pane switched, and resets scroll position on a flip in either
+  direction — a viewer parked 2000px up its history has no meaningful offset once
+  the buffer it was reading stops existing.
+
+### Added (opt-in)
+
+- `KeyboardSequenceOptions.applicationCursorKeys` — unmodified arrows and
+  Home/End emit SS3. Off by default; modified forms stay CSI.
+
+### Contract gate
+
+- The additive proof reads `type X = { a?: T }` the way it always read
+  `interface X { a?: T }`, and it reads a referenced declaration the way it reads
+  a root one. Both are the same contract to a consumer; the owner filter simply
+  looked at root interfaces only, so 38 declarations could not be proven additive
+  by a rule that already covered the change. It deliberately still refuses to
+  strip optionals out of ANONYMOUS type literals: with no owner name in the member
+  key, moving an optional property between two inline literals would be
+  indistinguishable from leaving it alone, and a gate that waves a real break
+  through is worse than one that asks for a review.
+
+### CI
+
+- The bun version is pinned in both workflows, and `ci-parity.sh` fails when the
+  bun it runs differs from that pin. Unpinned, `setup-bun` installed whatever
+  shipped that day; bun 1.3.14 deadlocked `demo/dogfooding.test.ts` while 1.3.11
+  ran the same file in 4.6s, and five release attempts were spent looking at a
+  diff that was never the problem. A parity gate running a different interpreter
+  than CI was not a parity gate.
 
 ## v0.9.2 — 2026-08-05
 

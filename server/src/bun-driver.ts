@@ -4,9 +4,14 @@
  * activity caches, worktree spawning, memory-scoped launches…) but this one
  * is complete and honest: every TmuxWsMux feature works against it.
  */
+import type { MuxPaneScreen } from "@thumbmux/core";
 import type { RawCursorState, TmuxDriver } from "./ws-mux";
 
 const LARGE_INPUT_THRESHOLD_BYTES = 8 * 1024;
+
+/** Single display-message format: cursor + pane screen mode in ONE sample. */
+const PANE_STATUS_FMT =
+  "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}|#{alternate_on}|#{mouse_sgr_flag}|#{mouse_any_flag}";
 
 export type TmuxTargetMode = "exact" | "legacy";
 
@@ -72,10 +77,22 @@ function sendLargeInput(target: string, bytes: Uint8Array) {
   }
 }
 
-function parseCursorLine(line: string): RawCursorState | null {
-  const [x, y, h, flag, inMode] = line.split("|").map((v) => Number(v));
-  if (![x, y, h].every(Number.isFinite)) return null;
-  return { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 };
+function parsePaneStatusLine(line: string): {
+  cursor: RawCursorState | null;
+  screen: MuxPaneScreen;
+} {
+  const [x, y, h, flag, inMode, alt, mouseSgr, mouseAny] = line.split("|").map((v) => Number(v));
+  const cursor = [x, y, h].every(Number.isFinite)
+    ? { x: x!, y: y!, paneHeight: h!, visible: flag === 1 && inMode === 0 }
+    : null;
+  return {
+    cursor,
+    screen: {
+      alt: alt === 1,
+      mouseSgr: mouseSgr === 1,
+      mouseAny: mouseAny === 1,
+    },
+  };
 }
 
 export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver {
@@ -158,20 +175,20 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
     async getCursor(session) {
       try {
         const out = run(["display-message", "-t", target.pane(session), "-p",
-          "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}"]).trim();
-        return parseCursorLine(out);
+          PANE_STATUS_FMT]).trim();
+        return parsePaneStatusLine(out).cursor;
       } catch {
         return null;
       }
     },
     async captureWithCursor(session, opts) {
       // ONE tmux invocation for both commands: the server runs them back to
-      // back, so the (content, cursor) pair cannot desync the way two
+      // back, so the (content, cursor, screen) triple cannot desync the way
       // separate calls can during a TUI repaint. display-message goes first —
       // its single line is trivially split off the top of the output.
       const paneTarget = target.pane(session);
       const args = ["display-message", "-t", paneTarget, "-p",
-        "#{cursor_x}|#{cursor_y}|#{pane_height}|#{cursor_flag}|#{pane_in_mode}",
+        PANE_STATUS_FMT,
         ";", "capture-pane", "-t", paneTarget, "-p", "-e"];
       if (!opts.currentPaneOnly && typeof opts.startLine === "number") {
         args.push("-S", String(opts.startLine));
@@ -180,12 +197,13 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
       const out = await new Response(p.stdout).text();
       if ((await p.exited) !== 0) throw new Error(`capture-pane failed for ${session}`);
       const nl = out.indexOf("\n");
-      const cursorLine = nl === -1 ? out : out.slice(0, nl);
+      const statusLine = nl === -1 ? out : out.slice(0, nl);
       const content = nl === -1 ? "" : out.slice(nl + 1);
       const lines = content.replace(/\n$/, "").split("\n");
       let last = lines.length;
       while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
-      return { content, cursor: parseCursorLine(cursorLine.trim()), trailingBlanks: lines.length - last };
+      const { cursor, screen } = parsePaneStatusLine(statusLine.trim());
+      return { content, cursor, trailingBlanks: lines.length - last, screen };
     },
   };
 }

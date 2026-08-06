@@ -210,3 +210,62 @@ describe("cursor mapping", () => {
     }
   });
 });
+
+describe("pane screen mode (FS1)", () => {
+  function screenDriver(state: State & { screen: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } }): TmuxDriver {
+    return {
+      ...baseDriver(state),
+      captureWithCursor: async () => ({
+        content: state.viewport.slice(0, 4).join("\n"),
+        cursor: { ...state.cursor },
+        trailingBlanks: 6,
+        screen: { ...state.screen },
+      }),
+    };
+  }
+
+  test("output frames carry the driver screen sample", async () => {
+    const state = {
+      ...makeState(),
+      screen: { alt: true, mouseSgr: true, mouseAny: true },
+    };
+    const mux = new TmuxWsMux({ driver: screenDriver(state), pollNormalMs: 25 });
+    const ws = new FakeWS();
+    try {
+      mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+      await until(() => ws.frames("output").some((m) => m.screen != null));
+      expect(ws.frames("output").at(-1).screen).toEqual({
+        alt: true,
+        mouseSgr: true,
+        mouseAny: true,
+      });
+    } finally {
+      mux.stop();
+    }
+  });
+
+  test("screen change without content change emits an output frame with the new screen", async () => {
+    const state = {
+      ...makeState(),
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    };
+    const mux = new TmuxWsMux({ driver: screenDriver(state), pollNormalMs: 25 });
+    const ws = new FakeWS();
+    try {
+      mux.handleMessage({ type: "subscribe", session: SES }, ws as any);
+      await until(() => ws.frames("output").some((m) => m.screen?.alt === false));
+      const outputsBefore = ws.frames("output").length;
+
+      // TUI enters alternate screen; pane text is identical.
+      state.screen = { alt: true, mouseSgr: true, mouseAny: true };
+      await until(() => ws.frames("output").some((m) => m.screen?.alt === true));
+
+      const latest = ws.frames("output").at(-1);
+      expect(latest.screen).toEqual({ alt: true, mouseSgr: true, mouseAny: true });
+      expect(latest.data).toBe(state.viewport.slice(0, 4).join("\n"));
+      expect(ws.frames("output").length).toBeGreaterThan(outputsBefore);
+    } finally {
+      mux.stop();
+    }
+  });
+});
