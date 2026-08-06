@@ -30,12 +30,17 @@ jobs:
       # it deterministically, so this does not change what ships.
       - name: build git-dist for the artifact tests
         run: bun run build:git-dist
-      # A hang here used to run until the 6-hour job ceiling with nothing naming
-      # the culprit. `--timeout` fails the individual test by name; the step
-      # ceiling is the backstop for a hang outside any single test. The suite
-      # takes ~100s on a dev box, so 15 minutes is generous, not tight.
+      # `--timeout` fails an individual test by name; the step ceiling is the
+      # backstop for a wait that belongs to no single test.
+      #
+      # The ceiling is 60 minutes and that is not padding. This suite installs
+      # real consumer fixtures over the network and drives a real browser, and a
+      # 2-core runner does not resemble the 16-core box where it finishes in
+      # 101 seconds. A first attempt at 15 minutes killed three releases in a
+      # row and taught nothing — every "hang" it reported was this step being
+      # slow, and cutting it short only removed the evidence.
       - name: unit and contract suites
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build

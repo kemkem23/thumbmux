@@ -24,23 +24,23 @@ jobs:
       - name: build git-dist for the artifact tests
         run: bun run build:git-dist
       - name: core unit tests
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: bun test --timeout 120000 ./core/tests/ ./core/src/*.test.ts
       # Real tmux on a runner is the likeliest place for this job to hang rather
       # than fail: a pane that never becomes ready waits forever. The per-test
       # timeout names the culprit; the step ceiling catches a hang between tests.
       - name: protocol conformance (real tmux)
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: bun test --timeout 120000 ./server/tests/
       - name: svelte + app + demo unit tests
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: bun test --timeout 120000 ./svelte/tests/ ./app/tests/ ./demo/*.test.ts ./scripts/*.test.ts
       # Release-parity gate: must stay byte-identical to the unit-test command
       # in release.yml. Split suite steps above give better failure locality;
       # this combined process is what release-dist actually runs, and a
       # DOM-harness / preload interaction can fail only under one process.
       - name: release-parity combined unit tests
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       - name: demo builds
         run: cd demo && bun run build
