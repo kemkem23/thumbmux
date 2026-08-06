@@ -22,6 +22,22 @@ fi
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$package_dir"
 
+# Parity means the same toolchain, not just the same commands. setup-bun was
+# unpinned once and CI silently moved to bun 1.3.14, where demo/dogfooding.test.ts
+# deadlocks — five release attempts burned while this script ran green on 1.3.11.
+# A gate that runs a different interpreter than CI is not a parity gate.
+pinned_bun="$(grep -oP 'bun-version:\s*\K[0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml | head -1 || true)"
+local_bun="$(bun --version)"
+if [ -z "$pinned_bun" ]; then
+  echo "ci-parity: FAILED — .github/workflows/ci.yml does not pin bun-version" >&2
+  exit 1
+fi
+if [ "$pinned_bun" != "$local_bun" ]; then
+  echo "ci-parity: FAILED — CI pins bun $pinned_bun, this shell runs $local_bun" >&2
+  exit 1
+fi
+echo "ci-parity: bun $local_bun matches the CI pin"
+
 # `git archive HEAD:<path>` resolves <path> against the CURRENT directory, not
 # the repo root — running it from inside the package yields an empty archive
 # and exit 0, so the whole gate silently tests nothing. Archive from the top.

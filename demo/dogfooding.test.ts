@@ -74,6 +74,14 @@ const appSource = await readFile(new URL("./src/App.svelte", import.meta.url), "
 const policySource = await readFile(new URL("./policy.ts", import.meta.url), "utf8");
 const serverPolicySource = await readFile(new URL("./server-policy.ts", import.meta.url), "utf8");
 
+// Registered ONCE, at module scope. Two mounting tests want the same mock, and
+// calling mock.module a second time for a module that is already mocked — with a
+// factory that dynamically imports it — deadlocks under bun 1.3.14: the factory
+// waits on a registry entry that the re-registration is holding. bun 1.3.11 let
+// it through, so CI (unpinned, on 1.3.14) hung for an hour while the same file
+// ran locally in 4.6s.
+mock.module("@thumbmux/app", () => import("../app/src/index.ts"));
+
 function restoreProperty(
   target: object,
   key: string,
@@ -150,7 +158,6 @@ test("demo calls the imported defaultSurface instead of leaving a dogfood-only i
 });
 
 test("demo preserves the pre-extraction raw launch error line", async () => {
-  mock.module("@thumbmux/app", () => import("../app/src/index.ts"));
   const { default: App } = await import("./src/App.svelte");
   const mux = tmuxMux as unknown as {
     onSessions(callback: (rows: unknown[]) => void): () => void;
@@ -208,7 +215,6 @@ test("demo preserves the pre-extraction raw launch error line", async () => {
 });
 
 test("deep-link session hydrates from later mux pushes when REST bootstrap fails", async () => {
-  mock.module("@thumbmux/app", () => import("../app/src/index.ts"));
   const { default: App } = await import("./src/App.svelte");
   const mux = tmuxMux as unknown as {
     onSessions(callback: (rows: unknown[]) => void): () => void;
