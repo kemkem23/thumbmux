@@ -257,6 +257,101 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", "frozen"]);
   });
 
+  test("an optional member added to a type alias is as additive as one on an interface", () => {
+    // The proof strips optional properties and requires the rest to be identical.
+    // `type X = { a?: T }` is the same contract as `interface X { a?: T }`, and it
+    // was rejected for years only because the owner filter read interfaces alone.
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string; cursor?: number; screen?: boolean };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .not.toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("a type alias that gains a REQUIRED member is still a break", () => {
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string; cursor?: number; screen: boolean };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("dropping an optional member from a type alias is still a break", () => {
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "export type frozen = { channel: string; cursor?: number };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "export type frozen = { channel: string };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
+  test("an optional member added to a REFERENCED type alias is additive too", () => {
+    // A dependency was never strippable, so a dependent could not be proven
+    // additive when the type it referenced gained an optional member.
+    const baseline = fixture("0.9.2");
+    writeCoreDeclarations(baseline, [
+      "type Payload = { channel: string; cursor?: number };",
+      "export type frozen = Payload | { type: \"pong\" };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const current = fixture("0.10.0");
+    writeCoreDeclarations(current, [
+      "type Payload = { channel: string; cursor?: number; screen?: boolean };",
+      "export type frozen = Payload | { type: \"pong\" };",
+      "export declare function stabilizing(input: number): number;",
+      "export declare function experimental(input: boolean): boolean;",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(current);
+    expect(runFixture(current, baseline).errors.map(({ code, name }) => [code, name]))
+      .not.toContainEqual(["baseline-signature-change", "frozen"]);
+  });
+
   test("a patch may declare a new export", () => {
     const baseline = fixture("0.8.4");
     writeBaselineManifest(baseline);

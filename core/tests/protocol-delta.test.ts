@@ -139,13 +139,8 @@ describe("mux delta protocol", () => {
 
   test("accepts a valid MuxPaneScreen on a delta and rejects a malformed one", () => {
     const base = ["one", "two"];
-    const good = createMuxDeltaFrame(
-      "terminal",
-      base,
-      ["one", "three"],
-      { row: 0, col: 1 },
-      { alt: true, mouseSgr: true, mouseAny: false },
-    );
+    const good = createMuxDeltaFrame("terminal", base, ["one", "three"], { row: 0, col: 1 });
+    good.screen = { alt: true, mouseSgr: true, mouseAny: false };
     expect(good.screen).toEqual({ alt: true, mouseSgr: true, mouseAny: false });
     expect(validateMuxDeltaFrame(good, base)).not.toBeNull();
     expect(applyMuxDelta(base, good)).toEqual(["one", "three"]);

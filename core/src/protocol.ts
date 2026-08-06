@@ -216,7 +216,6 @@ export function createMuxDeltaFrame(
   base: readonly string[],
   next: readonly string[],
   cursor?: MuxCursor | null,
-  screen?: MuxPaneScreen | null,
 ): MuxDeltaFrame {
   const prefix = muxCommonPrefixLength(base, next);
   const frame: MuxDeltaFrame = {
@@ -228,7 +227,6 @@ export function createMuxDeltaFrame(
     lines: next.slice(prefix),
   };
   if (cursor !== undefined) frame.cursor = cursor;
-  if (screen !== undefined) frame.screen = screen;
   return frame;
 }
 
@@ -325,8 +323,12 @@ export function chooseMuxOutputFrame(
     base,
     splitMuxOutputData(full.data),
     full.cursor,
-    full.screen,
   );
+  // Rides on the frame rather than through a fifth parameter: `screen` is an
+  // optional field on an already-optional-bearing wire shape, and widening a
+  // frozen factory's signature to carry it would be a declaration change the
+  // additive proof cannot express — for a value this call site already holds.
+  if (full.screen !== undefined) delta.screen = full.screen;
   return shouldUseMuxDelta(full, delta) ? delta : full;
 }
 

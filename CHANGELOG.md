@@ -69,6 +69,18 @@ tmux reports each separately, so the package samples them instead of guessing.
 - `KeyboardSequenceOptions.applicationCursorKeys` — unmodified arrows and
   Home/End emit SS3. Off by default; modified forms stay CSI.
 
+### Contract gate
+
+- The additive proof reads `type X = { a?: T }` the way it always read
+  `interface X { a?: T }`, and it reads a referenced declaration the way it reads
+  a root one. Both are the same contract to a consumer; the owner filter simply
+  looked at root interfaces only, so 38 declarations could not be proven additive
+  by a rule that already covered the change. It deliberately still refuses to
+  strip optionals out of ANONYMOUS type literals: with no owner name in the member
+  key, moving an optional property between two inline literals would be
+  indistinguishable from leaving it alone, and a gate that waves a real break
+  through is worse than one that asks for a review.
+
 ### CI
 
 - The bun version is pinned in both workflows, and `ci-parity.sh` fails when the
