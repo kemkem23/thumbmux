@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.10.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.10.1-dist`.
+
+## v0.10.1 — 2026-08-06
+
+No runtime change. `v0.10.0-dist` was published from a commit whose `ci` workflow
+was red, and a dist tag is immutable by design — a consumer pins it, so it can
+never be made to mean something else. This is that same code plus the one fix,
+released under a number nobody has pinned yet.
+
+The fix: three quickstart tests get their own timeout. Each installs a real
+consumer, runs tsc, runs a Vite build and drives headless Chromium; that finishes
+in 25s on a sixteen-core box and exceeded the suite-wide 120s ceiling on the
+two-core runner. The ceiling stays where it is for the other four hundred tests,
+because it is there to name a genuine hang quickly.
 
 ## v0.10.0 — 2026-08-06
 
