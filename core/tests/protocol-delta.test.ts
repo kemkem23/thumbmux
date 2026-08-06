@@ -137,6 +137,50 @@ describe("mux delta protocol", () => {
     expect(applyMuxDelta(base, delta)).toEqual(["one", "three"]);
   });
 
+  test("accepts a valid MuxPaneScreen on a delta and rejects a malformed one", () => {
+    const base = ["one", "two"];
+    const good = createMuxDeltaFrame(
+      "terminal",
+      base,
+      ["one", "three"],
+      { row: 0, col: 1 },
+      { alt: true, mouseSgr: true, mouseAny: false },
+    );
+    expect(good.screen).toEqual({ alt: true, mouseSgr: true, mouseAny: false });
+    expect(validateMuxDeltaFrame(good, base)).not.toBeNull();
+    expect(applyMuxDelta(base, good)).toEqual(["one", "three"]);
+
+    const badScreen: unknown[] = [
+      { ...good, screen: { alt: 1, mouseSgr: true, mouseAny: false } },
+      { ...good, screen: { alt: true, mouseSgr: true } },
+      { ...good, screen: "alt" },
+    ];
+    for (const frame of badScreen) {
+      expect(validateMuxDeltaFrame(frame, base)).toBeNull();
+      expect(applyMuxDelta(base, frame)).toBeNull();
+    }
+
+    // null screen is authoritative "unknown / hidden" (same as cursor).
+    const withNull = { ...good, screen: null };
+    expect(validateMuxDeltaFrame(withNull, base)).not.toBeNull();
+  });
+
+  test("chooseMuxOutputFrame carries screen onto a chosen delta", () => {
+    const base = Array.from({ length: 30 }, (_, index) => `stable-${index}`);
+    const next = [...base.slice(0, -1), "changed"];
+    const screen = { alt: true, mouseSgr: true, mouseAny: true };
+    const full: MuxFullOutputFrame = {
+      channel: "terminal",
+      type: "output",
+      data: next.join("\n"),
+      cursor: { row: 0, col: 0 },
+      screen,
+    };
+    const chosen = chooseMuxOutputFrame(full, base);
+    expect(chosen.type).toBe("delta");
+    expect(chosen.screen).toEqual(screen);
+  });
+
   test("chooses only a strict smaller delta and never turns reset output into one", () => {
     const base = Array.from({ length: 30 }, (_, index) => `stable-${index}`);
     const next = [...base.slice(0, -1), "changed"];

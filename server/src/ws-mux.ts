@@ -22,6 +22,7 @@ import {
   splitMuxOutputData,
   type MuxClientMessage,
   type MuxFullOutputFrame,
+  type MuxPaneScreen,
   type MuxServerMessage,
   type SessionListItem,
   type SessionListRow,
@@ -52,18 +53,26 @@ export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem>
    * problem. */
   getCursor?(session: string): Promise<RawCursorState | null>;
   /** OPTIONAL, preferred over getCursor: capture the pane AND sample the
-   * cursor in ONE tmux invocation (`tmux display-message ... \; capture-pane
-   * ...`) so the (content, cursor) pair can never desync — a stale mismatched
-   * pair would otherwise be frozen by hash dedupe for as long as the pane
-   * stays idle, misplacing every new viewer's caret.
+   * cursor (and optionally pane screen mode) in ONE tmux invocation
+   * (`tmux display-message ... \; capture-pane ...`) so the (content, cursor,
+   * screen) triple can never desync — a stale mismatched pair would otherwise
+   * be frozen by hash dedupe for as long as the pane stays idle, misplacing
+   * every new viewer's caret / alt-screen state.
    * `trailingBlanks` = count of consecutive blank lines at the END of the RAW
    * capture output (before any trimming your driver applies to `content`) —
    * the mux needs it to anchor cursor rows, and it cannot recover the number
-   * itself once the content is trimmed. */
+   * itself once the content is trimmed.
+   * `screen` is optional for back-compat drivers; when present, output frames
+   * carry it and screen-only changes are pushed without a content re-hash. */
   captureWithCursor?(
     session: string,
     opts: { startLine?: number; currentPaneOnly?: boolean },
-  ): Promise<{ content: string; cursor: RawCursorState | null; trailingBlanks: number }>;
+  ): Promise<{
+    content: string;
+    cursor: RawCursorState | null;
+    trailingBlanks: number;
+    screen?: MuxPaneScreen | null;
+  }>;
 }
 
 /** tmux cursor sample: cell coords within the visible pane + visibility
@@ -317,6 +326,9 @@ export class TmuxWsMux<
   /** last cursor broadcast per session — attached to cached first paints so
    * a new viewer of a static pane still gets a caret */
   private lastCursor = new Map<string, { row: number; col: number } | null>();
+  /** last pane screen-mode sample per session — attached like lastCursor so a
+   * new viewer of a static pane still learns alt/mouse without a content change */
+  private lastScreen = new Map<string, MuxPaneScreen | null>();
   private pipeDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pipeMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollCounter = 0;
@@ -412,6 +424,7 @@ export class TmuxWsMux<
         type: "output",
         data: this.contentFor(session, ws, cachedContent),
         cursor: this.lastCursor.get(session) ?? null,
+        ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
       });
       // Cached pane content is only a fast first paint. Always follow it with a
       // real capture so a reopened terminal cannot stay behind the live tmux pane
@@ -524,6 +537,7 @@ export class TmuxWsMux<
           type: "output",
           data: this.contentFor(session, ws, cached),
           cursor: this.lastCursor.get(session) ?? null,
+          ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
         });
         // If re-blocked mid catch-up, remaining sessions stay pending for the next drain.
         if (this.blockedSockets.has(ws) || this.shedSockets.has(ws)) break;
@@ -798,6 +812,12 @@ export class TmuxWsMux<
     return x.row === y.row && x.col === y.col;
   }
 
+  private screenEq(a: MuxPaneScreen | null | undefined, b: MuxPaneScreen | null | undefined): boolean {
+    const x = a ?? null, y = b ?? null;
+    if (x === null || y === null) return x === y;
+    return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny;
+  }
+
   /**
    * Best-effort canonical output tap. Keep the absent-hook path allocation-free:
    * the frame object only exists for hosts that explicitly install the seam.
@@ -809,6 +829,7 @@ export class TmuxWsMux<
     data: string,
     cursor: { row: number; col: number } | null,
     reset?: "resize" | "resync",
+    screen?: MuxPaneScreen | null,
   ): void {
     const hook = this.hooks.onOutput;
     if (!hook) return;
@@ -817,6 +838,7 @@ export class TmuxWsMux<
       type: "output",
       data,
       cursor: cursor ? { ...cursor } : null,
+      ...(screen !== undefined ? { screen: screen ? { ...screen } : null } : {}),
       ...(reset ? { reset } : {}),
     };
     try {
@@ -1061,6 +1083,7 @@ export class TmuxWsMux<
         type: "output",
         data,
         cursor,
+        ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
       };
       const frame: MuxFullOutputFrame = group.reset ? { ...full, reset: group.reset } : full;
       const output = group.base === undefined
@@ -1240,6 +1263,7 @@ export class TmuxWsMux<
     this.pendingOutputFulls.delete(session);
     this.pendingOutputResets.delete(session);
     this.lastCursor.delete(session);
+    this.lastScreen.delete(session);
     this.contents.delete(session);
     this.hashes.delete(session);
     this.lastActivity.delete(session);
@@ -1461,6 +1485,7 @@ export class TmuxWsMux<
         type: "output",
         data: this.contentFor(session, ws, cachedContent),
         cursor: this.lastCursor.get(session) ?? null,
+        ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
       });
     }
     this.queueCapture(session);
@@ -1630,6 +1655,10 @@ export class TmuxWsMux<
       this.lastCursor.set(newSession, this.lastCursor.get(oldSession) ?? null);
       this.lastCursor.delete(oldSession);
     }
+    if (this.lastScreen.has(oldSession)) {
+      this.lastScreen.set(newSession, this.lastScreen.get(oldSession) ?? null);
+      this.lastScreen.delete(oldSession);
+    }
     const hash = this.hashes.get(oldSession);
     if (hash) {
       this.hashes.set(newSession, hash);
@@ -1754,11 +1783,17 @@ export class TmuxWsMux<
       let content: string;
       let rawCursor: RawCursorState | null = null;
       let trailingBlanks: number | null = null;
+      /** undefined = driver did not sample; null/object = atomic sample */
+      let rawScreen: MuxPaneScreen | null | undefined = undefined;
       if (this.driver.captureWithCursor) {
         const combined = await this.driver.captureWithCursor(session, captureOpts);
         content = combined.content;
         rawCursor = combined.cursor;
         trailingBlanks = combined.trailingBlanks;
+        // Only treat as sampled when the driver actually returned the field.
+        if (Object.prototype.hasOwnProperty.call(combined, "screen")) {
+          rawScreen = combined.screen ?? null;
+        }
       } else {
         content = await this.driver.capturePane(session, captureOpts);
       }
@@ -1837,6 +1872,11 @@ export class TmuxWsMux<
           : (this.lastCursor.get(session) ?? null);
         const cursorMoved = atomicCursor !== undefined
           && !this.cursorEq(atomicCursor, this.lastCursor.get(session));
+        // Screen is only authoritative on the atomic path when the driver
+        // returned the field. undefined = not sampled this tick.
+        const atomicScreen = rawScreen;
+        const screenMoved = atomicScreen !== undefined
+          && !this.screenEq(atomicScreen, this.lastScreen.get(session));
         if (this.hasPendingOutputFrame(session, viewers)) {
           // Remember who receives the complete pending frame before successful
           // sends clear their markers. A coincident cursor move still has to
@@ -1848,16 +1888,32 @@ export class TmuxWsMux<
             if (fulls?.has(ws) || resets?.has(ws)) pendingViewers.add(ws);
           }
           if (cursorMoved) this.lastCursor.set(session, atomicCursor);
-          if ((cursorMoved || archiveReflowGeneration !== undefined) && this.hooks.onOutput) {
+          if (screenMoved) this.lastScreen.set(session, atomicScreen);
+          if ((cursorMoved || screenMoved || archiveReflowGeneration !== undefined) && this.hooks.onOutput) {
             this.emitOutputHook(
               session,
               liveContent,
               cursor,
               archiveReflowGeneration !== undefined ? "resize" : undefined,
+              this.lastScreen.has(session) ? (this.lastScreen.get(session) ?? null) : undefined,
             );
           }
           this.sendPendingOutputFrames(session, viewers, liveContent, cursor);
-          if (cursorMoved) {
+          // Non-pending viewers still need the change: screen lives only on
+          // full/delta frames, so a screen move re-sends output (same content);
+          // a pure cursor move stays on the lightweight cursor frame.
+          if (screenMoved) {
+            for (const ws of viewers) {
+              if (pendingViewers.has(ws)) continue;
+              this.sendOutputFrame(session, ws, {
+                channel: session,
+                type: "output",
+                data: this.contentFor(session, ws, liveContent),
+                cursor,
+                screen: atomicScreen,
+              });
+            }
+          } else if (cursorMoved) {
             const cursorMsg = JSON.stringify({
               channel: session,
               type: "cursor",
@@ -1870,13 +1926,23 @@ export class TmuxWsMux<
           }
           return;
         }
-        // Content unchanged — but a cursor that moved anyway (arrow keys on a
-        // shell line) must still reach viewers, minus the pane re-send. Only
-        // the atomic driver path does this: with two-call sampling a mid-
-        // repaint cursor could spam spurious frames on every idle tick.
-        if (atomicCursor !== undefined) {
-          if (cursorMoved) {
-            this.lastCursor.set(session, atomicCursor);
+        // Content unchanged — but a cursor / screen that moved anyway must
+        // still reach viewers. Only the atomic driver path does this: with
+        // two-call sampling a mid-repaint sample could spam idle ticks.
+        if (atomicCursor !== undefined || atomicScreen !== undefined) {
+          if (cursorMoved && atomicCursor !== undefined) this.lastCursor.set(session, atomicCursor);
+          if (screenMoved) this.lastScreen.set(session, atomicScreen!);
+          if (screenMoved) {
+            // Output carries screen (+ current cursor). Not a cursor-only frame:
+            // MuxPaneScreen is only defined on full/delta wire shapes.
+            const nextCursor = atomicCursor !== undefined
+              ? atomicCursor
+              : (this.lastCursor.get(session) ?? null);
+            if (this.hooks.onOutput) {
+              this.emitOutputHook(session, liveContent, nextCursor, undefined, atomicScreen);
+            }
+            this.sendGroupedOutputFrames(session, viewers, liveContent, nextCursor);
+          } else if (cursorMoved && atomicCursor !== undefined) {
             if (this.hooks.onOutput) this.emitOutputHook(session, liveContent, atomicCursor);
             const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor: atomicCursor } satisfies MuxServerMessage);
             for (const ws of viewers) {
@@ -1908,12 +1974,14 @@ export class TmuxWsMux<
       }
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
       this.lastCursor.set(session, cursor);
+      if (rawScreen !== undefined) this.lastScreen.set(session, rawScreen);
       if (this.hooks.onOutput) {
         this.emitOutputHook(
           session,
           liveContent,
           cursor,
           archiveReflowGeneration !== undefined ? "resize" : undefined,
+          rawScreen,
         );
       }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);

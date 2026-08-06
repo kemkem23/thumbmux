@@ -7,6 +7,9 @@
 
 export type MuxCursor = { row: number; col: number };
 
+/** tmux pane screen-mode sample: alternate buffer + SGR / any-event mouse. */
+export interface MuxPaneScreen { alt: boolean; mouseSgr: boolean; mouseAny: boolean; }
+
 /**
  * Minimum row inside the JSON-encoded `data` of a `__sessions` frame.
  *
@@ -42,6 +45,8 @@ export type MuxFullOutputFrame = {
   type: "output";
   data: string;
   cursor?: MuxCursor | null;
+  /** Present when the driver samples pane screen mode (alt buffer + mouse). */
+  screen?: MuxPaneScreen | null;
   reset?: "resize" | "resync";
 };
 
@@ -54,6 +59,8 @@ export type MuxDeltaFrame = {
   prefixHash: string;
   lines: string[];
   cursor?: MuxCursor | null;
+  /** Present when the driver samples pane screen mode (alt buffer + mouse). */
+  screen?: MuxPaneScreen | null;
 };
 
 export type MuxOutputFrame = MuxFullOutputFrame | MuxDeltaFrame;
@@ -209,6 +216,7 @@ export function createMuxDeltaFrame(
   base: readonly string[],
   next: readonly string[],
   cursor?: MuxCursor | null,
+  screen?: MuxPaneScreen | null,
 ): MuxDeltaFrame {
   const prefix = muxCommonPrefixLength(base, next);
   const frame: MuxDeltaFrame = {
@@ -220,6 +228,7 @@ export function createMuxDeltaFrame(
     lines: next.slice(prefix),
   };
   if (cursor !== undefined) frame.cursor = cursor;
+  if (screen !== undefined) frame.screen = screen;
   return frame;
 }
 
@@ -234,6 +243,17 @@ function isMuxCursor(value: unknown): value is MuxCursor | null {
     Number.isInteger(cursor.row) &&
     Number.isInteger(cursor.col) &&
     (cursor.col as number) >= 0
+  );
+}
+
+function isMuxPaneScreen(value: unknown): value is MuxPaneScreen | null {
+  if (value === null) return true;
+  if (typeof value !== "object" || value === null) return false;
+  const screen = value as Record<string, unknown>;
+  return (
+    typeof screen.alt === "boolean" &&
+    typeof screen.mouseSgr === "boolean" &&
+    typeof screen.mouseAny === "boolean"
   );
 }
 
@@ -258,6 +278,9 @@ export function validateMuxDeltaFrame(
   if (!Array.isArray(candidate.lines) || !candidate.lines.every((line) => typeof line === "string")) return null;
 
   if (Object.prototype.hasOwnProperty.call(candidate, "cursor") && !isMuxCursor(candidate.cursor)) {
+    return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(candidate, "screen") && !isMuxPaneScreen(candidate.screen)) {
     return null;
   }
 
@@ -302,6 +325,7 @@ export function chooseMuxOutputFrame(
     base,
     splitMuxOutputData(full.data),
     full.cursor,
+    full.screen,
   );
   return shouldUseMuxDelta(full, delta) ? delta : full;
 }
