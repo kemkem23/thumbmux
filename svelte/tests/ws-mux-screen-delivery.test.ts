@@ -218,8 +218,10 @@ describe('TmuxMux MuxDeliveryMeta.screen (FS5)', () => {
       base,
       splitMuxOutputData('a\nb\nc\n'),
       { row: 2, col: 0 },
-      SCREEN_LOCAL,
     );
+    // The factory keeps its frozen 0.9.2 signature; `screen` rides on the frame,
+    // which is exactly what chooseMuxOutputFrame does on the server.
+    delta.screen = SCREEN_LOCAL;
     socket.receive(delta);
 
     expect(deliveries[1]!.meta?.screen).toEqual(SCREEN_LOCAL);
