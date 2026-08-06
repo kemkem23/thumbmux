@@ -63,9 +63,41 @@
     return !!(node && rootEl && (node === rootEl || rootEl.contains(node)));
   }
 
-  function targetIsInteractive(target: EventTarget | null): boolean {
+  /**
+   * Real text entry owns its keystrokes. A link or button rendered *inside*
+   * the terminal (OSC-8 / detected URLs from ansi-html, rare in-pane buttons)
+   * must not — those are part of the pane surface, not a form.
+   */
+  function isRealTextEntry(target: EventTarget | null): boolean {
     if (!(target instanceof Element)) return false;
-    return !!target.closest('input,textarea,select,button,a,[contenteditable="true"]');
+    return !!target.closest('input,textarea,select,[contenteditable="true"]');
+  }
+
+  /**
+   * True when this wrapper should route keys: either the root itself is
+   * focused, or focus landed on a non-editable descendant inside the pane
+   * (e.g. an OSC-8 <a>). Real text entry inside the wrapper is excluded.
+   *
+   * Encoded behaviour (pinned by FS4 tests): reclaim focus onto the wrapper
+   * and still forward the keystroke — do not silently mute the terminal.
+   */
+  function terminalOwnsKeyboard(target: EventTarget | null): boolean {
+    if (!enabled) return false;
+    if (isRealTextEntry(target)) return false;
+    if (nativeFocused) return true;
+    // Focus stole onto a non-editable descendant — reclaim so the wrapper
+    // remains the focus owner and subsequent keydowns hit a stable target.
+    const ae = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!nodeInsideRoot(ae) || isRealTextEntry(ae)) return false;
+    rootEl?.focus({ preventScroll: true });
+    // focus() should fire handleFocus; if the host/DOM suppresses it, keep
+    // routing state consistent with the reclaim we just performed.
+    if (!nativeFocused) {
+      nativeFocused = true;
+      focused = true;
+      onFocusChange?.(true);
+    }
+    return true;
   }
 
   function terminalSelectionActive(): boolean {
@@ -88,7 +120,18 @@
     }
   }
 
+  /**
+   * Chord identity for copy/paste policy. Prefer physical KeyA–KeyZ from
+   * `e.code` (same rule core/src/keys.ts uses in ctrlLetterFromCode) so a Thai
+   * Kedmanee Ctrl+C arrives as KeyC even when e.key is 'แ'. Fall back to e.key
+   * when code is absent or not a letter key. No mapping table — one code rule.
+   */
   function keyName(e: KeyboardEvent): string {
+    const code = e.code;
+    if (code && code.length === 4 && code.startsWith('Key')) {
+      const letter = code.charAt(3);
+      if (letter >= 'A' && letter <= 'Z') return letter.toLowerCase();
+    }
     return e.key.toLowerCase();
   }
 
@@ -172,7 +215,8 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (!enabled || !nativeFocused || composing || e.isComposing || targetIsInteractive(e.target)) return;
+    if (!enabled || composing || e.isComposing) return;
+    if (!terminalOwnsKeyboard(e.target)) return;
 
     if (isCopyShortcut(e)) {
       // Ctrl+Shift+C = browser convention (devtools / terminal-style copy) —
@@ -209,7 +253,7 @@
   }
 
   function handlePaste(e: ClipboardEvent) {
-    if (!enabled || !nativeFocused || composing || targetIsInteractive(e.target)) return;
+    if (!enabled || composing || !terminalOwnsKeyboard(e.target)) return;
     const data = e.clipboardData;
     if (!data || clipboardHasFiles(data)) return;
     const text = data.getData('text/plain') || data.getData('text');
@@ -223,7 +267,11 @@
   }
 
   function handlePointerDown(e: PointerEvent) {
-    if (!enabled || e.button !== 0 || targetIsInteractive(e.target)) return;
+    if (!enabled || e.button !== 0 || isRealTextEntry(e.target)) return;
+    // Let real <a> keep the click (navigation / open). Keys reclaim focus later
+    // via terminalOwnsKeyboard — focusing the root on pointerdown can cancel
+    // the link activation in some browsers.
+    if (e.target instanceof Element && e.target.closest('a')) return;
     rootEl?.focus({ preventScroll: true });
   }
 
@@ -243,14 +291,14 @@
   }
 
   function handleCompositionStart(e: CompositionEvent) {
-    if (!enabled || !nativeFocused || targetIsInteractive(e.target)) return;
+    if (!enabled || !nativeFocused || isRealTextEntry(e.target)) return;
     composing = true;
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
     const data = e.data;
     composing = false;
-    if (!enabled || !nativeFocused || targetIsInteractive(e.target) || !data) return;
+    if (!enabled || !nativeFocused || isRealTextEntry(e.target) || !data) return;
     onKeys(data);
   }
 
