@@ -366,6 +366,17 @@ afterAll(() => {
   rmSync(WORK_ROOT, { recursive: true, force: true });
 });
 
+/**
+ * These tests do not call a function — each installs a real consumer, runs tsc,
+ * runs a Vite build and drives headless Chromium. On the two-core CI runner that
+ * is minutes of honest work, and the suite-wide `--timeout 120000` (which exists
+ * to name a genuine hang quickly) fires on it. A ceiling tight enough to trip on
+ * healthy work manufactures failures and destroys the evidence that would tell
+ * the two apart — that mistake cost five release attempts on 2026-08-06. So the
+ * budget is raised HERE, per test, and nowhere else.
+ */
+const BUILD_AND_BROWSE_TIMEOUT_MS = 600_000;
+
 describe("README quickstart", () => {
   test("marks two complete copyable fences", () => {
     expect(README.match(/^## Quickstart$/gm)).toHaveLength(1);
@@ -418,7 +429,7 @@ describe("README quickstart", () => {
       processHandle.kill();
       await processHandle.exited;
     }
-  });
+  }, BUILD_AND_BROWSE_TIMEOUT_MS);
 
   test("type-checks, builds, and executes the client fence with Svelte 5 and Vite", async () => {
     const { code } = extractQuickstart("client");
@@ -430,7 +441,7 @@ describe("README quickstart", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(CONSUMER_ROOT, "dist", "index.html"))).toBe(true);
     expect(await executeBuiltClient()).toEqual([]);
-  });
+  }, BUILD_AND_BROWSE_TIMEOUT_MS);
 
   test("client gate rejects semantic TypeScript errors", () => {
     const { code } = extractQuickstart("client");
@@ -445,5 +456,5 @@ describe("README quickstart", () => {
     expect(typecheckClient().exitCode).toBe(0);
     expect(buildClient().exitCode).toBe(0);
     expect(await executeBuiltClient()).toContain("quickstart startup mutation");
-  });
+  }, BUILD_AND_BROWSE_TIMEOUT_MS);
 });
