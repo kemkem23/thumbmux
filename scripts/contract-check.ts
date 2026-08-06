@@ -1098,47 +1098,31 @@ function releaseBoundary(
 }
 
 /**
- * Declarations reviewed by hand for the 0.9.2 -> 0.10.0 release, each pinned to
+ * Declarations reviewed by hand for the 0.10.1 -> 0.11.0 release, each pinned to
  * BOTH the digest it was reviewed against and the digest it was reviewed as.
  * Entries are `subpath:name:baseline:current`.
  *
- * Every one of them is the same change: `screen?: MuxPaneScreen | null` added to
- * the object literal `TmuxDriver.captureWithCursor` resolves to, and the types
- * that reach it. `isMinorOptionalAddition` proves an optional addition on a named
- * interface or type alias — it deliberately does NOT strip optionals out of
- * ANONYMOUS type literals, because with no owner name in the member key, moving
- * an optional property from one inline literal to another would look identical
- * to leaving it alone. Widening the proof to cover this would be a gate that
- * waves a real break through, which is worse than a gate that asks for review.
+ * One entry, one reason. TM-02 asked for `openDock(opts?: {focus?: boolean})`
+ * and `openCompose(opts?: {focus?: boolean})` — a trailing optional PARAMETER,
+ * which every existing caller satisfies by passing nothing. `isMinorOptionalAddition`
+ * proves added optional MEMBERS; it does not model parameters, and teaching it to
+ * is a separate concept with its own edges (rest params, overloads, variance) that
+ * should not be invented under release pressure. The 0.9.2 -> 0.10.0 table is gone
+ * from this file because its version guard made it inert the moment 0.10.1 became
+ * the baseline, which is how these tables are supposed to end.
  *
- * The evidence is the frozen consumer fixtures, which CONTRACT.md names as what
- * carries behaviour declarations cannot express: the packed 0.10.0 tarball
- * installs into the app-host fixture, typechecks 292 files with 0 ERRORS,
- * builds, and drives a real session (hub rendered, session opened, marker
- * captured, receipt matched).
+ * The evidence is the one CONTRACT.md names for behaviour declarations cannot
+ * express: the packed tarball installs into the frozen app-host consumer,
+ * typechecks with 0 ERRORS, builds, and drives a real session end to end.
  *
  * Do not add a row here to make a red gate green. Add one only after a fixture
  * has proven the change, and delete the table when the release ships.
  */
-const V0100_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
-  "server:AppRoutes:e22c213ba975cc023e553a87a93a95c7e924322c255de2b66d31461bfc270bb5:9961db9165db5fbb9aa8e2ccc858772a2801f29177aed2969043e3d37fc71b67",
-  "server:AppRoutesOptions:bd351265349fbccee37f7cf3dd75998e8599ad59ce98fe312adc1d1ad8e41cbd:fbd815c477a5d7c96ba8fc70ea25ccb498049e6f5f7bc63a69fb813f6e694fca",
-  "server:createAppRoutes:37668fd89f19fac9dff3932c330321b4ec32c0198d78eaf7e34cf02fb05cc664:3c87d16c24b31d74ae6ae68c73547c7e118354e6377b4a36685966cf6167a956",
-  "server:createBunTmuxDriver:58f60edb5f5c779ebfbb855955c973236951894c11513cc3505416340602c59d:96f8d9a246633892db34aba944eccb2432e5145292ea5f572c6cb0663fff4d52",
-  "server:createSpawnHandler:034a65b16434eb5735164819daa92667845ac14d7920b2ca579408b41a90cc66:3f45c1e0f3c983bb87c731caa8b7619aaaafe410114bd575bf71ba3ea24729ea",
-  "server:SpawnHandlerOptions:4bb3333c6570c4f23f086e39ec01f7aa363fa84c11fb569cdcafb4928d4fe43d:e2ad3a02503ebb921d0874ab127e725b3c6d49a251a92a1efee51bee567c1d76",
-  "server:TmuxDriver:24bc3378896f96d60b02f619a3a0307625fa76338351447ccff4d7186fadf903:31a1557c524f410f91b43202343d0496bd89cb9e2c3335c6972abf62c2a4c62e",
-  "server:TmuxWsMux:4a86aa4e4632961ca32de53ba0597f5d5b09d16dd096858c681f5490a5dd73f8:7bbe15ae120764e2b6b4c931e379742121e2429c78b8a4b0db2ffb3e08d466ab",
-  "server:TmuxWsMuxOptions:473015c7b059df28e78fe798ca5528eb0ce5237047de95f02c16823ba8f59ff1:3e98acd365ac48258e03b29707e49cc991b22afa7f97369333810c1940f31971",
-  "app:AppAdapters:a6124c94dd5559f6f96dea8111af755f50793b9a41c8d965c7b3dd5b0b99dc45:844939f98b8934843dbdc34b1819d5a6066b1cd5b16b980f920f784e50fdb202",
-  "app:createSessionsStore:333222166072736bbefc989070749a1e05a66c857f67d8d98378c2ef0cd269c3:0f71378ac1f9f6ff6a6c1f8f475b850b5163f4cb863dd668362de505c0b39684",
-  "app:EmbedView:a3032409e432333b952b9e22dfde7509b193ec49a36af87b7bbc32da900154a9:bbc74eb82ecc959b0fc3afab655b3cb51d6707a794aad3787eb2451bed2e49e4",
-  "app:HubView:5661d05d98f05077d25c3941234fbc5e6e974d0928fe2d1a06f8911ab754f56e:a2ec460d1e369fce4ea6f93a53f8cb05192e62ec5d2549bbc479b1b972be3a6a",
-  "app:SessionView:1e087ea65f121f0d92c58e0dd34be581b61187d39d1aa4031ae51faae6262f6d:a8b25ecec9c5ebc4e5ea08e8124001dec6443ac3355c9bcaa507ba9f5e26326d",
-  "app:ThumbmuxApp:a0948b0a0e912db50d1c70d20bccf1f6cd8b541eeb46aa8f72a64dd90b085f31:c25e4248001068b7c4616676d48637686ae06e31bde7cac65961d75e40553112",
+const V0110_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "svelte:ComposerDock:fec2af5c980d60e92ba24a8d4f9d249ac420af65c4a006c9cf1a814c3cb7a725:2880a78a343f06c126269d00c681f7181adb91562a922620898a6597c77acb00",
 ]);
 
-function isV0100MinorException(
+function isV0110MinorException(
   baselineVersion: string,
   currentVersion: string,
   subpath: PublicSubpackage,
@@ -1146,9 +1130,9 @@ function isV0100MinorException(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
 ): boolean {
-  if (baselineVersion !== "0.9.2" || currentVersion !== "0.10.0") return false;
+  if (baselineVersion !== "0.10.1" || currentVersion !== "0.11.0") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
-  return V0100_REVIEWED_ADDITIONS.has(reviewed);
+  return V0110_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1316,7 +1300,7 @@ export function evaluateBaseline(
     if (
       boundary === "minor"
       && !kindChanged
-      && isV0100MinorException(
+      && isV0110MinorException(
         baselineVersion,
         currentVersion,
         subpath,

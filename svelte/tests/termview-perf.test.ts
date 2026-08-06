@@ -47,6 +47,7 @@ type TermViewOverrides = {
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
+  maxRows?: number;
 };
 
 type MutableViewportLayout = {
@@ -707,6 +708,46 @@ afterEach(() => {
   frameCallbacks.clear();
   idleCallbacks.clear();
   jest.restoreAllMocks();
+});
+
+describe("TM-25 TermView configurable row ceiling", () => {
+  function measureTallViewportRows(maxRows?: number, minRows = 1): number {
+    const geometryCalls: Array<{ cols: number; rows: number }> = [];
+    const { target } = mountTermView(undefined, {
+      claimGeometry: false,
+      minRows,
+      ...(maxRows === undefined ? {} : { maxRows }),
+      onGeometryChange: (geometry) => geometryCalls.push(geometry),
+    });
+    const viewport = target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
+    if (!viewport) throw new Error("TermView root not found");
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, get: () => 320 },
+      // fontPx=13 gives a rounded 21px line height, so this fits 100 rows.
+      clientHeight: { configurable: true, get: () => 2_100 },
+    });
+
+    const resizeObserver = ControlledResizeObserver.latest;
+    if (!resizeObserver) throw new Error("TermView did not observe its viewport");
+    resizeObserver.fire();
+    flushSync();
+
+    const geometry = geometryCalls.at(-1);
+    if (!geometry) throw new Error("TermView did not report geometry");
+    return geometry.rows;
+  }
+
+  test("defaults to 60 rows when maxRows is omitted", () => {
+    expect(measureTallViewportRows()).toBe(60);
+  });
+
+  test("preserves the existing minRows-over-default-ceiling behavior", () => {
+    expect(measureTallViewportRows(undefined, 85)).toBe(85);
+  });
+
+  test("claims more than 60 rows when maxRows is raised", () => {
+    expect(measureTallViewportRows(200)).toBe(100);
+  });
 });
 
 describe("TermView bottomInsetPx development warnings", () => {

@@ -74,6 +74,7 @@
     fontPx = 13,
     minCols = 20,
     minRows = 15,
+    maxRows = 60,
     bottomInsetPx = 0,
     claimGeometry = true,
     altScreenMouse = false,
@@ -85,6 +86,14 @@
     screen = undefined,
     onKeys = undefined,
     onTap = undefined,
+    /**
+     * When true, a touchend that actually fires `onTap` is cancelled
+     * (stopPropagation + preventDefault) so the browser's compatibility
+     * mouse sequence cannot steal focus from an input the host just focused
+     * inside the gesture stack (TM-03). Default false = v0.10.1 event flow.
+     * Moved / long / selection / link taps never cancel.
+     */
+    cancelSyntheticClickOnTap = false,
     onLinesChange = undefined,
     onGeometryChange = undefined,
     onScrollStateChange = undefined,
@@ -94,6 +103,7 @@
     fontPx?: number;
     minCols?: number;
     minRows?: number;
+    maxRows?: number;
     /** Visual-only inset: the host shrank this many px (composer docked below).
      * Geometry math adds it back so the tmux pane is NEVER resized by a
      * transient overlay — only the scroll pin follows the shorter viewport. */
@@ -114,6 +124,9 @@
      * call your composer's openDock() here, synchronously, so iOS raises the
      * keyboard (gesture call stack). */
     onTap?: () => void;
+    /** Opt-in: cancel the touchend that fired `onTap` so the synthesized
+     * mousedown/click cannot blur the focused input (default false). */
+    cancelSyntheticClickOnTap?: boolean;
     onLinesChange?: (lines: string[], meta: LinesChangeMeta) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
@@ -2462,14 +2475,17 @@
     return !closestLink(target);
   }
 
-  function maybeTap(e: TouchEvent | MouseEvent, x: number, y: number) {
-    if (useSgrMouse || !onTap || !tapStart) return;
+  /** Returns true only when `onTap` was actually invoked for this gesture. */
+  function maybeTap(e: TouchEvent | MouseEvent, x: number, y: number): boolean {
+    if (useSgrMouse || !onTap || !tapStart) return false;
     const moved = Math.abs(x - tapStart.x) + Math.abs(y - tapStart.y);
     const dur = performance.now() - tapStart.t;
     const sel = window.getSelection?.();
     if (dur < 350 && moved < 10 && (!sel || sel.isCollapsed) && cleanTapTarget(e.target)) {
       onTap();
+      return true;
     }
+    return false;
   }
 
   function hasPointerModifier(e: PointerEvent): boolean {
@@ -2547,7 +2563,14 @@
       return;
     }
     if (e && e.changedTouches?.[0] && tapStart) {
-      maybeTap(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+      // TM-03: only cancel a touchend that actually fired onTap — moved /
+      // long / selection / link taps keep native behaviour. Default off so
+      // event flow stays byte-identical to v0.10.1 when the prop is unset.
+      const didTap = maybeTap(e, e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+      if (didTap && cancelSyntheticClickOnTap) {
+        e.stopPropagation();
+        if (e.cancelable) e.preventDefault();
+      }
     }
     tapStart = null;
     if (selectionActive) {
@@ -2691,7 +2714,7 @@
     const cw = measureCharWidth();
     charW = cw;
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
-    const rows = Math.max(minRows, Math.min(60, Math.floor(h / lineH)));
+    const rows = Math.max(minRows, Math.min(maxRows, Math.floor(h / lineH)));
     const changed = !!opts.force || cols !== lastPushedCols || rows !== lastPushedRows;
     if (!changed) return { cols, rows, changed: false };
     lastPushedCols = cols;

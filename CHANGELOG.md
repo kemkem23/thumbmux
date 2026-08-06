@@ -1,7 +1,61 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.10.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.11.0-dist`.
+
+## v0.11.0 — 2026-08-06
+
+The first release driven by a consumer's adoption report rather than by us. Every
+item below was measured against the shipped `v0.10.1-dist` by someone trying to
+delete their local patches, with line anchors and reproductions. Two of them we
+were carrying in production ourselves without knowing.
+
+### Fixed
+
+- **DIRECT mode matched an eight-key literal table and never read a modifier.**
+  `ComposerDock`'s DIRECT mode says in its own markup that "the OS keyboard IS the
+  input", and then dropped every Ctrl chord — Ctrl+C, Ctrl+X, Ctrl+D, Ctrl+R never
+  reached the pane, so a user could not interrupt a process from the mode built for
+  driving one. Alt chords, F1–F12, Home/End/PageUp/PageDown/Delete/Insert: dropped.
+  Two were worse than dropped: `Shift+Tab` matched the `Tab` entry and sent a bare
+  `\t` instead of `CSI Z`, and `Ctrl+Arrow` matched the arrow entry and sent a bare
+  `ESC [ A` with the modifier stripped. It calls `keyboardEventToSequence` now — the
+  encoder that was already exported from core and already correct. **v0.10.0's
+  physical-key fix never reached this path**, and the changelog entry for it read as
+  though it covered the product; it covered the desktop path only. Printable text
+  and IME still flow through the input event, so Thai typing is unchanged, and
+  Ctrl/Cmd+V still yields to the browser paste pipeline.
+- **`openDock()` focused before flushing the open state**, so in DIRECT mode the
+  focus landed in a `visibility: hidden` subtree and did nothing — the component
+  failed its own documented contract. `switchMode()` eight lines away already did
+  `flushSync` first, with a comment naming the same constraint.
+
+### Added
+
+- `openDock(opts?: { focus?: boolean })` and `openCompose(opts?: { focus?: boolean })`.
+  Omitted or `false` is byte-identical to 0.10.1. With `focus: true` the component
+  flushes and then synchronously focuses the input for the current mode before
+  returning, so a call inside a touch handler satisfies iOS Safari's user-activation
+  rule. Without this a host could not express "one tap raises the keyboard with the
+  cursor in the box" without reaching into unpublished DOM.
+- `TermView` prop `cancelSyntheticClickOnTap?: boolean`, default `false`. `onTap`'s
+  own docs tell a host to call `openDock()` synchronously — and then WebKit's
+  synthesized click for that same gesture blurred whatever was focused, so the
+  keyboard rose and fell inside one tap. When enabled, only a touchend whose
+  `maybeTap()` actually invoked `onTap()` is cancelled; moved, long, selection and
+  link taps keep native behaviour. `onTap`'s declaration is untouched — widening it
+  to return a boolean would have been a breaking change to an F-tier prop, and the
+  reporter said so themselves rather than ask for it.
+- `TermView` prop `maxRows?: number`, default `60`. The floor was a prop and the
+  ceiling was a literal, so a tall desktop viewport claimed 60 rows while painting
+  more — harmless for a shell, wrong for an alternate-screen TUI, which drew its
+  footer at row 60 with dead space below. Not a protocol limit: tmux takes far more.
+
+### Packaging
+
+- `svelte` is now an optional peer (`peerDependenciesMeta`). A headless consumer
+  importing only `thumbmux/core` and `thumbmux/server` was installing the entire
+  Svelte 5 toolchain; neither bundle contains the string `svelte` at all.
 
 ## v0.10.1 — 2026-08-06
 

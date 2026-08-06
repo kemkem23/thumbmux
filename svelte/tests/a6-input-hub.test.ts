@@ -182,6 +182,110 @@ describe("A6-2 ComposerDock isComposing", () => {
   });
 });
 
+// ─── TM-24: DIRECT must use the shared terminal key encoder ─────────────────
+
+describe("TM-24 ComposerDock DIRECT terminal key encoding", () => {
+  function mountDirectDock() {
+    const texts: string[] = [];
+    const keys: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      mode: "direct",
+      onSend: () => {},
+      onDirectText: (text: string) => texts.push(text),
+      onDirectKey: (sequence: string) => keys.push(sequence),
+    });
+    const ghost = target.querySelector<HTMLInputElement>('[data-testid="ghost-key"]');
+    if (!ghost) throw new Error("ghost-key missing");
+    return { ghost, keys, texts };
+  }
+
+  function keydown(
+    ghost: HTMLInputElement,
+    init: KeyboardEventInit & { key: string },
+  ): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+    flushSync(() => ghost.dispatchEvent(event));
+    return event;
+  }
+
+  test("relays control, layout-independent control, modified, and named keys", async () => {
+    const { ghost, keys } = mountDirectDock();
+    await tick();
+
+    const cases: Array<[KeyboardEventInit & { key: string }, string]> = [
+      [{ key: "c", code: "KeyC", ctrlKey: true }, "\x03"],
+      [{ key: "แ", code: "KeyC", ctrlKey: true }, "\x03"],
+      [{ key: "x", code: "KeyX", altKey: true }, "\x1bx"],
+      [{ key: "Tab", shiftKey: true }, "\x1b[Z"],
+      [{ key: "ArrowUp", ctrlKey: true }, "\x1b[1;5A"],
+      [{ key: "F5" }, "\x1b[15~"],
+      [{ key: "Home" }, "\x1b[H"],
+      [{ key: "End" }, "\x1b[F"],
+      [{ key: "PageUp" }, "\x1b[5~"],
+      [{ key: "PageDown" }, "\x1b[6~"],
+      [{ key: "Delete" }, "\x1b[3~"],
+      [{ key: "Insert" }, "\x1b[2~"],
+    ];
+
+    for (const [event, expected] of cases) {
+      const dispatched = keydown(ghost, event);
+      expect(dispatched.defaultPrevented).toBe(true);
+      expect(keys.at(-1)).toBe(expected);
+    }
+    expect(keys).toHaveLength(cases.length);
+  });
+
+  test("keeps ordinary Latin and Thai text on the input-event path", async () => {
+    const { ghost, keys, texts } = mountDirectDock();
+    await tick();
+
+    const printableCases = [
+      { key: "a" },
+      { key: "A", shiftKey: true },
+      { key: "แ" },
+      { key: "ฒ", shiftKey: true },
+    ];
+    for (const printable of printableCases) {
+      const event = keydown(ghost, printable);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(keys).toEqual([]);
+
+    flushSync(() => {
+      ghost.value = "aแ";
+      ghost.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        data: "aแ",
+        inputType: "insertText",
+      }));
+    });
+    expect(texts).toEqual(["aแ"]);
+  });
+
+  test("leaves paste shortcuts and unsupported modified tabs to the browser", async () => {
+    const { ghost, keys } = mountDirectDock();
+    await tick();
+
+    const pasteEvents = [
+      keydown(ghost, { key: "v", code: "KeyV", ctrlKey: true }),
+      keydown(ghost, { key: "V", code: "KeyV", ctrlKey: true, shiftKey: true }),
+      keydown(ghost, { key: "v", code: "KeyV", metaKey: true }),
+      // Thai Kedmanee physical KeyV must still be recognized as paste.
+      keydown(ghost, { key: "อ", code: "KeyV", ctrlKey: true }),
+      keydown(ghost, { key: "Tab", ctrlKey: true }),
+      keydown(ghost, { key: "Tab", altKey: true }),
+    ];
+
+    expect(pasteEvents.every((event) => !event.defaultPrevented)).toBe(true);
+    expect(keys).toEqual([]);
+  });
+});
+
 // ─── A6-4: DesktopKeys async paste must not outlive the component ───────────
 
 describe("A6-4 DesktopKeys paste generation", () => {

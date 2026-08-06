@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/server",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Server side of the thumbmux mobile terminal stack: multiplexed tmux WebSocket engine with pluggable driver and policy hooks (Bun/Node).",
   "type": "module",
   "exports": {
@@ -20,7 +20,7 @@
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@thumbmux/core": "^0.10.1"
+    "@thumbmux/core": "^0.11.0"
   },
   "devDependencies": {
     "typescript": "^5.9.3",

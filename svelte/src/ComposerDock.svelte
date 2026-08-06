@@ -32,6 +32,7 @@
    *   synchronously; opacity (never display:none) keeps it focusable.
    */
   import { flushSync } from 'svelte';
+  import { keyboardEventToSequence } from '@thumbmux/core';
 
   let {
     open = $bindable(false),
@@ -125,25 +126,36 @@
     };
   });
 
-  /** Open from a user gesture (tap handler call stack — see iOS rules). */
-  export function openDock() {
+  /** Open from a user gesture (tap handler call stack — see iOS rules).
+   *
+   * `opts.focus` (TM-02): when true, flush then focus the input for the
+   * current mode before return so a host can raise the keyboard in the same
+   * touchend stack. Omitted / false keeps v0.10.1 quiet-COMPOSE behaviour.
+   * DIRECT still focuses by design (documented contract). */
+  export function openDock(opts?: { focus?: boolean }) {
     // Re-read per open — the safe area changes with orientation (34px
     // portrait vs 21px landscape on Face-ID iPhones).
     safeBottom = measureSafeBottom();
-    open = true;
-    // COMPOSE opens quiet — the keyboard rises when the user taps the field.
-    // DIRECT has no visible field: summon the keyboard right here.
-    if (mode === 'direct') {
-      directInputEl?.focus({ preventScroll: true });
+    // TM-01: flush open before focus — without this the sheet is still
+    // visibility:hidden and focus on the ghost input is a no-op in WebKit
+    // (same gesture-stack constraint switchMode already documents).
+    flushSync(() => { open = true; });
+    // COMPOSE opens quiet unless the host asked for focus; DIRECT has no
+    // visible field so it always summons the keyboard right here.
+    const shouldFocus = mode === 'direct' || opts?.focus === true;
+    if (shouldFocus) {
+      if (mode === 'direct') directInputEl?.focus({ preventScroll: true });
+      else composeEl?.focus({ preventScroll: true });
     }
   }
 
   /** Open showing the COMPOSE field regardless of the current mode — for
    * programmatic prefills (upload messages): in DIRECT there is no visible
-   * input, so a prefilled message would be invisible (fleet finding). */
-  export function openCompose() {
+   * input, so a prefilled message would be invisible (fleet finding).
+   * Pass `{ focus: true }` to focus the textarea inside the same gesture. */
+  export function openCompose(opts?: { focus?: boolean }) {
     flushSync(() => { mode = 'compose'; });
-    openDock();
+    openDock(opts);
   }
 
   export function closeDock() {
@@ -205,18 +217,29 @@
     }
   }
 
-  const DIRECT_KEYS: Record<string, string> = {
-    Enter: '\r', Backspace: '\x7f', Escape: '\x1b', Tab: '\t',
-    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D',
-  };
+  function directKeyName(e: KeyboardEvent): string {
+    const code = e.code;
+    if (code && code.length === 4 && code.startsWith('Key')) {
+      const letter = code.charAt(3);
+      if (letter >= 'A' && letter <= 'Z') return letter.toLowerCase();
+    }
+    return e.key.toLowerCase();
+  }
 
   function directKeydown(e: KeyboardEvent) {
     if (e.isComposing || e.keyCode === 229) return;
-    const seq = DIRECT_KEYS[e.key];
-    if (seq) {
-      e.preventDefault();
-      onDirectKey(seq);
-    }
+    // The ghost input owns browser text entry and paste. Let printable text
+    // become an input event (including Thai/IME), and preserve the same
+    // Ctrl(+Shift)+V / Cmd+V browser paste policy as DesktopKeys.
+    if (
+      (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) ||
+      (directKeyName(e) === 'v' && (e.ctrlKey || e.metaKey))
+    ) return;
+
+    const seq = keyboardEventToSequence(e);
+    if (seq === null) return;
+    e.preventDefault();
+    onDirectKey(seq);
   }
 
   $effect(() => {
