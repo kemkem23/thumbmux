@@ -149,8 +149,24 @@
       : (liveScreenSeen ? liveScreen : null),
   );
 
-  /** Pointer routing: live/explicit screen.mouseSgr wins; otherwise static altScreenMouse. */
-  const useSgrMouse = $derived(resolvedScreen != null ? resolvedScreen.mouseSgr : altScreenMouse);
+  /** Pointer routing: live/explicit screen.mouseSgr wins; otherwise static
+   *  altScreenMouse — but ONLY when there is somewhere to send the bytes.
+   *
+   *  Without this guard, 0.10.0 silently removed tap and scroll from every
+   *  view-only surface in existence. A host that mounts a preview passes no
+   *  `onKeys` because it never wanted input; it also passed
+   *  `altScreenMouse={false}` and got local scrolling. Then the server started
+   *  sampling `screen`, a grok pane reported `mouseSgr` (it does even inline),
+   *  routing flipped to SGR, and every event went to `sendSgr`, which had
+   *  nothing to call. The surface kept rendering and stopped responding, with a
+   *  warning that only existed in DEV builds.
+   *
+   *  So the destination is part of the condition. No `onKeys` means the wire
+   *  cannot take pointer input away from a host that never asked for it. */
+  const canRouteSgr = $derived(typeof onKeys === 'function');
+  const useSgrMouse = $derived(
+    canRouteSgr && (resolvedScreen != null ? resolvedScreen.mouseSgr : altScreenMouse),
+  );
   /** Alternate screen has no scrollback — suppress history expand/prepend. */
   const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
 
@@ -2134,10 +2150,11 @@
   function warnMissingOnKeys() {
     if (warnedMissingKeys) return;
     warnedMissingKeys = true;
-    const meta = import.meta as unknown as { env?: { DEV?: boolean } };
-    if (meta.env?.DEV) {
-      console.warn('TermView SGR mouse routing requires onKeys; SGR mouse action ignored.');
-    }
+    // Warns in production too, once per instance. Dropping a user's tap is not a
+    // development-time concern — it is the one failure mode where the surface
+    // looks completely healthy and simply stops answering, and a DEV-only
+    // warning is invisible in exactly the build where that matters.
+    console.warn('TermView SGR mouse routing requires onKeys; SGR mouse action ignored.');
   }
 
   function sendSgr(data: string) {

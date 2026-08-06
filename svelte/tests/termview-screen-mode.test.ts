@@ -367,6 +367,43 @@ describe("TermView screen prop — pointer routing", () => {
     expect(historyCalls.length).toBeGreaterThan(0);
   });
 
+  test("TM-26: a wire reporting mouseSgr must not take pointer input from a host with no onKeys", async () => {
+    // The exact shape of a view-only preview: it passes no onKeys because it
+    // never wanted input, and it got local scrolling. 0.10.0 let the wire flip
+    // routing to SGR anyway, and every event reached sendSgr, which had nothing
+    // to call — tap and scroll vanished from a surface that still rendered.
+    // Our own mobile team-tree previews mount TermView exactly like this.
+    const { viewport } = mountTermView({
+      altScreenMouse: false,
+      screen: { alt: false, mouseSgr: true, mouseAny: true },
+    });
+    await tick();
+    deliverOutput(120);
+    await tick();
+    flushSync();
+
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    // Local scroll survives: the wire cannot take input away from a host that
+    // has nowhere to receive it.
+    expect(historyCalls.length).toBeGreaterThan(0);
+  });
+
+  test("TM-26: an explicit altScreenMouse also needs a destination", async () => {
+    const { viewport } = mountTermView({
+      altScreenMouse: true,
+      screen: null,
+    });
+    await tick();
+    deliverOutput(120);
+    await tick();
+    flushSync();
+
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls.length).toBeGreaterThan(0);
+  });
+
   test("without screen, altScreenMouse=true still forwards click as SGR (frozen path)", async () => {
     const sgr: string[] = [];
     const { viewport } = mountTermView({

@@ -1,7 +1,30 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.11.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.11.2-dist`.
+
+## v0.11.2 — 2026-08-06
+
+**Fixes a regression 0.10.0 introduced.** Upgrade past 0.10.0 directly to this.
+
+Making the wire's `screen.mouseSgr` win over the host's static `altScreenMouse`
+was right, and it missed that a view-only surface passes *neither*. Such a host
+supplies no `onKeys` because it never wanted input, and got local scrolling. Then
+a server started sampling `screen`, a grok pane reported `mouseSgr` — it does that
+even inline — routing flipped to SGR, and every event arrived at `sendSgr`, which
+had nothing to call. Tap and scroll disappeared from a surface that kept rendering
+perfectly, and the only complaint was a `console.warn` compiled out of production
+builds.
+
+SGR routing now requires a destination: no `onKeys` means the wire cannot take
+pointer input away from a host that never asked for it. This also covers a host
+that set `altScreenMouse` explicitly — dropping a user's tap is not better because
+they opted into the mode. And the warning fires in production, once per instance;
+a development-only message is invisible in exactly the build where silent input
+loss matters.
+
+Reported by Hispeed against the published bytes, and it was live in our own mobile
+team-tree previews, which mount `TermView` with no `onKeys` at all.
 
 ## v0.11.1 — 2026-08-06
 
