@@ -121,18 +121,30 @@ describe("frozen consumer runner policy", () => {
         await Bun.sleep(10);
       }
       expect(existsSync(marker)).toBe(true);
+      // A bounded wait, because this is the assertion that hangs when it is
+      // wrong. The second runner is supposed to lose the lock race and exit
+      // immediately; if it instead blocks — a lock that waits rather than
+      // failing, a first runner whose grandchildren still hold it — an
+      // unbounded spawnSync waits forever, and a test that hangs reports
+      // nothing at all. On CI that ran to the job ceiling with no culprit
+      // named. Two minutes is far past "immediately".
       const second = Bun.spawnSync({
         cmd: ["bash", runner],
         cwd: resolve(import.meta.dir, ".."),
         env: { ...commonEnv, TMPDIR: tempB, TMUX_TMPDIR: tmuxTempB },
         stdout: "pipe",
         stderr: "pipe",
+        timeout: 120_000,
       });
       expect(second.exitCode).not.toBe(0);
       expect(second.stderr.toString()).toContain("another runner owns");
     } finally {
-      first.kill();
-      await first.exited;
+      // `first` is bash; the work it started is its children. Killing only bash
+      // leaves them holding the lock the second runner is racing for, which is
+      // the shape that turns a failed assertion into a hung job. Signal the
+      // group, then bound the wait so cleanup cannot become the hang either.
+      try { process.kill(-first.pid, "SIGTERM"); } catch { first.kill(); }
+      await Promise.race([first.exited, Bun.sleep(30_000)]);
     }
   });
 });
