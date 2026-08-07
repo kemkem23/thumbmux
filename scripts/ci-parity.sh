@@ -26,17 +26,20 @@ cd "$package_dir"
 # unpinned once and CI silently moved to bun 1.3.14, where demo/dogfooding.test.ts
 # deadlocks — five release attempts burned while this script ran green on 1.3.11.
 # A gate that runs a different interpreter than CI is not a parity gate.
-pinned_bun="$(grep -oP 'bun-version:\s*\K[0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml | head -1 || true)"
+#
+# Bun pin lives in the shared verify-gate composite (single source of truth for
+# both ci.yml and release.yml). Do not re-read it from a workflow file.
+pinned_bun="$(grep -oP 'bun-version:\s*\K[0-9]+\.[0-9]+\.[0-9]+' .github/actions/verify-gate/action.yml | head -1 || true)"
 local_bun="$(bun --version)"
 if [ -z "$pinned_bun" ]; then
-  echo "ci-parity: FAILED — .github/workflows/ci.yml does not pin bun-version" >&2
+  echo "ci-parity: FAILED — .github/actions/verify-gate/action.yml does not pin bun-version" >&2
   exit 1
 fi
 if [ "$pinned_bun" != "$local_bun" ]; then
-  echo "ci-parity: FAILED — CI pins bun $pinned_bun, this shell runs $local_bun" >&2
+  echo "ci-parity: FAILED — verify-gate pins bun $pinned_bun, this shell runs $local_bun" >&2
   exit 1
 fi
-echo "ci-parity: bun $local_bun matches the CI pin"
+echo "ci-parity: bun $local_bun matches the verify-gate pin"
 
 # `git archive HEAD:<path>` resolves <path> against the CURRENT directory, not
 # the repo root — running it from inside the package yields an empty archive

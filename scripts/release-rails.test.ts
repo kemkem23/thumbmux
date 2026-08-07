@@ -25,7 +25,14 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+/** Single source of truth for the shared CI/release verification gate. */
+const VERIFY_GATE_REL = ".github/actions/verify-gate/action.yml";
+const VERIFY_GATE_USES = "./.github/actions/verify-gate";
 const roots: string[] = [];
+
+function readVerifyGate(): string {
+  return readFileSync(resolve(packageRoot, VERIFY_GATE_REL), "utf8");
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -206,18 +213,91 @@ describe("release rail policy", () => {
     )).toThrow(/beyond release-status paragraphs/);
   });
 
-  test("CI and release reject focused Playwright tests before the canonical run", () => {
-    for (const workflow of [ciWorkflow, releaseWorkflow]) {
-      expect(workflow).toContain("--forbid-only");
-      const preflight = workflow.slice(
-        workflow.lastIndexOf("- name: reject focused Playwright tests", workflow.indexOf("--forbid-only")),
-        workflow.indexOf("- name: canonical container e2e"),
-      );
-      expect(preflight).toContain("DEMO_URL:");
-      expect(workflow.indexOf("--forbid-only")).toBeLessThan(
-        workflow.indexOf("./e2e/run-container.sh"),
-      );
+  test("CI and release-dist share one verification gate (cannot green independently)", () => {
+    // Historical failure mode (2026-08-06): ci.yml and release.yml carried
+    // hand-copied step lists that drifted. release-dist went green and pushed
+    // v0.10.0-dist / v0.11.0-dist while ci was red on the same commit. Dist
+    // tags are immutable, so the only recovery was burning two version numbers
+    // (→ 0.10.1 / 0.11.1). Human discipline ("wait for both green") failed
+    // twice in one day; this test makes the shared definition mechanical.
+    //
+    // Invariant: both workflows must `uses:` the same local composite action,
+    // and that action (not the workflow files) owns every verification step
+    // that historically diverged. Release-only steps (version/retag check,
+    // commit+tag+push) stay outside the gate on purpose.
+    expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+
+    const gate = readVerifyGate();
+
+    // Markers of steps that were present in one workflow and missing (or
+    // ordered differently) in the other before the unify. If any of these
+    // leave the gate, the two rails can green independently again.
+    const requiredGateMarkers = [
+      "oven-sh/setup-bun@v2",
+      "bun-version:",
+      "bun install --frozen-lockfile",
+      "playwright install --with-deps chromium",
+      "bun run build:git-dist",
+      // Combined unit suite — the process release always ran; must not split
+      // into different globs per workflow.
+      "bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts",
+      "cd demo && bun run build",
+      "--forbid-only",
+      "./e2e/run-container.sh",
+      // packages build & pack was CI-only before unify — release could ship
+      // without proving pack readiness.
+      "bun pm pack",
+      "smoke:git-dist",
+      "materialize-contract-baseline.ts",
+      "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1",
+      "bun run contract",
+      "bash scripts/contract-fixtures.sh",
+    ];
+    for (const marker of requiredGateMarkers) {
+      expect(gate).toContain(marker);
     }
+
+    // Neither workflow re-inlines the combined unit suite (would re-open
+    // copy-paste drift). The only bun test invocation for the full suite lives
+    // in the gate.
+    const inlineCombinedSuite =
+      /bun test --timeout 120000 \.\/server\/tests\/\*\.test\.ts/;
+    expect(ciWorkflow).not.toMatch(inlineCombinedSuite);
+    expect(releaseWorkflow).not.toMatch(inlineCombinedSuite);
+
+    // Bun pin is single-sourced in the gate; parity must read it from there
+    // (not from a workflow that no longer owns the pin).
+    expect(parity).toContain(VERIFY_GATE_REL);
+    expect(parity).toContain("bun-version");
+
+    // Any bun-version that still appears in a workflow (e.g. release preflight
+    // setup-bun so version/retag scripts can run before the long suite) must
+    // equal the gate pin — otherwise the two rails can disagree on toolchain.
+    const gatePin = gate.match(/bun-version:\s*([0-9]+\.[0-9]+\.[0-9]+)/)?.[1];
+    expect(gatePin).toBeTruthy();
+    for (const workflow of [ciWorkflow, releaseWorkflow]) {
+      for (const match of workflow.matchAll(/bun-version:\s*([0-9]+\.[0-9]+\.[0-9]+)/g)) {
+        expect(match[1]).toBe(gatePin);
+      }
+    }
+  });
+
+  test("CI and release reject focused Playwright tests before the canonical run", () => {
+    const gate = readVerifyGate();
+    expect(gate).toContain("--forbid-only");
+    const preflight = gate.slice(
+      gate.lastIndexOf("reject focused Playwright tests", gate.indexOf("--forbid-only")),
+      gate.indexOf("canonical container e2e"),
+    );
+    expect(preflight).toContain("DEMO_URL:");
+    expect(gate.indexOf("--forbid-only")).toBeLessThan(
+      gate.indexOf("./e2e/run-container.sh"),
+    );
+    // Both rails still reach the gate (so forbid-only cannot be skipped by
+    // one path only).
+    expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
   });
 
   test("ci parity cannot call an E2E skip a pass and includes publish readiness", () => {
@@ -236,11 +316,16 @@ describe("release rail policy", () => {
   });
 
   test("CI, release, and local parity materialize a verified remote baseline", () => {
-    for (const rail of [ciWorkflow, releaseWorkflow, parity]) {
+    // CI + release materialize via the shared gate; local parity still does
+    // it inline (it has no Actions composite runner).
+    const gate = readVerifyGate();
+    for (const rail of [gate, parity]) {
       expect(rail).toContain("materialize-contract-baseline.ts");
       expect(rail).toContain("THUMBMUX_CONTRACT_REQUIRE_BASELINE=1");
       expect(rail).not.toContain("tag --list 'v[0-9]*-dist'");
     }
+    expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(parity).toContain("THUMBMUX_CONTRACT_REMOTE_URL");
     expect(parity.indexOf("git -C \"$repo_root\" archive \"$archive_ref\""))
       .toBeLessThan(parity.lastIndexOf("materialize-contract-baseline.ts"));

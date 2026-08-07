@@ -1,0 +1,117 @@
+# Shared verification gate for `ci` and `release-dist`.
+#
+# Why a composite action (not a reusable workflow, not only a shell script):
+# - release needs version/retag checks BEFORE the gate and commit/tag/push AFTER
+#   — a reusable workflow is a whole job and cannot sandwich those steps cleanly
+# - the gate needs Actions-native pieces (setup-bun, upload-artifact, GITHUB_ENV)
+#   that a plain script cannot own without re-implementing half of Actions
+# - a single local `uses: ./.github/actions/verify-gate` means the two workflows
+#   cannot green independently with different step lists (the 2026-08-06 failure
+#   mode that burned v0.10.0-dist and v0.11.0-dist while ci was red)
+#
+# Local parity (`scripts/ci-parity.sh`) mirrors every verification command below
+# so monorepo development catches the same gates without Actions.
+name: verify-gate
+description: >
+  Full verification suite shared by ci and release-dist. Own every gate that
+  must pass before a commit is considered releasable.
+inputs:
+  e2e-artifact-suffix:
+    description: Suffix for e2e artifact names/paths (e.g. ci or release)
+    required: true
+runs:
+  using: composite
+  steps:
+    # Pinned on purpose. Unpinned, setup-bun installs whatever shipped today,
+    # so the gate can go red with no commit of ours — and did: bun 1.3.14 hangs
+    # demo/dogfooding.test.ts (bun 1.3.11 runs the same file in 4.6s), which
+    # burned five release attempts before anyone looked at the toolchain.
+    # Single source of truth: ci-parity.sh greps bun-version from THIS file.
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.3.11
+    - run: sudo apt-get update && sudo apt-get install -y tmux
+      shell: bash
+    - run: bun install --frozen-lockfile
+      shell: bash
+    - name: install Playwright Chromium
+      run: ./node_modules/.bin/playwright install --with-deps chromium
+      shell: bash
+    # The suite includes tests that assert properties of the shipped artifact
+    # (dist hygiene, the README quickstart pack). They need git-dist to exist
+    # before they run. On a developer machine it is usually lying around from
+    # an earlier build, which is exactly how they passed locally for the whole
+    # of v0.8.0 while failing on the first clean checkout CI ever gave them.
+    - name: build git-dist for the artifact tests
+      run: bun run build:git-dist
+      shell: bash
+    # Combined process only — no per-workflow split suites. Split suites once
+    # gave better failure locality on ci but meant release ran a different
+    # process; a DOM-harness / preload interaction can fail under only one
+    # process layout. One command, both rails.
+    #
+    # `--timeout` fails an individual test by name; the step ceiling is the
+    # backstop for a wait that belongs to no single test.
+    #
+    # The ceiling is 60 minutes and that is not padding. This suite installs
+    # real consumer fixtures over the network and drives a real browser, and a
+    # 2-core runner does not resemble the 16-core box where it finishes in
+    # 101 seconds. A first attempt at 15 minutes killed three releases in a
+    # row and taught nothing — every "hang" it reported was this step being
+    # slow, and cutting it short only removed the evidence.
+    - name: unit and contract suites
+      timeout-minutes: 60
+      run: bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
+      shell: bash
+    - name: demo builds
+      run: cd demo && bun run build
+      shell: bash
+    - name: reject focused Playwright tests
+      run: ./node_modules/.bin/playwright test --config=e2e/playwright.config.ts --list --forbid-only
+      shell: bash
+      env:
+        DEMO_URL: http://127.0.0.1:1
+    - name: canonical container e2e
+      timeout-minutes: 20
+      run: ./e2e/run-container.sh
+      shell: bash
+      env:
+        THUMBMUX_E2E_ARTIFACTS: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
+    - name: retain e2e artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
+        if-no-files-found: ignore
+        retention-days: 7
+    # Publish readiness — was CI-only before the unify. A release that never
+    # packs the scoped packages can ship a tree that fails `bun pm pack`.
+    - name: packages build & pack (publish readiness)
+      run: |
+        (cd core && bun run build && bun pm pack)
+        (cd server && bun run build && bun pm pack)
+        (cd svelte && bun run build && bun pm pack)
+        (cd app && bun run build && bun pm pack)
+      shell: bash
+    - name: root git-dist consumer smoke
+      run: bun run build:git-dist && bun run smoke:git-dist
+      shell: bash
+    - name: materialize immutable prior contract
+      run: |
+        baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
+        bun scripts/materialize-contract-baseline.ts "$baseline_root"
+        echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+        echo "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1" >> "$GITHUB_ENV"
+      shell: bash
+    - name: public API contract gate
+      # Runs against the git-dist built above, not against source: the contract
+      # is what a consumer receives. Fails when a public name changes signature
+      # or appears without a declared tier.
+      run: bun run contract
+      shell: bash
+    - name: frozen consumer contract gate
+      # Packs that same git-dist and exercises all frozen consumers. Chromium
+      # was installed above for the app-host runtime fixture.
+      run: bash scripts/contract-fixtures.sh
+      shell: bash

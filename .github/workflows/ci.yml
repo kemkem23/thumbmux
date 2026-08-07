@@ -11,82 +11,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Pinned on purpose. Unpinned, setup-bun installs whatever shipped today,
-      # so the gate can go red with no commit of ours — and did: bun 1.3.14 hangs
-      # demo/dogfooding.test.ts (bun 1.3.11 runs the same file in 4.6s), which
-      # burned five release attempts before anyone looked at the toolchain.
-      - uses: oven-sh/setup-bun@v2
+      # Shared verification gate — same composite action that release-dist runs.
+      # Do not re-inline unit/e2e/contract steps here; see
+      # .github/actions/verify-gate/action.yml and scripts/release-rails.test.ts.
+      - uses: ./.github/actions/verify-gate
         with:
-          bun-version: 1.3.11
-      - run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: bun install --frozen-lockfile
-      - name: install Playwright Chromium
-        run: ./node_modules/.bin/playwright install --with-deps chromium
-      # The suite includes tests that assert properties of the shipped artifact
-      # (dist hygiene, the README quickstart pack). They need git-dist to exist
-      # before they run. On a developer machine it is usually lying around from
-      # an earlier build, which is exactly how they passed locally for the whole
-      # of v0.8.0 while failing on the first clean checkout CI ever gave them.
-      - name: build git-dist for the artifact tests
-        run: bun run build:git-dist
-      - name: core unit tests
-        timeout-minutes: 60
-        run: bun test --timeout 120000 ./core/tests/ ./core/src/*.test.ts
-      # Real tmux on a runner is the likeliest place for this job to hang rather
-      # than fail: a pane that never becomes ready waits forever. The per-test
-      # timeout names the culprit; the step ceiling catches a hang between tests.
-      - name: protocol conformance (real tmux)
-        timeout-minutes: 60
-        run: bun test --timeout 120000 ./server/tests/
-      - name: svelte + app + demo unit tests
-        timeout-minutes: 60
-        run: bun test --timeout 120000 ./svelte/tests/ ./app/tests/ ./demo/*.test.ts ./scripts/*.test.ts
-      # Release-parity gate: must stay byte-identical to the unit-test command
-      # in release.yml. Split suite steps above give better failure locality;
-      # this combined process is what release-dist actually runs, and a
-      # DOM-harness / preload interaction can fail only under one process.
-      - name: release-parity combined unit tests
-        timeout-minutes: 60
-        run: bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
-      - name: demo builds
-        run: cd demo && bun run build
-      - name: reject focused Playwright tests
-        run: ./node_modules/.bin/playwright test --config=e2e/playwright.config.ts --list --forbid-only
-        env:
-          DEMO_URL: http://127.0.0.1:1
-      - name: canonical container e2e
-        timeout-minutes: 20
-        run: ./e2e/run-container.sh
-        env:
-          THUMBMUX_E2E_ARTIFACTS: ${{ runner.temp }}/thumbmux-e2e-ci
-      - name: retain e2e artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: thumbmux-e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/thumbmux-e2e-ci
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: packages build & pack (publish readiness)
-        run: |
-          (cd core && bun run build && bun pm pack)
-          (cd server && bun run build && bun pm pack)
-          (cd svelte && bun run build && bun pm pack)
-          (cd app && bun run build && bun pm pack)
-      - name: root git-dist consumer smoke
-        run: bun run build:git-dist && bun run smoke:git-dist
-      - name: materialize immutable prior contract
-        run: |
-          baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
-          bun scripts/materialize-contract-baseline.ts "$baseline_root"
-          echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
-          echo "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1" >> "$GITHUB_ENV"
-      - name: public API contract gate
-        # Runs against the git-dist built in the step above, not against source:
-        # the contract is what a consumer receives. Fails when a public name
-        # changes signature or appears without a declared tier.
-        run: bun run contract
-      - name: frozen consumer contract gate
-        # Packs that same git-dist and exercises all frozen consumers. Chromium
-        # was installed above for the app-host runtime fixture.
-        run: bash scripts/contract-fixtures.sh
+          e2e-artifact-suffix: ci
