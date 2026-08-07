@@ -246,7 +246,10 @@
         return;
       }
       if (!hasRaf && typeof clearTimeout === 'function') {
-        clearTimeout(handle as ReturnType<typeof clearTimeout>);
+        // ReturnType<typeof clearTimeout> is `void` — that cast was a type-only
+        // lie (assertions are erased) so runtime still passed the real handle,
+        // but strict check rejected it. Use the parameter type of clearTimeout.
+        clearTimeout(handle as Parameters<typeof clearTimeout>[0]);
       }
     };
 

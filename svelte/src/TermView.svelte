@@ -395,9 +395,11 @@
     if (!selection || !searchPanelEl) return false;
     const anchor = selection.anchorNode;
     const focus = selection.focusNode;
+    // `node && contains(node)` is `Node | boolean | null` under strict TS —
+    // coerce to boolean so the predicate matches its annotation.
     return (
-      (anchor && searchPanelEl.contains(anchor)) ||
-      (focus && searchPanelEl.contains(focus))
+      !!(anchor && searchPanelEl.contains(anchor)) ||
+      !!(focus && searchPanelEl.contains(focus))
     );
   }
 

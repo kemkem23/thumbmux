@@ -306,6 +306,19 @@
     composing = false;
   }
 
+  // `oncompositioncancel` is a real DOM event but is absent from Svelte's
+  // HTML attribute typings, so a template attr fails svelte-check. Bind with
+  // addEventListener so composition cancel still clears `composing` the same
+  // way compositionend does — do not drop the handler to silence the type.
+  $effect(() => {
+    const el = rootEl;
+    if (!el) return;
+    el.addEventListener('compositioncancel', handleCompositionCancel);
+    return () => {
+      el.removeEventListener('compositioncancel', handleCompositionCancel);
+    };
+  });
+
   $effect(() => {
     if (!rootEl || typeof document === 'undefined') return;
     if (!enabled) {
@@ -348,7 +361,6 @@
   onpaste={handlePaste}
   oncompositionstart={handleCompositionStart}
   oncompositionend={handleCompositionEnd}
-  oncompositioncancel={handleCompositionCancel}
 >
   {#if children}
     {@const childSnippet = children as Snippet}

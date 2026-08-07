@@ -1,4 +1,9 @@
 <script module lang="ts">
+  // Import types once here. svelte-check merges module + instance into one TS
+  // scope, so a second bare import of the same names in the instance script is
+  // "Duplicate identifier". The instance script reuses these names without
+  // re-importing; that keeps both NotificationPermissionProps and the
+  // component $$ComponentProps declaration hashes stable for the contract gate.
   import type {
     BrowserNotificationEnvironment,
     BrowserServiceWorkerRegistrationLike,
@@ -51,17 +56,12 @@
     requestNotificationPermission,
     registerServiceWorker,
     showLocalNotification,
-    type BrowserNotificationEnvironment,
-    type BrowserServiceWorkerRegistrationLike,
-    type BrowserServiceWorkerRegistrationOptions,
-    type LocalNotificationResult,
-    type NotificationPermissionState,
-    type PermissionRequestResult,
-    type ServiceWorkerRegistrationResult,
   } from './notifications';
 
   type ActionPhase = 'idle' | 'requesting' | 'registering' | 'showing';
 
+  // Types (BrowserNotificationEnvironment, …) come from the module script's
+  // single import — do not re-import them here.
   let {
     environment,
     registration,

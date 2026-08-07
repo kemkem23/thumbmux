@@ -1,7 +1,34 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.13.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.13.1-dist`.
+
+## v0.13.1 — 2026-08-07
+
+**The `.svelte` sources we ship now pass strict `svelte-check` (TM-19).**
+No public API changed — the immutable-baseline gate agrees against v0.13.0-dist.
+
+The sources are in `files`, so consumers compile them. Anyone running
+`svelte-check` strictly in their own project was seeing 17 errors that came out
+of our files, not theirs. Four sites:
+
+- **`TermView`** — a callback declared to return `boolean` could return
+  `boolean | null`.
+- **`RecordingPlayer`** — `clearTimeout(handle as ReturnType<typeof clearTimeout>)`
+  asserts the argument is `void`. **Type-only, not a runtime bug**: assertions
+  are erased at compile time, so the real handle was always passed and the
+  timer always cleared. `Parameters<typeof clearTimeout>[0]` is what it meant.
+- **`NotificationPermission`** — the same types imported in both the module and
+  instance scripts; svelte-check merges those scopes, so the second import was
+  a redeclaration.
+- **`DesktopKeys`** — `oncompositioncancel` is not in Svelte's HTML typings.
+  The handler stays wired; only the way it is attached changed. Removing it to
+  silence the checker would have deleted a real behaviour to fix a type error.
+
+`scripts/svelte-check-gate.test.ts` runs the checker and asserts exit 0, and it
+is inside the shared verification gate because that gate runs
+`./scripts/*.test.ts`. Verified red at 17 errors before the fixes and green at
+0 after.
 
 ## v0.13.0 — 2026-08-07
 
