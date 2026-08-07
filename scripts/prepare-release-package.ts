@@ -26,6 +26,19 @@ export const RELEASE_PACKAGE_EXPORTS = {
     svelte: "./git-dist/app/index.js",
   },
   "./package.json": "./package.json",
+  // TM-08: `contract/manifest` and CONTRACT.md are in `files`, so they are
+  // genuinely installed — and were unreachable, because a package with an
+  // `exports` map blocks every path the map does not name. Shipping the only
+  // machine-readable tier inventory and then locking it away is worse than not
+  // shipping it: a consumer that wants to assert what it depends on can see the
+  // file on disk and still gets ERR_PACKAGE_PATH_NOT_EXPORTED.
+  //
+  // The subpath pattern is deliberate over a bare "./contract" directory entry:
+  // it exposes exactly the four manifests and nothing else under contract/,
+  // which is where goldens and fixtures live.
+  "./contract/manifest/*.json": "./contract/manifest/*.json",
+  "./CONTRACT.md": "./CONTRACT.md",
+  "./docs/*.md": "./docs/*.md",
 } as const;
 
 export function prepareReleasePackage(packageRoot: string): void {

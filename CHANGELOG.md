@@ -1,7 +1,51 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.12.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.12.1-dist`.
+
+## v0.12.1 — 2026-08-07
+
+**Packaging only — no runtime code changed.**
+
+### TM-08 — everything shipped is now reachable
+
+`contract/manifest/*.json` and `CONTRACT.md` were in `files`, so they were
+genuinely installed into `node_modules`, and they were unreachable: a package
+with an `exports` map blocks every path the map does not name, so any attempt
+to resolve them threw `ERR_PACKAGE_PATH_NOT_EXPORTED`. The only
+machine-readable tier inventory we publish shipped for four minor versions
+without being readable — which is worse than not shipping it, because a
+consumer can see the file on disk and still not open it.
+
+The map now names `./contract/manifest/*.json`, `./CONTRACT.md` and
+`./docs/*.md`. The manifest pattern is a subpath rather than a bare `./contract`
+directory entry, so it exposes exactly the four manifests and nothing else
+under `contract/`, where goldens and fixtures live.
+
+A new test asserts the invariant rather than the instance: **every entry in
+`files` must be reachable through some target in `exports`**. It fails if the
+manifest export is removed, which is the state 0.12.0 shipped in.
+
+### TM-28 — a decision, not a change
+
+`MuxServerMessage` was narrowed in **0.9.2**, on a frozen-tier type, in a
+patch. `{channel, type: "sessions"|"history"|"error"|"cursor", data?: string}`
+became two variants with `data` **required** on the first. That is a breaking
+change and it should not have ridden a patch; it went out inside a commit named
+for an unrelated XSS fix, which is how it escaped review.
+
+It is not being reverted, and the reasoning is worth stating rather than
+quietly leaving. The narrowed shape is the one that matches the wire: a
+`cursor` frame never carries `data`, and the other three always do. Restoring
+the permissive shape would break everyone who has adopted 0.9.2 or later —
+trading one silent break for another, two months on, to serve consumers who by
+now have either upgraded or pinned. The reporter filed it while saying it does
+not affect them and asked us not to spend time on it.
+
+What has changed is that this class cannot recur silently: the immutable
+baseline gate compares each release against the previously published dist tag
+and refuses a narrowing on an F- or S-tier export whatever the version number
+says.
 
 ## v0.12.0 — 2026-08-07
 

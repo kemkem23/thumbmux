@@ -273,4 +273,24 @@ describe("release rail policy", () => {
     expect(prepared.files).toEqual(RELEASE_PACKAGE_FILES);
     expect(prepared.exports).toEqual(RELEASE_PACKAGE_EXPORTS);
   });
+
+  test("everything the package ships is reachable through its exports map", () => {
+    // TM-08. `files` and `exports` answer different questions — what gets
+    // installed, and what a consumer is allowed to resolve — and a package with
+    // an `exports` map blocks every path the map does not name. So a file can
+    // be genuinely present in node_modules and still throw
+    // ERR_PACKAGE_PATH_NOT_EXPORTED, which is how the only machine-readable
+    // tier inventory shipped for four minor versions without being readable.
+    //
+    // The invariant is one-directional on purpose: shipping something a
+    // consumer cannot reach is the bug. Exporting a path that is not shipped is
+    // caught by resolution failing loudly at install time.
+    const targets = Object.values(RELEASE_PACKAGE_EXPORTS).flatMap((entry) =>
+      typeof entry === "string" ? [entry] : Object.values(entry),
+    );
+    const unreachable = RELEASE_PACKAGE_FILES.filter((shipped) =>
+      !targets.some((target) => target.replace(/^\.\//, "").startsWith(shipped)),
+    );
+    expect(unreachable).toEqual([]);
+  });
 });
