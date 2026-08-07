@@ -1,7 +1,47 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.12.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.13.0-dist`.
+
+## v0.13.0 — 2026-08-07
+
+**Packaging only — no runtime code changed.** Version numbers in package.json
+files are bumped at release time; this section documents the surface that
+ships with that bump.
+
+### TM-09 — pure JS modules no longer trapped behind the `svelte` condition
+
+`./svelte` and `./app` still declare only `types` + `svelte` conditions, so a
+resolver that does not set the `svelte` condition cannot enter those barrels.
+That protection is intentional for components.
+
+It was not intentional for **ten pure JS modules** that live under the same
+trees, ship in `git-dist`, and have no Svelte coupling of their own
+(no `from 'svelte'`, no runes, no `.svelte` imports):
+
+- `svelte/session-grid`, `svelte/notifications`, `svelte/service-worker`,
+  `svelte/recording-player`, `svelte/term-search`, `svelte/content-update-gate`
+- `app/config`, `app/navigation`, `app/overlay`, `app/sessions-store`
+
+The sharpest case is `service-worker`: it is designed for
+`ServiceWorkerGlobalScope`, which has neither Svelte nor a bundler pass that
+knows the `svelte` condition. Consumers re-verified the ten modules against
+v0.10.1 and still could not resolve them.
+
+Each is now a first-class export with `types` + `import` (no `svelte`
+condition required), e.g. `import { … } from "thumbmux/svelte/service-worker"`.
+The component barrels are unchanged and still require the condition.
+
+### Root export
+
+There was no `"."` export, so `import "thumbmux"` threw immediately
+(`No "exports" main defined`). `"."` now points at the same surface as
+`./core` — framework-free, no Svelte condition. Existing `./core` / `./server`
+/ `./svelte` / `./app` paths are untouched.
+
+A regression test materialises a release-shaped install and asks **plain Node**
+(default conditions, no `svelte`) to import each subpath. Reading the exports
+map as a string does not count.
 
 ## v0.12.1 — 2026-08-07
 
