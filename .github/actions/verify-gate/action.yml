@@ -60,8 +60,13 @@ runs:
     # row and taught nothing — every "hang" it reported was this step being
     # slow, and cutting it short only removed the evidence.
     - name: unit and contract suites
-      timeout-minutes: 60
-      run: bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
+      # `timeout-minutes` is a WORKFLOW step key — a composite action rejects it
+      # outright ("Unexpected value 'timeout-minutes'") and the whole action
+      # fails to load. Nothing local catches that: ci-parity runs the commands,
+      # not the Actions schema, so this passed every gate here and died on the
+      # runner. The ceiling moves into the shell instead, where it means the
+      # same thing and is portable.
+      run: timeout --kill-after=60s 60m bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts
       shell: bash
     - name: demo builds
       run: cd demo && bun run build
@@ -72,8 +77,8 @@ runs:
       env:
         DEMO_URL: http://127.0.0.1:1
     - name: canonical container e2e
-      timeout-minutes: 20
-      run: ./e2e/run-container.sh
+      # Same reason as above — shell timeout, not the workflow-only key.
+      run: timeout --kill-after=60s 20m ./e2e/run-container.sh
       shell: bash
       env:
         THUMBMUX_E2E_ARTIFACTS: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}

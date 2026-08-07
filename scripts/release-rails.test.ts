@@ -379,3 +379,41 @@ describe("release rail policy", () => {
     expect(unreachable).toEqual([]);
   });
 });
+
+describe("composite action schema", () => {
+  // The gate died on the runner with "Unexpected value 'timeout-minutes'" while
+  // every local check was green, because `timeout-minutes` is a WORKFLOW step
+  // key that a composite action rejects — and nothing here validates Actions
+  // YAML. ci-parity runs the COMMANDS; it has no opinion about the schema they
+  // are written in. So the keys a composite step may carry are asserted
+  // directly, and the ceiling lives in the shell where it is portable.
+  const COMPOSITE_STEP_ONLY_KEYS = [
+    "timeout-minutes",
+    "continue-on-error",
+    "services",
+    "strategy",
+    "container",
+  ] as const;
+
+  test("the shared gate uses no workflow-only step keys", () => {
+    const gate = readFileSync(
+      join(packageRoot, ".github/actions/verify-gate/action.yml"),
+      "utf8",
+    );
+    const offenders = COMPOSITE_STEP_ONLY_KEYS.filter((key) =>
+      new RegExp(`^\\s*${key}\\s*:`, "m").test(gate),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  test("the long steps still have a ceiling, just a portable one", () => {
+    const gate = readFileSync(
+      join(packageRoot, ".github/actions/verify-gate/action.yml"),
+      "utf8",
+    );
+    // Removing the key must not quietly remove the limit — that would trade a
+    // loud failure for a six-hour hang on the default job timeout.
+    expect(gate).toMatch(/run:\s*timeout\b.*bun test/);
+    expect(gate).toMatch(/run:\s*timeout\b.*run-container\.sh/);
+  });
+});
