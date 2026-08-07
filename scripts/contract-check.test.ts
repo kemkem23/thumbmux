@@ -960,3 +960,81 @@ describe("declaration signatures", () => {
     expect(after).toBe(before);
   });
 });
+
+describe("optional additions inside a referenced type", () => {
+  /** Build a fixture whose only export is an interface holding an optional
+   *  property typed as a second interface — the shape that matters, because a
+   *  type reached ONLY through an optional property is never reached by the
+   *  stripped base traversal. */
+  function referencedOptionalFixture(version: string, nested: string[]): string {
+    const root = fixture(version);
+    writeCoreDeclarations(root, [
+      "export interface Nested {",
+      "  required: string;",
+      ...nested,
+      "}",
+      "export interface Holder {",
+      "  base: string;",
+      "  nested?: Nested;",
+      "}",
+    ], { stampLegacy: false });
+    return root;
+  }
+
+  function evaluate(baselineRoot: string, currentRoot: string) {
+    const baselineManifest = deriveGitDistReport(baselineRoot, ["core"]).core.map((entry) => ({
+      name: entry.name,
+      kind: entry.kind,
+      signature: entry.signature,
+      tier: "F" as ContractTier,
+    }));
+    const currentLive = deriveGitDistReport(currentRoot, ["core"]).core;
+    const currentManifest = currentLive.map((entry) => ({
+      name: entry.name,
+      kind: entry.kind,
+      signature: entry.signature,
+      tier: "F" as ContractTier,
+    }));
+    return evaluateBaseline(
+      "core",
+      baselineManifest,
+      currentManifest,
+      deriveGitDistReport(baselineRoot, ["core"]).core,
+      currentLive,
+      "0.11.2",
+      "0.12.0",
+    );
+  }
+
+  test("adding an optional to the referenced type is additive for its holder", () => {
+    const before = referencedOptionalFixture("0.11.2", []);
+    const after = referencedOptionalFixture("0.12.0", ["  added?: boolean;"]);
+    const result = evaluate(before, after);
+    expect(result.errors.map((error) => error.message)).toEqual([]);
+  });
+
+  test("removing an optional from the referenced type still fails", () => {
+    const before = referencedOptionalFixture("0.11.2", ["  existing?: boolean;"]);
+    const after = referencedOptionalFixture("0.12.0", []);
+    const messages = evaluate(before, after).errors.map((error) => error.message);
+    // Both the type that lost the member and the holder that reaches it.
+    expect(messages.some((message) => message.includes('"Nested"'))).toBe(true);
+    expect(messages.some((message) => message.includes('"Holder"'))).toBe(true);
+  });
+
+  test("narrowing a required member of the referenced type still fails", () => {
+    const before = referencedOptionalFixture("0.11.2", []);
+    const after = fixture("0.12.0");
+    writeCoreDeclarations(after, [
+      "export interface Nested {",
+      "  required: number;",
+      "}",
+      "export interface Holder {",
+      "  base: string;",
+      "  nested?: Nested;",
+      "}",
+    ], { stampLegacy: false });
+    const messages = evaluate(before, after).errors.map((error) => error.message);
+    expect(messages.some((message) => message.includes('"Holder"'))).toBe(true);
+  });
+});

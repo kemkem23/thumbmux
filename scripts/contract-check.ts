@@ -430,6 +430,10 @@ function optionalAdditionModel(
   declarationRoot: string,
 ): NonNullable<LiveContractEntry["optionalAddition"]> {
   const declarations = new Map<string, ts.Declaration>();
+  const strippedSurface = (declaration: ts.Declaration): string =>
+    ownsStrippableOptionals(declaration)
+      ? stripDirectOptionalProperties(declaration)
+      : declarationSurfaceText(declaration);
   const baseSignature = signatureWithDependencies(
     checker,
     rootDeclarations,
@@ -437,9 +441,7 @@ function optionalAdditionModel(
     traversalRoots,
     declarationRoot,
     true,
-    (declaration) => ownsStrippableOptionals(declaration)
-      ? stripDirectOptionalProperties(declaration)
-      : declarationSurfaceText(declaration),
+    strippedSurface,
     (node) => {
       if (!isDirectOptionalProperty(node)) return false;
       const owner = directPropertyOwner(node);
@@ -447,14 +449,31 @@ function optionalAdditionModel(
     },
     (declaration) => declarations.set(declarationKey(declaration), declaration),
   );
-  const members = [...declarations.values()].flatMap((declaration) => {
-    if (!ownsStrippableOptionals(declaration)) return [];
+
+  // A member's own signature is computed with the SAME stripping applied to
+  // everything it reaches. Without that, `foo?: SomeInterface` changes its
+  // member hash the moment `SomeInterface` gains an optional property of its
+  // own — a member that reads as REMOVED, failing the exact case this predicate
+  // exists to allow. Narrowing is still caught: the stripped text of a reached
+  // declaration contains all of its non-optional structure.
+  //
+  // The base traversal never reaches a type referenced only through an optional
+  // property (it skips those nodes), so member traversal is also where such
+  // declarations are discovered. They are folded into the queue so their own
+  // optionals are modelled as members too — which is what keeps a REMOVAL from
+  // one of them a failure rather than an invisible change.
+  const queue = [...declarations.values()];
+  const seen = new Set(queue.map(declarationKey));
+  const members: string[] = [];
+  for (let index = 0; index < queue.length; index++) {
+    const declaration = queue[index]!;
+    if (!ownsStrippableOptionals(declaration)) continue;
     const owner = ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration)
       ? declaration.name.text
       : "";
     const file = relative(declarationRoot, declaration.getSourceFile().fileName)
       .split(sep).join("/");
-    return directOptionalProperties(declaration).map((member) => {
+    for (const member of directOptionalProperties(declaration)) {
       const memberSignature = signatureWithDependencies(
         checker,
         [],
@@ -462,10 +481,19 @@ function optionalAdditionModel(
         [member],
         declarationRoot,
         true,
+        strippedSurface,
+        () => false,
+        (reached) => {
+          const key = declarationKey(reached);
+          if (seen.has(key)) return;
+          seen.add(key);
+          queue.push(reached);
+        },
       );
-      return `${file}:${owner}:${memberSignature}`;
-    });
-  }).sort();
+      members.push(`${file}:${owner}:${memberSignature}`);
+    }
+  }
+  members.sort();
   return { baseSignature, members };
 }
 
