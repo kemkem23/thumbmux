@@ -274,6 +274,14 @@ Vite/SvelteKit pick them up automatically (they ship Svelte sources + `.d.ts`,
 compiled by your bundler). **Pin only a `-dist` tag that the listing command
 returns**; update by choosing another published tag and reinstalling.
 
+**TypeScript consumers of `thumbmux/svelte` and `thumbmux/app` must set
+`"moduleResolution": "bundler"`** (or an equivalent that resolves
+`./TermView.svelte` to its adjacent `.d.ts` the same way). Under
+`moduleResolution` `node16` / `nodenext`, the published Svelte declarations
+fail with TS2307 on every sibling `.svelte` specifier — `thumbmux/server` and
+`thumbmux/core` stay clean under both. This is a hard requirement, not a hint:
+the package's own type smoke and contract fixtures assume `bundler`.
+
 **⚡ Run the demo.** On a machine with `tmux` and Bun:
 
 ```bash
@@ -636,6 +644,36 @@ Docs: [application shell](docs/app.md) ·
 [token guard](docs/security.md) ·
 [CONTRACT.md](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md) ·
 [release process](https://github.com/kemkem23/thumbmux/blob/main/SPLIT.md)
+
+## Host CSS custom properties (theming surface)
+
+Shipped Svelte components style themselves through **host-supplied CSS custom
+properties**. They are not TypeScript exports, so they do not appear in the
+contract manifests — but they are still part of the host-facing surface: rename
+one and every consumer restyles silently. Map a `TerminalSurface` (from
+`deriveSurface` / `defaultSurface` in `thumbmux/core`) onto the terminal chrome
+variables below; fonts and layout insets are host-only.
+
+| Property | Required? | Meaning |
+|---|---|---|
+| `--font-mono` | **yes** | Terminal typeface. `TermView` measures character width from the **computed** font to derive cols/rows — if this is unset you get a proportional font and drifting geometry, not a loud error. |
+| `--font-thai` | optional | UI chrome that mixes Thai (composer, prompts, shortcuts). Falls back to `--font-mono` where listed. |
+| `--tbg` | **yes** | Terminal / page surface background. |
+| `--tfg` | **yes** | Main text on that surface. |
+| `--tstage` | recommended | Stage edge behind the terminal (HUD / dock contrast). |
+| `--agent` | recommended | Accent for borders, LEDs, focus chrome. |
+| `--hud` | recommended | HUD bar background (often semi-transparent). |
+| `--hud-fg` | recommended | HUD text / icon color. |
+| `--hud-line` | recommended | HUD hairline / control borders. |
+| `--dock-inset` / `--dock-full` | optional | Mobile composer-dock geometry (see mobile composer docs / `ComposerDock`). |
+| `--kb-inset` | optional | Extra bottom inset while a software keyboard is up. |
+
+`SessionView` / `EmbedView` in `thumbmux/app` already write the surface fields to
+the matching `--*` properties on their root. A headless host that mounts
+`TermView` alone must set at least `--font-mono`, `--tbg`, and `--tfg` on an
+ancestor. There is no published `surfaceCssVars()` helper yet — if you map
+camelCase surface keys to kebab-case CSS vars, keep that mapping in **one**
+place in your app so it cannot drift from the table above.
 
 ## Compatibility checks
 

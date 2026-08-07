@@ -24,6 +24,26 @@ not complete unless one of these layers can expose a violation.
 | Deprecation ceremony | Emitted `.d.ts` JSDoc, manifest metadata, the `Deprecated` section of `CHANGELOG.md`, `core/src/deprecate.test.ts`, and the frozen-fixture review rule below | A missing stamp, malformed runtime warning, early removal, or unsupported old spelling blocks the release. |
 | Distribution rail | `.github/workflows/release.yml`, `scripts/smoke-git-dist.sh`, and the resolved commit in a consumer lockfile | The release workflow builds and tests the artifact, consumer smoke tests its public entry points, and each release creates a new exact `-dist` tag rather than changing an older pin. |
 
+### Consumer TypeScript resolution (not optional for Svelte entrypoints)
+
+Consumers of **`thumbmux/svelte`** and **`thumbmux/app`** must compile with
+`"moduleResolution": "bundler"` (or an equivalent that resolves a specifier
+like `./TermView.svelte` to its adjacent `.d.ts` the same way). Under
+`moduleResolution` values `node16` / `nodenext`, the published Svelte
+declaration graph fails with TS2307 on every sibling `.svelte` import.
+`thumbmux/core` and `thumbmux/server` remain usable under both. The root
+README states the same requirement next to the install path; the smoke rail
+and contract fixtures exercise the package under `bundler`.
+
+### Host CSS custom properties (outside the export manifests)
+
+Component chrome is themed through host-supplied CSS custom properties
+(`--font-mono`, `--tbg`, `--tfg`, `--hud-fg`, …). They are **not** TypeScript
+exports, so the surface gate does not inventory them — the authoritative list
+and required-vs-optional rules live in the installed `README.md` section
+"Host CSS custom properties (theming surface)". Renaming a load-bearing
+property without a release note is still a silent restyle for every consumer.
+
 Changing an expected value in an ordinary test does not make a breaking change
 compatible. A change to a frozen manifest, consumer fixture, or wire golden is
 itself a contract event and must follow the policy below.

@@ -200,3 +200,65 @@ describe("public documentation snippets", () => {
     expect(failures).toEqual([]);
   });
 });
+
+/**
+ * Adoption-report regressions (Hispeed TM-11 / TM-20 / TM-23).
+ * These are prose contracts that ship inside node_modules via the `files`
+ * whitelist — a wrong install glob or an undocumented hard requirement is how
+ * consumers get stranded (v0.9.1 README → v0.8.3 forever).
+ */
+describe("adoption-report documentation contracts (TM-11, TM-20, TM-23)", () => {
+  const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
+  const contract = readFileSync(join(PACKAGE_ROOT, "CONTRACT.md"), "utf8");
+  const protocol = readFileSync(join(PACKAGE_ROOT, "docs/protocol.md"), "utf8");
+
+  test("TM-20: README and CONTRACT require moduleResolution bundler for svelte/app", () => {
+    // Must name both the setting and the broken alternatives — otherwise a
+    // host can keep node16 and think "bundler" is optional advice.
+    for (const body of [readme, contract]) {
+      expect(body).toMatch(/moduleResolution/);
+      expect(body).toMatch(/["']bundler["']/);
+      expect(body).toMatch(/node16|nodenext/i);
+      expect(body).toMatch(/thumbmux\/svelte/);
+    }
+  });
+
+  test("TM-11: host CSS custom properties are named as a load-bearing surface", () => {
+    // Load-bearing vars from the adoption report — especially --font-mono,
+    // which silently breaks geometry when missing.
+    expect(readme).toContain("Host CSS custom properties");
+    for (const prop of [
+      "--font-mono",
+      "--font-thai",
+      "--tbg",
+      "--tfg",
+      "--tstage",
+      "--agent",
+      "--hud",
+      "--hud-fg",
+      "--hud-line",
+    ]) {
+      expect(readme).toContain(prop);
+    }
+    // CONTRACT must point at the README list (manifests cannot inventory CSS).
+    expect(contract).toMatch(/CSS custom properties/);
+    expect(contract).toContain("--font-mono");
+  });
+
+  test("TM-23: protocol states history prepend has no content de-duplication", () => {
+    expect(protocol).toMatch(/does not content-de-duplicate/i);
+    expect(protocol).toMatch(/must not.*return rows the client already has/i);
+  });
+
+  test("TM-23: protocol states sessions_subscribe is idempotent per socket", () => {
+    expect(protocol).toMatch(/sessions_subscribe.*idempoten|idempoten.*sessions_subscribe/is);
+    expect(protocol).toMatch(/Set/);
+    expect(protocol).toMatch(/exactly once/i);
+  });
+
+  test("install guidance never reintroduces a minor-pinned dist glob", () => {
+    // v0.9.1 trap: refs/tags/v0.8.*-dist stranded consumers on 0.8.3.
+    expect(readme).not.toMatch(/refs\/tags\/v0\.\d+\.\*-dist/);
+    expect(readme).toMatch(/refs\/tags\/v0\.\*-dist/);
+  });
+});

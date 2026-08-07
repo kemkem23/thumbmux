@@ -173,6 +173,34 @@ both handler detachment and socket identity checks. `TermView` performs
 recovery after its 5-second archive-reply timeout and when it unmounts with an
 accepted request still outstanding.
 
+#### History page overlap with the live window (normative for hosts)
+
+The bundled `TermView` **does not content-de-duplicate** an archive page against
+rows it already holds in the live / already-mounted window. A successful
+`history` reply is prepended as the server sent it (subject only to the viewer's
+own row/byte retention budget, which may drop the **oldest prefix of the
+incoming page**, never rows already on screen).
+
+Therefore a host archive **must not** return rows the client already has for
+that session. Use the `beforeLine` / `afterLine` anchors: `beforeLine: N` means
+logical lines strictly `< N`, which is the edge of the client's current oldest
+mounted line when paging backward. Overlapping pages produce duplicated rows in
+the viewer; that is host error, not a client merge step you can rely on.
+
+Live **capture** merging is a different path (`findLineOverlap` on successive
+full/delta frames) and must not be confused with archive prepend.
+
+#### `sessions_subscribe` idempotency
+
+`TmuxWsMux.subscribeSessions(ws)` stores subscribers in a `Set`. Subscribing the
+**same socket** more than once is a **no-op** for membership: the socket still
+receives each session-list push **exactly once** per broadcast. Calling
+`sessions_subscribe` again may still trigger an immediate list push to that
+socket (catch-up / resync), but it does not create a second delivery slot.
+`sessions_unsubscribe` removes the socket and cancels any owed list debt.
+Hosts that both auto-subscribe on WebSocket open and let the bundled client
+send `sessions_subscribe` are safe under this rule.
+
 The socket boundary is deliberate. Expiring the gate on the same socket, or
 relying only on a component-local request id, cannot correlate a tokenless late
 reply once a retry is active. That reply could belong to a different anchor or
