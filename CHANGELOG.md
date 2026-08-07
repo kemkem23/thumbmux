@@ -1,7 +1,46 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.11.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.12.0-dist`.
+
+## v0.12.0 — 2026-08-07
+
+**Three additive seams for hosts that have something to say about a session
+beyond its pane.** Nothing changes for a host that adopts none of them: every
+new option defaults to today's behavior, and the DOM is identical when they are
+omitted.
+
+### `GridSession.subtitle` — one line of host context on a hub card
+
+A hub card could show a name, a chip, a state and a live miniature, and nothing
+about *what the session is actually doing*. `subtitle` is a plain string the
+package neither produces nor interprets — a note, an activity summary, whatever
+the host thinks is worth reading before opening the card. Rendered as text
+(never markup: this is exactly where a host will put model output), clamped to
+two lines so a long one cannot grow the card.
+
+Omit it and the card is byte-identical. The test that matters asserts the
+subtitle renders in **both** card branches — grouped and flat are separate
+markup in `SessionGrid`, and this repo has shipped a fix to one of two branches
+before.
+
+### `sessionPresentation.promptsCollapsible` — the prompt list as a disclosure
+
+`PromptsPanel` gains `collapsible` and `initiallyOpen`; `SessionView` passes
+them through from the presentation options. Default false, which is the
+always-open list with the title as a plain `<div>` exactly as before.
+
+This exists because five prompts is most of a phone's HUD panel. A host that
+adds its own panel content had no way to make room for it, and the panel was
+scrolling content out of reach rather than choosing what to show.
+
+### `sessionPresentation.extraPanelPlacement` — extra panel above the stock ones
+
+`'top' | 'bottom'`, default `'bottom'` — where it has always rendered. The
+stack's order is a priority order, not a layout detail: a host whose extra
+panel summarizes what the session is doing wants it above a note and a prompt
+history, and the only way to get that before was to give up the stock note and
+prompt panels entirely and rebuild both.
 
 ## v0.11.2 — 2026-08-06
 

@@ -127,6 +127,9 @@
   });
 
   let showShortcutBar = $derived(adapters.sessionPresentation?.showShortcutBar ?? true);
+  let promptsCollapsible = $derived(adapters.sessionPresentation?.promptsCollapsible ?? false);
+  let promptsInitiallyOpen = $derived(adapters.sessionPresentation?.promptsInitiallyOpen ?? false);
+  let extraPanelOnTop = $derived(adapters.sessionPresentation?.extraPanelPlacement === 'top');
   let controlInset = $derived(Math.max(
     showShortcutBar ? shortcutBarHeight : 0,
     scrollControlsHeight,
@@ -584,6 +587,10 @@
 
 {#snippet hudPanel()}
   <div class="hud-panel-stack">
+    {#if adapters.extraPanel && extraPanelOnTop}
+      {@const extraPanelTop = adapters.extraPanel}
+      {@render extraPanelTop(session)}
+    {/if}
     {#if adapters.notes}
       <NotePanel
         {note}
@@ -597,6 +604,8 @@
       <PromptsPanel
         prompts={recentPrompts}
         loading={promptsLoading}
+        collapsible={promptsCollapsible}
+        initiallyOpen={promptsInitiallyOpen}
         onPick={(prompt) => {
           hudExpanded = false;
           prefillComposer(prompt);
@@ -608,7 +617,7 @@
         }}
       />
     {/if}
-    {#if adapters.extraPanel}
+    {#if adapters.extraPanel && !extraPanelOnTop}
       {@const extraPanel = adapters.extraPanel}
       {@render extraPanel(session)}
     {/if}

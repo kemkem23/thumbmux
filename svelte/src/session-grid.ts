@@ -21,6 +21,13 @@ export type GridSession = {
   groupKey?: string;
   groupLabel?: string;
 
+  /** One line of host-supplied context under the name — a note, a summary of
+   *  what the session is doing, whatever the host considers worth reading
+   *  before opening the card. The package neither produces nor interprets it;
+   *  it is clamped to two lines and rendered as text. Omit it and the card is
+   *  byte-identical to a card without one. */
+  subtitle?: string;
+
   state?: GridSessionState;
   /** Visible and accessible host-localized label. */
   stateLabel?: string;

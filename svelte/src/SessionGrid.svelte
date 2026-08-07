@@ -273,6 +273,9 @@
             </span>
             <span class="sr-only">{item.session.name}</span>
           </div>
+          {#if item.session.subtitle}
+            <div class="subtitle" data-testid="grid-subtitle">{item.session.subtitle}</div>
+          {/if}
           {#if item.session.state}
             <div class={stateClass(item.session.state)} data-testid="grid-state" data-state={item.session.state}>
               <span class="dot" aria-hidden="true"></span>
@@ -315,6 +318,9 @@
           </span>
           <span class="sr-only">{item.session.name}</span>
         </div>
+        {#if item.session.subtitle}
+          <div class="subtitle" data-testid="grid-subtitle">{item.session.subtitle}</div>
+        {/if}
         {#if item.session.state}
           <div class={stateClass(item.session.state)} data-testid="grid-state" data-state={item.session.state}>
             <span class="dot" aria-hidden="true"></span>
@@ -461,6 +467,18 @@
     border-bottom: 2px solid var(--accent);
     background: var(--hub-card, #ffffff);
     z-index: 1;
+  }
+  .subtitle {
+    padding: 5px 9px 0;
+    color: var(--hub-ink, #1a1a1a);
+    font: 600 9.5px var(--font-thai, var(--font-mono, ui-monospace, monospace));
+    line-height: 1.4;
+    opacity: .75;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
   .chip {
     font: 700 8px var(--font-mono, ui-monospace, monospace);

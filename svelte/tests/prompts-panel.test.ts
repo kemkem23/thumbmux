@@ -196,3 +196,76 @@ describe("PromptsPanel", () => {
     expect(authorStyle.getPropertyValue("overflow").trim()).toBe("hidden");
   });
 });
+
+describe("collapsible disclosure", () => {
+  test("without the prop the list is always open and the title is not a control", async () => {
+    const { target } = mountPromptsPanel({ prompts: ["one", "two"] });
+    await tick();
+
+    expect(target.querySelector('[data-testid="prompts-toggle"]')).toBeNull();
+    expect(target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
+    // The title stays a plain div — a host that never opts in gets the same
+    // DOM it had before this prop existed.
+    const title = target.querySelector(".ptitle");
+    expect(title?.tagName).toBe("DIV");
+  });
+
+  test("collapsible starts closed, hides the list, and reports its state", async () => {
+    const { target } = mountPromptsPanel({ prompts: ["one", "two"], collapsible: true });
+    await tick();
+
+    const toggle = target.querySelector<HTMLButtonElement>('[data-testid="prompts-toggle"]');
+    expect(toggle).not.toBeNull();
+    expect(toggle!.getAttribute("aria-expanded")).toBe("false");
+    expect(target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(0);
+    // The count is visible while collapsed — otherwise the disclosure gives no
+    // reason to open it.
+    expect(toggle!.textContent).toContain("(2)");
+  });
+
+  test("clicking the disclosure opens and closes the list", async () => {
+    const { target } = mountPromptsPanel({ prompts: ["one", "two"], collapsible: true });
+    await tick();
+
+    const toggle = target.querySelector<HTMLButtonElement>('[data-testid="prompts-toggle"]')!;
+    toggle.click();
+    flushSync();
+    await tick();
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
+
+    toggle.click();
+    flushSync();
+    await tick();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(0);
+  });
+
+  test("initiallyOpen starts expanded, and is ignored without collapsible", async () => {
+    const open = mountPromptsPanel({ prompts: ["one"], collapsible: true, initiallyOpen: true });
+    await tick();
+    expect(
+      open.target.querySelector('[data-testid="prompts-toggle"]')!.getAttribute("aria-expanded"),
+    ).toBe("true");
+    expect(open.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(1);
+
+    const notCollapsible = mountPromptsPanel({ prompts: ["one"], initiallyOpen: false });
+    await tick();
+    // initiallyOpen:false must not close a panel that was never collapsible.
+    expect(notCollapsible.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(1);
+  });
+
+  test("the empty and loading states are hidden while collapsed too", async () => {
+    const { target } = mountPromptsPanel({ prompts: [], collapsible: true, loading: true });
+    await tick();
+    expect(target.querySelector(".pnone")).toBeNull();
+
+    const toggle = target.querySelector<HTMLButtonElement>('[data-testid="prompts-toggle"]')!;
+    // Nothing to count, so no count — an empty "(0)" is noise.
+    expect(toggle.textContent).not.toContain("(0)");
+    toggle.click();
+    flushSync();
+    await tick();
+    expect(target.querySelector(".pnone")).not.toBeNull();
+  });
+});

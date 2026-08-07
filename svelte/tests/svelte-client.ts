@@ -21,3 +21,8 @@ export const tick = client.tick as typeof import("svelte").tick;
 // flushSync forces pending effects to run to completion so self-invalidating
 // $effects surface during the test rather than after it returns.
 export const flushSync = client.flushSync as typeof import("svelte").flushSync;
+// Same reason as the rest of this file: the bare `svelte` export condition
+// hands back the SERVER createRawSnippet, whose render() pushes into a payload
+// that does not exist under a client mount. Tests that pass a snippet prop need
+// the client one.
+export const createRawSnippet = client.createRawSnippet as typeof import("svelte").createRawSnippet;

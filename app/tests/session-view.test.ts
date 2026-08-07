@@ -21,6 +21,7 @@ import type { Component } from 'svelte';
 import { proxy as reactiveProps } from 'svelte/internal/client';
 import { tmuxMux } from '@thumbmux/svelte';
 import {
+  createRawSnippet,
   flushSync,
   mount,
   tick,
@@ -125,6 +126,13 @@ function restoreProperty(
   if (descriptor) Object.defineProperty(target, key, descriptor);
   else Reflect.deleteProperty(target, key);
 }
+
+/** A minimal host `extraPanel`. `createRawSnippet` is the supported way to
+ *  build a snippet outside a .svelte file; its render must return exactly one
+ *  element, which is also what makes it identifiable in the panel stack. */
+const hostPanelSnippet = createRawSnippet(() => ({
+  render: () => '<div data-testid="host-extra-panel"></div>',
+}));
 
 async function flushPromises(): Promise<void> {
   await Promise.resolve();
@@ -545,6 +553,77 @@ describe('mountable terminal views', () => {
     expect(included.target.querySelectorAll('[data-testid="note-panel"]')).toHaveLength(1);
     expect(included.target.querySelectorAll('[data-testid="prompts-panel"]')).toHaveLength(1);
     expect(included.target.querySelectorAll('[data-testid="upload-input"]')).toHaveLength(1);
+  });
+
+  test('the prompt list becomes a disclosure only when the host asks for one', async () => {
+    const stock = mountView(SessionView, {
+      session: 'sh-stock-prompts',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => ['first prompt', 'second prompt'],
+      } satisfies AppAdapters,
+    });
+    const collapsible = mountView(SessionView, {
+      session: 'sh-collapsible-prompts',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => ['first prompt', 'second prompt'],
+        sessionPresentation: { promptsCollapsible: true },
+      } satisfies AppAdapters,
+    });
+
+    for (const entry of [stock, collapsible]) {
+      const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+      if (!expand) throw new Error('SessionView did not render its HUD toggle');
+      flushSync(() => expand.click());
+    }
+    await flushPromises();
+
+    // Unchanged for a host that did not opt in.
+    expect(stock.target.querySelectorAll('[data-testid="prompts-toggle"]')).toHaveLength(0);
+    expect(stock.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
+
+    // Opted in: the list is behind a control and starts closed.
+    const toggle = collapsible.target.querySelector<HTMLButtonElement>('[data-testid="prompts-toggle"]');
+    expect(toggle).not.toBeNull();
+    expect(toggle!.getAttribute('aria-expanded')).toBe('false');
+    expect(collapsible.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(0);
+
+    flushSync(() => toggle!.click());
+    await flushPromises();
+    expect(collapsible.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
+  });
+
+  test('extraPanel renders last by default and first when the host places it on top', async () => {
+    // The stack's order is a priority order. A host whose extra panel says what
+    // the session is doing wants it above a note and a prompt history, and the
+    // only alternative was to give up the stock panels entirely.
+    const adaptersFor = (placement?: 'top' | 'bottom'): AppAdapters => ({
+      termProps: () => ({ claimGeometry: false }),
+      notes: { load: async () => 'a note', save: async () => {} },
+      prompts: async () => ['a prompt'],
+      extraPanel: hostPanelSnippet,
+      ...(placement ? { sessionPresentation: { extraPanelPlacement: placement } } : {}),
+    });
+
+    const stacks: Record<string, string[]> = {};
+    for (const [key, placement] of [['default', undefined], ['top', 'top'], ['bottom', 'bottom']] as const) {
+      const entry = mountView(SessionView, {
+        session: `sh-panel-${key}`,
+        adapters: adaptersFor(placement),
+      });
+      const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+      if (!expand) throw new Error('SessionView did not render its HUD toggle');
+      flushSync(() => expand.click());
+      await flushPromises();
+      stacks[key] = Array.from(
+        entry.target.querySelectorAll('.hud-panel-stack > *'),
+      ).map((node) => node.getAttribute('data-testid') ?? node.className);
+    }
+
+    expect(stacks.default).toEqual(['note-panel', 'prompts-panel', 'host-extra-panel']);
+    expect(stacks.bottom).toEqual(['note-panel', 'prompts-panel', 'host-extra-panel']);
+    expect(stacks.top).toEqual(['host-extra-panel', 'note-panel', 'prompts-panel']);
   });
 
   test('host surface wins over termProps palette while other term overrides remain', async () => {

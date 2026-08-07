@@ -50,6 +50,24 @@ export interface SessionPresentationOptions {
   ) => readonly FabAction[];
   /** Render the persistent shortcut chips and manage button. Defaults true. */
   showShortcutBar?: boolean;
+  /** Put the recent-prompt list behind a disclosure in the HUD panel.
+   *
+   * Defaults false, which reproduces today's always-open list exactly. A host
+   * that adds its own panel content through `extraPanel` runs out of panel
+   * height fast — five prompts is most of a phone screen — and the collapsed
+   * list is what makes the rest of the stack reachable without scrolling. */
+  promptsCollapsible?: boolean;
+  /** Start the collapsible prompt list open. Defaults false (collapsed); has
+   * no effect unless `promptsCollapsible` is set. */
+  promptsInitiallyOpen?: boolean;
+  /** Where `extraPanel` renders inside the HUD panel stack. Defaults
+   * `'bottom'`, which is where it has always rendered.
+   *
+   * `'top'` exists because the stack's order is a priority order, not a
+   * layout detail: a host whose extra panel is the summary of what the session
+   * is doing wants it above a note and a prompt history, and previously had no
+   * way to say so short of giving up the stock note and prompt panels. */
+  extraPanelPlacement?: 'top' | 'bottom';
 }
 
 /** Host-owned behavior and policy seams for the mountable application shell. */
