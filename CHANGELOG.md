@@ -44,10 +44,9 @@ Omitting the prop renders the row exactly as before. That is asserted, not
 asserted-adjacent: the whole `.hud-names` subtree is compared element for
 element. The width guarantee is asserted in real Chromium — happy-dom reports
 every width as 0, so the entire finding is invisible to the suite that runs
-everywhere else — and each measurement is paired with a control taken while the
-collapse rule is neutralized by a stylesheet override, which reproduces the crush.
-A harness that was not really laying out would fail the control instead of
-passing the test.
+everywhere else. The crush itself is reproduced by a control measurement taken
+while the collapse rule is neutralized by a stylesheet override; a harness that
+had stopped laying out would fail that control rather than pass the test.
 
 ### The HUD's two silent text transforms are now opt-out
 

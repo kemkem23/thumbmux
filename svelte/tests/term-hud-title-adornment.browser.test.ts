@@ -134,7 +134,11 @@ async function render(
        .host-chip { font: inherit; }
        ${opts.extraCss ?? ""}
      </style></head><body><div id="app"></div>
-     <script>window.__hudProps = ${JSON.stringify({ title: opts.title, adorn: opts.adorn })};</script>
+     <script>window.__hudProps = ${JSON.stringify({ title: opts.title, adorn: opts.adorn })};
+       // Cleared here rather than trusted to be absent: if setContent ever reuses
+       // the window, a stale flag would let the wait return before this document's
+       // mount had run, and the control would silently measure the previous page.
+       window.__hudReady = false;</script>
      <script type="module">${bundle.replaceAll("</script", "<\\/script")}</script>
      </body></html>`,
     { waitUntil: "load" },
