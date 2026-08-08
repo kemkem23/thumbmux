@@ -829,8 +829,19 @@ describe("A3-9 maxBlockedMs timeout", () => {
       (mux as any).queueCapture(SESSION);
       await until(() => (mux as any).blockedSockets.has(ws) || closed.length > 0);
 
-      // Stay idle — no further pushes. Timer must still shed.
-      await new Promise((r) => setTimeout(r, 60));
+      // Stay idle — no further pushes. The timer must shed on its own.
+      //
+      // Waited on a condition, not on the clock. This used to sleep a flat 60ms
+      // against a 25ms `maxBlockedMs`, and that 35ms of slack is not slack on a
+      // two-core runner executing 99 test files in one process: the shed timer
+      // competes with everything else on the event loop. It cost a release —
+      // the same commit passed `ci` and failed `release-dist`, which is a thing
+      // only a nondeterministic test can do.
+      //
+      // Nothing else can satisfy this: `pollNormalMs` is 60s, so no capture
+      // runs inside the window, and no code here pushes. If shedding needed a
+      // push, `until` throws at its deadline and the test fails as before.
+      await until(() => closed.length > 0);
       expect(closed.length).toBeGreaterThanOrEqual(1);
       expect((mux as any).shedSockets.has(ws)).toBe(true);
     } finally {

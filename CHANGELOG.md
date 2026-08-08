@@ -1,9 +1,21 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.1-dist`.
 
-## v0.15.0 — 2026-08-08
+## v0.15.1 — 2026-08-08
+
+`v0.15.0` was tagged and never published. `release-dist` stopped it at the
+verification gate over `A3-9 maxBlockedMs timeout`, a test that slept a flat
+60ms against a 25ms timeout and asserted the timer had fired. That is not slack
+on a two-core runner executing 99 test files in one process, and CI proved it
+itself: the same commit passed `ci` and failed `release-dist`, which only a
+nondeterministic test can do. It waits on the condition now, and still fails
+(with the shed timer disabled) when the behaviour it describes is absent.
+
+No consumer could have installed 0.15.0 — only `-dist` tags are installable and
+that one does not exist. Everything below is what 0.15.1 carries.
+
 
 ### Changed defaults
 
