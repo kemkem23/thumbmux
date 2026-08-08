@@ -68,6 +68,12 @@ export interface SessionPresentationOptions {
    * is doing wants it above a note and a prompt history, and previously had no
    * way to say so short of giving up the stock note and prompt panels. */
   extraPanelPlacement?: 'top' | 'bottom';
+  /** Text placed before the HUD note. Defaults to `'✎ '`, which is what the
+   * HUD has always prefixed; pass `''` to render the host's note verbatim. */
+  notePrefix?: string;
+  /** `'upper'` (default) uppercases the HUD status text, as it always has;
+   * `'none'` renders it exactly as the shell's labels give it. */
+  statusCase?: 'upper' | 'none';
 }
 
 /** Host-owned behavior and policy seams for the mountable application shell. */
@@ -184,6 +190,14 @@ export interface AppAdapters {
    * shell lending its composer rather than the host rebuilding one. */
   extraActions?: (session: string, context: SessionActionContext) => FabAction[];
   extraPanel?: Snippet<[string]>;
+  /** Inline slot on the HUD's session-name row — live per-session information
+   * that belongs beside the name rather than behind the expand caret.
+   *
+   * It collapses instead of competing for width: when the name and the slot
+   * cannot both be read, the slot leaves and the name keeps the row. A host
+   * that wants its content guaranteed on screen at every width should use
+   * `extraPanel` instead, which is always given room. */
+  titleAdornment?: Snippet<[string]>;
   extraSheets?: Snippet<[string]>;
   /** Dismiss any open host overlay; returns whether one was dismissed. This is
    * a command — calling it closes things. */

@@ -585,6 +585,13 @@
   });
 </script>
 
+{#snippet hudTitleAdornment()}
+  {#if adapters.titleAdornment}
+    {@const adorn = adapters.titleAdornment}
+    {@render adorn(session)}
+  {/if}
+{/snippet}
+
 {#snippet hudPanel()}
   <div class="hud-panel-stack">
     {#if adapters.extraPanel && extraPanelOnTop}
@@ -685,6 +692,9 @@
     onToggleExpand={() => { void loadPrompts(); }}
     backAria={labels.hudBack}
     panel={hasHudPanel ? hudPanel : undefined}
+    titleAdornment={adapters.titleAdornment ? hudTitleAdornment : undefined}
+    notePrefix={adapters.sessionPresentation?.notePrefix ?? '✎ '}
+    statusCase={adapters.sessionPresentation?.statusCase ?? 'upper'}
   />
 
   {#if showShortcutBar}

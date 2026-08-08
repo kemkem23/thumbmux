@@ -626,6 +626,66 @@ describe('mountable terminal views', () => {
     expect(stacks.top).toEqual(['host-extra-panel', 'note-panel', 'prompts-panel']);
   });
 
+  test('titleAdornment reaches the HUD name row, and is absent when the host omits it', async () => {
+    // The v0.8.3 lesson, in test form: `AppAdapters` having the field is not
+    // the same claim as the value arriving at the component. M3 was BLOCKED by
+    // exactly this — HubView took `adapters` and forwarded one of six values,
+    // and nothing in the diff showed it.
+    const stock = mountView(SessionView, {
+      session: 'sh-adornment-stock',
+      adapters: { termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+    });
+    expect(stock.target.querySelector('[data-testid="hud-title-adornment"]')).toBeNull();
+
+    const adorned = mountView(SessionView, {
+      session: 'sh-adornment-host',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        titleAdornment: createRawSnippet((session: () => string) => ({
+          render: () => `<span data-testid="host-adornment">${session()} · 2m14s</span>`,
+        })),
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+
+    const slot = adorned.target.querySelector('[data-testid="hud-title-adornment"]');
+    expect(slot).not.toBeNull();
+    // The session name is handed to the snippet — a per-session badge cannot be
+    // built from a slot that does not know which session it is on.
+    expect(slot!.querySelector('[data-testid="host-adornment"]')!.textContent).toBe(
+      'sh-adornment-host · 2m14s',
+    );
+  });
+
+  test('the HUD note prefix and status case are the host\'s to set', async () => {
+    const stock = mountView(SessionView, {
+      session: 'sh-hud-transforms-stock',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        notes: { load: async () => 'รอ merge', save: async () => {} },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    // Unchanged for a host that says nothing: ✎ prefix, uppercased status.
+    expect(stock.target.querySelector('.hud-note')!.textContent).toBe('✎ รอ merge');
+    expect(stock.target.querySelector('.st')!.textContent!.trim()).toBe(
+      stock.target.querySelector('.st')!.textContent!.trim().toUpperCase(),
+    );
+
+    const custom = mountView(SessionView, {
+      session: 'sh-hud-transforms-host',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        notes: { load: async () => 'รอ merge', save: async () => {} },
+        sessionPresentation: { notePrefix: '', statusCase: 'none' },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    expect(custom.target.querySelector('.hud-note')!.textContent).toBe('รอ merge');
+    const status = custom.target.querySelector('.st')!.textContent!.trim();
+    expect(status).not.toBe(status.toUpperCase());
+  });
+
   test('host surface wins over termProps palette while other term overrides remain', async () => {
     const termPalette = palette('#552211');
     const hostPalette = palette('#123456');

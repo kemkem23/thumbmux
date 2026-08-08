@@ -10,3 +10,8 @@ git-dist/
 # Playwright run state — never ship this; one of these literally read {"status":"failed"}
 test-results/
 **/test-results/
+
+# Browser-harness entry written at test time. It lives beside the tests (not in
+# a temp dir) because it imports `svelte`, and Node resolution walks up from the
+# importing file — from /tmp there is no node_modules to find.
+*.generated.ts

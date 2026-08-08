@@ -3,6 +3,65 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.13.1-dist`.
 
+## Unreleased — ships as v1.1.0
+
+Held deliberately. The 1.0 tag is defined as a re-tag of a proven 0.x **with no
+new code in it**, so anything below has to come after it, and the seven-day soak
+that qualifies 0.13.1 is still running. Landing on `main` does not touch
+`v0.13.1-dist`, which is what production is pinned to.
+
+### TM-04 — an inline slot on the HUD's session-name row
+
+`TermHud` gains `titleAdornment?: PanelSnippet`, rendered inside `.nm` after the
+name and before the caret. `AppAdapters.titleAdornment?: Snippet<[string]>`
+carries it through the mountable shell and hands the snippet its session name.
+
+A host had no published way to put live per-session information beside the
+session name, and the consumer report measured all three substitutes failing:
+`chip` is the single agent-identity badge and holds one value, `note` lands on a
+second line, and `status` — force-uppercased and `flex: 0 0 auto` — took 248px of
+a 390px bar and left `.nm` with **clientWidth 15px against scrollWidth 187px**,
+i.e. the session name clipped to its caret glyph.
+
+**The slot collapses rather than competing for width.** The contract we replied
+with would have made the name shrink first and the slot never shrink; that
+answers the wrong question. Both exist to be read, and half a badge next to a
+clipped name is two unreadable things where only one of them is what the operator
+came for. So when the name and the slot cannot both fit, the slot leaves the row
+entirely and the name keeps all of it. The row may drop the slot briefly while it
+is still measuring — losing the adornment for a moment is acceptable, losing the
+name is not.
+
+The decision is made on **intrinsic** widths (the `scrollWidth` of the clipped
+name and of the out-of-flow slot), never on the widths they currently occupy, so
+it cannot oscillate between the two states. A collapsed slot goes out of flow
+rather than to `display: none`, because it has to keep reporting its own width —
+otherwise the row would have no way to discover it fits again. And with no layout
+engine at all (SSR, jsdom, happy-dom) every width reads 0, which means "unknown",
+which renders the host's content rather than swallowing it.
+
+Omitting the prop renders the row exactly as before. That is asserted, not
+asserted-adjacent: the whole `.hud-names` subtree is compared element for
+element. The width guarantee is asserted in real Chromium — happy-dom reports
+every width as 0, so the entire finding is invisible to the suite that runs
+everywhere else — and each measurement is paired with a control taken while the
+collapse rule is neutralized by a stylesheet override, which reproduces the crush.
+A harness that was not really laying out would fail the control instead of
+passing the test.
+
+### The HUD's two silent text transforms are now opt-out
+
+`status` was force-uppercased and `note` force-prefixed with `✎`, neither
+documented, which made both props unusable for any other wording — including in
+another language. `TermHud` gains `statusCase?: 'upper' | 'none'` and
+`notePrefix?: string`, and `sessionPresentation` carries both through the shell.
+
+**The defaults keep the old behaviour**, and that is a deliberate difference from
+the report, which asked for the transforms to become opt-in. `TermHud` is F tier:
+flipping a default changes what every existing consumer renders, which is the
+thing the tier exists to prevent. Opt-out reaches the same place without spending
+anyone else's release on it.
+
 ## v0.13.1 — 2026-08-07
 
 **The `.svelte` sources we ship now pass strict `svelte-check` (TM-19).**
