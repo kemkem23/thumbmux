@@ -42,6 +42,12 @@
     "tier": "F"
   },
   {
+    "name": "DEFAULT_ANSI_COLORS",
+    "kind": "value",
+    "signature": "f83dc176b81eeb0a2b71b32ef49640fd941eb78a0cb8742f5eb8ab345119b2f5",
+    "tier": "D"
+  },
+  {
     "name": "DEFAULT_LAUNCH_PRESETS",
     "kind": "value",
     "signature": "733fcab5ce3d47945fbb58ac0d6b492800c34378f544d8a60d3654356937d073",

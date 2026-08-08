@@ -1,7 +1,64 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.14.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.0-dist`.
+
+## v0.15.0 — 2026-08-08
+
+### Changed defaults
+
+**The 16 basic ANSI colours no longer rename themselves.** Slot 4 is called
+`blue` and rendered `#c8b4ff` — lavender. Slot 5 is `magenta` and rendered
+pink. A pane that asked for blue got purple, on every surface this package
+draws, and nothing said so.
+
+That is not a matter of taste, because a program does not send a colour for
+these slots — it sends a **number**, and the slot names are the only statement
+of what the number means. Choosing lavender for `blue` is the package
+overriding the author of the program being displayed. It is the same defect
+this package's primary consumer was caught making one level up, repainting
+panes whose colours had already been chosen, except here it was us doing it to
+our consumers.
+
+Hues now match names, at values readable on a dark background:
+
+| slot | was | now |
+| --- | --- | --- |
+| 1 red | `#ff7a7a` | `#cd3131` |
+| 2 green | `#7dffa0` | `#0dbc79` |
+| 3 yellow | `#ffef9e` | `#e5e510` |
+| 4 blue | `#c8b4ff` (lavender) | `#2472c8` |
+| 5 magenta | `#ff9ad5` (pink) | `#bc3fbc` |
+| 6 cyan | `#9be9ff` | `#11a8cd` |
+
+The values are the ones VS Code's integrated terminal ships. That is a second
+reason on top of being correct: it is the terminal most CLI authors have in
+front of them while choosing their colours, which makes it the closest
+available answer to what the author saw.
+
+**Bright ANSI slots existed but never rendered.** `deriveSurface` named no
+`bright*` entries at all, and `paletteForSurface` falls back to the normal
+colour when a bright one is missing — so all six bright slots collapsed onto
+their normal twins. A pane distinguishing bright blue from blue was drawn with
+one colour for both. The test covering this asserted `base[9] === base[1]`,
+recording the collapse as if it were intended.
+
+**Two ANSI tables existed and disagreed.** `DEFAULT_ANSI_BASE` and
+`DERIVED_DARK_ANSI` were separate literals; the second wins for every surface
+`deriveSurface` produces, which includes `defaultSurface`, so slots 1-6 and
+9-14 of the first were never what the package rendered. Both are now built from
+one pair of tiers.
+
+### Added
+
+- **`DEFAULT_ANSI_COLORS`** (core, tier D) — the 16-entry default palette, for
+  hosts assembling an `AnsiPalette` for a surface this module does not build: a
+  thumbnail, an embedded preview, a grid card. It was a private constant, and
+  the cost of that was measurable: six separate files in this package's primary
+  consumer had each hand-copied a sixteen-colour array, they had drifted apart,
+  and **none of them matched what the package rendered**. Prefer
+  `defaultSurface(bg).palette` when you have a background — it fills the
+  background, foreground and bright-foreground slots from that surface.
 
 ## v0.14.0 — 2026-08-08
 

@@ -44,12 +44,57 @@ const DEFAULT_BASE_SURFACE: TerminalSurface = {
   xterm: {},
 };
 
+/**
+ * The 16 basic ANSI slots, and the one decision a terminal viewer cannot avoid.
+ *
+ * A program does not send a colour for these — it sends a NUMBER, and slot 4 is
+ * named `blue`. Whoever renders it chooses what blue looks like, which makes
+ * this list a claim about what the program meant, not a matter of taste.
+ *
+ * It used to read `'#c8b4ff'` at slot 4: lavender. Slot 5, `magenta`, was pink.
+ * A pane that asked for blue got purple, and nothing anywhere said so. That is
+ * the same defect this package's own consumers were caught making one level up
+ * — repainting output whose colours were already chosen — except here it was
+ * the package doing it to them.
+ *
+ * So the hues now match the names. The values are the ones VS Code's integrated
+ * terminal ships, chosen for a second reason beyond being correct: it is the
+ * terminal most CLI authors are looking at while they pick their colours, which
+ * makes it the closest available answer to "what did the author see".
+ *
+ * Slots 0, 7, 8 and 15 are overwritten from the surface in `paletteForSurface`
+ * (background, foreground, dim, bright foreground) — the values here are the
+ * fallbacks for a caller that supplies none.
+ */
+const ANSI_NORMAL = {
+  red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
+  blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd',
+} as const;
+const ANSI_BRIGHT = {
+  red: '#f14c4c', green: '#23d18b', yellow: '#f5f543',
+  blue: '#3b8eea', magenta: '#d670d6', cyan: '#29b8db',
+} as const;
+
 const DEFAULT_ANSI_BASE = [
-  '#101014', '#ff7a7a', '#7dffa0', '#ffef9e',
-  '#c8b4ff', '#ff9ad5', '#9be9ff', '#e8e8e8',
-  '#8a8a92', '#ff9d9d', '#a0ffbe', '#fff5bd',
-  '#dcceff', '#ffbde4', '#c2f1ff', '#ffffff',
+  '#101014', ANSI_NORMAL.red, ANSI_NORMAL.green, ANSI_NORMAL.yellow,
+  ANSI_NORMAL.blue, ANSI_NORMAL.magenta, ANSI_NORMAL.cyan, '#e5e5e5',
+  '#666666', ANSI_BRIGHT.red, ANSI_BRIGHT.green, ANSI_BRIGHT.yellow,
+  ANSI_BRIGHT.blue, ANSI_BRIGHT.magenta, ANSI_BRIGHT.cyan, '#ffffff',
 ];
+
+/**
+ * The default palette as a plain 16-entry list, for hosts that assemble their
+ * own `AnsiPalette` for a surface this module does not build (a thumbnail, an
+ * embedded preview, a grid card). Exported because it was not: six separate
+ * files in this package's own primary consumer had each hand-copied a
+ * sixteen-colour array, they had drifted apart, and none of them matched what
+ * the package rendered — which is what a private constant costs.
+ *
+ * Prefer `defaultSurface(bg).palette` when you have a background colour; it
+ * fills slots 0/7/15 from that surface so the terminal's own background and
+ * foreground stay consistent with the chrome around it.
+ */
+export const DEFAULT_ANSI_COLORS: readonly string[] = Object.freeze([...DEFAULT_ANSI_BASE]);
 
 const ANSI_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'] as const;
 
@@ -132,9 +177,25 @@ function enforceContrast(hex: string, bg: string, minContrast: number): string {
   return readableFallback(bg);
 }
 
+/**
+ * Built from the same two tiers, not hand-written beside them. It used to be a
+ * second literal list, and the two disagreed in a way nothing could see: this
+ * one wins for every surface `deriveSurface` produces — which includes
+ * `defaultSurface` — so the values in `DEFAULT_ANSI_BASE` at slots 1-6 and 9-14
+ * were never what the package actually rendered.
+ *
+ * It also named no `bright*` entries at all. `paletteForSurface` falls back to
+ * the normal colour when a bright one is missing, so **every bright slot
+ * collapsed onto its normal twin**: a pane asking for bright blue got blue, and
+ * the distinction the program was drawing disappeared. The old test for this
+ * asserted `base[9] === base[1]`, freezing the collapse in place as if intended.
+ */
 const DERIVED_DARK_ANSI = {
-  red: '#ff7a7a', green: '#7dffa0', yellow: '#ffef9e', blue: '#c8b4ff',
-  magenta: '#ff9ad5', cyan: '#9be9ff', brightBlack: '#b9b2aa',
+  ...ANSI_NORMAL,
+  brightRed: ANSI_BRIGHT.red, brightGreen: ANSI_BRIGHT.green,
+  brightYellow: ANSI_BRIGHT.yellow, brightBlue: ANSI_BRIGHT.blue,
+  brightMagenta: ANSI_BRIGHT.magenta, brightCyan: ANSI_BRIGHT.cyan,
+  brightBlack: '#8a8a92',
 };
 const DERIVED_LIGHT_ANSI = {
   red: '#b3261e', green: '#1d7a3e', yellow: '#8a6d00', blue: '#4a35b8',
