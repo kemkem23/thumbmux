@@ -1,14 +1,17 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.13.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.14.0-dist`.
 
-## Unreleased — ships as v1.1.0
+## v0.14.0 — 2026-08-08
 
-Held deliberately. The 1.0 tag is defined as a re-tag of a proven 0.x **with no
-new code in it**, so anything below has to come after it, and the seven-day soak
-that qualifies 0.13.1 is still running. Landing on `main` does not touch
-`v0.13.1-dist`, which is what production is pinned to.
+Held for a day, then released after re-reading the criterion instead of the note
+about it. The seven-day soak measures the three consumer surfaces running on
+`thumbmux/app` in production **without patches arising from the migration work**
+— it is not a freeze on the version number, and it explicitly allows fixes that
+go out "ผ่านรอบ release ปกติ". This is a consumer-reported feature on a normal
+release round, so the clock is untouched and 1.0 remains a re-tag of a proven
+0.x — now of this one.
 
 ### TM-04 — an inline slot on the HUD's session-name row
 

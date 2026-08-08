@@ -755,11 +755,16 @@ evidence for the published tiers, not a claim of 1.0 compatibility.
 - [x] prefs/upload data-loss paths fixed and previously untested components covered
 - [x] `smoke:git-dist` checks source-derived core/server export parity for consumers
 
-**v0.11.x — current checkout**
+**v0.14.x — current checkout**
 - [x] Mountable `ThumbmuxApp` plus hub, session, and embed views under `thumbmux/app`
 - [x] `createAppRoutes()` composition for the matching HTTP and WebSocket surface
 - [x] Four-subpath contract gate plus three separate frozen consumer fixtures
 - [x] Copyable server/client quickstart executed from a packed `git-dist` consumer
+- [x] Every path in `files` reachable through `exports`, proven by a rule not a case
+- [x] Ten framework-free modules no longer gated behind the `svelte` export condition
+- [x] Shipped `.svelte` sources pass strict `svelte-check`
+- [x] `TermHud.titleAdornment` — an inline slot on the session-name row that
+      collapses rather than taking width from the name
 
 **Later**: split view (two panes side by side), hub pinning + activity badges,
 binary protocol (msgpack) / WebTransport, SSH-backed driver example,
