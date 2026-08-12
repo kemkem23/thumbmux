@@ -656,8 +656,8 @@ variables below; fonts and layout insets are host-only.
 
 | Property | Required? | Meaning |
 |---|---|---|
-| `--font-mono` | **yes** | Terminal typeface. `TermView` measures character width from the **computed** font to derive cols/rows — if this is unset you get a proportional font and drifting geometry, not a loud error. |
-| `--font-thai` | optional | UI chrome that mixes Thai (composer, prompts, shortcuts). Falls back to `--font-mono` where listed. |
+| `--font-mono` | **yes** | Terminal typeface. `TermView` measures character width from the **computed** font to derive cols/rows — if this is unset you get a proportional font and drifting geometry, not a loud error. The family must be **monospace and cover every glyph the terminal can emit**, including box-drawing `U+2500–257F`. A missing glyph falls through to a different family with a different advance width and the grid breaks by a few percent with no warning (the Google Fonts subset of JetBrains Mono ships no `U+25xx` range). Thai/CJK panes also need a monospace face for that script in the stack, or a second family matched with `size-adjust` — see `docs/desktop.md` "Host font contract". |
+| `--font-thai` | optional | UI chrome that mixes Thai (composer, prompts, shortcuts). Falls back to `--font-mono` where listed. Does **not** replace `--font-mono` for TermView cell metrics. |
 | `--tbg` | **yes** | Terminal / page surface background. |
 | `--tfg` | **yes** | Main text on that surface. |
 | `--tstage` | recommended | Stage edge behind the terminal (HUD / dock contrast). |

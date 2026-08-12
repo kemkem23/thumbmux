@@ -449,6 +449,101 @@ type TermViewHandle = {
 };
 ```
 
+### Native selection freezes scroll *and* live paint (full blast radius)
+
+`TermView` re-reads `window.getSelection()` before deciding whether a gesture or
+paint is safe. While a non-collapsed selection has its anchor or focus node
+inside the terminal viewport (`[data-testid="mtv"]`), **six** independent paths
+yield — not just wheel:
+
+| Path | Effect while a selection is live |
+|---|---|
+| `applyScroll()` | Returns before the `translate3d` write. Nothing moves, even a scroll that would stay inside the already-mounted ±60-row corridor. |
+| `onTouchStart` / `onTouchMove` | Touch scroll never establishes; mid-move after a collapsed selection also bails because no `touchstart` was accepted. |
+| `onWheel` | Desktop wheel is a no-op. |
+| `scrollToBottom()` | Returns `false`. The host ⤓ / "ล่าสุด" button is **silently dead**. |
+| Live content gate | New pane output is coalesced into a pending capture and **not painted** until the selection collapses. |
+| History prepend / search re-render | Deferred the same way — they replace row HTML and would destroy the selection's text nodes. |
+
+This is intentional: the virtualiser unmounts rows that leave the corridor, and a
+browser selection is anchored to concrete text nodes. The guard protects that
+invariant. It is **not** a permanent freeze — collapsing the selection (tap
+elsewhere, click outside the range, `Selection.removeAllRanges()`) fires
+`selectionchange`, clears the flag, and re-arms deferred work. Nothing in the
+UI says so, which is why the symptom reads as "page frozen".
+
+**Supported host escape hatch.** TermView's own handlers re-read the live
+selection on every entry, and both the element `wheel` listener and Svelte's
+delegated touch listeners run in the **bubble** phase. A host may therefore
+install a **document-level capture-phase** listener that collapses a terminal
+selection before TermView sees the event:
+
+```ts
+function nodeInMtv(node: Node | null): boolean {
+  const el = node instanceof Element ? node : node?.parentElement ?? null;
+  return !!el?.closest('[data-testid="mtv"]');
+}
+
+document.addEventListener('wheel', () => {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return;
+  // Scope to TermView only so chat/flow selections survive.
+  if (!nodeInMtv(sel.anchorNode) && !nodeInMtv(sel.focusNode)) return;
+  sel.removeAllRanges();
+}, { capture: true });
+```
+
+Register touch as `{ capture: true, passive: true }` and never call
+`preventDefault()` from that listener — Svelte marks `touchstart`/`touchmove`
+passive by default, and you only need `removeAllRanges()`. A wheel may collapse
+unconditionally (a wheel is never a selection adjustment). A touch should
+collapse only when the contact point is clearly outside the selection's client
+rects (inflate ~24px) so iOS selection-handle dragging still works.
+
+Cost of the escape hatch, stated plainly: you cannot scroll *while keeping* a
+selection. You cannot do that today either — today the view just stops
+responding. The host trades an invisible freeze for a visible "selection went
+away when you scrolled", which matches every native phone terminal.
+
+### Copy: selection-first vs whole-buffer
+
+- `copySelection()` — copies the live native selection when one exists inside
+  the terminal; returns `false` when there is none (or copy fails).
+- `copyAll()` — always copies the complete buffer (archive-backed when history
+  is loaded). **Ignores** any live selection.
+- Stock `SessionView` FAB copy calls `copySelection()` first and falls back to
+  `copyAll()` only when selection copy returns `false`. That is the package
+  default; `CONTRACT.md` names it "selection-first with whole-buffer fallback".
+- A host that overrides the FAB (or any action) to call only `context.copyAll()`
+  **gives that up**: a user who selected text and taps copy gets the entire
+  screen. Do that only when the label and product intent are whole-screen copy.
+
+### Host font contract (cell geometry is measured, not assumed)
+
+`TermView` measures the **computed** font of its viewport to derive cell width
+and row height. That measurement is only trustworthy when:
+
+1. **`--font-mono` is set** on an ancestor to a monospace family. Unset → the
+   browser falls back to a proportional face → cols/rows drift silently (no
+   loud error). Documented since v0.13.0.
+2. **The family covers every glyph the terminal can emit**, including
+   box-drawing `U+2500–257F`. A missing glyph falls through to a different
+   family with a **different advance width**, and the grid breaks by a few
+   percent with no warning. The Google Fonts subset of JetBrains Mono ships
+   **no** `U+25xx` range — hosts that set
+   `'JetBrains Mono', 'Sarabun', …` without a mono face that covers box-drawing
+   will mis-measure every TUI border.
+3. **Script coverage is part of the same contract.** Thai, CJK, and other
+   non-Latin scripts need a **monospace** face *for that script* in the stack
+   (or a carefully `size-adjust`-matched second family). A proportional Thai
+   fallback after a Latin mono primary is the same silent-grid failure as (2).
+
+Practical host checklist: pick a mono primary that includes box-drawing (self-hosted
+full JetBrains Mono, Iosevka, Cascadia Mono, …), put script-specific mono faces
+next, and only then a last-resort `monospace`. Use `size-adjust` / `ascent-override`
+when a second family must share the grid. UI chrome that mixes Thai can use
+`--font-thai` without affecting TermView cell metrics.
+
 ### `DesktopKeys.svelte`
 
 New component exported from `thumbmux/svelte`.

@@ -1533,4 +1533,57 @@ describe('mountable terminal views', () => {
     if (!noteText) throw new Error('SessionView did not render note text');
     expect(noteText.textContent).toBe('new note');
   });
+
+  // sessionPresentation.composerMode — additive S-tier optional. Seeds the
+  // composer $state once at mount; in-session switches still win for the
+  // life of the component. Omitted default must stay COMPOSE (0.15.1 behaviour).
+  test('sessionPresentation.composerMode opens the composer in DIRECT', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-composer-direct',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sessionPresentation: { composerMode: 'direct' },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+    flushSync(() => terminal.click());
+    await tick();
+
+    const sheet = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!sheet) throw new Error('SessionView did not render ComposerDock');
+    expect(sheet.classList.contains('open')).toBe(true);
+    // DIRECT gates the whole .crow/textarea — no visible field.
+    expect(sheet.querySelector('textarea')).toBeNull();
+    const direct = Array.from(sheet.querySelectorAll<HTMLButtonElement>('.mode-btn'))
+      .find((button) => button.textContent?.trim() === 'DIRECT');
+    expect(direct).toBeTruthy();
+    expect(direct!.classList.contains('on')).toBe(true);
+  });
+
+  test('omitted sessionPresentation.composerMode keeps COMPOSE as the stock default', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-composer-default',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+    flushSync(() => terminal.click());
+    await tick();
+
+    const sheet = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    if (!sheet) throw new Error('SessionView did not render ComposerDock');
+    expect(sheet.classList.contains('open')).toBe(true);
+    expect(sheet.querySelector('textarea')).not.toBeNull();
+    const compose = Array.from(sheet.querySelectorAll<HTMLButtonElement>('.mode-btn'))
+      .find((button) => button.textContent?.trim() === 'COMPOSE');
+    expect(compose).toBeTruthy();
+    expect(compose!.classList.contains('on')).toBe(true);
+  });
 });

@@ -117,9 +117,13 @@
     themeOpen: false,
     fabOpen: false,
   });
+  // Seed once at mount from the host presentation option. Do NOT derive this
+  // from adapters — a later adapters re-derive would stomp the user's live
+  // COMPOSE/DIRECT choice. $state initialisers run once; that is the wanted
+  // "default at mount, user wins after" behaviour.
   let composer = $state({
     text: '',
-    mode: 'compose' as 'compose' | 'direct',
+    mode: (adapters.sessionPresentation?.composerMode ?? 'compose') as 'compose' | 'direct',
     openCompose: () => {
       overlay.composerOpen = true;
       composerRef?.openCompose();

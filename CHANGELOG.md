@@ -1,7 +1,42 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
+
+## v0.15.2 — 2026-08-12
+
+Documentation-led patch: one additive S-tier option, and four host-facing gaps
+that only showed up when a consumer had to measure behavior the package never
+wrote down. No runtime change for hosts that pass nothing.
+
+### Added
+
+- **`SessionPresentationOptions.composerMode?: 'compose' \| 'direct'`** (app,
+  tier S) — seeds the composer mode for a freshly mounted `SessionView`.
+  Defaults to `'compose'` (unchanged). Per-mount state: the user's in-session
+  COMPOSE/DIRECT choice wins until remount; prefill still forces COMPOSE
+  because DIRECT has no visible field. `EmbedView` does not read this option.
+  Host example: `sessionPresentation: { composerMode: 'direct' }`.
+
+### Documented (were true, were never said)
+
+- **Selection guard blast radius** (`docs/desktop.md`) — not only wheel deltas:
+  `applyScroll`, touch scroll, `scrollToBottom()` (⤓ dead), live content paint,
+  history prepend, and search re-render all yield while a native selection is
+  live. Guard clears when the selection collapses. Supported host escape hatch:
+  document capture-phase listener that `removeAllRanges()` before TermView's
+  bubble handlers re-read the selection.
+- **Host font contract** (`README.md`, `CONTRACT.md`, `docs/desktop.md`) —
+  `--font-mono` must be monospace **and** cover box-drawing `U+2500–257F` (and
+  the scripts the pane shows). Missing glyphs fall through to a different
+  advance and break the grid silently; Google Fonts JetBrains Mono has no
+  `U+25xx`. `size-adjust` for a second-family script stack is part of the same
+  contract.
+- **Copy semantics** — stock FAB is selection-first with whole-buffer fallback;
+  `SessionActionContext.copyAll` is whole-buffer only. Overriding the FAB to
+  call only `copyAll()` copies the entire screen even when text is selected.
+- **`composerMode` remount semantics** — documented in JSDoc, `docs/app.md`, and
+  `CONTRACT.md` so "it forgets my choice" is not re-derived as a bug.
 
 ## v0.15.1 — 2026-08-08
 

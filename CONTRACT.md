@@ -44,6 +44,15 @@ and required-vs-optional rules live in the installed `README.md` section
 "Host CSS custom properties (theming surface)". Renaming a load-bearing
 property without a release note is still a silent restyle for every consumer.
 
+`--font-mono` is not only "set a monospace face". `TermView` measures the
+**computed** font to derive cell width and row height, so the family must (1) be
+monospace, (2) cover every glyph the terminal can emit — including box-drawing
+`U+2500–257F` — because a missing glyph falls through to another family with a
+different advance and the grid breaks silently, and (3) cover the scripts the
+pane will show (Thai/CJK need a monospace face for that script, or a
+`size-adjust`-matched second family). Full detail and the host escape hatch for
+the selection-scroll freeze live in `docs/desktop.md`.
+
 Changing an expected value in an ordinary test does not make a breaking change
 compatible. A change to a frozen manifest, consumer fixture, or wire golden is
 itself a contract event and must follow the policy below.
@@ -206,19 +215,28 @@ final list, so a host can replace, remove, or reorder any entry. New actions the
 callback creates receive the same FAB auto-dismiss behavior as legacy extra
 actions.
 `showShortcutBar: false` removes the persistent bar without removing its manager
-sheet or stock FAB action; omission keeps the bar. Copy does not get a second
-policy adapter: the opt-in action transformer receives optional
-`SessionActionContext.copyAll`, while legacy `extraActions` keeps its original
-two-member runtime context and the untouched stock copy action remains
-selection-first with whole-buffer fallback. File-paste unavailability likewise
+sheet or stock FAB action; omission keeps the bar. `composerMode: 'direct' |
+'compose'` seeds the composer mode once at `SessionView` mount (default
+`'compose'`). It is **per-mount state**, not a preference: the user's in-session
+COMPOSE/DIRECT choice wins for the life of the component; a remount (navigating
+home → terminal, reloading) re-seeds from this option. Prefill paths still force
+COMPOSE because DIRECT has no visible field. `EmbedView` does not read
+`sessionPresentation` and keeps its own hardcoded COMPOSE default. Copy does not
+get a second policy adapter: the opt-in action transformer receives optional
+`SessionActionContext.copyAll` (whole-buffer, ignores selection), while legacy
+`extraActions` keeps its original two-member runtime context and the untouched
+stock copy action remains selection-first with whole-buffer fallback. A host
+that overrides stock copy to call only `copyAll()` deliberately copies the
+entire screen even when text is selected. File-paste unavailability likewise
 stays on the existing upload adapter: when `upload.endpoint(session)` is null,
 optional `upload.onUnavailable` receives that session, the pasted files, and the
 enhanced action context. With an endpoint, paste still uploads; with neither an
 endpoint nor the callback, the browser keeps the paste. Separately, the session
 stage mirrors the current mapped metadata's exact `state` as `data-state`; this
 forwards an existing value and adds no adapter. The app view tests pin each
-configured route separately and pin all omitted defaults, while the unchanged
-frozen app consumer exercises the additive omitted route.
+configured route separately and pin all omitted defaults (including omitted
+`composerMode` → COMPOSE), while the unchanged frozen app consumer exercises the
+additive omitted route.
 
 ## Deprecation policy
 

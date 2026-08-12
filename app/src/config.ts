@@ -74,6 +74,15 @@ export interface SessionPresentationOptions {
   /** `'upper'` (default) uppercases the HUD status text, as it always has;
    * `'none'` renders it exactly as the shell's labels give it. */
   statusCase?: 'upper' | 'none';
+  /** Mode the composer opens in for a freshly mounted session. Defaults to
+   * `'compose'`, which is what every version through 0.15.1 did.
+   *
+   * This is **per-mount state**, not a remembered preference: the user's
+   * in-session COMPOSE/DIRECT choice wins for the life of the mounted
+   * `SessionView`, but a remount (home → terminal, reload) re-seeds from this
+   * value. Prefill paths still force COMPOSE because DIRECT has no visible
+   * field. `EmbedView` does not read this option. */
+  composerMode?: 'compose' | 'direct';
 }
 
 /** Host-owned behavior and policy seams for the mountable application shell. */
@@ -220,7 +229,12 @@ export interface SessionActionContext {
    * Optional so existing code that constructs this public context type keeps
    * compiling. `SessionView` supplies it to the opt-in session-presentation
    * and unavailable-upload callbacks; legacy `extraActions` receives its
-   * original two-member runtime context. */
+   * original two-member runtime context.
+   *
+   * Stock FAB copy is **selection-first with whole-buffer fallback**
+   * (`copySelection()` then `copyAll()`). Wiring an action that only calls
+   * `copyAll()` deliberately gives that up: a user who selected text and
+   * taps your button gets the entire screen, not their selection. */
   copyAll?: () => Promise<boolean>;
 }
 
