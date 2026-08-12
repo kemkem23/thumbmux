@@ -68,13 +68,24 @@
   .slots {
     position: absolute; right: 12px; bottom: calc(76px + env(safe-area-inset-bottom)); z-index: 39;
     display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
-    /* long action lists must scroll, not walk off the top (issue #1) */
+    /* long action lists must scroll, not walk off the top (issue #1).
+       Closed: overflow hidden so a fractional max-height vs content stack
+       never paints a hairline scrollbar on every terminal (D7). Open: auto
+       only when the list is actually taller than the budget. */
     max-height: calc(100dvh - 150px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
-    overflow-y: auto;
+    overflow-x: hidden;
+    overflow-y: hidden;
     overscroll-behavior: contain;
     pointer-events: none;
   }
-  .slots.open { pointer-events: auto; }
+  .slots.open {
+    pointer-events: auto;
+    overflow-y: auto;
+    /* ~half-line slack: font metrics / subpixel layout routinely leave the
+       content 8–12px over an exact max-height, which is not a real need to
+       scroll — it only manufactures a scrollbar. */
+    max-height: calc(100dvh - 138px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  }
   .slot {
     min-height: 46px; padding: 0 16px;
     background: var(--hud); color: var(--hud-fg);

@@ -186,7 +186,14 @@
   function autoGrow() {
     if (!composeEl) return;
     composeEl.style.height = 'auto';
-    composeEl.style.height = `${Math.min(composeEl.scrollHeight, 142)}px`;
+    // scrollHeight is content+padding; with border-box the border still sits
+    // outside that number, so a raw assignment leaves 1–2px of overflow and
+    // paints a hairline scrollbar on an empty/single-line field (D7).
+    const measured = composeEl.scrollHeight;
+    const next = Math.min(measured + 2, 142);
+    composeEl.style.height = `${next}px`;
+    // Only show a bar when we hit the max and content still wants more.
+    composeEl.style.overflowY = measured + 2 > 142 ? 'auto' : 'hidden';
   }
 
   // Host-driven prefills (recent-prompt reuse, upload result) must grow the
@@ -327,9 +334,13 @@
   .crow { display: flex; align-items: flex-end; }
   .crow textarea {
     flex: 1; min-height: 46px; max-height: 142px;
+    box-sizing: border-box;
     border: 1px solid var(--hud-line); background: rgba(0,0,0,.25);
     color: var(--hud-fg); font: 400 16px var(--font-thai); line-height: 1.55;
-    padding: 11px 10px; resize: none; overflow-y: auto;
+    padding: 11px 10px; resize: none;
+    /* autoGrow toggles overflow-y; start hidden so empty/single-line never
+       paints a 2px phantom scrollbar (D7). */
+    overflow-y: hidden;
   }
   .crow textarea::placeholder { color: var(--hud-fg); opacity: .4; }
   .snd {

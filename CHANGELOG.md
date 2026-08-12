@@ -22,6 +22,13 @@ every reopen.
   session with `liveLineLimit=1000`). `history_expand` cannot invent those
   rows. Documented in `docs/protocol.md` under "Live-window bootstrap and the
   archive boundary".
+- **Hairline scrollbars on ActionFab + ComposerDock** — `.slots` used
+  `overflow-y: auto` even when closed, so a fractional max-height vs content
+  stack painted a ~12px scrollbar on every terminal. Closed lists now
+  `overflow-y: hidden`; open lists keep auto with a half-line max-height
+  slack. The compose textarea set `height` to raw `scrollHeight` under
+  `border-box`, leaving 1–2px of overflow and a phantom bar on empty fields;
+  auto-grow adds 2px and keeps `overflow-y: hidden` until the max height.
 
 ### Added
 
