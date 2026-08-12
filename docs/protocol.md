@@ -190,6 +190,59 @@ the viewer; that is host error, not a client merge step you can rely on.
 Live **capture** merging is a different path (`findLineOverlap` on successive
 full/delta frames) and must not be confused with archive prepend.
 
+#### Live-window bootstrap and the archive boundary (normative for hosts)
+
+`TmuxWsMux` seeds a session's archive once, from a full-history capture, splitting
+it at `liveLineLimit`: everything older is archived, the newest `liveLineLimit`
+rows become the live window. After a successful seed, every later capture —
+including a reopen after the last viewer left — uses the **full** live depth
+(`DEFAULT_CAPTURE_START_LINE = -liveLineLimit`), not the short first-paint
+window (`INITIAL_CAPTURE_START_LINE = -min(250, liveLineLimit)`).
+
+That choice is load-bearing. The archive's newest row ends at
+`total − liveLineLimit`. A narrow reopen bootstrap beginning near
+`total − 250 − paneRows` leaves a multi-hundred-line gap that
+`history_expand` cannot fill, because expand only returns what was archived.
+Hosts that reconcile scrolled-off rows only when the mux still holds
+`previousContent` are especially exposed: `dropSessionState` clears that cache
+when the last viewer unsubscribes, so a shrink on reopen permanently loses the
+seam. `FileHistoryArchive` keeps its own live window and reconciles through
+`stableOverlap`; a custom archive must do the same (or equivalent) and must treat
+a capture narrower than the prior live window as a **shrink to reconcile**, not
+as a repaint that discards the middle.
+
+#### Two kinds of missing rows, one label
+
+Rows can go missing in two unrelated ways, and only one of them is labelled.
+When **client retention** evicts a span, the boundary carries `data-gap-rows`, a
+`.mtv-gap-marker` element, and the accessible label `N rows dropped before this
+row`. When the **server** delivers a live window that does not abut its own
+archive, the client has no structural way to know rows are absent and renders
+the boundary as two ordinary adjacent rows unless the host embeds a visible
+marker in the archived text. Do not read the absence of a gap marker as proof
+that history is contiguous.
+
+#### Client retention budgets and what the user sees at the ceiling
+
+`TermView` retains at most 10,000 rows or ~8 MiB of history, whichever fills
+first, and once the budget is full it stops requesting older pages entirely —
+it does not evict older rows to make room for more. The budget is not
+configurable through props. **The stop is not signposted.** The oldest retained
+row renders like any other row: no marker distinguishing "beginning of the
+session" from "client stopped asking". Hosts exposing deeper scrollback should
+render their own end-of-buffer affordance.
+
+#### `TmuxWsMux` mutates the tmux session's `history-limit`
+
+After a successful archive seed, the mux calls
+`driver.setSessionHistoryLimit(session, liveLineLimit)`, permanently lowering
+that tmux session's own scrollback to the live-window size. This is deliberate —
+the archive becomes the durable history and tmux keeps only a working window —
+but it is destructive and is not reversed when the archive is deleted. Any host
+tooling that reads deep scrollback straight from tmux (`capture-pane -S -`) for
+the same session must be sized against `liveLineLimit`, not against the tmux
+global.
+
 #### `sessions_subscribe` idempotency
 
 `TmuxWsMux.subscribeSessions(ws)` stores subscribers in a `Set`. Subscribing the

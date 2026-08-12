@@ -5,9 +5,23 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 
 ## v0.15.2 — 2026-08-12
 
-Documentation-led patch: one additive S-tier option, and four host-facing gaps
-that only showed up when a consumer had to measure behavior the package never
-wrote down. No runtime change for hosts that pass nothing.
+Documentation-led patch plus a **data-loss fix** at the archive/live seam.
+One additive S-tier option; four host-facing doc gaps; and a subscribe/resize
+capture-depth correction that stops multi-hundred-line silent history holes on
+every reopen.
+
+### Fixed
+
+- **Reopen live capture depth after archive seed** (`TmuxWsMux`) — once a
+  session is archive-seeded, subscribe and resize captures use the full
+  `liveLineLimit` window (`DEFAULT_CAPTURE_START_LINE`), not the short
+  first-paint bootstrap (`INITIAL = -min(250, liveLineLimit)`). The short
+  window did not abut the archive boundary (`total − liveLineLimit`), so hosts
+  that only reconcile when the mux still held `previousContent` permanently
+  lost the middle (measured: **710 lines** every reopen on a 6 000-line
+  session with `liveLineLimit=1000`). `history_expand` cannot invent those
+  rows. Documented in `docs/protocol.md` under "Live-window bootstrap and the
+  archive boundary".
 
 ### Added
 

@@ -434,12 +434,16 @@ export class TmuxWsMux<
       // capture window and make terminal scrolling feel truncated.
       this.captureStartLines.set(session, this.DEFAULT_CAPTURE_START_LINE);
     } else if (!resizeCapturePending) {
-      // With a real archive, a reopened session can bootstrap from a small live
-      // window because older lines remain available through history_expand.
-      // Without one, a completed seed is the only durable indication that this
-      // session should reopen directly at the normal live depth.
-      const canExpandFromArchive = profile.archive && this.archive !== null;
-      const startLine = this.archiveSeeded.has(session) && !canExpandFromArchive
+      // After a successful seed, always reopen at the full live-window depth.
+      // A narrow bootstrap (INITIAL = -min(250, liveLineLimit)) does not abut
+      // the archive boundary (archive ends at total−liveLineLimit; bootstrap
+      // begins near total−250−paneRows). Hosts that only reconcile when the mux
+      // still holds previousContent — which dropSessionState clears on the last
+      // unsubscribe — permanently lose the rows in between. history_expand only
+      // returns what was archived; it cannot invent the missing seam.
+      // Before the seed completes, keep the small initial window for the first
+      // paint; the full-history capture path ignores captureStartLines anyway.
+      const startLine = this.archiveSeeded.has(session)
         ? this.DEFAULT_CAPTURE_START_LINE
         : this.INITIAL_CAPTURE_START_LINE;
       this.captureStartLines.set(session, startLine);
@@ -1369,7 +1373,14 @@ export class TmuxWsMux<
       for (const viewer of this.subscribers.get(session) ?? []) {
         this.requireResetOutput(session, viewer, "resize");
       }
-      this.captureStartLines.set(session, this.INITIAL_CAPTURE_START_LINE);
+      // Same contract as subscribe: a post-seed capture must stay at live depth
+      // so the archive/live seam cannot open on a geometry reflow either.
+      this.captureStartLines.set(
+        session,
+        this.archiveSeeded.has(session)
+          ? this.DEFAULT_CAPTURE_START_LINE
+          : this.INITIAL_CAPTURE_START_LINE,
+      );
       this.queueCapture(session, { fullHistory: false });
       this.refreshSessionListSchedule();
     } catch (e: any) {
