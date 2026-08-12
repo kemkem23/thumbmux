@@ -75,15 +75,23 @@ export function capturePane(session: string, startLine = -5000): string {
   return dockerExec(`tmux capture-pane -t ${shellQuote(session)} -p -S ${startLine}`, 20_000);
 }
 
-export function demoUrlForSession(session: string): string {
+export function demoUrlForSession(
+  session: string,
+  extras?: { composerMode?: 'compose' | 'direct' },
+): string {
   if (!process.env.DEMO_URL) throw new Error('DEMO_URL is required');
   const url = new URL(process.env.DEMO_URL);
   url.searchParams.set('session', session);
+  if (extras?.composerMode) url.searchParams.set('composerMode', extras.composerMode);
   return url.toString();
 }
 
-export async function openSession(page: Page, session: string) {
-  await page.goto(demoUrlForSession(session), { waitUntil: 'domcontentloaded' });
+export async function openSession(
+  page: Page,
+  session: string,
+  extras?: { composerMode?: 'compose' | 'direct' },
+) {
+  await page.goto(demoUrlForSession(session, extras), { waitUntil: 'domcontentloaded' });
   const mtv = page.getByTestId('mtv');
   await expect(mtv).toBeVisible();
   await expect.poll(() => dataTotal(page), { timeout: 20_000 }).toBeGreaterThan(0);

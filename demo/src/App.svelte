@@ -32,6 +32,12 @@
     const value = Number(new URL(window.location.href).searchParams.get('gridDelayMs') ?? 0);
     return Number.isFinite(value) ? Math.max(0, Math.min(2_000, value)) : 0;
   })();
+  // e2e / dogfooding: ?composerMode=direct|compose seeds SessionView's mount
+  // default. Omitted = package stock ('compose'). Not a prefs-persisted value.
+  const composerModeParam = (() => {
+    const raw = new URL(window.location.href).searchParams.get('composerMode');
+    return raw === 'direct' || raw === 'compose' ? raw : undefined;
+  })();
 
   let bg = $state(DARK_BG);
   let altScreenSessions = $state<Record<string, boolean>>({});
@@ -134,6 +140,9 @@
           ?? demoSessionMetadataFromName(session)?.altScreenMouse
           ?? false,
       }),
+      ...(composerModeParam
+        ? { sessionPresentation: { composerMode: composerModeParam } }
+        : {}),
       theme: {
         defaultBg: DARK_BG, swatches: THEME_SWATCHES, storageKey: PREFS_KEY,
         surfaceFor: () => surface,
