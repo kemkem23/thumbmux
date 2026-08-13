@@ -167,14 +167,12 @@
   const useSgrMouse = $derived(
     canRouteSgr && (resolvedScreen != null ? resolvedScreen.mouseSgr : altScreenMouse),
   );
-  /** Alternate screen has no scrollback — suppress history expand/prepend. */
+  /** Alternate screen has no scrollback — suppress history expand/prepend.
+   * Unknown screen (no sample yet, no explicit prop) is treated as **normal**
+   * — asking is harmless; blocking until a sample arrives silently killed
+   * history for every host that never populates `screen` (34f7afe regression). */
   const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
-  /**
-   * Until the first screen sample (or an explicit `screen` prop) arrives we do
-   * not know whether the pane is alternate-screen. Expanding history in that
-   * window once produced a stale-archive prepend for session names reused after
-   * an alt-screen incarnation. Wait for a known mode before asking.
-   */
+  /** Diagnostic only: a sample or explicit prop has arrived. Never a request gate. */
   const screenModeKnown = $derived(screen !== undefined || liveScreenSeen);
 
   const LINE_RATIO = 1.6;
@@ -1558,10 +1556,10 @@
   }
 
   function requestOlderHistory(): boolean {
-    // Wait for the first screen sample (or an explicit `screen` prop) so a
-    // reused session name cannot pull a stale archive while still alternate.
-    if (!screenModeKnown) return false;
-    // Alternate screen has no scrollback — never expand history into it.
+    // Unknown screen → treat as normal (has scrollback). Only a *known*
+    // alternate screen suppresses expand. 0.15.2 discarded a late alt reply
+    // (one wasted RT); refusing to ask until a sample arrived made history
+    // stop for every host that never sends `screen`.
     if (noScrollback) return false;
     if (archiveLoading || archiveExhausted) return false;
     if (atRetentionBudget()) {
@@ -2935,6 +2933,42 @@
     settledBottomOffsetPx = 0;
   }
 
+  /**
+   * Alternate screen has no tmux scrollback. If we speculatively prepended
+   * while mode was unknown (or the pane just entered alt), drop archived
+   * rows so a reused session name cannot keep a stale archive on screen.
+   * Live pane content stays.
+   */
+  function discardArchiveForAltScreen(): void {
+    cancelScheduledPrependWork();
+    pendingPrependWork = null;
+    prependParseSeq++;
+    if (archivedLines.length === 0) return;
+    archivedLines = [];
+    rawLines = liveLines.slice();
+    archiveOffset = ARCHIVE_OFFSET_START;
+    archiveBeforeLine = null;
+    archiveExhausted = false;
+    historyStopReason = 'none';
+    archivedRetentionGaps = new Map();
+    liveGapEntryState = null;
+    clearRetentionGap();
+    htmlCache = new Map();
+    renderEntryStates = new Map();
+    rawEntryState = createSgrState();
+    rebuildAllLinks();
+    rebuildFrom(0);
+    total = rawLines.length;
+    recalculateRetainedEstimatedBytes();
+    bottomOffsetPx = 0;
+    rebuildWindow(visibleRowRange(0), true);
+    contentEpoch++;
+    renderEpoch++;
+    applyScroll();
+    emitScrollState();
+    settledBottomOffsetPx = 0;
+  }
+
   /** Oldest retained rows are in the virtual window — show the ceiling note. */
   let showHistoryCeiling = $derived(
     historyStopReason === 'ceiling' && winStart === 0 && !noScrollback,
@@ -2947,10 +2981,17 @@
     if (!screenAltObserved) {
       screenAltObserved = true;
       lastScreenAlt = alt;
+      // First sample is not a "flip", but if it is alt we may already have
+      // prepended a stale archive while mode was unknown — drop it.
+      if (alt) {
+        discardArchiveForAltScreen();
+        resetScrollForScreenMode();
+      }
       return;
     }
     if (alt === lastScreenAlt) return;
     lastScreenAlt = alt;
+    if (alt) discardArchiveForAltScreen();
     resetScrollForScreenMode();
   });
 

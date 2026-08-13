@@ -22,10 +22,13 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 - **Alternate-screen scroll looked like a frozen terminal (D5)** — rubber-band
   only, no explanation. Affects every `grok-*` and fullscreen Claude Code
   session. Package now shows “Alternate screen · no scrollback”.
-- **One `history_expand` before the first `screen` sample** — mode unknown was
-  treated as “has scrollback”; a reused session name after alt-screen could
-  pull a stale archive (reply discarded, still a wrong request). Expansion now
-  waits until `screen` is known (prop or first wire sample).
+- **One `history_expand` before the first `screen` sample** — a reused name
+  after alt-screen can pull a stale archive. Unknown mode is treated as
+  **normal** (asking is harmless); a late reply is discarded once `screen.alt`
+  is known, and a prepend that landed while unknown is dropped when the first
+  sample is alt. (34f7afe blocked *every* expand until a sample arrived and
+  silently killed history for hosts that never send `screen` — reverted that
+  gate.)
 
 ### Added
 

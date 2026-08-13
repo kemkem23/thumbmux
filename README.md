@@ -82,8 +82,9 @@ session; the true server end-of-archive is not. When client retention drops a
 span, its boundary is labelled `N rows dropped`; the label is presentation
 chrome, not terminal text. Alternate-screen panes (`screen.alt`) have no
 scrollback at all — TermView shows “Alternate screen · no scrollback” and
-suppresses history expansion (including before the first screen sample
-arrives). These client budgets are separate from `FileHistoryArchive.maxLines`
+suppresses history expansion once alt is known. Unknown mode is treated as
+normal (asking still happens); a prepend that landed while unknown is
+dropped when the first sample is alt. These client budgets are separate from `FileHistoryArchive.maxLines`
 and are not currently configurable through TermView props. When the pane width
 changes, the live window reflows
 from tmux and arrives as a full reset; archived rows deliberately keep their

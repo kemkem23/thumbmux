@@ -217,10 +217,11 @@ rubber-band movement. The component renders a compact `role="note"` banner
 `data-no-scrollback="1"`) so the surface is not mistaken for a frozen terminal.
 Hosts may still add their own chrome; the package note is the minimum so every
 `grok-*` / fullscreen Claude Code surface explains itself without host glue.
-History expansion also waits for the first `meta.screen` sample (or an
-explicit `screen` prop) before asking — a request issued while mode is unknown
-can hit a stale archive for a session name reused after an alt-screen
-incarnation.
+Unknown screen mode (no sample yet, no explicit `screen` prop) is treated as
+**normal** — `history_expand` still fires, because blocking until a sample
+arrives silently killed history for every host that never populates `screen`.
+A late reply is discarded once `screen.alt` is known; a prepend that landed
+while mode was unknown is dropped when the first sample (or a flip) is alt.
 
 v0.3.1 note: `TermView` owns touch forwarding under `altScreenMouse=true`.
 Hosts should not capture touch gestures for SGR forwarding; links, selection,

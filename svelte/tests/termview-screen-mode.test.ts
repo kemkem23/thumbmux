@@ -540,9 +540,9 @@ describe("TermView screen prop — alt scrollback", () => {
     expect(historyCalls).toHaveLength(0);
   });
 
-  test("omitted screen prop does not request history until the first wire sample", async () => {
-    // screen: undefined (prop omitted) — wait for meta.screen before expand so a
-    // reused session name cannot pull a stale archive while still alternate.
+  test("omitted screen prop still requests history (unknown = normal)", async () => {
+    // Hosts that never populate `screen` must keep loading older rows.
+    // 34f7afe gated every expand on a sample and silently killed history.
     const { viewport } = mountTermView({ screen: undefined });
     await tick();
     deliverOutput(80);
@@ -552,28 +552,54 @@ describe("TermView screen prop — alt scrollback", () => {
     expect(viewport.getAttribute("data-screen-mode-known")).toBeNull();
     historyCalls = [];
     wheelTowardHistory(viewport);
-    expect(historyCalls).toHaveLength(0);
+    expect(historyCalls.length).toBeGreaterThan(0);
+  });
 
-    // First delivery with screen meta unlocks normal history expand.
+  test("history prepended while screen is unknown is dropped when first sample is alt", async () => {
+    const { viewport } = mountTermView({ screen: undefined });
+    await tick();
+    deliverOutput(80);
+    await tick();
+    flushSync();
+
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls.length).toBeGreaterThan(0);
+    const liveOnly = totalRows(viewport);
+
+    deliverHistory(
+      Array.from({ length: 30 }, (_, i) => `stale-archive-${i}`),
+      { startLine: 0, hasMore: false },
+    );
+    for (let i = 0; i < 40; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      drainAnimationFrames();
+      await tick();
+      if (totalRows(viewport) > liveOnly) break;
+    }
+    expect(totalRows(viewport)).toBeGreaterThan(liveOnly);
+
+    // First screen sample is alt — drop the speculative prepend.
     if (!sessionCallback) throw new Error("subscribe was not invoked");
     sessionCallback(
-      Array.from({ length: 80 }, (_, i) => `line-${i}`).join("\n"),
+      Array.from({ length: 40 }, (_, i) => `alt-pane-${i}`).join("\n"),
       "output",
       null,
       {
         source: "full",
         replace: true,
-        screen: { alt: false, mouseSgr: false, mouseAny: false },
+        screen: { alt: true, mouseSgr: false, mouseAny: false },
       },
     );
     await tick();
     flushSync();
     drainAnimationFrames();
 
-    expect(viewport.getAttribute("data-screen-mode-known")).toBe("1");
+    expect(viewport.getAttribute("data-no-scrollback")).toBe("1");
+    expect(viewport.textContent ?? "").not.toMatch(/stale-archive-/);
     historyCalls = [];
     wheelTowardHistory(viewport);
-    expect(historyCalls.length).toBeGreaterThan(0);
+    expect(historyCalls).toHaveLength(0);
   });
 });
 
