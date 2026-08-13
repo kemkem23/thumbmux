@@ -227,7 +227,11 @@ stored value outside the current bounds is **clamped** into range — never
 silently ignored (the 0.15.2 defect was a bare-literal 11–18 clamp that dropped
 out-of-band preferences and left the default on screen). Stock step is
 graduated (1px below 20, 2px to 32, 4px above); a host that wants a different
-step replaces `font-up` / `font-down` via `sessionPresentation.actions`. Pure
+step replaces `font-up` / `font-down` via `sessionPresentation.actions`. A
+metadata-only spread of a stock action (same `id`, same `onTap` reference)
+keeps the stock dismiss policy — A+/A− leave the FAB open; rebinding `onTap`
+or introducing a new `id` closes the FAB first. Stock testids:
+`demo-font-up` / `demo-font-down`. Pure
 helpers `resolveFontBounds`, `clampFontPx`, `stepFontPx` and the stock constants
 `DEFAULT_FONT_PX` / `DEFAULT_FONT_PX_MIN` / `DEFAULT_FONT_PX_MAX` are exported
 from `thumbmux/app` so a host store can share the same ladder.

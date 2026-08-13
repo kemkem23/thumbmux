@@ -534,12 +534,15 @@
       {
         id: 'font-up',
         label: labels.actionFontUp,
+        testid: 'demo-font-up',
         // Graduated step then clamp — see stepFontPx / fontPxMin / fontPxMax.
+        // Deliberately does NOT close the FAB: size is adjusted by repeated taps.
         onTap: () => setFont(stepFontPx(storedFontPx, 1)),
       },
       {
         id: 'font-down',
         label: labels.actionFontDown,
+        testid: 'demo-font-down',
         onTap: () => setFont(stepFontPx(storedFontPx, -1)),
       },
     );
@@ -549,10 +552,23 @@
     const compose = adapters.sessionPresentation?.actions;
     if (!compose) return defaults;
 
-    const defaultActions = new Set(defaults);
-    return compose(session, actionContext, defaults).map((action) => (
-      defaultActions.has(action) ? action : dismissingHostAction(action)
-    ));
+    // Stock vs host is NOT pure object identity. A host that only patches
+    // label/testid (`{ ...stockFontUp, testid: 'slot-font-up' }`) must keep the
+    // stock dismiss policy — font-up stays open for repeated taps. Pure
+    // identity treated every spread as a host action and wrapped it so the
+    // menu closed on first tap (kemcortex 08-13: adding testid alone turned
+    // A+/A− into menu-closing buttons). Rule:
+    //   1. default entry by identity → already final (stock or pre-wrapped extra)
+    //   2. same id as stock AND same onTap reference → metadata-only patch, keep open
+    //   3. otherwise → host action, close FAB then run
+    const defaultByIdentity = new Set(defaults);
+    const stockById = new Map(stock.map((action) => [action.id, action]));
+    return compose(session, actionContext, defaults).map((action) => {
+      if (defaultByIdentity.has(action)) return action;
+      const stockAction = stockById.get(action.id);
+      if (stockAction && action.onTap === stockAction.onTap) return action;
+      return dismissingHostAction(action);
+    });
   });
 
   let noteRequest = 0;

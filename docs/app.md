@@ -280,6 +280,30 @@ void sessionPresentation;
 void nextUp;
 ```
 
+**Stock A+/A− keep the FAB open** after a tap (so a thumb can step the size
+without reopening the menu). Host actions and `extraActions` close it first.
+
+**How the shell tells stock from host after `sessionPresentation.actions`:**
+
+| What the compose callback returns | FAB after tap |
+| --- | --- |
+| A default entry **by identity** (including pre-wrapped `extraActions`) | Stock / already-wrapped policy kept |
+| Same `id` as a stock action **and** the same `onTap` reference (metadata-only spread: `testid`, `label`, …) | Stock policy kept — menu stays open for font-up/down |
+| Same `id` but a **new** `onTap`, or any unknown `id` | Host policy — menu closes, then `onTap` runs |
+
+Through 0.15.5 the rule was pure object identity: `{ ...fontUp, testid: "…" }`
+was treated as a host action and closed the menu on first tap. Prefer the
+stock testids (`demo-font-up` / `demo-font-down`) or a metadata-only patch.
+
+**Probing A+/A− in a browser:** closed slots stay mounted for the open
+animation. They have `opacity: 0`, `pointer-events: none`, `disabled`, and a
+non-zero `getBoundingClientRect()` from `transform: scale(0.92)` (about
+141.7×42.3 on a 390-wide phone). Coordinate taps at those numbers hit the
+terminal underneath and look exactly like "onTap never fires / no prefs
+write". Always assert `.slots.open` and `!button.disabled` (or click
+`[data-testid="demo-font-up"]` only while the slots container has class
+`open`) before measuring.
+
 **`EmbedView` does not read these bounds.** It has no A+/A− chrome; size is only the explicit `fontPx` prop (or `termProps().fontPx`).
 
 **Two host mechanisms can disagree.** A host that keeps its own font store (e.g. a desktop header `A+/A−` writing `localStorage`) and also mounts `SessionView` with the stock FAB will have two independent sizes unless it either (a) feeds the store into `termProps().fontPx` and drives A+/A− through that store via `sessionPresentation.actions`, or (b) drops the host store on the phone surface and lets package prefs be the single source of truth. Passing `fontPxMin`/`fontPxMax` alone only aligns the *bounds*, not the *value*.

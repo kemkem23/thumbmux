@@ -3,6 +3,23 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.15.5-dist`.
 
+## Unreleased
+
+### Fixed
+
+- **`sessionPresentation.actions` treated every spread of a stock action as a
+  host action** — pure object identity decided whether the shell wraps `onTap`
+  to close the FAB first. A host that only added `testid` (or relabelled)
+  `{ ...fontUp, testid: "slot-font-up" }` lost the stock "keep menu open"
+  policy on A+/A−, so the first tap closed the list. Rule is now: default
+  entry by identity, **or** same stock `id` with the **same `onTap` reference**
+  (metadata-only patch), keeps stock policy; a rebound `onTap` or unknown id
+  still closes the menu. Stock A+/A− also ship `demo-font-up` /
+  `demo-font-down` testids. Docs: closed slots keep a non-zero
+  `getBoundingClientRect` under `scale(0.92)` — probes must assert
+  `.slots.open` before coordinate-tapping or they hit the terminal and look
+  like onTap never ran.
+
 ## v0.15.5 — 2026-08-13
 
 ### Fixed

@@ -955,6 +955,84 @@ describe('mountable terminal views', () => {
     expect(slots.classList.contains('open')).toBe(false);
   });
 
+  // Stock A+/A− keep the menu open so a thumb can step the size repeatedly.
+  // A host that only patches testid/label must not flip that policy: pure object
+  // identity used to wrap every spread into dismissingHostAction (08-13).
+  test('metadata-only patch of stock font-up keeps the FAB open and still saves', async () => {
+    let savedFont: number | undefined;
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-testid-patch',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prefs: {
+          load: async () => ({ fontPx: 17 }),
+          save: async (patch) => {
+            if (typeof patch.fontPx === 'number') savedFont = patch.fontPx;
+          },
+        },
+        sessionPresentation: {
+          actions: (_session, _context, defaults) => {
+            const fontUp = defaults.find((action) => action.id === 'font-up');
+            if (!fontUp) throw new Error('stock font-up missing from defaults');
+            // Spread → new object, same onTap reference. Old rule: host action.
+            return [{ ...fontUp, testid: 'slot-font-up' }];
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await tick();
+
+    await openFab(target);
+    const slots = target.querySelector<HTMLElement>('.slots');
+    const button = target.querySelector<HTMLButtonElement>('[data-testid="slot-font-up"]');
+    if (!slots || !button) throw new Error('patched font-up did not render');
+    expect(slots.classList.contains('open')).toBe(true);
+
+    flushSync(() => button.click());
+    await tick();
+    expect(savedFont).toBe(18);
+    // Menu stays open — that is the whole point of not wrapping stock onTap.
+    expect(slots.classList.contains('open')).toBe(true);
+
+    flushSync(() => button.click());
+    await tick();
+    expect(savedFont).toBe(19);
+    expect(slots.classList.contains('open')).toBe(true);
+  });
+
+  test('rebinding stock font-up onTap is treated as a host action and closes the FAB', async () => {
+    let calls = 0;
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-rebind',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sessionPresentation: {
+          actions: (_session, _context, defaults) => {
+            const fontUp = defaults.find((action) => action.id === 'font-up');
+            if (!fontUp) throw new Error('stock font-up missing from defaults');
+            return [{
+              ...fontUp,
+              testid: 'host-font-up',
+              onTap: () => { calls += 1; },
+            }];
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    await openFab(target);
+    const slots = target.querySelector<HTMLElement>('.slots');
+    const button = target.querySelector<HTMLButtonElement>('[data-testid="host-font-up"]');
+    if (!slots || !button) throw new Error('rebound font-up did not render');
+
+    flushSync(() => button.click());
+    await tick();
+    expect(calls).toBe(1);
+    expect(slots.classList.contains('open')).toBe(false);
+  });
+
   test('host can replace and reorder the complete FAB action list', async () => {
     let defaultIds: string[] = [];
     let presetCalls = 0;
