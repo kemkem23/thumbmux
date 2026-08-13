@@ -38,6 +38,15 @@
     const raw = new URL(window.location.href).searchParams.get('composerMode');
     return raw === 'direct' || raw === 'compose' ? raw : undefined;
   })();
+  // e2e / dogfooding: ?dpadPlacement=top-right|… seeds the ✛ pad corner.
+  // Omitted = package stock bottom-left. Not prefs-persisted.
+  const dpadPlacementParam = (() => {
+    const raw = new URL(window.location.href).searchParams.get('dpadPlacement');
+    return raw === 'bottom-left' || raw === 'bottom-right'
+      || raw === 'top-left' || raw === 'top-right'
+      ? raw
+      : undefined;
+  })();
 
   let bg = $state(DARK_BG);
   let altScreenSessions = $state<Record<string, boolean>>({});
@@ -140,8 +149,13 @@
           ?? demoSessionMetadataFromName(session)?.altScreenMouse
           ?? false,
       }),
-      ...(composerModeParam
-        ? { sessionPresentation: { composerMode: composerModeParam } }
+      ...((composerModeParam || dpadPlacementParam)
+        ? {
+            sessionPresentation: {
+              ...(composerModeParam ? { composerMode: composerModeParam } : {}),
+              ...(dpadPlacementParam ? { dpadPlacement: dpadPlacementParam } : {}),
+            },
+          }
         : {}),
       theme: {
         defaultBg: DARK_BG, swatches: THEME_SWATCHES, storageKey: PREFS_KEY,

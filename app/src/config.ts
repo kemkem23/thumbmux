@@ -104,6 +104,20 @@ export interface SessionPresentationOptions {
    * **40**. See `fontPxMin` for clamp / step / host-override semantics.
    */
   fontPxMax?: number;
+  /**
+   * Stage corner for the stock ✛ arrow pad (`DpadSheet`). Defaults to
+   * `'bottom-left'`, which is where the pad has always rendered.
+   *
+   * On a phone the bottom-left is where the newest output is — exactly what
+   * the user is reading when they open the pad. Hosts that want the pad off
+   * the live tail pass `'top-right'` (or another corner). Every corner
+   * respects `env(safe-area-inset-*)` (notch / home indicator); Playwright
+   * always reads `env()` as 0, so safe-area clearance is a device check.
+   *
+   * Values: `'bottom-left' | 'bottom-right' | 'top-left' | 'top-right'`.
+   * Unknown values fall back to the stock default.
+   */
+  dpadPlacement?: 'bottom-left' | 'bottom-right' | 'top-left' | 'top-right';
 }
 
 /** Host-owned behavior and policy seams for the mountable application shell. */

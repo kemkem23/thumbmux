@@ -43,6 +43,12 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 - **History-ceiling signpost** — `.mtv-history-ceiling` / `data-history-ceiling`,
   `data-history-stop="ceiling"|"exhausted"|"none"`.
 - **No-scrollback signpost** — `.mtv-no-scrollback` / `data-no-scrollback`.
+- **`SessionPresentationOptions.dpadPlacement?`** (app, tier S) + matching
+  `DpadSheet.placement` prop — stage corner for the ✛ arrow pad. Stock default
+  remains **`bottom-left`** (no silent move for existing hosts). Values:
+  `'bottom-left' | 'bottom-right' | 'top-left' | 'top-right'`. Every corner
+  clears `env(safe-area-inset-*)` on that edge. Host example:
+  `sessionPresentation: { dpadPlacement: 'top-right' }`.
 
 ### Documented
 
@@ -54,6 +60,8 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 - Client retention ceiling UX and alternate-screen scrollback note —
   `docs/protocol.md`, `docs/desktop.md` §5, README history paragraph (replaces
   the audit G2/G5 “not signposted” prose).
+- Dpad corner option, default, four values, safe-area behaviour —
+  `docs/app.md`, `CONTRACT.md`, JSDoc on `dpadPlacement` / `DpadSheet.placement`.
 
 ## v0.15.2 — 2026-08-12
 

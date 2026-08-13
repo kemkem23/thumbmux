@@ -108,15 +108,15 @@
     "tier": "F"
   },
   {
-    "name": "ContentLinesChangeSource",
-    "kind": "type",
-    "signature": "dcd3817fec8f8751cf4c89edbea683b6b77f9699155811049626f884e55f22cf",
-    "tier": "X"
-  },
-  {
     "name": "contentLinesChangeSource",
     "kind": "value",
     "signature": "e25a6915170749b17983c0a4775eb1fadd2372080c9793920912cfa4c9c446bc",
+    "tier": "X"
+  },
+  {
+    "name": "ContentLinesChangeSource",
+    "kind": "type",
+    "signature": "dcd3817fec8f8751cf4c89edbea683b6b77f9699155811049626f884e55f22cf",
     "tier": "X"
   },
   {
@@ -192,6 +192,12 @@
     "tier": "F"
   },
   {
+    "name": "DEFAULT_DPAD_PLACEMENT",
+    "kind": "value",
+    "signature": "25c2e83c9c6093a41cb9c433fa5811879676c15cde87d9c6887f497a029deb76",
+    "tier": "S"
+  },
+  {
     "name": "deriveThumbnailPalette",
     "kind": "value",
     "signature": "fb10b7a5688cfaaa86825e86fa03644829c4ebf95a0e21e321f14f468e43d42c",
@@ -222,9 +228,15 @@
     "tier": "S"
   },
   {
+    "name": "DpadPlacement",
+    "kind": "type",
+    "signature": "0778195521251da9b41b17f894392e6ac5e5b33338893bc33569b8babb38286a",
+    "tier": "S"
+  },
+  {
     "name": "DpadSheet",
     "kind": "component",
-    "signature": "8478de8dfd787418acd2e7395db1b4e2913bee37639933381eb0d0150f2988b0",
+    "signature": "17fee541836db9705554aa9bc2c82e05e2f20c9dd6ebbfe31bc35d61c8390849",
     "tier": "F"
   },
   {
@@ -612,6 +624,12 @@
     "tier": "S"
   },
   {
+    "name": "resolveDpadPlacement",
+    "kind": "value",
+    "signature": "986540a5aa6f619e37659549c30ac9fd71e4c640b33c21e295a71fc5f02cfcc5",
+    "tier": "S"
+  },
+  {
     "name": "resolveNotificationEnvironment",
     "kind": "value",
     "signature": "7d06b76f64856fdab1d6217a0defe5577a6b467c6a09b055687237d59979f4a9",
@@ -660,16 +678,16 @@
     "tier": "X"
   },
   {
-    "name": "SearchKeyIntent",
-    "kind": "type",
-    "signature": "56e145ee22924f0fe4d2be914be052a79341977f99bcad5b727ce6fa3224d065",
-    "tier": "X"
-  },
-  {
     "name": "searchKeyIntent",
     "kind": "value",
     "signature": "0535791c9d3ce4495797d58c77367157ec5b64cedc988df24f4450ca81386c9a",
     "tier": "S"
+  },
+  {
+    "name": "SearchKeyIntent",
+    "kind": "type",
+    "signature": "56e145ee22924f0fe4d2be914be052a79341977f99bcad5b727ce6fa3224d065",
+    "tier": "X"
   },
   {
     "name": "SearchKeyScope",
@@ -786,15 +804,15 @@
     "tier": "F"
   },
   {
-    "name": "TmuxMux",
-    "kind": "value",
-    "signature": "012f1c80792491d086e729516a96c0819b6b97e38df91bb974ce787a4b0d9665",
-    "tier": "F"
-  },
-  {
     "name": "tmuxMux",
     "kind": "value",
     "signature": "81286229e23d5c640da73e546dbe1f7c92856c36cbbca21c7d38a91c168f68db",
+    "tier": "F"
+  },
+  {
+    "name": "TmuxMux",
+    "kind": "value",
+    "signature": "012f1c80792491d086e729516a96c0819b6b97e38df91bb974ce787a4b0d9665",
     "tier": "F"
   },
   {

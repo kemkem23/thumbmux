@@ -230,9 +230,17 @@ graduated (1px below 20, 2px to 32, 4px above); a host that wants a different
 step replaces `font-up` / `font-down` via `sessionPresentation.actions`. Pure
 helpers `resolveFontBounds`, `clampFontPx`, `stepFontPx` and the stock constants
 `DEFAULT_FONT_PX` / `DEFAULT_FONT_PX_MIN` / `DEFAULT_FONT_PX_MAX` are exported
-from `thumbmux/app` so a host store can share the same ladder. `EmbedView` does
-not read `sessionPresentation` (composer stays hardcoded COMPOSE; font is only
-its explicit `fontPx` prop). Copy does not get a second policy adapter: the
+from `thumbmux/app` so a host store can share the same ladder.
+`dpadPlacement` (optional, stock default **`bottom-left`**) chooses the stage
+corner for the stock ✛ `DpadSheet`: `'bottom-left' | 'bottom-right' |
+'top-left' | 'top-right'`. Through 0.15.2 the pad was a bare CSS
+`left/bottom` with no prop — on a phone bottom-left covers the live tail. The
+default stays bottom-left so existing hosts do not see a silent move; hosts
+that want the pad off the newest output pass `'top-right'` (or another corner).
+Every corner uses `env(safe-area-inset-*)` for that edge (Playwright reads
+`env()` as 0 — device check only). `EmbedView` does not read
+`sessionPresentation` (composer stays hardcoded COMPOSE; font is only its
+explicit `fontPx` prop; no dpad). Copy does not get a second policy adapter: the
 opt-in action transformer receives optional `SessionActionContext.copyAll`
 (whole-buffer, ignores selection), while legacy `extraActions` keeps its
 original two-member runtime context and the untouched stock copy action remains

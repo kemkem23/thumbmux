@@ -26,6 +26,11 @@ export {
 export { default as ComposerDock, type ComposerLabels } from './ComposerDock.svelte';
 export { default as TermHud } from './TermHud.svelte';
 export { default as DpadSheet } from './DpadSheet.svelte';
+export {
+  DEFAULT_DPAD_PLACEMENT,
+  resolveDpadPlacement,
+  type DpadPlacement,
+} from './dpad';
 export { default as ThemeSheet } from './ThemeSheet.svelte';
 export { default as ActionFab, type FabAction } from './ActionFab.svelte';
 export { tmuxMux, configureTmuxMux, TmuxMux, type TmuxMuxOptions } from './ws-mux.svelte';

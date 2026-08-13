@@ -153,6 +153,7 @@
   let promptsCollapsible = $derived(adapters.sessionPresentation?.promptsCollapsible ?? false);
   let promptsInitiallyOpen = $derived(adapters.sessionPresentation?.promptsInitiallyOpen ?? false);
   let extraPanelOnTop = $derived(adapters.sessionPresentation?.extraPanelPlacement === 'top');
+  let dpadPlacement = $derived(adapters.sessionPresentation?.dpadPlacement);
   let controlInset = $derived(Math.max(
     showShortcutBar ? shortcutBarHeight : 0,
     scrollControlsHeight,
@@ -779,7 +780,7 @@
     {onFab}
     fabAria={labels.fabAria}
   />
-  <DpadSheet bind:open={dpadOpen} onKey={sendKeys} />
+  <DpadSheet bind:open={dpadOpen} onKey={sendKeys} placement={dpadPlacement} />
   <ThemeSheet
     bind:open={overlay.themeOpen}
     bind:customBg

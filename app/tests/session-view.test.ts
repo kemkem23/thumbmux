@@ -1534,6 +1534,52 @@ describe('mountable terminal views', () => {
     expect(noteText.textContent).toBe('new note');
   });
 
+  test('sessionPresentation.dpadPlacement opens the pad in the host corner', async () => {
+    const keys: string[] = [];
+    const { target } = mountView(SessionView, {
+      session: 'sh-dpad-corner',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sendKeys: (_session, data) => { keys.push(data); },
+        sessionPresentation: { dpadPlacement: 'top-right' },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    await openFab(target);
+    const dpad = Array.from(target.querySelectorAll<HTMLButtonElement>('.slots .slot'))
+      .find((button) => (button.textContent ?? '').includes('Arrows'));
+    if (!dpad) throw new Error('dpad action missing');
+    flushSync(() => dpad.click());
+    await tick();
+
+    const pad = target.querySelector<HTMLElement>('[data-testid="dpad-sheet"]');
+    expect(pad).not.toBeNull();
+    expect(pad?.getAttribute('data-placement')).toBe('top-right');
+
+    flushSync(() => {
+      target.querySelector<HTMLButtonElement>('[data-testid="dpad-up"]')?.click();
+    });
+    expect(keys).toContain('\x1b[A');
+  });
+
+  test('omitted dpadPlacement keeps the stock bottom-left default', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-dpad-default',
+      adapters: { termProps: () => ({ claimGeometry: false }) } satisfies AppAdapters,
+    });
+    await tick();
+    await openFab(target);
+    const dpad = Array.from(target.querySelectorAll<HTMLButtonElement>('.slots .slot'))
+      .find((button) => (button.textContent ?? '').includes('Arrows'));
+    if (!dpad) throw new Error('dpad action missing');
+    flushSync(() => dpad.click());
+    await tick();
+    expect(
+      target.querySelector('[data-testid="dpad-sheet"]')?.getAttribute('data-placement'),
+    ).toBe('bottom-left');
+  });
+
   // sessionPresentation.fontPxMin/Max + stock A+/A− — the 0.15.2 defect was a
   // hard 11–18 clamp with bare literals that silently dropped a stored value
   // outside the band. Stock defaults are now 4–40, host-configurable, clamp
