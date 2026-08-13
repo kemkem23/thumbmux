@@ -2816,11 +2816,37 @@
     tmuxMux.sendResize(session, measured.cols, measured.rows);
   }
 
-  /** Re-measure and re-claim geometry (e.g. after a host font-size change —
-   * glyph resizes don't fire the ResizeObserver). */
-  export function refreshGeometry() {
+  /**
+   * Font-driven pane resize settle window. Rapid A+/A− is ~120–180ms between
+   * taps on a phone thumb; 220ms swallows a burst so Claude Code reprints its
+   * header once. A single deliberate tap still flushes without needing a
+   * second press. Viewport ResizeObserver is not on this timer.
+   */
+  const FONT_RESIZE_SETTLE_MS = 220;
+  let fontResizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingFontResize = false;
+
+  function flushFontResize(): void {
+    if (fontResizeTimer) {
+      clearTimeout(fontResizeTimer);
+      fontResizeTimer = null;
+    }
+    if (!pendingFontResize) return;
+    pendingFontResize = false;
     lastPushedCols = 0;
     pushGeometry({ force: true });
+  }
+
+  function scheduleFontResize(): void {
+    pendingFontResize = true;
+    if (fontResizeTimer) clearTimeout(fontResizeTimer);
+    fontResizeTimer = setTimeout(() => {
+      fontResizeTimer = null;
+      flushFontResize();
+    }, FONT_RESIZE_SETTLE_MS);
+  }
+
+  function refreshVisualLayout(): void {
     if (selectionActive) {
       renderRefreshPending = true;
       return;
@@ -2829,9 +2855,22 @@
     applyScroll();
   }
 
+  /** Re-measure and re-claim geometry immediately (viewport / visibility).
+   * Glyph resizes don't fire the ResizeObserver — those use the font path. */
+  export function refreshGeometry() {
+    lastPushedCols = 0;
+    pushGeometry({ force: true });
+    refreshVisualLayout();
+  }
+
   let lastFontPx: number | null = null;
   $effect(() => {
-    if (lastFontPx !== null && fontPx !== lastFontPx) refreshGeometry();
+    if (lastFontPx !== null && fontPx !== lastFontPx) {
+      // Paint on every tap. Only the tmux resize is deferred — a burst of
+      // A+ must not reprint the agent header N times (BRIEF-H).
+      refreshVisualLayout();
+      scheduleFontResize();
+    }
     lastFontPx = fontPx;
   });
 
@@ -3066,6 +3105,9 @@
   onDestroy(() => {
     // Svelte 5 runs onDestroy during SSR too — guard all browser APIs.
     if (typeof window === 'undefined') return;
+    // Flush a mid-burst font resize so unmount / session switch does not
+    // leave tmux at the previous size (worse than the storm).
+    flushFontResize();
     destroyed = true;
     cancelDeferredFrames();
     stopInertia();

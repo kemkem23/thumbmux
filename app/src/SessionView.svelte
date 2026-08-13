@@ -679,7 +679,7 @@
   style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
 >
   <div class="mtv-host" style:top={`${hudHeight}px`}>
-    {#key `${session}|${surface.tbg}|${resolvedTermProps.fontPx}`}
+    {#key `${session}|${surface.tbg}`}
       {#if isDesktop}
         <DesktopKeys
           bind:focused={desktopKeysFocused}

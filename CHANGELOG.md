@@ -29,6 +29,14 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
   sample is alt. (34f7afe blocked *every* expand until a sample arrived and
   silently killed history for hosts that never send `screen` — reverted that
   gate.)
+- **Font A+/A− resize storm** — every tap called `refreshGeometry()` →
+  `sendResize` with no debounce, and `SessionView` remounted TermView on
+  each `fontPx` (`{#key}` included the size). Claude Code reprints its
+  header on every pane resize, so a burst of taps filled the pane with
+  startup banners. Visual size still updates on every tap; only the tmux
+  resize waits **220ms** after the last font change (fast thumb ~120–180ms
+  apart). ResizeObserver / visibility / mount stay immediate. A pending
+  resize is **flushed** on unmount so the last size is not dropped.
 
 ### Added
 

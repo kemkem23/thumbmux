@@ -442,7 +442,12 @@ type TermViewProps = {
 ```
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
-passes is rendered. The stock A+/A− range (default 4–40, host-overridable via
+passes is rendered immediately. A change of `fontPx` **does not** send a tmux
+resize on every tap — the pane geometry is pushed **220ms after the last
+font change** so a burst of A+/A− produces one `resize` (Claude Code reprints
+its header on every pane resize). Viewport `ResizeObserver`, visibility
+return, and mount still resize immediately. A pending font resize is flushed
+on unmount. The stock A+/A− range (default 4–40, host-overridable via
 `sessionPresentation.fontPxMin` / `fontPxMax`) lives on `SessionView` only —
 see `docs/app.md` "Terminal font size". A desktop host that drives TermView
 directly (no SessionView) owns its own clamp and step.

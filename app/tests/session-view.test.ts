@@ -1585,8 +1585,9 @@ describe('mountable terminal views', () => {
   // outside the band. Stock defaults are now 4–40, host-configurable, clamp
   // (not ignore) on load, graduated step on the FAB actions.
   //
-  // TermView is keyed on fontPx, so each size change remounts it — re-query
-  // the node after every click rather than holding a stale element.
+  // TermView used to remount on every fontPx ({#key} included the size),
+  // which forced a resize per tap. Re-query after each click anyway —
+  // renderEpoch rebuilds the line nodes.
   function renderedFontPx(target: HTMLElement): string {
     const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
     if (!terminal) throw new Error('SessionView did not render TermView');
