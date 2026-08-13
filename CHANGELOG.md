@@ -1,9 +1,28 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.4-dist`.
 
-## Unreleased (v0.15.3 candidates)
+## Unreleased (v0.15.4 candidates)
+
+### Fixed
+
+- **Stored `fontPx` never applied on a cold cache** — `createServerPrefs.load()`
+  returned the localStorage cache immediately (often `{}` or a partial write
+  without `fontPx`) and refreshed the server snapshot in the background. When
+  a *sibling* `createServerPrefs` for the same `cacheKey` finished its GET
+  first, it wrote the equal JSON into localStorage; the later instance then
+  **skipped emit** (`JSON.stringify(fresh) === JSON.stringify(current)`), so
+  its subscribers never ran. `SessionView` only applied the empty/stale
+  `load()` return and stayed on `DEFAULT_FONT_PX` (13). Production
+  measurement (0.15.3, empty cache): `PUT fontPx:30` → open `/m/t` →
+  **13px / `data-last-cols` 47**. After the fix (always emit on a successful
+  in-generation GET): **30px / cols 21**. Hosts that open more than one
+  adapter for the same key (page prefs + a theme side-channel is common)
+  should still prefer a single shared instance; the emit rule is the safety
+  net. See `docs/app.md` prefs row.
+
+## v0.15.3 — 2026-08-13
 
 ### Fixed
 

@@ -5,6 +5,15 @@
  *                        createPrefsHandler) with a localStorage cache so
  *                        first paint never waits on the network and offline
  *                        reads still work; saves are optimistic.
+ *
+ * Multiple `createServerPrefs({ url, cacheKey })` calls are independent
+ * adapters that happen to share the same localStorage key. A successful GET
+ * always notifies *that* adapter's subscribers, even when the cache already
+ * holds an equal snapshot (written by a sibling). Hosts that open more than
+ * one adapter for the same key (page prefs + a theme side-channel is common)
+ * must still see the server value on every subscriber set — otherwise
+ * `SessionView` keeps `DEFAULT_FONT_PX` after `load()` returned an empty cache.
+ * Prefer a single shared adapter when possible; the emit rule is the safety net.
  */
 import { mergePrefs, type PreferencesAdapter, type ThumbmuxPrefs } from '@thumbmux/core';
 
@@ -133,11 +142,16 @@ export function createServerPrefs(opts: {
         const fresh = await r.json().catch(() => null);
         if (generation !== gen) return; // a save() won while we were fetching
         const current = readCache(cacheKey);
-        if (
-          isPrefsSnapshot(fresh)
-          && canRefreshCache(current, fresh)
-          && JSON.stringify(fresh) !== JSON.stringify(current)
-        ) emit(fresh);
+        if (!isPrefsSnapshot(fresh) || !canRefreshCache(current, fresh)) return;
+        // Always emit on a successful in-generation GET — even when localStorage
+        // already matches. Hosts commonly construct *two* createServerPrefs for
+        // the same cacheKey (e.g. page prefs + a theme/prefs side-channel). The
+        // sibling that finishes first writes the cache; without this, the later
+        // instance skips emit and its subscribers never see the server snapshot.
+        // SessionView then keeps DEFAULT_FONT_PX forever: load() returned the
+        // empty/stale cache, and the only subscribe path never fired.
+        // (kemcortex production 0.15.3: PUT fontPx:30, open /m/t → 13px.)
+        emit(fresh);
       }).catch(() => { /* offline — cache serves */ });
       return cached;
     },

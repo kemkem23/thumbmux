@@ -155,6 +155,62 @@ describe("createServerPrefs", () => {
     });
   });
 
+  // Multi-instance race (kemcortex production 0.15.3): two createServerPrefs
+  // share a cacheKey. The sibling that finishes GET first writes localStorage;
+  // the later instance used to skip emit when JSON matched and its subscribers
+  // never saw fontPx — SessionView stayed on DEFAULT_FONT_PX after load()
+  // returned the empty/stale cache.
+  test("notifies subscribers when a sibling instance already wrote the equal cache", async () => {
+    const key = cacheKey("sibling-equal-cache");
+    realStorage.removeItem(key);
+    const serverSnap: ThumbmuxPrefs = { fontPx: 30, kxAgentTheme: false };
+
+    const gateSibling = deferred<Response>();
+    const gateLocal = deferred<Response>();
+
+    const sibling = createServerPrefs({
+      url: `/prefs/${key}-sibling`,
+      cacheKey: key,
+      fetchFn: (async () => gateSibling.promise) as typeof fetch,
+    });
+    const local = createServerPrefs({
+      url: `/prefs/${key}-local`,
+      cacheKey: key,
+      fetchFn: (async () => gateLocal.promise) as typeof fetch,
+    });
+
+    const emissions: ThumbmuxPrefs[] = [];
+    let visible: ThumbmuxPrefs = {};
+    local.subscribe?.((prefs) => {
+      emissions.push(prefs);
+      visible = prefs;
+    });
+
+    // SessionView order: subscribe, then load() which returns the empty cache.
+    const immediate = await local.load();
+    await sibling.load();
+    expect(immediate).toEqual({});
+
+    // Sibling GET lands first — writes cache, notifies only sibling's subs.
+    gateSibling.resolve(Response.json(serverSnap));
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(readStoredPrefs(key)).toEqual(serverSnap);
+    expect(emissions).toHaveLength(0);
+
+    // Local GET lands second with the same body. Must still emit to local
+    // subscribers — the equality short-circuit was the bug.
+    gateLocal.resolve(Response.json(serverSnap));
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(emissions).toHaveLength(1);
+    expect(emissions[0]).toEqual(serverSnap);
+    expect(visible).toEqual(serverSnap);
+  });
+
   // A6-13: authoritative {} (server file missing / all keys deleted) and fully
   // disjoint snapshots must replace the local cache — not be rejected.
   test("A6-13 applies authoritative empty object from GET (complete deletion)", async () => {
