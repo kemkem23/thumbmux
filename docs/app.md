@@ -264,13 +264,20 @@ import {
 } from "thumbmux/app";
 
 // Match the shell's stock band to a host store that also uses 4–40:
-sessionPresentation: {
+const sessionPresentation = {
   fontPxMin: DEFAULT_FONT_PX_MIN, // 4
   fontPxMax: DEFAULT_FONT_PX_MAX, // 40
-}
+};
 
 // Custom step: keep the stock actions' ids but rebind onTap, or supply your own.
 // stepFontPx / clampFontPx are the pure helpers the shell itself uses.
+const currentPx = 13;
+const nextUp = clampFontPx(stepFontPx(currentPx, 1), {
+  min: DEFAULT_FONT_PX_MIN,
+  max: DEFAULT_FONT_PX_MAX,
+});
+void sessionPresentation;
+void nextUp;
 ```
 
 **`EmbedView` does not read these bounds.** It has no A+/A− chrome; size is only the explicit `fontPx` prop (or `termProps().fontPx`).
