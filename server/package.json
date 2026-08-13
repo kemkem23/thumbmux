@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/server",
-  "version": "0.15.4",
+  "version": "0.15.5",
   "description": "Server side of the thumbmux mobile terminal stack: multiplexed tmux WebSocket engine with pluggable driver and policy hooks (Bun/Node).",
   "type": "module",
   "exports": {

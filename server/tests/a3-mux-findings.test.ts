@@ -7,7 +7,12 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionListItem } from "../../core/src/protocol";
 import { FrameJournal, type FrameJournalStorage } from "../src/frame-journal";
-import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
+import {
+  TmuxWsMux,
+  installMuxTimeHooksForTests,
+  type HistoryArchiveLike,
+  type TmuxDriver,
+} from "../src/ws-mux";
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
@@ -792,6 +797,49 @@ describe("A3-8 unsubscribe clears session-list debt", () => {
 // A3-9 P2 — maxBlockedMs is a real timeout
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Manual clock + one-shot timer for A3-9. Advances time under the test's
+ * control so the shed rule does not depend on a loaded runner's event loop.
+ * Firing a due timer is explicit — nothing races with 99 other files.
+ */
+class ManualClock {
+  now = 1_000_000;
+  private nextId = 1;
+  private timers = new Map<number, { due: number; fn: () => void }>();
+
+  clock = (): number => this.now;
+
+  setTimeout = (fn: () => void, ms: number): number => {
+    const id = this.nextId++;
+    this.timers.set(id, { due: this.now + ms, fn });
+    return id;
+  };
+
+  clearTimeout = (handle: unknown): void => {
+    this.timers.delete(handle as number);
+  };
+
+  /** Advance wall time and run every timer whose due ≤ now (in due order). */
+  advance(ms: number): void {
+    this.now += ms;
+    for (;;) {
+      let next: { id: number; due: number; fn: () => void } | null = null;
+      for (const [id, t] of this.timers) {
+        if (t.due <= this.now && (!next || t.due < next.due || (t.due === next.due && id < next.id))) {
+          next = { id, due: t.due, fn: t.fn };
+        }
+      }
+      if (!next) break;
+      this.timers.delete(next.id);
+      next.fn();
+    }
+  }
+
+  pendingCount(): number {
+    return this.timers.size;
+  }
+}
+
 describe("A3-9 maxBlockedMs timeout", () => {
   test("blocked socket is shed after maxBlockedMs without another push", async () => {
     const SESSION = "a3-9-timeout";
@@ -806,6 +854,13 @@ describe("A3-9 maxBlockedMs timeout", () => {
       hash: (c) => c,
     };
     const closed: string[] = [];
+    const time = new ManualClock();
+    // Install before construct — hooks are captured at construction.
+    const restoreTime = installMuxTimeHooksForTests({
+      clock: time.clock,
+      setTimeout: time.setTimeout,
+      clearTimeout: time.clearTimeout,
+    });
     const mux = new TmuxWsMux({
       driver,
       backpressure: {
@@ -829,23 +884,36 @@ describe("A3-9 maxBlockedMs timeout", () => {
       (mux as any).queueCapture(SESSION);
       await until(() => (mux as any).blockedSockets.has(ws) || closed.length > 0);
 
-      // Stay idle — no further pushes. The timer must shed on its own.
+      // Stay idle — no further pushes. The armed maxBlockedMs timer must shed
+      // on its own once the injected clock advances past the threshold.
       //
-      // Waited on a condition, not on the clock. This used to sleep a flat 60ms
-      // against a 25ms `maxBlockedMs`, and that 35ms of slack is not slack on a
-      // two-core runner executing 99 test files in one process: the shed timer
-      // competes with everything else on the event loop. It cost a release —
-      // the same commit passed `ci` and failed `release-dist`, which is a thing
-      // only a nondeterministic test can do.
+      // Prior versions waited on real time (`sleep(60)` then `until` with a 3s
+      // ceiling). On a two-core `release-dist` runner the whole suite shares
+      // one event loop and the 25ms timer can sit for >3s without firing —
+      // same commit green in `ci`, red in `release-dist`. Driving the clock
+      // removes the scheduler from the assertion entirely.
       //
       // Nothing else can satisfy this: `pollNormalMs` is 60s, so no capture
-      // runs inside the window, and no code here pushes. If shedding needed a
-      // push, `until` throws at its deadline and the test fails as before.
-      await until(() => closed.length > 0);
-      expect(closed.length).toBeGreaterThanOrEqual(1);
+      // runs, and no code here pushes. Advancing less than maxBlockedMs must
+      // leave the socket blocked; advancing to the threshold must shed it.
+      expect(time.pendingCount()).toBe(1);
+      expect(closed).toEqual([]);
+      expect((mux as any).blockedSockets.has(ws)).toBe(true);
+
+      time.advance(24);
+      expect(closed).toEqual([]);
+      expect((mux as any).shedSockets.has(ws)).toBe(false);
+      expect((mux as any).blockedSockets.has(ws)).toBe(true);
+
+      time.advance(1);
+      expect(closed.length).toBe(1);
+      expect(closed[0]).toContain("blocked>25ms");
       expect((mux as any).shedSockets.has(ws)).toBe(true);
+      expect((mux as any).blockedSockets.has(ws)).toBe(false);
+      expect(time.pendingCount()).toBe(0);
     } finally {
       mux.stop();
+      restoreTime();
     }
   });
 });

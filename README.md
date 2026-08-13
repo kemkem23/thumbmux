@@ -562,9 +562,13 @@ const mux = new TmuxWsMux({
 
 For backpressure that stays enabled, `maxBlockedMs` (default 30 seconds) and
 `maxBufferedBytes` (default 8 MiB, when buffered-byte reporting is available)
-control slow-peer shedding. The implementation evaluates blocked durations when it
-attempts to send again (for output, list, or resume checks), so a peer can remain
-in a blocked state longer than `maxBlockedMs` if no subsequent send path runs it.
+control slow-peer shedding. A blocked socket arms a one-shot timer for
+`maxBlockedMs` when it first enters the blocked state, so an idle session still
+sheds a peer that never receives another push. Buffered-byte shedding still
+evaluates on the next send path (output, list, or resume checks). Tests that
+need a deterministic shed call `installMuxTimeHooksForTests({ clock, setTimeout,
+clearTimeout })` before constructing `TmuxWsMux` instead of waiting on the real
+event loop.
 
 **Client** — a compact terminal page. `submitPlan()` separates pasted text
 from Enter because agent TUIs can swallow an Enter sent in the same tick. Set

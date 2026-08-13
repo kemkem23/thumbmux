@@ -156,6 +156,12 @@
     "tier": "F"
   },
   {
+    "name": "installMuxTimeHooksForTests",
+    "kind": "value",
+    "signature": "d5ada05376f466a92007ad5f92fc5204b500e77f8dfacc5d113ef47f17133938",
+    "tier": "X"
+  },
+  {
     "name": "InvalidateSessionOptions",
     "kind": "type",
     "signature": "1730e36ec4251d587e6d18985ede5ffde16f34f458a2d89c1cdbb2fcd0fb9a62",
@@ -202,6 +208,12 @@
     "kind": "type",
     "signature": "c56f8a1fe1f3aac14d2df9dc40fbc3953c9319390e63bbd6d7565f2b761003a0",
     "tier": "F"
+  },
+  {
+    "name": "MuxTimeHooks",
+    "kind": "type",
+    "signature": "21d3003caaf3377fd2c46b1487a6a561eb6168f0c1b3f2096fa7ae2a4534d320",
+    "tier": "X"
   },
   {
     "name": "PipeManagerLike",

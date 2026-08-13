@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/app",
-  "version": "0.15.4",
+  "version": "0.15.5",
   "description": "Mountable Svelte application shell for the thumbmux mobile terminal stack.",
   "type": "module",
   "exports": {

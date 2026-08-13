@@ -210,6 +210,57 @@ export type MuxBackpressureOptions<WS extends WsLike = WsLike> = {
   close?(ws: WS, reason: string): void;
 };
 
+/**
+ * Deterministic clock + one-shot timer for the maxBlockedMs shed path.
+ * Production leaves this unset (real `Date.now` / `setTimeout`). Tests install
+ * via `installMuxTimeHooksForTests` so the shed rule does not wait on a loaded
+ * runner's event loop. Only the blocked-socket arm uses these hooks — poll,
+ * pipe, and burst timers stay on the real scheduler.
+ *
+ * Not an options field: putting `clock`/`timeout` on `MuxBackpressureOptions`
+ * or `TmuxWsMuxOptions` re-hashes every `Partial<TmuxWsMuxOptions>` holder
+ * (AppRoutesOptions / createAppRoutes) in a way the additive optional-member
+ * proof cannot prove through `Partial<>`, which would force an F/S break for a
+ * test-only surface.
+ */
+export type MuxTimeHooks = {
+  clock: () => number;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+};
+
+let muxTimeHooks: MuxTimeHooks | null = null;
+
+/**
+ * Install (or clear) package-level time hooks used by every subsequent
+ * `TmuxWsMux` constructed on this module. Returns a restore function.
+ * Intended for tests; production hosts should not call this.
+ */
+export function installMuxTimeHooksForTests(hooks: MuxTimeHooks | null): () => void {
+  const previous = muxTimeHooks;
+  muxTimeHooks = hooks;
+  return () => {
+    muxTimeHooks = previous;
+  };
+}
+
+function muxNowMs(): number {
+  return muxTimeHooks?.clock() ?? Date.now();
+}
+
+function muxArmTimeout(fn: () => void, ms: number): unknown {
+  if (muxTimeHooks) return muxTimeHooks.setTimeout(fn, ms);
+  return setTimeout(fn, ms);
+}
+
+function muxDisarmTimeout(handle: unknown): void {
+  if (muxTimeHooks) {
+    muxTimeHooks.clearTimeout(handle);
+    return;
+  }
+  clearTimeout(handle as ReturnType<typeof setTimeout>);
+}
+
 export type TmuxWsMuxOptions<
   WS extends WsLike = WsLike,
   SessionRow extends SessionListRow = SessionListItem,
@@ -570,7 +621,7 @@ export class TmuxWsMux<
     const blocked = this.blockedSockets.get(ws);
     if (!blocked) return false;
 
-    const blockedMs = Date.now() - blocked.since;
+    const blockedMs = muxNowMs() - blocked.since;
     this.clearBlockedTimeout(ws);
     this.blockedSockets.delete(ws);
     this.hooks.onBackpressure?.(ws, "drained", {
@@ -598,22 +649,29 @@ export class TmuxWsMux<
 
   private clearBlockedTimeout(ws: WS) {
     const timer = this.blockedTimeouts.get(ws);
-    if (timer) clearTimeout(timer);
+    if (timer !== undefined) muxDisarmTimeout(timer);
     this.blockedTimeouts.delete(ws);
   }
 
-  /** Arm a one-shot shed timer so maxBlockedMs is enforced without a next push. */
+  /**
+   * Arm a one-shot shed timer so maxBlockedMs is enforced without a next push.
+   * When the timer fires the socket is shed directly — the arm itself is the
+   * duration proof. Re-reading the wall clock here used to re-check
+   * `now - since >= maxBlockedMs`; a timer that fires a millisecond early
+   * (or a frozen injected clock that the test had not advanced yet) would then
+   * drop the only timer and leave the peer blocked forever on an idle session.
+   */
   private armBlockedTimeout(ws: WS) {
     this.clearBlockedTimeout(ws);
     if (!this.bpEnabled) return;
     if (!(this.bpMaxBlockedMs > 0) || !Number.isFinite(this.bpMaxBlockedMs)) return;
-    const timer = setTimeout(() => {
+    const timer = muxArmTimeout(() => {
       this.blockedTimeouts.delete(ws);
       if (this.shedSockets.has(ws)) return;
       if (!this.blockedSockets.has(ws)) return;
-      this.maybeShed(ws, "timeout");
+      this.shedSocket(ws, `backpressure:blocked>${this.bpMaxBlockedMs}ms`);
     }, this.bpMaxBlockedMs);
-    this.blockedTimeouts.set(ws, timer);
+    this.blockedTimeouts.set(ws, timer as ReturnType<typeof setTimeout>);
   }
 
   private readBufferedAmount(ws: WS): number | undefined {
@@ -644,7 +702,7 @@ export class TmuxWsMux<
     if (!this.bpEnabled) return;
     if (this.shedSockets.has(ws)) return;
     if (!this.blockedSockets.has(ws)) {
-      this.blockedSockets.set(ws, { since: Date.now() });
+      this.blockedSockets.set(ws, { since: muxNowMs() });
       this.hooks.onBackpressure?.(ws, "blocked", {
         blockedMs: 0,
         bufferedBytes: this.readBufferedAmount(ws),
@@ -666,7 +724,7 @@ export class TmuxWsMux<
   private shedSocket(ws: WS, reason: string) {
     if (this.shedSockets.has(ws)) return;
     const blocked = this.blockedSockets.get(ws);
-    const blockedMs = blocked ? Date.now() - blocked.since : 0;
+    const blockedMs = blocked ? muxNowMs() - blocked.since : 0;
     const bufferedBytes = this.readBufferedAmount(ws);
     this.shedSockets.add(ws);
     this.clearBlockedTimeout(ws);
@@ -685,7 +743,7 @@ export class TmuxWsMux<
       return true;
     }
     const blocked = this.blockedSockets.get(ws);
-    if (blocked && Date.now() - blocked.since >= this.bpMaxBlockedMs) {
+    if (blocked && muxNowMs() - blocked.since >= this.bpMaxBlockedMs) {
       this.shedSocket(ws, `backpressure:blocked>${this.bpMaxBlockedMs}ms`);
       return true;
     }
@@ -869,7 +927,7 @@ export class TmuxWsMux<
     this.pipeDebounceTimers.clear();
     for (const t of this.pipeMaxTimers.values()) clearTimeout(t);
     this.pipeMaxTimers.clear();
-    for (const t of this.blockedTimeouts.values()) clearTimeout(t);
+    for (const t of this.blockedTimeouts.values()) muxDisarmTimeout(t);
     this.blockedTimeouts.clear();
     for (const session of this.piped) this.pipes?.stopPipe(session);
     this.piped.clear();

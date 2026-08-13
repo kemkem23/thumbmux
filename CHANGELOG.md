@@ -1,9 +1,28 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.4-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.5-dist`.
 
-## Unreleased (v0.15.4 candidates)
+## v0.15.5 — 2026-08-13
+
+### Fixed
+
+- **A3-9 `maxBlockedMs` shed was only as reliable as the runner's event loop** —
+  the product already armed a real one-shot timer when a socket entered the
+  blocked state, but the regression test waited on real time (`until` with a
+  3s ceiling over a 25ms timer). On GitHub's two-core `release-dist` runner the
+  whole suite shares one process and that timer can sit past 3s without firing
+  — same commit green in `ci`, red in `release-dist`, twice. The test now
+  installs package-level time hooks (`installMuxTimeHooksForTests` +
+  `MuxTimeHooks`, tier X) and advances them; shedding is asserted without
+  sleeping. Hooks live outside `TmuxWsMuxOptions` so they do not re-hash
+  `Partial<TmuxWsMuxOptions>` holders through a `Partial<>` hole in the
+  additive optional-member proof. The timer callback also sheds directly on
+  fire instead of re-checking wall clock (a re-check that failed left no timer
+  and no shed on an idle session). Docs no longer claim that `maxBlockedMs`
+  only evaluates on the next push.
+
+## v0.15.4 — 2026-08-13 (source tagged; dist blocked by A3-9)
 
 ### Fixed
 
