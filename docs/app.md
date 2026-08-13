@@ -159,7 +159,7 @@ omitting an entire nested block.
 | `spawn.contexts` | No contexts and no workspace picker. It is loaded only when a custom `spawn.launch` also exists; rejection becomes an empty list. | `contexts: async () => [{ id: "default", label: "Default workspace" }]` |
 | `spawn.launch` | `POST {basePath}/spawn` with the `LaunchSpec` only. A custom function receives `(spec, contextId)` and must return `{ name }`. The shell applies `String(name)` before closing the launcher, so strict-name enforcement belongs in your launch endpoint (not just adapter typing). A launch failure leaves the sheet open and shows the error. | `launch: async (spec, contextId) => postLaunch(spec, contextId)` |
 | `hubPresentation` | Optional hub-only presentation controls (filter chips, grouping, ordering, and whether command text is shown). A supplied object only changes stock `HubView` visuals; it does not gate launch, notes, uploads, or sessions policy. | `hubPresentation: { showCommand: true, groupable: true, order: "name" }` |
-| `sessionPresentation` | Optional session-only presentation controls. `actions` receives shell `SessionActionContext` and default action list; return your preferred list composition. `showShortcutBar` can hide the shortcut tile row but does not touch other stages. `promptsCollapsible` / `promptsInitiallyOpen` put the recent-prompt list behind a disclosure. `extraPanelPlacement` chooses which end of the HUD panel stack `extraPanel` renders at. `notePrefix` and `statusCase` turn off the HUD's two built-in text transforms — the `'✎ '` before a note and the uppercasing of status — which otherwise make both fields unusable for any other wording. `composerMode: 'direct' \| 'compose'` seeds the composer mode for a **freshly mounted** session (default `'compose'`); it is per-mount state — the user's in-session switch wins until remount (home → terminal, reload), and prefill still forces COMPOSE because DIRECT has no visible field. | `sessionPresentation: { showShortcutBar: false, notePrefix: '', statusCase: 'none', composerMode: 'direct' }` |
+| `sessionPresentation` | Optional session-only presentation controls. `actions` receives shell `SessionActionContext` and default action list; return your preferred list composition. `showShortcutBar` can hide the shortcut tile row but does not touch other stages. `promptsCollapsible` / `promptsInitiallyOpen` put the recent-prompt list behind a disclosure. `extraPanelPlacement` chooses which end of the HUD panel stack `extraPanel` renders at. `notePrefix` and `statusCase` turn off the HUD's two built-in text transforms — the `'✎ '` before a note and the uppercasing of status — which otherwise make both fields unusable for any other wording. `composerMode: 'direct' \| 'compose'` seeds the composer mode for a **freshly mounted** session (default `'compose'`); it is per-mount state — the user's in-session switch wins until remount (home → terminal, reload), and prefill still forces COMPOSE because DIRECT has no visible field. `fontPxMin` / `fontPxMax` set the inclusive bounds for stock A+/A− and prefs load (default **4–40**); out-of-range stored values **clamp**, they are never ignored. Stock step is graduated (1px below 20, 2px to 32, 4px above). | `sessionPresentation: { showShortcutBar: false, notePrefix: '', statusCase: 'none', composerMode: 'direct', fontPxMin: 4, fontPxMax: 40 }` |
 
 Here is a complete implementation of the examples that use ordinary HTTP and
 the shared mux:
@@ -241,7 +241,41 @@ fields.
 | `termProps().claimGeometry` | `true` in `SessionView`. `EmbedView` always forces `false`, even if the adapter returns `true`. | `claimGeometry: false` for a secondary full view. |
 | `termProps().altScreenMouse` | `false`. Enable only for a session whose full-screen application expects SGR mouse input. | `altScreenMouse: session === "monitor"` |
 | `termProps().palette` | The palette preference is derived from `theme.surfaceFor(session).palette` first (when present), then the background fallback. A `theme.surfaceFor`-derived palette may still be preserved when `termProps` omits or returns `undefined`. | `palette: defaultSurface("#101014").palette` |
-| `termProps().fontPx` | The stored font size, initially 13. The explicit `EmbedView` `fontPx` prop takes precedence over this adapter value. | `fontPx: 14` |
+| `termProps().fontPx` | When set, this **overrides** the stored preference for that session (A+/A− still write the preference, but TermView renders this value). Absent, `SessionView` uses the stored size (default **13**, range controlled by `fontPxMin`/`fontPxMax`). The explicit `EmbedView` `fontPx` prop takes precedence over this adapter value. | `fontPx: 14` |
+
+### Terminal font size (SessionView stock A+/A−)
+
+`SessionView` owns a single stored `fontPx` preference (via `prefs`) and two stock FAB actions (`font-up` / `font-down`). Through 0.15.2 both the load path and the actions hard-clamped to bare literals **11–18** and silently dropped any stored value outside that band — a host that widened its own control saw no effect.
+
+| Piece | Stock default | How a host changes it |
+| --- | --- | --- |
+| Default size (no preference stored) | **13** | Write `fontPx` through `prefs`, or force via `termProps().fontPx` |
+| Inclusive min | **4** | `sessionPresentation.fontPxMin` |
+| Inclusive max | **40** | `sessionPresentation.fontPxMax` |
+| Step | Graduated: **1px** below 20, **2px** to 32, **4px** above | Replace `font-up` / `font-down` via `sessionPresentation.actions` (the step helper is not a prop — see below) |
+| Out-of-range stored value | **Clamped** into the current bounds | — (never ignored) |
+
+```ts
+import {
+  DEFAULT_FONT_PX_MIN,
+  DEFAULT_FONT_PX_MAX,
+  stepFontPx,
+  clampFontPx,
+} from "thumbmux/app";
+
+// Match the shell's stock band to a host store that also uses 4–40:
+sessionPresentation: {
+  fontPxMin: DEFAULT_FONT_PX_MIN, // 4
+  fontPxMax: DEFAULT_FONT_PX_MAX, // 40
+}
+
+// Custom step: keep the stock actions' ids but rebind onTap, or supply your own.
+// stepFontPx / clampFontPx are the pure helpers the shell itself uses.
+```
+
+**`EmbedView` does not read these bounds.** It has no A+/A− chrome; size is only the explicit `fontPx` prop (or `termProps().fontPx`).
+
+**Two host mechanisms can disagree.** A host that keeps its own font store (e.g. a desktop header `A+/A−` writing `localStorage`) and also mounts `SessionView` with the stock FAB will have two independent sizes unless it either (a) feeds the store into `termProps().fontPx` and drives A+/A− through that store via `sessionPresentation.actions`, or (b) drops the host store on the phone surface and lets package prefs be the single source of truth. Passing `fontPxMin`/`fontPxMax` alone only aligns the *bounds*, not the *value*.
 
 The following helpers make the notes, prompts, upload, and preferences examples
 copyable. A production host should add its authentication policy to these

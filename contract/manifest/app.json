@@ -2,13 +2,19 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "082109523d4f02d9f2652511267fb2234de48f9932af90a49d44cd64e12af1b3",
+    "signature": "9d6f57b1fc1fb784dbd21b05dd5a66b6d9a4e33c268f85a794cf5c7a67bd43ce",
     "tier": "S"
   },
   {
     "name": "AppLabels",
     "kind": "type",
     "signature": "76ac2b4644c086d5f2bac25ea0aa384979663dc4020f5e6b88815e89e3fab006",
+    "tier": "S"
+  },
+  {
+    "name": "clampFontPx",
+    "kind": "value",
+    "signature": "94e4aa20f20977858b76654bb4ba4a854feb03f4d0a5f106799c638759610051",
     "tier": "S"
   },
   {
@@ -30,9 +36,33 @@
     "tier": "S"
   },
   {
+    "name": "DEFAULT_FONT_PX",
+    "kind": "value",
+    "signature": "91e616880142ca646a6eb620259c30c9aeafdbfa6a3db055a1bcbb5630f30624",
+    "tier": "S"
+  },
+  {
+    "name": "DEFAULT_FONT_PX_MAX",
+    "kind": "value",
+    "signature": "e632007297bc3acd04bc3d935e65dc614578c5ca30088db01ddbba423878dce9",
+    "tier": "S"
+  },
+  {
+    "name": "DEFAULT_FONT_PX_MIN",
+    "kind": "value",
+    "signature": "7fcfb02e05ea79a9b37e20c3a92081f468f8c01eb0cf155e00ca8e26de214812",
+    "tier": "S"
+  },
+  {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "519a49100a1df62df624a61f79e2f92c27e4ecf478d8a8e83aac39753fcf349a",
+    "signature": "0c8ff70c7cb7069b58d0941a8fc202ec673e78abef03d8310fd36230fa2d0bd3",
+    "tier": "S"
+  },
+  {
+    "name": "FontBounds",
+    "kind": "type",
+    "signature": "bcdb6a429b850f7084f66be172622b1529fac9a57011e8ba5db65274a7ca3a94",
     "tier": "S"
   },
   {
@@ -44,7 +74,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "ceed1ec193d75fd3dd1825a7d8f0db2105d436e7154b64202bda9446909a446e",
+    "signature": "ad68152f793eb2c7b5d469e7c81be9f5af39bffab09bb07f38adf3ac891d248f",
     "tier": "S"
   },
   {
@@ -60,6 +90,12 @@
     "tier": "S"
   },
   {
+    "name": "resolveFontBounds",
+    "kind": "value",
+    "signature": "9a3fb96dbb809a6f5959e04555888b63b4c17938c80d7f5dda2832f2966bfd1a",
+    "tier": "S"
+  },
+  {
     "name": "SessionActionContext",
     "kind": "type",
     "signature": "d08b2e21bb9c2c57c67937699cd54aa217bb7dd0363f37d02678fc1d5fa7af02",
@@ -68,13 +104,19 @@
   {
     "name": "SessionPresentationOptions",
     "kind": "type",
-    "signature": "540ef947fc3fe3f58de7996804b6c344dfdae7eaa98bc91cfa753c3d7e7f2959",
+    "signature": "e780911a95b3a08d4bcbee6aea0339f5ab5dcc1b200dd55c437bf9c8d5017f13",
     "tier": "S"
   },
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "d929f4c1d3f38e18be8f6158f427faaa54fd355af01118c3661a27f0e0af3f07",
+    "signature": "f20d52219e4a400988099b846ee99f9ed6db0a9ad369ac9e96bd364025d9eafc",
+    "tier": "S"
+  },
+  {
+    "name": "stepFontPx",
+    "kind": "value",
+    "signature": "3248bf46e3dc7e62df1d348115384a3654d0f5b063f48866408b4ba67992834c",
     "tier": "S"
   },
   {
@@ -86,7 +128,7 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "410b1ac0ba8a7e947c169536b5edbe576035a92a3196d029924f18414f5487e9",
+    "signature": "761b2f97d1a598c9e49d146984ff79944d87df4a5ba3a1a284cea6ef13db7cb7",
     "tier": "S"
   }
 ]

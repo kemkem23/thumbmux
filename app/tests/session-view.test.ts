@@ -1534,6 +1534,123 @@ describe('mountable terminal views', () => {
     expect(noteText.textContent).toBe('new note');
   });
 
+  // sessionPresentation.fontPxMin/Max + stock A+/A− — the 0.15.2 defect was a
+  // hard 11–18 clamp with bare literals that silently dropped a stored value
+  // outside the band. Stock defaults are now 4–40, host-configurable, clamp
+  // (not ignore) on load, graduated step on the FAB actions.
+  //
+  // TermView is keyed on fontPx, so each size change remounts it — re-query
+  // the node after every click rather than holding a stale element.
+  function renderedFontPx(target: HTMLElement): string {
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+    return terminal.style.fontSize;
+  }
+
+  async function tapFabAction(target: HTMLElement, label: string): Promise<void> {
+    const slotsOpen = target.querySelector('.slots')?.classList.contains('open');
+    if (!slotsOpen) await openFab(target);
+    const button = Array.from(target.querySelectorAll<HTMLButtonElement>('.slots .slot'))
+      .find((candidate) => (candidate.textContent ?? '').includes(label));
+    if (!button) throw new Error(`FAB action containing "${label}" not found`);
+    flushSync(() => button.click());
+    await tick();
+  }
+
+  test('stock font A+ reaches beyond the old 18px ceiling', async () => {
+    let savedFont: number | undefined;
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-wide',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prefs: {
+          load: async () => ({ fontPx: 17 }),
+          save: async (patch) => {
+            if (typeof patch.fontPx === 'number') savedFont = patch.fontPx;
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await tick();
+    expect(renderedFontPx(target)).toBe('17px');
+
+    // 17 → 18 → 19 → 20 under the stock 4–40 band (1px steps below 20).
+    await tapFabAction(target, 'Bigger');
+    await tapFabAction(target, 'Bigger');
+    await tapFabAction(target, 'Bigger');
+    expect(renderedFontPx(target)).toBe('20px');
+    expect(savedFont).toBe(20);
+  });
+
+  test('stored font outside the band clamps instead of being ignored', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-clamp',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        // Host narrows the band to 11–18 (the old hard-coded range) while the
+        // stored preference is 40. Clamp → 18, never stay at the 13 default.
+        sessionPresentation: { fontPxMin: 11, fontPxMax: 18 },
+        prefs: {
+          load: async () => ({ fontPx: 40 }),
+          save: async () => {},
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await tick();
+    expect(renderedFontPx(target)).toBe('18px');
+  });
+
+  test('host fontPxMin/fontPxMax rebind the stock A+/A− clamp', async () => {
+    let savedFont: number | undefined;
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-host-bounds',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sessionPresentation: { fontPxMin: 6, fontPxMax: 12 },
+        prefs: {
+          load: async () => ({ fontPx: 10 }),
+          save: async (patch) => {
+            if (typeof patch.fontPx === 'number') savedFont = patch.fontPx;
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await tick();
+    expect(renderedFontPx(target)).toBe('10px');
+
+    // 10 → 11 → 12 → clamp stays 12.
+    await tapFabAction(target, 'Bigger');
+    await tapFabAction(target, 'Bigger');
+    await tapFabAction(target, 'Bigger');
+    expect(renderedFontPx(target)).toBe('12px');
+    expect(savedFont).toBe(12);
+
+    // Walk down past the floor: 12 → … → 6 → clamp stays 6.
+    for (let i = 0; i < 20; i += 1) await tapFabAction(target, 'Smaller');
+    expect(renderedFontPx(target)).toBe('6px');
+    expect(savedFont).toBe(6);
+  });
+
+  test('stored font at the wide stock max (40) loads and renders', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-font-max',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prefs: {
+          load: async () => ({ fontPx: 40 }),
+          save: async () => {},
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await tick();
+    // The 0.15.2 bug dropped this to the 13 default because 40 > 18.
+    expect(renderedFontPx(target)).toBe('40px');
+  });
+
   // sessionPresentation.composerMode — additive S-tier optional. Seeds the
   // composer $state once at mount; in-session switches still win for the
   // life of the component. Omitted default must stay COMPOSE (0.15.1 behaviour).

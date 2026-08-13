@@ -410,7 +410,7 @@ import type { AnsiPalette } from 'thumbmux/core';
 type TermViewProps = {
   session: string;
   palette: AnsiPalette;
-  fontPx?: number;                 // default 13
+  fontPx?: number;                 // default 13 (TermView itself has no range clamp)
   minCols?: number;                // default 20
   minRows?: number;                // default 15
   bottomInsetPx?: number;          // default 0
@@ -426,6 +426,12 @@ type TermViewProps = {
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
+
+`fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
+passes is rendered. The stock A+/A− range (default 4–40, host-overridable via
+`sessionPresentation.fontPxMin` / `fontPxMax`) lives on `SessionView` only —
+see `docs/app.md` "Terminal font size". A desktop host that drives TermView
+directly (no SessionView) owns its own clamp and step.
 
 `claimGeometry=false` is absolute: no resize frames, including mount,
 reconnect, visibility return, font changes, or ResizeObserver changes.

@@ -22,6 +22,7 @@ import ThumbmuxApp from '../src/ThumbmuxApp.svelte';
 import type {
   AppAdapters,
   AppLabels,
+  FontBounds,
   HubPresentationOptions,
   SessionActionContext,
   SessionPresentationOptions,
@@ -43,18 +44,25 @@ type MuxSurface = {
 
 const REQUIRED_RUNTIME_EXPORTS = [
   'DEFAULT_APP_LABELS',
+  'DEFAULT_FONT_PX',
+  'DEFAULT_FONT_PX_MAX',
+  'DEFAULT_FONT_PX_MIN',
   'EmbedView',
   'HubView',
   'SessionView',
   'ThumbmuxApp',
+  'clampFontPx',
   'createQueryParamNav',
   'createSessionsStore',
   'nextStageOverlay',
   'prefillOnError',
+  'resolveFontBounds',
+  'stepFontPx',
 ] as const;
 const REQUIRED_TYPE_EXPORTS = [
   'AppAdapters',
   'AppLabels',
+  'FontBounds',
   'HubPresentationOptions',
   'SessionActionContext',
   'SessionPresentationOptions',
@@ -66,6 +74,7 @@ const REQUIRED_TYPE_EXPORTS = [
 type ConfigExports = [
   AppAdapters,
   AppLabels,
+  FontBounds,
   HubPresentationOptions,
   SessionActionContext,
   SessionPresentationOptions,
@@ -418,10 +427,21 @@ describe('ThumbmuxApp navigation', () => {
   });
 });
 
+const NUMBER_CONSTANTS = new Set([
+  'DEFAULT_FONT_PX',
+  'DEFAULT_FONT_PX_MIN',
+  'DEFAULT_FONT_PX_MAX',
+]);
+const NON_CALLABLE_RUNTIME = new Set(['DEFAULT_APP_LABELS', ...NUMBER_CONSTANTS]);
+
 describe('thumbmux/app barrel', () => {
   test('exports the complete workspace runtime and declaration surface', () => {
     for (const name of REQUIRED_RUNTIME_EXPORTS) {
-      const expectedType = name === 'DEFAULT_APP_LABELS' ? 'object' : 'function';
+      const expectedType = name === 'DEFAULT_APP_LABELS'
+        ? 'object'
+        : NUMBER_CONSTANTS.has(name)
+          ? 'number'
+          : 'function';
       expect(typeof app[name], name).toBe(expectedType);
     }
 
@@ -432,7 +452,7 @@ describe('thumbmux/app barrel', () => {
       ...REQUIRED_TYPE_EXPORTS,
     ].sort());
     expect(manifest.callable).toEqual(
-      REQUIRED_RUNTIME_EXPORTS.filter((name) => name !== 'DEFAULT_APP_LABELS').sort(),
+      REQUIRED_RUNTIME_EXPORTS.filter((name) => !NON_CALLABLE_RUNTIME.has(name)).sort(),
     );
   });
 });

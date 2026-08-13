@@ -83,6 +83,27 @@ export interface SessionPresentationOptions {
    * value. Prefill paths still force COMPOSE because DIRECT has no visible
    * field. `EmbedView` does not read this option. */
   composerMode?: 'compose' | 'direct';
+  /**
+   * Inclusive lower bound (CSS px) for the stock A+/A− actions and for loading
+   * a stored `fontPx` preference. Defaults to **4**.
+   *
+   * A stored value outside the current bounds is **clamped** into range — not
+   * ignored. Through 0.15.2 the shell hard-clamped to 11–18 with bare literals
+   * and silently dropped anything outside, so a host that widened its own
+   * control saw no effect on the phone surface.
+   *
+   * Stock step is graduated (1px below 20, 2px to 32, 4px above) so 4→40 is
+   * not 36 taps; the sequence is identical going up and coming back down. A
+   * host that wants a different step replaces `font-up` / `font-down` via
+   * `sessionPresentation.actions`. `EmbedView` does not read these bounds —
+   * its explicit `fontPx` prop is the only size it uses.
+   */
+  fontPxMin?: number;
+  /**
+   * Inclusive upper bound (CSS px) for stock A+/A− and prefs load. Defaults to
+   * **40**. See `fontPxMin` for clamp / step / host-override semantics.
+   */
+  fontPxMax?: number;
 }
 
 /** Host-owned behavior and policy seams for the mountable application shell. */

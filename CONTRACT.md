@@ -220,23 +220,34 @@ sheet or stock FAB action; omission keeps the bar. `composerMode: 'direct' |
 `'compose'`). It is **per-mount state**, not a preference: the user's in-session
 COMPOSE/DIRECT choice wins for the life of the component; a remount (navigating
 home → terminal, reloading) re-seeds from this option. Prefill paths still force
-COMPOSE because DIRECT has no visible field. `EmbedView` does not read
-`sessionPresentation` and keeps its own hardcoded COMPOSE default. Copy does not
-get a second policy adapter: the opt-in action transformer receives optional
-`SessionActionContext.copyAll` (whole-buffer, ignores selection), while legacy
-`extraActions` keeps its original two-member runtime context and the untouched
-stock copy action remains selection-first with whole-buffer fallback. A host
-that overrides stock copy to call only `copyAll()` deliberately copies the
-entire screen even when text is selected. File-paste unavailability likewise
-stays on the existing upload adapter: when `upload.endpoint(session)` is null,
-optional `upload.onUnavailable` receives that session, the pasted files, and the
+COMPOSE because DIRECT has no visible field. `fontPxMin` / `fontPxMax`
+(optional numbers, stock defaults **4** and **40**) set the inclusive bounds
+for the stock A+/A− actions and for loading a stored `fontPx` preference. A
+stored value outside the current bounds is **clamped** into range — never
+silently ignored (the 0.15.2 defect was a bare-literal 11–18 clamp that dropped
+out-of-band preferences and left the default on screen). Stock step is
+graduated (1px below 20, 2px to 32, 4px above); a host that wants a different
+step replaces `font-up` / `font-down` via `sessionPresentation.actions`. Pure
+helpers `resolveFontBounds`, `clampFontPx`, `stepFontPx` and the stock constants
+`DEFAULT_FONT_PX` / `DEFAULT_FONT_PX_MIN` / `DEFAULT_FONT_PX_MAX` are exported
+from `thumbmux/app` so a host store can share the same ladder. `EmbedView` does
+not read `sessionPresentation` (composer stays hardcoded COMPOSE; font is only
+its explicit `fontPx` prop). Copy does not get a second policy adapter: the
+opt-in action transformer receives optional `SessionActionContext.copyAll`
+(whole-buffer, ignores selection), while legacy `extraActions` keeps its
+original two-member runtime context and the untouched stock copy action remains
+selection-first with whole-buffer fallback. A host that overrides stock copy to
+call only `copyAll()` deliberately copies the entire screen even when text is
+selected. File-paste unavailability likewise stays on the existing upload
+adapter: when `upload.endpoint(session)` is null, optional
+`upload.onUnavailable` receives that session, the pasted files, and the
 enhanced action context. With an endpoint, paste still uploads; with neither an
 endpoint nor the callback, the browser keeps the paste. Separately, the session
 stage mirrors the current mapped metadata's exact `state` as `data-state`; this
 forwards an existing value and adds no adapter. The app view tests pin each
 configured route separately and pin all omitted defaults (including omitted
-`composerMode` → COMPOSE), while the unchanged frozen app consumer exercises the
-additive omitted route.
+`composerMode` → COMPOSE and omitted font bounds → 4–40), while the unchanged
+frozen app consumer exercises the additive omitted route.
 
 ## Deprecation policy
 

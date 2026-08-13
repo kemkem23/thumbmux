@@ -12,6 +12,15 @@ export type {
   SessionPresentationOptions,
   SubmissionTransport,
 } from './config';
+export {
+  DEFAULT_FONT_PX,
+  DEFAULT_FONT_PX_MIN,
+  DEFAULT_FONT_PX_MAX,
+  clampFontPx,
+  resolveFontBounds,
+  stepFontPx,
+} from './font-range';
+export type { FontBounds } from './font-range';
 export { createQueryParamNav } from './navigation';
 export { createSessionsStore } from './sessions-store';
 export { nextStageOverlay, prefillOnError } from './overlay';

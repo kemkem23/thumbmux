@@ -34,6 +34,12 @@
     type SubmissionTransport,
   } from './config';
   import {
+    DEFAULT_FONT_PX,
+    clampFontPx,
+    resolveFontBounds,
+    stepFontPx,
+  } from './font-range';
+  import {
     nextStageOverlay,
     prefillOnError,
     type OverlayTransition,
@@ -59,9 +65,22 @@
   const liveSessionsMux = adapters.mux ?? tmuxMux;
   let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
-  let storedFontPx = $state(13);
+  let storedFontPx = $state(DEFAULT_FONT_PX);
   let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS.map((shortcut) => ({ ...shortcut })));
   let customBg = $state(localBg);
+
+  // Host can widen/narrow the stock A+/A− band via sessionPresentation.
+  // Recomputed each read so a live prop change rebinds the clamp gate.
+  function currentFontBounds() {
+    return resolveFontBounds(
+      adapters.sessionPresentation?.fontPxMin,
+      adapters.sessionPresentation?.fontPxMax,
+    );
+  }
+  let fontBounds = $derived(currentFontBounds());
+  // Display size is always in-bounds even if storage held a wider value from a
+  // previous wider configuration (or a host that wrote prefs outside the band).
+  let effectiveFontPx = $derived(clampFontPx(storedFontPx, fontBounds));
 
   let configuredTermProps = $derived(adapters.termProps?.(session) ?? {});
   let hostSurface = $derived(adapters.theme?.surfaceFor?.(session) ?? null);
@@ -80,7 +99,7 @@
     claimGeometry: configuredTermProps.claimGeometry ?? true,
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
     palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
-    fontPx: configuredTermProps.fontPx ?? storedFontPx,
+    fontPx: configuredTermProps.fontPx ?? effectiveFontPx,
   });
   let themeMode = $derived(
     adapters.theme?.mode?.() ?? (luminance(surface.tbg) > 0.55 ? 'light' : 'dark'),
@@ -164,8 +183,15 @@
         customBg = bg;
       }
     }
-    const font = Number(snapshot.fontPx);
-    if (font >= 11 && font <= 18) storedFontPx = font;
+    // Clamp, do not ignore: a stored 40 under a 4–40 band must render 40, and
+    // a stored 40 under a host-narrowed band must render the upper bound — never
+    // leave the previous default as if the preference failed to load.
+    if (snapshot.fontPx !== undefined && snapshot.fontPx !== null) {
+      const font = Number(snapshot.fontPx);
+      if (Number.isFinite(font)) {
+        storedFontPx = clampFontPx(font, currentFontBounds());
+      }
+    }
     if (Array.isArray(snapshot.shortcuts)) {
       shortcuts = snapshot.shortcuts.map((shortcut) => ({ ...shortcut }));
     }
@@ -182,7 +208,7 @@
   }
 
   function setFont(next: number): void {
-    storedFontPx = Math.max(11, Math.min(18, next));
+    storedFontPx = clampFontPx(next, currentFontBounds());
     savePrefs({ fontPx: storedFontPx });
   }
 
@@ -507,12 +533,13 @@
       {
         id: 'font-up',
         label: labels.actionFontUp,
-        onTap: () => setFont(storedFontPx + 1),
+        // Graduated step then clamp — see stepFontPx / fontPxMin / fontPxMax.
+        onTap: () => setFont(stepFontPx(storedFontPx, 1)),
       },
       {
         id: 'font-down',
         label: labels.actionFontDown,
-        onTap: () => setFont(storedFontPx - 1),
+        onTap: () => setFont(stepFontPx(storedFontPx, -1)),
       },
     );
     const extras = (adapters.extraActions?.(session, legacyActionContext) ?? [])

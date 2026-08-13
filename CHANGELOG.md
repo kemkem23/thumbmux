@@ -3,6 +3,40 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 
+## Unreleased (v0.15.3 candidates)
+
+### Fixed
+
+- **Terminal font range locked at 11–18 inside `SessionView`** — stock A+/A− and
+  prefs load used bare literals `Math.max(11, Math.min(18, …))` with no prop and
+  no documentation. A stored value outside that band was **silently dropped**, so
+  a host that widened its own control (kemcortex: 4–40) still rendered the 13px
+  default on the phone surface and the tmux pane geometry never moved. Measured
+  on production 0.15.2: prefs `fontPx=40` → rendered **13px**, pane stayed
+  47×32.
+
+### Added
+
+- **`SessionPresentationOptions.fontPxMin?` / `fontPxMax?`** (app, tier S) —
+  inclusive bounds for stock A+/A− and prefs load. Stock defaults **4–40**.
+  Out-of-range stored values **clamp** into the current bounds (never ignored).
+  Host example: `sessionPresentation: { fontPxMin: 4, fontPxMax: 40 }`.
+- **Graduated font step** on stock A+/A−: 1px below 20, 2px to 32, 4px above
+  (same ladder as kemcortex's terminal-font store; sequence identical up and
+  down). A host that wants a different step replaces `font-up` / `font-down`
+  via `sessionPresentation.actions`.
+- **Public pure helpers** from `thumbmux/app`: `resolveFontBounds`,
+  `clampFontPx`, `stepFontPx`, plus `DEFAULT_FONT_PX` (13) /
+  `DEFAULT_FONT_PX_MIN` (4) / `DEFAULT_FONT_PX_MAX` (40) and type `FontBounds`.
+
+### Documented
+
+- Range, default, step, clamp behaviour, and how a host overrides the bounds —
+  `docs/app.md` ("Terminal font size"), `CONTRACT.md` (`sessionPresentation`),
+  JSDoc on the new options. Also notes that a host-side font store and the
+  package prefs are two independent mechanisms that can disagree unless the
+  host wires them together.
+
 ## v0.15.2 — 2026-08-12
 
 Documentation-led patch plus a **data-loss fix** at the archive/live seam.
