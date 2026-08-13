@@ -93,9 +93,16 @@ test('stock A+/A− walks the graduated ladder from floor to ceiling', async ({ 
     }
     await expect.poll(() => renderedFontPx(page), { timeout: 5_000 }).toBe(40);
 
+    // The pane resize is debounced (220ms after the last size change) so a burst
+    // of taps costs one tmux resize instead of 24 — see TermView's font-resize
+    // timer. `data-last-cols` is the last *pushed* geometry, so it lags the
+    // rendered glyph size on purpose. Poll for it rather than reading straight
+    // after the visual settles; a bounded poll still fails if the coalesced
+    // resize never lands, which is the failure mode that matters.
+    await expect
+      .poll(async () => (await paneGeometry(page)).cols, { timeout: 5_000 })
+      .toBeLessThan(geometryAtMin.cols);
     const geometryAtMax = await paneGeometry(page);
-    // Larger font → fewer cols/rows (geometry claim is on).
-    expect(geometryAtMax.cols).toBeLessThan(geometryAtMin.cols);
     expect(geometryAtMax.rows).toBeLessThanOrEqual(geometryAtMin.rows);
 
     // One more A+ must clamp, not advance.
