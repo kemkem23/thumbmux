@@ -82,18 +82,20 @@ test('D4: deep history ceiling shows older-history-not-loaded note', async ({ br
     createLineSession(session, 'CEIL', 12_000);
     await openSession(page, session);
 
-    // Page toward older history until the ceiling flag appears (or we give up).
-    for (let i = 0; i < 80; i += 1) {
+    // Page toward older history until the client budget stop is declared.
+    // Do not treat total>=10000 alone as success — a live capture can sit at
+    // the cap with history-stop still "none" until a refused expand or a
+    // retention eviction marks the ceiling.
+    for (let i = 0; i < 120; i += 1) {
       await flingUp(page, 3);
       const stop = await page.getByTestId('mtv').getAttribute('data-history-stop');
-      const total = Number(await page.getByTestId('mtv').getAttribute('data-total'));
-      if (stop === 'ceiling' || total >= 10_000) break;
-      await page.waitForTimeout(120);
+      if (stop === 'ceiling') break;
+      await page.waitForTimeout(80);
     }
 
     await expect.poll(async () => {
       return page.getByTestId('mtv').getAttribute('data-history-stop');
-    }, { timeout: 60_000 }).toBe('ceiling');
+    }, { timeout: 90_000 }).toBe('ceiling');
 
     await expect.poll(async () => {
       return Number(await page.getByTestId('mtv').getAttribute('data-total'));

@@ -1193,6 +1193,11 @@
     if (prefixCount > 0 || lowerCount > 0) {
       total = rawLines.length;
       recalculateRetainedEstimatedBytes();
+      // Live eviction that fills the budget is the same stop as a refused
+      // history page — older rows exist (or just got dropped) and we will
+      // not ask for more. Without this, a 12k first capture sat at
+      // total=10000 with history-stop still "none".
+      if (atRetentionBudget()) markHistoryCeiling();
     }
   }
 
