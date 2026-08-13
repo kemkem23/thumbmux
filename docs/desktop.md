@@ -209,6 +209,19 @@ scroll engine:
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:
 
+**Alternate-screen scrollback (package-owned note, since 0.15.3).** When
+`screen.alt` is true the pane has no tmux scrollback: `TermView` suppresses
+`history_expand`, holds one pane height of rows, and wheel/touch produce only
+rubber-band movement. The component renders a compact `role="note"` banner
+(`.mtv-no-scrollback`, `data-testid="mtv-no-scrollback"`,
+`data-no-scrollback="1"`) so the surface is not mistaken for a frozen terminal.
+Hosts may still add their own chrome; the package note is the minimum so every
+`grok-*` / fullscreen Claude Code surface explains itself without host glue.
+History expansion also waits for the first `meta.screen` sample (or an
+explicit `screen` prop) before asking — a request issued while mode is unknown
+can hit a stale archive for a session name reused after an alt-screen
+incarnation.
+
 v0.3.1 note: `TermView` owns touch forwarding under `altScreenMouse=true`.
 Hosts should not capture touch gestures for SGR forwarding; links, selection,
 local scroll fallback, and terminal mouse sequences are resolved inside

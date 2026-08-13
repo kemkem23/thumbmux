@@ -75,11 +75,17 @@ when the host wires a history archive. TermView keeps a built-in client
 retention budget of 10,000 rows or an estimated 8 MiB, whichever fills first;
 the mounted viewport and overscan are protected, so they may exceed the nominal
 budget. Once the budget is full, further upward archive expansion stops — like
-a finite tmux `history-limit` — even if the server still has older rows. When
-client retention drops a span, its boundary is labelled `N rows dropped`; the
-label is presentation chrome, not terminal text. These client budgets are
-separate from `FileHistoryArchive.maxLines` and are not currently configurable
-through TermView props. When the pane width changes, the live window reflows
+a finite tmux `history-limit` — even if the server still has older rows. That
+client ceiling is **signposted** (a `role="note"` banner: “Older history not
+loaded · limit 10k rows / 8 MiB”) so it is not mistaken for the start of the
+session; the true server end-of-archive is not. When client retention drops a
+span, its boundary is labelled `N rows dropped`; the label is presentation
+chrome, not terminal text. Alternate-screen panes (`screen.alt`) have no
+scrollback at all — TermView shows “Alternate screen · no scrollback” and
+suppresses history expansion (including before the first screen sample
+arrives). These client budgets are separate from `FileHistoryArchive.maxLines`
+and are not currently configurable through TermView props. When the pane width
+changes, the live window reflows
 from tmux and arrives as a full reset; archived rows deliberately keep their
 original physical wrapping so history is not silently rewritten
 ([details](docs/reflow.md)).

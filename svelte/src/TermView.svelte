@@ -169,6 +169,13 @@
   );
   /** Alternate screen has no scrollback — suppress history expand/prepend. */
   const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
+  /**
+   * Until the first screen sample (or an explicit `screen` prop) arrives we do
+   * not know whether the pane is alternate-screen. Expanding history in that
+   * window once produced a stale-archive prepend for session names reused after
+   * an alt-screen incarnation. Wait for a known mode before asking.
+   */
+  const screenModeKnown = $derived(screen !== undefined || liveScreenSeen);
 
   const LINE_RATIO = 1.6;
   const OVERSCAN_ROWS = 60;
@@ -180,6 +187,11 @@
   const HISTORY_GAP_LINK_ROWS = 128;
   const HISTORY_RETAINED_ROW_BUDGET = 10_000;
   const HISTORY_RETAINED_BYTE_BUDGET = 8 * 1024 * 1024;
+  /** Human-readable copy for the retention-ceiling note (also the aria-label). */
+  const HISTORY_CEILING_LABEL =
+    'Older history is not loaded. This viewer keeps at most 10,000 rows or about 8 mebibytes; more rows may still exist on the server.';
+  const NO_SCROLLBACK_LABEL =
+    'This session is on the alternate screen. There is no scrollback history; only the current full-screen view is shown.';
   // The authorized 100k-row Chrome benchmark chose 300 over 256 to retain
   // fewer states while keeping measured cold-window rebuild p95 below 1 ms.
   const SGR_CHECKPOINT_INTERVAL = 300;
@@ -226,6 +238,17 @@
   let archiveBeforeLine: number | null = null;
   let archiveLoading = false;
   let archiveExhausted = false;
+  /**
+   * Why further upward history expansion has stopped.
+   * - `'none'` — still eligible to ask (or never tried).
+   * - `'exhausted'` — server reported the true start of archived history
+   *   (`hasMore: false` / null cursor). The top row *is* the start.
+   * - `'ceiling'` — client retention budget (10k rows / ~8 MiB) is full, so
+   *   TermView refuses further pages even if the server still has older rows.
+   *   Distinct from a gap marker: no rows were dropped *between* retained
+   *   lines; older history simply was never loaded.
+   */
+  let historyStopReason = $state<'none' | 'exhausted' | 'ceiling'>('none');
   // Client-side request ids guard local deferred work, not wire identity: the
   // protocol echoes no token. On timeout the mux retires the old socket before
   // this state allows a retry, fencing any late reply from the abandoned wire.
@@ -1501,7 +1524,10 @@
     } else if (bottomOffsetPx > 0 && liveLines.length > 0) {
       const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
       liveLines = merged.lines;
-      if (merged.appendedLineCount > 0) archiveExhausted = false;
+      if (merged.appendedLineCount > 0) {
+        archiveExhausted = false;
+        clearHistoryStopIfResumed();
+      }
     } else {
       liveLines = nextLive;
     }
@@ -1513,14 +1539,35 @@
     });
   }
 
+  function atRetentionBudget(): boolean {
+    return (
+      rawLines.length >= HISTORY_RETAINED_ROW_BUDGET ||
+      retainedEstimatedBytes >= HISTORY_RETAINED_BYTE_BUDGET
+    );
+  }
+
+  function markHistoryCeiling(): void {
+    historyStopReason = 'ceiling';
+  }
+
+  function clearHistoryStopIfResumed(): void {
+    // Live growth or a successful prepend may re-open the ask path.
+    if (!archiveExhausted && !atRetentionBudget()) {
+      historyStopReason = 'none';
+    }
+  }
+
   function requestOlderHistory(): boolean {
+    // Wait for the first screen sample (or an explicit `screen` prop) so a
+    // reused session name cannot pull a stale archive while still alternate.
+    if (!screenModeKnown) return false;
     // Alternate screen has no scrollback — never expand history into it.
     if (noScrollback) return false;
     if (archiveLoading || archiveExhausted) return false;
-    if (
-      rawLines.length >= HISTORY_RETAINED_ROW_BUDGET ||
-      retainedEstimatedBytes >= HISTORY_RETAINED_BYTE_BUDGET
-    ) return false;
+    if (atRetentionBudget()) {
+      markHistoryCeiling();
+      return false;
+    }
     const requestId = ++archiveRequestSeq;
     const requestSession = session;
     archiveInflightRequestId = requestId;
@@ -1697,7 +1744,10 @@
           archiveBeforeLine = reloadBeforeLine;
         }
       }
+      // Entire page discarded to stay inside the retention budget — more rows
+      // may still exist on the server; this is the client ceiling, not EOF.
       archiveExhausted = true;
+      markHistoryCeiling();
       const shouldRerun = settleArchiveContinuationRequest('committed');
       if (searchQuery && shouldRerun) requestSearchRerun(activeIdentity);
       finishArchiveRequest();
@@ -1763,6 +1813,10 @@
       if (Number.isSafeInteger(reloadBeforeLine)) {
         archiveBeforeLine = reloadBeforeLine;
         archiveExhausted = false;
+        // Prefix was trimmed for budget — further expand is still blocked by
+        // atRetentionBudget(), and the ceiling note must stay up.
+        if (atRetentionBudget()) markHistoryCeiling();
+        else clearHistoryStopIfResumed();
       }
     }
 
@@ -1773,6 +1827,7 @@
       // not emit a zero-row prepend event.
       rawEntryState = currentFirstState;
       archiveExhausted = true;
+      markHistoryCeiling();
       rebuildAllLinks();
       rebuildFrom(0);
       total = rawLines.length;
@@ -1895,7 +1950,14 @@
     archiveBeforeLine = historyStartLine;
     // A nonempty page without a numeric cursor can be rendered once, but it
     // cannot be advanced safely: requesting before null would duplicate it.
-    archiveExhausted = historyStartLine === null || !history.hasMore || lines.length === 0;
+    const serverSaysEnd =
+      historyStartLine === null || !history.hasMore || lines.length === 0;
+    archiveExhausted = serverSaysEnd;
+    if (serverSaysEnd) {
+      // Server-side end of archive — the top row *is* the start of retained
+      // history (not a client ceiling).
+      historyStopReason = 'exhausted';
+    }
     if (lines.length === 0) {
       const settlement = archiveExhausted ? 'exhausted' : 'empty';
       finishArchiveRequest(settlement);
@@ -1903,6 +1965,9 @@
     }
 
     stageHistoryPrepend(lines, historyStartLine);
+    if (archiveExhausted) historyStopReason = 'exhausted';
+    else if (atRetentionBudget()) markHistoryCeiling();
+    else clearHistoryStopIfResumed();
   }
 
   function applyArchivedHistory(data: string) {
@@ -2861,11 +2926,19 @@
     archiveRequestActive = false;
     archiveInflightRequestId = null;
     archiveInflightSession = null;
+    // Screen-mode flip is a new scroll world; drop any prior stop reason so an
+    // alt-screen banner is not confused with a normal-mode ceiling note.
+    historyStopReason = 'none';
     bottomOffsetPx = 0;
     applyScroll();
     emitScrollState();
     settledBottomOffsetPx = 0;
   }
+
+  /** Oldest retained rows are in the virtual window — show the ceiling note. */
+  let showHistoryCeiling = $derived(
+    historyStopReason === 'ceiling' && winStart === 0 && !noScrollback,
+  );
 
   let screenAltObserved = false;
   let lastScreenAlt = false;
@@ -3043,6 +3116,10 @@
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
+  data-history-stop={historyStopReason}
+  data-history-ceiling={historyStopReason === 'ceiling' ? '1' : undefined}
+  data-no-scrollback={noScrollback ? '1' : undefined}
+  data-screen-mode-known={screenModeKnown ? '1' : undefined}
   style:font-size={`${fontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
@@ -3124,6 +3201,36 @@
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>
   {/if}
+  {#if noScrollback}
+    <!--
+      Alternate screen has no tmux scrollback. Without this note the surface is
+      indistinguishable from a frozen terminal (audit D5). Distinct from the
+      retention-gap gutter marker — different fact, different vocabulary.
+    -->
+    <div
+      class="mtv-no-scrollback"
+      data-testid="mtv-no-scrollback"
+      role="note"
+      aria-label={NO_SCROLLBACK_LABEL}
+    >
+      <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
+    </div>
+  {/if}
+  {#if showHistoryCeiling}
+    <!--
+      Client retention ceiling (audit D4). Not a gap marker: no rows were
+      dropped between retained lines; older archive rows simply were never
+      loaded. Shown only when the oldest retained row is in the window.
+    -->
+    <div
+      class="mtv-history-ceiling"
+      data-testid="mtv-history-ceiling"
+      role="note"
+      aria-label={HISTORY_CEILING_LABEL}
+    >
+      <span class="mtv-signpost-text">Older history not loaded · limit 10k rows / 8 MiB</span>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -3139,6 +3246,29 @@
        gesture so iOS still initiates it on a held finger. */
     touch-action: none;
     -webkit-touch-callout: default;
+  }
+  .mtv-no-scrollback,
+  .mtv-history-ceiling {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 3;
+    padding: 5px 8px;
+    box-sizing: border-box;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--tfg) 32%, transparent);
+    background: color-mix(in srgb, var(--tbg) 82%, var(--tfg));
+  }
+  .mtv-signpost-text {
+    display: block;
+    font: 600 11px / 1.35 var(--font-mono, ui-monospace, monospace);
+    color: var(--tfg);
+    opacity: 0.92;
+    letter-spacing: 0.01em;
+    white-space: normal;
   }
   .mtv-search {
     position: absolute;

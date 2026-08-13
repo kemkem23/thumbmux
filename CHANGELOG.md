@@ -14,6 +14,18 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
   default on the phone surface and the tmux pane geometry never moved. Measured
   on production 0.15.2: prefs `fontPx=40` → rendered **13px**, pane stayed
   47×32.
+- **History ceiling looked like the start of the session (D4)** — at the 10k /
+  8 MiB client retention budget the viewer stopped asking for older pages with
+  no marker, so ~19k archived rows could sit unreachable while the top row
+  looked ordinary. `TermView` now shows a `role="note"` ceiling banner when the
+  stop is the client budget (distinct from server `hasMore: false`).
+- **Alternate-screen scroll looked like a frozen terminal (D5)** — rubber-band
+  only, no explanation. Affects every `grok-*` and fullscreen Claude Code
+  session. Package now shows “Alternate screen · no scrollback”.
+- **One `history_expand` before the first `screen` sample** — mode unknown was
+  treated as “has scrollback”; a reused session name after alt-screen could
+  pull a stale archive (reply discarded, still a wrong request). Expansion now
+  waits until `screen` is known (prop or first wire sample).
 
 ### Added
 
@@ -28,6 +40,9 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
 - **Public pure helpers** from `thumbmux/app`: `resolveFontBounds`,
   `clampFontPx`, `stepFontPx`, plus `DEFAULT_FONT_PX` (13) /
   `DEFAULT_FONT_PX_MIN` (4) / `DEFAULT_FONT_PX_MAX` (40) and type `FontBounds`.
+- **History-ceiling signpost** — `.mtv-history-ceiling` / `data-history-ceiling`,
+  `data-history-stop="ceiling"|"exhausted"|"none"`.
+- **No-scrollback signpost** — `.mtv-no-scrollback` / `data-no-scrollback`.
 
 ### Documented
 
@@ -36,6 +51,9 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.2-dist`.
   JSDoc on the new options. Also notes that a host-side font store and the
   package prefs are two independent mechanisms that can disagree unless the
   host wires them together.
+- Client retention ceiling UX and alternate-screen scrollback note —
+  `docs/protocol.md`, `docs/desktop.md` §5, README history paragraph (replaces
+  the audit G2/G5 “not signposted” prose).
 
 ## v0.15.2 — 2026-08-12
 

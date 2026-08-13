@@ -28,7 +28,11 @@ type MuxCallback = (
   data: string,
   type?: string,
   cursor?: { row: number; col: number } | null,
-  meta?: { source: "full" | "delta"; replace: boolean },
+  meta?: {
+    source: "full" | "delta";
+    replace: boolean;
+    screen?: ScreenMode | null;
+  },
 ) => void;
 
 type ScreenMode = { alt: boolean; mouseSgr: boolean; mouseAny: boolean };
@@ -513,5 +517,134 @@ describe("TermView screen prop — alt scrollback", () => {
     await tick();
     flushSync();
     expect(settledBottomOffset(entry.viewport)).toBe(0);
+  });
+
+  test("screen.alt=true renders the no-scrollback signpost (a11y note)", async () => {
+    const { viewport, target } = mountTermView({
+      screen: { alt: true, mouseSgr: false, mouseAny: false },
+    });
+    await tick();
+    deliverOutput(40);
+    await tick();
+    flushSync();
+
+    expect(viewport.getAttribute("data-no-scrollback")).toBe("1");
+    const note = target.querySelector<HTMLElement>('[data-testid="mtv-no-scrollback"]');
+    expect(note).not.toBeNull();
+    expect(note?.getAttribute("role")).toBe("note");
+    expect(note?.getAttribute("aria-label") ?? "").toMatch(/alternate screen/i);
+    expect(note?.textContent ?? "").toMatch(/no scrollback/i);
+
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls).toHaveLength(0);
+  });
+
+  test("omitted screen prop does not request history until the first wire sample", async () => {
+    // screen: undefined (prop omitted) — wait for meta.screen before expand so a
+    // reused session name cannot pull a stale archive while still alternate.
+    const { viewport } = mountTermView({ screen: undefined });
+    await tick();
+    deliverOutput(80);
+    await tick();
+    flushSync();
+
+    expect(viewport.getAttribute("data-screen-mode-known")).toBeNull();
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls).toHaveLength(0);
+
+    // First delivery with screen meta unlocks normal history expand.
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      Array.from({ length: 80 }, (_, i) => `line-${i}`).join("\n"),
+      "output",
+      null,
+      {
+        source: "full",
+        replace: true,
+        screen: { alt: false, mouseSgr: false, mouseAny: false },
+      },
+    );
+    await tick();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(viewport.getAttribute("data-screen-mode-known")).toBe("1");
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls.length).toBeGreaterThan(0);
+  });
+});
+
+describe("TermView history-ceiling signpost (D4)", () => {
+  test("retention budget stop surfaces a ceiling note, not a gap marker", async () => {
+    const { viewport, target } = mountTermView({
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    await tick();
+    // Fill the 10,000-row client budget in one capture.
+    deliverOutput(10_000);
+    await tick();
+    flushSync();
+    drainAnimationFrames();
+    expect(totalRows(viewport)).toBe(10_000);
+
+    historyCalls = [];
+    // Scroll to the oldest retained rows so winStart === 0 and the note can show.
+    wheelTowardHistory(viewport);
+    await tick();
+    flushSync();
+    drainAnimationFrames();
+
+    // Budget full → refuse further expand (no storm) and raise the ceiling flag.
+    expect(historyCalls).toHaveLength(0);
+    expect(viewport.getAttribute("data-history-stop")).toBe("ceiling");
+    expect(viewport.getAttribute("data-history-ceiling")).toBe("1");
+
+    const note = target.querySelector<HTMLElement>('[data-testid="mtv-history-ceiling"]');
+    expect(note).not.toBeNull();
+    expect(note?.getAttribute("role")).toBe("note");
+    expect(note?.getAttribute("aria-label") ?? "").toMatch(/10,?000 rows|8 mebibytes/i);
+    expect(note?.textContent ?? "").toMatch(/Older history not loaded/i);
+    // Distinct vocabulary from the retention-gap gutter.
+    expect(target.querySelectorAll(".mtv-gap-marker")).toHaveLength(0);
+  }, 60_000);
+
+  test("server hasMore=false is exhausted, not ceiling", async () => {
+    const { viewport, target } = mountTermView({
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    await tick();
+    deliverOutput(80);
+    await tick();
+    flushSync();
+
+    historyCalls = [];
+    wheelTowardHistory(viewport);
+    expect(historyCalls.length).toBeGreaterThan(0);
+
+    // Let wheel inertia settle so busy() is false and prepend work can run.
+    for (let i = 0; i < 40; i += 1) {
+      drainAnimationFrames();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    deliverHistory(
+      Array.from({ length: 20 }, (_, i) => `older-${i}`),
+      { startLine: 0, hasMore: false },
+    );
+    for (let i = 0; i < 40; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      drainAnimationFrames();
+      await tick();
+      if (totalRows(viewport) > 80) break;
+    }
+    flushSync();
+
+    expect(totalRows(viewport)).toBeGreaterThan(80);
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+    expect(viewport.getAttribute("data-history-ceiling")).toBeNull();
+    expect(target.querySelector('[data-testid="mtv-history-ceiling"]')).toBeNull();
   });
 });

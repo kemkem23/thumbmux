@@ -227,10 +227,18 @@ that history is contiguous.
 `TermView` retains at most 10,000 rows or ~8 MiB of history, whichever fills
 first, and once the budget is full it stops requesting older pages entirely —
 it does not evict older rows to make room for more. The budget is not
-configurable through props. **The stop is not signposted.** The oldest retained
-row renders like any other row: no marker distinguishing "beginning of the
-session" from "client stopped asking". Hosts exposing deeper scrollback should
-render their own end-of-buffer affordance.
+configurable through props.
+
+**Signpost (package-owned, since 0.15.3).** When the stop is the **client
+ceiling** (budget full while the server may still have older rows), and the
+oldest retained row is in the virtual window, `TermView` renders a
+`role="note"` banner (`.mtv-history-ceiling`, `data-testid="mtv-history-ceiling"`,
+`data-history-ceiling="1"`, `data-history-stop="ceiling"`) with an accessible
+label explaining that older history was not loaded. This is **not** a gap
+marker: no rows were dropped between retained lines; older archive rows simply
+were never requested. When the server reports the true start of archived
+history (`hasMore: false`), `data-history-stop="exhausted"` and **no** ceiling
+banner is shown — the top row really is the start.
 
 #### `TmuxWsMux` mutates the tmux session's `history-limit`
 
