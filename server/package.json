@@ -20,7 +20,7 @@
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@thumbmux/core": "^0.15.4"
+    "@thumbmux/core": "^0.15.5"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
