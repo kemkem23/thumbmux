@@ -100,8 +100,8 @@
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
     palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
     fontPx: configuredTermProps.fontPx ?? effectiveFontPx,
-    pinNarrowCells: adapters.sessionPresentation?.pinNarrowCells ?? true,
   });
+  let unpinNarrowCells = $derived(adapters.sessionPresentation?.pinNarrowCells === false);
   let themeMode = $derived(
     adapters.theme?.mode?.() ?? (luminance(surface.tbg) > 0.55 ? 'light' : 'dark'),
   );
@@ -695,7 +695,11 @@
   style:--dock-full={dockFull > 0 ? `${dockFull}px` : null}
   style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}
 >
-  <div class="mtv-host" style:top={`${hudHeight}px`}>
+  <div
+    class="mtv-host"
+    style:top={`${hudHeight}px`}
+    data-mtv-unpin-narrow={unpinNarrowCells ? '' : undefined}
+  >
     {#key `${session}|${surface.tbg}`}
       {#if isDesktop}
         <DesktopKeys

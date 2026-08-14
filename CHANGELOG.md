@@ -32,11 +32,10 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
 
   Hosts whose `--font-mono` is already fixed-advance for every script can
   turn the one-cell pin off: `sessionPresentation.pinNarrowCells: false`.
-  That gives the spans back (a 40-column Thai line is one text node again)
-  and gives up the grid guarantee for those scripts. Dual-width CJK/emoji
-  pins stay on; they are not the DOM cost this switch exists to avoid.
-  `EmbedView` does not read the presentation option — pass `pinNarrowCells`
-  on `TermView` there.
+  That gives up the grid guarantee for those scripts. Dual-width CJK/emoji
+  pins stay on. `EmbedView` does not read the presentation option; a
+  standalone `TermView` always pins. The switch is not a new TermView prop
+  (that surface is F-tier).
 
   Devanagari conjuncts such as `क्ष` and the tail of `हिन्दी` (`न्दी`, 3
   cells) are pinned as one grapheme so the virama can still join. The box

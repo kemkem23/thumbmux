@@ -124,12 +124,9 @@ export interface SessionPresentationOptions {
    * **true**.
    *
    * Set `false` when `--font-mono` is already fixed-advance for every script
-   * the terminal emits: you give up the grid guarantee for those scripts and
-   * get back a much smaller DOM (a 40-column Thai line is one text node
-   * again instead of ~thirty spans). Dual-width CJK/emoji pins (`.mtv-w2`)
-   * stay on; they predate this option and are not the DOM cost this switch
-   * exists to avoid. `EmbedView` does not read this option — pass
-   * `pinNarrowCells` on `TermView` directly there.
+   * the terminal emits: you give up the grid guarantee for those scripts.
+   * Dual-width CJK/emoji pins (`.mtv-w2`) stay on. `EmbedView` does not
+   * read `sessionPresentation`; a standalone `TermView` always pins.
    */
   pinNarrowCells?: boolean;
 }

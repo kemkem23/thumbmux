@@ -94,14 +94,6 @@
      * Moved / long / selection / link taps never cancel.
      */
     cancelSyntheticClickOnTap = false,
-    /**
-     * Pin one-cell non-ASCII clusters (`.mtv-w1`) to a measured ASCII cell.
-     * Default true. Hosts whose `--font-mono` is already fixed-advance for
-     * every script can set false to skip the extra spans; CJK/emoji `.mtv-w2`
-     * pinning is unchanged. The host-facing switch is
-     * `sessionPresentation.pinNarrowCells`.
-     */
-    pinNarrowCells = true,
     onLinesChange = undefined,
     onGeometryChange = undefined,
     onScrollStateChange = undefined,
@@ -135,7 +127,6 @@
     /** Opt-in: cancel the touchend that fired `onTap` so the synthesized
      * mousedown/click cannot blur the focused input (default false). */
     cancelSyntheticClickOnTap?: boolean;
-    pinNarrowCells?: boolean;
     onLinesChange?: (lines: string[], meta: LinesChangeMeta) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
@@ -184,10 +175,14 @@
   /** Diagnostic only: a sample or explicit prop has arrived. Never a request gate. */
   const screenModeKnown = $derived(screen !== undefined || liveScreenSeen);
 
-  /** Drop `.mtv-w1` / `.mtv-wx` wrappers when the host opted out of narrow pins.
-   * Dual-width `.mtv-w2` from CJK/emoji is left alone. */
+  /**
+   * Drop `.mtv-w1` / `.mtv-wx` when an ancestor opted out. Not a TermView
+   * prop (F-tier surface stays frozen): SessionView sets
+   * `data-mtv-unpin-narrow` from `sessionPresentation.pinNarrowCells`.
+   * Dual-width `.mtv-w2` from CJK/emoji is left alone.
+   */
   function applyPinPolicy(html: string): string {
-    if (pinNarrowCells !== false) return html;
+    if (!viewportEl?.closest?.('[data-mtv-unpin-narrow]')) return html;
     return html
       .replace(/<span class="mtv-w1">([^<]*)<\/span>/g, '$1')
       .replace(/<span class="mtv-wx" style="--mtv-cells:\d+">([^<]*)<\/span>/g, '$1');
