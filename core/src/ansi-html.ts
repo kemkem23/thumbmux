@@ -18,7 +18,7 @@
  * lines stay byte-identical to the pre-wide-cell renderer.
  */
 
-import { charCellWidth } from './cells';
+import { wideUnitLength } from './cells';
 
 export type UnderlineStyle = 'single' | 'double' | 'curly' | 'dotted' | 'dashed';
 
@@ -354,13 +354,10 @@ function escapeHtml(s: string): string {
 const WIDE_CELL_CLASS = 'mtv-w2';
 
 /**
- * Escape text and pin East-Asian-wide / emoji code points into a fixed
- * two-cell span. ASCII-only input is byte-identical to `escapeHtml` alone —
- * no empty wrappers, no class attributes on narrow text.
- *
- * Trailing zero-width code points (variation selectors, ZWJ, combining marks
- * that somehow follow a wide base) are absorbed into the same span so they
- * stay with their base glyph for font fallback and selection.
+ * Escape text and pin dual-width units into a fixed two-cell span.
+ * A dual-width unit is either a `charCellWidth===2` code point (plus trailing
+ * zero-width) or a narrow base + U+FE0F that tmux promotes to two cells.
+ * ASCII-only input is byte-identical to `escapeHtml` alone.
  */
 function escapeHtmlWithWideCells(text: string): string {
   const len = text.length;
@@ -370,22 +367,16 @@ function escapeHtmlWithWideCells(text: string): string {
   let bufStart = 0;
   let i = 0;
   while (i < len) {
-    const cp = text.codePointAt(i)!;
-    const chLen = cp > 0xffff ? 2 : 1;
-    if (charCellWidth(cp) === 2) {
+    const unitLen = wideUnitLength(text, i);
+    if (unitLen > 0) {
       if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
-      let end = i + chLen;
-      while (end < len) {
-        const next = text.codePointAt(end)!;
-        if (charCellWidth(next) !== 0) break;
-        end += next > 0xffff ? 2 : 1;
-      }
-      out += `<span class="${WIDE_CELL_CLASS}">${escapeHtml(text.slice(i, end))}</span>`;
-      i = end;
+      out += `<span class="${WIDE_CELL_CLASS}">${escapeHtml(text.slice(i, i + unitLen))}</span>`;
+      i += unitLen;
       bufStart = i;
       continue;
     }
-    i += chLen;
+    const cp = text.codePointAt(i)!;
+    i += cp > 0xffff ? 2 : 1;
   }
   if (bufStart < len) out += escapeHtml(text.slice(bufStart));
   return out;

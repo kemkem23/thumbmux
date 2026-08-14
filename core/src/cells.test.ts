@@ -20,6 +20,30 @@ describe("charCellWidth", () => {
     expect(charCellWidth("한".codePointAt(0)!)).toBe(2);
     expect(charCellWidth(0x1f525)).toBe(2); // 🔥
   });
+  /**
+   * BMP dingbat/emoji that Unicode marks EAW=W — measured 2 in live tmux.
+   * These used to fall through the gap between Hangul Jamo and CJK radicals
+   * and return 1, which walked every box-table border that contained them.
+   */
+  test("EAW=W dingbats/emoji that predate U+1F000 are 2 cells", () => {
+    expect(charCellWidth(0x2705)).toBe(2); // ✅
+    expect(charCellWidth(0x274c)).toBe(2); // ❌
+    expect(charCellWidth(0x2b50)).toBe(2); // ⭐
+    expect(charCellWidth(0x2757)).toBe(2); // ❗
+    expect(charCellWidth(0x231a)).toBe(2); // ⌚
+    expect(charCellWidth(0x26a1)).toBe(2); // ⚡
+    expect(charCellWidth(0x2728)).toBe(2); // ✨
+  });
+  /**
+   * ⚠ looks as emoji-ish as ❌ but EAW=N and tmux advances one cell.
+   * Widening it would break tables the other way — pin the narrow count.
+   */
+  test("⚠ stays 1 cell (EAW=N, tmux-measured)", () => {
+    expect(charCellWidth(0x26a0)).toBe(1); // ⚠
+    expect(charCellWidth(0x2713)).toBe(1); // ✓
+    expect(charCellWidth(0x2714)).toBe(1); // ✔
+    expect(charCellWidth(0x2764)).toBe(1); // ❤ alone (no FE0F)
+  });
   test("zero-width joiners and variation selectors are 0", () => {
     expect(charCellWidth(0x200d)).toBe(0);
     expect(charCellWidth(0xfe0f)).toBe(0);
@@ -33,6 +57,16 @@ describe("stringCells", () => {
   });
   test("CJK doubles", () => {
     expect(stringCells("a你b")).toBe(4);
+  });
+  test("FE0F promotes a narrow base to 2 cells (tmux: ❤=1, ❤️=2)", () => {
+    expect(stringCells("❤")).toBe(1);
+    expect(stringCells("❤️")).toBe(2); // U+2764 U+FE0F
+    expect(stringCells("⚠")).toBe(1);
+    expect(stringCells("⚠️")).toBe(2);
+  });
+  test("mixed status-row matches tmux column count", () => {
+    // ✅❌⭐❗⌚ = 5×2, ⚠ = 1, 漢 = 2, 🙂 = 2 → 15
+    expect(stringCells("✅❌⭐❗⌚⚠漢🙂")).toBe(5 * 2 + 1 + 2 + 2);
   });
 });
 

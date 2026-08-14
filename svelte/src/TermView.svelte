@@ -3379,21 +3379,27 @@
     line-height: var(--mtv-lineh);
   }
   /*
-   * Dual-width cells (CJK / fullwidth / emoji). ansi-html wraps each
-   * charCellWidth===2 code point in .mtv-w2; we pin the box to exactly two
-   * measured ASCII cells so column N lands where tmux says it does, even
-   * when the host font paints the glyph at ~1.6×. text-align centers the
-   * ink in the two-cell box; overflow:hidden keeps a too-wide fallback
-   * glyph from shoving the rest of the row.
+   * Dual-width cells (CJK / fullwidth / emoji / EAW=W dingbats / base+FE0F).
+   * ansi-html wraps each dual-width unit in .mtv-w2; we pin the box to exactly
+   * two measured ASCII cells so column N lands where tmux says it does.
+   *
+   * Colour emoji fonts often paint ~1em×1em ink while two mono cells are only
+   * ~1.2em wide — overflow:hidden alone *clips* the picture. Cap font-size so
+   * 1em of ink fits the box on both axes; overflow:hidden stays as a safety
+   * net only. The box size itself never changes (grid is sacrosanct).
    */
   .mtv-line :global(.mtv-w2) {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: calc(2 * var(--mtv-cw, 1ch));
+    height: var(--mtv-lineh);
     box-sizing: border-box;
-    text-align: center;
     vertical-align: top;
     overflow: hidden;
     white-space: pre;
+    line-height: 1;
+    font-size: min(var(--mtv-lineh), calc(2 * var(--mtv-cw, 1ch) * 0.92));
   }
   /* Keep the virtual row stride exactly N * lineH. Moving the old text label
      to top:0 would only cover this row instead; doubling the row would break

@@ -66,6 +66,31 @@ describe("dual-width cell spans (mtv-w2)", () => {
     expect(lineToHtml("a🔥b", createSgrState(), pal)).toBe(`a${w2("🔥")}b`);
   });
 
+  test("BMP EAW=W dingbats pin as dual-width; ⚠ stays bare", () => {
+    expect(lineToHtml("✅", createSgrState(), pal)).toBe(w2("✅"));
+    expect(lineToHtml("❌", createSgrState(), pal)).toBe(w2("❌"));
+    expect(lineToHtml("⭐", createSgrState(), pal)).toBe(w2("⭐"));
+    expect(lineToHtml("❗", createSgrState(), pal)).toBe(w2("❗"));
+    expect(lineToHtml("⌚", createSgrState(), pal)).toBe(w2("⌚"));
+    // ⚠ is EAW=N / tmux=1 — no wrapper
+    expect(lineToHtml("⚠", createSgrState(), pal)).toBe("⚠");
+    expect(lineToHtml("⚠", createSgrState(), pal)).not.toContain("mtv-w2");
+  });
+
+  test("FE0F-promoted base is one dual-width unit", () => {
+    // ❤ alone narrow; ❤️ (❤ + FE0F) is 2 cells in our tmux → one mtv-w2 span.
+    expect(lineToHtml("❤", createSgrState(), pal)).toBe("❤");
+    expect(lineToHtml("❤️", createSgrState(), pal)).toBe(w2("❤️"));
+  });
+
+  test("status table row: wide dingbats + narrow ⚠ + CJK", () => {
+    const line = "│ ✅ ❌ ⭐ ⚠ 漢 │";
+    const html = lineToHtml(line, createSgrState(), pal);
+    expect(html).toBe(
+      `│ ${w2("✅")} ${w2("❌")} ${w2("⭐")} ⚠ ${w2("漢")} │`,
+    );
+  });
+
   test("SGR color wraps around dual-width cells without breaking the class", () => {
     expect(lineToHtml("\x1b[31m漢x\x1b[0m", createSgrState(), pal)).toBe(
       `<span style="color:#f00">${w2("漢")}x</span>`,
