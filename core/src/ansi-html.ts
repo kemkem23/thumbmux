@@ -10,7 +10,15 @@
  *
  * Used by MobileTermView: lines render once into DOM and scrolling is a pure
  * GPU transform, so this parser is OFF the scroll hot path by design.
+ *
+ * Dual-width cells (CJK / fullwidth / emoji): `charCellWidth === 2` code
+ * points are wrapped in `<span class="mtv-w2">`. TermView sizes that class to
+ * exactly two measured ASCII cells so the rendered grid matches tmux columns
+ * regardless of the host's `--font-mono` advance for those glyphs. ASCII-only
+ * lines stay byte-identical to the pre-wide-cell renderer.
  */
+
+import { charCellWidth } from './cells';
 
 export type UnderlineStyle = 'single' | 'double' | 'curly' | 'dotted' | 'dashed';
 
@@ -339,6 +347,50 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * Class name for dual-width terminal cells. Kept as a string constant (not an
+ * export) so the public API surface is unchanged; TermView CSS targets it.
+ */
+const WIDE_CELL_CLASS = 'mtv-w2';
+
+/**
+ * Escape text and pin East-Asian-wide / emoji code points into a fixed
+ * two-cell span. ASCII-only input is byte-identical to `escapeHtml` alone —
+ * no empty wrappers, no class attributes on narrow text.
+ *
+ * Trailing zero-width code points (variation selectors, ZWJ, combining marks
+ * that somehow follow a wide base) are absorbed into the same span so they
+ * stay with their base glyph for font fallback and selection.
+ */
+function escapeHtmlWithWideCells(text: string): string {
+  const len = text.length;
+  if (len === 0) return '';
+
+  let out = '';
+  let bufStart = 0;
+  let i = 0;
+  while (i < len) {
+    const cp = text.codePointAt(i)!;
+    const chLen = cp > 0xffff ? 2 : 1;
+    if (charCellWidth(cp) === 2) {
+      if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
+      let end = i + chLen;
+      while (end < len) {
+        const next = text.codePointAt(end)!;
+        if (charCellWidth(next) !== 0) break;
+        end += next > 0xffff ? 2 : 1;
+      }
+      out += `<span class="${WIDE_CELL_CLASS}">${escapeHtml(text.slice(i, end))}</span>`;
+      i = end;
+      bufStart = i;
+      continue;
+    }
+    i += chLen;
+  }
+  if (bufStart < len) out += escapeHtml(text.slice(bufStart));
+  return out;
+}
+
 function escapeAttr(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -577,7 +629,7 @@ function isSurrogatePairAt(text: string, index: number): boolean {
 }
 
 function withOverlay(text: string, kind: 'search-match' | 'search-active' | null): string {
-  const escaped = escapeHtml(text);
+  const escaped = escapeHtmlWithWideCells(text);
   if (kind === 'search-active') return `<span class="search-active">${escaped}</span>`;
   if (kind === 'search-match') return `<span class="search-match">${escaped}</span>`;
   return escaped;
@@ -639,8 +691,8 @@ export function lineToHtml(
     const explicitHref = safeOsc8Href();
     if (!explicitHref && !rangeWalker) {
       out += isDefaultSgrState(st)
-        ? escapeHtml(rawText)
-        : `${spanOpen(st, palette)}${escapeHtml(rawText)}</span>`;
+        ? escapeHtmlWithWideCells(rawText)
+        : `${spanOpen(st, palette)}${escapeHtmlWithWideCells(rawText)}</span>`;
       col += rawText.length;
       return;
     }
