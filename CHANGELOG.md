@@ -1,7 +1,23 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.8-dist`.
+
+## v0.15.8 — 2026-08-14
+
+### Fixed
+
+- **One-cell letters were drawn at 55 % — regression from v0.15.7.** The scale-to-fit clamp
+`min(line-height, cell × 0.92)` is the right answer for square emoji
+ink in a two-cell box. Applied to `.mtv-w1` it is `0.6em × 0.92 =
+0.552em` every time — every Thai (and Greek, Cyrillic, …) letter
+shrank to just over half size inside a correctly sized cell. The box
+stays one measured cell; the ink now **inherits** the line's font size.
+The clamp remains only on `.mtv-w1.mtv-fit`, which `lineToHtml` adds
+for one-cell symbols (`⚠`, `❤`) whose ink really is a 1em square.
+`.mtv-wx` (N≥3 letter conjuncts) inherits too. `.mtv-w2` is unchanged.
+  v0.15.7 shipped a grid that was correct and half-legible; this restores the
+  ink without moving a single box. Upgrade straight from 0.15.6 if you can.
 
 ## v0.15.7 — 2026-08-14
 
@@ -37,15 +53,6 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
   standalone `TermView` always pins. The switch is not a new TermView prop
   (that surface is F-tier).
 
-  **One-cell letters were drawn at 55 %.** The scale-to-fit clamp
-  `min(line-height, cell × 0.92)` is the right answer for square emoji
-  ink in a two-cell box. Applied to `.mtv-w1` it is `0.6em × 0.92 =
-  0.552em` every time — every Thai (and Greek, Cyrillic, …) letter
-  shrank to just over half size inside a correctly sized cell. The box
-  stays one measured cell; the ink now **inherits** the line's font size.
-  The clamp remains only on `.mtv-w1.mtv-fit`, which `lineToHtml` adds
-  for one-cell symbols (`⚠`, `❤`) whose ink really is a 1em square.
-  `.mtv-wx` (N≥3 letter conjuncts) inherits too. `.mtv-w2` is unchanged.
 
   **Thumbnails pin too.** `SessionThumb` already went through `lineToHtml`,
   so v0.15.6's `.mtv-w2` and this release's `.mtv-w1` were in every hub
