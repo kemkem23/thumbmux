@@ -79,12 +79,6 @@ function graphemeAt(text: string, i: number): string {
   return first ? first.segment : '';
 }
 
-function isBareGrapheme(g: string): boolean {
-  if (!g) return true;
-  const cp = g.codePointAt(0)!;
-  return cp < 0x80 || isTerminalGridGlyph(cp);
-}
-
 export type UnderlineStyle = 'single' | 'double' | 'curly' | 'dotted' | 'dashed';
 
 export type SgrState = {
@@ -443,6 +437,14 @@ function escapeHtmlWithWideCells(text: string): string {
   let bufStart = 0;
   let i = 0;
   while (i < len) {
+    const cp = text.codePointAt(i)!;
+    // ASCII and box-drawing / braille stay in the bare buffer. Segmenter
+    // is only for scripts that need a pin — the 100k-row ASCII bench
+    // must not pay a grapheme walk per character.
+    if (cp < 0x80 || isTerminalGridGlyph(cp)) {
+      i += cp > 0xffff ? 2 : 1;
+      continue;
+    }
     const unitLen = wideUnitLength(text, i);
     if (unitLen > 0) {
       if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
@@ -452,14 +454,13 @@ function escapeHtmlWithWideCells(text: string): string {
       continue;
     }
     const grapheme = graphemeAt(text, i);
-    if (grapheme && !isBareGrapheme(grapheme)) {
+    if (grapheme) {
       if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
       out += pinSpan(grapheme, stringCells(grapheme));
       i += grapheme.length;
       bufStart = i;
       continue;
     }
-    const cp = text.codePointAt(i)!;
     i += cp > 0xffff ? 2 : 1;
   }
   if (bufStart < len) out += escapeHtml(text.slice(bufStart));
