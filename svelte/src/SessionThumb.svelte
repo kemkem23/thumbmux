@@ -157,6 +157,9 @@
   }
   .tail :global(.mtv-w1) {
     width: var(--mtv-cw, 1ch);
+    font-size: inherit;
+  }
+  .tail :global(.mtv-w1.mtv-fit) {
     font-size: min(var(--mtv-lineh, 1.38em), calc(var(--mtv-cw, 1ch) * 0.92));
   }
   .tail :global(.mtv-w2) {
@@ -165,7 +168,7 @@
   }
   .tail :global(.mtv-wx) {
     width: calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch));
-    font-size: min(var(--mtv-lineh, 1.38em), calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch) * 0.92));
+    font-size: inherit;
   }
   .wait {
     position: absolute;

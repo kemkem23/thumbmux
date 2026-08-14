@@ -37,6 +37,16 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
   standalone `TermView` always pins. The switch is not a new TermView prop
   (that surface is F-tier).
 
+  **One-cell letters were drawn at 55 %.** The scale-to-fit clamp
+  `min(line-height, cell × 0.92)` is the right answer for square emoji
+  ink in a two-cell box. Applied to `.mtv-w1` it is `0.6em × 0.92 =
+  0.552em` every time — every Thai (and Greek, Cyrillic, …) letter
+  shrank to just over half size inside a correctly sized cell. The box
+  stays one measured cell; the ink now **inherits** the line's font size.
+  The clamp remains only on `.mtv-w1.mtv-fit`, which `lineToHtml` adds
+  for one-cell symbols (`⚠`, `❤`) whose ink really is a 1em square.
+  `.mtv-wx` (N≥3 letter conjuncts) inherits too. `.mtv-w2` is unchanged.
+
   **Thumbnails pin too.** `SessionThumb` already went through `lineToHtml`,
   so v0.15.6's `.mtv-w2` and this release's `.mtv-w1` were in every hub
   card — but TermView scopes the box CSS under `.mtv-line`, which a

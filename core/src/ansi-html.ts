@@ -413,10 +413,23 @@ function escapeHtml(s: string): string {
 const WIDE_CELL_CLASS = 'mtv-w2';
 const NARROW_CELL_CLASS = 'mtv-w1';
 const MULTI_CELL_CLASS = 'mtv-wx';
+/** Square-ink 1-cell symbols (⚠, ❤). Letters must not get this — the
+ * scale-to-fit clamp is 0.552em on a 0.6em cell and shrinks Thai to 55%. */
+const FIT_CLASS = 'mtv-fit';
+
+function clusterNeedsFit(text: string): boolean {
+  const cp = text.codePointAt(0);
+  if (cp === undefined) return false;
+  const ch = String.fromCodePoint(cp);
+  return /\p{S}/u.test(ch) || /\p{Extended_Pictographic}/u.test(ch);
+}
 
 function pinSpan(text: string, cells: number): string {
   const body = escapeHtml(text);
-  if (cells <= 1) return `<span class="${NARROW_CELL_CLASS}">${body}</span>`;
+  if (cells <= 1) {
+    const fit = clusterNeedsFit(text) ? ` ${FIT_CLASS}` : '';
+    return `<span class="${NARROW_CELL_CLASS}${fit}">${body}</span>`;
+  }
   if (cells === 2) return `<span class="${WIDE_CELL_CLASS}">${body}</span>`;
   return `<span class="${MULTI_CELL_CLASS}" style="--mtv-cells:${cells}">${body}</span>`;
 }

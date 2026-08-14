@@ -184,7 +184,7 @@
   function applyPinPolicy(html: string): string {
     if (!viewportEl?.closest?.('[data-mtv-unpin-narrow]')) return html;
     return html
-      .replace(/<span class="mtv-w1">([^<]*)<\/span>/g, '$1')
+      .replace(/<span class="mtv-w1(?: mtv-fit)?">([^<]*)<\/span>/g, '$1')
       .replace(/<span class="mtv-wx" style="--mtv-cells:\d+">([^<]*)<\/span>/g, '$1');
   }
 
@@ -3425,6 +3425,12 @@
   }
   .mtv-line :global(.mtv-w1) {
     width: var(--mtv-cw, 1ch);
+    /* Letters are designed to fit a 0.6em cell at the inherited size.
+     * min(lineh, cw*0.92) is 0.552em forever and shrank Thai to 55%. */
+    font-size: inherit;
+  }
+  .mtv-line :global(.mtv-w1.mtv-fit) {
+    /* Square-ink 1-cell symbols (⚠) really do overflow the cell. */
     font-size: min(var(--mtv-lineh), calc(var(--mtv-cw, 1ch) * 0.92));
   }
   .mtv-line :global(.mtv-w2) {
@@ -3433,7 +3439,8 @@
   }
   .mtv-line :global(.mtv-wx) {
     width: calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch));
-    font-size: min(var(--mtv-lineh), calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch) * 0.92));
+    /* N≥3 is a letter conjunct, not square ink — inherit like .mtv-w1. */
+    font-size: inherit;
   }
   /* Keep the virtual row stride exactly N * lineH. Moving the old text label
      to top:0 would only cover this row instead; doubling the row would break
