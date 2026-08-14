@@ -1,11 +1,42 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.6-dist`.
 
-## Unreleased
+## v0.15.6 — 2026-08-14
 
 ### Fixed
+
+- **Wide glyphs were two cells in the column arithmetic and about 1.6 on screen** —
+  `charCellWidth` has always known that CJK, fullwidth forms and emoji occupy two
+  terminal columns, but only `terminal-link`'s column maths consulted it. The
+  render path handed text to the browser and let the font's advance decide, so
+  every line containing one drifted against the grid tmux is counting: box
+  tables stepped, the caret sat wrong, link hit targets missed. `ansi-html` now
+  wraps each dual-width code point in `<span class="mtv-w2">` and `TermView`
+  pins that box to exactly two measured ASCII cells, **scaling the glyph to fit
+  rather than clipping it**, so every wide glyph lands in an identical box —
+  same width, same height, same baseline. Measured on-grid at every size from 4
+  to 40. ASCII-only output is byte-identical, and Thai and braille are
+  untouched because they are genuinely one cell.
+
+  The width table itself was also wrong in a way that showed up in ordinary
+  status tables: `WIDE_RANGES` jumped from `0x1100` straight to `0x2e80`, so
+  **the emoji that predate the `0x1F000` plane counted as one cell** — `✅`
+  U+2705, `❌` U+274C, `⭐` U+2B50, `❗` U+2757, `⌚` U+231A and the rest of the
+  East-Asian-Wide entries in Dingbats and Miscellaneous Symbols. Those are the
+  check marks and crosses that appear in every generated table, and each one
+  cost its row a column. The wide set now follows `EastAsianWidth`, verified by
+  printing each character into a live tmux pane and reading `#{cursor_x}` back.
+  **`⚠` U+26A0 stays one cell** — it is `N`, not `W`, and widening it would
+  break tables in the opposite direction, which is why this cannot be done by
+  eye. `U+FE0F` now promotes its base: a bare `❤` is one cell, `❤️` is two,
+  matching what tmux does.
+
+  Hosts that render rows themselves rather than through `lineToHtml` see no
+  change; hosts that use `TermView` should expect wide glyphs to occupy their
+  correct two columns, which is a visible layout change wherever they were
+  previously drawn narrow.
 
 - **Residual 2-row hole at the archive/live seam when the prompt rewrites** —
   live reconciliation used exact suffix→prefix overlap only. Shell/TUI
