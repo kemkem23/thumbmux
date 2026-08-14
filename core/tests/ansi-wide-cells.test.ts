@@ -19,6 +19,8 @@ const pal: AnsiPalette = {
 };
 
 const w2 = (s: string) => `<span class="mtv-w2">${s}</span>`;
+const w1 = (s: string) => `<span class="mtv-w1">${s}</span>`;
+const wx = (s: string, n: number) => `<span class="mtv-wx" style="--mtv-cells:${n}">${s}</span>`;
 
 describe("dual-width cell spans (mtv-w2)", () => {
   test("ASCII-only lines are byte-identical to plain escape (no wrappers)", () => {
@@ -72,14 +74,14 @@ describe("dual-width cell spans (mtv-w2)", () => {
     expect(lineToHtml("⭐", createSgrState(), pal)).toBe(w2("⭐"));
     expect(lineToHtml("❗", createSgrState(), pal)).toBe(w2("❗"));
     expect(lineToHtml("⌚", createSgrState(), pal)).toBe(w2("⌚"));
-    // ⚠ is EAW=N / tmux=1 — no wrapper
-    expect(lineToHtml("⚠", createSgrState(), pal)).toBe("⚠");
+    // ⚠ is EAW=N / tmux=1 — not dual-width, but it is a one-cell non-ASCII pin.
+    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1("⚠"));
     expect(lineToHtml("⚠", createSgrState(), pal)).not.toContain("mtv-w2");
   });
 
   test("FE0F-promoted base is one dual-width unit", () => {
-    // ❤ alone narrow; ❤️ (❤ + FE0F) is 2 cells in our tmux → one mtv-w2 span.
-    expect(lineToHtml("❤", createSgrState(), pal)).toBe("❤");
+    // ❤ alone narrow (mtv-w1); ❤️ (❤ + FE0F) is 2 cells in our tmux → mtv-w2.
+    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1("❤"));
     expect(lineToHtml("❤️", createSgrState(), pal)).toBe(w2("❤️"));
   });
 
@@ -87,7 +89,7 @@ describe("dual-width cell spans (mtv-w2)", () => {
     const line = "│ ✅ ❌ ⭐ ⚠ 漢 │";
     const html = lineToHtml(line, createSgrState(), pal);
     expect(html).toBe(
-      `│ ${w2("✅")} ${w2("❌")} ${w2("⭐")} ⚠ ${w2("漢")} │`,
+      `│ ${w2("✅")} ${w2("❌")} ${w2("⭐")} ${w1("⚠")} ${w2("漢")} │`,
     );
   });
 
@@ -97,11 +99,32 @@ describe("dual-width cell spans (mtv-w2)", () => {
     );
   });
 
-  test("Thai remains single-width (no mtv-w2); combining marks stay bare", () => {
-    // "สวัสดี" = bases + marks; cells.ts counts 4, none are wide.
+  test("Thai remains single-width (no mtv-w2); combining marks stay with their base", () => {
+    // "สวัสดี" = 4 one-cell clusters. Marks ride the preceding base in one
+    // span so the shaper can attach them — splitting was what made TlwgMono
+    // unusable. ASCII-only lines still have no wrapper (test above).
     const html = lineToHtml("สวัสดี", createSgrState(), pal);
-    expect(html).toBe("สวัสดี");
+    expect(html).toBe(`${w1("ส")}${w1("วั")}${w1("ส")}${w1("ดี")}`);
     expect(html).not.toContain("mtv-w2");
+  });
+
+  test("one-cell non-ASCII clusters pin as mtv-w1; ASCII and box-drawing stay bare", () => {
+    expect(lineToHtml("ก", createSgrState(), pal)).toBe(w1("ก"));
+    expect(lineToHtml("aกb", createSgrState(), pal)).toBe(`a${w1("ก")}b`);
+    expect(lineToHtml("─│╭", createSgrState(), pal)).toBe("─│╭");
+    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1("⚠"));
+    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1("❤"));
+    expect(lineToHtml("Ελ", createSgrState(), pal)).toBe(`${w1("Ε")}${w1("λ")}`);
+  });
+
+  test("Devanagari keeps Mc with its base (shaped cluster, width = cells)", () => {
+    // Intl.Segmenter: हि (2) | न्दी (3). The virama stays with the following
+    // consonant so the conjunct shapes; a hand-rolled "base+marks" split
+    // painted a visible virama.
+    expect(lineToHtml("हिन्दी", createSgrState(), pal)).toBe(
+      `${w2("हि")}${wx("न्दी", 3)}`,
+    );
+    expect(lineToHtml("क्ष", createSgrState(), pal)).toBe(w2("क्ष"));
   });
 
   test("mixed box-drawing table row keeps ASCII bare and CJK dual-width", () => {

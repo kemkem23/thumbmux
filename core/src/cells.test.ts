@@ -48,12 +48,55 @@ describe("charCellWidth", () => {
     expect(charCellWidth(0x200d)).toBe(0);
     expect(charCellWidth(0xfe0f)).toBe(0);
   });
+  /**
+   * Bidi/format Cf that tmux advances 0 for. Not every Cf is zero: SHY
+   * (U+00AD) and Arabic number sign (U+0600) are 1 in the same pane.
+   */
+  test("bidi format controls are 0; SHY and U+0600 stay 1 (tmux-measured)", () => {
+    expect(charCellWidth(0x200e)).toBe(0); // LRM
+    expect(charCellWidth(0x200f)).toBe(0); // RLM
+    expect(charCellWidth(0x061c)).toBe(0); // ALM
+    expect(charCellWidth(0x202a)).toBe(0); // LRE
+    expect(charCellWidth(0x202c)).toBe(0); // PDF
+    expect(charCellWidth(0x2066)).toBe(0); // LRI
+    expect(charCellWidth(0xfeff)).toBe(0); // BOM / ZWNBSP
+    expect(charCellWidth(0x00ad)).toBe(1); // SHY
+    expect(charCellWidth(0x0600)).toBe(1); // ARABIC NUMBER SIGN
+  });
+  /**
+   * Mc (spacing combining) occupies a column. The old `/\p{M}/u` rule treated
+   * Mc the same as Mn/Me and returned 0, so हिन्दी counted as 3 against tmux's 5.
+   * Thai is unaffected: every Thai mark is Mn.
+   */
+  test("Devanagari Mc vowel signs are 1 cell; virama (Mn) is 0", () => {
+    expect(charCellWidth("ह".codePointAt(0)!)).toBe(1); // LETTER HA (Lo)
+    expect(charCellWidth("ि".codePointAt(0)!)).toBe(1); // VOWEL SIGN I (Mc)
+    expect(charCellWidth("्".codePointAt(0)!)).toBe(0); // VIRAMA (Mn)
+    expect(charCellWidth("ी".codePointAt(0)!)).toBe(1); // VOWEL SIGN II (Mc)
+    expect(charCellWidth("ा".codePointAt(0)!)).toBe(1); // VOWEL SIGN AA (Mc)
+  });
+  test("Tamil / Bengali / Myanmar Mc signs are 1; their Mn marks stay 0", () => {
+    expect(charCellWidth("ி".codePointAt(0)!)).toBe(1); // TAMIL VOWEL SIGN I (Mc)
+    expect(charCellWidth("ா".codePointAt(0)!)).toBe(1); // TAMIL VOWEL SIGN AA (Mc)
+    expect(charCellWidth("ி".codePointAt(0)!)).toBe(1);
+    expect(charCellWidth("ি".codePointAt(0)!)).toBe(1); // BENGALI VOWEL SIGN I (Mc)
+    expect(charCellWidth("া".codePointAt(0)!)).toBe(1); // BENGALI VOWEL SIGN AA (Mc)
+    expect(charCellWidth("্".codePointAt(0)!)).toBe(0); // BENGALI VIRAMA (Mn)
+    expect(charCellWidth("ိ".codePointAt(0)!)).toBe(0); // MYANMAR VOWEL SIGN I (Mn, above)
+    expect(charCellWidth("ာ".codePointAt(0)!)).toBe(1); // MYANMAR VOWEL SIGN AA (Mc)
+    expect(charCellWidth("ေ".codePointAt(0)!)).toBe(1); // MYANMAR VOWEL SIGN E (Mc)
+    expect(charCellWidth("္".codePointAt(0)!)).toBe(0); // MYANMAR SIGN ASAT (Mn)
+  });
 });
 
 describe("stringCells", () => {
   test("mixed Thai counts spacing chars only", () => {
     // ส(1) วั(1+0) ส(1) ดี(1+0) = 4 cells
     expect(stringCells("สวัสดี")).toBe(4);
+  });
+  test("हिन्दी is 5 cells (Mc vowels count; virama does not)", () => {
+    // ह(Lo=1) ि(Mc=1) न(Lo=1) ्(Mn=0) द(Lo=1) ी(Mc=1) = 5
+    expect(stringCells("हिन्दी")).toBe(5);
   });
   test("CJK doubles", () => {
     expect(stringCells("a你b")).toBe(4);

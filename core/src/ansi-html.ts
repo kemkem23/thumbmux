@@ -12,13 +12,15 @@
  * GPU transform, so this parser is OFF the scroll hot path by design.
  *
  * Dual-width cells (CJK / fullwidth / emoji): `charCellWidth === 2` code
- * points are wrapped in `<span class="mtv-w2">`. TermView sizes that class to
- * exactly two measured ASCII cells so the rendered grid matches tmux columns
- * regardless of the host's `--font-mono` advance for those glyphs. ASCII-only
- * lines stay byte-identical to the pre-wide-cell renderer.
+ * points are wrapped in `<span class="mtv-w2">`. One-cell non-ASCII clusters
+ * (a base plus its trailing marks, including Mc) are wrapped in
+ * `<span class="mtv-w1">`, or `mtv-w2` / `mtv-wx` when the cluster itself
+ * occupies more than one column. TermView sizes those classes to N measured
+ * ASCII cells so the rendered grid matches tmux regardless of the host font.
+ * ASCII and box-drawing / braille stay byte-identical — no wrapper.
  */
 
-import { charCellWidth } from './cells';
+import { charCellWidth, stringCells } from './cells';
 
 /** U+FE0F — tmux promotes a preceding 1-cell base to 2 (see cells.ts stringCells). */
 const VS16 = 0xfe0f;
@@ -56,6 +58,31 @@ function wideUnitLength(text: string, i: number): number {
     }
   }
   return 0;
+}
+
+/** Box drawing, block elements, braille — already 1-cell mono by design. */
+function isTerminalGridGlyph(cp: number): boolean {
+  return (cp >= 0x2500 && cp <= 0x259f) || (cp >= 0x2800 && cp <= 0x28ff);
+}
+
+const GRAPHEME = new Intl.Segmenter('en', { granularity: 'grapheme' });
+
+/**
+ * First grapheme at UTF-16 index `i`. Using the real segmenter (not
+ * "base + trailing Mn") is what keeps a Devanagari conjunct such as न्द
+ * in one box so the virama can join; splitting it was how हिन्दी painted
+ * as हि + visible-virama + दी.
+ */
+function graphemeAt(text: string, i: number): string {
+  if (i >= text.length) return '';
+  const first = GRAPHEME.segment(text.slice(i))[Symbol.iterator]().next().value;
+  return first ? first.segment : '';
+}
+
+function isBareGrapheme(g: string): boolean {
+  if (!g) return true;
+  const cp = g.codePointAt(0)!;
+  return cp < 0x80 || isTerminalGridGlyph(cp);
 }
 
 export type UnderlineStyle = 'single' | 'double' | 'curly' | 'dotted' | 'dashed';
@@ -390,12 +417,23 @@ function escapeHtml(s: string): string {
  * export) so the public API surface is unchanged; TermView CSS targets it.
  */
 const WIDE_CELL_CLASS = 'mtv-w2';
+const NARROW_CELL_CLASS = 'mtv-w1';
+const MULTI_CELL_CLASS = 'mtv-wx';
+
+function pinSpan(text: string, cells: number): string {
+  const body = escapeHtml(text);
+  if (cells <= 1) return `<span class="${NARROW_CELL_CLASS}">${body}</span>`;
+  if (cells === 2) return `<span class="${WIDE_CELL_CLASS}">${body}</span>`;
+  return `<span class="${MULTI_CELL_CLASS}" style="--mtv-cells:${cells}">${body}</span>`;
+}
 
 /**
- * Escape text and pin dual-width units into a fixed two-cell span.
- * A dual-width unit is either a `charCellWidth===2` code point (plus trailing
- * zero-width) or a narrow base + U+FE0F that tmux promotes to two cells.
- * ASCII-only input is byte-identical to `escapeHtml` alone.
+ * Escape text and pin non-ASCII clusters into a fixed N-cell span.
+ * Dual-width units (CJK / emoji / FE0F-promoted) stay `.mtv-w2`. One-cell
+ * script clusters become `.mtv-w1`. A cluster that absorbs Mc vowels and
+ * ends up two-or-more cells wide reuses `.mtv-w2` / `.mtv-wx` so the
+ * shaper sees the whole grapheme. ASCII and box-drawing / braille are
+ * byte-identical to `escapeHtml` alone.
  */
 function escapeHtmlWithWideCells(text: string): string {
   const len = text.length;
@@ -410,6 +448,14 @@ function escapeHtmlWithWideCells(text: string): string {
       if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
       out += `<span class="${WIDE_CELL_CLASS}">${escapeHtml(text.slice(i, i + unitLen))}</span>`;
       i += unitLen;
+      bufStart = i;
+      continue;
+    }
+    const grapheme = graphemeAt(text, i);
+    if (grapheme && !isBareGrapheme(grapheme)) {
+      if (i > bufStart) out += escapeHtml(text.slice(bufStart, i));
+      out += pinSpan(grapheme, stringCells(grapheme));
+      i += grapheme.length;
       bufStart = i;
       continue;
     }

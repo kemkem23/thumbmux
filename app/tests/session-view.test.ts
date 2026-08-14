@@ -1805,6 +1805,19 @@ describe('mountable terminal views', () => {
     expect(direct!.classList.contains('on')).toBe(true);
   });
 
+  test('sessionPresentation.pinNarrowCells: false is accepted and mounts', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-pin-off',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        sessionPresentation: { pinNarrowCells: false },
+      } satisfies AppAdapters,
+    });
+    await tick();
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+  });
+
   test('omitted sessionPresentation.composerMode keeps COMPOSE as the stock default', async () => {
     const { target } = mountView(SessionView, {
       session: 'sh-composer-default',

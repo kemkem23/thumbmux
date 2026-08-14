@@ -1,8 +1,11 @@
 /**
  * Terminal cell accounting for non-ASCII text — mirrors how tmux/wcwidth
  * count columns so cursor cells can be mapped back onto rendered text:
- *   - combining marks (Thai/Lao vowels & tone marks, diacritics), zero-width
- *     joiners and variation selectors occupy 0 cells on their own
+ *   - Mn (non-spacing) and Me (enclosing) marks occupy 0 cells — Thai/Lao
+ *     vowels & tone marks, viramas, floating diacritics. Mc (spacing
+ *     combining) occupies 1: Devanagari/Tamil/Bengali vowel signs sit beside
+ *     the consonant and tmux advances for them. Zero-width joiners and
+ *     variation selectors occupy 0 on their own.
  *   - East Asian Wide/Fullwidth (CJK, Hangul, emoji, EAW=W dingbats) occupy 2
  *   - U+FE0F (emoji presentation VS) *promotes* a preceding 1-cell base to 2
  *     when counting a string (measured against live tmux on this host: ❤=1,
@@ -14,8 +17,23 @@
  * blocks — ⚠ (U+26A0) is deliberately *not* included (EAW=N, tmux=1).
  */
 
-const ZERO_WIDTH = /^[​-‍︀-️]$/;
-const COMBINING = /\p{M}/u;
+/** Mn + Me only. Mc is a spacing combining mark and occupies a column. */
+const ZERO_WIDTH_MARK = /\p{Mn}|\p{Me}/u;
+
+/**
+ * Format / variation-selector code points tmux advances 0 for.
+ * Not every Cf is here: SHY (U+00AD) and U+0600 are 1 in live tmux.
+ */
+function isZeroWidthFormat(cp: number): boolean {
+  if (cp >= 0x200b && cp <= 0x200f) return true; // ZWSP..RLM
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return true; // VS1–VS16
+  if (cp === 0x061c || cp === 0x180e || cp === 0xfeff) return true;
+  if (cp >= 0x202a && cp <= 0x202e) return true; // bidi embeddings
+  if (cp >= 0x2060 && cp <= 0x2064) return true;
+  if (cp >= 0x2066 && cp <= 0x206f) return true;
+  if (cp >= 0xfff9 && cp <= 0xfffb) return true;
+  return false;
+}
 
 /** U+FE0F emoji-style variation selector — zero-width alone, promotes base. */
 const VS16 = 0xfe0f;
@@ -78,7 +96,7 @@ const WIDE_RANGES: Array<[number, number]> = [
 /** Cells one code point occupies in a terminal (0, 1 or 2). */
 export function charCellWidth(cp: number): 0 | 1 | 2 {
   const ch = String.fromCodePoint(cp);
-  if (ZERO_WIDTH.test(ch) || COMBINING.test(ch)) return 0;
+  if (isZeroWidthFormat(cp) || ZERO_WIDTH_MARK.test(ch)) return 0;
   for (const [a, b] of WIDE_RANGES) {
     if (cp >= a && cp <= b) return 2;
     if (cp < a) break; // ranges are sorted

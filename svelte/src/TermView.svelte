@@ -94,6 +94,14 @@
      * Moved / long / selection / link taps never cancel.
      */
     cancelSyntheticClickOnTap = false,
+    /**
+     * Pin one-cell non-ASCII clusters (`.mtv-w1`) to a measured ASCII cell.
+     * Default true. Hosts whose `--font-mono` is already fixed-advance for
+     * every script can set false to skip the extra spans; CJK/emoji `.mtv-w2`
+     * pinning is unchanged. The host-facing switch is
+     * `sessionPresentation.pinNarrowCells`.
+     */
+    pinNarrowCells = true,
     onLinesChange = undefined,
     onGeometryChange = undefined,
     onScrollStateChange = undefined,
@@ -127,6 +135,7 @@
     /** Opt-in: cancel the touchend that fired `onTap` so the synthesized
      * mousedown/click cannot blur the focused input (default false). */
     cancelSyntheticClickOnTap?: boolean;
+    pinNarrowCells?: boolean;
     onLinesChange?: (lines: string[], meta: LinesChangeMeta) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
@@ -174,6 +183,24 @@
   const noScrollback = $derived(resolvedScreen != null && resolvedScreen.alt);
   /** Diagnostic only: a sample or explicit prop has arrived. Never a request gate. */
   const screenModeKnown = $derived(screen !== undefined || liveScreenSeen);
+
+  /** Drop `.mtv-w1` / `.mtv-wx` wrappers when the host opted out of narrow pins.
+   * Dual-width `.mtv-w2` from CJK/emoji is left alone. */
+  function applyPinPolicy(html: string): string {
+    if (pinNarrowCells !== false) return html;
+    return html
+      .replace(/<span class="mtv-w1">([^<]*)<\/span>/g, '$1')
+      .replace(/<span class="mtv-wx" style="--mtv-cells:\d+">([^<]*)<\/span>/g, '$1');
+  }
+
+  function htmlLine(
+    raw: string,
+    st: SgrState,
+    links?: LineLinkRange[],
+    overlays?: LineOverlayRange[],
+  ): string {
+    return applyPinPolicy(lineToHtml(raw, st, palette, links, overlays));
+  }
 
   const LINE_RATIO = 1.6;
   const OVERSCAN_ROWS = 60;
@@ -594,7 +621,7 @@
     const cachedEntry = renderEntryStates.get(idx);
     if (!cachedEntry) return base;
     const st = cloneSgrState(cachedEntry);
-    const html = lineToHtml(rawLine, st, palette, linksByLine[idx], ranges);
+    const html = htmlLine(rawLine, st, linksByLine[idx], ranges);
     writeSparseOverlay(searchSparseCache, idx, searchGeneration, html);
     return html;
   }
@@ -906,7 +933,7 @@
         sgrCheckpoints.set(i, cloneSgrState(state));
       }
       nextEntries.set(i, cloneSgrState(state));
-      nextHtml.set(i, lineToHtml(rawLines[i] ?? '', state, palette, linksByLine[i]));
+      nextHtml.set(i, htmlLine(rawLines[i] ?? '', state, linksByLine[i]));
       if ((i + 1) % SGR_CHECKPOINT_INTERVAL === 0) {
         sgrCheckpoints.set(i + 1, cloneSgrState(state));
       }
@@ -1257,7 +1284,7 @@
     const cachedEntry = renderEntryStates.get(idx);
     if (!cachedEntry || !htmlCache.has(idx)) return;
     const state = cloneSgrState(cachedEntry);
-    htmlCache.set(idx, lineToHtml(rawLines[idx], state, palette, linksByLine[idx]));
+    htmlCache.set(idx, htmlLine(rawLines[idx], state, linksByLine[idx]));
   }
 
   function rerenderPrependSeam(stage: PrependStage) {
@@ -3388,18 +3415,30 @@
    * 1em of ink fits the box on both axes; overflow:hidden stays as a safety
    * net only. The box size itself never changes (grid is sacrosanct).
    */
-  .mtv-line :global(.mtv-w2) {
+  .mtv-line :global(.mtv-w1),
+  .mtv-line :global(.mtv-w2),
+  .mtv-line :global(.mtv-wx) {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: calc(2 * var(--mtv-cw, 1ch));
     height: var(--mtv-lineh);
     box-sizing: border-box;
     vertical-align: top;
     overflow: hidden;
     white-space: pre;
     line-height: 1;
+  }
+  .mtv-line :global(.mtv-w1) {
+    width: var(--mtv-cw, 1ch);
+    font-size: min(var(--mtv-lineh), calc(var(--mtv-cw, 1ch) * 0.92));
+  }
+  .mtv-line :global(.mtv-w2) {
+    width: calc(2 * var(--mtv-cw, 1ch));
     font-size: min(var(--mtv-lineh), calc(2 * var(--mtv-cw, 1ch) * 0.92));
+  }
+  .mtv-line :global(.mtv-wx) {
+    width: calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch));
+    font-size: min(var(--mtv-lineh), calc(var(--mtv-cells, 1) * var(--mtv-cw, 1ch) * 0.92));
   }
   /* Keep the virtual row stride exactly N * lineH. Moving the old text label
      to top:0 would only cover this row instead; doubling the row would break

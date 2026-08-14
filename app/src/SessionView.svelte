@@ -100,6 +100,7 @@
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
     palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
     fontPx: configuredTermProps.fontPx ?? effectiveFontPx,
+    pinNarrowCells: adapters.sessionPresentation?.pinNarrowCells ?? true,
   });
   let themeMode = $derived(
     adapters.theme?.mode?.() ?? (luminance(surface.tbg) > 0.55 ? 'light' : 'dark'),

@@ -1,7 +1,54 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.6-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
+
+## v0.15.7 — 2026-08-14
+
+### Fixed
+
+- **One-cell scripts were on the grid in tmux and off it in the browser** —
+  v0.15.6 pinned CJK/emoji to two cells because the font's advance disagreed
+  with tmux's column count. The same disagreement exists for every script we
+  do not ship a fixed-advance face for. Hindi `हिन्दी` was the isolated
+  arithmetic bug: `charCellWidth` treated **all** Unicode marks (`\p{M}`) as
+  zero-width, including **Mc** (spacing combining). Mc vowel signs occupy a
+  column — they sit beside the consonant. The old rule counted हिन्दी as 3;
+  tmux measures 5. The rule is now Mn/Me → 0, Mc → 1. Thai is unchanged
+  (every Thai mark is Mn). Verified per character in a live pane via
+  `#{cursor_x}`. Neighbours from the same sweep: bidi format controls
+  (LRM/RLM/ALM and the U+202A–202E / U+2066–2069 embeddings) are 0 in tmux
+  and now 0 here; **SHY U+00AD and U+0600 stay 1** — not every Cf is zero,
+  which is why this cannot be `/\p{Cf}/`.
+
+  The render path now pins **one-cell non-ASCII clusters** the way v0.15.6
+  pinned two-cell ones: a base plus its trailing marks (Mc stays with the
+  consonant so the shaper can reorder a left-matra) lands in
+  `<span class="mtv-w1">`, sized to exactly one measured ASCII cell, glyph
+  scaled to fit, never clipped. A cluster that absorbs Mc and occupies two
+  cells reuses `.mtv-w2`. ASCII and box-drawing / braille stay
+  **byte-identical** — no wrapper, not one extra byte. v0.15.6's CJK and
+  emoji behaviour is unchanged.
+
+  Hosts whose `--font-mono` is already fixed-advance for every script can
+  turn the one-cell pin off: `sessionPresentation.pinNarrowCells: false`.
+  That gives the spans back (a 40-column Thai line is one text node again)
+  and gives up the grid guarantee for those scripts. Dual-width CJK/emoji
+  pins stay on; they are not the DOM cost this switch exists to avoid.
+  `EmbedView` does not read the presentation option — pass `pinNarrowCells`
+  on `TermView` there.
+
+  Devanagari conjuncts such as `क्ष` and the tail of `हिन्दी` (`न्दी`, 3
+  cells) are pinned as one grapheme so the virama can still join. The box
+  is N cells; the ink is narrower. That is the pin doing its job, not a
+  remaining width bug. Splitting on "base + marks" painted a visible
+  virama — `Intl.Segmenter` is what keeps the conjunct in one box. Scripts we could make agree on
+  the cell count (live tmux vs `stringCells`): Latin, Vietnamese, Greek,
+  Cyrillic, Arabic, Hebrew, Thai, Lao, Khmer, Myanmar, Tamil, Bengali,
+  Telugu, Gujarati, Gurmukhi, Kannada, Malayalam, Sinhala, Tibetan, Hangul,
+  Hiragana, Katakana, CJK, Armenian, Georgian, Ethiopic, Cherokee, Yi,
+  Tifinagh, N'Ko, emoji, box-drawing, braille. Three Cf marks disagreed
+  before the neighbour pass and agree now.
 
 ## v0.15.6 — 2026-08-14
 

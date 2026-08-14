@@ -242,9 +242,14 @@ corner for the stock ✛ `DpadSheet`: `'bottom-left' | 'bottom-right' |
 default stays bottom-left so existing hosts do not see a silent move; hosts
 that want the pad off the newest output pass `'top-right'` (or another corner).
 Every corner uses `env(safe-area-inset-*)` for that edge (Playwright reads
-`env()` as 0 — device check only). `EmbedView` does not read
+`env()` as 0 — device check only). `pinNarrowCells` (optional, stock default
+**true**) pins one-cell non-ASCII clusters into a one-cell box so a
+proportional fallback cannot walk the grid. Set `false` when the host font is
+already fixed-advance for every script: you give up that guarantee and the
+wrapper spans go away (a 40-column Thai line is one text node again). Dual-width
+CJK/emoji pins (`.mtv-w2`) are not behind this switch. `EmbedView` does not read
 `sessionPresentation` (composer stays hardcoded COMPOSE; font is only its
-explicit `fontPx` prop; no dpad). Copy does not get a second policy adapter: the
+explicit `fontPx` prop; no dpad; pass `pinNarrowCells` on `TermView` directly). Copy does not get a second policy adapter: the
 opt-in action transformer receives optional `SessionActionContext.copyAll`
 (whole-buffer, ignores selection), while legacy `extraActions` keeps its
 original two-member runtime context and the untouched stock copy action remains
