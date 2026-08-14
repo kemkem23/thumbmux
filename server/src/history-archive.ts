@@ -99,6 +99,15 @@ function commonPrefixLength(left: readonly string[], right: readonly string[]): 
 }
 
 /**
+ * Captures frequently rewrite the prompt and one adjacent status/footer row.
+ * The same bound is used by `looksLikeTailRepaint`, client
+ * `readerAnchorLineDelta`, and scroll-overlap recovery below. Changing it
+ * here without the others re-opens the residual archive/live seam.
+ * Module-private on purpose — not a new public API (lane rule).
+ */
+const CAPTURE_TAIL_REWRITE_ROWS = 2;
+
+/**
  * Classify consecutive live terminal captures that most likely changed in
  * place instead of scrolling. A stable prefix with at most two rewritten tail
  * rows is treated as a prompt/status repaint so callers do not manufacture
@@ -110,7 +119,7 @@ export function looksLikeTailRepaint(previous: readonly string[], next: readonly
   // Captures frequently rewrite the prompt and one adjacent tail row. A
   // stable prefix through that tail is stronger evidence of an in-place
   // repaint than any coincidental suffix→prefix match in repeated output.
-  return commonPrefixLength(previous, next) >= Math.max(1, shortest - 2);
+  return commonPrefixLength(previous, next) >= Math.max(1, shortest - CAPTURE_TAIL_REWRITE_ROWS);
 }
 
 function minimumReliableOverlap(previous: readonly string[], next: readonly string[]): number {
@@ -119,6 +128,42 @@ function minimumReliableOverlap(previous: readonly string[], next: readonly stri
   // Require at least half of a tiny window and up to eight rows for a normal
   // terminal window. One repeated separator/status row is not proof of scroll.
   return Math.min(shortest, Math.max(2, Math.min(8, Math.ceil(shortest / 2))));
+}
+
+/**
+ * How many leading rows of `previous` scrolled out of the live window.
+ *
+ * Exact suffix→prefix overlap fails when the bottom prompt/status rewrites
+ * (the residual 2-row seam): the shared content is still there, but the
+ * match cannot include the rewritten tail. Fall back to matching after
+ * dropping up to CAPTURE_TAIL_REWRITE_ROWS trailing rows of `previous` —
+ * the rewritten tail is not archived as departed history.
+ *
+ * Returns null when there is no reliable scroll proof (caller must not
+ * invent history). Module-private — not a new public export.
+ */
+function stableScrollDeparture(
+  previous: readonly string[],
+  next: readonly string[],
+  maxTailRewrite: number = CAPTURE_TAIL_REWRITE_ROWS,
+): { overlap: number; departed: number } | null {
+  const exact = stableOverlap(previous, next);
+  if (exact > 0) {
+    return { overlap: exact, departed: previous.length - exact };
+  }
+
+  const tailMax = Math.min(
+    Math.max(0, Math.floor(maxTailRewrite)),
+    Math.max(0, previous.length - 1),
+  );
+  for (let tail = 1; tail <= tailMax; tail++) {
+    const prevStable = previous.slice(0, previous.length - tail);
+    const overlap = stableOverlap(prevStable, next);
+    if (overlap > 0) {
+      return { overlap, departed: prevStable.length - overlap };
+    }
+  }
+  return null;
 }
 
 function emptyState(): ArchiveState {
@@ -252,20 +297,29 @@ export class FileHistoryArchive implements HistoryArchiveLike {
         }
 
         if (!reconciledFullHistory && !opts.replace) {
-          const overlap = looksLikeTailRepaint(state.live, nextLive)
-            ? 0
-            : stableOverlap(state.live, nextLive);
-          // No reliable suffix→prefix overlap means a repaint, an in-place
-          // edit, or an ambiguous repeated row — not proof that prior live
-          // rows scrolled out. Fail safe by replacing the live view without
-          // manufacturing history or advancing its logical origin.
-          if (overlap >= minimumReliableOverlap(state.live, nextLive)) {
-            const leavingCount = state.live.length - overlap;
+          // In-place prompt/status repaints share a long common *prefix* and
+          // must not invent scrolled history from a coincidental suffix match.
+          // Real scrolls with a rewritten tail share almost no prefix and need
+          // tail-tolerant suffix matching (stableScrollDeparture) or the top
+          // of the live window is lost at the archive/live seam.
+          const match = looksLikeTailRepaint(state.live, nextLive)
+            ? null
+            : stableScrollDeparture(state.live, nextLive);
+          // No reliable overlap means a full repaint, an in-place edit, or an
+          // ambiguous repeated row — not proof that prior live rows scrolled
+          // out. Fail safe by replacing the live view without manufacturing
+          // history or advancing its logical origin.
+          if (
+            match !== null
+            && match.overlap >= minimumReliableOverlap(state.live, nextLive)
+            && match.departed > 0
+          ) {
+            const leavingCount = match.departed;
             for (let i = 0; i < leavingCount; i++) {
               state.entries.push({ line: state.liveStart + i, text: state.live[i]! });
             }
             state.liveStart += leavingCount;
-            entriesChanged = leavingCount > 0;
+            entriesChanged = true;
           }
         }
         // Without a full-history proof, replace means an in-place resize

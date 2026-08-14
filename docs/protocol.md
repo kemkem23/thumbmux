@@ -207,9 +207,16 @@ Hosts that reconcile scrolled-off rows only when the mux still holds
 `previousContent` are especially exposed: `dropSessionState` clears that cache
 when the last viewer unsubscribes, so a shrink on reopen permanently loses the
 seam. `FileHistoryArchive` keeps its own live window and reconciles through
-`stableOverlap`; a custom archive must do the same (or equivalent) and must treat
-a capture narrower than the prior live window as a **shrink to reconcile**, not
-as a repaint that discards the middle.
+exact `stableOverlap`, then the same match after dropping up to **two** trailing
+rows of the previous live window. The two-row bound is the same one used by
+`looksLikeTailRepaint` and the client's `readerAnchorLineDelta`: captures
+routinely rewrite the prompt and one adjacent status/footer row every turn.
+Exact suffix→prefix overlap alone returns 0 in that case even when nearly the
+whole window is shared, which permanently lost the top of the live window at
+the archive/live seam (the residual "2 rows" marker after the large D1 fix). A
+custom archive must apply the same tolerance — or equivalent — and must treat a
+capture narrower than the prior live window as a **shrink to reconcile**, not as
+a repaint that discards the middle.
 
 #### Two kinds of missing rows, one label
 

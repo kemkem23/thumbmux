@@ -101,6 +101,25 @@ describe("public terminal-capture reconciliation helpers", () => {
     expect(looksLikeTailRepaint(previous, shifted)).toBe(false);
     expect(looksLikeTailRepaint(previous, [] as const)).toBe(true);
   });
+
+  test("scroll + rewritten prompt: exact suffix overlap is 0 (the residual 2-row bug)", () => {
+    // Real shell/TUI captures end with a prompt that rewrites every turn.
+    // A pure suffix→prefix match then returns 0 even when ~all content is shared.
+    // looksLikeTailRepaint / readerAnchorLineDelta already encode maxTailRewrite=2;
+    // archive reconciliation must use the same tolerance or it loses the seam.
+    const previous = [
+      ...Array.from({ length: 98 }, (_, i) => `line-${i}`),
+      "status",
+      "prompt>",
+    ];
+    const next = [
+      ...Array.from({ length: 96 }, (_, i) => `line-${i + 2}`),
+      "status updated",
+      "prompt>x",
+    ];
+    expect(stableOverlap(previous, next)).toBe(0);
+    expect(looksLikeTailRepaint(previous, next)).toBe(false);
+  });
 });
 
 describe("FileHistoryArchive", () => {
@@ -127,6 +146,42 @@ describe("FileHistoryArchive", () => {
     expect(result.lines).toEqual(capture(0, 6).split("\n"));
     expect(result.startLine).toBe(0);
     expect(result.hasMore).toBe(false);
+  });
+
+  test("archives rows that scrolled off even when the prompt/status tail rewrote (residual 2-row seam)", () => {
+    // Pre-fix: stableOverlap returned 0 because the last 1–2 rows (prompt +
+    // status) rewrite every capture, so the archive never received the two
+    // content rows that left the top of the live window. Production then saw
+    // `… 2 rows not captured (archive/live seam) …` (or silent loss when
+    // lengths stayed equal).
+    const { archive } = makeArchive();
+    const liveLimit = 20;
+    const previous = [
+      ...Array.from({ length: liveLimit - 2 }, (_, i) => `row-${i}`),
+      "status-old",
+      "prompt-old>",
+    ];
+    const next = [
+      ...Array.from({ length: liveLimit - 4 }, (_, i) => `row-${i + 2}`),
+      "status-new",
+      "prompt-new>",
+      "typed-a",
+      "typed-b",
+    ];
+    expect(previous).toHaveLength(liveLimit);
+    expect(next).toHaveLength(liveLimit);
+
+    ingest(archive, "seam", previous.join("\n"), true, liveLimit);
+    expect(page(archive, "seam", null).lines).toEqual([]);
+
+    // Exact suffix overlap is zero — that is the bug signature.
+    expect(stableOverlap(previous, next)).toBe(0);
+
+    ingest(archive, "seam", next.join("\n"), false, liveLimit);
+    const archived = page(archive, "seam", null).lines;
+    // The two content rows that left the top must be archived; the rewritten
+    // prompt/status tail must not be manufactured into history.
+    expect(archived).toEqual(["row-0", "row-1"]);
   });
 
   test("normalizes newline-terminated captures and strips only trailing blank viewport rows", () => {

@@ -7,6 +7,18 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.5-dist`.
 
 ### Fixed
 
+- **Residual 2-row hole at the archive/live seam when the prompt rewrites** —
+  live reconciliation used exact suffix→prefix overlap only. Shell/TUI
+  captures rewrite the prompt and one adjacent status row every turn (same
+  bound as `looksLikeTailRepaint` and client `readerAnchorLineDelta`), so
+  overlap returned 0 even when nearly the whole window was shared. The rows
+  that had scrolled off the top of the live window were never archived; hosts
+  that mark zero-overlap shrinks then showed `… 2 rows not captured
+  (archive/live seam) …`. `FileHistoryArchive` now retries the match after
+  dropping up to two trailing rows of the previous live window. A pure
+  in-place tail repaint still does not invent history. Docs:
+  `docs/protocol.md` live-window bootstrap section.
+
 - **`sessionPresentation.actions` treated every spread of a stock action as a
   host action** — pure object identity decided whether the shell wraps `onTap`
   to close the FAB first. A host that only added `testid` (or relabelled)
