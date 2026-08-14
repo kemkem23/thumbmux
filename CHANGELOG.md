@@ -37,6 +37,17 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.15.7-dist`.
   standalone `TermView` always pins. The switch is not a new TermView prop
   (that surface is F-tier).
 
+  **Thumbnails pin too.** `SessionThumb` already went through `lineToHtml`,
+  so v0.15.6's `.mtv-w2` and this release's `.mtv-w1` were in every hub
+  card — but TermView scopes the box CSS under `.mtv-line`, which a
+  thumbnail `<div>` is not. The spans were paid for and did nothing.
+  `SessionThumb` now owns the same pin CSS and measures `--mtv-cw` from
+  ten ASCII Ms (same as TermView). Bare `1ch` is a cell in this face
+  (0.997–1.000 × M at 7–13px) but cannot be used for both `width` and
+  `font-size` on the same element — `ch` follows the new size and the
+  box shrinks. A mis-aligned box table in a card is the same defect at
+  a smaller size.
+
   Devanagari conjuncts such as `क्ष` and the tail of `हिन्दी` (`न्दी`, 3
   cells) are pinned as one grapheme so the virama can still join. The box
   is N cells; the ink is narrower. That is the pin doing its job, not a

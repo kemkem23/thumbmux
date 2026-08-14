@@ -577,6 +577,59 @@ describe("A6-19 SessionThumb SGR context before slice", () => {
   });
 });
 
+describe("SessionThumb pins wide and one-cell clusters", () => {
+  test("thumbnail CSS sizes .mtv-w1 / .mtv-w2 — spans are not inert wrappers", async () => {
+    const originalSubscribe = tmuxMux.subscribe.bind(tmuxMux);
+    const payload = "a漢ส✅";
+    let deliver: ((data: string, type?: string) => void) | null = null;
+    tmuxMux.subscribe = ((
+      _session: string,
+      cb: (data: string, type?: string) => void,
+    ) => {
+      deliver = cb;
+      return () => {
+        deliver = null;
+      };
+    }) as typeof tmuxMux.subscribe;
+
+    try {
+      const { target } = mountComponent(SessionThumb, {
+        session: "thumb-pin",
+        palette,
+        maxLines: 4,
+      });
+      await tick();
+      if (!deliver) throw new Error("subscribe not called");
+      flushSync(() => {
+        deliver!(payload, "output");
+      });
+      await tick();
+
+      const thumb = target.querySelector<HTMLElement>('[data-testid="session-thumb"]');
+      if (!thumb) throw new Error("thumb missing");
+      const w2 = thumb.querySelector<HTMLElement>(".mtv-w2");
+      const w1 = thumb.querySelector<HTMLElement>(".mtv-w1");
+      expect(w2, "CJK/emoji must still emit mtv-w2").toBeTruthy();
+      expect(w1, "Thai must emit mtv-w1").toBeTruthy();
+
+      // TermView scopes pin CSS under `.mtv-line` (hashed). A thumbnail
+      // <div> never matches, so happy-dom (and the browser) leave the
+      // span as an unstyled inline. The stylesheet that ships with
+      // SessionThumb must own the box — 1ch is a cell in this mono face
+      // (measured 0.997–1.000 × M at 7–13px).
+      const css = [...document.querySelectorAll("style")]
+        .map((el) => el.textContent ?? "")
+        .join("\n");
+      expect(css).toContain("inline-flex");
+      expect(css).toMatch(/--mtv-cw/);
+      expect(css).toMatch(/mtv-w1/);
+      expect(css).toMatch(/mtv-w2/);
+    } finally {
+      tmuxMux.subscribe = originalSubscribe as typeof tmuxMux.subscribe;
+    }
+  });
+});
+
 // ─── A6-12: ActionFab closed slots not tabbable ─────────────────────────────
 
 describe("A6-12 ActionFab closed slots", () => {
