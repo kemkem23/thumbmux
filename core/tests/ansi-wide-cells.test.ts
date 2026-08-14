@@ -20,6 +20,7 @@ const pal: AnsiPalette = {
 
 const w2 = (s: string) => `<span class="mtv-w2">${s}</span>`;
 const w1 = (s: string) => `<span class="mtv-w1">${s}</span>`;
+const w1fit = (s: string) => `<span class="mtv-w1 mtv-fit">${s}</span>`;
 const wx = (s: string, n: number) => `<span class="mtv-wx" style="--mtv-cells:${n}">${s}</span>`;
 
 describe("dual-width cell spans (mtv-w2)", () => {
@@ -75,13 +76,13 @@ describe("dual-width cell spans (mtv-w2)", () => {
     expect(lineToHtml("❗", createSgrState(), pal)).toBe(w2("❗"));
     expect(lineToHtml("⌚", createSgrState(), pal)).toBe(w2("⌚"));
     // ⚠ is EAW=N / tmux=1 — not dual-width, but it is a one-cell non-ASCII pin.
-    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1("⚠"));
+    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1fit("⚠"));
     expect(lineToHtml("⚠", createSgrState(), pal)).not.toContain("mtv-w2");
   });
 
   test("FE0F-promoted base is one dual-width unit", () => {
-    // ❤ alone narrow (mtv-w1); ❤️ (❤ + FE0F) is 2 cells in our tmux → mtv-w2.
-    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1("❤"));
+    // ❤ alone narrow (mtv-w1 + fit); ❤️ (❤ + FE0F) is 2 cells → mtv-w2.
+    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1fit("❤"));
     expect(lineToHtml("❤️", createSgrState(), pal)).toBe(w2("❤️"));
   });
 
@@ -89,7 +90,7 @@ describe("dual-width cell spans (mtv-w2)", () => {
     const line = "│ ✅ ❌ ⭐ ⚠ 漢 │";
     const html = lineToHtml(line, createSgrState(), pal);
     expect(html).toBe(
-      `│ ${w2("✅")} ${w2("❌")} ${w2("⭐")} ${w1("⚠")} ${w2("漢")} │`,
+      `│ ${w2("✅")} ${w2("❌")} ${w2("⭐")} ${w1fit("⚠")} ${w2("漢")} │`,
     );
   });
 
@@ -112,9 +113,18 @@ describe("dual-width cell spans (mtv-w2)", () => {
     expect(lineToHtml("ก", createSgrState(), pal)).toBe(w1("ก"));
     expect(lineToHtml("aกb", createSgrState(), pal)).toBe(`a${w1("ก")}b`);
     expect(lineToHtml("─│╭", createSgrState(), pal)).toBe("─│╭");
-    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1("⚠"));
-    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1("❤"));
+    expect(lineToHtml("⚠", createSgrState(), pal)).toBe(w1fit("⚠"));
+    expect(lineToHtml("❤", createSgrState(), pal)).toBe(w1fit("❤"));
     expect(lineToHtml("Ελ", createSgrState(), pal)).toBe(`${w1("Ε")}${w1("λ")}`);
+  });
+
+  test("one-cell letters inherit size; one-cell symbols carry mtv-fit", () => {
+    // Letters must not get the emoji scale-to-fit class — that clamp is
+    // 0.552em on a 0.6em cell and was shrinking every Thai glyph to 55%.
+    expect(lineToHtml("ก", createSgrState(), pal)).toBe(w1("ก"));
+    expect(lineToHtml("ก", createSgrState(), pal)).not.toContain("mtv-fit");
+    expect(lineToHtml("⚠", createSgrState(), pal)).toContain("mtv-fit");
+    expect(lineToHtml("❤", createSgrState(), pal)).toContain("mtv-fit");
   });
 
   test("Devanagari keeps Mc with its base (shaped cluster, width = cells)", () => {
