@@ -18,7 +18,45 @@
  * lines stay byte-identical to the pre-wide-cell renderer.
  */
 
-import { wideUnitLength } from './cells';
+import { charCellWidth } from './cells';
+
+/** U+FE0F — tmux promotes a preceding 1-cell base to 2 (see cells.ts stringCells). */
+const VS16 = 0xfe0f;
+
+/**
+ * Dual-width *unit* length at UTF-16 index `i`: a wide code point (+ trailing
+ * zero-width), or a narrow base + FE0F that tmux counts as two cells. 0 if the
+ * code point at `i` is not the start of a dual-width unit.
+ * Kept private — not a public export (contract gate).
+ */
+function wideUnitLength(text: string, i: number): number {
+  if (i >= text.length) return 0;
+  const cp = text.codePointAt(i)!;
+  const cpLen = cp > 0xffff ? 2 : 1;
+  const w = charCellWidth(cp);
+  if (w === 2) {
+    let end = i + cpLen;
+    while (end < text.length) {
+      const next = text.codePointAt(end)!;
+      if (charCellWidth(next) !== 0) break;
+      end += next > 0xffff ? 2 : 1;
+    }
+    return end - i;
+  }
+  if (w === 1) {
+    const j = i + cpLen;
+    if (j < text.length && text.codePointAt(j) === VS16) {
+      let end = j + 1;
+      while (end < text.length) {
+        const next = text.codePointAt(end)!;
+        if (charCellWidth(next) !== 0) break;
+        end += next > 0xffff ? 2 : 1;
+      }
+      return end - i;
+    }
+  }
+  return 0;
+}
 
 export type UnderlineStyle = 'single' | 'double' | 'curly' | 'dotted' | 'dashed';
 

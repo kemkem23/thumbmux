@@ -18,7 +18,7 @@ const ZERO_WIDTH = /^[​-‍︀-️]$/;
 const COMBINING = /\p{M}/u;
 
 /** U+FE0F emoji-style variation selector — zero-width alone, promotes base. */
-export const VS16 = 0xfe0f;
+const VS16 = 0xfe0f;
 
 /** [start, end] inclusive code-point ranges rendered double-width. Sorted. */
 const WIDE_RANGES: Array<[number, number]> = [
@@ -159,37 +159,4 @@ export function prefixForCells(text: string, cells: number): { prefix: string; c
   return { prefix: text.slice(0, end), cells: consumed };
 }
 
-/**
- * Whether `text` starting at UTF-16 index `i` is a dual-width *unit* for the
- * render path: either a single wide code point, or a narrow base + FE0F that
- * tmux promotes to two cells. Returns the UTF-16 length of the unit, or 0.
- */
-export function wideUnitLength(text: string, i: number): number {
-  if (i >= text.length) return 0;
-  const cp = text.codePointAt(i)!;
-  const cpLen = cp > 0xffff ? 2 : 1;
-  const w = charCellWidth(cp);
-  if (w === 2) {
-    let end = i + cpLen;
-    while (end < text.length) {
-      const next = text.codePointAt(end)!;
-      if (charCellWidth(next) !== 0) break;
-      end += next > 0xffff ? 2 : 1;
-    }
-    return end - i;
-  }
-  if (w === 1) {
-    const j = i + cpLen;
-    if (j < text.length && text.codePointAt(j) === VS16) {
-      // base + FE0F (+ further trailing zero-width)
-      let end = j + 1; // FE0F is BMP
-      while (end < text.length) {
-        const next = text.codePointAt(end)!;
-        if (charCellWidth(next) !== 0) break;
-        end += next > 0xffff ? 2 : 1;
-      }
-      return end - i;
-    }
-  }
-  return 0;
-}
+
