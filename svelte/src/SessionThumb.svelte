@@ -151,7 +151,7 @@
     height: 1.38em;
     box-sizing: border-box;
     vertical-align: top;
-    overflow: hidden;
+    overflow: visible;
     white-space: pre;
     line-height: 1;
   }
@@ -161,6 +161,7 @@
   }
   .tail :global(.mtv-w1.mtv-fit) {
     font-size: min(var(--mtv-lineh, 1.38em), calc(var(--mtv-cw, 1ch) * 0.92));
+    overflow: hidden;
   }
   .tail :global(.mtv-w2) {
     width: calc(2 * var(--mtv-cw, 1ch));

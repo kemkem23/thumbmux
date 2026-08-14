@@ -3407,8 +3407,11 @@
    *
    * Colour emoji fonts often paint ~1em×1em ink while two mono cells are only
    * ~1.2em wide — overflow:hidden alone *clips* the picture. Cap font-size so
-   * 1em of ink fits the box on both axes; overflow:hidden stays as a safety
-   * net only. The box size itself never changes (grid is sacrosanct).
+   * 1em of ink fits the box on both axes. Letter boxes must NOT clip: Thai ำ
+   * (and Devanagari, and any mark that reaches left of its origin) is a
+   * letter in its own cell whose ink belongs over the previous consonant.
+   * The clip stays only on .mtv-fit, where we scale square symbol ink on
+   * purpose. The box size itself never changes (grid is sacrosanct).
    */
   .mtv-line :global(.mtv-w1),
   .mtv-line :global(.mtv-w2),
@@ -3419,7 +3422,7 @@
     height: var(--mtv-lineh);
     box-sizing: border-box;
     vertical-align: top;
-    overflow: hidden;
+    overflow: visible;
     white-space: pre;
     line-height: 1;
   }
@@ -3432,6 +3435,7 @@
   .mtv-line :global(.mtv-w1.mtv-fit) {
     /* Square-ink 1-cell symbols (⚠) really do overflow the cell. */
     font-size: min(var(--mtv-lineh), calc(var(--mtv-cw, 1ch) * 0.92));
+    overflow: hidden;
   }
   .mtv-line :global(.mtv-w2) {
     width: calc(2 * var(--mtv-cw, 1ch));

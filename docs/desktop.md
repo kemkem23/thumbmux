@@ -564,11 +564,14 @@ and row height. That measurement is only trustworthy when:
    fallback after a Latin mono primary is the same silent-grid failure as (2).
    From v0.15.7 `TermView` also **pins** one-cell non-ASCII clusters
    (`.mtv-w1`) the same way it already pins CJK/emoji (`.mtv-w2`): the box is
-   one measured ASCII cell and the glyph is scaled to fit, so a missing
-   script face can no longer walk the column grid. The pin is not a
-   substitute for a real mono face — marks still need a font that attaches
-   them — but it is the only mechanism that works for scripts we will never
-   ship a font for. Hosts whose face is already fixed-advance set
+   one measured ASCII cell, so a missing script face can no longer walk the
+   column grid. From v0.15.9 those letter boxes are `overflow: visible` —
+   Thai `ำ`, Devanagari, and any mark that reaches left of its origin must
+   paint into the previous cell; a clip deletes the glyph. `.mtv-w1.mtv-fit`
+   (square symbols) still clips. The pin is not a substitute for a real mono
+   face — marks still need a font that attaches them — but it is the only
+   mechanism that works for scripts we will never ship a font for. Hosts
+   whose face is already fixed-advance set
    `sessionPresentation.pinNarrowCells: false` and give the spans back.
 
 Practical host checklist: pick a mono primary that includes box-drawing (self-hosted

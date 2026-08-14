@@ -1,7 +1,35 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.8-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.15.9-dist`.
+
+## v0.15.9 — 2026-08-14
+
+### Fixed
+
+- **Thai (and any script whose ink reaches backwards) was being clipped out of
+  its own cell.** v0.15.7 pinned one-cell letters in `.mtv-w1` and kept
+  `overflow: hidden` on the box as a safety net. That net deletes correct
+  glyphs. `ำ` (U+0E33 SARA AM) is a **letter**, not a mark — its นิคหิต is
+  designed to sit above and to the left of its own origin, over the preceding
+  consonant. At the shipped host face the ink starts at `x0 = −253` (42 % of a
+  cell backwards). The box clipped at its left edge, so `ทำให้` painted as
+  `ทาให้`: the vowel was not chipped, it was gone. Same mechanism, smaller
+  reach, for `ๅ` and the pre-posed vowels `โ ใ ไ`, and for anything else
+  (Devanagari included) whose marks reach left of the cell that reserved
+  them.
+
+  Letter boxes — `.mtv-w1`, `.mtv-w2`, `.mtv-wx` — are now `overflow: visible`.
+  The clip stays only on `.mtv-w1.mtv-fit`, where we deliberately scale
+  square symbol ink (`⚠`, `❤`) down and a clip is a real backstop. The grid
+  does not move: a box is still exactly N measured ASCII cells; only what is
+  *painted* changed. Do not "fix" this by shifting `ำ` into the middle of its
+  own box — the นิคหิต belongs over the previous consonant.
+
+  One glyph in the shipped host font still paints past its cell to the
+  **right** when isolated: Devanagari `ि` (U+093F), about 2.5 px at 15 px.
+  In real text it is absorbed into `हि` (`.mtv-w2`). The answer to a
+  right-overflow is the font, not the box. The clip is not coming back.
 
 ## v0.15.8 — 2026-08-14
 
