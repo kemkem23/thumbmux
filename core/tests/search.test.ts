@@ -14,15 +14,47 @@ const TEST_PALETTE: AnsiPalette = {
   defaultBg: "#000000",
 };
 
-/** Extract the full text inside the first search-match span from lineToHtml output. */
+/**
+ * Visible text inside the first `search-match` span from lineToHtml output.
+ *
+ * Nesting-aware: dual-width cells wrap wide glyphs in an inner `.mtv-w2`
+ * span, so the first `</span>` is no longer the search-match closer. Walk
+ * tag depth to the matching close, then strip markup and unescape so the
+ * contract stays "highlighted region === query as visible text" (no half
+ * surrogate, no markup-shape assertion).
+ */
 function highlightedSubstring(html: string): string | null {
   const open = '<span class="search-match">';
   const start = html.indexOf(open);
   if (start < 0) return null;
-  const contentStart = start + open.length;
-  const end = html.indexOf("</span>", contentStart);
-  if (end < 0) return null;
-  return html.slice(contentStart, end);
+  let i = start + open.length;
+  let depth = 1;
+  const contentStart = i;
+  while (i < html.length && depth > 0) {
+    const lt = html.indexOf("<", i);
+    if (lt < 0) return null;
+    if (html.startsWith("</span>", lt)) {
+      depth -= 1;
+      if (depth === 0) {
+        return html
+          .slice(contentStart, lt)
+          .replace(/<[^>]*>/g, "")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/&amp;/g, "&");
+      }
+      i = lt + "</span>".length;
+      continue;
+    }
+    const gt = html.indexOf(">", lt);
+    if (gt < 0) return null;
+    // Opening <span…> (not a close — those handled above) deepens the walk.
+    if (/^<span(?:\s|>)/i.test(html.slice(lt, gt + 1))) depth += 1;
+    i = gt + 1;
+  }
+  return null;
 }
 
 /** Assert no match span starts or ends mid-surrogate-pair. */

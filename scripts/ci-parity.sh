@@ -64,7 +64,12 @@ else
   contract_remote_url="$(git -C "$repo_root" remote get-url origin)"
 fi
 
-echo "ci-parity: exporting $archive_ref -> $work"
+# Print the commit hash next to the archive ref. A gate that only says
+# "exporting HEAD:…" lets a lane report a green log taken 44s *before* its
+# own fix commit and look identical to a real green (v0156 CJK review).
+export_head="$(git -C "$repo_root" rev-parse HEAD)"
+export_subj="$(git -C "$repo_root" log -1 --format='%s' HEAD)"
+echo "ci-parity: exporting $archive_ref @ $export_head ($export_subj) -> $work"
 git -C "$repo_root" archive "$archive_ref" | tar -x -C "$work"
 cd "$work"
 

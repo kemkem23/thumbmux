@@ -213,8 +213,10 @@ describe("ansi-modern seam", () => {
       [{ start: 1, end: 3, href: "https://astral.example" }],
     );
 
+    // Wide glyphs (emoji = 2 cells) are pinned in .mtv-w2 so the render grid
+    // matches tmux columns regardless of host font advance.
     expect(html).toBe(
-      `x<a href="https://astral.example" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline">${emoji}</a>y`,
+      `x<a href="https://astral.example" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline"><span class="mtv-w2">${emoji}</span></a>y`,
     );
 
     expect(lineToHtml(
@@ -223,7 +225,7 @@ describe("ansi-modern seam", () => {
       palette,
       undefined,
       [{ start: 1, end: 3, kind: "search-match" }],
-    )).toBe(`x<span class="search-match">${emoji}</span>y`);
+    )).toBe(`x<span class="search-match"><span class="mtv-w2">${emoji}</span></span>y`);
   });
 
   test("a malformed OSC 8 replacement clears an earlier OSC 8 link", () => {
@@ -267,7 +269,7 @@ describe("ansi-modern hardening", () => {
       ],
     );
     expect(loneSurrogate.test(overlayHtml)).toBe(false);
-    expect(overlayHtml).toContain('<span class="search-match">\u{1F603}</span>');
+    expect(overlayHtml).toContain('<span class="search-match"><span class="mtv-w2">\u{1F603}</span></span>');
 
     const linkHtml = lineToHtml(
       "a😃b",
@@ -276,7 +278,7 @@ describe("ansi-modern hardening", () => {
       [{ start: 2, end: 3, href: "https://x.example" }],
     );
     expect(loneSurrogate.test(linkHtml)).toBe(false);
-    expect(linkHtml).toContain(">\u{1F603}</a>");
+    expect(linkHtml).toContain('><span class="mtv-w2">\u{1F603}</span></a>');
     expect(linkHtml.startsWith("a")).toBe(true);
     expect(linkHtml.endsWith("b")).toBe(true);
   });
@@ -427,10 +429,11 @@ describe("ansi-modern hardening", () => {
     const loneSurrogate =
       /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+    const w2 = (s: string) => `<span class="mtv-w2">${s}</span>`;
     const cases = [
-      { input: "\x1b😃", expected: "😃" },
-      { input: "a\x1b😃b", expected: "a😃b" },
-      { input: "\x1b(😃", expected: "😃" },
+      { input: "\x1b😃", expected: w2("😃") },
+      { input: "a\x1b😃b", expected: `a${w2("😃")}b` },
+      { input: "\x1b(😃", expected: w2("😃") },
     ];
     for (const { input, expected } of cases) {
       const html = lineToHtml(input, createSgrState(), palette);
@@ -445,9 +448,9 @@ describe("ansi-modern hardening", () => {
     expect(lineToHtml("A\x1b7B", createSgrState(), palette)).toBe("AB");
     expect(lineToHtml("A\x1b=B", createSgrState(), palette)).toBe("AB");
     expect(lineToHtml("A\x1b(BB", createSgrState(), palette)).toBe("AB");
-    expect(lineToHtml("\x1b7😃", createSgrState(), palette)).toBe("😃");
+    expect(lineToHtml("\x1b7😃", createSgrState(), palette)).toBe(w2("😃"));
     expect(lineToHtml("a\x1b[31m😃b", createSgrState(), palette)).toBe(
-      'a<span style="color:#f00">😃b</span>',
+      `a<span style="color:#f00">${w2("😃")}b</span>`,
     );
   });
 
@@ -485,8 +488,12 @@ describe("ansi-modern hardening", () => {
     expect(lineToHtml("A\x1b7B", createSgrState(), palette)).toBe("AB");
     expect(lineToHtml("A\x1b=B", createSgrState(), palette)).toBe("AB");
     expect(lineToHtml("A\x1b(BB", createSgrState(), palette)).toBe("AB");
-    expect(lineToHtml("\x1b😃", createSgrState(), palette)).toBe("😃");
-    expect(lineToHtml("\x1b(😃", createSgrState(), palette)).toBe("😃");
+    expect(lineToHtml("\x1b😃", createSgrState(), palette)).toBe(
+      '<span class="mtv-w2">😃</span>',
+    );
+    expect(lineToHtml("\x1b(😃", createSgrState(), palette)).toBe(
+      '<span class="mtv-w2">😃</span>',
+    );
     expect(lineToHtml("before\x1b[31\x1b[0mafter", createSgrState(), palette)).toBe(
       "beforeafter",
     );

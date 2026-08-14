@@ -53,7 +53,7 @@
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
     readerAnchorLineDelta,
-    prefixForCells, stripAnsi, paneTextForCopy,
+    charCellWidth, prefixForCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
@@ -2750,29 +2750,25 @@
     return measureCtx.measureText('MMMMMMMMMM').width / 10;
   }
 
-  // Pixel-accurate caret column: measure the ACTUAL text left of the cursor
-  // with the live font instead of multiplying col × charW — Thai combining
-  // vowels (0 cells), CJK (2 cells) and emoji make cell arithmetic drift
-  // from the DOM's real glyph advances. Memoized: scroll re-renders hit the
-  // cache (the key ignores winStart), only content/cursor changes re-measure.
+  // Caret column on the terminal grid. Dual-width glyphs (CJK/emoji) are
+  // pinned to two cells by `mtv-w2` in the render path, so cell arithmetic
+  // matches the DOM. Font advances alone do not — a CJK glyph is often ~1.6
+  // ASCII cells of ink while the grid still owes it two. Memoized: scroll
+  // re-renders hit the cache (the key ignores winStart).
   let cursorPosCache = { key: '', left: 0, width: 0 };
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
     const key = `${col}|${fontPx}|${charW}|${raw}`;
     if (cursorPosCache.key === key) return cursorPosCache;
-    if (!measureCtx) measureCharWidth();
-    let left = col * charW;
+    const left = col * charW;
     let width = charW;
-    if (measureCtx) {
-      const line = stripAnsi(raw);
-      const { prefix, cells } = prefixForCells(line, col);
-      measureCtx.font = measureFontSpec();
-      const prefixPx = measureCtx.measureText(prefix).width;
-      // cursor past the end of the text (blank cells) → pad with charW
-      left = prefixPx + Math.max(0, col - cells) * charW;
-      let nextChar: string | undefined;
-      for (const c of line.slice(prefix.length)) { nextChar = c; break; }
-      if (nextChar) width = measureCtx.measureText(prefix + nextChar).width - prefixPx;
+    const line = stripAnsi(raw);
+    const { prefix } = prefixForCells(line, col);
+    let nextChar: string | undefined;
+    for (const c of line.slice(prefix.length)) { nextChar = c; break; }
+    if (nextChar) {
+      const w = charCellWidth(nextChar.codePointAt(0)!);
+      width = Math.max(1, w === 0 ? 1 : w) * charW;
     }
     cursorPosCache = { key, left, width };
     return cursorPosCache;
@@ -3211,6 +3207,7 @@
   style:font-size={`${fontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
+  style:--mtv-cw={charW > 0 ? `${charW}px` : '1ch'}
   style:--tfg={palette.defaultFg}
   style:--tbg={palette.defaultBg}
   ontouchstart={onTouchStart}
@@ -3380,6 +3377,29 @@
        rows shoved the tail ~90px below the fold. height beats glyph extents. */
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
+  }
+  /*
+   * Dual-width cells (CJK / fullwidth / emoji / EAW=W dingbats / base+FE0F).
+   * ansi-html wraps each dual-width unit in .mtv-w2; we pin the box to exactly
+   * two measured ASCII cells so column N lands where tmux says it does.
+   *
+   * Colour emoji fonts often paint ~1em×1em ink while two mono cells are only
+   * ~1.2em wide — overflow:hidden alone *clips* the picture. Cap font-size so
+   * 1em of ink fits the box on both axes; overflow:hidden stays as a safety
+   * net only. The box size itself never changes (grid is sacrosanct).
+   */
+  .mtv-line :global(.mtv-w2) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: calc(2 * var(--mtv-cw, 1ch));
+    height: var(--mtv-lineh);
+    box-sizing: border-box;
+    vertical-align: top;
+    overflow: hidden;
+    white-space: pre;
+    line-height: 1;
+    font-size: min(var(--mtv-lineh), calc(2 * var(--mtv-cw, 1ch) * 0.92));
   }
   /* Keep the virtual row stride exactly N * lineH. Moving the old text label
      to top:0 would only cover this row instead; doubling the row would break
