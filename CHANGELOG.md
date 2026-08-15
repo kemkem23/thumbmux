@@ -1,7 +1,30 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.2-dist`.
+
+## v0.16.2 — 2026-08-15
+
+### Fixed
+
+- **Periodic session metadata refreshes no longer blank every live thumbnail.**
+  `SessionGrid` deliberately retains cards by session name, but each host
+  snapshot replaces their metadata objects. The child session prop getter was
+  invalidated by that new object even when it returned the same name, so all
+  `SessionThumb` subscription effects cleared their live state, unsubscribed,
+  and immediately subscribed again. When the last viewer left, the server also
+  discarded that pane's cache and delta base, turning a harmless metadata tick
+  into a 40-pane recapture and resync storm. Primitive derived equality barriers
+  now isolate the subscription effect from object identity: equal `(session,
+  maxLines)` values keep the existing subscription and `.tail`, while a real
+  name or line-limit change still resubscribes.
+
+### Documentation
+
+- The desktop contract now states that `screen.mouseSgr` — not alternate-screen
+  state alone — decides whether the terminal owns pointer input, and documents
+  the host-side launcher/verification obligations for agents whose fullscreen
+  modes may silently downgrade.
 
 ## v0.16.1 — 2026-08-15
 
