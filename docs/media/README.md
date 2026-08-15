@@ -61,3 +61,15 @@ renaming one silently breaks the public page.
 
 File sizes should stay in the same neighbourhood as the previous set
 (roughly 40–700 KB). They ship inside the npm tarball.
+
+## The htop shot shows host kernel numbers, and that is fine
+
+`desktop-htop.png` is real htop running inside the capture container. Containers share the host
+kernel, so its header carries the host's total RAM, swap, uptime and load average. No file paths,
+no session names, no work content — the process list is entirely the container's own
+(`sleep infinity` as PID 1, the demo, the staged tmux).
+
+kem reviewed this and accepted it: *"htop ไม่มีอะไร sensitive แบบนี้ไม่เป็นไร"*. Do not "fix" it by
+masking the header or capping the container's memory — it was looked at and allowed, and a later
+round rediscovering the header and hiding it would be undoing a decision rather than finding a
+problem. If the host ever changes such that those numbers matter, that is a new decision.
