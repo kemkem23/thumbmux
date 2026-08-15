@@ -81,6 +81,21 @@ export type ArchiveAppendResult = {
    * it" are different answers, and only the second deserves a marker.
    */
   needsDeeper: boolean;
+  /**
+   * Lines a size cap deleted during this append. `0` whenever no cap is set,
+   * which is every consumer that has not opted in. Reported rather than done
+   * silently: this is the one operation in the archive that destroys history,
+   * so a host that wants to log or alert on it can.
+   *
+   * **Optional in the type, always present at runtime.** Making it required
+   * would narrow a tier-S declaration: anyone who constructs an
+   * `ArchiveAppendResult` — an alternative `HistoryArchiveLike`, a test double —
+   * would have to supply a field they have never heard of, and their code stops
+   * compiling on a minor. The immutable-baseline gate refuses that, correctly.
+   * Every return path in this file sets it, so `?? 0` is defensive, not a real
+   * branch.
+   */
+  prunedLines?: number;
 };
 
 export type DurableHistoryArchiveOptions = {
@@ -90,6 +105,19 @@ export type DurableHistoryArchiveOptions = {
   group?: (session: string) => string;
   chunkLines?: number;
   chunkBytes?: number;
+  /**
+   * Approximate ceiling on how many lines one session keeps. Unset = unbounded,
+   * which is what every 0.16.x consumer already has.
+   *
+   * "Approximate" is load-bearing: pruning drops whole chunk FILES from the
+   * oldest end, because rewriting a partial chunk would cost O(size) and break
+   * the append-only property that makes torn-write recovery a truncation. So a
+   * session holds at least this many lines and up to one chunk more — it never
+   * drops below the cap while it has the lines to meet it.
+   */
+  maxLinesPerSession?: number;
+  /** Same, measured in bytes on disk. Whichever cap is reached first prunes. */
+  maxBytesPerSession?: number;
 };
 
 type Chunk = { file: string; start: number; lines: number; bytes: number };
@@ -135,6 +163,8 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
   private readonly groupOf: (session: string) => string;
   private readonly chunkLines: number;
   private readonly chunkBytes: number;
+  private readonly maxLines: number | null;
+  private readonly maxBytes: number | null;
   private readonly states = new Map<string, SessionState>();
 
   constructor(options: DurableHistoryArchiveOptions) {
@@ -142,6 +172,8 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
     this.groupOf = options.group ?? (() => "_ungrouped");
     this.chunkLines = Math.max(1, Math.floor(options.chunkLines ?? DEFAULT_CHUNK_LINES));
     this.chunkBytes = Math.max(1024, Math.floor(options.chunkBytes ?? DEFAULT_CHUNK_BYTES));
+    this.maxLines = positiveCap(options.maxLinesPerSession);
+    this.maxBytes = positiveCap(options.maxBytesPerSession);
   }
 
   // ── HistoryArchiveLike ────────────────────────────────────────────────────
@@ -166,21 +198,27 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
     const state = this.stateFor(session);
     if (state.disabled || state.totalLines === 0) return emptyPage();
 
+    const floor = archiveFloor(state);
     const requested = Number.isSafeInteger(beforeLine) ? beforeLine! : state.liveStart;
     const end = Math.max(0, Math.min(requested, state.liveStart, state.totalLines));
-    if (end === 0) return emptyPage();
+    if (end <= floor) return emptyPage();
     const pageLimit = Math.max(1, Math.floor(limit));
-    const start = Math.max(0, end - pageLimit);
+    // Clamp to the floor, not to 0. Once a cap has pruned the oldest chunks,
+    // line 0 no longer exists — reporting `startLine: 0` for a page that really
+    // begins at line 70 shifts every number the caller derives from it, and
+    // `hasMore: start > 0` would promise history that cannot be served.
+    const start = Math.max(floor, end - pageLimit);
     const lines = this.readRange(state, start, end);
-    return { lines, startLine: lines.length === 0 ? null : start, hasMore: start > 0 };
+    return { lines, startLine: lines.length === 0 ? null : start, hasMore: start > floor };
   }
 
   readAfter(session: string, afterLine: number | null, limit = 500): HistoryPage {
     const state = this.stateFor(session);
     if (state.disabled || state.totalLines === 0) return emptyPage();
 
-    const start = Math.max(0, Math.min(
-      Number.isSafeInteger(afterLine) ? afterLine! + 1 : 0,
+    const floor = archiveFloor(state);
+    const start = Math.max(floor, Math.min(
+      Number.isSafeInteger(afterLine) ? afterLine! + 1 : floor,
       state.totalLines,
     ));
     const end = Math.min(start + Math.max(1, Math.floor(limit)), state.liveStart);
@@ -242,6 +280,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
         gap: false,
         deferred: stitch.deferred,
         needsDeeper: false,
+        prunedLines: 0,
       };
     }
 
@@ -256,6 +295,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
         gap: false,
         deferred: false,
         needsDeeper: true,
+        prunedLines: 0,
       };
     }
 
@@ -263,6 +303,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
     // same miss repeats every capture and writes a marker every capture — which
     // is how a mechanism built to make an alarm trustworthy starts forging it.
     const gap = !stitch.anchored && tail.length > 0 && stitch.appended.length > 0;
+    let prunedLines = 0;
     try {
       if (gap) this.append(state, [historyGapMarker(new Date())]);
       if (stitch.appended.length > 0) this.append(state, stitch.appended);
@@ -270,6 +311,9 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
         0,
         state.totalLines - Math.min(Math.max(1, opts.liveLineLimit), state.totalLines),
       );
+      // After the write, never before: a cap must bound what is stored, and it
+      // can only know that once this capture is stored.
+      prunedLines = this.enforceCaps(state);
       this.writeMeta(session, state);
     } catch {
       state.disabled = true;
@@ -283,6 +327,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
       gap,
       deferred: false,
       needsDeeper: false,
+      prunedLines,
     };
   }
 
@@ -373,6 +418,75 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
     }
   }
 
+  /**
+   * Delete whole chunk files from the oldest end until the session is within
+   * its caps. Returns how many lines went.
+   *
+   * Two rules the tests pin, both deliberate:
+   *
+   * 1. **Never drop below the cap.** A chunk is removed only when what remains
+   *    after removing it still meets the cap, so the archive overshoots by less
+   *    than one chunk rather than undershooting by up to one. A cap is a ceiling
+   *    on cost, not a target to hit exactly, and holding slightly more history
+   *    than asked is the harmless direction to be wrong in.
+   * 2. **Never renumber.** Line numbers stay absolute; the archive simply starts
+   *    later. Renumbering would invalidate every `startLine` a viewer is holding
+   *    and every line number written into a gap marker.
+   *
+   * The newest chunk is never dropped, so a cap smaller than one chunk degrades
+   * to "keep one chunk" instead of emptying the session.
+   */
+  private enforceCaps(state: SessionState): number {
+    if (this.maxLines === null && this.maxBytes === null) return 0;
+
+    let pruned = 0;
+    while (state.chunks.length > 1) {
+      const oldest = state.chunks[0];
+      const heldLines = state.totalLines - oldest.start;
+      const heldBytes = state.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      const linesAfter = heldLines - oldest.lines;
+      const bytesAfter = heldBytes - oldest.bytes;
+
+      const overLines = this.maxLines !== null && heldLines > this.maxLines;
+      const overBytes = this.maxBytes !== null && heldBytes > this.maxBytes;
+      if (!overLines && !overBytes) break;
+      // Rule 1: only drop while what survives still satisfies every cap.
+      if (this.maxLines !== null && linesAfter < this.maxLines) break;
+      if (this.maxBytes !== null && bytesAfter < this.maxBytes) break;
+
+      try {
+        rmSync(join(state.dir, oldest.file), { force: true });
+      } catch {
+        // Leave it in place and try again next append rather than losing track
+        // of a file that is still on disk.
+        break;
+      }
+      state.chunks.shift();
+      pruned += oldest.lines;
+    }
+
+    // `index.jsonl` is a cache, but a cache that names deleted files is worse
+    // than no cache — it is the shape of bug that makes an external reader trust
+    // something that is not there. Rewrite it from what survived.
+    if (pruned > 0) this.rewriteIndex(state);
+    return pruned;
+  }
+
+  private rewriteIndex(state: SessionState): void {
+    try {
+      const path = join(state.dir, "index.jsonl");
+      const body = state.chunks
+        .map((chunk) => JSON.stringify({ file: chunk.file, start: chunk.start, lines: chunk.lines, bytes: chunk.bytes }))
+        .join("\n");
+      const tmp = `${path}.${process.pid}.tmp`;
+      writeFileSync(tmp, body === "" ? "" : `${body}\n`);
+      chmodSync(tmp, PRIVATE_FILE_MODE);
+      renameSync(tmp, path);
+    } catch {
+      // Same contract as appendIndex: losing the index costs a rescan, never a line.
+    }
+  }
+
   private appendIndex(state: SessionState, chunk: Chunk): void {
     try {
       const path = join(state.dir, "index.jsonl");
@@ -434,5 +548,26 @@ function emptyPage(): HistoryPage {
 
 /** A disabled or broken archive reports zero rather than guessing a position. */
 function failedAppend(): ArchiveAppendResult {
-  return { appended: 0, liveStartLine: 0, totalLines: 0, gap: false, deferred: false, needsDeeper: false };
+  return { appended: 0, liveStartLine: 0, totalLines: 0, gap: false, deferred: false, needsDeeper: false, prunedLines: 0 };
+}
+
+/**
+ * A cap is only a cap when it is a positive finite number. `0`, `NaN` and
+ * negatives mean "unset" rather than "keep nothing" — an env var that failed to
+ * parse must not be read as an instruction to delete every line.
+ */
+/**
+ * The oldest line this archive can still serve. `0` until a cap prunes; after
+ * that, the start of the oldest surviving chunk. Readers clamp to it so a
+ * request for a line that was deleted returns nothing rather than a page whose
+ * reported `startLine` does not match the lines inside it.
+ */
+function archiveFloor(state: SessionState): number {
+  return state.chunks.length === 0 ? 0 : state.chunks[0]!.start;
+}
+
+function positiveCap(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  const floored = Math.floor(value);
+  return Number.isFinite(floored) && floored > 0 ? floored : null;
 }

@@ -121,6 +121,42 @@ to answer a question nobody asked yet.
 - **Anything from before you turned this on.** History that was never captured
   cannot be reconstructed.
 
+## Size caps delete history
+
+`DurableHistoryArchive` grows without limit unless you tell it not to. Two
+options bound one session:
+
+```ts
+new DurableHistoryArchive({
+  root: "/var/lib/myapp/history",
+  maxLinesPerSession: 500_000,   // unset by default
+  maxBytesPerSession: 256 * 1024 * 1024,
+})
+```
+
+**Both are off by default, and turning one on is not reversible.** An append that
+pushes a session past its cap deletes whole chunk files from the oldest end.
+Those lines are gone — there is no tombstone, no marker, and no recovery. The
+count that went is reported as `prunedLines` on the append result, so a host that
+wants to log or alert on it can; nothing is logged for you. That field is
+optional in the type and always set at runtime — required would have narrowed a
+frozen declaration for anyone who builds an `ArchiveAppendResult` themselves.
+
+Three properties are worth knowing before you pick a number:
+
+- **The cap is approximate, and it errs upward.** Pruning removes whole chunks,
+  because rewriting a partial one would cost O(size) and break the append-only
+  property that makes torn-write recovery a truncation. A chunk is dropped only
+  when what remains still meets the cap, so a session holds *at least* the cap
+  and up to one chunk more. It never falls below it.
+- **Line numbers are never renumbered.** The archive simply starts later.
+  `readBefore(session, null)` reports the new first line as `startLine` and
+  `hasMore: false` once you reach it, and `readAfter(session, null)` agrees.
+  Asking for a line below that floor returns an empty page rather than a short
+  one mislabelled as line 0.
+- **The newest chunk is never dropped.** A cap smaller than one chunk degrades to
+  "keep one chunk" instead of emptying the session.
+
 ## Markers
 
 A gap marker is a line **about** the history, written into it:

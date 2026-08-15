@@ -26,7 +26,7 @@
   {
     "name": "ArchiveAppendResult",
     "kind": "type",
-    "signature": "d6da6017e0b5bc6e0e8c813bd0f689831e9c29b148765eb57cef6efb04518408",
+    "signature": "168472f8e56c828764362668ba5ac6d82d74c173ebae6184f25a238bcad1536b",
     "tier": "S"
   },
   {
@@ -80,13 +80,13 @@
   {
     "name": "DurableHistoryArchive",
     "kind": "value",
-    "signature": "d4a4d1e48f46082415dfcba9827228fd3451986377adf492ddaf065695389f29",
+    "signature": "ac2b8b225618deafba39ee3e27f33cb9aa14f716f272f1353f9227838bc66e41",
     "tier": "S"
   },
   {
     "name": "DurableHistoryArchiveOptions",
     "kind": "type",
-    "signature": "d81eea6d71e17abad4c4e0257f462e1b6c298f3d2f3046ca153e91dd88f5de05",
+    "signature": "57a8ae15de0d6c4bb301cd522eff9ccdb8b34f4f730930dabd2b29825a820d07",
     "tier": "S"
   },
   {

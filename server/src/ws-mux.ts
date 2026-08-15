@@ -583,6 +583,15 @@ export class TmuxWsMux<
     return this.blockedSockets.has(ws);
   }
 
+  // A `hasViewers(session)` accessor was drafted here for `RetentionLane`, whose
+  // captures run outside `queueCapture` and so need to stay off sessions the
+  // viewer path is already archiving. It is deliberately absent: `TmuxWsMux` is
+  // tier F, and a new method changes a frozen declaration for a question the
+  // host can already answer. `MuxHooks.onSubscribe` / `onUnsubscribe` /
+  // `onSocketClose` report every transition, so a host wires
+  // `RetentionLaneOptions.hasViewers` from its own set and the package surface
+  // does not grow. See CHANGELOG v0.17.0.
+
   /**
    * The socket drained — resume pushes and hand it CURRENT truth (never a replay).
    *

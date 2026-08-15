@@ -1,7 +1,53 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
+
+## v0.17.0 — 2026-08-16
+
+### Added
+
+- **`DurableHistoryArchive` can bound a session** — `maxLinesPerSession` and
+  `maxBytesPerSession`, both **unset by default**, so every 0.16.x consumer keeps
+  the unbounded behaviour it has today. When set, an append past the cap deletes
+  whole chunk files from the oldest end and reports the count as the new
+  `ArchiveAppendResult.prunedLines`. This is the only operation in the archive
+  that destroys history, which is why it is opt-in and why the count is returned
+  rather than merely logged. The cap is approximate and errs upward: whole chunks
+  only, a chunk is dropped only when what survives still meets the cap, and the
+  newest chunk is never dropped — so a cap smaller than one chunk keeps one chunk
+  instead of emptying the session. See `docs/history.md` → "Size caps delete
+  history".
+
+`ArchiveAppendResult.prunedLines` is **optional in the type and always present at
+runtime**. Making it required would narrow a tier-S declaration — anyone who
+constructs the result, such as an alternative `HistoryArchiveLike` or a test
+double, would stop compiling on a minor. The immutable-baseline gate refused the
+required version, correctly.
+
+### Not added, and why
+
+A `TmuxWsMux.hasViewers(session)` accessor was drafted for `RetentionLane`, which
+runs outside the mux and therefore outside `queueCapture` — a host running both
+needs to keep the lane off sessions the viewer path is already archiving, or two
+writers append to one archive and the loser's anchor stops matching the disk.
+
+It is not here. `TmuxWsMux` is tier F, and a new method changes a frozen
+declaration to answer a question the host can already answer: `MuxHooks`
+`onSubscribe` / `onUnsubscribe` / `onSocketClose` report every transition, so a
+host tracks its own set and passes `RetentionLaneOptions.hasViewers` from that.
+The gate is what surfaced this, and the smaller surface is the better design.
+
+### Fixed
+
+- **Reads no longer report `startLine: 0` for a page that begins later.** Once a
+  cap prunes the oldest chunks, line 0 does not exist. `readBefore` clamped its
+  window to `0` regardless, so a page whose first line was really line 70 was
+  labelled line 0 — shifting every number a caller derives from it — and
+  `hasMore: start > 0` promised history that could no longer be served. Both
+  `readBefore` and `readAfter` now clamp to the archive's true floor, and a
+  request below it returns an empty page instead of a mislabelled short one. This
+  is only reachable with a cap configured, so no 0.16.x consumer was affected.
 
 ## v0.16.2 — 2026-08-15
 
