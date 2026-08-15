@@ -1,7 +1,40 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
+
+## v0.17.0 — 2026-08-16
+
+### Added
+
+- **`DurableHistoryArchive` can bound a session** — `maxLinesPerSession` and
+  `maxBytesPerSession`, both **unset by default**, so every 0.16.x consumer keeps
+  the unbounded behaviour it has today. When set, an append past the cap deletes
+  whole chunk files from the oldest end and reports the count as the new
+  `ArchiveAppendResult.prunedLines`. This is the only operation in the archive
+  that destroys history, which is why it is opt-in and why the count is returned
+  rather than merely logged. The cap is approximate and errs upward: whole chunks
+  only, a chunk is dropped only when what survives still meets the cap, and the
+  newest chunk is never dropped — so a cap smaller than one chunk keeps one chunk
+  instead of emptying the session. See `docs/history.md` → "Size caps delete
+  history".
+- **`TmuxWsMux.hasViewers(session)`** — read-only, creates nothing. `RetentionLane`
+  runs outside the mux, so its captures do not pass through `queueCapture` and
+  cannot be serialised against the viewer path by construction; a host running
+  both needs this to keep the lane off sessions the viewer is already archiving.
+  Wire it as `RetentionLaneOptions.hasViewers`. Without it, two writers append to
+  one archive and the loser's anchor stops matching what is on disk.
+
+### Fixed
+
+- **Reads no longer report `startLine: 0` for a page that begins later.** Once a
+  cap prunes the oldest chunks, line 0 does not exist. `readBefore` clamped its
+  window to `0` regardless, so a page whose first line was really line 70 was
+  labelled line 0 — shifting every number a caller derives from it — and
+  `hasMore: start > 0` promised history that could no longer be served. Both
+  `readBefore` and `readAfter` now clamp to the archive's true floor, and a
+  request below it returns an empty page instead of a mislabelled short one. This
+  is only reachable with a cap configured, so no 0.16.x consumer was affected.
 
 ## v0.16.2 — 2026-08-15
 

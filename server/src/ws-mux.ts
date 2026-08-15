@@ -584,6 +584,21 @@ export class TmuxWsMux<
   }
 
   /**
+   * Is any socket currently subscribed to this session?
+   *
+   * `RetentionLane` runs outside this class, so its captures do not pass through
+   * `queueCapture` and cannot be serialised against the viewer path by
+   * construction. A host that runs both needs this to keep the lane off sessions
+   * the viewer is already archiving — otherwise two writers append to one
+   * archive and the loser's anchor no longer matches what is on disk.
+   *
+   * Read-only: it neither creates a channel nor reaps an empty one.
+   */
+  hasViewers(session: string): boolean {
+    return (this.subscribers.get(session)?.size ?? 0) > 0;
+  }
+
+  /**
    * The socket drained — resume pushes and hand it CURRENT truth (never a replay).
    *
    * FAST path: hosts wire this from Bun's `websocket.drain(ws)` handler so the
