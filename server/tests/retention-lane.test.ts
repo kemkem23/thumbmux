@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
+import { RetentionLane, type RetentionLaneStatus } from "../src/retention-lane";
+import type { HistoryArchiveLike, TmuxDriver } from "../src/ws-mux";
 
 type AppendCall = { session: string; lines: number; paneRows: number; deeperAvailable?: boolean };
 
@@ -30,141 +31,141 @@ function archiveSpy(overrides: Partial<HistoryArchiveLike> = {}) {
   return { archive, calls };
 }
 
-function driver(capture: string, rows: Record<string, unknown>[] = [{ name: "cc-a" }]): TmuxDriver {
+type LaneDriver = Pick<TmuxDriver, "capturePane" | "getHistoryLimit" | "listSessions">;
+
+function driver(capture: string, rows: Record<string, unknown>[] = [{ name: "cc-a" }]): LaneDriver {
   return {
     listSessions: () => rows as never,
     capturePane: async () => capture,
-    sendKeys: () => {},
-    getSessionActivity: () => new Map([["cc-a", 1]]),
     getHistoryLimit: () => 50_000,
-    setSessionHistoryLimit: () => {},
-    resizeWindow: () => {},
-    hash: (content) => content,
   };
 }
 
-test("a retained session with no viewer is captured and archived", async () => {
+test("a listed session is captured and archived", async () => {
   const { archive, calls } = archiveSpy();
-  const mux = new TmuxWsMux({
+  const lane = new RetentionLane({
     driver: driver("one\ntwo\nthree"),
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
   });
-  mux.retainSession("cc-a");
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
 
   expect(calls).toHaveLength(1);
   expect(calls[0]!.session).toBe("cc-a");
   expect(calls[0]!.lines).toBe(3);
-  mux.stop();
 });
 
-test("retention sends no frames", async () => {
-  const { archive } = archiveSpy();
-  const sent: string[] = [];
-  const mux = new TmuxWsMux({
+test("an archive whose appendAnchored is a class method still works", async () => {
+  // The lane held that function in a local and called it detached, so `this`
+  // was undefined for any real class. Every spy here is a closure and none of
+  // them could see it; the live-tmux test failed on its first run instead.
+  class MethodArchive {
+    lines = 0;
+    ingestSnapshot() { return { liveContent: "" }; }
+    readBefore() { return { lines: [], startLine: null, hasMore: false }; }
+    renameSession() {}
+    appendAnchored(_session: string, captured: readonly string[]) {
+      this.lines += captured.length;   // throws if `this` was lost
+      return {
+        appended: captured.length,
+        liveStartLine: 0,
+        totalLines: this.lines,
+        gap: false,
+        deferred: false,
+        needsDeeper: false,
+      };
+    }
+  }
+  const archive = new MethodArchive();
+  const errors: (string | null)[] = [];
+  const lane = new RetentionLane({
+    driver: driver("one\ntwo\nthree"),
+    archive: archive as unknown as HistoryArchiveLike,
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    onStatus: (status) => errors.push(status.lastError),
+  });
+
+  await lane.tick();
+
+  expect(errors).toEqual([null]);
+  expect(archive.lines).toBe(3);
+});
+
+test("the host's list is read fresh every tick, so releasing a session is just not listing it", async () => {
+  const { archive, calls } = archiveSpy();
+  let listed: string[] = ["cc-a"];
+  const lane = new RetentionLane({
     driver: driver("one\ntwo"),
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => listed,
+    liveLineLimit: 1_000,
   });
-  mux.subscribeSessions({ send: (data: string) => { sent.push(data); return 1; } } as never);
-  mux.retainSession("cc-a");
-  sent.length = 0;
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
+  expect(calls).toHaveLength(1);
 
-  expect(sent).toEqual([]);
-  mux.stop();
+  listed = [];
+  await lane.tick();
+
+  // No retained-set of its own means no second copy of the host's policy to
+  // fall out of sync with.
+  expect(calls).toHaveLength(1);
 });
 
-test("releasing a session stops retaining it", async () => {
-  const { archive, calls } = archiveSpy();
-  const mux = new TmuxWsMux({
-    driver: driver("one\ntwo"),
-    archive,
-    retention: { enabled: true, intervalMs: 10 },
-  });
-  mux.retainSession("cc-a");
-  mux.releaseSession("cc-a");
-
-  await mux.runRetentionTickForTests();
-
-  expect(calls).toEqual([]);
-  mux.stop();
-});
-
-test("retention is off unless the host asks for it", async () => {
-  const { archive, calls } = archiveSpy();
-  const mux = new TmuxWsMux({ driver: driver("one\ntwo"), archive });
-  mux.retainSession("cc-a");
-
-  await mux.runRetentionTickForTests();
-
-  expect(calls).toEqual([]);
-  mux.stop();
-});
-
-test("retention refuses to start against an archive that cannot anchor", () => {
-  // A lane that silently falls back to the path this release exists to replace
-  // would keep losing history while looking healthy.
+test("a lane refuses to exist against an archive that cannot anchor", () => {
+  // Falling back to the viewer-shaped ingest would keep the lane looking healthy
+  // while losing history, which is the failure this release exists to end.
   const archive: HistoryArchiveLike = {
     ingestSnapshot: () => ({ liveContent: "" }),
     readBefore: () => ({ lines: [], startLine: null, hasMore: false }),
     renameSession: () => {},
   };
-  expect(() => new TmuxWsMux({
+  expect(() => new RetentionLane({
     driver: driver("one"),
     archive,
-    retention: { enabled: true },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
   })).toThrow(/appendAnchored/);
 });
 
-test("a session the viewer lane owns is left to it", async () => {
+test("a session a viewer owns is left to the viewer's own captures", async () => {
   const { archive, calls } = archiveSpy();
-  const mux = new TmuxWsMux({
+  const lane = new RetentionLane({
     driver: driver("one\ntwo"),
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    hasViewers: (session) => session === "cc-a",
   });
-  mux.retainSession("cc-a");
-  mux.subscribe("cc-a", { send: () => 1 } as never);
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
 
-  // The viewer lane captures this session four times a second through the same
-  // archive; a second writer would only race it.
   expect(calls).toEqual([]);
-  mux.stop();
 });
 
 test("the pane height comes from the session row, and a missing one stores less rather than more", async () => {
-  const { archive, calls } = archiveSpy();
-  const mux = new TmuxWsMux({
+  const known = archiveSpy();
+  await new RetentionLane({
     driver: driver("one\ntwo", [{ name: "cc-a", paneRows: 41 }]),
-    archive,
+    archive: known.archive,
+    sessions: () => ["cc-a"],
     liveLineLimit: 700,
-    retention: { enabled: true, intervalMs: 10 },
-  });
-  mux.retainSession("cc-a");
-  await mux.runRetentionTickForTests();
-  expect(calls[0]!.paneRows).toBe(41);
+  }).tick();
+  expect(known.calls[0]!.paneRows).toBe(41);
 
   const bare = archiveSpy();
-  const muxBare = new TmuxWsMux({
+  await new RetentionLane({
     driver: driver("one\ntwo", [{ name: "cc-a" }]),
     archive: bare.archive,
+    sessions: () => ["cc-a"],
     liveLineLimit: 700,
-    retention: { enabled: true, intervalMs: 10 },
-  });
-  muxBare.retainSession("cc-a");
-  await muxBare.runRetentionTickForTests();
-  // Unknown screen height must err deep: a too-small guess stores rows tmux can
-  // still repaint, which is how stale copies get written as history.
+  }).tick();
+  // An unknown screen height must err deep: too small stores rows tmux can still
+  // repaint, which is how a stale copy gets written down as history.
   expect(bare.calls[0]!.paneRows).toBe(700);
-
-  mux.stop();
-  muxBare.stop();
 });
 
 test("a shallow miss escalates to one full-ring capture before anything is written", async () => {
@@ -181,73 +182,115 @@ test("a shallow miss escalates to one full-ring capture before anything is writt
         : { appended: 5, liveStartLine: 0, totalLines: 5, gap: false, deferred: false, needsDeeper: false };
     },
   };
-  const mux = new TmuxWsMux({
+  const seen: RetentionLaneStatus[] = [];
+  const lane = new RetentionLane({
     driver: {
       ...driver("one\ntwo"),
       capturePane: async (_session, opts) => { depths.push(opts.startLine ?? 0); return "one\ntwo"; },
     },
     archive,
+    sessions: () => ["cc-a"],
     liveLineLimit: 1_000,
-    retention: { enabled: true, intervalMs: 10 },
+    onStatus: (status) => seen.push(status),
   });
-  mux.retainSession("cc-a");
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
 
   expect(depths).toEqual([-2_000, -50_000]);
-  expect(mux.retentionStatus()[0]?.archivedLines).toBe(5);
-  mux.stop();
+  expect(seen.at(-1)?.archivedLines).toBe(5);
 });
 
-test("status reports what was archived, so a stalled session is visible", async () => {
+test("status reaches the host on every attempt, so a stalled session is visible", async () => {
   const { archive } = archiveSpy();
-  const mux = new TmuxWsMux({
+  const seen: RetentionLaneStatus[] = [];
+  const lane = new RetentionLane({
     driver: driver("one\ntwo\nthree"),
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    onStatus: (status) => seen.push(status),
   });
-  mux.retainSession("cc-a");
 
-  await mux.runRetentionTickForTests();
-  const [status] = mux.retentionStatus();
+  await lane.tick();
 
-  expect(status?.session).toBe("cc-a");
-  expect(status?.archivedLines).toBe(3);
-  expect(status?.lastArchivedAt).not.toBeNull();
-  expect(status?.lastError).toBeNull();
-  mux.stop();
+  expect(seen).toHaveLength(1);
+  expect(seen[0]!.session).toBe("cc-a");
+  expect(seen[0]!.archivedLines).toBe(3);
+  expect(seen[0]!.lastArchivedAt).not.toBeNull();
+  expect(seen[0]!.lastError).toBeNull();
 });
 
-test("a capture that throws is recorded rather than swallowed", async () => {
+test("a capture that throws is reported rather than swallowed", async () => {
   const { archive } = archiveSpy();
-  const mux = new TmuxWsMux({
+  const errors: (string | null)[] = [];
+  const lane = new RetentionLane({
     driver: { ...driver(""), capturePane: async () => { throw new Error("pane vanished"); } },
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    onStatus: (status) => errors.push(status.lastError),
   });
-  mux.retainSession("cc-a");
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
 
-  expect(mux.retentionStatus()[0]?.lastError).toContain("pane vanished");
-  mux.stop();
+  // A lane that reports only its successes is indistinguishable from a dead one.
+  expect(errors.at(-1)).toContain("pane vanished");
 });
 
-test("the mux never shrinks a session's scrollback", async () => {
-  // tmux's ring is the buffer that makes a polling archive safe, and the shrink
-  // was always a no-op on a live pane: history-limit only applies to windows
-  // created after it is set.
-  const shrinks: number[] = [];
-  const { archive } = archiveSpy();
-  const mux = new TmuxWsMux({
-    driver: { ...driver("one\ntwo"), setSessionHistoryLimit: (_s, limit) => { shrinks.push(limit); } },
+test("a status hook that throws does not take the lane down with it", async () => {
+  const { archive, calls } = archiveSpy();
+  const lane = new RetentionLane({
+    driver: driver("one\ntwo"),
     archive,
-    retention: { enabled: true, intervalMs: 10 },
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    onStatus: () => { throw new Error("host telemetry exploded"); },
   });
-  mux.retainSession("cc-a");
 
-  await mux.runRetentionTickForTests();
+  await lane.tick();
+  await lane.tick();
 
-  expect(shrinks).toEqual([]);
-  mux.stop();
+  expect(calls).toHaveLength(2);
+});
+
+test("a slow tick does not overlap itself", async () => {
+  const { archive, calls } = archiveSpy();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const lane = new RetentionLane({
+    driver: { ...driver("one"), capturePane: async () => { await gate; return "one"; } },
+    archive,
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+  });
+
+  const first = lane.tick();
+  await lane.tick();          // returns immediately: the first is still running
+  release();
+  await first;
+
+  expect(calls).toHaveLength(1);
+});
+
+test("start and stop own the timer, and nothing runs before start", async () => {
+  const { archive, calls } = archiveSpy();
+  const lane = new RetentionLane({
+    driver: driver("one\ntwo"),
+    archive,
+    sessions: () => ["cc-a"],
+    liveLineLimit: 1_000,
+    intervalMs: 5,
+  });
+
+  await Bun.sleep(20);
+  expect(calls).toEqual([]);
+
+  lane.start();
+  await Bun.sleep(40);
+  lane.stop();
+  const afterStop = calls.length;
+  expect(afterStop).toBeGreaterThan(0);
+
+  await Bun.sleep(30);
+  expect(calls).toHaveLength(afterStop);
 });

@@ -111,12 +111,18 @@ export interface HistoryArchiveLike {
    * `history_expand` keeps its pre-0.16 meaning — page from the end of the
    * archive — which is correct for an archive that holds only departed rows.
    */
-  liveStartLine?(session: string): number | null;
+  liveStartLine?: (session: string) => number | null;
   /**
    * Durable append anchored on the archive's own tail, using `paneRows` to know
-   * which rows tmux can still repaint. Required for `retention`.
+   * which rows tmux can still repaint. Required by `RetentionLane`.
+   *
+   * Both of these are optional PROPERTIES, not optional methods: the contract
+   * gate proves an addition is additive by stripping optional property
+   * signatures, and an optional method here moves the declaration hash of every
+   * type that reaches this one — which reads as a breaking change to a frozen
+   * interface.
    */
-  appendAnchored?(
+  appendAnchored?: (
     session: string,
     captured: readonly string[],
     opts: {
@@ -125,7 +131,7 @@ export interface HistoryArchiveLike {
       /** Caller can still capture deeper, so report a miss instead of marking it. */
       deeperAvailable?: boolean;
     },
-  ): {
+  ) => {
     appended: number;
     liveStartLine: number;
     totalLines: number;
@@ -199,11 +205,6 @@ export interface MuxHooks<
    * This is a telemetry tap: throwing is isolated from viewer delivery.
    */
   onOutput?(session: string, frame: MuxFullOutputFrame): void;
-  /**
-   * A retained session was captured with no viewer attached. Telemetry only —
-   * throwing is isolated from the lane, exactly like `onOutput`.
-   */
-  onRetention?(session: string, status: RetentionStatus): void;
   /** Per-principal session-list authorization. Called with the provider's rows for EVERY delivery to
    * that socket — the initial `sessions_subscribe` reply, every push, and backpressure drain catch-up.
    * Return the subset this socket may see (do not mutate the input array).
@@ -230,42 +231,6 @@ export interface MuxHooks<
  * a client is synchronously waiting on them. Only server-pushed traffic
  * (output/delta, cursor-only, session-list) is suppressed while blocked.
  */
-/**
- * Keep a session's scrollback growing when nobody is watching it.
- *
- * A terminal viewer normally captures only what someone is looking at, which
- * means an agent working alone stops being archived the moment the last tab
- * closes. This lane captures retained sessions on its own slow timer and feeds
- * the same archive, producing no frames for anyone.
- *
- * Off by default: a library should not start doing work, or claim a tmux pane's
- * single pipe, because it was constructed.
- */
-export type RetentionOptions = {
-  /** Master switch. Default false. */
-  enabled?: boolean;
-  /** How often retained sessions are captured. Default 30000. */
-  intervalMs?: number;
-  /**
-   * Claim each retained pane's `pipe-pane` to notice output immediately instead
-   * of waiting for the next tick. Default false — tmux allows one pipe per pane
-   * and the server may be shared with a host's own tooling.
-   */
-  usePipeSignal?: boolean;
-  /** Bytes seen on the pipe before an early capture is triggered. Default 32768. */
-  pipeByteThreshold?: number;
-};
-
-/** What retention knows about one session, for hosts to surface and alert on. */
-export type RetentionStatus = {
-  session: string;
-  lastCaptureAt: number;
-  lastArchivedAt: number | null;
-  archivedLines: number;
-  gaps: number;
-  lastError: string | null;
-};
-
 export type MuxBackpressureOptions<WS extends WsLike = WsLike> = {
   /** Master switch. Default true. false = pre-0.4 behaviour (-1 keeps sending). */
   enabled?: boolean;
@@ -319,19 +284,6 @@ function muxNowMs(): number {
   return muxTimeHooks?.clock() ?? Date.now();
 }
 
-/**
- * Split a `capture-pane` result the way the archive expects: drop the record
- * terminator, then the blank rows below the last content row, so a newline-
- * terminated capture cannot manufacture an archive line.
- */
-function splitCapturedLines(content: string): string[] {
-  const terminated = content.endsWith("\n") ? content.slice(0, -1) : content;
-  if (terminated === "") return [];
-  const lines = terminated.split("\n");
-  while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
-  return lines;
-}
-
 function muxArmTimeout(fn: () => void, ms: number): unknown {
   if (muxTimeHooks) return muxTimeHooks.setTimeout(fn, ms);
   return setTimeout(fn, ms);
@@ -372,8 +324,6 @@ export type TmuxWsMuxOptions<
   pollReconcileMs?: number;   // default 3000
   /** Outbound backpressure. Default enabled — see MuxBackpressureOptions. */
   backpressure?: MuxBackpressureOptions<WS>;
-  /** Keep retained sessions archived with no viewer attached. Off by default. */
-  retention?: RetentionOptions;
   log?: (...args: unknown[]) => void;
   logError?: (...args: unknown[]) => void;
 };
@@ -489,14 +439,6 @@ export class TmuxWsMux<
    */
   private blockedTimeouts = new Map<WS, ReturnType<typeof setTimeout>>();
 
-  // ── Retention (capture with no viewer attached) ───────────────────────────
-  private retentionEnabled = false;
-  private retentionIntervalMs = 30_000;
-  private retained = new Set<string>();
-  private retentionStatuses = new Map<string, RetentionStatus>();
-  private retentionInterval: ReturnType<typeof setInterval> | null = null;
-  private retentionInFlight = new Set<string>();
-
   constructor(opts: TmuxWsMuxOptions<WS, SessionRow>) {
     this.compressFrames = opts.compressFrames === true;
     this.driver = opts.driver;
@@ -523,139 +465,6 @@ export class TmuxWsMux<
     this.bpMaxBlockedMs = bp.maxBlockedMs ?? 30_000;
     this.bpBufferedAmount = bp.bufferedAmount;
     this.bpClose = bp.close;
-
-    this.retentionEnabled = opts.retention?.enabled === true;
-    this.retentionIntervalMs = Math.max(1, Math.floor(opts.retention?.intervalMs ?? 30_000));
-    if (this.retentionEnabled && !this.archive?.appendAnchored) {
-      // Falling back to the viewer-shaped ingest here would keep history growing
-      // in a lane that cannot anchor, which is the silent loss this exists to
-      // end. Refuse at construction, where a host can still see it.
-      throw new Error("thumbmux: retention requires an archive with appendAnchored");
-    }
-  }
-
-  // ── Retention ─────────────────────────────────────────────────────────────
-
-  /** Keep archiving this session even when nobody is subscribed to it. */
-  retainSession(session: string) {
-    this.retained.add(session);
-    if (this.retentionEnabled && !this.retentionInterval) {
-      this.retentionInterval = setInterval(() => void this.runRetentionTick(), this.retentionIntervalMs);
-    }
-  }
-
-  /** Stop retaining a session. Its stored history is untouched. */
-  releaseSession(session: string) {
-    this.retained.delete(session);
-    this.retentionStatuses.delete(session);
-    if (this.retained.size === 0 && this.retentionInterval) {
-      clearInterval(this.retentionInterval);
-      this.retentionInterval = null;
-    }
-  }
-
-  /** What retention has managed for each retained session. */
-  retentionStatus(): readonly RetentionStatus[] {
-    return [...this.retentionStatuses.values()];
-  }
-
-  /** Deterministic single tick for tests — the timer path calls the same code. */
-  runRetentionTickForTests(): Promise<void> {
-    return this.runRetentionTick();
-  }
-
-  private async runRetentionTick(): Promise<void> {
-    if (!this.retentionEnabled || this.retained.size === 0) return;
-    for (const session of [...this.retained]) {
-      // A subscribed session is already being captured four times a second
-      // through this same archive; a second writer would only race it.
-      const viewers = this.subscribers.get(session);
-      if (viewers && viewers.size > 0) continue;
-      if (this.retentionInFlight.has(session)) continue;
-      this.retentionInFlight.add(session);
-      try {
-        await this.captureForRetention(session);
-      } finally {
-        this.retentionInFlight.delete(session);
-      }
-    }
-  }
-
-  /**
-   * Capture one retained session and hand it to the archive. Produces no frame,
-   * touches no geometry, and creates no delta base: nothing here is on a
-   * viewer's path.
-   */
-  private async captureForRetention(session: string): Promise<void> {
-    const status = this.retentionStatuses.get(session) ?? {
-      session,
-      lastCaptureAt: 0,
-      lastArchivedAt: null,
-      archivedLines: 0,
-      gaps: 0,
-      lastError: null,
-    };
-    this.retentionStatuses.set(session, status);
-
-    const append = this.archive?.appendAnchored;
-    if (!append || !this.profileOf(session).archive) return;
-
-    const paneRows = this.retentionPaneRows(session);
-    const shallow = -this.liveLineLimit * 2;
-    const deep = -Math.max(this.driver.getHistoryLimit(), this.liveLineLimit);
-    try {
-      let lines = splitCapturedLines(await this.driver.capturePane(session, { startLine: shallow }));
-      status.lastCaptureAt = muxNowMs();
-      let result = append.call(this.archive!, session, lines, {
-        paneRows,
-        liveLineLimit: this.liveLineLimit,
-        deeperAvailable: true,
-      });
-      if (result.needsDeeper) {
-        // One expensive capture answers "did tmux drop it, or did I look too
-        // late" — and only after that is a gap marker honest.
-        lines = splitCapturedLines(await this.driver.capturePane(session, { startLine: deep }));
-        status.lastCaptureAt = muxNowMs();
-        result = append.call(this.archive!, session, lines, {
-          paneRows,
-          liveLineLimit: this.liveLineLimit,
-        });
-      }
-      if (result.appended > 0) {
-        status.archivedLines += result.appended;
-        status.lastArchivedAt = muxNowMs();
-      }
-      if (result.gap) status.gaps++;
-      status.lastError = null;
-      try {
-        this.hooks.onRetention?.(session, { ...status });
-      } catch {
-        // A telemetry tap must never break the lane that feeds it.
-      }
-    } catch (cause) {
-      status.lastError = cause instanceof Error ? cause.message : String(cause);
-      try {
-        this.logError(`[thumbmux-mux] retention capture failed for "${session}":`, status.lastError);
-      } catch {}
-    }
-  }
-
-  /**
-   * The screen height is the only part of a capture tmux can still repaint.
-   * When the host's session row does not carry one, fall back to the live window
-   * — deeper than any real pane, so an unknown height stores less rather than
-   * storing rows that may still change.
-   */
-  private retentionPaneRows(session: string): number {
-    for (const row of this.sessionListProvider()) {
-      if ((row as { name?: unknown }).name !== session) continue;
-      const paneRows = (row as { paneRows?: unknown }).paneRows;
-      if (typeof paneRows === "number" && Number.isFinite(paneRows) && paneRows > 0) {
-        return Math.floor(paneRows);
-      }
-      break;
-    }
-    return this.liveLineLimit;
   }
 
   setSessionListProvider(provider?: () => readonly SessionRow[]) {
@@ -1148,7 +957,6 @@ export class TmuxWsMux<
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
     if (this.burstTimer) { clearTimeout(this.burstTimer); this.burstTimer = null; }
-    if (this.retentionInterval) { clearInterval(this.retentionInterval); this.retentionInterval = null; }
     for (const t of this.immediateCaptureTimers.values()) clearTimeout(t);
     this.immediateCaptureTimers.clear();
     for (const t of this.pipeDebounceTimers.values()) clearTimeout(t);

@@ -1,20 +1,38 @@
 [
   {
+    "name": "anchorFromTail",
+    "kind": "value",
+    "signature": "b158e5f73a8ca235af5cd63bbc4a12d65a94976d06a4a3c4441a7f3000b94c04",
+    "tier": "S"
+  },
+  {
+    "name": "AnchorMatch",
+    "kind": "type",
+    "signature": "231e6d6d1cac93a1c8cc95cf78aabd3c669c59271676654aed89295e492341d7",
+    "tier": "S"
+  },
+  {
     "name": "AppRoutes",
     "kind": "type",
-    "signature": "9961db9165db5fbb9aa8e2ccc858772a2801f29177aed2969043e3d37fc71b67",
+    "signature": "c5fc6c71e0d6b04a658e3930357ce13b9fbc5af4804da6c1abe445b1f73cb4fd",
     "tier": "S"
   },
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "fbd815c477a5d7c96ba8fc70ea25ccb498049e6f5f7bc63a69fb813f6e694fca",
+    "signature": "cc662cd6518c7151ad2cdcd5f8bc4d6a8be74d8b97b33283faa9b53a8fd84e8d",
+    "tier": "S"
+  },
+  {
+    "name": "ArchiveAppendResult",
+    "kind": "type",
+    "signature": "d6da6017e0b5bc6e0e8c813bd0f689831e9c29b148765eb57cef6efb04518408",
     "tier": "S"
   },
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "3c87d16c24b31d74ae6ae68c73547c7e118354e6377b4a36685966cf6167a956",
+    "signature": "e1f89ea4f7ea071fce9e85f7533dcbadcf001e88310134ab3ba78825d3cd3205",
     "tier": "S"
   },
   {
@@ -60,6 +78,18 @@
     "tier": "D"
   },
   {
+    "name": "DurableHistoryArchive",
+    "kind": "value",
+    "signature": "d4a4d1e48f46082415dfcba9827228fd3451986377adf492ddaf065695389f29",
+    "tier": "S"
+  },
+  {
+    "name": "DurableHistoryArchiveOptions",
+    "kind": "type",
+    "signature": "d81eea6d71e17abad4c4e0257f462e1b6c298f3d2f3046ca153e91dd88f5de05",
+    "tier": "S"
+  },
+  {
     "name": "exactTmuxPaneTarget",
     "kind": "value",
     "signature": "9450364fef99d3856cf3670274772742808aea99de0ec947a668833fb8b64d27",
@@ -74,7 +104,7 @@
   {
     "name": "FileHistoryArchive",
     "kind": "value",
-    "signature": "e26ac7a89e3596e963c1376c86f5ec09aa86c45cad26b45d5eeb4a744ed0d180",
+    "signature": "0de8be2d28f4cef7212c9be036565fbe38617864d6ad8486360642c6ba2f7e50",
     "tier": "F"
   },
   {
@@ -116,8 +146,14 @@
   {
     "name": "HistoryArchiveLike",
     "kind": "type",
-    "signature": "94e8d1e7584ca42b059c6f2ccaf1f49924d6d51bf2a615f4e3ca5e340d2e56cf",
+    "signature": "f642d7abe2d7d1c755654d87b47bd2b576302314b9627934ce82ce0b13dec94f",
     "tier": "F"
+  },
+  {
+    "name": "historyGapMarker",
+    "kind": "value",
+    "signature": "e6208889b21ad79674b3b90eb529ed33b1829142be9cd60819c73b643075ac19",
+    "tier": "S"
   },
   {
     "name": "HistoryPage",
@@ -168,10 +204,22 @@
     "tier": "F"
   },
   {
+    "name": "isHistoryMarker",
+    "kind": "value",
+    "signature": "c5b5db4870b9b84bfbe2ede1c873b7d7dfb9ee3b6acf18c5cd478b876729323a",
+    "tier": "S"
+  },
+  {
     "name": "killTmuxSession",
     "kind": "value",
     "signature": "5da2f4ccbc6c1f7588ea43411e332b4e803f6b3377f11f6333ad45770766b79f",
     "tier": "F"
+  },
+  {
+    "name": "locateAnchor",
+    "kind": "value",
+    "signature": "4fd999ae76dc9a75c577d506700e2dab44251092230307f492c2016a5e7149f3",
+    "tier": "S"
   },
   {
     "name": "looksLikeTailRepaint",
@@ -240,6 +288,24 @@
     "tier": "F"
   },
   {
+    "name": "RetentionLane",
+    "kind": "value",
+    "signature": "591d0e1371c38e9013bf9e49bbade02d95f04c48a77e9b5440c645f9eb0c8d6c",
+    "tier": "S"
+  },
+  {
+    "name": "RetentionLaneOptions",
+    "kind": "type",
+    "signature": "98e35df9bddaa0e69ace24e1cae5cd480e7eb860dd934f89cb9d076357ba003c",
+    "tier": "S"
+  },
+  {
+    "name": "RetentionLaneStatus",
+    "kind": "type",
+    "signature": "01d62c1a86af6bd1a364ad69c71c8e6a0db67220662d862ea26ef7400c7edbba",
+    "tier": "S"
+  },
+  {
     "name": "SessionProfile",
     "kind": "type",
     "signature": "a40fe8a0eddf98ceb5c3defaf4e7db969b5282c712babbaad3d5aa68d7060613",
@@ -300,6 +366,24 @@
     "tier": "X"
   },
   {
+    "name": "stitchCapture",
+    "kind": "value",
+    "signature": "dc173b6d0912ba103318694f9a48dea1322e715ec3d6631a60986e347a904745",
+    "tier": "S"
+  },
+  {
+    "name": "StitchInput",
+    "kind": "type",
+    "signature": "934d33a83664a524bbccce04db7dd6ec1a556611936a223a31fde9779a74a1e3",
+    "tier": "S"
+  },
+  {
+    "name": "StitchResult",
+    "kind": "type",
+    "signature": "e9895bf9d1e432e8e9f69d1fdad3b84bccc52858990956b28b8b1b3fad0e1bc3",
+    "tier": "S"
+  },
+  {
     "name": "TmuxDriver",
     "kind": "type",
     "signature": "31a1557c524f410f91b43202343d0496bd89cb9e2c3335c6972abf62c2a4c62e",
@@ -320,13 +404,13 @@
   {
     "name": "TmuxWsMux",
     "kind": "value",
-    "signature": "7bbe15ae120764e2b6b4c931e379742121e2429c78b8a4b0db2ffb3e08d466ab",
+    "signature": "8ab44d4250b9e866ebf7de4f65eb0b17fdc2d289c282fcde78a8006674c52050",
     "tier": "F"
   },
   {
     "name": "TmuxWsMuxOptions",
     "kind": "type",
-    "signature": "3e98acd365ac48258e03b29707e49cc991b22afa7f97369333810c1940f31971",
+    "signature": "d9cad580dd157b901490827749bf3836e39d83d9baa0dbe17c22afdc5a27d3a0",
     "tier": "F"
   },
   {

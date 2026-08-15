@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DurableHistoryArchive } from "../src/durable-history-archive";
-import { TmuxWsMux, type TmuxDriver } from "../src/ws-mux";
+import { RetentionLane } from "../src/retention-lane";
+import type { TmuxDriver } from "../src/ws-mux";
 
 /**
  * Every other retention test uses a fake driver, and the defect that motivated
@@ -48,22 +49,21 @@ test("a session nobody is watching keeps every line it produced", async () => {
       hash: (content) => content,
     };
     const archive = new DurableHistoryArchive({ root, group: () => "probe" });
-    const mux = new TmuxWsMux({
+    const lane = new RetentionLane({
       driver,
       archive,
+      sessions: () => [SESSION],
       liveLineLimit: 200,
-      retention: { enabled: true, intervalMs: 50 },
     });
-    mux.retainSession(SESSION);
 
-    await mux.runRetentionTickForTests();
+    await lane.tick();
     for (let batch = 0; batch < 3; batch++) {
       const from = batch * 400 + 1;
       tmux("send-keys", "-t", `=${SESSION}:0.0`, `for i in $(seq ${from} ${from + 399}); do echo "N $i"; done`, "Enter");
       await Bun.sleep(2_500);
-      await mux.runRetentionTickForTests();
+      await lane.tick();
     }
-    mux.stop();
+    lane.stop();
 
     // Everything the archive holds, including the rows the viewer would still
     // be shown live — durability and display are separate questions now.
