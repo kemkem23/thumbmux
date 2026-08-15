@@ -86,8 +86,16 @@ export type ArchiveAppendResult = {
    * which is every consumer that has not opted in. Reported rather than done
    * silently: this is the one operation in the archive that destroys history,
    * so a host that wants to log or alert on it can.
+   *
+   * **Optional in the type, always present at runtime.** Making it required
+   * would narrow a tier-S declaration: anyone who constructs an
+   * `ArchiveAppendResult` — an alternative `HistoryArchiveLike`, a test double —
+   * would have to supply a field they have never heard of, and their code stops
+   * compiling on a minor. The immutable-baseline gate refuses that, correctly.
+   * Every return path in this file sets it, so `?? 0` is defensive, not a real
+   * branch.
    */
-  prunedLines: number;
+  prunedLines?: number;
 };
 
 export type DurableHistoryArchiveOptions = {

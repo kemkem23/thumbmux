@@ -138,7 +138,9 @@ new DurableHistoryArchive({
 pushes a session past its cap deletes whole chunk files from the oldest end.
 Those lines are gone — there is no tombstone, no marker, and no recovery. The
 count that went is reported as `prunedLines` on the append result, so a host that
-wants to log or alert on it can; nothing is logged for you.
+wants to log or alert on it can; nothing is logged for you. That field is
+optional in the type and always set at runtime — required would have narrowed a
+frozen declaration for anyone who builds an `ArchiveAppendResult` themselves.
 
 Three properties are worth knowing before you pick a number:
 

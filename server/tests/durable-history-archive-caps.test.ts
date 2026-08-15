@@ -37,7 +37,7 @@ function logFiles(archive: DurableHistoryArchive, session: string): string[] {
 function grow(archive: DurableHistoryArchive, session: string, total: number, step: number): number {
   let pruned = 0;
   for (let end = step; end <= total; end += step) {
-    pruned += archive.appendAnchored(session, capture(rows(1, end)), OPTS).prunedLines;
+    pruned += archive.appendAnchored(session, capture(rows(1, end)), OPTS).prunedLines ?? 0;
   }
   return pruned;
 }
@@ -139,4 +139,16 @@ test("appending after a prune still stitches: the anchor comes from what survive
   expect(after.appended).toBe(10);
   expect(after.gap).toBe(false);
   expect(after.totalLines).toBe(110);
+});
+
+test("prunedLines is optional in the type but never absent at runtime", () => {
+  const capped = new DurableHistoryArchive({ root, chunkLines: 10, maxLinesPerSession: 25 });
+  const uncapped = new DurableHistoryArchive({ root: mkdtempSync(join(tmpdir(), "thumbmux-caps-u-")), chunkLines: 10 });
+
+  for (const archive of [capped, uncapped]) {
+    const first = archive.appendAnchored("s", capture(rows(1, 40)), OPTS);
+    expect(first.prunedLines).toBeTypeOf("number");
+    const second = archive.appendAnchored("s", capture(rows(1, 40)), OPTS);   // nothing new -> tooShort path
+    expect(second.prunedLines).toBeTypeOf("number");
+  }
 });

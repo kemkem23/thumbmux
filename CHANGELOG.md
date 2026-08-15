@@ -18,12 +18,25 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
   newest chunk is never dropped — so a cap smaller than one chunk keeps one chunk
   instead of emptying the session. See `docs/history.md` → "Size caps delete
   history".
-- **`TmuxWsMux.hasViewers(session)`** — read-only, creates nothing. `RetentionLane`
-  runs outside the mux, so its captures do not pass through `queueCapture` and
-  cannot be serialised against the viewer path by construction; a host running
-  both needs this to keep the lane off sessions the viewer is already archiving.
-  Wire it as `RetentionLaneOptions.hasViewers`. Without it, two writers append to
-  one archive and the loser's anchor stops matching what is on disk.
+
+`ArchiveAppendResult.prunedLines` is **optional in the type and always present at
+runtime**. Making it required would narrow a tier-S declaration — anyone who
+constructs the result, such as an alternative `HistoryArchiveLike` or a test
+double, would stop compiling on a minor. The immutable-baseline gate refused the
+required version, correctly.
+
+### Not added, and why
+
+A `TmuxWsMux.hasViewers(session)` accessor was drafted for `RetentionLane`, which
+runs outside the mux and therefore outside `queueCapture` — a host running both
+needs to keep the lane off sessions the viewer path is already archiving, or two
+writers append to one archive and the loser's anchor stops matching the disk.
+
+It is not here. `TmuxWsMux` is tier F, and a new method changes a frozen
+declaration to answer a question the host can already answer: `MuxHooks`
+`onSubscribe` / `onUnsubscribe` / `onSocketClose` report every transition, so a
+host tracks its own set and passes `RetentionLaneOptions.hasViewers` from that.
+The gate is what surfaced this, and the smaller surface is the better design.
 
 ### Fixed
 
