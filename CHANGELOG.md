@@ -1,7 +1,25 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.1-dist`.
+
+## v0.16.1 — 2026-08-15
+
+### Fixed
+
+- **Live session thumbnails no longer rebuild every terminal row when one line
+  changes.** `SessionThumb` previously joined the complete tail into one HTML
+  string, so Svelte assigned `innerHTML` on the container whenever even one
+  spinner byte changed. Every `.mtv-line` node was discarded and recreated —
+  about 44 rows per tile, even though production captures keep 75–85% of their
+  rows byte-identical between adjacent frames. The tail now uses rows keyed by
+  screen index and one `{@html}` block per row. Unchanged rows take Svelte's
+  equal-string fast path while only changed row contents are replaced. ANSI SGR
+  and OSC state still advances through the entire frame in order, including the
+  discarded context above the visible tail, and the resulting line markup is
+  byte-identical to the joined renderer. The thumbnail boundary uses
+  `contain: layout paint`; it deliberately does not use `content-visibility`,
+  which can leave blank space on Safari/iOS.
 
 ## v0.16.0 — 2026-08-15
 
