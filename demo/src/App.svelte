@@ -47,6 +47,15 @@
       ? raw
       : undefined;
   })();
+  // Capture hook for scripts/capture-media.sh. Default demo is unchanged.
+  // Hub subtitles are host-owned (v0.12.0); the package does not invent them.
+  const mediaCapture = new URL(window.location.href).searchParams.get('media') === '1';
+  const CAPTURE_SUBTITLES: Record<string, string> = {
+    agent: 'coloured diff · 48 tests green',
+    build: 'vite production · 321 pass',
+    htop: 'alt-screen · SGR mouse',
+    'server-logs': 'ws + http tail',
+  };
 
   let bg = $state(DARK_BG);
   let altScreenSessions = $state<Record<string, boolean>>({});
@@ -155,6 +164,15 @@
               ...(composerModeParam ? { composerMode: composerModeParam } : {}),
               ...(dpadPlacementParam ? { dpadPlacement: dpadPlacementParam } : {}),
             },
+          }
+        : {}),
+      ...(mediaCapture
+        ? {
+            sessionMeta: (rows: SessionListItem[]) => rows.map((row) => ({
+              name: row.name,
+              chip: 'TMUX',
+              subtitle: CAPTURE_SUBTITLES[row.name],
+            })),
           }
         : {}),
       theme: {
