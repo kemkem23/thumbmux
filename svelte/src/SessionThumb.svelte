@@ -21,7 +21,7 @@
   let connected = $state(false);
   let thumbEl = $state<HTMLDivElement | null>(null);
   let thumbPalette = $derived(deriveThumbnailPalette(palette));
-  let html = $derived(renderContent(content, maxLines, thumbPalette));
+  let lines = $derived(renderLines(content, maxLines, thumbPalette));
 
   /** Pin boxes must use a *measured* cell in px. `width: 1ch` plus
    * `font-size: calc(1ch * 0.92)` on the same element is circular — ch
@@ -42,7 +42,7 @@
 
   $effect(() => {
     const el = thumbEl;
-    void html;
+    void lines;
     void connected;
     if (!el) return;
     measureThumbCell(el);
@@ -55,7 +55,7 @@
   /** Advance SGR/OSC through the full tail first, then keep only the last
    * linesToKeep for display — otherwise a color/link opened in the discarded
    * +10 context lines is lost on the visible suffix (A6-19). */
-  function renderContent(raw: string, linesToKeep: number, renderPalette: AnsiPalette) {
+  function renderLines(raw: string, linesToKeep: number, renderPalette: AnsiPalette) {
     const lines = raw.replace(/\r/g, '').split('\n');
     const start = Math.max(0, lines.length - linesToKeep);
     const st = createSgrState();
@@ -64,8 +64,7 @@
     }
     return lines
       .slice(start)
-      .map((line) => `<div class="mtv-line">${lineToHtml(line, st, renderPalette) || '&nbsp;'}</div>`)
-      .join('');
+      .map((line) => lineToHtml(line, st, renderPalette) || '&nbsp;');
   }
 
   // A6-10: resubscribe when session or maxLines changes (not only on mount).
@@ -101,7 +100,11 @@
   aria-hidden="true"
 >
   {#if connected}
-    <div class="tail">{@html html}</div>
+    <div class="tail">
+      {#each lines as lineHtml, i (i)}
+        <div class="mtv-line">{@html lineHtml}</div>
+      {/each}
+    </div>
   {:else}
     <div class="wait">…</div>
   {/if}
@@ -112,6 +115,7 @@
     position: absolute;
     inset: 0;
     overflow: hidden;
+    contain: layout paint;
     container-type: inline-size;
     background: var(--tbg);
     color: var(--tfg);
