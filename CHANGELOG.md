@@ -1,7 +1,47 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.15.9-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.0-dist`.
+
+## v0.16.0 — 2026-08-15
+
+### Added
+
+- **History that keeps growing with nobody watching.** `RetentionLane` captures
+  the sessions a host lists, on its own timer, with no viewer attached and no
+  frames produced. Pair it with `DurableHistoryArchive`, which stores scrollback
+  as plain text — one file line per terminal line, ANSI intact, chunk filenames
+  that are their own absolute start line — so `cat`, `grep -a` and `sed -n` work
+  with no parser in between. Its `index.jsonl` and `meta.json` are caches that a
+  directory scan rebuilds, and a line torn by a power cut is dropped on open.
+  See [docs/history.md](docs/history.md).
+
+- **The live window is now durable, and reported separately.** The archive keeps
+  the rows the viewer is still showing and exposes `liveStartLine`;
+  `history_expand` pages from that boundary instead of from the end of the
+  archive, so a client scrolling up still never sees a row twice. Those were one
+  number before, which meant a session's newest rows lived only inside tmux — and
+  a tmux server restart took them.
+
+- `stitchCapture` / `locateAnchor` (`thumbmux/server`): the reconciliation both
+  paths use, as a pure function. It anchors on what the archive already holds and
+  stores everything above the visible screen — the only region tmux can repaint.
+  The previous reconciliation tolerated two rewritten rows, which fits a shell
+  prompt and not an agent: measured over 378 consecutive production captures,
+  composers repaint five to eight rows and **96% of genuine scrolls archived
+  nothing**, silently.
+
+- `HistoryArchiveLike` gains optional `appendAnchored` and `liveStartLine`. An
+  archive without them behaves exactly as before.
+
+### Removed
+
+- The mux no longer lowers a session's `history-limit` after seeding the
+  archive. tmux applies that option only to windows created after it is set, so
+  on every live pane the call reported success and changed nothing — and
+  shrinking the ring is backwards for a polling archive, which relies on it to
+  carry a burst between captures. `TmuxDriver.setSessionHistoryLimit` remains
+  part of the driver contract; the mux simply never calls it.
 
 ## v0.15.9 — 2026-08-14
 

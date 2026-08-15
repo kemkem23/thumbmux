@@ -7,9 +7,9 @@
 A reusable web-terminal shell and server engine for driving tmux sessions —
 especially AI coding agents — from phone and desktop browsers: a compositor-
 scroll viewer, a keyboard-aware composer, a live session hub, and a multiplexed
-WebSocket engine. The current 0.11.x checkout exposes public core, Svelte,
-server, and assembled app entrypoints. It still needs a host process; it is not
-a standalone executable or an installed copy of the repository demo.
+WebSocket engine. The package exposes public core, Svelte, server, and assembled
+app entrypoints. It still needs a host process; it is not a standalone
+executable or an installed copy of the repository demo.
 
 [![CI](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kemkem23/thumbmux/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/tag/kemkem23/thumbmux?filter=v*-dist&label=release&color=16a34a)](https://github.com/kemkem23/thumbmux/tags)
@@ -49,6 +49,13 @@ phone as the primary device, and rebuilds the viewer around one idea:
   server-side polling and captures. The mux also provides content-hash dedupe,
   cursor-only frames, tail-mode thumbnails, opt-in line-delta frames, and
   opt-in per-message deflate.
+- **History that keeps growing with nobody watching.** A terminal viewer
+  normally archives what someone is looking at, so an agent working alone stops
+  being recorded the moment the last tab closes. `RetentionLane` keeps chosen
+  sessions captured on their own timer, and `DurableHistoryArchive` stores the
+  result as plain text a shell can read — including the rows still on screen,
+  because losing the tmux server should not take a session's newest thousand
+  lines with it. See [Durable history](docs/history.md).
 
 ## The tour
 
@@ -644,7 +651,7 @@ an installable component, not a listener or executable.
 |---|---|
 | **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
+| **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `RetentionLane` keeps chosen sessions archived with no viewer attached · `DurableHistoryArchive` plain-text scrollback store that also keeps the live window · `stitchCapture` the reconciliation both use · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
 | **`thumbmux/app`** | `ThumbmuxApp` assembled hub/session shell · separate `HubView`, `SessionView`, and chromeless `EmbedView` mounts · typed `AppAdapters` for routing, session metadata, launch, content, preferences, theme, labels, and host extension slots |
 
 Docs: [application shell](docs/app.md) ·
@@ -652,6 +659,7 @@ Docs: [application shell](docs/app.md) ·
 [desktop interaction contract](docs/desktop.md) ·
 [WS protocol](docs/protocol.md) · [resize/reflow contract](docs/reflow.md) ·
 [recording journal](docs/recording.md) · [notifications](docs/notifications.md) ·
+[durable history](docs/history.md) ·
 [token guard](docs/security.md) ·
 [CONTRACT.md](https://github.com/kemkem23/thumbmux/blob/main/CONTRACT.md) ·
 [release process](https://github.com/kemkem23/thumbmux/blob/main/SPLIT.md)
