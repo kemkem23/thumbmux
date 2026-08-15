@@ -104,6 +104,29 @@ export interface HistoryArchiveLike {
     },
   ): { liveContent: string };
   readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
+  /**
+   * Absolute archive line where the mux's live window begins.
+   *
+   * Present only on archives that store the live window durably. Without it,
+   * `history_expand` keeps its pre-0.16 meaning — page from the end of the
+   * archive — which is correct for an archive that holds only departed rows.
+   */
+  liveStartLine?(session: string): number | null;
+  /**
+   * Durable append anchored on the archive's own tail, using `paneRows` to know
+   * which rows tmux can still repaint. Required for `retention`.
+   */
+  appendAnchored?(
+    session: string,
+    captured: readonly string[],
+    opts: { paneRows: number; liveLineLimit: number },
+  ): {
+    appended: number;
+    liveStartLine: number;
+    totalLines: number;
+    gap: boolean;
+    deferred: boolean;
+  };
   /** Optional forward archive paging. `afterLine` is an exclusive anchor. */
   readAfter?(session: string, afterLine: number | null, limit?: number): unknown;
   renameSession(oldSession: string, newSession: string): void;
@@ -1466,7 +1489,7 @@ export class TmuxWsMux<
   }
 
   private reportArchiveReadErrorBestEffort(
-    method: "readBefore" | "readAfter",
+    method: "readBefore" | "readAfter" | "liveStartLine",
     session: string,
     error: unknown,
   ): void {
@@ -1486,8 +1509,20 @@ export class TmuxWsMux<
     // (A3-6). A current-pane-only / non-archived profile must not surface
     // durable rows retained under the same session name.
     if (this.archive && this.profileOf(session).archive) {
+      // `null` means "the oldest row I can show" to the client. An archive that
+      // stores the live window durably ends BELOW that row, so answering from
+      // its end would repeat rows the viewer already has. A boundary that throws
+      // falls back to the old meaning rather than failing the reply.
+      let anchor = beforeLine ?? null;
+      if (anchor === null && this.archive.liveStartLine) {
+        try {
+          anchor = this.archive.liveStartLine(session) ?? null;
+        } catch (e: unknown) {
+          this.reportArchiveReadErrorBestEffort("liveStartLine", session, e);
+        }
+      }
       try {
-        history = this.archive.readBefore(session, beforeLine ?? null, limit);
+        history = this.archive.readBefore(session, anchor, limit);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readBefore", session, e);
       }
