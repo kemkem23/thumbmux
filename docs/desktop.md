@@ -223,6 +223,10 @@ arrives silently killed history for every host that never populates `screen`.
 A late reply is discarded once `screen.alt` is known; a prepend that landed
 while mode was unknown is dropped when the first sample (or a flip) is alt.
 
+This paragraph is about scrollback retention specifically. Whether the pane
+also claims the pointer is a separate, independent signal (`screen.mouseSgr`,
+not `screen.alt`) — see "Pointer-claim contract" under Props contract.
+
 v0.3.1 note: `TermView` owns touch forwarding under `altScreenMouse=true`.
 Hosts should not capture touch gestures for SGR forwarding; links, selection,
 local scroll fallback, and terminal mouse sequences are resolved inside
@@ -258,6 +262,10 @@ Snap-to-bottom behavior:
 
 When `altScreenMouse=true`, a plain left click can become an SGR click. It must
 not steal link clicks or text selection.
+
+Despite this section's title, the actual trigger is `screen.mouseSgr` (live or
+explicit), not `screen.alt` — a pane can claim clicks from the main screen
+too. See "Pointer-claim contract" under Props contract.
 
 Pointer algorithm:
 
@@ -430,7 +438,9 @@ type TermViewProps = {
   bottomInsetPx?: number;          // default 0
   claimGeometry?: boolean;         // default true
   altScreenMouse?: boolean;        // default false
-  onKeys?: (data: string) => void; // required when altScreenMouse=true
+  screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
+                                    // default undefined — live wire sample wins once one arrives
+  onKeys?: (data: string) => void; // gate for SGR routing from either source — see below
   onTap?: () => void;
   onLinesChange?: (
     lines: string[],
@@ -456,7 +466,12 @@ directly (no SessionView) owns its own clamp and step.
 reconnect, visibility return, font changes, or ResizeObserver changes.
 
 `altScreenMouse=true` requires `onKeys`. If `onKeys` is absent, SGR mouse
-actions are no-ops and should warn in development builds only.
+actions are no-ops and should warn in development builds only. The same gate
+applies when a live or explicit `screen` reports `mouseSgr: true`: `onKeys`
+decides whether SGR routing can activate at all, whichever source supplied
+`true`. A view-only surface that samples a live `screen` and never wires
+`onKeys` stays inert instead of losing scroll — see "Pointer-claim contract"
+below for why a pane can want the pointer at all.
 
 `onScrollStateChange` is a boundary notification: it fires when `scrolledUp`
 changes, and `bottomOffset` is the offset at that transition. It is not
@@ -473,6 +488,70 @@ type TermViewHandle = {
   refreshGeometry(): void;   // no resize send when claimGeometry=false
 };
 ```
+
+### Pointer-claim contract: `screen.mouseSgr`, not `screen.alt`, decides who gets the wheel
+
+A pane's `MuxPaneScreen { alt, mouseSgr, mouseAny }` is sampled from the
+multiplexer's own state (tmux's `#{alternate_on}` / `#{mouse_sgr_flag}` /
+`#{mouse_any_flag}`) and reaches the host on every full frame and delta. A
+host does not have to opt in to receive it, and `TermView` already prefers a
+live sample over its own `altScreenMouse` prop once one has arrived (see
+`screen` above) — nothing new needs to be built to observe this.
+
+**The three fields are not one signal.** `alt` says which screen buffer is
+active. `mouseSgr` / `mouseAny` say whether the running program has asked the
+terminal to report pointer events to *it* instead of to native scrolling.
+These are set independently by whatever is running in the pane, and a program
+can ask for the pointer while sitting on the **main** screen —
+`alt: false, mouseSgr: true` is a real, observed combination, not a
+theoretical one. Do not infer one field from the other, and do not gate
+pointer-forwarding logic on `alt` when the question is actually `mouseSgr`.
+
+**What happens once a pane claims the pointer.** When `mouseSgr` (live or
+explicit) is true, `TermView` forwards wheel and click to the pane as SGR
+sequences instead of moving local scroll (sections 5–6). That is correct
+*only if* the pane does something useful with those bytes — its own
+scrollback, its own paging. If a pane claims the pointer but does not retain
+output anywhere a host can reach it — no growing multiplexer history, no
+in-pane scroll surface wired to the forwarded bytes — the user is not looking
+at a degraded terminal. There is no route back to earlier output at all: not
+local scroll (the pane owns the wheel now), not a "scrolled up" indicator,
+nothing. This state is reachable by spawning a normal, working program with an
+unlucky combination of flags; it needs no bug in thumbmux or in the program.
+
+**Whose job it is to prevent that.** thumbmux reports what a pane already
+claims; it has no channel to ask a subprocess to release the pointer or to
+make it retain history — those are properties of the program the host chose
+to run and how the host chose to run it. The only party in a position to avoid
+the trap is **the host that spawns the process**, by picking whichever mode or
+flag that program offers for handing scrollback (and the pointer) back to the
+terminal. And because that choice is made by flag, not guaranteed by contract,
+a host that makes it must **verify it took** — after spawning, confirm the
+pane is actually reporting `mouseSgr: false` (via the first live `screen`
+sample, or a direct query to the multiplexer if the check needs to happen
+before a frame arrives) rather than trusting that the flag was accepted. A
+mode like this can fail its own internal feature probe and silently fall back
+to the pointer-claiming mode, with nothing surfaced to say so — the pane just
+quietly stops growing its history again.
+
+**Worked example: grok.** Measured on a real `grok 0.2.102` session, three
+ways to start it:
+
+| spawn mode | `alt` | `mouseSgr` | history after a long answer |
+|---|:---:|:---:|---:|
+| `--no-alt-screen` (today's default) | 0 | **1** | **15** — flat, nothing new retained |
+| `--minimal` | 0 | **0** | **555** — grows with the conversation |
+| `--fullscreen` | 1 | 1 | 0 — by design, alt-screen keeps none |
+
+The first row is the trap this section describes: not on the alternate
+screen, yet still holding the pointer, with nothing accumulating for the user
+to reach. The second row is what a host should look for — the program itself
+offers a mode that both releases the pointer and writes finalized output
+where the multiplexer (and thumbmux) can page through it; the fix cost no
+package code, because `TermView` already deferred to whatever the pane
+reported. The one thing the host must still do is check that the mode
+actually took, because this exact program can fall back from the second row
+to the first without saying so.
 
 ### Native selection freezes scroll *and* live paint (full blast radius)
 
