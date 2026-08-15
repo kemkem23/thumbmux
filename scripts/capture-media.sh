@@ -85,9 +85,8 @@ cleanup() {
       | redact_token >"$ARTIFACTS_DIR/demo.log"
     docker rm -f "$CONTAINER" >/dev/null 2>&1
   fi
-  rm -rf "$BASELINE_DIR"
+  rm -rf "$BASELINE_DIR" "$ARTIFACTS_DIR"
   trap - EXIT
-  # Re-snapshot compare happens only on success; cleanup must still drop the container.
   exit "$rc"
 }
 trap cleanup EXIT
