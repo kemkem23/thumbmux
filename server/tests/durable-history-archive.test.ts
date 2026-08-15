@@ -133,6 +133,24 @@ test("a line torn by a power cut is dropped, and the rest survives", () => {
   expect(reopened.readBefore("s", null, 500).lines).toEqual(rows(1, 20));
 });
 
+test("a missed anchor asks for a deeper look before it calls the history broken", () => {
+  // "I looked too shallow" and "tmux dropped it" are different answers, and only
+  // the second is worth a marker. Escalating first is what keeps a burst tmux
+  // still holds from being recorded as a hole.
+  const archive = new DurableHistoryArchive({ root });
+  archive.appendAnchored("s", capture(rows(1, 30)), OPTS);
+
+  const shallow = archive.appendAnchored("s", capture(rows(900, 930)), { ...OPTS, deeperAvailable: true });
+  expect(shallow.needsDeeper).toBe(true);
+  expect(shallow.gap).toBe(false);
+  expect(shallow.appended).toBe(0);
+
+  const deeper = archive.appendAnchored("s", capture(rows(1, 40)), OPTS);
+  expect(deeper.needsDeeper).toBe(false);
+  expect(deeper.gap).toBe(false);
+  expect(deeper.appended).toBe(10);
+});
+
 test("a session name that is not path-safe cannot escape its root", () => {
   const archive = new DurableHistoryArchive({ root, group: () => "g" });
 

@@ -75,6 +75,12 @@ export type ArchiveAppendResult = {
   totalLines: number;
   gap: boolean;
   deferred: boolean;
+  /**
+   * The anchor was not in this capture, and the caller said a deeper one is
+   * available. Nothing was written: "I looked too shallow" and "tmux dropped
+   * it" are different answers, and only the second deserves a marker.
+   */
+  needsDeeper: boolean;
 };
 
 export type DurableHistoryArchiveOptions = {
@@ -215,12 +221,10 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
   appendAnchored(
     session: string,
     captured: readonly string[],
-    opts: { paneRows: number; liveLineLimit: number },
+    opts: { paneRows: number; liveLineLimit: number; deeperAvailable?: boolean },
   ): ArchiveAppendResult {
     const state = this.stateFor(session);
-    if (state.disabled) {
-      return { appended: 0, liveStartLine: 0, totalLines: 0, gap: false, deferred: false };
-    }
+    if (state.disabled) return failedAppend();
 
     const tail = anchorFromTail(this.tailLines(state, ANCHOR_LINES * 4), ANCHOR_LINES);
     const stitch = stitchCapture({
@@ -237,6 +241,21 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
         totalLines: state.totalLines,
         gap: false,
         deferred: stitch.deferred,
+        needsDeeper: false,
+      };
+    }
+
+    // Only the caller knows whether a deeper capture is still available, so it
+    // gets to say so; a marker written before that question is answered records
+    // a hole in the history that may not exist.
+    if (!stitch.anchored && tail.length > 0 && opts.deeperAvailable) {
+      return {
+        appended: 0,
+        liveStartLine: state.liveStart,
+        totalLines: state.totalLines,
+        gap: false,
+        deferred: false,
+        needsDeeper: true,
       };
     }
 
@@ -254,7 +273,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
       this.writeMeta(session, state);
     } catch {
       state.disabled = true;
-      return { appended: 0, liveStartLine: 0, totalLines: 0, gap: false, deferred: false };
+      return failedAppend();
     }
 
     return {
@@ -263,6 +282,7 @@ export class DurableHistoryArchive implements HistoryArchiveLike {
       totalLines: state.totalLines,
       gap,
       deferred: false,
+      needsDeeper: false,
     };
   }
 
@@ -410,4 +430,9 @@ function splitCapture(content: string): string[] {
 
 function emptyPage(): HistoryPage {
   return { lines: [], startLine: null, hasMore: false };
+}
+
+/** A disabled or broken archive reports zero rather than guessing a position. */
+function failedAppend(): ArchiveAppendResult {
+  return { appended: 0, liveStartLine: 0, totalLines: 0, gap: false, deferred: false, needsDeeper: false };
 }
