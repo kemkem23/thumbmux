@@ -22,6 +22,12 @@
   let thumbEl = $state<HTMLDivElement | null>(null);
   let thumbPalette = $derived(deriveThumbnailPalette(palette));
   let lines = $derived(renderLines(content, maxLines, thumbPalette));
+  // SessionGrid rebuilds its metadata objects whenever a host snapshot changes.
+  // Its retained keyed child can therefore invalidate the session prop getter
+  // even when the returned name is unchanged. These primitive derived signals
+  // stop that parent invalidation before it reaches the subscription effect.
+  let subscribedSession = $derived(session);
+  let subscribedTail = $derived(maxLines + 10);
 
   /** Pin boxes must use a *measured* cell in px. `width: 1ch` plus
    * `font-size: calc(1ch * 0.92)` on the same element is circular — ch
@@ -69,8 +75,8 @@
 
   // A6-10: resubscribe when session or maxLines changes (not only on mount).
   $effect(() => {
-    const name = session;
-    const tail = maxLines + 10;
+    const name = subscribedSession;
+    const tail = subscribedTail;
     let active = true;
     content = '';
     connected = false;

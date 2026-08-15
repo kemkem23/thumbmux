@@ -4,8 +4,9 @@ import { createSgrState, lineToHtml } from "@thumbmux/core";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import SessionThumb from "../src/SessionThumb.svelte";
-import { deriveThumbnailPalette } from "../src/session-grid";
+import { deriveThumbnailPalette, type GridSession } from "../src/session-grid";
 import { tmuxMux } from "../src/ws-mux.svelte";
+import SessionGridHost from "./SessionGridHost.svelte";
 
 const palette: AnsiPalette = {
   defaultFg: "#eeeeee",
@@ -119,5 +120,82 @@ describe("SessionThumb incremental line rendering", () => {
     const legacy = document.createElement("div");
     legacy.innerHTML = legacyTailHtml(raw, maxLines);
     expect(tail.innerHTML).toBe(legacy.innerHTML);
+  });
+});
+
+describe("SessionThumb subscription stability", () => {
+  test("fresh grid metadata with the same session name keeps the live subscription and tail", async () => {
+    const subscriptions: Array<{
+      session: string;
+      tail?: number;
+      deliver: (data: string, type?: string) => void;
+    }> = [];
+    let unsubscribeCount = 0;
+
+    tmuxMux.subscribe = ((session, callback, options) => {
+      subscriptions.push({ session, tail: options?.tail, deliver: callback });
+      return () => {
+        unsubscribeCount += 1;
+      };
+    }) as typeof tmuxMux.subscribe;
+
+    target = document.createElement("div");
+    document.body.appendChild(target);
+    flushSync(() => {
+      mounted = mount(SessionGridHost, {
+        target: target!,
+        props: {
+          initialSessions: [
+            { name: "steady-session", state: "idle", subtitle: "first snapshot" },
+          ] satisfies GridSession[],
+          palette,
+        },
+      }) as Record<string, unknown>;
+    });
+    await tick();
+
+    const host = mounted as {
+      replaceSessions?: (sessions: GridSession[]) => void;
+    };
+    if (typeof host.replaceSessions !== "function") {
+      throw new Error("SessionGridHost did not export replaceSessions");
+    }
+
+    expect(subscriptions.map(({ session, tail }) => ({ session, tail }))).toEqual([
+      { session: "steady-session", tail: 40 },
+    ]);
+    flushSync(() => {
+      subscriptions[0]!.deliver("stable left\nstable right", "output");
+    });
+    await tick();
+
+    const thumbBefore = target.querySelector<HTMLElement>('[data-testid="session-thumb"]');
+    const tailBefore = thumbBefore?.querySelector<HTMLElement>(".tail");
+    if (!thumbBefore || !tailBefore) throw new Error("SessionGrid thumbnail did not become live");
+    expect(thumbBefore.querySelector(".wait")).toBeNull();
+
+    flushSync(() => {
+      host.replaceSessions!([
+        {
+          name: "steady-session",
+          state: "working",
+          subtitle: "second snapshot",
+          lastActivityAt: 1_765_732_800_000,
+        },
+      ]);
+    });
+    await tick();
+
+    // Control: the fresh metadata object reached the retained keyed card.
+    expect(target.querySelector('[data-testid="grid-subtitle"]')?.textContent).toBe("second snapshot");
+    expect(target.querySelector('[data-testid="grid-state"]')?.getAttribute("data-state")).toBe("working");
+    // But an equal primitive (session, maxLines) pair must not tear down the
+    // wire subscription, clear connected, or replace the live tail.
+    expect(subscriptions).toHaveLength(1);
+    expect(unsubscribeCount).toBe(0);
+    const thumbAfter = target.querySelector<HTMLElement>('[data-testid="session-thumb"]');
+    expect(thumbAfter === thumbBefore).toBe(true);
+    expect(thumbAfter?.querySelector(".wait")).toBeNull();
+    expect(thumbAfter?.querySelector(".tail") === tailBefore).toBe(true);
   });
 });
