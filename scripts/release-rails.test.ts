@@ -250,7 +250,7 @@ describe("release rail policy", () => {
       "bun pm pack",
       "smoke:git-dist",
       "materialize-contract-baseline.ts",
-      "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1",
+      "THUMBMUX_CONTRACT_BASELINE_ROOT=",
       "bun run contract",
       "bash scripts/contract-fixtures.sh",
     ];
@@ -321,7 +321,12 @@ describe("release rail policy", () => {
     const gate = readVerifyGate();
     for (const rail of [gate, parity]) {
       expect(rail).toContain("materialize-contract-baseline.ts");
-      expect(rail).toContain("THUMBMUX_CONTRACT_REQUIRE_BASELINE=1");
+      // Supplying the root IS the requirement now: contract-check refuses to run
+      // without a baseline unless the caller states THUMBMUX_CONTRACT_BASELINE=skip.
+      // The old THUMBMUX_CONTRACT_REQUIRE_BASELINE switch is gone, and a rail that
+      // still sets it would suggest the default is permissive.
+      expect(rail).toContain("THUMBMUX_CONTRACT_BASELINE_ROOT=");
+      expect(rail).not.toContain("THUMBMUX_CONTRACT_BASELINE=skip");
       expect(rail).not.toContain("tag --list 'v[0-9]*-dist'");
     }
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);

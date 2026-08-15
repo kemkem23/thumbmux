@@ -6,6 +6,7 @@ import {
   checkContract,
   deriveGitDistReport,
   evaluateBaseline,
+  resolveBaselineMode,
   type ContractEntry,
   type ContractTier,
 } from "./contract-check";
@@ -1037,4 +1038,33 @@ describe("optional additions inside a referenced type", () => {
     const messages = evaluate(before, after).errors.map((error) => error.message);
     expect(messages.some((message) => message.includes('"Holder"'))).toBe(true);
   });
+});
+
+test("a missing immutable baseline is an error, not a silent skip", () => {
+  // The baseline block answers "did a frozen name change"; the surface gate only
+  // answers "is every name declared". Skipping the first one silently printed
+  // the same success line as a full run, and that false all-clear was reported
+  // to a human once already.
+  const missing = resolveBaselineMode({});
+  expect(missing.error).toContain("THUMBMUX_CONTRACT_BASELINE_ROOT");
+  expect(missing.skipped).toBe(false);
+});
+
+test("a baseline root is used when supplied", () => {
+  const supplied = resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE_ROOT: "/tmp/baseline" });
+  expect(supplied.baselinePackageRoot).toBe("/tmp/baseline");
+  expect(supplied.skipped).toBe(false);
+  expect(supplied.error).toBeUndefined();
+});
+
+test("skipping the baseline takes a deliberate opt-out", () => {
+  const skipped = resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "skip" });
+  expect(skipped.skipped).toBe(true);
+  expect(skipped.error).toBeUndefined();
+  // Anything other than the exact word is not an opt-out.
+  expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "yes" }).error).toBeTruthy();
+});
+
+test("an empty baseline root is treated as absent rather than as a directory", () => {
+  expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE_ROOT: "   " }).error).toBeTruthy();
 });

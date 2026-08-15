@@ -703,6 +703,19 @@ compares the built `core`, `server`, `svelte`, and `app` declarations with their
 checked-in tier manifests. That command is the surface gate; it does not run
 consumer fixtures.
 
+It also refuses to run without the **immutable baseline** — the published
+artifact it diffs the frozen surface against:
+
+```bash
+bun scripts/materialize-contract-baseline.ts /tmp/thumbmux-baseline
+THUMBMUX_CONTRACT_BASELINE_ROOT=/tmp/thumbmux-baseline bun run contract
+```
+
+`THUMBMUX_CONTRACT_BASELINE=skip` runs the surface gate alone; the success line
+then says so out loud. That is deliberate: the baseline half answers *did a
+frozen name change*, and skipping it silently once produced a "contract check
+passed" that had never looked.
+
 `bash scripts/contract-fixtures.sh` separately packs the same `git-dist`
 artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
 and `app-host`. They compile and exercise the low-level host, guarded route

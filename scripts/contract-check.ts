@@ -1479,12 +1479,42 @@ function tierSummary(
   return `${subpath} ${live.length} (F ${counts.F}, S ${counts.S}, X ${counts.X}, D ${counts.D})`;
 }
 
+/**
+ * Decide whether this run may proceed without the immutable baseline.
+ *
+ * The baseline block is the half of this gate that answers "did a frozen name
+ * change" — the surface gate alone only answers "is every name declared". They
+ * were opt-in the wrong way round: without `THUMBMUX_CONTRACT_BASELINE_ROOT`
+ * the baseline block was skipped **silently**, so `bun run contract` by hand
+ * printed the same "contract check passed" line as a full run. It has already
+ * produced one false all-clear reported to a human.
+ *
+ * So a missing baseline is now an error, and skipping it takes a deliberate,
+ * greppable opt-out that the success line then admits to.
+ */
+export function resolveBaselineMode(env: Record<string, string | undefined>): {
+  baselinePackageRoot?: string;
+  skipped: boolean;
+  error?: string;
+} {
+  const baselinePackageRoot = env.THUMBMUX_CONTRACT_BASELINE_ROOT?.trim();
+  if (baselinePackageRoot) return { baselinePackageRoot, skipped: false };
+  if (env.THUMBMUX_CONTRACT_BASELINE === "skip") return { skipped: true };
+  return {
+    skipped: false,
+    error: "contract check needs the immutable baseline: set "
+      + "THUMBMUX_CONTRACT_BASELINE_ROOT=<dir> (materialize one with "
+      + "`bun scripts/materialize-contract-baseline.ts <empty-dir>`), or state "
+      + "that you are skipping the frozen-surface half with "
+      + "THUMBMUX_CONTRACT_BASELINE=skip",
+  };
+}
+
 if (import.meta.main) {
   try {
-    const baselinePackageRoot = process.env.THUMBMUX_CONTRACT_BASELINE_ROOT?.trim();
-    if (process.env.THUMBMUX_CONTRACT_REQUIRE_BASELINE === "1" && !baselinePackageRoot) {
-      throw new Error("contract check requires THUMBMUX_CONTRACT_BASELINE_ROOT");
-    }
+    const baseline = resolveBaselineMode(process.env);
+    if (baseline.error) throw new Error(baseline.error);
+    const baselinePackageRoot = baseline.baselinePackageRoot;
     const result = checkContract({
       ...(baselinePackageRoot ? { baselinePackageRoot } : {}),
     });
@@ -1495,8 +1525,14 @@ if (import.meta.main) {
       for (const item of result.errors) console.error(`- ${item.message}`);
       process.exitCode = 1;
     } else {
+      // A run that skipped the frozen-surface half must not print the same
+      // sentence as one that checked it. "Passed" without a scope is how a
+      // partial check gets quoted as a full one.
+      const scope = baseline.skipped
+        ? "contract check passed WITHOUT the immutable baseline (frozen-surface changes were NOT checked)"
+        : "contract check passed";
       console.log(
-        `contract check passed: ${CONTRACT_SUBPACKAGES.map((subpath) =>
+        `${scope}: ${CONTRACT_SUBPACKAGES.map((subpath) =>
           tierSummary(subpath, result.live[subpath], result.manifests[subpath])).join(", ")}`,
       );
     }

@@ -106,8 +106,9 @@ runs:
       run: |
         baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
         bun scripts/materialize-contract-baseline.ts "$baseline_root"
+        # Requiring the baseline is the contract check's default; the root is
+        # the only thing CI still has to supply.
         echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
-        echo "THUMBMUX_CONTRACT_REQUIRE_BASELINE=1" >> "$GITHUB_ENV"
       shell: bash
     - name: public API contract gate
       # Runs against the git-dist built above, not against source: the contract

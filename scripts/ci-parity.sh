@@ -76,8 +76,12 @@ cd "$work"
 baseline_root="$work/.contract-baseline"
 THUMBMUX_CONTRACT_REMOTE_URL="$contract_remote_url" \
   bun scripts/materialize-contract-baseline.ts "$baseline_root"
+# The baseline is required by default now; supplying the root is the whole job.
+# THUMBMUX_CONTRACT_REQUIRE_BASELINE used to be what made a missing baseline an
+# error, which meant a hand-run `bun run contract` was green without ever
+# checking the frozen surface. Keeping a dead switch here would suggest it is
+# still load-bearing.
 export THUMBMUX_CONTRACT_BASELINE_ROOT="$baseline_root"
-export THUMBMUX_CONTRACT_REQUIRE_BASELINE=1
 
 # Fail loudly rather than run a green suite over an empty directory.
 for required in package.json bun.lock core/package.json server/package.json svelte/package.json app/package.json; do
