@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "svelte/compiler";
 import { readFileSync, rmSync } from "node:fs";
-import { expect as pwExpect, type Browser, type Page } from "@playwright/test";
+import type { Browser, Page } from "@playwright/test";
 import { FIXTURES, HOST_CSS, REAL_CODEX_PROMPTS } from "./adaptive-prompt-fixtures";
 const REAL_FIRST = 'อัปโหลดไฟล์ "Screenshot 2026-08-19 160003.png" เสร็จแล้ว → uploads/20260819090033_01MOCMODT7578QT850S8Z5FW69_Screenshot_2026-08-19_160003.png this i s the picture i captured from real scene i think i expect the ui to be more make sense. can you spot the problem? first of all i need the recent prompt immediately show when i click expand second is the note and the session recal area should be more smart dynamic so it could display with less empty space and follow the content height.';
 
@@ -17,7 +17,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const ENTRY = join(here, ".prompts-disclosure-entry.generated.ts");
 
 const sveltePlugin: import("bun").BunPlugin = {
-  name: "thumbmux-svelte-browser",
+  // Bun runs test files concurrently. A distinct plugin name keeps this
+  // browser build isolated from the older TermHud browser harness.
+  name: "thumbmux-prompts-disclosure-browser",
   setup(build) {
     build.onLoad({ filter: /\.svelte$/ }, (args) => ({
       contents: compile(readFileSync(args.path, "utf8"), {
@@ -32,7 +34,9 @@ const sveltePlugin: import("bun").BunPlugin = {
 
 let browser: Browser;
 let bundle: string;
+const ISOLATED_BROWSER_CHILD = process.env.THUMBMUX_PROMPTS_BROWSER_CHILD === "1";
 
+if (ISOLATED_BROWSER_CHILD) {
 beforeAll(async () => {
   await Bun.write(
     ENTRY,
@@ -52,6 +56,9 @@ window.__sceneReady = true;
   });
   if (!built.success) throw new Error(built.logs.map(String).join("\n"));
   bundle = await built.outputs[0]!.text();
+  // Keep Playwright out of the static test graph: Bun browser builds can run
+  // beside this hook, and must never mistake Node-only Playwright modules for
+  // dependencies of a generated browser entry.
   const { chromium } = require("@playwright/test") as typeof import("@playwright/test");
   browser = await chromium.launch();
 }, 180_000);
@@ -93,6 +100,32 @@ async function render(page: Page, opts: { width: number; height: number; prompts
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   const inPage = await page.evaluate(() => (window as unknown as { __pageErrors?: string[] }).__pageErrors ?? []);
   expect([...pageErrors, ...inPage]).toEqual([]);
+}
+
+async function waitForTestIdText(page: Page, testId: string, expected: string): Promise<void> {
+  await page.waitForFunction(
+    ({ testId, expected }) => document.querySelector(`[data-testid="${testId}"]`)?.textContent === expected,
+    { testId, expected },
+  );
+}
+
+async function waitForTestIdAttribute(
+  page: Page,
+  testId: string,
+  name: string,
+  expected: string,
+): Promise<void> {
+  await page.waitForFunction(
+    ({ testId, name, expected }) => document.querySelector(`[data-testid="${testId}"]`)?.getAttribute(name) === expected,
+    { testId, name, expected },
+  );
+}
+
+async function waitForTestIdValue(page: Page, testId: string, expected: string): Promise<void> {
+  await page.waitForFunction(
+    ({ testId, expected }) => (document.querySelector(`[data-testid="${testId}"]`) as HTMLTextAreaElement | null)?.value === expected,
+    { testId, expected },
+  );
 }
 
 describe("measured prompt disclosure", () => {
@@ -141,8 +174,8 @@ describe("measured prompt disclosure", () => {
       expect(REAL_FIRST.length).toBeGreaterThan(480);
       expect(REAL_FIRST.length).toBeLessThan(500);
       const row = page.getByTestId("prompt-item");
-      await pwExpect(row).toHaveText(REAL_FIRST);
-      await pwExpect(page.getByTestId("prompt-disclose")).toHaveCount(0);
+      expect(await row.textContent()).toBe(REAL_FIRST);
+      expect(await page.getByTestId("prompt-disclose").count()).toBe(0);
       const clip = await row.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
       expect(clip).toBe(false);
     } finally {
@@ -158,9 +191,9 @@ describe("measured prompt disclosure", () => {
       const row = page.getByTestId("prompt-item");
       const disclose = page.getByTestId("prompt-disclose");
       await disclose.scrollIntoViewIfNeeded();
-      await pwExpect(disclose).toBeVisible();
-      await pwExpect(disclose).toHaveAttribute("aria-expanded", "false");
-      await pwExpect(disclose).toHaveText("แสดงทั้งหมด");
+      await disclose.waitFor({ state: "visible" });
+      expect(await disclose.getAttribute("aria-expanded")).toBe("false");
+      expect(await disclose.textContent()).toBe("แสดงทั้งหมด");
       const box = await disclose.boundingBox();
       expect(box).not.toBeNull();
       expect(box!.width).toBeGreaterThanOrEqual(44);
@@ -187,10 +220,10 @@ describe("measured prompt disclosure", () => {
       expect(await row.evaluate((el) => el.classList.contains("clamped"))).toBe(true);
       expect(await row.evaluate((el) => el.scrollHeight > el.clientHeight + 1)).toBe(true);
       await disclose.click();
-      await pwExpect(disclose).toHaveAttribute("aria-expanded", "true");
-      await pwExpect(disclose).toHaveText("ย่อ");
+      await waitForTestIdAttribute(page, "prompt-disclose", "aria-expanded", "true");
+      await waitForTestIdText(page, "prompt-disclose", "ย่อ");
       expect(await row.evaluate((el) => el.classList.contains("clamped"))).toBe(false);
-      await pwExpect(row).toHaveText(payload);
+      expect(await row.textContent()).toBe(payload);
     } finally {
       await page.close();
     }
@@ -201,14 +234,14 @@ describe("measured prompt disclosure", () => {
     try {
       const payload = "EnglishOnlyBlock".repeat(40).slice(0, 500);
       await render(page, { width: 320, height: 568, prompts: [payload] });
-      await pwExpect(page.getByTestId("prompt-disclose")).toBeVisible();
+      await page.getByTestId("prompt-disclose").waitFor({ state: "visible" });
       await page.setViewportSize({ width: 2054, height: 281 });
       await page.waitForFunction(() => {
         const panel = document.querySelector("[data-testid='prompts-panel']");
         return panel?.getAttribute("data-overflow-ready") === "true"
           && !document.querySelector("[data-testid='prompt-disclose']");
       });
-      await pwExpect(page.getByTestId("prompt-disclose")).toHaveCount(0);
+      expect(await page.getByTestId("prompt-disclose").count()).toBe(0);
       const clip = await page.getByTestId("prompt-item").evaluate((el) => el.scrollHeight > el.clientHeight + 1);
       expect(clip).toBe(false);
     } finally {
@@ -228,7 +261,8 @@ describe("measured prompt disclosure", () => {
       for (let i = 0; i < hostile.prompts.length; i++) {
         await rows.nth(i).scrollIntoViewIfNeeded();
         await rows.nth(i).click();
-        await pwExpect(page.getByTestId("composer-prefill")).toHaveValue(hostile.prompts[i]!);
+        await waitForTestIdValue(page, "composer-prefill", hostile.prompts[i]!);
+        expect(await page.getByTestId("composer-prefill").inputValue()).toBe(hostile.prompts[i]!);
       }
     } finally {
       await page.close();
@@ -248,7 +282,7 @@ describe("measured prompt disclosure", () => {
       expect(panelBox).not.toBeNull();
       expect(newestBox!.y).toBeGreaterThanOrEqual(panelBox!.y - 0.5);
       expect(newestBox!.y).toBeLessThan(panelBox!.y + panelBox!.height);
-      await pwExpect(page.getByTestId("hud-panel-more")).toBeVisible();
+      await page.getByTestId("hud-panel-more").waitFor({ state: "visible" });
       const before = await page.getByTestId("hud-panel-body").evaluate((el) => el.scrollTop);
       await page.getByTestId("hud-panel-body").evaluate((el) => {
         el.scrollTop = el.scrollHeight;
@@ -259,10 +293,34 @@ describe("measured prompt disclosure", () => {
       }));
       expect(after.overflow).toBe(true);
       expect(after.top).toBeGreaterThan(before);
-      await pwExpect(page.getByTestId("hud-panel-more")).toBeVisible();
-      await pwExpect(page.getByTestId("hud-panel")).toHaveAttribute("data-scrollable", "true");
+      await page.getByTestId("hud-panel-more").waitFor({ state: "visible" });
+      expect(await page.getByTestId("hud-panel").getAttribute("data-scrollable")).toBe("true");
     } finally {
       await page.close();
     }
   });
 });
+} else {
+  test("measured prompt disclosure passes in an isolated real-browser worker", async () => {
+    // Bun.build calls from separate test files can overlap inside one aggregate
+    // `bun test` process and cross-contaminate their loader graphs. Run this
+    // harness in its own process so the public-tree parity command proves the
+    // browser scenes instead of depending on test-file scheduling.
+    const child = Bun.spawn({
+      cmd: [process.execPath, "test", fileURLToPath(import.meta.url)],
+      cwd: join(here, "../.."),
+      env: { ...process.env, THUMBMUX_PROMPTS_BROWSER_CHILD: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, status] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    const output = `${stdout}\n${stderr}`;
+    if (status !== 0) throw new Error(`isolated prompt browser worker failed:\n${output}`);
+    expect(output).toContain("6 pass");
+    expect(output).toContain("0 fail");
+  }, 240_000);
+}
