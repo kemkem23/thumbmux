@@ -594,6 +594,151 @@ describe('mountable terminal views', () => {
     expect(collapsible.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
   });
 
+  test('an initially-open prompt disclosure is prefetched, first, and visible on expand', async () => {
+    let resolvePrompts!: (prompts: string[]) => void;
+    let promptLoads = 0;
+    const promptGate = new Promise<string[]>((resolve) => { resolvePrompts = resolve; });
+    const entry = mountView(SessionView, {
+      session: 'sh-priority-prompts',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        notes: { load: async () => 'a note', save: async () => {} },
+        prompts: async () => {
+          promptLoads += 1;
+          return promptGate;
+        },
+        extraPanel: hostPanelSnippet,
+        sessionPresentation: {
+          promptsCollapsible: true,
+          promptsInitiallyOpen: true,
+          extraPanelPlacement: 'top',
+        },
+      } satisfies AppAdapters,
+    });
+
+    await flushPromises();
+    // Prefetch starts while the HUD is still closed.
+    expect(promptLoads).toBe(1);
+    expect(entry.target.querySelector('[data-testid="hud-panel"]')).toBeNull();
+
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await tick();
+
+    // Expanding reuses the in-flight prefetch instead of issuing a second load,
+    // and the visible disclosure is already open at the top of the stack.
+    expect(promptLoads).toBe(1);
+    expect(
+      entry.target.querySelector('[data-testid="prompts-toggle"]')?.getAttribute('aria-expanded'),
+    ).toBe('true');
+    expect(Array.from(entry.target.querySelectorAll('.hud-panel-stack > *')).map(
+      (node) => node.getAttribute('data-testid') ?? node.className,
+    )).toEqual(['prompts-panel', 'host-extra-panel', 'note-panel']);
+
+    resolvePrompts(['newest prompt', 'older prompt']);
+    await flushPromises();
+    expect(entry.target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(2);
+    expect(entry.target.querySelector('[data-testid="prompt-item"]')?.textContent).toBe('newest prompt');
+  });
+
+  test('a completed prompt prefetch paints the newest prompt in the first expand frame', async () => {
+    const entry = mountView(SessionView, {
+      session: 'sh-warm-prompts',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => ['newest prompt', 'older prompt'],
+        sessionPresentation: {
+          promptsCollapsible: true,
+          promptsInitiallyOpen: true,
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+
+    // No post-click timer or network settlement is required. The refresh may
+    // run in the background, but the prefetched snapshot is in this same frame.
+    const rows = entry.target.querySelectorAll('[data-testid="prompt-item"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.textContent).toBe('newest prompt');
+  });
+
+  test('a synchronous prompt-adapter failure clears the prefetch and retries on expand', async () => {
+    let promptLoads = 0;
+    const entry = mountView(SessionView, {
+      session: 'sh-retry-prompts',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: () => {
+          promptLoads += 1;
+          if (promptLoads === 1) throw new Error('synchronous host failure');
+          return Promise.resolve(['recovered newest prompt']);
+        },
+        sessionPresentation: {
+          promptsCollapsible: true,
+          promptsInitiallyOpen: true,
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    expect(promptLoads).toBe(1);
+
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await flushPromises();
+
+    expect(promptLoads).toBe(2);
+    expect(entry.target.querySelector('[data-testid="prompt-item"]')?.textContent)
+      .toBe('recovered newest prompt');
+  });
+
+  test('an unrelated adapters-object refresh keeps a completed prompt prefetch warm', async () => {
+    let promptLoads = 0;
+    const promptAdapter = async () => {
+      promptLoads += 1;
+      return ['warm prompt'];
+    };
+    const baseAdapters: AppAdapters = {
+      termProps: () => ({ claimGeometry: false }),
+      prompts: promptAdapter,
+      sessionPresentation: {
+        promptsCollapsible: true,
+        promptsInitiallyOpen: true,
+      },
+    };
+    const props = reactiveProps({
+      session: 'sh-stable-prompt-adapter',
+      adapters: baseAdapters,
+    });
+    const entry = mountView(SessionView, props);
+    await flushPromises();
+    expect(promptLoads).toBe(1);
+
+    // Hosts commonly rebuild the outer bag when a title summary arrives. The
+    // prompt function itself is unchanged, so this must not clear/refetch it.
+    flushSync(() => {
+      props.adapters = {
+        ...baseAdapters,
+        titleAdornment: createRawSnippet((name: () => string) => ({
+          render: () => `<span>${name()}</span>`,
+        })),
+      };
+    });
+    await flushPromises();
+    expect(promptLoads).toBe(1);
+
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    expect(entry.target.querySelector('[data-testid="prompt-item"]')?.textContent)
+      .toBe('warm prompt');
+  });
+
   test('extraPanel renders last by default and first when the host places it on top', async () => {
     // The stack's order is a priority order. A host whose extra panel says what
     // the session is doing wants it above a note and a prompt history, and the

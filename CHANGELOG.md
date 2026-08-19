@@ -1,7 +1,25 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.3-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.4-dist`.
+
+## v0.16.4 — 2026-08-19
+
+### Fixed
+
+- **Recall-first hosts see recent prompts on the first expanded frame.** When a
+  host explicitly combines `promptsCollapsible: true` with
+  `promptsInitiallyOpen: true`, `SessionView` now prefetches the current
+  session's prompts while the HUD is closed, reuses an in-flight request when
+  expand is tapped, and renders the open prompt panel before note and host
+  summary panels. A completed prefetch therefore paints the newest prompt in
+  the click frame instead of showing an empty disclosure. Session changes
+  still discard stale results. Hosts that omit either option retain lazy
+  load-on-expand and the historical panel order.
+
+- **Short dense-HUD notes no longer reserve an empty half-row.** The note field
+  now sizes to its content while the activity field owns the remaining width;
+  both fields still shrink, wrap, and clamp without overflowing narrow bars.
 
 ## v0.16.3 — 2026-08-19
 

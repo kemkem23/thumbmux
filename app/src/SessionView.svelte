@@ -153,6 +153,15 @@
   let showShortcutBar = $derived(adapters.sessionPresentation?.showShortcutBar ?? true);
   let promptsCollapsible = $derived(adapters.sessionPresentation?.promptsCollapsible ?? false);
   let promptsInitiallyOpen = $derived(adapters.sessionPresentation?.promptsInitiallyOpen ?? false);
+  // Keep adapter identity separate from the surrounding options object. A
+  // host may rebuild that object when unrelated HUD data changes; the same
+  // prompt function must not invalidate a warm snapshot or duplicate a load.
+  let promptsAdapter = $derived(adapters.prompts);
+  // An initially-open prompt list is the host saying that recall is the first
+  // thing the operator needs after expanding the HUD. Treat that as a complete
+  // priority choice: warm the data before the click and render the panel first,
+  // instead of opening an empty disclosure below note/summary content.
+  let promptsTakePriority = $derived(promptsCollapsible && promptsInitiallyOpen);
   let extraPanelOnTop = $derived(adapters.sessionPresentation?.extraPanelPlacement === 'top');
   let dpadPlacement = $derived(adapters.sessionPresentation?.dpadPlacement);
   let controlInset = $derived(Math.max(
@@ -446,19 +455,49 @@
   });
 
   let promptRequest = 0;
-  async function loadPrompts(): Promise<void> {
-    if (!hudExpanded || !adapters.prompts) return;
-    const request = ++promptRequest;
-    const requestedSession = session;
-    promptsLoading = true;
-    try {
-      const loaded = await adapters.prompts(requestedSession);
-      if (request === promptRequest && requestedSession === session) recentPrompts = loaded;
-    } catch {
-      // Keep the last successful snapshot available while the source recovers.
-    } finally {
-      if (request === promptRequest) promptsLoading = false;
+  let promptLoadSession: string | null = null;
+  let promptLoadPromise: Promise<void> | null = null;
+
+  function loadPrompts(allowWhileCollapsed = false): Promise<void> {
+    // Put the non-reactive argument first: the prefetching effect calls this
+    // with `true` and must not subscribe itself to `hudExpanded`, otherwise the
+    // expand click reruns the effect, clears the in-flight request, and defeats
+    // coalescing at exactly the moment it matters.
+    const promptAdapter = promptsAdapter;
+    if ((!allowWhileCollapsed && !hudExpanded) || !promptAdapter) {
+      return Promise.resolve();
     }
+    const requestedSession = session;
+    // Expanding while the mount-time prefetch is still in flight must reuse it.
+    // Starting a second request would cancel the first through `promptRequest`
+    // and turn a warm click back into a loading-only click.
+    if (promptLoadSession === requestedSession && promptLoadPromise) {
+      return promptLoadPromise;
+    }
+    const request = ++promptRequest;
+    promptsLoading = true;
+    promptLoadSession = requestedSession;
+    // Start through a resolved promise so even an adapter which throws before
+    // returning a Promise becomes a normal rejection. The cleanup callback is
+    // therefore always a later microtask, after `pending` is initialized and
+    // stored — avoiding a temporal-dead-zone failure on synchronous throws.
+    const pending = Promise.resolve()
+      .then(() => promptAdapter(requestedSession))
+      .then((loaded) => {
+        if (request === promptRequest && requestedSession === session) recentPrompts = loaded;
+      })
+      .catch(() => {
+        // Keep the last successful snapshot available while the source recovers.
+      })
+      .finally(() => {
+        if (request === promptRequest) promptsLoading = false;
+        if (request === promptRequest && promptLoadSession === requestedSession) {
+          promptLoadPromise = null;
+          promptLoadSession = null;
+        }
+      });
+    promptLoadPromise = pending;
+    return pending;
   }
 
   function showHub(): void {
@@ -596,10 +635,17 @@
   });
 
   $effect(() => {
-    session;
+    const requestedSession = session;
+    const shouldPrefetch = promptsTakePriority;
+    const promptAdapter = promptsAdapter;
     promptRequest += 1;
+    promptLoadSession = null;
+    promptLoadPromise = null;
     recentPrompts = [];
     promptsLoading = false;
+    if (requestedSession && shouldPrefetch && promptAdapter) {
+      void loadPrompts(true);
+    }
   });
 
   onMount(() => {
@@ -641,8 +687,29 @@
   {/if}
 {/snippet}
 
+{#snippet recentPromptsPanel()}
+  <PromptsPanel
+    prompts={recentPrompts}
+    loading={promptsLoading}
+    collapsible={promptsCollapsible}
+    initiallyOpen={promptsInitiallyOpen}
+    onPick={(prompt) => {
+      hudExpanded = false;
+      prefillComposer(prompt);
+    }}
+    labels={{
+      title: labels.promptsTitle,
+      loading: labels.promptsLoading,
+      none: labels.promptsEmpty,
+    }}
+  />
+{/snippet}
+
 {#snippet hudPanel()}
   <div class="hud-panel-stack">
+    {#if adapters.prompts && promptsTakePriority}
+      {@render recentPromptsPanel()}
+    {/if}
     {#if adapters.extraPanel && extraPanelOnTop}
       {@const extraPanelTop = adapters.extraPanel}
       {@render extraPanelTop(session)}
@@ -656,22 +723,8 @@
         labels={{ edit: labels.noteEdit, save: labels.noteSave, cancel: labels.noteCancel }}
       />
     {/if}
-    {#if adapters.prompts}
-      <PromptsPanel
-        prompts={recentPrompts}
-        loading={promptsLoading}
-        collapsible={promptsCollapsible}
-        initiallyOpen={promptsInitiallyOpen}
-        onPick={(prompt) => {
-          hudExpanded = false;
-          prefillComposer(prompt);
-        }}
-        labels={{
-          title: labels.promptsTitle,
-          loading: labels.promptsLoading,
-          none: labels.promptsEmpty,
-        }}
-      />
+    {#if adapters.prompts && !promptsTakePriority}
+      {@render recentPromptsPanel()}
     {/if}
     {#if adapters.extraPanel && !extraPanelOnTop}
       {@const extraPanel = adapters.extraPanel}
