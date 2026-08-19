@@ -1115,6 +1115,24 @@ describe("TermView alt-screen pointer and touch hit testing", () => {
 });
 
 describe("TermView compositor scroll diagnostics", () => {
+  test("treats any positive bottom offset as scrolled up", async () => {
+    const scrollStates: ScrollState[] = [];
+    const { app, viewport } = await prepareScrollableTermView((state) => scrollStates.push(state));
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    expect(isScrolledUp?.()).toBe(false);
+    scrollStates.length = 0;
+
+    // A fractional pixel is deliberately much smaller than the 21px terminal
+    // row and would normally round to zero. Follow state is exact: only the
+    // actual offset=0 is the live tail, and diagnostics must preserve that
+    // sentinel distinction.
+    wheelTowardHistory(viewport, -0.25);
+
+    expect(isScrolledUp?.()).toBe(true);
+    expect(scrollStates).toEqual([{ bottomOffset: 1, scrolledUp: true }]);
+    expect(viewport.getAttribute("data-bottom-offset")).toBe("1");
+  });
+
   test("bottom offset is mirrored once at settle, never during a fling", async () => {
     const { app, viewport } = await prepareScrollableTermView();
     wheelTowardHistory(viewport);
@@ -1715,6 +1733,47 @@ describe("TermView retained history budgets", () => {
 
     const afterOffset = Number(viewport.getAttribute("data-bottom-offset"));
     expect(afterOffset - beforeOffset).toBeCloseTo(lineHeight, 5);
+  }, 120_000);
+
+  test("keeps the viewport fixed when a full replace rewrites a long tail", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1);
+
+    const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+    if (!layer) throw new Error("TermView compositor layer not found");
+    const transformBefore = layer.style.transform;
+    const offsetBefore = compositorBottomOffset(viewport);
+    const totalBefore = Number(viewport.getAttribute("data-total"));
+    const stablePrefix = retainedLines.slice(0, -6);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      [
+        ...stablePrefix,
+        "rewritten-tail-1",
+        "rewritten-tail-2",
+        "rewritten-tail-3",
+        "rewritten-tail-4",
+        "rewritten-tail-5",
+        "rewritten-tail-6",
+        "new-tail-1",
+        "new-tail-2",
+        "new-tail-3",
+        "new-tail-4",
+      ].join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore + 4);
+    expect(compositorBottomOffset(viewport)).toBe(offsetBefore + 4 * 21);
+    expect(layer.style.transform).toBe(transformBefore);
   }, 120_000);
 
   // A5-9 (replace path): full-window identical overlap must not claim every

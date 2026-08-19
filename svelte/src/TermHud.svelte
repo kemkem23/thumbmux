@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { copyPlainText } from './clipboard';
 
   /** Structurally-typed snippet: Svelte's `Snippet` carries a nominal brand
    * (unique symbol), so in monorepos where the host and this package resolve
@@ -25,6 +26,10 @@
     titleAdornment,
     notePrefix = '✎ ',
     statusCase = 'upper',
+    layout = 'default',
+    copyTitleAria = 'Copy tmux session name',
+    expandAria = 'Expand session details',
+    onCopyTitle,
   }: {
     chip: string;
     title: string;
@@ -57,7 +62,28 @@
     /** `'upper'` (default, historical) uppercases `status`; `'none'` renders it
      * exactly as given. */
     statusCase?: 'upper' | 'none';
+    /** Opt-in compact metadata layout. The default preserves the historical
+     * stacked title/note button and its whole-row expand target. */
+    layout?: 'default' | 'dense';
+    /** Accessible labels for the dense layout's two independent controls. */
+    copyTitleAria?: string;
+    expandAria?: string;
+    /** Override the dense title button's clipboard transport. When omitted the
+     * component writes to the browser clipboard with a plain-HTTP fallback. */
+    onCopyTitle?: (title: string) => void | Promise<void>;
   } = $props();
+
+  async function copyTitle(): Promise<void> {
+    try {
+      if (onCopyTitle) await onCopyTitle(title);
+      else await copyPlainText(title);
+    } catch { /* a clipboard denial must not break the HUD */ }
+  }
+
+  function toggleExpanded(): void {
+    expanded = !expanded;
+    onToggleExpand?.();
+  }
 
   /** Used only when the row's own `column-gap` cannot be read (no layout
    * engine). The measured value is always preferred so the predicate below
@@ -121,35 +147,71 @@
   });
 </script>
 
-<div class="hud-top" bind:offsetHeight={barHeight}>
+<div class="hud-top" class:dense={layout === 'dense'} bind:offsetHeight={barHeight}>
   <button class="bk" onclick={onBack} aria-label={backAria}>‹</button>
   <span class="agchip">{chip}</span>
-  <button class="hud-names" onclick={() => { expanded = !expanded; onToggleExpand?.(); }} aria-expanded={expanded} data-testid="hud-expand">
-    {#if titleAdornment}
-      {@const adornSnippet = titleAdornment as Snippet}
-      <span class="nm nm-slotted" bind:this={nmEl}><span class="nm-title" bind:this={titleEl}>{title}</span><span
-          class="nm-slot"
-          class:nm-slot-collapsed={!adornmentFits}
+  {#if layout === 'dense'}
+    <div class="hud-dense-fields" data-testid="hud-dense-fields">
+      <button
+        type="button"
+        class="hud-copy-title"
+        data-testid="hud-copy-title"
+        aria-label={`${copyTitleAria}: ${title}`}
+        onclick={() => { void copyTitle(); }}
+      >{title}</button>
+      {#if note}
+        <span class="hud-separator" aria-hidden="true">:</span>
+        <span class="hud-note hud-note-dense" lang="th">{note}</span>
+      {/if}
+      {#if titleAdornment}
+        {@const denseAdornment = titleAdornment as Snippet}
+        <span class="hud-separator" aria-hidden="true">:</span>
+        <span
+          class="hud-dense-adornment"
           data-testid="hud-title-adornment"
-          data-collapsed={adornmentFits ? 'false' : 'true'}
-          bind:this={slotEl}
-        >{@render adornSnippet()}</span><span class="hud-caret" bind:this={caretEl}>{expanded ? '▴' : '▾'}</span></span>
-    {:else}
-      <span class="nm">{title} <span class="hud-caret">{expanded ? '▴' : '▾'}</span></span>
-    {/if}
-    {#if note}
-      <span class="hud-note" lang="th">{notePrefix}{note}</span>
-    {/if}
-  </button>
-  <span class="st">
-    <span class="led" class:pulse={working}></span>
-    {statusCase === 'upper' ? (status || '…').toUpperCase() : (status || '…')}
-  </span>
+          data-collapsed="false"
+        >{@render denseAdornment()}</span>
+      {/if}
+      <span class="hud-separator" aria-hidden="true">:</span>
+      <button
+        type="button"
+        class="hud-dense-expand"
+        onclick={toggleExpanded}
+        aria-label={expandAria}
+        aria-expanded={expanded}
+        data-testid="hud-expand"
+      >{expanded ? '▴' : '▾'}</button>
+    </div>
+  {:else}
+    <button class="hud-names" onclick={toggleExpanded} aria-expanded={expanded} data-testid="hud-expand">
+      {#if titleAdornment}
+        {@const adornSnippet = titleAdornment as Snippet}
+        <span class="nm nm-slotted" bind:this={nmEl}><span class="nm-title" bind:this={titleEl}>{title}</span><span
+            class="nm-slot"
+            class:nm-slot-collapsed={!adornmentFits}
+            data-testid="hud-title-adornment"
+            data-collapsed={adornmentFits ? 'false' : 'true'}
+            bind:this={slotEl}
+          >{@render adornSnippet()}</span><span class="hud-caret" bind:this={caretEl}>{expanded ? '▴' : '▾'}</span></span>
+      {:else}
+        <span class="nm">{title} <span class="hud-caret">{expanded ? '▴' : '▾'}</span></span>
+      {/if}
+      {#if note}
+        <span class="hud-note" lang="th">{notePrefix}{note}</span>
+      {/if}
+    </button>
+  {/if}
+  {#if layout === 'default'}
+    <span class="st">
+      <span class="led" class:pulse={working}></span>
+      {statusCase === 'upper' ? (status || '…').toUpperCase() : (status || '…')}
+    </span>
+  {/if}
 </div>
 
 {#if expanded && panel}
   {@const panelSnippet = panel as Snippet}
-  <div class="hud-panel" style:top={`${barHeight}px`} data-testid="hud-panel">
+  <div class="hud-panel" class:dense={layout === 'dense'} style:top={`${barHeight}px`} data-testid="hud-panel">
     {@render panelSnippet()}
   </div>
 {/if}
@@ -166,6 +228,16 @@
     border-bottom: 2px solid var(--agent);
     font-family: var(--font-mono);
   }
+  .hud-top.dense {
+    align-items: flex-start;
+    gap: 4px;
+    padding: calc(2px + env(safe-area-inset-top)) 4px 2px;
+    background: var(--tbg);
+    border-bottom-width: 1px;
+  }
+  .hud-top.dense .agchip {
+    display: none;
+  }
   .bk {
     font: 700 16px var(--font-mono); color: var(--hud-fg);
     background: none; border: 1px solid var(--hud-line);
@@ -177,6 +249,85 @@
     display: flex; flex-direction: column; justify-content: center;
     background: none; border: none; color: var(--hud-fg); padding: 0;
     touch-action: manipulation; cursor: pointer;
+  }
+  .hud-dense-fields {
+    min-width: 0;
+    flex: 1 1 auto;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    align-content: center;
+    flex-wrap: wrap;
+    gap: 0 4px;
+    color: var(--hud-fg);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.7;
+  }
+  .hud-copy-title,
+  .hud-dense-expand {
+    min-height: 44px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--hud-fg);
+    font: inherit;
+    touch-action: manipulation;
+    cursor: pointer;
+  }
+  .hud-copy-title {
+    min-width: 44px;
+    max-width: 100%;
+    padding: 0;
+    font-weight: 700;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .hud-dense-expand {
+    flex: 0 0 44px;
+    width: 44px;
+    padding: 0;
+    color: var(--agent);
+  }
+  .hud-copy-title:focus-visible,
+  .hud-dense-expand:focus-visible {
+    outline: 2px solid var(--agent);
+    outline-offset: -2px;
+  }
+  .hud-separator {
+    flex: 0 0 auto;
+    color: var(--agent);
+    font-weight: 700;
+  }
+  .hud-note.hud-note-dense,
+  .hud-dense-adornment {
+    min-width: 0;
+    max-width: 100%;
+    flex: 1 1 180px;
+    overflow: hidden;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    opacity: .86;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+  }
+  .hud-note.hud-note-dense {
+    font-family: var(--font-thai);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.7;
+    letter-spacing: 0;
+    word-break: normal;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+  .hud-dense-adornment {
+    font: inherit;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
   }
   .nm { display: block; font: 700 12px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Slotted variant — only reached when `titleAdornment` is passed, so a row
@@ -208,5 +359,8 @@
     border-bottom: 1px solid var(--agent);
     padding: 10px 12px calc(12px + 2px);
     max-height: 55dvh; overflow-y: auto;
+  }
+  .hud-panel.dense {
+    background: var(--tbg);
   }
 </style>

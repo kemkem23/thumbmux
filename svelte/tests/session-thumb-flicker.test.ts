@@ -23,19 +23,25 @@ const originalSubscribe = tmuxMux.subscribe.bind(tmuxMux);
 let mounted: Record<string, unknown> | null = null;
 let target: HTMLDivElement | null = null;
 let deliver: ((data: string, type?: string) => void) | null = null;
+let subscribedTail: number | undefined;
 
 afterEach(() => {
   tmuxMux.subscribe = originalSubscribe as typeof tmuxMux.subscribe;
   deliver = null;
+  subscribedTail = undefined;
   if (mounted) unmount(mounted);
   target?.remove();
   mounted = null;
   target = null;
 });
 
-async function mountThumb(maxLines = 4): Promise<HTMLDivElement> {
-  tmuxMux.subscribe = ((_session, callback) => {
+async function mountThumb(
+  maxLines: number | null = 4,
+  density: "default" | "dense" = "default",
+): Promise<HTMLDivElement> {
+  tmuxMux.subscribe = ((_session, callback, options) => {
     deliver = callback;
+    subscribedTail = options?.tail;
     return () => {
       deliver = null;
     };
@@ -46,7 +52,12 @@ async function mountThumb(maxLines = 4): Promise<HTMLDivElement> {
   flushSync(() => {
     mounted = mount(SessionThumb, {
       target: target!,
-      props: { session: "flicker-fixture", palette, maxLines },
+      props: {
+        session: "flicker-fixture",
+        palette,
+        density,
+        ...(maxLines === null ? {} : { maxLines }),
+      },
     }) as Record<string, unknown>;
   });
   await tick();
@@ -75,6 +86,15 @@ function legacyTailHtml(raw: string, linesToKeep: number): string {
 }
 
 describe("SessionThumb incremental line rendering", () => {
+  test("dense mode opts into a 50-line render window and 60-line subscription", async () => {
+    const host = await mountThumb(null, "dense");
+    expect(subscribedTail).toBe(60);
+    await sendFrame(Array.from({ length: 70 }, (_, index) => `line-${index}`).join("\n"));
+    expect(host.querySelector('[data-testid="session-thumb"]')?.classList.contains("dense")).toBe(true);
+    expect(host.querySelectorAll(".tail > .mtv-line")).toHaveLength(50);
+    expect(host.querySelector(".tail > .mtv-line")?.textContent).toBe("line-20");
+  });
+
   test("a one-line frame change preserves the existing line DOM", async () => {
     const host = await mountThumb(3);
     await sendFrame("\x1b[31mstable-left\nspinner-1\nstable-right\x1b[0m");

@@ -288,6 +288,29 @@ Vite/SvelteKit pick them up automatically (they ship Svelte sources + `.d.ts`,
 compiled by your bundler). **Pin only a `-dist` tag that the listing command
 returns**; update by choosing another published tag and reinstalling.
 
+### Opt-in dense session chrome
+
+The stock HUD and grid are unchanged unless a host opts in. `TermHud`
+`layout="dense"` renders a wrapping `name : note : titleAdornment : expand`
+bar. The name is its own clipboard button and the expand control remains a
+separate button; `onCopyTitle`, `copyTitleAria`, and `expandAria` let a host
+replace the clipboard transport or labels. Dense mode renders the note verbatim
+(without the stock `✎ ` prefix), always keeps `titleAdornment` visible, and
+hides the agent chip while retaining Back.
+
+`SessionGrid cardLayout="dense"` renders the matching
+`name : note : summary : expand` metadata above a denser live preview. Add
+`note` and `summary` to each `GridSession`; `subtitle` remains supported and is
+the dense summary fallback. Dense cards are one full-container-width square on
+mobile/coarse pointers, and exactly 500 × 500 px from 768 px on a fine-pointer
+desktop. Set `showNew={false}` when the host supplies its own launcher.
+`SessionThumb density="dense"` is also public for hosts composing a card
+directly. Omitting every new prop preserves the historical layout, 30-line
+thumbnail window, and launcher card.
+
+The assembled shell forwards the same opt-ins as
+`hubPresentation.cardLayout` and `sessionPresentation.headerLayout`.
+
 **TypeScript consumers of `thumbmux/svelte` and `thumbmux/app` must set
 `"moduleResolution": "bundler"`** (or an equivalent that resolves
 `./TermView.svelte` to its adjacent `.d.ts` the same way). Under

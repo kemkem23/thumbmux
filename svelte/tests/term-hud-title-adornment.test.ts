@@ -116,6 +116,63 @@ describe("TM-04 · titleAdornment", () => {
     expect(slot.getAttribute("data-collapsed")).toBe("false");
     expect(slot.classList.contains("nm-slot-collapsed")).toBe(false);
   });
+
+  test("dense layout orders wrapping metadata, copies the title, and keeps expand separate", async () => {
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    let copied = "";
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => { copied = text; } },
+    });
+    try {
+      const target = mountHud({
+        layout: "dense",
+        note: "รอ merge",
+        titleAdornment: textSnippet("กำลังรันชุดทดสอบยาว"),
+      });
+      await tick();
+
+      const fields = target.querySelector('[data-testid="hud-dense-fields"]')!;
+      const order = Array.from(fields.children).map((element) =>
+        element.className.split(" ")[0],
+      );
+      expect(order).toEqual([
+        "hud-copy-title",
+        "hud-separator",
+        "hud-note",
+        "hud-separator",
+        "hud-dense-adornment",
+        "hud-separator",
+        "hud-dense-expand",
+      ]);
+      // Dense is the literal `name : note : activity : expand` surface. The
+      // historical pencil prefix belongs only to the default stacked layout.
+      expect(target.querySelector(".hud-note")!.textContent).toBe("รอ merge");
+
+      const copy = target.querySelector<HTMLButtonElement>('[data-testid="hud-copy-title"]')!;
+      const expand = target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]')!;
+      const note = target.querySelector<HTMLElement>(".hud-note-dense")!;
+      const adorn = target.querySelector<HTMLElement>(".hud-dense-adornment")!;
+      expect(getComputedStyle(copy).minWidth).toBe("44px");
+      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
+      expect(getComputedStyle(adorn).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
+      flushSync(() => copy.click());
+      await Promise.resolve();
+      expect(copied).toBe("term-3fsy9c-orchestrator");
+      expect(expand.getAttribute("aria-expanded")).toBe("false");
+
+      flushSync(() => expand.click());
+      await tick();
+      expect(expand.getAttribute("aria-expanded")).toBe("true");
+      expect(copied).toBe("term-3fsy9c-orchestrator");
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      } else {
+        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+      }
+    }
+  });
 });
 
 describe("TM-04 · status and note transforms are opt-in", () => {

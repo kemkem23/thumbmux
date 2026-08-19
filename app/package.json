@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/app",
-  "version": "0.16.2",
+  "version": "0.16.3",
   "description": "Mountable Svelte application shell for the thumbmux mobile terminal stack.",
   "type": "module",
   "exports": {
@@ -23,8 +23,8 @@
     "build": "rm -rf dist && svelte-package -i src -o dist"
   },
   "dependencies": {
-    "@thumbmux/core": "^0.16.2",
-    "@thumbmux/svelte": "^0.16.2"
+    "@thumbmux/core": "^0.16.3",
+    "@thumbmux/svelte": "^0.16.3"
   },
   "devDependencies": {
     "@sveltejs/package": "^2.5.4",

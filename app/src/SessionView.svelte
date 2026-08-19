@@ -748,6 +748,7 @@
     titleAdornment={adapters.titleAdornment ? hudTitleAdornment : undefined}
     notePrefix={adapters.sessionPresentation?.notePrefix ?? '✎ '}
     statusCase={adapters.sessionPresentation?.statusCase ?? 'upper'}
+    layout={adapters.sessionPresentation?.headerLayout ?? 'default'}
   />
 
   {#if showShortcutBar}
