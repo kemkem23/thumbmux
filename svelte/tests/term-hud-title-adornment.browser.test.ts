@@ -226,10 +226,18 @@ type DenseMeasurement = {
   adornCollapsed: string | null;
   adornVisibility: string;
   noteLineClamp: string;
+  noteLeft: number;
+  noteRight: number;
+  noteTop: number;
+  noteWidth: number;
+  noteTextWidth: number;
   noteClientHeight: number;
   noteScrollHeight: number;
   noteLineHeight: number;
   adornLineClamp: string;
+  adornLeft: number;
+  adornTop: number;
+  adornWidth: number;
   adornClientHeight: number;
   adornScrollHeight: number;
   adornLineHeight: number;
@@ -275,9 +283,13 @@ async function renderDense(
     const hudRect = hud.getBoundingClientRect();
     const titleRange = document.createRange();
     titleRange.selectNodeContents(title);
+    const noteRange = document.createRange();
+    noteRange.selectNodeContents(note);
     const titleStyle = getComputedStyle(title);
     const noteStyle = getComputedStyle(note);
     const adornStyle = getComputedStyle(adorn);
+    const noteRect = note.getBoundingClientRect();
+    const adornRect = adorn.getBoundingClientRect();
     const resolvedLineHeight = (style: CSSStyleDeclaration) =>
       Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.7;
     return {
@@ -293,10 +305,18 @@ async function renderDense(
       adornCollapsed: adorn.getAttribute("data-collapsed"),
       adornVisibility: adornStyle.visibility,
       noteLineClamp: noteStyle.getPropertyValue("-webkit-line-clamp"),
+      noteLeft: noteRect.left,
+      noteRight: noteRect.right,
+      noteTop: noteRect.top,
+      noteWidth: noteRect.width,
+      noteTextWidth: noteRange.getBoundingClientRect().width,
       noteClientHeight: note.clientHeight,
       noteScrollHeight: note.scrollHeight,
       noteLineHeight: resolvedLineHeight(noteStyle),
       adornLineClamp: adornStyle.getPropertyValue("-webkit-line-clamp"),
+      adornLeft: adornRect.left,
+      adornTop: adornRect.top,
+      adornWidth: adornRect.width,
       adornClientHeight: adorn.clientHeight,
       adornScrollHeight: adorn.scrollHeight,
       adornLineHeight: resolvedLineHeight(adornStyle),
@@ -461,6 +481,32 @@ describe("TM-04 · the name keeps the row", () => {
 });
 
 describe("dense HUD browser layout", () => {
+  test(
+    "sizes a short note to its content and gives the remaining wide row to activity",
+    async () => {
+      const page = await browser.newPage({ viewport: { width: 2200, height: 500 } });
+      try {
+        const measurement = await renderDense(page, {
+          width: 2036,
+          title: "codex-kem-cortex-orchestrator-2",
+          note: "test note",
+          adorn: "งานยืด timeout ของ Claude Fable เป็น 2 ชั่วโมงทำจบแล้ว เทสต์ผ่าน ยังไม่ commit และตอนนี้รอคำสั่งใหม่",
+        });
+        expect(Math.abs(measurement.noteTop - measurement.adornTop)).toBeLessThanOrEqual(1);
+        expect(measurement.noteWidth).toBeGreaterThan(1);
+        expect(measurement.noteWidth).toBeLessThanOrEqual(measurement.noteTextWidth + 1);
+        // Only the colon and the row's two 4px gaps belong between the fields.
+        // The old equal-grow rule left roughly 780px of invisible note width.
+        expect(measurement.adornLeft - measurement.noteRight).toBeLessThanOrEqual(24);
+        expect(measurement.adornWidth).toBeGreaterThan(measurement.noteWidth * 5);
+        expect(measurement.hudScrollWidth).toBeLessThanOrEqual(measurement.hudClientWidth + 1);
+      } finally {
+        await page.close();
+      }
+    },
+    120_000,
+  );
+
   test(
     "wraps all metadata without collapsing activity or overflowing the narrow bar",
     async () => {

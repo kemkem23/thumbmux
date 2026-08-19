@@ -305,7 +305,6 @@
   .hud-dense-adornment {
     min-width: 0;
     max-width: 100%;
-    flex: 1 1 180px;
     overflow: hidden;
     text-overflow: clip;
     white-space: normal;
@@ -315,6 +314,11 @@
     -webkit-box-orient: vertical;
   }
   .hud-note.hud-note-dense {
+    /* A short note must end where its text ends. Giving note and activity the
+       same grow factor creates a large invisible half-row between their two
+       separators on wide screens. The activity is normally the long field,
+       so it owns the remaining width while both fields can still shrink/wrap. */
+    flex: 0 1 auto;
     font-family: var(--font-thai);
     font-size: 12px;
     font-weight: 600;
@@ -325,6 +329,7 @@
     line-clamp: 2;
   }
   .hud-dense-adornment {
+    flex: 1 1 180px;
     font: inherit;
     -webkit-line-clamp: 3;
     line-clamp: 3;

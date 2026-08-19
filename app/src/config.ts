@@ -61,16 +61,21 @@ export interface SessionPresentationOptions {
    * height fast — five prompts is most of a phone screen — and the collapsed
    * list is what makes the rest of the stack reachable without scrolling. */
   promptsCollapsible?: boolean;
-  /** Start the collapsible prompt list open. Defaults false (collapsed); has
-   * no effect unless `promptsCollapsible` is set. */
+  /** Start the collapsible prompt list open. When paired with
+   * `promptsCollapsible`, SessionView also prefetches the prompt adapter and
+   * renders this list first, so the first HUD expansion can show recall
+   * immediately. Defaults false (collapsed); has no effect unless
+   * `promptsCollapsible` is set. */
   promptsInitiallyOpen?: boolean;
   /** Where `extraPanel` renders inside the HUD panel stack. Defaults
    * `'bottom'`, which is where it has always rendered.
    *
    * `'top'` exists because the stack's order is a priority order, not a
    * layout detail: a host whose extra panel is the summary of what the session
-   * is doing wants it above a note and a prompt history, and previously had no
-   * way to say so short of giving up the stock note and prompt panels. */
+   * is doing wants it above the stock panels. The one explicit exception is a
+   * collapsible prompt list with `promptsInitiallyOpen: true`: that opt-in
+   * makes recent prompts the first panel, followed by a top-placed extra panel
+   * and then the note. */
   extraPanelPlacement?: 'top' | 'bottom';
   /** Text placed before the HUD note. Defaults to `'✎ '`, which is what the
    * HUD has always prefixed; pass `''` to render the host's note verbatim. */
