@@ -168,6 +168,19 @@ notes are verbatim (the default layout alone applies `notePrefix`), the
 adornment never collapses, and the agent chip is hidden while Back remains.
 Omission keeps `headerLayout: 'default'` and the historical header unchanged.
 
+When `promptsCollapsible` and `promptsInitiallyOpen` are both true, the
+recall-priority stack has three stable styling seams: the prompt panel is
+`.promptsp`, note panels are `.notep`, and note plus `extraPanel` are grouped
+inside `.hud-meta-column`. The package default remains a compact vertical
+stack. A host that owns a wider session layout can target those classes (use
+`:global(...)` from scoped Svelte CSS) to place the prompt beside the metadata
+column; it does not need to reorder or reconstruct the panels. Keep the prompt
+column and metadata column `min-width: 0`, and let `.hud-meta-column` size to
+its contents rather than assigning equal grid rows. `PromptsPanel` itself
+remeasures rows: only real overflow beyond eight rendered lines is clamped,
+with a separate 44-pixel disclosure, while clicking the text still supplies
+the complete prompt to the composer.
+
 Here is a complete implementation of the examples that use ordinary HTTP and
 the shared mux:
 

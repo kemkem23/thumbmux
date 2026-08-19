@@ -1,7 +1,34 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.4-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.5-dist`.
+
+## v0.16.5 — 2026-08-19
+
+### Fixed
+
+- **Recent-prompt recall no longer turns a resend into a 500-unit preview.**
+  The pane scanner keeps the complete payload found inside its bounded line
+  window instead of replacing the tail with a synthetic ellipsis. The
+  prompt row passes that exact value to the composer, including host-supplied
+  newlines, Thai combining marks, emoji, and tested 499/500/501/4096-unit
+  boundaries. Pane captures still normalize continuation-row whitespace
+  because tmux cannot distinguish a visual wrap from an intentional newline.
+
+- **Long prompt rows disclose measured overflow instead of silently losing
+  text.** A row that really exceeds eight rendered lines gets an explicit
+  44-pixel “Show all”/“Show less” control (Thai labels when the panel title is
+  Thai). Rows that fit remain fully visible with no redundant control, and a
+  resize remeasures them.
+
+- **The expanded HUD now uses its available height without hiding the newest
+  recall.** `TermHud` hugs short content, gives overflowing content an inner
+  scroller plus a compact persistent cue, and preserves a useful terminal
+  floor on shallow viewports. Recall-priority `SessionView` markup groups note
+  and host extra panels in a compact metadata column so host layouts can place
+  prompt, recap, and note without vacant grid rows.
+
+No public type or server surface changed in this maintenance release.
 
 ## v0.16.4 — 2026-08-19
 

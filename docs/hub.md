@@ -163,6 +163,15 @@ prompt database. If prompts must survive capture limits, session exit, or a
 server restart, persist them in a host-owned store and pass the retrieved values
 to the UI. The reference host uses SQLite for that durable layer.
 
+The pane scanner does not impose a character preview limit: text found inside
+its bounded scan window is returned without a synthetic ellipsis. Because a
+tmux pane does not identify whether a continuation row was a visual wrap or an
+intentional newline, pane-derived continuations are normalized to spaces. A
+host-owned prompt array can retain intentional newlines, and `PromptsPanel`
+passes either form back through `onPick` exactly. Visual density is separate
+from data fidelity: a browser-measured row over eight rendered lines receives
+an explicit Show all/Show less control rather than being silently clipped.
+
 ### A deep-scrollback archive
 
 Hub thumbnails subscribe only to a bounded live tail. For older pages in a full

@@ -145,6 +145,40 @@
     void title;
     measureAdornment();
   });
+
+  let panelEl: HTMLElement | undefined = $state();
+  let panelBodyEl: HTMLElement | undefined = $state();
+  let panelScrollable = $state(false);
+
+  function measurePanel(): void {
+    const body = panelBodyEl;
+    if (!body || body.clientHeight <= 0) {
+      panelScrollable = false;
+      return;
+    }
+    panelScrollable = body.scrollHeight > body.clientHeight + 1;
+  }
+
+  $effect(() => {
+    const body = panelBodyEl;
+    void expanded;
+    if (!body) return;
+    measurePanel();
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => measurePanel());
+    ro?.observe(body);
+    for (const child of body.children) ro?.observe(child);
+    const mo = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(() => {
+        if (ro) for (const child of body.children) ro.observe(child);
+        measurePanel();
+      });
+    mo?.observe(body, { childList: true, subtree: true, characterData: true });
+    return () => {
+      ro?.disconnect();
+      mo?.disconnect();
+    };
+  });
 </script>
 
 <div class="hud-top" class:dense={layout === 'dense'} bind:offsetHeight={barHeight}>
@@ -211,8 +245,22 @@
 
 {#if expanded && panel}
   {@const panelSnippet = panel as Snippet}
-  <div class="hud-panel" class:dense={layout === 'dense'} style:top={`${barHeight}px`} data-testid="hud-panel">
-    {@render panelSnippet()}
+  <div
+    class="hud-panel"
+    class:dense={layout === 'dense'}
+    class:scrollable={panelScrollable}
+    style:top={`${barHeight}px`}
+    style:--hud-bar-height={`${barHeight}px`}
+    data-testid="hud-panel"
+    data-scrollable={panelScrollable ? 'true' : 'false'}
+    bind:this={panelEl}
+  >
+    <div class="hud-panel-body" data-testid="hud-panel-body" bind:this={panelBodyEl}>
+      {@render panelSnippet()}
+    </div>
+    {#if panelScrollable}
+      <div class="hud-more" data-testid="hud-panel-more" aria-hidden="true">▾ more</div>
+    {/if}
   </div>
 {/if}
 
@@ -362,10 +410,51 @@
     background: linear-gradient(var(--hud), var(--hud)), var(--tbg);
     color: var(--hud-fg);
     border-bottom: 1px solid var(--agent);
-    padding: 10px 12px calc(12px + 2px);
-    max-height: 55dvh; overflow-y: auto;
+    padding: 10px 12px 12px;
+    /* Hug content when it fits. When it does not, cap the panel so a shallow
+       viewport still keeps a usable terminal: max(72px, 25dvh) below the bar.
+       55dvh remains the historical ceiling on tall screens. */
+    max-height: min(
+      55dvh,
+      calc(100dvh - var(--hud-bar-height, 52px) - max(72px, 25dvh))
+    );
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+  /* Overflow is told by a 12px footer, not by eating the first frame.
+     Drop the 12px outer bottom pad and the old 22+8 chrome so a 2054×281
+     body can keep the newest prompt and the recap CWD on screen. */
+  .hud-panel.scrollable {
+    padding-bottom: 0;
+  }
+  .hud-panel-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: auto;
+    scrollbar-color: var(--agent) transparent;
   }
   .hud-panel.dense {
     background: var(--tbg);
+  }
+  .hud-more {
+    flex: 0 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 12px;
+    min-height: 12px;
+    margin: 2px -12px 0;
+    padding: 0 12px;
+    border-top: 1px solid var(--agent);
+    background: var(--tbg);
+    color: var(--agent);
+    font: 700 8px var(--font-mono);
+    letter-spacing: .08em;
+    line-height: 1;
+    pointer-events: none;
   }
 </style>

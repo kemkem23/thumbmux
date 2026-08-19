@@ -705,30 +705,43 @@
   />
 {/snippet}
 
+{#snippet notePanel()}
+  {#if adapters.notes}
+    <NotePanel
+      {note}
+      placeholder={labels.noteEmpty}
+      saving={noteSaving}
+      onSave={(text) => { void saveNote(text); }}
+      labels={{ edit: labels.noteEdit, save: labels.noteSave, cancel: labels.noteCancel }}
+    />
+  {/if}
+{/snippet}
+
+{#snippet extraPanelAt(placement: 'top' | 'bottom')}
+  {#if adapters.extraPanel && (extraPanelOnTop ? placement === 'top' : placement === 'bottom')}
+    {@const extra = adapters.extraPanel}
+    {@render extra(session)}
+  {/if}
+{/snippet}
+
 {#snippet hudPanel()}
-  <div class="hud-panel-stack">
+  <div class="hud-panel-stack" class:recall-priority={promptsTakePriority}>
     {#if adapters.prompts && promptsTakePriority}
       {@render recentPromptsPanel()}
-    {/if}
-    {#if adapters.extraPanel && extraPanelOnTop}
-      {@const extraPanelTop = adapters.extraPanel}
-      {@render extraPanelTop(session)}
-    {/if}
-    {#if adapters.notes}
-      <NotePanel
-        {note}
-        placeholder={labels.noteEmpty}
-        saving={noteSaving}
-        onSave={(text) => { void saveNote(text); }}
-        labels={{ edit: labels.noteEdit, save: labels.noteSave, cancel: labels.noteCancel }}
-      />
-    {/if}
-    {#if adapters.prompts && !promptsTakePriority}
-      {@render recentPromptsPanel()}
-    {/if}
-    {#if adapters.extraPanel && !extraPanelOnTop}
-      {@const extraPanel = adapters.extraPanel}
-      {@render extraPanel(session)}
+      {#if adapters.notes || adapters.extraPanel}
+        <div class="hud-meta-column" data-testid="hud-meta-column">
+          {@render extraPanelAt('top')}
+          {@render notePanel()}
+          {@render extraPanelAt('bottom')}
+        </div>
+      {/if}
+    {:else}
+      {@render extraPanelAt('top')}
+      {@render notePanel()}
+      {#if adapters.prompts}
+        {@render recentPromptsPanel()}
+      {/if}
+      {@render extraPanelAt('bottom')}
     {/if}
   </div>
 {/snippet}
@@ -979,6 +992,15 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    min-width: 0;
+    align-items: stretch;
+  }
+  .hud-meta-column {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    align-items: stretch;
   }
 
   .scroll-controls {

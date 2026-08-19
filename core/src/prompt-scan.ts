@@ -37,7 +37,6 @@ export type ExtractRecentPromptsFromPaneOptions = {
 const DEFAULT_TARGET_COUNT = 5;
 const DEFAULT_INITIAL_SCAN_LINES = 240;
 const DEFAULT_MAX_SCAN_LINES = 1200;
-const MAX_PROMPT_DISPLAY_CHARS = 500;
 
 const PROMPT_MARKERS = new Set(["❯", "›"]);
 
@@ -199,19 +198,6 @@ function extractMarkdownSection(lines: string[], title: string): string | null {
   return text || null;
 }
 
-function truncatePrompt(text: string): string {
-  if (text.length <= MAX_PROMPT_DISPLAY_CHARS) return text;
-  let end = MAX_PROMPT_DISPLAY_CHARS - 3;
-  // Never leave an unpaired UTF-16 surrogate at the cut. A high surrogate kept
-  // without its low half (or a lone low half) is not a Unicode scalar and
-  // surfaces as U+FFFD / garbage in every consumer that persists the prompt.
-  if (end > 0 && end <= text.length) {
-    const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff) end -= 1; // orphan high surrogate
-  }
-  return `${text.slice(0, end).trimEnd()}...`;
-}
-
 function normalizePromptBlock(lines: string[]): string {
   const cleanLines = lines
     .map(cleanPromptLine)
@@ -219,7 +205,11 @@ function normalizePromptBlock(lines: string[]): string {
 
   const userReport = extractMarkdownSection(cleanLines, "User report");
   const source = userReport ?? cleanLines.join(" ");
-  return truncatePrompt(source.replace(/\s+/g, " ").trim());
+  // Honest capture limit: a tmux pane cannot tell a wrap-break from an
+  // intentional newline, so continuation rows are joined with a space. The
+  // returned string is otherwise the submitted payload — never a 500-unit
+  // preview with a synthetic ellipsis that later looks resendable.
+  return source.replace(/\s+/g, " ").trim();
 }
 
 function collectPrompts(lines: string[], start: number, matchers: PromptMatcherSet): string[] {
