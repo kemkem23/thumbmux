@@ -30,12 +30,120 @@ runs:
     - uses: oven-sh/setup-bun@v2
       with:
         bun-version: 1.3.11
-    - run: sudo apt-get update && sudo apt-get install -y tmux
-      shell: bash
     - run: bun install --frozen-lockfile
       shell: bash
-    - name: install Playwright Chromium
-      run: ./node_modules/.bin/playwright install --with-deps chromium
+    - name: ensure tmux and Playwright Chromium system dependencies
+      run: |
+        playwright=./node_modules/.bin/playwright
+        if [ ! -x "$playwright" ]; then
+          echo "::error::Playwright CLI is unavailable after bun install"
+          exit 1
+        fi
+
+        if ! command -v timeout >/dev/null 2>&1; then
+          echo "::error::required command is unavailable: timeout"
+          exit 1
+        fi
+
+        tmux_ready=0
+        if command -v tmux >/dev/null 2>&1; then
+          tmux -V
+          tmux_ready=1
+        fi
+
+        playwright_deps_ready=0
+        if timeout --signal=TERM --kill-after=15s 90s \
+          "$playwright" install-deps --dry-run chromium
+        then
+          echo "Playwright Chromium system dependencies are already satisfied"
+          playwright_deps_ready=1
+        fi
+
+        if [ "$tmux_ready" -eq 1 ] && [ "$playwright_deps_ready" -eq 1 ]; then
+          exit 0
+        fi
+
+        for required in sudo apt-get mktemp; do
+          if ! command -v "$required" >/dev/null 2>&1; then
+            echo "::error::required command is unavailable: $required"
+            exit 1
+          fi
+        done
+        if ! sudo -n true; then
+          echo "::error::passwordless sudo is required for system dependencies"
+          exit 1
+        fi
+
+        apt_config=$(mktemp "${RUNNER_TEMP:-/tmp}/thumbmux-apt.XXXXXX.conf")
+        cleanup_apt_config() {
+          rm -f "$apt_config"
+        }
+        trap cleanup_apt_config EXIT
+        printf '%s\n' \
+          'Acquire::Retries "3";' \
+          'Acquire::http::Timeout "20";' \
+          'Acquire::https::Timeout "20";' \
+          'DPkg::Lock::Timeout "60";' \
+          'DPkg::Use-Pty "0";' \
+          > "$apt_config"
+
+        retry_bounded() {
+          local label=$1
+          shift
+          local attempt status
+          for attempt in 1 2 3; do
+            if "$@"; then
+              return 0
+            else
+              status=$?
+            fi
+            echo "::warning::${label} attempt ${attempt}/3 failed with status ${status}"
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 5))"
+            fi
+          done
+          echo "::error::${label} failed after 3 bounded attempts"
+          return 1
+        }
+
+        install_tmux() {
+          sudo -n env \
+            "APT_CONFIG=$apt_config" \
+            DEBIAN_FRONTEND=noninteractive \
+            timeout --signal=TERM --kill-after=30s 4m \
+            bash -c 'apt-get update && apt-get install -y --no-install-recommends tmux'
+        }
+
+        install_playwright_dependencies() {
+          sudo -n env \
+            "PATH=$PATH" \
+            "APT_CONFIG=$apt_config" \
+            DEBIAN_FRONTEND=noninteractive \
+            timeout --signal=TERM --kill-after=30s 4m \
+            "$playwright" install-deps chromium &&
+          sudo -n env \
+            "PATH=$PATH" \
+            "APT_CONFIG=$apt_config" \
+            DEBIAN_FRONTEND=noninteractive \
+            timeout --signal=TERM --kill-after=15s 90s \
+            "$playwright" install-deps --dry-run chromium
+        }
+
+        if [ "$tmux_ready" -ne 1 ]; then
+          retry_bounded "tmux dependency installation" install_tmux
+          if ! command -v tmux >/dev/null 2>&1; then
+            echo "::error::tmux is unavailable after a successful apt command"
+            exit 1
+          fi
+          tmux -V
+        fi
+
+        if [ "$playwright_deps_ready" -ne 1 ]; then
+          retry_bounded "Playwright dependency installation" install_playwright_dependencies
+        fi
+      shell: bash
+    - name: install Playwright Chromium browser
+      run: timeout --signal=TERM --kill-after=30s 10m ./node_modules/.bin/playwright install chromium
       shell: bash
     # The suite includes tests that assert properties of the shipped artifact
     # (dist hygiene, the README quickstart pack). They need git-dist to exist

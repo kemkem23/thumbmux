@@ -237,7 +237,8 @@ describe("release rail policy", () => {
       "oven-sh/setup-bun@v2",
       "bun-version:",
       "bun install --frozen-lockfile",
-      "playwright install --with-deps chromium",
+      "install-deps chromium",
+      "playwright install chromium",
       "bun run build:git-dist",
       // Combined unit suite — the process release always ran; must not split
       // into different globs per workflow.
@@ -281,6 +282,43 @@ describe("release rail policy", () => {
         expect(match[1]).toBe(gatePin);
       }
     }
+  });
+
+  test("system dependency installs are prechecked, retried, bounded, and split", () => {
+    const gate = readVerifyGate();
+
+    expect(gate).toContain("ensure tmux and Playwright Chromium system dependencies");
+    expect(gate).toContain("command -v tmux");
+    expect(gate).toContain('Acquire::Retries "3";');
+    expect(gate).toContain('Acquire::http::Timeout "20";');
+    expect(gate).toContain('Acquire::https::Timeout "20";');
+    expect(gate).toContain('DPkg::Lock::Timeout "60";');
+    expect(gate).toContain('DPkg::Use-Pty "0";');
+    expect(gate).toContain('"APT_CONFIG=$apt_config"');
+    expect(gate).toContain("install-deps --dry-run chromium");
+    expect(gate).toContain("install-deps chromium");
+    expect(gate).toContain("install Playwright Chromium browser");
+    expect(gate).toContain("playwright install chromium");
+    expect(gate).not.toContain("--with-deps");
+    expect(gate).not.toContain("sudo apt-get update && sudo apt-get install -y tmux");
+
+    expect(gate.match(/for attempt in 1 2 3/g)?.length).toBe(1);
+    expect(gate.match(/retry_bounded "/g)?.length).toBe(2);
+    expect(gate.match(/sudo -n true/g)?.length).toBe(1);
+    expect(gate.match(/timeout --signal=TERM --kill-after=/g)?.length)
+      .toBeGreaterThanOrEqual(5);
+
+    const rootWrappedPlaywright = /sudo -n env\s+\\\n\s+"PATH=\$PATH"\s+\\\n\s+"APT_CONFIG=\$apt_config"[\s\S]*?timeout --signal=TERM --kill-after=30s 4m\s+\\\n\s+"\$playwright" install-deps chromium/;
+    expect(gate).toMatch(rootWrappedPlaywright);
+    const rootWrappedTmux = /install_tmux\(\)[\s\S]*?sudo -n env\s+\\\n\s+"APT_CONFIG=\$apt_config"[\s\S]*?timeout --signal=TERM --kill-after=30s 4m[\s\S]*?apt-get update && apt-get install/;
+    expect(gate).toMatch(rootWrappedTmux);
+
+    const tmux = gate.indexOf("ensure tmux and Playwright Chromium system dependencies");
+    const bunInstall = gate.indexOf("bun install --frozen-lockfile");
+    const browser = gate.indexOf("install Playwright Chromium browser");
+    expect(tmux).toBeGreaterThanOrEqual(0);
+    expect(bunInstall).toBeLessThan(tmux);
+    expect(tmux).toBeLessThan(browser);
   });
 
   test("CI and release reject focused Playwright tests before the canonical run", () => {

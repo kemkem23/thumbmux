@@ -1,7 +1,23 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.6-dist`.
+
+## v0.16.6 — 2026-08-19
+
+### Fixed
+
+- **Release verification no longer waits indefinitely on an unhealthy Ubuntu
+  package mirror.** The shared CI/release gate now skips system installation
+  when `tmux` and the Playwright Chromium libraries are already present. When
+  installation is required, both apt-backed paths have three bounded attempts,
+  per-attempt hard and network timeouts, non-interactive privilege prechecks,
+  and explicit postchecks. Chromium's browser download is a separate bounded
+  step, so an infrastructure failure cannot masquerade as a test hang and its
+  source is visible in the job summary.
+
+No runtime, public type, server surface, package lock, or contract manifest
+changed in this maintenance release.
 
 ## v0.16.5 — 2026-08-19
 
