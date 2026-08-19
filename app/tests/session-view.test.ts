@@ -634,7 +634,10 @@ describe('mountable terminal views', () => {
     ).toBe('true');
     expect(Array.from(entry.target.querySelectorAll('.hud-panel-stack > *')).map(
       (node) => node.getAttribute('data-testid') ?? node.className,
-    )).toEqual(['prompts-panel', 'host-extra-panel', 'note-panel']);
+    )).toEqual(['prompts-panel', 'hud-meta-column']);
+    expect(Array.from(entry.target.querySelectorAll('[data-testid="hud-meta-column"] > *')).map(
+      (node) => node.getAttribute('data-testid') ?? node.className,
+    )).toEqual(['host-extra-panel', 'note-panel']);
 
     resolvePrompts(['newest prompt', 'older prompt']);
     await flushPromises();
@@ -737,6 +740,73 @@ describe('mountable terminal views', () => {
     flushSync(() => expand.click());
     expect(entry.target.querySelector('[data-testid="prompt-item"]')?.textContent)
       .toBe('warm prompt');
+  });
+
+  test.each([499, 500, 501, 4096] as const)(
+    'clicking a %s-unit extracted prompt prefills the composer with the exact payload',
+    async (length) => {
+      const { extractRecentPromptsFromPane } = await import('@thumbmux/core');
+      const payload = 'Q'.repeat(length);
+      const pane = [`❯ ${payload}`, '● response body here enough', ''].join('\n');
+      const extracted = extractRecentPromptsFromPane(pane, 5);
+      const entry = mountView(SessionView, {
+        session: `sh-recall-${length}`,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          prompts: async () => extracted,
+          sessionPresentation: {
+            promptsCollapsible: true,
+            promptsInitiallyOpen: true,
+          },
+        } satisfies AppAdapters,
+      });
+      await flushPromises();
+
+      const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+      if (!expand) throw new Error('SessionView did not render its HUD toggle');
+      flushSync(() => expand.click());
+      await tick();
+
+      const row = entry.target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+      if (!row) throw new Error('expected a prompt row');
+      flushSync(() => row.click());
+      await tick();
+
+      const composer = entry.target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+      const textarea = composer?.querySelector<HTMLTextAreaElement>('textarea');
+      if (!composer || !textarea) throw new Error('prompt pick did not open ComposerDock');
+      expect(extracted).toEqual([payload]);
+      expect(textarea.value).toBe(payload);
+      expect(textarea.value.length).toBe(length);
+      expect(textarea.value.endsWith('...')).toBe(false);
+    },
+  );
+
+  test('clicking an API-shaped prompt with newlines, Thai, and emoji prefills exactly', async () => {
+    const payload = 'บรรทัดหนึ่ง\nsecond line with 😀 and ก้ำ\nthird';
+    const entry = mountView(SessionView, {
+      session: 'sh-recall-unicode',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => [payload],
+        sessionPresentation: {
+          promptsCollapsible: true,
+          promptsInitiallyOpen: true,
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await tick();
+    const row = entry.target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+    if (!row) throw new Error('expected a prompt row');
+    flushSync(() => row.click());
+    await tick();
+    const textarea = entry.target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    if (!textarea) throw new Error('prompt pick did not open ComposerDock');
+    expect(textarea.value).toBe(payload);
   });
 
   test('extraPanel renders last by default and first when the host places it on top', async () => {
