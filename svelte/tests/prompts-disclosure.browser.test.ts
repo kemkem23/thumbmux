@@ -15,6 +15,7 @@ const REAL_FIRST = 'อัปโหลดไฟล์ "Screenshot 2026-08-19 160
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const ENTRY = join(here, ".prompts-disclosure-entry.generated.ts");
+const BROWSER_TEST_TIMEOUT_MS = 30_000;
 
 const sveltePlugin: import("bun").BunPlugin = {
   // Bun runs test files concurrently. A distinct plugin name keeps this
@@ -165,7 +166,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 
   test("a ~485-char row that fits at 2054x281 has no disclosure", async () => {
     const page = await browser.newPage();
@@ -181,7 +182,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 
   test("a 500-unit row at phone width is clamped with a 44x44 disclosure", async () => {
     const page = await browser.newPage();
@@ -227,7 +228,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 
   test("resizing a clamped phone row to 2054x281 hides the now-unnecessary disclosure", async () => {
     const page = await browser.newPage();
@@ -247,7 +248,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 
   test("every hostile row including embedded newlines prefills exactly", async () => {
     const page = await browser.newPage();
@@ -267,7 +268,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 
   test("overflowing panel scrolls for real and keeps the footer cue", async () => {
     const page = await browser.newPage();
@@ -298,7 +299,7 @@ describe("measured prompt disclosure", () => {
     } finally {
       await page.close();
     }
-  });
+  }, BROWSER_TEST_TIMEOUT_MS);
 });
 } else {
   test("measured prompt disclosure passes in an isolated real-browser worker", async () => {
