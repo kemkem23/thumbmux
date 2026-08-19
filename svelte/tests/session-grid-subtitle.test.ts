@@ -92,3 +92,93 @@ describe("grid card subtitle", () => {
     expect(style.getPropertyValue("overflow").trim()).toBe("hidden");
   });
 });
+
+describe("dense grid card metadata", () => {
+  test("keeps default cards unchanged when dense fields are supplied but not enabled", async () => {
+    const target = mountGrid([{ name: "alpha-1", note: "operator note", summary: "live summary" }]);
+    await tick();
+    expect(target.querySelector('[data-testid="grid-card"]')?.tagName).toBe("BUTTON");
+    expect(target.querySelector('[data-testid="grid-dense-head"]')).toBeNull();
+    expect(target.querySelector('[data-testid="grid-note"]')).toBeNull();
+    expect(target.querySelector('[data-testid="grid-summary"]')).toBeNull();
+  });
+
+  test("renders note and summary as text, copies name, opens separately, and can hide new", async () => {
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    let copied = "";
+    const opened: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => { copied = text; } },
+    });
+    try {
+      const target = mountGrid(
+        [{
+          name: "alpha-dense-1",
+          note: "โน้ต <b>ต้องเป็น text</b>",
+          summary: "กำลังรัน integration tests",
+        }],
+        {
+          cardLayout: "dense",
+          showNew: false,
+          onOpen: (name: string) => opened.push(name),
+        },
+      );
+      await tick();
+
+      const card = target.querySelector<HTMLElement>('[data-testid="grid-card"]')!;
+      expect(card.tagName).toBe("DIV");
+      expect(card.querySelector('[data-testid="grid-note"]')!.textContent).toBe(
+        "โน้ต <b>ต้องเป็น text</b>",
+      );
+      expect(card.querySelector('[data-testid="grid-note"]')!.childElementCount).toBe(0);
+      expect(card.querySelector('[data-testid="grid-summary"]')!.textContent).toBe(
+        "กำลังรัน integration tests",
+      );
+      expect(card.querySelector('[data-testid="session-thumb"]')!.classList.contains("dense")).toBe(true);
+      expect(target.querySelector('[data-testid="grid-new"]')).toBeNull();
+
+      const copy = card.querySelector<HTMLButtonElement>('[data-testid="grid-copy-name"]')!;
+      const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
+      const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
+      expect(getComputedStyle(copy).minWidth).toBe("44px");
+      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
+      expect(getComputedStyle(summary).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
+
+      flushSync(() => {
+        copy.click();
+      });
+      await Promise.resolve();
+      expect(copied).toBe("alpha-dense-1");
+      expect(opened).toEqual([]);
+
+      flushSync(() => {
+        card.querySelector<HTMLButtonElement>('[data-testid="grid-expand"]')!.click();
+      });
+      expect(opened).toEqual(["alpha-dense-1"]);
+      expect(copied).toBe("alpha-dense-1");
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      } else {
+        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+      }
+    }
+  });
+
+  test("renders dense metadata through the grouped branch and accepts subtitle as summary fallback", async () => {
+    const target = mountGrid(
+      [{
+        name: "alpha-grouped",
+        groupKey: "build",
+        groupLabel: "Build",
+        note: "pinned",
+        subtitle: "legacy summary",
+      }],
+      { cardLayout: "dense", groupable: true, defaultGrouped: true },
+    );
+    await tick();
+    expect(target.querySelector('[data-testid="grid-note"]')?.textContent).toBe("pinned");
+    expect(target.querySelector('[data-testid="grid-summary"]')?.textContent).toBe("legacy summary");
+  });
+});

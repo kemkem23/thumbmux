@@ -34,11 +34,15 @@ export interface HubPresentationOptions {
   groupable?: boolean;
   order?: GridOrder;
   showCommand?: boolean;
+  /** Opt into the full-width-mobile / 500px-desktop metadata card layout. */
+  cardLayout?: 'default' | 'dense';
 }
 
 /** Optional presentation choices for one mounted session. Omitted members
  * retain `SessionView`'s stock controls. */
 export interface SessionPresentationOptions {
+  /** Opt into the wrapping `name : note : activity : expand` HUD. */
+  headerLayout?: 'default' | 'dense';
   /** Compose the complete FAB list after stock actions and legacy
    * `extraActions` have been assembled. Returning the supplied actions by
    * reference preserves their existing behavior; newly created actions are

@@ -52,7 +52,6 @@
     collectTerminalUrlSegments,
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
-    readerAnchorLineDelta,
     charCellWidth, prefixForCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
@@ -424,8 +423,19 @@
     }
   }
 
+  function isAwayFromLiveTail(): boolean {
+    return bottomOffsetPx > 0;
+  }
+
+  /** Boundary diagnostics are integer pixels, but must never round a real
+   * positive offset down to the sentinel 0 (which means exact live-tail). */
+  function reportedBottomOffset(): number {
+    const rounded = Math.round(bottomOffsetPx);
+    return isAwayFromLiveTail() ? Math.max(1, rounded) : rounded;
+  }
+
   export function isScrolledUp(): boolean {
-    return bottomOffsetPx > lineH;
+    return isAwayFromLiveTail();
   }
 
   function isSearchTarget(target: EventTarget | null): boolean {
@@ -1325,29 +1335,31 @@
   }
 
   function commitLines(next: string[], opts: {
-    preserveReaderAnchor?: boolean;
+    followTail: boolean;
     source: LinesChangeMeta['source'];
   }) {
+    // Snapshot the physical viewport before changing total/maxOffset. A
+    // reader who is even one pixel away from the live tail owns this scroll
+    // position; content updates may repaint any number of tail rows without
+    // moving the rows already under their eyes. At exactly offset=0 the live
+    // tail owns the viewport and follows the new maxOffset instead.
+    const readerScrollTop = opts.followTail
+      ? null
+      : maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+
     // Find common prefix so unchanged history isn't re-parsed.
     let common = 0;
     const minLen = Math.min(rawLines.length, next.length);
     while (common < minLen && rawLines[common] === next[common]) common++;
     const linesChanged = rawLines.length !== next.length || common !== minLen;
 
-    if (bottomOffsetPx > 0 && opts.preserveReaderAnchor) {
-      const lineDelta = readerAnchorLineDelta(rawLines, next);
-      if (lineDelta !== 0) {
-        // Live captures may rewrite the prompt and one adjacent tail row
-        // while appending. A stable prefix through that small tail keeps the
-        // same reader row under the finger without treating resets as appends.
-        bottomOffsetPx = Math.max(0, bottomOffsetPx + lineDelta * lineH);
-      }
-    }
-
     rawLines = next;
     total = next.length;
     rebuildAllLinks();
     rebuildFrom(common);
+    bottomOffsetPx = readerScrollTop === null
+      ? 0
+      : Math.max(0, maxOffset() - readerScrollTop);
     bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
     // Content delivery is already gated outside gestures. Establish the exact
     // protected viewport+overscan for the enlarged model before trimming it.
@@ -1531,6 +1543,7 @@
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
   ) {
+    const followTail = !isAwayFromLiveTail();
     const replaceRetainedRows = replace
       ? replaceRetainedOverlapRows(liveLines, nextLive)
       : 0;
@@ -1546,7 +1559,7 @@
       if (discardedLiveRows > 0) {
         recordRetentionGap(archivedLines.length, discardedLiveRows);
       }
-    } else if (bottomOffsetPx > 0 && liveLines.length > 0) {
+    } else if (!followTail && liveLines.length > 0) {
       const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
       liveLines = merged.lines;
       if (merged.appendedLineCount > 0) {
@@ -1557,9 +1570,7 @@
       liveLines = nextLive;
     }
     commitLines([...archivedLines, ...liveLines], {
-      // A reset-tagged capture with a proven common prefix is still a live
-      // growth/shrink from the reader's point of view — keep their row.
-      preserveReaderAnchor: !replace || replaceRetainedRows > 0,
+      followTail,
       source,
     });
   }
@@ -2194,7 +2205,7 @@
       layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
     }
     emitScrollState();
-    if (!busy()) settledBottomOffsetPx = Math.round(bottomOffsetPx);
+    if (!busy()) settledBottomOffsetPx = reportedBottomOffset();
     if (!windowCovered && !busy()) schedulePendingContentFlush();
     return windowCovered;
   }
@@ -2207,11 +2218,11 @@
   }
 
   function emitScrollState() {
-    const scrolledUp = bottomOffsetPx > lineH;
+    const scrolledUp = isAwayFromLiveTail();
     if (scrolledUp === scrollStateScrolledUp) return;
     scrollStateScrolledUp = scrolledUp;
     onScrollStateChange?.({
-      bottomOffset: Math.round(bottomOffsetPx),
+      bottomOffset: reportedBottomOffset(),
       scrolledUp,
     });
   }

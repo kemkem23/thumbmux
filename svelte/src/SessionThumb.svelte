@@ -10,24 +10,29 @@
   let {
     session,
     palette,
-    maxLines = 30,
+    maxLines,
+    density = 'default',
   }: {
     session: string;
     palette: AnsiPalette;
     maxLines?: number;
+    /** Opt-in preview density used by large hub cards. The historical thumbnail
+     * sizing and 30-line tail remain the default. */
+    density?: 'default' | 'dense';
   } = $props();
 
   let content = $state('');
   let connected = $state(false);
   let thumbEl = $state<HTMLDivElement | null>(null);
   let thumbPalette = $derived(deriveThumbnailPalette(palette));
-  let lines = $derived(renderLines(content, maxLines, thumbPalette));
+  let effectiveMaxLines = $derived(maxLines ?? (density === 'dense' ? 50 : 30));
+  let lines = $derived(renderLines(content, effectiveMaxLines, thumbPalette));
   // SessionGrid rebuilds its metadata objects whenever a host snapshot changes.
   // Its retained keyed child can therefore invalidate the session prop getter
   // even when the returned name is unchanged. These primitive derived signals
   // stop that parent invalidation before it reaches the subscription effect.
   let subscribedSession = $derived(session);
-  let subscribedTail = $derived(maxLines + 10);
+  let subscribedTail = $derived(effectiveMaxLines + 10);
 
   /** Pin boxes must use a *measured* cell in px. `width: 1ch` plus
    * `font-size: calc(1ch * 0.92)` on the same element is circular — ch
@@ -98,6 +103,7 @@
 <div
   bind:this={thumbEl}
   class="thumb"
+  class:dense={density === 'dense'}
   style:--tfg={thumbPalette.defaultFg}
   style:--tbg={thumbPalette.defaultBg}
   data-testid="session-thumb"
@@ -141,6 +147,15 @@
     -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - clamp(18px, 12cqw, 42px)), transparent);
     mask-image: linear-gradient(90deg, #000 calc(100% - clamp(18px, 12cqw, 42px)), transparent);
   }
+  .thumb.dense .tail {
+    left: 4px;
+    bottom: 2px;
+    font-size: 6px;
+    font-size: clamp(6px, 2cqw, 10px);
+    line-height: 1.22;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
   .tail :global(div) {
     width: max-content;
     min-width: max-content;
@@ -164,6 +179,11 @@
     overflow: visible;
     white-space: pre;
     line-height: 1;
+  }
+  .thumb.dense .tail :global(.mtv-w1),
+  .thumb.dense .tail :global(.mtv-w2),
+  .thumb.dense .tail :global(.mtv-wx) {
+    height: 1.22em;
   }
   .tail :global(.mtv-w1) {
     width: var(--mtv-cw, 1ch);

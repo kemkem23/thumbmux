@@ -657,6 +657,28 @@ describe('mountable terminal views', () => {
     );
   });
 
+  test('sessionPresentation.headerLayout opts SessionView into the dense HUD', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'sh-dense-header',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        notes: { load: async () => 'รอ merge', save: async () => {} },
+        sessionPresentation: { headerLayout: 'dense' },
+        titleAdornment: createRawSnippet(() => ({
+          render: () => '<span data-testid="dense-activity">กำลังรันเทสต์</span>',
+        })),
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+
+    expect(target.querySelector('[data-testid="hud-dense-fields"]')).not.toBeNull();
+    expect(target.querySelector('[data-testid="hud-copy-title"]')?.textContent).toBe('sh-dense-header');
+    // Dense renders the field literally; the default HUD alone owns the pencil prefix.
+    expect(target.querySelector('.hud-note')?.textContent).toBe('รอ merge');
+    expect(target.querySelector('[data-testid="dense-activity"]')?.textContent).toBe('กำลังรันเทสต์');
+    expect(target.querySelector('[data-testid="hud-expand"]')?.getAttribute('aria-expanded')).toBe('false');
+  });
+
   test('the HUD note prefix and status case are the host\'s to set', async () => {
     const stock = mountView(SessionView, {
       session: 'sh-hud-transforms-stock',

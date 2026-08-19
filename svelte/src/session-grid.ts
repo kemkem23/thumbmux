@@ -28,6 +28,12 @@ export type GridSession = {
    *  byte-identical to a card without one. */
   subtitle?: string;
 
+  /** Host-owned operator note shown by the opt-in dense card chrome. */
+  note?: string;
+  /** Host-owned description of what the session is doing. Dense cards render
+   * this separately from `note`; `subtitle` remains the legacy card field. */
+  summary?: string;
+
   state?: GridSessionState;
   /** Visible and accessible host-localized label. */
   stateLabel?: string;
@@ -61,6 +67,14 @@ export type SessionGridProps = {
   ungroupedLabel?: string;
 
   order?: GridOrder;
+
+  /** Opt-in 500px desktop / full-width mobile cards with dense metadata. */
+  cardLayout?: 'default' | 'dense';
+  /** Whether to append the launcher card. Defaults true. */
+  showNew?: boolean;
+  /** Accessible labels for dense card controls. */
+  copyNameLabel?: string;
+  expandLabel?: string;
 };
 
 export type DisplaySessionName = {

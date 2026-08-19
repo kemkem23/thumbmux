@@ -49,6 +49,29 @@ The gate is what surfaced this, and the smaller surface is the better design.
   request below it returns an empty page instead of a mislabelled short one. This
   is only reachable with a cap configured, so no 0.16.x consumer was affected.
 
+## v0.16.3 — 2026-08-19
+
+### Added
+
+- **Opt-in dense HUD and live session cards.** `TermHud layout="dense"` renders
+  the wrapping `name : note : titleAdornment : expand` header, copies the exact
+  tmux name from the name control, and keeps expand separate. `SessionGrid
+  cardLayout="dense"` adds host-owned `GridSession.note` / `summary`, a denser
+  `SessionThumb`, full-width square coarse/mobile cards, and exact 500 × 500 px
+  fine-pointer desktop cards; `showNew={false}` can hide the stock launcher.
+  `HubPresentationOptions.cardLayout` and
+  `SessionPresentationOptions.headerLayout` forward these modes through the app
+  shell. Every option is additive and omitted by default, so existing HUDs,
+  cards, thumbnail tails, and launchers remain unchanged.
+
+### Fixed
+
+- **Live output follows only at the exact live tail.** Any positive bottom
+  offset, including a sub-line wheel movement, now counts as scrolled up.
+  Appends and full resyncs that rewrite several tail rows preserve the reader's
+  physical scroll position; `scrollToBottom()` explicitly returns ownership to
+  the live tail before pending content is flushed.
+
 ## v0.16.2 — 2026-08-15
 
 ### Fixed

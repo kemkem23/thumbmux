@@ -111,6 +111,37 @@ thumbnail without synthesizing state. Earlier demo code used `hash % 3` to
 invent WORKING/IDLE; v0.5.0 removed that heuristic, and the demo's end-to-end
 contract now requires zero state dots when no classifier is wired.
 
+## Opt-in dense cards
+
+Pass `cardLayout="dense"` when the hub needs terminal metadata and the preview
+to share one compact square. Each card renders
+`name : note : summary : expand`; the name copies the exact session name while
+the expand button alone calls `onOpen`. Both `note` and `summary` are host-owned
+plain text. If `summary` is absent, the existing `subtitle` is used in its
+place. Default cards ignore the two new fields, so merely enriching a
+`GridSession` cannot silently change an existing hub.
+
+```svelte
+<SessionGrid
+  sessions={[{
+    name: 'codex-orchestrator',
+    note: 'release checklist',
+    summary: 'running browser integration tests',
+  }]}
+  {palette}
+  {onOpen}
+  {onNew}
+  cardLayout="dense"
+  showNew={false}
+/>
+```
+
+Dense cards are square and take the full container width on coarse pointers and
+narrow screens. At 768 px or wider, a fine pointer selects exact 500 × 500 px
+cards. This pointer guard is intentional: a phone in landscape can exceed 768
+px and must still stay one full-width column. `showNew` defaults to `true`; set
+it to `false` only when the host exposes creation elsewhere.
+
 ## What the hub does NOT give you
 
 ### Agent-state classification
@@ -165,6 +196,10 @@ including hooks for cwd validation and host-created worktrees.
 `tmuxMux.sendResize()`, and has no `claimGeometry` prop. A thumbnail card's CSS
 size is not the tmux pane's rows and columns: several cards and devices can view
 the same pane at different sizes.
+
+The optional `density="dense"` preview renders 50 rows from a 60-row
+subscription and uses smaller line metrics. Omitting it keeps the historical
+30 rendered rows plus 10 ANSI-context rows.
 
 Do not resize the real pane to match a thumbnail. Geometry belongs to the one
 visible, interactive `TermView` (or to a host-side arbitration policy). Any
