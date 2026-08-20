@@ -18,6 +18,12 @@ type VisibleAnchor = {
   y: number;
 };
 
+type ViewportBox = {
+  top: number;
+  bottom: number;
+  height: number;
+};
+
 async function installWireProbe(page: Page, session: string): Promise<void> {
   await page.addInitScript((sessionName) => {
     const NativeWebSocket = window.WebSocket;
@@ -103,6 +109,13 @@ async function visibleAnchor(page: Page): Promise<VisibleAnchor> {
   });
 }
 
+async function viewportBox(page: Page): Promise<ViewportBox> {
+  return page.getByTestId('mtv').evaluate((mtv) => {
+    const rect = mtv.getBoundingClientRect();
+    return { top: rect.top, bottom: rect.bottom, height: rect.height };
+  });
+}
+
 async function anchorByText(page: Page, text: string): Promise<VisibleAnchor | null> {
   return page.getByTestId('mtv').evaluate((mtv, wanted) => {
     const viewport = mtv.getBoundingClientRect();
@@ -175,14 +188,28 @@ test('content follows only at the exact live tail and preserves a scrolled reade
   try {
     createLineSession(session, 'FOLLOW', 360);
     await installWireProbe(page, session);
-    await openSession(page, session);
+    await openSession(page, session, { showShortcutBar: false });
     await expect.poll(() => dataTotal(page)).toBeGreaterThanOrEqual(360);
 
     const rowHeight = await lineHeight(page);
+    const exactTailAnchor = await visibleAnchor(page);
+    const exactTailViewport = await viewportBox(page);
     await wheel(page, -4, 1);
     await expect.poll(() => bottomOffset(page)).toBeGreaterThan(0);
     await expect(page.getByTestId('demo-scroll-bottom')).toBeVisible();
-    const smallScrollAnchor = await visibleAnchor(page);
+    await expect.poll(async () => (await viewportBox(page)).height)
+      .toBeLessThan(exactTailViewport.height - 40);
+    const scrolledViewport = await viewportBox(page);
+    const smallScrollAnchor = await anchorByText(page, exactTailAnchor.text);
+    expect(smallScrollAnchor).not.toBeNull();
+    expect(smallScrollAnchor!.lineId).toBe(exactTailAnchor.lineId);
+    // The 4px reader gesture should move the same row down by 4px. Mounting the
+    // docked control moves the viewport bottom upward, but must not counter-
+    // scroll the content 52px toward the live tail.
+    expect(scrolledViewport.top + smallScrollAnchor!.y)
+      .toBeCloseTo(exactTailViewport.top + exactTailAnchor.y + 4, 1);
+    expect(await bottomOffset(page))
+      .toBeCloseTo(exactTailViewport.bottom - scrolledViewport.bottom + 4, 0);
     const totalBeforeLive = await dataTotal(page);
 
     appendLines(session, [
@@ -193,7 +220,7 @@ test('content follows only at the exact live tail and preserves a scrolled reade
     ]);
     await expect.poll(() => dataTotal(page), { timeout: 20_000 }).toBeGreaterThan(totalBeforeLive);
     await expect(page.getByTestId('demo-new-content')).toBeVisible();
-    await expectAnchorStable(page, smallScrollAnchor);
+    await expectAnchorStable(page, smallScrollAnchor!);
     expect(await bottomOffset(page)).toBeGreaterThan(0);
 
     await page.getByTestId('demo-new-content').click();

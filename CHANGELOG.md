@@ -1,7 +1,21 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.6-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.7-dist`.
+
+## v0.16.7 — 2026-08-20
+
+### Fixed
+
+- **Leaving the live tail no longer counter-scrolls when a docked control
+  changes the terminal height.** `TermView` now preserves the reader's physical
+  row from the viewport's measured bottom edge. A 4-pixel scroll therefore
+  remains a 4-pixel scroll when `SessionView` mounts its 44-pixel latest button
+  plus 8-pixel gap, instead of jumping 48 pixels toward new output. Top-only HUD
+  growth, exact-tail following, viewport expansion, and later live output retain
+  their intended behavior.
+
+No public type or server surface changed in this maintenance release.
 
 ## v0.16.6 — 2026-08-19
 

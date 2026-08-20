@@ -279,14 +279,26 @@ async function prepareScrollableTermView(
   onScrollStateChange?: (state: ScrollState) => void,
   lineCount = 240,
   overrides: TermViewOverrides = {},
-): Promise<Mounted & { viewport: HTMLElement }> {
+): Promise<Mounted & {
+  viewport: HTMLElement;
+  layout: MutableViewportLayout;
+  resizeObserver: ControlledResizeObserver;
+}> {
   const mountedView = mountTermView(onScrollStateChange, overrides);
   const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
   if (!viewport) throw new Error("TermView root not found");
 
+  const layout: MutableViewportLayout = {
+    clientWidth: 320,
+    clientHeight: 240,
+    left: 0,
+    top: 0,
+    width: 320,
+    height: 240,
+  };
   Object.defineProperty(viewport, "clientHeight", {
     configurable: true,
-    get: () => 240,
+    get: () => layout.clientHeight,
   });
 
   const resizeObserver = ControlledResizeObserver.latest;
@@ -297,7 +309,7 @@ async function prepareScrollableTermView(
   drainAnimationFrames();
   flushSync();
 
-  return { ...mountedView, viewport };
+  return { ...mountedView, viewport, layout, resizeObserver };
 }
 
 function viewportRect(layout: MutableViewportLayout): DOMRect {
@@ -1115,6 +1127,139 @@ describe("TermView alt-screen pointer and touch hit testing", () => {
 });
 
 describe("TermView compositor scroll diagnostics", () => {
+  test("preserves the reader's physical anchor when the viewport shrinks off-bottom", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    // Establish the physical-edge baseline while the exact tail still owns the
+    // viewport, just as onMount does in a real browser.
+    resizeObserver.fire();
+
+    // SessionView inserts a 44px scroll control plus an 8px gap as soon as the
+    // first wheel event leaves the live tail. That makes the observed terminal
+    // viewport 52px shorter. Holding bottomOffset constant would move the
+    // physical rows 52px toward the live tail and mostly undo a tiny scroll.
+    wheelTowardHistory(viewport, -4);
+    const offsetBeforeResize = compositorBottomOffset(viewport);
+    const total = Number(viewport.getAttribute("data-total"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const bottomBeforeResize = viewportRect(layout).bottom;
+    const physicalAnchorBefore = bottomBeforeResize + offsetBeforeResize - total * lineHeight;
+    const scrollTopBefore = Math.max(0, total * lineHeight - layout.clientHeight)
+      - offsetBeforeResize;
+    const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+    if (!layer) throw new Error("TermView compositor layer not found");
+    const transformBefore = layer.style.transform;
+
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterResize = compositorBottomOffset(viewport);
+    const scrollTopAfter = Math.max(0, total * lineHeight - layout.clientHeight)
+      - offsetAfterResize;
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterResize).toBe(offsetBeforeResize + 52);
+    expect(scrollTopAfter).toBe(scrollTopBefore);
+    expect(viewportRect(layout).bottom + offsetAfterResize - total * lineHeight)
+      .toBe(physicalAnchorBefore);
+    expect(layer.style.transform).toBe(transformBefore);
+
+    // Once the layout has moved, later live output must still preserve the
+    // same reader-owned row instead of silently rejoining tail-follow.
+    deliverLiveAppend(239, 1);
+    flushSync();
+    drainScheduledWork();
+    const totalAfterAppend = Number(viewport.getAttribute("data-total"));
+    const offsetAfterAppend = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterAppend).toBe(offsetAfterResize + lineHeight);
+    expect(viewportRect(layout).bottom + offsetAfterAppend - totalAfterAppend * lineHeight)
+      .toBe(physicalAnchorBefore);
+    expect(layer.style.transform).toBe(transformBefore);
+  });
+
+  test("does not compensate an off-bottom reader when only the viewport top moves", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    wheelTowardHistory(viewport, -4);
+    const offsetBeforeResize = compositorBottomOffset(viewport);
+    const bottomBeforeResize = viewportRect(layout).bottom;
+
+    // A taller HUD moves the terminal's top downward while leaving its bottom
+    // edge fixed. Height-only compensation would incorrectly move every row.
+    layout.top += 52;
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterResize = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(viewportRect(layout).bottom).toBe(bottomBeforeResize);
+    expect(offsetAfterResize).toBe(offsetBeforeResize);
+    expect(viewportRect(layout).bottom + offsetAfterResize)
+      .toBe(bottomBeforeResize + offsetBeforeResize);
+  });
+
+  test("keeps exact-tail ownership when the viewport bottom moves", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(isScrolledUp?.()).toBe(false);
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(viewport.getAttribute("data-bottom-offset")).toBe("0");
+  });
+
+  test("preserves an off-bottom anchor on expansion until the live tail enters view", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    wheelTowardHistory(viewport, -80);
+    const offsetBeforeExpand = compositorBottomOffset(viewport);
+    const bottomBeforeExpand = viewportRect(layout).bottom;
+
+    layout.clientHeight += 52;
+    layout.height += 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterExpand = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterExpand).toBe(offsetBeforeExpand - 52);
+    expect(viewportRect(layout).bottom + offsetAfterExpand)
+      .toBe(bottomBeforeExpand + offsetBeforeExpand);
+
+    // A second expansion reaches past the old reader anchor. At that point
+    // there is no content below the viewport to preserve, so exact-tail
+    // ownership is the truthful state rather than a negative offset.
+    layout.clientHeight += 52;
+    layout.height += 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(isScrolledUp?.()).toBe(false);
+    expect(compositorBottomOffset(viewport)).toBe(0);
+  });
+
   test("treats any positive bottom offset as scrolled up", async () => {
     const scrollStates: ScrollState[] = [];
     const { app, viewport } = await prepareScrollableTermView((state) => scrollStates.push(state));

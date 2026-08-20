@@ -77,19 +77,22 @@ export function capturePane(session: string, startLine = -5000): string {
 
 export function demoUrlForSession(
   session: string,
-  extras?: { composerMode?: 'compose' | 'direct' },
+  extras?: { composerMode?: 'compose' | 'direct'; showShortcutBar?: boolean },
 ): string {
   if (!process.env.DEMO_URL) throw new Error('DEMO_URL is required');
   const url = new URL(process.env.DEMO_URL);
   url.searchParams.set('session', session);
   if (extras?.composerMode) url.searchParams.set('composerMode', extras.composerMode);
+  if (extras?.showShortcutBar !== undefined) {
+    url.searchParams.set('showShortcutBar', String(extras.showShortcutBar));
+  }
   return url.toString();
 }
 
 export async function openSession(
   page: Page,
   session: string,
-  extras?: { composerMode?: 'compose' | 'direct' },
+  extras?: { composerMode?: 'compose' | 'direct'; showShortcutBar?: boolean },
 ) {
   await page.goto(demoUrlForSession(session, extras), { waitUntil: 'domcontentloaded' });
   const mtv = page.getByTestId('mtv');

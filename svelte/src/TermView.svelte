@@ -223,6 +223,9 @@
   const MOMENTUM_GAIN = 1.25;
 
   let viewportEl = $state<HTMLDivElement | null>(null);
+  // Last measured physical bottom edge. A height alone cannot tell whether a
+  // viewport shrank from its top (HUD growth) or bottom (docked controls).
+  let viewportBottom: number | null = null;
   let cursor = $state<{ row: number; col: number } | null>(null);
   let charW = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
@@ -652,6 +655,33 @@
 
   function maxOffset(): number {
     return Math.max(0, total * lineH - Math.max(1, viewH));
+  }
+
+  /** Preserve an off-bottom row's physical screen position across layout.
+   *
+   * `bottomOffsetPx` is measured from the live tail. For a fixed content row,
+   * its screen Y changes only with `viewport.bottom + bottomOffsetPx`; a top-edge
+   * HUD resize therefore needs no compensation, while a bottom-docked control
+   * does. SessionView exposes the latter immediately: its 44px "latest" control
+   * plus 8px gap appears on the first off-bottom scroll. Before this correction,
+   * a 4px wheel gesture was counter-scrolled 48px toward the tail.
+   */
+  function updateViewportGeometry(
+    viewport: HTMLDivElement | null,
+    bounds = viewport?.getBoundingClientRect(),
+  ): void {
+    if (!viewport) return;
+    const nextHeight = viewport.clientHeight;
+    const nextBottom = bounds?.bottom ?? Number.NaN;
+    if (
+      viewportBottom !== null
+      && Number.isFinite(nextBottom)
+      && isAwayFromLiveTail()
+    ) {
+      bottomOffsetPx = Math.max(0, bottomOffsetPx + viewportBottom - nextBottom);
+    }
+    viewH = nextHeight;
+    viewportBottom = Number.isFinite(nextBottom) ? nextBottom : null;
   }
 
   function busy(): boolean {
@@ -2276,11 +2306,11 @@
     return { cols: lastPushedCols, rows: lastPushedRows };
   }
 
-  function contentHitArea(): ContentHitArea | null {
+  function contentHitArea(bounds = viewportEl?.getBoundingClientRect()): ContentHitArea | null {
     if (!viewportEl) return null;
     const geom = currentGeometry();
     if (!geom) return null;
-    const bounds = viewportEl.getBoundingClientRect();
+    if (!bounds) return null;
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     const cellW = Math.max(1, charW || measureCharWidth());
     const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
@@ -2301,6 +2331,11 @@
   function refreshAltTouchHitArea() {
     if (altTouchY === null) return;
     altTouchHitArea = contentHitArea();
+  }
+
+  function refreshAltTouchHitAreaFromBounds(bounds: DOMRect | undefined) {
+    if (altTouchY === null) return;
+    altTouchHitArea = contentHitArea(bounds);
   }
 
   // Trackpads emit dozens of sub-line pixel deltas per second — accumulate a
@@ -3079,7 +3114,7 @@
   let observedVisualViewport: VisualViewport | null = null;
 
   onMount(() => {
-    viewH = viewportEl?.clientHeight ?? 0;
+    updateViewportGeometry(viewportEl);
     updateSelectionActive();
     keydownCaptureHost = resolveKeydownCaptureHost();
     keydownCaptureHost?.addEventListener('keydown', onTermViewKeydown, { capture: true });
@@ -3114,9 +3149,10 @@
     pushGeometry({ force: true });
     scheduleDeferredFrame(() => pushGeometry({ force: true }));
     resizeObs = new ResizeObserver(() => {
-      viewH = viewportEl?.clientHeight ?? viewH;
+      const bounds = viewportEl?.getBoundingClientRect();
+      updateViewportGeometry(viewportEl, bounds);
       pushGeometry();
-      refreshAltTouchHitArea();
+      refreshAltTouchHitAreaFromBounds(bounds);
       applyScroll();
     });
     if (viewportEl) resizeObs.observe(viewportEl);

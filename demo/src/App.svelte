@@ -38,6 +38,13 @@
     const raw = new URL(window.location.href).searchParams.get('composerMode');
     return raw === 'direct' || raw === 'compose' ? raw : undefined;
   })();
+  // e2e / dogfooding: mirror hosts that dock no persistent shortcut bar, so
+  // the first off-bottom scroll mounts a control that really moves the
+  // terminal's bottom edge. Omitted = package stock (`true`).
+  const showShortcutBarParam = (() => {
+    const raw = new URL(window.location.href).searchParams.get('showShortcutBar');
+    return raw === 'false' ? false : raw === 'true' ? true : undefined;
+  })();
   // e2e / dogfooding: ?dpadPlacement=top-right|… seeds the ✛ pad corner.
   // Omitted = package stock bottom-left. Not prefs-persisted.
   const dpadPlacementParam = (() => {
@@ -158,11 +165,12 @@
           ?? demoSessionMetadataFromName(session)?.altScreenMouse
           ?? false,
       }),
-      ...((composerModeParam || dpadPlacementParam)
+      ...((composerModeParam || dpadPlacementParam || showShortcutBarParam !== undefined)
         ? {
             sessionPresentation: {
               ...(composerModeParam ? { composerMode: composerModeParam } : {}),
               ...(dpadPlacementParam ? { dpadPlacement: dpadPlacementParam } : {}),
+              ...(showShortcutBarParam !== undefined ? { showShortcutBar: showShortcutBarParam } : {}),
             },
           }
         : {}),
