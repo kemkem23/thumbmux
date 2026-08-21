@@ -140,6 +140,28 @@ export function isClaudeStatusLine(trimmed: string): boolean {
     /\b(tokens|permissions|effort|5h|week|ctx:)/i.test(trimmed);
 }
 
+export function isGrokStatusLine(trimmed: string): boolean {
+  // Grok Build TUI v1.0.x (measured 2026-08-21 on grok 0.2.102 / Grok 4.6):
+  // the composer is a bare ❯ at column 0, then a chrome line such as
+  //   Grok 4.6 (high) · always-approve · 86K / 500K (17%) · ctrl+o transcript
+  //   Grok 4.6 (high) · always-approve · 209K / 500K (42%) · 23 queued · /queue · ctrl+o transcript
+  // Token and queue fields change every few seconds, so this line must never be
+  // admitted as a submitted prompt or glued onto a typed-but-unsent draft.
+  // The June 2026 boxed footer (`╰──── Grok Build · always-approve ─╯`) starts
+  // with box drawing and is already a prompt terminator; this matcher is for
+  // the v1.0.x chrome that has no box and no ❯ of its own.
+  const grokBrand = /^(?:Grok(?:[\s-]|$)|SuperGrok\b)/i.test(trimmed);
+  const hasTranscript = /\bctrl\+o\s+transcript\b/i.test(trimmed);
+  const hasApprove = /\balways-approve\b/i.test(trimmed);
+  const hasQueue = /\b\/queue\b/.test(trimmed) || /\b\d+\s+queued\b/i.test(trimmed);
+  const hasTokens = /\b\d+(?:\.\d+)?[kKmM]?\s*\/\s*\d+(?:\.\d+)?[kKmM]?\b/.test(trimmed);
+  const chromeBits = [hasTranscript, hasApprove, hasQueue, hasTokens].filter(Boolean).length;
+  if (grokBrand && chromeBits >= 1) return true;
+  // A wrap can drop the "Grok 4.6" prefix onto the previous row. The remaining
+  // chrome still carries two unique tokens that a submitted prompt body does not.
+  return chromeBits >= 2;
+}
+
 /**
  * Built-in heuristics tuned for Claude Code, Codex, and Grok pane output.
  * Consumers scanning another agent (for example aider, cline, or a plain shell)
@@ -157,11 +179,16 @@ export const DEFAULT_PROMPT_MATCHERS: PromptMatcherSet = Object.freeze({
     const leading = line.length - line.trimStart().length;
     if (leading > 6) return null;
 
-    return stripTrailingClock(normalized.slice(1).trim());
+    // Empty composer (`❯` with no payload) is not a submitted prompt. Returning
+    // "" here used to start a block that then swallowed the next chrome line
+    // (Grok 4.6 status) as a continuation, so recent-prompts filled with
+    // `Grok 4.6 (high) · always-approve · 86K / 500K (17%)`.
+    const payload = stripTrailingClock(normalized.slice(1).trim());
+    return payload || null;
   },
   isFaintPayload,
   isStatusLine(trimmedLine: string): boolean {
-    return isCodexStatusLine(trimmedLine) || isClaudeStatusLine(trimmedLine);
+    return isCodexStatusLine(trimmedLine) || isClaudeStatusLine(trimmedLine) || isGrokStatusLine(trimmedLine);
   },
   isPromptTerminator(line: string): boolean {
     const trimmed = line.replace(/\u00a0/g, " ").trim();

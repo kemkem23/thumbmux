@@ -3,6 +3,21 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.16.7-dist`.
 
+## v0.16.8 — 2026-08-21
+
+### Fixed
+
+- **Grok Build TUI v1.0.x chrome is no longer stored as a recent prompt.** Live
+  Grok 4.6 (measured on grok 0.2.102) echoes a bare `❯` at column 0 and then a
+  status line such as `Grok 4.6 (high) · always-approve · 86K / 500K (17%) ·
+  ctrl+o transcript` (token and queue fields change every few seconds). The
+  scanner still understood only the June 2026 boxed composer, so an empty `❯`
+  started a block that swallowed that chrome as a continuation, and a
+  typed-but-unsent draft glued onto it. Empty payloads now return null;
+  `isGrokStatusLine` joins the Claude/Codex status matchers. Legacy indent-5
+  clocked echoes and boxed composers stay extracted as before. 100 table-driven
+  pane cases plus a live v1.0.5 capture cover both scan APIs.
+
 ## v0.16.7 — 2026-08-20
 
 ### Fixed
