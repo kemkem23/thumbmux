@@ -60,12 +60,14 @@ describe("terminal prompt extraction", () => {
       isFaintPayload: typeof core.DEFAULT_PROMPT_MATCHERS.isFaintPayload,
       isStatusLine: typeof core.DEFAULT_PROMPT_MATCHERS.isStatusLine,
       isPromptTerminator: typeof core.DEFAULT_PROMPT_MATCHERS.isPromptTerminator,
+      isGrokStatusLine: typeof core.isGrokStatusLine,
       frozen: Object.isFrozen(core.DEFAULT_PROMPT_MATCHERS),
     }).toEqual({
       promptPayload: "function",
       isFaintPayload: "function",
       isStatusLine: "function",
       isPromptTerminator: "function",
+      isGrokStatusLine: "function",
       frozen: true,
     });
   });

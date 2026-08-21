@@ -576,6 +576,12 @@
     "tier": "X"
   },
   {
+    "name": "isGrokStatusLine",
+    "kind": "value",
+    "signature": "d6d99f0c1b663251ba4953a9352e963bd1d4910721f8d0dbb266cf9d788ca31d",
+    "tier": "X"
+  },
+  {
     "name": "keyboardEventToSequence",
     "kind": "value",
     "signature": "b684c548100331321cc6a7890d5e8c9b493cdd18e0f666c48f0434095f47e287",
