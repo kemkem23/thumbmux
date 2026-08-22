@@ -455,6 +455,42 @@ describe("TermView screen prop — alt scrollback", () => {
     expect(historyCalls).toHaveLength(0);
   });
 
+  test("screen.alt=true replaces a repaint instead of inventing scrollback from a coincidental seam", async () => {
+    const { viewport } = mountTermView({
+      altScreenMouse: false,
+      screen: { alt: true, mouseSgr: false, mouseAny: false },
+    });
+    await tick();
+    deliverOutput(120);
+    await tick();
+    flushSync();
+    wheelTowardHistory(viewport);
+    expect(settledBottomOffset(viewport)).toBeGreaterThan(0);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const next = [
+      ...Array.from({ length: 8 }, (_, row) => `line-${52 + row}`),
+      ...Array.from({ length: 112 }, (_, row) => `alt-repaint-${row}`),
+    ];
+    sessionCallback(
+      next.join("\n"),
+      "output",
+      null,
+      {
+        source: "full",
+        replace: false,
+        screen: { alt: true, mouseSgr: false, mouseAny: false },
+      },
+    );
+    await tick();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(totalRows(viewport)).toBe(120);
+    expect(viewport.textContent ?? "").not.toContain("line-0");
+    expect(viewport.textContent ?? "").toContain("line-52");
+  });
+
   test("screen.alt=true does not prepend a history reply that arrives while alt", async () => {
     const entry = mountTermView({
       screen: { alt: false, mouseSgr: false, mouseAny: false },
