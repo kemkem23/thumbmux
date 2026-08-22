@@ -1,7 +1,22 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.7-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.9-dist`.
+
+## v0.16.9 — 2026-08-22
+
+### Fixed
+
+- **Streaming output no longer moves a reader who has scrolled away from the
+  live tail.** A bounded tmux capture can advance at its top while Claude or
+  Codex repaints several composer/status rows at its bottom. That defeated the
+  old exact-overlap check, replaced the whole live window, and made the text
+  under the reader drift down one row per frame. `TermView` now proves the
+  chronological seam above the mutable pane, retains only the rows that left
+  the capture, and keeps the same physical row under the reader. Returning to
+  the exact bottom still resumes normal live-tail following.
+
+No public type or server surface changed in this maintenance release.
 
 ## v0.16.8 — 2026-08-21
 
