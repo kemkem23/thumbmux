@@ -182,6 +182,30 @@ async function injectLiveAppend(page: Page, session: string, marker: string): Pr
   }, { sessionName: session, line: marker });
 }
 
+async function injectSlidingTailRepaint(
+  page: Page,
+  session: string,
+  frame: number,
+): Promise<{ before: number; after: number }> {
+  return page.evaluate(({ sessionName, frameNumber }) => {
+    const state = (window as any).__thumbmuxContentFollow;
+    if (!state?.inject || !state.latestData) throw new Error('content-follow wire probe is not ready');
+    const previous = state.latestData.split('\n');
+    if (previous.length < 80) throw new Error('sliding-tail fixture needs a deep live window');
+    const next = [
+      ...previous.slice(1, -6),
+      ...Array.from({ length: 7 }, (_, row) => `FOLLOW stream ${frameNumber} tail ${row}`),
+    ];
+    state.inject({
+      channel: sessionName,
+      type: 'output',
+      data: next.join('\n'),
+      cursor: null,
+    });
+    return { before: previous.length, after: next.length };
+  }, { sessionName: session, frameNumber: frame });
+}
+
 test('content follows only at the exact live tail and preserves a scrolled reader', async ({ page }, testInfo) => {
   test.setTimeout(120_000);
   const session = makeSessionName(testInfo, 'follow');
@@ -234,6 +258,34 @@ test('content follows only at the exact live tail and preserves a scrolled reade
     await expect.poll(() => dataTotal(page), { timeout: 20_000 }).toBeGreaterThan(totalAtBottom);
     expect(await bottomOffset(page)).toBe(0);
     await expect.poll(async () => (await visibleTerminalLines(page)).includes(bottomMarker)).toBe(true);
+
+    await wheel(page, -Math.ceil(rowHeight * 14), 1);
+    await expect.poll(() => bottomOffset(page)).toBeGreaterThan(rowHeight * 5);
+    const streamingAnchor = await visibleAnchor(page);
+    let streamingTotal = await dataTotal(page);
+    for (let frame = 1; frame <= 5; frame++) {
+      const rewrite = await injectSlidingTailRepaint(page, session, frame);
+      expect(rewrite.after).toBe(rewrite.before);
+      streamingTotal += 1;
+      await expect.poll(() => dataTotal(page)).toBe(streamingTotal);
+      await expectAnchorStable(page, streamingAnchor);
+      expect(await bottomOffset(page)).toBeGreaterThan(rowHeight * 5);
+    }
+
+    await page.getByTestId('demo-new-content').click();
+    await expect.poll(() => bottomOffset(page)).toBe(0);
+    await expect.poll(async () => (await visibleTerminalLines(page)).includes('FOLLOW stream 5 tail 6'))
+      .toBe(true);
+
+    // The first frame received after reader ownership returns to the exact
+    // tail may collapse the retained off-bottom prefix back to the server's
+    // current live window. That is tail-following, and establishes a clean
+    // base for the independent reset/rewrite branch below.
+    const collapsedMarker = 'FOLLOW exact-tail frame after streaming';
+    await injectLiveAppend(page, session, collapsedMarker);
+    expect(await bottomOffset(page)).toBe(0);
+    await expect.poll(async () => (await visibleTerminalLines(page)).includes(collapsedMarker))
+      .toBe(true);
 
     await wheel(page, -Math.ceil(rowHeight * 7), 1);
     await expect.poll(() => bottomOffset(page)).toBeGreaterThan(rowHeight * 5);

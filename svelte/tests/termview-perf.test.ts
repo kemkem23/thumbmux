@@ -428,6 +428,24 @@ function expectMountedContentPreserved(
   }
 }
 
+function compositorLineY(viewport: HTMLElement, lineId: number): number {
+  const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+  const firstLine = layer?.querySelector<HTMLElement>(".mtv-line");
+  const target = layer?.querySelector<HTMLElement>(`[data-line-id="${lineId}"]`);
+  if (!layer || !firstLine || !target) {
+    throw new Error(`mounted compositor row ${lineId} not found`);
+  }
+  const translateMatch = layer.style.transform.match(
+    /translate3d\(0(?:px)?,\s*(-?\d+(?:\.\d+)?)px,\s*0(?:px)?\)/,
+  );
+  const firstLineId = Number(firstLine.getAttribute("data-line-id"));
+  const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+  if (!translateMatch?.[1] || !Number.isFinite(firstLineId) || !Number.isFinite(lineHeight)) {
+    throw new Error("terminal compositor diagnostics are incomplete");
+  }
+  return Number(translateMatch[1]) + (lineId - firstLineId) * lineHeight;
+}
+
 function median(values: number[]): number {
   if (values.length === 0) throw new Error("cannot take the median of an empty sample");
   const ordered = [...values].sort((a, b) => a - b);
@@ -1919,6 +1937,78 @@ describe("TermView retained history budgets", () => {
     expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore + 4);
     expect(compositorBottomOffset(viewport)).toBe(offsetBefore + 4 * 21);
     expect(layer.style.transform).toBe(transformBefore);
+  }, 120_000);
+
+  test("keeps a reader fixed while a sliding live window repaints its screen tail", async () => {
+    let retainedLines: string[] = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -200);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no mounted reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+    const offsetBefore = compositorBottomOffset(viewport);
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    let wireCapture = retainedLines.slice();
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    for (let frame = 1; frame <= 5; frame++) {
+      // Real agents keep a fixed capture window: one finalized row leaves the
+      // top while their 5-8 row composer/status tail is repainted in place.
+      // Exact suffix-to-prefix matching sees no overlap in that shape, but the
+      // immutable rows above one pane still prove the chronological shift.
+      wireCapture = [
+        ...wireCapture.slice(1, -6),
+        ...Array.from({ length: 7 }, (_, row) => `stream-${frame}-tail-${row}`),
+      ];
+      sessionCallback(
+        wireCapture.join("\n"),
+        "output",
+        null,
+        { source: "full", replace: false },
+      );
+      flushSync();
+      drainScheduledWork();
+
+      expect(Number(viewport.getAttribute("data-total"))).toBe(240 + frame);
+      expect(compositorBottomOffset(viewport)).toBe(offsetBefore + frame * lineHeight);
+      expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+      expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+      expect(retainedLines.slice(-wireCapture.length)).toEqual(wireCapture);
+      for (let oldFrame = 1; oldFrame < frame; oldFrame++) {
+        const marker = `stream-${oldFrame}-tail-`;
+        expect(retainedLines.filter((line) => line.startsWith(marker))).toHaveLength(
+          wireCapture.filter((line) => line.startsWith(marker)).length,
+        );
+      }
+    }
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+
+    wireCapture = [
+      ...wireCapture.slice(1, -6),
+      ...Array.from({ length: 7 }, (_, row) => `resumed-tail-${row}`),
+    ];
+    sessionCallback(
+      wireCapture.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: false },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(retainedLines.at(-1)).toBe("resumed-tail-6");
   }, 120_000);
 
   // A5-9 (replace path): full-window identical overlap must not claim every
