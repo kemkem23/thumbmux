@@ -2011,6 +2011,59 @@ describe("TermView retained history budgets", () => {
     expect(retainedLines.at(-1)).toBe("resumed-tail-6");
   }, 120_000);
 
+  test("prefers the pane seam when repeated chrome makes a false exact overlap", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    const chrome = Array.from({ length: 8 }, (_, row) => `repeated-chrome-${row}`);
+    const initial = Array.from({ length: 240 }, (_, row) => `seam-line-${row}`);
+    initial.splice(4, chrome.length, ...chrome);
+    initial.splice(initial.length - chrome.length, chrome.length, ...chrome);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      initial.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -200);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no repeated-chrome anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+    const offsetBefore = compositorBottomOffset(viewport);
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const nextCapture = [
+      ...initial.slice(4, -chrome.length),
+      ...Array.from({ length: 12 }, (_, row) => `repainted-tail-${row}`),
+    ];
+
+    sessionCallback(
+      nextCapture.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: false },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(244);
+    expect(compositorBottomOffset(viewport)).toBe(offsetBefore + 4 * lineHeight);
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+    expect(retainedLines.slice(-nextCapture.length)).toEqual(nextCapture);
+    for (const marker of chrome) {
+      expect(retainedLines.filter((line) => line === marker)).toHaveLength(1);
+    }
+  }, 120_000);
+
   // A5-9 (replace path): full-window identical overlap must not claim every
   // shortened row as "already retained" — keep one row of churn so gap math
   // still records a real discard when a repetitive live window shrinks.

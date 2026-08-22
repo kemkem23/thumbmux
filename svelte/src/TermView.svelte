@@ -1587,8 +1587,6 @@
     nextLive: string[],
   ) {
     const exact = mergeCapturedLinesForStableScroll(previousLive, nextLive);
-    if (exact.preservedPrefix) return exact;
-
     const measuredRows = Number.isFinite(lastPushedRows)
       ? Math.max(0, Math.floor(lastPushedRows))
       : 0;
@@ -1607,18 +1605,23 @@
 
     const immutablePrevious = previousLive.slice(0, immutableLength);
     const overlap = findLineOverlap(immutablePrevious, nextLive);
-    if (overlap < minimumReliableOverlap) return exact;
+    if (overlap >= minimumReliableOverlap) {
+      const departedRows = immutablePrevious.length - overlap;
+      const lines = [
+        ...previousLive.slice(0, departedRows),
+        ...nextLive,
+      ];
+      return {
+        lines,
+        appendedLineCount: lines.length - previousLive.length,
+        preservedPrefix: true,
+      };
+    }
 
-    const departedRows = immutablePrevious.length - overlap;
-    const lines = [
-      ...previousLive.slice(0, departedRows),
-      ...nextLive,
-    ];
-    return {
-      lines,
-      appendedLineCount: lines.length - previousLive.length,
-      preservedPrefix: true,
-    };
+    // Short tail-only deliveries legitimately rely on the core exact seam.
+    // For full windows the pane seam above wins first, so repeated composer
+    // chrome cannot override a stronger chronological match.
+    return exact;
   }
 
   function setLines(
@@ -1642,7 +1645,7 @@
       if (discardedLiveRows > 0) {
         recordRetentionGap(archivedLines.length, discardedLiveRows);
       }
-    } else if (!followTail && liveLines.length > 0) {
+    } else if (!followTail && liveLines.length > 0 && !noScrollback) {
       const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
       liveLines = merged.lines;
       if (merged.appendedLineCount > 0) {
