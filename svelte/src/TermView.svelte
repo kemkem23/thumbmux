@@ -1568,6 +1568,59 @@
     return overlap;
   }
 
+  /** Merge a polling capture without letting a repainting TUI move the reader.
+   *
+   * A fixed tmux capture window commonly advances by one or more rows while
+   * Claude/Codex repaint their whole composer/status area. The core exact
+   * suffix-to-prefix merge cannot prove that shift because the old mutable
+   * screen tail no longer equals the new prefix, so replacing the snapshot
+   * would move every visible row forward on every streaming frame.
+   *
+   * tmux can only repaint the current pane. Trim one maximum pane from the old
+   * capture, use the remaining immutable suffix as the chronological seam,
+   * retain only the rows that genuinely left the new window, and take the new
+   * snapshot verbatim for the overlap + live tail. A weak seam fails closed to
+   * the ordinary replacement path instead of guessing from repeated chrome.
+   */
+  function mergeLiveCaptureForStableReader(
+    previousLive: string[],
+    nextLive: string[],
+  ) {
+    const exact = mergeCapturedLinesForStableScroll(previousLive, nextLive);
+    if (exact.preservedPrefix) return exact;
+
+    const measuredRows = Number.isFinite(lastPushedRows)
+      ? Math.max(0, Math.floor(lastPushedRows))
+      : 0;
+    const configuredRows = Number.isFinite(maxRows)
+      ? Math.max(0, Math.floor(maxRows))
+      : 0;
+    const mutableTailRows = Math.max(measuredRows, configuredRows);
+    const immutableLength = previousLive.length - mutableTailRows;
+    const minimumReliableOverlap = 8;
+    if (
+      immutableLength < minimumReliableOverlap
+      || nextLive.length < minimumReliableOverlap
+    ) {
+      return exact;
+    }
+
+    const immutablePrevious = previousLive.slice(0, immutableLength);
+    const overlap = findLineOverlap(immutablePrevious, nextLive);
+    if (overlap < minimumReliableOverlap) return exact;
+
+    const departedRows = immutablePrevious.length - overlap;
+    const lines = [
+      ...previousLive.slice(0, departedRows),
+      ...nextLive,
+    ];
+    return {
+      lines,
+      appendedLineCount: lines.length - previousLive.length,
+      preservedPrefix: true,
+    };
+  }
+
   function setLines(
     nextLive: string[],
     replace = false,
@@ -1590,7 +1643,7 @@
         recordRetentionGap(archivedLines.length, discardedLiveRows);
       }
     } else if (!followTail && liveLines.length > 0) {
-      const merged = mergeCapturedLinesForStableScroll(liveLines, nextLive);
+      const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
       liveLines = merged.lines;
       if (merged.appendedLineCount > 0) {
         archiveExhausted = false;
