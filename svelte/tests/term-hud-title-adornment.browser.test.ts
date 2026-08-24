@@ -488,7 +488,7 @@ describe("dense HUD browser layout", () => {
       try {
         const measurement = await renderDense(page, {
           width: 2036,
-          title: "codex-kem-cortex-orchestrator-2",
+          title: "codex-project-2",
           note: "test note",
           adorn: "งานยืด timeout ของ Claude Fable เป็น 2 ชั่วโมงทำจบแล้ว เทสต์ผ่าน ยังไม่ commit และตอนนี้รอคำสั่งใหม่",
         });
@@ -514,7 +514,7 @@ describe("dense HUD browser layout", () => {
       try {
         const measurement = await renderDense(page, {
           width: 280,
-          title: "codex-kemcortex-very-long-session-name-20260819",
+          title: "codex-example-very-long-session-name-20260819",
           note: "โน้ตยาวที่ต้องขึ้นบรรทัดใหม่โดยไม่เว้นพื้นที่ฟุ่มเฟือย และยังมีรายละเอียดต่อเนื่องอีกหลายช่วงเพื่อพิสูจน์ว่าถูกจำกัดไว้สองบรรทัดจริง",
           adorn: "กำลังรัน browser integration tests ชุดใหญ่ พร้อมตรวจ responsive layout, clipboard separation, metadata wrapping และ regression cases อีกหลายรายการ",
         });

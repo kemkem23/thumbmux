@@ -662,6 +662,67 @@ describe("A6-12 ActionFab closed slots", () => {
     });
     expect(taps).toEqual([]);
   });
+
+  test("choice action expands left-side controls, exposes selection, and closes after a direct pick", async () => {
+    const taps: string[] = [];
+    const { target } = mountComponent(ActionFab, {
+      open: true,
+      actions: [
+        {
+          id: "bash-mode",
+          label: "BASH",
+          tag: "HIDE",
+          testid: "bash-mode",
+          onTap: () => taps.push("cycle-must-not-run"),
+        },
+      ],
+      flyouts: [
+        {
+          actionId: "bash-mode",
+          ariaLabel: "Bash display mode",
+          choices: [
+            { id: "show", label: "SHOW", testid: "bash-show", onTap: () => taps.push("show") },
+            { id: "hide", label: "HIDE", testid: "bash-hide", selected: true, onTap: () => taps.push("hide") },
+            { id: "distill", label: "DISTILL", testid: "bash-distill", onTap: () => taps.push("distill") },
+          ],
+        },
+      ],
+      onFab: () => {},
+    });
+    await tick();
+
+    const trigger = target.querySelector<HTMLButtonElement>('[data-testid="bash-mode"]');
+    const hide = target.querySelector<HTMLButtonElement>('[data-testid="bash-hide"]');
+    if (!trigger || !hide) throw new Error("choice action did not render");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(hide.disabled).toBe(true);
+    expect(hide.tabIndex).toBe(-1);
+    expect(hide.getAttribute("aria-pressed")).toBe("true");
+
+    flushSync(() => trigger.click());
+    await tick();
+    expect(taps).toEqual([]);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(hide.disabled).toBe(false);
+    expect(hide.tabIndex).toBe(0);
+
+    flushSync(() => hide.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    })));
+    await tick();
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
+
+    flushSync(() => trigger.click());
+    await tick();
+    flushSync(() => hide.click());
+    await tick();
+    expect(taps).toEqual(["hide"]);
+    expect(target.querySelector(".slots")?.classList.contains("open")).toBe(false);
+    expect(document.activeElement).toBe(target.querySelector(".fab"));
+  });
 });
 
 // ─── A6-15: NotePanel without onSave must not pretend to save ───────────────

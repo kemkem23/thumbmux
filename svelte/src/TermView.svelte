@@ -67,12 +67,15 @@
     wheelDeltaToLines, consumeWholeWheelLines,
     type MuxHistoryBoundary,
     detectClaudeBashBlocks,
-    projectClaudeBashLines,
+    groupClaudeBashBlocks,
+    projectClaudeBashGroupedLines,
     type ClaudeBashBlock,
+    type ClaudeBashGroup,
     type ClaudeBashDetection,
     type ClaudeBashMode,
-    type ClaudeBashProjection,
-    type ClaudeBashProjectionRow,
+    type ClaudeBashGroupedProjection,
+    type ClaudeBashGroupedProjectionRow,
+    type ClaudeBashGroupedSummaryRequest,
     type ClaudeBashSummaries,
     type ClaudeBashSummaryRequest,
   } from '@thumbmux/core';
@@ -120,9 +123,10 @@
      * canonical for copy, search, retention, history, and ANSI state. */
     claudeBashMode = 'off',
     claudeBashSummaries = undefined,
-    /** Batch of completed Bash calls whose placeholder is in the real
-     * viewport. Return summaries by id; rejection/missing ids settle to a
-     * deterministic fallback. Active and overscan-only rows are never sent. */
+    /** Lifecycle-bounded Bash groups selected for distillation. A cold view
+     * requests at most the newest ten groups; later live output queues only its
+     * newest completed group. Return summaries by id; rejection/missing ids
+     * settle to a deterministic fallback. Active groups are never sent. */
     onClaudeBashSummaryRequest = undefined,
   }: {
     session: string;
@@ -281,7 +285,19 @@
   // `null` is the zero-allocation off-mode identity projection. Keeping the
   // frozen default path avoids an O(rawRows) row-object rebuild on every live
   // frame and preserves the pre-feature cache/retention behaviour exactly.
-  let bashProjection: ClaudeBashProjection | null = null;
+  let bashProjection: ClaudeBashGroupedProjection | null = null;
+  /**
+   * Hide markers are one third of a terminal row. Keep their visual indexes as
+   * a sparse column (the detector retains at most 512 blocks) instead of
+   * rebuilding a 10k-entry prefix sum after every live-tail repaint.
+   *
+   * Geometry is expressed in integer thirds: a terminal/Haiku row is 3 units,
+   * a hide marker is 1. Pixel conversion happens only at the boundary, using
+   * `lineH / 3`, so every caller shares the exact same fractional coordinates.
+   */
+  const PRESENTATION_UNITS_PER_LINE = 3;
+  let compactBashVisualRows: number[] = [];
+  let compactBashVisualRowSet = new Set<number>();
   let cachedClaudeBashDetection: ClaudeBashDetection | null = null;
   let cachedClaudeBashDetectionRawLength = 0;
   let cachedClaudeBashDetectionScreenMode: 'normal' | 'alternate' | 'unknown' | null = null;
@@ -316,6 +332,11 @@
    * pane capture. `$state.raw` avoids proxying up to 10k immutable rows. */
   let archiveWindow = $state.raw<HistoryWindowState | null>(null);
   let archiveWindowAttachedToLive = $state(true);
+  /** Live captures received while the reader owns a detached archive are kept
+   * offscreen. Remember that projection work is owed so reattaching can admit
+   * exactly the newest completed live Bash group without replaying archive
+   * backlog through the Distill queue. */
+  let detachedLiveProjectionPending = false;
   /** Last mux-validated durable seam paired with the current live capture. */
   let liveBoundary = $state.raw<MuxHistoryBoundary | null>(null);
   /** Newest total observed in a history reply (may lead the next output tick). */
@@ -400,6 +421,21 @@
   let renderWindowPending = false;
   const requestedClaudeBashSummaries = new Set<string>();
   const settledClaudeBashSummaries = new Map<string, string>();
+  /** Missing group IDs which this distill epoch is allowed to send. Everything
+   * else renders as a one-third-row `hidden bash` divider. */
+  const eligibleClaudeBashSummaries = new Set<string>();
+  const CLAUDE_BASH_INITIAL_SUMMARY_GROUPS = 10;
+  // The host proxy allows five minutes so a request can wait behind one
+  // serialized model batch and still finish its own bounded subprocess. Keep a
+  // small client-side grace period, then settle to the deterministic preview
+  // and release the live-latest lane even if a custom adapter never resolves.
+  const CLAUDE_BASH_SUMMARY_TIMEOUT_MS = 305_000;
+  let claudeBashSummaryPolicyMode: ClaudeBashMode = 'off';
+  let claudeBashSummaryBootstrapPending = false;
+  let claudeBashSummaryInFlight = false;
+  let claudeBashSummaryTimeout: ReturnType<typeof setTimeout> | null = null;
+  let pendingClaudeBashInitialBatch: readonly ClaudeBashGroupedSummaryRequest[] | null = null;
+  let pendingLatestClaudeBashSummary: ClaudeBashGroupedSummaryRequest | null = null;
   let requestedClaudeBashSummaryCount = $state(0);
   let settledClaudeBashSummaryCount = $state(0);
   let lastClaudeBashDetectionScanRows = $state(0);
@@ -470,8 +506,19 @@
     intraRowPx: number;
   };
 
-  let bashSummaryRequestByFingerprint = new Map<string, ClaudeBashSummaryRequest>();
+  let bashSummaryRequestByFingerprint = new Map<string, ClaudeBashGroupedSummaryRequest>();
   let activeClaudeBashFingerprints = new Set<string>();
+
+  type ClaudeBashProjectionCause = 'presentation' | 'live' | 'replace' | 'history';
+
+  function syncClaudeBashSummaryPolicyMode(mode: ClaudeBashMode): void {
+    if (mode === claudeBashSummaryPolicyMode) return;
+    claudeBashSummaryPolicyMode = mode;
+    eligibleClaudeBashSummaries.clear();
+    pendingClaudeBashInitialBatch = null;
+    pendingLatestClaudeBashSummary = null;
+    claudeBashSummaryBootstrapPending = mode === 'haiku';
+  }
 
   function publishClaudeBashSummaryDiagnostics(): void {
     requestedClaudeBashSummaryCount = requestedClaudeBashSummaries.size;
@@ -485,6 +532,13 @@
     for (const id of settledClaudeBashSummaries.keys()) {
       if (!activeClaudeBashFingerprints.has(id)) settledClaudeBashSummaries.delete(id);
     }
+    for (const id of eligibleClaudeBashSummaries) {
+      if (!activeClaudeBashFingerprints.has(id)) eligibleClaudeBashSummaries.delete(id);
+    }
+    if (
+      pendingLatestClaudeBashSummary
+      && !activeClaudeBashFingerprints.has(pendingLatestClaudeBashSummary.fingerprint)
+    ) pendingLatestClaudeBashSummary = null;
     publishClaudeBashSummaryDiagnostics();
   }
 
@@ -499,7 +553,7 @@
     return resolvedScreen.alt ? 'alternate' : 'normal';
   }
 
-  function projectionRowAt(visualRow: number): ClaudeBashProjectionRow | null {
+  function projectionRowAt(visualRow: number): ClaudeBashGroupedProjectionRow | null {
     if (bashProjection) return bashProjection.rows[visualRow] ?? null;
     if (visualRow < 0 || visualRow >= rawLines.length) return null;
     return {
@@ -509,14 +563,121 @@
       rawStart: visualRow,
       rawEndExclusive: visualRow + 1,
       rawRange: { startLine: visualRow, endLine: visualRow + 1 },
+      group: null,
       block: null,
       fingerprint: null,
       status: null,
+      summaryState: 'none',
     };
   }
 
   function presentationRowCount(): number {
     return bashProjection?.rows.length ?? rawLines.length;
+  }
+
+  function rebuildPresentationGeometry(): void {
+    if (!bashProjection) {
+      compactBashVisualRows = [];
+      compactBashVisualRowSet = new Set();
+      return;
+    }
+
+    // Walk groups, not every projected row. This preserves the bounded
+    // incremental path for a 10k-row retained buffer and remains correct when
+    // one placeholder spans several adjacent Bash blocks plus separator rows.
+    const compact = new Set<number>();
+    const groups = bashProjection.detectedGroups;
+    for (const group of groups) {
+      const visualRow = bashProjection.rawToVisualRow[group.rawStart];
+      if (visualRow === undefined) continue;
+      const row = bashProjection.rows[visualRow];
+      if (
+        row?.kind === 'bash-placeholder'
+        && (bashProjection.mode === 'hide' || row.summaryState === 'suppressed')
+      ) {
+        compact.add(visualRow);
+      }
+    }
+    compactBashVisualRows = [...compact].sort((a, b) => a - b);
+    compactBashVisualRowSet = compact;
+  }
+
+  function compactRowsBefore(visualBoundary: number): number {
+    let low = 0;
+    let high = compactBashVisualRows.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((compactBashVisualRows[middle] ?? Infinity) < visualBoundary) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
+  function presentationUnitsBefore(visualBoundary: number): number {
+    const bounded = Math.max(0, Math.min(total, Math.floor(visualBoundary)));
+    if (compactBashVisualRows.length === 0) {
+      return bounded * PRESENTATION_UNITS_PER_LINE;
+    }
+    return (
+      bounded * PRESENTATION_UNITS_PER_LINE
+      - compactRowsBefore(bounded) * (PRESENTATION_UNITS_PER_LINE - 1)
+    );
+  }
+
+  function presentationRowTopPx(visualBoundary: number): number {
+    if (compactBashVisualRows.length === 0) {
+      return Math.max(0, Math.min(total, Math.floor(visualBoundary))) * lineH;
+    }
+    return presentationUnitsBefore(visualBoundary) * (lineH / PRESENTATION_UNITS_PER_LINE);
+  }
+
+  function presentationRowHeightPx(visualRow: number): number {
+    return compactBashVisualRowSet.has(visualRow)
+      ? lineH / PRESENTATION_UNITS_PER_LINE
+      : lineH;
+  }
+
+  function presentationContentHeightPx(): number {
+    return presentationRowTopPx(total);
+  }
+
+  /** Visual row containing a presentation-space pixel. Exact boundaries own
+   * the following row, matching floor(scrollTop / lineH) in the uniform path. */
+  function visualRowAtPresentationPixel(pixel: number): number {
+    if (total <= 0) return 0;
+    const boundedPixel = Number.isFinite(pixel) ? Math.max(0, pixel) : 0;
+    if (compactBashVisualRows.length === 0) {
+      return Math.max(0, Math.min(total - 1, Math.floor(boundedPixel / Math.max(1, lineH))));
+    }
+
+    let low = 0;
+    let high = total;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (presentationRowTopPx(middle) <= boundedPixel) low = middle;
+      else high = middle - 1;
+    }
+    return Math.min(total - 1, low);
+  }
+
+  /** First visual boundary at or after a content pixel. This is the
+   * variable-height equivalent of ceil(pixel / lineH), suitable as an
+   * exclusive viewport end. */
+  function visualBoundaryAtOrAfterPresentationPixel(pixel: number): number {
+    if (total <= 0) return 0;
+    const boundedPixel = Number.isFinite(pixel) ? Math.max(0, pixel) : 0;
+    if (compactBashVisualRows.length === 0) {
+      return Math.max(0, Math.min(total, Math.ceil(boundedPixel / Math.max(1, lineH))));
+    }
+
+    let low = 0;
+    let high = total;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (presentationRowTopPx(middle) < boundedPixel) low = middle + 1;
+      else high = middle;
+    }
+    return low;
   }
 
   function visualRowForRaw(rawRow: number): number {
@@ -544,15 +705,12 @@
     const rowCount = presentationRowCount();
     if (!isAwayFromLiveTail() || rowCount === 0) return null;
     const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
-    const visualRow = Math.max(
-      0,
-      Math.min(rowCount - 1, Math.floor(scrollTop / Math.max(1, lineH))),
-    );
+    const visualRow = visualRowAtPresentationPixel(scrollTop);
     const row = projectionRowAt(visualRow);
     if (!row) return null;
     return {
       rowId: archiveOffset + row.rawRange.startLine,
-      intraRowPx: scrollTop - visualRow * lineH,
+      intraRowPx: scrollTop - presentationRowTopPx(visualRow),
     };
   }
 
@@ -563,7 +721,7 @@
     }
     const rawRow = Math.max(0, Math.min(rawLines.length - 1, anchor.rowId - archiveOffset));
     const visualRow = visualRowForRaw(rawRow);
-    const scrollTop = Math.max(0, visualRow * lineH + anchor.intraRowPx);
+    const scrollTop = Math.max(0, presentationRowTopPx(visualRow) + anchor.intraRowPx);
     bottomOffsetPx = Math.max(0, Math.min(maxOffset(), maxOffset() - scrollTop));
   }
 
@@ -625,6 +783,20 @@
       sourceRange: shiftedRange(block.sourceRange),
       commandRange: shiftedRange(block.commandRange),
       outputRange: shiftedRange(block.outputRange),
+    };
+  }
+
+  function shiftedClaudeBashGroup(group: ClaudeBashGroup, offset: number): ClaudeBashGroup {
+    const shiftedBlocks = group.blocks.map((block) => shiftedClaudeBashBlock(block, offset));
+    return {
+      ...group,
+      rawStart: group.rawStart + offset,
+      rawEndExclusive: group.rawEndExclusive + offset,
+      sourceRange: {
+        startLine: group.sourceRange.startLine + offset,
+        endLine: group.sourceRange.endLine + offset,
+      },
+      blocks: shiftedBlocks,
     };
   }
 
@@ -738,6 +910,70 @@
     return entries.map(([id, summary]) => `${id}\u0000${summary}`).join('\u0001');
   }
 
+  function claudeBashEligibilityKey(): string {
+    return [...eligibleClaudeBashSummaries].sort().join('\u0001');
+  }
+
+  function hasClaudeBashSummary(id: string): boolean {
+    if (settledClaudeBashSummaries.get(id)?.trim()) return true;
+    return !!externalClaudeBashSummary(id)?.trim();
+  }
+
+  /** Select model work before projection so core can render every non-selected
+   * group as a compact divider immediately (never a spinner that will not run).
+   * Returns which queue lane should consume the resulting summary requests. */
+  function updateClaudeBashSummaryEligibility(
+    groups: readonly ClaudeBashGroup[],
+    cause: ClaudeBashProjectionCause,
+    changedFromRaw: number | undefined,
+  ): { bootstrap: boolean; liveFingerprint: string | null } {
+    if (normalizedClaudeBashMode() !== 'haiku' || claudeBashScreenMode() !== 'normal') {
+      return { bootstrap: false, liveFingerprint: null };
+    }
+    const completed = groups.filter((group) => group.status === 'completed');
+
+    // Do not consume the cold-start budget when the prop effect runs before the
+    // first pane capture. Once content exists (or the user enters Distill on an
+    // already-open pane), admit only the newest ten completed semantic groups.
+    if (claudeBashSummaryBootstrapPending && completed.length > 0) {
+      for (const group of completed.slice(-CLAUDE_BASH_INITIAL_SUMMARY_GROUPS)) {
+        eligibleClaudeBashSummaries.add(group.fingerprint);
+      }
+      claudeBashSummaryBootstrapPending = false;
+      return { bootstrap: true, liveFingerprint: null };
+    }
+
+    if (cause !== 'live' || changedFromRaw === undefined) {
+      return { bootstrap: false, liveFingerprint: null };
+    }
+    // A coalesced frame may finish several non-adjacent groups. The open-tab
+    // policy deliberately keeps only the newest missing one. A queued-but-not-
+    // dispatched older group becomes a compact divider rather than backlog.
+    const previousCompleted = new Set(
+      (bashProjection?.detectedGroups ?? [])
+        .filter((group) => group.status === 'completed')
+        .map((group) => group.fingerprint),
+    );
+    const newest = completed
+      .filter((group) => (
+        !previousCompleted.has(group.fingerprint)
+        && group.rawEndExclusive >= changedFromRaw
+        && !requestedClaudeBashSummaries.has(group.fingerprint)
+        && !hasClaudeBashSummary(group.fingerprint)
+      ))
+      .at(-1);
+    if (!newest) return { bootstrap: false, liveFingerprint: null };
+
+    if (
+      pendingLatestClaudeBashSummary
+      && !requestedClaudeBashSummaries.has(pendingLatestClaudeBashSummary.fingerprint)
+    ) {
+      eligibleClaudeBashSummaries.delete(pendingLatestClaudeBashSummary.fingerprint);
+    }
+    eligibleClaudeBashSummaries.add(newest.fingerprint);
+    return { bootstrap: false, liveFingerprint: newest.fingerprint };
+  }
+
   function localizedClaudeBashDetection(
     detection: ClaudeBashDetection,
     startLine: number,
@@ -752,10 +988,10 @@
   }
 
   function shiftedClaudeBashProjectionRow(
-    row: ClaudeBashProjectionRow,
+    row: ClaudeBashGroupedProjectionRow,
     rawOffset: number,
     visualOffset: number,
-  ): ClaudeBashProjectionRow {
+  ): ClaudeBashGroupedProjectionRow {
     return {
       ...row,
       visualRow: row.visualRow + visualOffset,
@@ -765,6 +1001,7 @@
         startLine: row.rawRange.startLine + rawOffset,
         endLine: row.rawRange.endLine + rawOffset,
       },
+      group: row.group ? shiftedClaudeBashGroup(row.group, rawOffset) : null,
       block: row.block ? shiftedClaudeBashBlock(row.block, rawOffset) : null,
     };
   }
@@ -775,21 +1012,30 @@
    * conservative full path. */
   function incrementalClaudeBashProjection(
     detection: ClaudeBashDetection,
+    detectedGroups: readonly ClaudeBashGroup[],
     summaries: ClaudeBashSummaries | undefined,
-    summaryKey: string,
+    projectionKey: string,
     changedFromRaw: number | undefined,
-  ): ClaudeBashProjection | null {
+    barrierLines: readonly number[],
+  ): ClaudeBashGroupedProjection | null {
     const previous = bashProjection;
     const startLine = lastClaudeBashProjectionRebuildStart;
     if (
       changedFromRaw === undefined
       || !previous
       || previous.mode !== normalizedClaudeBashMode()
-      || lastClaudeBashProjectionSummaryKey !== summaryKey
+      || lastClaudeBashProjectionSummaryKey !== projectionKey
       || claudeBashScreenMode() !== 'normal'
       || startLine <= 0
       || startLine >= rawLines.length
     ) return null;
+
+    // Grouping is semantic across adjacent blocks. If the bounded suffix seam
+    // lands inside a group, reusing its old prefix placeholder would split one
+    // burst into two rows/requests; take the conservative full projection.
+    if (detectedGroups.some((group) => (
+      group.rawStart < startLine && group.rawEndExclusive > startLine
+    ))) return null;
 
     const retainedBlockCoordinates = new Set(detection.blocks.map((block) =>
       `${block.rawStart}:${block.rawEndExclusive}:${block.fingerprint}`));
@@ -809,10 +1055,16 @@
     if (prefixRawEnd !== startLine) return null;
 
     const suffixRaw = rawLines.slice(startLine);
-    const suffix = projectClaudeBashLines(suffixRaw, {
+    const suffix = projectClaudeBashGroupedLines(suffixRaw, {
       mode: normalizedClaudeBashMode(),
       summaries,
       detection: localizedClaudeBashDetection(detection, startLine),
+      groupingOptions: {
+        barrierLines: barrierLines
+          .filter((line) => line > startLine)
+          .map((line) => line - startLine),
+      },
+      summaryEligibleIds: eligibleClaudeBashSummaries,
     });
     lastClaudeBashProjectionBuildRows = suffixRaw.length;
     const visualOffset = prefixRows.length;
@@ -825,11 +1077,11 @@
     ];
 
     const retainedRequestFingerprints = new Set(
-      detection.blocks
-        .filter((block) => block.rawEndExclusive <= startLine)
-        .map((block) => block.fingerprint),
+      detectedGroups
+        .filter((group) => group.rawEndExclusive <= startLine)
+        .map((group) => group.fingerprint),
     );
-    const summaryRequests: ClaudeBashSummaryRequest[] = [];
+    const summaryRequests: ClaudeBashGroupedSummaryRequest[] = [];
     const requestIds = new Set<string>();
     for (const request of previous.summaryRequests) {
       if (!retainedRequestFingerprints.has(request.fingerprint) || requestIds.has(request.id)) continue;
@@ -853,6 +1105,7 @@
       rawToVisualRow,
       rawToVisual: rawToVisualRow,
       detectedBlocks: detection.blocks,
+      detectedGroups,
       summaryRequests,
     };
   }
@@ -863,8 +1116,11 @@
   function rebuildClaudeBashProjection(
     anchor: PresentationAnchor | null,
     changedFromRaw?: number,
+    cause: ClaudeBashProjectionCause = 'presentation',
   ): void {
-    if (normalizedClaudeBashMode() === 'off') {
+    const mode = normalizedClaudeBashMode();
+    syncClaudeBashSummaryPolicyMode(mode);
+    if (mode === 'off') {
       const changedCoordinateSpace = bashProjection !== null;
       bashProjection = null;
       bashSummaryRequestByFingerprint = new Map();
@@ -876,6 +1132,7 @@
       lastClaudeBashProjectionBuildRows = 0;
       lastClaudeBashProjectionSummaryKey = '';
       total = rawLines.length;
+      rebuildPresentationGeometry();
       if (changedCoordinateSpace) {
         invalidateRenderedCache();
         invalidateSearchOverlayHtml();
@@ -887,38 +1144,57 @@
       return;
     }
     const summaries = mergedClaudeBashSummaries();
-    const summaryKey = claudeBashSummaryKey(summaries);
     const detection = detectionForClaudeBashProjection(changedFromRaw);
+    const barrierLines = claudeBashBarriers();
+    const detectedGroups = groupClaudeBashBlocks(rawLines, detection.blocks, {
+      barrierLines,
+    });
+    const queueSelection = updateClaudeBashSummaryEligibility(
+      detectedGroups,
+      cause,
+      changedFromRaw,
+    );
+    const projectionKey = [
+      claudeBashSummaryKey(summaries),
+      claudeBashEligibilityKey(),
+      barrierLines.join(','),
+    ].join('\u0002');
     // The incremental helper overwrites this with its bounded suffix length
     // when it can safely reuse the immutable prefix.
     lastClaudeBashProjectionBuildRows = rawLines.length;
     bashProjection = incrementalClaudeBashProjection(
       detection,
+      detectedGroups,
       summaries,
-      summaryKey,
+      projectionKey,
       changedFromRaw,
-    ) ?? projectClaudeBashLines(rawLines, {
-      mode: normalizedClaudeBashMode(),
+      barrierLines,
+    ) ?? projectClaudeBashGroupedLines(rawLines, {
+      mode,
       summaries,
       detection,
+      groupingOptions: { barrierLines },
+      summaryEligibleIds: eligibleClaudeBashSummaries,
     });
-    lastClaudeBashProjectionSummaryKey = summaryKey;
+    lastClaudeBashProjectionSummaryKey = projectionKey;
     bashSummaryRequestByFingerprint = new Map(
       bashProjection.summaryRequests.map((request) => [request.fingerprint, request]),
     );
     if (claudeBashScreenMode() === 'normal') {
       activeClaudeBashFingerprints = new Set(
-        bashProjection.detectedBlocks.map((block) => block.fingerprint),
+        bashProjection.detectedGroups.map((group) => group.fingerprint),
       );
       pruneClaudeBashSummaryState();
     }
     total = bashProjection.rows.length;
+    rebuildPresentationGeometry();
     invalidateRenderedCache();
     invalidateSearchOverlayHtml();
     restorePresentationAnchor(anchor);
     const visible = visibleRowRange(bottomOffsetPx);
     winStart = Math.max(0, visible.startIdx - OVERSCAN_ROWS);
     winEnd = Math.min(total, visible.endIdx + OVERSCAN_ROWS);
+    queueClaudeBashSummaryWork(queueSelection);
   }
 
   function returnedClaudeBashSummary(
@@ -933,7 +1209,7 @@
     return record[id] ?? null;
   }
 
-  function fallbackClaudeBashSummary(request: ClaudeBashSummaryRequest): string {
+  function fallbackClaudeBashSummary(request: ClaudeBashGroupedSummaryRequest): string {
     const command = request.command
       .replace(/\u00a0/g, ' ')
       .replace(/\s+/g, ' ')
@@ -957,7 +1233,7 @@
   }
 
   function settleClaudeBashSummaryBatch(
-    requests: readonly ClaudeBashSummaryRequest[],
+    requests: readonly ClaudeBashGroupedSummaryRequest[],
     summaries: ClaudeBashSummaries | void,
   ): void {
     if (destroyed) return;
@@ -981,41 +1257,92 @@
     if (changed) presentSettledClaudeBashSummaries();
   }
 
-  function requestVisibleClaudeBashSummaries(start: number, end: number): void {
-    if (normalizedClaudeBashMode() !== 'haiku') return;
-
-    const requests: ClaudeBashSummaryRequest[] = [];
-    const rowCount = presentationRowCount();
-    const boundedStart = Math.max(0, Math.min(start, rowCount));
-    const boundedEnd = Math.max(boundedStart, Math.min(end, rowCount));
-    for (let visualRow = boundedStart; visualRow < boundedEnd; visualRow += 1) {
-      const row = projectionRowAt(visualRow);
-      if (
-        row?.kind !== 'bash-placeholder'
-        || row.status !== 'completed'
-        || !row.fingerprint
-        || requestedClaudeBashSummaries.has(row.fingerprint)
-      ) continue;
-      const request = bashSummaryRequestByFingerprint.get(row.fingerprint);
-      if (!request) continue;
-      requestedClaudeBashSummaries.add(row.fingerprint);
-      requests.push(request);
+  function dispatchClaudeBashSummaryBatch(
+    candidates: readonly ClaudeBashGroupedSummaryRequest[],
+  ): void {
+    const requests = candidates.filter((request) => (
+      activeClaudeBashFingerprints.has(request.fingerprint)
+      && !requestedClaudeBashSummaries.has(request.fingerprint)
+    ));
+    if (requests.length === 0) {
+      pumpClaudeBashSummaryQueue();
+      return;
     }
-    if (requests.length === 0) return;
+    claudeBashSummaryInFlight = true;
+    for (const request of requests) requestedClaudeBashSummaries.add(request.fingerprint);
     publishClaudeBashSummaryDiagnostics();
+
+    let finished = false;
+    const finish = (summaries: ClaudeBashSummaries | void): void => {
+      if (finished) return;
+      finished = true;
+      if (claudeBashSummaryTimeout !== null) {
+        clearTimeout(claudeBashSummaryTimeout);
+        claudeBashSummaryTimeout = null;
+      }
+      if (destroyed) return;
+      claudeBashSummaryInFlight = false;
+      settleClaudeBashSummaryBatch(requests, summaries);
+      pumpClaudeBashSummaryQueue();
+    };
+    claudeBashSummaryTimeout = setTimeout(
+      () => finish(undefined),
+      CLAUDE_BASH_SUMMARY_TIMEOUT_MS,
+    );
     if (typeof onClaudeBashSummaryRequest !== 'function') {
-      Promise.resolve().then(() => settleClaudeBashSummaryBatch(requests, undefined));
+      Promise.resolve().then(() => finish(undefined));
       return;
     }
     try {
       const result = onClaudeBashSummaryRequest(requests);
       Promise.resolve(result).then(
-        (summaries) => settleClaudeBashSummaryBatch(requests, summaries),
-        () => settleClaudeBashSummaryBatch(requests, undefined),
+        (summaries) => finish(summaries),
+        () => finish(undefined),
       );
     } catch {
-      Promise.resolve().then(() => settleClaudeBashSummaryBatch(requests, undefined));
+      Promise.resolve().then(() => finish(undefined));
     }
+  }
+
+  /** One serial lane keeps a cold batch and live tail work deterministic. While
+   * a request is in flight, repeated live frames replace the waiting tail item
+   * instead of building a model backlog. */
+  function pumpClaudeBashSummaryQueue(): void {
+    if (
+      destroyed
+      || claudeBashSummaryInFlight
+      || normalizedClaudeBashMode() !== 'haiku'
+      || claudeBashScreenMode() !== 'normal'
+    ) return;
+
+    if (pendingClaudeBashInitialBatch) {
+      const batch = pendingClaudeBashInitialBatch;
+      pendingClaudeBashInitialBatch = null;
+      dispatchClaudeBashSummaryBatch(batch);
+      return;
+    }
+    if (pendingLatestClaudeBashSummary) {
+      const latest = pendingLatestClaudeBashSummary;
+      pendingLatestClaudeBashSummary = null;
+      dispatchClaudeBashSummaryBatch([latest]);
+    }
+  }
+
+  function queueClaudeBashSummaryWork(selection: {
+    bootstrap: boolean;
+    liveFingerprint: string | null;
+  }): void {
+    if (normalizedClaudeBashMode() !== 'haiku') return;
+    if (selection.bootstrap) {
+      pendingClaudeBashInitialBatch = bashProjection?.summaryRequests
+        .filter((request) => eligibleClaudeBashSummaries.has(request.fingerprint))
+        .slice(-CLAUDE_BASH_INITIAL_SUMMARY_GROUPS) ?? [];
+    }
+    if (selection.liveFingerprint) {
+      const latest = bashSummaryRequestByFingerprint.get(selection.liveFingerprint);
+      if (latest) pendingLatestClaudeBashSummary = latest;
+    }
+    pumpClaudeBashSummaryQueue();
   }
 
   function visualRowKey(visualRow: number): string {
@@ -1265,7 +1592,9 @@
     requestSearchPresentation();
   }
 
-  function placeholderSearchKind(row: ClaudeBashProjectionRow): 'search-match' | 'search-active' | null {
+  function placeholderSearchKind(
+    row: ClaudeBashGroupedProjectionRow,
+  ): 'search-match' | 'search-active' | null {
     let matched = false;
     for (let rawRow = row.rawRange.startLine; rawRow < row.rawRange.endLine; rawRow += 1) {
       const ranges = searchLineByIndex.get(rawRow);
@@ -1343,7 +1672,7 @@
   }
 
   function maxOffset(): number {
-    return Math.max(0, total * lineH - Math.max(1, viewH));
+    return Math.max(0, presentationContentHeightPx() - Math.max(1, viewH));
   }
 
   /** Preserve an off-bottom row's physical screen position across layout.
@@ -1861,7 +2190,7 @@
     rawLines.splice(from, evicted);
     linksByLine.splice(from, evicted);
     reindexSparseAfterRemoval(from, evicted, liveGapEntryState);
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor);
+    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - evicted * lineH);
@@ -1888,7 +2217,7 @@
       if (gapRowIndex < count) clearRetentionGap();
       else gapRowIndex -= count;
     }
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor);
+    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       winStart = Math.max(0, winStart - count);
@@ -1912,7 +2241,7 @@
     reindexSparseAfterRemoval(seam, bounded, liveGapEntryState);
     if (liveLines.length > 0) recordRetentionGap(seam, bounded);
     else clearRetentionGap();
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor);
+    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
@@ -1940,7 +2269,7 @@
       gapRowIndex = start;
       gapRowCount = bounded;
     } else clearRetentionGap();
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor);
+    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
@@ -2146,6 +2475,9 @@
   function commitLines(next: string[], opts: {
     followTail: boolean;
     source: LinesChangeMeta['source'];
+    /** A structural archive detach carries a live host cause but must not be
+     * mistaken for newly completed shell work by the presentation queue. */
+    projectionCause?: ClaudeBashProjectionCause;
     /** Sliding archive ownership enforces its own combined archive/live
      * budget. The legacy middle-gap retention algorithm must not mutate the
      * pure absolute window behind its back. */
@@ -2171,9 +2503,14 @@
     const linesChanged = rawLines.length !== next.length || common !== minLen;
 
     rawLines = next;
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, common);
+    if (projectBash) rebuildClaudeBashProjection(
+      presentationAnchor,
+      common,
+      opts.projectionCause ?? (opts.source === 'live' ? 'live' : 'replace'),
+    );
     else {
       bashProjection = null;
+      rebuildPresentationGeometry();
       cachedClaudeBashDetection = null;
       cachedClaudeBashDetectionRawLength = 0;
       cachedClaudeBashDetectionScreenMode = null;
@@ -2300,12 +2637,24 @@
     // here or the command's final output can stay invisible under the match.
     stopInertia();
     flushPendingContent();
-    bottomOffsetPx = searchJumpBottomOffset({
-      line: visualRowForRaw(line),
-      total,
-      lineH,
-      viewH,
-    });
+    const visualRow = visualRowForRaw(line);
+    if (compactBashVisualRows.length === 0) {
+      bottomOffsetPx = searchJumpBottomOffset({
+        line: visualRow,
+        total,
+        lineH,
+        viewH,
+      });
+    } else {
+      const mo = maxOffset();
+      const rowTop = presentationRowTopPx(visualRow);
+      const rowHeight = presentationRowHeightPx(visualRow);
+      const targetScrollTop = Math.max(
+        0,
+        Math.min(rowTop - (viewH / 2 - rowHeight / 2), mo),
+      );
+      bottomOffsetPx = Math.max(0, Math.min(mo - targetScrollTop, mo));
+    }
     applyScroll();
   }
 
@@ -2452,6 +2801,7 @@
   function clearSlidingArchiveAtBoundary(liveStartLine: number, resetReader: boolean): void {
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
+    detachedLiveProjectionPending = false;
     archivedLines = [];
     archiveBeforeLine = null;
     archiveExhausted = false;
@@ -2473,6 +2823,7 @@
     commitLines([...archivedLines], {
       followTail: false,
       source: 'live',
+      projectionCause: 'history',
       enforceRetention: false,
     });
     bottomOffsetPx = Math.max(0, Math.min(maxOffset(), maxOffset() - readerScrollTop));
@@ -2495,8 +2846,9 @@
     if (!archiveWindow || historyWindowEndLine(archiveWindow) !== previousLiveStart) return false;
     const crossed = nextLiveStart - previousLiveStart;
     if (crossed <= 0 || crossed > liveLines.length) return false;
-    const visible = visibleRowRange(bottomOffsetPx);
-    if (visible.endIdx <= archiveWindow.lines.length) return false;
+    const visible = strictVisibleRowRange(bottomOffsetPx);
+    const visibleRaw = rawRangeForVisualWindow(visible.startIdx, visible.endIdx);
+    if (visibleRaw.end <= archiveWindow.lines.length) return false;
     const promoted = liveLines.slice(0, crossed);
     try {
       archiveWindow = createHistoryWindow({
@@ -2531,6 +2883,20 @@
     if (previous && previous.generation !== boundary.generation) {
       // ws-mux only accepts a generation switch on a resync full. Absolute row
       // identities from the old WAL lane are meaningless in the new one.
+      cancelScheduledPrependWork();
+      pendingPrependWork = null;
+      prependParseSeq++;
+      if (archiveRequestActive && archiveInflightRequestId !== null) {
+        try {
+          tmuxMux.recoverHistoryRequest(archiveInflightSession ?? session);
+        } catch {
+          // The generation reset still owns the local fence even if socket
+          // recovery throws after detaching the abandoned transport.
+        }
+      }
+      if (archiveInflightRequestId !== null || archiveLoading) {
+        finishArchiveRequest('malformed');
+      }
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
@@ -2566,6 +2932,7 @@
       // bounded fresh live suffix offscreen; repainting it must not change
       // total/maxOffset, cursor visibility, search, selection, or the anchor.
       liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
+      detachedLiveProjectionPending = true;
       return;
     }
 
@@ -2605,6 +2972,7 @@
       source,
       enforceRetention: historyPaging !== 'sliding' || archiveWindow === null,
     });
+    detachedLiveProjectionPending = false;
     if (historyPaging === 'sliding' && archiveWindow === null) {
       // Legacy live-only retention may report a client ceiling at exactly
       // 10k. Sliding mode can still page by replacing the opposite archive
@@ -2906,7 +3274,7 @@
 
     archiveOffset -= lineCount;
     if (gapRowIndex >= 0) gapRowIndex += lineCount;
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor);
+    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       winStart += lineCount;
@@ -2980,7 +3348,11 @@
       markHistoryCeiling();
       rebuildAllLinks();
       rebuildFrom(0);
-      if (projectBash) rebuildClaudeBashProjection(capturePresentationAnchor());
+      if (projectBash) rebuildClaudeBashProjection(
+        capturePresentationAnchor(),
+        undefined,
+        'history',
+      );
       else total = rawLines.length;
       rebuildWindow(visibleRowRange(bottomOffsetPx));
       contentEpoch++;
@@ -3133,6 +3505,7 @@
     live: string[];
     livePrefixDropped: number;
     entryState: SgrState;
+    liveEntryState: SgrState | null;
   } | null {
     if (history.startLine === null || history.lines.length === 0) return null;
 
@@ -3178,6 +3551,20 @@
       for (let index = 0; index < keepFrom; index++) {
         lineToHtml(history.lines[index] ?? '', entryState, palette);
       }
+      let liveEntryState: SgrState | null = null;
+      if (livePrefixDropped > 0 && live.length > 0) {
+        // `entryState` is the state before the retained archive. Replay only
+        // the bounded resident archive and the evicted live prefix to preserve
+        // the exact SGR state at the archive/live gap without storing either
+        // missing live rows or per-row render state.
+        liveEntryState = cloneSgrState(entryState);
+        for (let index = keepFrom; index < history.lines.length; index++) {
+          lineToHtml(history.lines[index] ?? '', liveEntryState, palette);
+        }
+        for (let index = 0; index < livePrefixDropped; index++) {
+          lineToHtml(liveLines[index] ?? '', liveEntryState, palette);
+        }
+      }
       return {
         state: createHistoryWindow({
           startLine: history.startLine + keepFrom,
@@ -3193,6 +3580,7 @@
         live,
         livePrefixDropped,
         entryState,
+        liveEntryState,
       };
     } catch {
       return null;
@@ -3205,11 +3593,21 @@
     scrollTop: number;
   } {
     const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
-    const centerIndex = Math.floor((scrollTop + Math.max(0, viewH / 2)) / Math.max(1, lineH));
-    const anchorIndex = Math.max(0, Math.min(state.lines.length - 1, centerIndex));
-    const visible = visibleRowRange(bottomOffsetPx);
-    let protectedStart = Math.max(0, Math.min(state.lines.length - 1, visible.startIdx));
-    let protectedEnd = Math.max(protectedStart + 1, Math.min(state.lines.length, visible.endIdx));
+    const centerVisual = visualRowAtPresentationPixel(
+      scrollTop + Math.max(0, viewH / 2),
+    );
+    const centerRow = projectionRowAt(centerVisual);
+    const anchorIndex = Math.max(0, Math.min(
+      state.lines.length - 1,
+      centerRow?.rawRange.startLine ?? 0,
+    ));
+    const visible = strictVisibleRowRange(bottomOffsetPx);
+    const visibleRaw = rawRangeForVisualWindow(visible.startIdx, visible.endIdx);
+    let protectedStart = Math.max(0, Math.min(state.lines.length - 1, visibleRaw.start));
+    let protectedEnd = Math.max(
+      protectedStart + 1,
+      Math.min(state.lines.length, visibleRaw.end),
+    );
     if (anchorIndex < protectedStart || anchorIndex >= protectedEnd) {
       protectedStart = anchorIndex;
       protectedEnd = anchorIndex + 1;
@@ -3217,7 +3615,7 @@
     return {
       anchor: {
         line: state.startLine + anchorIndex,
-        viewportOffsetPx: anchorIndex * lineH - scrollTop,
+        viewportOffsetPx: presentationRowTopPx(visualRowForRaw(anchorIndex)) - scrollTop,
       },
       protectedRange: {
         startLine: state.startLine + protectedStart,
@@ -3236,6 +3634,10 @@
       acceptedLineCount: number;
       live?: string[];
       entryState?: SgrState;
+      /** Count and exact renderer state for live rows sacrificed while first
+       * seeding a full retention window beside a non-empty archive page. */
+      liveGapRows?: number;
+      liveEntryState?: SgrState | null;
       nextScrollTop?: number;
       gapBeforeRows?: number;
     },
@@ -3262,6 +3664,7 @@
       : null;
     const previousWindowStart = archiveWindow?.startLine ?? null;
     const previousArchiveOffset = archiveOffset;
+    const wasDetached = archiveWindow !== null && !archiveWindowAttachedToLive;
     archiveWindow = state;
     archiveWindowAttachedToLive = !state.hasNewer;
     archiveBeforeLine = state.startLine;
@@ -3291,6 +3694,14 @@
     if ((options.gapBeforeRows ?? 0) > 0) {
       recordRetentionGap(0, options.gapBeforeRows ?? 0);
     }
+    if (
+      (options.liveGapRows ?? 0) > 0
+      && archiveWindowAttachedToLive
+      && liveLines.length > 0
+    ) {
+      liveGapEntryState = cloneSgrState(options.liveEntryState ?? createSgrState());
+      recordRetentionGap(archivedLines.length, options.liveGapRows ?? 0);
+    }
     rawEntryState = cloneSgrState(options.entryState ?? createSgrState());
     htmlCache = new Map();
     renderEntryStates = new Map();
@@ -3300,7 +3711,26 @@
 
     let preservedProjectedCorridor = false;
     if (projectBash) {
-      rebuildClaudeBashProjection(presentationAnchor);
+      const reattachingPendingLive = (
+        wasDetached
+        && archiveWindowAttachedToLive
+        && detachedLiveProjectionPending
+        && liveLines.length > 0
+      );
+      if (reattachingPendingLive) {
+        // Archive pages may have shifted both raw edges, so force a complete
+        // detector rebuild. Keep the previous projection alive just long
+        // enough for live-latest eligibility to distinguish the newly visible
+        // completed group from historical backlog.
+        cachedClaudeBashDetection = null;
+        cachedClaudeBashDetectionRawLength = 0;
+        cachedClaudeBashDetectionScreenMode = null;
+        cachedClaudeBashBarrierKey = '';
+        lastClaudeBashProjectionRebuildStart = 0;
+        rebuildClaudeBashProjection(presentationAnchor, archivedLines.length, 'live');
+      } else {
+        rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
+      }
       if (
         previousWindowFirstRawId !== null
         && previousWindowEndRawId !== null
@@ -3326,6 +3756,14 @@
         }
       }
     } else {
+      bashProjection = null;
+      rebuildPresentationGeometry();
+      cachedClaudeBashDetection = null;
+      cachedClaudeBashDetectionRawLength = 0;
+      cachedClaudeBashDetectionScreenMode = null;
+      cachedClaudeBashBarrierKey = '';
+      lastClaudeBashDetectionScanRows = 0;
+      lastClaudeBashProjectionBuildRows = 0;
       total = rawLines.length;
       const nextScrollTop = Math.max(0, Math.min(
         maxOffset(),
@@ -3333,6 +3771,7 @@
       ));
       bottomOffsetPx = Math.max(0, maxOffset() - nextScrollTop);
     }
+    if (archiveWindowAttachedToLive) detachedLiveProjectionPending = false;
     if (!preservedProjectedCorridor) {
       rebuildWindow(visibleRowRange(bottomOffsetPx), true);
     }
@@ -3410,6 +3849,8 @@
         acceptedLineCount: seeded.state.lines.length,
         live: seeded.live,
         entryState: seeded.entryState,
+        liveGapRows: seeded.livePrefixDropped,
+        liveEntryState: seeded.liveEntryState,
       });
       return;
     }
@@ -3711,12 +4152,22 @@
 
   type VisibleRowRange = { startIdx: number; endIdx: number };
 
-  function visibleRowRange(bottomOffset: number): VisibleRowRange {
+  function strictVisibleRowRange(bottomOffset: number): VisibleRowRange {
     const mo = maxOffset();
     const scrollTop = mo - Math.max(0, Math.min(bottomOffset, mo));
+    const startIdx = total > 0 ? visualRowAtPresentationPixel(scrollTop) : 0;
+    const endIdx = visualBoundaryAtOrAfterPresentationPixel(scrollTop + viewH);
     return {
-      endIdx: Math.min(total, Math.ceil((scrollTop + viewH) / lineH) + 1),
-      startIdx: Math.max(0, Math.floor(scrollTop / lineH) - 1),
+      startIdx: Math.max(0, Math.min(total, startIdx)),
+      endIdx: Math.max(startIdx, Math.min(total, endIdx)),
+    };
+  }
+
+  function visibleRowRange(bottomOffset: number): VisibleRowRange {
+    const strict = strictVisibleRowRange(bottomOffset);
+    return {
+      endIdx: Math.min(total, strict.endIdx + 1),
+      startIdx: Math.max(0, strict.startIdx - 1),
     };
   }
 
@@ -3769,16 +4220,12 @@
     const scrollTop = mo - Math.max(0, Math.min(clamped, mo));
     const overshoot = clamped < 0 ? clamped : clamped > mo ? clamped - mo : 0;
 
-    const strictVisibleStart = Math.max(0, Math.floor(scrollTop / lineH));
-    const strictVisibleEnd = Math.min(total, Math.ceil((scrollTop + viewH) / lineH));
-    // A touch drag, fling, or spring can cross dozens of blocks which the
-    // reader never stops on. Model work belongs to the settled viewport only;
-    // every settle path calls applyScroll again after busy() becomes false.
-    if (!busy()) {
-      requestVisibleClaudeBashSummaries(strictVisibleStart, strictVisibleEnd);
-    }
-    // Rendering keeps one guard row on each side to avoid clipped glyph ink;
-    // model work uses the strict range above and never follows these guards.
+    const strictVisible = strictVisibleRowRange(clamped);
+    const strictVisibleStart = strictVisible.startIdx;
+    const strictVisibleEnd = strictVisible.endIdx;
+    // Rendering keeps one guard row on each side to avoid clipped glyph ink.
+    // Distill scheduling is lifecycle/live-event based and deliberately never
+    // follows scrolling through the virtual window.
     const endIdx = Math.min(total, strictVisibleEnd + 1);
     const startIdx = Math.max(0, strictVisibleStart - 1);
 
@@ -3812,7 +4259,7 @@
     }
 
     if (layerEl) {
-      const y = winStart * lineH - scrollTop - (overshoot * 0.35);
+      const y = presentationRowTopPx(winStart) - scrollTop - (overshoot * 0.35);
       layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
     }
     emitScrollState();
@@ -4640,6 +5087,7 @@
     prependParseSeq++;
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
+    detachedLiveProjectionPending = false;
     if (archivedLines.length === 0) return;
     archivedLines = [];
     rawLines = liveLines.slice();
@@ -4804,6 +5252,10 @@
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
     }
+    if (claudeBashSummaryTimeout !== null) {
+      clearTimeout(claudeBashSummaryTimeout);
+      claudeBashSummaryTimeout = null;
+    }
     if (unsubscribe) unsubscribe();
     resizeObs?.disconnect();
     observedVisualViewport?.removeEventListener('resize', refreshAltTouchHitArea);
@@ -4891,6 +5343,7 @@
   data-testid="mtv"
   data-total={total}
   data-raw-total={rawLines.length}
+  data-presentation-height={presentationContentHeightPx()}
   data-claude-bash-mode={normalizedClaudeBashMode()}
   data-claude-bash-detection-scan-rows={lastClaudeBashDetectionScanRows}
   data-claude-bash-projection-build-rows={lastClaudeBashProjectionBuildRows}
@@ -4968,40 +5421,65 @@
         {@const projectionRow = projectionRowAt(visualRow)}
         {@const rawLineIdx = projectionRow?.rawRange.startLine ?? rawLines.length}
         {@const droppedRows = retentionGapRowsAt(rawLineIdx, contentEpoch)}
+        {@const presentationTop = presentationRowTopPx(visualRow) - presentationRowTopPx(winStart)}
+        {@const presentationHeight = presentationRowHeightPx(visualRow)}
+        {@const compactBash = compactBashVisualRowSet.has(visualRow)}
+        {@const bashSearchKind = compactBash && projectionRow
+          ? placeholderSearchKind(projectionRow)
+          : null}
         {#if droppedRows > 0}<span
             class="mtv-gap-marker"
             role="note"
             aria-label={`${droppedRows} rows dropped before this row`}
             data-gap-marker-rows={droppedRows}
-            style:top={`${i * lineH}px`}
+            style:top={`${presentationTop}px`}
+            style:height={`${presentationHeight}px`}
           ></span>{/if}
         <div
           class="mtv-line"
           class:mtv-gap={droppedRows > 0}
           class:mtv-bash-placeholder={projectionRow?.kind === 'bash-placeholder'}
+          class:mtv-bash-hidden={compactBash}
           data-line-id={archiveOffset + rawLineIdx}
           data-visual-row={visualRow}
           data-raw-start={projectionRow?.rawRange.startLine}
           data-raw-end={projectionRow?.rawRange.endLine}
+          data-presentation-top={presentationRowTopPx(visualRow)}
+          data-presentation-height={presentationHeight}
           data-bash-id={projectionRow?.fingerprint ?? undefined}
           data-bash-status={projectionRow?.status ?? undefined}
           data-gap-rows={droppedRows > 0 ? droppedRows : undefined}
           title={droppedRows > 0 ? `${droppedRows} rows dropped before this row` : undefined}
-        >{@html cachedLineHtml(visualRow, contentEpoch)}</div>
+          style:height={`${presentationHeight}px`}
+          style:line-height={`${presentationHeight}px`}
+        >{#if compactBash && projectionRow}<span
+              class={`mtv-bash-divider ${bashSearchKind ?? ''}`}
+              role="note"
+              aria-label={projectionRow.status === 'active'
+                ? `hidden bash, running, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
+                : `hidden bash, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
+              title={projectionRow.status === 'active'
+                ? 'hidden bash · running'
+                : `hidden bash · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
+            ><span class="mtv-bash-divider-label">hidden bash</span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
     {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
       {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
       {@const cvisual = visualRowForRaw(cline)}
-      {#if cline >= 0 && cvisual >= winStart && cvisual < winEnd + (cursor.row < 0 ? -cursor.row : 0)}
+      {@const cursorProjectionRow = projectionRowAt(cvisual)}
+      {#if cline >= 0
+        && cursorProjectionRow?.kind !== 'bash-placeholder'
+        && cvisual >= winStart
+        && cvisual < winEnd + (cursor.row < 0 ? -cursor.row : 0)}
         <!-- negative row = caret on a blank row BELOW the last content line;
              the overlay is pixel-positioned, so it renders fine past the last
              DOM row (a bottom-clipped caret just stays hidden, never wrong) -->
         {@const cpos = cursorPos(cline, cursor.col)}
         <div
           class="mtv-cursor"
-          style:top={`${(cvisual - winStart) * lineH}px`}
+          style:top={`${presentationRowTopPx(cvisual) - presentationRowTopPx(winStart)}px`}
           style:left={`${6 + cpos.left}px`}
           style:width={`${Math.max(2, cpos.width)}px`}
           style:height={`${lineH}px`}
@@ -5115,6 +5593,50 @@
        rows shoved the tail ~90px below the fold. height beats glyph extents. */
     height: var(--mtv-lineh);
     line-height: var(--mtv-lineh);
+  }
+  /* Hide mode is a true one-third-row separator, not a full terminal row with
+     smaller ink. The virtual geometry uses the same fractional height, so the
+     following terminal row starts immediately after this box with no phantom
+     whitespace. Haiku placeholders deliberately keep the normal row style. */
+  .mtv-line.mtv-bash-hidden {
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    overflow: hidden;
+    color: #4ade80;
+  }
+  .mtv-bash-divider {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    color: inherit;
+    font: 500 max(6px, calc(var(--mtv-lineh) * 0.29)) / 1 var(--font-mono, ui-monospace, monospace);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .mtv-bash-divider::before,
+  .mtv-bash-divider::after {
+    content: '';
+    height: 1px;
+    min-width: 8px;
+    flex: 1 1 auto;
+    background: currentColor;
+    opacity: 0.72;
+  }
+  .mtv-bash-divider-label {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    opacity: 0.82;
+  }
+  .mtv-bash-divider.search-match {
+    background: rgba(74, 222, 128, 0.14);
+  }
+  .mtv-bash-divider.search-active {
+    background: rgba(250, 224, 66, 0.24);
+    outline: 1px solid rgba(250, 224, 66, 0.42);
+    outline-offset: -1px;
   }
   /*
    * Dual-width cells (CJK / fullwidth / emoji / EAW=W dingbats / base+FE0F).

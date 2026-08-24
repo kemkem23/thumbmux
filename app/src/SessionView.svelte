@@ -26,6 +26,7 @@
     createLocalPrefs,
     tmuxMux,
     type FabAction,
+    type FabActionFlyout,
   } from '@thumbmux/svelte';
   import { onMount } from 'svelte';
   import {
@@ -238,9 +239,8 @@
     savePrefs({ shortcuts: next });
   }
 
-  function cycleClaudeBashMode(): void {
-    const index = CLAUDE_BASH_MODES.indexOf(claudeBashMode);
-    claudeBashMode = CLAUDE_BASH_MODES[(index + 1) % CLAUDE_BASH_MODES.length] ?? 'off';
+  function setClaudeBashMode(mode: ClaudeBashMode): void {
+    claudeBashMode = mode;
     savePrefs({ claudeBashMode });
   }
 
@@ -589,11 +589,16 @@
       },
       ...(sessionAgent === 'claude' ? [{
         id: 'bash-mode',
-        label: `Bash: ${claudeBashMode.toUpperCase()}`,
+        label: 'BASH',
+        tag: claudeBashMode === 'off'
+          ? 'SHOW'
+          : claudeBashMode === 'hide'
+            ? 'HIDE'
+            : 'DISTILL',
         testid: 'demo-bash-mode',
-        // Keep the menu open so OFF → HIDE → HAIKU can be compared in
-        // place, like the stock repeated-tap font controls.
-        onTap: cycleClaudeBashMode,
+        // The matching flyout is passed separately so the frozen FabAction
+        // adapter type remains byte-compatible with existing hosts.
+        onTap: () => {},
       }] satisfies FabAction[] : []),
       {
         id: 'shortcuts',
@@ -646,6 +651,38 @@
       return dismissingHostAction(action);
     });
   });
+
+  let actionFlyouts = $derived.by((): FabActionFlyout[] => (
+    sessionAgent === 'claude'
+      ? [{
+        actionId: 'bash-mode',
+        ariaLabel: 'Bash display mode',
+        choices: [
+          {
+            id: 'bash-show',
+            label: 'SHOW',
+            testid: 'demo-bash-show',
+            selected: claudeBashMode === 'off',
+            onTap: () => setClaudeBashMode('off'),
+          },
+          {
+            id: 'bash-hide',
+            label: 'HIDE',
+            testid: 'demo-bash-hide',
+            selected: claudeBashMode === 'hide',
+            onTap: () => setClaudeBashMode('hide'),
+          },
+          {
+            id: 'bash-distill',
+            label: 'DISTILL',
+            testid: 'demo-bash-distill',
+            selected: claudeBashMode === 'haiku',
+            onTap: () => setClaudeBashMode('haiku'),
+          },
+        ],
+      }]
+      : []
+  ));
 
   let noteRequest = 0;
   $effect(() => {
@@ -905,6 +942,7 @@
         || (adapters.extraOverlayOpen?.() ?? false)
     }
     {actions}
+    flyouts={actionFlyouts}
     {onFab}
     fabAria={labels.fabAria}
   />

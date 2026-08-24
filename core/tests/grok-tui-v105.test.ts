@@ -71,8 +71,8 @@ function submitted(text: string, extra: string[] = []): string[] {
   return [echo(text), thought(), ...extra, "GROK_REPLY", "Turn completed in 4.1s."];
 }
 
-const LIVE_QUERY =
-  "tthumbmux's recent prompt display engine is not working properly. please use exec skill to spawn 100 grok to fix and test every possible case. and fix it till perfect. then deploy";
+const SYNTHETIC_QUERY =
+  "thumbmux's recent prompt display engine should preserve submitted prompts while excluding changing status chrome";
 
 const CASES: Case[] = [
   // ── A. empty composer + status chrome must never become a prompt (1–20)
@@ -99,11 +99,11 @@ const CASES: Case[] = [
 
   // ── B. submitted prompts must survive (21–40)
   { id: "B01", title: "short english submitted", pane: pane([...submitted("fix the scanner"), "❯", grokStatus()]), expected: ["fix the scanner"] },
-  { id: "B02", title: "live user query", pane: pane([...submitted(LIVE_QUERY), "❯", grokStatus()]), expected: [LIVE_QUERY] },
+  { id: "B02", title: "synthetic user query", pane: pane([...submitted(SYNTHETIC_QUERY), "❯", grokStatus()]), expected: [SYNTHETIC_QUERY] },
   { id: "B03", title: "thai submitted", pane: pane([...submitted("แก้ให้ recent prompt แสดงถูกต้อง"), "❯", grokStatus()]), expected: ["แก้ให้ recent prompt แสดงถูกต้อง"] },
   { id: "B04", title: "mixed thai+english", pane: pane([...submitted("ใช้ skill exec ยิง grok 10 ตัวไปช่วยกันวิเคราะห์ได้นะ"), "❯", grokStatus()]), expected: ["ใช้ skill exec ยิง grok 10 ตัวไปช่วยกันวิเคราะห์ได้นะ"] },
   { id: "B05", title: "emoji in prompt", pane: pane([...submitted("ship it 🚀 then deploy"), "❯", grokStatus()]), expected: ["ship it 🚀 then deploy"] },
-  { id: "B06", title: "url in prompt", pane: pane([...submitted("open https://kemcortex.tail37fdd9.ts.net/m/t/grok-1"), "❯", grokStatus()]), expected: ["open https://kemcortex.tail37fdd9.ts.net/m/t/grok-1"] },
+  { id: "B06", title: "url in prompt", pane: pane([...submitted("open https://terminal.example.test/m/t/grok-1"), "❯", grokStatus()]), expected: ["open https://terminal.example.test/m/t/grok-1"] },
   { id: "B07", title: "two submitted keep recency", pane: pane([
     ...submitted("first task here"),
     ...submitted("second task here"),
@@ -306,7 +306,7 @@ const CASES: Case[] = [
     "❯", grokStatus(),
   ]), expected: ["run the scan"] },
   { id: "E12", title: "shell launch banner is not a prompt", pane: pane([
-    "kemkem23@kemcortex:~/kemcortex/cortex-orchestrator$ systemd-run --user grok",
+    "dev@example-host:~/workspace/project$ systemd-run --user grok",
     "Signing in… starting your session.",
     "❯", grokStatus(),
   ]), expected: [] },
@@ -372,11 +372,11 @@ const CASES: Case[] = [
     "❯", grokStatus(),
   ]), expected: ["indent0 with clock xx"] },
   { id: "F10", title: "live mixed: query kept, status dropped", pane: pane([
-    echo(LIVE_QUERY),
+    echo(SYNTHETIC_QUERY),
     thought("4.8s"),
     "┃Looking at SessionView",
     "❯", grokStatus({ ansi: true, used: "86K", pct: "17%" }),
-  ]), expected: [LIVE_QUERY] },
+  ]), expected: [SYNTHETIC_QUERY] },
 ];
 
 describe("isGrokStatusLine", () => {
@@ -448,7 +448,7 @@ describe("Grok Build TUI v1.0.5 — 100 pane cases through both scan APIs", () =
   });
 });
 
-describe("live Grok 4.6 pane captured 2026-08-21", () => {
+describe("synthetic Grok 4.6 pane with the measured v1.0.5 shape", () => {
   test("keeps the submitted user query and drops every status snapshot", async () => {
     const content = await readFile(
       join(import.meta.dir, "fixtures/panes/grok-tui-v105-live.txt"),

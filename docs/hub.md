@@ -172,6 +172,11 @@ terminal view, wire the shipped
 live viewing still works but `history_expand` returns an empty page. The archive
 does not turn `SessionThumb` into a deep-history viewer.
 
+An archive that exists but temporarily cannot read is different from an absent
+archive: the mux sends the correlated retryable
+`history_temporarily_unavailable` error, not a false empty page. The bundled
+viewer retains the same absolute cursor and may retry after that settlement.
+
 A full viewer that requests both older and newer archive pages must serialize
 those requests per session on the shared WebSocket: the current `history` reply
 identifies the session but carries no direction marker or request token. An

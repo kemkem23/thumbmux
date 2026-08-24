@@ -36,6 +36,28 @@ const retention = new RetentionLane({
 retention.start();
 ```
 
+## A stronger boundary: direct PTY durability after T0
+
+The polling lane above is deliberately honest about its limit: tmux's history
+ring is the buffer between captures, so a sufficiently large burst can outrun
+it. A host that must preserve every byte from a declared point onward can place
+the child process behind thumbmux's direct PTY WAL proxy instead.
+
+That guarantee begins at an explicit cutover boundary, **T0**, only after the
+host has fenced input, verified the immutable logical instance and exact
+physical pane, and sealed the legacy polling archive. After activation, the
+proxy appends an ordered, checksummed record and syncs it before forwarding the
+corresponding child output for display. A supervised replay worker then rebuilds
+the terminal through a single-writer lease and publishes atomic checkpoints
+identified by both WAL sequence and byte offset.
+
+Recovery is exact rather than best-effort: a restart resumes from the persisted
+sequence/offset, and a conflicting writer, overshoot, identity drift, corrupt
+record, or unverifiable checkpoint fails closed instead of silently advancing
+the history. The host still owns the cutover journal, process restart ordering,
+storage durability, retention policy, and cleanup. Nothing in this lane can
+reconstruct output that was already missing before T0.
+
 ## What it stores, and where it stops
 
 `capture-pane` returns scrollback followed by the visible screen, and **only the
@@ -110,11 +132,13 @@ to answer a question nobody asked yet.
 
 ## What it cannot do
 
-- **A burst larger than tmux's ring.** If 60,000 lines are printed between two
-  captures and tmux keeps 50,000, the overflow is gone; no polling archive can
-  recover it. What you get instead is a `⟦thumbmux gap: …⟧` line recording that
-  it happened, with a lower bound on the size. Give tmux a large
-  `history-limit`: the ring is the buffer that carries a burst between captures.
+- **A burst larger than tmux's ring on the polling lane.** If 60,000 lines are
+  printed between two captures and tmux keeps 50,000, the overflow is gone; no
+  polling archive can recover it. What you get instead is a
+  `⟦thumbmux gap: …⟧` line recording that it happened, with a lower bound on the
+  size. Give tmux a large `history-limit`: the ring is the buffer that carries a
+  burst between captures. The direct PTY lane avoids this polling interval only
+  for bytes produced after its T0 boundary.
 - **A pane on the alternate screen.** A fullscreen TUI keeps its history inside
   the application, and tmux has no scrollback for it at all. There is nothing to
   capture, and the archive will honestly stay small.

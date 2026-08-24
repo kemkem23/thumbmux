@@ -32,7 +32,12 @@ export {
   type DpadPlacement,
 } from './dpad';
 export { default as ThemeSheet } from './ThemeSheet.svelte';
-export { default as ActionFab, type FabAction } from './ActionFab.svelte';
+export {
+  default as ActionFab,
+  type FabAction,
+  type FabActionChoice,
+  type FabActionFlyout,
+} from './ActionFab.svelte';
 export { tmuxMux, configureTmuxMux, TmuxMux, type TmuxMuxOptions } from './ws-mux.svelte';
 export { default as NewTerminalSheet, type SpawnAgent } from './NewTerminalSheet.svelte';
 export { default as SessionThumb } from './SessionThumb.svelte';

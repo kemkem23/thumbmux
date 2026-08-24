@@ -7,8 +7,8 @@
     prompts = [],
     note = "รอรีวิวผลรอบสุดท้าย",
     summary = "กำลังไล่แก้เลย์เอาต์ recall ของ thumbmux ให้แสดง prompt เต็มและไม่กินพื้นที่เทอร์มินัลเกินจำเป็น",
-    cwd = "/home/kemkem23/kemcortex/cortex-orchestrator",
-    title = "codex-kem-cortex-orchestrator-1",
+    cwd = "/home/dev/workspace/project",
+    title = "codex-project-1",
   }: {
     prompts?: string[];
     note?: string;

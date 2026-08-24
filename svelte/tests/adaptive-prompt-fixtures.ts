@@ -6,17 +6,33 @@ function pad(length: number, seed: string): string {
   return text.slice(0, length);
 }
 
-export const REAL_CODEX_PROMPTS = [
-  'อัปโหลดไฟล์ "Screenshot 2026-08-19 160003.png" เสร็จแล้ว → uploads/20260819090033_01MOCMODT7578QT850S8Z5FW69_Screenshot_2026-08-19_160003.png this i s the picture i captured from real scene i think i expect the ui to be more make sense. can you spot the problem? first of all i need the recent prompt immediately show when i click expand second is the note and the session recal area should be more smart dynamic so it could display with less empty space and follow the content height.',
-  "อีกเรื่องคือ ต้องการให้ถ้า scroll ไม่ได้อยู่ล่างสุด เท่ากับไม่มีการ auto scroll แม้จะมีการ update เนื้อหาเข้ามา ต้องการให้ตัวหนังสืออยู่นิ่ง ถ้าไม่ได้เลื่อนมาล่างสุด",
-  "1. ผมอยากให้ header ของ thumbmux มี format แบบนี้ <ชื่อ tmux> : <note> : <กำลังทำอะไรอยู่> : <ปุ่ม expand> โดยสามารถกดผลหลายบรรทัดได้ แต่ต้องการให้แสดงแบบไม่ต้องมีช่องว่างมาก คือ dense display น่ะ แล้วต้องการให้กดตรงชื่อ tmux แล้วให้ copy tmux name to clipboard ให้ด้วย 2. thumbnail ของ thumbmux ก็แสดง format นี้เหมือนกัน 3. ตัวหนังสือใน thumbnail ของ thumbmux ต้องการให้ dense กว่านี้อีก และ ขอเป็น 500x500 สำหรับ desktop แต่ถ้าเป็นมือถือขอเป็นเต็มความกว้างของจอ 4. ปุ่ม expand กับปุ่ม copy ต้องไม่ซ้อนกัน และต้องมีเป้าสัมผัสอย่างน้อย 44x44",
+function syntheticPrompt(prefix: string, length: number, seed: string): string {
+  return `${prefix}${pad(length, seed)}`.slice(0, length);
+}
+
+export const SYNTHETIC_CODEX_PROMPTS = [
+  syntheticPrompt(
+    'อัปโหลดไฟล์ "example-layout.png" เสร็จแล้ว → uploads/example-layout.png This synthetic mixed-language prompt verifies immediate recall, natural wrapping, exact text, and measured panel height. ',
+    485,
+    'layout spacing ภาษาไทย English selection accessibility ',
+  ),
+  syntheticPrompt(
+    "ถ้าผู้อ่านเลื่อนออกจากล่างสุด ให้ข้อความที่กำลังอัปเดตอยู่นิ่งและไม่ดึงตำแหน่งอ่านกลับไปท้ายจอ ",
+    165,
+    "scroll anchor live update ",
+  ),
+  syntheticPrompt(
+    "จัด header เป็น <session> : <note> : <activity> : <expand> แบบหนาแน่น รองรับข้อความหลายบรรทัด การคัดลอกชื่อ และเป้าสัมผัสที่เข้าถึงได้ ",
+    542,
+    "thumbnail responsive desktop mobile dense layout ภาษาไทย English ",
+  ),
 ] as const;
 
 const FIVE_LONG = [
   pad(500, "ก้ำไทยล้วน"),
   pad(500, "EnglishOnlyBlock"),
   pad(500, "ผสมไทยEnglish"),
-  `/home/kemkem23/${pad(500 - "/home/kemkem23/".length, "x")}`,
+  `/home/dev/${pad(500 - "/home/dev/".length, "x")}`,
   pad(500, "กeปิดmixed"),
 ];
 
@@ -31,7 +47,7 @@ export const FIXTURES: ReadonlyArray<{ id: string; prompts: readonly string[] }>
       `ยาว ${pad(230, "layout ")}จบ`,
     ],
   },
-  { id: "real-codex", prompts: REAL_CODEX_PROMPTS },
+  { id: "synthetic-codex", prompts: SYNTHETIC_CODEX_PROMPTS },
   { id: "five-500", prompts: FIVE_LONG.map((text) => text.slice(0, 500)) },
   {
     id: "hostile",

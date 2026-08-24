@@ -10,7 +10,13 @@ import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
 import { tmuxMux } from "../src/ws-mux.svelte";
-import type { AnsiPalette, MuxHistoryBoundary } from "@thumbmux/core";
+import type {
+  AnsiPalette,
+  ClaudeBashMode,
+  ClaudeBashSummaries,
+  ClaudeBashSummaryRequest,
+  MuxHistoryBoundary,
+} from "@thumbmux/core";
 
 type ScreenMode = { alt: boolean; mouseSgr: boolean; mouseAny: boolean };
 type MuxCallback = (
@@ -36,6 +42,9 @@ type Mounted = {
   target: HTMLElement;
   viewport: HTMLElement;
 };
+type SummaryHandler = (
+  requests: readonly ClaudeBashSummaryRequest[],
+) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
@@ -134,7 +143,10 @@ function drainScheduledWork(limit = 2_000): void {
   }
 }
 
-function mountTermView(): Mounted {
+function mountTermView(options: {
+  mode?: ClaudeBashMode;
+  onSummary?: SummaryHandler;
+} = {}): Mounted {
   const target = document.createElement("div");
   target.style.cssText = "position:relative;width:320px;height:240px;";
   document.body.appendChild(target);
@@ -148,6 +160,11 @@ function mountTermView(): Mounted {
         palette,
         claimGeometry: false,
         fontPx: 13,
+        ...(options.mode && options.mode !== "off"
+          ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
+          : {}),
+        claudeBashMode: options.mode ?? "off",
+        onClaudeBashSummaryRequest: options.onSummary,
         // Intentionally omit historyPaging: this verifies sliding is default.
         onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
       },
@@ -198,14 +215,22 @@ function deliverOutput(
   lines: string[],
   screen?: ScreenMode | null,
   boundary?: MuxHistoryBoundary,
+  delivery: { source?: "full" | "delta"; replace?: boolean } = {},
 ): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
   sessionCallback(lines.join("\n"), "output", null, {
-    source: "full",
-    replace: true,
+    source: delivery.source ?? "full",
+    replace: delivery.replace ?? true,
     ...(screen === undefined ? {} : { screen }),
     ...(boundary === undefined ? {} : { boundary }),
   });
+  flushSync();
+  drainScheduledWork();
+}
+
+async function settleUi(): Promise<void> {
+  await Promise.resolve();
+  await tick();
   flushSync();
   drainScheduledWork();
 }
@@ -257,6 +282,44 @@ function numberAttr(viewport: HTMLElement, name: string): number {
   const raw = viewport.getAttribute(name);
   if (raw === null) throw new Error(`${name} missing`);
   return Number(raw);
+}
+
+function historyBoundary(
+  generation: string,
+  liveStartLine: number,
+  sequence = liveStartLine,
+): MuxHistoryBoundary {
+  return {
+    generation,
+    liveStartLine,
+    walSequence: String(sequence),
+    walOffset: sequence * 100,
+  };
+}
+
+function layerTranslateY(viewport: HTMLElement): number {
+  const transform = viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform ?? "";
+  const match = /translate3d\(0(?:px)?,\s*(-?\d+(?:\.\d+)?)px,\s*0(?:px)?\)/.exec(transform);
+  if (!match?.[1]) throw new Error(`missing layer translate: ${transform}`);
+  return Number(match[1]);
+}
+
+function projectedScreenY(viewport: HTMLElement, row: HTMLElement): number {
+  const first = viewport.querySelector<HTMLElement>(".mtv-line");
+  if (!first) throw new Error("virtual window has no first row");
+  return (
+    Number(row.getAttribute("data-presentation-top"))
+    - Number(first.getAttribute("data-presentation-top"))
+    + layerTranslateY(viewport)
+  );
+}
+
+function completedBash(label: string): string[] {
+  return [
+    `● Bash(printf ${label})`,
+    `  ⎿  output-${label}`,
+    `● boundary-${label}`,
+  ];
 }
 
 /** Absolute archive row at the viewport's top edge (within archive pages). */
@@ -581,5 +644,272 @@ describe("TermView sliding archive window", () => {
     const marker = viewport.querySelector<HTMLElement>('[data-gap-marker-rows="240"]');
     expect(marker).not.toBeNull();
     expect(marker?.getAttribute("aria-label")).toBe("240 rows dropped before this row");
+  });
+
+  test("protects the full raw Bash group represented by a compact reader row", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines("tail", 240));
+
+    wheel(viewport, -1_000_000);
+    const resident = Array.from(
+      { length: 9_760 },
+      (_, index) => `     long-output-${index}`,
+    );
+    // Five adjacent blocks stay below the detector's 2k-row per-block cap but
+    // form one grouped presentation row covering 9.5k raw rows.
+    for (let block = 0; block < 5; block++) {
+      const start = block * 1_900;
+      resident[start] = `● Bash(printf protected-reader-group-${block})`;
+      resident[start + 1] = `  ⎿  long-output-${start + 1}`;
+    }
+    resident[9_500] = "● protected-reader-boundary";
+    for (let index = 9_501; index < resident.length; index++) {
+      resident[index] = `archive-tail-${index}`;
+    }
+    deliverHistory(2_000, resident, true, 11_760);
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({ direction: "before", cursor: 2_000, limit: 2_000 });
+    expect(viewport.querySelector(".mtv-bash-hidden")).not.toBeNull();
+
+    deliverHistory(0, archiveLines(0, 2_000), false, 11_760);
+
+    // The one-third-height row covers ~9.5k physical archive rows. Protection
+    // must retain that complete raw range, so the page discards its far prefix
+    // instead of cutting the Bash group at visual index 12 or 13.
+    expect(numberAttr(viewport, "data-history-window-rows")).toBe(9_760);
+    expect(numberAttr(viewport, "data-history-window-start")).toBeGreaterThan(1_000);
+    expect(numberAttr(viewport, "data-history-window-end")).toBeGreaterThan(11_000);
+    const retainedGroup = viewport.querySelector<HTMLElement>(".mtv-bash-hidden");
+    expect(retainedGroup).not.toBeNull();
+    expect(
+      Number(retainedGroup?.getAttribute("data-raw-end"))
+      - Number(retainedGroup?.getAttribute("data-raw-start")),
+    ).toBeGreaterThan(9_000);
+  });
+
+  test("promotes crossed live rows when a collapsed archive makes visual indexes smaller than raw indexes", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-collapsed", 100, 10),
+    );
+    wheel(viewport, -1_000_000);
+
+    const collapsedArchive = Array.from(
+      { length: 100 },
+      (_, index) => `     archived-output-${index}`,
+    );
+    collapsedArchive[0] = "● Bash(printf collapsed-archive)";
+    collapsedArchive[1] = "  ⎿  archived-output-1";
+    collapsedArchive[99] = "● archived-boundary";
+    deliverHistory(0, collapsedArchive, false, 100);
+
+    // Stay away from the tail while keeping live rows inside the viewport.
+    wheel(viewport, -42);
+    const before = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-108"));
+    if (!before) throw new Error("live anchor row was not mounted before seam advance");
+    const beforeY = projectedScreenY(viewport, before);
+
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-collapsed", 105, 15),
+    );
+
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(numberAttr(viewport, "data-history-window-end")).toBe(105);
+    const after = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-108"));
+    if (!after) throw new Error("live anchor row disappeared after seam promotion");
+    expect(projectedScreenY(viewport, after)).toBeCloseTo(beforeY, 5);
+    expect(new Set(deliveredLines.at(-1)).size).toBe(deliveredLines.at(-1)?.length);
+  });
+
+  test("generation reset retires both an active tokenless request and a claimed queued reply", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-old", 100, 10),
+    );
+    wheel(viewport, -1_000_000);
+    expect(viewport.getAttribute("data-history-request-direction")).toBe("before");
+
+    deliverOutput(
+      absoluteLines(0, 20),
+      undefined,
+      historyBoundary("g-new", 0, 1),
+    );
+    expect(recoverCalls).toBe(1);
+    expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+    deliverHistory(80, absoluteLines(80, 20), false, 100);
+    expect(viewport.getAttribute("data-history-window-start")).toBeNull();
+
+    wheel(viewport, -1_000_000);
+    expect(viewport.getAttribute("data-history-request-direction")).toBe("before");
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(JSON.stringify({
+      lines: absoluteLines(0, 20),
+      startLine: 0,
+      endLine: 20,
+      totalArchivedLines: 20,
+      hasMore: false,
+    }), "history");
+    flushSync();
+    expect(idleCallbacks.size + frameCallbacks.size).toBeGreaterThan(0);
+
+    // The reply has already released the wire but has not parsed/committed.
+    // A newer generation must cancel that queued local work as well.
+    deliverOutput(
+      absoluteLines(500, 20),
+      undefined,
+      historyBoundary("g-newer", 500, 2),
+    );
+    expect(recoverCalls).toBe(1);
+    expect(viewport.getAttribute("data-history-window-start")).toBeNull();
+    expect(viewport.getAttribute("data-history-generation")).toBe("g-newer");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(500, 20));
+  });
+
+  test("marks an emergency live-prefix trim and restores its ANSI entry state", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    const fullLive = liveLines("bounded", 10_000);
+    fullLive[0] = "\u001b[31mremoved-red-entry";
+    fullLive[1] = "retained-red-row";
+    deliverOutput(fullLive);
+    wheel(viewport, -1_000_000);
+    deliverHistory(0, ["archive-seed"], false, 1);
+
+    const marker = viewport.querySelector<HTMLElement>('[data-gap-marker-rows="1"]');
+    expect(marker).not.toBeNull();
+    expect(marker?.getAttribute("aria-label")).toBe("1 rows dropped before this row");
+    const retained = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("retained-red-row"));
+    expect(retained?.getAttribute("data-gap-rows")).toBe("1");
+    expect(retained?.innerHTML).toContain("color:#aa0000");
+    expect(deliveredLines.at(-1)).not.toContain("removed-red-entry");
+  });
+
+  test("reattach admits exactly the newest completed Bash received while live was detached", async () => {
+    const batches: ClaudeBashSummaryRequest[][] = [];
+    const { viewport } = mountTermView({
+      mode: "haiku",
+      onSummary: async (requests) => {
+        batches.push([...requests]);
+        return Object.fromEntries(
+          requests.map((request) => [request.id, `สรุป ${request.command}`]),
+        );
+      },
+    });
+    await tick();
+
+    deliverOutput(
+      [...completedBash("cold"), ...absoluteLines(100, 17)],
+      undefined,
+      historyBoundary("g-distill", 100, 10),
+    );
+    await settleUi();
+    await settleUi();
+    expect(batches).toHaveLength(1);
+    batches.length = 0;
+
+    wheel(viewport, -1_000_000);
+    const archived = absoluteLines(0, 100);
+    archived.splice(10, 3, ...completedBash("archive-backlog"));
+    deliverHistory(0, archived, false, 100);
+    await settleUi();
+    expect(batches).toHaveLength(0);
+    wheel(viewport, -1_000_000);
+
+    const detachedLive = [
+      "absolute-105",
+      ...completedBash("live-latest"),
+      ...absoluteLines(109, 16),
+    ];
+    deliverOutput(
+      detachedLive,
+      undefined,
+      historyBoundary("g-distill", 105, 15),
+    );
+    await settleUi();
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(batches).toHaveLength(0);
+
+    wheel(viewport, 1_000_000);
+    expect(historyCalls.at(-1)).toEqual({ direction: "after", cursor: 99, limit: 2_000 });
+    deliverHistory(100, absoluteLines(100, 5), false, 105);
+    await settleUi();
+    await settleUi();
+
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.map((request) => request.command)).toEqual(["printf live-latest"]);
+  });
+
+  test("settling history never cancels the independent Distill watchdog", async () => {
+    const never = new Promise<ClaudeBashSummaries>(() => {});
+    const originalSetTimeout = globalThis.setTimeout.bind(globalThis);
+    const originalClearTimeout = globalThis.clearTimeout.bind(globalThis);
+    const watchdogHandle = 987_654_322 as unknown as ReturnType<typeof setTimeout>;
+    let watchdogInstalled = false;
+    let watchdogCleared = false;
+    Object.defineProperty(globalThis, "setTimeout", {
+      configurable: true,
+      writable: true,
+      value: ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === 305_000) {
+          watchdogInstalled = true;
+          void handler;
+          void args;
+          return watchdogHandle;
+        }
+        return originalSetTimeout(handler, delay, ...args);
+      }) as typeof setTimeout,
+    });
+    Object.defineProperty(globalThis, "clearTimeout", {
+      configurable: true,
+      writable: true,
+      value: ((handle?: ReturnType<typeof setTimeout>) => {
+        if (handle === watchdogHandle) {
+          watchdogCleared = true;
+          return;
+        }
+        originalClearTimeout(handle);
+      }) as typeof clearTimeout,
+    });
+
+    try {
+      const { viewport } = mountTermView({
+        mode: "haiku",
+        onSummary: () => never,
+      });
+      await tick();
+      deliverOutput(completedBash("hung-during-history"));
+      await settleUi();
+      expect(watchdogInstalled).toBe(true);
+      expect(watchdogCleared).toBe(false);
+
+      wheel(viewport, -1_000_000);
+      deliverHistory(0, ["archive-does-not-own-distill-timeout"], false, 1);
+      expect(watchdogCleared).toBe(false);
+    } finally {
+      Object.defineProperty(globalThis, "setTimeout", {
+        configurable: true,
+        writable: true,
+        value: originalSetTimeout,
+      });
+      Object.defineProperty(globalThis, "clearTimeout", {
+        configurable: true,
+        writable: true,
+        value: originalClearTimeout,
+      });
+    }
   });
 });

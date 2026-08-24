@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   detectClaudeBashBlocks,
+  groupClaudeBashBlocks,
+  projectClaudeBashGroupedLines,
   projectClaudeBashLines,
 } from '../src/claude-bash';
 import { mergePrefs, type ThumbmuxPrefs } from '../src/prefs';
@@ -206,6 +208,163 @@ describe('Claude Bash detector', () => {
   });
 });
 
+describe('Claude Bash groups', () => {
+  test('joins blank-only and direct adjacency, and holds a burst with an active tail', () => {
+    const activeBurst = [
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      '\x1b[0m   ',
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      active[0]!,
+      '      tail)',
+    ];
+    const detection = detectClaudeBashBlocks(activeBurst);
+    expect(detection.blocks).toHaveLength(3);
+    const [group] = groupClaudeBashBlocks(activeBurst, detection.blocks);
+    expect(group).toMatchObject({
+      status: 'active',
+      blockCount: 3,
+      sourceRange: { startLine: 0, endLine: 7 },
+      lineCount: 7,
+    });
+    expect(group?.command).toContain('[Bash 1/3]');
+    expect(group?.command).toContain('[Bash 3/3]');
+
+    const projection = projectClaudeBashGroupedLines(activeBurst, { mode: 'haiku', detection });
+    expect(projection.lines).toEqual(['Bash กำลังรัน…']);
+    expect(projection.detectedGroups).toHaveLength(1);
+    expect(projection.summaryRequests).toEqual([]);
+  });
+
+  test('emits one completed group/request after the active tail closes and absorbs separator blanks', () => {
+    const finishedBurst = [
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      '',
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      '● Bash(printf third)',
+      '  ⎿  third-output',
+      '\x1b[0m  ',
+      '● อธิบายผล',
+    ];
+    const detection = detectClaudeBashBlocks(finishedBurst);
+    const [group] = groupClaudeBashBlocks(finishedBurst, detection.blocks);
+    expect(group).toMatchObject({
+      status: 'completed',
+      blockCount: 3,
+      sourceRange: { startLine: 0, endLine: 8 },
+      lineCount: 8,
+    });
+    expect(group?.fingerprint).toMatch(/^claude-bash-group-v1-[0-9a-f]{16}$/);
+
+    const projection = projectClaudeBashGroupedLines(finishedBurst, { mode: 'haiku', detection });
+    expect(projection.lines).toEqual(['Bash กำลังสรุป…', '● อธิบายผล']);
+    expect(projection.rawToVisualRow).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(projection.summaryRequests).toHaveLength(1);
+    expect(projection.summaryRequests[0]).toMatchObject({
+      id: group?.id,
+      blockCount: 3,
+      lineCount: 8,
+    });
+  });
+
+  test('semantic rows and retention barriers split otherwise adjacent groups', () => {
+    const semantic = [
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      '● อธิบายคั่นกลาง',
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      '● done',
+    ];
+    const semanticDetection = detectClaudeBashBlocks(semantic);
+    expect(groupClaudeBashBlocks(semantic, semanticDetection.blocks)).toHaveLength(2);
+
+    const direct = [
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      '● done',
+    ];
+    const directDetection = detectClaudeBashBlocks(direct);
+    expect(groupClaudeBashBlocks(direct, directDetection.blocks)).toHaveLength(1);
+    const split = projectClaudeBashGroupedLines(direct, {
+      mode: 'hide',
+      detection: directDetection,
+      groupingOptions: { barrierLines: [2] },
+    });
+    expect(split.detectedGroups).toHaveLength(2);
+    expect(split.rows.filter((row) => row.kind === 'bash-placeholder')).toHaveLength(2);
+  });
+
+  test('bounds merged previews and changes group identity when any member result changes', () => {
+    const lines = [
+      '● Bash(printf first-command-is-long)',
+      '  ⎿  first-output-is-long',
+      '● Bash(printf second-command-is-long)',
+      '  ⎿  second-output-is-long',
+      '● done',
+    ];
+    const changed = [...lines];
+    changed[3] = '  ⎿  changed-second-output';
+    const [group] = groupClaudeBashBlocks(lines, detectClaudeBashBlocks(lines).blocks, {
+      maxCommandChars: 44,
+      maxOutputChars: 40,
+    });
+    const [changedGroup] = groupClaudeBashBlocks(
+      changed,
+      detectClaudeBashBlocks(changed).blocks,
+      { maxCommandChars: 44, maxOutputChars: 40 },
+    );
+    expect(group?.command.length).toBeLessThanOrEqual(44);
+    expect(group?.output.length).toBeLessThanOrEqual(40);
+    expect(group?.command).toContain('[Bash 1/2]');
+    expect(group?.command).toContain('[Bash 2/2]');
+    expect(group?.command).toContain('printf s');
+    expect(group?.output).toContain('second-o');
+    expect(group?.commandTruncated).toBe(true);
+    expect(group?.outputTruncated).toBe(true);
+    expect(group?.fingerprint).not.toBe(changedGroup?.fingerprint);
+  });
+
+  test('uses explicit eligibility to distinguish suppressed, pending, and resolved groups', () => {
+    const detection = detectClaudeBashBlocks(completed);
+    const [group] = groupClaudeBashBlocks(completed, detection.blocks);
+    expect(group?.id).toBe(detection.blocks[0]?.id);
+    expect(group?.fingerprint).toBe(detection.blocks[0]?.fingerprint);
+
+    const suppressed = projectClaudeBashGroupedLines(completed, {
+      mode: 'haiku',
+      detection,
+      summaryEligibleIds: new Set(),
+    });
+    expect(suppressed.lines[0]).toBe('hidden bash');
+    expect(suppressed.rows[0]?.summaryState).toBe('suppressed');
+    expect(suppressed.summaryRequests).toEqual([]);
+
+    const pending = projectClaudeBashGroupedLines(completed, {
+      mode: 'haiku',
+      detection,
+      summaryEligibleIds: new Set([group!.id]),
+    });
+    expect(pending.rows[0]?.summaryState).toBe('pending');
+    expect(pending.summaryRequests).toHaveLength(1);
+
+    const resolved = projectClaudeBashGroupedLines(completed, {
+      mode: 'haiku',
+      detection,
+      summaries: { [group!.id]: 'อ่าน src/a.ts สำเร็จ' },
+      summaryEligibleIds: new Set(),
+    });
+    expect(resolved.rows[0]?.summaryState).toBe('resolved');
+    expect(resolved.lines[0]).toBe('Bash · อ่าน src/a.ts สำเร็จ');
+    expect(resolved.summaryRequests).toEqual([]);
+  });
+});
+
 describe('Claude Bash projection', () => {
   test('ThumbmuxPrefs merge-patches the shared host extension key', () => {
     const base: ThumbmuxPrefs = { fontPx: 18, claudeBashMode: 'off' };
@@ -226,6 +385,29 @@ describe('Claude Bash projection', () => {
       { startLine: 2, endLine: 3 },
       { startLine: 3, endLine: 4 },
       { startLine: 4, endLine: 5 },
+    ]);
+    expect(Object.keys(projection).sort()).toEqual([
+      'detectedBlocks',
+      'lines',
+      'mode',
+      'rawLines',
+      'rawToVisual',
+      'rawToVisualRow',
+      'rows',
+      'summaryRequests',
+      'visualToRaw',
+      'visualToRawRange',
+    ]);
+    expect(Object.keys(projection.rows[0] ?? {}).sort()).toEqual([
+      'block',
+      'fingerprint',
+      'kind',
+      'line',
+      'rawEndExclusive',
+      'rawRange',
+      'rawStart',
+      'status',
+      'visualRow',
     ]);
   });
 
@@ -274,6 +456,15 @@ describe('Claude Bash projection', () => {
     expect(pending.lines[0]).toBe('Bash กำลังสรุป…');
     expect(pending.summaryRequests).toHaveLength(1);
     const fingerprint = pending.summaryRequests[0]!.fingerprint;
+    expect(Object.keys(pending.summaryRequests[0] ?? {}).sort()).toEqual([
+      'command',
+      'commandTruncated',
+      'fingerprint',
+      'id',
+      'lineCount',
+      'output',
+      'outputTruncated',
+    ]);
 
     const resolved = projectClaudeBashLines(completed, {
       mode: 'haiku',

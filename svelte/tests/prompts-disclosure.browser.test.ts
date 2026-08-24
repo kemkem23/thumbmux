@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { compile } from "svelte/compiler";
 import { readFileSync, rmSync } from "node:fs";
 import type { Browser, Page } from "@playwright/test";
-import { FIXTURES, HOST_CSS, REAL_CODEX_PROMPTS } from "./adaptive-prompt-fixtures";
-const REAL_FIRST = 'อัปโหลดไฟล์ "Screenshot 2026-08-19 160003.png" เสร็จแล้ว → uploads/20260819090033_01MOCMODT7578QT850S8Z5FW69_Screenshot_2026-08-19_160003.png this i s the picture i captured from real scene i think i expect the ui to be more make sense. can you spot the problem? first of all i need the recent prompt immediately show when i click expand second is the note and the session recal area should be more smart dynamic so it could display with less empty space and follow the content height.';
+import { FIXTURES, HOST_CSS, SYNTHETIC_CODEX_PROMPTS } from "./adaptive-prompt-fixtures";
+const SYNTHETIC_FIRST = SYNTHETIC_CODEX_PROMPTS[0];
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -130,10 +130,11 @@ async function waitForTestIdValue(page: Page, testId: string, expected: string):
 }
 
 describe("measured prompt disclosure", () => {
-  test("2054x281 real-codex keeps newest prompt and recap inside the first body frame", async () => {
+  test("2054x281 synthetic mixed-script prompts keep newest recall and recap inside the first body frame", async () => {
     const page = await browser.newPage();
     try {
-      await render(page, { width: 2054, height: 281, prompts: [...REAL_CODEX_PROMPTS] });
+      expect(SYNTHETIC_CODEX_PROMPTS.map((prompt) => prompt.length)).toEqual([485, 165, 542]);
+      await render(page, { width: 2054, height: 281, prompts: [...SYNTHETIC_CODEX_PROMPTS] });
       const proof = await page.evaluate(() => {
         const inside = (inner: Element | null, outer: Element | null) => {
           if (!inner || !outer) return false;
@@ -171,11 +172,11 @@ describe("measured prompt disclosure", () => {
   test("a ~485-char row that fits at 2054x281 has no disclosure", async () => {
     const page = await browser.newPage();
     try {
-      await render(page, { width: 2054, height: 281, prompts: [REAL_FIRST] });
-      expect(REAL_FIRST.length).toBeGreaterThan(480);
-      expect(REAL_FIRST.length).toBeLessThan(500);
+      await render(page, { width: 2054, height: 281, prompts: [SYNTHETIC_FIRST] });
+      expect(SYNTHETIC_FIRST.length).toBeGreaterThan(480);
+      expect(SYNTHETIC_FIRST.length).toBeLessThan(500);
       const row = page.getByTestId("prompt-item");
-      expect(await row.textContent()).toBe(REAL_FIRST);
+      expect(await row.textContent()).toBe(SYNTHETIC_FIRST);
       expect(await page.getByTestId("prompt-disclose").count()).toBe(0);
       const clip = await row.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
       expect(clip).toBe(false);

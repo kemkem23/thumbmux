@@ -18,6 +18,7 @@ import { stripAnsi } from './prompt-scan';
 export type ClaudeBashMode = 'off' | 'hide' | 'haiku';
 export type ClaudeBashBlockStatus = 'completed' | 'active';
 export type ClaudeBashScreenMode = 'normal' | 'alternate' | 'unknown';
+export type ClaudeBashSummaryState = 'none' | 'suppressed' | 'pending' | 'resolved';
 
 /** Half-open physical-line range in the unmodified source (`startLine..endLine`). */
 export type ClaudeBashLineRange = Readonly<{
@@ -53,6 +54,32 @@ export type ClaudeBashBlock = Readonly<{
   fingerprint: string;
 }>;
 
+/**
+ * One uninterrupted run of top-level Bash calls. Claude commonly inserts
+ * blank physical rows between calls in the same tool burst; those rows belong
+ * to the presentation group, but any semantic row or retention discontinuity
+ * ends it. An active final call keeps the whole group active until Claude
+ * paints a conclusive non-Bash boundary.
+ */
+export type ClaudeBashGroup = Readonly<{
+  /** Content identity of the ordered member blocks; identical to `fingerprint`. */
+  id: string;
+  fingerprint: string;
+  /** Physical rows hidden by the single group placeholder, including blank gaps. */
+  lineCount: number;
+  rawStart: number;
+  rawEndExclusive: number;
+  status: ClaudeBashBlockStatus;
+  sourceRange: ClaudeBashLineRange;
+  blockCount: number;
+  blocks: readonly ClaudeBashBlock[];
+  /** Bounded, ordered previews merged for the host summarizer. */
+  command: string;
+  output: string;
+  commandTruncated: boolean;
+  outputTruncated: boolean;
+}>;
+
 export type ClaudeBashDetection = Readonly<{
   blocks: readonly ClaudeBashBlock[];
   scanRange: ClaudeBashLineRange;
@@ -72,6 +99,19 @@ export type ClaudeBashDetectionOptions = Readonly<{
   /** Maximum returned command preview size (UTF-16 units). Default: 4,096. */
   maxCommandChars?: number;
   /** Maximum returned output preview size (UTF-16 units). Default: 8,192. */
+  maxOutputChars?: number;
+}>;
+
+export type ClaudeBashGroupingOptions = Readonly<{
+  /**
+   * Raw row indexes with a discontinuity immediately before that row. Groups
+   * never cross one even when the retained rows on both sides look blank or
+   * directly adjacent.
+   */
+  barrierLines?: readonly number[];
+  /** Maximum merged command preview size (UTF-16 units). Default: 3,000. */
+  maxCommandChars?: number;
+  /** Maximum merged output preview size (UTF-16 units). Default: 6,000. */
   maxOutputChars?: number;
 }>;
 
@@ -131,11 +171,77 @@ export type ClaudeBashProjectionOptions = Readonly<{
   maxSummaryChars?: number;
 }>;
 
+/** Summary work emitted only by the additive grouped projection API. */
+export type ClaudeBashGroupedSummaryRequest = Readonly<{
+  id: string;
+  fingerprint: string;
+  lineCount: number;
+  command: string;
+  output: string;
+  commandTruncated: boolean;
+  outputTruncated: boolean;
+  blockCount: number;
+}>;
+
+/** A grouped projection row. The legacy row type remains byte-for-byte stable. */
+export type ClaudeBashGroupedProjectionRow = Readonly<{
+  visualRow: number;
+  kind: 'raw' | 'bash-placeholder';
+  /** Raw terminal row, or a single-line placeholder for a collapsed group. */
+  line: string;
+  rawStart: number;
+  rawEndExclusive: number;
+  rawRange: ClaudeBashLineRange;
+  /** Present on grouped placeholders; null on ordinary raw rows. */
+  group: ClaudeBashGroup | null;
+  /** Single-member compatibility view; null when a group has multiple blocks. */
+  block: ClaudeBashBlock | null;
+  fingerprint: string | null;
+  status: ClaudeBashBlockStatus | null;
+  summaryState: ClaudeBashSummaryState;
+}>;
+
+export type ClaudeBashGroupedProjection = Readonly<{
+  mode: ClaudeBashMode;
+  /** Exact source object supplied by the caller; never filtered or rewritten. */
+  rawLines: readonly string[];
+  /** One string per grouped visual row. `off` is the same object as `rawLines`. */
+  lines: readonly string[];
+  rows: readonly ClaudeBashGroupedProjectionRow[];
+  visualToRawRange: readonly ClaudeBashLineRange[];
+  visualToRaw: readonly ClaudeBashLineRange[];
+  rawToVisualRow: readonly number[];
+  rawToVisual: readonly number[];
+  detectedBlocks: readonly ClaudeBashBlock[];
+  detectedGroups: readonly ClaudeBashGroup[];
+  summaryRequests: readonly ClaudeBashGroupedSummaryRequest[];
+}>;
+
+export type ClaudeBashGroupedProjectionOptions = Readonly<{
+  mode: ClaudeBashMode;
+  detection?: ClaudeBashDetection;
+  detectionOptions?: ClaudeBashDetectionOptions;
+  groupingOptions?: ClaudeBashGroupingOptions;
+  summaries?: ClaudeBashSummaries;
+  /**
+   * Only missing group IDs in this set become pending summary work. When the
+   * option is omitted, every completed missing group remains eligible.
+   */
+  summaryEligibleIds?: ReadonlySet<string>;
+  /** Maximum visible summary text (UTF-16 units). Default: 240. */
+  maxSummaryChars?: number;
+}>;
+
 const DEFAULT_MAX_SCAN_LINES = 20_000;
 const DEFAULT_MAX_BLOCK_LINES = 2_000;
 const DEFAULT_MAX_BLOCKS = 512;
 const DEFAULT_MAX_COMMAND_CHARS = 4_096;
 const DEFAULT_MAX_OUTPUT_CHARS = 8_192;
+// Ten cold-start groups must fit the host's 96k request boundary in one model
+// batch. 10 × (3k command + 6k output) = 90k, leaving the client watchdog to
+// cover one bounded backend request rather than a hidden sequential split.
+const DEFAULT_MAX_GROUP_COMMAND_CHARS = 3_000;
+const DEFAULT_MAX_GROUP_OUTPUT_CHARS = 6_000;
 const DEFAULT_MAX_SUMMARY_CHARS = 240;
 
 // A terminal physical row should be bounded by pane width. Refuse a wildly
@@ -292,6 +398,16 @@ function blockFingerprint(
   const first = fnv1a32(normalized, 0x811c9dc5).toString(16).padStart(8, '0');
   const second = fnv1a32(normalized, 0x9e3779b9).toString(16).padStart(8, '0');
   return `claude-bash-v1-${first}${second}`;
+}
+
+function groupFingerprint(
+  blocks: readonly ClaudeBashBlock[],
+  status: ClaudeBashBlockStatus,
+): string {
+  const normalized = `${status}\u0000${blocks.map((block) => block.fingerprint).join('\u0000')}`;
+  const first = fnv1a32(normalized, 0x811c9dc5).toString(16).padStart(8, '0');
+  const second = fnv1a32(normalized, 0x9e3779b9).toString(16).padStart(8, '0');
+  return `claude-bash-group-v1-${first}${second}`;
 }
 
 function range(startLine: number, endLine: number): ClaudeBashLineRange {
@@ -460,6 +576,168 @@ export function detectClaudeBashBlocks(
   });
 }
 
+function isBlankPresentationRow(raw: string): boolean {
+  return visibleLine(raw).trim() === '';
+}
+
+function crossesBarrier(
+  start: number,
+  end: number,
+  barrierLines: ReadonlySet<number>,
+): boolean {
+  for (const barrier of barrierLines) {
+    if (barrier >= start && barrier <= end) return true;
+  }
+  return false;
+}
+
+function mergedGroupPreview(
+  blocks: readonly ClaudeBashBlock[],
+  field: 'command' | 'output',
+  maxChars: number,
+): { text: string; truncated: boolean } {
+  const memberWasTruncated = blocks.some((block) => (
+    field === 'command' ? block.commandTruncated : block.outputTruncated
+  ));
+  if (blocks.length <= 1) {
+    const bounded = truncateUtf16(blocks[0]?.[field] ?? '', maxChars);
+    return { text: bounded.text, truncated: bounded.truncated || memberWasTruncated };
+  }
+
+  const labels = blocks.map((_, index) => `[Bash ${index + 1}/${blocks.length}]`);
+  const fixedChars = labels.reduce((sum, label) => sum + label.length + 1, 0)
+    + (blocks.length - 1) * 2;
+  if (fixedChars >= maxChars) {
+    const bounded = truncateUtf16(labels.join('\n\n'), maxChars);
+    return { text: bounded.text, truncated: true };
+  }
+
+  // Reserve an equal share for every member before giving unused space from a
+  // short member to those after it. A single huge first output can therefore
+  // never erase the filename or intent carried by the last Bash call.
+  let remainingChars = maxChars - fixedChars;
+  let remainingMembers = blocks.length;
+  let truncated = memberWasTruncated;
+  const pieces = blocks.map((block, index) => {
+    const share = Math.floor(remainingChars / remainingMembers);
+    const bounded = truncateUtf16(block[field], share);
+    remainingChars -= bounded.text.length;
+    remainingMembers -= 1;
+    truncated ||= bounded.truncated;
+    return `${labels[index]}\n${bounded.text}`;
+  });
+  return { text: pieces.join('\n\n'), truncated };
+}
+
+/**
+ * Merge adjacent detected calls into semantic Bash groups without touching raw
+ * terminal data. Direct adjacency and ANSI/NBSP-normalized blank-only gaps join;
+ * semantic rows and caller-supplied retention barriers always split.
+ */
+export function groupClaudeBashBlocks(
+  rawLines: readonly string[],
+  detectedBlocks: readonly ClaudeBashBlock[],
+  options: ClaudeBashGroupingOptions = {},
+): readonly ClaudeBashGroup[] {
+  const maxCommandChars = boundedInteger(
+    options.maxCommandChars,
+    DEFAULT_MAX_GROUP_COMMAND_CHARS,
+    1_000_000,
+  );
+  const maxOutputChars = boundedInteger(
+    options.maxOutputChars,
+    DEFAULT_MAX_GROUP_OUTPUT_CHARS,
+    2_000_000,
+  );
+  const barrierLines = new Set(
+    (options.barrierLines ?? []).filter((line) => (
+      Number.isSafeInteger(line) && line >= 0 && line <= rawLines.length
+    )),
+  );
+  const sortedBlocks = [...detectedBlocks]
+    .filter((block) => (
+      block.rawStart >= 0
+      && block.rawEndExclusive <= rawLines.length
+      && block.rawStart < block.rawEndExclusive
+    ))
+    .sort((a, b) => a.rawStart - b.rawStart);
+  const blocks: ClaudeBashBlock[] = [];
+  let acceptedEnd = 0;
+  for (const block of sortedBlocks) {
+    if (blocks.length > 0 && block.rawStart < acceptedEnd) continue;
+    blocks.push(block);
+    acceptedEnd = block.rawEndExclusive;
+  }
+
+  const members: ClaudeBashBlock[][] = [];
+  for (const block of blocks) {
+    const current = members.at(-1);
+    const previous = current?.at(-1);
+    const blankOnlyGap = previous
+      ? rawLines
+        .slice(previous.rawEndExclusive, block.rawStart)
+        .every(isBlankPresentationRow)
+      : false;
+    if (
+      current
+      && previous
+      && blankOnlyGap
+      && !crossesBarrier(previous.rawEndExclusive, block.rawStart, barrierLines)
+    ) {
+      current.push(block);
+    } else {
+      members.push([block]);
+    }
+  }
+
+  return Object.freeze(members.map((groupBlocks) => {
+    const first = groupBlocks[0]!;
+    const last = groupBlocks.at(-1)!;
+    const status: ClaudeBashBlockStatus = groupBlocks.some((block) => block.status === 'active')
+      ? 'active'
+      : 'completed';
+    let rawEndExclusive = last.rawEndExclusive;
+    // parseCandidate deliberately leaves separator blanks before the following
+    // semantic boundary raw. Once the whole burst is grouped, absorb those
+    // blanks too so a compact row does not leave empty full-height terminal rows.
+    let trailingEnd = rawEndExclusive;
+    while (
+      trailingEnd < rawLines.length
+      && !barrierLines.has(trailingEnd)
+      && isBlankPresentationRow(rawLines[trailingEnd] ?? '')
+    ) trailingEnd += 1;
+    // Do not swallow unknown blank capture padding. A real following semantic
+    // row proves these blanks are the separator already used by the detector.
+    if (trailingEnd < rawLines.length && !barrierLines.has(trailingEnd)) {
+      rawEndExclusive = trailingEnd;
+    }
+
+    const command = mergedGroupPreview(groupBlocks, 'command', maxCommandChars);
+    const output = mergedGroupPreview(groupBlocks, 'output', maxOutputChars);
+    // A one-member group is semantically the same work item as the legacy
+    // per-block projection. Preserve its v0.16 fingerprint so hosts can reuse
+    // existing summary caches and do not spend model quota re-distilling it.
+    const fingerprint = groupBlocks.length === 1
+      ? first.fingerprint
+      : groupFingerprint(groupBlocks, status);
+    return Object.freeze({
+      id: fingerprint,
+      fingerprint,
+      lineCount: rawEndExclusive - first.rawStart,
+      rawStart: first.rawStart,
+      rawEndExclusive,
+      status,
+      sourceRange: range(first.rawStart, rawEndExclusive),
+      blockCount: groupBlocks.length,
+      blocks: Object.freeze([...groupBlocks]),
+      command: command.text,
+      output: output.text,
+      commandTruncated: command.truncated,
+      outputTruncated: output.truncated,
+    });
+  }));
+}
+
 function summaryFor(summaries: ClaudeBashSummaries | undefined, fingerprint: string): string | null {
   if (!summaries) return null;
   const maybeMap = summaries as ReadonlyMap<string, string>;
@@ -479,7 +757,185 @@ function cleanPlaceholderText(text: string, maxChars: number): string {
   return truncateUtf16(plain, maxChars).text;
 }
 
-function placeholderLine(
+function groupedPlaceholderLine(
+  group: ClaudeBashGroup,
+  mode: Exclude<ClaudeBashMode, 'off'>,
+  summaries: ClaudeBashSummaries | undefined,
+  maxSummaryChars: number,
+  summaryEligible: boolean,
+): { line: string; needsSummary: boolean; summaryState: ClaudeBashSummaryState } {
+  if (group.status === 'active') {
+    return { line: 'Bash กำลังรัน…', needsSummary: false, summaryState: 'none' };
+  }
+  if (mode === 'hide') {
+    const rows = group.sourceRange.endLine - group.sourceRange.startLine;
+    return { line: `Bash ซ่อนอยู่ · ${rows} แถว`, needsSummary: false, summaryState: 'none' };
+  }
+
+  const summary = summaryFor(summaries, group.fingerprint);
+  const clean = summary === null ? '' : cleanPlaceholderText(summary, maxSummaryChars);
+  if (clean) return { line: `Bash · ${clean}`, needsSummary: false, summaryState: 'resolved' };
+  if (!summaryEligible) {
+    return { line: 'hidden bash', needsSummary: false, summaryState: 'suppressed' };
+  }
+  return { line: 'Bash กำลังสรุป…', needsSummary: true, summaryState: 'pending' };
+}
+
+function groupedIdentityProjection(
+  rawLines: readonly string[],
+  mode: ClaudeBashMode,
+  detectedBlocks: readonly ClaudeBashBlock[] = Object.freeze([]),
+): ClaudeBashGroupedProjection {
+  const rows: ClaudeBashGroupedProjectionRow[] = rawLines.map((line, visualRow) => Object.freeze({
+    visualRow,
+    kind: 'raw' as const,
+    line,
+    rawRange: range(visualRow, visualRow + 1),
+    rawStart: visualRow,
+    rawEndExclusive: visualRow + 1,
+    group: null,
+    block: null,
+    fingerprint: null,
+    status: null,
+    summaryState: 'none',
+  }));
+  const visualToRawRange = rows.map((row) => row.rawRange);
+  const rawToVisualRow = rawLines.map((_, index) => index);
+  return Object.freeze({
+    mode,
+    rawLines,
+    lines: rawLines,
+    rows: Object.freeze(rows),
+    visualToRawRange: Object.freeze(visualToRawRange),
+    visualToRaw: Object.freeze(visualToRawRange),
+    rawToVisualRow: Object.freeze(rawToVisualRow),
+    rawToVisual: Object.freeze(rawToVisualRow),
+    detectedBlocks,
+    detectedGroups: Object.freeze([]),
+    summaryRequests: Object.freeze([]),
+  });
+}
+
+/**
+ * Collapse semantic Bash groups into one visual row while retaining every raw
+ * source line and a total raw↔visual mapping. This additive entry point keeps
+ * the legacy per-block projection contract unchanged.
+ */
+export function projectClaudeBashGroupedLines(
+  rawLines: readonly string[],
+  options: ClaudeBashGroupedProjectionOptions,
+): ClaudeBashGroupedProjection {
+  if (options.mode === 'off') return groupedIdentityProjection(rawLines, 'off');
+
+  const detection = options.detection ?? detectClaudeBashBlocks(rawLines, options.detectionOptions);
+  if (!detection.enabled || detection.blocks.length === 0) {
+    return groupedIdentityProjection(rawLines, options.mode, detection.blocks);
+  }
+
+  const maxSummaryChars = boundedInteger(
+    options.maxSummaryChars,
+    DEFAULT_MAX_SUMMARY_CHARS,
+    4_096,
+  );
+  const groups = groupClaudeBashBlocks(rawLines, detection.blocks, options.groupingOptions);
+
+  const rows: ClaudeBashGroupedProjectionRow[] = [];
+  const rawToVisualRow = new Array<number>(rawLines.length);
+  const summaryRequests: ClaudeBashGroupedSummaryRequest[] = [];
+  const requested = new Set<string>();
+  let rawLine = 0;
+
+  const pushRaw = (index: number) => {
+    const visualRow = rows.length;
+    rows.push(Object.freeze({
+      visualRow,
+      kind: 'raw',
+      line: rawLines[index] ?? '',
+      rawRange: range(index, index + 1),
+      rawStart: index,
+      rawEndExclusive: index + 1,
+      group: null,
+      block: null,
+      fingerprint: null,
+      status: null,
+      summaryState: 'none',
+    }));
+    rawToVisualRow[index] = visualRow;
+  };
+
+  for (const group of groups) {
+    const { startLine, endLine } = group.sourceRange;
+    // Ignore an externally supplied overlapping/retrograde detection result.
+    if (startLine < rawLine) continue;
+    while (rawLine < startLine) {
+      pushRaw(rawLine);
+      rawLine += 1;
+    }
+
+    const placeholder = groupedPlaceholderLine(
+      group,
+      options.mode,
+      options.summaries,
+      maxSummaryChars,
+      options.summaryEligibleIds?.has(group.fingerprint) ?? true,
+    );
+    const visualRow = rows.length;
+    rows.push(Object.freeze({
+      visualRow,
+      kind: 'bash-placeholder',
+      line: placeholder.line,
+      rawRange: group.sourceRange,
+      rawStart: startLine,
+      rawEndExclusive: endLine,
+      group,
+      block: group.blockCount === 1 ? group.blocks[0] ?? null : null,
+      fingerprint: group.fingerprint,
+      status: group.status,
+      summaryState: placeholder.summaryState,
+    }));
+    for (let index = startLine; index < endLine; index += 1) {
+      rawToVisualRow[index] = visualRow;
+    }
+    rawLine = endLine;
+
+    if (placeholder.needsSummary && !requested.has(group.fingerprint)) {
+      requested.add(group.fingerprint);
+      summaryRequests.push(Object.freeze({
+        id: group.id,
+        fingerprint: group.fingerprint,
+        lineCount: group.lineCount,
+        command: group.command,
+        output: group.output,
+        commandTruncated: group.commandTruncated,
+        outputTruncated: group.outputTruncated,
+        blockCount: group.blockCount,
+      }));
+    }
+  }
+
+  while (rawLine < rawLines.length) {
+    pushRaw(rawLine);
+    rawLine += 1;
+  }
+
+  const lines = rows.map((row) => row.line);
+  const visualToRawRange = rows.map((row) => row.rawRange);
+  return Object.freeze({
+    mode: options.mode,
+    rawLines,
+    lines: Object.freeze(lines),
+    rows: Object.freeze(rows),
+    visualToRawRange: Object.freeze(visualToRawRange),
+    visualToRaw: Object.freeze(visualToRawRange),
+    rawToVisualRow: Object.freeze(rawToVisualRow),
+    rawToVisual: Object.freeze(rawToVisualRow),
+    detectedBlocks: detection.blocks,
+    detectedGroups: groups,
+    summaryRequests: Object.freeze(summaryRequests),
+  });
+}
+
+function legacyPlaceholderLine(
   block: ClaudeBashBlock,
   mode: Exclude<ClaudeBashMode, 'off'>,
   summaries: ClaudeBashSummaries | undefined,
@@ -591,7 +1047,7 @@ export function projectClaudeBashLines(
       rawLine += 1;
     }
 
-    const placeholder = placeholderLine(
+    const placeholder = legacyPlaceholderLine(
       block,
       options.mode,
       options.summaries,

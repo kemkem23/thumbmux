@@ -14,7 +14,10 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.0-dist`.
   that WAL through bounded private-tmux replay and atomic checkpoints; its
   cross-process writer lease prevents two hosts from truncating or regressing the
   same materialized state. Restart and SIGKILL recovery resume from the durable
-  sequence without inventing or silently dropping rows. The seven intentional
+  sequence and WAL byte offset without inventing or silently dropping rows;
+  unavailable exact recovery fails closed. Node 18 hosts use the same
+  single-writer rule through the packaged Python/flock fallback when no native
+  SQLite module is available. The seven intentional
   `thumbmux/server` integration exports are tier X while production hosts prove
   the cutover lifecycle: `createTerminalPtyWalProxyLaunchSpec`,
   `createTerminalReplayWorkerClient`, `resolveTerminalReplayWorkerPath`,
@@ -29,17 +32,26 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.0-dist`.
   direction, and can fetch those evicted rows again while the server archive
   retains them. Absolute row identity and the visual anchor survive
   prepend/append/eviction, including Claude Bash projection, so crossing the
-  archive/live seam does not duplicate, skip, or jump rows.
+  archive/live seam does not duplicate, skip, or jump rows. A failed archive
+  read now settles with a retryable correlated error rather than a false empty
+  page, so the client retains and retries the same absolute cursor instead of
+  declaring EOF.
 
-- **Claude Code Bash blocks can be shown raw, collapsed, or summarized by a
-  host-owned service.** `SessionView` adds a Claude-only `bash-mode` action and
-  stores `off | hide | haiku` in the existing preferences adapter. `TermView`
-  detects only high-confidence completed/active Claude Bash layouts on a known
-  normal screen, retains the exact raw rows for copy/search/history/ANSI state,
-  and requests summaries only for completed blocks in the real viewport.
-  `AppAdapters.bashSummaries` is optional; rejection or omission falls back to
-  a deterministic command preview. The new `thumbmux/core` detector/projection
-  exports are experimental because Claude's terminal layout may evolve.
+- **Claude Code Bash calls can be shown raw, collapsed, or distilled by a
+  host-owned service.** `SessionView` adds a Claude-only BASH disclosure whose
+  SHOW / HIDE / DISTILL choices open directly to the left and stores the same
+  `off | hide | haiku` preference values. Consecutive calls separated only by
+  blank presentation rows become one semantic group. HIDE and non-selected
+  DISTILL groups render as a green `hidden bash` divider one third of a terminal
+  row high; `TermView` recalibrates virtual scroll, cursor, search, history
+  anchoring, and gap coordinates to that variable-height projection while the
+  exact raw rows remain canonical for copy/search/history/ANSI state. A fresh
+  DISTILL view requests at most its newest ten completed groups, then requests
+  only the newest group completed by each coalesced live update; scrolling never
+  creates model work, and a group with an active tail waits as a whole.
+  `AppAdapters.bashSummaries` remains optional; rejection or omission falls back
+  to a deterministic command preview. The `thumbmux/core` detector/projection
+  exports remain experimental because Claude's terminal layout may evolve.
 
 ## v0.16.8 — 2026-08-21
 

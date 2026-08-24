@@ -185,9 +185,10 @@ accepted request still outstanding.
 
 The bundled `TermView` **does not content-de-duplicate** an archive page against
 rows it already holds in the live / already-mounted window. A successful
-`history` reply is prepended as the server sent it (subject only to the viewer's
-own row/byte retention budget, which may drop the **oldest prefix of the
-incoming page**, never rows already on screen).
+`history` reply is inserted as the server sent it. Its default sliding cache may
+evict the far opposite edge to stay near its row/byte budget, but it protects
+the mounted viewport and overscan; the legacy ceiling mode may instead drop the
+oldest prefix of an incoming backward page.
 
 Therefore a host archive **must not** return rows the client already has for
 that session. Use the `beforeLine` / `afterLine` anchors: `beforeLine: N` means
@@ -237,23 +238,24 @@ the boundary as two ordinary adjacent rows unless the host embeds a visible
 marker in the archived text. Do not read the absence of a gap marker as proof
 that history is contiguous.
 
-#### Client retention budgets and what the user sees at the ceiling
+#### Client retention budgets and sliding replacement
 
-`TermView` retains at most 10,000 rows or ~8 MiB of history, whichever fills
-first, and once the budget is full it stops requesting older pages entirely —
-it does not evict older rows to make room for more. The budget is not
-configurable through props.
+`TermView` has a nominal 10,000-row / ~8 MiB presentation-cache budget. The
+mounted viewport and overscan are always protected and may temporarily make the
+cache larger. In the default `historyPaging="sliding"` mode, paging backward
+evicts the far newer edge and paging forward evicts the far older edge. Either
+edge can be requested again while the server still retains it; absolute archive
+line numbers, the visual anchor, ANSI entry state, and any retention-gap marker
+move with the window. Reaching the client budget is therefore not archive EOF.
 
-**Signpost (package-owned, since 0.15.3).** When the stop is the **client
-ceiling** (budget full while the server may still have older rows), and the
-oldest retained row is in the virtual window, `TermView` renders a
-`role="note"` banner (`.mtv-history-ceiling`, `data-testid="mtv-history-ceiling"`,
-`data-history-ceiling="1"`, `data-history-stop="ceiling"`) with an accessible
-label explaining that older history was not loaded. This is **not** a gap
-marker: no rows were dropped between retained lines; older archive rows simply
-were never requested. When the server reports the true start of archived
-history (`hasMore: false`), `data-history-stop="exhausted"` and **no** ceiling
-banner is shown — the top row really is the start.
+`historyPaging="ceiling"` preserves the older one-way behavior for hosts that
+choose it. In that mode the client stops requesting older pages when its budget
+is full and renders a `role="note"` banner (`.mtv-history-ceiling`,
+`data-testid="mtv-history-ceiling"`, `data-history-ceiling="1"`,
+`data-history-stop="ceiling"`). This is not a gap marker: those older rows were
+never loaded. In either mode, when the server reports the true retained start
+(`hasMore: false`), `data-history-stop="exhausted"` is authoritative and no
+ceiling banner is shown.
 
 #### `TmuxWsMux` does not lower tmux `history-limit`
 
