@@ -311,16 +311,20 @@ describe('Claude Bash groups', () => {
     const changed = [...lines];
     changed[3] = '  ⎿  changed-second-output';
     const [group] = groupClaudeBashBlocks(lines, detectClaudeBashBlocks(lines).blocks, {
-      maxCommandChars: 30,
-      maxOutputChars: 28,
+      maxCommandChars: 44,
+      maxOutputChars: 40,
     });
     const [changedGroup] = groupClaudeBashBlocks(
       changed,
       detectClaudeBashBlocks(changed).blocks,
-      { maxCommandChars: 30, maxOutputChars: 28 },
+      { maxCommandChars: 44, maxOutputChars: 40 },
     );
-    expect(group?.command.length).toBeLessThanOrEqual(30);
-    expect(group?.output.length).toBeLessThanOrEqual(28);
+    expect(group?.command.length).toBeLessThanOrEqual(44);
+    expect(group?.output.length).toBeLessThanOrEqual(40);
+    expect(group?.command).toContain('[Bash 1/2]');
+    expect(group?.command).toContain('[Bash 2/2]');
+    expect(group?.command).toContain('printf s');
+    expect(group?.output).toContain('second-o');
     expect(group?.commandTruncated).toBe(true);
     expect(group?.outputTruncated).toBe(true);
     expect(group?.fingerprint).not.toBe(changedGroup?.fingerprint);

@@ -673,13 +673,18 @@ describe("A6-12 ActionFab closed slots", () => {
           label: "BASH",
           tag: "HIDE",
           testid: "bash-mode",
-          choicesAria: "Bash display mode",
+          onTap: () => taps.push("cycle-must-not-run"),
+        },
+      ],
+      flyouts: [
+        {
+          actionId: "bash-mode",
+          ariaLabel: "Bash display mode",
           choices: [
             { id: "show", label: "SHOW", testid: "bash-show", onTap: () => taps.push("show") },
             { id: "hide", label: "HIDE", testid: "bash-hide", selected: true, onTap: () => taps.push("hide") },
             { id: "distill", label: "DISTILL", testid: "bash-distill", onTap: () => taps.push("distill") },
           ],
-          onTap: () => taps.push("cycle-must-not-run"),
         },
       ],
       onFab: () => {},

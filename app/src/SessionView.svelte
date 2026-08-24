@@ -26,6 +26,7 @@
     createLocalPrefs,
     tmuxMux,
     type FabAction,
+    type FabActionFlyout,
   } from '@thumbmux/svelte';
   import { onMount } from 'svelte';
   import {
@@ -595,33 +596,8 @@
             ? 'HIDE'
             : 'DISTILL',
         testid: 'demo-bash-mode',
-        choicesAria: 'Bash display mode',
-        choices: [
-          {
-            id: 'bash-show',
-            label: 'SHOW',
-            testid: 'demo-bash-show',
-            selected: claudeBashMode === 'off',
-            onTap: () => setClaudeBashMode('off'),
-          },
-          {
-            id: 'bash-hide',
-            label: 'HIDE',
-            testid: 'demo-bash-hide',
-            selected: claudeBashMode === 'hide',
-            onTap: () => setClaudeBashMode('hide'),
-          },
-          {
-            id: 'bash-distill',
-            label: 'DISTILL',
-            testid: 'demo-bash-distill',
-            selected: claudeBashMode === 'haiku',
-            onTap: () => setClaudeBashMode('haiku'),
-          },
-        ],
-        // ActionFab uses the primary button as a disclosure while choices are
-        // present. Keep onTap required so the public FabAction shape remains
-        // source-compatible for existing hosts.
+        // The matching flyout is passed separately so the frozen FabAction
+        // adapter type remains byte-compatible with existing hosts.
         onTap: () => {},
       }] satisfies FabAction[] : []),
       {
@@ -675,6 +651,38 @@
       return dismissingHostAction(action);
     });
   });
+
+  let actionFlyouts = $derived.by((): FabActionFlyout[] => (
+    sessionAgent === 'claude'
+      ? [{
+        actionId: 'bash-mode',
+        ariaLabel: 'Bash display mode',
+        choices: [
+          {
+            id: 'bash-show',
+            label: 'SHOW',
+            testid: 'demo-bash-show',
+            selected: claudeBashMode === 'off',
+            onTap: () => setClaudeBashMode('off'),
+          },
+          {
+            id: 'bash-hide',
+            label: 'HIDE',
+            testid: 'demo-bash-hide',
+            selected: claudeBashMode === 'hide',
+            onTap: () => setClaudeBashMode('hide'),
+          },
+          {
+            id: 'bash-distill',
+            label: 'DISTILL',
+            testid: 'demo-bash-distill',
+            selected: claudeBashMode === 'haiku',
+            onTap: () => setClaudeBashMode('haiku'),
+          },
+        ],
+      }]
+      : []
+  ));
 
   let noteRequest = 0;
   $effect(() => {
@@ -934,6 +942,7 @@
         || (adapters.extraOverlayOpen?.() ?? false)
     }
     {actions}
+    flyouts={actionFlyouts}
     {onFab}
     fabAria={labels.fabAria}
   />

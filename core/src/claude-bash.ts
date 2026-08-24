@@ -109,9 +109,9 @@ export type ClaudeBashGroupingOptions = Readonly<{
    * directly adjacent.
    */
   barrierLines?: readonly number[];
-  /** Maximum merged command preview size (UTF-16 units). Default: 4,096. */
+  /** Maximum merged command preview size (UTF-16 units). Default: 3,000. */
   maxCommandChars?: number;
-  /** Maximum merged output preview size (UTF-16 units). Default: 8,192. */
+  /** Maximum merged output preview size (UTF-16 units). Default: 6,000. */
   maxOutputChars?: number;
 }>;
 
@@ -237,6 +237,11 @@ const DEFAULT_MAX_BLOCK_LINES = 2_000;
 const DEFAULT_MAX_BLOCKS = 512;
 const DEFAULT_MAX_COMMAND_CHARS = 4_096;
 const DEFAULT_MAX_OUTPUT_CHARS = 8_192;
+// Ten cold-start groups must fit the host's 96k request boundary in one model
+// batch. 10 × (3k command + 6k output) = 90k, leaving the client watchdog to
+// cover one bounded backend request rather than a hidden sequential split.
+const DEFAULT_MAX_GROUP_COMMAND_CHARS = 3_000;
+const DEFAULT_MAX_GROUP_OUTPUT_CHARS = 6_000;
 const DEFAULT_MAX_SUMMARY_CHARS = 240;
 
 // A terminal physical row should be bounded by pane width. Refuse a wildly
@@ -591,16 +596,37 @@ function mergedGroupPreview(
   field: 'command' | 'output',
   maxChars: number,
 ): { text: string; truncated: boolean } {
-  const merged = blocks.length === 1
-    ? blocks[0]?.[field] ?? ''
-    : blocks.map((block, index) => (
-      `[Bash ${index + 1}/${blocks.length}]\n${block[field]}`
-    )).join('\n\n');
-  const bounded = truncateUtf16(merged, maxChars);
   const memberWasTruncated = blocks.some((block) => (
     field === 'command' ? block.commandTruncated : block.outputTruncated
   ));
-  return { text: bounded.text, truncated: bounded.truncated || memberWasTruncated };
+  if (blocks.length <= 1) {
+    const bounded = truncateUtf16(blocks[0]?.[field] ?? '', maxChars);
+    return { text: bounded.text, truncated: bounded.truncated || memberWasTruncated };
+  }
+
+  const labels = blocks.map((_, index) => `[Bash ${index + 1}/${blocks.length}]`);
+  const fixedChars = labels.reduce((sum, label) => sum + label.length + 1, 0)
+    + (blocks.length - 1) * 2;
+  if (fixedChars >= maxChars) {
+    const bounded = truncateUtf16(labels.join('\n\n'), maxChars);
+    return { text: bounded.text, truncated: true };
+  }
+
+  // Reserve an equal share for every member before giving unused space from a
+  // short member to those after it. A single huge first output can therefore
+  // never erase the filename or intent carried by the last Bash call.
+  let remainingChars = maxChars - fixedChars;
+  let remainingMembers = blocks.length;
+  let truncated = memberWasTruncated;
+  const pieces = blocks.map((block, index) => {
+    const share = Math.floor(remainingChars / remainingMembers);
+    const bounded = truncateUtf16(block[field], share);
+    remainingChars -= bounded.text.length;
+    remainingMembers -= 1;
+    truncated ||= bounded.truncated;
+    return `${labels[index]}\n${bounded.text}`;
+  });
+  return { text: pieces.join('\n\n'), truncated };
 }
 
 /**
@@ -615,12 +641,12 @@ export function groupClaudeBashBlocks(
 ): readonly ClaudeBashGroup[] {
   const maxCommandChars = boundedInteger(
     options.maxCommandChars,
-    DEFAULT_MAX_COMMAND_CHARS,
+    DEFAULT_MAX_GROUP_COMMAND_CHARS,
     1_000_000,
   );
   const maxOutputChars = boundedInteger(
     options.maxOutputChars,
-    DEFAULT_MAX_OUTPUT_CHARS,
+    DEFAULT_MAX_GROUP_OUTPUT_CHARS,
     2_000_000,
   );
   const barrierLines = new Set(

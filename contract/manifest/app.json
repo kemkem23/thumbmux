@@ -2,7 +2,7 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "c784afeefa606a0a1690e3bb82e4e1ab0a714929f0627437b8fa10b875f2dd29",
+    "signature": "5c6022703253da6864e2cf8d56788f316a498d2c9488f9a676766f6b85b3e145",
     "tier": "S"
   },
   {
@@ -56,7 +56,7 @@
   {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "e20a193370ab383a8cbf54f7485d76e46a2190821364e410bd4692eb0105bd91",
+    "signature": "3f8614b9062a8af88d57e98f59c683545b5584743ba4c3800dd891f05994a047",
     "tier": "S"
   },
   {
@@ -74,7 +74,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "4638e582fe75e148acc29dfb092445d1644c1d017cb53d7cad2fcb4f1d1695c4",
+    "signature": "c674635f5d4f9254cbc2c20ee3e9e98b545501d17d9a769497376c778aa98ef7",
     "tier": "S"
   },
   {
@@ -104,13 +104,13 @@
   {
     "name": "SessionPresentationOptions",
     "kind": "type",
-    "signature": "7792424a66dee4a463a3c3771a4cc8beec13e37962c72d01419ba9398d058278",
+    "signature": "8da09bffad6c4a23b90c14cde05f72be1e3d08275a89710733a57c23a06f17f1",
     "tier": "S"
   },
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "f70a473c767f7a6999cb8275e20444050b22298a16ad95790e45153c10648098",
+    "signature": "44f77430e5847131bf8b70ae706293f7b67cc6aebd36215e0d86c4c7fd118d1a",
     "tier": "S"
   },
   {
@@ -128,7 +128,7 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "b2ec2cbd10a1cb5b71efaf0c80a510330f3d194a35ae4f5fd7a677990ef229cc",
+    "signature": "1553750eb1644bfbde3eb5f939a649f8b87a02377eb1b56761a54353f2b8f7d7",
     "tier": "S"
   }
 ]
