@@ -319,6 +319,70 @@ describe("release rail policy", () => {
     expect(parity).toContain('DEMO_URL="${DEMO_URL:-http://127.0.0.1:1}"');
   });
 
+  test("server pack excludes Python bytecode caches even when they exist beside sources", () => {
+    const root = mkdtempSync(join(tmpdir(), "thumbmux-server-pack-hygiene-"));
+    const fixture = join(root, "server");
+    roots.push(root);
+    mkdirSync(join(fixture, "dist/__pycache__"), { recursive: true });
+    mkdirSync(join(fixture, "src/integrations/__pycache__"), { recursive: true });
+
+    const manifest = JSON.parse(
+      readFileSync(resolve(packageRoot, "server/package.json"), "utf8"),
+    ) as Record<string, unknown>;
+    // Packing the fixture must exercise the real shipped allow/exclude rules,
+    // without invoking the production build against intentionally tiny files.
+    delete manifest.scripts;
+    writeFileSync(join(fixture, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    writeFileSync(join(fixture, "dist/index.js"), "export {};\n");
+    writeFileSync(
+      join(fixture, "dist/__pycache__/proxy.cpython-312.pyc"),
+      "synthetic built bytecode cache\n",
+    );
+    writeFileSync(join(fixture, "src/index.ts"), "export {};\n");
+    writeFileSync(join(fixture, "src/integrations/proxy.py"), "print('fixture')\n");
+    writeFileSync(join(fixture, "src/integrations/schema.json"), "{}\n");
+    writeFileSync(
+      join(fixture, "src/integrations/__pycache__/proxy.cpython-312.pyc"),
+      "synthetic bytecode cache\n",
+    );
+    writeFileSync(join(fixture, "src/integrations/proxy.pyo"), "synthetic optimized bytecode\n");
+
+    const tarball = join(fixture, "server-pack-hygiene.tgz");
+    const packed = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        "pm",
+        "pack",
+        "--ignore-scripts",
+        "--filename",
+        "server-pack-hygiene.tgz",
+      ],
+      cwd: fixture,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (packed.exitCode !== 0) {
+      throw new Error(packed.stderr.toString() || packed.stdout.toString());
+    }
+    const listed = Bun.spawnSync({
+      cmd: ["tar", "-tzf", tarball],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (listed.exitCode !== 0) {
+      throw new Error(listed.stderr.toString() || listed.stdout.toString());
+    }
+    const files = listed.stdout.toString().trim().split(/\r?\n/);
+
+    expect(files).toContain("package/dist/index.js");
+    expect(files).toContain("package/src/index.ts");
+    expect(files).toContain("package/src/integrations/proxy.py");
+    expect(files).toContain("package/src/integrations/schema.json");
+    expect(files.filter((path) =>
+      path.includes("/__pycache__/") || /\.py[co]$/.test(path)
+    )).toEqual([]);
+  });
+
   test("CI, release, and local parity materialize a verified remote baseline", () => {
     // CI + release materialize via the shared gate; local parity still does
     // it inline (it has no Actions composite runner).

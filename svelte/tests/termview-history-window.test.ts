@@ -37,6 +37,13 @@ type MuxCallback = (
 type HistoryCall =
   | { direction: "before"; cursor: number | null; limit?: number }
   | { direction: "after"; cursor: number | null; limit?: number };
+type HistoryPrependDetail = {
+  lineCount: number;
+  cacheValid: boolean;
+  transformStable: boolean;
+  before: { transform: string; anchorText: string; rowCount: number };
+  after: { transform: string; anchorText: string; rowCount: number };
+};
 type Mounted = {
   app: Record<string, unknown>;
   target: HTMLElement;
@@ -412,6 +419,30 @@ afterEach(() => {
 });
 
 describe("TermView sliding archive window", () => {
+  test("keeps the raw rendered corridor and compositor transform stable across prepends", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    deliverOutput(liveLines("stable-live", 2_000));
+    const prepends: HistoryPrependDetail[] = [];
+    viewport.addEventListener("thumbmux-history-prepend", (event) => {
+      prepends.push((event as CustomEvent<HistoryPrependDetail>).detail);
+    });
+
+    for (const startLine of [4_000, 2_000]) {
+      wheel(viewport, -1_000_000);
+      const transformBefore = viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform;
+      deliverHistory(startLine, archiveLines(startLine, 2_000), true, 6_000);
+      const prepend = prepends.at(-1);
+      expect(prepend).toBeDefined();
+      expect(prepend?.lineCount).toBe(2_000);
+      expect(prepend?.cacheValid).toBe(true);
+      expect(prepend?.transformStable).toBe(true);
+      expect(prepend?.after.transform).toBe(prepend?.before.transform);
+      expect(viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform)
+        .toBe(transformBefore);
+    }
+  });
+
   test("settles a retryable archive error without marking EOF and retries the identical cursor", async () => {
     const { viewport } = mountTermView();
     await tick();

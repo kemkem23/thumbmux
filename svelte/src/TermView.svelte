@@ -3656,6 +3656,9 @@
     const previousWindowLastRow = previousWinEnd > previousWinStart
       ? projectionRowAt(previousWinEnd - 1)
       : null;
+    const previousWindowFirstEntryKey = previousWindowFirstRow
+      ? sgrStateKey(stateBeforeLine(previousWindowFirstRow.rawRange.startLine))
+      : null;
     const previousWindowFirstRawId = previousWindowFirstRow
       ? archiveOffset + previousWindowFirstRow.rawRange.startLine
       : null;
@@ -3731,30 +3734,6 @@
       } else {
         rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
       }
-      if (
-        previousWindowFirstRawId !== null
-        && previousWindowEndRawId !== null
-      ) {
-        const firstRaw = previousWindowFirstRawId - archiveOffset;
-        const endRaw = previousWindowEndRawId - archiveOffset;
-        if (firstRaw >= 0 && firstRaw < rawLines.length && endRaw > firstRaw && endRaw <= rawLines.length) {
-          const nextStart = visualRowForRaw(firstRaw);
-          const nextEnd = visualRowForRaw(endRaw - 1) + 1;
-          const visible = visibleRowRange(bottomOffsetPx);
-          // visible.startIdx already includes one guard row. Keeping the old
-          // first content row one slot below that guard is still covered and
-          // preserves the compositor transform byte-for-byte.
-          if (nextStart <= visible.startIdx + 1) {
-            winStart = nextStart;
-            winEnd = Math.min(total, Math.max(
-              nextEnd,
-              visible.endIdx + OVERSCAN_ROWS,
-            ));
-            buildRenderedWindow(winStart, winEnd);
-            preservedProjectedCorridor = true;
-          }
-        }
-      }
     } else {
       bashProjection = null;
       rebuildPresentationGeometry();
@@ -3771,6 +3750,33 @@
       ));
       bottomOffsetPx = Math.max(0, maxOffset() - nextScrollTop);
     }
+    if (
+      previousWindowFirstRawId !== null
+      && previousWindowEndRawId !== null
+    ) {
+      const firstRaw = previousWindowFirstRawId - archiveOffset;
+      const endRaw = previousWindowEndRawId - archiveOffset;
+      if (firstRaw >= 0 && firstRaw < rawLines.length && endRaw > firstRaw && endRaw <= rawLines.length) {
+        const nextStart = visualRowForRaw(firstRaw);
+        const nextEnd = visualRowForRaw(endRaw - 1) + 1;
+        const visible = visibleRowRange(bottomOffsetPx);
+        // Keep the exact keyed corridor mounted in both raw and grouped modes.
+        // A sliding prepend moves its visual indexes and scrollTop together;
+        // rebuilding around the new overscan origin would otherwise change the
+        // compositor transform for one frame and move the sampled anchor by
+        // OVERSCAN_ROWS. visible.startIdx already includes one guard row, so
+        // one slot below it remains covered.
+        if (nextStart <= visible.startIdx + 1) {
+          winStart = nextStart;
+          winEnd = Math.min(total, Math.max(
+            nextEnd,
+            visible.endIdx + OVERSCAN_ROWS,
+          ));
+          buildRenderedWindow(winStart, winEnd);
+          preservedProjectedCorridor = true;
+        }
+      }
+    }
     if (archiveWindowAttachedToLive) detachedLiveProjectionPending = false;
     if (!preservedProjectedCorridor) {
       rebuildWindow(visibleRowRange(bottomOffsetPx), true);
@@ -3782,11 +3788,16 @@
     if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
 
     const after = historyPrependSnapshot();
+    const corridorCacheValid = preservedProjectedCorridor
+      && previousWindowFirstEntryKey !== null
+      && previousWindowFirstRawId !== null
+      && sgrStateKey(stateBeforeLine(previousWindowFirstRawId - archiveOffset))
+        === previousWindowFirstEntryKey;
     if (options.acceptedLineCount > 0) {
       scheduleDeferredFrame(() => {
         emitHistoryPrependEvent(
           options.acceptedLineCount,
-          false,
+          corridorCacheValid,
           before,
           after,
           {

@@ -38,6 +38,12 @@
     const raw = new URL(window.location.href).searchParams.get('composerMode');
     return raw === 'direct' || raw === 'compose' ? raw : undefined;
   })();
+  // e2e / dogfooding: explicitly exercise either bounded-history policy.
+  // Omitted keeps TermView's stock sliding default.
+  const historyPagingParam = (() => {
+    const raw = new URL(window.location.href).searchParams.get('historyPaging');
+    return raw === 'ceiling' || raw === 'sliding' ? raw : undefined;
+  })();
   // e2e / dogfooding: mirror hosts that dock no persistent shortcut bar, so
   // the first off-bottom scroll mounts a control that really moves the
   // terminal's bottom edge. Omitted = package stock (`true`).
@@ -161,6 +167,7 @@
       // themselves rather than trusting a host to remember.
       termProps: (session) => ({
         claimGeometry: true,
+        ...(historyPagingParam ? { historyPaging: historyPagingParam } : {}),
         altScreenMouse: altScreens[session]
           ?? demoSessionMetadataFromName(session)?.altScreenMouse
           ?? false,

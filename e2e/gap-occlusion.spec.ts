@@ -134,6 +134,10 @@ function demoUrl(session?: string): string {
   if (!process.env.DEMO_URL) throw new Error('DEMO_URL is required');
   const url = new URL(process.env.DEMO_URL);
   if (session) url.searchParams.set('session', session);
+  // This visual regression exercises the explicit fixed-window gap marker.
+  // The package default is bidirectional sliding, which deliberately pages
+  // beyond the cap by evicting the opposite edge instead of creating this gap.
+  url.searchParams.set('historyPaging', 'ceiling');
   return url.toString();
 }
 
@@ -194,6 +198,7 @@ async function expandRealHistoryToCap(page: Page, session: string): Promise<void
   // server archive, not a fixed client live-window length.
   await expect.poll(() => archiveLineCount(session), { timeout: 30_000 })
     .toBeGreaterThanOrEqual(INITIAL_ROWS - INITIAL_LIVE_ROWS);
+  await expect(page.getByTestId('mtv')).toHaveAttribute('data-history-paging', 'ceiling');
   await expect.poll(() => dataTotal(page), { timeout: 30_000 }).toBeGreaterThan(0);
   for (let pageIndex = 0; pageIndex < 8 && await dataTotal(page) < RETAINED_ROW_CAP; pageIndex++) {
     const before = await dataTotal(page);
@@ -203,10 +208,10 @@ async function expandRealHistoryToCap(page: Page, session: string): Promise<void
   await expect.poll(() => dataTotal(page), { timeout: 30_000 }).toBe(RETAINED_ROW_CAP);
   await wheelToOldestLoadedRow(page);
   await expect.poll(async () => page.getByTestId('mtv').evaluate((mtv) => {
-    const total = Number(mtv.getAttribute('data-total'));
+    const presentationHeight = Number(mtv.getAttribute('data-presentation-height'));
     const lineHeight = Number.parseFloat(getComputedStyle(mtv).lineHeight);
     const bottomOffset = Number(mtv.getAttribute('data-bottom-offset'));
-    const maxOffset = Math.max(0, total * lineHeight - mtv.clientHeight);
+    const maxOffset = Math.max(0, presentationHeight - mtv.clientHeight);
     return Math.abs(maxOffset - bottomOffset) <= lineHeight;
   })).toBe(true);
 }
