@@ -186,6 +186,21 @@ member list is complete, which is the one thing an extension point cannot promis
 Such a consumer should key off the members it actually uses. If you need the
 complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes.
 
+`AppAdapters.bashSummaries` is the optional, host-owned boundary for Claude Code
+Bash summaries. Omitting it makes no model call: `off` remains the default,
+`hide` is local projection, and `haiku` settles to a deterministic command
+preview when the adapter is absent, rejects, or omits an id. `TermView` requests
+only high-confidence completed blocks in a settled real viewport; active calls,
+alternate/unknown screens, incomplete captures, and ambiguous layouts stay raw
+or use the local active placeholder. The source rows remain canonical for copy,
+search, history, retention, raw/visual coordinate mapping, and ANSI/OSC state in
+all modes. The host owns model choice, authentication, redaction, lifecycle
+checks, throttling, and durable caching. The low-level `ClaudeBash*`,
+`detectClaudeBashBlocks`, and `projectClaudeBashLines` core exports are tier X:
+Claude controls the painted layout, so those detector/projection contracts are
+explicitly experimental even though omission behavior in the app shell is
+additive.
+
 `AppAdapters.sendSubmissionKeys` is the optional composer-submission transport.
 `SessionView` and `EmbedView` use it for `submitPlan` steps only; raw terminal,
 desktop-key, direct-mode, D-pad, and non-submitting shortcut input stays on

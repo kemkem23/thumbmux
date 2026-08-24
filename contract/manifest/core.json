@@ -42,6 +42,78 @@
     "tier": "F"
   },
   {
+    "name": "ClaudeBashBlock",
+    "kind": "type",
+    "signature": "2f0606d4c61e21fc8cc1ea936d3eed68d19d8e230a2f0a881090a5064ee1a33f",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashBlockStatus",
+    "kind": "type",
+    "signature": "a3f80f7817422ecaa46b0f156e18ae0debf9bd5e6639974bd594d237e38ec52c",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashDetection",
+    "kind": "type",
+    "signature": "5935c41985e9b2d07b5b692f842590d4ddceead840800ed27647525cc469f34a",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashDetectionOptions",
+    "kind": "type",
+    "signature": "fe16156d3602ecaea11fad6e49c57835ba874107a6fe5088e2755df0a2ad0b9c",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashLineRange",
+    "kind": "type",
+    "signature": "32d6dfc0a614b8765adc97c69b8e32aee2293685863895a49b07aa7abc6be29b",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashMode",
+    "kind": "type",
+    "signature": "55b2d1dffadeb72d693f2d937c6afbaaf239f5b70f6e49de9d275da557bb023a",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjection",
+    "kind": "type",
+    "signature": "7d5a35ef071992271d90a6668dff1e1b1408f1ca417966b288ac4dca38e78153",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjectionOptions",
+    "kind": "type",
+    "signature": "2f1b23dd7b2a04fea02123dc16ac09133f27b1c75a326831fbe4e2d002ffe0cf",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjectionRow",
+    "kind": "type",
+    "signature": "bd80cfcab43eefe3830412f7b33edf580442f2410c6a8bb7c87437930a2da715",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashScreenMode",
+    "kind": "type",
+    "signature": "3a437bbf26bb9c1019dc834caf4ee3b0006420f4c55f904a158783f7b2ff17eb",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashSummaries",
+    "kind": "type",
+    "signature": "0cbebcfcda9462f2430acdd96f39d88bc60c86a11a7c645b57e6d4b611776ce0",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashSummaryRequest",
+    "kind": "type",
+    "signature": "82b9d84f97730aa27b451e4bfee1d60f6890b5f2638b7a999f2463db34a79e84",
+    "tier": "X"
+  },
+  {
     "name": "DEFAULT_ANSI_COLORS",
     "kind": "value",
     "signature": "f83dc176b81eeb0a2b71b32ef49640fd941eb78a0cb8742f5eb8ab345119b2f5",
@@ -516,6 +588,12 @@
     "tier": "F"
   },
   {
+    "name": "detectClaudeBashBlocks",
+    "kind": "value",
+    "signature": "0fd028227b414552b6f9651b7546eabfee5f58484d9ada47848b3a558a5147ad",
+    "tier": "X"
+  },
+  {
     "name": "extractRecentPrompts",
     "kind": "value",
     "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
@@ -676,6 +754,12 @@
     "kind": "value",
     "signature": "7317016c15250832563c0fb5cde557efa980e23d767db545fed7b0c33b1432bb",
     "tier": "F"
+  },
+  {
+    "name": "projectClaudeBashLines",
+    "kind": "value",
+    "signature": "0d8d664daae7459395624024964252b2c44e7385c8e8e9c3d9177db2f571dcf6",
+    "tier": "X"
   },
   {
     "name": "readerAnchorLineDelta",

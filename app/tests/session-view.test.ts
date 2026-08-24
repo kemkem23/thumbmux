@@ -10,6 +10,7 @@ import type {
   AnsiPalette,
   SubmitAgent,
   TerminalSurfaceWithPalette,
+  ThumbmuxPrefs,
   UploadedFile,
 } from '@thumbmux/core';
 import { submitPlan } from '@thumbmux/core';
@@ -1509,6 +1510,149 @@ describe('mountable terminal views', () => {
       'A− Smaller text',
       'Legacy extra',
     ]);
+  });
+
+  test('Claude Bash action cycles OFF, HIDE, HAIKU and persists the shared preference', async () => {
+    const saved: Array<Partial<ThumbmuxPrefs>> = [];
+    let publishPrefs: ((prefs: ThumbmuxPrefs) => void) | undefined;
+    const { target } = mountView(SessionView, {
+      session: 'cc-bash-mode',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        submitAgent: () => 'claude',
+        prefs: {
+          load: async () => ({ claudeBashMode: 'hide' }),
+          save: async (patch) => { saved.push(patch); },
+          subscribe: (callback) => {
+            publishPrefs = callback;
+            return () => {};
+          },
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await openFab(target);
+
+    const slots = target.querySelector<HTMLElement>('.slots');
+    const action = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
+    if (!slots || !action) throw new Error('Claude Bash mode action did not render');
+    expect(action.textContent?.trim()).toBe('Bash: HIDE');
+    expect(action.getAttribute('aria-hidden')).toBe('false');
+
+    flushSync(() => action.click());
+    await tick();
+    expect(saved.at(-1)).toEqual({ claudeBashMode: 'haiku' });
+    expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
+      .toBe('Bash: HAIKU');
+    expect(slots.classList.contains('open')).toBe(true);
+
+    const haikuAction = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
+    if (!haikuAction) throw new Error('Claude Bash HAIKU action did not render');
+    flushSync(() => haikuAction.click());
+    await tick();
+    expect(saved.at(-1)).toEqual({ claudeBashMode: 'off' });
+    expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
+      .toBe('Bash: OFF');
+
+    if (!publishPrefs) throw new Error('SessionView did not subscribe to shared preferences');
+    flushSync(() => publishPrefs?.({ claudeBashMode: 'hide' }));
+    await tick();
+    expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
+      .toBe('Bash: HIDE');
+  });
+
+  test('Bash action stays absent outside Claude sessions even when the stored mode is HAIKU', async () => {
+    const { target } = mountView(SessionView, {
+      session: 'codex-no-bash-mode',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        submitAgent: () => 'codex',
+        prefs: {
+          load: async () => ({ claudeBashMode: 'haiku' }),
+          save: async () => {},
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await openFab(target);
+
+    expect(target.querySelector('[data-testid="demo-bash-mode"]')).toBeNull();
+  });
+
+  test('rejected Haiku adapter settles once to a deterministic Bash preview', async () => {
+    type OutputCallback = (
+      data: string,
+      type?: string,
+      cursor?: { row: number; col: number } | null,
+      meta?: {
+        source: 'full' | 'delta';
+        replace: boolean;
+        screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
+      },
+    ) => void;
+    let deliverOutput: OutputCallback | undefined;
+    tmuxMux.subscribe = ((_session: string, callback: OutputCallback) => {
+      deliverOutput = callback;
+      return () => {};
+    }) as typeof tmuxMux.subscribe;
+    ControlledResizeObserver.latest = null;
+    globalThis.ResizeObserver = ControlledResizeObserver;
+    window.ResizeObserver = ControlledResizeObserver;
+
+    let requests = 0;
+    const { target } = mountView(SessionView, {
+      session: 'cc-bash-summary-failure',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        submitAgent: () => 'claude',
+        prefs: {
+          load: async () => ({ claudeBashMode: 'haiku' }),
+          save: async () => {},
+        },
+        bashSummaries: async (_session, batch) => {
+          requests += 1;
+          expect(batch).toHaveLength(1);
+          expect(batch[0]?.command).toBe("sed -n '1,80p' src/a.ts");
+          throw new Error('Haiku unavailable');
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal || !deliverOutput) throw new Error('TermView did not mount its output stream');
+    Object.defineProperties(terminal, {
+      clientWidth: { configurable: true, value: 640 },
+      clientHeight: { configurable: true, value: 320 },
+    });
+    const observer = ControlledResizeObserver.latest;
+    if (!observer) throw new Error('TermView did not observe its viewport');
+    observer.fire();
+
+    deliverOutput([
+      '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(sed -n \'1,80p\' src/a.ts)',
+      '\x1b[38;5;246m  ⎿ \u00a0\x1b[39mfile contents',
+      '● ต่อไป',
+    ].join('\n'), 'output', null, {
+      source: 'full',
+      replace: true,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    await flushPromises();
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    await tick();
+
+    const placeholder = target.querySelector<HTMLElement>('.mtv-bash-placeholder');
+    if (!placeholder) throw new Error('TermView did not collapse the completed Bash block');
+    expect(placeholder.textContent).toBe("Bash · sed -n '1,80p' src/a.ts · 2 แถว");
+    expect(placeholder.textContent).not.toContain('กำลังสรุป');
+    expect(requests).toBe(1);
+
+    // Re-presenting the same viewport must not turn a provider outage into a
+    // request loop; the deterministic row is already final for this block id.
+    observer.fire();
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    expect(requests).toBe(1);
   });
 
   test('omitted shortcut option keeps the stock shortcut bar', async () => {
