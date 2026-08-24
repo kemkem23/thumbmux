@@ -18,10 +18,10 @@
     },
     "app": {
       "name": "@thumbmux/app",
-      "version": "0.18.1",
+      "version": "0.18.2",
       "dependencies": {
-        "@thumbmux/core": "^0.18.1",
-        "@thumbmux/svelte": "^0.18.1",
+        "@thumbmux/core": "^0.18.2",
+        "@thumbmux/svelte": "^0.18.2",
       },
       "devDependencies": {
         "@sveltejs/package": "^2.5.4",
@@ -35,7 +35,7 @@
     },
     "core": {
       "name": "@thumbmux/core",
-      "version": "0.18.1",
+      "version": "0.18.2",
       "devDependencies": {
         "typescript": "^5.9.3",
       },
@@ -54,9 +54,9 @@
     },
     "server": {
       "name": "@thumbmux/server",
-      "version": "0.18.1",
+      "version": "0.18.2",
       "dependencies": {
-        "@thumbmux/core": "^0.18.1",
+        "@thumbmux/core": "^0.18.2",
       },
       "devDependencies": {
         "@types/bun": "^1.3.0",
@@ -65,9 +65,9 @@
     },
     "svelte": {
       "name": "@thumbmux/svelte",
-      "version": "0.18.1",
+      "version": "0.18.2",
       "dependencies": {
-        "@thumbmux/core": "^0.18.1",
+        "@thumbmux/core": "^0.18.2",
       },
       "devDependencies": {
         "@sveltejs/package": "^2.5.4",

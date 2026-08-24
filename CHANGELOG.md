@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.2-dist`.
+
+## v0.18.2 — 2026-08-24
+
+### Fixed
+
+- **The first upward gesture on a short live terminal now enters archived
+  history instead of snapping back to the live tail.** When the live Bash
+  projection is shorter than the viewport, `TermView` preserves the atomic
+  prepend anchor and then replays the wheel distance that had no physical
+  scroll range before the history page arrived. Repeated wheels accumulate on
+  the same request, down-then-up cancellation reclaims only the newest intent,
+  retryable failures discard stale intent, and non-sliding history mode keeps
+  its original live-tail behavior.
 
 ## v0.18.1 — 2026-08-24
 
