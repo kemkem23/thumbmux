@@ -18,14 +18,15 @@
     testid?: string;
     /** small trailing tag, e.g. "SEND" */
     tag?: string;
-    /**
-     * Optional one-level choice flyout. The action button becomes a disclosure
-     * and the choices open to its left; its `onTap` is retained for backwards
-     * type compatibility but is not invoked while choices are present.
-     */
-    choices?: readonly FabActionChoice[];
-    choicesAria?: string;
     onTap: () => void;
+  };
+
+  /** Optional one-level flyout kept separate from `FabAction` so adding this
+   * presentation does not widen the frozen action type used by app adapters. */
+  export type FabActionFlyout = {
+    actionId: string;
+    choices: readonly FabActionChoice[];
+    ariaLabel?: string;
   };
 </script>
 
@@ -39,6 +40,7 @@
     open = $bindable(false),
     active = false,
     actions,
+    flyouts = [],
     onFab,
     fabAria = 'Actions',
   }: {
@@ -46,6 +48,7 @@
     /** rotate the FAB into ✕ posture (any sheet open) */
     active?: boolean;
     actions: FabAction[];
+    flyouts?: readonly FabActionFlyout[];
     onFab: (e: MouseEvent) => void;
     fabAria?: string;
   } = $props();
@@ -53,11 +56,16 @@
   let expandedActionId = $state<string | null>(null);
   let fabElement = $state<HTMLButtonElement | null>(null);
 
+  function flyoutFor(actionId: string): FabActionFlyout | undefined {
+    return flyouts.find((flyout) => flyout.actionId === actionId);
+  }
+
   $effect(() => {
     if (
       expandedActionId !== null
       && (!open || !actions.some((action) => (
-        action.id === expandedActionId && (action.choices?.length ?? 0) > 0
+        action.id === expandedActionId
+        && (flyoutFor(action.id)?.choices.length ?? 0) > 0
       )))
     ) {
       expandedActionId = null;
@@ -66,7 +74,7 @@
 
   function activateAction(action: FabAction): void {
     if (!open) return;
-    if ((action.choices?.length ?? 0) > 0) {
+    if ((flyoutFor(action.id)?.choices.length ?? 0) > 0) {
       expandedActionId = expandedActionId === action.id ? null : action.id;
       return;
     }
@@ -111,7 +119,8 @@
 
 <div class="slots" class:open aria-hidden={!open}>
   {#each actions as a (a.id)}
-    {@const hasChoices = (a.choices?.length ?? 0) > 0}
+    {@const flyout = flyoutFor(a.id)}
+    {@const hasChoices = (flyout?.choices.length ?? 0) > 0}
     {@const choicesOpen = open && expandedActionId === a.id}
     <div class="slot-row" class:has-choices={hasChoices}>
       <!-- A6-12: closed slots stay mounted for the open animation but must not
@@ -138,10 +147,10 @@
           class="choices"
           class:open={choicesOpen}
           role="group"
-          aria-label={a.choicesAria ?? `${a.label} choices`}
+          aria-label={flyout?.ariaLabel ?? `${a.label} choices`}
           aria-hidden={!choicesOpen}
         >
-          {#each a.choices ?? [] as choice (choice.id)}
+          {#each flyout?.choices ?? [] as choice (choice.id)}
             <button
               type="button"
               class="choice"

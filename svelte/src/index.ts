@@ -36,6 +36,7 @@ export {
   default as ActionFab,
   type FabAction,
   type FabActionChoice,
+  type FabActionFlyout,
 } from './ActionFab.svelte';
 export { tmuxMux, configureTmuxMux, TmuxMux, type TmuxMuxOptions } from './ws-mux.svelte';
 export { default as NewTerminalSheet, type SpawnAgent } from './NewTerminalSheet.svelte';
