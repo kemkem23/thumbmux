@@ -24,7 +24,8 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 |---|---|
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). In the regular path it is sent when the content hash changed, but cached startup snapshots and cache-driven resync/catch-up replies can also send full output without a hash delta; a resize or resync path also emits reset output frames. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
-| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive, an unsupported forward read, or an archive read that throws uses `{lines:[], startLine:null, hasMore:false}` as a synchronous fallback. Archive-error logging is best effort: a throwing host logger cannot suppress the mux's single reply attempt. Delivery still depends on `ws.send` succeeding, so clients should retain their own request timeout and recovery. |
+| `{channel, type:"history", data}` | Successful `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive or an unsupported forward reader uses `{lines:[], startLine:null, hasMore:false}`; an actual read failure does **not** use that shape because it would falsely claim archive EOF. |
+| `{channel, type:"error", data:"history_temporarily_unavailable", code:"history_temporarily_unavailable", request:"history_expand", retryable:true}` | Correlated settlement for an accepted history request whose archive boundary/read threw. It releases the same per-session request lease as a `history` reply without marking either edge exhausted. The bundled `TermView` leaves its absolute cursor unchanged, so a later eligible scroll retries the same range. The server never copies the exception text onto the wire; archive-error logging and delivery are best effort. |
 | `{channel, type:"error", data}` | e.g. the session disappeared. A host-driven `invalidateSession()` makes one final send attempt to each affected WebSocket subscriber before that session lifecycle goes quiet. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
@@ -142,6 +143,13 @@ request the other direction. Do not issue concurrent before/after requests or
 try to infer their direction from `startLine`, `hasMore`, or row order; those
 fields are valid in both directions.
 
+The retryable `history_temporarily_unavailable` error is the only non-history
+frame that settles this same lease. It is deliberately identified by all three
+fields (`request`, `code`, and `retryable`), not by `type:"error"` alone: other
+error frames describe session lifecycle failures and must not be mistaken for
+a page reply. A retryable failure is not EOF, so clients must retain both the
+direction and the exact absolute cursor for the next request.
+
 The bundled `TmuxMux` applies that rule to both public paging methods:
 `requestHistory(session, beforeLine?, limit?)` pages backward and
 `requestHistoryAfter(session, afterLine, limit?)` pages forward. They share a
@@ -247,16 +255,14 @@ were never requested. When the server reports the true start of archived
 history (`hasMore: false`), `data-history-stop="exhausted"` and **no** ceiling
 banner is shown — the top row really is the start.
 
-#### `TmuxWsMux` mutates the tmux session's `history-limit`
+#### `TmuxWsMux` does not lower tmux `history-limit`
 
-After a successful archive seed, the mux calls
-`driver.setSessionHistoryLimit(session, liveLineLimit)`, permanently lowering
-that tmux session's own scrollback to the live-window size. This is deliberate —
-the archive becomes the durable history and tmux keeps only a working window —
-but it is destructive and is not reversed when the archive is deleted. Any host
-tooling that reads deep scrollback straight from tmux (`capture-pane -S -`) for
-the same session must be sized against `liveLineLimit`, not against the tmux
-global.
+Archive ingestion trims only the snapshot returned to viewers. It does not call
+`driver.setSessionHistoryLimit`: a polling archive needs tmux's existing ring to
+absorb bursts between captures, and changing a session option does not resize
+windows that already exist anyway. A host may choose a smaller ring when it
+creates a new window, but that is an external retention decision rather than a
+mux side effect.
 
 #### `sessions_subscribe` idempotency
 

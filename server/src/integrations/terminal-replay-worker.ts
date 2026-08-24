@@ -388,6 +388,8 @@ function normalizeMaterializerOptions(value: unknown): TerminalReplayMaterialize
     "historyLimit",
     "commandTimeoutMs",
     "maxWalFrameBytesPerRefresh",
+    "recoverySequence",
+    "recoveryWalOffset",
   ] as const;
   exactKeys(value, ["walPath", "stateDir"], optional, label);
   const path = (key: "walPath" | "stateDir" | "historyPath" | "checkpointPath") =>
@@ -446,16 +448,46 @@ function normalizeMaterializerOptions(value: unknown): TerminalReplayMaterialize
       256 * 1024 * 1024,
     );
   }
+  if ((value.recoverySequence === undefined) !== (value.recoveryWalOffset === undefined)) {
+    throw new Error(`${label}.recoverySequence and recoveryWalOffset must be supplied together`);
+  }
+  if (value.recoverySequence !== undefined && value.recoveryWalOffset !== undefined) {
+    const recoverySequence = boundedString(value.recoverySequence, `${label}.recoverySequence`, 20);
+    if (!/^[1-9]\d*$/.test(recoverySequence) || BigInt(recoverySequence) > MAX_UINT64) {
+      throw new Error(`${label}.recoverySequence must be a positive uint64 decimal`);
+    }
+    normalized.recoverySequence = recoverySequence;
+    normalized.recoveryWalOffset = boundedInteger(
+      value.recoveryWalOffset,
+      `${label}.recoveryWalOffset`,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+  }
   return normalized;
 }
 
-function normalizeWorkerPath(value: string | URL | undefined): string {
+/** Resolve and verify the replay-worker entry shipped beside the server
+ * bundle. The TypeScript source candidate keeps Bun source checkouts usable,
+ * while a published Node build must resolve the adjacent JavaScript asset. */
+export function resolveTerminalReplayWorkerPath(value?: string | URL): string {
+  let workerPath: string;
   if (value instanceof URL) {
     if (value.protocol !== "file:") throw new Error("workerPath URL must use file:");
-    return fileURLToPath(value);
+    workerPath = fileURLToPath(value);
+  } else if (value !== undefined) {
+    workerPath = resolve(boundedString(value, "workerPath", MAX_PATH_BYTES));
+  } else {
+    const candidates = [
+      fileURLToPath(new URL("./terminal-replay-worker-entry.js", import.meta.url)),
+      fileURLToPath(new URL("../terminal-replay-worker-entry.ts", import.meta.url)),
+    ];
+    workerPath = candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
   }
-  if (value !== undefined) return resolve(boundedString(value, "workerPath", MAX_PATH_BYTES));
-  return fileURLToPath(new URL("./terminal-replay-worker-entry.js", import.meta.url));
+  if (!existsSync(workerPath)) {
+    throw new Error(`terminal replay worker does not exist: ${workerPath}`);
+  }
+  return workerPath;
 }
 
 function normalizeClientOptions(value: TerminalReplayWorkerClientOptions): NormalizedClientOptions {
@@ -472,9 +504,8 @@ function normalizeClientOptions(value: TerminalReplayWorkerClientOptions): Norma
     "runtimePath",
     MAX_PATH_BYTES,
   ));
-  const workerPath = normalizeWorkerPath(value.workerPath);
+  const workerPath = resolveTerminalReplayWorkerPath(value.workerPath);
   if (!existsSync(runtimePath)) throw new Error(`terminal replay runtime does not exist: ${runtimePath}`);
-  if (!existsSync(workerPath)) throw new Error(`terminal replay worker does not exist: ${workerPath}`);
   return {
     materializer: normalizeMaterializerOptions(value.materializer),
     runtimePath,
@@ -1030,9 +1061,21 @@ class ProcessTerminalReplayWorkerClient implements TerminalReplayWorkerClient {
   }
 
   async open(): Promise<void> {
-    const result = await this.send("open");
-    if (!result) throw new TerminalReplayWorkerError("PROTOCOL_ERROR", "open returned no result");
-    this.latestResult = result;
+    try {
+      const result = await this.send("open");
+      if (!result) {
+        throw new TerminalReplayWorkerError("PROTOCOL_ERROR", "open returned no result");
+      }
+      this.latestResult = result;
+    } catch (error) {
+      // An open failure is terminal: the factory cannot return this client.
+      // Mark it before cleanup so close() reaps the child immediately instead
+      // of sending a close request to a worker that already rejected OPEN.
+      this.fail(error instanceof TerminalReplayWorkerError
+        ? error
+        : new TerminalReplayWorkerError("OPEN_FAILED", errorMessage(error), { cause: error }));
+      throw error;
+    }
   }
 
   current(): Promise<TerminalReplayResult> {

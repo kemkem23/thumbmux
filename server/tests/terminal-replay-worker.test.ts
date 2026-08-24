@@ -11,6 +11,7 @@ import { OutputWalWriter } from "../src/output-wal";
 import type { TerminalReplayResult } from "../src/terminal-replay-materializer";
 import {
   createTerminalReplayWorkerClient,
+  resolveTerminalReplayWorkerPath,
   terminalReplayResultFromWire,
   terminalReplayResultToWire,
   TerminalReplayWorkerError,
@@ -32,6 +33,12 @@ const timeoutWorker = fileURLToPath(
 
 let roots: string[] = [];
 let clients: TerminalReplayWorkerClient[] = [];
+
+test("replay worker asset resolution fails closed for a missing shipped entry", () => {
+  const root = makeRoot();
+  expect(() => resolveTerminalReplayWorkerPath(join(root, "missing-worker.js")))
+    .toThrow("terminal replay worker does not exist");
+});
 
 function makeRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "thumbmux-replay-ipc-test-"));
@@ -168,6 +175,42 @@ describe("out-of-process terminal replay worker", () => {
     expect(batches).toBeGreaterThan(3);
   }, 40_000);
 
+  test("carries an exact recovery record boundary across IPC before exposing its suffix", async () => {
+    const root = makeRoot();
+    const options = materializerOptions(root);
+    const writer = new OutputWalWriter({ path: options.walPath, clock: () => 4 });
+    writer.appendJson("lifecycle", lifecycle("start"));
+    const target = writer.appendOutput(numbered(1, 8));
+    writer.appendOutput(numbered(9, 30));
+    writer.close();
+
+    const client = await createTerminalReplayWorkerClient({
+      materializer: {
+        ...options,
+        recoverySequence: target.sequence.toString(),
+        recoveryWalOffset: target.nextOffset,
+      },
+      workerPath: workerEntry,
+      requestTimeoutMs: 30_000,
+      shutdownGraceMs: 2_000,
+    });
+    clients.push(client);
+
+    expect(client.lastResult.sequence).toBe(target.sequence);
+    expect(client.lastResult.walOffset).toBe(target.nextOffset);
+    expect(client.lastResult.hasMoreWal).toBeTrue();
+    expect(renderedNumbers(client.lastResult)).toEqual(
+      Array.from({ length: 8 }, (_, index) => index + 1),
+    );
+
+    const suffix = await client.refresh();
+    expect(suffix.sequence).toBe(3n);
+    expect(suffix.hasMoreWal).toBeFalse();
+    expect(renderedNumbers(suffix)).toEqual(
+      Array.from({ length: 30 }, (_, index) => index + 1),
+    );
+  }, 40_000);
+
   test("round-trips uint64 WAL sequences without a JSON number", () => {
     const sequence = 9_007_199_254_740_993n;
     const source: TerminalReplayResult = {
@@ -232,6 +275,78 @@ describe("out-of-process terminal replay worker", () => {
     expect(recovered.sequence).toBe(3n);
     expect(renderedNumbers(recovered)).toEqual(
       Array.from({ length: 30 }, (_, index) => index + 1),
+    );
+  }, 40_000);
+
+  test("one stateDir has one process writer and SIGKILL releases its SQLite lease", async () => {
+    const root = makeRoot();
+    const options = materializerOptions(root);
+    const firstWriter = new OutputWalWriter({ path: options.walPath, clock: () => 20 });
+    firstWriter.appendJson("lifecycle", lifecycle("start"));
+    firstWriter.appendOutput(numbered(1, 30));
+    firstWriter.close();
+
+    const holder = await createTerminalReplayWorkerClient({
+      materializer: options,
+      workerPath: workerEntry,
+      requestTimeoutMs: 30_000,
+      shutdownGraceMs: 2_000,
+    });
+    clients.push(holder);
+    expect(holder.lastResult.historyBytes).toBeGreaterThan(0);
+    const holderCheckpoint = readFileSync(holder.lastResult.checkpointPath);
+    const holderHistory = readFileSync(holder.lastResult.historyPath);
+    const holderOffset = holder.lastResult.walOffset;
+    const holderSequence = holder.lastResult.sequence;
+
+    const contenderStarted = Date.now();
+    try {
+      await createTerminalReplayWorkerClient({
+        materializer: options,
+        workerPath: workerEntry,
+        requestTimeoutMs: 30_000,
+        shutdownGraceMs: 2_000,
+      });
+      throw new Error("expected the competing replay worker to be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(TerminalReplayWorkerError);
+      expect((error as TerminalReplayWorkerError).code).toBe("OPEN_FAILED");
+      expect((error as Error).message).toContain(
+        "terminal replay state already has an active writer",
+      );
+    }
+    expect(Date.now() - contenderStarted).toBeLessThan(3_000);
+
+    // A rejected process must not read a stale checkpoint and truncate or
+    // republish either of the active holder's derived files.
+    expect(readFileSync(holder.lastResult.checkpointPath)).toEqual(holderCheckpoint);
+    expect(readFileSync(holder.lastResult.historyPath)).toEqual(holderHistory);
+
+    process.kill(holder.pid, "SIGKILL");
+    await eventually(() => holder.closed, "SIGKILLed replay worker exit");
+    await holder.close();
+    clients = clients.filter((selected) => selected !== holder);
+
+    const replacement = await createTerminalReplayWorkerClient({
+      materializer: options,
+      workerPath: workerEntry,
+      requestTimeoutMs: 30_000,
+      shutdownGraceMs: 2_000,
+    });
+    clients.push(replacement);
+    expect(replacement.lastResult.recoveredFromCheckpoint).toBe(true);
+    expect(replacement.lastResult.walOffset).toBe(holderOffset);
+    expect(replacement.lastResult.sequence).toBe(holderSequence);
+    expect(readFileSync(replacement.lastResult.historyPath)).toEqual(holderHistory);
+
+    const appended = new OutputWalWriter({ path: options.walPath, clock: () => 21 });
+    appended.appendOutput(numbered(31, 45));
+    appended.close();
+    const advanced = await replacement.refresh();
+    expect(advanced.sequence).toBe(holderSequence + 1n);
+    expect(advanced.walOffset).toBeGreaterThan(holderOffset);
+    expect(renderedNumbers(advanced)).toEqual(
+      Array.from({ length: 45 }, (_, index) => index + 1),
     );
   }, 40_000);
 

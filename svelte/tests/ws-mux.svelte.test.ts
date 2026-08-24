@@ -593,6 +593,49 @@ describe('TmuxMux archive history paging', () => {
     socket.finishClose();
   });
 
+  test('a retryable history error settles the wire lease and reaches the subscriber without posing as EOF', () => {
+    const deliveries: Array<{ data: string; type?: string; meta?: unknown }> = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type, _cursor, meta) => {
+      deliveries.push({ data, type, meta });
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    expect(mux.requestHistory('work', 100, 25)).toBe(false);
+
+    socket.receive({
+      channel: 'work',
+      type: 'error',
+      data: 'history_temporarily_unavailable',
+      code: 'history_temporarily_unavailable',
+      request: 'history_expand',
+      retryable: true,
+    });
+
+    expect(deliveries).toEqual([{
+      data: 'history_temporarily_unavailable',
+      type: 'error',
+      meta: {
+        source: 'full',
+        replace: false,
+        historyError: {
+          code: 'history_temporarily_unavailable',
+          retryable: true,
+        },
+      },
+    }]);
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    expect(socket.frames().filter((frame) => frame.type === 'history_expand')).toEqual([
+      { type: 'history_expand', session: 'work', beforeLine: 100, limit: 25 },
+      { type: 'history_expand', session: 'work', beforeLine: 100, limit: 25 },
+    ]);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
   test('retries on a replacement socket so a late different-anchor reply is fenced', () => {
     const deliveries: string[] = [];
     const mux = new TmuxMux();

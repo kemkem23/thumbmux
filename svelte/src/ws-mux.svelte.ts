@@ -23,6 +23,15 @@ export type MuxDeliveryMeta = {
   screen?: MuxPaneScreen | null;
   /** Sticky durable archive/live seam paired with this output snapshot. */
   boundary?: MuxHistoryBoundary;
+  /**
+   * Present only when an additive `error` wire frame settles a failed history
+   * read. The ordinary output fields stay populated for callback compatibility;
+   * consumers must use this marker rather than treating the error as pane data.
+   */
+  historyError?: {
+    code: 'history_temporarily_unavailable';
+    retryable: true;
+  };
 };
 
 type Callback = (
@@ -75,6 +84,26 @@ const utf8 = new TextEncoder();
 const BYTES_OPEN = utf8.encode('[');
 const BYTES_CLOSE = utf8.encode(']');
 const BYTES_COMMA = utf8.encode(',');
+
+function isRetryableHistoryErrorFrame(value: unknown): value is {
+  channel: string;
+  type: 'error';
+  data: 'history_temporarily_unavailable';
+  code: 'history_temporarily_unavailable';
+  request: 'history_expand';
+  retryable: true;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const frame = value as Record<string, unknown>;
+  return (
+    typeof frame.channel === 'string' &&
+    frame.type === 'error' &&
+    frame.data === 'history_temporarily_unavailable' &&
+    frame.code === 'history_temporarily_unavailable' &&
+    frame.request === 'history_expand' &&
+    frame.retryable === true
+  );
+}
 
 function fnvFeed(hash: number, bytes: Uint8Array): number {
   for (let i = 0; i < bytes.length; i++) {
@@ -897,7 +926,8 @@ export class TmuxMux {
         // historyFenced drops late replies so they cannot land on a later
         // subscriber. Unsolicited history (no fence) still delivers — the
         // deferred-queue flush-before-history contract depends on that.
-        if (msg.type === 'history' && typeof msg.channel === 'string') {
+        const retryableHistoryError = isRetryableHistoryErrorFrame(msg);
+        if ((msg.type === 'history' || retryableHistoryError) && typeof msg.channel === 'string') {
           const wasInflight = this.historyInflight.get(msg.channel) === socket;
           if (wasInflight) this.historyInflight.delete(msg.channel);
           if (!wasInflight && this.historyFenced.has(msg.channel)) {
@@ -982,7 +1012,12 @@ export class TmuxMux {
           return;
         }
 
-        if (msg.type === 'history' || msg.type === 'error' || msg.type === 'cursor') {
+        if (
+          msg.type === 'history' ||
+          retryableHistoryError ||
+          msg.type === 'error' ||
+          msg.type === 'cursor'
+        ) {
           // Flush deferred content first so caret/history never lands ahead
           // of the pane state it belongs to.
           if (this.deferredDeltas.has(msg.channel)) {
@@ -993,7 +1028,21 @@ export class TmuxMux {
           for (const cb of cbs) {
             // "cursor" frames carry no data — callbacks that render output
             // must check `type` before treating data as pane content.
-            cb(msg.data ?? '', msg.type as OutputType, msg.cursor);
+            cb(
+              msg.data ?? '',
+              msg.type as OutputType,
+              msg.cursor,
+              retryableHistoryError
+                ? {
+                    source: 'full',
+                    replace: false,
+                    historyError: {
+                      code: 'history_temporarily_unavailable',
+                      retryable: true,
+                    },
+                  }
+                : undefined,
+            );
           }
         }
       } catch {}

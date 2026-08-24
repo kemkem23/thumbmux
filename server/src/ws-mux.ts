@@ -1587,14 +1587,28 @@ export class TmuxWsMux<
       const message = error instanceof Error ? error.message : String(error);
       this.logError(`[thumbmux-mux] archive ${method} error for "${session}":`, message);
     } catch {
-      // The archive failure is represented by the empty-page reply below.
+      // The archive failure is represented by a retryable wire reply below.
       // Logging is observability-only; retrying or using another logger could
       // throw recursively, so a logger failure must not replace that reply.
     }
   }
 
+  private sendHistoryReadErrorBestEffort(session: string, ws: WS): void {
+    try {
+      this.wsSend(ws, JSON.stringify({
+        channel: session,
+        type: "error",
+        data: "history_temporarily_unavailable",
+        code: "history_temporarily_unavailable",
+        request: "history_expand",
+        retryable: true,
+      }));
+    } catch {}
+  }
+
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
+    let readFailed = false;
     // SessionProfile.archive gates history_expand as well as capture feed
     // (A3-6). A current-pane-only / non-archived profile must not surface
     // durable rows retained under the same session name.
@@ -1602,23 +1616,32 @@ export class TmuxWsMux<
       // `null` means "the oldest row I can show" to the client. An archive that
       // stores the live window durably ends BELOW that row, so answering from
       // its end would repeat rows the viewer already has. A boundary that throws
-      // falls back to the old meaning rather than failing the reply.
+      // cannot safely fall back to the archive tail: doing so could duplicate
+      // live rows. Return a retryable error without claiming archive EOF.
       let anchor = beforeLine ?? null;
       if (anchor === null && this.archive.liveStartLine) {
         try {
           anchor = this.archive.liveStartLine(session) ?? null;
         } catch (e: unknown) {
           this.reportArchiveReadErrorBestEffort("liveStartLine", session, e);
+          readFailed = true;
         }
       }
-      try {
-        history = this.archive.readBefore(session, anchor, limit);
-      } catch (e: unknown) {
-        this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+      if (!readFailed) {
+        try {
+          history = this.archive.readBefore(session, anchor, limit);
+        } catch (e: unknown) {
+          this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+          readFailed = true;
+        }
       }
     }
-    // No archive (or a failed archive read) answers with an explicit empty
-    // page so the client stops waiting. The two cases stay wire-identical.
+    if (readFailed) {
+      this.sendHistoryReadErrorBestEffort(session, ws);
+      return;
+    }
+    // A missing/disabled archive still answers with the established empty
+    // page. Only an actual read failure is retryable and distinct from EOF.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,
@@ -1630,15 +1653,21 @@ export class TmuxWsMux<
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
+    let readFailed = false;
     if (this.archive?.readAfter && this.profileOf(session).archive) {
       try {
         history = this.archive.readAfter(session, afterLine, limit);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readAfter", session, e);
+        readFailed = true;
       }
     }
-    // A legacy archive without forward paging, a missing archive, and a
-    // failed forward read all use the established empty-page wire response.
+    if (readFailed) {
+      this.sendHistoryReadErrorBestEffort(session, ws);
+      return;
+    }
+    // A legacy archive without forward paging and a missing archive retain
+    // the established empty-page wire response.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,

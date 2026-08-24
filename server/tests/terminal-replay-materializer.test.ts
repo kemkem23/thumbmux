@@ -443,7 +443,8 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
       windowId: "@20",
       paneId,
       generation,
-    });
+  });
+
     const writer = new OutputWalWriter({ path: walPath, clock: () => 598 });
     writer.appendJson("lifecycle", lifecycle("start", geometry(18, 4), physical("gen-a", "%30")));
     writer.appendOutput(Buffer.from("OLD\r\n"));
@@ -466,6 +467,146 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
 
     const rebuilt = materialize();
     expect(readFileSync(rebuilt.historyPath).toString("utf8")).toBe(history);
+    expect(rebuilt.screen).toEqual(result.screen);
+  }, 30_000);
+
+  test("exposes an exact independently durable recovery target before a larger suffix", () => {
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 250 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(30, 5)));
+    const target = writer.appendOutput(numbered(1, 8));
+    for (let index = 0; index < 20; index += 1) {
+      writer.appendOutput(Buffer.from(`later-${index}-${"x".repeat(900)}\r\n`, "utf8"));
+    }
+    writer.close();
+
+    const session = new TerminalReplayMaterializer({
+      walPath,
+      stateDir,
+      recoverySequence: target.sequence.toString(),
+      recoveryWalOffset: target.nextOffset,
+      maxWalFrameBytesPerRefresh: 64 * 1024,
+    }).open();
+    try {
+      expect(session.current.sequence).toBe(target.sequence);
+      expect(session.current.walOffset).toBe(target.nextOffset);
+      expect(session.current.hasMoreWal).toBeTrue();
+      const next = session.refresh();
+      expect(next.sequence).toBeGreaterThan(target.sequence);
+    } finally {
+      session.close();
+    }
+  });
+
+  test("rebuilds a checkpoint ahead of the recovery target before exposing its screen", () => {
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 251 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(20, 2)));
+    const target = writer.appendOutput(Buffer.from("TARGET\r\n", "utf8"));
+    writer.appendOutput(Buffer.from("LATER\r\n", "utf8"));
+    writer.close();
+
+    const ahead = materialize();
+    expect(ahead.sequence).toBeGreaterThan(target.sequence);
+    expect(plainRendered(ahead)).toContain("LATER");
+
+    const recovered = new TerminalReplayMaterializer({
+      walPath,
+      stateDir,
+      recoverySequence: target.sequence.toString(),
+      recoveryWalOffset: target.nextOffset,
+    }).open();
+    try {
+      expect(recovered.current.recoveredFromCheckpoint).toBeFalse();
+      expect(recovered.current.sequence).toBe(target.sequence);
+      expect(recovered.current.walOffset).toBe(target.nextOffset);
+      expect(plainRendered(recovered.current)).toContain("TARGET");
+      expect(plainRendered(recovered.current)).not.toContain("LATER");
+      expect(recovered.current.hasMoreWal).toBeTrue();
+    } finally {
+      recovered.close();
+    }
+  });
+
+  test("repeated generations that die before emitting output add no phantom history rows", () => {
+    const physical = (generation: string, paneId: string): TerminalReplayIdentity => identity({
+      sessionId: "$10",
+      windowId: "@20",
+      paneId,
+      generation,
+    });
+    const firstWriter = new OutputWalWriter({ path: walPath, clock: () => 598 });
+    firstWriter.appendJson("lifecycle", lifecycle("start", geometry(18, 4), physical("gen-a", "%30")));
+    firstWriter.close();
+    const first = materialize();
+    expect(readFileSync(first.historyPath)).toEqual(Buffer.alloc(0));
+
+    const secondWriter = new OutputWalWriter({ path: walPath, clock: () => 599 });
+    secondWriter.appendJson("lifecycle", lifecycle("resume", geometry(22, 5), physical("gen-b", "%31")));
+    secondWriter.appendJson("resize", {
+      phase: "commit",
+      changeId: "unseen-layout",
+      from: geometry(22, 5),
+      to: geometry(16, 3),
+      reason: "tmux-control-layout",
+    });
+    secondWriter.appendOutput(Buffer.alloc(0));
+    secondWriter.close();
+    const second = materialize();
+    expect(readFileSync(second.historyPath)).toEqual(Buffer.alloc(0));
+
+    const finalWriter = new OutputWalWriter({ path: walPath, clock: () => 600 });
+    finalWriter.appendJson("lifecycle", lifecycle("resume", geometry(20, 6), physical("gen-c", "%32")));
+    finalWriter.appendJson("lifecycle", lifecycle("end", geometry(20, 6), physical("gen-c", "%32")));
+    finalWriter.close();
+
+    const result = materialize();
+    expect(readFileSync(result.historyPath)).toEqual(Buffer.alloc(0));
+    expect(result.identity?.generation).toBe("gen-c");
+    expect(result.screen?.rows).toBe(6);
+
+    const rebuilt = materialize();
+    expect(readFileSync(rebuilt.historyPath)).toEqual(Buffer.alloc(0));
+    expect(rebuilt.screen).toEqual(result.screen);
+  }, 30_000);
+
+  test("seals each output-producing generation once while discarding unseen generations", () => {
+    const physical = (generation: string, paneId: string): TerminalReplayIdentity => identity({
+      sessionId: "$10",
+      windowId: "@20",
+      paneId,
+      generation,
+    });
+    const firstWriter = new OutputWalWriter({ path: walPath, clock: () => 598 });
+    firstWriter.appendJson("lifecycle", lifecycle("start", geometry(18, 4), physical("gen-a", "%30")));
+    firstWriter.appendOutput(Buffer.from("VISIBLE-A\r\n"));
+    firstWriter.close();
+    const first = materialize();
+    expect(readFileSync(first.historyPath)).toEqual(Buffer.alloc(0));
+
+    const secondWriter = new OutputWalWriter({ path: walPath, clock: () => 599 });
+    secondWriter.appendJson("lifecycle", lifecycle("resume", geometry(18, 4), physical("gen-b", "%31")));
+    secondWriter.appendJson("lifecycle", lifecycle("resume", geometry(18, 4), physical("gen-c", "%32")));
+    secondWriter.appendOutput(Buffer.from("VISIBLE-C\r\n"));
+    secondWriter.close();
+    const second = materialize();
+    expect((readFileSync(second.historyPath).toString("utf8").match(/VISIBLE-A/g) ?? []).length)
+      .toBe(1);
+
+    const finalWriter = new OutputWalWriter({ path: walPath, clock: () => 600 });
+    finalWriter.appendJson("lifecycle", lifecycle("resume", geometry(18, 4), physical("gen-d", "%33")));
+    finalWriter.appendJson("lifecycle", lifecycle("resume", geometry(18, 4), physical("gen-e", "%34")));
+    finalWriter.appendJson("lifecycle", lifecycle("end", geometry(18, 4), physical("gen-e", "%34")));
+    finalWriter.close();
+
+    const result = materialize();
+    const history = readFileSync(result.historyPath);
+    const text = history.toString("utf8");
+    expect((text.match(/VISIBLE-A/g) ?? []).length).toBe(1);
+    expect((text.match(/VISIBLE-C/g) ?? []).length).toBe(1);
+    expect(history.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0)).toBe(8);
+    expect(result.identity?.generation).toBe("gen-e");
+
+    const rebuilt = materialize();
+    expect(readFileSync(rebuilt.historyPath)).toEqual(history);
     expect(rebuilt.screen).toEqual(result.screen);
   }, 30_000);
 

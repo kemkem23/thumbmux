@@ -2,7 +2,7 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "a823474de2f6e08cce677f1b3a11e00ab9c7ccff0b949f49eace222d5a3dec0b",
+    "signature": "4daaa8569401f924d83ae1d3ed7efde5c7744969ca10decc4bc4d29ca51f8f37",
     "tier": "S"
   },
   {
@@ -26,7 +26,7 @@
   {
     "name": "createSessionsStore",
     "kind": "value",
-    "signature": "0f71378ac1f9f6ff6a6c1f8f475b850b5163f4cb863dd668362de505c0b39684",
+    "signature": "f2fe5f45457282241f459b41fb7045fc3898a168211f43e4e503e3d319891607",
     "tier": "S"
   },
   {
@@ -56,7 +56,7 @@
   {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "7bbe923c65212002094ee10ca72520aee1fa50396c669e93afff7e1d3b8fe6db",
+    "signature": "4fd0fa32d19b34f9471b7ee8ca04c78b98a6d40e9394ea64b54621c6b55b0926",
     "tier": "S"
   },
   {
@@ -74,7 +74,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "bb460d05beb1fe641c14ad0a5fc7d029104ca8489cd787090e188014103fc4fe",
+    "signature": "f03791a6444692c1b6748ac2518b6740244e31ed84c0f9a931c8670459bfedc0",
     "tier": "S"
   },
   {
@@ -110,7 +110,7 @@
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "1cbd0cf3e5a986a98834f943782f1f362a93eabd3fcb659972ca18e809859a0d",
+    "signature": "ea76a8247174b6a2f7fe9f38c93b793197589e358b605da6d4ae750d6ed864a8",
     "tier": "S"
   },
   {
@@ -128,7 +128,7 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "9d587a8f04ae91c4c9e9fa58baccbce5aa01db81eeb38dd25371eb18a8125bfa",
+    "signature": "05c61f3c3ae06496d83b697b1f4faee19279c884d553b07b7c99fbbe19c3f623",
     "tier": "S"
   }
 ]

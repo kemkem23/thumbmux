@@ -21,6 +21,23 @@ class FakeWS {
       .filter((frame) => frame.channel === SESSION && frame.type === "history")
       .map((frame) => JSON.parse(frame.data));
   }
+
+  historyErrors(): Array<{
+    channel: string;
+    type: string;
+    data: string;
+    code: string;
+    request: string;
+    retryable: boolean;
+  }> {
+    return this.sent
+      .map((data) => JSON.parse(data))
+      .filter((frame) => (
+        frame.channel === SESSION &&
+        frame.type === "error" &&
+        frame.request === "history_expand"
+      ));
+  }
 }
 
 function sessionListItem(name: string): SessionListItem {
@@ -213,7 +230,7 @@ test("a beforeLine-only client still selects readBefore when both archive direct
   }
 });
 
-test("a throwing readAfter still returns the no-archive page and logs the failure", () => {
+test("a throwing readAfter returns one retryable non-sensitive error instead of archive EOF", () => {
   const logs: unknown[][] = [];
   const archive: HistoryArchiveLike = {
     ingestSnapshot: (_session, content) => ({ liveContent: content }),
@@ -228,9 +245,7 @@ test("a throwing readAfter still returns the no-archive page and logs the failur
     archive,
     logError: (...args: unknown[]) => { logs.push(args); },
   });
-  const noArchiveMux = new TmuxWsMux({ driver: fakeDriver() });
   const ws = new FakeWS();
-  const noArchiveWs = new FakeWS();
   const request: MuxClientMessage = {
     type: "history_expand",
     session: SESSION,
@@ -245,10 +260,16 @@ test("a throwing readAfter still returns the no-archive page and logs the failur
     } catch (error) {
       thrown = error;
     }
-    noArchiveMux.handleMessage(request, noArchiveWs);
-
-    expect(ws.sent).toEqual(noArchiveWs.sent);
-    expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+    expect(ws.historyPages()).toEqual([]);
+    expect(ws.historyErrors()).toEqual([{
+      channel: SESSION,
+      type: "error",
+      data: "history_temporarily_unavailable",
+      code: "history_temporarily_unavailable",
+      request: "history_expand",
+      retryable: true,
+    }]);
+    expect(ws.sent[0]).not.toContain("readAfter exploded");
     expect(thrown).toBeUndefined();
     expect(logs).toEqual([[
       `[thumbmux-mux] archive readAfter error for "${SESSION}":`,
@@ -256,11 +277,10 @@ test("a throwing readAfter still returns the no-archive page and logs the failur
     ]]);
   } finally {
     mux.stop();
-    noArchiveMux.stop();
   }
 });
 
-test("a throwing readBefore still returns the no-archive page and logs the failure", () => {
+test("a throwing readBefore returns one retryable non-sensitive error instead of archive EOF", () => {
   const logs: unknown[][] = [];
   const archive: HistoryArchiveLike = {
     ingestSnapshot: (_session, content) => ({ liveContent: content }),
@@ -275,9 +295,7 @@ test("a throwing readBefore still returns the no-archive page and logs the failu
     archive,
     logError: (...args: unknown[]) => { logs.push(args); },
   });
-  const noArchiveMux = new TmuxWsMux({ driver: fakeDriver() });
   const ws = new FakeWS();
-  const noArchiveWs = new FakeWS();
   const request: MuxClientMessage = {
     type: "history_expand",
     session: SESSION,
@@ -292,10 +310,16 @@ test("a throwing readBefore still returns the no-archive page and logs the failu
     } catch (error) {
       thrown = error;
     }
-    noArchiveMux.handleMessage(request, noArchiveWs);
-
-    expect(ws.sent).toEqual(noArchiveWs.sent);
-    expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+    expect(ws.historyPages()).toEqual([]);
+    expect(ws.historyErrors()).toEqual([{
+      channel: SESSION,
+      type: "error",
+      data: "history_temporarily_unavailable",
+      code: "history_temporarily_unavailable",
+      request: "history_expand",
+      retryable: true,
+    }]);
+    expect(ws.sent[0]).not.toContain("readBefore exploded");
     expect(thrown).toBeUndefined();
     expect(logs).toEqual([[
       `[thumbmux-mux] archive readBefore error for "${SESSION}":`,
@@ -303,14 +327,13 @@ test("a throwing readBefore still returns the no-archive page and logs the failu
     ]]);
   } finally {
     mux.stop();
-    noArchiveMux.stop();
   }
 });
 
 for (const direction of ["before", "after"] as const) {
   const method = direction === "before" ? "readBefore" : "readAfter";
 
-  test(`a throwing ${method} and throwing logger still produce exactly one empty history frame`, () => {
+  test(`a throwing ${method} and throwing logger still produce exactly one retryable error frame`, () => {
     let archiveCalls = 0;
     const logs: unknown[][] = [];
     const archive: HistoryArchiveLike = {
@@ -358,7 +381,16 @@ for (const direction of ["before", "after"] as const) {
         `${method} exploded`,
       ]]);
       expect(ws.sent).toHaveLength(1);
-      expect(ws.historyPages()).toEqual([{ lines: [], startLine: null, hasMore: false }]);
+      expect(ws.historyPages()).toEqual([]);
+      expect(ws.historyErrors()).toEqual([{
+        channel: SESSION,
+        type: "error",
+        data: "history_temporarily_unavailable",
+        code: "history_temporarily_unavailable",
+        request: "history_expand",
+        retryable: true,
+      }]);
+      expect(ws.sent[0]).not.toContain(`${method} exploded`);
       expect(thrown).toBeUndefined();
     } finally {
       mux.stop();

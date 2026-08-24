@@ -182,6 +182,66 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", "stabilizing"]);
   });
 
+  test("the v0.18 reviewed additions require the exact release and digest pair", () => {
+    const name = "TmuxDriver";
+    const baselineDigest = "31a1557c524f410f91b43202343d0496bd89cb9e2c3335c6972abf62c2a4c62e";
+    const reviewedDigest = "6b15203b589dccd2acc8102af15f3d40b82d2b52bcbb909656553275185393f2";
+    const manifest: ContractEntry[] = [{
+      name,
+      kind: "type",
+      signature: baselineDigest,
+      tier: "F",
+    }];
+    const baselineLive = [{
+      name,
+      kind: "type" as const,
+      signature: baselineDigest,
+      compatibilitySignature: baselineDigest,
+    }];
+    const currentLive = [{
+      name,
+      kind: "type" as const,
+      signature: reviewedDigest,
+      compatibilitySignature: reviewedDigest,
+    }];
+
+    expect(evaluateBaseline(
+      "server",
+      manifest,
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.17.0",
+      "0.18.0",
+    ).errors).toEqual([]);
+
+    const wrongDigest = [{
+      ...currentLive[0]!,
+      compatibilitySignature: `${reviewedDigest.slice(0, -1)}0`,
+    }];
+    expect(evaluateBaseline(
+      "server",
+      manifest,
+      manifest,
+      baselineLive,
+      wrongDigest,
+      "0.17.0",
+      "0.18.0",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+
+    expect(evaluateBaseline(
+      "server",
+      manifest,
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.17.0",
+      "0.18.1",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+  });
+
   test("a minor may add optional members without weakening existing F members", () => {
     const baseline = fixture("0.8.4");
     writeCoreDeclarations(baseline, [
@@ -866,9 +926,20 @@ describe("declaration signatures", () => {
     writeComponent("string", "{ blur(): void }", "'value'");
     const exposedChanged = deriveGitDistReport(root, ["svelte"]).svelte[0]
       ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'text' | 'mode'");
+    const bindingsBefore = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'mode' | 'text'");
+    const bindingsReordered = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'mode'");
+    const bindingRemoved = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
 
     expect(defaultChanged).not.toBe(before);
     expect(exposedChanged).not.toBe(before);
+    expect(bindingsReordered).toBe(bindingsBefore);
+    expect(bindingRemoved).not.toBe(bindingsBefore);
   });
 
   test("follows non-exported declarations reachable from a public signature", () => {

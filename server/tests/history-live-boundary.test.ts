@@ -63,14 +63,23 @@ test("an archive without a live boundary behaves exactly as before", () => {
   mux.stop();
 });
 
-test("a live boundary that throws does not take the history reply down with it", () => {
+test("a throwing live boundary returns a retryable error without reading a duplicate-prone tail", () => {
   const { archive, reads } = recordingArchive(() => { throw new Error("boundary unavailable"); });
   const mux = new TmuxWsMux({ driver: driver(), archive });
   const sent: string[] = [];
 
   mux.expandHistory("s", { send: (data: string) => { sent.push(data); return 1; } } as never, null, 100);
 
-  expect(reads).toEqual([null]);
+  expect(reads).toEqual([]);
   expect(sent).toHaveLength(1);
+  expect(JSON.parse(sent[0]!)).toEqual({
+    channel: "s",
+    type: "error",
+    data: "history_temporarily_unavailable",
+    code: "history_temporarily_unavailable",
+    request: "history_expand",
+    retryable: true,
+  });
+  expect(sent[0]).not.toContain("boundary unavailable");
   mux.stop();
 });

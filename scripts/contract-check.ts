@@ -572,6 +572,18 @@ function componentTypeArgumentNodes(typeNode: ts.TypeNode | undefined): readonly
   return [];
 }
 
+function componentTypeArgumentSurface(argument: ts.TypeNode, index: number): string {
+  // Svelte's generated third Component<> argument is a union of bindable prop
+  // names. Union order has no TypeScript meaning, but svelte2tsx has emitted
+  // different orders for byte-identical source across toolchain runs. Sort
+  // only that bindings union so the immutable gate measures the public set,
+  // while props/defaults and exported methods remain order-sensitive inputs.
+  const surface = index === 2 && ts.isUnionTypeNode(argument)
+    ? argument.types.map((member) => normalizeDeclarationText(member.getText())).sort().join(" | ")
+    : argument.getText();
+  return `component-argument-${index}: ${surface}`;
+}
+
 function compatibilityComponentSignature(
   checker: ts.TypeChecker,
   symbol: ts.Symbol,
@@ -585,7 +597,7 @@ function compatibilityComponentSignature(
     return signatureWithDependencies(
       checker,
       [],
-      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments.map(componentTypeArgumentSurface),
       typeArguments,
       declarationRoot,
       true,
@@ -609,7 +621,7 @@ function componentOptionalAdditionModel(
     return optionalAdditionModel(
       checker,
       [],
-      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments.map(componentTypeArgumentSurface),
       typeArguments,
       declarationRoot,
     );
@@ -1150,6 +1162,38 @@ const V0110_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "svelte:ComposerDock:fec2af5c980d60e92ba24a8d4f9d249ac420af65c4a006c9cf1a814c3cb7a725:2880a78a343f06c126269d00c681f7181adb91562a922620898a6597c77acb00",
 ]);
 
+/**
+ * Additive durable-boundary and Claude Bash presentation declarations reviewed
+ * for 0.17.0 -> 0.18.0. The generic optional-member proof accepts the direct
+ * protocol additions, but cannot prove every transitive path through a class,
+ * function return, component prop, or an existing optional member whose
+ * referenced type gained optionals. None of these rows authorizes a removal or
+ * narrowing: the v0.17 frozen minimal, guarded, and app consumers all typecheck,
+ * build, and run against the packed v0.18 artifact.
+ */
+const V0180_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:c5fc6c71e0d6b04a658e3930357ce13b9fbc5af4804da6c1abe445b1f73cb4fd:bf934db559492005973a16f4f91591e078db81d6adcadfe00e4fc81b17aae770",
+  "server:AppRoutesOptions:cc662cd6518c7151ad2cdcd5f8bc4d6a8be74d8b97b33283faa9b53a8fd84e8d:fdfc8f38ca74022e9dafe7a539a41660b0fddd5f475c4d03c63ad4e34149f8c5",
+  "server:createAppRoutes:e1f89ea4f7ea071fce9e85f7533dcbadcf001e88310134ab3ba78825d3cd3205:82d6b1f45e0c93c5f95e9545385a8b10ea505d4fad03fc4c684309349869a137",
+  "server:createBunTmuxDriver:96f8d9a246633892db34aba944eccb2432e5145292ea5f572c6cb0663fff4d52:0029dcffa9eba1547ebd27d5df7d5a2fb16da49c5e447ec470ddf4da2a38de40",
+  "server:createSpawnHandler:3f45c1e0f3c983bb87c731caa8b7619aaaafe410114bd575bf71ba3ea24729ea:a230098d3172bcdba10994d1c8c22f5dc1aedfd8f70974e3ce1ae59ac0d81721",
+  "server:DurableHistoryArchive:ac2b8b225618deafba39ee3e27f33cb9aa14f716f272f1353f9227838bc66e41:70e25ca5e888960798469ee6a6a964d25716bc244fdb9664138e9e533680d01d",
+  "server:FileHistoryArchive:0de8be2d28f4cef7212c9be036565fbe38617864d6ad8486360642c6ba2f7e50:8779b4916cd1eac29c78b373855f10408572b950d3fcf80406d2442359cc6cf9",
+  "server:HistoryArchiveLike:f642d7abe2d7d1c755654d87b47bd2b576302314b9627934ce82ce0b13dec94f:a9f287b16a5ba85604b061a9d0f6bf0214bc8c42cb53b9c3b477d7de2053f16d",
+  "server:RetentionLane:591d0e1371c38e9013bf9e49bbade02d95f04c48a77e9b5440c645f9eb0c8d6c:4add5e1a70895280942ea425a7362e2e7e94ec9c91150c63904c66c14026bb23",
+  "server:RetentionLaneOptions:98e35df9bddaa0e69ace24e1cae5cd480e7eb860dd934f89cb9d076357ba003c:c98b4fcec3a99e2167774a3c77165dfdd233cedfb0ed815cc9eb28a8538eb215",
+  "server:SpawnHandlerOptions:e2ad3a02503ebb921d0874ab127e725b3c6d49a251a92a1efee51bee567c1d76:e9411ae2ea80c75cc8e71275a0b03f45c10ae0553e42609c7f6d3e354032b48c",
+  "server:TmuxDriver:31a1557c524f410f91b43202343d0496bd89cb9e2c3335c6972abf62c2a4c62e:6b15203b589dccd2acc8102af15f3d40b82d2b52bcbb909656553275185393f2",
+  "server:TmuxWsMux:8ab44d4250b9e866ebf7de4f65eb0b17fdc2d289c282fcde78a8006674c52050:5fab451dd0c8f853304b66a5ebe2654661cde7773dad0c11219f5553a2a52873",
+  "server:TmuxWsMuxOptions:d9cad580dd157b901490827749bf3836e39d83d9baa0dbe17c22afdc5a27d3a0:e1bd26d1c7826a7d6cfd59f19cbb44e8acf95480cada689c3abab8404a3c9a87",
+  "app:AppAdapters:f0011ca974218b3de4aac5d1f95ac54514d048a765b0a3fa7f66e4804daaecdf:4daaa8569401f924d83ae1d3ed7efde5c7744969ca10decc4bc4d29ca51f8f37",
+  "app:createSessionsStore:0f71378ac1f9f6ff6a6c1f8f475b850b5163f4cb863dd668362de505c0b39684:f2fe5f45457282241f459b41fb7045fc3898a168211f43e4e503e3d319891607",
+  "app:EmbedView:75354449febbc27879485892b4068650054867cee3b4b25610131d861d5ffbea:42d35e1d767944b17d91723c5d4b44125b90cea1232b1fefac7c581152f42933",
+  "app:HubView:3c1945999923d9b96bd84a5ed4b76036d9cf88476f293491fe7933e9cc966435:721857db61ece49f68f7b985bf4c265df717ddd29de1ca30262b24e3e837aa24",
+  "app:SessionView:1ffcecd9cfde2f4700abab082a8ec3259263350d608aae6066998f50683ff19f:97d277a4b1fc9cbb273eb17f3754b39ae36358b9a3113f23c57acdeb6c9c8fa3",
+  "app:ThumbmuxApp:8d9f842e391d521d8d8f58a649df37159d1381e0a1cfd6c4042f266ddba7dcc3:05c5f730406d035669b8b1ba69ed5c183e9fd89bf98521737fc578c6e9a6a55a",
+]);
+
 function isV0110MinorException(
   baselineVersion: string,
   currentVersion: string,
@@ -1161,6 +1205,19 @@ function isV0110MinorException(
   if (baselineVersion !== "0.10.1" || currentVersion !== "0.11.0") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V0110_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV0180MinorException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.17.0" || currentVersion !== "0.18.0") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0180_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1328,13 +1385,23 @@ export function evaluateBaseline(
     if (
       boundary === "minor"
       && !kindChanged
-      && isV0110MinorException(
-        baselineVersion,
-        currentVersion,
-        subpath,
-        previous.name,
-        previousLive,
-        nextLive,
+      && (
+        isV0110MinorException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0180MinorException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
       )
     ) {
       continue;

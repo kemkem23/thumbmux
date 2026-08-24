@@ -56,6 +56,14 @@ phone as the primary device, and rebuilds the viewer around one idea:
   result as plain text a shell can read — including the rows still on screen,
   because losing the tmux server should not take a session's newest thousand
   lines with it. See [Durable history](docs/history.md).
+- **A crash-durable path after an explicit cutover.** Hosts that need a stronger
+  guarantee can put the child agent directly behind thumbmux's PTY WAL proxy.
+  Once the host has immutably sealed its old archive and declared T0, output is
+  synced to a checksummed WAL before display, then rebuilt by a supervised
+  single-writer replay worker with atomic checkpoints. Process or host restarts
+  resume from that durable sequence. Bytes never captured before T0 cannot be
+  recreated, and the host remains responsible for identity checks and for
+  fencing input while it performs the cutover.
 
 ## The tour
 
@@ -81,13 +89,13 @@ Thai/CJK/emoji-aware cell widths. Pull down and older scrollback streams in
 when the host wires a history archive. TermView keeps a built-in client
 retention budget of 10,000 rows or an estimated 8 MiB, whichever fills first;
 the mounted viewport and overscan are protected, so they may exceed the nominal
-budget. Once the budget is full, further upward archive expansion stops — like
-a finite tmux `history-limit` — even if the server still has older rows. That
-client ceiling is **signposted** (a `role="note"` banner: “Older history not
-loaded · limit 10k rows / 8 MiB”) so it is not mistaken for the start of the
-session; the true server end-of-archive is not. When client retention drops a
-span, its boundary is labelled `N rows dropped`; the label is presentation
-chrome, not terminal text. Alternate-screen panes (`screen.alt`) have no
+budget. It is a bidirectional sliding window: paging upward evicts the far
+newer edge, paging back toward live evicts the far older edge, and either edge
+can be fetched again while the server archive still retains it. Absolute row
+identity and the visible anchor survive those replacements, so crossing the
+archive/live seam does not duplicate, skip, or jump rows. When client retention
+drops a span, its boundary is labelled `N rows dropped`; the label is
+presentation chrome, not terminal text. Alternate-screen panes (`screen.alt`) have no
 scrollback at all — TermView shows “Alternate screen · no scrollback” and
 suppresses history expansion once alt is known. Unknown mode is treated as
 normal (asking still happens); a prepend that landed while unknown is
@@ -97,6 +105,18 @@ changes, the live window reflows
 from tmux and arrives as a full reset; archived rows deliberately keep their
 original physical wrapping so history is not silently rewritten
 ([details](docs/reflow.md)).
+
+For Claude Code sessions, `SessionView` also offers a three-state Bash view:
+**OFF** keeps the pane verbatim, **HIDE** replaces a recognized Bash call with
+one local row, and **HAIKU** asks an optional host adapter for a short summary.
+Detection is deliberately fail-open outside a known normal screen or when the
+Claude header/result/boundary pattern is incomplete. Only completed blocks in
+the real viewport are offered to the host; active commands are never sent.
+Copy, search, history, retention, and ANSI parsing continue to use the original
+rows. thumbmux itself does not choose or invoke a model—the host owns redaction,
+lifecycle checks, throttling, caching, and transport. The low-level Claude Bash
+detector/projection exports are experimental because the upstream terminal
+layout may change; see [the app adapter contract](docs/app.md#22-session-metadata-panels-uploads-preferences-and-terminal-props).
 
 <p align="center">
   <img src="docs/media/term-agent.png" width="360" alt="Agent session: colored diff, test results, tappable URL" />
@@ -672,9 +692,9 @@ an installable component, not a listener or executable.
 
 | package | what you get |
 |---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · experimental Claude Bash detection/projection · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
-| **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `RetentionLane` keeps chosen sessions archived with no viewer attached · `DurableHistoryArchive` plain-text scrollback store that also keeps the live window · `stitchCapture` the reconciliation both use · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
+| **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `RetentionLane` keeps chosen sessions archived with no viewer attached · `DurableHistoryArchive` plain-text scrollback store that also keeps the live window · experimental direct-PTY WAL launch/health/control and supervised replay-worker integration · `stitchCapture` the reconciliation both use · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
 | **`thumbmux/app`** | `ThumbmuxApp` assembled hub/session shell · separate `HubView`, `SessionView`, and chromeless `EmbedView` mounts · typed `AppAdapters` for routing, session metadata, launch, content, preferences, theme, labels, and host extension slots |
 
 Docs: [application shell](docs/app.md) ·

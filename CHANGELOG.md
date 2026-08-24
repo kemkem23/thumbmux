@@ -1,7 +1,45 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.0-dist`.
+
+## v0.18.0 — 2026-08-24
+
+### Added
+
+- **A direct-PTY durable lane can preserve every terminal byte produced after a
+  host declares its cutover boundary (T0).** The proxy writes checksummed output,
+  resize, lifecycle, activation, and barrier records to its WAL and syncs them
+  before the child output is displayed. A supervised replay worker materializes
+  that WAL through bounded private-tmux replay and atomic checkpoints; its
+  cross-process writer lease prevents two hosts from truncating or regressing the
+  same materialized state. Restart and SIGKILL recovery resume from the durable
+  sequence without inventing or silently dropping rows. The seven intentional
+  `thumbmux/server` integration exports are tier X while production hosts prove
+  the cutover lifecycle: `createTerminalPtyWalProxyLaunchSpec`,
+  `createTerminalReplayWorkerClient`, `resolveTerminalReplayWorkerPath`,
+  `readTerminalPtyWalProxyHealth`, `TERMINAL_PTY_WAL_CONFIG_ENV`,
+  `TerminalPtyWalProxyHealth`, and `TerminalWalController`. This machinery does
+  not reconstruct bytes from before T0; sealing the old archive and fencing
+  input during cutover remain host responsibilities.
+
+- **`TermView` history retention is now a bounded, bidirectional sliding
+  window.** It keeps a nominal 10,000 rows / 8 MiB, protects the mounted
+  viewport and overscan, evicts the far edge as the reader pages in the other
+  direction, and can fetch those evicted rows again while the server archive
+  retains them. Absolute row identity and the visual anchor survive
+  prepend/append/eviction, including Claude Bash projection, so crossing the
+  archive/live seam does not duplicate, skip, or jump rows.
+
+- **Claude Code Bash blocks can be shown raw, collapsed, or summarized by a
+  host-owned service.** `SessionView` adds a Claude-only `bash-mode` action and
+  stores `off | hide | haiku` in the existing preferences adapter. `TermView`
+  detects only high-confidence completed/active Claude Bash layouts on a known
+  normal screen, retains the exact raw rows for copy/search/history/ANSI state,
+  and requests summaries only for completed blocks in the real viewport.
+  `AppAdapters.bashSummaries` is optional; rejection or omission falls back to
+  a deterministic command preview. The new `thumbmux/core` detector/projection
+  exports are experimental because Claude's terminal layout may evolve.
 
 ## v0.16.8 — 2026-08-21
 

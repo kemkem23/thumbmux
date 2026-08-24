@@ -794,7 +794,7 @@
   {
     "name": "TermView",
     "kind": "component",
-    "signature": "753562d5bf10f923ce280e98bf1bccc94144400852c17aafe959bfd370e7aa0d",
+    "signature": "c27b988482bc57e32cdcaa6849379525307f0f6ed53ece41d039539a1b4e1aee",
     "tier": "F"
   },
   {
@@ -806,13 +806,13 @@
   {
     "name": "tmuxMux",
     "kind": "value",
-    "signature": "81286229e23d5c640da73e546dbe1f7c92856c36cbbca21c7d38a91c168f68db",
+    "signature": "2e1934d928750030bd5c94808be1ed05a131bf45e9991da43610083aa45f6dbb",
     "tier": "F"
   },
   {
     "name": "TmuxMux",
     "kind": "value",
-    "signature": "012f1c80792491d086e729516a96c0819b6b97e38df91bb974ce787a4b0d9665",
+    "signature": "c0d2e266a8e89052be3a569055d5f892df3a57c254d804b45b3449166af77871",
     "tier": "F"
   },
   {

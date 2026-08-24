@@ -186,6 +186,45 @@ member list is complete, which is the one thing an extension point cannot promis
 Such a consumer should key off the members it actually uses. If you need the
 complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes.
 
+`AppAdapters.bashSummaries` is the optional, host-owned boundary for Claude Code
+Bash summaries. Omitting it makes no model call: `off` remains the default,
+`hide` is local projection, and `haiku` settles to a deterministic command
+preview when the adapter is absent, rejects, or omits an id. `TermView` requests
+only high-confidence completed blocks in a settled real viewport; active calls,
+alternate/unknown screens, incomplete captures, and ambiguous layouts stay raw
+or use the local active placeholder. The source rows remain canonical for copy,
+search, history, retention, raw/visual coordinate mapping, and ANSI/OSC state in
+all modes. The host owns model choice, authentication, redaction, lifecycle
+checks, throttling, and durable caching. The low-level `ClaudeBash*`,
+`detectClaudeBashBlocks`, and `projectClaudeBashLines` core exports are tier X:
+Claude controls the painted layout, so those detector/projection contracts are
+explicitly experimental even though omission behavior in the app shell is
+additive.
+
+The v0.18.0 direct-PTY durability integration is also tier X while production
+hosts prove its cutover lifecycle. Its intentional `thumbmux/server` surface is
+limited to `createTerminalPtyWalProxyLaunchSpec`,
+`createTerminalReplayWorkerClient`, `resolveTerminalReplayWorkerPath`,
+`readTerminalPtyWalProxyHealth`, `TERMINAL_PTY_WAL_CONFIG_ENV`,
+`TerminalPtyWalProxyHealth`, and `TerminalWalController`; the WAL codecs,
+materializer internals, worker entrypoint, and tmux control recorder are not a
+public extension surface. The package guarantee starts only after the host has
+immutably sealed its legacy rows, fenced input, verified the exact logical and
+physical pane identity, and activated a T0 boundary. From that point the proxy
+syncs an ordered checksummed record before displaying child output, and replay
+uses an exclusive cross-process writer lease plus atomic checkpoints. The host
+still owns cutover journaling, restart ordering, storage durability, identity
+policy, and recovery of anything that predates T0.
+
+`TermView`'s 10,000-row / 8 MiB client budget is a presentation cache, not an
+archive-retention promise. It may exceed the nominal cap to protect the mounted
+viewport and overscan. Evicting either far edge does not claim that the server
+deleted those rows: the client can page them back in from the other direction.
+The stable contract is that absolute row identity and the visible anchor remain
+continuous across archive paging, live updates, and window replacement; a host
+that wants a permanent byte/row retention guarantee must provide durable server
+storage separately.
+
 `AppAdapters.sendSubmissionKeys` is the optional composer-submission transport.
 `SessionView` and `EmbedView` use it for `submitPlan` steps only; raw terminal,
 desktop-key, direct-mode, D-pad, and non-submitting shortcut input stays on

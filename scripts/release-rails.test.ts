@@ -25,6 +25,10 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+const node18ReplayLockSmoke = readFileSync(
+  resolve(import.meta.dir, "git-dist-smoke/node18-replay-lock-smoke.mjs"),
+  "utf8",
+);
 /** Single source of truth for the shared CI/release verification gate. */
 const VERIFY_GATE_REL = ".github/actions/verify-gate/action.yml";
 const VERIFY_GATE_USES = "./.github/actions/verify-gate";
@@ -343,6 +347,19 @@ describe("release rail policy", () => {
     for (const subpath of ["core", "server", "svelte", "app"]) {
       expect(smoke).toContain(`package/contract/manifest/${subpath}.json`);
     }
+  });
+
+  test("packed Node 18 smoke permanently gates portable replay writer recovery", () => {
+    expect(smoke).toContain("timeout 240 docker run --rm");
+    expect(smoke).toContain("timeout 120 apk add --no-cache python3 tmux");
+    expect(smoke).toContain("node18-replay-lock-smoke.mjs");
+    expect(smoke).toContain("node node18-replay-lock-smoke.mjs");
+    expect(node18ReplayLockSmoke)
+      .toContain('createTerminalReplayWorkerClient } from "thumbmux/server"');
+    expect(node18ReplayLockSmoke).toContain("Promise.allSettled([");
+    expect(node18ReplayLockSmoke).toContain('process.kill(killedPid, "SIGKILL")');
+    expect(node18ReplayLockSmoke).toContain("replacement.lastResult.recoveredFromCheckpoint !== true");
+    expect(node18ReplayLockSmoke).not.toContain("terminal-replay-materializer");
   });
 
   test("release and smoke derive the packed root manifest from one helper", () => {

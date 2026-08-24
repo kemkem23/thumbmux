@@ -4,6 +4,8 @@
     defaultSurface,
     luminance,
     submitPlan,
+    type ClaudeBashMode,
+    type ClaudeBashSummaryRequest,
     type SessionListItem,
     type Shortcut,
     type ThumbmuxPrefs,
@@ -59,6 +61,7 @@
   const DARK_BG = '#101014';
   const LIGHT_BG = '#f5f0e8';
   const STOCK_SWATCHES = [DARK_BG, '#000000', '#0b1c3d', '#b34700', LIGHT_BG, '#e6e6e6'];
+  const CLAUDE_BASH_MODES: readonly ClaudeBashMode[] = ['off', 'hide', 'haiku'];
   const hostOwnsThemeState = !!adapters.theme;
   const prefs = adapters.prefs ?? createLocalPrefs(adapters.theme?.storageKey ?? LOCAL_PREFS_KEY);
 
@@ -67,6 +70,7 @@
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
   let storedFontPx = $state(DEFAULT_FONT_PX);
   let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS.map((shortcut) => ({ ...shortcut })));
+  let claudeBashMode = $state<ClaudeBashMode>('off');
   let customBg = $state(localBg);
 
   // Host can widen/narrow the stock A+/A− band via sessionPresentation.
@@ -108,6 +112,9 @@
   let themeDefaultBg = $derived(adapters.theme?.defaultBg ?? DARK_BG);
   let themeSwatches = $derived(adapters.theme?.swatches ?? STOCK_SWATCHES);
   let sessionAgent = $derived(adapters.submitAgent?.(session) ?? 'generic');
+  let effectiveClaudeBashMode = $derived<ClaudeBashMode>(
+    sessionAgent === 'claude' ? claudeBashMode : 'off',
+  );
 
   let termRef = $state<ReturnType<typeof TermView> | null>(null);
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
@@ -206,6 +213,9 @@
     if (Array.isArray(snapshot.shortcuts)) {
       shortcuts = snapshot.shortcuts.map((shortcut) => ({ ...shortcut }));
     }
+    claudeBashMode = CLAUDE_BASH_MODES.includes(snapshot.claudeBashMode as ClaudeBashMode)
+      ? snapshot.claudeBashMode as ClaudeBashMode
+      : 'off';
   }
 
   function savePrefs(patch: Partial<ThumbmuxPrefs>): void {
@@ -226,6 +236,24 @@
   function setShortcuts(next: Shortcut[]): void {
     shortcuts = next;
     savePrefs({ shortcuts: next });
+  }
+
+  function cycleClaudeBashMode(): void {
+    const index = CLAUDE_BASH_MODES.indexOf(claudeBashMode);
+    claudeBashMode = CLAUDE_BASH_MODES[(index + 1) % CLAUDE_BASH_MODES.length] ?? 'off';
+    savePrefs({ claudeBashMode });
+  }
+
+  function requestClaudeBashSummaries(
+    requests: readonly ClaudeBashSummaryRequest[],
+  ): Promise<Readonly<Record<string, string>>> | void {
+    if (effectiveClaudeBashMode !== 'haiku' || requests.length === 0) return;
+    const summarize = adapters.bashSummaries;
+    if (!summarize) return;
+    // Return the host promise to TermView. It owns the attempted-id fence and
+    // turns rejection, synchronous throw, or missing ids into one final
+    // deterministic row without retrying the provider on every repaint.
+    return summarize(session, requests);
   }
 
   function sendKeysTo(targetSession: string, data: string): void {
@@ -559,6 +587,14 @@
         testid: 'demo-copy',
         onTap: () => { overlay.fabOpen = false; void copyTerminal(); },
       },
+      ...(sessionAgent === 'claude' ? [{
+        id: 'bash-mode',
+        label: `Bash: ${claudeBashMode.toUpperCase()}`,
+        testid: 'demo-bash-mode',
+        // Keep the menu open so OFF → HIDE → HAIKU can be compared in
+        // place, like the stock repeated-tap font controls.
+        onTap: cycleClaudeBashMode,
+      }] satisfies FabAction[] : []),
       {
         id: 'shortcuts',
         label: labels.actionShortcuts,
@@ -782,6 +818,8 @@
             onTap={onTerminalTap}
             onLinesChange={onTermLinesChange}
             onScrollStateChange={onTermScrollStateChange}
+            claudeBashMode={effectiveClaudeBashMode}
+            onClaudeBashSummaryRequest={requestClaudeBashSummaries}
           />
         </DesktopKeys>
       {:else}
@@ -794,6 +832,8 @@
           onTap={onTerminalTap}
           onLinesChange={onTermLinesChange}
           onScrollStateChange={onTermScrollStateChange}
+          claudeBashMode={effectiveClaudeBashMode}
+          onClaudeBashSummaryRequest={requestClaudeBashSummaries}
         />
       {/if}
     {/key}

@@ -1,17 +1,22 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
+import { createRequire } from "node:module";
 import {
   chmodSync,
   closeSync,
   constants,
   existsSync,
   fdatasyncSync,
+  fchmodSync,
   fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
   readSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -77,6 +82,7 @@ const COMMAND_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 const MAX_COLS = 4_096;
 const MAX_ROWS = 4_096;
 const MAX_CELLS = 4_194_304;
+const REPLAY_WRITER_LOCK_FILE = "replay-writer-lock.sqlite";
 
 export type TerminalReplayGeometry = {
   cols: number;
@@ -166,6 +172,10 @@ export type TerminalReplayMaterializerOptions = {
    * bounded (the shipped PTY proxy caps them at 64 KiB).
    */
   maxWalFrameBytesPerRefresh?: number;
+  /** Optional independently durable cursor that recovery must expose exactly
+   * before consuming any later WAL suffix. Decimal uint64 + record-end offset. */
+  recoverySequence?: string;
+  recoveryWalOffset?: number;
 };
 
 export type TerminalReplayResult = {
@@ -347,8 +357,454 @@ function fsyncDirectory(path: string): void {
 }
 
 function ensurePrivateDirectory(path: string): void {
-  mkdirSync(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-  chmodSync(path, PRIVATE_DIRECTORY_MODE);
+  const absolute = resolve(path);
+  const missing: string[] = [];
+  let cursor = absolute;
+  while (!existsSync(cursor)) {
+    missing.push(cursor);
+    const parent = dirname(cursor);
+    if (parent === cursor) {
+      throw new Error(`cannot find an existing ancestor for terminal replay directory ${absolute}`);
+    }
+    cursor = parent;
+  }
+
+  const requireRealDirectory = (directory: string) => {
+    const stat = lstatSync(directory);
+    if (
+      !stat.isDirectory()
+      || stat.isSymbolicLink()
+      || realpathSync(directory) !== directory
+    ) {
+      throw new Error(`terminal replay path is not a real directory: ${directory}`);
+    }
+  };
+  requireRealDirectory(cursor);
+  for (const directory of missing.reverse()) {
+    try {
+      mkdirSync(directory, { mode: PRIVATE_DIRECTORY_MODE });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    requireRealDirectory(directory);
+    chmodSync(directory, PRIVATE_DIRECTORY_MODE);
+    fsyncDirectory(directory);
+    fsyncDirectory(dirname(directory));
+  }
+  requireRealDirectory(absolute);
+  chmodSync(absolute, PRIVATE_DIRECTORY_MODE);
+  // A peer may have won mkdir without persisting the directory entry yet.
+  fsyncDirectory(absolute);
+  fsyncDirectory(dirname(absolute));
+}
+
+type ReplayWriterLockDatabase = {
+  exec(sql: string): unknown;
+  close(): void;
+};
+
+type ReplayWriterLockDatabaseConstructor = new (
+  path: string,
+  options?: Record<string, unknown>,
+) => ReplayWriterLockDatabase;
+
+type ReplayWriterLease = { release(): void };
+type PortableReplayWriterClaim = {
+  token: string;
+  pid: number;
+  bootId: string;
+  processStartTicks: string;
+};
+
+const PORTABLE_REPLAY_WRITER_LOCK_FILE = "replay-writer-lock.json";
+const PORTABLE_REPLAY_KERNEL_LOCK_FILE = "replay-writer-lock.flock";
+const FRESH_PORTABLE_LOCK_MS = 2_000;
+const PORTABLE_LOCK_HELPER_TIMEOUT_MS = 3_000;
+
+const PORTABLE_LOCK_HELPER = String.raw`
+import fcntl, os, sys
+
+lock_path, ready_path, contended_path, released_path, token = sys.argv[1:]
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        marker = os.open(contended_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(marker, token.encode("utf-8"))
+        os.fsync(marker)
+        os.close(marker)
+        sys.exit(73)
+    marker = os.open(ready_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.write(marker, token.encode("utf-8"))
+    os.fsync(marker)
+    os.close(marker)
+    graceful_release = sys.stdin.buffer.read(1)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    if graceful_release:
+        marker = os.open(released_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(marker, token.encode("utf-8"))
+        os.fsync(marker)
+        os.close(marker)
+finally:
+    os.close(fd)
+`;
+
+function waitForMarker(path: string, token: string, deadline: number): boolean {
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    try {
+      if (readFileSync(path, "utf8") === token) return true;
+    } catch { /* marker is not published yet */ }
+    Atomics.wait(sleeper, 0, 0, 5);
+  }
+  return false;
+}
+
+/**
+ * Node 18 has neither bun:sqlite nor node:sqlite. A tiny Python helper owns a
+ * kernel advisory lock while its parent worker is alive. The pipe reaches EOF
+ * after SIGKILL and the kernel also drops the lock on reboot. This serializes
+ * stale O_EXCL-claim reclamation, avoiding compare-then-unlink races.
+ */
+class PortableReplayKernelLease implements ReplayWriterLease {
+  private released = false;
+
+  private constructor(
+    private readonly helper: ReturnType<typeof spawn>,
+    private readonly readyPath: string,
+    private readonly contendedPath: string,
+    private readonly releasedPath: string,
+    private readonly token: string,
+  ) {}
+
+  static acquire(stateDir: string): PortableReplayKernelLease {
+    const token = crypto.randomUUID();
+    const lockPath = join(stateDir, PORTABLE_REPLAY_KERNEL_LOCK_FILE);
+    const readyPath = join(stateDir, `.replay-writer-flock-ready-${token}`);
+    const contendedPath = join(stateDir, `.replay-writer-flock-contended-${token}`);
+    const releasedPath = join(stateDir, `.replay-writer-flock-released-${token}`);
+    const helper = spawn(
+      "python3",
+      ["-c", PORTABLE_LOCK_HELPER, lockPath, readyPath, contendedPath, releasedPath, token],
+      { stdio: ["pipe", "ignore", "ignore"] },
+    );
+    // Synchronous materializer construction polls durable handshake markers;
+    // consume asynchronous spawn/pipe errors so they cannot crash Node 18.
+    helper.on("error", () => {});
+    helper.stdin?.on("error", () => {});
+    if (!helper.pid) {
+      helper.kill("SIGKILL");
+      throw new Error("terminal replay portable writer lock helper did not start");
+    }
+    const deadline = Date.now() + PORTABLE_LOCK_HELPER_TIMEOUT_MS;
+    for (;;) {
+      if (waitForMarker(readyPath, token, Math.min(deadline, Date.now() + 10))) {
+        try { unlinkSync(readyPath); } catch { /* ephemeral handshake */ }
+        return new PortableReplayKernelLease(
+          helper,
+          readyPath,
+          contendedPath,
+          releasedPath,
+          token,
+        );
+      }
+      if (waitForMarker(contendedPath, token, Math.min(deadline, Date.now() + 10))) {
+        try { unlinkSync(contendedPath); } catch { /* ephemeral handshake */ }
+        helper.kill("SIGKILL");
+        throw new Error(`terminal replay state already has an active writer: ${stateDir}`);
+      }
+      if (Date.now() >= deadline) {
+        helper.kill("SIGKILL");
+        for (const path of [readyPath, contendedPath, releasedPath]) {
+          try { unlinkSync(path); } catch { /* absent handshake */ }
+        }
+        throw new Error("terminal replay portable writer lock helper timed out");
+      }
+    }
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    this.helper.stdin?.write(Buffer.from([0]));
+    const unlocked = waitForMarker(
+      this.releasedPath,
+      this.token,
+      Date.now() + PORTABLE_LOCK_HELPER_TIMEOUT_MS,
+    );
+    this.helper.stdin?.destroy();
+    if (!unlocked) this.helper.kill("SIGKILL");
+    for (const path of [this.readyPath, this.contendedPath, this.releasedPath]) {
+      try { unlinkSync(path); } catch { /* absent handshake */ }
+    }
+    if (!unlocked) throw new Error("terminal replay portable writer lock helper did not release");
+  }
+}
+
+function isMissingSqliteRuntime(error: unknown): boolean {
+  return isObject(error)
+    && (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_UNKNOWN_BUILTIN_MODULE");
+}
+
+function openReplayWriterLockDatabase(path: string): ReplayWriterLockDatabase | null {
+  const runtimeRequire = createRequire(import.meta.url);
+  let bunLoadError: unknown;
+  try {
+    const sqlite = runtimeRequire("bun:sqlite") as {
+      Database: ReplayWriterLockDatabaseConstructor;
+    };
+    return new sqlite.Database(path, { create: true, readwrite: true, strict: true });
+  } catch (error) {
+    if (!isMissingSqliteRuntime(error)) throw error;
+    bunLoadError = error;
+  }
+
+  try {
+    const sqlite = runtimeRequire("node:sqlite") as {
+      DatabaseSync: ReplayWriterLockDatabaseConstructor;
+    };
+    return new sqlite.DatabaseSync(path);
+  } catch (nodeError) {
+    if (!isMissingSqliteRuntime(nodeError)) throw nodeError;
+    return null;
+  }
+}
+
+function currentBootId(): string {
+  const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (!value) throw new Error("portable terminal replay lock cannot read the Linux boot id");
+  return value;
+}
+
+function processStartTicks(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return null;
+    return stat.slice(close + 2).trim().split(/\s+/)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readPortableClaim(path: string): PortableReplayWriterClaim | null {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as Partial<PortableReplayWriterClaim>;
+    if (
+      typeof value.token !== "string"
+      || !Number.isSafeInteger(value.pid)
+      || typeof value.bootId !== "string"
+      || typeof value.processStartTicks !== "string"
+    ) return null;
+    return value as PortableReplayWriterClaim;
+  } catch {
+    return null;
+  }
+}
+
+function portableClaimIsAlive(claim: PortableReplayWriterClaim, bootId: string): boolean {
+  return claim.bootId === bootId
+    && processStartTicks(claim.pid) === claim.processStartTicks;
+}
+
+class PortableReplayWriterLease implements ReplayWriterLease {
+  private released = false;
+
+  private constructor(
+    private readonly path: string,
+    private readonly directory: string,
+    private readonly fd: number,
+    private readonly claim: PortableReplayWriterClaim,
+    private readonly kernelLease: PortableReplayKernelLease,
+  ) {}
+
+  static acquire(stateDir: string): PortableReplayWriterLease {
+    const kernelLease = PortableReplayKernelLease.acquire(stateDir);
+    try {
+    const path = join(stateDir, PORTABLE_REPLAY_WRITER_LOCK_FILE);
+    const stalePath = `${path}.stale`;
+    const bootId = currentBootId();
+    const startTicks = processStartTicks(process.pid);
+    if (!startTicks) throw new Error("portable terminal replay lock cannot read its process start time");
+    const claim: PortableReplayWriterClaim = {
+      token: crypto.randomUUID(),
+      pid: process.pid,
+      bootId,
+      processStartTicks: startTicks,
+    };
+    const body = Buffer.from(`${JSON.stringify(claim)}\n`, "utf8");
+
+    const create = (): PortableReplayWriterLease | null => {
+      let fd: number;
+      try {
+        fd = openSync(
+          path,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_DSYNC,
+          PRIVATE_FILE_MODE,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+        throw error;
+      }
+      try {
+        writeAll(fd, body);
+        fdatasyncSync(fd);
+        fsyncDirectory(stateDir);
+        return new PortableReplayWriterLease(path, stateDir, fd, claim, kernelLease);
+      } catch (error) {
+        closeSync(fd);
+        try { unlinkSync(path); } catch { /* best effort */ }
+        throw error;
+      }
+    };
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const created = create();
+      if (created) return created;
+      const existing = readPortableClaim(path);
+      if (!existing) {
+        try {
+          const age = Date.now() - statSync(path).mtimeMs;
+          if (age >= 0 && age < FRESH_PORTABLE_LOCK_MS) {
+            throw new Error(`terminal replay state already has an active writer: ${stateDir}`);
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message.includes("active writer")) throw error;
+        }
+      }
+      if (existing && portableClaimIsAlive(existing, bootId)) {
+        throw new Error(`terminal replay state already has an active writer: ${stateDir}`);
+      }
+
+      try { unlinkSync(stalePath); } catch { /* absent or prior crash */ }
+      try {
+        renameSync(path, stalePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const quarantined = readPortableClaim(stalePath);
+      if (quarantined && portableClaimIsAlive(quarantined, bootId)) {
+        try {
+          if (!existsSync(path)) renameSync(stalePath, path);
+          else unlinkSync(stalePath);
+        } catch { /* fail closed below */ }
+        throw new Error(`terminal replay state already has an active writer: ${stateDir}`);
+      }
+      try { unlinkSync(stalePath); } catch { /* best effort */ }
+      fsyncDirectory(stateDir);
+    }
+    throw new Error(`terminal replay portable writer lock is contended: ${stateDir}`);
+    } catch (error) {
+      kernelLease.release();
+      throw error;
+    }
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    try { closeSync(this.fd); } catch { /* already closed */ }
+    try {
+      const current = readPortableClaim(this.path);
+      if (current?.token === this.claim.token) {
+        try {
+          unlinkSync(this.path);
+          fsyncDirectory(this.directory);
+        } catch { /* a replacement owner is authoritative */ }
+      }
+    } finally {
+      this.kernelLease.release();
+    }
+  }
+}
+
+function isSqliteLockContention(error: unknown): boolean {
+  if (!isObject(error)) return false;
+  return error.code === "SQLITE_BUSY"
+    || error.code === "SQLITE_LOCKED"
+    || (error.code === "ERR_SQLITE_ERROR"
+      && typeof error.message === "string"
+      && /\b(?:database|database table) is locked\b/i.test(error.message));
+}
+
+/**
+ * Process-level single-writer lease for one materialized replay stateDir.
+ *
+ * SQLite's BEGIN IMMEDIATE owns a kernel-backed database write lock until the
+ * connection is closed. Holding this transaction across the complete replay
+ * session prevents a second process from reading a stale checkpoint and then
+ * truncating or publishing over the active writer's derived history. The OS
+ * releases the lock if the worker is SIGKILLed or the machine reboots.
+ */
+class TerminalReplayWriterLease implements ReplayWriterLease {
+  private released = false;
+
+  private constructor(private readonly database: ReplayWriterLockDatabase) {}
+
+  static acquire(stateDir: string): ReplayWriterLease {
+    ensurePrivateDirectory(stateDir);
+    const lockPath = join(stateDir, REPLAY_WRITER_LOCK_FILE);
+    const existed = existsSync(lockPath);
+    const lockFd = openSync(
+      lockPath,
+      constants.O_CREAT
+        | constants.O_RDWR
+        | constants.O_DSYNC
+        | (constants.O_NOFOLLOW ?? 0),
+      PRIVATE_FILE_MODE,
+    );
+    try {
+      if (!fstatSync(lockFd).isFile()) {
+        throw new Error(`terminal replay writer lock is not a regular file: ${lockPath}`);
+      }
+      fchmodSync(lockFd, PRIVATE_FILE_MODE);
+      fdatasyncSync(lockFd);
+    } finally {
+      closeSync(lockFd);
+    }
+    if (!existed) fsyncDirectory(stateDir);
+
+    let database: ReplayWriterLockDatabase | null = null;
+    try {
+      database = openReplayWriterLockDatabase(lockPath);
+      if (!database) return PortableReplayWriterLease.acquire(stateDir);
+      database.exec("PRAGMA busy_timeout = 0");
+      database.exec("PRAGMA synchronous = FULL");
+      database.exec("PRAGMA journal_mode = DELETE");
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS replay_writer_lock (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+        )
+      `);
+      // This transaction intentionally remains open for the session lifetime.
+      database.exec("BEGIN IMMEDIATE");
+      return new TerminalReplayWriterLease(database);
+    } catch (error) {
+      if (database) {
+        try { database.close(); } catch { /* closing still releases any acquired lock */ }
+      }
+      if (isSqliteLockContention(error)) {
+        throw new Error(
+          `terminal replay state already has an active writer: ${stateDir}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    try {
+      this.database.exec("ROLLBACK");
+    } catch {
+      // close() below is the fail-closed unlock path even if SQLite is damaged.
+    }
+    try { this.database.close(); } catch { /* the fd has still been closed best-effort */ }
+  }
 }
 
 function writeAtomicJson(path: string, value: unknown): void {
@@ -1091,6 +1547,32 @@ class PrivateTmuxReplay {
   }
 
   /**
+   * Apply geometry while the current source generation has emitted no bytes.
+   * Such a generation was never observably painted by the direct PTY proxy,
+   * so blank rows created by tmux resize mechanics are disposable emulator
+   * state rather than terminal history.
+   */
+  resizeUnseen(geometry: TerminalReplayGeometry): void {
+    this.discardHistory();
+    this.run([
+      "resize-window",
+      "-t",
+      this.target,
+      "-x",
+      String(geometry.cols),
+      "-y",
+      String(geometry.rows),
+    ]);
+    const actual = this.currentGeometry();
+    if (!sameGeometry(actual, geometry)) {
+      throw new Error(
+        `private replay resize produced ${actual.cols}x${actual.rows}, expected ${geometry.cols}x${geometry.rows}`,
+      );
+    }
+    this.discardHistory();
+  }
+
+  /**
    * Commit the old PTY generation's final visible rows exactly once, then
    * replace the emulator pane with a genuinely blank terminal.  Repainting a
    * screenshot cannot reset hidden VT modes, tab stops, or parser state.
@@ -1103,6 +1585,20 @@ class PrivateTmuxReplay {
     const oldScreen = this.captureScreen();
     onHistory(Buffer.from(oldScreen.cellsBase64, "base64"));
 
+    this.resetGeneration(geometry);
+  }
+
+  /**
+   * Drop a source generation that never emitted PTY output. START/RESUME is
+   * durable before ACTIVATE, so a crash in that interval leaves a lifecycle
+   * record but no screen that was ever visible to the user. Persisting its
+   * blank grid would manufacture rows on every failed activation attempt.
+   */
+  discardUnseenAndReset(geometry: TerminalReplayGeometry): void {
+    this.resetGeneration(geometry);
+  }
+
+  private resetGeneration(geometry: TerminalReplayGeometry): void {
     if (this.inputFd < 0) throw new Error("private replay FIFO writer is not open");
     const previousWriter = this.inputFd;
     truncateSync(this.mirrorPath, 0);
@@ -1141,6 +1637,14 @@ class PrivateTmuxReplay {
       throw new Error(
         `private replay generation reset produced ${actual.cols}x${actual.rows}, expected ${geometry.cols}x${geometry.rows}`,
       );
+    }
+  }
+
+  discardHistory(): void {
+    this.run(["clear-history", "-t", this.target]);
+    const remaining = this.historySize();
+    if (remaining !== 0) {
+      throw new Error(`private replay clear-history left ${remaining} rows`);
     }
   }
 
@@ -1304,6 +1808,7 @@ class ReplayEngine {
   private geometry: TerminalReplayGeometry | null = null;
   private pendingResize: TerminalReplayResize | null = null;
   private recordsSeen = 0;
+  private hasOutputInGeneration = false;
 
   constructor(private readonly tmux: PrivateTmuxReplay) {}
 
@@ -1336,6 +1841,7 @@ class ReplayEngine {
       this.lifecycle = "active";
       this.identity = value.identity;
       this.geometry = value.geometry;
+      this.hasOutputInGeneration = false;
       return;
     }
 
@@ -1353,13 +1859,27 @@ class ReplayEngine {
         && value.identity.generation !== this.identity!.generation;
       if (generationChanged) {
         // A new direct-PTY generation starts from a blank emulator. Preserve
-        // the prior generation's last visible screen as immutable history,
-        // but do not leak any hidden VT state into the replacement pane.
-        this.tmux.sealVisibleAndReset(value.geometry, onHistory);
+        // the prior generation's last visible screen only if that generation
+        // emitted bytes. START/RESUME is durable before ACTIVATE, so a source
+        // that dies while still gated has no user-visible screen to archive.
+        if (this.hasOutputInGeneration) {
+          this.tmux.sealVisibleAndReset(value.geometry, onHistory);
+        } else {
+          this.tmux.discardUnseenAndReset(value.geometry);
+        }
+        this.hasOutputInGeneration = false;
       } else {
-        this.tmux.drainHistory(onHistory);
+        if (this.hasOutputInGeneration) {
+          this.tmux.drainHistory(onHistory);
+        } else {
+          this.tmux.discardHistory();
+        }
         if (!sameGeometry(this.geometry!, value.geometry)) {
-          this.tmux.resize(value.geometry, onHistory);
+          if (this.hasOutputInGeneration) {
+            this.tmux.resize(value.geometry, onHistory);
+          } else {
+            this.tmux.resizeUnseen(value.geometry);
+          }
         }
       }
       this.identity = value.identity;
@@ -1372,7 +1892,11 @@ class ReplayEngine {
         `lifecycle end geometry ${value.geometry.cols}x${value.geometry.rows} differs from replay ${this.geometry!.cols}x${this.geometry!.rows}`,
       );
     }
-    this.tmux.drainHistory(onHistory);
+    if (this.hasOutputInGeneration) {
+      this.tmux.drainHistory(onHistory);
+    } else {
+      this.tmux.discardHistory();
+    }
     this.identity = value.identity;
     this.lifecycle = "ended";
   }
@@ -1394,7 +1918,11 @@ class ReplayEngine {
           `resize prepare ${value.changeId} starts at ${value.from.cols}x${value.from.rows}, replay is ${this.geometry!.cols}x${this.geometry!.rows}`,
         );
       }
-      this.tmux.drainHistory(onHistory);
+      if (this.hasOutputInGeneration) {
+        this.tmux.drainHistory(onHistory);
+      } else {
+        this.tmux.discardHistory();
+      }
       this.pendingResize = value;
       return;
     }
@@ -1406,7 +1934,11 @@ class ReplayEngine {
         if (!sameGeometry(this.geometry!, value.from)) {
           throw new Error(`authoritative resize ${value.changeId} source geometry changed`);
         }
-        this.tmux.resize(value.to, onHistory);
+        if (this.hasOutputInGeneration) {
+          this.tmux.resize(value.to, onHistory);
+        } else {
+          this.tmux.resizeUnseen(value.to);
+        }
         this.geometry = value.to;
         return;
       }
@@ -1419,7 +1951,11 @@ class ReplayEngine {
       throw new Error(`resize ${value.phase} ${value.changeId} source geometry changed`);
     }
     if (value.phase === "commit") {
-      this.tmux.resize(value.to, onHistory);
+      if (this.hasOutputInGeneration) {
+        this.tmux.resize(value.to, onHistory);
+      } else {
+        this.tmux.resizeUnseen(value.to);
+      }
       this.geometry = value.to;
     }
     // abort deliberately leaves the emulator at `from`.
@@ -1442,7 +1978,10 @@ class ReplayEngine {
               `output appears during prepared resize ${this.pendingResize.changeId}`,
             );
           }
-          this.tmux.feed(record.payload, onHistory);
+          if (record.payload.byteLength > 0) {
+            this.tmux.feed(record.payload, onHistory);
+            this.hasOutputInGeneration = true;
+          }
           break;
         case "resize":
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
@@ -1517,6 +2056,7 @@ export class TerminalReplayMaterializer {
   private readonly historyLimit: number;
   private readonly commandTimeoutMs: number;
   private readonly maxWalFrameBytesPerRefresh: number;
+  private readonly recoveryTarget: { sequence: bigint; walOffset: number } | null;
 
   constructor(options: TerminalReplayMaterializerOptions) {
     this.walPath = resolve(nonEmptyString(options.walPath, "walPath"));
@@ -1551,6 +2091,22 @@ export class TerminalReplayMaterializer {
       DEFAULT_MAX_WAL_FRAME_BYTES_PER_REFRESH,
       "maxWalFrameBytesPerRefresh",
     );
+    if ((options.recoverySequence === undefined) !== (options.recoveryWalOffset === undefined)) {
+      throw new Error("recoverySequence and recoveryWalOffset must be supplied together");
+    }
+    if (options.recoverySequence !== undefined && options.recoveryWalOffset !== undefined) {
+      if (!/^[1-9]\d*$/.test(options.recoverySequence)) {
+        throw new Error("recoverySequence must be a positive decimal bigint");
+      }
+      const sequence = BigInt(options.recoverySequence);
+      if (sequence > ((1n << 64n) - 1n)) throw new Error("recoverySequence exceeds uint64");
+      if (!Number.isSafeInteger(options.recoveryWalOffset) || options.recoveryWalOffset <= 0) {
+        throw new Error("recoveryWalOffset must be a positive safe integer");
+      }
+      this.recoveryTarget = { sequence, walOffset: options.recoveryWalOffset };
+    } else {
+      this.recoveryTarget = null;
+    }
     if (this.historyLimit <= MAX_ROWS) {
       throw new Error(
         `historyLimit must be greater than the maximum replay pane height ${MAX_ROWS}`,
@@ -1573,6 +2129,7 @@ export class TerminalReplayMaterializer {
   open(): TerminalReplaySession {
     return new TerminalReplaySession({
       walPath: this.walPath,
+      stateDir: this.stateDir,
       historyPath: this.historyPath,
       checkpointPath: this.checkpointPath,
       tmuxCommand: this.tmuxCommand,
@@ -1582,6 +2139,7 @@ export class TerminalReplayMaterializer {
       historyLimit: this.historyLimit,
       commandTimeoutMs: this.commandTimeoutMs,
       maxWalFrameBytesPerRefresh: this.maxWalFrameBytesPerRefresh,
+      recoveryTarget: this.recoveryTarget,
     });
   }
 
@@ -1600,6 +2158,7 @@ export class TerminalReplayMaterializer {
 
 type TerminalReplaySessionOptions = {
   walPath: string;
+  stateDir: string;
   historyPath: string;
   checkpointPath: string;
   tmuxCommand: string;
@@ -1609,14 +2168,17 @@ type TerminalReplaySessionOptions = {
   historyLimit: number;
   commandTimeoutMs: number;
   maxWalFrameBytesPerRefresh: number;
+  recoveryTarget: { sequence: bigint; walOffset: number } | null;
 };
 
 export class TerminalReplaySession {
   private readonly walPath: string;
   private readonly historyPath: string;
   private readonly checkpointPath: string;
+  private readonly writerLease: ReplayWriterLease;
   private readonly recoveredFromCheckpoint: boolean;
   private readonly maxWalFrameBytesPerRefresh: number;
+  private recoveryTarget: { sequence: bigint; walOffset: number } | null;
   private readonly history: MaterializedHistoryFile;
   private readonly tmux: PrivateTmuxReplay;
   private readonly engine: ReplayEngine;
@@ -1634,14 +2196,48 @@ export class TerminalReplaySession {
     this.historyPath = options.historyPath;
     this.checkpointPath = options.checkpointPath;
     this.maxWalFrameBytesPerRefresh = options.maxWalFrameBytesPerRefresh;
-    const checkpoint = readTerminalReplayCheckpoint(this.checkpointPath);
-    if (checkpoint && resolve(checkpoint.walPath) !== this.walPath) {
-      throw new Error(
-        `checkpoint belongs to ${checkpoint.walPath}, not ${this.walPath}`,
-      );
+    this.recoveryTarget = options.recoveryTarget;
+    const writerLease = TerminalReplayWriterLease.acquire(options.stateDir);
+    this.writerLease = writerLease;
+    let checkpoint: TerminalReplayCheckpoint | null;
+    try {
+      // The lease must precede both checkpoint reads and history open/truncate.
+      checkpoint = readTerminalReplayCheckpoint(this.checkpointPath);
+      if (checkpoint && resolve(checkpoint.walPath) !== this.walPath) {
+        throw new Error(
+          `checkpoint belongs to ${checkpoint.walPath}, not ${this.walPath}`,
+        );
+      }
+      if (checkpoint && this.recoveryTarget) {
+        const checkpointSequence = BigInt(checkpoint.cursor.sequence);
+        if (
+          checkpoint.cursor.walOffset === this.recoveryTarget.walOffset
+          && checkpointSequence !== this.recoveryTarget.sequence
+        ) throw new Error("terminal replay checkpoint target offset has a different sequence");
+        if (checkpoint.cursor.walOffset > this.recoveryTarget.walOffset) {
+          // Derived state may safely be rebuilt from WAL. Remove the checkpoint
+          // first and persist that removal before MaterializedHistoryFile
+          // truncates history, so a crash can never leave a published cursor
+          // referring to the truncated file.
+          unlinkSync(this.checkpointPath);
+          fsyncDirectory(dirname(this.checkpointPath));
+          checkpoint = null;
+        } else if (checkpoint.cursor.walOffset === this.recoveryTarget.walOffset) {
+          this.recoveryTarget = null;
+        }
+      }
+    } catch (error) {
+      writerLease.release();
+      throw error;
     }
     this.recoveredFromCheckpoint = checkpoint !== null;
-    const history = new MaterializedHistoryFile(this.historyPath, checkpoint);
+    let history: MaterializedHistoryFile;
+    try {
+      history = new MaterializedHistoryFile(this.historyPath, checkpoint);
+    } catch (error) {
+      writerLease.release();
+      throw error;
+    }
     let tmux: PrivateTmuxReplay;
     try {
       tmux = new PrivateTmuxReplay({
@@ -1653,7 +2249,7 @@ export class TerminalReplaySession {
         commandTimeoutMs: options.commandTimeoutMs,
       });
     } catch (error) {
-      history.close();
+      try { history.close(); } finally { writerLease.release(); }
       throw error;
     }
     this.history = history;
@@ -1748,7 +2344,11 @@ export class TerminalReplaySession {
 
       this.result = this.commitCheckpoint();
     } catch (error) {
-      try { this.history.close(); } finally { this.tmux.close(); }
+      try {
+        this.history.close();
+      } finally {
+        try { this.tmux.close(); } finally { this.writerLease.release(); }
+      }
       this.closed = true;
       throw error;
     }
@@ -1828,9 +2428,24 @@ export class TerminalReplaySession {
       this.tailCursor = createOutputWalStartCursor(this.walPath);
     }
 
+    const targetRemaining = this.recoveryTarget
+      ? this.recoveryTarget.walOffset - this.lastOffset
+      : null;
+    if (targetRemaining !== null && targetRemaining <= 0) {
+      if (
+        this.lastOffset !== this.recoveryTarget!.walOffset
+        || this.lastSequence !== this.recoveryTarget!.sequence
+      ) throw new Error("terminal replay recovery target is not an exact WAL cursor");
+      this.recoveryTarget = null;
+      this.hasMoreWal = this.peekTailHasMore();
+      return false;
+    }
+
     let changed = false;
     const batch = readOutputWalTail(this.walPath, this.tailCursor, {
-      maxFrameBytes: this.maxWalFrameBytesPerRefresh,
+      maxFrameBytes: targetRemaining === null
+        ? this.maxWalFrameBytesPerRefresh
+        : Math.min(this.maxWalFrameBytesPerRefresh, targetRemaining),
       // When the last published checkpoint ended at PREPARE, expose the
       // matching COMMIT/ABORT as its own verified handoff before accepting
       // post-resize output. Otherwise a host store that correctly rejected
@@ -1842,6 +2457,9 @@ export class TerminalReplaySession {
         throw new Error(
           `incremental WAL record begins at ${record.offset}, expected ${this.lastOffset}`,
         );
+      }
+      if (this.recoveryTarget && record.nextOffset > this.recoveryTarget.walOffset) {
+        throw new Error("terminal replay recovery target is not a record boundary");
       }
       this.engine.process(record, (captured) => this.history.accept(captured, "append"));
       this.lastOffset = record.nextOffset;
@@ -1855,7 +2473,16 @@ export class TerminalReplaySession {
       throw new Error("incremental WAL cursor diverged from processed records");
     }
     this.tailCursor = batch.cursor;
-    this.hasMoreWal = batch.hasMore;
+    if (this.recoveryTarget && this.lastOffset === this.recoveryTarget.walOffset) {
+      if (this.lastSequence !== this.recoveryTarget.sequence) {
+        throw new Error("terminal replay recovery target sequence does not match its WAL offset");
+      }
+      this.recoveryTarget = null;
+    }
+    if (this.recoveryTarget && batch.records.length === 0) {
+      throw new Error("terminal replay recovery target is beyond the readable WAL");
+    }
+    this.hasMoreWal = batch.hasMore || this.peekTailHasMore();
     return changed;
   }
 
@@ -1885,6 +2512,10 @@ export class TerminalReplaySession {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    try { this.history.close(); } finally { this.tmux.close(); }
+    try {
+      this.history.close();
+    } finally {
+      try { this.tmux.close(); } finally { this.writerLease.release(); }
+    }
   }
 }

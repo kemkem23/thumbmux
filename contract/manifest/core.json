@@ -42,6 +42,78 @@
     "tier": "F"
   },
   {
+    "name": "ClaudeBashBlock",
+    "kind": "type",
+    "signature": "2f0606d4c61e21fc8cc1ea936d3eed68d19d8e230a2f0a881090a5064ee1a33f",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashBlockStatus",
+    "kind": "type",
+    "signature": "a3f80f7817422ecaa46b0f156e18ae0debf9bd5e6639974bd594d237e38ec52c",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashDetection",
+    "kind": "type",
+    "signature": "5935c41985e9b2d07b5b692f842590d4ddceead840800ed27647525cc469f34a",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashDetectionOptions",
+    "kind": "type",
+    "signature": "fe16156d3602ecaea11fad6e49c57835ba874107a6fe5088e2755df0a2ad0b9c",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashLineRange",
+    "kind": "type",
+    "signature": "32d6dfc0a614b8765adc97c69b8e32aee2293685863895a49b07aa7abc6be29b",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashMode",
+    "kind": "type",
+    "signature": "55b2d1dffadeb72d693f2d937c6afbaaf239f5b70f6e49de9d275da557bb023a",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjection",
+    "kind": "type",
+    "signature": "7d5a35ef071992271d90a6668dff1e1b1408f1ca417966b288ac4dca38e78153",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjectionOptions",
+    "kind": "type",
+    "signature": "2f1b23dd7b2a04fea02123dc16ac09133f27b1c75a326831fbe4e2d002ffe0cf",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashProjectionRow",
+    "kind": "type",
+    "signature": "bd80cfcab43eefe3830412f7b33edf580442f2410c6a8bb7c87437930a2da715",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashScreenMode",
+    "kind": "type",
+    "signature": "3a437bbf26bb9c1019dc834caf4ee3b0006420f4c55f904a158783f7b2ff17eb",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashSummaries",
+    "kind": "type",
+    "signature": "0cbebcfcda9462f2430acdd96f39d88bc60c86a11a7c645b57e6d4b611776ce0",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashSummaryRequest",
+    "kind": "type",
+    "signature": "82b9d84f97730aa27b451e4bfee1d60f6890b5f2638b7a999f2463db34a79e84",
+    "tier": "X"
+  },
+  {
     "name": "DEFAULT_ANSI_COLORS",
     "kind": "value",
     "signature": "f83dc176b81eeb0a2b71b32ef49640fd941eb78a0cb8742f5eb8ab345119b2f5",
@@ -98,7 +170,7 @@
   {
     "name": "JournalRecordV1",
     "kind": "type",
-    "signature": "0a656ab5b897149fd91089dc967ae831428515e755a2dd19fa31ec878dbd0388",
+    "signature": "bf38d09877d71b78e67497dcc82855571205c264d305dfd045b98c94bba94675",
     "tier": "F"
   },
   {
@@ -176,19 +248,31 @@
   {
     "name": "MuxDeltaFrame",
     "kind": "type",
-    "signature": "6b9dd2dd08a154158fe2dc1eac7a088628c1eb7bf7716f6069f394bc187bc292",
+    "signature": "4cc36154974066e62a3cf45f0fa6bfc864fa71681932691e6607566ffe7b1b8b",
     "tier": "F"
   },
   {
     "name": "MuxFullOutputFrame",
     "kind": "type",
-    "signature": "34c415db8e45207f430cd2b1906895fa9bb2c43a16737bdf6a869965f1a2dea9",
+    "signature": "4e511c4f929c57d2f6f126bc606a03836812396b929e10eda860f09fe57ad362",
     "tier": "F"
+  },
+  {
+    "name": "MuxHistoryBoundary",
+    "kind": "type",
+    "signature": "16dcebd2a4ed0fcedff7c3a8f3cd1177d46825a1154ab67cb251f226fa8f6873",
+    "tier": "X"
+  },
+  {
+    "name": "MuxHistoryBoundaryTransition",
+    "kind": "type",
+    "signature": "6e56f9a5ec3888a698612620c946d41d9e3f3d0a4aed3b5aeeffaf030aef4e15",
+    "tier": "X"
   },
   {
     "name": "MuxOutputFrame",
     "kind": "type",
-    "signature": "e8a96fc037e350c0441b9a211c0a3ce070773babc1f439e763e7779aa9affa08",
+    "signature": "f034bf054ba4e56c7d8f770cf021cbc6b66ab10db7ba3ab328ab1b126604aae8",
     "tier": "F"
   },
   {
@@ -218,13 +302,13 @@
   {
     "name": "MuxServerFrame",
     "kind": "type",
-    "signature": "65893d1d037e45422d63492b6d67a2cb2e242db174c24e11477014d79aac8af5",
+    "signature": "e9d1de7871a65f46943e4d02ca7c8976ddd65094442ea4eefdfc4ba8e805733e",
     "tier": "S"
   },
   {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "dcf8bcb375cbd6569f7a640e3a0ee008e208a7189960e145c425f31203a6c276",
+    "signature": "e52d952ea95638df3fc36c108a8c8939809f496e06b51a6c7106d0118e3d0cea",
     "tier": "F"
   },
   {
@@ -236,7 +320,7 @@
   {
     "name": "ParsedReplayRecord",
     "kind": "type",
-    "signature": "dbfefd0994c7b368017b42e594c7a7495e7372d645854c5f3dc7066b348d4f38",
+    "signature": "06f151fc700a6b3f1d32257ad81059d723dc307401bbbaf190687560549cd1e7",
     "tier": "F"
   },
   {
@@ -266,19 +350,19 @@
   {
     "name": "ReplayFullCheckpoint",
     "kind": "type",
-    "signature": "81edfe1faac98eed5e7075c27847ba44fe58e51696641686fefef12ac24035dc",
+    "signature": "63c257e294f37d579a4987323c25f30d315fe073226a59f7efb47d6da989a7c4",
     "tier": "F"
   },
   {
     "name": "ReplayJournal",
     "kind": "value",
-    "signature": "5744f5c32016f2eb4a9e7da8fdb0662d056b4cbdb17aa10ff54fa03130912173",
+    "signature": "a939fb0fd4526d4a0800e3d1409efe8a6fc0a16fc2bb82f58a74cd60d1c0be01",
     "tier": "F"
   },
   {
     "name": "ReplayLookup",
     "kind": "type",
-    "signature": "90fd8b16398b32258e7094d011befda6ee71191b9b11a63397297bec9aded1a0",
+    "signature": "91baa3a40d32087dc14d2ec0ba7ff376429533cdbe7b6671ff55920430f1309f",
     "tier": "F"
   },
   {
@@ -458,7 +542,7 @@
   {
     "name": "chooseMuxOutputFrame",
     "kind": "value",
-    "signature": "6847f33bfd780fe6a31907e6ce2883b0af11d026138551d4af5be48fadd9ead9",
+    "signature": "08a0b1eda9f1db1b8ee965c98bb5fb1d9e408649df88698d7f15f0b26ac5fec2",
     "tier": "F"
   },
   {
@@ -494,7 +578,7 @@
   {
     "name": "createMuxDeltaFrame",
     "kind": "value",
-    "signature": "c540347faf7caec2dd7648f39fc9f402b2ddb6f6395895599f51c482ae06c6e9",
+    "signature": "76210d3ed16b2f321ea10a2cc826ea72b1a52862270b9845d0776d6be2924b57",
     "tier": "F"
   },
   {
@@ -514,6 +598,12 @@
     "kind": "value",
     "signature": "b6b6467a572fb20601b6ca930331dd82cc54a45b97cee5d3fac28f7d6a038a49",
     "tier": "F"
+  },
+  {
+    "name": "detectClaudeBashBlocks",
+    "kind": "value",
+    "signature": "0fd028227b414552b6f9651b7546eabfee5f58484d9ada47848b3a558a5147ad",
+    "tier": "X"
   },
   {
     "name": "extractRecentPrompts",
@@ -630,6 +720,12 @@
     "tier": "F"
   },
   {
+    "name": "muxHistoryBoundaryTransition",
+    "kind": "value",
+    "signature": "75fc706000109924db8b75fd5c8da025527afc644b465540ee4b8082c9c68f72",
+    "tier": "X"
+  },
+  {
     "name": "muxPrefixHash",
     "kind": "value",
     "signature": "a095de06716f6ff436f2bc61580a8df9cb432cf7580ea74e5fa509d4d3330302",
@@ -656,7 +752,7 @@
   {
     "name": "parseReplayJournal",
     "kind": "value",
-    "signature": "4f0141a0717d3ccd6b9a52f205d17e0fe57099b838ecbf27940405341f54e1eb",
+    "signature": "adf52be345cf1c314384eb3e2020d4a749d5ac5e8adce417ecb9f79c3809600e",
     "tier": "F"
   },
   {
@@ -676,6 +772,12 @@
     "kind": "value",
     "signature": "7317016c15250832563c0fb5cde557efa980e23d767db545fed7b0c33b1432bb",
     "tier": "F"
+  },
+  {
+    "name": "projectClaudeBashLines",
+    "kind": "value",
+    "signature": "0d8d664daae7459395624024964252b2c44e7385c8e8e9c3d9177db2f571dcf6",
+    "tier": "X"
   },
   {
     "name": "readerAnchorLineDelta",
@@ -710,7 +812,7 @@
   {
     "name": "serializedMuxFrameSize",
     "kind": "value",
-    "signature": "e7aa70f1d8fb6f6c693c59e126d28eaf963a3408c12c31cf3b88582fba9935dc",
+    "signature": "fde8db54a15f70fc633b863b764756a9e14424936fb81f2e76df7eb73a8f957e",
     "tier": "F"
   },
   {
@@ -740,7 +842,7 @@
   {
     "name": "shouldUseMuxDelta",
     "kind": "value",
-    "signature": "0ff9bbbd584209463d47968caa04570e652381a887fe0e4d9eff744430610538",
+    "signature": "e989f5169f3d6a20582116520d1b659856f037389ff8bbd6730042ec92920645",
     "tier": "F"
   },
   {
@@ -782,8 +884,14 @@
   {
     "name": "validateMuxDeltaFrame",
     "kind": "value",
-    "signature": "d010349a53ca343a3a38c1e32285882edcbf2719cdf67018327fd5af88c7005e",
+    "signature": "8787a527fe959fb636ff1a2088ec8c2e7126c56633d710c6099802116451c43b",
     "tier": "F"
+  },
+  {
+    "name": "validateMuxHistoryBoundary",
+    "kind": "value",
+    "signature": "3d66d05394244d91cc1f120c1411456fc6ceb165b53aec4da23abdb22810063a",
+    "tier": "X"
   },
   {
     "name": "warnDeprecated",

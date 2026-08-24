@@ -22,6 +22,10 @@ type MuxCallback = (
     replace: boolean;
     screen?: ScreenMode | null;
     boundary?: MuxHistoryBoundary;
+    historyError?: {
+      code: "history_temporarily_unavailable";
+      retryable: true;
+    };
   },
 ) => void;
 type HistoryCall =
@@ -224,6 +228,20 @@ function deliverHistory(
   drainScheduledWork();
 }
 
+function deliverHistoryError(): void {
+  if (!sessionCallback) throw new Error("subscribe was not invoked");
+  sessionCallback("history_temporarily_unavailable", "error", undefined, {
+    source: "full",
+    replace: false,
+    historyError: {
+      code: "history_temporarily_unavailable",
+      retryable: true,
+    },
+  });
+  flushSync();
+  drainScheduledWork();
+}
+
 function wheel(viewport: HTMLElement, deltaY: number): void {
   viewport.dispatchEvent(new WheelEvent("wheel", {
     deltaY,
@@ -331,6 +349,31 @@ afterEach(() => {
 });
 
 describe("TermView sliding archive window", () => {
+  test("settles a retryable archive error without marking EOF and retries the identical cursor", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    deliverOutput(liveLines());
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+    expect(viewport.getAttribute("data-history-request-direction")).toBe("before");
+
+    deliverHistoryError();
+    expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+    expect(viewport.getAttribute("data-history-stop")).toBe("none");
+    expect(viewport.getAttribute("data-history-window-start")).toBeNull();
+    expect(recoverCalls).toBe(0);
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toEqual([
+      { direction: "before", cursor: null, limit: 2_000 },
+      { direction: "before", cursor: null, limit: 2_000 },
+    ]);
+    deliverHistory(18_000, archiveLines(18_000, 2_000), true);
+    expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+    expect(viewport.getAttribute("data-history-stop")).toBe("none");
+  });
+
   test("advances an atomic seam without gaps, duplicates, or a detached-reader jump", async () => {
     const { viewport } = mountTermView();
     await tick();

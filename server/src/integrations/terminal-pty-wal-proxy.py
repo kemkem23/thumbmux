@@ -40,6 +40,7 @@ SOCKET_FILE = "control.sock"
 LOCK_FILE = "writer.lock"
 HEALTH_FILE = "pty-proxy-status.json"
 DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log"
+FINALIZE_LOGICAL_END_FLAG = "--finalize-logical-end"
 
 MAGIC = b"THMWAL01"
 VERSION = 1
@@ -87,6 +88,49 @@ def fsync_directory(path: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def ensure_durable_directory(path: str) -> None:
+    """Create a private directory chain and persist every new directory name."""
+    missing: list[str] = []
+    cursor = path
+    while True:
+        try:
+            info = os.lstat(cursor)
+        except FileNotFoundError:
+            missing.append(cursor)
+            parent = os.path.dirname(cursor)
+            if parent == cursor:
+                raise ProxyError(f"terminal WAL has no existing ancestor: {path}")
+            cursor = parent
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ProxyError(f"terminal WAL directory component is not a real directory: {cursor}")
+        break
+
+    for directory in reversed(missing):
+        parent = os.path.dirname(directory)
+        try:
+            os.mkdir(directory, PRIVATE_DIRECTORY_MODE)
+        except FileExistsError:
+            pass
+        info = os.lstat(directory)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ProxyError(f"terminal WAL directory component is not a real directory: {directory}")
+        os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+        # The child's metadata and the parent's new directory entry must both
+        # survive before START, ACTIVATE, or any displayed output is possible.
+        fsync_directory(directory)
+        fsync_directory(parent)
+
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ProxyError("terminal WAL directory must be a real directory")
+    os.chmod(path, PRIVATE_DIRECTORY_MODE)
+    # Cover a mkdir race in which a peer created the leaf just before us but
+    # had not yet synced its parent entry.
+    fsync_directory(path)
+    fsync_directory(os.path.dirname(path))
 
 
 def write_all(fd: int, data: bytes | bytearray | memoryview) -> None:
@@ -340,6 +384,8 @@ class ExistingWal:
     active: bool
     session: Optional[str]
     instance_id: Optional[str]
+    identity: Optional[dict[str, Any]]
+    geometry: Optional[dict[str, int]]
     pending_resize: Optional[dict[str, Any]]
     sequence: int
     last_at: int
@@ -367,12 +413,110 @@ def validate_geometry(value: Any, label: str) -> dict[str, int]:
     return {"cols": cols, "rows": rows}
 
 
-def scan_wal(path: str) -> tuple[list[WalRecord], int, Optional[tuple[str, int]]]:
+class WalInspector:
+    """Validate one record at a time while retaining only resumable WAL state."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.session: Optional[str] = None
+        self.instance_id: Optional[str] = None
+        self.identity: Optional[dict[str, Any]] = None
+        self.geometry: Optional[dict[str, int]] = None
+        self.pending: Optional[dict[str, Any]] = None
+        self.sequence = 0
+        self.last_at = 0
+
+    def consume(self, record: WalRecord) -> None:
+        first = self.sequence == 0
+        if first and record.kind != "lifecycle":
+            raise WalCorruption("terminal WAL first record must be lifecycle start")
+        if record.kind == "lifecycle":
+            if self.pending is not None:
+                raise WalCorruption("terminal WAL lifecycle appears inside pending resize")
+            value = decode_json_payload(record.payload, "lifecycle")
+            if set(value) != {"event", "identity", "geometry"}:
+                raise WalCorruption("terminal WAL lifecycle fields are invalid")
+            event = value.get("event")
+            next_identity = value.get("identity")
+            next_geometry = validate_geometry(value.get("geometry"), "lifecycle.geometry")
+            if event not in ("start", "resume", "end") or not isinstance(next_identity, dict):
+                raise WalCorruption("terminal WAL lifecycle is invalid")
+            next_session, next_instance = next_identity.get("session"), next_identity.get("instanceId")
+            if not isinstance(next_session, str) or not isinstance(next_instance, str):
+                raise WalCorruption("terminal WAL lifecycle identity is invalid")
+            if first:
+                if event != "start":
+                    raise WalCorruption("terminal WAL first lifecycle event must be start")
+                self.session, self.instance_id, self.active = next_session, next_instance, True
+            else:
+                if event == "start" or next_session != self.session or next_instance != self.instance_id:
+                    raise WalCorruption("terminal WAL lifecycle chain changed identity")
+                if event == "end":
+                    if not self.active:
+                        raise WalCorruption("terminal WAL lifecycle ended twice")
+                    self.active = False
+                elif not self.active:
+                    raise WalCorruption("terminal WAL resumed after logical END")
+            # Keep only the latest source identity and geometry needed for a
+            # RESUME or offline END. Earlier lifecycle payloads are released.
+            self.identity = dict(next_identity)
+            self.geometry = next_geometry
+        else:
+            if not self.active:
+                raise WalCorruption("terminal WAL contains data outside active lifecycle")
+            if record.kind == "resize":
+                value = decode_json_payload(record.payload, "resize")
+                allowed = {"phase", "changeId", "from", "to", "reason"}
+                if not {"phase", "changeId", "from", "to"}.issubset(value) or not set(value).issubset(allowed):
+                    raise WalCorruption("terminal WAL resize fields are invalid")
+                phase = value.get("phase")
+                validate_geometry(value.get("from"), "resize.from")
+                next_geometry = validate_geometry(value.get("to"), "resize.to")
+                if not isinstance(value.get("changeId"), str) or not SAFE_ID.fullmatch(value["changeId"]):
+                    raise WalCorruption("terminal WAL resize changeId is invalid")
+                if phase == "prepare":
+                    if self.pending is not None:
+                        raise WalCorruption("terminal WAL contains nested resize")
+                    # The matching completion and crash recovery need this one
+                    # record only; completed resize payloads are released.
+                    self.pending = value
+                elif phase in ("commit", "abort"):
+                    if self.pending is None or any(
+                        value.get(key) != self.pending.get(key)
+                        for key in ("changeId", "from", "to", "reason")
+                    ):
+                        raise WalCorruption("terminal WAL resize completion has no matching prepare")
+                    self.pending = None
+                    if phase == "commit":
+                        self.geometry = next_geometry
+                else:
+                    raise WalCorruption("terminal WAL resize phase is invalid")
+            elif self.pending is not None:
+                raise WalCorruption("terminal WAL record appears inside pending resize")
+        self.sequence = record.sequence
+        self.last_at = record.at
+
+    def finish(self, valid_bytes: int) -> ExistingWal:
+        return ExistingWal(
+            self.sequence == 0,
+            self.active,
+            self.session,
+            self.instance_id,
+            self.identity,
+            self.geometry,
+            self.pending,
+            self.sequence,
+            self.last_at,
+            valid_bytes,
+        )
+
+
+def scan_wal(path: str) -> tuple[ExistingWal, Optional[tuple[str, int]]]:
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        return [], 0, None
-    records: list[WalRecord] = []
+        return WalInspector().finish(0), None
+    inspector = WalInspector()
     offset = 0
     previous_sequence = 0
     previous_at = 0
@@ -407,11 +551,15 @@ def scan_wal(path: str) -> tuple[list[WalRecord], int, Optional[tuple[str, int]]
             if actual != checksum:
                 raise WalCorruption(f"WAL checksum mismatch at byte {offset}")
             next_offset = offset + HEADER_BYTES + length
-            records.append(WalRecord(sequence, next_offset, CODE_TO_KIND[code], payload, at))
+            inspector.consume(WalRecord(sequence, next_offset, CODE_TO_KIND[code], payload, at))
+            # Drop the current payload before pread allocates the next one, so
+            # peak scan memory is bounded by one format-sized record plus the
+            # small latest lifecycle/resize state retained by the inspector.
+            del payload
             offset = next_offset
             previous_sequence = sequence
             previous_at = at
-        return records, offset, problem
+        return inspector.finish(offset), problem
     finally:
         os.close(fd)
 
@@ -453,82 +601,16 @@ def quarantine_torn_tail(path: str, valid_bytes: int, directory: str) -> None:
         os.close(repair)
 
 
-def inspect_records(records: list[WalRecord], valid_bytes: int) -> ExistingWal:
-    if not records:
-        return ExistingWal(True, False, None, None, None, 0, 0, valid_bytes)
-    active = False
-    session: Optional[str] = None
-    instance_id: Optional[str] = None
-    pending: Optional[dict[str, Any]] = None
-    for index, record in enumerate(records):
-        if index == 0 and record.kind != "lifecycle":
-            raise WalCorruption("terminal WAL first record must be lifecycle start")
-        if record.kind == "lifecycle":
-            if pending is not None:
-                raise WalCorruption("terminal WAL lifecycle appears inside pending resize")
-            value = decode_json_payload(record.payload, "lifecycle")
-            if set(value) != {"event", "identity", "geometry"}:
-                raise WalCorruption("terminal WAL lifecycle fields are invalid")
-            event = value.get("event")
-            identity = value.get("identity")
-            validate_geometry(value.get("geometry"), "lifecycle.geometry")
-            if event not in ("start", "resume", "end") or not isinstance(identity, dict):
-                raise WalCorruption("terminal WAL lifecycle is invalid")
-            next_session, next_instance = identity.get("session"), identity.get("instanceId")
-            if not isinstance(next_session, str) or not isinstance(next_instance, str):
-                raise WalCorruption("terminal WAL lifecycle identity is invalid")
-            if index == 0:
-                if event != "start":
-                    raise WalCorruption("terminal WAL first lifecycle event must be start")
-                session, instance_id, active = next_session, next_instance, True
-            else:
-                if event == "start" or next_session != session or next_instance != instance_id:
-                    raise WalCorruption("terminal WAL lifecycle chain changed identity")
-                if event == "end":
-                    if not active:
-                        raise WalCorruption("terminal WAL lifecycle ended twice")
-                    active = False
-                elif not active:
-                    raise WalCorruption("terminal WAL resumed after logical END")
-            continue
-        if not active:
-            raise WalCorruption("terminal WAL contains data outside active lifecycle")
-        if record.kind == "resize":
-            value = decode_json_payload(record.payload, "resize")
-            allowed = {"phase", "changeId", "from", "to", "reason"}
-            if not {"phase", "changeId", "from", "to"}.issubset(value) or not set(value).issubset(allowed):
-                raise WalCorruption("terminal WAL resize fields are invalid")
-            phase = value.get("phase")
-            validate_geometry(value.get("from"), "resize.from")
-            validate_geometry(value.get("to"), "resize.to")
-            if not isinstance(value.get("changeId"), str) or not SAFE_ID.fullmatch(value["changeId"]):
-                raise WalCorruption("terminal WAL resize changeId is invalid")
-            if phase == "prepare":
-                if pending is not None:
-                    raise WalCorruption("terminal WAL contains nested resize")
-                pending = value
-            elif phase in ("commit", "abort"):
-                if pending is None or any(value.get(key) != pending.get(key) for key in ("changeId", "from", "to", "reason")):
-                    raise WalCorruption("terminal WAL resize completion has no matching prepare")
-                pending = None
-            else:
-                raise WalCorruption("terminal WAL resize phase is invalid")
-        elif pending is not None:
-            raise WalCorruption("terminal WAL record appears inside pending resize")
-    last = records[-1]
-    return ExistingWal(False, active, session, instance_id, pending, last.sequence, last.at, valid_bytes)
-
-
 class WalWriter:
     def __init__(self, path: str, directory: str) -> None:
         assert_regular_or_absent(path, "terminal WAL")
-        records, valid_bytes, problem = scan_wal(path)
+        existing, problem = scan_wal(path)
         if problem is not None:
-            quarantine_torn_tail(path, valid_bytes, directory)
-            records, valid_bytes, second_problem = scan_wal(path)
+            quarantine_torn_tail(path, existing.valid_bytes, directory)
+            existing, second_problem = scan_wal(path)
             if second_problem is not None:
                 raise WalCorruption("terminal WAL remains torn after repair")
-        self.existing = inspect_records(records, valid_bytes)
+        self.existing = existing
         existed = os.path.exists(path)
         self.fd = os.open(
             path,
@@ -570,6 +652,66 @@ class WalWriter:
         os.fdatasync(self.fd)
         os.close(self.fd)
         self.fd = -1
+
+
+def finalize_logical_end(config: dict[str, Any]) -> None:
+    """Durably close an active logical WAL without touching tmux or a child."""
+    directory = config["directory"]
+    ensure_durable_directory(directory)
+    if os.path.realpath(directory) != directory:
+        raise ProxyError("terminal WAL directory must not resolve through a symlink")
+    os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+
+    lock = WriterLock(
+        directory,
+        config["identity"]["instanceId"],
+        f"offline-finalize-{uuid.uuid4().hex}",
+    )
+    writer: Optional[WalWriter] = None
+    try:
+        # This is the same lifetime lock used by the direct proxy. A live or
+        # disconnected-but-resumable proxy must win; only an offline lane may
+        # be finalized without its child.
+        lock.acquire()
+        writer = WalWriter(os.path.join(directory, WAL_FILE), directory)
+        existing = writer.existing
+        if existing.empty:
+            raise ProxyError("terminal WAL has no logical lifecycle to finalize")
+        if (
+            existing.session != config["identity"]["session"]
+            or existing.instance_id != config["identity"]["instanceId"]
+        ):
+            raise ProxyError("terminal WAL logical identity does not match offline finalizer")
+        if existing.identity is None or existing.geometry is None:
+            raise WalCorruption("terminal WAL has no final source identity and geometry")
+        if not existing.active:
+            # END is immutable. Identity was verified above, so a retry after a
+            # crash between END and the caller's cascade is already complete.
+            return
+        if existing.pending_resize is not None:
+            writer.append_json(
+                "resize",
+                {
+                    "phase": "abort",
+                    **{
+                        key: value
+                        for key, value in existing.pending_resize.items()
+                        if key != "phase"
+                    },
+                },
+            )
+        writer.append_json(
+            "lifecycle",
+            {
+                "event": "end",
+                "identity": existing.identity,
+                "geometry": existing.geometry,
+            },
+        )
+    finally:
+        if writer is not None:
+            writer.close()
+        lock.release()
 
 
 def positive_integer(value: Any, label: str, maximum: int) -> int:
@@ -884,7 +1026,7 @@ class Proxy:
         self.disconnected_linger = False
 
     def setup_directory(self) -> None:
-        os.makedirs(self.directory, mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
+        ensure_durable_directory(self.directory)
         if os.path.realpath(self.directory) != self.directory:
             raise ProxyError("terminal WAL directory must not resolve through a symlink")
         os.chmod(self.directory, PRIVATE_DIRECTORY_MODE)
@@ -1618,13 +1760,24 @@ class Proxy:
         self.selector.close()
 
 
-def main() -> int:
+def main(arguments: Optional[list[str]] = None) -> int:
+    selected_arguments = sys.argv[1:] if arguments is None else arguments
+    if selected_arguments not in ([], [FINALIZE_LOGICAL_END_FLAG]):
+        return 125
     try:
         config = load_config()
     except BaseException:
         # No trusted private diagnostics path exists yet.  Never leak proxy
         # internals into the pane that is reserved for child terminal bytes.
         return 125
+    if selected_arguments == [FINALIZE_LOGICAL_END_FLAG]:
+        try:
+            finalize_logical_end(config)
+            return 0
+        except BaseException:
+            # Recovery callers use the exit status as the only contract. This
+            # mode must never write diagnostics into a terminal or invoke tmux.
+            return 125
     proxy = Proxy(config)
     try:
         return proxy.start()
