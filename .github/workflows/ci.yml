@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, maintenance/0.16.9]
+    branches: [main, maintenance/0.16.10]
   pull_request:
 
 jobs:
