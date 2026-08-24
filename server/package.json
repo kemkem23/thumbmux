@@ -17,7 +17,7 @@
     "src"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json"
+    "build": "rm -rf dist && bun build src/index.ts src/terminal-replay-worker-entry.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json && bun run ./scripts/copy-runtime-assets.ts"
   },
   "dependencies": {
     "@thumbmux/core": "^0.17.0"

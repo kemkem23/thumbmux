@@ -44,6 +44,7 @@ type TermViewProps = {
   fontPx: number;
   altScreenMouse: boolean;
   screen: ScreenMode | null | undefined;
+  historyPaging: "ceiling" | "sliding";
   onKeys?: (data: string) => void;
 };
 
@@ -136,6 +137,9 @@ function mountTermView(overrides: Partial<TermViewProps> = {}): Mounted {
     fontPx: 13,
     altScreenMouse: false,
     screen: null as ScreenMode | null | undefined,
+    // This file is the rollback-path regression suite. Sliding-specific
+    // request/range/anchor coverage lives in termview-history-window.test.ts.
+    historyPaging: "ceiling" as const,
     ...overrides,
   }) as TermViewProps;
 

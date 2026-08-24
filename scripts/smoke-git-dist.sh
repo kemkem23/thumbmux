@@ -19,6 +19,7 @@ for path in \
   "$PACKAGE_ROOT/git-dist/core/index.d.ts" \
   "$PACKAGE_ROOT/git-dist/server/index.js" \
   "$PACKAGE_ROOT/git-dist/server/index.d.ts" \
+  "$PACKAGE_ROOT/git-dist/server/terminal-pty-wal-proxy.py" \
   "$PACKAGE_ROOT/git-dist/svelte/index.js" \
   "$PACKAGE_ROOT/git-dist/svelte/index.d.ts" \
   "$PACKAGE_ROOT/git-dist/app/index.js" \
@@ -30,6 +31,17 @@ for path in \
   "$PACKAGE_ROOT/contract/manifest/app.json"; do
   [[ -f "$path" ]] || { echo "git-dist smoke: missing $path" >&2; exit 1; }
 done
+
+[[ -x "$PACKAGE_ROOT/git-dist/server/terminal-pty-wal-proxy.py" ]] || {
+  echo "git-dist smoke: terminal PTY WAL proxy helper is not executable" >&2
+  exit 1
+}
+cmp -s \
+  "$PACKAGE_ROOT/server/src/integrations/terminal-pty-wal-proxy.py" \
+  "$PACKAGE_ROOT/git-dist/server/terminal-pty-wal-proxy.py" || {
+  echo "git-dist smoke: terminal PTY WAL proxy helper differs from source" >&2
+  exit 1
+}
 
 bun "$EXPORT_GUARD" check-exports "$PACKAGE_ROOT" "$EXPECTED_SOURCE_ROOT"
 
@@ -54,7 +66,8 @@ for asset in \
   package/contract/manifest/core.json \
   package/contract/manifest/server.json \
   package/contract/manifest/svelte.json \
-  package/contract/manifest/app.json; do
+  package/contract/manifest/app.json \
+  package/git-dist/server/terminal-pty-wal-proxy.py; do
   grep -Fxq "$asset" <<<"$PACKAGE_CONTENTS" || {
     echo "git-dist smoke: packed artifact is missing $asset" >&2
     exit 1
@@ -71,6 +84,7 @@ bun "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE
   test -f node_modules/thumbmux/contract/manifest/server.json
   test -f node_modules/thumbmux/contract/manifest/svelte.json
   test -f node_modules/thumbmux/contract/manifest/app.json
+  test -x node_modules/thumbmux/git-dist/server/terminal-pty-wal-proxy.py
   bun run check
   ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs
@@ -89,6 +103,7 @@ bun "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer" "$EXPECTED_SOURCE
   test -f node_modules/thumbmux/contract/manifest/server.json
   test -f node_modules/thumbmux/contract/manifest/svelte.json
   test -f node_modules/thumbmux/contract/manifest/app.json
+  test -x node_modules/thumbmux/git-dist/server/terminal-pty-wal-proxy.py
   npm run check
   ./node_modules/.bin/tsc -p tsconfig.nodenext.json
   node runtime-smoke.mjs

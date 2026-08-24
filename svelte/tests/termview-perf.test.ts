@@ -48,6 +48,7 @@ type TermViewOverrides = {
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
   maxRows?: number;
+  historyPaging?: "ceiling" | "sliding";
 };
 
 type MutableViewportLayout = {
@@ -238,6 +239,9 @@ function mountTermView(
         palette,
         claimGeometry: false,
         fontPx: 13,
+        // Preserve the historical benchmark/retention corpus as an explicit
+        // rollback-path contract; sliding has its own focused component test.
+        historyPaging: "ceiling",
         onScrollStateChange,
         ...overrides,
       },

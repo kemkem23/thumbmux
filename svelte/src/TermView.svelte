@@ -27,6 +27,15 @@
     type ContentUpdate,
   } from './content-update-gate';
   import {
+    applyHistoryWindowPage,
+    createHistoryWindow,
+    historyWindowEndLine,
+    historyWindowRequestCursor,
+    type HistoryWindowDirection,
+    type HistoryWindowLimits,
+    type HistoryWindowState,
+  } from './history-window';
+  import {
     searchKeyIntent,
     moveActiveIndex,
     readSparseOverlay,
@@ -56,6 +65,7 @@
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
+    type MuxHistoryBoundary,
   } from '@thumbmux/core';
 
   type LinesChangeMeta = {
@@ -93,6 +103,7 @@
      * Moved / long / selection / link taps never cancel.
      */
     cancelSyntheticClickOnTap = false,
+    historyPaging = 'sliding',
     onLinesChange = undefined,
     onGeometryChange = undefined,
     onScrollStateChange = undefined,
@@ -126,6 +137,9 @@
     /** Opt-in: cancel the touchend that fired `onTap` so the synthesized
      * mousedown/click cannot blur the focused input (default false). */
     cancelSyntheticClickOnTap?: boolean;
+    /** Bounded bidirectional archive paging is the default. `ceiling` keeps
+     * the pre-0.17 backward-only retention path as an instant rollback. */
+    historyPaging?: 'ceiling' | 'sliding';
     onLinesChange?: (lines: string[], meta: LinesChangeMeta) => void;
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
@@ -209,6 +223,8 @@
   /** Human-readable copy for the retention-ceiling note (also the aria-label). */
   const HISTORY_CEILING_LABEL =
     'Older history is not loaded. This viewer keeps at most 10,000 rows or about 8 mebibytes; more rows may still exist on the server.';
+  const HISTORY_WINDOW_LABEL =
+    'History is shown through a bounded sliding window. Scroll to either edge to load the adjacent archive page.';
   const NO_SCROLLBACK_LABEL =
     'This session is on the alternate screen. There is no scrollback history; only the current full-screen view is shown.';
   // The authorized 100k-row Chrome benchmark chose 300 over 256 to retain
@@ -258,6 +274,14 @@
   let total = $state(0);
   let connected = $state(false);
   let archiveBeforeLine: number | null = null;
+  /** Sliding mode keeps archived absolute identity separate from the current
+   * pane capture. `$state.raw` avoids proxying up to 10k immutable rows. */
+  let archiveWindow = $state.raw<HistoryWindowState | null>(null);
+  let archiveWindowAttachedToLive = $state(true);
+  /** Last mux-validated durable seam paired with the current live capture. */
+  let liveBoundary = $state.raw<MuxHistoryBoundary | null>(null);
+  /** Newest total observed in a history reply (may lead the next output tick). */
+  let archiveTotalHint = 0;
   let archiveLoading = false;
   let archiveExhausted = false;
   /**
@@ -278,6 +302,11 @@
   let archiveRequestSeq = 0;
   let archiveInflightRequestId: number | null = null;
   let archiveInflightSession: string | null = null;
+  // History replies are tokenless and carry no direction. These fields are
+  // therefore part of the wire fence: only the locally accepted request may
+  // interpret a reply, and it interprets it with this remembered direction.
+  let archiveInflightDirection = $state<HistoryWindowDirection | null>(null);
+  let archiveInflightAnchorLine: number | null = null;
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
@@ -376,6 +405,7 @@
     source: 'full' | 'delta';
     replace: boolean;
     screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
+    boundary?: MuxHistoryBoundary;
   };
 
   type SearchActiveIdentity = {
@@ -427,7 +457,14 @@
   }
 
   function isAwayFromLiveTail(): boolean {
-    return bottomOffsetPx > 0;
+    // A detached archive window can be at its own local bottom while still
+    // being many pages away from the live pane. Keep cursor/latest-button
+    // semantics tied to the real live seam, not local scroll coordinates.
+    return bottomOffsetPx > 0 || (
+      historyPaging === 'sliding' &&
+      archiveWindow !== null &&
+      !archiveWindowAttachedToLive
+    );
   }
 
   /** Boundary diagnostics are integer pixels, but must never round a real
@@ -648,6 +685,13 @@
       }
     }
     applyScroll();
+    if (
+      historyPaging === 'sliding' &&
+      archiveWindow !== null &&
+      !archiveWindowAttachedToLive
+    ) {
+      maybeRequestNewerHistory(0);
+    }
     flushPendingContent();
     emitScrollState();
     return true;
@@ -803,6 +847,26 @@
       for (const link of links) bytes += 64 + 2 * link.href.length;
     }
     return bytes;
+  }
+
+  /** Page-model byte estimates include the same retained URL metadata as the
+   * rendered TermView columns, while remaining independent of DOM/HTML rows. */
+  function estimatedHistoryWindowLineStorage(lines: readonly string[]): number[] {
+    const links: (LineLinkRange[] | undefined)[] = new Array(lines.length);
+    const cols = lastPushedCols > 0 ? lastPushedCols : 60;
+    try {
+      for (const match of collectTerminalUrlSegments([...lines], 0, lines.length, cols)) {
+        for (const segment of match.segments) {
+          if (segment.lineIdx < 0 || segment.lineIdx >= lines.length) continue;
+          (links[segment.lineIdx] ??= []).push({
+            start: segment.startCol,
+            end: segment.endCol,
+            href: match.url,
+          });
+        }
+      }
+    } catch { /* malformed URL-like text falls back to raw row storage */ }
+    return lines.map((line, index) => estimatedLineStorageBytes(line, links[index]));
   }
 
   function recalculateRetainedEstimatedBytes(): void {
@@ -1367,6 +1431,10 @@
   function commitLines(next: string[], opts: {
     followTail: boolean;
     source: LinesChangeMeta['source'];
+    /** Sliding archive ownership enforces its own combined archive/live
+     * budget. The legacy middle-gap retention algorithm must not mutate the
+     * pure absolute window behind its back. */
+    enforceRetention?: boolean;
   }) {
     // Snapshot the physical viewport before changing total/maxOffset. A
     // reader who is even one pixel away from the live tail owns this scroll
@@ -1394,7 +1462,7 @@
     // Content delivery is already gated outside gestures. Establish the exact
     // protected viewport+overscan for the enlarged model before trimming it.
     rebuildWindow(visibleRowRange(bottomOffsetPx));
-    enforceLiveRetention();
+    if (opts.enforceRetention !== false) enforceLiveRetention();
     bottomOffsetPx = Math.min(bottomOffsetPx, maxOffset());
     contentEpoch++;
     applyScroll();
@@ -1624,11 +1692,147 @@
     return exact;
   }
 
+  /** Keep the newest pane capture rows that fit beside the resident archive.
+   * Detached live content is never rendered, but it is still bounded RAM and
+   * is ready to rejoin when forward paging reaches the archive/live seam. */
+  function boundLiveLinesForArchive(
+    lines: readonly string[],
+    state: HistoryWindowState,
+  ): string[] {
+    const lineBytes = estimatedHistoryWindowLineStorage(lines);
+    let rowsLeft = Math.max(0, HISTORY_RETAINED_ROW_BUDGET - state.lines.length);
+    let bytesLeft = Math.max(0, HISTORY_RETAINED_BYTE_BUDGET - state.estimatedBytes);
+    let start = lines.length;
+    while (start > 0 && rowsLeft > 0) {
+      const bytes = lineBytes[start - 1] ?? 0;
+      if (bytes > bytesLeft) break;
+      start--;
+      rowsLeft--;
+      bytesLeft -= bytes;
+    }
+    return Array.from(lines.slice(start));
+  }
+
+  function clearSlidingArchiveAtBoundary(liveStartLine: number, resetReader: boolean): void {
+    archiveWindow = null;
+    archiveWindowAttachedToLive = true;
+    archivedLines = [];
+    archiveBeforeLine = null;
+    archiveExhausted = false;
+    historyStopReason = 'none';
+    archiveOffset = liveStartLine;
+    if (resetReader) bottomOffsetPx = 0;
+  }
+
+  function detachSlidingArchiveFromLive(liveStartLine: number): void {
+    if (
+      !archiveWindow
+      || historyWindowEndLine(archiveWindow) >= liveStartLine
+      || (archiveWindow.hasNewer && !archiveWindowAttachedToLive)
+    ) return;
+    const readerScrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+    archiveWindow = { ...archiveWindow, hasNewer: true };
+    archiveWindowAttachedToLive = false;
+    archivedLines = Array.from(archiveWindow.lines);
+    commitLines([...archivedLines], {
+      followTail: false,
+      source: 'live',
+      enforceRetention: false,
+    });
+    bottomOffsetPx = Math.max(0, Math.min(maxOffset(), maxOffset() - readerScrollTop));
+    rebuildWindow(visibleRowRange(bottomOffsetPx), true);
+    applyScroll();
+    emitScrollState();
+  }
+
+  /**
+   * If the reader's mounted viewport overlaps rows that just crossed the seam,
+   * promote that exact old-live prefix into the resident archive. This keeps
+   * the same absolute rows under the reader while the paired new live capture
+   * replaces the suffix. It is only an optimization for rows proven by the
+   * monotonic boundary; all other detached readers page from the server.
+   */
+  function promoteCrossedLiveRows(
+    previousLiveStart: number,
+    nextLiveStart: number,
+  ): boolean {
+    if (!archiveWindow || historyWindowEndLine(archiveWindow) !== previousLiveStart) return false;
+    const crossed = nextLiveStart - previousLiveStart;
+    if (crossed <= 0 || crossed > liveLines.length) return false;
+    const visible = visibleRowRange(bottomOffsetPx);
+    if (visible.endIdx <= archiveWindow.lines.length) return false;
+    const promoted = liveLines.slice(0, crossed);
+    try {
+      archiveWindow = createHistoryWindow({
+        startLine: archiveWindow.startLine,
+        lines: [...archiveWindow.lines, ...promoted],
+        lineBytes: [...archiveWindow.lineBytes, ...estimatedHistoryWindowLineStorage(promoted)],
+        hasOlder: archiveWindow.hasOlder,
+        hasNewer: false,
+        limits: archiveWindow.limits,
+      });
+      archivedLines = Array.from(archiveWindow.lines);
+      archiveWindowAttachedToLive = true;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Reconcile a mux-validated durable seam before applying its paired live
+   * capture. At the tail, stale archive rows are cheap to discard and can be
+   * re-seeded from the new liveStart later. A detached reader keeps the exact
+   * resident absolute rows and scrollTop, but the window becomes pageable on
+   * its newer edge so it can walk to the new seam without a hole or duplicate.
+   */
+  function reconcileLiveBoundary(boundary: MuxHistoryBoundary | undefined): void {
+    if (!boundary || historyPaging !== 'sliding') return;
+    const previous = liveBoundary;
+    liveBoundary = { ...boundary };
+    archiveTotalHint = Math.max(archiveTotalHint, boundary.liveStartLine);
+
+    if (previous && previous.generation !== boundary.generation) {
+      // ws-mux only accepts a generation switch on a resync full. Absolute row
+      // identities from the old WAL lane are meaningless in the new one.
+      archiveTotalHint = boundary.liveStartLine;
+      liveLines = [];
+      clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
+      return;
+    }
+    if (!archiveWindow || (previous && boundary.liveStartLine <= previous.liveStartLine)) return;
+
+    const residentEnd = historyWindowEndLine(archiveWindow);
+    if (residentEnd >= boundary.liveStartLine) return;
+    if (!isAwayFromLiveTail()) {
+      clearSlidingArchiveAtBoundary(boundary.liveStartLine, false);
+      return;
+    }
+
+    if (previous && promoteCrossedLiveRows(previous.liveStartLine, boundary.liveStartLine)) {
+      return;
+    }
+
+    detachSlidingArchiveFromLive(boundary.liveStartLine);
+  }
+
   function setLines(
     nextLive: string[],
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
   ) {
+    if (
+      historyPaging === 'sliding' &&
+      archiveWindow !== null &&
+      !archiveWindowAttachedToLive
+    ) {
+      // A reader in a detached archive owns the visible model. Keep only a
+      // bounded fresh live suffix offscreen; repainting it must not change
+      // total/maxOffset, cursor visibility, search, selection, or the anchor.
+      liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
+      return;
+    }
+
     const followTail = !isAwayFromLiveTail();
     const replaceRetainedRows = replace
       ? replaceRetainedOverlapRows(liveLines, nextLive)
@@ -1655,10 +1859,22 @@
     } else {
       liveLines = nextLive;
     }
+
+    if (historyPaging === 'sliding' && archiveWindow !== null) {
+      liveLines = boundLiveLinesForArchive(liveLines, archiveWindow);
+      archivedLines = Array.from(archiveWindow.lines);
+    }
     commitLines([...archivedLines, ...liveLines], {
       followTail,
       source,
+      enforceRetention: historyPaging !== 'sliding' || archiveWindow === null,
     });
+    if (historyPaging === 'sliding' && archiveWindow === null) {
+      // Legacy live-only retention may report a client ceiling at exactly
+      // 10k. Sliding mode can still page by replacing the opposite archive
+      // side, so this is not a terminal stop.
+      historyStopReason = 'none';
+    }
   }
 
   function atRetentionBudget(): boolean {
@@ -1679,21 +1895,41 @@
     }
   }
 
-  function requestOlderHistory(): boolean {
+  function requestArchiveHistory(direction: HistoryWindowDirection): boolean {
     // Unknown screen → treat as normal (has scrollback). Only a *known*
     // alternate screen suppresses expand. 0.15.2 discarded a late alt reply
     // (one wasted RT); refusing to ask until a sample arrived made history
     // stop for every host that never sends `screen`.
     if (noScrollback) return false;
-    if (archiveLoading || archiveExhausted) return false;
-    if (atRetentionBudget()) {
+    if (archiveLoading) return false;
+    if (direction === 'after' && (historyPaging !== 'sliding' || archiveWindow === null)) {
+      return false;
+    }
+    if (direction === 'before' && archiveExhausted) return false;
+    if (historyPaging === 'ceiling' && atRetentionBudget()) {
       markHistoryCeiling();
       return false;
     }
+
+    const slidingCursor = historyPaging === 'sliding' && archiveWindow !== null
+      ? historyWindowRequestCursor(archiveWindow, direction)
+      : null;
+    if (historyPaging === 'sliding' && archiveWindow !== null && slidingCursor === null) {
+      if (direction === 'before') archiveExhausted = true;
+      return false;
+    }
+    const cursorLine = slidingCursor === null
+      ? null
+      : slidingCursor.direction === 'before'
+        ? slidingCursor.beforeLine
+        : slidingCursor.afterLine;
+
     const requestId = ++archiveRequestSeq;
     const requestSession = session;
     archiveInflightRequestId = requestId;
     archiveInflightSession = requestSession;
+    archiveInflightDirection = direction;
+    archiveInflightAnchorLine = cursorLine;
     archiveLoading = true;
     archiveRequestActive = true;
     if (archiveRequestTimer) clearTimeout(archiveRequestTimer);
@@ -1718,22 +1954,41 @@
       archiveRequestActive = false;
       archiveInflightRequestId = null;
       archiveInflightSession = null;
+      archiveInflightDirection = null;
+      archiveInflightAnchorLine = null;
       archiveRequestTimer = null;
     }, HISTORY_REPLY_TIMEOUT_MS);
 
     // Mux rejection (another request owns this session, no open socket, or a
     // failed send) must not leave a phantom request that consumes another
     // caller's broadcast history reply or waits through a pointless timeout.
-    if (!tmuxMux.requestHistory(requestSession, archiveBeforeLine, HISTORY_BATCH_LINES)) {
+    const accepted = direction === 'before'
+      ? tmuxMux.requestHistory(
+          requestSession,
+          historyPaging === 'sliding' ? cursorLine : archiveBeforeLine,
+          HISTORY_BATCH_LINES,
+        )
+      : tmuxMux.requestHistoryAfter(requestSession, cursorLine, HISTORY_BATCH_LINES);
+    if (!accepted) {
       if (archiveRequestTimer) clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
       archiveLoading = false;
       archiveRequestActive = false;
       archiveInflightRequestId = null;
       archiveInflightSession = null;
+      archiveInflightDirection = null;
+      archiveInflightAnchorLine = null;
       return false;
     }
     return true;
+  }
+
+  function requestOlderHistory(): boolean {
+    return requestArchiveHistory('before');
+  }
+
+  function requestNewerHistory(): boolean {
+    return requestArchiveHistory('after');
   }
 
   function historyPrefetchThreshold(): number {
@@ -1743,6 +1998,17 @@
   function maybeRequestOlderHistory(projectedBottomOffset = bottomOffsetPx) {
     if (archiveLoading || archiveExhausted || total === 0) return;
     if (projectedBottomOffset >= maxOffset() - historyPrefetchThreshold()) requestOlderHistory();
+  }
+
+  function maybeRequestNewerHistory(projectedBottomOffset = bottomOffsetPx) {
+    if (
+      historyPaging !== 'sliding' ||
+      archiveLoading ||
+      archiveWindow === null ||
+      !archiveWindow.hasNewer ||
+      total === 0
+    ) return;
+    if (projectedBottomOffset <= historyPrefetchThreshold()) requestNewerHistory();
   }
 
   function historyPrependSnapshot(): HistoryPrependSnapshot {
@@ -1773,6 +2039,12 @@
     cacheValid: boolean,
     before: HistoryPrependSnapshot,
     after: HistoryPrependSnapshot,
+    page?: {
+      direction: HistoryWindowDirection;
+      indexDelta: number;
+      startLine: number;
+      endLine: number;
+    },
   ) {
     viewportEl?.dispatchEvent(new CustomEvent('thumbmux-history-prepend', {
       detail: {
@@ -1781,6 +2053,7 @@
         before,
         after,
         transformStable: before.transform === after.transform,
+        ...page,
       },
     }));
   }
@@ -1791,6 +2064,8 @@
     archiveRequestActive = false;
     archiveInflightRequestId = null;
     archiveInflightSession = null;
+    archiveInflightDirection = null;
+    archiveInflightAnchorLine = null;
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
@@ -2033,6 +2308,405 @@
     enqueuePrependWork(parseSlice);
   }
 
+  type ParsedHistoryPage = {
+    lines: string[];
+    startLine: number | null;
+    endLine: number;
+    totalArchivedLines: number;
+    hasMore: boolean;
+  };
+
+  function parseHistoryPage(data: string): ParsedHistoryPage | null {
+    let payload: unknown = null;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      return null;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const candidate = payload as {
+      lines?: unknown;
+      startLine?: unknown;
+      endLine?: unknown;
+      totalArchivedLines?: unknown;
+      hasMore?: unknown;
+    };
+    const validStartLine = candidate.startLine === undefined || candidate.startLine === null || (
+      typeof candidate.startLine === 'number' &&
+      Number.isSafeInteger(candidate.startLine) &&
+      candidate.startLine >= 0
+    );
+    const validEndLine = candidate.endLine === undefined || candidate.endLine === null || (
+      typeof candidate.endLine === 'number' &&
+      Number.isSafeInteger(candidate.endLine) &&
+      candidate.endLine >= 0
+    );
+    const validTotal = candidate.totalArchivedLines === undefined || (
+      typeof candidate.totalArchivedLines === 'number' &&
+      Number.isSafeInteger(candidate.totalArchivedLines) &&
+      candidate.totalArchivedLines >= 0
+    );
+    if (
+      !Array.isArray(candidate.lines) ||
+      !candidate.lines.every((line) => typeof line === 'string') ||
+      typeof candidate.hasMore !== 'boolean' ||
+      !validStartLine ||
+      !validEndLine ||
+      !validTotal
+    ) return null;
+
+    const lines = candidate.lines as string[];
+    const startLine = typeof candidate.startLine === 'number' ? candidate.startLine : null;
+    const derivedEnd = startLine === null ? 0 : startLine + lines.length;
+    const endLine = typeof candidate.endLine === 'number' ? candidate.endLine : derivedEnd;
+    if (startLine !== null && endLine !== derivedEnd) return null;
+    if (startLine === null && lines.length > 0) return null;
+    const totalArchivedLines = typeof candidate.totalArchivedLines === 'number'
+      ? candidate.totalArchivedLines
+      : endLine;
+    if (endLine > totalArchivedLines) return null;
+    return {
+      lines: [...lines],
+      startLine,
+      endLine,
+      totalArchivedLines,
+      hasMore: candidate.hasMore,
+    };
+  }
+
+  function seedSlidingHistoryWindow(history: ParsedHistoryPage): {
+    state: HistoryWindowState;
+    live: string[];
+    livePrefixDropped: number;
+    entryState: SgrState;
+  } | null {
+    if (history.startLine === null || history.lines.length === 0) return null;
+
+    // Make room for at least the newest incoming archive row. This only
+    // matters for a live capture already sitting exactly on a client budget;
+    // production captures are normally a much smaller pane-tail window.
+    const lineBytes = estimatedHistoryWindowLineStorage(history.lines);
+    const liveLineBytes = estimatedHistoryWindowLineStorage(liveLines);
+    const newestBytes = lineBytes.at(-1) ?? 0;
+    let liveBytes = liveLineBytes.reduce((sum, bytes) => sum + bytes, 0);
+    let livePrefixDropped = 0;
+    while (
+      livePrefixDropped < liveLines.length && (
+        liveLines.length - livePrefixDropped >= HISTORY_RETAINED_ROW_BUDGET ||
+        liveBytes + newestBytes > HISTORY_RETAINED_BYTE_BUDGET
+      )
+    ) {
+      liveBytes -= liveLineBytes[livePrefixDropped] ?? 0;
+      livePrefixDropped++;
+    }
+    const live = liveLines.slice(livePrefixDropped);
+
+    const limits: HistoryWindowLimits = {
+      maxRows: Math.max(1, HISTORY_RETAINED_ROW_BUDGET - live.length),
+      maxBytes: Math.max(1, HISTORY_RETAINED_BYTE_BUDGET - liveBytes),
+      rowOverheadBytes: HISTORY_ROW_OVERHEAD_BYTES,
+    };
+    let keepFrom = 0;
+    let retainedBytes = lineBytes.reduce((sum, bytes) => sum + bytes, 0);
+    while (
+      keepFrom < history.lines.length && (
+        history.lines.length - keepFrom > limits.maxRows ||
+        retainedBytes > limits.maxBytes
+      )
+    ) {
+      retainedBytes -= lineBytes[keepFrom] ?? 0;
+      keepFrom++;
+    }
+    if (keepFrom >= history.lines.length) return null;
+
+    try {
+      const entryState = createSgrState();
+      for (let index = 0; index < keepFrom; index++) {
+        lineToHtml(history.lines[index] ?? '', entryState, palette);
+      }
+      return {
+        state: createHistoryWindow({
+          startLine: history.startLine + keepFrom,
+          lines: history.lines.slice(keepFrom),
+          lineBytes: lineBytes.slice(keepFrom),
+          hasOlder: history.hasMore || keepFrom > 0,
+          hasNewer: history.endLine < Math.max(
+            history.totalArchivedLines,
+            liveBoundary?.liveStartLine ?? 0,
+          ),
+          limits,
+        }),
+        live,
+        livePrefixDropped,
+        entryState,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function slidingReaderAnchor(state: HistoryWindowState): {
+    anchor: { line: number; viewportOffsetPx: number };
+    protectedRange: { startLine: number; endLine: number };
+    scrollTop: number;
+  } {
+    const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+    const centerIndex = Math.floor((scrollTop + Math.max(0, viewH / 2)) / Math.max(1, lineH));
+    const anchorIndex = Math.max(0, Math.min(state.lines.length - 1, centerIndex));
+    const visible = visibleRowRange(bottomOffsetPx);
+    let protectedStart = Math.max(0, Math.min(state.lines.length - 1, visible.startIdx));
+    let protectedEnd = Math.max(protectedStart + 1, Math.min(state.lines.length, visible.endIdx));
+    if (anchorIndex < protectedStart || anchorIndex >= protectedEnd) {
+      protectedStart = anchorIndex;
+      protectedEnd = anchorIndex + 1;
+    }
+    return {
+      anchor: {
+        line: state.startLine + anchorIndex,
+        viewportOffsetPx: anchorIndex * lineH - scrollTop,
+      },
+      protectedRange: {
+        startLine: state.startLine + protectedStart,
+        endLine: state.startLine + protectedEnd,
+      },
+      scrollTop,
+    };
+  }
+
+  function commitSlidingHistoryWindow(
+    state: HistoryWindowState,
+    options: {
+      direction: HistoryWindowDirection;
+      indexDelta: number;
+      oldScrollTop: number;
+      acceptedLineCount: number;
+      live?: string[];
+      entryState?: SgrState;
+      nextScrollTop?: number;
+      gapBeforeRows?: number;
+    },
+  ): void {
+    const activeIdentity = currentSearchActiveIdentity();
+    const before = historyPrependSnapshot();
+    archiveWindow = state;
+    archiveWindowAttachedToLive = !state.hasNewer;
+    archiveBeforeLine = state.startLine;
+    archiveExhausted = !state.hasOlder;
+    historyStopReason = archiveExhausted ? 'exhausted' : 'none';
+
+    liveLines = boundLiveLinesForArchive(options.live ?? liveLines, state);
+    archivedLines = Array.from(state.lines);
+    rawLines = archiveWindowAttachedToLive
+      ? [...archivedLines, ...liveLines]
+      : [...archivedLines];
+    archiveOffset = state.startLine;
+    total = rawLines.length;
+
+    // A slid absolute range is a new bounded render world. Rebuild sparse ANSI
+    // and URL state only for the resident rows; no evicted row remains in DOM,
+    // search/copy metadata, or checkpoint maps.
+    archivedRetentionGaps = new Map();
+    liveGapEntryState = null;
+    clearRetentionGap();
+    if ((options.gapBeforeRows ?? 0) > 0) {
+      recordRetentionGap(0, options.gapBeforeRows ?? 0);
+    }
+    rawEntryState = cloneSgrState(options.entryState ?? createSgrState());
+    htmlCache = new Map();
+    renderEntryStates = new Map();
+    sgrCheckpoints = new Map();
+    rebuildAllLinks();
+    rebuildFrom(0);
+
+    const nextScrollTop = Math.max(0, Math.min(
+      maxOffset(),
+      options.nextScrollTop ?? options.oldScrollTop + options.indexDelta * lineH,
+    ));
+    bottomOffsetPx = Math.max(0, maxOffset() - nextScrollTop);
+    rebuildWindow(visibleRowRange(bottomOffsetPx), true);
+    contentEpoch++;
+    renderEpoch++;
+    applyScroll();
+    emitScrollState();
+    if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
+
+    const after = historyPrependSnapshot();
+    if (options.acceptedLineCount > 0) {
+      scheduleDeferredFrame(() => {
+        emitHistoryPrependEvent(
+          options.acceptedLineCount,
+          false,
+          before,
+          after,
+          {
+            direction: options.direction,
+            indexDelta: options.indexDelta,
+            startLine: state.startLine,
+            endLine: historyWindowEndLine(state),
+          },
+        );
+      });
+    }
+
+    const shouldRerun = settleArchiveContinuationRequest('committed');
+    if (searchQuery || shouldRerun) requestSearchRerun(activeIdentity);
+    finishArchiveRequest();
+  }
+
+  function processSlidingArchivedHistory(
+    data: string,
+    direction: HistoryWindowDirection,
+    requestAnchorLine: number | null,
+  ): void {
+    if (noScrollback) {
+      finishArchiveRequest('empty');
+      return;
+    }
+    const history = parseHistoryPage(data);
+    if (!history || (history.lines.length === 0 && history.hasMore)) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    archiveTotalHint = Math.max(archiveTotalHint, history.totalArchivedLines);
+    if (archiveWindow && isAwayFromLiveTail()) {
+      detachSlidingArchiveFromLive(archiveTotalHint);
+    }
+
+    if (archiveWindow === null) {
+      if (direction !== 'before') {
+        finishArchiveRequest('malformed');
+        return;
+      }
+      if (history.lines.length === 0) {
+        archiveExhausted = !history.hasMore;
+        historyStopReason = archiveExhausted ? 'exhausted' : 'none';
+        finishArchiveRequest(archiveExhausted ? 'exhausted' : 'empty');
+        return;
+      }
+      const seeded = seedSlidingHistoryWindow(history);
+      if (!seeded) {
+        finishArchiveRequest('malformed');
+        return;
+      }
+      const oldScrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+      commitSlidingHistoryWindow(seeded.state, {
+        direction,
+        // Archive rows enter before live; an emergency live-prefix trim moves
+        // the same anchor back by the number of rows it removed.
+        indexDelta: seeded.state.lines.length - seeded.livePrefixDropped,
+        oldScrollTop,
+        acceptedLineCount: seeded.state.lines.length,
+        live: seeded.live,
+        entryState: seeded.entryState,
+      });
+      return;
+    }
+
+    if (requestAnchorLine === null) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    const reader = slidingReaderAnchor(archiveWindow);
+    const previousWindow = archiveWindow;
+    const previousEntryState = cloneSgrState(rawEntryState);
+    const applied = applyHistoryWindowPage(
+      archiveWindow,
+      {
+        direction,
+        anchorLine: requestAnchorLine,
+        startLine: history.startLine,
+        lines: history.lines,
+        lineBytes: estimatedHistoryWindowLineStorage(history.lines),
+        hasMore: direction === 'after'
+          ? history.hasMore || history.endLine < Math.max(
+              archiveTotalHint,
+              liveBoundary?.liveStartLine ?? 0,
+            )
+          : history.hasMore,
+      },
+      { anchor: reader.anchor, protectedRange: reader.protectedRange },
+    );
+    if (applied.kind === 'rejected') {
+      const previousEnd = historyWindowEndLine(previousWindow);
+      // The archive may prune its oldest prefix while a user reads a detached
+      // window. `readAfter` then truthfully jumps beyond our exclusive cursor.
+      // The pure model rejects that non-contiguous page; the UI turns it into
+      // an explicit, counted gap and resumes from the new server floor.
+      if (
+        direction === 'after' &&
+        applied.reason === 'non-contiguous-page' &&
+        history.startLine !== null &&
+        history.startLine > previousEnd &&
+        history.lines.length > 0
+      ) {
+        const bytes = estimatedHistoryWindowLineStorage(history.lines);
+        let keepEnd = history.lines.length;
+        let retainedBytes = bytes.reduce((sum, value) => sum + value, 0);
+        while (
+          keepEnd > 0 && (
+            keepEnd > previousWindow.limits.maxRows ||
+            retainedBytes > previousWindow.limits.maxBytes
+          )
+        ) {
+          keepEnd--;
+          retainedBytes -= bytes[keepEnd] ?? 0;
+        }
+        if (keepEnd > 0) {
+          try {
+            const replacement = createHistoryWindow({
+              startLine: history.startLine,
+              lines: history.lines.slice(0, keepEnd),
+              lineBytes: bytes.slice(0, keepEnd),
+              // Rows below the new floor no longer exist; the marker carries
+              // that loss, while a truncated incoming suffix remains pageable.
+              hasOlder: false,
+              hasNewer: history.hasMore || keepEnd < history.lines.length,
+              limits: previousWindow.limits,
+            });
+            commitSlidingHistoryWindow(replacement, {
+              direction,
+              indexDelta: 0,
+              oldScrollTop: reader.scrollTop,
+              nextScrollTop: 0,
+              acceptedLineCount: keepEnd,
+              entryState: createSgrState(),
+              gapBeforeRows: history.startLine - previousEnd,
+            });
+            return;
+          } catch {
+            // Fall through to the ordinary malformed-page fence.
+          }
+        }
+      }
+      finishArchiveRequest('malformed');
+      return;
+    }
+    let entryState = previousEntryState;
+    if (applied.state.startLine > previousWindow.startLine) {
+      // Forward sliding evicts an existing archive prefix. Capture the exact
+      // SGR state at the new absolute first row before replacing rawLines.
+      entryState = stateBeforeLine(applied.state.startLine - previousWindow.startLine);
+    } else if (applied.state.startLine < previousWindow.startLine) {
+      // Backward pages normally retain their first row. If protection forced
+      // a far-edge prefix discard, replay only that discarded prefix to seed
+      // the first accepted row's ANSI state.
+      entryState = createSgrState();
+      if (history.startLine !== null) {
+        const discardCount = Math.max(0, applied.state.startLine - history.startLine);
+        for (let index = 0; index < discardCount; index++) {
+          lineToHtml(history.lines[index] ?? '', entryState, palette);
+        }
+      }
+    }
+    commitSlidingHistoryWindow(applied.state, {
+      direction,
+      indexDelta: applied.anchor.indexDelta,
+      oldScrollTop: reader.scrollTop,
+      acceptedLineCount: applied.acceptedPage?.rowCount ?? 0,
+      entryState,
+    });
+  }
+
   function processArchivedHistory(data: string) {
     // A late history reply must not prepend into an alternate-screen buffer.
     if (noScrollback) {
@@ -2106,10 +2780,20 @@
     // Claim the wire reply immediately so a duplicate cannot overwrite the
     // queued raw page. Keep archiveLoading true until validation/commit ends.
     const requestId = archiveInflightRequestId;
+    const direction = archiveInflightDirection;
+    const requestAnchorLine = archiveInflightAnchorLine;
     archiveRequestActive = false;
     enqueuePrependWork(() => {
       if (archiveInflightRequestId !== requestId || !archiveLoading) return;
-      processArchivedHistory(data);
+      if (historyPaging === 'sliding') {
+        if (direction === null) {
+          finishArchiveRequest('malformed');
+          return;
+        }
+        processSlidingArchivedHistory(data, direction, requestAnchorLine);
+      } else {
+        processArchivedHistory(data);
+      }
     });
   }
 
@@ -2119,6 +2803,7 @@
 
   function applyContentDelivery(delivery: ContentUpdate) {
     if (delivery.cursor !== undefined) cursor = delivery.cursor;
+    reconcileLiveBoundary((delivery.meta as MuxDeliveryMeta).boundary);
     setLines(
       delivery.data.replace(/\r/g, '').split('\n'),
       delivery.meta.replace,
@@ -2300,6 +2985,7 @@
     bottomOffsetPx += dyPx;
     const windowCovered = applyScroll();
     if (dyPx > 0) maybeRequestOlderHistory();
+    else if (dyPx < 0) maybeRequestNewerHistory();
     return windowCovered;
   }
 
@@ -2333,6 +3019,7 @@
     bottomOffsetPx = Math.max(0, Math.min(bottomOffsetPx + delta, maxOffset()));
     applyScroll();
     if (delta > 0) maybeRequestOlderHistory();
+    else if (delta < 0) maybeRequestNewerHistory();
   }
 
   let warnedMissingKeys = false;
@@ -2822,6 +3509,7 @@
     preparingMomentum = true;
     applyScroll();
     if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * MOMENTUM_TAU);
+    else if (vel < 0) maybeRequestNewerHistory(bottomOffsetPx + vel * MOMENTUM_TAU);
     let lastT = performance.now();
     const step = () => {
       const now = performance.now();
@@ -2836,6 +3524,7 @@
         return;
       }
       if (vel > 0) maybeRequestOlderHistory(bottomOffsetPx + vel * TAU);
+      else if (vel < 0) maybeRequestNewerHistory(bottomOffsetPx + vel * TAU);
       const m = maxOffset();
       if (bottomOffsetPx < 0 || bottomOffsetPx > m) {
         momentumFrame = null;
@@ -3088,6 +3777,8 @@
     archiveRequestActive = false;
     archiveInflightRequestId = null;
     archiveInflightSession = null;
+    archiveInflightDirection = null;
+    archiveInflightAnchorLine = null;
     // Screen-mode flip is a new scroll world; drop any prior stop reason so an
     // alt-screen banner is not confused with a normal-mode ceiling note.
     historyStopReason = 'none';
@@ -3107,6 +3798,8 @@
     cancelScheduledPrependWork();
     pendingPrependWork = null;
     prependParseSeq++;
+    archiveWindow = null;
+    archiveWindowAttachedToLive = true;
     if (archivedLines.length === 0) return;
     archivedLines = [];
     rawLines = liveLines.slice();
@@ -3135,7 +3828,21 @@
 
   /** Oldest retained rows are in the virtual window — show the ceiling note. */
   let showHistoryCeiling = $derived(
-    historyStopReason === 'ceiling' && winStart === 0 && !noScrollback,
+    historyPaging === 'ceiling' &&
+    historyStopReason === 'ceiling' &&
+    winStart === 0 &&
+    !noScrollback,
+  );
+
+  /** A sliding boundary is navigable, not a terminal ceiling. Show the same
+   * neutral instruction at whichever pageable edge is currently mounted. */
+  let showHistoryWindowSignpost = $derived(
+    historyPaging === 'sliding' &&
+    archiveWindow !== null &&
+    !noScrollback && (
+      (archiveWindow.hasOlder && winStart === 0) ||
+      (archiveWindow.hasNewer && winEnd === total)
+    ),
   );
 
   let screenAltObserved = false;
@@ -3326,7 +4033,19 @@
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
   data-history-stop={historyStopReason}
-  data-history-ceiling={historyStopReason === 'ceiling' ? '1' : undefined}
+  data-history-paging={historyPaging}
+  data-history-ceiling={historyPaging === 'ceiling' && historyStopReason === 'ceiling' ? '1' : undefined}
+  data-history-window-start={archiveWindow?.startLine}
+  data-history-window-end={archiveWindow ? historyWindowEndLine(archiveWindow) : undefined}
+  data-history-window-rows={archiveWindow?.lines.length}
+  data-history-window-estimated-bytes={archiveWindow?.estimatedBytes}
+  data-history-window-attached={archiveWindow ? (archiveWindowAttachedToLive ? '1' : '0') : undefined}
+  data-history-window-has-older={archiveWindow ? (archiveWindow.hasOlder ? '1' : '0') : undefined}
+  data-history-window-has-newer={archiveWindow ? (archiveWindow.hasNewer ? '1' : '0') : undefined}
+  data-history-live-start={liveBoundary?.liveStartLine}
+  data-history-generation={liveBoundary?.generation}
+  data-history-total-hint={archiveTotalHint}
+  data-history-request-direction={archiveInflightDirection ?? undefined}
   data-no-scrollback={noScrollback ? '1' : undefined}
   data-screen-mode-known={screenModeKnown ? '1' : undefined}
   style:font-size={`${fontPx}px`}
@@ -3441,6 +4160,16 @@
       <span class="mtv-signpost-text">Older history not loaded · limit 10k rows / 8 MiB</span>
     </div>
   {/if}
+  {#if showHistoryWindowSignpost}
+    <div
+      class="mtv-history-window"
+      data-testid="mtv-history-window"
+      role="note"
+      aria-label={HISTORY_WINDOW_LABEL}
+    >
+      <span class="mtv-signpost-text">History window · scroll to load</span>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -3458,7 +4187,8 @@
     -webkit-touch-callout: default;
   }
   .mtv-no-scrollback,
-  .mtv-history-ceiling {
+  .mtv-history-ceiling,
+  .mtv-history-window {
     position: absolute;
     top: 0;
     left: 0;

@@ -5,9 +5,12 @@
 // itself is part of the thumbmux protocol.
 
 import {
+  muxHistoryBoundaryTransition,
   splitMuxOutputData,
+  validateMuxHistoryBoundary,
   type MuxAuthErrorFrame,
   type MuxClientInfo,
+  type MuxHistoryBoundary,
   type MuxOutputType as OutputType,
   type MuxPaneScreen,
   type MuxServerMessage,
@@ -18,6 +21,8 @@ export type MuxDeliveryMeta = {
   replace: boolean;
   /** Live pane screen mode from the wire (sticky across deltas that omit it). */
   screen?: MuxPaneScreen | null;
+  /** Sticky durable archive/live seam paired with this output snapshot. */
+  boundary?: MuxHistoryBoundary;
 };
 
 type Callback = (
@@ -173,6 +178,10 @@ export class TmuxMux {
    * left fullscreen. Cleared with the other per-channel caches.
    */
   private lastScreen = new Map<string, MuxPaneScreen | null>();
+  /** Last accepted monotonic durable seam for each channel/socket generation. */
+  private lastBoundary = new Map<string, MuxHistoryBoundary>();
+  /** A seen boundary field makes that channel fail closed against downgrade. */
+  private boundaryRequired = new Set<string>();
   private settleScheduled = false;
   private settleCancel: (() => void) | null = null;
   /** A failed delta requests one full replacement; later deltas wait for it. */
@@ -429,6 +438,38 @@ export class TmuxMux {
     }
   }
 
+  /**
+   * Validate an output boundary without mutating sticky state. Once a channel
+   * advertises a durable seam, omission is invalid too: silently reusing the
+   * old seam beside newer content is exactly the gap this protocol prevents.
+   */
+  private boundaryFromFrame(
+    session: string,
+    frame: unknown,
+    allowReset: boolean,
+  ): MuxHistoryBoundary | undefined | null {
+    if (typeof frame !== 'object' || frame === null) return null;
+    const candidate = frame as Record<string, unknown>;
+    const present = Object.prototype.hasOwnProperty.call(candidate, 'boundary');
+    const previous = this.lastBoundary.get(session);
+    if (!present) {
+      return previous === undefined && !this.boundaryRequired.has(session) ? undefined : null;
+    }
+    this.boundaryRequired.add(session);
+    const boundary = validateMuxHistoryBoundary(candidate.boundary);
+    if (!boundary) return null;
+    if (previous !== undefined) {
+      const transition = muxHistoryBoundaryTransition(previous, boundary);
+      if (transition === 'regression') return null;
+      if (transition === 'generation-mismatch' && !allowReset) return null;
+    }
+    return boundary;
+  }
+
+  private rememberBoundary(session: string, boundary: MuxHistoryBoundary | undefined): void {
+    if (boundary !== undefined) this.lastBoundary.set(session, boundary);
+  }
+
   /** Build delivery meta, attaching last-known screen when one exists. */
   private deliveryMeta(
     source: 'full' | 'delta',
@@ -439,6 +480,9 @@ export class TmuxMux {
     if (this.lastScreen.has(session)) {
       meta.screen = this.lastScreen.get(session);
     }
+    if (this.lastBoundary.has(session)) {
+      meta.boundary = { ...this.lastBoundary.get(session)! };
+    }
     return meta;
   }
 
@@ -448,6 +492,8 @@ export class TmuxMux {
     this.discardPrefixHashCache(session);
     this.discardDeferred(session);
     this.discardLastScreen(session);
+    this.lastBoundary.delete(session);
+    this.boundaryRequired.delete(session);
   }
 
   private invalidateAllOutputBases() {
@@ -457,6 +503,8 @@ export class TmuxMux {
     this.prefixHashCaches.clear();
     this.deferredDeltas.clear();
     this.lastScreen.clear();
+    this.lastBoundary.clear();
+    this.boundaryRequired.clear();
   }
 
   private requestResync(session: string) {
@@ -507,6 +555,7 @@ export class TmuxMux {
     lines: string[];
     cursor: MuxServerMessage['cursor'] | undefined;
     cursorPresent: boolean;
+    boundary: MuxHistoryBoundary | undefined;
   } | null {
     if (typeof frame !== 'object' || frame === null) return null;
     const candidate = frame as Record<string, unknown>;
@@ -528,12 +577,15 @@ export class TmuxMux {
     }
     const cursorPresent = Object.prototype.hasOwnProperty.call(candidate, 'cursor');
     if (cursorPresent && !isMuxCursor(candidate.cursor)) return null;
+    const boundary = this.boundaryFromFrame(session, frame, false);
+    if (boundary === null) return null;
 
     return {
       prefix: p,
       lines: candidate.lines as string[],
       cursor: cursorPresent ? (candidate.cursor as MuxServerMessage['cursor']) : undefined,
       cursorPresent,
+      boundary,
     };
   }
 
@@ -550,6 +602,7 @@ export class TmuxMux {
     next: string[];
     cursor: MuxServerMessage['cursor'] | undefined;
     cursorPresent: boolean;
+    boundary: MuxHistoryBoundary | undefined;
   } | null {
     const delta = this.validateDeltaLocal(session, frame, base);
     if (!delta) return null;
@@ -567,6 +620,7 @@ export class TmuxMux {
       next,
       cursor: delta.cursor,
       cursorPresent: delta.cursorPresent,
+      boundary: delta.boundary,
     };
   }
 
@@ -688,6 +742,7 @@ export class TmuxMux {
         this.requestResync(session);
         return;
       }
+      this.rememberBoundary(session, result.boundary);
       this.rememberScreen(session, frame);
       base = result.next;
       applied = true;
@@ -860,12 +915,22 @@ export class TmuxMux {
           // Guard first: a non-string data field is a complete no-op for the
           // session (do not drop a still-valid deferred queue or hash cache).
           if (typeof msg.data !== 'string') return;
+          const boundary = this.boundaryFromFrame(
+            msg.channel,
+            msg,
+            msg.reset === 'resync',
+          );
+          if (boundary === null) {
+            this.requestResync(msg.channel);
+            return;
+          }
           // A full frame supersedes any deferred deltas for this session —
           // discard without delivering them, then install the new base.
           this.discardDeferred(msg.channel);
           this.discardPrefixHashCache(msg.channel);
           this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
           this.resyncingSessions.delete(msg.channel);
+          this.rememberBoundary(msg.channel, boundary);
           this.rememberScreen(msg.channel, msg);
           const meta = this.deliveryMeta(
             'full',
@@ -906,6 +971,7 @@ export class TmuxMux {
             this.requestResync(msg.channel);
             return;
           }
+          this.rememberBoundary(msg.channel, applied.boundary);
           this.rememberScreen(msg.channel, msg);
           this.deliverDelta(
             msg.channel,

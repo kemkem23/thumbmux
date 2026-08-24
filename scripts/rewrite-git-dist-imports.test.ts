@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,6 +27,9 @@ function fixture(): string {
   writeFileSync(join(root, "core/dist/index.d.ts"), "export declare const core: true;\n");
   writeFileSync(join(root, "server/dist/index.js"), "export const server = true;\n");
   writeFileSync(join(root, "server/dist/index.d.ts"), "export declare const server: true;\n");
+  const proxyAsset = join(root, "server/dist/terminal-pty-wal-proxy.py");
+  writeFileSync(proxyAsset, "#!/usr/bin/env python3\n", { mode: 0o755 });
+  chmodSync(proxyAsset, 0o755);
   writeFileSync(join(root, "svelte/dist/index.js"), "export const svelte = true;\n");
   writeFileSync(join(root, "svelte/dist/index.d.ts"), "export declare const svelte: true;\n");
   writeFileSync(join(root, "app/dist/index.js"), "export const app = true;\n");
@@ -461,6 +464,15 @@ describe("git-dist import rewriting", () => {
     ).toThrow(/rewritten specifier does not resolve: git-dist\/server\/index\.js → \.\/does-not-exist\.js/);
   });
 
+  test("fails closed when the shipped proxy asset loses its runtime mode", () => {
+    const root = fixture();
+    rewriteGitDistImports(root);
+    chmodSync(join(root, "git-dist/server/terminal-pty-wal-proxy.py"), 0o644);
+
+    expect(() => assertGitDistInvariants(root))
+      .toThrow("git-dist runtime asset is not readable/executable");
+  });
+
   test("requiredGitDistArtifacts maps package.json exports onto git-dist paths", () => {
     const root = fixture();
     writeExportsMap(root);
@@ -471,6 +483,7 @@ describe("git-dist import rewriting", () => {
       "git-dist/core/index.js",
       "git-dist/server/index.d.ts",
       "git-dist/server/index.js",
+      "git-dist/server/terminal-pty-wal-proxy.py",
       "git-dist/svelte/index.d.ts",
       "git-dist/svelte/index.js",
     ]);
