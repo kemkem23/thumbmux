@@ -720,6 +720,34 @@
     };
   }
 
+  /** Sliding history can reveal semantic context that changes whether a blank
+   * at the resident seam belongs to a compact Bash group. Prefer a visible,
+   * nonblank raw row whose membership cannot change under that blank-only
+   * expansion; fall back to the ordinary top-row anchor when none is visible. */
+  function captureStableHistoryPresentationAnchor(force = false): PresentationAnchor | null {
+    const fallback = capturePresentationAnchor(force);
+    if (!fallback || !bashProjection) return fallback;
+    const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+    const visible = strictVisibleRowRange(bottomOffsetPx);
+    const centerPx = scrollTop + Math.max(0, viewH / 2);
+    let best: { row: ClaudeBashGroupedProjectionRow; distance: number } | null = null;
+    for (let visual = visible.startIdx; visual < visible.endIdx; visual += 1) {
+      const row = projectionRowAt(visual);
+      if (
+        row?.kind !== 'raw'
+        || !stripAnsi(rawLines[row.rawRange.startLine] ?? '').replace(/\u00a0/g, ' ').trim()
+      ) continue;
+      const midpoint = presentationRowTopPx(visual) + presentationRowHeightPx(visual) / 2;
+      const distance = Math.abs(midpoint - centerPx);
+      if (!best || distance < best.distance) best = { row, distance };
+    }
+    if (!best) return fallback;
+    return {
+      rowId: archiveOffset + best.row.rawRange.startLine,
+      intraRowPx: scrollTop - presentationRowTopPx(best.row.visualRow),
+    };
+  }
+
   function restorePresentationAnchor(anchor: PresentationAnchor | null): void {
     if (!anchor) {
       bottomOffsetPx = 0;
@@ -1039,8 +1067,16 @@
     // Grouping is semantic across adjacent blocks. If the bounded suffix seam
     // lands inside a group, reusing its old prefix placeholder would split one
     // burst into two rows/requests; take the conservative full projection.
+    // A group can also begin exactly on the seam because it absorbed separator
+    // blanks before its first detected block. In the sliced suffix that blank
+    // becomes unproven capture padding and stays raw, so that seam must use the
+    // same full fallback to keep incremental and cold projection identical.
     if (detectedGroups.some((group) => (
-      group.rawStart < startLine && group.rawEndExclusive > startLine
+      (group.rawStart < startLine && group.rawEndExclusive > startLine)
+      || (
+        group.rawStart === startLine
+        && (group.blocks[0]?.rawStart ?? group.rawStart) > startLine
+      )
     ))) return null;
 
     const retainedBlockCoordinates = new Set(detection.blocks.map((block) =>
@@ -3742,7 +3778,7 @@
     // tail. Ordinary live projection rebuilds keep the default follow-tail
     // behavior.
     const presentationAnchor = projectBash
-      ? capturePresentationAnchor(options.direction === 'before')
+      ? captureStableHistoryPresentationAnchor(options.direction === 'before')
       : null;
     const previousWinStart = winStart;
     const previousWinEnd = winEnd;
@@ -5606,7 +5642,10 @@
               title={projectionRow.status === 'active'
                 ? 'hidden bash · running'
                 : `hidden bash · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
-            ><span class="mtv-bash-divider-label">hidden bash</span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
+            ><span class="mtv-bash-divider-label">hidden bash</span><span
+                class="mtv-bash-divider-rule"
+                aria-hidden="true"
+              ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
     {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
@@ -5761,9 +5800,7 @@
     letter-spacing: 0.02em;
     white-space: nowrap;
   }
-  .mtv-bash-divider::before,
-  .mtv-bash-divider::after {
-    content: '';
+  .mtv-bash-divider-rule {
     height: 1px;
     min-width: 8px;
     flex: 1 1 auto;
@@ -5772,7 +5809,7 @@
   }
   .mtv-bash-divider-label {
     flex: 0 0 auto;
-    padding: 0 4px;
+    padding: 0 4px 0 0;
     opacity: 0.82;
   }
   .mtv-bash-divider.search-match {

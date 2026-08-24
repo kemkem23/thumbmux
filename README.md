@@ -111,6 +111,11 @@ For Claude Code sessions, `SessionView` also offers a three-state Bash view:
 Bash group with a green `hidden bash` divider one third of a terminal row high,
 and **DISTILL** asks an optional host adapter for a short summary. The three
 choices open directly to the left of the BASH action instead of cycling modes.
+The compact divider is centred in the separator gap: its small label is
+left-aligned and a one-pixel green rule fills the remaining space to the right.
+Blank rows immediately before and after a recognized group are folded into that
+divider only when surrounding semantic rows prove they are separators; capture
+padding and retention seams remain visible rather than being guessed away.
 Detection is deliberately fail-open outside a known normal screen or when the
 Claude header/result/boundary pattern is incomplete. A fresh Distill view offers
 at most its newest ten completed groups; while it remains open, each coalesced
