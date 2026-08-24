@@ -1,9 +1,9 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.16.10-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.16.11-dist`.
 
-## v0.16.10 — 2026-08-24
+## v0.16.11 — 2026-08-24
 
 ### Added
 
@@ -18,10 +18,27 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.16.10-dist`.
   exact raw rows remain canonical for copy/search/history/ANSI state. A fresh
   DISTILL view requests at most its newest ten completed groups, then requests
   only the newest group completed by each coalesced live update; scrolling never
-  creates model work, and a group with an active tail waits as a whole.
+  creates model work, and a group with an active tail waits as a whole. A
+  five-minute client watchdog releases the serial lane to a deterministic
+  preview if a host adapter never settles, so later live work cannot stall
+  forever.
   `AppAdapters.bashSummaries` remains optional; rejection or omission falls back
   to a deterministic command preview. The `thumbmux/core` detector/projection
   exports remain experimental because Claude's terminal layout may evolve.
+
+## v0.16.10 — 2026-08-24
+
+### Added
+
+- **Claude Code Bash blocks can be shown raw, collapsed, or summarized by a
+  host-owned service.** `SessionView` adds a Claude-only `bash-mode` action and
+  stores `off | hide | haiku` in the existing preferences adapter. `TermView`
+  detects only high-confidence completed/active Claude Bash layouts on a known
+  normal screen, retains the exact raw rows for copy/search/history/ANSI state,
+  and requests summaries only for completed blocks in the real viewport.
+  `AppAdapters.bashSummaries` is optional; rejection or omission falls back to
+  a deterministic command preview. The new `thumbmux/core` detector/projection
+  exports are experimental because Claude's terminal layout may evolve.
 
 ## v0.16.9 — 2026-08-22
 
