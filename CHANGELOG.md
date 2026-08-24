@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.3-dist`.
+
+## v0.18.3 — 2026-08-24
+
+### Fixed
+
+- **The compact Claude Bash divider now occupies the centre of the separator
+  gap instead of sitting below leftover blank rows.** A proven blank-only
+  prefix and suffix are folded into the same one-third-row Bash projection;
+  capture-start padding and retention seams still remain raw. The small
+  `hidden bash` label is left-aligned and a one-pixel green rule fills only the
+  space to its right. Incremental projection and both history paging modes now
+  preserve the same raw cursor, search target, and reader anchor when newly
+  loaded semantic context proves that a seam blank belongs to the Bash group.
 
 ## v0.18.2 — 2026-08-24
 
