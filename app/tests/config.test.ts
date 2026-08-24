@@ -96,6 +96,7 @@ const plannedAdapters = {
   },
   notes: { load: async () => '', save: async () => {} },
   prompts: async () => [],
+  bashSummaries: async () => ({}),
   upload: {
     endpoint: () => '/upload',
     dir: 'uploads',

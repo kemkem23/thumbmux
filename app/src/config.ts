@@ -1,5 +1,6 @@
 import type {
   AnsiPalette,
+  ClaudeBashSummaryRequest,
   LaunchPreset,
   LaunchSpec,
   PreferencesAdapter,
@@ -199,6 +200,16 @@ export interface AppAdapters {
     save(session: string, text: string): Promise<void>;
   };
   prompts?: (session: string) => Promise<string[]>;
+  /** Summarize completed, high-confidence Claude Bash blocks which TermView
+   * has determined are visible. The host owns the model, durable cache, and
+   * transport; this UI package never calls a model itself. Returning only a
+   * subset is valid — TermView fills missing entries, rejected promises, and
+   * omitted adapters with a deterministic command preview so the terminal
+   * never remains stuck on a loading placeholder. */
+  bashSummaries?: (
+    session: string,
+    requests: readonly ClaudeBashSummaryRequest[],
+  ) => Promise<Readonly<Record<string, string>>>;
   upload?: {
     endpoint(session: string): string | null;
     dir?: string;

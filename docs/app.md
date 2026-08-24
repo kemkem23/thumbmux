@@ -238,6 +238,7 @@ fields.
 | `notes.load` | Not called when `notes` is absent. With the block present it is called for the current session. Load errors are swallowed; after an initial or session-changing failure the note remains empty. | `load: (session) => fetchText("/host/notes/" + encodeURIComponent(session))` |
 | `notes.save` | Not called when `notes` is absent. The editor closes immediately; the shell waits for the promise before committing the new note, and failure keeps the previously committed note. | `save: (session, text) => putText("/host/notes/" + encodeURIComponent(session), text)` |
 | `prompts` | No prompt load and no `PromptsPanel`. There is no automatic pane scanner in the app shell. With an adapter, loading begins when the HUD expands by default. If `promptsCollapsible` and `promptsInitiallyOpen` are both true, SessionView instead prefetches on mount, coalesces an in-flight expand with that request, and places the open prompt panel first. | `prompts: (session) => fetchJson("/host/prompts/" + encodeURIComponent(session))` |
+| `bashSummaries` | No model call. Claude sessions still get the stock `bash-mode` action: **OFF** renders exact raw rows, **HIDE** replaces each high-confidence Bash span with one local row, and **HAIKU** calls this adapter only for completed blocks in the real viewport. Missing adapters, rejected calls, and missing IDs settle once to a deterministic command preview. The host owns model choice, redaction, authentication, lifecycle checks, throttling, and durable caching. Raw rows remain canonical for copy, search, scrollback, retention, and ANSI state in every mode. | `bashSummaries: (session, blocks) => postJson("/host/bash-summaries", { session, blocks })` |
 | `upload` | No upload action, hidden file input, or composer file-paste handler. Supplying the block enables those only for sessions whose endpoint is a non-empty string. | `upload: { endpoint, dir, formatPrefill }` |
 | `upload.endpoint` | Required inside `upload`. Return `null` to intentionally hide upload UI for a session; an empty string is also treated as hidden. `basePath` does not fill this field. | `endpoint: (session) => "/terminal-api/upload?session=" + encodeURIComponent(session)` |
 | `upload.onUnavailable` | Still called when paste files are submitted while `endpoint(session)` is `null` and can route to `ActionContext`-driven fallback behavior (`prefill`, message, local upload UX, etc.). | `onUnavailable: (session, files, context) => context.prefill("Save these files as notes")` |
@@ -378,7 +379,12 @@ supply the read functions and callbacks as one coherent adapter.
 | `theme.onToggleMode` | With no `theme` block the shell updates local state. With a block but no callback, the visible toggle is a no-op. | `onToggleMode: (next) => { mode = next; }` |
 | `theme.onPick` | With no `theme` block the shell stores the selected background. With a block but no callback, swatch selection is a no-op. | `onPick: (session, hex) => { backgrounds[session] = hex; }` |
 | `theme.onReset` | With no `theme` block the shell restores `defaultBg`. With a block but no callback, Reset is a no-op. | `onReset: (session) => { delete backgrounds[session]; }` |
-| `labels` | Shallow-merges with `DEFAULT_APP_LABELS`. Every omitted `AppLabels` key keeps its stock English value; function-valued labels such as `hubCount` and `terminalAria` remain functions. | `labels: { hubTitle: "SESSIONS", hubCount: (count) => String(count) + " open" }` |
+| `labels` | Shallow-merges with `DEFAULT_APP_LABELS`. Every omitted established key keeps its stock English value; function-valued labels such as `hubCount` and `terminalAria` remain functions. The Bash action uses `Bash: OFF/HIDE/HAIKU`; a host that needs localized wording can map that stock action through the existing `sessionPresentation.actions` callback. | `labels: { hubTitle: "SESSIONS" }` |
+
+The standalone `TermView` Claude Bash detector/projection types and helpers are
+**experimental** (`X` contract tier): Claude Code controls the painted terminal
+layout, so future minor releases may need to adjust those low-level shapes.
+The assembled `SessionView` path above is the compatibility-preserving route.
 
 A Svelte wrapper can keep host-owned theme state reactive:
 

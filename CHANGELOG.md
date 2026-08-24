@@ -3,6 +3,20 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
 
+## Unreleased
+
+### Added
+
+- **Claude Code Bash blocks can be shown raw, collapsed, or summarized by a
+  host-owned service.** `SessionView` adds a Claude-only `bash-mode` action and
+  stores `off | hide | haiku` in the existing preferences adapter. `TermView`
+  detects only high-confidence completed/active Claude Bash layouts on a known
+  normal screen, retains the exact raw rows for copy/search/history/ANSI state,
+  and requests summaries only for completed blocks in the real viewport.
+  `AppAdapters.bashSummaries` is optional; rejection or omission falls back to
+  a deterministic command preview. The new `thumbmux/core` detector/projection
+  exports are experimental because Claude's terminal layout may evolve.
+
 ## v0.16.8 — 2026-08-21
 
 ### Fixed
