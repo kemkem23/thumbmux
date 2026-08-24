@@ -37,7 +37,7 @@ type Mounted = {
   app: Record<string, unknown>;
   target: HTMLElement;
   viewport: HTMLElement;
-  props: { claudeBashMode: ClaudeBashMode };
+  props: { claudeBashMode: ClaudeBashMode; historyPaging: 'ceiling' | 'sliding' };
 };
 
 class ControlledResizeObserver implements ResizeObserver {
@@ -69,10 +69,12 @@ const palette: AnsiPalette = {
 
 const COMPLETED_WITH_CARRIED_RED = [
   'before',
+  '',
   '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(cd repo',
   "      sed -n '1,80p' src/a.ts)",
   '\x1b[38;5;246m  ⎿ \u00a0\x1b[31mfirst',
   '     rest',
+  '',
   '● ต่อไป',
   'after',
 ];
@@ -167,6 +169,7 @@ function mountView(
   mode: ClaudeBashMode,
   options: {
     height?: number;
+    historyPaging?: 'ceiling' | 'sliding';
     onSummary?: SummaryHandler;
     onLinesChange?: (lines: string[]) => void;
   } = {},
@@ -182,6 +185,7 @@ function mountView(
     fontPx: 13,
     screen: { alt: false, mouseSgr: false, mouseAny: false },
     claudeBashMode: mode,
+    historyPaging: options.historyPaging ?? 'sliding',
     onClaudeBashSummaryRequest: options.onSummary,
     onLinesChange: options.onLinesChange
       ? (lines: string[]) => options.onLinesChange?.(lines)
@@ -328,12 +332,16 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
 
     expect(viewport.getAttribute('data-total')).toBe('4');
-    expect(viewport.getAttribute('data-raw-total')).toBe('7');
+    expect(viewport.getAttribute('data-raw-total')).toBe('9');
     const placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
     expect(placeholder?.textContent).toBe('hidden bash');
     expect(placeholder?.getAttribute('data-raw-start')).toBe('1');
-    expect(placeholder?.getAttribute('data-raw-end')).toBe('5');
+    expect(placeholder?.getAttribute('data-raw-end')).toBe('7');
     expect(placeholder?.classList.contains('mtv-bash-hidden')).toBe(true);
+    expect(placeholder?.querySelector('.mtv-bash-divider')?.firstElementChild)
+      .toBe(placeholder?.querySelector('.mtv-bash-divider-label'));
+    expect(placeholder?.querySelector('.mtv-bash-divider')?.lastElementChild)
+      .toBe(placeholder?.querySelector('.mtv-bash-divider-rule'));
 
     const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
     expect(lineHeight).toBe(21);
@@ -341,7 +349,7 @@ describe('TermView Claude Bash projection', () => {
     expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight / 3);
     expect(placeholder?.style.height).toBe(`${lineHeight / 3}px`);
 
-    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="5"]');
+    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="7"]');
     expect(boundary?.textContent).toContain('ต่อไป');
     expect(Number(boundary?.getAttribute('data-presentation-top'))).toBe(
       lineHeight + lineHeight / 3,
@@ -467,19 +475,24 @@ describe('TermView Claude Bash projection', () => {
     const { viewport } = mountView('hide');
     const lines = [
       'before',
+      '',
       '● Bash(printf cursor-hidden)',
       '  ⎿  hidden-output',
+      '\x1b[0m \u00a0',
       '● semantic-boundary',
       'after',
     ];
-    // lastContent=4; cursor.row=1 targets raw row 3, immediately after Bash.
+    // lastContent=6; cursor.row=1 targets raw row 5, immediately after the
+    // compact group that absorbed both separator blanks.
     deliver(lines, true, { row: 1, col: 0 });
     await settleUi();
 
     const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
     const marker = viewport.querySelector<HTMLElement>('.mtv-bash-hidden');
-    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="3"]');
+    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="5"]');
     const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(marker?.getAttribute('data-raw-start')).toBe('1');
+    expect(marker?.getAttribute('data-raw-end')).toBe('5');
     expect(marker?.style.height).toBe(`${lineHeight / 3}px`);
     expect(Number(boundary?.getAttribute('data-presentation-top'))).toBe(
       lineHeight + lineHeight / 3,
@@ -489,9 +502,79 @@ describe('TermView Claude Bash projection', () => {
 
     // A terminal cursor reported on a raw row inside hidden Bash must not paint
     // a full-height caret over the synthetic one-third divider.
-    deliver(lines, true, { row: 2, col: 0 });
+    deliver(lines, true, { row: 3, col: 0 });
     await settleUi();
     expect(viewport.querySelector('[data-testid="mtv-cursor"]')).toBeNull();
+  });
+
+  test('live completion absorbs both separators while keeping the tail pinned and cursor exact', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const prefix = Array.from({ length: 50 }, (_, index) => `prefix-${index}`);
+    const unfinished = [
+      ...prefix,
+      '',
+      '● Bash(printf live-separators)',
+      '  ⎿  live-output',
+      '\x1b[0m \u00a0',
+    ];
+    deliver(unfinished);
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    expect(viewport.getAttribute('data-total')).toBe(String(unfinished.length));
+    expect(viewport.getAttribute('data-bottom-offset')).toBe('0');
+
+    const completed = [...unfinished, '● semantic-boundary', 'after'];
+    // lastContent=55; cursor.row=1 targets the newly appended boundary at raw 54.
+    deliver(completed, true, { row: 1, col: 0 });
+    await settleUi();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    const marker = viewport.querySelector<HTMLElement>('.mtv-bash-hidden');
+    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="54"]');
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(viewport.getAttribute('data-total')).toBe('53');
+    expect(viewport.getAttribute('data-bottom-offset')).toBe('0');
+    expect(marker?.getAttribute('data-raw-start')).toBe('50');
+    expect(marker?.getAttribute('data-raw-end')).toBe('54');
+    expect(Number(boundary?.getAttribute('data-presentation-top'))).toBe(
+      prefix.length * lineHeight + lineHeight / 3,
+    );
+    expect(cursor?.style.top).toBe(`${prefix.length * lineHeight + lineHeight / 3}px`);
+  });
+
+  test('live separator collapse below a scrolled reader preserves the mounted raw anchor', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const prefix = Array.from({ length: 240 }, (_, index) => `prefix-${index}`);
+    const unfinished = [
+      ...prefix,
+      '',
+      '● Bash(printf reader-separators)',
+      '  ⎿  reader-output',
+      '',
+    ];
+    deliver(unfinished);
+    await settleUi();
+    wheelUp(viewport, 630);
+    await settleUi();
+    expect(Number(viewport.getAttribute('data-bottom-offset'))).toBeGreaterThan(0);
+
+    const before = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-line'))
+      .find((row) => {
+        const y = projectedScreenY(viewport, row);
+        return row.textContent?.startsWith('prefix-') && y >= 0 && y < 120;
+      });
+    if (!before) throw new Error('scrolled reader anchor was not mounted');
+    const anchorId = before.getAttribute('data-line-id');
+    const screenYBefore = projectedScreenY(viewport, before);
+
+    deliver([...unfinished, '● semantic-boundary', 'after']);
+    await settleUi();
+
+    const after = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
+    if (!after) throw new Error('live separator collapse dropped the reader anchor');
+    expect(projectedScreenY(viewport, after)).toBeCloseTo(screenYBefore, 5);
+    expect(Number(viewport.getAttribute('data-bottom-offset'))).toBeGreaterThan(0);
+    expect(viewport.getAttribute('data-total')).toBe('243');
   });
 
   test('show-hide-show toggle preserves the same post-Bash raw anchor on screen', async () => {
@@ -500,8 +583,10 @@ describe('TermView Claude Bash projection', () => {
     const suffix = Array.from({ length: 180 }, (_, index) => `anchor-${index}`);
     deliver([
       ...prefix,
+      '',
       '● Bash(printf toggle-anchor)',
       '  ⎿  hidden-output',
+      '\x1b[0m \u00a0',
       '● semantic-boundary',
       ...suffix,
     ]);
@@ -512,7 +597,7 @@ describe('TermView Claude Bash projection', () => {
       .find((row) => row.textContent === targetText);
     // Initially pinned to the tail, so anchor-80 is outside the mounted window.
     expect(initialTarget).toBeUndefined();
-    const targetRaw = prefix.length + 3 + 40;
+    const targetRaw = prefix.length + 5 + 40;
     const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
     const hiddenTargetTop = (
       prefix.length * lineHeight
@@ -1030,6 +1115,49 @@ describe('TermView Claude Bash projection', () => {
     ).toBeLessThanOrEqual(2_049);
   });
 
+  test('incremental seam on an absorbed leading blank falls back to the exact cold projection', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const first = Array.from({ length: 10_000 }, (_, i) => `plain-${i}`);
+    // Repainting only row 9,999 makes the bounded detector seam 9,999 - 2,048
+    // = 7,951. A full projection can prove this blank belongs between semantic
+    // rows; a suffix beginning here cannot, because local row zero looks like
+    // capture padding.
+    first[7_951] = '\x1b[0m \u00a0';
+    first[7_952] = '● Bash(printf seam-leading-blank)';
+    first[7_953] = '  ⎿  seam-output';
+    first[7_954] = '● seam-boundary';
+    deliver(first);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-total')).toBe('9998');
+
+    const repaint = [...first];
+    repaint[9_999] = 'plain-repainted-tail';
+    deliver(repaint);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-total')).toBe('9998');
+    expect(viewport.getAttribute('data-claude-bash-projection-build-rows')).toBe('10000');
+
+    viewport.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'f', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    flushSync();
+    const input = viewport.querySelector<HTMLInputElement>('[data-testid="term-search-input"]');
+    if (!input) throw new Error('search input did not open');
+    input.value = 'seam-output';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await settleUi();
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter', bubbles: true, cancelable: true,
+    }));
+    await settleUi();
+
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="7951"]')
+      ?.getAttribute('data-raw-end')).toBe('7954');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="7952"]')).toBeNull();
+  });
+
   test('incremental projection expands a placeholder ejected by the 512-block detector cap', async () => {
     const { viewport } = mountView('hide', { height: 120 });
     const block = (index: number) => [
@@ -1115,6 +1243,94 @@ describe('TermView Claude Bash projection', () => {
     expect(Number.parseFloat(gapMarker.style.height)).toBe(
       Number(gapLine.getAttribute('data-presentation-height')),
     );
+  });
+
+  test('history prepend can prove a leading separator without moving the reader anchor', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const live = [
+      '',
+      '● Bash(printf seam-history)',
+      '  ⎿  seam-history-output',
+      '\x1b[0m \u00a0',
+      '● live-boundary',
+      ...Array.from({ length: 115 }, (_, index) => `line-${index}`),
+    ];
+    deliver(live);
+    await settleUi();
+    wheelUp(viewport);
+    expect(historyRequests).toBe(1);
+
+    // At capture start the leading blank is deliberately retained because no
+    // semantic predecessor proves it is a separator yet.
+    expect(viewport.getAttribute('data-total')).toBe('118');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="1"]')
+      ?.getAttribute('data-raw-end')).toBe('4');
+    const beforeLine = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-line'))
+      .find((line) => line.textContent === 'line-0');
+    if (!beforeLine) throw new Error('history seam anchor line was not mounted');
+    const anchorId = beforeLine.getAttribute('data-line-id');
+    const screenYBefore = projectedScreenY(viewport, beforeLine);
+    const contentHeightBefore = Number(viewport.getAttribute('data-presentation-height'));
+
+    if (!sessionCallback) throw new Error('TermView did not subscribe');
+    sessionCallback(JSON.stringify({
+      lines: ['● older-semantic'],
+      startLine: 0,
+      hasMore: false,
+    }), 'history');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settleUi();
+
+    // The new semantic row occupies exactly the full row vacated when the old
+    // capture-padding blank becomes a proven separator inside the marker.
+    expect(viewport.getAttribute('data-raw-total')).toBe('121');
+    expect(viewport.getAttribute('data-total')).toBe('118');
+    expect(Number(viewport.getAttribute('data-presentation-height'))).toBe(contentHeightBefore);
+    const afterLine = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
+    if (!afterLine) throw new Error('history seam projection dropped the raw anchor');
+    expect(projectedScreenY(viewport, afterLine)).toBeCloseTo(screenYBefore, 5);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="1"]')
+      ?.getAttribute('data-raw-end')).toBe('5');
+  });
+
+  test('ceiling-history prepend keeps the same anchor when seam context absorbs a blank', async () => {
+    const { viewport } = mountView('hide', { height: 120, historyPaging: 'ceiling' });
+    const live = [
+      '',
+      '● Bash(printf ceiling-seam)',
+      '  ⎿  ceiling-output',
+      '',
+      '● live-boundary',
+      ...Array.from({ length: 115 }, (_, index) => `ceiling-line-${index}`),
+    ];
+    deliver(live);
+    await settleUi();
+    wheelUp(viewport);
+    expect(historyRequests).toBe(1);
+
+    const beforeLine = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-line'))
+      .find((line) => line.textContent === 'ceiling-line-0');
+    if (!beforeLine) throw new Error('ceiling seam anchor line was not mounted');
+    const anchorId = beforeLine.getAttribute('data-line-id');
+    const screenYBefore = projectedScreenY(viewport, beforeLine);
+
+    if (!sessionCallback) throw new Error('TermView did not subscribe');
+    sessionCallback(JSON.stringify({
+      lines: ['● ceiling-older-semantic'],
+      startLine: 0,
+      hasMore: false,
+    }), 'history');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settleUi();
+
+    expect(viewport.getAttribute('data-history-paging')).toBe('ceiling');
+    expect(viewport.getAttribute('data-raw-total')).toBe('121');
+    expect(viewport.getAttribute('data-total')).toBe('118');
+    const afterLine = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
+    if (!afterLine) throw new Error('ceiling seam projection dropped the raw anchor');
+    expect(projectedScreenY(viewport, afterLine)).toBeCloseTo(screenYBefore, 5);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="1"]')
+      ?.getAttribute('data-raw-end')).toBe('5');
   });
 
   test('history prepend uses projected row count and preserves the mounted raw anchor', async () => {
