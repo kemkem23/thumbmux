@@ -391,9 +391,15 @@
    * else renders as a one-third-row `hidden bash` divider. */
   const eligibleClaudeBashSummaries = new Set<string>();
   const CLAUDE_BASH_INITIAL_SUMMARY_GROUPS = 10;
+  // The host proxy allows five minutes so a request can wait behind one
+  // serialized model batch and still finish its own bounded subprocess. Keep a
+  // small client-side grace period, then settle to the deterministic preview
+  // and release the live-latest lane even if a custom adapter never resolves.
+  const CLAUDE_BASH_SUMMARY_TIMEOUT_MS = 305_000;
   let claudeBashSummaryPolicyMode: ClaudeBashMode = 'off';
   let claudeBashSummaryBootstrapPending = false;
   let claudeBashSummaryInFlight = false;
+  let claudeBashSummaryTimeout: ReturnType<typeof setTimeout> | null = null;
   let pendingClaudeBashInitialBatch: readonly ClaudeBashGroupedSummaryRequest[] | null = null;
   let pendingLatestClaudeBashSummary: ClaudeBashGroupedSummaryRequest | null = null;
   let requestedClaudeBashSummaryCount = $state(0);
@@ -1227,12 +1233,23 @@
     for (const request of requests) requestedClaudeBashSummaries.add(request.fingerprint);
     publishClaudeBashSummaryDiagnostics();
 
+    let finished = false;
     const finish = (summaries: ClaudeBashSummaries | void): void => {
+      if (finished) return;
+      finished = true;
+      if (claudeBashSummaryTimeout !== null) {
+        clearTimeout(claudeBashSummaryTimeout);
+        claudeBashSummaryTimeout = null;
+      }
       if (destroyed) return;
       claudeBashSummaryInFlight = false;
       settleClaudeBashSummaryBatch(requests, summaries);
       pumpClaudeBashSummaryQueue();
     };
+    claudeBashSummaryTimeout = setTimeout(
+      () => finish(undefined),
+      CLAUDE_BASH_SUMMARY_TIMEOUT_MS,
+    );
     if (typeof onClaudeBashSummaryRequest !== 'function') {
       Promise.resolve().then(() => finish(undefined));
       return;
@@ -2850,6 +2867,10 @@
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
+    }
+    if (claudeBashSummaryTimeout !== null) {
+      clearTimeout(claudeBashSummaryTimeout);
+      claudeBashSummaryTimeout = null;
     }
   }
 
