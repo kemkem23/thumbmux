@@ -591,6 +591,63 @@ describe("TermView sliding archive window", () => {
     }
   });
 
+  test("reports a compact Bash seam as uncached while preserving the raw reader anchor", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines("seam-live", 240));
+    const prepends: HistoryPrependDetail[] = [];
+    viewport.addEventListener("thumbmux-history-prepend", (event) => {
+      prepends.push((event as CustomEvent<HistoryPrependDetail>).detail);
+    });
+
+    wheel(viewport, -1_000_000);
+    const resident = archiveLines(2_000, 9_760);
+    resident[0] = "  ⎿  split-output";
+    resident[1] = "     split-detail";
+    resident[2] = "● resident-boundary";
+    resident[24] = "resident-reader-anchor";
+    deliverHistory(2_000, resident, true, 11_760);
+
+    // Enter the prefetch corridor in one gesture but stop 420px below the
+    // absolute top. The accepted request now snapshots non-zero scrollTop, so
+    // a compact cross-page group must rebase presentation geometry.
+    const maxOffset = numberAttr(viewport, "data-presentation-height") - VIEW_HEIGHT;
+    const bottomOffset = numberAttr(viewport, "data-bottom-offset");
+    wheel(viewport, -(maxOffset - 420 - bottomOffset));
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: 2_000,
+      limit: 2_000,
+    });
+    const beforeAnchor = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("resident-reader-anchor"));
+    if (!beforeAnchor) throw new Error("compact-seam reader anchor was not mounted");
+    const anchorId = beforeAnchor.getAttribute("data-line-id");
+    if (!anchorId) throw new Error("compact-seam reader anchor had no absolute identity");
+    const beforeY = projectedScreenY(viewport, beforeAnchor);
+    const transformBefore = viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform;
+    const eventCountBefore = prepends.length;
+
+    const older = archiveLines(0, 2_000);
+    older[older.length - 1] = "● Bash(printf split-history)";
+    deliverHistory(0, older, false, 11_760);
+
+    expect(prepends).toHaveLength(eventCountBefore + 1);
+    const prepend = prepends.at(-1);
+    expect(prepend?.lineCount).toBe(2_000);
+    expect(prepend?.transformStable).toBe(false);
+    expect(prepend?.before.transform).toBe(transformBefore);
+    expect(prepend?.after.transform).not.toBe(prepend?.before.transform);
+    expect(prepend?.cacheValid).toBe(false);
+    expect(prepend?.cacheValid && !prepend.transformStable).toBe(false);
+    expect(numberAttr(viewport, "data-history-window-rows")).toBe(9_760);
+    expect(viewport.getAttribute("data-history-window-has-newer")).toBe("1");
+    const afterAnchor = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
+    if (!afterAnchor) throw new Error("compact-seam reader anchor disappeared");
+    expect(afterAnchor.textContent).toContain("resident-reader-anchor");
+    expect(projectedScreenY(viewport, afterAnchor)).toBeCloseTo(beforeY, 5);
+  });
+
   test("settles a retryable archive error without marking EOF and retries the identical cursor", async () => {
     const { viewport } = mountTermView();
     await tick();

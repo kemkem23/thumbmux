@@ -3218,13 +3218,18 @@
       endLine: number;
     },
   ) {
+    const transformStable = before.transform === after.transform;
     viewportEl?.dispatchEvent(new CustomEvent('thumbmux-history-prepend', {
       detail: {
         lineCount,
-        cacheValid,
+        // The public cache diagnostic is valid only when the compositor origin
+        // is unchanged too. A compact Bash divider can preserve the exact
+        // raw/SGR corridor while changing presentation geometry by one third
+        // of a row; report that seam as uncached instead of a false success.
+        cacheValid: cacheValid && transformStable,
         before,
         after,
-        transformStable: before.transform === after.transform,
+        transformStable,
         ...page,
       },
     }));
