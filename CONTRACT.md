@@ -186,6 +186,51 @@ member list is complete, which is the one thing an extension point cannot promis
 Such a consumer should key off the members it actually uses. If you need the
 complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes.
 
+`AppAdapters.bashSummaries` is the optional, host-owned boundary for Claude Code
+Bash summaries. Omitting it makes no model call: `off` remains the default,
+`hide` is local projection, and `haiku` settles to a deterministic command
+preview when the adapter is absent, rejects, or omits an id. Consecutive
+high-confidence calls separated only by blank presentation rows are one group.
+A fresh `haiku` view requests no more than its newest ten completed groups; each
+later coalesced live update requests only its newest newly-completed group, and
+scrolling never schedules adapter work. An active tail holds the whole group.
+Alternate/unknown screens, incomplete captures, and ambiguous layouts stay raw
+or use the local active placeholder. Compact `hide` and suppressed `haiku` rows
+occupy one third of a terminal row in the presentation coordinate system. The
+source rows remain canonical for copy, search, history, retention, raw/visual
+mapping, and ANSI/OSC state in all modes. The host owns model choice,
+authentication, redaction, lifecycle checks, throttling, and durable caching.
+The low-level `ClaudeBash*`, `detectClaudeBashBlocks`,
+`groupClaudeBashBlocks`, `projectClaudeBashLines`, and
+`projectClaudeBashGroupedLines` core exports are tier X:
+Claude controls the painted layout, so those detector/projection contracts are
+explicitly experimental even though omission behavior in the app shell is
+additive.
+
+The v0.18.0 direct-PTY durability integration is also tier X while production
+hosts prove its cutover lifecycle. Its intentional `thumbmux/server` surface is
+limited to `createTerminalPtyWalProxyLaunchSpec`,
+`createTerminalReplayWorkerClient`, `resolveTerminalReplayWorkerPath`,
+`readTerminalPtyWalProxyHealth`, `TERMINAL_PTY_WAL_CONFIG_ENV`,
+`TerminalPtyWalProxyHealth`, and `TerminalWalController`; the WAL codecs,
+materializer internals, worker entrypoint, and tmux control recorder are not a
+public extension surface. The package guarantee starts only after the host has
+immutably sealed its legacy rows, fenced input, verified the exact logical and
+physical pane identity, and activated a T0 boundary. From that point the proxy
+syncs an ordered checksummed record before displaying child output, and replay
+uses an exclusive cross-process writer lease plus atomic checkpoints. The host
+still owns cutover journaling, restart ordering, storage durability, identity
+policy, and recovery of anything that predates T0.
+
+`TermView`'s 10,000-row / 8 MiB client budget is a presentation cache, not an
+archive-retention promise. It may exceed the nominal cap to protect the mounted
+viewport and overscan. Evicting either far edge does not claim that the server
+deleted those rows: the client can page them back in from the other direction.
+The stable contract is that absolute row identity and the visible anchor remain
+continuous across archive paging, live updates, and window replacement; a host
+that wants a permanent byte/row retention guarantee must provide durable server
+storage separately.
+
 `AppAdapters.sendSubmissionKeys` is the optional composer-submission transport.
 `SessionView` and `EmbedView` use it for `submitPlan` steps only; raw terminal,
 desktop-key, direct-mode, D-pad, and non-submitting shortcut input stays on
@@ -198,10 +243,11 @@ routes, and the frozen app consumer omits the adapter to exercise the additive
 case.
 
 `AppAdapters.hubPresentation` is the optional hub-presentation block. Its `filterOptions`,
-`groupable`, and `order` members feed `SessionGrid`, while `showCommand` feeds
-`LaunchSheet`. Each member is optional. Omitting one preserves the presentation
-component's existing default: no filter choices, grouping disabled, input order,
-and command preview shown. Launcher color mode deliberately reuses the existing
+`groupable`, `order`, and `cardLayout` members feed `SessionGrid`, while
+`showCommand` feeds `LaunchSheet`. Each member is optional. Omitting one
+preserves the presentation component's existing default: no filter choices,
+grouping disabled, input order, `cardLayout: 'default'`, and command preview
+shown. Launcher color mode deliberately reuses the existing
 `AppAdapters.theme.mode` seam instead of introducing a second theme setting;
 `dark` is true only when that callback returns `dark`, and an absent theme or
 mode retains the light launcher. The app view tests pin both the configured and
@@ -214,6 +260,12 @@ stock actions followed by the existing `extraActions`; the returned list is the
 final list, so a host can replace, remove, or reorder any entry. New actions the
 callback creates receive the same FAB auto-dismiss behavior as legacy extra
 actions.
+`headerLayout: 'dense'` opts the HUD into the wrapping
+`name : note : titleAdornment : expand` format. In that mode the title copies
+the exact tmux session name, expand is an independent control, the note is
+verbatim (no `notePrefix`), the adornment never collapses, and the agent chip is
+hidden while Back remains available. Omission retains `headerLayout: 'default'`
+and the complete historical HUD behavior.
 `showShortcutBar: false` removes the persistent bar without removing its manager
 sheet or stock FAB action; omission keeps the bar. `composerMode: 'direct' |
 'compose'` seeds the composer mode once at `SessionView` mount (default
@@ -264,6 +316,24 @@ forwards an existing value and adds no adapter. The app view tests pin each
 configured route separately and pin all omitted defaults (including omitted
 `composerMode` → COMPOSE and omitted font bounds → 4–40), while the unchanged
 frozen app consumer exercises the additive omitted route.
+
+The lower-level dense Svelte presentation is additive as well:
+
+- `GridSession.note` and `GridSession.summary` are optional host-owned text.
+  `SessionGrid cardLayout="dense"` renders them separately; when `summary` is
+  absent, the existing `subtitle` is its fallback. Default cards do not render
+  either new field.
+- `SessionGrid.showNew` defaults to `true`. `false` hides only the launcher
+  card; it does not change `onNew` or session opening policy.
+- Dense cards are square and full container width by default. Only a
+  fine-pointer viewport at least 768 px wide switches them to exact 500 × 500 px
+  cards, so coarse-pointer mobile landscape remains full-width.
+- `SessionThumb density="dense"` uses a 50-line visible window and requests 60
+  lines for ANSI context. Omission retains the 30-line visible window and
+  40-line subscription.
+- Dense names and expand buttons are independent controls. The deterministic
+  hooks are `grid-copy-name` / `grid-expand` and `hud-copy-title` /
+  `hud-expand`; copying never opens a session or toggles the HUD.
 
 ## Deprecation policy
 

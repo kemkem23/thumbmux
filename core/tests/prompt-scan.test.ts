@@ -60,12 +60,14 @@ describe("terminal prompt extraction", () => {
       isFaintPayload: typeof core.DEFAULT_PROMPT_MATCHERS.isFaintPayload,
       isStatusLine: typeof core.DEFAULT_PROMPT_MATCHERS.isStatusLine,
       isPromptTerminator: typeof core.DEFAULT_PROMPT_MATCHERS.isPromptTerminator,
+      isGrokStatusLine: typeof core.isGrokStatusLine,
       frozen: Object.isFrozen(core.DEFAULT_PROMPT_MATCHERS),
     }).toEqual({
       promptPayload: "function",
       isFaintPayload: "function",
       isStatusLine: "function",
       isPromptTerminator: "function",
+      isGrokStatusLine: "function",
       frozen: true,
     });
   });
@@ -341,17 +343,15 @@ describe("terminal prompt extraction", () => {
     expect(extractRecentPromptsFromPane(lines.join("\n"), 0)).toEqual([]);
   });
 
-  test("truncatePrompt never returns an unpaired high surrogate (A2-10)", () => {
-    // 496 ASCII + emoji (2 UTF-16 units) + "tail" crosses the 500-unit cap with
-    // the cut mid-emoji when naively slicing at 497.
+  test("a payload that used to sit on the 500-unit cut is kept exact, including the emoji", () => {
+    // 496 ASCII + emoji (2 UTF-16 units) + "tail" used to be sliced mid-emoji
+    // and then padded with "...". Recall must send the original payload.
     const long = `${"a".repeat(496)}😀tail`;
     const prompts = extractRecentPromptsFromPane(`❯ ${long}\n● response body here enough\n`);
-    expect(prompts.length).toBe(1);
+    expect(prompts).toEqual([long]);
     const text = prompts[0]!;
-    expect(text.endsWith("...")).toBe(true);
-    // No high surrogate without a following low surrogate.
+    expect(text.endsWith("...")).toBe(false);
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(text)).toBe(false);
-    // No low surrogate without a preceding high surrogate.
     expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)).toBe(false);
   });
 });

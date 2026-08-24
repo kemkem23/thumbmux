@@ -19,9 +19,12 @@
  */
 import {
   chooseMuxOutputFrame,
+  muxHistoryBoundaryTransition,
   splitMuxOutputData,
+  validateMuxHistoryBoundary,
   type MuxClientMessage,
   type MuxFullOutputFrame,
+  type MuxHistoryBoundary,
   type MuxPaneScreen,
   type MuxServerMessage,
   type SessionListItem,
@@ -72,6 +75,8 @@ export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem>
     cursor: RawCursorState | null;
     trailingBlanks: number;
     screen?: MuxPaneScreen | null;
+    /** Opaque token pairing this exact capture with a durable archive seam. */
+    archiveCaptureToken?: string;
   }>;
 }
 
@@ -101,6 +106,8 @@ export interface HistoryArchiveLike {
       liveLineLimit: number;
       /** Replace the live archive window in place after a pane reflow. */
       replace?: boolean;
+      /** Exact token returned by the driver's atomic canonical capture. */
+      captureToken?: string;
     },
   ): { liveContent: string };
   readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
@@ -112,6 +119,12 @@ export interface HistoryArchiveLike {
    * archive — which is correct for an archive that holds only departed rows.
    */
   liveStartLine?: (session: string) => number | null;
+  /**
+   * Atomic durable seam paired with the mux's next canonical live capture.
+   * A cutover archive returns a value on every sample; legacy lanes return
+   * null. This is an optional property for additive interface compatibility.
+   */
+  boundary?: (session: string) => MuxHistoryBoundary | null;
   /**
    * Durable append anchored on the archive's own tail, using `paneRows` to know
    * which rows tmux can still repaint. Required by `RetentionLane`.
@@ -416,6 +429,8 @@ export class TmuxWsMux<
   /** last pane screen-mode sample per session — attached like lastCursor so a
    * new viewer of a static pane still learns alt/mouse without a content change */
   private lastScreen = new Map<string, MuxPaneScreen | null>();
+  /** Last durable archive/live seam sampled in the same capture transaction. */
+  private lastBoundary = new Map<string, MuxHistoryBoundary>();
   private pipeDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pipeMaxTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollCounter = 0;
@@ -925,6 +940,35 @@ export class TmuxWsMux<
     return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny;
   }
 
+  private boundaryEq(a: MuxHistoryBoundary | undefined, b: MuxHistoryBoundary | undefined): boolean {
+    if (a === undefined || b === undefined) return a === b;
+    return muxHistoryBoundaryTransition(a, b) === "same";
+  }
+
+  /**
+   * Read and clone a host boundary immediately after archive ingestion. A lane
+   * that previously advertised durable identity may never silently disappear:
+   * keeping an old seam beside a newer screen would create an invisible gap.
+   */
+  private sampleArchiveBoundary(session: string): MuxHistoryBoundary | undefined {
+    const provider = this.archive?.boundary;
+    if (!provider) return undefined;
+    const raw = provider(session);
+    if (raw === null) {
+      if (this.lastBoundary.has(session)) {
+        throw new Error(`durable history boundary disappeared for ${session}`);
+      }
+      return undefined;
+    }
+    const boundary = validateMuxHistoryBoundary(raw);
+    if (!boundary) throw new Error(`invalid durable history boundary for ${session}`);
+    const previous = this.lastBoundary.get(session);
+    if (previous && muxHistoryBoundaryTransition(previous, boundary) === "regression") {
+      throw new Error(`durable history boundary regressed for ${session}`);
+    }
+    return boundary;
+  }
+
   /**
    * Best-effort canonical output tap. Keep the absent-hook path allocation-free:
    * the frame object only exists for hosts that explicitly install the seam.
@@ -937,6 +981,7 @@ export class TmuxWsMux<
     cursor: { row: number; col: number } | null,
     reset?: "resize" | "resync",
     screen?: MuxPaneScreen | null,
+    boundary?: MuxHistoryBoundary,
   ): void {
     const hook = this.hooks.onOutput;
     if (!hook) return;
@@ -946,6 +991,7 @@ export class TmuxWsMux<
       data,
       cursor: cursor ? { ...cursor } : null,
       ...(screen !== undefined ? { screen: screen ? { ...screen } : null } : {}),
+      ...(boundary !== undefined ? { boundary: { ...boundary } } : {}),
       ...(reset ? { reset } : {}),
     };
     try {
@@ -1191,6 +1237,7 @@ export class TmuxWsMux<
         data,
         cursor,
         ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
+        ...(this.lastBoundary.has(session) ? { boundary: this.lastBoundary.get(session)! } : {}),
       };
       const frame: MuxFullOutputFrame = group.reset ? { ...full, reset: group.reset } : full;
       const output = group.base === undefined
@@ -1357,6 +1404,26 @@ export class TmuxWsMux<
     return viewers.length;
   }
 
+  /**
+   * Keep viewers attached but invalidate every output base and request one
+   * canonical full capture. Hosts use this when a durable source generation
+   * changes underneath the same logical session name.
+   */
+  resetSessionOutput(session: string): number {
+    const viewers = this.subscribers.get(session);
+    if (!viewers || viewers.size === 0) return 0;
+    this.contents.delete(session);
+    this.hashes.delete(session);
+    this.lastCursor.delete(session);
+    this.lastScreen.delete(session);
+    this.lastBoundary.delete(session);
+    this.archiveSeeded.delete(session);
+    this.captureStartLines.delete(session);
+    for (const ws of viewers) this.requireResetOutput(session, ws, "resync");
+    this.queueCapture(session, { fullHistory: true });
+    return viewers.size;
+  }
+
   private dropSessionState(session: string) {
     const viewers = this.subscribers.get(session);
     this.subscribers.delete(session);
@@ -1371,6 +1438,7 @@ export class TmuxWsMux<
     this.pendingOutputResets.delete(session);
     this.lastCursor.delete(session);
     this.lastScreen.delete(session);
+    this.lastBoundary.delete(session);
     this.contents.delete(session);
     this.hashes.delete(session);
     this.lastActivity.delete(session);
@@ -1519,14 +1587,28 @@ export class TmuxWsMux<
       const message = error instanceof Error ? error.message : String(error);
       this.logError(`[thumbmux-mux] archive ${method} error for "${session}":`, message);
     } catch {
-      // The archive failure is represented by the empty-page reply below.
+      // The archive failure is represented by a retryable wire reply below.
       // Logging is observability-only; retrying or using another logger could
       // throw recursively, so a logger failure must not replace that reply.
     }
   }
 
+  private sendHistoryReadErrorBestEffort(session: string, ws: WS): void {
+    try {
+      this.wsSend(ws, JSON.stringify({
+        channel: session,
+        type: "error",
+        data: "history_temporarily_unavailable",
+        code: "history_temporarily_unavailable",
+        request: "history_expand",
+        retryable: true,
+      }));
+    } catch {}
+  }
+
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
+    let readFailed = false;
     // SessionProfile.archive gates history_expand as well as capture feed
     // (A3-6). A current-pane-only / non-archived profile must not surface
     // durable rows retained under the same session name.
@@ -1534,23 +1616,32 @@ export class TmuxWsMux<
       // `null` means "the oldest row I can show" to the client. An archive that
       // stores the live window durably ends BELOW that row, so answering from
       // its end would repeat rows the viewer already has. A boundary that throws
-      // falls back to the old meaning rather than failing the reply.
+      // cannot safely fall back to the archive tail: doing so could duplicate
+      // live rows. Return a retryable error without claiming archive EOF.
       let anchor = beforeLine ?? null;
       if (anchor === null && this.archive.liveStartLine) {
         try {
           anchor = this.archive.liveStartLine(session) ?? null;
         } catch (e: unknown) {
           this.reportArchiveReadErrorBestEffort("liveStartLine", session, e);
+          readFailed = true;
         }
       }
-      try {
-        history = this.archive.readBefore(session, anchor, limit);
-      } catch (e: unknown) {
-        this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+      if (!readFailed) {
+        try {
+          history = this.archive.readBefore(session, anchor, limit);
+        } catch (e: unknown) {
+          this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+          readFailed = true;
+        }
       }
     }
-    // No archive (or a failed archive read) answers with an explicit empty
-    // page so the client stops waiting. The two cases stay wire-identical.
+    if (readFailed) {
+      this.sendHistoryReadErrorBestEffort(session, ws);
+      return;
+    }
+    // A missing/disabled archive still answers with the established empty
+    // page. Only an actual read failure is retryable and distinct from EOF.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,
@@ -1562,15 +1653,21 @@ export class TmuxWsMux<
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
+    let readFailed = false;
     if (this.archive?.readAfter && this.profileOf(session).archive) {
       try {
         history = this.archive.readAfter(session, afterLine, limit);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readAfter", session, e);
+        readFailed = true;
       }
     }
-    // A legacy archive without forward paging, a missing archive, and a
-    // failed forward read all use the established empty-page wire response.
+    if (readFailed) {
+      this.sendHistoryReadErrorBestEffort(session, ws);
+      return;
+    }
+    // A legacy archive without forward paging and a missing archive retain
+    // the established empty-page wire response.
     try {
       this.wsSend(ws, JSON.stringify({
         channel: session,
@@ -1785,6 +1882,10 @@ export class TmuxWsMux<
       this.lastScreen.set(newSession, this.lastScreen.get(oldSession) ?? null);
       this.lastScreen.delete(oldSession);
     }
+    if (this.lastBoundary.has(oldSession)) {
+      this.lastBoundary.set(newSession, this.lastBoundary.get(oldSession)!);
+      this.lastBoundary.delete(oldSession);
+    }
     const hash = this.hashes.get(oldSession);
     if (hash) {
       this.hashes.set(newSession, hash);
@@ -1905,12 +2006,28 @@ export class TmuxWsMux<
       const useArchive = profile.archive
         && this.archive !== null
         && (!!opts.fullHistory || this.archiveSeeded.has(session));
+      // Fence an asynchronous durable materializer around the pane read. If
+      // its head changes while capturePane awaits, neither the old nor new
+      // boundary can be proven to describe that screen, so retry instead of
+      // publishing a guessed seam.
+      let boundaryBeforeCapture: MuxHistoryBoundary | undefined;
+      if (useArchive) {
+        try {
+          boundaryBeforeCapture = this.sampleArchiveBoundary(session);
+        } catch (archiveCause) {
+          const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
+          try { this.logError(`[thumbmux-mux] archive boundary error for "${session}":`, message); } catch {}
+          if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
+          return;
+        }
+      }
       const captureOpts = profile.currentPaneOnly ? { currentPaneOnly: true } : { startLine };
       let content: string;
       let rawCursor: RawCursorState | null = null;
       let trailingBlanks: number | null = null;
       /** undefined = driver did not sample; null/object = atomic sample */
       let rawScreen: MuxPaneScreen | null | undefined = undefined;
+      let archiveCaptureToken: string | undefined;
       if (this.driver.captureWithCursor) {
         const combined = await this.driver.captureWithCursor(session, captureOpts);
         content = combined.content;
@@ -1920,6 +2037,7 @@ export class TmuxWsMux<
         if (Object.prototype.hasOwnProperty.call(combined, "screen")) {
           rawScreen = combined.screen ?? null;
         }
+        archiveCaptureToken = combined.archiveCaptureToken;
       } else {
         content = await this.driver.capturePane(session, captureOpts);
       }
@@ -1934,6 +2052,7 @@ export class TmuxWsMux<
         return;
       }
       let liveContent: string;
+      let boundary: MuxHistoryBoundary | undefined;
       if (!useArchive) {
         liveContent = content;
       } else {
@@ -1946,7 +2065,20 @@ export class TmuxWsMux<
             fullHistory: !!opts.fullHistory,
             liveLineLimit: this.liveLineLimit,
             replace: archiveReflowGeneration !== undefined || undefined,
+            captureToken: archiveCaptureToken,
           }).liveContent;
+          // Sample immediately after the synchronous archive transaction. The
+          // boundary and `liveContent` now describe one canonical seam; never
+          // refresh this value later while serializing individual viewers.
+          boundary = this.sampleArchiveBoundary(session);
+          if (!this.boundaryEq(boundaryBeforeCapture, boundary)) {
+            // Preserve the bootstrap intent and coalesce one current-head
+            // retry. queueCapture observes the in-flight lane and schedules it
+            // immediately after this invocation releases ownership.
+            if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
+            this.queueCapture(session, { fullHistory: !!opts.fullHistory });
+            return;
+          }
         } catch (archiveCause) {
           if (!this.ownsSessionLifecycle(session, viewers)) return;
           const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
@@ -1988,6 +2120,9 @@ export class TmuxWsMux<
         // should be large.
       }
 
+      const previousBoundary = this.lastBoundary.get(session);
+      const boundaryMoved = boundary !== undefined && !this.boundaryEq(previousBoundary, boundary);
+
       const hash = this.driver.hash(liveContent);
       this.contents.set(session, liveContent);
       if (hash === this.hashes.get(session)) {
@@ -2006,6 +2141,7 @@ export class TmuxWsMux<
         const atomicScreen = rawScreen;
         const screenMoved = atomicScreen !== undefined
           && !this.screenEq(atomicScreen, this.lastScreen.get(session));
+        if (boundary !== undefined) this.lastBoundary.set(session, boundary);
         if (this.hasPendingOutputFrame(session, viewers)) {
           // Remember who receives the complete pending frame before successful
           // sends clear their markers. A coincident cursor move still has to
@@ -2018,20 +2154,21 @@ export class TmuxWsMux<
           }
           if (cursorMoved) this.lastCursor.set(session, atomicCursor);
           if (screenMoved) this.lastScreen.set(session, atomicScreen);
-          if ((cursorMoved || screenMoved || archiveReflowGeneration !== undefined) && this.hooks.onOutput) {
+          if ((cursorMoved || screenMoved || boundaryMoved || archiveReflowGeneration !== undefined) && this.hooks.onOutput) {
             this.emitOutputHook(
               session,
               liveContent,
               cursor,
               archiveReflowGeneration !== undefined ? "resize" : undefined,
               this.lastScreen.has(session) ? (this.lastScreen.get(session) ?? null) : undefined,
+              boundary,
             );
           }
           this.sendPendingOutputFrames(session, viewers, liveContent, cursor);
           // Non-pending viewers still need the change: screen lives only on
           // full/delta frames, so a screen move re-sends output (same content);
           // a pure cursor move stays on the lightweight cursor frame.
-          if (screenMoved) {
+          if (screenMoved || boundaryMoved) {
             for (const ws of viewers) {
               if (pendingViewers.has(ws)) continue;
               this.sendOutputFrame(session, ws, {
@@ -2039,7 +2176,8 @@ export class TmuxWsMux<
                 type: "output",
                 data: this.contentFor(session, ws, liveContent),
                 cursor,
-                screen: atomicScreen,
+                ...(screenMoved ? { screen: atomicScreen } : {}),
+                ...(boundary !== undefined ? { boundary } : {}),
               });
             }
           } else if (cursorMoved) {
@@ -2058,17 +2196,24 @@ export class TmuxWsMux<
         // Content unchanged — but a cursor / screen that moved anyway must
         // still reach viewers. Only the atomic driver path does this: with
         // two-call sampling a mid-repaint sample could spam idle ticks.
-        if (atomicCursor !== undefined || atomicScreen !== undefined) {
+        if (atomicCursor !== undefined || atomicScreen !== undefined || boundaryMoved) {
           if (cursorMoved && atomicCursor !== undefined) this.lastCursor.set(session, atomicCursor);
           if (screenMoved) this.lastScreen.set(session, atomicScreen!);
-          if (screenMoved) {
+          if (screenMoved || boundaryMoved) {
             // Output carries screen (+ current cursor). Not a cursor-only frame:
             // MuxPaneScreen is only defined on full/delta wire shapes.
             const nextCursor = atomicCursor !== undefined
               ? atomicCursor
               : (this.lastCursor.get(session) ?? null);
             if (this.hooks.onOutput) {
-              this.emitOutputHook(session, liveContent, nextCursor, undefined, atomicScreen);
+              this.emitOutputHook(
+                session,
+                liveContent,
+                nextCursor,
+                undefined,
+                atomicScreen,
+                boundary,
+              );
             }
             this.sendGroupedOutputFrames(session, viewers, liveContent, nextCursor);
           } else if (cursorMoved && atomicCursor !== undefined) {
@@ -2102,6 +2247,7 @@ export class TmuxWsMux<
         return;
       }
       const cursor = this.mapRawCursor(rawCursor, trailingBlanks ?? 0);
+      if (boundary !== undefined) this.lastBoundary.set(session, boundary);
       this.lastCursor.set(session, cursor);
       if (rawScreen !== undefined) this.lastScreen.set(session, rawScreen);
       if (this.hooks.onOutput) {
@@ -2111,6 +2257,7 @@ export class TmuxWsMux<
           cursor,
           archiveReflowGeneration !== undefined ? "resize" : undefined,
           rawScreen,
+          boundary,
         );
       }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);

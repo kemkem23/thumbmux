@@ -205,6 +205,7 @@
     filterOptions={hubPresentation?.filterOptions}
     groupable={hubPresentation?.groupable}
     order={hubPresentation?.order}
+    cardLayout={hubPresentation?.cardLayout}
   />
 
   <LaunchSheet

@@ -11,6 +11,27 @@ export type MuxCursor = { row: number; col: number };
 export interface MuxPaneScreen { alt: boolean; mouseSgr: boolean; mouseAny: boolean; }
 
 /**
+ * Atomic identity of the durable archive/live seam paired with a pane capture.
+ *
+ * `generation` changes only when the durable WAL lane is replaced. The three
+ * numeric coordinates are monotonic inside one generation. WAL sequence is a
+ * decimal string because the recorder uses uint64 values that are not always
+ * JSON-safe JavaScript numbers.
+ */
+export type MuxHistoryBoundary = {
+  generation: string;
+  liveStartLine: number;
+  walSequence: string;
+  walOffset: number;
+};
+
+export type MuxHistoryBoundaryTransition =
+  | "same"
+  | "advance"
+  | "regression"
+  | "generation-mismatch";
+
+/**
  * Minimum row inside the JSON-encoded `data` of a `__sessions` frame.
  *
  * Only `name` is required by the protocol. Server APIs use this no-index-
@@ -47,6 +68,8 @@ export type MuxFullOutputFrame = {
   cursor?: MuxCursor | null;
   /** Present when the driver samples pane screen mode (alt buffer + mouse). */
   screen?: MuxPaneScreen | null;
+  /** Durable archive/live seam paired with this exact canonical capture. */
+  boundary?: MuxHistoryBoundary;
   reset?: "resize" | "resync";
 };
 
@@ -61,6 +84,8 @@ export type MuxDeltaFrame = {
   cursor?: MuxCursor | null;
   /** Present when the driver samples pane screen mode (alt buffer + mouse). */
   screen?: MuxPaneScreen | null;
+  /** Durable archive/live seam paired with the reconstructed capture. */
+  boundary?: MuxHistoryBoundary;
 };
 
 export type MuxOutputFrame = MuxFullOutputFrame | MuxDeltaFrame;
@@ -255,6 +280,59 @@ function isMuxPaneScreen(value: unknown): value is MuxPaneScreen | null {
   );
 }
 
+/** Parse and defensively clone a durable seam identity received from the wire. */
+export function validateMuxHistoryBoundary(value: unknown): MuxHistoryBoundary | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const boundary = value as Record<string, unknown>;
+  if (
+    typeof boundary.generation !== "string"
+    || boundary.generation.length === 0
+    || boundary.generation.length > 256
+    || !Number.isSafeInteger(boundary.liveStartLine)
+    || (boundary.liveStartLine as number) < 0
+    || typeof boundary.walSequence !== "string"
+    || !/^(0|[1-9][0-9]{0,19})$/.test(boundary.walSequence)
+    || !Number.isSafeInteger(boundary.walOffset)
+    || (boundary.walOffset as number) < 0
+  ) return null;
+  return {
+    generation: boundary.generation,
+    liveStartLine: boundary.liveStartLine as number,
+    walSequence: boundary.walSequence,
+    walOffset: boundary.walOffset as number,
+  };
+}
+
+function compareDecimalStrings(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/** Classify an incoming seam relative to the last accepted seam. */
+export function muxHistoryBoundaryTransition(
+  previous: MuxHistoryBoundary,
+  next: MuxHistoryBoundary,
+): MuxHistoryBoundaryTransition {
+  if (previous.generation !== next.generation) return "generation-mismatch";
+  const sequenceOrder = compareDecimalStrings(previous.walSequence, next.walSequence);
+  const offsetOrder = Math.sign(next.walOffset - previous.walOffset);
+  if (
+    next.liveStartLine < previous.liveStartLine
+    || sequenceOrder > 0
+    || offsetOrder < 0
+    // Sequence and byte cursor identify the same WAL commit. Advancing only
+    // one coordinate is not a valid monotonic head and must fail closed.
+    || (sequenceOrder === 0) !== (offsetOrder === 0)
+    || (next.liveStartLine > previous.liveStartLine && sequenceOrder === 0)
+  ) return "regression";
+  return next.liveStartLine === previous.liveStartLine
+    && sequenceOrder === 0
+    && next.walOffset === previous.walOffset
+    ? "same"
+    : "advance";
+}
+
 /**
  * Validate a received delta against its current raw base. Invalid deltas must
  * not update either content or cursor; callers can request one resync instead.
@@ -281,6 +359,10 @@ export function validateMuxDeltaFrame(
   if (Object.prototype.hasOwnProperty.call(candidate, "screen") && !isMuxPaneScreen(candidate.screen)) {
     return null;
   }
+  if (
+    Object.prototype.hasOwnProperty.call(candidate, "boundary")
+    && validateMuxHistoryBoundary(candidate.boundary) === null
+  ) return null;
 
   return candidate as unknown as MuxDeltaFrame;
 }
@@ -329,6 +411,7 @@ export function chooseMuxOutputFrame(
   // frozen factory's signature to carry it would be a declaration change the
   // additive proof cannot express — for a value this call site already holds.
   if (full.screen !== undefined) delta.screen = full.screen;
+  if (full.boundary !== undefined) delta.boundary = full.boundary;
   return shouldUseMuxDelta(full, delta) ? delta : full;
 }
 

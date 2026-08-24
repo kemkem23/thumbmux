@@ -186,14 +186,87 @@ describe("PromptsPanel", () => {
     expect(stripAnsi(ansiTextFromDom)).toBe(extractedPrompts[0]);
     expect(rendered.some((text) => /\p{Script=Thai}/u.test(text))).toBe(true);
 
-    const producerTruncatedPrompt = rendered.find((text) => text.endsWith("..."));
-    expect(producerTruncatedPrompt?.length).toBe(500);
+    expect(rendered.some((text) => text.endsWith("...") && text.length === 500)).toBe(false);
+    expect(nonAnsiRendered[1]).toBe(longThaiPrompt);
 
     const authorStyle = promptAuthorStyle(rows[0]!);
     expect(authorStyle.getPropertyValue("min-height").trim()).toBe("44px");
-    expect(authorStyle.getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
-    expect(authorStyle.getPropertyValue("-webkit-box-orient").trim()).toBe("vertical");
-    expect(authorStyle.getPropertyValue("overflow").trim()).toBe("hidden");
+    expect(authorStyle.getPropertyValue("-webkit-line-clamp").trim()).not.toBe("2");
+    expect(authorStyle.getPropertyValue("overflow").trim()).not.toBe("hidden");
+  });
+
+  test("does not silently two-line-clamp a long row without a disclosure", async () => {
+    const long = `${"ก้ำ".repeat(80)} ${"dense recall ".repeat(40)}`;
+    const { target } = mountPromptsPanel({ prompts: [long] });
+    await tick();
+
+    const row = target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+    if (!row) throw new Error("expected a prompt row");
+    const disclose = target.querySelector('[data-testid="prompt-disclose"]');
+    const authorStyle = promptAuthorStyle(row);
+    const clamp = authorStyle.getPropertyValue("-webkit-line-clamp").trim();
+    const overflow = authorStyle.getPropertyValue("overflow").trim();
+    const silentTwoLineClip = clamp === "2" && overflow === "hidden" && !disclose;
+
+    expect(silentTwoLineClip).toBe(false);
+    expect(row.textContent).toBe(long);
+  });
+
+  test("clicking a 501-unit extracted prompt prefills the exact original payload", async () => {
+    const payload = `${"z".repeat(501)}`;
+    const extracted = extractRecentPrompts([
+      `❯ ${payload}`,
+      "● response body here enough",
+    ]);
+    const picked: string[] = [];
+    const { target } = mountPromptsPanel({
+      prompts: extracted,
+      onPick: (prompt) => picked.push(prompt),
+    });
+    await tick();
+
+    const row = target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+    if (!row) throw new Error("expected a prompt row");
+    flushSync(() => row.click());
+    await tick();
+
+    expect(extracted).toEqual([payload]);
+    expect(picked).toEqual([payload]);
+    expect(picked[0]?.length).toBe(501);
+    expect(picked[0]?.endsWith("...")).toBe(false);
+  });
+
+  test("happy-dom cannot measure overflow so a long payload stays fully visible, never silently two-line clamped", async () => {
+    const payload = `ไทย ${"dense ".repeat(90)}`;
+    expect(payload.length).toBeGreaterThan(480);
+    const { target } = mountPromptsPanel({ prompts: [payload] });
+    await tick();
+
+    const row = target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+    if (!row) throw new Error("expected a prompt row");
+    // Without a layout engine the panel must not invent a clamp. Real
+    // Chromium measures and may add a disclosure; that is covered by the
+    // geometry matrix, not by happy-dom.
+    expect(target.querySelector('[data-testid="prompt-disclose"]')).toBeNull();
+    expect(row.className).not.toContain("clamped");
+    expect(row.textContent).toBe(payload);
+    expect(promptAuthorStyle(row).getPropertyValue("-webkit-line-clamp").trim()).not.toBe("2");
+  });
+
+  test("clicking an API-shaped prompt with embedded newlines restores them exactly", async () => {
+    const payload = "first line\nsecond line\nthird line with ไทย and 😀";
+    const picked: string[] = [];
+    const { target } = mountPromptsPanel({
+      prompts: [payload],
+      onPick: (prompt) => picked.push(prompt),
+    });
+    await tick();
+
+    const row = target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]');
+    if (!row) throw new Error("expected a prompt row");
+    flushSync(() => row.click());
+    await tick();
+    expect(picked).toEqual([payload]);
   });
 });
 

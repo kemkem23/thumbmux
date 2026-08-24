@@ -201,10 +201,14 @@ scroll engine:
   not send keys.
 - `bottomOffsetPx === 0` means the view is pinned to the live tail. Wheel-down
   at the bottom is a no-op and future output remains visible.
-- Wheel-up increases local scroll offset. When the user reaches the top edge,
-  `TermView` may request older history through the existing history path.
-- While scrolled up, new output is merged without jumping the viewport. Returning
-  to bottom flushes pending live content.
+- Wheel-up increases local scroll offset. **Any positive offset**, even less
+  than one row, means the reader is no longer following the tail. When the user
+  reaches the top edge, `TermView` may request older history through the
+  existing history path.
+- While away from the tail, appends and full resyncs preserve the same physical
+  scroll position instead of moving the viewport. `scrollToBottom()` sets the
+  offset to exactly zero before flushing any content deferred by a gesture or
+  selection, then future output follows again.
 
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:
@@ -474,8 +478,10 @@ decides whether SGR routing can activate at all, whichever source supplied
 below for why a pane can want the pointer at all.
 
 `onScrollStateChange` is a boundary notification: it fires when `scrolledUp`
-changes, and `bottomOffset` is the offset at that transition. It is not
-per-frame scroll telemetry.
+changes, and `bottomOffset` is the offset at that transition. `scrolledUp` is
+true for every positive internal offset; a positive fractional offset is
+reported as at least `1`, so the public sentinel `bottomOffset: 0` always means
+the exact live tail. It is not per-frame scroll telemetry.
 
 Public methods keep their names:
 
@@ -539,7 +545,7 @@ ways to start it:
 
 | spawn mode | `alt` | `mouseSgr` | history after a long answer |
 |---|:---:|:---:|---:|
-| `--no-alt-screen` (today's default) | 0 | **1** | **15** — flat, nothing new retained |
+| `--no-alt-screen` (inline mode) | 0 | **1** | **15** — flat, nothing new retained |
 | `--minimal` | 0 | **0** | **555** — grows with the conversation |
 | `--fullscreen` | 1 | 1 | 0 — by design, alt-screen keeps none |
 

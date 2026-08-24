@@ -13,9 +13,12 @@
    * miniatures (SessionThumb) plus a "+ terminal" card. Pure presentation:
    * the host supplies sessions and handles open/new. */
   import SessionThumb from './SessionThumb.svelte';
+  import { copyPlainText } from './clipboard';
   import {
     buildSessionGridModel,
     displayStateLabel,
+    type GridSession,
+    type PreparedGridSession,
     type SessionGridProps,
   } from './session-grid';
 
@@ -41,6 +44,10 @@
     defaultGrouped = false,
     ungroupedLabel = 'Ungrouped',
     order = 'input',
+    cardLayout = 'default',
+    showNew = true,
+    copyNameLabel = 'Copy tmux session name',
+    expandLabel = 'Expand terminal',
   }: SessionGridProps = $props();
 
   let gridEl = $state<HTMLDivElement | null>(null);
@@ -60,7 +67,10 @@
   let controlsVisible = $derived(searchable || filterOptions.length > 0 || groupable);
   let showSkeletons = $derived(loading && sessions.length === 0);
   let skeletonSlots = $derived(Array.from({ length: skeletonSlotCount(skeletonCount) }, (_, index) => index));
-  let focusKeys = $derived([...model.items.map((item) => item.session.name), NEW_FOCUS_KEY]);
+  let focusKeys = $derived([
+    ...model.items.map((item) => item.session.name),
+    ...(showNew ? [NEW_FOCUS_KEY] : []),
+  ]);
 
   $effect(() => {
     if (previousDefaultGrouped !== defaultGrouped) {
@@ -170,12 +180,81 @@
   function stateClass(state: string | undefined): string {
     return state === 'working' ? 'state working' : 'state idle';
   }
+
+  function denseSummary(session: GridSession): string | undefined {
+    return session.summary ?? session.subtitle;
+  }
+
+  function copySessionName(name: string): void {
+    void copyPlainText(name);
+  }
 </script>
+
+{#snippet denseCard(item: PreparedGridSession)}
+  <div
+    class="card dense-card"
+    style:--accent={item.session.color ?? 'var(--hub-accent, #1a1a1a)'}
+    title={item.session.name}
+    data-testid="grid-card"
+    data-session={item.session.name}
+    data-filter-value={item.session.filterValue ?? ''}
+    data-group-key={item.session.groupKey ?? ''}
+    role="group"
+    aria-label={item.session.name}
+  >
+    <div class="dense-head" data-testid="grid-dense-head">
+      <button
+        type="button"
+        class="dense-name"
+        data-testid="grid-copy-name"
+        aria-label={`${copyNameLabel}: ${item.session.name}`}
+        onclick={() => copySessionName(item.session.name)}
+      >{item.session.name}</button>
+      {#if item.session.note}
+        <span class="dense-separator" aria-hidden="true">:</span>
+        <span class="dense-note" data-testid="grid-note">{item.session.note}</span>
+      {/if}
+      {#if denseSummary(item.session)}
+        <span class="dense-separator" aria-hidden="true">:</span>
+        <span class="dense-summary" data-testid="grid-summary">{denseSummary(item.session)}</span>
+      {/if}
+      <span class="dense-separator" aria-hidden="true">:</span>
+      <button
+        type="button"
+        class="dense-expand"
+        onclick={() => onOpen(item.session.name)}
+        onfocus={() => (activeFocusKey = item.session.name)}
+        tabindex={tabIndexFor(item.session.name)}
+        aria-label={`${expandLabel}: ${item.session.name}`}
+        data-testid="grid-expand"
+        data-session={item.session.name}
+        data-focus-key={item.session.name}
+      >↗</button>
+    </div>
+    {#if item.session.state}
+      <div class={stateClass(item.session.state)} data-testid="grid-state" data-state={item.session.state}>
+        <span class="dot" aria-hidden="true"></span>
+        <span>{displayStateLabel(item.session)}</span>
+        {#if item.activityDatetime}
+          <time data-testid="grid-activity" datetime={item.activityDatetime}>{item.session.lastActivityLabel ?? item.activityDatetime}</time>
+        {/if}
+      </div>
+    {/if}
+    <div class="live">
+      <SessionThumb
+        session={item.session.name}
+        palette={item.session.palette ?? palette}
+        density="dense"
+      />
+    </div>
+  </div>
+{/snippet}
 
 <svelte:window onkeydown={handleGridKeydown} />
 
 <div
   class="grid"
+  class:dense={cardLayout === 'dense'}
   data-testid="session-grid"
   aria-busy={loading ? 'true' : 'false'}
   bind:this={gridEl}
@@ -249,7 +328,10 @@
       </div>
       {#each group.items as rawItem (rawItem.session.name)}
         {@const item = rawItem}
-        <button
+        {#if cardLayout === 'dense'}
+          {@render denseCard(item)}
+        {:else}
+          <button
           class="card"
           style:--accent={item.session.color ?? 'var(--hub-accent, #1a1a1a)'}
           onclick={() => onOpen(item.session.name)}
@@ -288,13 +370,17 @@
           <div class="live">
             <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} />
           </div>
-        </button>
+          </button>
+        {/if}
       {/each}
     {/each}
   {:else}
     {#each model.items as rawItem (rawItem.session.name)}
       {@const item = rawItem}
-      <button
+      {#if cardLayout === 'dense'}
+        {@render denseCard(item)}
+      {:else}
+        <button
         class="card"
         style:--accent={item.session.color ?? 'var(--hub-accent, #1a1a1a)'}
         onclick={() => onOpen(item.session.name)}
@@ -333,21 +419,24 @@
         <div class="live">
           <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} />
         </div>
-      </button>
+        </button>
+      {/if}
     {/each}
   {/if}
 
-  <button
-    class="card new"
-    onclick={onNew}
-    onfocus={() => (activeFocusKey = NEW_FOCUS_KEY)}
-    tabindex={tabIndexFor(NEW_FOCUS_KEY)}
-    data-testid="grid-new"
-    data-focus-key={NEW_FOCUS_KEY}
-  >
-    <span class="plus">+</span>
-    <span class="new-label">{newLabel}</span>
-  </button>
+  {#if showNew}
+    <button
+      class="card new"
+      onclick={onNew}
+      onfocus={() => (activeFocusKey = NEW_FOCUS_KEY)}
+      tabindex={tabIndexFor(NEW_FOCUS_KEY)}
+      data-testid="grid-new"
+      data-focus-key={NEW_FOCUS_KEY}
+    >
+      <span class="plus">+</span>
+      <span class="new-label">{newLabel}</span>
+    </button>
+  {/if}
 </div>
 
 <style>
@@ -370,6 +459,31 @@
   }
   @media (min-width: 1440px) {
     .grid { --grid-cols: 6; }
+  }
+  .grid.dense {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    width: 100%;
+    max-width: none;
+    padding: 0;
+  }
+  .grid.dense .card {
+    box-sizing: border-box;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1 / 1;
+    border-radius: 0;
+  }
+  @media (min-width: 768px) and (pointer: fine) {
+    .grid.dense {
+      grid-template-columns: repeat(auto-fit, 500px);
+      justify-content: start;
+    }
+    .grid.dense .card {
+      width: 500px;
+      height: 500px;
+      aspect-ratio: auto;
+    }
   }
   .controls,
   .group-heading,
@@ -467,6 +581,95 @@
     border-bottom: 2px solid var(--accent);
     background: var(--hub-card, #ffffff);
     z-index: 1;
+  }
+  .dense-head {
+    display: flex;
+    align-items: center;
+    align-content: center;
+    flex-wrap: wrap;
+    gap: 0 4px;
+    min-width: 0;
+    min-height: 44px;
+    padding: 2px 4px;
+    border-bottom: 1px solid var(--accent);
+    background: var(--hub-card, #ffffff);
+    color: var(--hub-ink, #1a1a1a);
+    font: 600 12px/1.7 var(--font-mono, ui-monospace, monospace);
+    z-index: 1;
+  }
+  .dense-name,
+  .dense-expand {
+    min-height: 44px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--hub-ink, #1a1a1a);
+    font: inherit;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .dense-name {
+    min-width: 44px;
+    max-width: 100%;
+    padding: 0;
+    font-weight: 700;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .dense-expand {
+    flex: 0 0 44px;
+    width: 44px;
+    padding: 0;
+    color: var(--accent);
+  }
+  .dense-name:focus-visible,
+  .dense-expand:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .dense-separator {
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .dense-note,
+  .dense-summary {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    letter-spacing: 0;
+    font-family: var(--font-thai, var(--font-mono, ui-monospace, monospace));
+    line-height: 1.7;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .dense-note {
+    flex: 0 1 auto;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    color: var(--hub-ink2, #6b6560);
+  }
+  .dense-summary {
+    flex: 1 1 180px;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    color: var(--hub-ink, #1a1a1a);
+  }
+  .dense-card .state {
+    min-height: 20px;
+    padding: 2px 4px 0;
+  }
+  .dense-card {
+    cursor: default;
+  }
+  .dense-card .state .dot {
+    box-shadow: none;
+  }
+  .dense-card .live {
+    border-top: 1px solid var(--hub-line, #d8d2c8);
   }
   .subtitle {
     padding: 5px 9px 0;
@@ -608,6 +811,9 @@
     background: linear-gradient(90deg, transparent, rgba(255,255,255,.55), transparent);
     animation: grid-shimmer 1.25s ease-in-out infinite;
     animation-delay: calc(var(--skeleton-index, 0) * 70ms);
+  }
+  .grid.dense .skeleton::after {
+    display: none;
   }
   .skeleton-head,
   .skeleton-live {

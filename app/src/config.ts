@@ -1,5 +1,6 @@
 import type {
   AnsiPalette,
+  ClaudeBashSummaryRequest,
   LaunchPreset,
   LaunchSpec,
   PreferencesAdapter,
@@ -34,11 +35,15 @@ export interface HubPresentationOptions {
   groupable?: boolean;
   order?: GridOrder;
   showCommand?: boolean;
+  /** Opt into the full-width-mobile / 500px-desktop metadata card layout. */
+  cardLayout?: 'default' | 'dense';
 }
 
 /** Optional presentation choices for one mounted session. Omitted members
  * retain `SessionView`'s stock controls. */
 export interface SessionPresentationOptions {
+  /** Opt into the wrapping `name : note : activity : expand` HUD. */
+  headerLayout?: 'default' | 'dense';
   /** Compose the complete FAB list after stock actions and legacy
    * `extraActions` have been assembled. Returning the supplied actions by
    * reference preserves their existing behavior; newly created actions are
@@ -57,16 +62,21 @@ export interface SessionPresentationOptions {
    * height fast — five prompts is most of a phone screen — and the collapsed
    * list is what makes the rest of the stack reachable without scrolling. */
   promptsCollapsible?: boolean;
-  /** Start the collapsible prompt list open. Defaults false (collapsed); has
-   * no effect unless `promptsCollapsible` is set. */
+  /** Start the collapsible prompt list open. When paired with
+   * `promptsCollapsible`, SessionView also prefetches the prompt adapter and
+   * renders this list first, so the first HUD expansion can show recall
+   * immediately. Defaults false (collapsed); has no effect unless
+   * `promptsCollapsible` is set. */
   promptsInitiallyOpen?: boolean;
   /** Where `extraPanel` renders inside the HUD panel stack. Defaults
    * `'bottom'`, which is where it has always rendered.
    *
    * `'top'` exists because the stack's order is a priority order, not a
    * layout detail: a host whose extra panel is the summary of what the session
-   * is doing wants it above a note and a prompt history, and previously had no
-   * way to say so short of giving up the stock note and prompt panels. */
+   * is doing wants it above the stock panels. The one explicit exception is a
+   * collapsible prompt list with `promptsInitiallyOpen: true`: that opt-in
+   * makes recent prompts the first panel, followed by a top-placed extra panel
+   * and then the note. */
   extraPanelPlacement?: 'top' | 'bottom';
   /** Text placed before the HUD note. Defaults to `'✎ '`, which is what the
    * HUD has always prefixed; pass `''` to render the host's note verbatim. */
@@ -190,6 +200,16 @@ export interface AppAdapters {
     save(session: string, text: string): Promise<void>;
   };
   prompts?: (session: string) => Promise<string[]>;
+  /** Summarize completed, high-confidence Claude Bash blocks which TermView
+   * has determined are visible. The host owns the model, durable cache, and
+   * transport; this UI package never calls a model itself. Returning only a
+   * subset is valid — TermView fills missing entries, rejected promises, and
+   * omitted adapters with a deterministic command preview so the terminal
+   * never remains stuck on a loading placeholder. */
+  bashSummaries?: (
+    session: string,
+    requests: readonly ClaudeBashSummaryRequest[],
+  ) => Promise<Readonly<Record<string, string>>>;
   upload?: {
     endpoint(session: string): string | null;
     dir?: string;

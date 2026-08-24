@@ -48,6 +48,7 @@ type TermViewOverrides = {
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
   maxRows?: number;
+  historyPaging?: "ceiling" | "sliding";
 };
 
 type MutableViewportLayout = {
@@ -238,6 +239,9 @@ function mountTermView(
         palette,
         claimGeometry: false,
         fontPx: 13,
+        // Preserve the historical benchmark/retention corpus as an explicit
+        // rollback-path contract; sliding has its own focused component test.
+        historyPaging: "ceiling",
         onScrollStateChange,
         ...overrides,
       },
@@ -279,14 +283,26 @@ async function prepareScrollableTermView(
   onScrollStateChange?: (state: ScrollState) => void,
   lineCount = 240,
   overrides: TermViewOverrides = {},
-): Promise<Mounted & { viewport: HTMLElement }> {
+): Promise<Mounted & {
+  viewport: HTMLElement;
+  layout: MutableViewportLayout;
+  resizeObserver: ControlledResizeObserver;
+}> {
   const mountedView = mountTermView(onScrollStateChange, overrides);
   const viewport = mountedView.target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
   if (!viewport) throw new Error("TermView root not found");
 
+  const layout: MutableViewportLayout = {
+    clientWidth: 320,
+    clientHeight: 240,
+    left: 0,
+    top: 0,
+    width: 320,
+    height: 240,
+  };
   Object.defineProperty(viewport, "clientHeight", {
     configurable: true,
-    get: () => 240,
+    get: () => layout.clientHeight,
   });
 
   const resizeObserver = ControlledResizeObserver.latest;
@@ -297,7 +313,7 @@ async function prepareScrollableTermView(
   drainAnimationFrames();
   flushSync();
 
-  return { ...mountedView, viewport };
+  return { ...mountedView, viewport, layout, resizeObserver };
 }
 
 function viewportRect(layout: MutableViewportLayout): DOMRect {
@@ -414,6 +430,24 @@ function expectMountedContentPreserved(
   for (const [key, content] of before) {
     expect(after.get(key)).toBe(content);
   }
+}
+
+function compositorLineY(viewport: HTMLElement, lineId: number): number {
+  const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+  const firstLine = layer?.querySelector<HTMLElement>(".mtv-line");
+  const target = layer?.querySelector<HTMLElement>(`[data-line-id="${lineId}"]`);
+  if (!layer || !firstLine || !target) {
+    throw new Error(`mounted compositor row ${lineId} not found`);
+  }
+  const translateMatch = layer.style.transform.match(
+    /translate3d\(0(?:px)?,\s*(-?\d+(?:\.\d+)?)px,\s*0(?:px)?\)/,
+  );
+  const firstLineId = Number(firstLine.getAttribute("data-line-id"));
+  const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+  if (!translateMatch?.[1] || !Number.isFinite(firstLineId) || !Number.isFinite(lineHeight)) {
+    throw new Error("terminal compositor diagnostics are incomplete");
+  }
+  return Number(translateMatch[1]) + (lineId - firstLineId) * lineHeight;
 }
 
 function median(values: number[]): number {
@@ -1115,6 +1149,157 @@ describe("TermView alt-screen pointer and touch hit testing", () => {
 });
 
 describe("TermView compositor scroll diagnostics", () => {
+  test("preserves the reader's physical anchor when the viewport shrinks off-bottom", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    // Establish the physical-edge baseline while the exact tail still owns the
+    // viewport, just as onMount does in a real browser.
+    resizeObserver.fire();
+
+    // SessionView inserts a 44px scroll control plus an 8px gap as soon as the
+    // first wheel event leaves the live tail. That makes the observed terminal
+    // viewport 52px shorter. Holding bottomOffset constant would move the
+    // physical rows 52px toward the live tail and mostly undo a tiny scroll.
+    wheelTowardHistory(viewport, -4);
+    const offsetBeforeResize = compositorBottomOffset(viewport);
+    const total = Number(viewport.getAttribute("data-total"));
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const bottomBeforeResize = viewportRect(layout).bottom;
+    const physicalAnchorBefore = bottomBeforeResize + offsetBeforeResize - total * lineHeight;
+    const scrollTopBefore = Math.max(0, total * lineHeight - layout.clientHeight)
+      - offsetBeforeResize;
+    const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+    if (!layer) throw new Error("TermView compositor layer not found");
+    const transformBefore = layer.style.transform;
+
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterResize = compositorBottomOffset(viewport);
+    const scrollTopAfter = Math.max(0, total * lineHeight - layout.clientHeight)
+      - offsetAfterResize;
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterResize).toBe(offsetBeforeResize + 52);
+    expect(scrollTopAfter).toBe(scrollTopBefore);
+    expect(viewportRect(layout).bottom + offsetAfterResize - total * lineHeight)
+      .toBe(physicalAnchorBefore);
+    expect(layer.style.transform).toBe(transformBefore);
+
+    // Once the layout has moved, later live output must still preserve the
+    // same reader-owned row instead of silently rejoining tail-follow.
+    deliverLiveAppend(239, 1);
+    flushSync();
+    drainScheduledWork();
+    const totalAfterAppend = Number(viewport.getAttribute("data-total"));
+    const offsetAfterAppend = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterAppend).toBe(offsetAfterResize + lineHeight);
+    expect(viewportRect(layout).bottom + offsetAfterAppend - totalAfterAppend * lineHeight)
+      .toBe(physicalAnchorBefore);
+    expect(layer.style.transform).toBe(transformBefore);
+  });
+
+  test("does not compensate an off-bottom reader when only the viewport top moves", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    wheelTowardHistory(viewport, -4);
+    const offsetBeforeResize = compositorBottomOffset(viewport);
+    const bottomBeforeResize = viewportRect(layout).bottom;
+
+    // A taller HUD moves the terminal's top downward while leaving its bottom
+    // edge fixed. Height-only compensation would incorrectly move every row.
+    layout.top += 52;
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterResize = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(viewportRect(layout).bottom).toBe(bottomBeforeResize);
+    expect(offsetAfterResize).toBe(offsetBeforeResize);
+    expect(viewportRect(layout).bottom + offsetAfterResize)
+      .toBe(bottomBeforeResize + offsetBeforeResize);
+  });
+
+  test("keeps exact-tail ownership when the viewport bottom moves", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    layout.clientHeight -= 52;
+    layout.height -= 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(isScrolledUp?.()).toBe(false);
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(viewport.getAttribute("data-bottom-offset")).toBe("0");
+  });
+
+  test("preserves an off-bottom anchor on expansion until the live tail enters view", async () => {
+    const { app, viewport, layout, resizeObserver } = await prepareScrollableTermView();
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    jest.spyOn(viewport, "getBoundingClientRect").mockImplementation(() => viewportRect(layout));
+    resizeObserver.fire();
+
+    wheelTowardHistory(viewport, -80);
+    const offsetBeforeExpand = compositorBottomOffset(viewport);
+    const bottomBeforeExpand = viewportRect(layout).bottom;
+
+    layout.clientHeight += 52;
+    layout.height += 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    const offsetAfterExpand = compositorBottomOffset(viewport);
+    expect(isScrolledUp?.()).toBe(true);
+    expect(offsetAfterExpand).toBe(offsetBeforeExpand - 52);
+    expect(viewportRect(layout).bottom + offsetAfterExpand)
+      .toBe(bottomBeforeExpand + offsetBeforeExpand);
+
+    // A second expansion reaches past the old reader anchor. At that point
+    // there is no content below the viewport to preserve, so exact-tail
+    // ownership is the truthful state rather than a negative offset.
+    layout.clientHeight += 52;
+    layout.height += 52;
+    resizeObserver.fire();
+    flushSync();
+    drainAnimationFrames();
+
+    expect(isScrolledUp?.()).toBe(false);
+    expect(compositorBottomOffset(viewport)).toBe(0);
+  });
+
+  test("treats any positive bottom offset as scrolled up", async () => {
+    const scrollStates: ScrollState[] = [];
+    const { app, viewport } = await prepareScrollableTermView((state) => scrollStates.push(state));
+    const isScrolledUp = app.isScrolledUp as (() => boolean) | undefined;
+    expect(isScrolledUp?.()).toBe(false);
+    scrollStates.length = 0;
+
+    // A fractional pixel is deliberately much smaller than the 21px terminal
+    // row and would normally round to zero. Follow state is exact: only the
+    // actual offset=0 is the live tail, and diagnostics must preserve that
+    // sentinel distinction.
+    wheelTowardHistory(viewport, -0.25);
+
+    expect(isScrolledUp?.()).toBe(true);
+    expect(scrollStates).toEqual([{ bottomOffset: 1, scrolledUp: true }]);
+    expect(viewport.getAttribute("data-bottom-offset")).toBe("1");
+  });
+
   test("bottom offset is mirrored once at settle, never during a fling", async () => {
     const { app, viewport } = await prepareScrollableTermView();
     wheelTowardHistory(viewport);
@@ -1715,6 +1900,172 @@ describe("TermView retained history budgets", () => {
 
     const afterOffset = Number(viewport.getAttribute("data-bottom-offset"));
     expect(afterOffset - beforeOffset).toBeCloseTo(lineHeight, 5);
+  }, 120_000);
+
+  test("keeps the viewport fixed when a full replace rewrites a long tail", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -1);
+
+    const layer = viewport.querySelector<HTMLElement>(".mtv-layer");
+    if (!layer) throw new Error("TermView compositor layer not found");
+    const transformBefore = layer.style.transform;
+    const offsetBefore = compositorBottomOffset(viewport);
+    const totalBefore = Number(viewport.getAttribute("data-total"));
+    const stablePrefix = retainedLines.slice(0, -6);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      [
+        ...stablePrefix,
+        "rewritten-tail-1",
+        "rewritten-tail-2",
+        "rewritten-tail-3",
+        "rewritten-tail-4",
+        "rewritten-tail-5",
+        "rewritten-tail-6",
+        "new-tail-1",
+        "new-tail-2",
+        "new-tail-3",
+        "new-tail-4",
+      ].join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(totalBefore + 4);
+    expect(compositorBottomOffset(viewport)).toBe(offsetBefore + 4 * 21);
+    expect(layer.style.transform).toBe(transformBefore);
+  }, 120_000);
+
+  test("keeps a reader fixed while a sliding live window repaints its screen tail", async () => {
+    let retainedLines: string[] = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -200);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no mounted reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+    const offsetBefore = compositorBottomOffset(viewport);
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    let wireCapture = retainedLines.slice();
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    for (let frame = 1; frame <= 5; frame++) {
+      // Real agents keep a fixed capture window: one finalized row leaves the
+      // top while their 5-8 row composer/status tail is repainted in place.
+      // Exact suffix-to-prefix matching sees no overlap in that shape, but the
+      // immutable rows above one pane still prove the chronological shift.
+      wireCapture = [
+        ...wireCapture.slice(1, -6),
+        ...Array.from({ length: 7 }, (_, row) => `stream-${frame}-tail-${row}`),
+      ];
+      sessionCallback(
+        wireCapture.join("\n"),
+        "output",
+        null,
+        { source: "full", replace: false },
+      );
+      flushSync();
+      drainScheduledWork();
+
+      expect(Number(viewport.getAttribute("data-total"))).toBe(240 + frame);
+      expect(compositorBottomOffset(viewport)).toBe(offsetBefore + frame * lineHeight);
+      expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+      expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+      expect(retainedLines.slice(-wireCapture.length)).toEqual(wireCapture);
+      for (let oldFrame = 1; oldFrame < frame; oldFrame++) {
+        const marker = `stream-${oldFrame}-tail-`;
+        expect(retainedLines.filter((line) => line.startsWith(marker))).toHaveLength(
+          wireCapture.filter((line) => line.startsWith(marker)).length,
+        );
+      }
+    }
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+
+    wireCapture = [
+      ...wireCapture.slice(1, -6),
+      ...Array.from({ length: 7 }, (_, row) => `resumed-tail-${row}`),
+    ];
+    sessionCallback(
+      wireCapture.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: false },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(retainedLines.at(-1)).toBe("resumed-tail-6");
+  }, 120_000);
+
+  test("prefers the pane seam when repeated chrome makes a false exact overlap", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    const chrome = Array.from({ length: 8 }, (_, row) => `repeated-chrome-${row}`);
+    const initial = Array.from({ length: 240 }, (_, row) => `seam-line-${row}`);
+    initial.splice(4, chrome.length, ...chrome);
+    initial.splice(initial.length - chrome.length, chrome.length, ...chrome);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(
+      initial.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: true },
+    );
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -200);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no repeated-chrome anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+    const offsetBefore = compositorBottomOffset(viewport);
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue("--mtv-lineh"));
+    const nextCapture = [
+      ...initial.slice(4, -chrome.length),
+      ...Array.from({ length: 12 }, (_, row) => `repainted-tail-${row}`),
+    ];
+
+    sessionCallback(
+      nextCapture.join("\n"),
+      "output",
+      null,
+      { source: "full", replace: false },
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(Number(viewport.getAttribute("data-total"))).toBe(244);
+    expect(compositorBottomOffset(viewport)).toBe(offsetBefore + 4 * lineHeight);
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+    expect(retainedLines.slice(-nextCapture.length)).toEqual(nextCapture);
+    for (const marker of chrome) {
+      expect(retainedLines.filter((line) => line === marker)).toHaveLength(1);
+    }
   }, 120_000);
 
   // A5-9 (replace path): full-window identical overlap must not claim every

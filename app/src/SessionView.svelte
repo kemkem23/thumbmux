@@ -4,6 +4,8 @@
     defaultSurface,
     luminance,
     submitPlan,
+    type ClaudeBashMode,
+    type ClaudeBashSummaryRequest,
     type SessionListItem,
     type Shortcut,
     type ThumbmuxPrefs,
@@ -24,6 +26,7 @@
     createLocalPrefs,
     tmuxMux,
     type FabAction,
+    type FabActionFlyout,
   } from '@thumbmux/svelte';
   import { onMount } from 'svelte';
   import {
@@ -59,6 +62,7 @@
   const DARK_BG = '#101014';
   const LIGHT_BG = '#f5f0e8';
   const STOCK_SWATCHES = [DARK_BG, '#000000', '#0b1c3d', '#b34700', LIGHT_BG, '#e6e6e6'];
+  const CLAUDE_BASH_MODES: readonly ClaudeBashMode[] = ['off', 'hide', 'haiku'];
   const hostOwnsThemeState = !!adapters.theme;
   const prefs = adapters.prefs ?? createLocalPrefs(adapters.theme?.storageKey ?? LOCAL_PREFS_KEY);
 
@@ -67,6 +71,7 @@
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
   let storedFontPx = $state(DEFAULT_FONT_PX);
   let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS.map((shortcut) => ({ ...shortcut })));
+  let claudeBashMode = $state<ClaudeBashMode>('off');
   let customBg = $state(localBg);
 
   // Host can widen/narrow the stock A+/A− band via sessionPresentation.
@@ -108,6 +113,9 @@
   let themeDefaultBg = $derived(adapters.theme?.defaultBg ?? DARK_BG);
   let themeSwatches = $derived(adapters.theme?.swatches ?? STOCK_SWATCHES);
   let sessionAgent = $derived(adapters.submitAgent?.(session) ?? 'generic');
+  let effectiveClaudeBashMode = $derived<ClaudeBashMode>(
+    sessionAgent === 'claude' ? claudeBashMode : 'off',
+  );
 
   let termRef = $state<ReturnType<typeof TermView> | null>(null);
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
@@ -153,6 +161,15 @@
   let showShortcutBar = $derived(adapters.sessionPresentation?.showShortcutBar ?? true);
   let promptsCollapsible = $derived(adapters.sessionPresentation?.promptsCollapsible ?? false);
   let promptsInitiallyOpen = $derived(adapters.sessionPresentation?.promptsInitiallyOpen ?? false);
+  // Keep adapter identity separate from the surrounding options object. A
+  // host may rebuild that object when unrelated HUD data changes; the same
+  // prompt function must not invalidate a warm snapshot or duplicate a load.
+  let promptsAdapter = $derived(adapters.prompts);
+  // An initially-open prompt list is the host saying that recall is the first
+  // thing the operator needs after expanding the HUD. Treat that as a complete
+  // priority choice: warm the data before the click and render the panel first,
+  // instead of opening an empty disclosure below note/summary content.
+  let promptsTakePriority = $derived(promptsCollapsible && promptsInitiallyOpen);
   let extraPanelOnTop = $derived(adapters.sessionPresentation?.extraPanelPlacement === 'top');
   let dpadPlacement = $derived(adapters.sessionPresentation?.dpadPlacement);
   let controlInset = $derived(Math.max(
@@ -197,6 +214,9 @@
     if (Array.isArray(snapshot.shortcuts)) {
       shortcuts = snapshot.shortcuts.map((shortcut) => ({ ...shortcut }));
     }
+    claudeBashMode = CLAUDE_BASH_MODES.includes(snapshot.claudeBashMode as ClaudeBashMode)
+      ? snapshot.claudeBashMode as ClaudeBashMode
+      : 'off';
   }
 
   function savePrefs(patch: Partial<ThumbmuxPrefs>): void {
@@ -217,6 +237,23 @@
   function setShortcuts(next: Shortcut[]): void {
     shortcuts = next;
     savePrefs({ shortcuts: next });
+  }
+
+  function setClaudeBashMode(mode: ClaudeBashMode): void {
+    claudeBashMode = mode;
+    savePrefs({ claudeBashMode });
+  }
+
+  function requestClaudeBashSummaries(
+    requests: readonly ClaudeBashSummaryRequest[],
+  ): Promise<Readonly<Record<string, string>>> | void {
+    if (effectiveClaudeBashMode !== 'haiku' || requests.length === 0) return;
+    const summarize = adapters.bashSummaries;
+    if (!summarize) return;
+    // Return the host promise to TermView. It owns the attempted-id fence and
+    // turns rejection, synchronous throw, or missing ids into one final
+    // deterministic row without retrying the provider on every repaint.
+    return summarize(session, requests);
   }
 
   function sendKeysTo(targetSession: string, data: string): void {
@@ -446,19 +483,49 @@
   });
 
   let promptRequest = 0;
-  async function loadPrompts(): Promise<void> {
-    if (!hudExpanded || !adapters.prompts) return;
-    const request = ++promptRequest;
-    const requestedSession = session;
-    promptsLoading = true;
-    try {
-      const loaded = await adapters.prompts(requestedSession);
-      if (request === promptRequest && requestedSession === session) recentPrompts = loaded;
-    } catch {
-      // Keep the last successful snapshot available while the source recovers.
-    } finally {
-      if (request === promptRequest) promptsLoading = false;
+  let promptLoadSession: string | null = null;
+  let promptLoadPromise: Promise<void> | null = null;
+
+  function loadPrompts(allowWhileCollapsed = false): Promise<void> {
+    // Put the non-reactive argument first: the prefetching effect calls this
+    // with `true` and must not subscribe itself to `hudExpanded`, otherwise the
+    // expand click reruns the effect, clears the in-flight request, and defeats
+    // coalescing at exactly the moment it matters.
+    const promptAdapter = promptsAdapter;
+    if ((!allowWhileCollapsed && !hudExpanded) || !promptAdapter) {
+      return Promise.resolve();
     }
+    const requestedSession = session;
+    // Expanding while the mount-time prefetch is still in flight must reuse it.
+    // Starting a second request would cancel the first through `promptRequest`
+    // and turn a warm click back into a loading-only click.
+    if (promptLoadSession === requestedSession && promptLoadPromise) {
+      return promptLoadPromise;
+    }
+    const request = ++promptRequest;
+    promptsLoading = true;
+    promptLoadSession = requestedSession;
+    // Start through a resolved promise so even an adapter which throws before
+    // returning a Promise becomes a normal rejection. The cleanup callback is
+    // therefore always a later microtask, after `pending` is initialized and
+    // stored — avoiding a temporal-dead-zone failure on synchronous throws.
+    const pending = Promise.resolve()
+      .then(() => promptAdapter(requestedSession))
+      .then((loaded) => {
+        if (request === promptRequest && requestedSession === session) recentPrompts = loaded;
+      })
+      .catch(() => {
+        // Keep the last successful snapshot available while the source recovers.
+      })
+      .finally(() => {
+        if (request === promptRequest) promptsLoading = false;
+        if (request === promptRequest && promptLoadSession === requestedSession) {
+          promptLoadPromise = null;
+          promptLoadSession = null;
+        }
+      });
+    promptLoadPromise = pending;
+    return pending;
   }
 
   function showHub(): void {
@@ -520,6 +587,19 @@
         testid: 'demo-copy',
         onTap: () => { overlay.fabOpen = false; void copyTerminal(); },
       },
+      ...(sessionAgent === 'claude' ? [{
+        id: 'bash-mode',
+        label: 'BASH',
+        tag: claudeBashMode === 'off'
+          ? 'SHOW'
+          : claudeBashMode === 'hide'
+            ? 'HIDE'
+            : 'DISTILL',
+        testid: 'demo-bash-mode',
+        // The matching flyout is passed separately so the frozen FabAction
+        // adapter type remains byte-compatible with existing hosts.
+        onTap: () => {},
+      }] satisfies FabAction[] : []),
       {
         id: 'shortcuts',
         label: labels.actionShortcuts,
@@ -572,6 +652,38 @@
     });
   });
 
+  let actionFlyouts = $derived.by((): FabActionFlyout[] => (
+    sessionAgent === 'claude'
+      ? [{
+        actionId: 'bash-mode',
+        ariaLabel: 'Bash display mode',
+        choices: [
+          {
+            id: 'bash-show',
+            label: 'SHOW',
+            testid: 'demo-bash-show',
+            selected: claudeBashMode === 'off',
+            onTap: () => setClaudeBashMode('off'),
+          },
+          {
+            id: 'bash-hide',
+            label: 'HIDE',
+            testid: 'demo-bash-hide',
+            selected: claudeBashMode === 'hide',
+            onTap: () => setClaudeBashMode('hide'),
+          },
+          {
+            id: 'bash-distill',
+            label: 'DISTILL',
+            testid: 'demo-bash-distill',
+            selected: claudeBashMode === 'haiku',
+            onTap: () => setClaudeBashMode('haiku'),
+          },
+        ],
+      }]
+      : []
+  ));
+
   let noteRequest = 0;
   $effect(() => {
     const noteAdapter = adapters.notes;
@@ -596,10 +708,17 @@
   });
 
   $effect(() => {
-    session;
+    const requestedSession = session;
+    const shouldPrefetch = promptsTakePriority;
+    const promptAdapter = promptsAdapter;
     promptRequest += 1;
+    promptLoadSession = null;
+    promptLoadPromise = null;
     recentPrompts = [];
     promptsLoading = false;
+    if (requestedSession && shouldPrefetch && promptAdapter) {
+      void loadPrompts(true);
+    }
   });
 
   onMount(() => {
@@ -641,41 +760,61 @@
   {/if}
 {/snippet}
 
+{#snippet recentPromptsPanel()}
+  <PromptsPanel
+    prompts={recentPrompts}
+    loading={promptsLoading}
+    collapsible={promptsCollapsible}
+    initiallyOpen={promptsInitiallyOpen}
+    onPick={(prompt) => {
+      hudExpanded = false;
+      prefillComposer(prompt);
+    }}
+    labels={{
+      title: labels.promptsTitle,
+      loading: labels.promptsLoading,
+      none: labels.promptsEmpty,
+    }}
+  />
+{/snippet}
+
+{#snippet notePanel()}
+  {#if adapters.notes}
+    <NotePanel
+      {note}
+      placeholder={labels.noteEmpty}
+      saving={noteSaving}
+      onSave={(text) => { void saveNote(text); }}
+      labels={{ edit: labels.noteEdit, save: labels.noteSave, cancel: labels.noteCancel }}
+    />
+  {/if}
+{/snippet}
+
+{#snippet extraPanelAt(placement: 'top' | 'bottom')}
+  {#if adapters.extraPanel && (extraPanelOnTop ? placement === 'top' : placement === 'bottom')}
+    {@const extra = adapters.extraPanel}
+    {@render extra(session)}
+  {/if}
+{/snippet}
+
 {#snippet hudPanel()}
-  <div class="hud-panel-stack">
-    {#if adapters.extraPanel && extraPanelOnTop}
-      {@const extraPanelTop = adapters.extraPanel}
-      {@render extraPanelTop(session)}
-    {/if}
-    {#if adapters.notes}
-      <NotePanel
-        {note}
-        placeholder={labels.noteEmpty}
-        saving={noteSaving}
-        onSave={(text) => { void saveNote(text); }}
-        labels={{ edit: labels.noteEdit, save: labels.noteSave, cancel: labels.noteCancel }}
-      />
-    {/if}
-    {#if adapters.prompts}
-      <PromptsPanel
-        prompts={recentPrompts}
-        loading={promptsLoading}
-        collapsible={promptsCollapsible}
-        initiallyOpen={promptsInitiallyOpen}
-        onPick={(prompt) => {
-          hudExpanded = false;
-          prefillComposer(prompt);
-        }}
-        labels={{
-          title: labels.promptsTitle,
-          loading: labels.promptsLoading,
-          none: labels.promptsEmpty,
-        }}
-      />
-    {/if}
-    {#if adapters.extraPanel && !extraPanelOnTop}
-      {@const extraPanel = adapters.extraPanel}
-      {@render extraPanel(session)}
+  <div class="hud-panel-stack" class:recall-priority={promptsTakePriority}>
+    {#if adapters.prompts && promptsTakePriority}
+      {@render recentPromptsPanel()}
+      {#if adapters.notes || adapters.extraPanel}
+        <div class="hud-meta-column" data-testid="hud-meta-column">
+          {@render extraPanelAt('top')}
+          {@render notePanel()}
+          {@render extraPanelAt('bottom')}
+        </div>
+      {/if}
+    {:else}
+      {@render extraPanelAt('top')}
+      {@render notePanel()}
+      {#if adapters.prompts}
+        {@render recentPromptsPanel()}
+      {/if}
+      {@render extraPanelAt('bottom')}
     {/if}
   </div>
 {/snippet}
@@ -716,6 +855,8 @@
             onTap={onTerminalTap}
             onLinesChange={onTermLinesChange}
             onScrollStateChange={onTermScrollStateChange}
+            claudeBashMode={effectiveClaudeBashMode}
+            onClaudeBashSummaryRequest={requestClaudeBashSummaries}
           />
         </DesktopKeys>
       {:else}
@@ -728,6 +869,8 @@
           onTap={onTerminalTap}
           onLinesChange={onTermLinesChange}
           onScrollStateChange={onTermScrollStateChange}
+          claudeBashMode={effectiveClaudeBashMode}
+          onClaudeBashSummaryRequest={requestClaudeBashSummaries}
         />
       {/if}
     {/key}
@@ -748,6 +891,7 @@
     titleAdornment={adapters.titleAdornment ? hudTitleAdornment : undefined}
     notePrefix={adapters.sessionPresentation?.notePrefix ?? '✎ '}
     statusCase={adapters.sessionPresentation?.statusCase ?? 'upper'}
+    layout={adapters.sessionPresentation?.headerLayout ?? 'default'}
   />
 
   {#if showShortcutBar}
@@ -798,6 +942,7 @@
         || (adapters.extraOverlayOpen?.() ?? false)
     }
     {actions}
+    flyouts={actionFlyouts}
     {onFab}
     fabAria={labels.fabAria}
   />
@@ -925,6 +1070,15 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    min-width: 0;
+    align-items: stretch;
+  }
+  .hud-meta-column {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    align-items: stretch;
   }
 
   .scroll-controls {

@@ -80,7 +80,8 @@ test('D4: deep history ceiling shows older-history-not-loaded note', async ({ br
     // ~12k numbered lines is enough to fill the 10k client budget after live
     // window retention; archive seed keeps the rest on disk.
     createLineSession(session, 'CEIL', 12_000);
-    await openSession(page, session);
+    await openSession(page, session, { historyPaging: 'ceiling' });
+    await expect(page.getByTestId('mtv')).toHaveAttribute('data-history-paging', 'ceiling');
 
     // Page toward older history until the client budget stop is declared.
     // Do not treat total>=10000 alone as success — a live capture can sit at

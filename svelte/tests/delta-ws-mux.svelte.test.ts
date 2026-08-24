@@ -4,6 +4,7 @@ import {
   muxPrefixHash,
   splitMuxOutputData,
   type MuxDeltaFrame,
+  type MuxHistoryBoundary,
 } from '@thumbmux/core';
 
 const originalState = Object.getOwnPropertyDescriptor(globalThis, '$state');
@@ -158,6 +159,103 @@ afterAll(() => {
 });
 
 describe('TmuxMux delta delivery', () => {
+  test('keeps durable boundary sticky and resyncs regressions or generation switches', () => {
+    const { socket, deliveries, unsubscribe } = openMux();
+    const first: MuxHistoryBoundary = {
+      generation: 'g1', liveStartLine: 100, walSequence: '10', walOffset: 1_000,
+    };
+    socket.receive(full('row-1\nrow-2', { boundary: first }));
+    expect((deliveries.at(-1)!.meta as any).boundary).toEqual(first);
+
+    const advanced: MuxHistoryBoundary = {
+      generation: 'g1', liveStartLine: 110, walSequence: '20', walOffset: 2_000,
+    };
+    const advance = createMuxDeltaFrame(
+      'terminal',
+      splitMuxOutputData('row-1\nrow-2'),
+      splitMuxOutputData('row-1\nrow-3'),
+    );
+    advance.boundary = advanced;
+    socket.receive(advance);
+    expect((deliveries.at(-1)!.meta as any).boundary).toEqual(advanced);
+
+    const deliveredBeforeRegression = deliveries.length;
+    const regression = createMuxDeltaFrame(
+      'terminal',
+      splitMuxOutputData('row-1\nrow-3'),
+      splitMuxOutputData('row-1\nrow-4'),
+    );
+    regression.boundary = { ...advanced, liveStartLine: 109 };
+    socket.receive(regression);
+    expect(deliveries).toHaveLength(deliveredBeforeRegression);
+    expect(socket.frames('resync')).toHaveLength(1);
+
+    // The reset full is the explicit generation fence and may establish lower
+    // absolute/WAL coordinates for a brand-new recorder lane.
+    const reset: MuxHistoryBoundary = {
+      generation: 'g2', liveStartLine: 0, walSequence: '1', walOffset: 64,
+    };
+    socket.receive(full('new generation', { boundary: reset, reset: 'resync' }));
+    expect((deliveries.at(-1)!.meta as any).boundary).toEqual(reset);
+    expect((deliveries.at(-1)!.meta as any).replace).toBe(true);
+
+    const beforeMismatch = deliveries.length;
+    socket.receive(full('unexpected switch', {
+      boundary: { ...first, generation: 'g3' },
+    }));
+    expect(deliveries).toHaveLength(beforeMismatch);
+    expect(socket.frames('resync')).toHaveLength(2);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('delivers boundary-only delta updates even when reconstructed text is unchanged', () => {
+    const { socket, deliveries, unsubscribe } = openMux();
+    const first: MuxHistoryBoundary = {
+      generation: 'g1', liveStartLine: 100, walSequence: '10', walOffset: 1_000,
+    };
+    socket.receive(full('same\ncontent', { boundary: first }));
+    const base = splitMuxOutputData('same\ncontent');
+    const delta = createMuxDeltaFrame('terminal', base, base);
+    delta.boundary = {
+      ...first, liveStartLine: 125, walSequence: '20', walOffset: 2_000,
+    };
+    socket.receive(delta);
+
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[1]!.data).toBe('same\ncontent');
+    expect((deliveries[1]!.meta as any).boundary.liveStartLine).toBe(125);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('a malformed first boundary cannot downgrade its resync reply to legacy output', () => {
+    const { socket, deliveries, unsubscribe } = openMux();
+    socket.receive(full('untrusted', {
+      boundary: {
+        generation: 'g1', liveStartLine: 10, walSequence: 'not-decimal', walOffset: 100,
+      },
+    }));
+    expect(deliveries).toEqual([]);
+    expect(socket.frames('resync')).toHaveLength(1);
+
+    socket.receive(full('missing seam', { reset: 'resync' }));
+    expect(deliveries).toEqual([]);
+    expect(socket.frames('resync')).toHaveLength(1);
+
+    const recovered: MuxHistoryBoundary = {
+      generation: 'g1', liveStartLine: 10, walSequence: '1', walOffset: 100,
+    };
+    socket.receive(full('trusted', { reset: 'resync', boundary: recovered }));
+    expect(deliveries).toHaveLength(1);
+    expect((deliveries[0]!.meta as any).boundary).toEqual(recovered);
+
+    unsubscribe();
+    socket.finishClose();
+  });
+
   test('reconstructs Unicode and trailing empty lines, while legacy callbacks still receive output', () => {
     const { socket, deliveries, unsubscribe } = openMux();
     const legacy: string[] = [];

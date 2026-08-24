@@ -14,13 +14,13 @@
   {
     "name": "AppRoutes",
     "kind": "type",
-    "signature": "c5fc6c71e0d6b04a658e3930357ce13b9fbc5af4804da6c1abe445b1f73cb4fd",
+    "signature": "bf934db559492005973a16f4f91591e078db81d6adcadfe00e4fc81b17aae770",
     "tier": "S"
   },
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "cc662cd6518c7151ad2cdcd5f8bc4d6a8be74d8b97b33283faa9b53a8fd84e8d",
+    "signature": "fdfc8f38ca74022e9dafe7a539a41660b0fddd5f475c4d03c63ad4e34149f8c5",
     "tier": "S"
   },
   {
@@ -32,13 +32,13 @@
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "e1f89ea4f7ea071fce9e85f7533dcbadcf001e88310134ab3ba78825d3cd3205",
+    "signature": "82d6b1f45e0c93c5f95e9545385a8b10ea505d4fad03fc4c684309349869a137",
     "tier": "S"
   },
   {
     "name": "createBunTmuxDriver",
     "kind": "value",
-    "signature": "96f8d9a246633892db34aba944eccb2432e5145292ea5f572c6cb0663fff4d52",
+    "signature": "0029dcffa9eba1547ebd27d5df7d5a2fb16da49c5e447ec470ddf4da2a38de40",
     "tier": "F"
   },
   {
@@ -50,8 +50,20 @@
   {
     "name": "createSpawnHandler",
     "kind": "value",
-    "signature": "3f45c1e0f3c983bb87c731caa8b7619aaaafe410114bd575bf71ba3ea24729ea",
+    "signature": "a230098d3172bcdba10994d1c8c22f5dc1aedfd8f70974e3ce1ae59ac0d81721",
     "tier": "F"
+  },
+  {
+    "name": "createTerminalPtyWalProxyLaunchSpec",
+    "kind": "value",
+    "signature": "c253f8843b21d3e0b31258e59cba1232aa6348d04b1ae5e592864bbb786c62f4",
+    "tier": "X"
+  },
+  {
+    "name": "createTerminalReplayWorkerClient",
+    "kind": "value",
+    "signature": "058ac1952db7afdefef01cda822c29c0337c8f7b41e96bf04a38f0159c250cd7",
+    "tier": "X"
   },
   {
     "name": "createTokenGuard",
@@ -80,7 +92,7 @@
   {
     "name": "DurableHistoryArchive",
     "kind": "value",
-    "signature": "ac2b8b225618deafba39ee3e27f33cb9aa14f716f272f1353f9227838bc66e41",
+    "signature": "70e25ca5e888960798469ee6a6a964d25716bc244fdb9664138e9e533680d01d",
     "tier": "S"
   },
   {
@@ -104,7 +116,7 @@
   {
     "name": "FileHistoryArchive",
     "kind": "value",
-    "signature": "0de8be2d28f4cef7212c9be036565fbe38617864d6ad8486360642c6ba2f7e50",
+    "signature": "8779b4916cd1eac29c78b373855f10408572b950d3fcf80406d2442359cc6cf9",
     "tier": "F"
   },
   {
@@ -116,7 +128,7 @@
   {
     "name": "FrameJournal",
     "kind": "value",
-    "signature": "9b3f2e319b5c67b1c8a2347e608d27e32f1810c9ed8b669504e286c966ceac6c",
+    "signature": "7e0598cad8a353f9f4cf1f7df38dd5e6f8b261a12e8cabbcccdece6324f16e93",
     "tier": "F"
   },
   {
@@ -134,7 +146,7 @@
   {
     "name": "FrameJournalRecordV1",
     "kind": "type",
-    "signature": "5f55a8c20d6320acc902369a22a49fbfe54c089e15ac174017ec171c20302ca5",
+    "signature": "c360c813a25639e8310928fc7907a2de73c11ad79f4b6f2ca4764d83199ff3a2",
     "tier": "F"
   },
   {
@@ -146,7 +158,7 @@
   {
     "name": "HistoryArchiveLike",
     "kind": "type",
-    "signature": "f642d7abe2d7d1c755654d87b47bd2b576302314b9627934ce82ce0b13dec94f",
+    "signature": "a9f287b16a5ba85604b061a9d0f6bf0214bc8c42cb53b9c3b477d7de2053f16d",
     "tier": "F"
   },
   {
@@ -254,7 +266,7 @@
   {
     "name": "MuxHooks",
     "kind": "type",
-    "signature": "c56f8a1fe1f3aac14d2df9dc40fbc3953c9319390e63bbd6d7565f2b761003a0",
+    "signature": "b02e59656dd99f5c90a979b8c667e0ae0f876e247f1b9f78d0b6c7a66b6910de",
     "tier": "F"
   },
   {
@@ -282,21 +294,33 @@
     "tier": "F"
   },
   {
+    "name": "readTerminalPtyWalProxyHealth",
+    "kind": "value",
+    "signature": "b024964222dc1789e250cceaa1c49518a4c7382cac8404b4e1f9c88c8a860205",
+    "tier": "X"
+  },
+  {
     "name": "RecoveredSessionState",
     "kind": "type",
     "signature": "bcd4777df5c92f7d08bca2687a72854e4ddce8d82e004683988ced180f44199d",
     "tier": "F"
   },
   {
+    "name": "resolveTerminalReplayWorkerPath",
+    "kind": "value",
+    "signature": "87237cb3f0deafe7d859ae4eb855358f2bf071f1871920fb0215e3fab5e6a7cf",
+    "tier": "X"
+  },
+  {
     "name": "RetentionLane",
     "kind": "value",
-    "signature": "591d0e1371c38e9013bf9e49bbade02d95f04c48a77e9b5440c645f9eb0c8d6c",
+    "signature": "4add5e1a70895280942ea425a7362e2e7e94ec9c91150c63904c66c14026bb23",
     "tier": "S"
   },
   {
     "name": "RetentionLaneOptions",
     "kind": "type",
-    "signature": "98e35df9bddaa0e69ace24e1cae5cd480e7eb860dd934f89cb9d076357ba003c",
+    "signature": "c98b4fcec3a99e2167774a3c77165dfdd233cedfb0ed815cc9eb28a8538eb215",
     "tier": "S"
   },
   {
@@ -326,7 +350,7 @@
   {
     "name": "SpawnHandlerOptions",
     "kind": "type",
-    "signature": "e2ad3a02503ebb921d0874ab127e725b3c6d49a251a92a1efee51bee567c1d76",
+    "signature": "e9411ae2ea80c75cc8e71275a0b03f45c10ae0553e42609c7f6d3e354032b48c",
     "tier": "F"
   },
   {
@@ -384,9 +408,27 @@
     "tier": "S"
   },
   {
+    "name": "TERMINAL_PTY_WAL_CONFIG_ENV",
+    "kind": "value",
+    "signature": "aa75938ab22d175903403d88987a2021a616cb4e9f9fce68211c4462457c1b7f",
+    "tier": "X"
+  },
+  {
+    "name": "TerminalPtyWalProxyHealth",
+    "kind": "type",
+    "signature": "5e6a6668d36943d6a1c9183ef1f5833e3f3c6f3c8a41f317c7553d51ed6f1da9",
+    "tier": "X"
+  },
+  {
+    "name": "TerminalWalController",
+    "kind": "value",
+    "signature": "c02efe7016ecd70e4264446b8b6c426326b39435d8b88cdd3ae91e9f8e80e479",
+    "tier": "X"
+  },
+  {
     "name": "TmuxDriver",
     "kind": "type",
-    "signature": "31a1557c524f410f91b43202343d0496bd89cb9e2c3335c6972abf62c2a4c62e",
+    "signature": "6b15203b589dccd2acc8102af15f3d40b82d2b52bcbb909656553275185393f2",
     "tier": "F"
   },
   {
@@ -404,13 +446,13 @@
   {
     "name": "TmuxWsMux",
     "kind": "value",
-    "signature": "8ab44d4250b9e866ebf7de4f65eb0b17fdc2d289c282fcde78a8006674c52050",
+    "signature": "5fab451dd0c8f853304b66a5ebe2654661cde7773dad0c11219f5553a2a52873",
     "tier": "F"
   },
   {
     "name": "TmuxWsMuxOptions",
     "kind": "type",
-    "signature": "d9cad580dd157b901490827749bf3836e39d83d9baa0dbe17c22afdc5a27d3a0",
+    "signature": "e1bd26d1c7826a7d6cfd59f19cbb44e8acf95480cada689c3abab8404a3c9a87",
     "tier": "F"
   },
   {

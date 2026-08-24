@@ -25,6 +25,10 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+const node18ReplayLockSmoke = readFileSync(
+  resolve(import.meta.dir, "git-dist-smoke/node18-replay-lock-smoke.mjs"),
+  "utf8",
+);
 /** Single source of truth for the shared CI/release verification gate. */
 const VERIFY_GATE_REL = ".github/actions/verify-gate/action.yml";
 const VERIFY_GATE_USES = "./.github/actions/verify-gate";
@@ -315,6 +319,70 @@ describe("release rail policy", () => {
     expect(parity).toContain('DEMO_URL="${DEMO_URL:-http://127.0.0.1:1}"');
   });
 
+  test("server pack excludes Python bytecode caches even when they exist beside sources", () => {
+    const root = mkdtempSync(join(tmpdir(), "thumbmux-server-pack-hygiene-"));
+    const fixture = join(root, "server");
+    roots.push(root);
+    mkdirSync(join(fixture, "dist/__pycache__"), { recursive: true });
+    mkdirSync(join(fixture, "src/integrations/__pycache__"), { recursive: true });
+
+    const manifest = JSON.parse(
+      readFileSync(resolve(packageRoot, "server/package.json"), "utf8"),
+    ) as Record<string, unknown>;
+    // Packing the fixture must exercise the real shipped allow/exclude rules,
+    // without invoking the production build against intentionally tiny files.
+    delete manifest.scripts;
+    writeFileSync(join(fixture, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    writeFileSync(join(fixture, "dist/index.js"), "export {};\n");
+    writeFileSync(
+      join(fixture, "dist/__pycache__/proxy.cpython-312.pyc"),
+      "synthetic built bytecode cache\n",
+    );
+    writeFileSync(join(fixture, "src/index.ts"), "export {};\n");
+    writeFileSync(join(fixture, "src/integrations/proxy.py"), "print('fixture')\n");
+    writeFileSync(join(fixture, "src/integrations/schema.json"), "{}\n");
+    writeFileSync(
+      join(fixture, "src/integrations/__pycache__/proxy.cpython-312.pyc"),
+      "synthetic bytecode cache\n",
+    );
+    writeFileSync(join(fixture, "src/integrations/proxy.pyo"), "synthetic optimized bytecode\n");
+
+    const tarball = join(fixture, "server-pack-hygiene.tgz");
+    const packed = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        "pm",
+        "pack",
+        "--ignore-scripts",
+        "--filename",
+        "server-pack-hygiene.tgz",
+      ],
+      cwd: fixture,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (packed.exitCode !== 0) {
+      throw new Error(packed.stderr.toString() || packed.stdout.toString());
+    }
+    const listed = Bun.spawnSync({
+      cmd: ["tar", "-tzf", tarball],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (listed.exitCode !== 0) {
+      throw new Error(listed.stderr.toString() || listed.stdout.toString());
+    }
+    const files = listed.stdout.toString().trim().split(/\r?\n/);
+
+    expect(files).toContain("package/dist/index.js");
+    expect(files).toContain("package/src/index.ts");
+    expect(files).toContain("package/src/integrations/proxy.py");
+    expect(files).toContain("package/src/integrations/schema.json");
+    expect(files.filter((path) =>
+      path.includes("/__pycache__/") || /\.py[co]$/.test(path)
+    )).toEqual([]);
+  });
+
   test("CI, release, and local parity materialize a verified remote baseline", () => {
     // CI + release materialize via the shared gate; local parity still does
     // it inline (it has no Actions composite runner).
@@ -343,6 +411,19 @@ describe("release rail policy", () => {
     for (const subpath of ["core", "server", "svelte", "app"]) {
       expect(smoke).toContain(`package/contract/manifest/${subpath}.json`);
     }
+  });
+
+  test("packed Node 18 smoke permanently gates portable replay writer recovery", () => {
+    expect(smoke).toContain("timeout 240 docker run --rm");
+    expect(smoke).toContain("timeout 120 apk add --no-cache python3 tmux");
+    expect(smoke).toContain("node18-replay-lock-smoke.mjs");
+    expect(smoke).toContain("node node18-replay-lock-smoke.mjs");
+    expect(node18ReplayLockSmoke)
+      .toContain('createTerminalReplayWorkerClient } from "thumbmux/server"');
+    expect(node18ReplayLockSmoke).toContain("Promise.allSettled([");
+    expect(node18ReplayLockSmoke).toContain('process.kill(killedPid, "SIGKILL")');
+    expect(node18ReplayLockSmoke).toContain("replacement.lastResult.recoveredFromCheckpoint !== true");
+    expect(node18ReplayLockSmoke).not.toContain("terminal-replay-materializer");
   });
 
   test("release and smoke derive the packed root manifest from one helper", () => {

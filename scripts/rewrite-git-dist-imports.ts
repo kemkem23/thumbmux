@@ -28,6 +28,9 @@ export type PublicExportManifest = {
 export type GitDistExportManifests = Record<PublicSubpackage, PublicExportManifest>;
 const REWRITE_ROOTS = ["git-dist/server", "git-dist/svelte", "git-dist/app"] as const;
 const REWRITE_TARGETS = ["core", "svelte"] as const;
+export const GIT_DIST_RUNTIME_ASSETS = [
+  "git-dist/server/terminal-pty-wal-proxy.py",
+] as const;
 type RewriteTarget = (typeof REWRITE_TARGETS)[number];
 const WORKSPACE_SPECIFIER = /^@thumbmux\/(core|server|svelte|app)(?:\/.*)?$/;
 
@@ -825,6 +828,7 @@ export function requiredGitDistArtifacts(root = PACKAGE_ROOT): string[] {
     "git-dist/core/index.d.ts",
     "git-dist/svelte/index.js",
     "git-dist/svelte/index.d.ts",
+    ...GIT_DIST_RUNTIME_ASSETS,
   ]);
   const pkgPath = resolve(root, "package.json");
   if (!existsSync(pkgPath)) return [...required].sort();
@@ -855,7 +859,7 @@ export function requiredGitDistArtifacts(root = PACKAGE_ROOT): string[] {
  * Fail-closed post-conditions for a usable git-dist aggregate.
  *
  * 1. Zero bare internal workspace module edges anywhere under git-dist.
- * 2. Required entrypoints exist and are non-empty.
+ * 2. Required entrypoints/runtime assets exist and are non-empty.
  * 3. Every rewritten relative specifier resolves to a real file on disk.
  *
  * File/replacement *counts* are intentionally not asserted — they grow when
@@ -879,6 +883,10 @@ export function assertGitDistInvariants(
     }
     if (statSync(abs).size === 0) {
       throw new Error(`empty git-dist entrypoint: ${rel}`);
+    }
+    if (GIT_DIST_RUNTIME_ASSETS.includes(rel as (typeof GIT_DIST_RUNTIME_ASSETS)[number])
+      && (statSync(abs).mode & 0o555) !== 0o555) {
+      throw new Error(`git-dist runtime asset is not readable/executable: ${rel}`);
     }
   }
 

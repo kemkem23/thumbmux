@@ -5,10 +5,12 @@ import {
   createMuxDeltaFrame,
   fnv1a32,
   muxPrefixHash,
+  muxHistoryBoundaryTransition,
   serializedMuxFrameSize,
   shouldUseMuxDelta,
   splitMuxOutputData,
   validateMuxDeltaFrame,
+  validateMuxHistoryBoundary,
   type MuxDeltaFrame,
   type MuxFullOutputFrame,
 } from "../src/protocol";
@@ -174,6 +176,58 @@ describe("mux delta protocol", () => {
     const chosen = chooseMuxOutputFrame(full, base);
     expect(chosen.type).toBe("delta");
     expect(chosen.screen).toEqual(screen);
+  });
+
+  test("carries a validated durable history boundary on full and delta frames", () => {
+    const boundary = {
+      generation: "wal-generation-1",
+      liveStartLine: 42_000,
+      walSequence: "18446744073709551615",
+      walOffset: 9_000_000,
+    };
+    expect(validateMuxHistoryBoundary(boundary)).toEqual(boundary);
+    expect(validateMuxHistoryBoundary({ ...boundary, walSequence: "01" })).toBeNull();
+    expect(validateMuxHistoryBoundary({ ...boundary, liveStartLine: -1 })).toBeNull();
+
+    const base = Array.from({ length: 30 }, (_, index) => `stable-${index}`);
+    const full: MuxFullOutputFrame = {
+      channel: "terminal",
+      type: "output",
+      data: [...base.slice(0, -1), "changed"].join("\n"),
+      boundary,
+    };
+    const chosen = chooseMuxOutputFrame(full, base);
+    expect(chosen.type).toBe("delta");
+    expect(chosen.boundary).toEqual(boundary);
+    expect(validateMuxDeltaFrame(chosen, base)).not.toBeNull();
+    expect(validateMuxDeltaFrame({ ...chosen, boundary: { ...boundary, walOffset: -1 } }, base)).toBeNull();
+  });
+
+  test("classifies durable seam advance, regression, and generation reset", () => {
+    const previous = {
+      generation: "g1",
+      liveStartLine: 100,
+      walSequence: "99",
+      walOffset: 1_000,
+    };
+    expect(muxHistoryBoundaryTransition(previous, { ...previous })).toBe("same");
+    expect(muxHistoryBoundaryTransition(previous, {
+      ...previous,
+      liveStartLine: 101,
+      walSequence: "100",
+      walOffset: 1_100,
+    })).toBe("advance");
+    expect(muxHistoryBoundaryTransition(previous, {
+      ...previous,
+      liveStartLine: 99,
+    })).toBe("regression");
+    expect(muxHistoryBoundaryTransition(previous, {
+      ...previous,
+      generation: "g2",
+      liveStartLine: 0,
+      walSequence: "1",
+      walOffset: 64,
+    })).toBe("generation-mismatch");
   });
 
   test("chooses only a strict smaller delta and never turns reset output into one", () => {

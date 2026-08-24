@@ -37,7 +37,6 @@ export type ExtractRecentPromptsFromPaneOptions = {
 const DEFAULT_TARGET_COUNT = 5;
 const DEFAULT_INITIAL_SCAN_LINES = 240;
 const DEFAULT_MAX_SCAN_LINES = 1200;
-const MAX_PROMPT_DISPLAY_CHARS = 500;
 
 const PROMPT_MARKERS = new Set(["❯", "›"]);
 
@@ -141,6 +140,28 @@ export function isClaudeStatusLine(trimmed: string): boolean {
     /\b(tokens|permissions|effort|5h|week|ctx:)/i.test(trimmed);
 }
 
+export function isGrokStatusLine(trimmed: string): boolean {
+  // Grok Build TUI v1.0.x (measured 2026-08-21 on grok 0.2.102 / Grok 4.6):
+  // the composer is a bare ❯ at column 0, then a chrome line such as
+  //   Grok 4.6 (high) · always-approve · 86K / 500K (17%) · ctrl+o transcript
+  //   Grok 4.6 (high) · always-approve · 209K / 500K (42%) · 23 queued · /queue · ctrl+o transcript
+  // Token and queue fields change every few seconds, so this line must never be
+  // admitted as a submitted prompt or glued onto a typed-but-unsent draft.
+  // The June 2026 boxed footer (`╰──── Grok Build · always-approve ─╯`) starts
+  // with box drawing and is already a prompt terminator; this matcher is for
+  // the v1.0.x chrome that has no box and no ❯ of its own.
+  const grokBrand = /^(?:Grok(?:[\s-]|$)|SuperGrok\b)/i.test(trimmed);
+  const hasTranscript = /\bctrl\+o\s+transcript\b/i.test(trimmed);
+  const hasApprove = /\balways-approve\b/i.test(trimmed);
+  const hasQueue = /\b\/queue\b/.test(trimmed) || /\b\d+\s+queued\b/i.test(trimmed);
+  const hasTokens = /\b\d+(?:\.\d+)?[kKmM]?\s*\/\s*\d+(?:\.\d+)?[kKmM]?\b/.test(trimmed);
+  const chromeBits = [hasTranscript, hasApprove, hasQueue, hasTokens].filter(Boolean).length;
+  if (grokBrand && chromeBits >= 1) return true;
+  // A wrap can drop the "Grok 4.6" prefix onto the previous row. The remaining
+  // chrome still carries two unique tokens that a submitted prompt body does not.
+  return chromeBits >= 2;
+}
+
 /**
  * Built-in heuristics tuned for Claude Code, Codex, and Grok pane output.
  * Consumers scanning another agent (for example aider, cline, or a plain shell)
@@ -158,11 +179,16 @@ export const DEFAULT_PROMPT_MATCHERS: PromptMatcherSet = Object.freeze({
     const leading = line.length - line.trimStart().length;
     if (leading > 6) return null;
 
-    return stripTrailingClock(normalized.slice(1).trim());
+    // Empty composer (`❯` with no payload) is not a submitted prompt. Returning
+    // "" here used to start a block that then swallowed the next chrome line
+    // (Grok 4.6 status) as a continuation, so recent-prompts filled with
+    // `Grok 4.6 (high) · always-approve · 86K / 500K (17%)`.
+    const payload = stripTrailingClock(normalized.slice(1).trim());
+    return payload || null;
   },
   isFaintPayload,
   isStatusLine(trimmedLine: string): boolean {
-    return isCodexStatusLine(trimmedLine) || isClaudeStatusLine(trimmedLine);
+    return isCodexStatusLine(trimmedLine) || isClaudeStatusLine(trimmedLine) || isGrokStatusLine(trimmedLine);
   },
   isPromptTerminator(line: string): boolean {
     const trimmed = line.replace(/\u00a0/g, " ").trim();
@@ -199,19 +225,6 @@ function extractMarkdownSection(lines: string[], title: string): string | null {
   return text || null;
 }
 
-function truncatePrompt(text: string): string {
-  if (text.length <= MAX_PROMPT_DISPLAY_CHARS) return text;
-  let end = MAX_PROMPT_DISPLAY_CHARS - 3;
-  // Never leave an unpaired UTF-16 surrogate at the cut. A high surrogate kept
-  // without its low half (or a lone low half) is not a Unicode scalar and
-  // surfaces as U+FFFD / garbage in every consumer that persists the prompt.
-  if (end > 0 && end <= text.length) {
-    const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff) end -= 1; // orphan high surrogate
-  }
-  return `${text.slice(0, end).trimEnd()}...`;
-}
-
 function normalizePromptBlock(lines: string[]): string {
   const cleanLines = lines
     .map(cleanPromptLine)
@@ -219,7 +232,11 @@ function normalizePromptBlock(lines: string[]): string {
 
   const userReport = extractMarkdownSection(cleanLines, "User report");
   const source = userReport ?? cleanLines.join(" ");
-  return truncatePrompt(source.replace(/\s+/g, " ").trim());
+  // Honest capture limit: a tmux pane cannot tell a wrap-break from an
+  // intentional newline, so continuation rows are joined with a space. The
+  // returned string is otherwise the submitted payload — never a 500-unit
+  // preview with a synthetic ellipsis that later looks resendable.
+  return source.replace(/\s+/g, " ").trim();
 }
 
 function collectPrompts(lines: string[], start: number, matchers: PromptMatcherSet): string[] {

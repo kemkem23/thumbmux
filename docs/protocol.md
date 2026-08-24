@@ -24,7 +24,8 @@ One WebSocket multiplexes every session. All frames are JSON. Types live in
 |---|---|
 | `{channel, type:"output", data, cursor?}` | full pane snapshot (or the tail slice for tail subscribers). In the regular path it is sent when the content hash changed, but cached startup snapshots and cache-driven resync/catch-up replies can also send full output without a hash delta; a resize or resync path also emits reset output frames. `cursor` is `{row, col}` (`row` counts up from the last content line, trailing blanks trimmed; same convention for tail slices; NEGATIVE row = caret sits \|row\| blank rows BELOW the last content line, e.g. a shell waiting after newline-terminated output) or `null` when hidden; present when the driver supplies cursor state. |
 | `{channel, type:"cursor", cursor}` | caret-only update: the cursor moved but the pane content did not (arrow keys on a shell line), so the snapshot is not re-sent. Carries no `data` — clients that render output must check `type` first. Emitted only on the `captureWithCursor` driver path. |
-| `{channel, type:"history", data}` | `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive, an unsupported forward read, or an archive read that throws uses `{lines:[], startLine:null, hasMore:false}` as a synchronous fallback. Archive-error logging is best effort: a throwing host logger cannot suppress the mux's single reply attempt. Delivery still depends on `ws.send` succeeding, so clients should retain their own request timeout and recovery. |
+| `{channel, type:"history", data}` | Successful `history_expand` reply — `data` is a JSON-encoded string of `{lines, startLine, hasMore}`. The frame echoes neither the requested direction/cursor nor a request token. A missing archive or an unsupported forward reader uses `{lines:[], startLine:null, hasMore:false}`; an actual read failure does **not** use that shape because it would falsely claim archive EOF. |
+| `{channel, type:"error", data:"history_temporarily_unavailable", code:"history_temporarily_unavailable", request:"history_expand", retryable:true}` | Correlated settlement for an accepted history request whose archive boundary/read threw. It releases the same per-session request lease as a `history` reply without marking either edge exhausted. The bundled `TermView` leaves its absolute cursor unchanged, so a later eligible scroll retries the same range. The server never copies the exception text onto the wire; archive-error logging and delivery are best effort. |
 | `{channel, type:"error", data}` | e.g. the session disappeared. A host-driven `invalidateSession()` makes one final send attempt to each affected WebSocket subscriber before that session lifecycle goes quiet. |
 | `{channel:"__sessions", type:"sessions", data}` | session list — `data` is a JSON-encoded **string** (parse it), like every `data` field on this table; pushed on subscribe and whenever the list changes (~5 s cadence). |
 | `{type:"pong"}` | ping reply. |
@@ -142,6 +143,13 @@ request the other direction. Do not issue concurrent before/after requests or
 try to infer their direction from `startLine`, `hasMore`, or row order; those
 fields are valid in both directions.
 
+The retryable `history_temporarily_unavailable` error is the only non-history
+frame that settles this same lease. It is deliberately identified by all three
+fields (`request`, `code`, and `retryable`), not by `type:"error"` alone: other
+error frames describe session lifecycle failures and must not be mistaken for
+a page reply. A retryable failure is not EOF, so clients must retain both the
+direction and the exact absolute cursor for the next request.
+
 The bundled `TmuxMux` applies that rule to both public paging methods:
 `requestHistory(session, beforeLine?, limit?)` pages backward and
 `requestHistoryAfter(session, afterLine, limit?)` pages forward. They share a
@@ -177,9 +185,10 @@ accepted request still outstanding.
 
 The bundled `TermView` **does not content-de-duplicate** an archive page against
 rows it already holds in the live / already-mounted window. A successful
-`history` reply is prepended as the server sent it (subject only to the viewer's
-own row/byte retention budget, which may drop the **oldest prefix of the
-incoming page**, never rows already on screen).
+`history` reply is inserted as the server sent it. Its default sliding cache may
+evict the far opposite edge to stay near its row/byte budget, but it protects
+the mounted viewport and overscan; the legacy ceiling mode may instead drop the
+oldest prefix of an incoming backward page.
 
 Therefore a host archive **must not** return rows the client already has for
 that session. Use the `beforeLine` / `afterLine` anchors: `beforeLine: N` means
@@ -229,34 +238,33 @@ the boundary as two ordinary adjacent rows unless the host embeds a visible
 marker in the archived text. Do not read the absence of a gap marker as proof
 that history is contiguous.
 
-#### Client retention budgets and what the user sees at the ceiling
+#### Client retention budgets and sliding replacement
 
-`TermView` retains at most 10,000 rows or ~8 MiB of history, whichever fills
-first, and once the budget is full it stops requesting older pages entirely —
-it does not evict older rows to make room for more. The budget is not
-configurable through props.
+`TermView` has a nominal 10,000-row / ~8 MiB presentation-cache budget. The
+mounted viewport and overscan are always protected and may temporarily make the
+cache larger. In the default `historyPaging="sliding"` mode, paging backward
+evicts the far newer edge and paging forward evicts the far older edge. Either
+edge can be requested again while the server still retains it; absolute archive
+line numbers, the visual anchor, ANSI entry state, and any retention-gap marker
+move with the window. Reaching the client budget is therefore not archive EOF.
 
-**Signpost (package-owned, since 0.15.3).** When the stop is the **client
-ceiling** (budget full while the server may still have older rows), and the
-oldest retained row is in the virtual window, `TermView` renders a
-`role="note"` banner (`.mtv-history-ceiling`, `data-testid="mtv-history-ceiling"`,
-`data-history-ceiling="1"`, `data-history-stop="ceiling"`) with an accessible
-label explaining that older history was not loaded. This is **not** a gap
-marker: no rows were dropped between retained lines; older archive rows simply
-were never requested. When the server reports the true start of archived
-history (`hasMore: false`), `data-history-stop="exhausted"` and **no** ceiling
-banner is shown — the top row really is the start.
+`historyPaging="ceiling"` preserves the older one-way behavior for hosts that
+choose it. In that mode the client stops requesting older pages when its budget
+is full and renders a `role="note"` banner (`.mtv-history-ceiling`,
+`data-testid="mtv-history-ceiling"`, `data-history-ceiling="1"`,
+`data-history-stop="ceiling"`). This is not a gap marker: those older rows were
+never loaded. In either mode, when the server reports the true retained start
+(`hasMore: false`), `data-history-stop="exhausted"` is authoritative and no
+ceiling banner is shown.
 
-#### `TmuxWsMux` mutates the tmux session's `history-limit`
+#### `TmuxWsMux` does not lower tmux `history-limit`
 
-After a successful archive seed, the mux calls
-`driver.setSessionHistoryLimit(session, liveLineLimit)`, permanently lowering
-that tmux session's own scrollback to the live-window size. This is deliberate —
-the archive becomes the durable history and tmux keeps only a working window —
-but it is destructive and is not reversed when the archive is deleted. Any host
-tooling that reads deep scrollback straight from tmux (`capture-pane -S -`) for
-the same session must be sized against `liveLineLimit`, not against the tmux
-global.
+Archive ingestion trims only the snapshot returned to viewers. It does not call
+`driver.setSessionHistoryLimit`: a polling archive needs tmux's existing ring to
+absorb bursts between captures, and changing a session option does not resize
+windows that already exist anyway. A host may choose a smaller ring when it
+creates a new window, but that is an external retention decision rather than a
+mux side effect.
 
 #### `sessions_subscribe` idempotency
 

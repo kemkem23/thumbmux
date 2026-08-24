@@ -2,7 +2,7 @@
   {
     "name": "ActionFab",
     "kind": "component",
-    "signature": "fc40c190d9fe50748a489d9a0077218518fb0c75db260b6f3287bdd1218232d6",
+    "signature": "fb9e65b8a0c8fb0582a4862c0274e945cceaac640b67f7f1768a762090048d15",
     "tier": "F"
   },
   {
@@ -56,7 +56,7 @@
   {
     "name": "buildSessionGridModel",
     "kind": "value",
-    "signature": "c51c11c93daa5d9c1ab51e7c5ba8b82ab0f10c1ab67f5a0df59201eca548fc79",
+    "signature": "f33305d57a63308413b2ae7e982764c2860a23e6e0749c858feb4b51d2c8e847",
     "tier": "S"
   },
   {
@@ -224,7 +224,7 @@
   {
     "name": "displayStateLabel",
     "kind": "value",
-    "signature": "de8b67d439b3f4584d5c5f8ec26abe3aebfbc7e30345c63ae6b3ff4a16925ffd",
+    "signature": "99e6a0541013a7dac0f3d58ee44c1c90dd0b6d3c1669472704c0f7466c975174",
     "tier": "S"
   },
   {
@@ -243,6 +243,18 @@
     "name": "FabAction",
     "kind": "type",
     "signature": "c082b6f93e05ca56ac03b02c0c7b98b56ccd98128a99d4445a3b5cffbf28008f",
+    "tier": "F"
+  },
+  {
+    "name": "FabActionChoice",
+    "kind": "type",
+    "signature": "12b268e75609aa014d9b71552b56ff69899fb73af7f661f14c0a6e3a467d52a0",
+    "tier": "F"
+  },
+  {
+    "name": "FabActionFlyout",
+    "kind": "type",
+    "signature": "0413d5df4f278b15ade2cc3dba4eaea6f7c3d3c66ab3bfd63a0016acaf7ab4d7",
     "tier": "F"
   },
   {
@@ -290,7 +302,7 @@
   {
     "name": "GridSession",
     "kind": "type",
-    "signature": "4b854c0b04cc640f5523f5c0eea333f05b637474e161b0e18944b429f77bdf13",
+    "signature": "8718b8bf783e9d0cf7d437e3b52ae03965254cd15ee528de6d654e19884c8222",
     "tier": "F"
   },
   {
@@ -728,19 +740,19 @@
   {
     "name": "SessionGrid",
     "kind": "component",
-    "signature": "464e605198b1d9cce83d08afd8171dd6e3e5e32a758fd9177c4902260ac4e04a",
+    "signature": "828e5961becf4581b743d893653e0df0f796f45033736afb6a2c5834ef7c9ead",
     "tier": "F"
   },
   {
     "name": "SessionGridProps",
     "kind": "type",
-    "signature": "d73c24e2f56d118c56ce230c378ba7f7d6e3ead8582ef161d22947e62c6217b2",
+    "signature": "1cfe102b7740c45ff83d537a90cfac651499a2d8e0363d23cf20175c8e5e71d8",
     "tier": "F"
   },
   {
     "name": "SessionThumb",
     "kind": "component",
-    "signature": "391ada68b9cbc61a9f3893f58616201f79f090d22af50da9a8b15386b5987e8e",
+    "signature": "2ca28d8977e3b3e5dde49bf6a6ef759c9f56f4b5622e10f5df76d7f920ea5b36",
     "tier": "F"
   },
   {
@@ -782,7 +794,7 @@
   {
     "name": "TermHud",
     "kind": "component",
-    "signature": "b279fe20023ba8fc7b9220f4460288cc9cb84d9ecd86d20494189dfd7177743e",
+    "signature": "703da63313bd419a5e78c89bbb174aa84a7230f31d0ce88e9dd61e7a6643356d",
     "tier": "F"
   },
   {
@@ -794,7 +806,7 @@
   {
     "name": "TermView",
     "kind": "component",
-    "signature": "753562d5bf10f923ce280e98bf1bccc94144400852c17aafe959bfd370e7aa0d",
+    "signature": "c27b988482bc57e32cdcaa6849379525307f0f6ed53ece41d039539a1b4e1aee",
     "tier": "F"
   },
   {
@@ -806,13 +818,13 @@
   {
     "name": "tmuxMux",
     "kind": "value",
-    "signature": "81286229e23d5c640da73e546dbe1f7c92856c36cbbca21c7d38a91c168f68db",
+    "signature": "2e1934d928750030bd5c94808be1ed05a131bf45e9991da43610083aa45f6dbb",
     "tier": "F"
   },
   {
     "name": "TmuxMux",
     "kind": "value",
-    "signature": "012f1c80792491d086e729516a96c0819b6b97e38df91bb974ce787a4b0d9665",
+    "signature": "c0d2e266a8e89052be3a569055d5f892df3a57c254d804b45b3449166af77871",
     "tier": "F"
   },
   {

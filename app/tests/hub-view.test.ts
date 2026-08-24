@@ -238,6 +238,8 @@ describe('HubView', () => {
         filterValue: 'tool',
         groupKey: 'workspace',
         groupLabel: 'Workspace',
+        note: 'operator note',
+        summary: 'live summary',
         lastActivityAt: row.name === 'newer-session' ? 200 : 100,
       })),
       spawn: { presets: [preset] },
@@ -247,6 +249,7 @@ describe('HubView', () => {
         groupable: true,
         order: 'recent' as const,
         showCommand: false,
+        cardLayout: 'dense' as const,
       },
     } satisfies AppAdapters;
     const { target } = mountHub({ adapters });
@@ -267,12 +270,14 @@ describe('HubView', () => {
       ),
       commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
       darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
+      denseCard: target.querySelector('[data-testid="grid-dense-head"]') !== null,
     }).toEqual({
       filterValues: ['', 'tool'],
       groupable: true,
       order: ['newer-session', 'older-session'],
       commandPreview: false,
       darkLauncher: true,
+      denseCard: true,
     });
   });
 
@@ -310,12 +315,14 @@ describe('HubView', () => {
       ),
       commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
       darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
+      denseCard: target.querySelector('[data-testid="grid-dense-head"]') !== null,
     }).toEqual({
       filterValues: [],
       groupable: false,
       order: ['input-first', 'input-second'],
       commandPreview: true,
       darkLauncher: false,
+      denseCard: false,
     });
   });
 

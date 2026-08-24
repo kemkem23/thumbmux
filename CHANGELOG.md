@@ -1,7 +1,72 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.0-dist`.
+
+## v0.18.0 — 2026-08-24
+
+### Added
+
+- **A direct-PTY durable lane can preserve every terminal byte produced after a
+  host declares its cutover boundary (T0).** The proxy writes checksummed output,
+  resize, lifecycle, activation, and barrier records to its WAL and syncs them
+  before the child output is displayed. A supervised replay worker materializes
+  that WAL through bounded private-tmux replay and atomic checkpoints; its
+  cross-process writer lease prevents two hosts from truncating or regressing the
+  same materialized state. Restart and SIGKILL recovery resume from the durable
+  sequence and WAL byte offset without inventing or silently dropping rows;
+  unavailable exact recovery fails closed. Node 18 hosts use the same
+  single-writer rule through the packaged Python/flock fallback when no native
+  SQLite module is available. The seven intentional
+  `thumbmux/server` integration exports are tier X while production hosts prove
+  the cutover lifecycle: `createTerminalPtyWalProxyLaunchSpec`,
+  `createTerminalReplayWorkerClient`, `resolveTerminalReplayWorkerPath`,
+  `readTerminalPtyWalProxyHealth`, `TERMINAL_PTY_WAL_CONFIG_ENV`,
+  `TerminalPtyWalProxyHealth`, and `TerminalWalController`. This machinery does
+  not reconstruct bytes from before T0; sealing the old archive and fencing
+  input during cutover remain host responsibilities.
+
+- **`TermView` history retention is now a bounded, bidirectional sliding
+  window.** It keeps a nominal 10,000 rows / 8 MiB, protects the mounted
+  viewport and overscan, evicts the far edge as the reader pages in the other
+  direction, and can fetch those evicted rows again while the server archive
+  retains them. Absolute row identity and the visual anchor survive
+  prepend/append/eviction, including Claude Bash projection, so crossing the
+  archive/live seam does not duplicate, skip, or jump rows. A failed archive
+  read now settles with a retryable correlated error rather than a false empty
+  page, so the client retains and retries the same absolute cursor instead of
+  declaring EOF.
+
+- **Claude Code Bash calls can be shown raw, collapsed, or distilled by a
+  host-owned service.** `SessionView` adds a Claude-only BASH disclosure whose
+  SHOW / HIDE / DISTILL choices open directly to the left and stores the same
+  `off | hide | haiku` preference values. Consecutive calls separated only by
+  blank presentation rows become one semantic group. HIDE and non-selected
+  DISTILL groups render as a green `hidden bash` divider one third of a terminal
+  row high; `TermView` recalibrates virtual scroll, cursor, search, history
+  anchoring, and gap coordinates to that variable-height projection while the
+  exact raw rows remain canonical for copy/search/history/ANSI state. A fresh
+  DISTILL view requests at most its newest ten completed groups, then requests
+  only the newest group completed by each coalesced live update; scrolling never
+  creates model work, and a group with an active tail waits as a whole.
+  `AppAdapters.bashSummaries` remains optional; rejection or omission falls back
+  to a deterministic command preview. The `thumbmux/core` detector/projection
+  exports remain experimental because Claude's terminal layout may evolve.
+
+## v0.16.8 — 2026-08-21
+
+### Fixed
+
+- **Grok Build TUI v1.0.x chrome is no longer stored as a recent prompt.** Live
+  Grok 4.6 (measured on grok 0.2.102) echoes a bare `❯` at column 0 and then a
+  status line such as `Grok 4.6 (high) · always-approve · 86K / 500K (17%) ·
+  ctrl+o transcript` (token and queue fields change every few seconds). The
+  scanner still understood only the June 2026 boxed composer, so an empty `❯`
+  started a block that swallowed that chrome as a continuation, and a
+  typed-but-unsent draft glued onto it. Empty payloads now return null;
+  `isGrokStatusLine` joins the Claude/Codex status matchers. Legacy indent-5
+  clocked echoes and boxed composers stay extracted as before. 100 table-driven
+  pane cases plus a live v1.0.5 capture cover both scan APIs.
 
 ## v0.17.0 — 2026-08-16
 
@@ -48,6 +113,29 @@ The gate is what surfaced this, and the smaller surface is the better design.
   `readBefore` and `readAfter` now clamp to the archive's true floor, and a
   request below it returns an empty page instead of a mislabelled short one. This
   is only reachable with a cap configured, so no 0.16.x consumer was affected.
+
+## v0.16.3 — 2026-08-19
+
+### Added
+
+- **Opt-in dense HUD and live session cards.** `TermHud layout="dense"` renders
+  the wrapping `name : note : titleAdornment : expand` header, copies the exact
+  tmux name from the name control, and keeps expand separate. `SessionGrid
+  cardLayout="dense"` adds host-owned `GridSession.note` / `summary`, a denser
+  `SessionThumb`, full-width square coarse/mobile cards, and exact 500 × 500 px
+  fine-pointer desktop cards; `showNew={false}` can hide the stock launcher.
+  `HubPresentationOptions.cardLayout` and
+  `SessionPresentationOptions.headerLayout` forward these modes through the app
+  shell. Every option is additive and omitted by default, so existing HUDs,
+  cards, thumbnail tails, and launchers remain unchanged.
+
+### Fixed
+
+- **Live output follows only at the exact live tail.** Any positive bottom
+  offset, including a sub-line wheel movement, now counts as scrolled up.
+  Appends and full resyncs that rewrite several tail rows preserve the reader's
+  physical scroll position; `scrollToBottom()` explicitly returns ownership to
+  the live tail before pending content is flushed.
 
 ## v0.16.2 — 2026-08-15
 
