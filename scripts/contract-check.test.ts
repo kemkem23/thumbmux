@@ -866,9 +866,20 @@ describe("declaration signatures", () => {
     writeComponent("string", "{ blur(): void }", "'value'");
     const exposedChanged = deriveGitDistReport(root, ["svelte"]).svelte[0]
       ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'text' | 'mode'");
+    const bindingsBefore = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'mode' | 'text'");
+    const bindingsReordered = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
+    writeComponent("string", "{ focus(): void }", "'open' | 'mode'");
+    const bindingRemoved = deriveGitDistReport(root, ["svelte"]).svelte[0]
+      ?.compatibilitySignature;
 
     expect(defaultChanged).not.toBe(before);
     expect(exposedChanged).not.toBe(before);
+    expect(bindingsReordered).toBe(bindingsBefore);
+    expect(bindingRemoved).not.toBe(bindingsBefore);
   });
 
   test("follows non-exported declarations reachable from a public signature", () => {

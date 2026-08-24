@@ -572,6 +572,18 @@ function componentTypeArgumentNodes(typeNode: ts.TypeNode | undefined): readonly
   return [];
 }
 
+function componentTypeArgumentSurface(argument: ts.TypeNode, index: number): string {
+  // Svelte's generated third Component<> argument is a union of bindable prop
+  // names. Union order has no TypeScript meaning, but svelte2tsx has emitted
+  // different orders for byte-identical source across toolchain runs. Sort
+  // only that bindings union so the immutable gate measures the public set,
+  // while props/defaults and exported methods remain order-sensitive inputs.
+  const surface = index === 2 && ts.isUnionTypeNode(argument)
+    ? argument.types.map((member) => normalizeDeclarationText(member.getText())).sort().join(" | ")
+    : argument.getText();
+  return `component-argument-${index}: ${surface}`;
+}
+
 function compatibilityComponentSignature(
   checker: ts.TypeChecker,
   symbol: ts.Symbol,
@@ -585,7 +597,7 @@ function compatibilityComponentSignature(
     return signatureWithDependencies(
       checker,
       [],
-      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments.map(componentTypeArgumentSurface),
       typeArguments,
       declarationRoot,
       true,
@@ -609,7 +621,7 @@ function componentOptionalAdditionModel(
     return optionalAdditionModel(
       checker,
       [],
-      typeArguments.map((argument, index) => `component-argument-${index}: ${argument.getText()}`),
+      typeArguments.map(componentTypeArgumentSurface),
       typeArguments,
       declarationRoot,
     );
