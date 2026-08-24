@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { isAbsolute, join, resolve } from "node:path";
@@ -12,6 +13,7 @@ import {
 } from "./terminal-wal";
 
 export const TERMINAL_PTY_WAL_CONFIG_ENV = "THUMBMUX_TERMINAL_PTY_WAL_CONFIG";
+export const TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV = "THUMBMUX_TERMINAL_PROXY_ASSET_SHA256";
 export const TERMINAL_PTY_WAL_HEALTH_FILE = "pty-proxy-status.json";
 export const TERMINAL_PTY_WAL_DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log";
 
@@ -291,12 +293,15 @@ export function createTerminalPtyWalProxyLaunchSpec(
   if (Buffer.byteLength(encoded, "utf8") > MAX_CONFIG_JSON_BYTES) {
     throw new Error(`terminal PTY WAL config exceeds ${MAX_CONFIG_JSON_BYTES} bytes`);
   }
+  const assetPath = resolveTerminalPtyWalProxyScriptPath();
+  const assetSha256 = createHash("sha256").update(readFileSync(assetPath)).digest("hex");
   return {
     executable: config.pythonExecutable,
-    args: ["-u", resolveTerminalPtyWalProxyScriptPath()],
+    args: ["-u", assetPath],
     env: {
       ...baseEnvironment,
       [TERMINAL_PTY_WAL_CONFIG_ENV]: encoded,
+      [TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]: assetSha256,
       PYTHONUNBUFFERED: "1",
     },
   };
@@ -325,7 +330,7 @@ export function readTerminalPtyWalProxyHealth(directory: string): TerminalPtyWal
     "foregroundPidStartTicks", "foregroundCommand", "source", "geometry",
     "updatedAt", "heartbeatAt", "walSequence", "walNextOffset", "deliveredSequence", "deliveredNextOffset",
   ];
-  exactKeys(value, required, ["childExitCode", "error"], "terminal PTY WAL health");
+  exactKeys(value, required, ["assetSha256", "childExitCode", "error"], "terminal PTY WAL health");
   const states = new Set(["starting", "armed", "ready", "resizing", "ending", "disconnected", "ended", "fatal"]);
   if (value.version !== 1 || typeof value.state !== "string" || !states.has(value.state)) {
     throw new Error("terminal PTY WAL health state/version is invalid");
@@ -366,6 +371,10 @@ export function readTerminalPtyWalProxyHealth(directory: string): TerminalPtyWal
   }
   if (value.error !== undefined && (typeof value.error !== "string" || value.error.length > 2_048)) {
     throw new Error("health.error is invalid");
+  }
+  if (value.assetSha256 !== undefined
+    && (typeof value.assetSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.assetSha256))) {
+    throw new Error("health.assetSha256 is invalid");
   }
   return {
     version: 1,

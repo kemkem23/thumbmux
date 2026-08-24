@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from typing import Any, Optional
 
 
 CONFIG_ENV = "THUMBMUX_TERMINAL_PTY_WAL_CONFIG"
+ASSET_SHA256_ENV = "THUMBMUX_TERMINAL_PROXY_ASSET_SHA256"
 WAL_FILE = "output.wal"
 SOCKET_FILE = "control.sock"
 LOCK_FILE = "writer.lock"
@@ -133,6 +135,46 @@ def ensure_durable_directory(path: str) -> None:
     fsync_directory(os.path.dirname(path))
 
 
+def verify_running_proxy_asset() -> str:
+    """Fail before WAL access unless this process names the expected bytes."""
+    expected = os.environ.get(ASSET_SHA256_ENV, "")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected):
+        raise ProxyError(f"{ASSET_SHA256_ENV} is missing or invalid")
+    path = os.path.realpath(__file__)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise ProxyError("terminal proxy asset is empty or not a regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            try:
+                chunk = os.read(fd, 1024 * 1024)
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(fd)
+        if (
+            total != before.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise ProxyError("terminal proxy asset changed while it was verified")
+        actual = digest.hexdigest()
+    finally:
+        os.close(fd)
+    if actual != expected:
+        raise ProxyError("terminal proxy asset does not match its launch fingerprint")
+    return actual
+
+
 def write_all(fd: int, data: bytes | bytearray | memoryview) -> None:
     view = memoryview(data)
     written = 0
@@ -140,6 +182,20 @@ def write_all(fd: int, data: bytes | bytearray | memoryview) -> None:
         try:
             count = os.write(fd, view[written:])
         except InterruptedError:
+            continue
+        except BlockingIOError:
+            # stdin and stdout normally refer to the same outer PTY open-file
+            # description.  Making stdin nonblocking can therefore make the
+            # stdout copy nonblocking too.  A full tmux PTY is backpressure,
+            # not a failed durable delivery: wait for room and resume at the
+            # first byte the kernel has not accepted yet.
+            while True:
+                try:
+                    _readable, writable, _exceptional = select.select([], [fd], [])
+                except InterruptedError:
+                    continue
+                if writable:
+                    break
             continue
         if count <= 0:
             raise OSError(errno.EIO, "write made no progress")
@@ -989,9 +1045,10 @@ def fork_child(config: dict[str, Any], geometry: dict[str, int], outer_attribute
 
 
 class Proxy:
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], asset_sha256: str = "") -> None:
         self.config = config
         self.directory = config["directory"]
+        self.asset_sha256 = asset_sha256
         self.generation = uuid.uuid4().hex
         self.log: Optional[DiagnosticLog] = None
         self.status_writer: Optional[AtomicStatus] = None
@@ -1057,6 +1114,7 @@ class Proxy:
             "version": 1,
             "state": self.state,
             "generation": self.generation,
+            "assetSha256": self.asset_sha256,
             "pid": os.getpid(),
             "pidStartTicks": process_start_ticks(os.getpid()),
             "childPid": self.child.pid if self.child is not None else None,
@@ -1765,6 +1823,7 @@ def main(arguments: Optional[list[str]] = None) -> int:
     if selected_arguments not in ([], [FINALIZE_LOGICAL_END_FLAG]):
         return 125
     try:
+        asset_sha256 = verify_running_proxy_asset()
         config = load_config()
     except BaseException:
         # No trusted private diagnostics path exists yet.  Never leak proxy
@@ -1778,7 +1837,7 @@ def main(arguments: Optional[list[str]] = None) -> int:
             # Recovery callers use the exit status as the only contract. This
             # mode must never write diagnostics into a terminal or invoke tmux.
             return 125
-    proxy = Proxy(config)
+    proxy = Proxy(config, asset_sha256)
     try:
         return proxy.start()
     except BaseException as error:

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   appendFileSync,
@@ -19,6 +20,7 @@ import {
   parseTerminalPtyWalProxyConfig,
   readTerminalPtyWalProxyHealth,
   TERMINAL_PTY_WAL_CONFIG_ENV,
+  TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV,
 } from "../src/integrations/terminal-pty-wal-proxy";
 import {
   parseTerminalWalIdentity,
@@ -113,6 +115,92 @@ function runOfflineFinalizer(
 }
 
 describe("direct child PTY durable WAL proxy", () => {
+  test("binds and self-verifies the exact Python asset before WAL access", () => {
+    if (spawnSync("python3", ["--version"], { stdio: "ignore" }).status !== 0) return;
+    const root = mkdtempSync(join(tmpdir(), "tmptywal-asset-"));
+    roots.push(root);
+    const launch = createTerminalPtyWalProxyLaunchSpec({
+      directory: join(root, "lane"),
+      identity: { session: "sh-asset", instanceId: "asset-proof", paneTarget: "=sh-asset:0.0" },
+      argv: ["/bin/true"],
+    }, {});
+    const asset = launch.args[1]!;
+    const expected = createHash("sha256").update(readFileSync(asset)).digest("hex");
+    expect(launch.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]).toBe(expected);
+    const probe = [
+      "import importlib.util,sys",
+      "spec=importlib.util.spec_from_file_location('thumbmux_asset',sys.argv[1])",
+      "module=importlib.util.module_from_spec(spec)",
+      "sys.modules['thumbmux_asset']=module",
+      "spec.loader.exec_module(module)",
+      "print(module.verify_running_proxy_asset())",
+    ].join("\n");
+    const verified = spawnSync("python3", ["-c", probe, asset], {
+      env: launch.env,
+      encoding: "utf8",
+    });
+    expect({ status: verified.status, stdout: verified.stdout.trim(), stderr: verified.stderr })
+      .toEqual({ status: 0, stdout: expected, stderr: "" });
+    const rejected = spawnSync("python3", ["-c", probe, asset], {
+      env: { ...launch.env, [TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]: "0".repeat(64) },
+      encoding: "utf8",
+    });
+    expect(rejected.status).not.toBe(0);
+  });
+
+  test("retries outer PTY EAGAIN after one WAL append without duplicating delivered bytes", () => {
+    if (spawnSync("python3", ["--version"], { stdio: "ignore" }).status !== 0) return;
+    const root = mkdtempSync(join(tmpdir(), "tmptywal-eagain-"));
+    roots.push(root);
+    const scriptPath = createTerminalPtyWalProxyLaunchSpec({
+      directory: join(root, "lane"),
+      identity: { session: "sh-eagain", instanceId: "eagain-proof", paneTarget: "=sh-eagain:0.0" },
+      argv: ["/bin/true"],
+    }, {}).args[1]!;
+    const probe = [
+      "import errno,importlib.util,json,sys",
+      "spec=importlib.util.spec_from_file_location('thumbmux_proxy',sys.argv[1])",
+      "module=importlib.util.module_from_spec(spec)",
+      "sys.modules['thumbmux_proxy']=module",
+      "spec.loader.exec_module(module)",
+      "payload=b'outer-pty-bytes'",
+      "class Writer:\n def __init__(self): self.calls=0\n def append(self,kind,data):\n  self.calls+=1\n  assert kind=='output' and data==payload\n  return module.WalRecord(7,123,kind,bytes(data),99)",
+      "writer=Writer()",
+      "proxy=module.Proxy({'directory':'/not-used','heartbeatMs':1000})",
+      "proxy.writer=writer",
+      "accepted=bytearray()",
+      "attempts=[]",
+      "waits=0",
+      "steps=iter(('partial','again','interrupt','finish'))",
+      "original_write=module.os.write",
+      "original_select=module.select.select",
+      "def fake_write(fd,data):\n assert fd==1\n chunk=bytes(data)\n attempts.append(chunk.hex())\n step=next(steps)\n if step=='partial':\n  accepted.extend(chunk[:3]);return 3\n if step=='again': raise BlockingIOError(errno.EAGAIN,'outer PTY full')\n if step=='interrupt': raise InterruptedError(errno.EINTR,'signal')\n accepted.extend(chunk);return len(chunk)",
+      "def fake_select(readable,writable,exceptional):\n global waits\n assert readable==[] and writable==[1] and exceptional==[]\n waits+=1\n return [],[1],[]",
+      "module.os.write=fake_write",
+      "module.select.select=fake_select",
+      "try: proxy.append_output_and_display(payload)\nfinally:\n module.os.write=original_write\n module.select.select=original_select",
+      "print(json.dumps({'writerCalls':writer.calls,'accepted':accepted.hex(),'attempts':attempts,'waits':waits,'walSequence':proxy.wal_sequence,'walNextOffset':proxy.wal_next_offset,'deliveredSequence':proxy.delivered_sequence,'deliveredNextOffset':proxy.delivered_next_offset}))",
+    ].join("\n");
+    const result = spawnSync("python3", ["-c", probe, scriptPath], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      writerCalls: 1,
+      accepted: Buffer.from("outer-pty-bytes").toString("hex"),
+      attempts: [
+        Buffer.from("outer-pty-bytes").toString("hex"),
+        Buffer.from("er-pty-bytes").toString("hex"),
+        Buffer.from("er-pty-bytes").toString("hex"),
+        Buffer.from("er-pty-bytes").toString("hex"),
+      ],
+      waits: 1,
+      walSequence: 7,
+      walNextOffset: 123,
+      deliveredSequence: 7,
+      deliveredNextOffset: 123,
+    });
+  });
+
   test("fsyncs every first-created WAL directory and its parent before startup", () => {
     if (spawnSync("python3", ["--version"], { stdio: "ignore" }).status !== 0) return;
     const root = mkdtempSync(join(tmpdir(), "tmptywal-dirs-"));
@@ -482,11 +570,13 @@ describe("direct child PTY durable WAL proxy", () => {
       terminateGraceMs: 500,
     }, {});
     const firstConfig = first.env[TERMINAL_PTY_WAL_CONFIG_ENV];
-    if (!firstConfig) throw new Error("launch spec omitted proxy config");
+    const firstAsset = first.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV];
+    if (!firstConfig || !firstAsset) throw new Error("launch spec omitted proxy config or asset digest");
     const firstSpawn = tmux(
       socket,
       "new-session", "-d", "-x", "80", "-y", "24", "-s", session,
       "-e", `${TERMINAL_PTY_WAL_CONFIG_ENV}=${firstConfig}`,
+      "-e", `${TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV}=${firstAsset}`,
       first.executable, ...first.args,
     );
     expect(firstSpawn.status).toBe(0);
@@ -563,11 +653,13 @@ describe("direct child PTY durable WAL proxy", () => {
       terminateGraceMs: 500,
     }, {});
     const secondConfig = second.env[TERMINAL_PTY_WAL_CONFIG_ENV];
-    if (!secondConfig) throw new Error("launch spec omitted proxy config");
+    const secondAsset = second.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV];
+    if (!secondConfig || !secondAsset) throw new Error("launch spec omitted proxy config or asset digest");
     expect(tmux(
       socket,
       "new-session", "-d", "-x", "80", "-y", "24", "-s", session,
       "-e", `${TERMINAL_PTY_WAL_CONFIG_ENV}=${secondConfig}`,
+      "-e", `${TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV}=${secondAsset}`,
       second.executable, ...second.args,
     ).status).toBe(0);
     await eventually(
@@ -597,6 +689,7 @@ describe("direct child PTY durable WAL proxy", () => {
       socket,
       "new-session", "-d", "-x", "80", "-y", "24", "-s", contenderSession,
       "-e", `${TERMINAL_PTY_WAL_CONFIG_ENV}=${contender.env[TERMINAL_PTY_WAL_CONFIG_ENV]}`,
+      "-e", `${TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV}=${contender.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]}`,
       contender.executable, ...contender.args,
     ).status).toBe(0);
     await eventually(() => tmux(socket, "has-session", "-t", `=${contenderSession}`).status !== 0, "contending pane exit");

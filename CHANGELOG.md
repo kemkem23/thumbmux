@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.1-dist`.
+
+## v0.18.1 — 2026-08-24
+
+### Fixed
+
+- **A full outer tmux PTY is now treated as backpressure, not as a fatal proxy
+  error.** The direct-PTY WAL proxy waits until stdout is writable and resumes
+  from the first byte the kernel has not accepted. The output record remains
+  fsynced exactly once, and a partial write followed by `EAGAIN` or `EINTR`
+  neither duplicates nor drops displayed bytes. Launch specs also fingerprint
+  the shipped Python helper; the proxy verifies those exact bytes before any
+  WAL access and publishes the digest in its health record so a recovering host
+  can reject a stale runtime asset before activation.
 
 ## v0.18.0 — 2026-08-24
 
