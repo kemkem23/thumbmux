@@ -373,6 +373,12 @@
   // get a settled mirror, while the only reactive hot-path state is the coarse
   // scrolled-up boundary needed by the cursor and host controls.
   let bottomOffsetPx = 0;
+  // An upward reader gesture can request the first archive page while a short
+  // live screen has no physical scroll range. Keep that logical reader state
+  // separate from the zero-pixel tail coordinate so live updates do not steal
+  // the anchor before the newly available history can be scrolled.
+  let historyReaderAtUnscrollableTail = false;
+  let deferredUnscrollableHistoryPx = 0;
   let settledBottomOffsetPx = $state(0);
   let scrollStateScrolledUp = $state(false);
   let winStart = $state(0);
@@ -701,9 +707,9 @@
     };
   }
 
-  function capturePresentationAnchor(): PresentationAnchor | null {
+  function capturePresentationAnchor(force = false): PresentationAnchor | null {
     const rowCount = presentationRowCount();
-    if (!isAwayFromLiveTail() || rowCount === 0) return null;
+    if ((!force && !isAwayFromLiveTail()) || rowCount === 0) return null;
     const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
     const visualRow = visualRowAtPresentationPixel(scrollTop);
     const row = projectionRowAt(visualRow);
@@ -1400,7 +1406,7 @@
     // A detached archive window can be at its own local bottom while still
     // being many pages away from the live pane. Keep cursor/latest-button
     // semantics tied to the real live seam, not local scroll coordinates.
-    return bottomOffsetPx > 0 || (
+    return historyReaderAtUnscrollableTail || bottomOffsetPx > 0 || (
       historyPaging === 'sliding' &&
       archiveWindow !== null &&
       !archiveWindowAttachedToLive
@@ -1649,6 +1655,8 @@
     updateSelectionActive();
     if (selectionActive) return false;
     stopInertia();
+    historyReaderAtUnscrollableTail = false;
+    deferredUnscrollableHistoryPx = 0;
     bottomOffsetPx = 0;
     if (useSgrMouse) {
       const geom = currentGeometry();
@@ -1672,7 +1680,25 @@
   }
 
   function maxOffset(): number {
-    return Math.max(0, presentationContentHeightPx() - Math.max(1, viewH));
+    const contentHeight = presentationContentHeightPx();
+    if (
+      historyPaging === 'sliding'
+      && archiveWindow !== null
+      && archiveWindowAttachedToLive
+      && liveLines.length > 0
+    ) {
+      // A pane capture may temporarily contain fewer rows than the browser
+      // viewport (most visibly while geometry catches up). At the live tail
+      // those rows are top-aligned and leave unused space below them. Once an
+      // archive page is prepended, preserve that same live-screen alignment;
+      // subtracting the whole viewport would consume the prior slack and move
+      // every live row even though the reader's absolute anchor is unchanged.
+      const liveStart = visualRowForRaw(archivedLines.length);
+      const liveTop = presentationRowTopPx(liveStart);
+      const liveHeight = Math.max(0, contentHeight - liveTop);
+      return Math.max(0, liveTop + Math.max(0, liveHeight - Math.max(1, viewH)));
+    }
+    return Math.max(0, contentHeight - Math.max(1, viewH));
   }
 
   /** Preserve an off-bottom row's physical screen position across layout.
@@ -2807,7 +2833,11 @@
     archiveExhausted = false;
     historyStopReason = 'none';
     archiveOffset = liveStartLine;
-    if (resetReader) bottomOffsetPx = 0;
+    if (resetReader) {
+      historyReaderAtUnscrollableTail = false;
+      deferredUnscrollableHistoryPx = 0;
+      bottomOffsetPx = 0;
+    }
   }
 
   function detachSlidingArchiveFromLive(liveStartLine: number): void {
@@ -3061,6 +3091,11 @@
       archiveInflightDirection = null;
       archiveInflightAnchorLine = null;
       archiveRequestTimer = null;
+      if (archiveWindow === null && historyReaderAtUnscrollableTail) {
+        historyReaderAtUnscrollableTail = false;
+        deferredUnscrollableHistoryPx = 0;
+        applyScroll();
+      }
     }, HISTORY_REPLY_TIMEOUT_MS);
 
     // Mux rejection (another request owns this session, no open socket, or a
@@ -3099,9 +3134,42 @@
     return Math.max(2 * viewH, 24 * lineH);
   }
 
-  function maybeRequestOlderHistory(projectedBottomOffset = bottomOffsetPx) {
-    if (archiveLoading || archiveExhausted || total === 0) return;
-    if (projectedBottomOffset >= maxOffset() - historyPrefetchThreshold()) requestOlderHistory();
+  function maybeRequestOlderHistory(projectedBottomOffset = bottomOffsetPx): boolean {
+    const canDeferUnscrollableHistory = (
+      historyPaging === 'sliding'
+      && maxOffset() === 0
+    );
+    if (
+      canDeferUnscrollableHistory
+      && archiveLoading
+      && archiveInflightDirection === 'before'
+      && projectedBottomOffset > 0
+    ) {
+      deferredUnscrollableHistoryPx = Math.max(
+        deferredUnscrollableHistoryPx,
+        projectedBottomOffset,
+      );
+      // A downward gesture may have relinquished the logical reader claim
+      // without cancelling the already accepted tokenless request. A fresh
+      // upward gesture must reclaim that same in-flight page so its new pixel
+      // intent is replayed when the reply arrives.
+      historyReaderAtUnscrollableTail = true;
+      applyScroll();
+    }
+    if (archiveLoading || archiveExhausted || total === 0) return false;
+    if (projectedBottomOffset < maxOffset() - historyPrefetchThreshold()) return false;
+    const accepted = requestOlderHistory();
+    if (accepted && canDeferUnscrollableHistory) {
+      historyReaderAtUnscrollableTail = true;
+      deferredUnscrollableHistoryPx = Math.max(
+        deferredUnscrollableHistoryPx,
+        Math.max(0, projectedBottomOffset),
+      );
+      // The physical transform is unchanged, but the public/coarse state must
+      // immediately say that the reader—not the live tail—owns this viewport.
+      applyScroll();
+    }
+    return accepted;
   }
 
   function maybeRequestNewerHistory(projectedBottomOffset = bottomOffsetPx) {
@@ -3173,6 +3241,18 @@
     if (archiveRequestTimer) {
       clearTimeout(archiveRequestTimer);
       archiveRequestTimer = null;
+    }
+    if (
+      settlement !== undefined
+      && settlement !== 'committed'
+      && archiveWindow === null
+      && historyReaderAtUnscrollableTail
+    ) {
+      // A rejected/empty first page left no history world for the logical
+      // reader claim to own. Return to ordinary live-tail following.
+      historyReaderAtUnscrollableTail = false;
+      deferredUnscrollableHistoryPx = 0;
+      applyScroll();
     }
   }
 
@@ -3649,7 +3729,16 @@
     // presentation coordinate once Bash blocks collapse to one visual row.
     // Capture the absolute raw row under the reader before replacing the
     // resident window and restore that same row after rebuilding projection.
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    // A short live screen can fit entirely inside the viewport, leaving
+    // bottomOffsetPx at the live-tail sentinel even after an upward wheel has
+    // accepted an older-history request. This commit is still reader-driven:
+    // force an absolute anchor for backward pages so the newly prepended rows
+    // move above the existing screen instead of pinning the reader back to the
+    // tail. Ordinary live projection rebuilds keep the default follow-tail
+    // behavior.
+    const presentationAnchor = projectBash
+      ? capturePresentationAnchor(options.direction === 'before')
+      : null;
     const previousWinStart = winStart;
     const previousWinEnd = winEnd;
     const previousWindowFirstRow = projectionRowAt(previousWinStart);
@@ -3788,6 +3877,12 @@
     if (onLinesChange) onLinesChange([...rawLines], { source: 'prepend' });
 
     const after = historyPrependSnapshot();
+    const deferredReaderScrollPx = (
+      options.direction === 'before'
+      && historyReaderAtUnscrollableTail
+    )
+      ? Math.max(0, Math.min(deferredUnscrollableHistoryPx, maxOffset()))
+      : 0;
     const corridorCacheValid = preservedProjectedCorridor
       && previousWindowFirstEntryKey !== null
       && previousWindowFirstRawId !== null
@@ -3807,6 +3902,23 @@
             endLine: historyWindowEndLine(state),
           },
         );
+        if (
+          deferredReaderScrollPx > 0
+          && historyReaderAtUnscrollableTail
+          && deferredUnscrollableHistoryPx > 0
+        ) {
+          // First preserve and publish the exact prepend anchor, then replay
+          // the wheel/drag distance that could not exist before history was
+          // resident. This makes one reader gesture both load and enter the
+          // archive without conflating that gesture with the atomic commit.
+          deferredUnscrollableHistoryPx = 0;
+          historyReaderAtUnscrollableTail = false;
+          bottomOffsetPx = Math.min(
+            maxOffset(),
+            bottomOffsetPx + deferredReaderScrollPx,
+          );
+          applyScroll();
+        }
       });
     }
 
@@ -4281,6 +4393,10 @@
 
   function scrollBy(dyPx: number): boolean {
     bottomOffsetPx += dyPx;
+    if (dyPx < 0 && bottomOffsetPx <= 0) {
+      historyReaderAtUnscrollableTail = false;
+      deferredUnscrollableHistoryPx = 0;
+    }
     const windowCovered = applyScroll();
     if (dyPx > 0) maybeRequestOlderHistory();
     else if (dyPx < 0) maybeRequestNewerHistory();
@@ -4314,9 +4430,18 @@
     e.preventDefault();
     e.stopPropagation();
     const delta = -wheelPixels(e);
+    const projectedBottomOffset = bottomOffsetPx + delta;
     bottomOffsetPx = Math.max(0, Math.min(bottomOffsetPx + delta, maxOffset()));
+    if (delta < 0 && bottomOffsetPx <= 0) {
+      historyReaderAtUnscrollableTail = false;
+      deferredUnscrollableHistoryPx = 0;
+    }
     applyScroll();
-    if (delta > 0) maybeRequestOlderHistory();
+    if (delta > 0) maybeRequestOlderHistory(
+      maxOffset() === 0
+        ? deferredUnscrollableHistoryPx + projectedBottomOffset
+        : projectedBottomOffset,
+    );
     else if (delta < 0) maybeRequestNewerHistory();
   }
 
@@ -5080,6 +5205,8 @@
     // Screen-mode flip is a new scroll world; drop any prior stop reason so an
     // alt-screen banner is not confused with a normal-mode ceiling note.
     historyStopReason = 'none';
+    historyReaderAtUnscrollableTail = false;
+    deferredUnscrollableHistoryPx = 0;
     bottomOffsetPx = 0;
     applyScroll();
     emitScrollState();
@@ -5116,6 +5243,8 @@
     rebuildFrom(0);
     rebuildClaudeBashProjection(null);
     recalculateRetainedEstimatedBytes();
+    historyReaderAtUnscrollableTail = false;
+    deferredUnscrollableHistoryPx = 0;
     bottomOffsetPx = 0;
     rebuildWindow(visibleRowRange(0), true);
     contentEpoch++;

@@ -153,6 +153,7 @@ function drainScheduledWork(limit = 2_000): void {
 function mountTermView(options: {
   mode?: ClaudeBashMode;
   onSummary?: SummaryHandler;
+  historyPaging?: "ceiling" | "sliding";
 } = {}): Mounted {
   const target = document.createElement("div");
   target.style.cssText = "position:relative;width:320px;height:240px;";
@@ -172,7 +173,9 @@ function mountTermView(options: {
           : {}),
         claudeBashMode: options.mode ?? "off",
         onClaudeBashSummaryRequest: options.onSummary,
-        // Intentionally omit historyPaging: this verifies sliding is default.
+        // Omit unless a test explicitly exercises the legacy ceiling mode;
+        // the rest of this file therefore continues to verify the default.
+        ...(options.historyPaging ? { historyPaging: options.historyPaging } : {}),
         onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
       },
     }) as Record<string, unknown>;
@@ -419,6 +422,151 @@ afterEach(() => {
 });
 
 describe("TermView sliding archive window", () => {
+  test("replays an upward wheel after loading history for a short Bash-projected live screen", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      liveLines("short-live", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-short-live", 10_000, 1),
+    );
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+    const beforeRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-live-0"));
+    if (!beforeRow) throw new Error("short live reader row was not mounted before history expansion");
+    const beforeY = projectedScreenY(viewport, beforeRow);
+    const prepends: HistoryPrependDetail[] = [];
+    viewport.addEventListener("thumbmux-history-prepend", (event) => {
+      prepends.push((event as CustomEvent<HistoryPrependDetail>).detail);
+    });
+
+    const deferredWheelPx = 84;
+    wheel(viewport, -deferredWheelPx);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+    deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+
+    const prepend = prepends.at(-1);
+    expect(prepend).toBeDefined();
+    expect(prepend?.cacheValid).toBe(true);
+    expect(prepend?.transformStable).toBe(true);
+    expect(prepend?.after.transform).toBe(prepend?.before.transform);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(deferredWheelPx);
+    const afterRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-live-0"));
+    if (!afterRow) throw new Error("short live reader row disappeared after history expansion");
+    expect(projectedScreenY(viewport, afterRow)).toBeCloseTo(beforeY + deferredWheelPx, 5);
+  });
+
+  test("accumulates repeated wheels while a short-screen history request is in flight", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      liveLines("short-repeat", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-short-repeat", 10_000, 1),
+    );
+    const beforeRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-repeat-0"));
+    if (!beforeRow) throw new Error("repeated-wheel anchor row was not mounted");
+    const beforeY = projectedScreenY(viewport, beforeRow);
+
+    wheel(viewport, -42);
+    wheel(viewport, -63);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+    deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(105);
+    const afterRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-repeat-0"));
+    if (!afterRow) throw new Error("repeated-wheel anchor row disappeared");
+    expect(projectedScreenY(viewport, afterRow)).toBeCloseTo(beforeY + 105, 5);
+  });
+
+  test("drops short-screen wheel intent after a retryable history error", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      liveLines("short-retry", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-short-retry", 10_000, 1),
+    );
+    const beforeRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-retry-0"));
+    if (!beforeRow) throw new Error("retry anchor row was not mounted");
+    const beforeY = projectedScreenY(viewport, beforeRow);
+
+    wheel(viewport, -84);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(1);
+    deliverHistoryError();
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+
+    wheel(viewport, -42);
+    expect(historyCalls).toEqual([
+      { direction: "before", cursor: null, limit: 2_000 },
+      { direction: "before", cursor: null, limit: 2_000 },
+    ]);
+    deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(42);
+    const afterRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-retry-0"));
+    if (!afterRow) throw new Error("retry anchor row disappeared");
+    expect(projectedScreenY(viewport, afterRow)).toBeCloseTo(beforeY + 42, 5);
+  });
+
+  test("reclaims an in-flight short-screen request after down cancels the first wheel", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      liveLines("short-reclaim", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-short-reclaim", 10_000, 1),
+    );
+    const beforeRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-reclaim-0"));
+    if (!beforeRow) throw new Error("reclaimed-wheel anchor row was not mounted");
+    const beforeY = projectedScreenY(viewport, beforeRow);
+
+    wheel(viewport, -84);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(1);
+    wheel(viewport, 84);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+    wheel(viewport, -42);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(1);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+
+    deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(42);
+    const afterRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("short-reclaim-0"));
+    if (!afterRow) throw new Error("reclaimed-wheel anchor row disappeared");
+    expect(projectedScreenY(viewport, afterRow)).toBeCloseTo(beforeY + 42, 5);
+  });
+
+  test("does not retain sliding-only short-screen intent in ceiling mode", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(
+      liveLines("short-ceiling", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+    );
+
+    wheel(viewport, -84);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+    deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+    expect(viewport.getAttribute("data-history-paging")).toBe("ceiling");
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+
+    deliverOutput(
+      liveLines("short-ceiling-fresh", 10),
+      { alt: false, mouseSgr: false, mouseAny: false },
+    );
+    expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+    expect(Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .some((row) => row.textContent?.includes("short-ceiling-fresh-9"))).toBe(true);
+  });
+
   test("keeps the raw rendered corridor and compositor transform stable across prepends", async () => {
     const { viewport } = mountTermView();
     await tick();
