@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.3-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.4-dist`.
+
+## v0.18.4 — 2026-08-25
+
+### Fixed
+
+- **History-prepend diagnostics now fail closed when a compact Claude Bash
+  seam changes presentation geometry.** The raw rendered corridor and its SGR
+  entry state can remain reusable while the compositor origin moves by one
+  third of a terminal row to preserve the same absolute reader anchor. Such an
+  event now reports `cacheValid: false` unless its transform is also unchanged,
+  instead of publishing a false cache success. A bounded 10,000-row regression
+  crosses that Bash seam while evicting the opposite edge and proves the same
+  raw row, text, and screen Y remain stable.
 
 ## v0.18.3 — 2026-08-24
 
