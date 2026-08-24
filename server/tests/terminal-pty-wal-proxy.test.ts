@@ -415,9 +415,9 @@ describe("direct child PTY durable WAL proxy", () => {
     const parsed = parseTerminalPtyWalProxyConfig({
       directory: "/tmp/thumbmux-pty-schema",
       identity: {
-        session: "cc-hs-server-1",
+        session: "durable-agent-1",
         instanceId: "instance-1",
-        paneTarget: "=cc-hs-server-1:0.0",
+        paneTarget: "=durable-agent-1:0.0",
       },
       argv: ["bash", "--noprofile"],
       env: { EMPTY_IS_VALID: "" },
@@ -426,9 +426,9 @@ describe("direct child PTY durable WAL proxy", () => {
     expect(parsed.env.EMPTY_IS_VALID).toBe("");
 
     expect(parseTerminalWalIdentity({
-      session: "cc-hs-server-1",
+      session: "durable-agent-1",
       instanceId: "instance-1",
-      paneTarget: "=cc-hs-server-1:0.0",
+      paneTarget: "=durable-agent-1:0.0",
       tmuxServerPid: 123,
       sessionCreated: 456,
       sessionId: "$1",
@@ -442,9 +442,9 @@ describe("direct child PTY durable WAL proxy", () => {
       generation: "0123456789abcdef",
     });
     expect(() => parseTerminalWalIdentity({
-      session: "cc-hs-server-1",
+      session: "durable-agent-1",
       instanceId: "instance-1",
-      paneTarget: "=cc-hs-server-1:0.0",
+      paneTarget: "=durable-agent-1:0.0",
       tmuxServerPid: 123,
       sessionCreated: 456,
       generation: "missing-physical-ids",

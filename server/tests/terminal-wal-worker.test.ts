@@ -36,9 +36,9 @@ function makeRoot(): string {
 
 function identity(overrides: Partial<TerminalWalIdentity> = {}): TerminalWalIdentity {
   return {
-    session: "cc-hs-server-1",
+    session: "durable-agent-1",
     instanceId: "terminal-incarnation-1",
-    paneTarget: "=cc-hs-server-1:0.0",
+    paneTarget: "=durable-agent-1:0.0",
     tmuxServerPid: 1234,
     sessionCreated: 1_700_000_000,
     ...overrides,
@@ -232,7 +232,7 @@ describe("terminal WAL stdin worker and controller", () => {
     await first.worker.stop();
 
     const secondIdentity = identity({
-      paneTarget: "=cc-hs-server-1:2.1",
+      paneTarget: "=durable-agent-1:2.1",
       tmuxServerPid: 5678,
       sessionCreated: 1_700_000_999,
     });

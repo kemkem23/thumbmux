@@ -545,8 +545,8 @@ ways to start it:
 
 | spawn mode | `alt` | `mouseSgr` | history after a long answer |
 |---|:---:|:---:|---:|
-| `--no-alt-screen` (Inline; kemcortex default **until** 2026-08-15) | 0 | **1** | **15** — flat, nothing new retained |
-| `--minimal` (kemcortex default **since** 2026-08-15) | 0 | **0** | **555** — grows with the conversation |
+| `--no-alt-screen` (inline mode) | 0 | **1** | **15** — flat, nothing new retained |
+| `--minimal` | 0 | **0** | **555** — grows with the conversation |
 | `--fullscreen` | 1 | 1 | 0 — by design, alt-screen keeps none |
 
 The first row is the trap this section describes: not on the alternate

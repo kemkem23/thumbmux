@@ -45,9 +45,9 @@ function makeDirectory(): string {
 
 function identity(overrides: Partial<TerminalWalIdentity> = {}): TerminalWalIdentity {
   return {
-    session: "cc-hs-server-1",
+    session: "durable-agent-1",
     instanceId: "terminal-control-incarnation",
-    paneTarget: "=cc-hs-server-1:0.0",
+    paneTarget: "=durable-agent-1:0.0",
     tmuxServerPid: 4321,
     sessionCreated: 1_700_000_000,
     ...overrides,
@@ -56,11 +56,11 @@ function identity(overrides: Partial<TerminalWalIdentity> = {}): TerminalWalIden
 
 function source(overrides: Partial<TerminalControlSourceIdentity> = {}): TerminalControlSourceIdentity {
   return {
-    session: "cc-hs-server-1",
+    session: "durable-agent-1",
     sessionId: "$9",
     windowId: "@42",
     paneId: "%42",
-    paneTarget: "=cc-hs-server-1:0.0",
+    paneTarget: "=durable-agent-1:0.0",
     tmuxServerPid: 4321,
     sessionCreated: 1_700_000_000,
     geometry: { cols: 80, rows: 24 },
@@ -104,7 +104,7 @@ function makeRecorder(options: {
 async function ready(recorder: TerminalControlWalRecorder, fake: FakeControlProcess): Promise<void> {
   const starting = recorder.start();
   fake.stdout.write("%begin 1700000000 1 0\n%end 1700000000 1 0\n");
-  fake.stdout.write("%session-changed $9 cc-hs-server-1\n");
+  fake.stdout.write("%session-changed $9 durable-agent-1\n");
   await starting;
 }
 
@@ -184,7 +184,7 @@ describe("ordered tmux control WAL recorder", () => {
       "-f",
       "read-only,ignore-size,pause-after=1",
       "-t",
-      "=cc-hs-server-1:0.0",
+      "=durable-agent-1:0.0",
     ]]);
 
     fake.stdout.write("%extended-output %42 0 : before\\015\\012\n");
@@ -275,10 +275,10 @@ describe("ordered tmux control WAL recorder", () => {
     const directory = makeDirectory();
     const { fake, recorder } = makeRecorder({
       directory,
-      resolved: source({ paneId: "%99", paneTarget: "=cc-hs-server-1:0.1" }),
+      resolved: source({ paneId: "%99", paneTarget: "=durable-agent-1:0.1" }),
     });
     const starting = recorder.start();
-    fake.stdout.write("%begin 1 1 0\n%end 1 1 0\n%session-changed $9 cc-hs-server-1\n");
+    fake.stdout.write("%begin 1 1 0\n%end 1 1 0\n%session-changed $9 durable-agent-1\n");
     await expect(starting).rejects.toThrow("exact WAL pane target");
     expect(fake.stdout.isPaused()).toBe(true);
     expect(existsSync(resolveTerminalWalPaths(directory).walPath)).toBe(false);
