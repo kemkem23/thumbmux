@@ -99,16 +99,22 @@ original physical wrapping so history is not silently rewritten
 ([details](docs/reflow.md)).
 
 For Claude Code sessions, `SessionView` also offers a three-state Bash view:
-**OFF** keeps the pane verbatim, **HIDE** replaces a recognized Bash call with
-one local row, and **HAIKU** asks an optional host adapter for a short summary.
+**SHOW** keeps the pane verbatim, **HIDE** replaces each recognized consecutive
+Bash group with a green `hidden bash` divider one third of a terminal row high,
+and **DISTILL** asks an optional host adapter for a short summary. The three
+choices open directly to the left of the BASH action instead of cycling modes.
 Detection is deliberately fail-open outside a known normal screen or when the
-Claude header/result/boundary pattern is incomplete. Only completed blocks in
-the real viewport are offered to the host; active commands are never sent.
+Claude header/result/boundary pattern is incomplete. A fresh Distill view offers
+at most its newest ten completed groups; while it remains open, each coalesced
+live update offers only its newest newly-completed group. Scrolling creates no
+summary work, and an active tail holds its whole adjacent group until completion.
 Copy, search, history, retention, and ANSI parsing continue to use the original
-rows. thumbmux itself does not choose or invoke a model—the host owns redaction,
-lifecycle checks, throttling, caching, and transport. The low-level Claude Bash
-detector/projection exports are experimental because the upstream terminal
-layout may change; see [the app adapter contract](docs/app.md#22-session-metadata-panels-uploads-preferences-and-terminal-props).
+rows. Virtual scroll, cursor, search jumps, history anchors, and retention-gap
+markers use the variable-height presentation coordinates. thumbmux itself does
+not choose or invoke a model—the host owns redaction, lifecycle checks,
+throttling, caching, and transport. The low-level Claude Bash detector/projection
+exports are experimental because the upstream terminal layout may change; see
+[the app adapter contract](docs/app.md#22-session-metadata-panels-uploads-preferences-and-terminal-props).
 
 <p align="center">
   <img src="docs/media/term-agent.png" width="360" alt="Agent session: colored diff, test results, tappable URL" />

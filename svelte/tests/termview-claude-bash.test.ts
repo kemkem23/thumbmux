@@ -214,9 +214,13 @@ function mountView(
   return entry;
 }
 
-function deliver(lines: readonly string[], replace = true): void {
+function deliver(
+  lines: readonly string[],
+  replace = true,
+  cursor: { row: number; col: number } | null = null,
+): void {
   if (!sessionCallback) throw new Error('TermView did not subscribe');
-  sessionCallback(lines.join('\n'), 'output', null, {
+  sessionCallback(lines.join('\n'), 'output', cursor, {
     source: 'full',
     replace,
     screen: { alt: false, mouseSgr: false, mouseAny: false },
@@ -244,6 +248,23 @@ function wheelUp(viewport: HTMLElement, pixels = 1_000_000): void {
     cancelable: true,
   }));
   flushSync();
+}
+
+function layerTranslateY(viewport: HTMLElement): number {
+  const transform = viewport.querySelector<HTMLElement>('.mtv-layer')?.style.transform ?? '';
+  const match = /translate3d\(0(?:px)?,\s*(-?\d+(?:\.\d+)?)px,\s*0(?:px)?\)/.exec(transform);
+  if (!match?.[1]) throw new Error(`missing layer translate: ${transform}`);
+  return Number(match[1]);
+}
+
+function projectedScreenY(viewport: HTMLElement, row: HTMLElement): number {
+  const first = viewport.querySelector<HTMLElement>('.mtv-line');
+  if (!first) throw new Error('virtual window has no first row');
+  return (
+    Number(row.getAttribute('data-presentation-top'))
+    - Number(first.getAttribute('data-presentation-top'))
+    + layerTranslateY(viewport)
+  );
 }
 
 function asTouchList(points: Array<{ clientX: number; clientY: number }>): TouchList {
@@ -309,12 +330,23 @@ describe('TermView Claude Bash projection', () => {
     expect(viewport.getAttribute('data-total')).toBe('4');
     expect(viewport.getAttribute('data-raw-total')).toBe('7');
     const placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
-    expect(placeholder?.textContent).toContain('Bash ซ่อนอยู่ · 4 แถว');
+    expect(placeholder?.textContent).toBe('hidden bash');
     expect(placeholder?.getAttribute('data-raw-start')).toBe('1');
     expect(placeholder?.getAttribute('data-raw-end')).toBe('5');
+    expect(placeholder?.classList.contains('mtv-bash-hidden')).toBe(true);
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    expect(lineHeight).toBe(21);
+    expect(Number(placeholder?.getAttribute('data-presentation-top'))).toBe(lineHeight);
+    expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight / 3);
+    expect(placeholder?.style.height).toBe(`${lineHeight / 3}px`);
 
     const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="5"]');
     expect(boundary?.textContent).toContain('ต่อไป');
+    expect(Number(boundary?.getAttribute('data-presentation-top'))).toBe(
+      lineHeight + lineHeight / 3,
+    );
+    expect(viewport.getAttribute('data-presentation-height')).toBe('70');
     // Output ends in SGR red with no reset. The visible boundary must inherit
     // that state even though every Bash output row is visually absent.
     expect(boundary?.innerHTML).toContain('color:#aa0000');
@@ -332,7 +364,7 @@ describe('TermView Claude Bash projection', () => {
     expect(viewport.querySelector('[data-testid="term-search-match"]')?.textContent).toContain('1 matches');
     expect(
       viewport.querySelector('.mtv-bash-placeholder .search-active')?.textContent,
-    ).toContain('Bash ซ่อนอยู่');
+    ).toContain('hidden bash');
   });
 
   test('placeholder uses neutral UI style while hidden raw rows still carry SGR and OSC state', async () => {
@@ -346,7 +378,7 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
 
     const placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
-    expect(placeholder?.textContent).toContain('Bash ซ่อนอยู่');
+    expect(placeholder?.textContent).toContain('hidden bash');
     expect(placeholder?.querySelector('a')).toBeNull();
     expect(placeholder?.innerHTML).not.toContain('color:#000000');
     expect(placeholder?.innerHTML).not.toContain('opacity:0.7');
@@ -354,6 +386,164 @@ describe('TermView Claude Bash projection', () => {
     const following = viewport.querySelector<HTMLElement>('[data-raw-start="3"]');
     expect(following?.innerHTML).toContain('color:#aa0000');
     expect(following?.querySelector('a')?.getAttribute('href')).toBe('https://wrong.example');
+  });
+
+  test('many one-third hide dividers have exact cumulative height and leave no phantom rows', async () => {
+    const { viewport } = mountView('hide', { height: 63 });
+    const blockCount = 100;
+    const lines = Array.from({ length: blockCount }, (_, index) => [
+      `● Bash(printf compact-${index})`,
+      `  ⎿  output-${index}`,
+      `● semantic-boundary-${index}`,
+    ]).flat();
+    deliver(lines);
+    await settleUi();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    const markerHeight = lineHeight / 3;
+    const expectedHeight = blockCount * (markerHeight + lineHeight);
+    expect(viewport.getAttribute('data-total')).toBe(String(blockCount * 2));
+    expect(Number(viewport.getAttribute('data-presentation-height'))).toBe(expectedHeight);
+
+    const finalBoundary = viewport.querySelector<HTMLElement>(
+      `[data-raw-start="${lines.length - 1}"]`,
+    );
+    expect(Number(finalBoundary?.getAttribute('data-presentation-top'))).toBe(
+      expectedHeight - lineHeight,
+    );
+    expect(Number(finalBoundary?.getAttribute('data-presentation-height'))).toBe(lineHeight);
+
+    wheelUp(viewport);
+    await settleUi();
+    const firstMarker = viewport.querySelector<HTMLElement>('[data-raw-start="0"]');
+    const firstBoundary = viewport.querySelector<HTMLElement>('[data-raw-start="2"]');
+    expect(firstMarker?.style.height).toBe(`${markerHeight}px`);
+    expect(Number(firstBoundary?.getAttribute('data-presentation-top'))).toBe(markerHeight);
+    expect(viewport.querySelector<HTMLElement>('.mtv-layer')?.style.transform)
+      .toBe('translate3d(0, 0.00px, 0)');
+  });
+
+  test('search jump centres a raw hit inside a one-third marker in presentation pixels', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const prefix = Array.from({ length: 80 }, (_, index) => `prefix-${index}`);
+    const suffix = Array.from({ length: 80 }, (_, index) => `suffix-${index}`);
+    deliver([
+      ...prefix,
+      '● Bash(printf geometry-needle)',
+      '  ⎿  geometry-needle-output',
+      '● semantic-boundary',
+      ...suffix,
+    ]);
+    await settleUi();
+
+    viewport.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'f', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    flushSync();
+    const input = viewport.querySelector<HTMLInputElement>('[data-testid="term-search-input"]');
+    if (!input) throw new Error('search input did not open');
+    input.value = 'geometry-needle-output';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await settleUi();
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter', bubbles: true, cancelable: true,
+    }));
+    await settleUi();
+
+    const marker = viewport.querySelector<HTMLElement>('.mtv-bash-hidden');
+    if (!marker) throw new Error('search jump did not mount the Bash marker');
+    expect(marker.querySelector('.search-active')?.textContent).toContain('hidden bash');
+    const contentHeight = Number(viewport.getAttribute('data-presentation-height'));
+    const rowTop = Number(marker.getAttribute('data-presentation-top'));
+    const rowHeight = Number(marker.getAttribute('data-presentation-height'));
+    const maxOffset = Math.max(0, contentHeight - 120);
+    const targetScrollTop = Math.max(0, Math.min(rowTop - (120 / 2 - rowHeight / 2), maxOffset));
+    expect(Math.abs(
+      Number(viewport.getAttribute('data-bottom-offset')) - (maxOffset - targetScrollTop),
+    )).toBeLessThanOrEqual(0.5); // diagnostics intentionally round to whole pixels
+  });
+
+  test('cursor after a compact marker uses fractional presentation top and never paints inside it', async () => {
+    const { viewport } = mountView('hide');
+    const lines = [
+      'before',
+      '● Bash(printf cursor-hidden)',
+      '  ⎿  hidden-output',
+      '● semantic-boundary',
+      'after',
+    ];
+    // lastContent=4; cursor.row=1 targets raw row 3, immediately after Bash.
+    deliver(lines, true, { row: 1, col: 0 });
+    await settleUi();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    const marker = viewport.querySelector<HTMLElement>('.mtv-bash-hidden');
+    const boundary = viewport.querySelector<HTMLElement>('[data-raw-start="3"]');
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(marker?.style.height).toBe(`${lineHeight / 3}px`);
+    expect(Number(boundary?.getAttribute('data-presentation-top'))).toBe(
+      lineHeight + lineHeight / 3,
+    );
+    expect(cursor?.style.top).toBe(`${lineHeight + lineHeight / 3}px`);
+    expect(cursor?.style.height).toBe(`${lineHeight}px`);
+
+    // A terminal cursor reported on a raw row inside hidden Bash must not paint
+    // a full-height caret over the synthetic one-third divider.
+    deliver(lines, true, { row: 2, col: 0 });
+    await settleUi();
+    expect(viewport.querySelector('[data-testid="mtv-cursor"]')).toBeNull();
+  });
+
+  test('show-hide-show toggle preserves the same post-Bash raw anchor on screen', async () => {
+    const { props, viewport } = mountView('hide', { height: 120 });
+    const prefix = Array.from({ length: 20 }, (_, index) => `prefix-${index}`);
+    const suffix = Array.from({ length: 180 }, (_, index) => `anchor-${index}`);
+    deliver([
+      ...prefix,
+      '● Bash(printf toggle-anchor)',
+      '  ⎿  hidden-output',
+      '● semantic-boundary',
+      ...suffix,
+    ]);
+    await settleUi();
+
+    const targetText = 'anchor-40';
+    const initialTarget = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-line'))
+      .find((row) => row.textContent === targetText);
+    // Initially pinned to the tail, so anchor-80 is outside the mounted window.
+    expect(initialTarget).toBeUndefined();
+    const targetRaw = prefix.length + 3 + 40;
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    const hiddenTargetTop = (
+      prefix.length * lineHeight
+      + lineHeight / 3
+      + lineHeight
+      + 40 * lineHeight
+    );
+    const maxOffset = Number(viewport.getAttribute('data-presentation-height')) - 120;
+    const desiredScrollTop = hiddenTargetTop - 36;
+    wheelUp(viewport, maxOffset - desiredScrollTop);
+    await settleUi();
+
+    let target = viewport.querySelector<HTMLElement>(`[data-raw-start="${targetRaw}"]`);
+    if (!target) throw new Error('target anchor did not enter the hide viewport');
+    const absoluteRowId = target.getAttribute('data-line-id');
+    const hiddenY = projectedScreenY(viewport, target);
+
+    flushSync(() => { props.claudeBashMode = 'off'; });
+    await settleUi();
+    target = viewport.querySelector<HTMLElement>(`[data-line-id="${absoluteRowId}"]`);
+    if (!target) throw new Error('raw anchor was not retained after show');
+    const shownY = projectedScreenY(viewport, target);
+    expect(Math.abs(shownY - hiddenY)).toBeLessThanOrEqual(0.01);
+    expect(viewport.querySelector('.mtv-bash-hidden')).toBeNull();
+
+    flushSync(() => { props.claudeBashMode = 'hide'; });
+    await settleUi();
+    target = viewport.querySelector<HTMLElement>(`[data-line-id="${absoluteRowId}"]`);
+    if (!target) throw new Error('raw anchor was not retained after hide');
+    expect(Math.abs(projectedScreenY(viewport, target) - hiddenY)).toBeLessThanOrEqual(0.01);
+    expect(viewport.querySelector('.mtv-bash-hidden')).not.toBeNull();
   });
 
   test('same-length raw replacement while off cannot reuse a stale hide detection', async () => {
@@ -379,7 +569,7 @@ describe('TermView Claude Bash projection', () => {
     expect(visibleText(viewport)).toEqual(['ordinary-a', 'ordinary-b', 'ordinary-c']);
   });
 
-  test('haiku requests only completed blocks in the real viewport, then keeps row count stable', async () => {
+  test('haiku cold-start requests completed groups independent of viewport, then keeps row count stable', async () => {
     const batches: ClaudeBashSummaryRequest[][] = [];
     const onSummary: SummaryHandler = async (requests) => {
       batches.push([...requests]);
@@ -404,19 +594,145 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
 
     expect(batches).toHaveLength(1);
-    expect(batches[0]?.map((request) => request.command)).toEqual(['printf second']);
+    expect(batches[0]?.map((request) => request.command)).toEqual([
+      'printf first',
+      'printf second',
+    ]);
     expect(viewport.textContent).toContain('Bash · สรุป printf second');
     expect(viewport.getAttribute('data-total')).toBe(visualRowsBefore);
+    const haikuPlaceholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    expect(haikuPlaceholder?.classList.contains('mtv-bash-hidden')).toBe(false);
+    expect(Number(haikuPlaceholder?.getAttribute('data-presentation-height'))).toBe(lineHeight);
+    expect(haikuPlaceholder?.style.height).toBe(`${lineHeight}px`);
 
     wheelUp(viewport);
     await settleUi();
     await settleUi();
-    expect(batches).toHaveLength(2);
-    expect(batches[1]?.map((request) => request.command)).toEqual(['printf first']);
+    expect(batches).toHaveLength(1);
+    expect(viewport.textContent).toContain('Bash · สรุป printf first');
     expect(viewport.getAttribute('data-total')).toBe(visualRowsBefore);
   });
 
-  test('haiku does not request a placeholder mounted only as the render guard row', async () => {
+  test('haiku cold-start admits only the newest ten groups and live delivery coalesces to the newest group', async () => {
+    const batches: ClaudeBashSummaryRequest[][] = [];
+    const onSummary: SummaryHandler = async (requests) => {
+      batches.push([...requests]);
+      return Object.fromEntries(requests.map((request) => [request.id, `สรุป ${request.command}`]));
+    };
+    mountView('haiku', { onSummary });
+    const block = (label: string) => [
+      `● Bash(printf ${label})`,
+      `  ⎿  output-${label}`,
+      `● boundary-${label}`,
+    ];
+    const cold = Array.from({ length: 12 }, (_, index) => block(`cold-${index}`)).flat();
+    deliver(cold);
+    await settleUi();
+    await settleUi();
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.map((request) => request.command)).toEqual(
+      Array.from({ length: 10 }, (_, index) => `printf cold-${index + 2}`),
+    );
+
+    // One coalesced live capture can complete several groups. The open-view
+    // policy intentionally sends only the newest one, never a catch-up queue.
+    deliver([
+      ...cold,
+      ...block('live-12'),
+      ...block('live-13'),
+    ], false);
+    await settleUi();
+    await settleUi();
+
+    expect(batches).toHaveLength(2);
+    expect(batches[1]?.map((request) => request.command)).toEqual(['printf live-13']);
+  });
+
+  test('a live adjacent burst waits for its active tail, then sends one merged group', async () => {
+    const batches: ClaudeBashSummaryRequest[][] = [];
+    mountView('haiku', {
+      onSummary: async (requests) => {
+        batches.push([...requests]);
+        return Object.fromEntries(requests.map((request) => [request.id, 'สรุปแล้ว']));
+      },
+    });
+    const cold = [
+      '● Bash(printf cold)',
+      '  ⎿  cold-output',
+      '● cold-boundary',
+    ];
+    deliver(cold);
+    await settleUi();
+    await settleUi();
+    expect(batches).toHaveLength(1);
+
+    deliver([
+      ...cold,
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      ACTIVE[0]!,
+      '      second-continuation)',
+    ], false);
+    await settleUi();
+    expect(batches).toHaveLength(1);
+
+    deliver([
+      ...cold,
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      '● live-boundary',
+    ], false);
+    await settleUi();
+    await settleUi();
+
+    expect(batches).toHaveLength(2);
+    expect(batches[1]).toHaveLength(1);
+    expect(batches[1]?.[0]).toMatchObject({ blockCount: 2 });
+    expect(batches[1]?.[0]?.command).toContain('[Bash 1/2]');
+    expect(batches[1]?.[0]?.command).toContain('[Bash 2/2]');
+  });
+
+  test('live completions replace the waiting tail item while the cold batch is in flight', async () => {
+    const batches: ClaudeBashSummaryRequest[][] = [];
+    let releaseCold: ((value: ClaudeBashSummaries) => void) | null = null;
+    const coldResult = new Promise<ClaudeBashSummaries>((resolve) => {
+      releaseCold = resolve;
+    });
+    mountView('haiku', {
+      onSummary: (requests) => {
+        batches.push([...requests]);
+        if (batches.length === 1) return coldResult;
+        return Object.fromEntries(requests.map((request) => [request.id, 'สดล่าสุด']));
+      },
+    });
+    const block = (label: string) => [
+      `● Bash(printf ${label})`,
+      `  ⎿  output-${label}`,
+      `● boundary-${label}`,
+    ];
+    const cold = block('cold');
+    deliver(cold);
+    await settleUi();
+    expect(batches).toHaveLength(1);
+
+    deliver([...cold, ...block('queued-old')], false);
+    await settleUi();
+    deliver([...cold, ...block('queued-old'), ...block('queued-new')], false);
+    await settleUi();
+    expect(batches).toHaveLength(1);
+
+    releaseCold?.({ [batches[0]?.[0]?.id ?? '']: 'เย็นเสร็จแล้ว' });
+    await settleUi();
+    await settleUi();
+    expect(batches).toHaveLength(2);
+    expect(batches[1]?.map((request) => request.command)).toEqual(['printf queued-new']);
+  });
+
+  test('haiku cold-start request is independent of render guard rows', async () => {
     const batches: ClaudeBashSummaryRequest[][] = [];
     const { viewport } = mountView('haiku', {
       height: 21,
@@ -429,13 +745,14 @@ describe('TermView Claude Bash projection', () => {
     ]);
     await settleUi();
 
-    // The placeholder immediately above the one-row viewport is mounted to
-    // prevent clipped glyphs, but it is not visible and must cost no model call.
+    // Bootstrap eligibility is semantic rather than viewport-driven: a group
+    // immediately above the one-row viewport still belongs to the newest ten.
     expect(viewport.querySelector('.mtv-bash-placeholder')).not.toBeNull();
-    expect(batches).toHaveLength(0);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.map((request) => request.command)).toEqual(['printf guard']);
   });
 
-  test('haiku ignores transient gesture viewports and requests only the final settled viewport', async () => {
+  test('haiku bootstrap does not depend on transient gesture viewports', async () => {
     const batches: ClaudeBashSummaryRequest[][] = [];
     const { viewport } = mountView('haiku', {
       height: 32,
@@ -455,7 +772,11 @@ describe('TermView Claude Bash projection', () => {
       ...Array.from({ length: 50 }, (_, index) => `middle-b-${index}`),
     ]);
     await settleUi();
-    expect(batches).toHaveLength(0);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.map((request) => request.command)).toEqual([
+      'printf first',
+      'printf transient',
+    ]);
 
     const point = { clientX: 40, clientY: 16 };
     viewport.dispatchEvent(touchEvent('touchstart', [point]));
@@ -470,13 +791,12 @@ describe('TermView Claude Bash projection', () => {
     }));
     flushSync();
     wheelUp(viewport);
-    expect(batches).toHaveLength(0);
+    expect(batches).toHaveLength(1);
 
     viewport.dispatchEvent(touchEvent('touchend', [], [point]));
     await settleUi();
     await settleUi();
     expect(batches).toHaveLength(1);
-    expect(batches[0]?.map((request) => request.command)).toEqual(['printf first']);
   });
 
   test('active styled Bash compacts without a Haiku request', async () => {
@@ -493,6 +813,35 @@ describe('TermView Claude Bash projection', () => {
     (app.refreshGeometry as (() => void) | undefined)?.();
     await settleUi();
     expect(batches).toHaveLength(0);
+  });
+
+  test('Haiku pending and resolved placeholders retain a full terminal-row height', async () => {
+    let resolveSummary: ((value: ClaudeBashSummaries) => void) | null = null;
+    const summary = new Promise<ClaudeBashSummaries>((resolve) => {
+      resolveSummary = resolve;
+    });
+    const { viewport } = mountView('haiku', {
+      onSummary: () => summary,
+    });
+    deliver([
+      '● Bash(printf full-height)',
+      '  ⎿  output',
+      '● semantic-boundary',
+    ]);
+    await settleUi();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    let placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
+    expect(placeholder?.classList.contains('mtv-bash-hidden')).toBe(false);
+    expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight);
+    expect(placeholder?.style.height).toBe(`${lineHeight}px`);
+
+    resolveSummary?.({ [placeholder?.getAttribute('data-bash-id') ?? '']: 'สรุปแล้ว' });
+    await settleUi();
+    await settleUi();
+    placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
+    expect(placeholder?.classList.contains('mtv-bash-hidden')).toBe(false);
+    expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight);
   });
 
   test('a rejected summary settles once to deterministic fallback without a retry storm', async () => {
@@ -580,7 +929,7 @@ describe('TermView Claude Bash projection', () => {
         `● Bash(printf round-${round})`,
         `  ⎿  output-${round}`,
         `● done-${round}`,
-      ]);
+      ], round === 0);
       await settleUi();
       await settleUi();
       expect(viewport.getAttribute('data-claude-bash-requested-count')).toBe('1');
@@ -624,8 +973,9 @@ describe('TermView Claude Bash projection', () => {
     ];
     deliver(first);
     await settleUi();
-    // 512 newest five-row blocks collapse to one row each.
-    expect(viewport.getAttribute('data-total')).toBe(String(first.length - 512 * 4));
+    // The 512 newest five-row blocks are directly adjacent, so first-class
+    // grouping collapses the whole retained burst to one placeholder row.
+    expect(viewport.getAttribute('data-total')).toBe(String(first.length - (512 * 5 - 1)));
 
     const next = [
       ...first.slice(0, -1),
@@ -636,7 +986,7 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
     // The newly detected block ejects the oldest prior placeholder. It must
     // expand to all five raw rows instead of remaining collapsed from cache.
-    expect(viewport.getAttribute('data-total')).toBe(String(next.length - 512 * 4));
+    expect(viewport.getAttribute('data-total')).toBe(String(next.length - (512 * 5 - 1)));
   });
 
   test('retention gaps are hard detector barriers and never form one cross-gap Bash prompt', async () => {
@@ -649,9 +999,14 @@ describe('TermView Claude Bash projection', () => {
       viewport.querySelectorAll<HTMLElement>('.mtv-line'),
       (line) => Number(line.getAttribute('data-raw-end')),
     ));
-    expect(protectedEnd).toBeGreaterThan(1);
+    expect(protectedEnd).toBeGreaterThan(8);
 
     const next = Array.from({ length: 12_100 }, (_, i) => `next-${i}`);
+    // A valid compact group just before the discontinuity calibrates the gap's
+    // absolute position against a preceding one-third row.
+    next[protectedEnd - 6] = '● Bash(printf valid-before-gap)';
+    next[protectedEnd - 5] = '  ⎿  valid-output';
+    next[protectedEnd - 4] = '● valid-semantic-boundary';
     next[protectedEnd - 1] = '● Bash(printf must-not-cross-gap)';
     // 2,100 rows are removed immediately below the protected viewport. Before
     // retention this candidate is > core's 2,000-row limit and fails open;
@@ -662,7 +1017,7 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
 
     expect(viewport.getAttribute('data-raw-total')).toBe('10000');
-    expect(viewport.getAttribute('data-total')).toBe('10000');
+    expect(viewport.getAttribute('data-total')).toBe('9999');
     viewport.dispatchEvent(new WheelEvent('wheel', {
       deltaY: 1_500,
       deltaMode: WheelEvent.DOM_DELTA_PIXEL,
@@ -670,8 +1025,24 @@ describe('TermView Claude Bash projection', () => {
       cancelable: true,
     }));
     flushSync();
-    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
-    expect(viewport.querySelector('[data-gap-marker-rows="2100"]')).not.toBeNull();
+    const compact = viewport.querySelector<HTMLElement>('.mtv-bash-hidden');
+    expect(compact?.getAttribute('data-raw-start')).toBe(String(protectedEnd - 6));
+    expect(Number(compact?.getAttribute('data-presentation-height'))).toBe(7);
+    // Exactly one local Bash group collapsed; the candidate spanning the gap
+    // remained raw because the retention discontinuity is a hard barrier.
+    expect(viewport.querySelectorAll('.mtv-bash-placeholder')).toHaveLength(1);
+
+    const gapMarker = viewport.querySelector<HTMLElement>('[data-gap-marker-rows="2100"]');
+    const gapLine = viewport.querySelector<HTMLElement>('[data-gap-rows="2100"]');
+    const firstLine = viewport.querySelector<HTMLElement>('.mtv-line');
+    if (!gapMarker || !gapLine || !firstLine) throw new Error('gap calibration rows not mounted');
+    expect(Number.parseFloat(gapMarker.style.top)).toBe(
+      Number(gapLine.getAttribute('data-presentation-top'))
+      - Number(firstLine.getAttribute('data-presentation-top')),
+    );
+    expect(Number.parseFloat(gapMarker.style.height)).toBe(
+      Number(gapLine.getAttribute('data-presentation-height')),
+    );
   });
 
   test('history prepend uses projected row count and preserves the mounted raw anchor', async () => {
@@ -685,6 +1056,8 @@ describe('TermView Claude Bash projection', () => {
       .find((line) => line.textContent === 'line-0');
     if (!beforeLine) throw new Error('reader anchor line was not mounted');
     const anchorId = beforeLine.getAttribute('data-line-id');
+    const screenYBefore = projectedScreenY(viewport, beforeLine);
+    const contentHeightBefore = Number(viewport.getAttribute('data-presentation-height'));
     const layer = viewport.querySelector<HTMLElement>('.mtv-layer');
     const transformBefore = layer?.style.transform;
 
@@ -708,6 +1081,21 @@ describe('TermView Claude Bash projection', () => {
     expect(viewport.getAttribute('data-total')).toBe('124');
     const afterLine = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
     expect(afterLine?.textContent).toBe('line-0');
+    if (!afterLine) throw new Error('history prepend dropped the raw anchor');
+    expect(afterLine.getAttribute('data-presentation-top')).toBe('70');
+    expect(Number(viewport.getAttribute('data-presentation-height'))).toBe(
+      contentHeightBefore + 70,
+    );
+    expect(projectedScreenY(viewport, afterLine)).toBe(screenYBefore);
     expect(layer?.style.transform).toBe(transformBefore);
+
+    // The preserved window starts at the old line-0, so reveal the newly
+    // prepended rows only after proving the anchor did not move.
+    wheelUp(viewport);
+    await settleUi();
+    const marker = viewport.querySelector<HTMLElement>('[data-raw-start="1"]');
+    expect(marker?.classList.contains('mtv-bash-hidden')).toBe(true);
+    expect(marker?.getAttribute('data-presentation-top')).toBe('21');
+    expect(marker?.getAttribute('data-presentation-height')).toBe('7');
   });
 });

@@ -7,15 +7,21 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.17.0-dist`.
 
 ### Added
 
-- **Claude Code Bash blocks can be shown raw, collapsed, or summarized by a
-  host-owned service.** `SessionView` adds a Claude-only `bash-mode` action and
-  stores `off | hide | haiku` in the existing preferences adapter. `TermView`
-  detects only high-confidence completed/active Claude Bash layouts on a known
-  normal screen, retains the exact raw rows for copy/search/history/ANSI state,
-  and requests summaries only for completed blocks in the real viewport.
-  `AppAdapters.bashSummaries` is optional; rejection or omission falls back to
-  a deterministic command preview. The new `thumbmux/core` detector/projection
-  exports are experimental because Claude's terminal layout may evolve.
+- **Claude Code Bash calls can be shown raw, collapsed, or distilled by a
+  host-owned service.** `SessionView` adds a Claude-only BASH disclosure whose
+  SHOW / HIDE / DISTILL choices open directly to the left and stores the same
+  `off | hide | haiku` preference values. Consecutive calls separated only by
+  blank presentation rows become one semantic group. HIDE and non-selected
+  DISTILL groups render as a green `hidden bash` divider one third of a terminal
+  row high; `TermView` recalibrates virtual scroll, cursor, search, history
+  anchoring, and gap coordinates to that variable-height projection while the
+  exact raw rows remain canonical for copy/search/history/ANSI state. A fresh
+  DISTILL view requests at most its newest ten completed groups, then requests
+  only the newest group completed by each coalesced live update; scrolling never
+  creates model work, and a group with an active tail waits as a whole.
+  `AppAdapters.bashSummaries` remains optional; rejection or omission falls back
+  to a deterministic command preview. The `thumbmux/core` detector/projection
+  exports remain experimental because Claude's terminal layout may evolve.
 
 ## v0.16.8 — 2026-08-21
 

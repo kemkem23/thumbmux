@@ -238,9 +238,8 @@
     savePrefs({ shortcuts: next });
   }
 
-  function cycleClaudeBashMode(): void {
-    const index = CLAUDE_BASH_MODES.indexOf(claudeBashMode);
-    claudeBashMode = CLAUDE_BASH_MODES[(index + 1) % CLAUDE_BASH_MODES.length] ?? 'off';
+  function setClaudeBashMode(mode: ClaudeBashMode): void {
+    claudeBashMode = mode;
     savePrefs({ claudeBashMode });
   }
 
@@ -589,11 +588,41 @@
       },
       ...(sessionAgent === 'claude' ? [{
         id: 'bash-mode',
-        label: `Bash: ${claudeBashMode.toUpperCase()}`,
+        label: 'BASH',
+        tag: claudeBashMode === 'off'
+          ? 'SHOW'
+          : claudeBashMode === 'hide'
+            ? 'HIDE'
+            : 'DISTILL',
         testid: 'demo-bash-mode',
-        // Keep the menu open so OFF → HIDE → HAIKU can be compared in
-        // place, like the stock repeated-tap font controls.
-        onTap: cycleClaudeBashMode,
+        choicesAria: 'Bash display mode',
+        choices: [
+          {
+            id: 'bash-show',
+            label: 'SHOW',
+            testid: 'demo-bash-show',
+            selected: claudeBashMode === 'off',
+            onTap: () => setClaudeBashMode('off'),
+          },
+          {
+            id: 'bash-hide',
+            label: 'HIDE',
+            testid: 'demo-bash-hide',
+            selected: claudeBashMode === 'hide',
+            onTap: () => setClaudeBashMode('hide'),
+          },
+          {
+            id: 'bash-distill',
+            label: 'DISTILL',
+            testid: 'demo-bash-distill',
+            selected: claudeBashMode === 'haiku',
+            onTap: () => setClaudeBashMode('haiku'),
+          },
+        ],
+        // ActionFab uses the primary button as a disclosure while choices are
+        // present. Keep onTap required so the public FabAction shape remains
+        // source-compatible for existing hosts.
+        onTap: () => {},
       }] satisfies FabAction[] : []),
       {
         id: 'shortcuts',

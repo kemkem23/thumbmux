@@ -2,7 +2,7 @@
   {
     "name": "ActionFab",
     "kind": "component",
-    "signature": "fc40c190d9fe50748a489d9a0077218518fb0c75db260b6f3287bdd1218232d6",
+    "signature": "943fd799284cb5a2d82c5a91b408362a17f6f7052d28e2d87de888a0004c70c8",
     "tier": "F"
   },
   {
@@ -242,7 +242,13 @@
   {
     "name": "FabAction",
     "kind": "type",
-    "signature": "c082b6f93e05ca56ac03b02c0c7b98b56ccd98128a99d4445a3b5cffbf28008f",
+    "signature": "8f6885a6d886da83e55fb3809a2a143bd16aff51bb120b657547e6805b9a3956",
+    "tier": "F"
+  },
+  {
+    "name": "FabActionChoice",
+    "kind": "type",
+    "signature": "12b268e75609aa014d9b71552b56ff69899fb73af7f661f14c0a6e3a467d52a0",
     "tier": "F"
   },
   {
