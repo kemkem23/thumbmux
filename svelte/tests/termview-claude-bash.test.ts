@@ -1293,6 +1293,71 @@ describe('TermView Claude Bash projection', () => {
       ?.getAttribute('data-raw-end')).toBe('5');
   });
 
+  test('history prepend preserves a raw anchor that becomes covered by a Bash marker', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const live = [
+      '  ⎿  split-output-0',
+      '     split-output-1',
+      '     split-output-2',
+      '     split-output-3',
+      '',
+      '● live-boundary',
+      ...Array.from({ length: 115 }, (_, index) => `split-line-${index}`),
+    ];
+    deliver(live);
+    await settleUi();
+    wheelUp(viewport);
+    expect(historyRequests).toBe(1);
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    // Match captureStableHistoryPresentationAnchor: choose the visible,
+    // nonblank raw row nearest the viewport centre. The history page below
+    // reveals that this row was Bash output whose header lived just above the
+    // original capture boundary.
+    const beforeLine = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-line'))
+      .filter((row) => {
+        const y = projectedScreenY(viewport, row);
+        return row.textContent?.includes('split-output-') && y >= 0 && y < 120;
+      })
+      .sort((left, right) => {
+        const leftMid = projectedScreenY(viewport, left)
+          + Number(left.getAttribute('data-presentation-height')) / 2;
+        const rightMid = projectedScreenY(viewport, right)
+          + Number(right.getAttribute('data-presentation-height')) / 2;
+        return Math.abs(leftMid - 60) - Math.abs(rightMid - 60);
+      })[0];
+    if (!beforeLine) throw new Error('split Bash anchor was not mounted');
+    const anchorId = Number(beforeLine.getAttribute('data-line-id'));
+    const screenYBefore = projectedScreenY(viewport, beforeLine);
+
+    if (!sessionCallback) throw new Error('TermView did not subscribe');
+    sessionCallback(JSON.stringify({
+      lines: [
+        ...Array.from({ length: 20 }, (_, index) => `older-${index}`),
+        '● Bash(printf split-history)',
+      ],
+      startLine: 0,
+      hasMore: false,
+    }), 'history');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settleUi();
+
+    expect(viewport.querySelector(`[data-line-id="${anchorId}"]`)).toBeNull();
+    const coveringMarker = Array.from(
+      viewport.querySelectorAll<HTMLElement>('.mtv-bash-placeholder'),
+    ).find((row) => {
+      const absoluteStart = Number(row.getAttribute('data-line-id'));
+      const residentStart = Number(row.getAttribute('data-raw-start'));
+      const residentEnd = Number(row.getAttribute('data-raw-end'));
+      return absoluteStart <= anchorId
+        && anchorId < absoluteStart + residentEnd - residentStart;
+    });
+    if (!coveringMarker) throw new Error('history marker did not cover the raw anchor');
+    expect(coveringMarker.classList.contains('mtv-bash-hidden')).toBe(true);
+    expect(Math.abs(projectedScreenY(viewport, coveringMarker) - screenYBefore))
+      .toBeLessThanOrEqual(0.5);
+  });
+
   test('ceiling-history prepend keeps the same anchor when seam context absorbs a blank', async () => {
     const { viewport } = mountView('hide', { height: 120, historyPaging: 'ceiling' });
     const live = [
