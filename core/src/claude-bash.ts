@@ -696,6 +696,22 @@ export function groupClaudeBashBlocks(
     const status: ClaudeBashBlockStatus = groupBlocks.some((block) => block.status === 'active')
       ? 'active'
       : 'completed';
+    let rawStart = first.rawStart;
+    // Claude normally leaves separator blanks before a top-level Bash call.
+    // Keeping those rows raw puts the compact divider at the bottom of the
+    // apparent gap even though the rule is centred inside its own third-row.
+    // Absorb a proven blank-only prefix so the compact row itself becomes the
+    // complete gap between semantic rows. Capture padding and retention seams
+    // remain raw because there is no continuous semantic row on their left.
+    let leadingStart = rawStart;
+    while (
+      leadingStart > 0
+      && !barrierLines.has(leadingStart)
+      && isBlankPresentationRow(rawLines[leadingStart - 1] ?? '')
+    ) leadingStart -= 1;
+    if (leadingStart > 0 && !barrierLines.has(leadingStart)) {
+      rawStart = leadingStart;
+    }
     let rawEndExclusive = last.rawEndExclusive;
     // parseCandidate deliberately leaves separator blanks before the following
     // semantic boundary raw. Once the whole burst is grouped, absorb those
@@ -723,11 +739,11 @@ export function groupClaudeBashBlocks(
     return Object.freeze({
       id: fingerprint,
       fingerprint,
-      lineCount: rawEndExclusive - first.rawStart,
-      rawStart: first.rawStart,
+      lineCount: rawEndExclusive - rawStart,
+      rawStart,
       rawEndExclusive,
       status,
-      sourceRange: range(first.rawStart, rawEndExclusive),
+      sourceRange: range(rawStart, rawEndExclusive),
       blockCount: groupBlocks.length,
       blocks: Object.freeze([...groupBlocks]),
       command: command.text,

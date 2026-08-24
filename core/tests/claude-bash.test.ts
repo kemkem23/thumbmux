@@ -270,6 +270,47 @@ describe('Claude Bash groups', () => {
     });
   });
 
+  test('absorbs proven leading and trailing separator blanks so the divider is the whole gap', () => {
+    const separated = [
+      '● อธิบายก่อนหน้า',
+      '',
+      '\x1b[0m \u00a0',
+      '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(printf compact)',
+      '  ⎿  compact-output',
+      '\x1b[0m   ',
+      '\u00a0',
+      '● อธิบายถัดไป',
+    ];
+    const detection = detectClaudeBashBlocks(separated);
+    expect(detection.blocks[0]?.sourceRange).toEqual({ startLine: 3, endLine: 5 });
+
+    const [group] = groupClaudeBashBlocks(separated, detection.blocks);
+    expect(group).toMatchObject({
+      sourceRange: { startLine: 1, endLine: 7 },
+      lineCount: 6,
+      rawStart: 1,
+      rawEndExclusive: 7,
+    });
+
+    const projection = projectClaudeBashGroupedLines(separated, { mode: 'hide', detection });
+    expect(projection.lines).toEqual([
+      '● อธิบายก่อนหน้า',
+      'Bash ซ่อนอยู่ · 6 แถว',
+      '● อธิบายถัดไป',
+    ]);
+    expect(projection.rawToVisualRow).toEqual([0, 1, 1, 1, 1, 1, 1, 2]);
+
+    const leadingCapturePadding = separated.slice(1);
+    const leadingDetection = detectClaudeBashBlocks(leadingCapturePadding);
+    const [leadingGroup] = groupClaudeBashBlocks(leadingCapturePadding, leadingDetection.blocks);
+    expect(leadingGroup?.rawStart).toBe(2);
+
+    const acrossRetentionGap = groupClaudeBashBlocks(separated, detection.blocks, {
+      barrierLines: [2],
+    });
+    expect(acrossRetentionGap[0]?.rawStart).toBe(3);
+  });
+
   test('semantic rows and retention barriers split otherwise adjacent groups', () => {
     const semantic = [
       '● Bash(printf first)',

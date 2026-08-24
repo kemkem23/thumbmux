@@ -191,6 +191,11 @@ Bash summaries. Omitting it makes no model call: `off` remains the default,
 `hide` is local projection, and `haiku` settles to a deterministic command
 preview when the adapter is absent, rejects, or omits an id. Consecutive
 high-confidence calls separated only by blank presentation rows are one group.
+A proven blank-only prefix and suffix are included in that compact group's raw
+range so its left-aligned `hidden bash` label and right-hand one-pixel rule sit
+at the centre of the complete separator gap. Capture-start padding and any
+blank range touching a retention barrier remain raw; the detector does not infer
+missing semantic context across either boundary.
 A fresh `haiku` view requests no more than its newest ten completed groups; each
 later coalesced live update requests only its newest newly-completed group, and
 scrolling never schedules adapter work. An active tail holds the whole group.
