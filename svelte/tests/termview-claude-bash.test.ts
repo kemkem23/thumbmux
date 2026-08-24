@@ -732,6 +732,78 @@ describe('TermView Claude Bash projection', () => {
     expect(batches[1]?.map((request) => request.command)).toEqual(['printf queued-new']);
   });
 
+  test('a hung summary adapter times out and releases the live-latest lane', async () => {
+    const batches: ClaudeBashSummaryRequest[][] = [];
+    const never = new Promise<ClaudeBashSummaries>(() => {});
+    mountView('haiku', {
+      onSummary: (requests) => {
+        batches.push([...requests]);
+        if (batches.length === 1) return never;
+        return Object.fromEntries(requests.map((request) => [request.id, 'เดินต่อหลัง timeout']));
+      },
+    });
+
+    const originalSetTimeout = globalThis.setTimeout.bind(globalThis);
+    const originalClearTimeout = globalThis.clearTimeout.bind(globalThis);
+    const fakeHandle = 987_654_321 as unknown as ReturnType<typeof setTimeout>;
+    let watchdog: (() => void) | null = null;
+    Object.defineProperty(globalThis, 'setTimeout', {
+      configurable: true,
+      writable: true,
+      value: ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === 305_000) {
+          if (typeof handler !== 'function') throw new Error('watchdog must be callable');
+          watchdog = () => handler(...args);
+          return fakeHandle;
+        }
+        return originalSetTimeout(handler, delay, ...args);
+      }) as typeof setTimeout,
+    });
+    Object.defineProperty(globalThis, 'clearTimeout', {
+      configurable: true,
+      writable: true,
+      value: ((handle?: ReturnType<typeof setTimeout>) => {
+        if (handle !== fakeHandle) originalClearTimeout(handle);
+      }) as typeof clearTimeout,
+    });
+
+    const block = (label: string) => [
+      `● Bash(printf ${label})`,
+      `  ⎿  output-${label}`,
+      `● boundary-${label}`,
+    ];
+    try {
+      const cold = block('hung-cold');
+      deliver(cold);
+      await settleUi();
+      expect(batches).toHaveLength(1);
+
+      deliver([...cold, ...block('latest-after-hang')], false);
+      await settleUi();
+      expect(batches).toHaveLength(1);
+      expect(watchdog).not.toBeNull();
+
+      watchdog?.();
+      await settleUi();
+      await settleUi();
+      expect(batches).toHaveLength(2);
+      expect(batches[1]?.map((request) => request.command)).toEqual([
+        'printf latest-after-hang',
+      ]);
+    } finally {
+      Object.defineProperty(globalThis, 'setTimeout', {
+        configurable: true,
+        writable: true,
+        value: originalSetTimeout,
+      });
+      Object.defineProperty(globalThis, 'clearTimeout', {
+        configurable: true,
+        writable: true,
+        value: originalClearTimeout,
+      });
+    }
+  });
+
   test('haiku cold-start request is independent of render guard rows', async () => {
     const batches: ClaudeBashSummaryRequest[][] = [];
     const { viewport } = mountView('haiku', {
