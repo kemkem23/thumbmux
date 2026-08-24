@@ -189,14 +189,20 @@ complete-set guarantee, pin the `-dist` tag; the artifact at a tag never changes
 `AppAdapters.bashSummaries` is the optional, host-owned boundary for Claude Code
 Bash summaries. Omitting it makes no model call: `off` remains the default,
 `hide` is local projection, and `haiku` settles to a deterministic command
-preview when the adapter is absent, rejects, or omits an id. `TermView` requests
-only high-confidence completed blocks in a settled real viewport; active calls,
-alternate/unknown screens, incomplete captures, and ambiguous layouts stay raw
-or use the local active placeholder. The source rows remain canonical for copy,
-search, history, retention, raw/visual coordinate mapping, and ANSI/OSC state in
-all modes. The host owns model choice, authentication, redaction, lifecycle
-checks, throttling, and durable caching. The low-level `ClaudeBash*`,
-`detectClaudeBashBlocks`, and `projectClaudeBashLines` core exports are tier X:
+preview when the adapter is absent, rejects, or omits an id. Consecutive
+high-confidence calls separated only by blank presentation rows are one group.
+A fresh `haiku` view requests no more than its newest ten completed groups; each
+later coalesced live update requests only its newest newly-completed group, and
+scrolling never schedules adapter work. An active tail holds the whole group.
+Alternate/unknown screens, incomplete captures, and ambiguous layouts stay raw
+or use the local active placeholder. Compact `hide` and suppressed `haiku` rows
+occupy one third of a terminal row in the presentation coordinate system. The
+source rows remain canonical for copy, search, history, retention, raw/visual
+mapping, and ANSI/OSC state in all modes. The host owns model choice,
+authentication, redaction, lifecycle checks, throttling, and durable caching.
+The low-level `ClaudeBash*`, `detectClaudeBashBlocks`,
+`groupClaudeBashBlocks`, `projectClaudeBashLines`, and
+`projectClaudeBashGroupedLines` core exports are tier X:
 Claude controls the painted layout, so those detector/projection contracts are
 explicitly experimental even though omission behavior in the app shell is
 additive.

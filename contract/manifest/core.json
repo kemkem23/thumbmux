@@ -66,6 +66,42 @@
     "tier": "X"
   },
   {
+    "name": "ClaudeBashGroup",
+    "kind": "type",
+    "signature": "514574b075456dfc418021f445155ed7fbee6a0e708d8aa3507a0bc3fa3ccc9d",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashGroupedProjection",
+    "kind": "type",
+    "signature": "6e9c5fb554119ab8e30ca06497b82c6f442f3239e7b00de90508bd904b3d0598",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashGroupedProjectionOptions",
+    "kind": "type",
+    "signature": "e346f20dec38a8677ff86bd440e012aef5432c526a0d3c5852b80e6507919a84",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashGroupedProjectionRow",
+    "kind": "type",
+    "signature": "abba900b342918e821eaaa852496db2e262577250f07a0d7f8d35157104d251a",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashGroupedSummaryRequest",
+    "kind": "type",
+    "signature": "447d59758043222b2a138ace3591c703fd228b5d28f6ab27c9804c484075355c",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashGroupingOptions",
+    "kind": "type",
+    "signature": "eac92f330dc1b632e001cf63440aa7fab854f0cb960c527ca77b5ff7ab9c5b85",
+    "tier": "X"
+  },
+  {
     "name": "ClaudeBashLineRange",
     "kind": "type",
     "signature": "32d6dfc0a614b8765adc97c69b8e32aee2293685863895a49b07aa7abc6be29b",
@@ -111,6 +147,12 @@
     "name": "ClaudeBashSummaryRequest",
     "kind": "type",
     "signature": "82b9d84f97730aa27b451e4bfee1d60f6890b5f2638b7a999f2463db34a79e84",
+    "tier": "X"
+  },
+  {
+    "name": "ClaudeBashSummaryState",
+    "kind": "type",
+    "signature": "9e4e8ca6d1ce740200aeb3e60a073a741e143d10b5e70fc3ce255208319e3e42",
     "tier": "X"
   },
   {
@@ -630,6 +672,12 @@
     "tier": "F"
   },
   {
+    "name": "groupClaudeBashBlocks",
+    "kind": "value",
+    "signature": "c1e970c758740249ffdbd52d079bffcd0d81b5c90a3314ad700b48835750f464",
+    "tier": "X"
+  },
+  {
     "name": "hexToRgb",
     "kind": "value",
     "signature": "4ca5411b6c153faf68a277d61452f220e91b8de9621626aadc1482983cd63059",
@@ -754,6 +802,12 @@
     "kind": "value",
     "signature": "7317016c15250832563c0fb5cde557efa980e23d767db545fed7b0c33b1432bb",
     "tier": "F"
+  },
+  {
+    "name": "projectClaudeBashGroupedLines",
+    "kind": "value",
+    "signature": "b5a730050698e059de31d128db0b71782931df7b066196c2b89b1ca6b2165ac0",
+    "tier": "X"
   },
   {
     "name": "projectClaudeBashLines",

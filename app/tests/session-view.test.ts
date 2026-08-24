@@ -1512,7 +1512,7 @@ describe('mountable terminal views', () => {
     ]);
   });
 
-  test('Claude Bash action cycles OFF, HIDE, HAIKU and persists the shared preference', async () => {
+  test('Claude Bash flyout selects SHOW, HIDE, or DISTILL directly and persists the shared preference', async () => {
     const saved: Array<Partial<ThumbmuxPrefs>> = [];
     let publishPrefs: ((prefs: ThumbmuxPrefs) => void) | undefined;
     const { target } = mountView(SessionView, {
@@ -1536,29 +1536,44 @@ describe('mountable terminal views', () => {
     const slots = target.querySelector<HTMLElement>('.slots');
     const action = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
     if (!slots || !action) throw new Error('Claude Bash mode action did not render');
-    expect(action.textContent?.trim()).toBe('Bash: HIDE');
+    expect(action.textContent?.trim()).toBe('BASH HIDE');
     expect(action.getAttribute('aria-hidden')).toBe('false');
+    expect(action.getAttribute('aria-expanded')).toBe('false');
 
     flushSync(() => action.click());
     await tick();
+    expect(saved).toEqual([]);
+    expect(action.getAttribute('aria-expanded')).toBe('true');
+    const distill = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-distill"]');
+    if (!distill) throw new Error('Claude Bash DISTILL choice did not render');
+    expect(distill.getAttribute('aria-pressed')).toBe('false');
+    flushSync(() => distill.click());
+    await tick();
     expect(saved.at(-1)).toEqual({ claudeBashMode: 'haiku' });
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('Bash: HAIKU');
-    expect(slots.classList.contains('open')).toBe(true);
+      .toBe('BASH DISTILL');
+    expect(slots.classList.contains('open')).toBe(false);
 
-    const haikuAction = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
-    if (!haikuAction) throw new Error('Claude Bash HAIKU action did not render');
-    flushSync(() => haikuAction.click());
+    await openFab(target);
+    const distillAction = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
+    if (!distillAction) throw new Error('Claude Bash DISTILL action did not render');
+    flushSync(() => distillAction.click());
+    await tick();
+    const show = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-show"]');
+    if (!show) throw new Error('Claude Bash SHOW choice did not render');
+    expect(show.getAttribute('aria-pressed')).toBe('false');
+    expect(distill.getAttribute('aria-pressed')).toBe('true');
+    flushSync(() => show.click());
     await tick();
     expect(saved.at(-1)).toEqual({ claudeBashMode: 'off' });
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('Bash: OFF');
+      .toBe('BASH SHOW');
 
     if (!publishPrefs) throw new Error('SessionView did not subscribe to shared preferences');
     flushSync(() => publishPrefs?.({ claudeBashMode: 'hide' }));
     await tick();
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('Bash: HIDE');
+      .toBe('BASH HIDE');
   });
 
   test('Bash action stays absent outside Claude sessions even when the stored mode is HAIKU', async () => {
