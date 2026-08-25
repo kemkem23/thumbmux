@@ -1,7 +1,27 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.4-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.5-dist`.
+
+## v0.18.5 — 2026-08-25
+
+### Fixed
+
+- **Claude Bash compaction no longer cuts a soft-wrapped table, rule, marker,
+  fake `Bash(...)` header, or permission dialog in half.** Physical rows at
+  column zero are treated as ambiguous when the preceding result exactly fills
+  the calibrated pane. A boundary in that lane must match Claude's measured
+  marker wrapper; arbitrary shell colour is not identity. The paired 244-grey
+  `rule / ❯ / rule` composer stays visible, approval semantics always fail
+  open, stale pre-resize composer widths are ignored, and an exact
+  `maxBlockLines` candidate is no longer rejected one row early. Unknown
+  Claude layouts remain raw rather than hiding uncertain content.
+
+- **The terminal block cursor now measures the complete grapheme rendered in
+  its cell.** Emoji variation sequences such as `❤️` occupy the same two-cell
+  width as the ANSI renderer instead of painting a one-cell cursor over a
+  two-cell glyph; ordinary text, Thai combining clusters, CJK, and emoji after
+  compact one-third-row Bash dividers retain their calibrated position.
 
 ## v0.18.4 — 2026-08-25
 
