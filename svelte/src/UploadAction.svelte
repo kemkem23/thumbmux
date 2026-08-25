@@ -10,6 +10,8 @@
     dir = 'uploads',
     accept = undefined,
     busy = $bindable(false),
+    prepareForm,
+    onResponse,
     onUploaded,
     onError,
   }: {
@@ -18,6 +20,15 @@
     dir?: string;
     accept?: string;
     busy?: boolean;
+    /** Host-owned multipart fields plus an opaque per-request settlement context. */
+    prepareForm?: (files: readonly File[], form: FormData) => unknown | Promise<unknown>;
+    /** Observe parsed HTTP state with the exact context returned for this request. */
+    onResponse?: (
+      files: readonly File[],
+      response: Response,
+      data: unknown,
+      context: unknown,
+    ) => void | Promise<void>;
     /** message uses the response `dir`, falling back to the `dir` prop */
     onUploaded: (message: string, files: UploadedFile[]) => void;
     onError: (message: string) => void;
@@ -52,8 +63,10 @@
     try {
       const form = new FormData();
       for (const f of files) form.append('files', f);
+      const requestContext = prepareForm ? await prepareForm(files, form) : undefined;
       const res = await fetch(endpoint, { method: 'POST', body: form });
       const data = await res.json().catch(() => ({}));
+      if (onResponse) await onResponse(files, res, data, requestContext);
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const responseFiles = data?.files;
       const hasUsableFiles =

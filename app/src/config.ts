@@ -213,6 +213,20 @@ export interface AppAdapters {
   upload?: {
     endpoint(session: string): string | null;
     dir?: string;
+    /** Add multipart fields and return opaque context tied to this exact request. */
+    prepareForm?: (
+      session: string,
+      files: readonly File[],
+      form: FormData,
+    ) => unknown | Promise<unknown>;
+    /** Observe parsed HTTP state with the exact per-request context. */
+    onResponse?: (
+      session: string,
+      files: readonly File[],
+      response: Response,
+      data: unknown,
+      context: unknown,
+    ) => void | Promise<void>;
     /** Replace the composer prefill written after a successful upload. Mirrors
      * `formatUploadMessage(files, dir)` from core, so a host that only wants to
      * decorate the default can call that itself. Without this, extraction would
