@@ -65,7 +65,7 @@
     collectTerminalUrlSegments,
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
-    charCellWidth, stringCells, prefixForCells, stripAnsi, paneTextForCopy,
+    prefixForCells, stringCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
@@ -5243,21 +5243,7 @@
   // ASCII cells of ink while the grid still owes it two. Memoized: scroll
   // re-renders hit the cache (the key ignores winStart).
   let cursorPosCache = { key: '', left: 0, width: 0 };
-
-  function cursorTerminalUnitCells(text: string, start: number): number {
-    const tail = text.slice(start);
-    if (!tail) return 1;
-    let unit = '';
-    let first = true;
-    for (const character of tail) {
-      const width = charCellWidth(character.codePointAt(0)!);
-      if (!first && width !== 0) break;
-      unit += character;
-      first = false;
-    }
-    return Math.max(1, stringCells(unit));
-  }
-
+  const cursorGraphemes = new Intl.Segmenter('en', { granularity: 'grapheme' });
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
     const key = `${col}|${fontPx}|${charW}|${raw}`;
@@ -5266,7 +5252,14 @@
     let width = charW;
     const line = stripAnsi(raw);
     const { prefix } = prefixForCells(line, col);
-    width = cursorTerminalUnitCells(line, prefix.length) * charW;
+    // Match ansi-html's rendered unit, not merely the first code point. `❤️`
+    // is one two-cell grapheme (❤ + VS16), and Indic conjuncts can likewise
+    // span several terminal cells. Reading only the base painted a one-cell
+    // caret over a two-cell glyph even though its left edge was correct.
+    for (const { segment } of cursorGraphemes.segment(line.slice(prefix.length))) {
+      width = Math.max(1, stringCells(segment)) * charW;
+      break;
+    }
     cursorPosCache = { key, left, width };
     return cursorPosCache;
   }

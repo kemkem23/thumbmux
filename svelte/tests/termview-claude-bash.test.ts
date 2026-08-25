@@ -507,6 +507,28 @@ describe('TermView Claude Bash projection', () => {
     expect(viewport.querySelector('[data-testid="mtv-cursor"]')).toBeNull();
   });
 
+  test('cursor width follows the same full grapheme cell span as the ANSI renderer', async () => {
+    const { viewport } = mountView('off');
+    deliver(['A❤️B', 'after'], true, { row: 1, col: 1 });
+    await settleUi();
+
+    const cellWidth = Number.parseFloat(viewport.style.getPropertyValue('--mtv-cw'));
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    const renderedHeart = Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-w2'))
+      .find((span) => span.textContent === '❤️');
+    expect(cellWidth).toBeGreaterThan(0);
+    expect(renderedHeart).toBeDefined();
+    expect(cursor?.style.left).toBe(`${6 + cellWidth}px`);
+    expect(cursor?.style.width).toBe(`${2 * cellWidth}px`);
+
+    // The same base without VS16 is a one-cell symbol and must keep a
+    // one-cell block caret rather than inheriting the promoted width.
+    deliver(['A❤B', 'after'], true, { row: 1, col: 1 });
+    await settleUi();
+    expect(viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]')?.style.width)
+      .toBe(`${cellWidth}px`);
+  });
+
   test('live completion absorbs both separators while keeping the tail pinned and cursor exact', async () => {
     const { viewport } = mountView('hide', { height: 120 });
     const prefix = Array.from({ length: 50 }, (_, index) => `prefix-${index}`);
