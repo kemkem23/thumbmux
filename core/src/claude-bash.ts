@@ -249,6 +249,14 @@ const DEFAULT_MAX_SUMMARY_CHARS = 240;
 // oversized candidate rather than spending unbounded work trying to classify it.
 const MAX_CANDIDATE_ROW_CHARS = 65_536;
 
+// The current composer calibrates only the live pane width. Retained history
+// can have been painted at another geometry, and a discontinuous archive
+// segment can contain no composer at all. A wide row immediately before
+// marker-shaped text is therefore plausibly an old soft-wrap even when it does
+// not equal today's width. The 64-cell floor covers the calibrated 80/126/240
+// layouts without turning ordinary command output into a guessed old pane.
+const MIN_PLAUSIBLE_SOFT_WRAP_CELLS = 64;
+
 const SGR = '\\x1b\\[[0-9;:]*m';
 const STYLED_BLANK_PREFIX = new RegExp(`^(?:${SGR})+ (?:${SGR})+ $`);
 const BOLD_BASH = /\x1b\[(?:1(?:;[0-9;:]*)?|[0-9;:]*;1(?:;[0-9;:]*)?)mBash/;
@@ -261,6 +269,8 @@ type HeaderMatch = Readonly<{
 
 type ParsedCandidate = Readonly<{
   block: ClaudeBashBlock | null;
+  /** Skip a rejected header-shaped continuation so it cannot become a block. */
+  resumeLine?: number;
 }>;
 
 function boundedInteger(
@@ -354,6 +364,26 @@ function confirmedClaudeComposerRuleAt(rawLines: readonly string[], index: numbe
     if (otherCells === cells && /^❯(?:\s|$)/.test(middle)) return cells;
   }
   return null;
+}
+
+/** Resume at the newest composer after a rejected ambiguous corridor. A shell
+ * can emit more than one exact Claude-looking `Bash(...)` header, so advancing
+ * by only one row would let a later spoof become an independently hidden
+ * block. If this retained segment has no composer, quarantine through the
+ * bounded candidate scan instead. */
+function resumeAfterAmbiguousCorridor(
+  rawLines: readonly string[],
+  ambiguousLine: number,
+  scanEnd: number,
+): number {
+  for (
+    let index = Math.min(rawLines.length, scanEnd) - 1;
+    index > ambiguousLine;
+    index -= 1
+  ) {
+    if (confirmedClaudeComposerRuleAt(rawLines, index) !== null) return index;
+  }
+  return scanEnd;
 }
 
 /** Find the current physical pane width from Claude's paired composer chrome.
@@ -514,16 +544,56 @@ function parseCandidate(
         // the opening border look like a possible tmux continuation.
         if (boundary === 'approval') return { block: null };
 
-        // A positively identified Claude composer must remain wholly visible.
-        // It takes precedence over the soft-wrap heuristic because its upper
-        // rule is itself full-width by definition.
+        const calibratedTopLevel = boundary === 'top-level'
+          && isCalibratedClaudeTopLevel(raw);
+        const previousCells = stringCells(visibleLine(rawLines[i - 1] ?? ''));
+        const previousFillsCurrentPane = limits.paneColumns !== null
+          && previousCells === limits.paneColumns;
+        const previousCouldFillAnotherPane = previousCells >= MIN_PLAUSIBLE_SOFT_WRAP_CELLS
+          && !previousFillsCurrentPane;
+        const rejectedAmbiguousBoundary: ParsedCandidate = nextHeader
+          ? { block: null, resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd) }
+          : { block: null };
+
+        // Rounded chrome is Claude's dialog family. Unknown copy must be kept
+        // just as carefully as today's recognised approval wording. Square
+        // `┌` remains eligible for the calibrated soft-wrapped table path.
+        if (boundary === 'dialog' && /^╭/.test(line)) {
+          return {
+            block: null,
+            resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd),
+          };
+        }
+
+        // A paired composer is positive UI only when it follows an ordinary
+        // short/separator row. Immediately after a possible full-width result,
+        // the exact same bytes can be shell output (for example a captured
+        // Claude pane). Preserve the whole candidate instead of cutting it.
         if (boundary === 'composer-rule' && confirmedClaudeComposerRuleAt(rawLines, i) !== null) {
+          if (
+            previousFillsCurrentPane
+            || (previousCouldFillAnotherPane && !softWrappedWeakBoundary)
+          ) {
+            return rejectedAmbiguousBoundary;
+          }
           boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
           break;
         }
 
-        const calibratedTopLevel = boundary === 'top-level'
-          && isCalibratedClaudeTopLevel(raw);
+        // A retained segment may have no composer or may predate a resize. We
+        // cannot prove that a long preceding row was a hard newline, so every
+        // boundary shape after it fails open. This also covers capture paths
+        // which trim trailing spaces from a physically full row.
+        if (previousCouldFillAnotherPane && !softWrappedWeakBoundary) {
+          return rejectedAmbiguousBoundary;
+        }
+
+        // Even Claude's calibrated marker wrapper can be emitted verbatim by a
+        // shell command. When it lands directly after a proven full row there
+        // is no byte-level discriminator, so keep both possible meanings raw.
+        if (previousFillsCurrentPane && calibratedTopLevel) {
+          return rejectedAmbiguousBoundary;
+        }
 
         // tmux capture-pane preserves soft wraps as physical rows. A marker,
         // header, box, or rule at column zero can therefore be shell output.
@@ -531,10 +601,8 @@ function parseCandidate(
         // as continuation. This must run for top-level markers too: limiting it
         // to boxes/rules left `● shell bullet` and fake `● Bash(...)` output
         // outside a partially hidden block.
-        const previousCells = stringCells(visibleLine(rawLines[i - 1] ?? ''));
         if (
-          limits.paneColumns !== null
-          && previousCells === limits.paneColumns
+          previousFillsCurrentPane
           && !calibratedTopLevel
         ) {
           pendingBlankStart = -1;
@@ -668,7 +736,7 @@ export function detectClaudeBashBlocks(
       paneColumns,
     });
     if (!parsed.block) {
-      i += 1;
+      i = Math.max(i + 1, parsed.resumeLine ?? 0);
       continue;
     }
 
