@@ -14,6 +14,7 @@
  */
 
 import { stripAnsi } from './prompt-scan';
+import { stringCells } from './cells';
 
 export type ClaudeBashMode = 'off' | 'hide' | 'haiku';
 export type ClaudeBashBlockStatus = 'completed' | 'active';
@@ -248,6 +249,14 @@ const DEFAULT_MAX_SUMMARY_CHARS = 240;
 // oversized candidate rather than spending unbounded work trying to classify it.
 const MAX_CANDIDATE_ROW_CHARS = 65_536;
 
+// The current composer calibrates only the live pane width. Retained history
+// can have been painted at another geometry, and a discontinuous archive
+// segment can contain no composer at all. A wide row immediately before
+// marker-shaped text is therefore plausibly an old soft-wrap even when it does
+// not equal today's width. The 64-cell floor covers the calibrated 80/126/240
+// layouts without turning ordinary command output into a guessed old pane.
+const MIN_PLAUSIBLE_SOFT_WRAP_CELLS = 64;
+
 const SGR = '\\x1b\\[[0-9;:]*m';
 const STYLED_BLANK_PREFIX = new RegExp(`^(?:${SGR})+ (?:${SGR})+ $`);
 const BOLD_BASH = /\x1b\[(?:1(?:;[0-9;:]*)?|[0-9;:]*;1(?:;[0-9;:]*)?)mBash/;
@@ -260,6 +269,8 @@ type HeaderMatch = Readonly<{
 
 type ParsedCandidate = Readonly<{
   block: ClaudeBashBlock | null;
+  /** Skip a rejected header-shaped continuation so it cannot become a block. */
+  resumeLine?: number;
 }>;
 
 function boundedInteger(
@@ -311,17 +322,90 @@ function isResultDelimiter(line: string): boolean {
 type BoundaryKind = 'top-level' | 'composer-rule' | 'dialog' | 'approval';
 
 function boundaryKind(line: string): BoundaryKind | null {
+  // Approval copy can sit inside either rounded or square Claude chrome. Strip
+  // only one leading border and its rule decoration; ordinary command output
+  // remains untouched. Recognition here is deliberately semantic because an
+  // approval surface must never disappear together with completed output.
+  const dialogContent = line
+    .replace(/^\s*[│┃║╭┌┏](?:[─━-]*\s*)?/, '')
+    .trimStart();
   // Claude's permission UI has existed both as a box and as plain rows. A
   // styled active Bash header directly above either form is an approval, not
   // proof that the command ran; keep the whole surface raw.
   if (
-    /^\s*(?:I want to run:|Do you want to (?:allow|proceed)|Would you like to (?:allow|proceed)|This command requires approval)/i.test(line)
-    || /^❯\s*\d+[.)]\s*(?:Yes|No|Allow|Deny)\b/i.test(line)
+    /^(?:I want to run:|Do you want to (?:allow|proceed)|Would you like to (?:allow|proceed)|This command requires approval)/i.test(dialogContent)
+    || /^❯\s*\d+[.)]\s*(?:Yes|No|Allow|Deny)\b/i.test(dialogContent)
   ) return 'approval';
   if (/^(?:●|⏺|❯|✻)(?:\s|$)/.test(line)) return 'top-level';
   if (/^[─━-]{8,}\s*$/.test(line)) return 'composer-rule';
   if (/^[╭┌┏](?:[─━-]|\s)/.test(line)) return 'dialog';
   return null;
+}
+
+/** Claude 2.1.x paints both composer rules as one un-reset 244-grey row.
+ * Requiring the paired `rule / ❯ / rule` shape keeps this a calibrated UI
+ * signature instead of guessing from a generic box-drawing line. */
+function claudeComposerRuleCells(raw: string): number | null {
+  const style = /^\x1b\[38(?:;5;244|:5:244)m/.exec(raw);
+  if (!style) return null;
+  if (raw.slice(style[0].length).includes('\x1b')) return null;
+  const line = visibleLine(raw);
+  if (!/^[─━-]{8,}$/.test(line)) return null;
+  return stringCells(line);
+}
+
+function confirmedClaudeComposerRuleAt(rawLines: readonly string[], index: number): number | null {
+  const cells = claudeComposerRuleCells(rawLines[index] ?? '');
+  if (cells === null) return null;
+  for (const otherIndex of [index + 2, index - 2]) {
+    if (otherIndex < 0 || otherIndex >= rawLines.length) continue;
+    const otherCells = claudeComposerRuleCells(rawLines[otherIndex] ?? '');
+    const middle = visibleLine(rawLines[(index + otherIndex) / 2] ?? '');
+    if (otherCells === cells && /^❯(?:\s|$)/.test(middle)) return cells;
+  }
+  return null;
+}
+
+/** Resume at the newest composer after a rejected ambiguous corridor. A shell
+ * can emit more than one exact Claude-looking `Bash(...)` header, so advancing
+ * by only one row would let a later spoof become an independently hidden
+ * block. If this retained segment has no composer, quarantine through the
+ * bounded candidate scan instead. */
+function resumeAfterAmbiguousCorridor(
+  rawLines: readonly string[],
+  ambiguousLine: number,
+  scanEnd: number,
+): number {
+  for (
+    let index = Math.min(rawLines.length, scanEnd) - 1;
+    index > ambiguousLine;
+    index -= 1
+  ) {
+    if (confirmedClaudeComposerRuleAt(rawLines, index) !== null) return index;
+  }
+  return scanEnd;
+}
+
+/** Find the current physical pane width from Claude's paired composer chrome.
+ * Live calibration put all ten observed pairs 4–7 rows from the capture tail.
+ * Keep 64 rows of headroom, but never scan an old archive-sized corridor: a
+ * composer from before resize must not masquerade as today's pane width. */
+function inferredPaneColumns(rawLines: readonly string[]): number | null {
+  const start = Math.max(0, rawLines.length - 64);
+  for (let index = rawLines.length - 1; index >= start; index -= 1) {
+    const cells = confirmedClaudeComposerRuleAt(rawLines, index);
+    if (cells !== null) return cells;
+  }
+  return null;
+}
+
+/** Claude Code 2.1.x top-level marker wrapper calibrated from 1,507 raw rows
+ * across five live panes (100% matched). This is used only after a physical
+ * soft-wrap makes a column-zero marker ambiguous. Unknown versions/themes
+ * fail open instead of letting arbitrary shell colour turn into a boundary. */
+function isCalibratedClaudeTopLevel(raw: string): boolean {
+  return /^(?:\x1b\[0m)?\x1b\[38(?:;5;|:5:)(?:114|231|246|211|220)m(?:\x1b\[49m)?(?:●|✻)\x1b\[39m(?:\s|$)/
+    .test(raw);
 }
 
 function trimOneClosingParen(rows: string[]): void {
@@ -422,14 +506,21 @@ function parseCandidate(
     maxBlockLines: number;
     maxCommandChars: number;
     maxOutputChars: number;
+    paneColumns: number | null;
   }>,
 ): ParsedCandidate {
-  const hardEnd = Math.min(rawLines.length, startLine + limits.maxBlockLines);
+  // A block whose source range is exactly maxBlockLines rows is allowed. Read
+  // one extra physical row so a boundary at that half-open end can prove the
+  // candidate without becoming part of it. The old `< start + maxBlockLines`
+  // loop rejected that exact-limit case one row too early.
+  const maximumCandidateEnd = startLine + limits.maxBlockLines;
+  const scanEnd = Math.min(rawLines.length, maximumCandidateEnd + 1);
   let delimiterLine = -1;
   let boundaryLine = -1;
   let pendingBlankStart = -1;
+  let softWrappedWeakBoundary = false;
 
-  for (let i = startLine + 1; i < hardEnd; i += 1) {
+  for (let i = startLine + 1; i < scanEnd; i += 1) {
     const raw = rawLines[i] ?? '';
     if (raw.length > MAX_CANDIDATE_ROW_CHARS) return { block: null };
     const line = visibleLine(raw);
@@ -448,6 +539,91 @@ function parseCandidate(
       if ((boundary === 'dialog' || boundary === 'approval') && delimiterLine < 0) {
         return { block: null };
       }
+      if (delimiterLine >= 0) {
+        // Permission semantics always win, even after a full-width result made
+        // the opening border look like a possible tmux continuation.
+        if (boundary === 'approval') return { block: null };
+
+        const calibratedTopLevel = boundary === 'top-level'
+          && isCalibratedClaudeTopLevel(raw);
+        const previousCells = stringCells(visibleLine(rawLines[i - 1] ?? ''));
+        const previousFillsCurrentPane = limits.paneColumns !== null
+          && previousCells === limits.paneColumns;
+        const previousCouldFillAnotherPane = previousCells >= MIN_PLAUSIBLE_SOFT_WRAP_CELLS
+          && !previousFillsCurrentPane;
+        const rejectedAmbiguousBoundary: ParsedCandidate = nextHeader
+          ? { block: null, resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd) }
+          : { block: null };
+
+        // Rounded chrome is Claude's dialog family. Unknown copy must be kept
+        // just as carefully as today's recognised approval wording. Square
+        // `┌` remains eligible for the calibrated soft-wrapped table path.
+        if (boundary === 'dialog' && /^╭/.test(line)) {
+          return {
+            block: null,
+            resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd),
+          };
+        }
+
+        // A paired composer is positive UI only when it follows an ordinary
+        // short/separator row. Immediately after a possible full-width result,
+        // the exact same bytes can be shell output (for example a captured
+        // Claude pane). Preserve the whole candidate instead of cutting it.
+        if (boundary === 'composer-rule' && confirmedClaudeComposerRuleAt(rawLines, i) !== null) {
+          if (
+            previousFillsCurrentPane
+            || (previousCouldFillAnotherPane && !softWrappedWeakBoundary)
+          ) {
+            return rejectedAmbiguousBoundary;
+          }
+          boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
+          break;
+        }
+
+        // A retained segment may have no composer or may predate a resize. We
+        // cannot prove that a long preceding row was a hard newline, so every
+        // boundary shape after it fails open. This also covers capture paths
+        // which trim trailing spaces from a physically full row.
+        if (previousCouldFillAnotherPane && !softWrappedWeakBoundary) {
+          return rejectedAmbiguousBoundary;
+        }
+
+        // Even Claude's calibrated marker wrapper can be emitted verbatim by a
+        // shell command. When it lands directly after a proven full row there
+        // is no byte-level discriminator, so keep both possible meanings raw.
+        if (previousFillsCurrentPane && calibratedTopLevel) {
+          return rejectedAmbiguousBoundary;
+        }
+
+        // tmux capture-pane preserves soft wraps as physical rows. A marker,
+        // header, box, or rule at column zero can therefore be shell output.
+        // If the preceding row filled the pane, treat every uncalibrated shape
+        // as continuation. This must run for top-level markers too: limiting it
+        // to boxes/rules left `● shell bullet` and fake `● Bash(...)` output
+        // outside a partially hidden block.
+        if (
+          previousFillsCurrentPane
+          && !calibratedTopLevel
+        ) {
+          pendingBlankStart = -1;
+          softWrappedWeakBoundary = true;
+          continue;
+        }
+
+        if (softWrappedWeakBoundary && boundary === 'top-level' && !calibratedTopLevel) {
+          // A generic SGR such as shell-red is not Claude identity. Once the
+          // candidate crossed an ambiguous continuation, preserve everything
+          // rather than cutting at that coloured output bullet.
+          return { block: null };
+        }
+
+        if (boundary === 'dialog' || boundary === 'composer-rule') {
+          // An uncalibrated post-result box/rule could be either command output
+          // or UI. Preserve the complete candidate instead of hiding half a
+          // table or half a dialog.
+          return { block: null };
+        }
+      }
       boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
       break;
     }
@@ -461,7 +637,7 @@ function parseCandidate(
     }
   }
 
-  const hitLineLimit = hardEnd < rawLines.length && boundaryLine < 0;
+  const hitLineLimit = maximumCandidateEnd < rawLines.length && boundaryLine < 0;
   if (hitLineLimit) return { block: null };
 
   let endLine = boundaryLine;
@@ -544,6 +720,7 @@ export function detectClaudeBashBlocks(
   }
 
   const blocks: ClaudeBashBlock[] = [];
+  const paneColumns = inferredPaneColumns(rawLines);
   let i = scanStart;
   while (i < rawLines.length) {
     const header = headerAt(rawLines[i] ?? '');
@@ -556,9 +733,10 @@ export function detectClaudeBashBlocks(
       maxBlockLines,
       maxCommandChars,
       maxOutputChars,
+      paneColumns,
     });
     if (!parsed.block) {
-      i += 1;
+      i = Math.max(i + 1, parsed.resumeLine ?? 0);
       continue;
     }
 

@@ -61,7 +61,7 @@
     collectTerminalUrlSegments,
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
-    charCellWidth, prefixForCells, stripAnsi, paneTextForCopy,
+    prefixForCells, stringCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
@@ -5033,6 +5033,7 @@
   // ASCII cells of ink while the grid still owes it two. Memoized: scroll
   // re-renders hit the cache (the key ignores winStart).
   let cursorPosCache = { key: '', left: 0, width: 0 };
+  const cursorGraphemes = new Intl.Segmenter('en', { granularity: 'grapheme' });
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
     const key = `${col}|${fontPx}|${charW}|${raw}`;
@@ -5041,11 +5042,13 @@
     let width = charW;
     const line = stripAnsi(raw);
     const { prefix } = prefixForCells(line, col);
-    let nextChar: string | undefined;
-    for (const c of line.slice(prefix.length)) { nextChar = c; break; }
-    if (nextChar) {
-      const w = charCellWidth(nextChar.codePointAt(0)!);
-      width = Math.max(1, w === 0 ? 1 : w) * charW;
+    // Match ansi-html's rendered unit, not merely the first code point. `❤️`
+    // is one two-cell grapheme (❤ + VS16), and Indic conjuncts can likewise
+    // span several terminal cells. Reading only the base painted a one-cell
+    // caret over a two-cell glyph even though its left edge was correct.
+    for (const { segment } of cursorGraphemes.segment(line.slice(prefix.length))) {
+      width = Math.max(1, stringCells(segment)) * charW;
+      break;
     }
     cursorPosCache = { key, left, width };
     return cursorPosCache;
@@ -5647,7 +5650,6 @@
                 aria-hidden="true"
               ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
-    {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
       {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
@@ -5671,6 +5673,7 @@
         ></div>
       {/if}
     {/if}
+    {/key}
   </div>
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>
