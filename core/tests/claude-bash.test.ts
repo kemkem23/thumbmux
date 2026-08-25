@@ -110,6 +110,220 @@ describe('Claude Bash detector', () => {
     expect(block?.output).toBe('one\nShell cwd was reset to /repo\ntail');
   });
 
+  test('keeps soft-wrapped Bash tables and rules after the result delimiter intact', () => {
+    const paneColumns = 80;
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
+    const continuations = [
+      ['─'.repeat(paneColumns - 5), '─'.repeat(24), '│ wide table result │', '└────────────────────┘'],
+      ['┌' + '─'.repeat(paneColumns - 6), '─'.repeat(20) + '┐', '│ another result │', '└─────────────────┘'],
+      ['-'.repeat(paneColumns - 5), '-'.repeat(24), 'plain output after rule'],
+      ['界'.repeat(37) + 'ก', '┌────────────────────', '│ Unicode-width result │', '└────────────────────┘'],
+    ];
+
+    for (const continuation of continuations) {
+      const lines = [
+        '● Bash(render-wide-table)',
+        `  ⎿  ${continuation[0]}`,
+        ...continuation.slice(1),
+        '\x1b[38;5;231m●\x1b[39m next',
+        composerRule,
+        '❯ ',
+        composerRule,
+      ];
+      const [block] = detectClaudeBashBlocks(lines).blocks;
+      expect(block?.sourceRange).toEqual({ startLine: 0, endLine: lines.length - 4 });
+      expect(block?.output).toContain(continuation.at(-1));
+
+      const projection = projectClaudeBashLines(lines, { mode: 'hide' });
+      expect(projection.rows[0]?.rawRange).toEqual({ startLine: 0, endLine: lines.length - 4 });
+      expect(projection.lines).toHaveLength(5);
+      expect(projection.lines[1]).toContain('●');
+    }
+
+    const unstyledAfterAmbiguity = [
+      '● Bash(render-wide-table)',
+      `  ⎿  ${'─'.repeat(paneColumns - 5)}`,
+      '─'.repeat(20),
+      '● could also be output',
+      composerRule,
+      '❯ ',
+      composerRule,
+    ];
+    expect(detectClaudeBashBlocks(unstyledAfterAmbiguity).blocks).toEqual([]);
+  });
+
+  test('keeps soft-wrapped marker-shaped shell output inside one Bash block', () => {
+    const paneColumns = 80;
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
+    const markerOutputs = [
+      { raw: '● shell bullet', visible: '● shell bullet' },
+      { raw: '❯ shell prompt-shaped output', visible: '❯ shell prompt-shaped output' },
+      { raw: '✻ shell spinner-shaped output', visible: '✻ shell spinner-shaped output' },
+      { raw: '\x1b[31m● red shell bullet\x1b[0m', visible: '● red shell bullet' },
+    ];
+
+    for (const markerOutput of markerOutputs) {
+      const lines = [
+        '● Bash(render-marker-output)',
+        `  ⎿  ${'x'.repeat(paneColumns - 5)}`,
+        markerOutput.raw,
+        'tail after marker-shaped output',
+        '\x1b[38;5;231m●\x1b[39m real Claude boundary',
+        composerRule,
+        '❯ ',
+        composerRule,
+      ];
+      const detection = detectClaudeBashBlocks(lines);
+      expect(detection.blocks).toHaveLength(1);
+      expect(detection.blocks[0]?.sourceRange).toEqual({ startLine: 0, endLine: 4 });
+      expect(detection.blocks[0]?.output).toContain(markerOutput.visible);
+      expect(detection.blocks[0]?.output).toContain('tail after marker-shaped output');
+      expect(projectClaudeBashLines(lines, { mode: 'hide' }).rows[0]?.rawRange)
+        .toEqual({ startLine: 0, endLine: 4 });
+    }
+  });
+
+  test('fails open after ambiguous wraps instead of trusting arbitrary SGR or approval choices', () => {
+    const paneColumns = 80;
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
+    const colouredOutputAfterRule = [
+      '● Bash(render-rule-and-bullet)',
+      `  ⎿  ${'x'.repeat(paneColumns - 5)}`,
+      '─'.repeat(24),
+      '\x1b[31m● red shell bullet\x1b[0m',
+      '\x1b[38;5;231m●\x1b[39m real Claude boundary',
+      composerRule,
+      '❯ ',
+      composerRule,
+    ];
+    expect(detectClaudeBashBlocks(colouredOutputAfterRule).blocks).toEqual([]);
+    expect(projectClaudeBashLines(colouredOutputAfterRule, { mode: 'hide' }).lines)
+      .toBe(colouredOutputAfterRule);
+
+    const approvalAfterFullRow = [
+      '● Bash(dangerous-command)',
+      `  ⎿  ${'x'.repeat(paneColumns - 5)}`,
+      '╭─ command requires confirmation',
+      '│ Do you want to proceed?',
+      '\x1b[31m❯ 1. Yes\x1b[0m',
+      '╰────────────────────────',
+      '\x1b[38;5;231m●\x1b[39m later Claude response',
+      composerRule,
+      '❯ ',
+      composerRule,
+    ];
+    expect(detectClaudeBashBlocks(approvalAfterFullRow).blocks).toEqual([]);
+    expect(projectClaudeBashLines(approvalAfterFullRow, { mode: 'hide' }).lines)
+      .toBe(approvalAfterFullRow);
+  });
+
+  test('does not split a fake Bash header emitted by a full-width result row', () => {
+    const paneColumns = 80;
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
+    const lines = [
+      '● Bash(print-Claude-looking-output)',
+      `  ⎿  ${'x'.repeat(paneColumns - 5)}`,
+      '● Bash(fake-output)',
+      '  ⎿  fake delimiter is still outer command output',
+      'fake tail',
+      '\x1b[38;5;231m●\x1b[39m real Claude boundary',
+      composerRule,
+      '❯ ',
+      composerRule,
+    ];
+    const detection = detectClaudeBashBlocks(lines);
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]?.sourceRange).toEqual({ startLine: 0, endLine: 5 });
+    expect(detection.blocks[0]?.output).toContain('● Bash(fake-output)');
+    expect(detection.blocks[0]?.output).toContain('fake delimiter is still outer command output');
+  });
+
+  test('fails open on ambiguous post-result dialog chrome without a later top-level boundary', () => {
+    const ambiguous = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      '╭────────────────────',
+      '│ could be wrapped command output or UI',
+      '╰────────────────────',
+    ];
+    expect(detectClaudeBashBlocks(ambiguous).blocks).toEqual([]);
+    expect(projectClaudeBashLines(ambiguous, { mode: 'hide' }).lines).toBe(ambiguous);
+  });
+
+  test('preserves complete composer and approval UI after Bash output', () => {
+    for (const columns of [80, 240]) {
+      const rule = `\x1b[38;5;244m${'─'.repeat(columns)}`;
+      const composer = [
+        '● Bash(printf done)',
+        '  ⎿  done',
+        rule,
+        '❯ ',
+        rule,
+        '  status',
+      ];
+      const [composerBlock] = detectClaudeBashBlocks(composer).blocks;
+      expect(composerBlock?.sourceRange).toEqual({ startLine: 0, endLine: 2 });
+      expect(projectClaudeBashLines(composer, { mode: 'hide' }).lines).toEqual([
+        'Bash ซ่อนอยู่ · 2 แถว',
+        ...composer.slice(2),
+      ]);
+    }
+
+    const unpairedRule = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;244m${'─'.repeat(80)}`,
+      'status without a paired composer',
+    ];
+    expect(detectClaudeBashBlocks(unpairedRule).blocks).toEqual([]);
+    expect(projectClaudeBashLines(unpairedRule, { mode: 'hide' }).lines).toBe(unpairedRule);
+
+    const staleComposerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const staleWidthAfterResize = [
+      staleComposerRule,
+      '❯ old composer before resize',
+      staleComposerRule,
+      ...Array.from({ length: 65 }, (_, index) => `archived row ${index}`),
+      '● Bash(render-after-resize)',
+      `  ⎿  ${'x'.repeat(75)}`,
+      '┌────────────────────',
+      '│ width is no longer calibrated',
+      '└────────────────────',
+      '\x1b[38;5;231m●\x1b[39m later response',
+    ];
+    expect(detectClaudeBashBlocks(staleWidthAfterResize).blocks).toEqual([]);
+    expect(projectClaudeBashLines(staleWidthAfterResize, { mode: 'hide' }).lines)
+      .toBe(staleWidthAfterResize);
+
+    const approval = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      '╭─ Do you want to proceed?',
+      '│ choose one',
+      '❯ 1. Yes',
+      '╰────────────────────────',
+      '● next',
+    ];
+    expect(detectClaudeBashBlocks(approval).blocks).toEqual([]);
+    expect(projectClaudeBashLines(approval, { mode: 'hide' }).lines).toBe(approval);
+  });
+
+  test('accepts a block exactly maxBlockLines rows long when its boundary is next', () => {
+    const exactLimit = [
+      '● Bash(printf exact)',
+      '      continuation)',
+      '  ⎿  first',
+      '     second',
+      '● next',
+    ];
+    const [block] = detectClaudeBashBlocks(exactLimit, { maxBlockLines: 4 }).blocks;
+    expect(block?.sourceRange).toEqual({ startLine: 0, endLine: 4 });
+
+    const tooLong = [...exactLimit];
+    tooLong.splice(4, 0, '     third');
+    expect(detectClaudeBashBlocks(tooLong, { maxBlockLines: 4 }).blocks).toEqual([]);
+  });
+
   test('keeps nested Agent Bash and output text containing Bash( as ordinary output', () => {
     const falsePositives = [
       '  Agent(worker)',
