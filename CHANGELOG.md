@@ -13,15 +13,21 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.5-dist`.
   the calibrated pane. A boundary in that lane must match Claude's measured
   marker wrapper; arbitrary shell colour is not identity. The paired 244-grey
   `rule / ❯ / rule` composer stays visible, approval semantics always fail
-  open, stale pre-resize composer widths are ignored, and an exact
-  `maxBlockLines` candidate is no longer rejected one row early. Unknown
-  Claude layouts remain raw rather than hiding uncertain content.
+  open, and an exact `maxBlockLines` candidate is no longer rejected one row
+  early. Retained segments painted at an older width (or separated from their
+  composer), trailing-space wraps, exact ANSI marker/header/composer output,
+  repeated fake Bash headers, and unknown rounded dialogs now fail open as one
+  raw corridor rather than hiding only a prefix. Unknown Claude layouts remain
+  raw rather than hiding uncertain content.
 
 - **The terminal block cursor now measures the complete grapheme rendered in
   its cell.** Emoji variation sequences such as `❤️` occupy the same two-cell
   width as the ANSI renderer instead of painting a one-cell cursor over a
   two-cell glyph; ordinary text, Thai combining clusters, CJK, and emoji after
-  compact one-third-row Bash dividers retain their calibrated position.
+  compact one-third-row Bash dividers retain their calibrated position. Rows
+  and the cursor also repaint in the same projection epoch, so changing between
+  SHOW and HIDE cannot leave the cursor mapped through the previous mode or
+  make it disappear.
 
 ## v0.18.4 — 2026-08-25
 

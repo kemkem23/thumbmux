@@ -507,6 +507,37 @@ describe('TermView Claude Bash projection', () => {
     expect(viewport.querySelector('[data-testid="mtv-cursor"]')).toBeNull();
   });
 
+  test('show-hide-show recomputes a live cursor in the same projection epoch as its rows', async () => {
+    const { props, viewport } = mountView('off');
+    const lines = [
+      'before',
+      '● Bash(printf cursor-toggle)',
+      '  ⎿  hidden-output',
+      '● semantic-boundary',
+      'live cursor row',
+    ];
+    // lastContent=4 and row=0 pins the caret to the live row after Bash.
+    deliver(lines, true, { row: 0, col: 5 });
+    await settleUi();
+
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
+    const cursor = () => viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor()?.style.top).toBe(`${4 * lineHeight}px`);
+
+    flushSync(() => { props.claudeBashMode = 'hide'; });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-hidden')).not.toBeNull();
+    expect(cursor()?.style.top).toBe(`${2 * lineHeight + lineHeight / 3}px`);
+    expect(cursor()?.style.left).toBe(`${6 + 5 * Number.parseFloat(
+      viewport.style.getPropertyValue('--mtv-cw'),
+    )}px`);
+
+    flushSync(() => { props.claudeBashMode = 'off'; });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-hidden')).toBeNull();
+    expect(cursor()?.style.top).toBe(`${4 * lineHeight}px`);
+  });
+
   test('cursor width follows the same full grapheme cell span as the ANSI renderer', async () => {
     const { viewport } = mountView('off');
     deliver(['A❤️B', 'after'], true, { row: 1, col: 1 });
@@ -1265,6 +1296,46 @@ describe('TermView Claude Bash projection', () => {
     expect(Number.parseFloat(gapMarker.style.height)).toBe(
       Number(gapLine.getAttribute('data-presentation-height')),
     );
+  });
+
+  test('an archived pre-resize segment without its composer never hides half a wrapped Bash result', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    deliver(Array.from({ length: 10_000 }, (_, i) => `base-${i}`));
+    await settleUi();
+    wheelUp(viewport);
+
+    const protectedEnd = Math.max(...Array.from(
+      viewport.querySelectorAll<HTMLElement>('.mtv-line'),
+      (line) => Number(line.getAttribute('data-raw-end')),
+    ));
+    expect(protectedEnd).toBeGreaterThan(8);
+
+    const next = Array.from({ length: 12_100 }, (_, i) => `next-${i}`);
+    const candidateStart = protectedEnd - 6;
+    next[candidateStart] = '● Bash(render archived 80-column output)';
+    // Exactly 80 terminal cells including Claude's five-cell result prefix.
+    // The matching 80-column composer lived outside this retained segment, and
+    // the live pane may now be 240 columns wide. The marker-shaped continuation
+    // is therefore ambiguous and must keep the complete candidate raw.
+    next[candidateStart + 1] = `  ⎿  ${'x'.repeat(75)}`;
+    next[candidateStart + 2] = '● shell output from the old wrapped pane';
+    next[candidateStart + 3] = 'shell tail after the marker-shaped row';
+    next[candidateStart + 4] = '\x1b[38;5;231m●\x1b[39m real Claude response';
+    next[candidateStart + 5] = 'last retained row before the gap';
+    const liveStart = protectedEnd + 2_100;
+    const currentComposer = `\x1b[38;5;244m${'─'.repeat(240)}`;
+    next[liveStart + 10] = currentComposer;
+    next[liveStart + 11] = '❯ current 240-column composer';
+    next[liveStart + 12] = currentComposer;
+    // Sliding retention removes 2,100 rows immediately below the protected
+    // viewport. The new 240-column composer is retained on the live side but
+    // is deliberately unavailable to the old 80-column detector segment.
+    deliver(next);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-raw-total')).toBe('10000');
+    expect(viewport.getAttribute('data-total')).toBe('10000');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
   });
 
   test('history prepend can prove a leading separator without moving the reader anchor', async () => {

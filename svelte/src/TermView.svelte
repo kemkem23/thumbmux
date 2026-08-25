@@ -5650,7 +5650,6 @@
                 aria-hidden="true"
               ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
-    {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
       {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
@@ -5674,6 +5673,7 @@
         ></div>
       {/if}
     {/if}
+    {/key}
   </div>
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>

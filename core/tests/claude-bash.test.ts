@@ -238,6 +238,128 @@ describe('Claude Bash detector', () => {
     expect(detection.blocks[0]?.output).toContain('fake delimiter is still outer command output');
   });
 
+  test('fails open on marker-shaped history when pane width is absent, stale, or space-trimmed', () => {
+    const calibratedBoundary = '\x1b[38;5;231m●\x1b[39m real Claude boundary';
+    const markerOutputs = [
+      '● shell bullet',
+      '❯ shell prompt-shaped output',
+      '✻ shell spinner-shaped output',
+      '\x1b[31m● red shell bullet\x1b[0m',
+    ];
+
+    for (const [historicalColumns, currentColumns] of [
+      [80, 240],
+      [240, 80],
+      [80, 126],
+      [126, 80],
+    ] as const) {
+      const composerRule = `\x1b[38;5;244m${'─'.repeat(currentColumns)}`;
+      for (const markerOutput of markerOutputs) {
+        const lines = [
+          '● Bash(render-old-geometry)',
+          `  ⎿  ${'x'.repeat(historicalColumns - 5)}`,
+          markerOutput,
+          'tail after marker-shaped output',
+          calibratedBoundary,
+          composerRule,
+          '❯ ',
+          composerRule,
+        ];
+        expect(detectClaudeBashBlocks(lines).blocks).toEqual([]);
+        expect(projectClaudeBashLines(lines, { mode: 'hide' }).lines).toBe(lines);
+      }
+    }
+
+    const noComposerCalibration = [
+      '● Bash(render-retained-segment)',
+      `  ⎿  ${'x'.repeat(75)}`,
+      '● shell bullet in an isolated history segment',
+      'tail after marker-shaped output',
+      calibratedBoundary,
+    ];
+    expect(detectClaudeBashBlocks(noComposerCalibration).blocks).toEqual([]);
+
+    // Some capture paths preserve these spaces and others trim them. In both
+    // cases the 75 visible cells are still wide enough to be an old soft-wrap;
+    // never use the following shell marker to hide only the candidate prefix.
+    const currentComposerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const trailingSpaces = [
+      '● Bash(render-space-padded-row)',
+      `  ⎿  ${'x'.repeat(70)}${' '.repeat(5)}`,
+      '● shell bullet after trailing spaces',
+      'tail after marker-shaped output',
+      calibratedBoundary,
+      currentComposerRule,
+      '❯ ',
+      currentComposerRule,
+    ];
+    expect(detectClaudeBashBlocks(trailingSpaces).blocks).toEqual([]);
+    expect(projectClaudeBashLines(trailingSpaces, { mode: 'hide' }).lines)
+      .toBe(trailingSpaces);
+  });
+
+  test('fails open for exact Claude-looking shell bytes and unknown rounded dialogs', () => {
+    const paneColumns = 80;
+    const fullResult = `  ⎿  ${'x'.repeat(paneColumns - 5)}`;
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
+    const composer = [composerRule, '\x1b[39m❯ ', composerRule];
+    const boundary = (text: string) => `\x1b[38;5;231m●\x1b[39m ${text}`;
+    const fixtures = [
+      [
+        '● Bash(emit-exact-composer)',
+        fullResult,
+        ...composer,
+        'shell tail after fake composer',
+        boundary('real Claude response'),
+        ...composer,
+      ],
+      [
+        '● Bash(emit-exact-marker)',
+        fullResult,
+        boundary('shell-emitted marker'),
+        'shell tail after fake marker',
+        boundary('real Claude response'),
+        ...composer,
+      ],
+      [
+        '● Bash(emit-exact-header)',
+        fullResult,
+        '\x1b[38;5;231m●\x1b[39m Bash(fake)',
+        '  ⎿  fake delimiter is shell output',
+        boundary('real Claude response'),
+        ...composer,
+      ],
+      [
+        '● Bash(emit-repeated-exact-headers)',
+        fullResult,
+        '\x1b[38;5;231m●\x1b[39m Bash(fake-one)',
+        '  ⎿  first fake delimiter is shell output',
+        '\x1b[38;5;231m●\x1b[39m Bash(fake-two)',
+        '  ⎿  second fake delimiter is shell output',
+        boundary('real Claude response'),
+        ...composer,
+      ],
+      [
+        '● Bash(long-result-before-new-dialog)',
+        fullResult,
+        '╭─ New Claude UI prompt',
+        '│ Continue with experimental action?',
+        '│ press enter to proceed',
+        '╰────────────────────────',
+        boundary('real Claude response'),
+        ...composer,
+      ],
+    ];
+
+    for (const lines of fixtures) {
+      expect(detectClaudeBashBlocks(lines).blocks).toEqual([]);
+      // The conclusive response and composer stay byte-for-byte raw too. In
+      // particular, rejecting the outer candidate must not rescan the fake
+      // `Bash(...)` header as a second independently hidden block.
+      expect(projectClaudeBashLines(lines, { mode: 'hide' }).lines).toBe(lines);
+    }
+  });
+
   test('fails open on ambiguous post-result dialog chrome without a later top-level boundary', () => {
     const ambiguous = [
       '● Bash(printf done)',
