@@ -312,8 +312,9 @@ describe("release rail policy", () => {
     expect(skipBranch).toContain("exit 1");
     expect(parity).toContain("demo builds");
     for (const packageName of ["core", "server", "svelte", "app"]) {
-      expect(parity).toContain(`cd ${packageName}`);
-      expect(parity).toContain("bun pm pack");
+      expect(parity).toContain(
+        `(cd ${packageName} && "$THUMBMUX_GUARD_BUN_BIN" run build && "$THUMBMUX_GUARD_BUN_BIN" pm pack)`,
+      );
     }
     expect(parity).toContain("./e2e/run-container.sh");
     expect(parity).not.toContain("--config=e2e/playwright.config.ts --list");
