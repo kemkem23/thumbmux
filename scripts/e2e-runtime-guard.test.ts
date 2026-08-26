@@ -49,12 +49,12 @@ describe('thumbmux e2e runtime admission', () => {
       THUMBMUX_GUARD_DOCKER_SOCKET_IDENTITY: '1:2:3:660',
     };
     expect(() => assertThumbmuxPlaywrightRuntime(forged))
-      .toThrow(/runner paths|runner identity/);
+      .toThrow(/GitHub-hosted disposable-job heuristic|runner paths|checkout\/runtime paths/);
     expect(() => assertThumbmuxMediaRuntime({
       ...forged,
       THUMBMUX_TEST_SCOPE: 'media',
       THUMBMUX_TEST_ATTESTATION: '/tmp/forged-media-attestation',
-    })).toThrow(/runner paths|runner identity/);
+    })).toThrow(/GitHub-hosted disposable-job heuristic|runner paths|checkout\/runtime paths/);
   });
 
   test('the media browser driver checks scope/container/output before launch', () => {
@@ -135,11 +135,14 @@ describe('thumbmux e2e runtime admission', () => {
       [e2e, 'docker run --detach'],
       [media, 'docker run --detach'],
       [smoke, '/usr/bin/timeout 240 /usr/bin/docker run'],
-      [contracts, "tmux list-sessions -F '#S'"],
+      [contracts, 'if [[ -n "$(fixture_sessions)" ]]'],
     ] as const) {
       const admission = source.indexOf('thumbmux_prepare_test_runtime');
-      const firstLifecycle = source.indexOf(lifecycle);
       expect(admission).toBeGreaterThan(-1);
+      // Shell function bodies are definitions, not lifecycle execution. Start
+      // at the admission call so a pre-admission helper definition cannot be
+      // mistaken for an executed tmux/Docker operation.
+      const firstLifecycle = source.indexOf(lifecycle, admission);
       expect(firstLifecycle).toBeGreaterThan(admission);
     }
     expect(media).not.toContain('docker ps -a');
