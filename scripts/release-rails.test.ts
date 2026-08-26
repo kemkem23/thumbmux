@@ -25,6 +25,9 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+const e2eRunner = readFileSync(resolve(packageRoot, "e2e/run-container.sh"), "utf8");
+const e2eConfig = readFileSync(resolve(packageRoot, "e2e/playwright.config.ts"), "utf8");
+const e2eHelpers = readFileSync(resolve(packageRoot, "e2e/helpers.ts"), "utf8");
 const node18ReplayLockSmoke = readFileSync(
   resolve(import.meta.dir, "git-dist-smoke/node18-replay-lock-smoke.mjs"),
   "utf8",
@@ -256,7 +259,7 @@ describe("release rail policy", () => {
       "materialize-contract-baseline.ts",
       "THUMBMUX_CONTRACT_BASELINE_ROOT=",
       "bun run contract",
-      "bash scripts/contract-fixtures.sh",
+      "./scripts/contract-fixtures.sh",
     ];
     for (const marker of requiredGateMarkers) {
       expect(gate).toContain(marker);
@@ -287,17 +290,14 @@ describe("release rail policy", () => {
     }
   });
 
-  test("CI and release reject focused Playwright tests before the canonical run", () => {
+  test("CI and release reject focused Playwright tests inside the attested canonical run", () => {
     const gate = readVerifyGate();
-    expect(gate).toContain("--forbid-only");
-    const preflight = gate.slice(
-      gate.lastIndexOf("reject focused Playwright tests", gate.indexOf("--forbid-only")),
-      gate.indexOf("canonical container e2e"),
-    );
-    expect(preflight).toContain("DEMO_URL:");
-    expect(gate.indexOf("--forbid-only")).toBeLessThan(
-      gate.indexOf("./e2e/run-container.sh"),
-    );
+    expect(gate).not.toContain("--config=e2e/playwright.config.ts --list");
+    expect(e2eRunner).toContain("--forbid-only");
+    expect(e2eRunner).toContain('THUMBMUX_TEST_ATTESTATION="$THUMBMUX_GUARD_ATTESTATION"');
+    expect(e2eConfig).toContain("assertThumbmuxPlaywrightRuntime()");
+    expect(e2eHelpers).toContain("assertOwnedContainer()");
+    expect(e2eHelpers).not.toContain("|| 'thumbmux-sim'");
     // Both rails still reach the gate (so forbid-only cannot be skipped by
     // one path only).
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
@@ -315,8 +315,9 @@ describe("release rail policy", () => {
       expect(parity).toContain(`cd ${packageName}`);
       expect(parity).toContain("bun pm pack");
     }
-    expect(parity).toContain("--forbid-only");
-    expect(parity).toContain('DEMO_URL="${DEMO_URL:-http://127.0.0.1:1}"');
+    expect(parity).toContain("./e2e/run-container.sh");
+    expect(parity).not.toContain("--config=e2e/playwright.config.ts --list");
+    expect(e2eRunner).toContain("--forbid-only");
   });
 
   test("server pack excludes Python bytecode caches even when they exist beside sources", () => {
@@ -400,13 +401,13 @@ describe("release rail policy", () => {
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(parity).toContain("THUMBMUX_CONTRACT_REMOTE_URL");
-    expect(parity.indexOf("git -C \"$repo_root\" archive \"$archive_ref\""))
+    expect(parity.indexOf("thumbmux_emit_frozen_source_archive"))
       .toBeLessThan(parity.lastIndexOf("materialize-contract-baseline.ts"));
   });
 
   test("root smoke stages and verifies every advertised contract asset", () => {
-    expect(smoke).toContain('cp "$PACKAGE_ROOT/CONTRACT.md" "$WORK/package/"');
-    expect(smoke).toContain('cp -R "$PACKAGE_ROOT/contract/manifest" "$WORK/package/contract/"');
+    expect(smoke).toContain('cp "$PACKAGE_SOURCE/CONTRACT.md" "$WORK/package/"');
+    expect(smoke).toContain('cp -R "$PACKAGE_SOURCE/contract/manifest" "$WORK/package/contract/"');
     expect(smoke).toContain("package/CONTRACT.md");
     for (const subpath of ["core", "server", "svelte", "app"]) {
       expect(smoke).toContain(`package/contract/manifest/${subpath}.json`);
@@ -414,7 +415,10 @@ describe("release rail policy", () => {
   });
 
   test("packed Node 18 smoke permanently gates portable replay writer recovery", () => {
-    expect(smoke).toContain("timeout 240 docker run --rm");
+    expect(smoke).toContain("/usr/bin/timeout 240 /usr/bin/docker run");
+    expect(smoke).toContain('--cidfile "$CID_FILE"');
+    expect(smoke).toContain("com.kemcortex.thumbmux.run-id");
+    expect(smoke).not.toContain("docker run --rm");
     expect(smoke).toContain("timeout 120 apk add --no-cache python3 tmux");
     expect(smoke).toContain("node18-replay-lock-smoke.mjs");
     expect(smoke).toContain("node node18-replay-lock-smoke.mjs");
@@ -499,7 +503,7 @@ describe("composite action schema", () => {
     );
     // Removing the key must not quietly remove the limit — that would trade a
     // loud failure for a six-hour hang on the default job timeout.
-    expect(gate).toMatch(/run:\s*timeout\b.*bun test/);
-    expect(gate).toMatch(/run:\s*timeout\b.*run-container\.sh/);
+    expect(gate).toMatch(/run:\s*\/usr\/bin\/timeout\b.*bun test/);
+    expect(gate).toMatch(/run:\s*\/usr\/bin\/timeout\b.*run-container\.sh/);
   });
 });

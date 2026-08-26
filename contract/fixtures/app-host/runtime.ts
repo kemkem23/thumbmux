@@ -3,16 +3,18 @@
  * Changes require a matching contract manifest change and the CONTRACT.md
  * deprecation procedure.
  */
-import { chromium } from "@playwright/test";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import {
+import { assertContractFixturePort, assertContractFixtureRuntime } from "./runtime-guard";
+
+const privateRuntime = assertContractFixtureRuntime();
+const { chromium } = await import("@playwright/test");
+const {
   createAppRoutes,
   createBunTmuxDriver,
   killTmuxSession,
   spawnTmuxSession,
-} from "thumbmux/server";
+} = await import("thumbmux/server");
 
 const FIXTURE = "app-host";
 const SESSION_PREFIX = "ctrfix-app";
@@ -48,7 +50,7 @@ function capturePane(name: string): string {
     "tmux",
     "capture-pane",
     "-t",
-    `=${name}:`,
+    `=${name}:0.0`,
     "-p",
     "-S",
     "-100",
@@ -130,7 +132,8 @@ function paneProbeSource(): string {
 
 const fixtureRoot = import.meta.dir;
 const distRoot = resolve(fixtureRoot, "dist");
-const runtimeRoot = await mkdtemp(join(tmpdir(), "thumbmux-app-contract-"));
+const runtimeRoot = join(privateRuntime, `app-contract-${crypto.randomUUID()}`);
+await mkdir(runtimeRoot, { mode: 0o700 });
 const probePath = join(runtimeRoot, "pane-probe.mjs");
 const sessionName = `${SESSION_PREFIX}-${process.pid}-${Date.now()}`;
 const marker = `CTR_APP_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
@@ -209,6 +212,7 @@ try {
     },
     websocket: routes.websocket,
   });
+  assertContractFixturePort(server.port);
   origin = `http://127.0.0.1:${server.port}`;
 
   const executablePath = process.env.CHROMIUM_PATH?.trim();
@@ -322,11 +326,8 @@ try {
 const sessionRemoved = !hasSession(sessionName);
 if (!sessionRemoved) cleanupErrors.push(`tmux session still exists: ${sessionName}`);
 
-try {
-  await rm(runtimeRoot, { recursive: true, force: true });
-} catch (error) {
-  cleanupErrors.push(`temporary directory cleanup: ${errorMessage(error)}`);
-}
+// The outer runner removes the exact dev:ino-attested runtime with
+// rm --one-file-system after proving every listener/session is gone.
 
 const summary = {
   fixture: FIXTURE,

@@ -1,15 +1,28 @@
-import { expect, type Page, type TestInfo } from '@playwright/test';
+import type { Page, TestInfo } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
+import {
+  assertLocalDemoUrl,
+  assertThumbmuxDockerContainer,
+  assertThumbmuxPlaywrightRuntime,
+} from './test-runtime-guard';
 
-const CONTAINER = process.env.THUMBMUX_CONTAINER || 'thumbmux-sim';
+const RUNTIME = assertThumbmuxPlaywrightRuntime();
+assertLocalDemoUrl(process.env.DEMO_URL);
+const { expect } = await import('@playwright/test');
+const CONTAINER = RUNTIME.containerId;
 const SESSION_RE = /^sim-[a-z0-9-]+$/;
+
+function assertOwnedContainer() {
+  assertThumbmuxDockerContainer('e2e');
+}
 
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export function dockerExec(script: string, timeout = 30_000): string {
-  return execFileSync('docker', ['exec', CONTAINER, 'bash', '-lc', script], {
+  assertOwnedContainer();
+  return execFileSync('/usr/bin/docker', ['exec', CONTAINER, '/usr/bin/bash', '-lc', script], {
     encoding: 'utf8',
     timeout,
     maxBuffer: 64 * 1024 * 1024,
@@ -27,14 +40,14 @@ function assertOwnedSession(session: string) {
 
 export function killSession(session: string) {
   assertOwnedSession(session);
-  dockerExec(`tmux kill-session -t ${shellQuote(session)} 2>/dev/null || true`, 10_000);
+  dockerExec(`tmux kill-session -t ${shellQuote(`=${session}`)} 2>/dev/null || true`, 10_000);
 }
 
 export function createLineSession(session: string, prefix: string, count: number) {
   assertOwnedSession(session);
   const limit = Math.max(6000, count + 200);
   dockerExec(`tmux start-server \\; set-option -g history-limit ${limit} \\; new-session -d -s ${shellQuote(session)} -x 120 -y 40 ${shellQuote('bash --noprofile --norc')}`, 10_000);
-  dockerExec(`tmux set-option -t ${shellQuote(session)} history-limit ${limit}`, 10_000);
+  dockerExec(`tmux set-option -t ${shellQuote(`=${session}:0.0`)} history-limit ${limit}`, 10_000);
   runShellCommand(session, `seq -f ${shellQuote(`${prefix} line %04g payload`)} 1 ${count}`);
   const last = `${prefix} line ${String(count).padStart(4, '0')} payload`;
   for (let i = 0; i < 60; i++) {
@@ -47,17 +60,17 @@ export function createLineSession(session: string, prefix: string, count: number
 export function createShellSession(session: string) {
   assertOwnedSession(session);
   dockerExec(`tmux start-server \\; set-option -g history-limit 6000 \\; new-session -d -s ${shellQuote(session)} -x 120 -y 40 ${shellQuote('bash --noprofile --norc')}`, 10_000);
-  dockerExec(`tmux set-option -t ${shellQuote(session)} history-limit 6000`, 10_000);
+  dockerExec(`tmux set-option -t ${shellQuote(`=${session}:0.0`)} history-limit 6000`, 10_000);
 }
 
 export function sendLiteral(session: string, text: string) {
   assertOwnedSession(session);
-  dockerExec(`tmux send-keys -t ${shellQuote(session)} -l -- ${shellQuote(text)}`, 10_000);
+  dockerExec(`tmux send-keys -t ${shellQuote(`=${session}:0.0`)} -l -- ${shellQuote(text)}`, 10_000);
 }
 
 export function sendEnter(session: string) {
   assertOwnedSession(session);
-  dockerExec(`tmux send-keys -t ${shellQuote(session)} Enter`, 10_000);
+  dockerExec(`tmux send-keys -t ${shellQuote(`=${session}:0.0`)} Enter`, 10_000);
 }
 
 export function runShellCommand(session: string, command: string) {
@@ -72,7 +85,7 @@ export function appendLines(session: string, lines: string[]) {
 
 export function capturePane(session: string, startLine = -5000): string {
   assertOwnedSession(session);
-  return dockerExec(`tmux capture-pane -t ${shellQuote(session)} -p -S ${startLine}`, 20_000);
+  return dockerExec(`tmux capture-pane -t ${shellQuote(`=${session}:0.0`)} -p -S ${startLine}`, 20_000);
 }
 
 export function demoUrlForSession(

@@ -17,7 +17,7 @@
     "demo": "bun run --cwd demo start",
     "build:packages": "bun run --cwd core build && bun run --cwd server build && bun run --cwd svelte build && bun run --cwd app build",
     "build:git-dist": "bun run build:packages && bun run ./scripts/rewrite-git-dist-imports.ts",
-    "smoke:git-dist": "bash ./scripts/smoke-git-dist.sh",
+    "smoke:git-dist": "./scripts/smoke-git-dist.sh",
     "prepare": "bun run build:packages",
     "contract": "bun ./scripts/contract-check.ts"
   },

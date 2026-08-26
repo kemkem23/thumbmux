@@ -13,13 +13,13 @@ function createHistorySession(session: string) {
       `new-session -d -s ${shellQuote(session)} -x 120 -y 40 ${shellQuote('bash --noprofile --norc')}`,
     10_000,
   );
-  dockerExec(`tmux set-option -t ${shellQuote(session)} history-limit ${HISTORY_LIMIT}`, 10_000);
-  dockerExec(`tmux send-keys -t ${shellQuote(session)} -l -- ${shellQuote(`seq -f '${PREFIX} line %05g payload' 1 ${TOTAL_LINES}`)}`, 10_000);
-  dockerExec(`tmux send-keys -t ${shellQuote(session)} Enter`, 10_000);
+  dockerExec(`tmux set-option -t ${shellQuote(`=${session}:0.0`)} history-limit ${HISTORY_LIMIT}`, 10_000);
+  dockerExec(`tmux send-keys -t ${shellQuote(`=${session}:0.0`)} -l -- ${shellQuote(`seq -f '${PREFIX} line %05g payload' 1 ${TOTAL_LINES}`)}`, 10_000);
+  dockerExec(`tmux send-keys -t ${shellQuote(`=${session}:0.0`)} Enter`, 10_000);
 
   const last = `${PREFIX} line ${String(TOTAL_LINES).padStart(5, '0')} payload`;
   for (let i = 0; i < 120; i++) {
-    const pane = dockerExec(`tmux capture-pane -t ${shellQuote(session)} -p -S -80`, 20_000);
+    const pane = dockerExec(`tmux capture-pane -t ${shellQuote(`=${session}:0.0`)} -p -S -80`, 20_000);
     if (pane.includes(last)) return;
     dockerExec('sleep 0.1', 1_000);
   }
