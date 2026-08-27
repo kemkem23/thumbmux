@@ -197,6 +197,10 @@ describe('thumbmux e2e runtime admission', () => {
   test('the canonical Playwright CLI runs through the exact post-admission Node binary', () => {
     const e2e = readFileSync(resolve(import.meta.dir, '../e2e/run-container.sh'), 'utf8');
     const guard = readFileSync(resolve(import.meta.dir, 'test-runtime-guard.sh'), 'utf8');
+    const manifest = JSON.parse(readFileSync(
+      resolve(import.meta.dir, '../package.json'),
+      'utf8',
+    )) as { devDependencies?: Record<string, string> };
     const action = readFileSync(
       resolve(import.meta.dir, '../.github/actions/verify-gate/action.yml'),
       'utf8',
@@ -208,6 +212,10 @@ describe('thumbmux e2e runtime admission', () => {
     expect(action).toContain('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0');
     expect(action).toContain('node-version: 22.23.2');
     expect(action).toContain('check-latest: false');
+    // Bun may lay @playwright/test out through its isolated store while
+    // Playwright's Node ESM hook resolves from the logical top-level package.
+    // Keep the runtime package direct so both layouts expose the same root.
+    expect(manifest.devDependencies?.playwright).toBe('1.61.1');
     expect(guard).toContain('/opt/hostedtoolcache/node/22.23.2/x64/bin/node');
     expect(guard).toContain('node_owner" =~ ^(0|$(/usr/bin/id -u)):[0-7]{3,4}:regular\\ file$');
     expect(guard).toContain('! -L "$node_bin"');
