@@ -215,4 +215,19 @@ describe('TermView cursor grid mapping', () => {
     expect(px(cursor(viewport).style.left)).toBeCloseTo(6 + cellWidth, 5);
     expect(px(cursor(viewport).style.width)).toBeCloseTo(2 * cellWidth, 5);
   });
+
+  test('tracks each tmux cell inside multi-codepoint Devanagari clusters', async () => {
+    const viewport = mountView();
+    // Private tmux 3.4 reports both strings as two cells: ह+ि and क्+ष.
+    // The cursor may occupy either grid cell even though the browser shapes
+    // each string as one visual cluster, so do not widen it to the grapheme.
+    for (const text of ['हि', 'क्ष']) {
+      for (const col of [0, 1]) {
+        await deliver([text], { row: 0, col });
+        const cellWidth = px(viewport.style.getPropertyValue('--mtv-cw'));
+        expect(px(cursor(viewport).style.left)).toBeCloseTo(6 + col * cellWidth, 5);
+        expect(px(cursor(viewport).style.width)).toBeCloseTo(cellWidth, 5);
+      }
+    }
+  });
 });
