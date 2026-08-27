@@ -1021,8 +1021,15 @@ describe("TermView sliding archive window", () => {
 
     const selection = window.getSelection();
     if (!selection) throw new Error("window selection was unavailable");
+    const selectedRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => (row.textContent?.length ?? 0) > 0);
+    const selectedText = selectedRow?.firstChild;
+    if (!(selectedText instanceof Text) || selectedText.data.length === 0) {
+      throw new Error("rendered row did not expose a selectable text node");
+    }
     const range = document.createRange();
-    range.selectNodeContents(viewport);
+    range.setStart(selectedText, 0);
+    range.setEnd(selectedText, 1);
     selection.removeAllRanges();
     selection.addRange(range);
     document.dispatchEvent(new Event("selectionchange"));
