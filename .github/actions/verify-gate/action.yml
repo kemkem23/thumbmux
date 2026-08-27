@@ -76,13 +76,12 @@ runs:
         path: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
         if-no-files-found: ignore
         retention-days: 7
-    # The suite includes tests that assert properties of the shipped artifact
-    # (dist hygiene, the README quickstart pack). They need git-dist to exist
-    # before they run. On a developer machine it is usually lying around from
-    # an earlier build, which is exactly how they passed locally for the whole
-    # of v0.8.0 while failing on the first clean checkout CI ever gave them.
-    - name: build git-dist for the artifact tests
-      run: bun run build:git-dist
+    # The smoke lane has the same clean-checkout admission as container E2E.
+    # Run it before unit/demo/pack lanes can create non-source scratch output;
+    # its build also supplies git-dist to the artifact tests below. Moving it
+    # later would force the guard to trust a checkout already used by tests.
+    - name: root git-dist consumer smoke
+      run: bun run build:git-dist && bun run smoke:git-dist
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
     # Combined process only — no per-workflow split suites. Split suites once
     # gave better failure locality on ci but meant release ran a different
@@ -119,9 +118,6 @@ runs:
         (cd svelte && bun run build && bun pm pack)
         (cd app && bun run build && bun pm pack)
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
-    - name: root git-dist consumer smoke
-      run: bun run build:git-dist && bun run smoke:git-dist
-      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
     - name: materialize immutable prior contract
       run: |
         baseline_root="$RUNNER_TEMP/thumbmux-contract-baseline"
@@ -146,7 +142,16 @@ runs:
       # or leave an undeclared artifact before release-dist creates its tag.
       run: |
         test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-        git diff --quiet --no-ext-diff --
-        git diff --cached --quiet --no-ext-diff --
-        test -z "$(git ls-files --others --exclude-standard)"
+        if ! git diff --quiet --no-ext-diff -- \
+          || ! git diff --cached --quiet --no-ext-diff --; then
+          printf 'verify-gate: tracked/staged source drift after verification\n' >&2
+          git diff --name-status -- >&2
+          git diff --cached --name-status -- >&2
+          exit 1
+        fi
+        untracked="$(git ls-files --others --exclude-standard)"
+        if [[ -n "$untracked" ]]; then
+          printf 'verify-gate: undeclared output after verification\n%s\n' "$untracked" >&2
+          exit 1
+        fi
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}

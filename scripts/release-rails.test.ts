@@ -286,14 +286,19 @@ describe("release rail policy", () => {
     const frozenInstallStep = gate.indexOf("bun install --frozen-lockfile");
     const playwrightInstallStep = gate.indexOf("- name: install Playwright Chromium");
     const e2eStep = gate.indexOf("- name: canonical container e2e");
-    const artifactBuildStep = gate.indexOf("- name: build git-dist for the artifact tests");
+    const smokeStep = gate.indexOf("- name: root git-dist consumer smoke");
+    const unitStep = gate.indexOf("- name: unit and contract suites");
     expect(nodeSetupStep).toBeGreaterThan(-1);
     expect(bunSetupStep).toBeGreaterThan(nodeSetupStep);
     expect(frozenInstallStep).toBeGreaterThan(bunSetupStep);
     expect(playwrightInstallStep).toBeGreaterThan(frozenInstallStep);
     expect(e2eStep).toBeGreaterThan(playwrightInstallStep);
     expect(e2eStep).toBeGreaterThan(-1);
-    expect(artifactBuildStep).toBeGreaterThan(e2eStep);
+    expect(smokeStep).toBeGreaterThan(e2eStep);
+    expect(unitStep).toBeGreaterThan(smokeStep);
+    expect(gate.indexOf("- name: root git-dist consumer smoke", smokeStep + 1)).toBe(-1);
+    expect(gate).not.toContain("- name: build git-dist for the artifact tests");
+    expect(gate).toContain("verify-gate: undeclared output after verification");
 
     const nodeSetupBlock = gate.slice(nodeSetupStep, bunSetupStep);
     expect(nodeSetupBlock).toContain("node-version: 22.23.2");
