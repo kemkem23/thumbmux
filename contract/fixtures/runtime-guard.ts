@@ -77,7 +77,7 @@ export function assertContractFixtureRuntime(): string {
     || !/^(?:\/opt\/hostedtoolcache\/bun\/[^/]+\/x64\/bun|\/home\/runner\/(?:setup-bun|\.bun)\/bin\/bun)$/.test(bunBin)
     || !lstatSync(bunBin).isFile()
     || lstatSync(bunBin).isSymbolicLink()
-    || bunBinStat.uid !== uid
+    || (bunBinStat.uid !== 0 && bunBinStat.uid !== uid)
     || (bunBinStat.mode & 0o111) === 0
     || privateBinStat.uid !== uid
     || (privateBinStat.mode & 0o7777) !== 0o700

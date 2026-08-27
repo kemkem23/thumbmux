@@ -122,6 +122,9 @@ describe("frozen consumer runner policy", () => {
     expect(fixtureGuard).toContain(
       "bunBin !== process.env.THUMBMUX_GUARD_BUN_BIN",
     );
+    expect(fixtureGuard).toContain(
+      "(bunBinStat.uid !== 0 && bunBinStat.uid !== uid)",
+    );
     expect(appRuntime).toContain(
       '`exec ${shellQuote(bunBin)} ${shellQuote(probePath)}`',
     );
