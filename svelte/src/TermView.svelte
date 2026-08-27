@@ -5760,6 +5760,11 @@
   data-history-request-direction={archiveInflightDirection ?? undefined}
   data-no-scrollback={noScrollback ? '1' : undefined}
   data-screen-mode-known={screenModeKnown ? '1' : undefined}
+  data-content-update-pending={contentUpdateGate.pending ? '1' : '0'}
+  data-content-update-pending-cursor-row={contentUpdateGate.pending?.cursor?.row}
+  data-content-update-pending-cursor-col={contentUpdateGate.pending?.cursor?.col}
+  data-content-update-busy={busy() ? '1' : '0'}
+  data-content-update-selection={selectionActive ? '1' : '0'}
   style:font-size={`${fontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
@@ -5873,6 +5878,10 @@
           style:width={`${Math.max(2, cpos.width)}px`}
           style:height={`${lineH}px`}
           data-testid="mtv-cursor"
+          data-cursor-row={cursor.row}
+          data-cursor-col={cursor.col}
+          data-cursor-raw-line={cline}
+          data-cursor-visual-row={cvisual}
         ></div>
       {/if}
     {/if}
