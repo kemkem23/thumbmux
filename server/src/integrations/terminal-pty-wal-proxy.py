@@ -43,6 +43,9 @@ LOCK_FILE = "writer.lock"
 HEALTH_FILE = "pty-proxy-status.json"
 DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log"
 FINALIZE_LOGICAL_END_FLAG = "--finalize-logical-end"
+TEST_BOOT_DIAGNOSTIC_ENV = "THUMBMUX_TEST_TERMINAL_PROXY_BOOT_DIAGNOSTIC"
+TEST_BOOT_DIAGNOSTIC_PATH = "/run/kemcortex-browser-suite/logs/terminal-proxy-boot.log"
+TEST_BOOT_DIAGNOSTIC_MAX_BYTES = 128 * 1024
 
 MAGIC = b"THMWAL01"
 VERSION = 1
@@ -78,6 +81,33 @@ class ProxyError(RuntimeError):
 
 class WalCorruption(ProxyError):
     pass
+
+
+def write_browser_sandbox_boot_diagnostic(error: BaseException) -> None:
+    """Record pre-config failures only in the exact private browser runtime."""
+    if (
+        os.environ.get("CORTEX_TEST_HARD_SANDBOX") != "browser"
+        or os.environ.get("CORTEX_TEST_RUNTIME") != "/run/kemcortex-browser-suite"
+        or os.environ.get(TEST_BOOT_DIAGNOSTIC_ENV) != TEST_BOOT_DIAGNOSTIC_PATH
+    ):
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(TEST_BOOT_DIAGNOSTIC_PATH, flags, PRIVATE_FILE_MODE)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != PRIVATE_FILE_MODE
+            or info.st_size >= TEST_BOOT_DIAGNOSTIC_MAX_BYTES
+        ):
+            return
+        message = f"{type(error).__name__}: {error}".replace("\0", "").replace("\n", " ")
+        payload = (message[:4096] + "\n").encode("utf-8", "replace")
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def now_ms() -> int:
@@ -1825,9 +1855,15 @@ def main(arguments: Optional[list[str]] = None) -> int:
     try:
         asset_sha256 = verify_running_proxy_asset()
         config = load_config()
-    except BaseException:
+    except BaseException as error:
         # No trusted private diagnostics path exists yet.  Never leak proxy
         # internals into the pane that is reserved for child terminal bytes.
+        # The exact browser hard sandbox is the sole exception: its bounded
+        # tmpfs log contains only synthetic state and is destroyed after export.
+        try:
+            write_browser_sandbox_boot_diagnostic(error)
+        except BaseException:
+            pass
         return 125
     if selected_arguments == [FINALIZE_LOGICAL_END_FLAG]:
         try:
