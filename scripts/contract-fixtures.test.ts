@@ -140,6 +140,15 @@ describe("frozen consumer runner policy", () => {
     expect(lock).toContain('"@types/bun": ["@types/bun@1.3.14"');
   });
 
+  test("app consumer uses the exact browser installed by the verify gate", () => {
+    const source = readFileSync(runner, "utf8");
+    const lock = readFileSync(resolve(import.meta.dir, "../bun.lock"), "utf8");
+
+    expect(source).toContain("'devDependencies.@playwright/test=1.61.1'");
+    expect(source).not.toContain("'devDependencies.@playwright/test=^1.61.1'");
+    expect(lock).toContain('"@playwright/test": ["@playwright/test@1.61.1"');
+  });
+
   test("consumer port guard rejects an unassigned or production listener", () => {
     expect(() => assertContractFixturePort(undefined)).toThrow(
       "unsafe or reserved loopback port undefined",
