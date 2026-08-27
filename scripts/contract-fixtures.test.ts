@@ -116,6 +116,15 @@ describe("frozen consumer runner policy", () => {
     expect(fixtureGuard).not.toContain("pathParts.length !== 4");
   });
 
+  test("consumer Bun types stay aligned with the frozen package lock", () => {
+    const source = readFileSync(runner, "utf8");
+    const lock = readFileSync(resolve(import.meta.dir, "../bun.lock"), "utf8");
+
+    expect(source).toContain("'devDependencies.@types/bun=1.3.14'");
+    expect(source).not.toContain("'devDependencies.@types/bun=^1.3.0'");
+    expect(lock).toContain('"@types/bun": ["@types/bun@1.3.14"');
+  });
+
   test("forged disposable markers still fail before tmux or Docker", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-contract-lock-test-"));
     roots.push(root);
