@@ -979,6 +979,89 @@ describe("TermView sliding archive window", () => {
     expect(cursor?.getAttribute("data-cursor-col")).toBe("7");
   });
 
+  test("drops stale screen mode with the rejected content and cursor frame", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    const accepted = absoluteLines(105, 20);
+    deliverOutput(
+      accepted,
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-screen-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 7 } },
+    );
+    const acceptedDeliveryCount = deliveredLines.length;
+
+    deliverOutput(
+      absoluteLines(103, 20).map((line) => `stale-${line}`),
+      { alt: true, mouseSgr: true, mouseAny: true },
+      historyBoundary("g-screen-regression", 103, 14),
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
+    );
+
+    expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("7");
+  });
+
+  test("keeps a newer pending boundary when a stale cached frame arrives", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-pending-regression", 100, 10),
+      { source: "full", replace: false, cursor: { row: 0, col: 1 } },
+    );
+    const appliedDeliveryCount = deliveredLines.length;
+
+    const selection = window.getSelection();
+    if (!selection) throw new Error("window selection was unavailable");
+    const range = document.createRange();
+    range.selectNodeContents(viewport);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+    expect(viewport.getAttribute("data-content-update-selection")).toBe("1");
+
+    const pending = absoluteLines(105, 20);
+    deliverOutput(
+      pending,
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-pending-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 5 } },
+    );
+    expect(viewport.getAttribute("data-content-update-pending")).toBe("1");
+    expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(100);
+
+    deliverOutput(
+      absoluteLines(103, 20).map((line) => `stale-${line}`),
+      { alt: true, mouseSgr: true, mouseAny: true },
+      historyBoundary("g-pending-regression", 103, 13),
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
+    );
+    expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
+    expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
+    expect(deliveredLines).toHaveLength(appliedDeliveryCount);
+
+    selection.removeAllRanges();
+    document.dispatchEvent(new Event("selectionchange"));
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-content-update-pending")).toBe("0");
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(deliveredLines.at(-1)).toEqual(pending);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("5");
+  });
+
   test("rejects stale WAL coordinates at an unchanged live seam", async () => {
     const { viewport } = mountTermView();
     await tick();

@@ -373,6 +373,11 @@
   let archiveInflightDirection = $state<HistoryWindowDirection | null>(null);
   let archiveInflightAnchorLine: number | null = null;
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
+  // The applied boundary can lag while content is held behind a selection or
+  // gesture. Remember the newest frame admitted from the wire as a separate
+  // high-water fence so a reconnecting cached frame cannot replace that
+  // pending delivery before reconcileLiveBoundary() gets a chance to run.
+  let admittedLiveBoundaryHighWater: MuxHistoryBoundary | null = null;
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
   // Keep the per-frame compositor offset out of Svelte reactivity. Diagnostics
@@ -4400,6 +4405,32 @@
     return { busy: busy(), selectionActive };
   }
 
+  /**
+   * Fence the complete live frame before any of its screen, cursor, or content
+   * state is observed. `liveBoundary` covers committed deliveries; the
+   * high-water mark also covers a newer whole frame waiting in the content
+   * gate. Both are needed because the gate deliberately coalesces by arrival.
+   */
+  function admitLiveDelivery(meta?: MuxDeliveryMeta): boolean {
+    const boundary = meta?.boundary;
+    if (!boundary || historyPaging !== 'sliding') return true;
+    const previous = admittedLiveBoundaryHighWater ?? liveBoundary;
+    if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
+      return false;
+    }
+    admittedLiveBoundaryHighWater = { ...boundary };
+    return true;
+  }
+
+  function applyLiveScreen(meta?: MuxDeliveryMeta): void {
+    if (!meta || !Object.prototype.hasOwnProperty.call(meta, 'screen')) return;
+    // Accepted screen mode remains immediate while a selection/gesture holds
+    // paint, preserving pointer routing without letting a rejected stale frame
+    // reset scrollback or mouse policy.
+    liveScreen = meta.screen ?? null;
+    liveScreenSeen = true;
+  }
+
   function applyContentDelivery(delivery: ContentUpdate) {
     const boundaryReconciliation = reconcileLiveBoundary(
       (delivery.meta as MuxDeliveryMeta).boundary,
@@ -4419,6 +4450,8 @@
     nextCursor: { row: number; col: number } | null | undefined,
     meta?: MuxDeliveryMeta,
   ) {
+    if (!admitLiveDelivery(meta)) return;
+    applyLiveScreen(meta);
     const result = receiveContentUpdate(contentUpdateGate, {
       data,
       cursor: nextCursor,
@@ -5564,12 +5597,6 @@
       cur?: { row: number; col: number } | null,
       meta?: MuxDeliveryMeta,
     ) => {
-      // Apply screen mode even when content is gated (busy/selection): pointer
-      // routing and scrollback policy must track the pane, not the paint queue.
-      if (meta && Object.prototype.hasOwnProperty.call(meta, 'screen')) {
-        liveScreen = meta.screen ?? null;
-        liveScreenSeen = true;
-      }
       if (type === 'history') {
         applyArchivedHistory(data);
         return;
