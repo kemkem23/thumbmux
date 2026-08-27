@@ -5528,6 +5528,16 @@
   let unsubscribe: (() => void) | null = null;
   let resizeObs: ResizeObserver | null = null;
   let observedVisualViewport: VisualViewport | null = null;
+  let observedFontSet: FontFaceSet | null = null;
+
+  function onFontMetricsChanged(): void {
+    if (destroyed) return;
+    // A swap-loaded web font changes glyph metrics without changing the
+    // viewport box, so ResizeObserver cannot see it. Re-measure normally: the
+    // CSS cell width always updates, while tmux receives a resize only when
+    // the rounded cols/rows actually changed.
+    pushGeometry();
+  }
 
   onMount(() => {
     updateViewportGeometry(viewportEl);
@@ -5576,6 +5586,14 @@
       applyScroll();
     });
     if (viewportEl) resizeObs.observe(viewportEl);
+    const fontSet = (document as Document & { fonts?: FontFaceSet }).fonts;
+    if (fontSet) {
+      observedFontSet = fontSet;
+      observedFontSet.addEventListener('loadingdone', onFontMetricsChanged);
+      void observedFontSet.ready.then(onFontMetricsChanged, () => {
+        // Font loading failure leaves the currently measured fallback grid.
+      });
+    }
     observedVisualViewport = window.visualViewport;
     observedVisualViewport?.addEventListener('resize', refreshAltTouchHitArea, { passive: true });
     observedVisualViewport?.addEventListener('scroll', refreshAltTouchHitArea, { passive: true });
@@ -5623,6 +5641,8 @@
     }
     if (unsubscribe) unsubscribe();
     resizeObs?.disconnect();
+    observedFontSet?.removeEventListener('loadingdone', onFontMetricsChanged);
+    observedFontSet = null;
     observedVisualViewport?.removeEventListener('resize', refreshAltTouchHitArea);
     observedVisualViewport?.removeEventListener('scroll', refreshAltTouchHitArea);
     observedVisualViewport = null;
