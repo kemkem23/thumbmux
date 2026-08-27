@@ -277,16 +277,17 @@ describe("release rail policy", () => {
       expect(gate).toContain(marker);
     }
 
-    // Docker admission requires the primary checkout to be the clean exact
-    // public commit. build:git-dist and later suites intentionally create
-    // ignored artifacts, so the canonical E2E lane must run before the first
-    // source-tree build instead of weakening the runtime guard for dirty state.
+    // Guarded Docker/network lanes require the primary checkout to be the clean
+    // exact public commit. build:git-dist supplies the frozen consumer fixtures,
+    // but unit/demo/pack lanes may create scratch output, so every guarded lane
+    // must finish before those later lanes instead of weakening admission.
     const nodeSetupStep = gate.indexOf("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020");
     const bunSetupStep = gate.indexOf("oven-sh/setup-bun@v2");
     const frozenInstallStep = gate.indexOf("bun install --frozen-lockfile");
     const playwrightInstallStep = gate.indexOf("- name: install Playwright Chromium");
     const e2eStep = gate.indexOf("- name: canonical container e2e");
     const smokeStep = gate.indexOf("- name: root git-dist consumer smoke");
+    const fixturesStep = gate.indexOf("- name: frozen consumer contract gate");
     const unitStep = gate.indexOf("- name: unit and contract suites");
     expect(nodeSetupStep).toBeGreaterThan(-1);
     expect(bunSetupStep).toBeGreaterThan(nodeSetupStep);
@@ -295,8 +296,10 @@ describe("release rail policy", () => {
     expect(e2eStep).toBeGreaterThan(playwrightInstallStep);
     expect(e2eStep).toBeGreaterThan(-1);
     expect(smokeStep).toBeGreaterThan(e2eStep);
-    expect(unitStep).toBeGreaterThan(smokeStep);
+    expect(fixturesStep).toBeGreaterThan(smokeStep);
+    expect(unitStep).toBeGreaterThan(fixturesStep);
     expect(gate.indexOf("- name: root git-dist consumer smoke", smokeStep + 1)).toBe(-1);
+    expect(gate.indexOf("- name: frozen consumer contract gate", fixturesStep + 1)).toBe(-1);
     expect(gate).not.toContain("- name: build git-dist for the artifact tests");
     expect(gate).toContain("verify-gate: undeclared output after verification");
 
