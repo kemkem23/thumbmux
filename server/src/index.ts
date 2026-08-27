@@ -44,6 +44,7 @@ export type { TerminalPtyWalProxyHealth } from './integrations/terminal-pty-wal-
 
 export * from './ws-mux';
 export * from './bun-driver';
+export * from './tmux-capture-normalize';
 export * from './spawn-handler';
 export * from './upload-handler';
 export * from "./prefs-handler";

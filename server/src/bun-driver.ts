@@ -6,6 +6,7 @@
  */
 import type { MuxPaneScreen } from "@thumbmux/core";
 import type { RawCursorState, TmuxDriver } from "./ws-mux";
+import { normalizeTmuxCaptureCells } from './tmux-capture-normalize';
 
 const LARGE_INPUT_THRESHOLD_BYTES = 8 * 1024;
 
@@ -128,7 +129,7 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
       const p = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
       const out = await new Response(p.stdout).text();
       if ((await p.exited) !== 0) throw new Error(`capture-pane failed for ${session}`);
-      return out;
+      return normalizeTmuxCaptureCells(out);
     },
     sendKeys(session, data) {
       const bytes = new TextEncoder().encode(data);
@@ -198,7 +199,7 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
       if ((await p.exited) !== 0) throw new Error(`capture-pane failed for ${session}`);
       const nl = out.indexOf("\n");
       const statusLine = nl === -1 ? out : out.slice(0, nl);
-      const content = nl === -1 ? "" : out.slice(nl + 1);
+      const content = normalizeTmuxCaptureCells(nl === -1 ? "" : out.slice(nl + 1));
       const lines = content.replace(/\n$/, "").split("\n");
       let last = lines.length;
       while (last > 0 && (lines[last - 1] ?? "").trim() === "") last--;
