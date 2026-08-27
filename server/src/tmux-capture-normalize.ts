@@ -2,6 +2,8 @@ import { charCellWidth } from '@thumbmux/core';
 
 const ESC = 0x1b;
 const BEL = 0x07;
+const SO = 0x0e;
+const SI = 0x0f;
 const VS16 = 0xfe0f;
 
 function escapeEnd(text: string, start: number): number {
@@ -58,6 +60,15 @@ export function normalizeTmuxCaptureCells(text: string): string {
       index += 1;
       previousVisibleWidth = 0;
       promotedPaddingPending = false;
+      continue;
+    }
+    if (codePoint === SO || codePoint === SI) {
+      // Shift Out/In changes the active terminal character set but occupies
+      // no cell. tmux normally consumes it before capture-pane serialization;
+      // preserve the byte without losing a still-pending continuation cell if
+      // an alternate capture mode or tmux version does surface it.
+      normalized += text.slice(index, index + unitLength);
+      index += unitLength;
       continue;
     }
 
