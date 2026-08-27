@@ -292,6 +292,27 @@ function wheel(viewport: HTMLElement, deltaY: number): void {
   drainScheduledWork();
 }
 
+function touchEvent(
+  type: "touchstart" | "touchend",
+  touches: Array<{ clientX: number; clientY: number }>,
+  changedTouches = touches,
+): TouchEvent {
+  const asTouchList = (points: Array<{ clientX: number; clientY: number }>): TouchList => {
+    const list = points.slice() as Array<{ clientX: number; clientY: number }> & {
+      item(index: number): Touch | null;
+    };
+    list.item = (index: number) => (list[index] as Touch | undefined) ?? null;
+    return list as unknown as TouchList;
+  };
+  const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+  Object.defineProperties(event, {
+    touches: { value: asTouchList(touches) },
+    targetTouches: { value: asTouchList(touches) },
+    changedTouches: { value: asTouchList(changedTouches) },
+  });
+  return event;
+}
+
 function numberAttr(viewport: HTMLElement, name: string): number {
   const raw = viewport.getAttribute(name);
   if (raw === null) throw new Error(`${name} missing`);
@@ -1019,50 +1040,34 @@ describe("TermView sliding archive window", () => {
     );
     const appliedDeliveryCount = deliveredLines.length;
 
-    const selectedNode = viewport.querySelector<HTMLElement>(".mtv-line");
-    if (!selectedNode) throw new Error("rendered row was unavailable for the selection gate");
-    const originalGetSelection = window.getSelection.bind(window);
     const pending = absoluteLines(105, 20);
-    Object.defineProperty(window, "getSelection", {
-      configurable: true,
-      value: () => ({
-        isCollapsed: false,
-        anchorNode: selectedNode,
-        focusNode: selectedNode,
-      }) as Selection,
-    });
-    try {
-      document.dispatchEvent(new Event("selectionchange"));
-      flushSync();
+    const touch = { clientX: 40, clientY: 80 };
+    viewport.dispatchEvent(touchEvent("touchstart", [touch]));
+    flushSync();
 
-      deliverOutput(
-        pending,
-        { alt: false, mouseSgr: false, mouseAny: false },
-        historyBoundary("g-pending-regression", 105, 15),
-        { source: "full", replace: false, cursor: { row: 0, col: 5 } },
-      );
-      expect(viewport.getAttribute("data-content-update-pending")).toBe("1");
-      expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
-      expect(numberAttr(viewport, "data-history-live-start")).toBe(100);
+    deliverOutput(
+      pending,
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-pending-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 5 } },
+    );
+    expect(viewport.getAttribute("data-content-update-pending")).toBe("1");
+    expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(100);
 
-      deliverOutput(
-        absoluteLines(103, 20).map((line) => `stale-${line}`),
-        { alt: true, mouseSgr: true, mouseAny: true },
-        historyBoundary("g-pending-regression", 103, 13),
-        { source: "full", replace: false, cursor: { row: 0, col: 3 } },
-      );
-      expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
-      expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
-      expect(deliveredLines).toHaveLength(appliedDeliveryCount);
-    } finally {
-      Object.defineProperty(window, "getSelection", {
-        configurable: true,
-        value: originalGetSelection,
-      });
-      document.dispatchEvent(new Event("selectionchange"));
-      flushSync();
-      drainScheduledWork();
-    }
+    deliverOutput(
+      absoluteLines(103, 20).map((line) => `stale-${line}`),
+      { alt: true, mouseSgr: true, mouseAny: true },
+      historyBoundary("g-pending-regression", 103, 13),
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
+    );
+    expect(viewport.getAttribute("data-content-update-pending-cursor-col")).toBe("5");
+    expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
+    expect(deliveredLines).toHaveLength(appliedDeliveryCount);
+
+    viewport.dispatchEvent(touchEvent("touchend", [], [touch]));
+    flushSync();
+    drainScheduledWork();
 
     expect(viewport.getAttribute("data-content-update-pending")).toBe("0");
     expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
