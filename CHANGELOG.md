@@ -1,7 +1,40 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.6-dist`.
+
+## v0.18.6 — 2026-08-27
+
+### Fixed
+
+- **Initial history no longer duplicates terminal rows or jumps the reader at
+  the durable live/archive seam.** Overlapping bootstrap, prepend and live
+  deliveries are reconciled as one ordered boundary, including a pending newer
+  frame followed by an older cached frame. A stale delivery is rejected before
+  it can change screen metadata, content, cursor or the pending high-water mark.
+
+- **The cursor stays on the rendered terminal cell while content, fonts and
+  viewport geometry change.** Row-zero cursors re-anchor when an unchanged
+  cursor coordinate receives a longer content tail; late web-font readiness,
+  resize, Unicode combining sequences, CJK and emoji retain the same measured
+  cell geometry as the rendered rows.
+
+- **Raw tmux capture remains byte-faithful by default.** The optional capture
+  normalizer is exported for explicit diagnostics, but the Bun driver does not
+  rewrite ambiguous variation-selector padding before host WAL or archive
+  ingestion.
+
+- **Managed launch callbacks can retain their durable receipt across retries.**
+  App and upload hosts may persist a returned launch receipt instead of losing
+  it when the first presentation attempt is retried.
+
+### Security
+
+- **Release, contract and real-browser lanes now fail closed outside an
+  attested disposable runtime.** The package rail fingerprints one frozen tree,
+  private tmux target, namespaces, ports and credentials boundary; local lanes
+  cannot silently claim the Docker/network lifecycle proof reserved for the
+  public GitHub-hosted runner.
 
 ## v0.18.5 — 2026-08-25
 
