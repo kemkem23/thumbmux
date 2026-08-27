@@ -169,7 +169,7 @@ install_consumer() {
     npm pkg set "name=thumbmux-contract-$fixture" "type=module"
     npm pkg set "private=true" --json
     npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
-    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=^1.3.0'
+    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=1.3.14'
 
     if [[ "$fixture" == "app-host" ]]; then
       npm pkg set 'dependencies.svelte=^5.51.0'
