@@ -242,6 +242,66 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", name]);
   });
 
+  test("the v0.18.6 nested upload additions require the exact patch and digest pair", () => {
+    const name = "AppAdapters";
+    const baselineDigest = "4daaa8569401f924d83ae1d3ed7efde5c7744969ca10decc4bc4d29ca51f8f37";
+    const reviewedDigest = "94a4200917228a4cdfb183dd31d6a37b9c437b1a4e9f9d71ccd0e571d1431b4b";
+    const manifest: ContractEntry[] = [{
+      name,
+      kind: "type",
+      signature: baselineDigest,
+      tier: "S",
+    }];
+    const baselineLive = [{
+      name,
+      kind: "type" as const,
+      signature: baselineDigest,
+      compatibilitySignature: baselineDigest,
+    }];
+    const currentLive = [{
+      name,
+      kind: "type" as const,
+      signature: reviewedDigest,
+      compatibilitySignature: reviewedDigest,
+    }];
+
+    expect(evaluateBaseline(
+      "app",
+      manifest,
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.5",
+      "0.18.6",
+    ).errors).toEqual([]);
+
+    const wrongDigest = [{
+      ...currentLive[0]!,
+      compatibilitySignature: `${reviewedDigest.slice(0, -1)}0`,
+    }];
+    expect(evaluateBaseline(
+      "app",
+      manifest,
+      manifest,
+      baselineLive,
+      wrongDigest,
+      "0.18.5",
+      "0.18.6",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+
+    expect(evaluateBaseline(
+      "app",
+      manifest,
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.5",
+      "0.18.7",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+  });
+
   test("a minor may add optional members without weakening existing F members", () => {
     const baseline = fixture("0.8.4");
     writeCoreDeclarations(baseline, [
