@@ -292,6 +292,28 @@ function wheel(viewport: HTMLElement, deltaY: number): void {
   drainScheduledWork();
 }
 
+function asTouchList(points: Array<{ clientX: number; clientY: number }>): TouchList {
+  const list = points.slice() as Array<{ clientX: number; clientY: number }> & {
+    item(index: number): Touch | null;
+  };
+  list.item = (index: number) => (list[index] as Touch | undefined) ?? null;
+  return list as unknown as TouchList;
+}
+
+function touchEvent(
+  type: "touchstart" | "touchend",
+  touches: Array<{ clientX: number; clientY: number }>,
+  changedTouches = touches,
+): TouchEvent {
+  const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+  Object.defineProperties(event, {
+    touches: { value: asTouchList(touches) },
+    targetTouches: { value: asTouchList(touches) },
+    changedTouches: { value: asTouchList(changedTouches) },
+  });
+  return event;
+}
+
 function numberAttr(viewport: HTMLElement, name: string): number {
   const raw = viewport.getAttribute(name);
   if (raw === null) throw new Error(`${name} missing`);
@@ -1019,24 +1041,10 @@ describe("TermView sliding archive window", () => {
     );
     const appliedDeliveryCount = deliveredLines.length;
 
-    const selection = window.getSelection();
-    if (!selection) throw new Error("window selection was unavailable");
-    const selectedRow = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
-      .find((row) => (row.textContent?.length ?? 0) > 0);
-    const selectedText = selectedRow
-      ? document.createTreeWalker(selectedRow, 4).nextNode()
-      : null;
-    if (selectedText?.nodeType !== Node.TEXT_NODE || (selectedText.textContent?.length ?? 0) === 0) {
-      throw new Error("rendered row did not expose a selectable text node");
-    }
-    const range = document.createRange();
-    range.setStart(selectedText, 0);
-    range.setEnd(selectedText, 1);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    document.dispatchEvent(new Event("selectionchange"));
+    const touch = { clientX: 40, clientY: 80 };
+    viewport.dispatchEvent(touchEvent("touchstart", [touch]));
     flushSync();
-    expect(viewport.getAttribute("data-content-update-selection")).toBe("1");
+    expect(viewport.getAttribute("data-content-update-busy")).toBe("1");
 
     const pending = absoluteLines(105, 20);
     deliverOutput(
@@ -1059,8 +1067,7 @@ describe("TermView sliding archive window", () => {
     expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
     expect(deliveredLines).toHaveLength(appliedDeliveryCount);
 
-    selection.removeAllRanges();
-    document.dispatchEvent(new Event("selectionchange"));
+    viewport.dispatchEvent(touchEvent("touchend", [], [touch]));
     flushSync();
     drainScheduledWork();
 
