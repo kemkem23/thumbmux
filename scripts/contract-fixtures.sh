@@ -174,7 +174,7 @@ install_consumer() {
     if [[ "$fixture" == "app-host" ]]; then
       npm pkg set 'dependencies.svelte=^5.51.0'
       npm pkg set \
-        'devDependencies.@playwright/test=^1.61.1' \
+        'devDependencies.@playwright/test=1.61.1' \
         'devDependencies.@sveltejs/vite-plugin-svelte=^6.2.1' \
         'devDependencies.svelte-check=^4.3.4' \
         'devDependencies.vite=^7.3.1'
