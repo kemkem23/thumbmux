@@ -137,7 +137,7 @@ function installControlledFonts(initialCellWidth: number): ControlledFontFaceSet
     configurable: true,
     value: fonts,
   });
-  Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
+  Object.defineProperty(window.HTMLCanvasElement.prototype, 'getContext', {
     configurable: true,
     value: () => ({
       font: '',
@@ -170,7 +170,7 @@ beforeEach(() => {
   originalWindowResizeObserver = window.ResizeObserver;
   originalDocumentFontsDescriptor = Object.getOwnPropertyDescriptor(document, 'fonts');
   originalCanvasGetContextDescriptor = Object.getOwnPropertyDescriptor(
-    HTMLCanvasElement.prototype,
+    window.HTMLCanvasElement.prototype,
     'getContext',
   );
   globalThis.ResizeObserver = ControlledResizeObserver;
@@ -194,12 +194,12 @@ afterEach(() => {
   }
   if (originalCanvasGetContextDescriptor) {
     Object.defineProperty(
-      HTMLCanvasElement.prototype,
+      window.HTMLCanvasElement.prototype,
       'getContext',
       originalCanvasGetContextDescriptor,
     );
   } else {
-    Reflect.deleteProperty(HTMLCanvasElement.prototype, 'getContext');
+    Reflect.deleteProperty(window.HTMLCanvasElement.prototype, 'getContext');
   }
 });
 
