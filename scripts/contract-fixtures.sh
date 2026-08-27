@@ -19,6 +19,7 @@ SCRIPT_DIR="$(/usr/bin/dirname -- "$SCRIPT_FILE")"
 PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 ONLY_FIXTURE="${THUMBMUX_CONTRACT_ONLY:-}"
 . "$SCRIPT_DIR/test-runtime-guard.sh"
+. "$SCRIPT_DIR/private-test-tmux-cleanup.sh"
 
 THUMBMUX_GUARD_RUNTIME=''
 RUN_COMPLETE=0
@@ -30,9 +31,66 @@ fixture_sessions() {
   tmux list-sessions -F '#S' 2>/dev/null || true
 }
 
+stop_private_tmux_through_attested_shim() {
+  local output=''
+  local server_pid=''
+  local probe_rc=0
+  local attempt=0
+
+  if output="$(LC_ALL=C tmux display-message -p '#{pid}' 2>&1)"; then
+    [[ "$output" =~ ^[1-9][0-9]{0,9}$ && "$output" != 1 ]] || return 1
+    server_pid="$output"
+  else
+    probe_rc=$?
+    if (( probe_rc != 0 )) \
+      && _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+      return 0
+    fi
+    printf 'contract fixtures: initial private tmux probe failed: %s\n' "$output" >&2
+    return 1
+  fi
+
+  if ! output="$(LC_ALL=C tmux kill-server 2>&1)" \
+    && ! _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+    printf 'contract fixtures: attested private tmux kill-server failed: %s\n' \
+      "$output" >&2
+    return 1
+  fi
+
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    if output="$(LC_ALL=C tmux display-message -p '#{pid}' 2>&1)"; then
+      if [[ "$output" != "$server_pid" ]]; then
+        printf 'contract fixtures: private tmux PID changed during cleanup: %s -> %s\n' \
+          "$server_pid" "$output" >&2
+        return 1
+      fi
+    else
+      probe_rc=$?
+      if (( probe_rc != 0 )) \
+        && _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+        break
+      fi
+      printf 'contract fixtures: post-kill private tmux probe failed: %s\n' \
+        "$output" >&2
+      return 1
+    fi
+    /usr/bin/sleep 0.05
+  done
+  (( attempt < 40 )) || return 1
+
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    /usr/bin/kill -0 "$server_pid" 2>/dev/null || return 0
+    /usr/bin/sleep 0.05
+  done
+  printf 'contract fixtures: original private tmux PID survived cleanup: %s\n' \
+    "$server_pid" >&2
+  return 1
+}
+
 cleanup() {
   local rc=$?
   local remaining=''
+  local tmux_cleanup_safe=1
   set +e
   if [[ -n "$THUMBMUX_GUARD_RUNTIME" && "$PRIVATE_TMUX_READY" == 1 ]]; then
     remaining="$(fixture_sessions)"
@@ -42,20 +100,32 @@ cleanup() {
       rc=1
     fi
     if [[ -S "$TMUX_SOCKET" && ! -L "$TMUX_SOCKET" ]]; then
-      # The shim inserts the one attested -S path. This can only stop the
-      # server rooted inside this run's exact private runtime.
-      tmux kill-server >/dev/null 2>&1 || true
+      # Only the shim may stop the server. The shared helper then proves and
+      # quarantines the exact stale -S socket inode left by tmux 3.4.
+      if stop_private_tmux_through_attested_shim; then
+        stop_private_tmux_server /usr/bin/tmux "$TMUX_SOCKET" "$TMUX_ROOT" \
+          || { rc=1; tmux_cleanup_safe=0; }
+      else
+        rc=1
+        tmux_cleanup_safe=0
+      fi
     elif [[ -e "$TMUX_SOCKET" || -L "$TMUX_SOCKET" ]]; then
       echo 'contract fixtures: private tmux socket changed type; refusing kill-server' >&2
       rc=1
+      tmux_cleanup_safe=0
     fi
-    if [[ -S "$TMUX_SOCKET" || -L "$TMUX_SOCKET" ]]; then
-      echo 'contract fixtures: exact private tmux server survived cleanup' >&2
+    if [[ -e "$TMUX_SOCKET" || -L "$TMUX_SOCKET" ]]; then
+      echo 'contract fixtures: exact private tmux socket survived attested cleanup' >&2
       rc=1
+      tmux_cleanup_safe=0
     fi
   fi
   if [[ -n "$THUMBMUX_GUARD_RUNTIME" ]]; then
-    thumbmux_remove_test_runtime || rc=1
+    if [[ "$tmux_cleanup_safe" == 1 ]]; then
+      thumbmux_remove_test_runtime || rc=1
+    else
+      echo 'contract fixtures: preserving changed private runtime after unsafe tmux cleanup' >&2
+    fi
   fi
   [[ "$RUN_COMPLETE" == 1 || "$PRIVATE_TMUX_READY" == 0 ]] || rc=1
   trap - EXIT
