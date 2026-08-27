@@ -63,11 +63,12 @@ export function assertContractFixtureRuntime(): string {
     || (runtimeStat.mode & 0o7777) !== 0o700
     || identity(runtime, true) !== process.env.THUMBMUX_GUARD_RUNTIME_IDENTITY
     || socket !== `${socketParent}/default`
-    || pathParts.length !== 4
+    || pathParts.length !== 5
     || pathParts[0] !== `${runtime}/bin`
     || pathParts[1] !== "/usr/bin"
     || pathParts[2] !== "/bin"
     || !/^(?:\/opt\/hostedtoolcache\/bun\/[^/]+\/x64|\/home\/runner\/(?:setup-bun|\.bun)\/bin)$/.test(pathParts[3] ?? "")
+    || pathParts[4] !== "/opt/hostedtoolcache/node/22.23.2/x64/bin"
     || privateBinStat.uid !== uid
     || (privateBinStat.mode & 0o7777) !== 0o700
     || lstatSync(`${runtime}/tmux`).isSymbolicLink()

@@ -94,6 +94,28 @@ describe("frozen consumer runner policy", () => {
     expect(source).not.toContain("tmux kill-session");
   });
 
+  test("consumer runtime gate binds the exact admitted Bun and Node PATH", () => {
+    const runnerSource = readFileSync(runner, "utf8");
+    const fixtureGuard = readFileSync(
+      resolve(import.meta.dir, "../contract/fixtures/runtime-guard.ts"),
+      "utf8",
+    );
+    const admissionGuard = readFileSync(
+      resolve(import.meta.dir, "test-runtime-guard.sh"),
+      "utf8",
+    );
+
+    expect(admissionGuard).toContain(
+      'PATH="/usr/bin:/bin:$(/usr/bin/dirname -- "$bun_real"):$(/usr/bin/dirname -- "$THUMBMUX_GUARD_NODE_BIN")"',
+    );
+    expect(runnerSource).toContain('export PATH="$PRIVATE_BIN:$PATH"');
+    expect(fixtureGuard).toContain("pathParts.length !== 5");
+    expect(fixtureGuard).toContain(
+      'pathParts[4] !== "/opt/hostedtoolcache/node/22.23.2/x64/bin"',
+    );
+    expect(fixtureGuard).not.toContain("pathParts.length !== 4");
+  });
+
   test("forged disposable markers still fail before tmux or Docker", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-contract-lock-test-"));
     roots.push(root);
