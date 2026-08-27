@@ -88,6 +88,10 @@ thumbmux_emit_frozen_source_archive \
 /usr/bin/cp -a -- "$PACKAGE_ROOT/git-dist/." "$PACKAGE_SOURCE/git-dist/"
 /usr/bin/diff -qr -- "$PACKAGE_ROOT/git-dist" "$PACKAGE_SOURCE/git-dist" >/dev/null \
   || { echo 'git-dist smoke: generated git-dist changed while freezing' >&2; exit 2; }
+(
+  cd "$PACKAGE_SOURCE"
+  "$THUMBMUX_GUARD_BUN_BIN" install --frozen-lockfile --ignore-scripts
+)
 FIXTURE="$PACKAGE_SOURCE/scripts/git-dist-smoke"
 EXPORT_GUARD="$PACKAGE_SOURCE/scripts/rewrite-git-dist-imports.ts"
 RELEASE_MANIFEST="$PACKAGE_SOURCE/scripts/prepare-release-package.ts"
@@ -127,7 +131,7 @@ cmp -s \
   exit 1
 }
 
-"$THUMBMUX_GUARD_BUN_BIN" "$EXPORT_GUARD" check-exports "$PACKAGE_SOURCE" "$EXPECTED_SOURCE_ROOT"
+"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" check-exports "$PACKAGE_SOURCE" "$EXPECTED_SOURCE_ROOT"
 
 mkdir -p "$WORK/package" "$WORK/bun-consumer" "$WORK/npm-consumer"
 cp "$PACKAGE_SOURCE/package.json" "$PACKAGE_SOURCE/README.md" "$PACKAGE_SOURCE/LICENSE" "$WORK/package/"
@@ -138,7 +142,7 @@ cp -R "$PACKAGE_SOURCE/contract/manifest" "$WORK/package/contract/"
 
 (
   cd "$WORK/package"
-  "$THUMBMUX_GUARD_BUN_BIN" "$RELEASE_MANIFEST" .
+  "$THUMBMUX_GUARD_BUN_BIN" --no-install "$RELEASE_MANIFEST" .
   npm pack --pack-destination "$WORK" --silent >/dev/null
 )
 
@@ -159,7 +163,7 @@ for asset in \
   }
 done
 cp -R "$FIXTURE/." "$WORK/bun-consumer/"
-"$THUMBMUX_GUARD_BUN_BIN" "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE_ROOT"
+"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE_ROOT"
 (
   cd "$WORK/bun-consumer"
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
@@ -178,7 +182,7 @@ cp -R "$FIXTURE/." "$WORK/bun-consumer/"
 )
 
 cp -R "$FIXTURE/." "$WORK/npm-consumer/"
-"$THUMBMUX_GUARD_BUN_BIN" "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer" "$EXPECTED_SOURCE_ROOT"
+"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer" "$EXPECTED_SOURCE_ROOT"
 (
   cd "$WORK/npm-consumer"
   npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
