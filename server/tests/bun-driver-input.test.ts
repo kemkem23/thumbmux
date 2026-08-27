@@ -90,7 +90,7 @@ describe("Bun tmux driver input delivery", () => {
     }, () => createBunTmuxDriver().sendKeys("pane-a", "plain input"));
 
     expect(calls).toEqual([{
-      command: ["tmux", "send-keys", "-t", "=pane-a:", "-l", "--", "plain input"],
+      command: ["tmux", "send-keys", "-t", "=pane-a:0.0", "-l", "--", "plain input"],
       options: undefined,
     }]);
   });
@@ -122,7 +122,7 @@ describe("Bun tmux driver input delivery", () => {
     expect(bufferName).toMatch(/^thumbmux-input-/);
     expect(load!.command.slice(4)).toEqual(["-"]);
     expect(Array.from(load!.options!.stdin as Uint8Array)).toEqual(Array.from(new TextEncoder().encode(data)));
-    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "=pane-large:"]);
+    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "=pane-large:0.0"]);
     expect(cleanup!.command).toEqual(["tmux", "delete-buffer", "-b", bufferName]);
   });
 
@@ -140,7 +140,7 @@ describe("Bun tmux driver input delivery", () => {
     const bufferName = load!.command[3]!;
     expect(load!.command.slice(4)).toEqual(["-"]);
     expect(Array.from(load!.options!.stdin as Uint8Array)).toEqual([0x61, 0x00, 0x62]);
-    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "=pane-nul:"]);
+    expect(paste!.command).toEqual(["tmux", "paste-buffer", "-d", "-r", "-b", bufferName, "-t", "=pane-nul:0.0"]);
     expect(cleanup!.command).toEqual(["tmux", "delete-buffer", "-b", bufferName]);
   });
 
