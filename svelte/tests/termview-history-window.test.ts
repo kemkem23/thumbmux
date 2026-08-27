@@ -731,6 +731,38 @@ describe("TermView sliding archive window", () => {
     expect(deliveredLines.at(-1)).toEqual(absoluteLines(0, 20));
   });
 
+  test("does not duplicate crossed live rows when the initial history reply races a newer seam", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-race", 100, 10),
+    );
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toMatchObject({ direction: "before", cursor: null });
+
+    // The reader is already away from the tail while the first tokenless
+    // history request is in flight. A normal non-replace capture advances the
+    // durable seam by five rows; the stable-reader merge deliberately retains
+    // those crossed rows until the absolute history page arrives.
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-race", 105, 15),
+      { source: "full", replace: false },
+    );
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(100, 25));
+
+    // The page is authoritative for [85, 105), so the retained live prefix
+    // [100, 105) must be consumed at the seam instead of being rendered twice.
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(40);
+  });
+
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {
     const { viewport, target } = mountTermView();
     await tick();
