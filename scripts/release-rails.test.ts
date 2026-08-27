@@ -265,6 +265,15 @@ describe("release rail policy", () => {
       expect(gate).toContain(marker);
     }
 
+    // Docker admission requires the primary checkout to be the clean exact
+    // public commit. build:git-dist and later suites intentionally create
+    // ignored artifacts, so the canonical E2E lane must run before the first
+    // source-tree build instead of weakening the runtime guard for dirty state.
+    const e2eStep = gate.indexOf("- name: canonical container e2e");
+    const artifactBuildStep = gate.indexOf("- name: build git-dist for the artifact tests");
+    expect(e2eStep).toBeGreaterThan(-1);
+    expect(artifactBuildStep).toBeGreaterThan(e2eStep);
+
     // Neither workflow re-inlines the combined unit suite (would re-open
     // copy-paste drift). The only bun test invocation for the full suite lives
     // in the gate.

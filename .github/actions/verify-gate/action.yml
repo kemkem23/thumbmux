@@ -38,6 +38,25 @@ runs:
     - name: install Playwright Chromium
       run: ./node_modules/.bin/playwright install --with-deps chromium
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+    - name: canonical container e2e
+      # Run while the checkout is still the clean exact requested commit.
+      # Later build/unit lanes intentionally create ignored artifacts; admitting
+      # Docker only before those mutations keeps the source receipt fail-closed
+      # without teaching the runtime guard to accept a dirty checkout.
+      # run-container owns --forbid-only inside its attested runtime; invoking
+      # Playwright directly would bypass the container/run-id guard.
+      run: /usr/bin/timeout --kill-after=60s 20m ./e2e/run-container.sh
+      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+      env:
+        THUMBMUX_E2E_ARTIFACTS: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
+    - name: retain e2e artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
+        if-no-files-found: ignore
+        retention-days: 7
     # The suite includes tests that assert properties of the shipped artifact
     # (dist hygiene, the README quickstart pack). They need git-dist to exist
     # before they run. On a developer machine it is usually lying around from
@@ -72,22 +91,6 @@ runs:
     - name: demo builds
       run: cd demo && bun run build
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
-    - name: canonical container e2e
-      # Same reason as above — shell timeout, not the workflow-only key.
-      # run-container owns --forbid-only inside its attested runtime; invoking
-      # Playwright directly would bypass the container/run-id guard.
-      run: /usr/bin/timeout --kill-after=60s 20m ./e2e/run-container.sh
-      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
-      env:
-        THUMBMUX_E2E_ARTIFACTS: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
-    - name: retain e2e artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/thumbmux-e2e-${{ inputs.e2e-artifact-suffix }}
-        if-no-files-found: ignore
-        retention-days: 7
     # Publish readiness — was CI-only before the unify. A release that never
     # packs the scoped packages can ship a tree that fails `bun pm pack`.
     - name: packages build & pack (publish readiness)
