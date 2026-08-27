@@ -739,6 +739,7 @@ describe("TermView sliding archive window", () => {
       absoluteLines(100, 20),
       undefined,
       historyBoundary("g-race", 100, 10),
+      { source: "full", replace: false },
     );
     wheel(viewport, -1_000_000);
     expect(historyCalls.at(-1)).toMatchObject({ direction: "before", cursor: null });
@@ -761,6 +762,36 @@ describe("TermView sliding archive window", () => {
     expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
     expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
     expect(new Set(deliveredLines.at(-1)).size).toBe(40);
+  });
+
+  test("uses absolute seam movement when every startup row has identical text", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    const repeated = Array.from({ length: 20 }, () => "same-status-row");
+
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-repeated-race", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-repeated-race", 105, 15),
+      { source: "full", replace: false },
+    );
+
+    // Five distinct absolute rows crossed the seam even though their bytes are
+    // indistinguishable from both snapshots.
+    expect(numberAttr(viewport, "data-raw-total")).toBe(25);
+    deliverHistory(85, repeated, false, 105);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(40);
+    expect(deliveredLines.at(-1)).toHaveLength(40);
+    const mountedIds = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .map((row) => row.getAttribute("data-line-id"));
+    expect(new Set(mountedIds).size).toBe(mountedIds.length);
   });
 
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {
@@ -987,6 +1018,7 @@ describe("TermView sliding archive window", () => {
       absoluteLines(105, 20),
       undefined,
       historyBoundary("g-collapsed", 105, 15),
+      { source: "full", replace: false },
     );
 
     expect(viewport.getAttribute("data-history-window-attached")).toBe("1");

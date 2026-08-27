@@ -339,6 +339,11 @@
   let detachedLiveProjectionPending = false;
   /** Last mux-validated durable seam paired with the current live capture. */
   let liveBoundary = $state.raw<MuxHistoryBoundary | null>(null);
+  /** Rows retained ahead of the current durable seam solely to keep an
+   * archive-less reader stable while its first history page is in flight.
+   * Their identity comes from monotonic boundary movement, never content
+   * matching; the page consumes this prefix exactly when it reaches the seam. */
+  let retainedLivePrefixBeforeBoundary = 0;
   /** Newest total observed in a history reply (may lead the next output tick). */
   let archiveTotalHint = 0;
   let archiveLoading = false;
@@ -2297,6 +2302,10 @@
     const seam = archivedLines.length;
     const suffixEntry = stateBeforeLine(seam + bounded);
     liveLines.splice(0, bounded);
+    retainedLivePrefixBeforeBoundary = Math.max(
+      0,
+      retainedLivePrefixBeforeBoundary - bounded,
+    );
     rawLines.splice(seam, bounded);
     linksByLine.splice(seam, bounded);
     liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
@@ -2325,6 +2334,10 @@
     linksByLine.splice(start, bounded);
     archivedLines = rawLines.slice(0, start);
     liveLines = rawLines.slice(start);
+    // The legacy middle-gap split no longer has one contiguous absolute live
+    // origin. A later durable page must establish a fresh seam rather than
+    // consuming a stale prefix count across that explicit retention gap.
+    retainedLivePrefixBeforeBoundary = 0;
     liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
     reindexSparseAfterRemoval(start, bounded, liveGapEntryState);
     if (liveGapEntryState) {
@@ -2869,6 +2882,7 @@
     archiveExhausted = false;
     historyStopReason = 'none';
     archiveOffset = liveStartLine;
+    retainedLivePrefixBeforeBoundary = 0;
     if (resetReader) {
       historyReaderAtUnscrollableTail = false;
       deferredUnscrollableHistoryPx = 0;
@@ -2940,8 +2954,19 @@
    * resident absolute rows and scrollTop, but the window becomes pageable on
    * its newer edge so it can walk to the new seam without a hole or duplicate.
    */
-  function reconcileLiveBoundary(boundary: MuxHistoryBoundary | undefined): void {
-    if (!boundary || historyPaging !== 'sliding') return;
+  type LiveBoundaryReconciliation = {
+    advancedRows: number;
+    promotedRows: boolean;
+  };
+
+  function reconcileLiveBoundary(
+    boundary: MuxHistoryBoundary | undefined,
+  ): LiveBoundaryReconciliation {
+    const unchanged: LiveBoundaryReconciliation = {
+      advancedRows: 0,
+      promotedRows: false,
+    };
+    if (!boundary || historyPaging !== 'sliding') return unchanged;
     const previous = liveBoundary;
     liveBoundary = { ...boundary };
     archiveTotalHint = Math.max(archiveTotalHint, boundary.liveStartLine);
@@ -2966,28 +2991,43 @@
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
-      return;
+      return unchanged;
     }
-    if (!archiveWindow || (previous && boundary.liveStartLine <= previous.liveStartLine)) return;
+    const advancedRows = previous
+      ? Math.max(0, boundary.liveStartLine - previous.liveStartLine)
+      : 0;
+    const advanced: LiveBoundaryReconciliation = {
+      advancedRows,
+      promotedRows: false,
+    };
+    if (
+      !archiveWindow
+      || (previous && boundary.liveStartLine <= previous.liveStartLine)
+    ) return advanced;
 
     const residentEnd = historyWindowEndLine(archiveWindow);
-    if (residentEnd >= boundary.liveStartLine) return;
+    if (residentEnd >= boundary.liveStartLine) return advanced;
     if (!isAwayFromLiveTail()) {
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, false);
-      return;
+      return advanced;
     }
 
     if (previous && promoteCrossedLiveRows(previous.liveStartLine, boundary.liveStartLine)) {
-      return;
+      return { advancedRows, promotedRows: true };
     }
 
     detachSlidingArchiveFromLive(boundary.liveStartLine);
+    return advanced;
   }
 
   function setLines(
     nextLive: string[],
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
+    boundaryReconciliation: LiveBoundaryReconciliation = {
+      advancedRows: 0,
+      promotedRows: false,
+    },
   ) {
     if (
       historyPaging === 'sliding' &&
@@ -2998,6 +3038,7 @@
       // bounded fresh live suffix offscreen; repainting it must not change
       // total/maxOffset, cursor visibility, search, selection, or the anchor.
       liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
+      retainedLivePrefixBeforeBoundary = 0;
       detachedLiveProjectionPending = true;
       return;
     }
@@ -3006,7 +3047,13 @@
     const replaceRetainedRows = replace
       ? replaceRetainedOverlapRows(liveLines, nextLive)
       : 0;
-    if (replace) {
+    if (boundaryReconciliation.promotedRows) {
+      // The monotonic seam already moved the crossed old-live prefix into the
+      // archive. The paired capture starts at the new boundary, so retaining
+      // the same prefix in liveLines would render those absolute rows twice.
+      liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
+    } else if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width. A resync can
       // replay the same cached content, so count only old rows not covered by
@@ -3015,18 +3062,53 @@
         ? liveLines.length - replaceRetainedRows
         : 0;
       liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
       if (discardedLiveRows > 0) {
         recordRetentionGap(archivedLines.length, discardedLiveRows);
+      }
+    } else if (
+      !followTail
+      && historyPaging === 'sliding'
+      && archiveWindow === null
+      && liveLines.length > 0
+      && boundaryReconciliation.advancedRows > 0
+      && boundaryReconciliation.advancedRows
+        <= liveLines.length - retainedLivePrefixBeforeBoundary
+      && !noScrollback
+    ) {
+      // A durable boundary gives stronger identity than textual overlap. Keep
+      // exactly the old canonical rows that crossed [oldStart, newStart), then
+      // append the complete new canonical live snapshot. This remains exact
+      // for a screen made entirely of identical blank/status rows, where any
+      // content matcher would collapse distinct absolute rows together.
+      const previousLength = liveLines.length;
+      retainedLivePrefixBeforeBoundary += boundaryReconciliation.advancedRows;
+      liveLines = [
+        ...liveLines.slice(0, retainedLivePrefixBeforeBoundary),
+        ...nextLive,
+      ];
+      if (liveLines.length > previousLength) {
+        archiveExhausted = false;
+        clearHistoryStopIfResumed();
       }
     } else if (!followTail && liveLines.length > 0 && !noScrollback) {
       const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
       liveLines = merged.lines;
+      if (historyPaging === 'sliding' && archiveWindow === null && merged.preservedPrefix) {
+        retainedLivePrefixBeforeBoundary = Math.min(
+          liveLines.length,
+          retainedLivePrefixBeforeBoundary + boundaryReconciliation.advancedRows,
+        );
+      } else if (!merged.preservedPrefix) {
+        retainedLivePrefixBeforeBoundary = 0;
+      }
       if (merged.appendedLineCount > 0) {
         archiveExhausted = false;
         clearHistoryStopIfResumed();
       }
     } else {
       liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
     }
 
     if (historyPaging === 'sliding' && archiveWindow !== null) {
@@ -3627,27 +3709,50 @@
     livePrefixDropped: number;
     entryState: SgrState;
     liveEntryState: SgrState | null;
+    consumedRetainedLivePrefixRows: number;
   } | null {
     if (history.startLine === null || history.lines.length === 0) return null;
+
+    // A reader can retain old live rows while the first tokenless history
+    // request is in flight. Once a page reaches the current durable seam, its
+    // suffix is authoritative for those crossed rows. Carry only any older
+    // retained prefix that lies before the returned page, then let canonical
+    // live content begin exactly at liveStartLine. This is absolute arithmetic
+    // and remains correct when every row has identical text.
+    const consumedRetainedLivePrefixRows = history.endLine === liveBoundary?.liveStartLine
+      ? Math.min(retainedLivePrefixBeforeBoundary, liveLines.length)
+      : 0;
+    const pageOverlapRows = Math.min(
+      consumedRetainedLivePrefixRows,
+      history.lines.length,
+    );
+    const carriedPrefixRows = consumedRetainedLivePrefixRows - pageOverlapRows;
+    const normalizedStartLine = history.startLine - carriedPrefixRows;
+    if (normalizedStartLine < 0) return null;
+    const normalizedHistoryLines = [
+      ...liveLines.slice(0, carriedPrefixRows),
+      ...history.lines,
+    ];
+    const canonicalLiveLines = liveLines.slice(consumedRetainedLivePrefixRows);
 
     // Make room for at least the newest incoming archive row. This only
     // matters for a live capture already sitting exactly on a client budget;
     // production captures are normally a much smaller pane-tail window.
-    const lineBytes = estimatedHistoryWindowLineStorage(history.lines);
-    const liveLineBytes = estimatedHistoryWindowLineStorage(liveLines);
+    const lineBytes = estimatedHistoryWindowLineStorage(normalizedHistoryLines);
+    const liveLineBytes = estimatedHistoryWindowLineStorage(canonicalLiveLines);
     const newestBytes = lineBytes.at(-1) ?? 0;
     let liveBytes = liveLineBytes.reduce((sum, bytes) => sum + bytes, 0);
     let livePrefixDropped = 0;
     while (
-      livePrefixDropped < liveLines.length && (
-        liveLines.length - livePrefixDropped >= HISTORY_RETAINED_ROW_BUDGET ||
+      livePrefixDropped < canonicalLiveLines.length && (
+        canonicalLiveLines.length - livePrefixDropped >= HISTORY_RETAINED_ROW_BUDGET ||
         liveBytes + newestBytes > HISTORY_RETAINED_BYTE_BUDGET
       )
     ) {
       liveBytes -= liveLineBytes[livePrefixDropped] ?? 0;
       livePrefixDropped++;
     }
-    const live = liveLines.slice(livePrefixDropped);
+    const live = canonicalLiveLines.slice(livePrefixDropped);
 
     const limits: HistoryWindowLimits = {
       maxRows: Math.max(1, HISTORY_RETAINED_ROW_BUDGET - live.length),
@@ -3657,20 +3762,20 @@
     let keepFrom = 0;
     let retainedBytes = lineBytes.reduce((sum, bytes) => sum + bytes, 0);
     while (
-      keepFrom < history.lines.length && (
-        history.lines.length - keepFrom > limits.maxRows ||
+      keepFrom < normalizedHistoryLines.length && (
+        normalizedHistoryLines.length - keepFrom > limits.maxRows ||
         retainedBytes > limits.maxBytes
       )
     ) {
       retainedBytes -= lineBytes[keepFrom] ?? 0;
       keepFrom++;
     }
-    if (keepFrom >= history.lines.length) return null;
+    if (keepFrom >= normalizedHistoryLines.length) return null;
 
     try {
       const entryState = createSgrState();
       for (let index = 0; index < keepFrom; index++) {
-        lineToHtml(history.lines[index] ?? '', entryState, palette);
+        lineToHtml(normalizedHistoryLines[index] ?? '', entryState, palette);
       }
       let liveEntryState: SgrState | null = null;
       if (livePrefixDropped > 0 && live.length > 0) {
@@ -3679,17 +3784,17 @@
         // the exact SGR state at the archive/live gap without storing either
         // missing live rows or per-row render state.
         liveEntryState = cloneSgrState(entryState);
-        for (let index = keepFrom; index < history.lines.length; index++) {
-          lineToHtml(history.lines[index] ?? '', liveEntryState, palette);
+        for (let index = keepFrom; index < normalizedHistoryLines.length; index++) {
+          lineToHtml(normalizedHistoryLines[index] ?? '', liveEntryState, palette);
         }
         for (let index = 0; index < livePrefixDropped; index++) {
-          lineToHtml(liveLines[index] ?? '', liveEntryState, palette);
+          lineToHtml(canonicalLiveLines[index] ?? '', liveEntryState, palette);
         }
       }
       return {
         state: createHistoryWindow({
-          startLine: history.startLine + keepFrom,
-          lines: history.lines.slice(keepFrom),
+          startLine: normalizedStartLine + keepFrom,
+          lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
           hasOlder: history.hasMore || keepFrom > 0,
           hasNewer: history.endLine < Math.max(
@@ -3702,6 +3807,7 @@
         livePrefixDropped,
         entryState,
         liveEntryState,
+        consumedRetainedLivePrefixRows,
       };
     } catch {
       return null;
@@ -4004,6 +4110,9 @@
         return;
       }
       const oldScrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+      if (seeded.consumedRetainedLivePrefixRows > 0) {
+        retainedLivePrefixBeforeBoundary = 0;
+      }
       commitSlidingHistoryWindow(seeded.state, {
         direction,
         // Archive rows enter before live; an emergency live-prefix trim moves
@@ -4230,11 +4339,14 @@
 
   function applyContentDelivery(delivery: ContentUpdate) {
     if (delivery.cursor !== undefined) cursor = delivery.cursor;
-    reconcileLiveBoundary((delivery.meta as MuxDeliveryMeta).boundary);
+    const boundaryReconciliation = reconcileLiveBoundary(
+      (delivery.meta as MuxDeliveryMeta).boundary,
+    );
     setLines(
       delivery.data.replace(/\r/g, '').split('\n'),
       delivery.meta.replace,
       contentLinesChangeSource(delivery),
+      boundaryReconciliation,
     );
   }
 
@@ -5267,6 +5379,7 @@
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
+    retainedLivePrefixBeforeBoundary = 0;
     if (archivedLines.length === 0) return;
     archivedLines = [];
     rawLines = liveLines.slice();
