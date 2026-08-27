@@ -1,3 +1,5 @@
+import { stripTerminalControls } from './terminal-controls';
+
 export type SearchMode = 'plain' | 'regex-lite';
 export type SearchOptions = { mode?: SearchMode; caseSensitive?: boolean };
 export type SearchMatch = { line: number; start: number; end: number };
@@ -18,9 +20,6 @@ export type SearchResult = {
 const MAX_PATTERN_UNITS = 256;
 const MAX_MATCHES = 10_000;
 const MAX_QUANT = 100;
-const ESC = '\u001b';
-const BEL = '\u0007';
-const ST = '\\';
 
 type Quantifier = { min: number; max: number | null };
 type RegexNode =
@@ -39,138 +38,6 @@ type ParserError = SearchError | null;
 
 function createError(code: SearchErrorCode, message: string): SearchError {
   return { code, message };
-}
-
-/** True when `index` is a high surrogate followed by a low surrogate in `text`. */
-function isSurrogatePairAt(text: string, index: number): boolean {
-  if (index < 0 || index + 1 >= text.length) return false;
-  const hi = text.charCodeAt(index);
-  const lo = text.charCodeAt(index + 1);
-  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff;
-}
-
-/**
- * Visible text of a terminal line after control sequences are removed.
- *
- * Cross-module contract (shared with `lineToHtml` in ansi-html.ts; the
- * renderer half is pinned by `core/tests/ansi-modern.test.ts`):
- *
- * 1. Unknown two-byte escape `ESC X` emits NO visible text — swallow BOTH
- *    the ESC and the following code unit.
- * 2. ESC inside a CSI aborts that CSI and is re-dispatched: do not consume
- *    it, emit nothing for the aborted CSI, and continue the outer loop from
- *    the aborting ESC so the next sequence is parsed normally.
- * 3. Charset selectors (`ESC ( ) * + - . / # %`) take a third byte when safe.
- *    An ESC as that third unit aborts the selector and is re-dispatched;
- *    never swallow a UTF-16 surrogate half (stop before the pair).
- * 4. SearchMatch UTF-16 offsets are into this visible string so they land
- *    on the same columns the renderer paints (its col counter skips the
- *    same controls).
- */
-function stripTerminalControls(raw: string): string {
-  // Hot path: pure text has nothing to strip.
-  if (raw.indexOf(ESC) < 0) return raw;
-
-  let out = '';
-  let i = 0;
-
-  while (i < raw.length) {
-    if (raw[i] !== ESC) {
-      out += raw[i];
-      i += 1;
-      continue;
-    }
-
-    // ESC at end of line → swallow ESC; nothing follows.
-    if (i + 1 >= raw.length) {
-      break;
-    }
-
-    const next = raw[i + 1];
-
-    if (next === '[') {
-      // CSI: scan from i+2. ESC aborts and is re-dispatched; 0x40..0x7e is
-      // the final byte; end-of-line with no final → remainder invisible.
-      let end = i + 2;
-      let abortedAt = -1;
-      while (end < raw.length) {
-        const code = raw.charCodeAt(end);
-        if (code === 0x1b) {
-          abortedAt = end;
-          break;
-        }
-        if (code >= 0x40 && code <= 0x7e) break;
-        end += 1;
-      }
-      if (abortedAt >= 0) {
-        i = abortedAt;
-        continue;
-      }
-      if (end >= raw.length) {
-        // Unterminated CSI: remainder of line is invisible.
-        break;
-      }
-      i = end + 1;
-      continue;
-    }
-
-    if (next === ']') {
-      // OSC. Terminator is BEL or ST (ESC \).
-      let end = i + 2;
-      let after = raw.length;
-      let terminated = false;
-      while (end < raw.length) {
-        if (raw[end] === BEL) {
-          after = end + 1;
-          terminated = true;
-          break;
-        }
-        if (raw[end] === ESC && end + 1 < raw.length && raw[end + 1] === ST) {
-          after = end + 2;
-          terminated = true;
-          break;
-        }
-        end += 1;
-      }
-      if (!terminated) {
-        // Unterminated OSC: remainder of line is invisible.
-        break;
-      }
-      i = after;
-      continue;
-    }
-
-    // Character-set selectors ESC ( ) * + - . / # % — third byte when safe.
-    // Mirror lineToHtml: ESC restarts the parser (re-dispatch); never split a
-    // surrogate pair by swallowing only its high half.
-    if (
-      next === '(' || next === ')' || next === '*' || next === '+' ||
-      next === '-' || next === '.' || next === '/' || next === '#' || next === '%'
-    ) {
-      const third = i + 2;
-      if (
-        third >= raw.length ||
-        raw.charCodeAt(third) === 0x1b ||
-        isSurrogatePairAt(raw, third)
-      ) {
-        i = Math.min(raw.length, third);
-      } else {
-        i = Math.min(raw.length, i + 3);
-      }
-      continue;
-    }
-
-    // Known two-byte controls: ESC = > 7 8.
-    if (next === '=' || next === '>' || next === '7' || next === '8') {
-      i += 2;
-      continue;
-    }
-
-    // Unknown two-byte escape ESC X: swallow both (no visible text).
-    i += 2;
-  }
-
-  return out;
 }
 
 /** UTF-16 width of the code point starting at `offset` (1 or 2). */

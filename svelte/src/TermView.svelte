@@ -61,7 +61,7 @@
     collectTerminalUrlSegments,
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
-    charCellWidth, prefixForCells, stripAnsi, paneTextForCopy,
+    charCellWidth, stringCells, prefixForCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
@@ -5164,6 +5164,21 @@
   // ASCII cells of ink while the grid still owes it two. Memoized: scroll
   // re-renders hit the cache (the key ignores winStart).
   let cursorPosCache = { key: '', left: 0, width: 0 };
+
+  function cursorTerminalUnitCells(text: string, start: number): number {
+    const tail = text.slice(start);
+    if (!tail) return 1;
+    let unit = '';
+    let first = true;
+    for (const character of tail) {
+      const width = charCellWidth(character.codePointAt(0)!);
+      if (!first && width !== 0) break;
+      unit += character;
+      first = false;
+    }
+    return Math.max(1, stringCells(unit));
+  }
+
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
     const key = `${col}|${fontPx}|${charW}|${raw}`;
@@ -5172,12 +5187,7 @@
     let width = charW;
     const line = stripAnsi(raw);
     const { prefix } = prefixForCells(line, col);
-    let nextChar: string | undefined;
-    for (const c of line.slice(prefix.length)) { nextChar = c; break; }
-    if (nextChar) {
-      const w = charCellWidth(nextChar.codePointAt(0)!);
-      width = Math.max(1, w === 0 ? 1 : w) * charW;
-    }
+    width = cursorTerminalUnitCells(line, prefix.length) * charW;
     cursorPosCache = { key, left, width };
     return cursorPosCache;
   }
@@ -5784,6 +5794,7 @@
       {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
       {@const cline = lastContent - cursor.row}
       {@const cvisual = visualRowForRaw(cline)}
+      {@const blankRowsPastRawEnd = Math.max(0, cline - rawLines.length)}
       {@const cursorProjectionRow = projectionRowAt(cvisual)}
       {#if cline >= 0
         && cursorProjectionRow?.kind !== 'bash-placeholder'
@@ -5795,7 +5806,7 @@
         {@const cpos = cursorPos(cline, cursor.col)}
         <div
           class="mtv-cursor"
-          style:top={`${presentationRowTopPx(cvisual) - presentationRowTopPx(winStart)}px`}
+          style:top={`${presentationRowTopPx(cvisual) + blankRowsPastRawEnd * lineH - presentationRowTopPx(winStart)}px`}
           style:left={`${6 + cpos.left}px`}
           style:width={`${Math.max(2, cpos.width)}px`}
           style:height={`${lineH}px`}
