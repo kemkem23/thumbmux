@@ -65,7 +65,7 @@
     collectTerminalUrlSegments,
     findLineOverlap,
     mergeCapturedLinesForStableScroll,
-    prefixForCells, stringCells, stripAnsi, paneTextForCopy,
+    charCellWidth, prefixForCells, stringCells, stripAnsi, paneTextForCopy,
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
@@ -5243,7 +5243,6 @@
   // ASCII cells of ink while the grid still owes it two. Memoized: scroll
   // re-renders hit the cache (the key ignores winStart).
   let cursorPosCache = { key: '', left: 0, width: 0 };
-  const cursorGraphemes = new Intl.Segmenter('en', { granularity: 'grapheme' });
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
     const key = `${col}|${fontPx}|${charW}|${raw}`;
@@ -5252,13 +5251,26 @@
     let width = charW;
     const line = stripAnsi(raw);
     const { prefix } = prefixForCells(line, col);
-    // Match ansi-html's rendered unit, not merely the first code point. `❤️`
-    // is one two-cell grapheme (❤ + VS16), and Indic conjuncts can likewise
-    // span several terminal cells. Reading only the base painted a one-cell
-    // caret over a two-cell glyph even though its left edge was correct.
-    for (const { segment } of cursorGraphemes.segment(line.slice(prefix.length))) {
-      width = Math.max(1, stringCells(segment)) * charW;
-      break;
+    // Cursor ownership follows terminal cells, not browser grapheme clusters.
+    // A spacing combining mark (Mc) is its own tmux cell even when the browser
+    // shapes it with the preceding consonant. Wide code points and FE0F
+    // promotion remain atomic two-cell glyphs, matching ansi-html's pinning.
+    const tail = line.slice(prefix.length);
+    const first = tail.codePointAt(0);
+    if (first !== undefined) {
+      const firstWidth = charCellWidth(first);
+      width = Math.max(1, firstWidth) * charW;
+      if (firstWidth === 1) {
+        const firstLength = first > 0xffff ? 2 : 1;
+        for (const ch of tail.slice(firstLength)) {
+          const cp = ch.codePointAt(0)!;
+          if (charCellWidth(cp) > 0) break;
+          if (cp === 0xfe0f) {
+            width = 2 * charW;
+            break;
+          }
+        }
+      }
     }
     cursorPosCache = { key, left, width };
     return cursorPosCache;
