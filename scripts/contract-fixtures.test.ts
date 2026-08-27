@@ -88,10 +88,26 @@ describe("frozen consumer runner policy", () => {
 
   test("runner uses an atomic tmux-namespace lock and never sweeps sessions", () => {
     const source = readFileSync(runner, "utf8");
+    const cleanup = readFileSync(
+      resolve(import.meta.dir, "private-test-tmux-cleanup.sh"),
+      "utf8",
+    );
     expect(source).toContain("flock -n");
     expect(source).toContain('THUMBMUX_TEST_TMUX_SOCKET="$TMUX_SOCKET"');
     expect(source).toContain('private-test-tmux.sh');
+    expect(source).toContain('private-test-tmux-cleanup.sh');
     expect(source).toContain('unset TMUX TMUX_PANE');
+    expect(source).toContain(
+      'stop_private_tmux_server /usr/bin/tmux "$TMUX_SOCKET" "$TMUX_ROOT"',
+    );
+    expect(source).toContain("stop_private_tmux_through_attested_shim");
+    expect(source).toContain("LC_ALL=C tmux kill-server");
+    expect(source).toContain("_cortex_private_tmux_is_no_server");
+    expect(source).toContain('/usr/bin/kill -0 "$server_pid"');
+    expect(source).toContain('[[ "$tmux_cleanup_safe" == 1 ]]');
+    expect(cleanup).toContain("_cortex_private_tmux_quarantine_stale_socket");
+    expect(cleanup).toContain("/usr/bin/mv --no-copy -n -T");
+    expect(cleanup).toContain("original_socket_identity");
     expect(source).not.toContain("tmux kill-session");
   });
 
