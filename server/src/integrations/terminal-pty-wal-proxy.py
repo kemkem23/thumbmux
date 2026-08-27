@@ -85,11 +85,11 @@ class WalCorruption(ProxyError):
 
 def write_browser_sandbox_boot_diagnostic(error: BaseException) -> None:
     """Record pre-config failures only in the exact private browser runtime."""
-    if (
-        os.environ.get("CORTEX_TEST_HARD_SANDBOX") != "browser"
-        or os.environ.get("CORTEX_TEST_RUNTIME") != "/run/kemcortex-browser-suite"
-        or os.environ.get(TEST_BOOT_DIAGNOSTIC_ENV) != TEST_BOOT_DIAGNOSTIC_PATH
-    ):
+    # The launch environment itself may be the malformed input under test, so
+    # it cannot be the sole authority for this fallback. bwrap owns a private
+    # UTS namespace with this one fixed hostname; the exact /run path, owner,
+    # mode and byte cap remain independent write boundaries below.
+    if os.uname().nodename != "cortex-browser-test":
         return
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(TEST_BOOT_DIAGNOSTIC_PATH, flags, PRIVATE_FILE_MODE)
