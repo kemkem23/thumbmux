@@ -27,6 +27,10 @@
     type ContentUpdate,
   } from './content-update-gate';
   import {
+    admitLiveBoundary,
+    createLiveBoundaryAdmission,
+  } from './live-boundary-admission';
+  import {
     applyHistoryWindowPage,
     createHistoryWindow,
     historyWindowEndLine,
@@ -377,7 +381,7 @@
   // gesture. Remember the newest frame admitted from the wire as a separate
   // high-water fence so a reconnecting cached frame cannot replace that
   // pending delivery before reconcileLiveBoundary() gets a chance to run.
-  let admittedLiveBoundaryHighWater: MuxHistoryBoundary | null = null;
+  let liveBoundaryAdmission = createLiveBoundaryAdmission();
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
   // Keep the per-frame compositor offset out of Svelte reactivity. Diagnostics
@@ -4414,12 +4418,9 @@
   function admitLiveDelivery(meta?: MuxDeliveryMeta): boolean {
     const boundary = meta?.boundary;
     if (!boundary || historyPaging !== 'sliding') return true;
-    const previous = admittedLiveBoundaryHighWater ?? liveBoundary;
-    if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
-      return false;
-    }
-    admittedLiveBoundaryHighWater = { ...boundary };
-    return true;
+    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, boundary);
+    liveBoundaryAdmission = result.admission;
+    return result.accepted;
   }
 
   function applyLiveScreen(meta?: MuxDeliveryMeta): void {
