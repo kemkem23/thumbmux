@@ -225,10 +225,14 @@ function deliverOutput(
   lines: string[],
   screen?: ScreenMode | null,
   boundary?: MuxHistoryBoundary,
-  delivery: { source?: "full" | "delta"; replace?: boolean } = {},
+  delivery: {
+    source?: "full" | "delta";
+    replace?: boolean;
+    cursor?: { row: number; col: number } | null;
+  } = {},
 ): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
-  sessionCallback(lines.join("\n"), "output", null, {
+  sessionCallback(lines.join("\n"), "output", delivery.cursor ?? null, {
     source: delivery.source ?? "full",
     replace: delivery.replace ?? true,
     ...(screen === undefined ? {} : { screen }),
@@ -952,21 +956,56 @@ describe("TermView sliding archive window", () => {
     const { viewport } = mountTermView();
     await tick();
 
+    const accepted = absoluteLines(105, 20);
     deliverOutput(
-      absoluteLines(105, 20),
+      accepted,
       undefined,
       historyBoundary("g-regression", 105, 15),
-      { source: "full", replace: false },
+      { source: "full", replace: false, cursor: { row: 0, col: 7 } },
     );
+    const acceptedDeliveryCount = deliveredLines.length;
     deliverOutput(
       absoluteLines(103, 20),
       undefined,
       historyBoundary("g-regression", 103, 14),
-      { source: "full", replace: false },
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
     );
 
     expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
     expect(viewport.getAttribute("data-history-generation")).toBe("g-regression");
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("7");
+  });
+
+  test("rejects stale WAL coordinates at an unchanged live seam", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    const accepted = absoluteLines(105, 20);
+    deliverOutput(
+      accepted,
+      undefined,
+      historyBoundary("g-wal-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 9 } },
+    );
+    const acceptedDeliveryCount = deliveredLines.length;
+    deliverOutput(
+      absoluteLines(105, 20).map((line) => `stale-${line}`),
+      undefined,
+      {
+        ...historyBoundary("g-wal-regression", 105, 14),
+        liveStartLine: 105,
+      },
+      { source: "full", replace: false, cursor: { row: 0, col: 2 } },
+    );
+
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("9");
   });
 
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {

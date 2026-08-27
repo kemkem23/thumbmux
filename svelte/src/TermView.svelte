@@ -65,6 +65,7 @@
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
+    muxHistoryBoundaryTransition,
     type MuxHistoryBoundary,
     detectClaudeBashBlocks,
     groupClaudeBashBlocks,
@@ -2961,6 +2962,7 @@
    * its newer edge so it can walk to the new seam without a hole or duplicate.
    */
   type LiveBoundaryReconciliation = {
+    acceptDelivery: boolean;
     advancedRows: number;
     useCanonicalLiveCapture: boolean;
   };
@@ -2969,20 +2971,18 @@
     boundary: MuxHistoryBoundary | undefined,
   ): LiveBoundaryReconciliation {
     const unchanged: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
       advancedRows: 0,
       useCanonicalLiveCapture: false,
     };
     if (!boundary || historyPaging !== 'sliding') return unchanged;
     const previous = liveBoundary;
-    if (
-      previous
-      && previous.generation === boundary.generation
-      && boundary.liveStartLine < previous.liveStartLine
-    ) {
+    if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
       // A reconnecting transport can race a cached full frame behind the last
       // accepted durable seam. Its absolute identity is stale even if its
-      // bytes look plausible, so never move the local boundary backwards.
-      return unchanged;
+      // bytes look plausible, so reject its content and cursor together with
+      // every monotonic coordinate instead of only preserving the boundary.
+      return { ...unchanged, acceptDelivery: false };
     }
     liveBoundary = { ...boundary };
     archiveTotalHint = Math.max(archiveTotalHint, boundary.liveStartLine);
@@ -3013,6 +3013,7 @@
       ? Math.max(0, boundary.liveStartLine - previous.liveStartLine)
       : 0;
     const advanced: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
       advancedRows,
       useCanonicalLiveCapture: false,
     };
@@ -3034,7 +3035,7 @@
       archiveWindow = { ...archiveWindow, hasNewer: false };
       archivedLines = Array.from(archiveWindow.lines);
       archiveWindowAttachedToLive = true;
-      return { advancedRows, useCanonicalLiveCapture: true };
+      return { acceptDelivery: true, advancedRows, useCanonicalLiveCapture: true };
     }
     if (residentEnd >= boundary.liveStartLine) return advanced;
     if (!isAwayFromLiveTail()) {
@@ -3043,7 +3044,7 @@
     }
 
     if (previous && promoteCrossedLiveRows(previous.liveStartLine, boundary.liveStartLine)) {
-      return { advancedRows, useCanonicalLiveCapture: true };
+      return { acceptDelivery: true, advancedRows, useCanonicalLiveCapture: true };
     }
 
     detachSlidingArchiveFromLive(boundary.liveStartLine);
@@ -3055,6 +3056,7 @@
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
     boundaryReconciliation: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
       advancedRows: 0,
       useCanonicalLiveCapture: false,
     },
@@ -4399,10 +4401,11 @@
   }
 
   function applyContentDelivery(delivery: ContentUpdate) {
-    if (delivery.cursor !== undefined) cursor = delivery.cursor;
     const boundaryReconciliation = reconcileLiveBoundary(
       (delivery.meta as MuxDeliveryMeta).boundary,
     );
+    if (!boundaryReconciliation.acceptDelivery) return;
+    if (delivery.cursor !== undefined) cursor = delivery.cursor;
     setLines(
       delivery.data.replace(/\r/g, '').split('\n'),
       delivery.meta.replace,
