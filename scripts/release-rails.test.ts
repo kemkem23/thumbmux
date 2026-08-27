@@ -247,10 +247,14 @@ describe("release rail policy", () => {
     // ordered differently) in the other before the unify. If any of these
     // leave the gate, the two rails can green independently again.
     const requiredGateMarkers = [
+      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+      "node-version: 22.23.2",
+      "check-latest: false",
       "oven-sh/setup-bun@v2",
       "bun-version:",
       "bun install --frozen-lockfile",
-      "playwright install --with-deps chromium",
+      '"$thumbmux_node_bin" "$playwright_cli" install --with-deps chromium',
+      "@playwright+test@1.61.1/node_modules/@playwright/test/cli.js",
       "bun run build:git-dist",
       // Combined unit suite — the process release always ran; must not split
       // into different globs per workflow.
@@ -277,10 +281,25 @@ describe("release rail policy", () => {
     // public commit. build:git-dist and later suites intentionally create
     // ignored artifacts, so the canonical E2E lane must run before the first
     // source-tree build instead of weakening the runtime guard for dirty state.
+    const nodeSetupStep = gate.indexOf("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020");
+    const bunSetupStep = gate.indexOf("oven-sh/setup-bun@v2");
+    const frozenInstallStep = gate.indexOf("bun install --frozen-lockfile");
+    const playwrightInstallStep = gate.indexOf("- name: install Playwright Chromium");
     const e2eStep = gate.indexOf("- name: canonical container e2e");
     const artifactBuildStep = gate.indexOf("- name: build git-dist for the artifact tests");
+    expect(nodeSetupStep).toBeGreaterThan(-1);
+    expect(bunSetupStep).toBeGreaterThan(nodeSetupStep);
+    expect(frozenInstallStep).toBeGreaterThan(bunSetupStep);
+    expect(playwrightInstallStep).toBeGreaterThan(frozenInstallStep);
+    expect(e2eStep).toBeGreaterThan(playwrightInstallStep);
     expect(e2eStep).toBeGreaterThan(-1);
     expect(artifactBuildStep).toBeGreaterThan(e2eStep);
+
+    const nodeSetupBlock = gate.slice(nodeSetupStep, bunSetupStep);
+    expect(nodeSetupBlock).toContain("node-version: 22.23.2");
+    expect(nodeSetupBlock).toContain("check-latest: false");
+    expect(nodeSetupBlock).not.toContain("cache:");
+    expect(gate).not.toContain("actions/setup-node@v");
 
     // Neither workflow re-inlines the combined unit suite (would re-open
     // copy-paste drift). The only bun test invocation for the full suite lives

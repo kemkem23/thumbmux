@@ -194,10 +194,31 @@ describe('thumbmux e2e runtime admission', () => {
     expect(parity).not.toContain('mktemp -d -t thumbmux-ci-parity');
   });
 
-  test('the canonical Playwright CLI runs through the attested pinned Bun binary', () => {
+  test('the canonical Playwright CLI runs through the exact post-admission Node binary', () => {
     const e2e = readFileSync(resolve(import.meta.dir, '../e2e/run-container.sh'), 'utf8');
-    expect(e2e).toContain('"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_BIN" test');
-    expect(e2e).not.toContain('\n"$PLAYWRIGHT_BIN" test');
+    const guard = readFileSync(resolve(import.meta.dir, 'test-runtime-guard.sh'), 'utf8');
+    const action = readFileSync(
+      resolve(import.meta.dir, '../.github/actions/verify-gate/action.yml'),
+      'utf8',
+    );
+    const nodeDiscovery = guard.indexOf('thumbmux_assert_attested_node()');
+    const providerAdmission = guard.indexOf("THUMBMUX_GUARD_PROVIDER-}", nodeDiscovery);
+    expect(nodeDiscovery).toBeGreaterThan(-1);
+    expect(providerAdmission).toBeGreaterThan(nodeDiscovery);
+    expect(action).toContain('actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0');
+    expect(action).toContain('node-version: 22.23.2');
+    expect(action).toContain('check-latest: false');
+    expect(guard).toContain('/opt/hostedtoolcache/node/22.23.2/x64/bin/node');
+    expect(guard).toContain('node_owner" =~ ^(0|$(/usr/bin/id -u)):[0-7]{3,4}:regular\\ file$');
+    expect(guard).toContain('! -L "$node_bin"');
+    expect(guard).toContain('"$node_version" == v22.23.2');
+    expect(guard).toContain('export PATH THUMBMUX_GUARD_BUN_BIN THUMBMUX_GUARD_NODE_BIN');
+    expect(e2e).toContain('PLAYWRIGHT_ENTRY="$PACKAGE_ROOT/node_modules/@playwright/test/cli.js"');
+    expect(e2e).toContain('$PACKAGE_ROOT/node_modules/.bun/@playwright+test@1.61.1/node_modules/@playwright/test/cli.js');
+    expect(e2e).toContain("thumbmux_assert_attested_node || fail 'attested Node changed before Playwright launch'");
+    expect(e2e).toContain('"$THUMBMUX_GUARD_NODE_BIN" "$PLAYWRIGHT_CLI" test');
+    expect(e2e).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_CLI"');
+    expect(e2e).not.toContain('node_modules/.bin/playwright');
   });
 
   test('e2e tmux operations use exact session, window, and pane targets', () => {
