@@ -28,6 +28,7 @@ const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8"
 const e2eRunner = readFileSync(resolve(packageRoot, "e2e/run-container.sh"), "utf8");
 const e2eConfig = readFileSync(resolve(packageRoot, "e2e/playwright.config.ts"), "utf8");
 const e2eHelpers = readFileSync(resolve(packageRoot, "e2e/helpers.ts"), "utf8");
+const gitIgnore = readFileSync(resolve(packageRoot, ".gitignore"), "utf8");
 const node18ReplayLockSmoke = readFileSync(
   resolve(import.meta.dir, "git-dist-smoke/node18-replay-lock-smoke.mjs"),
   "utf8",
@@ -46,6 +47,11 @@ afterEach(() => {
 });
 
 describe("release rail policy", () => {
+  test("Svelte package scratch output cannot dirty Docker source admission", () => {
+    expect(gitIgnore).toContain("svelte/.svelte-kit/");
+    expect(gitIgnore).toContain("app/.svelte-kit/");
+  });
+
   test("immutable baseline selection uses the newest eligible remote dist tag", () => {
     const refs = [
       "aaa refs/tags/v0.7.1-dist",
