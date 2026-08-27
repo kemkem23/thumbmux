@@ -44,7 +44,7 @@ HEALTH_FILE = "pty-proxy-status.json"
 DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log"
 FINALIZE_LOGICAL_END_FLAG = "--finalize-logical-end"
 TEST_BOOT_DIAGNOSTIC_ENV = "THUMBMUX_TEST_TERMINAL_PROXY_BOOT_DIAGNOSTIC"
-TEST_BOOT_DIAGNOSTIC_PATH = "/run/kemcortex-browser-suite/logs/terminal-proxy-boot.log"
+TEST_BOOT_DIAGNOSTIC_PATH = "/tmp/cortex-browser-terminal-proxy-boot.log"
 TEST_BOOT_DIAGNOSTIC_MAX_BYTES = 128 * 1024
 
 MAGIC = b"THMWAL01"
