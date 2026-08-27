@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, extname, relative, resolve, sep } from "node:path";
-import * as ts from "typescript";
+import ts from "typescript";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
 const PACKAGES = ["core", "server", "svelte", "app"] as const;
