@@ -83,6 +83,12 @@ runs:
     - name: root git-dist consumer smoke
       run: bun run build:git-dist && bun run smoke:git-dist
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+    - name: frozen consumer contract gate
+      # This lane has the same clean-checkout admission as container E2E and
+      # root smoke. It consumes the git-dist built immediately above, so it
+      # must run before unit/demo/pack lanes create source-tree scratch output.
+      run: ./scripts/contract-fixtures.sh
+      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
     # Combined process only — no per-workflow split suites. Split suites once
     # gave better failure locality on ci but meant release ran a different
     # process; a DOM-harness / preload interaction can fail under only one
@@ -131,11 +137,6 @@ runs:
       # is what a consumer receives. Fails when a public name changes signature
       # or appears without a declared tier.
       run: bun run contract
-      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
-    - name: frozen consumer contract gate
-      # Packs that same git-dist and exercises all frozen consumers. Chromium
-      # was installed above for the app-host runtime fixture.
-      run: ./scripts/contract-fixtures.sh
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
     - name: source integrity after verification
       # Generated outputs are ignored, but no suite may rewrite tracked source
