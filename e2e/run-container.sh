@@ -230,7 +230,7 @@ export THUMBMUX_TEST_ATTESTATION="$THUMBMUX_GUARD_ATTESTATION"
 
 cd "$E2E_DIR"
 set +e
-"$PLAYWRIGHT_BIN" test \
+"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_BIN" test \
   --config=playwright.config.ts \
   --forbid-only \
   --output="$ARTIFACTS_DIR/playwright" \
