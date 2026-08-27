@@ -192,6 +192,7 @@ describe('TermView cursor grid mapping', () => {
     const cases = [
       { text: '❤', cells: 1 },
       { text: '❤️', cells: 2 },
+      { text: '\x1b[31m❤️', cells: 2 },
       { text: '⚠', cells: 1 },
       { text: '⚠️', cells: 2 },
       { text: 'สั', cells: 1 },
