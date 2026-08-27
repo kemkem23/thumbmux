@@ -8,6 +8,10 @@ import { join, resolve, sep } from "node:path";
 import { assertContractFixturePort, assertContractFixtureRuntime } from "./runtime-guard";
 
 const privateRuntime = assertContractFixtureRuntime();
+const bunBin = process.env.THUMBMUX_GUARD_BUN_BIN;
+if (typeof bunBin !== "string" || bunBin.length === 0) {
+  throw new Error("contract fixture isolation: attested Bun binary is missing");
+}
 const { chromium } = await import("@playwright/test");
 const {
   createAppRoutes,
@@ -169,7 +173,7 @@ try {
   spawnTmuxSession(
     sessionName,
     runtimeRoot,
-    `exec bun ${shellQuote(probePath)}`,
+    `exec ${shellQuote(bunBin)} ${shellQuote(probePath)}`,
   );
   assert(hasSession(sessionName), "real tmux session was not created");
   await waitForPane(

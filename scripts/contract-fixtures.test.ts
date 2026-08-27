@@ -101,6 +101,10 @@ describe("frozen consumer runner policy", () => {
       resolve(import.meta.dir, "../contract/fixtures/runtime-guard.ts"),
       "utf8",
     );
+    const appRuntime = readFileSync(
+      resolve(import.meta.dir, "../contract/fixtures/app-host/runtime.ts"),
+      "utf8",
+    );
     const admissionGuard = readFileSync(
       resolve(import.meta.dir, "test-runtime-guard.sh"),
       "utf8",
@@ -115,6 +119,13 @@ describe("frozen consumer runner policy", () => {
       'pathParts[4] !== "/opt/hostedtoolcache/node/22.23.2/x64/bin"',
     );
     expect(fixtureGuard).not.toContain("pathParts.length !== 4");
+    expect(fixtureGuard).toContain(
+      "bunBin !== process.env.THUMBMUX_GUARD_BUN_BIN",
+    );
+    expect(appRuntime).toContain(
+      '`exec ${shellQuote(bunBin)} ${shellQuote(probePath)}`',
+    );
+    expect(appRuntime).not.toContain("`exec bun ");
   });
 
   test("consumer Bun types stay aligned with the frozen package lock", () => {
