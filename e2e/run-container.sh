@@ -24,7 +24,8 @@ IMAGE="oven/bun:1"
 DEMO_PORT=7681
 HOST_PORT=''
 READY_TIMEOUT="${THUMBMUX_E2E_READY_TIMEOUT:-90}"
-PLAYWRIGHT_BIN="$PACKAGE_ROOT/node_modules/.bin/playwright"
+PLAYWRIGHT_ENTRY="$PACKAGE_ROOT/node_modules/@playwright/test/cli.js"
+PLAYWRIGHT_CLI=''
 CONTAINER_STARTED=0
 CONTAINER_ID=''
 CLEANUP_FAILED=0
@@ -90,7 +91,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for forbidden_override in THUMBMUX_CONTAINER THUMBMUX_PACKAGE_DIR THUMBMUX_E2E_IMAGE \
-  THUMBMUX_DEMO_PORT THUMBMUX_HOST_PORT THUMBMUX_PLAYWRIGHT_BIN; do
+  THUMBMUX_DEMO_PORT THUMBMUX_HOST_PORT THUMBMUX_PLAYWRIGHT_BIN \
+  THUMBMUX_PLAYWRIGHT_CLI; do
   [[ -z "${!forbidden_override-}" ]] \
     || fail "$forbidden_override is runner-owned and cannot be overridden"
 done
@@ -113,7 +115,13 @@ command -v curl >/dev/null 2>&1 || fail 'curl is required'
 command -v tar >/dev/null 2>&1 || fail 'tar is required'
 [[ -f "$PACKAGE_ROOT/package.json" ]] || fail "package root is invalid: $PACKAGE_ROOT"
 [[ -f "$E2E_DIR/playwright.config.ts" ]] || fail "e2e config is missing: $E2E_DIR/playwright.config.ts"
-[[ -x "$PLAYWRIGHT_BIN" ]] || fail "local Playwright is missing; run bun install --frozen-lockfile"
+PLAYWRIGHT_CLI="$(/usr/bin/realpath -e -- "$PLAYWRIGHT_ENTRY" 2>/dev/null || true)"
+case "$PLAYWRIGHT_CLI" in
+  "$PACKAGE_ROOT/node_modules/@playwright/test/cli.js"|"$PACKAGE_ROOT/node_modules/.bun/@playwright+test@1.61.1/node_modules/@playwright/test/cli.js") ;;
+  *) fail 'local Playwright CLI escaped the frozen dependency tree' ;;
+esac
+[[ -f "$PLAYWRIGHT_CLI" && ! -L "$PLAYWRIGHT_CLI" ]] \
+  || fail "local Playwright CLI is missing or linked; run bun install --frozen-lockfile"
 [[ "$DEMO_PORT" =~ ^[0-9]+$ ]] || fail 'THUMBMUX_DEMO_PORT must be numeric'
 [[ "$READY_TIMEOUT" =~ ^[0-9]+$ ]] || fail 'THUMBMUX_E2E_READY_TIMEOUT must be numeric'
 
@@ -229,8 +237,9 @@ export THUMBMUX_TEST_RUN_ID="$RUN_ID" THUMBMUX_TEST_SCOPE=e2e
 export THUMBMUX_TEST_ATTESTATION="$THUMBMUX_GUARD_ATTESTATION"
 
 cd "$E2E_DIR"
+thumbmux_assert_attested_node || fail 'attested Node changed before Playwright launch'
 set +e
-"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_BIN" test \
+"$THUMBMUX_GUARD_NODE_BIN" "$PLAYWRIGHT_CLI" test \
   --config=playwright.config.ts \
   --forbid-only \
   --output="$ARTIFACTS_DIR/playwright" \
