@@ -755,6 +755,10 @@ describe("TermView sliding archive window", () => {
       { source: "full", replace: false },
     );
     expect(deliveredLines.at(-1)).toEqual(absoluteLines(100, 25));
+    const anchorBefore = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorBefore) throw new Error("startup race anchor was not mounted");
+    const anchorY = projectedScreenY(viewport, anchorBefore);
 
     // The page is authoritative for [85, 105), so the retained live prefix
     // [100, 105) must be consumed at the seam instead of being rendered twice.
@@ -762,6 +766,10 @@ describe("TermView sliding archive window", () => {
     expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
     expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
     expect(new Set(deliveredLines.at(-1)).size).toBe(40);
+    const anchorAfter = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorAfter) throw new Error("startup race anchor disappeared");
+    expect(projectedScreenY(viewport, anchorAfter)).toBeCloseTo(anchorY, 5);
   });
 
   test("uses absolute seam movement when every startup row has identical text", async () => {
@@ -792,6 +800,35 @@ describe("TermView sliding archive window", () => {
     const mountedIds = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
       .map((row) => row.getAttribute("data-line-id"));
     expect(new Set(mountedIds).size).toBe(mountedIds.length);
+  });
+
+  test("keeps an ahead-of-output history page detached until its exact seam arrives", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-history-ahead", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+
+    // The archive transaction reached 105 first, but this viewer has only seen
+    // the output frame paired with boundary 100. Rendering both sides now
+    // would overlap absolute rows 100..104.
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 20));
+
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-history-ahead", 105, 15),
+      { source: "full", replace: false },
+    );
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(40);
   });
 
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {

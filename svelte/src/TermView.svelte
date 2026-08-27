@@ -2956,7 +2956,7 @@
    */
   type LiveBoundaryReconciliation = {
     advancedRows: number;
-    promotedRows: boolean;
+    useCanonicalLiveCapture: boolean;
   };
 
   function reconcileLiveBoundary(
@@ -2964,7 +2964,7 @@
   ): LiveBoundaryReconciliation {
     const unchanged: LiveBoundaryReconciliation = {
       advancedRows: 0,
-      promotedRows: false,
+      useCanonicalLiveCapture: false,
     };
     if (!boundary || historyPaging !== 'sliding') return unchanged;
     const previous = liveBoundary;
@@ -2998,7 +2998,7 @@
       : 0;
     const advanced: LiveBoundaryReconciliation = {
       advancedRows,
-      promotedRows: false,
+      useCanonicalLiveCapture: false,
     };
     if (
       !archiveWindow
@@ -3006,6 +3006,20 @@
     ) return advanced;
 
     const residentEnd = historyWindowEndLine(archiveWindow);
+    if (
+      residentEnd === boundary.liveStartLine
+      && archiveWindow.hasNewer
+      && !archiveWindowAttachedToLive
+    ) {
+      // A history reply can observe a newer durable head before its paired
+      // output frame reaches this client. Keep that page detached until this
+      // exact equality arrives, then join it to the canonical capture without
+      // content-merging the stale live snapshot that preceded the boundary.
+      archiveWindow = { ...archiveWindow, hasNewer: false };
+      archivedLines = Array.from(archiveWindow.lines);
+      archiveWindowAttachedToLive = true;
+      return { advancedRows, useCanonicalLiveCapture: true };
+    }
     if (residentEnd >= boundary.liveStartLine) return advanced;
     if (!isAwayFromLiveTail()) {
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, false);
@@ -3013,7 +3027,7 @@
     }
 
     if (previous && promoteCrossedLiveRows(previous.liveStartLine, boundary.liveStartLine)) {
-      return { advancedRows, promotedRows: true };
+      return { advancedRows, useCanonicalLiveCapture: true };
     }
 
     detachSlidingArchiveFromLive(boundary.liveStartLine);
@@ -3026,7 +3040,7 @@
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
     boundaryReconciliation: LiveBoundaryReconciliation = {
       advancedRows: 0,
-      promotedRows: false,
+      useCanonicalLiveCapture: false,
     },
   ) {
     if (
@@ -3047,7 +3061,7 @@
     const replaceRetainedRows = replace
       ? replaceRetainedOverlapRows(liveLines, nextLive)
       : 0;
-    if (boundaryReconciliation.promotedRows) {
+    if (boundaryReconciliation.useCanonicalLiveCapture) {
       // The monotonic seam already moved the crossed old-live prefix into the
       // archive. The paired capture starts at the new boundary, so retaining
       // the same prefix in liveLines would render those absolute rows twice.
@@ -3797,10 +3811,13 @@
           lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
           hasOlder: history.hasMore || keepFrom > 0,
-          hasNewer: history.endLine < Math.max(
-            history.totalArchivedLines,
-            liveBoundary?.liveStartLine ?? 0,
-          ),
+          // Equality with the client-observed durable seam is the only proof
+          // that archive and live are adjacent. A reply may see a newer server
+          // head before the paired output frame; keep it detached until that
+          // exact boundary arrives instead of overlapping the stale live view.
+          hasNewer: liveBoundary
+            ? history.endLine !== liveBoundary.liveStartLine
+            : history.endLine < history.totalArchivedLines,
           limits,
         }),
         live,
@@ -4117,7 +4134,9 @@
         direction,
         // Archive rows enter before live; an emergency live-prefix trim moves
         // the same anchor back by the number of rows it removed.
-        indexDelta: seeded.state.lines.length - seeded.livePrefixDropped,
+        indexDelta: seeded.state.lines.length
+          - seeded.consumedRetainedLivePrefixRows
+          - seeded.livePrefixDropped,
         oldScrollTop,
         acceptedLineCount: seeded.state.lines.length,
         live: seeded.live,
