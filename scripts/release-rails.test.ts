@@ -25,6 +25,10 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+const gitDistRewriter = readFileSync(
+  resolve(import.meta.dir, "rewrite-git-dist-imports.ts"),
+  "utf8",
+);
 const e2eRunner = readFileSync(resolve(packageRoot, "e2e/run-container.sh"), "utf8");
 const e2eConfig = readFileSync(resolve(packageRoot, "e2e/playwright.config.ts"), "utf8");
 const e2eHelpers = readFileSync(resolve(packageRoot, "e2e/helpers.ts"), "utf8");
@@ -47,6 +51,11 @@ afterEach(() => {
 });
 
 describe("release rail policy", () => {
+  test("frozen git-dist guard imports TypeScript through its stable namespace", () => {
+    expect(gitDistRewriter).toContain('import * as ts from "typescript";');
+    expect(gitDistRewriter).not.toContain('import ts from "typescript";');
+  });
+
   test("Svelte package scratch output cannot dirty Docker source admission", () => {
     expect(gitIgnore).toContain("svelte/.svelte-kit/");
     expect(gitIgnore).toContain("app/.svelte-kit/");
