@@ -49,7 +49,7 @@ describe("Bun tmux driver pane screen status (FS1)", () => {
   test("captureWithCursor returns a MuxPaneScreen from the combined status line", async () => {
     const status =
       "3|1|24|1|0|1|1|0\n" + // x|y|h|flag|in_mode|alt|mouseSgr|mouseAny
-      "hello\nworld\n\n";
+      "A❤️ B\nworld\n\n";
     const originalSpawn = Bun.spawn;
     const originalSpawnSync = Bun.spawnSync;
     Bun.spawn = ((cmd: string[]) => {
@@ -73,10 +73,26 @@ describe("Bun tmux driver pane screen status (FS1)", () => {
       const combined = await createBunTmuxDriver().captureWithCursor!("s", { currentPaneOnly: true });
       expect(combined.screen).toEqual({ alt: true, mouseSgr: true, mouseAny: false });
       expect(combined.cursor).toEqual({ x: 3, y: 1, paneHeight: 24, visible: true });
-      expect(combined.content).toContain("hello");
+      expect(combined.content).toContain("A❤️ B");
     } finally {
       Bun.spawn = originalSpawn;
       Bun.spawnSync = originalSpawnSync;
+    }
+  });
+
+  test("capturePane preserves raw tmux capture bytes without guessing filler provenance", async () => {
+    const rawCapture = "A❤️ B\n";
+    const originalSpawn = Bun.spawn;
+    Bun.spawn = (() => ({
+      stdout: new Response(rawCapture).body,
+      stderr: new Response("").body,
+      exited: Promise.resolve(0),
+    })) as typeof Bun.spawn;
+    try {
+      expect(await createBunTmuxDriver().capturePane("s", { currentPaneOnly: true }))
+        .toBe(rawCapture);
+    } finally {
+      Bun.spawn = originalSpawn;
     }
   });
 });
