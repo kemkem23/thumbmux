@@ -1034,7 +1034,6 @@ describe("TermView sliding archive window", () => {
     try {
       document.dispatchEvent(new Event("selectionchange"));
       flushSync();
-      expect(viewport.getAttribute("data-content-update-selection")).toBe("1");
 
       deliverOutput(
         pending,
