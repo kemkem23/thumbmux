@@ -3,6 +3,8 @@ demo/dist/
 dist/
 git-dist/
 *.tgz
+svelte/.svelte-kit/
+app/.svelte-kit/
 
 # agent bookkeeping — never ship to the public repo
 .claude/
