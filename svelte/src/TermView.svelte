@@ -2273,7 +2273,13 @@
     const archivedCount = Math.min(count, archivedLines.length);
     const liveCount = count - archivedCount;
     archivedLines.splice(0, archivedCount);
-    if (liveCount > 0) liveLines.splice(0, liveCount);
+    if (liveCount > 0) {
+      liveLines.splice(0, liveCount);
+      retainedLivePrefixBeforeBoundary = Math.max(
+        0,
+        retainedLivePrefixBeforeBoundary - liveCount,
+      );
+    }
     rawLines.splice(0, count);
     linksByLine.splice(0, count);
     rawEntryState = nextEntryState;
@@ -2968,6 +2974,16 @@
     };
     if (!boundary || historyPaging !== 'sliding') return unchanged;
     const previous = liveBoundary;
+    if (
+      previous
+      && previous.generation === boundary.generation
+      && boundary.liveStartLine < previous.liveStartLine
+    ) {
+      // A reconnecting transport can race a cached full frame behind the last
+      // accepted durable seam. Its absolute identity is stale even if its
+      // bytes look plausible, so never move the local boundary backwards.
+      return unchanged;
+    }
     liveBoundary = { ...boundary };
     archiveTotalHint = Math.max(archiveTotalHint, boundary.liveStartLine);
 
@@ -3067,6 +3083,45 @@
       // the same prefix in liveLines would render those absolute rows twice.
       liveLines = nextLive;
       retainedLivePrefixBeforeBoundary = 0;
+    } else if (
+      !followTail
+      && historyPaging === 'sliding'
+      && archiveWindow === null
+      && liveLines.length > 0
+      && !noScrollback
+      && (
+        retainedLivePrefixBeforeBoundary > 0
+        || boundaryReconciliation.advancedRows > 0
+      )
+    ) {
+      // Once a durable seam has identified an immutable prefix, every frame
+      // at that seam must compose that prefix with the complete canonical live
+      // snapshot. Text overlap is not row identity: a full-screen repaint can
+      // change every byte, while a repeated status screen can make unrelated
+      // rows look identical.
+      const canonicalResidentRows = Math.max(
+        0,
+        liveLines.length - retainedLivePrefixBeforeBoundary,
+      );
+      const advancedRows = boundaryReconciliation.advancedRows;
+      if (advancedRows <= canonicalResidentRows) {
+        const previousLength = liveLines.length;
+        retainedLivePrefixBeforeBoundary += advancedRows;
+        liveLines = [
+          ...liveLines.slice(0, retainedLivePrefixBeforeBoundary),
+          ...nextLive,
+        ];
+        if (liveLines.length > previousLength) {
+          archiveExhausted = false;
+          clearHistoryStopIfResumed();
+        }
+      } else {
+        // The seam jumped beyond every resident canonical row. Keep no
+        // guessed prefix; the next absolute history page will fill whatever
+        // durable range the server still retains.
+        liveLines = nextLive;
+        retainedLivePrefixBeforeBoundary = 0;
+      }
     } else if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width. A resync can
@@ -3079,31 +3134,6 @@
       retainedLivePrefixBeforeBoundary = 0;
       if (discardedLiveRows > 0) {
         recordRetentionGap(archivedLines.length, discardedLiveRows);
-      }
-    } else if (
-      !followTail
-      && historyPaging === 'sliding'
-      && archiveWindow === null
-      && liveLines.length > 0
-      && boundaryReconciliation.advancedRows > 0
-      && boundaryReconciliation.advancedRows
-        <= liveLines.length - retainedLivePrefixBeforeBoundary
-      && !noScrollback
-    ) {
-      // A durable boundary gives stronger identity than textual overlap. Keep
-      // exactly the old canonical rows that crossed [oldStart, newStart), then
-      // append the complete new canonical live snapshot. This remains exact
-      // for a screen made entirely of identical blank/status rows, where any
-      // content matcher would collapse distinct absolute rows together.
-      const previousLength = liveLines.length;
-      retainedLivePrefixBeforeBoundary += boundaryReconciliation.advancedRows;
-      liveLines = [
-        ...liveLines.slice(0, retainedLivePrefixBeforeBoundary),
-        ...nextLive,
-      ];
-      if (liveLines.length > previousLength) {
-        archiveExhausted = false;
-        clearHistoryStopIfResumed();
       }
     } else if (!followTail && liveLines.length > 0 && !noScrollback) {
       const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
@@ -3886,6 +3916,17 @@
       gapBeforeRows?: number;
     },
   ): void {
+    if (
+      liveBoundary
+      && historyWindowEndLine(state) !== liveBoundary.liveStartLine
+      && !state.hasNewer
+    ) {
+      // Attachment is legal only at exact durable equality. This defensive
+      // normalization covers initial pages, forward pages, and replacement
+      // paths so a future caller cannot concatenate overlapping archive/live
+      // ranges merely because a server reply said it had no newer page.
+      state = { ...state, hasNewer: true };
+    }
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
     const projectBash = normalizedClaudeBashMode() !== 'off';
@@ -4163,9 +4204,10 @@
         lines: history.lines,
         lineBytes: estimatedHistoryWindowLineStorage(history.lines),
         hasMore: direction === 'after'
-          ? history.hasMore || history.endLine < Math.max(
-              archiveTotalHint,
-              liveBoundary?.liveStartLine ?? 0,
+          ? history.hasMore || (
+              liveBoundary
+                ? history.endLine !== liveBoundary.liveStartLine
+                : history.endLine < archiveTotalHint
             )
           : history.hasMore,
       },
