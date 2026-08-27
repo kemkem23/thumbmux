@@ -19,14 +19,15 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.6-dist`.
   resize, Unicode combining sequences, CJK and emoji retain the same measured
   cell geometry as the rendered rows.
 
-- **Raw tmux capture remains byte-faithful by default.** The optional capture
-  normalizer is exported for explicit diagnostics, but the Bun driver does not
-  rewrite ambiguous variation-selector padding before host WAL or archive
-  ingestion.
+- **Raw tmux capture remains byte-faithful by default.** A source-only
+  diagnostic helper records the ambiguous variation-selector padding case, but
+  it is not a public export and the Bun driver does not rewrite capture bytes
+  before host WAL or archive ingestion.
 
-- **Managed launch callbacks can retain their durable receipt across retries.**
-  App and upload hosts may persist a returned launch receipt instead of losing
-  it when the first presentation attempt is retried.
+- **Upload requests can carry and settle a host-owned durable receipt across
+  retries.** Optional request-scoped hooks may append idempotency fields and
+  observe the parsed response with the exact opaque context from that attempt;
+  omitting both hooks preserves the existing upload behavior.
 
 ### Security
 
