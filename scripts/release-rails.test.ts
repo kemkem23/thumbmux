@@ -456,6 +456,29 @@ describe("release rail policy", () => {
     }
   });
 
+  test("root smoke installs the frozen lock before running staged TypeScript helpers", () => {
+    const frozenCopy = smoke.indexOf(
+      '/usr/bin/diff -qr -- "$PACKAGE_ROOT/git-dist" "$PACKAGE_SOURCE/git-dist"',
+    );
+    const frozenInstall = smoke.indexOf(
+      '"$THUMBMUX_GUARD_BUN_BIN" install --frozen-lockfile --ignore-scripts',
+    );
+    const helperCalls = [
+      '"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" check-exports',
+      '"$THUMBMUX_GUARD_BUN_BIN" --no-install "$RELEASE_MANIFEST" .',
+      '"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer"',
+      '"$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" write-consumer-guards "$WORK/npm-consumer"',
+    ];
+    expect(frozenCopy).toBeGreaterThan(-1);
+    expect(frozenInstall).toBeGreaterThan(frozenCopy);
+    for (const call of helperCalls) {
+      expect(smoke).toContain(call);
+      expect(smoke.indexOf(call)).toBeGreaterThan(frozenInstall);
+    }
+    expect(smoke).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$EXPORT_GUARD"');
+    expect(smoke).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$RELEASE_MANIFEST"');
+  });
+
   test("packed Node 18 smoke permanently gates portable replay writer recovery", () => {
     expect(smoke).toContain("/usr/bin/timeout 240 /usr/bin/docker run");
     expect(smoke).toContain('--cidfile "$CID_FILE"');
