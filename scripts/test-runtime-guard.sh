@@ -105,26 +105,50 @@ thumbmux_assert_final_receipt_file() {
     && "${lines[7]}" == "receipt-identity=${observed_identity}" ]] || return 1
 }
 
+thumbmux_assert_attested_node() {
+  local node_bin="${THUMBMUX_GUARD_NODE_BIN-}"
+  local node_real node_owner node_version
+  [[ "${THUMBMUX_GUARD_PROVIDER-}" == github-hosted \
+    || "${THUMBMUX_GUARD_PROVIDER-}" == github-hosted-frozen-export ]] \
+    || { thumbmux_guard_error 'GitHub Node cannot be admitted before public admission'; return 1; }
+  node_real="$(/usr/bin/realpath -e -- "$node_bin" 2>/dev/null || true)"
+  node_owner="$(/usr/bin/stat -c '%u:%a:%F' -- "$node_bin" 2>/dev/null || true)"
+  node_version="$("$node_bin" --version 2>/dev/null || true)"
+  [[ "$node_bin" == /opt/hostedtoolcache/node/22.23.2/x64/bin/node \
+    && "$node_real" == "$node_bin" \
+    && "$node_owner" =~ ^(0|$(/usr/bin/id -u)):[0-7]{3,4}:regular\ file$ \
+    && -x "$node_bin" && ! -L "$node_bin" \
+    && "$node_version" == v22.23.2 ]] \
+    || { thumbmux_guard_error 'attested GitHub Node 22.23.2 binary identity is unsafe'; return 1; }
+}
+
 thumbmux_restore_attested_tool_path() {
-  local candidate real owner
+  local bun_candidate bun_real bun_owner node_candidate
   [[ "${THUMBMUX_GUARD_PROVIDER-}" == github-hosted \
     || "${THUMBMUX_GUARD_PROVIDER-}" == github-hosted-frozen-export ]] \
     || { thumbmux_guard_error 'runner tool path cannot be restored before public admission'; return 1; }
   PATH="${THUMBMUX_ENTRY_CALLER_PATH-}"
-  candidate="$(command -v bun 2>/dev/null || true)"
-  real="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
-  case "$real" in
+  bun_candidate="$(command -v bun 2>/dev/null || true)"
+  bun_real="$(/usr/bin/realpath -e -- "$bun_candidate" 2>/dev/null || true)"
+  case "$bun_real" in
     /opt/hostedtoolcache/bun/*/x64/bun|/home/runner/setup-bun/bin/bun|/home/runner/.bun/bin/bun) ;;
     *) PATH=/usr/bin:/bin; export PATH; thumbmux_guard_error 'attested GitHub Bun binary path is unavailable'; return 1 ;;
   esac
-  owner="$(/usr/bin/stat -Lc '%u:%a:%F' -- "$real" 2>/dev/null || true)"
-  [[ "$owner" =~ ^(0|$(id -u)):[0-7]{3,4}:regular\ file$ && -x "$real" && ! -L "$real" ]] \
+  bun_owner="$(/usr/bin/stat -Lc '%u:%a:%F' -- "$bun_real" 2>/dev/null || true)"
+  [[ "$bun_owner" =~ ^(0|$(id -u)):[0-7]{3,4}:regular\ file$ \
+    && -x "$bun_real" && ! -L "$bun_real" ]] \
     || { PATH=/usr/bin:/bin; export PATH; thumbmux_guard_error 'attested GitHub Bun binary identity is unsafe'; return 1; }
-  THUMBMUX_GUARD_BUN_BIN="$real"
-  # Keep fixed host utilities ahead of the one admitted runner tool. Callers
-  # execute Bun through THUMBMUX_GUARD_BUN_BIN when its exact identity matters.
-  PATH="/usr/bin:/bin:$(/usr/bin/dirname -- "$real")"
-  export PATH THUMBMUX_GUARD_BUN_BIN
+
+  node_candidate="$(command -v node 2>/dev/null || true)"
+  THUMBMUX_GUARD_BUN_BIN="$bun_real"
+  THUMBMUX_GUARD_NODE_BIN="$node_candidate"
+  export THUMBMUX_GUARD_BUN_BIN THUMBMUX_GUARD_NODE_BIN
+  thumbmux_assert_attested_node \
+    || { THUMBMUX_GUARD_NODE_BIN=''; PATH=/usr/bin:/bin; export PATH THUMBMUX_GUARD_NODE_BIN; return 1; }
+  # Keep fixed host utilities ahead of the two admitted runner tools. Callers
+  # execute both interpreters through their absolute attested paths.
+  PATH="/usr/bin:/bin:$(/usr/bin/dirname -- "$bun_real"):$(/usr/bin/dirname -- "$THUMBMUX_GUARD_NODE_BIN")"
+  export PATH THUMBMUX_GUARD_BUN_BIN THUMBMUX_GUARD_NODE_BIN
 }
 
 thumbmux_make_run_id() {
