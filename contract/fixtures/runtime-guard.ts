@@ -42,11 +42,13 @@ export function assertContractFixtureRuntime(): string {
   let receipt: string;
   let tmuxShim: string;
   let checkout: string;
+  let bunBin: string;
   try {
     runtime = realpathSync(runtimeRaw);
     receipt = realpathSync(`${runtime}/runtime-attestation`);
     tmuxShim = realpathSync(`${runtime}/bin/tmux`);
     checkout = realpathSync(process.env.THUMBMUX_GUARD_CHECKOUT ?? "");
+    bunBin = realpathSync(process.env.THUMBMUX_GUARD_BUN_BIN ?? "");
   } catch {
     fail("runtime receipt or private tmux shim is unavailable");
   }
@@ -56,6 +58,7 @@ export function assertContractFixtureRuntime(): string {
   const socketParent = `${runtime}/tmux/tmux-${uid}`;
   const socketParentStat = statSync(socketParent);
   const tmuxShimStat = statSync(tmuxShim);
+  const bunBinStat = statSync(bunBin);
   const pathParts = process.env.PATH?.split(":") ?? [];
   if (runtime !== runtimeRaw
     || lstatSync(runtimeRaw).isSymbolicLink()
@@ -69,6 +72,13 @@ export function assertContractFixtureRuntime(): string {
     || pathParts[2] !== "/bin"
     || !/^(?:\/opt\/hostedtoolcache\/bun\/[^/]+\/x64|\/home\/runner\/(?:setup-bun|\.bun)\/bin)$/.test(pathParts[3] ?? "")
     || pathParts[4] !== "/opt/hostedtoolcache/node/22.23.2/x64/bin"
+    || bunBin !== process.env.THUMBMUX_GUARD_BUN_BIN
+    || dirname(bunBin) !== pathParts[3]
+    || !/^(?:\/opt\/hostedtoolcache\/bun\/[^/]+\/x64\/bun|\/home\/runner\/(?:setup-bun|\.bun)\/bin\/bun)$/.test(bunBin)
+    || !lstatSync(bunBin).isFile()
+    || lstatSync(bunBin).isSymbolicLink()
+    || (bunBinStat.uid !== 0 && bunBinStat.uid !== uid)
+    || (bunBinStat.mode & 0o111) === 0
     || privateBinStat.uid !== uid
     || (privateBinStat.mode & 0o7777) !== 0o700
     || lstatSync(`${runtime}/tmux`).isSymbolicLink()
