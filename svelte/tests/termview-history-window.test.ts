@@ -831,6 +831,144 @@ describe("TermView sliding archive window", () => {
     expect(new Set(deliveredLines.at(-1)).size).toBe(40);
   });
 
+  test("replaces canonically when a repeated-text boundary jump exceeds the resident live window", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    const repeated = Array.from({ length: 20 }, () => "same-status-row");
+
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-large-jump", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+
+    // Twenty resident rows cannot prove the five missing absolute rows in a
+    // 25-row seam advance. Repeated bytes must not be mistaken for identity.
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-large-jump", 125, 35),
+      { source: "full", replace: false },
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(20);
+
+    // The authoritative page [105, 125) now meets the exact durable seam and
+    // must attach beside the complete canonical live screen [125, 145).
+    deliverHistory(105, repeated, false, 125);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(40);
+    expect(deliveredLines.at(-1)).toHaveLength(40);
+  });
+
+  test("preserves an absolute crossed prefix across a same-boundary repaint", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-same-boundary", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-same-boundary", 105, 15),
+      { source: "full", replace: false },
+    );
+    const anchorBefore = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorBefore) throw new Error("same-boundary anchor was not mounted");
+    const anchorY = projectedScreenY(viewport, anchorBefore);
+
+    // A repaint at the same durable seam may change every visible byte. The
+    // already-proven prefix [100, 105) is still immutable absolute history.
+    const repainted = Array.from({ length: 20 }, (_, index) => `repaint-${105 + index}`);
+    deliverOutput(
+      repainted,
+      undefined,
+      historyBoundary("g-same-boundary", 105, 16),
+      { source: "full", replace: false },
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(25);
+    const anchorAfter = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorAfter) throw new Error("same-boundary repaint dropped the absolute anchor");
+    expect(projectedScreenY(viewport, anchorAfter)).toBeCloseTo(anchorY, 5);
+
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual([
+      ...absoluteLines(85, 20),
+      ...repainted,
+    ]);
+  });
+
+  test("keeps a forward page detached when it outruns the current output boundary", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverHistory(80, absoluteLines(80, 20), false, 100);
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 105, 15),
+      { source: "full", replace: false },
+    );
+
+    wheel(viewport, 1_000_000);
+    expect(historyCalls.at(-1)).toEqual({ direction: "after", cursor: 99, limit: 2_000 });
+
+    // The server head has reached 110, but this client still owns output 105.
+    // Joining page [100, 110) to live [105, 125) would duplicate 105..109.
+    deliverHistory(100, absoluteLines(100, 10), false, 110);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(viewport.getAttribute("data-history-window-has-newer")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(80, 30));
+
+    deliverOutput(
+      absoluteLines(110, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 110, 20),
+      { source: "full", replace: false },
+    );
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(80, 50));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(50);
+  });
+
+  test("rejects a stale same-generation boundary regression", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-regression", 105, 15),
+      { source: "full", replace: false },
+    );
+    deliverOutput(
+      absoluteLines(103, 20),
+      undefined,
+      historyBoundary("g-regression", 103, 14),
+      { source: "full", replace: false },
+    );
+
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(viewport.getAttribute("data-history-generation")).toBe("g-regression");
+  });
+
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {
     const { viewport, target } = mountTermView();
     await tick();
