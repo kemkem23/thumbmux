@@ -206,6 +206,27 @@ describe('TermView cursor grid mapping', () => {
     }
   });
 
+  test('reanchors an unchanged row-zero cursor after a content delta grows the tail', async () => {
+    const viewport = mountView();
+    await deliver(['before'], { row: 0, col: 0 });
+    const lineHeight = px(viewport.style.getPropertyValue('--mtv-lineh'));
+
+    const prefix = 'target:A';
+    await deliver(['before', 'echo', '', `${prefix}❤️B`], {
+      row: 0,
+      col: prefix.length,
+    });
+
+    const caret = cursor(viewport);
+    expect(caret.getAttribute('data-cursor-row')).toBe('0');
+    expect(caret.getAttribute('data-cursor-raw-line')).toBe('3');
+    expect(px(caret.style.top)).toBe(3 * lineHeight);
+    expect(px(caret.style.width)).toBeCloseTo(
+      2 * px(viewport.style.getPropertyValue('--mtv-cw')),
+      5,
+    );
+  });
+
   test('uses the same visible control-sequence stream as the renderer', async () => {
     const viewport = mountView();
     await deliver(['A\x1bc❤️B'], { row: 0, col: 1 });

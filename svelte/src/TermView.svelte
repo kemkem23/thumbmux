@@ -5234,6 +5234,17 @@
     return cursorPosCache;
   }
 
+  /** rawLines stays deliberately unproxied because it may retain 10k terminal
+   * rows.  contentEpoch is the explicit reactive revision: without consuming
+   * it here, a content delta that keeps cursor.row unchanged can leave the
+   * caret anchored against the previous rawLines length. */
+  function lastContentLine(contentRevision: number): number {
+    void contentRevision;
+    let index = rawLines.length;
+    while (index > 0 && !(rawLines[index - 1] ?? '').trim()) index--;
+    return index - 1;
+  }
+
   function canSendResize(): boolean {
     return !!(
       claimGeometry &&
@@ -5858,7 +5869,7 @@
       {/each}
     {/key}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
-      {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
+      {@const lastContent = lastContentLine(contentEpoch)}
       {@const cline = lastContent - cursor.row}
       {@const cvisual = visualRowForRaw(cline)}
       {@const blankRowsPastRawEnd = Math.max(0, cline - rawLines.length)}
