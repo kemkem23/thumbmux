@@ -162,8 +162,8 @@ export function assertContractFixtureRuntime(): string {
   return runtime;
 }
 
-export function assertContractFixturePort(port: number): void {
-  if (!Number.isInteger(port) || port < 1024 || port > 65_535
+export function assertContractFixturePort(port: number | undefined): void {
+  if (port === undefined || !Number.isInteger(port) || port < 1024 || port > 65_535
     || port === 47_779 || port === 47_780) {
     fail(`unsafe or reserved loopback port ${port}`);
   }

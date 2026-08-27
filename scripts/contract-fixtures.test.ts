@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { assertContractFixturePort } from "../contract/fixtures/runtime-guard";
 
 const roots: string[] = [];
 const runner = resolve(import.meta.dir, "contract-fixtures.sh");
@@ -123,6 +124,16 @@ describe("frozen consumer runner policy", () => {
     expect(source).toContain("'devDependencies.@types/bun=1.3.14'");
     expect(source).not.toContain("'devDependencies.@types/bun=^1.3.0'");
     expect(lock).toContain('"@types/bun": ["@types/bun@1.3.14"');
+  });
+
+  test("consumer port guard rejects an unassigned or production listener", () => {
+    expect(() => assertContractFixturePort(undefined)).toThrow(
+      "unsafe or reserved loopback port undefined",
+    );
+    expect(() => assertContractFixturePort(47_779)).toThrow(
+      "unsafe or reserved loopback port 47779",
+    );
+    expect(() => assertContractFixturePort(48_779)).not.toThrow();
   });
 
   test("forged disposable markers still fail before tmux or Docker", () => {
