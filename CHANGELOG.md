@@ -24,6 +24,12 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.6-dist`.
   it is not a public export and the Bun driver does not rewrite capture bytes
   before host WAL or archive ingestion.
 
+- **Exact-mode pane operations now stay on window 0, pane 0 even if another
+  tmux window becomes active.** The reference driver targets `=name:0.0` for
+  capture, input, resize and cursor sampling instead of letting a trailing
+  colon select mutable current-pane state. Hosts that deliberately want tmux's
+  native active/prefix resolution can still opt into `targetMode: "legacy"`.
+
 - **Upload requests can carry and settle a host-owned durable receipt across
   retries.** Optional request-scoped hooks may append idempotency fields and
   observe the parsed response with the exact opaque context from that attempt;
