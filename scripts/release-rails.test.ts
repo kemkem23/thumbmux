@@ -266,6 +266,8 @@ describe("release rail policy", () => {
       "THUMBMUX_CONTRACT_BASELINE_ROOT=",
       "bun run contract",
       "./scripts/contract-fixtures.sh",
+      "source integrity after verification",
+      "git ls-files --others --exclude-standard",
     ];
     for (const marker of requiredGateMarkers) {
       expect(gate).toContain(marker);
