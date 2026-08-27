@@ -122,3 +122,12 @@ runs:
       # was installed above for the app-host runtime fixture.
       run: ./scripts/contract-fixtures.sh
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+    - name: source integrity after verification
+      # Generated outputs are ignored, but no suite may rewrite tracked source
+      # or leave an undeclared artifact before release-dist creates its tag.
+      run: |
+        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        git diff --quiet --no-ext-diff --
+        git diff --cached --quiet --no-ext-diff --
+        test -z "$(git ls-files --others --exclude-standard)"
+      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
