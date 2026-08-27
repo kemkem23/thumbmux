@@ -194,6 +194,12 @@ describe('thumbmux e2e runtime admission', () => {
     expect(parity).not.toContain('mktemp -d -t thumbmux-ci-parity');
   });
 
+  test('the canonical Playwright CLI runs through the attested pinned Bun binary', () => {
+    const e2e = readFileSync(resolve(import.meta.dir, '../e2e/run-container.sh'), 'utf8');
+    expect(e2e).toContain('"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_BIN" test');
+    expect(e2e).not.toContain('\n"$PLAYWRIGHT_BIN" test');
+  });
+
   test('e2e tmux operations use exact session, window, and pane targets', () => {
     const helpers = readFileSync(resolve(import.meta.dir, '../e2e/helpers.ts'), 'utf8');
     expect(helpers).toContain('shellQuote(`=${session}`)');
