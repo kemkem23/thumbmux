@@ -49,6 +49,45 @@ let originalSendResize: typeof tmuxMux.sendResize;
 let originalSubscribe: typeof tmuxMux.subscribe;
 let originalResizeObserver: typeof ResizeObserver;
 let originalWindowResizeObserver: typeof ResizeObserver;
+let originalDocumentFontsDescriptor: PropertyDescriptor | undefined;
+let originalCanvasGetContextDescriptor: PropertyDescriptor | undefined;
+let controlledCellWidth = 7.8;
+
+class ControlledFontFaceSet {
+  private readonly listeners = new Set<EventListenerOrEventListenerObject>();
+  private resolveReady!: (value: FontFaceSet) => void;
+  private readySettled = false;
+
+  readonly ready = new Promise<FontFaceSet>((resolve) => {
+    this.resolveReady = resolve;
+  });
+
+  addEventListener(type: string, callback: EventListenerOrEventListenerObject | null): void {
+    if (type === 'loadingdone' && callback) this.listeners.add(callback);
+  }
+
+  removeEventListener(type: string, callback: EventListenerOrEventListenerObject | null): void {
+    if (type === 'loadingdone' && callback) this.listeners.delete(callback);
+  }
+
+  settleReady(): void {
+    if (this.readySettled) return;
+    this.readySettled = true;
+    this.resolveReady(this as unknown as FontFaceSet);
+  }
+
+  loadingDone(): void {
+    const event = new Event('loadingdone');
+    for (const callback of [...this.listeners]) {
+      if (typeof callback === 'function') callback.call(this as unknown as EventTarget, event);
+      else callback.handleEvent(event);
+    }
+  }
+
+  get listenerCount(): number {
+    return this.listeners.size;
+  }
+}
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
@@ -91,6 +130,33 @@ function mountTermView(overrides: Partial<TermViewProps> = {}): Mounted {
   return entry;
 }
 
+function installControlledFonts(initialCellWidth: number): ControlledFontFaceSet {
+  controlledCellWidth = initialCellWidth;
+  const fonts = new ControlledFontFaceSet();
+  Object.defineProperty(document, 'fonts', {
+    configurable: true,
+    value: fonts,
+  });
+  Object.defineProperty(window.HTMLCanvasElement.prototype, 'getContext', {
+    configurable: true,
+    value: () => ({
+      font: '',
+      measureText: (text: string) => ({ width: controlledCellWidth * text.length }),
+    }),
+  });
+  return fonts;
+}
+
+async function settleMount(): Promise<void> {
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  resizeCalls = [];
+}
+
+function cssCellWidth(viewport: HTMLElement): number {
+  return Number.parseFloat(viewport.style.getPropertyValue('--mtv-cw'));
+}
+
 beforeEach(() => {
   resizeCalls = [];
   ControlledResizeObserver.latest = null;
@@ -102,6 +168,11 @@ beforeEach(() => {
   tmuxMux.subscribe = (() => () => {}) as typeof tmuxMux.subscribe;
   originalResizeObserver = globalThis.ResizeObserver;
   originalWindowResizeObserver = window.ResizeObserver;
+  originalDocumentFontsDescriptor = Object.getOwnPropertyDescriptor(document, 'fonts');
+  originalCanvasGetContextDescriptor = Object.getOwnPropertyDescriptor(
+    window.HTMLCanvasElement.prototype,
+    'getContext',
+  );
   globalThis.ResizeObserver = ControlledResizeObserver;
   window.ResizeObserver = ControlledResizeObserver;
 });
@@ -116,6 +187,20 @@ afterEach(() => {
   tmuxMux.subscribe = originalSubscribe;
   globalThis.ResizeObserver = originalResizeObserver;
   window.ResizeObserver = originalWindowResizeObserver;
+  if (originalDocumentFontsDescriptor) {
+    Object.defineProperty(document, 'fonts', originalDocumentFontsDescriptor);
+  } else {
+    Reflect.deleteProperty(document, 'fonts');
+  }
+  if (originalCanvasGetContextDescriptor) {
+    Object.defineProperty(
+      window.HTMLCanvasElement.prototype,
+      'getContext',
+      originalCanvasGetContextDescriptor,
+    );
+  } else {
+    Reflect.deleteProperty(window.HTMLCanvasElement.prototype, 'getContext');
+  }
 });
 
 describe('TermView font-driven resize debounce (BRIEF-H)', () => {
@@ -191,5 +276,88 @@ describe('TermView font-driven resize debounce (BRIEF-H)', () => {
     target.remove();
     mounted.pop();
     expect(resizeCalls.length).toBe(afterMount + 1);
+  });
+});
+
+describe('TermView late web-font geometry', () => {
+  test('remeasures after document.fonts.ready and sends one changed grid size', async () => {
+    const fonts = installControlledFonts(6);
+    const { viewport } = mountTermView();
+    await settleMount();
+    expect(cssCellWidth(viewport)).toBe(6);
+
+    controlledCellWidth = 8;
+    fonts.settleReady();
+    await Promise.resolve();
+    await tick();
+
+    expect(cssCellWidth(viewport)).toBe(8);
+    expect(resizeCalls).toEqual([{ session: SESSION, cols: 38, rows: 20 }]);
+  });
+
+  test('coalesces ready and loadingdone when both report the same metric', async () => {
+    const fonts = installControlledFonts(6);
+    const { viewport } = mountTermView();
+    await settleMount();
+
+    controlledCellWidth = 9;
+    fonts.loadingDone();
+    fonts.settleReady();
+    await Promise.resolve();
+    await tick();
+
+    expect(cssCellWidth(viewport)).toBe(9);
+    expect(resizeCalls).toEqual([{ session: SESSION, cols: 34, rows: 20 }]);
+  });
+
+  test('handles a later loadingdone without sending duplicate unchanged resizes', async () => {
+    const fonts = installControlledFonts(6);
+    const { viewport } = mountTermView();
+    await settleMount();
+    fonts.settleReady();
+    await Promise.resolve();
+    resizeCalls = [];
+
+    controlledCellWidth = 8;
+    fonts.loadingDone();
+    await tick();
+    expect(cssCellWidth(viewport)).toBe(8);
+    expect(resizeCalls).toHaveLength(1);
+
+    fonts.loadingDone();
+    await tick();
+    expect(resizeCalls).toHaveLength(1);
+  });
+
+  test('repaints a changed cell metric even when the rounded grid is unchanged', async () => {
+    const fonts = installControlledFonts(8);
+    const { viewport } = mountTermView();
+    await settleMount();
+
+    controlledCellWidth = 8.01;
+    fonts.loadingDone();
+    await tick();
+
+    expect(cssCellWidth(viewport)).toBeCloseTo(8.01, 5);
+    expect(resizeCalls).toHaveLength(0);
+  });
+
+  test('removes its listener and ignores an unresolved ready promise after unmount', async () => {
+    const fonts = installControlledFonts(6);
+    const { app, target } = mountTermView();
+    await settleMount();
+    expect(fonts.listenerCount).toBe(1);
+
+    unmount(app);
+    target.remove();
+    mounted.pop();
+    expect(fonts.listenerCount).toBe(0);
+
+    controlledCellWidth = 8;
+    fonts.loadingDone();
+    fonts.settleReady();
+    await Promise.resolve();
+    await tick();
+    expect(resizeCalls).toHaveLength(0);
   });
 });

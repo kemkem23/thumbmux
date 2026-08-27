@@ -1,4 +1,5 @@
 import { charCellWidth, stringCells } from './cells';
+import { stripTerminalControls } from './terminal-controls';
 
 export interface TerminalLinkSegment {
   lineIdx: number;
@@ -224,13 +225,4 @@ export function findTerminalUrlAtCell(rawLines: string[], lineIdx: number, col: 
   return null;
 }
 
-function stripAnsi(text: string): string {
-  // Every pattern below needs an ESC byte; skip three regex passes when there is none.
-  if (text.indexOf('\x1b') < 0) return text;
-  return text
-    // Include colon-form SGR parameters (`4:3`, `58:2::r:g:b`) — semicolon-only
-    // left modern underline/color codes as "visible" columns and shifted links.
-    .replace(/\x1b\[[0-9:;]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    .replace(/\x1b\][^\x1b]*\x1b\\/g, '');
-}
+const stripAnsi = stripTerminalControls;

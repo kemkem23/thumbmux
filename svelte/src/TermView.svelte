@@ -27,6 +27,10 @@
     type ContentUpdate,
   } from './content-update-gate';
   import {
+    admitLiveBoundary,
+    createLiveBoundaryAdmission,
+  } from './live-boundary-admission';
+  import {
     applyHistoryWindowPage,
     createHistoryWindow,
     historyWindowEndLine,
@@ -65,6 +69,7 @@
     contentCellFromPoint, centerContentCell,
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
+    muxHistoryBoundaryTransition,
     type MuxHistoryBoundary,
     detectClaudeBashBlocks,
     groupClaudeBashBlocks,
@@ -339,6 +344,11 @@
   let detachedLiveProjectionPending = false;
   /** Last mux-validated durable seam paired with the current live capture. */
   let liveBoundary = $state.raw<MuxHistoryBoundary | null>(null);
+  /** Rows retained ahead of the current durable seam solely to keep an
+   * archive-less reader stable while its first history page is in flight.
+   * Their identity comes from monotonic boundary movement, never content
+   * matching; the page consumes this prefix exactly when it reaches the seam. */
+  let retainedLivePrefixBeforeBoundary = 0;
   /** Newest total observed in a history reply (may lead the next output tick). */
   let archiveTotalHint = 0;
   let archiveLoading = false;
@@ -367,6 +377,11 @@
   let archiveInflightDirection = $state<HistoryWindowDirection | null>(null);
   let archiveInflightAnchorLine: number | null = null;
   let archiveRequestTimer: ReturnType<typeof setTimeout> | null = null;
+  // The applied boundary can lag while content is held behind a selection or
+  // gesture. Remember the newest frame admitted from the wire as a separate
+  // high-water fence so a reconnecting cached frame cannot replace that
+  // pending delivery before reconcileLiveBoundary() gets a chance to run.
+  let liveBoundaryAdmission = createLiveBoundaryAdmission();
 
   // --- scroll model: bottomOffsetPx 0 = pinned to live tail ---
   // Keep the per-frame compositor offset out of Svelte reactivity. Diagnostics
@@ -2268,7 +2283,13 @@
     const archivedCount = Math.min(count, archivedLines.length);
     const liveCount = count - archivedCount;
     archivedLines.splice(0, archivedCount);
-    if (liveCount > 0) liveLines.splice(0, liveCount);
+    if (liveCount > 0) {
+      liveLines.splice(0, liveCount);
+      retainedLivePrefixBeforeBoundary = Math.max(
+        0,
+        retainedLivePrefixBeforeBoundary - liveCount,
+      );
+    }
     rawLines.splice(0, count);
     linksByLine.splice(0, count);
     rawEntryState = nextEntryState;
@@ -2297,6 +2318,10 @@
     const seam = archivedLines.length;
     const suffixEntry = stateBeforeLine(seam + bounded);
     liveLines.splice(0, bounded);
+    retainedLivePrefixBeforeBoundary = Math.max(
+      0,
+      retainedLivePrefixBeforeBoundary - bounded,
+    );
     rawLines.splice(seam, bounded);
     linksByLine.splice(seam, bounded);
     liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
@@ -2325,6 +2350,10 @@
     linksByLine.splice(start, bounded);
     archivedLines = rawLines.slice(0, start);
     liveLines = rawLines.slice(start);
+    // The legacy middle-gap split no longer has one contiguous absolute live
+    // origin. A later durable page must establish a fresh seam rather than
+    // consuming a stale prefix count across that explicit retention gap.
+    retainedLivePrefixBeforeBoundary = 0;
     liveGapEntryState = liveLines.length > 0 ? suffixEntry : null;
     reindexSparseAfterRemoval(start, bounded, liveGapEntryState);
     if (liveGapEntryState) {
@@ -2869,6 +2898,7 @@
     archiveExhausted = false;
     historyStopReason = 'none';
     archiveOffset = liveStartLine;
+    retainedLivePrefixBeforeBoundary = 0;
     if (resetReader) {
       historyReaderAtUnscrollableTail = false;
       deferredUnscrollableHistoryPx = 0;
@@ -2940,9 +2970,29 @@
    * resident absolute rows and scrollTop, but the window becomes pageable on
    * its newer edge so it can walk to the new seam without a hole or duplicate.
    */
-  function reconcileLiveBoundary(boundary: MuxHistoryBoundary | undefined): void {
-    if (!boundary || historyPaging !== 'sliding') return;
+  type LiveBoundaryReconciliation = {
+    acceptDelivery: boolean;
+    advancedRows: number;
+    useCanonicalLiveCapture: boolean;
+  };
+
+  function reconcileLiveBoundary(
+    boundary: MuxHistoryBoundary | undefined,
+  ): LiveBoundaryReconciliation {
+    const unchanged: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
+      advancedRows: 0,
+      useCanonicalLiveCapture: false,
+    };
+    if (!boundary || historyPaging !== 'sliding') return unchanged;
     const previous = liveBoundary;
+    if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
+      // A reconnecting transport can race a cached full frame behind the last
+      // accepted durable seam. Its absolute identity is stale even if its
+      // bytes look plausible, so reject its content and cursor together with
+      // every monotonic coordinate instead of only preserving the boundary.
+      return { ...unchanged, acceptDelivery: false };
+    }
     liveBoundary = { ...boundary };
     archiveTotalHint = Math.max(archiveTotalHint, boundary.liveStartLine);
 
@@ -2966,28 +3016,59 @@
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
-      return;
+      return unchanged;
     }
-    if (!archiveWindow || (previous && boundary.liveStartLine <= previous.liveStartLine)) return;
+    const advancedRows = previous
+      ? Math.max(0, boundary.liveStartLine - previous.liveStartLine)
+      : 0;
+    const advanced: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
+      advancedRows,
+      useCanonicalLiveCapture: false,
+    };
+    if (
+      !archiveWindow
+      || (previous && boundary.liveStartLine <= previous.liveStartLine)
+    ) return advanced;
 
     const residentEnd = historyWindowEndLine(archiveWindow);
-    if (residentEnd >= boundary.liveStartLine) return;
+    if (
+      residentEnd === boundary.liveStartLine
+      && archiveWindow.hasNewer
+      && !archiveWindowAttachedToLive
+    ) {
+      // A history reply can observe a newer durable head before its paired
+      // output frame reaches this client. Keep that page detached until this
+      // exact equality arrives, then join it to the canonical capture without
+      // content-merging the stale live snapshot that preceded the boundary.
+      archiveWindow = { ...archiveWindow, hasNewer: false };
+      archivedLines = Array.from(archiveWindow.lines);
+      archiveWindowAttachedToLive = true;
+      return { acceptDelivery: true, advancedRows, useCanonicalLiveCapture: true };
+    }
+    if (residentEnd >= boundary.liveStartLine) return advanced;
     if (!isAwayFromLiveTail()) {
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, false);
-      return;
+      return advanced;
     }
 
     if (previous && promoteCrossedLiveRows(previous.liveStartLine, boundary.liveStartLine)) {
-      return;
+      return { acceptDelivery: true, advancedRows, useCanonicalLiveCapture: true };
     }
 
     detachSlidingArchiveFromLive(boundary.liveStartLine);
+    return advanced;
   }
 
   function setLines(
     nextLive: string[],
     replace = false,
     source: LinesChangeMeta['source'] = replace ? 'replace' : 'live',
+    boundaryReconciliation: LiveBoundaryReconciliation = {
+      acceptDelivery: true,
+      advancedRows: 0,
+      useCanonicalLiveCapture: false,
+    },
   ) {
     if (
       historyPaging === 'sliding' &&
@@ -2998,6 +3079,7 @@
       // bounded fresh live suffix offscreen; repainting it must not change
       // total/maxOffset, cursor visibility, search, selection, or the anchor.
       liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
+      retainedLivePrefixBeforeBoundary = 0;
       detachedLiveProjectionPending = true;
       return;
     }
@@ -3006,7 +3088,52 @@
     const replaceRetainedRows = replace
       ? replaceRetainedOverlapRows(liveLines, nextLive)
       : 0;
-    if (replace) {
+    if (boundaryReconciliation.useCanonicalLiveCapture) {
+      // The monotonic seam already moved the crossed old-live prefix into the
+      // archive. The paired capture starts at the new boundary, so retaining
+      // the same prefix in liveLines would render those absolute rows twice.
+      liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
+    } else if (
+      !followTail
+      && historyPaging === 'sliding'
+      && archiveWindow === null
+      && liveLines.length > 0
+      && !noScrollback
+      && (
+        retainedLivePrefixBeforeBoundary > 0
+        || boundaryReconciliation.advancedRows > 0
+      )
+    ) {
+      // Once a durable seam has identified an immutable prefix, every frame
+      // at that seam must compose that prefix with the complete canonical live
+      // snapshot. Text overlap is not row identity: a full-screen repaint can
+      // change every byte, while a repeated status screen can make unrelated
+      // rows look identical.
+      const canonicalResidentRows = Math.max(
+        0,
+        liveLines.length - retainedLivePrefixBeforeBoundary,
+      );
+      const advancedRows = boundaryReconciliation.advancedRows;
+      if (advancedRows <= canonicalResidentRows) {
+        const previousLength = liveLines.length;
+        retainedLivePrefixBeforeBoundary += advancedRows;
+        liveLines = [
+          ...liveLines.slice(0, retainedLivePrefixBeforeBoundary),
+          ...nextLive,
+        ];
+        if (liveLines.length > previousLength) {
+          archiveExhausted = false;
+          clearHistoryStopIfResumed();
+        }
+      } else {
+        // The seam jumped beyond every resident canonical row. Keep no
+        // guessed prefix; the next absolute history page will fill whatever
+        // durable range the server still retains.
+        liveLines = nextLive;
+        retainedLivePrefixBeforeBoundary = 0;
+      }
+    } else if (replace) {
       // Resize/resync captures reflow only the current live window. Archived
       // rows remain physical history at their original width. A resync can
       // replay the same cached content, so count only old rows not covered by
@@ -3015,18 +3142,28 @@
         ? liveLines.length - replaceRetainedRows
         : 0;
       liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
       if (discardedLiveRows > 0) {
         recordRetentionGap(archivedLines.length, discardedLiveRows);
       }
     } else if (!followTail && liveLines.length > 0 && !noScrollback) {
       const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
       liveLines = merged.lines;
+      if (historyPaging === 'sliding' && archiveWindow === null && merged.preservedPrefix) {
+        retainedLivePrefixBeforeBoundary = Math.min(
+          liveLines.length,
+          retainedLivePrefixBeforeBoundary + boundaryReconciliation.advancedRows,
+        );
+      } else if (!merged.preservedPrefix) {
+        retainedLivePrefixBeforeBoundary = 0;
+      }
       if (merged.appendedLineCount > 0) {
         archiveExhausted = false;
         clearHistoryStopIfResumed();
       }
     } else {
       liveLines = nextLive;
+      retainedLivePrefixBeforeBoundary = 0;
     }
 
     if (historyPaging === 'sliding' && archiveWindow !== null) {
@@ -3627,27 +3764,50 @@
     livePrefixDropped: number;
     entryState: SgrState;
     liveEntryState: SgrState | null;
+    consumedRetainedLivePrefixRows: number;
   } | null {
     if (history.startLine === null || history.lines.length === 0) return null;
+
+    // A reader can retain old live rows while the first tokenless history
+    // request is in flight. Once a page reaches the current durable seam, its
+    // suffix is authoritative for those crossed rows. Carry only any older
+    // retained prefix that lies before the returned page, then let canonical
+    // live content begin exactly at liveStartLine. This is absolute arithmetic
+    // and remains correct when every row has identical text.
+    const consumedRetainedLivePrefixRows = history.endLine === liveBoundary?.liveStartLine
+      ? Math.min(retainedLivePrefixBeforeBoundary, liveLines.length)
+      : 0;
+    const pageOverlapRows = Math.min(
+      consumedRetainedLivePrefixRows,
+      history.lines.length,
+    );
+    const carriedPrefixRows = consumedRetainedLivePrefixRows - pageOverlapRows;
+    const normalizedStartLine = history.startLine - carriedPrefixRows;
+    if (normalizedStartLine < 0) return null;
+    const normalizedHistoryLines = [
+      ...liveLines.slice(0, carriedPrefixRows),
+      ...history.lines,
+    ];
+    const canonicalLiveLines = liveLines.slice(consumedRetainedLivePrefixRows);
 
     // Make room for at least the newest incoming archive row. This only
     // matters for a live capture already sitting exactly on a client budget;
     // production captures are normally a much smaller pane-tail window.
-    const lineBytes = estimatedHistoryWindowLineStorage(history.lines);
-    const liveLineBytes = estimatedHistoryWindowLineStorage(liveLines);
+    const lineBytes = estimatedHistoryWindowLineStorage(normalizedHistoryLines);
+    const liveLineBytes = estimatedHistoryWindowLineStorage(canonicalLiveLines);
     const newestBytes = lineBytes.at(-1) ?? 0;
     let liveBytes = liveLineBytes.reduce((sum, bytes) => sum + bytes, 0);
     let livePrefixDropped = 0;
     while (
-      livePrefixDropped < liveLines.length && (
-        liveLines.length - livePrefixDropped >= HISTORY_RETAINED_ROW_BUDGET ||
+      livePrefixDropped < canonicalLiveLines.length && (
+        canonicalLiveLines.length - livePrefixDropped >= HISTORY_RETAINED_ROW_BUDGET ||
         liveBytes + newestBytes > HISTORY_RETAINED_BYTE_BUDGET
       )
     ) {
       liveBytes -= liveLineBytes[livePrefixDropped] ?? 0;
       livePrefixDropped++;
     }
-    const live = liveLines.slice(livePrefixDropped);
+    const live = canonicalLiveLines.slice(livePrefixDropped);
 
     const limits: HistoryWindowLimits = {
       maxRows: Math.max(1, HISTORY_RETAINED_ROW_BUDGET - live.length),
@@ -3657,20 +3817,20 @@
     let keepFrom = 0;
     let retainedBytes = lineBytes.reduce((sum, bytes) => sum + bytes, 0);
     while (
-      keepFrom < history.lines.length && (
-        history.lines.length - keepFrom > limits.maxRows ||
+      keepFrom < normalizedHistoryLines.length && (
+        normalizedHistoryLines.length - keepFrom > limits.maxRows ||
         retainedBytes > limits.maxBytes
       )
     ) {
       retainedBytes -= lineBytes[keepFrom] ?? 0;
       keepFrom++;
     }
-    if (keepFrom >= history.lines.length) return null;
+    if (keepFrom >= normalizedHistoryLines.length) return null;
 
     try {
       const entryState = createSgrState();
       for (let index = 0; index < keepFrom; index++) {
-        lineToHtml(history.lines[index] ?? '', entryState, palette);
+        lineToHtml(normalizedHistoryLines[index] ?? '', entryState, palette);
       }
       let liveEntryState: SgrState | null = null;
       if (livePrefixDropped > 0 && live.length > 0) {
@@ -3679,29 +3839,33 @@
         // the exact SGR state at the archive/live gap without storing either
         // missing live rows or per-row render state.
         liveEntryState = cloneSgrState(entryState);
-        for (let index = keepFrom; index < history.lines.length; index++) {
-          lineToHtml(history.lines[index] ?? '', liveEntryState, palette);
+        for (let index = keepFrom; index < normalizedHistoryLines.length; index++) {
+          lineToHtml(normalizedHistoryLines[index] ?? '', liveEntryState, palette);
         }
         for (let index = 0; index < livePrefixDropped; index++) {
-          lineToHtml(liveLines[index] ?? '', liveEntryState, palette);
+          lineToHtml(canonicalLiveLines[index] ?? '', liveEntryState, palette);
         }
       }
       return {
         state: createHistoryWindow({
-          startLine: history.startLine + keepFrom,
-          lines: history.lines.slice(keepFrom),
+          startLine: normalizedStartLine + keepFrom,
+          lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
           hasOlder: history.hasMore || keepFrom > 0,
-          hasNewer: history.endLine < Math.max(
-            history.totalArchivedLines,
-            liveBoundary?.liveStartLine ?? 0,
-          ),
+          // Equality with the client-observed durable seam is the only proof
+          // that archive and live are adjacent. A reply may see a newer server
+          // head before the paired output frame; keep it detached until that
+          // exact boundary arrives instead of overlapping the stale live view.
+          hasNewer: liveBoundary
+            ? history.endLine !== liveBoundary.liveStartLine
+            : history.endLine < history.totalArchivedLines,
           limits,
         }),
         live,
         livePrefixDropped,
         entryState,
         liveEntryState,
+        consumedRetainedLivePrefixRows,
       };
     } catch {
       return null;
@@ -3763,6 +3927,17 @@
       gapBeforeRows?: number;
     },
   ): void {
+    if (
+      liveBoundary
+      && historyWindowEndLine(state) !== liveBoundary.liveStartLine
+      && !state.hasNewer
+    ) {
+      // Attachment is legal only at exact durable equality. This defensive
+      // normalization covers initial pages, forward pages, and replacement
+      // paths so a future caller cannot concatenate overlapping archive/live
+      // ranges merely because a server reply said it had no newer page.
+      state = { ...state, hasNewer: true };
+    }
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
     const projectBash = normalizedClaudeBashMode() !== 'off';
@@ -4004,11 +4179,16 @@
         return;
       }
       const oldScrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
+      if (seeded.consumedRetainedLivePrefixRows > 0) {
+        retainedLivePrefixBeforeBoundary = 0;
+      }
       commitSlidingHistoryWindow(seeded.state, {
         direction,
         // Archive rows enter before live; an emergency live-prefix trim moves
         // the same anchor back by the number of rows it removed.
-        indexDelta: seeded.state.lines.length - seeded.livePrefixDropped,
+        indexDelta: seeded.state.lines.length
+          - seeded.consumedRetainedLivePrefixRows
+          - seeded.livePrefixDropped,
         oldScrollTop,
         acceptedLineCount: seeded.state.lines.length,
         live: seeded.live,
@@ -4035,9 +4215,10 @@
         lines: history.lines,
         lineBytes: estimatedHistoryWindowLineStorage(history.lines),
         hasMore: direction === 'after'
-          ? history.hasMore || history.endLine < Math.max(
-              archiveTotalHint,
-              liveBoundary?.liveStartLine ?? 0,
+          ? history.hasMore || (
+              liveBoundary
+                ? history.endLine !== liveBoundary.liveStartLine
+                : history.endLine < archiveTotalHint
             )
           : history.hasMore,
       },
@@ -4228,13 +4409,40 @@
     return { busy: busy(), selectionActive };
   }
 
+  /**
+   * Fence the complete live frame before any of its screen, cursor, or content
+   * state is observed. `liveBoundary` covers committed deliveries; the
+   * high-water mark also covers a newer whole frame waiting in the content
+   * gate. Both are needed because the gate deliberately coalesces by arrival.
+   */
+  function admitLiveDelivery(meta?: MuxDeliveryMeta): boolean {
+    const boundary = meta?.boundary;
+    if (!boundary || historyPaging !== 'sliding') return true;
+    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, boundary);
+    liveBoundaryAdmission = result.admission;
+    return result.accepted;
+  }
+
+  function applyLiveScreen(meta?: MuxDeliveryMeta): void {
+    if (!meta || !Object.prototype.hasOwnProperty.call(meta, 'screen')) return;
+    // Accepted screen mode remains immediate while a selection/gesture holds
+    // paint, preserving pointer routing without letting a rejected stale frame
+    // reset scrollback or mouse policy.
+    liveScreen = meta.screen ?? null;
+    liveScreenSeen = true;
+  }
+
   function applyContentDelivery(delivery: ContentUpdate) {
+    const boundaryReconciliation = reconcileLiveBoundary(
+      (delivery.meta as MuxDeliveryMeta).boundary,
+    );
+    if (!boundaryReconciliation.acceptDelivery) return;
     if (delivery.cursor !== undefined) cursor = delivery.cursor;
-    reconcileLiveBoundary((delivery.meta as MuxDeliveryMeta).boundary);
     setLines(
       delivery.data.replace(/\r/g, '').split('\n'),
       delivery.meta.replace,
       contentLinesChangeSource(delivery),
+      boundaryReconciliation,
     );
   }
 
@@ -4243,6 +4451,8 @@
     nextCursor: { row: number; col: number } | null | undefined,
     meta?: MuxDeliveryMeta,
   ) {
+    if (!admitLiveDelivery(meta)) return;
+    applyLiveScreen(meta);
     const result = receiveContentUpdate(contentUpdateGate, {
       data,
       cursor: nextCursor,
@@ -5054,6 +5264,17 @@
     return cursorPosCache;
   }
 
+  /** rawLines stays deliberately unproxied because it may retain 10k terminal
+   * rows.  contentEpoch is the explicit reactive revision: without consuming
+   * it here, a content delta that keeps cursor.row unchanged can leave the
+   * caret anchored against the previous rawLines length. */
+  function lastContentLine(contentRevision: number): number {
+    void contentRevision;
+    let index = rawLines.length;
+    while (index > 0 && !(rawLines[index - 1] ?? '').trim()) index--;
+    return index - 1;
+  }
+
   function canSendResize(): boolean {
     return !!(
       claimGeometry &&
@@ -5270,6 +5491,7 @@
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
+    retainedLivePrefixBeforeBoundary = 0;
     if (archivedLines.length === 0) return;
     archivedLines = [];
     rawLines = liveLines.slice();
@@ -5347,6 +5569,16 @@
   let unsubscribe: (() => void) | null = null;
   let resizeObs: ResizeObserver | null = null;
   let observedVisualViewport: VisualViewport | null = null;
+  let observedFontSet: FontFaceSet | null = null;
+
+  function onFontMetricsChanged(): void {
+    if (destroyed) return;
+    // A swap-loaded web font changes glyph metrics without changing the
+    // viewport box, so ResizeObserver cannot see it. Re-measure normally: the
+    // CSS cell width always updates, while tmux receives a resize only when
+    // the rounded cols/rows actually changed.
+    pushGeometry();
+  }
 
   onMount(() => {
     updateViewportGeometry(viewportEl);
@@ -5359,12 +5591,6 @@
       cur?: { row: number; col: number } | null,
       meta?: MuxDeliveryMeta,
     ) => {
-      // Apply screen mode even when content is gated (busy/selection): pointer
-      // routing and scrollback policy must track the pane, not the paint queue.
-      if (meta && Object.prototype.hasOwnProperty.call(meta, 'screen')) {
-        liveScreen = meta.screen ?? null;
-        liveScreenSeen = true;
-      }
       if (type === 'history') {
         applyArchivedHistory(data);
         return;
@@ -5395,6 +5621,14 @@
       applyScroll();
     });
     if (viewportEl) resizeObs.observe(viewportEl);
+    const fontSet = (document as Document & { fonts?: FontFaceSet }).fonts;
+    if (fontSet) {
+      observedFontSet = fontSet;
+      observedFontSet.addEventListener('loadingdone', onFontMetricsChanged);
+      void observedFontSet.ready.then(onFontMetricsChanged, () => {
+        // Font loading failure leaves the currently measured fallback grid.
+      });
+    }
     observedVisualViewport = window.visualViewport;
     observedVisualViewport?.addEventListener('resize', refreshAltTouchHitArea, { passive: true });
     observedVisualViewport?.addEventListener('scroll', refreshAltTouchHitArea, { passive: true });
@@ -5442,6 +5676,8 @@
     }
     if (unsubscribe) unsubscribe();
     resizeObs?.disconnect();
+    observedFontSet?.removeEventListener('loadingdone', onFontMetricsChanged);
+    observedFontSet = null;
     observedVisualViewport?.removeEventListener('resize', refreshAltTouchHitArea);
     observedVisualViewport?.removeEventListener('scroll', refreshAltTouchHitArea);
     observedVisualViewport = null;
@@ -5559,6 +5795,11 @@
   data-history-request-direction={archiveInflightDirection ?? undefined}
   data-no-scrollback={noScrollback ? '1' : undefined}
   data-screen-mode-known={screenModeKnown ? '1' : undefined}
+  data-content-update-pending={contentUpdateGate.pending ? '1' : '0'}
+  data-content-update-pending-cursor-row={contentUpdateGate.pending?.cursor?.row}
+  data-content-update-pending-cursor-col={contentUpdateGate.pending?.cursor?.col}
+  data-content-update-busy={busy() ? '1' : '0'}
+  data-content-update-selection={selectionActive ? '1' : '0'}
   style:font-size={`${fontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
@@ -5651,9 +5892,10 @@
               ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
-      {@const lastContent = (() => { let i = rawLines.length; while (i > 0 && !(rawLines[i - 1] ?? '').trim()) i--; return i - 1; })()}
+      {@const lastContent = lastContentLine(contentEpoch)}
       {@const cline = lastContent - cursor.row}
       {@const cvisual = visualRowForRaw(cline)}
+      {@const blankRowsPastRawEnd = Math.max(0, cline - rawLines.length)}
       {@const cursorProjectionRow = projectionRowAt(cvisual)}
       {#if cline >= 0
         && cursorProjectionRow?.kind !== 'bash-placeholder'
@@ -5665,11 +5907,15 @@
         {@const cpos = cursorPos(cline, cursor.col)}
         <div
           class="mtv-cursor"
-          style:top={`${presentationRowTopPx(cvisual) - presentationRowTopPx(winStart)}px`}
+          style:top={`${presentationRowTopPx(cvisual) + blankRowsPastRawEnd * lineH - presentationRowTopPx(winStart)}px`}
           style:left={`${6 + cpos.left}px`}
           style:width={`${Math.max(2, cpos.width)}px`}
           style:height={`${lineH}px`}
           data-testid="mtv-cursor"
+          data-cursor-row={cursor.row}
+          data-cursor-col={cursor.col}
+          data-cursor-raw-line={cline}
+          data-cursor-visual-row={cvisual}
         ></div>
       {/if}
     {/if}

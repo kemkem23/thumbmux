@@ -4,14 +4,17 @@
  * deprecation procedure.
  */
 
-import {
+import type { TmuxDriver } from "thumbmux/server";
+import { assertContractFixturePort, assertContractFixtureRuntime } from "./runtime-guard";
+
+const privateRuntime = assertContractFixtureRuntime();
+const {
   createAppRoutes,
   createBunTmuxDriver,
   createTokenGuard,
   killTmuxSession,
   spawnTmuxSession,
-  type TmuxDriver,
-} from "thumbmux/server";
+} = await import("thumbmux/server");
 
 type WireFrame = {
   channel?: string;
@@ -159,12 +162,12 @@ let markerAbsent = false;
 try {
   spawnTmuxSession(
     allowedSession,
-    "/tmp",
+    privateRuntime,
     `printf '${allowedSeed}\\n'`,
   );
   spawnTmuxSession(
     deniedSession,
-    "/tmp",
+    privateRuntime,
     `printf '${deniedSeed}\\n'`,
   );
   await until(
@@ -182,6 +185,7 @@ try {
     },
     websocket: routes.websocket,
   });
+  assertContractFixturePort(server.port);
   origin = `http://127.0.0.1:${server.port}`;
 
   ws = new WebSocket(

@@ -1194,6 +1194,24 @@ const V0180_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "app:ThumbmuxApp:8d9f842e391d521d8d8f58a649df37159d1381e0a1cfd6c4042f266ddba7dcc3:05c5f730406d035669b8b1ba69ed5c183e9fd89bf98521737fc578c6e9a6a55a",
 ]);
 
+/**
+ * Additive request-receipt hooks reviewed for 0.18.5 -> 0.18.6. The direct
+ * UploadAction props pass the structural optional-member proof. AppAdapters
+ * carries the same two optionals inside its existing optional `upload` member,
+ * and that nested declaration propagates through the four app components that
+ * accept AppAdapters. The generic proof deliberately does not recurse into an
+ * existing optional member, so these rows pin the exact old/new compatibility
+ * digests. The frozen app consumer still has to compile, build, and run against
+ * the packed artifact in the public verify-gate before the source tag is cut.
+ */
+const V0186_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "app:AppAdapters:4daaa8569401f924d83ae1d3ed7efde5c7744969ca10decc4bc4d29ca51f8f37:94a4200917228a4cdfb183dd31d6a37b9c437b1a4e9f9d71ccd0e571d1431b4b",
+  "app:EmbedView:42d35e1d767944b17d91723c5d4b44125b90cea1232b1fefac7c581152f42933:81907789d818447c5c7e6714eef73c61851967cb2a862c8e56b2387030bc7e57",
+  "app:HubView:721857db61ece49f68f7b985bf4c265df717ddd29de1ca30262b24e3e837aa24:3d0081589b979829a8dad9ae6c450f4c098e6a17499adcb4fee78079399c348e",
+  "app:SessionView:97d277a4b1fc9cbb273eb17f3754b39ae36358b9a3113f23c57acdeb6c9c8fa3:d3e868503f999de175ce3cfe8e43b155ed9b24df37c0ec329d0ce1d83678626e",
+  "app:ThumbmuxApp:05c5f730406d035669b8b1ba69ed5c183e9fd89bf98521737fc578c6e9a6a55a:c824a279f048823a40d097e0b8b58b1b6f8f9e8e39f149a4ec68ea8fe7353c52",
+]);
+
 function isV0110MinorException(
   baselineVersion: string,
   currentVersion: string,
@@ -1218,6 +1236,19 @@ function isV0180MinorException(
   if (baselineVersion !== "0.17.0" || currentVersion !== "0.18.0") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V0180_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV0186PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.18.5" || currentVersion !== "0.18.6") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0186_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1402,6 +1433,20 @@ export function evaluateBaseline(
           previousLive,
           nextLive,
         )
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !kindChanged
+      && isV0186PatchException(
+        baselineVersion,
+        currentVersion,
+        subpath,
+        previous.name,
+        previousLive,
+        nextLive,
       )
     ) {
       continue;

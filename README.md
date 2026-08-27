@@ -770,10 +770,12 @@ then says so out loud. That is deliberate: the baseline half answers *did a
 frozen name change*, and skipping it silently once produced a "contract check
 passed" that had never looked.
 
-`bash scripts/contract-fixtures.sh` separately packs the same `git-dist`
-artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
-and `app-host`. They compile and exercise the low-level host, guarded route
-composition, and Svelte app mount respectively. `thumbmux/app` and
+In the public repository's GitHub-hosted disposable lane,
+`./scripts/contract-fixtures.sh` separately packs the same `git-dist` artifact
+and installs three frozen consumers: `minimal-host`, `guarded-host`, and
+`app-host`. A local invocation fails closed before tmux/browser lifecycle. The
+fixtures compile and exercise the low-level host, guarded route composition,
+and Svelte app mount respectively. `thumbmux/app` and
 `createAppRoutes` remain **S — stabilizing** throughout the pre-1.0 line; these checks are
 evidence for the published tiers, not a claim of 1.0 compatibility.
 

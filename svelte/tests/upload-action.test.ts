@@ -13,6 +13,13 @@ type UploadActionProps = {
   dir?: string;
   accept?: string;
   busy?: boolean;
+  prepareForm?: (files: readonly File[], form: FormData) => unknown | Promise<unknown>;
+  onResponse?: (
+    files: readonly File[],
+    response: Response,
+    data: unknown,
+    context: unknown,
+  ) => void | Promise<void>;
   onUploaded: (message: string, files: UploadedFile[]) => void;
   onError: (message: string) => void;
 };
@@ -118,6 +125,13 @@ describe("UploadAction", () => {
       { original: "diagram.png", stored: "srv-b29_diagram.png" },
     ];
     const fetchCalls: Array<{ input: string | URL | Request; init?: RequestInit }> = [];
+    const requestContext = { requestKey: 'ui:durable-upload-test' };
+    const responseCalls: Array<{
+      files: number;
+      status: number;
+      data: unknown;
+      context: unknown;
+    }> = [];
 
     replaceFetch((async (input: string | URL | Request, init?: RequestInit) => {
       fetchCalls.push({ input, init });
@@ -133,6 +147,13 @@ describe("UploadAction", () => {
     const { input } = mountUploadAction({
       endpoint,
       dir: fallbackDir,
+      prepareForm: (_files, form) => {
+        form.set('requestKey', requestContext.requestKey);
+        return requestContext;
+      },
+      onResponse: (files, response, data, context) => {
+        responseCalls.push({ files: files.length, status: response.status, data, context });
+      },
       onUploaded: (message, files) => {
         const result = { message, files };
         uploadResults.push(result);
@@ -153,6 +174,13 @@ describe("UploadAction", () => {
     const body = fetchCalls[0]?.init?.body;
     expect(body).toBeInstanceOf(FormData);
     expect((body as FormData).getAll("files")).toHaveLength(selectedFiles.length);
+    expect((body as FormData).get('requestKey')).toBe('ui:durable-upload-test');
+    expect(responseCalls).toEqual([{
+      files: selectedFiles.length,
+      status: 201,
+      data: { ok: true, files: storedByServer },
+      context: requestContext,
+    }]);
 
     expect(uploadResults).toHaveLength(1);
     expect(result.files).toEqual(storedByServer);
@@ -307,6 +335,51 @@ describe("UploadAction", () => {
       );
     });
   }
+
+  test('keeps the exact prepare context when overlapping responses settle in reverse order', async () => {
+    const requests = [deferred<Response>(), deferred<Response>()];
+    const contextsByFile = new Map<string, { requestKey: string }>();
+    const observed: Array<{ responseLabel: string; requestKey: string }> = [];
+    let fetchIndex = 0;
+    replaceFetch((async () => requests[fetchIndex++]!.promise) as typeof fetch);
+
+    const { app } = mountUploadAction({
+      prepareForm: (files, form) => {
+        const context = { requestKey: `ui:${files[0]!.name}` };
+        contextsByFile.set(files[0]!.name, context);
+        form.set('requestKey', context.requestKey);
+        return context;
+      },
+      onResponse: (_files, _response, data, context) => {
+        const responseLabel = (data as { label: string }).label;
+        observed.push({
+          responseLabel,
+          requestKey: (context as { requestKey: string }).requestKey,
+        });
+      },
+      onUploaded: () => {},
+    });
+    const instance = app as UploadActionInstance;
+    const first = instance.uploadFiles([new File(['first'], 'first.txt')]);
+    const second = instance.uploadFiles([new File(['second'], 'second.txt')]);
+
+    requests[1]!.resolve(Response.json({
+      label: 'second-response',
+      files: [{ original: 'second.txt', stored: 'second.txt' }],
+    }));
+    await second;
+    requests[0]!.resolve(Response.json({
+      label: 'first-response',
+      files: [{ original: 'first.txt', stored: 'first.txt' }],
+    }));
+    await first;
+
+    expect(contextsByFile.size).toBe(2);
+    expect(observed).toEqual([
+      { responseLabel: 'second-response', requestKey: 'ui:second.txt' },
+      { responseLabel: 'first-response', requestKey: 'ui:first.txt' },
+    ]);
+  });
 
   for (const response of [
     {

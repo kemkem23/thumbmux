@@ -57,7 +57,7 @@ function archiveDataState(session: string): ArchiveDataState {
 
 function paneWidth(session: string): number {
   return Number(dockerExec(
-    `tmux display-message -p -t ${shellQuote(session)} ${shellQuote('#{window_width}')}`,
+    `tmux display-message -p -t ${shellQuote(`=${session}:0.0`)} ${shellQuote('#{window_width}')}`,
   ).trim());
 }
 

@@ -1,7 +1,47 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.6-dist`.
+
+## v0.18.6 — 2026-08-27
+
+### Fixed
+
+- **Initial history no longer duplicates terminal rows or jumps the reader at
+  the durable live/archive seam.** Overlapping bootstrap, prepend and live
+  deliveries are reconciled as one ordered boundary, including a pending newer
+  frame followed by an older cached frame. A stale delivery is rejected before
+  it can change screen metadata, content, cursor or the pending high-water mark.
+
+- **The cursor stays on the rendered terminal cell while content, fonts and
+  viewport geometry change.** Row-zero cursors re-anchor when an unchanged
+  cursor coordinate receives a longer content tail; late web-font readiness,
+  resize, Unicode combining sequences, CJK and emoji retain the same measured
+  cell geometry as the rendered rows.
+
+- **Raw tmux capture remains byte-faithful by default.** A source-only
+  diagnostic helper records the ambiguous variation-selector padding case, but
+  it is not a public export and the Bun driver does not rewrite capture bytes
+  before host WAL or archive ingestion.
+
+- **Exact-mode pane operations now stay on window 0, pane 0 even if another
+  tmux window becomes active.** The reference driver targets `=name:0.0` for
+  capture, input, resize and cursor sampling instead of letting a trailing
+  colon select mutable current-pane state. Hosts that deliberately want tmux's
+  native active/prefix resolution can still opt into `targetMode: "legacy"`.
+
+- **Upload requests can carry and settle a host-owned durable receipt across
+  retries.** Optional request-scoped hooks may append idempotency fields and
+  observe the parsed response with the exact opaque context from that attempt;
+  omitting both hooks preserves the existing upload behavior.
+
+### Security
+
+- **Release, contract and real-browser lanes now fail closed outside an
+  attested disposable runtime.** The package rail fingerprints one frozen tree,
+  private tmux target, namespaces, ports and credentials boundary; local lanes
+  cannot silently claim the Docker/network lifecycle proof reserved for the
+  public GitHub-hosted runner.
 
 ## v0.18.5 — 2026-08-25
 

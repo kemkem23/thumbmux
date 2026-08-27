@@ -974,6 +974,10 @@
       bind:busy={uploading}
       endpoint={uploadEndpoint}
       dir={uploadDir}
+      prepareForm={(files, form) => adapters.upload?.prepareForm?.(session, files, form)}
+      onResponse={(files, response, data, context) => (
+        adapters.upload?.onResponse?.(session, files, response, data, context)
+      )}
       onUploaded={(message, files) => {
         if (armedUploadEpoch !== uploadEpoch) return;
         prefillComposer(adapters.upload?.formatPrefill?.(files, uploadDir) ?? message);

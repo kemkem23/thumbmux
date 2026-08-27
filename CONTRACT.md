@@ -322,6 +322,15 @@ configured route separately and pin all omitted defaults (including omitted
 `composerMode` → COMPOSE and omitted font bounds → 4–40), while the unchanged
 frozen app consumer exercises the additive omitted route.
 
+The upload adapter also has two optional, request-scoped settlement hooks.
+`upload.prepareForm` runs after the stock file fields are appended and before
+the request, may add host receipt/idempotency fields, and returns opaque context.
+`upload.onResponse` is awaited after JSON parsing for both success and HTTP
+failure and receives that exact context. Omitting either hook preserves the
+published upload request and callback behavior; throwing from either enters the
+existing upload error route. Context is never shared between concurrent or
+retried requests.
+
 The lower-level dense Svelte presentation is additive as well:
 
 - `GridSession.note` and `GridSession.summary` are optional host-owned text.

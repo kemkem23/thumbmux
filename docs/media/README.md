@@ -13,8 +13,10 @@ script, so nothing failed when the pictures went stale.
 On the kemcortex host that is the live agent fleet. Capturing there and
 shipping the PNGs in the public tarball would leak other people's sessions.
 
-The capture harness starts a disposable `oven/bun:1` image, installs tmux and
-htop *inside it*, copies this package tree in, stages exactly four sessions
+The capture harness is restricted to the public repository's GitHub-hosted
+disposable job. It admits one clean exact commit, starts a disposable
+`oven/bun:1` image, installs tmux and htop *inside it*, transfers a frozen
+`git archive` of that commit, stages exactly four sessions
 (`agent`, `build`, `htop`, `server-logs`), and publishes an ephemeral
 localhost port. Playwright on the host drives that port. The run **fails** if
 the hub shows any session name outside those four.
@@ -23,8 +25,8 @@ The host's tmux server is never started, listed for mutation, or killed.
 
 ## Re-run
 
-From this package root, on a machine with Docker, Bun, and local Playwright
-Chromium:
+Run the media capture only from the public repository's GitHub-hosted job after
+setup-bun and Playwright Chromium have been installed:
 
 ```bash
 bun install --frozen-lockfile
@@ -32,10 +34,11 @@ bun install --frozen-lockfile
 ./scripts/capture-media.sh
 ```
 
-One command. No manual clicks. The ten files under this directory are
-overwritten in place. The script then removes the container, drops `/tmp`
-scratch, and checks that `docker ps -a` and the host `tmux ls` match the
-snapshot it took before it started.
+One command. No manual clicks. Images stay inside the exact dev:ino-attested
+private runtime until the browser, container, and private tmux lifecycle has
+ended. The harness then copies only the ten validated files into this directory
+and removes the exact labelled container plus the private runtime. It never
+opens or snapshots the host tmux/default socket.
 
 `?media=1` on the demo URL is the capture hook: it is how the host supplies
 the one-line hub `subtitle` (a v0.12.0 host-owned field). The default demo is

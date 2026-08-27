@@ -4,14 +4,17 @@
  * process in CONTRACT.md. Do not update this file to follow an implementation.
  */
 
-import {
+import type { TmuxDriver } from "thumbmux/server";
+import { assertContractFixturePort, assertContractFixtureRuntime } from "./runtime-guard";
+
+const privateRuntime = assertContractFixtureRuntime();
+const {
   FileHistoryArchive,
   TmuxWsMux,
   createBunTmuxDriver,
   killTmuxSession,
   spawnTmuxSession,
-  type TmuxDriver,
-} from "thumbmux/server";
+} = await import("thumbmux/server");
 
 type WireFrame = {
   channel?: string;
@@ -65,7 +68,7 @@ type BunRuntime = {
 const runtime = (globalThis as unknown as { Bun: BunRuntime }).Bun;
 const unique = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
 const session = `ctrfix-min-${unique}`;
-const archiveRoot = `/tmp/${session}-history`;
+const archiveRoot = `${privateRuntime}/${session}-history`;
 const seedPrefix = `CTR-FIXTURE-SEED-${unique}`;
 const keysMarker = `CTR-FIXTURE-KEYS-${unique}`;
 
@@ -231,7 +234,7 @@ async function main(): Promise<void> {
   const tmuxVersion = runtime.spawnSync(["tmux", "-V"]);
   assert(tmuxVersion.exitCode === 0, "this fixture requires tmux");
   assert(session.startsWith("ctrfix-"), "fixture session must use the ctrfix- prefix");
-  assert(archiveRoot.startsWith("/tmp/ctrfix-min-"), "unsafe archive cleanup target");
+  assert(archiveRoot.startsWith(`${privateRuntime}/ctrfix-min-`), "unsafe archive root");
 
   const driver = createBunTmuxDriver();
   const archive = new FileHistoryArchive({ root: archiveRoot, maxLines: 1_000 });
@@ -272,7 +275,7 @@ async function main(): Promise<void> {
   };
 
   try {
-    spawnTmuxSession(session, "/tmp");
+    spawnTmuxSession(session, privateRuntime);
     driver.setSessionHistoryLimit(session, 1_000);
     driver.sendKeys(
       session,
@@ -296,6 +299,7 @@ async function main(): Promise<void> {
       },
       websocket: handlers,
     });
+    assertContractFixturePort(server.port);
     httpBase = `http://127.0.0.1:${server.port}`;
     const connected = await connect(`ws://127.0.0.1:${server.port}/ws`);
     client = connected.socket;
@@ -397,10 +401,8 @@ async function main(): Promise<void> {
     try { await server?.stop(true); } catch {}
     mux.stop();
     try { killTmuxSession(session); } catch {}
-    const removeArchive = runtime.spawnSync(["rm", "-rf", "--", archiveRoot]);
-    if (removeArchive.exitCode !== 0 && failure === undefined) {
-      failure = new Error("failed to remove fixture history archive");
-    }
+    // The outer runner removes the exact dev:ino-attested runtime with
+    // rm --one-file-system after proving every listener/session is gone.
   }
 
   const sessionAbsent = !driver.listSessions().some((row) => row.name === session);
