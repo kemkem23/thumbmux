@@ -347,10 +347,17 @@ test('an unprovable Grok-style repaint stays offscreen until the reader rejoins'
 
     const newestMarker = await injectUnprovableGrokRepaint(page, session, 300);
     await expect(page.getByTestId('mtv')).toHaveAttribute('data-live-rejoin-pending', '1');
-    await expect(page.getByTestId('demo-new-content')).toBeVisible();
+    // Deferred whole captures do not emit onLinesChange before commit, so the
+    // app may retain its generic bottom control. Both controls are the same
+    // visible latest-content action and rejoin TermView's deferred live tail.
+    const latestControl = page.locator(
+      '[data-testid="demo-new-content"], [data-testid="demo-scroll-bottom"]',
+    );
+    await expect(latestControl).toHaveCount(1);
+    await expect(latestControl).toBeVisible();
     await expectAnchorStable(page, anchor);
 
-    await page.getByTestId('demo-new-content').click();
+    await latestControl.click();
     await expect.poll(() => bottomOffset(page)).toBe(0);
     await expect(page.getByTestId('mtv')).not.toHaveAttribute('data-live-rejoin-pending', '1');
     await expect.poll(async () => (await visibleTerminalLines(page)).includes(newestMarker))

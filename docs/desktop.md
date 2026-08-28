@@ -457,21 +457,24 @@ type TermViewProps = {
   onTap?: () => void;
   onLinesChange?: (
     lines: string[],
-    meta: {
-      source: 'live' | 'prepend' | 'replace';
-      pending?: boolean;
-    },
+    meta: { source: 'live' | 'prepend' | 'replace' },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
 
-`onLinesChange` normally publishes the newly committed raw model. The one
-exception is a fail-closed reader freeze: it publishes the still-visible model
-with `meta.pending=true` to signal unseen live activity without claiming that
-the deferred capture has entered copy/search/DOM state. The later tail rejoin
-publishes the committed model with `pending` absent.
+`onLinesChange` publishes the newly committed raw model. A fail-closed reader
+freeze therefore stays silent while newer whole captures are deferred. The
+later tail rejoin publishes the newest model once with its original `live` or
+`replace` source when it enters the current raw model. If an absolute archive
+is still detached, rejoin refreshes only its offscreen live suffix; the existing
+`prepend` notification is emitted when forward paging attaches the seam. A
+newer capture waiting behind an active gesture is coalesced into that deferred
+slot before rejoin, so an older frame cannot be published first. A gesture that
+retreats, becomes multi-touch, or hands control to search navigation cancels
+its inferred rejoin and leaves the reader model frozen until a later explicit
+tail action.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux
