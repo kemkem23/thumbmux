@@ -209,6 +209,15 @@ scroll engine:
   scroll position instead of moving the viewport. `scrollToBottom()` sets the
   offset to exactly zero before flushing any content deferred by a gesture or
   selection, then future output follows again.
+- A boundary-less capture whose row continuity cannot be proved does not
+  replace the reader's mounted rows. `TermView` keeps only the newest such
+  capture offscreen (`data-live-rejoin-pending="1"`) and applies it when local
+  wheel/touch reaches the live tail or `scrollToBottom()` is called. This is a
+  fail-closed path for repainting normal-screen TUIs. Later full resyncs and a
+  first durable boundary stay behind the same reader fence; the deferred suffix
+  is capped by the normal 10,000-row / 8 MiB retention budget. Captures with a
+  proven overlap or an already-established durable boundary continue to merge
+  immediately.
 
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:

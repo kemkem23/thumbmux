@@ -283,6 +283,19 @@
   let rawLines: string[] = [];
   let liveLines: string[] = [];
   let archivedLines: string[] = [];
+  /**
+   * A legacy (boundary-less) capture can advance farther than content overlap
+   * can prove while a reader is off the live tail. Replacing the mounted model
+   * in that state preserves only a pixel index, not the row the person was
+   * reading. Keep the newest canonical capture offscreen until the reader
+   * explicitly rejoins; one bounded capture is retained, never a frame queue.
+   */
+  let deferredLegacyLiveCapture = $state.raw<{
+    lines: string[];
+    source: LinesChangeMeta['source'];
+    replace: boolean;
+    boundary?: MuxHistoryBoundary;
+  } | null>(null);
   // Visual projection is a second coordinate space, never a replacement for
   // rawLines. Every projected row owns a half-open raw range and every raw row
   // maps back to one visual row. This is what lets Bash blocks occupy one row
@@ -1457,7 +1470,8 @@
     // A detached archive window can be at its own local bottom while still
     // being many pages away from the live pane. Keep cursor/latest-button
     // semantics tied to the real live seam, not local scroll coordinates.
-    return historyReaderAtUnscrollableTail || bottomOffsetPx > 0 || (
+    return deferredLegacyLiveCapture !== null
+      || historyReaderAtUnscrollableTail || bottomOffsetPx > 0 || (
       historyPaging === 'sliding' &&
       archiveWindow !== null &&
       !archiveWindowAttachedToLive
@@ -1717,6 +1731,7 @@
         sendSgr(sgrSnapToBottom(cx, cy));
       }
     }
+    rejoinDeferredLegacyLiveCapture();
     applyScroll();
     if (
       historyPaging === 'sliding' &&
@@ -2868,6 +2883,73 @@
     return exact;
   }
 
+  /**
+   * Preserve the reader-owned projection when a legacy capture has no durable
+   * row boundary and neither exact overlap nor the immutable pane seam proves
+   * continuity. The newest whole capture replaces the previous deferred one,
+   * matching the content gate's bounded coalescing contract.
+   */
+  function deferUnprovenLegacyLiveCapture(
+    nextLive: string[],
+    source: LinesChangeMeta['source'],
+    replace = false,
+    boundary?: MuxHistoryBoundary,
+  ): void {
+    const previous = deferredLegacyLiveCapture;
+    const boundedLines = archiveWindow === null
+      ? boundLinesToRetentionBudget(nextLive)
+      : boundLiveLinesForArchive(nextLive, archiveWindow);
+    deferredLegacyLiveCapture = {
+      lines: boundedLines,
+      source: previous?.source === 'live' || source === 'live' ? 'live' : source,
+      replace: previous?.replace === true || replace,
+      boundary: boundary ? { ...boundary } : undefined,
+    };
+    // SessionView uses this signal to label its already-visible tail control
+    // as new content. Keep the payload truthful to the frozen visible model;
+    // the newest canonical capture is published only when it is committed.
+    onLinesChange?.([...rawLines], { source: deferredLegacyLiveCapture.source });
+    emitScrollState();
+  }
+
+  /** Apply the newest deferred legacy delivery only at an explicit/local tail
+   * rejoin. Route it through the ordinary boundary/archive path so a history
+   * window that detached in the meantime remains pageable instead of being
+   * accidentally concatenated to the live pane. */
+  function rejoinDeferredLegacyLiveCapture(): boolean {
+    const pending = deferredLegacyLiveCapture;
+    if (!pending) return false;
+    deferredLegacyLiveCapture = null;
+    const boundaryReconciliation = reconcileLiveBoundary(pending.boundary);
+    if (!boundaryReconciliation.acceptDelivery) return true;
+    setLines(
+      pending.lines,
+      pending.replace,
+      pending.source,
+      boundaryReconciliation,
+    );
+    return true;
+  }
+
+  /** Bound a deferred whole capture by the same retained row/byte ceilings as
+   * a committed legacy model. This is one newest suffix, never an event queue. */
+  function boundLinesToRetentionBudget(lines: readonly string[]): string[] {
+    let rowsLeft = HISTORY_RETAINED_ROW_BUDGET;
+    let bytesLeft = HISTORY_RETAINED_BYTE_BUDGET;
+    let start = lines.length;
+    while (start > 0 && rowsLeft > 0) {
+      // Deferred state stores raw strings only. URL/render metadata is built
+      // after commit, so accounting it here would add work without bounding
+      // any additional pending allocation.
+      const bytes = estimatedLineStorageBytes(lines[start - 1] ?? '', undefined);
+      if (bytes > bytesLeft) break;
+      start--;
+      rowsLeft--;
+      bytesLeft -= bytes;
+    }
+    return Array.from(lines.slice(start));
+  }
+
   /** Keep the newest pane capture rows that fit beside the resident archive.
    * Detached live content is never rendered, but it is still bounded RAM and
    * is ready to rejoin when forward paging reaches the archive/live seam. */
@@ -3079,6 +3161,7 @@
       // bounded fresh live suffix offscreen; repainting it must not change
       // total/maxOffset, cursor visibility, search, selection, or the anchor.
       liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
+      deferredLegacyLiveCapture = null;
       retainedLivePrefixBeforeBoundary = 0;
       detachedLiveProjectionPending = true;
       return;
@@ -3148,6 +3231,10 @@
       }
     } else if (!followTail && liveLines.length > 0 && !noScrollback) {
       const merged = mergeLiveCaptureForStableReader(liveLines, nextLive);
+      if (!merged.preservedPrefix && liveBoundary === null) {
+        deferUnprovenLegacyLiveCapture(nextLive, source);
+        return;
+      }
       liveLines = merged.lines;
       if (historyPaging === 'sliding' && archiveWindow === null && merged.preservedPrefix) {
         retainedLivePrefixBeforeBoundary = Math.min(
@@ -3165,6 +3252,8 @@
       liveLines = nextLive;
       retainedLivePrefixBeforeBoundary = 0;
     }
+
+    deferredLegacyLiveCapture = null;
 
     if (historyPaging === 'sliding' && archiveWindow !== null) {
       liveLines = boundLiveLinesForArchive(liveLines, archiveWindow);
@@ -4433,15 +4522,38 @@
   }
 
   function applyContentDelivery(delivery: ContentUpdate) {
-    const boundaryReconciliation = reconcileLiveBoundary(
-      (delivery.meta as MuxDeliveryMeta).boundary,
-    );
+    const meta = delivery.meta as MuxDeliveryMeta;
+    const source = contentLinesChangeSource(delivery);
+    const nextLive = delivery.data.replace(/\r/g, '').split('\n');
+    // Once an unproven legacy frame has been deferred, keep every later whole
+    // delivery behind the same reader-owned fence. Reconcile only the newest
+    // boundary at explicit rejoin; otherwise a resync or first durable seam
+    // could mutate the archive/projection underneath the reader.
+    if (
+      !noScrollback && (
+        deferredLegacyLiveCapture !== null || (
+          isAwayFromLiveTail()
+          && liveBoundary === null
+          && (meta.replace || meta.boundary !== undefined)
+        )
+      )
+    ) {
+      if (delivery.cursor !== undefined) cursor = delivery.cursor;
+      deferUnprovenLegacyLiveCapture(
+        nextLive,
+        source,
+        meta.replace,
+        meta.boundary,
+      );
+      return;
+    }
+    const boundaryReconciliation = reconcileLiveBoundary(meta.boundary);
     if (!boundaryReconciliation.acceptDelivery) return;
     if (delivery.cursor !== undefined) cursor = delivery.cursor;
     setLines(
-      delivery.data.replace(/\r/g, '').split('\n'),
+      nextLive,
       delivery.meta.replace,
-      contentLinesChangeSource(delivery),
+      source,
       boundaryReconciliation,
     );
   }
@@ -4647,6 +4759,8 @@
     if (dyPx < 0 && bottomOffsetPx <= 0) {
       historyReaderAtUnscrollableTail = false;
       deferredUnscrollableHistoryPx = 0;
+      bottomOffsetPx = 0;
+      rejoinDeferredLegacyLiveCapture();
     }
     const windowCovered = applyScroll();
     if (dyPx > 0) maybeRequestOlderHistory();
@@ -4686,6 +4800,7 @@
     if (delta < 0 && bottomOffsetPx <= 0) {
       historyReaderAtUnscrollableTail = false;
       deferredUnscrollableHistoryPx = 0;
+      rejoinDeferredLegacyLiveCapture();
     }
     applyScroll();
     if (delta > 0) maybeRequestOlderHistory(
@@ -4947,6 +5062,7 @@
     const from = bottomOffsetPx;
     if (Math.abs(from - target) < 0.5) {
       bottomOffsetPx = target;
+      if (target === 0) rejoinDeferredLegacyLiveCapture();
       applyScroll();
       flushPendingContent();
       return;
@@ -4966,6 +5082,7 @@
       if (k >= 1) {
         springFrame = null;
         bottomOffsetPx = target;
+        if (target === 0) rejoinDeferredLegacyLiveCapture();
         applyScroll();
         flushPendingContent();
       } else {
@@ -5484,6 +5601,7 @@
     historyStopReason = 'none';
     historyReaderAtUnscrollableTail = false;
     deferredUnscrollableHistoryPx = 0;
+    deferredLegacyLiveCapture = null;
     bottomOffsetPx = 0;
     applyScroll();
     emitScrollState();
@@ -5503,6 +5621,7 @@
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
+    deferredLegacyLiveCapture = null;
     retainedLivePrefixBeforeBoundary = 0;
     if (archivedLines.length === 0) return;
     archivedLines = [];
@@ -5808,6 +5927,7 @@
   data-no-scrollback={noScrollback ? '1' : undefined}
   data-screen-mode-known={screenModeKnown ? '1' : undefined}
   data-content-update-pending={contentUpdateGate.pending ? '1' : '0'}
+  data-live-rejoin-pending={deferredLegacyLiveCapture ? '1' : undefined}
   data-content-update-pending-cursor-row={contentUpdateGate.pending?.cursor?.row}
   data-content-update-pending-cursor-col={contentUpdateGate.pending?.cursor?.col}
   data-content-update-busy={busy() ? '1' : '0'}
