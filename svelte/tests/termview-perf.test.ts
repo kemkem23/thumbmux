@@ -2212,6 +2212,348 @@ describe("TermView retained history budgets", () => {
     expect(viewport.getAttribute("data-live-cursor-col")).toBe("10");
   }, 120_000);
 
+  test("coalesces a gesture-gated capture before committing tail rejoin", async () => {
+    const lineEvents: Array<{
+      lines: string[];
+      meta: { source: "live" | "prepend" | "replace" };
+    }> = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines, meta) => {
+        lineEvents.push({ lines: [...lines], meta: { ...meta } });
+      },
+    });
+    wheelTowardHistory(viewport, -400);
+    const eventCountBeforeDeferred = lineEvents.length;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const deferredA = Array.from(
+      { length: 240 },
+      (_, row) => `grok-deferred-a-${row}`,
+    );
+    sessionCallback(deferredA.join("\n"), "output", { row: 3, col: 4 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 2_100 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 100 }]));
+
+    const gatedB = Array.from(
+      { length: 240 },
+      (_, row) => `grok-gated-b-${row}`,
+    );
+    sessionCallback(gatedB.join("\n"), "output", { row: 11, col: 12 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("3");
+
+    // The drag reaches local offset zero while B is still gated. A must not be
+    // committed in this frame; touch settle will coalesce B over it first.
+    drainAnimationFrames();
+    flushSync();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    // B's cursor is bundled with the gated whole frame, so retaining A's
+    // cursor here proves both pending layers coexist before touch settle.
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("3");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+
+    // Decay the sampled velocity so touchend takes the deterministic idle
+    // settle path instead of adding an unrelated momentum tail.
+    for (let sample = 0; sample < 32; sample++) {
+      viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 100 }]));
+    }
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 100 }]),
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.meta).toEqual({ source: "live" });
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-gated-b-239");
+    expect(lineEvents.slice(eventCountBeforeDeferred).some(
+      (event) => event.lines.at(-1) === "grok-deferred-a-239",
+    )).toBe(false);
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("11");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("12");
+  }, 120_000);
+
+  test("commits only the newest capture when a live-tail momentum fling settles", async () => {
+    const lineEvents: string[][] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { lineEvents.push([...lines]); },
+    });
+    wheelTowardHistory(viewport, -400);
+    const eventCountBeforeDeferred = lineEvents.length;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const deferredA = Array.from(
+      { length: 240 },
+      (_, row) => `grok-momentum-a-${row}`,
+    );
+    sessionCallback(deferredA.join("\n"), "output", { row: 25, col: 26 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+
+    // Release a real negative-velocity fling before B arrives. B is therefore
+    // held by momentum (not touch), and the natural decay crosses local tail.
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 500 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 400 }]));
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 400 }]),
+    );
+    expect(frameCallbacks.size).toBeGreaterThan(0);
+
+    const gatedB = Array.from(
+      { length: 240 },
+      (_, row) => `grok-momentum-b-${row}`,
+    );
+    sessionCallback(gatedB.join("\n"), "output", { row: 27, col: 28 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("25");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+
+    drainAnimationFrames();
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.at(-1)).toBe("grok-momentum-b-239");
+    expect(lineEvents.slice(eventCountBeforeDeferred).some(
+      (lines) => lines.at(-1) === "grok-momentum-a-239",
+    )).toBe(false);
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("27");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("28");
+  }, 120_000);
+
+  test("cancels a gated tail rejoin when the gesture retreats into history", async () => {
+    const lineEvents: Array<{ lines: string[] }> = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { lineEvents.push({ lines: [...lines] }); },
+    });
+    wheelTowardHistory(viewport, -400);
+    const eventCountBeforeDeferred = lineEvents.length;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const deferredA = Array.from(
+      { length: 240 },
+      (_, row) => `grok-retreat-a-${row}`,
+    );
+    sessionCallback(deferredA.join("\n"), "output", { row: 13, col: 14 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 2_100 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 100 }]));
+    const gatedB = Array.from(
+      { length: 240 },
+      (_, row) => `grok-retreat-b-${row}`,
+    );
+    sessionCallback(gatedB.join("\n"), "output", { row: 15, col: 16 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    drainAnimationFrames();
+
+    // The first drag reached tail and requested a deferred rejoin, but the
+    // same gesture then moves back into history before the gate can settle.
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 500 }]));
+    drainAnimationFrames();
+    for (let sample = 0; sample < 32; sample++) {
+      viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 500 }]));
+    }
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 500 }]),
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("15");
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-retreat-b-239");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("15");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("16");
+  }, 120_000);
+
+  test("keeps a search raw index on the frozen model when it cancels a tail fling", async () => {
+    const lineEvents: string[][] = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { lineEvents.push([...lines]); },
+    });
+    viewport.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    const input = viewport.querySelector<HTMLInputElement>(
+      '[data-testid="term-search-input"]',
+    );
+    if (!input) throw new Error("terminal search input did not open");
+    input.value = "line-10";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    drainAnimationFrames();
+
+    wheelTowardHistory(viewport, -400);
+    const eventCountBeforeDeferred = lineEvents.length;
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const deferredA = Array.from(
+      { length: 240 },
+      (_, row) => `grok-search-a-${row}`,
+    );
+    sessionCallback(deferredA.join("\n"), "output", { row: 21, col: 22 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 2_100 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 100 }]));
+    const gatedB = Array.from(
+      { length: 240 },
+      (_, row) => `grok-search-b-${row}`,
+    );
+    sessionCallback(gatedB.join("\n"), "output", { row: 23, col: 24 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 100 }]),
+    );
+    expect(frameCallbacks.size).toBeGreaterThan(0);
+
+    // Enter cancels the live fling and jumps using the match index from the
+    // frozen model. B may replace the deferred slot, but cannot commit first.
+    input.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+    expect([...mountedLineContent(viewport).values()].some(
+      (line) => line.startsWith("line-"),
+    )).toBe(true);
+    expect([...mountedLineContent(viewport).values()].some(
+      (line) => line.startsWith("grok-search-b-"),
+    )).toBe(false);
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("23");
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.at(-1)).toBe("grok-search-b-239");
+  }, 120_000);
+
+  test("flushes the newest gated capture when multi-touch aborts a gesture", async () => {
+    const lineEvents: string[][] = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { lineEvents.push([...lines]); },
+    });
+    wheelTowardHistory(viewport, -400);
+    const eventCountBeforeDeferred = lineEvents.length;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const deferredA = Array.from(
+      { length: 240 },
+      (_, row) => `grok-multitouch-a-${row}`,
+    );
+    sessionCallback(deferredA.join("\n"), "output", { row: 17, col: 18 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 2_100 }]));
+    frameNow += 16;
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 100 }]));
+    const gatedB = Array.from(
+      { length: 240 },
+      (_, row) => `grok-multitouch-b-${row}`,
+    );
+    sessionCallback(gatedB.join("\n"), "output", { row: 19, col: 20 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("17");
+
+    // The queued single-finger drag reaches local tail while B is gated,
+    // establishing the exact rejoin intent that a second contact must cancel.
+    drainAnimationFrames();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("17");
+
+    viewport.dispatchEvent(touchEvent("touchmove", [
+      { clientX: 40, clientY: 100 },
+      { clientX: 120, clientY: 160 },
+    ]));
+    flushSync();
+    drainScheduledWork();
+
+    // Abort settles the content gate, so B owns the deferred slot/cursor, but
+    // the off-tail reader projection and callback stream remain untouched.
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("19");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("20");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.at(-1)).toBe("grok-multitouch-b-239");
+  }, 120_000);
+
   test("bounds an unproven deferred capture before it rejoins the live tail", async () => {
     const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
       historyPaging: "sliding",

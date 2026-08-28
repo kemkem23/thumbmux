@@ -467,7 +467,11 @@ type TermViewProps = {
 `onLinesChange` publishes the newly committed raw model. A fail-closed reader
 freeze therefore stays silent while newer whole captures are deferred. The
 later tail rejoin publishes the newest committed model once with its original
-`live` or `replace` source.
+`live` or `replace` source. A newer capture waiting behind an active gesture is
+coalesced into that deferred slot before rejoin, so an older frame cannot be
+published first. A gesture that retreats, becomes multi-touch, or hands control
+to search navigation cancels its inferred rejoin and leaves the reader model
+frozen until a later explicit tail action.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux

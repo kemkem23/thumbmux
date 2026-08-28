@@ -17,7 +17,11 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.7-dist`.
   touch gestures without moving the anchor text, row identity, or screen Y.
   Deferred captures remain silent on `onLinesChange`; the newest capture is
   reported once, with its original `live` or `replace` source, only when tail
-  rejoin commits it.
+  rejoin commits it. If a gesture gate already holds a newer whole capture,
+  rejoin coalesces that capture first instead of briefly committing the older
+  deferred frame. Retreating into history, a multi-touch abort, or search
+  navigation cancels an inferred gesture rejoin so frozen row coordinates
+  cannot be reused against a different capture.
 
 ## v0.18.6 — 2026-08-27
 

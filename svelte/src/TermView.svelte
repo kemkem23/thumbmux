@@ -296,6 +296,7 @@
     replace: boolean;
     boundary?: MuxHistoryBoundary;
   } | null>(null);
+  let deferredTailRejoinRequested = false;
   // Visual projection is a second coordinate space, never a replacement for
   // rawLines. Every projected row owns a half-open raw range and every raw row
   // maps back to one visual row. This is what lets Bash blocks occupy one row
@@ -1466,16 +1467,19 @@
     }
   }
 
-  function isAwayFromLiveTail(): boolean {
+  function readerPositionIsAtLiveTail(): boolean {
     // A detached archive window can be at its own local bottom while still
     // being many pages away from the live pane. Keep cursor/latest-button
     // semantics tied to the real live seam, not local scroll coordinates.
-    return deferredLegacyLiveCapture !== null
-      || historyReaderAtUnscrollableTail || bottomOffsetPx > 0 || (
+    return !historyReaderAtUnscrollableTail && bottomOffsetPx <= 0 && !(
       historyPaging === 'sliding' &&
       archiveWindow !== null &&
       !archiveWindowAttachedToLive
     );
+  }
+
+  function isAwayFromLiveTail(): boolean {
+    return deferredLegacyLiveCapture !== null || !readerPositionIsAtLiveTail();
   }
 
   /** Boundary diagnostics are integer pixels, but must never round a real
@@ -1731,6 +1735,10 @@
         sendSgr(sgrSnapToBottom(cx, cy));
       }
     }
+    // A newer whole capture may be coalesced behind the gesture/content gate.
+    // Pull it into the deferred slot before committing so tail rejoin exposes
+    // only the newest frame and publishes one model-change callback.
+    flushPendingContent();
     rejoinDeferredLegacyLiveCapture();
     applyScroll();
     if (
@@ -1740,7 +1748,6 @@
     ) {
       maybeRequestNewerHistory(0);
     }
-    flushPendingContent();
     emitScrollState();
     return true;
   }
@@ -2741,6 +2748,10 @@
     // straight past the match we just centred. Stopping inertia removes the
     // settle callback that would have flushed deferred live content, so flush
     // here or the command's final output can stay invisible under the match.
+    // The match's raw index belongs to the current reader model; cancel an
+    // inferred tail rejoin before flushing so a replacement cannot make that
+    // index point at unrelated text.
+    deferredTailRejoinRequested = false;
     stopInertia();
     flushPendingContent();
     const visualRow = visualRowForRaw(line);
@@ -2921,7 +2932,18 @@
    * accidentally concatenated to the live pane. */
   function rejoinDeferredLegacyLiveCapture(): boolean {
     const pending = deferredLegacyLiveCapture;
-    if (!pending) return false;
+    if (!pending) {
+      deferredTailRejoinRequested = false;
+      return false;
+    }
+    // Never commit an older deferred frame while a newer whole delivery waits
+    // behind the gesture/content gate. Remember this explicit tail intent so
+    // its idle flush can replace A with B, then commit only B.
+    if (contentUpdateGate.pending !== null) {
+      deferredTailRejoinRequested = true;
+      return false;
+    }
+    deferredTailRejoinRequested = false;
     deferredLegacyLiveCapture = null;
     const boundaryReconciliation = reconcileLiveBoundary(pending.boundary);
     if (!boundaryReconciliation.acceptDelivery) return true;
@@ -3165,6 +3187,7 @@
       // total/maxOffset, cursor visibility, search, selection, or the anchor.
       liveLines = boundLiveLinesForArchive(nextLive, archiveWindow);
       deferredLegacyLiveCapture = null;
+      deferredTailRejoinRequested = false;
       retainedLivePrefixBeforeBoundary = 0;
       detachedLiveProjectionPending = true;
       return;
@@ -3257,6 +3280,7 @@
     }
 
     deferredLegacyLiveCapture = null;
+    deferredTailRejoinRequested = false;
 
     if (historyPaging === 'sliding' && archiveWindow !== null) {
       liveLines = boundLiveLinesForArchive(liveLines, archiveWindow);
@@ -4581,6 +4605,14 @@
     const result = flushContentUpdate(contentUpdateGate, contentUpdateBlock());
     contentUpdateGate = result.gate;
     if (result.delivery) applyContentDelivery(result.delivery);
+    if (deferredTailRejoinRequested && !busy() && !selectionActive) {
+      const reachedRequestedTail = !historyReaderAtUnscrollableTail && bottomOffsetPx <= 0;
+      if (contentUpdateGate.pending === null && reachedRequestedTail) {
+        rejoinDeferredLegacyLiveCapture();
+      } else if (!reachedRequestedTail) {
+        deferredTailRejoinRequested = false;
+      }
+    }
     flushDeferredPresentation();
     schedulePendingPrependWork();
   }
@@ -4932,6 +4964,10 @@
     if (wasActive && !selectionActive) {
       const pendingJump = pendingSearchJumpLine;
       pendingSearchJumpLine = null;
+      // A queued jump also owns a raw-row coordinate from the frozen reader
+      // model. The content-flush frame is scheduled first, so cancel inferred
+      // tail intent before arming either callback.
+      if (pendingJump !== null) deferredTailRejoinRequested = false;
       // Selection blocked history prepend commits; re-arm idle work now.
       schedulePendingPrependWork();
       schedulePendingContentFlush();
@@ -4960,6 +4996,12 @@
     touching = false;
     tapStart = null;
     touchVel = 0;
+    // Multi-touch/invalid-contact abort is a real gesture settle. Do not leave
+    // the newest whole capture stranded behind a gate that is no longer busy.
+    // The ambiguous extra contact cancels any inferred tail intent: preserve
+    // the reader projection until an unambiguous later rejoin.
+    deferredTailRejoinRequested = false;
+    flushPendingContent();
   }
 
   // --- gesture physics (px-true, no quantization, iOS decel curve) ---
@@ -5065,9 +5107,9 @@
     const from = bottomOffsetPx;
     if (Math.abs(from - target) < 0.5) {
       bottomOffsetPx = target;
+      flushPendingContent();
       if (target === 0) rejoinDeferredLegacyLiveCapture();
       applyScroll();
-      flushPendingContent();
       return;
     }
     const t0 = performance.now();
@@ -5085,9 +5127,9 @@
       if (k >= 1) {
         springFrame = null;
         bottomOffsetPx = target;
+        flushPendingContent();
         if (target === 0) rejoinDeferredLegacyLiveCapture();
         applyScroll();
-        flushPendingContent();
       } else {
         springFrame = requestAnimationFrame(step);
       }
@@ -5605,6 +5647,7 @@
     historyReaderAtUnscrollableTail = false;
     deferredUnscrollableHistoryPx = 0;
     deferredLegacyLiveCapture = null;
+    deferredTailRejoinRequested = false;
     bottomOffsetPx = 0;
     applyScroll();
     emitScrollState();
@@ -5625,6 +5668,7 @@
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
     deferredLegacyLiveCapture = null;
+    deferredTailRejoinRequested = false;
     retainedLivePrefixBeforeBoundary = 0;
     if (archivedLines.length === 0) return;
     archivedLines = [];
