@@ -457,21 +457,18 @@ type TermViewProps = {
   onTap?: () => void;
   onLinesChange?: (
     lines: string[],
-    meta: {
-      source: 'live' | 'prepend' | 'replace';
-      pending?: boolean;
-    },
+    meta: { source: 'live' | 'prepend' | 'replace' },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
 
-`onLinesChange` normally publishes the newly committed raw model. The one
-exception is a fail-closed reader freeze: it publishes the still-visible model
-with `meta.pending=true` to signal unseen live activity without claiming that
-the deferred capture has entered copy/search/DOM state. The later tail rejoin
-publishes the committed model with `pending` absent.
+`onLinesChange` normally publishes the newly committed raw model. When a
+fail-closed reader freeze begins, it emits one `source: 'live'` notification
+with the still-visible model so a host can light its unseen-content control.
+Further coalesced repaint frames do not repeat that notification. The later
+tail rejoin publishes the committed model normally.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux

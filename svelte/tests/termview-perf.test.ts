@@ -53,7 +53,7 @@ type TermViewOverrides = {
   onKeys?: (data: string) => void;
   onLinesChange?: (
     lines: string[],
-    meta: { source: "live" | "prepend" | "replace"; pending?: boolean },
+    meta: { source: "live" | "prepend" | "replace" },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
@@ -2088,7 +2088,7 @@ describe("TermView retained history budgets", () => {
     let retainedLines: string[] = [];
     const lineEvents: Array<{
       lines: string[];
-      meta: { source: "live" | "prepend" | "replace"; pending?: boolean };
+      meta: { source: "live" | "prepend" | "replace" };
     }> = [];
     const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
       historyPaging: "sliding",
@@ -2105,6 +2105,7 @@ describe("TermView retained history budgets", () => {
     if (anchorId === undefined) throw new Error("no resync reader anchor was available");
     const anchorText = mountedBefore.get(anchorId);
     const anchorYBefore = compositorLineY(viewport, anchorId);
+    const eventCountBeforeDeferred = lineEvents.length;
 
     if (!sessionCallback) throw new Error("subscribe was not invoked");
     const unproven = Array.from({ length: 240 }, (_, row) => `grok-unproven-${row}`);
@@ -2116,8 +2117,10 @@ describe("TermView retained history budgets", () => {
     flushSync();
     drainScheduledWork();
     expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
-    expect(lineEvents.at(-1)?.meta.pending).toBe(true);
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.meta).toEqual({ source: "live" });
     expect(lineEvents.at(-1)?.lines.at(-1)).toBe("line-239");
+    const deferredEventCount = lineEvents.length;
 
     const resync = Array.from({ length: 240 }, (_, row) => `grok-resync-${row}`);
     sessionCallback(resync.join("\n"), "output", undefined, {
@@ -2139,8 +2142,7 @@ describe("TermView retained history budgets", () => {
     expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
     expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
     expect(retainedLines.at(-1)).toBe("line-239");
-    expect(lineEvents.at(-1)?.meta).toMatchObject({ source: "live", pending: true });
-    const deferredEventCount = lineEvents.length;
+    expect(lineEvents).toHaveLength(deferredEventCount);
 
     const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
     expect(scrollToBottom?.()).toBe(true);
@@ -2148,7 +2150,6 @@ describe("TermView retained history budgets", () => {
     drainScheduledWork();
     expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
     expect(lineEvents).toHaveLength(deferredEventCount + 1);
-    expect(lineEvents.at(-1)?.meta.pending).toBeUndefined();
     expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-resync-239");
     expect([...mountedLineContent(viewport).values()]).toContain("grok-resync-239");
     expect(viewport.getAttribute("data-live-cursor-row")).toBe("7");

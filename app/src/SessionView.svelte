@@ -438,7 +438,7 @@
 
   function onTermLinesChange(
     _lines: string[],
-    meta: { source: 'live' | 'prepend' | 'replace'; pending?: boolean },
+    meta: { source: 'live' | 'prepend' | 'replace' },
   ): void {
     if (meta.source === 'live' && termScrollState.scrolledUp) hasNewContent = true;
   }
