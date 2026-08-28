@@ -53,7 +53,7 @@ type TermViewOverrides = {
   onKeys?: (data: string) => void;
   onLinesChange?: (
     lines: string[],
-    meta: { source: "live" | "prepend" | "replace" },
+    meta: { source: "live" | "prepend" | "replace"; pending?: boolean },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
@@ -2086,9 +2086,16 @@ describe("TermView retained history budgets", () => {
 
   test("keeps a pending Grok reader frozen across resync and its first durable boundary", async () => {
     let retainedLines: string[] = [];
+    const lineEvents: Array<{
+      lines: string[];
+      meta: { source: "live" | "prepend" | "replace"; pending?: boolean };
+    }> = [];
     const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
       historyPaging: "sliding",
-      onLinesChange: (lines) => { retainedLines = [...lines]; },
+      onLinesChange: (lines, meta) => {
+        retainedLines = [...lines];
+        lineEvents.push({ lines: [...lines], meta: { ...meta } });
+      },
     });
     wheelTowardHistory(viewport, -400);
 
@@ -2109,6 +2116,8 @@ describe("TermView retained history budgets", () => {
     flushSync();
     drainScheduledWork();
     expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents.at(-1)?.meta.pending).toBe(true);
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("line-239");
 
     const resync = Array.from({ length: 240 }, (_, row) => `grok-resync-${row}`);
     sessionCallback(resync.join("\n"), "output", undefined, {
@@ -2130,12 +2139,17 @@ describe("TermView retained history budgets", () => {
     expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
     expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
     expect(retainedLines.at(-1)).toBe("line-239");
+    expect(lineEvents.at(-1)?.meta).toMatchObject({ source: "live", pending: true });
+    const deferredEventCount = lineEvents.length;
 
     const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
     expect(scrollToBottom?.()).toBe(true);
     flushSync();
     drainScheduledWork();
     expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(deferredEventCount + 1);
+    expect(lineEvents.at(-1)?.meta.pending).toBeUndefined();
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-resync-239");
     expect([...mountedLineContent(viewport).values()]).toContain("grok-resync-239");
     expect(viewport.querySelector('[data-testid="mtv-cursor"]')?.getAttribute("data-cursor-row"))
       .toBe("7");
@@ -2156,6 +2170,12 @@ describe("TermView retained history budgets", () => {
       source: "delta",
       replace: false,
       screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-oversized-boundary",
+        liveStartLine: 50_000,
+        walSequence: "99",
+        walOffset: 9_900,
+      },
     });
     flushSync();
     drainScheduledWork();
@@ -2171,8 +2191,29 @@ describe("TermView retained history budgets", () => {
     expect(Number(viewport.getAttribute("data-raw-total"))).toBeLessThanOrEqual(10_000);
     expect(Number(viewport.getAttribute("data-retained-estimated-bytes")))
       .toBeLessThanOrEqual(Number(viewport.getAttribute("data-retained-byte-budget")));
+    expect(viewport.getAttribute("data-history-generation")).toBeNull();
     expect([...mountedLineContent(viewport).values()])
       .toContain("grok-oversized-deferred-11999");
+
+    const recoveredBoundaryCapture = Array.from(
+      { length: 240 },
+      (_, row) => `grok-boundary-recovered-${row}`,
+    );
+    sessionCallback(recoveredBoundaryCapture.join("\n"), "output", null, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-oversized-boundary",
+        liveStartLine: 50_000,
+        walSequence: "99",
+        walOffset: 9_900,
+      },
+    });
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-history-generation"))
+      .toBe("grok-oversized-boundary");
   }, 120_000);
 
   test("keeps the Grok reader model frozen across a 300-frame touch burst", async () => {

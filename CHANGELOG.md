@@ -15,6 +15,8 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.7-dist`.
   absolute boundaries keep their existing incremental path. This covers short
   Grok Minimal conversations and long `insert_before` bursts coalesced during
   touch gestures without moving the anchor text, row identity, or screen Y.
+  While frozen, `onLinesChange` reports the still-visible rows with
+  `meta.pending=true`; the committed capture is reported once at rejoin.
 
 ## v0.18.6 — 2026-08-27
 

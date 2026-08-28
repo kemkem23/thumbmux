@@ -87,6 +87,8 @@
 
   type LinesChangeMeta = {
     source: 'live' | 'prepend' | 'replace';
+    /** A newer whole capture exists, but reader-owned rows remain mounted. */
+    pending?: boolean;
   };
 
   type ContentHitArea = {
@@ -2899,16 +2901,23 @@
     const boundedLines = archiveWindow === null
       ? boundLinesToRetentionBudget(nextLive)
       : boundLiveLinesForArchive(nextLive, archiveWindow);
+    const retainedWholeCapture = boundedLines.length === nextLive.length;
     deferredLegacyLiveCapture = {
       lines: boundedLines,
       source: previous?.source === 'live' || source === 'live' ? 'live' : source,
       replace: previous?.replace === true || replace,
-      boundary: boundary ? { ...boundary } : undefined,
+      // Trimming a boundary-bearing capture changes its first absolute row.
+      // Do not reuse the server's original seam beside that suffix; the next
+      // untrimmed boundary delivery can re-establish absolute paging safely.
+      boundary: retainedWholeCapture && boundary ? { ...boundary } : undefined,
     };
     // SessionView uses this signal to label its already-visible tail control
     // as new content. Keep the payload truthful to the frozen visible model;
     // the newest canonical capture is published only when it is committed.
-    onLinesChange?.([...rawLines], { source: deferredLegacyLiveCapture.source });
+    onLinesChange?.([...rawLines], {
+      source: deferredLegacyLiveCapture.source,
+      pending: true,
+    });
     emitScrollState();
   }
 
