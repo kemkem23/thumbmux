@@ -2117,9 +2117,8 @@ describe("TermView retained history budgets", () => {
     flushSync();
     drainScheduledWork();
     expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
-    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
-    expect(lineEvents.at(-1)?.meta).toEqual({ source: "live" });
-    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("line-239");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+    expect(retainedLines.at(-1)).toBe("line-239");
     const deferredEventCount = lineEvents.length;
 
     const resync = Array.from({ length: 240 }, (_, row) => `grok-resync-${row}`);
@@ -2154,6 +2153,63 @@ describe("TermView retained history budgets", () => {
     expect([...mountedLineContent(viewport).values()]).toContain("grok-resync-239");
     expect(viewport.getAttribute("data-live-cursor-row")).toBe("7");
     expect(viewport.getAttribute("data-live-cursor-col")).toBe("8");
+  }, 120_000);
+
+  test("keeps a replace-first durable boundary silent until tail rejoin commits it", async () => {
+    const lineEvents: Array<{
+      lines: string[];
+      meta: { source: "live" | "prepend" | "replace" };
+    }> = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines, meta) => {
+        lineEvents.push({ lines: [...lines], meta: { ...meta } });
+      },
+    });
+    wheelTowardHistory(viewport, -400);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const anchorId = [...mountedBefore.keys()][Math.floor(mountedBefore.size / 2)];
+    if (anchorId === undefined) throw new Error("no replace-first reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+    const eventCountBeforeDeferred = lineEvents.length;
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const replacement = Array.from(
+      { length: 240 },
+      (_, row) => `grok-replace-first-${row}`,
+    );
+    sessionCallback(replacement.join("\n"), "output", { row: 9, col: 10 }, {
+      source: "full",
+      replace: true,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-replace-generation",
+        liveStartLine: 24_000,
+        walSequence: "84",
+        walOffset: 8_192,
+      },
+    });
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred);
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(eventCountBeforeDeferred + 1);
+    expect(lineEvents.at(-1)?.meta).toEqual({ source: "replace" });
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-replace-first-239");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("9");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("10");
   }, 120_000);
 
   test("bounds an unproven deferred capture before it rejoins the live tail", async () => {

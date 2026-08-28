@@ -15,9 +15,9 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.7-dist`.
   absolute boundaries keep their existing incremental path. This covers short
   Grok Minimal conversations and long `insert_before` bursts coalesced during
   touch gestures without moving the anchor text, row identity, or screen Y.
-  At freeze onset, `onLinesChange` reports the still-visible rows once with its
-  existing `source: 'live'` shape; coalesced repaints stay silent and the
-  committed capture is reported once at rejoin.
+  Deferred captures remain silent on `onLinesChange`; the newest capture is
+  reported once, with its original `live` or `replace` source, only when tail
+  rejoin commits it.
 
 ## v0.18.6 — 2026-08-27
 

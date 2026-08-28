@@ -464,11 +464,10 @@ type TermViewProps = {
 };
 ```
 
-`onLinesChange` normally publishes the newly committed raw model. When a
-fail-closed reader freeze begins, it emits one `source: 'live'` notification
-with the still-visible model so a host can light its unseen-content control.
-Further coalesced repaint frames do not repeat that notification. The later
-tail rejoin publishes the committed model normally.
+`onLinesChange` publishes the newly committed raw model. A fail-closed reader
+freeze therefore stays silent while newer whole captures are deferred. The
+later tail rejoin publishes the newest committed model once with its original
+`live` or `replace` source.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux

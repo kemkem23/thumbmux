@@ -2896,7 +2896,6 @@
     boundary?: MuxHistoryBoundary,
   ): void {
     const previous = deferredLegacyLiveCapture;
-    const announceUnseenLiveContent = previous === null;
     const boundedLines = archiveWindow === null
       ? boundLinesToRetentionBudget(nextLive)
       : boundLiveLinesForArchive(nextLive, archiveWindow);
@@ -2910,13 +2909,9 @@
       // untrimmed boundary delivery can re-establish absolute paging safely.
       boundary: retainedWholeCapture && boundary ? { ...boundary } : undefined,
     };
-    // SessionView uses one live-source signal to label its already-visible
-    // tail control as new content. Keep the payload truthful to the frozen
-    // visible model and do not emit again for every coalesced repaint; the
-    // newest canonical capture is published only when it is committed.
-    if (announceUnseenLiveContent) {
-      onLinesChange?.([...rawLines], { source: 'live' });
-    }
+    // onLinesChange describes committed model changes. Keep it silent while
+    // the reader-owned projection is frozen; explicit tail rejoin publishes
+    // the newest canonical capture once through setLines below.
     emitScrollState();
   }
 
