@@ -4543,7 +4543,7 @@
         deferredLegacyLiveCapture !== null || (
           isAwayFromLiveTail()
           && liveBoundary === null
-          && (meta.replace || meta.boundary !== undefined)
+          && meta.boundary !== undefined
         )
       )
     ) {
