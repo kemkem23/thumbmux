@@ -5939,6 +5939,8 @@
   data-live-rejoin-pending={deferredLegacyLiveCapture ? '1' : undefined}
   data-content-update-pending-cursor-row={contentUpdateGate.pending?.cursor?.row}
   data-content-update-pending-cursor-col={contentUpdateGate.pending?.cursor?.col}
+  data-live-cursor-row={cursor?.row}
+  data-live-cursor-col={cursor?.col}
   data-content-update-busy={busy() ? '1' : '0'}
   data-content-update-selection={selectionActive ? '1' : '0'}
   style:font-size={`${fontPx}px`}

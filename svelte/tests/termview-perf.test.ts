@@ -2151,8 +2151,8 @@ describe("TermView retained history budgets", () => {
     expect(lineEvents.at(-1)?.meta.pending).toBeUndefined();
     expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-resync-239");
     expect([...mountedLineContent(viewport).values()]).toContain("grok-resync-239");
-    expect(viewport.querySelector('[data-testid="mtv-cursor"]')?.getAttribute("data-cursor-row"))
-      .toBe("7");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("7");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("8");
   }, 120_000);
 
   test("bounds an unproven deferred capture before it rejoins the live tail", async () => {
