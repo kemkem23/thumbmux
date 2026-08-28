@@ -209,6 +209,15 @@ scroll engine:
   scroll position instead of moving the viewport. `scrollToBottom()` sets the
   offset to exactly zero before flushing any content deferred by a gesture or
   selection, then future output follows again.
+- A boundary-less capture whose row continuity cannot be proved does not
+  replace the reader's mounted rows. `TermView` keeps only the newest such
+  capture offscreen (`data-live-rejoin-pending="1"`) and applies it when local
+  wheel/touch reaches the live tail or `scrollToBottom()` is called. This is a
+  fail-closed path for repainting normal-screen TUIs. Later full resyncs and a
+  first durable boundary stay behind the same reader fence; the deferred suffix
+  is capped by the normal 10,000-row / 8 MiB retention budget. Captures with a
+  proven overlap or an already-established durable boundary continue to merge
+  immediately.
 
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:
@@ -448,12 +457,21 @@ type TermViewProps = {
   onTap?: () => void;
   onLinesChange?: (
     lines: string[],
-    meta: { source: 'live' | 'prepend' | 'replace' },
+    meta: {
+      source: 'live' | 'prepend' | 'replace';
+      pending?: boolean;
+    },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
+
+`onLinesChange` normally publishes the newly committed raw model. The one
+exception is a fail-closed reader freeze: it publishes the still-visible model
+with `meta.pending=true` to signal unseen live activity without claiming that
+the deferred capture has entered copy/search/DOM state. The later tail rejoin
+publishes the committed model with `pending` absent.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux

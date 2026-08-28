@@ -31,7 +31,17 @@ type MuxCallback = (
   data: string,
   type?: string,
   cursor?: { row: number; col: number } | null,
-  meta?: { source: "full" | "delta"; replace: boolean },
+  meta?: {
+    source: "full" | "delta";
+    replace: boolean;
+    screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
+    boundary?: {
+      generation: string;
+      liveStartLine: number;
+      walSequence: string;
+      walOffset: number;
+    };
+  },
 ) => void;
 
 type Mounted = { app: Record<string, unknown>; target: HTMLElement };
@@ -43,7 +53,7 @@ type TermViewOverrides = {
   onKeys?: (data: string) => void;
   onLinesChange?: (
     lines: string[],
-    meta: { source: "live" | "prepend" | "replace" },
+    meta: { source: "live" | "prepend" | "replace"; pending?: boolean },
   ) => void;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   minRows?: number;
@@ -2013,6 +2023,264 @@ describe("TermView retained history budgets", () => {
 
     expect(compositorBottomOffset(viewport)).toBe(0);
     expect(retainedLines.at(-1)).toBe("resumed-tail-6");
+  }, 120_000);
+
+  test("freezes a short Grok Minimal repaint whose row continuity cannot be proven", async () => {
+    let retainedLines: string[] = [];
+    const { viewport } = await prepareScrollableTermView(undefined, 56, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    wheelTowardHistory(viewport, -200);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no short Grok reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+
+    // Grok Minimal commits a block with insert_before, then repaints its live
+    // viewport. While the conversation is shorter than one maximum pane there
+    // is no immutable suffix-to-prefix seam strong enough to identify rows.
+    const nextCapture = [
+      "line-0",
+      "line-1",
+      "line-2",
+      "line-3",
+      ...Array.from({ length: 8 }, (_, row) => `grok-committed-${row}`),
+      ...Array.from({ length: 44 }, (_, row) => `grok-live-repaint-${row}`),
+    ];
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(nextCapture.join("\n"), "output", null, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+    expect(retainedLines.at(-1)).toBe("line-55");
+
+    wheelTowardHistory(viewport, 1_000_000);
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(retainedLines.at(-1)).toBe("grok-live-repaint-43");
+    expect([...mountedLineContent(viewport).values()]).toContain("grok-live-repaint-43");
+
+    const followedCapture = [...nextCapture.slice(1), "grok-followed-at-tail"];
+    sessionCallback(followedCapture.join("\n"), "output", null, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect([...mountedLineContent(viewport).values()]).toContain("grok-followed-at-tail");
+  }, 120_000);
+
+  test("keeps a pending Grok reader frozen across resync and its first durable boundary", async () => {
+    let retainedLines: string[] = [];
+    const lineEvents: Array<{
+      lines: string[];
+      meta: { source: "live" | "prepend" | "replace"; pending?: boolean };
+    }> = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines, meta) => {
+        retainedLines = [...lines];
+        lineEvents.push({ lines: [...lines], meta: { ...meta } });
+      },
+    });
+    wheelTowardHistory(viewport, -400);
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no resync reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    const unproven = Array.from({ length: 240 }, (_, row) => `grok-unproven-${row}`);
+    sessionCallback(unproven.join("\n"), "output", { row: 1, col: 2 }, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(lineEvents.at(-1)?.meta.pending).toBe(true);
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("line-239");
+
+    const resync = Array.from({ length: 240 }, (_, row) => `grok-resync-${row}`);
+    sessionCallback(resync.join("\n"), "output", undefined, {
+      source: "full",
+      replace: true,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-generation-1",
+        liveStartLine: 12_000,
+        walSequence: "42",
+        walOffset: 4_096,
+      },
+    });
+    sessionCallback("", "cursor", { row: 7, col: 8 });
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+    expect(retainedLines.at(-1)).toBe("line-239");
+    expect(lineEvents.at(-1)?.meta).toMatchObject({ source: "live", pending: true });
+    const deferredEventCount = lineEvents.length;
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(lineEvents).toHaveLength(deferredEventCount + 1);
+    expect(lineEvents.at(-1)?.meta.pending).toBeUndefined();
+    expect(lineEvents.at(-1)?.lines.at(-1)).toBe("grok-resync-239");
+    expect([...mountedLineContent(viewport).values()]).toContain("grok-resync-239");
+    expect(viewport.getAttribute("data-live-cursor-row")).toBe("7");
+    expect(viewport.getAttribute("data-live-cursor-col")).toBe("8");
+  }, 120_000);
+
+  test("bounds an unproven deferred capture before it rejoins the live tail", async () => {
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+    });
+    wheelTowardHistory(viewport, -400);
+
+    const oversized = Array.from(
+      { length: 12_000 },
+      (_, row) => `grok-oversized-deferred-${row}`,
+    );
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(oversized.join("\n"), "output", null, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-oversized-boundary",
+        liveStartLine: 50_000,
+        walSequence: "99",
+        walOffset: 9_900,
+      },
+    });
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(Number(viewport.getAttribute("data-total"))).toBe(240);
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(Number(viewport.getAttribute("data-raw-total"))).toBeLessThanOrEqual(10_000);
+    expect(Number(viewport.getAttribute("data-retained-estimated-bytes")))
+      .toBeLessThanOrEqual(Number(viewport.getAttribute("data-retained-byte-budget")));
+    expect(viewport.getAttribute("data-history-generation")).toBeNull();
+    expect([...mountedLineContent(viewport).values()])
+      .toContain("grok-oversized-deferred-11999");
+
+    const recoveredBoundaryCapture = Array.from(
+      { length: 240 },
+      (_, row) => `grok-boundary-recovered-${row}`,
+    );
+    sessionCallback(recoveredBoundaryCapture.join("\n"), "output", null, {
+      source: "delta",
+      replace: false,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+      boundary: {
+        generation: "grok-oversized-boundary",
+        liveStartLine: 50_000,
+        walSequence: "99",
+        walOffset: 9_900,
+      },
+    });
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-history-generation"))
+      .toBe("grok-oversized-boundary");
+  }, 120_000);
+
+  test("keeps the Grok reader model frozen across a 300-frame touch burst", async () => {
+    let retainedLines: string[] = [];
+    const { app, viewport } = await prepareScrollableTermView(undefined, 240, {
+      historyPaging: "sliding",
+      onLinesChange: (lines) => { retainedLines = [...lines]; },
+    });
+    const grokCapture = (start: number, frame: number) => [
+      ...Array.from({ length: 190 }, (_, row) => `grok-history-${start + row}`),
+      ...Array.from({ length: 50 }, (_, row) => `grok-frame-${frame}-live-${row}`),
+    ];
+
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(grokCapture(0, 0).join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+      screen: { alt: false, mouseSgr: false, mouseAny: false },
+    });
+    flushSync();
+    drainScheduledWork();
+    wheelTowardHistory(viewport, -400);
+
+    viewport.dispatchEvent(touchEvent("touchstart", [{ clientX: 40, clientY: 120 }]));
+    viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 180 }]));
+    drainScheduledWork();
+    // Decay the sampled velocity without moving again, so touchend exercises
+    // the real drag path but does not leave an unrelated momentum animation.
+    for (let sample = 0; sample < 32; sample++) {
+      viewport.dispatchEvent(touchEvent("touchmove", [{ clientX: 40, clientY: 180 }]));
+    }
+
+    const mountedBefore = mountedLineContent(viewport);
+    const mountedIds = [...mountedBefore.keys()];
+    const anchorId = mountedIds[Math.floor(mountedIds.length / 2)];
+    if (anchorId === undefined) throw new Error("no burst reader anchor was available");
+    const anchorText = mountedBefore.get(anchorId);
+    const anchorYBefore = compositorLineY(viewport, anchorId);
+
+    // Mobile content delivery deliberately coalesces to the newest whole frame
+    // while a finger owns the compositor. A long Grok turn can therefore move
+    // farther than every text-overlap heuristic before the gesture releases.
+    for (let frame = 1; frame <= 300; frame++) {
+      sessionCallback(grokCapture(frame, frame).join("\n"), "output", null, {
+        source: "delta",
+        replace: false,
+        screen: { alt: false, mouseSgr: false, mouseAny: false },
+      });
+    }
+    viewport.dispatchEvent(
+      touchEvent("touchend", [], [{ clientX: 40, clientY: 180 }]),
+    );
+    flushSync();
+    drainScheduledWork();
+
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(mountedLineContent(viewport).get(anchorId)).toBe(anchorText);
+    expect(compositorLineY(viewport, anchorId)).toBe(anchorYBefore);
+
+    const scrollToBottom = app.scrollToBottom as (() => boolean) | undefined;
+    expect(scrollToBottom?.()).toBe(true);
+    flushSync();
+    drainScheduledWork();
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(compositorBottomOffset(viewport)).toBe(0);
+    expect(retainedLines.at(-1)).toBe("grok-frame-300-live-49");
+    expect([...mountedLineContent(viewport).values()]).toContain("grok-frame-300-live-49");
   }, 120_000);
 
   test("prefers the pane seam when repeated chrome makes a false exact overlap", async () => {

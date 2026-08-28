@@ -835,6 +835,47 @@ describe("TermView sliding archive window", () => {
     expect(new Set(deliveredLines.at(-1)).size).toBe(40);
   });
 
+  test("keeps a deferred legacy Grok capture offscreen while a detached archive pages forward", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(liveLines("legacy-before", 240), undefined, undefined, {
+      source: "full",
+      replace: true,
+    });
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toMatchObject({ direction: "before", cursor: null });
+
+    const newestGrok = liveLines("legacy-grok-newest", 240);
+    deliverOutput(newestGrok, undefined, undefined, {
+      source: "delta",
+      replace: false,
+    });
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+
+    // This tokenless reply knows that newer archive rows exist, so it owns a
+    // detached window. Rejoining live must request those rows instead of
+    // concatenating the window directly with the deferred capture.
+    deliverHistory(0, archiveLines(0, 20), false, 100);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(archiveLines(0, 20));
+
+    wheel(viewport, 1_000_000);
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(historyCalls.at(-1)).toEqual({ direction: "after", cursor: 19, limit: 2_000 });
+    expect(deliveredLines.at(-1)).toEqual(archiveLines(0, 20));
+
+    deliverHistory(20, archiveLines(20, 80), false, 100);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual([
+      ...archiveLines(0, 100),
+      ...newestGrok,
+    ]);
+    expect(new Set(deliveredLines.at(-1)).size).toBe(340);
+  });
+
   test("replaces canonically when a repeated-text boundary jump exceeds the resident live window", async () => {
     const { viewport } = mountTermView();
     await tick();

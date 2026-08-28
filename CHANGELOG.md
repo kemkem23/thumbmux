@@ -1,7 +1,22 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.6-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.7-dist`.
+
+## v0.18.7 — 2026-08-28
+
+### Fixed
+
+- **A repainting normal-screen TUI can no longer replace history underneath a
+  scrolled reader when a legacy capture has no provable row seam.** `TermView`
+  freezes the reader-owned projection, coalesces only the newest canonical live
+  capture offscreen, and applies it when the reader explicitly reaches the
+  live tail or presses the latest-content control. Proven overlaps and durable
+  absolute boundaries keep their existing incremental path. This covers short
+  Grok Minimal conversations and long `insert_before` bursts coalesced during
+  touch gestures without moving the anchor text, row identity, or screen Y.
+  While frozen, `onLinesChange` reports the still-visible rows with
+  `meta.pending=true`; the committed capture is reported once at rejoin.
 
 ## v0.18.6 — 2026-08-27
 
