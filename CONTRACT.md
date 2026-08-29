@@ -359,7 +359,9 @@ The lower-level dense Svelte presentation is additive as well:
   host's responsibility. The name and terminal preview are independent controls: the preview
   owns the session-open action and the name remains copy-only. The deterministic
   hooks remain `grid-copy-name` / `grid-expand` and `hud-copy-title` /
-  `hud-expand`; copying never opens a session or toggles the HUD.
+  `hud-expand`; copying never opens a session or toggles the HUD. The dense
+  thumbnail stays inert and is a sibling beneath the full-preview open-button
+  overlay, so hover/focus repaints cannot replace the hit target.
 
 ## Deprecation policy
 

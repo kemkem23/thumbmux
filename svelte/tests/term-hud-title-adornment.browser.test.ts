@@ -7,7 +7,9 @@
  * into service as an inline badge at a 390px bar, `.nm` had clientWidth 15px
  * against scrollWidth 187px: the name clipped to its caret glyph. happy-dom
  * reports every width as 0, so the whole of that finding is invisible to the
- * suite that runs everywhere else. This file drives real Chromium.
+ * suite that runs everywhere else. This file drives real Chromium by default
+ * and can repeat the same source/layout checks in WebKit via
+ * THUMBMUX_LAYOUT_BROWSER=webkit.
  *
  * The HUD suite carries its own control. Each width assertion is paired with the same
  * measurement taken while the collapse rule is neutralized by a stylesheet
@@ -158,8 +160,12 @@ window.__hudReady = true;
   }
   bundle = await built.outputs[0]!.text();
 
-  const { chromium } = require("@playwright/test") as typeof import("@playwright/test");
-  browser = await chromium.launch();
+  const playwright = require("@playwright/test") as typeof import("@playwright/test");
+  const requestedBrowser = process.env.THUMBMUX_LAYOUT_BROWSER ?? "chromium";
+  if (requestedBrowser !== "chromium" && requestedBrowser !== "webkit") {
+    throw new Error(`unsupported THUMBMUX_LAYOUT_BROWSER: ${requestedBrowser}`);
+  }
+  browser = await playwright[requestedBrowser].launch();
 }, 180_000);
 
 afterAll(async () => {
@@ -673,6 +679,9 @@ describe("dense SessionGrid browser layout", () => {
           headText: head.textContent ?? "",
           openTag: open.tagName,
           openContainsThumb: open.contains(thumb),
+          openSharesPreviewParent: open.parentElement === thumb.parentElement,
+          openFollowsThumb: open.previousElementSibling === thumb,
+          openPointerEvents: getComputedStyle(open).pointerEvents,
           killTag: kill.tagName,
           killText: kill.textContent,
           killWidth: kill.getBoundingClientRect().width,
@@ -703,7 +712,10 @@ describe("dense SessionGrid browser layout", () => {
       expect(denseChrome.headContainsOpen).toBe(false);
       expect(denseChrome.headText).not.toContain("↗");
       expect(denseChrome.openTag).toBe("BUTTON");
-      expect(denseChrome.openContainsThumb).toBe(true);
+      expect(denseChrome.openContainsThumb).toBe(false);
+      expect(denseChrome.openSharesPreviewParent).toBe(true);
+      expect(denseChrome.openFollowsThumb).toBe(true);
+      expect(denseChrome.openPointerEvents).toBe("auto");
       expect(denseChrome.killTag).toBe("BUTTON");
       expect(denseChrome.killText).toBe("×");
       expect(denseChrome.killWidth).toBe(44);
@@ -722,11 +734,19 @@ describe("dense SessionGrid browser layout", () => {
       expect(denseChrome.summaryLineClamp).toBe("3");
       expect(denseChrome.summaryHeight).toBeLessThanOrEqual(denseChrome.summaryLineHeight * 3 + 1);
 
-      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      const firstCard = page.locator('[data-testid="grid-card"]').first();
+      const openPreview = firstCard.locator('[data-testid="grid-expand"]');
+      const thumbPreview = firstCard.locator('[data-testid="session-thumb"]');
+      const originalOpenNode = await openPreview.elementHandle();
+      expect(originalOpenNode).not.toBeNull();
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
       await openPreview.focus();
       await page.waitForTimeout(180);
       const focusedSurface = await openPreview.evaluate((element) => {
-        const thumb = element.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const thumb = element.parentElement!.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
         const openStyle = getComputedStyle(element);
         const surfaceStyle = getComputedStyle(thumb);
         const focusStyle = getComputedStyle(element, "::after");
@@ -755,27 +775,72 @@ describe("dense SessionGrid browser layout", () => {
       expect(focusedSurface.outlineWidth).toBe("0px");
       expect(focusedSurface.focusBoxShadow).toContain("rgb(255, 255, 255)");
       expect(focusedSurface.focusBoxShadow).toContain("rgb(17, 17, 17)");
-      await openPreview.locator('[data-testid="session-thumb"]').evaluate((thumb) => {
+      await thumbPreview.evaluate((thumb) => {
         (thumb as HTMLElement).style.setProperty("--tbg", "#f5f5f5");
       });
       const ring = await focusRingPixels(page, await openPreview.screenshot({ animations: "disabled" }));
       expect(ring.innerWhite.every((channel) => channel >= 250)).toBe(true);
       expect(ring.outerBlack.every((channel) => channel >= 14 && channel <= 20)).toBe(true);
       expect(ring.surface.every((channel) => channel >= 240)).toBe(true);
-      await openPreview.locator('[data-testid="session-thumb"]').evaluate((thumb) => {
+      await thumbPreview.evaluate((thumb) => {
         (thumb as HTMLElement).style.setProperty("--tbg", "#111111");
       });
       await openPreview.evaluate((element) => element.blur());
       await page.waitForTimeout(180);
-      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
+      expect(await thumbPreview.evaluate(
         (thumb) => getComputedStyle(thumb).backgroundColor,
       )).toBe("rgb(102, 102, 102)");
+      const hitBoxBeforeHover = await openPreview.boundingBox();
       await openPreview.hover();
       await page.waitForTimeout(180);
-      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
+      expect(await thumbPreview.evaluate(
         (thumb) => getComputedStyle(thumb).backgroundColor,
       )).toBe("rgb(17, 17, 17)");
-      await openPreview.click();
+      const hitBoxAfterHover = await openPreview.boundingBox();
+      expect(hitBoxBeforeHover).not.toBeNull();
+      expect(hitBoxAfterHover).not.toBeNull();
+      for (const key of ["x", "y", "width", "height"] as const) {
+        expect(Math.abs(hitBoxAfterHover![key] - hitBoxBeforeHover![key])).toBeLessThanOrEqual(1);
+      }
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      // Android WebView/XR pointers can emit HOVER_EXIT immediately before
+      // the press. That resets the preview palette and rewrites the thumbnail
+      // DOM; the stable sibling overlay must remain the hit target throughout.
+      await openPreview.dispatchEvent("pointerleave", { pointerType: "mouse" });
+      await page.waitForTimeout(180);
+      expect(await thumbPreview.evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(102, 102, 102)");
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      expect(await originalOpenNode!.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return element.isConnected
+          && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      await page.mouse.down();
+      await page.mouse.up();
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.focus();
+      await page.keyboard.press("Enter");
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.focus();
+      await page.keyboard.press("Space");
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
@@ -828,6 +893,22 @@ describe("dense SessionGrid browser layout", () => {
       expect(cards[0]!.height).toBe(844);
       expect(cards[1]!.top - cards[0]!.top).toBe(852);
       expect(cards[0]!.pageWidth).toBeLessThanOrEqual(cards[0]!.viewportWidth);
+      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      const hit = await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = Math.max(rect.top + 10, Math.min(rect.bottom - 10, window.innerHeight - 10));
+        return {
+          visiblePointIsButton: document.elementFromPoint(x, y) === element,
+          x,
+          y,
+        };
+      });
+      expect(hit.visiblePointIsButton).toBe(true);
+      await page.touchscreen.tap(hit.x, hit.y);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
     } finally {
       await context.close();
     }

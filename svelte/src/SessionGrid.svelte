@@ -264,30 +264,36 @@
         {/if}
       </div>
     {/if}
-    <button
-      type="button"
-      class="live dense-open"
-      onclick={() => onOpen(item.session.name)}
-      onpointerenter={() => (hoveredPreview = item.session.name)}
-      onpointerleave={() => leavePreview(item.session.name)}
-      onfocus={() => {
-        activeFocusKey = item.session.name;
-        focusedPreview = item.session.name;
-      }}
-      onblur={() => blurPreview(item.session.name)}
-      tabindex={tabIndexFor(item.session.name)}
-      aria-label={`${expandLabel}: ${item.session.name}`}
-      data-testid="grid-expand"
-      data-session={item.session.name}
-      data-focus-key={item.session.name}
-    >
+    <div class="live dense-preview">
       <SessionThumb
         session={item.session.name}
         palette={item.session.palette ?? palette}
         density="dense"
         previewBackground={densePreviewBackground(item.session.name)}
       />
-    </button>
+      <!-- Keep the inert terminal miniature outside the interactive subtree
+           so activation never relies on browser-specific retargeting across
+           inert content. Embedded/XR pointers may repaint the miniature on a
+           hover exit immediately before press; this stable sibling overlay
+           remains the complete preview hit target throughout. -->
+      <button
+        type="button"
+        class="dense-open"
+        onclick={() => onOpen(item.session.name)}
+        onpointerenter={() => (hoveredPreview = item.session.name)}
+        onpointerleave={() => leavePreview(item.session.name)}
+        onfocus={() => {
+          activeFocusKey = item.session.name;
+          focusedPreview = item.session.name;
+        }}
+        onblur={() => blurPreview(item.session.name)}
+        tabindex={tabIndexFor(item.session.name)}
+        aria-label={`${expandLabel}: ${item.session.name}`}
+        data-testid="grid-expand"
+        data-session={item.session.name}
+        data-focus-key={item.session.name}
+      ></button>
+    </div>
   </div>
 {/snippet}
 
@@ -742,22 +748,29 @@
   .dense-card .live {
     border-top: 0;
   }
+  .dense-preview {
+    isolation: isolate;
+  }
   .dense-open {
-    position: relative;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
     width: 100%;
+    height: 100%;
     min-width: 0;
+    min-height: 0;
     margin: 0;
     padding: 0;
     appearance: none;
-    border-right: 0;
-    border-bottom: 0;
-    border-left: 0;
+    border: 0;
     border-radius: 0;
     background: transparent;
     color: inherit;
     text-align: left;
     cursor: pointer;
+    pointer-events: auto;
     touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   .dense-open:focus-visible {
     z-index: 2;

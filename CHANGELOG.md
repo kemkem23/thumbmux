@@ -1,7 +1,19 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.9-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.10-dist`.
+
+## v0.18.10 — 2026-08-29
+
+### Fixed
+
+- **Dense terminal previews remain clickable across embedded, touch and XR
+  browsers.** The read-only `inert` thumbnail and the full-preview open button
+  are now stable siblings, with the button as an explicit overlay hit target.
+  A hover-exit repaint immediately before a press can therefore no longer
+  replace or invalidate the interactive subtree. Mouse click, touch tap and
+  keyboard activation retain one open action, while the separate copy and kill
+  controls keep their existing behavior.
 
 ## v0.18.9 — 2026-08-29
 
