@@ -13,7 +13,9 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.9-dist`.
   preview uses a gray idle surface, restores the terminal background on hover,
   keyboard focus or press, and retains its read-only thumbnail behavior. Hosts
   can add a separate 44px × control at the card's top-right for a confirmed
-  session kill without shrinking the three header tracks.
+  session kill without shrinking the three header tracks. Preview contrast is
+  recalculated for ANSI 0–255 and truecolour output, not only the base palette;
+  dim output keeps its hue without unreadable preview-only opacity.
 - **Dense terminal previews fit more output without changing their font size.**
   Row leading is reduced from 1.22 to 1.10 while matching the pinned Unicode
   cell boxes to the same pitch.

@@ -743,6 +743,7 @@
     border-top: 0;
   }
   .dense-open {
+    position: relative;
     width: 100%;
     min-width: 0;
     margin: 0;
@@ -760,9 +761,25 @@
   }
   .dense-open:focus-visible {
     z-index: 2;
-    outline: 3px solid #ffffff;
-    outline-offset: -3px;
-    box-shadow: inset 0 0 0 6px #111111;
+    outline: 0;
+  }
+  .dense-open:focus-visible::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    box-sizing: border-box;
+    pointer-events: none;
+    box-shadow: inset 0 0 0 3px #ffffff, inset 0 0 0 6px #111111;
+  }
+  @media (forced-colors: active) {
+    .dense-open:focus-visible {
+      outline: 0;
+    }
+    .dense-open:focus-visible::after {
+      border: 3px solid CanvasText;
+      box-shadow: none;
+    }
   }
   .subtitle {
     padding: 5px 9px 0;

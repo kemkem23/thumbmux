@@ -36,7 +36,7 @@ const sveltePlugin: import("bun").BunPlugin = {
   setup(build) {
     build.onLoad({ filter: /ws-mux\.svelte\.ts$/ }, () => ({
       contents: `export const tmuxMux = { subscribe(_session, callback) {
-        callback('\\u001b[30m0 \\u001b[31m1 \\u001b[32m2 \\u001b[33m3 \\u001b[34m4 \\u001b[35m5 \\u001b[36m6 \\u001b[37m7 \\u001b[90m8 \\u001b[91m9 \\u001b[92mA \\u001b[93mB \\u001b[94mC \\u001b[95mD \\u001b[96mE \\u001b[97mF \\u001b[0m\\nไทย กิ้ 👩🏽‍💻 ⣿ └─ dense preview', 'full');
+        callback('\\u001b[30m0 \\u001b[31m1 \\u001b[32m2 \\u001b[33m3 \\u001b[34m4 \\u001b[35m5 \\u001b[36m6 \\u001b[37m7 \\u001b[90m8 \\u001b[91m9 \\u001b[92mA \\u001b[93mB \\u001b[94mC \\u001b[95mD \\u001b[96mE \\u001b[97mF \\u001b[38;5;242mI \\u001b[38;2;102;102;102mT \\u001b[38;2;102;102;102;48;2;102;102;102mB \\u001b[2;38;2;231;231;231mD \\u001b[0m\\nไทย กิ้ 👩🏽‍💻 ⣿ └─ dense preview', 'full');
         return () => {};
       } };`,
       loader: "js",
@@ -369,8 +369,31 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-function minimumContrast(colors: string[], background: string): number {
-  return Math.min(...colors.map((color) => contrastRatio(color, background)));
+type ContrastSample = { foreground: string; background: string; opacity: string };
+
+function minimumContrast(samples: ContrastSample[]): number {
+  return Math.min(...samples.map(({ foreground, background }) => contrastRatio(foreground, background)));
+}
+
+async function focusRingPixels(page: Page, png: Uint8Array): Promise<{
+  innerWhite: number[];
+  outerBlack: number[];
+  surface: number[];
+}> {
+  const src = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+  return page.evaluate(async (imageSource) => {
+    const loaded = new Image();
+    loaded.src = imageSource;
+    await loaded.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = loaded.naturalWidth;
+    canvas.height = loaded.naturalHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true })!;
+    context.drawImage(loaded, 0, 0);
+    const y = Math.floor(canvas.height / 2);
+    const sample = (x: number) => Array.from(context.getImageData(x, y, 1, 1).data.slice(0, 3));
+    return { innerWhite: sample(1), outerBlack: sample(4), surface: sample(8) };
+  }, src);
 }
 
 async function renderDenseGrid(context: BrowserContext): Promise<Page> {
@@ -625,11 +648,18 @@ describe("dense SessionGrid browser layout", () => {
           (line) => line.getBoundingClientRect(),
         );
         const surfaceStyle = getComputedStyle(thumb);
-        const renderedColors = [
-          surfaceStyle.color,
-          ...Array.from(tail.querySelectorAll<HTMLElement>('[style*="color"]')).map(
-            (span) => getComputedStyle(span).color,
-          ),
+        const renderedSamples = [
+          { foreground: surfaceStyle.color, background: surfaceStyle.backgroundColor, opacity: surfaceStyle.opacity },
+          ...Array.from(tail.querySelectorAll<HTMLElement>('[style*="color"]')).map((span) => {
+            const style = getComputedStyle(span);
+            return {
+              foreground: style.color,
+              background: style.backgroundColor === "rgba(0, 0, 0, 0)"
+                ? surfaceStyle.backgroundColor
+                : style.backgroundColor,
+              opacity: style.opacity,
+            };
+          }),
         ];
         return {
           sectionCount: sections.length,
@@ -650,7 +680,7 @@ describe("dense SessionGrid browser layout", () => {
           killTop: kill.getBoundingClientRect().top - head.getBoundingClientRect().top,
           killRight: head.getBoundingClientRect().right - kill.getBoundingClientRect().right,
           thumbBackground: surfaceStyle.backgroundColor,
-          renderedColors,
+          renderedSamples,
           thumbLineHeightRatio: Number.parseFloat(tailStyle.lineHeight) / Number.parseFloat(tailStyle.fontSize),
           thumbLinePitch: lineRects[1]!.top - lineRects[0]!.top,
           thumbLineHeight: Number.parseFloat(tailStyle.lineHeight),
@@ -681,8 +711,9 @@ describe("dense SessionGrid browser layout", () => {
       expect(denseChrome.killTop).toBe(0);
       expect(denseChrome.killRight).toBe(0);
       expect(denseChrome.thumbBackground).toBe("rgb(102, 102, 102)");
-      expect(denseChrome.renderedColors.length).toBeGreaterThanOrEqual(17);
-      expect(minimumContrast(denseChrome.renderedColors, denseChrome.thumbBackground)).toBeGreaterThanOrEqual(4.5);
+      expect(denseChrome.renderedSamples.length).toBeGreaterThanOrEqual(21);
+      expect(minimumContrast(denseChrome.renderedSamples)).toBeGreaterThanOrEqual(4.5);
+      expect(denseChrome.renderedSamples.every((sample) => sample.opacity === "1")).toBe(true);
       expect(denseChrome.thumbLineHeightRatio).toBeCloseTo(1.1, 2);
       expect(denseChrome.thumbLinePitch).toBeCloseTo(denseChrome.thumbLineHeight, 1);
       expect(denseChrome.copyMinWidth).toBe("44px");
@@ -697,24 +728,43 @@ describe("dense SessionGrid browser layout", () => {
       const focusedSurface = await openPreview.evaluate((element) => {
         const thumb = element.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
         const openStyle = getComputedStyle(element);
+        const surfaceStyle = getComputedStyle(thumb);
+        const focusStyle = getComputedStyle(element, "::after");
         return {
-          background: getComputedStyle(thumb).backgroundColor,
-          renderedColors: [
-            getComputedStyle(thumb).color,
-            ...Array.from(thumb.querySelectorAll<HTMLElement>('[style*="color"]')).map(
-              (span) => getComputedStyle(span).color,
-            ),
+          background: surfaceStyle.backgroundColor,
+          renderedSamples: [
+            { foreground: surfaceStyle.color, background: surfaceStyle.backgroundColor, opacity: surfaceStyle.opacity },
+            ...Array.from(thumb.querySelectorAll<HTMLElement>('[style*="color"]')).map((span) => {
+              const style = getComputedStyle(span);
+              return {
+                foreground: style.color,
+                background: style.backgroundColor === "rgba(0, 0, 0, 0)"
+                  ? surfaceStyle.backgroundColor
+                  : style.backgroundColor,
+                opacity: style.opacity,
+              };
+            }),
           ],
           outlineColor: openStyle.outlineColor,
           outlineWidth: openStyle.outlineWidth,
-          boxShadow: openStyle.boxShadow,
+          focusBoxShadow: focusStyle.boxShadow,
         };
       });
       expect(focusedSurface.background).toBe("rgb(17, 17, 17)");
-      expect(minimumContrast(focusedSurface.renderedColors, focusedSurface.background)).toBeGreaterThanOrEqual(4.5);
-      expect(focusedSurface.outlineColor).toBe("rgb(255, 255, 255)");
-      expect(focusedSurface.outlineWidth).toBe("3px");
-      expect(focusedSurface.boxShadow).toContain("rgb(17, 17, 17)");
+      expect(focusedSurface.renderedSamples.some((sample) => sample.opacity === "0.6")).toBe(true);
+      expect(focusedSurface.outlineWidth).toBe("0px");
+      expect(focusedSurface.focusBoxShadow).toContain("rgb(255, 255, 255)");
+      expect(focusedSurface.focusBoxShadow).toContain("rgb(17, 17, 17)");
+      await openPreview.locator('[data-testid="session-thumb"]').evaluate((thumb) => {
+        (thumb as HTMLElement).style.setProperty("--tbg", "#f5f5f5");
+      });
+      const ring = await focusRingPixels(page, await openPreview.screenshot({ animations: "disabled" }));
+      expect(ring.innerWhite.every((channel) => channel >= 250)).toBe(true);
+      expect(ring.outerBlack.every((channel) => channel >= 14 && channel <= 20)).toBe(true);
+      expect(ring.surface.every((channel) => channel >= 240)).toBe(true);
+      await openPreview.locator('[data-testid="session-thumb"]').evaluate((thumb) => {
+        (thumb as HTMLElement).style.setProperty("--tbg", "#111111");
+      });
       await openPreview.evaluate((element) => element.blur());
       await page.waitForTimeout(180);
       expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
@@ -736,6 +786,28 @@ describe("dense SessionGrid browser layout", () => {
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("forced-colors mode retains a painted keyboard focus indicator", async () => {
+    const context = await browser.newContext({
+      viewport: { width: 1200, height: 900 },
+      forcedColors: "active",
+    });
+    try {
+      const page = await renderDenseGrid(context);
+      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      await page.keyboard.press("Tab");
+      await openPreview.focus();
+      const forcedFocus = await openPreview.evaluate((element) => {
+        const style = getComputedStyle(element, "::after");
+        return { color: style.borderTopColor, style: style.borderTopStyle, width: style.borderTopWidth };
+      });
+      expect(forcedFocus.width).toBe("3px");
+      expect(forcedFocus.style).toBe("solid");
+      expect(forcedFocus.color).not.toBe("rgba(0, 0, 0, 0)");
     } finally {
       await context.close();
     }

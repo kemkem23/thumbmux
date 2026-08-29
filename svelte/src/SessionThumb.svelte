@@ -4,7 +4,7 @@
    * viewer) and renders the pane tail with the same ANSI renderer as
    * TermView, just tiny. Never sends keys or resizes the pane. */
   import { tmuxMux } from './ws-mux.svelte';
-  import { deriveThumbnailPalette } from './session-grid';
+  import { deriveThumbnailPalette, readableColorOn } from './session-grid';
   import { createSgrState, lineToHtml, type AnsiPalette } from '@thumbmux/core';
 
   let {
@@ -33,7 +33,8 @@
     : palette);
   let thumbPalette = $derived(deriveThumbnailPalette(renderPalette));
   let effectiveMaxLines = $derived(maxLines ?? (density === 'dense' ? 50 : 30));
-  let lines = $derived(renderLines(content, effectiveMaxLines, thumbPalette));
+  let contrastBackground = $derived(previewBackground ? thumbPalette.defaultBg : null);
+  let lines = $derived(renderLines(content, effectiveMaxLines, thumbPalette, contrastBackground));
   // SessionGrid rebuilds its metadata objects whenever a host snapshot changes.
   // Its retained keyed child can therefore invalidate the session prop getter
   // even when the returned name is unchanged. These primitive derived signals
@@ -73,7 +74,12 @@
   /** Advance SGR/OSC through the full tail first, then keep only the last
    * linesToKeep for display — otherwise a color/link opened in the discarded
    * +10 context lines is lost on the visible suffix (A6-19). */
-  function renderLines(raw: string, linesToKeep: number, renderPalette: AnsiPalette) {
+  function renderLines(
+    raw: string,
+    linesToKeep: number,
+    renderPalette: AnsiPalette,
+    previewContrastBackground: string | null,
+  ) {
     const lines = raw.replace(/\r/g, '').split('\n');
     const start = Math.max(0, lines.length - linesToKeep);
     const st = createSgrState();
@@ -82,7 +88,39 @@
     }
     return lines
       .slice(start)
-      .map((line) => lineToHtml(line, st, renderPalette) || '&nbsp;');
+      .map((line) => {
+        const html = lineToHtml(line, st, renderPalette);
+        return (previewContrastBackground
+          ? contrastSafeHtml(html, previewContrastBackground)
+          : html) || '&nbsp;';
+      });
+  }
+
+  /** The core renderer resolves 256-colour and truecolour SGR directly, so
+   * changing palette.base alone cannot make those foregrounds readable on a
+   * preview-only surface. Its style attributes contain sanitized colours;
+   * adjust each rendered foreground against its own SGR background (or the
+   * thumbnail surface when transparent) without changing the terminal model. */
+  function contrastSafeHtml(html: string, surfaceBackground: string): string {
+    return html.replace(/style="([^"]*)"/g, (attribute, declarations: string) => {
+      // SGR dim is opacity in the full terminal. At .6 opacity no foreground
+      // can reach 4.5:1 against this mid-gray surface, even pure black/white,
+      // so miniature previews keep its hue but omit only the dim opacity.
+      const legibleDeclarations = declarations
+        .split(';')
+        .filter((declaration) => declaration !== 'opacity:.6')
+        .join(';');
+      const foreground = /(?:^|;)color:(#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8})(?=;|$)/i.exec(legibleDeclarations);
+      if (!foreground?.[1] || foreground.index === undefined) return `style="${legibleDeclarations}"`;
+      const background = /(?:^|;)background-color:(#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8})(?=;|$)/i
+        .exec(legibleDeclarations)?.[1] ?? surfaceBackground;
+      const readable = readableColorOn(background, foreground[1]);
+      const colorOffset = foreground.index + foreground[0].lastIndexOf(foreground[1]);
+      const next = legibleDeclarations.slice(0, colorOffset)
+        + readable
+        + legibleDeclarations.slice(colorOffset + foreground[1].length);
+      return `style="${next}"`;
+    });
   }
 
   // A6-10: resubscribe when session or maxLines changes (not only on mount).
