@@ -142,6 +142,10 @@ cards. This pointer guard is intentional: a phone in landscape can exceed 768
 px and must still stay one full-width column. `showNew` defaults to `true`; set
 it to `false` only when the host exposes creation elsewhere.
 
+The inert read-only miniature and its full-size open button are sibling layers.
+That keeps the button as a stable mouse, touch and XR hit target even when a
+hover-exit repaints the miniature immediately before a press.
+
 ## What the hub does NOT give you
 
 ### Agent-state classification
