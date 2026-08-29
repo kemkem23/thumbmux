@@ -23,12 +23,14 @@
   } from './session-grid';
 
   const NEW_FOCUS_KEY = '__thumbmux_new__';
+  const DENSE_IDLE_BACKGROUND = '#666666';
 
   let {
     sessions,
     palette,
     onOpen,
     onNew,
+    onKill,
     newLabel = '+ terminal',
     emptyLabel = 'No sessions yet — start one',
     loading = false,
@@ -48,6 +50,7 @@
     showNew = true,
     copyNameLabel = 'Copy tmux session name',
     expandLabel = 'Expand terminal',
+    killLabel = 'Kill tmux session',
   }: SessionGridProps = $props();
 
   let gridEl = $state<HTMLDivElement | null>(null);
@@ -56,6 +59,8 @@
   let grouped = $state(false);
   let previousDefaultGrouped = $state<boolean | null>(null);
   let activeFocusKey = $state<string | null>(null);
+  let hoveredPreview = $state<string | null>(null);
+  let focusedPreview = $state<string | null>(null);
 
   let model = $derived(buildSessionGridModel(sessions, {
     filterValue,
@@ -188,6 +193,20 @@
   function copySessionName(name: string): void {
     void copyPlainText(name);
   }
+
+  function densePreviewBackground(name: string): string | undefined {
+    return hoveredPreview === name || focusedPreview === name
+      ? undefined
+      : DENSE_IDLE_BACKGROUND;
+  }
+
+  function leavePreview(name: string): void {
+    if (hoveredPreview === name) hoveredPreview = null;
+  }
+
+  function blurPreview(name: string): void {
+    if (focusedPreview === name) focusedPreview = null;
+  }
 </script>
 
 {#snippet denseCard(item: PreparedGridSession)}
@@ -202,34 +221,39 @@
     role="group"
     aria-label={item.session.name}
   >
-    <div class="dense-head" data-testid="grid-dense-head">
-      <button
-        type="button"
-        class="dense-name"
-        data-testid="grid-copy-name"
-        aria-label={`${copyNameLabel}: ${item.session.name}`}
-        onclick={() => copySessionName(item.session.name)}
-      >{item.session.name}</button>
-      {#if item.session.note}
-        <span class="dense-separator" aria-hidden="true">:</span>
-        <span class="dense-note" data-testid="grid-note">{item.session.note}</span>
+    <div class="dense-head" class:has-kill={!!onKill} data-testid="grid-dense-head">
+      <div class="dense-section dense-name-section" data-section="name">
+        <button
+          type="button"
+          class="dense-name"
+          data-testid="grid-copy-name"
+          aria-label={`${copyNameLabel}: ${item.session.name}`}
+          onclick={() => copySessionName(item.session.name)}
+        >{item.session.name}</button>
+      </div>
+      <div class="dense-section dense-note-section" data-section="note">
+        {#if item.session.note}
+          <span class="dense-note" data-testid="grid-note">{item.session.note}</span>
+        {/if}
+      </div>
+      <div class="dense-section dense-summary-section" data-section="summary">
+        {#if denseSummary(item.session)}
+          <span class="dense-summary" data-testid="grid-summary">{denseSummary(item.session)}</span>
+        {/if}
+      </div>
+      {#if onKill}
+        <button
+          type="button"
+          class="dense-kill"
+          data-testid="grid-kill"
+          aria-label={`${killLabel}: ${item.session.name}`}
+          title={`${killLabel}: ${item.session.name}`}
+          onclick={(event) => {
+            event.stopPropagation();
+            onKill?.(item.session.name);
+          }}
+        ><span aria-hidden="true">×</span></button>
       {/if}
-      {#if denseSummary(item.session)}
-        <span class="dense-separator" aria-hidden="true">:</span>
-        <span class="dense-summary" data-testid="grid-summary">{denseSummary(item.session)}</span>
-      {/if}
-      <span class="dense-separator" aria-hidden="true">:</span>
-      <button
-        type="button"
-        class="dense-expand"
-        onclick={() => onOpen(item.session.name)}
-        onfocus={() => (activeFocusKey = item.session.name)}
-        tabindex={tabIndexFor(item.session.name)}
-        aria-label={`${expandLabel}: ${item.session.name}`}
-        data-testid="grid-expand"
-        data-session={item.session.name}
-        data-focus-key={item.session.name}
-      >↗</button>
     </div>
     {#if item.session.state}
       <div class={stateClass(item.session.state)} data-testid="grid-state" data-state={item.session.state}>
@@ -240,13 +264,30 @@
         {/if}
       </div>
     {/if}
-    <div class="live">
+    <button
+      type="button"
+      class="live dense-open"
+      onclick={() => onOpen(item.session.name)}
+      onpointerenter={() => (hoveredPreview = item.session.name)}
+      onpointerleave={() => leavePreview(item.session.name)}
+      onfocus={() => {
+        activeFocusKey = item.session.name;
+        focusedPreview = item.session.name;
+      }}
+      onblur={() => blurPreview(item.session.name)}
+      tabindex={tabIndexFor(item.session.name)}
+      aria-label={`${expandLabel}: ${item.session.name}`}
+      data-testid="grid-expand"
+      data-session={item.session.name}
+      data-focus-key={item.session.name}
+    >
       <SessionThumb
         session={item.session.name}
         palette={item.session.palette ?? palette}
         density="dense"
+        previewBackground={densePreviewBackground(item.session.name)}
       />
-    </div>
+    </button>
   </div>
 {/snippet}
 
@@ -583,58 +624,59 @@
     z-index: 1;
   }
   .dense-head {
-    display: flex;
-    align-items: center;
-    align-content: center;
-    flex-wrap: wrap;
-    gap: 0 4px;
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 0;
     min-width: 0;
-    min-height: 44px;
-    padding: 2px 4px;
-    border-bottom: 1px solid var(--accent);
+    height: 72px;
+    padding: 0;
+    border-bottom: 1px solid var(--hub-dense-divider, #9b9590);
     background: var(--hub-card, #ffffff);
     color: var(--hub-ink, #1a1a1a);
     font: 600 12px/1.7 var(--font-mono, ui-monospace, monospace);
     z-index: 1;
   }
-  .dense-name,
-  .dense-expand {
+  .dense-section {
+    min-width: 0;
+    min-height: 0;
+    box-sizing: border-box;
+    padding: 4px 6px;
+    overflow: hidden;
+    color: var(--hub-ink, #1a1a1a);
+  }
+  .dense-section + .dense-section {
+    border-inline-start: 1px solid var(--hub-dense-divider, #9b9590);
+  }
+  .dense-name-section {
+    padding: 0;
+  }
+  .dense-name {
+    width: 100%;
+    height: 100%;
+    min-width: 44px;
     min-height: 44px;
+    box-sizing: border-box;
     border: 0;
     border-radius: 0;
     background: transparent;
     color: var(--hub-ink, #1a1a1a);
-    font: inherit;
+    font: 700 12px/1.4 var(--font-mono, ui-monospace, monospace);
     cursor: pointer;
     touch-action: manipulation;
-  }
-  .dense-name {
-    min-width: 44px;
-    max-width: 100%;
-    padding: 0;
-    font-weight: 700;
+    padding: 4px 6px;
     text-align: left;
     white-space: normal;
     overflow-wrap: anywhere;
   }
-  .dense-expand {
-    flex: 0 0 44px;
-    width: 44px;
-    padding: 0;
-    color: var(--accent);
-  }
-  .dense-name:focus-visible,
-  .dense-expand:focus-visible {
+  .dense-name:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
-  .dense-separator {
-    flex: 0 0 auto;
-    color: var(--accent);
-    font-weight: 700;
-  }
   .dense-note,
   .dense-summary {
+    width: 100%;
     min-width: 0;
     max-width: 100%;
     overflow-wrap: anywhere;
@@ -644,19 +686,48 @@
     line-height: 1.7;
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-  .dense-note {
-    flex: 0 1 auto;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    color: var(--hub-ink2, #6b6560);
-  }
-  .dense-summary {
-    flex: 1 1 180px;
     -webkit-line-clamp: 3;
     line-clamp: 3;
+    overflow: hidden;
     color: var(--hub-ink, #1a1a1a);
+  }
+  .dense-note {
+    font-weight: 500;
+  }
+  .dense-summary {
+    font-weight: 600;
+  }
+  .dense-head.has-kill .dense-summary-section {
+    padding-inline-end: 48px;
+  }
+  .dense-kill {
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-end: 0;
+    z-index: 2;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-inline-start: 1px solid var(--hub-dense-divider, #9b9590);
+    border-block-end: 1px solid var(--hub-dense-divider, #9b9590);
+    border-radius: 0;
+    background: var(--hub-card, #ffffff);
+    color: var(--hub-ink, #1a1a1a);
+    font: 400 24px/1 var(--font-mono, ui-monospace, monospace);
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .dense-kill:hover,
+  .dense-kill:active {
+    background: var(--hub-ink, #1a1a1a);
+    color: var(--hub-card, #ffffff);
+  }
+  .dense-kill:focus-visible {
+    outline: 3px solid var(--hub-ink, #1a1a1a);
+    outline-offset: -3px;
   }
   .dense-card .state {
     min-height: 20px;
@@ -669,7 +740,46 @@
     box-shadow: none;
   }
   .dense-card .live {
-    border-top: 1px solid var(--hub-line, #d8d2c8);
+    border-top: 0;
+  }
+  .dense-open {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    appearance: none;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .dense-open:focus-visible {
+    z-index: 2;
+    outline: 0;
+  }
+  .dense-open:focus-visible::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    box-sizing: border-box;
+    pointer-events: none;
+    box-shadow: inset 0 0 0 3px #ffffff, inset 0 0 0 6px #111111;
+  }
+  @media (forced-colors: active) {
+    .dense-open:focus-visible {
+      outline: 0;
+    }
+    .dense-open:focus-visible::after {
+      border: 3px solid CanvasText;
+      box-shadow: none;
+    }
   }
   .subtitle {
     padding: 5px 9px 0;

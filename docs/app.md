@@ -382,6 +382,7 @@ supply the read functions and callbacks as one coherent adapter.
 | `theme.onPick` | With no `theme` block the shell stores the selected background. With a block but no callback, swatch selection is a no-op. | `onPick: (session, hex) => { backgrounds[session] = hex; }` |
 | `theme.onReset` | With no `theme` block the shell restores `defaultBg`. With a block but no callback, Reset is a no-op. | `onReset: (session) => { delete backgrounds[session]; }` |
 | `labels` | Shallow-merges with `DEFAULT_APP_LABELS`. Every omitted established key keeps its stock English value; function-valued labels such as `hubCount` and `terminalAria` remain functions. The Bash disclosure and its package-owned flyout use the terse stock labels `BASH`, `SHOW`, `HIDE`, and `DISTILL`; `sessionPresentation.actions` may still place or relabel the BASH trigger, while the mutually-exclusive choices remain outside the frozen `FabAction` adapter type. | `labels: { hubTitle: "SESSIONS" }` |
+| `killSession` | Opt-in dense-hub × action. The host confirms, performs the destructive mutation, reports errors, and refreshes the list; omission renders no kill control. | `killSession: confirmAndKill` |
 
 The standalone `TermView` Claude Bash detector/projection types and helpers are
 **experimental** (`X` contract tier): Claude Code controls the painted terminal

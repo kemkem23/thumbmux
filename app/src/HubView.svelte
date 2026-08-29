@@ -192,6 +192,7 @@
     {palette}
     onOpen={openSession}
     onNew={openLauncher}
+    onKill={adapters.killSession}
     newLabel={labels.gridNew}
     emptyLabel={labels.gridEmpty}
     loading={!sessionsLoaded}
@@ -202,6 +203,7 @@
     searchPlaceholder={labels.gridSearchPlaceholder}
     groupToggleLabel={labels.gridGroup}
     ungroupedLabel={labels.gridUngrouped}
+    killLabel={hubPresentation?.killLabel}
     filterOptions={hubPresentation?.filterOptions}
     groupable={hubPresentation?.groupable}
     order={hubPresentation?.order}

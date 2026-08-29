@@ -228,6 +228,7 @@ describe('HubView', () => {
   });
 
   test('forwards host hub presentation options to the grid and launcher', async () => {
+    const killed: string[] = [];
     const adapters = {
       fetchSessions: async () => [
         session('older-session'),
@@ -244,12 +245,14 @@ describe('HubView', () => {
       })),
       spawn: { presets: [preset] },
       theme: { mode: () => 'dark' as const },
+      killSession: (name: string) => { killed.push(name); },
       hubPresentation: {
         filterOptions: [{ value: 'tool', label: 'TOOL' }],
         groupable: true,
         order: 'recent' as const,
         showCommand: false,
         cardLayout: 'dense' as const,
+        killLabel: 'End tmux session',
       },
     } satisfies AppAdapters;
     const { target } = mountHub({ adapters });
@@ -271,6 +274,7 @@ describe('HubView', () => {
       commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
       darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
       denseCard: target.querySelector('[data-testid="grid-dense-head"]') !== null,
+      killControl: target.querySelector('[data-testid="grid-kill"]') !== null,
     }).toEqual({
       filterValues: ['', 'tool'],
       groupable: true,
@@ -278,7 +282,14 @@ describe('HubView', () => {
       commandPreview: false,
       darkLauncher: true,
       denseCard: true,
+      killControl: true,
     });
+
+    click(target, '[data-testid="grid-card"][data-session="newer-session"] [data-testid="grid-kill"]');
+    expect(killed).toEqual(['newer-session']);
+    expect(target.querySelector('[data-testid="grid-kill"]')?.getAttribute('aria-label')).toBe(
+      'End tmux session: newer-session',
+    );
   });
 
   test('retains every hub presentation default when the host supplies no options', async () => {
@@ -316,6 +327,7 @@ describe('HubView', () => {
       commandPreview: target.querySelector('[data-testid="launch-command"]') !== null,
       darkLauncher: target.querySelector('[data-testid="launch-sheet"]')?.classList.contains('dark'),
       denseCard: target.querySelector('[data-testid="grid-dense-head"]') !== null,
+      killControl: target.querySelector('[data-testid="grid-kill"]') !== null,
     }).toEqual({
       filterValues: [],
       groupable: false,
@@ -323,6 +335,7 @@ describe('HubView', () => {
       commandPreview: true,
       darkLauncher: false,
       denseCard: false,
+      killControl: false,
     });
   });
 

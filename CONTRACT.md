@@ -344,9 +344,20 @@ The lower-level dense Svelte presentation is additive as well:
   cards, so coarse-pointer mobile landscape remains full-width.
 - `SessionThumb density="dense"` uses a 50-line visible window and requests 60
   lines for ANSI context. Omission retains the 30-line visible window and
-  40-line subscription.
-- Dense names and expand buttons are independent controls. The deterministic
-  hooks are `grid-copy-name` / `grid-expand` and `hud-copy-title` /
+  40-line subscription. Optional `previewBackground` changes the preview palette
+  as one unit: default foreground, ANSI 0–15, indexed 16–255 and truecolour
+  foregrounds are contrast-derived against their rendered background rather
+  than repainting the preview surface alone. Dense thumbnails preserve an SGR
+  dim colour but omit its opacity only while a preview background is active,
+  because no .6-alpha foreground can meet 4.5:1 on the mid-gray idle surface;
+  the original dim opacity returns with the terminal background on interaction.
+- Dense headers reserve three equal sections for name, note and summary, with
+  empty host-owned fields retaining their section instead of shifting the
+  layout. Optional `onKill` adds a 44px corner control without changing those
+  three tracks; confirmation, errors and the destructive mutation remain the
+  host's responsibility. The name and terminal preview are independent controls: the preview
+  owns the session-open action and the name remains copy-only. The deterministic
+  hooks remain `grid-copy-name` / `grid-expand` and `hud-copy-title` /
   `hud-expand`; copying never opens a session or toggles the HUD.
 
 ## Deprecation policy
