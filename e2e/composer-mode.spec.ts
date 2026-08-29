@@ -5,6 +5,7 @@
  */
 import { expect, test } from '@playwright/test';
 import {
+  capturePane,
   createShellSession,
   killSession,
   makeSessionName,
@@ -63,6 +64,56 @@ test('omitted composerMode keeps stock COMPOSE (textarea + COMPOSE chip on)', as
 
     await page.screenshot({
       path: testInfo.outputPath('composer-mode-default-compose.png'),
+      fullPage: true,
+    });
+  } finally {
+    await context.close();
+    killSession(session);
+  }
+});
+
+test('COMPOSE SEND stays open and focused for the next message', async ({ browser }, testInfo) => {
+  const session = makeSessionName(testInfo, 'compose-focus');
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 740 },
+    isMobile: true,
+    hasTouch: true,
+  });
+  const page = await context.newPage();
+  try {
+    createShellSession(session);
+    await openSession(page, session);
+
+    await page.getByTestId('mtv').click();
+    const sheet = page.getByTestId('input-sheet');
+    const textarea = sheet.locator('textarea');
+    const send = sheet.getByRole('button', { name: 'SEND' });
+    const firstMarker = `compose-focus-first-${Date.now().toString(36)}`;
+    const secondMarker = `compose-focus-second-${Date.now().toString(36)}`;
+
+    await textarea.fill(`printf '%s\\n' '${firstMarker}'`);
+    await send.click();
+
+    await expect(sheet).toHaveClass(/open/);
+    await expect(textarea).toHaveValue('');
+    await expect(textarea).toBeFocused();
+    await page.waitForTimeout(500);
+    await expect(textarea).toBeFocused();
+    await expect.poll(() => capturePane(session, -80)).toContain(firstMarker);
+
+    // Type the second command through the still-active textarea without a
+    // click. Enter must preserve the same ready-for-next-message contract.
+    await page.keyboard.type(`printf '%s\\n' '${secondMarker}'`);
+    await expect(textarea).toHaveValue(`printf '%s\\n' '${secondMarker}'`);
+    await page.keyboard.press('Enter');
+
+    await expect(sheet).toHaveClass(/open/);
+    await expect(textarea).toHaveValue('');
+    await expect(textarea).toBeFocused();
+    await expect.poll(() => capturePane(session, -80)).toContain(secondMarker);
+
+    await page.screenshot({
+      path: testInfo.outputPath('composer-send-stays-focused.png'),
       fullPage: true,
     });
   } finally {

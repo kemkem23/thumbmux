@@ -176,11 +176,19 @@
 
   function sendCompose() {
     const v = text.trim();
-    if (!v) return;
-    onSend(v);
-    text = '';
-    if (composeEl) composeEl.style.height = 'auto';
-    closeDock();
+    try {
+      if (!v) return;
+      onSend(v);
+      text = '';
+      if (composeEl) composeEl.style.height = 'auto';
+    } finally {
+      // Keep COMPOSE ready for the next message. A pointer click moves focus to
+      // SEND before this handler runs, so focus the textarea synchronously while
+      // the user-gesture stack is still active; deferred focus would not keep
+      // the iOS keyboard raised. `finally` also restores focus if a host rejects
+      // a submission synchronously, without clearing that failed draft.
+      composeEl?.focus({ preventScroll: true });
+    }
   }
 
   function autoGrow() {
