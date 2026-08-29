@@ -344,7 +344,8 @@ The lower-level dense Svelte presentation is additive as well:
   cards, so coarse-pointer mobile landscape remains full-width.
 - `SessionThumb density="dense"` uses a 50-line visible window and requests 60
   lines for ANSI context. Omission retains the 30-line visible window and
-  40-line subscription. Optional `previewBackground` changes the preview palette
+  40-line subscription. Optional `previewBackground` accepts an opaque six-digit
+  `#rrggbb` value (not shorthand or alpha) and changes the preview palette
   as one unit: default foreground, ANSI 0–15, indexed 16–255 and truecolour
   foregrounds are contrast-derived against their rendered background rather
   than repainting the preview surface alone. Dense thumbnails preserve an SGR
