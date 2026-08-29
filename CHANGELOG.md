@@ -1,7 +1,18 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.7-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.8-dist`.
+
+## v0.18.8 — 2026-08-29
+
+### Changed
+
+- **COMPOSE stays open and ready after SEND.** Submitting by button or Enter
+  clears the sent draft, keeps the dock in place, and restores textarea focus
+  synchronously so the next message can be typed without another tap and an
+  iOS software keyboard can remain raised. A synchronous host rejection keeps
+  the draft and still restores focus; IME composition and DIRECT mode retain
+  their existing behavior.
 
 ## v0.18.7 — 2026-08-28
 

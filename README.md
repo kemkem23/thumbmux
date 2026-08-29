@@ -136,8 +136,9 @@ exports are experimental because the upstream terminal layout may change; see
 
 With the documented bottom-inset wiring, the composer **docks**: the viewport
 shrinks by the reported sheet height and springs back. ComposerDock does not
-resize the pty for a transient overlay. Prefer raw? **DIRECT mode** holds focus
-in an invisible input so the OS keyboard drives the pane
+resize the pty for a transient overlay. In **COMPOSE**, SEND clears the draft
+but leaves the dock open and the textarea focused for the next message. Prefer
+raw? **DIRECT mode** holds focus in an invisible input so the OS keyboard drives the pane
 keystroke-by-keystroke, Thai IME included.
 
 ### One-tap shortcuts, notes, uploads

@@ -93,12 +93,9 @@ describe("A6-2 ComposerDock isComposing", () => {
     });
     expect(sent).toEqual(["partial-ime"]);
 
-    // Restore draft and re-open compose field after sendCompose closed the dock
-    text = "still-composing";
+    // Use a fresh dock so the IME assertion is independent of the control
+    // submission's cleared draft while preserving the keep-open contract.
     sent.length = 0;
-    // open may have been set false by sendCompose — force open again via prop if needed
-    const sheet = target.querySelector('[data-testid="input-sheet"]');
-    // Re-mount a fresh dock for the composition case so closed state cannot mask it
     while (mounted.length > 0) {
       const entry = mounted.pop()!;
       try {
@@ -132,7 +129,6 @@ describe("A6-2 ComposerDock isComposing", () => {
     flushSync(() => ta2.dispatchEvent(ev));
 
     expect(sent).toEqual([]);
-    void sheet;
   });
 
   test("DIRECT input/keydown during composition does not relay", async () => {
