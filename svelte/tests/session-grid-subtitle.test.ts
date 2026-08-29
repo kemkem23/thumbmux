@@ -103,7 +103,7 @@ describe("dense grid card metadata", () => {
     expect(target.querySelector('[data-testid="grid-summary"]')).toBeNull();
   });
 
-  test("renders note and summary as text, copies name, opens separately, and can hide new", async () => {
+  test("renders balanced dense sections, copies the name, opens from the preview, and can hide new", async () => {
     const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     let copied = "";
     const opened: string[] = [];
@@ -127,7 +127,14 @@ describe("dense grid card metadata", () => {
       await tick();
 
       const card = target.querySelector<HTMLElement>('[data-testid="grid-card"]')!;
+      const head = card.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
       expect(card.tagName).toBe("DIV");
+      expect(Array.from(head.querySelectorAll<HTMLElement>(':scope > .dense-section')).map(
+        (section) => section.dataset.section,
+      )).toEqual(["name", "note", "summary"]);
+      expect(head.querySelector('[data-testid="grid-expand"]')).toBeNull();
+      expect(head.textContent).not.toContain("↗");
+      expect(head.querySelector('.dense-separator')).toBeNull();
       expect(card.querySelector('[data-testid="grid-note"]')!.textContent).toBe(
         "โน้ต <b>ต้องเป็น text</b>",
       );
@@ -139,10 +146,14 @@ describe("dense grid card metadata", () => {
       expect(target.querySelector('[data-testid="grid-new"]')).toBeNull();
 
       const copy = card.querySelector<HTMLButtonElement>('[data-testid="grid-copy-name"]')!;
+      const openPreview = card.querySelector<HTMLButtonElement>('[data-testid="grid-expand"]')!;
       const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
       const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
       expect(getComputedStyle(copy).minWidth).toBe("44px");
-      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
+      expect(openPreview.tagName).toBe("BUTTON");
+      expect(openPreview.classList.contains("dense-open")).toBe(true);
+      expect(openPreview.querySelector('[data-testid="session-thumb"]')).not.toBeNull();
+      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
       expect(getComputedStyle(summary).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
 
       flushSync(() => {
@@ -153,7 +164,7 @@ describe("dense grid card metadata", () => {
       expect(opened).toEqual([]);
 
       flushSync(() => {
-        card.querySelector<HTMLButtonElement>('[data-testid="grid-expand"]')!.click();
+        openPreview.click();
       });
       expect(opened).toEqual(["alpha-dense-1"]);
       expect(copied).toBe("alpha-dense-1");

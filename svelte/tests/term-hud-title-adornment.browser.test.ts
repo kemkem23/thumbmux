@@ -13,8 +13,9 @@
  * measurement taken while the collapse rule is neutralized by a stylesheet
  * override — if the harness were not really laying out, the control could not
  * reproduce the crush, and the test would fail rather than pass vacuously.
- * SessionThumb alone is stubbed because its wire/ANSI behavior has dedicated
- * tests; the real SessionGrid markup and CSS still own every measured card.
+ * SessionThumb's transport alone is stubbed because wire/ANSI behavior has
+ * dedicated tests; the real SessionGrid and SessionThumb markup/CSS own every
+ * measured surface.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
@@ -33,11 +34,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sveltePlugin: import("bun").BunPlugin = {
   name: "thumbmux-svelte-browser",
   setup(build) {
+    build.onLoad({ filter: /ws-mux\.svelte\.ts$/ }, () => ({
+      contents: "export const tmuxMux = { subscribe(_session, callback) { callback('ไทย e2e\\n└─ dense preview', 'full'); return () => {}; } };",
+      loader: "js",
+    }));
     build.onLoad({ filter: /\.svelte$/ }, (args) => {
-      const source = args.path.endsWith("/SessionThumb.svelte")
-        ? `<script>let { density = 'default' } = $props();</script>
-           <div data-testid="session-thumb" class:dense={density === 'dense'}><div class="tail"></div></div>`
-        : readFileSync(args.path, "utf8");
+      const source = readFileSync(args.path, "utf8");
       return {
       contents: compile(source, {
         filename: args.path,
@@ -576,12 +578,36 @@ describe("dense SessionGrid browser layout", () => {
       expect(await page.locator('[data-testid="grid-summary"]').count()).toBe(2);
       expect(await page.locator('[data-testid="session-thumb"].dense').count()).toBe(2);
       const denseChrome = await page.locator('[data-testid="grid-card"]').first().evaluate((card) => {
+        const head = card.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
+        const sections = Array.from(head.querySelectorAll<HTMLElement>(':scope > .dense-section'));
         const copy = card.querySelector<HTMLElement>('[data-testid="grid-copy-name"]')!;
         const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
         const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
+        const open = card.querySelector<HTMLElement>('[data-testid="grid-expand"]')!;
+        const thumb = card.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const tail = thumb.querySelector<HTMLElement>('.tail')!;
         const noteStyle = getComputedStyle(note);
         const summaryStyle = getComputedStyle(summary);
+        const tailStyle = getComputedStyle(tail);
+        const lineRects = Array.from(tail.querySelectorAll<HTMLElement>('.mtv-line')).map(
+          (line) => line.getBoundingClientRect(),
+        );
         return {
+          sectionCount: sections.length,
+          sectionNames: sections.map((section) => section.dataset.section),
+          sectionWidths: sections.map((section) => section.getBoundingClientRect().width),
+          sectionDividerWidths: sections.slice(1).map((section) => getComputedStyle(section).borderLeftWidth),
+          sectionDividerColors: sections.slice(1).map((section) => getComputedStyle(section).borderLeftColor),
+          sectionColors: sections.map((section) => getComputedStyle(section).color),
+          headHeight: head.getBoundingClientRect().height,
+          headContainsOpen: head.contains(open),
+          headText: head.textContent ?? "",
+          openTag: open.tagName,
+          openContainsThumb: open.contains(thumb),
+          thumbBackground: getComputedStyle(thumb).backgroundColor,
+          thumbLineHeightRatio: Number.parseFloat(tailStyle.lineHeight) / Number.parseFloat(tailStyle.fontSize),
+          thumbLinePitch: lineRects[1]!.top - lineRects[0]!.top,
+          thumbLineHeight: Number.parseFloat(tailStyle.lineHeight),
           copyMinWidth: getComputedStyle(copy).minWidth,
           noteLineClamp: noteStyle.getPropertyValue("-webkit-line-clamp"),
           noteHeight: note.clientHeight,
@@ -591,12 +617,43 @@ describe("dense SessionGrid browser layout", () => {
           summaryLineHeight: Number.parseFloat(summaryStyle.lineHeight),
         };
       });
+      expect(denseChrome.sectionCount).toBe(3);
+      expect(denseChrome.sectionNames).toEqual(["name", "note", "summary"]);
+      expect(Math.max(...denseChrome.sectionWidths) - Math.min(...denseChrome.sectionWidths)).toBeLessThan(1);
+      expect(denseChrome.sectionDividerWidths).toEqual(["1px", "1px"]);
+      expect(denseChrome.sectionDividerColors).toEqual(["rgb(155, 149, 144)", "rgb(155, 149, 144)"]);
+      expect(new Set(denseChrome.sectionColors).size).toBe(1);
+      expect(denseChrome.headHeight).toBe(72);
+      expect(denseChrome.headContainsOpen).toBe(false);
+      expect(denseChrome.headText).not.toContain("↗");
+      expect(denseChrome.openTag).toBe("BUTTON");
+      expect(denseChrome.openContainsThumb).toBe(true);
+      expect(denseChrome.thumbBackground).toBe("rgb(102, 102, 102)");
+      expect(denseChrome.thumbLineHeightRatio).toBeCloseTo(1.1, 2);
+      expect(denseChrome.thumbLinePitch).toBeCloseTo(denseChrome.thumbLineHeight, 1);
       expect(denseChrome.copyMinWidth).toBe("44px");
-      expect(denseChrome.noteLineClamp).toBe("2");
-      expect(denseChrome.noteHeight).toBeLessThanOrEqual(denseChrome.noteLineHeight * 2 + 1);
+      expect(denseChrome.noteLineClamp).toBe("3");
+      expect(denseChrome.noteHeight).toBeLessThanOrEqual(denseChrome.noteLineHeight * 3 + 1);
       expect(denseChrome.summaryLineClamp).toBe("3");
       expect(denseChrome.summaryHeight).toBeLessThanOrEqual(denseChrome.summaryLineHeight * 3 + 1);
-      await page.locator('[data-testid="grid-expand"]').first().click();
+
+      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      await openPreview.focus();
+      await page.waitForTimeout(180);
+      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(17, 17, 17)");
+      await openPreview.evaluate((element) => element.blur());
+      await page.waitForTimeout(180);
+      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(102, 102, 102)");
+      await openPreview.hover();
+      await page.waitForTimeout(180);
+      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(17, 17, 17)");
+      await openPreview.click();
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
@@ -620,6 +677,47 @@ describe("dense SessionGrid browser layout", () => {
       expect(cards[0]!.height).toBe(844);
       expect(cards[1]!.top - cards[0]!.top).toBe(852);
       expect(cards[0]!.pageWidth).toBeLessThanOrEqual(cards[0]!.viewportWidth);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("phone portrait keeps three equal metadata sections and a full preview target", async () => {
+    const context = await browser.newContext({
+      viewport: { width: 320, height: 700 },
+      isMobile: true,
+      hasTouch: true,
+    });
+    try {
+      const page = await renderDenseGrid(context);
+      const card = page.locator('[data-testid="grid-card"]').first();
+      const metrics = await card.evaluate((element) => {
+        const head = element.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
+        const sections = Array.from(head.querySelectorAll<HTMLElement>(':scope > .dense-section'));
+        const open = element.querySelector<HTMLElement>('[data-testid="grid-expand"]')!;
+        const thumb = element.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const cardRect = element.getBoundingClientRect();
+        const openRect = open.getBoundingClientRect();
+        return {
+          cardWidth: cardRect.width,
+          cardHeight: cardRect.height,
+          headHeight: head.getBoundingClientRect().height,
+          sectionWidths: sections.map((section) => section.getBoundingClientRect().width),
+          openWidth: openRect.width,
+          openHeight: openRect.height,
+          thumbBackground: getComputedStyle(thumb).backgroundColor,
+          pageWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
+        };
+      });
+      expect(metrics.cardWidth).toBe(320);
+      expect(metrics.cardHeight).toBe(320);
+      expect(metrics.headHeight).toBe(72);
+      expect(Math.max(...metrics.sectionWidths) - Math.min(...metrics.sectionWidths)).toBeLessThan(1);
+      expect(metrics.openWidth).toBe(metrics.cardWidth - 2);
+      expect(metrics.openHeight).toBe(metrics.cardHeight - metrics.headHeight - 2);
+      expect(metrics.thumbBackground).toBe("rgb(102, 102, 102)");
+      expect(metrics.pageWidth).toBeLessThanOrEqual(metrics.viewportWidth);
     } finally {
       await context.close();
     }

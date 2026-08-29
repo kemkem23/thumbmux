@@ -345,8 +345,11 @@ The lower-level dense Svelte presentation is additive as well:
 - `SessionThumb density="dense"` uses a 50-line visible window and requests 60
   lines for ANSI context. Omission retains the 30-line visible window and
   40-line subscription.
-- Dense names and expand buttons are independent controls. The deterministic
-  hooks are `grid-copy-name` / `grid-expand` and `hud-copy-title` /
+- Dense headers reserve three equal sections for name, note and summary, with
+  empty host-owned fields retaining their section instead of shifting the
+  layout. The name and terminal preview are independent controls: the preview
+  owns the session-open action and the name remains copy-only. The deterministic
+  hooks remain `grid-copy-name` / `grid-expand` and `hud-copy-title` /
   `hud-expand`; copying never opens a session or toggles the HUD.
 
 ## Deprecation policy

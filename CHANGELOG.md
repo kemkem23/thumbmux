@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.8-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.9-dist`.
+
+## v0.18.9 — 2026-08-29
+
+### Changed
+
+- **Dense session cards open from the terminal preview instead of a small
+  arrow.** The name remains an independent copy target, while name, note and
+  summary now occupy three equal header sections with neutral dividers. The
+  preview uses a gray idle surface, restores the terminal background on hover,
+  keyboard focus or press, and retains its read-only thumbnail behavior.
+- **Dense terminal previews fit more output without changing their font size.**
+  Row leading is reduced from 1.22 to 1.10 while matching the pinned Unicode
+  cell boxes to the same pitch.
 
 ## v0.18.8 — 2026-08-29
 

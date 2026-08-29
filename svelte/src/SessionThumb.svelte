@@ -129,7 +129,7 @@
     overflow: hidden;
     contain: layout paint;
     container-type: inline-size;
-    background: var(--tbg);
+    background: var(--thumb-preview-bg, var(--tbg));
     color: var(--tfg);
     font-family: var(--font-mono, ui-monospace, monospace);
     pointer-events: none;
@@ -152,7 +152,7 @@
     bottom: 2px;
     font-size: 6px;
     font-size: clamp(6px, 2cqw, 10px);
-    line-height: 1.22;
+    line-height: 1.1;
     -webkit-mask-image: none;
     mask-image: none;
   }
@@ -183,7 +183,7 @@
   .thumb.dense .tail :global(.mtv-w1),
   .thumb.dense .tail :global(.mtv-w2),
   .thumb.dense .tail :global(.mtv-wx) {
-    height: 1.22em;
+    height: 1.1em;
   }
   .tail :global(.mtv-w1) {
     width: var(--mtv-cw, 1ch);
