@@ -11,7 +11,9 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.18.9-dist`.
   arrow.** The name remains an independent copy target, while name, note and
   summary now occupy three equal header sections with neutral dividers. The
   preview uses a gray idle surface, restores the terminal background on hover,
-  keyboard focus or press, and retains its read-only thumbnail behavior.
+  keyboard focus or press, and retains its read-only thumbnail behavior. Hosts
+  can add a separate 44px × control at the card's top-right for a confirmed
+  session kill without shrinking the three header tracks.
 - **Dense terminal previews fit more output without changing their font size.**
   Row leading is reduced from 1.22 to 1.10 while matching the pinned Unicode
   cell boxes to the same pitch.

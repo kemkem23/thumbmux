@@ -48,6 +48,9 @@ export type SessionGridProps = {
   palette: AnsiPalette;
   onOpen: (name: string) => void;
   onNew: () => void;
+  /** Optional host-owned destructive action shown as a corner control on
+   * dense cards. Confirmation, mutation errors and refresh stay host-owned. */
+  onKill?: (name: string) => void | Promise<void>;
   newLabel?: string;
   emptyLabel?: string;
 
@@ -75,6 +78,7 @@ export type SessionGridProps = {
   /** Accessible labels for dense card controls. */
   copyNameLabel?: string;
   expandLabel?: string;
+  killLabel?: string;
 };
 
 export type DisplaySessionName = {

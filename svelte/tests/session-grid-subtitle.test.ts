@@ -107,6 +107,7 @@ describe("dense grid card metadata", () => {
     const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     let copied = "";
     const opened: string[] = [];
+    const killed: string[] = [];
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: async (text: string) => { copied = text; } },
@@ -122,6 +123,7 @@ describe("dense grid card metadata", () => {
           cardLayout: "dense",
           showNew: false,
           onOpen: (name: string) => opened.push(name),
+          onKill: (name: string) => killed.push(name),
         },
       );
       await tick();
@@ -147,12 +149,15 @@ describe("dense grid card metadata", () => {
 
       const copy = card.querySelector<HTMLButtonElement>('[data-testid="grid-copy-name"]')!;
       const openPreview = card.querySelector<HTMLButtonElement>('[data-testid="grid-expand"]')!;
+      const kill = card.querySelector<HTMLButtonElement>('[data-testid="grid-kill"]')!;
       const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
       const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
       expect(getComputedStyle(copy).minWidth).toBe("44px");
       expect(openPreview.tagName).toBe("BUTTON");
       expect(openPreview.classList.contains("dense-open")).toBe(true);
       expect(openPreview.querySelector('[data-testid="session-thumb"]')).not.toBeNull();
+      expect(kill.textContent).toBe("×");
+      expect(head.contains(kill)).toBe(true);
       expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
       expect(getComputedStyle(summary).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
 
@@ -168,6 +173,12 @@ describe("dense grid card metadata", () => {
       });
       expect(opened).toEqual(["alpha-dense-1"]);
       expect(copied).toBe("alpha-dense-1");
+
+      flushSync(() => {
+        kill.click();
+      });
+      expect(killed).toEqual(["alpha-dense-1"]);
+      expect(opened).toEqual(["alpha-dense-1"]);
     } finally {
       if (clipboardDescriptor) {
         Object.defineProperty(navigator, "clipboard", clipboardDescriptor);

@@ -35,7 +35,10 @@ const sveltePlugin: import("bun").BunPlugin = {
   name: "thumbmux-svelte-browser",
   setup(build) {
     build.onLoad({ filter: /ws-mux\.svelte\.ts$/ }, () => ({
-      contents: "export const tmuxMux = { subscribe(_session, callback) { callback('ไทย e2e\\n└─ dense preview', 'full'); return () => {}; } };",
+      contents: `export const tmuxMux = { subscribe(_session, callback) {
+        callback('\\u001b[30m0 \\u001b[31m1 \\u001b[32m2 \\u001b[33m3 \\u001b[34m4 \\u001b[35m5 \\u001b[36m6 \\u001b[37m7 \\u001b[90m8 \\u001b[91m9 \\u001b[92mA \\u001b[93mB \\u001b[94mC \\u001b[95mD \\u001b[96mE \\u001b[97mF \\u001b[0m\\nไทย กิ้ 👩🏽‍💻 ⣿ └─ dense preview', 'full');
+        return () => {};
+      } };`,
       loader: "js",
     }));
     build.onLoad({ filter: /\.svelte$/ }, (args) => {
@@ -111,12 +114,14 @@ if (cfg.component === "grid") {
     { name: "grok-dense-beta", note: "รอ input", summary: "สรุปงานล่าสุดของ session" },
   ];
   window.__denseOpened = [];
+  window.__denseKilled = [];
   mount(SessionGrid, {
     target: document.getElementById("app"),
     props: {
       sessions,
       palette,
       onOpen(name) { window.__denseOpened.push(name); },
+      onKill(name) { window.__denseKilled.push(name); },
       onNew() {},
       cardLayout: "dense",
       showNew: false,
@@ -341,6 +346,32 @@ type CardMetrics = {
   pageWidth: number;
   viewportWidth: number;
 };
+
+function cssRgb(value: string): [number, number, number] {
+  const channels = value.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+  if (!channels || channels.length !== 3 || channels.some((channel) => !Number.isFinite(channel))) {
+    throw new Error(`expected a computed rgb() color, received ${JSON.stringify(value)}`);
+  }
+  return channels as [number, number, number];
+}
+
+function relativeLuminance(value: string): number {
+  const channels = cssRgb(value).map((channel) => {
+    const srgb = channel / 255;
+    return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+  });
+  return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const lighter = Math.max(relativeLuminance(foreground), relativeLuminance(background));
+  const darker = Math.min(relativeLuminance(foreground), relativeLuminance(background));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function minimumContrast(colors: string[], background: string): number {
+  return Math.min(...colors.map((color) => contrastRatio(color, background)));
+}
 
 async function renderDenseGrid(context: BrowserContext): Promise<Page> {
   const page = await context.newPage();
@@ -584,6 +615,7 @@ describe("dense SessionGrid browser layout", () => {
         const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
         const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
         const open = card.querySelector<HTMLElement>('[data-testid="grid-expand"]')!;
+        const kill = card.querySelector<HTMLElement>('[data-testid="grid-kill"]')!;
         const thumb = card.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
         const tail = thumb.querySelector<HTMLElement>('.tail')!;
         const noteStyle = getComputedStyle(note);
@@ -592,6 +624,13 @@ describe("dense SessionGrid browser layout", () => {
         const lineRects = Array.from(tail.querySelectorAll<HTMLElement>('.mtv-line')).map(
           (line) => line.getBoundingClientRect(),
         );
+        const surfaceStyle = getComputedStyle(thumb);
+        const renderedColors = [
+          surfaceStyle.color,
+          ...Array.from(tail.querySelectorAll<HTMLElement>('[style*="color"]')).map(
+            (span) => getComputedStyle(span).color,
+          ),
+        ];
         return {
           sectionCount: sections.length,
           sectionNames: sections.map((section) => section.dataset.section),
@@ -604,7 +643,14 @@ describe("dense SessionGrid browser layout", () => {
           headText: head.textContent ?? "",
           openTag: open.tagName,
           openContainsThumb: open.contains(thumb),
-          thumbBackground: getComputedStyle(thumb).backgroundColor,
+          killTag: kill.tagName,
+          killText: kill.textContent,
+          killWidth: kill.getBoundingClientRect().width,
+          killHeight: kill.getBoundingClientRect().height,
+          killTop: kill.getBoundingClientRect().top - head.getBoundingClientRect().top,
+          killRight: head.getBoundingClientRect().right - kill.getBoundingClientRect().right,
+          thumbBackground: surfaceStyle.backgroundColor,
+          renderedColors,
           thumbLineHeightRatio: Number.parseFloat(tailStyle.lineHeight) / Number.parseFloat(tailStyle.fontSize),
           thumbLinePitch: lineRects[1]!.top - lineRects[0]!.top,
           thumbLineHeight: Number.parseFloat(tailStyle.lineHeight),
@@ -628,7 +674,15 @@ describe("dense SessionGrid browser layout", () => {
       expect(denseChrome.headText).not.toContain("↗");
       expect(denseChrome.openTag).toBe("BUTTON");
       expect(denseChrome.openContainsThumb).toBe(true);
+      expect(denseChrome.killTag).toBe("BUTTON");
+      expect(denseChrome.killText).toBe("×");
+      expect(denseChrome.killWidth).toBe(44);
+      expect(denseChrome.killHeight).toBe(44);
+      expect(denseChrome.killTop).toBe(0);
+      expect(denseChrome.killRight).toBe(0);
       expect(denseChrome.thumbBackground).toBe("rgb(102, 102, 102)");
+      expect(denseChrome.renderedColors.length).toBeGreaterThanOrEqual(17);
+      expect(minimumContrast(denseChrome.renderedColors, denseChrome.thumbBackground)).toBeGreaterThanOrEqual(4.5);
       expect(denseChrome.thumbLineHeightRatio).toBeCloseTo(1.1, 2);
       expect(denseChrome.thumbLinePitch).toBeCloseTo(denseChrome.thumbLineHeight, 1);
       expect(denseChrome.copyMinWidth).toBe("44px");
@@ -640,9 +694,27 @@ describe("dense SessionGrid browser layout", () => {
       const openPreview = page.locator('[data-testid="grid-expand"]').first();
       await openPreview.focus();
       await page.waitForTimeout(180);
-      expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
-        (thumb) => getComputedStyle(thumb).backgroundColor,
-      )).toBe("rgb(17, 17, 17)");
+      const focusedSurface = await openPreview.evaluate((element) => {
+        const thumb = element.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const openStyle = getComputedStyle(element);
+        return {
+          background: getComputedStyle(thumb).backgroundColor,
+          renderedColors: [
+            getComputedStyle(thumb).color,
+            ...Array.from(thumb.querySelectorAll<HTMLElement>('[style*="color"]')).map(
+              (span) => getComputedStyle(span).color,
+            ),
+          ],
+          outlineColor: openStyle.outlineColor,
+          outlineWidth: openStyle.outlineWidth,
+          boxShadow: openStyle.boxShadow,
+        };
+      });
+      expect(focusedSurface.background).toBe("rgb(17, 17, 17)");
+      expect(minimumContrast(focusedSurface.renderedColors, focusedSurface.background)).toBeGreaterThanOrEqual(4.5);
+      expect(focusedSurface.outlineColor).toBe("rgb(255, 255, 255)");
+      expect(focusedSurface.outlineWidth).toBe("3px");
+      expect(focusedSurface.boxShadow).toContain("rgb(17, 17, 17)");
       await openPreview.evaluate((element) => element.blur());
       await page.waitForTimeout(180);
       expect(await openPreview.locator('[data-testid="session-thumb"]').evaluate(
@@ -654,6 +726,13 @@ describe("dense SessionGrid browser layout", () => {
         (thumb) => getComputedStyle(thumb).backgroundColor,
       )).toBe("rgb(17, 17, 17)");
       await openPreview.click();
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.locator('[data-testid="grid-kill"]').first().click();
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseKilled: string[] }
+      ).__denseKilled)).toEqual(["codex-dense-alpha-very-long-name"]);
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);

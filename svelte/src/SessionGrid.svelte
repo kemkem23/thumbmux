@@ -23,12 +23,14 @@
   } from './session-grid';
 
   const NEW_FOCUS_KEY = '__thumbmux_new__';
+  const DENSE_IDLE_BACKGROUND = '#666666';
 
   let {
     sessions,
     palette,
     onOpen,
     onNew,
+    onKill,
     newLabel = '+ terminal',
     emptyLabel = 'No sessions yet — start one',
     loading = false,
@@ -48,6 +50,7 @@
     showNew = true,
     copyNameLabel = 'Copy tmux session name',
     expandLabel = 'Expand terminal',
+    killLabel = 'Kill tmux session',
   }: SessionGridProps = $props();
 
   let gridEl = $state<HTMLDivElement | null>(null);
@@ -56,6 +59,8 @@
   let grouped = $state(false);
   let previousDefaultGrouped = $state<boolean | null>(null);
   let activeFocusKey = $state<string | null>(null);
+  let hoveredPreview = $state<string | null>(null);
+  let focusedPreview = $state<string | null>(null);
 
   let model = $derived(buildSessionGridModel(sessions, {
     filterValue,
@@ -188,6 +193,20 @@
   function copySessionName(name: string): void {
     void copyPlainText(name);
   }
+
+  function densePreviewBackground(name: string): string | undefined {
+    return hoveredPreview === name || focusedPreview === name
+      ? undefined
+      : DENSE_IDLE_BACKGROUND;
+  }
+
+  function leavePreview(name: string): void {
+    if (hoveredPreview === name) hoveredPreview = null;
+  }
+
+  function blurPreview(name: string): void {
+    if (focusedPreview === name) focusedPreview = null;
+  }
 </script>
 
 {#snippet denseCard(item: PreparedGridSession)}
@@ -202,7 +221,7 @@
     role="group"
     aria-label={item.session.name}
   >
-    <div class="dense-head" data-testid="grid-dense-head">
+    <div class="dense-head" class:has-kill={!!onKill} data-testid="grid-dense-head">
       <div class="dense-section dense-name-section" data-section="name">
         <button
           type="button"
@@ -222,6 +241,19 @@
           <span class="dense-summary" data-testid="grid-summary">{denseSummary(item.session)}</span>
         {/if}
       </div>
+      {#if onKill}
+        <button
+          type="button"
+          class="dense-kill"
+          data-testid="grid-kill"
+          aria-label={`${killLabel}: ${item.session.name}`}
+          title={`${killLabel}: ${item.session.name}`}
+          onclick={(event) => {
+            event.stopPropagation();
+            onKill?.(item.session.name);
+          }}
+        ><span aria-hidden="true">×</span></button>
+      {/if}
     </div>
     {#if item.session.state}
       <div class={stateClass(item.session.state)} data-testid="grid-state" data-state={item.session.state}>
@@ -236,7 +268,13 @@
       type="button"
       class="live dense-open"
       onclick={() => onOpen(item.session.name)}
-      onfocus={() => (activeFocusKey = item.session.name)}
+      onpointerenter={() => (hoveredPreview = item.session.name)}
+      onpointerleave={() => leavePreview(item.session.name)}
+      onfocus={() => {
+        activeFocusKey = item.session.name;
+        focusedPreview = item.session.name;
+      }}
+      onblur={() => blurPreview(item.session.name)}
       tabindex={tabIndexFor(item.session.name)}
       aria-label={`${expandLabel}: ${item.session.name}`}
       data-testid="grid-expand"
@@ -247,6 +285,7 @@
         session={item.session.name}
         palette={item.session.palette ?? palette}
         density="dense"
+        previewBackground={densePreviewBackground(item.session.name)}
       />
     </button>
   </div>
@@ -585,6 +624,7 @@
     z-index: 1;
   }
   .dense-head {
+    position: relative;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     align-items: stretch;
@@ -657,6 +697,38 @@
   .dense-summary {
     font-weight: 600;
   }
+  .dense-head.has-kill .dense-summary-section {
+    padding-inline-end: 48px;
+  }
+  .dense-kill {
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-end: 0;
+    z-index: 2;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-inline-start: 1px solid var(--hub-dense-divider, #9b9590);
+    border-block-end: 1px solid var(--hub-dense-divider, #9b9590);
+    border-radius: 0;
+    background: var(--hub-card, #ffffff);
+    color: var(--hub-ink, #1a1a1a);
+    font: 400 24px/1 var(--font-mono, ui-monospace, monospace);
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .dense-kill:hover,
+  .dense-kill:active {
+    background: var(--hub-ink, #1a1a1a);
+    color: var(--hub-card, #ffffff);
+  }
+  .dense-kill:focus-visible {
+    outline: 3px solid var(--hub-ink, #1a1a1a);
+    outline-offset: -3px;
+  }
   .dense-card .state {
     min-height: 20px;
     padding: 2px 4px 0;
@@ -686,23 +758,11 @@
     cursor: pointer;
     touch-action: manipulation;
   }
-  .dense-open :global([data-testid="session-thumb"]) {
-    --thumb-preview-bg: var(--hub-dense-thumb-idle, #666666);
-    transition: background-color 140ms ease;
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .dense-open:hover :global([data-testid="session-thumb"]) {
-      --thumb-preview-bg: var(--tbg);
-    }
-  }
-  .dense-open:active :global([data-testid="session-thumb"]),
-  .dense-open:focus-visible :global([data-testid="session-thumb"]) {
-    --thumb-preview-bg: var(--tbg);
-  }
   .dense-open:focus-visible {
     z-index: 2;
-    outline: 3px solid color-mix(in srgb, var(--accent, var(--hub-accent, #1a1a1a)) 80%, white);
+    outline: 3px solid #ffffff;
     outline-offset: -3px;
+    box-shadow: inset 0 0 0 6px #111111;
   }
   .subtitle {
     padding: 5px 9px 0;

@@ -12,6 +12,7 @@
     palette,
     maxLines,
     density = 'default',
+    previewBackground,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -19,12 +20,18 @@
     /** Opt-in preview density used by large hub cards. The historical thumbnail
      * sizing and 30-line tail remain the default. */
     density?: 'default' | 'dense';
+    /** Optional preview-only background. Foreground and ANSI colors are
+     * contrast-derived against it instead of merely repainting the surface. */
+    previewBackground?: string;
   } = $props();
 
   let content = $state('');
   let connected = $state(false);
   let thumbEl = $state<HTMLDivElement | null>(null);
-  let thumbPalette = $derived(deriveThumbnailPalette(palette));
+  let renderPalette = $derived(previewBackground
+    ? { ...palette, defaultBg: previewBackground }
+    : palette);
+  let thumbPalette = $derived(deriveThumbnailPalette(renderPalette));
   let effectiveMaxLines = $derived(maxLines ?? (density === 'dense' ? 50 : 30));
   let lines = $derived(renderLines(content, effectiveMaxLines, thumbPalette));
   // SessionGrid rebuilds its metadata objects whenever a host snapshot changes.
@@ -129,7 +136,7 @@
     overflow: hidden;
     contain: layout paint;
     container-type: inline-size;
-    background: var(--thumb-preview-bg, var(--tbg));
+    background: var(--tbg);
     color: var(--tfg);
     font-family: var(--font-mono, ui-monospace, monospace);
     pointer-events: none;
@@ -155,6 +162,9 @@
     line-height: 1.1;
     -webkit-mask-image: none;
     mask-image: none;
+  }
+  .thumb.dense {
+    transition: background-color 140ms ease;
   }
   .tail :global(div) {
     width: max-content;
