@@ -188,6 +188,97 @@ describe("TM-02 openCompose/openDock optional focus", () => {
   });
 });
 
+// ─── TM-02b ──────────────────────────────────────────────────────────────────────
+
+describe("TM-02b COMPOSE stays ready after SEND", () => {
+  test("SEND clears the draft, keeps the dock open, and restores textarea focus", async () => {
+    const sent: string[] = [];
+    const { target } = mountDock({
+      open: true,
+      mode: "compose",
+      text: "next task",
+      onSend: (text: string) => sent.push(text),
+    });
+    await tick();
+
+    const sheet = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    const textarea = target.querySelector<HTMLTextAreaElement>("textarea");
+    const send = target.querySelector<HTMLButtonElement>("button.snd");
+    if (!sheet || !textarea || !send) throw new Error("compose controls missing");
+
+    // A real pointer click moves focus from the textarea to SEND before the
+    // click handler runs. Model that explicitly so the regression cannot pass
+    // merely because the test DOM kept the textarea focused.
+    textarea.focus();
+    send.focus();
+    send.click();
+
+    // Focus must move within the click handler itself so WebKit can preserve
+    // the software keyboard. Bound DOM value updates settle on the next tick.
+    expect(document.activeElement).toBe(textarea);
+    await tick();
+    expect(sent).toEqual(["next task"]);
+    expect(textarea.value).toBe("");
+    expect(sheet.classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test("Enter follows the same keep-open and refocus contract", async () => {
+    const sent: string[] = [];
+    const { target } = mountDock({
+      open: true,
+      mode: "compose",
+      text: "send with enter",
+      onSend: (text: string) => sent.push(text),
+    });
+    await tick();
+
+    const sheet = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    const textarea = target.querySelector<HTMLTextAreaElement>("textarea");
+    if (!sheet || !textarea) throw new Error("compose controls missing");
+
+    textarea.focus();
+    textarea.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    await tick();
+
+    expect(sent).toEqual(["send with enter"]);
+    expect(textarea.value).toBe("");
+    expect(sheet.classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test("a synchronous host failure keeps the draft and returns focus", async () => {
+    let attempts = 0;
+    const { target } = mountDock({
+      open: true,
+      mode: "compose",
+      text: "must not disappear",
+      onSend: () => {
+        attempts += 1;
+        throw new Error("sync transport failure");
+      },
+    });
+    await tick();
+
+    const sheet = target.querySelector<HTMLElement>('[data-testid="input-sheet"]');
+    const textarea = target.querySelector<HTMLTextAreaElement>("textarea");
+    const send = target.querySelector<HTMLButtonElement>("button.snd");
+    if (!sheet || !textarea || !send) throw new Error("compose controls missing");
+
+    textarea.focus();
+    send.focus();
+    send.click();
+    await tick();
+
+    expect(attempts).toBe(1);
+    expect(textarea.value).toBe("must not disappear");
+    expect(sheet.classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(textarea);
+  });
+});
+
 // ─── TM-03 ──────────────────────────────────────────────────────────────────
 
 describe("TM-03 cancelSyntheticClickOnTap", () => {
