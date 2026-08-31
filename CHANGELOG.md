@@ -1,7 +1,21 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.10-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.11-dist`.
+
+## v0.18.11 — 2026-08-31
+
+### Fixed
+
+- **Mobile and embedded-browser preview taps no longer depend on a synthesized
+  click that may never arrive.** Dense previews capture the primary pointer,
+  remember the session selected at pointerdown, and use a short pointerup
+  fallback when a browser suppresses the compatibility click. Movement beyond
+  the tap threshold, scrolling, pointer cancellation and removed cards never
+  open a session; a live keyed-card reorder still opens the session originally
+  pressed instead of the card that later moved under the same coordinates.
+  Native click, keyboard and assistive activation remain single-shot, while
+  direct-touch pointer-enter no longer creates a misleading sticky hover.
 
 ## v0.18.10 — 2026-08-29
 

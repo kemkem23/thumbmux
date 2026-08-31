@@ -102,7 +102,7 @@ beforeAll(async () => {
     `
 import { mount, createRawSnippet } from "svelte";
 import TermHud from ${JSON.stringify(join(here, "../src/TermHud.svelte"))};
-import SessionGrid from ${JSON.stringify(join(here, "../src/SessionGrid.svelte"))};
+import SessionGridHost from ${JSON.stringify(join(here, "./SessionGridHost.svelte"))};
 
 const cfg = window.__hudProps ?? {};
 if (cfg.component === "grid") {
@@ -117,10 +117,10 @@ if (cfg.component === "grid") {
   ];
   window.__denseOpened = [];
   window.__denseKilled = [];
-  mount(SessionGrid, {
+  const gridHost = mount(SessionGridHost, {
     target: document.getElementById("app"),
     props: {
-      sessions,
+      initialSessions: sessions,
       palette,
       onOpen(name) { window.__denseOpened.push(name); },
       onKill(name) { window.__denseKilled.push(name); },
@@ -129,6 +129,7 @@ if (cfg.component === "grid") {
       showNew: false,
     },
   });
+  window.__replaceDenseSessions = (next) => gridHost.replaceSessions(next);
 } else {
   const props = {
     chip: "CC",
@@ -848,6 +849,49 @@ describe("dense SessionGrid browser layout", () => {
       expect(await page.evaluate(() => (
         window as unknown as { __denseKilled: string[] }
       ).__denseKilled)).toEqual(["codex-dense-alpha-very-long-name"]);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+
+      // If an embedded browser omits the compatibility click, pointerup owns
+      // a short fallback and still activates exactly once.
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+        const block = (event: MouseEvent) => {
+          if (!(event.target instanceof Element) || !event.target.closest('[data-testid="grid-expand"]')) return;
+          document.removeEventListener("click", block, true);
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        };
+        document.addEventListener("click", block, true);
+      });
+      await openPreview.hover();
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.waitForTimeout(80);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+
+      // Live metadata can reorder keyed cards while the pointer is down. The
+      // original session/node remains the activation target after it moves.
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.hover();
+      await page.mouse.down();
+      await page.evaluate(() => {
+        (window as unknown as {
+          __replaceDenseSessions: (sessions: Array<Record<string, string>>) => void;
+        }).__replaceDenseSessions([
+          { name: "grok-dense-beta", note: "รอ input", summary: "สรุปงานล่าสุดของ session" },
+          { name: "codex-dense-alpha-very-long-name", note: "moved", summary: "still selected" },
+        ]);
+      });
+      await page.waitForTimeout(30);
+      expect(await originalOpenNode!.evaluate((element) => element.isConnected)).toBe(true);
+      await page.mouse.up();
+      await page.waitForTimeout(80);
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
