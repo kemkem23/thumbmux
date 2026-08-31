@@ -12,6 +12,7 @@
   /** SessionGrid — the "which terminal?" screen. A grid of live pane
    * miniatures (SessionThumb) plus a "+ terminal" card. Pure presentation:
    * the host supplies sessions and handles open/new. */
+  import { onDestroy } from 'svelte';
   import SessionThumb from './SessionThumb.svelte';
   import { copyPlainText } from './clipboard';
   import {
@@ -24,6 +25,57 @@
 
   const NEW_FOCUS_KEY = '__thumbmux_new__';
   const DENSE_IDLE_BACKGROUND = '#666666';
+  const PREVIEW_TAP_SLOP_PX = 12;
+  const PREVIEW_SCROLL_SLOP_PX = 4;
+  const PREVIEW_CLICK_WAIT_MS = 48;
+  const PREVIEW_CLICK_DEDUPE_MS = 1_500;
+
+  type PreviewGesture = {
+    pointerKey: string;
+    pointerId: number;
+    pointerType: string;
+    name: string;
+    target: HTMLButtonElement;
+    startX: number;
+    startY: number;
+    startRect: PreviewRect;
+    scrollTarget: Element;
+    startScrollLeft: number;
+    startScrollTop: number;
+    moved: boolean;
+  };
+
+  type PreviewRect = {
+    left: number;
+    right: number;
+    top: number;
+    bottom: number;
+    width: number;
+    height: number;
+  };
+
+  type PendingPreviewActivation = {
+    pointerKey: string;
+    pointerId: number;
+    pointerType: string;
+    name: string;
+    target: HTMLButtonElement;
+    timer: ReturnType<typeof setTimeout>;
+  };
+
+  type SuppressedPreviewClick = {
+    pointerKey: string;
+    pointerId: number;
+    pointerType: string;
+    target: HTMLButtonElement;
+    until: number;
+  };
+
+  type PreviewPointerIdentity = {
+    pointerKey: string;
+    pointerId: number;
+    pointerType: string;
+  };
 
   let {
     sessions,
@@ -61,6 +113,12 @@
   let activeFocusKey = $state<string | null>(null);
   let hoveredPreview = $state<string | null>(null);
   let focusedPreview = $state<string | null>(null);
+  // These records do not render UI, so keep them outside the reactive graph.
+  // `isPrimary` is only singular per pointer type: a touch and an XR/mouse
+  // pointer can both be primary at once, hence the per-pointer maps.
+  const previewGestures = new Map<string, PreviewGesture>();
+  const pendingPreviewActivations = new Map<string, PendingPreviewActivation>();
+  const suppressedPreviewClicks = new Map<string, SuppressedPreviewClick>();
 
   let model = $derived(buildSessionGridModel(sessions, {
     filterValue,
@@ -207,6 +265,320 @@
   function blurPreview(name: string): void {
     if (focusedPreview === name) focusedPreview = null;
   }
+
+  function previewPointerKey(pointerType: string, pointerId: number): string {
+    return `${pointerType || 'unknown'}:${pointerId}`;
+  }
+
+  function clearPendingPreviewActivation(pending: PendingPreviewActivation): void {
+    clearTimeout(pending.timer);
+    if (pendingPreviewActivations.get(pending.pointerKey) === pending) {
+      pendingPreviewActivations.delete(pending.pointerKey);
+    }
+  }
+
+  function suppressLatePreviewClick(
+    pointerKey: string,
+    pointerId: number,
+    pointerType: string,
+    target: HTMLButtonElement,
+  ): void {
+    suppressedPreviewClicks.set(pointerKey, {
+      pointerKey,
+      pointerId,
+      pointerType,
+      target,
+      until: Date.now() + PREVIEW_CLICK_DEDUPE_MS,
+    });
+  }
+
+  function clearExpiredPreviewSuppressions(): void {
+    const now = Date.now();
+    for (const [key, suppression] of suppressedPreviewClicks) {
+      if (suppression.until < now) suppressedPreviewClicks.delete(key);
+    }
+  }
+
+  function cancelAllPreviewWork(): void {
+    for (const gesture of previewGestures.values()) {
+      suppressLatePreviewClick(gesture.pointerKey, gesture.pointerId, gesture.pointerType, gesture.target);
+      if (gesture.pointerType === 'touch') leavePreview(gesture.name);
+    }
+    previewGestures.clear();
+    for (const pending of pendingPreviewActivations.values()) {
+      clearTimeout(pending.timer);
+      suppressLatePreviewClick(pending.pointerKey, pending.pointerId, pending.pointerType, pending.target);
+    }
+    pendingPreviewActivations.clear();
+  }
+
+  function previewSessionStillExists(name: string): boolean {
+    return sessions.some((session) => session.name === name);
+  }
+
+  function commitPreviewActivation(pending: PendingPreviewActivation): void {
+    if (pendingPreviewActivations.get(pending.pointerKey) !== pending) return;
+    const canOpen = pending.target.isConnected && previewSessionStillExists(pending.name);
+    cancelAllPreviewWork();
+    if (canOpen) onOpen(pending.name);
+  }
+
+  function previewRect(target: HTMLButtonElement): PreviewRect {
+    const rect = target.getBoundingClientRect();
+    return {
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
+  function previewRectContains(rect: PreviewRect, x: number, y: number): boolean {
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }
+
+  function previewReleaseIsInside(gesture: PreviewGesture, event: PointerEvent): boolean {
+    const currentRect = previewRect(gesture.target);
+    // DOM-only test shims report a zero rect. Real laid-out cards must contain
+    // the release in either their pressed or current (possibly reordered) box.
+    const hasLayout = gesture.startRect.width > 0 || gesture.startRect.height > 0
+      || currentRect.width > 0 || currentRect.height > 0;
+    return !hasLayout
+      || previewRectContains(gesture.startRect, event.clientX, event.clientY)
+      || previewRectContains(currentRect, event.clientX, event.clientY);
+  }
+
+  function eventPreviewPointerIdentity(event: MouseEvent): PreviewPointerIdentity | null {
+    if (typeof PointerEvent === 'undefined' || !(event instanceof PointerEvent)) return null;
+    return {
+      pointerKey: previewPointerKey(event.pointerType, event.pointerId),
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+    };
+  }
+
+  function previewPointerEnter(event: PointerEvent, name: string): void {
+    // Direct-touch pointers do not hover. Treating their synthetic enter as a
+    // hover repaints a large live miniature before the press has even settled,
+    // and leaves a misleading sticky highlight when the browser starts a pan.
+    if (event.pointerType !== 'touch') hoveredPreview = name;
+  }
+
+  function previewPointerLeave(event: PointerEvent, name: string): void {
+    if (event.pointerType !== 'touch') leavePreview(name);
+  }
+
+  function previewScrollTarget(target: HTMLElement): Element {
+    let parent = target.parentElement;
+    while (parent && parent !== document.body) {
+      const style = getComputedStyle(parent);
+      const scrollable = /(auto|scroll|overlay)/.test(`${style.overflowX} ${style.overflowY}`);
+      if (scrollable && (parent.scrollHeight > parent.clientHeight || parent.scrollWidth > parent.clientWidth)) {
+        return parent;
+      }
+      parent = parent.parentElement;
+    }
+    return document.scrollingElement ?? document.documentElement;
+  }
+
+  function previewPointerDown(event: PointerEvent, name: string): void {
+    if (event.isPrimary === false || event.button !== 0) return;
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLButtonElement)) return;
+
+    const pointerKey = previewPointerKey(event.pointerType, event.pointerId);
+    const existingPending = pendingPreviewActivations.get(pointerKey);
+    if (existingPending) {
+      clearPendingPreviewActivation(existingPending);
+      suppressLatePreviewClick(
+        existingPending.pointerKey,
+        existingPending.pointerId,
+        existingPending.pointerType,
+        existingPending.target,
+      );
+    }
+    previewGestures.delete(pointerKey);
+    clearExpiredPreviewSuppressions();
+
+    const scrollTarget = previewScrollTarget(target);
+    previewGestures.set(pointerKey, {
+      pointerKey,
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      name,
+      target,
+      startX: event.clientX,
+      startY: event.clientY,
+      startRect: previewRect(target),
+      scrollTarget,
+      startScrollLeft: scrollTarget.scrollLeft,
+      startScrollTop: scrollTarget.scrollTop,
+      moved: false,
+    });
+    // Touch has implicit capture in modern browsers; explicit capture also
+    // covers mouse-like XR/WebView pointers and keeps the original session
+    // attached when a live host reorders keyed cards under the pointer.
+    try {
+      target.setPointerCapture(event.pointerId);
+    } catch {
+      // Some DOM shims and older embedded browsers do not implement capture.
+      // The pointerup fallback still improves their clean-tap path.
+    }
+    hoveredPreview = name;
+  }
+
+  function updatePreviewPointerDistance(event: PointerEvent): PreviewGesture | null {
+    const gesture = previewGestures.get(previewPointerKey(event.pointerType, event.pointerId));
+    if (!gesture) return null;
+    const pointerDistance = Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY);
+    const scrollDistance = Math.hypot(
+      gesture.scrollTarget.scrollLeft - gesture.startScrollLeft,
+      gesture.scrollTarget.scrollTop - gesture.startScrollTop,
+    );
+    if (pointerDistance > PREVIEW_TAP_SLOP_PX || scrollDistance > PREVIEW_SCROLL_SLOP_PX) {
+      gesture.moved = true;
+    }
+    return gesture;
+  }
+
+  function previewPointerMove(event: PointerEvent): void {
+    updatePreviewPointerDistance(event);
+  }
+
+  function previewPointerCancel(event: PointerEvent): void {
+    const pointerKey = previewPointerKey(event.pointerType, event.pointerId);
+    const gesture = previewGestures.get(pointerKey);
+    if (!gesture) return;
+    previewGestures.delete(pointerKey);
+    suppressLatePreviewClick(pointerKey, gesture.pointerId, gesture.pointerType, gesture.target);
+    if (gesture.pointerType === 'touch') leavePreview(gesture.name);
+  }
+
+  function previewContextMenu(event: MouseEvent): void {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLButtonElement)) return;
+    const pointer = eventPreviewPointerIdentity(event);
+
+    for (const [key, gesture] of previewGestures) {
+      const samePointer = pointer && (
+        key === pointer.pointerKey
+        || (gesture.pointerId === pointer.pointerId && gesture.pointerType === pointer.pointerType)
+      );
+      if (samePointer || gesture.target === target) {
+        previewGestures.delete(key);
+        suppressLatePreviewClick(key, gesture.pointerId, gesture.pointerType, gesture.target);
+        if (gesture.pointerType === 'touch') leavePreview(gesture.name);
+      }
+    }
+    for (const [key, pending] of pendingPreviewActivations) {
+      const samePointer = pointer && (
+        key === pointer.pointerKey
+        || (pending.pointerId === pointer.pointerId && pending.pointerType === pointer.pointerType)
+      );
+      if (samePointer || pending.target === target) {
+        clearPendingPreviewActivation(pending);
+        suppressLatePreviewClick(key, pending.pointerId, pending.pointerType, pending.target);
+      }
+    }
+    // Keep the browser's context menu available. This handler only makes sure
+    // a long-press cannot also turn into a delayed session activation.
+  }
+
+  function previewPointerUp(event: PointerEvent): void {
+    const gesture = updatePreviewPointerDistance(event);
+    if (!gesture) return;
+    previewGestures.delete(gesture.pointerKey);
+    if (gesture.pointerType === 'touch') leavePreview(gesture.name);
+
+    // Without capture, a keyed reorder can deliver pointerup to the card that
+    // moved underneath the coordinates. The connected pointerdown target is
+    // still authoritative; a removed target is never activated.
+    if (gesture.moved || !gesture.target.isConnected || !previewReleaseIsInside(gesture, event)) {
+      suppressLatePreviewClick(
+        gesture.pointerKey,
+        gesture.pointerId,
+        gesture.pointerType,
+        gesture.target,
+      );
+      return;
+    }
+
+    const priorPending = pendingPreviewActivations.get(gesture.pointerKey);
+    if (priorPending) clearPendingPreviewActivation(priorPending);
+    // Let a standards-compliant click win. Embedded browsers that deliver
+    // pointerup but omit the compatibility click still open after one frame;
+    // any unusually late click is then absorbed below instead of opening twice.
+    const timer = setTimeout(() => {
+      const pending = pendingPreviewActivations.get(gesture.pointerKey);
+      if (!pending || pending.timer !== timer) return;
+      commitPreviewActivation(pending);
+    }, PREVIEW_CLICK_WAIT_MS);
+    pendingPreviewActivations.set(gesture.pointerKey, {
+      pointerKey: gesture.pointerKey,
+      pointerId: gesture.pointerId,
+      pointerType: gesture.pointerType,
+      name: gesture.name,
+      target: gesture.target,
+      timer,
+    });
+  }
+
+  function previewClick(event: MouseEvent, name: string): void {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLButtonElement)) return;
+
+    // detail=0 is a keyboard, switch-control, voice or programmatic action.
+    // It must win over any unrelated touch that happens to be pending.
+    if (event.detail === 0) {
+      cancelAllPreviewWork();
+      onOpen(name);
+      return;
+    }
+
+    clearExpiredPreviewSuppressions();
+    const pointer = eventPreviewPointerIdentity(event);
+    let pending = pointer ? pendingPreviewActivations.get(pointer.pointerKey) : undefined;
+    if (!pending && pointer) {
+      const sameId = [...pendingPreviewActivations.values()]
+        .filter((candidate) => candidate.pointerId === pointer.pointerId);
+      if (sameId.length === 1) pending = sameId[0];
+    }
+    // Safari/WebViews that still expose click as MouseEvent have no pointerId;
+    // match the original node instead. A correlated modern PointerEvent can
+    // safely keep the pointerdown session even if a live reorder retargets it.
+    if (!pending) {
+      pending = [...pendingPreviewActivations.values()].find((candidate) => candidate.target === target);
+    }
+    if (pending) {
+      commitPreviewActivation(pending);
+      return;
+    }
+
+    let suppressed = pointer ? suppressedPreviewClicks.get(pointer.pointerKey) : undefined;
+    if (!suppressed && pointer) {
+      const sameId = [...suppressedPreviewClicks.values()]
+        .filter((candidate) => candidate.pointerId === pointer.pointerId);
+      if (sameId.length === 1) suppressed = sameId[0];
+    }
+    if (!suppressed) {
+      suppressed = [...suppressedPreviewClicks.values()].find((candidate) => candidate.target === target);
+    }
+    if (suppressed) return;
+
+    // A normal click with no preceding PointerEvent remains supported for old
+    // engines. Since it is a complete activation, abandon unrelated gestures.
+    cancelAllPreviewWork();
+    onOpen(name);
+  }
+
+  onDestroy(() => {
+    for (const pending of pendingPreviewActivations.values()) clearTimeout(pending.timer);
+    pendingPreviewActivations.clear();
+    previewGestures.clear();
+    suppressedPreviewClicks.clear();
+  });
 </script>
 
 {#snippet denseCard(item: PreparedGridSession)}
@@ -279,9 +651,14 @@
       <button
         type="button"
         class="dense-open"
-        onclick={() => onOpen(item.session.name)}
-        onpointerenter={() => (hoveredPreview = item.session.name)}
-        onpointerleave={() => leavePreview(item.session.name)}
+        onclick={(event) => previewClick(event, item.session.name)}
+        onpointerenter={(event) => previewPointerEnter(event, item.session.name)}
+        onpointerleave={(event) => previewPointerLeave(event, item.session.name)}
+        onpointerdown={(event) => previewPointerDown(event, item.session.name)}
+        onpointermove={previewPointerMove}
+        onpointerup={previewPointerUp}
+        onpointercancel={previewPointerCancel}
+        oncontextmenu={previewContextMenu}
         onfocus={() => {
           activeFocusKey = item.session.name;
           focusedPreview = item.session.name;
