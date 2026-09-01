@@ -151,6 +151,41 @@ describe("terminal prompt extraction", () => {
     ]);
   });
 
+  test("keeps status-shaped prose inside a submitted multi-line prompt", () => {
+    expect(extractRecentPrompts([
+      '❯ document these literal examples',
+      '✳ Writing a report',
+      '✽ Reading app.log',
+      '\x1b[38;5;246m✳\x1b[39m Writing a report',
+      '\x1b[38;5;246m✽\x1b[39m Reading app.log',
+      'and keep both lines verbatim',
+      '● response body starts here',
+    ])).toEqual([
+      'document these literal examples ✳ Writing a report ✽ Reading app.log '
+        + '✳ Writing a report ✽ Reading app.log and keep both lines verbatim',
+    ]);
+  });
+
+  test("preserves an exact Claude activity capture pasted into a submitted prompt", () => {
+    const plainStatus = '✢ Thinking… (thinking with xhigh effort)';
+    const expected = [
+      'preserve this capture ✢ Thinking… (thinking with xhigh effort) '
+        + 'and explain why it flickers',
+    ];
+    for (const status of [plainStatus, `\x1b[38;5;174m${plainStatus}\x1b[39m`]) {
+      const lines = [
+        '❯ preserve this capture',
+        status,
+        'and explain why it flickers',
+        '● response',
+      ];
+      expect({
+        lines: extractRecentPrompts(lines),
+        pane: extractRecentPromptsFromPane(lines.join('\n')),
+      }, status).toEqual({ lines: expected, pane: expected });
+    }
+  });
+
   test("strips ansi escape codes used by tmux captures", () => {
     expect(stripAnsi("\x1b[1m›\x1b[0m prompt")).toBe("› prompt");
   });

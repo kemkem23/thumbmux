@@ -1536,7 +1536,7 @@ describe('mountable terminal views', () => {
     const slots = target.querySelector<HTMLElement>('.slots');
     const action = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
     if (!slots || !action) throw new Error('Claude Bash mode action did not render');
-    expect(action.textContent?.trim()).toBe('BASH HIDE');
+    expect(action.textContent?.trim()).toBe('TOOLS HIDE');
     expect(action.getAttribute('aria-hidden')).toBe('false');
     expect(action.getAttribute('aria-expanded')).toBe('false');
 
@@ -1551,7 +1551,7 @@ describe('mountable terminal views', () => {
     await tick();
     expect(saved.at(-1)).toEqual({ claudeBashMode: 'haiku' });
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('BASH DISTILL');
+      .toBe('TOOLS DISTILL');
     expect(slots.classList.contains('open')).toBe(false);
 
     await openFab(target);
@@ -1567,31 +1567,47 @@ describe('mountable terminal views', () => {
     await tick();
     expect(saved.at(-1)).toEqual({ claudeBashMode: 'off' });
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('BASH SHOW');
+      .toBe('TOOLS SHOW');
 
     if (!publishPrefs) throw new Error('SessionView did not subscribe to shared preferences');
     flushSync(() => publishPrefs?.({ claudeBashMode: 'hide' }));
     await tick();
     expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
-      .toBe('BASH HIDE');
+      .toBe('TOOLS HIDE');
   });
 
-  test('Bash action stays absent outside Claude sessions even when the stored mode is HAIKU', async () => {
+  test('Codex exposes TOOLS SHOW/HIDE and maps a stored DISTILL preference to HIDE', async () => {
+    const saved: Array<Partial<ThumbmuxPrefs>> = [];
     const { target } = mountView(SessionView, {
-      session: 'codex-no-bash-mode',
+      session: 'codex-tools-mode',
       adapters: {
         termProps: () => ({ claimGeometry: false }),
         submitAgent: () => 'codex',
         prefs: {
           load: async () => ({ claudeBashMode: 'haiku' }),
-          save: async () => {},
+          save: async (patch) => { saved.push(patch); },
         },
       } satisfies AppAdapters,
     });
     await flushPromises();
     await openFab(target);
 
-    expect(target.querySelector('[data-testid="demo-bash-mode"]')).toBeNull();
+    const action = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-mode"]');
+    if (!action) throw new Error('Codex TOOLS mode action did not render');
+    expect(action.textContent?.trim()).toBe('TOOLS HIDE');
+    flushSync(() => action.click());
+    await tick();
+    expect(target.querySelector('[data-testid="demo-bash-distill"]')).toBeNull();
+    const show = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-show"]');
+    const hide = target.querySelector<HTMLButtonElement>('[data-testid="demo-bash-hide"]');
+    if (!show || !hide) throw new Error('Codex TOOLS choices did not render');
+    expect(show.getAttribute('aria-pressed')).toBe('false');
+    expect(hide.getAttribute('aria-pressed')).toBe('true');
+    flushSync(() => show.click());
+    await tick();
+    expect(saved.at(-1)).toEqual({ claudeBashMode: 'off' });
+    expect(target.querySelector('[data-testid="demo-bash-mode"]')?.textContent?.trim())
+      .toBe('TOOLS SHOW');
   });
 
   test('rejected Haiku adapter settles once to a deterministic Bash preview', async () => {

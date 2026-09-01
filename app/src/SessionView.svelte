@@ -116,6 +116,12 @@
   let effectiveClaudeBashMode = $derived<ClaudeBashMode>(
     sessionAgent === 'claude' ? claudeBashMode : 'off',
   );
+  // Keep the existing shared preference key for backwards compatibility.
+  // DISTILL is Claude-only; when that stored value is viewed in a Codex
+  // session it intentionally degrades to the ordinary hidden-tools view.
+  let effectiveCodexToolMode = $derived<'off' | 'hide'>(
+    sessionAgent === 'codex' && claudeBashMode !== 'off' ? 'hide' : 'off',
+  );
 
   let termRef = $state<ReturnType<typeof TermView> | null>(null);
   let composerRef = $state<ReturnType<typeof ComposerDock> | null>(null);
@@ -587,14 +593,16 @@
         testid: 'demo-copy',
         onTap: () => { overlay.fabOpen = false; void copyTerminal(); },
       },
-      ...(sessionAgent === 'claude' ? [{
+      ...(sessionAgent === 'claude' || sessionAgent === 'codex' ? [{
         id: 'bash-mode',
-        label: 'BASH',
-        tag: claudeBashMode === 'off'
-          ? 'SHOW'
-          : claudeBashMode === 'hide'
-            ? 'HIDE'
-            : 'DISTILL',
+        label: 'TOOLS',
+        tag: sessionAgent === 'codex'
+          ? (effectiveCodexToolMode === 'hide' ? 'HIDE' : 'SHOW')
+          : claudeBashMode === 'off'
+            ? 'SHOW'
+            : claudeBashMode === 'hide'
+              ? 'HIDE'
+              : 'DISTILL',
         testid: 'demo-bash-mode',
         // The matching flyout is passed separately so the frozen FabAction
         // adapter type remains byte-compatible with existing hosts.
@@ -653,32 +661,36 @@
   });
 
   let actionFlyouts = $derived.by((): FabActionFlyout[] => (
-    sessionAgent === 'claude'
+    sessionAgent === 'claude' || sessionAgent === 'codex'
       ? [{
         actionId: 'bash-mode',
-        ariaLabel: 'Bash display mode',
+        ariaLabel: 'Tool display mode',
         choices: [
           {
             id: 'bash-show',
             label: 'SHOW',
             testid: 'demo-bash-show',
-            selected: claudeBashMode === 'off',
+            selected: sessionAgent === 'codex'
+              ? effectiveCodexToolMode === 'off'
+              : claudeBashMode === 'off',
             onTap: () => setClaudeBashMode('off'),
           },
           {
             id: 'bash-hide',
             label: 'HIDE',
             testid: 'demo-bash-hide',
-            selected: claudeBashMode === 'hide',
+            selected: sessionAgent === 'codex'
+              ? effectiveCodexToolMode === 'hide'
+              : claudeBashMode === 'hide',
             onTap: () => setClaudeBashMode('hide'),
           },
-          {
+          ...(sessionAgent === 'claude' ? [{
             id: 'bash-distill',
             label: 'DISTILL',
             testid: 'demo-bash-distill',
             selected: claudeBashMode === 'haiku',
             onTap: () => setClaudeBashMode('haiku'),
-          },
+          }] : []),
         ],
       }]
       : []
@@ -856,6 +868,7 @@
             onLinesChange={onTermLinesChange}
             onScrollStateChange={onTermScrollStateChange}
             claudeBashMode={effectiveClaudeBashMode}
+            codexToolMode={effectiveCodexToolMode}
             onClaudeBashSummaryRequest={requestClaudeBashSummaries}
           />
         </DesktopKeys>
@@ -870,6 +883,7 @@
           onLinesChange={onTermLinesChange}
           onScrollStateChange={onTermScrollStateChange}
           claudeBashMode={effectiveClaudeBashMode}
+          codexToolMode={effectiveCodexToolMode}
           onClaudeBashSummaryRequest={requestClaudeBashSummaries}
         />
       {/if}

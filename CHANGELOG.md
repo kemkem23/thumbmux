@@ -1,7 +1,29 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.11-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.12-dist`.
+
+## v0.18.12 — 2026-09-02
+
+### Changed
+
+- **The session disclosure is now named `TOOLS` and also supports Codex.**
+  Claude Code keeps **SHOW / HIDE / DISTILL**; Codex gets **SHOW / HIDE**.
+  Codex HIDE conservatively compacts sealed successful `Ran` output, completed
+  background waits and interactions, waiting/finished and agent lifecycle
+  events, viewed-image events, and only the body of completed edits. The edit
+  summary, active status, running-background HUD, submitted prompt/composer,
+  assistant prose, warnings, approvals, failures and interrupted work stay
+  visible. Unknown or incomplete terminal paint fails open.
+
+### Fixed
+
+- **Claude tool compaction no longer flickers or swallows the latest prompt
+  while Claude is thinking.** Projection now keeps canonical rows separate
+  from presentation rows, recognizes the current activity lines explicitly,
+  holds ambiguous/live corridors open, and preserves placeholder identity
+  across repaint, history movement and terminal reflow. Copy, search, cursor,
+  scroll anchors and ANSI state continue to use the unmodified terminal data.
 
 ## v0.18.11 — 2026-08-31
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   detectClaudeBashBlocks,
+  detectClaudeBashBlocksWithActivityEvidence,
   groupClaudeBashBlocks,
   projectClaudeBashGroupedLines,
   projectClaudeBashLines,
@@ -20,6 +21,11 @@ const active = [
   '\x1b[38;5;246m \x1b[39m \x1b[1mBash\x1b[0m(rg -n Bash src',
   '      tests)',
 ];
+
+function paintedActivity(frame: string, verb = 'Thinking'): string {
+  return `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174m${verb}…\x1b[39m `
+    + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m';
+}
 
 describe('Claude Bash detector', () => {
   test('detects completed ANSI physical rows with exact source/command/output ranges', () => {
@@ -67,6 +73,761 @@ describe('Claude Bash detector', () => {
     expect(detectClaudeBashBlocks([
       '\x1b[38;5;246m  Bash(rg -n Bash src)',
     ]).blocks).toEqual([]);
+  });
+
+  test('fails open when an active capture edge reaches an indented queued prompt', () => {
+    const queuedPrompt = '  ❯ prompt ระหว่างที่ Bash ยัง active ต้องไม่หาย';
+    const lines = [
+      active[0]!,
+      '      tests)',
+      queuedPrompt,
+    ];
+
+    expect(detectClaudeBashBlocks(lines).blocks).toEqual([]);
+    expect(projectClaudeBashLines(lines, { mode: 'hide' }).lines).toBe(lines);
+  });
+
+  test('uses a queued prompt only as a protective edge while Bash is still active', () => {
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'latest queued prompt\x1b[39m\x1b[49m';
+    const firstLines = [
+      ...active,
+      '\x1b[38;5;246m  ⎿ \u00a0\x1b[39mfirst chunk',
+      '',
+      queuedPrompt,
+    ];
+    const secondLines = [
+      ...active,
+      '\x1b[38;5;246m  ⎿ \u00a0\x1b[39mfirst chunk',
+      '     second chunk',
+      '',
+      queuedPrompt,
+    ];
+    const first = detectClaudeBashBlocks(firstLines);
+    const second = detectClaudeBashBlocks(secondLines);
+
+    expect(first.blocks[0]).toMatchObject({
+      status: 'active',
+      sourceRange: { startLine: 0, endLine: 3 },
+      output: 'first chunk',
+    });
+    expect(second.blocks[0]).toMatchObject({
+      status: 'active',
+      sourceRange: { startLine: 0, endLine: 4 },
+      output: 'first chunk\nsecond chunk',
+    });
+    expect(second.blocks[0]?.fingerprint).toBe(first.blocks[0]?.fingerprint);
+
+    const firstHaiku = projectClaudeBashGroupedLines(firstLines, {
+      mode: 'haiku',
+      detection: first,
+    });
+    const secondHaiku = projectClaudeBashGroupedLines(secondLines, {
+      mode: 'haiku',
+      detection: second,
+    });
+    expect(firstHaiku.rows[0]).toMatchObject({
+      kind: 'bash-placeholder',
+      status: 'active',
+      line: 'Bash กำลังรัน…',
+      rawRange: { startLine: 0, endLine: 4 },
+      summaryState: 'none',
+    });
+    expect(secondHaiku.rows[0]).toMatchObject({
+      kind: 'bash-placeholder',
+      status: 'active',
+      line: 'Bash กำลังรัน…',
+      rawRange: { startLine: 0, endLine: 5 },
+      summaryState: 'none',
+    });
+    expect(secondHaiku.detectedGroups[0]?.fingerprint)
+      .toBe(firstHaiku.detectedGroups[0]?.fingerprint);
+    expect(firstHaiku.lines).toEqual(['Bash กำลังรัน…', queuedPrompt]);
+    expect(secondHaiku.lines).toEqual(['Bash กำลังรัน…', queuedPrompt]);
+    expect(firstHaiku.summaryRequests).toEqual([]);
+    expect(secondHaiku.summaryRequests).toEqual([]);
+  });
+
+  test('keeps every Claude thinking-animation frame outside completed Bash output', () => {
+    const spinnerFrames = ['·', '✻', '✽', '✶', '✳', '✢'];
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+
+    for (const frame of spinnerFrames) {
+      const thinking = paintedActivity(frame);
+      const lines = [
+        '● Bash(printf done)',
+        '  ⎿  done',
+        thinking,
+        '',
+        composerRule,
+        '❯ queued follow-up',
+        composerRule,
+      ];
+
+      const [block] = detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks;
+      expect(block?.sourceRange, `frame ${frame}`).toEqual({ startLine: 0, endLine: 2 });
+      expect(projectClaudeBashLines(lines, {
+        mode: 'hide',
+        detection: detectClaudeBashBlocksWithActivityEvidence(lines, [2]),
+      }).lines, `frame ${frame}`).toEqual([
+        'Bash ซ่อนอยู่ · 2 แถว',
+        thinking,
+        ...lines.slice(3),
+      ]);
+      const distilled = projectClaudeBashLines(lines, {
+        mode: 'haiku',
+        detection: detectClaudeBashBlocksWithActivityEvidence(lines, [2]),
+      });
+      expect(distilled.lines[1], `distill frame ${frame}`).toBe(thinking);
+      expect(distilled.summaryRequests, `distill frame ${frame}`).toEqual([
+        expect.objectContaining({ command: 'printf done', output: 'done', lineCount: 2 }),
+      ]);
+      expect(JSON.stringify(distilled.summaryRequests), `distill frame ${frame}`)
+        .not.toContain('Thinking');
+    }
+  });
+
+  test('keeps the old API fail-open and requires positional evidence for activity detection', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    expect(detectClaudeBashBlocks(lines).blocks).toEqual([]);
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks[0]?.sourceRange)
+      .toEqual({ startLine: 0, endLine: 2 });
+  });
+
+  test('keeps every Claude thinking-animation frame outside an active Bash tail', () => {
+    const spinnerFrames = ['·', '✻', '✽', '✶', '✳', '✢'];
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+
+    for (const frame of spinnerFrames) {
+      const thinking = paintedActivity(frame);
+      const lines = [
+        active[0]!,
+        '  ⎿  command completed; Claude is thinking about the result',
+        thinking,
+        '',
+        composerRule,
+        '❯ queued follow-up',
+        composerRule,
+      ];
+      const projection = projectClaudeBashLines(lines, {
+        mode: 'hide',
+        detection: detectClaudeBashBlocksWithActivityEvidence(lines, [2]),
+      });
+
+      expect(projection.detectedBlocks[0]?.sourceRange, `frame ${frame}`)
+        .toEqual({ startLine: 0, endLine: 2 });
+      expect(projection.lines[1], `frame ${frame}`).toBe(thinking);
+      expect(projection.rawToVisualRow[2], `frame ${frame}`).toBe(1);
+    }
+  });
+
+  test('fails open when an active capture ends on an unconfirmed activity row', () => {
+    for (const frame of ['●', '·', '✻', '✽', '✶', '✳', '✢']) {
+      const cases = [
+        paintedActivity(frame),
+        `\x1b[38;5;246m${frame}\x1b[39m Thinking… (thinking with xhigh effort)`,
+        `${frame} Thinking… (thinking with xhigh effort)`,
+      ];
+      for (const status of cases) {
+        const lines = [
+          active[0]!,
+          '  ⎿  command completed',
+          status,
+        ];
+        expect(detectClaudeBashBlocks(lines).blocks, status).toEqual([]);
+        expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks, status)
+          .toEqual([]);
+        expect(projectClaudeBashLines(lines, {
+          mode: 'hide',
+          detection: detectClaudeBashBlocksWithActivityEvidence(lines, [2]),
+        }).lines, status).toBe(lines);
+      }
+    }
+  });
+
+  test('keeps every legacy 246-marker activity frame stable after repaint proof', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    for (const frame of ['·', '✻', '✽', '✶', '✳', '✢']) {
+      const thinking = `\x1b[38;5;246m${frame}\x1b[39m Thinking… `
+        + '(thinking with xhigh effort)';
+      const lines = [
+        '● Bash(printf done)',
+        '  ⎿  done',
+        thinking,
+        composerRule,
+        '❯ queued follow-up',
+        composerRule,
+      ];
+
+      expect(detectClaudeBashBlocks(lines).blocks, frame).toEqual([]);
+      expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks[0]?.sourceRange,
+        frame).toEqual({ startLine: 0, endLine: 2 });
+      expect(projectClaudeBashLines(lines, {
+        mode: 'hide',
+        detection: detectClaudeBashBlocksWithActivityEvidence(lines, [2]),
+      }).lines[1], frame).toBe(thinking);
+    }
+  });
+
+  test('accepts the measured live 174/246 activity paint before paired composer chrome', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const thinking = '\x1b[38;5;174m●\x1b[39m \x1b[38;5;174mSpinning…\x1b[39m '
+      + '\x1b[38;5;246m(7m 9s · ↓ 38.3k tokens · thinking with max effort)\x1b[39m   ';
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      '',
+      thinking,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [3]).blocks[0]?.sourceRange)
+      .toEqual({ startLine: 0, endLine: 2 });
+    expect(projectClaudeBashLines(lines, {
+      mode: 'hide',
+      detection: detectClaudeBashBlocksWithActivityEvidence(lines, [3]),
+    }).lines).toEqual([
+      'Bash ซ่อนอยู่ · 2 แถว',
+      '',
+      thinking,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ]);
+  });
+
+  test('treats submitted prompt echoes at columns zero through two as protective boundaries', () => {
+    for (const indent of ['', ' ', '  ']) {
+      const queuedPrompt = `${indent}\x1b[38;5;239m\x1b[48;5;237m❯ `
+        + '\x1b[38;5;231mprompt ล่าสุดของผู้ใช้ต้องไม่หาย\x1b[39m\x1b[49m';
+      const lines = [
+        '● Bash(printf done)',
+        '  ⎿  done',
+        '',
+        queuedPrompt,
+        '\x1b[38;5;231m●\x1b[39m ตอบคำถามถัดไป',
+      ];
+
+      const detection = detectClaudeBashBlocks(lines);
+      expect(detection.blocks[0]?.sourceRange, JSON.stringify(indent))
+        .toEqual({ startLine: 0, endLine: 2 });
+      expect(detection.blocks[0]?.output, JSON.stringify(indent)).not.toContain('prompt ล่าสุด');
+
+      const projection = projectClaudeBashLines(lines, { mode: 'hide', detection });
+      expect(projection.lines, JSON.stringify(indent)).toContain(queuedPrompt);
+    }
+  });
+
+  test('never lets proven activity hide a queued prompt or its wrapped continuation', () => {
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'prompt ล่าสุดของผู้ใช้ต้องไม่หาย\x1b[39m\x1b[49m';
+    const continuation = '     และบรรทัดต่อของ prompt ต้องยังอยู่';
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(110)}`;
+    const thinking = '\x1b[38;5;174m✽\x1b[39m \x1b[38;5;174mTransfiguring…\x1b[39m '
+      + '\x1b[38;5;246m(6m 56s · ↓ 20.9k tokens)\x1b[39m';
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      '',
+      queuedPrompt,
+      continuation,
+      thinking,
+      '',
+      composerRule,
+      '\x1b[38;5;244m❯ Press up to edit queued messages',
+      composerRule,
+    ];
+
+    const detection = detectClaudeBashBlocksWithActivityEvidence(lines, [5]);
+    expect(detection.blocks[0]?.sourceRange).toEqual({ startLine: 0, endLine: 2 });
+    expect(detection.blocks[0]?.output).not.toContain('prompt ล่าสุด');
+
+    const projection = projectClaudeBashLines(lines, { mode: 'hide', detection });
+    expect(projection.lines).toContain(queuedPrompt);
+    expect(projection.lines).toContain(continuation);
+    expect(projection.lines).toContain(thinking);
+  });
+
+  test('protects Bash-shaped prompt continuation without disabling real styled Bash', () => {
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'review this literal transcript\x1b[39m\x1b[49m';
+    const lines = [
+      queuedPrompt,
+      '  the following Bash transcript is user-authored text',
+      '● Bash(printf literal-user-text)',
+      '  ⎿  literal result must remain prompt text',
+      '     literal tail must remain prompt text',
+      '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(printf real)',
+      '  ⎿  real result',
+      '\x1b[38;5;231m●\x1b[39m done',
+    ];
+    const detection = detectClaudeBashBlocks(lines);
+
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]).toMatchObject({
+      status: 'completed',
+      rawStart: 5,
+      rawEndExclusive: 7,
+      command: 'printf real',
+      output: 'real result',
+    });
+    const projection = projectClaudeBashGroupedLines(lines, {
+      mode: 'hide',
+      detection,
+    });
+    expect(projection.rows[2]).toMatchObject({
+      kind: 'raw',
+      rawRange: { startLine: 2, endLine: 3 },
+    });
+    expect(projection.rows[5]).toMatchObject({
+      kind: 'bash-placeholder',
+      rawRange: { startLine: 5, endLine: 7 },
+    });
+    expect(projection.rawToVisualRow).toEqual([0, 1, 2, 3, 4, 5, 5, 6]);
+
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const afterComposerBottom = [
+      composerRule,
+      '\x1b[38;5;244m❯ Press up to edit queued messages',
+      composerRule,
+      ...lines,
+    ];
+    const afterComposerDetection = detectClaudeBashBlocks(afterComposerBottom);
+    expect(afterComposerDetection.blocks).toHaveLength(1);
+    expect(afterComposerDetection.blocks[0]?.sourceRange)
+      .toEqual({ startLine: 8, endLine: 10 });
+    expect(projectClaudeBashGroupedLines(afterComposerBottom, {
+      mode: 'hide',
+      detection: afterComposerDetection,
+    }).rows.find((row) => row.rawStart === 5)).toMatchObject({
+      kind: 'raw',
+      rawRange: { startLine: 5, endLine: 6 },
+    });
+
+    const activeAfterPrompt = detectClaudeBashBlocks([queuedPrompt, ...active]);
+    expect(activeAfterPrompt.blocks[0]).toMatchObject({
+      status: 'active',
+      sourceRange: { startLine: 1, endLine: 3 },
+    });
+
+    const seamDetection = detectClaudeBashBlocks(lines, {
+      maxScanLines: lines.length - 1,
+    });
+    expect(seamDetection.scanRange).toEqual({ startLine: 1, endLine: lines.length });
+    expect(seamDetection.blocks).toHaveLength(1);
+    expect(seamDetection.blocks[0]?.sourceRange).toEqual({ startLine: 5, endLine: 7 });
+
+    const olderStyledHeader = '\x1b[38;5;114m⏺\x1b[39m \x1b[1mBash\x1b[0m(printf older-real)';
+    const olderStyled = [
+      queuedPrompt,
+      olderStyledHeader,
+      '  ⎿  older real output',
+      '\x1b[38;5;231m●\x1b[39m done',
+    ];
+    const olderAfterPrompt = detectClaudeBashBlocks(olderStyled);
+    expect(olderAfterPrompt.blocks[0]?.sourceRange).toEqual({ startLine: 1, endLine: 3 });
+    const olderAtScanSeam = detectClaudeBashBlocks(olderStyled, { maxScanLines: 3 });
+    expect(olderAtScanSeam.scanRange).toEqual({ startLine: 1, endLine: 4 });
+    expect(olderAtScanSeam.blocks[0]?.sourceRange).toEqual({ startLine: 1, endLine: 3 });
+
+    const longPrompt = [
+      queuedPrompt,
+      ...Array.from({ length: 64 }, (_, index) => `  continuation ${index}`),
+      '● Bash(printf prompt-owned-after-old-cap)',
+      '  ⎿  prompt-owned output after old cap',
+      composerRule,
+      '\x1b[38;5;244m❯ Press up to edit queued messages',
+      composerRule,
+    ];
+    const longDetection = detectClaudeBashBlocks(longPrompt);
+    expect(longDetection.blocks).toEqual([]);
+    const longProjection = projectClaudeBashGroupedLines(longPrompt, {
+      mode: 'haiku',
+      detection: longDetection,
+    });
+    expect(longProjection.lines).toEqual(longPrompt);
+    expect(longProjection.summaryRequests).toEqual([]);
+  });
+
+  test('does not treat a later bold Bash word as styled header proof', () => {
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'review this ANSI transcript\x1b[39m\x1b[49m';
+
+    for (const marker of ['●', '⏺']) {
+      const lines = [
+        queuedPrompt,
+        `\x1b[38;5;231m${marker}\x1b[39m Bash(prompt-owned; later label \x1b[1mBash\x1b[0m)`,
+        '  ⎿  prompt-owned output',
+        '\x1b[38;5;231m●\x1b[39m apparent boundary',
+      ];
+
+      const detection = detectClaudeBashBlocks(lines);
+      expect(detection.blocks, marker).toEqual([]);
+      expect(projectClaudeBashGroupedLines(lines, {
+        mode: 'hide',
+        detection,
+      }).lines).toEqual(lines);
+    }
+  });
+
+  test('keeps status-shaped plain and ANSI shell output inside HIDE and DISTILL payloads', () => {
+    const shellRows = [
+      '✽ Reading app.log',
+      '\x1b[38;5;246m✽\x1b[39m Reading app.log',
+      '✳ Writing a report',
+      '· Done for 3m',
+      '\x1b[38;5;246m*\x1b[39m shell spinner-shaped output',
+    ];
+
+    for (const shellRow of shellRows) {
+      const lines = [
+        '● Bash(printf marker-like-output)',
+        '  ⎿  first',
+        shellRow,
+        'tail remains part of command output',
+        '● real Claude boundary',
+      ];
+      const detection = detectClaudeBashBlocks(lines);
+      expect(detection.blocks[0]?.sourceRange, shellRow).toEqual({ startLine: 0, endLine: 4 });
+      expect(detection.blocks[0]?.output, shellRow).toContain('tail remains part of command output');
+
+      const distilled = projectClaudeBashGroupedLines(lines, { mode: 'haiku', detection });
+      expect(distilled.summaryRequests, shellRow).toEqual([
+        expect.objectContaining({
+          output: expect.stringContaining('tail remains part of command output'),
+          lineCount: 4,
+        }),
+      ]);
+    }
+
+    const ambiguousStatuses = [
+      '* Ruminating… (1m 1s · almost done thinking with max effort)',
+      '\x1b[38;5;246m✢\x1b[39m Thinking… (thinking with xhigh effort)',
+    ];
+    for (const ambiguousStatus of ambiguousStatuses) {
+      const ambiguousLines = [
+        '● Bash(printf marker-like-output)',
+        '  ⎿  first',
+        ambiguousStatus,
+        'tail remains part of command output',
+        '● real Claude boundary',
+      ];
+      expect(detectClaudeBashBlocks(ambiguousLines).blocks, ambiguousStatus).toEqual([]);
+      expect(projectClaudeBashLines(ambiguousLines, { mode: 'haiku' }).lines, ambiguousStatus)
+        .toBe(ambiguousLines);
+    }
+  });
+
+  test('keeps controlled ANSI/OSC status bytes raw and splits Bash groups across status repaint rows', () => {
+    const ansiStatus = '\x1b]0;thinking\x1b\\\x1b[?25l' + paintedActivity('✢') + '\x1b[?25h';
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const lines = [
+      '● Bash(printf first)',
+      '  ⎿  first-output',
+      ansiStatus,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+      '● Bash(printf second)',
+      '  ⎿  second-output',
+      '● final response',
+    ];
+    const detection = detectClaudeBashBlocksWithActivityEvidence(lines, [2]);
+    expect(detection.blocks.map((block) => block.sourceRange)).toEqual([
+      { startLine: 0, endLine: 2 },
+      { startLine: 7, endLine: 9 },
+    ]);
+    expect(groupClaudeBashBlocks(lines, detection.blocks)).toHaveLength(2);
+
+    const projection = projectClaudeBashGroupedLines(lines, { mode: 'hide', detection });
+    expect(projection.lines).toEqual([
+      'Bash ซ่อนอยู่ · 2 แถว',
+      ansiStatus,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+      'Bash ซ่อนอยู่ · 2 แถว',
+      '● final response',
+    ]);
+    expect(projection.rows[1]).toMatchObject({
+      kind: 'raw',
+      line: ansiStatus,
+      rawStart: 2,
+      rawEndExclusive: 3,
+    });
+  });
+
+  test('does not skip an ordinary shell tail while seeking later composer chrome', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const statusShapedOutput = '\x1b[38;5;246m✢\x1b[39m Thinking… '
+      + '(1m · ↓ 2k tokens · thinking with max effort)';
+    const lines = [
+      '● Bash(printf status-shaped-output)',
+      '  ⎿  first',
+      statusShapedOutput,
+      'ordinary tail must remain in the Bash payload',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    const detection = detectClaudeBashBlocks(lines);
+    expect(detection.blocks).toEqual([]);
+    expect(projectClaudeBashLines(lines, { mode: 'haiku' }).lines).toBe(lines);
+  });
+
+  test('fails open for a one-frame status-shaped shell tail until repaint evidence exists', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const cases = [
+      paintedActivity('✢'),
+    ];
+
+    for (const statusShapedOutput of cases) {
+      const lines = [
+        '● Bash(printf final-status-shaped-row)',
+        '  ⎿  first',
+        statusShapedOutput,
+        '',
+        composerRule,
+        '❯ queued follow-up',
+        composerRule,
+      ];
+
+      expect(detectClaudeBashBlocks(lines).blocks, statusShapedOutput).toEqual([]);
+      expect(projectClaudeBashLines(lines, { mode: 'haiku' }).lines, statusShapedOutput)
+        .toBe(lines);
+
+      const confirmed = detectClaudeBashBlocksWithActivityEvidence(lines, [2]);
+      expect(confirmed.blocks[0]?.sourceRange, statusShapedOutput)
+        .toEqual({ startLine: 0, endLine: 2 });
+      expect(confirmed.blocks[0]?.output, statusShapedOutput).toBe('first');
+    }
+  });
+
+  test('fails open for styled bullet frames without nearby paired composer chrome', () => {
+    for (const frame of ['●', '✻', '✢']) {
+      const lines = [
+        '● Bash(printf final-status-shaped-row)',
+        '  ⎿  first',
+        paintedActivity(frame),
+        '● real Claude response',
+      ];
+
+      expect(detectClaudeBashBlocks(lines).blocks, frame).toEqual([]);
+      expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks, frame)
+        .toEqual([]);
+      expect(projectClaudeBashLines(lines, { mode: 'haiku' }).lines, frame).toBe(lines);
+    }
+  });
+
+  test('fails open for plain or non-Claude-painted semantic activity markers', () => {
+    const cases = [
+      ...['●', '✻', '✢'].map((frame) =>
+        `${frame} Thinking… (thinking with xhigh effort)`),
+      '\x1b[38;5;196m●\x1b[39m Thinking… (thinking with xhigh effort)',
+      '\x1b[38;5;246m✻ Thinking… (thinking with xhigh effort)',
+    ];
+    for (const status of cases) {
+      const lines = [
+        '● Bash(printf final-status-shaped-row)',
+        '  ⎿  first',
+        status,
+        'ordinary tail must survive',
+        '● real Claude response',
+      ];
+
+      expect(detectClaudeBashBlocks(lines).blocks, status).toEqual([]);
+      expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks, status)
+        .toEqual([]);
+      expect(projectClaudeBashLines(lines, { mode: 'haiku' }).lines, status).toBe(lines);
+    }
+  });
+
+  test('accepts equivalent measured composer paint across tmux SGR segmentation', () => {
+    const rules = [
+      `\x1b[0m\x1b[38;5;244m${'─'.repeat(80)}`,
+      `\x1b[0;38;5;244m${'─'.repeat(80)}\x1b[39m`,
+      `\x1b[49m\x1b[38:5:244m${'─'.repeat(80)}`,
+      `\x1b[38;5;244m${'─'.repeat(40)}\x1b[38;5;244m${'─'.repeat(40)}\x1b[39m`,
+    ];
+    const composerPrompt = '\x1b[38;5;244m❯ queued follow-up';
+    for (const composerRule of rules) {
+      const lines = [
+        '● Bash(printf done)',
+        '  ⎿  done',
+        paintedActivity('✢'),
+        '',
+        composerRule,
+        composerPrompt,
+        composerRule,
+      ];
+      expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks[0]?.sourceRange,
+        composerRule).toEqual({ startLine: 0, endLine: 2 });
+    }
+
+    const mixedRule = `\x1b[38;5;244m${'─'.repeat(40)}\x1b[38;5;196m${'─'.repeat(40)}`;
+    expect(detectClaudeBashBlocksWithActivityEvidence([
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '',
+      mixedRule,
+      '❯ queued follow-up',
+      mixedRule,
+    ], [2]).blocks).toEqual([]);
+
+    const inverseRule = `\x1b[38;5;244;48;5;196;7m${'─'.repeat(80)}`;
+    expect(detectClaudeBashBlocksWithActivityEvidence([
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '',
+      inverseRule,
+      '❯ queued follow-up',
+      inverseRule,
+    ], [2]).blocks).toEqual([]);
+  });
+
+  test('rejects paired composer rules when the prompt row is not 244-painted', () => {
+    const topRule = `\x1b[38;5;244m${'─'.repeat(80)}\x1b[39m`;
+    const bottomRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '',
+      topRule,
+      '❯ shell prompt-shaped output',
+      bottomRule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks).toEqual([]);
+  });
+
+  test('accepts a bottom composer rule which inherits 244 paint across rows', () => {
+    const topRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const bottomRule = '─'.repeat(80);
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '',
+      topRule,
+      '❯ queued follow-up',
+      bottomRule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks[0]?.sourceRange)
+      .toEqual({ startLine: 0, endLine: 2 });
+
+    // Resetting the inherited foreground before the bottom row makes the same
+    // visible glyphs ordinary unpainted output, so the identity check rejects.
+    lines[5] = '\x1b[39m❯ queued follow-up';
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks).toEqual([]);
+  });
+
+  test('accepts a top composer rule which inherits 244 from a preceding blank row', () => {
+    const rule = '─'.repeat(80);
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      paintedActivity('✢'),
+      '\x1b[38;5;244m',
+      rule,
+      '❯ queued follow-up',
+      rule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks[0]?.sourceRange)
+      .toEqual({ startLine: 0, endLine: 2 });
+  });
+
+  test('rejects activity paint while inverse rendition is inherited from shell output', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done\x1b[7m',
+      paintedActivity('✢'),
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks).toEqual([]);
+  });
+
+  test('rejects inherited activity paint after malformed ESC carry', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const lines = [
+      '● Bash(printf done)',
+      '  ⎿  done\x1b[38;5;174mX\x1b[1\x1b[0m',
+      '✢ Thinking… \x1b[38;5;246m(thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    expect(detectClaudeBashBlocksWithActivityEvidence(lines, [2]).blocks).toEqual([]);
+  });
+
+  test('keeps an ordinary coloured download meter in the final DISTILL payload', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const download = '\x1b[38;5;246m*\x1b[39m Downloading… (↓ 12 MB/s)';
+    const lines = [
+      '● Bash(printf download-progress)',
+      '  ⎿  connected',
+      download,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const detection = detectClaudeBashBlocks(lines);
+    expect(detection.blocks[0]?.sourceRange).toEqual({ startLine: 0, endLine: 3 });
+    expect(detection.blocks[0]?.output).toBe('connected\n* Downloading… (↓ 12 MB/s)');
+    expect(projectClaudeBashGroupedLines(lines, { mode: 'haiku', detection }).summaryRequests)
+      .toEqual([expect.objectContaining({
+        output: 'connected\n* Downloading… (↓ 12 MB/s)',
+        lineCount: 4,
+      })]);
+  });
+
+  test('does not mistake background RGB operands for Claude foreground paint', () => {
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const backgroundOnly = '\x1b[48;2;38;5;174m✢ Thinking… '
+      + '(1m · ↓ 2k tokens · thinking with max effort)';
+    const lines = [
+      '● Bash(printf background-colour)',
+      '  ⎿  first',
+      backgroundOnly,
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    const detection = detectClaudeBashBlocks(lines);
+    expect(detection.blocks).toEqual([]);
+    expect(projectClaudeBashLines(lines, { mode: 'haiku' }).lines).toBe(lines);
   });
 
   test('promotes a stale grey header when result plus later boundary proves completion', () => {
@@ -132,7 +893,7 @@ describe('Claude Bash detector', () => {
       ];
       const [block] = detectClaudeBashBlocks(lines).blocks;
       expect(block?.sourceRange).toEqual({ startLine: 0, endLine: lines.length - 4 });
-      expect(block?.output).toContain(continuation.at(-1));
+      expect(block?.output).toContain(continuation.at(-1)!);
 
       const projection = projectClaudeBashLines(lines, { mode: 'hide' });
       expect(projection.rows[0]?.rawRange).toEqual({ startLine: 0, endLine: lines.length - 4 });
@@ -157,7 +918,6 @@ describe('Claude Bash detector', () => {
     const composerRule = `\x1b[38;5;244m${'─'.repeat(paneColumns)}`;
     const markerOutputs = [
       { raw: '● shell bullet', visible: '● shell bullet' },
-      { raw: '❯ shell prompt-shaped output', visible: '❯ shell prompt-shaped output' },
       { raw: '✻ shell spinner-shaped output', visible: '✻ shell spinner-shaped output' },
       { raw: '\x1b[31m● red shell bullet\x1b[0m', visible: '● red shell bullet' },
     ];
@@ -181,6 +941,23 @@ describe('Claude Bash detector', () => {
       expect(projectClaudeBashLines(lines, { mode: 'hide' }).rows[0]?.rawRange)
         .toEqual({ startLine: 0, endLine: 4 });
     }
+
+    // Prompt-shaped bytes immediately after a full-width result are
+    // indistinguishable from a submitted prompt at a soft-wrap seam. Preserve
+    // the complete candidate rather than hiding either interpretation.
+    const ambiguousPrompt = [
+      '● Bash(render-marker-output)',
+      `  ⎿  ${'x'.repeat(paneColumns - 5)}`,
+      '❯ shell prompt-shaped output',
+      'tail after prompt-shaped output',
+      '\x1b[38;5;231m●\x1b[39m real Claude boundary',
+      composerRule,
+      '❯ ',
+      composerRule,
+    ];
+    expect(detectClaudeBashBlocks(ambiguousPrompt).blocks).toEqual([]);
+    expect(projectClaudeBashLines(ambiguousPrompt, { mode: 'hide' }).lines)
+      .toBe(ambiguousPrompt);
   });
 
   test('fails open after ambiguous wraps instead of trusting arbitrary SGR or approval choices', () => {
@@ -444,6 +1221,23 @@ describe('Claude Bash detector', () => {
     const tooLong = [...exactLimit];
     tooLong.splice(4, 0, '     third');
     expect(detectClaudeBashBlocks(tooLong, { maxBlockLines: 4 }).blocks).toEqual([]);
+  });
+
+  test('does not inspect paint bytes before the maxScanLines corridor', () => {
+    const rows = Array.from({ length: 100 }, (_, index) => `archived-${index}`);
+    rows[99] = 'current tail';
+    const guarded = new Proxy(rows, {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/.test(property) && Number(property) < 99) {
+          throw new Error(`read outside scan corridor: ${property}`);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const detection = detectClaudeBashBlocks(guarded, { maxScanLines: 1 });
+    expect(detection.scanRange).toEqual({ startLine: 99, endLine: 100 });
+    expect(detection.blocks).toEqual([]);
   });
 
   test('keeps nested Agent Bash and output text containing Bash( as ordinary output', () => {

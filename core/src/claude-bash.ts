@@ -15,6 +15,11 @@
 
 import { stripAnsi } from './prompt-scan';
 import { stringCells } from './cells';
+import {
+  isClaudeActivityStatusLine,
+  isStyledClaudeActivityStatusLine,
+  terminalPaintSnapshot,
+} from './claude-status';
 
 export type ClaudeBashMode = 'off' | 'hide' | 'haiku';
 export type ClaudeBashBlockStatus = 'completed' | 'active';
@@ -315,13 +320,81 @@ function headerAt(raw: string): HeaderMatch | null {
   return completedHeader(raw) ?? activeHeader(raw);
 }
 
+function isCalibratedCompletedHeader(raw: string): boolean {
+  if (completedHeader(raw) === null || !isCalibratedClaudeTopLevel(raw)) return false;
+  const boldBash = BOLD_BASH.exec(raw);
+  if (!boldBash) return false;
+  // The bold SGR must begin at the semantic `Bash` label immediately after
+  // Claude's marker. A submitted prompt can contain a plain fake header and a
+  // later bold word; that later styling is not proof for the leading label.
+  const semanticPrefix = stripAnsi(raw.slice(0, boldBash.index)).replace(/\u00a0/g, ' ');
+  return semanticPrefix === '● ' || semanticPrefix === '⏺ ';
+}
+
 function isResultDelimiter(line: string): boolean {
   return /^ {2}⎿(?: {1,2}|$)/.test(line);
 }
 
-type BoundaryKind = 'top-level' | 'composer-rule' | 'dialog' | 'approval';
+type BoundaryKind = 'top-level' | 'user-prompt' | 'composer-rule' | 'dialog' | 'approval';
 
-function boundaryKind(line: string): BoundaryKind | null {
+type TerminalPaintEntryState = Readonly<{
+  foreground: number | null;
+  inverse: boolean;
+  concealed: boolean;
+}>;
+
+type TerminalPaintCorridor = Readonly<{
+  startLine: number;
+  entries: readonly TerminalPaintEntryState[];
+}>;
+
+function terminalPaintCorridor(
+  rawLines: readonly string[],
+  startLine: number,
+): TerminalPaintCorridor {
+  const entries: TerminalPaintEntryState[] = [];
+  const boundedStart = Math.max(0, Math.min(startLine, rawLines.length));
+  // State outside maxScanLines is intentionally not inspected. Unknown carry
+  // fails open until an in-corridor SGR reset establishes exact rendition.
+  let state: TerminalPaintEntryState = boundedStart === 0
+    ? { foreground: null, inverse: false, concealed: false }
+    : { foreground: -1, inverse: false, concealed: true };
+  for (let index = boundedStart; index < rawLines.length; index += 1) {
+    const raw = rawLines[index] ?? '';
+    entries.push(state);
+    if (raw.length > MAX_CANDIDATE_ROW_CHARS) {
+      state = { foreground: -1, inverse: false, concealed: true };
+      continue;
+    }
+    const paint = terminalPaintSnapshot(
+      raw,
+      state.foreground,
+      state.inverse,
+      state.concealed,
+    );
+    state = paint
+      ? {
+          foreground: paint.endForeground,
+          inverse: paint.endInverse,
+          concealed: paint.endConcealed,
+        }
+      // Malformed control input is an unknown rendition until a later reset
+      // explicitly clears it; treating it as concealed keeps identity checks
+      // fail-open while the ordinary raw renderer remains canonical.
+      : { foreground: -1, inverse: false, concealed: true };
+  }
+  return { startLine: boundedStart, entries };
+}
+
+function terminalPaintEntryAt(
+  corridor: TerminalPaintCorridor,
+  line: number,
+): TerminalPaintEntryState | undefined {
+  if (line < corridor.startLine) return undefined;
+  return corridor.entries[line - corridor.startLine];
+}
+
+function boundaryKind(raw: string, line: string): BoundaryKind | null {
   // Approval copy can sit inside either rounded or square Claude chrome. Strip
   // only one leading border and its rule decoration; ordinary command output
   // remains untouched. Recognition here is deliberately semantic because an
@@ -336,34 +409,192 @@ function boundaryKind(line: string): BoundaryKind | null {
     /^(?:I want to run:|Do you want to (?:allow|proceed)|Would you like to (?:allow|proceed)|This command requires approval)/i.test(dialogContent)
     || /^❯\s*\d+[.)]\s*(?:Yes|No|Allow|Deny)\b/i.test(dialogContent)
   ) return 'approval';
-  if (/^(?:●|⏺|❯|✻)(?:\s|$)/.test(line)) return 'top-level';
+  // Claude can echo a submitted/queued prompt at columns 0–2 while tool work
+  // continues. This is a protective boundary, not an identity claim: a shell
+  // row which happens to share the shape may make us expose more Bash output,
+  // but must never let HIDE consume user-authored text through the next Claude
+  // marker. Approval choices above retain their stronger fail-open semantics.
+  if (/^ {0,2}❯(?:\s|$)/u.test(line)) return 'user-prompt';
+  if (
+    /^(?:●|⏺|✻)(?:\s|$)/.test(line)
+    || isCalibratedClaudeTopLevel(raw)
+  ) return 'top-level';
   if (/^[─━-]{8,}\s*$/.test(line)) return 'composer-rule';
   if (/^[╭┌┏](?:[─━-]|\s)/.test(line)) return 'dialog';
   return null;
 }
 
-/** Claude 2.1.x paints both composer rules as one un-reset 244-grey row.
- * Requiring the paired `rule / ❯ / rule` shape keeps this a calibrated UI
- * signature instead of guessing from a generic box-drawing line. */
-function claudeComposerRuleCells(raw: string): number | null {
-  const style = /^\x1b\[38(?:;5;244|:5:244)m/.exec(raw);
-  if (!style) return null;
-  if (raw.slice(style[0].length).includes('\x1b')) return null;
-  const line = visibleLine(raw);
+/** Claude paints every cell in both composer rules 244-grey. tmux may split or
+ * reset equivalent SGR spans, so validate the painted cells plus the paired
+ * `rule / ❯ / rule` shape rather than one serialization of those spans. */
+function claudeComposerRule(
+  raw: string,
+  initialForeground: number | null = null,
+  initialInverse = false,
+  initialConcealed = false,
+): {
+  cells: number;
+  endForeground: number | null;
+  endInverse: boolean;
+  endConcealed: boolean;
+} | null {
+  const paint = terminalPaintSnapshot(
+    raw,
+    initialForeground,
+    initialInverse,
+    initialConcealed,
+  );
+  if (!paint) return null;
+  const line = paint.visible.replace(/\u00a0/g, ' ').trimEnd();
   if (!/^[─━-]{8,}$/.test(line)) return null;
-  return stringCells(line);
+  for (let unit = 0; unit < line.length; unit += 1) {
+    if (paint.foregrounds[unit] !== 244) return null;
+  }
+  return {
+    cells: stringCells(line),
+    endForeground: paint.endForeground,
+    endInverse: paint.endInverse,
+    endConcealed: paint.endConcealed,
+  };
 }
 
-function confirmedClaudeComposerRuleAt(rawLines: readonly string[], index: number): number | null {
-  const cells = claudeComposerRuleCells(rawLines[index] ?? '');
-  if (cells === null) return null;
+function confirmedClaudeComposerPairAt(
+  rawLines: readonly string[],
+  topIndex: number,
+  bottomIndex: number,
+  paintCorridor: TerminalPaintCorridor,
+): number | null {
+  if (
+    topIndex < paintCorridor.startLine
+    || bottomIndex !== topIndex + 2
+    || bottomIndex >= rawLines.length
+    || (rawLines[topIndex]?.length ?? 0) > MAX_CANDIDATE_ROW_CHARS
+    || (rawLines[topIndex + 1]?.length ?? 0) > MAX_CANDIDATE_ROW_CHARS
+    || (rawLines[bottomIndex]?.length ?? 0) > MAX_CANDIDATE_ROW_CHARS
+  ) return null;
+  const topEntry = terminalPaintEntryAt(paintCorridor, topIndex);
+  const top = claudeComposerRule(
+    rawLines[topIndex] ?? '',
+    topEntry?.foreground ?? null,
+    topEntry?.inverse ?? false,
+    topEntry?.concealed ?? false,
+  );
+  if (!top) return null;
+  const middleRaw = rawLines[topIndex + 1] ?? '';
+  const middlePaint = terminalPaintSnapshot(
+    middleRaw,
+    top.endForeground,
+    top.endInverse,
+    top.endConcealed,
+  );
+  if (!middlePaint) return null;
+  const middle = middlePaint.visible.replace(/\u00a0/g, ' ').trimEnd();
+  if (!/^❯(?:\s|$)/.test(middle)) return null;
+  for (let unit = 0; unit < middle.length; unit += 1) {
+    if (/\s/u.test(middle[unit] ?? '')) continue;
+    if (middlePaint.foregrounds[unit] !== 244) {
+      return null;
+    }
+  }
+  const bottom = claudeComposerRule(
+    rawLines[bottomIndex] ?? '',
+    middlePaint.endForeground,
+    middlePaint.endInverse,
+    middlePaint.endConcealed,
+  );
+  return bottom?.cells === top.cells ? top.cells : null;
+}
+
+function confirmedClaudeComposerRuleAt(
+  rawLines: readonly string[],
+  index: number,
+  paintCorridor: TerminalPaintCorridor,
+): number | null {
   for (const otherIndex of [index + 2, index - 2]) {
     if (otherIndex < 0 || otherIndex >= rawLines.length) continue;
-    const otherCells = claudeComposerRuleCells(rawLines[otherIndex] ?? '');
-    const middle = visibleLine(rawLines[(index + otherIndex) / 2] ?? '');
-    if (otherCells === cells && /^❯(?:\s|$)/.test(middle)) return cells;
+    const cells = confirmedClaudeComposerPairAt(
+      rawLines,
+      Math.min(index, otherIndex),
+      Math.max(index, otherIndex),
+      paintCorridor,
+    );
+    if (cells !== null) return cells;
   }
   return null;
+}
+
+function confirmedClaudeComposerPromptAt(
+  rawLines: readonly string[],
+  index: number,
+  paintCorridor: TerminalPaintCorridor,
+): boolean {
+  return confirmedClaudeComposerPairAt(
+    rawLines,
+    index - 1,
+    index + 1,
+    paintCorridor,
+  ) !== null;
+}
+
+/**
+ * The rotating glyph alone is not identity: Bash output can print the same
+ * words and colours. Accept a newly added Claude spinner only when its exact
+ * measured styling is followed by the paired live composer within eight rows.
+ * Historical/ambiguous rows remain only contextual candidates until a caller
+ * supplies repaint evidence.
+ */
+function isContextualClaudeActivityStatusAt(
+  rawLines: readonly string[],
+  index: number,
+  paintCorridor: TerminalPaintCorridor,
+): boolean {
+  const entry = terminalPaintEntryAt(paintCorridor, index);
+  if (!isStyledClaudeActivityStatusLine(
+    rawLines[index] ?? '',
+    entry?.foreground ?? null,
+    entry?.inverse ?? false,
+    entry?.concealed ?? false,
+  )) return false;
+  const end = Math.min(rawLines.length, index + 8);
+  let candidate = index + 1;
+
+  const skipBlankRows = (): boolean => {
+    let skipped = 0;
+    while (candidate < end && visibleLine(rawLines[candidate] ?? '').trim() === '') {
+      skipped += 1;
+      if (skipped > 2) return false;
+      candidate += 1;
+    }
+    return true;
+  };
+  const hasComposer = (): boolean => (
+    candidate < end
+    && confirmedClaudeComposerRuleAt(rawLines, candidate, paintCorridor) !== null
+  );
+
+  if (!skipBlankRows()) return false;
+  if (hasComposer()) return true;
+
+  // Retained Claude captures place at most one of these known chrome families
+  // between the animated status and composer. Ordinary output is never skipped:
+  // a status-shaped shell row followed by a real tail must fail open.
+  const first = visibleLine(rawLines[candidate] ?? '').trimStart();
+  if (/^⎿\s*Tip:/.test(first)) {
+    candidate += 1;
+    if (!skipBlankRows()) return false;
+    return hasComposer();
+  }
+  if (/^● How is Claude doing this session\?\s*\(optional\)\s*$/.test(first)) {
+    candidate += 1;
+    const choices = visibleLine(rawLines[candidate] ?? '').trim();
+    if (!/^1:\s*Bad\s+2:\s*Fine\s+3:\s*Good\s+0:\s*Dismiss$/.test(choices)) {
+      return false;
+    }
+    candidate += 1;
+    if (!skipBlankRows()) return false;
+    return hasComposer();
+  }
+  return false;
 }
 
 /** Resume at the newest composer after a rejected ambiguous corridor. A shell
@@ -375,13 +606,14 @@ function resumeAfterAmbiguousCorridor(
   rawLines: readonly string[],
   ambiguousLine: number,
   scanEnd: number,
+  paintCorridor: TerminalPaintCorridor,
 ): number {
   for (
     let index = Math.min(rawLines.length, scanEnd) - 1;
     index > ambiguousLine;
     index -= 1
   ) {
-    if (confirmedClaudeComposerRuleAt(rawLines, index) !== null) return index;
+    if (confirmedClaudeComposerRuleAt(rawLines, index, paintCorridor) !== null) return index;
   }
   return scanEnd;
 }
@@ -390,10 +622,13 @@ function resumeAfterAmbiguousCorridor(
  * Live calibration put all ten observed pairs 4–7 rows from the capture tail.
  * Keep 64 rows of headroom, but never scan an old archive-sized corridor: a
  * composer from before resize must not masquerade as today's pane width. */
-function inferredPaneColumns(rawLines: readonly string[]): number | null {
-  const start = Math.max(0, rawLines.length - 64);
+function inferredPaneColumns(
+  rawLines: readonly string[],
+  paintCorridor: TerminalPaintCorridor,
+): number | null {
+  const start = Math.max(paintCorridor.startLine, rawLines.length - 64);
   for (let index = rawLines.length - 1; index >= start; index -= 1) {
-    const cells = confirmedClaudeComposerRuleAt(rawLines, index);
+    const cells = confirmedClaudeComposerRuleAt(rawLines, index, paintCorridor);
     if (cells !== null) return cells;
   }
   return null;
@@ -404,8 +639,59 @@ function inferredPaneColumns(rawLines: readonly string[]): number | null {
  * soft-wrap makes a column-zero marker ambiguous. Unknown versions/themes
  * fail open instead of letting arbitrary shell colour turn into a boundary. */
 function isCalibratedClaudeTopLevel(raw: string): boolean {
-  return /^(?:\x1b\[0m)?\x1b\[38(?:;5;|:5:)(?:114|231|246|211|220)m(?:\x1b\[49m)?(?:●|✻)\x1b\[39m(?:\s|$)/
+  return /^(?:\x1b\[0m)?\x1b\[38(?:;5;|:5:)(?:114|174|231|246|211|220)m(?:\x1b\[49m)?(?:●|⏺|✻)\x1b\[39m(?:\s|$)/
     .test(raw);
+}
+
+/**
+ * A submitted prompt can wrap onto rows which begin with literal terminal
+ * examples such as `● Bash(...)`. Protect every following row in the already
+ * bounded scan corridor so those examples cannot become hidden blocks, even
+ * when a long mobile prompt spans more physical rows than a normal viewport.
+ *
+ * Only Claude's two strongest Bash identities end the guard early. Activity
+ * animation deliberately does not: it repaints while the queued prompt stays
+ * on screen and cannot prove that later retained rows are tool output.
+ */
+function protectedPromptContinuationRows(
+  rawLines: readonly string[],
+  scanStart: number,
+  paintCorridor: TerminalPaintCorridor,
+): ReadonlySet<number> {
+  const protectedRows = new Set<number>();
+  // A bounded scan can begin in the middle of a prompt continuation. Protect
+  // its unknown prefix conservatively instead of reading outside maxScanLines.
+  let guarding = scanStart > 0;
+
+  for (let index = scanStart; index < rawLines.length; index += 1) {
+    const raw = rawLines[index] ?? '';
+    if (raw.length <= MAX_CANDIDATE_ROW_CHARS) {
+      const line = visibleLine(raw);
+      if (boundaryKind(raw, line) === 'user-prompt') {
+        // The grey rule / `❯` / rule composer is Claude chrome, not a submitted
+        // prompt echo. It conclusively ends any earlier prompt continuation and
+        // must not quarantine a later retained Bash call.
+        if (confirmedClaudeComposerPromptAt(rawLines, index, paintCorridor)) {
+          guarding = false;
+          continue;
+        }
+        guarding = true;
+        continue;
+      }
+      if (
+        guarding
+        && (activeHeader(raw) !== null || isCalibratedCompletedHeader(raw))
+      ) {
+        guarding = false;
+        continue;
+      }
+    }
+
+    if (!guarding) continue;
+    if (index >= scanStart) protectedRows.add(index);
+  }
+
+  return protectedRows;
 }
 
 function trimOneClosingParen(rows: string[]): void {
@@ -507,6 +793,8 @@ function parseCandidate(
     maxCommandChars: number;
     maxOutputChars: number;
     paneColumns: number | null;
+    activityStatusLines: ReadonlySet<number>;
+    paintCorridor: TerminalPaintCorridor;
   }>,
 ): ParsedCandidate {
   // A block whose source range is exactly maxBlockLines rows is allowed. Read
@@ -517,8 +805,10 @@ function parseCandidate(
   const scanEnd = Math.min(rawLines.length, maximumCandidateEnd + 1);
   let delimiterLine = -1;
   let boundaryLine = -1;
+  let completionBoundary = false;
   let pendingBlankStart = -1;
   let softWrappedWeakBoundary = false;
+  let ambiguousActivityStatusLine = -1;
 
   for (let i = startLine + 1; i < scanEnd; i += 1) {
     const raw = rawLines[i] ?? '';
@@ -532,8 +822,72 @@ function parseCandidate(
     }
 
     const nextHeader = headerAt(raw);
-    const boundary = nextHeader ? 'top-level' : boundaryKind(line);
+    const semanticActivityStatus = isClaudeActivityStatusLine(line);
+    const paintEntry = terminalPaintEntryAt(limits.paintCorridor, i);
+    const styledActivityStatus = semanticActivityStatus
+      && isStyledClaudeActivityStatusLine(
+        raw,
+        paintEntry?.foreground ?? null,
+        paintEntry?.inverse ?? false,
+        paintEntry?.concealed ?? false,
+      );
+    const contextualActivityStatus = styledActivityStatus
+      && isContextualClaudeActivityStatusAt(rawLines, i, limits.paintCorridor);
+    const activityStatusBoundary = contextualActivityStatus
+      && limits.activityStatusLines.has(i);
+    const boundary = nextHeader
+      ? 'top-level'
+      : activityStatusBoundary
+        ? 'top-level'
+        // `●` and `✻` are normally top-level markers, but an animated row with
+        // exact composer context is still indistinguishable from the final
+        // line of shell output in one static capture. Wait for repaint proof.
+        : semanticActivityStatus
+          ? null
+          : boundaryKind(raw, line);
+    if (semanticActivityStatus && !activityStatusBoundary && delimiterLine >= 0) {
+      ambiguousActivityStatusLine = i;
+    }
     if (boundary) {
+      if (ambiguousActivityStatusLine >= 0 && !activityStatusBoundary) {
+        return { block: null };
+      }
+      if (boundary === 'user-prompt') {
+        // A prompt before any result means the candidate is not a proven
+        // executed Bash block. After a result it is a hard protective edge.
+        // If the preceding physical row could be a soft wrap, bytes alone
+        // cannot decide between shell output and a real prompt: preserve the
+        // entire corridor instead of hiding either interpretation.
+        if (delimiterLine < 0) {
+          return {
+            block: null,
+            resumeLine: resumeAfterAmbiguousCorridor(
+              rawLines,
+              i,
+              scanEnd,
+              limits.paintCorridor,
+            ),
+          };
+        }
+        const previousCells = stringCells(visibleLine(rawLines[i - 1] ?? ''));
+        const previousFillsCurrentPane = limits.paneColumns !== null
+          && previousCells === limits.paneColumns;
+        const previousCouldFillAnotherPane = previousCells >= MIN_PLAUSIBLE_SOFT_WRAP_CELLS
+          && !previousFillsCurrentPane;
+        if (previousFillsCurrentPane || previousCouldFillAnotherPane) {
+          return {
+            block: null,
+            resumeLine: resumeAfterAmbiguousCorridor(
+              rawLines,
+              i,
+              scanEnd,
+              limits.paintCorridor,
+            ),
+          };
+        }
+        boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
+        break;
+      }
       // An approval box before a result is not an executed Bash block. Preserve
       // the complete dialog and candidate verbatim.
       if ((boundary === 'dialog' || boundary === 'approval') && delimiterLine < 0) {
@@ -545,14 +899,22 @@ function parseCandidate(
         if (boundary === 'approval') return { block: null };
 
         const calibratedTopLevel = boundary === 'top-level'
-          && isCalibratedClaudeTopLevel(raw);
+          && (activityStatusBoundary || isCalibratedClaudeTopLevel(raw));
         const previousCells = stringCells(visibleLine(rawLines[i - 1] ?? ''));
         const previousFillsCurrentPane = limits.paneColumns !== null
           && previousCells === limits.paneColumns;
         const previousCouldFillAnotherPane = previousCells >= MIN_PLAUSIBLE_SOFT_WRAP_CELLS
           && !previousFillsCurrentPane;
         const rejectedAmbiguousBoundary: ParsedCandidate = nextHeader
-          ? { block: null, resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd) }
+          ? {
+              block: null,
+              resumeLine: resumeAfterAmbiguousCorridor(
+                rawLines,
+                i,
+                scanEnd,
+                limits.paintCorridor,
+              ),
+            }
           : { block: null };
 
         // Rounded chrome is Claude's dialog family. Unknown copy must be kept
@@ -561,7 +923,12 @@ function parseCandidate(
         if (boundary === 'dialog' && /^╭/.test(line)) {
           return {
             block: null,
-            resumeLine: resumeAfterAmbiguousCorridor(rawLines, i, scanEnd),
+            resumeLine: resumeAfterAmbiguousCorridor(
+              rawLines,
+              i,
+              scanEnd,
+              limits.paintCorridor,
+            ),
           };
         }
 
@@ -569,13 +936,22 @@ function parseCandidate(
         // short/separator row. Immediately after a possible full-width result,
         // the exact same bytes can be shell output (for example a captured
         // Claude pane). Preserve the whole candidate instead of cutting it.
-        if (boundary === 'composer-rule' && confirmedClaudeComposerRuleAt(rawLines, i) !== null) {
+        if (
+          boundary === 'composer-rule'
+          && confirmedClaudeComposerRuleAt(rawLines, i, limits.paintCorridor) !== null
+        ) {
+          // A status-shaped row immediately before this exact composer may be
+          // Claude animation or shell output. Until a caller has witnessed it
+          // repaint, keep the entire Bash candidate raw and never summarize a
+          // payload which might have had its final output row cut away.
+          if (ambiguousActivityStatusLine >= 0) return { block: null };
           if (
             previousFillsCurrentPane
             || (previousCouldFillAnotherPane && !softWrappedWeakBoundary)
           ) {
             return rejectedAmbiguousBoundary;
           }
+          completionBoundary = true;
           boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
           break;
         }
@@ -624,6 +1000,7 @@ function parseCandidate(
           return { block: null };
         }
       }
+      completionBoundary = true;
       boundaryLine = pendingBlankStart >= 0 ? pendingBlankStart : i;
       break;
     }
@@ -647,7 +1024,11 @@ function parseCandidate(
     if (delimiterLine < 0 || endLine < 0) return { block: null };
   } else if (endLine < 0) {
     // Exact ANSI-styled active calls may safely collapse through the current
-    // capture edge. They are never offered to the summarizer.
+    // capture edge unless that edge contains an unconfirmed activity-shaped
+    // row. That row may already be Claude chrome or the command's final output;
+    // either way, collapsing it for one partial capture would visibly flicker.
+    if (ambiguousActivityStatusLine >= 0) return { block: null };
+    // Active calls are never offered to the summarizer.
     endLine = rawLines.length;
   }
 
@@ -673,7 +1054,7 @@ function parseCandidate(
   // offered to a summarizer.
   const status: ClaudeBashBlockStatus = header.status === 'active'
     && delimiterLine >= 0
-    && boundaryLine >= 0
+    && completionBoundary
     ? 'completed'
     : header.status;
   const fingerprint = blockFingerprint(fullCommand, fullOutput, status);
@@ -698,10 +1079,10 @@ function parseCandidate(
   };
 }
 
-/** Detect high-confidence top-level Claude Code Bash blocks in physical rows. */
-export function detectClaudeBashBlocks(
+function detectClaudeBashBlocksInternal(
   rawLines: readonly string[],
-  options: ClaudeBashDetectionOptions = {},
+  options: ClaudeBashDetectionOptions,
+  provenActivityStatusLines: readonly number[],
 ): ClaudeBashDetection {
   const maxScanLines = boundedInteger(options.maxScanLines, DEFAULT_MAX_SCAN_LINES, 1_000_000);
   const scanStart = Math.max(0, rawLines.length - maxScanLines);
@@ -715,14 +1096,30 @@ export function detectClaudeBashBlocks(
   const maxBlocks = boundedInteger(options.maxBlocks, DEFAULT_MAX_BLOCKS, 100_000);
   const maxCommandChars = boundedInteger(options.maxCommandChars, DEFAULT_MAX_COMMAND_CHARS, 1_000_000);
   const maxOutputChars = boundedInteger(options.maxOutputChars, DEFAULT_MAX_OUTPUT_CHARS, 2_000_000);
+  const activityStatusLines = new Set<number>();
+  for (const line of provenActivityStatusLines.slice(0, 512)) {
+    if (Number.isInteger(line) && line >= scanStart && line < rawLines.length) {
+      activityStatusLines.add(line);
+    }
+  }
   if (maxBlockLines < 2 || maxBlocks === 0) {
     return Object.freeze({ blocks: Object.freeze([]), scanRange, enabled: true });
   }
 
   const blocks: ClaudeBashBlock[] = [];
-  const paneColumns = inferredPaneColumns(rawLines);
+  const paintCorridor = terminalPaintCorridor(rawLines, scanStart);
+  const paneColumns = inferredPaneColumns(rawLines, paintCorridor);
+  const promptContinuationRows = protectedPromptContinuationRows(
+    rawLines,
+    scanStart,
+    paintCorridor,
+  );
   let i = scanStart;
   while (i < rawLines.length) {
+    if (promptContinuationRows.has(i)) {
+      i += 1;
+      continue;
+    }
     const header = headerAt(rawLines[i] ?? '');
     if (!header) {
       i += 1;
@@ -734,6 +1131,8 @@ export function detectClaudeBashBlocks(
       maxCommandChars,
       maxOutputChars,
       paneColumns,
+      activityStatusLines,
+      paintCorridor,
     });
     if (!parsed.block) {
       i = Math.max(i + 1, parsed.resumeLine ?? 0);
@@ -752,6 +1151,29 @@ export function detectClaudeBashBlocks(
     scanRange,
     enabled: true,
   });
+}
+
+/** Detect high-confidence top-level Claude Code Bash blocks in physical rows. */
+export function detectClaudeBashBlocks(
+  rawLines: readonly string[],
+  options: ClaudeBashDetectionOptions = {},
+): ClaudeBashDetection {
+  return detectClaudeBashBlocksInternal(rawLines, options, []);
+}
+
+/**
+ * Experimental temporal-evidence entry point used by live terminal views.
+ * `provenActivityStatusLines` must contain only physical rows whose visible
+ * Claude activity text repainted one-to-one across successive captures. Paint
+ * and paired-composer identity are still revalidated here; unproven rows stay
+ * raw and never truncate a DISTILL payload.
+ */
+export function detectClaudeBashBlocksWithActivityEvidence(
+  rawLines: readonly string[],
+  provenActivityStatusLines: readonly number[],
+  options: ClaudeBashDetectionOptions = {},
+): ClaudeBashDetection {
+  return detectClaudeBashBlocksInternal(rawLines, options, provenActivityStatusLines);
 }
 
 function isBlankPresentationRow(raw: string): boolean {

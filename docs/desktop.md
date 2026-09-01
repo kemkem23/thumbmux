@@ -451,6 +451,8 @@ type TermViewProps = {
   bottomInsetPx?: number;          // default 0
   claimGeometry?: boolean;         // default true
   altScreenMouse?: boolean;        // default false
+  claudeBashMode?: 'off' | 'hide' | 'haiku'; // default off; presentation only
+  codexToolMode?: 'off' | 'hide';  // default off; presentation only
   screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
                                     // default undefined — live wire sample wins once one arrives
   onKeys?: (data: string) => void; // gate for SGR routing from either source — see below
@@ -463,6 +465,12 @@ type TermViewProps = {
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
+
+The Claude and Codex tool modes alter only presentation rows. Detection runs
+only on a known normal screen and fails open on incomplete or ambiguous paint.
+Copy, search, cursor placement, history retention and callbacks continue to use
+the canonical raw rows. `SessionView` exposes these modes through its `TOOLS`
+action; a direct `TermView` host may opt in with the props above.
 
 `onLinesChange` publishes the newly committed raw model. A fail-closed reader
 freeze therefore stays silent while newer whole captures are deferred. The
