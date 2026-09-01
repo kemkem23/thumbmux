@@ -26,6 +26,12 @@ type MuxCallback = (
     source: 'full' | 'delta';
     replace: boolean;
     screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
+    boundary?: {
+      generation: string;
+      liveStartLine: number;
+      walSequence: string;
+      walOffset: number;
+    };
   },
 ) => void;
 
@@ -83,6 +89,16 @@ const ACTIVE = [
   '\x1b[38;5;246m \x1b[39m \x1b[1mBash\x1b[0m(rg -n Bash src',
   '      tests)',
 ];
+
+const styledCompletedBashHeader = (command: string) =>
+  `\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(${command})`;
+
+const historyBoundaryAt = (generation: string, liveStartLine: number) => ({
+  generation,
+  liveStartLine,
+  walSequence: String(liveStartLine),
+  walOffset: liveStartLine * 100,
+});
 
 const mounted: Mounted[] = [];
 let sessionCallback: MuxCallback | null = null;
@@ -170,6 +186,7 @@ function mountView(
   options: {
     height?: number;
     historyPaging?: 'ceiling' | 'sliding';
+    useLiveScreen?: boolean;
     onSummary?: SummaryHandler;
     onLinesChange?: (lines: string[]) => void;
   } = {},
@@ -183,7 +200,9 @@ function mountView(
     palette,
     claimGeometry: false,
     fontPx: 13,
-    screen: { alt: false, mouseSgr: false, mouseAny: false },
+    screen: options.useLiveScreen
+      ? undefined
+      : { alt: false, mouseSgr: false, mouseAny: false },
     claudeBashMode: mode,
     historyPaging: options.historyPaging ?? 'sliding',
     onClaudeBashSummaryRequest: options.onSummary,
@@ -222,12 +241,23 @@ function deliver(
   lines: readonly string[],
   replace = true,
   cursor: { row: number; col: number } | null = null,
+  meta: Partial<NonNullable<Parameters<MuxCallback>[3]>> = {},
 ): void {
   if (!sessionCallback) throw new Error('TermView did not subscribe');
   sessionCallback(lines.join('\n'), 'output', cursor, {
     source: 'full',
     replace,
     screen: { alt: false, mouseSgr: false, mouseAny: false },
+    // Projection-focused fixtures model a capture whose physical origin is
+    // known. Provenance-specific cases pass their own boundary or explicitly
+    // omit this default; the full history matrix lives in the companion test.
+    boundary: {
+      generation: 'g-known-origin',
+      liveStartLine: 0,
+      walSequence: '0',
+      walOffset: 0,
+    },
+    ...meta,
   });
   flushSync();
 }
@@ -236,6 +266,21 @@ async function settleUi(): Promise<void> {
   await Promise.resolve();
   await tick();
   flushSync();
+}
+
+async function waitForAttribute(
+  element: Element,
+  name: string,
+  expected: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await settleUi();
+    if (element.getAttribute(name) === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(
+    `timed out waiting for ${name}=${expected}; received ${element.getAttribute(name)}`,
+  );
 }
 
 function visibleText(viewport: HTMLElement): string[] {
@@ -373,6 +418,780 @@ describe('TermView Claude Bash projection', () => {
     expect(
       viewport.querySelector('.mtv-bash-placeholder .search-active')?.textContent,
     ).toContain('hidden bash');
+  });
+
+  test('thinking animation stays on its own visible raw row through every Claude frame', async () => {
+    const { viewport } = mountView('hide');
+    const spinnerFrames = ['·', '✻', '✽', '✶', '✳', '✢', '·'];
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string, prompt = '❯ queued follow-up') => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      prompt,
+      composerRule,
+    ];
+
+    // One static frame is indistinguishable from a command whose final output
+    // copied Claude chrome. Fail open until the same row visibly repaints.
+    deliver(pane(spinnerFrames[0]!));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    expect(visibleText(viewport)).toContain(
+      '· Thinking… (1m · ↓ 2k tokens · thinking with xhigh effort)',
+    );
+
+    for (const frame of spinnerFrames.slice(1)) {
+      const thinking = pane(frame)[2]!;
+      deliver(pane(frame));
+      await settleUi();
+
+      const placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
+      const status = viewport.querySelector<HTMLElement>('[data-raw-start="2"][data-raw-end="3"]');
+      expect(placeholder?.getAttribute('data-raw-start'), `frame ${frame}`).toBe('0');
+      expect(placeholder?.getAttribute('data-raw-end'), `frame ${frame}`).toBe('2');
+      expect(status?.textContent, `frame ${frame}`).toContain(`${frame} Thinking…`);
+      expect(viewport.getAttribute('data-claude-activity-evidence'), `frame ${frame}`).toBe('2');
+      expect(viewport.getAttribute('data-raw-total'), `frame ${frame}`).toBe('7');
+      expect(viewport.getAttribute('data-total'), `frame ${frame}`).toBe('6');
+    }
+
+    // A later update elsewhere in the composer must not forget the already
+    // witnessed activity row when that row's visible bytes stay unchanged.
+    deliver(pane('·', '❯ queued follow-up updated'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end')).toBe('2');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')?.textContent)
+      .toContain('· Thinking…');
+
+    // Claude can insert Tip chrome below the status without moving the status
+    // itself. Global tail shifting alone would point the proof at the Bash
+    // result row and expand the hidden block for this frame.
+    const withTip = pane('·', '❯ queued follow-up updated');
+    withTip.splice(3, 0, '⎿ Tip: press escape to interrupt');
+    deliver(withTip);
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('8');
+    expect(viewport.getAttribute('data-total')).toBe('7');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end')).toBe('2');
+    deliver(pane('·', '❯ queued follow-up updated'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end')).toBe('2');
+
+    // A full replacement which moves the status row must arm the new absolute
+    // coordinate instead of transferring proof by proximity. Controlled
+    // history prepend/removal paths reindex separately because they know the
+    // exact mutation boundary.
+    deliver(['retained history row', ...pane('·', '❯ shifted composer')]);
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    deliver(['retained history row', ...pane('✻', '❯ shifted composer')]);
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('3');
+    expect(viewport.getAttribute('data-total')).toBe('7');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start')).toBe('1');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="3"]')?.textContent)
+      .toContain('✻ Thinking…');
+    deliver(pane('✻', '❯ unshifted composer'));
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('');
+    expect(viewport.getAttribute('data-total')).toBe('7');
+    expect(viewport.querySelector('.mtv-bash-placeholder') === null).toBe(true);
+    deliver(pane('✽', '❯ unshifted composer'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start')).toBe('0');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')?.textContent)
+      .toContain('✽ Thinking…');
+  });
+
+  test('keeps a queued user prompt mounted when an equal-height hidden range moves', async () => {
+    const { viewport } = mountView('hide');
+    const promptText = '❯ prompt ล่าสุดของผู้ใช้ต้องไม่หาย';
+    const updatedPromptText = '❯ prompt ล่าสุดฉบับแก้ไขก็ต้องไม่หาย';
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'prompt ล่าสุดของผู้ใช้ต้องไม่หาย\x1b[39m\x1b[49m';
+    const updatedQueuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'prompt ล่าสุดฉบับแก้ไขก็ต้องไม่หาย\x1b[39m\x1b[49m';
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(110)}`;
+    const activity = (frame: string) => (
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mTransfiguring…\x1b[39m `
+        + '\x1b[38;5;246m(6m 56s · ↓ 20.9k tokens)\x1b[39m'
+    );
+    const emptyComposer = '\x1b[38;5;244m❯ Press up to edit queued messages';
+    const first = (frame: string) => [
+      'retained row before Bash',
+      '● Bash(printf first)',
+      '  ⎿  first',
+      '',
+      queuedPrompt,
+      activity(frame),
+      '',
+      composerRule,
+      emptyComposer,
+      composerRule,
+      'footer chrome',
+    ];
+    const shifted = (frame: string, prompt = queuedPrompt) => [
+      '● Bash(printf second)',
+      '  ⎿  second',
+      '',
+      prompt,
+      activity(frame),
+      '',
+      composerRule,
+      emptyComposer,
+      composerRule,
+      'retained row after composer',
+      'footer chrome',
+    ];
+
+    deliver(first('·'));
+    await settleUi();
+    deliver(first('✻'));
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('11');
+    expect(viewport.getAttribute('data-total')).toBe('9');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start'))
+      .toBe('1');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('4');
+    const firstPrompt = viewport.querySelector<HTMLElement>('[data-raw-start="4"]');
+    expect(firstPrompt?.textContent).toContain(promptText);
+    expect(firstPrompt?.closest('.mtv-bash-placeholder')).toBeNull();
+
+    // This replacement keeps eleven raw rows and nine presentation rows while
+    // moving the compacted Bash range from 1..4 to 0..3. The keyed DOM must
+    // publish the new projection instead of leaving the prompt behind a stale
+    // placeholder at visual row one.
+    deliver(shifted('✻'));
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('11');
+    expect(viewport.getAttribute('data-total')).toBe('9');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start'))
+      .toBe('0');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('3');
+    const shiftedPrompt = viewport.querySelector<HTMLElement>('[data-raw-start="3"]');
+    expect(shiftedPrompt?.textContent).toContain(promptText);
+    expect(shiftedPrompt?.closest('.mtv-bash-placeholder')).toBeNull();
+    expect(visibleText(viewport).filter((line) => line.includes(promptText))).toHaveLength(1);
+
+    // Composer traffic can replace the queued prompt without changing either
+    // raw or projected height. That update must invalidate the visible keyed
+    // row even while the spinner bytes stay unchanged.
+    deliver(shifted('✻', updatedQueuedPrompt));
+    await settleUi();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="3"]')?.textContent)
+      .toContain(updatedPromptText);
+    expect(visibleText(viewport).some((line) => line.includes(promptText))).toBe(false);
+
+    // Repaint at the moved status coordinate rearms temporal evidence without
+    // widening the Bash range across the prompt.
+    deliver(shifted('✽', updatedQueuedPrompt));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('3');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="3"]')?.textContent)
+      .toContain(updatedPromptText);
+    expect(visibleText(viewport)).toContain('✽ Transfiguring… (6m 56s · ↓ 20.9k tokens)');
+  });
+
+  test('keeps a Bash-shaped queued-prompt continuation out of the hidden range', async () => {
+    const { viewport } = mountView('hide');
+    const queuedPrompt = '  \x1b[38;5;239m\x1b[48;5;237m❯ \x1b[38;5;231m'
+      + 'preserve literal capture below\x1b[39m\x1b[49m';
+    const fakeHeader = '\x1b[38;5;231m\x1b[48;5;237m'
+      + '● Bash(printf prompt-owned)\x1b[39m\x1b[49m';
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(110)}`;
+    const activity = (frame: string) => (
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mTransfiguring…\x1b[39m `
+        + '\x1b[38;5;246m(6m 56s · ↓ 20.9k tokens)\x1b[39m'
+    );
+    const pane = (frame: string) => [
+      '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(printf real)',
+      '\x1b[38;5;246m  ⎿ \u00a0\x1b[39mreal output',
+      '',
+      queuedPrompt,
+      fakeHeader,
+      '  ⎿  prompt-owned output',
+      activity(frame),
+      '',
+      composerRule,
+      '\x1b[38;5;244m❯ Press up to edit queued messages',
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+
+    const placeholders = viewport.querySelectorAll('.mtv-bash-placeholder');
+    expect(placeholders).toHaveLength(1);
+    expect(placeholders[0]?.getAttribute('data-raw-start')).toBe('0');
+    expect(placeholders[0]?.getAttribute('data-raw-end')).toBe('3');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="3"]')?.textContent)
+      .toContain('❯ preserve literal capture below');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="4"]')?.textContent)
+      .toContain('● Bash(printf prompt-owned)');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="5"]')?.textContent)
+      .toContain('⎿  prompt-owned output');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="4"]')
+      ?.closest('.mtv-bash-placeholder')).toBeNull();
+  });
+
+  test('enabling hide arms the already visible activity frame for the next repaint', async () => {
+    const { props, viewport } = mountView('off');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    flushSync(() => { props.claudeBashMode = 'hide'; });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    deliver(pane('✻'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end')).toBe('2');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')?.textContent)
+      .toContain('✻ Thinking…');
+  });
+
+  test('measured live bullet/verb repaint becomes a stable activity boundary', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (verb: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;174m●\x1b[39m \x1b[38;5;174m${verb}…\x1b[39m `
+        + '\x1b[38;5;246m(7m · ↓ 38.3k tokens · thinking with max effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('Spinning'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    deliver(pane('Sprouting'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end')).toBe('2');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')?.textContent)
+      .toContain('● Sprouting…');
+  });
+
+  test('legacy 246-marker animation stays stable through every repaint frame', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;246m${frame}\x1b[39m Thinking… `
+        + '(1m · ↓ 2k tokens · thinking with xhigh effort)',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const frames = ['·', '✻', '✽', '✶', '✳', '✢'];
+
+    deliver(pane(frames[0]!));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    for (const frame of frames.slice(1)) {
+      deliver(pane(frame));
+      await settleUi();
+      expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'), frame)
+        .toBe('2');
+      expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')?.textContent, frame)
+        .toContain(`${frame} Thinking…`);
+    }
+  });
+
+  test('active capture edge keeps an unpaired thinking row visible across repaint', async () => {
+    const { viewport } = mountView('hide');
+    const pane = (frame: string) => [
+      ACTIVE[0]!,
+      '  ⎿  command completed',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    expect(viewport.getAttribute('data-total')).toBe('3');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    expect(visibleText(viewport)).toContain(
+      '✻ Thinking… (1m · ↓ 2k tokens · thinking with xhigh effort)',
+    );
+  });
+
+  test('WAL generation change requires a fresh within-generation repaint', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string) => [
+      styledCompletedBashHeader('printf done'),
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const boundary = (generation: string) => ({
+      generation,
+      liveStartLine: 100,
+      walSequence: '10',
+      walOffset: 1_000,
+    });
+
+    deliver(pane('·'), true, null, { boundary: boundary('g1') });
+    await settleUi();
+    deliver(pane('✻'), true, null, { boundary: boundary('g1') });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).not.toBeNull();
+
+    deliver(pane('✻'), true, null, { boundary: boundary('g2') });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    deliver(pane('✽'), true, null, { boundary: boundary('g2') });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('2');
+  });
+
+  test('WAL generation fence invalidates an authorized block beyond incremental rescan', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string, trailers: readonly string[]) => [
+      styledCompletedBashHeader('printf done'),
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+      ...trailers,
+    ];
+    const boundary = (generation: string) => ({
+      generation,
+      liveStartLine: 100,
+      walSequence: '10',
+      walOffset: 1_000,
+    });
+    const trailers = Array.from({ length: 2_100 }, (_, index) => `trailer-${index}`);
+
+    deliver(pane('·', []), true, null, { boundary: boundary('g1') });
+    await settleUi();
+    deliver(pane('✻', []), true, null, { boundary: boundary('g1') });
+    await settleUi();
+    deliver(pane('✻', trailers), true, null, { boundary: boundary('g1') });
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('2107');
+    expect(viewport.getAttribute('data-total')).toBe('2106');
+
+    const changedTail = [...trailers];
+    changedTail[changedTail.length - 1] = 'new-generation-tail';
+    deliver(pane('✻', changedTail), true, null, { boundary: boundary('g2') });
+    await settleUi();
+    expect(viewport.getAttribute('data-total')).toBe('2107');
+  });
+
+  test('alternate-to-normal screen flip requires a fresh normal-screen repaint', async () => {
+    const { viewport } = mountView('hide', { useLiveScreen: true });
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const screen = (alt: boolean) => ({ alt, mouseSgr: false, mouseAny: false });
+
+    deliver(pane('·'), true, null, { screen: screen(true) });
+    await settleUi();
+    deliver(pane('✻'), true, null, { screen: screen(true) });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    deliver(pane('✻'), true, null, { screen: screen(false) });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    deliver(pane('✽'), true, null, { screen: screen(false) });
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('2');
+  });
+
+  test('confirmed and rearming repaint survive beyond the bounded tail scan', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    expect(viewport.getAttribute('data-total')).toBe('6');
+
+    const later = Array.from({ length: 100 }, (_, index) => `later-${index}`);
+    deliver([...pane('✻'), ...later]);
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('107');
+    expect(viewport.getAttribute('data-total')).toBe('106');
+
+    const movedPane = (frame: string) => {
+      const moved = ['retained-history-row', ...pane(frame)];
+      // Keep the total raw length unchanged while moving the status 2 -> 3.
+      moved.splice(4, 1);
+      return moved;
+    };
+    deliver([...movedPane('✻'), ...later]);
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    // Row 3 is outside the newest 96 rows. Its exact repaint must still rearm
+    // from the persistent baseline instead of leaving HIDE raw forever.
+    deliver([...movedPane('✽'), ...later]);
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('3');
+    // The block is now above the virtualized DOM window; model row count is
+    // the authoritative proof that its two raw rows collapsed to one marker.
+    expect(viewport.getAttribute('data-total')).toBe('106');
+  });
+
+  test('does not transfer repaint proof between collapsing status rows', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string, verb: string, label: string) => [
+      `● Bash(printf ${label})`,
+      `  ⎿  ${label}`,
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174m${verb}…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const first = pane('·', 'Alpha', 'first');
+    const second = pane('✻', 'Beta', 'second');
+
+    // Status A is raw row 2 and status B is raw row 30. When the 28 rows
+    // between/tail disappear, A stays byte-identical at row 2 while B occupies
+    // A's tail-relative candidate. That is two source identities, not repaint.
+    deliver([...first, ...Array.from({ length: 21 }, (_, index) => `filler-${index}`), ...second]);
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    deliver(first);
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('7');
+    expect(viewport.getAttribute('data-total')).toBe('7');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+  });
+
+  test('requires a fresh repaint after a replacement moves the only status row', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string, label: string, prefix: readonly string[] = []) => [
+      ...prefix,
+      `● Bash(printf ${label})`,
+      `  ⎿  ${label}`,
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·', 'genuine'));
+    await settleUi();
+    deliver(pane('✻', 'genuine'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).not.toBeNull();
+
+    const shiftedPrefix = ['shell-row-a', 'shell-row-b', 'shell-row-c'];
+    deliver(pane('✻', 'static-spoof', shiftedPrefix));
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('10');
+    expect(viewport.getAttribute('data-total')).toBe('10');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    deliver(pane('✽', 'static-spoof', shiftedPrefix));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start'))
+      .toBe('3');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('5');
+  });
+
+  test('keeps a settled DISTILL summary while a moved status row rearms', async () => {
+    let summaryCalls = 0;
+    const onSummary: SummaryHandler = async (requests) => {
+      summaryCalls += 1;
+      return Object.fromEntries(requests.map((request) => [request.id, 'สรุปคงเดิม']));
+    };
+    const { viewport } = mountView('haiku', { onSummary });
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (
+      frame: string,
+      prefix: readonly string[] = [],
+      includeStatusGap = true,
+    ) => [
+      ...prefix,
+      '● Bash(printf stable-summary)',
+      '  ⎿  stable-output',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      ...(includeStatusGap ? [''] : []),
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    await settleUi();
+    expect(summaryCalls).toBe(1);
+    expect(viewport.textContent).toContain('Bash · สรุปคงเดิม');
+
+    // Prefix insertion plus removal of the status gap keeps the same total
+    // length, so row displacement is not equal to the net length shift.
+    deliver(pane('✻', ['retained-history-row'], false));
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    // A second replacement can move the provisional baseline again before the
+    // spinner repaints. Roll it forward without authorizing this movement frame
+    // or pruning the already-settled semantic summary.
+    const twiceShiftedPrefix = ['retained-history-row', 'second-retained-row'];
+    deliver(pane('✻', twiceShiftedPrefix, false));
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+    expect(summaryCalls).toBe(1);
+
+    deliver(pane('✽', twiceShiftedPrefix, false));
+    await settleUi();
+    await settleUi();
+    expect(viewport.getAttribute('data-claude-activity-evidence')).toBe('4');
+    expect(viewport.textContent).toContain('Bash · สรุปคงเดิม');
+    expect(summaryCalls).toBe(1);
+  });
+
+  test('keeps an in-flight DISTILL result which settles during the raw rearm frame', async () => {
+    let summaryCalls = 0;
+    let settleSummary: ((summaries: ClaudeBashSummaries) => void) | null = null;
+    const pendingSummary = new Promise<ClaudeBashSummaries>((resolve) => {
+      settleSummary = resolve;
+    });
+    let requestedIds: string[] = [];
+    const onSummary: SummaryHandler = (requests) => {
+      summaryCalls += 1;
+      requestedIds = requests.map((request) => request.id);
+      return pendingSummary;
+    };
+    const { viewport } = mountView('haiku', { onSummary });
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (
+      frame: string,
+      prefix: readonly string[] = [],
+      prompt = '❯ queued follow-up',
+    ) => [
+      ...prefix,
+      '● Bash(printf pending-summary)',
+      '  ⎿  pending-output',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      prompt,
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    expect(summaryCalls).toBe(1);
+    expect(requestedIds).toHaveLength(1);
+
+    deliver(pane('✻', ['retained-history-row']));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    // Composer-only traffic may arrive before the spinner repaints at its new
+    // coordinate. It must not consume the evidence grace or drop the request.
+    deliver(pane('✻', ['retained-history-row'], '❯ prompt changed while waiting'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    settleSummary?.(Object.fromEntries(requestedIds.map((id) => [id, 'สรุประหว่างรอ'])));
+    await settleUi();
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+
+    deliver(pane('✽', ['retained-history-row'], '❯ prompt changed while waiting'));
+    await settleUi();
+    await settleUi();
+    expect(viewport.textContent).toContain('Bash · สรุประหว่างรอ');
+    expect(summaryCalls).toBe(1);
+  });
+
+  test('withdrawn repaint proof invalidates a cached block before a distant raw change', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const status = (frame: string) => (
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m'
+    );
+    const pane = (frame: string) => [
+      '● Bash(printf done)',
+      '  ⎿  done',
+      status(frame),
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+    const stableTail = Array.from({ length: 3_000 }, (_, index) => `stable-${index}`);
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    deliver([...pane('✻'), ...stableTail]);
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('3007');
+    expect(viewport.getAttribute('data-total')).toBe('3006');
+
+    const next = [
+      ...pane('✻'),
+      ...stableTail,
+      ...Array.from({ length: 3_000 }, (_, index) => `appended-${index}`),
+    ];
+    // The old proof at row 2 now has both an absolute and a tail-relative
+    // status candidate. The proof must be withdrawn even though the first raw
+    // byte change is 3,002 rows down, beyond the incremental rescan window.
+    next[3_002] = status('✽');
+    deliver(next);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-raw-total')).toBe('6007');
+    expect(viewport.getAttribute('data-total')).toBe('6007');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+  });
+
+  test('does not preserve repaint proof onto a byte-stable competing status row', async () => {
+    const { viewport } = mountView('hide');
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const pane = (frame: string, label: string) => [
+      `● Bash(printf ${label})`,
+      `  ⎿  ${label}`,
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·', 'actual'));
+    await settleUi();
+    deliver(pane('✻', 'actual'));
+    await settleUi();
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-end'))
+      .toBe('2');
+
+    // The old proof at raw 2 now has two candidates: an exact ✻ row at the
+    // same absolute index and the actual prior block shifted to raw 28/30.
+    // Byte equality cannot choose source identity between them.
+    deliver([
+      ...pane('✻', 'fake'),
+      ...Array.from({ length: 21 }, (_, index) => `filler-${index}`),
+      ...pane('✽', 'actual'),
+    ]);
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('35');
+    expect(viewport.getAttribute('data-total')).toBe('35');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+  });
+
+  test('ceiling-history prepend keeps repaint proof attached to the activity row', async () => {
+    const { viewport } = mountView('hide', { height: 120, historyPaging: 'ceiling' });
+    const composerRule = `\x1b[38;5;244m${'─'.repeat(80)}`;
+    const prefix = Array.from({ length: 115 }, (_, index) => `retained-${index}`);
+    const pane = (frame: string) => [
+      ...prefix,
+      styledCompletedBashHeader('printf done'),
+      '  ⎿  done',
+      `\x1b[38;5;174m${frame}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
+        + '\x1b[38;5;246m(1m · ↓ 2k tokens · thinking with xhigh effort)\x1b[39m',
+      '',
+      composerRule,
+      '❯ queued follow-up',
+      composerRule,
+    ];
+
+    deliver(pane('·'));
+    await settleUi();
+    deliver(pane('✻'));
+    await settleUi();
+    expect(viewport.getAttribute('data-raw-total')).toBe('122');
+    expect(viewport.getAttribute('data-total')).toBe('121');
+    expect(viewport.querySelector('.mtv-bash-placeholder')?.getAttribute('data-raw-start'))
+      .toBe('115');
+
+    wheelUp(viewport);
+    expect(historyRequests).toBe(1);
+    if (!sessionCallback) throw new Error('TermView did not subscribe');
+    sessionCallback(JSON.stringify({
+      lines: ['older-history'],
+      startLine: 0,
+      hasMore: false,
+    }), 'history');
+    await waitForAttribute(viewport, 'data-raw-total', '123');
+
+    // The proof belonged to raw row 117 before the prepend and row 118 after
+    // it. Leaving the index behind makes the detector fail open and expands
+    // the hidden Bash block for one history commit.
+    expect(viewport.getAttribute('data-raw-total')).toBe('123');
+    expect(viewport.getAttribute('data-total')).toBe('122');
   });
 
   test('placeholder uses neutral UI style while hidden raw rows still carry SGR and OSC state', async () => {
@@ -1168,6 +1987,32 @@ describe('TermView Claude Bash projection', () => {
     ).toBeLessThanOrEqual(2_049);
   });
 
+  test('a stale cached block cannot strengthen prompt-owned Bash after replacement', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    const first = Array.from({ length: 3_000 }, (_, index) => `plain-${index}`);
+    first[2_500] = '● Bash(printf initially-real)';
+    first[2_501] = '  ⎿  initially-real output';
+    first[2_502] = '● initially-real boundary';
+    deliver(first);
+    await settleUi();
+    expect(viewport.getAttribute('data-total')).toBe('2999');
+
+    const replacement = [...first];
+    replacement[2_400] = '  ❯ submitted prompt begins before stale block coordinate';
+    for (let index = 2_401; index < 2_500; index += 1) {
+      replacement[index] = `  prompt continuation ${index}`;
+    }
+    replacement[2_500] = '● Bash(printf prompt-owned-at-stale-coordinate)';
+    replacement[2_501] = '  ⎿  prompt-owned output';
+    replacement[2_502] = '● apparent boundary inside prompt transcript';
+    deliver(replacement);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-raw-total')).toBe('3000');
+    expect(viewport.getAttribute('data-total')).toBe('3000');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+  });
+
   test('incremental seam on an absorbed leading blank falls back to the exact cold projection', async () => {
     const { viewport } = mountView('hide', { height: 120 });
     const first = Array.from({ length: 10_000 }, (_, i) => `plain-${i}`);
@@ -1298,6 +2143,33 @@ describe('TermView Claude Bash projection', () => {
     );
   });
 
+  test('a retention seam cannot turn prompt continuation into a hidden Bash block', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    deliver(Array.from({ length: 10_000 }, (_, index) => `base-${index}`));
+    await settleUi();
+    wheelUp(viewport);
+
+    const protectedEnd = Math.max(...Array.from(
+      viewport.querySelectorAll<HTMLElement>('.mtv-line'),
+      (line) => Number(line.getAttribute('data-raw-end')),
+    ));
+    expect(protectedEnd).toBeGreaterThan(2);
+
+    const next = Array.from({ length: 12_100 }, (_, index) => `next-${index}`);
+    next[protectedEnd - 1] = '  ❯ long prompt anchor retained before the gap';
+    // Sliding retention removes 2,100 rows here. The next row becomes the
+    // first row of a detector segment whose prompt anchor is no longer local.
+    next[protectedEnd + 2_100] = '● Bash(printf prompt-owned-after-gap)';
+    next[protectedEnd + 2_101] = '  ⎿  prompt-owned output after gap';
+    next[protectedEnd + 2_102] = '● apparent boundary after prompt transcript';
+    deliver(next);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-raw-total')).toBe('10000');
+    expect(viewport.getAttribute('data-total')).toBe('10000');
+    expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
+  });
+
   test('an archived pre-resize segment without its composer never hides half a wrapped Bash result', async () => {
     const { viewport } = mountView('hide', { height: 120 });
     deliver(Array.from({ length: 10_000 }, (_, i) => `base-${i}`));
@@ -1342,13 +2214,15 @@ describe('TermView Claude Bash projection', () => {
     const { viewport } = mountView('hide', { height: 120 });
     const live = [
       '',
-      '● Bash(printf seam-history)',
+      styledCompletedBashHeader('printf seam-history'),
       '  ⎿  seam-history-output',
       '\x1b[0m \u00a0',
       '● live-boundary',
       ...Array.from({ length: 115 }, (_, index) => `line-${index}`),
     ];
-    deliver(live);
+    deliver(live, true, null, {
+      boundary: historyBoundaryAt('g-seam-history', 1),
+    });
     await settleUi();
     wheelUp(viewport);
     expect(historyRequests).toBe(1);
@@ -1397,7 +2271,9 @@ describe('TermView Claude Bash projection', () => {
       '● live-boundary',
       ...Array.from({ length: 115 }, (_, index) => `split-line-${index}`),
     ];
-    deliver(live);
+    deliver(live, true, null, {
+      boundary: historyBoundaryAt('g-split-history', 21),
+    });
     await settleUi();
     wheelUp(viewport);
     expect(historyRequests).toBe(1);
@@ -1451,11 +2327,11 @@ describe('TermView Claude Bash projection', () => {
       .toBeLessThanOrEqual(0.5);
   });
 
-  test('ceiling-history prepend keeps the same anchor when seam context absorbs a blank', async () => {
+  test('ceiling-history prepend keeps its anchor while preserving an unproven seam blank', async () => {
     const { viewport } = mountView('hide', { height: 120, historyPaging: 'ceiling' });
     const live = [
       '',
-      '● Bash(printf ceiling-seam)',
+      styledCompletedBashHeader('printf ceiling-seam'),
       '  ⎿  ceiling-output',
       '',
       '● live-boundary',
@@ -1483,17 +2359,22 @@ describe('TermView Claude Bash projection', () => {
 
     expect(viewport.getAttribute('data-history-paging')).toBe('ceiling');
     expect(viewport.getAttribute('data-raw-total')).toBe('121');
-    expect(viewport.getAttribute('data-total')).toBe('118');
+    expect(viewport.getAttribute('data-total')).toBe('119');
     const afterLine = viewport.querySelector<HTMLElement>(`[data-line-id="${anchorId}"]`);
     if (!afterLine) throw new Error('ceiling seam projection dropped the raw anchor');
     expect(projectedScreenY(viewport, afterLine)).toBeCloseTo(screenYBefore, 5);
-    expect(viewport.querySelector<HTMLElement>('[data-raw-start="1"]')
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="2"]')
       ?.getAttribute('data-raw-end')).toBe('5');
   });
 
   test('history prepend uses projected row count and preserves the mounted raw anchor', async () => {
     const { viewport } = mountView('hide', { height: 120 });
-    deliver(Array.from({ length: 120 }, (_, i) => `line-${i}`));
+    deliver(
+      Array.from({ length: 120 }, (_, i) => `line-${i}`),
+      true,
+      null,
+      { boundary: historyBoundaryAt('g-anchor-history', 5) },
+    );
     await settleUi();
     wheelUp(viewport);
     expect(historyRequests).toBe(1);

@@ -330,10 +330,14 @@ function projectedScreenY(viewport: HTMLElement, row: HTMLElement): number {
 
 function completedBash(label: string): string[] {
   return [
-    `● Bash(printf ${label})`,
+    styledBashHeader(`printf ${label}`),
     `  ⎿  output-${label}`,
     `● boundary-${label}`,
   ];
+}
+
+function styledBashHeader(command: string): string {
+  return `\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(${command})`;
 }
 
 /** Absolute archive row at the viewport's top edge (within archive pages). */
@@ -1228,6 +1232,677 @@ describe("TermView sliding archive window", () => {
     expect(marker?.getAttribute("aria-label")).toBe("240 rows dropped before this row");
   });
 
+  test("keeps Bash-shaped prompt continuation raw when live history precedes row zero", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput([
+      "● Bash(prompt-owned-at-live-start)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("bounded-live", 7),
+    ], undefined, historyBoundary("g-leading-live", 18_000, 1));
+
+    expect(viewport.getAttribute("data-history-live-start")).toBe("18000");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(10);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-at-live-start)");
+  });
+
+  test("keeps initial Bash-shaped rows raw when sliding output has no boundary proof", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput([
+      "● Bash(prompt-owned-without-boundary)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("boundaryless-live", 7),
+    ]);
+
+    expect(viewport.getAttribute("data-history-live-start")).toBeNull();
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(10);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-without-boundary)");
+  });
+
+  test("does not reuse a prior boundary for a boundaryless replacement frame", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(
+      liveLines("proven-live", 10),
+      undefined,
+      historyBoundary("g-boundary-drop", 0, 1),
+    );
+    expect(viewport.getAttribute("data-history-live-start")).toBe("0");
+
+    deliverOutput([
+      "● Bash(prompt-owned-on-cached-reconnect-frame)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("boundaryless-reconnect", 7),
+    ]);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(10);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-on-cached-reconnect-frame)");
+  });
+
+  test("guards the live seam when an attached archive has no paired boundary", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines("unpaired-archive-live", 120));
+
+    wheel(viewport, -1_000_000);
+    deliverHistory(0, archiveLines(0, 5), false, 5);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(viewport.getAttribute("data-history-window-start")).toBe("0");
+
+    deliverOutput([
+      "● Bash(prompt-owned-at-unproven-live-seam)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("unpaired-live-replacement", 117),
+    ]);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(125);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="5"]')?.textContent)
+      .toBe("● Bash(prompt-owned-at-unproven-live-seam)");
+  });
+
+  test("guards the live seam below a known-origin ceiling archive", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("ceiling-seam-live", 120));
+
+    wheel(viewport, -1_000_000);
+    deliverHistory(0, archiveLines(0, 5), false, 5);
+    expect(viewport.getAttribute("data-history-paging")).toBe("ceiling");
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+
+    deliverOutput([
+      "● Bash(prompt-owned-at-ceiling-live-seam)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("ceiling-live-replacement", 117),
+    ]);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(125);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="5"]')?.textContent)
+      .toBe("● Bash(prompt-owned-at-ceiling-live-seam)");
+  });
+
+  test("keeps Bash-shaped initial live rows raw while ceiling history is unresolved", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput([
+      "● Bash(prompt-owned-before-ceiling-load)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("unresolved-ceiling", 7),
+    ]);
+
+    expect(viewport.getAttribute("data-history-paging")).toBe("ceiling");
+    expect(viewport.getAttribute("data-history-stop")).toBe("none");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(10);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-ceiling-load)");
+
+    deliverOutput([
+      styledBashHeader("printf proven-ceiling-bash"),
+      "  ⎿  real command output",
+      "● apparent boundary",
+      ...liveLines("unresolved-ceiling", 7),
+    ]);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(9);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"].mtv-bash-hidden'))
+      .not.toBeNull();
+  });
+
+  test("keeps ceiling row zero unknown after an empty EOF without a numeric floor", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    const promptOwned = [
+      "● Bash(prompt-owned-before-empty-eof)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("empty-eof-live", 117),
+    ];
+    deliverOutput(promptOwned);
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: null,
+      limit: 2_000,
+    });
+    deliverHistory(null, [], false);
+
+    const repainted = [...promptOwned];
+    repainted[repainted.length - 1] = "empty-eof-live-repainted-tail";
+    deliverOutput(repainted);
+
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(120);
+    expect(numberAttr(viewport, "data-total")).toBe(120);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-empty-eof)");
+  });
+
+  test("does not reuse an empty numeric-floor proof for a later live window", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("numeric-eof-live", 120));
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: null,
+      limit: 2_000,
+    });
+    deliverHistory(0, [], false);
+
+    deliverOutput([
+      "● Bash(prompt-owned-after-empty-floor-zero)",
+      "  ⎿  prompt-owned output",
+      "● apparent boundary",
+      ...liveLines("later-live-window", 117),
+    ]);
+
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(120);
+    expect(numberAttr(viewport, "data-total")).toBe(120);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-after-empty-floor-zero)");
+  });
+
+  test("does not move a resident ceiling floor with an empty numeric page", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("resident-floor-live", 120));
+
+    wheel(viewport, -1_000_000);
+    const resident = archiveLines(18_000, 5);
+    resident[0] = "● Bash(prompt-owned-at-resident-floor)";
+    resident[1] = "  ⎿  prompt-owned output";
+    resident[2] = "● apparent boundary";
+    deliverHistory(18_000, resident, true, 18_005);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(125);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: 18_000,
+      limit: 2_000,
+    });
+    deliverHistory(0, [], false);
+
+    const repainted = liveLines("resident-floor-live", 120);
+    repainted[repainted.length - 1] = "resident-floor-repainted-tail";
+    deliverOutput(repainted);
+
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(125);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-at-resident-floor)");
+  });
+
+  test("rejects a ceiling page whose row range exceeds safe integer coordinates", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("unsafe-floor-live", 120));
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toHaveLength(1);
+    deliverHistory(
+      Number.MAX_SAFE_INTEGER,
+      ["unsafe-floor-a", "unsafe-floor-b"],
+      false,
+    );
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(120);
+    expect(viewport.getAttribute("data-history-stop")).toBe("none");
+    expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toHaveLength(2);
+  });
+
+  test("never re-requests a cursorless ceiling page after trimming its prefix", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("cursorless-retention-live", 9_999));
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+    deliverHistory(null, ["cursorless-old-a", "cursorless-old-b"], false);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+
+    deliverOutput(liveLines("cursorless-retention-shrunk", 120));
+    expect(numberAttr(viewport, "data-raw-total")).toBe(121);
+    wheel(viewport, -1_000_000);
+    expect(historyCalls).toHaveLength(1);
+  });
+
+  test("keeps prompt continuation raw after client retention cuts its anchor", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    const oversized = Array.from(
+      { length: 12_000 },
+      (_, index) => `retention-row-${index}`,
+    );
+    oversized[1_999] = "  ❯ submitted prompt anchor outside retained rows";
+    oversized[2_000] = "● Bash(prompt-owned-after-client-cut)";
+    oversized[2_001] = "  ⎿  prompt-owned output";
+    oversized[2_002] = "● apparent boundary";
+
+    deliverOutput(
+      oversized,
+      undefined,
+      historyBoundary("g-client-leading-cut", 0, 1),
+    );
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(numberAttr(viewport, "data-total")).toBe(10_000);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-after-client-cut)");
+
+    // A paired replacement at absolute origin zero is a new authoritative raw
+    // world. It may safely retire the conservative client-cut provenance.
+    deliverOutput(
+      [
+        "● Bash(printf restored-known-origin)",
+        "  ⎿  real command output",
+        "● real boundary",
+        ...liveLines("restored-known-origin", 7),
+      ],
+      undefined,
+      historyBoundary("g-client-leading-cut", 0, 2),
+      { replace: true },
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10);
+    expect(numberAttr(viewport, "data-total")).toBe(9);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"].mtv-bash-hidden'))
+      .not.toBeNull();
+  });
+
+  test("does not authorize Haiku work before an oversized origin restore is retained", async () => {
+    let summaryCalls = 0;
+    const summaryBatches: string[][] = [];
+    const { viewport } = mountTermView({
+      mode: "haiku",
+      onSummary: (requests) => {
+        summaryCalls += 1;
+        summaryBatches.push(requests.map((request) => request.command));
+        return {};
+      },
+    });
+    await tick();
+    deliverOutput(
+      Array.from({ length: 12_000 }, (_, index) => `initial-cut-${index}`),
+      undefined,
+      historyBoundary("g-oversized-origin-restore", 0, 1),
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+
+    const oversizedRestore = Array.from(
+      { length: 12_000 },
+      (_, index) => `oversized-restore-${index}`,
+    );
+    oversizedRestore[0] = styledBashHeader("printf evicted-before-summary");
+    oversizedRestore[1] = "  ⎿  must never reach Haiku";
+    oversizedRestore[2] = "● apparent boundary";
+    deliverOutput(
+      oversizedRestore,
+      undefined,
+      historyBoundary("g-oversized-origin-restore", 0, 2),
+      { replace: true },
+    );
+    await settleUi();
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(summaryCalls).toBe(0);
+    expect(viewport.querySelector(".mtv-bash-placeholder")).toBeNull();
+
+    const retainedRestore = Array.from(
+      { length: 12_000 },
+      (_, index) => `retained-restore-${index}`,
+    );
+    retainedRestore.splice(11_980, 3, ...completedBash("retained-bootstrap-a"));
+    retainedRestore.splice(11_990, 3, ...completedBash("retained-bootstrap-b"));
+    deliverOutput(
+      retainedRestore,
+      undefined,
+      historyBoundary("g-oversized-origin-restore", 0, 3),
+      { replace: true },
+    );
+    await settleUi();
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(summaryCalls).toBe(1);
+    expect(summaryBatches).toEqual([[
+      "printf retained-bootstrap-a",
+      "printf retained-bootstrap-b",
+    ]]);
+    expect(viewport.querySelector(".mtv-bash-placeholder")).not.toBeNull();
+  });
+
+  test("retention finalizes eligibility before a synchronous Haiku callback re-enters", async () => {
+    const batches: string[][] = [];
+    let nestedFrame: string[] | null = null;
+    let nestedDelivered = false;
+    mountTermView({
+      mode: "haiku",
+      onSummary: (requests) => {
+        const commands = requests.map((request) => request.command);
+        batches.push(commands);
+        if (
+          !nestedDelivered
+          && commands.includes("printf retained-newest-b")
+          && nestedFrame
+        ) {
+          nestedDelivered = true;
+          if (!sessionCallback) throw new Error("subscribe was not invoked");
+          const frame = [...nestedFrame];
+          frame[frame.length - 30] = "reentrant-pre-group-repaint";
+          sessionCallback(frame.join("\n"), "output", null, {
+            source: "delta",
+            replace: true,
+            boundary: historyBoundary("g-retention-reentrant", 0, 3),
+          });
+        }
+        return Object.fromEntries(
+          requests.map((request) => [request.id, `summary ${request.command}`]),
+        );
+      },
+    });
+    await tick();
+
+    deliverOutput(
+      completedBash("bootstrap-before-retention"),
+      undefined,
+      historyBoundary("g-retention-reentrant", 0, 1),
+    );
+    await settleUi();
+    batches.length = 0;
+
+    const oversized = Array.from(
+      { length: 12_000 },
+      (_, index) => `reentrant-retention-${index}`,
+    );
+    oversized.splice(11_980, 3, ...completedBash("retained-older-a"));
+    oversized.splice(11_990, 3, ...completedBash("retained-newest-b"));
+    nestedFrame = oversized.slice(2_000);
+    deliverOutput(
+      oversized,
+      undefined,
+      historyBoundary("g-retention-reentrant", 0, 2),
+      { source: "delta", replace: true },
+    );
+    await settleUi();
+    await settleUi();
+
+    expect(nestedDelivered).toBe(true);
+    expect(batches).toEqual([["printf retained-newest-b"]]);
+  });
+
+  test("defers Haiku until cross-seam URL byte retention has settled", async () => {
+    let summaryCalls = 0;
+    const { viewport } = mountTermView({
+      mode: "haiku",
+      historyPaging: "ceiling",
+      onSummary: () => {
+        summaryCalls += 1;
+        return {};
+      },
+    });
+    await tick();
+
+    const continuation = "c".repeat(20);
+    const resident = liveLines("seam-byte-live", 120);
+    resident[0] = continuation;
+    resident[1] = "x".repeat(4_000_000);
+    deliverOutput(resident);
+
+    const url = `https://example.com/${"a".repeat(40)}`;
+    expect(url).toHaveLength(60);
+    const page = [
+      styledBashHeader("printf evicted-after-seam-accounting"),
+      "  ⎿  must not reach Haiku",
+      "● completed-before-url-seam",
+      url,
+    ];
+    const wrappedHrefLength = url.length + continuation.length;
+    const stageBytes = page.reduce(
+      (bytes, line) => bytes + 64 + 2 * line.length,
+      64 + 2 * wrappedHrefLength,
+    );
+    const budget = numberAttr(viewport, "data-retained-byte-budget");
+    const initialBytes = numberAttr(viewport, "data-retained-estimated-bytes");
+    const fillerGrowth = Math.floor((budget - stageBytes - 100 - initialBytes) / 2);
+    expect(fillerGrowth).toBeGreaterThan(0);
+    resident[1] += "x".repeat(fillerGrowth);
+    deliverOutput(resident);
+
+    const tunedBytes = numberAttr(viewport, "data-retained-estimated-bytes");
+    expect(budget - tunedBytes - stageBytes).toBeGreaterThanOrEqual(100);
+    expect(budget - tunedBytes - stageBytes).toBeLessThanOrEqual(101);
+
+    wheel(viewport, -1_000_000);
+    deliverHistory(0, page, false, page.length);
+    await settleUi();
+
+    expect(numberAttr(viewport, "data-retained-estimated-bytes")).toBeLessThanOrEqual(budget);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(123);
+    expect(deliveredLines.at(-1)).not.toContain(page[0]);
+    expect(summaryCalls).toBe(0);
+  });
+
+  test("keeps resident prompt rows raw while an origin page is still parsing", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("atomic-history-live", 120));
+
+    wheel(viewport, -1_000_000);
+    const resident = archiveLines(600, 5);
+    resident[0] = "● Bash(prompt-owned-during-history-parse)";
+    resident[1] = "  ⎿  prompt-owned output";
+    resident[2] = "● apparent boundary";
+    deliverHistory(600, resident, true, 605);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+
+    wheel(viewport, -1_000_000);
+    if (!sessionCallback) throw new Error("subscribe was not invoked");
+    sessionCallback(JSON.stringify({
+      lines: archiveLines(0, 600),
+      startLine: 0,
+      endLine: 600,
+      totalArchivedLines: 600,
+      hasMore: false,
+    }), "history");
+    flushSync();
+
+    const processReply = idleCallbacks.entries().next().value as
+      | [number, IdleRequestCallback]
+      | undefined;
+    if (!processReply) throw new Error("history reply was not queued");
+    idleCallbacks.delete(processReply[0]);
+    processReply[1]({ didTimeout: false, timeRemaining: () => 50 });
+    flushSync();
+    expect(idleCallbacks.size).toBeGreaterThan(0);
+
+    const repainted = liveLines("atomic-history-live", 120);
+    repainted[repainted.length - 1] = "atomic-history-live-repainted-tail";
+    sessionCallback(repainted.join("\n"), "output", null, {
+      source: "full",
+      replace: true,
+    });
+    flushSync();
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(125);
+    expect(numberAttr(viewport, "data-total")).toBe(125);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    drainScheduledWork();
+  });
+
+  test("keeps prompt continuation raw when retention cuts only the archive anchor", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines("archive-cut-live", 240));
+
+    wheel(viewport, -1_000_000);
+    const archive = archiveLines(0, 9_760);
+    archive[0] = "  ❯ submitted prompt anchor at archive origin";
+    archive[1] = "● Bash(prompt-owned-after-archive-cut)";
+    archive[2] = "  ⎿  prompt-owned output";
+    archive[3] = "● apparent boundary";
+    deliverHistory(0, archive, false, 9_760);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(numberAttr(viewport, "data-total")).toBe(10_000);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+
+    // Growing only the live tail by one row forces the 10k retention gate to
+    // remove archive row zero. The plain Bash-shaped continuation becomes the
+    // new resident row zero, but its submitted-prompt anchor is now missing.
+    deliverOutput(liveLines("archive-cut-live-grown", 241));
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(numberAttr(viewport, "data-total")).toBe(10_000);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-after-archive-cut)");
+  });
+
+  test("keeps Bash-shaped prompt continuation raw at a ceiling-history leading edge", async () => {
+    const { viewport } = mountTermView({ mode: "hide", historyPaging: "ceiling" });
+    await tick();
+    deliverOutput(liveLines());
+
+    wheel(viewport, -1_000_000);
+    const firstPage = archiveLines(18_000, 2_000);
+    firstPage[0] = "● Bash(prompt-owned-before-ceiling-page)";
+    firstPage[1] = "  ⎿  prompt-owned output";
+    firstPage[2] = "● apparent boundary";
+    deliverHistory(18_000, firstPage, true);
+
+    expect(viewport.getAttribute("data-history-paging")).toBe("ceiling");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(2_240);
+    expect(numberAttr(viewport, "data-total")).toBe(2_240);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: 18_000,
+      limit: 2_000,
+    });
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-ceiling-page)");
+
+    deliverHistory(null, [], false);
+    deliverOutput(liveLines("ceiling-repaint", 240));
+    expect(viewport.getAttribute("data-history-stop")).toBe("exhausted");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(2_240);
+    expect(numberAttr(viewport, "data-total")).toBe(2_240);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-ceiling-page)");
+  });
+
+  test("keeps Bash-shaped prompt continuation raw across a nonzero history floor", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines());
+
+    wheel(viewport, -1_000_000);
+    const firstPage = archiveLines(18_000, 2_000);
+    firstPage[0] = "● Bash(prompt-owned-before-page)";
+    firstPage[1] = "  ⎿  prompt-owned output";
+    firstPage[2] = "● apparent boundary";
+    deliverHistory(18_000, firstPage, true);
+
+    expect(viewport.getAttribute("data-history-window-has-older")).toBe("1");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(2_240);
+    expect(numberAttr(viewport, "data-total")).toBe(2_240);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "before",
+      cursor: 18_000,
+      limit: 2_000,
+    });
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-page)");
+    deliverHistory(null, [], false);
+
+    // The server floor makes older rows unreachable, but absolute row 18,000
+    // still has unknown physical predecessors. Flipping hasOlder must not make
+    // the same prompt-owned bytes suddenly eligible for HIDE.
+    expect(viewport.getAttribute("data-history-window-start")).toBe("18000");
+    expect(viewport.getAttribute("data-history-window-has-older")).toBe("0");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(2_240);
+    expect(numberAttr(viewport, "data-total")).toBe(2_240);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
+      .toBe("● Bash(prompt-owned-before-page)");
+  });
+
+  test("keeps Bash-shaped prompt continuation raw after a leading server-pruning gap", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines());
+
+    for (const startLine of [18_000, 16_000, 14_000, 12_000, 10_000, 8_000]) {
+      wheel(viewport, -1_000_000);
+      deliverHistory(startLine, archiveLines(startLine, 2_000), true);
+    }
+    expect(numberAttr(viewport, "data-history-window-end")).toBe(17_760);
+
+    wheel(viewport, 1_000_000);
+    expect(historyCalls.at(-1)).toEqual({
+      direction: "after",
+      cursor: 17_759,
+      limit: 2_000,
+    });
+
+    const replacement = archiveLines(18_000, 2_000);
+    replacement[0] = "● Bash(prompt-owned-after-leading-gap)";
+    replacement[1] = "  ⎿  prompt-owned output";
+    replacement[2] = "● apparent boundary";
+    deliverHistory(18_000, replacement, true);
+
+    expect(numberAttr(viewport, "data-raw-total")).toBe(2_000);
+    expect(numberAttr(viewport, "data-total")).toBe(2_000);
+    expect(viewport.querySelector(".mtv-bash-hidden")).toBeNull();
+    const firstRow = viewport.querySelector<HTMLElement>('[data-raw-start="0"]');
+    expect(firstRow?.textContent).toBe("● Bash(prompt-owned-after-leading-gap)");
+    expect(viewport.querySelector('[data-gap-marker-rows="240"]')).not.toBeNull();
+  });
+
   test("protects the full raw Bash group represented by a compact reader row", async () => {
     const { viewport } = mountTermView({ mode: "hide" });
     await tick();
@@ -1239,10 +1914,12 @@ describe("TermView sliding archive window", () => {
       (_, index) => `     long-output-${index}`,
     );
     // Five adjacent blocks stay below the detector's 2k-row per-block cap but
-    // form one grouped presentation row covering 9.5k raw rows.
+    // form one grouped presentation row covering 9.5k raw rows. Their strict
+    // Claude paint proves these are real Bash headers despite the missing
+    // archive prefix before resident row zero.
     for (let block = 0; block < 5; block++) {
       const start = block * 1_900;
-      resident[start] = `● Bash(printf protected-reader-group-${block})`;
+      resident[start] = styledBashHeader(`printf protected-reader-group-${block}`);
       resident[start + 1] = `  ⎿  long-output-${start + 1}`;
     }
     resident[9_500] = "● protected-reader-boundary";
@@ -1269,6 +1946,43 @@ describe("TermView sliding archive window", () => {
       Number(retainedGroup?.getAttribute("data-raw-end"))
       - Number(retainedGroup?.getAttribute("data-raw-start")),
     ).toBeGreaterThan(9_000);
+  });
+
+  test("invalidates Bash detection when a same-length sliding window replaces raw content", async () => {
+    const { viewport } = mountTermView({ mode: "hide" });
+    await tick();
+    deliverOutput(liveLines("cache-tail", 240));
+
+    wheel(viewport, -1_000_000);
+    const resident = archiveLines(2_000, 9_760);
+    resident[0] = styledBashHeader("printf old-window");
+    resident[1] = "  ⎿  old-output";
+    resident[2] = "● old-boundary";
+    deliverHistory(2_000, resident, true, 11_760);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    expect(numberAttr(viewport, "data-total")).toBe(9_999);
+    expect(numberAttr(viewport, "data-claude-bash-detection-scan-rows"))
+      .toBeGreaterThan(0);
+
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toEqual({ direction: "before", cursor: 2_000, limit: 2_000 });
+    // Processing the reply first detaches the 240-row live suffix and builds a
+    // 9,760-row cache, then applies the incoming page as another 9,760-row raw
+    // world inside the same delivery. Those equal lengths are not identity.
+    expect(numberAttr(viewport, "data-raw-total")).toBe(10_000);
+    deliverHistory(0, archiveLines(0, 2_000), false, 11_760);
+
+    // The raw array still has 9,760 rows, but row zero now belongs to the new
+    // absolute page. Coordinate-only cache reuse would hide archive-0/1 under
+    // the stale old-window block and report a zero-row detector scan.
+    expect(numberAttr(viewport, "data-raw-total")).toBe(9_760);
+    expect(numberAttr(viewport, "data-claude-bash-detection-scan-rows"))
+      .toBeGreaterThan(0);
+    wheel(viewport, -1_000_000);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"].mtv-bash-hidden'))
+      .toBeNull();
+    expect(Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .some((row) => row.textContent === "archive-0")).toBe(true);
   });
 
   test("promotes crossed live rows when a collapsed archive makes visual indexes smaller than raw indexes", async () => {

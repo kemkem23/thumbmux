@@ -648,6 +648,12 @@
     "tier": "X"
   },
   {
+    "name": "detectClaudeBashBlocksWithActivityEvidence",
+    "kind": "value",
+    "signature": "ced6486de9932c21bb2e8520fb15510988a6ebea3281af9ea2594188d1b1299d",
+    "tier": "X"
+  },
+  {
     "name": "extractRecentPrompts",
     "kind": "value",
     "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
@@ -693,6 +699,12 @@
     "name": "hexToRgb",
     "kind": "value",
     "signature": "4ca5411b6c153faf68a277d61452f220e91b8de9621626aadc1482983cd63059",
+    "tier": "X"
+  },
+  {
+    "name": "isClaudeActivityStatusLine",
+    "kind": "value",
+    "signature": "373cbd94c18aa19e348cbef1a7de834fba1767ccf2147eadcb1e6b9ee6405767",
     "tier": "X"
   },
   {

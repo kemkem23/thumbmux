@@ -14,6 +14,8 @@
  * keys            desktop KeyboardEvent → terminal byte sequences (+ bracketed paste)
  * sgr-mouse       SGR mouse-forwarding math for alt-screen TUIs (wheel/click/hit-test)
  */
+import { isClaudeActivityStatusLine as matchesClaudeActivityStatusLine } from './claude-status';
+
 export * from './ansi-html';
 export * from './search';
 export * from './replay';
@@ -21,6 +23,12 @@ export * from './notification';
 export * from './terminal-link';
 export * from './terminal-scroll';
 export * from './prompt-scan';
+// Bun 1.3.11 can emit an undefined alias when a barrel directly re-exports a
+// symbol that another bundled module also imports. Keep a real local binding
+// so the aggregate core dist remains loadable by plain Node.
+export function isClaudeActivityStatusLine(line: string): boolean {
+  return matchesClaudeActivityStatusLine(line);
+}
 export * from './claude-bash';
 export * from './surface';
 export * from './protocol';
