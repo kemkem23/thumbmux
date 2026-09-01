@@ -205,12 +205,14 @@ occupy one third of a terminal row in the presentation coordinate system. The
 source rows remain canonical for copy, search, history, retention, raw/visual
 mapping, and ANSI/OSC state in all modes. The host owns model choice,
 authentication, redaction, lifecycle checks, throttling, and durable caching.
-The low-level `ClaudeBash*`, `detectClaudeBashBlocks`,
-`groupClaudeBashBlocks`, `projectClaudeBashLines`, and
-`projectClaudeBashGroupedLines` core exports are tier X:
-Claude controls the painted layout, so those detector/projection contracts are
-explicitly experimental even though omission behavior in the app shell is
-additive.
+The low-level `ClaudeBash*`, `CodexTool*`, and provider-neutral `Tool*` core
+exports are tier X. This includes `detectClaudeBashBlocks`,
+`groupClaudeBashBlocks`, `projectClaudeBashLines`,
+`projectClaudeBashGroupedLines`, `detectCodexToolBlocks`, `projectToolLines`,
+`reconcileToolBlockIds`, `stableToolFingerprint`, and
+`validateToolCollapseBlocks`. Claude and Codex control their painted layouts,
+so those detector/projection contracts are explicitly experimental even though
+omission behavior in the app shell is additive.
 
 The v0.18.0 direct-PTY durability integration is also tier X while production
 hosts prove its cutover lifecycle. Its intentional `thumbmux/server` surface is

@@ -156,6 +156,24 @@
     "tier": "X"
   },
   {
+    "name": "CodexToolDetection",
+    "kind": "type",
+    "signature": "c1dbdb4b45b9eafd820b2c96b3df1b3e011aef4fc52a69fe71416317bc318734",
+    "tier": "X"
+  },
+  {
+    "name": "CodexToolDetectionOptions",
+    "kind": "type",
+    "signature": "501289d8be8f83e3edb13fb28c8b22824af9630d101d7d107f07069bc843168d",
+    "tier": "X"
+  },
+  {
+    "name": "CodexToolScreenMode",
+    "kind": "type",
+    "signature": "aa572e859dff500d15d0b1f7d51b0506727e960441c5b7a113ddd4df7dfb0da9",
+    "tier": "X"
+  },
+  {
     "name": "DEFAULT_ANSI_COLORS",
     "kind": "value",
     "signature": "f83dc176b81eeb0a2b71b32ef49640fd941eb78a0cb8742f5eb8ab345119b2f5",
@@ -528,6 +546,72 @@
     "tier": "F"
   },
   {
+    "name": "ToolBlockKind",
+    "kind": "type",
+    "signature": "075363278d555b87e363fb285f854a6791a449ddf8d441c92243660a1764c1f2",
+    "tier": "X"
+  },
+  {
+    "name": "ToolBlockOutcome",
+    "kind": "type",
+    "signature": "27c4c5e4d9f96eeceaafcd6ad825d5d453412d4bf6a9b2d43f9b9d23bfc6c8ed",
+    "tier": "X"
+  },
+  {
+    "name": "ToolCollapseBlock",
+    "kind": "type",
+    "signature": "03c93092967e1083d84a03005d05741f9fdd2761a6911a40f431eb2c618facf0",
+    "tier": "X"
+  },
+  {
+    "name": "ToolLineRange",
+    "kind": "type",
+    "signature": "06b05d60a6c1ec9a905752abe8946960a1bd4cfcc1aa3b501c3a8f905d02e8e6",
+    "tier": "X"
+  },
+  {
+    "name": "ToolPlaceholderContext",
+    "kind": "type",
+    "signature": "bf6e50b33f69e3cfeb03cb10e98875b4a679b1821fecbddf90bb061e6dbf31cc",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProjection",
+    "kind": "type",
+    "signature": "926e2190d6b716301504dd06f9f6bfc682ff46d7a5c5715e7893d586f88cfe11",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProjectionOptions",
+    "kind": "type",
+    "signature": "56467c38094cd99c68e16ce6386812ee3dc7d5c1218787d31df0974d65e4a23a",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProjectionRejection",
+    "kind": "type",
+    "signature": "e4ea8c29866ac15ecb7ee51d68e4d2902cd2c8f4533aaac14239602a9afd2372",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProjectionRow",
+    "kind": "type",
+    "signature": "2cd985310979b9e7184a22da02ed7046c8d8e7e4210c0699e8b0078df8481f2c",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProjectionValidation",
+    "kind": "type",
+    "signature": "50c9877b8d04f511b735510b85386a575523f05e951530817217784cf1879aef",
+    "tier": "X"
+  },
+  {
+    "name": "ToolProvider",
+    "kind": "type",
+    "signature": "7778195cf44368cb49cf613ce24b76e5280bb8d9eb305f99079a5622bae07218",
+    "tier": "X"
+  },
+  {
     "name": "UnderlineStyle",
     "kind": "type",
     "signature": "85f82c0a28377418e1a245e1162967d8257bbb8b6db6164a886f8f4b0c0f89cf",
@@ -651,6 +735,12 @@
     "name": "detectClaudeBashBlocksWithActivityEvidence",
     "kind": "value",
     "signature": "ced6486de9932c21bb2e8520fb15510988a6ebea3281af9ea2594188d1b1299d",
+    "tier": "X"
+  },
+  {
+    "name": "detectCodexToolBlocks",
+    "kind": "value",
+    "signature": "0905ffb17a414f18eeae6a6aa4751e18a66d834dd0cce2d8affb50d57c2cbbb4",
     "tier": "X"
   },
   {
@@ -846,9 +936,21 @@
     "tier": "X"
   },
   {
+    "name": "projectToolLines",
+    "kind": "value",
+    "signature": "35add128de3f89964e4ff47258ba8c328a4f8da0edb739e18aae7bc235cedd47",
+    "tier": "X"
+  },
+  {
     "name": "readerAnchorLineDelta",
     "kind": "value",
     "signature": "f6d9e1e1070c19e751a40ea032e9a5240c0cf4387a96cd69d3ae27ba35b3156d",
+    "tier": "X"
+  },
+  {
+    "name": "reconcileToolBlockIds",
+    "kind": "value",
+    "signature": "771a9d3500cfa17ae4f3b457eb0e76373783064e83810555fea9e950c6c9781d",
     "tier": "X"
   },
   {
@@ -918,6 +1020,12 @@
     "tier": "F"
   },
   {
+    "name": "stableToolFingerprint",
+    "kind": "value",
+    "signature": "eb6a5a303353d7c104f628162d4ffb5e380057bb95137e50da5aa0ac68169771",
+    "tier": "X"
+  },
+  {
     "name": "stringCells",
     "kind": "value",
     "signature": "5868bdc45807a72b7e60b2d3e37b0a802bb8aea1e73269a8e536c971f42cb19c",
@@ -957,6 +1065,12 @@
     "name": "validateMuxHistoryBoundary",
     "kind": "value",
     "signature": "3d66d05394244d91cc1f120c1411456fc6ceb165b53aec4da23abdb22810063a",
+    "tier": "X"
+  },
+  {
+    "name": "validateToolCollapseBlocks",
+    "kind": "value",
+    "signature": "080997a34f0363226b4d4036956dcc652a39ba5c71390ea346d64848b8a5e6b3",
     "tier": "X"
   },
   {

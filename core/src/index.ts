@@ -9,6 +9,8 @@
  * terminal-scroll merge successive pane captures without scroll jumps
  * prompt-scan     extract the user's submitted prompts from raw pane text
  * claude-bash     detect/project Claude Bash calls for off/hide/haiku views
+ * codex-tools     detect sealed, completed Codex tool/event blocks
+ * tool-projection provider-neutral completed-tool collapse and row mapping
  * surface         derive a full readable surface from one background color
  * cells           terminal cell widths (Thai/CJK/emoji) → cursor column math
  * keys            desktop KeyboardEvent → terminal byte sequences (+ bracketed paste)
@@ -30,6 +32,8 @@ export function isClaudeActivityStatusLine(line: string): boolean {
   return matchesClaudeActivityStatusLine(line);
 }
 export * from './claude-bash';
+export * from './tool-projection';
+export * from './codex-tools';
 export * from './surface';
 export * from './protocol';
 export * from './launch';

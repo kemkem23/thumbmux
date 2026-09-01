@@ -85,7 +85,53 @@
     type ClaudeBashGroupedSummaryRequest,
     type ClaudeBashSummaries,
     type ClaudeBashSummaryRequest,
+    detectCodexToolBlocks,
+    projectToolLines,
+    reconcileToolBlockIds,
+    type ToolCollapseBlock,
+    type ToolProjectionRow,
   } from '@thumbmux/core';
+
+  type CodexToolMode = 'off' | 'hide';
+
+  /**
+   * Both providers project directly from rawLines, then meet in this one
+   * presentation coordinate space. Optional Claude-only fields let the
+   * existing summary/cache state machine stay provider-local while Codex rows
+   * use the same raw↔visual, anchor, search, SGR, and cursor data plane.
+   */
+  type ToolPresentationRow = Readonly<{
+    visualRow: number;
+    kind: 'raw' | 'bash-placeholder' | 'tool-placeholder';
+    line: string;
+    rawStart: number;
+    rawEndExclusive: number;
+    rawRange: Readonly<{ startLine: number; endLine: number }>;
+    group?: ClaudeBashGroup | null;
+    block?: ClaudeBashBlock | ToolCollapseBlock | null;
+    fingerprint: string | null;
+    status?: ClaudeBashGroupedProjectionRow['status'];
+    summaryState?: ClaudeBashGroupedProjectionRow['summaryState'];
+    placeholderKey?: string | null;
+    toolProvider?: 'codex' | null;
+    toolKind?: ToolCollapseBlock['kind'] | null;
+    toolId?: string | null;
+  }>;
+
+  type ToolPresentationProjection = Readonly<{
+    mode: ClaudeBashMode;
+    rawLines: readonly string[];
+    lines: readonly string[];
+    rows: readonly ToolPresentationRow[];
+    visualToRawRange: readonly Readonly<{ startLine: number; endLine: number }>[];
+    visualToRaw: readonly Readonly<{ startLine: number; endLine: number }>[];
+    rawToVisualRow: readonly number[];
+    rawToVisual: readonly number[];
+    detectedBlocks: readonly ClaudeBashBlock[];
+    detectedGroups: readonly ClaudeBashGroup[];
+    summaryRequests: readonly ClaudeBashGroupedSummaryRequest[];
+    codexBlocks: readonly ToolCollapseBlock[];
+  }>;
 
   type LinesChangeMeta = {
     source: 'live' | 'prepend' | 'replace';
@@ -129,6 +175,9 @@
     /** Presentation-only Claude Code Bash compaction. Raw terminal rows remain
      * canonical for copy, search, retention, history, and ANSI state. */
     claudeBashMode = 'off',
+    /** Presentation-only Codex completed-tool compaction. Detection is strict
+     * and fail-open; raw rows remain canonical for every terminal operation. */
+    codexToolMode = 'off',
     claudeBashSummaries = undefined,
     /** Lifecycle-bounded Bash groups selected for distillation. A cold view
      * requests at most the newest ten groups; later live output queues only its
@@ -172,6 +221,7 @@
     onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
     onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
     claudeBashMode?: ClaudeBashMode;
+    codexToolMode?: CodexToolMode;
     claudeBashSummaries?: ClaudeBashSummaries;
     onClaudeBashSummaryRequest?: (
       requests: readonly ClaudeBashSummaryRequest[],
@@ -306,7 +356,14 @@
   // `null` is the zero-allocation off-mode identity projection. Keeping the
   // frozen default path avoids an O(rawRows) row-object rebuild on every live
   // frame and preserves the pre-feature cache/retention behaviour exactly.
+  /** Pure Claude projection retained for its incremental detector, summary
+   * eligibility, and temporal repaint state. Never feed Codex from this. */
   let bashProjection: ClaudeBashGroupedProjection | null = null;
+  /** Single provider-neutral coordinate space consumed by every visual/raw
+   * mapping. It is composed only from projections of the same rawLines. */
+  let toolPresentation: ToolPresentationProjection | null = null;
+  /** Stable Codex occurrence ids survive physical reflow between projections. */
+  let codexToolIdentityBaseline: readonly ToolCollapseBlock[] = [];
   // The projection and its sparse geometry are deliberately plain immutable
   // structures. Publish one small reactive revision after rebuilding them so
   // a same-height projection change updates the existing keyed DOM rows
@@ -498,6 +555,7 @@
   let settledClaudeBashSummaryCount = $state(0);
   let lastClaudeBashDetectionScanRows = $state(0);
   let lastClaudeBashProjectionBuildRows = $state(0);
+  let lastCodexToolBlockCount = $state(0);
   let bashProjectionRefreshPending = false;
   let pendingPrependWork: (() => void) | null = null;
   let cancelPrependWorkTask: (() => void) | null = null;
@@ -616,14 +674,22 @@
       : 'off';
   }
 
+  function normalizedCodexToolMode(): CodexToolMode {
+    return codexToolMode === 'hide' ? 'hide' : 'off';
+  }
+
+  function projectsAnyTools(): boolean {
+    return normalizedClaudeBashMode() !== 'off' || normalizedCodexToolMode() !== 'off';
+  }
+
   function claudeBashScreenMode(): 'normal' | 'alternate' | 'unknown' {
     if (!screenModeKnown || resolvedScreen === null) return 'unknown';
     return resolvedScreen.alt ? 'alternate' : 'normal';
   }
 
-  function projectionRowAt(visualRow: number): ClaudeBashGroupedProjectionRow | null {
+  function projectionRowAt(visualRow: number): ToolPresentationRow | null {
     void bashProjectionRevision;
-    if (bashProjection) return bashProjection.rows[visualRow] ?? null;
+    if (toolPresentation) return toolPresentation.rows[visualRow] ?? null;
     if (visualRow < 0 || visualRow >= rawLines.length) return null;
     return {
       visualRow,
@@ -637,15 +703,17 @@
       fingerprint: null,
       status: null,
       summaryState: 'none',
+      placeholderKey: null,
+      toolProvider: null,
     };
   }
 
   function presentationRowCount(): number {
-    return bashProjection?.rows.length ?? rawLines.length;
+    return toolPresentation?.rows.length ?? rawLines.length;
   }
 
   function rebuildPresentationGeometry(): void {
-    if (!bashProjection) {
+    if (!toolPresentation) {
       compactBashVisualRows = [];
       compactBashVisualRowSet = new Set();
       bashProjectionRevision += 1;
@@ -656,16 +724,21 @@
     // incremental path for a 10k-row retained buffer and remains correct when
     // one placeholder spans several adjacent Bash blocks plus separator rows.
     const compact = new Set<number>();
-    const groups = bashProjection.detectedGroups;
+    const groups = bashProjection?.detectedGroups ?? [];
     for (const group of groups) {
-      const visualRow = bashProjection.rawToVisualRow[group.rawStart];
+      const visualRow = toolPresentation.rawToVisualRow[group.rawStart];
       if (visualRow === undefined) continue;
-      const row = bashProjection.rows[visualRow];
+      const row = toolPresentation.rows[visualRow];
       if (
         row?.kind === 'bash-placeholder'
-        && (bashProjection.mode === 'hide' || row.summaryState === 'suppressed')
+        && (normalizedClaudeBashMode() === 'hide' || row.summaryState === 'suppressed')
       ) {
         compact.add(visualRow);
+      }
+    }
+    if (normalizedCodexToolMode() === 'hide') {
+      for (const row of toolPresentation.rows) {
+        if (row.kind === 'tool-placeholder') compact.add(row.visualRow);
       }
     }
     compactBashVisualRows = [...compact].sort((a, b) => a - b);
@@ -764,11 +837,12 @@
   }
 
   function visualRowForRaw(rawRow: number): number {
-    if (!bashProjection) return Math.max(0, Math.min(rawRow, rawLines.length));
-    if (bashProjection.rows.length === 0) return 0;
-    if (rawRow <= 0) return bashProjection.rawToVisualRow[0] ?? 0;
-    if (rawRow >= rawLines.length) return bashProjection.rows.length;
-    return bashProjection.rawToVisualRow[rawRow] ?? Math.min(rawRow, bashProjection.rows.length - 1);
+    if (!toolPresentation) return Math.max(0, Math.min(rawRow, rawLines.length));
+    if (toolPresentation.rows.length === 0) return 0;
+    if (rawRow <= 0) return toolPresentation.rawToVisualRow[0] ?? 0;
+    if (rawRow >= rawLines.length) return toolPresentation.rows.length;
+    return toolPresentation.rawToVisualRow[rawRow]
+      ?? Math.min(rawRow, toolPresentation.rows.length - 1);
   }
 
   /** Raw half-open range covered by a visual half-open window. */
@@ -803,11 +877,11 @@
    * expansion; fall back to the ordinary top-row anchor when none is visible. */
   function captureStableHistoryPresentationAnchor(force = false): PresentationAnchor | null {
     const fallback = capturePresentationAnchor(force);
-    if (!fallback || !bashProjection) return fallback;
+    if (!fallback || !toolPresentation) return fallback;
     const scrollTop = maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()));
     const visible = strictVisibleRowRange(bottomOffsetPx);
     const centerPx = scrollTop + Math.max(0, viewH / 2);
-    let best: { row: ClaudeBashGroupedProjectionRow; distance: number } | null = null;
+    let best: { row: ToolPresentationRow; distance: number } | null = null;
     for (let visual = visible.startIdx; visual < visible.endIdx; visual += 1) {
       const row = projectionRowAt(visual);
       if (
@@ -1147,6 +1221,193 @@
       || (liveGapEntryState !== null && archivedLines.length === 0 && liveLines.length > 0)
       || (gapRowIndex === 0 && gapRowCount > 0)
     );
+  }
+
+  function shiftedToolRange(
+    source: Readonly<{ startLine: number; endLine: number }>,
+    offset: number,
+  ): { startLine: number; endLine: number } {
+    return {
+      startLine: source.startLine + offset,
+      endLine: source.endLine + offset,
+    };
+  }
+
+  function shiftedCodexToolBlock(
+    block: ToolCollapseBlock,
+    offset: number,
+  ): ToolCollapseBlock {
+    return {
+      ...block,
+      sourceRange: shiftedToolRange(block.sourceRange, offset),
+      proofRange: shiftedToolRange(block.proofRange, offset),
+      collapseRanges: block.collapseRanges.map((candidate) =>
+        shiftedToolRange(candidate, offset)),
+      protectedRanges: block.protectedRanges.map((candidate) =>
+        shiftedToolRange(candidate, offset)),
+    };
+  }
+
+  const CODEX_TOOL_MAX_PROJECTED_BLOCKS = 512;
+  const CODEX_TOOL_MAX_RECONCILE_BLOCKS = CODEX_TOOL_MAX_PROJECTED_BLOCKS * 2;
+
+  /** Detect each retained continuous corridor independently. A client/server
+   * retention seam never becomes semantic adjacency, and an unknown leading
+   * row cannot authorize a self-contained marker at that segment boundary. */
+  function detectCodexToolSegments(): ToolCollapseBlock[] {
+    if (normalizedCodexToolMode() === 'off') return [];
+    const screenMode = claudeBashScreenMode();
+    if (screenMode !== 'normal') {
+      detectCodexToolBlocks(rawLines, { screenMode });
+      return [];
+    }
+
+    const barriers = [...claudeBashBarriers(), rawLines.length];
+    const unknownLeadingPrefix = claudeBashHasUnknownLeadingPrefix();
+    const blocks: ToolCollapseBlock[] = [];
+    let segmentStart = 0;
+    for (const segmentEnd of barriers) {
+      if (segmentEnd <= segmentStart) continue;
+      const segmentLines = segmentStart === 0 && segmentEnd === rawLines.length
+        ? rawLines
+        : rawLines.slice(segmentStart, segmentEnd);
+      const detection = detectCodexToolBlocks(
+        segmentLines,
+        {
+          screenMode,
+          identityLineOffset: archiveOffset + segmentStart,
+          leadingEdgeSealed: segmentStart === 0 && !unknownLeadingPrefix,
+          maxBlocks: CODEX_TOOL_MAX_RECONCILE_BLOCKS,
+        },
+      );
+      for (const block of detection.blocks) {
+        blocks.push(shiftedCodexToolBlock(block, segmentStart));
+      }
+      segmentStart = segmentEnd;
+    }
+    return blocks.slice(-CODEX_TOOL_MAX_RECONCILE_BLOCKS);
+  }
+
+  function toolRangesOverlap(
+    left: Readonly<{ startLine: number; endLine: number }>,
+    right: Readonly<{ startLine: number; endLine: number }>,
+  ): boolean {
+    return left.startLine < right.endLine && right.startLine < left.endLine;
+  }
+
+  /** Merge two projections of the exact same canonical raw buffer. This is
+   * intentionally not a pipeline: Codex never sees Claude placeholder text or
+   * shifted visual coordinates. Ambiguous cross-provider overlap rejects the
+   * Codex block and leaves the already-proven Claude projection unchanged. */
+  function buildToolPresentation(
+    claudeProjection: ClaudeBashGroupedProjection,
+  ): ToolPresentationProjection {
+    if (
+      normalizedCodexToolMode() === 'off'
+      || claudeBashScreenMode() !== 'normal'
+    ) {
+      // Preserve Claude's bounded incremental arrays by reference. Codex-off
+      // must not turn its hot path back into an O(retainedRows) merge.
+      lastCodexToolBlockCount = 0;
+      return {
+        ...claudeProjection,
+        codexBlocks: [],
+      };
+    }
+    const claudePlaceholderRanges = claudeProjection.rows
+      .filter((row) => row.kind === 'bash-placeholder')
+      .map((row) => row.rawRange);
+    const codexBlocks = reconcileToolBlockIds(
+      codexToolIdentityBaseline,
+      detectCodexToolSegments().filter((block) => (
+        !claudePlaceholderRanges.some((candidate) =>
+          toolRangesOverlap(block.proofRange, candidate))
+      )),
+    ).slice(-CODEX_TOOL_MAX_PROJECTED_BLOCKS);
+    if (codexBlocks.length === 0) {
+      lastCodexToolBlockCount = 0;
+      return {
+        ...claudeProjection,
+        codexBlocks: [],
+      };
+    }
+    const codexProjection = projectToolLines(rawLines, {
+      blocks: codexBlocks,
+      enabled: true,
+      placeholder: () => 'hidden tools',
+    });
+    lastCodexToolBlockCount = codexProjection.projectedBlocks.length;
+    if (codexProjection.projectedBlocks.length > 0) {
+      codexToolIdentityBaseline = codexProjection.projectedBlocks;
+    }
+
+    const claudePlaceholders = new Map<number, ClaudeBashGroupedProjectionRow>();
+    for (const row of claudeProjection.rows) {
+      if (row.kind === 'bash-placeholder') {
+        claudePlaceholders.set(row.rawRange.startLine, row);
+      }
+    }
+    const codexPlaceholders = new Map<number, ToolProjectionRow>();
+    for (const row of codexProjection.rows) {
+      if (row.kind === 'tool-placeholder') {
+        codexPlaceholders.set(row.rawRange.startLine, row);
+      }
+    }
+
+    const rows: ToolPresentationRow[] = [];
+    const rawToVisualRow = Array<number>(rawLines.length);
+    for (let rawRow = 0; rawRow < rawLines.length;) {
+      const claudeRow = claudePlaceholders.get(rawRow);
+      const codexRow = codexPlaceholders.get(rawRow);
+      const sourceRow = claudeRow
+        ?? codexRow
+        ?? claudeProjection.rows[claudeProjection.rawToVisualRow[rawRow] ?? rawRow];
+      if (!sourceRow) {
+        rawRow += 1;
+        continue;
+      }
+      const visualRow = rows.length;
+      const row: ToolPresentationRow = sourceRow.kind === 'tool-placeholder'
+        ? {
+            ...sourceRow,
+            visualRow,
+            toolProvider: 'codex',
+            toolKind: sourceRow.block?.kind ?? null,
+            toolId: sourceRow.block?.id ?? null,
+          }
+        : {
+            ...sourceRow,
+            visualRow,
+            placeholderKey: null,
+            toolProvider: null,
+            toolKind: null,
+            toolId: null,
+          };
+      rows.push(row);
+      for (
+        let mapped = row.rawRange.startLine;
+        mapped < row.rawRange.endLine;
+        mapped += 1
+      ) rawToVisualRow[mapped] = visualRow;
+      rawRow = row.rawRange.endLine;
+    }
+
+    const lines = rows.map((row) => row.line);
+    const visualToRawRange = rows.map((row) => row.rawRange);
+    return {
+      mode: claudeProjection.mode,
+      rawLines,
+      lines,
+      rows,
+      visualToRawRange,
+      visualToRaw: visualToRawRange,
+      rawToVisualRow,
+      rawToVisual: rawToVisualRow,
+      detectedBlocks: claudeProjection.detectedBlocks,
+      detectedGroups: claudeProjection.detectedGroups,
+      summaryRequests: claudeProjection.summaryRequests,
+      codexBlocks: codexProjection.projectedBlocks,
+    };
   }
 
   function shiftedClaudeBashBlock(block: ClaudeBashBlock, offset: number): ClaudeBashBlock {
@@ -1567,6 +1828,7 @@
     eligibilityBaselineOverride?: ClaudeBashGroupedProjection | null,
   ): void {
     const mode = normalizedClaudeBashMode();
+    const codexMode = normalizedCodexToolMode();
     syncClaudeBashSummaryPolicyMode(mode);
     const repaintDomain = currentClaudeActivityRepaintDomain();
     if (
@@ -1576,11 +1838,12 @@
     if (cause === 'history' || claudeActivityRepaintDomain !== repaintDomain) {
       claudeActivityRearmBaselineRows = new Set();
     }
-    if (mode === 'off') {
+    if (mode === 'off' && codexMode === 'off') {
       clearClaudeBashSummaryEvidenceGrace();
       claudeActivityRearmBaselineRows = new Set();
-      const changedCoordinateSpace = bashProjection !== null;
+      const changedCoordinateSpace = toolPresentation !== null;
       bashProjection = null;
+      toolPresentation = null;
       bashSummaryRequestByFingerprint = new Map();
       cachedClaudeBashDetection = null;
       cachedClaudeBashDetectionRawLength = 0;
@@ -1589,6 +1852,7 @@
       lastClaudeBashDetectionScanRows = 0;
       lastClaudeBashProjectionBuildRows = 0;
       lastClaudeBashProjectionSummaryKey = '';
+      lastCodexToolBlockCount = 0;
       total = rawLines.length;
       rebuildPresentationGeometry();
       if (changedCoordinateSpace) {
@@ -1601,62 +1865,83 @@
       }
       return;
     }
-    const summaries = mergedClaudeBashSummaries();
-    const detection = detectionForClaudeBashProjection(changedFromRaw);
-    const barrierLines = claudeBashBarriers();
-    const detectedGroups = groupClaudeBashBlocks(rawLines, detection.blocks, {
-      barrierLines,
-    });
-    const eligibilityBaseline = eligibilityBaselineOverride === undefined
-      ? bashProjection
-      : eligibilityBaselineOverride;
-    const queueSelection = claudeBashRetentionProjection
-      ? { bootstrap: false, liveFingerprint: null }
-      : updateClaudeBashSummaryEligibility(
-        detectedGroups,
-        cause,
-        changedFromRaw,
-        eligibilityBaseline,
-      );
-    const projectionKey = [
-      claudeBashSummaryKey(summaries),
-      claudeBashEligibilityKey(),
-      barrierLines.join(','),
-    ].join('\u0002');
-    // The incremental helper overwrites this with its bounded suffix length
-    // when it can safely reuse the immutable prefix.
-    lastClaudeBashProjectionBuildRows = rawLines.length;
-    bashProjection = incrementalClaudeBashProjection(
-      detection,
-      detectedGroups,
-      summaries,
-      projectionKey,
-      changedFromRaw,
-      barrierLines,
-    ) ?? projectClaudeBashGroupedLines(rawLines, {
-      mode,
-      summaries,
-      detection,
-      groupingOptions: { barrierLines },
-      summaryEligibleIds: eligibleClaudeBashSummaries,
-    });
-    lastClaudeBashProjectionSummaryKey = projectionKey;
-    if (!claudeBashRetentionProjection) {
-      bashSummaryRequestByFingerprint = new Map(
-        bashProjection.summaryRequests.map((request) => [request.fingerprint, request]),
-      );
-      if (claudeBashScreenMode() === 'normal') {
-        const detectedFingerprints = new Set(
-          bashProjection.detectedGroups.map((group) => group.fingerprint),
+
+    let queueSelection: { bootstrap: boolean; liveFingerprint: string | null } = {
+      bootstrap: false,
+      liveFingerprint: null,
+    };
+    if (mode === 'off') {
+      clearClaudeBashSummaryEvidenceGrace();
+      claudeActivityRearmBaselineRows = new Set();
+      bashSummaryRequestByFingerprint = new Map();
+      cachedClaudeBashDetection = null;
+      cachedClaudeBashDetectionRawLength = 0;
+      cachedClaudeBashDetectionScreenMode = null;
+      cachedClaudeBashBarrierKey = '';
+      lastClaudeBashDetectionScanRows = 0;
+      lastClaudeBashProjectionBuildRows = 0;
+      lastClaudeBashProjectionSummaryKey = '';
+      bashProjection = projectClaudeBashGroupedLines(rawLines, { mode: 'off' });
+    } else {
+      const summaries = mergedClaudeBashSummaries();
+      const detection = detectionForClaudeBashProjection(changedFromRaw);
+      const barrierLines = claudeBashBarriers();
+      const detectedGroups = groupClaudeBashBlocks(rawLines, detection.blocks, {
+        barrierLines,
+      });
+      const eligibilityBaseline = eligibilityBaselineOverride === undefined
+        ? bashProjection
+        : eligibilityBaselineOverride;
+      queueSelection = claudeBashRetentionProjection
+        ? { bootstrap: false, liveFingerprint: null }
+        : updateClaudeBashSummaryEligibility(
+          detectedGroups,
+          cause,
+          changedFromRaw,
+          eligibilityBaseline,
         );
-        activeClaudeBashFingerprints = new Set([
-          ...detectedFingerprints,
-          ...claudeBashSummaryEvidenceGrace,
-        ]);
-        pruneClaudeBashSummaryState();
+      const projectionKey = [
+        claudeBashSummaryKey(summaries),
+        claudeBashEligibilityKey(),
+        barrierLines.join(','),
+      ].join('\u0002');
+      // The incremental helper overwrites this with its bounded suffix length
+      // when it can safely reuse the immutable prefix.
+      lastClaudeBashProjectionBuildRows = rawLines.length;
+      bashProjection = incrementalClaudeBashProjection(
+        detection,
+        detectedGroups,
+        summaries,
+        projectionKey,
+        changedFromRaw,
+        barrierLines,
+      ) ?? projectClaudeBashGroupedLines(rawLines, {
+        mode,
+        summaries,
+        detection,
+        groupingOptions: { barrierLines },
+        summaryEligibleIds: eligibleClaudeBashSummaries,
+      });
+      lastClaudeBashProjectionSummaryKey = projectionKey;
+      if (!claudeBashRetentionProjection) {
+        bashSummaryRequestByFingerprint = new Map(
+          bashProjection.summaryRequests.map((request) => [request.fingerprint, request]),
+        );
+        if (claudeBashScreenMode() === 'normal') {
+          const detectedFingerprints = new Set(
+            bashProjection.detectedGroups.map((group) => group.fingerprint),
+          );
+          activeClaudeBashFingerprints = new Set([
+            ...detectedFingerprints,
+            ...claudeBashSummaryEvidenceGrace,
+          ]);
+          pruneClaudeBashSummaryState();
+        }
       }
     }
-    total = bashProjection.rows.length;
+
+    toolPresentation = buildToolPresentation(bashProjection);
+    total = toolPresentation.rows.length;
     rebuildPresentationGeometry();
     invalidateRenderedCache();
     invalidateSearchOverlayHtml();
@@ -1664,7 +1949,7 @@
     const visible = visibleRowRange(bottomOffsetPx);
     winStart = Math.max(0, visible.startIdx - OVERSCAN_ROWS);
     winEnd = Math.min(total, visible.endIdx + OVERSCAN_ROWS);
-    if (!claudeBashRetentionProjection) {
+    if (mode !== 'off' && !claudeBashRetentionProjection) {
       queueClaudeBashSummaryWork(queueSelection);
     }
   }
@@ -1821,9 +2106,13 @@
     const row = projectionRowAt(visualRow);
     if (!row) return `empty:${visualRow}`;
     const rawId = archiveOffset + row.rawRange.startLine;
-    return row.kind === 'bash-placeholder'
-      ? `bash:${rawId}:${row.fingerprint ?? 'active'}`
-      : `raw:${rawId}`;
+    if (row.kind === 'bash-placeholder') {
+      return `bash:${rawId}:${row.fingerprint ?? 'active'}`;
+    }
+    if (row.kind === 'tool-placeholder') {
+      return row.placeholderKey ?? `tool:codex:${row.fingerprint ?? rawId}`;
+    }
+    return `raw:${rawId}`;
   }
 
   /** Copy the whole buffer (ANSI stripped, grid padding trimmed) to the
@@ -2069,7 +2358,7 @@
   }
 
   function placeholderSearchKind(
-    row: ClaudeBashGroupedProjectionRow,
+    row: ToolPresentationRow,
   ): 'search-match' | 'search-active' | null {
     let matched = false;
     for (let rawRow = row.rawRange.startLine; rawRow < row.rawRange.endLine; rawRow += 1) {
@@ -2085,7 +2374,7 @@
     void epoch;
     const projectionRow = projectionRowAt(visualRow);
     if (!projectionRow) return ' ';
-    if (projectionRow.kind === 'bash-placeholder') {
+    if (projectionRow.kind === 'bash-placeholder' || projectionRow.kind === 'tool-placeholder') {
       const base = bashPlaceholderHtmlCache.get(visualRow) ?? ' ';
       const kind = placeholderSearchKind(projectionRow);
       if (!kind) return base;
@@ -2519,7 +2808,10 @@
           sgrCheckpoints.set(rawRow, cloneSgrState(state));
         }
         if (rawRow === projectionRow.rawRange.startLine) {
-          if (projectionRow.kind === 'bash-placeholder') {
+          if (
+            projectionRow.kind === 'bash-placeholder'
+            || projectionRow.kind === 'tool-placeholder'
+          ) {
             // Synthetic UI must never inherit an unrelated unclosed SGR/OSC 8
             // from the row before the tool call (black-on-black text, inverse,
             // strike, or a bogus clickable link). Hidden source still advances
@@ -2673,8 +2965,8 @@
     const archiveLength = archivedLines.length;
     const evicted = Math.max(0, archiveLength - Math.max(0, from));
     if (evicted === 0) return 0;
-    const projectBash = normalizedClaudeBashMode() !== 'off';
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    const projectTools = projectsAnyTools();
+    const presentationAnchor = projectTools ? capturePresentationAnchor() : null;
 
     if (liveLines.length > 0) {
       let absorbedGapRows = 0;
@@ -2691,7 +2983,7 @@
     reindexActivityRowsAfterRemoval(from, evicted);
     linksByLine.splice(from, evicted);
     reindexSparseAfterRemoval(from, evicted, liveGapEntryState);
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
+    if (projectTools) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - evicted * lineH);
@@ -2704,8 +2996,8 @@
     // Whatever column owns the removed rows, raw row zero has moved without a
     // server-authenticated replacement world. Preserve that missing context.
     clientLeadingPrefixDropped = true;
-    const projectBash = normalizedClaudeBashMode() !== 'off';
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    const projectTools = projectsAnyTools();
+    const presentationAnchor = projectTools ? capturePresentationAnchor() : null;
     const nextEntryState = stateBeforeLine(count);
     const archivedCount = Math.min(count, archivedLines.length);
     const liveCount = count - archivedCount;
@@ -2728,7 +3020,7 @@
       if (gapRowIndex < count) clearRetentionGap();
       else gapRowIndex -= count;
     }
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
+    if (projectTools) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       winStart = Math.max(0, winStart - count);
@@ -2741,8 +3033,8 @@
   function dropRetainedLivePrefix(count: number): void {
     const bounded = Math.min(count, liveLines.length);
     if (bounded <= 0) return;
-    const projectBash = normalizedClaudeBashMode() !== 'off';
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    const projectTools = projectsAnyTools();
+    const presentationAnchor = projectTools ? capturePresentationAnchor() : null;
     const seam = archivedLines.length;
     const suffixEntry = stateBeforeLine(seam + bounded);
     liveLines.splice(0, bounded);
@@ -2757,7 +3049,7 @@
     reindexSparseAfterRemoval(seam, bounded, liveGapEntryState);
     if (liveLines.length > 0) recordRetentionGap(seam, bounded);
     else clearRetentionGap();
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
+    if (projectTools) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
@@ -2771,8 +3063,8 @@
     const start = Math.max(0, Math.min(from, rawLines.length));
     const bounded = Math.min(count, rawLines.length - start);
     if (bounded <= 0) return;
-    const projectBash = normalizedClaudeBashMode() !== 'off';
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    const projectTools = projectsAnyTools();
+    const presentationAnchor = projectTools ? capturePresentationAnchor() : null;
     const suffixEntry = stateBeforeLine(start + bounded);
     archiveCurrentRetentionGap();
     rawLines.splice(start, bounded);
@@ -2790,7 +3082,7 @@
       gapRowIndex = start;
       gapRowCount = bounded;
     } else clearRetentionGap();
-    if (projectBash) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
+    if (projectTools) rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
     else {
       total = rawLines.length;
       bottomOffsetPx = Math.max(0, bottomOffsetPx - bounded * lineH);
@@ -3009,13 +3301,14 @@
     // position; content updates may repaint any number of tail rows without
     // moving the rows already under their eyes. At exactly offset=0 the live
     // tail owns the viewport and follows the new maxOffset instead.
-    const projectBash = normalizedClaudeBashMode() !== 'off';
+    const projectClaude = normalizedClaudeBashMode() !== 'off';
+    const projectTools = projectClaude || normalizedCodexToolMode() !== 'off';
     const projectionCause = opts.projectionCause
       ?? (opts.source === 'live' ? 'live' : 'replace');
-    const presentationAnchor = projectBash && !opts.followTail
+    const presentationAnchor = projectTools && !opts.followTail
       ? capturePresentationAnchor()
       : null;
-    const readerScrollTop = !projectBash && !opts.followTail
+    const readerScrollTop = !projectTools && !opts.followTail
       ? maxOffset() - Math.max(0, Math.min(bottomOffsetPx, maxOffset()))
       : null;
 
@@ -3026,12 +3319,12 @@
     const linesChanged = rawLines.length !== next.length || common !== minLen;
 
     const repaintDomain = currentClaudeActivityRepaintDomain();
-    const activityEvidenceFence = projectBash && (
+    const activityEvidenceFence = projectClaude && (
       projectionCause === 'history'
       || opts.source === 'prepend'
       || repaintDomain !== claudeActivityRepaintDomain
     );
-    const canCompareActivityRepaint = projectBash
+    const canCompareActivityRepaint = projectClaude
       && projectionCause !== 'history'
       && opts.source !== 'prepend'
       && repaintDomain !== null
@@ -3055,7 +3348,7 @@
     );
     confirmedClaudeActivityStatusRows = nextClaudeActivityStatusRows;
     claudeActivityRearmBaselineRows = activityRepaintTransition.rearmBaselineRows;
-    claudeActivityRepaintDomain = !projectBash
+    claudeActivityRepaintDomain = !projectClaude
       || projectionCause === 'history'
       || opts.source === 'prepend'
       ? null
@@ -3074,7 +3367,7 @@
     // new proof, vanished baseline, screen/generation change or history fence
     // ends the grace.
     if (
-      projectBash
+      projectClaude
       && !activityEvidenceFence
       && activityEvidenceRemoved
       && !activityEvidenceAdded
@@ -3085,7 +3378,7 @@
       claudeBashSummaryEvidenceGrace = new Set(activeClaudeBashFingerprints);
       claudeBashSummaryEvidenceGraceDomain = repaintDomain;
     } else if (
-      projectBash
+      projectClaude
       && !activityEvidenceFence
       && !activityEvidenceAdded
       && repaintDomain !== null
@@ -3105,7 +3398,7 @@
     // moved ahead of any summary side effect.
     rebuildAllLinks();
     rebuildFrom(common);
-    const deferSummaryUntilAfterRetention = projectBash
+    const deferProjectionUntilAfterRetention = projectTools
       && opts.enforceRetention !== false
       && (
         rawLines.length > HISTORY_RETAINED_ROW_BUDGET
@@ -3113,17 +3406,18 @@
       );
     const stableEligibilityBaseline = bashProjection;
     const previousRetentionProjection = claudeBashRetentionProjection;
-    if (deferSummaryUntilAfterRetention) {
+    if (deferProjectionUntilAfterRetention) {
       claudeBashRetentionProjection = true;
     }
     try {
-      if (projectBash) rebuildClaudeBashProjection(
+      if (projectTools) rebuildClaudeBashProjection(
         presentationAnchor,
         activityEvidenceFence || activityEvidenceChanged ? 0 : common,
         projectionCause,
       );
       else {
         bashProjection = null;
+        toolPresentation = null;
         rebuildPresentationGeometry();
         cachedClaudeBashDetection = null;
         cachedClaudeBashDetectionRawLength = 0;
@@ -3131,9 +3425,10 @@
         cachedClaudeBashBarrierKey = '';
         lastClaudeBashDetectionScanRows = 0;
         lastClaudeBashProjectionBuildRows = 0;
+        lastCodexToolBlockCount = 0;
         total = next.length;
       }
-      if (!projectBash) {
+      if (!projectTools) {
         bottomOffsetPx = opts.followTail
           ? 0
           : Math.max(0, maxOffset() - (readerScrollTop ?? 0));
@@ -3144,11 +3439,11 @@
       rebuildWindow(visibleRowRange(bottomOffsetPx));
       if (opts.enforceRetention !== false) enforceLiveRetention();
     } finally {
-      if (deferSummaryUntilAfterRetention) {
+      if (deferProjectionUntilAfterRetention) {
         claudeBashRetentionProjection = previousRetentionProjection;
       }
     }
-    if (deferSummaryUntilAfterRetention) {
+    if (deferProjectionUntilAfterRetention) {
       const finalAnchor = capturePresentationAnchor();
       // Pass the stable baseline as a local argument. rebuild publishes the
       // final projection before it can call the host, so a synchronous nested
@@ -3839,11 +4134,11 @@
       // absolute zero survived intact. Retire old cut provenance only here;
       // clearing it before commit could briefly authorize an oversized frame
       // whose own leading rows are about to be trimmed again.
-      const presentationAnchor = normalizedClaudeBashMode() === 'off'
+      const presentationAnchor = !projectsAnyTools()
         ? null
         : capturePresentationAnchor();
       clientLeadingPrefixDropped = false;
-      if (normalizedClaudeBashMode() !== 'off') {
+      if (projectsAnyTools()) {
         rebuildClaudeBashProjection(
           presentationAnchor,
           0,
@@ -4176,11 +4471,11 @@
     const receivedLineCount = stage.lines.length;
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
-    const projectBash = normalizedClaudeBashMode() !== 'off';
-    const presentationAnchor = projectBash ? capturePresentationAnchor() : null;
+    const projectTools = projectsAnyTools();
+    const presentationAnchor = projectTools ? capturePresentationAnchor() : null;
     const previousWinStart = winStart;
     const previousWinEnd = winEnd;
-    const previousWindowFirstRaw = projectBash
+    const previousWindowFirstRaw = projectTools
       ? projectionRowAt(previousWinStart)?.rawRange.startLine ?? 0
       : 0;
     const currentFirstState = cloneSgrState(rawEntryState);
@@ -4193,7 +4488,7 @@
     const stableEligibilityBaseline = bashProjection;
 
     const restoreProjectedCorridor = () => {
-      if (!projectBash || lineCount <= 0) return;
+      if (!projectTools || lineCount <= 0) return;
       // Preserve the existing mounted corridor just as off mode does. The
       // number of prepended *visual* rows may be much smaller than lineCount,
       // so derive the shift from the old first raw row after its index moves.
@@ -4243,9 +4538,9 @@
       droppedIncomingPrefix === 0 && stage.serverSaysEnd
     );
     const previousRetentionProjection = claudeBashRetentionProjection;
-    if (projectBash) claudeBashRetentionProjection = true;
+    if (projectTools) claudeBashRetentionProjection = true;
     try {
-      if (projectBash) {
+      if (projectTools) {
         rebuildClaudeBashProjection(presentationAnchor, undefined, 'history');
         restoreProjectedCorridor();
       } else {
@@ -4329,7 +4624,7 @@
         markHistoryCeiling();
         rebuildAllLinks();
         rebuildFrom(0);
-        if (projectBash) rebuildClaudeBashProjection(
+        if (projectTools) rebuildClaudeBashProjection(
           capturePresentationAnchor(),
           undefined,
           'history',
@@ -4337,10 +4632,10 @@
         else total = rawLines.length;
       }
     } finally {
-      if (projectBash) claudeBashRetentionProjection = previousRetentionProjection;
+      if (projectTools) claudeBashRetentionProjection = previousRetentionProjection;
     }
 
-    if (projectBash) {
+    if (projectTools) {
       rebuildClaudeBashProjection(
         capturePresentationAnchor(),
         undefined,
@@ -4684,7 +4979,7 @@
     }
     const activeIdentity = currentSearchActiveIdentity();
     const before = historyPrependSnapshot();
-    const projectBash = normalizedClaudeBashMode() !== 'off';
+    const projectTools = projectsAnyTools();
     // Sliding pages can evict either edge, so raw indexDelta is not a stable
     // presentation coordinate once Bash blocks collapse to one visual row.
     // Capture the absolute raw row under the reader before replacing the
@@ -4696,7 +4991,7 @@
     // move above the existing screen instead of pinning the reader back to the
     // tail. Ordinary live projection rebuilds keep the default follow-tail
     // behavior.
-    const presentationAnchor = projectBash
+    const presentationAnchor = projectTools
       ? captureStableHistoryPresentationAnchor(options.direction === 'before')
       : null;
     const previousWinStart = winStart;
@@ -4770,7 +5065,7 @@
     rebuildFrom(0);
 
     let preservedProjectedCorridor = false;
-    if (projectBash) {
+    if (projectTools) {
       const reattachingPendingLive = (
         wasDetached
         && archiveWindowAttachedToLive
@@ -4793,6 +5088,7 @@
       }
     } else {
       bashProjection = null;
+      toolPresentation = null;
       rebuildPresentationGeometry();
       cachedClaudeBashDetection = null;
       cachedClaudeBashDetectionRawLength = 0;
@@ -4800,6 +5096,7 @@
       cachedClaudeBashBarrierKey = '';
       lastClaudeBashDetectionScanRows = 0;
       lastClaudeBashProjectionBuildRows = 0;
+      lastCodexToolBlockCount = 0;
       total = rawLines.length;
       const nextScrollTop = Math.max(0, Math.min(
         maxOffset(),
@@ -6528,6 +6825,7 @@
     const mode = normalizedClaudeBashMode();
     const key = [
       mode,
+      normalizedCodexToolMode(),
       claudeBashScreenMode(),
       externalClaudeBashSummarySignature(),
     ].join('\u0002');
@@ -6596,6 +6894,8 @@
   data-raw-total={rawLines.length}
   data-presentation-height={presentationContentHeightPx()}
   data-claude-bash-mode={normalizedClaudeBashMode()}
+  data-codex-tool-mode={normalizedCodexToolMode()}
+  data-codex-tool-block-count={lastCodexToolBlockCount}
   data-claude-activity-evidence={claudeActivityEvidenceDiagnostic()}
   data-claude-bash-detection-scan-rows={lastClaudeBashDetectionScanRows}
   data-claude-bash-projection-build-rows={lastClaudeBashProjectionBuildRows}
@@ -6683,8 +6983,9 @@
         {@const droppedRows = retentionGapRowsAt(rawLineIdx, contentEpoch)}
         {@const presentationTop = presentationRowTopPx(visualRow) - presentationRowTopPx(winStart)}
         {@const presentationHeight = presentationRowHeightPx(visualRow)}
-        {@const compactBash = compactBashVisualRowAt(visualRow)}
-        {@const bashSearchKind = compactBash && projectionRow
+        {@const compactTool = compactBashVisualRowAt(visualRow)}
+        {@const codexTool = projectionRow?.kind === 'tool-placeholder'}
+        {@const toolSearchKind = compactTool && projectionRow
           ? placeholderSearchKind(projectionRow)
           : null}
         {#if droppedRows > 0}<span
@@ -6699,30 +7000,44 @@
           class="mtv-line"
           class:mtv-gap={droppedRows > 0}
           class:mtv-bash-placeholder={projectionRow?.kind === 'bash-placeholder'}
-          class:mtv-bash-hidden={compactBash}
+          class:mtv-tool-placeholder={codexTool}
+          class:mtv-bash-hidden={compactTool && !codexTool}
+          class:mtv-tool-hidden={compactTool && codexTool}
           data-line-id={archiveOffset + rawLineIdx}
           data-visual-row={visualRow}
           data-raw-start={projectionRow?.rawRange.startLine}
           data-raw-end={projectionRow?.rawRange.endLine}
           data-presentation-top={presentationRowTopPx(visualRow)}
           data-presentation-height={presentationHeight}
-          data-bash-id={projectionRow?.fingerprint ?? undefined}
-          data-bash-status={projectionRow?.status ?? undefined}
+          data-bash-id={projectionRow?.kind === 'bash-placeholder'
+            ? projectionRow.fingerprint ?? undefined
+            : undefined}
+          data-bash-status={projectionRow?.kind === 'bash-placeholder'
+            ? projectionRow.status ?? undefined
+            : undefined}
+          data-tool-provider={codexTool ? 'codex' : undefined}
+          data-tool-id={codexTool ? projectionRow?.toolId ?? undefined : undefined}
+          data-tool-key={codexTool ? projectionRow?.placeholderKey ?? undefined : undefined}
+          data-tool-kind={codexTool ? projectionRow?.toolKind ?? undefined : undefined}
           data-gap-rows={droppedRows > 0 ? droppedRows : undefined}
           title={droppedRows > 0 ? `${droppedRows} rows dropped before this row` : undefined}
           style:height={`${presentationHeight}px`}
           style:line-height={`${presentationHeight}px`}
-        >{#if compactBash && projectionRow}<span
-              class={`mtv-bash-divider ${bashSearchKind ?? ''}`}
+        >{#if compactTool && projectionRow}<span
+              class={`mtv-tool-divider ${codexTool ? 'mtv-codex-divider' : 'mtv-bash-divider'} ${toolSearchKind ?? ''}`}
               role="note"
-              aria-label={projectionRow.status === 'active'
+              aria-label={codexTool
+                ? `hidden tools, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
+                : projectionRow.status === 'active'
                 ? `hidden bash, running, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
                 : `hidden bash, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
-              title={projectionRow.status === 'active'
+              title={codexTool
+                ? `hidden tools · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
+                : projectionRow.status === 'active'
                 ? 'hidden bash · running'
                 : `hidden bash · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
-            ><span class="mtv-bash-divider-label">hidden bash</span><span
-                class="mtv-bash-divider-rule"
+            ><span class={`mtv-tool-divider-label ${codexTool ? '' : 'mtv-bash-divider-label'}`}>{codexTool ? 'hidden tools' : 'hidden bash'}</span><span
+                class={`mtv-tool-divider-rule ${codexTool ? '' : 'mtv-bash-divider-rule'}`}
                 aria-hidden="true"
               ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
@@ -6734,6 +7049,7 @@
       {@const cursorProjectionRow = projectionRowAt(cvisual)}
       {#if cline >= 0
         && cursorProjectionRow?.kind !== 'bash-placeholder'
+        && cursorProjectionRow?.kind !== 'tool-placeholder'
         && cvisual >= winStart
         && cvisual < winEnd + (cursor.row < 0 ? -cursor.row : 0)}
         <!-- negative row = caret on a blank row BELOW the last content line;
@@ -6866,14 +7182,15 @@
      smaller ink. The virtual geometry uses the same fractional height, so the
      following terminal row starts immediately after this box with no phantom
      whitespace. Haiku placeholders deliberately keep the normal row style. */
-  .mtv-line.mtv-bash-hidden {
+  .mtv-line.mtv-bash-hidden,
+  .mtv-line.mtv-tool-hidden {
     display: flex;
     align-items: center;
     box-sizing: border-box;
     overflow: hidden;
     color: #4ade80;
   }
-  .mtv-bash-divider {
+  .mtv-tool-divider {
     display: flex;
     align-items: center;
     width: 100%;
@@ -6884,22 +7201,22 @@
     letter-spacing: 0.02em;
     white-space: nowrap;
   }
-  .mtv-bash-divider-rule {
+  .mtv-tool-divider-rule {
     height: 1px;
     min-width: 8px;
     flex: 1 1 auto;
     background: currentColor;
     opacity: 0.72;
   }
-  .mtv-bash-divider-label {
+  .mtv-tool-divider-label {
     flex: 0 0 auto;
     padding: 0 4px 0 0;
     opacity: 0.82;
   }
-  .mtv-bash-divider.search-match {
+  .mtv-tool-divider.search-match {
     background: rgba(74, 222, 128, 0.14);
   }
-  .mtv-bash-divider.search-active {
+  .mtv-tool-divider.search-active {
     background: rgba(250, 224, 66, 0.24);
     outline: 1px solid rgba(250, 224, 66, 0.42);
     outline-offset: -1px;

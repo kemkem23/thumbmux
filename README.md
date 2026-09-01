@@ -106,18 +106,23 @@ from tmux and arrives as a full reset; archived rows deliberately keep their
 original physical wrapping so history is not silently rewritten
 ([details](docs/reflow.md)).
 
-For Claude Code sessions, `SessionView` also offers a three-state Bash view:
-**SHOW** keeps the pane verbatim, **HIDE** replaces each recognized consecutive
-Bash group with a green `hidden bash` divider one third of a terminal row high,
-and **DISTILL** asks an optional host adapter for a short summary. The three
-choices open directly to the left of the BASH action instead of cycling modes.
+For Claude Code and Codex sessions, `SessionView` offers a compact `TOOLS`
+disclosure. Claude Code keeps three choices: **SHOW** keeps the pane verbatim,
+**HIDE** replaces each recognized consecutive Bash group with a green
+`hidden bash` divider one third of a terminal row high, and **DISTILL** asks an
+optional host adapter for a short summary. Codex offers **SHOW / HIDE**; HIDE
+compacts only sealed, successful completed-tool paint such as `Ran`, background
+waits/interactions, agent events, viewed images and completed edit bodies. The
+edit summary remains visible. Active status, running-background HUD, prompts,
+assistant prose, warnings, approvals, failures and interrupted work remain raw.
+The choices open directly to the left of the TOOLS action instead of cycling modes.
 The compact divider is centred in the separator gap: its small label is
 left-aligned and a one-pixel green rule fills the remaining space to the right.
 Blank rows immediately before and after a recognized group are folded into that
 divider only when surrounding semantic rows prove they are separators; capture
 padding and retention seams remain visible rather than being guessed away.
-Detection is deliberately fail-open outside a known normal screen or when the
-Claude header/result/boundary pattern is incomplete. A fresh Distill view offers
+Detection is deliberately fail-open outside a known normal screen or when a
+provider's header/result/boundary pattern is incomplete. A fresh Distill view offers
 at most its newest ten completed groups; while it remains open, each coalesced
 live update offers only its newest newly-completed group. Scrolling creates no
 summary work, and an active tail holds its whole adjacent group until completion.
@@ -125,7 +130,7 @@ Copy, search, history, retention, and ANSI parsing continue to use the original
 rows. Virtual scroll, cursor, search jumps, history anchors, and retention-gap
 markers use the variable-height presentation coordinates. thumbmux itself does
 not choose or invoke a model—the host owns redaction, lifecycle checks,
-throttling, caching, and transport. The low-level Claude Bash detector/projection
+throttling, caching, and transport. The low-level Claude/Codex detector/projection
 exports are experimental because the upstream terminal layout may change; see
 [the app adapter contract](docs/app.md#22-session-metadata-panels-uploads-preferences-and-terminal-props).
 
@@ -704,7 +709,7 @@ an installable component, not a listener or executable.
 
 | package | what you get |
 |---|---|
-| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · experimental Claude Bash detection/projection · `replay` strict full/delta journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
+| **`thumbmux/core`** | `ansi-html` incremental SGR→HTML renderer (modern underlines + OSC 8 hyperlinks + search overlay ranges) · `search` bounded visible-text / regex-lite scrollback search · experimental Claude Bash and Codex completed-tool detection/projection · `replay` strict full/delta frame-journal parse + seek · `notification` host-supplied agent-notification contract · `terminal-link` wrapped-URL detection · `terminal-scroll` jump-free capture merging · `prompt-scan` submitted-prompt extraction · `keyboardEventToSequence` terminal key encoding · `bracketedPaste` + `pasteInfo` thresholds · `submitPlan` (encodes the paste-ingest/Enter race agent TUIs have) · SGR mouse math for alt-screen TUIs · `surface` one-color theming · `launch` preset command builder · `protocol` the WS message types |
 | **`thumbmux/svelte`** | `TermView` compositor-scroll viewer (`claimGeometry`, `altScreenMouse`, built-in search overlay) · `TermSearch` · `RecordingPlayer` · `NotificationPermission` · `DesktopKeys` desktop focus/key/paste wrapper · `ComposerDock` COMPOSE/DIRECT input sheet · `SessionGrid` + `SessionThumb` live-miniature hub · `LaunchSheet` preset launcher · `ShortcutBar` + `ShortcutsSheet` · `NotePanel` + `PromptsPanel` · `UploadAction` · `TermHud`, `ActionFab`, `DpadSheet`, `ThemeSheet`, `NewTerminalSheet` · `ws-mux` reconnecting multiplexed client · notification / service-worker helpers |
 | **`thumbmux/server`** | `createAppRoutes()` reference composition for sessions, spawn, optional upload/preferences, kill, and the fixed WebSocket mux · `TmuxWsMux` shared adaptive polling, dirty signals, content-hash dedupe, tail + delta modes, history, and backpressure · `RetentionLane` keeps chosen sessions archived with no viewer attached · `DurableHistoryArchive` plain-text scrollback store that also keeps the live window · experimental direct-PTY WAL launch/health/control and supervised replay-worker integration · `stitchCapture` the reconciliation both use · `FileHistoryArchive` · `FrameJournal` · `createTokenGuard()` · `createBunTmuxDriver()` · individual fetch-style handler factories |
 | **`thumbmux/app`** | `ThumbmuxApp` assembled hub/session shell · separate `HubView`, `SessionView`, and chromeless `EmbedView` mounts · typed `AppAdapters` for routing, session metadata, launch, content, preferences, theme, labels, and host extension slots |
