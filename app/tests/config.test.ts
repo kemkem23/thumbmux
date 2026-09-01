@@ -84,11 +84,13 @@ const plannedAdapters = {
     launch: async () => ({ name: 'generated-session' }),
   },
   sessionMeta: () => [],
+  killSession: async (_name: string) => {},
   hubPresentation: {
     filterOptions: [{ value: 'tool', label: 'Tool' }],
     groupable: true,
     order: 'recent',
     showCommand: false,
+    killLabel: 'End session',
   },
   sessionPresentation: {
     actions: (_session, _context, defaults) => defaults,

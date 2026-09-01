@@ -10,56 +10,69 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { assertContractFixturePort } from "../contract/fixtures/runtime-guard";
 
 const roots: string[] = [];
 const runner = resolve(import.meta.dir, "contract-fixtures.sh");
+
+function untrustedHostEnv(extra: Record<string, string> = {}): Record<string, string> {
+  const env = { ...process.env } as Record<string, string>;
+  for (const name of [
+    "CI", "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_WORKSPACE",
+    "RUNNER_TEMP", "THUMBMUX_DEDICATED_DOCKER_ROOT",
+    "CORTEX_TEST_DISPOSABLE_CHECKOUT", "CORTEX_TEST_HARD_SANDBOX",
+    "CORTEX_TEST_ISOLATED", "CORTEX_TEST_RUNTIME", "CORTEX_TEST_REPO_ROOT",
+    "CORTEX_TEST_SANDBOX_ATTESTATION", "DOCKER_HOST", "DOCKER_CONTEXT",
+  ]) delete env[name];
+  return { ...env, ...extra };
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("frozen consumer runner policy", () => {
-  test("refusal preserves a pre-existing ctrfix session", () => {
+  test("direct invocation fails before caller-supplied tmux or Docker can run", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-contract-runner-test-"));
     roots.push(root);
     const bin = join(root, "bin");
-    const log = join(root, "tmux.log");
+    const log = join(root, "dangerous-command.log");
     const temp = join(root, "tmp");
     mkdirSync(bin);
     mkdirSync(temp);
-    const fakeTmux = join(bin, "tmux");
-    writeFileSync(fakeTmux, [
+    const fakeCommand = [
       "#!/bin/sh",
-      'if [ "$1" = "list-sessions" ]; then',
-      "  echo ctrfix-existing",
-      "  exit 0",
-      "fi",
-      'if [ "$1" = "kill-session" ]; then',
-      '  printf "%s\\n" "$*" >> "$THUMBMUX_FAKE_TMUX_LOG"',
-      "  exit 0",
-      "fi",
+      'printf "%s %s\\n" "$0" "$*" >> "$THUMBMUX_DANGEROUS_COMMAND_LOG"',
       "exit 0",
       "",
-    ].join("\n"));
-    chmodSync(fakeTmux, 0o755);
+    ].join("\n");
+    for (const name of ["bash", "git", "tmux", "docker"]) {
+      const executable = join(bin, name);
+      writeFileSync(executable, fakeCommand);
+      chmodSync(executable, 0o755);
+    }
 
+    const bashEnv = join(root, "bash-env.sh");
+    writeFileSync(
+      bashEnv,
+      'printf "BASH_ENV executed\\n" >> "$THUMBMUX_DANGEROUS_COMMAND_LOG"\n',
+    );
     const result = Bun.spawnSync({
-      cmd: ["bash", runner],
+      cmd: [runner],
       cwd: resolve(import.meta.dir, ".."),
-      env: {
-        ...process.env,
+      env: untrustedHostEnv({
         PATH: `${bin}:${process.env.PATH ?? ""}`,
+        BASH_ENV: bashEnv,
         TMPDIR: temp,
-        THUMBMUX_FAKE_TMUX_LOG: log,
-      },
+        THUMBMUX_DANGEROUS_COMMAND_LOG: log,
+      }),
       stdout: "pipe",
       stderr: "pipe",
     });
 
     expect(result.exitCode).not.toBe(0);
-    expect(result.stderr.toString()).toContain(
-      "refusing to start while ctrfix-* sessions already exist",
-    );
+    expect(result.stderr.toString()).toContain("INCOMPLETE");
     expect(existsSync(log) ? readFileSync(log, "utf8") : "").toBe("");
   });
 
@@ -75,76 +88,125 @@ describe("frozen consumer runner policy", () => {
 
   test("runner uses an atomic tmux-namespace lock and never sweeps sessions", () => {
     const source = readFileSync(runner, "utf8");
+    const cleanup = readFileSync(
+      resolve(import.meta.dir, "private-test-tmux-cleanup.sh"),
+      "utf8",
+    );
     expect(source).toContain("flock -n");
-    expect(source).toContain('TMUX_TMPDIR:-/tmp');
-    expect(source).toContain('TMUX%%,*');
+    expect(source).toContain('THUMBMUX_TEST_TMUX_SOCKET="$TMUX_SOCKET"');
+    expect(source).toContain('private-test-tmux.sh');
+    expect(source).toContain('private-test-tmux-cleanup.sh');
+    expect(source).toContain('unset TMUX TMUX_PANE');
+    expect(source).toContain(
+      'stop_private_tmux_server /usr/bin/tmux "$TMUX_SOCKET" "$TMUX_ROOT"',
+    );
+    expect(source).toContain("stop_private_tmux_through_attested_shim");
+    expect(source).toContain("LC_ALL=C tmux kill-server");
+    expect(source).toContain("_cortex_private_tmux_is_no_server");
+    expect(source).toContain('/usr/bin/kill -0 "$server_pid"');
+    expect(source).toContain('[[ "$tmux_cleanup_safe" == 1 ]]');
+    expect(cleanup).toContain("_cortex_private_tmux_quarantine_stale_socket");
+    expect(cleanup).toContain("/usr/bin/mv --no-copy -n -T");
+    expect(cleanup).toContain("original_socket_identity");
     expect(source).not.toContain("tmux kill-session");
   });
 
-  test("two runners on one TMUX socket cannot split locks with temp overrides", async () => {
+  test("consumer runtime gate binds the exact admitted Bun and Node PATH", () => {
+    const runnerSource = readFileSync(runner, "utf8");
+    const fixtureGuard = readFileSync(
+      resolve(import.meta.dir, "../contract/fixtures/runtime-guard.ts"),
+      "utf8",
+    );
+    const appRuntime = readFileSync(
+      resolve(import.meta.dir, "../contract/fixtures/app-host/runtime.ts"),
+      "utf8",
+    );
+    const admissionGuard = readFileSync(
+      resolve(import.meta.dir, "test-runtime-guard.sh"),
+      "utf8",
+    );
+
+    expect(admissionGuard).toContain(
+      'PATH="/usr/bin:/bin:$(/usr/bin/dirname -- "$bun_real"):$(/usr/bin/dirname -- "$THUMBMUX_GUARD_NODE_BIN")"',
+    );
+    expect(runnerSource).toContain('export PATH="$PRIVATE_BIN:$PATH"');
+    expect(fixtureGuard).toContain("pathParts.length !== 5");
+    expect(fixtureGuard).toContain(
+      'pathParts[4] !== "/opt/hostedtoolcache/node/22.23.2/x64/bin"',
+    );
+    expect(fixtureGuard).not.toContain("pathParts.length !== 4");
+    expect(fixtureGuard).toContain(
+      "bunBin !== process.env.THUMBMUX_GUARD_BUN_BIN",
+    );
+    expect(fixtureGuard).toContain(
+      "(bunBinStat.uid !== 0 && bunBinStat.uid !== uid)",
+    );
+    expect(appRuntime).toContain(
+      '`exec ${shellQuote(bunBin)} ${shellQuote(probePath)}`',
+    );
+    expect(appRuntime).not.toContain("`exec bun ");
+  });
+
+  test("consumer Bun types stay aligned with the frozen package lock", () => {
+    const source = readFileSync(runner, "utf8");
+    const lock = readFileSync(resolve(import.meta.dir, "../bun.lock"), "utf8");
+
+    expect(source).toContain("'devDependencies.@types/bun=1.3.14'");
+    expect(source).not.toContain("'devDependencies.@types/bun=^1.3.0'");
+    expect(lock).toContain('"@types/bun": ["@types/bun@1.3.14"');
+  });
+
+  test("app consumer uses the exact browser installed by the verify gate", () => {
+    const source = readFileSync(runner, "utf8");
+    const lock = readFileSync(resolve(import.meta.dir, "../bun.lock"), "utf8");
+
+    expect(source).toContain("'devDependencies.@playwright/test=1.61.1'");
+    expect(source).not.toContain("'devDependencies.@playwright/test=^1.61.1'");
+    expect(lock).toContain('"@playwright/test": ["@playwright/test@1.61.1"');
+  });
+
+  test("consumer port guard rejects an unassigned or production listener", () => {
+    expect(() => assertContractFixturePort(undefined)).toThrow(
+      "unsafe or reserved loopback port undefined",
+    );
+    expect(() => assertContractFixturePort(47_779)).toThrow(
+      "unsafe or reserved loopback port 47779",
+    );
+    expect(() => assertContractFixturePort(48_779)).not.toThrow();
+  });
+
+  test("forged disposable markers still fail before tmux or Docker", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-contract-lock-test-"));
     roots.push(root);
     const bin = join(root, "bin");
-    const tempA = join(root, "tmp-a");
-    const tempB = join(root, "tmp-b");
-    const tmuxTempA = join(root, "tmux-a");
-    const tmuxTempB = join(root, "tmux-b");
-    const tmuxSocket = join(root, "shared.sock");
-    const marker = join(root, "first-entered");
-    for (const path of [bin, tempA, tempB, tmuxTempA, tmuxTempB]) mkdirSync(path);
-    const fakeTmux = join(bin, "tmux");
-    writeFileSync(fakeTmux, [
+    const log = join(root, "dangerous-command.log");
+    mkdirSync(bin);
+    const fakeCommand = [
       "#!/bin/sh",
-      'if [ "$1" = "list-sessions" ]; then',
-      '  : > "$THUMBMUX_LOCK_TEST_MARKER"',
-      "  sleep 5",
-      "  exit 1",
-      "fi",
+      'printf "%s %s\\n" "$0" "$*" >> "$THUMBMUX_DANGEROUS_COMMAND_LOG"',
       "exit 0",
       "",
-    ].join("\n"));
-    chmodSync(fakeTmux, 0o755);
-    const commonEnv = {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
-      TMUX: `${tmuxSocket},123,0`,
-      THUMBMUX_LOCK_TEST_MARKER: marker,
-    };
-    const first = Bun.spawn(["bash", runner], {
-      cwd: resolve(import.meta.dir, ".."),
-      env: { ...commonEnv, TMPDIR: tempA, TMUX_TMPDIR: tmuxTempA },
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    try {
-      for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt++) {
-        await Bun.sleep(10);
-      }
-      expect(existsSync(marker)).toBe(true);
-      // A bounded wait, because this is the assertion that hangs when it is
-      // wrong. The second runner is supposed to lose the lock race and exit
-      // immediately; if it instead blocks — a lock that waits rather than
-      // failing, a first runner whose grandchildren still hold it — an
-      // unbounded spawnSync waits forever, and a test that hangs reports
-      // nothing at all. On CI that ran to the job ceiling with no culprit
-      // named. Two minutes is far past "immediately".
-      const second = Bun.spawnSync({
-        cmd: ["bash", runner],
-        cwd: resolve(import.meta.dir, ".."),
-        env: { ...commonEnv, TMPDIR: tempB, TMUX_TMPDIR: tmuxTempB },
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 120_000,
-      });
-      expect(second.exitCode).not.toBe(0);
-      expect(second.stderr.toString()).toContain("another runner owns");
-    } finally {
-      // `first` is bash; the work it started is its children. Killing only bash
-      // leaves them holding the lock the second runner is racing for, which is
-      // the shape that turns a failed assertion into a hung job. Signal the
-      // group, then bound the wait so cleanup cannot become the hang either.
-      try { process.kill(-first.pid, "SIGTERM"); } catch { first.kill(); }
-      await Promise.race([first.exited, Bun.sleep(30_000)]);
+    ].join("\n");
+    for (const name of ["git", "tmux", "docker"]) {
+      const executable = join(bin, name);
+      writeFileSync(executable, fakeCommand);
+      chmodSync(executable, 0o755);
     }
+    const result = Bun.spawnSync({
+      cmd: [runner],
+      cwd: resolve(import.meta.dir, ".."),
+      env: untrustedHostEnv({
+        CI: "1",
+        CORTEX_TEST_DISPOSABLE_CHECKOUT: "1",
+        THUMBMUX_DEDICATED_DOCKER_ROOT: "/tmp/thumbmux-dedicated-docker.forged",
+        THUMBMUX_DANGEROUS_COMMAND_LOG: log,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+      }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain("INCOMPLETE");
+    expect(existsSync(log) ? readFileSync(log, "utf8") : "").toBe("");
   });
 });

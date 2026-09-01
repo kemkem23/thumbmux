@@ -33,11 +33,11 @@ export function exactTmuxTarget(name: string): string {
 /**
  * Exact target-pane/window syntax. Pane operations such as `send-keys` and
  * `capture-pane` reject a bare exact-session target (`=name`), even though
- * `kill-session` accepts it. Keep both the leading `=` and trailing `:`:
- * without `=`, tmux may silently prefix-match a different session.
+ * `kill-session` accepts it. Pin window 0, pane 0 as well as the exact session;
+ * a trailing `:` alone still lets tmux choose the current window/pane.
  */
 export function exactTmuxPaneTarget(name: string): string {
-  return `${exactTmuxTarget(name)}:`;
+  return `${exactTmuxTarget(name)}:0.0`;
 }
 
 function targetResolvers(options: TmuxTargetOptions): {

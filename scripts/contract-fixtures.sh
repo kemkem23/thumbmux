@@ -1,19 +1,175 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
+case "$-" in *p*) ;; *) printf 'contract fixtures: privileged interpreter is required\n' >&2; exit 126 ;; esac
+THUMBMUX_ENTRY_CALLER_PATH="${PATH-}"
+PATH=/usr/bin:/bin
+export PATH THUMBMUX_ENTRY_CALLER_PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS BUN_OPTIONS NODE_PATH \
+  PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH \
+  GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+  GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT 2>/dev/null || :
 set -euo pipefail
 
 # Frozen consumer fixtures are intentionally installed like outside packages.
-# Override roots only for mutation proofs against disposable copies in /tmp.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Package/fixture roots are harness-owned; the only admitted host is the public
+# GitHub-hosted disposable CI job.
+SCRIPT_FILE="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")" \
+  || { printf 'contract fixtures: entrypoint path is unavailable\n' >&2; exit 126; }
+SCRIPT_DIR="$(/usr/bin/dirname -- "$SCRIPT_FILE")"
 PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-PACKAGE_SOURCE="${THUMBMUX_CONTRACT_PACKAGE_ROOT:-$PACKAGE_ROOT}"
-FIXTURES_ROOT="${THUMBMUX_CONTRACT_FIXTURES_ROOT:-$PACKAGE_ROOT/contract/fixtures}"
 ONLY_FIXTURE="${THUMBMUX_CONTRACT_ONLY:-}"
-if [[ -n "${TMUX:-}" ]]; then
-  tmux_socket="${TMUX%%,*}"
-  LOCK_FILE="$(dirname -- "$tmux_socket")/.thumbmux-contract-fixtures-$(basename -- "$tmux_socket").lock"
-else
-  LOCK_FILE="${TMUX_TMPDIR:-/tmp}/thumbmux-contract-fixtures-${UID}.lock"
-fi
+. "$SCRIPT_DIR/test-runtime-guard.sh"
+. "$SCRIPT_DIR/private-test-tmux-cleanup.sh"
+
+THUMBMUX_GUARD_RUNTIME=''
+RUN_COMPLETE=0
+PRIVATE_TMUX_READY=0
+TMUX_SOCKET=''
+
+fixture_sessions() {
+  [[ "$PRIVATE_TMUX_READY" == 1 ]] || return 0
+  tmux list-sessions -F '#S' 2>/dev/null || true
+}
+
+stop_private_tmux_through_attested_shim() {
+  local output=''
+  local server_pid=''
+  local probe_rc=0
+  local attempt=0
+
+  if output="$(LC_ALL=C tmux display-message -p '#{pid}' 2>&1)"; then
+    [[ "$output" =~ ^[1-9][0-9]{0,9}$ && "$output" != 1 ]] || return 1
+    server_pid="$output"
+  else
+    probe_rc=$?
+    if (( probe_rc != 0 )) \
+      && _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+      return 0
+    fi
+    printf 'contract fixtures: initial private tmux probe failed: %s\n' "$output" >&2
+    return 1
+  fi
+
+  if ! output="$(LC_ALL=C tmux kill-server 2>&1)" \
+    && ! _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+    printf 'contract fixtures: attested private tmux kill-server failed: %s\n' \
+      "$output" >&2
+    return 1
+  fi
+
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    if output="$(LC_ALL=C tmux display-message -p '#{pid}' 2>&1)"; then
+      if [[ "$output" != "$server_pid" ]]; then
+        printf 'contract fixtures: private tmux PID changed during cleanup: %s -> %s\n' \
+          "$server_pid" "$output" >&2
+        return 1
+      fi
+    else
+      probe_rc=$?
+      if (( probe_rc != 0 )) \
+        && _cortex_private_tmux_is_no_server "$output" "$TMUX_SOCKET"; then
+        break
+      fi
+      printf 'contract fixtures: post-kill private tmux probe failed: %s\n' \
+        "$output" >&2
+      return 1
+    fi
+    /usr/bin/sleep 0.05
+  done
+  (( attempt < 40 )) || return 1
+
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    /usr/bin/kill -0 "$server_pid" 2>/dev/null || return 0
+    /usr/bin/sleep 0.05
+  done
+  printf 'contract fixtures: original private tmux PID survived cleanup: %s\n' \
+    "$server_pid" >&2
+  return 1
+}
+
+cleanup() {
+  local rc=$?
+  local remaining=''
+  local tmux_cleanup_safe=1
+  set +e
+  if [[ -n "$THUMBMUX_GUARD_RUNTIME" && "$PRIVATE_TMUX_READY" == 1 ]]; then
+    remaining="$(fixture_sessions)"
+    if [[ -n "$remaining" ]]; then
+      echo 'contract fixtures: private tmux sessions survived fixture cleanup' >&2
+      printf '%s\n' "$remaining" >&2
+      rc=1
+    fi
+    if [[ -S "$TMUX_SOCKET" && ! -L "$TMUX_SOCKET" ]]; then
+      # Only the shim may stop the server. The shared helper then proves and
+      # quarantines the exact stale -S socket inode left by tmux 3.4.
+      if stop_private_tmux_through_attested_shim; then
+        stop_private_tmux_server /usr/bin/tmux "$TMUX_SOCKET" "$TMUX_ROOT" \
+          || { rc=1; tmux_cleanup_safe=0; }
+      else
+        rc=1
+        tmux_cleanup_safe=0
+      fi
+    elif [[ -e "$TMUX_SOCKET" || -L "$TMUX_SOCKET" ]]; then
+      echo 'contract fixtures: private tmux socket changed type; refusing kill-server' >&2
+      rc=1
+      tmux_cleanup_safe=0
+    fi
+    if [[ -e "$TMUX_SOCKET" || -L "$TMUX_SOCKET" ]]; then
+      echo 'contract fixtures: exact private tmux socket survived attested cleanup' >&2
+      rc=1
+      tmux_cleanup_safe=0
+    fi
+  fi
+  if [[ -n "$THUMBMUX_GUARD_RUNTIME" ]]; then
+    if [[ "$tmux_cleanup_safe" == 1 ]]; then
+      thumbmux_remove_test_runtime || rc=1
+    else
+      echo 'contract fixtures: preserving changed private runtime after unsafe tmux cleanup' >&2
+    fi
+  fi
+  [[ "$RUN_COMPLETE" == 1 || "$PRIVATE_TMUX_READY" == 0 ]] || rc=1
+  trap - EXIT
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+[[ -z "${THUMBMUX_CONTRACT_PACKAGE_ROOT-}" \
+  && -z "${THUMBMUX_CONTRACT_FIXTURES_ROOT-}" \
+  && -z "${CHROMIUM_PATH-}" ]] \
+  || { echo 'contract fixtures: package/fixture/browser overrides are forbidden' >&2; exit 2; }
+thumbmux_prepare_test_runtime contract-fixtures "$PACKAGE_ROOT" \
+  || { echo 'contract fixtures: public disposable-CI attestation failed' >&2; exit 2; }
+RUN_ID="$(thumbmux_make_run_id)"
+thumbmux_bind_run_attestation "$RUN_ID" contract-fixtures
+PACKAGE_SOURCE="$THUMBMUX_GUARD_RUNTIME/source"
+/usr/bin/install -d -m 0700 "$PACKAGE_SOURCE"
+thumbmux_emit_frozen_source_archive \
+  | /usr/bin/tar -x -C "$PACKAGE_SOURCE" \
+  || { echo 'contract fixtures: frozen source export failed' >&2; exit 2; }
+[[ -d "$PACKAGE_ROOT/git-dist" && ! -L "$PACKAGE_ROOT/git-dist" \
+  && -z "$(/usr/bin/find "$PACKAGE_ROOT/git-dist" -type l -print -quit)" ]] \
+  || { echo 'contract fixtures: generated git-dist is missing or symlinked' >&2; exit 2; }
+/usr/bin/install -d -m 0700 "$PACKAGE_SOURCE/git-dist"
+/usr/bin/cp -a -- "$PACKAGE_ROOT/git-dist/." "$PACKAGE_SOURCE/git-dist/"
+/usr/bin/diff -qr -- "$PACKAGE_ROOT/git-dist" "$PACKAGE_SOURCE/git-dist" >/dev/null \
+  || { echo 'contract fixtures: generated git-dist changed while freezing' >&2; exit 2; }
+FIXTURES_ROOT="$PACKAGE_SOURCE/contract/fixtures"
+PRIVATE_BIN="$THUMBMUX_GUARD_RUNTIME/bin"
+TMUX_ROOT="$THUMBMUX_GUARD_RUNTIME/tmux"
+TMUX_SOCKET="$TMUX_ROOT/tmux-$(id -u)/default"
+mkdir -p "$PRIVATE_BIN" "$TMUX_ROOT" "${TMUX_SOCKET%/*}"
+chmod 0700 "$PRIVATE_BIN" "$TMUX_ROOT" "${TMUX_SOCKET%/*}"
+/usr/bin/ln -s "$PACKAGE_SOURCE/scripts/private-test-tmux.sh" "$PRIVATE_BIN/tmux"
+unset TMUX TMUX_PANE TMUX_TMPDIR
+export THUMBMUX_TEST_RUNTIME="$THUMBMUX_GUARD_RUNTIME"
+export THUMBMUX_TEST_RUN_ID="$RUN_ID"
+export THUMBMUX_TEST_SCOPE=contract-fixtures
+export THUMBMUX_TEST_TMUX_SOCKET="$TMUX_SOCKET"
+export PATH="$PRIVATE_BIN:$PATH"
+PRIVATE_TMUX_READY=1
+LOCK_FILE="$THUMBMUX_GUARD_RUNTIME/contract-fixtures.lock"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -21,22 +177,14 @@ if ! flock -n 9; then
   exit 1
 fi
 
-fixture_sessions() {
-  tmux list-sessions -F '#S' 2>/dev/null | awk '/^ctrfix-/' || true
-}
-
-cleanup() {
-  [[ -z "${WORK:-}" ]] || rm -rf "$WORK"
-}
-
 if [[ -n "$(fixture_sessions)" ]]; then
-  echo "contract fixtures: refusing to start while ctrfix-* sessions already exist" >&2
+  echo "contract fixtures: refusing an unexpectedly non-empty private tmux server" >&2
   fixture_sessions >&2
   exit 1
 fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/thumbmux-contract-fixtures.XXXXXX")"
-trap cleanup EXIT INT TERM
+WORK="$THUMBMUX_GUARD_RUNTIME/work"
+mkdir -p "$WORK"
 
 case "$ONLY_FIXTURE" in
   ""|minimal-host|guarded-host|app-host) ;;
@@ -83,6 +231,7 @@ install_consumer() {
   }
   mkdir -p "$consumer"
   cp -R "$FIXTURES_ROOT/$fixture/." "$consumer/"
+  cp "$FIXTURES_ROOT/runtime-guard.ts" "$consumer/runtime-guard.ts"
 
   (
     cd "$consumer"
@@ -90,18 +239,18 @@ install_consumer() {
     npm pkg set "name=thumbmux-contract-$fixture" "type=module"
     npm pkg set "private=true" --json
     npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
-    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=^1.3.0'
+    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=1.3.14'
 
     if [[ "$fixture" == "app-host" ]]; then
       npm pkg set 'dependencies.svelte=^5.51.0'
       npm pkg set \
-        'devDependencies.@playwright/test=^1.61.1' \
+        'devDependencies.@playwright/test=1.61.1' \
         'devDependencies.@sveltejs/vite-plugin-svelte=^6.2.1' \
         'devDependencies.svelte-check=^4.3.4' \
         'devDependencies.vite=^7.3.1'
     fi
 
-    env NODE_ENV=development bun install --ignore-scripts
+    env NODE_ENV=development "$THUMBMUX_GUARD_BUN_BIN" install --ignore-scripts
 
     local installed
     installed="$(realpath node_modules/thumbmux)"
@@ -129,20 +278,11 @@ install_consumer() {
         --tsconfig ./contract-app-host-tsconfig.json \
         --fail-on-warnings
       ./node_modules/.bin/vite build
-      if [[ -z "${CHROMIUM_PATH:-}" ]]; then
-        for browser_command in google-chrome-stable google-chrome chromium chromium-browser; do
-          if command -v "$browser_command" >/dev/null 2>&1; then
-            CHROMIUM_PATH="$(command -v "$browser_command")"
-            export CHROMIUM_PATH
-            break
-          fi
-        done
-      fi
-      bun run runtime.ts
+      "$THUMBMUX_GUARD_BUN_BIN" runtime.ts
     elif [[ -f index.ts ]]; then
-      bun run index.ts
+      "$THUMBMUX_GUARD_BUN_BIN" index.ts
     else
-      bun run run.ts
+      "$THUMBMUX_GUARD_BUN_BIN" run.ts
     fi
   )
 }
@@ -157,7 +297,7 @@ done
 
 remaining_sessions="$(fixture_sessions)"
 if [[ -n "$remaining_sessions" ]]; then
-  echo "contract fixtures cleanup: tmux sessions remain" >&2
+  echo "contract fixtures cleanup: private tmux sessions remain" >&2
   echo "$remaining_sessions" >&2
   exit 1
 fi
@@ -171,3 +311,4 @@ fi
 
 echo "contract fixtures cleanup: ctrfix sessions=0, fixture listener processes=0"
 echo "contract fixtures: all selected frozen consumers passed"
+RUN_COMPLETE=1

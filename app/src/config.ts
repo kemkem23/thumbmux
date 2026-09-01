@@ -37,6 +37,8 @@ export interface HubPresentationOptions {
   showCommand?: boolean;
   /** Opt into the full-width-mobile / 500px-desktop metadata card layout. */
   cardLayout?: 'default' | 'dense';
+  /** Accessible label for the opt-in dense-card kill control. */
+  killLabel?: string;
 }
 
 /** Optional presentation choices for one mounted session. Omitted members
@@ -155,6 +157,9 @@ export interface AppAdapters {
    * consumer keeps its own server and mounts only the client shell — so the
    * path shape is not something the package gets to assume. */
   fetchSessions?: () => Promise<SessionListItem[]>;
+  /** Optional destructive action exposed only on dense hub cards. The host
+   * owns confirmation, error UX, the mutation transport and list refresh. */
+  killSession?: (name: string) => void | Promise<void>;
   /** Override the live session-list stream used by `HubView` and `SessionView`
    * after bootstrap. Defaults to the `@thumbmux/svelte` singleton. This seam
    * does not replace `TermView`'s pane output, history, resize, or connection

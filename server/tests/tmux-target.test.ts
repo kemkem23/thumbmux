@@ -12,7 +12,7 @@ const unusualNames = [
 describe("exact tmux target helpers", () => {
   test("return the exact session and pane forms", () => {
     expect(exactTmuxTarget("s")).toBe("=s");
-    expect(exactTmuxPaneTarget("s")).toBe("=s:");
+    expect(exactTmuxPaneTarget("s")).toBe("=s:0.0");
   });
 
   test("pane targets start with the exact-match marker", () => {
@@ -22,13 +22,13 @@ describe("exact tmux target helpers", () => {
 
   test("pane targets end with the pane selector", () => {
     const targets = unusualNames.map(exactTmuxPaneTarget);
-    expect(targets.every((target) => target.endsWith(":"))).toBe(true);
+    expect(targets.every((target) => target.endsWith(":0.0"))).toBe(true);
   });
 
   test("unusual names preserve the relation to exact session targets", () => {
     const sessionTargets = unusualNames.map(exactTmuxTarget);
     const paneTargets = unusualNames.map(exactTmuxPaneTarget);
 
-    expect(paneTargets).toEqual(sessionTargets.map((target) => `${target}:`));
+    expect(paneTargets).toEqual(sessionTargets.map((target) => `${target}:0.0`));
   });
 });

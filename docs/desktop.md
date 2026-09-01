@@ -209,6 +209,15 @@ scroll engine:
   scroll position instead of moving the viewport. `scrollToBottom()` sets the
   offset to exactly zero before flushing any content deferred by a gesture or
   selection, then future output follows again.
+- A boundary-less capture whose row continuity cannot be proved does not
+  replace the reader's mounted rows. `TermView` keeps only the newest such
+  capture offscreen (`data-live-rejoin-pending="1"`) and applies it when local
+  wheel/touch reaches the live tail or `scrollToBottom()` is called. This is a
+  fail-closed path for repainting normal-screen TUIs. Later full resyncs and a
+  first durable boundary stay behind the same reader fence; the deferred suffix
+  is capped by the normal 10,000-row / 8 MiB retention budget. Captures with a
+  proven overlap or an already-established durable boundary continue to merge
+  immediately.
 
 When `altScreenMouse=true`, wheel events are forwarded to the pane instead of
 moving local scroll:
@@ -454,6 +463,18 @@ type TermViewProps = {
   onScrollStateChange?: (state: { bottomOffset: number; scrolledUp: boolean }) => void;
 };
 ```
+
+`onLinesChange` publishes the newly committed raw model. A fail-closed reader
+freeze therefore stays silent while newer whole captures are deferred. The
+later tail rejoin publishes the newest model once with its original `live` or
+`replace` source when it enters the current raw model. If an absolute archive
+is still detached, rejoin refreshes only its offscreen live suffix; the existing
+`prepend` notification is emitted when forward paging attaches the seam. A
+newer capture waiting behind an active gesture is coalesced into that deferred
+slot before rejoin, so an older frame cannot be published first. A gesture that
+retreats, becomes multi-touch, or hands control to search navigation cancels
+its inferred rejoin and leaves the reader model frozen until a later explicit
+tail action.
 
 `fontPx` on `TermView` is an unconstrained CSS pixel size: whatever the host
 passes is rendered immediately. A change of `fontPx` **does not** send a tmux

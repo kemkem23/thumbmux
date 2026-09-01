@@ -53,6 +53,6 @@ describe("git-dist hygiene", () => {
     const sessionName = "probe-session";
 
     expect(publicApi.exactTmuxPaneTarget?.(sessionName))
-      .toBe(`${serverBarrel.exactTmuxTarget(sessionName)}:`);
+      .toBe(`${serverBarrel.exactTmuxTarget(sessionName)}:0.0`);
   });
 });

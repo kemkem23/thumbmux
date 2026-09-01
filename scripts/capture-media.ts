@@ -5,16 +5,25 @@
  * never in the picture: the hub is asserted to contain exactly the four
  * staged names, and the run fails if any other session appears.
  */
-import { chromium, expect, type Browser, type BrowserContext, type Page } from "@playwright/test";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import type { Browser, BrowserContext, Page } from "@playwright/test";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import {
+  assertLocalDemoUrl,
+  assertThumbmuxDockerContainer,
+} from "../e2e/test-runtime-guard";
 
-const DEMO_URL = process.env.DEMO_URL;
-const OUT_DIR = process.env.THUMBMUX_MEDIA_OUT;
-const ARTIFACTS = process.env.THUMBMUX_MEDIA_ARTIFACTS ?? "/tmp/thumbmux-media-artifacts";
+const RUNTIME = assertThumbmuxDockerContainer("media");
+const DEMO_URL = assertLocalDemoUrl(process.env.DEMO_URL);
+const { chromium, expect } = await import("@playwright/test");
+const expectedOut = realpathSync(resolve(dirname(RUNTIME.attestation), "generated-media"));
+const expectedArtifacts = realpathSync(resolve(dirname(RUNTIME.attestation), "artifacts"));
+const OUT_DIR = realpathSync(process.env.THUMBMUX_MEDIA_OUT ?? "");
+const ARTIFACTS = realpathSync(process.env.THUMBMUX_MEDIA_ARTIFACTS ?? "");
 
-if (!DEMO_URL) throw new Error("DEMO_URL is required");
-if (!OUT_DIR) throw new Error("THUMBMUX_MEDIA_OUT is required");
+if (OUT_DIR !== expectedOut || ARTIFACTS !== expectedArtifacts) {
+  throw new Error("thumbmux media isolation: output/artifact roots escaped the guarded run");
+}
 
 const ALLOWED = ["agent", "build", "htop", "server-logs"] as const;
 const PHONE = { width: 390, height: 664 };

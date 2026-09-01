@@ -7,9 +7,19 @@
   let {
     palette,
     initialSessions,
+    onOpen = () => {},
+    onNew = () => {},
+    onKill,
+    cardLayout = 'default',
+    showNew = true,
   }: {
     palette: AnsiPalette;
     initialSessions: GridSession[];
+    onOpen?: (name: string) => void;
+    onNew?: () => void;
+    onKill?: (name: string) => void;
+    cardLayout?: 'default' | 'dense';
+    showNew?: boolean;
   } = $props();
 
   let sessions = $state(initialSessions);
@@ -19,4 +29,4 @@
   }
 </script>
 
-<SessionGrid {sessions} {palette} onOpen={() => {}} onNew={() => {}} />
+<SessionGrid {sessions} {palette} {onOpen} {onNew} {onKill} {cardLayout} {showNew} />

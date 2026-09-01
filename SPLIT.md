@@ -111,16 +111,15 @@ Release checklist:
   becomes `0.8.0` the range stops matching the workspace, bun falls through to
   the public registry, and the install dies on `404 @thumbmux/core`. The
   version bump alone is not a release; it is half of one.
-- **Run `bash scripts/ci-parity.sh` before pushing the tag.** The workflows in
-  `.github/` only fire in the public repo, so a package developed inside the
-  private monorepo can accumulate commits that CI has never seen — v0.8.0
-  reached 51 of them, and the first thing CI ever said about that work was
-  "no", twice, at the moment of release. The script exports the committed tree
-  to a clean directory, installs from the lockfile, builds `git-dist`, and runs
-  the same suite CI runs. It catches what a working-tree `bun test` cannot: a
-  test reading a stale `git-dist` left over from an earlier build, a path that
-  escapes the package and resolves against the host repo, and anything the
-  lockfile installs differently from your incremental `node_modules`.
+- **Require the public GitHub-hosted `verify-gate` on the exact public-main
+  merge SHA before pushing the tag.** Both `ci.yml` and `release.yml` call the
+  same composite action. A monorepo invocation of `./scripts/ci-parity.sh`
+  enters the canonical hard sandbox and then reports `INCOMPLETE`; it never
+  reconnects Docker/network or touches host tmux. The public disposable gate
+  admits one clean exact commit, installs from the lockfile, builds `git-dist`,
+  and runs the unit, contract, pack, consumer and real-browser/container lanes.
+  It catches stale artifacts, paths that escape the package, and lockfile
+  behavior hidden by incremental `node_modules`.
 - Publish public `main` with the commit-tree merge above. Never
   `git push thumbmux-public thumbmux-release:main`. Never `--force`.
 - Push the `vX.Y.Z` source tag and let `release-dist` publish `vX.Y.Z-dist`.

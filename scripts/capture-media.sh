@@ -1,27 +1,38 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
+case "$-" in *p*) ;; *) printf 'thumbmux media: privileged interpreter is required\n' >&2; exit 126 ;; esac
+THUMBMUX_ENTRY_CALLER_PATH="${PATH-}"
+PATH=/usr/bin:/bin
+export PATH THUMBMUX_ENTRY_CALLER_PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS BUN_OPTIONS NODE_PATH \
+  PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH \
+  GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+  GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT 2>/dev/null || :
 # Regenerate packages/thumbmux/docs/media/*.png from the package demo.
 #
-# The demo talks to whatever tmux it can see. On this host that is kem's live
-# agent fleet. Capture therefore runs inside a blank container whose tmux
-# contains only the four staged README sessions. The host tmux server is never
-# started, listed, or killed by this script.
+# The demo talks only to an attested private tmux socket inside an exactly
+# labelled disposable container. The host tmux server is never opened, listed,
+# started, or killed by this script.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_FILE="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")" \
+  || { printf 'thumbmux media: entrypoint path is unavailable\n' >&2; exit 126; }
+SCRIPT_DIR="$(/usr/bin/dirname -- "$SCRIPT_FILE")"
 PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-REPO_README="$PACKAGE_ROOT/README.md"
-MEDIA_DIR="$PACKAGE_ROOT/docs/media"
-PLAYWRIGHT_BIN="${THUMBMUX_PLAYWRIGHT_BIN:-$PACKAGE_ROOT/node_modules/.bin/playwright}"
+LIVE_MEDIA_DIR="$PACKAGE_ROOT/docs/media"
+REPO_README=''
+MEDIA_DIR=''
+PLAYWRIGHT_BIN="$PACKAGE_ROOT/node_modules/.bin/playwright"
+. "$SCRIPT_DIR/test-runtime-guard.sh"
 
-CONTAINER="${THUMBMUX_MEDIA_CONTAINER:-thumbmux-media-$$}"
-IMAGE="${THUMBMUX_E2E_IMAGE:-oven/bun:1}"
-DEMO_PORT="${THUMBMUX_DEMO_PORT:-7681}"
-HOST_PORT="${THUMBMUX_HOST_PORT:-}"
+IMAGE="oven/bun:1"
+DEMO_PORT=7681
+HOST_PORT=''
 READY_TIMEOUT="${THUMBMUX_E2E_READY_TIMEOUT:-180}"
-ARTIFACTS_DIR="${THUMBMUX_MEDIA_ARTIFACTS:-${TMPDIR:-/tmp}/${CONTAINER}-artifacts}"
-BASELINE_DIR="${THUMBMUX_MEDIA_BASELINE:-${TMPDIR:-/tmp}/${CONTAINER}-baseline}"
 
 ALLOWED_NAMES=(agent build htop server-logs)
+MEDIA_FILES=(composer.png desktop-agent.png desktop-htop.png hero.png hub.png \
+  launcher.png shortcuts.png term-agent.png term-cream.png theme.png)
 PHONE_W=780
 PHONE_H=1328
 DESKTOP_W=2880
@@ -32,6 +43,11 @@ MIN_BYTES=40000
 MAX_BYTES=700000
 
 CONTAINER_STARTED=0
+CONTAINER_ID=''
+CLEANUP_FAILED=0
+ARTIFACTS_DIR=''
+THUMBMUX_GUARD_RUNTIME=''
+CID_FILE=''
 
 fail() {
   echo "thumbmux media: $*" >&2
@@ -42,50 +58,45 @@ redact_token() {
   sed -E 's/([?&]t=)[a-f0-9]+/\1<redacted>/g'
 }
 
-snapshot_host() {
-  mkdir -p "$BASELINE_DIR"
-  docker ps -a --format '{{.ID}} {{.Names}}' | sort >"$BASELINE_DIR/docker.txt"
-  if command -v tmux >/dev/null 2>&1; then
-    tmux ls -F '#S' 2>/dev/null | sort >"$BASELINE_DIR/tmux.txt" || : >"$BASELINE_DIR/tmux.txt"
-  else
-    : >"$BASELINE_DIR/tmux.txt"
-  fi
-}
-
-assert_host_untouched() {
-  local now_docker now_tmux
-  now_docker="$(mktemp)"
-  now_tmux="$(mktemp)"
-  docker ps -a --format '{{.ID}} {{.Names}}' | sort >"$now_docker"
-  if command -v tmux >/dev/null 2>&1; then
-    tmux ls -F '#S' 2>/dev/null | sort >"$now_tmux" || : >"$now_tmux"
-  else
-    : >"$now_tmux"
-  fi
-  if ! cmp -s "$BASELINE_DIR/docker.txt" "$now_docker"; then
-    echo "thumbmux media: docker ps -a changed from the pre-run snapshot:" >&2
-    diff -u "$BASELINE_DIR/docker.txt" "$now_docker" >&2 || true
-    rm -f "$now_docker" "$now_tmux"
-    fail "host docker inventory must match the pre-run snapshot"
-  fi
-  if ! cmp -s "$BASELINE_DIR/tmux.txt" "$now_tmux"; then
-    echo "thumbmux media: host tmux ls changed from the pre-run snapshot:" >&2
-    diff -u "$BASELINE_DIR/tmux.txt" "$now_tmux" >&2 || true
-    rm -f "$now_docker" "$now_tmux"
-    fail "host tmux must be identical — this script must never create or kill host sessions"
-  fi
-  rm -f "$now_docker" "$now_tmux"
+assert_owned_container() {
+  local identity
+  [[ "$CONTAINER_ID" =~ ^[a-f0-9]{64}$ ]] || return 1
+  identity="$(docker inspect --format \
+    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.kemcortex.thumbmux.run-id"}}|{{index .Config.Labels "com.kemcortex.thumbmux.scope"}}' \
+    "$CONTAINER_ID" 2>/dev/null || true)"
+  [[ "$identity" == "$CONTAINER_ID|/$CONTAINER|$RUN_ID|media" ]]
 }
 
 cleanup() {
   local rc=$?
   set +e
-  if [[ "$CONTAINER_STARTED" == 1 ]]; then
-    docker exec "$CONTAINER" bash -lc 'test -f /tmp/demo.log && cat /tmp/demo.log' 2>/dev/null \
-      | redact_token >"$ARTIFACTS_DIR/demo.log"
-    docker rm -f "$CONTAINER" >/dev/null 2>&1
+  if [[ "$CONTAINER_STARTED" == 0 && -n "$CID_FILE" && -s "$CID_FILE" ]]; then
+    CONTAINER_ID="$(<"$CID_FILE")"
+    if [[ "$CONTAINER_ID" =~ ^[a-f0-9]{64}$ ]]; then
+      CONTAINER_STARTED=1
+    else
+      echo 'thumbmux media: invalid Docker cidfile; refusing guessed cleanup' >&2
+      CLEANUP_FAILED=1
+    fi
   fi
-  rm -rf "$BASELINE_DIR" "$ARTIFACTS_DIR"
+  if [[ "$CONTAINER_STARTED" == 1 ]]; then
+    if thumbmux_recheck_docker_attestation && assert_owned_container; then
+      docker exec "$CONTAINER_ID" bash -lc 'test -f /tmp/demo.log && cat /tmp/demo.log' 2>/dev/null \
+      | redact_token >"$ARTIFACTS_DIR/demo.log"
+      if ! docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 \
+        || docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
+        echo 'thumbmux media: exact owned-container cleanup failed; runtime retained' >&2
+        CLEANUP_FAILED=1
+      fi
+    else
+      echo 'thumbmux media: container identity/labels changed; refusing cleanup' >&2
+      CLEANUP_FAILED=1
+    fi
+  fi
+  if [[ "$CLEANUP_FAILED" == 0 && -n "$THUMBMUX_GUARD_RUNTIME" ]]; then
+    thumbmux_remove_test_runtime || CLEANUP_FAILED=1
+  fi
+  (( CLEANUP_FAILED == 0 )) || rc=1
   trap - EXIT
   exit "$rc"
 }
@@ -93,63 +104,95 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-command -v docker >/dev/null 2>&1 || fail 'docker is required'
+for forbidden_override in THUMBMUX_MEDIA_CONTAINER THUMBMUX_E2E_IMAGE \
+  THUMBMUX_DEMO_PORT THUMBMUX_HOST_PORT THUMBMUX_MEDIA_ARTIFACTS \
+  THUMBMUX_MEDIA_BASELINE THUMBMUX_PLAYWRIGHT_BIN; do
+  [[ -z "${!forbidden_override-}" ]] \
+    || fail "$forbidden_override is runner-owned and cannot be overridden"
+done
+
+thumbmux_prepare_test_runtime media "$PACKAGE_ROOT" \
+  || fail 'disposable CI/Docker attestation failed'
+RUN_ID="$(thumbmux_make_run_id)" || fail 'run id generation failed'
+thumbmux_bind_run_attestation "$RUN_ID" media || fail 'run attestation failed'
+CID_FILE="$THUMBMUX_GUARD_RUNTIME/container.cid"
+CONTAINER="thumbmux-media-${RUN_ID}"
+CONTAINER_RUNTIME="/run/thumbmux-media-${RUN_ID}"
+FROZEN_HOST_SOURCE="$THUMBMUX_GUARD_RUNTIME/frozen-host-source"
+/usr/bin/install -d -m 0700 "$FROZEN_HOST_SOURCE"
+thumbmux_emit_frozen_source_archive \
+  | /usr/bin/tar -x -C "$FROZEN_HOST_SOURCE" README.md scripts/private-test-tmux.sh \
+  || fail 'could not materialize the attested private tmux shim'
+PRIVATE_TMUX_SHIM="$FROZEN_HOST_SOURCE/scripts/private-test-tmux.sh"
+REPO_README="$FROZEN_HOST_SOURCE/README.md"
+MEDIA_DIR="$THUMBMUX_GUARD_RUNTIME/generated-media"
+
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 command -v tar >/dev/null 2>&1 || fail 'tar is required'
 command -v python3 >/dev/null 2>&1 || fail 'python3 is required'
 [[ -f "$PACKAGE_ROOT/package.json" ]] || fail "package root is invalid: $PACKAGE_ROOT"
 [[ -x "$PLAYWRIGHT_BIN" ]] || fail "local Playwright is missing; run bun install --frozen-lockfile && ./node_modules/.bin/playwright install chromium"
-[[ "$DEMO_PORT" =~ ^[0-9]+$ ]] || fail 'THUMBMUX_DEMO_PORT must be numeric'
-[[ -z "$HOST_PORT" || "$HOST_PORT" =~ ^[0-9]+$ ]] || fail 'THUMBMUX_HOST_PORT must be numeric'
+[[ "$READY_TIMEOUT" =~ ^[0-9]+$ ]] || fail 'THUMBMUX_E2E_READY_TIMEOUT must be numeric'
+
+[[ -x "$PRIVATE_TMUX_SHIM" && ! -L "$PRIVATE_TMUX_SHIM" ]] \
+  || fail 'private tmux shim is missing, non-executable, or symlinked'
+ARTIFACTS_DIR="$THUMBMUX_GUARD_RUNTIME/artifacts"
 
 mkdir -p "$ARTIFACTS_DIR" "$MEDIA_DIR"
 ARTIFACTS_DIR="$(cd -- "$ARTIFACTS_DIR" && pwd -P)"
 
-snapshot_host
-echo "thumbmux media: host baseline docker=$(wc -l <"$BASELINE_DIR/docker.txt") tmux=$(wc -l <"$BASELINE_DIR/tmux.txt")"
-
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-
-if [[ -n "$HOST_PORT" ]]; then
-  PUBLISH=(--publish "127.0.0.1:${HOST_PORT}:${DEMO_PORT}")
-else
-  PUBLISH=(--publish "127.0.0.1::${DEMO_PORT}")
-fi
-
-docker run --detach --name "$CONTAINER" "${PUBLISH[@]}" "$IMAGE" sleep infinity >/dev/null
+thumbmux_recheck_docker_attestation \
+  || fail 'Docker daemon changed before container creation'
+CONTAINER_ID="$(docker run --detach \
+  --cidfile "$CID_FILE" \
+  --name "$CONTAINER" \
+  --hostname "$CONTAINER" \
+  --label "com.kemcortex.thumbmux.run-id=$RUN_ID" \
+  --label 'com.kemcortex.thumbmux.scope=media' \
+  --publish "127.0.0.1::${DEMO_PORT}" \
+  --mount "type=bind,src=$PRIVATE_TMUX_SHIM,dst=/usr/local/bin/tmux,readonly" \
+  --mount "type=bind,src=$THUMBMUX_GUARD_ATTESTATION,dst=/run/thumbmux-host-attestation,readonly" \
+  --env "THUMBMUX_TEST_RUNTIME=$CONTAINER_RUNTIME" \
+  --env "THUMBMUX_TEST_RUN_ID=$RUN_ID" \
+  --env 'THUMBMUX_TEST_SCOPE=media' \
+  --env 'THUMBMUX_TEST_CONTAINER_SCOPE=media' \
+  --env "THUMBMUX_TEST_TMUX_SOCKET=$CONTAINER_RUNTIME/tmux/tmux-0/default" \
+  "$IMAGE" sleep infinity)" || fail 'Docker refused the unique media container'
+[[ "$CONTAINER_ID" =~ ^[a-f0-9]{64}$ ]] || fail 'Docker returned an invalid container id'
+[[ -s "$CID_FILE" && "$(<"$CID_FILE")" == "$CONTAINER_ID" ]] \
+  || fail 'Docker cidfile does not match the returned container id'
 CONTAINER_STARTED=1
+assert_owned_container || fail 'new container identity/labels do not match this run'
 
-if [[ -z "$HOST_PORT" ]]; then
-  HOST_PORT="$(docker port "$CONTAINER" "${DEMO_PORT}/tcp" \
-    | awk -F: '/127[.]0[.]0[.]1:/ { print $NF; exit }')"
-fi
+HOST_PORT="$(docker port "$CONTAINER_ID" "${DEMO_PORT}/tcp" \
+  | awk -F: '/127[.]0[.]0[.]1:/ { print $NF; exit }')"
 [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || fail 'docker did not publish an ephemeral localhost port'
+(( HOST_PORT >= 1024 && HOST_PORT <= 65535 )) \
+  || fail "Docker selected invalid host port $HOST_PORT"
+case "$HOST_PORT" in
+  47779|47780) fail "Docker selected reserved production port $HOST_PORT" ;;
+esac
 
 echo "thumbmux media: container=$CONTAINER image=$IMAGE host=127.0.0.1:${HOST_PORT}"
 echo "thumbmux media: artifacts=$ARTIFACTS_DIR"
 
-docker exec "$CONTAINER" bash -lc \
+docker exec "$CONTAINER_ID" bash -lc \
   'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux procps htop locales >/dev/null && (locale-gen C.UTF-8 >/dev/null 2>&1 || true)'
+docker exec "$CONTAINER_ID" bash -lc \
+  'install -d -m 0700 "$THUMBMUX_TEST_RUNTIME" "$THUMBMUX_TEST_RUNTIME/tmux" "$THUMBMUX_TEST_RUNTIME/tmux/tmux-$(id -u)"; test "$(command -v tmux)" = /usr/local/bin/tmux; tmux -V' \
+  >/dev/null
 
-tar -C "$PACKAGE_ROOT" \
-  --exclude=.git \
-  --exclude=node_modules \
-  --exclude='*/node_modules' \
-  --exclude=dist \
-  --exclude='*/dist' \
-  --exclude=git-dist \
-  --exclude='*/git-dist' \
-  -cf - . \
-  | docker exec -i "$CONTAINER" bash -lc 'mkdir -p /app && tar -C /app -xf -'
+thumbmux_emit_frozen_source_archive \
+  | docker exec -i "$CONTAINER_ID" bash -lc 'mkdir -p /app && tar -C /app -xf -'
 
-docker exec "$CONTAINER" bash -lc 'cd /app && bun install --frozen-lockfile' >/dev/null
+docker exec "$CONTAINER_ID" bash -lc 'cd /app && bun install --frozen-lockfile' >/dev/null
 
 # Stage the four sessions BEFORE the demo starts so the first hub frame is clean.
-docker exec "$CONTAINER" bash -lc \
+docker exec "$CONTAINER_ID" bash -lc \
   'export LANG=C.UTF-8 LC_ALL=C.UTF-8; chmod +x /app/scripts/media-scenes/stage.sh && /app/scripts/media-scenes/stage.sh'
 
 # Hard isolation: container tmux must be exactly the four staged names.
-CONTAINER_SESSIONS="$(docker exec "$CONTAINER" bash -lc "tmux list-sessions -F '#{session_name}' | sort")"
+CONTAINER_SESSIONS="$(docker exec "$CONTAINER_ID" bash -lc "tmux list-sessions -F '#{session_name}' | sort")"
 EXPECTED_SESSIONS="$(printf '%s\n' "${ALLOWED_NAMES[@]}" | sort)"
 [[ "$CONTAINER_SESSIONS" == "$EXPECTED_SESSIONS" ]] || fail "container tmux is not the four staged sessions:
 expected:
@@ -161,16 +204,16 @@ if printf '%s\n' "$CONTAINER_SESSIONS" | grep -Eq '^(cc|claude|codex|grok)-'; th
   fail "container tmux contains a host-agent prefix — aborting before capture"
 fi
 
-docker exec --detach "$CONTAINER" bash -lc \
+docker exec --detach "$CONTAINER_ID" bash -lc \
   'export LANG=C.UTF-8 LC_ALL=C.UTF-8; cd /app && exec bun run demo -- --host >/tmp/demo.log 2>&1'
 
 TOKEN=''
 DEADLINE=$((SECONDS + READY_TIMEOUT))
 while (( SECONDS < DEADLINE )); do
-  if [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]]; then
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null || true)" != true ]]; then
     fail 'container stopped before the demo became ready'
   fi
-  TOKEN="$(docker exec "$CONTAINER" bash -lc \
+  TOKEN="$(docker exec "$CONTAINER_ID" bash -lc \
     "grep -oE 't=[a-f0-9]+' /tmp/demo.log 2>/dev/null | head -n 1 | cut -d= -f2" \
     2>/dev/null || true)"
   if [[ -n "$TOKEN" ]]; then
@@ -184,7 +227,7 @@ done
 
 if [[ -z "$TOKEN" ]] || ! curl --fail --silent --max-time 2 "$DEMO_URL" >/dev/null 2>&1; then
   echo 'thumbmux media: demo readiness timed out; recent demo log follows' >&2
-  docker exec "$CONTAINER" bash -lc 'tail -n 80 /tmp/demo.log' 2>/dev/null | redact_token >&2 || true
+  docker exec "$CONTAINER_ID" bash -lc 'tail -n 80 /tmp/demo.log' 2>/dev/null | redact_token >&2 || true
   exit 1
 fi
 
@@ -194,9 +237,12 @@ export DEMO_URL
 export THUMBMUX_MEDIA_OUT="$MEDIA_DIR"
 export THUMBMUX_MEDIA_ARTIFACTS="$ARTIFACTS_DIR"
 export THUMBMUX_README="$REPO_README"
+export THUMBMUX_CONTAINER="$CONTAINER_ID"
+export THUMBMUX_TEST_RUN_ID="$RUN_ID" THUMBMUX_TEST_SCOPE=media
+export THUMBMUX_TEST_ATTESTATION="$THUMBMUX_GUARD_ATTESTATION"
 
 cd "$PACKAGE_ROOT"
-bun "$SCRIPT_DIR/capture-media.ts"
+"$THUMBMUX_GUARD_BUN_BIN" "$SCRIPT_DIR/capture-media.ts"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -285,15 +331,35 @@ if errors:
 PY
 
 # Re-assert container tmux still has only the four names after capture.
-CONTAINER_SESSIONS="$(docker exec "$CONTAINER" bash -lc "tmux list-sessions -F '#{session_name}' | sort")"
+CONTAINER_SESSIONS="$(docker exec "$CONTAINER_ID" bash -lc "tmux list-sessions -F '#{session_name}' | sort")"
 [[ "$CONTAINER_SESSIONS" == "$EXPECTED_SESSIONS" ]] || fail "container tmux drifted during capture:
 $CONTAINER_SESSIONS"
 
 echo "thumbmux media: ten files written under $MEDIA_DIR"
 
-# Drop the container now so the host-inventory compare sees a clean slate.
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# Drop exactly the labelled container ID created by this run.
+thumbmux_recheck_docker_attestation \
+  || fail 'Docker daemon changed before exact container cleanup'
+assert_owned_container || fail 'container identity/labels changed before cleanup'
+docker rm -f "$CONTAINER_ID" >/dev/null
+if docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
+  fail 'owned media container survived cleanup'
+fi
 CONTAINER_STARTED=0
-rm -rf "$ARTIFACTS_DIR"
-assert_host_untouched
-echo "thumbmux media: container removed, scratch gone, host docker/tmux match the pre-run snapshot"
+
+# Only after every Docker/tmux/browser lifecycle has ended do the validated
+# images cross from the private runtime into the tracked documentation tree.
+[[ -d "$LIVE_MEDIA_DIR" && ! -L "$LIVE_MEDIA_DIR" \
+  && "$(/usr/bin/realpath -e -- "$LIVE_MEDIA_DIR")" == "$PACKAGE_ROOT/docs/media" ]] \
+  || fail 'tracked media destination is missing, symlinked, or non-canonical'
+for media_file in "${MEDIA_FILES[@]}"; do
+  source_file="$MEDIA_DIR/$media_file"
+  staged_file="$LIVE_MEDIA_DIR/.${media_file}.thumbmux-${RUN_ID}.tmp"
+  [[ -f "$source_file" && ! -L "$source_file" ]] \
+    || fail "validated media output disappeared: $media_file"
+  /usr/bin/install -m 0644 -- "$source_file" "$staged_file"
+  /usr/bin/mv -f -- "$staged_file" "$LIVE_MEDIA_DIR/$media_file"
+done
+thumbmux_remove_test_runtime
+THUMBMUX_GUARD_RUNTIME=''
+echo "thumbmux media: owned container removed; validated files installed under $LIVE_MEDIA_DIR; host tmux was never opened"

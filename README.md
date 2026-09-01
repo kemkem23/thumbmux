@@ -136,8 +136,9 @@ exports are experimental because the upstream terminal layout may change; see
 
 With the documented bottom-inset wiring, the composer **docks**: the viewport
 shrinks by the reported sheet height and springs back. ComposerDock does not
-resize the pty for a transient overlay. Prefer raw? **DIRECT mode** holds focus
-in an invisible input so the OS keyboard drives the pane
+resize the pty for a transient overlay. In **COMPOSE**, SEND clears the draft
+but leaves the dock open and the textarea focused for the next message. Prefer
+raw? **DIRECT mode** holds focus in an invisible input so the OS keyboard drives the pane
 keystroke-by-keystroke, Thai IME included.
 
 ### One-tap shortcuts, notes, uploads
@@ -770,10 +771,12 @@ then says so out loud. That is deliberate: the baseline half answers *did a
 frozen name change*, and skipping it silently once produced a "contract check
 passed" that had never looked.
 
-`bash scripts/contract-fixtures.sh` separately packs the same `git-dist`
-artifact and installs three frozen consumers: `minimal-host`, `guarded-host`,
-and `app-host`. They compile and exercise the low-level host, guarded route
-composition, and Svelte app mount respectively. `thumbmux/app` and
+In the public repository's GitHub-hosted disposable lane,
+`./scripts/contract-fixtures.sh` separately packs the same `git-dist` artifact
+and installs three frozen consumers: `minimal-host`, `guarded-host`, and
+`app-host`. A local invocation fails closed before tmux/browser lifecycle. The
+fixtures compile and exercise the low-level host, guarded route composition,
+and Svelte app mount respectively. `thumbmux/app` and
 `createAppRoutes` remain **S — stabilizing** throughout the pre-1.0 line; these checks are
 evidence for the published tiers, not a claim of 1.0 compatibility.
 

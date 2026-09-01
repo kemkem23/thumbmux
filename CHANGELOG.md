@@ -1,7 +1,149 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.4-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.11-dist`.
+
+## v0.18.11 — 2026-08-31
+
+### Fixed
+
+- **Mobile and embedded-browser preview taps no longer depend on a synthesized
+  click that may never arrive.** Dense previews capture the primary pointer,
+  remember the session selected at pointerdown, and use a short pointerup
+  fallback when a browser suppresses the compatibility click. Movement beyond
+  the tap threshold, scrolling, pointer cancellation and removed cards never
+  open a session; a live keyed-card reorder still opens the session originally
+  pressed instead of the card that later moved under the same coordinates.
+  Native click, keyboard and assistive activation remain single-shot, while
+  direct-touch pointer-enter no longer creates a misleading sticky hover.
+
+## v0.18.10 — 2026-08-29
+
+### Fixed
+
+- **Dense terminal previews remain clickable across embedded, touch and XR
+  browsers.** The read-only `inert` thumbnail and the full-preview open button
+  are now stable siblings, with the button as an explicit overlay hit target.
+  A hover-exit repaint immediately before a press can therefore no longer
+  replace or invalidate the interactive subtree. Mouse click, touch tap and
+  keyboard activation retain one open action, while the separate copy and kill
+  controls keep their existing behavior.
+
+## v0.18.9 — 2026-08-29
+
+### Changed
+
+- **Dense session cards open from the terminal preview instead of a small
+  arrow.** The name remains an independent copy target, while name, note and
+  summary now occupy three equal header sections with neutral dividers. The
+  preview uses a gray idle surface, restores the terminal background on hover,
+  keyboard focus or press, and retains its read-only thumbnail behavior. Hosts
+  can add a separate 44px × control at the card's top-right for a confirmed
+  session kill without shrinking the three header tracks. Preview contrast is
+  recalculated for ANSI 0–255 and truecolour output, not only the base palette;
+  dim output keeps its hue without unreadable preview-only opacity.
+- **Dense terminal previews fit more output without changing their font size.**
+  Row leading is reduced from 1.22 to 1.10 while matching the pinned Unicode
+  cell boxes to the same pitch.
+
+## v0.18.8 — 2026-08-29
+
+### Changed
+
+- **COMPOSE stays open and ready after SEND.** Submitting by button or Enter
+  clears the sent draft, keeps the dock in place, and restores textarea focus
+  synchronously so the next message can be typed without another tap and an
+  iOS software keyboard can remain raised. A synchronous host rejection keeps
+  the draft and still restores focus; IME composition and DIRECT mode retain
+  their existing behavior.
+
+## v0.18.7 — 2026-08-28
+
+### Fixed
+
+- **A repainting normal-screen TUI can no longer replace history underneath a
+  scrolled reader when a legacy capture has no provable row seam.** `TermView`
+  freezes the reader-owned projection, coalesces only the newest canonical live
+  capture offscreen, and applies it when the reader explicitly reaches the
+  live tail or presses the latest-content control. Proven overlaps and durable
+  absolute boundaries keep their existing incremental path. This covers short
+  Grok Minimal conversations and long `insert_before` bursts coalesced during
+  touch gestures without moving the anchor text, row identity, or screen Y.
+  Deferred captures remain silent on `onLinesChange`; the newest capture is
+  reported once with its original `live` or `replace` source when tail rejoin
+  commits it into the current raw model. A detached absolute archive keeps the
+  refreshed live suffix offscreen and retains its existing `prepend` attach
+  path. If a gesture gate already holds a newer whole capture, rejoin coalesces
+  that capture first instead of briefly committing the older deferred frame.
+  Retreating into history, a multi-touch abort, or search navigation cancels an
+  inferred gesture rejoin so frozen row coordinates cannot be reused against a
+  different capture.
+
+## v0.18.6 — 2026-08-27
+
+### Fixed
+
+- **Initial history no longer duplicates terminal rows or jumps the reader at
+  the durable live/archive seam.** Overlapping bootstrap, prepend and live
+  deliveries are reconciled as one ordered boundary, including a pending newer
+  frame followed by an older cached frame. A stale delivery is rejected before
+  it can change screen metadata, content, cursor or the pending high-water mark.
+
+- **The cursor stays on the rendered terminal cell while content, fonts and
+  viewport geometry change.** Row-zero cursors re-anchor when an unchanged
+  cursor coordinate receives a longer content tail; late web-font readiness,
+  resize, Unicode combining sequences, CJK and emoji retain the same measured
+  cell geometry as the rendered rows.
+
+- **Raw tmux capture remains byte-faithful by default.** A source-only
+  diagnostic helper records the ambiguous variation-selector padding case, but
+  it is not a public export and the Bun driver does not rewrite capture bytes
+  before host WAL or archive ingestion.
+
+- **Exact-mode pane operations now stay on window 0, pane 0 even if another
+  tmux window becomes active.** The reference driver targets `=name:0.0` for
+  capture, input, resize and cursor sampling instead of letting a trailing
+  colon select mutable current-pane state. Hosts that deliberately want tmux's
+  native active/prefix resolution can still opt into `targetMode: "legacy"`.
+
+- **Upload requests can carry and settle a host-owned durable receipt across
+  retries.** Optional request-scoped hooks may append idempotency fields and
+  observe the parsed response with the exact opaque context from that attempt;
+  omitting both hooks preserves the existing upload behavior.
+
+### Security
+
+- **Release, contract and real-browser lanes now fail closed outside an
+  attested disposable runtime.** The package rail fingerprints one frozen tree,
+  private tmux target, namespaces, ports and credentials boundary; local lanes
+  cannot silently claim the Docker/network lifecycle proof reserved for the
+  public GitHub-hosted runner.
+
+## v0.18.5 — 2026-08-25
+
+### Fixed
+
+- **Claude Bash compaction no longer cuts a soft-wrapped table, rule, marker,
+  fake `Bash(...)` header, or permission dialog in half.** Physical rows at
+  column zero are treated as ambiguous when the preceding result exactly fills
+  the calibrated pane. A boundary in that lane must match Claude's measured
+  marker wrapper; arbitrary shell colour is not identity. The paired 244-grey
+  `rule / ❯ / rule` composer stays visible, approval semantics always fail
+  open, and an exact `maxBlockLines` candidate is no longer rejected one row
+  early. Retained segments painted at an older width (or separated from their
+  composer), trailing-space wraps, exact ANSI marker/header/composer output,
+  repeated fake Bash headers, and unknown rounded dialogs now fail open as one
+  raw corridor rather than hiding only a prefix. Unknown Claude layouts remain
+  raw rather than hiding uncertain content.
+
+- **The terminal block cursor now measures the complete grapheme rendered in
+  its cell.** Emoji variation sequences such as `❤️` occupy the same two-cell
+  width as the ANSI renderer instead of painting a one-cell cursor over a
+  two-cell glyph; ordinary text, Thai combining clusters, CJK, and emoji after
+  compact one-third-row Bash dividers retain their calibrated position. Rows
+  and the cursor also repaint in the same projection epoch, so changing between
+  SHOW and HIDE cannot leave the cursor mapped through the previous mode or
+  make it disappear.
 
 ## v0.18.4 — 2026-08-25
 

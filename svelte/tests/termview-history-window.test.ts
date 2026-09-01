@@ -225,10 +225,14 @@ function deliverOutput(
   lines: string[],
   screen?: ScreenMode | null,
   boundary?: MuxHistoryBoundary,
-  delivery: { source?: "full" | "delta"; replace?: boolean } = {},
+  delivery: {
+    source?: "full" | "delta";
+    replace?: boolean;
+    cursor?: { row: number; col: number } | null;
+  } = {},
 ): void {
   if (!sessionCallback) throw new Error("subscribe was not invoked");
-  sessionCallback(lines.join("\n"), "output", null, {
+  sessionCallback(lines.join("\n"), "output", delivery.cursor ?? null, {
     source: delivery.source ?? "full",
     replace: delivery.replace ?? true,
     ...(screen === undefined ? {} : { screen }),
@@ -731,6 +735,348 @@ describe("TermView sliding archive window", () => {
     expect(deliveredLines.at(-1)).toEqual(absoluteLines(0, 20));
   });
 
+  test("does not duplicate crossed live rows when the initial history reply races a newer seam", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-race", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toMatchObject({ direction: "before", cursor: null });
+
+    // The reader is already away from the tail while the first tokenless
+    // history request is in flight. A normal non-replace capture advances the
+    // durable seam by five rows; the stable-reader merge deliberately retains
+    // those crossed rows until the absolute history page arrives.
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-race", 105, 15),
+      { source: "full", replace: false },
+    );
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(100, 25));
+    const anchorBefore = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorBefore) throw new Error("startup race anchor was not mounted");
+    const anchorY = projectedScreenY(viewport, anchorBefore);
+
+    // The page is authoritative for [85, 105), so the retained live prefix
+    // [100, 105) must be consumed at the seam instead of being rendered twice.
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(40);
+    const anchorAfter = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorAfter) throw new Error("startup race anchor disappeared");
+    expect(projectedScreenY(viewport, anchorAfter)).toBeCloseTo(anchorY, 5);
+  });
+
+  test("uses absolute seam movement when every startup row has identical text", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    const repeated = Array.from({ length: 20 }, () => "same-status-row");
+
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-repeated-race", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-repeated-race", 105, 15),
+      { source: "full", replace: false },
+    );
+
+    // Five distinct absolute rows crossed the seam even though their bytes are
+    // indistinguishable from both snapshots.
+    expect(numberAttr(viewport, "data-raw-total")).toBe(25);
+    deliverHistory(85, repeated, false, 105);
+    expect(numberAttr(viewport, "data-raw-total")).toBe(40);
+    expect(deliveredLines.at(-1)).toHaveLength(40);
+    const mountedIds = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .map((row) => row.getAttribute("data-line-id"));
+    expect(new Set(mountedIds).size).toBe(mountedIds.length);
+  });
+
+  test("keeps an ahead-of-output history page detached until its exact seam arrives", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-history-ahead", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+
+    // The archive transaction reached 105 first, but this viewer has only seen
+    // the output frame paired with boundary 100. Rendering both sides now
+    // would overlap absolute rows 100..104.
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 20));
+
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-history-ahead", 105, 15),
+      { source: "full", replace: false },
+    );
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(85, 40));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(40);
+  });
+
+  test("keeps a deferred legacy Grok capture offscreen while a detached archive pages forward", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(liveLines("legacy-before", 240), undefined, undefined, {
+      source: "full",
+      replace: true,
+    });
+    wheel(viewport, -1_000_000);
+    expect(historyCalls.at(-1)).toMatchObject({ direction: "before", cursor: null });
+
+    const newestGrok = liveLines("legacy-grok-newest", 240);
+    deliverOutput(newestGrok, undefined, undefined, {
+      source: "delta",
+      replace: false,
+    });
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+
+    // This tokenless reply knows that newer archive rows exist, so it owns a
+    // detached window. Rejoining live must request those rows instead of
+    // concatenating the window directly with the deferred capture.
+    deliverHistory(0, archiveLines(0, 20), false, 100);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(archiveLines(0, 20));
+
+    wheel(viewport, 1_000_000);
+    expect(viewport.getAttribute("data-live-rejoin-pending")).toBeNull();
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(historyCalls.at(-1)).toEqual({ direction: "after", cursor: 19, limit: 2_000 });
+    expect(deliveredLines.at(-1)).toEqual(archiveLines(0, 20));
+
+    deliverHistory(20, archiveLines(20, 80), false, 100);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual([
+      ...archiveLines(0, 100),
+      ...newestGrok,
+    ]);
+    expect(new Set(deliveredLines.at(-1)).size).toBe(340);
+  });
+
+  test("replaces canonically when a repeated-text boundary jump exceeds the resident live window", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+    const repeated = Array.from({ length: 20 }, () => "same-status-row");
+
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-large-jump", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+
+    // Twenty resident rows cannot prove the five missing absolute rows in a
+    // 25-row seam advance. Repeated bytes must not be mistaken for identity.
+    deliverOutput(
+      repeated,
+      undefined,
+      historyBoundary("g-large-jump", 125, 35),
+      { source: "full", replace: false },
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(20);
+
+    // The authoritative page [105, 125) now meets the exact durable seam and
+    // must attach beside the complete canonical live screen [125, 145).
+    deliverHistory(105, repeated, false, 125);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(numberAttr(viewport, "data-raw-total")).toBe(40);
+    expect(deliveredLines.at(-1)).toHaveLength(40);
+  });
+
+  test("preserves an absolute crossed prefix across a same-boundary repaint", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-same-boundary", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-same-boundary", 105, 15),
+      { source: "full", replace: false },
+    );
+    const anchorBefore = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorBefore) throw new Error("same-boundary anchor was not mounted");
+    const anchorY = projectedScreenY(viewport, anchorBefore);
+
+    // A repaint at the same durable seam may change every visible byte. The
+    // already-proven prefix [100, 105) is still immutable absolute history.
+    const repainted = Array.from({ length: 20 }, (_, index) => `repaint-${105 + index}`);
+    deliverOutput(
+      repainted,
+      undefined,
+      historyBoundary("g-same-boundary", 105, 16),
+      { source: "full", replace: false },
+    );
+    expect(numberAttr(viewport, "data-raw-total")).toBe(25);
+    const anchorAfter = Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+      .find((row) => row.textContent?.includes("absolute-100"));
+    if (!anchorAfter) throw new Error("same-boundary repaint dropped the absolute anchor");
+    expect(projectedScreenY(viewport, anchorAfter)).toBeCloseTo(anchorY, 5);
+
+    deliverHistory(85, absoluteLines(85, 20), false, 105);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual([
+      ...absoluteLines(85, 20),
+      ...repainted,
+    ]);
+  });
+
+  test("keeps a forward page detached when it outruns the current output boundary", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    deliverOutput(
+      absoluteLines(100, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 100, 10),
+      { source: "full", replace: false },
+    );
+    wheel(viewport, -1_000_000);
+    deliverHistory(80, absoluteLines(80, 20), false, 100);
+    wheel(viewport, -1_000_000);
+    deliverOutput(
+      absoluteLines(105, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 105, 15),
+      { source: "full", replace: false },
+    );
+
+    wheel(viewport, 1_000_000);
+    expect(historyCalls.at(-1)).toEqual({ direction: "after", cursor: 99, limit: 2_000 });
+
+    // The server head has reached 110, but this client still owns output 105.
+    // Joining page [100, 110) to live [105, 125) would duplicate 105..109.
+    deliverHistory(100, absoluteLines(100, 10), false, 110);
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("0");
+    expect(viewport.getAttribute("data-history-window-has-newer")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(80, 30));
+
+    deliverOutput(
+      absoluteLines(110, 20),
+      undefined,
+      historyBoundary("g-forward-ahead", 110, 20),
+      { source: "full", replace: false },
+    );
+    expect(viewport.getAttribute("data-history-window-attached")).toBe("1");
+    expect(deliveredLines.at(-1)).toEqual(absoluteLines(80, 50));
+    expect(new Set(deliveredLines.at(-1)).size).toBe(50);
+  });
+
+  test("rejects a stale same-generation boundary regression", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    const accepted = absoluteLines(105, 20);
+    deliverOutput(
+      accepted,
+      undefined,
+      historyBoundary("g-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 7 } },
+    );
+    const acceptedDeliveryCount = deliveredLines.length;
+    deliverOutput(
+      absoluteLines(103, 20),
+      undefined,
+      historyBoundary("g-regression", 103, 14),
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
+    );
+
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(viewport.getAttribute("data-history-generation")).toBe("g-regression");
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("7");
+  });
+
+  test("drops stale screen mode with the rejected content and cursor frame", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    const accepted = absoluteLines(105, 20);
+    deliverOutput(
+      accepted,
+      { alt: false, mouseSgr: false, mouseAny: false },
+      historyBoundary("g-screen-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 7 } },
+    );
+    const acceptedDeliveryCount = deliveredLines.length;
+
+    deliverOutput(
+      absoluteLines(103, 20).map((line) => `stale-${line}`),
+      { alt: true, mouseSgr: true, mouseAny: true },
+      historyBoundary("g-screen-regression", 103, 14),
+      { source: "full", replace: false, cursor: { row: 0, col: 3 } },
+    );
+
+    expect(viewport.getAttribute("data-no-scrollback")).toBeNull();
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("7");
+  });
+
+  test("rejects stale WAL coordinates at an unchanged live seam", async () => {
+    const { viewport } = mountTermView();
+    await tick();
+
+    const accepted = absoluteLines(105, 20);
+    deliverOutput(
+      accepted,
+      undefined,
+      historyBoundary("g-wal-regression", 105, 15),
+      { source: "full", replace: false, cursor: { row: 0, col: 9 } },
+    );
+    const acceptedDeliveryCount = deliveredLines.length;
+    deliverOutput(
+      absoluteLines(105, 20).map((line) => `stale-${line}`),
+      undefined,
+      {
+        ...historyBoundary("g-wal-regression", 105, 14),
+        liveStartLine: 105,
+      },
+      { source: "full", replace: false, cursor: { row: 0, col: 2 } },
+    );
+
+    expect(numberAttr(viewport, "data-history-live-start")).toBe(105);
+    expect(deliveredLines).toHaveLength(acceptedDeliveryCount);
+    expect(deliveredLines.at(-1)).toEqual(accepted);
+    const cursor = viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(cursor?.getAttribute("data-cursor-col")).toBe("9");
+  });
+
   test("pages backward past 10k, then forward to the live seam without moving the reader anchor", async () => {
     const { viewport, target } = mountTermView();
     await tick();
@@ -955,6 +1301,7 @@ describe("TermView sliding archive window", () => {
       absoluteLines(105, 20),
       undefined,
       historyBoundary("g-collapsed", 105, 15),
+      { source: "full", replace: false },
     );
 
     expect(viewport.getAttribute("data-history-window-attached")).toBe("1");

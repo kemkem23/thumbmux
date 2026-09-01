@@ -7,6 +7,20 @@ import {
   updatePendingContentCursor,
   type ContentUpdate,
 } from '../src/content-update-gate';
+import {
+  admitLiveBoundary,
+  createLiveBoundaryAdmission,
+} from '../src/live-boundary-admission';
+import type { MuxHistoryBoundary } from '@thumbmux/core';
+
+function boundary(liveStartLine: number, sequence = liveStartLine): MuxHistoryBoundary {
+  return {
+    generation: 'g-pending-race',
+    liveStartLine,
+    walSequence: String(sequence),
+    walOffset: sequence * 100,
+  };
+}
 
 function delivery(
   data: string,
@@ -32,6 +46,42 @@ function delivery(
 }
 
 describe('content update gate', () => {
+  test('rejects a cached boundary behind the pending high-water before coalescing', () => {
+    const applied = boundary(100, 10);
+    let admission = createLiveBoundaryAdmission();
+    admission = admitLiveBoundary(admission, null, applied).admission;
+
+    let gate = receiveContentUpdate(
+      createContentUpdateGate(),
+      delivery('absolute-100', { cursor: { row: 0, col: 1 } }),
+      { busy: false, selectionActive: false },
+    ).gate;
+
+    const pendingBoundary = boundary(105, 15);
+    const pendingAdmission = admitLiveBoundary(admission, applied, pendingBoundary);
+    expect(pendingAdmission.accepted).toBe(true);
+    admission = pendingAdmission.admission;
+    gate = receiveContentUpdate(
+      gate,
+      delivery('absolute-105', { cursor: { row: 0, col: 5 } }),
+      { busy: true, selectionActive: false },
+    ).gate;
+    expect(gate.pending?.data).toBe('absolute-105');
+
+    const staleAdmission = admitLiveBoundary(admission, applied, boundary(103, 13));
+    expect(staleAdmission.accepted).toBe(false);
+    expect(staleAdmission.admission).toBe(admission);
+    // A rejected complete frame never enters receiveContentUpdate(), so the
+    // arrival-based coalescer cannot replace 105 with its cached 103 snapshot.
+    expect(gate.pending?.data).toBe('absolute-105');
+    expect(gate.pending?.cursor).toEqual({ row: 0, col: 5 });
+
+    const flushed = flushContentUpdate(gate, { busy: false, selectionActive: false });
+    expect(flushed.delivery?.data).toBe('absolute-105');
+    expect(flushed.delivery?.cursor).toEqual({ row: 0, col: 5 });
+    expect(flushed.gate.pending).toBeNull();
+  });
+
   test('delivers immediately while the view is idle', () => {
     const update = delivery('first', { cursor: { row: 2, col: 3 } });
     const result = receiveContentUpdate(createContentUpdateGate(), update, {

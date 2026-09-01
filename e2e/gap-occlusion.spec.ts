@@ -93,12 +93,12 @@ function createGapSession(session: string): void {
       + `new-session -d -s ${shellQuote(session)} -x 120 -y 40 ${shellQuote(shellCommand)}`,
     10_000,
   );
-  dockerExec(`tmux set-option -t ${shellQuote(session)} history-limit ${HISTORY_LIMIT}`, 10_000);
+  dockerExec(`tmux set-option -t ${shellQuote(`=${session}:0.0`)} history-limit ${HISTORY_LIMIT}`, 10_000);
 
   const marker = `LIVE SENTINEL ${String(INITIAL_ROWS).padStart(5, '0')}`;
   for (let attempt = 0; attempt < 120; attempt++) {
     const tail = dockerExec(
-      `tmux capture-pane -t ${shellQuote(session)} -p -S -80`,
+      `tmux capture-pane -t ${shellQuote(`=${session}:0.0`)} -p -S -80`,
       20_000,
     );
     if (tail.includes(marker) && dockerExec(`test -p ${shellQuote(fifo)} && echo ready`).trim() === 'ready') {
@@ -117,7 +117,7 @@ function appendLiveRows(session: string, start: number, end: number): void {
   );
   const marker = `LIVE SENTINEL ${String(end).padStart(5, '0')}`;
   for (let attempt = 0; attempt < 120; attempt++) {
-    const tail = dockerExec(`tmux capture-pane -t ${shellQuote(session)} -p -S -80`, 20_000);
+    const tail = dockerExec(`tmux capture-pane -t ${shellQuote(`=${session}:0.0`)} -p -S -80`, 20_000);
     if (tail.includes(marker)) return;
     dockerExec('sleep 0.1', 1_000);
   }
@@ -126,7 +126,7 @@ function appendLiveRows(session: string, start: number, end: number): void {
 
 function killGapSession(session: string): void {
   assertOwnedSession(session);
-  dockerExec(`tmux kill-session -t ${shellQuote(session)} 2>/dev/null || true`, 10_000);
+  dockerExec(`tmux kill-session -t ${shellQuote(`=${session}`)} 2>/dev/null || true`, 10_000);
   dockerExec(`rm -f -- ${shellQuote(fifoPath(session))}`, 10_000);
 }
 

@@ -206,6 +206,29 @@ async function injectSlidingTailRepaint(
   }, { sessionName: session, frameNumber: frame });
 }
 
+async function injectUnprovableGrokRepaint(
+  page: Page,
+  session: string,
+  frame: number,
+): Promise<string> {
+  return page.evaluate(({ sessionName, frameNumber }) => {
+    const state = (window as any).__thumbmuxContentFollow;
+    if (!state?.inject || !state.latestData) throw new Error('content-follow wire probe is not ready');
+    const marker = `GROK frame ${frameNumber} live 49`;
+    const next = [
+      ...Array.from({ length: 310 }, (_, row) => `GROK committed ${frameNumber + row}`),
+      ...Array.from({ length: 50 }, (_, row) => `GROK frame ${frameNumber} live ${row}`),
+    ];
+    state.inject({
+      channel: sessionName,
+      type: 'output',
+      data: next.join('\n'),
+      cursor: null,
+    });
+    return marker;
+  }, { sessionName: session, frameNumber: frame });
+}
+
 test('content follows only at the exact live tail and preserves a scrolled reader', async ({ page }, testInfo) => {
   test.setTimeout(120_000);
   const session = makeSessionName(testInfo, 'follow');
@@ -303,6 +326,42 @@ test('content follows only at the exact live tail and preserves a scrolled reade
     await injectLiveAppend(page, session, resumedMarker);
     expect(await bottomOffset(page)).toBe(0);
     await expect.poll(async () => (await visibleTerminalLines(page)).includes(resumedMarker)).toBe(true);
+  } finally {
+    killSession(session);
+  }
+});
+
+test('an unprovable Grok-style repaint stays offscreen until the reader rejoins', async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
+  const session = makeSessionName(testInfo, 'grok-reader-freeze');
+  try {
+    createLineSession(session, 'FOLLOW', 360);
+    await installWireProbe(page, session);
+    await openSession(page, session, { showShortcutBar: false });
+    await expect.poll(() => dataTotal(page)).toBeGreaterThanOrEqual(360);
+
+    const rowHeight = await lineHeight(page);
+    await wheel(page, -Math.ceil(rowHeight * 14), 1);
+    await expect.poll(() => bottomOffset(page)).toBeGreaterThan(rowHeight * 5);
+    const anchor = await visibleAnchor(page);
+
+    const newestMarker = await injectUnprovableGrokRepaint(page, session, 300);
+    await expect(page.getByTestId('mtv')).toHaveAttribute('data-live-rejoin-pending', '1');
+    // Deferred whole captures do not emit onLinesChange before commit, so the
+    // app may retain its generic bottom control. Both controls are the same
+    // visible latest-content action and rejoin TermView's deferred live tail.
+    const latestControl = page.locator(
+      '[data-testid="demo-new-content"], [data-testid="demo-scroll-bottom"]',
+    );
+    await expect(latestControl).toHaveCount(1);
+    await expect(latestControl).toBeVisible();
+    await expectAnchorStable(page, anchor);
+
+    await latestControl.click();
+    await expect.poll(() => bottomOffset(page)).toBe(0);
+    await expect(page.getByTestId('mtv')).not.toHaveAttribute('data-live-rejoin-pending', '1');
+    await expect.poll(async () => (await visibleTerminalLines(page)).includes(newestMarker))
+      .toBe(true);
   } finally {
     killSession(session);
   }

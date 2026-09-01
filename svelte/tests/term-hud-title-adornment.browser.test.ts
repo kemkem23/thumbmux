@@ -7,14 +7,17 @@
  * into service as an inline badge at a 390px bar, `.nm` had clientWidth 15px
  * against scrollWidth 187px: the name clipped to its caret glyph. happy-dom
  * reports every width as 0, so the whole of that finding is invisible to the
- * suite that runs everywhere else. This file drives real Chromium.
+ * suite that runs everywhere else. This file drives real Chromium by default
+ * and can repeat the same source/layout checks in WebKit via
+ * THUMBMUX_LAYOUT_BROWSER=webkit.
  *
  * The HUD suite carries its own control. Each width assertion is paired with the same
  * measurement taken while the collapse rule is neutralized by a stylesheet
  * override — if the harness were not really laying out, the control could not
  * reproduce the crush, and the test would fail rather than pass vacuously.
- * SessionThumb alone is stubbed because its wire/ANSI behavior has dedicated
- * tests; the real SessionGrid markup and CSS still own every measured card.
+ * SessionThumb's transport alone is stubbed because wire/ANSI behavior has
+ * dedicated tests; the real SessionGrid and SessionThumb markup/CSS own every
+ * measured surface.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
@@ -33,11 +36,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sveltePlugin: import("bun").BunPlugin = {
   name: "thumbmux-svelte-browser",
   setup(build) {
+    build.onLoad({ filter: /ws-mux\.svelte\.ts$/ }, () => ({
+      contents: `export const tmuxMux = { subscribe(_session, callback) {
+        callback('\\u001b[30m0 \\u001b[31m1 \\u001b[32m2 \\u001b[33m3 \\u001b[34m4 \\u001b[35m5 \\u001b[36m6 \\u001b[37m7 \\u001b[90m8 \\u001b[91m9 \\u001b[92mA \\u001b[93mB \\u001b[94mC \\u001b[95mD \\u001b[96mE \\u001b[97mF \\u001b[38;5;242mI \\u001b[38;2;102;102;102mT \\u001b[38;2;102;102;102;48;2;102;102;102mB \\u001b[2;38;2;231;231;231mD \\u001b[0m\\nไทย กิ้ 👩🏽‍💻 ⣿ └─ dense preview', 'full');
+        return () => {};
+      } };`,
+      loader: "js",
+    }));
     build.onLoad({ filter: /\.svelte$/ }, (args) => {
-      const source = args.path.endsWith("/SessionThumb.svelte")
-        ? `<script>let { density = 'default' } = $props();</script>
-           <div data-testid="session-thumb" class:dense={density === 'dense'}><div class="tail"></div></div>`
-        : readFileSync(args.path, "utf8");
+      const source = readFileSync(args.path, "utf8");
       return {
       contents: compile(source, {
         filename: args.path,
@@ -95,7 +102,7 @@ beforeAll(async () => {
     `
 import { mount, createRawSnippet } from "svelte";
 import TermHud from ${JSON.stringify(join(here, "../src/TermHud.svelte"))};
-import SessionGrid from ${JSON.stringify(join(here, "../src/SessionGrid.svelte"))};
+import SessionGridHost from ${JSON.stringify(join(here, "./SessionGridHost.svelte"))};
 
 const cfg = window.__hudProps ?? {};
 if (cfg.component === "grid") {
@@ -109,17 +116,20 @@ if (cfg.component === "grid") {
     { name: "grok-dense-beta", note: "รอ input", summary: "สรุปงานล่าสุดของ session" },
   ];
   window.__denseOpened = [];
-  mount(SessionGrid, {
+  window.__denseKilled = [];
+  const gridHost = mount(SessionGridHost, {
     target: document.getElementById("app"),
     props: {
-      sessions,
+      initialSessions: sessions,
       palette,
       onOpen(name) { window.__denseOpened.push(name); },
+      onKill(name) { window.__denseKilled.push(name); },
       onNew() {},
       cardLayout: "dense",
       showNew: false,
     },
   });
+  window.__replaceDenseSessions = (next) => gridHost.replaceSessions(next);
 } else {
   const props = {
     chip: "CC",
@@ -151,8 +161,12 @@ window.__hudReady = true;
   }
   bundle = await built.outputs[0]!.text();
 
-  const { chromium } = require("@playwright/test") as typeof import("@playwright/test");
-  browser = await chromium.launch();
+  const playwright = require("@playwright/test") as typeof import("@playwright/test");
+  const requestedBrowser = process.env.THUMBMUX_LAYOUT_BROWSER ?? "chromium";
+  if (requestedBrowser !== "chromium" && requestedBrowser !== "webkit") {
+    throw new Error(`unsupported THUMBMUX_LAYOUT_BROWSER: ${requestedBrowser}`);
+  }
+  browser = await playwright[requestedBrowser].launch();
 }, 180_000);
 
 afterAll(async () => {
@@ -339,6 +353,55 @@ type CardMetrics = {
   pageWidth: number;
   viewportWidth: number;
 };
+
+function cssRgb(value: string): [number, number, number] {
+  const channels = value.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+  if (!channels || channels.length !== 3 || channels.some((channel) => !Number.isFinite(channel))) {
+    throw new Error(`expected a computed rgb() color, received ${JSON.stringify(value)}`);
+  }
+  return channels as [number, number, number];
+}
+
+function relativeLuminance(value: string): number {
+  const channels = cssRgb(value).map((channel) => {
+    const srgb = channel / 255;
+    return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+  });
+  return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const lighter = Math.max(relativeLuminance(foreground), relativeLuminance(background));
+  const darker = Math.min(relativeLuminance(foreground), relativeLuminance(background));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+type ContrastSample = { foreground: string; background: string; opacity: string };
+
+function minimumContrast(samples: ContrastSample[]): number {
+  return Math.min(...samples.map(({ foreground, background }) => contrastRatio(foreground, background)));
+}
+
+async function focusRingPixels(page: Page, png: Uint8Array): Promise<{
+  innerWhite: number[];
+  outerBlack: number[];
+  surface: number[];
+}> {
+  const src = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+  return page.evaluate(async (imageSource) => {
+    const loaded = new Image();
+    loaded.src = imageSource;
+    await loaded.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = loaded.naturalWidth;
+    canvas.height = loaded.naturalHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true })!;
+    context.drawImage(loaded, 0, 0);
+    const y = Math.floor(canvas.height / 2);
+    const sample = (x: number) => Array.from(context.getImageData(x, y, 1, 1).data.slice(0, 3));
+    return { innerWhite: sample(1), outerBlack: sample(4), surface: sample(8) };
+  }, src);
+}
 
 async function renderDenseGrid(context: BrowserContext): Promise<Page> {
   const page = await context.newPage();
@@ -576,12 +639,61 @@ describe("dense SessionGrid browser layout", () => {
       expect(await page.locator('[data-testid="grid-summary"]').count()).toBe(2);
       expect(await page.locator('[data-testid="session-thumb"].dense').count()).toBe(2);
       const denseChrome = await page.locator('[data-testid="grid-card"]').first().evaluate((card) => {
+        const head = card.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
+        const sections = Array.from(head.querySelectorAll<HTMLElement>(':scope > .dense-section'));
         const copy = card.querySelector<HTMLElement>('[data-testid="grid-copy-name"]')!;
         const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
         const summary = card.querySelector<HTMLElement>('[data-testid="grid-summary"]')!;
+        const open = card.querySelector<HTMLElement>('[data-testid="grid-expand"]')!;
+        const kill = card.querySelector<HTMLElement>('[data-testid="grid-kill"]')!;
+        const thumb = card.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const tail = thumb.querySelector<HTMLElement>('.tail')!;
         const noteStyle = getComputedStyle(note);
         const summaryStyle = getComputedStyle(summary);
+        const tailStyle = getComputedStyle(tail);
+        const lineRects = Array.from(tail.querySelectorAll<HTMLElement>('.mtv-line')).map(
+          (line) => line.getBoundingClientRect(),
+        );
+        const surfaceStyle = getComputedStyle(thumb);
+        const renderedSamples = [
+          { foreground: surfaceStyle.color, background: surfaceStyle.backgroundColor, opacity: surfaceStyle.opacity },
+          ...Array.from(tail.querySelectorAll<HTMLElement>('[style*="color"]')).map((span) => {
+            const style = getComputedStyle(span);
+            return {
+              foreground: style.color,
+              background: style.backgroundColor === "rgba(0, 0, 0, 0)"
+                ? surfaceStyle.backgroundColor
+                : style.backgroundColor,
+              opacity: style.opacity,
+            };
+          }),
+        ];
         return {
+          sectionCount: sections.length,
+          sectionNames: sections.map((section) => section.dataset.section),
+          sectionWidths: sections.map((section) => section.getBoundingClientRect().width),
+          sectionDividerWidths: sections.slice(1).map((section) => getComputedStyle(section).borderLeftWidth),
+          sectionDividerColors: sections.slice(1).map((section) => getComputedStyle(section).borderLeftColor),
+          sectionColors: sections.map((section) => getComputedStyle(section).color),
+          headHeight: head.getBoundingClientRect().height,
+          headContainsOpen: head.contains(open),
+          headText: head.textContent ?? "",
+          openTag: open.tagName,
+          openContainsThumb: open.contains(thumb),
+          openSharesPreviewParent: open.parentElement === thumb.parentElement,
+          openFollowsThumb: open.previousElementSibling === thumb,
+          openPointerEvents: getComputedStyle(open).pointerEvents,
+          killTag: kill.tagName,
+          killText: kill.textContent,
+          killWidth: kill.getBoundingClientRect().width,
+          killHeight: kill.getBoundingClientRect().height,
+          killTop: kill.getBoundingClientRect().top - head.getBoundingClientRect().top,
+          killRight: head.getBoundingClientRect().right - kill.getBoundingClientRect().right,
+          thumbBackground: surfaceStyle.backgroundColor,
+          renderedSamples,
+          thumbLineHeightRatio: Number.parseFloat(tailStyle.lineHeight) / Number.parseFloat(tailStyle.fontSize),
+          thumbLinePitch: lineRects[1]!.top - lineRects[0]!.top,
+          thumbLineHeight: Number.parseFloat(tailStyle.lineHeight),
           copyMinWidth: getComputedStyle(copy).minWidth,
           noteLineClamp: noteStyle.getPropertyValue("-webkit-line-clamp"),
           noteHeight: note.clientHeight,
@@ -591,15 +703,220 @@ describe("dense SessionGrid browser layout", () => {
           summaryLineHeight: Number.parseFloat(summaryStyle.lineHeight),
         };
       });
+      expect(denseChrome.sectionCount).toBe(3);
+      expect(denseChrome.sectionNames).toEqual(["name", "note", "summary"]);
+      expect(Math.max(...denseChrome.sectionWidths) - Math.min(...denseChrome.sectionWidths)).toBeLessThan(1);
+      expect(denseChrome.sectionDividerWidths).toEqual(["1px", "1px"]);
+      expect(denseChrome.sectionDividerColors).toEqual(["rgb(155, 149, 144)", "rgb(155, 149, 144)"]);
+      expect(new Set(denseChrome.sectionColors).size).toBe(1);
+      expect(denseChrome.headHeight).toBe(72);
+      expect(denseChrome.headContainsOpen).toBe(false);
+      expect(denseChrome.headText).not.toContain("↗");
+      expect(denseChrome.openTag).toBe("BUTTON");
+      expect(denseChrome.openContainsThumb).toBe(false);
+      expect(denseChrome.openSharesPreviewParent).toBe(true);
+      expect(denseChrome.openFollowsThumb).toBe(true);
+      expect(denseChrome.openPointerEvents).toBe("auto");
+      expect(denseChrome.killTag).toBe("BUTTON");
+      expect(denseChrome.killText).toBe("×");
+      expect(denseChrome.killWidth).toBe(44);
+      expect(denseChrome.killHeight).toBe(44);
+      expect(denseChrome.killTop).toBe(0);
+      expect(denseChrome.killRight).toBe(0);
+      expect(denseChrome.thumbBackground).toBe("rgb(102, 102, 102)");
+      expect(denseChrome.renderedSamples.length).toBeGreaterThanOrEqual(21);
+      expect(minimumContrast(denseChrome.renderedSamples)).toBeGreaterThanOrEqual(4.5);
+      expect(denseChrome.renderedSamples.every((sample) => sample.opacity === "1")).toBe(true);
+      expect(denseChrome.thumbLineHeightRatio).toBeCloseTo(1.1, 2);
+      expect(denseChrome.thumbLinePitch).toBeCloseTo(denseChrome.thumbLineHeight, 1);
       expect(denseChrome.copyMinWidth).toBe("44px");
-      expect(denseChrome.noteLineClamp).toBe("2");
-      expect(denseChrome.noteHeight).toBeLessThanOrEqual(denseChrome.noteLineHeight * 2 + 1);
+      expect(denseChrome.noteLineClamp).toBe("3");
+      expect(denseChrome.noteHeight).toBeLessThanOrEqual(denseChrome.noteLineHeight * 3 + 1);
       expect(denseChrome.summaryLineClamp).toBe("3");
       expect(denseChrome.summaryHeight).toBeLessThanOrEqual(denseChrome.summaryLineHeight * 3 + 1);
-      await page.locator('[data-testid="grid-expand"]').first().click();
+
+      const firstCard = page.locator('[data-testid="grid-card"]').first();
+      const openPreview = firstCard.locator('[data-testid="grid-expand"]');
+      const thumbPreview = firstCard.locator('[data-testid="session-thumb"]');
+      const originalOpenNode = await openPreview.elementHandle();
+      expect(originalOpenNode).not.toBeNull();
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      await openPreview.focus();
+      await page.waitForTimeout(180);
+      const focusedSurface = await openPreview.evaluate((element) => {
+        const thumb = element.parentElement!.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const openStyle = getComputedStyle(element);
+        const surfaceStyle = getComputedStyle(thumb);
+        const focusStyle = getComputedStyle(element, "::after");
+        return {
+          background: surfaceStyle.backgroundColor,
+          renderedSamples: [
+            { foreground: surfaceStyle.color, background: surfaceStyle.backgroundColor, opacity: surfaceStyle.opacity },
+            ...Array.from(thumb.querySelectorAll<HTMLElement>('[style*="color"]')).map((span) => {
+              const style = getComputedStyle(span);
+              return {
+                foreground: style.color,
+                background: style.backgroundColor === "rgba(0, 0, 0, 0)"
+                  ? surfaceStyle.backgroundColor
+                  : style.backgroundColor,
+                opacity: style.opacity,
+              };
+            }),
+          ],
+          outlineColor: openStyle.outlineColor,
+          outlineWidth: openStyle.outlineWidth,
+          focusBoxShadow: focusStyle.boxShadow,
+        };
+      });
+      expect(focusedSurface.background).toBe("rgb(17, 17, 17)");
+      expect(focusedSurface.renderedSamples.some((sample) => sample.opacity === "0.6")).toBe(true);
+      expect(focusedSurface.outlineWidth).toBe("0px");
+      expect(focusedSurface.focusBoxShadow).toContain("rgb(255, 255, 255)");
+      expect(focusedSurface.focusBoxShadow).toContain("rgb(17, 17, 17)");
+      await thumbPreview.evaluate((thumb) => {
+        (thumb as HTMLElement).style.setProperty("--tbg", "#f5f5f5");
+      });
+      const ring = await focusRingPixels(page, await openPreview.screenshot({ animations: "disabled" }));
+      expect(ring.innerWhite.every((channel) => channel >= 250)).toBe(true);
+      expect(ring.outerBlack.every((channel) => channel >= 14 && channel <= 20)).toBe(true);
+      expect(ring.surface.every((channel) => channel >= 240)).toBe(true);
+      await thumbPreview.evaluate((thumb) => {
+        (thumb as HTMLElement).style.setProperty("--tbg", "#111111");
+      });
+      await openPreview.evaluate((element) => element.blur());
+      await page.waitForTimeout(180);
+      expect(await thumbPreview.evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(102, 102, 102)");
+      const hitBoxBeforeHover = await openPreview.boundingBox();
+      await openPreview.hover();
+      await page.waitForTimeout(180);
+      expect(await thumbPreview.evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(17, 17, 17)");
+      const hitBoxAfterHover = await openPreview.boundingBox();
+      expect(hitBoxBeforeHover).not.toBeNull();
+      expect(hitBoxAfterHover).not.toBeNull();
+      for (const key of ["x", "y", "width", "height"] as const) {
+        expect(Math.abs(hitBoxAfterHover![key] - hitBoxBeforeHover![key])).toBeLessThanOrEqual(1);
+      }
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      // Android WebView/XR pointers can emit HOVER_EXIT immediately before
+      // the press. That resets the preview palette and rewrites the thumbnail
+      // DOM; the stable sibling overlay must remain the hit target throughout.
+      await openPreview.dispatchEvent("pointerleave", { pointerType: "mouse" });
+      await page.waitForTimeout(180);
+      expect(await thumbPreview.evaluate(
+        (thumb) => getComputedStyle(thumb).backgroundColor,
+      )).toBe("rgb(102, 102, 102)");
+      expect(await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      expect(await originalOpenNode!.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return element.isConnected
+          && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === element;
+      })).toBe(true);
+      await page.mouse.down();
+      await page.mouse.up();
       expect(await page.evaluate(() => (
         window as unknown as { __denseOpened: string[] }
       ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.focus();
+      await page.keyboard.press("Enter");
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.focus();
+      await page.keyboard.press("Space");
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+      await page.locator('[data-testid="grid-kill"]').first().click();
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseKilled: string[] }
+      ).__denseKilled)).toEqual(["codex-dense-alpha-very-long-name"]);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+
+      // If an embedded browser omits the compatibility click, pointerup owns
+      // a short fallback and still activates exactly once.
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+        const block = (event: MouseEvent) => {
+          if (!(event.target instanceof Element) || !event.target.closest('[data-testid="grid-expand"]')) return;
+          document.removeEventListener("click", block, true);
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        };
+        document.addEventListener("click", block, true);
+      });
+      await openPreview.hover();
+      await page.mouse.down();
+      await page.mouse.up();
+      await page.waitForTimeout(80);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+
+      // Live metadata can reorder keyed cards while the pointer is down. The
+      // original session/node remains the activation target after it moves.
+      await page.evaluate(() => {
+        (window as unknown as { __denseOpened: string[] }).__denseOpened = [];
+      });
+      await openPreview.hover();
+      await page.mouse.down();
+      await page.evaluate(() => {
+        (window as unknown as {
+          __replaceDenseSessions: (sessions: Array<Record<string, string>>) => void;
+        }).__replaceDenseSessions([
+          { name: "grok-dense-beta", note: "รอ input", summary: "สรุปงานล่าสุดของ session" },
+          { name: "codex-dense-alpha-very-long-name", note: "moved", summary: "still selected" },
+        ]);
+      });
+      await page.waitForTimeout(30);
+      expect(await originalOpenNode!.evaluate((element) => element.isConnected)).toBe(true);
+      await page.mouse.up();
+      await page.waitForTimeout(80);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("forced-colors mode retains a painted keyboard focus indicator", async () => {
+    const context = await browser.newContext({
+      viewport: { width: 1200, height: 900 },
+      forcedColors: "active",
+    });
+    try {
+      const page = await renderDenseGrid(context);
+      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      await page.keyboard.press("Tab");
+      await openPreview.focus();
+      const forcedFocus = await openPreview.evaluate((element) => {
+        const style = getComputedStyle(element, "::after");
+        return { color: style.borderTopColor, style: style.borderTopStyle, width: style.borderTopWidth };
+      });
+      expect(forcedFocus.width).toBe("3px");
+      expect(forcedFocus.style).toBe("solid");
+      expect(forcedFocus.color).not.toBe("rgba(0, 0, 0, 0)");
     } finally {
       await context.close();
     }
@@ -620,6 +937,63 @@ describe("dense SessionGrid browser layout", () => {
       expect(cards[0]!.height).toBe(844);
       expect(cards[1]!.top - cards[0]!.top).toBe(852);
       expect(cards[0]!.pageWidth).toBeLessThanOrEqual(cards[0]!.viewportWidth);
+      const openPreview = page.locator('[data-testid="grid-expand"]').first();
+      const hit = await openPreview.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = Math.max(rect.top + 10, Math.min(rect.bottom - 10, window.innerHeight - 10));
+        return {
+          visiblePointIsButton: document.elementFromPoint(x, y) === element,
+          x,
+          y,
+        };
+      });
+      expect(hit.visiblePointIsButton).toBe(true);
+      await page.touchscreen.tap(hit.x, hit.y);
+      expect(await page.evaluate(() => (
+        window as unknown as { __denseOpened: string[] }
+      ).__denseOpened)).toEqual(["codex-dense-alpha-very-long-name"]);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("phone portrait keeps three equal metadata sections and a full preview target", async () => {
+    const context = await browser.newContext({
+      viewport: { width: 320, height: 700 },
+      isMobile: true,
+      hasTouch: true,
+    });
+    try {
+      const page = await renderDenseGrid(context);
+      const card = page.locator('[data-testid="grid-card"]').first();
+      const metrics = await card.evaluate((element) => {
+        const head = element.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
+        const sections = Array.from(head.querySelectorAll<HTMLElement>(':scope > .dense-section'));
+        const open = element.querySelector<HTMLElement>('[data-testid="grid-expand"]')!;
+        const thumb = element.querySelector<HTMLElement>('[data-testid="session-thumb"]')!;
+        const cardRect = element.getBoundingClientRect();
+        const openRect = open.getBoundingClientRect();
+        return {
+          cardWidth: cardRect.width,
+          cardHeight: cardRect.height,
+          headHeight: head.getBoundingClientRect().height,
+          sectionWidths: sections.map((section) => section.getBoundingClientRect().width),
+          openWidth: openRect.width,
+          openHeight: openRect.height,
+          thumbBackground: getComputedStyle(thumb).backgroundColor,
+          pageWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
+        };
+      });
+      expect(metrics.cardWidth).toBe(320);
+      expect(metrics.cardHeight).toBe(320);
+      expect(metrics.headHeight).toBe(72);
+      expect(Math.max(...metrics.sectionWidths) - Math.min(...metrics.sectionWidths)).toBeLessThan(1);
+      expect(metrics.openWidth).toBe(metrics.cardWidth - 2);
+      expect(metrics.openHeight).toBe(metrics.cardHeight - metrics.headHeight - 2);
+      expect(metrics.thumbBackground).toBe("rgb(102, 102, 102)");
+      expect(metrics.pageWidth).toBeLessThanOrEqual(metrics.viewportWidth);
     } finally {
       await context.close();
     }
