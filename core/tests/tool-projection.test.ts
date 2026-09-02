@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  coalesceAdjacentToolProjection,
   projectToolLines,
   reconcileToolBlockIds,
   stableToolFingerprint,
@@ -32,6 +33,17 @@ function block(
   };
 }
 
+type GroupedToolProjection = ReturnType<typeof coalesceAdjacentToolProjection>;
+type ToolPlaceholderGroup = NonNullable<
+  GroupedToolProjection['rows'][number]['placeholderGroup']
+>;
+
+function placeholderGroups(projection: GroupedToolProjection): ToolPlaceholderGroup[] {
+  return projection.rows.flatMap((row) => (
+    row.placeholderGroup ? [row.placeholderGroup] : []
+  ));
+}
+
 describe('provider-neutral tool projection', () => {
   test('collapses a proven range and maintains exact raw/visual mappings', () => {
     const rawLines = ['', 'ran header', 'output', '', 'assistant prose'];
@@ -59,6 +71,8 @@ describe('provider-neutral tool projection', () => {
       fingerprint: 'tool-v1-fixture',
       placeholderKey: 'tool-placeholder:codex:tool-v1-fixture:part-0',
     });
+    expect(projection.rows.every((row) => !('blockCount' in row))).toBe(true);
+    expect(projection.rows.every((row) => !('placeholderGroup' in row))).toBe(true);
     expect(projection.hiddenLineCount).toBe(2);
   });
 
@@ -112,6 +126,407 @@ describe('provider-neutral tool projection', () => {
       null,
       'tool-placeholder:codex:tool-v1-split:part-1',
     ]);
+  });
+
+  test('coalesces equal-provider placeholders through complete ANSI/NBSP blank rows', () => {
+    const rawLines = [
+      'before',
+      'tool one',
+      '\x1b[0m \u00a0\t',
+      'tool two',
+      'after',
+    ];
+    const first = block(range(1, 2), [range(1, 2)], [], range(1, 3), 'first');
+    const second = block(range(3, 4), [range(3, 4)], [], range(3, 4), 'second');
+    const projected = projectToolLines(rawLines, {
+      blocks: [first, second],
+      placeholder: () => 'hidden tools',
+    });
+    const coalesced = coalesceAdjacentToolProjection(projected);
+
+    expect(coalesced.lines).toEqual(['before', 'hidden tools', 'after']);
+    expect(coalesced.visualToRawRange).toEqual([
+      range(0, 1),
+      range(1, 4),
+      range(4, 5),
+    ]);
+    expect(coalesced.rawToVisualRow).toEqual([0, 1, 1, 1, 2]);
+    expect(coalesced.hiddenLineCount).toBe(3);
+    expect(coalesced.projectedBlocks).toBe(projected.projectedBlocks);
+    expect(coalesced.rejectedBlocks).toBe(projected.rejectedBlocks);
+    expect(coalesced.rows[1]).toMatchObject({
+      kind: 'tool-placeholder',
+      rawStart: 1,
+      rawEndExclusive: 4,
+      block: null,
+      fingerprint: null,
+      blockCount: 2,
+      placeholderGroup: {
+        provider: 'codex',
+        line: 'hidden tools',
+        rawRange: range(1, 4),
+        memberPlaceholderKeys: [
+          'tool-placeholder:codex:first:part-0',
+          'tool-placeholder:codex:second:part-0',
+        ],
+        blockCount: 2,
+      },
+    });
+
+    const directLines = ['tool one', 'tool two'];
+    const direct = coalesceAdjacentToolProjection(projectToolLines(directLines, {
+      blocks: [
+        block(range(0, 1), [range(0, 1)], [], range(0, 1), 'direct-first'),
+        block(range(1, 2), [range(1, 2)], [], range(1, 2), 'direct-second'),
+      ],
+      placeholder: () => 'hidden tools',
+    }));
+    expect(direct.lines).toEqual(['hidden tools']);
+    expect(direct.visualToRawRange).toEqual([range(0, 2)]);
+    expect(direct.rows[0]?.blockCount).toBe(2);
+  });
+
+  test('does not coalesce across barriers, protected/rejected rows, or malformed ANSI', () => {
+    const rawLines = ['tool one', '\x1b[0m \u00a0', 'tool two'];
+    const first = block(range(0, 1), [range(0, 1)], [], range(0, 1), 'first');
+    const second = block(range(2, 3), [range(2, 3)], [], range(2, 3), 'second');
+    const projected = projectToolLines(rawLines, {
+      blocks: [first, second],
+      placeholder: () => 'hidden tools',
+    });
+    const barrierSplit = coalesceAdjacentToolProjection(projected, { barrierLines: [2] });
+    expect(barrierSplit.rows.filter((row) => row.kind === 'tool-placeholder')).toHaveLength(2);
+    expect(barrierSplit.lines).toEqual(['hidden tools', '\x1b[0m \u00a0', 'hidden tools']);
+
+    const protectedBlock = block(
+      range(0, 3),
+      [range(0, 1), range(2, 3)],
+      [range(1, 2)],
+      range(0, 3),
+      'protected-split',
+    );
+    const protectedProjection = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks: [protectedBlock],
+      placeholder: () => 'hidden tools',
+    }));
+    expect(protectedProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+      .toHaveLength(2);
+    expect(protectedProjection.rows[1]?.kind).toBe('raw');
+
+    const rejectedGap = {
+      ...block(range(1, 2), [range(1, 2)], [], range(1, 2), 'rejected-gap'),
+      label: '',
+    };
+    const rejectedProjection = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks: [first, rejectedGap, second],
+      placeholder: () => 'hidden tools',
+    }));
+    expect(rejectedProjection.rejectedBlocks[0]?.reason).toBe('invalid-identity');
+    expect(rejectedProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+      .toHaveLength(2);
+
+    for (const unsafeControl of ['\x1b[', '\x1b[2J', '\x1bD']) {
+      const unsafeLines = ['tool one', unsafeControl, 'tool two'];
+      const unsafeProjection = coalesceAdjacentToolProjection(projectToolLines(unsafeLines, {
+        blocks: [first, second],
+        placeholder: () => 'hidden tools',
+      }));
+      expect(unsafeProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+        .toHaveLength(2);
+      expect(unsafeProjection.lines[1]).toBe(unsafeControl);
+    }
+
+    const visibleLines = ['tool one', '› submitted prompt stays visible', 'tool two'];
+    const visibleProjection = coalesceAdjacentToolProjection(projectToolLines(visibleLines, {
+      blocks: [first, second],
+      placeholder: () => 'hidden tools',
+    }));
+    expect(visibleProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+      .toHaveLength(2);
+    expect(visibleProjection.lines[1]).toBe('› submitted prompt stays visible');
+  });
+
+  test('does not merge different providers or unequal custom placeholder text', () => {
+    const rawLines = ['tool one', '', 'tool two'];
+    const first = block(range(0, 1), [range(0, 1)], [], range(0, 1), 'first');
+    const second = block(range(2, 3), [range(2, 3)], [], range(2, 3), 'second');
+    const crossProvider = {
+      ...second,
+      provider: 'claude' as const,
+    };
+    const providerProjection = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks: [first, crossProvider],
+      placeholder: () => 'hidden tools',
+    }));
+    expect(providerProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+      .toHaveLength(2);
+
+    const customProjection = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks: [first, second],
+      placeholder: ({ block: source }) => `hidden ${source.id}`,
+    }));
+    expect(customProjection.lines).toEqual(['hidden first', '', 'hidden second']);
+    expect(customProjection.rows.filter((row) => row.kind === 'tool-placeholder'))
+      .toHaveLength(2);
+  });
+
+  test('carries group identity through append and front-drop, but not replacement', () => {
+    const occurrence = (id: string, startLine: number): ToolCollapseBlock => ({
+      ...block(
+        range(startLine, startLine + 1),
+        [range(startLine, startLine + 1)],
+        [],
+        range(startLine, startLine + 1),
+        id,
+      ),
+      id,
+    });
+    const grouped = (
+      rawLines: readonly string[],
+      blocks: readonly ToolCollapseBlock[],
+      previousGroups: readonly ToolPlaceholderGroup[] = [],
+    ) => coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks,
+      placeholder: () => 'hidden tools',
+    }), { previousGroups });
+
+    const initial = grouped(
+      ['A', '', 'B'],
+      [occurrence('A', 0), occurrence('B', 2)],
+    );
+    const initialGroup = placeholderGroups(initial)[0];
+    expect(initialGroup).toMatchObject({ blockCount: 2 });
+    expect(initialGroup?.placeholderKey).toBe('tool-placeholder:codex:A:part-0');
+
+    const appended = grouped(
+      ['A', '', 'B', '', 'C'],
+      [occurrence('A', 0), occurrence('B', 2), occurrence('C', 4)],
+      placeholderGroups(initial),
+    );
+    const appendedGroup = placeholderGroups(appended)[0];
+    expect(appendedGroup).toMatchObject({ blockCount: 3 });
+    expect(appendedGroup?.placeholderKey).toBe(initialGroup?.placeholderKey);
+
+    const frontDropped = grouped(
+      ['B', '', 'C'],
+      [occurrence('B', 0), occurrence('C', 2)],
+      placeholderGroups(appended),
+    );
+    const frontDroppedGroup = placeholderGroups(frontDropped)[0];
+    expect(frontDroppedGroup?.memberPlaceholderKeys).toEqual([
+      'tool-placeholder:codex:B:part-0',
+      'tool-placeholder:codex:C:part-0',
+    ]);
+    expect(frontDroppedGroup?.placeholderKey).toBe(initialGroup?.placeholderKey);
+    expect(frontDropped.rows[0]?.placeholderKey).toBe(initialGroup?.placeholderKey);
+
+    const replaced = grouped(
+      ['D', '', 'E'],
+      [occurrence('D', 0), occurrence('E', 2)],
+      placeholderGroups(frontDropped),
+    );
+    const replacedGroup = placeholderGroups(replaced)[0];
+    expect(replacedGroup?.placeholderKey).toBe('tool-placeholder:codex:D:part-0');
+    expect(replacedGroup?.placeholderKey).not.toBe(initialGroup?.placeholderKey);
+
+    const collidingReplacement = grouped(
+      ['A'],
+      [occurrence('A', 0)],
+      placeholderGroups(frontDropped),
+    );
+    const collidingReplacementKey = placeholderGroups(collidingReplacement)[0]?.placeholderKey;
+    expect(collidingReplacementKey).not.toBe(initialGroup?.placeholderKey);
+    expect(collidingReplacementKey).toStartWith('tool-placeholder:codex:A:part-0:group-');
+  });
+
+  test('assigns one old key on split and deterministically restores it on merge', () => {
+    const occurrence = (id: string, startLine: number): ToolCollapseBlock => ({
+      ...block(
+        range(startLine, startLine + 1),
+        [range(startLine, startLine + 1)],
+        [],
+        range(startLine, startLine + 1),
+        id,
+      ),
+      id,
+    });
+    const grouped = (
+      rawLines: readonly string[],
+      blocks: readonly ToolCollapseBlock[],
+      previousGroups: readonly ToolPlaceholderGroup[] = [],
+    ) => coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks,
+      placeholder: () => 'hidden tools',
+    }), { previousGroups });
+
+    const initial = grouped(
+      ['A', '', 'B', '', 'C'],
+      [occurrence('A', 0), occurrence('B', 2), occurrence('C', 4)],
+    );
+    const initialKey = placeholderGroups(initial)[0]?.placeholderKey;
+
+    const split = grouped(
+      ['A', '', 'B', '', '› submitted prompt stays visible', '', 'C'],
+      [occurrence('A', 0), occurrence('B', 2), occurrence('C', 6)],
+      placeholderGroups(initial),
+    );
+    const splitGroups = placeholderGroups(split);
+    expect(splitGroups).toHaveLength(2);
+    expect(splitGroups[0]?.placeholderKey).toBe(initialKey);
+    expect(splitGroups[1]?.placeholderKey).toBe('tool-placeholder:codex:C:part-0');
+    expect(split.lines).toContain('› submitted prompt stays visible');
+
+    const merged = grouped(
+      ['A', '', 'B', '', 'C'],
+      [occurrence('A', 0), occurrence('B', 2), occurrence('C', 4)],
+      splitGroups,
+    );
+    expect(placeholderGroups(merged)).toHaveLength(1);
+    expect(placeholderGroups(merged)[0]?.placeholderKey).toBe(initialKey);
+  });
+
+  test('maximizes carried keys across simultaneous adjacent split and merge', () => {
+    const occurrence = (id: string, startLine: number): ToolCollapseBlock => ({
+      ...block(
+        range(startLine, startLine + 1),
+        [range(startLine, startLine + 1)],
+        [],
+        range(startLine, startLine + 1),
+        id,
+      ),
+      id,
+    });
+    const grouped = (
+      rawLines: readonly string[],
+      ids: readonly string[],
+      barrierLines: readonly number[],
+      previousGroups: readonly ToolPlaceholderGroup[] = [],
+    ) => coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+      blocks: ids.map((id, index) => occurrence(id, index * 2)),
+      placeholder: () => 'hidden tools',
+    }), { barrierLines, previousGroups });
+
+    const previous = grouped(
+      ['A', '', 'B', '', 'C', '', 'D'],
+      ['A', 'B', 'C', 'D'],
+      [4],
+    );
+    const previousGroups = placeholderGroups(previous);
+    expect(previousGroups.map(({ memberPlaceholderKeys }) => memberPlaceholderKeys)).toEqual([
+      ['tool-placeholder:codex:A:part-0', 'tool-placeholder:codex:B:part-0'],
+      ['tool-placeholder:codex:C:part-0', 'tool-placeholder:codex:D:part-0'],
+    ]);
+
+    const shifted = grouped(
+      ['B', '', 'C', '', 'D'],
+      ['B', 'C', 'D'],
+      [4],
+      previousGroups,
+    );
+    expect(placeholderGroups(shifted).map(({ placeholderKey }) => placeholderKey)).toEqual([
+      previousGroups[0]?.placeholderKey,
+      previousGroups[1]?.placeholderKey,
+    ]);
+
+    const symmetricPrevious = grouped(
+      ['A', '', 'B', '', 'C'],
+      ['A', 'B', 'C'],
+      [2],
+    );
+    const symmetricGroups = placeholderGroups(symmetricPrevious);
+    const symmetricNext = grouped(
+      ['A', '', 'B', '', 'C'],
+      ['A', 'B', 'C'],
+      [4],
+      symmetricGroups,
+    );
+    expect(placeholderGroups(symmetricNext).map(({ placeholderKey }) => placeholderKey)).toEqual([
+      symmetricGroups[0]?.placeholderKey,
+      symmetricGroups[1]?.placeholderKey,
+    ]);
+  });
+
+  test('maximizes monotonic key reuse across every small ordered partition pair', () => {
+    for (let memberCount = 1; memberCount <= 6; memberCount += 1) {
+      const ids = Array.from({ length: memberCount }, (_, index) => `M${index}`);
+      const rawLines = ids.flatMap((id, index) => (
+        index + 1 < ids.length ? [id, ''] : [id]
+      ));
+      const blocks = ids.map((id, index) => ({
+        ...block(
+          range(index * 2, index * 2 + 1),
+          [range(index * 2, index * 2 + 1)],
+          [],
+          range(index * 2, index * 2 + 1),
+          id,
+        ),
+        id,
+      }));
+      const partitionCount = 1 << Math.max(0, memberCount - 1);
+      const barriers = (mask: number) => Array.from(
+        { length: memberCount - 1 },
+        (_, index) => index,
+      ).filter((index) => (mask & (1 << index)) !== 0)
+        .map((index) => (index + 1) * 2);
+
+      for (let previousMask = 0; previousMask < partitionCount; previousMask += 1) {
+        const previous = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+          blocks,
+          placeholder: () => 'hidden tools',
+        }), { barrierLines: barriers(previousMask) });
+        const previousGroups = placeholderGroups(previous);
+        const previousKeys = new Set(previousGroups.map(({ placeholderKey }) => placeholderKey));
+
+        for (let nextMask = 0; nextMask < partitionCount; nextMask += 1) {
+          const next = coalesceAdjacentToolProjection(projectToolLines(rawLines, {
+            blocks,
+            placeholder: () => 'hidden tools',
+          }), {
+            barrierLines: barriers(nextMask),
+            previousGroups,
+          });
+          const nextGroups = placeholderGroups(next);
+          const nextKeys = nextGroups.map(({ placeholderKey }) => placeholderKey);
+          expect(new Set(nextKeys).size).toBe(nextKeys.length);
+          const carriedCount = nextKeys.filter((key) => previousKeys.has(key)).length;
+          const maximumMatches = Array.from(
+            { length: previousGroups.length + 1 },
+            () => Array<number>(nextGroups.length + 1).fill(0),
+          );
+          for (let previousIndex = 1; previousIndex <= previousGroups.length; previousIndex += 1) {
+            for (let nextIndex = 1; nextIndex <= nextGroups.length; nextIndex += 1) {
+              const previousMembers = new Set(
+                previousGroups[previousIndex - 1]?.memberPlaceholderKeys ?? [],
+              );
+              const overlaps = nextGroups[nextIndex - 1]?.memberPlaceholderKeys.some(
+                (key) => previousMembers.has(key),
+              ) ?? false;
+              maximumMatches[previousIndex]![nextIndex] = Math.max(
+                maximumMatches[previousIndex - 1]?.[nextIndex] ?? 0,
+                maximumMatches[previousIndex]?.[nextIndex - 1] ?? 0,
+                overlaps
+                  ? (maximumMatches[previousIndex - 1]?.[nextIndex - 1] ?? 0) + 1
+                  : 0,
+              );
+            }
+          }
+          const expectedCarriedCount = maximumMatches.at(-1)?.at(-1) ?? 0;
+          if (carriedCount !== expectedCarriedCount) {
+            throw new Error(JSON.stringify({
+              memberCount,
+              previousMask,
+              nextMask,
+              previous: previousGroups.map((group) => group.memberPlaceholderKeys),
+              next: nextGroups.map((group) => group.memberPlaceholderKeys),
+              previousKeys: [...previousKeys],
+              nextKeys,
+              carriedCount,
+              expectedCarriedCount,
+            }));
+          }
+        }
+      }
+    }
   });
 
   test('rejects malformed ranges and every participant in an overlap', () => {

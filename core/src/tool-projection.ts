@@ -123,6 +123,40 @@ export type ToolProjectionOptions = Readonly<{
   placeholder?: (context: ToolPlaceholderContext) => string;
 }>;
 
+/**
+ * One presentation-only run of adjacent completed-tool placeholders.
+ *
+ * Member keys, rather than detector fingerprints or physical row coordinates,
+ * are the temporal identity proof. A following projection may therefore carry
+ * `placeholderKey` while at least one reconciled member occurrence survives.
+ */
+type ToolPlaceholderGroup = Readonly<{
+  placeholderKey: string;
+  provider: ToolProvider;
+  line: string;
+  rawRange: ToolLineRange;
+  memberPlaceholderKeys: readonly string[];
+  blockCount: number;
+}>;
+
+type ToolGroupedProjectionRow = Readonly<ToolProjectionRow & {
+  /** Number of distinct detector blocks represented by this visual row. */
+  blockCount: number;
+  /** The coalesced placeholder group, or null for a raw fallback row. */
+  placeholderGroup: ToolPlaceholderGroup | null;
+}>;
+
+type ToolGroupedProjection = Readonly<Omit<ToolProjection, 'rows'> & {
+  rows: readonly ToolGroupedProjectionRow[];
+}>;
+
+type ToolProjectionCoalesceOptions = Readonly<{
+  /** Raw boundaries which semantic grouping must never cross. */
+  barrierLines?: readonly number[];
+  /** Groups from the preceding projection epoch, used only for stable keys. */
+  previousGroups?: readonly ToolPlaceholderGroup[];
+}>;
+
 type PreviousOccurrence = Readonly<{
   block: ToolCollapseBlock;
   startLine: number;
@@ -791,6 +825,346 @@ export function projectToolLines(
     rawToVisual: rawToVisualRow,
     projectedBlocks: validation.acceptedBlocks,
     rejectedBlocks: validation.rejectedBlocks,
+    hiddenLineCount,
+  };
+}
+
+type ToolPlaceholderGroupCandidate = {
+  startRowIndex: number;
+  endRowIndex: number;
+  provider: ToolProvider;
+  line: string;
+  memberRows: ToolProjectionRow[];
+  memberPlaceholderKeys: string[];
+  blockIds: Set<string>;
+};
+
+function isBlankToolSeparator(raw: string): boolean {
+  let index = 0;
+  while (index < raw.length) {
+    if (raw[index] !== '\x1b') {
+      if (!/[ \t\u00a0]/u.test(raw[index] ?? '')) return false;
+      index += 1;
+      continue;
+    }
+    const next = raw[index + 1];
+    // Only SGR paint is safe separator chrome. Cursor movement, erase/reset,
+    // OSC, charset controls, and unfamiliar/incomplete ESC sequences stay raw.
+    if (next !== '[') return false;
+    let end = index + 2;
+    while (end < raw.length && /[0-9:;]/u.test(raw[end] ?? '')) end += 1;
+    if (raw[end] !== 'm') return false;
+    index = end + 1;
+  }
+  return true;
+}
+
+function projectionRowsCoverRawSource(projection: ToolProjection): boolean {
+  let cursor = 0;
+  const memberKeys = new Set<string>();
+  for (const row of projection.rows) {
+    if (
+      !validRange(row.rawRange, projection.rawLines.length)
+      || row.rawStart !== row.rawRange.startLine
+      || row.rawEndExclusive !== row.rawRange.endLine
+      || row.rawRange.startLine !== cursor
+    ) return false;
+    if (row.kind === 'tool-placeholder') {
+      if (!row.block || !row.placeholderKey || memberKeys.has(row.placeholderKey)) return false;
+      memberKeys.add(row.placeholderKey);
+    } else if (row.block !== null || row.placeholderKey !== null) return false;
+    cursor = row.rawRange.endLine;
+  }
+  return cursor === projection.rawLines.length;
+}
+
+function rangeTouchesAny(
+  startLine: number,
+  endLine: number,
+  ranges: readonly ToolLineRange[],
+): boolean {
+  return ranges.some((candidate) => (
+    candidate.startLine < endLine && startLine < candidate.endLine
+  ));
+}
+
+function gapCrossesBarrier(
+  startLine: number,
+  endLine: number,
+  barrierLines: ReadonlySet<number>,
+): boolean {
+  for (const barrier of barrierLines) {
+    if (barrier >= startLine && barrier <= endLine) return true;
+  }
+  return false;
+}
+
+function joinableToolPlaceholderGap(
+  projection: ToolProjection,
+  rows: readonly ToolProjectionRow[],
+  previousIndex: number,
+  nextIndex: number,
+  barriers: ReadonlySet<number>,
+  hardRanges: readonly ToolLineRange[],
+): boolean {
+  const previous = rows[previousIndex];
+  const next = rows[nextIndex];
+  if (!previous || !next) return false;
+  const gapStart = previous.rawRange.endLine;
+  const gapEnd = next.rawRange.startLine;
+  if (gapStart > gapEnd || gapCrossesBarrier(gapStart, gapEnd, barriers)) return false;
+  if (rangeTouchesAny(gapStart, gapEnd, hardRanges)) return false;
+  for (let index = previousIndex + 1; index < nextIndex; index += 1) {
+    const row = rows[index];
+    if (!row || row.kind !== 'raw') return false;
+    for (let rawRow = row.rawRange.startLine; rawRow < row.rawRange.endLine; rawRow += 1) {
+      if (!isBlankToolSeparator(projection.rawLines[rawRow] ?? '')) return false;
+    }
+  }
+  return true;
+}
+
+function validPreviousToolGroups(
+  groups: readonly ToolPlaceholderGroup[],
+): readonly ToolPlaceholderGroup[] {
+  const keyOwners = new Map<string, number>();
+  for (const group of groups) {
+    if (!group.placeholderKey.trim()) continue;
+    keyOwners.set(group.placeholderKey, (keyOwners.get(group.placeholderKey) ?? 0) + 1);
+  }
+  return groups.filter((group) => (
+    group.placeholderKey.trim() !== ''
+    && keyOwners.get(group.placeholderKey) === 1
+    && group.line !== ''
+    && group.memberPlaceholderKeys.length > 0
+    && new Set(group.memberPlaceholderKeys).size === group.memberPlaceholderKeys.length
+    && group.memberPlaceholderKeys.every((key) => key.trim() !== '')
+    && Number.isSafeInteger(group.rawRange.startLine)
+    && Number.isSafeInteger(group.rawRange.endLine)
+    && group.rawRange.startLine < group.rawRange.endLine
+    && Number.isSafeInteger(group.blockCount)
+    && group.blockCount > 0
+  ));
+}
+
+function assignToolPlaceholderGroupKeys(
+  candidates: readonly ToolPlaceholderGroupCandidate[],
+  previousGroups: readonly ToolPlaceholderGroup[],
+): readonly string[] {
+  const previous = validPreviousToolGroups(previousGroups);
+  const ownerByMemberKey = new Map<string, number>();
+  const ambiguousMemberKeys = new Set<string>();
+  previous.forEach((group, previousIndex) => {
+    for (const key of group.memberPlaceholderKeys) {
+      if (ownerByMemberKey.has(key)) ambiguousMemberKeys.add(key);
+      else ownerByMemberKey.set(key, previousIndex);
+    }
+  });
+  for (const key of ambiguousMemberKeys) ownerByMemberKey.delete(key);
+
+  const assigned: Array<string | null> = Array(candidates.length).fill(null);
+  let previousFloor = -1;
+  candidates.forEach((candidate, candidateIndex) => {
+    const overlappingPrevious = new Set<number>();
+    for (const memberKey of candidate.memberPlaceholderKeys) {
+      const previousIndex = ownerByMemberKey.get(memberKey);
+      if (previousIndex === undefined || previousIndex <= previousFloor) continue;
+      const group = previous[previousIndex];
+      if (group?.provider === candidate.provider && group.line === candidate.line) {
+        overlappingPrevious.add(previousIndex);
+      }
+    }
+    // Previous/current groups are ordered partitions of the same reconciled
+    // member stream. Taking the earliest overlapping predecessor leaves every
+    // later predecessor available to later split children, maximizing the
+    // number of DOM keys carried across simultaneous split+merge transitions.
+    let chosenIndex: number | undefined;
+    for (const previousIndex of overlappingPrevious) {
+      if (chosenIndex === undefined || previousIndex < chosenIndex) chosenIndex = previousIndex;
+    }
+    if (chosenIndex === undefined) return;
+    const chosen = previous[chosenIndex];
+    if (!chosen) return;
+    assigned[candidateIndex] = chosen.placeholderKey;
+    previousFloor = chosenIndex;
+  });
+
+  const usedKeys = new Set(assigned.filter((key): key is string => key !== null));
+  const reservedPreviousKeys = new Set(previous.map(({ placeholderKey }) => placeholderKey));
+  return candidates.map((candidate, index) => {
+    const carried = assigned[index];
+    if (carried !== null) return carried;
+    const base = candidate.memberPlaceholderKeys[0]
+      ?? `tool-placeholder:${candidate.provider}:group-${index}`;
+    let key = base;
+    let suffix = 1;
+    // A prior key is reusable only through a proven overlapping member match.
+    // Otherwise a later detector id could coincidentally equal a stale group
+    // key after that group's original first member has fallen out of retention.
+    while (usedKeys.has(key) || reservedPreviousKeys.has(key)) {
+      key = `${base}:group-${suffix}`;
+      suffix += 1;
+    }
+    usedKeys.add(key);
+    return key;
+  });
+}
+
+function groupedIdentityProjection(projection: ToolProjection): ToolGroupedProjection {
+  return {
+    ...projection,
+    rows: projection.rows.map((row) => ({
+      ...row,
+      blockCount: row.kind === 'tool-placeholder' ? 1 : 0,
+      placeholderGroup: null,
+    })),
+  };
+}
+
+/**
+ * Merge adjacent completed-tool placeholders after detector validation.
+ *
+ * Only plain/NBSP whitespace and complete SGR-only blank rows may join equal
+ * provider/text markers. Protected, rejected, or caller-declared barriers always
+ * remain raw. The source buffer and detector block lists stay canonical.
+ */
+export function coalesceAdjacentToolProjection(
+  projection: ToolProjection,
+  options: ToolProjectionCoalesceOptions = {},
+): ToolGroupedProjection {
+  if (projection.rows.length === 0 || !projectionRowsCoverRawSource(projection)) {
+    return groupedIdentityProjection(projection);
+  }
+
+  const barriers = new Set(
+    (options.barrierLines ?? []).filter((line) => (
+      Number.isSafeInteger(line) && line >= 0 && line <= projection.rawLines.length
+    )),
+  );
+  const hardRanges = [
+    ...projection.projectedBlocks.flatMap((block) => block.protectedRanges),
+    ...projection.rejectedBlocks.map(({ block }) => block.sourceRange)
+      .filter((candidate) => validRange(candidate, projection.rawLines.length)),
+  ];
+  const placeholderIndexes = projection.rows.flatMap((row, index) => (
+    row.kind === 'tool-placeholder' ? [index] : []
+  ));
+  if (placeholderIndexes.length === 0) return groupedIdentityProjection(projection);
+
+  const candidates: ToolPlaceholderGroupCandidate[] = [];
+  for (const rowIndex of placeholderIndexes) {
+    const row = projection.rows[rowIndex];
+    if (!row?.block || !row.placeholderKey) return groupedIdentityProjection(projection);
+    const current = candidates.at(-1);
+    if (
+      current
+      && current.provider === row.block.provider
+      && current.line !== ''
+      && current.line === row.line
+      && joinableToolPlaceholderGap(
+        projection,
+        projection.rows,
+        current.endRowIndex,
+        rowIndex,
+        barriers,
+        hardRanges,
+      )
+    ) {
+      current.endRowIndex = rowIndex;
+      current.memberRows.push(row);
+      current.memberPlaceholderKeys.push(row.placeholderKey);
+      current.blockIds.add(row.block.id);
+      continue;
+    }
+    candidates.push({
+      startRowIndex: rowIndex,
+      endRowIndex: rowIndex,
+      provider: row.block.provider,
+      line: row.line,
+      memberRows: [row],
+      memberPlaceholderKeys: [row.placeholderKey],
+      blockIds: new Set([row.block.id]),
+    });
+  }
+
+  const groupKeys = assignToolPlaceholderGroupKeys(
+    candidates,
+    options.previousGroups ?? [],
+  );
+  const groupByStartRow = new Map<number, {
+    candidate: ToolPlaceholderGroupCandidate;
+    group: ToolPlaceholderGroup;
+  }>();
+  candidates.forEach((candidate, index) => {
+    const first = candidate.memberRows[0]!;
+    const last = candidate.memberRows.at(-1)!;
+    const group = Object.freeze({
+      placeholderKey: groupKeys[index]!,
+      provider: candidate.provider,
+      line: candidate.line,
+      rawRange: range(first.rawRange.startLine, last.rawRange.endLine),
+      memberPlaceholderKeys: Object.freeze([...candidate.memberPlaceholderKeys]),
+      blockCount: candidate.blockIds.size,
+    });
+    groupByStartRow.set(candidate.startRowIndex, { candidate, group });
+  });
+
+  const rows: ToolGroupedProjectionRow[] = [];
+  const rawToVisualRow = Array<number>(projection.rawLines.length);
+  let hiddenLineCount = 0;
+  for (let rowIndex = 0; rowIndex < projection.rows.length;) {
+    const grouped = groupByStartRow.get(rowIndex);
+    const source = projection.rows[rowIndex]!;
+    const visualRow = rows.length;
+    let row: ToolGroupedProjectionRow;
+    if (grouped) {
+      const { candidate, group } = grouped;
+      const singleton = candidate.memberRows.length === 1;
+      row = {
+        ...(singleton ? source : {
+          kind: 'tool-placeholder' as const,
+          line: group.line,
+          rawStart: group.rawRange.startLine,
+          rawEndExclusive: group.rawRange.endLine,
+          rawRange: group.rawRange,
+          block: null,
+          fingerprint: null,
+          placeholderKey: group.placeholderKey,
+        }),
+        visualRow,
+        placeholderKey: group.placeholderKey,
+        blockCount: group.blockCount,
+        placeholderGroup: group,
+      };
+      rowIndex = candidate.endRowIndex + 1;
+      hiddenLineCount += row.rawRange.endLine - row.rawRange.startLine;
+    } else {
+      row = {
+        ...source,
+        visualRow,
+        blockCount: source.kind === 'tool-placeholder' ? 1 : 0,
+        placeholderGroup: null,
+      };
+      rowIndex += 1;
+    }
+    rows.push(row);
+    for (let rawRow = row.rawRange.startLine; rawRow < row.rawRange.endLine; rawRow += 1) {
+      rawToVisualRow[rawRow] = visualRow;
+    }
+  }
+
+  const lines = rows.map((row) => row.line);
+  const visualToRawRange = rows.map((row) => row.rawRange);
+  return {
+    rawLines: projection.rawLines,
+    lines,
+    rows,
+    visualToRawRange,
+    visualToRaw: visualToRawRange,
+    rawToVisualRow,
+    rawToVisual: rawToVisualRow,
+    projectedBlocks: projection.projectedBlocks,
+    rejectedBlocks: projection.rejectedBlocks,
     hiddenLineCount,
   };
 }
