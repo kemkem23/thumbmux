@@ -1,7 +1,21 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.12-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.13-dist`.
+
+## v0.18.13 — 2026-09-02
+
+### Changed
+
+- **Adjacent completed Codex tools now share one `hidden tools` divider.**
+  Directly adjacent markers, or markers separated only by proven blank
+  whitespace/SGR paint, coalesce without changing the raw terminal buffer.
+  Submitted prompts, assistant text, live `Working`/`Thinking`/`Reading`
+  status, warnings, errors, approvals, retention boundaries, protected edits,
+  and unsafe terminal controls remain visible and split the run. Aggregate
+  identity follows surviving member occurrences across repaint, reflow,
+  append and rolling retention so the divider stays mounted instead of
+  flickering; fully replaced work receives a fresh identity.
 
 ## v0.18.12 — 2026-09-02
 

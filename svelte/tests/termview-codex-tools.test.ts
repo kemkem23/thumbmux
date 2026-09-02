@@ -269,7 +269,7 @@ function openSearch(viewport: HTMLElement, query: string): void {
 }
 
 describe('TermView Codex completed-tool projection', () => {
-  test('projects sealed Ran, Waited, and Edited ranges into compact hidden-tools rows', async () => {
+  test('merges adjacent sealed Ran and Waited ranges while an Edited header splits its body', async () => {
     const { viewport } = mountView('hide');
     const lines = [
       '',
@@ -289,11 +289,11 @@ describe('TermView Codex completed-tool projection', () => {
     await settleUi();
 
     const placeholders = viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder');
-    expect(placeholders).toHaveLength(3);
+    expect(placeholders).toHaveLength(2);
     expect(viewport.getAttribute('data-raw-total')).toBe(String(lines.length));
+    expect(viewport.getAttribute('data-total')).toBe('7');
     expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('3');
     expect(Array.from(placeholders, (row) => row.textContent)).toEqual([
-      'hidden tools',
       'hidden tools',
       'hidden tools',
     ]);
@@ -301,10 +301,32 @@ describe('TermView Codex completed-tool projection', () => {
       row.getAttribute('data-raw-start'),
       row.getAttribute('data-raw-end'),
     ])).toEqual([
-      ['1', '3'],
-      ['4', '6'],
+      ['1', '6'],
       ['8', '10'],
     ]);
+    expect(Array.from(placeholders, (row) => row.getAttribute('data-tool-block-count')))
+      .toEqual(['2', '1']);
+    expect(placeholders[0]?.hasAttribute('data-tool-kind')).toBe(false);
+    expect(placeholders[0]?.hasAttribute('data-tool-id')).toBe(false);
+    expect(placeholders[1]?.getAttribute('data-tool-kind')).toBe('edit');
+    expect(Array.from(placeholders, (row) => (
+      row.querySelector('.mtv-tool-divider')?.getAttribute('aria-label')
+    ))).toEqual([
+      'hidden tools, 2 blocks, 5 rows',
+      'hidden tools, 1 block, 2 rows',
+    ]);
+    expect(Array.from(placeholders, (row) => (
+      row.querySelector('.mtv-tool-divider')?.getAttribute('title')
+    ))).toEqual([
+      'hidden tools · 2 blocks · 5 rows',
+      'hidden tools · 1 block · 2 rows',
+    ]);
+    expect(viewport.querySelector('[data-raw-start="3"]')).toBeNull();
+    for (const rawStart of [0, 6, 10]) {
+      expect(viewport.querySelector<HTMLElement>(
+        `[data-raw-start="${rawStart}"]`,
+      )?.textContent?.replace(/\u00a0/g, ' ').trim()).toBe('');
+    }
     expect(viewport.querySelector<HTMLElement>('[data-raw-start="7"]')?.textContent)
       .toContain('Edited src/view.ts');
     const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
@@ -313,6 +335,60 @@ describe('TermView Codex completed-tool projection', () => {
       expect(placeholder.getAttribute('data-tool-provider')).toBe('codex');
       expect(placeholder.getAttribute('data-tool-key')).toMatch(/^tool-placeholder:codex:/);
     }
+  });
+
+  test('blank separators merge, while assistant prose, prompts, and live rows split groups', async () => {
+    const { viewport } = mountView('hide');
+    const lines = [
+      'before',
+      '',
+      runGroup,
+      '\x1b[0m \u00a0',
+      '',
+      runGroup,
+      '',
+      'assistant prose between tools',
+      '',
+      runGroup,
+      '',
+      '› latest submitted prompt must split groups',
+      '',
+      runGroup,
+      '',
+      '\x1b[2m◦ Working (12s · esc to interrupt)\x1b[0m',
+      '',
+      runGroup,
+      '',
+      'after',
+    ];
+    deliver(lines);
+    await settleUi();
+
+    const placeholders = Array.from(
+      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
+    );
+    expect(viewport.getAttribute('data-raw-total')).toBe('20');
+    expect(viewport.getAttribute('data-total')).toBe('17');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('5');
+    expect(placeholders).toHaveLength(4);
+    expect(placeholders.map((row) => [
+      row.getAttribute('data-raw-start'),
+      row.getAttribute('data-raw-end'),
+      row.getAttribute('data-tool-block-count'),
+    ])).toEqual([
+      ['2', '6', '2'],
+      ['9', '10', '1'],
+      ['13', '14', '1'],
+      ['17', '18', '1'],
+    ]);
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="7"]')?.textContent)
+      .toContain('assistant prose between tools');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="11"]')?.textContent)
+      .toContain('latest submitted prompt must split groups');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="15"]')?.textContent)
+      .toContain('Working (12s · esc to interrupt)');
+    expect(viewport.querySelector<HTMLElement>('[data-raw-start="19"]')?.textContent)
+      .toContain('after');
   });
 
   test('keeps Working, prompts, red failures, approvals, and errors raw', async () => {
@@ -408,52 +484,46 @@ describe('TermView Codex completed-tool projection', () => {
       .toBe(stableKey);
   });
 
-  test('keeps duplicate placeholder nodes in source order across row-id collisions', async () => {
+  test('keeps one adjacent-group node across row-id collisions, reflow, and append', async () => {
     const { viewport } = mountView('hide');
-    deliver(['', runGroup, '', runGroup, '']);
+    deliver(['', runGroup, '', runGroup, '', 'after']);
     await settleUi();
-    const before = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    );
-    expect(before).toHaveLength(2);
-    const keys = before.map((row) => row.getAttribute('data-tool-key'));
+    const before = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    if (!before) throw new Error('initial adjacent Codex group missing');
+    expect(viewport.querySelectorAll('.mtv-tool-placeholder')).toHaveLength(1);
+    expect(before.getAttribute('data-raw-start')).toBe('1');
+    expect(before.getAttribute('data-raw-end')).toBe('4');
+    expect(before.getAttribute('data-tool-block-count')).toBe('2');
+    const key = before.getAttribute('data-tool-key');
+    before.setAttribute('data-adjacent-group-node', 'stable');
 
-    // Both blocks move down two rows. The first provisional row id now equals
-    // the second block's previous id, but equal-cardinality source order must
-    // keep each keyed DOM node attached to its own occurrence.
-    deliver(['older half one', 'older half two', '', runGroup, '', runGroup, '']);
-    await settleUi();
-    const after = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    );
-    expect(after.map((row) => row.getAttribute('data-tool-key'))).toEqual(keys);
-    expect(after[0]?.isSameNode(before[0] ?? null)).toBe(true);
-    expect(after[1]?.isSameNode(before[1] ?? null)).toBe(true);
-
-    // A second identical detector frame must use the cached detector origin,
-    // not reinterpret the carried occurrence ids as a retention shift.
-    deliver(['older half one', 'older half two', '', runGroup, '', runGroup, '']);
-    await settleUi();
-    const stable = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    );
-    expect(stable[0]?.isSameNode(before[0] ?? null)).toBe(true);
-    expect(stable[1]?.isSameNode(before[1] ?? null)).toBe(true);
-
-    deliver([
+    // Both retained members move down two rows while a third adjacent member
+    // appears. The group grows and changes raw coordinates without replacing
+    // the keyed divider node.
+    const reflowedAndAppended = [
       'older half one', 'older half two', '',
-      runGroup, '', runGroup, '', runGroup, '',
-    ]);
+      runGroup, '', runGroup, '', runGroup, '', 'after',
+    ];
+    deliver(reflowedAndAppended);
     await settleUi();
-    const appended = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    );
-    expect(appended).toHaveLength(3);
-    expect(appended[0]?.isSameNode(before[0] ?? null)).toBe(true);
-    expect(appended[1]?.isSameNode(before[1] ?? null)).toBe(true);
+    const after = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.querySelectorAll('.mtv-tool-placeholder')).toHaveLength(1);
+    expect(after?.getAttribute('data-raw-start')).toBe('3');
+    expect(after?.getAttribute('data-raw-end')).toBe('8');
+    expect(after?.getAttribute('data-tool-block-count')).toBe('3');
+    expect(after?.getAttribute('data-tool-key')).toBe(key);
+    expect(after?.getAttribute('data-adjacent-group-node')).toBe('stable');
+    expect(after?.isSameNode(before)).toBe(true);
+
+    // An identical detector frame must not churn the carried group identity.
+    deliver(reflowedAndAppended);
+    await settleUi();
+    const stable = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(stable?.getAttribute('data-tool-key')).toBe(key);
+    expect(stable?.isSameNode(before)).toBe(true);
   });
 
-  test('reconciles overflow candidates before enforcing the 512-placeholder cap', async () => {
+  test('keeps one group stable while the 512-block cap has retained members', async () => {
     const { viewport } = mountView('hide', { height: 240 });
     const appendBlocks = (base: readonly string[], count: number): string[] => {
       const lines = [...base];
@@ -464,29 +534,41 @@ describe('TermView Codex completed-tool projection', () => {
     deliver(initial);
     await settleUi();
     expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('512');
-    const visibleBefore = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    );
-    const survivor = visibleBefore.at(-1);
-    if (!survivor) throw new Error('cap fixture did not render a visible survivor');
+    expect(viewport.querySelectorAll('.mtv-tool-placeholder')).toHaveLength(1);
+    const survivor = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    if (!survivor) throw new Error('cap fixture did not render its grouped placeholder');
+    expect(survivor.getAttribute('data-raw-start')).toBe('1');
+    expect(survivor.getAttribute('data-raw-end')).toBe('1024');
+    expect(survivor.getAttribute('data-tool-block-count')).toBe('512');
     const survivorKey = survivor.getAttribute('data-tool-key');
+    survivor.setAttribute('data-cap-group-node', 'old');
 
     const appendedOne = appendBlocks(initial, 1);
     deliver(appendedOne);
     await settleUi();
     expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('512');
-    const afterOne = Array.from(
-      viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'),
-    ).find((row) => row.getAttribute('data-tool-key') === survivorKey);
+    expect(viewport.querySelectorAll('.mtv-tool-placeholder')).toHaveLength(1);
+    const afterOne = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(afterOne?.getAttribute('data-raw-start')).toBe('3');
+    expect(afterOne?.getAttribute('data-raw-end')).toBe('1026');
+    expect(afterOne?.getAttribute('data-tool-block-count')).toBe('512');
+    expect(afterOne?.getAttribute('data-tool-key')).toBe(survivorKey);
+    expect(afterOne?.getAttribute('data-cap-group-node')).toBe('old');
     expect(afterOne?.isSameNode(survivor)).toBe(true);
 
     // With 512 further appends the final 512-window contains only new blocks;
-    // the old survivor should disappear rather than lend its key to new work.
+    // the old group must disappear rather than lend its key or node to new work.
     deliver(appendBlocks(appendedOne, 512));
     await settleUi();
     expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('512');
-    expect(Array.from(viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder'))
-      .some((row) => row.getAttribute('data-tool-key') === survivorKey)).toBe(false);
+    expect(viewport.querySelectorAll('.mtv-tool-placeholder')).toHaveLength(1);
+    const replacement = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(replacement?.getAttribute('data-raw-start')).toBe('1027');
+    expect(replacement?.getAttribute('data-raw-end')).toBe('2050');
+    expect(replacement?.getAttribute('data-tool-block-count')).toBe('512');
+    expect(replacement?.getAttribute('data-tool-key')).not.toBe(survivorKey);
+    expect(replacement?.isSameNode(survivor)).toBe(false);
+    expect(viewport.querySelector('[data-cap-group-node="old"]')).toBeNull();
   });
 
   test('maps raw search and cursor through a compact row while hidden ANSI still advances SGR', async () => {

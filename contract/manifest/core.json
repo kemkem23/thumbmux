@@ -678,6 +678,12 @@
     "tier": "X"
   },
   {
+    "name": "coalesceAdjacentToolProjection",
+    "kind": "value",
+    "signature": "bb04edd54d192b3392d574880500ce6bb059129bc90022f3cc72ae557580a336",
+    "tier": "X"
+  },
+  {
     "name": "collectTerminalUrlSegments",
     "kind": "value",
     "signature": "dc4266a8e047706a22e5c7fc95640fe348ba766ab65cdc9c4a20336d30ec58db",

@@ -86,13 +86,16 @@
     type ClaudeBashSummaries,
     type ClaudeBashSummaryRequest,
     detectCodexToolBlocks,
+    coalesceAdjacentToolProjection,
     projectToolLines,
     reconcileToolBlockIds,
     type ToolCollapseBlock,
-    type ToolProjectionRow,
   } from '@thumbmux/core';
 
   type CodexToolMode = 'off' | 'hide';
+  type CodexToolProjection = ReturnType<typeof coalesceAdjacentToolProjection>;
+  type CodexToolProjectionRow = CodexToolProjection['rows'][number];
+  type CodexToolPlaceholderGroup = NonNullable<CodexToolProjectionRow['placeholderGroup']>;
 
   /**
    * Both providers project directly from rawLines, then meet in this one
@@ -116,6 +119,7 @@
     toolProvider?: 'codex' | null;
     toolKind?: ToolCollapseBlock['kind'] | null;
     toolId?: string | null;
+    toolBlockCount?: number | null;
   }>;
 
   type ToolPresentationProjection = Readonly<{
@@ -364,6 +368,9 @@
   let toolPresentation: ToolPresentationProjection | null = null;
   /** Stable Codex occurrence ids survive physical reflow between projections. */
   let codexToolIdentityBaseline: readonly ToolCollapseBlock[] = [];
+  /** Stable aggregate ids keep an adjacent hidden-tools divider mounted while
+   * its member window grows, shifts, or loses an older occurrence. */
+  let codexToolGroupIdentityBaseline: readonly CodexToolPlaceholderGroup[] = [];
   // The projection and its sparse geometry are deliberately plain immutable
   // structures. Publish one small reactive revision after rebuilding them so
   // a same-height projection change updates the existing keyed DOM rows
@@ -1254,7 +1261,9 @@
   /** Detect each retained continuous corridor independently. A client/server
    * retention seam never becomes semantic adjacency, and an unknown leading
    * row cannot authorize a self-contained marker at that segment boundary. */
-  function detectCodexToolSegments(): ToolCollapseBlock[] {
+  function detectCodexToolSegments(
+    barrierLines: readonly number[] = claudeBashBarriers(),
+  ): ToolCollapseBlock[] {
     if (normalizedCodexToolMode() === 'off') return [];
     const screenMode = claudeBashScreenMode();
     if (screenMode !== 'normal') {
@@ -1262,7 +1271,7 @@
       return [];
     }
 
-    const barriers = [...claudeBashBarriers(), rawLines.length];
+    const barriers = [...barrierLines, rawLines.length];
     const unknownLeadingPrefix = claudeBashHasUnknownLeadingPrefix();
     const blocks: ToolCollapseBlock[] = [];
     let segmentStart = 0;
@@ -1317,9 +1326,10 @@
     const claudePlaceholderRanges = claudeProjection.rows
       .filter((row) => row.kind === 'bash-placeholder')
       .map((row) => row.rawRange);
+    const barrierLines = claudeBashBarriers();
     const codexBlocks = reconcileToolBlockIds(
       codexToolIdentityBaseline,
-      detectCodexToolSegments().filter((block) => (
+      detectCodexToolSegments(barrierLines).filter((block) => (
         !claudePlaceholderRanges.some((candidate) =>
           toolRangesOverlap(block.proofRange, candidate))
       )),
@@ -1331,14 +1341,24 @@
         codexBlocks: [],
       };
     }
-    const codexProjection = projectToolLines(rawLines, {
+    const individualCodexProjection = projectToolLines(rawLines, {
       blocks: codexBlocks,
       enabled: true,
       placeholder: () => 'hidden tools',
     });
-    lastCodexToolBlockCount = codexProjection.projectedBlocks.length;
-    if (codexProjection.projectedBlocks.length > 0) {
-      codexToolIdentityBaseline = codexProjection.projectedBlocks;
+    lastCodexToolBlockCount = individualCodexProjection.projectedBlocks.length;
+    if (individualCodexProjection.projectedBlocks.length > 0) {
+      codexToolIdentityBaseline = individualCodexProjection.projectedBlocks;
+    }
+    const codexProjection = coalesceAdjacentToolProjection(individualCodexProjection, {
+      barrierLines,
+      previousGroups: codexToolGroupIdentityBaseline,
+    });
+    const nextCodexGroups = codexProjection.rows.flatMap((row) => (
+      row.placeholderGroup ? [row.placeholderGroup] : []
+    ));
+    if (nextCodexGroups.length > 0) {
+      codexToolGroupIdentityBaseline = nextCodexGroups;
     }
 
     const claudePlaceholders = new Map<number, ClaudeBashGroupedProjectionRow>();
@@ -1347,7 +1367,7 @@
         claudePlaceholders.set(row.rawRange.startLine, row);
       }
     }
-    const codexPlaceholders = new Map<number, ToolProjectionRow>();
+    const codexPlaceholders = new Map<number, CodexToolProjectionRow>();
     for (const row of codexProjection.rows) {
       if (row.kind === 'tool-placeholder') {
         codexPlaceholders.set(row.rawRange.startLine, row);
@@ -1372,8 +1392,11 @@
             ...sourceRow,
             visualRow,
             toolProvider: 'codex',
-            toolKind: sourceRow.block?.kind ?? null,
-            toolId: sourceRow.block?.id ?? null,
+            // An aggregate may mix Ran, Waited, agent, and edit events. Do not
+            // mislabel the whole divider as whichever member happened to lead.
+            toolKind: sourceRow.blockCount > 1 ? null : sourceRow.block?.kind ?? null,
+            toolId: sourceRow.blockCount > 1 ? null : sourceRow.block?.id ?? null,
+            toolBlockCount: sourceRow.blockCount,
           }
         : {
             ...sourceRow,
@@ -1382,6 +1405,7 @@
             toolProvider: null,
             toolKind: null,
             toolId: null,
+            toolBlockCount: null,
           };
       rows.push(row);
       for (
@@ -7019,6 +7043,9 @@
           data-tool-id={codexTool ? projectionRow?.toolId ?? undefined : undefined}
           data-tool-key={codexTool ? projectionRow?.placeholderKey ?? undefined : undefined}
           data-tool-kind={codexTool ? projectionRow?.toolKind ?? undefined : undefined}
+          data-tool-block-count={codexTool
+            ? projectionRow?.toolBlockCount ?? undefined
+            : undefined}
           data-gap-rows={droppedRows > 0 ? droppedRows : undefined}
           title={droppedRows > 0 ? `${droppedRows} rows dropped before this row` : undefined}
           style:height={`${presentationHeight}px`}
@@ -7027,12 +7054,16 @@
               class={`mtv-tool-divider ${codexTool ? 'mtv-codex-divider' : 'mtv-bash-divider'} ${toolSearchKind ?? ''}`}
               role="note"
               aria-label={codexTool
-                ? `hidden tools, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
+                ? `hidden tools, ${projectionRow.toolBlockCount ?? 1} ${
+                    (projectionRow.toolBlockCount ?? 1) === 1 ? 'block' : 'blocks'
+                  }, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
                 : projectionRow.status === 'active'
                 ? `hidden bash, running, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
                 : `hidden bash, ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
               title={codexTool
-                ? `hidden tools · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
+                ? `hidden tools · ${projectionRow.toolBlockCount ?? 1} ${
+                    (projectionRow.toolBlockCount ?? 1) === 1 ? 'block' : 'blocks'
+                  } · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`
                 : projectionRow.status === 'active'
                 ? 'hidden bash · running'
                 : `hidden bash · ${projectionRow.rawEndExclusive - projectionRow.rawStart} rows`}
