@@ -1,0 +1,1236 @@
+// Multiplexed WebSocket client for tmux sessions (thumbmux)
+// Single WS connection → subscribe/unsubscribe per session.
+// Host-specific bits (WS endpoint, extra client-info fields such as a
+// telemetry client id) are injected via configureTmuxMux() — the wire format
+// itself is part of the thumbmux protocol.
+import { muxHistoryBoundaryTransition, splitMuxOutputData, validateMuxHistoryBoundary, } from '../core/index.js';
+const PING_INTERVAL = 25_000; // 25s — under most carrier NAT timeouts (30-60s)
+const PONG_TIMEOUT = 8_000; // 8s — if no pong, assume dead
+const CONNECT_TIMEOUT = 8_000; // 8s — max wait for initial connection
+const RECONNECT_MIN = 1_000; // 1s
+const RECONNECT_MAX = 15_000; // 15s
+const MAX_DEFER_MS = 250;
+const MAX_DEFERRED_FRAMES = 64;
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+const utf8 = new TextEncoder();
+const BYTES_OPEN = utf8.encode('[');
+const BYTES_CLOSE = utf8.encode(']');
+const BYTES_COMMA = utf8.encode(',');
+function isRetryableHistoryErrorFrame(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return false;
+    const frame = value;
+    return (typeof frame.channel === 'string' &&
+        frame.type === 'error' &&
+        frame.data === 'history_temporarily_unavailable' &&
+        frame.code === 'history_temporarily_unavailable' &&
+        frame.request === 'history_expand' &&
+        frame.retryable === true);
+}
+function fnvFeed(hash, bytes) {
+    for (let i = 0; i < bytes.length; i++) {
+        hash ^= bytes[i];
+        hash = Math.imul(hash, FNV_PRIME);
+    }
+    return hash;
+}
+function finalizeFnv(hash) {
+    return (hash >>> 0).toString(16).padStart(8, '0');
+}
+function defaultScheduleFrame(cb) {
+    let active = true;
+    if (typeof globalThis.requestAnimationFrame === 'function'
+        && typeof globalThis.cancelAnimationFrame === 'function') {
+        const frame = globalThis.requestAnimationFrame(() => {
+            if (!active)
+                return;
+            active = false;
+            cb();
+        });
+        return () => {
+            if (!active)
+                return;
+            active = false;
+            globalThis.cancelAnimationFrame(frame);
+        };
+    }
+    const timer = setTimeout(() => {
+        if (!active)
+            return;
+        active = false;
+        cb();
+    }, 16);
+    return () => {
+        if (!active)
+            return;
+        active = false;
+        clearTimeout(timer);
+    };
+}
+function isMuxCursor(value) {
+    if (value === null)
+        return true;
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const cursor = value;
+    // Keep lockstep with core protocol.ts isMuxCursor (A1-12: col is 0-based
+    // cells, never negative; row may be negative below the last content line).
+    // validateDeltaLocal claims to match validateMuxDeltaFrame accept/reject.
+    return (Number.isInteger(cursor.row)
+        && Number.isInteger(cursor.col)
+        && cursor.col >= 0);
+}
+const AUTH_ERROR_EVENT = 'thumbmux:auth-error';
+function isMuxAuthError(value) {
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const candidate = value;
+    return candidate.type === 'auth_error'
+        && (candidate.status === 401 || candidate.status === 403)
+        && typeof candidate.code === 'string';
+}
+export class TmuxMux {
+    opts = {};
+    ws = null;
+    subs = new Map();
+    /** per-callback tail preference; effective tail = undefined if ANY full subscriber */
+    subTails = new Map();
+    /** per-callback busy probe; absence means "never defer for this session" */
+    subDeferProbes = new Map();
+    sentTail = new Map();
+    /** Exact raw `data.split('\\n')` bases, scoped to the current socket and tail. */
+    outputBases = new Map();
+    /** Streaming FNV prefix-hash states bound to each base's array identity. */
+    prefixHashCaches = new Map();
+    /** Raw delta frames held while every subscriber reports busy. */
+    deferredDeltas = new Map();
+    /**
+     * Last known pane screen mode per channel. A delta (or full frame) that
+     * omits `screen` reuses this so unchanged repaints do not look like the pane
+     * left fullscreen. Cleared with the other per-channel caches.
+     */
+    lastScreen = new Map();
+    /** Last accepted monotonic durable seam for each channel/socket generation. */
+    lastBoundary = new Map();
+    /** A seen boundary field makes that channel fail closed against downgrade. */
+    boundaryRequired = new Set();
+    settleScheduled = false;
+    settleCancel = null;
+    /** A failed delta requests one full replacement; later deltas wait for it. */
+    resyncingSessions = new Set();
+    /** Session leases mapped to the socket that owns the tokenless reply. */
+    historyInflight = new Map();
+    /**
+     * A6-14: after the last subscriber leaves while a history request is still
+     * outstanding, late tokenless replies must not be handed to a later
+     * subscriber of the same session name. Cleared on the next requestHistory.
+     * Unsolicited history (no prior request / no fence) still delivers so
+     * flush-before-history ordering stays intact.
+     */
+    historyFenced = new Set();
+    reconnectTimer = null;
+    pingTimer = null;
+    pongTimer = null;
+    connectTimer = null;
+    sessionCallbacks = new Set();
+    pendingResizeBySession = new Map();
+    reconnectDelay = RECONNECT_MIN;
+    disposed = false;
+    visibilityBound = false;
+    visibilityDocument = null;
+    visibilityWindow = null;
+    visibilityHandler = null;
+    viewportBound = false;
+    viewportWindow = null;
+    boundVisualViewport = null;
+    viewportHandler = null;
+    clientInfoTimer = null;
+    connected = $state(false);
+    configure(opts) {
+        if (this.disposed)
+            return;
+        this.opts = { ...this.opts, ...opts };
+    }
+    getUrl() {
+        if (this.opts.getUrl)
+            return this.opts.getUrl();
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${proto}//${window.location.host}/ws/tmux`;
+    }
+    ensureConnection() {
+        if (this.disposed)
+            return;
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+        this.connect();
+    }
+    bindVisibility() {
+        if (this.disposed || this.visibilityBound || typeof document === 'undefined')
+            return;
+        this.visibilityBound = true;
+        const boundDocument = document;
+        const boundWindow = typeof window === 'undefined' ? null : window;
+        const handleVisible = () => {
+            if (this.disposed)
+                return;
+            this.sendClientInfo('visibility');
+            if (boundDocument.visibilityState === 'visible') {
+                // Coming back to foreground — reconnect immediately if dead
+                if (!this.ws || (this.ws.readyState !== WebSocket.OPEN
+                    && this.ws.readyState !== WebSocket.CONNECTING)) {
+                    this.cancelReconnect();
+                    this.reconnectDelay = RECONNECT_MIN;
+                    this.ensureConnection();
+                }
+                else if (this.ws.readyState === WebSocket.OPEN) {
+                    // Connection looks alive — verify with a ping
+                    this.sendPing();
+                    this.flushPendingResizes();
+                }
+            }
+        };
+        this.visibilityDocument = boundDocument;
+        this.visibilityWindow = boundWindow;
+        this.visibilityHandler = handleVisible;
+        boundDocument.addEventListener('visibilitychange', handleVisible);
+        boundWindow?.addEventListener('pageshow', handleVisible);
+    }
+    unbindVisibility() {
+        if (this.visibilityHandler) {
+            this.visibilityDocument?.removeEventListener('visibilitychange', this.visibilityHandler);
+            this.visibilityWindow?.removeEventListener('pageshow', this.visibilityHandler);
+        }
+        this.visibilityDocument = null;
+        this.visibilityWindow = null;
+        this.visibilityHandler = null;
+        this.visibilityBound = false;
+    }
+    bindViewport() {
+        if (this.disposed || this.viewportBound || typeof window === 'undefined')
+            return;
+        this.viewportBound = true;
+        const boundWindow = window;
+        const boundVisualViewport = boundWindow.visualViewport;
+        const schedule = () => {
+            if (this.disposed)
+                return;
+            if (this.clientInfoTimer)
+                clearTimeout(this.clientInfoTimer);
+            this.clientInfoTimer = setTimeout(() => {
+                this.clientInfoTimer = null;
+                if (this.disposed)
+                    return;
+                this.sendClientInfo('viewport');
+            }, 250);
+        };
+        this.viewportWindow = boundWindow;
+        this.boundVisualViewport = boundVisualViewport;
+        this.viewportHandler = schedule;
+        boundWindow.addEventListener('resize', schedule, { passive: true });
+        boundVisualViewport?.addEventListener('resize', schedule, { passive: true });
+        boundVisualViewport?.addEventListener('scroll', schedule, { passive: true });
+    }
+    unbindViewport() {
+        if (this.viewportHandler) {
+            this.viewportWindow?.removeEventListener('resize', this.viewportHandler);
+            this.boundVisualViewport?.removeEventListener('resize', this.viewportHandler);
+            this.boundVisualViewport?.removeEventListener('scroll', this.viewportHandler);
+        }
+        this.viewportWindow = null;
+        this.boundVisualViewport = null;
+        this.viewportHandler = null;
+        this.viewportBound = false;
+    }
+    clientInfo() {
+        if (typeof window === 'undefined')
+            return {};
+        const vv = window.visualViewport;
+        const base = {
+            href: window.location.href,
+            pathname: window.location.pathname,
+            userAgent: navigator.userAgent,
+            language: navigator.language,
+            platform: navigator.platform,
+            visibilityState: typeof document !== 'undefined' ? document.visibilityState : undefined,
+            viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                visualWidth: vv?.width,
+                visualHeight: vv?.height,
+                screenWidth: window.screen?.width,
+                screenHeight: window.screen?.height,
+                devicePixelRatio: window.devicePixelRatio,
+            },
+        };
+        // A6-3: getClientMeta throw or non-JSON-safe values must not abort onopen
+        // (which would leave an OPEN socket with no pane resubscribe) and must not
+        // make JSON.stringify fail inside send() (which drops subscribe frames).
+        let meta = {};
+        try {
+            const raw = this.opts.getClientMeta?.();
+            if (raw && typeof raw === 'object') {
+                try {
+                    meta = JSON.parse(JSON.stringify(raw));
+                }
+                catch {
+                    meta = {};
+                }
+            }
+        }
+        catch {
+            meta = {};
+        }
+        return { ...base, ...meta };
+    }
+    sendClientInfo(_reason = 'client_info') {
+        if (this.disposed)
+            return;
+        this.send(this.ws, { type: 'client_info', client: this.clientInfo() });
+    }
+    /**
+     * Send only through the currently-owned open socket. Capturing `socket`
+     * before checking it prevents a callback from an older connection from
+     * accidentally sending through a newer socket stored in `this.ws`.
+     */
+    send(socket, message) {
+        if (this.disposed || !socket || this.ws !== socket || socket.readyState !== WebSocket.OPEN)
+            return false;
+        try {
+            socket.send(JSON.stringify(message));
+            return true;
+        }
+        catch {
+            // readyState can change between the guard and send (for example while
+            // a page is being frozen). The close/error path owns reconnection.
+            return false;
+        }
+    }
+    pageVisible() {
+        return typeof document === 'undefined' || document.visibilityState !== 'hidden';
+    }
+    effectiveTail(session) {
+        const tails = this.subTails.get(session);
+        if (!tails || tails.size === 0)
+            return undefined;
+        let max = 0;
+        for (const t of tails.values()) {
+            if (t === undefined)
+                return undefined; // a full viewer wins
+            if (t > max)
+                max = t;
+        }
+        return max;
+    }
+    sendSubscribe(session) {
+        const tail = this.effectiveTail(session);
+        // A subscribe can be an initial subscription, reconnect, or tail change.
+        // Each asks the server for a new full base before a delta is acceptable.
+        this.invalidateOutputBase(session);
+        if (this.send(this.ws, {
+            type: 'subscribe',
+            session,
+            tail,
+            delta: true,
+            client: this.clientInfo(),
+        })) {
+            this.sentTail.set(session, tail);
+        }
+    }
+    discardDeferred(session) {
+        this.deferredDeltas.delete(session);
+    }
+    discardPrefixHashCache(session) {
+        this.prefixHashCaches.delete(session);
+    }
+    discardLastScreen(session) {
+        this.lastScreen.delete(session);
+    }
+    /**
+     * When a full/delta frame carries `screen`, remember it for this channel.
+     * Malformed values are ignored so a bad sample cannot poison the sticky
+     * last-known mode.
+     */
+    rememberScreen(session, frame) {
+        if (typeof frame !== 'object' || frame === null)
+            return;
+        if (!Object.prototype.hasOwnProperty.call(frame, 'screen'))
+            return;
+        const screen = frame.screen;
+        if (screen === null) {
+            this.lastScreen.set(session, null);
+            return;
+        }
+        if (typeof screen === 'object'
+            && screen !== null
+            && typeof screen.alt === 'boolean'
+            && typeof screen.mouseSgr === 'boolean'
+            && typeof screen.mouseAny === 'boolean') {
+            this.lastScreen.set(session, screen);
+        }
+    }
+    /**
+     * Validate an output boundary without mutating sticky state. Once a channel
+     * advertises a durable seam, omission is invalid too: silently reusing the
+     * old seam beside newer content is exactly the gap this protocol prevents.
+     */
+    boundaryFromFrame(session, frame, allowReset) {
+        if (typeof frame !== 'object' || frame === null)
+            return null;
+        const candidate = frame;
+        const present = Object.prototype.hasOwnProperty.call(candidate, 'boundary');
+        const previous = this.lastBoundary.get(session);
+        if (!present) {
+            return previous === undefined && !this.boundaryRequired.has(session) ? undefined : null;
+        }
+        this.boundaryRequired.add(session);
+        const boundary = validateMuxHistoryBoundary(candidate.boundary);
+        if (!boundary)
+            return null;
+        if (previous !== undefined) {
+            const transition = muxHistoryBoundaryTransition(previous, boundary);
+            if (transition === 'regression')
+                return null;
+            if (transition === 'generation-mismatch' && !allowReset)
+                return null;
+        }
+        return boundary;
+    }
+    rememberBoundary(session, boundary) {
+        if (boundary !== undefined)
+            this.lastBoundary.set(session, boundary);
+    }
+    /** Build delivery meta, attaching last-known screen when one exists. */
+    deliveryMeta(source, replace, session) {
+        const meta = { source, replace };
+        if (this.lastScreen.has(session)) {
+            meta.screen = this.lastScreen.get(session);
+        }
+        if (this.lastBoundary.has(session)) {
+            meta.boundary = { ...this.lastBoundary.get(session) };
+        }
+        return meta;
+    }
+    invalidateOutputBase(session) {
+        this.outputBases.delete(session);
+        this.resyncingSessions.delete(session);
+        this.discardPrefixHashCache(session);
+        this.discardDeferred(session);
+        this.discardLastScreen(session);
+        this.lastBoundary.delete(session);
+        this.boundaryRequired.delete(session);
+    }
+    invalidateAllOutputBases() {
+        this.outputBases.clear();
+        this.resyncingSessions.clear();
+        this.sentTail.clear();
+        this.prefixHashCaches.clear();
+        this.deferredDeltas.clear();
+        this.lastScreen.clear();
+        this.lastBoundary.clear();
+        this.boundaryRequired.clear();
+    }
+    requestResync(session) {
+        if (this.resyncingSessions.has(session))
+            return;
+        this.outputBases.delete(session);
+        this.discardPrefixHashCache(session);
+        this.discardDeferred(session);
+        this.discardLastScreen(session);
+        this.resyncingSessions.add(session);
+        this.send(this.ws, { type: 'resync', session });
+    }
+    /**
+     * Incremental muxPrefixHash(base.slice(0, prefix)), byte-identical to
+     * core's fnv1a32(JSON.stringify(...)). States are bound to the base's
+     * array identity — a mismatched reference rebuilds from scratch.
+     */
+    prefixHash(session, base, prefix) {
+        let cache = this.prefixHashCaches.get(session);
+        if (!cache || cache.base !== base) {
+            cache = { base, states: [] };
+            this.prefixHashCaches.set(session, cache);
+        }
+        if (cache.states.length === 0) {
+            cache.states[0] = fnvFeed(FNV_OFFSET, BYTES_OPEN);
+        }
+        while (cache.states.length <= prefix) {
+            const k = cache.states.length;
+            let h = cache.states[k - 1];
+            if (k > 1)
+                h = fnvFeed(h, BYTES_COMMA);
+            h = fnvFeed(h, utf8.encode(JSON.stringify(base[k - 1])));
+            cache.states[k] = h;
+        }
+        return finalizeFnv(fnvFeed(cache.states[prefix], BYTES_CLOSE));
+    }
+    /**
+     * Structural checks matching core validateMuxDeltaFrame accept/reject
+     * outcomes exactly, but hashing via the incremental cache so a one-line
+     * delta is O(changed lines) rather than O(whole base).
+     */
+    validateDeltaLocal(session, frame, base) {
+        if (typeof frame !== 'object' || frame === null)
+            return null;
+        const candidate = frame;
+        if (typeof candidate.channel !== 'string')
+            return null;
+        if (candidate.type !== 'delta')
+            return null;
+        const baseLength = candidate.baseLength;
+        const prefix = candidate.prefix;
+        // Range checks BEFORE hashing so a bogus prefix never indexes out of range
+        // or triggers a huge hash.
+        if (!Number.isInteger(baseLength) || baseLength !== base.length)
+            return null;
+        if (!Number.isInteger(prefix) || prefix < 0 || prefix > base.length) {
+            return null;
+        }
+        const p = prefix;
+        if (typeof candidate.prefixHash !== 'string')
+            return null;
+        if (candidate.prefixHash !== this.prefixHash(session, base, p))
+            return null;
+        if (!Array.isArray(candidate.lines) || !candidate.lines.every((line) => typeof line === 'string')) {
+            return null;
+        }
+        const cursorPresent = Object.prototype.hasOwnProperty.call(candidate, 'cursor');
+        if (cursorPresent && !isMuxCursor(candidate.cursor))
+            return null;
+        const boundary = this.boundaryFromFrame(session, frame, false);
+        if (boundary === null)
+            return null;
+        return {
+            prefix: p,
+            lines: candidate.lines,
+            cursor: cursorPresent ? candidate.cursor : undefined,
+            cursorPresent,
+            boundary,
+        };
+    }
+    /**
+     * Apply a validated delta: reconstruct next base, carry hash states
+     * [0..prefix], return delivery fields. Null on reject (no side effects
+     * other than possibly warming the hash cache up to a valid range check).
+     */
+    applyValidatedDelta(session, frame, base) {
+        const delta = this.validateDeltaLocal(session, frame, base);
+        if (!delta)
+            return null;
+        const next = base.slice(0, delta.prefix).concat(delta.lines);
+        const cache = this.prefixHashCaches.get(session);
+        if (cache && cache.base === base) {
+            this.prefixHashCaches.set(session, {
+                base: next,
+                states: cache.states.slice(0, delta.prefix + 1),
+            });
+        }
+        else {
+            this.prefixHashCaches.delete(session);
+        }
+        return {
+            next,
+            cursor: delta.cursor,
+            cursorPresent: delta.cursorPresent,
+            boundary: delta.boundary,
+        };
+    }
+    deliverDelta(session, next, cursor, cbs) {
+        const data = next.join('\n');
+        this.outputBases.set(session, next);
+        const meta = this.deliveryMeta('delta', false, session);
+        for (const cb of cbs) {
+            cb(data, 'output', cursor, meta);
+        }
+    }
+    sessionShouldDefer(session) {
+        const cbs = this.subs.get(session);
+        if (!cbs || cbs.size === 0)
+            return false;
+        const probes = this.subDeferProbes.get(session);
+        if (!probes)
+            return false;
+        for (const cb of cbs) {
+            const probe = probes.get(cb);
+            if (!probe)
+                return false;
+            try {
+                if (!probe())
+                    return false;
+            }
+            catch {
+                return false;
+            }
+        }
+        return true;
+    }
+    scheduleSettle() {
+        if (this.disposed)
+            return;
+        if (this.settleScheduled)
+            return;
+        if (this.deferredDeltas.size === 0)
+            return;
+        this.settleScheduled = true;
+        const settle = () => {
+            this.settleCancel = null;
+            this.settleScheduled = false;
+            if (this.disposed)
+                return;
+            this.settleDeferred();
+        };
+        if (this.opts.scheduleFrame) {
+            // An injected scheduler owns its own queue; the callback's disposed
+            // guard makes already-queued work inert.
+            this.opts.scheduleFrame(settle);
+        }
+        else {
+            this.settleCancel = defaultScheduleFrame(settle);
+        }
+    }
+    settleDeferred() {
+        if (this.disposed)
+            return;
+        let needReschedule = false;
+        // Snapshot keys — flush mutates the map.
+        for (const session of [...this.deferredDeltas.keys()]) {
+            const queue = this.deferredDeltas.get(session);
+            if (!queue)
+                continue;
+            const age = Date.now() - queue.firstAt;
+            if (!this.sessionShouldDefer(session)
+                || age >= MAX_DEFER_MS
+                || queue.frames.length >= MAX_DEFERRED_FRAMES) {
+                this.flushDeferred(session);
+            }
+            else {
+                needReschedule = true;
+            }
+        }
+        if (needReschedule)
+            this.scheduleSettle();
+    }
+    enqueueDeferredDelta(session, frame) {
+        let queue = this.deferredDeltas.get(session);
+        if (!queue) {
+            queue = { frames: [], firstAt: Date.now() };
+            this.deferredDeltas.set(session, queue);
+        }
+        queue.frames.push(frame);
+        if (queue.frames.length >= MAX_DEFERRED_FRAMES) {
+            this.flushDeferred(session);
+            return;
+        }
+        this.scheduleSettle();
+    }
+    /**
+     * Apply queued raw deltas in order against successive bases, then deliver
+     * ONE coalesced callback with the final content. A rejected frame delivers
+     * any content already applied, drops the rest, and requests one resync.
+     */
+    flushDeferred(session) {
+        const queue = this.deferredDeltas.get(session);
+        this.deferredDeltas.delete(session);
+        if (!queue || queue.frames.length === 0)
+            return;
+        const cbs = this.subs.get(session);
+        if (!cbs || cbs.size === 0)
+            return;
+        let base = this.outputBases.get(session);
+        if (!base || this.resyncingSessions.has(session)) {
+            this.requestResync(session);
+            return;
+        }
+        let lastCursor;
+        let cursorPresent = false;
+        let applied = false;
+        for (const frame of queue.frames) {
+            const result = this.applyValidatedDelta(session, frame, base);
+            if (!result) {
+                if (applied) {
+                    this.deliverDelta(session, base, cursorPresent ? lastCursor : undefined, cbs);
+                }
+                this.requestResync(session);
+                return;
+            }
+            this.rememberBoundary(session, result.boundary);
+            this.rememberScreen(session, frame);
+            base = result.next;
+            applied = true;
+            if (result.cursorPresent) {
+                lastCursor = result.cursor;
+                cursorPresent = true;
+            }
+        }
+        if (applied) {
+            this.deliverDelta(session, base, cursorPresent ? lastCursor : undefined, cbs);
+        }
+    }
+    /** Re-subscribe when the tail composition changes (e.g. a full viewer
+     * joins a session a thumbnail was already tailing). */
+    refreshSubscription(session) {
+        if (!this.subs.has(session))
+            return;
+        if (this.ws?.readyState !== WebSocket.OPEN)
+            return;
+        if (this.sentTail.get(session) !== this.effectiveTail(session)) {
+            this.sendSubscribe(session);
+        }
+    }
+    sendResizeNow(session, geometry) {
+        if (!this.pageVisible())
+            return;
+        this.send(this.ws, {
+            type: 'resize',
+            session,
+            cols: geometry.cols,
+            rows: geometry.rows,
+            client: this.clientInfo(),
+        });
+    }
+    flushResize(session) {
+        if (!this.subs.has(session))
+            return;
+        const geometry = this.pendingResizeBySession.get(session);
+        if (!geometry)
+            return;
+        this.sendResizeNow(session, geometry);
+    }
+    flushPendingResizes() {
+        if (!this.pageVisible())
+            return;
+        for (const session of this.subs.keys()) {
+            this.flushResize(session);
+        }
+    }
+    connect() {
+        if (this.disposed || typeof window === 'undefined')
+            return;
+        this.bindVisibility();
+        this.bindViewport();
+        // Visibility/pageshow and reconnect timers can converge on the same tick.
+        // Never replace a healthy or in-flight connection with another one.
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+        // A CLOSED/CLOSING socket may not have delivered its close callback (page
+        // freeze and mobile network transitions are common examples). Detach it
+        // before installing the replacement so late callbacks are harmless.
+        if (this.ws) {
+            this.releaseSocket(this.ws, true);
+        }
+        else {
+            this.clearConnectionTimers();
+        }
+        this.connected = false;
+        this.cancelReconnect();
+        const url = this.getUrl();
+        // getUrl is host-controlled and may dispose this mux reentrantly.
+        if (this.disposed)
+            return;
+        const socket = new WebSocket(url);
+        // Native WebSocket construction is synchronous and non-reentrant, but a
+        // host polyfill may dispose the mux from its constructor.
+        if (this.disposed) {
+            this.closeSocket(socket);
+            return;
+        }
+        this.ws = socket;
+        // Connection timeout — if not open in 8s, kill and retry
+        const connectTimer = setTimeout(() => {
+            if (this.ws !== socket || this.connectTimer !== connectTimer)
+                return;
+            this.connectTimer = null;
+            if (socket.readyState === WebSocket.CONNECTING) {
+                this.closeSocket(socket);
+            }
+        }, CONNECT_TIMEOUT);
+        this.connectTimer = connectTimer;
+        socket.onopen = () => {
+            if (this.ws !== socket) {
+                this.releaseSocket(socket, true);
+                return;
+            }
+            if (this.connectTimer === connectTimer) {
+                clearTimeout(this.connectTimer);
+                this.connectTimer = null;
+            }
+            this.connected = true;
+            this.reconnectDelay = RECONNECT_MIN; // reset backoff on success
+            this.cancelReconnect();
+            this.startPing(socket);
+            this.sendClientInfo('open');
+            // Re-subscribe all active sessions
+            for (const session of this.subs.keys()) {
+                this.sendSubscribe(session);
+            }
+            // Re-arm the session-list push across reconnects too.
+            if (this.sessionCallbacks.size > 0) {
+                this.send(socket, { type: 'sessions_subscribe' });
+            }
+            this.flushPendingResizes();
+        };
+        socket.onmessage = (event) => {
+            if (this.ws !== socket)
+                return;
+            try {
+                const msg = JSON.parse(event.data);
+                // Handle pong from server
+                if (msg.type === 'pong') {
+                    if (this.pongTimer) {
+                        clearTimeout(this.pongTimer);
+                        this.pongTimer = null;
+                    }
+                    return;
+                }
+                if (isMuxAuthError(msg)) {
+                    // Guard denials are connection-scoped and deliberately have no
+                    // channel. Surface them before channel routing so browser hosts can
+                    // observe the denial instead of receiving silence.
+                    if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+                        window.dispatchEvent(new CustomEvent(AUTH_ERROR_EVENT, { detail: msg }));
+                    }
+                    return;
+                }
+                if (msg.channel === '__sessions' && msg.type === 'sessions') {
+                    const sessions = JSON.parse(msg.data);
+                    for (const cb of this.sessionCallbacks) {
+                        cb(sessions);
+                    }
+                    return;
+                }
+                // History replies have no request token or direction marker. Release
+                // the per-session wire gate before subscriber callbacks so a callback
+                // can request the next page synchronously. Do this before the no-subs
+                // return too: a reply racing an unsubscribe still settles the request.
+                // A6-14: if the last subscriber left while a request was outstanding,
+                // historyFenced drops late replies so they cannot land on a later
+                // subscriber. Unsolicited history (no fence) still delivers — the
+                // deferred-queue flush-before-history contract depends on that.
+                const retryableHistoryError = isRetryableHistoryErrorFrame(msg);
+                if ((msg.type === 'history' || retryableHistoryError) && typeof msg.channel === 'string') {
+                    const wasInflight = this.historyInflight.get(msg.channel) === socket;
+                    if (wasInflight)
+                        this.historyInflight.delete(msg.channel);
+                    if (!wasInflight && this.historyFenced.has(msg.channel)) {
+                        return;
+                    }
+                    // A matched inflight reply consumes any fence for this generation.
+                    if (wasInflight)
+                        this.historyFenced.delete(msg.channel);
+                }
+                const cbs = typeof msg.channel === 'string' ? this.subs.get(msg.channel) : undefined;
+                if (!cbs)
+                    return;
+                if (msg.type === 'output') {
+                    // A full frame establishes its raw base exactly; in particular, a
+                    // trailing empty line and CR bytes remain part of future hashes.
+                    // Guard first: a non-string data field is a complete no-op for the
+                    // session (do not drop a still-valid deferred queue or hash cache).
+                    if (typeof msg.data !== 'string')
+                        return;
+                    const boundary = this.boundaryFromFrame(msg.channel, msg, msg.reset === 'resync');
+                    if (boundary === null) {
+                        this.requestResync(msg.channel);
+                        return;
+                    }
+                    // A full frame supersedes any deferred deltas for this session —
+                    // discard without delivering them, then install the new base.
+                    this.discardDeferred(msg.channel);
+                    this.discardPrefixHashCache(msg.channel);
+                    this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
+                    this.resyncingSessions.delete(msg.channel);
+                    this.rememberBoundary(msg.channel, boundary);
+                    this.rememberScreen(msg.channel, msg);
+                    const meta = this.deliveryMeta('full', msg.reset === 'resize' || msg.reset === 'resync', msg.channel);
+                    for (const cb of cbs)
+                        cb(msg.data, 'output', msg.cursor, meta);
+                    return;
+                }
+                if (msg.type === 'delta') {
+                    // Do not let an invalid, missing, or stale base leak either content
+                    // or cursor to subscribers. The server answers one coalesced resync
+                    // with a full output frame, which re-enables deltas above.
+                    const base = this.outputBases.get(msg.channel);
+                    if (!base || this.resyncingSessions.has(msg.channel)) {
+                        this.requestResync(msg.channel);
+                        return;
+                    }
+                    // Busy-deferral: queue raw frames, no validation/hash/join/callback.
+                    // Screen is remembered at flush time (with each applied frame) so a
+                    // deferred delta still updates sticky mode before delivery.
+                    if (this.sessionShouldDefer(msg.channel)) {
+                        this.enqueueDeferredDelta(msg.channel, msg);
+                        return;
+                    }
+                    // A queue survives a busy-probe flip: the fast path would apply this frame
+                    // against the un-advanced base and leave older frames to replay later
+                    // against a newer base (silent revert). Enqueue-then-flush keeps every
+                    // frame applied against its own successive base, in arrival order.
+                    if (this.deferredDeltas.has(msg.channel)) {
+                        this.enqueueDeferredDelta(msg.channel, msg);
+                        this.flushDeferred(msg.channel);
+                        return;
+                    }
+                    const applied = this.applyValidatedDelta(msg.channel, msg, base);
+                    if (!applied) {
+                        this.requestResync(msg.channel);
+                        return;
+                    }
+                    this.rememberBoundary(msg.channel, applied.boundary);
+                    this.rememberScreen(msg.channel, msg);
+                    this.deliverDelta(msg.channel, applied.next, applied.cursorPresent ? applied.cursor : undefined, cbs);
+                    return;
+                }
+                if (msg.type === 'history' ||
+                    retryableHistoryError ||
+                    msg.type === 'error' ||
+                    msg.type === 'cursor') {
+                    // Flush deferred content first so caret/history never lands ahead
+                    // of the pane state it belongs to.
+                    if (this.deferredDeltas.has(msg.channel)) {
+                        this.flushDeferred(msg.channel);
+                    }
+                    // Re-fetch cbs after flush (subscribers may have changed — unlikely
+                    // mid-handler, but the set reference is stable for this path).
+                    for (const cb of cbs) {
+                        // "cursor" frames carry no data — callbacks that render output
+                        // must check `type` before treating data as pane content.
+                        cb(msg.data ?? '', msg.type, msg.cursor, retryableHistoryError
+                            ? {
+                                source: 'full',
+                                replace: false,
+                                historyError: {
+                                    code: 'history_temporarily_unavailable',
+                                    retryable: true,
+                                },
+                            }
+                            : undefined);
+                    }
+                }
+            }
+            catch { }
+        };
+        socket.onclose = () => {
+            if (this.ws !== socket)
+                return;
+            this.connected = false;
+            this.releaseSocket(socket);
+            this.scheduleReconnect();
+        };
+        socket.onerror = () => {
+            if (this.ws !== socket)
+                return;
+            this.connected = false;
+            this.closeSocket(socket);
+        };
+    }
+    clearConnectionTimers() {
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+        if (this.pongTimer) {
+            clearTimeout(this.pongTimer);
+            this.pongTimer = null;
+        }
+        if (this.connectTimer) {
+            clearTimeout(this.connectTimer);
+            this.connectTimer = null;
+        }
+    }
+    closeSocket(socket) {
+        if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)
+            return;
+        try {
+            socket.close();
+        }
+        catch {
+            // Closing is best-effort; a late close callback is identity-guarded.
+        }
+    }
+    releaseSocket(socket, close = false) {
+        const isCurrent = this.ws === socket;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        if (isCurrent) {
+            this.clearConnectionTimers();
+            this.ws = null;
+            this.invalidateAllOutputBases();
+        }
+        if (close)
+            this.closeSocket(socket);
+    }
+    startPing(socket) {
+        if (this.disposed || this.ws !== socket)
+            return;
+        if (this.pingTimer)
+            clearInterval(this.pingTimer);
+        this.pingTimer = setInterval(() => this.sendPing(socket), PING_INTERVAL);
+    }
+    sendPing(socket = this.ws) {
+        if (!socket || !this.send(socket, { type: 'ping', client: this.clientInfo() }))
+            return;
+        // Expect pong within timeout
+        if (this.pongTimer)
+            clearTimeout(this.pongTimer);
+        const pongTimer = setTimeout(() => {
+            if (this.ws !== socket || this.pongTimer !== pongTimer)
+                return;
+            this.pongTimer = null;
+            // No pong received — connection is dead
+            this.closeSocket(socket);
+        }, PONG_TIMEOUT);
+        this.pongTimer = pongTimer;
+    }
+    cancelReconnect() {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+    }
+    scheduleReconnect() {
+        if (this.disposed)
+            return;
+        if (this.reconnectTimer)
+            return;
+        if (this.subs.size === 0 && this.sessionCallbacks.size === 0)
+            return;
+        const delay = this.reconnectDelay;
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX);
+        const reconnectTimer = setTimeout(() => {
+            if (this.reconnectTimer !== reconnectTimer)
+                return;
+            this.reconnectTimer = null;
+            if (this.subs.size > 0 || this.sessionCallbacks.size > 0) {
+                this.ensureConnection();
+            }
+        }, delay);
+        this.reconnectTimer = reconnectTimer;
+    }
+    /**
+     * Permanently release every resource owned by this mux. Disposal is
+     * idempotent; a disposed instance deliberately cannot reconnect or accept
+     * new subscriptions.
+     */
+    dispose() {
+        if (this.disposed)
+            return;
+        this.disposed = true;
+        this.unbindVisibility();
+        this.unbindViewport();
+        this.cancelReconnect();
+        if (this.clientInfoTimer) {
+            clearTimeout(this.clientInfoTimer);
+            this.clientInfoTimer = null;
+        }
+        if (this.settleCancel) {
+            try {
+                this.settleCancel();
+            }
+            catch {
+                // Browser frame/timer cancellation is best-effort.
+            }
+            this.settleCancel = null;
+        }
+        this.settleScheduled = false;
+        const socket = this.ws;
+        if (socket) {
+            this.releaseSocket(socket, true);
+        }
+        else {
+            this.clearConnectionTimers();
+            this.invalidateAllOutputBases();
+        }
+        this.connected = false;
+        for (const callbacks of this.subs.values())
+            callbacks.clear();
+        this.subs.clear();
+        this.subTails.clear();
+        this.subDeferProbes.clear();
+        this.sessionCallbacks.clear();
+        this.pendingResizeBySession.clear();
+        this.deferredDeltas.clear();
+        this.historyInflight.clear();
+        this.historyFenced.clear();
+        this.opts = {};
+    }
+    /** Subscribe to a tmux session's output. Returns unsubscribe function. */
+    subscribe(session, callback, opts = {}) {
+        if (this.disposed)
+            return () => { };
+        let set = this.subs.get(session);
+        const isNew = !set;
+        if (!set) {
+            set = new Set();
+            this.subs.set(session, set);
+        }
+        set.add(callback);
+        let tails = this.subTails.get(session);
+        if (!tails) {
+            tails = new Map();
+            this.subTails.set(session, tails);
+        }
+        tails.set(callback, opts.tail && opts.tail > 0 ? Math.floor(opts.tail) : undefined);
+        let probes = this.subDeferProbes.get(session);
+        if (!probes) {
+            probes = new Map();
+            this.subDeferProbes.set(session, probes);
+        }
+        probes.set(callback, opts.deferWhileBusy);
+        if (isNew) {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+                this.sendClientInfo('subscribe');
+                this.sendSubscribe(session);
+                this.flushResize(session);
+            }
+        }
+        else {
+            this.refreshSubscription(session);
+        }
+        this.ensureConnection();
+        let active = true;
+        return () => {
+            if (!active)
+                return;
+            active = false;
+            if (this.subs.get(session) !== set)
+                return;
+            set.delete(callback);
+            this.subTails.get(session)?.delete(callback);
+            this.subDeferProbes.get(session)?.delete(callback);
+            if (set.size === 0) {
+                this.subs.delete(session);
+                this.subTails.delete(session);
+                this.subDeferProbes.delete(session);
+                this.sentTail.delete(session);
+                this.invalidateOutputBase(session);
+                this.pendingResizeBySession.delete(session);
+                // A6-14: if a history request is still outstanding, fence late replies
+                // so they cannot deliver into a later subscriber of this session name.
+                if (this.historyInflight.has(session)) {
+                    this.historyFenced.add(session);
+                }
+                this.historyInflight.delete(session);
+                this.send(this.ws, { type: 'unsubscribe', session });
+            }
+            else {
+                this.refreshSubscription(session);
+            }
+        };
+    }
+    /** Subscribe to session list changes (pushed by server every 5s).
+     * Sends `sessions_subscribe` itself — hosts do NOT need to auto-subscribe
+     * sockets server-side (v0.3.1 fix: previously only hosts that subscribed
+     * every socket on open ever delivered `__sessions` pushes). */
+    onSessions(callback) {
+        if (this.disposed)
+            return () => { };
+        const first = this.sessionCallbacks.size === 0;
+        this.sessionCallbacks.add(callback);
+        this.ensureConnection();
+        if (first && this.ws?.readyState === WebSocket.OPEN) {
+            this.send(this.ws, { type: 'sessions_subscribe' });
+        }
+        let active = true;
+        return () => {
+            if (!active)
+                return;
+            active = false;
+            if (!this.sessionCallbacks.delete(callback))
+                return;
+            if (this.sessionCallbacks.size === 0 && this.ws?.readyState === WebSocket.OPEN) {
+                this.send(this.ws, { type: 'sessions_unsubscribe' });
+            }
+        };
+    }
+    /** Send keys to a session. */
+    sendKeys(session, data) {
+        if (this.disposed)
+            return;
+        // No client blob here: a keystroke frame is hot-path (~60B vs ~520B) —
+        // the server already knows this socket from subscribe/client_info.
+        this.send(this.ws, { type: 'keys', session, data });
+    }
+    /** Sync terminal size to tmux pane. */
+    sendResize(session, cols, rows) {
+        if (this.disposed)
+            return;
+        this.pendingResizeBySession.set(session, { cols, rows });
+        this.ensureConnection();
+        this.sendResizeNow(session, { cols, rows });
+    }
+    sendHistoryRequest(session, cursor, limit) {
+        if (this.disposed || this.historyInflight.has(session))
+            return false;
+        const socket = this.ws;
+        if (!socket)
+            return false;
+        // Mark before send so even a synchronous WebSocket test double cannot
+        // deliver the reply before the gate exists. Roll back a dropped/failed
+        // send; only frames actually written to this socket count as in-flight.
+        // A new request also lifts an A6-14 fence from a prior generation.
+        this.historyFenced.delete(session);
+        this.historyInflight.set(session, socket);
+        if (!this.send(socket, {
+            type: 'history_expand',
+            session,
+            ...cursor,
+            ...(limit === undefined ? {} : { limit }),
+        })) {
+            if (this.historyInflight.get(session) === socket) {
+                this.historyInflight.delete(session);
+            }
+            return false;
+        }
+        return true;
+    }
+    /** Expand capture history when the viewer scrolls to the top. */
+    requestHistory(session, beforeLine, limit = 500) {
+        return this.sendHistoryRequest(session, { beforeLine: beforeLine ?? null }, limit);
+    }
+    /** Page archived capture history forward from an exclusive line anchor. */
+    requestHistoryAfter(session, afterLine, limit) {
+        return this.sendHistoryRequest(session, { afterLine }, limit);
+    }
+    /**
+     * Fence an abandoned tokenless history request before its caller retries.
+     * If its socket is still current, replace the whole multiplexed socket;
+     * otherwise that socket is already fenced and only its stale lease remains.
+     */
+    recoverHistoryRequest(session) {
+        if (this.disposed)
+            return false;
+        const requestSocket = this.historyInflight.get(session);
+        if (!requestSocket)
+            return false;
+        this.historyInflight.delete(session);
+        // A normal disconnect may already have fenced the request's wire. Its
+        // lease deliberately survived that replacement so another caller could
+        // not consume a new reply while the original caller still considered its
+        // request active. Settling that stale lease must not retire the new wire.
+        if (this.ws !== requestSocket)
+            return true;
+        this.connected = false;
+        this.cancelReconnect();
+        this.releaseSocket(requestSocket, true);
+        this.reconnectDelay = RECONNECT_MIN;
+        try {
+            this.ensureConnection();
+        }
+        catch {
+            // The ambiguous wire is already fenced and its lease is settled. Treat
+            // replacement setup as best-effort so the boolean recovery contract
+            // remains represented even when a host URL/socket factory throws.
+        }
+        return true;
+    }
+}
+export const tmuxMux = new TmuxMux();
+/** Configure the shared singleton (call once at host startup). */
+export function configureTmuxMux(opts) {
+    tmuxMux.configure(opts);
+}
