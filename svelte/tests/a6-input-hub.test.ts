@@ -691,6 +691,10 @@ describe("A6-12 ActionFab closed slots", () => {
     const hide = target.querySelector<HTMLButtonElement>('[data-testid="bash-hide"]');
     if (!trigger || !hide) throw new Error("choice action did not render");
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    const disclosure = trigger.querySelector<HTMLElement>('[data-testid="fab-disclosure-indicator"]');
+    expect(disclosure).not.toBeNull();
+    expect(disclosure?.getAttribute("aria-hidden")).toBe("true");
+    expect(disclosure?.getAttribute("data-direction")).toBe("left");
     expect(hide.disabled).toBe(true);
     expect(hide.tabIndex).toBe(-1);
     expect(hide.getAttribute("aria-pressed")).toBe("true");
@@ -699,6 +703,7 @@ describe("A6-12 ActionFab closed slots", () => {
     await tick();
     expect(taps).toEqual([]);
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(disclosure?.getAttribute("data-direction")).toBe("right");
     expect(hide.disabled).toBe(false);
     expect(hide.tabIndex).toBe(0);
 

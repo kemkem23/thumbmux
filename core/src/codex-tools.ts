@@ -390,7 +390,10 @@ function exactFailureHeader(raw: string): boolean {
   return FAILURE_BULLET.test(raw) && /\x1b\[(?:0;)?1mRan\x1b\[0m /u.test(raw);
 }
 
-function isProtectedSemanticRow(raw: string): boolean {
+function isProtectedSemanticRow(
+  raw: string,
+  allowDimBoundaryPrefix = false,
+): boolean {
   if (raw.length > MAX_ROW_CHARS || !hasOnlyCompleteTerminalControls(raw)) return true;
   const line = visible(raw).trim();
   if (line === '') return false;
@@ -405,7 +408,13 @@ function isProtectedSemanticRow(raw: string): boolean {
   if (/^\d+\s+background terminals?\b/iu.test(line)) return true;
   if (/\besc to interrupt\b/iu.test(line)) return true;
   if (/^(?:■|⚠|Warning\b|Error\b|FAILED\b|Approval\b|Approve\b|Allow\b|Deny\b|Do you want\b)/iu.test(line)) {
-    return true;
+    // A command/prompt captured under a completed Waited/interaction event can
+    // soft-wrap at column zero onto words that resemble a top-level boundary.
+    // Override that lexical resemblance only for an explicitly faint body row
+    // after another accepted detail row. Unpainted/coloured error and approval
+    // UI, first-row ambiguity, live statuses, prompts, and event bullets all
+    // remain protected by the guards above/below.
+    if (!(allowDimBoundaryPrefix && DIM_ROW.test(raw))) return true;
   }
   if (/^─+\s*Worked for\b/u.test(line) || /^─{8,}$/u.test(line)) return true;
   if (exactFailureHeader(raw)) return true;
@@ -430,6 +439,7 @@ function sealedBody(
   maxBlockLines: number,
   maxBlockChars: number,
   acceptsRow: (raw: string, bodyOffset: number) => boolean,
+  allowDimBoundaryContinuation = false,
 ): SealedBody | null {
   const maximumEnd = Math.min(rawLines.length, startLine + maxBlockLines + 1);
   const bodyLines: string[] = [];
@@ -444,7 +454,10 @@ function sealedBody(
     }
     candidateChars += raw.length;
     if (candidateChars > maxBlockChars) return null;
-    if (isProtectedSemanticRow(raw) || !acceptsRow(raw, bodyLines.length)) return null;
+    if (isProtectedSemanticRow(
+      raw,
+      allowDimBoundaryContinuation && bodyLines.length > 0,
+    ) || !acceptsRow(raw, bodyLines.length)) return null;
     bodyLines.push(raw);
   }
   return null;
@@ -607,6 +620,7 @@ function parseAt(
       maxBlockLines,
       maxBlockChars,
       dimDetailRows(raw),
+      true,
     );
     if (!body) return null;
     return wholeBlock(
@@ -627,6 +641,7 @@ function parseAt(
       maxBlockLines,
       maxBlockChars,
       dimDetailRows(raw),
+      true,
     );
     if (!body) return null;
     return wholeBlock(

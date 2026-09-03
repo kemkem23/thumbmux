@@ -220,6 +220,45 @@ describe('Codex completed tool detector', () => {
     ]);
   });
 
+  test('keeps dim command continuations that begin like protected boundaries inside Waited', () => {
+    for (const prefix of ['FAILED.', 'Error', 'Approval']) {
+      const rawLines = [
+        '',
+        waited,
+        '\x1b[2mexec/exec.sh codex sol "a long private prompt\x1b[0m',
+        `\x1b[2m${prefix} is quoted prompt text, not a terminal event\x1b[0m`,
+        '',
+        'assistant prose',
+      ];
+      const detection = detectCodexToolBlocks(rawLines);
+
+      expect(detection.blocks, prefix).toHaveLength(1);
+      expect(detection.blocks[0]).toMatchObject({
+        kind: 'background-wait',
+        sourceRange: { startLine: 1, endLine: 4 },
+        proofRange: { startLine: 1, endLine: 5 },
+      });
+    }
+  });
+
+  test('still fails open for real error, approval, Working, and prompt rows in a Waited corridor', () => {
+    for (const protectedRow of [
+      'FAILED. the actual command failed',
+      'Error: permission denied',
+      'Approval required before continuing',
+      '\x1b[2m◦ Working (12s · esc to interrupt)\x1b[0m',
+      '› submitted prompt must remain visible',
+    ]) {
+      expect(detectCodexToolBlocks([
+        '',
+        waited,
+        '\x1b[2mexec/exec.sh codex sol "private prompt"\x1b[0m',
+        protectedRow,
+        '',
+      ]).blocks, protectedRow).toEqual([]);
+    }
+  });
+
   test('finds a sealed Waited block directly after a self-completing Ran group', () => {
     const rawLines = ['', runGroup, ownerMobileWaited, ''];
     expect(detectCodexToolBlocks(rawLines).blocks.map((block) => ({
