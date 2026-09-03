@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.13-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.14-dist`.
+
+## v0.18.14 — 2026-09-03
+
+### Fixed
+
+- **Codex completed-tool seals now use the same invisible-row definition as
+  adjacent-marker coalescing.** Space, tab, NBSP, and complete SGR-only rows
+  can prove a completed block without accepting cursor movement, erase, OSC,
+  malformed controls, or other ambiguous terminal bytes.
+- **A completed `Ran N commands` marker can directly precede another completed
+  Codex tool marker.** The detector carries the proven end boundary forward,
+  so an adjacent `Waited for background terminal` block is no longer left raw
+  merely because there is no blank row between the two markers.
 
 ## v0.18.13 — 2026-09-02
 
