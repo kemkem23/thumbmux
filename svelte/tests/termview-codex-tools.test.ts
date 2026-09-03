@@ -85,6 +85,15 @@ const failedRun = '\x1b[1m\x1b[38;5;1m•\x1b[0m \x1b[1mRan\x1b[0m '
 const waited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
   + ' · bun test\x1b[0m';
 
+const ownerMobileWaited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
+  + ' · ./.agents/skills/\x1b[0m';
+const ownerMobilePrompt = [
+  "\x1b[2mexec/exec.sh codex sol 'Campaign 1\x1b[0m",
+  '\x1b[2mVendor Chat, exactly one new read-only G4\x1b[0m',
+  '\x1b[2mblocker-extraction/admission lane under authorized\x1b[0m',
+  '\x1b[2mlocal fallback from terminal RELAY_UNAVAILABLE/FAILED.\x1b[0m',
+];
+
 const edited = '\x1b[2m• \x1b[0;1mEdited\x1b[0m src/view.ts ('
   + '\x1b[38;5;2m+2\x1b[39m \x1b[38;5;1m-1\x1b[39m)';
 
@@ -335,6 +344,42 @@ describe('TermView Codex completed-tool projection', () => {
       expect(placeholder.getAttribute('data-tool-provider')).toBe('codex');
       expect(placeholder.getAttribute('data-tool-key')).toMatch(/^tool-placeholder:codex:/);
     }
+  });
+
+  test('hides the owner mobile Waited prompt behind an SGR/NBSP-only seal', async () => {
+    const { viewport } = mountView('hide');
+    const lines = [
+      '',
+      ownerMobileWaited,
+      ...ownerMobilePrompt,
+      '\x1b[0m \u00a0\x1b[39m',
+      'assistant prose',
+    ];
+    deliver(lines);
+    await settleUi();
+
+    const placeholder = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('1');
+    expect(placeholder?.textContent).toBe('hidden tools');
+    expect(placeholder?.getAttribute('data-raw-start')).toBe('1');
+    expect(placeholder?.getAttribute('data-raw-end')).toBe('6');
+    expect(viewport.textContent).not.toContain('Campaign 1');
+    expect(viewport.textContent).toContain('assistant prose');
+  });
+
+  test('merges directly adjacent self-completing Ran and sealed Waited blocks', async () => {
+    const { viewport } = mountView('hide');
+    const lines = ['', runGroup, ownerMobileWaited, '', 'assistant prose'];
+    deliver(lines);
+    await settleUi();
+
+    const placeholders = viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('2');
+    expect(placeholders).toHaveLength(1);
+    expect(placeholders[0]?.getAttribute('data-raw-start')).toBe('1');
+    expect(placeholders[0]?.getAttribute('data-raw-end')).toBe('3');
+    expect(placeholders[0]?.getAttribute('data-tool-block-count')).toBe('2');
+    expect(viewport.textContent).toContain('assistant prose');
   });
 
   test('blank separators merge, while assistant prose, prompts, and live rows split groups', async () => {

@@ -15,6 +15,15 @@ const failedRun = '\x1b[1m\x1b[38;5;1m•\x1b[0m \x1b[1mRan\x1b[0m '
 const waited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
   + ' · .agents/skills/\x1b[0m';
 
+const ownerMobileWaited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
+  + ' · ./.agents/skills/\x1b[0m';
+const ownerMobilePrompt = [
+  "\x1b[2mexec/exec.sh codex sol 'Campaign 1\x1b[0m",
+  '\x1b[2mVendor Chat, exactly one new read-only G4\x1b[0m',
+  '\x1b[2mblocker-extraction/admission lane under authorized\x1b[0m',
+  '\x1b[2mlocal fallback from terminal RELAY_UNAVAILABLE/FAILED.\x1b[0m',
+];
+
 const waiting = '\x1b[2m• \x1b[0;1mWaiting for agents\x1b[0m';
 const finished = '\x1b[2m• \x1b[0;1mFinished waiting\x1b[0m';
 const noAgents = '\x1b[2m  └ \x1b[0mNo agents completed yet';
@@ -184,6 +193,42 @@ describe('Codex completed tool detector', () => {
       kind: 'background-wait',
       sourceRange: { startLine: 1, endLine: 4 },
     });
+  });
+
+  test('hides the owner mobile Waited fixture when its seal is SGR/NBSP-only', () => {
+    const rawLines = [
+      '',
+      ownerMobileWaited,
+      ...ownerMobilePrompt,
+      '\x1b[0m \u00a0\x1b[39m',
+      'assistant prose',
+    ];
+    const detection = detectCodexToolBlocks(rawLines);
+
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]).toMatchObject({
+      kind: 'background-wait',
+      outcome: 'completed',
+      sourceRange: { startLine: 1, endLine: 6 },
+      proofRange: { startLine: 1, endLine: 7 },
+    });
+    expect(projectToolLines(rawLines, { blocks: detection.blocks }).lines).toEqual([
+      '',
+      'Codex background wait ซ่อนอยู่ · 5 แถว',
+      '\x1b[0m \u00a0\x1b[39m',
+      'assistant prose',
+    ]);
+  });
+
+  test('finds a sealed Waited block directly after a self-completing Ran group', () => {
+    const rawLines = ['', runGroup, ownerMobileWaited, ''];
+    expect(detectCodexToolBlocks(rawLines).blocks.map((block) => ({
+      kind: block.kind,
+      sourceRange: block.sourceRange,
+    }))).toEqual([
+      { kind: 'run-group', sourceRange: { startLine: 1, endLine: 2 } },
+      { kind: 'background-wait', sourceRange: { startLine: 2, endLine: 3 } },
+    ]);
   });
 
   test('requires Finished waiting before collapsing the paired agent wait corridor', () => {

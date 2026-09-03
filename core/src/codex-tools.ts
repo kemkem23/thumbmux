@@ -8,7 +8,7 @@
  * corridors remain byte-for-byte visible.
  */
 
-import { stripTerminalControls } from './terminal-controls';
+import { isBlankToolSeparator, stripTerminalControls } from './terminal-controls';
 import {
   stableToolFingerprint,
   type ToolBlockKind,
@@ -368,9 +368,9 @@ function ranDetailRows(header: string, commandFragment: string): {
   };
 }
 
-/** A seal row contains no control bytes and paints no semantic cell. */
+/** A seal row paints no semantic cell and contains only safe separator chrome. */
 function isSealRow(raw: string): boolean {
-  return /^[ \t]*$/.test(raw);
+  return isBlankToolSeparator(raw);
 }
 
 function leadingBoundaryIsKnown(
@@ -378,7 +378,9 @@ function leadingBoundaryIsKnown(
   line: number,
   scanStart: number,
   leadingEdgeSealed: boolean,
+  previousCompletedEndLine: number | undefined,
 ): boolean {
+  if (line === previousCompletedEndLine) return true;
   if (line === 0) return scanStart === 0 && leadingEdgeSealed;
   if (line <= scanStart) return false;
   return isSealRow(rawLines[line - 1] ?? '');
@@ -761,12 +763,14 @@ export function detectCodexToolBlocks(
   }
 
   const blocks: ToolCollapseBlock[] = [];
+  let previousCompletedEndLine: number | undefined;
   for (let line = scanStart; line < rawLines.length; line += 1) {
     if (!leadingBoundaryIsKnown(
       rawLines,
       line,
       scanStart,
       options.leadingEdgeSealed === true,
+      previousCompletedEndLine,
     )) continue;
     const block = parseAt(rawLines, line, maxBlockLines, maxBlockChars);
     if (!block) continue;
@@ -776,6 +780,7 @@ export function detectCodexToolBlocks(
       ...block,
       id: `${block.fingerprint}:row-${absoluteStart}`,
     }));
+    previousCompletedEndLine = block.sourceRange.endLine;
     line = Math.max(line, block.sourceRange.endLine - 1);
   }
 
