@@ -161,7 +161,8 @@ describe("createAppRoutes", () => {
         pollNormalMs: 40,
         pollBurstMs: 20,
         pollReconcileMs: 40,
-        sessionListIntervalMs: 40,
+        // DELETE must push inventory itself; this timer is only reconciliation.
+        sessionListIntervalMs: 60_000,
       },
     });
 

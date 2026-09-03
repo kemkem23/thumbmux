@@ -2370,7 +2370,14 @@ export class TmuxWsMux<
     }
   }
 
-  private broadcastSessionList() {
+  /**
+   * Reconcile and push the current authoritative session inventory now.
+   *
+   * Hosts call this after a successful create/rename/stop commit so viewers do
+   * not depend on the periodic inventory timer for mutation visibility. The
+   * existing dedupe, filtering, and backpressure rules still apply.
+   */
+  broadcastSessionList() {
     try {
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
