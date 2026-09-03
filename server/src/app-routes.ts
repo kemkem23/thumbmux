@@ -660,6 +660,7 @@ export function createAppRoutes(options: AppRoutesOptions = {}): AppRoutes<WsLik
         try {
           killTmuxSession(name);
           mux.invalidateSession(name);
+          mux.broadcastSessionList();
           return withSetCookie(Response.json({ ok: true, name }), setCookie);
         } catch (error) {
           return withSetCookie(

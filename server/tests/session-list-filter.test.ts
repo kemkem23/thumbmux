@@ -140,6 +140,25 @@ function principalFilter(
 }
 
 describe("session-list filter (DEFECT C)", () => {
+  test("host mutation can push changed inventory without waiting for the poll interval", () => {
+    const { mux, setSessions } = makeHarness({ sessionListIntervalMs: 60_000 });
+    const ws = new FakeWS();
+    try {
+      mux.subscribeSessions(ws);
+      expect(ws.sessionListFrames()).toHaveLength(1);
+      expect(ws.sessionListRaw()[0]).toContain("alpha");
+
+      setSessions([sessionRow("beta")]);
+      mux.broadcastSessionList();
+
+      expect(ws.sessionListFrames()).toHaveLength(2);
+      expect(ws.sessionListRaw().at(-1)).not.toContain("alpha");
+      expect(ws.sessionListRaw().at(-1)).toContain("beta");
+    } finally {
+      mux.stop();
+    }
+  });
+
   test("1. no hook = today's behaviour (shared complete list + global dedupe)", async () => {
     const { mux, setSessions, getSessions } = makeHarness();
     const listSocket = new FakeWS();
