@@ -1212,6 +1212,23 @@ const V0186_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "app:ThumbmuxApp:05c5f730406d035669b8b1ba69ed5c183e9fd89bf98521737fc578c6e9a6a55a:c824a279f048823a40d097e0b8b58b1b6f8f9e8e39f149a4ec68ea8fe7353c52",
 ]);
 
+/**
+ * Additive `TmuxWsMux.broadcastSessionList()` promotion reviewed for
+ * 0.18.13 -> 0.18.16. The method changed from private to public so hosts can
+ * push the session inventory after create/rename/stop instead of waiting for
+ * the list poll. `isMinorOptionalAddition` cannot prove it: a class method is
+ * not an optional member, and the new public declaration hashes through
+ * `AppRoutes` and `createAppRoutes` because they expose `TmuxWsMux`. Frozen
+ * fixtures construct those types without calling the new method. The d.ts
+ * delta versus `v0.18.13-dist` is only `private broadcastSessionList` becoming
+ * `broadcastSessionList(): void`.
+ */
+const V01816_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:bf934db559492005973a16f4f91591e078db81d6adcadfe00e4fc81b17aae770:0cd8e42c83784c872b4bb3f9b35c99c2efb817c71f68d1f55e990a2c4a84b22e",
+  "server:createAppRoutes:82d6b1f45e0c93c5f95e9545385a8b10ea505d4fad03fc4c684309349869a137:f541e3c9bd9791bfb98c9a083ff3ea0a02bddd2551c091ffb69cc271f11ce3dc",
+  "server:TmuxWsMux:5fab451dd0c8f853304b66a5ebe2654661cde7773dad0c11219f5553a2a52873:b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782",
+]);
+
 function isV0110MinorException(
   baselineVersion: string,
   currentVersion: string,
@@ -1249,6 +1266,19 @@ function isV0186PatchException(
   if (baselineVersion !== "0.18.5" || currentVersion !== "0.18.6") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V0186_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV01816PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.18.13" || currentVersion !== "0.18.16") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V01816_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1440,13 +1470,23 @@ export function evaluateBaseline(
 
     if (
       !kindChanged
-      && isV0186PatchException(
-        baselineVersion,
-        currentVersion,
-        subpath,
-        previous.name,
-        previousLive,
-        nextLive,
+      && (
+        isV0186PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV01816PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
       )
     ) {
       continue;

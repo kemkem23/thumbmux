@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.15-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.16-dist`.
+
+## v0.18.16 — 2026-09-04
+
+### Changed
+
+- **Declared `TmuxWsMux.broadcastSessionList()` on the public F surface.**
+  Hosts already call this after a successful create/rename/stop so viewers
+  see the new inventory without waiting for the list poll. The method has
+  been public in production since the 0.18.14 close-event push; this release
+  records that additive class member, and the transitive `AppRoutes` /
+  `createAppRoutes` declaration hashes, against the last certified baseline
+  (`v0.18.13-dist`). Existing constructors keep compiling. Callers that never
+  invoke the new method are unchanged.
 
 ## v0.18.15 — 2026-09-04
 
