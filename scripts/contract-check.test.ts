@@ -302,6 +302,66 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", name]);
   });
 
+  test("the v0.18.16 public session-list push requires the exact patch and digest pair", () => {
+    const name = "TmuxWsMux";
+    const baselineDigest = "5fab451dd0c8f853304b66a5ebe2654661cde7773dad0c11219f5553a2a52873";
+    const reviewedDigest = "b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782";
+    const manifest: ContractEntry[] = [{
+      name,
+      kind: "value",
+      signature: reviewedDigest,
+      tier: "F",
+    }];
+    const baselineLive = [{
+      name,
+      kind: "value" as const,
+      signature: baselineDigest,
+      compatibilitySignature: baselineDigest,
+    }];
+    const currentLive = [{
+      name,
+      kind: "value" as const,
+      signature: reviewedDigest,
+      compatibilitySignature: reviewedDigest,
+    }];
+
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.13",
+      "0.18.16",
+    ).errors).toEqual([]);
+
+    const wrongDigest = [{
+      ...currentLive[0]!,
+      compatibilitySignature: `${reviewedDigest.slice(0, -1)}0`,
+    }];
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      wrongDigest,
+      "0.18.13",
+      "0.18.16",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.13",
+      "0.18.17",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+  });
+
   test("a minor may add optional members without weakening existing F members", () => {
     const baseline = fixture("0.8.4");
     writeCoreDeclarations(baseline, [
