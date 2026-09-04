@@ -140,6 +140,15 @@
       >
         {a.label}
         {#if a.tag}<small>{a.tag}</small>{/if}
+        {#if hasChoices}
+          <span
+            class="disclosure"
+            class:open={choicesOpen}
+            aria-hidden="true"
+            data-direction={choicesOpen ? 'right' : 'left'}
+            data-testid="fab-disclosure-indicator"
+          ></span>
+        {/if}
       </button>
 
       {#if hasChoices}
@@ -235,6 +244,16 @@
     touch-action: manipulation;
   }
   .slot small { font: 700 9px var(--font-mono); opacity: .6; letter-spacing: .05em; }
+  .disclosure {
+    width: 8px;
+    flex: 0 0 8px;
+    font: 700 17px/1 var(--font-mono);
+    color: var(--agent);
+    text-align: center;
+  }
+  .disclosure::before { content: '‹'; }
+  .disclosure.open::before { content: '›'; }
+  .disclosure.open { color: var(--hud-fg); }
   .slot.prim { border-color: var(--agent); color: var(--agent); }
   .choices {
     display: flex;

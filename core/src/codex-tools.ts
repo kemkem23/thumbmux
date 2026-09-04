@@ -8,7 +8,7 @@
  * corridors remain byte-for-byte visible.
  */
 
-import { stripTerminalControls } from './terminal-controls';
+import { isBlankToolSeparator, stripTerminalControls } from './terminal-controls';
 import {
   stableToolFingerprint,
   type ToolBlockKind,
@@ -309,6 +309,71 @@ function dimDetailRows(header: string): (raw: string) => boolean {
   };
 }
 
+type ShellQuoteState = { single: boolean; double: boolean };
+
+function updateShellQuotes(raw: string, quotes: ShellQuoteState): void {
+  const text = stripTerminalControls(raw);
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (quotes.single) {
+      if (char === "'") quotes.single = false;
+    } else if (quotes.double) {
+      if (char === '\\') {
+        i += 1;
+      } else if (char === '"') {
+        quotes.double = false;
+      }
+    } else {
+      if (char === '\\') {
+        i += 1;
+      } else if (char === "'") {
+        quotes.single = true;
+      } else if (char === '"') {
+        quotes.double = true;
+      }
+    }
+  }
+}
+
+function commandDetailRows(header: string): {
+  accepts: (raw: string, bodyOffset: number) => boolean;
+  isContinuationDetail: (raw: string) => boolean;
+} {
+  const headerPaint = dimPaintEvidence(header, { dim: false, foreground: null });
+  let inherited = { dim: headerPaint.endDim, foreground: headerPaint.endForegroundKey };
+  const quotes: ShellQuoteState = { single: false, double: false };
+  updateShellQuotes(header, quotes);
+
+  return {
+    accepts: (raw: string, _bodyOffset: number) => {
+      const evidence = dimPaintEvidence(raw, inherited);
+      inherited = { dim: evidence.endDim, foreground: evidence.endForegroundKey };
+      const currentlyInQuotes = quotes.single || quotes.double;
+      updateShellQuotes(raw, quotes);
+
+      if (evidence.hasSemanticCell && evidence.firstSemanticCellDim) {
+        return true;
+      }
+
+      // Soft-wrapped rows inside an unclosed command quote (e.g. bash multiline prompt)
+      // where terminal wrap or capture pane omitted the leading faint SGR.
+      if (
+        currentlyInQuotes
+        && evidence.hasSemanticCell
+        && hasOnlyCompleteTerminalControls(raw)
+      ) {
+        return true;
+      }
+
+      return false;
+    },
+    isContinuationDetail: (raw: string) => {
+      const evidence = dimPaintEvidence(raw, { dim: false, foreground: null });
+      return evidence.hasSemanticCell && evidence.firstSemanticCellDim;
+    },
+  };
+}
+
 function foregroundPalette(raw: string): ReadonlySet<string> {
   const colors = new Set<string>();
   let state: PaintState = { dim: false, foreground: null };
@@ -368,9 +433,9 @@ function ranDetailRows(header: string, commandFragment: string): {
   };
 }
 
-/** A seal row contains no control bytes and paints no semantic cell. */
+/** A seal row paints no semantic cell and contains only safe separator chrome. */
 function isSealRow(raw: string): boolean {
-  return /^[ \t]*$/.test(raw);
+  return isBlankToolSeparator(raw);
 }
 
 function leadingBoundaryIsKnown(
@@ -378,7 +443,9 @@ function leadingBoundaryIsKnown(
   line: number,
   scanStart: number,
   leadingEdgeSealed: boolean,
+  previousCompletedEndLine: number | undefined,
 ): boolean {
+  if (line === previousCompletedEndLine) return true;
   if (line === 0) return scanStart === 0 && leadingEdgeSealed;
   if (line <= scanStart) return false;
   return isSealRow(rawLines[line - 1] ?? '');
@@ -388,7 +455,10 @@ function exactFailureHeader(raw: string): boolean {
   return FAILURE_BULLET.test(raw) && /\x1b\[(?:0;)?1mRan\x1b\[0m /u.test(raw);
 }
 
-function isProtectedSemanticRow(raw: string): boolean {
+function isProtectedSemanticRow(
+  raw: string,
+  allowDimBoundaryPrefix = false,
+): boolean {
   if (raw.length > MAX_ROW_CHARS || !hasOnlyCompleteTerminalControls(raw)) return true;
   const line = visible(raw).trim();
   if (line === '') return false;
@@ -403,7 +473,13 @@ function isProtectedSemanticRow(raw: string): boolean {
   if (/^\d+\s+background terminals?\b/iu.test(line)) return true;
   if (/\besc to interrupt\b/iu.test(line)) return true;
   if (/^(?:■|⚠|Warning\b|Error\b|FAILED\b|Approval\b|Approve\b|Allow\b|Deny\b|Do you want\b)/iu.test(line)) {
-    return true;
+    // A command/prompt captured under a completed Waited/interaction event can
+    // soft-wrap at column zero onto words that resemble a top-level boundary.
+    // Override that lexical resemblance only for an explicitly faint body row
+    // after another accepted detail row. Unpainted/coloured error and approval
+    // UI, first-row ambiguity, live statuses, prompts, and event bullets all
+    // remain protected by the guards above/below.
+    if (!(allowDimBoundaryPrefix && DIM_ROW.test(raw))) return true;
   }
   if (/^─+\s*Worked for\b/u.test(line) || /^─{8,}$/u.test(line)) return true;
   if (exactFailureHeader(raw)) return true;
@@ -428,6 +504,8 @@ function sealedBody(
   maxBlockLines: number,
   maxBlockChars: number,
   acceptsRow: (raw: string, bodyOffset: number) => boolean,
+  allowDimBoundaryContinuation = false,
+  isContinuationDetail?: (raw: string) => boolean,
 ): SealedBody | null {
   const maximumEnd = Math.min(rawLines.length, startLine + maxBlockLines + 1);
   const bodyLines: string[] = [];
@@ -436,13 +514,43 @@ function sealedBody(
   for (let line = startLine + 1; line < maximumEnd; line += 1) {
     const raw = rawLines[line] ?? '';
     if (isSealRow(raw)) {
+      if (isContinuationDetail) {
+        let nextLine = line + 1;
+        while (nextLine < maximumEnd && isSealRow(rawLines[nextLine] ?? '')) {
+          nextLine += 1;
+        }
+
+        if (nextLine < maximumEnd) {
+          const nextRaw = rawLines[nextLine] ?? '';
+          const nextIsProtected = isProtectedSemanticRow(
+            nextRaw,
+            allowDimBoundaryContinuation && bodyLines.length > 0,
+          );
+          const nextIsDetail = !nextIsProtected && isContinuationDetail(nextRaw);
+
+          if (nextIsDetail) {
+            for (let b = line; b < nextLine; b += 1) {
+              const blankRaw = rawLines[b] ?? '';
+              candidateChars += blankRaw.length;
+              if (candidateChars > maxBlockChars) return null;
+              bodyLines.push(blankRaw);
+            }
+            line = nextLine - 1;
+            continue;
+          }
+        }
+      }
+
       const sourceEnd = line;
       if (sourceEnd <= startLine || sourceEnd - startLine > maxBlockLines) return null;
       return { sourceEnd, proofEnd: line + 1, bodyLines };
     }
     candidateChars += raw.length;
     if (candidateChars > maxBlockChars) return null;
-    if (isProtectedSemanticRow(raw) || !acceptsRow(raw, bodyLines.length)) return null;
+    if (isProtectedSemanticRow(
+      raw,
+      allowDimBoundaryContinuation && bodyLines.length > 0,
+    ) || !acceptsRow(raw, bodyLines.length)) return null;
     bodyLines.push(raw);
   }
   return null;
@@ -599,12 +707,15 @@ function parseAt(
 
   const waited = WAITED.exec(raw);
   if (waited) {
+    const detail = commandDetailRows(raw);
     const body = sealedBody(
       rawLines,
       startLine,
       maxBlockLines,
       maxBlockChars,
-      dimDetailRows(raw),
+      detail.accepts,
+      true,
+      detail.isContinuationDetail,
     );
     if (!body) return null;
     return wholeBlock(
@@ -619,12 +730,15 @@ function parseAt(
 
   const backgroundInteraction = BACKGROUND_INTERACTION.exec(raw);
   if (backgroundInteraction) {
+    const detail = commandDetailRows(raw);
     const body = sealedBody(
       rawLines,
       startLine,
       maxBlockLines,
       maxBlockChars,
-      dimDetailRows(raw),
+      detail.accepts,
+      true,
+      detail.isContinuationDetail,
     );
     if (!body) return null;
     return wholeBlock(
@@ -761,12 +875,14 @@ export function detectCodexToolBlocks(
   }
 
   const blocks: ToolCollapseBlock[] = [];
+  let previousCompletedEndLine: number | undefined;
   for (let line = scanStart; line < rawLines.length; line += 1) {
     if (!leadingBoundaryIsKnown(
       rawLines,
       line,
       scanStart,
       options.leadingEdgeSealed === true,
+      previousCompletedEndLine,
     )) continue;
     const block = parseAt(rawLines, line, maxBlockLines, maxBlockChars);
     if (!block) continue;
@@ -776,6 +892,7 @@ export function detectCodexToolBlocks(
       ...block,
       id: `${block.fingerprint}:row-${absoluteStart}`,
     }));
+    previousCompletedEndLine = block.sourceRange.endLine;
     line = Math.max(line, block.sourceRange.endLine - 1);
   }
 

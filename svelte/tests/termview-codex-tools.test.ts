@@ -85,6 +85,15 @@ const failedRun = '\x1b[1m\x1b[38;5;1m•\x1b[0m \x1b[1mRan\x1b[0m '
 const waited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
   + ' · bun test\x1b[0m';
 
+const ownerMobileWaited = '\x1b[0;1m• Waited for background terminal\x1b[0;2m'
+  + ' · ./.agents/skills/\x1b[0m';
+const ownerMobilePrompt = [
+  "\x1b[2mexec/exec.sh codex sol 'Campaign 1\x1b[0m",
+  '\x1b[2mVendor Chat, exactly one new read-only G4\x1b[0m',
+  '\x1b[2mblocker-extraction/admission lane under authorized\x1b[0m',
+  '\x1b[2mlocal fallback from terminal RELAY_UNAVAILABLE/FAILED.\x1b[0m',
+];
+
 const edited = '\x1b[2m• \x1b[0;1mEdited\x1b[0m src/view.ts ('
   + '\x1b[38;5;2m+2\x1b[39m \x1b[38;5;1m-1\x1b[39m)';
 
@@ -335,6 +344,63 @@ describe('TermView Codex completed-tool projection', () => {
       expect(placeholder.getAttribute('data-tool-provider')).toBe('codex');
       expect(placeholder.getAttribute('data-tool-key')).toMatch(/^tool-placeholder:codex:/);
     }
+  });
+
+  test('hides the owner mobile Waited prompt behind an SGR/NBSP-only seal', async () => {
+    const { viewport } = mountView('hide');
+    const lines = [
+      '',
+      ownerMobileWaited,
+      ...ownerMobilePrompt,
+      '\x1b[0m \u00a0\x1b[39m',
+      'assistant prose',
+    ];
+    deliver(lines);
+    await settleUi();
+
+    const placeholder = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('1');
+    expect(placeholder?.textContent).toBe('hidden tools');
+    expect(placeholder?.getAttribute('data-raw-start')).toBe('1');
+    expect(placeholder?.getAttribute('data-raw-end')).toBe('6');
+    expect(viewport.textContent).not.toContain('Campaign 1');
+    expect(viewport.textContent).toContain('assistant prose');
+  });
+
+  test('hides dim Waited continuations that quote failure-like prefixes', async () => {
+    const { viewport } = mountView('hide');
+    const lines = [
+      '',
+      waited,
+      '\x1b[2mexec/exec.sh codex sol "a long private prompt\x1b[0m',
+      '\x1b[2mFAILED. Error Approval are quoted prompt text\x1b[0m',
+      '',
+      'assistant prose',
+    ];
+    deliver(lines);
+    await settleUi();
+
+    const placeholder = viewport.querySelector<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('1');
+    expect(placeholder?.getAttribute('data-raw-start')).toBe('1');
+    expect(placeholder?.getAttribute('data-raw-end')).toBe('4');
+    expect(viewport.textContent).not.toContain('quoted prompt text');
+    expect(viewport.textContent).toContain('assistant prose');
+  });
+
+  test('merges directly adjacent self-completing Ran and sealed Waited blocks', async () => {
+    const { viewport } = mountView('hide');
+    const lines = ['', runGroup, ownerMobileWaited, '', 'assistant prose'];
+    deliver(lines);
+    await settleUi();
+
+    const placeholders = viewport.querySelectorAll<HTMLElement>('.mtv-tool-placeholder');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('2');
+    expect(placeholders).toHaveLength(1);
+    expect(placeholders[0]?.getAttribute('data-raw-start')).toBe('1');
+    expect(placeholders[0]?.getAttribute('data-raw-end')).toBe('3');
+    expect(placeholders[0]?.getAttribute('data-tool-block-count')).toBe('2');
+    expect(viewport.textContent).toContain('assistant prose');
   });
 
   test('blank separators merge, while assistant prose, prompts, and live rows split groups', async () => {
@@ -648,6 +714,48 @@ describe('TermView Codex completed-tool projection', () => {
     expect(viewport.querySelector('.mtv-tool-placeholder')).toBeNull();
     expect(viewport.querySelector<HTMLElement>('[data-raw-start="0"]')?.textContent)
       .toContain('Ran 2 commands');
+  });
+
+  test('retention gaps are hard barriers and never seal one cross-gap Waited block', async () => {
+    const { viewport } = mountView('hide', { height: 120 });
+    deliver(Array.from({ length: 10_000 }, (_, index) => `base-${index}`));
+    await settleUi();
+    wheelUp(viewport, 1_000_000);
+
+    const protectedEnd = Math.max(...Array.from(
+      viewport.querySelectorAll<HTMLElement>('.mtv-line'),
+      (line) => Number(line.getAttribute('data-raw-end')),
+    ));
+    expect(protectedEnd).toBeGreaterThan(8);
+
+    const next = Array.from({ length: 12_100 }, (_, index) => `next-${index}`);
+    // A known-good block before the discontinuity proves that Codex hiding is
+    // active. The second candidate would look sealed only if the detector
+    // incorrectly treated the 2,100 discarded rows as semantic adjacency.
+    next[protectedEnd - 6] = '';
+    next[protectedEnd - 5] = successfulRun();
+    next[protectedEnd - 4] = '\x1b[2m  └ valid-before-gap\x1b[0m';
+    next[protectedEnd - 3] = '';
+    next[protectedEnd - 1] = waited;
+    next[protectedEnd + 2_100] = '\x1b[2mexec/exec.sh must-not-cross-gap\x1b[0m';
+    next[protectedEnd + 2_101] = '';
+    next[protectedEnd + 2_102] = 'assistant prose after gap';
+    deliver(next);
+    await settleUi();
+
+    expect(viewport.getAttribute('data-raw-total')).toBe('10000');
+    expect(viewport.getAttribute('data-codex-tool-block-count')).toBe('1');
+    viewport.dispatchEvent(new WheelEvent('wheel', {
+      deltaY: 1_500,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+      bubbles: true,
+      cancelable: true,
+    }));
+    flushSync();
+    const placeholders = viewport.querySelectorAll('.mtv-tool-placeholder');
+    expect(placeholders).toHaveLength(1);
+    expect(viewport.textContent).toContain('Waited for background terminal');
+    expect(viewport.querySelector('[data-gap-marker-rows="2100"]')).not.toBeNull();
   });
 
   test('keeps the absolute placeholder key when prefix eviction shifts its raw index', async () => {

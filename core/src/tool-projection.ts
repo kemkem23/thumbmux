@@ -7,7 +7,7 @@
  * Invalid or overlapping evidence always fails open.
  */
 
-import { stripTerminalControls } from './terminal-controls';
+import { isBlankToolSeparator, stripTerminalControls } from './terminal-controls';
 
 export type ToolProvider = 'claude' | 'codex' | 'grok';
 
@@ -838,26 +838,6 @@ type ToolPlaceholderGroupCandidate = {
   memberPlaceholderKeys: string[];
   blockIds: Set<string>;
 };
-
-function isBlankToolSeparator(raw: string): boolean {
-  let index = 0;
-  while (index < raw.length) {
-    if (raw[index] !== '\x1b') {
-      if (!/[ \t\u00a0]/u.test(raw[index] ?? '')) return false;
-      index += 1;
-      continue;
-    }
-    const next = raw[index + 1];
-    // Only SGR paint is safe separator chrome. Cursor movement, erase/reset,
-    // OSC, charset controls, and unfamiliar/incomplete ESC sequences stay raw.
-    if (next !== '[') return false;
-    let end = index + 2;
-    while (end < raw.length && /[0-9:;]/u.test(raw[end] ?? '')) end += 1;
-    if (raw[end] !== 'm') return false;
-    index = end + 1;
-  }
-  return true;
-}
 
 function projectionRowsCoverRawSource(projection: ToolProjection): boolean {
   let cursor = 0;
