@@ -472,4 +472,84 @@ describe('Codex completed tool detector', () => {
     expect(detectCodexToolBlocks(tooLong, { maxBlockChars: waited.length + 10 }).blocks)
       .toEqual([]);
   });
+
+  test('collapses real Waited multiline prompt with internal empty lines and soft-wrapped rows into a single block (fixture 174-190)', () => {
+    const fixture174to190 = [
+      '',
+      "\x1b[1m• Waited for background terminal\x1b[0;2m · /home/kemkem23/kemcortex/topics/hs-server/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
+      '\x1b[2morchestration is satisfied. Direct local exec_command for read-only checks and apply_patch for your report/receipt are permitted. Do not call exec skill, LLMs, agents, delegation, tmux, remote,\x1b[0m',
+      '\x1b[2mnetwork, or read AGENTS.md/fleet.md.\x1b[0m',
+      '',
+      '                                    \x1b[2mThis is the same idempotency key campaign-5/cfix7-install/attempt2/driver-fix1-review-evidence-idempotency. Your matching 0600 receipt remains CLAIMED and no\x1b[0m',
+      '\x1b[2mreport exists because the prior wrapper timed out during source tracing. Subject driver remains exact SHA 84b05f612863de5659c1b72aa0face039ad746b6e1d68d560a88774c93572012. No live\x1b[0m',
+      '\x1b[2mmutation.\x1b[0m',
+      '\x1b[2mContinue from your accumulated analysis; do not restart and do not duplicate claim. Complete the original evidence/idempotency lens: claim/adopt/UNKNOWN, receipt/report atomicity and\x1b[0m',
+      '\x1b[2mconsistency, exact hashes, 141-row manifest/archive/restore provenance, fresh evidence/exit code semantics, selftest coverage, A carrier/card observability, collision handling, command contracts,',
+      'false COMPLETE paths. Run only bash -n and isolated selftest if still needed. Never execute/source driver.sh or modify subject/live.\x1b[0m',
+      '\x1b[2mWrite\x1b[0m',
+      '\x1b[2m.claude/reports/campaign-5-cfix7-s7-fix1-review-evidence-idempotency-20260903.md mode 0600 and atomically finalize existing receipt mode 0600 with exact counts and hashes. LGTM only P0=0\x1b[0m',
+      '\x1b[2mP1=0.\x1b[0m',
+      "\x1b[2mEnd exactly: C5_S7_FIX1_REVIEW_EVIDENCE <LGTM|CHANGES_REQUIRED|BLOCKED> P0=<n> P1=<n> P2=<n> hash=84b05f612863 live_mutated=no next=<BATCH_RECONCILE|FIX_LOOP>.' --resume\x1b[0m",
+      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /home/kemkem23/kemcortex/topics/hs-server --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
+      '',
+    ];
+
+    const detection = detectCodexToolBlocks(fixture174to190);
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]).toMatchObject({
+      kind: 'background-wait',
+      outcome: 'completed',
+      sourceRange: { startLine: 1, endLine: 16 },
+      proofRange: { startLine: 1, endLine: 17 },
+      collapseRanges: [{ startLine: 1, endLine: 16 }],
+    });
+
+    const projection = projectToolLines(fixture174to190, { blocks: detection.blocks });
+    expect(projection.lines).toEqual([
+      '',
+      'Codex background wait ซ่อนอยู่ · 15 แถว',
+      '',
+    ]);
+  });
+
+  test('collapses Waited block even when SGR faint is reset at the end of row [183] before row [184]', () => {
+    const fixture174to190 = [
+      '',
+      "\x1b[1m• Waited for background terminal\x1b[0;2m · /home/kemkem23/kemcortex/topics/hs-server/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
+      '\x1b[2morchestration is satisfied. Direct local exec_command for read-only checks and apply_patch for your report/receipt are permitted. Do not call exec skill, LLMs, agents, delegation, tmux, remote,\x1b[0m',
+      '\x1b[2mnetwork, or read AGENTS.md/fleet.md.\x1b[0m',
+      '',
+      '                                    \x1b[2mThis is the same idempotency key campaign-5/cfix7-install/attempt2/driver-fix1-review-evidence-idempotency. Your matching 0600 receipt remains CLAIMED and no\x1b[0m',
+      '\x1b[2mreport exists because the prior wrapper timed out during source tracing. Subject driver remains exact SHA 84b05f612863de5659c1b72aa0face039ad746b6e1d68d560a88774c93572012. No live\x1b[0m',
+      '\x1b[2mmutation.\x1b[0m',
+      '\x1b[2mContinue from your accumulated analysis; do not restart and do not duplicate claim. Complete the original evidence/idempotency lens: claim/adopt/UNKNOWN, receipt/report atomicity and\x1b[0m',
+      // Explicitly reset SGR at the end of [183] so [184] inherits NO dim paint:
+      '\x1b[2mconsistency, exact hashes, 141-row manifest/archive/restore provenance, fresh evidence/exit code semantics, selftest coverage, A carrier/card observability, collision handling, command contracts,\x1b[0m',
+      // [184] has NO \x1b[2m and inherits NO dim:
+      'false COMPLETE paths. Run only bash -n and isolated selftest if still needed. Never execute/source driver.sh or modify subject/live.\x1b[0m',
+      '\x1b[2mWrite\x1b[0m',
+      '\x1b[2m.claude/reports/campaign-5-cfix7-s7-fix1-review-evidence-idempotency-20260903.md mode 0600 and atomically finalize existing receipt mode 0600 with exact counts and hashes. LGTM only P0=0\x1b[0m',
+      '\x1b[2mP1=0.\x1b[0m',
+      "\x1b[2mEnd exactly: C5_S7_FIX1_REVIEW_EVIDENCE <LGTM|CHANGES_REQUIRED|BLOCKED> P0=<n> P1=<n> P2=<n> hash=84b05f612863 live_mutated=no next=<BATCH_RECONCILE|FIX_LOOP>.' --resume\x1b[0m",
+      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /home/kemkem23/kemcortex/topics/hs-server --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
+      '',
+    ];
+
+    const detection = detectCodexToolBlocks(fixture174to190);
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]).toMatchObject({
+      kind: 'background-wait',
+      outcome: 'completed',
+      sourceRange: { startLine: 1, endLine: 16 },
+      proofRange: { startLine: 1, endLine: 17 },
+      collapseRanges: [{ startLine: 1, endLine: 16 }],
+    });
+
+    const projection = projectToolLines(fixture174to190, { blocks: detection.blocks });
+    expect(projection.lines).toEqual([
+      '',
+      'Codex background wait ซ่อนอยู่ · 15 แถว',
+      '',
+    ]);
+  });
 });

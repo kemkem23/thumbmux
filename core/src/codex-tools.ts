@@ -309,6 +309,71 @@ function dimDetailRows(header: string): (raw: string) => boolean {
   };
 }
 
+type ShellQuoteState = { single: boolean; double: boolean };
+
+function updateShellQuotes(raw: string, quotes: ShellQuoteState): void {
+  const text = stripTerminalControls(raw);
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (quotes.single) {
+      if (char === "'") quotes.single = false;
+    } else if (quotes.double) {
+      if (char === '\\') {
+        i += 1;
+      } else if (char === '"') {
+        quotes.double = false;
+      }
+    } else {
+      if (char === '\\') {
+        i += 1;
+      } else if (char === "'") {
+        quotes.single = true;
+      } else if (char === '"') {
+        quotes.double = true;
+      }
+    }
+  }
+}
+
+function commandDetailRows(header: string): {
+  accepts: (raw: string, bodyOffset: number) => boolean;
+  isContinuationDetail: (raw: string) => boolean;
+} {
+  const headerPaint = dimPaintEvidence(header, { dim: false, foreground: null });
+  let inherited = { dim: headerPaint.endDim, foreground: headerPaint.endForegroundKey };
+  const quotes: ShellQuoteState = { single: false, double: false };
+  updateShellQuotes(header, quotes);
+
+  return {
+    accepts: (raw: string, _bodyOffset: number) => {
+      const evidence = dimPaintEvidence(raw, inherited);
+      inherited = { dim: evidence.endDim, foreground: evidence.endForegroundKey };
+      const currentlyInQuotes = quotes.single || quotes.double;
+      updateShellQuotes(raw, quotes);
+
+      if (evidence.hasSemanticCell && evidence.firstSemanticCellDim) {
+        return true;
+      }
+
+      // Soft-wrapped rows inside an unclosed command quote (e.g. bash multiline prompt)
+      // where terminal wrap or capture pane omitted the leading faint SGR.
+      if (
+        currentlyInQuotes
+        && evidence.hasSemanticCell
+        && hasOnlyCompleteTerminalControls(raw)
+      ) {
+        return true;
+      }
+
+      return false;
+    },
+    isContinuationDetail: (raw: string) => {
+      const evidence = dimPaintEvidence(raw, { dim: false, foreground: null });
+      return evidence.hasSemanticCell && evidence.firstSemanticCellDim;
+    },
+  };
+}
+
 function foregroundPalette(raw: string): ReadonlySet<string> {
   const colors = new Set<string>();
   let state: PaintState = { dim: false, foreground: null };
@@ -440,6 +505,7 @@ function sealedBody(
   maxBlockChars: number,
   acceptsRow: (raw: string, bodyOffset: number) => boolean,
   allowDimBoundaryContinuation = false,
+  isContinuationDetail?: (raw: string) => boolean,
 ): SealedBody | null {
   const maximumEnd = Math.min(rawLines.length, startLine + maxBlockLines + 1);
   const bodyLines: string[] = [];
@@ -448,6 +514,33 @@ function sealedBody(
   for (let line = startLine + 1; line < maximumEnd; line += 1) {
     const raw = rawLines[line] ?? '';
     if (isSealRow(raw)) {
+      if (isContinuationDetail) {
+        let nextLine = line + 1;
+        while (nextLine < maximumEnd && isSealRow(rawLines[nextLine] ?? '')) {
+          nextLine += 1;
+        }
+
+        if (nextLine < maximumEnd) {
+          const nextRaw = rawLines[nextLine] ?? '';
+          const nextIsProtected = isProtectedSemanticRow(
+            nextRaw,
+            allowDimBoundaryContinuation && bodyLines.length > 0,
+          );
+          const nextIsDetail = !nextIsProtected && isContinuationDetail(nextRaw);
+
+          if (nextIsDetail) {
+            for (let b = line; b < nextLine; b += 1) {
+              const blankRaw = rawLines[b] ?? '';
+              candidateChars += blankRaw.length;
+              if (candidateChars > maxBlockChars) return null;
+              bodyLines.push(blankRaw);
+            }
+            line = nextLine - 1;
+            continue;
+          }
+        }
+      }
+
       const sourceEnd = line;
       if (sourceEnd <= startLine || sourceEnd - startLine > maxBlockLines) return null;
       return { sourceEnd, proofEnd: line + 1, bodyLines };
@@ -614,13 +707,15 @@ function parseAt(
 
   const waited = WAITED.exec(raw);
   if (waited) {
+    const detail = commandDetailRows(raw);
     const body = sealedBody(
       rawLines,
       startLine,
       maxBlockLines,
       maxBlockChars,
-      dimDetailRows(raw),
+      detail.accepts,
       true,
+      detail.isContinuationDetail,
     );
     if (!body) return null;
     return wholeBlock(
@@ -635,13 +730,15 @@ function parseAt(
 
   const backgroundInteraction = BACKGROUND_INTERACTION.exec(raw);
   if (backgroundInteraction) {
+    const detail = commandDetailRows(raw);
     const body = sealedBody(
       rawLines,
       startLine,
       maxBlockLines,
       maxBlockChars,
-      dimDetailRows(raw),
+      detail.accepts,
       true,
+      detail.isContinuationDetail,
     );
     if (!body) return null;
     return wholeBlock(
