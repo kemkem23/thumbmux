@@ -1,7 +1,20 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.14-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.15-dist`.
+
+## v0.18.15 — 2026-09-04
+
+### Fixed
+
+- **Codex tool blocks no longer seal prematurely when multiline commands have internal blank lines.**
+  Internal blank lines within command invocations (such as prompt arguments with paragraph breaks)
+  are absorbed into the block body when followed by verified continuation detail rows, while
+  preserving strict fail-open boundaries and never collapsing assistant prose, user prompts,
+  or system status markers.
+- **Background terminal command continuation tracks unclosed shell quotes and soft-wrapped rows.**
+  Rows wrapped without leading SGR faint paint within command quotes are safely kept in the
+  block without truncating the tool range or spilling raw command tokens into visible text.
 
 ## v0.18.14 — 2026-09-03
 
