@@ -1227,27 +1227,41 @@ class Proxy:
         except KeyError:
             pass
 
-    def read_master_once(self) -> bool:
+    def pull_master_bytes(self, limit: Optional[int] = None) -> bytes:
         if self.child is None or self.master_eof:
-            return False
+            return b""
+        size = self.config["maxOutputRecordBytes"] if limit is None else limit
+        if size <= 0:
+            return b""
         try:
-            payload = os.read(self.child.master_fd, self.config["maxOutputRecordBytes"])
+            payload = os.read(self.child.master_fd, size)
         except BlockingIOError:
-            return False
+            return b""
         except OSError as error:
             if error.errno == errno.EIO:
                 self.master_eof = True
-                return False
+                return b""
             raise
         if not payload:
             self.master_eof = True
+        return payload
+
+    def read_master_once(self) -> bool:
+        payload = self.pull_master_bytes()
+        if not payload:
             return False
         self.append_output_and_display(payload)
         return True
 
     def drain_master(self) -> None:
+        """Empty the inner PTY. Live I/O must not call this."""
         while self.read_master_once():
             pass
+
+    def service_outer_input(self) -> None:
+        self.read_outer()
+        if self.pending_input:
+            self.write_pending_input()
 
     def read_outer(self) -> None:
         remaining = self.config["maxPendingInputBytes"] - len(self.pending_input)
@@ -1663,6 +1677,8 @@ class Proxy:
 
             timeout = max(0.0, self.config["heartbeatMs"] / 1000 - (time.monotonic() - self.last_health_at))
             events = self.selector.select(timeout)
+            master_read = False
+            master_write = False
             for key, mask in events:
                 kind = key.data
                 if kind == "server":
@@ -1671,9 +1687,9 @@ class Proxy:
                     self.read_control(key.fileobj)
                 elif kind == "master":
                     if mask & selectors.EVENT_READ:
-                        self.drain_master()
+                        master_read = True
                     if mask & selectors.EVENT_WRITE:
-                        self.write_pending_input()
+                        master_write = True
                 elif kind == "outer":
                     self.read_outer()
                 elif kind == "signal":
@@ -1684,6 +1700,22 @@ class Proxy:
                         pass
                 elif kind == "child-error":
                     self.read_exec_error()
+            # Live path: never drain-until-empty. Bytes already in hand are
+            # still fdatasync'd before the outer write (decision #2 stays 0 ms).
+            # Keystrokes are taken before that fdatasync so the child can echo
+            # during it, then taken again afterwards.
+            if master_write or self.pending_input:
+                self.write_pending_input()
+            if master_read:
+                payload = self.pull_master_bytes()
+                if payload:
+                    self.service_outer_input()
+                    room = self.config["maxOutputRecordBytes"] - len(payload)
+                    extra = self.pull_master_bytes(room) if room > 0 else b""
+                    if extra:
+                        payload += extra
+                    self.append_output_and_display(payload)
+                    self.service_outer_input()
             self.write_health(False)
 
     def start(self) -> int:
