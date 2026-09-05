@@ -1,7 +1,17 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.16-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.18.17-dist`.
+
+## v0.18.17 — 2026-09-05
+
+### Fixed
+
+- **Live PTY WAL proxy now yields after one output chunk so a flood cannot starve keys.**
+  The live loop reads one master chunk, services stdin, then `fdatasync`s that
+  chunk before displaying it. `drain_master()` remains only for frozen/exit
+  boundaries. Displayed bytes still hit disk before the outer write (decision
+  #2 stays 0 ms). No RAM buffer and no 25 ms batched flush.
 
 ## v0.18.16 — 2026-09-04
 
