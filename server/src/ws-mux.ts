@@ -2449,4 +2449,17 @@ export class TmuxWsMux<
     }
   }
 
+  /**
+   * Reconcile and push the current authoritative session inventory now.
+   *
+   * @deprecated since v0.18.18 — use pushSessionInventory; removal no earlier than v0.19.0
+   */
+  broadcastSessionList(): void {
+    warnDeprecated("TmuxWsMux.broadcastSessionList", {
+      since: "0.18.18",
+      replacement: "pushSessionInventory",
+      removeNoEarlierThan: "0.19.0",
+    });
+    this.pushSessionInventory();
+  }
 }
