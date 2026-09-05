@@ -25,6 +25,14 @@ const ciWorkflow = readFileSync(
 );
 const parity = readFileSync(resolve(import.meta.dir, "ci-parity.sh"), "utf8");
 const smoke = readFileSync(resolve(import.meta.dir, "smoke-git-dist.sh"), "utf8");
+const contractFixtures = readFileSync(
+  resolve(import.meta.dir, "contract-fixtures.sh"),
+  "utf8",
+);
+const repairPSmokeScenarios = readFileSync(
+  resolve(import.meta.dir, "repair-20260905-P-smoke-scenarios.sh"),
+  "utf8",
+);
 const e2eRunner = readFileSync(resolve(packageRoot, "e2e/run-container.sh"), "utf8");
 const e2eConfig = readFileSync(resolve(packageRoot, "e2e/playwright.config.ts"), "utf8");
 const e2eHelpers = readFileSync(resolve(packageRoot, "e2e/helpers.ts"), "utf8");
@@ -266,6 +274,10 @@ describe("release rail policy", () => {
       // without proving pack readiness.
       "bun pm pack",
       "smoke:git-dist",
+      "repair-20260905-P-smoke-scenarios.sh",
+      "THUMBMUX_SMOKE_ARTIFACT_OUT:",
+      "THUMBMUX_CONTRACT_TARBALL:",
+      "retain verified package artifact",
       "materialize-contract-baseline.ts",
       "THUMBMUX_CONTRACT_BASELINE_ROOT=",
       "bun run contract",
@@ -287,7 +299,9 @@ describe("release rail policy", () => {
     const playwrightInstallStep = gate.indexOf("- name: install Playwright Chromium");
     const e2eStep = gate.indexOf("- name: canonical container e2e");
     const smokeStep = gate.indexOf("- name: root git-dist consumer smoke");
+    const smokeScenariosStep = gate.indexOf("- name: repair P smoke failure and TERM cleanup");
     const fixturesStep = gate.indexOf("- name: frozen consumer contract gate");
+    const packageArtifactStep = gate.indexOf("- name: retain verified package artifact");
     const unitStep = gate.indexOf("- name: unit and contract suites");
     expect(nodeSetupStep).toBeGreaterThan(-1);
     expect(bunSetupStep).toBeGreaterThan(nodeSetupStep);
@@ -296,7 +310,9 @@ describe("release rail policy", () => {
     expect(e2eStep).toBeGreaterThan(playwrightInstallStep);
     expect(e2eStep).toBeGreaterThan(-1);
     expect(smokeStep).toBeGreaterThan(e2eStep);
-    expect(fixturesStep).toBeGreaterThan(smokeStep);
+    expect(smokeScenariosStep).toBeGreaterThan(smokeStep);
+    expect(fixturesStep).toBeGreaterThan(smokeScenariosStep);
+    expect(packageArtifactStep).toBeGreaterThan(fixturesStep);
     expect(unitStep).toBeGreaterThan(fixturesStep);
     expect(gate.indexOf("- name: root git-dist consumer smoke", smokeStep + 1)).toBe(-1);
     expect(gate.indexOf("- name: frozen consumer contract gate", fixturesStep + 1)).toBe(-1);
@@ -332,6 +348,34 @@ describe("release rail policy", () => {
         expect(match[1]).toBe(gatePin);
       }
     }
+  });
+
+  test("one attested candidate artifact crosses smoke, frozen fixtures, and retention", () => {
+    const gate = readVerifyGate();
+    const candidate = "${{ runner.temp }}/thumbmux-candidate-${{ github.sha }}.tgz";
+    expect(gate.match(new RegExp(candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))?.length)
+      .toBe(3);
+    expect(smoke).toContain('expected_artifact="${RUNNER_TEMP-}/thumbmux-candidate-${GITHUB_SHA-}.tgz"');
+    expect(smoke).toContain('/usr/bin/install -m 0600 -- "$PACKAGE_TARBALL" "$ARTIFACT_OUT"');
+    expect(contractFixtures).toContain('expected_tarball="${RUNNER_TEMP-}/thumbmux-candidate-${GITHUB_SHA-}.tgz"');
+    expect(contractFixtures).toContain('/usr/bin/cmp -s -- "$THUMBMUX_CONTRACT_TARBALL" "$PACKAGE_TARBALL"');
+  });
+
+  test("repair P exercises intentional post-prereq failure and TERM cleanup", () => {
+    expect(smoke).toContain("fail-after-prereq|term-after-prereq");
+    expect(smoke).toContain("fault-ready phase=after-prereq action=fail rc=86");
+    expect(smoke).toContain("fault-ready phase=after-prereq action=wait-for-TERM");
+    expect(repairPSmokeScenarios).toContain('[[ "$rc" == 86 ]]');
+    expect(repairPSmokeScenarios).toContain('[[ "$rc" == 143 ]]');
+    expect(repairPSmokeScenarios).toContain("containers=0 images=0");
+    expect(smoke).toContain('--filter "label=com.kemcortex.thumbmux.run-id=$RUN_ID"');
+    expect(smoke).toContain('docker images -q "thumbmux-node18-prereqs-$RUN_ID"');
+    expect(smoke).toContain(
+      'git-dist smoke: cleanup run-id=$RUN_ID containers=$container_count images=$image_count',
+    );
+    expect(smoke.indexOf('/usr/bin/docker rm -f "$CONTAINER_ID"')).toBeLessThan(
+      smoke.indexOf('git-dist smoke: cleanup run-id=$RUN_ID'),
+    );
   });
 
   test("CI and release reject focused Playwright tests inside the attested canonical run", () => {

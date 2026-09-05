@@ -3,6 +3,20 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.18.17-dist`.
 
+## v0.18.18 — 2026-09-05
+
+### Changed
+
+- **Added `TmuxWsMux.pushSessionInventory()` as the narrower, mutation-focused method name.**
+  Reconciles and pushes authoritative session inventory immediately to subscribers, matching
+  its actual job ("push inventory after mutation") rather than implying a broadcast of everything.
+
+### Deprecated
+
+- **`TmuxWsMux.broadcastSessionList()` is deprecated in favor of `TmuxWsMux.pushSessionInventory()`.**
+  The old name remains functional as an alias and delegates directly to `pushSessionInventory()`
+  with a one-time process deprecation warning. Removal is scheduled no earlier than v0.19.0.
+
 ## v0.18.17 — 2026-09-05
 
 ### Fixed

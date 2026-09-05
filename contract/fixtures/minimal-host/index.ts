@@ -247,6 +247,10 @@ async function main(): Promise<void> {
     burstDurationMs: 1_000,
     pollReconcileMs: 200,
   });
+  // Frozen consumers keep calling the legacy public spelling throughout its
+  // promised removal window. This call must compile and execute against the
+  // packed artifact, while the package emits its one-time warning.
+  mux.broadcastSessionList();
 
   let server: FixtureServer | undefined;
   let serverSocket: LiveSocket | undefined;

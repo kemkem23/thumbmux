@@ -83,12 +83,27 @@ runs:
     - name: root git-dist consumer smoke
       run: bun run build:git-dist && bun run smoke:git-dist
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+      env:
+        THUMBMUX_SMOKE_ARTIFACT_OUT: ${{ runner.temp }}/thumbmux-candidate-${{ github.sha }}.tgz
+    - name: repair P smoke failure and TERM cleanup
+      if: github.event_name == 'pull_request'
+      run: ./scripts/repair-20260905-P-smoke-scenarios.sh
+      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
     - name: frozen consumer contract gate
       # This lane has the same clean-checkout admission as container E2E and
       # root smoke. It consumes the git-dist built immediately above, so it
       # must run before unit/demo/pack lanes create source-tree scratch output.
       run: ./scripts/contract-fixtures.sh
       shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}
+      env:
+        THUMBMUX_CONTRACT_TARBALL: ${{ runner.temp }}/thumbmux-candidate-${{ github.sha }}.tgz
+    - name: retain verified package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: thumbmux-candidate-${{ github.sha }}
+        path: ${{ runner.temp }}/thumbmux-candidate-${{ github.sha }}.tgz
+        if-no-files-found: error
+        retention-days: 7
     # Combined process only — no per-workflow split suites. Split suites once
     # gave better failure locality on ci but meant release ran a different
     # process; a DOM-harness / preload interaction can fail under only one

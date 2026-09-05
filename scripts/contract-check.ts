@@ -34,11 +34,16 @@ export type LiveContractEntry = {
   };
   /** Raw text after the emitted declaration's @deprecated tag. */
   deprecatedDeclaration?: string;
+  /** Public class members, used to validate method-level deprecation aliases. */
+  members?: string[];
+  /** Raw @deprecated text keyed by the public class member carrying the tag. */
+  deprecatedMembers?: Record<string, string>;
 };
 
-export type ContractEntry = LiveContractEntry & {
+export type ContractEntry = Omit<LiveContractEntry, "deprecatedMembers"> & {
   tier: ContractTier;
   deprecated?: ContractDeprecation;
+  deprecatedMembers?: Record<string, ContractDeprecation>;
 };
 
 export type GitDistContractReport = Record<PublicSubpackage, LiveContractEntry[]>;
@@ -692,6 +697,45 @@ function deprecatedDeclarationText(symbol: ts.Symbol): string | undefined {
   return comments.find((comment) => comment.length > 0);
 }
 
+function publicClassMemberName(member: ts.ClassElement): string | undefined {
+  if (classMemberIsPrivate(member) || !member.name) return undefined;
+  if (
+    ts.isIdentifier(member.name)
+    || ts.isStringLiteral(member.name)
+    || ts.isNumericLiteral(member.name)
+  ) {
+    return member.name.text;
+  }
+  return member.name.getText();
+}
+
+function classMemberDeprecations(symbol: ts.Symbol): {
+  members: string[];
+  deprecatedMembers: Record<string, string>;
+} {
+  const members = new Set<string>();
+  const deprecatedMembers: Record<string, string> = {};
+  for (const declaration of symbol.declarations ?? []) {
+    if (!ts.isClassDeclaration(declaration)) continue;
+    for (const member of declaration.members) {
+      const name = publicClassMemberName(member);
+      if (!name) continue;
+      members.add(name);
+      const stamp = ts.getJSDocTags(member)
+        .filter((tag): tag is ts.JSDocDeprecatedTag => ts.isJSDocDeprecatedTag(tag))
+        .map((tag) => typeof tag.comment === "string"
+          ? tag.comment.trim()
+          : tag.comment?.map((part) => part.getText()).join("").trim() ?? "")
+        .find((comment) => comment.length > 0);
+      if (stamp) deprecatedMembers[name] = stamp;
+    }
+  }
+  return {
+    members: [...members].sort(),
+    deprecatedMembers,
+  };
+}
+
 function componentPropsSignature(
   checker: ts.TypeChecker,
   symbol: ts.Symbol,
@@ -798,6 +842,7 @@ export function deriveGitDistReport(
       // would inspect the replacement declaration and lose the stamp attached
       // to `export { replacement as oldName }`.
       const deprecatedDeclaration = deprecatedDeclarationText(exportedSymbol);
+      const memberDeprecations = classMemberDeprecations(symbol);
       const optionalAddition = isComponent
         ? componentOptionalAdditionModel(checker, symbol, name, declarationRoot)
         : declarationOptionalAdditionModel(checker, symbol, declarationRoot);
@@ -812,6 +857,12 @@ export function deriveGitDistReport(
           : compatibilityDeclarationSignature(checker, symbol, declarationRoot),
         optionalAddition,
         ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}),
+        ...(memberDeprecations.members.length > 0
+          ? { members: memberDeprecations.members }
+          : {}),
+        ...(Object.keys(memberDeprecations.deprecatedMembers).length > 0
+          ? { deprecatedMembers: memberDeprecations.deprecatedMembers }
+          : {}),
       };
     }).sort((left, right) => left.name.localeCompare(right.name));
 
@@ -884,7 +935,32 @@ export function readContractManifest(
         replacement: assertStringField(item.deprecated, "replacement", `${context}.deprecated`),
       };
     }
-    return { name, kind, tier, signature, ...(deprecated ? { deprecated } : {}) };
+    let deprecatedMembers: Record<string, ContractDeprecation> | undefined;
+    if (item.deprecatedMembers !== undefined) {
+      if (!isRecord(item.deprecatedMembers)) {
+        throw new Error(`${context}.deprecatedMembers must be an object`);
+      }
+      deprecatedMembers = {};
+      for (const [member, metadata] of Object.entries(item.deprecatedMembers)) {
+        const memberContext = `${context}.deprecatedMembers.${member}`;
+        if (!member || !isRecord(metadata)) {
+          throw new Error(`${memberContext} must be a non-empty member name and object`);
+        }
+        deprecatedMembers[member] = {
+          since: assertStringField(metadata, "since", memberContext),
+          removeNoEarlierThan: assertStringField(metadata, "removeNoEarlierThan", memberContext),
+          replacement: assertStringField(metadata, "replacement", memberContext),
+        };
+      }
+    }
+    return {
+      name,
+      kind,
+      tier,
+      signature,
+      ...(deprecated ? { deprecated } : {}),
+      ...(deprecatedMembers ? { deprecatedMembers } : {}),
+    };
   });
 }
 
@@ -1039,6 +1115,80 @@ export function evaluateManifest(
         expected,
         `deprecated export "${expected.name}" has an emitted declaration stamp but no manifest metadata`,
       ));
+    }
+    if (actual) {
+      const memberNames = new Set(actual.members ?? []);
+      const declaredMembers = expected.deprecatedMembers ?? {};
+      const emittedMembers = actual.deprecatedMembers ?? {};
+      for (const [member, metadata] of Object.entries(declaredMembers)) {
+        const entry = { name: `${expected.name}.${member}` };
+        if (!validDeprecationWindow(metadata.since, metadata.removeNoEarlierThan)) {
+          errors.push(diagnostic(
+            "deprecated-window-invalid",
+            subpath,
+            entry,
+            `deprecated member "${entry.name}" has an invalid removal window ${metadata.since} → ${metadata.removeNoEarlierThan}`,
+          ));
+        }
+        if (metadata.replacement === member || !memberNames.has(metadata.replacement)) {
+          errors.push(diagnostic(
+            "deprecated-replacement-missing",
+            subpath,
+            entry,
+            `deprecated member "${entry.name}" replacement "${metadata.replacement}" is not a live distinct member`,
+          ));
+        }
+        if (!memberNames.has(member)) {
+          const collection = compareVersions(currentVersion, metadata.removeNoEarlierThan) < 0
+            ? errors
+            : summaries;
+          collection.push(diagnostic(
+            compareVersions(currentVersion, metadata.removeNoEarlierThan) < 0
+              ? "deprecated-early-removal"
+              : "deprecated-removal-eligible",
+            subpath,
+            entry,
+            compareVersions(currentVersion, metadata.removeNoEarlierThan) < 0
+              ? `deprecated member "${entry.name}" was removed before ${metadata.removeNoEarlierThan}`
+              : `deprecated member "${entry.name}" is absent at an eligible removal version`,
+          ));
+          continue;
+        }
+        const stamp = `since v${metadata.since} — use ${metadata.replacement}; removal no earlier than v${metadata.removeNoEarlierThan}`;
+        if (!emittedMembers[member]) {
+          errors.push(diagnostic(
+            "deprecated-declaration-missing",
+            subpath,
+            entry,
+            `deprecated member "${entry.name}" has no emitted @deprecated declaration stamp`,
+          ));
+        } else if (emittedMembers[member] !== stamp) {
+          errors.push(diagnostic(
+            "deprecated-declaration-mismatch",
+            subpath,
+            entry,
+            `deprecated member "${entry.name}" declaration stamp does not match its manifest metadata`,
+          ));
+        }
+        if (compareVersions(currentVersion, metadata.removeNoEarlierThan) >= 0) {
+          warnings.push(diagnostic(
+            "deprecated-removal-due",
+            subpath,
+            entry,
+            `deprecated member "${entry.name}" remains after ${metadata.removeNoEarlierThan}`,
+          ));
+        }
+      }
+      for (const member of Object.keys(emittedMembers)) {
+        if (declaredMembers[member]) continue;
+        const entry = { name: `${expected.name}.${member}` };
+        errors.push(diagnostic(
+          "deprecated-manifest-missing",
+          subpath,
+          entry,
+          `deprecated member "${entry.name}" has an emitted declaration stamp but no manifest metadata`,
+        ));
+      }
     }
     if (!actual) {
       if (expected.deprecated) {
@@ -1281,6 +1431,31 @@ function isV01816PatchException(
   return V01816_REVIEWED_ADDITIONS.has(reviewed);
 }
 
+/**
+ * Additive `TmuxWsMux.pushSessionInventory()` alias and `broadcastSessionList()`
+ * deprecation reviewed for 0.18.17 -> 0.18.18. The class method adds a narrower,
+ * mutation-focused method name while keeping the deprecated broadcastSessionList()
+ * alias fully functional.
+ */
+const V01818_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:0cd8e42c83784c872b4bb3f9b35c99c2efb817c71f68d1f55e990a2c4a84b22e:837535d472b4debf60589f2769f99dac52e89a85c1917cb27c8b5f8314b7e9b1",
+  "server:createAppRoutes:f541e3c9bd9791bfb98c9a083ff3ea0a02bddd2551c091ffb69cc271f11ce3dc:78466f944c750f9fab528c7c46c2dfb432e3b358ff6bc15aae031fa5ea51fb40",
+  "server:TmuxWsMux:b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782:9ba44fbc46c195803b405d3f7ba45377dbcda95c6cab5ac88911ebbe7ce20f68",
+]);
+
+function isV01818PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.18.17" || currentVersion !== "0.18.18") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V01818_REVIEWED_ADDITIONS.has(reviewed);
+}
+
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1406,6 +1581,30 @@ export function evaluateBaseline(
         `immutable deprecation metadata for "${previous.name}" was removed or changed`,
       ));
     }
+    const previousDeprecatedMembers = previous.deprecatedMembers ?? {};
+    const nextDeprecatedMembers = next.deprecatedMembers ?? {};
+    for (const [member, metadata] of Object.entries(nextDeprecatedMembers)) {
+      if (
+        !previousDeprecatedMembers[member]
+        && compareVersions(metadata.since, currentVersion) !== 0
+      ) {
+        errors.push(diagnostic(
+          "deprecated-since-version-mismatch",
+          subpath,
+          { name: `${previous.name}.${member}` },
+          `new deprecation metadata for "${previous.name}.${member}" says ${metadata.since}, expected ${currentVersion}`,
+        ));
+      }
+    }
+    for (const [member, metadata] of Object.entries(previousDeprecatedMembers)) {
+      if (JSON.stringify(metadata) === JSON.stringify(nextDeprecatedMembers[member])) continue;
+      errors.push(diagnostic(
+        "baseline-tier-weakening",
+        subpath,
+        { name: `${previous.name}.${member}` },
+        `immutable deprecation metadata for "${previous.name}.${member}" was removed or changed`,
+      ));
+    }
 
     const signatureChanged = (
       previousLive.compatibilitySignature ?? previousLive.signature
@@ -1480,6 +1679,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV01816PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV01818PatchException(
           baselineVersion,
           currentVersion,
           subpath,

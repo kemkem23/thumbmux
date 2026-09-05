@@ -6,6 +6,7 @@ import {
   checkContract,
   deriveGitDistReport,
   evaluateBaseline,
+  evaluateManifest,
   resolveBaselineMode,
   type ContractEntry,
   type ContractTier,
@@ -360,6 +361,73 @@ describe("contract surface policy", () => {
       "0.18.17",
     ).errors.map(({ code, name: exportName }) => [code, exportName]))
       .toContainEqual(["baseline-signature-change", name]);
+  });
+
+  test("the v0.18.18 pushSessionInventory alias requires the exact patch and digest pair", () => {
+    const name = "TmuxWsMux";
+    const baselineDigest = "b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782";
+    const reviewedDigest = "9ba44fbc46c195803b405d3f7ba45377dbcda95c6cab5ac88911ebbe7ce20f68";
+    const manifest: ContractEntry[] = [{
+      name,
+      kind: "value",
+      signature: reviewedDigest,
+      tier: "F",
+    }];
+    const baselineLive = [{
+      name,
+      kind: "value" as const,
+      signature: baselineDigest,
+      compatibilitySignature: baselineDigest,
+    }];
+    const currentLive = [{
+      name,
+      kind: "value" as const,
+      signature: reviewedDigest,
+      compatibilitySignature: reviewedDigest,
+    }];
+
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.17",
+      "0.18.18",
+    ).errors).toEqual([]);
+
+    const wrongDigest = [{
+      ...currentLive[0]!,
+      compatibilitySignature: `${reviewedDigest.slice(0, -1)}0`,
+    }];
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      wrongDigest,
+      "0.18.17",
+      "0.18.18",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+
+    for (const [baselineVersion, currentVersion] of [
+      ["0.18.17", "0.18.17"],
+      ["0.18.18", "0.18.18"],
+      ["0.18.16", "0.18.18"],
+      ["0.18.17", "0.18.19"],
+    ] as const) {
+      expect(evaluateBaseline(
+        "server",
+        [{ ...manifest[0]!, signature: baselineDigest }],
+        manifest,
+        baselineLive,
+        currentLive,
+        baselineVersion,
+        currentVersion,
+      ).errors.map(({ code, name: exportName }) => [code, exportName]))
+        .toContainEqual(["baseline-signature-change", name]);
+    }
   });
 
   test("a minor may add optional members without weakening existing F members", () => {
@@ -889,6 +957,55 @@ describe("contract surface policy", () => {
 
     expect(runFixture(root).errors.filter(({ code }) => code.startsWith("deprecated-")))
       .toEqual([]);
+  });
+
+  test("accepts method-level deprecation metadata without deprecating its class", () => {
+    const metadata = {
+      since: "0.18.18",
+      removeNoEarlierThan: "0.19.0",
+      replacement: "pushSessionInventory",
+    };
+    const manifest: ContractEntry[] = [{
+      name: "TmuxWsMux",
+      kind: "value",
+      signature: "a".repeat(64),
+      tier: "F",
+      deprecatedMembers: { broadcastSessionList: metadata },
+    }];
+    const live = [{
+      name: "TmuxWsMux",
+      kind: "value" as const,
+      signature: "a".repeat(64),
+      members: ["broadcastSessionList", "pushSessionInventory"],
+      deprecatedMembers: {
+        broadcastSessionList:
+          "since v0.18.18 — use pushSessionInventory; removal no earlier than v0.19.0",
+      },
+    }];
+
+    expect(evaluateManifest("server", manifest, live, "0.18.18").errors).toEqual([]);
+
+    const missingMemberStamp = [{ ...live[0]!, deprecatedMembers: {} }];
+    expect(evaluateManifest(
+      "server",
+      manifest,
+      missingMemberStamp,
+      "0.18.18",
+    ).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["deprecated-declaration-missing", "TmuxWsMux.broadcastSessionList"]);
+
+    const classLevelStamp = [{
+      ...live[0]!,
+      deprecatedDeclaration:
+        "since v0.18.18 — use pushSessionInventory; removal no earlier than v0.19.0",
+    }];
+    expect(evaluateManifest(
+      "server",
+      manifest,
+      classLevelStamp,
+      "0.18.18",
+    ).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["deprecated-manifest-missing", "TmuxWsMux"]);
   });
 
   test("a new deprecation replacement must preserve the old consumer shape", () => {
