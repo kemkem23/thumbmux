@@ -26,6 +26,12 @@ CID_FILE=''
 CONTAINER_STARTED=0
 CLEANUP_FAILED=0
 RUN_COMPLETE=0
+SMOKE_TEST_MODE="${THUMBMUX_SMOKE_TEST_MODE-}"
+ARTIFACT_OUT="${THUMBMUX_SMOKE_ARTIFACT_OUT-}"
+
+now_ms() {
+  /usr/bin/date +%s%3N
+}
 
 assert_owned_container() {
   local identity
@@ -80,6 +86,18 @@ thumbmux_prepare_test_runtime git-dist-smoke "$PACKAGE_ROOT" \
   || { echo 'git-dist smoke: public disposable-CI attestation failed' >&2; exit 2; }
 RUN_ID="$(thumbmux_make_run_id)"
 thumbmux_bind_run_attestation "$RUN_ID" git-dist-smoke
+case "$SMOKE_TEST_MODE" in
+  ""|fail-after-prereq|term-after-prereq) ;;
+  *) echo "git-dist smoke: unknown attested test mode: $SMOKE_TEST_MODE" >&2; exit 2 ;;
+esac
+echo "git-dist smoke: run-id=$RUN_ID test-mode=${SMOKE_TEST_MODE:-success}"
+if [[ -n "$ARTIFACT_OUT" ]]; then
+  expected_artifact="${RUNNER_TEMP-}/thumbmux-candidate-${GITHUB_SHA-}.tgz"
+  [[ "$ARTIFACT_OUT" == "$expected_artifact" \
+    && "${RUNNER_TEMP-}" == /home/runner/work/_temp \
+    && ! -e "$ARTIFACT_OUT" && ! -L "$ARTIFACT_OUT" ]] \
+    || { echo 'git-dist smoke: attested artifact output path is invalid or already exists' >&2; exit 2; }
+fi
 PACKAGE_SOURCE="$THUMBMUX_GUARD_RUNTIME/source"
 /usr/bin/install -d -m 0700 "$PACKAGE_SOURCE"
 thumbmux_emit_frozen_source_archive \
@@ -166,6 +184,12 @@ for asset in \
     exit 1
   }
 done
+if [[ -n "$ARTIFACT_OUT" ]]; then
+  /usr/bin/install -m 0600 -- "$PACKAGE_TARBALL" "$ARTIFACT_OUT"
+  [[ ! -L "$ARTIFACT_OUT" && -f "$ARTIFACT_OUT" ]] \
+    || { echo 'git-dist smoke: exported candidate artifact is not a regular file' >&2; exit 1; }
+  echo "git-dist smoke: artifact=$ARTIFACT_OUT sha256=$(/usr/bin/sha256sum "$ARTIFACT_OUT" | /usr/bin/cut -d' ' -f1)"
+fi
 cp -R "$FIXTURE/." "$WORK/bun-consumer/"
 "$THUMBMUX_GUARD_BUN_BIN" --no-install "$EXPORT_GUARD" write-consumer-guards "$WORK/bun-consumer" "$EXPECTED_SOURCE_ROOT"
 (
@@ -209,13 +233,31 @@ set +e
 thumbmux_recheck_docker_attestation \
   || { echo 'git-dist smoke: Docker daemon changed before Node 18 container creation' >&2; exit 1; }
 PREREQ_IMAGE="thumbmux-node18-prereqs-${RUN_ID}"
+DOWNLOAD_STARTED="$(now_ms)"
+/usr/bin/docker pull node:18-alpine >/dev/null
+DOWNLOAD_RC=$?
+DOWNLOAD_MS=$(( $(now_ms) - DOWNLOAD_STARTED ))
+echo "git-dist smoke: timing download_ms=$DOWNLOAD_MS rc=$DOWNLOAD_RC"
+(( DOWNLOAD_RC == 0 )) \
+  || { echo "git-dist smoke: base image download exited $DOWNLOAD_RC" >&2; exit "$DOWNLOAD_RC"; }
+BUILD_STARTED="$(now_ms)"
 /usr/bin/docker build -t "$PREREQ_IMAGE" - <<'EOF' >/dev/null
 FROM node:18-alpine
 RUN timeout 120 apk add --no-cache python3 tmux
 EOF
 BUILD_RC=$?
+BUILD_MS=$(( $(now_ms) - BUILD_STARTED ))
+echo "git-dist smoke: timing build_ms=$BUILD_MS rc=$BUILD_RC"
 (( BUILD_RC == 0 )) \
   || { echo "git-dist smoke: prerequisite image build exited $BUILD_RC" >&2; exit "$BUILD_RC"; }
+if [[ "$SMOKE_TEST_MODE" == fail-after-prereq ]]; then
+  echo 'git-dist smoke: fault-ready phase=after-prereq action=fail rc=86'
+  exit 86
+fi
+if [[ "$SMOKE_TEST_MODE" == term-after-prereq ]]; then
+  echo 'git-dist smoke: fault-ready phase=after-prereq action=wait-for-TERM'
+  while :; do /usr/bin/sleep 0.1; done
+fi
 /usr/bin/timeout 240 /usr/bin/docker run \
   --cidfile "$CID_FILE" \
   --name "$CONTAINER" \
@@ -227,11 +269,17 @@ BUILD_RC=$?
   "$PREREQ_IMAGE" sh -lc '
   mkdir /app && cd /app
   npm init -y >/dev/null 2>&1
+  install_started=$(node -e "process.stdout.write(String(Date.now()))")
   npm install --ignore-scripts /tmp/thumbmux.tgz >/dev/null 2>&1
+  install_ms=$(( $(node -e "process.stdout.write(String(Date.now()))") - install_started ))
+  echo "git-dist smoke: timing install_ms=$install_ms rc=0"
   cp /tmp/runtime-export-guard.mjs /app/runtime-export-guard.mjs
   cp /tmp/node18-replay-lock-smoke.mjs /app/node18-replay-lock-smoke.mjs
+  code_started=$(node -e "process.stdout.write(String(Date.now()))")
   node runtime-export-guard.mjs
   node node18-replay-lock-smoke.mjs
+  code_ms=$(( $(node -e "process.stdout.write(String(Date.now()))") - code_started ))
+  echo "git-dist smoke: timing code_ms=$code_ms rc=0"
 '
 DOCKER_RC=$?
 set -e

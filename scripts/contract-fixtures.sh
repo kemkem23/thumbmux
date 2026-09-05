@@ -206,20 +206,33 @@ for path in \
   [[ -e "$path" ]] || { echo "contract fixtures: missing package input $path" >&2; exit 1; }
 done
 
-mkdir -p "$WORK/package"
-cp "$PACKAGE_SOURCE/package.json" "$PACKAGE_SOURCE/README.md" "$PACKAGE_SOURCE/LICENSE" "$WORK/package/"
-cp -R "$PACKAGE_SOURCE/docs" "$PACKAGE_SOURCE/git-dist" "$WORK/package/"
+if [[ -n "${THUMBMUX_CONTRACT_TARBALL-}" ]]; then
+  expected_tarball="${RUNNER_TEMP-}/thumbmux-candidate-${GITHUB_SHA-}.tgz"
+  [[ "$THUMBMUX_CONTRACT_TARBALL" == "$expected_tarball" \
+    && "${RUNNER_TEMP-}" == /home/runner/work/_temp \
+    && -f "$THUMBMUX_CONTRACT_TARBALL" && ! -L "$THUMBMUX_CONTRACT_TARBALL" ]] \
+    || { echo 'contract fixtures: attested shared tarball is invalid' >&2; exit 2; }
+  PACKAGE_TARBALL="$WORK/thumbmux-candidate.tgz"
+  /usr/bin/install -m 0600 -- "$THUMBMUX_CONTRACT_TARBALL" "$PACKAGE_TARBALL"
+  /usr/bin/cmp -s -- "$THUMBMUX_CONTRACT_TARBALL" "$PACKAGE_TARBALL" \
+    || { echo 'contract fixtures: shared tarball changed while freezing' >&2; exit 1; }
+  echo "contract fixtures: shared artifact sha256=$(/usr/bin/sha256sum "$PACKAGE_TARBALL" | /usr/bin/cut -d' ' -f1)"
+else
+  mkdir -p "$WORK/package"
+  cp "$PACKAGE_SOURCE/package.json" "$PACKAGE_SOURCE/README.md" "$PACKAGE_SOURCE/LICENSE" "$WORK/package/"
+  cp -R "$PACKAGE_SOURCE/docs" "$PACKAGE_SOURCE/git-dist" "$WORK/package/"
 
-(
-  cd "$WORK/package"
-  npm pkg delete scripts workspaces
-  npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./app":{"types":"./git-dist/app/index.d.ts","svelte":"./git-dist/app/index.js"},"./package.json":"./package.json"}' --json
-  npm pkg set files='["git-dist","docs"]' --json
-  npm pack --pack-destination "$WORK" --silent >/dev/null
-)
+  (
+    cd "$WORK/package"
+    npm pkg delete scripts workspaces
+    npm pkg set exports='{"./core":{"types":"./git-dist/core/index.d.ts","import":"./git-dist/core/index.js"},"./server":{"types":"./git-dist/server/index.d.ts","import":"./git-dist/server/index.js"},"./svelte":{"types":"./git-dist/svelte/index.d.ts","svelte":"./git-dist/svelte/index.js"},"./app":{"types":"./git-dist/app/index.d.ts","svelte":"./git-dist/app/index.js"},"./package.json":"./package.json"}' --json
+    npm pkg set files='["git-dist","docs"]' --json
+    npm pack --pack-destination "$WORK" --silent >/dev/null
+  )
 
-PACKAGE_TARBALL="$(find "$WORK" -maxdepth 1 -name 'thumbmux-*.tgz' -print -quit)"
-[[ -n "$PACKAGE_TARBALL" ]] || { echo "contract fixtures: npm pack produced no tarball" >&2; exit 1; }
+  PACKAGE_TARBALL="$(find "$WORK" -maxdepth 1 -name 'thumbmux-*.tgz' -print -quit)"
+  [[ -n "$PACKAGE_TARBALL" ]] || { echo "contract fixtures: npm pack produced no tarball" >&2; exit 1; }
+fi
 
 install_consumer() {
   local fixture="$1"

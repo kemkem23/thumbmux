@@ -447,7 +447,14 @@
     "name": "TmuxWsMux",
     "kind": "value",
     "signature": "9ba44fbc46c195803b405d3f7ba45377dbcda95c6cab5ac88911ebbe7ce20f68",
-    "tier": "F"
+    "tier": "F",
+    "deprecatedMembers": {
+      "broadcastSessionList": {
+        "since": "0.18.18",
+        "removeNoEarlierThan": "0.19.0",
+        "replacement": "pushSessionInventory"
+      }
+    }
   },
   {
     "name": "TmuxWsMuxOptions",
