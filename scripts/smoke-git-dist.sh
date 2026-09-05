@@ -26,6 +26,7 @@ CID_FILE=''
 CONTAINER_STARTED=0
 CLEANUP_FAILED=0
 RUN_COMPLETE=0
+RUN_ID=''
 SMOKE_TEST_MODE="${THUMBMUX_SMOKE_TEST_MODE-}"
 ARTIFACT_OUT="${THUMBMUX_SMOKE_ARTIFACT_OUT-}"
 
@@ -44,10 +45,8 @@ assert_owned_container() {
 
 cleanup() {
   local rc=$?
+  local remaining_containers remaining_images container_count image_count
   set +e
-  if [[ -n "${PREREQ_IMAGE-}" ]]; then
-    /usr/bin/docker rmi -f "$PREREQ_IMAGE" >/dev/null 2>&1 || true
-  fi
   if [[ "$CONTAINER_STARTED" == 0 && -n "$CID_FILE" && -s "$CID_FILE" ]]; then
     CONTAINER_ID="$(<"$CID_FILE")"
     if [[ "$CONTAINER_ID" =~ ^[a-f0-9]{64}$ ]]; then
@@ -56,6 +55,9 @@ cleanup() {
       echo 'git-dist smoke: invalid Docker cidfile; refusing guessed cleanup' >&2
       CLEANUP_FAILED=1
     fi
+  fi
+  if [[ -n "${PREREQ_IMAGE-}" ]]; then
+    /usr/bin/docker rmi -f "$PREREQ_IMAGE" >/dev/null 2>&1 || true
   fi
   if [[ "$CONTAINER_STARTED" == 1 ]]; then
     if thumbmux_recheck_docker_attestation && assert_owned_container; then
@@ -66,6 +68,25 @@ cleanup() {
       fi
     else
       echo 'git-dist smoke: container identity/labels changed; refusing cleanup' >&2
+      CLEANUP_FAILED=1
+    fi
+  fi
+  if [[ -n "$RUN_ID" ]]; then
+    if thumbmux_recheck_docker_attestation; then
+      remaining_containers="$(/usr/bin/docker ps -aq \
+        --filter "label=com.kemcortex.thumbmux.run-id=$RUN_ID")"
+      remaining_images="$(/usr/bin/docker images -q "thumbmux-node18-prereqs-$RUN_ID")"
+      container_count="$(/usr/bin/sed '/^$/d' <<<"$remaining_containers" | /usr/bin/wc -l)"
+      image_count="$(/usr/bin/sed '/^$/d' <<<"$remaining_images" | /usr/bin/wc -l)"
+      container_count="${container_count//[[:space:]]/}"
+      image_count="${image_count//[[:space:]]/}"
+      echo "git-dist smoke: cleanup run-id=$RUN_ID containers=$container_count images=$image_count"
+      if [[ "$container_count" != 0 || "$image_count" != 0 ]]; then
+        echo 'git-dist smoke: owned Docker resources survived cleanup' >&2
+        CLEANUP_FAILED=1
+      fi
+    else
+      echo 'git-dist smoke: Docker daemon changed before cleanup verification' >&2
       CLEANUP_FAILED=1
     fi
   fi

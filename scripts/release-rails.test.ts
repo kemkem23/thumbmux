@@ -368,6 +368,14 @@ describe("release rail policy", () => {
     expect(repairPSmokeScenarios).toContain('[[ "$rc" == 86 ]]');
     expect(repairPSmokeScenarios).toContain('[[ "$rc" == 143 ]]');
     expect(repairPSmokeScenarios).toContain("containers=0 images=0");
+    expect(smoke).toContain('--filter "label=com.kemcortex.thumbmux.run-id=$RUN_ID"');
+    expect(smoke).toContain('docker images -q "thumbmux-node18-prereqs-$RUN_ID"');
+    expect(smoke).toContain(
+      'git-dist smoke: cleanup run-id=$RUN_ID containers=$container_count images=$image_count',
+    );
+    expect(smoke.indexOf('/usr/bin/docker rm -f "$CONTAINER_ID"')).toBeLessThan(
+      smoke.indexOf('git-dist smoke: cleanup run-id=$RUN_ID'),
+    );
   });
 
   test("CI and release reject focused Playwright tests inside the attested canonical run", () => {
