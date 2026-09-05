@@ -1,7 +1,5 @@
 #!/usr/bin/bash -p
 case "$-" in *p*) ;; *) printf 'repair P smoke scenarios: privileged interpreter is required\n' >&2; exit 126 ;; esac
-PATH=/usr/bin:/bin
-export PATH
 unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS BUN_OPTIONS NODE_PATH \
   PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH \
   TMUX TMUX_PANE TMUX_TMPDIR CORTEX_INSTANCE_ID
