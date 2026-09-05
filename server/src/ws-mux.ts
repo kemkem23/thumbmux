@@ -22,6 +22,7 @@ import {
   muxHistoryBoundaryTransition,
   splitMuxOutputData,
   validateMuxHistoryBoundary,
+  warnDeprecated,
   type MuxClientMessage,
   type MuxFullOutputFrame,
   type MuxHistoryBoundary,
@@ -2299,7 +2300,7 @@ export class TmuxWsMux<
 
     if (needsDedicatedListPolling) {
       if (this.sessionListInterval) return;
-      this.sessionListInterval = setInterval(() => this.broadcastSessionList(), this.SESSION_LIST_INTERVAL);
+      this.sessionListInterval = setInterval(() => this.pushSessionInventory(), this.SESSION_LIST_INTERVAL);
       return;
     }
 
@@ -2360,10 +2361,10 @@ export class TmuxWsMux<
         await Promise.allSettled(tasks);
       }
 
-      // Every ~5s: broadcast session list if changed
+      // Every ~5s: push session inventory if changed
       const sessionListInterval = Math.max(Math.round(this.SESSION_LIST_INTERVAL / this.currentRate), 1);
       if (this.pollCounter % sessionListInterval === 0) {
-        this.broadcastSessionList();
+        this.pushSessionInventory();
       }
     } finally {
       this.inFlight = false;
@@ -2377,7 +2378,7 @@ export class TmuxWsMux<
    * not depend on the periodic inventory timer for mutation visibility. The
    * existing dedupe, filtering, and backpressure rules still apply.
    */
-  broadcastSessionList() {
+  pushSessionInventory(): void {
     try {
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
@@ -2444,7 +2445,21 @@ export class TmuxWsMux<
       // Unfiltered provider result only — never a filtered projection.
       if (anyAccounted) this.lastSessionsJson = json;
     } catch (e: any) {
-      this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);
+      this.logError("[thumbmux-mux] pushSessionInventory error:", e.message);
     }
+  }
+
+  /**
+   * Reconcile and push the current authoritative session inventory now.
+   *
+   * @deprecated since v0.18.18 — use pushSessionInventory; removal no earlier than v0.19.0
+   */
+  broadcastSessionList(): void {
+    warnDeprecated("TmuxWsMux.broadcastSessionList", {
+      since: "0.18.18",
+      replacement: "pushSessionInventory",
+      removeNoEarlierThan: "0.19.0",
+    });
+    this.pushSessionInventory();
   }
 }

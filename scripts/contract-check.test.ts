@@ -362,6 +362,55 @@ describe("contract surface policy", () => {
       .toContainEqual(["baseline-signature-change", name]);
   });
 
+  test("the v0.18.18 pushSessionInventory alias requires the exact patch and digest pair", () => {
+    const name = "TmuxWsMux";
+    const baselineDigest = "b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782";
+    const reviewedDigest = "9ba44fbc46c195803b405d3f7ba45377dbcda95c6cab5ac88911ebbe7ce20f68";
+    const manifest: ContractEntry[] = [{
+      name,
+      kind: "value",
+      signature: reviewedDigest,
+      tier: "F",
+    }];
+    const baselineLive = [{
+      name,
+      kind: "value" as const,
+      signature: baselineDigest,
+      compatibilitySignature: baselineDigest,
+    }];
+    const currentLive = [{
+      name,
+      kind: "value" as const,
+      signature: reviewedDigest,
+      compatibilitySignature: reviewedDigest,
+    }];
+
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      currentLive,
+      "0.18.17",
+      "0.18.18",
+    ).errors).toEqual([]);
+
+    const wrongDigest = [{
+      ...currentLive[0]!,
+      compatibilitySignature: `${reviewedDigest.slice(0, -1)}0`,
+    }];
+    expect(evaluateBaseline(
+      "server",
+      [{ ...manifest[0]!, signature: baselineDigest }],
+      manifest,
+      baselineLive,
+      wrongDigest,
+      "0.18.17",
+      "0.18.18",
+    ).errors.map(({ code, name: exportName }) => [code, exportName]))
+      .toContainEqual(["baseline-signature-change", name]);
+  });
+
   test("a minor may add optional members without weakening existing F members", () => {
     const baseline = fixture("0.8.4");
     writeCoreDeclarations(baseline, [

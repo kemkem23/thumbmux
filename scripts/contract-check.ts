@@ -1281,6 +1281,34 @@ function isV01816PatchException(
   return V01816_REVIEWED_ADDITIONS.has(reviewed);
 }
 
+/**
+ * Additive `TmuxWsMux.pushSessionInventory()` alias and `broadcastSessionList()`
+ * deprecation reviewed for 0.18.17 -> 0.18.18. The class method adds a narrower,
+ * mutation-focused method name while keeping the deprecated broadcastSessionList()
+ * alias fully functional.
+ */
+const V01818_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:0cd8e42c83784c872b4bb3f9b35c99c2efb817c71f68d1f55e990a2c4a84b22e:837535d472b4debf60589f2769f99dac52e89a85c1917cb27c8b5f8314b7e9b1",
+  "server:createAppRoutes:f541e3c9bd9791bfb98c9a083ff3ea0a02bddd2551c091ffb69cc271f11ce3dc:78466f944c750f9fab528c7c46c2dfb432e3b358ff6bc15aae031fa5ea51fb40",
+  "server:TmuxWsMux:b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782:9ba44fbc46c195803b405d3f7ba45377dbcda95c6cab5ac88911ebbe7ce20f68",
+]);
+
+function isV01818PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (
+    (baselineVersion !== "0.18.16" && baselineVersion !== "0.18.17")
+    || (currentVersion !== "0.18.17" && currentVersion !== "0.18.18")
+  ) return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V01818_REVIEWED_ADDITIONS.has(reviewed);
+}
+
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1480,6 +1508,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV01816PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV01818PatchException(
           baselineVersion,
           currentVersion,
           subpath,

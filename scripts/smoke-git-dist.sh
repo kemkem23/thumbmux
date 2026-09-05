@@ -21,6 +21,7 @@ PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 THUMBMUX_GUARD_RUNTIME=''
 CONTAINER=''
 CONTAINER_ID=''
+PREREQ_IMAGE=''
 CID_FILE=''
 CONTAINER_STARTED=0
 CLEANUP_FAILED=0
@@ -38,6 +39,9 @@ assert_owned_container() {
 cleanup() {
   local rc=$?
   set +e
+  if [[ -n "${PREREQ_IMAGE-}" ]]; then
+    /usr/bin/docker rmi -f "$PREREQ_IMAGE" >/dev/null 2>&1 || true
+  fi
   if [[ "$CONTAINER_STARTED" == 0 && -n "$CID_FILE" && -s "$CID_FILE" ]]; then
     CONTAINER_ID="$(<"$CID_FILE")"
     if [[ "$CONTAINER_ID" =~ ^[a-f0-9]{64}$ ]]; then
@@ -204,6 +208,14 @@ cp -R "$FIXTURE/." "$WORK/npm-consumer/"
 set +e
 thumbmux_recheck_docker_attestation \
   || { echo 'git-dist smoke: Docker daemon changed before Node 18 container creation' >&2; exit 1; }
+PREREQ_IMAGE="thumbmux-node18-prereqs-${RUN_ID}"
+/usr/bin/docker build -t "$PREREQ_IMAGE" - <<'EOF' >/dev/null
+FROM node:18-alpine
+RUN timeout 120 apk add --no-cache python3 tmux
+EOF
+BUILD_RC=$?
+(( BUILD_RC == 0 )) \
+  || { echo "git-dist smoke: prerequisite image build exited $BUILD_RC" >&2; exit "$BUILD_RC"; }
 /usr/bin/timeout 240 /usr/bin/docker run \
   --cidfile "$CID_FILE" \
   --name "$CONTAINER" \
@@ -212,8 +224,7 @@ thumbmux_recheck_docker_attestation \
   -v "$PACKAGE_TARBALL:/tmp/thumbmux.tgz:ro" \
   -v "$WORK/bun-consumer/runtime-export-guard.mjs:/tmp/runtime-export-guard.mjs:ro" \
   -v "$FIXTURE/node18-replay-lock-smoke.mjs:/tmp/node18-replay-lock-smoke.mjs:ro" \
-  node:18-alpine sh -lc '
-  timeout 120 apk add --no-cache python3 tmux >/dev/null
+  "$PREREQ_IMAGE" sh -lc '
   mkdir /app && cd /app
   npm init -y >/dev/null 2>&1
   npm install --ignore-scripts /tmp/thumbmux.tgz >/dev/null 2>&1
@@ -248,6 +259,11 @@ if /usr/bin/docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
 fi
 CONTAINER_STARTED=0
 rm -f -- "$CID_FILE"
+
+if [[ -n "${PREREQ_IMAGE-}" ]]; then
+  /usr/bin/docker rmi -f "$PREREQ_IMAGE" >/dev/null 2>&1 || true
+  PREREQ_IMAGE=''
+fi
 
 echo "git-dist smoke: Bun/npm installs, TypeScript, Vite/Svelte, current Node, and Node 18 replay lock passed"
 RUN_COMPLETE=1
