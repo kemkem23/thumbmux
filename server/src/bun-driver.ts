@@ -51,6 +51,14 @@ function targetResolvers(options: TmuxTargetOptions): {
   };
 }
 
+/**
+ * Depth this driver reports when tmux cannot be read. Deliberately NOT the
+ * kemcortex host's 50000: this driver is the package's own tmux backend and
+ * keeps tmux's own documented 2000-line default, so a thumbmux embedder that
+ * never configured a depth is not handed a 50000-line capture request.
+ */
+const DEFAULT_DRIVER_HISTORY_LIMIT = 2000;
+
 function run(args: string[]): string {
   const p = Bun.spawnSync(["tmux", ...args]);
   if (p.exitCode !== 0) throw new Error(p.stderr.toString().trim() || `tmux ${args[0]} failed`);
@@ -157,11 +165,30 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
       latestActivity = map;
       return map;
     },
-    getHistoryLimit() {
+    getHistoryLimit(session) {
+      // `history_limit` is a PANE property, frozen when the pane is born from
+      // whatever the session option said at that moment. `show-options -g`
+      // therefore answers "what would a pane created right now be born with",
+      // which is a different question and a different number: on a server
+      // whose global option is 1000, panes created earlier under 50000 keep
+      // 50000, and a capture sized from the global read loses everything older
+      // than the last 1000 lines. Read the pane the caller named.
+      if (session !== undefined) {
+        try {
+          const m = run(["display-message", "-p", "-t", target.pane(session), "#{history_limit}"])
+            .match(/(\d+)/);
+          const limit = m ? Number(m[1]) : 0;
+          return limit > 0 ? limit : DEFAULT_DRIVER_HISTORY_LIMIT;
+        } catch { return DEFAULT_DRIVER_HISTORY_LIMIT; }
+      }
+      // No session: nothing pane-specific can be answered. This is the older
+      // `getHistoryLimit(): number` contract shape, kept reachable so a caller
+      // that predates the session parameter still gets a number rather than a
+      // throw. It reads the global option and is knowingly the wrong question.
       try {
         const m = run(["show-options", "-g", "history-limit"]).match(/(\d+)/);
-        return m ? Number(m[1]) : 2000;
-      } catch { return 2000; }
+        return m ? Number(m[1]) : DEFAULT_DRIVER_HISTORY_LIMIT;
+      } catch { return DEFAULT_DRIVER_HISTORY_LIMIT; }
     },
     setSessionHistoryLimit(session, limit) {
       run(["set-option", "-t", target.pane(session), "history-limit", String(limit)]);

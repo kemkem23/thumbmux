@@ -41,7 +41,19 @@ export interface TmuxDriver<SessionRow extends SessionListRow = SessionListItem>
   sendKeys(session: string, data: string): void;
   /** session → last-activity timestamp (one tmux call for all sessions) */
   getSessionActivity(): Map<string, number>;
-  getHistoryLimit(): number;
+  /**
+   * Scrollback depth of ONE session's pane, in lines.
+   *
+   * `history_limit` is frozen on a pane when it is born, so a driver asked
+   * without a session cannot answer for the session being captured: tmux
+   * resolves an untargeted read to whichever session was created last. Every
+   * call site in this package knows its session and passes it.
+   *
+   * The parameter is optional ONLY so that a host written against the older
+   * `getHistoryLimit(): number` shape still satisfies this interface. Such a
+   * host answers ambient, and its full-history window will be the wrong depth.
+   */
+  getHistoryLimit(session?: string): number;
   setSessionHistoryLimit(session: string, limit: number): void;
   resizeWindow(session: string, cols: number, rows: number): void;
   /** content hash for change dedupe (host may pass a native hash, e.g. Bun.hash) */
@@ -1993,7 +2005,7 @@ export class TmuxWsMux<
     try {
       const previousContent = this.contents.get(session) ?? null;
       const startLine = opts.fullHistory
-        ? -Math.max(this.driver.getHistoryLimit(), this.liveLineLimit)
+        ? -Math.max(this.driver.getHistoryLimit(session), this.liveLineLimit)
         : (this.captureStartLines.get(session) ?? this.DEFAULT_CAPTURE_START_LINE);
       this.lastReconcileCapture.set(session, Date.now());
       const profile = this.profileOf(session);
