@@ -250,6 +250,34 @@ afterEach(() => {
 });
 
 describe("attachment-draft helpers", () => {
+  test.each(["", "image/"])("a nameless file with empty subtype uses the png name fallback (type=%s)", (type) => {
+    const file = imageFile("", type);
+    const originalName = file.name;
+    expect(draftFileName(file, 3, 1700000000000)).toBe("pasted-1700000000000-3.png");
+    // This is a display-name fallback, not a conversion of the original File.
+    expect(file.type).toBe(type);
+    expect(file.name).toBe(originalName);
+  });
+
+  test("removing a missing id preserves list identity and every preview URL", () => {
+    const ports = recordingPorts();
+    const files = [imageFile("a.png"), imageFile("b.png")];
+    const items = createDraftItems(files, ports);
+    const result = removeDraftItem(items, "missing-id", ports);
+
+    expect(result).toBe(items);
+    expect(draftFilesOf(result)).toEqual(files);
+    expect(ports.created).toEqual(items.map((item) => item.url));
+    expect(ports.revoked).toEqual([]);
+  });
+
+  test.each([",", " \t ", " , , \n"])("accept containing only separators imposes no filter (%j)", (accept) => {
+    const files = [imageFile("a.png"), new File(["pdf"], "b.pdf", { type: "application/pdf" })];
+    expect(accept.length).toBeGreaterThan(0);
+    for (const file of files) expect(fileMatchesAccept(file, accept)).toBe(true);
+    expect(acceptableDraftFiles(files, { accept })).toEqual(files);
+  });
+
   test("names a clipboard file from its type and labels non-images by extension", () => {
     const pasted = new File([new Uint8Array([1])], "", { type: "image/webp" });
     expect(draftFileName(pasted, 2, 1_700_000_000_000)).toBe("pasted-1700000000000-2.webp");
@@ -326,6 +354,20 @@ describe("attachment-draft helpers", () => {
 });
 
 describe("attachment-draft · image error lifecycle", () => {
+  test("cancelling a pending load twice is a no-op the second time", () => {
+    const onLoad = mock(() => {});
+    const onError = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad, onError });
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(onError).toHaveBeenCalledTimes(0);
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
+  });
+
   test("an error after cancel calls neither handler and does not revoke twice", () => {
     const onLoad = mock(() => {});
     const onError = mock(() => {});
@@ -359,6 +401,60 @@ describe("attachment-draft · image error lifecycle", () => {
 });
 
 describe("AttachmentDraftPicker", () => {
+  test("paste without clipboardData is declined without consuming the event", async () => {
+    const keep = imageFile("keep.png");
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({ files: [keep], onChange });
+    await tick();
+    const urlsBefore = thumbUrls(target);
+    const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, "clipboardData", { value: null });
+    expect(input.disabled).toBe(false);
+    expect(event.clipboardData).toBeNull();
+
+    // Mirror the host's preventDefault decision using the public return value.
+    const accepted = app.acceptPaste(event);
+    if (accepted) event.preventDefault();
+    expect(accepted).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(app.currentFiles()).toEqual([keep]);
+    expect(thumbUrls(target)).toEqual(urlsBefore);
+    expect(created).toEqual(urlsBefore);
+    expect(revoked).toEqual([]);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test("clear on an empty draft is silent both initially and after clearing files", async () => {
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({ onChange });
+    await tick();
+    app.clear();
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(created).toEqual([]);
+    expect(revoked).toEqual([]);
+
+    const file = imageFile("a.png");
+    chooseFiles(input, [file]);
+    flushSync();
+    await tick();
+    expect(onChange.mock.calls).toEqual([[[file]]]);
+    expect(created).toHaveLength(1);
+    app.clear();
+    expect(onChange.mock.calls).toEqual([[[file]], [[]]]);
+    expect(revoked).toEqual(created);
+    app.clear();
+    flushSync();
+    await tick();
+
+    expect(onChange.mock.calls).toEqual([[[file]], [[]]]);
+    expect(app.currentFiles()).toEqual([]);
+    expect(itemNames(target)).toEqual([]);
+    expect(target.querySelector('[data-testid="attachment-draft-list"]')).toBeNull();
+    expect(revoked).toEqual(created);
+    expect(fetchCalls).toEqual([]);
+  });
+
   test.each([false, true])("host open() calls the hidden input exactly when enabled (disabled=%s)", async (disabled) => {
     const onChange = mock((_files: File[]) => {});
     const { host, input } = mountHost({ disabled, onChange });
