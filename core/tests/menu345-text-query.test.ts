@@ -31,8 +31,8 @@ describe("matchesTextQuery — lowercase + includes, both directions", () => {
 });
 
 describe("matchesTextQuery — the empty query", () => {
-  // MANAGE's `if (!searchFilter) return true` is exactly String.includes(''),
-  // so an empty query must keep every row of all four groups visible.
+  // For string queries, MANAGE's empty-filter guard agrees with includes('').
+  // Runtime falsy values need their own guard; they cannot call toLowerCase().
   test("an empty query matches anything", () => {
     expect(matchesTextQuery("kem-cortex-orchestrator", "")).toBe(true);
   });
@@ -50,6 +50,76 @@ describe("matchesTextQuery — the empty query", () => {
     // itself stays honest to includes() and reports a match.
     expect(matchesTextQuery("kem-cortex", "   ", { trimQuery: true })).toBe(true);
   });
+});
+
+describe("matchesTextQuery — parity with the original MANAGE filter", () => {
+  function originalManage(name: string, searchFilter: string): boolean {
+    if (!searchFilter) return true;
+    return name.toLowerCase().includes(searchFilter.toLowerCase());
+  }
+
+  // Frozen pre-repair helper: used only for string compatibility, never as
+  // the oracle for the runtime-falsy bug it contained.
+  function beforeRepair(text: string, query: string, options?: TextQueryOptions): boolean {
+    const needle = options?.trimQuery ? query.trim() : query;
+    return text.toLowerCase().includes(needle.toLowerCase());
+  }
+
+  const haystack = "Cortex Orchestrator ตัวจับข้อความ café a.c v[0.19.0 skill library";
+  const strings: [string, boolean, boolean][] = [
+    ["", true, true],
+    ["  ", false, true],
+    ["   ", false, true],
+    ["\t\n", false, true],
+    ["cortex", true, true],
+    ["CORTEX", true, true],
+    [" cortex", false, true],
+    ["cortex ", true, true],
+    ["  cortex  ", false, true],
+    ["\tCORTEX\n", false, true],
+    ["orches", true, true],
+    ["absent", false, false],
+    ["จับข้อ", true, true],
+    ["ข้อคิด", false, false],
+    ["café", true, true],
+    ["cafe\u0301", false, false],
+    ["a.c", true, true],
+    ["a*c", false, false],
+    ["[0.19", true, true],
+    ["skill library", true, true],
+    ["skill  library", false, false],
+    ["0", true, true],
+    ["false", false, false],
+    ["undefined", false, false],
+    ["null", false, false],
+    ["\u0000", false, false],
+    ["😀", false, false],
+  ];
+
+  for (const [query, raw, trimmed] of strings) {
+    test(`preserves string results for ${JSON.stringify(query)} in every option mode`, () => {
+      expect(originalManage(haystack, query)).toBe(raw);
+      for (const options of [undefined, {}, { trimQuery: false }, { trimQuery: true }]) {
+        const expected = options?.trimQuery ? trimmed : raw;
+        expect(beforeRepair(haystack, query, options)).toBe(expected);
+        expect(matchesTextQuery(haystack, query, options)).toBe(expected);
+      }
+    });
+  }
+
+  for (const query of [undefined, null, 0, false, NaN, 0n]) {
+    test(`keeps every MANAGE row for runtime ${String(query)} (${typeof query})`, () => {
+      // Deliberately cross the TypeScript boundary, as an unready host store
+      // can at runtime. The public signature must remain query: string.
+      const runtimeQuery = query as unknown as string;
+      for (const name of ["session-item", "", "ตัวจับข้อความ"]) {
+        expect(originalManage(name, runtimeQuery)).toBe(true);
+        for (const options of [undefined, {}, { trimQuery: false }]) {
+          expect(matchesTextQuery(name, runtimeQuery, options)).toBe(true);
+        }
+      }
+    });
+  }
 });
 
 describe("matchesTextQuery — trimQuery", () => {

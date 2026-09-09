@@ -46,5 +46,8 @@ export function matchesTextQuery(
   options?: TextQueryOptions,
 ): boolean {
   const needle = options?.trimQuery ? query.trim() : query;
+  // Preserve MANAGE's empty-filter guard, including falsy runtime values
+  // that can arrive before the host's string state is ready.
+  if (!needle) return true;
   return text.toLowerCase().includes(needle.toLowerCase());
 }
