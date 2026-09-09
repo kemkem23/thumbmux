@@ -4,10 +4,11 @@ export type { Continuity, HistoryContext, HistoryRow, HistoryGeometry, SourceObs
 export { compareShadowBatch, inspectShadowRuntime, inspectHistoryHealth, inspectHistoryMirror, inspectImportProgress, validateHistoryPage, verifyHistoryOracle } from './sqlite-history/detectors';
 export { sealHistorySnapshot } from './sqlite-history/transfer';
 export { assertMigrationReady, readSealedHistoryOracle } from './sqlite-history/rehearsal';
+export type { ReaderVerification, ReaderEmptyReason, ReaderUnverifiableReason, ReaderPageResult, ReaderSnapshotResult } from './sqlite-history/reader';
 
 export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
-  const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal]=await Promise.all([
-    import('bun:sqlite'),import('./sqlite-history/store'),import('./sqlite-history/coordinator'),import('./sqlite-history/bridge'),import('./sqlite-history/transfer'),import('./sqlite-history/rehearsal')]);
+  const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal,reader]=await Promise.all([
+    import('bun:sqlite'),import('./sqlite-history/store'),import('./sqlite-history/coordinator'),import('./sqlite-history/bridge'),import('./sqlite-history/transfer'),import('./sqlite-history/rehearsal'),import('./sqlite-history/reader')]);
   const file=prepareFile(options.file);
   const db=new Database(file,{strict:true,safeIntegers:false});
   let store:InstanceType<typeof HistoryStore>;
@@ -18,6 +19,9 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     createCaptureBridge:(o:HistoryBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
     // Writer-only shadow facade. SQLite readers remain unwired and opt-in.
     createShadowBridge:(o:HistoryShadowBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
+    // Wave 4 reader canary. Read-only, opt-in, and not wired to viewer/REST.
+    createReaderCanary:()=>new reader.HistoryReaderCanary(store),
+    readerRequest:(canary:InstanceType<typeof reader.HistoryReaderCanary>,request:Request)=>reader.historyReaderRequest(canary,request),
     snapshot:store.snapshot.bind(store),
     readBefore:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'before',anchor,limit,context),
     readAfter:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'after',anchor,limit,context),
