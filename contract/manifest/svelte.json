@@ -6,6 +6,12 @@
     "tier": "F"
   },
   {
+    "name": "AttachmentDraftPicker",
+    "kind": "component",
+    "signature": "0d2d397352ed001af7a4b8533b894fcbfb90e15e70b17681b47b3bdbd3843b5e",
+    "tier": "S"
+  },
+  {
     "name": "BrowserLocationLike",
     "kind": "type",
     "signature": "7902c14a6e5e23dd28d3131979deb6e85dd499a010e0724000329fdcd3483224",
@@ -321,6 +327,12 @@
     "name": "handlePushNotificationEvent",
     "kind": "value",
     "signature": "695da7dcd41d35cd8fff0684e0a15d038930901ed89e9ba632cf4c791c57f6b5",
+    "tier": "S"
+  },
+  {
+    "name": "ImageAnnotator",
+    "kind": "component",
+    "signature": "557a83e3535f4526c851a94a6dbbfd133eccc4844dc482ceeb4eeeb02020a5f0",
     "tier": "S"
   },
   {
@@ -786,6 +798,12 @@
     "tier": "F"
   },
   {
+    "name": "SessionMetadata",
+    "kind": "component",
+    "signature": "9d2f8e2f442c6a8ab232ee0e6c0fd2e088d3d484b705d2c56c76958bbb7500bf",
+    "tier": "S"
+  },
+  {
     "name": "SessionThumb",
     "kind": "component",
     "signature": "c9d8a0caf26014b04cd17d2685e419b78e4ef45e2bdfb553af7f83f1508b71af",
@@ -868,6 +886,12 @@
     "kind": "component",
     "signature": "22de8ffd76e1268ff3054bee5416114d2b9c3fd76d7b6b28ad0da6cba11b3678",
     "tier": "F"
+  },
+  {
+    "name": "ThemeSourceChoice",
+    "kind": "component",
+    "signature": "e2e0be373cfeec40b4d9f4ef3db6bb831741dba74290972a46e89b04acb6081c",
+    "tier": "S"
   },
   {
     "name": "tmuxMux",

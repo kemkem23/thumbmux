@@ -1,7 +1,87 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.19.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.0-dist`.
+
+## v0.20.0 — 2026-09-10
+
+Minor, not a patch: six new public exports land on the `S` tier and nothing on
+the existing `F` tier moves. On a `0.x` line a caret range does not cross the
+minor, so a consumer on `^0.19.x` must bump the pin deliberately before any of
+these names resolve. There is no migration and `PRAGMA user_version` is
+untouched — this release adds surface, it does not reinterpret stored data.
+
+### Added
+
+- **`matchesTextQuery` / `TextQueryOptions` (core).** The lowercase-plus-
+  `includes` filter that host menus and list views each re-implemented is now
+  one function with an explicit options type. `trimQuery` defaults to `false`
+  so the default keeps the old behaviour exactly: a query of `" izmir"` still
+  fails to match `Izmir` unless the caller opts into trimming. The haystack is
+  never trimmed in either mode. Matching is substring, not prefix, and regex
+  metacharacters in the query are literal — there is no pattern language here.
+- **`SessionMetadata` (svelte).** The session `cwd` + last-activity row, with
+  the full path kept in the DOM via `title` so a host copying from the node
+  still gets the whole path; the visual truncation is CSS, not a sliced string.
+  Renders nothing at all when both fields are absent, so an empty session does
+  not leave a hollow frame. Emits `<time datetime>` only when the host supplies
+  a machine-readable timestamp.
+- **`ThemeSourceChoice` (svelte).** The two-state "session colour / agent
+  colour" control. Selected state is derived from the `enabled` prop alone and
+  is published both as `class:on` and as `aria-pressed`. Pressing the side that
+  is already selected does not call `onChange`. The component knows nothing
+  about agents, topics or providers and never touches `localStorage`; the hint
+  string naming CC/CODEX/GROK stays a host-supplied prop.
+- **`AttachmentDraftPicker` (svelte).** A pre-send attachment list with an
+  instance API (`open`, `addFiles`, `acceptPaste`, `clear`, `currentFiles`)
+  shaped like the existing `UploadAction.open()`. Choosing a file performs no
+  request; the host still owns upload, naming, hashing and receipt claim/settle.
+- **`ImageAnnotator` (svelte).** A pre-send markup panel with `submit`,
+  `clearAll` and `removeImage`. It hands the host a Blob and a comment and
+  nothing else — it does not read the clipboard, does not probe permissions,
+  and does not register a mobile overlay or back-button entry. Those stay with
+  the host route.
+
+The picker's internal `./attachment-draft` module is deliberately **not**
+exported. Its tests import it by file path. Publishing it would turn the
+picker's private helpers into a contract nobody reserved a name for.
+
+### Notes for integrators
+
+Version and internal ranges move together. `server`, `svelte` and `app` each
+carry `@thumbmux/core`, and `app` also `@thumbmux/svelte`, at `^0.20.0`; left
+at `^0.19.0` those ranges stop matching the workspace the moment core becomes
+0.20.0 and the install falls through to the public registry. `bun.lock` records
+the same five workspace versions and is part of the lockstep set.
+
+Consumer pins in the root and brain-ui manifests are deliberately untouched.
+They move only after the public repo publishes `v0.20.0-dist`.
+
+### Also inside this tag, and inert
+
+`v0.19.0-dist` was the last published tag, so this one also carries every
+`server/src/sqlite-history/` change merged since: the wave 4 reader canary, the
+wave 5 authoritative writer, and the first half of wave 6's rollout tooling
+(`reader.ts`, `authoritative.ts`, `rollout.ts` and their tests). None of it is
+part of this release's headline, and none of it runs on its own:
+
+- **The contracted surface did not move.** `contract/manifest/server.json` is
+  byte-identical to `v0.19.0`; only `core.json` and `svelte.json` changed, and
+  those changed by exactly the six names above. `sqlite-history` is not
+  re-exported from `server/src/index.ts`, so nothing new appears on the barrel.
+- **Every new path is opt-in and fails closed.** `HistoryRolloutAllowlist.route`
+  returns `'legacy'` for any group without an explicitly `enabled` record, an
+  empty roster throws `rollout-empty-roster`, and the new factory methods on the
+  object `createSqliteHistoryStore` returns (`createReaderCanary`,
+  `createAuthoritativeBridge`, `createRolloutAllowlist`) are additive
+  properties that no shipped code calls.
+- **A consumer that does not import it never loads it.** The module is a
+  separate build entry, not part of the barrel, so upgrading the pin does not
+  pull it into a bundle that never names it.
+
+Stated here because a release note that lists only its headline leaves a reader
+to discover the rest by diffing two tags. What ships in the tag is the tag's
+contents, not the subset the note was written about.
 
 ## v0.19.0 — 2026-09-09
 

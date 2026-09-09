@@ -8,7 +8,7 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
 import type { Component } from "svelte";
@@ -3315,16 +3315,34 @@ describe("TermView retained history budgets", () => {
 
 describe("TermView sparse retained-storage benchmark", () => {
   const playwrightChromiumPath = chromium.executablePath();
-  const playwrightChromiumAvailable = existsSync(playwrightChromiumPath);
-  const chromiumBenchmarkTest = playwrightChromiumAvailable ? test : test.skip;
-  const chromiumBenchmarkName = playwrightChromiumAvailable
+  const playwrightChromiumRevisionDir = dirname(dirname(playwrightChromiumPath));
+  const playwrightChromiumRevision = basename(playwrightChromiumRevisionDir)
+    .replace(/^chromium-/, "");
+  const playwrightHeadlessShellPath = join(
+    dirname(playwrightChromiumRevisionDir),
+    `chromium_headless_shell-${playwrightChromiumRevision}`,
+    "chrome-headless-shell-linux64",
+    "chrome-headless-shell",
+  );
+  // Playwright 1.61.1 normally selects the headless shell for a headless
+  // launch, while chromium.executablePath() names Chrome for Testing. Pick one
+  // installed executable and pass that exact path to launch so the guard can
+  // neither skip a runnable benchmark nor admit a launch that will fail.
+  const playwrightChromiumExecutable = [
+    playwrightHeadlessShellPath,
+    playwrightChromiumPath,
+  ].find(existsSync);
+  const chromiumBenchmarkTest = playwrightChromiumExecutable ? test : test.skip;
+  const chromiumBenchmarkName = playwrightChromiumExecutable
     ? "100k-row Chrome heap, cold rebuild, and search stay within measured gates"
     : "100k-row Chrome heap, cold rebuild, and search stay within measured gates " +
-      `(skipped: Playwright Chromium is not installed at ${playwrightChromiumPath})`;
+      `(skipped: no Playwright Chromium executable is installed; expected ` +
+      `${playwrightHeadlessShellPath} or ${playwrightChromiumPath})`;
 
   chromiumBenchmarkTest(chromiumBenchmarkName, async () => {
     const browser = await chromium.launch({
       headless: true,
+      executablePath: playwrightChromiumExecutable!,
       args: ["--js-flags=--expose-gc"],
     });
 
