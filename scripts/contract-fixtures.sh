@@ -239,7 +239,10 @@ install_consumer() {
     npm pkg set "name=thumbmux-contract-$fixture" "type=module"
     npm pkg set "private=true" --json
     npm pkg set "dependencies.thumbmux=file:$PACKAGE_TARBALL"
-    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=1.3.14'
+    # bun-types declares @types/node as "*". DefinitelyTyped's latest tag can
+    # move to an older major when several release lines publish in sequence.
+    # Pin explicitly so this gate does not depend on upstream release order.
+    npm pkg set 'devDependencies.typescript=^5.9.3' 'devDependencies.@types/bun=1.3.14' 'devDependencies.@types/node=26.5.1'
 
     if [[ "$fixture" == "app-host" ]]; then
       npm pkg set 'dependencies.svelte=^5.51.0'

@@ -48,6 +48,16 @@ picker's private helpers into a contract nobody reserved a name for.
 
 ### Notes for integrators
 
+Consumers using `skipLibCheck: false` with `bun-types@1.3.14` in their
+dependency tree can encounter declaration errors for `TextEncoderEncodeIntoResult`,
+`ConnectionOptions`, `KeyObject`, and `TLSSocket` when its `@types/node: "*"`
+resolves to `22.20.2`. DefinitelyTyped's `latest` tag can move to an older
+major when multiple release lines publish in sequence. Until `bun-types`
+constrains this dependency, explicitly pin `@types/node` to `26.5.1` in the
+consumer's devDependencies (and verify the resolved dependency tree). The
+frozen-consumer installer now uses this exact pin; library checking remains
+enabled and the frozen fixtures are unchanged.
+
 Version and internal ranges move together. `server`, `svelte` and `app` each
 carry `@thumbmux/core`, and `app` also `@thumbmux/svelte`, at `^0.20.0`; left
 at `^0.19.0` those ranges stop matching the workspace the moment core becomes
