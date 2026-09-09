@@ -265,6 +265,30 @@ describe('wave 4 reader canary', () => {
     } finally { await f.cleanup(); }
   });
 
+  test('the canary path never plans a full table scan or a temporary sort', async () => {
+    const f = fixture();
+    try {
+      const sid = await f.store.register({ name: 'plan', lifecycleKey: 'wave4-plan' });
+      await seed(f.store, sid, 20_000, 500);
+      const reader = new HistoryReaderCanary(f.store);
+      const ctx = reader.snapshot(sid).receipt.context;
+      f.db.exec('ANALYZE');
+      const statements: Array<[string, string, unknown[]]> = [
+        ['page-before', 'SELECT line_no,kind,text FROM history_line WHERE session_id=? AND line_no>=? AND line_no<? ORDER BY line_no DESC LIMIT ?', [sid, 0, 12_000, 2000]],
+        ['page-after', 'SELECT line_no,kind,text FROM history_line WHERE session_id=? AND line_no>=? AND line_no<? ORDER BY line_no', [sid, 8000, 10_000]],
+        ['coverAt', 'SELECT seq,row_start,row_end,expected_rows,rows_sha256 FROM history_capture WHERE session_id=? AND seq<=? AND row_start<=? ORDER BY seq DESC LIMIT 1', [sid, ctx.revision, 8000]],
+        ['coverFrom', 'SELECT seq,row_start,row_end,expected_rows,rows_sha256 FROM history_capture WHERE session_id=? AND seq>=? AND seq<=? ORDER BY seq', [sid, 16, ctx.revision]],
+      ];
+      for (const [name, sql, args] of statements) {
+        const plan = (f.db.query('EXPLAIN QUERY PLAN ' + sql).all(...args as never[]) as { detail: string }[]).map(p => p.detail);
+        expect(plan.filter(d => /^SEARCH .+ USING PRIMARY KEY/.test(d)).length,
+          `${name}: ${JSON.stringify(plan)}`).toBeGreaterThan(0);
+        expect(plan.filter(d => /\bSCAN\b/.test(d)), name).toEqual([]);
+        expect(plan.filter(d => /TEMP B-TREE|USE TEMP/.test(d)), name).toEqual([]);
+      }
+    } finally { await f.cleanup(); }
+  });
+
   test('the shipping server still does not import the SQLite history package', () => {
     const src = join(import.meta.dir, '../src');
     const offenders: string[] = [];
