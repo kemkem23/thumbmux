@@ -20,7 +20,7 @@
  *                                  bundle/sealed originals stay intact
  */
 import { describe, expect, test } from 'bun:test';
-import { appendFileSync, chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AuthoritativeHistoryBridge, readMirror } from '../src/sqlite-history/authoritative';
 import { HistoryRolloutAllowlist, assessGroupReadiness, auditBackupCoverage, runRestoreDrill } from '../src/sqlite-history/rollout';
@@ -82,7 +82,7 @@ describe('wave 6 expansion tooling (fixture half)', () => {
     try {
       const { sid, mirror, bridge, sessionMirror } = await readyGroupSession(f, 'canary', 'allowlist', 5);
       const emptySid = await f.store.register({ name: 'empty-1', lifecycleKey: 'wave6-empty', group: 'empty-group' });
-      const rollout = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'empty-group'] });
+      const rollout = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'empty-group'], mirrorDirectory: mirror });
 
       // Routing default: nothing is enabled, nothing routes to the new writer.
       expect(rollout.route('canary')).toBe('legacy');
@@ -134,10 +134,10 @@ describe('wave 6 expansion tooling (fixture half)', () => {
       rollout.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
 
       // The decision survives a restart of the allowlist over the same directory.
-      const reopened = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'empty-group'] });
+      const reopened = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'empty-group'], mirrorDirectory: mirror });
       expect(reopened.route('canary')).toBe('sqlite-authoritative');
       // A stray receipt does not outrank the declared roster.
-      const rosterless = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['some-other-group'] });
+      const rosterless = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['some-other-group'], mirrorDirectory: mirror });
       expect(rosterless.route('canary')).toBe('legacy');
       console.log('WAVE6_ALLOWLIST', JSON.stringify({ sourceCount: ready.sourceCount, sessions: ready.expectedSessions.length,
         probes: ready.faultProbeIds.length, watermark: ready.watermarks[0], refusals: faultsOf(f.alarms, 'rollout-refused').length }));
@@ -245,7 +245,7 @@ describe('wave 6 expansion tooling (fixture half)', () => {
     try {
       const { sid, sealed, mirror, bridge } = await readyGroupSession(f, 'canary', 'retire', 4);
       bridge.resumeMirror(sid);
-      const rollout = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'cold-group'] });
+      const rollout = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'cold-group'], mirrorDirectory: mirror });
       rollout.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
 
       let legacyWrites = 0;
@@ -280,7 +280,7 @@ describe('wave 6 expansion tooling (fixture half)', () => {
 
       // The silence check survives a restart, and a later write into a recorded
       // legacy artifact is detected as an overlapping old writer.
-      const reopened = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'cold-group'] });
+      const reopened = new HistoryRolloutAllowlist(f.store, { directory: join(f.dir, 'rollout'), declaredGroups: ['canary', 'cold-group'], mirrorDirectory: mirror });
       expect(reopened.retirement('canary')?.retiredAt).toBe(receipt.retiredAt);
       chmodSync(artifacts[0], 0o600);
       appendFileSync(artifacts[0], '{"line":999,"text":"stray legacy write"}\n');
@@ -288,6 +288,113 @@ describe('wave 6 expansion tooling (fixture half)', () => {
       evidence(faultsOf(f.alarms, 'legacy-writer-overwrite').at(-1));
       console.log('WAVE6_RETIREMENT', JSON.stringify({ artifacts: receipt.artifacts.length, legacyWrites,
         overwriteDetected: true, bundleFiles: readSeal(bundle).files.size }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+  test('the enable gate re-reads the mirror itself: evidence that was true when written cannot enable a group whose mirror is gone or unreadable', async () => {
+    const f = fixture();
+    try {
+      const { sid, mirror, bridge, sessionMirror } = await readyGroupSession(f, 'canary', 'mirrorgone', 3);
+      bridge.resumeMirror(sid);
+      const rollout = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+      const ready = await assessGroupReadiness(f.store, 'canary', mirror);
+      expect(ready.watermarks).toEqual([{ sessionId: sid, exportedRevision: f.store.session(sid).revision, targetRevision: f.store.session(sid).revision }]);
+
+      // The mirror the evidence attests to is destroyed after the assessment.
+      // The evidence numbers still agree with the store, so a gate that only
+      // compares numbers inside the evidence would enable a group whose backup
+      // copy no longer exists.
+      rmSync(sessionMirror, { recursive: true, force: true });
+      expect(existsSync(sessionMirror)).toBe(false);
+      expect(() => rollout.enableGroup(ready)).toThrow(/rollout-refused:mirror-missing/);
+      expect(rollout.route('canary')).toBe('legacy');
+      evidence(faultsOf(f.alarms, 'rollout-refused').at(-1));
+
+      // A mirror that exists but cannot be read is refused with its own reason,
+      // never silently treated as "watermark 0" and never as a pass.
+      bridge.resumeMirror(sid);
+      const watermarkPath = join(sessionMirror, 'watermark.json');
+      chmodSync(watermarkPath, 0o600);
+      writeFileSync(watermarkPath, JSON.stringify({ version: 1, sessionId: 'a-different-session', exportedRevision: 1 }));
+      expect(() => rollout.enableGroup(ready)).toThrow(/rollout-refused:mirror-unreadable/);
+      expect(rollout.route('canary')).toBe('legacy');
+
+      // Restoring the mirror restores the pass, so the gate is not simply stuck.
+      rmSync(sessionMirror, { recursive: true, force: true });
+      bridge.resumeMirror(sid);
+      expect(readMirror(mirror, sid).exportedRevision).toBe(f.store.session(sid).revision);
+      expect(rollout.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror)).state).toBe('enabled');
+      expect(rollout.route('canary')).toBe('sqlite-authoritative');
+      console.log('WAVE6_GATE_MIRROR', JSON.stringify({ session: sid,
+        refusals: faultsOf(f.alarms, 'rollout-refused').map(fault => fault.expected).slice(-2) }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+
+  test('the enable gate reads the live group roster: a session that joins the group after the assessment is refused, not enabled for free', async () => {
+    const f = fixture();
+    try {
+      const { sid, mirror, bridge } = await readyGroupSession(f, 'canary', 'roster', 4);
+      bridge.resumeMirror(sid);
+      const rollout = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+      const ready = await assessGroupReadiness(f.store, 'canary', mirror);
+      expect(ready.expectedSessions).toEqual([sid]);
+
+      // A second session joins the same group after the evidence was computed.
+      // It has no receipts, no import and no mirror: enabling the group on the
+      // first session's evidence would route this one to the new writer too.
+      const late = await f.store.register({ name: 'roster-late', lifecycleKey: 'wave6-roster-late', group: 'canary' });
+      expect(f.store.session(late).revision).toBe(0);
+      expect(() => rollout.enableGroup(ready)).toThrow(/rollout-refused:session-without-receipts/);
+      expect(rollout.route('canary')).toBe('legacy');
+      const refusal = faultsOf(f.alarms, 'rollout-refused').at(-1);
+      evidence(refusal);
+      expect(JSON.stringify(refusal?.observed)).toContain(late);
+
+      // Re-assessing does not help while the newcomer is unbacked, and the
+      // stale evidence cannot be replayed either.
+      const reassessed = await assessGroupReadiness(f.store, 'canary', mirror);
+      expect(() => rollout.enableGroup(reassessed)).toThrow(/rollout-refused:session-without-receipts/);
+      expect(() => rollout.enableGroup(ready)).toThrow(/rollout-refused/);
+      expect(rollout.route('canary')).toBe('legacy');
+
+      // Once the newcomer really has receipts, an import and a caught-up
+      // mirror, the whole group passes — the gate refuses, it does not block.
+      const { sealed } = sealedJsonlSource(f.dir, 'roster-late', 2);
+      expect((await importHistorySnapshot(f.store, { sourceId: 'wave6-source-roster-late', sessionId: late, snapshotDirectory: sealed, format: 'file-jsonl' })).state).toBe('verified');
+      const lateBridge = bridgeFor(f.store, mirror);
+      lateBridge.resumeMirror(late);
+      await lateBridge.commitBatch(batch(f.store, late, ['live:roster-late:0'], ['screen-row']));
+      const complete = await assessGroupReadiness(f.store, 'canary', mirror);
+      expect(complete.expectedSessions).toEqual([sid, late].sort());
+      expect(rollout.enableGroup(complete).state).toBe('enabled');
+      expect(rollout.route('canary')).toBe('sqlite-authoritative');
+      console.log('WAVE6_GATE_ROSTER', JSON.stringify({ enrolled: complete.expectedSessions.length,
+        refusals: faultsOf(f.alarms, 'rollout-refused').map(fault => fault.expected).slice(-2) }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+  test('routing is per session: a session that joins an already-enabled group keeps the legacy path until the group is enabled again over it', async () => {
+    const f = fixture();
+    try {
+      const { sid, mirror, bridge } = await readyGroupSession(f, 'canary', 'perssession', 3);
+      bridge.resumeMirror(sid);
+      const rollout = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+      rollout.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
+      expect(rollout.routeSession(sid)).toBe('sqlite-authoritative');
+
+      // Enrolment after the fact must not inherit the verdict: this session was
+      // in no roster the gate ever checked.
+      const late = await f.store.register({ name: 'late-join', lifecycleKey: 'wave6-late-join', group: 'canary' });
+      expect(rollout.route('canary')).toBe('sqlite-authoritative');
+      expect(rollout.routeSession(late)).toBe('legacy');
+      expect(rollout.routeSession(sid)).toBe('sqlite-authoritative');
+
+      // A session outside the declared roster is legacy on both doors.
+      const outsider = await f.store.register({ name: 'outsider', lifecycleKey: 'wave6-outsider', group: 'never-declared' });
+      expect(rollout.routeSession(outsider)).toBe('legacy');
+      console.log('WAVE6_GATE_ROUTE_SESSION', JSON.stringify({ group: rollout.route('canary'),
+        enrolled: rollout.routeSession(sid), lateJoin: rollout.routeSession(late), outsider: rollout.routeSession(outsider) }));
     } finally { await f.cleanup(); }
   }, 60000);
 });

@@ -28,7 +28,7 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     // Wave 5 authoritative writer. Opt-in; no production session is wired to it.
     createAuthoritativeBridge:(o:import('./sqlite-history/authoritative').HistoryAuthoritativeBridgeOptions)=>new authoritative.AuthoritativeHistoryBridge(store,o),
     // Wave 6 first half. Opt-in expansion tooling; no group is enabled anywhere.
-    createRolloutAllowlist:(o:{directory:string;declaredGroups:readonly string[]})=>new rollout.HistoryRolloutAllowlist(store,o),
+    createRolloutAllowlist:(o:{directory:string;declaredGroups:readonly string[];mirrorDirectory:string})=>new rollout.HistoryRolloutAllowlist(store,o),
     assessGroupReadiness:(group:string,mirrorDirectory:string)=>rollout.assessGroupReadiness(store,group,mirrorDirectory),
     auditBackupCoverage:(mirrorDirectory:string)=>rollout.auditBackupCoverage(store,mirrorDirectory),
     restoreDrill:(bundleDirectory:string,scratchDirectory:string)=>rollout.runRestoreDrill(bundleDirectory,scratchDirectory),

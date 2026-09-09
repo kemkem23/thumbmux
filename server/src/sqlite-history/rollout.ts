@@ -7,7 +7,10 @@
  *     on the declared roster always routes to the legacy path. Enabling a group
  *     requires computed readiness evidence — source count > 0, expected
  *     sessions, source paths, fault-probe IDs and a mirror watermark this tool
- *     read itself — and every item is re-read from the store at enable time.
+ *     read itself — and every item is re-read at enable time: the roster from
+ *     `history_session` and the watermark from the mirror on disk, never from
+ *     the numbers the evidence carries. Evidence that was true when it was
+ *     written does not pass once the world it describes has moved.
  *     "0 mismatches" produced by empty input is a refusal, not a pass.
  *  2. A per-batch restore drill: restore an export bundle into a fresh store
  *     and compare the restored rows/frames against independent oracle parsers.
@@ -136,11 +139,15 @@ export async function assessGroupReadiness(store: HistoryStore, group: string, m
  * to the authoritative writer; everything else takes the legacy path. */
 export class HistoryRolloutAllowlist {
   private directory: string;
+  private mirrorDirectory: string;
   private declared: Set<string>;
   private states = new Map<string, RolloutGroupState>();
   private retirements = new Map<string, LegacyRetirementReceipt>();
-  constructor(private store: HistoryStore, options: { directory: string; declaredGroups: readonly string[] }) {
+  constructor(private store: HistoryStore, options: { directory: string; declaredGroups: readonly string[]; mirrorDirectory: string }) {
     this.directory = privateDirectory(options.directory);
+    // The gate reads the mirror itself at enable time; it never learns where the
+    // mirror is from the evidence it is asked to judge.
+    this.mirrorDirectory = resolve(options.mirrorDirectory);
     this.declared = new Set(options.declaredGroups);
     if (!this.declared.size) throw new Error('rollout-empty-roster');
     for (const name of readdirSync(this.directory).sort()) {
@@ -153,26 +160,62 @@ export class HistoryRolloutAllowlist {
       else throw new Error('unexpected-rollout-entry');
     }
   }
-  /** The routing decision. A group missing from the declared roster is legacy
-   * even if a stray receipt file names it. */
+  /** The group-level routing decision. A group missing from the declared roster
+   * is legacy even if a stray receipt file names it. Production wiring must ask
+   * `routeSession`: a group verdict alone cannot speak for a session that was
+   * never part of the verified roster. */
   route(group: string): RolloutRoute {
     if (!this.declared.has(group)) return 'legacy';
     return this.states.get(group)?.state === 'enabled' ? 'sqlite-authoritative' : 'legacy';
+  }
+  /** The per-session routing decision. A session only leaves the legacy path
+   * when its own group is enabled *and* the session was in the roster the gate
+   * verified at enable time. A session that joined the group afterwards keeps
+   * the legacy path until the group is enabled again over the new roster. */
+  routeSession(sessionId: string): RolloutRoute {
+    const group = this.store.session(sessionId).group_label;
+    if (this.route(group) !== 'sqlite-authoritative') return 'legacy';
+    const enrolled = this.states.get(group)?.evidence?.expectedSessions ?? [];
+    return enrolled.includes(sessionId) ? 'sqlite-authoritative' : 'legacy';
   }
   private refuse(group: string, reason: string, observed: unknown): never {
     this.store.persistFault('', 'rollout-refused', reason, { group, observed });
     throw new Error(`rollout-refused:${reason}`);
   }
-  /** Enable one group. Every readiness item is re-read from the store/mirror at
-   * enable time; evidence produced from empty input never passes. */
+  /** Read one session's mirror from disk right now. A missing mirror and an
+   * unreadable mirror each refuse under their own reason; neither is allowed to
+   * collapse into "watermark 0", which would read as a merely lagging mirror. */
+  private observeMirror(group: string, sessionId: string): { exportedRevision: number } {
+    const sessionMirror = join(this.mirrorDirectory, sha(sessionId));
+    if (!existsSync(sessionMirror)) this.refuse(group, 'mirror-missing', { sessionId, directory: sessionMirror });
+    try { return readMirror(this.mirrorDirectory, sessionId); }
+    catch (error) { this.refuse(group, 'mirror-unreadable', { sessionId, error: String(error) }); }
+  }
+  /** The group's membership as the store has it right now, unioned with the
+   * sessions the evidence claims. The store's answer is what the gate judges;
+   * a claimed session that has since left the group still has to answer for
+   * itself through `session-outside-group`. */
+  private rosterOf(group: string, evidence: GroupReadinessEvidence): string[] {
+    const members = (this.store.db.query('SELECT session_id FROM history_session WHERE group_label=? ORDER BY session_id')
+      .all(group) as Array<{ session_id: string }>).map(row => row.session_id);
+    if (!members.length) this.refuse(group, 'no-expected-sessions', 0);
+    return [...new Set([...members, ...evidence.expectedSessions])].sort();
+  }
+  /** Enable one group. Every readiness item is re-read from the store and from
+   * the mirror at enable time — the roster comes from `history_session`, not
+   * from the evidence, and the watermark comes from the mirror on disk, not
+   * from the number the evidence carries. Evidence produced from empty input
+   * never passes, and evidence that was true when it was written does not pass
+   * once the world it describes has changed. */
   enableGroup(evidence: GroupReadinessEvidence): RolloutGroupState {
     const group = evidence.group;
     if (!this.declared.has(group)) this.refuse(group, 'group-not-declared', group);
     if (!evidence.expectedSessions.length) this.refuse(group, 'no-expected-sessions', 0);
     if (!evidence.sourcePaths.length) this.refuse(group, 'no-source-paths', 0);
     if (!evidence.faultProbeIds.length) this.refuse(group, 'no-fault-probes', 0);
+    const roster = this.rosterOf(group, evidence);
     let recount = 0;
-    for (const sessionId of evidence.expectedSessions) {
+    for (const sessionId of roster) {
       const session = this.store.session(sessionId);
       if (session.group_label !== group) this.refuse(group, 'session-outside-group', { sessionId, group_label: session.group_label });
       if (!(session.revision > 0)) this.refuse(group, 'session-without-receipts', { sessionId, revision: session.revision });
@@ -188,15 +231,25 @@ export class HistoryRolloutAllowlist {
       const landed = this.store.db.query('SELECT issue_id FROM history_issue WHERE issue_id=?').get(issueId);
       if (!landed) this.refuse(group, 'fault-probe-unknown', issueId);
     }
-    for (const sessionId of evidence.expectedSessions) {
+    for (const sessionId of roster) {
       const claimed = evidence.watermarks.find(mark => mark.sessionId === sessionId);
       if (!claimed) this.refuse(group, 'watermark-missing', sessionId);
       const revision = this.store.session(sessionId).revision;
-      if (claimed.exportedRevision !== revision || claimed.targetRevision !== revision) {
+      // The mirror is read here, now. The claim is then held against what was
+      // read, so a stale claim and a mirror that has fallen behind since the
+      // assessment are both caught.
+      const observed = this.observeMirror(group, sessionId);
+      if (observed.exportedRevision !== revision) {
+        this.refuse(group, 'watermark-behind-writer', { sessionId, observed: observed.exportedRevision, revision });
+      }
+      if (claimed.exportedRevision !== observed.exportedRevision || claimed.targetRevision !== revision) {
         this.refuse(group, 'watermark-behind-writer', { sessionId, claimed, revision });
       }
     }
-    const state: RolloutGroupState = { version: 1, group, state: 'enabled', evidence, changedAt: Date.now() };
+    // The stored evidence is rewritten with the roster the gate actually
+    // verified, so `routeSession` can never be wider than what was checked.
+    const state: RolloutGroupState = { version: 1, group, state: 'enabled',
+      evidence: { ...evidence, expectedSessions: roster }, changedAt: Date.now() };
     durableReplace(this.directory, `group-${sha(group)}.json`, JSON.stringify(state));
     this.states.set(group, state);
     return state;
