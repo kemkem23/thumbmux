@@ -138,7 +138,8 @@ export class OptInHistoryBridge implements HistoryCaptureBridge {
       if(!entry.shadowCompared) {
         const sqlite=this.store.shadowSnapshot(entry.sessionId,entry.requestId);
         const oracle=shadow.sourceOracle(projection(batch));
-        entry={...entry,shadowCompared:true,shadowReport:compareShadowBatch(entry.sessionId,entry.legacyShadow,sqlite,oracle,(shadow.now??Date.now)())};
+        entry={...entry,shadowCompared:true,shadowDelivered:entry.shadowDelivered??false,
+          shadowReport:compareShadowBatch(entry.sessionId,entry.legacyShadow,sqlite,oracle,(shadow.now??Date.now)())};
         this.spool.update(entry);
       }
       if(!entry.shadowDelivered) {
