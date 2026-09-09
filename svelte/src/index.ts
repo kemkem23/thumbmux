@@ -16,6 +16,10 @@
  * service-worker           push/click handlers for the notification service worker
  * TermSearch               in-terminal search bar (query / next / previous / close)
  * term-search              host-facing search key intents + active-index helpers
+ * SessionMetadata          session cwd + last-activity row (host owns the strings)
+ * ThemeSourceChoice        two-state "session color / agent color" picker
+ * AttachmentDraftPicker    pre-send attachment draft list (pick/paste/remove)
+ * ImageAnnotator           pre-send image markup panel (draw/undo/comment/submit)
  */
 export { default as TermView } from './TermView.svelte';
 export {
@@ -184,3 +188,7 @@ export {
   type ContentUpdateGateResult,
   type ContentUpdateMeta,
 } from './content-update-gate';
+export { default as SessionMetadata } from './SessionMetadata.svelte';
+export { default as ThemeSourceChoice } from './ThemeSourceChoice.svelte';
+export { default as AttachmentDraftPicker } from './AttachmentDraftPicker.svelte';
+export { default as ImageAnnotator } from './ImageAnnotator.svelte';
