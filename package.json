@@ -48,6 +48,10 @@
       "types": "./server/dist/index.d.ts",
       "import": "./server/dist/index.js"
     },
+    "./server/recall": {
+      "types": "./server/dist/recall-handler.d.ts",
+      "import": "./server/dist/recall-handler.js"
+    },
     "./svelte": {
       "types": "./svelte/dist/index.d.ts",
       "svelte": "./svelte/dist/index.js"
@@ -80,6 +84,10 @@
       "types": "./svelte/dist/content-update-gate.d.ts",
       "import": "./svelte/dist/content-update-gate.js"
     },
+    "./svelte/selection-release": {
+      "types": "./svelte/dist/selection-release.d.ts",
+      "import": "./svelte/dist/selection-release.js"
+    },
     "./app/config": {
       "types": "./app/dist/config.d.ts",
       "import": "./app/dist/config.js"
@@ -95,6 +103,14 @@
     "./app/sessions-store": {
       "types": "./app/dist/sessions-store.d.ts",
       "import": "./app/dist/sessions-store.js"
+    },
+    "./app/font-range": {
+      "types": "./app/dist/font-range.d.ts",
+      "import": "./app/dist/font-range.js"
+    },
+    "./app/embed-config": {
+      "types": "./app/dist/embed-config.d.ts",
+      "import": "./app/dist/embed-config.js"
     },
     "./package.json": "./package.json"
   }

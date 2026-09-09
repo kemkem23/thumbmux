@@ -12,7 +12,9 @@
  * codex-tools     detect sealed, completed Codex tool/event blocks
  * tool-projection provider-neutral completed-tool collapse and row mapping
  * surface         derive a full readable surface from one background color
+ * theme-overrides persisted per-mode background picks (parse/read/write, no store)
  * cells           terminal cell widths (Thai/CJK/emoji) → cursor column math
+ * clear-context    provider-aware key plan for clearing an agent's conversation
  * keys            desktop KeyboardEvent → terminal byte sequences (+ bracketed paste)
  * sgr-mouse       SGR mouse-forwarding math for alt-screen TUIs (wheel/click/hit-test)
  */
@@ -41,9 +43,11 @@ export * from './upload';
 export * from './cells';
 export * from './copy';
 export * from './prefs';
+export * from './theme-overrides';
 export * from './keys';
 export * from './sgr-mouse';
 export * from './paste';
 export * from './submit';
+export * from './clear-context';
 export * from './prepend';
 export * from './deprecate';

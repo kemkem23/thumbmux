@@ -42,6 +42,12 @@
     "tier": "F"
   },
   {
+    "name": "CLEAR_CONTEXT_CONTROL_BYTES",
+    "kind": "value",
+    "signature": "e93092286def4e615cf7335186fa7bcfde2b31a22b989abb84cd2004cc244313",
+    "tier": "X"
+  },
+  {
     "name": "ClaudeBashBlock",
     "kind": "type",
     "signature": "2f0606d4c61e21fc8cc1ea936d3eed68d19d8e230a2f0a881090a5064ee1a33f",
@@ -156,6 +162,30 @@
     "tier": "X"
   },
   {
+    "name": "ClearContextControlKey",
+    "kind": "type",
+    "signature": "bcbf6b182c542ae59e7881aef4a6a615d196d61ee7df104f02930f77f241cdb2",
+    "tier": "X"
+  },
+  {
+    "name": "ClearContextPlanOptions",
+    "kind": "type",
+    "signature": "9d389613b3179c2e7aeba573518d40c86f4429f6af4e0bbd900ee87c6523167f",
+    "tier": "X"
+  },
+  {
+    "name": "ClearContextStep",
+    "kind": "type",
+    "signature": "30be8962265e8d05a661b6c3f894bd42e13ce8e8bc491528e2ae600d8e7d1540",
+    "tier": "X"
+  },
+  {
+    "name": "ClearContextStrategy",
+    "kind": "type",
+    "signature": "f741d1219e1644314c81940c984343c78e9e4cb2143961d970e3b768be53d256",
+    "tier": "X"
+  },
+  {
     "name": "CodexToolDetection",
     "kind": "type",
     "signature": "c1dbdb4b45b9eafd820b2c96b3df1b3e011aef4fc52a69fe71416317bc318734",
@@ -178,6 +208,12 @@
     "kind": "value",
     "signature": "f83dc176b81eeb0a2b71b32ef49640fd941eb78a0cb8742f5eb8ab345119b2f5",
     "tier": "D"
+  },
+  {
+    "name": "DEFAULT_CLEAR_COMMAND",
+    "kind": "value",
+    "signature": "efaf9e8b76dbd3ab85fee58b8292da9a1e87dec6ff6b4c95cb1d8dbde7e436a0",
+    "tier": "X"
   },
   {
     "name": "DEFAULT_LAUNCH_PRESETS",
@@ -516,6 +552,12 @@
     "tier": "F"
   },
   {
+    "name": "THEME_MODES",
+    "kind": "value",
+    "signature": "e9d3f7ff84ad5b9ec65e4f09492518f99068bff8fe5cf3abdf992af76e97bdc7",
+    "tier": "S"
+  },
+  {
     "name": "TerminalLinkMatch",
     "kind": "type",
     "signature": "89894d53af384da7ec6447829686384848507c1eb41bf9806b70ad5a2364528d",
@@ -538,6 +580,18 @@
     "kind": "type",
     "signature": "7ad5d0055850947ae84ad64498fcf8eec8978350b6d746e32c909f8481a58acd",
     "tier": "F"
+  },
+  {
+    "name": "ThemeBackgrounds",
+    "kind": "type",
+    "signature": "d0e9b61a4f7ca8af3b0acd9f27ea275cac0739c1c3bef1fce63ce2be5c160051",
+    "tier": "S"
+  },
+  {
+    "name": "ThemeMode",
+    "kind": "type",
+    "signature": "b6c26e49bb1d32cc86fe9460530d01d1bfd9d52ebc3cff3769622c3c33d7fd29",
+    "tier": "S"
   },
   {
     "name": "ThumbmuxPrefs",
@@ -672,6 +726,18 @@
     "tier": "F"
   },
   {
+    "name": "clearContextPlan",
+    "kind": "value",
+    "signature": "d23fb4d16c7e15956fd5a4716e531ecfa766c8a40b028b8e0bd44e15e262755c",
+    "tier": "X"
+  },
+  {
+    "name": "clearContextStrategy",
+    "kind": "value",
+    "signature": "1b0f10ff3c632adadead524bc2c590e133c714081899420c49f0af4f2d4b5156",
+    "tier": "X"
+  },
+  {
     "name": "cloneSgrState",
     "kind": "value",
     "signature": "55bd791336656c9f7f4d05cdf0d9c0602878a1bdfc7e4a012d0704020d5caebb",
@@ -750,6 +816,12 @@
     "tier": "X"
   },
   {
+    "name": "emptyThemeBackgrounds",
+    "kind": "value",
+    "signature": "216c09e4eb589ce224ee5f7b9162dce0d491e4f5e1607488c5ebd5d6b80b22d8",
+    "tier": "S"
+  },
+  {
     "name": "extractRecentPrompts",
     "kind": "value",
     "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
@@ -826,6 +898,18 @@
     "kind": "value",
     "signature": "d6d99f0c1b663251ba4953a9352e963bd1d4910721f8d0dbb266cf9d788ca31d",
     "tier": "X"
+  },
+  {
+    "name": "isThemeBackground",
+    "kind": "value",
+    "signature": "f433c15dc7edfa7724d72084e67d16dc419c9dc829880d035a5b1bca22ce0c2b",
+    "tier": "S"
+  },
+  {
+    "name": "isThemeMode",
+    "kind": "value",
+    "signature": "b797e58d87513d9b0a7c3e4ac5260cea4d11a4ac1b0fc6a83206a151dc0b800b",
+    "tier": "S"
   },
   {
     "name": "keyboardEventToSequence",
@@ -912,6 +996,18 @@
     "tier": "F"
   },
   {
+    "name": "parseThemeBackgrounds",
+    "kind": "value",
+    "signature": "c8a3737c6afade09a9a71e4bb694dd495490df80df6006d74d797adcf5f3dd16",
+    "tier": "S"
+  },
+  {
+    "name": "parseThemeBackgroundsJson",
+    "kind": "value",
+    "signature": "b1baee5d0f04b3c1063508fa7795ab64d1c0f38293358ac7dd0919703cc442d8",
+    "tier": "S"
+  },
+  {
     "name": "pasteInfo",
     "kind": "value",
     "signature": "384c7c89321b4fa0559006682a0f0ff5301aef174f3190bc5a3191e12a485b96",
@@ -946,6 +1042,12 @@
     "kind": "value",
     "signature": "35add128de3f89964e4ff47258ba8c328a4f8da0edb739e18aae7bc235cedd47",
     "tier": "X"
+  },
+  {
+    "name": "readThemeBackground",
+    "kind": "value",
+    "signature": "824c9804c73b0dafe9b2739352960355a827b7801b2d678e72fcbebeabc0c6bc",
+    "tier": "S"
   },
   {
     "name": "readerAnchorLineDelta",
@@ -1096,5 +1198,11 @@
     "kind": "value",
     "signature": "0bf0eee63592105cfb7d5cfc9e72c6e3b565122249e4ff2afc2be4a01db7f0d6",
     "tier": "X"
+  },
+  {
+    "name": "writeThemeBackground",
+    "kind": "value",
+    "signature": "85e7943405016d8473351c6f537c01228a44c4c9467f05024f5260fbb2609ed8",
+    "tier": "S"
   }
 ]

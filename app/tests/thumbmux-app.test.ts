@@ -22,6 +22,8 @@ import ThumbmuxApp from '../src/ThumbmuxApp.svelte';
 import type {
   AppAdapters,
   AppLabels,
+  EmbedGeometry,
+  EmbedGeometryInput,
   FontBounds,
   HubPresentationOptions,
   SessionActionContext,
@@ -44,6 +46,16 @@ type MuxSurface = {
 
 const REQUIRED_RUNTIME_EXPORTS = [
   'DEFAULT_APP_LABELS',
+  'EMBED_CHROME_HEIGHT_PX',
+  'EMBED_FONT_PX_DESKTOP',
+  'EMBED_FONT_PX_MAX',
+  'EMBED_FONT_PX_MIN',
+  'EMBED_FONT_PX_MOBILE',
+  'EMBED_LINE_HEIGHT_RATIO',
+  'EMBED_MAX_ROWS',
+  'EMBED_MIN_FIT_HEIGHT_PX',
+  'EMBED_MIN_ROWS',
+  'EMBED_MOBILE_MAX_WIDTH_PX',
   'DEFAULT_FONT_PX',
   'DEFAULT_FONT_PX_MAX',
   'DEFAULT_FONT_PX_MIN',
@@ -54,14 +66,19 @@ const REQUIRED_RUNTIME_EXPORTS = [
   'clampFontPx',
   'createQueryParamNav',
   'createSessionsStore',
+  'defaultEmbedFontPx',
+  'fitEmbedRows',
   'nextStageOverlay',
   'prefillOnError',
+  'resolveEmbedGeometry',
   'resolveFontBounds',
   'stepFontPx',
 ] as const;
 const REQUIRED_TYPE_EXPORTS = [
   'AppAdapters',
   'AppLabels',
+  'EmbedGeometry',
+  'EmbedGeometryInput',
   'FontBounds',
   'HubPresentationOptions',
   'SessionActionContext',
@@ -74,6 +91,8 @@ const REQUIRED_TYPE_EXPORTS = [
 type ConfigExports = [
   AppAdapters,
   AppLabels,
+  EmbedGeometry,
+  EmbedGeometryInput,
   FontBounds,
   HubPresentationOptions,
   SessionActionContext,
@@ -431,6 +450,16 @@ const NUMBER_CONSTANTS = new Set([
   'DEFAULT_FONT_PX',
   'DEFAULT_FONT_PX_MIN',
   'DEFAULT_FONT_PX_MAX',
+  'EMBED_CHROME_HEIGHT_PX',
+  'EMBED_FONT_PX_DESKTOP',
+  'EMBED_FONT_PX_MAX',
+  'EMBED_FONT_PX_MIN',
+  'EMBED_FONT_PX_MOBILE',
+  'EMBED_LINE_HEIGHT_RATIO',
+  'EMBED_MAX_ROWS',
+  'EMBED_MIN_FIT_HEIGHT_PX',
+  'EMBED_MIN_ROWS',
+  'EMBED_MOBILE_MAX_WIDTH_PX',
 ]);
 const NON_CALLABLE_RUNTIME = new Set(['DEFAULT_APP_LABELS', ...NUMBER_CONSTANTS]);
 

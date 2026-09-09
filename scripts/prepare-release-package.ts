@@ -31,10 +31,13 @@ export const FRAMEWORK_FREE_SUBPATHS = [
   "svelte/recording-player",
   "svelte/term-search",
   "svelte/content-update-gate",
+  "svelte/selection-release",
   "app/config",
   "app/navigation",
   "app/overlay",
   "app/sessions-store",
+  "app/font-range",
+  "app/embed-config",
 ] as const;
 
 export type FrameworkFreeSubpath = (typeof FRAMEWORK_FREE_SUBPATHS)[number];
@@ -97,6 +100,13 @@ export const RELEASE_PACKAGE_EXPORTS = {
   "./server": {
     types: "./git-dist/server/index.d.ts",
     import: "./git-dist/server/index.js",
+  },
+  // Kept off the ./server barrel on purpose: this is the only module in the
+  // package that loads a database driver (bun:sqlite). A host importing the
+  // WebSocket engine must not pay for it, so recall is reachable only here.
+  "./server/recall": {
+    types: "./git-dist/server/recall-handler.d.ts",
+    import: "./git-dist/server/recall-handler.js",
   },
   "./svelte": {
     types: "./git-dist/svelte/index.d.ts",

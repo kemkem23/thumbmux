@@ -23,6 +23,14 @@
     "./sessions-store": {
       "types": "./dist/sessions-store.d.ts",
       "import": "./dist/sessions-store.js"
+    },
+    "./font-range": {
+      "types": "./dist/font-range.d.ts",
+      "import": "./dist/font-range.js"
+    },
+    "./embed-config": {
+      "types": "./dist/embed-config.d.ts",
+      "import": "./dist/embed-config.js"
     }
   },
   "peerDependencies": {

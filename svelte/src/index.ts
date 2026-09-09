@@ -33,6 +33,17 @@ export {
 } from './dpad';
 export { default as ThemeSheet } from './ThemeSheet.svelte';
 export {
+  STOCK_SCROLL_CONTROL_SELECTORS,
+  SELECTION_HANDLE_MARGIN_PX,
+  TERMINAL_SEARCH_SELECTOR,
+  TERMINAL_VIEWPORT_SELECTOR,
+  installTerminalSelectionRelease,
+  isScrollIntent,
+  pointIsOnSelection,
+  releasableTerminalSelection,
+  type SelectionReleaseOptions,
+} from './selection-release';
+export {
   default as ActionFab,
   type FabAction,
   type FabActionChoice,
