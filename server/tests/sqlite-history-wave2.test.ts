@@ -109,6 +109,8 @@ test('sealed manifest and full row/frame/screen oracle make every injected misma
     f.db.query("UPDATE history_import SET state='copying' WHERE source_id=?").run('oracle');
     expect(inspectImportedSnapshot(f.store,options).unresolved.map(item=>item.kind)).toContain('import-state');
 
+    const rogue=join(directory,'unlisted.bin');writeFileSync(rogue,'not in manifest');
+    expect(()=>inspectImportedSnapshot(f.store,options)).toThrow('orphan-snapshot-file');rmSync(rogue);
     const sourceFile=join(directory,'meta.json');chmodSync(sourceFile,0o600);writeFileSync(sourceFile,'{}');
     expect(()=>inspectImportedSnapshot(f.store,options)).toThrow('snapshot-digest');
   }finally{await f.cleanup();}
