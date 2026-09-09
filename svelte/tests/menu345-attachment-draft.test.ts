@@ -6,7 +6,7 @@
  * object-URL lifecycle (remove / clear / prop re-seed / unmount), and they
  * re-assert that UploadAction's send-immediately default is untouched.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import AttachmentDraftPicker from "../src/AttachmentDraftPicker.svelte";
@@ -21,9 +21,12 @@ import {
   draftFilesOf,
   fileMatchesAccept,
   imageFilesFromClipboard,
+  loadAnnotationImage,
   releaseDraftItems,
   removeDraftItem,
   syncDraftItems,
+  type AnnotationImageHandlers,
+  type AnnotationImageLike,
   type ObjectUrlPorts,
 } from "../src/attachment-draft";
 
@@ -85,6 +88,22 @@ function recordingPorts(): ObjectUrlPorts & { created: string[]; revoked: string
       revokedHere.push(url);
     },
   };
+}
+
+/** Keep image completion under the test's control, including after cancellation. */
+function pendingImageLoad(handlers: AnnotationImageHandlers) {
+  const ports = recordingPorts();
+  const image: AnnotationImageLike = {
+    width: 0, height: 0, src: "", onload: null, onerror: null,
+  };
+  const load = loadAnnotationImage(imageFile("broken.png"), {
+    ...ports,
+    createImage: () => image,
+  }, handlers);
+  expect(ports.created).toHaveLength(1);
+  expect(image.src).toBe(ports.created[0]!);
+  expect(image.onerror).toBeFunction();
+  return { ports, image, load };
 }
 
 /** A fetch that must never be called; every call is recorded and fails loudly. */
@@ -287,6 +306,39 @@ describe("attachment-draft helpers", () => {
       { kind: "file", type: "image/jpeg", getAsFile: () => null },
     ]);
     expect(files).toEqual([png]);
+  });
+});
+
+describe("attachment-draft · image error lifecycle", () => {
+  test("an error after cancel calls neither handler and does not revoke twice", () => {
+    const onLoad = mock(() => {});
+    const onError = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad, onError });
+
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    // Invoke the installed handler: optional chaining could hide missing wiring.
+    image.onerror!();
+
+    expect(onError).toHaveBeenCalledTimes(0);
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(ports.revoked).toEqual([image.src]);
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
+  });
+
+  test("an error without an onError callback releases the URL and never reports a load", () => {
+    const onLoad = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad });
+
+    expect(ports.revoked).toEqual([]);
+    image.onerror!();
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(ports.revoked).toEqual([image.src]);
+
+    load.cancel();
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
   });
 });
 
