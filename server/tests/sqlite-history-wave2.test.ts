@@ -37,13 +37,14 @@ test('opt-in bridge spools one capture and requires matching receipts from legac
 
 test('bridge rejects a lying legacy acknowledgement before SQLite commit',async()=>{
   const f=fixture();try{
-    const sid=await f.store.register({name:'bridge-bad',lifecycleKey:'bridge-bad'});
+    const sid=await f.store.register({name:'bridge-bad',lifecycleKey:'bridge-bad'});let lying=true;
     const bridge=new OptInHistoryBridge(f.store,{spoolDirectory:join(f.dir,'spool'),
-      legacyProjection:{write:async value=>({requestId:value.requestId,digest:'0'.repeat(64)})},sessions:()=>[sid],
+      legacyProjection:{write:async value=>({requestId:value.requestId,digest:lying?'0'.repeat(64):legacyProjectionDigest(value)})},sessions:()=>[sid],
       driver:{geometryGeneration:()=>1,capture:async()=>observation(ids(50),10)}});
     await expect(bridge.probe(sid)).rejects.toThrow('legacy-projection-mismatch');
     expect(f.store.session(sid).revision).toBe(0);
     expect(bridge.ledger()[0]).toMatchObject({legacyCommitted:false,sqliteCommitted:false});
+    lying=false;await bridge.resumePending();
   }finally{await f.cleanup();}
 });
 
