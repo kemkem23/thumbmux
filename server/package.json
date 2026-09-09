@@ -11,6 +11,10 @@
     "./recall": {
       "types": "./dist/recall-handler.d.ts",
       "import": "./dist/recall-handler.js"
+    },
+    "./sqlite-history": {
+      "types": "./dist/sqlite-history.d.ts",
+      "import": "./dist/sqlite-history.js"
     }
   },
   "license": "MIT",

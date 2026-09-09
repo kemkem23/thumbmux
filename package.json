@@ -52,6 +52,10 @@
       "types": "./server/dist/recall-handler.d.ts",
       "import": "./server/dist/recall-handler.js"
     },
+    "./server/sqlite-history": {
+      "types": "./server/dist/sqlite-history.d.ts",
+      "import": "./server/dist/sqlite-history.js"
+    },
     "./svelte": {
       "types": "./svelte/dist/index.d.ts",
       "svelte": "./svelte/dist/index.js"
