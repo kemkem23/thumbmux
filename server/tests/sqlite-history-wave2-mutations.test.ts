@@ -42,6 +42,7 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       const child=Bun.spawn(args,{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
       const output=out+err;console.log('MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed:output.includes('(fail)')}));
+      if(code!==0&&!output.includes('(fail)'))console.log('MUTANT_INVALID_OUTPUT',output);
       return {code,output};
     };
     expect((await run('clean-before')).code).toBe(0);
