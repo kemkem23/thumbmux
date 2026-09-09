@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { locateAnchor } from '../history-stitch';
 import { sha, validateObservation, safe } from './codec';
 import type { HistoryStore } from './store';
-import type { CaptureObservation, CaptureReceipt, HistoryCoordinatorOptions, HistoryEvidence } from './types';
+import type { CaptureBatch, CaptureObservation, CaptureReceipt, HistoryCoordinatorOptions, HistoryEvidence } from './types';
+
+export type CaptureBatchCommitter = (batch: CaptureBatch) => Promise<CaptureReceipt>;
 
 /** No work starts until start()/probe(). Neither subscribers nor a global ticking flag gate captures. */
 export class HistoryCoordinator {
@@ -10,7 +12,8 @@ export class HistoryCoordinator {
   private pending=new Map<string, import('./types').CaptureBatch>();
   private timer:ReturnType<typeof setInterval>|null=null;
   private stopped=false;
-  constructor(private store:HistoryStore,private options:HistoryCoordinatorOptions) {
+  constructor(private store:HistoryStore,private options:HistoryCoordinatorOptions,
+    private commitBatch:CaptureBatchCommitter=(batch)=>store.commit(batch)) {
     safe(options.recordingSessionBytes??64*1024*1024);safe(options.recordingRootBytes??256*1024*1024);safe(options.intervalMs??10000);safe(options.deadlineMs??5000);safe(options.liveLineLimit??1000);
     if((options.intervalMs??10000)<1 || (options.deadlineMs??5000)<1) throw new Error('invalid-deadline');
     store.addDrain(()=>this.stopAndDrain());
@@ -30,7 +33,7 @@ export class HistoryCoordinator {
     try {
       // Retry a failed commit with the original observation and request ID, never a recapture.
       const retry=this.pending.get(sid);
-      if(retry) {const receipt=await this.store.commit(retry);this.pending.delete(sid);await this.publish(receipt);return receipt;}
+      if(retry) {const receipt=await this.commitBatch(retry);this.pending.delete(sid);await this.publish(receipt);return receipt;}
       const ticket=this.store.ticket(sid,randomUUID());
       const generation=this.options.driver.geometryGeneration(sid);
       const abort=new AbortController();
@@ -70,7 +73,7 @@ export class HistoryCoordinator {
       const batch={ticket,observation:o,appended,recordFrames:this.options.recordFrames??false,recordingSessionBytes:this.options.recordingSessionBytes,recordingRootBytes:this.options.recordingRootBytes,liveLineLimit:this.options.liveLineLimit??1000,
         evidence:{classification,depth,source:o.source,rawSha256:sha(raw)},unresolved:unresolved?raw:undefined};
       this.pending.set(sid,batch);
-      const receipt=await this.store.commit(batch);
+      const receipt=await this.commitBatch(batch);
       this.pending.delete(sid);
       // This is the sole delivery point. COMMIT has returned; a failed send cannot undo durability.
       await this.publish(receipt);
@@ -84,6 +87,6 @@ export class HistoryCoordinator {
     this.stopped=true;if(this.timer){clearInterval(this.timer);this.timer=null;}
     await Promise.allSettled(this.running.values());
     // Stop admission, but finish observations already accepted by this coordinator.
-    for(const [sid,batch] of this.pending){await this.store.commit(batch);this.pending.delete(sid);}
+    for(const [sid,batch] of this.pending){await this.commitBatch(batch);this.pending.delete(sid);}
   }
 }
