@@ -35,7 +35,9 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
     mkdirSync(join(root,'server/tests/sqlite-history'),{recursive:true});
     cpSync(join(pkg,'server/tests/sqlite-history-wave2.test.ts'),join(root,'server/tests/sqlite-history-wave2.test.ts'));
     cpSync(join(pkg,'server/tests/sqlite-history/helpers.ts'),join(root,'server/tests/sqlite-history/helpers.ts'));
-    mkdirSync(join(root,'node_modules/@thumbmux'),{recursive:true});cpSync(join(pkg,'core'),join(root,'node_modules/@thumbmux/core'),{recursive:true});
+    const copiedCore=join(root,'node_modules/@thumbmux/core');mkdirSync(copiedCore,{recursive:true});
+    cpSync(join(pkg,'core/src'),join(copiedCore,'src'),{recursive:true});
+    writeFileSync(join(copiedCore,'package.json'),'\n{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}\n');
     writeFileSync(join(root,'package.json'),'\n{"type":"module"}\n');
     const run=async(name:string,pattern?:string)=>{
       const args=[process.execPath,'test','./server/tests/sqlite-history-wave2.test.ts'];if(pattern)args.push('--test-name-pattern',pattern);
