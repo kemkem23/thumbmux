@@ -28,6 +28,7 @@ test('opt-in bridge spools one capture and requires matching receipts from legac
     const receipt=await bridge.probe(sid);
     expect(receipt.legacyCommitted).toBe(true);expect(receipt.sqliteCommitted).toBe(true);
     expect(received).toHaveLength(1);expect(received[0].rows).toHaveLength(40);
+    expect(received[0].geometry).toEqual(receipt.sqlite.geometry);expect(received[0].source).toEqual({});
     expect(f.store.rows(sid,0,40).map(row=>row.text)).toEqual(received[0].rows.map(row=>row.text));
     expect(bridge.ledger()).toEqual([{requestId:receipt.requestId,sessionId:sid,digest:receipt.digest,
       legacyCommitted:true,sqliteCommitted:true,sqliteRevision:1}]);
@@ -84,6 +85,7 @@ test('closed-session importer resumes persisted checkpoint after restart and rer
     await current.close();current=new HistoryStore(new Database(f.file,{strict:true}),{file:f.file,onFault:fault=>f.alarms.push(fault)});
     const repeated=await importClosedHistorySession(current,input);
     expect(repeated.sessionId).toBe(sid);expect(current.session(sid).revision).toBe(revision);expect(current.rows(sid,0,1100)).toHaveLength(1100);
+    await expect(importClosedHistorySession(current,{...input,name:'wrong-name'})).rejects.toThrow('closed-import-identity-conflict');
     expect(progress.some(value=>value.cursor===500&&value.state==='copying')).toBe(true);
     expect(progress.some(value=>value.cursor===1100&&value.state==='verified')).toBe(true);
   }finally{

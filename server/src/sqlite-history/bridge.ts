@@ -38,6 +38,9 @@ function projection(batch: CaptureBatch): LegacyProjection {
     rows: structuredClone(batch.appended),
     screen: structuredClone(batch.observation.screen),
     raw: structuredClone(batch.observation.raw),
+    geometry: structuredClone(batch.observation.geometry),
+    source: structuredClone(batch.observation.source),
+    at: batch.observation.at,
     ...(batch.frame ? { frame: structuredClone(batch.frame) } : {}),
   };
 }

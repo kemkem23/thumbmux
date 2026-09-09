@@ -124,6 +124,12 @@ export function verifyImportedSnapshot(store: HistoryStore, input: HistoryImport
 export async function importClosedHistorySession(store: HistoryStore, input: ClosedHistoryImportOptions): Promise<ClosedHistoryImportResult> {
   const old = store.db.query('SELECT session_id FROM history_import WHERE source_id=?').get(input.sourceId) as {session_id:string|null}|null;
   const oracle = readSealedHistoryOracle(input.snapshotDirectory, input.format);
+  if (old?.session_id) {
+    const existing=store.session(old.session_id);
+    if (existing.lifecycle_key!==input.lifecycleKey || existing.name!==input.name || existing.group_label!==(input.group??'_ungrouped')) {
+      throw new Error('closed-import-identity-conflict');
+    }
+  }
   const sessionId = old?.session_id ?? await store.register({name:input.name,lifecycleKey:input.lifecycleKey,group:input.group,
     firstLine:oracle.rows[0]?.line_no ?? 0});
   if (!sessionId) throw new Error('closed-import-unmapped');

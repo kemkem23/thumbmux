@@ -88,6 +88,7 @@ export interface LegacyProjection {
   requestId: string; sessionId: string;
   rows: Array<{ kind: 'terminal' | 'gap'; text: string }>;
   screen: string[]; raw: string[];
+  geometry: HistoryGeometry; source: SourceObservation; at: number;
   frame?: FrameJournalRecordV1;
 }
 export interface LegacyProjectionAcknowledgement { requestId: string; digest: string }

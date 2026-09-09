@@ -23,6 +23,8 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       from:"if (report.unresolved.length || !report.ready)",to:'if (false)'}]},
     {name:'collapse-import-request-identity',pattern:'resumes persisted checkpoint',edits:[{file:'transfer.ts',
       from:'`import:${input.sourceId}:${from}`',to:'`import:${input.sourceId}:constant`'}]},
+    {name:'accept-conflicting-closed-identity',pattern:'resumes persisted checkpoint',edits:[{file:'rehearsal.ts',
+      from:"if (existing.lifecycle_key!==input.lifecycleKey || existing.name!==input.name || existing.group_label!==(input.group??'_ungrouped'))",to:'if (false)'}]},
     {name:'silence-progress-watchdog',pattern:'checkpoint detector cries',edits:[{file:'detectors.ts',
       from:"if(progress.state==='verified' || progress.state==='quarantined' || now-progress.checkpointAt<=30000)return null;",to:'return null;'}]},
     {name:'drop-batch-progress-notification',pattern:'resumes persisted checkpoint',edits:[{file:'transfer.ts',
