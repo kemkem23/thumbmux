@@ -69,8 +69,8 @@ test('closed-session importer resumes persisted checkpoint after restart and rer
   const f=fixture();let current=f.store;try{
     const lines=ids(1100),raw=lines.map((text,line)=>JSON.stringify({line,text})+'\n').join('');
     const directory=sealed(f,'closed',{'history.jsonl':raw,'meta.json':JSON.stringify({liveStart:1100,nextLine:1102,live:['pane','']})});
-    const progress:number[]=[];const input={sourceId:'closed-source',snapshotDirectory:directory,format:'file-jsonl' as const,
-      name:'closed',lifecycleKey:'closed-lifecycle',onProgress:(value:any)=>progress.push(value.recordCursor)};
+    const progress:Array<{cursor:number;state:string}>=[];const input={sourceId:'closed-source',snapshotDirectory:directory,format:'file-jsonl' as const,
+      name:'closed',lifecycleKey:'closed-lifecycle',onProgress:(value:any)=>progress.push({cursor:value.recordCursor,state:value.state})};
     const original=current.commit.bind(current);let calls=0;
     current.commit=async(...args)=>{if(++calls===2)throw new Error('synthetic restart');return original(...args);};
     expect((await importClosedHistorySession(current,input)).state).toBe('quarantined');
@@ -84,7 +84,8 @@ test('closed-session importer resumes persisted checkpoint after restart and rer
     await current.close();current=new HistoryStore(new Database(f.file,{strict:true}),{file:f.file,onFault:fault=>f.alarms.push(fault)});
     const repeated=await importClosedHistorySession(current,input);
     expect(repeated.sessionId).toBe(sid);expect(current.session(sid).revision).toBe(revision);expect(current.rows(sid,0,1100)).toHaveLength(1100);
-    expect(progress).toContain(500);expect(progress).toContain(1100);
+    expect(progress.some(value=>value.cursor===500&&value.state==='copying')).toBe(true);
+    expect(progress.some(value=>value.cursor===1100&&value.state==='verified')).toBe(true);
   }finally{
     if(current!==f.store)await current.close();
     rmSync(f.dir,{recursive:true,force:true});
