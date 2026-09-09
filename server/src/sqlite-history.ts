@@ -6,10 +6,13 @@ export { sealHistorySnapshot } from './sqlite-history/transfer';
 export { assertMigrationReady, readSealedHistoryOracle } from './sqlite-history/rehearsal';
 export type { ReaderVerification, ReaderEmptyReason, ReaderUnverifiableReason, ReaderPageResult, ReaderSnapshotResult } from './sqlite-history/reader';
 export type { AuthoritativeMirrorStage, AuthoritativeMirrorStatus, AuthoritativeRollbackReceipt, HistoryAuthoritativeBridgeOptions } from './sqlite-history/authoritative';
+// Wave 6 first half: expansion tooling, still opt-in and unwired to production.
+export { runRestoreDrill } from './sqlite-history/rollout';
+export type { BackupAuditEntry, BackupAuditReport, GroupReadinessEvidence, LegacyArtifactDigest, LegacyRetirementReceipt, RestoreDrillReceipt, RolloutGroupState, RolloutRoute } from './sqlite-history/rollout';
 
 export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
-  const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal,reader,authoritative]=await Promise.all([
-    import('bun:sqlite'),import('./sqlite-history/store'),import('./sqlite-history/coordinator'),import('./sqlite-history/bridge'),import('./sqlite-history/transfer'),import('./sqlite-history/rehearsal'),import('./sqlite-history/reader'),import('./sqlite-history/authoritative')]);
+  const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal,reader,authoritative,rollout]=await Promise.all([
+    import('bun:sqlite'),import('./sqlite-history/store'),import('./sqlite-history/coordinator'),import('./sqlite-history/bridge'),import('./sqlite-history/transfer'),import('./sqlite-history/rehearsal'),import('./sqlite-history/reader'),import('./sqlite-history/authoritative'),import('./sqlite-history/rollout')]);
   const file=prepareFile(options.file);
   const db=new Database(file,{strict:true,safeIntegers:false});
   let store:InstanceType<typeof HistoryStore>;
@@ -24,6 +27,11 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     createReaderCanary:()=>new reader.HistoryReaderCanary(store),
     // Wave 5 authoritative writer. Opt-in; no production session is wired to it.
     createAuthoritativeBridge:(o:import('./sqlite-history/authoritative').HistoryAuthoritativeBridgeOptions)=>new authoritative.AuthoritativeHistoryBridge(store,o),
+    // Wave 6 first half. Opt-in expansion tooling; no group is enabled anywhere.
+    createRolloutAllowlist:(o:{directory:string;declaredGroups:readonly string[]})=>new rollout.HistoryRolloutAllowlist(store,o),
+    assessGroupReadiness:(group:string,mirrorDirectory:string)=>rollout.assessGroupReadiness(store,group,mirrorDirectory),
+    auditBackupCoverage:(mirrorDirectory:string)=>rollout.auditBackupCoverage(store,mirrorDirectory),
+    restoreDrill:(bundleDirectory:string,scratchDirectory:string)=>rollout.runRestoreDrill(bundleDirectory,scratchDirectory),
     readerRequest:(canary:InstanceType<typeof reader.HistoryReaderCanary>,request:Request)=>reader.historyReaderRequest(canary,request),
     snapshot:store.snapshot.bind(store),
     readBefore:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'before',anchor,limit,context),
