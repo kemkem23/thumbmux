@@ -8,6 +8,7 @@
  * frame-to-frame bounce in those numbers is the flicker kem reported.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +18,7 @@ import type { Browser, Page } from "@playwright/test";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const ENTRY = join(here, ".bash-hide-flicker-entry.generated.ts");
+const ENTRY = join(here, `.bash-hide-flicker-entry.${process.pid}.${randomUUID()}.generated.ts`);
 const BROWSER_TEST_TIMEOUT_MS = 60_000;
 
 const sveltePkgPath = require.resolve("svelte/package.json");
@@ -238,19 +239,23 @@ describe("Bash HIDE geometry in a real engine", () => {
     // Bun.build calls from separate test files can overlap inside one aggregate
     // `bun test` process and cross-contaminate their loader graphs. Run this
     // harness in its own process, matching the other browser scenes.
-    const child = Bun.spawn({
-      cmd: [process.execPath, "test", fileURLToPath(import.meta.url)],
+    // Synchronous supervision prevents the aggregate Bun event loop from
+    // delaying child-output collection behind unrelated compile/test callbacks.
+    // The local suite runner additionally schedules browser files after bulk
+    // tests and holds the hard-sandbox host lease until cgroup cleanup finishes.
+    const child = Bun.spawnSync({
+      cmd: ["/usr/bin/timeout", "--kill-after=5s", "230s",
+        process.execPath, "test", fileURLToPath(import.meta.url)],
       cwd: join(here, "../.."),
       env: { ...process.env, THUMBMUX_FLICKER_BROWSER_CHILD: "1" },
       stdout: "pipe",
       stderr: "pipe",
     });
-    const [stdout, stderr, status] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
-    ]);
-    const output = `${stdout}\n${stderr}`;
+    const status = child.exitCode;
+    const output = `${child.stdout.toString()}\n${child.stderr.toString()}`;
+    if (status === 124 || status === 137) {
+      throw new Error(`browser worker exceeded its execution budget; resource starvation vs code hang is undetermined:\n${output}`);
+    }
     if (status !== 0) throw new Error(`isolated flicker browser worker failed:\n${output}`);
     expect(output).toContain("1 pass");
     expect(output).toContain("0 fail");
