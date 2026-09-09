@@ -1032,6 +1032,42 @@
       return [...candidates];
     };
 
+    /**
+     * The single old row this replacement translated but did not preserve, or
+     * `null` when the frame is not one contiguous insert/remove plus at most
+     * that one edited row.
+     *
+     * Claude pins its composer chrome to the bottom of the pane and prints new
+     * output above the activity status row, so a frame carrying output moves
+     * that row by exactly the capture's net length change. Every other row must
+     * still be byte-identical: at its own index before the edited block, and at
+     * `lengthShift` after it. That is what tells such a translation apart from
+     * a replacement whose surrounding content also changed — only a proven pure
+     * edit lets an existing proof move with the rows it already owns, and it
+     * still has to repaint to stay authorized.
+     *
+     * Computed once per capture: a per-proof scan would be O(retainedRows) on
+     * the delivery path for each of up to 512 retained proofs.
+     */
+    const pureEditRow = ((): { editEnd: number; movedRow: number | null } | null => {
+      if (lengthShift === 0) return null;
+      const prefixLimit = Math.min(rawLines.length, next.length);
+      let commonPrefix = 0;
+      while (
+        commonPrefix < prefixLimit
+        && rawLines[commonPrefix] === next[commonPrefix]
+      ) commonPrefix += 1;
+      // Removed rows leave the edited window open until the deleted block ends.
+      const editEnd = lengthShift > 0 ? commonPrefix : commonPrefix - lengthShift;
+      let movedRow: number | null = null;
+      for (let row = editEnd; row < rawLines.length; row += 1) {
+        if (rawLines[row] === next[row + lengthShift]) continue;
+        if (movedRow !== null) return null;
+        movedRow = row;
+      }
+      return { editEnd, movedRow };
+    })();
+
     // Preserve already witnessed rows independently of the bounded discovery
     // scan below. A full capture can grow after the composer and move a stable
     // activity row far away from the tail without changing its identity.
@@ -1042,8 +1078,30 @@
         next,
         [previousIndex, previousIndex + lengthShift],
       );
+      const translatedIndex = previousIndex + lengthShift;
       if (candidates.length === 1 && candidates[0] === previousIndex) {
         confirmed.add(previousIndex);
+      } else if (
+        // The whole frame is a proven pure edit, this row is its only other
+        // moved row, it is the sole status-shaped candidate of the two
+        // coordinates in both directions, and it repainted at its new index —
+        // the same visible-change bar the discovery scan below demands. A
+        // replacement whose surrounding rows also changed still fails closed.
+        candidates.length === 1
+        && candidates[0] === translatedIndex
+        && normalizedClaudeActivityStatus(next[translatedIndex] ?? '') !== previousStatus
+        && pureEditRow !== null
+        && previousIndex >= pureEditRow.editEnd
+        && (pureEditRow.movedRow === null || pureEditRow.movedRow === previousIndex)
+        && (() => {
+          const reverse = statusIndexesAt(
+            rawLines,
+            [translatedIndex, translatedIndex - lengthShift],
+          );
+          return reverse.length === 1 && reverse[0] === previousIndex;
+        })()
+      ) {
+        confirmed.add(translatedIndex);
       } else {
         // Nearby rows are baseline-only: they retain summary lifecycle state
         // across resize/reflow whose displacement differs from the net length
