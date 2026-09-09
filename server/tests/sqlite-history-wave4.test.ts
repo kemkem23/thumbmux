@@ -15,8 +15,17 @@ import { validateHistoryPage } from '../src/sqlite-history/detectors';
 import type { HistoryContext, HistoryRow } from '../src/sqlite-history/types';
 import { batch, fixture, ids } from './sqlite-history/helpers';
 
+type Verifier = { verify(sid: string, revision: number, rows: HistoryRow[], start: number, end: number): { status: string; reason?: string } };
+const verifier = (reader: HistoryReaderCanary) => reader as unknown as Verifier;
+
 async function seed(store: ReturnType<typeof fixture>['store'], sid: string, total: number, per = 100) {
   for (let start = 0; start < total; start += per) await store.commit(batch(store, sid, ids(per, start)));
+}
+
+/** A commit that leaves `liveImmutable` numbered rows inside the live window. */
+async function seedLive(store: ReturnType<typeof fixture>['store'], sid: string, from: number, count: number, liveImmutable: number) {
+  const b = batch(store, sid, ids(count, from));
+  await store.commit({ ...b, liveLineLimit: liveImmutable + b.observation.screen.length });
 }
 
 describe('wave 4 reader canary', () => {
@@ -27,6 +36,9 @@ describe('wave 4 reader canary', () => {
       await seed(f.store, sid, 1000);
       const reader = new HistoryReaderCanary(f.store);
       const snapshot = reader.snapshot(sid);
+      // Nothing is parked in the live window here, and the canary says exactly
+      // that rather than inventing a verified empty range.
+      expect(snapshot.verification).toEqual({ status: 'empty', reason: 'at-live-start', coveringCaptures: [] });
       const result = reader.page(sid, 'before', null, 500, snapshot.receipt.context);
       expect(result.verification.status).toBe('verified');
       if (result.verification.status !== 'verified') throw new Error('unreachable');
@@ -39,6 +51,21 @@ describe('wave 4 reader canary', () => {
       // `source-unknown` is wave 1's honest answer for a synthetic driver with
       // no source evidence; no reader/storage detector may fire here.
       expect(f.alarms.filter(a => a.detector !== 'source-unknown')).toEqual([]);
+    } finally { await f.cleanup(); }
+  });
+
+  test('the live window a reopened viewer renders is checked against its receipts', async () => {
+    const f = fixture();
+    try {
+      const sid = await f.store.register({ name: 'live', lifecycleKey: 'wave4-live' });
+      await seed(f.store, sid, 700);
+      await seedLive(f.store, sid, 700, 300, 290);
+      const reader = new HistoryReaderCanary(f.store);
+      const snapshot = reader.snapshot(sid);
+      expect(snapshot.receipt.context.liveStart).toBe(710);
+      expect(snapshot.live).toHaveLength(290);
+      expect(snapshot.verification.status).toBe('verified');
+      expect(snapshot.live.map(r => r.text)).toEqual(ids(290, 710));
     } finally { await f.cleanup(); }
   });
 
@@ -71,9 +98,7 @@ describe('wave 4 reader canary', () => {
       const ok = reader.page(sid, 'before', null, 100, ctx);
       expect(ok.verification.status).toBe('verified');
       // Ask the verifier directly about a range below the first receipt.
-      const below = (reader as unknown as {
-        verify(sid: string, revision: number, rows: HistoryRow[], start: number, end: number): { status: string; reason?: string };
-      }).verify(sid, ctx.revision, [], 4000, 4100);
+      const below = verifier(reader).verify(sid, ctx.revision, [], 4000, 4100);
       expect(below.status).toBe('unverifiable');
       expect(below.reason).toBe('range-below-verified-floor');
     } finally { await f.cleanup(); }
@@ -168,6 +193,9 @@ describe('wave 4 reader canary', () => {
       const pinned = reader.page(sid, 'before', null, 100, stale);
       expect(pinned.verification.status).toBe('verified');
       expect(pinned.page.context.revision).toBe(stale.revision);
+      // The pin's own boundary, not the writer's newer one.
+      validateHistoryPage(stale, pinned.page);
+      expect(pinned.page.endLine).toBeLessThanOrEqual(stale.liveStart);
       // ... and a forged context is refused outright.
       const forged: HistoryContext = { ...stale, revision: fresh.revision + 5 };
       expect(() => reader.page(sid, 'before', null, 100, forged)).toThrow(/context-mismatch/);
@@ -196,6 +224,44 @@ describe('wave 4 reader canary', () => {
       expect((await missing.json() as { error: string }).error).toMatch(/unknown-session/);
       const bad = await call(`/history/page?session=${sid}&direction=sideways&limit=100`);
       expect(bad.status).toBe(400);
+    } finally { await f.cleanup(); }
+  });
+
+  test('rows that disagree with the covering receipt are rejected byte for byte', async () => {
+    const f = fixture();
+    try {
+      const sid = await f.store.register({ name: 'bytes', lifecycleKey: 'wave4-bytes' });
+      await seed(f.store, sid, 300);
+      const reader = new HistoryReaderCanary(f.store);
+      const ctx = reader.snapshot(sid).receipt.context;
+      const honest = reader.page(sid, 'before', null, 100, ctx);
+      expect(honest.verification.status).toBe('verified');
+      const rows = honest.page.rows;
+      const start = honest.page.startLine, end = honest.page.endLine;
+      // Same count, same line numbers, one byte different: a length-only check
+      // would wave this through.
+      const swapped = rows.map((r, i) => i === 7 ? { ...r, text: r.text.replace(/.$/, 'X') } : r);
+      expect(swapped[7]!.text.length).toBe(rows[7]!.text.length);
+      expect(() => verifier(reader).verify(sid, ctx.revision, swapped, start, end)).toThrow(/reader-range-digest/);
+      // A dropped row must not be papered over either.
+      expect(() => verifier(reader).verify(sid, ctx.revision, rows.slice(1), start, end)).toThrow(/reader-range-digest/);
+      // And a kind flipped to `gap` is a different row, not a presentation detail.
+      const flipped = rows.map((r, i) => i === 3 ? { ...r, kind: 'gap' as const } : r);
+      expect(() => verifier(reader).verify(sid, ctx.revision, flipped, start, end)).toThrow(/reader-range-digest/);
+      expect(f.alarms.filter(a => a.detector === 'reader-range-digest')).toHaveLength(3);
+    } finally { await f.cleanup(); }
+  });
+
+  test('a range running past the newest receipt says so instead of claiming coverage', async () => {
+    const f = fixture();
+    try {
+      const sid = await f.store.register({ name: 'above', lifecycleKey: 'wave4-above' });
+      await seed(f.store, sid, 200);
+      const reader = new HistoryReaderCanary(f.store);
+      const ctx = reader.snapshot(sid).receipt.context;
+      const beyond = verifier(reader).verify(sid, ctx.revision, [], ctx.nextLine - 10, ctx.nextLine + 50);
+      expect(beyond.status).toBe('unverifiable');
+      expect(beyond.reason).toBe('range-above-verified-receipt');
     } finally { await f.cleanup(); }
   });
 

@@ -101,8 +101,9 @@ export class HistoryReaderCanary {
     }
     const offset = start - head.row_start;
     const slice = verified.slice(offset, offset + (end - start));
-    if (slice.length !== rows.length
-      || slice.some((r, i) => r.line_no !== rows[i]?.line_no || r.kind !== rows[i]?.kind || r.text !== rows[i]?.text)) {
+    const rangeMatches = slice.length === rows.length
+      && slice.every((r, i) => r.line_no === rows[i]?.line_no && r.kind === rows[i]?.kind && r.text === rows[i]?.text);
+    if (!rangeMatches) {
       this.store.persistFault(sid, 'reader-range-digest',
         { start, end, rows: slice.length, digest: rowsDigest(slice) },
         { rows: rows.length, digest: rowsDigest(rows) });
