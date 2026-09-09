@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { HistoryContext, HistoryFault, HistoryHealth, HistoryPageV1, HistoryRow } from './types';
+import { sha } from './codec';
+import type { HistoryContext, HistoryFault, HistoryHealth, HistoryImportProgress, HistoryPageV1, HistoryRow, LegacyProjection, LegacyProjectionAcknowledgement } from './types';
 
 /** Call from a host watchdog/process independent of the collector event loop.
  * No internal timer: a frozen collector cannot freeze this caller's scheduling. */
@@ -30,4 +31,17 @@ export function verifyHistoryOracle(expected:readonly HistoryRow[],observed:read
 
 export function inspectHistoryMirror(sessionId:string,targetRevision:number,exportedRevision:number,lagSince:number,now=Date.now()):HistoryFault|null {
   return exportedRevision<targetRevision && now-lagSince>30000 ? {issue_id:randomUUID(),sessionId,detector:'mirror-stale',expected:targetRevision,observed:exportedRevision,timestamp:now,missing_count:null}:null;
+}
+
+export function verifyDualWriteAcknowledgement(projection:LegacyProjection,acknowledgement:LegacyProjectionAcknowledgement):void {
+  const digest=sha(JSON.stringify(projection));
+  if(acknowledgement.requestId!==projection.requestId || acknowledgement.digest!==digest)throw new Error('legacy-projection-mismatch');
+}
+
+/** The caller schedules this outside the importer event loop. A persisted checkpoint
+ * timestamp makes a restarted watchdog able to distinguish progress from silence. */
+export function inspectImportProgress(progress:HistoryImportProgress,now=Date.now()):HistoryFault|null {
+  if(progress.state==='verified' || progress.state==='quarantined' || now-progress.checkpointAt<=30000)return null;
+  return {issue_id:randomUUID(),sessionId:progress.sessionId??'',detector:'import-progress-stale',
+    expected:'checkpoint age <=30000ms',observed:now-progress.checkpointAt,timestamp:now,missing_count:null};
 }

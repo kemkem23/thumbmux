@@ -3,7 +3,7 @@ import { join, basename, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { HistoryStore } from './store';
 import { safe, sha } from './codec';
-import type { HistoryImportOptions, HistoryRow, HistoryGeometry } from './types';
+import type { HistoryImportOptions, HistoryImportProgress, HistoryImportState, HistoryRow, HistoryGeometry } from './types';
 import { parseReplayJournal } from '@thumbmux/core';
 import type { FrameJournalRecordV1 } from '../frame-journal';
 
@@ -109,10 +109,24 @@ function parseSource(input:HistoryImportOptions,files:Map<string,Buffer>):Parsed
   return result;
 }
 
-export async function importHistorySnapshot(store:HistoryStore,input:HistoryImportOptions):Promise<{state:string;records:number}> {
+export function readImportProgress(store:HistoryStore,sourceId:string):HistoryImportProgress {
+  const row=store.db.query('SELECT * FROM history_import WHERE source_id=?').get(sourceId) as {
+    source_id:string;session_id:string|null;state:HistoryImportState;snapshot_bytes:number;byte_cursor:number;record_cursor:number;evidence_json:string
+  }|null;
+  if(!row)throw new Error('unknown-import');
+  const evidence=JSON.parse(row.evidence_json) as {totalRecords?:number;checkpointAt?:number};
+  return {sourceId:row.source_id,sessionId:row.session_id,state:row.state,snapshotBytes:row.snapshot_bytes,
+    byteCursor:row.byte_cursor,totalRecords:safe(evidence.totalRecords??row.record_cursor),recordCursor:row.record_cursor,
+    checkpointAt:safe(evidence.checkpointAt??0)};
+}
+
+export async function importHistorySnapshot(store:HistoryStore,input:HistoryImportOptions):Promise<{state:HistoryImportState;records:number}> {
   const sealed=readSeal(input.snapshotDirectory);
   const sid=input.sessionId??null;
   const parsed=parseSource(input,sealed.files);
+  const total=parsed.rows.length+parsed.frames.length;
+  const evidenceJson=(error:string|null)=>JSON.stringify({seal:sealed.seal,error,oracleRequired:true,totalRecords:total,checkpointAt:Date.now()});
+  const notify=()=>{try{input.onProgress?.(readImportProgress(store,input.sourceId));}catch(error){store.report(sid??'','import-progress-delivery-failed','progress callback accepted',String(error));}};
   await store.write(sid??'',()=>{
     const old=store.db.query('SELECT * FROM history_import WHERE source_id=?').get(input.sourceId) as {snapshot_sha256:string;session_id:string|null;format:string}|null;
     if(old){if(old.snapshot_sha256!==sealed.digest||old.session_id!==sid||old.format!==input.format)throw new Error('import-identity-conflict');return;}
@@ -121,11 +135,11 @@ export async function importHistorySnapshot(store:HistoryStore,input:HistoryImpo
       if(s.revision!==0 || (parsed.rows.length&&s.next_line!==parsed.rows[0].line_no))throw new Error('import-requires-empty-mapped-session-at-source-floor');
     }
     store.db.query('INSERT INTO history_import VALUES (?,?,?,?,?,?,0,0,0,NULL,?,?)').run(input.sourceId,sid,input.snapshotDirectory,input.format,
-      sealed.digest,sealed.bytes,'pending',JSON.stringify({seal:sealed.seal,error:parsed.error}));
+      sealed.digest,sealed.bytes,'pending',evidenceJson(parsed.error));
   });
+  notify();
   const current=()=>store.db.query('SELECT * FROM history_import WHERE source_id=?').get(input.sourceId) as {record_cursor:number;state:string};
-  if(!sid){await store.write('',()=>{store.db.query("UPDATE history_import SET state='quarantined' WHERE source_id=?").run(input.sourceId);});return {state:'quarantined',records:0};}
-  const total=parsed.rows.length+parsed.frames.length;
+  if(!sid){await store.write('',()=>{store.db.query("UPDATE history_import SET state='quarantined',evidence_json=? WHERE source_id=?").run(evidenceJson('unmapped-session'),input.sourceId);});notify();return {state:'quarantined',records:0};}
   let cursor=current().record_cursor;
   try {
     // Import batches are bounded by both rows and encoded bytes; yield between commits.
@@ -135,7 +149,7 @@ export async function importHistorySnapshot(store:HistoryStore,input:HistoryImpo
       if(input.format==='frame-ndjson') {
         await store.write(sid,()=>{
           for(let i=from;i<to;i++)store.insertFrame(sid,parsed.frames[i],null);
-          store.db.query("UPDATE history_import SET record_cursor=?,imported_records=?,byte_cursor=?,state='copying' WHERE source_id=?").run(to,to,parsed.offsets[to-1]??0,input.sourceId);
+          store.db.query("UPDATE history_import SET record_cursor=?,imported_records=?,byte_cursor=?,state='copying',evidence_json=? WHERE source_id=?").run(to,to,parsed.offsets[to-1]??0,evidenceJson(null),input.sourceId);
         });
       } else {
         const rows=parsed.rows.slice(from,to),screen=to===total?parsed.screen:[];
@@ -143,16 +157,17 @@ export async function importHistorySnapshot(store:HistoryStore,input:HistoryImpo
         await store.commit({ticket:store.ticket(sid,`import:${input.sourceId}:${from}`),observation:{raw:screen,screen,geometry,at:0,source:{}},
           appended:rows.map(({kind,text})=>({kind,text})),liveLineLimit:0,evidence:{classification:'import',depth:'import',source:{},rawSha256:sealed.digest,
             importSpan:{source_id:input.sourceId,physicalRecordStart:from,count:rows.length},legacy:parsed.legacy}},()=>{
-          store.db.query("UPDATE history_import SET record_cursor=?,imported_records=?,byte_cursor=?,state='copying' WHERE source_id=?").run(to,to,parsed.offsets[to-1]??0,input.sourceId);
+          store.db.query("UPDATE history_import SET record_cursor=?,imported_records=?,byte_cursor=?,state='copying',evidence_json=? WHERE source_id=?").run(to,to,parsed.offsets[to-1]??0,evidenceJson(null),input.sourceId);
         });
       }
-      cursor=to;await new Promise<void>(resolve=>setTimeout(resolve,0));if(!total)break;
+      cursor=to;notify();await new Promise<void>(resolve=>setTimeout(resolve,0));if(!total)break;
     }
   }catch(error){parsed.error=String(error);}
-  const state=parsed.error?'quarantined':'verified';
+  const state:HistoryImportState=parsed.error?'quarantined':'verified';
   await store.write(sid,()=>{store.db.query('UPDATE history_import SET state=?,byte_cursor=?,imported_sha256=?,evidence_json=? WHERE source_id=?').run(
     state,state==='verified'?sealed.bytes:Math.min(sealed.bytes,parsed.offsets[cursor-1]??0),sha(JSON.stringify({rows:parsed.rows.slice(0,cursor),frames:parsed.frames.slice(0,cursor)})),
-    JSON.stringify({seal:sealed.seal,error:parsed.error,oracleRequired:true}),input.sourceId);});
+    evidenceJson(parsed.error),input.sourceId);});
+  notify();
   if(parsed.error)store.persistFault(sid,'import-quarantined','all sealed physical records mapped',parsed.error);
   return {state,records:cursor};
 }

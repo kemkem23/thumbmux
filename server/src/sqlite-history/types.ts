@@ -54,6 +54,63 @@ export interface HistoryCoordinatorOptions {
 export type LegacyFormat = 'file-jsonl' | 'durable-log' | 'frame-ndjson' | 'host-chunks';
 export interface HistoryImportOptions {
   sourceId: string; sessionId?: string; snapshotDirectory: string; format: LegacyFormat;
+  onProgress?: (progress: HistoryImportProgress) => void;
+}
+
+export type HistoryImportState = 'pending' | 'copying' | 'verified' | 'quarantined';
+export interface HistoryImportProgress {
+  sourceId: string; sessionId: string | null; state: HistoryImportState;
+  snapshotBytes: number; byteCursor: number; totalRecords: number; recordCursor: number;
+  checkpointAt: number;
+}
+export interface ClosedHistoryImportOptions extends Omit<HistoryImportOptions, 'sessionId'> {
+  name: string; lifecycleKey: string; group?: string;
+}
+export interface MigrationUnresolvedEntry {
+  kind: 'import-state' | 'byte-cursor' | 'record-cursor' | 'source-error' | 'row-diff' | 'frame-diff' | 'screen-diff' | 'unresolved-capture';
+  expected: number | string; observed: number | string;
+}
+export interface MigrationVerification {
+  sourceId: string; sessionId: string;
+  manifest: { files: number; bytes: number; sha256: string };
+  rows: { expected: number; observed: number; sha256: string };
+  frames: { expected: number; observed: number; sha256: string };
+  screen: { expected: number; observed: number; sha256: string };
+  unresolved: MigrationUnresolvedEntry[];
+  ready: boolean;
+}
+export interface ClosedHistoryImportResult {
+  sessionId: string; state: HistoryImportState; records: number;
+  verification: MigrationVerification | null;
+}
+
+export interface LegacyProjection {
+  requestId: string; sessionId: string;
+  rows: Array<{ kind: 'terminal' | 'gap'; text: string }>;
+  screen: string[]; raw: string[];
+  geometry: HistoryGeometry; source: SourceObservation; at: number;
+  frame?: FrameJournalRecordV1;
+}
+export interface LegacyProjectionAcknowledgement { requestId: string; digest: string }
+export interface LegacyProjectionWriter {
+  write(projection: LegacyProjection): Promise<LegacyProjectionAcknowledgement>;
+}
+export interface HistoryBridgeOptions extends HistoryCoordinatorOptions {
+  spoolDirectory: string; legacyProjection: LegacyProjectionWriter;
+}
+export interface HistoryBridgeLedgerEntry {
+  requestId: string; sessionId: string; digest: string;
+  legacyCommitted: boolean; sqliteCommitted: boolean; sqliteRevision: number | null;
+}
+export interface DualWriteReceipt {
+  sqlite: CaptureReceipt; requestId: string; digest: string;
+  legacyCommitted: true; sqliteCommitted: true;
+}
+export interface HistoryCaptureBridge {
+  start(): void; probe(sessionId: string): Promise<DualWriteReceipt>;
+  resumePending(): Promise<HistoryBridgeLedgerEntry[]>;
+  ledger(): HistoryBridgeLedgerEntry[];
+  stopAndDrain(): Promise<void>;
 }
 
 export interface HistoryCaptureCoordinator {
