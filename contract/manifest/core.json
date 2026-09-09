@@ -582,6 +582,12 @@
     "tier": "F"
   },
   {
+    "name": "TextQueryOptions",
+    "kind": "type",
+    "signature": "6fa046273c7fdf4ce06373194b32ebf395aaaa82e3523cc578c8389b23f56b1c",
+    "tier": "S"
+  },
+  {
     "name": "ThemeBackgrounds",
     "kind": "type",
     "signature": "d0e9b61a4f7ca8af3b0acd9f27ea275cac0739c1c3bef1fce63ce2be5c160051",
@@ -934,6 +940,12 @@
     "kind": "value",
     "signature": "24b902ae0157416841ed13ecaf7dc46ac0ad913dd2374ee1a938512866783942",
     "tier": "F"
+  },
+  {
+    "name": "matchesTextQuery",
+    "kind": "value",
+    "signature": "ac0e55b76be4b65579ac2c411dbf8da7a0221b35095fe405039c00e77e47272c",
+    "tier": "S"
   },
   {
     "name": "mergeCapturedLinesForStableScroll",

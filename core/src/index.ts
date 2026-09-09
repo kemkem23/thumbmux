@@ -17,6 +17,7 @@
  * clear-context    provider-aware key plan for clearing an agent's conversation
  * keys            desktop KeyboardEvent → terminal byte sequences (+ bracketed paste)
  * sgr-mouse       SGR mouse-forwarding math for alt-screen TUIs (wheel/click/hit-test)
+ * text-query      case-insensitive substring matching for host list/menu filters
  */
 import { isClaudeActivityStatusLine as matchesClaudeActivityStatusLine } from './claude-status';
 
@@ -51,3 +52,4 @@ export * from './submit';
 export * from './clear-context';
 export * from './prepend';
 export * from './deprecate';
+export * from './text-query';
