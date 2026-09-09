@@ -834,7 +834,7 @@ describe("ImageAnnotator", () => {
         touchOn(canvas, "touchmove", [[150, 160]]);
         touchOn(canvas, "touchend");
         touchOn(canvas, "touchcancel");
-        // Instance methods are also guarded, even before disabled DOM updates.
+        // Instance methods also respect the lock without relying on disabled DOM.
         app.clearAll();
         app.removeImage();
         await app.submit();
