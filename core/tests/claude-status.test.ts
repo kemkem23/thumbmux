@@ -42,6 +42,31 @@ describe('Claude activity status grammar', () => {
     )).toBe(true);
   });
 
+  test('recognises the elapsed-only detail frames current Claude paints early in a turn', () => {
+    for (const line of [
+      '✢ Beaming… (3s)',
+      '✻ Beaming… (12s)',
+      '· Simmering… (1m 5s)',
+      '✶ Percolating… (1h 2m 3s)',
+      '* Beaming… (59s)',
+    ]) expect(isClaudeActivityStatusLine(line), line).toBe(true);
+    expect(isStyledClaudeActivityStatusLine(
+      '\x1b[38;5;174m✢\x1b[39m \x1b[38;5;174mBeaming…\x1b[39m '
+        + '\x1b[38;5;246m(3s)\x1b[39m',
+    )).toBe(true);
+
+    // Elapsed time must be the whole detail: partial matches stay shell text.
+    for (const line of [
+      '✢ Beaming… (3s · esc to interrupt)',
+      '* Downloading… (3s remaining)',
+      '✢ Beaming… (about 3s)',
+      '✢ Beaming… (3)',
+      '✢ Beaming… (3 s)',
+      '✢ Beaming… ()',
+      '⠴ Beaming… (3s)',
+    ]) expect(isClaudeActivityStatusLine(line), line).toBe(false);
+  });
+
   test('rejects status-shaped shell text, partial paints, and cross-agent spinners', () => {
     const ordinary = [
       '✢ shell spinner-shaped output',

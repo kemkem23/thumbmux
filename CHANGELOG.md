@@ -1,7 +1,85 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.18.17-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.19.0-dist`.
+
+## v0.19.0 — 2026-09-09
+
+Minor, not a patch: this release adds new exports (`thumbmux/server/sqlite-history`,
+and `@thumbmux/server/sqlite-history` for scoped consumers) and widens one
+F-tier method signature. On a
+`0.x` line a caret range does not cross the minor, so a consumer moving from
+`^0.18.x` must bump the pin deliberately.
+
+### Fixed
+
+- **A collapsed Bash block no longer flickers back to full height while a pane
+  is streaming output.** The repaint evidence that lets a Bash block stay
+  collapsed was stored as an absolute row number. Claude pins its composer to
+  the bottom and prints new output *above* the status row, so every frame
+  carrying new output shifted that row and invalidated the evidence: the
+  collapsed block sprang open to full height, the next frame collapsed it
+  again, and it alternated on every frame for as long as output kept arriving.
+  Evidence may now follow a shift when the new frame is provably the old one
+  with a single contiguous block of rows inserted or removed, every other row
+  identical byte for byte on both sides of the edit, and the status row
+  genuinely repainted — the same bar the discovery loop already applies. A
+  replace that also changes surrounding content is still rejected. Measured in
+  Chromium at 390x640 on an intermittently streaming pane: content height had
+  been oscillating 161 ↔ 259/280/301/322 px and the compact row count 2 ↔ 1
+  every frame; after the fix both hold steady at 161 px and 2 rows.
+- **Claude status lines that carry only an elapsed time are recognised again.**
+  The grammar required a keyword such as `thinking`, `effort`, or `tokens`
+  inside the parentheses, but current Claude builds draw just the elapsed time
+  at the start of a turn, so a line like `✢ Beaming… (3s)` was not classified
+  as activity. A detail that is entirely a duration is now accepted; a duration
+  mixed with other words (`3s remaining`) is still treated as shell text.
+- **Scrollback depth is now read per session at every runtime entry point.**
+  tmux resolves an untargeted `#{history_limit}` to the newest session on the
+  server, so any path that reached the reader through a dependency slot
+  silently used the wrong pane's depth — 1000 lines on a host whose panes
+  actually hold 50000, which truncated full-history capture and deep
+  re-capture. The driver now reads `#{history_limit}` off the named pane
+  instead of `show-options -g`, and the per-session loop in the history keeper
+  computes its window inside the loop rather than hoisting one session's depth
+  across all of them.
+
+### Changed
+
+- **`TmuxDriver.getHistoryLimit` accepts the session it is being asked about:
+  `getHistoryLimit(session?: string): number`.** The parameter is optional and
+  the change is additive in both directions — a host implementing the older
+  `getHistoryLimit(): number` still satisfies the interface, and callers that
+  pass nothing still compile. **Behavioural caveat:** such a host keeps
+  compiling but keeps answering ambiently, which means the wrong scrollback
+  depth for every session except the most recently created one. Hosts that
+  implement `TmuxDriver` themselves should thread the session through. This is
+  recorded as a reviewed signature change against the `v0.18.17-dist` baseline;
+  the eleven manifest rows it moves are all transitive exposures of
+  `TmuxDriver` through `TmuxWsMux`, `AppRoutes`, the spawn handler, and the
+  retention lane, not eleven separate decisions.
+
+### Added
+
+- **Opt-in SQLite terminal history (waves 1-3), reachable as
+  `thumbmux/server/sqlite-history` (root package) or
+  `@thumbmux/server/sqlite-history` (scoped package).** Wave 1 adds
+  the store and its fault proofs, wave 2 adds a dual-writing bridge and a
+  rehearsal that imports already-closed sessions, and wave 3 adds continuous
+  shadow comparison that reads both stores and reports divergence. **This is
+  opt-in in the strict sense and changes no default behaviour:** the module
+  sits outside the `thumbmux/server` barrel, nothing on the default path
+  constructs it, and a host that does not import the new subpath runs exactly
+  the code it ran in 0.18.17. Existing history storage is untouched — the
+  shadow rail observes and compares, it does not replace.
+- **A07/A19/B02-B04/B07/C01-C02 moved into the package.** Behaviour that lived
+  in the host is now shipped and tier-checked: provider-aware CLEAR CONTEXT key
+  plans as data (A07), terminal selection release with its four selector names
+  now export-tiered so a rename trips the contract gate (A19), background theme
+  override parse/read/write (B02-B04), `?font=` / `?lines=` embed configuration
+  with viewport row computation (B07), and a SQLite-backed recall store for
+  per-lifecycle notes and recent prompts (C01-C02). Hosts are not required to
+  switch to these; the host-side call sites move in a later release.
 
 ## v0.18.17 — 2026-09-05
 

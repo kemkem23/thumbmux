@@ -136,7 +136,10 @@ export class RetentionLane {
       if (result.needsDeeper) {
         // One expensive capture answers "did tmux drop it, or did I look too
         // late" — and only after that is a gap marker honest.
-        const deep = -Math.max(this.options.driver.getHistoryLimit(), liveLineLimit);
+        // Named session: `history_limit` is a per-pane value, so the deep
+        // window has to come from THIS session's pane, not from whatever
+        // session an untargeted tmux read happens to resolve to.
+        const deep = -Math.max(this.options.driver.getHistoryLimit(session), liveLineLimit);
         lines = splitCapture(await this.options.driver.capturePane(session, { startLine: deep }));
         status.lastCaptureAt = Date.now();
         result = append(lines, { paneRows, liveLineLimit });

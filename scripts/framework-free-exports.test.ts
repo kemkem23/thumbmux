@@ -171,7 +171,7 @@ describe("TM-09 framework-free subpath exports (no svelte condition)", () => {
     }
   });
 
-  test("all ten subpaths + package root resolve under plain Node (no svelte condition)", () => {
+  test("every framework-free subpath + package root resolves under plain Node (no svelte condition)", () => {
     const install = materializeReleaseInstall();
 
     // Root entry: without ".", import "thumbmux" is "No exports main defined".

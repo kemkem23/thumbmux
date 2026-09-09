@@ -1229,6 +1229,45 @@ const V01816_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "server:TmuxWsMux:5fab451dd0c8f853304b66a5ebe2654661cde7773dad0c11219f5553a2a52873:b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782",
 ]);
 
+/**
+ * `TmuxDriver.getHistoryLimit` gaining an optional `session` parameter,
+ * reviewed for 0.18.17 -> 0.19.0. `history_limit` is frozen on a pane at
+ * birth, so an untargeted read resolves to whichever session tmux created
+ * last and answers for the wrong pane. The method now takes the session it is
+ * being asked about.
+ *
+ * The parameter is optional precisely so the change stays additive in both
+ * directions. A host that implements the older `getHistoryLimit(): number`
+ * still satisfies the widened member — TypeScript accepts an implementation
+ * that declares fewer parameters — and every existing caller that passes
+ * nothing still compiles. Nothing was removed, renamed, or narrowed.
+ *
+ * `isMinorOptionalAddition` cannot prove this: it recognises added optional
+ * *members*, and this is a widened parameter list on an existing member. The
+ * single `ws-mux.d.ts` delta versus `v0.18.17-dist` hashes through all eleven
+ * rows below because `TmuxWsMux`, `AppRoutes`, the spawn handler, and the
+ * retention lane each expose `TmuxDriver` transitively.
+ *
+ * The behavioural caveat is recorded in CHANGELOG.md rather than the type: a
+ * host left on the old ambient shape keeps compiling but reports the wrong
+ * scrollback depth for every session but the newest. The frozen consumer
+ * fixtures must compile and run against the packed artifact in the public
+ * verify-gate before the source tag is cut.
+ */
+const V0190_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:0cd8e42c83784c872b4bb3f9b35c99c2efb817c71f68d1f55e990a2c4a84b22e:09b178774240fce179aa289da7faae4e29386684fc82f2525794ab8653d2144f",
+  "server:AppRoutesOptions:fdfc8f38ca74022e9dafe7a539a41660b0fddd5f475c4d03c63ad4e34149f8c5:79beb2a1182f9534f84269991d3ddf8632e70d2f4de2d25da109ec17beeb8924",
+  "server:RetentionLane:4add5e1a70895280942ea425a7362e2e7e94ec9c91150c63904c66c14026bb23:f6fd7975602e2443ed33df19df35e28bf25726a04bdd074e93b86678ac3d2605",
+  "server:RetentionLaneOptions:c98b4fcec3a99e2167774a3c77165dfdd233cedfb0ed815cc9eb28a8538eb215:d95c69484d559f4b5138d3d4b54c37a86a671cafca672760c2914aa10d3bf58a",
+  "server:SpawnHandlerOptions:e9411ae2ea80c75cc8e71275a0b03f45c10ae0553e42609c7f6d3e354032b48c:681266eef500af541eaa7a06ca1bbec7d9fa4f6aaffbc5012d42b2c420896ae0",
+  "server:TmuxDriver:6b15203b589dccd2acc8102af15f3d40b82d2b52bcbb909656553275185393f2:550174adb01304b4640525fbf2fe49c2515b0774373ad2370820f2bbc9ee3091",
+  "server:TmuxWsMux:b56a5adebfc41698659299d151810ca4f52d01eadf5df4659073716219fa0782:160438d0bacb001d60c85097bb54d5d7d1614dbdf6962d61a0d755ea5fae26f4",
+  "server:TmuxWsMuxOptions:e1bd26d1c7826a7d6cfd59f19cbb44e8acf95480cada689c3abab8404a3c9a87:dbceac83e684da3dbe845be4cc952a677e10075e7141cdf1ade77077e74f1b9f",
+  "server:createAppRoutes:f541e3c9bd9791bfb98c9a083ff3ea0a02bddd2551c091ffb69cc271f11ce3dc:a5edb190a8bf573591b331f79575c6def2b7062981a4babe54184897db54f8c9",
+  "server:createBunTmuxDriver:0029dcffa9eba1547ebd27d5df7d5a2fb16da49c5e447ec470ddf4da2a38de40:44e40c1007a3d80ab0ba7382b2e5de221dff18b957f93a1f6df892173074c41f",
+  "server:createSpawnHandler:a230098d3172bcdba10994d1c8c22f5dc1aedfd8f70974e3ce1ae59ac0d81721:3e8dae732d9699e1be8efe54d5b4897c843094ceff1fd92ebf3a5f05176d0af9",
+]);
+
 function isV0110MinorException(
   baselineVersion: string,
   currentVersion: string,
@@ -1253,6 +1292,19 @@ function isV0180MinorException(
   if (baselineVersion !== "0.17.0" || currentVersion !== "0.18.0") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V0180_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV0190MinorException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.18.17" || currentVersion !== "0.19.0") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0190_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isV0186PatchException(
@@ -1456,6 +1508,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV0180MinorException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0190MinorException(
           baselineVersion,
           currentVersion,
           subpath,

@@ -332,7 +332,10 @@ describe("terminal prompt extraction", () => {
       "console.log(JSON.stringify(r));",
     ].join("");
     const proc = Bun.spawnSync({
-      cmd: ["timeout", "1", "bun", "-e", script],
+      // process.execPath is the Bun running this test. A bare "bun" needs Bun on
+      // PATH, which the hard sandbox deliberately narrows to /usr/bin:/bin, so
+      // the probe returned 127 there and the A2-5 assertion never ran.
+      cmd: ["timeout", "1", process.execPath, "-e", script],
       cwd: join(import.meta.dir, "../.."),
       stdout: "pipe",
       stderr: "pipe",

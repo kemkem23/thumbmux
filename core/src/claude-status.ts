@@ -5,6 +5,10 @@ import { stripTerminalControls } from './terminal-controls';
 const CLAUDE_ACTIVITY_MARKER = '[●·✻✽✶✳✢*]';
 const CLAUDE_STATUS_WORD = "\\p{L}[\\p{L}'’-]*";
 const CLAUDE_ACTIVITY_DETAIL = '(?:\\bthinking\\b|\\beffort\\b|\\btokens?\\b)';
+// Early in a turn current Claude paints only elapsed time, e.g. `(3s)` or
+// `(1m 5s)`. The whole detail must be that duration — a duration merely
+// mentioned inside other words (`3s remaining`) stays shell text.
+const CLAUDE_ELAPSED_ONLY_DETAIL = '\\d+[hms](?: \\d+[ms]){0,2}';
 
 // Tool output can naturally say `Reading app.log`, `Writing a report`, or
 // `Done for 3m`. Do not classify those semantic words alone. Current Claude
@@ -12,7 +16,8 @@ const CLAUDE_ACTIVITY_DETAIL = '(?:\\bthinking\\b|\\beffort\\b|\\btokens?\\b)';
 // containing activity metadata; requiring both keeps ambiguous shell text raw.
 const CLAUDE_ACTIVE_STATUS = new RegExp(
   `^${CLAUDE_ACTIVITY_MARKER}\\s+${CLAUDE_STATUS_WORD}(?:…|\\.{3})\\s+`
-    + `\\((?=[^\\n)]*${CLAUDE_ACTIVITY_DETAIL})[^\\n)]*\\)\\s*$`,
+    + `\\((?=[^\\n)]*${CLAUDE_ACTIVITY_DETAIL}|${CLAUDE_ELAPSED_ONLY_DETAIL}\\))`
+    + '[^\\n)]*\\)\\s*$',
   'iu',
 );
 

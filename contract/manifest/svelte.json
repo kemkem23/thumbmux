@@ -324,6 +324,18 @@
     "tier": "S"
   },
   {
+    "name": "installTerminalSelectionRelease",
+    "kind": "value",
+    "signature": "9d0d3cf1861692835b331ea6718dcd75b84f5060a458bbb0d6db6d51a6a33944",
+    "tier": "S"
+  },
+  {
+    "name": "isScrollIntent",
+    "kind": "value",
+    "signature": "7fb00fbd0583cb75a2705880586c12b4c32f0a1933bf24cc9854d6ccc9db8a5b",
+    "tier": "S"
+  },
+  {
     "name": "LaunchContext",
     "kind": "type",
     "signature": "18425b4c30298446c98b8a74fbebf0a9f22ced016461b31c6fef768a53f34044",
@@ -516,6 +528,12 @@
     "tier": "S"
   },
   {
+    "name": "pointIsOnSelection",
+    "kind": "value",
+    "signature": "1c74c1d0b55f0ee04343ec80d614288e6aba26648b648d8139221826eee7f3db",
+    "tier": "S"
+  },
+  {
     "name": "PromptsPanel",
     "kind": "component",
     "signature": "eeabae3cbcca4ab135572967cb25dd554d6b1c26fd1bcc9657d253b58c0a6e0d",
@@ -618,6 +636,12 @@
     "tier": "S"
   },
   {
+    "name": "releasableTerminalSelection",
+    "kind": "value",
+    "signature": "c38f073a623f0604984d54a942d1f5a3c8cfaacb5d37bf0d30d70f4ec1dbdbb4",
+    "tier": "S"
+  },
+  {
     "name": "ReplayJournalLike",
     "kind": "type",
     "signature": "c11b7cc142655bb2f596d990bf4715f6a78a7d018c5805139245a1da234e7e19",
@@ -708,6 +732,18 @@
     "tier": "X"
   },
   {
+    "name": "SELECTION_HANDLE_MARGIN_PX",
+    "kind": "value",
+    "signature": "7e4e0204aadeb2fc40359874a37d8cc8a0f9d77ef0aeeb6e75ece57852e13804",
+    "tier": "S"
+  },
+  {
+    "name": "SelectionReleaseOptions",
+    "kind": "type",
+    "signature": "4e335edadd89fd1974e9ab2ea899f299793886d7fc232ef0ae44d2854ebb099f",
+    "tier": "S"
+  },
+  {
     "name": "ServiceWorkerListenerHost",
     "kind": "type",
     "signature": "ef53fa5c4b9dbb4aa350306dec0745114da4a37a2053b9f07bb022a0abc411d1",
@@ -792,10 +828,28 @@
     "tier": "S"
   },
   {
+    "name": "STOCK_SCROLL_CONTROL_SELECTORS",
+    "kind": "value",
+    "signature": "cabda3948f12186c080f48dd380c284a775c95f847a89da30fb3bfcb673591d9",
+    "tier": "S"
+  },
+  {
     "name": "TermHud",
     "kind": "component",
     "signature": "703da63313bd419a5e78c89bbb174aa84a7230f31d0ce88e9dd61e7a6643356d",
     "tier": "F"
+  },
+  {
+    "name": "TERMINAL_SEARCH_SELECTOR",
+    "kind": "value",
+    "signature": "5d1822bec5bce4f6aef8bbf68fff6d0d284ca46bef9ad99ee0e05d974d6c23a3",
+    "tier": "S"
+  },
+  {
+    "name": "TERMINAL_VIEWPORT_SELECTOR",
+    "kind": "value",
+    "signature": "76cead7d3d439461d4c4ec84cffb0f10e871899a94b1cec11393654deabeb400",
+    "tier": "S"
   },
   {
     "name": "TermSearch",

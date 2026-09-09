@@ -1,0 +1,35 @@
+/** Opt-in entry point, proposed tier S. No SQLite module, file or timer at evaluation. */
+import type { SqliteHistoryOptions, HistoryBridgeOptions, HistoryShadowBridgeOptions, HistoryCoordinatorOptions, HistoryImportOptions, HistoryContext, HistoryCaptureBridge, HistoryCaptureCoordinator, ClosedHistoryImportOptions } from './sqlite-history/types';
+export type { Continuity, HistoryContext, HistoryRow, HistoryGeometry, SourceObservation, CaptureObservation, HistoryFault, SqliteHistoryOptions, CaptureReceipt, HistoryPageV1, HistoryHealth, HistoryCaptureDriver, HistoryCoordinatorOptions, LegacyFormat, HistoryImportOptions, HistoryImportState, HistoryImportProgress, ClosedHistoryImportOptions, ClosedHistoryImportResult, MigrationUnresolvedEntry, MigrationVerification, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter, HistoryBridgeOptions, HistoryBridgeLedgerEntry, DualWriteReceipt, HistoryCaptureBridge, HistoryCaptureCoordinator, ShadowFrameRecord, ShadowUnresolvedRecord, ShadowBatchSnapshot, ShadowSourceOracle, ShadowComparisonReport, HistoryShadowBridgeOptions, ShadowRuntimeState } from './sqlite-history/types';
+export { compareShadowBatch, inspectShadowRuntime, inspectHistoryHealth, inspectHistoryMirror, inspectImportProgress, validateHistoryPage, verifyHistoryOracle } from './sqlite-history/detectors';
+export { sealHistorySnapshot } from './sqlite-history/transfer';
+export { assertMigrationReady, readSealedHistoryOracle } from './sqlite-history/rehearsal';
+
+export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
+  const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal]=await Promise.all([
+    import('bun:sqlite'),import('./sqlite-history/store'),import('./sqlite-history/coordinator'),import('./sqlite-history/bridge'),import('./sqlite-history/transfer'),import('./sqlite-history/rehearsal')]);
+  const file=prepareFile(options.file);
+  const db=new Database(file,{strict:true,safeIntegers:false});
+  let store:InstanceType<typeof HistoryStore>;
+  try {store=new HistoryStore(db,options);prepareFile(file);}catch(error){db.close();throw error;}
+  return {
+    registerSession:store.register.bind(store),renameSession:store.rename.bind(store),closeSession:store.closeSession.bind(store),
+    createCaptureCoordinator:(o:HistoryCoordinatorOptions):HistoryCaptureCoordinator=>new HistoryCoordinator(store,o),
+    createCaptureBridge:(o:HistoryBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
+    // Writer-only shadow facade. SQLite readers remain unwired and opt-in.
+    createShadowBridge:(o:HistoryShadowBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
+    snapshot:store.snapshot.bind(store),
+    readBefore:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'before',anchor,limit,context),
+    readAfter:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'after',anchor,limit,context),
+    audit:store.audit.bind(store),health:store.health.bind(store),
+    importSnapshot:(input:HistoryImportOptions)=>transfer.importHistorySnapshot(store,input),
+    importProgress:(sourceId:string)=>transfer.readImportProgress(store,sourceId),
+    importClosedSession:(input:ClosedHistoryImportOptions)=>rehearsal.importClosedHistorySession(store,input),
+    inspectImportedSnapshot:(input:HistoryImportOptions)=>rehearsal.inspectImportedSnapshot(store,input),
+    verifyImportedSnapshot:(input:HistoryImportOptions)=>rehearsal.verifyImportedSnapshot(store,input),
+    exportBundle:(sid:string,directory:string)=>transfer.exportHistoryBundle(store,sid,directory),
+    restoreBundle:(directory:string)=>transfer.restoreHistoryBundle(store,directory),
+    close:store.close.bind(store),
+  };
+}
+export type SqliteHistoryStore = Awaited<ReturnType<typeof createSqliteHistoryStore>>;

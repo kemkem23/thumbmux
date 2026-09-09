@@ -54,9 +54,93 @@
     "tier": "S"
   },
   {
+    "name": "defaultEmbedFontPx",
+    "kind": "value",
+    "signature": "2e290cf35998f1d1b422592f4026134567abc2c88ea7e32fabd385e46d6e6fbb",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_CHROME_HEIGHT_PX",
+    "kind": "value",
+    "signature": "1c2e379ee1d2ec61efebb05ebde922c827591a1fca0904478040585266d3714c",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_FONT_PX_DESKTOP",
+    "kind": "value",
+    "signature": "c3633765d18bf75eee14ebb63a06691717767cae4ccb41700abda7c1f4cb1183",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_FONT_PX_MAX",
+    "kind": "value",
+    "signature": "c045eadc09abc9822baf49c5dea1b49bb2ec68fd80a7a206b69e11cbf587227a",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_FONT_PX_MIN",
+    "kind": "value",
+    "signature": "1e59996c88df631bf9b99034c6dea56882599701cc7dbb6954e54d9c5ca5d33a",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_FONT_PX_MOBILE",
+    "kind": "value",
+    "signature": "7731054c5d65a879bfb793d3c88ce0d06085fb4875d17b2cd08951f504076c4d",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_LINE_HEIGHT_RATIO",
+    "kind": "value",
+    "signature": "8e460e974e110070c0113d34968bd840e9eeccdb91677553dbfe1dbe127ac3ea",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_MAX_ROWS",
+    "kind": "value",
+    "signature": "794bebb909fc2eb2cb04ef753c91bbee0fc33a5c003a27d3a7037d8c2be1971c",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_MIN_FIT_HEIGHT_PX",
+    "kind": "value",
+    "signature": "32166c8085244135667d12ad8642a881f316356d38561c85d6dee03e0384171f",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_MIN_ROWS",
+    "kind": "value",
+    "signature": "a1069af47594d03b4d4edbebbf039f7d56d45e249e60342b13ef90f33f8b60f2",
+    "tier": "S"
+  },
+  {
+    "name": "EMBED_MOBILE_MAX_WIDTH_PX",
+    "kind": "value",
+    "signature": "f4fd37ca7553a6fe73dd8efa80c465d1daa4ebd24c915c21393f65bce8efce2c",
+    "tier": "S"
+  },
+  {
+    "name": "EmbedGeometry",
+    "kind": "type",
+    "signature": "97e90ddc88ece2d729bb1e40239d98721dd6a39f94a590733e2c9edd85c1a2ec",
+    "tier": "S"
+  },
+  {
+    "name": "EmbedGeometryInput",
+    "kind": "type",
+    "signature": "b43779b5ff33b5a4eee037b8316e37eb6b08894322cd9446ef172a9852e577b3",
+    "tier": "S"
+  },
+  {
     "name": "EmbedView",
     "kind": "component",
     "signature": "6374530f7159f3b8e76433c89f25b99b2216dfc402fad10829a1c7a195806380",
+    "tier": "S"
+  },
+  {
+    "name": "fitEmbedRows",
+    "kind": "value",
+    "signature": "69a02bfc2d036b796dafbdd4448b860b3b3a593d88b48da97814a0b58a5f7b9e",
     "tier": "S"
   },
   {
@@ -87,6 +171,12 @@
     "name": "prefillOnError",
     "kind": "value",
     "signature": "79bbfbc42dfbbf82536e953de34ba8fac1e7c19f1d62bff62628a8e1276424ac",
+    "tier": "S"
+  },
+  {
+    "name": "resolveEmbedGeometry",
+    "kind": "value",
+    "signature": "9a0fe449d783ed610a4f245108f03a8d0febd95ed36a0530151f78322e233f71",
     "tier": "S"
   },
   {
