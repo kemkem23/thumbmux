@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { parseReplayJournal } from '@thumbmux/core';
 import { SCHEMA, GUARDS, SCHEMA_VERSION } from './schema';
 import { safe, sha, rowsDigest, validateObservation } from './codec';
-import type { CaptureBatch, CaptureReceipt, CaptureTicket, HistoryContext, HistoryFault, HistoryHealth, HistoryPageV1, HistoryRow, SqliteHistoryOptions } from './types';
+import type { CaptureBatch, CaptureReceipt, CaptureTicket, HistoryContext, HistoryFault, HistoryHealth, HistoryPageV1, HistoryRow, ShadowBatchSnapshot, SqliteHistoryOptions } from './types';
 
 type Session = { session_id: string; lifecycle_key: string; name: string; group_label: string; active: number;
   writer_fence: number; revision: number; first_line: number; next_line: number; live_start: number;
@@ -116,6 +116,16 @@ export class HistoryStore {
   }
   rows(sid: string, start: number, end: number): HistoryRow[] {
     return this.db.query('SELECT line_no,kind,text FROM history_line WHERE session_id=? AND line_no>=? AND line_no<? ORDER BY line_no').all(sid,start,end) as HistoryRow[];
+  }
+  shadowSnapshot(sid:string,requestId:string):ShadowBatchSnapshot {
+    return this.db.transaction(()=>{
+      const c=this.db.query('SELECT * FROM history_capture WHERE session_id=? AND request_id=?').get(sid,requestId) as Capture|null;
+      if(!c)throw new Error('shadow-sqlite-receipt-missing');
+      const frames=this.db.query('SELECT record_json FROM history_frame WHERE session_id=? AND capture_seq=? ORDER BY frame_seq').all(sid,c.seq) as {record_json:string}[];
+      return {requestId:c.request_id,revision:c.seq,rows:this.rows(sid,c.row_start,c.row_end),
+        frames:frames.map((frame,ordinal)=>({ordinal,bytes:frame.record_json})),
+        unresolved:c.unresolved_capture?[{ordinal:0,sha256:sha(c.unresolved_capture)}]:[]};
+    })();
   }
   tail(sid: string, count=40): HistoryRow[] {
     const s=this.session(sid); return this.rows(sid,Math.max(s.first_line,s.next_line-count),s.next_line);

@@ -91,7 +91,30 @@ export interface LegacyProjection {
   geometry: HistoryGeometry; source: SourceObservation; at: number;
   frame?: FrameJournalRecordV1;
 }
-export interface LegacyProjectionAcknowledgement { requestId: string; digest: string }
+export interface ShadowFrameRecord { ordinal: number; bytes: string }
+export interface ShadowUnresolvedRecord { ordinal: number; sha256: string }
+export interface ShadowBatchSnapshot {
+  requestId: string; revision: number; rows: HistoryRow[];
+  frames: ShadowFrameRecord[]; unresolved: ShadowUnresolvedRecord[];
+}
+export interface ShadowSourceOracle {
+  requestId: string; rows: HistoryRow[];
+  frames?: ShadowFrameRecord[]; unresolved?: ShadowUnresolvedRecord[];
+}
+export interface ShadowComparisonReport {
+  sessionId: string; requestId: string; comparedAt: number;
+  receipts: { legacyRequestId: string; sqliteRequestId: string; match: boolean };
+  lines: { matchedCoordinates: number; byteMismatches: number[]; kindMismatches: number[]; legacyOnly: number[]; sqliteOnly: number[] };
+  frames: { matchedOrdinals: number; byteMismatches: number[]; legacyOnly: number[]; sqliteOnly: number[] };
+  unresolved: { matchedOrdinals: number; digestMismatches: number[]; legacyOnly: number[]; sqliteOnly: number[] };
+  source: {
+    status: 'verified' | 'unknown' | 'mismatch';
+    legacy: { missingCoordinates: number[]; extraCoordinates: number[]; byteMismatches: number[] } | null;
+    sqlite: { missingCoordinates: number[]; extraCoordinates: number[]; byteMismatches: number[] } | null;
+  };
+  faults: HistoryFault[];
+}
+export interface LegacyProjectionAcknowledgement { requestId: string; digest: string; shadow?: ShadowBatchSnapshot }
 export interface LegacyProjectionWriter {
   write(projection: LegacyProjection): Promise<LegacyProjectionAcknowledgement>;
 }
@@ -101,6 +124,7 @@ export interface HistoryBridgeOptions extends HistoryCoordinatorOptions {
 export interface HistoryBridgeLedgerEntry {
   requestId: string; sessionId: string; digest: string;
   legacyCommitted: boolean; sqliteCommitted: boolean; sqliteRevision: number | null;
+  shadowCompared?: boolean; shadowDelivered?: boolean;
 }
 export interface DualWriteReceipt {
   sqlite: CaptureReceipt; requestId: string; digest: string;
@@ -111,6 +135,19 @@ export interface HistoryCaptureBridge {
   resumePending(): Promise<HistoryBridgeLedgerEntry[]>;
   ledger(): HistoryBridgeLedgerEntry[];
   stopAndDrain(): Promise<void>;
+}
+
+export interface HistoryShadowBridgeOptions extends HistoryBridgeOptions {
+  shadow: {
+    sourceOracle: (projection: LegacyProjection) => ShadowSourceOracle | null;
+    onComparison: (report: ShadowComparisonReport) => void | Promise<void>;
+    now?: () => number;
+  };
+}
+export interface ShadowRuntimeState {
+  sessionId: string; startedAt: number; lastProbeAt: number | null; inFlightSince: number | null;
+  targetRevision: number; exportedRevision: number; exportLagSince: number | null;
+  lastWriteFailure: { backend: 'legacy' | 'sqlite'; at: number; error: string } | null;
 }
 
 export interface HistoryCaptureCoordinator {

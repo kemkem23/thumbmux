@@ -1,6 +1,78 @@
 import { randomUUID } from 'node:crypto';
 import { sha } from './codec';
-import type { HistoryContext, HistoryFault, HistoryHealth, HistoryImportProgress, HistoryPageV1, HistoryRow, LegacyProjection, LegacyProjectionAcknowledgement } from './types';
+import type {
+  HistoryContext, HistoryFault, HistoryHealth, HistoryImportProgress, HistoryPageV1, HistoryRow,
+  LegacyProjection, LegacyProjectionAcknowledgement, ShadowBatchSnapshot, ShadowComparisonReport,
+  ShadowFrameRecord, ShadowRuntimeState, ShadowSourceOracle, ShadowUnresolvedRecord,
+} from './types';
+
+function shadowFault(sessionId:string,detector:string,expected:unknown,observed:unknown,timestamp:number):HistoryFault {
+  const body={sessionId,detector,expected,observed,timestamp};
+  return {issue_id:`shadow-${sha(JSON.stringify(body)).slice(0,24)}`,...body,missing_count:null};
+}
+
+function coordinates<T extends {ordinal:number}>(left:readonly T[],right:readonly T[],bytes:(value:T)=>string) {
+  const a=new Map(left.map(value=>[value.ordinal,value])),b=new Map(right.map(value=>[value.ordinal,value]));
+  const shared=[...a.keys()].filter(key=>b.has(key)).sort((x,y)=>x-y);
+  return {matched:shared.length,mismatches:shared.filter(key=>Buffer.compare(Buffer.from(bytes(a.get(key)!)),Buffer.from(bytes(b.get(key)!)))!==0),
+    leftOnly:[...a.keys()].filter(key=>!b.has(key)).sort((x,y)=>x-y),rightOnly:[...b.keys()].filter(key=>!a.has(key)).sort((x,y)=>x-y)};
+}
+
+function sourceDiff(observed:readonly HistoryRow[],oracle:readonly HistoryRow[]) {
+  const actual=new Map(observed.map(row=>[row.line_no,row])),expected=new Map(oracle.map(row=>[row.line_no,row]));
+  const shared=[...expected.keys()].filter(key=>actual.has(key));
+  return {missingCoordinates:[...expected.keys()].filter(key=>!actual.has(key)).sort((a,b)=>a-b),
+    extraCoordinates:[...actual.keys()].filter(key=>!expected.has(key)).sort((a,b)=>a-b),
+    byteMismatches:shared.filter(key=>actual.get(key)!.kind!==expected.get(key)!.kind ||
+      Buffer.compare(Buffer.from(actual.get(key)!.text),Buffer.from(expected.get(key)!.text))!==0).sort((a,b)=>a-b)};
+}
+
+/** Pure shadow comparator. The optional source oracle is independent of both
+ * projections: legacy is never treated as the answer key for source completeness. */
+export function compareShadowBatch(sessionId:string,legacy:ShadowBatchSnapshot,sqlite:ShadowBatchSnapshot,
+  oracle:ShadowSourceOracle|null,comparedAt:number):ShadowComparisonReport {
+  const legacyRows=new Map(legacy.rows.map(row=>[row.line_no,row])),sqliteRows=new Map(sqlite.rows.map(row=>[row.line_no,row]));
+  const shared=[...legacyRows.keys()].filter(key=>sqliteRows.has(key)).sort((a,b)=>a-b);
+  const lineBytes=shared.filter(key=>Buffer.compare(Buffer.from(legacyRows.get(key)!.text),Buffer.from(sqliteRows.get(key)!.text))!==0);
+  const lineKinds=shared.filter(key=>legacyRows.get(key)!.kind!==sqliteRows.get(key)!.kind);
+  const frames=coordinates<ShadowFrameRecord>(legacy.frames,sqlite.frames,value=>value.bytes);
+  const unresolved=coordinates<ShadowUnresolvedRecord>(legacy.unresolved,sqlite.unresolved,value=>value.sha256);
+  const lines={matchedCoordinates:shared.length,byteMismatches:lineBytes,kindMismatches:lineKinds,
+    legacyOnly:[...legacyRows.keys()].filter(key=>!sqliteRows.has(key)).sort((a,b)=>a-b),
+    sqliteOnly:[...sqliteRows.keys()].filter(key=>!legacyRows.has(key)).sort((a,b)=>a-b)};
+  const receipts={legacyRequestId:legacy.requestId,sqliteRequestId:sqlite.requestId,match:legacy.requestId===sqlite.requestId};
+  let source:ShadowComparisonReport['source']={status:'unknown',legacy:null,sqlite:null};
+  if(oracle) {
+    const left=sourceDiff(legacy.rows,oracle.rows),right=sourceDiff(sqlite.rows,oracle.rows);
+    const bad=!oracle.rows.length || oracle.requestId!==legacy.requestId || oracle.requestId!==sqlite.requestId ||
+      [...Object.values(left),...Object.values(right)].some(values=>values.length>0);
+    source={status:bad?'mismatch':'verified',legacy:left,sqlite:right};
+  }
+  const faults:HistoryFault[]=[];
+  if(!receipts.match)faults.push(shadowFault(sessionId,'shadow-receipt-mismatch',legacy.requestId,sqlite.requestId,comparedAt));
+  if(lineBytes.length||lineKinds.length||lines.legacyOnly.length||lines.sqliteOnly.length)faults.push(shadowFault(sessionId,'shadow-line-mismatch',
+    {byteMismatches:[],kindMismatches:[],legacyOnly:[],sqliteOnly:[]},{byteMismatches:lineBytes,kindMismatches:lineKinds,legacyOnly:lines.legacyOnly,sqliteOnly:lines.sqliteOnly},comparedAt));
+  if(frames.mismatches.length||frames.leftOnly.length||frames.rightOnly.length)faults.push(shadowFault(sessionId,'shadow-frame-mismatch',
+    {byteMismatches:[],legacyOnly:[],sqliteOnly:[]},{byteMismatches:frames.mismatches,legacyOnly:frames.leftOnly,sqliteOnly:frames.rightOnly},comparedAt));
+  if(unresolved.mismatches.length||unresolved.leftOnly.length||unresolved.rightOnly.length)faults.push(shadowFault(sessionId,'shadow-unresolved-mismatch',
+    {digestMismatches:[],legacyOnly:[],sqliteOnly:[]},{digestMismatches:unresolved.mismatches,legacyOnly:unresolved.leftOnly,sqliteOnly:unresolved.rightOnly},comparedAt));
+  if(source.status==='mismatch')faults.push(shadowFault(sessionId,'shadow-source-mismatch','both projections match a non-empty independent oracle',source,comparedAt));
+  return {sessionId,requestId:sqlite.requestId,comparedAt,receipts,lines,
+    frames:{matchedOrdinals:frames.matched,byteMismatches:frames.mismatches,legacyOnly:frames.leftOnly,sqliteOnly:frames.rightOnly},
+    unresolved:{matchedOrdinals:unresolved.matched,digestMismatches:unresolved.mismatches,legacyOnly:unresolved.leftOnly,sqliteOnly:unresolved.rightOnly},source,faults};
+}
+
+/** Pure watchdog detector. Scheduling and alarm delivery remain host concerns. */
+export function inspectShadowRuntime(state:ShadowRuntimeState,now:number,staleAfterMs=30000):HistoryFault[] {
+  const findings:HistoryFault[]=[];
+  const last=state.lastProbeAt??state.startedAt;
+  if(now-last>staleAfterMs || state.inFlightSince!==null&&now-state.inFlightSince>staleAfterMs)findings.push(shadowFault(state.sessionId,'shadow-collector-stale',
+    `probe/in-flight age <=${staleAfterMs}ms`,{probeAge:now-last,inFlightAge:state.inFlightSince===null?null:now-state.inFlightSince},now));
+  if(state.targetRevision>state.exportedRevision && state.exportLagSince!==null && now-state.exportLagSince>staleAfterMs)findings.push(shadowFault(state.sessionId,'shadow-export-lag',
+    {revision:state.targetRevision,age:`<=${staleAfterMs}ms`},{revision:state.exportedRevision,age:now-state.exportLagSince},now));
+  if(state.lastWriteFailure)findings.push(shadowFault(state.sessionId,'shadow-write-failure','both shadow destinations acknowledged the batch',state.lastWriteFailure,now));
+  return findings;
+}
 
 /** Call from a host watchdog/process independent of the collector event loop.
  * No internal timer: a frozen collector cannot freeze this caller's scheduling. */

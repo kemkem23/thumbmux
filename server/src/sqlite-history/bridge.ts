@@ -7,14 +7,16 @@ import { randomUUID } from 'node:crypto';
 import { sha } from './codec';
 import { HistoryCoordinator } from './coordinator';
 import type { HistoryStore } from './store';
-import { verifyDualWriteAcknowledgement } from './detectors';
+import { compareShadowBatch, verifyDualWriteAcknowledgement } from './detectors';
 import type {
   CaptureBatch, CaptureReceipt, DualWriteReceipt, HistoryBridgeLedgerEntry,
-  HistoryBridgeOptions, HistoryCaptureBridge, LegacyProjection,
+  HistoryBridgeOptions, HistoryCaptureBridge, HistoryShadowBridgeOptions, LegacyProjection,
+  ShadowBatchSnapshot, ShadowComparisonReport,
 } from './types';
 
 type StoredBatch = Omit<CaptureBatch, 'unresolved'> & { unresolved?: string };
-type SpoolEntry = HistoryBridgeLedgerEntry & { version: 1; batch: StoredBatch };
+type SpoolEntry = HistoryBridgeLedgerEntry & { version: 1; batch: StoredBatch;
+  legacyShadow?: ShadowBatchSnapshot; shadowReport?: ShadowComparisonReport };
 
 function syncDirectory(path: string): void {
   const fd = openSync(path, 'r');
@@ -104,9 +106,15 @@ class BridgeSpool {
 export class OptInHistoryBridge implements HistoryCaptureBridge {
   private spool: BridgeSpool;
   private coordinator: HistoryCoordinator;
-  constructor(private store: HistoryStore, private options: HistoryBridgeOptions) {
+  constructor(private store: HistoryStore, private options: HistoryBridgeOptions | HistoryShadowBridgeOptions) {
     this.spool = new BridgeSpool(options.spoolDirectory);
     this.coordinator = new HistoryCoordinator(store, options, batch => this.commit(batch));
+  }
+  private shadow():HistoryShadowBridgeOptions['shadow']|null {
+    return 'shadow' in this.options ? this.options.shadow : null;
+  }
+  private needsResume(entry:SpoolEntry):boolean {
+    return !entry.legacyCommitted || !entry.sqliteCommitted || !!this.shadow()&&!entry.shadowDelivered;
   }
   private async commit(input: CaptureBatch): Promise<CaptureReceipt> {
     let entry = this.spool.accept(input);
@@ -114,7 +122,7 @@ export class OptInHistoryBridge implements HistoryCaptureBridge {
     if (!entry.legacyCommitted) {
       const value = projection(batch), acknowledgement = await this.options.legacyProjection.write(structuredClone(value));
       verifyDualWriteAcknowledgement(value, acknowledgement);
-      entry = { ...entry, legacyCommitted: true };
+      entry = { ...entry, legacyCommitted: true, ...(acknowledgement.shadow?{legacyShadow:structuredClone(acknowledgement.shadow)}:{}) };
       this.spool.update(entry);
     }
     const fresh = { ...batch, ticket: this.store.ticket(entry.sessionId, entry.requestId) };
@@ -124,10 +132,24 @@ export class OptInHistoryBridge implements HistoryCaptureBridge {
       entry = { ...entry, sqliteCommitted: true, sqliteRevision: receipt.context.revision };
       this.spool.update(entry);
     }
+    const shadow=this.shadow();
+    if(shadow) {
+      if(!entry.legacyShadow)throw new Error('shadow-legacy-snapshot-missing');
+      if(!entry.shadowCompared) {
+        const sqlite=this.store.shadowSnapshot(entry.sessionId,entry.requestId);
+        const oracle=shadow.sourceOracle(projection(batch));
+        entry={...entry,shadowCompared:true,shadowReport:compareShadowBatch(entry.sessionId,entry.legacyShadow,sqlite,oracle,(shadow.now??Date.now)())};
+        this.spool.update(entry);
+      }
+      if(!entry.shadowDelivered) {
+        await shadow.onComparison(structuredClone(entry.shadowReport!));
+        entry={...entry,shadowDelivered:true};this.spool.update(entry);
+      }
+    }
     return receipt;
   }
   start(): void {
-    if (this.spool.list().some(entry => !entry.legacyCommitted || !entry.sqliteCommitted)) throw new Error('bridge-pending-requires-resume');
+    if (this.spool.list().some(entry => this.needsResume(entry))) throw new Error('bridge-pending-requires-resume');
     this.coordinator.start();
   }
   async probe(sessionId: string): Promise<DualWriteReceipt> {
@@ -137,11 +159,11 @@ export class OptInHistoryBridge implements HistoryCaptureBridge {
     return { sqlite, requestId: entry.requestId, digest: entry.digest, legacyCommitted: true, sqliteCommitted: true };
   }
   async resumePending(): Promise<HistoryBridgeLedgerEntry[]> {
-    for (const entry of this.spool.list()) if (!entry.legacyCommitted || !entry.sqliteCommitted) await this.commit(decodeBatch(entry.batch));
+    for (const entry of this.spool.list()) if (this.needsResume(entry)) await this.commit(decodeBatch(entry.batch));
     return this.ledger();
   }
   ledger(): HistoryBridgeLedgerEntry[] {
-    return this.spool.list().map(({ batch: _batch, version: _version, ...entry }) => entry);
+    return this.spool.list().map(({ batch: _batch, version: _version, legacyShadow:_legacyShadow, shadowReport:_shadowReport, ...entry }) => entry);
   }
   stopAndDrain(): Promise<void> { return this.coordinator.stopAndDrain(); }
 }

@@ -1,7 +1,7 @@
 /** Opt-in entry point, proposed tier S. No SQLite module, file or timer at evaluation. */
-import type { SqliteHistoryOptions, HistoryBridgeOptions, HistoryCoordinatorOptions, HistoryImportOptions, HistoryContext, HistoryCaptureBridge, HistoryCaptureCoordinator, ClosedHistoryImportOptions } from './sqlite-history/types';
-export type { Continuity, HistoryContext, HistoryRow, HistoryGeometry, SourceObservation, CaptureObservation, HistoryFault, SqliteHistoryOptions, CaptureReceipt, HistoryPageV1, HistoryHealth, HistoryCaptureDriver, HistoryCoordinatorOptions, LegacyFormat, HistoryImportOptions, HistoryImportState, HistoryImportProgress, ClosedHistoryImportOptions, ClosedHistoryImportResult, MigrationUnresolvedEntry, MigrationVerification, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter, HistoryBridgeOptions, HistoryBridgeLedgerEntry, DualWriteReceipt, HistoryCaptureBridge, HistoryCaptureCoordinator } from './sqlite-history/types';
-export { inspectHistoryHealth, inspectHistoryMirror, inspectImportProgress, validateHistoryPage, verifyHistoryOracle } from './sqlite-history/detectors';
+import type { SqliteHistoryOptions, HistoryBridgeOptions, HistoryShadowBridgeOptions, HistoryCoordinatorOptions, HistoryImportOptions, HistoryContext, HistoryCaptureBridge, HistoryCaptureCoordinator, ClosedHistoryImportOptions } from './sqlite-history/types';
+export type { Continuity, HistoryContext, HistoryRow, HistoryGeometry, SourceObservation, CaptureObservation, HistoryFault, SqliteHistoryOptions, CaptureReceipt, HistoryPageV1, HistoryHealth, HistoryCaptureDriver, HistoryCoordinatorOptions, LegacyFormat, HistoryImportOptions, HistoryImportState, HistoryImportProgress, ClosedHistoryImportOptions, ClosedHistoryImportResult, MigrationUnresolvedEntry, MigrationVerification, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter, HistoryBridgeOptions, HistoryBridgeLedgerEntry, DualWriteReceipt, HistoryCaptureBridge, HistoryCaptureCoordinator, ShadowFrameRecord, ShadowUnresolvedRecord, ShadowBatchSnapshot, ShadowSourceOracle, ShadowComparisonReport, HistoryShadowBridgeOptions, ShadowRuntimeState } from './sqlite-history/types';
+export { compareShadowBatch, inspectShadowRuntime, inspectHistoryHealth, inspectHistoryMirror, inspectImportProgress, validateHistoryPage, verifyHistoryOracle } from './sqlite-history/detectors';
 export { sealHistorySnapshot } from './sqlite-history/transfer';
 export { assertMigrationReady, readSealedHistoryOracle } from './sqlite-history/rehearsal';
 
@@ -16,6 +16,8 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     registerSession:store.register.bind(store),renameSession:store.rename.bind(store),closeSession:store.closeSession.bind(store),
     createCaptureCoordinator:(o:HistoryCoordinatorOptions):HistoryCaptureCoordinator=>new HistoryCoordinator(store,o),
     createCaptureBridge:(o:HistoryBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
+    // Writer-only shadow facade. SQLite readers remain unwired and opt-in.
+    createShadowBridge:(o:HistoryShadowBridgeOptions):HistoryCaptureBridge=>new OptInHistoryBridge(store,o),
     snapshot:store.snapshot.bind(store),
     readBefore:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'before',anchor,limit,context),
     readAfter:(sid:string,anchor:number|null,limit:number,context?:HistoryContext)=>store.page(sid,'after',anchor,limit,context),
