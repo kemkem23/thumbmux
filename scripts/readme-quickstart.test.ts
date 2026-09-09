@@ -196,7 +196,10 @@ function installConsumer(tarball: string): void {
       vite: "^7.3.1",
     },
   }, null, 2)}\n`);
-  requireCommand(["bun", "install", "--ignore-scripts"], CONSUMER_ROOT);
+  // process.execPath, not a bare "bun": the hard sandbox narrows PATH to
+  // /usr/bin:/bin, and "Executable not found in $PATH" hid the blocker that
+  // actually stops this test there (the consumer install needs the registry).
+  requireCommand([process.execPath, "install", "--ignore-scripts"], CONSUMER_ROOT);
 
   const installed = realpathSync(join(CONSUMER_ROOT, "node_modules", "thumbmux"));
   const expectedPrefix = `${realpathSync(join(CONSUMER_ROOT, "node_modules"))}${sep}`;
@@ -474,7 +477,7 @@ describe("README quickstart", () => {
 
     const port = await reservePort();
     const processHandle = Bun.spawn({
-      cmd: ["bun", "run", "server.ts"],
+      cmd: [process.execPath, "run", "server.ts"],
       cwd: CONSUMER_ROOT,
       env: { ...process.env, PORT: String(port) },
       stdout: "pipe",
