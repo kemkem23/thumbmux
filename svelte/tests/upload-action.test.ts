@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { fetchStub } from "./fetch-stub";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import UploadAction from "../src/UploadAction.svelte";
@@ -133,10 +134,10 @@ describe("UploadAction", () => {
       context: unknown;
     }> = [];
 
-    replaceFetch((async (input: string | URL | Request, init?: RequestInit) => {
+    replaceFetch(fetchStub(async (input: string | URL | Request, init?: RequestInit) => {
       fetchCalls.push({ input, init });
       return Response.json({ ok: true, files: storedByServer }, { status: 201 });
-    }) as typeof fetch);
+    }));
 
     let resolveUploaded!: (result: { message: string; files: UploadedFile[] }) => void;
     const uploaded = new Promise<{ message: string; files: UploadedFile[] }>((resolve) => {
@@ -202,11 +203,11 @@ describe("UploadAction", () => {
     };
     const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
 
-    replaceFetch((async () =>
+    replaceFetch(fetchStub(async () =>
       Response.json(
         { ok: true, files: [storedByServer], dir: serverDir },
         { status: 201 },
-      )) as typeof fetch);
+      )));
 
     const { app } = mountUploadAction({
       dir: fallbackDir,
@@ -243,7 +244,7 @@ describe("UploadAction", () => {
       const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
       const surfacedErrors: string[] = [];
 
-      replaceFetch((async () => Response.json(malformed.body, { status: 201 })) as typeof fetch);
+      replaceFetch(fetchStub(async () => Response.json(malformed.body, { status: 201 })));
 
       const { app } = mountUploadAction({
         onUploaded: (message, files) => uploadResults.push({ message, files }),
@@ -271,7 +272,7 @@ describe("UploadAction", () => {
       let boundBusy = false;
       const labels = ["first", "second"] as const;
 
-      replaceFetch((async () => requests[fetchIndex++]!.promise) as typeof fetch);
+      replaceFetch(fetchStub(async () => requests[fetchIndex++]!.promise));
 
       const { app } = mountUploadAction(
         {
@@ -341,7 +342,7 @@ describe("UploadAction", () => {
     const contextsByFile = new Map<string, { requestKey: string }>();
     const observed: Array<{ responseLabel: string; requestKey: string }> = [];
     let fetchIndex = 0;
-    replaceFetch((async () => requests[fetchIndex++]!.promise) as typeof fetch);
+    replaceFetch(fetchStub(async () => requests[fetchIndex++]!.promise));
 
     const { app } = mountUploadAction({
       prepareForm: (files, form) => {
@@ -398,10 +399,10 @@ describe("UploadAction", () => {
       const uploadResults: Array<{ message: string; files: UploadedFile[] }> = [];
       const surfacedErrors: string[] = [];
 
-      replaceFetch((async () => {
+      replaceFetch(fetchStub(async () => {
         fetchCount += 1;
         return response.make();
-      }) as typeof fetch);
+      }));
 
       const { app } = mountUploadAction({
         onUploaded: (message, files) => uploadResults.push({ message, files }),
@@ -420,10 +421,10 @@ describe("UploadAction", () => {
 
   test("does not fetch for an empty upload or a cancelled picker", async () => {
     let fetchCount = 0;
-    replaceFetch((async () => {
+    replaceFetch(fetchStub(async () => {
       fetchCount += 1;
       throw new Error("empty selections must not reach fetch");
-    }) as typeof fetch);
+    }));
 
     const { app, input } = mountUploadAction();
     const instance = app as UploadActionInstance;

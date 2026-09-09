@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { fetchStub } from "./fetch-stub";
 import {
   DEFAULT_SHORTCUTS,
   mergePrefs,
@@ -71,7 +72,7 @@ function trackedBackgroundFetch(
   const calls: FetchCall[] = [];
   const completed = deferred<void>();
 
-  const fetchFn = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  const fetchFn = fetchStub((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     calls.push({ input, init });
     const source = Promise.resolve().then(() => handler(input, init));
     const thenable = {
@@ -88,7 +89,7 @@ function trackedBackgroundFetch(
       },
     };
     return thenable as unknown as Promise<Response>;
-  }) as typeof fetch;
+  });
 
   return { fetchFn, calls, done: completed.promise };
 }
@@ -171,12 +172,12 @@ describe("createServerPrefs", () => {
     const sibling = createServerPrefs({
       url: `/prefs/${key}-sibling`,
       cacheKey: key,
-      fetchFn: (async () => gateSibling.promise) as typeof fetch,
+      fetchFn: fetchStub(async () => gateSibling.promise),
     });
     const local = createServerPrefs({
       url: `/prefs/${key}-local`,
       cacheKey: key,
-      fetchFn: (async () => gateLocal.promise) as typeof fetch,
+      fetchFn: fetchStub(async () => gateLocal.promise),
     });
 
     const emissions: ThumbmuxPrefs[] = [];
@@ -360,7 +361,7 @@ describe("createServerPrefs", () => {
       const adapter = createServerPrefs({
         url: `/prefs/${key}`,
         cacheKey: key,
-        fetchFn: (async () => errorCase.response()) as typeof fetch,
+        fetchFn: fetchStub(async () => errorCase.response()),
       });
       let visible = cached;
       adapter.subscribe?.((prefs) => {
@@ -407,7 +408,7 @@ describe("createServerPrefs", () => {
     let active = 0;
     let maxInFlight = 0;
 
-    const fetchFn = ((_: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const fetchFn = fetchStub((_: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const gate = gates[requestBodies.length];
       if (!gate) throw new Error("unexpected extra PUT");
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -416,7 +417,7 @@ describe("createServerPrefs", () => {
       return gate.promise.finally(() => {
         active -= 1;
       });
-    }) as typeof fetch;
+    });
 
     const adapter = createServerPrefs({
       url: `/prefs/${key}`,
@@ -479,7 +480,7 @@ describe("createServerPrefs", () => {
     const trackedGet = trackedContinuation(getResponse.promise);
     const putStarted = deferred<void>();
     const requestMethods: string[] = [];
-    const fetchFn = ((_: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const fetchFn = fetchStub((_: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const method = init?.method ?? "GET";
       requestMethods.push(method);
       if (method === "PUT") {
@@ -487,7 +488,7 @@ describe("createServerPrefs", () => {
         return putResponse.promise;
       }
       return trackedGet.promise;
-    }) as typeof fetch;
+    });
     const adapter = createServerPrefs({
       url: `/prefs/${key}`,
       cacheKey: key,
@@ -534,11 +535,11 @@ describe("createServerPrefs", () => {
     const responseGates = [deferred<Response>(), deferred<Response>()];
     const trackedResponses = responseGates.map((gate) => trackedContinuation(gate.promise));
     let requestCount = 0;
-    const fetchFn = (() => {
+    const fetchFn = fetchStub(() => {
       const response = trackedResponses[requestCount++];
       if (!response) throw new Error("unexpected extra GET");
       return response.promise;
-    }) as typeof fetch;
+    });
     const adapter = createServerPrefs({
       url: `/prefs/${key}`,
       cacheKey: key,
@@ -581,11 +582,11 @@ describe("createServerPrefs", () => {
     const responseGates = [deferred<Response>(), deferred<Response>()];
     const trackedResponses = responseGates.map((gate) => trackedContinuation(gate.promise));
     let requestCount = 0;
-    const fetchFn = (() => {
+    const fetchFn = fetchStub(() => {
       const response = trackedResponses[requestCount++];
       if (!response) throw new Error("unexpected extra GET");
       return response.promise;
-    }) as typeof fetch;
+    });
     const adapter = createServerPrefs({
       url: `/prefs/${key}`,
       cacheKey: key,
@@ -631,7 +632,7 @@ describe("createServerPrefs", () => {
       const adapter = createServerPrefs({
         url: `/prefs/${key}`,
         cacheKey: key,
-        fetchFn: (async () => malformed.response()) as typeof fetch,
+        fetchFn: fetchStub(async () => malformed.response()),
       });
       const emissions: ThumbmuxPrefs[] = [];
       let visible = cached;
@@ -667,10 +668,10 @@ describe("createServerPrefs", () => {
     Object.defineProperty(globalThis, "fetch", {
       configurable: true,
       writable: true,
-      value: (async (input: string | URL | Request) => {
+      value: fetchStub(async (input: string | URL | Request) => {
         if (String(input) === url) matchingGlobalCalls += 1;
         return Response.json({ unexpectedGlobalTransport: true });
-      }) as typeof fetch,
+      }),
     });
 
     try {
@@ -761,11 +762,11 @@ describe("createLocalPrefs", () => {
         : createServerPrefs({
             url: `/prefs/${key}`,
             cacheKey: key,
-            fetchFn: (async (_input, init) => {
+            fetchFn: fetchStub(async (_input, init) => {
               const patch = JSON.parse(String(init?.body)) as Partial<ThumbmuxPrefs>;
               serverSnapshot = mergePrefs(serverSnapshot, patch);
               return Response.json(serverSnapshot);
-            }) as typeof fetch,
+            }),
           });
       const firstFontPx = Number(cached.fontPx) + 1;
       const trace: string[] = [];
