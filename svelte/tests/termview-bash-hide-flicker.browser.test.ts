@@ -244,16 +244,17 @@ describe("Bash HIDE geometry in a real engine", () => {
     // The local suite runner additionally schedules browser files after bulk
     // tests and holds the hard-sandbox host lease until cgroup cleanup finishes.
     const child = Bun.spawnSync({
-      cmd: ["/usr/bin/timeout", "--kill-after=5s", "230s",
-        process.execPath, "test", fileURLToPath(import.meta.url)],
+      cmd: [process.execPath, "test", fileURLToPath(import.meta.url)],
       cwd: join(here, "../.."),
       env: { ...process.env, THUMBMUX_FLICKER_BROWSER_CHILD: "1" },
       stdout: "pipe",
       stderr: "pipe",
+      timeout: 230_000,
+      killSignal: "SIGKILL",
     });
     const status = child.exitCode;
     const output = `${child.stdout.toString()}\n${child.stderr.toString()}`;
-    if (status === 124 || status === 137) {
+    if (status === null || child.signalCode) {
       throw new Error(`browser worker exceeded its execution budget; resource starvation vs code hang is undetermined:\n${output}`);
     }
     if (status !== 0) throw new Error(`isolated flicker browser worker failed:\n${output}`);
