@@ -7,6 +7,8 @@
  * assertions on real component behaviour — coordinates, export size, stroke
  * bookkeeping, promise handling and object-URL lifetime — instead of on a
  * reimplementation of it.
+ * Mouse and touch events go through the mounted component's DOM listeners.
+ * This is not proof of physical phone gestures or real canvas pixels.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
@@ -97,6 +99,10 @@ let createdImages: FakeImage[] = [];
 let created: string[] = [];
 let revoked: string[] = [];
 let exportedSizes: Array<{ width: number; height: number; type?: string }> = [];
+let eventErrors: string[] = [];
+function recordEventError(event: ErrorEvent): void {
+  eventErrors.push(event.error?.message ?? event.message);
+}
 
 const mounted: Array<{ app: unknown; target: HTMLElement }> = [];
 const canvasProto = Object.getPrototypeOf(
@@ -198,6 +204,24 @@ function commentInput(target: HTMLElement): HTMLInputElement {
   return target.querySelector<HTMLInputElement>('[data-testid="image-annotator-comment"]')!;
 }
 
+function toolButton(target: HTMLElement, name: string): HTMLButtonElement {
+  return target.querySelector<HTMLButtonElement>(`[data-testid="image-annotator-${name}"]`)!;
+}
+
+function touchOn(
+  canvas: HTMLCanvasElement,
+  type: "touchstart" | "touchmove" | "touchend" | "touchcancel",
+  points: Array<[number, number]> = [],
+): TouchEvent {
+  const touches = points.map(([clientX, clientY], identifier) => ({
+    identifier, clientX, clientY, target: canvas,
+  }) as Touch);
+  const event = new TouchEvent(type, { touches, bubbles: true, cancelable: true });
+  canvas.dispatchEvent(event);
+  flushSync();
+  return event;
+}
+
 function typeComment(target: HTMLElement, value: string): void {
   const input = commentInput(target);
   input.value = value;
@@ -214,6 +238,8 @@ beforeEach(() => {
   created = [];
   revoked = [];
   exportedSizes = [];
+  eventErrors = [];
+  window.addEventListener("error", recordEventError);
 
   let counter = 0;
   URL.createObjectURL = ((_blob: Blob) => {
@@ -266,6 +292,10 @@ afterEach(() => {
   (globalThis as { Image?: unknown }).Image = originalImage;
   URL.createObjectURL = originalCreate;
   URL.revokeObjectURL = originalRevoke;
+  window.removeEventListener("error", recordEventError);
+  // DOM listeners can report exceptions to window instead of dispatchEvent's
+  // caller. Such exceptions must fail even a test expecting no submission.
+  expect(eventErrors).toEqual([]);
 });
 
 describe("annotation helpers", () => {
@@ -436,6 +466,167 @@ describe("annotation helpers", () => {
 });
 
 describe("ImageAnnotator", () => {
+  test("touch draws and commits exactly the same scaled stroke as the mouse", async () => {
+    const { target } = mountAnnotator({ image: pngBlob(), onSubmit: () => {}, onClose: () => {} });
+    await tick();
+    await decodeImage(1600, 900);
+    const canvas = canvasOf(target);
+    displayAt(canvas, { left: 20, top: 10, width: 400, height: 225 });
+    const points: Array<[number, number]> = [[120, 60], [170, 85], [220, 110]];
+    const expected = [[[400, 200], [600, 300], [800, 400]]];
+    const ctx = contextOf(canvas);
+
+    ctx.calls.length = 0;
+    drawStrokeOn(canvas, points);
+    const mousePaths = pathsOf(ctx.calls);
+    expect(mousePaths).toEqual(expected);
+    toolButton(target, "undo").click();
+    flushSync();
+    expect(toolButton(target, "undo").disabled).toBe(true);
+
+    touchOn(canvas, "touchstart", [points[0]!]);
+    for (const point of points.slice(1)) {
+      touchOn(canvas, "touchmove", [point]);
+    }
+    ctx.calls.length = 0;
+    expect(touchOn(canvas, "touchend").defaultPrevented).toBe(true);
+    expect(pathsOf(ctx.calls)).toEqual(mousePaths);
+    expect(toolButton(target, "undo").disabled).toBe(false);
+
+    // An ended stroke must not grow if a later move arrives without a start.
+    ctx.calls.length = 0;
+    touchOn(canvas, "touchmove", [[300, 200]]);
+    expect(ctx.calls).toEqual([]);
+    toolButton(target, "undo").click();
+    flushSync();
+    expect(pathsOf(ctx.calls)).toEqual([]);
+    expect(toolButton(target, "undo").disabled).toBe(true);
+  });
+
+  test("touchcancel commits the partial stroke and the next gesture is separate", async () => {
+    const { target } = mountAnnotator({ image: pngBlob(), onSubmit: () => {}, onClose: () => {} });
+    await tick();
+    await decodeImage(400, 300);
+    const canvas = canvasOf(target);
+    displayAt(canvas, { left: 0, top: 0, width: 400, height: 300 });
+    const ctx = contextOf(canvas);
+    touchOn(canvas, "touchstart", [[10, 20]]);
+    touchOn(canvas, "touchmove", [[30, 40]]);
+    ctx.calls.length = 0;
+    expect(touchOn(canvas, "touchcancel").defaultPrevented).toBe(true);
+    expect(pathsOf(ctx.calls)).toEqual([[[10, 20], [30, 40]]]);
+    expect(toolButton(target, "undo").disabled).toBe(false);
+
+    ctx.calls.length = 0;
+    touchOn(canvas, "touchmove", [[80, 90]]);
+    touchOn(canvas, "touchend");
+    expect(ctx.calls).toEqual([]);
+    touchOn(canvas, "touchstart", [[100, 110]]);
+    touchOn(canvas, "touchmove", [[120, 130]]);
+    ctx.calls.length = 0;
+    touchOn(canvas, "touchend");
+    expect(pathsOf(ctx.calls)).toEqual([
+      [[10, 20], [30, 40]], [[100, 110], [120, 130]],
+    ]);
+    ctx.calls.length = 0;
+    toolButton(target, "undo").click();
+    flushSync();
+    expect(pathsOf(ctx.calls)).toEqual([[[10, 20], [30, 40]]]);
+  });
+
+  test("mouseleave commits the stroke and later movement cannot extend it", async () => {
+    const { target } = mountAnnotator({ image: pngBlob(), onSubmit: () => {}, onClose: () => {} });
+    await tick();
+    await decodeImage(400, 300);
+    const canvas = canvasOf(target);
+    displayAt(canvas, { left: 0, top: 0, width: 400, height: 300 });
+    const ctx = contextOf(canvas);
+    canvas.dispatchEvent(new MouseEvent("mousedown", { clientX: 10, clientY: 20, bubbles: true }));
+    canvas.dispatchEvent(new MouseEvent("mousemove", { clientX: 30, clientY: 40, bubbles: true }));
+    canvas.dispatchEvent(new MouseEvent("mouseleave"));
+    flushSync();
+    expect(toolButton(target, "undo").disabled).toBe(false);
+    expect(pathsOf(ctx.calls)).toEqual([[[10, 20], [30, 40]]]);
+    ctx.calls.length = 0;
+    canvas.dispatchEvent(new MouseEvent("mousemove", { clientX: 80, clientY: 90, bubbles: true }));
+    canvas.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    flushSync();
+    expect(ctx.calls).toEqual([]);
+    drawStrokeOn(canvas, [[100, 110], [120, 130]]);
+    expect(pathsOf(ctx.calls)).toEqual([
+      [[10, 20], [30, 40]], [[100, 110], [120, 130]],
+    ]);
+  });
+
+  test("the component reports a broken image without exporting or closing", async () => {
+    let submissions = 0;
+    let closes = 0;
+    const { target } = mountAnnotator({
+      image: pngBlob(), comment: "เก็บไว้เลือกภาพใหม่",
+      onSubmit: () => { submissions += 1; },
+      onClose: () => { closes += 1; },
+    });
+    await tick();
+    expect(createdImages).toHaveLength(1);
+    expect(typeof createdImages[0]!.onerror).toBe("function");
+    createdImages[0]!.onerror!();
+    flushSync();
+    await tick();
+    expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent)
+      .toBe("Unable to read that image.");
+    expect(hasCanvas(target)).toBe(false);
+    expect(hasEmptyState(target)).toBe(true);
+    expect(submitButton(target).disabled).toBe(true);
+    expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
+    expect(commentInput(target).value).toBe("เก็บไว้เลือกภาพใหม่");
+    expect(revoked).toEqual([created[0]!]);
+    expect(exportedSizes).toEqual([]);
+    expect(submissions).toBe(0);
+    expect(closes).toBe(0);
+  });
+
+  test("the X button closes exactly once without submitting", async () => {
+    let closes = 0;
+    let submissions = 0;
+    const { target } = mountAnnotator({
+      image: pngBlob(),
+      onSubmit: () => { submissions += 1; },
+      onClose: () => { closes += 1; },
+    });
+    await tick();
+    await decodeImage(400, 300);
+    toolButton(target, "close").click();
+    flushSync();
+    expect(closes).toBe(1);
+    expect(submissions).toBe(0);
+    expect(exportedSizes).toEqual([]);
+  });
+
+  test("Enter before decode does not start submitting or export an empty image", async () => {
+    let submissions = 0;
+    let closes = 0;
+    const { target } = mountAnnotator({
+      image: pngBlob(), comment: "รอภาพ",
+      onSubmit: () => { submissions += 1; },
+      onClose: () => { closes += 1; },
+    });
+    await tick();
+    expect(createdImages).toHaveLength(1);
+    commentInput(target).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    flushSync();
+    await tick();
+    expect(submissions).toBe(0);
+    expect(exportedSizes).toEqual([]);
+    expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
+    expect(submitButton(target).disabled).toBe(true);
+    expect(commentInput(target).disabled).toBe(false);
+    expect(commentInput(target).value).toBe("รอภาพ");
+    expect(hasEmptyState(target)).toBe(true);
+    expect(target.querySelector('[data-testid="image-annotator-error"]') === null).toBe(true);
+    expect(closes).toBe(0);
+    expect(revoked).toEqual([]);
+  });
+
   test("sizes the canvas to the image's own pixels and paints it once", async () => {
     const { target } = mountAnnotator({ image: pngBlob(), onSubmit: () => {}, onClose: () => {} });
     await tick();
@@ -589,6 +780,163 @@ describe("ImageAnnotator", () => {
     expect(revoked).toEqual([created[0]!]);
   });
 
+  test.each(["resolve", "reject"] as const)(
+    "editing stays locked through PNG export and upload, then %s settles it",
+    async (outcome) => {
+      let resolveUpload!: () => void;
+      let rejectUpload!: (reason: Error) => void;
+      const upload = new Promise<void>((resolve, reject) => {
+        resolveUpload = resolve;
+        rejectUpload = reject;
+      });
+      const submissions: Array<{ image: Blob; comment: string }> = [];
+      let closes = 0;
+      const { app, target } = mountAnnotator({
+        image: pngBlob(),
+        onSubmit: (draft) => {
+          submissions.push(draft);
+          if (submissions.length === 1) return upload;
+        },
+        onClose: () => { closes += 1; },
+      });
+      await tick();
+      await decodeImage(800, 600);
+      const canvas = canvasOf(target);
+      displayAt(canvas, { left: 0, top: 0, width: 800, height: 600 });
+      drawStrokeOn(canvas, [[10, 20], [30, 40]]);
+      typeComment(target, "  ส่งร่างนี้  ");
+      const ctx = contextOf(canvas);
+      let finishExport!: (blob: Blob) => void;
+      let exports = 0;
+      canvas.toBlob = (callback) => {
+        exports += 1;
+        finishExport = callback;
+      };
+
+      const pendingSubmit = app.submit();
+      flushSync();
+      await tick();
+      expect(exports).toBe(1);
+      expect(submissions).toHaveLength(0);
+
+      async function assertLocked(): Promise<void> {
+        expect(submitButton(target).textContent?.trim()).toBe("UPLOADING...");
+        expect(submitButton(target).disabled).toBe(true);
+        expect(commentInput(target).disabled).toBe(true);
+        expect(canvas.getAttribute("aria-disabled")).toBe("true");
+        for (const name of ["undo", "clear", "remove"]) {
+          expect(toolButton(target, name).disabled).toBe(true);
+          toolButton(target, name).click();
+        }
+        ctx.calls.length = 0;
+        drawStrokeOn(canvas, [[90, 100], [110, 120]]);
+        touchOn(canvas, "touchstart", [[130, 140]]);
+        touchOn(canvas, "touchmove", [[150, 160]]);
+        touchOn(canvas, "touchend");
+        touchOn(canvas, "touchcancel");
+        // Instance methods also respect the lock without relying on disabled DOM.
+        app.clearAll();
+        app.removeImage();
+        await app.submit();
+        commentInput(target).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+        flushSync();
+        expect(ctx.calls).toEqual([]);
+        expect(hasCanvas(target)).toBe(true);
+        expect(commentInput(target).value).toBe("  ส่งร่างนี้  ");
+        expect(revoked).toEqual([]);
+        expect(exports).toBe(1);
+        expect(closes).toBe(0);
+      }
+
+      await assertLocked();
+      const encoded = pngBlob();
+      finishExport(encoded);
+      await tick();
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]!.image).toBe(encoded);
+      expect(submissions[0]!.comment).toBe("ส่งร่างนี้");
+      await assertLocked();
+      expect(submissions).toHaveLength(1);
+
+      if (outcome === "resolve") resolveUpload();
+      else rejectUpload(new Error("ลองส่งใหม่"));
+      await pendingSubmit;
+      flushSync();
+      expect(commentInput(target).disabled).toBe(false);
+      expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
+
+      if (outcome === "resolve") {
+        expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent ?? "").toBe("");
+        expect(closes).toBe(1);
+        expect(hasCanvas(target)).toBe(false);
+        expect(commentInput(target).value).toBe("");
+        expect(revoked).toEqual([created[0]!]);
+      } else {
+        expect(closes).toBe(0);
+        expect(canvasOf(target) === canvas).toBe(true);
+        expect(canvas.getAttribute("aria-disabled")).toBe("false");
+        expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent).toBe("ลองส่งใหม่");
+        for (const name of ["undo", "clear", "remove", "submit"]) {
+          expect(toolButton(target, name).disabled).toBe(false);
+        }
+        touchOn(canvas, "touchstart", [[50, 60]]);
+        touchOn(canvas, "touchmove", [[70, 80]]);
+        ctx.calls.length = 0;
+        touchOn(canvas, "touchend");
+        expect(pathsOf(ctx.calls)).toEqual([
+          [[10, 20], [30, 40]], [[50, 60], [70, 80]],
+        ]);
+        ctx.calls.length = 0;
+        toolButton(target, "undo").click();
+        flushSync();
+        expect(pathsOf(ctx.calls)).toEqual([[[10, 20], [30, 40]]]);
+        ctx.calls.length = 0;
+        drawStrokeOn(canvas, [[100, 110], [120, 130]]);
+        expect(pathsOf(ctx.calls)).toEqual([
+          [[10, 20], [30, 40]], [[100, 110], [120, 130]],
+        ]);
+        typeComment(target, "แก้แล้วส่งใหม่");
+        expect(revoked).toEqual([]);
+        const retry = app.submit();
+        finishExport(encoded);
+        await retry;
+        flushSync();
+        expect(exports).toBe(2);
+        expect(submissions).toHaveLength(2);
+        expect(submissions[1]!.comment).toBe("แก้แล้วส่งใหม่");
+        expect(closes).toBe(1);
+        expect(hasCanvas(target)).toBe(false);
+      }
+    },
+  );
+
+  test("submitting mid-gesture finishes it so a failed upload cannot resume a stale stroke", async () => {
+    const { app, target } = mountAnnotator({
+      image: pngBlob(),
+      onSubmit: () => Promise.reject(new Error("ลองใหม่")),
+      onClose: () => {},
+    });
+    await tick();
+    await decodeImage(400, 300);
+    const canvas = canvasOf(target);
+    displayAt(canvas, { left: 0, top: 0, width: 400, height: 300 });
+    touchOn(canvas, "touchstart", [[10, 20]]);
+    touchOn(canvas, "touchmove", [[30, 40]]);
+    expect(toolButton(target, "undo").disabled).toBe(true);
+    await app.submit();
+    flushSync();
+    expect(toolButton(target, "undo").disabled).toBe(false);
+    const ctx = contextOf(canvas);
+    ctx.calls.length = 0;
+    touchOn(canvas, "touchmove", [[50, 60]]);
+    touchOn(canvas, "touchend");
+    expect(ctx.calls).toEqual([]);
+    drawStrokeOn(canvas, [[100, 110], [120, 130]]);
+    expect(pathsOf(ctx.calls)).toEqual([
+      [[10, 20], [30, 40]], [[100, 110], [120, 130]],
+    ]);
+  });
+
   test("submit waits for the host promise, then clears the draft and closes", async () => {
     let settle!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -674,6 +1022,31 @@ describe("ImageAnnotator", () => {
     expect(pathsOf(ctx.calls).length).toBeGreaterThanOrEqual(2);
   });
 
+  test.each([
+    ["network unavailable", "network unavailable"],
+    [undefined, "Unable to upload that image."],
+    [null, "Unable to upload that image."],
+  ])("a non-Error rejection (%s) explains the failure and unlocks the draft", async (cause, message) => {
+    let closes = 0;
+    const { app, target } = mountAnnotator({
+      image: pngBlob(), comment: "ยังแก้ต่อได้",
+      onSubmit: () => Promise.reject(cause),
+      onClose: () => { closes += 1; },
+    });
+    await tick();
+    await decodeImage(400, 300);
+    await app.submit();
+    flushSync();
+    expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent).toBe(message);
+    expect(hasCanvas(target)).toBe(true);
+    expect(commentInput(target).value).toBe("ยังแก้ต่อได้");
+    expect(commentInput(target).disabled).toBe(false);
+    expect(submitButton(target).disabled).toBe(false);
+    expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
+    expect(closes).toBe(0);
+    expect(revoked).toEqual([]);
+  });
+
   test("unmount hands the object URL back", async () => {
     const { app, target } = mountAnnotator({
       image: pngBlob(),
@@ -706,13 +1079,6 @@ describe("ImageAnnotator", () => {
       },
     });
     await tick();
-
-    commentInput(target).dispatchEvent(
-      new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
-    );
-    await tick();
-    // No image decoded yet — Enter must not submit an empty draft.
-    expect(submissions).toEqual([]);
 
     await decodeImage(200, 100);
     typeComment(target, "ส่งด้วย Enter");

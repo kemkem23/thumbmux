@@ -119,32 +119,32 @@
   }
 
   function startDraw(event: MouseEvent): void {
-    if (!hasImage) return;
+    if (submitting || !hasImage) return;
     drawing = true;
     currentStroke = [pointFrom(event)];
   }
 
   function moveDraw(event: MouseEvent): void {
-    if (!drawing) return;
+    if (submitting || !drawing) return;
     currentStroke = [...currentStroke, pointFrom(event)];
   }
 
   function endDraw(): void {
-    if (!drawing) return;
+    if (submitting || !drawing) return;
     drawing = false;
     strokes = commitStroke(strokes, currentStroke);
     currentStroke = [];
   }
 
   function startDrawTouch(event: TouchEvent): void {
-    if (!hasImage || event.touches.length !== 1) return;
+    if (submitting || !hasImage || event.touches.length !== 1) return;
     event.preventDefault();
     drawing = true;
     currentStroke = [pointFrom(event.touches[0]!)];
   }
 
   function moveDrawTouch(event: TouchEvent): void {
-    if (!drawing || event.touches.length !== 1) return;
+    if (submitting || !drawing || event.touches.length !== 1) return;
     event.preventDefault();
     currentStroke = [...currentStroke, pointFrom(event.touches[0]!)];
   }
@@ -160,6 +160,13 @@
 
   /** CLEAR drops everything, comment included — same as the host panel. */
   export function clearAll(): void {
+    if (submitting) return;
+    resetDraft();
+  }
+
+  // Successful submission must clear its snapshot while user edits stay locked.
+  function resetDraft(): void {
+    drawing = false;
     strokes = [];
     currentStroke = [];
     comment = '';
@@ -169,6 +176,8 @@
 
   /** REMOVE drops the picture only; the comment already typed survives. */
   export function removeImage(): void {
+    if (submitting) return;
+    drawing = false;
     strokes = [];
     currentStroke = [];
     error = '';
@@ -177,16 +186,18 @@
 
   export async function submit(): Promise<void> {
     if (!canvasEl || !hasImage || submitting) return;
+    // End any live gesture before freezing the draft, including instance submit.
+    endDraw();
     submitting = true;
     error = '';
     try {
       const exported = await canvasToPngBlob(canvasEl);
       await onSubmit({ image: exported, comment: comment.trim() });
-      clearAll();
+      resetDraft();
       onClose();
     } catch (cause) {
       // Draft intentionally untouched: a failed upload must be retryable.
-      error = cause instanceof Error ? cause.message : String(cause);
+      error = cause instanceof Error ? cause.message : String(cause ?? 'Unable to upload that image.');
     } finally {
       submitting = false;
     }
@@ -225,6 +236,7 @@
         type="button"
         class="annotator-btn"
         onclick={removeImage}
+        disabled={submitting}
         aria-label="Remove image"
         data-testid="image-annotator-remove"
       >&times;</button>
@@ -233,6 +245,7 @@
       <canvas
         bind:this={canvasEl}
         data-testid="image-annotator-canvas"
+        aria-disabled={submitting}
         onmousedown={startDraw}
         onmousemove={moveDraw}
         onmouseup={endDraw}
@@ -248,13 +261,14 @@
         type="button"
         class="annotator-btn"
         onclick={undo}
-        disabled={strokes.length === 0}
+        disabled={submitting || strokes.length === 0}
         data-testid="image-annotator-undo"
       >UNDO</button>
       <button
         type="button"
         class="annotator-btn danger"
         onclick={clearAll}
+        disabled={submitting}
         data-testid="image-annotator-clear"
       >CLEAR</button>
     </div>
@@ -269,6 +283,7 @@
       placeholder="comment..."
       lang="th"
       bind:value={comment}
+      disabled={submitting}
       onkeydown={(event) => {
         if (event.key === 'Enter' && hasImage) void submit();
       }}
@@ -367,6 +382,10 @@
     touch-action: none;
     max-width: 100%;
     height: auto;
+  }
+
+  canvas[aria-disabled='true'] {
+    cursor: not-allowed;
   }
 
   .annotator-tools {
