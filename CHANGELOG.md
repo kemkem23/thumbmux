@@ -57,6 +57,32 @@ the same five workspace versions and is part of the lockstep set.
 Consumer pins in the root and brain-ui manifests are deliberately untouched.
 They move only after the public repo publishes `v0.20.0-dist`.
 
+### Also inside this tag, and inert
+
+`v0.19.0-dist` was the last published tag, so this one also carries every
+`server/src/sqlite-history/` change merged since: the wave 4 reader canary, the
+wave 5 authoritative writer, and the first half of wave 6's rollout tooling
+(`reader.ts`, `authoritative.ts`, `rollout.ts` and their tests). None of it is
+part of this release's headline, and none of it runs on its own:
+
+- **The contracted surface did not move.** `contract/manifest/server.json` is
+  byte-identical to `v0.19.0`; only `core.json` and `svelte.json` changed, and
+  those changed by exactly the six names above. `sqlite-history` is not
+  re-exported from `server/src/index.ts`, so nothing new appears on the barrel.
+- **Every new path is opt-in and fails closed.** `HistoryRolloutAllowlist.route`
+  returns `'legacy'` for any group without an explicitly `enabled` record, an
+  empty roster throws `rollout-empty-roster`, and the new factory methods on the
+  object `createSqliteHistoryStore` returns (`createReaderCanary`,
+  `createAuthoritativeBridge`, `createRolloutAllowlist`) are additive
+  properties that no shipped code calls.
+- **A consumer that does not import it never loads it.** The module is a
+  separate build entry, not part of the barrel, so upgrading the pin does not
+  pull it into a bundle that never names it.
+
+Stated here because a release note that lists only its headline leaves a reader
+to discover the rest by diffing two tags. What ships in the tag is the tag's
+contents, not the subset the note was written about.
+
 ## v0.19.0 — 2026-09-09
 
 Minor, not a patch: this release adds new exports (`thumbmux/server/sqlite-history`,
