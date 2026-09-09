@@ -45,7 +45,7 @@ type Mounted = {
   input: HTMLInputElement;
 };
 
-const mounted: Array<{ app: unknown; target: HTMLElement }> = [];
+const mounted: Array<{ app: Record<string, unknown>; target: HTMLElement }> = [];
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
 const originalCreate = URL.createObjectURL;
 const originalRevoke = URL.revokeObjectURL;
@@ -717,7 +717,7 @@ describe("AttachmentDraftPicker", () => {
 
     const target = document.createElement("div");
     document.body.appendChild(target);
-    let app!: unknown;
+    let app!: Record<string, unknown>;
     const uploaded: string[] = [];
     flushSync(() => {
       app = mount(UploadAction, {

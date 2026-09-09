@@ -1630,7 +1630,7 @@ describe("TermView history prepend scheduling", () => {
     const settledMirrorBeforeFling = viewport.getAttribute("data-bottom-offset");
     const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
     let historyRectReads = 0;
-    jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
+    jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       if (this === viewport || this.classList.contains("mtv-line")) historyRectReads++;
       return originalGetBoundingClientRect.call(this);
     });

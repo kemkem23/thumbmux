@@ -168,7 +168,9 @@ describe("TM-04 · titleAdornment", () => {
       if (clipboardDescriptor) {
         Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
       } else {
-        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+        // `Navigator.clipboard` is declared required, so `delete` on it is a
+        // type error however it is cast. Reflect drops the stub without one.
+        Reflect.deleteProperty(navigator, "clipboard");
       }
     }
   });
