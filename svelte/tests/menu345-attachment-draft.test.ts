@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import AttachmentDraftPicker from "../src/AttachmentDraftPicker.svelte";
+import AttachmentDraftHost from "./AttachmentDraftHost.svelte";
 import UploadAction from "../src/UploadAction.svelte";
 import {
   acceptableDraftFiles,
@@ -115,6 +116,45 @@ function mountPicker(props: {
   if (!input) throw new Error("picker did not render its file input");
   mounted.push({ app, target });
   return { app, target, input };
+}
+
+type HostInstance = {
+  /** Moves the `files` prop after mount — what no test did before W3-I1b. */
+  setFiles(next: File[]): void;
+  currentProp(): File[];
+  inner(): PickerInstance;
+};
+
+type MountedHost = {
+  host: HostInstance;
+  target: HTMLElement;
+  input: HTMLInputElement;
+};
+
+/** Mounts the picker underneath a host that can hand it a different array. */
+function mountHost(props: {
+  initialFiles?: File[];
+  accept?: string;
+  multiple?: boolean;
+  disabled?: boolean;
+  onChange: (files: File[]) => void;
+}): MountedHost {
+  const target = document.createElement("div");
+  document.body.appendChild(target);
+  let host!: HostInstance;
+  flushSync(() => {
+    host = mount(AttachmentDraftHost, { target, props }) as unknown as HostInstance;
+  });
+  const input = target.querySelector<HTMLInputElement>('[data-testid="attachment-draft-input"]');
+  if (!input) throw new Error("picker did not render its file input");
+  mounted.push({ app: host, target });
+  return { host, target, input };
+}
+
+function thumbUrls(target: HTMLElement): string[] {
+  return Array.from(
+    target.querySelectorAll<HTMLImageElement>('[data-testid="attachment-draft-thumb"]'),
+  ).map((node) => node.getAttribute("src") ?? "");
 }
 
 function chooseFiles(input: HTMLInputElement, files: File[]): void {
@@ -442,5 +482,118 @@ describe("AttachmentDraftPicker", () => {
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0]!.input).toBe("/api/upload");
     expect(uploaded).toHaveLength(1);
+  });
+});
+
+/**
+ * W3-I1b — the `files` prop moving *after* mount.
+ *
+ * The re-seed `$effect` in AttachmentDraftPicker had no test walking into it:
+ * every earlier test passed `files` once, at mount, where the effect's first
+ * run always takes the `incoming === known` early return. Proof: a `throw`
+ * placed inside the branch left all 31 tests green. These three lock what the
+ * host actually sees, and they count `onChange` calls instead of reading
+ * `changes.at(-1)` — the old shape cannot see a call that should not exist.
+ */
+describe("AttachmentDraftPicker · host moves the files prop", () => {
+  test("a new array from the host re-seeds the draft and fires onChange zero times", async () => {
+    const changes: File[][] = [];
+    const kept = imageFile("kept.png");
+    const dropped = imageFile("dropped.png");
+    const { host, target, input } = mountHost({ onChange: (files) => changes.push(files) });
+    await tick();
+
+    chooseFiles(input, [kept, dropped]);
+    flushSync();
+    await tick();
+    expect(changes).toHaveLength(1);
+    expect(created).toHaveLength(2);
+    const keptUrl = created[0]!;
+    const droppedUrl = created[1]!;
+
+    // The host swaps in a different array: one file survives, one leaves, one is new.
+    const arrived = imageFile("arrived.png");
+    host.setFiles([kept, arrived]);
+    flushSync();
+    await tick();
+
+    expect(itemNames(target)).toEqual(["kept.png", "arrived.png"]);
+    expect(host.inner().currentFiles()).toEqual([kept, arrived]);
+    // Count, not last value: a re-seed that reported itself back would be a loop.
+    expect(changes).toHaveLength(1);
+    expect(fetchCalls).toEqual([]);
+    // The survivor keeps its preview URL; only the file that left gave one back.
+    expect(created).toHaveLength(3);
+    expect(thumbUrls(target)).toEqual([keptUrl, created[2]!]);
+    expect(revoked).toEqual([droppedUrl]);
+
+    // The re-seeded list is what unmount now owns — no double revoke of the dropped one.
+    const entry = mounted.pop()!;
+    unmount(entry.app);
+    entry.target.remove();
+    flushSync();
+    expect(revoked).toEqual([droppedUrl, keptUrl, created[2]!]);
+  });
+
+  test("the array from onChange handed straight back does not re-seed and stays silent", async () => {
+    const changes: File[][] = [];
+    const { host, target, input } = mountHost({ onChange: (files) => changes.push(files) });
+    await tick();
+
+    chooseFiles(input, [imageFile("a.png"), imageFile("b.png")]);
+    flushSync();
+    await tick();
+    expect(changes).toHaveLength(1);
+    const echoed = changes[0]!;
+    const urlsBefore = thumbUrls(target);
+    expect(urlsBefore).toEqual([created[0]!, created[1]!]);
+
+    // A controlled host mirrors onChange into its own state — that array comes
+    // straight back as the prop, and must not be treated as a new instruction.
+    host.setFiles(echoed);
+    flushSync();
+    await tick();
+
+    expect(host.currentProp()).toBe(echoed);
+    expect(itemNames(target)).toEqual(["a.png", "b.png"]);
+    expect(host.inner().currentFiles()).toEqual(echoed);
+    expect(changes).toHaveLength(1);
+    // No preview URL was re-created and none was handed back.
+    expect(created).toHaveLength(2);
+    expect(revoked).toEqual([]);
+    expect(thumbUrls(target)).toEqual(urlsBefore);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test("host empties the draft with [] after a send — list clears, every URL comes back", async () => {
+    const changes: File[][] = [];
+    const { host, target, input } = mountHost({ onChange: (files) => changes.push(files) });
+    await tick();
+
+    chooseFiles(input, [imageFile("one.png"), imageFile("two.png")]);
+    flushSync();
+    await tick();
+    expect(changes).toHaveLength(1);
+    expect(created).toHaveLength(2);
+
+    // What a host does once its own upload succeeded: hand back an empty draft.
+    host.setFiles([]);
+    flushSync();
+    await tick();
+
+    expect(itemNames(target)).toEqual([]);
+    expect(target.querySelector('[data-testid="attachment-draft-list"]')).toBeNull();
+    expect(host.inner().currentFiles()).toEqual([]);
+    expect(revoked.sort()).toEqual([...created].sort());
+    // Emptying the draft is the host telling us, not us telling the host.
+    expect(changes).toHaveLength(1);
+    expect(fetchCalls).toEqual([]);
+
+    // Nothing is left to revoke a second time on unmount.
+    const entry = mounted.pop()!;
+    unmount(entry.app);
+    entry.target.remove();
+    flushSync();
+    expect(revoked.sort()).toEqual([...created].sort());
   });
 });
