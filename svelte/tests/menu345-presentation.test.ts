@@ -394,6 +394,20 @@ describe("ThemeSourceChoice (B03)", () => {
     }
   });
 
+  test("extraClass preserves host classes on the choice wrapper", () => {
+    const { target } = mountComponent(ThemeSourceChoice, {
+      ...LABELS,
+      extraClass: "host-theme-layout host-spacing",
+      onChange: () => {},
+    });
+    const wrapper = required<HTMLElement>(target, '[data-testid="theme-source-choice"]');
+    expect(wrapper.classList.contains("theme-source")).toBe(true);
+    expect(wrapper.classList.contains("host-theme-layout")).toBe(true);
+    expect(wrapper.classList.contains("host-spacing")).toBe(true);
+    expect(target.querySelectorAll(".host-theme-layout")).toHaveLength(1);
+    expect(target.querySelectorAll("button.host-theme-layout")).toHaveLength(0);
+  });
+
   test("the hint is the host's text and disappears when absent", () => {
     const withHint = mountComponent(ThemeSourceChoice, {
       ...LABELS,
