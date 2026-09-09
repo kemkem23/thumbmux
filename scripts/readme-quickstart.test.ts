@@ -192,6 +192,9 @@ function installConsumer(tarball: string): void {
     devDependencies: {
       "@sveltejs/vite-plugin-svelte": "^6.2.1",
       "@types/bun": "^1.3.0",
+      // bun-types uses "*"; DefinitelyTyped's latest can return to an older
+      // major. Keep strict consumer checks independent of release order.
+      "@types/node": "26.5.1",
       typescript: "^5.9.3",
       vite: "^7.3.1",
     },
