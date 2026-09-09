@@ -866,6 +866,7 @@ describe("ImageAnnotator", () => {
       expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
 
       if (outcome === "resolve") {
+        expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent ?? "").toBe("");
         expect(closes).toBe(1);
         expect(hasCanvas(target)).toBe(false);
         expect(commentInput(target).value).toBe("");
@@ -1019,6 +1020,31 @@ describe("ImageAnnotator", () => {
     await tick();
     // Both strokes replay: the one drawn before the failure and the new one.
     expect(pathsOf(ctx.calls).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test.each([
+    ["network unavailable", "network unavailable"],
+    [undefined, "Unable to upload that image."],
+    [null, "Unable to upload that image."],
+  ])("a non-Error rejection (%s) explains the failure and unlocks the draft", async (cause, message) => {
+    let closes = 0;
+    const { app, target } = mountAnnotator({
+      image: pngBlob(), comment: "ยังแก้ต่อได้",
+      onSubmit: () => Promise.reject(cause),
+      onClose: () => { closes += 1; },
+    });
+    await tick();
+    await decodeImage(400, 300);
+    await app.submit();
+    flushSync();
+    expect(target.querySelector('[data-testid="image-annotator-error"]')?.textContent).toBe(message);
+    expect(hasCanvas(target)).toBe(true);
+    expect(commentInput(target).value).toBe("ยังแก้ต่อได้");
+    expect(commentInput(target).disabled).toBe(false);
+    expect(submitButton(target).disabled).toBe(false);
+    expect(submitButton(target).textContent?.trim()).toBe("SUBMIT");
+    expect(closes).toBe(0);
+    expect(revoked).toEqual([]);
   });
 
   test("unmount hands the object URL back", async () => {

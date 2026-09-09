@@ -197,7 +197,7 @@
       onClose();
     } catch (cause) {
       // Draft intentionally untouched: a failed upload must be retryable.
-      error = cause instanceof Error ? cause.message : String(cause);
+      error = cause instanceof Error ? cause.message : String(cause ?? 'Unable to upload that image.');
     } finally {
       submitting = false;
     }
