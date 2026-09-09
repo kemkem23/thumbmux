@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { proxy as reactiveProps } from 'svelte/internal/client';
+import type { ComponentProps } from 'svelte';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
 import TermView from '../src/TermView.svelte';
@@ -38,11 +39,19 @@ type SummaryHandler = (
   requests: readonly ClaudeBashSummaryRequest[],
 ) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
 
+// The full TermView prop shape, plus the two props this suite always sets and
+// then flips at runtime — declaring them required here keeps the reads below
+// free of `| undefined` without loosening anything the component declares.
+type MountProps = ComponentProps<typeof TermView> & {
+  claudeBashMode: ClaudeBashMode;
+  historyPaging: 'ceiling' | 'sliding';
+};
+
 type Mounted = {
   app: Record<string, unknown>;
   target: HTMLElement;
   viewport: HTMLElement;
-  props: { claudeBashMode: ClaudeBashMode; historyPaging: 'ceiling' | 'sliding' };
+  props: MountProps;
 };
 
 class ControlledResizeObserver implements ResizeObserver {
@@ -194,7 +203,7 @@ function mountView(
   target.style.cssText = `position:relative;width:320px;height:${options.height ?? 240}px;`;
   document.body.appendChild(target);
 
-  const props = reactiveProps({
+  const props = reactiveProps<MountProps>({
     session: `cc-bash-${mode}-${mounted.length}`,
     palette,
     claimGeometry: false,
@@ -1015,7 +1024,13 @@ describe('TermView Claude Bash projection', () => {
 
   test('keeps an in-flight DISTILL result which settles during the raw rearm frame', async () => {
     let summaryCalls = 0;
-    let settleSummary: ((summaries: ClaudeBashSummaries) => void) | null = null;
+    // Assigned from inside a callback. A `| null` declaration narrows to
+    // `never` at the call below because TS cannot see the callback run, so
+    // start from a throwing default instead: it types cleanly and turns
+    // "never assigned" into a loud failure rather than a skipped `?.`.
+    let settleSummary: (summaries: ClaudeBashSummaries) => void = () => {
+      throw new Error('TermView never requested a summary');
+    };
     const pendingSummary = new Promise<ClaudeBashSummaries>((resolve) => {
       settleSummary = resolve;
     });
@@ -1060,7 +1075,7 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
     expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
 
-    settleSummary?.(Object.fromEntries(requestedIds.map((id) => [id, 'สรุประหว่างรอ'])));
+    settleSummary(Object.fromEntries(requestedIds.map((id) => [id, 'สรุประหว่างรอ'])));
     await settleUi();
     await settleUi();
     expect(viewport.querySelector('.mtv-bash-placeholder')).toBeNull();
@@ -1654,7 +1669,13 @@ describe('TermView Claude Bash projection', () => {
 
   test('live completions replace the waiting tail item while the cold batch is in flight', async () => {
     const batches: ClaudeBashSummaryRequest[][] = [];
-    let releaseCold: ((value: ClaudeBashSummaries) => void) | null = null;
+    // Assigned from inside a callback. A `| null` declaration narrows to
+    // `never` at the call below because TS cannot see the callback run, so
+    // start from a throwing default instead: it types cleanly and turns
+    // "never assigned" into a loud failure rather than a skipped `?.`.
+    let releaseCold: (value: ClaudeBashSummaries) => void = () => {
+      throw new Error('TermView never requested the cold summary batch');
+    };
     const coldResult = new Promise<ClaudeBashSummaries>((resolve) => {
       releaseCold = resolve;
     });
@@ -1681,7 +1702,7 @@ describe('TermView Claude Bash projection', () => {
     await settleUi();
     expect(batches).toHaveLength(1);
 
-    releaseCold?.({ [batches[0]?.[0]?.id ?? '']: 'เย็นเสร็จแล้ว' });
+    releaseCold({ [batches[0]?.[0]?.id ?? '']: 'เย็นเสร็จแล้ว' });
     await settleUi();
     await settleUi();
     expect(batches).toHaveLength(2);
@@ -1702,7 +1723,13 @@ describe('TermView Claude Bash projection', () => {
     const originalSetTimeout = globalThis.setTimeout.bind(globalThis);
     const originalClearTimeout = globalThis.clearTimeout.bind(globalThis);
     const fakeHandle = 987_654_321 as unknown as ReturnType<typeof setTimeout>;
-    let watchdog: (() => void) | null = null;
+    // Assigned from inside a callback. A `| null` declaration narrows to
+    // `never` at the call below because TS cannot see the callback run, so
+    // start from a throwing default instead: it types cleanly and turns
+    // "never assigned" into a loud failure rather than a skipped `?.`.
+    let watchdog: () => void = () => {
+      throw new Error('TermView never armed the summary watchdog');
+    };
     Object.defineProperty(globalThis, 'setTimeout', {
       configurable: true,
       writable: true,
@@ -1737,9 +1764,8 @@ describe('TermView Claude Bash projection', () => {
       deliver([...cold, ...block('latest-after-hang')], false);
       await settleUi();
       expect(batches).toHaveLength(1);
-      expect(watchdog).not.toBeNull();
 
-      watchdog?.();
+      watchdog();
       await settleUi();
       await settleUi();
       expect(batches).toHaveLength(2);
@@ -1844,7 +1870,13 @@ describe('TermView Claude Bash projection', () => {
   });
 
   test('Haiku pending and resolved placeholders retain a full terminal-row height', async () => {
-    let resolveSummary: ((value: ClaudeBashSummaries) => void) | null = null;
+    // Assigned from inside a callback. A `| null` declaration narrows to
+    // `never` at the call below because TS cannot see the callback run, so
+    // start from a throwing default instead: it types cleanly and turns
+    // "never assigned" into a loud failure rather than a skipped `?.`.
+    let resolveSummary: (value: ClaudeBashSummaries) => void = () => {
+      throw new Error('TermView never requested the placeholder summary');
+    };
     const summary = new Promise<ClaudeBashSummaries>((resolve) => {
       resolveSummary = resolve;
     });
@@ -1864,7 +1896,7 @@ describe('TermView Claude Bash projection', () => {
     expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight);
     expect(placeholder?.style.height).toBe(`${lineHeight}px`);
 
-    resolveSummary?.({ [placeholder?.getAttribute('data-bash-id') ?? '']: 'สรุปแล้ว' });
+    resolveSummary({ [placeholder?.getAttribute('data-bash-id') ?? '']: 'สรุปแล้ว' });
     await settleUi();
     await settleUi();
     placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');

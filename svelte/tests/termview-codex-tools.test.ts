@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { proxy as reactiveProps } from 'svelte/internal/client';
+import type { ComponentProps } from 'svelte';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
 import TermView from '../src/TermView.svelte';
@@ -168,7 +169,7 @@ function mountView(
   target.style.cssText = `position:relative;width:320px;height:${height}px;`;
   document.body.appendChild(target);
 
-  const props = reactiveProps({
+  const props = reactiveProps<ComponentProps<typeof TermView>>({
     session: `codex-tools-${mode}-${mounted.length}`,
     palette,
     claimGeometry: false,
