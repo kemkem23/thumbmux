@@ -857,6 +857,8 @@ evidence for the published tiers, not a claim of 1.0 compatibility.
 - [x] Every path in `files` reachable through `exports`, proven by a rule not a case
 - [x] Ten framework-free modules no longer gated behind the `svelte` export condition
 - [x] Shipped `.svelte` sources pass strict `svelte-check`
+- [x] The Svelte **test** suite passes the same strict `svelte-check`
+      (`svelte/tsconfig.tests.json`; same options, wider file set)
 - [x] `TermHud.titleAdornment` — an inline slot on the session-name row that
       collapses rather than taking width from the name
 
