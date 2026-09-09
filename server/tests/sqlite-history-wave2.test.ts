@@ -32,6 +32,8 @@ test('opt-in bridge spools one capture and requires matching receipts from legac
     expect(f.store.rows(sid,0,40).map(row=>row.text)).toEqual(received[0].rows.map(row=>row.text));
     expect(bridge.ledger()).toEqual([{requestId:receipt.requestId,sessionId:sid,digest:receipt.digest,
       legacyCommitted:true,sqliteCommitted:true,sqliteRevision:1}]);
+    console.log('BRIDGE_PROOF',JSON.stringify({captures:1,legacyRows:received[0].rows.length,sqliteRows:f.store.rows(sid,0,40).length,
+      ledgerComplete:bridge.ledger().filter(item=>item.legacyCommitted&&item.sqliteCommitted).length}));
     await bridge.stopAndDrain();
   }finally{await f.cleanup();}
 });
@@ -88,6 +90,9 @@ test('closed-session importer resumes persisted checkpoint after restart and rer
     await expect(importClosedHistorySession(current,{...input,name:'wrong-name'})).rejects.toThrow('closed-import-identity-conflict');
     expect(progress.some(value=>value.cursor===500&&value.state==='copying')).toBe(true);
     expect(progress.some(value=>value.cursor===1100&&value.state==='verified')).toBe(true);
+    console.log('IMPORT_PROOF',JSON.stringify({restartCheckpoint:500,finalRecords:repeated.records,rows:current.rows(sid,0,1100).length,
+      manifestFiles:repeated.verification?.manifest.files,manifestBytes:repeated.verification?.manifest.bytes,
+      unresolved:repeated.verification?.unresolved.length,revisionStable:current.session(sid).revision===revision}));
   }finally{
     if(current!==f.store)await current.close();
     rmSync(f.dir,{recursive:true,force:true});
