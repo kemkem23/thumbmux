@@ -5,7 +5,6 @@
  * pixel anchoring, signposts, and alt-screen teardown to that model.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -161,7 +160,7 @@ function mountTermView(options: {
 
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: SESSION,

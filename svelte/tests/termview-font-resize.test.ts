@@ -5,7 +5,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import type { Component } from 'svelte';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 import TermView from '../src/TermView.svelte';
 import { tmuxMux } from '../src/ws-mux.svelte';
@@ -115,7 +114,7 @@ function mountTermView(overrides: Partial<TermViewProps> = {}): Mounted {
   }) as TermViewProps;
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, { target, props }) as Record<string, unknown>;
+    app = mount(TermView, { target, props }) as Record<string, unknown>;
   });
   const viewport = target.querySelector('[data-testid="mtv"]') as HTMLElement | null;
   if (!viewport) throw new Error('TermView root not found');

@@ -8,7 +8,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -145,7 +144,7 @@ function mountTermView(overrides: Partial<TermViewProps> = {}): Mounted {
 
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props,
     }) as Record<string, unknown>;

@@ -4,7 +4,6 @@
  * keeps one canonical raw coordinate space for rendering and interaction.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { Component } from 'svelte';
 import { proxy as reactiveProps } from 'svelte/internal/client';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
@@ -182,7 +181,7 @@ function mountView(
   });
   let app: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, { target, props }) as Record<string, unknown>;
+    app = mount(TermView, { target, props }) as Record<string, unknown>;
   });
 
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');

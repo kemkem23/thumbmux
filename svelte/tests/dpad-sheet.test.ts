@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import type { Component } from 'svelte';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 import DpadSheet from '../src/DpadSheet.svelte';
 import {
@@ -21,7 +20,7 @@ function mountPad(props: {
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(DpadSheet as Component, {
+    app = mount(DpadSheet, {
       target,
       props: {
         open: props.open ?? true,

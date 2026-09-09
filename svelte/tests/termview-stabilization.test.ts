@@ -7,7 +7,6 @@
  * (preload.ts) and stubs the mux singleton so no live WebSocket is needed.
  */
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -113,7 +112,7 @@ function mountTermView(): Mounted {
 
   let app: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: SESSION,

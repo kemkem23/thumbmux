@@ -5,7 +5,6 @@
  * does not replace TermView's canonical raw buffer or raw coordinate systems.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { Component } from 'svelte';
 import { proxy as reactiveProps } from 'svelte/internal/client';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
@@ -212,7 +211,7 @@ function mountView(
   });
   let app: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props,
     }) as Record<string, unknown>;

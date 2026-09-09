@@ -11,7 +11,6 @@
  *          prop off leaves event flow byte-identical to v0.10.1.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 import type { AnsiPalette } from "@thumbmux/core";
 
@@ -55,7 +54,7 @@ function mountDock(props: Record<string, unknown>): { api: DockApi; target: HTML
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(ComposerDock as Component, {
+    app = mount(ComposerDock, {
       target,
       props: {
         onSend: () => {},
@@ -103,7 +102,7 @@ function mountTerm(
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: "tm-gesture",

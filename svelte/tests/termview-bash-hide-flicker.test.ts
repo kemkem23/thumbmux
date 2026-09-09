@@ -15,7 +15,6 @@
  * only the live tail changes.
  */
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import type { Component } from 'svelte';
 import { proxy as reactiveProps } from 'svelte/internal/client';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
@@ -124,7 +123,7 @@ function mountView(mode: ClaudeBashMode, height = 400): HTMLElement {
   });
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, { target, props }) as Record<string, unknown>;
+    app = mount(TermView, { target, props }) as Record<string, unknown>;
   });
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
   if (!viewport) throw new Error('TermView viewport did not mount');
