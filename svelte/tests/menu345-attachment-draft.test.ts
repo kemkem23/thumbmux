@@ -6,7 +6,7 @@
  * object-URL lifecycle (remove / clear / prop re-seed / unmount), and they
  * re-assert that UploadAction's send-immediately default is untouched.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import AttachmentDraftPicker from "../src/AttachmentDraftPicker.svelte";
@@ -21,9 +21,12 @@ import {
   draftFilesOf,
   fileMatchesAccept,
   imageFilesFromClipboard,
+  loadAnnotationImage,
   releaseDraftItems,
   removeDraftItem,
   syncDraftItems,
+  type AnnotationImageHandlers,
+  type AnnotationImageLike,
   type ObjectUrlPorts,
 } from "../src/attachment-draft";
 
@@ -85,6 +88,22 @@ function recordingPorts(): ObjectUrlPorts & { created: string[]; revoked: string
       revokedHere.push(url);
     },
   };
+}
+
+/** Keep image completion under the test's control, including after cancellation. */
+function pendingImageLoad(handlers: AnnotationImageHandlers) {
+  const ports = recordingPorts();
+  const image: AnnotationImageLike = {
+    width: 0, height: 0, src: "", onload: null, onerror: null,
+  };
+  const load = loadAnnotationImage(imageFile("broken.png"), {
+    ...ports,
+    createImage: () => image,
+  }, handlers);
+  expect(ports.created).toHaveLength(1);
+  expect(image.src).toBe(ports.created[0]!);
+  expect(image.onerror).toBeFunction();
+  return { ports, image, load };
 }
 
 /** A fetch that must never be called; every call is recorded and fails loudly. */
@@ -161,7 +180,23 @@ function chooseFiles(input: HTMLInputElement, files: File[]): void {
   const fileList = input.files;
   if (!fileList) throw new Error("file input has no FileList");
   (fileList as unknown as File[]).push(...files);
-  input.dispatchEvent(new Event("change", { bubbles: true }));
+  dispatchInputEvent(input, "change");
+}
+
+/** happy-dom reports handler throws through window.error; fail the test too. */
+function dispatchInputEvent(input: HTMLInputElement, type: string): void {
+  const errors: unknown[] = [];
+  const recordError = (event: ErrorEvent): void => {
+    errors.push(event.error ?? new Error(event.message));
+    event.preventDefault();
+  };
+  window.addEventListener("error", recordError);
+  try {
+    input.dispatchEvent(new Event(type, { bubbles: true }));
+  } finally {
+    window.removeEventListener("error", recordError);
+  }
+  if (errors.length > 0) throw errors[0];
 }
 
 function pasteEvent(
@@ -215,6 +250,34 @@ afterEach(() => {
 });
 
 describe("attachment-draft helpers", () => {
+  test.each(["", "image/"])("a nameless file with empty subtype uses the png name fallback (type=%s)", (type) => {
+    const file = imageFile("", type);
+    const originalName = file.name;
+    expect(draftFileName(file, 3, 1700000000000)).toBe("pasted-1700000000000-3.png");
+    // This is a display-name fallback, not a conversion of the original File.
+    expect(file.type).toBe(type);
+    expect(file.name).toBe(originalName);
+  });
+
+  test("removing a missing id preserves list identity and every preview URL", () => {
+    const ports = recordingPorts();
+    const files = [imageFile("a.png"), imageFile("b.png")];
+    const items = createDraftItems(files, ports);
+    const result = removeDraftItem(items, "missing-id", ports);
+
+    expect(result).toBe(items);
+    expect(draftFilesOf(result)).toEqual(files);
+    expect(ports.created).toEqual(items.map((item) => item.url));
+    expect(ports.revoked).toEqual([]);
+  });
+
+  test.each([",", " \t ", " , , \n"])("accept containing only separators imposes no filter (%j)", (accept) => {
+    const files = [imageFile("a.png"), new File(["pdf"], "b.pdf", { type: "application/pdf" })];
+    expect(accept.length).toBeGreaterThan(0);
+    for (const file of files) expect(fileMatchesAccept(file, accept)).toBe(true);
+    expect(acceptableDraftFiles(files, { accept })).toEqual(files);
+  });
+
   test("names a clipboard file from its type and labels non-images by extension", () => {
     const pasted = new File([new Uint8Array([1])], "", { type: "image/webp" });
     expect(draftFileName(pasted, 2, 1_700_000_000_000)).toBe("pasted-1700000000000-2.webp");
@@ -290,7 +353,196 @@ describe("attachment-draft helpers", () => {
   });
 });
 
+describe("attachment-draft · image error lifecycle", () => {
+  test("cancelling a pending load twice is a no-op the second time", () => {
+    const onLoad = mock(() => {});
+    const onError = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad, onError });
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(onError).toHaveBeenCalledTimes(0);
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
+  });
+
+  test("an error after cancel calls neither handler and does not revoke twice", () => {
+    const onLoad = mock(() => {});
+    const onError = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad, onError });
+
+    load.cancel();
+    expect(ports.revoked).toEqual([image.src]);
+    // Invoke the installed handler: optional chaining could hide missing wiring.
+    image.onerror!();
+
+    expect(onError).toHaveBeenCalledTimes(0);
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(ports.revoked).toEqual([image.src]);
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
+  });
+
+  test("an error without an onError callback releases the URL and never reports a load", () => {
+    const onLoad = mock(() => {});
+    const { ports, image, load } = pendingImageLoad({ onLoad });
+
+    expect(ports.revoked).toEqual([]);
+    image.onerror!();
+    expect(onLoad).toHaveBeenCalledTimes(0);
+    expect(ports.revoked).toEqual([image.src]);
+
+    load.cancel();
+    load.release();
+    expect(ports.revoked).toEqual([image.src]);
+  });
+});
+
 describe("AttachmentDraftPicker", () => {
+  test("paste without clipboardData is declined without consuming the event", async () => {
+    const keep = imageFile("keep.png");
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({ files: [keep], onChange });
+    await tick();
+    const urlsBefore = thumbUrls(target);
+    const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, "clipboardData", { value: null });
+    expect(input.disabled).toBe(false);
+    expect(event.clipboardData).toBeNull();
+
+    // Mirror the host's preventDefault decision using the public return value.
+    const accepted = app.acceptPaste(event);
+    if (accepted) event.preventDefault();
+    expect(accepted).toBe(false);
+    expect(event.defaultPrevented).toBe(false);
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(app.currentFiles()).toEqual([keep]);
+    expect(thumbUrls(target)).toEqual(urlsBefore);
+    expect(created).toEqual(urlsBefore);
+    expect(revoked).toEqual([]);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test("clear on an empty draft is silent both initially and after clearing files", async () => {
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({ onChange });
+    await tick();
+    app.clear();
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(created).toEqual([]);
+    expect(revoked).toEqual([]);
+
+    const file = imageFile("a.png");
+    chooseFiles(input, [file]);
+    flushSync();
+    await tick();
+    expect(onChange.mock.calls).toEqual([[[file]]]);
+    expect(created).toHaveLength(1);
+    app.clear();
+    expect(onChange.mock.calls).toEqual([[[file]], [[]]]);
+    expect(revoked).toEqual(created);
+    app.clear();
+    flushSync();
+    await tick();
+
+    expect(onChange.mock.calls).toEqual([[[file]], [[]]]);
+    expect(app.currentFiles()).toEqual([]);
+    expect(itemNames(target)).toEqual([]);
+    expect(target.querySelector('[data-testid="attachment-draft-list"]')).toBeNull();
+    expect(revoked).toEqual(created);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test.each([false, true])("host open() calls the hidden input exactly when enabled (disabled=%s)", async (disabled) => {
+    const onChange = mock((_files: File[]) => {});
+    const { host, input } = mountHost({ disabled, onChange });
+    await tick();
+    expect(input.type).toBe("file");
+    expect(input.getAttribute("aria-hidden")).toBe("true");
+    expect(input.disabled).toBe(disabled);
+
+    // Spy on the method, not the click event: HTML's disabled guard must not
+    // hide a mistaken .click() call inside the component's instance API.
+    const click = spyOn(input, "click").mockImplementation(() => {});
+    try {
+      host.inner().open();
+      expect(click).toHaveBeenCalledTimes(disabled ? 0 : 1);
+      if (!disabled) {
+        expect(click.mock.calls).toEqual([[]]);
+        expect(click.mock.contexts).toEqual([input]);
+      }
+    } finally {
+      click.mockRestore();
+    }
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(created).toEqual([]);
+    expect(fetchCalls).toEqual([]);
+  });
+
+  test.each([false, true])("rejecting every selected file preserves the draft without onChange (seeded=%s)", async (seeded) => {
+    const keep = imageFile("keep.png");
+    const initial = seeded ? [keep] : [];
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({
+      files: initial, accept: "image/*", multiple: false, onChange,
+    });
+    await tick();
+    const urlsBefore = thumbUrls(target);
+    expect(input.disabled).toBe(false);
+    expect(input.accept).toBe("image/*");
+
+    chooseFiles(input, [new File(["rejected"], "no.pdf", { type: "application/pdf" })]);
+    flushSync();
+    await tick();
+
+    expect(input.value).toBe("");
+    expect(input.files).toHaveLength(0);
+    expect(app.currentFiles()).toEqual(initial);
+    expect(itemNames(target)).toEqual(initial.map((file) => file.name));
+    expect(thumbUrls(target)).toEqual(urlsBefore);
+    expect(created).toEqual(urlsBefore);
+    expect(revoked).toEqual([]);
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(fetchCalls).toEqual([]);
+
+    // The same enabled picker still accepts a valid next selection.
+    const accepted = imageFile("accepted.png");
+    chooseFiles(input, [accepted]);
+    flushSync();
+    await tick();
+    expect(onChange.mock.calls).toEqual([[[accepted]]]);
+    expect(app.currentFiles()).toEqual([accepted]);
+    expect(revoked).toEqual(urlsBefore);
+  });
+
+  test("an empty input change and a cancel event preserve the existing draft", async () => {
+    const keep = imageFile("keep.png");
+    const onChange = mock((_files: File[]) => {});
+    const { app, target, input } = mountPicker({ files: [keep], onChange });
+    await tick();
+    const urlsBefore = thumbUrls(target);
+    expect(input.disabled).toBe(false);
+    expect(input.files).toHaveLength(0);
+
+    // Exercise the empty-change handler, separately from the native cancel
+    // event (which has no listener). Neither represents a draft change.
+    chooseFiles(input, []);
+    dispatchInputEvent(input, "cancel");
+    flushSync();
+    await tick();
+
+    expect(input.value).toBe("");
+    expect(app.currentFiles()).toEqual([keep]);
+    expect(itemNames(target)).toEqual(["keep.png"]);
+    expect(thumbUrls(target)).toEqual(urlsBefore);
+    expect(created).toEqual(urlsBefore);
+    expect(revoked).toEqual([]);
+    expect(onChange).toHaveBeenCalledTimes(0);
+    expect(fetchCalls).toEqual([]);
+  });
+
   test("picking files sends nothing and reports plain File[]", async () => {
     const changes: File[][] = [];
     const { app, target, input } = mountPicker({ onChange: (files) => changes.push(files) });
