@@ -39,8 +39,8 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
     writeFileSync(join(root,'package.json'),'\n{"type":"module"}\n');
     const run=async(name:string,pattern?:string)=>{
       const args=[process.execPath,'test','./server/tests/sqlite-history-wave2.test.ts'];if(pattern)args.push('--test-name-pattern',pattern);
-      const process=Bun.spawn(args,{cwd:root,stdout:'pipe',stderr:'pipe'});
-      const [code,out,err]=await Promise.all([process.exited,new Response(process.stdout).text(),new Response(process.stderr).text()]);
+      const child=Bun.spawn(args,{cwd:root,stdout:'pipe',stderr:'pipe'});
+      const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
       const output=out+err;console.log('MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed:output.includes('(fail)')}));
       return {code,output};
     };
