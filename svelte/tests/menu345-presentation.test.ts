@@ -353,6 +353,47 @@ describe("ThemeSourceChoice (B03)", () => {
     expect(calls).toEqual([]);
   });
 
+  test("choose guards disabled even when the DOM click barrier is bypassed", () => {
+    const errors: string[] = [];
+    const captureError = (event: ErrorEvent) => {
+      errors.push(event.error instanceof Error ? event.error.message : event.message);
+      event.preventDefault();
+    };
+    window.addEventListener("error", captureError);
+    try {
+      for (const enabled of [false, true]) {
+        for (const disabled of [true, false]) {
+          const calls: boolean[] = [];
+          const { target } = mountComponent(ThemeSourceChoice, {
+            ...LABELS,
+            enabled,
+            disabled,
+            onChange: (next: boolean) => calls.push(next),
+          });
+          // Always choose the opposite side, so the same-value guard cannot
+          // mask a missing disabled guard. Only change the DOM property: the
+          // component's disabled prop remains true in the blocked cases.
+          const button = required<HTMLButtonElement>(target,
+            `[data-testid="agent-theme-${enabled ? "off" : "on"}"]`);
+          expect(button.disabled).toBe(disabled);
+          button.disabled = false;
+          flushSync(() => button.click());
+
+          // DOM dispatch can report handler throws as window errors instead
+          // of throwing to the test. Make those failures visible as well.
+          expect(errors).toEqual([]);
+          expect(calls).toEqual(disabled ? [] : [!enabled]);
+          expect(button.getAttribute("aria-pressed")).toBe("false");
+          expect(required<HTMLButtonElement>(target,
+            `[data-testid="agent-theme-${enabled ? "on" : "off"}"]`)
+            .getAttribute("aria-pressed")).toBe("true");
+        }
+      }
+    } finally {
+      window.removeEventListener("error", captureError);
+    }
+  });
+
   test("the hint is the host's text and disappears when absent", () => {
     const withHint = mountComponent(ThemeSourceChoice, {
       ...LABELS,
