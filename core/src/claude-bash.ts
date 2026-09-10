@@ -2,10 +2,12 @@
  * Claude Code Bash presentation model.
  *
  * Claude paints tool calls as physical terminal rows. A completed top-level
- * Bash call has a coloured `●`/`⏺` marker, a bold `Bash(` label, and a
- * `  ⎿ ` command/result delimiter. While the command is active Claude paints
- * the marker cell as a styled grey blank instead. This module recognises only
- * those high-confidence shapes and deliberately leaves ambiguous text alone.
+ * Bash call has a coloured `●`/`⏺` marker, a bold `Bash(` label, a `  ⎿ `
+ * result delimiter, and a following boundary. While the command is active
+ * Claude usually paints the marker cell as a styled grey blank; it may also
+ * keep the green `●` and put a live status (`Running…` / `starting…`) on the
+ * first `⎿` row. This module recognises only those high-confidence shapes
+ * and deliberately leaves ambiguous text alone.
  *
  * Detection never joins or mutates source rows. Projection keeps the complete
  * raw input beside visual-row metadata so a stateful ANSI renderer can parse
@@ -333,6 +335,19 @@ function isCalibratedCompletedHeader(raw: string): boolean {
 
 function isResultDelimiter(line: string): boolean {
   return /^ {2}⎿(?: {1,2}|$)/.test(line);
+}
+
+/**
+ * Claude's live Bash status on the first `⎿` row. Measured from pane
+ * captures (`Running…`, `Running… (10s)`) and the confirmed HIDE-mode
+ * symptom (`starting…`, `running...`). A completed background result
+ * (`Running in the background…`) has no ellipsis after Running and is
+ * not this shape.
+ */
+function isLiveRunningResult(line: string): boolean {
+  if (!isResultDelimiter(line)) return false;
+  const body = removeResultPrefix(line).replace(/\u00a0/g, ' ').trim();
+  return /^(?:running|starting)(?:\u2026|\.{3})(?:\s+\([^)]*\))?\s*$/i.test(body);
 }
 
 type BoundaryKind = 'top-level' | 'user-prompt' | 'composer-rule' | 'dialog' | 'approval';
@@ -1018,10 +1033,28 @@ function parseCandidate(
   if (hitLineLimit) return { block: null };
 
   let endLine = boundaryLine;
+  let liveRunningUnclosed = false;
   if (header.status === 'completed') {
     // Completed blocks need both structural halves and a strong following
-    // boundary. A capture cut at either edge remains untouched.
-    if (delimiterLine < 0 || endLine < 0) return { block: null };
+    // boundary. A capture cut at either edge remains untouched: collapsing it
+    // as completed would hide an unknown tail and send incomplete output to
+    // the summarizer. Do not delete this reject — the fail-open tests for
+    // `● Bash(printf cut)` / missing delimiter exist to keep it.
+    if (delimiterLine < 0 || endLine < 0) {
+      // Separate case: Claude may keep the green `●` marker while the
+      // command is still running. The first `⎿` row then carries a live
+      // status (`Running…` / `starting…`) and there is no completion
+      // boundary yet. That live tail is the same shape as a styled-active
+      // header — collapse it as active through the capture edge and never
+      // offer it to the summarizer. A completed call whose capture was cut
+      // (result text on `⎿`, no live status) still fails open above.
+      liveRunningUnclosed = delimiterLine >= 0
+        && endLine < 0
+        && ambiguousActivityStatusLine < 0
+        && isLiveRunningResult(visibleLine(rawLines[delimiterLine] ?? ''));
+      if (!liveRunningUnclosed) return { block: null };
+      endLine = rawLines.length;
+    }
   } else if (endLine < 0) {
     // Exact ANSI-styled active calls may safely collapse through the current
     // capture edge unless that edge contains an unconfirmed activity-shaped
@@ -1052,11 +1085,13 @@ function parseCandidate(
   // top-level boundary is stronger completion evidence than that stale colour.
   // Without both signals the exact styled call remains active and is never
   // offered to a summarizer.
-  const status: ClaudeBashBlockStatus = header.status === 'active'
-    && delimiterLine >= 0
-    && completionBoundary
-    ? 'completed'
-    : header.status;
+  const status: ClaudeBashBlockStatus = liveRunningUnclosed
+    ? 'active'
+    : header.status === 'active'
+      && delimiterLine >= 0
+      && completionBoundary
+      ? 'completed'
+      : header.status;
   const fingerprint = blockFingerprint(fullCommand, fullOutput, status);
   const lineCount = endLine - startLine;
 

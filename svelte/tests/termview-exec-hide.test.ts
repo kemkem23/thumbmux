@@ -199,7 +199,7 @@ describe('TermView active exec hide measurements (Lane E1)', () => {
     expect(placeholder?.getAttribute('data-bash-status')).toBe('active');
   });
 
-  test('Case B: unclosed bullet header (● Bash without boundary) does NOT collapse at all (remains raw rows)', async () => {
+  test('Case B: unclosed bullet header (● Bash with live ⎿ status, no boundary) collapses like an active call', async () => {
     const viewport = mountView('hide');
 
     const lines = [
@@ -209,29 +209,37 @@ describe('TermView active exec hide measurements (Lane E1)', () => {
       '\x1b[38;5;246m  ⎿  running...',
       ...Array.from({ length: 30 }, (_, i) => `     stream line ${i}`),
     ];
+    expect(lines).toHaveLength(34);
 
-    // Core layer measurement: completedHeader requires boundaryLine; when missing, parseCandidate returns null block
+    // Live ● + ⎿ running... at the capture tail is still running, not a
+    // truncated completed call. Collapse it as active; never summarize.
     const detection = detectClaudeBashBlocks(lines);
-    expect(detection.blocks).toHaveLength(0);
+    expect(detection.blocks).toHaveLength(1);
+    expect(detection.blocks[0]?.status).toBe('active');
 
     const projection = projectClaudeBashGroupedLines(lines, { mode: 'hide', detection });
     expect(projection.mode).toBe('hide');
-    expect(projection.rows).toHaveLength(34);
-    for (const row of projection.rows) {
-      expect(row.kind).toBe('raw');
-    }
+    expect(projection.rows).toHaveLength(2);
+    expect(projection.rows[1]?.kind).toBe('bash-placeholder');
+    expect(projection.rows[1]?.status).toBe('active');
 
-    // UI layer measurement: renders all 34 raw lines, no divider, no hidden placeholder
     deliver(lines);
     await settleUi();
 
     const linesEls = viewport.querySelectorAll('.mtv-line');
     const divider = viewport.querySelector<HTMLElement>('.mtv-bash-divider');
     const placeholder = viewport.querySelector<HTMLElement>('.mtv-bash-placeholder');
+    const lineHeight = Number.parseFloat(viewport.style.getPropertyValue('--mtv-lineh'));
 
-    expect(linesEls.length).toBe(34);
-    expect(divider).toBeNull();
-    expect(placeholder).toBeNull();
+    expect(linesEls.length).toBe(2);
+    expect(divider).not.toBeNull();
+    expect(viewport.querySelectorAll('.mtv-bash-divider')).toHaveLength(1);
+    expect(divider?.textContent).toContain('hidden bash');
+    expect(placeholder?.classList.contains('mtv-bash-hidden')).toBe(true);
+    expect(placeholder?.getAttribute('data-bash-status')).toBe('active');
+    expect(lineHeight).toBe(21);
+    expect(Number(placeholder?.getAttribute('data-presentation-height'))).toBe(lineHeight / 3);
+    expect(placeholder?.style.height).toBe(`${lineHeight / 3}px`);
   });
 
   test('Case C: every .mtv-bash-hidden row contains a non-null .mtv-bash-divider (no empty 1/3 height rows)', async () => {
