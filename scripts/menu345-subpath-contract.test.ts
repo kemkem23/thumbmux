@@ -16,10 +16,12 @@
  * subpath where it actually lives.
  *
  * What it checks, and against what:
- *   - the **installed artifact** (`node_modules/thumbmux`) of the host that
- *     depends on thumbmux — not `packages/thumbmux/git-dist`, not a path alias,
- *     not the source in this repo. A gate that reads the repo's own source
- *     cannot tell a released package from an unreleased edit;
+ *   - the **installed artifact** (`node_modules/thumbmux`) of **every** package
+ *     in the checkout that pins thumbmux — not the first ancestor, not
+ *     `packages/thumbmux/git-dist`, not a path alias, not the source in this
+ *     repo. A gate that reads the repo's own source cannot tell a released
+ *     package from an unreleased edit, and a gate that stops at the first host
+ *     cannot tell when a later host (today: `brain-ui`) is on another pin;
  *   - its `exports["./server/recall"]` condition map still points at files that
  *     exist, for both `types` and `import`;
  *   - every public name and normalized declaration signature recorded in
@@ -35,9 +37,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 import { normalizeDeclarationText } from "./contract-check";
 
@@ -79,6 +81,24 @@ export type ArtifactLocation = {
   declaredImport: string;
 };
 
+/** A package in the checkout that declares a `thumbmux` dependency. */
+export type ConsumerHost = {
+  root: string;
+  pin: string;
+  installed: boolean;
+};
+
+const SKIP_DIRECTORY_NAMES = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "git-dist",
+  ".svelte-kit",
+  "coverage",
+  ".turbo",
+  ".bun",
+]);
+
 /** True when this tree is the monorepo copy rather than a standalone checkout. */
 export function isMonorepoCheckout(packageRoot = PACKAGE_ROOT): boolean {
   return packageRoot.endsWith(`${sep}packages${sep}thumbmux`);
@@ -103,26 +123,132 @@ function dependencyPin(pkg: Record<string, unknown>): string | null {
 }
 
 /**
- * Walk up from `start` for the nearest package that both declares a `thumbmux`
- * dependency and has it installed. The walk stops after the first ancestor
- * holding a `.git` entry so it can never wander out of the checkout and grade
- * some unrelated tree's install.
+ * Checkout that owns this package. In the monorepo that is the tree containing
+ * `packages/thumbmux`, not a nested `.git` inside the vendored copy — walking
+ * up and stopping at the first `.git` is what made the gate grade one host.
  */
-export function findConsumerHost(start = PACKAGE_ROOT): { root: string; pin: string } | null {
-  let dir = start;
+export function findCheckoutRoot(packageRoot = PACKAGE_ROOT): string | null {
+  if (isMonorepoCheckout(packageRoot)) {
+    return resolve(packageRoot, "..", "..");
+  }
+  let dir = packageRoot;
   for (;;) {
-    const manifest = resolve(dir, "package.json");
-    if (existsSync(manifest)) {
-      const pin = dependencyPin(readJson(manifest));
-      if (pin !== null && existsSync(resolve(dir, "node_modules", "thumbmux", "package.json"))) {
-        return { root: dir, pin };
-      }
-    }
-    if (existsSync(resolve(dir, ".git"))) return null;
+    if (existsSync(resolve(dir, ".git"))) return dir;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+function collectPackageManifests(dir: string, into: string[]): void {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (SKIP_DIRECTORY_NAMES.has(entry.name)) continue;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (resolve(path) === PACKAGE_ROOT) continue;
+      collectPackageManifests(path, into);
+      continue;
+    }
+    if (entry.isFile() && entry.name === "package.json") into.push(path);
+  }
+}
+
+/**
+ * Every package in `checkoutRoot` that pins `thumbmux`, installed or not.
+ * Does not stop at the first hit. Skips `packages/thumbmux` itself (source +
+ * its smoke fixtures) and never walks `node_modules`.
+ */
+export function findConsumerHosts(checkoutRoot?: string): ConsumerHost[] {
+  const root = checkoutRoot ?? findCheckoutRoot();
+  if (!root) return [];
+  const manifests: string[] = [];
+  collectPackageManifests(root, manifests);
+  const hosts: ConsumerHost[] = [];
+  for (const manifest of manifests) {
+    const dir = dirname(manifest);
+    if (dir === PACKAGE_ROOT || dir.startsWith(`${PACKAGE_ROOT}${sep}`)) continue;
+    let pkg: Record<string, unknown>;
+    try {
+      pkg = readJson(manifest);
+    } catch {
+      continue;
+    }
+    if (pkg.name === "thumbmux") continue;
+    const pin = dependencyPin(pkg);
+    if (pin === null) continue;
+    hosts.push({
+      root: dir,
+      pin,
+      installed: existsSync(resolve(dir, "node_modules", "thumbmux", "package.json")),
+    });
+  }
+  hosts.sort((left, right) => left.root.localeCompare(right.root));
+  return hosts;
+}
+
+/** An installed host, used only to copy a real artifact into a temp tree. */
+export function findConsumerHost(start = PACKAGE_ROOT): ConsumerHost | null {
+  const found = start === PACKAGE_ROOT ? findConsumerHosts() : findConsumerHosts(start);
+  return found.find((entry) => entry.installed) ?? found[0] ?? null;
+}
+
+export function hostLabel(hostRoot: string, checkoutRoot: string): string {
+  const rel = relative(checkoutRoot, hostRoot);
+  return rel === "" ? "(repo root)" : rel.split(sep).join("/");
+}
+
+export function pinMismatchProblems(hosts: readonly ConsumerHost[], checkoutRoot: string): string[] {
+  const unique = new Set(hosts.map((entry) => entry.pin));
+  if (unique.size <= 1) return [];
+  const listing = hosts
+    .map((entry) => `${hostLabel(entry.root, checkoutRoot)}=${entry.pin}`)
+    .join(" ; ");
+  return [`${BREACH}: consumer hosts pin different thumbmux refs: ${listing}`];
+}
+
+export function missingInstallProblems(hosts: readonly ConsumerHost[], checkoutRoot: string): string[] {
+  return hosts
+    .filter((entry) => !entry.installed)
+    .map((entry) =>
+      `${MISSING}: ${hostLabel(entry.root, checkoutRoot)} pins thumbmux (${entry.pin}) but is not installed (no node_modules/thumbmux)`,
+    );
+}
+
+/**
+ * Grade every discovered host. Pin drift and a missing install are reported
+ * before any surface comparison so the two failure families never share wording.
+ */
+export async function gradeConsumerHosts(
+  hosts: readonly ConsumerHost[],
+  options: { checkoutRoot: string; snapshot?: SubpathSurface },
+): Promise<string[]> {
+  const { checkoutRoot } = options;
+  const snapshot = options.snapshot ?? readSnapshot();
+  const problems: string[] = [];
+  problems.push(...missingInstallProblems(hosts, checkoutRoot));
+  problems.push(...pinMismatchProblems(hosts, checkoutRoot));
+  for (const entry of hosts) {
+    if (!entry.installed) continue;
+    const label = hostLabel(entry.root, checkoutRoot);
+    try {
+      const artifact = resolveSubpathArtifact(entry.root, entry.pin);
+      const runtime = await readRuntimeExports(artifact.runtimePath);
+      const live = deriveSubpathSurface(artifact.typesPath, runtime);
+      for (const problem of compareSurface(snapshot, live)) {
+        problems.push(`${problem} — host ${label}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      problems.push(`${message} — host ${label}`);
+    }
+  }
+  return problems;
 }
 
 function conditionPath(
@@ -305,7 +431,9 @@ export function compareSurface(expected: SubpathSurface, actual: SubpathSurface)
   return problems;
 }
 
-const host = findConsumerHost();
+const checkoutRoot = findCheckoutRoot();
+const hosts = findConsumerHosts();
+const host = hosts.find((entry) => entry.installed) ?? null;
 
 describe("thumbmux/server/recall subpath surface", () => {
   test("the checked-in snapshot records a surface the existing barrel gate cannot see", () => {
@@ -327,20 +455,17 @@ describe("thumbmux/server/recall subpath surface", () => {
 
   test("a monorepo checkout has a consumer that installed the pinned artifact", () => {
     if (!isMonorepoCheckout()) return;
-    // Inside the monorepo the reference consumer is what makes the subpath a
-    // shipped promise. No install means nothing was actually verified, and a
-    // green run here would be a lie of omission.
-    expect(host).not.toBeNull();
+    // Inside the monorepo every package that pins thumbmux is a consumer of
+    // the subpath promise. Stopping at the first ancestor was a lie of
+    // omission: a later host could drift while this test stayed green.
+    expect(hosts.length).toBeGreaterThan(0);
+    expect(hosts.every((entry) => entry.installed)).toBe(true);
   });
 
-  test.skipIf(host === null)(
-    "the installed artifact still exports the recorded recall surface",
+  test.skipIf(hosts.length === 0 || checkoutRoot === null)(
+    "every consumer host that pins thumbmux still exports the recorded recall surface",
     async () => {
-      const found = host!;
-      const artifact = resolveSubpathArtifact(found.root, found.pin);
-      const runtime = await readRuntimeExports(artifact.runtimePath);
-      const live = deriveSubpathSurface(artifact.typesPath, runtime);
-      const problems = compareSurface(readSnapshot(), live);
+      const problems = await gradeConsumerHosts(hosts, { checkoutRoot: checkoutRoot! });
       expect(problems.join("\n")).toBe("");
     },
   );
@@ -484,4 +609,173 @@ describe("the subpath gate reports breaks and absences differently", () => {
       staged.cleanup();
     }
   });
+});
+
+/**
+ * The original finder walked ancestors and stopped at the first installed pin.
+ * These cases rebuild a tiny checkout with more than one host so that bug
+ * cannot come back without a red test — even if today's live tree happens to
+ * have only two, or tomorrow three.
+ */
+describe("the subpath gate grades every consumer host, not just the first", () => {
+  function writeInstalledArtifact(
+    hostRoot: string,
+    source: ArtifactLocation,
+    pin: string,
+    name: string,
+  ): void {
+    const target = resolve(hostRoot, "node_modules", "thumbmux");
+    const dist = resolve(target, "git-dist", "server");
+    mkdirSync(dist, { recursive: true });
+    mkdirSync(hostRoot, { recursive: true });
+    cpSync(source.typesPath, resolve(dist, "recall-handler.d.ts"));
+    cpSync(source.runtimePath, resolve(dist, "recall-handler.js"));
+    writeFileSync(
+      resolve(target, "package.json"),
+      JSON.stringify({
+        name: "thumbmux",
+        version: source.version,
+        type: "module",
+        exports: {
+          [SUBPATH]: {
+            types: "./git-dist/server/recall-handler.d.ts",
+            import: "./git-dist/server/recall-handler.js",
+          },
+        },
+      }, null, 2),
+    );
+    writeFileSync(
+      resolve(hostRoot, "package.json"),
+      JSON.stringify({ name, dependencies: { thumbmux: pin } }, null, 2),
+    );
+  }
+
+  function stageCheckout(): { checkout: string; source: ArtifactLocation; cleanup: () => void } {
+    const found = host;
+    if (!found) throw new Error("no consumer host to stage from");
+    const source = resolveSubpathArtifact(found.root, found.pin);
+    const checkout = mkdtempSync(join(tmpdir(), "thumbmux-menu345-hosts-"));
+    return { checkout, source, cleanup: () => rmSync(checkout, { recursive: true, force: true }) };
+  }
+
+  test.skipIf(host === null)("discovery does not stop at the first pinning package.json", () => {
+    const staged = stageCheckout();
+    try {
+      const pin = "github:example/thumbmux#aaa";
+      writeInstalledArtifact(staged.checkout, staged.source, pin, "synthetic-root");
+      writeInstalledArtifact(resolve(staged.checkout, "host-b"), staged.source, pin, "host-b");
+      writeInstalledArtifact(resolve(staged.checkout, "host-c"), staged.source, pin, "host-c");
+      rmSync(resolve(staged.checkout, "host-c", "node_modules"), { recursive: true, force: true });
+      const found = findConsumerHosts(staged.checkout);
+      expect(found.map((entry) => hostLabel(entry.root, staged.checkout))).toEqual([
+        "(repo root)",
+        "host-b",
+        "host-c",
+      ]);
+      expect(found.find((entry) => entry.root === staged.checkout)?.installed).toBe(true);
+      expect(found.find((entry) => entry.root.endsWith(`${sep}host-b`))?.installed).toBe(true);
+      expect(found.find((entry) => entry.root.endsWith(`${sep}host-c`))?.installed).toBe(false);
+    } finally {
+      staged.cleanup();
+    }
+  });
+
+  test.skipIf(host === null)(
+    "a signature change on a later host fails as ผิดสัญญา and names that host",
+    async () => {
+      const staged = stageCheckout();
+      try {
+        const pin = "github:example/thumbmux#same";
+        writeInstalledArtifact(staged.checkout, staged.source, pin, "synthetic-root");
+        writeInstalledArtifact(resolve(staged.checkout, "later-host"), staged.source, pin, "later-host");
+        const types = resolve(
+          staged.checkout,
+          "later-host",
+          "node_modules",
+          "thumbmux",
+          "git-dist",
+          "server",
+          "recall-handler.d.ts",
+        );
+        const before = readFileSync(types, "utf8");
+        const mutated = before.replace(
+          "readNote(session: string, expectedLifecycleId?: string)",
+          "readNote(session: string, expectedLifecycleId: string)",
+        );
+        expect(mutated).not.toBe(before);
+        writeFileSync(types, mutated);
+
+        const found = findConsumerHosts(staged.checkout);
+        expect(found).toHaveLength(2);
+        const problems = await gradeConsumerHosts(found, { checkoutRoot: staged.checkout });
+        const text = problems.join("\n");
+        expect(text).toContain("changed public signature");
+        expect(text).toContain("host later-host");
+        expect(text).not.toContain("host (repo root)");
+        expect(text).toContain("ผิดสัญญา");
+        expect(text).not.toContain(MISSING);
+      } finally {
+        staged.cleanup();
+      }
+    },
+  );
+
+  test.skipIf(host === null)(
+    "hosts that pin different refs fail as ผิดสัญญา naming every pin",
+    async () => {
+      const staged = stageCheckout();
+      try {
+        writeInstalledArtifact(
+          staged.checkout,
+          staged.source,
+          "github:example/thumbmux#v-aaa",
+          "synthetic-root",
+        );
+        writeInstalledArtifact(
+          resolve(staged.checkout, "other"),
+          staged.source,
+          "github:example/thumbmux#v-bbb",
+          "other",
+        );
+        const found = findConsumerHosts(staged.checkout);
+        const problems = await gradeConsumerHosts(found, { checkoutRoot: staged.checkout });
+        const text = problems.join("\n");
+        expect(text).toContain("consumer hosts pin different thumbmux refs");
+        expect(text).toContain("(repo root)=github:example/thumbmux#v-aaa");
+        expect(text).toContain("other=github:example/thumbmux#v-bbb");
+        expect(text).toContain("ผิดสัญญา");
+        expect(text).not.toContain("not installed");
+      } finally {
+        staged.cleanup();
+      }
+    },
+  );
+
+  test.skipIf(host === null)(
+    "a host that pins thumbmux but has no install says ARTIFACT MISSING, not ผิดสัญญา",
+    async () => {
+      const staged = stageCheckout();
+      try {
+        const pin = "github:example/thumbmux#same";
+        writeInstalledArtifact(staged.checkout, staged.source, pin, "synthetic-root");
+        const other = resolve(staged.checkout, "uninstalled-host");
+        mkdirSync(other, { recursive: true });
+        writeFileSync(
+          resolve(other, "package.json"),
+          JSON.stringify({ name: "uninstalled-host", dependencies: { thumbmux: pin } }, null, 2),
+        );
+        const found = findConsumerHosts(staged.checkout);
+        expect(found.some((entry) => !entry.installed)).toBe(true);
+        const problems = await gradeConsumerHosts(found, { checkoutRoot: staged.checkout });
+        const text = problems.join("\n");
+        expect(text).toContain(MISSING);
+        expect(text).toContain("uninstalled-host");
+        expect(text).toContain("not installed");
+        expect(text).not.toContain("changed public signature");
+        expect(text).not.toContain("pin different thumbmux refs");
+      } finally {
+        staged.cleanup();
+      }
+    },
+  );
 });
