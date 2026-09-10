@@ -229,9 +229,11 @@
     >&times;</button>
   </div>
 
-  {#if hasImage}
+  {#if image}
     <div class="annotator-selected" data-testid="image-annotator-selected">
-      <span class="annotator-selected-meta">{imageWidth}&times;{imageHeight}</span>
+      {#if hasImage}
+        <span class="annotator-selected-meta">{imageWidth}&times;{imageHeight}</span>
+      {/if}
       <button
         type="button"
         class="annotator-btn"
@@ -241,6 +243,9 @@
         data-testid="image-annotator-remove"
       >&times;</button>
     </div>
+  {/if}
+
+  {#if hasImage}
     <div class="annotator-canvas-wrap">
       <canvas
         bind:this={canvasEl}
