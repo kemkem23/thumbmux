@@ -792,7 +792,7 @@ describe("ImageAnnotator", () => {
 
   test.each(["resolve", "reject"] as const)(
     "editing stays locked through PNG export and upload, then %s settles it",
-    async (outcome) => {
+    async (outcome: "resolve" | "reject") => {
       let resolveUpload!: () => void;
       let rejectUpload!: (reason: Error) => void;
       const upload = new Promise<void>((resolve, reject) => {
@@ -1036,7 +1036,7 @@ describe("ImageAnnotator", () => {
     ["network unavailable", "network unavailable"],
     [undefined, "Unable to upload that image."],
     [null, "Unable to upload that image."],
-  ])("a non-Error rejection (%s) explains the failure and unlocks the draft", async (cause, message) => {
+  ])("a non-Error rejection (%s) explains the failure and unlocks the draft", async (cause: unknown, message: string) => {
     let closes = 0;
     const { app, target } = mountAnnotator({
       image: pngBlob(), comment: "ยังแก้ต่อได้",
