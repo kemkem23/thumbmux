@@ -6,9 +6,9 @@ export { sealHistorySnapshot } from './sqlite-history/transfer';
 export { assertMigrationReady, readSealedHistoryOracle } from './sqlite-history/rehearsal';
 export type { ReaderVerification, ReaderEmptyReason, ReaderUnverifiableReason, ReaderPageResult, ReaderSnapshotResult } from './sqlite-history/reader';
 export type { AuthoritativeMirrorStage, AuthoritativeMirrorStatus, AuthoritativeRollbackReceipt, HistoryAuthoritativeBridgeOptions } from './sqlite-history/authoritative';
-// Wave 6 first half: expansion tooling, still opt-in and unwired to production.
-export { runRestoreDrill } from './sqlite-history/rollout';
-export type { BackupAuditEntry, BackupAuditReport, GroupReadinessEvidence, LegacyArtifactDigest, LegacyRetirementReceipt, RestoreDrillReceipt, RolloutGroupState, RolloutRoute } from './sqlite-history/rollout';
+// Wave 6: expansion tooling + write-path router, still opt-in and unwired to production.
+export { expandGroup, runRestoreDrill } from './sqlite-history/rollout';
+export type { BackupAuditEntry, BackupAuditReport, ExpansionReceipt, GroupReadinessEvidence, HistoryWriter, LegacyArtifactDigest, LegacyRetirementReceipt, RestoreDrillReceipt, RolloutGroupState, RolloutRoute } from './sqlite-history/rollout';
 
 export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
   const [{Database},{HistoryStore,prepareFile},{HistoryCoordinator},{OptInHistoryBridge},transfer,rehearsal,reader,authoritative,rollout]=await Promise.all([
@@ -27,9 +27,11 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     createReaderCanary:()=>new reader.HistoryReaderCanary(store),
     // Wave 5 authoritative writer. Opt-in; no production session is wired to it.
     createAuthoritativeBridge:(o:import('./sqlite-history/authoritative').HistoryAuthoritativeBridgeOptions)=>new authoritative.AuthoritativeHistoryBridge(store,o),
-    // Wave 6 first half. Opt-in expansion tooling; no group is enabled anywhere.
+    // Wave 6. Opt-in expansion tooling and write-path router; no production group is enabled here.
     createRolloutAllowlist:(o:{directory:string;declaredGroups:readonly string[];mirrorDirectory:string})=>new rollout.HistoryRolloutAllowlist(store,o),
+    createRolloutRouter:(o:{allowlist:InstanceType<typeof rollout.HistoryRolloutAllowlist>;sqlite:rollout.HistoryWriter;legacy:rollout.HistoryWriter})=>new rollout.HistoryRolloutRouter(store,o.allowlist,{sqlite:o.sqlite,legacy:o.legacy}),
     assessGroupReadiness:(group:string,mirrorDirectory:string)=>rollout.assessGroupReadiness(store,group,mirrorDirectory),
+    expandGroup:(allowlist:InstanceType<typeof rollout.HistoryRolloutAllowlist>,group:string,o:{mirrorDirectory:string;scratchDirectory:string})=>rollout.expandGroup(store,allowlist,group,o),
     auditBackupCoverage:(mirrorDirectory:string)=>rollout.auditBackupCoverage(store,mirrorDirectory),
     restoreDrill:(bundleDirectory:string,scratchDirectory:string)=>rollout.runRestoreDrill(bundleDirectory,scratchDirectory),
     readerRequest:(canary:InstanceType<typeof reader.HistoryReaderCanary>,request:Request)=>reader.historyReaderRequest(canary,request),
