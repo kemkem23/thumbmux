@@ -37,11 +37,12 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 import { normalizeDeclarationText } from "./contract-check";
+import { RELEASE_PACKAGE_EXPORTS, prepareReleasePackage } from "./prepare-release-package";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
 const SNAPSHOT_PATH = resolve(PACKAGE_ROOT, "contract", "menu345-recall-surface.json");
@@ -778,4 +779,106 @@ describe("the subpath gate grades every consumer host, not just the first", () =
       }
     },
   );
+});
+
+/**
+ * sqlite-history is the same shape as recall: a subpath kept off the server
+ * barrel because it loads bun:sqlite. Unlike recall it is not yet in the
+ * pinned v0.20.1-dist artifact, so this gate reads RELEASE_PACKAGE_EXPORTS
+ * (what the next -dist tag will ship) rather than node_modules/thumbmux.
+ * Deleting the key must fail as a named contract break, not as SyntaxError.
+ */
+const SQLITE_SUBPATH = "./server/sqlite-history";
+const SQLITE_SPECIFIER = "thumbmux/server/sqlite-history";
+
+describe("thumbmux/server/sqlite-history release subpath", () => {
+  test("RELEASE_PACKAGE_EXPORTS names ./server/sqlite-history so a consumer import resolves", () => {
+    const keys = Object.keys(RELEASE_PACKAGE_EXPORTS);
+    if (!keys.includes(SQLITE_SUBPATH)) {
+      throw new Error(
+        `${BREACH}: release package no longer exports ${SQLITE_SUBPATH}`
+        + ` (a consumer's \`import ... from "${SQLITE_SPECIFIER}"\` stops resolving)`,
+      );
+    }
+    const entry = (RELEASE_PACKAGE_EXPORTS as Record<string, { types?: string; import?: string }>)[SQLITE_SUBPATH];
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`${BREACH}: ${SQLITE_SUBPATH} must map to a condition object`);
+    }
+    if (entry.types !== "./git-dist/server/sqlite-history.d.ts") {
+      throw new Error(
+        `${BREACH}: ${SQLITE_SUBPATH} "types" no longer points at git-dist/server/sqlite-history.d.ts`,
+      );
+    }
+    if (entry.import !== "./git-dist/server/sqlite-history.js") {
+      throw new Error(
+        `${BREACH}: ${SQLITE_SUBPATH} "import" no longer points at git-dist/server/sqlite-history.js`,
+      );
+    }
+  });
+
+  test("the mapped git-dist sqlite-history files exist", () => {
+    const typesPath = resolve(PACKAGE_ROOT, "git-dist", "server", "sqlite-history.d.ts");
+    const runtimePath = resolve(PACKAGE_ROOT, "git-dist", "server", "sqlite-history.js");
+    if (!existsSync(typesPath)) {
+      throw new Error(`${MISSING}: ${SQLITE_SUBPATH} "types" file is absent from git-dist: ${typesPath}`);
+    }
+    if (!existsSync(runtimePath)) {
+      throw new Error(`${MISSING}: ${SQLITE_SUBPATH} "import" file is absent from git-dist: ${runtimePath}`);
+    }
+    const types = readFileSync(typesPath, "utf8");
+    const runtime = readFileSync(runtimePath, "utf8");
+    expect(types).toContain("createSqliteHistoryStore");
+    expect(runtime).toMatch(/["']bun:sqlite["']/);
+  });
+
+  test("a materialized release install resolves thumbmux/server/sqlite-history", () => {
+    const root = mkdtempSync(join(tmpdir(), "thumbmux-sqlite-history-export-"));
+    try {
+      writeFileSync(
+        resolve(root, "package.json"),
+        `${JSON.stringify({ name: "sqlite-history-export-host", type: "module" }, null, 2)}\n`,
+      );
+      const pkg = resolve(root, "node_modules", "thumbmux");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(
+        resolve(pkg, "package.json"),
+        `${JSON.stringify({ name: "thumbmux", version: "0.20.1", type: "module" }, null, 2)}\n`,
+      );
+      prepareReleasePackage(pkg);
+      const gitDistSrc = resolve(PACKAGE_ROOT, "git-dist");
+      const gitDistDst = resolve(pkg, "git-dist");
+      try {
+        symlinkSync(gitDistSrc, gitDistDst, "dir");
+      } catch {
+        cpSync(gitDistSrc, gitDistDst, { recursive: true });
+      }
+      mkdirSync(resolve(pkg, "contract", "manifest"), { recursive: true });
+      writeFileSync(resolve(pkg, "CONTRACT.md"), "# contract\n");
+      mkdirSync(resolve(pkg, "docs"), { recursive: true });
+      writeFileSync(resolve(pkg, "docs", "readme.md"), "# docs\n");
+
+      const prepared = JSON.parse(readFileSync(resolve(pkg, "package.json"), "utf8")) as {
+        exports?: Record<string, unknown>;
+      };
+      if (prepared.exports?.[SQLITE_SUBPATH] === undefined) {
+        throw new Error(
+          `${BREACH}: release package no longer exports ${SQLITE_SUBPATH}`
+          + ` (a consumer's \`import ... from "${SQLITE_SPECIFIER}"\` stops resolving)`,
+        );
+      }
+
+      let resolved = "";
+      try {
+        resolved = Bun.resolveSync(SQLITE_SPECIFIER, root);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `${BREACH}: ${SQLITE_SPECIFIER} did not resolve from a prepared release install: ${message}`,
+        );
+      }
+      expect(resolved).toContain("sqlite-history.js");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
