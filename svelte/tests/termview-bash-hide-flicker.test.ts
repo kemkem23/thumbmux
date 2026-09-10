@@ -168,6 +168,17 @@ const activityStatus = (glyph: string, detail: string) =>
   `\x1b[38;5;174m${glyph}\x1b[39m \x1b[38;5;174mThinking…\x1b[39m `
   + `\x1b[38;5;246m(${detail})\x1b[39m`;
 
+/** Live Claude paints a traveling 216 highlight through the animated verb. */
+const sparkleActivityStatus = (glyph: string, detail: string, sparkleAt: number) => {
+  const verb = 'Newspapering';
+  const start = Math.max(0, Math.min(sparkleAt, verb.length - 3));
+  const before = verb.slice(0, start);
+  const sparkle = verb.slice(start, start + 3);
+  const after = verb.slice(start + 3);
+  return `\x1b[38;5;174m${glyph}\x1b[39m \x1b[38;5;174m${before}\x1b[38;5;216m${sparkle}`
+    + `\x1b[38;5;174m${after}… \x1b[38;5;246m(${detail})\x1b[39m`;
+};
+
 /**
  * A live Claude pane: prose, two completed Bash groups, streamed tool output,
  * the activity status row, and pinned composer chrome. Extra output rows are
@@ -255,4 +266,31 @@ test('a shrinking live tail keeps the proof that authorizes Bash HIDE', async ()
   deliver(livePane(activityStatus(SPINNER[2]!, '12s · ↓ 1.2k tokens'), 1));
   await settleUi();
   expect(geometry(viewport).compactRows).toBe(2);
+});
+
+test('verb sparkle 216 does not toggle Bash HIDE geometry frame to frame', async () => {
+  const viewport = mountView('hide');
+
+  deliver(livePane(activityStatus(SPINNER[0]!, '17m 38s · ↓ 46.7k tokens'), 0));
+  await settleUi();
+  deliver(livePane(activityStatus(SPINNER[1]!, '17m 39s · ↓ 46.7k tokens'), 0));
+  await settleUi();
+  expect(geometry(viewport).compactRows).toBe(2);
+
+  const observed: Geometry[] = [];
+  for (let frame = 0; frame < 8; frame += 1) {
+    const detail = `17m ${40 + frame}s · ↓ 46.${7 + (frame % 3)}k tokens`;
+    const status = frame % 2 === 0
+      ? sparkleActivityStatus(SPINNER[frame % SPINNER.length]!, detail, (frame * 2) % 10)
+      : activityStatus(SPINNER[frame % SPINNER.length]!, detail);
+    deliver(livePane(status, 0));
+    await settleUi();
+    observed.push(geometry(viewport));
+  }
+
+  expect(observed.map((entry) => entry.compactRows)).toEqual(observed.map(() => 2));
+  const heights = observed.map((entry) => entry.height);
+  for (let index = 1; index < heights.length; index += 1) {
+    expect(heights[index]).toBe(heights[0]!);
+  }
 });

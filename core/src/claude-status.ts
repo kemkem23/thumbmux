@@ -247,12 +247,19 @@ export function terminalPaintSnapshot(
   };
 }
 
+const CLAUDE_ACTIVITY_MARKER_FG = 174;
+const CLAUDE_ACTIVITY_VERB_FG = 174;
+/** Traveling highlight current Claude paints across a substring of the verb. */
+const CLAUDE_ACTIVITY_VERB_SPARKLE_FG = 216;
+const CLAUDE_ACTIVITY_METADATA_FG = 246;
+
 /**
  * Require one measured Claude paint layout on semantic cells. Current Claude
- * uses marker/animated verb 174 plus activity metadata 246. Older captures use
- * a 246 marker followed by default-colour verb/metadata. tmux may split/reset
- * SGR spans at any cell boundary, so validation follows resulting foreground
- * state instead of matching one byte-for-byte escape layout.
+ * uses marker 174, animated verb 174 with an optional 216 sparkle, and
+ * activity metadata 246. Older captures use a 246 marker followed by
+ * default-colour verb/metadata. tmux may split/reset SGR spans at any cell
+ * boundary, so validation follows resulting foreground state instead of
+ * matching one byte-for-byte escape layout.
  */
 export function isStyledClaudeActivityStatusLine(
   raw: string,
@@ -281,18 +288,26 @@ export function isStyledClaudeActivityStatusLine(
   const metadataEnd = normalized.lastIndexOf(')');
   if (verbStart < 0 || metadataStart < 0 || metadataEnd <= metadataStart) return false;
 
-  const paintedAs = (start: number, end: number, expected: number | null): boolean => {
+  const paintedAs = (
+    start: number,
+    end: number,
+    allowed: readonly (number | null)[],
+  ): boolean => {
     for (let unit = start; unit < end; unit += 1) {
       if (/\s/u.test(normalized[unit] ?? '')) continue;
-      if (paint.foregrounds[unit] !== expected) return false;
+      const foreground = paint.foregrounds[unit] ?? null;
+      if (!allowed.includes(foreground)) return false;
     }
     return true;
   };
-  const currentPaint = paintedAs(0, marker.length, 174)
-    && paintedAs(verbStart, verbStart + verb.length, 174)
-    && paintedAs(metadataStart, metadataEnd + 1, 246);
-  const legacyPaint = paintedAs(0, marker.length, 246)
-    && paintedAs(verbStart, verbStart + verb.length, null)
-    && paintedAs(metadataStart, metadataEnd + 1, null);
+  const currentPaint = paintedAs(0, marker.length, [CLAUDE_ACTIVITY_MARKER_FG])
+    && paintedAs(verbStart, verbStart + verb.length, [
+      CLAUDE_ACTIVITY_VERB_FG,
+      CLAUDE_ACTIVITY_VERB_SPARKLE_FG,
+    ])
+    && paintedAs(metadataStart, metadataEnd + 1, [CLAUDE_ACTIVITY_METADATA_FG]);
+  const legacyPaint = paintedAs(0, marker.length, [246])
+    && paintedAs(verbStart, verbStart + verb.length, [null])
+    && paintedAs(metadataStart, metadataEnd + 1, [null]);
   return currentPaint || legacyPaint;
 }

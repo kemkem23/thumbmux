@@ -31,16 +31,19 @@ test('wave3 shadow detectors kill every injected fault and clean tree passes bef
       const args=[process.execPath,'test','./server/tests/sqlite-history-wave3.test.ts'];if(pattern)args.push('--test-name-pattern',pattern);
       const child=Bun.spawn(args,{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
-      const output=out+err;console.log('WAVE3_MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed:output.includes('(fail)')}));
-      if(code!==0&&!output.includes('(fail)'))console.log('WAVE3_MUTANT_INVALID_OUTPUT',output);
-      return {code,output};
+      const output=out+err;
+      // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
+      const failed=/\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      console.log('WAVE3_MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed}));
+      if(code!==0&&!failed)console.log('WAVE3_MUTANT_INVALID_OUTPUT',output);
+      return {code,output,failed};
     };
     expect((await run('clean-before')).code).toBe(0);
     for(const mutant of mutants){
       const path=join(root,'server/src/sqlite-history',mutant.file),original=readFileSync(path,'utf8');
       expect(original.includes(mutant.from)).toBe(true);writeFileSync(path,original.replace(mutant.from,mutant.to));
       const result=await run(mutant.name,mutant.pattern);writeFileSync(path,original);
-      expect(result.code).not.toBe(0);expect(result.output).toContain('(fail)');
+      expect(result.code).not.toBe(0);expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
     expect((await run('clean-after')).code).toBe(0);

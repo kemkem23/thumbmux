@@ -1,7 +1,7 @@
 /**
- * Wave 6, first half: the fixture-provable expansion tooling.
+ * Wave 6: fixture-provable expansion tooling, plus the write-path door.
  *
- * Four opt-in pieces, none wired to any production session:
+ * First half: four opt-in pieces, none wired to any production session:
  *
  *  1. A per-group rollout allowlist. Groups are declared up front; a group not
  *     on the declared roster always routes to the legacy path. Enabling a group
@@ -22,6 +22,18 @@
  *     at retirement makes any later overwrite of the recorded legacy artifacts
  *     a loud fault. Exporter, rollback bundles and sealed originals stay
  *     untouched — retirement records digests, it never deletes.
+ *
+ * Second half: the door every capture has to walk, still opt-in, still not
+ * imported by the shipping server:
+ *
+ *  5. `HistoryRolloutRouter` sends each capture through `guardSession`, which
+ *     is `routeSession` plus a live re-read of that session's mirror. A group
+ *     verdict is not enough: a late joiner stays on the legacy writer, and a
+ *     mirror that vanishes after enable drops the group back to legacy with a
+ *     loud fault instead of keeping the snapshot taken at enable time.
+ *  6. `expandGroup` is one expansion batch: assess, enable, then restore-drill
+ *     every enrolled session. A failed drill disables the group. Nothing is
+ *     deleted. Production groups are not enabled here.
  */
 import {
   chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
@@ -31,10 +43,10 @@ import { basename, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { rowsDigest, safe, sha } from './codec';
 import { readMirror } from './authoritative';
-import { readSeal, restoreHistoryBundle } from './transfer';
+import { exportHistoryBundle, readSeal, restoreHistoryBundle } from './transfer';
 import { readSealedHistoryOracle } from './rehearsal';
 import type { HistoryStore } from './store';
-import type { Continuity, HistoryRow, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter } from './types';
+import type { CaptureBatch, CaptureReceipt, Continuity, HistoryRow, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter } from './types';
 
 export interface GroupReadinessEvidence {
   group: string;
@@ -73,6 +85,13 @@ export interface BackupAuditReport {
   startedAt: number; completedAt: number;
   sessions: BackupAuditEntry[];
   totals: { preserved: number; unknown: number; failed: number };
+}
+export interface HistoryWriter {
+  commitBatch(batch: CaptureBatch): Promise<CaptureReceipt>;
+}
+export interface ExpansionReceipt {
+  group: string; state: RolloutGroupState; drills: RestoreDrillReceipt[];
+  startedAt: number; completedAt: number;
 }
 
 function syncDirectory(path: string): void {
@@ -177,6 +196,29 @@ export class HistoryRolloutAllowlist {
     if (this.route(group) !== 'sqlite-authoritative') return 'legacy';
     const enrolled = this.states.get(group)?.evidence?.expectedSessions ?? [];
     return enrolled.includes(sessionId) ? 'sqlite-authoritative' : 'legacy';
+  }
+  /** Live routing decision for a write. Enrolment is not enough: the mirror is
+   * re-read from disk now. A missing or unreadable mirror is not a lagging
+   * watermark — the group is disabled and the capture stays on the legacy path
+   * so a vanished backup cannot keep serving as the authoritative writer. */
+  guardSession(sessionId: string): RolloutRoute {
+    if (this.routeSession(sessionId) !== 'sqlite-authoritative') return 'legacy';
+    const group = this.store.session(sessionId).group_label;
+    const sessionMirror = join(this.mirrorDirectory, sha(sessionId));
+    if (!existsSync(sessionMirror)) {
+      this.loseMirror(group, sessionId, 'mirror-missing', { directory: sessionMirror });
+      return 'legacy';
+    }
+    try { readMirror(this.mirrorDirectory, sessionId); }
+    catch (error) {
+      this.loseMirror(group, sessionId, 'mirror-unreadable', { error: String(error) });
+      return 'legacy';
+    }
+    return 'sqlite-authoritative';
+  }
+  private loseMirror(group: string, sessionId: string, reason: string, observed: unknown): void {
+    this.store.persistFault(sessionId, 'rollout-mirror-lost', reason, { group, observed });
+    this.disableGroup(group);
   }
   private refuse(group: string, reason: string, observed: unknown): never {
     this.store.persistFault('', 'rollout-refused', reason, { group, observed });
@@ -385,4 +427,47 @@ export function auditBackupCoverage(store: HistoryStore, mirrorDirectory: string
   const totals = { preserved: 0, unknown: 0, failed: 0 };
   for (const entry of entries) totals[entry.coverage]++;
   return { startedAt, completedAt: Date.now(), sessions: entries, totals };
+}
+
+/** One capture door. Every write asks `guardSession`, never the group-level
+ * `route`. Late joiners and a mirror that dies after enable stay on legacy. */
+export class HistoryRolloutRouter {
+  constructor(
+    private store: HistoryStore,
+    private allowlist: HistoryRolloutAllowlist,
+    private writers: { sqlite: HistoryWriter; legacy: HistoryWriter },
+  ) {}
+  async commitBatch(batch: CaptureBatch): Promise<CaptureReceipt> {
+    this.store.session(batch.ticket.sessionId);
+    const route = this.allowlist.guardSession(batch.ticket.sessionId);
+    if (route === 'sqlite-authoritative') return this.writers.sqlite.commitBatch(batch);
+    return this.writers.legacy.commitBatch(batch);
+  }
+}
+
+/** One expansion batch. Assess, enable, then restore-drill every enrolled
+ * session against independent oracles. A failed drill disables the group;
+ * nothing is deleted. */
+export async function expandGroup(
+  store: HistoryStore,
+  allowlist: HistoryRolloutAllowlist,
+  group: string,
+  options: { mirrorDirectory: string; scratchDirectory: string },
+): Promise<ExpansionReceipt> {
+  const startedAt = Date.now();
+  const evidence = await assessGroupReadiness(store, group, options.mirrorDirectory);
+  const state = allowlist.enableGroup(evidence);
+  const drills: RestoreDrillReceipt[] = [];
+  try {
+    const scratch = privateDirectory(options.scratchDirectory);
+    for (const sessionId of state.evidence!.expectedSessions) {
+      const bundle = join(scratch, `bundle-${sha(sessionId)}-${randomUUID()}`);
+      exportHistoryBundle(store, sessionId, bundle);
+      drills.push(await runRestoreDrill(bundle, scratch));
+    }
+  } catch (error) {
+    allowlist.disableGroup(group);
+    throw error;
+  }
+  return { group, state, drills, startedAt, completedAt: Date.now() };
 }

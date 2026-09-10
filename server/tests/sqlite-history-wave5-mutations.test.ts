@@ -3,7 +3,7 @@
  *
  * Every mutant lives in a throwaway copy of the package: the working tree is
  * never edited. The string a mutant edits must exist before it is edited, a
- * mutant counts as killed only when a real `bun:test` run reports `(fail)`,
+ * mutant counts as killed only when a real `bun:test` run reports `(fail)` or bun 1.3's `N fail`,
  * a death caused by a SyntaxError, ParseError or missing module is rejected,
  * a round that ran zero tests is rejected, and the clean tree must pass before
  * the first mutant and after the last one with the same test count.
@@ -85,9 +85,11 @@ test('wave5 authoritative-writer detectors kill every injected fault and the cle
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       const ran = /Ran (\d+) tests?/.exec(output);
-      console.log('WAVE5_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed: output.includes('(fail)') }));
-      if (code !== 0 && !output.includes('(fail)')) console.log('WAVE5_MUTANT_INVALID_OUTPUT', output.slice(-4000));
-      return { code, output, tests: Number(ran?.[1] ?? 0) };
+      // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
+      const failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      console.log('WAVE5_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed }));
+      if (code !== 0 && !failed) console.log('WAVE5_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
     const before = await run('clean-before');
     expect(before.code).toBe(0);
@@ -103,7 +105,7 @@ test('wave5 authoritative-writer detectors kill every injected fault and the cle
       // A mutant that ran nothing has not been killed by anything.
       expect(result.tests).toBeGreaterThan(0);
       expect(result.code).not.toBe(0);
-      expect(result.output).toContain('(fail)');
+      expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
     const after = await run('clean-after');

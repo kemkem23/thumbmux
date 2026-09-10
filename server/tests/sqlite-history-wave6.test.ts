@@ -1,5 +1,6 @@
 /**
- * Wave 6, first half: fixture proofs for the expansion tooling.
+ * Wave 6 fixture proofs: expansion tooling (first half) and the write-path
+ * door (second half).
  *
  * Everything runs on synthetic temp databases and temp directories. No tmux,
  * no production history, no `brain.db`, no network, and no production session
@@ -24,10 +25,11 @@ import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync,
 import { join } from 'node:path';
 import { AuthoritativeHistoryBridge, readMirror } from '../src/sqlite-history/authoritative';
 import { HistoryRolloutAllowlist, assessGroupReadiness, auditBackupCoverage, runRestoreDrill } from '../src/sqlite-history/rollout';
+import * as rolloutMod from '../src/sqlite-history/rollout';
 import { exportHistoryBundle, importHistorySnapshot, readSeal, sealHistorySnapshot } from '../src/sqlite-history/transfer';
-import { sha } from '../src/sqlite-history/codec';
+import { rowsDigest, sha } from '../src/sqlite-history/codec';
 import type { HistoryStore } from '../src/sqlite-history/store';
-import type { CaptureBatch, HistoryCaptureDriver, HistoryFault, LegacyProjection } from '../src/sqlite-history/types';
+import type { CaptureBatch, CaptureReceipt, HistoryCaptureDriver, HistoryFault, LegacyProjection } from '../src/sqlite-history/types';
 import { batch, evidence, fixture, observation } from './sqlite-history/helpers';
 
 const stubDriver: HistoryCaptureDriver = {
@@ -58,14 +60,40 @@ function sealedJsonlSource(dir: string, name: string, count: number): { sealed: 
   return { sealed, rows };
 }
 
+type RolloutRouterCtor = new (
+  store: HistoryStore,
+  allowlist: HistoryRolloutAllowlist,
+  writers: { sqlite: { commitBatch: (batch: CaptureBatch) => Promise<CaptureReceipt> }; legacy: { commitBatch: (batch: CaptureBatch) => Promise<CaptureReceipt> } },
+) => { commitBatch: (batch: CaptureBatch) => Promise<CaptureReceipt> };
+type ExpandGroupFn = (
+  store: HistoryStore,
+  allowlist: HistoryRolloutAllowlist,
+  group: string,
+  options: { mirrorDirectory: string; scratchDirectory: string },
+) => Promise<{
+  group: string; state: { state: 'enabled' | 'disabled' };
+  drills: Array<{ sessionId: string; rows: number; frames: number; rowsSha256: string }>;
+  startedAt: number; completedAt: number;
+}>;
+function requireRouter(): RolloutRouterCtor {
+  const Router = (rolloutMod as { HistoryRolloutRouter?: RolloutRouterCtor }).HistoryRolloutRouter;
+  if (typeof Router !== 'function') throw new Error('HistoryRolloutRouter missing');
+  return Router;
+}
+function requireExpandGroup(): ExpandGroupFn {
+  const expandGroup = (rolloutMod as { expandGroup?: ExpandGroupFn }).expandGroup;
+  if (typeof expandGroup !== 'function') throw new Error('expandGroup missing');
+  return expandGroup;
+}
+
 /** Import a sealed source into a registered session, add live commits, and
  * bring the mirror up to the committed revision. Returns computed state. */
-async function readyGroupSession(f: ReturnType<typeof fixture>, group: string, key: string, sourceRecords: number) {
+async function readyGroupSession(f: ReturnType<typeof fixture>, group: string, key: string, sourceRecords: number, mirrorDirectory?: string) {
   const { sealed } = sealedJsonlSource(f.dir, key, sourceRecords);
   const sid = await f.store.register({ name: key, lifecycleKey: `wave6-${key}`, group });
   const imported = await importHistorySnapshot(f.store, { sourceId: `wave6-source-${key}`, sessionId: sid, snapshotDirectory: sealed, format: 'file-jsonl' });
   expect(imported.state).toBe('verified');
-  const mirror = join(f.dir, `${key}-mirror`);
+  const mirror = mirrorDirectory ?? join(f.dir, `${key}-mirror`);
   const bridge = bridgeFor(f.store, mirror);
   // The import committed through the store directly; the mirror replays it
   // before the live commit so the seq files stay contiguous.
@@ -395,6 +423,152 @@ describe('wave 6 expansion tooling (fixture half)', () => {
       expect(rollout.routeSession(outsider)).toBe('legacy');
       console.log('WAVE6_GATE_ROUTE_SESSION', JSON.stringify({ group: rollout.route('canary'),
         enrolled: rollout.routeSession(sid), lateJoin: rollout.routeSession(late), outsider: rollout.routeSession(outsider) }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+});
+
+describe('wave 6 expansion wiring (second half)', () => {
+  test('write path: every capture is routed per session, not per group', async () => {
+    const f = fixture();
+    try {
+      const Router = requireRouter();
+      const mirror = join(f.dir, 'shared-mirror');
+      const { sid } = await readyGroupSession(f, 'canary', 'wired', 3, mirror);
+      const allowlist = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+      allowlist.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
+      const sqlite = bridgeFor(f.store, mirror);
+      const sqliteSessions: string[] = [];
+      const legacySessions: string[] = [];
+      const router = new Router(f.store, allowlist, {
+        sqlite: { commitBatch: async (next) => { sqliteSessions.push(next.ticket.sessionId); return sqlite.commitBatch(next); } },
+        legacy: { commitBatch: async (next) => { legacySessions.push(next.ticket.sessionId); return sqlite.commitBatch(next); } },
+      });
+
+      await router.commitBatch(batch(f.store, sid, ['via-router:enrolled'], ['screen']));
+      expect(sqliteSessions).toEqual([sid]);
+      expect(legacySessions).toEqual([]);
+
+      // A late joiner of an already-enabled group must not inherit the group
+      // verdict. The write door has to ask routeSession, not route(group).
+      const late = await f.store.register({ name: 'wired-late', lifecycleKey: 'wave6-wired-late', group: 'canary' });
+      await router.commitBatch(batch(f.store, late, ['via-router:late'], ['screen']));
+      expect(sqliteSessions).toEqual([sid]);
+      expect(legacySessions).toEqual([late]);
+      expect(allowlist.route('canary')).toBe('sqlite-authoritative');
+      expect(allowlist.routeSession(late)).toBe('legacy');
+      console.log('WAVE6_WRITE_PATH', JSON.stringify({ enrolled: sid, late, sqliteSessions, legacySessions }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+
+  test('live guard: a mirror that dies after enable drops the group back to legacy instead of writing as authoritative', async () => {
+    const f = fixture();
+    try {
+      const Router = requireRouter();
+      const { sid, mirror, sessionMirror } = await readyGroupSession(f, 'canary', 'liveguard', 3);
+      const allowlist = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+      allowlist.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
+      expect(typeof (allowlist as { guardSession?: unknown }).guardSession).toBe('function');
+      const sqlite = bridgeFor(f.store, mirror);
+      const sqliteSessions: string[] = [];
+      const legacySessions: string[] = [];
+      const router = new Router(f.store, allowlist, {
+        sqlite: { commitBatch: async (next) => { sqliteSessions.push(next.ticket.sessionId); return sqlite.commitBatch(next); } },
+        legacy: { commitBatch: async (next) => { legacySessions.push(next.ticket.sessionId); return sqlite.commitBatch(next); } },
+      });
+      await router.commitBatch(batch(f.store, sid, ['before-mirror-gone'], ['screen']));
+      expect(sqliteSessions).toEqual([sid]);
+      expect(legacySessions).toEqual([]);
+
+      rmSync(sessionMirror, { recursive: true, force: true });
+      expect(existsSync(sessionMirror)).toBe(false);
+      await router.commitBatch(batch(f.store, sid, ['after-mirror-gone'], ['screen']));
+      expect(legacySessions).toEqual([sid]);
+      expect(sqliteSessions).toEqual([sid]);
+      expect(allowlist.route('canary')).toBe('legacy');
+      expect(allowlist.routeSession(sid)).toBe('legacy');
+      const lost = faultsOf(f.alarms, 'rollout-mirror-lost').at(-1);
+      evidence(lost);
+      expect(lost?.expected).toBe('mirror-missing');
+
+      await router.commitBatch(batch(f.store, sid, ['after-disable'], ['screen']));
+      expect(legacySessions).toEqual([sid, sid]);
+
+      // Unreadable is its own reason, not a silent watermark-0 pass.
+      sqlite.resumeMirror(sid);
+      allowlist.enableGroup(await assessGroupReadiness(f.store, 'canary', mirror));
+      const watermarkPath = join(sessionMirror, 'watermark.json');
+      chmodSync(watermarkPath, 0o600);
+      writeFileSync(watermarkPath, JSON.stringify({ version: 1, sessionId: 'a-different-session', exportedRevision: 1 }));
+      sqliteSessions.length = 0;
+      legacySessions.length = 0;
+      await router.commitBatch(batch(f.store, sid, ['after-mirror-unreadable'], ['screen']));
+      expect(legacySessions).toEqual([sid]);
+      expect(sqliteSessions).toEqual([]);
+      expect(allowlist.route('canary')).toBe('legacy');
+      const unreadable = faultsOf(f.alarms, 'rollout-mirror-lost').at(-1);
+      evidence(unreadable);
+      expect(unreadable?.expected).toBe('mirror-unreadable');
+      console.log('WAVE6_LIVE_GUARD', JSON.stringify({
+        missing: lost?.expected, unreadable: unreadable?.expected, disabled: allowlist.route('canary') }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+
+  test('expansion batch: restore-drill every enrolled session after enable; a failed drill never leaves the group enabled', async () => {
+    const f = fixture();
+    try {
+      const expandGroup = requireExpandGroup();
+      const mirror = join(f.dir, 'shared-mirror');
+      const first = await readyGroupSession(f, 'canary', 'batch-a', 4, mirror);
+      const second = await readyGroupSession(f, 'canary', 'batch-b', 3, mirror);
+      const allowlist = new HistoryRolloutAllowlist(f.store,
+        { directory: join(f.dir, 'rollout'), declaredGroups: ['canary'], mirrorDirectory: mirror });
+
+      const receipt = await expandGroup(f.store, allowlist, 'canary', {
+        mirrorDirectory: mirror, scratchDirectory: join(f.dir, 'scratch'),
+      });
+      expect(receipt.state.state).toBe('enabled');
+      expect(allowlist.route('canary')).toBe('sqlite-authoritative');
+      expect(receipt.drills.length).toBe(2);
+      expect(receipt.drills.map(drill => drill.sessionId).sort()).toEqual([first.sid, second.sid].sort());
+      expect(receipt.completedAt).toBeGreaterThanOrEqual(receipt.startedAt);
+      for (const drill of receipt.drills) {
+        expect(drill.rows).toBeGreaterThan(0);
+        const session = f.store.session(drill.sessionId);
+        const rows = f.store.rows(drill.sessionId, session.first_line, session.next_line);
+        expect(drill.rows).toBe(rows.length);
+        expect(drill.rowsSha256).toBe(rowsDigest(rows));
+      }
+      expect(allowlist.routeSession(first.sid)).toBe('sqlite-authoritative');
+      expect(allowlist.routeSession(second.sid)).toBe('sqlite-authoritative');
+
+      const probe = f.store.persistFault(first.sid, 'post-expand-probe', 'fault channel still live after expansion', { at: 1 });
+      expect(f.db.query('SELECT issue_id FROM history_issue WHERE issue_id=?').get(probe.issue_id))
+        .toEqual({ issue_id: probe.issue_id });
+
+      allowlist.disableGroup('canary');
+      const badScratch = join(f.dir, 'scratch-is-a-file');
+      writeFileSync(badScratch, 'not-a-directory');
+      await expect(expandGroup(f.store, allowlist, 'canary', {
+        mirrorDirectory: mirror, scratchDirectory: badScratch,
+      })).rejects.toThrow(/rollout-directory-must-be-private/);
+      expect(allowlist.route('canary')).toBe('legacy');
+      console.log('WAVE6_EXPAND_BATCH', JSON.stringify({
+        drills: receipt.drills.length, rows: receipt.drills.map(drill => drill.rows),
+        failedDrillLeftDisabled: allowlist.route('canary') === 'legacy' }));
+    } finally { await f.cleanup(); }
+  }, 60000);
+
+  test('opt-in factory exposes the write-path router and expansion batch', async () => {
+    const f = fixture();
+    try {
+      const { createSqliteHistoryStore } = await import('../src/sqlite-history');
+      const history = await createSqliteHistoryStore({ file: join(f.dir, 'opt-in-wave6.db') });
+      try {
+        expect(typeof (history as { createRolloutRouter?: unknown }).createRolloutRouter).toBe('function');
+        expect(typeof (history as { expandGroup?: unknown }).expandGroup).toBe('function');
+      } finally { await history.close(); }
     } finally { await f.cleanup(); }
   }, 60000);
 });

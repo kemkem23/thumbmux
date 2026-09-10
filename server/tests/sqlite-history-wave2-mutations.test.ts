@@ -45,9 +45,12 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       const args=[process.execPath,'test','./server/tests/sqlite-history-wave2.test.ts'];if(pattern)args.push('--test-name-pattern',pattern);
       const child=Bun.spawn(args,{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
-      const output=out+err;console.log('MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed:output.includes('(fail)')}));
-      if(code!==0&&!output.includes('(fail)'))console.log('MUTANT_INVALID_OUTPUT',output);
-      return {code,output};
+      const output=out+err;
+      // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
+      const failed=/\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      console.log('MUTANT_RUN',JSON.stringify({name,code,ran:/Ran \d+ tests?/.test(output),failed}));
+      if(code!==0&&!failed)console.log('MUTANT_INVALID_OUTPUT',output);
+      return {code,output,failed};
     };
     expect((await run('clean-before')).code).toBe(0);
     for(const mutant of mutants){
@@ -58,7 +61,7 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       }
       const result=await run(mutant.name,mutant.pattern);
       for(const [path,contents] of originals)writeFileSync(path,contents);
-      expect(result.code).not.toBe(0);expect(result.output).toContain('(fail)');
+      expect(result.code).not.toBe(0);expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
     expect((await run('clean-after')).code).toBe(0);
