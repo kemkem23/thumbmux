@@ -1,0 +1,94 @@
+{
+  "$schema": "menu345 subpath surface snapshot",
+  "note": "Supplementary evidence for one public subpath that scripts/contract-check.ts cannot see: it reads git-dist/{core,server,svelte,app}/index.d.ts only, and thumbmux/server/recall is deliberately not on the server barrel (hoisting it would pull bun:sqlite into every barrel consumer). This file assigns NO tier. contract/manifest/*.json remains the only tier inventory.",
+  "recordedFrom": {
+    "pin": "github:kemkem23/thumbmux#v0.20.0-dist",
+    "packageVersion": "0.20.0",
+    "types": "./git-dist/server/recall-handler.d.ts",
+    "import": "./git-dist/server/recall-handler.js"
+  },
+  "tier": null,
+  "subpath": "thumbmux/server/recall",
+  "runtime": [
+    "DEFAULT_BUSY_TIMEOUT_MS",
+    "DEFAULT_KEEP_PROMPTS",
+    "DEFAULT_MIN_PROMPT_LENGTH",
+    "RECALL_SCHEMA_VERSION",
+    "RecallSchemaVersionError",
+    "createRecallHandler"
+  ],
+  "declarations": [
+    {
+      "name": "createRecallHandler",
+      "kind": "value",
+      "signature": "cdeb60e890c32adf78a24c6d0216dc80740844ded8344838cf1177698b34fa58",
+      "declaration": "export declare function createRecallHandler ( opts : RecallHandlerOptions ) : RecallHandler ;"
+    },
+    {
+      "name": "DEFAULT_BUSY_TIMEOUT_MS",
+      "kind": "value",
+      "signature": "8ef48509ecdebcb2b4635b45c49b58695367e0a54084d9c37aa357ce6ea07865",
+      "declaration": "DEFAULT_BUSY_TIMEOUT_MS = 5000"
+    },
+    {
+      "name": "DEFAULT_KEEP_PROMPTS",
+      "kind": "value",
+      "signature": "3b977b9f00ec105db350c6d7a39f8021d093be6167ef58e3d2afee42c6e00d0b",
+      "declaration": "DEFAULT_KEEP_PROMPTS = 100"
+    },
+    {
+      "name": "DEFAULT_MIN_PROMPT_LENGTH",
+      "kind": "value",
+      "signature": "23d17537d6a6169f72994a61a6dc978c740cb5ff626360b5a44781d4a887bcda",
+      "declaration": "DEFAULT_MIN_PROMPT_LENGTH = 3"
+    },
+    {
+      "name": "RECALL_SCHEMA_VERSION",
+      "kind": "value",
+      "signature": "7e0f5d17b415e8325c359b1f09ad461e514315c5ee3080f095452df2ebee7600",
+      "declaration": "RECALL_SCHEMA_VERSION = 1"
+    },
+    {
+      "name": "RecallHandler",
+      "kind": "type",
+      "signature": "f497bfdc71ecbb8c02d988d1c7aaa45766dc656f36a4843c6ef551563998caeb",
+      "declaration": "export type RecallHandler = { handle ( request : Request ) : Promise < Response > ; readNote ( session : string , expectedLifecycleId ? : string ) : Promise < RecallNote | null > ; writeNote ( session : string , note : string , expectedLifecycleId ? : string ) : Promise < RecallNote | null > ; readPrompts ( session : string , options ? : { limit ? : number ; expectedLifecycleId ? : string ; } ) : Promise < RecallPrompts | null > ; ingest ( batch : RecallIngestBatch ) : Promise < number > ; close ( ) : void ; } ;"
+    },
+    {
+      "name": "RecallHandlerOptions",
+      "kind": "type",
+      "signature": "542714aa2a619110f3953e600362c81298337eb5c92a249b19338669673cc82c",
+      "declaration": "export type RecallHandlerOptions = { file : string ; resolveSession : ( session : string ) => Promise < RecallSessionIdentity | null > | RecallSessionIdentity | null ; keepPromptsPerSession ? : number ; minPromptLength ? : number ; busyTimeoutMs ? : number ; now ? : ( ) => string ; } ;"
+    },
+    {
+      "name": "RecallIngestBatch",
+      "kind": "type",
+      "signature": "532c99d0820ce49730a27e74567606df694574e1a904160d69d75b865e63505c",
+      "declaration": "export type RecallIngestBatch = { session : string ; prompts : string [ ] ; expectedLifecycleId ? : string ; } ;"
+    },
+    {
+      "name": "RecallNote",
+      "kind": "type",
+      "signature": "c80a3001f9ff61e5b036e03d5eecf361026264c777c9762c045db660d2484b1b",
+      "declaration": "export type RecallNote = { session : string ; lifecycleId : string ; note : string ; noteUpdatedAt : string | null ; } ;"
+    },
+    {
+      "name": "RecallPrompts",
+      "kind": "type",
+      "signature": "feb67802d4e9672516286228a08fe346c3f124aff73737ed49bd8af61f028556",
+      "declaration": "export type RecallPrompts = { session : string ; lifecycleId : string ; prompts : string [ ] ; } ;"
+    },
+    {
+      "name": "RecallSchemaVersionError",
+      "kind": "value",
+      "signature": "5baeb499afc05ee06572a66024def8bb351d665be40286f222181fa2a106034a",
+      "declaration": "export declare class RecallSchemaVersionError extends Error { readonly found : number ; readonly supported : number ; constructor ( found : number , supported : number ) ; }"
+    },
+    {
+      "name": "RecallSessionIdentity",
+      "kind": "type",
+      "signature": "bdee21150c42b167d3226ee37a4a6fee071016d156d2d38f8e670d2878b5f545",
+      "declaration": "export type RecallSessionIdentity = { lifecycleId : string ; } ;"
+    }
+  ]
+}
