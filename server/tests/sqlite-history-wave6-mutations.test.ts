@@ -78,6 +78,22 @@ test('wave6 expansion-tooling detectors kill every injected fault and the clean 
     { name: 'audit-hides-storage-failure', pattern: 'backup coverage', file: 'sqlite-history/rollout.ts',
       from: "    try { store.audit(row.session_id); } catch { storage = 'failed'; }",
       to: '    try { store.audit(row.session_id); } catch { /* swallowed */ }' },
+    // --- second half: every write walks the live per-session door ---
+    { name: 'router-uses-group-route', pattern: 'write path', file: 'sqlite-history/rollout.ts',
+      from: '    const route = this.allowlist.guardSession(batch.ticket.sessionId);',
+      to: '    const route = this.allowlist.route(this.store.session(batch.ticket.sessionId).group_label);' },
+    { name: 'guard-skips-missing-mirror', pattern: 'live guard', file: 'sqlite-history/rollout.ts',
+      from: '    if (!existsSync(sessionMirror)) {',
+      to: '    if (false) {' },
+    { name: 'guard-swallows-unreadable', pattern: 'live guard', file: 'sqlite-history/rollout.ts',
+      from: "      this.loseMirror(group, sessionId, 'mirror-unreadable', { error: String(error) });",
+      to: "      return 'sqlite-authoritative';" },
+    { name: 'expand-skips-drill', pattern: 'expansion batch', file: 'sqlite-history/rollout.ts',
+      from: '      drills.push(await runRestoreDrill(bundle, scratch));',
+      to: '      void bundle;' },
+    { name: 'expand-keeps-enabled-on-drill-fail', pattern: 'expansion batch', file: 'sqlite-history/rollout.ts',
+      from: '    allowlist.disableGroup(group);',
+      to: '    void group;' },
   ];
   try {
     mkdirSync(join(root, 'server'), { recursive: true });
@@ -96,9 +112,10 @@ test('wave6 expansion-tooling detectors kill every injected fault and the clean 
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       const ran = /Ran (\d+) tests?/.exec(output);
-      console.log('WAVE6_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed: output.includes('(fail)') }));
-      if (code !== 0 && !output.includes('(fail)')) console.log('WAVE6_MUTANT_INVALID_OUTPUT', output.slice(-4000));
-      return { code, output, tests: Number(ran?.[1] ?? 0) };
+      const failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      console.log('WAVE6_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed }));
+      if (code !== 0 && !failed) console.log('WAVE6_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
     const before = await run('clean-before');
     expect(before.code).toBe(0);
@@ -114,7 +131,8 @@ test('wave6 expansion-tooling detectors kill every injected fault and the clean 
       // A mutant that ran nothing has not been killed by anything.
       expect(result.tests).toBeGreaterThan(0);
       expect(result.code).not.toBe(0);
-      expect(result.output).toContain('(fail)');
+      // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
+      expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
     const after = await run('clean-after');
