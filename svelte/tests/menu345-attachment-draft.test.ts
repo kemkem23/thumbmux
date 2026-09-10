@@ -251,7 +251,7 @@ afterEach(() => {
 });
 
 describe("attachment-draft helpers", () => {
-  test.each(["", "image/"])("a nameless file with empty subtype uses the png name fallback (type=%s)", (type) => {
+  test.each(["", "image/"])("a nameless file with empty subtype uses the png name fallback (type=%s)", (type: string) => {
     const file = imageFile("", type);
     const originalName = file.name;
     expect(draftFileName(file, 3, 1700000000000)).toBe("pasted-1700000000000-3.png");
@@ -272,7 +272,7 @@ describe("attachment-draft helpers", () => {
     expect(ports.revoked).toEqual([]);
   });
 
-  test.each([",", " \t ", " , , \n"])("accept containing only separators imposes no filter (%j)", (accept) => {
+  test.each([",", " \t ", " , , \n"])("accept containing only separators imposes no filter (%j)", (accept: string) => {
     const files = [imageFile("a.png"), new File(["pdf"], "b.pdf", { type: "application/pdf" })];
     expect(accept.length).toBeGreaterThan(0);
     for (const file of files) expect(fileMatchesAccept(file, accept)).toBe(true);
@@ -456,7 +456,7 @@ describe("AttachmentDraftPicker", () => {
     expect(fetchCalls).toEqual([]);
   });
 
-  test.each([false, true])("host open() calls the hidden input exactly when enabled (disabled=%s)", async (disabled) => {
+  test.each([false, true])("host open() calls the hidden input exactly when enabled (disabled=%s)", async (disabled: boolean) => {
     const onChange = mock((_files: File[]) => {});
     const { host, input } = mountHost({ disabled, onChange });
     await tick();
@@ -482,7 +482,7 @@ describe("AttachmentDraftPicker", () => {
     expect(fetchCalls).toEqual([]);
   });
 
-  test.each([false, true])("rejecting every selected file preserves the draft without onChange (seeded=%s)", async (seeded) => {
+  test.each([false, true])("rejecting every selected file preserves the draft without onChange (seeded=%s)", async (seeded: boolean) => {
     const keep = imageFile("keep.png");
     const initial = seeded ? [keep] : [];
     const onChange = mock((_files: File[]) => {});
