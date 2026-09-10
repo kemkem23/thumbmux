@@ -19,10 +19,15 @@ const palette: AnsiPalette = {
   ],
 };
 
+// Derived from the mux itself: a hand-written `(data: string, type?: string)`
+// is WIDER than the real `type?: OutputType`, so the compiler rejects it as a
+// delivery callback. Reading the shape off `subscribe` cannot drift.
+type MuxDeliver = Parameters<typeof tmuxMux.subscribe>[1];
+
 const originalSubscribe = tmuxMux.subscribe.bind(tmuxMux);
 let mounted: Record<string, unknown> | null = null;
 let target: HTMLDivElement | null = null;
-let deliver: ((data: string, type?: string) => void) | null = null;
+let deliver: MuxDeliver | null = null;
 let subscribedTail: number | undefined;
 
 afterEach(() => {
@@ -148,7 +153,7 @@ describe("SessionThumb subscription stability", () => {
     const subscriptions: Array<{
       session: string;
       tail?: number;
-      deliver: (data: string, type?: string) => void;
+      deliver: MuxDeliver;
     }> = [];
     let unsubscribeCount = 0;
 

@@ -848,8 +848,51 @@ describe('Claude Bash detector', () => {
       ['      printf orphan)', '  ⎿  orphan', '● next'],
       ['● Bash(printf no-result)', '● next'],
       ['● Bash(printf cut)', '  ⎿  cut'],
+      // Capture cut after a real result (not a live status) must stay raw
+      // even when extra continuation rows make it look like a live stream.
+      ['● Bash(cat file)', '  ⎿  first result', '     more output', '     still more'],
+      ['● Bash(long-task &)', '  ⎿  Running in the background (↓ to manage)'],
     ];
     for (const lines of cases) expect(detectClaudeBashBlocks(lines).blocks).toEqual([]);
+  });
+
+  test('collapses an unclosed ● Bash with a live ⎿ status as active, never as completed', () => {
+    const liveStatuses = [
+      '  ⎿  running...',
+      '  ⎿  starting…',
+      '  ⎿  Running…',
+      '  ⎿  Running… (10s)',
+      '  ⎿  Running… (1m 24s · timeout 10m)',
+      '\x1b[38;5;246m  ⎿  starting…',
+    ];
+
+    for (const delimiter of liveStatuses) {
+      const lines = [
+        '\x1b[38;5;114m●\x1b[39m \x1b[1mBash\x1b[0m(./.agents/skills/exec/exec.sh codex sol "run")',
+        delimiter,
+        '     stream line 0',
+        '     stream line 1',
+      ];
+      const detection = detectClaudeBashBlocks(lines);
+      expect(detection.blocks, delimiter).toHaveLength(1);
+      expect(detection.blocks[0], delimiter).toMatchObject({
+        status: 'active',
+        sourceRange: { startLine: 0, endLine: 4 },
+        command: './.agents/skills/exec/exec.sh codex sol "run"',
+      });
+
+      const hide = projectClaudeBashGroupedLines(lines, { mode: 'hide', detection });
+      expect(hide.rows, delimiter).toHaveLength(1);
+      expect(hide.rows[0], delimiter).toMatchObject({
+        kind: 'bash-placeholder',
+        status: 'active',
+      });
+      expect(hide.summaryRequests, delimiter).toEqual([]);
+
+      const haiku = projectClaudeBashLines(lines, { mode: 'haiku', detection });
+      expect(haiku.summaryRequests, delimiter).toEqual([]);
+      expect(haiku.rows[0]?.line, delimiter).toBe('Bash กำลังรัน…');
+    }
   });
 
   test('does not end a command on nested parens/heredoc and uses the first result marker', () => {

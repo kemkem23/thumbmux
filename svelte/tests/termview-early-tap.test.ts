@@ -14,7 +14,6 @@
  * a real reading on this clock.
  */
 import { afterEach, describe, expect, jest, test } from "bun:test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -48,7 +47,7 @@ function mountTermView(onTap: () => void): Mounted {
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: "early-tap",

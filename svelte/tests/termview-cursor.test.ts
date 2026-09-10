@@ -6,7 +6,6 @@
  * Bash presentation geometry, ANSI/control stripping, and Unicode cell width.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { Component } from 'svelte';
 import { flushSync, mount, tick, unmount } from './svelte-client';
 
 import TermView from '../src/TermView.svelte';
@@ -88,7 +87,7 @@ function mountView(mode: ClaudeBashMode = 'off'): HTMLElement {
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: `cursor-grid-${mounted.length}`,

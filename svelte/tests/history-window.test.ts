@@ -10,6 +10,7 @@ import {
   historyWindowRange,
   historyWindowRequestCursor,
   type HistoryWindowAnchor,
+  type HistoryWindowRejectReason,
   type HistoryWindowState,
 } from '../src/history-window';
 
@@ -372,7 +373,12 @@ describe('boundary and malformed-page handling', () => {
       hasNewer: true,
     });
     const reader = anchor(104);
-    const cases = [
+    // Annotated so a typo in a reason string fails here rather than turning
+    // the assertion below into a comparison of two arbitrary strings.
+    const cases: Array<{
+      reason: HistoryWindowRejectReason;
+      page: Parameters<typeof applyHistoryWindowPage>[1];
+    }> = [
       {
         reason: 'stale-cursor',
         page: { direction: 'before' as const, anchorLine: 99, startLine: 90, lines: rows(90, 10), hasMore: true },

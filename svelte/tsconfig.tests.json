@@ -1,0 +1,14 @@
+{
+  // TM-19 (widened 2026-09-10) — type-check the test suite too.
+  //
+  // `tsconfig.json` deliberately ships only `src/**`: it is the config a
+  // consumer inherits, and `svelte-package` builds from it. The test folder
+  // was therefore never compiled by anything, and drifted — a hand-copied prop
+  // type had gone stale by two props without a single red build.
+  //
+  // This config reuses the shipped compiler options verbatim (same `strict`,
+  // no relaxations) and only widens the file set. Keep it that way: if a new
+  // test cannot pass these options, fix the test, not this file.
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*", "tests/**/*"]
+}

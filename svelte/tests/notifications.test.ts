@@ -124,12 +124,11 @@ describe('notification helpers', () => {
         serviceWorker: {
           register() {
             registerCalls += 1;
-            return {
+            return Promise.resolve({
               showNotification() {
                 showCalls += 1;
-                return true;
               },
-            };
+            });
           },
         },
       },
@@ -367,7 +366,7 @@ describe('notification service-worker helpers', () => {
     const { serviceWorker } = await loadModules();
 
     const pushShowCalls: string[] = [];
-    const host: { addEventListener: (type: 'push' | 'notificationclick', listener: (event: unknown) => void) => void; removeEventListener?: (type: 'push' | 'notificationclick', listener: (event: unknown) => void) => void; events: Map<string, (event: unknown) => void[]> } = {
+    const host: { addEventListener: (type: 'push' | 'notificationclick', listener: (event: unknown) => void) => void; removeEventListener?: (type: 'push' | 'notificationclick', listener: (event: unknown) => void) => void; events: Map<string, Array<(event: unknown) => void>> } = {
       addEventListener(type, listener) {
         const listeners = this.events.get(type) ?? [];
         this.events.set(type, [...listeners, listener]);
@@ -390,7 +389,7 @@ describe('notification service-worker helpers', () => {
       },
     };
 
-    let openedFromRegisteredClick: string | null = null;
+    const openedFromRegisteredClick: string[] = [];
     const registrationResult = serviceWorker.registerNotificationServiceWorkerHandlers(host, {
       push: {
         registration,
@@ -399,7 +398,7 @@ describe('notification service-worker helpers', () => {
       click: {
         clients: {
           openWindow(url: string) {
-            openedFromRegisteredClick = url;
+            openedFromRegisteredClick.push(url);
             return Promise.resolve(url);
           },
         },
@@ -446,7 +445,7 @@ describe('notification service-worker helpers', () => {
       },
     });
     await Promise.all(clickWaitUntil);
-    expect(openedFromRegisteredClick).toBe('/queue/42');
+    expect(openedFromRegisteredClick).toEqual(['/queue/42']);
 
     registrationResult.ok && registrationResult.value.unregister();
     expect(host.events.get('push')).toHaveLength(0);

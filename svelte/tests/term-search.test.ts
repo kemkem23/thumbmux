@@ -239,7 +239,11 @@ describe('archive continuation state machine', () => {
       const begin = beginArchiveContinuation(createArchiveContinuationState(), archiveQuery({ queryGeneration: 4 }));
       expect(begin.requestToken).toBe(1);
 
-      const settled = settleArchiveContinuation(begin.state, begin.requestToken, settlement);
+      // `beginArchiveContinuation` may decline and hand back a null token; the
+      // assertion above says it did not, but only a real guard narrows the type.
+      const { requestToken } = begin;
+      if (requestToken === null) throw new Error("archive continuation did not begin");
+      const settled = settleArchiveContinuation(begin.state, requestToken, settlement);
       expect(settled.shouldRerunSearch).toBe(false);
       expect(settled.state).toEqual({
         queryGeneration: 4,

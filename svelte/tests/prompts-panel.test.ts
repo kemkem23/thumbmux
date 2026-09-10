@@ -1,15 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { ComponentProps } from "svelte";
 import { extractRecentPrompts, stripAnsi } from "@thumbmux/core";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import PromptsPanel from "../src/PromptsPanel.svelte";
 
-type PromptsPanelProps = {
-  prompts?: string[];
-  loading?: boolean;
-  onPick: (prompt: string) => void;
-  labels?: { title: string; loading: string; none: string };
-};
+// Read the prop shape off the component instead of restating it. A hand-copied
+// list silently drifts: this one had gone stale by two props (`collapsible`,
+// `initiallyOpen`) and nothing noticed, because `tests/` was outside the
+// svelte-check gate until TM-19 was widened.
+type PromptsPanelProps = ComponentProps<typeof PromptsPanel>;
 
 type Mounted = {
   app: Record<string, unknown>;

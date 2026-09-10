@@ -5,7 +5,6 @@
  * pixel anchoring, signposts, and alt-screen teardown to that model.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -161,7 +160,7 @@ function mountTermView(options: {
 
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: SESSION,
@@ -2024,7 +2023,9 @@ describe("TermView sliding archive window", () => {
       .find((row) => row.textContent?.includes("absolute-108"));
     if (!after) throw new Error("live anchor row disappeared after seam promotion");
     expect(projectedScreenY(viewport, after)).toBeCloseTo(beforeY, 5);
-    expect(new Set(deliveredLines.at(-1)).size).toBe(deliveredLines.at(-1)?.length);
+    const lastDelivery = deliveredLines.at(-1);
+    expect(lastDelivery).toBeDefined();
+    expect(new Set(lastDelivery ?? []).size).toBe((lastDelivery ?? []).length);
   });
 
   test("generation reset retires both an active tokenless request and a claimed queued reply", async () => {

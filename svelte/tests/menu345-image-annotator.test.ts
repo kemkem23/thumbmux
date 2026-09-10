@@ -104,7 +104,7 @@ function recordEventError(event: ErrorEvent): void {
   eventErrors.push(event.error?.message ?? event.message);
 }
 
-const mounted: Array<{ app: unknown; target: HTMLElement }> = [];
+const mounted: Array<{ app: Record<string, unknown>; target: HTMLElement }> = [];
 const canvasProto = Object.getPrototypeOf(
   document.createElement("canvas"),
 ) as HTMLCanvasElement;
@@ -213,9 +213,19 @@ function touchOn(
   type: "touchstart" | "touchmove" | "touchend" | "touchcancel",
   points: Array<[number, number]> = [],
 ): TouchEvent {
-  const touches = points.map(([clientX, clientY], identifier) => ({
-    identifier, clientX, clientY, target: canvas,
-  }) as Touch);
+  // Fill the whole `Touch` shape rather than casting a four-field object into
+  // it: the annotator reads clientX/clientY only, but a cast here would also
+  // hide the day it starts reading force or radius.
+  const touches = points.map(([clientX, clientY], identifier): Touch => ({
+    identifier,
+    target: canvas,
+    clientX, clientY,
+    screenX: clientX, screenY: clientY,
+    pageX: clientX, pageY: clientY,
+    radiusX: 0, radiusY: 0,
+    rotationAngle: 0,
+    force: 0,
+  }));
   const event = new TouchEvent(type, { touches, bubbles: true, cancelable: true });
   canvas.dispatchEvent(event);
   flushSync();
@@ -473,7 +483,7 @@ describe("ImageAnnotator", () => {
     const canvas = canvasOf(target);
     displayAt(canvas, { left: 20, top: 10, width: 400, height: 225 });
     const points: Array<[number, number]> = [[120, 60], [170, 85], [220, 110]];
-    const expected = [[[400, 200], [600, 300], [800, 400]]];
+    const expected: Array<Array<[number, number]>> = [[[400, 200], [600, 300], [800, 400]]];
     const ctx = contextOf(canvas);
 
     ctx.calls.length = 0;

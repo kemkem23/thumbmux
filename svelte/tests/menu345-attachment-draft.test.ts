@@ -7,6 +7,7 @@
  * re-assert that UploadAction's send-immediately default is untouched.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { fetchStub } from "./fetch-stub";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import AttachmentDraftPicker from "../src/AttachmentDraftPicker.svelte";
@@ -44,7 +45,7 @@ type Mounted = {
   input: HTMLInputElement;
 };
 
-const mounted: Array<{ app: unknown; target: HTMLElement }> = [];
+const mounted: Array<{ app: Record<string, unknown>; target: HTMLElement }> = [];
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
 const originalCreate = URL.createObjectURL;
 const originalRevoke = URL.revokeObjectURL;
@@ -111,10 +112,10 @@ function installFetchTripwire(): void {
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     writable: true,
-    value: (async (input: string | URL | Request, init?: RequestInit) => {
+    value: fetchStub(async (input: string | URL | Request, init?: RequestInit) => {
       fetchCalls.push({ input: String(input), init });
       return Response.json({ files: [{ stored: "unexpected.png" }] });
-    }) as typeof fetch,
+    }),
   });
 }
 
@@ -708,15 +709,15 @@ describe("AttachmentDraftPicker", () => {
     Object.defineProperty(globalThis, "fetch", {
       configurable: true,
       writable: true,
-      value: (async (input: string | URL | Request, init?: RequestInit) => {
+      value: fetchStub(async (input: string | URL | Request, init?: RequestInit) => {
         fetchCalls.push({ input: String(input), init });
         return Response.json({ files: [{ original: "a.png", stored: "srv-a.png" }] });
-      }) as typeof fetch,
+      }),
     });
 
     const target = document.createElement("div");
     document.body.appendChild(target);
-    let app!: unknown;
+    let app!: Record<string, unknown>;
     const uploaded: string[] = [];
     flushSync(() => {
       app = mount(UploadAction, {

@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import type { AnsiPalette } from "@thumbmux/core";
-import type { Component } from "svelte";
 import { flushSync, mount, tick, unmount } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -86,7 +85,7 @@ test("TermView cancels every queued animation frame when it is unmounted", async
 
   try {
     flushSync(() => {
-      app = mount(TermView as Component, {
+      app = mount(TermView, {
         target,
         props: {
           session: "teardown-session",

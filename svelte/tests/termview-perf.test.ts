@@ -11,7 +11,6 @@ import { createRequire } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
-import type { Component } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -242,7 +241,7 @@ function mountTermView(
 
   let app: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermView as Component, {
+    app = mount(TermView, {
       target,
       props: {
         session: SESSION,
@@ -918,7 +917,7 @@ describe("TermView bottomInsetPx development warnings", () => {
       });
       let app: Record<string, unknown>;
       flushSync(() => {
-        app = mount(TermView as Component, { target, props }) as Record<string, unknown>;
+        app = mount(TermView, { target, props }) as Record<string, unknown>;
       });
       mounted.push({ app: app!, target });
 
@@ -966,7 +965,7 @@ describe("TermView bottomInsetPx development warnings", () => {
     });
     let app: Record<string, unknown>;
     flushSync(() => {
-      app = mount(TermView as Component, {
+      app = mount(TermView, {
         target,
         props,
       }) as Record<string, unknown>;
@@ -1631,7 +1630,7 @@ describe("TermView history prepend scheduling", () => {
     const settledMirrorBeforeFling = viewport.getAttribute("data-bottom-offset");
     const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
     let historyRectReads = 0;
-    jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
+    jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       if (this === viewport || this.classList.contains("mtv-line")) historyRectReads++;
       return originalGetBoundingClientRect.call(this);
     });

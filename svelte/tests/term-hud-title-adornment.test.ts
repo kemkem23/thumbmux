@@ -13,7 +13,6 @@
  * layout engine and lives in `term-hud-title-adornment.browser.test.ts`.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import type { Component } from "svelte";
 import { createRawSnippet, flushSync, mount, tick, unmount } from "./svelte-client";
 
 import TermHud from "../src/TermHud.svelte";
@@ -35,7 +34,7 @@ function mountHud(props: Record<string, unknown> = {}): HTMLElement {
   document.body.appendChild(target);
   let app!: Record<string, unknown>;
   flushSync(() => {
-    app = mount(TermHud as Component, {
+    app = mount(TermHud, {
       target,
       props: { chip: "CC", title: "term-3fsy9c-orchestrator", onBack: () => {}, ...props },
     }) as Record<string, unknown>;
@@ -169,7 +168,9 @@ describe("TM-04 · titleAdornment", () => {
       if (clipboardDescriptor) {
         Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
       } else {
-        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+        // `Navigator.clipboard` is declared required, so `delete` on it is a
+        // type error however it is cast. Reflect drops the stub without one.
+        Reflect.deleteProperty(navigator, "clipboard");
       }
     }
   });
