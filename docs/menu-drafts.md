@@ -135,6 +135,10 @@ picker's job via `acceptPaste()`, and a host wires the two together. It also
 registers no overlay and no mobile back-button entry: it is a bare panel that
 your route places inside whatever overlay it already owns.
 
+REMOVE is keyed off the `image` prop, not off a successful decode. A 0-byte or
+corrupt blob still shows the × so the user can drop it and pick again. Wrapping
+that button in `{#if hasImage}` traps them with only Close.
+
 ## What a host still owns after adopting these
 
 Upload transport and endpoints · receipt claim/settle · filename, hashing and

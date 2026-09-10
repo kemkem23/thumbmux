@@ -593,6 +593,21 @@ describe("ImageAnnotator", () => {
     expect(exportedSizes).toEqual([]);
     expect(submissions).toBe(0);
     expect(closes).toBe(0);
+
+    // A broken decode must still leave a way out. Wrapping REMOVE in
+    // `{#if hasImage}` hides it exactly when the user is trapped.
+    const removeAfterError = toolButton(target, "remove");
+    expect(removeAfterError, "broken image must still offer REMOVE").toBeTruthy();
+    expect(removeAfterError.disabled).toBe(false);
+    removeAfterError.click();
+    flushSync();
+    await tick();
+    expect(target.querySelector('[data-testid="image-annotator-error"]')).toBeNull();
+    expect(toolButton(target, "remove")).toBeNull();
+    expect(hasEmptyState(target)).toBe(true);
+    expect(commentInput(target).value).toBe("เก็บไว้เลือกภาพใหม่");
+    expect(submissions).toBe(0);
+    expect(closes).toBe(0);
   });
 
   test("the X button closes exactly once without submitting", async () => {
@@ -771,9 +786,10 @@ describe("ImageAnnotator", () => {
     const { app, target } = mountAnnotator({ image: pngBlob(), onSubmit: () => {}, onClose: () => {} });
     await tick();
 
-    // Removed while the decode is still in flight — the panel has no remove
-    // button yet, which is exactly the window this guards.
+    // Removed while the decode is still in flight. REMOVE is now on screen as
+    // soon as `image` is set, so this window is reachable from the button too.
     const stale = createdImages.at(-1)!;
+    expect(toolButton(target, "remove"), "REMOVE must be on screen during decode").toBeTruthy();
     app.removeImage();
     flushSync();
     await tick();
