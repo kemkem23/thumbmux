@@ -1,5 +1,6 @@
 /** Opt-in entry point, proposed tier S. No SQLite module, file or timer at evaluation. */
 import type { SqliteHistoryOptions, HistoryBridgeOptions, HistoryShadowBridgeOptions, HistoryCoordinatorOptions, HistoryImportOptions, HistoryContext, HistoryCaptureBridge, HistoryCaptureCoordinator, ClosedHistoryImportOptions } from './sqlite-history/types';
+import type { HistoryRolloutAllowlist, HistoryWriter } from './sqlite-history/rollout';
 export type { Continuity, HistoryContext, HistoryRow, HistoryGeometry, SourceObservation, CaptureObservation, HistoryFault, SqliteHistoryOptions, CaptureReceipt, HistoryPageV1, HistoryHealth, HistoryCaptureDriver, HistoryCoordinatorOptions, LegacyFormat, HistoryImportOptions, HistoryImportState, HistoryImportProgress, ClosedHistoryImportOptions, ClosedHistoryImportResult, MigrationUnresolvedEntry, MigrationVerification, LegacyProjection, LegacyProjectionAcknowledgement, LegacyProjectionWriter, HistoryBridgeOptions, HistoryBridgeLedgerEntry, DualWriteReceipt, HistoryCaptureBridge, HistoryCaptureCoordinator, ShadowFrameRecord, ShadowUnresolvedRecord, ShadowBatchSnapshot, ShadowSourceOracle, ShadowComparisonReport, HistoryShadowBridgeOptions, ShadowRuntimeState } from './sqlite-history/types';
 export { compareShadowBatch, inspectShadowRuntime, inspectHistoryHealth, inspectHistoryMirror, inspectImportProgress, validateHistoryPage, verifyHistoryOracle } from './sqlite-history/detectors';
 export { sealHistorySnapshot } from './sqlite-history/transfer';
@@ -29,7 +30,7 @@ export async function createSqliteHistoryStore(options:SqliteHistoryOptions) {
     createAuthoritativeBridge:(o:import('./sqlite-history/authoritative').HistoryAuthoritativeBridgeOptions)=>new authoritative.AuthoritativeHistoryBridge(store,o),
     // Wave 6. Opt-in expansion tooling and write-path router; no production group is enabled here.
     createRolloutAllowlist:(o:{directory:string;declaredGroups:readonly string[];mirrorDirectory:string})=>new rollout.HistoryRolloutAllowlist(store,o),
-    createRolloutRouter:(o:{allowlist:InstanceType<typeof rollout.HistoryRolloutAllowlist>;sqlite:rollout.HistoryWriter;legacy:rollout.HistoryWriter})=>new rollout.HistoryRolloutRouter(store,o.allowlist,{sqlite:o.sqlite,legacy:o.legacy}),
+    createRolloutRouter:(o:{allowlist:HistoryRolloutAllowlist;sqlite:HistoryWriter;legacy:HistoryWriter})=>new rollout.HistoryRolloutRouter(store,o.allowlist,{sqlite:o.sqlite,legacy:o.legacy}),
     assessGroupReadiness:(group:string,mirrorDirectory:string)=>rollout.assessGroupReadiness(store,group,mirrorDirectory),
     expandGroup:(allowlist:InstanceType<typeof rollout.HistoryRolloutAllowlist>,group:string,o:{mirrorDirectory:string;scratchDirectory:string})=>rollout.expandGroup(store,allowlist,group,o),
     auditBackupCoverage:(mirrorDirectory:string)=>rollout.auditBackupCoverage(store,mirrorDirectory),
