@@ -1,7 +1,40 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.1-dist`.
+
+## v0.20.1 — 2026-09-10
+
+Patch. No new exports, no signature changes, no migration. A running Claude
+Bash call that still paints `Running…` / `starting…` on its first `⎿` row now
+collapses in HIDE mode. 0.20.0 treated that shape as a completed block with no
+closing boundary, so the detector discarded it and the full streaming output
+stayed on screen.
+
+### Fixed
+
+- **A Bash block that is still running now collapses in HIDE mode.** Claude
+  often keeps the green `●` marker while the command runs, and puts a live
+  status (`Running…`, `starting…`, `running...`, optionally with a duration
+  such as `(10s)` or `(1m 24s · timeout 10m)`) on the first `  ⎿ ` row. The
+  detector used to classify any green `● Bash(` header as completed. A
+  completed header without a closing boundary is then thrown away — that
+  fail-open is correct for a capture cut after real result text, because
+  collapsing it would hide an unknown tail and send incomplete output to the
+  summarizer. The live-status shape is not that case: there is a result
+  delimiter, the first `⎿` body is a live status, and there is no closing
+  boundary yet. Those blocks are now projected as `active` through the current
+  capture edge, so HIDE can collapse them. They are never offered to the
+  summarizer. A completed call whose capture was cut (`● Bash(printf cut)` +
+  `  ⎿  cut`, or `Running in the background` with no ellipsis after Running)
+  still fails open.
+
+Version and internal ranges move together. `server`, `svelte` and `app` each
+carry `@thumbmux/core`, and `app` also `@thumbmux/svelte`, at `^0.20.1`.
+`^0.20.0` already matches this patch on the `0.x` caret rule, but the release
+gate requires the five manifests and the lockfile to name the tag version
+exactly. Consumer pins in the root and brain-ui manifests are deliberately
+untouched. They move only after the public repo publishes `v0.20.1-dist`.
 
 ## v0.20.0 — 2026-09-10
 
