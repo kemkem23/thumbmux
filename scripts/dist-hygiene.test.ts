@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import * as serverBarrel from "../server/src";
+import { RELEASE_PACKAGE_EXPORTS } from "./prepare-release-package";
 
 const PACKAGE_ROOT = join(import.meta.dir, "..");
 const GIT_DIST_ROOT = join(PACKAGE_ROOT, "git-dist");
@@ -47,27 +48,43 @@ describe("git-dist hygiene", () => {
   });
 
   /**
-   * The recall store is the only module in the package that loads a database
-   * driver. Importing thumbmux/server must not pull it in: a host that only
-   * wants the WebSocket engine would start paying for bun:sqlite, and a
-   * non-Bun bundler resolving the barrel would fail on a module it has no
-   * reason to see. Reading the built barrel is the only honest check — the
-   * source barrel not naming it proves nothing about what the bundle inlined.
+   * Recall and sqlite-history are the only modules in the package that load a
+   * database driver. Importing thumbmux/server must not pull either in: a host
+   * that only wants the WebSocket engine would start paying for bun:sqlite,
+   * and a non-Bun bundler resolving the barrel would fail on a module it has
+   * no reason to see. Reading the built barrel is the only honest check — the
+   * source barrel not naming them proves nothing about what the bundle inlined.
    */
   test("the server barrel never statically imports a sqlite driver", () => {
     const barrel = readFileSync(join(GIT_DIST_ROOT, "server", "index.js"), "utf8");
     expect(barrel).not.toMatch(/import\s[^;]*from\s*["'](?:bun|node):sqlite["']/);
     expect(barrel).not.toMatch(/from\s*["']\.\/recall-handler/);
+    expect(barrel).not.toMatch(/from\s*["']\.\/sqlite-history/);
     expect(Object.keys(serverBarrel)).not.toContain("createRecallHandler");
+    expect(Object.keys(serverBarrel)).not.toContain("createSqliteHistoryStore");
 
-    // …and the module it is kept out of the barrel for really does exist,
-    // really does load the driver, and is reachable on its own path.
+    // …and the modules they are kept out of the barrel for really do exist,
+    // really do load the driver, and are reachable on their own paths.
     const recall = readFileSync(join(GIT_DIST_ROOT, "server", "recall-handler.js"), "utf8");
     expect(recall).toMatch(/from\s*["']bun:sqlite["']/);
+    const sqliteHistory = readFileSync(join(GIT_DIST_ROOT, "server", "sqlite-history.js"), "utf8");
+    expect(sqliteHistory).toMatch(/["']bun:sqlite["']/);
     const exportsMap = JSON.parse(
       readFileSync(join(PACKAGE_ROOT, "server", "package.json"), "utf8"),
     ).exports as Record<string, { import?: string }>;
     expect(exportsMap["./recall"]?.import).toBe("./dist/recall-handler.js");
+    expect(exportsMap["./sqlite-history"]?.import).toBe("./dist/sqlite-history.js");
+  });
+
+  test("the release package exports ./server/sqlite-history onto git-dist", () => {
+    const subpath = "./server/sqlite-history";
+    const keys = Object.keys(RELEASE_PACKAGE_EXPORTS);
+    expect(keys, "RELEASE_PACKAGE_EXPORTS is missing ./server/sqlite-history").toContain(subpath);
+    const entry = (RELEASE_PACKAGE_EXPORTS as Record<string, { types?: string; import?: string }>)[subpath];
+    expect(entry?.types).toBe("./git-dist/server/sqlite-history.d.ts");
+    expect(entry?.import).toBe("./git-dist/server/sqlite-history.js");
+    expect(existsSync(join(GIT_DIST_ROOT, "server", "sqlite-history.d.ts"))).toBe(true);
+    expect(existsSync(join(GIT_DIST_ROOT, "server", "sqlite-history.js"))).toBe(true);
   });
 
   test("the exact pane target helper is callable from the server barrel", () => {
