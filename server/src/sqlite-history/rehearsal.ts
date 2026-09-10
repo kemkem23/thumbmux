@@ -3,7 +3,7 @@ import { TextDecoder } from 'node:util';
 import { parseReplayJournal } from '@thumbmux/core';
 import { rowsDigest, safe, sha } from './codec';
 import type { HistoryStore } from './store';
-import { importHistorySnapshot, readSeal } from './transfer';
+import { importHistorySnapshot, isHostChunksOrphanJson, readSeal } from './transfer';
 import type {
   ClosedHistoryImportOptions, ClosedHistoryImportResult, HistoryImportOptions,
   HistoryRow, LegacyFormat, MigrationUnresolvedEntry, MigrationVerification,
@@ -66,7 +66,7 @@ export function readSealedHistoryOracle(directory: string, format: LegacyFormat)
       if (!Array.isArray(values) || values.length !== chunk.lineCount) throw new Error('oracle-chunk-count');
       values.forEach((text, index) => add(chunk.startLine + index, text));
     }
-    if ([...files.keys()].some(name => name.endsWith('.json') && name !== 'manifest.json' && !listed.has(name))) throw new Error('oracle-orphan-chunk');
+    if ([...files.keys()].some(name => isHostChunksOrphanJson(name, listed))) throw new Error('oracle-orphan-chunk');
   } else {
     const journals = [...files.keys()].filter(name => name.endsWith('.ndjson'));
     const name = files.has('journal.ndjson') ? 'journal.ndjson' : journals.length === 1 ? journals[0] : 'journal.ndjson';
