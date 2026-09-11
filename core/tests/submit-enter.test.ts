@@ -30,12 +30,14 @@ describe("submitPlan always delivers Enter", () => {
     }
   });
 
-  test("the extra-enter agent keeps text, Enter, and the delayed second Enter", () => {
-    expect(submitPlan("hello", { agent: namedAgent("co", "dex") })).toEqual([
-      { keys: "hello", delayBeforeMs: 0 },
-      { keys: "\r", delayBeforeMs: 150 },
-      { keys: "\r", delayBeforeMs: 1000 },
-    ]);
+  test("the extra-enter agents keep text, Enter, and the delayed second Enter", () => {
+    for (const agent of [namedAgent("co", "dex"), namedAgent("clau", "de"), namedAgent("gr", "ok")]) {
+      expect(submitPlan("hello", { agent })).toEqual([
+        { keys: "hello", delayBeforeMs: 0 },
+        { keys: "\r", delayBeforeMs: 150 },
+        { keys: "\r", delayBeforeMs: 1000 },
+      ]);
+    }
   });
 
   test("no option can suppress the Enter", () => {

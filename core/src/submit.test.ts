@@ -60,17 +60,19 @@ describe('submitPlan', () => {
     ]);
   });
 
-  test('first named agent uses the default two-step plan', () => {
+  test('first named agent (claude) adds a second delayed Enter', () => {
     expect(submitPlan('go', { agent: namedAgent('clau', 'de') })).toEqual([
       { keys: 'go', delayBeforeMs: 0 },
       { keys: '\r', delayBeforeMs: 150 },
+      { keys: '\r', delayBeforeMs: 1000 },
     ]);
   });
 
-  test('third named agent uses the default two-step plan', () => {
+  test('third named agent (grok) adds a second delayed Enter', () => {
     expect(submitPlan('go', { agent: namedAgent('gr', 'ok') })).toEqual([
       { keys: 'go', delayBeforeMs: 0 },
       { keys: '\r', delayBeforeMs: 150 },
+      { keys: '\r', delayBeforeMs: 1000 },
     ]);
   });
 

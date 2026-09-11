@@ -14,7 +14,14 @@ export type SubmitPlanOptions = {
 
 const DEFAULT_ENTER_DELAY_MS = 150;
 const EXTRA_ENTER_DELAY_MS = 1000;
-const EXTRA_ENTER_AGENT: SubmitAgent = `${'co'}${'dex'}`;
+
+function isExtraEnterAgent(agent?: SubmitAgent): boolean {
+  return (
+    agent === `${'co'}${'dex'}` ||
+    agent === `${'clau'}${'de'}` ||
+    agent === `${'gr'}${'ok'}`
+  );
+}
 
 /**
  * Builds keystroke batches for submitting composed text to an alt-screen TUI.
@@ -45,7 +52,7 @@ export function submitPlan(text: string, opts: SubmitPlanOptions = {}): SubmitSt
   }
 
   steps.push({ keys: '\r', delayBeforeMs: enterDelayMs });
-  if (opts.agent === EXTRA_ENTER_AGENT) {
+  if (isExtraEnterAgent(opts.agent)) {
     steps.push({ keys: '\r', delayBeforeMs: EXTRA_ENTER_DELAY_MS });
   }
 
