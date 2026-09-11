@@ -176,6 +176,120 @@ describe("A6-2 ComposerDock isComposing", () => {
     expect(texts).toEqual([]);
     expect(keys).toEqual([]);
   });
+
+  test("COMPOSE Enter with lingering keyCode 229 after composition does SEND", async () => {
+    let text = "thai-finished";
+    const sent: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      mode: "compose",
+      get text() {
+        return text;
+      },
+      set text(v: string) {
+        text = v;
+      },
+      onSend: (t: string) => sent.push(t),
+      onDirectText: () => {},
+      onDirectKey: () => {},
+    });
+    await tick();
+
+    const ta = target.querySelector<HTMLTextAreaElement>("textarea");
+    if (!ta) throw new Error("compose textarea missing");
+
+    // Simulate IME composition start and end (e.g. Thai Gboard or mobile browser)
+    flushSync(() => {
+      ta.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+      ta.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+
+    // Wait past the candidate-settle window (50ms)
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Now user presses Enter on virtual keyboard: keyCode is 229, isComposing is false
+    const enterEv = new KeyboardEvent("keydown", {
+      key: "Enter",
+      keyCode: 229,
+      bubbles: true,
+      cancelable: true,
+    });
+    flushSync(() => ta.dispatchEvent(enterEv));
+
+    // Must SEND the finished text!
+    expect(sent).toEqual(["thai-finished"]);
+  });
+
+  test("COMPOSE candidate accept Enter (within settle window) does not SEND", async () => {
+    let text = "candidate";
+    const sent: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      mode: "compose",
+      get text() {
+        return text;
+      },
+      set text(v: string) {
+        text = v;
+      },
+      onSend: (t: string) => sent.push(t),
+      onDirectText: () => {},
+      onDirectKey: () => {},
+    });
+    await tick();
+
+    const ta = target.querySelector<HTMLTextAreaElement>("textarea");
+    if (!ta) throw new Error("compose textarea missing");
+
+    // Candidate accept: compositionend followed IMMEDIATELY by Enter keydown (0ms)
+    flushSync(() => {
+      ta.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+      ta.dispatchEvent(new Event("compositionend", { bubbles: true }));
+      const enterEv = new KeyboardEvent("keydown", {
+        key: "Enter",
+        keyCode: 229,
+        bubbles: true,
+        cancelable: true,
+      });
+      ta.dispatchEvent(enterEv);
+    });
+
+    expect(sent).toEqual([]);
+  });
+
+  test("DIRECT Enter with lingering keyCode 229 after composition relays Enter", async () => {
+    const keys: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      mode: "direct",
+      onSend: () => {},
+      onDirectText: () => {},
+      onDirectKey: (s: string) => keys.push(s),
+    });
+    await tick();
+
+    const ghost = target.querySelector<HTMLInputElement>('[data-testid="ghost-key"]');
+    if (!ghost) throw new Error("ghost-key missing");
+
+    flushSync(() => {
+      ghost.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+      ghost.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    flushSync(() => {
+      const enterEv = new KeyboardEvent("keydown", {
+        key: "Enter",
+        keyCode: 229,
+        bubbles: true,
+        cancelable: true,
+      });
+      ghost.dispatchEvent(enterEv);
+    });
+
+    expect(keys).toEqual(["\r"]);
+  });
 });
 
 // ─── TM-24: DIRECT must use the shared terminal key encoder ─────────────────
