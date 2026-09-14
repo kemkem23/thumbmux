@@ -949,7 +949,8 @@ export class TmuxWsMux<
   private screenEq(a: MuxPaneScreen | null | undefined, b: MuxPaneScreen | null | undefined): boolean {
     const x = a ?? null, y = b ?? null;
     if (x === null || y === null) return x === y;
-    return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny;
+    return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny
+      && x.previewState === y.previewState && x.previewHasFrame === y.previewHasFrame;
   }
 
   private boundaryEq(a: MuxHistoryBoundary | undefined, b: MuxHistoryBoundary | undefined): boolean {

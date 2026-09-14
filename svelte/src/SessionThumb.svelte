@@ -28,6 +28,8 @@
 
   let content = $state('');
   let connected = $state(false);
+  let previewState = $state('live');
+  let hasFrame = $state(false);
   let thumbEl = $state<HTMLDivElement | null>(null);
   let renderPalette = $derived(previewBackground
     ? { ...palette, defaultBg: previewBackground }
@@ -131,11 +133,17 @@
     let active = true;
     content = '';
     connected = false;
-    const unsubscribe = tmuxMux.subscribe(name, (data, type) => {
+    previewState = 'live';
+    hasFrame = false;
+    const unsubscribe = tmuxMux.subscribe(name, (data, type, _cursor, meta) => {
       if (!active) return;
-      if (type === 'history' || type === 'error' || type === 'cursor') return;
-      connected = true;
-      content = data;
+      if (type === 'history' || type === 'cursor') return;
+      if (type === 'error') { connected = false; previewState = 'unavailable'; return; }
+      const screen = meta?.screen;
+      previewState = screen?.previewState ?? 'live';
+      connected = previewState === 'live';
+      hasFrame = screen?.previewHasFrame ?? true;
+      if (type !== 'cursor') content = data;
     }, { tail });
     return () => {
       active = false;
@@ -154,10 +162,11 @@
   style:--tbg={thumbPalette.defaultBg}
   data-testid="session-thumb"
   data-live={connected}
+  data-preview-state={previewState}
   inert
   aria-hidden="true"
 >
-  {#if connected}
+  {#if hasFrame}
     <div class="tail">
       {#each lines as lineHtml, i (i)}
         <div class="mtv-line">{@html lineHtml}</div>
@@ -166,9 +175,27 @@
   {:else}
     <div class="wait">…</div>
   {/if}
+  {#if previewState !== 'live'}
+    <div class="preview-status" data-testid="session-thumb-status">
+      {previewState === 'orphaned'
+        ? (hasFrame ? 'ภาพเก่า · ห้องหยุดทำงานแล้ว' : 'ห้องหยุดทำงานแล้ว · ไม่มีภาพที่ยืนยันได้')
+        : previewState === 'ended' ? 'ภาพเก่า · ห้องจบแล้ว' : 'ยังยืนยันภาพสดไม่ได้'}
+    </div>
+  {/if}
 </div>
 
 <style>
+  .preview-status {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    right: 3px;
+    padding: 3px 5px;
+    background: #302719;
+    color: #ffe1a3;
+    font: 11px/1.4 sans-serif;
+    z-index: 1;
+  }
   .thumb {
     position: absolute;
     inset: 0;
