@@ -248,13 +248,13 @@
   {
     "name": "ExtractRecentPromptsFromPaneOptions",
     "kind": "type",
-    "signature": "442b68363aba9d42fd8aef87ab18ef4ad2ae69a745b84d54ae69a081c42f232b",
+    "signature": "c845a80694cf98dabc7f4f359722ff0cec6bbddcc9be6c57d3a14dce40ac1c75",
     "tier": "F"
   },
   {
     "name": "ExtractRecentPromptsOptions",
     "kind": "type",
-    "signature": "8eecf6e91af1b31eb790d51716109086f3fa4cfc81fcb13c8c9575a8c7e430a0",
+    "signature": "7428b67e82e52b5060c6b4ee47e800ba6a7d57d65a77cd9c66983a18584973a8",
     "tier": "F"
   },
   {
@@ -830,13 +830,13 @@
   {
     "name": "extractRecentPrompts",
     "kind": "value",
-    "signature": "fccafc5280634036ff7bea22e55cfc395e5a9415b5954f120c240b88f3a2e430",
+    "signature": "cf855e762e16071bf2a695f653c656518c483b79dbda04d786fde700239c2f93",
     "tier": "F"
   },
   {
     "name": "extractRecentPromptsFromPane",
     "kind": "value",
-    "signature": "ae8ce06a4c2692ebfda72f1b299e990b0b680e590c6ae9ac2d6b7de5dcc0c708",
+    "signature": "89b038aadc04853ba1e2b4262a7da432bb998604dfc61ab6fe859e0761ad0b52",
     "tier": "F"
   },
   {
