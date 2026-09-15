@@ -79,6 +79,8 @@ export type SessionGridProps = {
   copyNameLabel?: string;
   expandLabel?: string;
   killLabel?: string;
+  /** Host formatter for the verified preview timestamp shown in stale labels. */
+  formatPreviewLastSuccessfulAt?: (timestamp: number) => string;
 };
 
 export type DisplaySessionName = {

@@ -185,6 +185,8 @@ export type TerminalReplayResult = {
   ended: boolean;
   walOffset: number;
   sequence: bigint;
+  /** Timestamp of the newest complete WAL record included in this replay. */
+  lastRecordAt?: number;
   /** More complete WAL records were visible after this bounded checkpoint. */
   hasMoreWal: boolean;
   historyBytes: number;
@@ -2380,6 +2382,7 @@ export class TerminalReplaySession {
       ended: snapshot.lifecycle === "ended",
       walOffset: this.lastOffset,
       sequence: this.lastSequence,
+      lastRecordAt: this.lastAt,
       hasMoreWal: this.hasMoreWal,
       historyBytes: this.history.bytes,
       identity: snapshot.identity,

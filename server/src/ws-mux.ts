@@ -950,7 +950,8 @@ export class TmuxWsMux<
     const x = a ?? null, y = b ?? null;
     if (x === null || y === null) return x === y;
     return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny
-      && x.previewState === y.previewState && x.previewHasFrame === y.previewHasFrame;
+      && x.previewState === y.previewState && x.previewHasFrame === y.previewHasFrame
+      && x.previewLastSuccessfulAt === y.previewLastSuccessfulAt;
   }
 
   private boundaryEq(a: MuxHistoryBoundary | undefined, b: MuxHistoryBoundary | undefined): boolean {
