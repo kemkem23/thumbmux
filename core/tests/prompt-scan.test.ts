@@ -131,6 +131,34 @@ describe("terminal prompt extraction", () => {
     ]);
   });
 
+  test("preserves multiline autofix reports and user-owned Markdown headings after -J capture", () => {
+    const lines = [
+      "› # AUTO-FIX TASK · user report (autonomous mode)",
+      "",
+      "  You are an auto-fix agent dispatched by the host orchestrator.",
+      "",
+      "  ## User report",
+      "  ทำสองข้อ",
+      "  ## ขั้นตอน",
+      "  1. แก้ parser",
+      "  2. ห้าม deploy",
+      "  <!-- thumbmux:user-report:end -->",
+      "",
+      "  ## Source",
+      "  Telegram /fix",
+      "",
+      "  ## Workflow (execute end-to-end, do not pause)",
+      "  1. Inspect",
+      "● response body",
+    ];
+    const expected = ["ทำสองข้อ\n## ขั้นตอน\n1. แก้ parser\n2. ห้าม deploy"];
+
+    expect({
+      lines: extractRecentPrompts(lines, { wrapJoined: true }),
+      pane: extractRecentPromptsFromPane(lines.join("\n"), 5, { wrapJoined: true }),
+    }).toEqual({ lines: expected, pane: expected });
+  });
+
   test("keeps normal claude and codex prompts in recency order without status chrome", () => {
     // Realistic pane order: each submitted prompt is followed by its response;
     // the empty composer + status chrome sit at the very bottom.

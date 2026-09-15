@@ -217,18 +217,37 @@ function cleanPromptLine(line: string): string {
     .trimEnd();
 }
 
-function extractMarkdownSection(lines: string[], title: string): string | null {
+const USER_REPORT_END_MARKER = "<!-- thumbmux:user-report:end -->";
+
+function isLegacyUserReportBoundary(line: string): boolean {
+  const trimmed = line.trim();
+  return /^##\s+(?:Attached screenshots|Source)\s*$/i.test(trimmed)
+    || /^##\s+Workflow\s+\(execute end-to-end, do not pause\)\s*$/i.test(trimmed);
+}
+
+function extractMarkdownSection(
+  lines: string[],
+  title: string,
+  preserveNewlines: boolean,
+): string | null {
   const heading = new RegExp(`^#{2,6}\\s+${title}\\s*$`, "i");
   const start = lines.findIndex((line) => heading.test(line.trim()));
   if (start < 0) return null;
 
   const section: string[] = [];
   for (const line of lines.slice(start + 1)) {
-    if (/^#{2,6}\s+\S/.test(line.trim())) break;
+    // Current autofix wrappers put an explicit sentinel after the verbatim
+    // report. It is the only unambiguous boundary because Markdown headings
+    // inside the report belong to the user. The exact legacy wrapper headings
+    // remain a fallback for prompts captured before the sentinel was added;
+    // arbitrary headings (for example `## ขั้นตอน`) must stay in the payload.
+    if (line.trim() === USER_REPORT_END_MARKER || isLegacyUserReportBoundary(line)) break;
     section.push(line);
   }
 
-  const text = section.join(" ").replace(/\s+/g, " ").trim();
+  const text = preserveNewlines
+    ? section.join("\n").trim()
+    : section.join(" ").replace(/\s+/g, " ").trim();
   return text || null;
 }
 
@@ -237,7 +256,7 @@ function normalizePromptBlock(lines: string[], wrapJoined: boolean): string {
     .map(cleanPromptLine)
     .filter((line, index, all) => line.trim() || (index > 0 && index < all.length - 1));
 
-  const userReport = extractMarkdownSection(cleanLines, "User report");
+  const userReport = extractMarkdownSection(cleanLines, "User report", wrapJoined);
   if (userReport) return userReport;
 
   if (wrapJoined) {
