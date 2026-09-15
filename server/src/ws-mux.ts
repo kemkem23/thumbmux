@@ -116,6 +116,8 @@ export interface HistoryArchiveLike {
       previousContent: string | null;
       fullHistory: boolean;
       liveLineLimit: number;
+      /** Requested capture scope; fewer visible rows do not prove departure. */
+      captureStartLine?: number;
       /** Replace the live archive window in place after a pane reflow. */
       replace?: boolean;
       /** Exact token returned by the driver's atomic canonical capture. */
@@ -2078,6 +2080,7 @@ export class TmuxWsMux<
             previousContent,
             fullHistory: !!opts.fullHistory,
             liveLineLimit: this.liveLineLimit,
+            captureStartLine: profile.currentPaneOnly ? 0 : startLine,
             replace: archiveReflowGeneration !== undefined || undefined,
             captureToken: archiveCaptureToken,
           }).liveContent;
