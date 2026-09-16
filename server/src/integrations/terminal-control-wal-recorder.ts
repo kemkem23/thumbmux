@@ -94,6 +94,7 @@ export type TerminalControlWalRecorderDependencies = {
   reconcilePause?: (
     request: TerminalControlPauseReconcileRequest,
   ) => Promise<TerminalControlRecoveryCapture | void>;
+  onAlert?: (message: string) => void;
   onFatal?: (error: Error) => void;
 };
 
@@ -120,6 +121,7 @@ export type TerminalControlWalRecorderStatus = {
   bufferedControlBytes: number;
   fatalMessage: string | null;
   degraded: boolean;
+  alert: string | null;
 };
 
 export type TerminalControlWalHealth = {
@@ -129,6 +131,7 @@ export type TerminalControlWalHealth = {
   source: TerminalControlSourceIdentity | null;
   updatedAt: number;
   degraded?: boolean;
+  alert?: string;
   error?: string;
 };
 
@@ -567,6 +570,8 @@ export function readTerminalControlWalHealth(directory: string): TerminalControl
     || !Number.isSafeInteger(value.updatedAt)
     || (value.updatedAt as number) < 0
     || (value.source !== null && !isPlainObject(value.source))
+    || (value.degraded !== undefined && typeof value.degraded !== "boolean")
+    || (value.alert !== undefined && typeof value.alert !== "string")
     || (value.error !== undefined && typeof value.error !== "string")) {
     throw new Error("terminal control WAL status file is invalid");
   }
@@ -583,7 +588,7 @@ export function readTerminalControlWalHealth(directory: string): TerminalControl
 export class TerminalControlWalRecorder {
   readonly config: NormalizedTerminalControlWalRecorderConfig;
   private readonly dependencies: Required<Pick<TerminalControlWalRecorderDependencies, "spawnControl" | "resolveIdentity" | "reconcilePause">>
-    & Pick<TerminalControlWalRecorderDependencies, "onFatal">;
+    & Pick<TerminalControlWalRecorderDependencies, "onFatal" | "onAlert">;
   private readonly input = new PassThrough();
   private readonly worker: TerminalWalWorker;
   private readonly sourceEpoch = randomUUID();
@@ -593,6 +598,12 @@ export class TerminalControlWalRecorder {
   private source: TerminalControlSourceIdentity | null = null;
   private fatalError: Error | null = null;
   private degraded = false;
+  private alertMessage: string | null = null;
+  private readonly recoveryQueue: TerminalControlPauseReconcileRequest[] = [];
+  private recoveryRunning = false;
+  private activeRecovery: TerminalControlPauseReconcileRequest | null = null;
+  private readonly settledGapIds = new Set<string>();
+  private pauseTimes: number[] = [];
   private attachCommandDone = false;
   private commandBlock: { at: string; number: string; flags: string } | null = null;
   private sessionChanged: { sessionId: string; session: string } | null = null;
@@ -625,6 +636,7 @@ export class TerminalControlWalRecorder {
       resolveIdentity: dependencies.resolveIdentity ?? resolveTerminalControlSourceIdentity,
       reconcilePause: dependencies.reconcilePause ?? ((request) => defaultReconcilePause(this.config, request)),
       ...(dependencies.onFatal === undefined ? {} : { onFatal: dependencies.onFatal }),
+      ...(dependencies.onAlert === undefined ? {} : { onAlert: dependencies.onAlert }),
     };
     this.worker = new TerminalWalWorker(this.config.worker, { input: this.input, walFormat: 2 });
     this.stream = new TmuxControlStreamBuffer({
@@ -645,6 +657,7 @@ export class TerminalControlWalRecorder {
       bufferedControlBytes: this.stream.bufferedBytes,
       fatalMessage: this.fatalError?.message ?? null,
       degraded: this.degraded,
+      alert: this.alertMessage,
     };
   }
 
@@ -960,45 +973,27 @@ export class TerminalControlWalRecorder {
           missingBytes: null,
           coverage: "unknown",
         });
-        this.continuePane({
+        const request = {
           gapId,
           paneId: event.paneId,
           source,
           capturedSeqBefore: (gap.sequence - 1n).toString(),
-        });
+        };
+        const now = Date.now();
+        this.pauseTimes = this.pauseTimes.filter((at) => now - at < 60_000);
+        this.pauseTimes.push(now);
+        if (this.pauseTimes.length >= 3) {
+          this.tripRecoveryLimit(request, "tmux pause rate reached 3 events within 60 seconds");
+          return;
+        }
+        this.continuePane(request);
       } else {
         // Acknowledge the pending continue timer so it does not fire.
         if (this.pendingContinueAck?.paneId === event.paneId) {
           const pending = this.pendingContinueAck;
           clearTimeout(pending.timer);
           this.pendingContinueAck = null;
-          void this.dependencies.reconcilePause(pending.request).then((capture) => {
-            if (!capture) return;
-            const capturedSeqAfter = this.worker.lastDurableSequence.toString();
-            const identity = capture.identity;
-            this.worker.appendOrderedRecovery({
-              gapId: pending.request.gapId,
-              sourceEpoch: this.sourceEpoch,
-              paneId: pending.request.paneId,
-              provenance: "recovered-from-ring",
-              recoveredBytesBase64: Buffer.from(capture.recoveredBytes).toString("base64"),
-              recoveredRows: capture.recoveredRows,
-              truncated: capture.truncated,
-              identity: {
-                session: identity.session,
-                sessionId: identity.sessionId,
-                windowId: identity.windowId,
-                paneId: identity.paneId,
-                paneTarget: identity.paneTarget,
-                tmuxServerPid: identity.tmuxServerPid,
-                sessionCreated: identity.sessionCreated,
-              },
-              geometry: capture.geometry,
-              capturedSeqBefore: pending.request.capturedSeqBefore,
-              capturedSeqAfter,
-              boundary: capture.boundary,
-            } satisfies OutputWalRecoverySnapshot);
-          }).catch((error) => this.fail(error));
+          this.enqueueRecovery(pending.request);
         }
       }
       return;
@@ -1044,6 +1039,109 @@ export class TerminalControlWalRecorder {
     child.stdin.write(`refresh-client -A "${paneId}:continue"\n`, (error) => {
       if (error) this.fail(error);
     });
+  }
+
+  private enqueueRecovery(request: TerminalControlPauseReconcileRequest): void {
+    this.recoveryQueue.push(request);
+    if (this.recoveryQueue.length + (this.recoveryRunning ? 1 : 0) > 8) {
+      this.tripRecoveryLimit(request, "tmux pause recovery queue exceeded 8 jobs");
+      return;
+    }
+    void this.drainRecoveryQueue();
+  }
+
+  private async drainRecoveryQueue(): Promise<void> {
+    if (this.recoveryRunning || this.fatalError) return;
+    const request = this.recoveryQueue.shift();
+    if (!request) return;
+    this.recoveryRunning = true;
+    this.activeRecovery = request;
+    try {
+      const capture = await this.dependencies.reconcilePause(request);
+      if (!this.settledGapIds.has(request.gapId)) {
+        if (!capture) throw new Error("pause reconciliation returned no result");
+        this.appendRecoveryResult(request, capture);
+      }
+    } catch (error) {
+      if (!this.settledGapIds.has(request.gapId)) this.appendRecoveryFailure(request, error);
+      for (const queued of this.recoveryQueue.splice(0)) {
+        if (!this.settledGapIds.has(queued.gapId)) {
+          this.appendRecoveryFailure(queued, new Error("pause reconciliation aborted after prior failure"));
+        }
+      }
+      this.fail(error);
+    } finally {
+      this.activeRecovery = null;
+      this.recoveryRunning = false;
+      if (!this.fatalError) void this.drainRecoveryQueue();
+    }
+  }
+
+  private recoveryIdentity(identity: TerminalControlSourceIdentity) {
+    return {
+      session: identity.session,
+      sessionId: identity.sessionId,
+      windowId: identity.windowId,
+      paneId: identity.paneId,
+      paneTarget: identity.paneTarget,
+      tmuxServerPid: identity.tmuxServerPid,
+      sessionCreated: identity.sessionCreated,
+    };
+  }
+
+  private appendRecoveryResult(
+    request: TerminalControlPauseReconcileRequest,
+    capture: TerminalControlRecoveryCapture,
+  ): void {
+    const status = capture.boundary === "matched" && !capture.truncated ? "success" : "ambiguous";
+    this.worker.appendOrderedRecovery({
+      gapId: request.gapId,
+      sourceEpoch: this.sourceEpoch,
+      paneId: request.paneId,
+      provenance: "recovered-from-ring",
+      status,
+      recoveredBytesBase64: Buffer.from(capture.recoveredBytes).toString("base64"),
+      recoveredRows: capture.recoveredRows,
+      truncated: capture.truncated,
+      identity: this.recoveryIdentity(capture.identity),
+      geometry: capture.geometry,
+      capturedSeqBefore: request.capturedSeqBefore,
+      capturedSeqAfter: this.worker.lastDurableSequence.toString(),
+      boundary: capture.boundary,
+    } satisfies OutputWalRecoverySnapshot);
+    this.settledGapIds.add(request.gapId);
+  }
+
+  private appendRecoveryFailure(request: TerminalControlPauseReconcileRequest, error: unknown): void {
+    const message = (error instanceof Error ? error.message : String(error)).replace(/[\0\r\n]/g, " ").slice(0, 2_048);
+    this.worker.appendOrderedRecovery({
+      gapId: request.gapId,
+      sourceEpoch: this.sourceEpoch,
+      paneId: request.paneId,
+      provenance: "recovered-from-ring",
+      status: "failed",
+      recoveredBytesBase64: "",
+      recoveredRows: null,
+      truncated: null,
+      identity: this.recoveryIdentity(request.source),
+      geometry: request.source.geometry,
+      capturedSeqBefore: request.capturedSeqBefore,
+      capturedSeqAfter: this.worker.lastDurableSequence.toString(),
+      boundary: null,
+      error: message,
+    });
+    this.settledGapIds.add(request.gapId);
+  }
+
+  private tripRecoveryLimit(current: TerminalControlPauseReconcileRequest, message: string): void {
+    const pending = [this.activeRecovery, ...this.recoveryQueue.splice(0), current]
+      .filter((request): request is TerminalControlPauseReconcileRequest => request !== null);
+    for (const request of pending) {
+      if (!this.settledGapIds.has(request.gapId)) this.appendRecoveryFailure(request, new Error(message));
+    }
+    this.alertMessage = message;
+    this.dependencies.onAlert?.(message);
+    this.fail(new Error(message));
   }
 
   private async finishFromExit(): Promise<void> {
@@ -1119,6 +1217,7 @@ export class TerminalControlWalRecorder {
       source: this.source,
       updatedAt: Date.now(),
       ...(this.degraded ? { degraded: true } : {}),
+      ...(this.alertMessage === null ? {} : { alert: this.alertMessage }),
       ...(error === undefined
         ? {}
         : { error: error.replace(/[\0\r\n]/g, " ").slice(0, 2_048) }),

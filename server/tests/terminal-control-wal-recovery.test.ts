@@ -66,7 +66,13 @@ async function makeReady(reconcilePause: (request: TerminalControlPauseReconcile
 
 test("starts one reconcile after the matching continue acknowledgement and remains degraded", async () => {
   const reconciles: TerminalControlPauseReconcileRequest[] = [];
-  const { fake, recorder } = await makeReady(async (request) => { reconciles.push(request); });
+  const { fake, recorder } = await makeReady(async (request) => {
+    reconciles.push(request);
+    return {
+      recoveredBytes: Buffer.alloc(0), recoveredRows: 0, truncated: false,
+      identity: request.source, geometry: request.source.geometry, boundary: "ambiguous",
+    };
+  });
 
   fake.stdout.write("%pause %42\n");
   expect(reconciles).toHaveLength(0);
@@ -105,4 +111,37 @@ test("stores a bounded capture as recovered-from-ring provenance instead of raw 
     identity: { paneId: "%42", windowId: "@42" },
     geometry: { cols: 80, rows: 24 },
   });
+});
+
+test("serializes repeated pauses and writes a reconcile result for every gapId", async () => {
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const calls: TerminalControlPauseReconcileRequest[] = [];
+  const { directory, fake, recorder } = await makeReady(async (request) => {
+    calls.push(request);
+    if (calls.length === 1) await firstBlocked;
+    if (calls.length === 2) throw new Error("capture failed");
+    return {
+      recoveredBytes: Buffer.from("ring\n"),
+      recoveredRows: 1,
+      truncated: false,
+      identity: request.source,
+      geometry: request.source.geometry,
+      boundary: "matched" as const,
+    };
+  });
+
+  fake.stdout.write("%pause %42\n%continue %42\n%pause %42\n%continue %42\n");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(calls).toHaveLength(1);
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  expect(calls).toHaveLength(2);
+  const recoveries = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
+    .filter((record) => record.kind === "recovery")
+    .map((record) => parseOutputWalJson<{ gapId: string; status: string }>(record));
+  expect(recoveries.map((recovery) => recovery.status)).toEqual(["success", "failed"]);
+  expect(new Set(recoveries.map((recovery) => recovery.gapId)).size).toBe(2);
+  expect(recorder.status.state).toBe("fatal");
 });

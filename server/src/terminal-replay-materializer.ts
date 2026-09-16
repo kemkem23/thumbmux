@@ -2008,7 +2008,7 @@ class ReplayEngine {
           if (recovery.gapId !== this.pendingGapId) {
             throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
           }
-          if (recovery.boundary === "matched" && !recovery.truncated) {
+          if (recovery.status === "success") {
             this.tmux.discardUnseenAndReset(recovery.geometry);
             const recovered = Buffer.from(recovery.recoveredBytesBase64, "base64");
             if (recovered.byteLength > 0) this.tmux.feed(recovered, onHistory);

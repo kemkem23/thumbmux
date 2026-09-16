@@ -825,9 +825,10 @@ export type OutputWalRecoverySnapshot = {
   sourceEpoch: string;
   paneId: string;
   provenance: "recovered-from-ring";
+  status: "success" | "failed" | "ambiguous";
   recoveredBytesBase64: string;
-  recoveredRows: number;
-  truncated: boolean;
+  recoveredRows: number | null;
+  truncated: boolean | null;
   identity: {
     session: string;
     sessionId: string;
@@ -840,7 +841,8 @@ export type OutputWalRecoverySnapshot = {
   geometry: { cols: number; rows: number };
   capturedSeqBefore: string;
   capturedSeqAfter: string;
-  boundary: "matched" | "ambiguous";
+  boundary: "matched" | "ambiguous" | null;
+  error?: string;
 };
 
 export function parseOutputWalRecoveryPayload(payload: Uint8Array): OutputWalRecoverySnapshot {
@@ -853,11 +855,13 @@ export function parseOutputWalRecoveryPayload(payload: Uint8Array): OutputWalRec
     || typeof recovery.sourceEpoch !== "string" || !recovery.sourceEpoch
     || typeof recovery.paneId !== "string" || !/^%[0-9]+$/.test(recovery.paneId)
     || recovery.provenance !== "recovered-from-ring"
+    || (recovery.status !== "success" && recovery.status !== "failed" && recovery.status !== "ambiguous")
     || typeof recovery.recoveredBytesBase64 !== "string"
-    || !Number.isSafeInteger(recovery.recoveredRows) || (recovery.recoveredRows as number) < 0
-    || (recovery.recoveredRows as number) > 10_000
-    || typeof recovery.truncated !== "boolean"
-    || (recovery.boundary !== "matched" && recovery.boundary !== "ambiguous")
+    || (recovery.recoveredRows !== null && (!Number.isSafeInteger(recovery.recoveredRows)
+      || (recovery.recoveredRows as number) < 0 || (recovery.recoveredRows as number) > 10_000))
+    || (recovery.truncated !== null && typeof recovery.truncated !== "boolean")
+    || (recovery.boundary !== null && recovery.boundary !== "matched" && recovery.boundary !== "ambiguous")
+    || (recovery.error !== undefined && typeof recovery.error !== "string")
     || typeof recovery.capturedSeqBefore !== "string" || !/^(0|[1-9][0-9]*)$/.test(recovery.capturedSeqBefore)
     || typeof recovery.capturedSeqAfter !== "string" || !/^(0|[1-9][0-9]*)$/.test(recovery.capturedSeqAfter)
     || BigInt(recovery.capturedSeqAfter) < BigInt(recovery.capturedSeqBefore)
@@ -868,6 +872,14 @@ export function parseOutputWalRecoveryPayload(payload: Uint8Array): OutputWalRec
     || !geometry || !Number.isSafeInteger(geometry.cols) || (geometry.cols as number) <= 0
     || !Number.isSafeInteger(geometry.rows) || (geometry.rows as number) <= 0) {
     throw new Error("invalid WAL recovery snapshot provenance or boundary");
+  }
+  if ((recovery.status === "success" && (recovery.boundary !== "matched" || recovery.truncated !== false
+      || recovery.recoveredRows === null || recovery.error !== undefined))
+    || (recovery.status === "ambiguous" && (recovery.recoveredRows === null || recovery.truncated === null
+      || recovery.boundary === null || recovery.error !== undefined))
+    || (recovery.status === "failed" && (recovery.recoveredRows !== null || recovery.truncated !== null
+      || recovery.boundary !== null || recovery.recoveredBytesBase64 !== "" || typeof recovery.error !== "string"))) {
+    throw new Error("invalid WAL recovery result status fields");
   }
   const recovered = Buffer.from(recovery.recoveredBytesBase64, "base64");
   if (recovered.byteLength > 8 * 1024 * 1024
