@@ -771,9 +771,10 @@ export class TerminalControlWalRecorder {
   private async teardown(writeLifecycleEnd: boolean): Promise<void> {
     if (this.state === "disconnected") return;
     this.state = "exiting";
-    if (this.pendingContinueAck) {
-      clearTimeout(this.pendingContinueAck.timer);
-      this.pendingContinueAck = null;
+    try {
+      this.settleInterruptedRecoveries("recorder stopped before pause recovery completed");
+    } catch (error) {
+      this.fail(error);
     }
     this.process?.stdout.pause();
     this.process?.kill("SIGTERM");
@@ -1065,11 +1066,12 @@ export class TerminalControlWalRecorder {
     this.activeRecovery = request;
     try {
       const capture = await this.dependencies.reconcilePause(request);
-      if (!this.settledGapIds.has(request.gapId)) {
+      if (!this.shouldStopReading() && !this.settledGapIds.has(request.gapId)) {
         if (!capture) throw new Error("pause reconciliation returned no result");
         this.appendRecoveryResult(request, capture);
       }
     } catch (error) {
+      if (this.shouldStopReading()) return;
       if (!this.settledGapIds.has(request.gapId)) this.appendRecoveryFailure(request, error);
       for (const queued of this.recoveryQueue.splice(0)) {
         if (!this.settledGapIds.has(queued.gapId)) {
@@ -1080,7 +1082,7 @@ export class TerminalControlWalRecorder {
     } finally {
       this.activeRecovery = null;
       this.recoveryRunning = false;
-      if (!this.fatalError) void this.drainRecoveryQueue();
+      if (!this.shouldStopReading()) void this.drainRecoveryQueue();
     }
   }
 
@@ -1151,6 +1153,18 @@ export class TerminalControlWalRecorder {
     this.fail(new Error(message));
   }
 
+  /** Persist cancellation before closing the writer; late capture callbacks
+   * must never resurrect this source epoch or write into a stopped worker. */
+  private settleInterruptedRecoveries(reason: string): void {
+    const requests = [this.activeRecovery, ...this.recoveryQueue.splice(0), this.pendingContinueAck?.request];
+    if (this.pendingContinueAck) clearTimeout(this.pendingContinueAck.timer);
+    this.pendingContinueAck = null;
+    for (const request of requests) {
+      if (!request || this.settledGapIds.has(request.gapId)) continue;
+      if (this.worker.status.started) this.appendRecoveryFailure(request, new Error(reason));
+    }
+  }
+
   private async finishFromExit(): Promise<void> {
     try {
       if (!this.worker.status.started) {
@@ -1162,6 +1176,7 @@ export class TerminalControlWalRecorder {
       // source epoch and must not turn a safely drained END into a fatal.
       // %exit closes only this source epoch. The logical instance remains
       // active unless the host durably armed an explicit logical END first.
+      this.settleInterruptedRecoveries("source exited before pause recovery completed");
       if (this.endOnSourceExit) await this.worker.closeLogicalLifecycle();
       else await this.worker.stop();
       this.endOnSourceExit = false;
@@ -1177,11 +1192,11 @@ export class TerminalControlWalRecorder {
     if (this.fatalError || this.state === "disconnected") return;
     this.fatalError = error instanceof Error ? error : new Error(String(error));
     this.state = "fatal";
-    // Cancel any pending %continue acknowledgement timer to avoid a second
-    // call to fail() after the first one has already set the fatal state.
-    if (this.pendingContinueAck) {
-      clearTimeout(this.pendingContinueAck.timer);
-      this.pendingContinueAck = null;
+    try {
+      this.settleInterruptedRecoveries("recorder failed before pause recovery completed");
+    } catch {
+      // Preserve the original error when storage itself cannot accept a
+      // cancellation. The durable gap still marks the missing interval.
     }
     // Detach only this read-only control client. The pane and tmux server are
     // owned by the host and must survive recorder failure/retry.
