@@ -1,3 +1,6 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { TerminalReplayMaterializer } from "../src/terminal-replay-materializer";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -189,3 +192,63 @@ test("supervisor retries failed recorder epochs after 5, 15, and 60 seconds then
   expect(alerts).toHaveLength(1);
   expect(alerts[0]).toContain("3 retries within 5 minutes");
 });
+
+test("command response payload cannot manufacture output or pause notifications", async () => {
+  const calls: string[] = [];
+  const { directory, fake, recorder } = await makeReady(async (request) => { calls.push(request.gapId); });
+  fake.stdout.write("%begin 3 3 1\n%output %42 FALSE_OUTPUT\n%pause %42\n");
+  fake.stdout.write(Buffer.from("ตัวอักษรในผลคำสั่ง\n"));
+  fake.stdout.write("%end 3 3 1\n%output %42 REAL_OUTPUT\n");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output"]);
+  expect(Buffer.from(records[1]!.payload).toString()).toBe("REAL_OUTPUT");
+  expect(recorder.status.state).toBe("ready");
+  expect(calls).toEqual([]);
+});
+
+test("default reconcile captures a real private pane and ambiguous recovery stays readable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "default-recovery-"));
+  roots.push(root);
+  const socket = join(root, "source.sock");
+  const env = { ...process.env };
+  delete env.TMUX; delete env.TMUX_PANE;
+  const tmux = (...args: string[]) => execFileSync("tmux", ["-S", socket, ...args], { env, encoding: "utf8" }).trimEnd();
+  let recorder: TerminalControlWalRecorder | undefined;
+  try {
+    tmux("new-session", "-d", "-s", "default-proof", "-x", "80", "-y", "24", "sh -c 'printf RING_FROM_REAL_PANE; sleep 60'");
+    expect(tmux("display-message", "-p", "#{socket_path}")).toBe(socket);
+    const [sessionId, paneId, pid, created] = tmux("display-message", "-p", "-t", "=default-proof:0.0",
+      "#{session_id}|#{pane_id}|#{pid}|#{session_created}").split("|");
+    const directory = join(root, "lane");
+    const fake = new FakeControlProcess();
+    recorder = new TerminalControlWalRecorder({
+      tmux: { socketPath: socket },
+      worker: { directory, identity: { session: "default-proof", instanceId: "default-proof-instance",
+        paneTarget: "=default-proof:0.0", tmuxServerPid: Number(pid), sessionCreated: Number(created) },
+        geometry: { cols: 80, rows: 24 } },
+    }, { spawnControl: () => fake }); // No reconcilePause or resolveIdentity replacement.
+    const starting = recorder.start();
+    fake.stdout.write(`%begin 1 1 0\n%end 1 1 0\n%session-changed ${sessionId} default-proof\n`);
+    await starting;
+    fake.stdout.write(`%output ${paneId} BEFORE_DEFAULT\\015\\012\n%pause ${paneId}\n%continue ${paneId}\n%output ${paneId} SUFFIX_DURING_CAPTURE\\015\\012\n`);
+    const walPath = resolveTerminalWalPaths(directory).walPath;
+    const deadline = Date.now() + 5_000;
+    while (![...readOutputWal(walPath)].some((record) => record.kind === "recovery") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const recoveryRecord = [...readOutputWal(walPath)].find((record) => record.kind === "recovery");
+    expect(recoveryRecord).toBeDefined();
+    const recovery = parseOutputWalJson<{ status: string; recoveredBytesBase64: string }>(recoveryRecord!);
+    expect(recovery.status).toBe("ambiguous");
+    expect(Buffer.from(recovery.recoveredBytesBase64, "base64").toString()).toContain("RING_FROM_REAL_PANE");
+    fake.stdout.write(`%output ${paneId} AFTER_DEFAULT\\015\\012\n`);
+    await recorder.stop();
+    const result = new TerminalReplayMaterializer({ walPath, stateDir: join(root, "view") }).materialize();
+    const rendered = readFileSync(result.historyPath, "utf8") + Buffer.from(result.screen!.cellsBase64, "base64").toString();
+    for (const text of ["BEFORE_DEFAULT", "SUFFIX_DURING_CAPTURE", "AFTER_DEFAULT", "ประวัติขาดช่วง", "recovered-from-ring", "RING_FROM_REAL_PANE"]) expect(rendered).toContain(text);
+  } finally {
+    await recorder?.stop();
+    tmux("kill-server");
+  }
+}, 30_000);
