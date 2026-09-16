@@ -1972,13 +1972,6 @@ class ReplayEngine {
     onHistory: (captured: Uint8Array) => void,
   ): void {
     try {
-      if (this.pendingGapId && record.kind !== "gap" && record.kind !== "recovery") {
-        // Output/layout observed while capture-pane runs is already covered by
-        // capturedSeqAfter when a matched snapshot is committed. Never feed it
-        // into a VT state whose prefix is known to be incomplete.
-        this.recordsSeen += 1;
-        return;
-      }
       switch (record.kind) {
         case "lifecycle":
           this.processLifecycle(record, parseLifecycle(parseOutputWalJson(record)), onHistory);
@@ -2001,6 +1994,7 @@ class ReplayEngine {
         case "gap":
           this.requireActive(record);
           this.pendingGapId = parseOutputWalGapPayload(record.payload).gapId;
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(this.pendingGapId)}]\n`));
           break;
         case "recovery": {
           this.requireActive(record);
@@ -2014,8 +2008,9 @@ class ReplayEngine {
             if (recovered.byteLength > 0) this.tmux.feed(recovered, onHistory);
             this.geometry = recovery.geometry;
             this.hasOutputInGeneration = recovered.byteLength > 0;
-            this.pendingGapId = null;
           }
+          onHistory(Buffer.from(`[ผลกู้ประวัติ gap ${JSON.stringify(recovery.gapId)}; สถานะ: ${recovery.status}]\n`));
+          this.pendingGapId = null;
           break;
         }
         case "checkpoint":
@@ -2033,9 +2028,6 @@ class ReplayEngine {
   }
 
   snapshot(): ReplaySnapshot {
-    if (this.pendingGapId) {
-      throw new Error(`unavailable: durable tmux-pause gap ${this.pendingGapId} was not unambiguously recovered`);
-    }
     return {
       lifecycle: this.lifecycle,
       identity: this.identity ? { ...this.identity } : null,
