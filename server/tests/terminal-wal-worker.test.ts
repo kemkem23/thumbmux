@@ -230,52 +230,51 @@ describe("terminal WAL stdin worker and controller", () => {
     expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint"]);
   });
 
-  test("writes RESUME for the same logical identity while allowing a new tmux source epoch", async () => {
+  test("clean stop resumes a new source epoch without a gap", async () => {
     const directory = makeRoot();
     const first = await startWorker(config(directory), new PassThrough(), 2);
-    first.input.write(Buffer.from("before unclean stop"));
-    await first.controller.barrier("barrier:before-unclean-stop");
+    first.input.write(Buffer.from("BEFORE"));
+    await first.controller.barrier("barrier:before");
     first.controller.close();
-    controllers = controllers.filter((value) => value !== first.controller);
     await first.worker.stop();
-
-    const secondIdentity = identity({
-      paneTarget: "=durable-agent-1:2.1",
-      tmuxServerPid: 5678,
-      sessionCreated: 1_700_000_999,
+    const stopped = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    const detached = stopped.at(-1)!;
+    expect(parseOutputWalJson(detached)).toEqual({
+      event: "source-detached", version: 1,
+      lastDurableSeq: stopped.at(-2)!.sequence.toString(),
     });
-    const second = await startWorker(config(directory, {
-      identity: secondIdentity,
-      geometry: { cols: 120, rows: 40 },
-    }), new PassThrough(), 2);
-    second.input.write(Buffer.from("after unclean resume"));
-    await second.controller.barrier("barrier:resumed");
-
+    const secondIdentity = identity({ tmuxServerPid: 5678, sessionCreated: 1_700_000_999 });
+    const second = await startWorker(config(directory, { identity: secondIdentity }), new PassThrough(), 2);
+    second.input.write(Buffer.from("AFTER"));
+    await second.controller.barrier("barrier:after");
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    expect(records.map((record) => record.kind)).toEqual([
-      "lifecycle",
-      "output",
-      "checkpoint",
-      "gap",
-      "lifecycle",
-      "output",
-      "checkpoint",
-    ]);
-    const gap = parseOutputWalGapPayload(records[3]!.payload);
-    expect(gap).toMatchObject({
-      reason: "unclean-source",
-      lastDurableSeq: "3",
-      missingBytes: null,
-      coverage: "unknown",
-    });
-    expect(Buffer.from(records[5]!.payload).toString()).toBe("after unclean resume");
-    const lifecycle = records
-      .filter((record) => record.kind === "lifecycle")
-      .map((record) => parseOutputWalJson(record));
-    expect(lifecycle).toEqual([
+    expect(records.filter((record) => record.kind === "gap")).toHaveLength(0);
+    expect(records.filter((record) => record.kind === "lifecycle").map(parseOutputWalJson)).toEqual([
       { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } },
-      { event: "resume", identity: secondIdentity, geometry: { cols: 120, rows: 40 } },
+      { event: "resume", identity: secondIdentity, geometry: { cols: 80, rows: 24 } },
     ]);
+    expect(records.filter((record) => record.kind === "output").map((r) => Buffer.from(r.payload).toString())).toEqual(["BEFORE", "AFTER"]);
+  });
+
+  test("interrupted tracked source records gap before resume and output", async () => {
+    const directory = makeRoot();
+    const path = resolveTerminalWalPaths(directory).walPath;
+    // Model a killed worker: durable records exist, but no source-detached record.
+    // Closing the raw file descriptor is harness cleanup, not a worker stop.
+    const writer = new OutputWalWriter({ path, format: 2 });
+    writer.appendJson("lifecycle", { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } });
+    writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+    writer.appendOutput(Buffer.from("BEFORE"));
+    writer.close();
+    const resumed = await startWorker(config(directory), new PassThrough(), 2);
+    resumed.worker.appendOrderedOutput(Buffer.from("AFTER"));
+    const records = [...readOutputWal(path)];
+    expect(records.map((r) => r.kind)).toEqual(["lifecycle", "checkpoint", "output", "gap", "lifecycle", "output"]);
+    expect(parseOutputWalGapPayload(records[3]!.payload)).toMatchObject({
+      reason: "unclean-source", lastDurableSeq: "3", missingBytes: null, coverage: "unknown",
+    });
+    expect(parseOutputWalJson(records[4]!)).toMatchObject({ event: "resume" });
+    expect(Buffer.from(records[5]!.payload).toString()).toBe("AFTER");
   });
 
   test("only explicit logical close writes END and an ended lifecycle cannot resume", async () => {
