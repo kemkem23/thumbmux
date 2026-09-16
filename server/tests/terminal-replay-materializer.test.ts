@@ -672,6 +672,37 @@ function pauseWriter() {
   return writer;
 }
 
+const gapReasonMessages = {
+  "tmux-pause": "tmux หยุดส่งชั่วคราว เก็บได้ไม่ครบ",
+  "recorder-failure": "ตัวบันทึกพังกลางคัน",
+  "unclean-source": "รอบก่อนจบไม่สะอาด (เครื่องดับ/โปรเซสถูกฆ่า) ไบต์ช่วงท้ายอาจหาย",
+} as const;
+
+for (const [reason, expectedMessage] of Object.entries(gapReasonMessages)) {
+  test(`labels ${reason} gaps with their actual cause`, () => {
+    const writer = new OutputWalWriter({ path: walPath, format: 2, clock: () => 100 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(80, 8)));
+    writer.appendGap({
+      gapId: `gap-${reason}`,
+      sourceEpoch: "epoch-1",
+      paneId: "%42",
+      reason: reason as keyof typeof gapReasonMessages,
+      detectedAt: 100,
+      missingBytes: null,
+      coverage: "unknown",
+    });
+    writer.appendOutput(Buffer.from("AFTER_GAP\r\n"));
+    writer.close();
+
+    const rendered = plainRendered(materialize());
+    expect(rendered).toContain(expectedMessage);
+    for (const otherMessage of Object.values(gapReasonMessages)) {
+      if (otherMessage !== expectedMessage) expect(rendered).not.toContain(otherMessage);
+    }
+    expect(rendered).toContain("AFTER_GAP");
+  }, 30_000);
+}
+
 for (const status of ["ambiguous", "failed"] as const) {
   test(`pause ${status} is local: live suffix and pre-gap screen survive restart`, () => {
     const writer = pauseWriter();
