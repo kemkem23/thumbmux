@@ -146,10 +146,10 @@
       const screen = meta?.screen;
       previewState = screen?.previewState ?? 'live';
       connected = previewState === 'live';
-      // "unavailable" means there is no verified image to show. Even a
-      // malformed/legacy frame that pairs it with previewHasFrame=true must
-      // fail closed to the existing gray placeholder instead of looking live.
-      hasFrame = previewState === 'unavailable' ? false : (screen?.previewHasFrame ?? true);
+      // Frame availability and current health are independent. Preserve an
+      // explicitly verified last frame when health is unavailable, with a
+      // stale label; legacy unavailable messages still fail closed.
+      hasFrame = screen?.previewHasFrame ?? (previewState !== 'unavailable');
       if (typeof screen?.previewLastSuccessfulAt === 'number') {
         lastSuccessfulAt = screen.previewLastSuccessfulAt;
       } else if (previewState === 'live') {
@@ -187,7 +187,7 @@
       <div class="wait">…</div>
     {/if}
   </div>
-  {#if hasFrame && (previewState === 'orphaned' || previewState === 'ended')}
+  {#if hasFrame && previewState !== 'live'}
     <span
       class="preview-status"
       role="status"
@@ -196,7 +196,7 @@
     >
       {previewState === 'orphaned'
         ? 'ภาพนี้เป็นภาพสุดท้ายก่อนห้องขาดการติดต่อ'
-        : 'ห้องนี้จบแล้ว · ภาพนี้เป็นภาพสุดท้าย'}
+        : previewState === 'ended' ? 'ห้องนี้จบแล้ว · ภาพนี้เป็นภาพสุดท้าย' : 'อ่านสถานะปัจจุบันไม่ได้ · ภาพนี้เป็นภาพสุดท้าย'}
       {#if lastSuccessfulAt !== null && formatPreviewLastSuccessfulAt}
         · สำเร็จล่าสุด {formatPreviewLastSuccessfulAt(lastSuccessfulAt)}
       {/if}
