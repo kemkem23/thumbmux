@@ -520,6 +520,7 @@ export class TerminalControlWalRecorder {
   private stderr = Buffer.alloc(0);
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private readySettled = false;
+  private pendingContinueAck: { paneId: string; timer: ReturnType<typeof setTimeout> } | null = null;
   private readonly readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (error: Error) => void;
@@ -667,6 +668,10 @@ export class TerminalControlWalRecorder {
   private async teardown(writeLifecycleEnd: boolean): Promise<void> {
     if (this.state === "disconnected") return;
     this.state = "exiting";
+    if (this.pendingContinueAck) {
+      clearTimeout(this.pendingContinueAck.timer);
+      this.pendingContinueAck = null;
+    }
     this.process?.stdout.pause();
     this.process?.kill("SIGTERM");
     if (this.worker.status.started) {
@@ -850,7 +855,15 @@ export class TerminalControlWalRecorder {
     }
     if (event.kind === "pause" || event.kind === "continue") {
       if (event.paneId !== source.paneId) throw new Error(`tmux ${event.kind} came from the wrong pane`);
-      if (event.kind === "pause") this.continuePane(event.paneId);
+      if (event.kind === "pause") {
+        this.continuePane(event.paneId);
+      } else {
+        // Acknowledge the pending continue timer so it does not fire.
+        if (this.pendingContinueAck?.paneId === event.paneId) {
+          clearTimeout(this.pendingContinueAck.timer);
+          this.pendingContinueAck = null;
+        }
+      }
       return;
     }
     if (event.kind === "output") {
@@ -870,9 +883,27 @@ export class TerminalControlWalRecorder {
   }
 
   private continuePane(paneId: string): void {
+    // Validate paneId before using it to construct the command.
+    // An unexpected format is an error path, not something to forward to tmux.
+    if (!/^%[0-9]+$/.test(paneId)) {
+      throw new Error(`tmux pause pane ID does not match expected format: ${paneId}`);
+    }
     const child = this.process;
     if (!child || !child.stdin.writable) throw new Error("tmux control stdin is not writable");
-    child.stdin.write(`refresh-client -A ${paneId}:continue\n`, (error) => {
+    // Clear any previous pending ack that was not resolved (should not happen
+    // in normal operation since tmux sends %pause per pane, not concurrently).
+    if (this.pendingContinueAck) {
+      clearTimeout(this.pendingContinueAck.timer);
+      this.pendingContinueAck = null;
+    }
+    // tmux 3.4 requires the pane-action argument to be quoted; sending
+    // %<id>:continue without quotes causes a parse error and %error response.
+    // Verified live: unquoted → %error (50ms); quoted → %continue (50ms).
+    const timer = setTimeout(() => {
+      this.fail(new Error(`tmux %continue for ${paneId} was not acknowledged within 2000ms`));
+    }, 2_000);
+    this.pendingContinueAck = { paneId, timer };
+    child.stdin.write(`refresh-client -A "${paneId}:continue"\n`, (error) => {
       if (error) this.fail(error);
     });
   }
@@ -903,8 +934,18 @@ export class TerminalControlWalRecorder {
     if (this.fatalError || this.state === "disconnected") return;
     this.fatalError = error instanceof Error ? error : new Error(String(error));
     this.state = "fatal";
-    // Do not kill or keep reading: the retained stream bytes plus the kernel
-    // pipe apply backpressure to tmux, preserving failure evidence/no-drop.
+    // Cancel any pending %continue acknowledgement timer to avoid a second
+    // call to fail() after the first one has already set the fatal state.
+    if (this.pendingContinueAck) {
+      clearTimeout(this.pendingContinueAck.timer);
+      this.pendingContinueAck = null;
+    }
+    // Do not kill the process. stdout.pause() retains unread bytes in the
+    // kernel pipe and applies backpressure to tmux, preserving failure
+    // evidence. It does NOT prevent bytes that were already in flight from
+    // being lost — no durable gap record is written here.
+    // TODO(§3.2 item 2): write a durable WAL gap record before entering
+    // the fatal state so that a future reader can detect the missing range.
     this.process?.stdout.pause();
     this.clearReadyTimer();
     if (!this.readySettled) {
