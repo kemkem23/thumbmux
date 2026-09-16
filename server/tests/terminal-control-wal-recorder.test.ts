@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -9,6 +9,7 @@ import { parseOutputWalJson, readOutputWal } from "../src/output-wal";
 import {
   installTerminalControlWalSignalHandlers,
   readTerminalControlWalHealth,
+  terminalControlWalStatusPath,
   TerminalControlWalRecorder,
   type TerminalControlProcess,
   type TerminalControlSourceIdentity,
@@ -73,6 +74,7 @@ function makeRecorder(options: {
   fake?: FakeControlProcess;
   resolved?: TerminalControlSourceIdentity;
   onFatal?: (error: Error) => void;
+  onAlert?: (message: string) => void;
 } = {}): {
   directory: string;
   fake: FakeControlProcess;
@@ -96,6 +98,7 @@ function makeRecorder(options: {
     },
     resolveIdentity: async () => options.resolved ?? source(),
     ...(options.onFatal === undefined ? {} : { onFatal: options.onFatal }),
+    ...(options.onAlert === undefined ? {} : { onAlert: options.onAlert }),
   });
   recorders.push(recorder);
   return { directory, fake, recorder, spawnArgs };
@@ -279,9 +282,17 @@ describe("ordered tmux control WAL recorder", () => {
       state: "fatal",
       error: expect.stringContaining("invalid tmux control-mode escape"),
     });
-    const outputs = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
-      .filter((record) => record.kind === "output");
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    const outputs = records.filter((record) => record.kind === "output");
     expect(Buffer.concat(outputs.map((record) => Buffer.from(record.payload))).toString()).toBe("good\n");
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "gap"]);
+    expect(parseOutputWalJson(records[2]!)).toMatchObject({
+      paneId: "%42",
+      reason: "recorder-failure",
+      lastDurableSeq: "2",
+      missingBytes: null,
+      coverage: "unknown",
+    });
   });
 
   test("fails identity validation before creating a WAL lifecycle", async () => {
@@ -295,6 +306,23 @@ describe("ordered tmux control WAL recorder", () => {
     await expect(starting).rejects.toThrow("exact WAL pane target");
     expect(fake.stdout.isPaused()).toBe(true);
     expect(existsSync(resolveTerminalWalPaths(directory).walPath)).toBe(false);
+  });
+
+  test("alerts out of band when fatal health cannot be persisted", async () => {
+    const alerts: string[] = [];
+    const { directory, fake, recorder } = makeRecorder({ onAlert: (message) => alerts.push(message) });
+    await ready(recorder, fake);
+    const healthPath = terminalControlWalStatusPath(directory);
+    unlinkSync(healthPath);
+    mkdirSync(healthPath);
+
+    fake.stdout.write("%output %42 bad\\x\n");
+
+    expect(recorder.status.state).toBe("fatal");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("fatal health could not be persisted");
+    expect(alerts[0]).not.toContain("gap was persisted");
+    rmSync(healthPath, { recursive: true });
   });
 
   test("treats %exit as source disconnect without ending the logical lifecycle", async () => {

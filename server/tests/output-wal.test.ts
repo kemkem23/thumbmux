@@ -179,6 +179,19 @@ describe("format 2 durable pause gaps", () => {
     resumed.close();
   });
 
+  test("round-trips recorder failure and unclean source gap reasons", () => {
+    const writer = new OutputWalWriter({ path, format: 2, clock: () => 1 });
+    writer.appendGap({ ...gap, gapId: "failure-gap", reason: "recorder-failure" });
+    writer.appendGap({ ...gap, gapId: "unclean-gap", reason: "unclean-source" });
+    writer.close();
+
+    const records = [...readOutputWal(path)];
+    expect(records.map((record) => parseOutputWalJson(record))).toEqual([
+      { ...gap, gapId: "failure-gap", reason: "recorder-failure", lastDurableSeq: "0" },
+      { ...gap, gapId: "unclean-gap", reason: "unclean-source", lastDurableSeq: "1" },
+    ]);
+  });
+
   test("cannot upgrade an existing format 1 or downgrade/repair a format 2", () => {
     const old = new OutputWalWriter({ path });
     old.appendOutput(Buffer.from("original"));

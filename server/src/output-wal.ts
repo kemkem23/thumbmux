@@ -798,7 +798,7 @@ export type OutputWalGap = {
   sourceEpoch: string;
   paneId: string;
   lastDurableSeq: string;
-  reason: "tmux-pause";
+  reason: "tmux-pause" | "recorder-failure" | "unclean-source";
   detectedAt: number;
   missingBytes: null;
   coverage: "unknown";
@@ -812,7 +812,8 @@ export function parseOutputWalGapPayload(payload: Uint8Array): OutputWalGap {
     || typeof gap.sourceEpoch !== "string" || !gap.sourceEpoch
     || typeof gap.paneId !== "string" || !/^%[0-9]+$/.test(gap.paneId)
     || typeof gap.lastDurableSeq !== "string" || !/^(0|[1-9][0-9]*)$/.test(gap.lastDurableSeq)
-    || gap.reason !== "tmux-pause" || gap.missingBytes !== null || gap.coverage !== "unknown"
+    || (gap.reason !== "tmux-pause" && gap.reason !== "recorder-failure" && gap.reason !== "unclean-source")
+    || gap.missingBytes !== null || gap.coverage !== "unknown"
     || typeof gap.detectedAt !== "number" || !Number.isSafeInteger(gap.detectedAt) || gap.detectedAt < 0) {
     throw new Error("invalid WAL gap: unknown loss must remain null/unknown");
   }
