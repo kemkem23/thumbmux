@@ -761,7 +761,7 @@ test("overlapping gaps settle independently across an open checkpoint", () => {
   expect(plainRendered(materialize())).toBe(settled);
 }, 30_000);
 
- test("source checkpoints preserve materialized output and logical lifecycle", () => {
+test("source checkpoints preserve materialized output and logical lifecycle", () => {
   const writer = new OutputWalWriter({ path: walPath, format: 2 });
   writer.appendJson("lifecycle", lifecycle("start", geometry(80, 8)));
   writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
