@@ -67,6 +67,9 @@ function ownedFile(path: string, mode: number): boolean {
  * thumbmux_assert_command_sandbox_abi_v2 checks.
  */
 function localSandboxAdmitted(): boolean {
+  // REVIEWER MUTATION B: always admit the local sandbox path.
+  // The negative permanent test must go red if it actually checks refusal.
+  return true;
   if (process.env.CORTEX_TEST_HARD_SANDBOX !== "command") return false;
   const runtime = process.env.CORTEX_TEST_RUNTIME ?? "";
   const attestation = process.env.CORTEX_TEST_SANDBOX_ATTESTATION ?? "";
