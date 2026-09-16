@@ -727,15 +727,23 @@ export class TerminalControlWalRecorder {
   };
 
   private handleLine(bytes: Uint8Array): void {
-    if (!this.commandBlock && isWalNotification(bytes)) {
+    if (isWalNotification(bytes)) {
       // Keep notifications byte-exact until the exact pane/window identity is
       // known. In particular tmux 3.4 emits printable UTF-8 bytes raw while
-      // octal-escaping control bytes in the same payload.
+      // octal-escaping control bytes in the same payload. Asynchronous
+      // notifications may be interleaved inside a command's %begin/%end block.
       this.enqueueOrApply({ kind: "raw-wal-line", bytes: Buffer.from(bytes) });
       return;
     }
 
     const line = strictAsciiControlLine(bytes);
+    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
+    if (pause) {
+      // tmux 3.4 may send %continue before the %end for refresh-client.
+      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
+      this.enqueueOrApply(event);
+      return;
+    }
     if (this.commandBlock) {
       const end = /^(%end|%error) (\d+) (\d+) (\d+)$/.exec(line);
       if (!end) {
@@ -771,13 +779,6 @@ export class TerminalControlWalRecorder {
       }
       this.sessionChanged = { sessionId: session[1]!, session: session[2]! };
       this.maybeBeginValidation();
-      return;
-    }
-
-    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
-    if (pause) {
-      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
-      this.enqueueOrApply(event);
       return;
     }
 
