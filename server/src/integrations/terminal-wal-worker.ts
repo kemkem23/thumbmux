@@ -20,6 +20,8 @@ import {
   OutputWalWriter,
   parseOutputWalJson,
   readOutputWal,
+  type OutputWalFormat,
+  type OutputWalGap,
   type OutputWalRecord,
 } from "../output-wal";
 import {
@@ -71,6 +73,8 @@ export type NormalizedTerminalWalWorkerConfig = {
 };
 
 export type TerminalWalWorkerDependencies = {
+  /** Control-mode capture requires format 2; pipe-pane capture remains format 1 by default. */
+  walFormat?: OutputWalFormat;
   input?: Readable;
   clock?: () => number;
   onFatal?: (error: Error) => void;
@@ -508,6 +512,7 @@ function sanitizeProtocolMessage(error: unknown): string {
 export class TerminalWalWorker {
   readonly config: NormalizedTerminalWalWorkerConfig;
   private readonly input: Readable;
+  private readonly walFormat: OutputWalFormat;
   private readonly clock: (() => number) | undefined;
   private readonly onFatal: ((error: Error) => void) | undefined;
   private server: Server | null = null;
@@ -530,6 +535,7 @@ export class TerminalWalWorker {
       ? validateNormalizedTerminalWalWorkerConfig(config)
       : parseTerminalWalWorkerConfig(config);
     this.input = dependencies.input ?? process.stdin;
+    this.walFormat = dependencies.walFormat ?? 1;
     this.clock = dependencies.clock;
     this.onFatal = dependencies.onFatal;
     this.geometry = copyGeometry(this.config.geometry);
@@ -588,6 +594,7 @@ export class TerminalWalWorker {
 
       this.writer = new OutputWalWriter({
         path: paths.walPath,
+        format: this.walFormat,
         clock: this.clock,
         // This is the on-disk format bound, not today's chunking preference.
         // Keeping it stable lets a restarted worker read older, larger frames.
@@ -656,6 +663,14 @@ export class TerminalWalWorker {
       records.push(writer.appendOutput(payload.subarray(offset, end)));
     }
     return records;
+  }
+
+  /** Synchronous durability barrier in the same writer/order as captured output. */
+  appendOrderedGap(gap: Omit<OutputWalGap, "lastDurableSeq">): OutputWalRecord {
+    if (!this.started || this.fatalError) throw new Error("terminal WAL worker is not active");
+    if (this.pendingResize) throw new Error("ordered gap cannot enter during a pending resize");
+    this.drainInput();
+    return this.requireWriter().appendGap(gap);
   }
 
   /** Record an observed ordered layout boundary before consuming its redraw. */

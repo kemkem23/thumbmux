@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   chmodSync,
@@ -504,6 +505,7 @@ export class TerminalControlWalRecorder {
     & Pick<TerminalControlWalRecorderDependencies, "onFatal">;
   private readonly input = new PassThrough();
   private readonly worker: TerminalWalWorker;
+  private readonly sourceEpoch = randomUUID();
   private readonly stream: TmuxControlStreamBuffer;
   private process: TerminalControlProcess | null = null;
   private state: TerminalControlWalRecorderStatus["state"] = "created";
@@ -537,7 +539,7 @@ export class TerminalControlWalRecorder {
       resolveIdentity: dependencies.resolveIdentity ?? resolveTerminalControlSourceIdentity,
       ...(dependencies.onFatal === undefined ? {} : { onFatal: dependencies.onFatal }),
     };
-    this.worker = new TerminalWalWorker(this.config.worker, { input: this.input });
+    this.worker = new TerminalWalWorker(this.config.worker, { input: this.input, walFormat: 2 });
     this.stream = new TmuxControlStreamBuffer({
       maxLineBytes: this.config.maxControlLineBytes,
       maxBufferedBytes: this.config.maxControlLineBytes + 64 * 1024,
@@ -655,7 +657,7 @@ export class TerminalControlWalRecorder {
         throw new Error("cannot close a logical lifecycle before its WAL START");
       }
       if (this.state !== "disconnected") await this.teardown(false);
-      const closer = new TerminalWalWorker(this.config.worker, { input: new PassThrough() });
+      const closer = new TerminalWalWorker(this.config.worker, { input: new PassThrough(), walFormat: 2 });
       await closer.start();
       await closer.closeLogicalLifecycle();
       this.writeHealth("disconnected");
@@ -856,6 +858,17 @@ export class TerminalControlWalRecorder {
     if (event.kind === "pause" || event.kind === "continue") {
       if (event.paneId !== source.paneId) throw new Error(`tmux ${event.kind} came from the wrong pane`);
       if (event.kind === "pause") {
+        // appendOrderedGap returns only after fsync. If it throws, fail()
+        // pauses stdout and this continue command is never sent.
+        this.worker.appendOrderedGap({
+          gapId: randomUUID(),
+          sourceEpoch: this.sourceEpoch,
+          paneId: event.paneId,
+          reason: "tmux-pause",
+          detectedAt: Date.now(),
+          missingBytes: null,
+          coverage: "unknown",
+        });
         this.continuePane(event.paneId);
       } else {
         // Acknowledge the pending continue timer so it does not fire.
@@ -943,9 +956,9 @@ export class TerminalControlWalRecorder {
     // Do not kill the process. stdout.pause() retains unread bytes in the
     // kernel pipe and applies backpressure to tmux, preserving failure
     // evidence. It does NOT prevent bytes that were already in flight from
-    // being lost — no durable gap record is written here.
-    // TODO(§3.2 item 2): write a durable WAL gap record before entering
-    // the fatal state so that a future reader can detect the missing range.
+    // being lost. Received pauses fsync their own gap before continue.
+    // TODO(§3.2 item 7): persist failure/unclean-source gaps when possible;
+    // a disk failure must never be reported as a successfully persisted gap.
     this.process?.stdout.pause();
     this.clearReadyTimer();
     if (!this.readySettled) {
