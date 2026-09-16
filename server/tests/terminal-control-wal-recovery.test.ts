@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, expect, test } from "bun:test";
+import { parseOutputWalJson, readOutputWal } from "../src/output-wal";
+import { resolveTerminalWalPaths } from "../src/integrations/terminal-wal";
 import {
   TerminalControlWalRecorder,
   type TerminalControlPauseReconcileRequest,
@@ -53,13 +55,13 @@ async function makeReady(reconcilePause: (request: TerminalControlPauseReconcile
       sessionCreated: 1_700_000_000,
       geometry: { cols: 80, rows: 24 },
     }),
-    reconcilePause,
+    reconcilePause: reconcilePause as never,
   });
   recorders.push(recorder);
   const starting = recorder.start();
   fake.stdout.write("%begin 1 1 0\n%end 1 1 0\n%session-changed $9 durable-agent-1\n");
   await starting;
-  return { fake, recorder };
+  return { directory: join(root, "lane"), fake, recorder };
 }
 
 test("starts one reconcile after the matching continue acknowledgement and remains degraded", async () => {
@@ -75,4 +77,32 @@ test("starts one reconcile after the matching continue acknowledgement and remai
   expect(reconciles[0]).toMatchObject({ paneId: "%42" });
   expect(reconciles[0]!.gapId).not.toBe("");
   expect(recorder.status).toMatchObject({ state: "ready", degraded: true });
+});
+
+test("stores a bounded capture as recovered-from-ring provenance instead of raw output", async () => {
+  const { directory, fake } = await makeReady(async (request) => ({
+    gapId: request.gapId,
+    recoveredBytes: Buffer.from("older\ncurrent\n"),
+    recoveredRows: 2,
+    truncated: false,
+    identity: request.source,
+    geometry: request.source.geometry,
+    boundary: "matched",
+  }) as never);
+
+  fake.stdout.write("%pause %42\n%continue %42\n");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "gap", "recovery"]);
+  expect(parseOutputWalJson(records[2]!)).toMatchObject({
+    provenance: "recovered-from-ring",
+    recoveredRows: 2,
+    truncated: false,
+    capturedSeqBefore: "1",
+    capturedSeqAfter: "2",
+    boundary: "matched",
+    identity: { paneId: "%42", windowId: "@42" },
+    geometry: { cols: 80, rows: 24 },
+  });
 });

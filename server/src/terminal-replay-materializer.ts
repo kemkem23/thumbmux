@@ -28,7 +28,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createOutputWalStartCursor,
+  parseOutputWalGapPayload,
   parseOutputWalJson,
+  parseOutputWalRecoveryPayload,
   readOutputWalTail,
   type OutputWalRecord,
   type OutputWalTailCursor,
@@ -1811,6 +1813,7 @@ class ReplayEngine {
   private pendingResize: TerminalReplayResize | null = null;
   private recordsSeen = 0;
   private hasOutputInGeneration = false;
+  private pendingGapId: string | null = null;
 
   constructor(private readonly tmux: PrivateTmuxReplay) {}
 
@@ -1969,6 +1972,13 @@ class ReplayEngine {
     onHistory: (captured: Uint8Array) => void,
   ): void {
     try {
+      if (this.pendingGapId && record.kind !== "gap" && record.kind !== "recovery") {
+        // Output/layout observed while capture-pane runs is already covered by
+        // capturedSeqAfter when a matched snapshot is committed. Never feed it
+        // into a VT state whose prefix is known to be incomplete.
+        this.recordsSeen += 1;
+        return;
+      }
       switch (record.kind) {
         case "lifecycle":
           this.processLifecycle(record, parseLifecycle(parseOutputWalJson(record)), onHistory);
@@ -1989,9 +1999,25 @@ class ReplayEngine {
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
           break;
         case "gap":
-          // No suffix may be fed into VT state with an unknown missing prefix.
-          // Ring reconciliation/reset belongs to PIPEHIST §3.2 items 3–5.
-          throw new Error("unavailable: durable tmux-pause gap requires reconciliation before replay");
+          this.requireActive(record);
+          this.pendingGapId = parseOutputWalGapPayload(record.payload).gapId;
+          break;
+        case "recovery": {
+          this.requireActive(record);
+          const recovery = parseOutputWalRecoveryPayload(record.payload);
+          if (recovery.gapId !== this.pendingGapId) {
+            throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
+          }
+          if (recovery.boundary === "matched" && !recovery.truncated) {
+            this.tmux.discardUnseenAndReset(recovery.geometry);
+            const recovered = Buffer.from(recovery.recoveredBytesBase64, "base64");
+            if (recovered.byteLength > 0) this.tmux.feed(recovered, onHistory);
+            this.geometry = recovery.geometry;
+            this.hasOutputInGeneration = recovered.byteLength > 0;
+            this.pendingGapId = null;
+          }
+          break;
+        }
         case "checkpoint":
           parseBarrier(parseOutputWalJson(record));
           break;
@@ -2007,6 +2033,9 @@ class ReplayEngine {
   }
 
   snapshot(): ReplaySnapshot {
+    if (this.pendingGapId) {
+      throw new Error(`unavailable: durable tmux-pause gap ${this.pendingGapId} was not unambiguously recovered`);
+    }
     return {
       lifecycle: this.lifecycle,
       identity: this.identity ? { ...this.identity } : null,

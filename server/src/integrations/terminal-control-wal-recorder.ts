@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough, type Readable, type Writable } from "node:stream";
+import type { OutputWalRecoverySnapshot } from "../output-wal";
 import {
   TerminalWalWorker,
   parseTerminalWalWorkerConfig,
@@ -90,7 +91,9 @@ export type TerminalControlWalRecorderDependencies = {
   resolveIdentity?: (
     config: NormalizedTerminalControlWalRecorderConfig,
   ) => Promise<TerminalControlSourceIdentity>;
-  reconcilePause?: (request: TerminalControlPauseReconcileRequest) => Promise<void>;
+  reconcilePause?: (
+    request: TerminalControlPauseReconcileRequest,
+  ) => Promise<TerminalControlRecoveryCapture | void>;
   onFatal?: (error: Error) => void;
 };
 
@@ -98,6 +101,16 @@ export type TerminalControlPauseReconcileRequest = {
   gapId: string;
   paneId: string;
   source: TerminalControlSourceIdentity;
+  capturedSeqBefore: string;
+};
+
+export type TerminalControlRecoveryCapture = {
+  recoveredBytes: Uint8Array;
+  recoveredRows: number;
+  truncated: boolean;
+  identity: TerminalControlSourceIdentity;
+  geometry: TerminalGeometry;
+  boundary: "matched" | "ambiguous";
 };
 
 export type TerminalControlWalRecorderStatus = {
@@ -359,34 +372,60 @@ function defaultSpawnControl(executable: string, args: string[]): TerminalContro
 async function defaultReconcilePause(
   recorder: NormalizedTerminalControlWalRecorderConfig,
   request: TerminalControlPauseReconcileRequest,
-): Promise<void> {
+): Promise<TerminalControlRecoveryCapture> {
+  if (request.source.geometry.rows > 10_000) {
+    throw new Error("tmux pause reconciliation exceeds the 10000-row memory budget");
+  }
+  const start = -(10_000 - request.source.geometry.rows);
   const args = [
     ...tmuxSelectorArgs(recorder.tmux),
     "capture-pane",
     "-p",
     "-e",
     "-S",
-    "-10000",
+    String(start),
     "-t",
     request.paneId,
   ];
-  await new Promise<void>((resolveCapture, rejectCapture) => {
+  const captured = await new Promise<{ bytes: Buffer; truncated: boolean }>((resolveCapture, rejectCapture) => {
     execFile(recorder.tmux.executable, args, {
       encoding: "buffer",
       timeout: 2_000,
       maxBuffer: 8 * 1024 * 1024,
-    }, (error, _stdout, stderr) => {
-      if (error) {
-        rejectCapture(new Error(`tmux pause reconciliation failed: ${error.message}`));
-        return;
-      }
+    }, (error, stdout, stderr) => {
       if (stderr.byteLength !== 0) {
         rejectCapture(new Error("tmux pause reconciliation wrote stderr"));
         return;
       }
-      resolveCapture();
+      const bytes = Buffer.from(stdout).subarray(0, 8 * 1024 * 1024);
+      if (error && !("killed" in error && error.killed)
+        && !("code" in error && error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")) {
+        rejectCapture(new Error(`tmux pause reconciliation failed: ${error.message}`));
+        return;
+      }
+      resolveCapture({ bytes, truncated: error !== null || Buffer.byteLength(stdout) > bytes.byteLength });
     });
   });
+  const observed = await resolveTerminalControlSourceIdentity(recorder);
+  if (observed.sessionId !== request.source.sessionId
+    || observed.windowId !== request.source.windowId
+    || observed.paneId !== request.source.paneId
+    || observed.paneTarget !== request.source.paneTarget
+    || observed.tmuxServerPid !== request.source.tmuxServerPid
+    || observed.sessionCreated !== request.source.sessionCreated) {
+    throw new Error("tmux pause reconciliation source identity changed");
+  }
+  const recoveredRows = captured.bytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0);
+  return {
+    recoveredBytes: captured.bytes,
+    recoveredRows: Math.min(recoveredRows, 10_000),
+    truncated: captured.truncated || recoveredRows > 10_000,
+    identity: observed,
+    geometry: observed.geometry,
+    // Without a unique byte/sequence anchor the ring is evidence beside the
+    // gap, never permission to splice it into the canonical byte stream.
+    boundary: "ambiguous",
+  };
 }
 
 function sameGeometry(left: TerminalGeometry, right: TerminalGeometry): boolean {
@@ -912,7 +951,7 @@ export class TerminalControlWalRecorder {
         // pauses stdout and this continue command is never sent.
         const gapId = randomUUID();
         this.degraded = true;
-        this.worker.appendOrderedGap({
+        const gap = this.worker.appendOrderedGap({
           gapId,
           sourceEpoch: this.sourceEpoch,
           paneId: event.paneId,
@@ -921,14 +960,45 @@ export class TerminalControlWalRecorder {
           missingBytes: null,
           coverage: "unknown",
         });
-        this.continuePane({ gapId, paneId: event.paneId, source });
+        this.continuePane({
+          gapId,
+          paneId: event.paneId,
+          source,
+          capturedSeqBefore: (gap.sequence - 1n).toString(),
+        });
       } else {
         // Acknowledge the pending continue timer so it does not fire.
         if (this.pendingContinueAck?.paneId === event.paneId) {
           const pending = this.pendingContinueAck;
           clearTimeout(pending.timer);
           this.pendingContinueAck = null;
-          void this.dependencies.reconcilePause(pending.request).catch((error) => this.fail(error));
+          void this.dependencies.reconcilePause(pending.request).then((capture) => {
+            if (!capture) return;
+            const capturedSeqAfter = this.worker.lastDurableSequence.toString();
+            const identity = capture.identity;
+            this.worker.appendOrderedRecovery({
+              gapId: pending.request.gapId,
+              sourceEpoch: this.sourceEpoch,
+              paneId: pending.request.paneId,
+              provenance: "recovered-from-ring",
+              recoveredBytesBase64: Buffer.from(capture.recoveredBytes).toString("base64"),
+              recoveredRows: capture.recoveredRows,
+              truncated: capture.truncated,
+              identity: {
+                session: identity.session,
+                sessionId: identity.sessionId,
+                windowId: identity.windowId,
+                paneId: identity.paneId,
+                paneTarget: identity.paneTarget,
+                tmuxServerPid: identity.tmuxServerPid,
+                sessionCreated: identity.sessionCreated,
+              },
+              geometry: capture.geometry,
+              capturedSeqBefore: pending.request.capturedSeqBefore,
+              capturedSeqAfter,
+              boundary: capture.boundary,
+            } satisfies OutputWalRecoverySnapshot);
+          }).catch((error) => this.fail(error));
         }
       }
       return;

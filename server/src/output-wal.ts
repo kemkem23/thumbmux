@@ -40,6 +40,7 @@ const KIND_TO_CODE = {
   resize: 3,
   checkpoint: 4,
   gap: 5,
+  recovery: 6,
 } as const;
 
 const CODE_TO_KIND = new Map<number, OutputWalKind>(
@@ -205,7 +206,7 @@ function parseHeader(
     return { kind: "corrupt", offset, message: `mixed WAL formats at byte ${offset}` };
   }
   const kind = CODE_TO_KIND.get(header.readUInt8(9));
-  if (!kind || (version === 1 && kind === "gap")) {
+  if (!kind || (version === 1 && (kind === "gap" || kind === "recovery"))) {
     return { kind: "unavailable", offset, message: `unavailable: unknown WAL record kind at byte ${offset}` };
   }
   if (header.readUInt16LE(10) !== 0 || header.readUInt32LE(36) !== 0) {
@@ -325,6 +326,15 @@ export function scanOutputWal(path: string, options: { maxPayloadBytes?: number 
         try {
           const gap = parseOutputWalGapPayload(payload);
           if (BigInt(gap.lastDurableSeq) !== parsed.sequence - 1n) throw new Error("invalid gap boundary");
+        } catch (error) {
+          return { validBytes: offset, records, lastSequence, lastAt,
+            problem: { kind: "corrupt", offset, message: String(error) } };
+        }
+      }
+      if (parsed.kind === "recovery") parseOutputWalRecoveryPayload(payload);
+      if (parsed.kind === "recovery") {
+        try {
+          parseOutputWalRecoveryPayload(payload);
         } catch (error) {
           return { validBytes: offset, records, lastSequence, lastAt,
             problem: { kind: "corrupt", offset, message: String(error) } };
@@ -700,6 +710,10 @@ export class OutputWalWriter {
       const gap = parseOutputWalGapPayload(payload);
       if (BigInt(gap.lastDurableSeq) !== this.sequence) throw new Error("invalid gap boundary");
     }
+    if (kind === "recovery") {
+      if (this.format !== 2) throw new Error("unavailable: recovery requires a new format 2 WAL");
+      parseOutputWalRecoveryPayload(payload);
+    }
     if (payload.byteLength > this.maxPayloadBytes) {
       throw new Error(`thumbmux output WAL payload exceeds ${this.maxPayloadBytes} bytes`);
     }
@@ -742,6 +756,10 @@ export class OutputWalWriter {
 
   appendGap(value: Omit<OutputWalGap, "lastDurableSeq">): OutputWalRecord {
     return this.appendJson("gap", { ...value, lastDurableSeq: this.sequence.toString() }, value.detectedAt);
+  }
+
+  appendRecovery(value: OutputWalRecoverySnapshot): OutputWalRecord {
+    return this.appendJson("recovery", value);
   }
 
   appendOutput(payload: Uint8Array, at?: number): OutputWalRecord {
@@ -800,4 +818,61 @@ export function parseOutputWalGapPayload(payload: Uint8Array): OutputWalGap {
     throw new Error("invalid WAL gap: unknown loss must remain null/unknown");
   }
   return gap as OutputWalGap;
+}
+
+export type OutputWalRecoverySnapshot = {
+  gapId: string;
+  sourceEpoch: string;
+  paneId: string;
+  provenance: "recovered-from-ring";
+  recoveredBytesBase64: string;
+  recoveredRows: number;
+  truncated: boolean;
+  identity: {
+    session: string;
+    sessionId: string;
+    windowId: string;
+    paneId: string;
+    paneTarget: string;
+    tmuxServerPid: number;
+    sessionCreated: number;
+  };
+  geometry: { cols: number; rows: number };
+  capturedSeqBefore: string;
+  capturedSeqAfter: string;
+  boundary: "matched" | "ambiguous";
+};
+
+export function parseOutputWalRecoveryPayload(payload: Uint8Array): OutputWalRecoverySnapshot {
+  const value: unknown = JSON.parse(Buffer.from(payload).toString("utf8"));
+  if (typeof value !== "object" || value === null) throw new Error("invalid WAL recovery snapshot");
+  const recovery = value as Record<string, unknown>;
+  const identity = recovery.identity as Record<string, unknown> | null;
+  const geometry = recovery.geometry as Record<string, unknown> | null;
+  if (typeof recovery.gapId !== "string" || !recovery.gapId
+    || typeof recovery.sourceEpoch !== "string" || !recovery.sourceEpoch
+    || typeof recovery.paneId !== "string" || !/^%[0-9]+$/.test(recovery.paneId)
+    || recovery.provenance !== "recovered-from-ring"
+    || typeof recovery.recoveredBytesBase64 !== "string"
+    || !Number.isSafeInteger(recovery.recoveredRows) || (recovery.recoveredRows as number) < 0
+    || (recovery.recoveredRows as number) > 10_000
+    || typeof recovery.truncated !== "boolean"
+    || (recovery.boundary !== "matched" && recovery.boundary !== "ambiguous")
+    || typeof recovery.capturedSeqBefore !== "string" || !/^(0|[1-9][0-9]*)$/.test(recovery.capturedSeqBefore)
+    || typeof recovery.capturedSeqAfter !== "string" || !/^(0|[1-9][0-9]*)$/.test(recovery.capturedSeqAfter)
+    || BigInt(recovery.capturedSeqAfter) < BigInt(recovery.capturedSeqBefore)
+    || !identity || typeof identity.session !== "string" || typeof identity.sessionId !== "string"
+    || typeof identity.windowId !== "string" || identity.paneId !== recovery.paneId
+    || typeof identity.paneTarget !== "string" || !Number.isSafeInteger(identity.tmuxServerPid)
+    || !Number.isSafeInteger(identity.sessionCreated)
+    || !geometry || !Number.isSafeInteger(geometry.cols) || (geometry.cols as number) <= 0
+    || !Number.isSafeInteger(geometry.rows) || (geometry.rows as number) <= 0) {
+    throw new Error("invalid WAL recovery snapshot provenance or boundary");
+  }
+  const recovered = Buffer.from(recovery.recoveredBytesBase64, "base64");
+  if (recovered.byteLength > 8 * 1024 * 1024
+    || recovered.toString("base64") !== recovery.recoveredBytesBase64) {
+    throw new Error("invalid WAL recovery snapshot byte budget or encoding");
+  }
+  return recovery as OutputWalRecoverySnapshot;
 }
