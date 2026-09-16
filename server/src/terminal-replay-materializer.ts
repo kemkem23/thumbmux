@@ -37,6 +37,12 @@ import {
   type OutputWalTailCursor,
 } from "./output-wal";
 
+const GAP_REASON_MESSAGES = {
+  "tmux-pause": "tmux หยุดส่งชั่วคราว เก็บได้ไม่ครบ",
+  "recorder-failure": "ตัวบันทึกพังกลางคัน",
+  "unclean-source": "รอบก่อนจบไม่สะอาด (เครื่องดับ/โปรเซสถูกฆ่า) ไบต์ช่วงท้ายอาจหาย",
+} satisfies Record<ReturnType<typeof parseOutputWalGapPayload>["reason"], string>;
+
 /**
  * Durable raw-WAL -> terminal-grid materializer.
  *
@@ -2005,7 +2011,7 @@ class ReplayEngine {
             this.tmux.discardUnseenAndReset(this.geometry!);
           }
           this.hasOutputInGeneration = false;
-          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(gap.gapId)}]\n`));
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: ${GAP_REASON_MESSAGES[gap.reason]}; gap ${JSON.stringify(gap.gapId)}]\n`));
           break;
         }
         case "recovery": {
