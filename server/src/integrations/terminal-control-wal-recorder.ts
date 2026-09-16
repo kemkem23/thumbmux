@@ -90,7 +90,14 @@ export type TerminalControlWalRecorderDependencies = {
   resolveIdentity?: (
     config: NormalizedTerminalControlWalRecorderConfig,
   ) => Promise<TerminalControlSourceIdentity>;
+  reconcilePause?: (request: TerminalControlPauseReconcileRequest) => Promise<void>;
   onFatal?: (error: Error) => void;
+};
+
+export type TerminalControlPauseReconcileRequest = {
+  gapId: string;
+  paneId: string;
+  source: TerminalControlSourceIdentity;
 };
 
 export type TerminalControlWalRecorderStatus = {
@@ -99,6 +106,7 @@ export type TerminalControlWalRecorderStatus = {
   pendingEventBytes: number;
   bufferedControlBytes: number;
   fatalMessage: string | null;
+  degraded: boolean;
 };
 
 export type TerminalControlWalHealth = {
@@ -107,6 +115,7 @@ export type TerminalControlWalHealth = {
   pid: number;
   source: TerminalControlSourceIdentity | null;
   updatedAt: number;
+  degraded?: boolean;
   error?: string;
 };
 
@@ -347,6 +356,39 @@ function defaultSpawnControl(executable: string, args: string[]): TerminalContro
   return spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
 }
 
+async function defaultReconcilePause(
+  recorder: NormalizedTerminalControlWalRecorderConfig,
+  request: TerminalControlPauseReconcileRequest,
+): Promise<void> {
+  const args = [
+    ...tmuxSelectorArgs(recorder.tmux),
+    "capture-pane",
+    "-p",
+    "-e",
+    "-S",
+    "-10000",
+    "-t",
+    request.paneId,
+  ];
+  await new Promise<void>((resolveCapture, rejectCapture) => {
+    execFile(recorder.tmux.executable, args, {
+      encoding: "buffer",
+      timeout: 2_000,
+      maxBuffer: 8 * 1024 * 1024,
+    }, (error, _stdout, stderr) => {
+      if (error) {
+        rejectCapture(new Error(`tmux pause reconciliation failed: ${error.message}`));
+        return;
+      }
+      if (stderr.byteLength !== 0) {
+        rejectCapture(new Error("tmux pause reconciliation wrote stderr"));
+        return;
+      }
+      resolveCapture();
+    });
+  });
+}
+
 function sameGeometry(left: TerminalGeometry, right: TerminalGeometry): boolean {
   return left.cols === right.cols && left.rows === right.rows;
 }
@@ -501,7 +543,7 @@ export function readTerminalControlWalHealth(directory: string): TerminalControl
  */
 export class TerminalControlWalRecorder {
   readonly config: NormalizedTerminalControlWalRecorderConfig;
-  private readonly dependencies: Required<Pick<TerminalControlWalRecorderDependencies, "spawnControl" | "resolveIdentity">>
+  private readonly dependencies: Required<Pick<TerminalControlWalRecorderDependencies, "spawnControl" | "resolveIdentity" | "reconcilePause">>
     & Pick<TerminalControlWalRecorderDependencies, "onFatal">;
   private readonly input = new PassThrough();
   private readonly worker: TerminalWalWorker;
@@ -511,6 +553,7 @@ export class TerminalControlWalRecorder {
   private state: TerminalControlWalRecorderStatus["state"] = "created";
   private source: TerminalControlSourceIdentity | null = null;
   private fatalError: Error | null = null;
+  private degraded = false;
   private attachCommandDone = false;
   private commandBlock: { at: string; number: string; flags: string } | null = null;
   private sessionChanged: { sessionId: string; session: string } | null = null;
@@ -522,7 +565,11 @@ export class TerminalControlWalRecorder {
   private stderr = Buffer.alloc(0);
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private readySettled = false;
-  private pendingContinueAck: { paneId: string; timer: ReturnType<typeof setTimeout> } | null = null;
+  private pendingContinueAck: {
+    paneId: string;
+    request: TerminalControlPauseReconcileRequest;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
   private readonly readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (error: Error) => void;
@@ -537,6 +584,7 @@ export class TerminalControlWalRecorder {
     this.dependencies = {
       spawnControl: dependencies.spawnControl ?? defaultSpawnControl,
       resolveIdentity: dependencies.resolveIdentity ?? resolveTerminalControlSourceIdentity,
+      reconcilePause: dependencies.reconcilePause ?? ((request) => defaultReconcilePause(this.config, request)),
       ...(dependencies.onFatal === undefined ? {} : { onFatal: dependencies.onFatal }),
     };
     this.worker = new TerminalWalWorker(this.config.worker, { input: this.input, walFormat: 2 });
@@ -557,6 +605,7 @@ export class TerminalControlWalRecorder {
       pendingEventBytes: this.pendingEventBytes,
       bufferedControlBytes: this.stream.bufferedBytes,
       fatalMessage: this.fatalError?.message ?? null,
+      degraded: this.degraded,
     };
   }
 
@@ -861,8 +910,10 @@ export class TerminalControlWalRecorder {
       if (event.kind === "pause") {
         // appendOrderedGap returns only after fsync. If it throws, fail()
         // pauses stdout and this continue command is never sent.
+        const gapId = randomUUID();
+        this.degraded = true;
         this.worker.appendOrderedGap({
-          gapId: randomUUID(),
+          gapId,
           sourceEpoch: this.sourceEpoch,
           paneId: event.paneId,
           reason: "tmux-pause",
@@ -870,12 +921,14 @@ export class TerminalControlWalRecorder {
           missingBytes: null,
           coverage: "unknown",
         });
-        this.continuePane(event.paneId);
+        this.continuePane({ gapId, paneId: event.paneId, source });
       } else {
         // Acknowledge the pending continue timer so it does not fire.
         if (this.pendingContinueAck?.paneId === event.paneId) {
-          clearTimeout(this.pendingContinueAck.timer);
+          const pending = this.pendingContinueAck;
+          clearTimeout(pending.timer);
           this.pendingContinueAck = null;
+          void this.dependencies.reconcilePause(pending.request).catch((error) => this.fail(error));
         }
       }
       return;
@@ -896,7 +949,8 @@ export class TerminalControlWalRecorder {
     );
   }
 
-  private continuePane(paneId: string): void {
+  private continuePane(request: TerminalControlPauseReconcileRequest): void {
+    const { paneId } = request;
     // Validate paneId before using it to construct the command.
     // An unexpected format is an error path, not something to forward to tmux.
     if (!/^%[0-9]+$/.test(paneId)) {
@@ -916,7 +970,7 @@ export class TerminalControlWalRecorder {
     const timer = setTimeout(() => {
       this.fail(new Error(`tmux %continue for ${paneId} was not acknowledged within 2000ms`));
     }, 2_000);
-    this.pendingContinueAck = { paneId, timer };
+    this.pendingContinueAck = { paneId, request, timer };
     child.stdin.write(`refresh-client -A "${paneId}:continue"\n`, (error) => {
       if (error) this.fail(error);
     });
@@ -994,6 +1048,7 @@ export class TerminalControlWalRecorder {
       pid: process.pid,
       source: this.source,
       updatedAt: Date.now(),
+      ...(this.degraded ? { degraded: true } : {}),
       ...(error === undefined
         ? {}
         : { error: error.replace(/[\0\r\n]/g, " ").slice(0, 2_048) }),
