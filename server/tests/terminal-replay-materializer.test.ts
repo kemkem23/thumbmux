@@ -649,3 +649,78 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     expect(readTerminalReplayCheckpoint(join(stateDir, "checkpoint.json"))).toBeNull();
   }, 30_000);
 });
+
+// WAL fixtures reproduce the reviewer's success-splice / ambiguous-hold /
+// overlap-gaps probes without bypassing the private tmux cage.
+function pauseGap(writer: OutputWalWriter, gapId: string) {
+  writer.appendGap({ gapId, sourceEpoch: "epoch-1", paneId: "%42", reason: "tmux-pause",
+    detectedAt: 100, missingBytes: null, coverage: "unknown" });
+}
+function pauseRecovery(writer: OutputWalWriter, gapId: string, status: "success" | "ambiguous" | "failed") {
+  writer.appendRecovery({ gapId, sourceEpoch: "epoch-1", paneId: "%42", provenance: "recovered-from-ring", status,
+    recoveredBytesBase64: status === "failed" ? "" : Buffer.from("RING_ROW\n\u001b[2J\u001b[HRECOVERED_ROW\n").toString("base64"),
+    recoveredRows: status === "failed" ? null : 2, truncated: status === "failed" ? null : false,
+    identity: { ...identity(), sessionId: "$9", windowId: "@42", paneId: "%42" }, geometry: geometry(80, 8),
+    capturedSeqBefore: "2", capturedSeqAfter: "3", boundary: status === "failed" ? null : status === "success" ? "matched" : "ambiguous",
+    ...(status === "failed" ? { error: "capture unavailable" } : {}),
+  });
+}
+function pauseWriter() {
+  const writer = new OutputWalWriter({ path: walPath, format: 2, clock: () => 100 });
+  writer.appendJson("lifecycle", lifecycle("start", geometry(80, 8)));
+  writer.appendOutput(Buffer.from("BEFORE_GAP\r\n"));
+  return writer;
+}
+
+for (const status of ["ambiguous", "failed"] as const) {
+  test(`pause ${status} is local: live suffix and pre-gap screen survive restart`, () => {
+    const writer = pauseWriter();
+    pauseGap(writer, "gap-one");
+    writer.appendOutput(Buffer.from("LIVE_SUFFIX\r\n"));
+    pauseRecovery(writer, "gap-one", status);
+    writer.appendOutput(Buffer.from("AFTER_CONTINUE\r\n"));
+    writer.close();
+    const first = plainRendered(materialize());
+    for (const text of ["BEFORE_GAP", "LIVE_SUFFIX", "AFTER_CONTINUE", "ประวัติขาดช่วง", `สถานะ: ${status}`]) {
+      expect(first).toContain(text);
+    }
+    expect(plainRendered(materialize())).toBe(first);
+  }, 30_000);
+}
+
+test("pause success archives the old screen and labels ring rows without VT execution", () => {
+  const writer = pauseWriter();
+  pauseGap(writer, "gap-one");
+  writer.appendOutput(Buffer.from("LIVE_SUFFIX\r\n"));
+  pauseRecovery(writer, "gap-one", "success");
+  writer.appendOutput(Buffer.from("AFTER_CONTINUE\r\n"));
+  writer.close();
+  const result = materialize();
+  const history = readFileSync(result.historyPath, "utf8");
+  const screen = Buffer.from(result.screen!.cellsBase64, "base64").toString();
+  for (const text of ["BEFORE_GAP", "ประวัติขาดช่วง", "recovered-from-ring", "RING_ROW", "RECOVERED_ROW"]) expect(history).toContain(text);
+  expect(history).not.toContain("\u001b[2J");
+  expect(screen).not.toContain("RECOVERED_ROW");
+  expect(plainRendered(result)).toContain("LIVE_SUFFIX");
+  expect(plainRendered(result)).toContain("AFTER_CONTINUE");
+  expect(plainRendered(materialize())).toBe(plainRendered(result));
+}, 30_000);
+
+test("overlapping gaps settle independently across an open checkpoint", () => {
+  const writer = pauseWriter();
+  pauseGap(writer, "gap-one");
+  pauseGap(writer, "gap-two");
+  writer.appendOutput(Buffer.from("WHILE_PENDING\r\n"));
+  const pending = plainRendered(materialize());
+  expect(pending).toContain("WHILE_PENDING");
+  expect(pending).toContain("gap-one");
+  expect(pending).toContain("gap-two");
+  pauseRecovery(writer, "gap-one", "success");
+  pauseRecovery(writer, "gap-two", "ambiguous");
+  writer.appendOutput(Buffer.from("AFTER_BOTH\r\n"));
+  writer.close();
+  const settled = plainRendered(materialize());
+  expect(settled).toContain("AFTER_BOTH");
+  expect(settled.match(/recovered-from-ring/g)).toHaveLength(2);
+  expect(plainRendered(materialize())).toBe(settled);
+}, 30_000);

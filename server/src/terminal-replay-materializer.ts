@@ -25,10 +25,13 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createOutputWalStartCursor,
+  parseOutputWalGapPayload,
   parseOutputWalJson,
+  parseOutputWalRecoveryPayload,
   readOutputWalTail,
   type OutputWalRecord,
   type OutputWalTailCursor,
@@ -1811,6 +1814,7 @@ class ReplayEngine {
   private pendingResize: TerminalReplayResize | null = null;
   private recordsSeen = 0;
   private hasOutputInGeneration = false;
+  private readonly pendingGaps = new Map<string, ReturnType<typeof parseOutputWalGapPayload>>();
 
   constructor(private readonly tmux: PrivateTmuxReplay) {}
 
@@ -1988,10 +1992,43 @@ class ReplayEngine {
         case "resize":
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
           break;
-        case "gap":
-          // No suffix may be fed into VT state with an unknown missing prefix.
-          // Ring reconciliation/reset belongs to PIPEHIST §3.2 items 3–5.
-          throw new Error("unavailable: durable tmux-pause gap requires reconciliation before replay");
+        case "gap": {
+          this.requireActive(record);
+          const gap = parseOutputWalGapPayload(record.payload);
+          if (this.pendingGaps.has(gap.gapId)) throw new Error(`duplicate pending gap ${gap.gapId}`);
+          this.pendingGaps.set(gap.gapId, gap);
+          // A gap starts a new, explicitly incomplete VT generation. Archive
+          // the prior visible screen before dropping modes or partial escapes.
+          if (this.hasOutputInGeneration) {
+            this.tmux.sealVisibleAndReset(this.geometry!, onHistory);
+          } else {
+            this.tmux.discardUnseenAndReset(this.geometry!);
+          }
+          this.hasOutputInGeneration = false;
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(gap.gapId)}]\n`));
+          break;
+        }
+        case "recovery": {
+          this.requireActive(record);
+          const recovery = parseOutputWalRecoveryPayload(record.payload);
+          const gap = this.pendingGaps.get(recovery.gapId);
+          if (!gap || gap.sourceEpoch !== recovery.sourceEpoch || gap.paneId !== recovery.paneId) {
+            throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
+          }
+          // capture-pane is already rendered rows, not a PTY byte stream.
+          // Keep it as a labelled archive excerpt, never feed it into live VT
+          // state or replace geometry/output received during capture.
+          this.tmux.drainHistory(onHistory);
+          onHistory(Buffer.from(`[ภาพที่กู้จาก ring (recovered-from-ring); gap ${JSON.stringify(recovery.gapId)}; สถานะ: ${recovery.status}; อาจซ้ำกับข้อมูลสดและไม่ยืนยันว่าครบ]\n`));
+          if (recovery.status !== "failed") {
+            const rows = stripVTControlCharacters(Buffer.from(recovery.recoveredBytesBase64, "base64").toString("utf8"))
+              .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+            if (rows) onHistory(Buffer.from(rows.endsWith("\n") ? rows : `${rows}\n`));
+          }
+          onHistory(Buffer.from("[จบภาพที่กู้จาก ring; ข้อมูลสดที่เก็บได้ยังแสดงต่อ]\n"));
+          this.pendingGaps.delete(recovery.gapId);
+          break;
+        }
         case "checkpoint":
           parseBarrier(parseOutputWalJson(record));
           break;

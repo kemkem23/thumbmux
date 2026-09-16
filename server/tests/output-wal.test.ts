@@ -18,6 +18,7 @@ import {
   readOutputWalTail,
   readOutputWal,
   scanOutputWal,
+  type OutputWalRecoverySnapshot,
 } from "../src/output-wal";
 
 let root = "";
@@ -47,8 +48,8 @@ describe("lossless output WAL", () => {
     expect(records.map((record) => record.at)).toEqual([20, 20, 30]);
     expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "resize"]);
     expect([...records[1]!.payload]).toEqual([...binary]);
-    expect(parseOutputWalJson(records[0]!)).toEqual({ event: "start", cols: 80, rows: 24 });
-    expect(parseOutputWalJson(records[2]!)).toEqual({ cols: 197, rows: 60 });
+    expect(parseOutputWalJson<Record<string, unknown>>(records[0]!)).toEqual({ event: "start", cols: 80, rows: 24 });
+    expect(parseOutputWalJson<Record<string, unknown>>(records[2]!)).toEqual({ cols: 197, rows: 60 });
     expect(records[0]!.offset).toBe(0);
     expect(records[1]!.offset).toBe(records[0]!.nextOffset);
     expect(scanOutputWal(path)).toMatchObject({ records: 3, problem: null });
@@ -171,7 +172,7 @@ describe("format 2 durable pause gaps", () => {
     writer.close();
     const tail = readOutputWalTail(path, cursor).records;
     expect(tail[0]!.kind).toBe("gap");
-    expect(parseOutputWalJson(tail[0]!)).toEqual({ ...gap, lastDurableSeq: "1" });
+    expect(parseOutputWalJson<Record<string, unknown>>(tail[0]!)).toEqual({ ...gap, lastDurableSeq: "1" });
     expect([...readOutputWal(path)]).toHaveLength(2);
     const resumed = new OutputWalWriter({ path, format: 2 });
     expect(resumed.lastDurableSequence).toBe(2n);
@@ -203,4 +204,70 @@ describe("format 2 durable pause gaps", () => {
     expect(statSync(path).size).toBe(0);
     writer.close();
   });
+});
+
+function ringRecovery(status: "success" | "ambiguous" | "failed" = "success"): OutputWalRecoverySnapshot {
+  return {
+    gapId: "gap-1", sourceEpoch: "epoch-1", paneId: "%42", provenance: "recovered-from-ring", status,
+    recoveredBytesBase64: status === "failed" ? "" : Buffer.from("ring\n").toString("base64"),
+    recoveredRows: status === "failed" ? null : 1, truncated: status === "failed" ? null : false,
+    identity: { session: "test", sessionId: "$1", windowId: "@1", paneId: "%42", paneTarget: "=test:0.0", tmuxServerPid: 123, sessionCreated: 100 },
+    geometry: { cols: 80, rows: 24 }, capturedSeqBefore: "0", capturedSeqAfter: "1",
+    boundary: status === "failed" ? null : status === "success" ? "matched" : "ambiguous",
+    ...(status === "failed" ? { error: "capture failed" } : {}),
+  };
+}
+
+test("appendRecovery round-trips every status and resumes as recovery, never raw output", () => {
+  const writer = new OutputWalWriter({ path, format: 2 });
+  for (const status of ["success", "ambiguous", "failed"] as const) writer.appendRecovery(ringRecovery(status));
+  writer.close();
+  const resumed = new OutputWalWriter({ path, format: 2 });
+  resumed.appendRecovery(ringRecovery());
+  resumed.close();
+  const records = [...readOutputWal(path)];
+  expect(records.map((record) => record.kind)).toEqual(["recovery", "recovery", "recovery", "recovery"]);
+  expect(records.map((record) => parseOutputWalJson(record))).toEqual([
+    ringRecovery("success"), ringRecovery("ambiguous"), ringRecovery("failed"), ringRecovery(),
+  ]);
+  expect(scanOutputWal(path)).toMatchObject({ records: 4, lastSequence: 4n, problem: null });
+});
+
+test("appendRecovery rejects format 1 and malformed provenance before touching disk", () => {
+  const legacy = new OutputWalWriter({ path });
+  expect(() => legacy.appendRecovery(ringRecovery())).toThrow("format 2");
+  legacy.close();
+  const writer = new OutputWalWriter({ path, format: 2 });
+  try {
+    for (const invalid of [
+      { ...ringRecovery(), provenance: "output" },
+      { ...ringRecovery(), boundary: "ambiguous" },
+      { ...ringRecovery(), recoveredBytesBase64: "***" },
+      { ...ringRecovery("failed"), recoveredRows: 0 },
+    ]) expect(() => writer.appendRecovery(invalid as OutputWalRecoverySnapshot)).toThrow("invalid WAL recovery");
+    expect(statSync(path).size).toBe(0);
+  } finally { writer.close(); }
+});
+
+test("scan reports a checksum-valid malformed recovery as corrupt without throwing", () => {
+  const writer = new OutputWalWriter({ path, format: 2 });
+  writer.appendRecovery(ringRecovery());
+  writer.close();
+  const bytes = readFileSync(path);
+  const payload = Buffer.from(bytes.subarray(40).toString().replace("recovered-from-ring", "xxxxxxxxxxxxxxxxxxx"));
+  expect(payload.byteLength).toBe(bytes.length - 40);
+  payload.copy(bytes, 40);
+  // Independent CRC32 fixture encoding, so malformed JSON semantics (not a
+  // broken checksum) exercise the recovery scanner's failure return path.
+  let crc = 0xffffffff;
+  for (const byte of Buffer.concat([bytes.subarray(8, 32), payload])) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  bytes.writeUInt32LE((crc ^ 0xffffffff) >>> 0, 32);
+  writeFileSync(path, bytes);
+  const scan = scanOutputWal(path);
+  expect(scan).toMatchObject({ validBytes: 0, records: 0, problem: { kind: "corrupt" } });
+  expect(scan.problem!.message).toContain("invalid WAL recovery");
+  expect(readFileSync(path)).toEqual(bytes);
 });

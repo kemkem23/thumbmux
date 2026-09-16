@@ -22,6 +22,7 @@ import {
   readOutputWal,
   type OutputWalFormat,
   type OutputWalGap,
+  type OutputWalRecoverySnapshot,
   type OutputWalRecord,
 } from "../output-wal";
 import {
@@ -671,6 +672,17 @@ export class TerminalWalWorker {
     if (this.pendingResize) throw new Error("ordered gap cannot enter during a pending resize");
     this.drainInput();
     return this.requireWriter().appendGap(gap);
+  }
+
+  get lastDurableSequence(): bigint {
+    return this.requireWriter().lastDurableSequence;
+  }
+
+  appendOrderedRecovery(recovery: OutputWalRecoverySnapshot): OutputWalRecord {
+    if (!this.started || this.fatalError) throw new Error("terminal WAL worker is not active");
+    if (this.pendingResize) throw new Error("ordered recovery cannot enter during a pending resize");
+    this.drainInput();
+    return this.requireWriter().appendRecovery(recovery);
   }
 
   /** Record an observed ordered layout boundary before consuming its redraw. */

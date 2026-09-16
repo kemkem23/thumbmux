@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { PassThrough, type Readable, type Writable } from "node:stream";
+import type { OutputWalRecoverySnapshot } from "../output-wal";
 import {
   TerminalWalWorker,
   parseTerminalWalWorkerConfig,
@@ -90,7 +91,27 @@ export type TerminalControlWalRecorderDependencies = {
   resolveIdentity?: (
     config: NormalizedTerminalControlWalRecorderConfig,
   ) => Promise<TerminalControlSourceIdentity>;
+  reconcilePause?: (
+    request: TerminalControlPauseReconcileRequest,
+  ) => Promise<TerminalControlRecoveryCapture | void>;
+  onAlert?: (message: string) => void;
   onFatal?: (error: Error) => void;
+};
+
+export type TerminalControlPauseReconcileRequest = {
+  gapId: string;
+  paneId: string;
+  source: TerminalControlSourceIdentity;
+  capturedSeqBefore: string;
+};
+
+export type TerminalControlRecoveryCapture = {
+  recoveredBytes: Uint8Array;
+  recoveredRows: number;
+  truncated: boolean;
+  identity: TerminalControlSourceIdentity;
+  geometry: TerminalGeometry;
+  boundary: "matched" | "ambiguous";
 };
 
 export type TerminalControlWalRecorderStatus = {
@@ -99,6 +120,8 @@ export type TerminalControlWalRecorderStatus = {
   pendingEventBytes: number;
   bufferedControlBytes: number;
   fatalMessage: string | null;
+  degraded: boolean;
+  alert: string | null;
 };
 
 export type TerminalControlWalHealth = {
@@ -107,6 +130,8 @@ export type TerminalControlWalHealth = {
   pid: number;
   source: TerminalControlSourceIdentity | null;
   updatedAt: number;
+  degraded?: boolean;
+  alert?: string;
   error?: string;
 };
 
@@ -347,6 +372,65 @@ function defaultSpawnControl(executable: string, args: string[]): TerminalContro
   return spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
 }
 
+async function defaultReconcilePause(
+  recorder: NormalizedTerminalControlWalRecorderConfig,
+  request: TerminalControlPauseReconcileRequest,
+): Promise<TerminalControlRecoveryCapture> {
+  if (request.source.geometry.rows > 10_000) {
+    throw new Error("tmux pause reconciliation exceeds the 10000-row memory budget");
+  }
+  const start = -(10_000 - request.source.geometry.rows);
+  const args = [
+    ...tmuxSelectorArgs(recorder.tmux),
+    "capture-pane",
+    "-p",
+    "-e",
+    "-S",
+    String(start),
+    "-t",
+    request.paneId,
+  ];
+  const captured = await new Promise<{ bytes: Buffer; truncated: boolean }>((resolveCapture, rejectCapture) => {
+    execFile(recorder.tmux.executable, args, {
+      encoding: "buffer",
+      timeout: 2_000,
+      maxBuffer: 8 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (stderr.byteLength !== 0) {
+        rejectCapture(new Error("tmux pause reconciliation wrote stderr"));
+        return;
+      }
+      const bytes = Buffer.from(stdout).subarray(0, 8 * 1024 * 1024);
+      if (error && !("killed" in error && error.killed)
+        && !("code" in error && error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")) {
+        rejectCapture(new Error(`tmux pause reconciliation failed: ${error.message}`));
+        return;
+      }
+      resolveCapture({ bytes, truncated: error !== null || Buffer.byteLength(stdout) > bytes.byteLength });
+    });
+  });
+  const observed = await resolveTerminalControlSourceIdentity(recorder);
+  if (observed.sessionId !== request.source.sessionId
+    || observed.windowId !== request.source.windowId
+    || observed.paneId !== request.source.paneId
+    || observed.paneTarget !== request.source.paneTarget
+    || observed.tmuxServerPid !== request.source.tmuxServerPid
+    || observed.sessionCreated !== request.source.sessionCreated) {
+    throw new Error("tmux pause reconciliation source identity changed");
+  }
+  const recoveredRows = captured.bytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0);
+  return {
+    recoveredBytes: captured.bytes,
+    recoveredRows: Math.min(recoveredRows, 10_000),
+    truncated: captured.truncated || recoveredRows > 10_000,
+    identity: observed,
+    geometry: observed.geometry,
+    // Without a unique byte/sequence anchor the ring is evidence beside the
+    // gap, never permission to splice it into the canonical byte stream.
+    boundary: "ambiguous",
+  };
+}
+
 function sameGeometry(left: TerminalGeometry, right: TerminalGeometry): boolean {
   return left.cols === right.cols && left.rows === right.rows;
 }
@@ -486,6 +570,8 @@ export function readTerminalControlWalHealth(directory: string): TerminalControl
     || !Number.isSafeInteger(value.updatedAt)
     || (value.updatedAt as number) < 0
     || (value.source !== null && !isPlainObject(value.source))
+    || (value.degraded !== undefined && typeof value.degraded !== "boolean")
+    || (value.alert !== undefined && typeof value.alert !== "string")
     || (value.error !== undefined && typeof value.error !== "string")) {
     throw new Error("terminal control WAL status file is invalid");
   }
@@ -501,8 +587,8 @@ export function readTerminalControlWalHealth(directory: string): TerminalControl
  */
 export class TerminalControlWalRecorder {
   readonly config: NormalizedTerminalControlWalRecorderConfig;
-  private readonly dependencies: Required<Pick<TerminalControlWalRecorderDependencies, "spawnControl" | "resolveIdentity">>
-    & Pick<TerminalControlWalRecorderDependencies, "onFatal">;
+  private readonly dependencies: Required<Pick<TerminalControlWalRecorderDependencies, "spawnControl" | "resolveIdentity" | "reconcilePause">>
+    & Pick<TerminalControlWalRecorderDependencies, "onFatal" | "onAlert">;
   private readonly input = new PassThrough();
   private readonly worker: TerminalWalWorker;
   private readonly sourceEpoch = randomUUID();
@@ -511,6 +597,13 @@ export class TerminalControlWalRecorder {
   private state: TerminalControlWalRecorderStatus["state"] = "created";
   private source: TerminalControlSourceIdentity | null = null;
   private fatalError: Error | null = null;
+  private degraded = false;
+  private alertMessage: string | null = null;
+  private readonly recoveryQueue: TerminalControlPauseReconcileRequest[] = [];
+  private recoveryRunning = false;
+  private activeRecovery: TerminalControlPauseReconcileRequest | null = null;
+  private readonly settledGapIds = new Set<string>();
+  private pauseTimes: number[] = [];
   private attachCommandDone = false;
   private commandBlock: { at: string; number: string; flags: string } | null = null;
   private sessionChanged: { sessionId: string; session: string } | null = null;
@@ -522,7 +615,11 @@ export class TerminalControlWalRecorder {
   private stderr = Buffer.alloc(0);
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private readySettled = false;
-  private pendingContinueAck: { paneId: string; timer: ReturnType<typeof setTimeout> } | null = null;
+  private pendingContinueAck: {
+    paneId: string;
+    request: TerminalControlPauseReconcileRequest;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
   private readonly readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (error: Error) => void;
@@ -537,7 +634,9 @@ export class TerminalControlWalRecorder {
     this.dependencies = {
       spawnControl: dependencies.spawnControl ?? defaultSpawnControl,
       resolveIdentity: dependencies.resolveIdentity ?? resolveTerminalControlSourceIdentity,
+      reconcilePause: dependencies.reconcilePause ?? ((request) => defaultReconcilePause(this.config, request)),
       ...(dependencies.onFatal === undefined ? {} : { onFatal: dependencies.onFatal }),
+      ...(dependencies.onAlert === undefined ? {} : { onAlert: dependencies.onAlert }),
     };
     this.worker = new TerminalWalWorker(this.config.worker, { input: this.input, walFormat: 2 });
     this.stream = new TmuxControlStreamBuffer({
@@ -557,6 +656,8 @@ export class TerminalControlWalRecorder {
       pendingEventBytes: this.pendingEventBytes,
       bufferedControlBytes: this.stream.bufferedBytes,
       fatalMessage: this.fatalError?.message ?? null,
+      degraded: this.degraded,
+      alert: this.alertMessage,
     };
   }
 
@@ -670,9 +771,10 @@ export class TerminalControlWalRecorder {
   private async teardown(writeLifecycleEnd: boolean): Promise<void> {
     if (this.state === "disconnected") return;
     this.state = "exiting";
-    if (this.pendingContinueAck) {
-      clearTimeout(this.pendingContinueAck.timer);
-      this.pendingContinueAck = null;
+    try {
+      this.settleInterruptedRecoveries("recorder stopped before pause recovery completed");
+    } catch (error) {
+      this.fail(error);
     }
     this.process?.stdout.pause();
     this.process?.kill("SIGTERM");
@@ -727,28 +829,18 @@ export class TerminalControlWalRecorder {
   };
 
   private handleLine(bytes: Uint8Array): void {
-    if (isWalNotification(bytes)) {
-      // Keep notifications byte-exact until the exact pane/window identity is
-      // known. In particular tmux 3.4 emits printable UTF-8 bytes raw while
-      // octal-escaping control bytes in the same payload. Asynchronous
-      // notifications may be interleaved inside a command's %begin/%end block.
-      this.enqueueOrApply({ kind: "raw-wal-line", bytes: Buffer.from(bytes) });
-      return;
-    }
-
-    const line = strictAsciiControlLine(bytes);
-    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
-    if (pause) {
-      // tmux 3.4 may send %continue before the %end for refresh-client.
-      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
-      this.enqueueOrApply(event);
-      return;
-    }
     if (this.commandBlock) {
-      const end = /^(%end|%error) (\d+) (\d+) (\d+)$/.exec(line);
-      if (!end) {
-        throw new Error("tmux control command produced unexpected output");
+      // Command payload is arbitrary rendered text (including UTF-8 and
+      // notification lookalikes). Only the matching terminator is protocol.
+      // refresh-client may emit the actual continue acknowledgement here;
+      // accept only the pane for which this recorder has a pending request.
+      const line = Buffer.from(bytes).toString("utf8");
+      if (this.pendingContinueAck && line === `%continue ${this.pendingContinueAck.paneId}`) {
+        this.enqueueOrApply({ kind: "continue", paneId: this.pendingContinueAck.paneId });
+        return;
       }
+      const end = /^(%end|%error) (\d+) (\d+) (\d+)$/.exec(line);
+      if (!end) return;
       if (end[2] !== this.commandBlock.at
         || end[3] !== this.commandBlock.number
         || end[4] !== this.commandBlock.flags) {
@@ -761,6 +853,23 @@ export class TerminalControlWalRecorder {
       return;
     }
 
+    if (isWalNotification(bytes)) {
+      // Keep notifications byte-exact until the exact pane/window identity is
+      // known. In particular tmux 3.4 emits printable UTF-8 bytes raw while
+      // octal-escaping control bytes in the same payload. Command response
+      // payload was handled above and must never reach this notification path.
+      this.enqueueOrApply({ kind: "raw-wal-line", bytes: Buffer.from(bytes) });
+      return;
+    }
+
+    const line = strictAsciiControlLine(bytes);
+    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
+    if (pause) {
+      // tmux 3.4 may send %continue before the %end for refresh-client.
+      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
+      this.enqueueOrApply(event);
+      return;
+    }
     const begin = /^%begin (\d+) (\d+) (\d+)$/.exec(line);
     if (begin) {
       this.commandBlock = { at: begin[1]!, number: begin[2]!, flags: begin[3]! };
@@ -861,8 +970,10 @@ export class TerminalControlWalRecorder {
       if (event.kind === "pause") {
         // appendOrderedGap returns only after fsync. If it throws, fail()
         // pauses stdout and this continue command is never sent.
-        this.worker.appendOrderedGap({
-          gapId: randomUUID(),
+        const gapId = randomUUID();
+        this.degraded = true;
+        const gap = this.worker.appendOrderedGap({
+          gapId,
           sourceEpoch: this.sourceEpoch,
           paneId: event.paneId,
           reason: "tmux-pause",
@@ -870,12 +981,27 @@ export class TerminalControlWalRecorder {
           missingBytes: null,
           coverage: "unknown",
         });
-        this.continuePane(event.paneId);
+        const request = {
+          gapId,
+          paneId: event.paneId,
+          source,
+          capturedSeqBefore: (gap.sequence - 1n).toString(),
+        };
+        const now = Date.now();
+        this.pauseTimes = this.pauseTimes.filter((at) => now - at < 60_000);
+        this.pauseTimes.push(now);
+        if (this.pauseTimes.length >= 3) {
+          this.tripRecoveryLimit(request, "tmux pause rate reached 3 events within 60 seconds");
+          return;
+        }
+        this.continuePane(request);
       } else {
         // Acknowledge the pending continue timer so it does not fire.
         if (this.pendingContinueAck?.paneId === event.paneId) {
-          clearTimeout(this.pendingContinueAck.timer);
+          const pending = this.pendingContinueAck;
+          clearTimeout(pending.timer);
           this.pendingContinueAck = null;
+          this.enqueueRecovery(pending.request);
         }
       }
       return;
@@ -896,7 +1022,8 @@ export class TerminalControlWalRecorder {
     );
   }
 
-  private continuePane(paneId: string): void {
+  private continuePane(request: TerminalControlPauseReconcileRequest): void {
+    const { paneId } = request;
     // Validate paneId before using it to construct the command.
     // An unexpected format is an error path, not something to forward to tmux.
     if (!/^%[0-9]+$/.test(paneId)) {
@@ -916,10 +1043,126 @@ export class TerminalControlWalRecorder {
     const timer = setTimeout(() => {
       this.fail(new Error(`tmux %continue for ${paneId} was not acknowledged within 2000ms`));
     }, 2_000);
-    this.pendingContinueAck = { paneId, timer };
+    this.pendingContinueAck = { paneId, request, timer };
     child.stdin.write(`refresh-client -A "${paneId}:continue"\n`, (error) => {
       if (error) this.fail(error);
     });
+  }
+
+  private enqueueRecovery(request: TerminalControlPauseReconcileRequest): void {
+    this.recoveryQueue.push(request);
+    if (this.recoveryQueue.length + (this.recoveryRunning ? 1 : 0) > 8) {
+      this.tripRecoveryLimit(request, "tmux pause recovery queue exceeded 8 jobs");
+      return;
+    }
+    void this.drainRecoveryQueue();
+  }
+
+  private async drainRecoveryQueue(): Promise<void> {
+    if (this.recoveryRunning || this.fatalError) return;
+    const request = this.recoveryQueue.shift();
+    if (!request) return;
+    this.recoveryRunning = true;
+    this.activeRecovery = request;
+    try {
+      const capture = await this.dependencies.reconcilePause(request);
+      if (!this.shouldStopReading() && !this.settledGapIds.has(request.gapId)) {
+        if (!capture) throw new Error("pause reconciliation returned no result");
+        this.appendRecoveryResult(request, capture);
+      }
+    } catch (error) {
+      if (this.shouldStopReading()) return;
+      if (!this.settledGapIds.has(request.gapId)) this.appendRecoveryFailure(request, error);
+      for (const queued of this.recoveryQueue.splice(0)) {
+        if (!this.settledGapIds.has(queued.gapId)) {
+          this.appendRecoveryFailure(queued, new Error("pause reconciliation aborted after prior failure"));
+        }
+      }
+      this.fail(error);
+    } finally {
+      this.activeRecovery = null;
+      this.recoveryRunning = false;
+      if (!this.shouldStopReading()) void this.drainRecoveryQueue();
+    }
+  }
+
+  private recoveryIdentity(identity: TerminalControlSourceIdentity) {
+    return {
+      session: identity.session,
+      sessionId: identity.sessionId,
+      windowId: identity.windowId,
+      paneId: identity.paneId,
+      paneTarget: identity.paneTarget,
+      tmuxServerPid: identity.tmuxServerPid,
+      sessionCreated: identity.sessionCreated,
+    };
+  }
+
+  private appendRecoveryResult(
+    request: TerminalControlPauseReconcileRequest,
+    capture: TerminalControlRecoveryCapture,
+  ): void {
+    const status = capture.boundary === "matched" && !capture.truncated ? "success" : "ambiguous";
+    this.worker.appendOrderedRecovery({
+      gapId: request.gapId,
+      sourceEpoch: this.sourceEpoch,
+      paneId: request.paneId,
+      provenance: "recovered-from-ring",
+      status,
+      recoveredBytesBase64: Buffer.from(capture.recoveredBytes).toString("base64"),
+      recoveredRows: capture.recoveredRows,
+      truncated: capture.truncated,
+      identity: this.recoveryIdentity(capture.identity),
+      geometry: capture.geometry,
+      capturedSeqBefore: request.capturedSeqBefore,
+      capturedSeqAfter: this.worker.lastDurableSequence.toString(),
+      boundary: capture.boundary,
+    } satisfies OutputWalRecoverySnapshot);
+    this.settledGapIds.add(request.gapId);
+  }
+
+  private appendRecoveryFailure(request: TerminalControlPauseReconcileRequest, error: unknown): void {
+    const message = (error instanceof Error ? error.message : String(error)).replace(/[\0\r\n]/g, " ").slice(0, 2_048);
+    this.worker.appendOrderedRecovery({
+      gapId: request.gapId,
+      sourceEpoch: this.sourceEpoch,
+      paneId: request.paneId,
+      provenance: "recovered-from-ring",
+      status: "failed",
+      recoveredBytesBase64: "",
+      recoveredRows: null,
+      truncated: null,
+      identity: this.recoveryIdentity(request.source),
+      geometry: request.source.geometry,
+      capturedSeqBefore: request.capturedSeqBefore,
+      capturedSeqAfter: this.worker.lastDurableSequence.toString(),
+      boundary: null,
+      error: message,
+    });
+    this.settledGapIds.add(request.gapId);
+  }
+
+  private tripRecoveryLimit(current: TerminalControlPauseReconcileRequest, message: string): void {
+    const pending = [this.activeRecovery, ...this.recoveryQueue.splice(0), current]
+      .filter((request): request is TerminalControlPauseReconcileRequest => request !== null);
+    for (const request of pending) {
+      if (!this.settledGapIds.has(request.gapId)) this.appendRecoveryFailure(request, new Error(message));
+    }
+    this.alertMessage = message;
+    this.dependencies.onAlert?.(message);
+    this.fail(new Error(message));
+  }
+
+  /** Persist cancellation before closing the writer; late capture callbacks
+   * must never resurrect this source epoch or write into a stopped worker. */
+  private settleInterruptedRecoveries(reason: string): void {
+    const requests = [this.activeRecovery, ...this.recoveryQueue.splice(0), this.pendingContinueAck?.request];
+    if (this.pendingContinueAck) clearTimeout(this.pendingContinueAck.timer);
+    this.pendingContinueAck = null;
+    for (const request of requests) {
+      if (!request || this.settledGapIds.has(request.gapId)) continue;
+      if (this.worker.status.started) this.appendRecoveryFailure(request, new Error(reason));
+    }
   }
 
   private async finishFromExit(): Promise<void> {
@@ -933,6 +1176,7 @@ export class TerminalControlWalRecorder {
       // source epoch and must not turn a safely drained END into a fatal.
       // %exit closes only this source epoch. The logical instance remains
       // active unless the host durably armed an explicit logical END first.
+      this.settleInterruptedRecoveries("source exited before pause recovery completed");
       if (this.endOnSourceExit) await this.worker.closeLogicalLifecycle();
       else await this.worker.stop();
       this.endOnSourceExit = false;
@@ -948,19 +1192,19 @@ export class TerminalControlWalRecorder {
     if (this.fatalError || this.state === "disconnected") return;
     this.fatalError = error instanceof Error ? error : new Error(String(error));
     this.state = "fatal";
-    // Cancel any pending %continue acknowledgement timer to avoid a second
-    // call to fail() after the first one has already set the fatal state.
-    if (this.pendingContinueAck) {
-      clearTimeout(this.pendingContinueAck.timer);
-      this.pendingContinueAck = null;
+    try {
+      this.settleInterruptedRecoveries("recorder failed before pause recovery completed");
+    } catch {
+      // Preserve the original error when storage itself cannot accept a
+      // cancellation. The durable gap still marks the missing interval.
     }
-    // Do not kill the process. stdout.pause() retains unread bytes in the
-    // kernel pipe and applies backpressure to tmux, preserving failure
-    // evidence. It does NOT prevent bytes that were already in flight from
-    // being lost. Received pauses fsync their own gap before continue.
+    // Detach only this read-only control client. The pane and tmux server are
+    // owned by the host and must survive recorder failure/retry.
     // TODO(§3.2 item 7): persist failure/unclean-source gaps when possible;
     // a disk failure must never be reported as a successfully persisted gap.
     this.process?.stdout.pause();
+    this.process?.kill("SIGTERM");
+    void this.worker.stop({ writeLifecycleEnd: false }).catch(() => undefined);
     this.clearReadyTimer();
     if (!this.readySettled) {
       this.readySettled = true;
@@ -994,6 +1238,8 @@ export class TerminalControlWalRecorder {
       pid: process.pid,
       source: this.source,
       updatedAt: Date.now(),
+      ...(this.degraded ? { degraded: true } : {}),
+      ...(this.alertMessage === null ? {} : { alert: this.alertMessage }),
       ...(error === undefined
         ? {}
         : { error: error.replace(/[\0\r\n]/g, " ").slice(0, 2_048) }),
@@ -1013,6 +1259,95 @@ export type TerminalControlWalSignalRecorder = Pick<
   TerminalControlWalRecorder,
   "stop" | "armLogicalEndOnSourceExit" | "cancelLogicalEndOnSourceExit"
 >;
+
+type TerminalControlWalRetryRecorder = TerminalControlWalSignalRecorder & {
+  start(): Promise<void>;
+};
+
+export type TerminalControlWalRetrySupervisorDependencies = {
+  factory: (onFatal: (error: Error) => void) => TerminalControlWalRetryRecorder;
+  schedule?: (callback: () => void, delayMs: number) => unknown;
+  cancel?: (handle: unknown) => void;
+  now?: () => number;
+  onAlert?: (message: string) => void;
+};
+
+/** Bounded source-epoch retry: 5s, 15s, 60s, then a durable external alert. */
+export class TerminalControlWalRetrySupervisor implements TerminalControlWalSignalRecorder {
+  private readonly schedule: (callback: () => void, delayMs: number) => unknown;
+  private readonly cancel: (handle: unknown) => void;
+  private readonly now: () => number;
+  private current: TerminalControlWalRetryRecorder | null = null;
+  private timer: unknown = null;
+  private stopped = false;
+  private failures: number[] = [];
+  private readonly handled = new Set<TerminalControlWalRetryRecorder>();
+
+  constructor(private readonly dependencies: TerminalControlWalRetrySupervisorDependencies) {
+    this.schedule = dependencies.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.cancel = dependencies.cancel ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.now = dependencies.now ?? Date.now;
+  }
+
+  async start(): Promise<void> {
+    if (this.current || this.stopped) return;
+    await this.launch();
+  }
+
+  private async launch(): Promise<void> {
+    if (this.stopped) return;
+    let recorder!: TerminalControlWalRetryRecorder;
+    recorder = this.dependencies.factory((error) => { void this.handleFailure(recorder, error); });
+    this.current = recorder;
+    try {
+      await recorder.start();
+    } catch (error) {
+      await this.handleFailure(recorder, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async handleFailure(recorder: TerminalControlWalRetryRecorder, error: Error): Promise<void> {
+    if (this.stopped || this.current !== recorder || this.handled.has(recorder)) return;
+    this.handled.add(recorder);
+    await recorder.stop().catch(() => undefined);
+    if (this.current === recorder) this.current = null;
+    const now = this.now();
+    this.failures = this.failures.filter((at) => now - at < 5 * 60_000);
+    this.failures.push(now);
+    const retryIndex = this.failures.length - 1;
+    const delays = [5_000, 15_000, 60_000] as const;
+    if (retryIndex >= delays.length) {
+      const message = `terminal control WAL stopped after 3 retries within 5 minutes: ${error.message}`;
+      this.dependencies.onAlert?.(message);
+      return;
+    }
+    this.timer = this.schedule(() => {
+      this.timer = null;
+      void this.launch();
+    }, delays[retryIndex]!);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer !== null) {
+      this.cancel(this.timer);
+      this.timer = null;
+    }
+    const recorder = this.current;
+    this.current = null;
+    if (recorder) await recorder.stop();
+  }
+
+  armLogicalEndOnSourceExit(): void {
+    if (!this.current) throw new Error("terminal control WAL has no active recorder epoch");
+    this.current.armLogicalEndOnSourceExit();
+  }
+
+  cancelLogicalEndOnSourceExit(): void {
+    if (!this.current) throw new Error("terminal control WAL has no active recorder epoch");
+    this.current.cancelLogicalEndOnSourceExit();
+  }
+}
 
 /**
  * Standalone-runner signal contract:
@@ -1045,22 +1380,23 @@ export function installTerminalControlWalSignalHandlers(
   target.on("SIGUSR2", () => invoke(() => recorder.armLogicalEndOnSourceExit()));
 }
 
-export async function runTerminalControlWalRecorderFromEnvironment(): Promise<TerminalControlWalRecorder> {
+export async function runTerminalControlWalRecorderFromEnvironment(): Promise<TerminalControlWalRetrySupervisor> {
   const config = parseTerminalControlWalRecorderConfigJson(
     process.env[TERMINAL_CONTROL_WAL_CONFIG_ENV] ?? "",
   );
-  const recorder = new TerminalControlWalRecorder(config, {
-    onFatal: (error) => {
+  const supervisor = new TerminalControlWalRetrySupervisor({
+    factory: (onFatal) => new TerminalControlWalRecorder(config, { onFatal }),
+    onAlert: (message) => {
+      console.error(`[thumbmux terminal-control-wal] alert: ${message}`);
+      process.exitCode = 1;
+    },
+  });
+  await supervisor.start();
+  installTerminalControlWalSignalHandlers(supervisor, {
+    onError: (error) => {
       console.error(`[thumbmux terminal-control-wal] fatal: ${error.message}`);
       process.exitCode = 1;
     },
   });
-  await recorder.start();
-  installTerminalControlWalSignalHandlers(recorder, {
-    onError: (error) => {
-      console.error(`[thumbmux terminal-control-wal] signal action failed: ${String(error)}`);
-      process.exitCode = 1;
-    },
-  });
-  return recorder;
+  return supervisor;
 }
