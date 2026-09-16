@@ -246,7 +246,9 @@ describe("ordered tmux control WAL recorder", () => {
     await ready(recorder, fake);
 
     fake.stdout.write("%pause %42\n");
-    await eventually(() => commands.includes("refresh-client -A %42:continue\n"), "continue command");
+    // tmux 3.4 requires the pane-action to be quoted; unquoted %<id>:continue
+    // returns %error and crashes the recorder. Verify the quoted form is sent.
+    await eventually(() => commands.includes('refresh-client -A "%42:continue"\n'), "continue command");
     fake.stdout.write("%begin 1700000001 2 1\n%end 1700000001 2 1\n");
     fake.stdout.write("%continue %42\n%output %42 resumed\\012\n");
     expect(recorder.status.state).toBe("ready");
