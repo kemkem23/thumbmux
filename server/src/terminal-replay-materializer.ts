@@ -1814,7 +1814,7 @@ class ReplayEngine {
   private pendingResize: TerminalReplayResize | null = null;
   private recordsSeen = 0;
   private hasOutputInGeneration = false;
-  private pendingGapId: string | null = null;
+  private readonly pendingGaps = new Map<string, ReturnType<typeof parseOutputWalGapPayload>>();
 
   constructor(private readonly tmux: PrivateTmuxReplay) {}
 
@@ -1992,9 +1992,11 @@ class ReplayEngine {
         case "resize":
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
           break;
-        case "gap":
+        case "gap": {
           this.requireActive(record);
-          this.pendingGapId = parseOutputWalGapPayload(record.payload).gapId;
+          const gap = parseOutputWalGapPayload(record.payload);
+          if (this.pendingGaps.has(gap.gapId)) throw new Error(`duplicate pending gap ${gap.gapId}`);
+          this.pendingGaps.set(gap.gapId, gap);
           // A gap starts a new, explicitly incomplete VT generation. Archive
           // the prior visible screen before dropping modes or partial escapes.
           if (this.hasOutputInGeneration) {
@@ -2003,12 +2005,14 @@ class ReplayEngine {
             this.tmux.discardUnseenAndReset(this.geometry!);
           }
           this.hasOutputInGeneration = false;
-          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(this.pendingGapId)}]\n`));
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(gap.gapId)}]\n`));
           break;
+        }
         case "recovery": {
           this.requireActive(record);
           const recovery = parseOutputWalRecoveryPayload(record.payload);
-          if (recovery.gapId !== this.pendingGapId) {
+          const gap = this.pendingGaps.get(recovery.gapId);
+          if (!gap || gap.sourceEpoch !== recovery.sourceEpoch || gap.paneId !== recovery.paneId) {
             throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
           }
           // capture-pane is already rendered rows, not a PTY byte stream.
@@ -2022,7 +2026,7 @@ class ReplayEngine {
             if (rows) onHistory(Buffer.from(rows.endsWith("\n") ? rows : `${rows}\n`));
           }
           onHistory(Buffer.from("[จบภาพที่กู้จาก ring; ข้อมูลสดที่เก็บได้ยังแสดงต่อ]\n"));
-          this.pendingGapId = null;
+          this.pendingGaps.delete(recovery.gapId);
           break;
         }
         case "checkpoint":
