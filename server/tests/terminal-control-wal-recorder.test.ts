@@ -322,6 +322,7 @@ describe("ordered tmux control WAL recorder", () => {
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toContain("fatal health could not be persisted");
     expect(alerts[0]).not.toContain("gap was persisted");
+    rmSync(healthPath, { recursive: true });
   });
 
   test("treats %exit as source disconnect without ending the logical lifecycle", async () => {

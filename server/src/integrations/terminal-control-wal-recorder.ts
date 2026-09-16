@@ -1235,8 +1235,15 @@ export class TerminalControlWalRecorder {
     }
     try {
       this.writeHealth("fatal", this.fatalError.message);
-    } catch {
-      // The original failure remains authoritative (often the same disk).
+    } catch (healthError) {
+      const detail = healthError instanceof Error ? healthError.message : String(healthError);
+      const message = `terminal control WAL fatal health could not be persisted: ${detail}`;
+      this.alertMessage = message;
+      try {
+        this.dependencies.onAlert?.(message);
+      } catch {
+        // The original recorder failure remains authoritative.
+      }
     }
     this.dependencies.onFatal?.(this.fatalError);
   }
