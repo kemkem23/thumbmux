@@ -828,28 +828,18 @@ export class TerminalControlWalRecorder {
   };
 
   private handleLine(bytes: Uint8Array): void {
-    if (isWalNotification(bytes)) {
-      // Keep notifications byte-exact until the exact pane/window identity is
-      // known. In particular tmux 3.4 emits printable UTF-8 bytes raw while
-      // octal-escaping control bytes in the same payload. Asynchronous
-      // notifications may be interleaved inside a command's %begin/%end block.
-      this.enqueueOrApply({ kind: "raw-wal-line", bytes: Buffer.from(bytes) });
-      return;
-    }
-
-    const line = strictAsciiControlLine(bytes);
-    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
-    if (pause) {
-      // tmux 3.4 may send %continue before the %end for refresh-client.
-      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
-      this.enqueueOrApply(event);
-      return;
-    }
     if (this.commandBlock) {
-      const end = /^(%end|%error) (\d+) (\d+) (\d+)$/.exec(line);
-      if (!end) {
-        throw new Error("tmux control command produced unexpected output");
+      // Command payload is arbitrary rendered text (including UTF-8 and
+      // notification lookalikes). Only the matching terminator is protocol.
+      // refresh-client may emit the actual continue acknowledgement here;
+      // accept only the pane for which this recorder has a pending request.
+      const line = Buffer.from(bytes).toString("utf8");
+      if (this.pendingContinueAck && line === `%continue ${this.pendingContinueAck.paneId}`) {
+        this.enqueueOrApply({ kind: "continue", paneId: this.pendingContinueAck.paneId });
+        return;
       }
+      const end = /^(%end|%error) (\d+) (\d+) (\d+)$/.exec(line);
+      if (!end) return;
       if (end[2] !== this.commandBlock.at
         || end[3] !== this.commandBlock.number
         || end[4] !== this.commandBlock.flags) {
@@ -862,6 +852,23 @@ export class TerminalControlWalRecorder {
       return;
     }
 
+    if (isWalNotification(bytes)) {
+      // Keep notifications byte-exact until the exact pane/window identity is
+      // known. In particular tmux 3.4 emits printable UTF-8 bytes raw while
+      // octal-escaping control bytes in the same payload. Command response
+      // payload was handled above and must never reach this notification path.
+      this.enqueueOrApply({ kind: "raw-wal-line", bytes: Buffer.from(bytes) });
+      return;
+    }
+
+    const line = strictAsciiControlLine(bytes);
+    const pause = /^%(pause|continue) (%\d+)$/.exec(line);
+    if (pause) {
+      // tmux 3.4 may send %continue before the %end for refresh-client.
+      const event: PendingRecorderEvent = { kind: pause[1] as "pause" | "continue", paneId: pause[2]! };
+      this.enqueueOrApply(event);
+      return;
+    }
     const begin = /^%begin (\d+) (\d+) (\d+)$/.exec(line);
     if (begin) {
       this.commandBlock = { at: begin[1]!, number: begin[2]!, flags: begin[3]! };
