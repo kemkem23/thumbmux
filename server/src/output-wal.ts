@@ -331,7 +331,6 @@ export function scanOutputWal(path: string, options: { maxPayloadBytes?: number 
             problem: { kind: "corrupt", offset, message: String(error) } };
         }
       }
-      if (parsed.kind === "recovery") parseOutputWalRecoveryPayload(payload);
       if (parsed.kind === "recovery") {
         try {
           parseOutputWalRecoveryPayload(payload);
