@@ -84,12 +84,39 @@ function ownedDirectory(path: string, mode: number): OwnershipCheck {
   }
 }
 
-function ownedFile(path: string, mode: number): boolean {
+function ownedFile(path: string, mode: number): OwnershipCheck {
   try {
     const st = statSync(path);
-    return st.isFile() && st.uid === process.getuid?.() && (st.mode & 0o777) === mode;
-  } catch {
-    return false;
+    if (!st.isFile()) {
+      return {
+        owned: false,
+        reason: `attestation path=${path} type=not-file expected=file`,
+      };
+    }
+    const expectedUid = process.getuid?.();
+    if (st.uid !== expectedUid) {
+      return {
+        owned: false,
+        reason: `attestation path=${path} owner uid=${st.uid} expected uid=${String(expectedUid)}`,
+      };
+    }
+    const actualMode = st.mode & 0o777;
+    if (actualMode !== mode) {
+      return {
+        owned: false,
+        reason: `attestation path=${path} mode=${octalMode(actualMode)} expected mode=${octalMode(mode)}`,
+      };
+    }
+    return { owned: true };
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "unknown";
+    return {
+      owned: false,
+      reason: `attestation path=${path} stat=failed error=${code} expected=file`,
+    };
   }
 }
 
@@ -112,7 +139,11 @@ function localSandboxAdmitted(): boolean {
     localSandboxRefusalReason = runtimeOwnership.reason;
     return false;
   }
-  if (!ownedFile(attestation, 0o600)) return false;
+  const attestationOwnership = ownedFile(attestation, 0o600);
+  if (!attestationOwnership.owned) {
+    localSandboxRefusalReason = attestationOwnership.reason;
+    return false;
+  }
   if (!existsSync(attestation)) return false;
   const lines = readFileSync(attestation, "utf8").split("\n");
   return lines[0] === "version=2" && lines[1] === "kind=command";
