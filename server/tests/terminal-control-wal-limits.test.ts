@@ -117,6 +117,36 @@ async function makeReady(options: {
   return { directory: join(root, "lane"), fake, recorder };
 }
 
+test("case 1: the third %pause within 60 seconds trips the rate limit and alerts", async () => {
+  const fatals: Error[] = [];
+  const alerts: string[] = [];
+  const { fake, recorder } = await makeReady({
+    onFatal: (error) => fatals.push(error),
+    onAlert: (message) => alerts.push(message),
+  });
+
+  fake.stdout.write("%pause %42\n");
+  expect(alerts).toHaveLength(0);
+  expect(fatals).toHaveLength(0);
+  expect(recorder.status.state).toBe("ready");
+
+  fake.stdout.write("%pause %42\n");
+  expect(alerts).toHaveLength(0);
+  expect(fatals).toHaveLength(0);
+  expect(recorder.status.state).toBe("ready");
+  expect(recorder.status.alert).toBeNull();
+
+  fake.stdout.write("%pause %42\n");
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain("3 events within 60 seconds");
+  expect(fatals).toHaveLength(1);
+  expect(fatals[0]!.message).toContain("3 events within 60 seconds");
+  expect(recorder.status.state).toBe("fatal");
+  expect(recorder.status.alert).toContain("3 events within 60 seconds");
+  expect(recorder.status.fatalMessage).toContain("3 events within 60 seconds");
+  expect(fake.killed).toBe(true);
+});
+
 test("case 3 control: acknowledged %continue does not fatal on the 2000ms timer", async () => {
   const fatals: Error[] = [];
   const alerts: string[] = [];
