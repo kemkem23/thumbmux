@@ -172,7 +172,7 @@ describe("format 2 durable pause gaps", () => {
     writer.close();
     const tail = readOutputWalTail(path, cursor).records;
     expect(tail[0]!.kind).toBe("gap");
-    expect(parseOutputWalJson(tail[0]!)).toEqual({ ...gap, lastDurableSeq: "1" });
+    expect(parseOutputWalJson<Record<string, unknown>>(tail[0]!)).toEqual({ ...gap, lastDurableSeq: "1" });
     expect([...readOutputWal(path)]).toHaveLength(2);
     const resumed = new OutputWalWriter({ path, format: 2 });
     expect(resumed.lastDurableSequence).toBe(2n);
