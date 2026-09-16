@@ -17,7 +17,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Server } from 'bun';
@@ -160,7 +160,8 @@ describe('P01: offline SQLite reader — onepath S1', () => {
     try {
       const r1 = new HistoryReaderCanary(s1);
       const ctx = r1.snapshot(sid).receipt.context;
-      const fwd = r1.page(sid, 'after', 0, 5, ctx);
+      // anchor=null for 'after' means "from the very start" (inclusive of line 0)
+      const fwd = r1.page(sid, 'after', null, 5, ctx);
       const bwd = r1.page(sid, 'before', 5, 5, ctx);
       expect(fwd.page.rows.map(r => r.text)).toEqual(bwd.page.rows.map(r => r.text));
       const full = r1.page(sid, 'before', null, 10, ctx);
@@ -226,8 +227,9 @@ describe('P01: offline SQLite reader — onepath S1', () => {
 
   // ── 6. Export + restore → bytes identical ────────────────────────────────
   test('6. export bundle + restore into fresh store → all rows byte-identical', async () => {
+    // NOTE: exportHistoryBundle creates the bundle directory itself (mkdirSync inside).
+    // Do NOT pre-create it or the call will fail with EEXIST.
     const bundleDir = join(tmpDir, 'bundle');
-    mkdirSync(bundleDir, { recursive: true, mode: 0o700 });
     const restoreDbDir = join(tmpDir, 'restore-db');
     mkdirSync(restoreDbDir, { recursive: true, mode: 0o700 });
     const restoreFile = prepareFile(join(restoreDbDir, 'history.db'));
@@ -270,34 +272,60 @@ describe('P01: offline SQLite reader — onepath S1', () => {
 
   // ── Mutation A: corrupt a row → reader MUST throw ────────────────────────
   test('mutation-A: corrupt row 0 text → reader throws (digest detector alive)', async () => {
-    // Bypass the store to corrupt history_line directly
-    const rawDb = new Database(dbFile, { strict: true });
-    rawDb.exec("UPDATE history_line SET text='CORRUPTED_SENTINEL' WHERE line_no=0");
-    rawDb.close();
-
-    const corrupt = openStore(dbFile);
+    // history_line has an immutability trigger (BEFORE UPDATE RAISE ABORT).
+    // To test storage-level corruption detection we create a fresh isolated DB,
+    // populate it with BATCH1, close it (WAL checkpoints), then overwrite the
+    // UTF-8 bytes of row-0's text in the binary file.  The stored rows_sha256
+    // hash will no longer match, so the reader MUST throw.
+    const mutDir = mkdtempSync(join(tmpdir(), 'onepath-s1-p01-mut-'));
     try {
-      const reader = new HistoryReaderCanary(corrupt);
-      const ctx = reader.snapshot(sid).receipt.context;
-      let threw = false;
+      // ── Build a clean DB ───────────────────────────────────────────────────
+      const mutFile = prepareFile(join(mutDir, 'history.db'));
+      const ms = openStore(mutFile);
+      let msid: string;
       try {
-        reader.page(sid, 'before', 5, 5, ctx);  // includes corrupted row 0
-      } catch (err) {
-        threw = true;
-        expect(String(err)).toMatch(/history-unavailable|reader-batch-digest|batch-hash/);
-      }
-      expect(threw).toBe(true);
-      console.log('P01_MUTATION_A_PROOF', JSON.stringify({ detectorFired: true }));
-    } finally { await corrupt.close(); }
+        msid = await ms.register({ name: 'mutation-test', lifecycleKey: 'mut-lk' });
+        await ms.commit(makeBatch(ms, msid, BATCH1_ROWS, BATCH1_SCREEN, BATCH1_GEOMETRY));
+      } finally { await ms.close(); }
+      // After close() bun:sqlite checkpoints the WAL; all bytes are in mutFile.
 
-    // Restore correct text
-    const fixDb = new Database(dbFile, { strict: true });
-    fixDb.exec("UPDATE history_line SET text='สวัสดี ชาวโลก' WHERE line_no=0");
-    fixDb.close();
+      // ── Corrupt the file at binary level ──────────────────────────────────
+      const target = Buffer.from('สวัสดี ชาวโลก', 'utf8');
+      const data = Buffer.from(readFileSync(mutFile));
+      const idx = data.indexOf(target);
+      if (idx === -1) throw new Error('mutation: target string not found in DB file');
+      // Overwrite text bytes with X (same length → SQLite page structure intact,
+      // but rowsDigest of the rows will differ from the stored rows_sha256).
+      target.fill(0x58); // 'X'
+      target.copy(data, idx);
+      writeFileSync(mutFile, data);
+
+      // ── Verify reader detects the corruption ──────────────────────────────
+      const corrupt = openStore(mutFile);
+      try {
+        const reader = new HistoryReaderCanary(corrupt);
+        const ctx = reader.snapshot(msid).receipt.context;
+        let threw = false;
+        try {
+          reader.page(msid, 'before', null, 10, ctx);
+        } catch (err) {
+          threw = true;
+          expect(String(err)).toMatch(/history-unavailable|reader-batch-digest|batch-hash/);
+        }
+        expect(threw).toBe(true);
+        console.log('P01_MUTATION_A_PROOF', JSON.stringify({ detectorFired: true }));
+      } finally { await corrupt.close(); }
+    } finally {
+      rmSync(mutDir, { recursive: true, force: true });
+    }
   });
 
-  // ── Mutation B: after repair, reader passes ───────────────────────────────
-  test('mutation-B: after text repair, reader passes cleanly (baseline restored)', async () => {
+  // ── Mutation B: main DB was never touched — baseline is intact ───────────
+  test('mutation-B: main DB integrity intact — reader passes (baseline confirmed)', async () => {
+    // Mutation A used its own isolated temp DB and cleaned up after itself.
+    // The main dbFile (seeded in beforeAll) was never corrupted.
+    // This test re-confirms the baseline: the detector fires on corrupt data
+    // (mutation A) AND passes on clean data (mutation B).
     const store = openStore(dbFile);
     try {
       const reader = new HistoryReaderCanary(store);
