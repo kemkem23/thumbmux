@@ -147,6 +147,54 @@ test("case 1: the third %pause within 60 seconds trips the rate limit and alerts
   expect(fake.killed).toBe(true);
 });
 
+test("case 2: the 9th recovery job trips the queue ceiling of 8", async () => {
+  installClock();
+  const fatals: Error[] = [];
+  const alerts: string[] = [];
+  let reconcileCount = 0;
+  let releaseFirst = () => {};
+  const { fake, recorder } = await makeReady({
+    onFatal: (error) => fatals.push(error),
+    onAlert: (message) => alerts.push(message),
+    reconcilePause: async (request) => {
+      reconcileCount += 1;
+      if (reconcileCount === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return emptyCapture(request);
+    },
+  });
+
+  try {
+    for (let i = 0; i < 8; i += 1) {
+      if (i > 0) advanceClock(61_000);
+      fake.stdout.write("%pause %42\n%continue %42\n");
+    }
+    await eventually(() => reconcileCount === 1, "first recovery job running");
+    expect(alerts).toHaveLength(0);
+    expect(fatals).toHaveLength(0);
+    expect(recorder.status.state).toBe("ready");
+    expect(reconcileCount).toBe(1);
+
+    advanceClock(61_000);
+    fake.stdout.write("%pause %42\n%continue %42\n");
+
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("exceeded 8 jobs");
+    expect(fatals).toHaveLength(1);
+    expect(fatals[0]!.message).toContain("exceeded 8 jobs");
+    expect(recorder.status.state).toBe("fatal");
+    expect(recorder.status.alert).toContain("exceeded 8 jobs");
+    expect(recorder.status.fatalMessage).toContain("exceeded 8 jobs");
+    expect(fake.killed).toBe(true);
+    expect(reconcileCount).toBe(1);
+  } finally {
+    releaseFirst();
+  }
+});
+
 test("case 3 control: acknowledged %continue does not fatal on the 2000ms timer", async () => {
   const fatals: Error[] = [];
   const alerts: string[] = [];
