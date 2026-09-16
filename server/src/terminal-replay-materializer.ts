@@ -25,6 +25,7 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createOutputWalStartCursor,
@@ -1994,6 +1995,14 @@ class ReplayEngine {
         case "gap":
           this.requireActive(record);
           this.pendingGapId = parseOutputWalGapPayload(record.payload).gapId;
+          // A gap starts a new, explicitly incomplete VT generation. Archive
+          // the prior visible screen before dropping modes or partial escapes.
+          if (this.hasOutputInGeneration) {
+            this.tmux.sealVisibleAndReset(this.geometry!, onHistory);
+          } else {
+            this.tmux.discardUnseenAndReset(this.geometry!);
+          }
+          this.hasOutputInGeneration = false;
           onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(this.pendingGapId)}]\n`));
           break;
         case "recovery": {
@@ -2002,14 +2011,17 @@ class ReplayEngine {
           if (recovery.gapId !== this.pendingGapId) {
             throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
           }
-          if (recovery.status === "success") {
-            this.tmux.discardUnseenAndReset(recovery.geometry);
-            const recovered = Buffer.from(recovery.recoveredBytesBase64, "base64");
-            if (recovered.byteLength > 0) this.tmux.feed(recovered, onHistory);
-            this.geometry = recovery.geometry;
-            this.hasOutputInGeneration = recovered.byteLength > 0;
+          // capture-pane is already rendered rows, not a PTY byte stream.
+          // Keep it as a labelled archive excerpt, never feed it into live VT
+          // state or replace geometry/output received during capture.
+          this.tmux.drainHistory(onHistory);
+          onHistory(Buffer.from(`[ภาพที่กู้จาก ring (recovered-from-ring); gap ${JSON.stringify(recovery.gapId)}; สถานะ: ${recovery.status}; อาจซ้ำกับข้อมูลสดและไม่ยืนยันว่าครบ]\n`));
+          if (recovery.status !== "failed") {
+            const rows = stripVTControlCharacters(Buffer.from(recovery.recoveredBytesBase64, "base64").toString("utf8"))
+              .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+            if (rows) onHistory(Buffer.from(rows.endsWith("\n") ? rows : `${rows}\n`));
           }
-          onHistory(Buffer.from(`[ผลกู้ประวัติ gap ${JSON.stringify(recovery.gapId)}; สถานะ: ${recovery.status}]\n`));
+          onHistory(Buffer.from("[จบภาพที่กู้จาก ring; ข้อมูลสดที่เก็บได้ยังแสดงต่อ]\n"));
           this.pendingGapId = null;
           break;
         }
