@@ -1,4 +1,7 @@
 import {
+  randomUUID,
+} from "node:crypto";
+import {
   chmodSync,
   closeSync,
   constants,
@@ -97,6 +100,7 @@ type ExistingWalState = {
   empty: boolean;
   active: boolean;
   logicalIdentity: Pick<TerminalWalIdentity, "session" | "instanceId"> | null;
+  sourceIdentity: TerminalWalIdentity | null;
   pendingResize: PendingResize | null;
 };
 
@@ -310,6 +314,7 @@ function inspectExistingWal(path: string): ExistingWalState {
   let records = 0;
   let active = false;
   let logicalIdentity: ExistingWalState["logicalIdentity"] = null;
+  let sourceIdentity: TerminalWalIdentity | null = null;
   let pendingResize: PendingResize | null = null;
   for (const record of readOutputWal(path)) {
     records += 1;
@@ -329,6 +334,7 @@ function inspectExistingWal(path: string): ExistingWalState {
           session: lifecycle.identity.session,
           instanceId: lifecycle.identity.instanceId,
         };
+        sourceIdentity = lifecycle.identity;
         active = true;
         continue;
       }
@@ -351,6 +357,7 @@ function inspectExistingWal(path: string): ExistingWalState {
         // still-active logical instance.
         active = true;
       }
+      sourceIdentity = lifecycle.identity;
       continue;
     }
 
@@ -375,7 +382,7 @@ function inspectExistingWal(path: string): ExistingWalState {
       throw new Error(`terminal WAL ${record.kind} record appears inside a pending resize`);
     }
   }
-  return { empty: records === 0, active, logicalIdentity, pendingResize };
+  return { empty: records === 0, active, logicalIdentity, sourceIdentity, pendingResize };
 }
 
 function copyGeometry(value: TerminalGeometry): TerminalGeometry {
@@ -616,6 +623,19 @@ export class TerminalWalWorker {
           "resize",
           { phase: "abort", ...existing.pendingResize } satisfies TerminalWalResizeRecord,
         );
+      }
+      if (!existing.empty && existing.active && this.writer.format === 2) {
+        const boundary = this.writer.lastDurableSequence.toString();
+        this.writer.appendGap({
+          gapId: randomUUID(),
+          sourceEpoch: existing.sourceIdentity?.generation
+            ?? `unclean-${existing.logicalIdentity!.instanceId}-${boundary}`,
+          paneId: existing.sourceIdentity?.paneId ?? "%0",
+          reason: "unclean-source",
+          detectedAt: this.clock?.() ?? Date.now(),
+          missingBytes: null,
+          coverage: "unknown",
+        });
       }
       const lifecycle: TerminalWalLifecycleRecord = {
         event: existing.empty ? "start" : "resume",
