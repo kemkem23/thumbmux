@@ -48,6 +48,14 @@ function octalMode(mode: number): string {
   return `0${mode.toString(8)}`;
 }
 
+function boundedAttestationLine(line: string | undefined): string {
+  if (line === undefined) return "<missing>";
+  const characters = Array.from(line);
+  const bounded =
+    characters.length > 80 ? `${characters.slice(0, 80).join("")}…` : line;
+  return JSON.stringify(bounded);
+}
+
 function ownedDirectory(path: string, mode: number): OwnershipCheck {
   try {
     const st = statSync(path);
@@ -144,9 +152,20 @@ function localSandboxAdmitted(): boolean {
     localSandboxRefusalReason = attestationOwnership.reason;
     return false;
   }
-  if (!existsSync(attestation)) return false;
+  if (!existsSync(attestation)) {
+    localSandboxRefusalReason =
+      `attestation path=${attestation} disappeared=before-read expected=file`;
+    return false;
+  }
   const lines = readFileSync(attestation, "utf8").split("\n");
-  return lines[0] === "version=2" && lines[1] === "kind=command";
+  if (lines[0] !== "version=2" || lines[1] !== "kind=command") {
+    localSandboxRefusalReason =
+      "attestation contents=invalid expected line1=\"version=2\" line2=\"kind=command\" " +
+      `actual line1=${boundedAttestationLine(lines[0])} ` +
+      `line2=${boundedAttestationLine(lines[1])}`;
+    return false;
+  }
+  return true;
 }
 
 let localSandboxRefusalReason: string | undefined;
