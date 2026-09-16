@@ -218,6 +218,19 @@ test("case 3 control: acknowledged %continue does not fatal on the 2000ms timer"
   expect(reconciles).toHaveLength(1);
 });
 
+test("defaultReconcilePause keeps timeout 2000ms, maxBuffer 8MiB, and a 10000-row cap", async () => {
+  const source = await Bun.file(
+    join(import.meta.dir, "../src/integrations/terminal-control-wal-recorder.ts"),
+  ).text();
+  const fn = source.slice(source.indexOf("async function defaultReconcilePause"));
+  const body = fn.slice(0, fn.indexOf("\nfunction sameGeometry"));
+  expect(body).toContain("timeout: 2_000");
+  expect(body).toContain("maxBuffer: 8 * 1024 * 1024");
+  expect(body).toContain("if (request.source.geometry.rows > 10_000)");
+  expect(body).toContain("exceeds the 10000-row memory budget");
+  expect(body).toContain("Math.min(recoveredRows, 10_000)");
+});
+
 test("case 3: missing %continue fatals after 2000ms with the ack timeout message", async () => {
   const fatals: Error[] = [];
   const alerts: string[] = [];
