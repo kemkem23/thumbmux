@@ -1988,6 +1988,10 @@ class ReplayEngine {
         case "resize":
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
           break;
+        case "gap":
+          // No suffix may be fed into VT state with an unknown missing prefix.
+          // Ring reconciliation/reset belongs to PIPEHIST §3.2 items 3–5.
+          throw new Error("unavailable: durable tmux-pause gap requires reconciliation before replay");
         case "checkpoint":
           parseBarrier(parseOutputWalJson(record));
           break;

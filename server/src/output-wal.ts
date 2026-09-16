@@ -27,6 +27,7 @@ import { dirname } from "node:path";
 
 const MAGIC = Buffer.from("THMWAL01", "ascii");
 const VERSION = 1;
+export type OutputWalFormat = 1 | 2;
 const HEADER_BYTES = 40;
 const CHECKSUM_INPUT_BYTES = 24;
 const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
@@ -38,6 +39,7 @@ const KIND_TO_CODE = {
   output: 2,
   resize: 3,
   checkpoint: 4,
+  gap: 5,
 } as const;
 
 const CODE_TO_KIND = new Map<number, OutputWalKind>(
@@ -58,7 +60,7 @@ export type OutputWalRecord = {
 };
 
 export type OutputWalProblem = {
-  kind: "torn" | "corrupt";
+  kind: "torn" | "corrupt" | "unavailable";
   offset: number;
   message: string;
 };
@@ -103,6 +105,8 @@ export type OutputWalTailOptions = Readonly<{
 
 export type OutputWalWriterOptions = {
   path: string;
+  /** Must match an existing WAL; never upgrades or rewrites format 1. */
+  format?: OutputWalFormat;
   clock?: () => number;
   maxPayloadBytes?: number;
   /** Tests can disable the automatic repair of an EOF-torn final record. */
@@ -182,6 +186,7 @@ function parseHeader(
   previousSequence: bigint,
   previousAt: number,
   maxPayloadBytes: number,
+  expectedVersion?: number,
 ): {
   kind: OutputWalKind;
   payloadLength: number;
@@ -192,12 +197,16 @@ function parseHeader(
   if (!header.subarray(0, MAGIC.byteLength).equals(MAGIC)) {
     return { kind: "corrupt", offset, message: `invalid WAL magic at byte ${offset}` };
   }
-  if (header.readUInt8(8) !== VERSION) {
-    return { kind: "corrupt", offset, message: `unsupported WAL version at byte ${offset}` };
+  const version = header.readUInt8(8);
+  if (version !== 1 && version !== 2) {
+    return { kind: "unavailable", offset, message: `unavailable: unsupported WAL version at byte ${offset}` };
+  }
+  if (expectedVersion !== undefined && version !== expectedVersion) {
+    return { kind: "corrupt", offset, message: `mixed WAL formats at byte ${offset}` };
   }
   const kind = CODE_TO_KIND.get(header.readUInt8(9));
-  if (!kind) {
-    return { kind: "corrupt", offset, message: `unknown WAL record kind at byte ${offset}` };
+  if (!kind || (version === 1 && kind === "gap")) {
+    return { kind: "unavailable", offset, message: `unavailable: unknown WAL record kind at byte ${offset}` };
   }
   if (header.readUInt16LE(10) !== 0 || header.readUInt32LE(36) !== 0) {
     return { kind: "corrupt", offset, message: `non-zero reserved WAL header field at byte ${offset}` };
@@ -246,6 +255,9 @@ export function scanOutputWal(path: string, options: { maxPayloadBytes?: number 
   const fd = openSync(path, constants.O_RDONLY);
   try {
     const size = fstatSync(fd).size;
+    const first = Buffer.alloc(HEADER_BYTES);
+    readExact(fd, first, 0, HEADER_BYTES, 0);
+    const expectedVersion = size >= HEADER_BYTES ? first.readUInt8(8) : undefined;
     let offset = 0;
     let records = 0;
     let lastSequence = 0n;
@@ -273,7 +285,7 @@ export function scanOutputWal(path: string, options: { maxPayloadBytes?: number 
           problem: { kind: "torn", offset, message: `torn WAL header at byte ${offset}` },
         };
       }
-      const parsed = parseHeader(header, offset, lastSequence, lastAt, maxPayloadBytes);
+      const parsed = parseHeader(header, offset, lastSequence, lastAt, maxPayloadBytes, expectedVersion);
       if ("message" in parsed) {
         return { validBytes: offset, records, lastSequence, lastAt, problem: parsed };
       }
@@ -309,6 +321,15 @@ export function scanOutputWal(path: string, options: { maxPayloadBytes?: number 
         };
       }
 
+      if (parsed.kind === "gap") {
+        try {
+          const gap = parseOutputWalGapPayload(payload);
+          if (BigInt(gap.lastDurableSeq) !== parsed.sequence - 1n) throw new Error("invalid gap boundary");
+        } catch (error) {
+          return { validBytes: offset, records, lastSequence, lastAt,
+            problem: { kind: "corrupt", offset, message: String(error) } };
+        }
+      }
       offset += HEADER_BYTES + parsed.payloadLength;
       records += 1;
       lastSequence = parsed.sequence;
@@ -423,6 +444,9 @@ export function readOutputWalTail(
   const fd = openSync(path, constants.O_RDONLY);
   try {
     const stat = fstatSync(fd);
+    const first = Buffer.alloc(HEADER_BYTES);
+    readExact(fd, first, 0, HEADER_BYTES, 0);
+    const expectedVersion = stat.size >= HEADER_BYTES ? first.readUInt8(8) : undefined;
     const identity = fileIdentity(stat);
     if (identity.device !== cursor.device || identity.inode !== cursor.inode) {
       throw new Error("thumbmux output WAL was replaced after the trusted tail cursor");
@@ -449,7 +473,7 @@ export function readOutputWalTail(
         incompleteTail = true;
         break;
       }
-      const parsed = parseHeader(header, offset, lastSequence, lastAt, maxPayloadBytes);
+      const parsed = parseHeader(header, offset, lastSequence, lastAt, maxPayloadBytes, expectedVersion);
       if ("message" in parsed) throw new Error(parsed.message);
       const recordBytes = HEADER_BYTES + parsed.payloadLength;
       if (remaining < recordBytes) {
@@ -468,6 +492,10 @@ export function readOutputWalTail(
       const checksum = crc32Parts([header.subarray(8, 8 + CHECKSUM_INPUT_BYTES), payload]);
       if (checksum !== parsed.checksum) {
         throw new Error(`WAL checksum mismatch at byte ${offset}`);
+      }
+      if (parsed.kind === "gap") {
+        const gap = parseOutputWalGapPayload(payload);
+        if (BigInt(gap.lastDurableSeq) !== parsed.sequence - 1n) throw new Error("invalid gap boundary");
       }
       const nextOffset = offset + recordBytes;
       records.push({
@@ -595,6 +623,7 @@ function fsyncDirectory(path: string): void {
 
 export class OutputWalWriter {
   private readonly path: string;
+  readonly format: OutputWalFormat;
   private readonly clock: () => number;
   private readonly maxPayloadBytes: number;
   private fd: number;
@@ -604,6 +633,8 @@ export class OutputWalWriter {
 
   constructor(options: OutputWalWriterOptions) {
     this.path = options.path;
+    this.format = options.format ?? VERSION;
+    if (this.format !== 1 && this.format !== 2) throw new Error("unsupported WAL writer format");
     this.clock = options.clock ?? (() => Date.now());
     this.maxPayloadBytes = positivePayloadLimit(options.maxPayloadBytes);
     mkdirSync(dirname(this.path), { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
@@ -613,6 +644,19 @@ export class OutputWalWriter {
     const scan = scanOutputWal(this.path, { maxPayloadBytes: this.maxPayloadBytes });
     if (scan.problem?.kind === "corrupt") {
       throw new Error(`${scan.problem.message}; refusing to append after corrupt bytes`);
+    }
+    if (scan.problem?.kind === "unavailable") throw new Error(scan.problem.message);
+    // Check before repair: a caller with the wrong capability must not mutate
+    // even a torn tail in another format's file.
+    if (existed && statSync(this.path).size >= HEADER_BYTES) {
+      const fd = openSync(this.path, constants.O_RDONLY);
+      try {
+        const header = Buffer.alloc(HEADER_BYTES);
+        readExact(fd, header, 0, HEADER_BYTES, 0);
+        if (header.readUInt8(8) !== this.format) {
+          throw new Error("unavailable: WAL format differs from writer capability; refusing rewrite");
+        }
+      } finally { closeSync(fd); }
     }
     let quarantinedPath: string | null = null;
     if (scan.problem?.kind === "torn") {
@@ -651,6 +695,11 @@ export class OutputWalWriter {
 
   append(kind: OutputWalKind, payload: Uint8Array, at = this.clock()): OutputWalRecord {
     if (this.fd < 0) throw new Error("thumbmux output WAL writer is closed");
+    if (kind === "gap") {
+      if (this.format !== 2) throw new Error("unavailable: gap requires a new format 2 WAL");
+      const gap = parseOutputWalGapPayload(payload);
+      if (BigInt(gap.lastDurableSeq) !== this.sequence) throw new Error("invalid gap boundary");
+    }
     if (payload.byteLength > this.maxPayloadBytes) {
       throw new Error(`thumbmux output WAL payload exceeds ${this.maxPayloadBytes} bytes`);
     }
@@ -658,7 +707,7 @@ export class OutputWalWriter {
     const sequence = this.sequence + 1n;
     const header = Buffer.alloc(HEADER_BYTES);
     MAGIC.copy(header, 0);
-    header.writeUInt8(VERSION, 8);
+    header.writeUInt8(this.format, 8);
     header.writeUInt8(KIND_TO_CODE[kind], 9);
     header.writeUInt16LE(0, 10);
     header.writeUInt32LE(payload.byteLength, 12);
@@ -685,6 +734,13 @@ export class OutputWalWriter {
       kind,
       payload: Buffer.from(payload),
     };
+  }
+
+  /** Latest append that completed the durability barrier, not an observed tmux seq. */
+  get lastDurableSequence(): bigint { return this.sequence; }
+
+  appendGap(value: Omit<OutputWalGap, "lastDurableSeq">): OutputWalRecord {
+    return this.appendJson("gap", { ...value, lastDurableSeq: this.sequence.toString() }, value.detectedAt);
   }
 
   appendOutput(payload: Uint8Array, at?: number): OutputWalRecord {
@@ -716,4 +772,31 @@ export function parseOutputWalJson<T = unknown>(record: OutputWalRecord): T {
     throw new Error("thumbmux output WAL output records are binary, not JSON");
   }
   return JSON.parse(Buffer.from(record.payload).toString("utf8")) as T;
+}
+
+/** Unknown loss stays null; zero would falsely assert complete coverage. */
+export type OutputWalGap = {
+  gapId: string;
+  sourceEpoch: string;
+  paneId: string;
+  lastDurableSeq: string;
+  reason: "tmux-pause";
+  detectedAt: number;
+  missingBytes: null;
+  coverage: "unknown";
+};
+
+export function parseOutputWalGapPayload(payload: Uint8Array): OutputWalGap {
+  const value: unknown = JSON.parse(Buffer.from(payload).toString("utf8"));
+  if (typeof value !== "object" || value === null) throw new Error("invalid WAL gap");
+  const gap = value as Record<string, unknown>;
+  if (typeof gap.gapId !== "string" || !gap.gapId
+    || typeof gap.sourceEpoch !== "string" || !gap.sourceEpoch
+    || typeof gap.paneId !== "string" || !/^%[0-9]+$/.test(gap.paneId)
+    || typeof gap.lastDurableSeq !== "string" || !/^(0|[1-9][0-9]*)$/.test(gap.lastDurableSeq)
+    || gap.reason !== "tmux-pause" || gap.missingBytes !== null || gap.coverage !== "unknown"
+    || typeof gap.detectedAt !== "number" || !Number.isSafeInteger(gap.detectedAt) || gap.detectedAt < 0) {
+    throw new Error("invalid WAL gap: unknown loss must remain null/unknown");
+  }
+  return gap as OutputWalGap;
 }

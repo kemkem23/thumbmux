@@ -158,3 +158,49 @@ describe("lossless output WAL", () => {
     expect(() => readOutputWalTail(path, cursor)).toThrow(/replaced/);
   });
 });
+
+describe("format 2 durable pause gaps", () => {
+  const gap = { gapId: "gap-1", sourceEpoch: "epoch-1", paneId: "%42",
+    reason: "tmux-pause" as const, detectedAt: 100, missingBytes: null, coverage: "unknown" as const };
+
+  test("preserves unknown loss and the latest durable boundary in full and tail reads", () => {
+    const writer = new OutputWalWriter({ path, format: 2, clock: () => 1 });
+    writer.appendOutput(Buffer.from("prefix"));
+    const cursor = createOutputWalTailCursor(path);
+    writer.appendGap(gap);
+    writer.close();
+    const tail = readOutputWalTail(path, cursor).records;
+    expect(tail[0]!.kind).toBe("gap");
+    expect(parseOutputWalJson(tail[0]!)).toEqual({ ...gap, lastDurableSeq: "1" });
+    expect([...readOutputWal(path)]).toHaveLength(2);
+    const resumed = new OutputWalWriter({ path, format: 2 });
+    expect(resumed.lastDurableSequence).toBe(2n);
+    resumed.close();
+  });
+
+  test("cannot upgrade an existing format 1 or downgrade/repair a format 2", () => {
+    const old = new OutputWalWriter({ path });
+    old.appendOutput(Buffer.from("original"));
+    expect(() => old.appendGap(gap)).toThrow("format 2");
+    old.close();
+    const before = readFileSync(path);
+    expect(() => new OutputWalWriter({ path, format: 2 })).toThrow("refusing rewrite");
+    expect(readFileSync(path)).toEqual(before);
+    const second = join(root, "v2.wal");
+    const modern = new OutputWalWriter({ path: second, format: 2 });
+    modern.appendGap(gap);
+    modern.close();
+    appendFileSync(second, "torn");
+    const torn = readFileSync(second);
+    expect(() => new OutputWalWriter({ path: second })).toThrow("refusing rewrite");
+    expect(readFileSync(second)).toEqual(torn);
+  });
+
+  test("rejects false zero loss and foreign durable boundary before writing", () => {
+    const writer = new OutputWalWriter({ path, format: 2 });
+    expect(() => writer.appendJson("gap", { ...gap, lastDurableSeq: "0", missingBytes: 0 })).toThrow("null/unknown");
+    expect(() => writer.appendJson("gap", { ...gap, lastDurableSeq: "99" })).toThrow("boundary");
+    expect(statSync(path).size).toBe(0);
+    writer.close();
+  });
+});
