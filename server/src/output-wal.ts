@@ -759,7 +759,7 @@ export class OutputWalWriter {
   }
 
   appendRecovery(value: OutputWalRecoverySnapshot): OutputWalRecord {
-    return this.appendJson("recovery", value);
+    return this.appendJson("output", value);
   }
 
   appendOutput(payload: Uint8Array, at?: number): OutputWalRecord {
