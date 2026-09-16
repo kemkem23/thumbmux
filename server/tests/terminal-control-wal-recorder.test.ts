@@ -279,9 +279,17 @@ describe("ordered tmux control WAL recorder", () => {
       state: "fatal",
       error: expect.stringContaining("invalid tmux control-mode escape"),
     });
-    const outputs = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
-      .filter((record) => record.kind === "output");
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    const outputs = records.filter((record) => record.kind === "output");
     expect(Buffer.concat(outputs.map((record) => Buffer.from(record.payload))).toString()).toBe("good\n");
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "gap"]);
+    expect(parseOutputWalJson(records[2]!)).toMatchObject({
+      paneId: "%42",
+      reason: "recorder-failure",
+      lastDurableSeq: "2",
+      missingBytes: null,
+      coverage: "unknown",
+    });
   });
 
   test("fails identity validation before creating a WAL lifecycle", async () => {
