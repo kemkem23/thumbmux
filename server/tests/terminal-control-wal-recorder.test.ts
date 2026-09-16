@@ -237,7 +237,7 @@ describe("ordered tmux control WAL recorder", () => {
     expect(parseOutputWalJson(records[0]!)).toMatchObject({ event: "start" });
   });
 
-  test("durably records %pause before continue and accepts resumed output inside its command block", async () => {
+  test("durably records pause and accepts its continue acknowledgement inside the command block", async () => {
     const { directory, fake, recorder } = makeRecorder();
     let commands = "";
     fake.stdin.on("data", (chunk) => {
@@ -249,9 +249,9 @@ describe("ordered tmux control WAL recorder", () => {
     // tmux 3.4 requires the pane-action to be quoted; unquoted %<id>:continue
     // returns %error and crashes the recorder. Verify the quoted form is sent.
     await eventually(() => commands.includes('refresh-client -A "%42:continue"\n'), "continue command");
-    // Real tmux 3.4 can interleave both notifications before the command's
-    // %end; rejecting them here turns the first genuine pause into fatal.
-    fake.stdout.write("%begin 1700000001 2 1\n%continue %42\n%output %42 resumed\\012\n%end 1700000001 2 1\n");
+    // Only the pending continue acknowledgement is accepted within the
+    // command response. Output notifications resume outside its delimiter.
+    fake.stdout.write("%begin 1700000001 2 1\n%continue %42\n%end 1700000001 2 1\n%output %42 resumed\\012\n");
     expect(recorder.status.state).toBe("ready");
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
     expect(records.map((record) => record.kind)).toEqual(["lifecycle", "gap", "output"]);
