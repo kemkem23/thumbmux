@@ -39,8 +39,8 @@ import {
 
 const GAP_REASON_MESSAGES = {
   "tmux-pause": "tmux หยุดส่งชั่วคราว เก็บได้ไม่ครบ",
-  "recorder-failure": "ตัวบันทึกพังกลางคัน",
-  "unclean-source": "รอบก่อนจบไม่สะอาด (เครื่องดับ/โปรเซสถูกฆ่า) ไบต์ช่วงท้ายอาจหาย",
+  "recorder-failure": "รอบก่อนจบไม่สะอาด (เครื่องดับ/โปรเซสถูกฆ่า) ไบต์ช่วงท้ายอาจหาย",
+  "unclean-source": "ตัวบันทึกพังกลางคัน",
 } satisfies Record<ReturnType<typeof parseOutputWalGapPayload>["reason"], string>;
 
 /**
