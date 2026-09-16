@@ -26,7 +26,7 @@
 // packages/thumbmux/scripts/test-runtime-guard.sh's own admission checks) —
 // but it closes the gap where nothing was checked at all.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 const EXIT_CODE = 97;
 
@@ -152,12 +152,19 @@ function localSandboxAdmitted(): boolean {
     localSandboxRefusalReason = attestationOwnership.reason;
     return false;
   }
-  if (!existsSync(attestation)) {
+  let lines: string[];
+  try {
+    lines = readFileSync(attestation, "utf8").split("\n");
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "unknown";
     localSandboxRefusalReason =
-      `attestation path=${attestation} disappeared=before-read expected=file`;
+      `attestation path=${attestation} read=failed error=${code} ` +
+      'expected line1="version=2" line2="kind=command"';
     return false;
   }
-  const lines = readFileSync(attestation, "utf8").split("\n");
   if (lines[0] !== "version=2" || lines[1] !== "kind=command") {
     localSandboxRefusalReason =
       "attestation contents=invalid expected line1=\"version=2\" line2=\"kind=command\" " +
