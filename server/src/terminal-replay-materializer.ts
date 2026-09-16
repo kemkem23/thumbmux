@@ -58,7 +58,7 @@ const GAP_REASON_MESSAGES = {
  * - lifecycle: `{ event: "start" | "resume" | "end", identity, geometry }`
  * - resize: `{ phase: "prepare" | "commit" | "abort", changeId, from, to,
  *   reason? }`
- * - checkpoint: `{ event: "barrier", requestId }` (ordering barrier only)
+ * - checkpoint: barrier, or version 1 source-tracking/source-detached (no screen changes)
  *
  * A resize is applied only after its matching commit.  Output between prepare
  * and commit/abort is rejected.  A WAL ending at prepare is materialized only
@@ -2035,9 +2035,20 @@ class ReplayEngine {
           this.pendingGaps.delete(recovery.gapId);
           break;
         }
-        case "checkpoint":
-          parseBarrier(parseOutputWalJson(record));
+        case "checkpoint": {
+          const value = parseOutputWalJson<unknown>(record);
+          if (isObject(value) && (value.event === "source-tracking" || value.event === "source-detached")) {
+            this.requireActive(record);
+            const keys = value.event === "source-tracking" ? "event,version" : "event,lastDurableSeq,version";
+            if (value.version !== 1 || Object.keys(value).sort().join(",") !== keys
+              || (value.event === "source-detached" && value.lastDurableSeq !== (record.sequence - 1n).toString())) {
+              throw new Error("invalid source checkpoint");
+            }
+          } else {
+            parseBarrier(value);
+          }
           break;
+        }
         default: {
           const exhaustive: never = record.kind;
           throw new Error(`unknown WAL record kind ${String(exhaustive)}`);

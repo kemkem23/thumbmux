@@ -287,7 +287,7 @@ describe("terminal WAL stdin worker and controller", () => {
     const next = new TerminalWalWorker(config(directory), { input: new PassThrough(), walFormat: 2 });
     await expect(next.start()).rejects.toThrow("logical lifecycle already ended");
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "lifecycle"]);
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "lifecycle"]);
     const lifecycle = records
       .filter((record) => record.kind === "lifecycle")
       .map((record) => parseOutputWalJson(record));

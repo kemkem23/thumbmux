@@ -98,6 +98,8 @@ type PendingResize = Omit<TerminalWalResizeRecord, "phase">;
 
 type ExistingWalState = {
   empty: boolean;
+  sourceTracking: boolean;
+  cleanlyDetached: boolean;
   active: boolean;
   logicalIdentity: Pick<TerminalWalIdentity, "session" | "instanceId"> | null;
   sourceIdentity: TerminalWalIdentity | null;
@@ -312,12 +314,16 @@ function samePendingResize(left: PendingResize, right: TerminalWalResizeRecord):
 /** Fail closed before appending to a WAL whose incarnation chain is ambiguous. */
 function inspectExistingWal(path: string): ExistingWalState {
   let records = 0;
+  let sourceTracking = false;
+  let cleanlyDetached = false;
   let active = false;
   let logicalIdentity: ExistingWalState["logicalIdentity"] = null;
   let sourceIdentity: TerminalWalIdentity | null = null;
   let pendingResize: PendingResize | null = null;
   for (const record of readOutputWal(path)) {
     records += 1;
+    // Only the final, sequence-bound detach certificate can attest a clean stop.
+    cleanlyDetached = false;
     if (records === 1 && record.kind !== "lifecycle") {
       throw new Error("terminal WAL first record must be lifecycle start");
     }
@@ -362,6 +368,19 @@ function inspectExistingWal(path: string): ExistingWalState {
     }
 
     if (!active) throw new Error("terminal WAL contains data after end without resume");
+    if (record.kind === "checkpoint") {
+      const value = parseOutputWalJson<unknown>(record);
+      if (isPlainObject(value) && (value.event === "source-tracking" || value.event === "source-detached")) {
+        const expectedKeys = value.event === "source-tracking" ? "event,version" : "event,lastDurableSeq,version";
+        if (value.version !== 1 || Object.keys(value).sort().join(",") !== expectedKeys
+          || (value.event === "source-detached" && (!sourceTracking
+            || value.lastDurableSeq !== (record.sequence - 1n).toString()))) {
+          throw new Error("terminal WAL source checkpoint is invalid");
+        }
+        sourceTracking = true;
+        cleanlyDetached = value.event === "source-detached";
+      }
+    }
     if (record.kind === "resize") {
       const resize = parseResizeRecord(record);
       if (resize.phase === "prepare") {
@@ -382,7 +401,7 @@ function inspectExistingWal(path: string): ExistingWalState {
       throw new Error(`terminal WAL ${record.kind} record appears inside a pending resize`);
     }
   }
-  return { empty: records === 0, active, logicalIdentity, sourceIdentity, pendingResize };
+  return { empty: records === 0, sourceTracking, cleanlyDetached, active, logicalIdentity, sourceIdentity, pendingResize };
 }
 
 function copyGeometry(value: TerminalGeometry): TerminalGeometry {
@@ -624,7 +643,7 @@ export class TerminalWalWorker {
           { phase: "abort", ...existing.pendingResize } satisfies TerminalWalResizeRecord,
         );
       }
-      if (!existing.empty && existing.active && this.writer.format === 2) {
+      if (!existing.empty && existing.active && existing.sourceTracking && !existing.cleanlyDetached && this.writer.format === 2) {
         const boundary = this.writer.lastDurableSequence.toString();
         this.writer.appendGap({
           gapId: randomUUID(),
@@ -637,12 +656,20 @@ export class TerminalWalWorker {
           coverage: "unknown",
         });
       }
+      // Old files deliberately receive no retrospective crash diagnosis. Enroll
+      // before RESUME so a crash in this new source is detectable on next open.
+      if (!existing.empty && !existing.sourceTracking && this.writer.format === 2) {
+        this.writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+      }
       const lifecycle: TerminalWalLifecycleRecord = {
         event: existing.empty ? "start" : "resume",
         identity: this.config.identity,
         geometry: copyGeometry(this.geometry),
       };
       this.writer.appendJson("lifecycle", lifecycle);
+      if (existing.empty && this.writer.format === 2) {
+        this.writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+      }
       this.started = true;
       this.input.on("readable", this.handleInputReadable);
       this.input.on("error", this.handleInputError);
@@ -1002,6 +1029,11 @@ export class TerminalWalWorker {
               geometry: copyGeometry(this.geometry),
             };
             writer.appendJson("lifecycle", lifecycle);
+          } else if (writer.format === 2) {
+            writer.appendJson("checkpoint", {
+              event: "source-detached", version: 1,
+              lastDurableSeq: writer.lastDurableSequence.toString(),
+            });
           }
         }
       } catch (error) {
