@@ -10,6 +10,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   OutputWalWriter,
+  parseOutputWalGapPayload,
   parseOutputWalJson,
   readOutputWal,
 } from "../src/output-wal";
@@ -60,8 +61,13 @@ function config(
 async function startWorker(
   workerConfig: TerminalWalWorkerConfig,
   input = new PassThrough(),
+  walFormat: 1 | 2 = 1,
 ): Promise<{ worker: TerminalWalWorker; input: PassThrough; controller: TerminalWalController }> {
-  const worker = new TerminalWalWorker(workerConfig, { input, clock: () => 1_700_000_000_000 });
+  const worker = new TerminalWalWorker(workerConfig, {
+    input,
+    clock: () => 1_700_000_000_000,
+    walFormat,
+  });
   await worker.start();
   workers.push(worker);
   const controller = new TerminalWalController({ directory: workerConfig.directory });
@@ -226,7 +232,9 @@ describe("terminal WAL stdin worker and controller", () => {
 
   test("writes RESUME for the same logical identity while allowing a new tmux source epoch", async () => {
     const directory = makeRoot();
-    const first = await startWorker(config(directory));
+    const first = await startWorker(config(directory), new PassThrough(), 2);
+    first.input.write(Buffer.from("before unclean stop"));
+    await first.controller.barrier("barrier:before-unclean-stop");
     first.controller.close();
     controllers = controllers.filter((value) => value !== first.controller);
     await first.worker.stop();
@@ -239,10 +247,28 @@ describe("terminal WAL stdin worker and controller", () => {
     const second = await startWorker(config(directory, {
       identity: secondIdentity,
       geometry: { cols: 120, rows: 40 },
-    }));
+    }), new PassThrough(), 2);
+    second.input.write(Buffer.from("after unclean resume"));
     await second.controller.barrier("barrier:resumed");
 
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.map((record) => record.kind)).toEqual([
+      "lifecycle",
+      "output",
+      "checkpoint",
+      "gap",
+      "lifecycle",
+      "output",
+      "checkpoint",
+    ]);
+    const gap = parseOutputWalGapPayload(records[3]!.payload);
+    expect(gap).toMatchObject({
+      reason: "unclean-source",
+      lastDurableSeq: "3",
+      missingBytes: null,
+      coverage: "unknown",
+    });
+    expect(Buffer.from(records[5]!.payload).toString()).toBe("after unclean resume");
     const lifecycle = records
       .filter((record) => record.kind === "lifecycle")
       .map((record) => parseOutputWalJson(record));
@@ -254,14 +280,16 @@ describe("terminal WAL stdin worker and controller", () => {
 
   test("only explicit logical close writes END and an ended lifecycle cannot resume", async () => {
     const directory = makeRoot();
-    const first = await startWorker(config(directory));
+    const first = await startWorker(config(directory), new PassThrough(), 2);
     first.controller.close();
     controllers = controllers.filter((value) => value !== first.controller);
     await first.worker.closeLogicalLifecycle();
 
-    const next = new TerminalWalWorker(config(directory), { input: new PassThrough() });
+    const next = new TerminalWalWorker(config(directory), { input: new PassThrough(), walFormat: 2 });
     await expect(next.start()).rejects.toThrow("logical lifecycle already ended");
-    const lifecycle = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "lifecycle"]);
+    const lifecycle = records
       .filter((record) => record.kind === "lifecycle")
       .map((record) => parseOutputWalJson(record));
     expect(lifecycle).toEqual([
