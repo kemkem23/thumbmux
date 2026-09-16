@@ -723,7 +723,8 @@ export class OutputWalWriter {
     writeAll(this.fd, frame);
     // O_DSYNC covers each write; fdatasync is deliberate belt-and-suspenders
     // for runtimes/filesystems that accept the flag but defer metadata updates.
-    fdatasyncSync(this.fd);
+    if (kind === "gap") fsyncSync(this.fd);
+    else fdatasyncSync(this.fd);
     this.sequence = sequence;
     this.lastAt = timestamp;
     return {
