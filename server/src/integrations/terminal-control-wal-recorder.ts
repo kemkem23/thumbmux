@@ -1176,13 +1176,13 @@ export class TerminalControlWalRecorder {
       clearTimeout(this.pendingContinueAck.timer);
       this.pendingContinueAck = null;
     }
-    // Do not kill the process. stdout.pause() retains unread bytes in the
-    // kernel pipe and applies backpressure to tmux, preserving failure
-    // evidence. It does NOT prevent bytes that were already in flight from
-    // being lost. Received pauses fsync their own gap before continue.
+    // Detach only this read-only control client. The pane and tmux server are
+    // owned by the host and must survive recorder failure/retry.
     // TODO(§3.2 item 7): persist failure/unclean-source gaps when possible;
     // a disk failure must never be reported as a successfully persisted gap.
     this.process?.stdout.pause();
+    this.process?.kill("SIGTERM");
+    void this.worker.stop({ writeLifecycleEnd: false }).catch(() => undefined);
     this.clearReadyTimer();
     if (!this.readySettled) {
       this.readySettled = true;
@@ -1238,6 +1238,95 @@ export type TerminalControlWalSignalRecorder = Pick<
   "stop" | "armLogicalEndOnSourceExit" | "cancelLogicalEndOnSourceExit"
 >;
 
+type TerminalControlWalRetryRecorder = TerminalControlWalSignalRecorder & {
+  start(): Promise<void>;
+};
+
+export type TerminalControlWalRetrySupervisorDependencies = {
+  factory: (onFatal: (error: Error) => void) => TerminalControlWalRetryRecorder;
+  schedule?: (callback: () => void, delayMs: number) => unknown;
+  cancel?: (handle: unknown) => void;
+  now?: () => number;
+  onAlert?: (message: string) => void;
+};
+
+/** Bounded source-epoch retry: 5s, 15s, 60s, then a durable external alert. */
+export class TerminalControlWalRetrySupervisor implements TerminalControlWalSignalRecorder {
+  private readonly schedule: (callback: () => void, delayMs: number) => unknown;
+  private readonly cancel: (handle: unknown) => void;
+  private readonly now: () => number;
+  private current: TerminalControlWalRetryRecorder | null = null;
+  private timer: unknown = null;
+  private stopped = false;
+  private failures: number[] = [];
+  private readonly handled = new Set<TerminalControlWalRetryRecorder>();
+
+  constructor(private readonly dependencies: TerminalControlWalRetrySupervisorDependencies) {
+    this.schedule = dependencies.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.cancel = dependencies.cancel ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.now = dependencies.now ?? Date.now;
+  }
+
+  async start(): Promise<void> {
+    if (this.current || this.stopped) return;
+    await this.launch();
+  }
+
+  private async launch(): Promise<void> {
+    if (this.stopped) return;
+    let recorder!: TerminalControlWalRetryRecorder;
+    recorder = this.dependencies.factory((error) => { void this.handleFailure(recorder, error); });
+    this.current = recorder;
+    try {
+      await recorder.start();
+    } catch (error) {
+      await this.handleFailure(recorder, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async handleFailure(recorder: TerminalControlWalRetryRecorder, error: Error): Promise<void> {
+    if (this.stopped || this.current !== recorder || this.handled.has(recorder)) return;
+    this.handled.add(recorder);
+    await recorder.stop().catch(() => undefined);
+    if (this.current === recorder) this.current = null;
+    const now = this.now();
+    this.failures = this.failures.filter((at) => now - at < 5 * 60_000);
+    this.failures.push(now);
+    const retryIndex = this.failures.length - 1;
+    const delays = [5_000, 15_000, 60_000] as const;
+    if (retryIndex >= delays.length) {
+      const message = `terminal control WAL stopped after 3 retries within 5 minutes: ${error.message}`;
+      this.dependencies.onAlert?.(message);
+      return;
+    }
+    this.timer = this.schedule(() => {
+      this.timer = null;
+      void this.launch();
+    }, delays[retryIndex]!);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer !== null) {
+      this.cancel(this.timer);
+      this.timer = null;
+    }
+    const recorder = this.current;
+    this.current = null;
+    if (recorder) await recorder.stop();
+  }
+
+  armLogicalEndOnSourceExit(): void {
+    if (!this.current) throw new Error("terminal control WAL has no active recorder epoch");
+    this.current.armLogicalEndOnSourceExit();
+  }
+
+  cancelLogicalEndOnSourceExit(): void {
+    if (!this.current) throw new Error("terminal control WAL has no active recorder epoch");
+    this.current.cancelLogicalEndOnSourceExit();
+  }
+}
+
 /**
  * Standalone-runner signal contract:
  * SIGTERM/SIGINT detach a source epoch. SIGUSR2 arms END-on-%exit without
@@ -1269,22 +1358,23 @@ export function installTerminalControlWalSignalHandlers(
   target.on("SIGUSR2", () => invoke(() => recorder.armLogicalEndOnSourceExit()));
 }
 
-export async function runTerminalControlWalRecorderFromEnvironment(): Promise<TerminalControlWalRecorder> {
+export async function runTerminalControlWalRecorderFromEnvironment(): Promise<TerminalControlWalRetrySupervisor> {
   const config = parseTerminalControlWalRecorderConfigJson(
     process.env[TERMINAL_CONTROL_WAL_CONFIG_ENV] ?? "",
   );
-  const recorder = new TerminalControlWalRecorder(config, {
-    onFatal: (error) => {
+  const supervisor = new TerminalControlWalRetrySupervisor({
+    factory: (onFatal) => new TerminalControlWalRecorder(config, { onFatal }),
+    onAlert: (message) => {
+      console.error(`[thumbmux terminal-control-wal] alert: ${message}`);
+      process.exitCode = 1;
+    },
+  });
+  await supervisor.start();
+  installTerminalControlWalSignalHandlers(supervisor, {
+    onError: (error) => {
       console.error(`[thumbmux terminal-control-wal] fatal: ${error.message}`);
       process.exitCode = 1;
     },
   });
-  await recorder.start();
-  installTerminalControlWalSignalHandlers(recorder, {
-    onError: (error) => {
-      console.error(`[thumbmux terminal-control-wal] signal action failed: ${String(error)}`);
-      process.exitCode = 1;
-    },
-  });
-  return recorder;
+  return supervisor;
 }

@@ -8,6 +8,8 @@ import { parseOutputWalJson, readOutputWal } from "../src/output-wal";
 import { resolveTerminalWalPaths } from "../src/integrations/terminal-wal";
 import {
   TerminalControlWalRecorder,
+  TerminalControlWalRetrySupervisor,
+  type TerminalControlRecoveryCapture,
   type TerminalControlPauseReconcileRequest,
   type TerminalControlProcess,
 } from "../src/integrations/terminal-control-wal-recorder";
@@ -16,7 +18,8 @@ class FakeControlProcess extends EventEmitter implements TerminalControlProcess 
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
-  kill(): boolean { this.emit("exit", null, "SIGTERM"); return true; }
+  killed = false;
+  kill(): boolean { this.killed = true; this.emit("exit", null, "SIGTERM"); return true; }
 }
 
 const roots: string[] = [];
@@ -27,7 +30,11 @@ afterEach(async () => {
   for (const root of roots.splice(0).reverse()) rmSync(root, { recursive: true, force: true });
 });
 
-async function makeReady(reconcilePause: (request: TerminalControlPauseReconcileRequest) => Promise<void>) {
+async function makeReady(
+  reconcilePause: (
+    request: TerminalControlPauseReconcileRequest,
+  ) => Promise<TerminalControlRecoveryCapture | void>,
+) {
   const root = mkdtempSync(join(tmpdir(), "tmctlwal-recovery-"));
   roots.push(root);
   const fake = new FakeControlProcess();
@@ -55,7 +62,7 @@ async function makeReady(reconcilePause: (request: TerminalControlPauseReconcile
       sessionCreated: 1_700_000_000,
       geometry: { cols: 80, rows: 24 },
     }),
-    reconcilePause: reconcilePause as never,
+    reconcilePause,
   });
   recorders.push(recorder);
   const starting = recorder.start();
@@ -144,4 +151,41 @@ test("serializes repeated pauses and writes a reconcile result for every gapId",
   expect(recoveries.map((recovery) => recovery.status)).toEqual(["success", "failed"]);
   expect(new Set(recoveries.map((recovery) => recovery.gapId)).size).toBe(2);
   expect(recorder.status.state).toBe("fatal");
+  expect(fake.killed).toBe(true);
+});
+
+test("supervisor retries failed recorder epochs after 5, 15, and 60 seconds then alerts", async () => {
+  const delays: number[] = [];
+  const scheduled: Array<() => void> = [];
+  const fatals: Array<(error: Error) => void> = [];
+  const alerts: string[] = [];
+  const supervisor = new TerminalControlWalRetrySupervisor({
+    factory: (onFatal) => {
+      fatals.push(onFatal);
+      return {
+        start: async () => undefined,
+        stop: async () => undefined,
+        armLogicalEndOnSourceExit: () => undefined,
+        cancelLogicalEndOnSourceExit: () => undefined,
+      };
+    },
+    schedule: (callback, delay) => { delays.push(delay); scheduled.push(callback); return callback; },
+    cancel: () => undefined,
+    now: () => 1_000,
+    onAlert: (message) => alerts.push(message),
+  });
+  await supervisor.start();
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    fatals[attempt]!(new Error(`failed-${attempt}`));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    scheduled[attempt]!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  fatals[3]!(new Error("failed-final"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(delays).toEqual([5_000, 15_000, 60_000]);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain("3 retries within 5 minutes");
 });
