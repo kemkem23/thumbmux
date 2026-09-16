@@ -626,12 +626,11 @@ export class TerminalWalWorker {
       }
       if (!existing.empty && existing.active && this.writer.format === 2) {
         const boundary = this.writer.lastDurableSequence.toString();
-        this.writer.appendJson("gap", {
+        this.writer.appendGap({
           gapId: randomUUID(),
           sourceEpoch: existing.sourceIdentity?.generation
             ?? `unclean-${existing.logicalIdentity!.instanceId}-${boundary}`,
           paneId: existing.sourceIdentity?.paneId ?? "%0",
-          lastDurableSeq: (this.writer.lastDurableSequence + 1n).toString(),
           reason: "unclean-source",
           detectedAt: this.clock?.() ?? Date.now(),
           missingBytes: null,
