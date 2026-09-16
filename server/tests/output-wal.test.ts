@@ -48,8 +48,8 @@ describe("lossless output WAL", () => {
     expect(records.map((record) => record.at)).toEqual([20, 20, 30]);
     expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "resize"]);
     expect([...records[1]!.payload]).toEqual([...binary]);
-    expect(parseOutputWalJson(records[0]!)).toEqual({ event: "start", cols: 80, rows: 24 });
-    expect(parseOutputWalJson(records[2]!)).toEqual({ cols: 197, rows: 60 });
+    expect(parseOutputWalJson<Record<string, unknown>>(records[0]!)).toEqual({ event: "start", cols: 80, rows: 24 });
+    expect(parseOutputWalJson<Record<string, unknown>>(records[2]!)).toEqual({ cols: 197, rows: 60 });
     expect(records[0]!.offset).toBe(0);
     expect(records[1]!.offset).toBe(records[0]!.nextOffset);
     expect(scanOutputWal(path)).toMatchObject({ records: 3, problem: null });
