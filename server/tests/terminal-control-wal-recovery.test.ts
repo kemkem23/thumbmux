@@ -252,3 +252,23 @@ test("default reconcile captures a real private pane and ambiguous recovery stay
     tmux("kill-server");
   }
 }, 30_000);
+
+test("stopping during capture settles every pending gap before closing WAL and ignores late failure", async () => {
+  let rejectCapture!: (error: Error) => void;
+  const capture = new Promise<never>((_resolve, reject) => { rejectCapture = reject; });
+  const { directory, fake, recorder } = await makeReady(() => capture);
+  fake.stdout.write("%pause %42\n%continue %42\n%pause %42\n");
+  await recorder.stop();
+  const walPath = resolveTerminalWalPaths(directory).walPath;
+  const before = readFileSync(walPath);
+  const records = [...readOutputWal(walPath)];
+  const gaps = records.filter((record) => record.kind === "gap").map((record) => parseOutputWalJson<{ gapId: string }>(record).gapId);
+  const results = records.filter((record) => record.kind === "recovery").map((record) => parseOutputWalJson<{ gapId: string; status: string }>(record));
+  // Always release the pending capture, even on the original failing code.
+  rejectCapture(new Error("late capture failure"));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(results.map((result) => result.gapId).sort()).toEqual(gaps.sort());
+  expect(results.map((result) => result.status)).toEqual(["failed", "failed"]);
+  expect(readFileSync(walPath)).toEqual(before);
+  expect(recorder.status.state).toBe("disconnected");
+});
