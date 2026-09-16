@@ -40,12 +40,47 @@ function fail(reason: string): never {
   process.exit(EXIT_CODE);
 }
 
-function ownedDirectory(path: string, mode: number): boolean {
+type OwnershipCheck =
+  | { owned: true }
+  | { owned: false; reason: string };
+
+function octalMode(mode: number): string {
+  return `0${mode.toString(8)}`;
+}
+
+function ownedDirectory(path: string, mode: number): OwnershipCheck {
   try {
     const st = statSync(path);
-    return st.isDirectory() && st.uid === process.getuid?.() && (st.mode & 0o777) === mode;
-  } catch {
-    return false;
+    if (!st.isDirectory()) {
+      return {
+        owned: false,
+        reason: `runtime path=${path} type=not-directory expected=directory`,
+      };
+    }
+    const expectedUid = process.getuid?.();
+    if (st.uid !== expectedUid) {
+      return {
+        owned: false,
+        reason: `runtime path=${path} owner uid=${st.uid} expected uid=${String(expectedUid)}`,
+      };
+    }
+    const actualMode = st.mode & 0o777;
+    if (actualMode !== mode) {
+      return {
+        owned: false,
+        reason: `runtime path=${path} mode=${octalMode(actualMode)} expected mode=${octalMode(mode)}`,
+      };
+    }
+    return { owned: true };
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "unknown";
+    return {
+      owned: false,
+      reason: `runtime path=${path} stat=failed error=${code} expected=directory`,
+    };
   }
 }
 
@@ -72,12 +107,18 @@ function localSandboxAdmitted(): boolean {
   const attestation = process.env.CORTEX_TEST_SANDBOX_ATTESTATION ?? "";
   if (runtime !== "/run/kemcortex-isolated-command") return false;
   if (attestation !== `${runtime}/sandbox-attestation`) return false;
-  if (!ownedDirectory(runtime, 0o700)) return false;
+  const runtimeOwnership = ownedDirectory(runtime, 0o700);
+  if (!runtimeOwnership.owned) {
+    localSandboxRefusalReason = runtimeOwnership.reason;
+    return false;
+  }
   if (!ownedFile(attestation, 0o600)) return false;
   if (!existsSync(attestation)) return false;
   const lines = readFileSync(attestation, "utf8").split("\n");
   return lines[0] === "version=2" && lines[1] === "kind=command";
 }
+
+let localSandboxRefusalReason: string | undefined;
 
 /** GitHub-hosted CI, mirroring test-runtime-guard.sh's thumbmux_assert_public_markers. */
 function publicCiAdmitted(): boolean {
@@ -96,7 +137,10 @@ function publicCiAdmitted(): boolean {
 
 if (!localSandboxAdmitted() && !publicCiAdmitted()) {
   fail(
-    "neither the local hard-sandbox receipt (CORTEX_TEST_HARD_SANDBOX=command, " +
+    (localSandboxRefusalReason === undefined
+      ? ""
+      : `${localSandboxRefusalReason}; `) +
+      "neither the local hard-sandbox receipt (CORTEX_TEST_HARD_SANDBOX=command, " +
       "/run/kemcortex-isolated-command/sandbox-attestation) nor GitHub-hosted CI " +
       "markers are present; several files under server/tests/ spawn real tmux " +
       "with no -S, which would reach the host's production socket outside one " +
