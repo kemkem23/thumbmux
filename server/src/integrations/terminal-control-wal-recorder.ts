@@ -1198,6 +1198,29 @@ export class TerminalControlWalRecorder {
       // Preserve the original error when storage itself cannot accept a
       // cancellation. The durable gap still marks the missing interval.
     }
+    if (this.worker.status.started && this.source) {
+      try {
+        this.worker.appendOrderedGap({
+          gapId: randomUUID(),
+          sourceEpoch: this.sourceEpoch,
+          paneId: this.source.paneId,
+          reason: "recorder-failure",
+          detectedAt: Date.now(),
+          missingBytes: null,
+          coverage: "unknown",
+        });
+        this.degraded = true;
+      } catch (gapError) {
+        const detail = gapError instanceof Error ? gapError.message : String(gapError);
+        const message = `terminal control WAL failure gap could not be persisted: ${detail}`;
+        this.alertMessage = message;
+        try {
+          this.dependencies.onAlert?.(message);
+        } catch {
+          // Preserve the recorder failure when the out-of-band callback fails.
+        }
+      }
+    }
     // Detach only this read-only control client. The pane and tmux server are
     // owned by the host and must survive recorder failure/retry.
     // TODO(§3.2 item 7): persist failure/unclean-source gaps when possible;
