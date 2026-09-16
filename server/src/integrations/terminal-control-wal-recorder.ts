@@ -1196,7 +1196,7 @@ export class TerminalControlWalRecorder {
       this.settleInterruptedRecoveries("recorder failed before pause recovery completed");
     } catch {
       // Preserve the original error when storage itself cannot accept a
-      // cancellation. The durable gap still marks the missing interval.
+      // cancellation. The failure gap below is attempted and reported separately.
     }
     if (this.worker.status.started && this.source) {
       try {
@@ -1221,10 +1221,11 @@ export class TerminalControlWalRecorder {
         }
       }
     }
+    // Pausing keeps this parser from consuming another delivered control line
+    // during fatal teardown. It is not evidence that tmux/source bytes were
+    // preserved; only a successfully appended durable gap marks uncertainty.
     // Detach only this read-only control client. The pane and tmux server are
     // owned by the host and must survive recorder failure/retry.
-    // TODO(§3.2 item 7): persist failure/unclean-source gaps when possible;
-    // a disk failure must never be reported as a successfully persisted gap.
     this.process?.stdout.pause();
     this.process?.kill("SIGTERM");
     void this.worker.stop({ writeLifecycleEnd: false }).catch(() => undefined);
