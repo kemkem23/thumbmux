@@ -1,4 +1,7 @@
 import {
+  randomUUID,
+} from "node:crypto";
+import {
   chmodSync,
   closeSync,
   constants,
@@ -20,6 +23,9 @@ import {
   OutputWalWriter,
   parseOutputWalJson,
   readOutputWal,
+  type OutputWalFormat,
+  type OutputWalGap,
+  type OutputWalRecoverySnapshot,
   type OutputWalRecord,
 } from "../output-wal";
 import {
@@ -71,6 +77,8 @@ export type NormalizedTerminalWalWorkerConfig = {
 };
 
 export type TerminalWalWorkerDependencies = {
+  /** Control-mode capture requires format 2; pipe-pane capture remains format 1 by default. */
+  walFormat?: OutputWalFormat;
   input?: Readable;
   clock?: () => number;
   onFatal?: (error: Error) => void;
@@ -90,8 +98,11 @@ type PendingResize = Omit<TerminalWalResizeRecord, "phase">;
 
 type ExistingWalState = {
   empty: boolean;
+  sourceTracking: boolean;
+  cleanlyDetached: boolean;
   active: boolean;
   logicalIdentity: Pick<TerminalWalIdentity, "session" | "instanceId"> | null;
+  sourceIdentity: TerminalWalIdentity | null;
   pendingResize: PendingResize | null;
 };
 
@@ -303,11 +314,16 @@ function samePendingResize(left: PendingResize, right: TerminalWalResizeRecord):
 /** Fail closed before appending to a WAL whose incarnation chain is ambiguous. */
 function inspectExistingWal(path: string): ExistingWalState {
   let records = 0;
+  let sourceTracking = false;
+  let cleanlyDetached = false;
   let active = false;
   let logicalIdentity: ExistingWalState["logicalIdentity"] = null;
+  let sourceIdentity: TerminalWalIdentity | null = null;
   let pendingResize: PendingResize | null = null;
   for (const record of readOutputWal(path)) {
     records += 1;
+    // Only the final, sequence-bound detach certificate can attest a clean stop.
+    cleanlyDetached = false;
     if (records === 1 && record.kind !== "lifecycle") {
       throw new Error("terminal WAL first record must be lifecycle start");
     }
@@ -324,6 +340,7 @@ function inspectExistingWal(path: string): ExistingWalState {
           session: lifecycle.identity.session,
           instanceId: lifecycle.identity.instanceId,
         };
+        sourceIdentity = lifecycle.identity;
         active = true;
         continue;
       }
@@ -346,10 +363,24 @@ function inspectExistingWal(path: string): ExistingWalState {
         // still-active logical instance.
         active = true;
       }
+      sourceIdentity = lifecycle.identity;
       continue;
     }
 
     if (!active) throw new Error("terminal WAL contains data after end without resume");
+    if (record.kind === "checkpoint") {
+      const value = parseOutputWalJson<unknown>(record);
+      if (isPlainObject(value) && (value.event === "source-tracking" || value.event === "source-detached")) {
+        const expectedKeys = value.event === "source-tracking" ? "event,version" : "event,lastDurableSeq,version";
+        if (value.version !== 1 || Object.keys(value).sort().join(",") !== expectedKeys
+          || (value.event === "source-detached" && (!sourceTracking
+            || value.lastDurableSeq !== (record.sequence - 1n).toString()))) {
+          throw new Error("terminal WAL source checkpoint is invalid");
+        }
+        sourceTracking = true;
+        cleanlyDetached = value.event === "source-detached";
+      }
+    }
     if (record.kind === "resize") {
       const resize = parseResizeRecord(record);
       if (resize.phase === "prepare") {
@@ -370,7 +401,7 @@ function inspectExistingWal(path: string): ExistingWalState {
       throw new Error(`terminal WAL ${record.kind} record appears inside a pending resize`);
     }
   }
-  return { empty: records === 0, active, logicalIdentity, pendingResize };
+  return { empty: records === 0, sourceTracking, cleanlyDetached, active, logicalIdentity, sourceIdentity, pendingResize };
 }
 
 function copyGeometry(value: TerminalGeometry): TerminalGeometry {
@@ -508,6 +539,7 @@ function sanitizeProtocolMessage(error: unknown): string {
 export class TerminalWalWorker {
   readonly config: NormalizedTerminalWalWorkerConfig;
   private readonly input: Readable;
+  private readonly walFormat: OutputWalFormat;
   private readonly clock: (() => number) | undefined;
   private readonly onFatal: ((error: Error) => void) | undefined;
   private server: Server | null = null;
@@ -530,6 +562,7 @@ export class TerminalWalWorker {
       ? validateNormalizedTerminalWalWorkerConfig(config)
       : parseTerminalWalWorkerConfig(config);
     this.input = dependencies.input ?? process.stdin;
+    this.walFormat = dependencies.walFormat ?? 1;
     this.clock = dependencies.clock;
     this.onFatal = dependencies.onFatal;
     this.geometry = copyGeometry(this.config.geometry);
@@ -588,6 +621,7 @@ export class TerminalWalWorker {
 
       this.writer = new OutputWalWriter({
         path: paths.walPath,
+        format: this.walFormat,
         clock: this.clock,
         // This is the on-disk format bound, not today's chunking preference.
         // Keeping it stable lets a restarted worker read older, larger frames.
@@ -609,12 +643,33 @@ export class TerminalWalWorker {
           { phase: "abort", ...existing.pendingResize } satisfies TerminalWalResizeRecord,
         );
       }
+      if (!existing.empty && existing.active && existing.sourceTracking && !existing.cleanlyDetached && this.writer.format === 2) {
+        const boundary = this.writer.lastDurableSequence.toString();
+        this.writer.appendGap({
+          gapId: randomUUID(),
+          sourceEpoch: existing.sourceIdentity?.generation
+            ?? `unclean-${existing.logicalIdentity!.instanceId}-${boundary}`,
+          paneId: existing.sourceIdentity?.paneId ?? "%0",
+          reason: "unclean-source",
+          detectedAt: this.clock?.() ?? Date.now(),
+          missingBytes: null,
+          coverage: "unknown",
+        });
+      }
+      // Old files deliberately receive no retrospective crash diagnosis. Enroll
+      // before RESUME so a crash in this new source is detectable on next open.
+      if (!existing.empty && !existing.sourceTracking && this.writer.format === 2) {
+        this.writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+      }
       const lifecycle: TerminalWalLifecycleRecord = {
         event: existing.empty ? "start" : "resume",
         identity: this.config.identity,
         geometry: copyGeometry(this.geometry),
       };
       this.writer.appendJson("lifecycle", lifecycle);
+      if (existing.empty && this.writer.format === 2) {
+        this.writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+      }
       this.started = true;
       this.input.on("readable", this.handleInputReadable);
       this.input.on("error", this.handleInputError);
@@ -656,6 +711,25 @@ export class TerminalWalWorker {
       records.push(writer.appendOutput(payload.subarray(offset, end)));
     }
     return records;
+  }
+
+  /** Synchronous durability barrier in the same writer/order as captured output. */
+  appendOrderedGap(gap: Omit<OutputWalGap, "lastDurableSeq">): OutputWalRecord {
+    if (!this.started || this.fatalError) throw new Error("terminal WAL worker is not active");
+    if (this.pendingResize) throw new Error("ordered gap cannot enter during a pending resize");
+    this.drainInput();
+    return this.requireWriter().appendGap(gap);
+  }
+
+  get lastDurableSequence(): bigint {
+    return this.requireWriter().lastDurableSequence;
+  }
+
+  appendOrderedRecovery(recovery: OutputWalRecoverySnapshot): OutputWalRecord {
+    if (!this.started || this.fatalError) throw new Error("terminal WAL worker is not active");
+    if (this.pendingResize) throw new Error("ordered recovery cannot enter during a pending resize");
+    this.drainInput();
+    return this.requireWriter().appendRecovery(recovery);
   }
 
   /** Record an observed ordered layout boundary before consuming its redraw. */
@@ -955,6 +1029,11 @@ export class TerminalWalWorker {
               geometry: copyGeometry(this.geometry),
             };
             writer.appendJson("lifecycle", lifecycle);
+          } else if (writer.format === 2) {
+            writer.appendJson("checkpoint", {
+              event: "source-detached", version: 1,
+              lastDurableSeq: writer.lastDurableSequence.toString(),
+            });
           }
         }
       } catch (error) {

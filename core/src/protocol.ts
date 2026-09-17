@@ -8,7 +8,13 @@
 export type MuxCursor = { row: number; col: number };
 
 /** tmux pane screen-mode sample: alternate buffer + SGR / any-event mouse. */
-export interface MuxPaneScreen { alt: boolean; mouseSgr: boolean; mouseAny: boolean; }
+export interface MuxPaneScreen {
+  /** Authoritative durable preview state; absent for legacy live captures. */
+  previewState?: "live" | "orphaned" | "ended" | "unavailable";
+  previewHasFrame?: boolean;
+  /** Timestamp of the last WAL record backing this verified preview. */
+  previewLastSuccessfulAt?: number;
+ alt: boolean; mouseSgr: boolean; mouseAny: boolean; }
 
 /**
  * Atomic identity of the durable archive/live seam paired with a pane capture.
@@ -273,10 +279,16 @@ function isMuxPaneScreen(value: unknown): value is MuxPaneScreen | null {
   if (value === null) return true;
   if (typeof value !== "object" || value === null) return false;
   const screen = value as Record<string, unknown>;
+  const previewLastSuccessfulAt = screen.previewLastSuccessfulAt;
   return (
     typeof screen.alt === "boolean" &&
     typeof screen.mouseSgr === "boolean" &&
-    typeof screen.mouseAny === "boolean"
+    typeof screen.mouseAny === "boolean" &&
+    (previewLastSuccessfulAt === undefined || (
+      typeof previewLastSuccessfulAt === "number" &&
+      Number.isFinite(previewLastSuccessfulAt) &&
+      previewLastSuccessfulAt >= 0
+    ))
   );
 }
 

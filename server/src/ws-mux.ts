@@ -116,6 +116,8 @@ export interface HistoryArchiveLike {
       previousContent: string | null;
       fullHistory: boolean;
       liveLineLimit: number;
+      /** Requested capture scope; fewer visible rows do not prove departure. */
+      captureStartLine?: number;
       /** Replace the live archive window in place after a pane reflow. */
       replace?: boolean;
       /** Exact token returned by the driver's atomic canonical capture. */
@@ -949,7 +951,9 @@ export class TmuxWsMux<
   private screenEq(a: MuxPaneScreen | null | undefined, b: MuxPaneScreen | null | undefined): boolean {
     const x = a ?? null, y = b ?? null;
     if (x === null || y === null) return x === y;
-    return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny;
+    return x.alt === y.alt && x.mouseSgr === y.mouseSgr && x.mouseAny === y.mouseAny
+      && x.previewState === y.previewState && x.previewHasFrame === y.previewHasFrame
+      && x.previewLastSuccessfulAt === y.previewLastSuccessfulAt;
   }
 
   private boundaryEq(a: MuxHistoryBoundary | undefined, b: MuxHistoryBoundary | undefined): boolean {
@@ -2076,6 +2080,7 @@ export class TmuxWsMux<
             previousContent,
             fullHistory: !!opts.fullHistory,
             liveLineLimit: this.liveLineLimit,
+            captureStartLine: profile.currentPaneOnly ? 0 : startLine,
             replace: archiveReflowGeneration !== undefined || undefined,
             captureToken: archiveCaptureToken,
           }).liveContent;

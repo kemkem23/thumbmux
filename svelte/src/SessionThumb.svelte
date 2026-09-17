@@ -13,6 +13,7 @@
     maxLines,
     density = 'default',
     previewBackground,
+    formatPreviewLastSuccessfulAt,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -24,10 +25,14 @@
      * colors are contrast-derived against it instead of merely repainting the
      * surface; other CSS color forms are outside this prop's contract. */
     previewBackground?: string;
+    formatPreviewLastSuccessfulAt?: (timestamp: number) => string;
   } = $props();
 
   let content = $state('');
   let connected = $state(false);
+  let previewState = $state('live');
+  let hasFrame = $state(false);
+  let lastSuccessfulAt = $state<number | null>(null);
   let thumbEl = $state<HTMLDivElement | null>(null);
   let renderPalette = $derived(previewBackground
     ? { ...palette, defaultBg: previewBackground }
@@ -131,11 +136,26 @@
     let active = true;
     content = '';
     connected = false;
-    const unsubscribe = tmuxMux.subscribe(name, (data, type) => {
+    previewState = 'live';
+    hasFrame = false;
+    lastSuccessfulAt = null;
+    const unsubscribe = tmuxMux.subscribe(name, (data, type, _cursor, meta) => {
       if (!active) return;
-      if (type === 'history' || type === 'error' || type === 'cursor') return;
-      connected = true;
-      content = data;
+      if (type === 'history' || type === 'cursor') return;
+      if (type === 'error') { connected = false; previewState = 'unavailable'; return; }
+      const screen = meta?.screen;
+      previewState = screen?.previewState ?? 'live';
+      connected = previewState === 'live';
+      // Frame availability and current health are independent. Preserve an
+      // explicitly verified last frame when health is unavailable, with a
+      // stale label; legacy unavailable messages still fail closed.
+      hasFrame = screen?.previewHasFrame ?? (previewState !== 'unavailable');
+      if (typeof screen?.previewLastSuccessfulAt === 'number') {
+        lastSuccessfulAt = screen.previewLastSuccessfulAt;
+      } else if (previewState === 'live') {
+        lastSuccessfulAt = Date.now();
+      }
+      if (type !== 'cursor') content = data;
     }, { tail });
     return () => {
       active = false;
@@ -154,21 +174,49 @@
   style:--tbg={thumbPalette.defaultBg}
   data-testid="session-thumb"
   data-live={connected}
-  inert
-  aria-hidden="true"
+  data-preview-state={previewState}
 >
-  {#if connected}
-    <div class="tail">
+  <div class="preview-content" inert aria-hidden="true">
+    {#if hasFrame}
+      <div class="tail">
       {#each lines as lineHtml, i (i)}
         <div class="mtv-line">{@html lineHtml}</div>
       {/each}
-    </div>
-  {:else}
-    <div class="wait">…</div>
+      </div>
+    {:else}
+      <div class="wait">…</div>
+    {/if}
+  </div>
+  {#if hasFrame && previewState !== 'live'}
+    <span
+      class="preview-status"
+      role="status"
+      data-testid="session-thumb-status"
+      data-last-successful-at={lastSuccessfulAt ?? undefined}
+    >
+      {previewState === 'orphaned'
+        ? 'ภาพนี้เป็นภาพสุดท้ายก่อนห้องขาดการติดต่อ'
+        : previewState === 'ended' ? 'ห้องนี้จบแล้ว · ภาพนี้เป็นภาพสุดท้าย' : 'อ่านสถานะปัจจุบันไม่ได้ · ภาพนี้เป็นภาพสุดท้าย'}
+      {#if lastSuccessfulAt !== null && formatPreviewLastSuccessfulAt}
+        · สำเร็จล่าสุด {formatPreviewLastSuccessfulAt(lastSuccessfulAt)}
+      {/if}
+    </span>
   {/if}
 </div>
 
 <style>
+  .preview-status {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    right: 3px;
+    padding: 3px 5px;
+    background: var(--tbg);
+    border: 1px solid #C45200;
+    color: #C45200;
+    font: 11px/1.4 sans-serif;
+    z-index: 1;
+  }
   .thumb {
     position: absolute;
     inset: 0;

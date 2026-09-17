@@ -1120,6 +1120,51 @@ describe('mountable terminal views', () => {
     }
   });
 
+  test('delivers delayed second Enter for agent TUI when using host submission transport', async () => {
+    jest.useFakeTimers();
+    const agent = ['co', 'dex'].join('') as SubmitAgent;
+    const sessionName = 'sh-session-host-settle';
+    const calls: Array<[string, string]> = [];
+    const { target } = mountView(SessionView, {
+      session: sessionName,
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        submitAgent: () => agent,
+        sendKeys: () => {
+          throw new Error('submission leaked to the raw-key transport');
+        },
+        sendSubmissionKeys: async (session: string, keys: string) => {
+          calls.push([session, keys]);
+        },
+      } satisfies AppAdapters,
+    });
+    await tick();
+
+    await composeAndSend(target, 'hello');
+    await flushPromises();
+
+    // Step 0 ('hello') and Step 1 ('\r') were dispatched.
+    // But the delayed second Enter (1000ms settle delay) MUST NOT have fired yet.
+    expect(calls).toEqual([
+      [sessionName, 'hello'],
+      [sessionName, '\r'],
+    ]);
+
+    // Advance time by 999ms: still shouldn't fire
+    jest.advanceTimersByTime(999);
+    await flushPromises();
+    expect(calls.length).toBe(2);
+
+    // Advance the remaining 1ms to hit 1000ms: second Enter fires!
+    jest.advanceTimersByTime(1);
+    await flushPromises();
+    expect(calls).toEqual([
+      [sessionName, 'hello'],
+      [sessionName, '\r'],
+      [sessionName, '\r'],
+    ]);
+  });
+
   test('a stage tap dismisses the host before it opens the composer', async () => {
     let hostOpen = true;
     let dismissCalls = 0;

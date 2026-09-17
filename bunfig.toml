@@ -1,8 +1,15 @@
 # Test runtime for the thumbmux monorepo package.
 #
-# Preload registers the Svelte compile plugin early (before parallel test-file
-# imports resolve `.svelte` paths) and installs happy-dom DOM globals for mount
-# tests. Network primitives stay Bun-native — see svelte/tests/preload.ts — so
-# core/server keep working when all suites share one `bun test` process.
+# tmux-isolation-guard must load first: it aborts the process before any test
+# module body or `beforeAll` runs unless a real hard-sandbox or GitHub-hosted
+# CI context is present, because server/tests/*.test.ts spawns real tmux with
+# no -S. See scripts/tmux-isolation-guard.ts for why this package needs its
+# own copy rather than relying on the monorepo root's tests/tmux-isolation-guard.ts.
+#
+# The Svelte preload registers the compile plugin early (before parallel
+# test-file imports resolve `.svelte` paths) and installs happy-dom DOM
+# globals for mount tests. Network primitives stay Bun-native — see
+# svelte/tests/preload.ts — so core/server keep working when all suites share
+# one `bun test` process.
 [test]
-preload = ["./svelte/tests/preload.ts"]
+preload = ["./scripts/tmux-isolation-guard.ts", "./svelte/tests/preload.ts"]

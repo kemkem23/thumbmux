@@ -101,12 +101,21 @@ export const RELEASE_PACKAGE_EXPORTS = {
     types: "./git-dist/server/index.d.ts",
     import: "./git-dist/server/index.js",
   },
-  // Kept off the ./server barrel on purpose: this is the only module in the
-  // package that loads a database driver (bun:sqlite). A host importing the
-  // WebSocket engine must not pay for it, so recall is reachable only here.
+  // Kept off the ./server barrel on purpose: these are the only modules in
+  // the package that load a database driver (bun:sqlite). A host importing
+  // the WebSocket engine must not pay for them, so each is reachable only
+  // on its own subpath.
   "./server/recall": {
     types: "./git-dist/server/recall-handler.d.ts",
     import: "./git-dist/server/recall-handler.js",
+  },
+  // sqlite-history is a separate build entry and already ships under
+  // git-dist/server/. Without this key a consumer import of
+  // thumbmux/server/sqlite-history is ERR_PACKAGE_PATH_NOT_EXPORTED
+  // even though the file is on disk (the v0.20.1-dist hole).
+  "./server/sqlite-history": {
+    types: "./git-dist/server/sqlite-history.d.ts",
+    import: "./git-dist/server/sqlite-history.js",
   },
   "./svelte": {
     types: "./git-dist/svelte/index.d.ts",

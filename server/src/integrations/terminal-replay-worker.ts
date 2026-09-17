@@ -309,6 +309,7 @@ export function terminalReplayResultToWire(
     ended: result.ended,
     walOffset: result.walOffset,
     sequence: result.sequence.toString(),
+    ...(typeof result.lastRecordAt === "number" ? { lastRecordAt: result.lastRecordAt } : {}),
     hasMoreWal: result.hasMoreWal,
     historyBytes: result.historyBytes,
     identity: result.identity,
@@ -339,7 +340,7 @@ export function terminalReplayResultFromWire(value: unknown): TerminalReplayResu
     "screen",
     "historyPath",
     "checkpointPath",
-  ], [], label);
+  ], ["lastRecordAt"], label);
   const geometry = parseNullable(value.geometry, parseGeometry, `${label}.geometry`);
   const screen = parseNullable(value.screen, parseScreen, `${label}.screen`);
   if (geometry && screen && (geometry.cols !== screen.cols || geometry.rows !== screen.rows)) {
@@ -355,6 +356,14 @@ export function terminalReplayResultFromWire(value: unknown): TerminalReplayResu
     ended: booleanValue(value.ended, `${label}.ended`),
     walOffset: boundedInteger(value.walOffset, `${label}.walOffset`, 0, Number.MAX_SAFE_INTEGER),
     sequence: parseUint64Decimal(value.sequence, `${label}.sequence`),
+    ...(value.lastRecordAt === undefined
+      ? {}
+      : { lastRecordAt: boundedInteger(
+        value.lastRecordAt,
+        `${label}.lastRecordAt`,
+        0,
+        Number.MAX_SAFE_INTEGER,
+      ) }),
     hasMoreWal: booleanValue(value.hasMoreWal, `${label}.hasMoreWal`),
     historyBytes: boundedInteger(
       value.historyBytes,

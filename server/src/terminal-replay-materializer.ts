@@ -25,14 +25,23 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createOutputWalStartCursor,
+  parseOutputWalGapPayload,
   parseOutputWalJson,
+  parseOutputWalRecoveryPayload,
   readOutputWalTail,
   type OutputWalRecord,
   type OutputWalTailCursor,
 } from "./output-wal";
+
+const GAP_REASON_MESSAGES = {
+  "tmux-pause": "การส่งข้อมูลถูกพักชั่วคราว ช่วงนั้นอาจเก็บไม่ครบ",
+  "recorder-failure": "ระบบบันทึกประวัติขัดข้อง ช่วงนั้นอาจเก็บไม่ครบ",
+  "unclean-source": "รอบก่อนจบโดยไม่ได้ยืนยันว่าเก็บประวัติครบ ช่วงท้ายอาจเก็บไม่ครบ",
+} satisfies Record<ReturnType<typeof parseOutputWalGapPayload>["reason"], string>;
 
 /**
  * Durable raw-WAL -> terminal-grid materializer.
@@ -49,7 +58,7 @@ import {
  * - lifecycle: `{ event: "start" | "resume" | "end", identity, geometry }`
  * - resize: `{ phase: "prepare" | "commit" | "abort", changeId, from, to,
  *   reason? }`
- * - checkpoint: `{ event: "barrier", requestId }` (ordering barrier only)
+ * - checkpoint: barrier, or version 1 source-tracking/source-detached (no screen changes)
  *
  * A resize is applied only after its matching commit.  Output between prepare
  * and commit/abort is rejected.  A WAL ending at prepare is materialized only
@@ -185,6 +194,8 @@ export type TerminalReplayResult = {
   ended: boolean;
   walOffset: number;
   sequence: bigint;
+  /** Timestamp of the newest complete WAL record included in this replay. */
+  lastRecordAt?: number;
   /** More complete WAL records were visible after this bounded checkpoint. */
   hasMoreWal: boolean;
   historyBytes: number;
@@ -1809,6 +1820,7 @@ class ReplayEngine {
   private pendingResize: TerminalReplayResize | null = null;
   private recordsSeen = 0;
   private hasOutputInGeneration = false;
+  private readonly pendingGaps = new Map<string, ReturnType<typeof parseOutputWalGapPayload>>();
 
   constructor(private readonly tmux: PrivateTmuxReplay) {}
 
@@ -1986,9 +1998,57 @@ class ReplayEngine {
         case "resize":
           this.processResize(record, parseResize(parseOutputWalJson(record)), onHistory);
           break;
-        case "checkpoint":
-          parseBarrier(parseOutputWalJson(record));
+        case "gap": {
+          this.requireActive(record);
+          const gap = parseOutputWalGapPayload(record.payload);
+          if (this.pendingGaps.has(gap.gapId)) throw new Error(`duplicate pending gap ${gap.gapId}`);
+          this.pendingGaps.set(gap.gapId, gap);
+          // A gap starts a new, explicitly incomplete VT generation. Archive
+          // the prior visible screen before dropping modes or partial escapes.
+          if (this.hasOutputInGeneration) {
+            this.tmux.sealVisibleAndReset(this.geometry!, onHistory);
+          } else {
+            this.tmux.discardUnseenAndReset(this.geometry!);
+          }
+          this.hasOutputInGeneration = false;
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: ${GAP_REASON_MESSAGES[gap.reason]}]\n`));
           break;
+        }
+        case "recovery": {
+          this.requireActive(record);
+          const recovery = parseOutputWalRecoveryPayload(record.payload);
+          const gap = this.pendingGaps.get(recovery.gapId);
+          if (!gap || gap.sourceEpoch !== recovery.sourceEpoch || gap.paneId !== recovery.paneId) {
+            throw new Error(`recovery ${recovery.gapId} has no matching pending gap`);
+          }
+          // capture-pane is already rendered rows, not a PTY byte stream.
+          // Keep it as a labelled archive excerpt, never feed it into live VT
+          // state or replace geometry/output received during capture.
+          this.tmux.drainHistory(onHistory);
+          onHistory(Buffer.from(`[ภาพที่กู้จาก ring (recovered-from-ring); สถานะ: ${recovery.status}; อาจซ้ำกับข้อมูลสดและไม่ยืนยันว่าครบ]\n`));
+          if (recovery.status !== "failed") {
+            const rows = stripVTControlCharacters(Buffer.from(recovery.recoveredBytesBase64, "base64").toString("utf8"))
+              .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+            if (rows) onHistory(Buffer.from(rows.endsWith("\n") ? rows : `${rows}\n`));
+          }
+          onHistory(Buffer.from("[จบภาพที่กู้จาก ring; ข้อมูลสดที่เก็บได้ยังแสดงต่อ]\n"));
+          this.pendingGaps.delete(recovery.gapId);
+          break;
+        }
+        case "checkpoint": {
+          const value = parseOutputWalJson<unknown>(record);
+          if (isObject(value) && (value.event === "source-tracking" || value.event === "source-detached")) {
+            this.requireActive(record);
+            const keys = value.event === "source-tracking" ? "event,version" : "event,lastDurableSeq,version";
+            if (value.version !== 1 || Object.keys(value).sort().join(",") !== keys
+              || (value.event === "source-detached" && value.lastDurableSeq !== (record.sequence - 1n).toString())) {
+              throw new Error("invalid source checkpoint");
+            }
+          } else {
+            parseBarrier(value);
+          }
+          break;
+        }
         default: {
           const exhaustive: never = record.kind;
           throw new Error(`unknown WAL record kind ${String(exhaustive)}`);
@@ -2380,6 +2440,7 @@ export class TerminalReplaySession {
       ended: snapshot.lifecycle === "ended",
       walOffset: this.lastOffset,
       sequence: this.lastSequence,
+      lastRecordAt: this.lastAt,
       hasMoreWal: this.hasMoreWal,
       historyBytes: this.history.bytes,
       identity: snapshot.identity,

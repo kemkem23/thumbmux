@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -9,6 +9,7 @@ import { parseOutputWalJson, readOutputWal } from "../src/output-wal";
 import {
   installTerminalControlWalSignalHandlers,
   readTerminalControlWalHealth,
+  terminalControlWalStatusPath,
   TerminalControlWalRecorder,
   type TerminalControlProcess,
   type TerminalControlSourceIdentity,
@@ -73,6 +74,7 @@ function makeRecorder(options: {
   fake?: FakeControlProcess;
   resolved?: TerminalControlSourceIdentity;
   onFatal?: (error: Error) => void;
+  onAlert?: (message: string) => void;
 } = {}): {
   directory: string;
   fake: FakeControlProcess;
@@ -96,6 +98,7 @@ function makeRecorder(options: {
     },
     resolveIdentity: async () => options.resolved ?? source(),
     ...(options.onFatal === undefined ? {} : { onFatal: options.onFatal }),
+    ...(options.onAlert === undefined ? {} : { onAlert: options.onAlert }),
   });
   recorders.push(recorder);
   return { directory, fake, recorder, spawnArgs };
@@ -237,8 +240,8 @@ describe("ordered tmux control WAL recorder", () => {
     expect(parseOutputWalJson(records[0]!)).toMatchObject({ event: "start" });
   });
 
-  test("answers %pause with refresh-client continue and resumes ordered capture", async () => {
-    const { fake, recorder } = makeRecorder();
+  test("durably records pause and accepts its continue acknowledgement inside the command block", async () => {
+    const { directory, fake, recorder } = makeRecorder();
     let commands = "";
     fake.stdin.on("data", (chunk) => {
       commands += Buffer.from(chunk).toString();
@@ -246,10 +249,23 @@ describe("ordered tmux control WAL recorder", () => {
     await ready(recorder, fake);
 
     fake.stdout.write("%pause %42\n");
-    await eventually(() => commands.includes("refresh-client -A %42:continue\n"), "continue command");
-    fake.stdout.write("%begin 1700000001 2 1\n%end 1700000001 2 1\n");
-    fake.stdout.write("%continue %42\n%output %42 resumed\\012\n");
+    // tmux 3.4 requires the pane-action to be quoted; unquoted %<id>:continue
+    // returns %error and crashes the recorder. Verify the quoted form is sent.
+    await eventually(() => commands.includes('refresh-client -A "%42:continue"\n'), "continue command");
+    // Only the pending continue acknowledgement is accepted within the
+    // command response. Output notifications resume outside its delimiter.
+    fake.stdout.write("%begin 1700000001 2 1\n%continue %42\n%end 1700000001 2 1\n%output %42 resumed\\012\n");
     expect(recorder.status.state).toBe("ready");
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "gap", "output"]);
+    expect(parseOutputWalJson(records[1]!)).toMatchObject({
+      paneId: "%42",
+      reason: "tmux-pause",
+      lastDurableSeq: "1",
+      missingBytes: null,
+      coverage: "unknown",
+    });
+    expect(Buffer.from(records[2]!.payload).toString()).toBe("resumed\n");
   });
 
   test("pauses on malformed output and retains later lines instead of consuming them", async () => {
@@ -266,9 +282,17 @@ describe("ordered tmux control WAL recorder", () => {
       state: "fatal",
       error: expect.stringContaining("invalid tmux control-mode escape"),
     });
-    const outputs = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
-      .filter((record) => record.kind === "output");
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    const outputs = records.filter((record) => record.kind === "output");
     expect(Buffer.concat(outputs.map((record) => Buffer.from(record.payload))).toString()).toBe("good\n");
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "gap"]);
+    expect(parseOutputWalJson(records[2]!)).toMatchObject({
+      paneId: "%42",
+      reason: "recorder-failure",
+      lastDurableSeq: "2",
+      missingBytes: null,
+      coverage: "unknown",
+    });
   });
 
   test("fails identity validation before creating a WAL lifecycle", async () => {
@@ -282,6 +306,23 @@ describe("ordered tmux control WAL recorder", () => {
     await expect(starting).rejects.toThrow("exact WAL pane target");
     expect(fake.stdout.isPaused()).toBe(true);
     expect(existsSync(resolveTerminalWalPaths(directory).walPath)).toBe(false);
+  });
+
+  test("alerts out of band when fatal health cannot be persisted", async () => {
+    const alerts: string[] = [];
+    const { directory, fake, recorder } = makeRecorder({ onAlert: (message) => alerts.push(message) });
+    await ready(recorder, fake);
+    const healthPath = terminalControlWalStatusPath(directory);
+    unlinkSync(healthPath);
+    mkdirSync(healthPath);
+
+    fake.stdout.write("%output %42 bad\\x\n");
+
+    expect(recorder.status.state).toBe("fatal");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("fatal health could not be persisted");
+    expect(alerts[0]).not.toContain("gap was persisted");
+    rmSync(healthPath, { recursive: true });
   });
 
   test("treats %exit as source disconnect without ending the logical lifecycle", async () => {

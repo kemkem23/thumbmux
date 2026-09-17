@@ -299,7 +299,7 @@
   ): Promise<boolean> {
     let previousStepAcknowledged = false;
     for (const step of steps) {
-      if (!previousStepAcknowledged && step.delayBeforeMs > 0) {
+      if ((!previousStepAcknowledged || step.delayBeforeMs >= 1000) && step.delayBeforeMs > 0) {
         await wait(step.delayBeforeMs);
       }
       try {

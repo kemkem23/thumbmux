@@ -103,6 +103,7 @@
     copyNameLabel = 'Copy tmux session name',
     expandLabel = 'Expand terminal',
     killLabel = 'Kill tmux session',
+    formatPreviewLastSuccessfulAt,
   }: SessionGridProps = $props();
 
   let gridEl = $state<HTMLDivElement | null>(null);
@@ -642,6 +643,7 @@
         palette={item.session.palette ?? palette}
         density="dense"
         previewBackground={densePreviewBackground(item.session.name)}
+        {formatPreviewLastSuccessfulAt}
       />
       <!-- Keep the inert terminal miniature outside the interactive subtree
            so activation never relies on browser-specific retargeting across
@@ -792,7 +794,7 @@
             </div>
           {/if}
           <div class="live">
-            <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} />
+            <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} {formatPreviewLastSuccessfulAt} />
           </div>
           </button>
         {/if}
@@ -841,7 +843,7 @@
           </div>
         {/if}
         <div class="live">
-          <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} />
+          <SessionThumb session={item.session.name} palette={item.session.palette ?? palette} {formatPreviewLastSuccessfulAt} />
         </div>
         </button>
       {/if}

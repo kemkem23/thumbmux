@@ -48,6 +48,11 @@ export function readSeal(directory:string):{seal:Seal;files:Map<string,Buffer>;d
   return {seal,files,digest:sha(raw),bytes};
 }
 function decode(data:Buffer):string {return new TextDecoder('utf-8',{fatal:true}).decode(data);}
+/** Host-written metadata that sits next to chunks. Not a chunk; not garbage. */
+export const HOST_CHUNKS_SIDECARS: ReadonlySet<string> = new Set(['lifecycle-binding.json']);
+export function isHostChunksOrphanJson(name:string,listed:ReadonlySet<string>):boolean {
+  return name.endsWith('.json') && name!=='manifest.json' && !listed.has(name) && !HOST_CHUNKS_SIDECARS.has(name);
+}
 type Parsed={rows:HistoryRow[];frames:FrameJournalRecordV1[];screen:string[];legacy?:{liveStart:number;nextLine:number};error:string|null;consumedBytes:number;offsets:number[]};
 function parseSource(input:HistoryImportOptions,files:Map<string,Buffer>):Parsed {
   const result:Parsed={rows:[],frames:[],screen:[],error:null,consumedBytes:0,offsets:[]};
@@ -96,7 +101,7 @@ function parseSource(input:HistoryImportOptions,files:Map<string,Buffer>):Parsed
         if(!Array.isArray(rows)||rows.length!==chunk.lineCount)throw new Error('chunk-count');
         rows.forEach((text,i)=>{add(chunk.startLine+i,text);result.offsets.push(result.consumedBytes);});result.consumedBytes+=bytes.length;result.offsets[result.offsets.length-1]=result.consumedBytes;
       }
-      if([...files.keys()].some(n=>n.endsWith('.json')&&n!=='manifest.json'&&!listed.has(n)))throw new Error('orphan-chunk');
+      if([...files.keys()].some(n=>isHostChunksOrphanJson(n,listed)))throw new Error('orphan-chunk');
       if(result.rows.length!==manifest.totalLines)throw new Error('manifest-count');
     } else {
       const journals=[...files.keys()].filter(n=>n.endsWith('.ndjson'));

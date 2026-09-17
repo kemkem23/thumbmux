@@ -211,9 +211,33 @@
     if (composeEl) autoGrow();
   });
 
+  let isComposing = false;
+  let justComposedUntil = 0;
+
+  function onCompositionStart() {
+    isComposing = true;
+  }
+
+  function onCompositionEnd() {
+    isComposing = false;
+    justComposedUntil = Date.now() + 50;
+  }
+
+  function isImeComposing(e: KeyboardEvent): boolean {
+    // Active IME composition or candidate-selection settle window (Safari/iOS)
+    if (e.isComposing || isComposing || Date.now() < justComposedUntil) {
+      return true;
+    }
+    // Lingering keyCode 229 from Android/mobile virtual keyboard on non-Enter keys
+    if (e.keyCode === 229 && e.key !== 'Enter') {
+      return true;
+    }
+    return false;
+  }
+
   function composeKeydown(e: KeyboardEvent) {
     // A6-2: IME candidate accept uses Enter while isComposing — must not SEND.
-    if (e.isComposing || e.keyCode === 229) return;
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendCompose();
@@ -242,7 +266,7 @@
   }
 
   function directKeydown(e: KeyboardEvent) {
-    if (e.isComposing || e.keyCode === 229) return;
+    if (isImeComposing(e)) return;
     // The ghost input owns browser text entry and paste. Let printable text
     // become an input event (including Thai/IME), and preserve the same
     // Ctrl(+Shift)+V / Cmd+V browser paste policy as DesktopKeys.
@@ -285,6 +309,8 @@
     data-testid="ghost-key"
     oninput={directInput}
     onkeydown={directKeydown}
+    oncompositionstart={onCompositionStart}
+    oncompositionend={onCompositionEnd}
     onpaste={handlePaste}
     aria-label={labels.directAria}
     autocomplete="off"
@@ -298,6 +324,8 @@
         bind:value={text}
         oninput={autoGrow}
         onkeydown={composeKeydown}
+        oncompositionstart={onCompositionStart}
+        oncompositionend={onCompositionEnd}
         onpaste={handlePaste}
         rows="1"
         placeholder={labels.placeholder}

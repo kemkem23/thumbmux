@@ -30,10 +30,22 @@ export type ExtractRecentPromptsOptions = {
   initialScanLines?: number;
   maxScanLines?: number;
   matchers?: PromptMatcherSet;
+  /** See {@link ExtractRecentPromptsFromPaneOptions.wrapJoined}. */
+  wrapJoined?: boolean;
 };
 
 export type ExtractRecentPromptsFromPaneOptions = {
   matchers?: PromptMatcherSet;
+  /**
+   * Set when `content` was captured with `tmux capture-pane -J`: tmux has
+   * already merged every soft-wrapped row back into its logical line, so each
+   * remaining `\n` in `content` is a hard newline the user actually typed —
+   * a real line break, not a column-width wrap. Multi-line prompt blocks are
+   * then rejoined with `\n` to reproduce what was submitted, instead of the
+   * lossy single-space join used for plain (non-`-J`) captures, where a wrap
+   * and a real newline cannot be told apart.
+   */
+  wrapJoined?: boolean;
 };
 
 const DEFAULT_TARGET_COUNT = 5;
@@ -205,36 +217,71 @@ function cleanPromptLine(line: string): string {
     .trimEnd();
 }
 
-function extractMarkdownSection(lines: string[], title: string): string | null {
+const USER_REPORT_END_MARKER = "<!-- thumbmux:user-report:end -->";
+
+function isLegacyUserReportBoundary(line: string): boolean {
+  const trimmed = line.trim();
+  return /^##\s+(?:Attached screenshots|Source)\s*$/i.test(trimmed)
+    || /^##\s+Workflow\s+\(execute end-to-end, do not pause\)\s*$/i.test(trimmed);
+}
+
+function extractMarkdownSection(
+  lines: string[],
+  title: string,
+  preserveNewlines: boolean,
+): string | null {
   const heading = new RegExp(`^#{2,6}\\s+${title}\\s*$`, "i");
   const start = lines.findIndex((line) => heading.test(line.trim()));
   if (start < 0) return null;
 
   const section: string[] = [];
   for (const line of lines.slice(start + 1)) {
-    if (/^#{2,6}\s+\S/.test(line.trim())) break;
+    // Current autofix wrappers put an explicit sentinel after the verbatim
+    // report. It is the only unambiguous boundary because Markdown headings
+    // inside the report belong to the user. The exact legacy wrapper headings
+    // remain a fallback for prompts captured before the sentinel was added;
+    // arbitrary headings (for example `## ขั้นตอน`) must stay in the payload.
+    if (line.trim() === USER_REPORT_END_MARKER || isLegacyUserReportBoundary(line)) break;
     section.push(line);
   }
 
-  const text = section.join(" ").replace(/\s+/g, " ").trim();
+  const text = preserveNewlines
+    ? section.join("\n").trim()
+    : section.join(" ").replace(/\s+/g, " ").trim();
   return text || null;
 }
 
-function normalizePromptBlock(lines: string[]): string {
+function normalizePromptBlock(lines: string[], wrapJoined: boolean): string {
   const cleanLines = lines
     .map(cleanPromptLine)
     .filter((line, index, all) => line.trim() || (index > 0 && index < all.length - 1));
 
-  const userReport = extractMarkdownSection(cleanLines, "User report");
-  const source = userReport ?? cleanLines.join(" ");
-  // Honest capture limit: a tmux pane cannot tell a wrap-break from an
-  // intentional newline, so continuation rows are joined with a space. The
-  // returned string is otherwise the submitted payload — never a 500-unit
-  // preview with a synthetic ellipsis that later looks resendable.
-  return source.replace(/\s+/g, " ").trim();
+  const userReport = extractMarkdownSection(cleanLines, "User report", wrapJoined);
+  if (userReport) return userReport;
+
+  if (wrapJoined) {
+    // The pane was captured with `-J`, so tmux itself already told wrap
+    // breaks from hard newlines apart (see ExtractRecentPromptsFromPaneOptions
+    // .wrapJoined) — reproduce the real line breaks instead of collapsing
+    // them. Only whole leading/trailing blank rows are gone (filtered above);
+    // everything else, including interior blank lines and repeated spaces the
+    // user actually typed, is preserved byte-for-byte.
+    return cleanLines.join("\n").trim();
+  }
+
+  // Honest capture limit: without -J, a tmux pane cannot tell a wrap-break
+  // from an intentional newline, so continuation rows are joined with a
+  // space. The returned string is otherwise the submitted payload — never a
+  // 500-unit preview with a synthetic ellipsis that later looks resendable.
+  return cleanLines.join(" ").replace(/\s+/g, " ").trim();
 }
 
-function collectPrompts(lines: string[], start: number, matchers: PromptMatcherSet): string[] {
+function collectPrompts(
+  lines: string[],
+  start: number,
+  matchers: PromptMatcherSet,
+  wrapJoined: boolean,
+): string[] {
   const prompts: string[] = [];
   let i = start;
 
@@ -297,7 +344,7 @@ function collectPrompts(lines: string[], start: number, matchers: PromptMatcherS
       continue;
     }
 
-    const prompt = normalizePromptBlock(block);
+    const prompt = normalizePromptBlock(block, wrapJoined);
     if (prompt && prompt.length >= 3 && !prompt.startsWith("/")) {
       prompts.push(prompt);
     }
@@ -320,9 +367,10 @@ export function extractRecentPrompts(
   const initialScanLines = Math.max(0, options.initialScanLines ?? DEFAULT_INITIAL_SCAN_LINES);
   const maxScanLines = options.maxScanLines ?? DEFAULT_MAX_SCAN_LINES;
   const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;
+  const wrapJoined = options.wrapJoined ?? false;
   const boundedMaxScanLines = Math.min(lines.length, maxScanLines);
   let scanLines = Math.min(lines.length, initialScanLines, boundedMaxScanLines);
-  let prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
+  let prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers, wrapJoined);
   // Stop on unique count, not raw collect count: two echoes of the same prompt
   // must not freeze the progressive window short of an older distinct entry.
   let unique = dedupeKeepLatest(prompts);
@@ -331,7 +379,7 @@ export function extractRecentPrompts(
     // initialScanLines: 0 used to leave scanLines at 0 forever (0*2 === 0) and
     // hang the event loop. Always make forward progress when deepening.
     scanLines = Math.min(boundedMaxScanLines, scanLines <= 0 ? 1 : scanLines * 2);
-    prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers);
+    prompts = collectPrompts(lines, Math.max(0, lines.length - scanLines), matchers, wrapJoined);
     unique = dedupeKeepLatest(prompts);
   }
 
@@ -350,7 +398,8 @@ export function extractRecentPromptsFromPane(
   const lines = content.split("\n");
   if (lines.length === 0) return [];
   const matchers = options.matchers ?? DEFAULT_PROMPT_MATCHERS;
-  return dedupeKeepLatest(collectPrompts(lines, 0, matchers)).slice(-targetCount);
+  const wrapJoined = options.wrapJoined ?? false;
+  return dedupeKeepLatest(collectPrompts(lines, 0, matchers, wrapJoined)).slice(-targetCount);
 }
 
 function dedupeKeepLatest(prompts: string[]): string[] {
