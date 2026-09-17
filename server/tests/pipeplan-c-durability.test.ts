@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { OutputWalWriter, parseOutputWalJson, readOutputWal } from "../src/output-wal";
 import {
   createTerminalPtyWalProxyLaunchSpec,
@@ -167,8 +167,13 @@ test("P1 v1 ENOSPC and EIO fail closed before display", () => {
     "  finally: module.os.write=original",
     "print(json.dumps(results))",
   ].join("\n");
-  const result = spawnSync("python3", ["-c", probe, script], { encoding: "utf8" });
+  // This probe bypasses launch.env. The interpreter must suppress bytecode itself.
+  const result = spawnSync("python3", ["-B", "-c", probe, script], {
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "", PYTHONPYCACHEPREFIX: "" },
+    encoding: "utf8",
+  });
   expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
+  expect(existsSync(join(dirname(script), "__pycache__"))).toBe(false);
   const samples = JSON.parse(result.stdout) as Array<Record<string, number>>;
   expect(samples).toHaveLength(10);
   expect(samples.every((sample) => sample.writes === 0 && sample.received === 13
