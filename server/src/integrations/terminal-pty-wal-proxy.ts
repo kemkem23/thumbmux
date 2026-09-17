@@ -16,6 +16,7 @@ export const TERMINAL_PTY_WAL_CONFIG_ENV = "THUMBMUX_TERMINAL_PTY_WAL_CONFIG";
 export const TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV = "THUMBMUX_TERMINAL_PROXY_ASSET_SHA256";
 export const TERMINAL_PTY_WAL_HEALTH_FILE = "pty-proxy-status.json";
 export const TERMINAL_PTY_WAL_DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log";
+export const PIPEHIST_HEALTH_V1_FILE = "pipehist-health-v1.json";
 
 const SAFE_SESSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SAFE_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -29,6 +30,83 @@ export type TerminalPtyWalProxyTmuxOptions = {
   executable?: string;
   socketName?: string;
   socketPath?: string;
+};
+
+export type PipehistIdentityV1 = {
+  session: string;
+  instanceId: string;
+  provider: "claude" | "codex" | "grok";
+  conversationId: string;
+  cwd: string;
+  laneKey: string;
+};
+
+export type PipehistProcessV1 = {
+  bootId: string;
+  pid: number;
+  startTicks: string;
+};
+
+export type PipehistBoundaryV1 = {
+  walSequence: string;
+  walNextOffset: number;
+  walPrefixSha256: string;
+  outputBytes: string;
+  v3Lines: number;
+};
+
+export type PipehistPhysicalV1 = {
+  server: PipehistProcessV1;
+  socketPath: string;
+  sessionId: string;
+  sessionCreated: number;
+  windowId: string;
+  paneId: string;
+  paneTarget: string;
+  proxy: PipehistProcessV1;
+  generation: string;
+};
+
+export type PipehistEpochV1 = {
+  schema: "pipehist.c.v1/epoch";
+  epochId: string;
+  ordinal: number;
+  previousEpochId: string | null;
+  identity: PipehistIdentityV1;
+  physical: PipehistPhysicalV1;
+  state: "opening" | "open" | "closing" | "clean" | "unclean" | "unknown";
+  opened: PipehistBoundaryV1 | null;
+  closed: PipehistBoundaryV1 | null;
+  uncleanPredecessor: { epochId: string; marker: PipehistBoundaryV1 | null } | null;
+};
+
+export type PipehistHealthV1 = {
+  schema: "pipehist.c.v1/health";
+  identity: PipehistIdentityV1;
+  sourceKind: "direct-pty-proxy";
+  epoch: PipehistEpochV1 | null;
+  observed: { bootId: string; monoNs: string; utc: string; sample: string };
+  state: "starting" | "ready" | "blocked" | "ended" | "fatal" | "unknown";
+  reason: "none" | "sync-pending" | "storage-error" | "source-lost"
+    | "unclean-epoch" | "identity-mismatch" | "stale" | "unreadable" | "replay-lag";
+  proxy: PipehistProcessV1 | null;
+  progress: {
+    receivedOutputBytes: string;
+    durableOutputBytes: string;
+    displayedOutputBytes: string;
+    walSequence: string;
+    walNextOffset: number;
+    replaySequence: string;
+    replayNextOffset: number;
+    pendingOutputBytes: number;
+  } | null;
+  error: string | null;
+};
+
+export type PipehistProxyConfigV1 = {
+  schema: "pipehist.c.v1/proxy-config";
+  identity: PipehistIdentityV1;
+  replay: { checkpointPath: string; historyPath: string } | null;
 };
 
 export type TerminalPtyWalProxyConfig = {
@@ -47,6 +125,7 @@ export type TerminalPtyWalProxyConfig = {
   maxPendingInputBytes?: number;
   heartbeatMs?: number;
   terminateGraceMs?: number;
+  pipehist?: PipehistProxyConfigV1;
 };
 
 export type NormalizedTerminalPtyWalProxyConfig = {
@@ -65,6 +144,7 @@ export type NormalizedTerminalPtyWalProxyConfig = {
   maxPendingInputBytes: number;
   heartbeatMs: number;
   terminateGraceMs: number;
+  pipehist?: PipehistProxyConfigV1;
 };
 
 export type TerminalPtyWalProxyHealth = {
@@ -123,6 +203,257 @@ function stringWithoutNul(value: unknown, label: string): string {
     throw new Error(`${label} must be a string without NUL`);
   }
   return value;
+}
+
+function safeInteger(value: unknown, label: string, minimum = 0): number {
+  if (!Number.isSafeInteger(value) || (value as number) < minimum) {
+    throw new Error(`${label} must be a safe integer no less than ${minimum}`);
+  }
+  return value as number;
+}
+
+function id(value: unknown, label: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error(`${label} must be a pipehist Id`);
+  }
+  return value;
+}
+
+function decimal(value: unknown, label: string): string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`${label} must be a canonical non-negative decimal string`);
+  }
+  return value;
+}
+
+function absolutePath(value: unknown, label: string): string {
+  const path = nonEmptyString(value, label);
+  if (!isAbsolute(path) || resolve(path) !== path) throw new Error(`${label} must be an absolute normalized path`);
+  return path;
+}
+
+function parsePipehistIdentityV1(value: unknown, label = "identity"): PipehistIdentityV1 {
+  if (!isObject(value)) throw new Error(`${label} must be an object`);
+  exactKeys(value, ["session", "instanceId", "provider", "conversationId", "cwd", "laneKey"], [], label);
+  if (typeof value.session !== "string" || !SAFE_SESSION.test(value.session)) {
+    throw new Error(`${label}.session must be a safe tmux session name`);
+  }
+  if (value.provider !== "claude" && value.provider !== "codex" && value.provider !== "grok") {
+    throw new Error(`${label}.provider is invalid`);
+  }
+  return {
+    session: value.session,
+    instanceId: id(value.instanceId, `${label}.instanceId`),
+    provider: value.provider,
+    conversationId: nonEmptyString(value.conversationId, `${label}.conversationId`),
+    cwd: absolutePath(value.cwd, `${label}.cwd`),
+    laneKey: id(value.laneKey, `${label}.laneKey`),
+  };
+}
+
+function parsePipehistProcessV1(value: unknown, label: string): PipehistProcessV1 {
+  if (!isObject(value)) throw new Error(`${label} must be an object`);
+  exactKeys(value, ["bootId", "pid", "startTicks"], [], label);
+  return {
+    bootId: nonEmptyString(value.bootId, `${label}.bootId`),
+    pid: safeInteger(value.pid, `${label}.pid`, 1),
+    startTicks: decimal(value.startTicks, `${label}.startTicks`),
+  };
+}
+
+function parsePipehistBoundaryV1(value: unknown, label: string): PipehistBoundaryV1 {
+  if (!isObject(value)) throw new Error(`${label} must be an object`);
+  exactKeys(value, ["walSequence", "walNextOffset", "walPrefixSha256", "outputBytes", "v3Lines"], [], label);
+  if (typeof value.walPrefixSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.walPrefixSha256)) {
+    throw new Error(`${label}.walPrefixSha256 must be a lowercase SHA-256`);
+  }
+  return {
+    walSequence: decimal(value.walSequence, `${label}.walSequence`),
+    walNextOffset: safeInteger(value.walNextOffset, `${label}.walNextOffset`),
+    walPrefixSha256: value.walPrefixSha256,
+    outputBytes: decimal(value.outputBytes, `${label}.outputBytes`),
+    v3Lines: safeInteger(value.v3Lines, `${label}.v3Lines`),
+  };
+}
+
+function parsePipehistPhysicalV1(value: unknown, identity: PipehistIdentityV1, label: string): PipehistPhysicalV1 {
+  if (!isObject(value)) throw new Error(`${label} must be an object`);
+  exactKeys(value, [
+    "server", "socketPath", "sessionId", "sessionCreated", "windowId", "paneId",
+    "paneTarget", "proxy", "generation",
+  ], [], label);
+  const paneTarget = nonEmptyString(value.paneTarget, `${label}.paneTarget`);
+  const expectedPane = new RegExp(`^=${identity.session.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\d+\\.\\d+$`);
+  if (!expectedPane.test(paneTarget)) throw new Error(`${label}.paneTarget is not exact for identity.session`);
+  const sessionId = nonEmptyString(value.sessionId, `${label}.sessionId`);
+  const windowId = nonEmptyString(value.windowId, `${label}.windowId`);
+  const paneId = nonEmptyString(value.paneId, `${label}.paneId`);
+  if (!/^\$\d+$/.test(sessionId) || !/^@\d+$/.test(windowId) || !/^%\d+$/.test(paneId)) {
+    throw new Error(`${label} tmux IDs are invalid`);
+  }
+  return {
+    server: parsePipehistProcessV1(value.server, `${label}.server`),
+    socketPath: absolutePath(value.socketPath, `${label}.socketPath`),
+    sessionId,
+    sessionCreated: safeInteger(value.sessionCreated, `${label}.sessionCreated`),
+    windowId,
+    paneId,
+    paneTarget,
+    proxy: parsePipehistProcessV1(value.proxy, `${label}.proxy`),
+    generation: id(value.generation, `${label}.generation`),
+  };
+}
+
+function samePipehistIdentity(left: PipehistIdentityV1, right: PipehistIdentityV1): boolean {
+  return left.session === right.session && left.instanceId === right.instanceId
+    && left.provider === right.provider && left.conversationId === right.conversationId
+    && left.cwd === right.cwd && left.laneKey === right.laneKey;
+}
+
+function samePipehistProcess(left: PipehistProcessV1, right: PipehistProcessV1): boolean {
+  return left.bootId === right.bootId && left.pid === right.pid && left.startTicks === right.startTicks;
+}
+
+function parsePipehistEpochV1(value: unknown, identity: PipehistIdentityV1): PipehistEpochV1 {
+  if (!isObject(value)) throw new Error("epoch must be an object");
+  exactKeys(value, [
+    "schema", "epochId", "ordinal", "previousEpochId", "identity", "physical", "state",
+    "opened", "closed", "uncleanPredecessor",
+  ], [], "epoch");
+  if (value.schema !== "pipehist.c.v1/epoch") throw new Error("epoch.schema is invalid");
+  const epochIdentity = parsePipehistIdentityV1(value.identity, "epoch.identity");
+  if (!samePipehistIdentity(identity, epochIdentity)) throw new Error("epoch.identity does not match health.identity");
+  const states = new Set(["opening", "open", "closing", "clean", "unclean", "unknown"]);
+  if (typeof value.state !== "string" || !states.has(value.state)) throw new Error("epoch.state is invalid");
+  const opened = value.opened === null ? null : parsePipehistBoundaryV1(value.opened, "epoch.opened");
+  const closed = value.closed === null ? null : parsePipehistBoundaryV1(value.closed, "epoch.closed");
+  let uncleanPredecessor: PipehistEpochV1["uncleanPredecessor"] = null;
+  if (value.uncleanPredecessor !== null) {
+    if (!isObject(value.uncleanPredecessor)) throw new Error("epoch.uncleanPredecessor must be an object or null");
+    exactKeys(value.uncleanPredecessor, ["epochId", "marker"], [], "epoch.uncleanPredecessor");
+    uncleanPredecessor = {
+      epochId: id(value.uncleanPredecessor.epochId, "epoch.uncleanPredecessor.epochId"),
+      marker: value.uncleanPredecessor.marker === null
+        ? null
+        : parsePipehistBoundaryV1(value.uncleanPredecessor.marker, "epoch.uncleanPredecessor.marker"),
+    };
+  }
+  if (value.state === "opening" && (opened !== null || closed !== null)) {
+    throw new Error("opening epoch must not claim opened or closed boundaries");
+  }
+  if ((value.state === "open" || value.state === "closing" || value.state === "clean") && opened === null) {
+    throw new Error(`${value.state} epoch requires an opened boundary`);
+  }
+  if (value.state === "clean" ? closed === null : closed !== null) {
+    throw new Error(value.state === "clean" ? "clean epoch requires a closed boundary" : "only a clean epoch may claim a closed boundary");
+  }
+  return {
+    schema: "pipehist.c.v1/epoch",
+    epochId: id(value.epochId, "epoch.epochId"),
+    ordinal: safeInteger(value.ordinal, "epoch.ordinal"),
+    previousEpochId: value.previousEpochId === null ? null : id(value.previousEpochId, "epoch.previousEpochId"),
+    identity: epochIdentity,
+    physical: parsePipehistPhysicalV1(value.physical, identity, "epoch.physical"),
+    state: value.state as PipehistEpochV1["state"],
+    opened,
+    closed,
+    uncleanPredecessor,
+  };
+}
+
+export function parsePipehistHealthV1(value: unknown): PipehistHealthV1 {
+  if (!isObject(value)) throw new Error("pipehist health must be an object");
+  exactKeys(value, ["schema", "identity", "sourceKind", "epoch", "observed", "state", "reason", "proxy", "progress", "error"], [], "pipehist health");
+  if (value.schema !== "pipehist.c.v1/health" || value.sourceKind !== "direct-pty-proxy") {
+    throw new Error("pipehist health schema/sourceKind is invalid");
+  }
+  const identity = parsePipehistIdentityV1(value.identity, "identity");
+  const epoch = value.epoch === null ? null : parsePipehistEpochV1(value.epoch, identity);
+  if (!isObject(value.observed)) throw new Error("observed must be an object");
+  exactKeys(value.observed, ["bootId", "monoNs", "utc", "sample"], [], "observed");
+  const utc = nonEmptyString(value.observed.utc, "observed.utc");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(utc) || !Number.isFinite(Date.parse(utc))) {
+    throw new Error("observed.utc must be RFC3339 UTC");
+  }
+  const states = new Set(["starting", "ready", "blocked", "ended", "fatal", "unknown"]);
+  const reasons = new Set(["none", "sync-pending", "storage-error", "source-lost", "unclean-epoch", "identity-mismatch", "stale", "unreadable", "replay-lag"]);
+  if (typeof value.state !== "string" || !states.has(value.state)) throw new Error("state is invalid");
+  if (typeof value.reason !== "string" || !reasons.has(value.reason)) throw new Error("reason is invalid");
+  const proxy = value.proxy === null ? null : parsePipehistProcessV1(value.proxy, "proxy");
+  let progress: PipehistHealthV1["progress"] = null;
+  if (value.progress !== null) {
+    if (!isObject(value.progress)) throw new Error("progress must be an object or null");
+    exactKeys(value.progress, [
+      "receivedOutputBytes", "durableOutputBytes", "displayedOutputBytes", "walSequence",
+      "walNextOffset", "replaySequence", "replayNextOffset", "pendingOutputBytes",
+    ], [], "progress");
+    const received = decimal(value.progress.receivedOutputBytes, "progress.receivedOutputBytes");
+    const durable = decimal(value.progress.durableOutputBytes, "progress.durableOutputBytes");
+    const displayed = decimal(value.progress.displayedOutputBytes, "progress.displayedOutputBytes");
+    if (BigInt(displayed) > BigInt(durable) || BigInt(durable) > BigInt(received)) {
+      throw new Error("progress must satisfy displayedOutputBytes <= durableOutputBytes <= receivedOutputBytes");
+    }
+    const pending = safeInteger(value.progress.pendingOutputBytes, "progress.pendingOutputBytes");
+    if (BigInt(received) - BigInt(displayed) !== BigInt(pending)) {
+      throw new Error("progress.pendingOutputBytes must equal receivedOutputBytes - displayedOutputBytes");
+    }
+    const walSequence = decimal(value.progress.walSequence, "progress.walSequence");
+    const replaySequence = decimal(value.progress.replaySequence, "progress.replaySequence");
+    const walNextOffset = safeInteger(value.progress.walNextOffset, "progress.walNextOffset");
+    const replayNextOffset = safeInteger(value.progress.replayNextOffset, "progress.replayNextOffset");
+    if (BigInt(replaySequence) > BigInt(walSequence) || replayNextOffset > walNextOffset) {
+      throw new Error("replay progress must not exceed the durable WAL prefix");
+    }
+    progress = { receivedOutputBytes: received, durableOutputBytes: durable, displayedOutputBytes: displayed,
+      walSequence, walNextOffset, replaySequence, replayNextOffset, pendingOutputBytes: pending };
+  }
+  if (value.error !== null && (typeof value.error !== "string" || value.error.length === 0 || value.error.length > 2_048)) {
+    throw new Error("error must be null or a non-empty string no longer than 2048 characters");
+  }
+  if (value.state === "ready") {
+    if (value.reason !== "none" || !epoch || epoch.state !== "open" || !proxy || !progress) {
+      throw new Error("ready health requires an open epoch, process, progress and reason none");
+    }
+    if (!samePipehistProcess(epoch.physical.proxy, proxy)) {
+      throw new Error("ready health proxy does not match epoch physical identity");
+    }
+    if (progress.replaySequence !== progress.walSequence || progress.replayNextOffset !== progress.walNextOffset) {
+      throw new Error("ready health requires replay at the durable WAL boundary");
+    }
+  }
+  return {
+    schema: "pipehist.c.v1/health",
+    identity,
+    sourceKind: "direct-pty-proxy",
+    epoch,
+    observed: {
+      bootId: nonEmptyString(value.observed.bootId, "observed.bootId"),
+      monoNs: decimal(value.observed.monoNs, "observed.monoNs"),
+      utc,
+      sample: decimal(value.observed.sample, "observed.sample"),
+    },
+    state: value.state as PipehistHealthV1["state"],
+    reason: value.reason as PipehistHealthV1["reason"],
+    proxy,
+    progress,
+    error: value.error as string | null,
+  };
+}
+
+function parsePipehistProxyConfigV1(value: unknown): PipehistProxyConfigV1 {
+  if (!isObject(value)) throw new Error("pipehist must be an object");
+  exactKeys(value, ["schema", "identity", "replay"], [], "pipehist");
+  if (value.schema !== "pipehist.c.v1/proxy-config") throw new Error("pipehist.schema is invalid");
+  let replay: PipehistProxyConfigV1["replay"] = null;
+  if (value.replay !== null) {
+    if (!isObject(value.replay)) throw new Error("pipehist.replay must be an object or null");
+    exactKeys(value.replay, ["checkpointPath", "historyPath"], [], "pipehist.replay");
+    replay = {
+      checkpointPath: absolutePath(value.replay.checkpointPath, "pipehist.replay.checkpointPath"),
+      historyPath: absolutePath(value.replay.historyPath, "pipehist.replay.historyPath"),
+    };
+  }
+  return { schema: "pipehist.c.v1/proxy-config", identity: parsePipehistIdentityV1(value.identity), replay };
 }
 
 function commandName(value: unknown, label: string, fallback?: string): string {
@@ -199,11 +530,14 @@ export function parseTerminalPtyWalProxyConfig(value: unknown): NormalizedTermin
       "maxPendingInputBytes",
       "heartbeatMs",
       "terminateGraceMs",
+      "pipehist",
     ],
     "terminal PTY WAL config",
   );
   const directory = nonEmptyString(value.directory, "directory");
   resolveTerminalWalPaths(directory);
+  const parsedIdentity = parseIdentity(value.identity);
+  const parsedTmux = parseTmux(value.tmux);
   if (!Array.isArray(value.argv) || value.argv.length === 0 || value.argv.length > 4_096) {
     throw new Error("argv must contain 1 through 4096 arguments");
   }
@@ -238,13 +572,21 @@ export function parseTerminalPtyWalProxyConfig(value: unknown): NormalizedTermin
   if (maxPendingInputBytes < maxOutputRecordBytes) {
     throw new Error("maxPendingInputBytes must be at least maxOutputRecordBytes");
   }
+  const pipehist = value.pipehist === undefined ? undefined : parsePipehistProxyConfigV1(value.pipehist);
+  if (pipehist && (pipehist.identity.session !== parsedIdentity.session
+    || pipehist.identity.instanceId !== parsedIdentity.instanceId)) {
+    throw new Error("pipehist.identity must match terminal PTY WAL identity");
+  }
+  if (pipehist && parsedTmux.socketPath === undefined) {
+    throw new Error("pipehist v1 requires tmux.socketPath so physical identity is explicit");
+  }
   return {
     directory,
-    identity: parseIdentity(value.identity),
+    identity: parsedIdentity,
     argv,
     ...(cwd === undefined ? {} : { cwd }),
     env,
-    tmux: parseTmux(value.tmux),
+    tmux: parsedTmux,
     pythonExecutable: commandName(value.pythonExecutable, "pythonExecutable", "python3"),
     maxOutputRecordBytes,
     maxPendingInputBytes,
@@ -255,6 +597,7 @@ export function parseTerminalPtyWalProxyConfig(value: unknown): NormalizedTermin
       "terminateGraceMs",
       300_000,
     ),
+    ...(pipehist === undefined ? {} : { pipehist }),
   };
 }
 
@@ -320,6 +663,15 @@ export function spawnTerminalPtyWalProxy(
 
 export function terminalPtyWalProxyHealthPath(directory: string): string {
   return join(resolveTerminalWalPaths(directory).directory, TERMINAL_PTY_WAL_HEALTH_FILE);
+}
+
+export function pipehistHealthV1Path(directory: string): string {
+  return join(resolveTerminalWalPaths(directory).directory, PIPEHIST_HEALTH_V1_FILE);
+}
+
+export function readPipehistHealthV1(directory: string): PipehistHealthV1 {
+  const value: unknown = JSON.parse(readFileSync(pipehistHealthV1Path(directory), "utf8"));
+  return parsePipehistHealthV1(value);
 }
 
 export function readTerminalPtyWalProxyHealth(directory: string): TerminalPtyWalProxyHealth {
