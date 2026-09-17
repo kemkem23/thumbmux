@@ -21,6 +21,16 @@ Since `v0.20.1`, this split also includes recorder/WAL pause-gap records,
 unclean resume labels, overlapping recovery identity, fatal health-write alerts,
 and related recovery, limits, worker-wire and one-path oracle tests.
 
+- **PTY proxy durability health:** the proxy can publish the strict optional
+  PIPEHIST v1 health contract, including source-epoch/process identity,
+  received/durable/displayed progress, replay progress and unclean predecessor
+  boundaries. An epoch opens only after source release; ready requires an open
+  epoch whose replay has caught up. Identity mismatches are rejected. The tag
+  includes the associated P1 durability tests; these tests are not a blanket
+  proof of every crash boundary on a running production proxy.
+- **WAL format compatibility:** gap/recovery records use format 2. Existing
+  format 1 WAL files are not silently upgraded or rewritten; a writer with
+  a mismatched format refuses to append.
 - **SQLite history packaging:** the generated dist now exports the existing
   `thumbmux/server/sqlite-history` build entry. This fixes
   `ERR_PACKAGE_PATH_NOT_EXPORTED` in v0.20.1-dist; no new barrel name is added.
