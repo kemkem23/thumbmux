@@ -658,6 +658,7 @@ export function createTerminalPtyWalProxyLaunchSpec(
       ...baseEnvironment,
       [TERMINAL_PTY_WAL_CONFIG_ENV]: encoded,
       [TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]: assetSha256,
+      PYTHONDONTWRITEBYTECODE: "1",
       PYTHONUNBUFFERED: "1",
     },
   };
