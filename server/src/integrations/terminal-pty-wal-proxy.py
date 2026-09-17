@@ -1253,6 +1253,7 @@ class Proxy:
         self.opened_boundary: Optional[dict[str, Any]] = None
         self.closed_boundary: Optional[dict[str, Any]] = None
         self.failure_reason: Optional[str] = None
+        self.pipehist_physical: Optional[dict[str, Any]] = None
 
     def setup_directory(self) -> None:
         ensure_durable_directory(self.directory)
@@ -1323,8 +1324,10 @@ class Proxy:
     def physical_value(self) -> Optional[dict[str, Any]]:
         if self.source is None or "pipehist" not in self.config:
             return None
+        if self.pipehist_physical is not None:
+            return self.pipehist_physical
         server_pid = self.source["tmuxServerPid"]
-        return {
+        self.pipehist_physical = {
             "server": {
                 "bootId": self.boot_id,
                 "pid": server_pid,
@@ -1343,6 +1346,7 @@ class Proxy:
             },
             "generation": self.generation,
         }
+        return self.pipehist_physical
 
     def pipehist_health_value(self) -> dict[str, Any]:
         logical = self.config["pipehist"]["identity"]
@@ -1750,7 +1754,7 @@ class Proxy:
         if self.child_status is not None or self.child.gate_fd < 0:
             raise ProxyError("terminal PTY child cannot be activated")
         v3_lines = self.wait_replay_boundary(self.activation_record)
-        self.opened_boundary = self.boundary_value(
+        opened_boundary = self.boundary_value(
             self.activation_record,
             self.received_output_bytes,
             v3_lines,
@@ -1760,6 +1764,7 @@ class Proxy:
         write_all(self.child.gate_fd, b"1")
         os.close(self.child.gate_fd)
         self.child.gate_fd = -1
+        self.opened_boundary = opened_boundary
         self.activated = True
         self.state = "ready"
         self.write_health(True)
