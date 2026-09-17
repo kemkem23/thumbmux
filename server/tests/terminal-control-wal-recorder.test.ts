@@ -201,6 +201,7 @@ describe("ordered tmux control WAL recorder", () => {
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
     expect(records.map((record) => record.kind)).toEqual([
       "lifecycle",
+      "checkpoint",
       "output",
       "resize",
       "resize",
@@ -208,18 +209,19 @@ describe("ordered tmux control WAL recorder", () => {
       "output",
       "lifecycle",
     ]);
-    expect(Buffer.from(records[1]!.payload).toString()).toBe("before\r\n");
-    expect(parseOutputWalJson(records[2]!)).toEqual({
+    expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+    expect(Buffer.from(records[2]!.payload).toString()).toBe("before\r\n");
+    expect(parseOutputWalJson(records[3]!)).toEqual({
       phase: "prepare",
       changeId: "layout:1",
       from: { cols: 80, rows: 24 },
       to: { cols: 90, rows: 30 },
       reason: "tmux-control-layout",
     });
-    expect(parseOutputWalJson(records[3]!)).toMatchObject({ phase: "commit", changeId: "layout:1" });
-    expect(Buffer.from(records[4]!.payload).toString()).toBe("after\r\n");
-    expect(Buffer.from(records[5]!.payload).toString()).toBe("tail-before-exit\n");
-    expect(parseOutputWalJson(records[6]!)).toMatchObject({
+    expect(parseOutputWalJson(records[4]!)).toMatchObject({ phase: "commit", changeId: "layout:1" });
+    expect(Buffer.from(records[5]!.payload).toString()).toBe("after\r\n");
+    expect(Buffer.from(records[6]!.payload).toString()).toBe("tail-before-exit\n");
+    expect(parseOutputWalJson(records[7]!)).toMatchObject({
       event: "end",
       geometry: { cols: 90, rows: 30 },
     });
@@ -236,8 +238,12 @@ describe("ordered tmux control WAL recorder", () => {
     await eventually(() => recorder.status.state === "disconnected", "cancelled END disconnect");
 
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output"]);
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "output", "checkpoint"]);
     expect(parseOutputWalJson(records[0]!)).toMatchObject({ event: "start" });
+    expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+    expect(parseOutputWalJson(records[3]!)).toEqual({
+      event: "source-detached", version: 1, lastDurableSeq: "3",
+    });
   });
 
   test("durably records pause and accepts its continue acknowledgement inside the command block", async () => {
@@ -257,15 +263,16 @@ describe("ordered tmux control WAL recorder", () => {
     fake.stdout.write("%begin 1700000001 2 1\n%continue %42\n%end 1700000001 2 1\n%output %42 resumed\\012\n");
     expect(recorder.status.state).toBe("ready");
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "gap", "output"]);
-    expect(parseOutputWalJson(records[1]!)).toMatchObject({
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "gap", "output"]);
+    expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+    expect(parseOutputWalJson(records[2]!)).toMatchObject({
       paneId: "%42",
       reason: "tmux-pause",
-      lastDurableSeq: "1",
+      lastDurableSeq: "2",
       missingBytes: null,
       coverage: "unknown",
     });
-    expect(Buffer.from(records[2]!.payload).toString()).toBe("resumed\n");
+    expect(Buffer.from(records[3]!.payload).toString()).toBe("resumed\n");
   });
 
   test("pauses on malformed output and retains later lines instead of consuming them", async () => {
@@ -285,13 +292,17 @@ describe("ordered tmux control WAL recorder", () => {
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
     const outputs = records.filter((record) => record.kind === "output");
     expect(Buffer.concat(outputs.map((record) => Buffer.from(record.payload))).toString()).toBe("good\n");
-    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output", "gap"]);
-    expect(parseOutputWalJson(records[2]!)).toMatchObject({
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "output", "gap", "checkpoint"]);
+    expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+    expect(parseOutputWalJson(records[3]!)).toMatchObject({
       paneId: "%42",
       reason: "recorder-failure",
-      lastDurableSeq: "2",
+      lastDurableSeq: "3",
       missingBytes: null,
       coverage: "unknown",
+    });
+    expect(parseOutputWalJson(records[4]!)).toEqual({
+      event: "source-detached", version: 1, lastDurableSeq: "4",
     });
   });
 
@@ -332,7 +343,11 @@ describe("ordered tmux control WAL recorder", () => {
     await eventually(() => recorder.status.state === "disconnected", "source disconnect");
 
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output"]);
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "output", "checkpoint"]);
+    expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+    expect(parseOutputWalJson(records[3]!)).toEqual({
+      event: "source-detached", version: 1, lastDurableSeq: "3",
+    });
     expect(readTerminalControlWalHealth(directory)).toMatchObject({
       state: "disconnected",
       pid: process.pid,
