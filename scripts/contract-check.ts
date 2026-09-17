@@ -411,15 +411,39 @@ function isDirectOptionalProperty(node: ts.Node): node is ts.PropertySignature {
     && directPropertyOwner(node) !== undefined;
 }
 
-function stripDirectOptionalProperties(declaration: ts.Declaration): string {
-  const members = directOptionalProperties(declaration);
-  if (members.length === 0) return declarationSurfaceText(declaration);
-  const base = declaration.getStart();
-  let text = declaration.getText();
-  for (const member of [...members].sort((left, right) => right.getStart() - left.getStart())) {
-    text = `${text.slice(0, member.getStart() - base)}${text.slice(member.getEnd() - base)}`;
+function stripDirectOptionalProperties(declaration: ts.Declaration, normalizeSeparators = false): string {
+  if (!normalizeSeparators) {
+    const members = directOptionalProperties(declaration);
+    if (members.length === 0) return declarationSurfaceText(declaration);
+    const base = declaration.getStart();
+    let text = declaration.getText();
+    for (const member of [...members].sort((left, right) => right.getStart() - left.getStart())) {
+      text = `${text.slice(0, member.getStart() - base)}${text.slice(member.getEnd() - base)}`;
+    }
+    return text;
   }
-  return text;
+  // Print both sides, even when the baseline has no optional members. Appending
+  // the first optional member can introduce a separator after the last required
+  // member; that punctuation is not a change to the required structure.
+  const optional = new Set(directOptionalProperties(declaration));
+  const keep = (member: ts.TypeElement) => !optional.has(member as ts.PropertySignature);
+  let stripped: ts.Node;
+  if (ts.isInterfaceDeclaration(declaration)) {
+    stripped = ts.factory.updateInterfaceDeclaration(
+      declaration, declaration.modifiers, declaration.name, declaration.typeParameters,
+      declaration.heritageClauses, declaration.members.filter(keep),
+    );
+  } else if (ts.isTypeAliasDeclaration(declaration) && ts.isTypeLiteralNode(declaration.type)) {
+    stripped = ts.factory.updateTypeAliasDeclaration(
+      declaration, declaration.modifiers, declaration.name, declaration.typeParameters,
+      ts.factory.updateTypeLiteralNode(declaration.type, declaration.type.members.filter(keep)),
+    );
+  } else {
+    return declarationSurfaceText(declaration);
+  }
+  return ts.createPrinter({ removeComments: true }).printNode(
+    ts.EmitHint.Unspecified, stripped, declaration.getSourceFile(),
+  );
 }
 
 function optionalAdditionModel(
@@ -662,9 +686,11 @@ function declarationOptionalAdditionModel(
   if (declarations.length === 0) {
     throw new Error(`public symbol has no declaration: ${symbol.getName()}`);
   }
+  // Normalize separators only on the exported declaration itself. Preserve the
+  // conservative proof for dependencies (including closed function results).
   const parts = [...new Set(declarations.map((declaration) =>
     ownsStrippableOptionals(declaration)
-      ? stripDirectOptionalProperties(declaration)
+      ? stripDirectOptionalProperties(declaration, true)
       : declarationSurfaceText(declaration)))];
   return optionalAdditionModel(
     checker,
