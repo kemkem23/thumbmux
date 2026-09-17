@@ -19,7 +19,8 @@
     "build:git-dist": "bun run build:packages && bun run ./scripts/rewrite-git-dist-imports.ts",
     "smoke:git-dist": "./scripts/smoke-git-dist.sh",
     "prepare": "bun run build:packages",
-    "contract": "bun ./scripts/contract-check.ts"
+    "contract": "bun ./scripts/contract-check.ts",
+    "test:contract": "bun test --config=./scripts/bunfig.contract.toml ./scripts/contract-check.test.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

@@ -1,0 +1,4 @@
+[test]
+# Only for scripts/contract-check.test.ts: declaration checks in temporary
+# fixtures, with no tmux, server, or browser execution. Real suites must retain
+# their isolation guard and use the designated sandbox runner.
