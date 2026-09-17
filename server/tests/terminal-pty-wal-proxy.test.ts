@@ -140,13 +140,13 @@ describe("direct child PTY durable WAL proxy", () => {
       "spec.loader.exec_module(module)",
       "print(module.verify_running_proxy_asset())",
     ].join("\n");
-    const verified = spawnSync("python3", ["-c", probe, asset], {
+    const verified = spawnSync("python3", ["-B", "-c", probe, asset], {
       env: launch.env,
       encoding: "utf8",
     });
     expect({ status: verified.status, stdout: verified.stdout.trim(), stderr: verified.stderr })
       .toEqual({ status: 0, stdout: expected, stderr: "" });
-    const rejected = spawnSync("python3", ["-c", probe, asset], {
+    const rejected = spawnSync("python3", ["-B", "-c", probe, asset], {
       env: {
         ...launch.env,
         [TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]: "0".repeat(64),
@@ -190,7 +190,7 @@ describe("direct child PTY durable WAL proxy", () => {
       "try: proxy.append_output_and_display(payload)\nfinally:\n module.os.write=original_write\n module.select.select=original_select",
       "print(json.dumps({'writerCalls':writer.calls,'accepted':accepted.hex(),'attempts':attempts,'waits':waits,'walSequence':proxy.wal_sequence,'walNextOffset':proxy.wal_next_offset,'deliveredSequence':proxy.delivered_sequence,'deliveredNextOffset':proxy.delivered_next_offset}))",
     ].join("\n");
-    const result = spawnSync("python3", ["-c", probe, scriptPath], {
+    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath], {
       env: pythonProbeEnv(),
       encoding: "utf8",
     });
@@ -236,7 +236,7 @@ describe("direct child PTY durable WAL proxy", () => {
       "module.ensure_durable_directory(sys.argv[2])",
       "print(json.dumps(calls))",
     ].join("\n");
-    const result = spawnSync("python3", ["-c", probe, scriptPath, target], {
+    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, target], {
       env: pythonProbeEnv(),
       encoding: "utf8",
     });
@@ -384,7 +384,7 @@ describe("direct child PTY durable WAL proxy", () => {
       "print('READY',flush=True)",
       "time.sleep(30)",
     ].join("\n");
-    const holder = spawn("python3", ["-u", "-c", holderCode, scriptPath, directory, instanceId], {
+    const holder = spawn("python3", ["-B", "-u", "-c", holderCode, scriptPath, directory, instanceId], {
       env: pythonProbeEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -478,7 +478,7 @@ describe("direct child PTY durable WAL proxy", () => {
       "try:\n module.WalWriter(path,directory)\nexcept module.WalCorruption as error:\n checksum_rejected='checksum mismatch' in str(error)",
       "print(json.dumps({'sourceBytes':source_bytes,'peakBytes':peak_bytes,'active':existing.active,'sequence':existing.sequence,'validBytes':existing.valid_bytes,'nextOffset':next_offset,'lastAt':last_at,'identity':existing.identity,'geometry':existing.geometry,'pending':existing.pending_resize,'checksumRejected':checksum_rejected,'corruptSize':os.stat(path).st_size}))",
     ].join("\n");
-    const result = spawnSync("python3", ["-c", probe, scriptPath, directory], {
+    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, directory], {
       env: pythonProbeEnv(),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
