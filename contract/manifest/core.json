@@ -266,7 +266,7 @@
   {
     "name": "JournalRecordV1",
     "kind": "type",
-    "signature": "bf38d09877d71b78e67497dcc82855571205c264d305dfd045b98c94bba94675",
+    "signature": "7a738f0a52df6acc6241e78d542d266c6048833ac955adb2e8a221a8cf278a85",
     "tier": "F"
   },
   {
@@ -344,13 +344,13 @@
   {
     "name": "MuxDeltaFrame",
     "kind": "type",
-    "signature": "4cc36154974066e62a3cf45f0fa6bfc864fa71681932691e6607566ffe7b1b8b",
+    "signature": "694b9236352104401b3df366b97c7cc8022279312db7a31f6b35100dba79e44e",
     "tier": "F"
   },
   {
     "name": "MuxFullOutputFrame",
     "kind": "type",
-    "signature": "4e511c4f929c57d2f6f126bc606a03836812396b929e10eda860f09fe57ad362",
+    "signature": "8ea86ab9d76a60a0b08fed4169c940cd72adcc21ee98b283090119306ce8cca1",
     "tier": "F"
   },
   {
@@ -368,7 +368,7 @@
   {
     "name": "MuxOutputFrame",
     "kind": "type",
-    "signature": "f034bf054ba4e56c7d8f770cf021cbc6b66ab10db7ba3ab328ab1b126604aae8",
+    "signature": "f080db2b40b474b135c26d9d05b6f89896260b125534cc99e6a6e5583613e544",
     "tier": "F"
   },
   {
@@ -380,7 +380,7 @@
   {
     "name": "MuxPaneScreen",
     "kind": "type",
-    "signature": "574ca0e3a7a8006bc554896e575bdb37b5b8a9da2255b8ffa73d2f8a78bd42fa",
+    "signature": "2d96f3581d8171919af29539d859a77b5f7df28c9c4f5a226cd7689d3a816c50",
     "tier": "F"
   },
   {
@@ -398,13 +398,13 @@
   {
     "name": "MuxServerFrame",
     "kind": "type",
-    "signature": "e9d1de7871a65f46943e4d02ca7c8976ddd65094442ea4eefdfc4ba8e805733e",
+    "signature": "59b894802077376e1007cd778a58dc33a969ce121b7bb75270d04798d25c5130",
     "tier": "S"
   },
   {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "e52d952ea95638df3fc36c108a8c8939809f496e06b51a6c7106d0118e3d0cea",
+    "signature": "42641b39793fbed6252f9ddf941c3db2ac50d4064999344f7c2280fb2057f031",
     "tier": "F"
   },
   {
@@ -416,7 +416,7 @@
   {
     "name": "ParsedReplayRecord",
     "kind": "type",
-    "signature": "06f151fc700a6b3f1d32257ad81059d723dc307401bbbaf190687560549cd1e7",
+    "signature": "44dfd05a3cc9b9c7b146ab6dc54511a7a9d0c93b23e862d0649e6f46f5a7e3c4",
     "tier": "F"
   },
   {
@@ -446,19 +446,19 @@
   {
     "name": "ReplayFullCheckpoint",
     "kind": "type",
-    "signature": "63c257e294f37d579a4987323c25f30d315fe073226a59f7efb47d6da989a7c4",
+    "signature": "5ad095b44c130bc1bf96304ec5c0b281905c4af80319c359abb1e354a49abf62",
     "tier": "F"
   },
   {
     "name": "ReplayJournal",
     "kind": "value",
-    "signature": "a939fb0fd4526d4a0800e3d1409efe8a6fc0a16fc2bb82f58a74cd60d1c0be01",
+    "signature": "e757ec17e78074676daf6e69ead05d7684474e394ae5b9b0208a9ec975793921",
     "tier": "F"
   },
   {
     "name": "ReplayLookup",
     "kind": "type",
-    "signature": "91baa3a40d32087dc14d2ec0ba7ff376429533cdbe7b6671ff55920430f1309f",
+    "signature": "be8caba201c6e4898108ef5e3d71723b46e10128456dc0a0cbc281d4c8ce8f9c",
     "tier": "F"
   },
   {
@@ -728,7 +728,7 @@
   {
     "name": "chooseMuxOutputFrame",
     "kind": "value",
-    "signature": "08a0b1eda9f1db1b8ee965c98bb5fb1d9e408649df88698d7f15f0b26ac5fec2",
+    "signature": "eea556e814d9ec1ac2ddbea8db474a4db2ee99608f1df5ec6aac771f9db758fe",
     "tier": "F"
   },
   {
@@ -782,7 +782,7 @@
   {
     "name": "createMuxDeltaFrame",
     "kind": "value",
-    "signature": "76210d3ed16b2f321ea10a2cc826ea72b1a52862270b9845d0776d6be2924b57",
+    "signature": "df51ed890a83392d1fbb18794cf781595cc4264ad8208ade68d9588c303f68a8",
     "tier": "F"
   },
   {
@@ -1004,7 +1004,7 @@
   {
     "name": "parseReplayJournal",
     "kind": "value",
-    "signature": "adf52be345cf1c314384eb3e2020d4a749d5ac5e8adce417ecb9f79c3809600e",
+    "signature": "3bd9442b0b2fb501f832aee67b67e96c057d7006a2f22de6bc730e047558f010",
     "tier": "F"
   },
   {
@@ -1100,7 +1100,7 @@
   {
     "name": "serializedMuxFrameSize",
     "kind": "value",
-    "signature": "fde8db54a15f70fc633b863b764756a9e14424936fb81f2e76df7eb73a8f957e",
+    "signature": "53a16fc39691eb26eee2a77513c4d255e515177ad5275cb25866fd4ec80ef932",
     "tier": "F"
   },
   {
@@ -1130,7 +1130,7 @@
   {
     "name": "shouldUseMuxDelta",
     "kind": "value",
-    "signature": "e989f5169f3d6a20582116520d1b659856f037389ff8bbd6730042ec92920645",
+    "signature": "2115705ab0ed3db096a7782de77272dad34dd87d586a5c0d7bab13377face174",
     "tier": "F"
   },
   {
@@ -1178,7 +1178,7 @@
   {
     "name": "validateMuxDeltaFrame",
     "kind": "value",
-    "signature": "8787a527fe959fb636ff1a2088ec8c2e7126c56633d710c6099802116451c43b",
+    "signature": "8a1737a74f3d2e802a6cfb0fd26c65860bc304e4df933f6b90a721e99e43f48c",
     "tier": "F"
   },
   {
