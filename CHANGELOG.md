@@ -1,7 +1,42 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.1-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.2-dist`.
+
+## v0.20.2 — 2026-09-17
+
+Patch. No new named exports, no signature removals, no migration. Optional fields and options are additive. A consumer still on `v0.20.1-dist` keeps the old submit and prompt-scan behaviour until it bumps the pin.
+
+### Fixed
+
+- **Delayed second Enter now covers Claude and Grok, not only Codex.** `submitPlan()` used a single `EXTRA_ENTER_AGENT = 'codex'` constant. Agent TUIs other than Codex still swallow the first Enter while ingesting paste. `isExtraEnterAgent()` (`6173c259`) treats `codex`, `claude`, and `grok` the same. `generic` is unchanged (one Enter). Hosts that already mapped session prefixes onto `SubmitAgent` get the extra step without a host-side rewrite.
+- **A 1s settle step is no longer skipped after a previous step already waited.** `deliverHostSubmission` in the app shell used to wait only before the first delayed step. The extra Enter (`delayBeforeMs >= 1000`) is the one that must actually land. (`be70010a`)
+- **Composer Enter during IME candidate selection is not SEND, but a lingering keyCode 229 after composition is allowed to submit.** The v0.20.1 path treated every `keyCode === 229` as "still composing". Android/mobile virtual keyboards leave 229 on later keys. (`e35acbab`)
+- **Recalled multi-line prompts keep real line breaks when the host opts in.** `extractRecentPrompts` / `extractRecentPromptsFromPane` gain `wrapJoined?: boolean` (default `false`, old collapse unchanged). Dist `v0.20.1` has **zero** `wrapJoined` in `git-dist/core/index.js`; the source accepts the opt-in in `prompt-scan.ts`. (`45271100`)
+- **Verified stale preview frames stay visible when current health is `unavailable`.** `MuxPaneScreen` carries optional `previewState` / `previewHasFrame` / `previewLastSuccessfulAt`. SessionThumb prefers `previewHasFrame` over inferring "no frame" from the status string. Hosts that still ship `patches/thumbmux-preview-status.patch` against `#7b4ff61` already have this in the installed svelte file; the patch is not in the unpatched dist tag. (`be3f4b4b` and related thumbnail commits)
+
+### Also inside this tag (server/WAL — not required for the submit-pin claim)
+
+Since `v0.20.1`, this split also includes recorder/WAL pause-gap records,
+unclean resume labels, overlapping recovery identity, fatal health-write alerts,
+and related recovery, limits, worker-wire and one-path oracle tests.
+
+- **SQLite history packaging:** the generated dist now exports the existing
+  `thumbmux/server/sqlite-history` build entry. This fixes
+  `ERR_PACKAGE_PATH_NOT_EXPORTED` in v0.20.1-dist; no new barrel name is added.
+- **SQLite history import:** `lifecycle-binding.json` is accepted as host sidecar
+  metadata by both import and sealed-oracle rehearsal. Other orphan JSON remains
+  rejected. Rehearsal and mutation tests cover this boundary.
+- **Preview timestamp formatting:** `SessionGrid` forwards the optional
+  `formatPreviewLastSuccessfulAt` callback to every thumbnail layout.
+- **Test isolation:** the package preload refuses unsafe host execution before
+  test bodies run; source tests require the supported sandbox or hosted CI.
+- **Release checks:** dist-hygiene and subpath tests cover the SQLite export;
+  the core contract signatures follow the additive prompt-scan options.
+
+Consumer pins move only after `v0.20.2-dist` exists, in a separate host change.
+The source includes the preview-status fix, so that later host change can drop
+its patch against the old dist.
 
 ## v0.20.1 — 2026-09-10
 
