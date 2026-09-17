@@ -233,7 +233,10 @@ describe("dense grid card metadata", () => {
       expect(preview.contains(openPreview)).toBe(true);
       expect(preview.contains(thumb)).toBe(true);
       expect(openPreview.previousElementSibling).toBe(thumb);
-      expect(thumb.hasAttribute("inert")).toBe(true);
+      const inertPreview = thumb.querySelector<HTMLElement>('.preview-content')!;
+      expect(inertPreview.hasAttribute("inert")).toBe(true);
+      expect(inertPreview.getAttribute("aria-hidden")).toBe("true");
+      expect(openPreview.contains(inertPreview)).toBe(false);
       expect(kill.textContent).toBe("×");
       expect(head.contains(kill)).toBe(true);
       expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
