@@ -347,13 +347,26 @@ function parsePipehistEpochV1(value: unknown, identity: PipehistIdentityV1): Pip
   if (value.state === "clean" ? closed === null : closed !== null) {
     throw new Error(value.state === "clean" ? "clean epoch requires a closed boundary" : "only a clean epoch may claim a closed boundary");
   }
+  const epochId = id(value.epochId, "epoch.epochId");
+  const ordinal = safeInteger(value.ordinal, "epoch.ordinal");
+  const previousEpochId = value.previousEpochId === null
+    ? null
+    : id(value.previousEpochId, "epoch.previousEpochId");
+  const physical = parsePipehistPhysicalV1(value.physical, identity, "epoch.physical");
+  if (physical.generation !== epochId) throw new Error("epoch.epochId must match physical.generation");
+  if ((ordinal === 0) !== (previousEpochId === null)) {
+    throw new Error("epoch.previousEpochId must be null exactly at ordinal zero");
+  }
+  if (uncleanPredecessor !== null && uncleanPredecessor.epochId !== previousEpochId) {
+    throw new Error("epoch.uncleanPredecessor must identify previousEpochId");
+  }
   return {
     schema: "pipehist.c.v1/epoch",
-    epochId: id(value.epochId, "epoch.epochId"),
-    ordinal: safeInteger(value.ordinal, "epoch.ordinal"),
-    previousEpochId: value.previousEpochId === null ? null : id(value.previousEpochId, "epoch.previousEpochId"),
+    epochId,
+    ordinal,
+    previousEpochId,
     identity: epochIdentity,
-    physical: parsePipehistPhysicalV1(value.physical, identity, "epoch.physical"),
+    physical,
     state: value.state as PipehistEpochV1["state"],
     opened,
     closed,
@@ -380,6 +393,9 @@ export function parsePipehistHealthV1(value: unknown): PipehistHealthV1 {
   if (typeof value.state !== "string" || !states.has(value.state)) throw new Error("state is invalid");
   if (typeof value.reason !== "string" || !reasons.has(value.reason)) throw new Error("reason is invalid");
   const proxy = value.proxy === null ? null : parsePipehistProcessV1(value.proxy, "proxy");
+  if (proxy && epoch && !samePipehistProcess(epoch.physical.proxy, proxy)) {
+    throw new Error("health proxy does not match epoch physical identity");
+  }
   let progress: PipehistHealthV1["progress"] = null;
   if (value.progress !== null) {
     if (!isObject(value.progress)) throw new Error("progress must be an object or null");
@@ -413,9 +429,6 @@ export function parsePipehistHealthV1(value: unknown): PipehistHealthV1 {
   if (value.state === "ready") {
     if (value.reason !== "none" || !epoch || epoch.state !== "open" || !proxy || !progress) {
       throw new Error("ready health requires an open epoch, process, progress and reason none");
-    }
-    if (!samePipehistProcess(epoch.physical.proxy, proxy)) {
-      throw new Error("ready health proxy does not match epoch physical identity");
     }
     if (progress.replaySequence !== progress.walSequence || progress.replayNextOffset !== progress.walNextOffset) {
       throw new Error("ready health requires replay at the durable WAL boundary");
