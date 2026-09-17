@@ -131,6 +131,7 @@ describe("direct child PTY durable WAL proxy", () => {
     const asset = launch.args[1]!;
     const expected = createHash("sha256").update(readFileSync(asset)).digest("hex");
     expect(launch.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]).toBe(expected);
+    expect(launch.env.PYTHONDONTWRITEBYTECODE).toBe("1");
     const probe = [
       "import importlib.util,sys",
       "spec=importlib.util.spec_from_file_location('thumbmux_asset',sys.argv[1])",
@@ -140,16 +141,16 @@ describe("direct child PTY durable WAL proxy", () => {
       "print(module.verify_running_proxy_asset())",
     ].join("\n");
     const verified = spawnSync("python3", ["-c", probe, asset], {
-      env: pythonProbeEnv(launch.env),
+      env: launch.env,
       encoding: "utf8",
     });
     expect({ status: verified.status, stdout: verified.stdout.trim(), stderr: verified.stderr })
       .toEqual({ status: 0, stdout: expected, stderr: "" });
     const rejected = spawnSync("python3", ["-c", probe, asset], {
-      env: pythonProbeEnv({
+      env: {
         ...launch.env,
         [TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]: "0".repeat(64),
-      }),
+      },
       encoding: "utf8",
     });
     expect(rejected.status).not.toBe(0);
