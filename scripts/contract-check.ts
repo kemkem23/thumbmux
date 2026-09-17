@@ -1230,6 +1230,34 @@ const V01816_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Additive capture-boundary metadata reviewed for 0.20.1 -> 0.20.2.
+ * `HistoryArchiveLike.ingestSnapshot(..., opts)` gained only the optional
+ * `captureStartLine?: number` input. Existing hosts can keep implementing the
+ * old method and existing callers can keep omitting the field.
+ *
+ * The generic optional-member proof deliberately sees only direct optional
+ * properties. This one sits in an inline parameter object, then propagates
+ * through classes that implement HistoryArchiveLike and through
+ * Partial<TmuxWsMuxOptions> holders. Teaching the generic proof variance for
+ * nested input and output objects under release pressure would be broader than
+ * the reviewed change, so these rows pin the exact old/new compatibility
+ * digests instead. Frozen consumers still have to compile, build, and run
+ * against the packed artifact in the public verify-gate before the tag is cut.
+ */
+const V0202_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:AppRoutes:09b178774240fce179aa289da7faae4e29386684fc82f2525794ab8653d2144f:fe42014191714e58106a980ce7be95346ef9c3475a9baa670328606a983ee0b2",
+  "server:AppRoutesOptions:79beb2a1182f9534f84269991d3ddf8632e70d2f4de2d25da109ec17beeb8924:77425c95e25bdfbf6d7135febdf15becb3c28e0c0e0e880b5a924ff013f2a053",
+  "server:createAppRoutes:a5edb190a8bf573591b331f79575c6def2b7062981a4babe54184897db54f8c9:f3542c4ae9ee4a2ed20e740de1d78eedce04a95419aa39e191d921be04ae82e5",
+  "server:DurableHistoryArchive:70e25ca5e888960798469ee6a6a964d25716bc244fdb9664138e9e533680d01d:95aa094f5730d71a4f49bf999f7f87656c8181c2745f6d2bbf91845147e5bc65",
+  "server:FileHistoryArchive:8779b4916cd1eac29c78b373855f10408572b950d3fcf80406d2442359cc6cf9:6d20443d28098be57f4e0ff4d1d900f3e08828d570592bf7208da3a99eedf136",
+  "server:HistoryArchiveLike:a9f287b16a5ba85604b061a9d0f6bf0214bc8c42cb53b9c3b477d7de2053f16d:ff22685f084739d852203d9de89ab34dd67e655486bd7a549f546525da3cc0e8",
+  "server:RetentionLane:f6fd7975602e2443ed33df19df35e28bf25726a04bdd074e93b86678ac3d2605:839f4c7629ad3284a7a91a1696433bcbbe304e3cc2953ce520fb8f35b209affd",
+  "server:RetentionLaneOptions:d95c69484d559f4b5138d3d4b54c37a86a671cafca672760c2914aa10d3bf58a:97ec7a7823c86957c629fe1a512fbc0992cb3bd0726fa2a2f463b1c619e06d99",
+  "server:TmuxWsMux:160438d0bacb001d60c85097bb54d5d7d1614dbdf6962d61a0d755ea5fae26f4:ccce251f320b964b0ba227756d8b5fcbd5e3ef2c61b2382d1cc49927b3fd7821",
+  "server:TmuxWsMuxOptions:dbceac83e684da3dbe845be4cc952a677e10075e7141cdf1ade77077e74f1b9f:c773fec3a455782ce9dc482157303fa0a341e29cb344ec899308951ea5f8adc1",
+]);
+
+/**
  * `TmuxDriver.getHistoryLimit` gaining an optional `session` parameter,
  * reviewed for 0.18.17 -> 0.19.0. `history_limit` is frozen on a pane at
  * birth, so an untargeted read resolves to whichever session tmux created
@@ -1331,6 +1359,19 @@ function isV01816PatchException(
   if (baselineVersion !== "0.18.13" || currentVersion !== "0.18.16") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V01816_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV0202PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.20.1" || currentVersion !== "0.20.2") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0202_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1489,7 +1530,7 @@ export function evaluateBaseline(
     if (
       (boundary === "minor" || boundary === "patch" || boundary === "same")
       && !kindChanged
-      && (previous.tier === "F" || previous.tier === "S")
+      && (previous.tier === "F" || previous.tier === "S" || previous.tier === "X")
       && isMinorOptionalAddition(previousLive, nextLive)
     ) {
       continue;
@@ -1540,6 +1581,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV01816PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0202PatchException(
           baselineVersion,
           currentVersion,
           subpath,

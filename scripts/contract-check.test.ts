@@ -165,6 +165,39 @@ describe("contract surface policy", () => {
       .not.toContainEqual(["baseline-patch-change", "experimental"]);
   });
 
+  test("an X optional addition may ride a patch, but an X rewrite still cannot", () => {
+    const baseline = fixture("0.8.4");
+    writeCoreDeclarations(baseline, [
+      "export declare function frozen(input: string): string;",
+      "export declare function stabilizing(input: number): number;",
+      "export interface experimental { required: string }",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(baseline);
+
+    const additive = fixture("0.8.5");
+    writeCoreDeclarations(additive, [
+      "export declare function frozen(input: string): string;",
+      "export declare function stabilizing(input: number): number;",
+      "export interface experimental { required: string; added?: boolean }",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(additive);
+    expect(runFixture(additive, baseline).errors.map(({ code, name }) => [code, name]))
+      .not.toContainEqual(["baseline-patch-change", "experimental"]);
+
+    const rewritten = fixture("0.8.5");
+    writeCoreDeclarations(rewritten, [
+      "export declare function frozen(input: string): string;",
+      "export declare function stabilizing(input: number): number;",
+      "export interface experimental { required: number }",
+      "export declare const legacy: string;",
+    ]);
+    writeBaselineManifest(rewritten);
+    expect(runFixture(rewritten, baseline).errors.map(({ code, name }) => [code, name]))
+      .toContainEqual(["baseline-patch-change", "experimental"]);
+  });
+
   test("an S route cannot be replaced at a minor boundary", () => {
     const baseline = fixture("0.8.4");
     writeBaselineManifest(baseline);
