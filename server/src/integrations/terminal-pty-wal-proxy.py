@@ -1409,11 +1409,13 @@ class Proxy:
             state, reason = "unknown", "source-lost"
         elif self.state == "ended" and self.closed_boundary is not None:
             state = "ended"
+        elif self.state in ("resizing", "ending"):
+            state, reason = "blocked", "sync-pending"
         elif replay_error is not None:
             state, reason = "unknown", "unreadable"
         elif self.received_output_bytes > self.durable_output_bytes:
             state, reason = "blocked", "sync-pending"
-        elif self.opened_boundary is not None and replay_sequence == self.wal_sequence and replay_offset == self.wal_next_offset:
+        elif self.state == "ready" and self.opened_boundary is not None and replay_sequence == self.wal_sequence and replay_offset == self.wal_next_offset:
             state = "ready"
         elif self.opened_boundary is not None:
             state, reason = "blocked", "replay-lag"
