@@ -155,7 +155,7 @@
       } else if (previewState === 'live') {
         lastSuccessfulAt = Date.now();
       }
-      if (type !== 'cursor') content = data;
+      content = data;
     }, { tail });
     return () => {
       active = false;
