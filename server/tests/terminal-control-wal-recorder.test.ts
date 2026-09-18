@@ -117,6 +117,119 @@ async function eventually(predicate: () => boolean, label: string): Promise<void
   throw new Error(`timed out waiting for ${label}`);
 }
 
+const GAPHOLE_RECORD_BYTES = 512;
+
+function gapholeRecord(epoch: string, index: number): Buffer {
+  const prefix = `PB1|${epoch}|${String(index).padStart(8, "0")}|`;
+  const suffix = `|${String(index).padStart(8, "0")}:END\n`;
+  const fillLength = GAPHOLE_RECORD_BYTES - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+  return Buffer.from(prefix + String(index % 10).repeat(fillLength) + suffix, "ascii");
+}
+
+function gapholeSource(epoch: string, count: number): Buffer {
+  return Buffer.concat(Array.from({ length: count }, (_, index) => gapholeRecord(epoch, index)));
+}
+
+function encodeTmuxControlOutput(paneId: string, bytes: Uint8Array): string {
+  let encoded = `%output ${paneId} `;
+  for (const byte of bytes) {
+    if (byte === 0x5c) encoded += "\\\\";
+    else if (byte < 0x20 || byte >= 0x7f) encoded += `\\${byte.toString(8).padStart(3, "0")}`;
+    else encoded += String.fromCharCode(byte);
+  }
+  return `${encoded}\n`;
+}
+
+function gapholeMissingRanges(source: Uint8Array, observed: Uint8Array): Array<{ start: number; end: number }> {
+  const left = Buffer.from(source);
+  const right = Buffer.from(observed);
+  const missing: Array<{ start: number; end: number }> = [];
+  let sourceOffset = 0;
+  let observedOffset = 0;
+  while (sourceOffset < left.length && observedOffset < right.length) {
+    if (left[sourceOffset] === right[observedOffset]) {
+      sourceOffset += 1;
+      observedOffset += 1;
+      continue;
+    }
+    const anchor = right.subarray(observedOffset, Math.min(right.length, observedOffset + 32));
+    const next = anchor.byteLength >= 8 ? left.indexOf(anchor, sourceOffset + 1) : -1;
+    if (next >= 0) {
+      missing.push({ start: sourceOffset, end: next });
+      sourceOffset = next;
+      continue;
+    }
+    const marker = right.subarray(observedOffset).toString("latin1").match(/^PB1\|[^|]+\|\d{8}\|/);
+    observedOffset += marker ? GAPHOLE_RECORD_BYTES : 1;
+  }
+  if (sourceOffset < left.length) missing.push({ start: sourceOffset, end: left.length });
+  return missing;
+}
+
+function gapholeCoverage(
+  records: ReturnType<typeof readOutputWal> extends Iterable<infer R> ? R[] : never,
+  source: Buffer,
+): Array<{ start: number; end: number }> {
+  const segments: Buffer[] = [];
+  let current: Buffer[] = [];
+  let gaps = 0;
+  for (const record of records) {
+    if (record.kind === "output") current.push(Buffer.from(record.payload));
+    if (record.kind === "gap") {
+      segments.push(Buffer.concat(current));
+      current = [];
+      gaps += 1;
+    }
+  }
+  segments.push(Buffer.concat(current));
+  if (gaps === 0) return [];
+  const positions: Array<{ start: number; end: number } | null> = [];
+  let cursor = 0;
+  for (const segment of segments) {
+    if (segment.byteLength === 0) {
+      positions.push(null);
+      continue;
+    }
+    const anchor = segment.subarray(0, Math.min(segment.byteLength, 2_048));
+    const start = source.indexOf(anchor, cursor);
+    if (start < 0) throw new Error("cannot map WAL segment into source");
+    positions.push({ start, end: start + segment.byteLength });
+    cursor = start + segment.byteLength;
+  }
+  return Array.from({ length: gaps }, (_, index) => {
+    let start = 0;
+    let end = source.byteLength;
+    for (let probe = index; probe >= 0; probe -= 1) {
+      if (positions[probe]) { start = positions[probe]!.end; break; }
+    }
+    for (let probe = index + 1; probe < positions.length; probe += 1) {
+      if (positions[probe]) { end = positions[probe]!.start; break; }
+    }
+    return { start, end };
+  });
+}
+
+function gapholeUncovered(
+  missing: Array<{ start: number; end: number }>,
+  coverage: Array<{ start: number; end: number }>,
+): number {
+  let total = 0;
+  for (const range of missing) {
+    let spans = [{ start: range.start, end: range.end }];
+    for (const cover of coverage) {
+      spans = spans.flatMap((span) => {
+        if (cover.end <= span.start || cover.start >= span.end) return [span];
+        return [
+          ...(cover.start > span.start ? [{ start: span.start, end: cover.start }] : []),
+          ...(cover.end < span.end ? [{ start: cover.end, end: span.end }] : []),
+        ];
+      });
+    }
+    total += spans.reduce((sum, span) => sum + span.end - span.start, 0);
+  }
+  return total;
+}
+
 afterEach(async () => {
   for (const recorder of recorders.splice(0).reverse()) {
     if (recorder.status.state !== "disconnected") await recorder.stop();
@@ -335,6 +448,27 @@ describe("ordered tmux control WAL recorder", () => {
     }).materialize();
     expect(replay.complete).toBe(true);
     expect(replay.ended).toBe(false);
+  });
+
+  test("marks every pause-resume hole so greedy missing bytes stay inside the gap", async () => {
+    const epoch = "gaphole1";
+    const source = gapholeSource(epoch, 40);
+    const pre = source.subarray(0, 10 * GAPHOLE_RECORD_BYTES + 100);
+    const post = source.subarray(20 * GAPHOLE_RECORD_BYTES + 26 + 80);
+    const { directory, fake, recorder } = makeRecorder();
+    await ready(recorder, fake);
+    fake.stdout.write(encodeTmuxControlOutput("%42", pre));
+    fake.stdout.write("%pause %42\n%continue %42\n");
+    fake.stdout.write(encodeTmuxControlOutput("%42", post));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.some((record) => record.kind === "gap")).toBe(true);
+    const durable = Buffer.concat(
+      records.filter((record) => record.kind === "output").map((record) => Buffer.from(record.payload)),
+    );
+    const uncovered = gapholeUncovered(gapholeMissingRanges(source, durable), gapholeCoverage(records, source));
+    expect(uncovered).toBe(0);
   });
 });
 
