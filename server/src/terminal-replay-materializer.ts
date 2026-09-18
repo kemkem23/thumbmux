@@ -37,6 +37,12 @@ import {
   type OutputWalTailCursor,
 } from "./output-wal";
 
+const GAP_REASON_MESSAGES = {
+  "tmux-pause": "การส่งข้อมูลถูกพักชั่วคราว ช่วงนั้นอาจเก็บไม่ครบ",
+  "recorder-failure": "ระบบบันทึกประวัติขัดข้อง ช่วงนั้นอาจเก็บไม่ครบ",
+  "unclean-source": "รอบก่อนจบโดยไม่ได้ยืนยันว่าเก็บประวัติครบ ช่วงท้ายอาจเก็บไม่ครบ",
+} satisfies Record<ReturnType<typeof parseOutputWalGapPayload>["reason"], string>;
+
 /**
  * Durable raw-WAL -> terminal-grid materializer.
  *
@@ -52,7 +58,7 @@ import {
  * - lifecycle: `{ event: "start" | "resume" | "end", identity, geometry }`
  * - resize: `{ phase: "prepare" | "commit" | "abort", changeId, from, to,
  *   reason? }`
- * - checkpoint: `{ event: "barrier", requestId }` (ordering barrier only)
+ * - checkpoint: barrier, or version 1 source-tracking/source-detached (no screen changes)
  *
  * A resize is applied only after its matching commit.  Output between prepare
  * and commit/abort is rejected.  A WAL ending at prepare is materialized only
@@ -2005,7 +2011,7 @@ class ReplayEngine {
             this.tmux.discardUnseenAndReset(this.geometry!);
           }
           this.hasOutputInGeneration = false;
-          onHistory(Buffer.from(`[ประวัติขาดช่วง: เก็บข้อมูลระหว่าง tmux หยุดส่งไม่ได้ครบ; gap ${JSON.stringify(gap.gapId)}]\n`));
+          onHistory(Buffer.from(`[ประวัติขาดช่วง: ${GAP_REASON_MESSAGES[gap.reason]}]\n`));
           break;
         }
         case "recovery": {
@@ -2019,7 +2025,7 @@ class ReplayEngine {
           // Keep it as a labelled archive excerpt, never feed it into live VT
           // state or replace geometry/output received during capture.
           this.tmux.drainHistory(onHistory);
-          onHistory(Buffer.from(`[ภาพที่กู้จาก ring (recovered-from-ring); gap ${JSON.stringify(recovery.gapId)}; สถานะ: ${recovery.status}; อาจซ้ำกับข้อมูลสดและไม่ยืนยันว่าครบ]\n`));
+          onHistory(Buffer.from(`[ภาพที่กู้จาก ring (recovered-from-ring); สถานะ: ${recovery.status}; อาจซ้ำกับข้อมูลสดและไม่ยืนยันว่าครบ]\n`));
           if (recovery.status !== "failed") {
             const rows = stripVTControlCharacters(Buffer.from(recovery.recoveredBytesBase64, "base64").toString("utf8"))
               .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
@@ -2029,9 +2035,20 @@ class ReplayEngine {
           this.pendingGaps.delete(recovery.gapId);
           break;
         }
-        case "checkpoint":
-          parseBarrier(parseOutputWalJson(record));
+        case "checkpoint": {
+          const value = parseOutputWalJson<unknown>(record);
+          if (isObject(value) && (value.event === "source-tracking" || value.event === "source-detached")) {
+            this.requireActive(record);
+            const keys = value.event === "source-tracking" ? "event,version" : "event,lastDurableSeq,version";
+            if (value.version !== 1 || Object.keys(value).sort().join(",") !== keys
+              || (value.event === "source-detached" && value.lastDurableSeq !== (record.sequence - 1n).toString())) {
+              throw new Error("invalid source checkpoint");
+            }
+          } else {
+            parseBarrier(value);
+          }
           break;
+        }
         default: {
           const exhaustive: never = record.kind;
           throw new Error(`unknown WAL record kind ${String(exhaustive)}`);

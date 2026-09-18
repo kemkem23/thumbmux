@@ -788,13 +788,13 @@
   {
     "name": "SessionGrid",
     "kind": "component",
-    "signature": "98a1283e846055a2a282af21b4ed2e8781308f31aa0b9e79938d853309f76de6",
+    "signature": "4dc71c7c333065c5706950b751139a6107c9c333acefb73109549a2dadcf0b38",
     "tier": "F"
   },
   {
     "name": "SessionGridProps",
     "kind": "type",
-    "signature": "aea3f2e9b9c3955a423ffc404f074cc30351d6ed343e8ecdd9ef0a746246cb53",
+    "signature": "c7bc9493d1bcb731aa11fd0df69c8222f287617ab76bf2abd527a7682766c1de",
     "tier": "F"
   },
   {
@@ -806,7 +806,7 @@
   {
     "name": "SessionThumb",
     "kind": "component",
-    "signature": "c9d8a0caf26014b04cd17d2685e419b78e4ef45e2bdfb553af7f83f1508b71af",
+    "signature": "450cc1bb357f18f168dbdcdb59e7f52e14638ad04078eaee5720b4352ca6e2c9",
     "tier": "F"
   },
   {
@@ -896,13 +896,13 @@
   {
     "name": "tmuxMux",
     "kind": "value",
-    "signature": "2e1934d928750030bd5c94808be1ed05a131bf45e9991da43610083aa45f6dbb",
+    "signature": "e48edf15296883274f2856a313c6ef84e8add75364cd40e036b423129f4ca8f6",
     "tier": "F"
   },
   {
     "name": "TmuxMux",
     "kind": "value",
-    "signature": "c0d2e266a8e89052be3a569055d5f892df3a57c254d804b45b3449166af77871",
+    "signature": "e0eb464a1a7964f0a13bbae0e3d82e4b305e0461b86f0798b4e908adb5c0b4cc",
     "tier": "F"
   },
   {

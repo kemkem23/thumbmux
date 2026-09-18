@@ -32,7 +32,8 @@ import tty
 import uuid
 import zlib
 from dataclasses import dataclass
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 
 CONFIG_ENV = "THUMBMUX_TERMINAL_PTY_WAL_CONFIG"
@@ -41,6 +42,7 @@ WAL_FILE = "output.wal"
 SOCKET_FILE = "control.sock"
 LOCK_FILE = "writer.lock"
 HEALTH_FILE = "pty-proxy-status.json"
+PIPEHIST_HEALTH_FILE = "pipehist-health-v1.json"
 DIAGNOSTIC_FILE = "pty-proxy-diagnostics.log"
 FINALIZE_LOGICAL_END_FLAG = "--finalize-logical-end"
 
@@ -175,7 +177,11 @@ def verify_running_proxy_asset() -> str:
     return actual
 
 
-def write_all(fd: int, data: bytes | bytearray | memoryview) -> None:
+def write_all(
+    fd: int,
+    data: bytes | bytearray | memoryview,
+    on_progress: Optional[Callable[[int], None]] = None,
+) -> None:
     view = memoryview(data)
     written = 0
     while written < len(view):
@@ -200,6 +206,8 @@ def write_all(fd: int, data: bytes | bytearray | memoryview) -> None:
         if count <= 0:
             raise OSError(errno.EIO, "write made no progress")
         written += count
+        if on_progress is not None:
+            on_progress(count)
 
 
 def read_boot_id() -> str:
@@ -277,16 +285,17 @@ class DiagnosticLog:
 
 
 class AtomicStatus:
-    def __init__(self, directory: str) -> None:
+    def __init__(self, directory: str, filename: str = HEALTH_FILE) -> None:
         self.directory = directory
-        self.path = os.path.join(directory, HEALTH_FILE)
+        self.filename = filename
+        self.path = os.path.join(directory, filename)
         self.counter = 0
 
     def write(self, value: dict[str, Any]) -> None:
         self.counter += 1
         temporary = os.path.join(
             self.directory,
-            f".{HEALTH_FILE}.tmp-{os.getpid()}-{self.counter}",
+            f".{self.filename}.tmp-{os.getpid()}-{self.counter}",
         )
         encoded = (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
         fd = -1
@@ -446,6 +455,9 @@ class ExistingWal:
     sequence: int
     last_at: int
     valid_bytes: int
+    epoch_ordinal: int
+    previous_epoch_id: Optional[str]
+    epoch_output_bytes: int
 
 
 def decode_json_payload(payload: bytes, label: str) -> dict[str, Any]:
@@ -481,6 +493,9 @@ class WalInspector:
         self.pending: Optional[dict[str, Any]] = None
         self.sequence = 0
         self.last_at = 0
+        self.epoch_ordinal = -1
+        self.previous_epoch_id: Optional[str] = None
+        self.epoch_output_bytes = 0
 
     def consume(self, record: WalRecord) -> None:
         first = self.sequence == 0
@@ -504,6 +519,7 @@ class WalInspector:
                 if event != "start":
                     raise WalCorruption("terminal WAL first lifecycle event must be start")
                 self.session, self.instance_id, self.active = next_session, next_instance, True
+                self.epoch_ordinal = 0
             else:
                 if event == "start" or next_session != self.session or next_instance != self.instance_id:
                     raise WalCorruption("terminal WAL lifecycle chain changed identity")
@@ -513,6 +529,13 @@ class WalInspector:
                     self.active = False
                 elif not self.active:
                     raise WalCorruption("terminal WAL resumed after logical END")
+                else:
+                    previous_generation = self.identity.get("generation") if self.identity is not None else None
+                    if not isinstance(previous_generation, str) or not SAFE_ID.fullmatch(previous_generation):
+                        raise WalCorruption("terminal WAL previous source generation is invalid")
+                    self.previous_epoch_id = previous_generation
+                    self.epoch_ordinal += 1
+                    self.epoch_output_bytes = 0
             # Keep only the latest source identity and geometry needed for a
             # RESUME or offline END. Earlier lifecycle payloads are released.
             self.identity = dict(next_identity)
@@ -549,6 +572,8 @@ class WalInspector:
                     raise WalCorruption("terminal WAL resize phase is invalid")
             elif self.pending is not None:
                 raise WalCorruption("terminal WAL record appears inside pending resize")
+            elif record.kind == "output":
+                self.epoch_output_bytes += len(record.payload)
         self.sequence = record.sequence
         self.last_at = record.at
 
@@ -564,6 +589,9 @@ class WalInspector:
             self.sequence,
             self.last_at,
             valid_bytes,
+            self.epoch_ordinal,
+            self.previous_epoch_id,
+            self.epoch_output_bytes,
         )
 
 
@@ -618,6 +646,77 @@ def scan_wal(path: str) -> tuple[ExistingWal, Optional[tuple[str, int]]]:
         return inspector.finish(offset), problem
     finally:
         os.close(fd)
+
+
+def sha256_prefix(path: str, length: int) -> str:
+    if length < 0:
+        raise ProxyError("terminal WAL hash boundary is invalid")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    offset = 0
+    try:
+        while offset < length:
+            chunk = os.pread(fd, min(1024 * 1024, length - offset), offset)
+            if not chunk:
+                raise ProxyError("terminal WAL ended before its claimed hash boundary")
+            digest.update(chunk)
+            offset += len(chunk)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def count_newlines_prefix(path: str, length: int) -> int:
+    if length < 0:
+        raise ProxyError("terminal replay history boundary is invalid")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    lines = 0
+    offset = 0
+    try:
+        while offset < length:
+            chunk = os.pread(fd, min(1024 * 1024, length - offset), offset)
+            if not chunk:
+                raise ProxyError("terminal replay history ended before its claimed boundary")
+            lines += chunk.count(b"\n")
+            offset += len(chunk)
+    finally:
+        os.close(fd)
+    return lines
+
+
+def read_replay_progress(config: dict[str, Any], wal_path: str) -> tuple[int, int, int]:
+    pipehist = config.get("pipehist")
+    replay = pipehist.get("replay") if isinstance(pipehist, dict) else None
+    if replay is None:
+        return 0, 0, 0
+    checkpoint_path = replay["checkpointPath"]
+    try:
+        with open(checkpoint_path, "r", encoding="utf-8") as source:
+            value = json.load(source)
+    except FileNotFoundError:
+        return 0, 0, 0
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProxyError(f"terminal replay checkpoint is unreadable: {error}") from error
+    if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("cursor"), dict):
+        raise ProxyError("terminal replay checkpoint schema is invalid")
+    cursor = value["cursor"]
+    sequence_text, offset, history_bytes = cursor.get("sequence"), cursor.get("walOffset"), value.get("historyBytes")
+    if (
+        not isinstance(sequence_text, str)
+        or not re.fullmatch(r"0|[1-9][0-9]*", sequence_text)
+        or not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 0
+        or not isinstance(history_bytes, int)
+        or isinstance(history_bytes, bool)
+        or history_bytes < 0
+    ):
+        raise ProxyError("terminal replay checkpoint progress is invalid")
+    checkpoint_wal = value.get("walPath")
+    if not isinstance(checkpoint_wal, str) or os.path.realpath(checkpoint_wal) != os.path.realpath(wal_path):
+        raise ProxyError("terminal replay checkpoint belongs to another WAL")
+    lines = count_newlines_prefix(replay["historyPath"], history_bytes)
+    return int(sequence_text), offset, lines
 
 
 def quarantine_torn_tail(path: str, valid_bytes: int, directory: str) -> None:
@@ -776,6 +875,63 @@ def positive_integer(value: Any, label: str, maximum: int) -> int:
     return value
 
 
+def validate_absolute_path(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or not os.path.isabs(value)
+        or os.path.normpath(value) != value
+    ):
+        raise ProxyError(f"{label} must be an absolute normalized path")
+    return value
+
+
+def validate_pipehist_config(value: Any, identity: dict[str, str], tmux: dict[str, str]) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"schema", "identity", "replay"}:
+        raise ProxyError("pipehist config fields are invalid")
+    if value.get("schema") != "pipehist.c.v1/proxy-config":
+        raise ProxyError("pipehist config schema is invalid")
+    logical = value.get("identity")
+    required = {"session", "instanceId", "provider", "conversationId", "cwd", "laneKey"}
+    if not isinstance(logical, dict) or set(logical) != required:
+        raise ProxyError("pipehist identity fields are invalid")
+    if logical.get("session") != identity["session"] or logical.get("instanceId") != identity["instanceId"]:
+        raise ProxyError("pipehist identity does not match terminal PTY WAL identity")
+    if logical.get("provider") not in ("claude", "codex", "grok"):
+        raise ProxyError("pipehist identity provider is invalid")
+    for field in ("instanceId", "laneKey"):
+        if not isinstance(logical.get(field), str) or not SAFE_ID.fullmatch(logical[field]):
+            raise ProxyError(f"pipehist identity {field} is invalid")
+    conversation_id = logical.get("conversationId")
+    if not isinstance(conversation_id, str) or not conversation_id or "\x00" in conversation_id:
+        raise ProxyError("pipehist identity conversationId is invalid")
+    cwd = validate_absolute_path(logical.get("cwd"), "pipehist identity cwd")
+    if "socketPath" not in tmux:
+        raise ProxyError("pipehist v1 requires an explicit tmux socketPath")
+    replay = value.get("replay")
+    normalized_replay: Optional[dict[str, str]] = None
+    if replay is not None:
+        if not isinstance(replay, dict) or set(replay) != {"checkpointPath", "historyPath"}:
+            raise ProxyError("pipehist replay fields are invalid")
+        normalized_replay = {
+            "checkpointPath": validate_absolute_path(replay.get("checkpointPath"), "pipehist replay checkpointPath"),
+            "historyPath": validate_absolute_path(replay.get("historyPath"), "pipehist replay historyPath"),
+        }
+    return {
+        "schema": "pipehist.c.v1/proxy-config",
+        "identity": {
+            "session": logical["session"],
+            "instanceId": logical["instanceId"],
+            "provider": logical["provider"],
+            "conversationId": conversation_id,
+            "cwd": cwd,
+            "laneKey": logical["laneKey"],
+        },
+        "replay": normalized_replay,
+    }
+
+
 def validate_config(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ProxyError("terminal PTY WAL config must be an object")
@@ -789,6 +945,7 @@ def validate_config(raw: Any) -> dict[str, Any]:
         "maxPendingInputBytes",
         "heartbeatMs",
         "terminateGraceMs",
+        "pipehist",
     }
     if not required.issubset(raw) or not set(raw).issubset(required | optional):
         raise ProxyError("terminal PTY WAL config fields are invalid")
@@ -856,17 +1013,21 @@ def validate_config(raw: Any) -> dict[str, Any]:
     max_input = positive_integer(raw.get("maxPendingInputBytes", 1024 * 1024), "maxPendingInputBytes", 64 * 1024 * 1024)
     if max_input < max_output:
         raise ProxyError("maxPendingInputBytes must be at least maxOutputRecordBytes")
+    normalized_tmux = {"executable": executable, **({"socketName": tmux["socketName"]} if tmux.get("socketName") else {}), **({"socketPath": tmux["socketPath"]} if tmux.get("socketPath") else {})}
+    normalized_identity = {"session": session, "instanceId": instance_id, "paneTarget": pane_target}
+    pipehist = None if "pipehist" not in raw else validate_pipehist_config(raw["pipehist"], normalized_identity, normalized_tmux)
     return {
         "directory": directory,
-        "identity": {"session": session, "instanceId": instance_id, "paneTarget": pane_target},
+        "identity": normalized_identity,
         "argv": argv,
         "cwd": cwd,
         "env": environment,
-        "tmux": {"executable": executable, **({"socketName": tmux["socketName"]} if tmux.get("socketName") else {}), **({"socketPath": tmux["socketPath"]} if tmux.get("socketPath") else {})},
+        "tmux": normalized_tmux,
         "maxOutputRecordBytes": max_output,
         "maxPendingInputBytes": max_input,
         "heartbeatMs": positive_integer(raw.get("heartbeatMs", 1000), "heartbeatMs", 60_000),
         "terminateGraceMs": positive_integer(raw.get("terminateGraceMs", 5000), "terminateGraceMs", 300_000),
+        **({"pipehist": pipehist} if pipehist is not None else {}),
     }
 
 
@@ -1052,6 +1213,7 @@ class Proxy:
         self.generation = uuid.uuid4().hex
         self.log: Optional[DiagnosticLog] = None
         self.status_writer: Optional[AtomicStatus] = None
+        self.pipehist_status_writer: Optional[AtomicStatus] = None
         self.lock: Optional[WriterLock] = None
         self.writer: Optional[WalWriter] = None
         self.server: Optional[socket.socket] = None
@@ -1081,6 +1243,17 @@ class Proxy:
         self.activated = False
         self.activation_record: Optional[WalRecord] = None
         self.disconnected_linger = False
+        self.boot_id = read_boot_id()
+        self.pipehist_sample = 0
+        self.received_output_bytes = 0
+        self.durable_output_bytes = 0
+        self.displayed_output_bytes = 0
+        self.epoch_ordinal = 0
+        self.previous_epoch_id: Optional[str] = None
+        self.opened_boundary: Optional[dict[str, Any]] = None
+        self.closed_boundary: Optional[dict[str, Any]] = None
+        self.failure_reason: Optional[str] = None
+        self.pipehist_physical: Optional[dict[str, Any]] = None
 
     def setup_directory(self) -> None:
         ensure_durable_directory(self.directory)
@@ -1136,6 +1309,135 @@ class Proxy:
             value["error"] = self.fatal_message[:2048]
         return value
 
+    def replay_progress(self) -> tuple[int, int, int]:
+        return read_replay_progress(self.config, os.path.join(self.directory, WAL_FILE))
+
+    def boundary_value(self, record: WalRecord, output_bytes: int, v3_lines: int) -> dict[str, Any]:
+        return {
+            "walSequence": str(record.sequence),
+            "walNextOffset": record.next_offset,
+            "walPrefixSha256": sha256_prefix(os.path.join(self.directory, WAL_FILE), record.next_offset),
+            "outputBytes": str(output_bytes),
+            "v3Lines": v3_lines,
+        }
+
+    def physical_value(self) -> Optional[dict[str, Any]]:
+        if self.source is None or "pipehist" not in self.config:
+            return None
+        if self.pipehist_physical is not None:
+            return self.pipehist_physical
+        server_pid = self.source["tmuxServerPid"]
+        self.pipehist_physical = {
+            "server": {
+                "bootId": self.boot_id,
+                "pid": server_pid,
+                "startTicks": process_start_ticks(server_pid),
+            },
+            "socketPath": self.config["tmux"]["socketPath"],
+            "sessionId": self.source["sessionId"],
+            "sessionCreated": self.source["sessionCreated"],
+            "windowId": self.source["windowId"],
+            "paneId": self.source["paneId"],
+            "paneTarget": self.source["paneTarget"],
+            "proxy": {
+                "bootId": self.boot_id,
+                "pid": os.getpid(),
+                "startTicks": process_start_ticks(os.getpid()),
+            },
+            "generation": self.generation,
+        }
+        return self.pipehist_physical
+
+    def pipehist_health_value(self) -> dict[str, Any]:
+        logical = self.config["pipehist"]["identity"]
+        self.pipehist_sample += 1
+        proxy_process = {
+            "bootId": self.boot_id,
+            "pid": os.getpid(),
+            "startTicks": process_start_ticks(os.getpid()),
+        }
+        replay_sequence = 0
+        replay_offset = 0
+        replay_error: Optional[str] = None
+        try:
+            replay_sequence, replay_offset, _v3_lines = self.replay_progress()
+        except BaseException as error:
+            replay_error = str(error).replace("\n", " ")[:2048]
+        epoch_state = "opening"
+        if self.state == "ending":
+            epoch_state = "closing"
+        elif self.closed_boundary is not None:
+            epoch_state = "clean"
+        elif self.opened_boundary is not None:
+            epoch_state = "open"
+        elif self.state in ("fatal", "disconnected"):
+            epoch_state = "unknown"
+        marker = self.opened_boundary if self.previous_epoch_id is not None else None
+        physical = self.physical_value()
+        epoch = None if physical is None else {
+            "schema": "pipehist.c.v1/epoch",
+            "epochId": self.generation,
+            "ordinal": self.epoch_ordinal,
+            "previousEpochId": self.previous_epoch_id,
+            "identity": logical,
+            "physical": physical,
+            "state": epoch_state,
+            "opened": self.opened_boundary,
+            "closed": self.closed_boundary,
+            "uncleanPredecessor": None if self.previous_epoch_id is None else {
+                "epochId": self.previous_epoch_id,
+                "marker": marker,
+            },
+        }
+        pending = self.received_output_bytes - self.displayed_output_bytes
+        progress = {
+            "receivedOutputBytes": str(self.received_output_bytes),
+            "durableOutputBytes": str(self.durable_output_bytes),
+            "displayedOutputBytes": str(self.displayed_output_bytes),
+            "walSequence": str(self.wal_sequence),
+            "walNextOffset": self.wal_next_offset,
+            "replaySequence": str(replay_sequence),
+            "replayNextOffset": replay_offset,
+            "pendingOutputBytes": pending,
+        }
+        state = "starting"
+        reason = "none"
+        if self.state == "fatal":
+            state = "fatal"
+            reason = self.failure_reason or "unreadable"
+        elif self.state == "disconnected":
+            state, reason = "unknown", "source-lost"
+        elif self.state == "ended" and self.closed_boundary is not None:
+            state = "ended"
+        elif self.state in ("resizing", "ending"):
+            state, reason = "blocked", "sync-pending"
+        elif replay_error is not None:
+            state, reason = "unknown", "unreadable"
+        elif self.received_output_bytes > self.durable_output_bytes:
+            state, reason = "blocked", "sync-pending"
+        elif self.state == "ready" and self.opened_boundary is not None and replay_sequence == self.wal_sequence and replay_offset == self.wal_next_offset:
+            state = "ready"
+        elif self.opened_boundary is not None:
+            state, reason = "blocked", "replay-lag"
+        error = self.fatal_message or replay_error
+        return {
+            "schema": "pipehist.c.v1/health",
+            "identity": logical,
+            "sourceKind": "direct-pty-proxy",
+            "epoch": epoch,
+            "observed": {
+                "bootId": self.boot_id,
+                "monoNs": str(time.monotonic_ns()),
+                "utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sample": str(self.pipehist_sample),
+            },
+            "state": state,
+            "reason": reason,
+            "proxy": proxy_process,
+            "progress": progress,
+            "error": error,
+        }
+
     def write_health(self, force: bool = False) -> None:
         monotonic = time.monotonic()
         interval = self.config["heartbeatMs"] / 1000
@@ -1144,6 +1446,8 @@ class Proxy:
         if self.status_writer is None:
             return
         self.status_writer.write(self.health_value())
+        if self.pipehist_status_writer is not None:
+            self.pipehist_status_writer.write(self.pipehist_health_value())
         self.last_health_at = monotonic
 
     def note_wal(self, record: WalRecord, delivered: bool) -> None:
@@ -1165,10 +1469,14 @@ class Proxy:
             return
         if self.writer is None:
             raise ProxyError("terminal WAL writer is unavailable")
+        self.received_output_bytes += len(payload)
         record = self.writer.append("output", payload)
+        self.durable_output_bytes += len(payload)
         self.note_wal(record, False)
         # The stable WAL boundary is deliberately before the only outer write.
-        write_all(1, payload)
+        write_all(1, payload, lambda count: setattr(
+            self, "displayed_output_bytes", self.displayed_output_bytes + count
+        ))
         self.note_wal(record, True)
         self.write_health(False)
 
@@ -1388,6 +1696,25 @@ class Proxy:
             self.resume_child()
         return record
 
+    def wait_replay_boundary(self, record: WalRecord, timeout_seconds: float = 5.0) -> int:
+        if "pipehist" not in self.config:
+            return 0
+        if self.config["pipehist"]["replay"] is None:
+            raise ProxyError("pipehist replay paths are required before activation")
+        deadline = time.monotonic() + timeout_seconds
+        last = (0, 0, 0)
+        while time.monotonic() < deadline:
+            last = self.replay_progress()
+            if last[0] == record.sequence and last[1] == record.next_offset:
+                return last[2]
+            if last[0] > record.sequence or last[1] > record.next_offset:
+                raise ProxyError("terminal replay advanced beyond an uncaptured epoch boundary")
+            time.sleep(0.01)
+        raise ProxyError(
+            f"terminal replay did not reach epoch boundary {record.sequence}/{record.next_offset}; "
+            f"last={last[0]}/{last[1]}"
+        )
+
     def ordered_resize(self) -> None:
         if self.child is None or self.geometry is None:
             return
@@ -1428,11 +1755,18 @@ class Proxy:
             return self.activation_record
         if self.child_status is not None or self.child.gate_fd < 0:
             raise ProxyError("terminal PTY child cannot be activated")
+        v3_lines = self.wait_replay_boundary(self.activation_record)
+        opened_boundary = self.boundary_value(
+            self.activation_record,
+            self.received_output_bytes,
+            v3_lines,
+        )
         # START/RESUME, source identity, geometry and the host T0 are durable
         # before this sole release point allows the child to chdir/exec.
         write_all(self.child.gate_fd, b"1")
         os.close(self.child.gate_fd)
         self.child.gate_fd = -1
+        self.opened_boundary = opened_boundary
         self.activated = True
         self.state = "ready"
         self.write_health(True)
@@ -1486,6 +1820,8 @@ class Proxy:
             "lifecycle",
             {"event": "end", "identity": self.source, "geometry": self.geometry},
         )
+        v3_lines = self.wait_replay_boundary(record)
+        self.closed_boundary = self.boundary_value(record, self.durable_output_bytes, v3_lines)
         self.logical_end_complete = True
         self.state = "ended"
         self.write_health(True)
@@ -1739,6 +2075,8 @@ class Proxy:
         # Only the process holding the birth-verified lock may publish the
         # canonical health file. A losing contender must not clobber it.
         self.status_writer = AtomicStatus(self.directory)
+        if "pipehist" in self.config:
+            self.pipehist_status_writer = AtomicStatus(self.directory, PIPEHIST_HEALTH_FILE)
         self.writer = WalWriter(os.path.join(self.directory, WAL_FILE), self.directory)
         existing = self.writer.existing
         if not existing.empty and (
@@ -1752,6 +2090,12 @@ class Proxy:
         self.wal_next_offset = self.writer.next_offset
         self.delivered_sequence = self.writer.sequence
         self.delivered_next_offset = self.writer.next_offset
+        self.epoch_ordinal = 0 if existing.empty else existing.epoch_ordinal + 1
+        if not existing.empty:
+            previous = existing.identity.get("generation") if existing.identity is not None else None
+            if not isinstance(previous, str) or not SAFE_ID.fullmatch(previous):
+                raise WalCorruption("terminal WAL previous epoch identity is unavailable")
+            self.previous_epoch_id = previous
         if existing.pending_resize is not None:
             self.append_json("resize", {"phase": "abort", **{key: value for key, value in existing.pending_resize.items() if key != "phase"}})
 
@@ -1776,6 +2120,14 @@ class Proxy:
     def fail_closed(self, error: BaseException) -> None:
         message = f"{type(error).__name__}: {error}"
         self.fatal_message = message
+        if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EIO, errno.EDQUOT, errno.EROFS):
+            self.failure_reason = "storage-error"
+        elif isinstance(error, WalCorruption):
+            self.failure_reason = "storage-error"
+        elif "identity" in str(error).lower() or "generation" in str(error).lower():
+            self.failure_reason = "identity-mismatch"
+        else:
+            self.failure_reason = "unreadable"
         self.state = "fatal"
         if self.child is not None and self.child_status is None:
             try:

@@ -672,6 +672,41 @@ function pauseWriter() {
   return writer;
 }
 
+const gapReasonMessages = {
+  "tmux-pause": "การส่งข้อมูลถูกพักชั่วคราว ช่วงนั้นอาจเก็บไม่ครบ",
+  "recorder-failure": "ระบบบันทึกประวัติขัดข้อง ช่วงนั้นอาจเก็บไม่ครบ",
+  "unclean-source": "รอบก่อนจบโดยไม่ได้ยืนยันว่าเก็บประวัติครบ ช่วงท้ายอาจเก็บไม่ครบ",
+} as const;
+
+for (const [reason, expectedMessage] of Object.entries(gapReasonMessages)) {
+  test(`labels ${reason} gaps with their actual cause`, () => {
+    const writer = new OutputWalWriter({ path: walPath, format: 2, clock: () => 100 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(80, 8)));
+    writer.appendGap({
+      gapId: `gap-${reason}`,
+      sourceEpoch: "epoch-1",
+      paneId: "%42",
+      reason: reason as keyof typeof gapReasonMessages,
+      detectedAt: 100,
+      missingBytes: null,
+      coverage: "unknown",
+    });
+    writer.appendOutput(Buffer.from("AFTER_GAP\r\n"));
+    writer.close();
+
+    const rendered = plainRendered(materialize());
+    expect(rendered).toContain(expectedMessage);
+    expect(rendered).not.toContain(`gap-${reason}`);
+    expect(rendered).not.toContain("เครื่องดับ");
+    expect(rendered).not.toContain("ไบต์");
+    expect(rendered).not.toContain("tmux");
+    for (const otherMessage of Object.values(gapReasonMessages)) {
+      if (otherMessage !== expectedMessage) expect(rendered).not.toContain(otherMessage);
+    }
+    expect(rendered).toContain("AFTER_GAP");
+  }, 30_000);
+}
+
 for (const status of ["ambiguous", "failed"] as const) {
   test(`pause ${status} is local: live suffix and pre-gap screen survive restart`, () => {
     const writer = pauseWriter();
@@ -713,8 +748,9 @@ test("overlapping gaps settle independently across an open checkpoint", () => {
   writer.appendOutput(Buffer.from("WHILE_PENDING\r\n"));
   const pending = plainRendered(materialize());
   expect(pending).toContain("WHILE_PENDING");
-  expect(pending).toContain("gap-one");
-  expect(pending).toContain("gap-two");
+  expect(pending.match(/ประวัติขาดช่วง/g)).toHaveLength(2);
+  expect(pending).not.toContain("gap-one");
+  expect(pending).not.toContain("gap-two");
   pauseRecovery(writer, "gap-one", "success");
   pauseRecovery(writer, "gap-two", "ambiguous");
   writer.appendOutput(Buffer.from("AFTER_BOTH\r\n"));
@@ -723,4 +759,20 @@ test("overlapping gaps settle independently across an open checkpoint", () => {
   expect(settled).toContain("AFTER_BOTH");
   expect(settled.match(/recovered-from-ring/g)).toHaveLength(2);
   expect(plainRendered(materialize())).toBe(settled);
+}, 30_000);
+
+test("source checkpoints preserve materialized output and logical lifecycle", () => {
+  const writer = new OutputWalWriter({ path: walPath, format: 2 });
+  writer.appendJson("lifecycle", lifecycle("start", geometry(80, 8)));
+  writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+  writer.appendOutput(Buffer.from("BEFORE_DETACH\r\n"));
+  writer.appendJson("checkpoint", { event: "source-detached", version: 1, lastDurableSeq: writer.lastDurableSequence.toString() });
+  writer.appendJson("lifecycle", lifecycle("resume", geometry(80, 8)));
+  writer.appendOutput(Buffer.from("AFTER_RESUME\r\n"));
+  writer.close();
+  const rendered = plainRendered(materialize());
+  expect(rendered).toContain("BEFORE_DETACH");
+  expect(rendered).toContain("AFTER_RESUME");
+  expect(rendered).not.toContain("ประวัติขาดช่วง");
+  expect(plainRendered(materialize())).toBe(rendered);
 }, 30_000);

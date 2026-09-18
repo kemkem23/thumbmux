@@ -586,18 +586,16 @@ describe("A6-11 SessionThumb OSC-8 not keyboard-focusable", () => {
       const thumb = target.querySelector<HTMLElement>('[data-testid="session-thumb"]');
       if (!thumb) throw new Error("thumb missing");
 
-      // Preferred: inert removes the whole subtree from sequential focus.
-      const inert = thumb.hasAttribute("inert") || (thumb as HTMLElement & { inert?: boolean }).inert;
-      const ariaHidden = thumb.getAttribute("aria-hidden") === "true";
-
       const anchors = [...target.querySelectorAll("a")];
-      const focusableAnchors = anchors.filter((a) => {
-        const ti = a.getAttribute("tabindex");
-        return ti !== "-1" && !a.hasAttribute("disabled");
-      });
-
-      // Either the container is inert/aria-hidden, or every anchor is tabindex=-1
-      expect(inert || ariaHidden || focusableAnchors.length === 0).toBe(true);
+      expect(anchors).toHaveLength(1);
+      for (const anchor of anchors) {
+        const inertBoundary = anchor.closest<HTMLElement>('.preview-content');
+        expect(inertBoundary).not.toBeNull();
+        expect(inertBoundary!.hasAttribute('inert')
+          || (inertBoundary as HTMLElement & { inert?: boolean }).inert).toBe(true);
+        expect(inertBoundary!.getAttribute('aria-hidden')).toBe('true');
+        expect(thumb.contains(inertBoundary)).toBe(true);
+      }
     } finally {
       tmuxMux.subscribe = originalSubscribe as typeof tmuxMux.subscribe;
     }

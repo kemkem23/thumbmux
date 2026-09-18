@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -6,10 +7,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
+import { TerminalControlWalRecorder, type TerminalControlProcess } from "../src/integrations/terminal-control-wal-recorder";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   OutputWalWriter,
+  parseOutputWalGapPayload,
   parseOutputWalJson,
   readOutputWal,
 } from "../src/output-wal";
@@ -60,8 +64,13 @@ function config(
 async function startWorker(
   workerConfig: TerminalWalWorkerConfig,
   input = new PassThrough(),
+  walFormat: 1 | 2 = 1,
 ): Promise<{ worker: TerminalWalWorker; input: PassThrough; controller: TerminalWalController }> {
-  const worker = new TerminalWalWorker(workerConfig, { input, clock: () => 1_700_000_000_000 });
+  const worker = new TerminalWalWorker(workerConfig, {
+    input,
+    clock: () => 1_700_000_000_000,
+    walFormat,
+  });
   await worker.start();
   workers.push(worker);
   const controller = new TerminalWalController({ directory: workerConfig.directory });
@@ -224,44 +233,141 @@ describe("terminal WAL stdin worker and controller", () => {
     expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint"]);
   });
 
-  test("writes RESUME for the same logical identity while allowing a new tmux source epoch", async () => {
+  test("clean stop resumes a new source epoch without a gap", async () => {
     const directory = makeRoot();
-    const first = await startWorker(config(directory));
+    const first = await startWorker(config(directory), new PassThrough(), 2);
+    first.input.write(Buffer.from("BEFORE"));
+    await first.controller.barrier("barrier:before");
     first.controller.close();
-    controllers = controllers.filter((value) => value !== first.controller);
     await first.worker.stop();
-
-    const secondIdentity = identity({
-      paneTarget: "=durable-agent-1:2.1",
-      tmuxServerPid: 5678,
-      sessionCreated: 1_700_000_999,
+    const stopped = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    const detached = stopped.at(-1)!;
+    expect(parseOutputWalJson(detached)).toEqual({
+      event: "source-detached", version: 1,
+      lastDurableSeq: stopped.at(-2)!.sequence.toString(),
     });
-    const second = await startWorker(config(directory, {
-      identity: secondIdentity,
-      geometry: { cols: 120, rows: 40 },
-    }));
-    await second.controller.barrier("barrier:resumed");
-
+    const secondIdentity = identity({ tmuxServerPid: 5678, sessionCreated: 1_700_000_999 });
+    const second = await startWorker(config(directory, { identity: secondIdentity }), new PassThrough(), 2);
+    second.input.write(Buffer.from("AFTER"));
+    await second.controller.barrier("barrier:after");
     const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-    const lifecycle = records
-      .filter((record) => record.kind === "lifecycle")
-      .map((record) => parseOutputWalJson(record));
-    expect(lifecycle).toEqual([
+    expect(records.filter((record) => record.kind === "gap")).toHaveLength(0);
+    expect(records.filter((record) => record.kind === "lifecycle").map(parseOutputWalJson)).toEqual([
       { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } },
-      { event: "resume", identity: secondIdentity, geometry: { cols: 120, rows: 40 } },
+      { event: "resume", identity: secondIdentity, geometry: { cols: 80, rows: 24 } },
     ]);
+    expect(records.filter((record) => record.kind === "output").map((r) => Buffer.from(r.payload).toString())).toEqual(["BEFORE", "AFTER"]);
+  });
+
+  test("interrupted tracked source records gap before resume and output", async () => {
+    const directory = makeRoot();
+    const path = resolveTerminalWalPaths(directory).walPath;
+    // Model a killed worker: durable records exist, but no source-detached record.
+    // Closing the raw file descriptor is harness cleanup, not a worker stop.
+    const writer = new OutputWalWriter({ path, format: 2 });
+    writer.appendJson("lifecycle", { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } });
+    writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+    writer.appendOutput(Buffer.from("BEFORE"));
+    writer.close();
+    const resumed = await startWorker(config(directory), new PassThrough(), 2);
+    resumed.worker.appendOrderedOutput(Buffer.from("AFTER"));
+    const records = [...readOutputWal(path)];
+    expect(records.map((r) => r.kind)).toEqual(["lifecycle", "checkpoint", "output", "gap", "lifecycle", "output"]);
+    expect(parseOutputWalGapPayload(records[3]!.payload)).toMatchObject({
+      reason: "unclean-source", lastDurableSeq: "3", missingBytes: null, coverage: "unknown",
+    });
+    expect(parseOutputWalJson(records[4]!)).toMatchObject({ event: "resume" });
+    expect(Buffer.from(records[5]!.payload).toString()).toBe("AFTER");
+  });
+
+  test("prebuffered stdin stays after gap and resume on an interrupted source", async () => {
+    const directory = makeRoot();
+    const path = resolveTerminalWalPaths(directory).walPath;
+    const writer = new OutputWalWriter({ path, format: 2 });
+    writer.appendJson("lifecycle", { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } });
+    writer.appendJson("checkpoint", { event: "source-tracking", version: 1 });
+    writer.appendOutput(Buffer.from("OLD"));
+    writer.close();
+    const input = new PassThrough();
+    input.write(Buffer.from("NEW-FIRST-BYTE"));
+    await startWorker(config(directory), input, 2);
+    const records = [...readOutputWal(path)];
+    expect(records.slice(3).map((r) => r.kind)).toEqual(["gap", "lifecycle", "output"]);
+    expect(parseOutputWalJson(records[4]!)).toMatchObject({ event: "resume" });
+    expect(Buffer.from(records[5]!.payload).toString()).toBe("NEW-FIRST-BYTE");
+  });
+
+  test("recorder failure followed by reopen keeps one failure gap", async () => {
+    class FakeProcess extends EventEmitter implements TerminalControlProcess {
+      readonly stdin = new PassThrough();
+      readonly stdout = new PassThrough();
+      readonly stderr = new PassThrough();
+      kill(): boolean { this.emit("exit", null, "SIGTERM"); return true; }
+    }
+    const directory = makeRoot();
+    const fake = new FakeProcess();
+    const recorder = new TerminalControlWalRecorder({ worker: config(directory), readyTimeoutMs: 2_000 }, {
+      spawnControl: () => fake,
+      resolveIdentity: async () => ({ ...identity(), sessionId: "$9", windowId: "@42", paneId: "%42", geometry: { cols: 80, rows: 24 } }),
+    });
+    try {
+      const starting = recorder.start();
+      fake.stdout.write("%begin 1700000000 1 0\n%end 1700000000 1 0\n%session-changed $9 durable-agent-1\n");
+      await starting;
+      fake.stdout.write("%output %42 bad\\x\n");
+      await eventually(() => recorder.status.state === "fatal", "recorder failure");
+      await eventually(() => !existsSync(resolveTerminalWalPaths(directory).lockPath), "failed recorder writer release");
+      await startWorker(config(directory), new PassThrough(), 2);
+      const gaps = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)].filter((r) => r.kind === "gap");
+      expect(gaps.map((r) => parseOutputWalGapPayload(r.payload).reason)).toEqual(["recorder-failure"]);
+    } finally {
+      await recorder.stop();
+    }
+  });
+
+  test("detached closer can start and write official END without a gap", async () => {
+    const directory = makeRoot();
+    const first = await startWorker(config(directory), new PassThrough(), 2);
+    first.worker.appendOrderedOutput(Buffer.from("DONE"));
+    first.controller.close();
+    await first.worker.stop();
+    const closer = await startWorker(config(directory), new PassThrough(), 2);
+    closer.controller.close();
+    await closer.worker.closeLogicalLifecycle();
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.filter((r) => r.kind === "gap")).toHaveLength(0);
+    expect(records.filter((r) => r.kind === "lifecycle").map((r) => parseOutputWalJson<{ event: string }>(r).event)).toEqual(["start", "resume", "end"]);
+    expect(records.at(-1)!.kind).toBe("lifecycle");
+  });
+
+  test("legacy format 2 enrolls without a retrospective gap then detects interruption", async () => {
+    const directory = makeRoot();
+    const path = resolveTerminalWalPaths(directory).walPath;
+    const writer = new OutputWalWriter({ path, format: 2 });
+    writer.appendJson("lifecycle", { event: "start", identity: identity(), geometry: { cols: 80, rows: 24 } });
+    writer.appendOutput(Buffer.from("LEGACY"));
+    writer.close();
+    const first = await startWorker(config(directory), new PassThrough(), 2);
+    expect([...readOutputWal(path)].filter((r) => r.kind === "gap")).toHaveLength(0);
+    // Input failure closes the fd without the clean-detach certificate.
+    first.input.emit("error", new Error("simulated source interruption"));
+    await first.worker.stop();
+    await startWorker(config(directory), new PassThrough(), 2);
+    expect([...readOutputWal(path)].filter((r) => r.kind === "gap").map((r) => parseOutputWalGapPayload(r.payload).reason)).toEqual(["unclean-source"]);
   });
 
   test("only explicit logical close writes END and an ended lifecycle cannot resume", async () => {
     const directory = makeRoot();
-    const first = await startWorker(config(directory));
+    const first = await startWorker(config(directory), new PassThrough(), 2);
     first.controller.close();
     controllers = controllers.filter((value) => value !== first.controller);
     await first.worker.closeLogicalLifecycle();
 
-    const next = new TerminalWalWorker(config(directory), { input: new PassThrough() });
+    const next = new TerminalWalWorker(config(directory), { input: new PassThrough(), walFormat: 2 });
     await expect(next.start()).rejects.toThrow("logical lifecycle already ended");
-    const lifecycle = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
+    const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+    expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "lifecycle"]);
+    const lifecycle = records
       .filter((record) => record.kind === "lifecycle")
       .map((record) => parseOutputWalJson(record));
     expect(lifecycle).toEqual([

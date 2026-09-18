@@ -110,13 +110,14 @@ test("stores a bounded capture as recovered-from-ring provenance instead of raw 
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "gap", "recovery"]);
-  expect(parseOutputWalJson(records[2]!)).toMatchObject({
+  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "gap", "recovery"]);
+  expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+  expect(parseOutputWalJson(records[3]!)).toMatchObject({
     provenance: "recovered-from-ring",
     recoveredRows: 2,
     truncated: false,
-    capturedSeqBefore: "1",
-    capturedSeqAfter: "2",
+    capturedSeqBefore: "2",
+    capturedSeqAfter: "3",
     boundary: "matched",
     identity: { paneId: "%42", windowId: "@42" },
     geometry: { cols: 80, rows: 24 },
@@ -201,8 +202,9 @@ test("command response payload cannot manufacture output or pause notifications"
   fake.stdout.write("%end 3 3 1\n%output %42 REAL_OUTPUT\n");
   await new Promise((resolve) => setTimeout(resolve, 10));
   const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "output"]);
-  expect(Buffer.from(records[1]!.payload).toString()).toBe("REAL_OUTPUT");
+  expect(records.map((record) => record.kind)).toEqual(["lifecycle", "checkpoint", "output"]);
+  expect(parseOutputWalJson(records[1]!)).toEqual({ event: "source-tracking", version: 1 });
+  expect(Buffer.from(records[2]!.payload).toString()).toBe("REAL_OUTPUT");
   expect(recorder.status.state).toBe("ready");
   expect(calls).toEqual([]);
 });

@@ -149,6 +149,7 @@ describe('P01: offline SQLite reader — onepath S1', () => {
         rows: all.length, digestMatch: sutDigest === ORACLE_ALL_DIGEST,
         geometryGen: snap.receipt.geometry.generation,
       }));
+      console.log('P01_IDENTITY_PROOF', JSON.stringify({ sessionIds: [sid] }));
     } finally { await store.close(); }
   });
 
