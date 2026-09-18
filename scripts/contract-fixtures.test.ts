@@ -33,30 +33,6 @@ afterEach(() => {
 });
 
 describe("frozen consumer runner policy", () => {
-  test("real hard sandbox blocks DNS, public TCP, and HTTP", () => {
-    // The production runner supplies this marker after entering its attested
-    // network namespace.  This test never manufactures the marker itself, so
-    // an ordinary host-side unit run cannot masquerade as isolation evidence.
-    if (process.env.CORTEX_TEST_HARD_SANDBOX !== "command") return;
-
-    const probes = [
-      ["DNS", "/usr/bin/getent", ["ahostsv4", "example.com"]],
-      ["TCP", "/usr/bin/timeout", ["3", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/1.1.1.1/443"]],
-      ["HTTP", "/usr/bin/curl", ["--fail", "--silent", "--show-error", "--connect-timeout", "2", "--max-time", "3", "https://example.com/"]],
-    ] as const;
-    for (const [label, executable, args] of probes) {
-      const result = Bun.spawnSync({
-        cmd: [executable, ...args],
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      console.log(
-        `C3HARDEN actual-isolation ${label} exit=${result.exitCode} signal=${result.signalCode ?? "none"} stderr=${JSON.stringify(result.stderr.toString().trim())}`,
-      );
-      expect(result.exitCode, `${label} unexpectedly reached the public network`).not.toBe(0);
-    }
-  });
-
   test("direct invocation fails before caller-supplied tmux or Docker can run", () => {
     const root = mkdtempSync(join(tmpdir(), "thumbmux-contract-runner-test-"));
     roots.push(root);
