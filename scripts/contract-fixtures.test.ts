@@ -16,19 +16,62 @@ import { assertContractFixturePort } from "../contract/fixtures/runtime-guard";
 const roots: string[] = [];
 const runner = resolve(import.meta.dir, "contract-fixtures.sh");
 
-// Read command positions without executing the runner (or its tmux lifecycle).
-// svelte-check receives a tsconfig, not a .svelte positional argument: prove
-// both copies feed that command, then prove the config selects the copied file.
-function assertSemanticProbeInput(source: string, config: string, parentConfig: string) {
+// Parse source only; never execute the runner or its tmux lifecycle.
+function parseRunnerSource(source: string) {
   const parsed = spawnSync("/usr/bin/python3", ["-B", "-I", "-S", "-c", `
 import json, runpy, sys
 parser = runpy.run_path(sys.argv[1])
-print(json.dumps(list(parser["command_argv"](sys.stdin.read()))))
+source = sys.stdin.read()
+shell = parser["Shell"](source)
+statements = list(shell.commands())
+def token(word):
+    value = "".join(value for kind, value in word) if all(kind == "literal" for kind, _ in word) else None
+    return {"value": value, "start": word.start, "end": word.end}
+print(json.dumps({
+    "commands": list(parser["command_argv"](source)),
+    "statements": [[token(word) for word in words] for words in statements],
+    "words": [token(word) for _, _, words in shell.recorded_commands for word in words],
+}))
 `, resolve(import.meta.dir, "../../../ops/testing/tests/command-cage-wiring.py")], {
     input: source, encoding: "utf8",
   });
   expect(parsed.status).toBe(0);
-  const commands: (string | null)[][] = JSON.parse(parsed.stdout);
+  return JSON.parse(parsed.stdout) as {
+    commands: (string | null)[][];
+    statements: { value: string | null; start: number; end: number }[][];
+    words: { value: string | null; start: number; end: number }[];
+  };
+}
+
+function assertPrivateTmuxReadyAfterLock(source: string) {
+  const { statements, words } = parseRunnerSource(source);
+  const locks = statements.filter((statement) =>
+    JSON.stringify(statement.map((word) => word.value)) === JSON.stringify(["if", "!", "flock", "-n", "9"]),
+  );
+  expect(locks).toHaveLength(1);
+  const lockIndex = statements.indexOf(locks[0]);
+  // Pin the failure branch through its closing fi: after flock alone is not
+  // enough, since setting readiness inside that branch still affects losers.
+  expect(statements.slice(lockIndex + 1, lockIndex + 5).map((statement) =>
+    statement.map((word) => word.value),
+  )).toEqual([
+    ["then"],
+    ["echo", null],
+    ["exit", "1"],
+    ["fi"],
+  ]);
+  const successPosition = statements[lockIndex + 4][0].end;
+  const readyAssignments = words.filter((word) => word.value === "PRIVATE_TMUX_READY=1");
+  expect(readyAssignments.length).toBeGreaterThan(0);
+  for (const assignment of readyAssignments) {
+    expect(assignment.start).toBeGreaterThan(successPosition);
+  }
+}
+
+// svelte-check receives a tsconfig, not a .svelte positional argument: prove
+// both copies feed that command, then prove the config selects the copied file.
+function assertSemanticProbeInput(source: string, config: string, parentConfig: string) {
+  const { commands } = parseRunnerSource(source);
   const inputChain = [
     ["cp", "<SCRIPT_DIR>/contract-app-host-probe.svelte", "src/ContractProbe.svelte"],
     ["cp", "<SCRIPT_DIR>/contract-app-host-tsconfig.json", "contract-app-host-tsconfig.json"],
@@ -172,6 +215,29 @@ describe("frozen consumer runner policy", () => {
     expect(cleanup).toContain("/usr/bin/mv --no-copy -n -T");
     expect(cleanup).toContain("original_socket_identity");
     expect(source).not.toContain("tmux kill-session");
+  });
+
+  test("every private tmux readiness assignment follows successful lock acquisition", () => {
+    assertPrivateTmuxReadyAfterLock(readFileSync(runner, "utf8"));
+  });
+
+  test("lock ordering rejects early, duplicate, and failure-branch readiness", () => {
+    const source = readFileSync(runner, "utf8");
+    const assignment = "PRIVATE_TMUX_READY=1\n";
+    const withoutReady = source.replaceAll(assignment, "");
+    const lock = 'exec 9>"$LOCK_FILE"';
+    const failure = '  echo "contract fixtures: another runner owns $LOCK_FILE"';
+    const mutants = [
+      withoutReady.replace(lock, assignment + lock),
+      source.replace(lock, assignment + lock),
+      withoutReady.replace(failure, "  " + assignment + failure),
+      withoutReady,
+    ];
+    for (const mutant of mutants) {
+      expect(mutant).not.toBe(source);
+      expect(() => assertPrivateTmuxReadyAfterLock(mutant)).toThrow();
+    }
+    assertPrivateTmuxReadyAfterLock("# PRIVATE_TMUX_READY=1\n" + source);
   });
 
   test("consumer runtime gate binds the exact admitted Bun and Node PATH", () => {

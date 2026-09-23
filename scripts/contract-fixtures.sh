@@ -168,7 +168,6 @@ export THUMBMUX_TEST_RUN_ID="$RUN_ID"
 export THUMBMUX_TEST_SCOPE=contract-fixtures
 export THUMBMUX_TEST_TMUX_SOCKET="$TMUX_SOCKET"
 export PATH="$PRIVATE_BIN:$PATH"
-PRIVATE_TMUX_READY=1
 LOCK_FILE="$THUMBMUX_GUARD_RUNTIME/contract-fixtures.lock"
 
 exec 9>"$LOCK_FILE"
@@ -176,6 +175,8 @@ if ! flock -n 9; then
   echo "contract fixtures: another runner owns $LOCK_FILE" >&2
   exit 1
 fi
+# Cleanup may inspect the private namespace only while this runner owns its lock.
+PRIVATE_TMUX_READY=1
 
 if [[ -n "$(fixture_sessions)" ]]; then
   echo "contract fixtures: refusing an unexpectedly non-empty private tmux server" >&2
