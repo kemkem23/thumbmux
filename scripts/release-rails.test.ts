@@ -487,7 +487,20 @@ describe("release rail policy", () => {
     expect(smoke).toContain('--cidfile "$CID_FILE"');
     expect(smoke).toContain("com.kemcortex.thumbmux.run-id");
     expect(smoke).not.toContain("docker run --rm");
-    expect(smoke).toContain("timeout 120 apk add --no-cache python3 tmux");
+    const timedDockerRunStart = smoke.indexOf("/usr/bin/timeout 240 /usr/bin/docker run");
+    const timedDockerRunEnd = smoke.indexOf("\nDOCKER_RC=$?", timedDockerRunStart);
+    expect(timedDockerRunStart).toBeGreaterThan(-1);
+    expect(timedDockerRunEnd).toBeGreaterThan(timedDockerRunStart);
+    const timedDockerRun = smoke.slice(timedDockerRunStart, timedDockerRunEnd);
+    expect(timedDockerRun).not.toContain("apk add");
+
+    const dockerBuildStart = smoke.indexOf("/usr/bin/timeout 300 /usr/bin/docker build");
+    const dockerBuildEnd = smoke.indexOf("\nEOF", dockerBuildStart);
+    expect(dockerBuildStart).toBeGreaterThan(-1);
+    expect(dockerBuildEnd).toBeGreaterThan(dockerBuildStart);
+    const dockerBuild = smoke.slice(dockerBuildStart, dockerBuildEnd);
+    expect(dockerBuild).toContain("timeout 120 apk add --no-cache python3 tmux");
+    expect(dockerBuildStart).toBeLessThan(timedDockerRunStart);
     expect(smoke).toContain("node18-replay-lock-smoke.mjs");
     expect(smoke).toContain("node node18-replay-lock-smoke.mjs");
     expect(node18ReplayLockSmoke)
