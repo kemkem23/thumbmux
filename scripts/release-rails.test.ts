@@ -69,6 +69,11 @@ function assertExecutableGateMarker(gate: string, marker: string): void {
     .flatMap((step) => step.run!.split("\n"))
     .map((line) => line.trim())
     .filter((line) => line !== "" && !line.startsWith("#"));
+  assertExecutableShellMarker(commands.join("\n"), marker);
+}
+
+function assertExecutableShellMarker(shell: string, marker: string): void {
+  const commands = activeShell(shell).split("\n").map((line) => line.trim());
   // Match command positions, not an echo/description containing the marker.
   // Supported wrappers mirror this action: timeout, subshell, and && chains.
   expect(commands.some((line) => line.split(/\s*&&\s*/).some((part) => {
@@ -77,6 +82,89 @@ function assertExecutableGateMarker(gate: string, marker: string): void {
     return command === marker || command.startsWith(`${marker} `)
       || command.startsWith(`${marker})`);
   }))).toBe(true);
+}
+
+// These are deliberately source-shape checks for the supported rails, not a
+// general shell interpreter. Ignore comments before joining continued commands.
+function activeShell(shell: string): string {
+  return shell.split("\n").filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n").replace(/\\\n\s*/g, " ");
+}
+
+function workflowShell(workflow: string): string {
+  const document = YAML.parse(workflow) as {
+    jobs?: Record<string, { if?: unknown; steps?: { run?: string; if?: unknown }[] }>;
+  };
+  return Object.values(document.jobs ?? {}).filter((job) => job.if === undefined)
+    .flatMap((job) => job.steps ?? [])
+    .filter((step) => step.if === undefined && typeof step.run === "string")
+    .map((step) => activeShell(step.run!)).join("\n");
+}
+
+function assertRetagBeforeBuild(workflow: string): void {
+  const shell = workflowShell(workflow);
+  const retag = "bun scripts/check-release-retag.ts";
+  const build = "bun run build:git-dist";
+  assertExecutableShellMarker(shell, retag);
+  assertExecutableShellMarker(shell, build);
+  expect(shell.indexOf(retag)).toBeLessThan(shell.indexOf(build));
+}
+
+function assertParityGatePinRead(shell: string): void {
+  // Both the key expression and input path must belong to the grep whose
+  // output is assigned to pinned_bun; an echo or unrelated mention cannot pass.
+  expect(activeShell(shell).split("\n")).toContain(
+    String.raw`pinned_bun="$(/usr/bin/grep -oP 'bun-version:\s*\K[0-9]+\.[0-9]+\.[0-9]+' ${VERIFY_GATE_REL} | /usr/bin/head -1 || true)"`,
+  );
+}
+
+function assertMaterializedBaseline(rail: string, composite: boolean): void {
+  const document = composite ? YAML.parse(rail) as {
+    runs?: { steps?: { run?: string; if?: unknown }[] };
+  } : undefined;
+  const bodies = composite
+    ? (document?.runs?.steps ?? [])
+      .filter((step) => step.if === undefined && typeof step.run === "string")
+      .map((step) => step.run!)
+    : [rail];
+  expect(bodies.some((body) => {
+    const shell = activeShell(body);
+    const declaration = /^\s*baseline_root="[^"\n]+"$/m.exec(shell);
+    const invocation = /^\s*(?:THUMBMUX_CONTRACT_REMOTE_URL="\$contract_remote_url"\s+)?(?:bun|"\$THUMBMUX_GUARD_BUN_BIN") scripts\/materialize-contract-baseline\.ts "\$baseline_root"\s*$/m.exec(shell);
+    const binding = composite
+      ? /^\s*echo "THUMBMUX_CONTRACT_BASELINE_ROOT=\$baseline_root" >> "\$GITHUB_ENV"\s*$/m.exec(shell)
+      : /^\s*export THUMBMUX_CONTRACT_BASELINE_ROOT="\$baseline_root"\s*$/m.exec(shell);
+    if (!declaration || !invocation || !binding) return false;
+    if (!(declaration.index < invocation.index && invocation.index < binding.index)) return false;
+    // Reassigning the variable between materialization and publication breaks
+    // the data flow even though both commands still spell $baseline_root.
+    return !/\bbaseline_root\s*=/.test(shell.slice(
+      declaration.index + declaration[0].length, binding.index,
+    ));
+  })).toBe(true);
+}
+
+function assertContractCopyBeforeVerification(source: string): void {
+  const shell = activeShell(source);
+  const copy = 'cp "$PACKAGE_SOURCE/CONTRACT.md" "$WORK/package/"';
+  assertExecutableShellMarker(shell, copy);
+  // Locate the actual packed-asset loop, not a comment mentioning its path.
+  const verification = /^for asset in\s+package\/CONTRACT\.md\s+[\s\S]*?; do\n\s*grep -Fxq "\$asset" <<<"\$PACKAGE_CONTENTS"/m.exec(shell);
+  expect(verification).not.toBeNull();
+  expect(shell.indexOf(copy)).toBeLessThan(shell.indexOf(verification![0]));
+}
+
+function assertReleaseManifestHelper(workflow: string): void {
+  assertExecutableShellMarker(workflowShell(workflow), "bun scripts/prepare-release-package.ts .");
+}
+
+function assertSmokeManifestHelper(source: string): void {
+  const shell = activeShell(source);
+  const binding = 'RELEASE_MANIFEST="$PACKAGE_SOURCE/scripts/prepare-release-package.ts"';
+  const invocation = '"$THUMBMUX_GUARD_BUN_BIN" --no-install "$RELEASE_MANIFEST" .';
+  expect(shell.split("\n")).toContain(binding);
+  assertExecutableShellMarker(shell, invocation);
+  expect(shell.indexOf(binding)).toBeLessThan(shell.indexOf(invocation));
 }
 
 afterEach(() => {
@@ -208,6 +296,75 @@ describe("release rail policy", () => {
       releaseWorkflow.indexOf("bun run build:git-dist"),
     );
     expect(releaseWorkflow).toContain("bun scripts/check-release-retag.ts");
+    assertRetagBeforeBuild(releaseWorkflow);
+  });
+
+  test("strengthened rail guards reject mutations that presence checks accept", () => {
+    const checkMutation = (
+      name: string, real: string, mutant: string, marker: string,
+      guard: (source: string) => void,
+    ) => {
+      // A failed replacement must fail the test, never count as a killed mutant.
+      expect({ name, source: mutant }).not.toEqual({ name, source: real });
+      expect(real).toContain(marker);
+      expect(mutant).toContain(marker);
+      expect(() => guard(real)).not.toThrow();
+      expect(() => guard(mutant)).toThrow();
+    };
+    const retag = "bun scripts/check-release-retag.ts";
+    const build = "bun run build:git-dist";
+    checkMutation("retag-check-after-build", releaseWorkflow,
+      releaseWorkflow.replace(`run: ${retag}`, "run: echo retag deferred")
+        .replace(`run: ${build}`, `run: |\n          ${build}\n          ${retag}`),
+      retag, assertRetagBeforeBuild);
+
+    const pinLine = parity.split("\n").find((line) => line.startsWith("pinned_bun="))!;
+    checkMutation("parity-does-not-read-gate-pin-path", parity,
+      parity.replace(pinLine, pinLine.replace(VERIFY_GATE_REL, ".github/workflows/ci.yml")),
+      VERIFY_GATE_REL, assertParityGatePinRead);
+    checkMutation("parity-does-not-read-gate-pin-key", parity,
+      parity.replace(pinLine, pinLine.replace("bun-version:", "node-version:")),
+      "bun-version", assertParityGatePinRead);
+
+    const gate = readVerifyGate();
+    for (const [railName, rail, composite] of [
+      ["gate", gate, true], ["parity", parity, false],
+    ] as const) {
+      const guard = (source: string) => assertMaterializedBaseline(source, composite);
+      checkMutation(`baseline-root-not-bound-to-materializer/${railName}`, rail,
+        rail.replace('scripts/materialize-contract-baseline.ts "$baseline_root"',
+          'scripts/materialize-contract-baseline.ts "/tmp/unrelated-baseline"'),
+        "materialize-contract-baseline.ts", guard);
+      checkMutation(`baseline-root-separate-from-materializer/${railName}`, rail,
+        rail.replace('THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root',
+          'THUMBMUX_CONTRACT_BASELINE_ROOT=/tmp/unrelated-baseline')
+          .replace('THUMBMUX_CONTRACT_BASELINE_ROOT="$baseline_root"',
+            'THUMBMUX_CONTRACT_BASELINE_ROOT="/tmp/unrelated-baseline"'),
+        "THUMBMUX_CONTRACT_BASELINE_ROOT=", guard);
+    }
+
+    const copy = 'cp "$PACKAGE_SOURCE/CONTRACT.md" "$WORK/package/"';
+    const lateCopy = smoke.replace(copy, "# contract copy deferred") + `\n${copy}\n`;
+    checkMutation("contract-copy-after-verification", smoke, lateCopy,
+      copy, assertContractCopyBeforeVerification);
+    const verificationStart = smoke.indexOf("for asset in ");
+    const verificationEnd = smoke.indexOf("\ndone", verificationStart) + "\ndone".length;
+    const verification = smoke.slice(verificationStart, verificationEnd);
+    const earlyVerification = smoke.replace(verification, "# verification moved earlier")
+      .replace(copy, `${verification}\n${copy}`);
+    checkMutation("contract-verification-before-copy", smoke, earlyVerification,
+      "package/CONTRACT.md", assertContractCopyBeforeVerification);
+
+    checkMutation("release-helper-only-comment", releaseWorkflow,
+      releaseWorkflow.replace("          bun scripts/prepare-release-package.ts .",
+        "          # bun scripts/prepare-release-package.ts ."),
+      "prepare-release-package.ts", assertReleaseManifestHelper);
+    checkMutation("smoke-helper-only-comment", smoke,
+      smoke.replace('RELEASE_MANIFEST="$PACKAGE_SOURCE/scripts/prepare-release-package.ts"',
+        '# RELEASE_MANIFEST="$PACKAGE_SOURCE/scripts/prepare-release-package.ts"')
+        .replace('  "$THUMBMUX_GUARD_BUN_BIN" --no-install "$RELEASE_MANIFEST" .',
+          '  # "$THUMBMUX_GUARD_BUN_BIN" --no-install "$RELEASE_MANIFEST" .'),
+      "prepare-release-package.ts", assertSmokeManifestHelper);
   });
 
   test("1.0 retag rail permits version metadata but rejects code and script drift", () => {
@@ -381,6 +538,7 @@ describe("release rail policy", () => {
     // (not from a workflow that no longer owns the pin).
     expect(parity).toContain(VERIFY_GATE_REL);
     expect(parity).toContain("bun-version");
+    assertParityGatePinRead(parity);
 
     // Any bun-version that still appears in a workflow (e.g. release preflight
     // setup-bun so version/retag scripts can run before the long suite) must
@@ -502,6 +660,7 @@ describe("release rail policy", () => {
       // The old THUMBMUX_CONTRACT_REQUIRE_BASELINE switch is gone, and a rail that
       // still sets it would suggest the default is permissive.
       expect(rail).toContain("THUMBMUX_CONTRACT_BASELINE_ROOT=");
+      assertMaterializedBaseline(rail, rail === gate);
       expect(rail).not.toContain("THUMBMUX_CONTRACT_BASELINE=skip");
       expect(rail).not.toContain("tag --list 'v[0-9]*-dist'");
     }
@@ -518,6 +677,7 @@ describe("release rail policy", () => {
     expect(smoke).toContain('cp "$PACKAGE_SOURCE/CONTRACT.md" "$WORK/package/"');
     expect(smoke).toContain('cp -R "$PACKAGE_SOURCE/contract/manifest" "$WORK/package/contract/"');
     expect(smoke).toContain("package/CONTRACT.md");
+    assertContractCopyBeforeVerification(smoke);
     for (const subpath of ["core", "server", "svelte", "app"]) {
       expect(smoke).toContain(`package/contract/manifest/${subpath}.json`);
     }
@@ -602,6 +762,8 @@ describe("release rail policy", () => {
   test("release and smoke derive the packed root manifest from one helper", () => {
     expect(releaseWorkflow).toContain("prepare-release-package.ts");
     expect(smoke).toContain("prepare-release-package.ts");
+    assertReleaseManifestHelper(releaseWorkflow);
+    assertSmokeManifestHelper(smoke);
 
     const root = mkdtempSync(join(tmpdir(), "thumbmux-release-package-"));
     roots.push(root);
