@@ -10,10 +10,46 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { assertContractFixturePort } from "../contract/fixtures/runtime-guard";
 
 const roots: string[] = [];
 const runner = resolve(import.meta.dir, "contract-fixtures.sh");
+
+// Read command positions without executing the runner (or its tmux lifecycle).
+// svelte-check receives a tsconfig, not a .svelte positional argument: prove
+// both copies feed that command, then prove the config selects the copied file.
+function assertSemanticProbeInput(source: string, config: string, parentConfig: string) {
+  const parsed = spawnSync("/usr/bin/python3", ["-B", "-I", "-S", "-c", `
+import json, runpy, sys
+parser = runpy.run_path(sys.argv[1])
+print(json.dumps(list(parser["command_argv"](sys.stdin.read()))))
+`, resolve(import.meta.dir, "../../../ops/testing/tests/command-cage-wiring.py")], {
+    input: source, encoding: "utf8",
+  });
+  expect(parsed.status).toBe(0);
+  const commands: (string | null)[][] = JSON.parse(parsed.stdout);
+  const inputChain = [
+    ["cp", "<SCRIPT_DIR>/contract-app-host-probe.svelte", "src/ContractProbe.svelte"],
+    ["cp", "<SCRIPT_DIR>/contract-app-host-tsconfig.json", "contract-app-host-tsconfig.json"],
+    ["./node_modules/.bin/svelte-check", "--tsconfig", "./contract-app-host-tsconfig.json", "--fail-on-warnings"],
+  ];
+  expect(commands.some((_, index) => inputChain.every((argv, offset) =>
+    JSON.stringify(commands[index + offset]) === JSON.stringify(argv),
+  ))).toBe(true);
+  const selected = JSON.parse(config);
+  // The frozen parent has a leading license comment; no other JSONC is needed.
+  const parent = JSON.parse(parentConfig.replace(/^\s*\/\*[\s\S]*?\*\//, ""));
+  expect(selected.extends).toBe("./tsconfig.json");
+  expect(parent.extends).toBeUndefined();
+  for (const settings of [parent, selected]) {
+    expect(settings.exclude ?? []).toEqual([]);
+  }
+  expect(Array.isArray(selected.include)).toBe(true);
+  expect(selected.include.some((pattern: string) =>
+    new Bun.Glob(pattern).match("src/ContractProbe.svelte"),
+  )).toBe(true);
+}
 
 function untrustedHostEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env = { ...process.env } as Record<string, string>;
@@ -84,6 +120,33 @@ describe("frozen consumer runner policy", () => {
     expect(source).toContain("svelte-check");
     expect(source).toContain("contract-app-host-probe.svelte");
     expect(readFileSync(probe, "utf8")).toContain("<ThumbmuxApp {adapters} />");
+    assertSemanticProbeInput(
+      source,
+      readFileSync(resolve(import.meta.dir, "contract-app-host-tsconfig.json"), "utf8"),
+      readFileSync(resolve(import.meta.dir, "../contract/fixtures/app-host/tsconfig.json"), "utf8"),
+    );
+  });
+
+  test("semantic probe input rejects unrelated checks and excluded probe files", () => {
+    const source = readFileSync(runner, "utf8");
+    const config = readFileSync(resolve(import.meta.dir, "contract-app-host-tsconfig.json"), "utf8");
+    const parent = readFileSync(resolve(import.meta.dir, "../contract/fixtures/app-host/tsconfig.json"), "utf8");
+    const unrelated = source.replace(
+      /\.\/node_modules\/\.bin\/svelte-check \\\n\s*--tsconfig \.\/contract-app-host-tsconfig\.json \\\n\s*--fail-on-warnings/,
+      "./node_modules/.bin/svelte-check unrelated.svelte\n# contract-app-host-probe.svelte is not checked",
+    );
+    expect(unrelated).not.toBe(source);
+    expect(() => assertSemanticProbeInput(unrelated, config, parent)).toThrow();
+    const commentedCopy = source.replace(
+      '      cp "$SCRIPT_DIR/contract-app-host-probe.svelte" src/ContractProbe.svelte',
+      '      # cp "$SCRIPT_DIR/contract-app-host-probe.svelte" src/ContractProbe.svelte',
+    );
+    expect(commentedCopy).not.toBe(source);
+    expect(() => assertSemanticProbeInput(commentedCopy, config, parent)).toThrow();
+    expect(() => assertSemanticProbeInput(source,
+      JSON.stringify({ ...JSON.parse(config), include: ["type-contract.ts"] }), parent)).toThrow();
+    expect(() => assertSemanticProbeInput(source,
+      JSON.stringify({ ...JSON.parse(config), exclude: ["src/**/*.svelte"] }), parent)).toThrow();
   });
 
   test("runner uses an atomic tmux-namespace lock and never sweeps sessions", () => {
