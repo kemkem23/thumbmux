@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { YAML } from "bun";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -40,6 +41,42 @@ const roots: string[] = [];
 
 function readVerifyGate(): string {
   return readFileSync(resolve(packageRoot, VERIFY_GATE_REL), "utf8");
+}
+
+// These checks deliberately accept only unconditional gate jobs/steps. A new
+// condition needs policy review, rather than guessing GitHub expression truth.
+function assertActiveVerifyGate(workflow: string): void {
+  const document = YAML.parse(workflow) as {
+    jobs?: Record<string, { if?: unknown; steps?: { uses?: string; if?: unknown }[] }>;
+  };
+  const callers = Object.values(document.jobs ?? {}).flatMap((job) =>
+    (job.steps ?? []).filter((step) => step.uses === VERIFY_GATE_USES)
+      .map((step) => ({ job, step })),
+  );
+  expect(callers.length).toBeGreaterThan(0);
+  for (const { job, step } of callers) {
+    expect(job.if).toBeUndefined();
+    expect(step.if).toBeUndefined();
+  }
+}
+
+function assertExecutableGateMarker(gate: string, marker: string): void {
+  const document = YAML.parse(gate) as {
+    runs?: { steps?: { run?: string; if?: unknown }[] };
+  };
+  const commands = (document.runs?.steps ?? [])
+    .filter((step) => step.if === undefined && typeof step.run === "string")
+    .flatMap((step) => step.run!.split("\n"))
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  // Match command positions, not an echo/description containing the marker.
+  // Supported wrappers mirror this action: timeout, subshell, and && chains.
+  expect(commands.some((line) => line.split(/\s*&&\s*/).some((part) => {
+    const command = part.replace(/^\(/, "")
+      .replace(/^\/usr\/bin\/timeout\s+(?:--\S+\s+)*\S+\s+/, "");
+    return command === marker || command.startsWith(`${marker} `)
+      || command.startsWith(`${marker})`);
+  }))).toBe(true);
 }
 
 afterEach(() => {
@@ -240,6 +277,8 @@ describe("release rail policy", () => {
     // commit+tag+push) stay outside the gate on purpose.
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    assertActiveVerifyGate(ciWorkflow);
+    assertActiveVerifyGate(releaseWorkflow);
 
     const gate = readVerifyGate();
 
@@ -275,6 +314,27 @@ describe("release rail policy", () => {
     ];
     for (const marker of requiredGateMarkers) {
       expect(gate).toContain(marker);
+    }
+
+    // Metadata/pins and the --forbid-only explanatory comment above are not
+    // shell commands. Check the actual verification invocations in run blocks.
+    for (const marker of [
+      "bun install --frozen-lockfile",
+      '"$thumbmux_node_bin" "$playwright_cli" install --with-deps chromium',
+      "bun run build:git-dist",
+      "bun run smoke:git-dist",
+      "bun test --timeout 120000 ./server/tests/*.test.ts ./core/tests/*.test.ts ./core/src/*.test.ts ./svelte/tests/*.test.ts ./app/tests/*.test.ts ./demo/*.test.ts ./scripts/*.test.ts",
+      "cd demo",
+      "bun run build",
+      "./e2e/run-container.sh",
+      "bun pm pack",
+      "bun scripts/materialize-contract-baseline.ts",
+      'echo "THUMBMUX_CONTRACT_BASELINE_ROOT=$baseline_root"',
+      'untracked="$(git ls-files --others --exclude-standard)"',
+      "bun run contract",
+      "./scripts/contract-fixtures.sh",
+    ]) {
+      assertExecutableGateMarker(gate, marker);
     }
 
     // Guarded Docker/network lanes require the primary checkout to be the clean
@@ -346,6 +406,8 @@ describe("release rail policy", () => {
     // one path only).
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    assertActiveVerifyGate(ciWorkflow);
+    assertActiveVerifyGate(releaseWorkflow);
   });
 
   test("ci parity cannot call an E2E skip a pass and includes publish readiness", () => {
@@ -445,6 +507,8 @@ describe("release rail policy", () => {
     }
     expect(ciWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
     expect(releaseWorkflow).toContain(`uses: ${VERIFY_GATE_USES}`);
+    assertActiveVerifyGate(ciWorkflow);
+    assertActiveVerifyGate(releaseWorkflow);
     expect(parity).toContain("THUMBMUX_CONTRACT_REMOTE_URL");
     expect(parity.indexOf("thumbmux_emit_frozen_source_archive"))
       .toBeLessThan(parity.lastIndexOf("materialize-contract-baseline.ts"));
@@ -480,6 +544,30 @@ describe("release rail policy", () => {
     }
     expect(smoke).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$EXPORT_GUARD"');
     expect(smoke).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$RELEASE_MANIFEST"');
+  });
+
+  test("root smoke removes prerequisite images after containers on both exit paths", () => {
+    // Top-level closing brace bounds cleanup; do not accept a deletion in an
+    // unrelated function or only on the normal path as EXIT-trap coverage.
+    const cleanupMatch = /^cleanup\(\) \{\n([\s\S]*?)^\}/m.exec(smoke);
+    expect(cleanupMatch).not.toBeNull();
+    const cleanup = cleanupMatch![1];
+    const normal = smoke.slice(smoke.indexOf("\nDOCKER_RC=$?"));
+    expect(smoke).toMatch(/^trap cleanup EXIT$/m);
+    expect(smoke.indexOf("\nDOCKER_RC=$?")).toBeGreaterThan(-1);
+    for (const path of [cleanup, normal]) {
+      const container = /^\s*(?:if ! )?\/usr\/bin\/docker rm(?: -f)? "\$CONTAINER_ID"[^\n]*$/m.exec(path);
+      const image = /^\s*\/usr\/bin\/docker image rm "\$PREREQ_IMAGE"[^\n]*$/m.exec(path);
+      expect(container).not.toBeNull();
+      expect(image).not.toBeNull();
+      expect(container!.index).toBeLessThan(image!.index);
+    }
+    // Inspect all image-removal invocations, including continued lines and
+    // flags after the image name. Container rm -f is intentionally unrelated.
+    const logicalLines = smoke.replace(/\\\n/g, " ").split("\n");
+    for (const line of logicalLines.filter((line) => /\bdocker\s+(?:image\s+rm|rmi)\b/.test(line))) {
+      expect(line).not.toMatch(/(?:^|\s)(?:-[^-\s]*f[^\s]*|--force(?:=\S+)?)(?=\s|$)/);
+    }
   });
 
   test("packed Node 18 smoke permanently gates portable replay writer recovery", () => {
