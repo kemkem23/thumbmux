@@ -418,10 +418,11 @@ test('newarch v2: 100ms flush, byte threshold, idempotent post-commit retry, epo
   const start=Date.now();while(s.token(naKey).durableRevision===0 && Date.now()-start<500)await Bun.sleep(5);
   expect(s.token(naKey).durableRevision).toBe(1);expect(s.health().lastFlushAgeMs).toBeLessThanOrEqual(150);
   const large='x'.repeat(270000);await s.appendScroll({...naEvent('',2),physicalRow:{text:large,cells:[]}});
+  const thresholdStart=Date.now();while(s.token(naKey).durableRevision<2&&Date.now()-thresholdStart<500)await Bun.sleep(5);
   expect(s.token(naKey).durableRevision).toBe(2);
   await s.appendScroll(naEvent('retry',3));fail=true;
   expect(()=>s.flush()).toThrow('watermark fault');expect(s.token(naKey).durableRevision).toBe(2);expect(s.health().status).toBe('degraded');
-  s.flush();expect(ids.at(-1)).toBe(ids.at(-2));expect(s.token(naKey).durableRevision).toBe(3);
+  const retryId=ids.at(-1);s.flush();expect(ids.filter(id=>id===retryId).length).toBe(2);expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
   await s.appendScroll({...naEvent('new epoch',4),sourceEpoch:2});s.flush();
   const page=s.readPage(s.token(naKey),null,10);expect(page.lines.map(r=>r.sourceEpoch)).toEqual([1,1,1,2]);
   const db=new Database(s.file,{readonly:true});expect(db.query('SELECT count(*) AS n FROM na_line').get()).toEqual({n:4});
@@ -443,6 +444,6 @@ test('newarch v2: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
   for(let i=1;i<21;i++)expect(s.readPage(s.token(keys[i]),null,2).lines.map(r=>r.text)).toEqual([`pane:${i}`]);
   const db=new Database(s.file);db.exec('DELETE FROM na_line WHERE line_id=710');db.close();
   expect(()=>s.readPage(token,0,2000)).toThrow('page-seam-hole');
-  console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,missing:0,extra:0,wrong:0,deletedLine710Detected:true,health:s.health()}));
+  console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,missing:Math.max(0,oracle.length-rows.length),extra:Math.max(0,rows.length-oracle.length),wrong:rows.filter((r,i)=>r!==oracle[i]).length,deletedLine710Detected:true,health:s.health()}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },30000);

@@ -1,4 +1,5 @@
 import { Database } from 'bun:sqlite';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -42,6 +43,34 @@ function admitPath(options: ProjectionOptions): string {
   return file;
 }
 
+type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number};
+function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void):void {
+  disk.transaction(()=>{
+    if(Number(Object.values(disk.query('PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
+    const existing=disk.query('SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
+    if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');return;}
+    for(const p of batch.panes) upsert(disk,'na_pane',{...p,durable_revision:p.revision});
+    for(const [table,rows] of batch.tables)for(const row of rows)upsert(disk,table,row);
+    disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
+    before?.();
+  }).immediate();
+}
+// Same module in source and compiled distributions: no extra worker asset/factory.
+if(!isMainThread && workerData?.projectionDiskWriter===true) {
+  const signal=new Int32Array(workerData.signal);
+  const errors=new Uint8Array(workerData.signal,8);
+  const disk=new Database(workerData.file,{strict:true});
+  disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
+  parentPort!.on('message',(batch:Batch)=>{
+    try {commitBatch(disk,workerData.fence,batch);Atomics.store(signal,0,1);}
+    catch(error) {
+      const bytes=new TextEncoder().encode(String(error)).subarray(0,errors.length);
+      errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
+    }
+    Atomics.notify(signal,0);
+  });
+}
+
 type Job={bytes:number;at:number;run:()=>ProjectionReceipt;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
 
 /** One RAM writer, one disk writer, round-robin pane queues, independent of viewers. */
@@ -59,7 +88,15 @@ export class ProjectionStore implements ProjectionWriterPort {
   private degraded=false;
   private stopped=false;
   private timer:ReturnType<typeof setInterval>;
-  private retry:{id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number}|null=null;
+  private retry:Batch|null=null;
+  private worker:Worker|null=null;
+  private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
+  private inFlight=false;
+  private closing=false;
+  private rejectedRows=0;
+  private screenBytes=new Map<string,number>();
+  private dirtyFaults=new Set<string>();
+  private faults=new Map<string,{id:string;pane:string;last:number;count:number}>();
   private lastCommitAt:number|null=null;
   private lastFlushAgeMs=0;
   constructor(private readonly options:ProjectionOptions) {
@@ -84,9 +121,12 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.recover();
     } catch(error) { this.disk.close();this.ram.db.close();throw error; }
     this.timer=setInterval(()=>{
-      if(this.dirtySince!==null && Date.now()-this.dirtySince>=100) {try {this.flush();}catch{/* fault already emitted */}}
-      if(this.pendingAge()>1000) this.fault('flush-overdue','pending age exceeded 1s');
-    },10);
+      try {
+        if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=75)))this.flushAsync();
+      } catch(error) {this.fault('flush-failed',String(error));}
+      if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
+    },5);
     this.timer.unref();
   }
   private owner():void {
@@ -112,22 +152,45 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.lastCommitAt=last?Number(last.committed_at):null;
   }
   private pendingAge():number {
-    const times=[...(this.dirtySince===null?[]:[this.dirtySince]),...[...this.queues.values()].map(q=>q[0]?.at).filter((v):v is number=>v!==undefined)];
+    const times=[...(this.retry?[this.retry.since]:[]),...(this.dirtySince===null?[]:[this.dirtySince]),...[...this.queues.values()].map(q=>q[0]?.at).filter((v):v is number=>v!==undefined)];
     return times.length?Math.max(0,Date.now()-Math.min(...times)):0;
   }
-  private fault(kind:string,reason:string):void {
+  private pendingBytes():number {return this.dirtyBytes+this.queuedBytes+(this.retry?.bytes??0);}
+  private fault(kind:string,reason:string,key?:PaneKey):void {
     this.degraded=true;
-    const fault={kind,reason,at:Date.now(),pendingBytes:this.dirtyBytes+this.queuedBytes};
-    // Delivery must work even when disk is full or SQLite itself is unavailable.
+    const now=Date.now();
+    const panes=key?[this.ram.pane(key)]:this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[];
+    let emit=false;
+    this.ram.db.transaction(()=>{
+      for(const p of panes) {
+        const tag=String(p.pane_key)+':'+kind, previous=this.faults.get(tag);
+        const count=(previous?.count??0)+(kind==='ingest-capacity'?1:0);
+        if(previous && kind!=='ingest-capacity' && now-previous.last<1000)continue;
+        if(!previous || now-previous.last>=1000)emit=true;
+        const id=previous?.id??randomUUID();
+        this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run('degraded',p.pane_key);
+        this.ram.db.query(`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
+          ON CONFLICT(issue_id) DO UPDATE SET revision=excluded.revision,missing_count=excluded.missing_count,reason=excluded.reason`)
+          .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,kind==='ingest-capacity'?count:null,now);
+        this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,count});
+        // Updates coalesce under one issue id; account metadata once per pending episode.
+        if(!this.dirtyFaults.has(tag)){this.dirtyBytes+=1024;this.dirtyFaults.add(tag);}
+        this.dirtySince??=now;
+      }
+    })();
+    if(!emit && panes.length)return;
+    const fault={kind,reason,at:now,pendingBytes:this.pendingBytes()};
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
   private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt):Promise<ProjectionReceipt> {
     try {
-      this.owner(); if(this.stopped) throw new Error('ingest-stopped');
+      this.owner(); if(this.closing) throw new Error('store-closing');
       const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
-      if(this.dirtyBytes+this.queuedBytes+bytes>PENDING_MAX || this.ram.bytes()+bytes>CACHE_MAX) {
-        this.stopped=true;this.fault('ingest-capacity','refusing incoming event; no rows dropped from accepted queue');
+      if(this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX) {
+        this.stopped=true;this.rejectedRows++;
+        const value=input as ScrollEvent;this.ram.ensure(key,value.sourceEpoch,value.geometryGeneration);
+        this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key);
         throw new Error('ingest-capacity');
       }
       const id=paneId(key);this.queuedBytes+=bytes;
@@ -157,61 +220,118 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
     }
     if(this.queues.size) setTimeout(()=>this.pump(),0);else this.pumping=false;
-    if(this.dirtyBytes>=FLUSH_BYTES) {try{this.flush();}catch{/* keep pending; timer retries */}}
+
   }
   appendScroll(event:ScrollEvent):Promise<ProjectionReceipt> {return this.enqueue(event.paneKey,event,e=>this.ram.append(e));}
-  replaceScreen(frame:ProjectionFrame):Promise<ProjectionReceipt> {return this.enqueue(frame.paneKey,frame,f=>{this.ram.screen(f);return this.ram.bump(f.paneKey);});}
+  replaceScreen(frame:ProjectionFrame):Promise<ProjectionReceipt> {
+    // A live frame replaces the previous frame immediately, even under scroll pressure.
+    try {
+      this.owner();if(this.closing)throw new Error('store-closing');
+      const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame);return this.ram.bump(frame.paneKey);})();
+      const id=paneId(frame.paneKey)+':'+frame.kind, bytes=Buffer.byteLength(JSON.stringify(frame))+512;
+      this.dirtyBytes+=bytes-(this.screenBytes.get(id)??0);this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
+      return Promise.resolve(receipt);
+    }catch(error){return Promise.reject(error);}
+  }
   calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c));}
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
   screen(key:PaneKey,kind:'normal'|'alternate'='normal'):SqlRow|null {
     this.owner();return this.ram.db.query('SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
   }
   readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
-  flush():void {
-    this.owner();if(!this.dirtyBytes && !this.retry)return;
-    try {
-      if(!this.retry) {
-        const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
-        const tables=new Map<string,SqlRow[]>();
-        for(const table of ['na_capture','na_line','na_screen','na_issue']) {
-          tables.set(table,this.ram.db.query(`SELECT t.* FROM ${table} t JOIN na_pane p ON t.pane_key=p.pane_key WHERE t.revision>p.durable_revision`).all() as SqlRow[]);
+  private snapshot():Batch|null {
+    if(this.retry)return this.retry;
+    if(!this.dirtyBytes && this.dirtySince===null)return null;
+    const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
+    const tables=new Map<string,SqlRow[]>();
+    for(const table of ['na_capture','na_line','na_screen','na_issue']) {
+      const rows:SqlRow[]=[];
+      for(const p of panes)rows.push(...this.ram.db.query(`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
+      tables.set(table,rows);
+    }
+    const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
+    this.retry={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince??Date.now()};
+    this.dirtyBytes=0;this.dirtySince=null;this.screenBytes.clear();this.dirtyFaults.clear();
+    return this.retry;
+  }
+  private acknowledge():void {
+    const batch=this.retry!;
+    this.options.checkpoint?.('after-disk-commit',batch.id);
+    this.options.checkpoint?.('before-watermark',batch.id);
+    this.ram.db.transaction(()=>{
+      for(const p of batch.panes)this.ram.db.query('UPDATE na_pane SET durable_revision=? WHERE pane_key=?').run(p.revision,p.pane_key);
+      this.ram.evict(batch.panes);
+    })();
+    this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
+    this.retry=null;
+    if(this.pendingBytes()<PENDING_MAX/2) {
+      this.stopped=false;
+      // Only clear a fault once its latest revision reached disk. Recovery itself
+      // is another dirty pane revision, so the persisted health follows reality.
+      for(const p of batch.panes) {
+        const current=this.ram.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(p.pane_key) as SqlRow;
+        if(p.health==='degraded' && current.revision===p.revision) {
+          this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
+          for(const [tag,f] of this.faults)if(f.pane===p.pane_key)this.faults.delete(tag);
+          this.dirtyBytes+=512;this.dirtySince??=Date.now();
         }
-        const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
-        this.retry={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince!};
       }
-      const batch=this.retry;
-      this.disk.transaction(()=>{
-        this.owner();
-        const existing=this.disk.query('SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
-        if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');return;}
-        for(const p of batch.panes) upsert(this.disk,'na_pane',{...p,durable_revision:p.revision});
-        for(const [table,rows] of batch.tables)for(const row of rows)upsert(this.disk,table,row);
-        this.disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
-        this.options.checkpoint?.('before-disk-commit',batch.id);
-      }).immediate();
-      this.options.checkpoint?.('after-disk-commit',batch.id);
-      this.options.checkpoint?.('before-watermark',batch.id);
-      this.ram.db.transaction(()=>{
-        for(const p of batch.panes)this.ram.db.query('UPDATE na_pane SET durable_revision=? WHERE pane_key=?').run(p.revision,p.pane_key);
-        this.ram.evict();
-      })();
-      this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
-      this.dirtyBytes-=batch.bytes;this.dirtySince=this.dirtyBytes?batch.since:null;
-      this.retry=null;this.degraded=false;
+      this.degraded=this.faults.size>0;
+    }
+  }
+  private finishWorker():void {
+    const state=Atomics.load(this.signal,0);
+    if(!state)return;
+    this.inFlight=false;
+    if(state===2)throw new Error(new TextDecoder().decode(new Uint8Array(this.signal.buffer,8,Atomics.load(this.signal,1))));
+    this.acknowledge();
+  }
+  private flushAsync():void {
+    this.owner();const batch=this.snapshot();if(!batch)return;
+    if(!this.worker) {
+      this.worker=new Worker(new URL(import.meta.url),{workerData:{projectionDiskWriter:true,file:this.file,fence:this.fence,signal:this.signal.buffer}});
+      this.worker.on('error',error=>{
+        const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
+        new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
+      });
+      this.worker.unref();
+    }
+    this.options.checkpoint?.('before-disk-commit',batch.id);
+    Atomics.store(this.signal,0,0);this.inFlight=true;this.worker.postMessage(batch);
+  }
+  /** Explicit durability barrier remains synchronous; the ingest pump never calls it. */
+  flush():void {
+    this.owner();
+    try {
+      if(this.inFlight) {
+        if(Atomics.wait(this.signal,0,0,5000)==='timed-out')throw new Error('disk-worker-timeout');
+        this.finishWorker();
+      }
+      let batch:Batch|null;
+      while((batch=this.snapshot())) {
+        commitBatch(this.disk,this.fence,batch,()=>this.options.checkpoint?.('before-disk-commit',batch.id));
+        this.acknowledge();
+      }
     }catch(error){this.fault('flush-failed',String(error));throw error;}
   }
   health():ProjectionHealth {
     this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
     const panes=(this.ram.db.query('SELECT server_identity,pane_id,birth_generation FROM na_pane').all() as SqlRow[])
       .map(p=>this.ram.token({serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)}));
-    return {status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.dirtyBytes+this.queuedBytes,
+    return {status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
       pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,panes};
   }
   async close():Promise<void> {
     if(this.closed)return;
-    this.stopped=true;
-    while(this.pumping)await new Promise(resolve=>setTimeout(resolve,1));
-    this.flush();clearInterval(this.timer);this.closed=true;this.ram.db.close();this.disk.close();
+    this.closing=true;clearInterval(this.timer);
+    try {
+      while(this.pumping)await new Promise(resolve=>setTimeout(resolve,1));
+      this.flush();
+    } finally {
+      this.closed=true;
+      if(this.worker)await this.worker.terminate();
+      this.ram.db.close();this.disk.close();
+    }
   }
 }
 export function createProjectionStore(options:ProjectionOptions):ProjectionStore {return new ProjectionStore(options);}

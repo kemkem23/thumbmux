@@ -161,6 +161,7 @@ test('newarch: real SIGKILL before disk commit, after commit, before RAM waterma
  const summary=[];
  try{
   for(const phase of ['before-disk-commit','after-disk-commit','before-watermark']) {
+   let lost=0;
    for(let trial=0;trial<20;trial++) {
     const dir=join(root,`${phase}-${trial}`);mkdirSync(dir);
     const script=`import {createProjectionStore} from ${JSON.stringify(module)};
@@ -176,12 +177,13 @@ test('newarch: real SIGKILL before disk commit, after commit, before RAM waterma
     try{
      const expected=phase==='before-disk-commit'?['durable-before']:['durable-before','in-flight'];
      const token=s.token(key);expect(token.revision).toBe(expected.length);expect(token.durableRevision).toBe(expected.length);
-     expect(s.readPage(token,null,10).lines.map(r=>r.text)).toEqual(expected);
+     const actual=s.readPage(token,null,10).lines.map(r=>r.text);lost+=expected.filter(r=>!actual.includes(r)).length;
+     expect(actual).toEqual(expected);
      await s.appendScroll({paneKey:key,sourceEpoch:2,geometryGeneration:1,receiveSeq:0,softWrap:false,physicalRow:{text:'restarted',cells:[]}});
      s.flush();expect(s.token(key).nextLineId).toBe(expected.length+1);
     }finally{await s.close();}
    }
-   summary.push({phase,trials:20,signal:'SIGKILL',durableRowsLost:0});
+   summary.push({phase,trials:20,signal:'SIGKILL',durableRowsLost:lost});
   }
   console.log('NA_CRASH_PROOF',JSON.stringify(summary));
  }finally{rmSync(root,{recursive:true,force:true});}
@@ -197,12 +199,83 @@ test('newarch: actual SQLITE_FULL preserves pending rows and reports host fault 
   disk.exec(`PRAGMA max_page_count=${pages}`);
   const event={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'x'.repeat(300000),cells:[]}};
   await s.appendScroll(event);
+  expect(()=>s.flush()).toThrow(/full/i);
   expect(faults.some(f=>/full/i.test(f.reason))).toBe(true);
   expect(s.health().status).toBe('degraded');expect(s.token(key).durableRevision).toBe(0);
   expect(s.readPage(s.token(key),null,1).lines[0].text).toBe(event.physicalRow.text);
   expect(s.health().pendingBytes).toBeGreaterThan(0);
   disk.exec('PRAGMA max_page_count=1073741823');s.flush();
-  expect(s.token(key).durableRevision).toBe(1);expect(s.health().pendingBytes).toBe(0);
+  expect(s.token(key).durableRevision).toBe(s.token(key).revision);expect(s.health().pendingBytes).toBe(0);
   console.log('NA_DISK_FULL',JSON.stringify({sqliteFull:true,hostFaults:faults.length,rowsLost:0,pendingAfterRetry:s.health().pendingBytes}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: random external SIGKILL x40 crosses eviction, independent durable oracle',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-random-crash-'));
+ const key={serverIdentity:'random-crash',paneId:'%1',birthGeneration:1};
+ const module=join(import.meta.dir,'../src/sqlite-history/projection-store.ts');
+ const oracle=join(root,'oracle.json');let lost=0,duplicates=0,wrong=0,maxRows=0;
+ try {
+  const initial=createProjectionStore({historyRoot:root,mode:'create'});
+  for(let n=0;n<5100;n++)await initial.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n+1,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+  initial.flush();writeFileSync(oracle,JSON.stringify({next:initial.token(key).nextLineId}));await initial.close();
+  for(let trial=0;trial<40;trial++) {
+   const script=`import {createProjectionStore} from ${JSON.stringify(module)};
+    import {openSync,writeSync,fsyncSync,closeSync,renameSync} from 'node:fs';
+    const s=createProjectionStore({historyRoot:${JSON.stringify(root)},mode:'recover'}),key=${JSON.stringify(key)};
+    for(let n=s.token(key).nextLineId;;n++) {
+      await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n+1,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+      if(n%31===0){s.flush();const fd=openSync(${JSON.stringify(oracle+'.next')},'w');writeSync(fd,JSON.stringify({next:s.token(key).nextLineId}));fsyncSync(fd);closeSync(fd);renameSync(${JSON.stringify(oracle+'.next')},${JSON.stringify(oracle)});}
+      if(n%8===0)await Bun.sleep(1);
+    }`;
+   const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'ignore',stderr:'pipe'});
+   await Bun.sleep(150+Math.floor(Math.random()*200));child.kill('SIGKILL');await child.exited;
+   expect(child.signalCode).toBe('SIGKILL');
+   const expected=JSON.parse(readFileSync(oracle,'utf8')).next;
+   const s=createProjectionStore({historyRoot:root,mode:'recover'});
+   try {
+    const token=s.token(key);lost+=Math.max(0,expected-token.nextLineId);maxRows=Math.max(maxRows,token.nextLineId);
+    expect(token.revision).toBe(token.durableRevision);
+    let anchor:number|null=null,seen=0;const texts=new Set<string>();
+    do {const page=s.readPage(token,anchor,2000);for(const row of page.lines){if(texts.has(row.text))duplicates++;texts.add(row.text);if(row.text!==String(seen))wrong++;seen++;}anchor=page.hasMore?page.nextAnchor:null;}while(anchor!==null);
+    lost+=Math.max(0,token.nextLineId-seen);
+   }finally{await s.close();}
+  }
+  console.log('NA_RANDOM_CRASH',JSON.stringify({trials:40,seedRows:5100,maxRows,lost,duplicates,wrong}));
+  expect(maxRows).toBeGreaterThan(5100);expect(lost+duplicates+wrong).toBe(0);
+ }finally{rmSync(root,{recursive:true,force:true});}
+},120000);
+
+test('newarch: scroll pressure recovers, live screen survives, exact loss issue persists',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-pressure-')),faults:any[]=[];
+ const key={serverIdentity:'pressure',paneId:'%1',birthGeneration:1};
+ const s=createProjectionStore({historyRoot:root,mode:'create',onFault:f=>faults.push(f)});
+ const event=(text:string,receiveSeq:number)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq,softWrap:false,physicalRow:{text,cells:[]}});
+ try {
+  // Queue pressure is deterministic; no producer waits for a prior receipt.
+  const outcomes=await Promise.all(Array.from({length:20},(_,i)=>s.appendScroll(event('x'.repeat(1024*1024),i)).then(()=>true,()=>false)));
+  const refused=outcomes.filter(v=>!v).length;expect(refused).toBeGreaterThan(0);expect(s.health().rejectedRows).toBe(refused);
+  await s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:20,cols:1,rows:1,kind:'normal',cells:[[{grapheme:'Z',width:1,continuation:false,fg:null,bg:null,style:0}]],cursor:null});
+  expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('Z');
+  expect((s as any).ram.pane(key).health).toBe('degraded');
+  s.flush();await s.appendScroll(event('recovered',21));s.flush();expect(s.health().status).toBe('healthy');
+  const disk=new Database(s.file,{readonly:true});
+  try {
+    expect(disk.query("SELECT sum(missing_count) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:refused});
+    expect(disk.query('SELECT health FROM na_pane').get()).toEqual({health:'healthy'});
+  }finally{disk.close();}
+  console.log('NA_PRESSURE',JSON.stringify({refused,counter:s.health().rejectedRows,faultNotifications:faults.length,screen:'Z',recovered:s.health().status}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('newarch: close releases timer and handles even when final flush throws',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-close-full-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'}),disk=(s as any).disk as Database;
+ try {
+  const pages=(disk.query('PRAGMA page_count').get() as any).page_count;disk.exec(`PRAGMA max_page_count=${pages}`);
+  await s.appendScroll({paneKey:{serverIdentity:'close',paneId:'%1',birthGeneration:1},sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'x'.repeat(300000),cells:[]}});
+  await expect(s.close()).rejects.toThrow(/full/i);await s.close();
+  expect(()=>s.health()).toThrow('store-closed');expect(()=>disk.query('SELECT 1').get()).toThrow();
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 });

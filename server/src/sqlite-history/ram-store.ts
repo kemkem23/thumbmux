@@ -25,7 +25,9 @@ export function encodeCells(cells: PhysicalRow['cells']): string {
   const runs: Array<[PhysicalRow['cells'][number],number]> = [];
   for(const cell of cells) {
     const last=runs.at(-1);
-    if(last && JSON.stringify(last[0])===JSON.stringify(cell)) last[1]++;
+    if(last && last[0].grapheme===cell.grapheme && last[0].width===cell.width
+      && last[0].continuation===cell.continuation && last[0].fg===cell.fg
+      && last[0].bg===cell.bg && last[0].style===cell.style) last[1]++;
     else runs.push([cell,1]);
   }
   return JSON.stringify(runs);
@@ -143,13 +145,16 @@ export class ProjectionRam {
     const size=this.db.query('PRAGMA page_size').get() as {page_size:number};
     return pages.page_count*size.page_size;
   }
-  evict(): void {
-    // 4500 unchecked-history candidates + 500 physical-row tray, including screen.
-    this.db.exec(`DELETE FROM na_line WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_line.pane_key)
-      AND line_id < (SELECT max(0,next_line_id-5000) FROM na_pane p WHERE p.pane_key=na_line.pane_key);
-      DELETE FROM na_capture WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_capture.pane_key)
-      AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=na_capture.pane_key AND l.checked_capture_id=na_capture.capture_id)
-      AND NOT EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_key=na_capture.pane_key AND s.last_capture_id=na_capture.capture_id);
-      DELETE FROM na_issue WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_issue.pane_key);`);
+  evict(panes: SqlRow[]): void {
+    // Indexed ranges only for committed panes; never visit every resident line.
+    for (const p of panes) {
+      this.db.query('DELETE FROM na_line WHERE pane_key=? AND line_id<? AND revision<=?')
+        .run(p.pane_key, Math.max(0, Number(p.next_line_id)-5000), p.revision);
+      this.db.query(`DELETE FROM na_capture WHERE pane_key=? AND revision<=?
+        AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=na_capture.pane_key AND l.checked_capture_id=na_capture.capture_id)
+        AND NOT EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_key=na_capture.pane_key AND s.last_capture_id=na_capture.capture_id)`)
+        .run(p.pane_key,p.revision);
+      this.db.query('DELETE FROM na_issue WHERE pane_key=? AND revision<=?').run(p.pane_key,p.revision);
+    }
   }
 }

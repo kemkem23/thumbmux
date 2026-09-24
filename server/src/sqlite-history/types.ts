@@ -194,7 +194,7 @@ export interface ProjectionPage {
 }
 export interface ProjectionFault { kind: string; at: number; reason: string; pendingBytes: number }
 export interface ProjectionHealth {
-  status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number;
+  status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
   panes: ProjectionToken[];
 }
