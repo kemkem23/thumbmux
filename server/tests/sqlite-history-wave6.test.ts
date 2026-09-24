@@ -578,12 +578,10 @@ import { tmpdir, cpus } from 'node:os';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
 import type { ProjectionCell } from '../src/sqlite-history/types';
 
-test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geometries',async()=>{
+async function measureProjectionLoad(cols:number,rows:number) {
  const root=mkdtempSync(join(tmpdir(),'na-steady-'));
  const stats=(a:number[])=>{const x=[...a].sort((a,b)=>a-b);const at=(p:number)=>x[Math.max(0,Math.ceil(x.length*p)-1)]??null;return {n:x.length,p50:at(.5),p95:at(.95),p99:at(.99),max:x.at(-1)??null};};
- const results:any[]=[];
- try{
-  for(const [cols,rows] of [[80,24],[120,40]]) {
+ try {
    const s=createProjectionStore({historyRoot:join(root,`${cols}`),mode:'create'});
    const timings:Record<string,{calls:number,totalMs:number,maxMs:number}>={};
    const instrument=(target:any,name:string,label=name)=>{
@@ -639,9 +637,24 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
     const cpu=process.cpuUsage(cpuStart);
     const result={timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
       pendingBytes:stats(pending),flushAgeMs:stats(ages),screenResolveMs:stats(screens),rssBytes:stats(rss),healthSampleGapMs:stats(sampleGaps),missing,extra,wrong};
-    results.push(result);console.log('NA_OPEN_LOOP',JSON.stringify(result));
+    console.log('NA_OPEN_LOOP',JSON.stringify(result));return result;
    }finally{await s.close();}
-  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+}
+
+test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geometries',async()=>{
+ const results:any[]=[];
+ for(const [cols,rows] of [[80,24],[120,40]]) {
+  const module=join(import.meta.dir,'../src/sqlite-history/projection-store.ts');
+  const script=`import {createProjectionStore} from ${JSON.stringify(module)};
+    import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
+    await (${measureProjectionLoad.toString()})(${cols},${rows});`;
+  const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+  const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  console.log(out);if(err)console.error(err);expect(exit).toBe(0);
+  const line=out.split('\n').find(l=>l.startsWith('NA_OPEN_LOOP '));expect(line).toBeDefined();
+  results.push(JSON.parse(line!.slice('NA_OPEN_LOOP '.length)));
+ }
   for(const r of results) {
     expect(r.refused).toBe(0);expect(r.screenRefused).toBe(0);expect(r.accepted).toBe(126000);
     expect(r.producerMs).toBeLessThan(61000);expect(r.healthSampleGapMs.max).toBeLessThanOrEqual(100);
@@ -650,5 +663,4 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
     expect(r.rssBytes.max).toBeLessThanOrEqual(256*1024*1024);
     expect(r.missing+r.extra+r.wrong).toBe(0);
   }
- }finally{rmSync(root,{recursive:true,force:true});}
 },240000);

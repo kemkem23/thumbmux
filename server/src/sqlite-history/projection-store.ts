@@ -192,7 +192,8 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true):Promise<ProjectionReceipt> {
     try {
-      this.owner(); if(this.closing) throw new Error('store-closing');
+      if(this.closed)throw new Error('store-closed');
+      if(this.closing)throw new Error('store-closing');
       const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
       if(this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX) {
         this.stopped=true;if(isScroll)this.rejectedRows++;
@@ -213,13 +214,18 @@ export class ProjectionStore implements ProjectionWriterPort {
     } catch(error) {return Promise.reject(error);}
   }
   private pump():void {
+    // Admission is only a reservation. Check the fence before applying the
+    // queued batch; commitBatch independently checks again inside the disk TX.
+    try {this.owner();}catch(error) {
+      for(const q of this.queues.values())for(const job of q)job.reject(error);
+      this.queues.clear();this.queuedBytes=0;this.pumping=false;return;
+    }
     let processed=0;
     while(this.queues.size && processed<128) {
       for(const [id,q] of this.queues) {
         const job=q.shift()!;if(!q.length)this.queues.delete(id);
         this.queuedBytes-=job.bytes;
         try {
-          this.owner();
           const receipt=this.ram.db.transaction(()=>{
             const receipt=job.run();
             if(this.ram.bytes()>CACHE_MAX) throw new Error('ram-cache-limit');

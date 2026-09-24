@@ -464,3 +464,20 @@ test('newarch: compact cells preserve every field, legacy v2 runs and screen rec
   try{expect(JSON.parse(String(r.screen(naKey)!.cells_json))).toEqual([cells]);}finally{await r.close();}
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+
+test('newarch: queued old writer is fenced before RAM acknowledgement and disk commit',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fence-'));
+ const old=createProjectionStore({historyRoot:dir,mode:'create'});
+ let current:ReturnType<typeof createProjectionStore>|undefined;
+ try {
+  await old.appendScroll(naEvent('durable',1));old.flush();
+  const pending=old.appendScroll(naEvent('old queued',2));
+  current=createProjectionStore({historyRoot:dir,mode:'recover'});
+  await expect(pending).rejects.toThrow('stale-writer');
+  expect(()=>old.flush()).toThrow('stale-writer');
+  await expect(old.close()).rejects.toThrow('stale-writer');
+  await current.appendScroll(naEvent('new writer',2));current.flush();
+  expect(current.readPage(current.token(naKey),null,10).lines.map(r=>r.text)).toEqual(['durable','new writer']);
+ }finally{await old.close();await current?.close();rmSync(dir,{recursive:true,force:true});}
+});
