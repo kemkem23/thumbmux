@@ -44,16 +44,18 @@ function admitPath(options: ProjectionOptions): string {
 }
 
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number};
-function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void):void {
+function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void) {
+  const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
     if(Number(Object.values(disk.query('PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
     const existing=disk.query('SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
-    if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');return;}
+    if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');writeMs=performance.now()-started;return;}
     for(const p of batch.panes) upsert(disk,'na_pane',{...p,durable_revision:p.revision});
     for(const [table,rows] of batch.tables)for(const row of rows)upsert(disk,table,row);
     disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
-    before?.();
+    before?.();writeMs=performance.now()-started;
   }).immediate();
+  const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs};
 }
 // Same module in source and compiled distributions: no extra worker asset/factory.
 if(!isMainThread && workerData?.projectionDiskWriter===true) {
@@ -62,7 +64,11 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const disk=new Database(workerData.file,{strict:true});
   disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
   parentPort!.on('message',(batch:Batch)=>{
-    try {commitBatch(disk,workerData.fence,batch);Atomics.store(signal,0,1);}
+    try {
+      const timing=commitBatch(disk,workerData.fence,batch);
+      Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
+      Atomics.store(signal,0,1);
+    }
     catch(error) {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,errors.length);
       errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
@@ -93,6 +99,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private worker:Worker|null=null;
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
+  private diskTiming={totalMs:0,writeMs:0,commitMs:0};
   private closing=false;
   private rejectedRows=0;
   private screenBytes=new Map<string,number>();
@@ -314,6 +321,8 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(!state)return;
     this.inFlight=false;
     if(state===2)throw new Error(new TextDecoder().decode(new Uint8Array(this.signal.buffer,8,Atomics.load(this.signal,1))));
+    const totalMs=Atomics.load(this.signal,2)/1000,writeMs=Atomics.load(this.signal,3)/1000;
+    this.diskTiming={totalMs,writeMs,commitMs:totalMs-writeMs};
     this.acknowledge();
   }
   private ensureWorker():void {
@@ -345,7 +354,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       let batch:Batch|null;
       while((batch=this.snapshot())) {
         const current=batch;
-        commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id));
+        this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id));
         this.acknowledge();
       }
     }catch(error){this.fault('flush-failed',String(error));throw error;}

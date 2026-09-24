@@ -586,13 +586,14 @@ async function measureProjectionLoad(cols:number,rows:number) {
    const timings:Record<string,{calls:number,totalMs:number,maxMs:number}>={};
    const instrument=(target:any,name:string,label=name)=>{
      const original=target[name].bind(target),t=timings[label]={calls:0,totalMs:0,maxMs:0};
-     target[name]=(...args:any[])=>{const start=performance.now();try{const result=original(...args);if(name==='acknowledge')ages.push((s as any).lastFlushAgeMs);return result;}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
+     target[name]=(...args:any[])=>{const start=performance.now();try{const result=original(...args);if(name==='acknowledge'){ages.push((s as any).lastFlushAgeMs);const d=(s as any).diskTiming;diskTotal.push(d.totalMs);diskWrite.push(d.writeMs);diskCommit.push(d.commitMs);}return result;}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
    };
    for(const name of ['owner','appendScroll','enqueue','pump','snapshot','acknowledge','replaceScreen'])instrument(s,name);
    for(const name of ['append','screen','bytes','evict'])instrument((s as any).ram,name,'ram.'+name);
    const keys=Array.from({length:21},(_,i)=>({serverIdentity:'open-loop',paneId:`%${i}`,birthGeneration:1}));
    const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
    const cells=Array.from({length:rows},()=>Array.from({length:cols},()=>cell(' ')));
+   const diskTotal:number[]=[],diskWrite:number[]=[],diskCommit:number[]=[];
    const pending:number[]=[],ages:number[]=[],rss:number[]=[],screens:number[]=[],sampleGaps:number[]=[];
    const active=new Set<Promise<unknown>>();let refused=0,screenRefused=0,accepted=0,produced=0,frames=0;
    let missing=0,extra=0,wrong=0;
@@ -634,7 +635,7 @@ async function measureProjectionLoad(cols:number,rows:number) {
       missing+=Math.max(0,6000-seen);extra+=Math.max(0,seen-6000);
     }
     const cpu=process.cpuUsage(cpuStart);
-    const result={timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
+    const result={diskTotalMs:stats(diskTotal),diskWriteMs:stats(diskWrite),diskCommitMs:stats(diskCommit),timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
       pendingBytes:stats(pending),flushAgeMs:stats(ages),screenResolveMs:stats(screens),rssBytes:stats(rss),healthSampleGapMs:stats(sampleGaps),missing,extra,wrong};
     console.log('NA_OPEN_LOOP',JSON.stringify(result));return result;
    }finally{await s.close();}

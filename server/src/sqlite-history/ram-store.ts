@@ -66,8 +66,13 @@ export function upsert(db: Database, table: string, row: SqlRow): void {
   if (!/^na_(pane|capture|line|screen|issue|commit)$/.test(table)) throw new Error('invalid-table');
   const columns = Object.keys(row);
   if (columns.some(c => !/^[a-z_]+$/.test(c))) throw new Error('invalid-column');
+  // These identity columns are equal on every possible UNIQUE conflict. Do not
+  // assign them again: SQLite otherwise schedules parent-key foreign-key work.
+  const identities:Record<string,string[]>={na_pane:['pane_key'],na_capture:['pane_key','capture_id'],
+    na_line:['pane_key','line_id'],na_screen:['pane_key','screen_kind'],na_issue:['issue_id'],na_commit:['commit_id']};
+  const mutable=columns.filter(c=>!identities[table].includes(c));
   db.query(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})
-    ON CONFLICT DO UPDATE SET ${columns.map(c=>`${c}=excluded.${c}`).join(',')}`).run(...Object.values(row));
+    ON CONFLICT DO UPDATE SET ${mutable.map(c=>`${c}=excluded.${c}`).join(',')}`).run(...Object.values(row));
 }
 
 /** Only the bounded live working set lives here. Disk history is never loaded wholesale. */
