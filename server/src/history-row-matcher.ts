@@ -109,8 +109,17 @@ export function matchHistoryRows(
     const uniqueTriple = (start: number, rows: readonly CapturedRow[]) => {
       const pattern = recent.slice(start, start + 3);
       if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return false;
+      // Pick a discriminating glyph once, avoiding full scans of candidates
+      // whose ordinary row labels differ only near the end of their prefix.
+      let probe = 0;
+      for (let x = 0; x < pattern[0]!.cells.length; x++) {
+        if (pattern[0]!.cells[x]!.grapheme !== pattern[1]!.cells[x]?.grapheme
+          || pattern[0]!.cells[x]!.grapheme !== pattern[2]!.cells[x]?.grapheme) { probe = x; break; }
+      }
+      const glyph = pattern[0]!.cells[probe]?.grapheme;
       let hits = 0;
       for (let i = 0; i + 2 < rows.length; i++) {
+        if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
         if (equalHistoryRows(pattern[0]!, rows[i]!) && equalHistoryRows(pattern[1]!, rows[i + 1]!)
           && equalHistoryRows(pattern[2]!, rows[i + 2]!) && ++hits > 1) return false;
       }
@@ -122,8 +131,9 @@ export function matchHistoryRows(
     }
     if (differences === 1 && mismatch >= 3 && mismatch + 3 < recent.length
       && [mismatch - 3, mismatch + 1].every(start => uniqueTriple(start, recent) && uniqueTriple(start, captured))) {
-      return { reason: 'matched',
-        checks: recent.flatMap((row, i) => i === mismatch ? [] : [{ lineId: row.lineId, capturedRow: i }]),
+      const checks: RowMatch['checks'] = [];
+      for (let i = 0; i < recent.length; i++) if (i !== mismatch) checks.push({ lineId: recent[i]!.lineId, capturedRow: i });
+      return { reason: 'matched', checks,
         repairs: [{ lineId: recent[mismatch]!.lineId, capturedRow: mismatch, row: captured[mismatch]! }] };
     }
   }
@@ -225,9 +235,9 @@ export class IncrementalHistoryMatcher {
     return result;
   }
   remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {
-    const retained = new Set(recent.map(row => row.lineId));
-    for (const id of this.checked.keys()) if (!retained.has(id)) this.checked.delete(id);
+    // Only the terminal verified triple is needed to seed the next chain.
+    // Copying 128 full rows on every 200ms tick dominated collector work.
     this.checked.clear();
-    for (const check of match.checks.slice(-128)) this.checked.set(check.lineId, structuredClone(captured[check.capturedRow]!));
+    for (const check of match.checks.slice(-3)) this.checked.set(check.lineId, structuredClone(captured[check.capturedRow]!));
   }
 }
