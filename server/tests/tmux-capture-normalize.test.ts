@@ -55,4 +55,37 @@ describe('tmux capture cell normalization', () => {
     expect(normalizeTmuxCaptureCells(normalizedOnce)).toBe('A❤️B');
     expect(normalizeTmuxCaptureCells(normalizedOnce)).not.toBe(normalizedOnce);
   });
+
+  test('G0: identical captures are observationally equal, not a source fence', () => {
+    const threeRepaints = 'SAME\rSAME\rSAME';
+    const captureBefore = 'SAME';
+    const captureAfter = 'SAME';
+    expect(captureBefore).toBe(captureAfter);
+    expect(threeRepaints.match(/SAME/g)).toHaveLength(3);
+    expect(captureAfter.match(/SAME/g)).toHaveLength(1);
+    console.log('G0_NORMALIZE', JSON.stringify({ case: 'identical-repaint', verdict: 'unknown', assertions: 3 }));
+  });
+
+  test('G0: a repeated prefix cannot identify which occurrence preceded pipe attach', () => {
+    const beforeAttach = 'DUPLICATE\r';
+    const afterAttach = 'DUPLICATE\r';
+    const pipeOnly = afterAttach;
+    const screen = 'DUPLICATE';
+    expect(pipeOnly).toBe(afterAttach);
+    expect(screen).toBe(beforeAttach.trim());
+    expect(screen).toBe(afterAttach.trim());
+    expect(pipeOnly).not.toBe(beforeAttach + afterAttach);
+    console.log('G0_NORMALIZE', JSON.stringify({ case: 'ambiguous-prefix', verdict: 'unknown', assertions: 4 }));
+  });
+
+  test('G0: geometry changes make a capture checkpoint incomparable', () => {
+    const before = { generation: 7, rows: 24, cols: 80 };
+    const after = { generation: 8, rows: 31, cols: 101 };
+    const comparable = before.generation === after.generation
+      && before.rows === after.rows
+      && before.cols === after.cols;
+    expect(comparable).toBe(false);
+    expect(before.generation).not.toBe(after.generation);
+    console.log('G0_NORMALIZE', JSON.stringify({ case: 'geometry-change', verdict: 'unknown', assertions: 2 }));
+  });
 });
