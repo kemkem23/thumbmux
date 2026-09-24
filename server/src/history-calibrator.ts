@@ -141,6 +141,8 @@ export class HistoryCalibrator {
       if (equalCalibrationFrames(latest.parserFrame, capture.frame)) {
         this.mode = 'PIPE'; this.latchAt = undefined; this.degraded = false;
       } else this.enterCapture();
+      // A committed capture supersedes any pipe publish queued before it.
+      this.pendingPipe = undefined; this.nextPipePublish = Infinity;
       this.ports.publish(committed, capture.frame);
       successful = true;
       this.forceFull = false;
@@ -156,7 +158,10 @@ export class HistoryCalibrator {
         this.ports.fault({ kind: 'capture-latch-degraded', at, missingCount: null });
       }
       const interval = !successful || this.mode === 'CAPTURE' ? 50 : at - this.outputAt <= 200 ? 200 : 1000;
-      this.request(Math.max(at, now + interval));
+      // An event timer may have fired while capture was in flight. Re-arm
+      // explicitly, and retain the 50ms minimum between capture starts.
+      this.deadline = Math.max(now + 50, Math.min(this.deadline, Math.max(at, now + interval)));
+      this.ports.schedule(this.dueAt);
     }
   }
 }

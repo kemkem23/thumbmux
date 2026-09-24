@@ -767,6 +767,36 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     h.time(400); await h.calibrator.runDue();
     expect(h.calibrator.dueAt).toBe(1400);
   });
+  test('an event whose timer fires during capture is re-armed after completion', async () => {
+    const h = naHarness();
+    const capture = h.ports.capture;
+    let release!: () => void;
+    h.ports.capture = async (...args) => {
+      const result = await capture(...args);
+      return new Promise(resolve => { release = resolve.bind(null, result); });
+    };
+    const running = h.calibrator.runDue();
+    await Promise.resolve(); await Promise.resolve();
+    h.time(10); h.calibrator.event('resize');
+    await h.calibrator.runDue(); // The host dequeued the event, but capture owns the lane.
+    release();
+    await running;
+    expect(h.published).toHaveLength(0);
+    expect(h.calibrator.dueAt).toBe(50);
+    expect(h.scheduled.at(-1)).toBe(50);
+    h.ports.capture = capture;
+    h.time(50); await h.calibrator.runDue();
+    expect(h.published).toHaveLength(1);
+  });
+  test('a capture commit cancels the older queued pipe publish even when parser matches', async () => {
+    const h = naHarness();
+    let stalePublishes = 0;
+    h.calibrator.output(() => stalePublishes++);
+    await h.calibrator.runDue();
+    h.time(16); await h.calibrator.runDue();
+    expect(stalePublishes).toBe(0);
+    expect(h.published).toHaveLength(1);
+  });
   test('dead reader and independent heartbeat detect failure even when pane_pipe would remain 1', () => {
     let at = 0; const faults: string[] = [];
     const wd = new HistoryWatchdog(() => at, f => { expect(f.missingCount).toBeNull(); faults.push(f.kind); });
