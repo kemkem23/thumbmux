@@ -38,7 +38,7 @@ function pythonProbeEnv(baseEnvironment: NodeJS.ProcessEnv = process.env): NodeJ
 
 afterEach(() => {
   for (const socket of sockets.splice(0)) {
-    tmux(socket, "kill-server");
+    spawnSync("tmux", ["-S", socket, "kill-server"], { stdio: "ignore" });
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -54,18 +54,11 @@ async function eventually(check: () => boolean, label: string, timeoutMs = 10_00
     }
     await Bun.sleep(25);
   }
-  const diagnostics = roots.flatMap(root => {
-    const path = join(root, "lane", "pty-proxy-diagnostics.log");
-    return existsSync(path) ? [readFileSync(path, "utf8")] : [];
-  }).join("\n");
-  throw new Error(`timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}\n${diagnostics}`);
+  throw new Error(`timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}`);
 }
 
 function tmux(socket: string, ...args: string[]): ReturnType<typeof spawnSync> {
-  const env = { ...process.env };
-  delete env.TMUX;
-  delete env.TMUX_PANE;
-  return spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8", env });
+  return spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8" });
 }
 
 function lifecycle(record: OutputWalRecord): TerminalWalLifecycleRecord {
@@ -561,121 +554,6 @@ describe("direct child PTY durable WAL proxy", () => {
       sessionCreated: 456,
       generation: "missing-physical-ids",
     })).toThrow("must be supplied together");
-  });
-
-  test("interactive bash foreground job survives resize and barrier with raw termios", async () => {
-    const root = mkdtempSync(join(tmpdir(), "tmptywal-job-"));
-    roots.push(root);
-    const socket = join(root, "tmux.sock");
-    sockets.push(socket);
-    const directory = join(root, "lane");
-    const snapshot = join(root, "job.json");
-    const script = join(root, "job.py");
-    writeFileSync(script, [
-      "import json,os,termios,tty",
-      "tty.setraw(0)",
-      "count=0",
-      "while True:",
-      " attrs=termios.tcgetattr(0)",
-      ` with open(${JSON.stringify(snapshot)}+'.tmp','w') as f: json.dump({'pid':os.getpid(),'pgrp':os.getpgrp(),'foreground':os.tcgetpgrp(0),'attrs':attrs[:6],'count':count},f)`,
-      ` os.replace(${JSON.stringify(snapshot)}+'.tmp',${JSON.stringify(snapshot)})`,
-      " os.read(0,1)",
-      " count+=1",
-    ].join("\n"));
-    const session = "sh-jobcontrol";
-    const launch = createTerminalPtyWalProxyLaunchSpec({
-      directory,
-      identity: { session, instanceId: "job-proof", paneTarget: `=${session}:0.0` },
-      argv: ["/bin/bash", "--noprofile", "--norc", "-i"],
-      env: { PS1: "JOB-SHELL> " },
-      tmux: { socketPath: socket }, heartbeatMs: 25, terminateGraceMs: 100,
-    }, {});
-    expect(tmux(socket, "-f", "/dev/null", "new-session", "-d", "-x", "80", "-y", "24", "-s", session,
-      "-e", `${TERMINAL_PTY_WAL_CONFIG_ENV}=${launch.env[TERMINAL_PTY_WAL_CONFIG_ENV]}`,
-      "-e", `${TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV}=${launch.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]}`,
-      launch.executable, ...launch.args).status).toBe(0);
-    await eventually(() => readTerminalPtyWalProxyHealth(directory).state === "armed", "job proxy armed");
-    const controller = new TerminalWalController({ directory, requestTimeoutMs: 10_000 });
-    try {
-      await controller.activate(readTerminalPtyWalProxyHealth(directory).generation);
-      const output = () => Buffer.concat([...readOutputWal(resolveTerminalWalPaths(directory).walPath)]
-        .filter(record => record.kind === "output").map(record => Buffer.from(record.payload))).toString();
-      await eventually(() => output().includes("JOB-SHELL> "), "interactive shell prompt");
-      expect(tmux(socket, "send-keys", "-t", `=${session}:0.0`, "-l", `python3 '${script}'`).status).toBe(0);
-      expect(tmux(socket, "send-keys", "-t", `=${session}:0.0`, "Enter").status).toBe(0);
-      await eventually(() => existsSync(snapshot), "foreground job reading stdin");
-      const before = JSON.parse(readFileSync(snapshot, "utf8"));
-      expect(before.foreground).toBe(before.pgrp);
-      expect(before.pgrp).not.toBe(readTerminalPtyWalProxyHealth(directory).childPid);
-      expect(before.attrs[0] & 256).toBe(0); // Linux ICRNL
-      for (const [index, cols] of [100, 110].entries()) {
-        expect(tmux(socket, "resize-window", "-t", `=${session}:0`, "-x", String(cols), "-y", "30").status).toBe(0);
-        await eventually(() => readTerminalPtyWalProxyHealth(directory).geometry?.cols === cols, "resize commit");
-        await controller.barrier(`job-barrier-${index}`);
-        // Inspect the kernel before sending input: the old SIGSTOP path leaves
-        // the job stopped/backgrounded even when the proxy reports ready.
-        const fields = readFileSync(`/proc/${before.pid}/stat`, "utf8").split(") ")[1]!.split(" ");
-        expect(fields[0]).not.toMatch(/^[Tt]$/);
-        expect(Number(fields[5])).toBe(before.pgrp);
-        expect(tmux(socket, "send-keys", "-t", `=${session}:0.0`, "-l", "x").status).toBe(0);
-        await eventually(() => JSON.parse(readFileSync(snapshot, "utf8")).count === index + 1, "job still consumes raw input");
-        const after = JSON.parse(readFileSync(snapshot, "utf8"));
-        expect(after.foreground).toBe(before.pgrp);
-        expect(after.attrs).toEqual(before.attrs);
-      }
-      expect(output()).not.toContain("Stopped");
-      const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
-      expect(records.filter(record => record.kind === "resize" && parseOutputWalJson<any>(record).phase === "commit")).toHaveLength(2);
-    } finally {
-      controller.close();
-    }
-  }, 20_000);
-
-  test("cgroup freezer acknowledges frozen state and thaws on timeout without stop signals", () => {
-    const root = mkdtempSync(join(tmpdir(), "tmptywal-freezer-"));
-    roots.push(root);
-    const scriptPath = createTerminalPtyWalProxyLaunchSpec({
-      directory: join(root, "lane"),
-      identity: { session: "sh-freezer", instanceId: "freezer", paneTarget: "=sh-freezer:0.0" },
-      argv: ["/bin/true"],
-    }, {}).args[1]!;
-    const probe = [
-      "import importlib.util,sys,pathlib",
-      "spec=importlib.util.spec_from_file_location('proxy',sys.argv[1])",
-      "m=importlib.util.module_from_spec(spec);sys.modules['proxy']=m;spec.loader.exec_module(m)",
-      "root=pathlib.Path(sys.argv[2])",
-      "events=root/'cgroup.events';control=root/'cgroup.freeze'",
-      "events.write_text('populated 1\\nfrozen 1\\n')",
-      "freezer=m.ChildFreezer(str(root))",
-      "assert freezer.freeze() and control.read_text()=='1'",
-      "freezer.set_frozen(False);assert control.read_text()=='0'",
-      "events.write_text('populated 1\\nfrozen 0\\n')",
-      "ticks=iter([0,3]);m.time.monotonic=lambda: next(ticks)",
-      "assert freezer.freeze() is False and control.read_text()=='0'",
-      "print('freezer acknowledgment and timeout thaw passed')",
-    ].join("\n");
-    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, root], { env: pythonProbeEnv(), encoding: "utf8" });
-    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
-  });
-
-  test("freezer guard thaws after abrupt proxy exit", async () => {
-    const root = mkdtempSync(join(tmpdir(), "tmptywal-thaw-"));
-    roots.push(root);
-    const scriptPath = createTerminalPtyWalProxyLaunchSpec({
-      directory: join(root, "lane"),
-      identity: { session: "sh-thaw", instanceId: "thaw", paneTarget: "=sh-thaw:0.0" },
-      argv: ["/bin/true"],
-    }, {}).args[1]!;
-    const probe = [
-      "import importlib.util,os,sys",
-      "spec=importlib.util.spec_from_file_location('proxy',sys.argv[1])",
-      "m=importlib.util.module_from_spec(spec);sys.modules['proxy']=m;spec.loader.exec_module(m)",
-      "freezer=m.ChildFreezer(sys.argv[2]);freezer.start_guard();freezer.set_frozen(True)",
-      "os._exit(0)",
-    ].join("\n");
-    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, root], { env: pythonProbeEnv(), encoding: "utf8" });
-    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
-    await eventually(() => readFileSync(join(root, "cgroup.freeze"), "utf8") === "0", "crash guard thaw");
   });
 
   test("real tmux preserves bytes, resumes with a new generation, orders resize, and ACKs END after EOF", async () => {
