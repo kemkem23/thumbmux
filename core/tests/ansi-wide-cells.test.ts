@@ -167,3 +167,103 @@ describe("Canvas terminal canonical cell model", () => {
     })).toBe("A漢B\nกิX");
   });
 });
+
+import { stringCells } from '../src/cells';
+import { canvasLinkHits, canvasHtmlLinkHits } from '../../svelte/src/canvas-terminal/links';
+import { singleLineGlyph, glyphShapeKey, GLYPH_INVENTORY } from '../../svelte/src/canvas-terminal/glyphs';
+import { paintCanvasRows } from '../../svelte/src/canvas-terminal/paint';
+
+describe('Canvas FIX1 regressions', () => {
+  test('grapheme advances sum code points, VS16 promotes, leading marks survive', () => {
+    for (const [prefix, expected] of [['น้ำ', 2], ['कि', 2], ['👨‍👩‍👧‍👦', 8], ['❤️', 2], ['A️', 2], ['ิก', 1]] as const) {
+      const text = `${prefix} https://example.com`;
+      const cells = lineToCanvasCells(text);
+      const bases = cells.filter(c => !c.continuation);
+      expect(bases.map(c => c.text).join('')).toBe(text);
+      expect(bases.find(c => c.text === 'h')!.col).toBe(expected + 1);
+      expect(cells.length).toBe(stringCells(text));
+      expect(bases.reduce((sum, c) => sum + c.width, 0)).toBe(stringCells(text));
+      const linked = `\x1b]8;;https://real.example\x07${text}\x1b]8;;\x07`;
+      expect(canvasLinkHits([linked], 200)[0]!.endCol).toBe(stringCells(text));
+    }
+    expect(lineToCanvasCells('ิก')[0]!.text).toBe('ิก');
+    expect(lineToCanvasCells('ิ')[0]!.text).toBe('ิ');
+  });
+
+  test('OSC8 targets, decoys and scheme rules match lineToHtml; one hit per link', () => {
+    const osc = (href: string, text: string, close = '\x07') => `\x1b]8;;${href}${close}${text}\x1b]8;;${close}`;
+    for (const href of ['https://real.example/secret', 'HTTP://REAL.example/X', 'mailto:a@b.example']) {
+      for (const label of ['กดที่นี่', 'https://decoy.example/x']) {
+        const raw = osc(href, label);
+        const hits = canvasLinkHits([raw], 200);
+        expect(hits).toHaveLength(1);
+        expect(hits[0]).toEqual({ row: 0, startCol: 0, endCol: stringCells(label), href });
+        expect(lineToHtml(raw, createSgrState(), pal)).toContain(`href="${href}"`);
+      }
+    }
+    for (const href of ['file:///etc/passwd', 'javascript:alert(1)', 'data:text/html,x', ' https://x.example']) {
+      expect(canvasLinkHits([osc(href, 'กดที่นี่')], 200)).toEqual([]);
+    }
+    expect(canvasLinkHits(['https://example.com/x'], 200)).toHaveLength(1);
+    expect(canvasLinkHits([osc('https://x.example/?a=1&b=2', 'X', '\x1b\\')], 200)[0]!.href).toBe('https://x.example/?a=1&b=2');
+    const rows = ['\x1b]8;;https://carry.example\x07one', '\x1b[31mtwo\x1b[0mthree\x1b]8;;\x07'];
+    const state = createSgrState();
+    const html = rows.map(row => lineToHtml(row, state, pal));
+    expect(canvasHtmlLinkHits(html)).toEqual([
+      { row: 0, startCol: 0, endCol: 3, href: 'https://carry.example' },
+      { row: 1, startCol: 0, endCol: 8, href: 'https://carry.example' },
+    ]);
+    // A viewport can start inside an OSC8 carried from an earlier raw row.
+    expect(canvasHtmlLinkHits(html.slice(1))[0]!.href).toBe('https://carry.example');
+    expect(canvasLinkHits(['\x1b]8;;https://x.example\x07a\x1b]8;bad\x07b'], 200)[0]!.endCol).toBe(1);
+  });
+
+  test('real glyph geometry is distinct, with only documented Hershey I/l sharing', () => {
+    for (const [start, length, allowed] of [[32, 95, ['Il']], [0x2500, 128, []]] as const) {
+      const groups = new Map<string, string>();
+      for (let cp = start; cp < start + length; cp++) {
+        const char = String.fromCodePoint(cp);
+        const glyph = singleLineGlyph(char)!;
+        expect(glyph).not.toBeNull();
+        if (char !== ' ') expect(glyph.strokes.length).toBeGreaterThan(0);
+        for (const stroke of glyph.strokes) {
+          expect(stroke.length).toBeGreaterThanOrEqual(2);
+          for (const [x, y] of stroke) {
+            expect(Number.isFinite(x) && Number.isFinite(y)).toBe(true);
+            expect(x >= 0 && x <= 1 && y >= 0 && y <= 1).toBe(true);
+          }
+        }
+        const key = glyphShapeKey(glyph);
+        groups.set(key, (groups.get(key) ?? '') + char);
+      }
+      expect([...groups.values()].filter(group => group.length > 1)).toEqual([...allowed]);
+      expect(start === 32 ? GLYPH_INVENTORY.ascii.uniqueShapes : GLYPH_INVENTORY.boxDrawing.uniqueShapes).toBe(groups.size);
+    }
+    const corner = singleLineGlyph('┌')!;
+    expect(corner.strokes.flat().every(([x, y]) => x >= .5 && y >= .5)).toBe(true);
+    expect(corner.strokes.flat()).toContainEqual([1, .5]);
+    expect(corner.strokes.flat()).toContainEqual([.5, 1]);
+    expect(singleLineGlyph('┄')!.strokes).toHaveLength(3);
+    expect(singleLineGlyph('━')!.weights!.every(w => w === 2)).toBe(true);
+    expect(new Set(['A', '0', '!'].map(c => glyphShapeKey(singleLineGlyph(c)!))).size).toBe(3);
+    expect(singleLineGlyph('Aิ')).toBeNull();
+    expect(singleLineGlyph('ก')).toBeNull();
+    expect(singleLineGlyph('漢')).toBeNull();
+  });
+
+  test('painting uses compact row geometry and changed content at identical coordinates', () => {
+    const calls: unknown[][] = [];
+    const context = {
+      canvas: { width: 400, height: 300 },
+      setTransform() {}, clearRect() {}, fillRect() {}, save() {}, restore() {}, beginPath() {}, rect() {}, clip() {},
+      fillText: (...args: unknown[]) => calls.push(args),
+    } as unknown as CanvasRenderingContext2D;
+    const options = { fontFamily: 'monospace', fontSize: 13, lineHeight: 21, cellWidth: 8, strokeWidth: 1, vectorFont: false, dpr: 1, palette: pal,
+      rowGeometry: [{ top: 0, height: 7 }, { top: 7, height: 21 }] };
+    paintCanvasRows(context, createCanvasModelRows(['', 'A']), options);
+    expect(calls.at(-1)).toEqual(['A', 0, 7 + 21 * .82]);
+    paintCanvasRows(context, createCanvasModelRows(['', 'B']), options);
+    expect(calls.at(-1)).toEqual(['B', 0, 7 + 21 * .82]);
+    expect(context.font).toBe('13px monospace');
+  });
+});

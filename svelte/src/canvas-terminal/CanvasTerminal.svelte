@@ -1,13 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { AnsiPalette, LineLinkRange } from '@thumbmux/core';
+  import type { AnsiPalette } from '@thumbmux/core';
   import { createCanvasModelRows } from './model';
-  import { paintCanvasRows } from './paint';
-  import { canvasLinkHits, osc8LinkHits } from './links';
+  import { paintCanvasRows, effectiveStrokeWidth } from './paint';
+  import { canvasHtmlLinkHits } from './links';
+  import { glyphCoverage } from './glyphs';
 
   let {
     lines,
-    linksByRow = [],
+    htmlRows = [],
+    geometry = [],
     firstLineId = 0,
     cols,
     cellWidth,
@@ -19,7 +21,8 @@
     palette,
   }: {
     lines: readonly string[];
-    linksByRow?: readonly (readonly LineLinkRange[] | undefined)[];
+    htmlRows?: readonly string[];
+    geometry?: readonly { top: number; height: number; id: number; visualRow: number; absoluteTop: number }[];
     firstLineId?: number;
     cols: number;
     cellWidth: number;
@@ -36,22 +39,37 @@
   let width = $state(0);
   let resizeObserver: ResizeObserver | null = null;
   const rows = $derived(createCanvasModelRows(lines, firstLineId));
-  const urlHits = $derived(canvasLinkHits(lines, cols));
-  const oscHits = $derived(osc8LinkHits(linksByRow));
-  const hits = $derived([...oscHits, ...urlHits]);
+  const hits = $derived(canvasHtmlLinkHits(htmlRows));
+  const height = $derived(Math.max(1, geometry.length
+    ? geometry.at(-1)!.top + geometry.at(-1)!.height : lines.length * lineHeight));
+  const effectiveWidth = $derived(effectiveStrokeWidth(strokeWidth));
+  const hasFallback = $derived(vectorFont && rows.some(row => row.cells.some(cell =>
+    !cell.continuation && glyphCoverage(cell.text) === 'outline-fallback')));
+  let resolvedFamily = $state('monospace');
+
+  function copyText(event: ClipboardEvent): void {
+    const selection = window.getSelection();
+    if (!selection || !host?.contains(selection.anchorNode) || !host.contains(selection.focusNode)) return;
+    event.clipboardData?.setData('text/plain', selection.toString().split('\n').map(line => line.replace(/\s+$/, '')).join('\n'));
+    if (event.clipboardData) event.preventDefault();
+  }
 
   function repaint(): void {
     if (!canvas || width <= 0 || cellWidth <= 0 || lineHeight <= 0) return;
     const dpr = Math.max(1, window.devicePixelRatio || 1);
-    const height = Math.max(1, lines.length * lineHeight);
-    canvas.width = Math.ceil(width * dpr);
-    canvas.height = Math.ceil(height * dpr);
+    const pixelWidth = Math.ceil(width * dpr);
+    const pixelHeight = Math.ceil(height * dpr);
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+    // CSS resolves var() and inherited families; CanvasRenderingContext2D cannot.
+    resolvedFamily = host ? getComputedStyle(host).fontFamily || 'monospace' : 'monospace';
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
     const context = canvas.getContext('2d');
     if (!context) return;
     paintCanvasRows(context, rows, {
-      fontFamily,
+      fontFamily: resolvedFamily,
+      rowGeometry: geometry,
       fontSize,
       lineHeight,
       cellWidth,
@@ -84,6 +102,8 @@
     cellWidth;
     strokeWidth;
     vectorFont;
+    geometry;
+    height;
     repaint();
   });
 </script>
@@ -94,14 +114,25 @@
   data-testid="canvas-terminal"
   data-first-line-id={firstLineId}
   data-row-count={rows.length}
-  data-font-mode={vectorFont ? 'single-line' : 'outline'}
-  data-stroke-width={strokeWidth}
-  style:height={`${lines.length * lineHeight}px`}
+  data-font-mode={vectorFont ? (hasFallback ? 'single-line-with-outline-fallback' : 'single-line') : 'outline'}
+  data-stroke-width={effectiveWidth}
+  style:font-family={fontFamily}
+  style:font-size={`${fontSize}px`}
+  style:line-height={`${lineHeight}px`}
+  oncopy={copyText}
+  style:height={`${height}px`}
 >
   <canvas bind:this={canvas} aria-hidden="true"></canvas>
   <div class="text-mirror" aria-label="Terminal viewport text">
-    {#each rows as row (row.id)}
-      <div class="mirror-row" data-line-id={row.id} style:height={`${lineHeight}px`}>{row.text || '\u00a0'}</div>
+    {#each rows as row, index (row.id)}
+      <div class="mirror-row mtv-line"
+        data-line-id={geometry[index]?.id ?? row.id}
+        data-visual-row={geometry[index]?.visualRow ?? index}
+        data-presentation-top={geometry[index]?.absoluteTop ?? index * lineHeight}
+        data-presentation-height={geometry[index]?.height ?? lineHeight}
+        style:top={`${geometry[index]?.top ?? index * lineHeight}px`}
+        style:height={`${geometry[index]?.height ?? lineHeight}px`}
+      >{#each row.cells.filter(cell => !cell.continuation) as cell}<span style:display="inline-block" style:width={`${cell.width * cellWidth}px`}>{cell.text}</span>{/each}</div>
     {/each}
   </div>
   <div class="link-layer" aria-label="Terminal links">
@@ -113,9 +144,9 @@
         aria-label={hit.href}
         title={hit.href}
         style:left={`${hit.startCol * cellWidth}px`}
-        style:top={`${hit.row * lineHeight}px`}
+        style:top={`${geometry[hit.row]?.top ?? hit.row * lineHeight}px`}
         style:width={`${Math.max(1, hit.endCol - hit.startCol) * cellWidth}px`}
-        style:height={`${lineHeight}px`}
+        style:height={`${geometry[hit.row]?.height ?? lineHeight}px`}
       ></a>
     {/each}
   </div>
@@ -125,7 +156,7 @@
   .canvas-terminal { position: relative; width: 100%; }
   canvas { position: absolute; inset: 0; display: block; pointer-events: none; }
   .text-mirror { position: absolute; inset: 0; color: transparent; background: transparent; white-space: pre; user-select: text; -webkit-user-select: text; }
-  .mirror-row { white-space: pre; overflow: hidden; }
+  .mirror-row { position: absolute; left: 0; right: 0; white-space: pre; overflow: hidden; }
   .link-layer { position: absolute; inset: 0; pointer-events: none; }
   .link-layer a { position: absolute; pointer-events: auto; color: transparent; text-decoration: none; }
   .link-layer a:focus { outline: 2px solid currentColor; outline-offset: -2px; color: var(--tfg); }

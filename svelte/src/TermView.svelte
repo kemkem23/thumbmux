@@ -6980,6 +6980,7 @@
    * renderer. It owns no history store, so switching engines cannot fork the
    * canonical bytes or the scroll window. */
   function canvasWindowLines(): string[] {
+    renderEpoch;
     const output: string[] = [];
     for (let visualRow = winStart; visualRow < winEnd; visualRow += 1) {
       output.push(projectionRowAt(visualRow)?.line ?? '');
@@ -6987,14 +6988,26 @@
     return output;
   }
 
-  function canvasWindowLinks(): (LineLinkRange[] | undefined)[] {
-    const output: (LineLinkRange[] | undefined)[] = [];
-    for (let visualRow = winStart; visualRow < winEnd; visualRow += 1) {
-      const rawLine = projectionRowAt(visualRow)?.rawRange.startLine;
-      output.push(rawLine === undefined ? undefined : linksByLine[rawLine]);
-    }
-    return output;
+  function canvasWindowHtml(): string[] {
+    renderEpoch;
+    return Array.from({ length: winEnd - winStart }, (_, i) => cachedLineHtml(winStart + i, contentEpoch));
   }
+
+  function canvasWindowGeometry() {
+    renderEpoch;
+    const origin = presentationRowTopPx(winStart);
+    return Array.from({ length: winEnd - winStart }, (_, i) => {
+      const visual = winStart + i;
+      return {
+        top: presentationRowTopPx(visual) - origin,
+        height: presentationRowHeightPx(visual),
+        id: archiveOffset + (projectionRowAt(visual)?.rawRange.startLine ?? rawLines.length),
+        visualRow: visual,
+        absoluteTop: presentationRowTopPx(visual),
+      };
+    });
+  }
+
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -7090,7 +7103,8 @@
     {#if renderer === 'canvas'}
       <CanvasTerminal
         lines={canvasWindowLines()}
-        linksByRow={canvasWindowLinks()}
+        htmlRows={canvasWindowHtml()}
+        geometry={canvasWindowGeometry()}
         firstLineId={archiveOffset + winStart}
         cols={Math.max(1, lastPushedCols)}
         cellWidth={charW}
@@ -7175,6 +7189,9 @@
                 aria-hidden="true"
               ></span></span>{:else}{@html cachedLineHtml(visualRow, contentEpoch)}{/if}</div>
       {/each}
+    {/key}
+    {/if}
+    {#key renderEpoch}
     {#if cursor && connected && !scrollStateScrolledUp && charW > 0}
       {@const lastContent = lastContentLine(contentEpoch)}
       {@const cline = lastContent - cursor.row}
@@ -7205,7 +7222,6 @@
       {/if}
     {/if}
     {/key}
-    {/if}
   </div>
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>

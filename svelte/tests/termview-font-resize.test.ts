@@ -184,12 +184,12 @@ beforeEach(() => {
 
 describe('Canvas centerline font contract (NEWARCH G4)', () => {
   test('publishes numeric inventory, provenance and honest fallbacks', () => {
-    expect(GLYPH_INVENTORY.ascii).toEqual({ requested: 95, singleLine: 95, fallback: 0 });
-    expect(GLYPH_INVENTORY.boxDrawing).toEqual({ requested: 128, singleLine: 128, fallback: 0 });
-    expect(GLYPH_INVENTORY.thai).toEqual({ requested: 128, singleLine: 0, fallback: 128 });
+    expect(GLYPH_INVENTORY.ascii).toMatchObject({ requested: 95, singleLine: 95, uniqueShapes: 94, fallback: 0 });
+    expect(GLYPH_INVENTORY.boxDrawing).toMatchObject({ requested: 128, singleLine: 128, uniqueShapes: 128, fallback: 0 });
+    expect(GLYPH_INVENTORY.thai).toMatchObject({ requested: 128, singleLine: 0, uniqueShapes: 0, fallback: 128 });
     expect(GLYPH_INVENTORY.cjkSample.singleLine).toBe(0);
     expect(GLYPH_INVENTORY.cjkSample.fallback).toBe(6);
-    expect(SINGLE_LINE_LICENSE).toBe('CC0-1.0');
+    expect(SINGLE_LINE_LICENSE).toContain('Hershey');
     expect(SINGLE_LINE_SOURCE).toContain('centerline');
     expect(glyphCoverage('A')).toBe('single-line');
     expect(glyphCoverage('─')).toBe('single-line');

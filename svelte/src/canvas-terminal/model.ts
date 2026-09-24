@@ -3,7 +3,7 @@ import { charCellWidth, stripAnsi } from '@thumbmux/core';
 export type CanvasCell = Readonly<{
   text: string;
   col: number;
-  width: 1 | 2;
+  width: number;
   continuation: false;
 }>;
 
@@ -26,45 +26,38 @@ export type CanvasModelRow = Readonly<{
 export type ModelPoint = Readonly<{ row: number; col: number }>;
 export type ModelSelection = Readonly<{ anchor: ModelPoint; focus: ModelPoint }>;
 
-const graphemeSegmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
-  ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
-  : null;
-
-function graphemes(text: string): string[] {
-  if (graphemeSegmenter) {
-    return [...graphemeSegmenter.segment(text)].map((entry) => entry.segment);
-  }
-  return Array.from(text);
-}
-
-/**
- * Build terminal cells from the canonical text model. Zero-width code points
- * are attached to the previous base cell because Thai marks such as U+0E34
- * are not reliably identified by Unicode combining-class tables alone.
- */
+/** Code-point accounting mirrors stringCells, including VS16 promotion.
+ * Keep graphemes together for shaping, but sum their terminal advances. */
 export function lineToCanvasCells(raw: string): CanvasTerminalCell[] {
   const text = stripAnsi(raw).replace(/\u00a0/g, ' ');
-  const cells: CanvasTerminalCell[] = [];
+  const bases: { text: string; col: number; width: number; continuation: false }[] = [];
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
   let col = 0;
-  for (const cluster of graphemes(text)) {
+  let pending = '';
+  let prevWidth = 0;
+  for (const { segment } of segmenter.segment(text)) {
     let width = 0;
-    for (const cp of Array.from(cluster)) width = Math.max(width, charCellWidth(cp.codePointAt(0)!));
+    for (const ch of segment) {
+      const cp = ch.codePointAt(0)!;
+      const w = charCellWidth(cp);
+      if (cp === 0xfe0f && prevWidth === 1) { width++; prevWidth = 2; }
+      else { width += w; if (w > 0) prevWidth = w; }
+    }
     if (width === 0) {
-      const previous = cells.findLast((cell) => !cell.continuation);
-      if (previous) {
-        const index = cells.indexOf(previous);
-        cells[index] = { ...previous, text: previous.text + cluster };
-      }
+      if (bases.length) bases[bases.length - 1]!.text += segment;
+      else pending += segment;
       continue;
     }
-    const cellWidth = width >= 2 ? 2 : 1;
-    cells.push({ text: cluster, col, width: cellWidth, continuation: false });
-    if (cellWidth === 2) {
-      cells.push({ text: '', col: col + 1, width: 0, continuation: true });
-    }
-    col += cellWidth;
+    bases.push({ text: pending + segment, col, width, continuation: false });
+    pending = '';
+    col += width;
   }
-  return cells;
+  // An orphan-only line must not silently discard canonical bytes.
+  if (pending) bases.push({ text: pending, col, width: 0, continuation: false });
+  return bases.flatMap((base): CanvasTerminalCell[] => [base,
+    ...Array.from({ length: Math.max(0, base.width - 1) }, (_, i): CanvasContinuationCell =>
+      ({ text: '', col: base.col + i + 1, width: 0, continuation: true })),
+  ]);
 }
 
 export function createCanvasModelRows(rawLines: readonly string[], firstId = 0): CanvasModelRow[] {
