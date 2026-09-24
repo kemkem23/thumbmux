@@ -754,7 +754,7 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     const h = naHarness(true);
     await h.calibrator.runDue();
     h.time(10); h.calibrator.scroll(20); h.time(200); await h.calibrator.runDue();
-    expect(h.limits).toEqual([4500, 23]);
+    expect(h.limits).toEqual([4500, 148]);
     h.time(201); h.calibrator.event('clear'); h.time(250); await h.calibrator.runDue();
     expect(h.limits.at(-1)).toBe(4500);
   });
@@ -938,19 +938,23 @@ console.log('NEWARCH_FIX1_FUZZ', JSON.stringify({ cases: agg.cases, checks: agg.
 expect(agg.cases).toBe(3000); expect(agg.checks).toBeGreaterThan(0); expect(agg.contentFalse).toBe(0); expect(agg.repairNotTmux).toBe(0);
 });
 
-test('FIX1 full matcher p95 at 4500 rows, independent cells and collision buckets', () => {
+test('FIX1 full matcher p95 at 4500 rows, independent cells and collision buckets', async () => {
   for (const cols of [80, 120]) {
     const recent = naRows(Array.from({ length: 4500 }, (_, i) => `row-${String(i).padStart(8, '0')}`.padEnd(cols, 'x')));
     const captured = recent.map(r => ({ softWrap: r.softWrap, cells: r.cells.map(c => ({ ...c })) }));
+    captured[2200]!.cells[cols - 1]!.fg = 'index:9';
     const times: number[] = [];
     for (let i = 0; i < 30; i++) {
+      // Match the specified per-pane 200ms cadence; do not time the sleep.
+      await new Promise(resolve => setTimeout(resolve, 200));
       const started = performance.now();
       const result = matchHistoryRows(recent, captured, naScope);
       times.push(performance.now() - started);
-      expect(result.checks).toHaveLength(4500);
+      expect(result.checks).toHaveLength(4499);
+      expect(result.repairs).toHaveLength(1);
     }
     times.sort((a, b) => a - b);
-    console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29] }));
+    console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29], cadenceMs: 200, driftedRows: 1 }));
     expect(times[28]!).toBeLessThanOrEqual(20);
     // Same sampled prefix, different final cells: never trust the bucket key.
     captured[2200]!.cells[cols - 1]!.fg = 'index:9';

@@ -78,11 +78,12 @@ function occurrences(pattern: number[], values: number[]): number {
   for (let i = pattern.length + 1; i < z.length; i++) if (z[i]! >= pattern.length) count++;
   return count;
 }
-function triples(values: number[]): Map<string, number[]> {
-  const map = new Map<string, number[]>();
+function triples(values: number[], base: number): Map<number | string, number[]> {
+  const map = new Map<number | string, number[]>();
   for (let i = 0; i + 2 < values.length; i++) {
     if (values[i] === values[i + 1] && values[i] === values[i + 2]) continue;
-    const key = `${values[i]},${values[i + 1]},${values[i + 2]}`;
+    const key = base < 200000 ? (values[i]! * base + values[i + 1]!) * base + values[i + 2]!
+      : `${values[i]},${values[i + 1]},${values[i + 2]}`;
     const positions = map.get(key) ?? [];
     positions.push(i); map.set(key, positions);
   }
@@ -98,6 +99,11 @@ export function matchHistoryRows(
   const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
   if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
+  if (recent.length >= 3 && recent.length === captured.length
+    && recent.every((row, i) => equalHistoryRows(row, captured[i]!))) {
+    if (recent.every(row => equalHistoryRows(row, recent[0]!))) return empty('ambiguous');
+    return { reason: 'matched', repairs: [], checks: recent.map((row, i) => ({ lineId: row.lineId, capturedRow: i })) };
+  }
   const [a, b] = internRows([recent, captured]) as [number[], number[]];
   if (a.length < 3 || b.length < 3) return empty('no-anchor');
   const reversed = a.slice().reverse();
@@ -119,9 +125,12 @@ export function matchHistoryRows(
   };
   for (let i = a.length - length; i < a.length; i++) check(i, i + offset);
 
+  if (length === a.length) return result;
+
   // A mismatch can only be repaired between two independently unique triples
   // with identical row counts. No insertion/deletion or renumbering is inferred.
-  const at = triples(a), bt = triples(b);
+  const base = a.length + b.length + 1;
+  const at = triples(a, base), bt = triples(b, base);
   const anchors: Array<[number, number]> = [];
   for (const [key, positions] of at) {
     const other = bt.get(key);
@@ -158,7 +167,8 @@ export class IncrementalHistoryMatcher {
     const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
     if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
     const [a, b] = internRows([recent, captured]) as [number[], number[]];
-    const at = triples(a), bt = triples(b);
+    const base = a.length + b.length + 1;
+  const at = triples(a, base), bt = triples(b, base);
     const anchors: Array<[number, number]> = [];
     for (const [key, positions] of at) {
       const other = bt.get(key);

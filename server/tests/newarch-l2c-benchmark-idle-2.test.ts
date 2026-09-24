@@ -104,7 +104,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             for (let i = 0; i < c.panes.length; i++) {
               const state = states.get(`${c.socket}/${i}`)!;
               // Extra overlap covers output arriving while the capture executes.
-              const tail = mode === 'full' || state.full ? 4500 : Math.min(4500, Math.max(3, counts[i]! - state.last + 13));
+              const tail = mode === 'full' || state.full ? 4500 : Math.min(4500, Math.max(3, counts[i]! - state.last + 128));
               tails.push(tail);
               if (args.length) args.push(';');
               args.push('display-message', '-p', `L2C-PANE-${i}`, ';', 'capture-pane', '-p', '-e', '-N', '-t', c.panes[i]!, '-S', `-${tail}`);

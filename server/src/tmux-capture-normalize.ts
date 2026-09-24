@@ -109,6 +109,9 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
   if (!Number.isSafeInteger(cols) || cols < 1) throw new Error('invalid capture width');
   let fg = 'default', bg = 'default', style = 0;
   const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  // tmux can merge a spacing heart into the preceding skin-tone cell. Its
+  // serialized text loses that cell boundary; do not certify a guessed width.
+  if (/[\u{1f3fb}-\u{1f3ff}]\u2764/u.test(raw)) throw new Error('ambiguous tmux emoji cell boundary');
   const lines = normalizeTmuxCaptureCells(raw).split('\n');
   // capture-pane terminates its serialized last physical row with one LF.
   if (lines.at(-1) === '') lines.pop();

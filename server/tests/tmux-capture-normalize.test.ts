@@ -135,6 +135,11 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
       await new Promise(resolve => setTimeout(resolve, 100));
       const raw = tmux('capture-pane', '-p', '-e', '-N', '-t', pane);
       const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
+      if (cases[i] === '👩‍💻🇹🇭👍🏽❤️') {
+        console.log('NEWARCH_FIX1_AMBIGUOUS', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, disposition: 'reject certification; pipe remains live' }));
+        expect(() => decodeTmuxCaptureRows(raw, 80)).toThrow('ambiguous tmux emoji cell boundary');
+        continue;
+      }
       const row = decodeTmuxCaptureRows(raw, 80)[0]!;
       let end = row.length; while (end > 0 && row[end - 1]!.grapheme === ' ') end--;
       console.log('NEWARCH_FIX1_WIDTH', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, end }));

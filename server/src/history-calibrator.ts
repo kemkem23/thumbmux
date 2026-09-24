@@ -117,7 +117,7 @@ export class HistoryCalibrator {
     const historyDue = this.forceFull || now - this.lastHistoryAt >= 200;
     const requestedScrolls = this.scrolls;
     const limit = this.options.historyLimit ?? 4500;
-    const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 3);
+    const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 128);
     let successful = false;
     try {
       const controller = new AbortController();
