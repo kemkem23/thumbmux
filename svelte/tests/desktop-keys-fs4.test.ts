@@ -165,6 +165,38 @@ describe("FS4 DesktopKeys physical-key shortcut identity", () => {
   });
 });
 
+describe("NEWARCH L5 reserved-key synthetic boundary", () => {
+  test("routes Ctrl-W if the browser delivers it, but does not claim browser capture", async () => {
+    const sent: string[] = [];
+    const { target } = mountDesktopKeys({
+      enabled: true,
+      focused: true,
+      onKeys: (data: string) => sent.push(data),
+    });
+    await tick();
+    const root = desktopRoot(target);
+    flushSync(() => root.focus());
+    const event = dispatchKey(root, { key: "w", code: "KeyW", ctrlKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(sent).toEqual(["\x17"]);
+  });
+
+  test("leaves Ctrl-Tab to the browser because physical capture is not guaranteed", async () => {
+    const sent: string[] = [];
+    const { target } = mountDesktopKeys({
+      enabled: true,
+      focused: true,
+      onKeys: (data: string) => sent.push(data),
+    });
+    await tick();
+    const root = desktopRoot(target);
+    flushSync(() => root.focus());
+    const event = dispatchKey(root, { key: "Tab", code: "Tab", ctrlKey: true });
+    expect(event.defaultPrevented).toBe(false);
+    expect(sent).toEqual([]);
+  });
+});
+
 describe("FS4 DesktopKeys in-pane focusable must not mute typing", () => {
   test("focus on OSC-8 <a> inside the pane still routes printable keys", async () => {
     const sent: string[] = [];

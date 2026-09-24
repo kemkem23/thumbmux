@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
-import { bracketedPaste, keyboardEventToSequence, type KeyLike } from './keys';
+import {
+  bracketedPaste,
+  keyboardEventToSequence,
+  reservedKeyAlternative,
+  reservedKeyAlternatives,
+  type KeyLike,
+} from './keys';
 
 describe('keyboardEventToSequence guards', () => {
   test('returns null while text composition is active', () => {
@@ -391,5 +397,36 @@ describe('bracketedPaste', () => {
       const body = wrapped.slice('\x1b[200~'.length, -'\x1b[201~'.length);
       expect(body).not.toContain('\x1b');
     }
+  });
+});
+
+describe('browser-reserved shortcut alternatives (synthetic scope only)', () => {
+  test('lists every plan baseline row explicitly without claiming physical capture', () => {
+    expect(reservedKeyAlternatives.map((entry) => entry.id)).toEqual([
+      'close-tab', 'new-window', 'new-tab', 'next-tab', 'previous-tab',
+      'location', 'reload', 'reload-f5', 'private-window', 'help-f1',
+      'fullscreen-f11', 'devtools-f12', 'escape', 'app-switch', 'app-close',
+      'secure-attention', 'system-keys',
+    ]);
+  });
+
+  test('soft-key alternatives emit byte-exact terminal sequences', () => {
+    const expected: Record<string, string> = {
+      'close-tab': '\x17', 'new-window': '\x0e', 'new-tab': '\x14',
+      'next-tab': '\t', 'previous-tab': '\x1b[Z', 'location': '\x0c',
+      reload: '\x12', 'reload-f5': '\x1b[15~', 'private-window': '\x0e',
+      'help-f1': '\x1bOP', 'fullscreen-f11': '\x1b[23~',
+      'devtools-f12': '\x1b[24~', escape: '\x1b',
+    };
+    for (const [id, sequence] of Object.entries(expected)) {
+      expect(reservedKeyAlternative(id)).toMatchObject({ fallback: 'soft-key', sequence });
+    }
+  });
+
+  test('does not invent bytes for OS-secure or app-switching shortcuts', () => {
+    for (const id of ['app-switch', 'app-close', 'secure-attention', 'system-keys']) {
+      expect(reservedKeyAlternative(id)?.sequence).toBeNull();
+    }
+    expect(reservedKeyAlternative('not-listed')).toBeNull();
   });
 });

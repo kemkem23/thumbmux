@@ -26,6 +26,43 @@ export type KeyboardSequenceOptions = {
   applicationCursorKeys?: boolean;
 };
 
+export type ReservedKeyAlternative = {
+  id: string;
+  label: string;
+  sequence: string | null;
+  fallback: 'soft-key' | 'native-client' | 'unsupported';
+};
+
+/**
+ * Explicit alternatives for shortcuts a normal browser tab may consume before
+ * JavaScript receives a KeyboardEvent.  This table powers a soft-key palette;
+ * it is not evidence that the corresponding physical shortcut is capturable.
+ * G7 must measure that with real browsers and hardware keyboards.
+ */
+export const reservedKeyAlternatives: readonly ReservedKeyAlternative[] = [
+  { id: 'close-tab', label: 'Ctrl-W / Cmd-W', sequence: '\x17', fallback: 'soft-key' },
+  { id: 'new-window', label: 'Ctrl-N / Cmd-N', sequence: '\x0e', fallback: 'soft-key' },
+  { id: 'new-tab', label: 'Ctrl-T / Cmd-T', sequence: '\x14', fallback: 'soft-key' },
+  { id: 'next-tab', label: 'Ctrl-Tab', sequence: '\t', fallback: 'soft-key' },
+  { id: 'previous-tab', label: 'Ctrl-Shift-Tab', sequence: `${ESC}[Z`, fallback: 'soft-key' },
+  { id: 'location', label: 'Ctrl-L / Cmd-L', sequence: '\x0c', fallback: 'soft-key' },
+  { id: 'reload', label: 'Ctrl-R / Cmd-R', sequence: '\x12', fallback: 'soft-key' },
+  { id: 'reload-f5', label: 'F5', sequence: `${ESC}[15~`, fallback: 'soft-key' },
+  { id: 'private-window', label: 'Ctrl-Shift-N / Cmd-Shift-N', sequence: '\x0e', fallback: 'soft-key' },
+  { id: 'help-f1', label: 'F1', sequence: `${ESC}OP`, fallback: 'soft-key' },
+  { id: 'fullscreen-f11', label: 'F11', sequence: `${ESC}[23~`, fallback: 'soft-key' },
+  { id: 'devtools-f12', label: 'F12', sequence: `${ESC}[24~`, fallback: 'soft-key' },
+  { id: 'escape', label: 'Esc', sequence: ESC, fallback: 'soft-key' },
+  { id: 'app-switch', label: 'Alt-Tab / Cmd-Tab', sequence: null, fallback: 'native-client' },
+  { id: 'app-close', label: 'Alt-F4 / Cmd-Q', sequence: null, fallback: 'native-client' },
+  { id: 'secure-attention', label: 'Ctrl-Alt-Delete / Win-L / Cmd-Ctrl-Q', sequence: null, fallback: 'unsupported' },
+  { id: 'system-keys', label: 'Fn / volume / brightness / power / system Home / gestures', sequence: null, fallback: 'unsupported' },
+] as const;
+
+export function reservedKeyAlternative(id: string): ReservedKeyAlternative | null {
+  return reservedKeyAlternatives.find((entry) => entry.id === id) ?? null;
+}
+
 const arrowFinals: Record<string, string> = {
   ArrowUp: 'A',
   ArrowDown: 'B',

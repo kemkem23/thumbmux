@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createBunTmuxDriver } from "../src/bun-driver";
+import {
+  createInputRouter,
+  type InputMetadata,
+  type PaneInputLease,
+} from "../src/input-router";
 
 type SpawnCall = {
   command: string[];
@@ -173,5 +178,94 @@ describe("Bun tmux driver input delivery", () => {
     });
 
     expect(calls.at(-1)!.command.slice(0, 2)).toEqual(["tmux", "delete-buffer"]);
+  });
+});
+
+describe("NEWARCH L5 exact-pane input router", () => {
+  const lease: PaneInputLease = { sessionId: "$7", paneId: "%42", generation: "birth-9" };
+
+  function fixture(options: { sendThrows?: boolean; updateThrows?: boolean } = {}) {
+    const metadata: InputMetadata[] = [];
+    const claimed = new Set<string>();
+    const sends: Array<{ paneId: string; data: string }> = [];
+    const gaps: InputMetadata[] = [];
+    const router = createInputRouter({
+      currentLease: () => lease,
+      sendExactPane: (paneId, data) => {
+        sends.push({ paneId, data });
+        if (options.sendThrows) throw new Error("ambiguous tmux handoff");
+      },
+      receipts: {
+        claim(value) {
+          if (claimed.has(value.eventId)) return false;
+          claimed.add(value.eventId);
+          metadata.push(value);
+          return true;
+        },
+        update(value) {
+          if (options.updateThrows) throw new Error("history unavailable");
+          metadata.push(value);
+        },
+        auditGap(value) { gaps.push(value); },
+      },
+    });
+    return { router, metadata, sends, gaps };
+  }
+
+  test("routes text and control bytes to the exact leased pane", () => {
+    const f = fixture();
+    for (const [clientSequence, kind, data] of [
+      [1, "text", "สวัสดี"], [2, "control", "\x03"], [3, "submit", "\r"],
+    ] as const) {
+      expect(f.router.route({ eventId: `evt-${clientSequence}`, clientSequence, lease, kind, data }).status)
+        .toBe("sent_to_tmux");
+    }
+    expect(f.sends).toEqual([
+      { paneId: "%42", data: "สวัสดี" },
+      { paneId: "%42", data: "\x03" },
+      { paneId: "%42", data: "\r" },
+    ]);
+  });
+
+  test("rejects a stale lifecycle lease before delivery or receipt claim", () => {
+    const f = fixture();
+    const stale = { ...lease, generation: "old-birth" };
+    const result = f.router.route({ eventId: "stale", clientSequence: 1, lease: stale, kind: "text", data: "x" });
+    expect(result.status).toBe("rejected_stale_lease");
+    expect(f.sends).toEqual([]);
+    expect(f.metadata).toEqual([]);
+  });
+
+  test("claims before delivery and never auto-resends a pending/duplicate event", () => {
+    const f = fixture({ sendThrows: true });
+    const operation = { eventId: "pending-crash", clientSequence: 8, lease, kind: "control" as const, data: "\x1b" };
+    expect(f.router.route(operation).status).toBe("delivery_unknown");
+    expect(f.router.route(operation).status).toBe("duplicate");
+    expect(f.sends).toHaveLength(1);
+  });
+
+  test("records an audit gap after delivery without replaying input", () => {
+    const f = fixture({ updateThrows: true });
+    const result = f.router.route({ eventId: "gap", clientSequence: 9, lease, kind: "text", data: "once" });
+    expect(result.status).toBe("sent_to_tmux");
+    expect(f.sends).toHaveLength(1);
+    expect(f.gaps).toHaveLength(1);
+  });
+
+  test("metadata contains the test secret zero times", () => {
+    const secret = "L5-SECRET-do-not-record-9c2a";
+    const f = fixture();
+    f.router.route({ eventId: "secret-event", clientSequence: 10, lease, kind: "text", data: secret });
+    expect(JSON.stringify(f.metadata).split(secret)).toHaveLength(1);
+    expect(f.metadata.at(-1)).toMatchObject({ byteLength: new TextEncoder().encode(secret).byteLength });
+    expect(Object.keys(f.metadata.at(-1)!)).not.toContain("data");
+  });
+
+  test("preserves a 64 KiB paste as one ordered exact-pane operation", () => {
+    const f = fixture();
+    const data = "ก".repeat(21_845) + "x";
+    expect(new TextEncoder().encode(data).byteLength).toBe(65_536);
+    f.router.route({ eventId: "paste-64k", clientSequence: 11, lease, kind: "paste", data });
+    expect(f.sends).toEqual([{ paneId: "%42", data }]);
   });
 });
