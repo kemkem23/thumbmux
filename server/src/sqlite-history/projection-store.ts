@@ -84,6 +84,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private dirtyBytes=0;
   private dirtySince:number|null=null;
   private pumping=false;
+  private pumpTurnAt=performance.now();
   private closed=false;
   private degraded=false;
   private stopped=false;
@@ -197,7 +198,11 @@ export class ProjectionStore implements ProjectionWriterPort {
       const result=new Promise<ProjectionReceipt>((resolve,reject)=>{
         const q=this.queues.get(id)??[];q.push({bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
       });
-      if(!this.pumping) {this.pumping=true;queueMicrotask(()=>this.pump());}
+      if(!this.pumping) {
+        this.pumping=true;
+        if(performance.now()-this.pumpTurnAt>=2)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);
+        else queueMicrotask(()=>this.pump());
+      }
       return result;
     } catch(error) {return Promise.reject(error);}
   }
@@ -219,7 +224,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         processed++;
       }
     }
-    if(this.queues.size) setTimeout(()=>this.pump(),0);else this.pumping=false;
+    if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
 
   }
   appendScroll(event:ScrollEvent):Promise<ProjectionReceipt> {return this.enqueue(event.paneKey,event,e=>this.ram.append(e));}
