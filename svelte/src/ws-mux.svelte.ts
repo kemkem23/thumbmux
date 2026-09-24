@@ -1355,6 +1355,3 @@ export const tmuxMux = new TmuxMux();
 export function configureTmuxMux(opts: TmuxMuxOptions) {
   tmuxMux.configure(opts);
 }
-
-// Temporary CAGEDOCS source-change stability proof.
-export const sourceEditProbeForCage = 1;
