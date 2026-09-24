@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from './schema';
-import { ProjectionRam, paneId, upsert, type SqlRow } from './ram-store';
+import { ProjectionRam, paneId, upsert, decodeFrameCells, type SqlRow } from './ram-store';
 import { readProjectionPage } from './projection-reader';
 import type { PaneKey, ProjectionCalibration, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -97,6 +97,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private rejectedRows=0;
   private screenBytes=new Map<string,number>();
   private dirtyFaults=new Set<string>();
+  private faultEmitted=new Map<string,number>();
   private faults=new Map<string,{id:string;pane:string;last:number;count:number}>();
   private lastCommitAt:number|null=null;
   private lastFlushAgeMs=0;
@@ -121,6 +122,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       const fd=openSync(dirname(this.file),'r');try {fsyncSync(fd);}finally {closeSync(fd);}
       this.recover();
     } catch(error) { this.disk.close();this.ram.db.close();throw error; }
+    try {this.ensureWorker();}catch(error){this.ram.db.close();this.disk.close();throw error;}
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
@@ -149,6 +151,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
     })();
     if(this.ram.bytes()>CACHE_MAX) throw new Error('recovery-cache-limit');
+    this.rejectedRows=Number((this.disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind='ingest-capacity'").get() as SqlRow).n);
+    this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     const last=this.disk.query('SELECT committed_at FROM na_commit ORDER BY committed_at DESC LIMIT 1').get() as SqlRow|null;
     this.lastCommitAt=last?Number(last.committed_at):null;
   }
@@ -157,7 +161,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     return times.length?Math.max(0,Date.now()-Math.min(...times)):0;
   }
   private pendingBytes():number {return this.dirtyBytes+this.queuedBytes+(this.retry?.bytes??0);}
-  private fault(kind:string,reason:string,key?:PaneKey):void {
+  private fault(kind:string,reason:string,key?:PaneKey,lostRows=1):void {
     this.degraded=true;
     const now=Date.now();
     const panes=key?[this.ram.pane(key)]:this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[];
@@ -165,7 +169,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.ram.db.transaction(()=>{
       for(const p of panes) {
         const tag=String(p.pane_key)+':'+kind, previous=this.faults.get(tag);
-        const count=(previous?.count??0)+(kind==='ingest-capacity'?1:0);
+        const count=(previous?.count??0)+(kind==='ingest-capacity'?lostRows:0);
         if(previous && kind!=='ingest-capacity' && now-previous.last<1000)continue;
         if(!previous || now-previous.last>=1000)emit=true;
         const id=previous?.id??randomUUID();
@@ -180,18 +184,20 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
     })();
     if(!emit && panes.length)return;
+    if(now-(this.faultEmitted.get(kind)??0)<1000)return;
+    this.faultEmitted.set(kind,now);
     const fault={kind,reason,at:now,pendingBytes:this.pendingBytes()};
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
-  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt):Promise<ProjectionReceipt> {
+  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true):Promise<ProjectionReceipt> {
     try {
       this.owner(); if(this.closing) throw new Error('store-closing');
       const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
       if(this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX) {
-        this.stopped=true;this.rejectedRows++;
-        const value=input as ScrollEvent;this.ram.ensure(key,value.sourceEpoch,value.geometryGeneration);
-        this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key);
+        this.stopped=true;if(isScroll)this.rejectedRows++;
+        const value=(isScroll?input:(input as ProjectionCalibration).capture) as ScrollEvent;this.ram.ensure(key,value.sourceEpoch,value.geometryGeneration);
+        this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key,isScroll?1:0);
         throw new Error('ingest-capacity');
       }
       const id=paneId(key);this.queuedBytes+=bytes;
@@ -233,15 +239,18 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       this.owner();if(this.closing)throw new Error('store-closing');
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame);return this.ram.bump(frame.paneKey);})();
-      const id=paneId(frame.paneKey)+':'+frame.kind, bytes=Buffer.byteLength(JSON.stringify(frame))+512;
+      const id=paneId(frame.paneKey)+':'+frame.kind;
+      const encoded=this.ram.db.query('SELECT cells_json FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(frame.paneKey),frame.kind) as SqlRow;
+      const bytes=Buffer.byteLength(String(encoded.cells_json))+512;
       this.dirtyBytes+=bytes-(this.screenBytes.get(id)??0);this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
       return Promise.resolve(receipt);
     }catch(error){return Promise.reject(error);}
   }
-  calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c));}
+  calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c),false);}
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
   screen(key:PaneKey,kind:'normal'|'alternate'='normal'):SqlRow|null {
-    this.owner();return this.ram.db.query('SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
+    this.owner();const row=this.ram.db.query('SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
+    return row?{...row,cells_json:JSON.stringify(decodeFrameCells(String(row.cells_json)))}:null;
   }
   readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
   private snapshot():Batch|null {
@@ -281,7 +290,7 @@ export class ProjectionStore implements ProjectionWriterPort {
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
         }
       }
-      this.degraded=this.faults.size>0;
+      this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     }
   }
   private finishWorker():void {
@@ -291,18 +300,23 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(state===2)throw new Error(new TextDecoder().decode(new Uint8Array(this.signal.buffer,8,Atomics.load(this.signal,1))));
     this.acknowledge();
   }
+  private ensureWorker():void {
+    if(this.worker)return;
+    this.worker=new Worker(new URL(import.meta.url),{workerData:{projectionDiskWriter:true,file:this.file,fence:this.fence,signal:this.signal.buffer}});
+    const failed=(error:unknown)=>{
+      if(this.closed)return;
+      const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
+      new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
+    };
+    this.worker.on('error',failed);
+    this.worker.on('exit',code=>{this.worker=null;if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
+    this.worker.unref();
+  }
   private flushAsync():void {
     this.owner();const batch=this.snapshot();if(!batch)return;
-    if(!this.worker) {
-      this.worker=new Worker(new URL(import.meta.url),{workerData:{projectionDiskWriter:true,file:this.file,fence:this.fence,signal:this.signal.buffer}});
-      this.worker.on('error',error=>{
-        const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
-        new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
-      });
-      this.worker.unref();
-    }
+    this.ensureWorker();
     this.options.checkpoint?.('before-disk-commit',batch.id);
-    Atomics.store(this.signal,0,0);this.inFlight=true;this.worker.postMessage(batch);
+    Atomics.store(this.signal,0,0);this.inFlight=true;this.worker!.postMessage(batch);
   }
   /** Explicit durability barrier remains synchronous; the ingest pump never calls it. */
   flush():void {

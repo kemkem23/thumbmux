@@ -21,19 +21,32 @@ export function validateRow(row: PhysicalRow): void {
       || ![c.fg,c.bg].every(v => v === null || typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)))) throw new Error('invalid-cell');
   }
 }
-export function encodeCells(cells: PhysicalRow['cells']): string {
-  const runs: Array<[PhysicalRow['cells'][number],number]> = [];
-  for(const cell of cells) {
+type CellRun=[string,number,boolean,string|number|null,string|number|null,number,number];
+function cellRuns(cells:PhysicalRow['cells']):CellRun[] {
+  const runs:CellRun[]=[];
+  for(const c of cells) {
     const last=runs.at(-1);
-    if(last && last[0].grapheme===cell.grapheme && last[0].width===cell.width
-      && last[0].continuation===cell.continuation && last[0].fg===cell.fg
-      && last[0].bg===cell.bg && last[0].style===cell.style) last[1]++;
-    else runs.push([cell,1]);
+    if(last && last[0]===c.grapheme && last[1]===c.width && last[2]===c.continuation
+      && last[3]===c.fg && last[4]===c.bg && last[5]===c.style)last[6]++;
+    else runs.push([c.grapheme,c.width,c.continuation,c.fg,c.bg,c.style,1]);
   }
-  return JSON.stringify(runs);
+  return runs;
 }
-export function decodeCells(encoded: string): PhysicalRow['cells'] {
-  return (JSON.parse(encoded) as Array<[PhysicalRow['cells'][number],number]>).flatMap(([cell,n])=>Array.from({length:n},()=>({...cell})));
+function expandRuns(runs:any[]):PhysicalRow['cells'] {
+  // Earlier v2 files used [cell,count]; both encodings are lossless/readable.
+  return runs.flatMap(run=>{
+    if(typeof run[0]==='object')return Array.from({length:run[1]},()=>({...run[0]}));
+    const [grapheme,width,continuation,fg,bg,style,n]=run;
+    return Array.from({length:n},()=>({grapheme,width,continuation,fg,bg,style}));
+  });
+}
+export function encodeCells(cells:PhysicalRow['cells']):string {return JSON.stringify(cellRuns(cells));}
+export function decodeCells(encoded:string):PhysicalRow['cells'] {return expandRuns(JSON.parse(encoded));}
+export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
+  return JSON.stringify({rle:1,rows:cells.map(cellRuns)});
+}
+export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
+  const value=JSON.parse(encoded);return value.rle===1?value.rows.map(expandRuns):value;
 }
 export function validateFrame(frame: ProjectionFrame): void {
   integer(frame.cols); integer(frame.rows); integer(frame.receiveSeq);
@@ -103,7 +116,7 @@ export class ProjectionRam {
     validateFrame(frame);
     const p=this.ensure(frame.paneKey,frame.sourceEpoch,frame.geometryGeneration), id=paneId(frame.paneKey);
     this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json')
-      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,JSON.stringify(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
+      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
   calibrate(change: ProjectionCalibration): ProjectionReceipt {
@@ -128,7 +141,7 @@ export class ProjectionRam {
         if(JSON.stringify(repair.physicalRow)!==JSON.stringify(expected)) throw new Error('repair-not-capture');
         const previous=decodeCells(String(row.cells_json));
         correctedCells+=expected.cells.filter((cell,i)=>JSON.stringify(cell)!==JSON.stringify(previous[i])).length;
-      } else if(row.text!==expected.text || row.cells_json!==encodeCells(expected.cells)) throw new Error('check-not-exact');
+      } else if(row.text!==expected.text || JSON.stringify(decodeCells(String(row.cells_json)))!==JSON.stringify(expected.cells)) throw new Error('check-not-exact');
     }
     this.db.query('INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,JSON.stringify(c.cells),JSON.stringify(c.history),mapped.size,correctedCells,c.ambiguousRows,c.result);
     for(const m of mutations) {

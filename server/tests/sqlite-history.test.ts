@@ -447,3 +447,20 @@ test('newarch v2: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
   console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,missing:Math.max(0,oracle.length-rows.length),extra:Math.max(0,rows.length-oracle.length),wrong:rows.filter((r,i)=>r!==oracle[i]).length,deletedLine710Detected:true,health:s.health()}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },30000);
+
+
+import { encodeCells, decodeCells } from '../src/sqlite-history/ram-store';
+test('newarch: compact cells preserve every field, legacy v2 runs and screen recovery',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-cell-runs-'));
+ const cells:ProjectionCell[]=[{grapheme:'漢',width:2,continuation:false,fg:'#123456',bg:4,style:7},
+   {grapheme:'',width:0,continuation:true,fg:'#123456',bg:4,style:7},naCell('ก้'),naCell(' '),naCell(' ')];
+ expect(decodeCells(encodeCells(cells))).toEqual(cells);
+ expect(decodeCells(JSON.stringify(cells.map(c=>[c,1])))).toEqual(cells);
+ const s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const frame={...naFrame(),cols:cells.length,cells:[cells]};await s.replaceScreen(frame);s.flush();
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual([cells]);
+  await s.close();const r=createProjectionStore({historyRoot:dir,mode:'recover'});
+  try{expect(JSON.parse(String(r.screen(naKey)!.cells_json))).toEqual([cells]);}finally{await r.close();}
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});

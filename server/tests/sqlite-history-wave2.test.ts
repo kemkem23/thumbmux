@@ -206,7 +206,7 @@ test('newarch: actual SQLITE_FULL preserves pending rows and reports host fault 
   expect(s.health().pendingBytes).toBeGreaterThan(0);
   disk.exec('PRAGMA max_page_count=1073741823');s.flush();
   expect(s.token(key).durableRevision).toBe(s.token(key).revision);expect(s.health().pendingBytes).toBe(0);
-  console.log('NA_DISK_FULL',JSON.stringify({sqliteFull:true,hostFaults:faults.length,rowsLost:0,pendingAfterRetry:s.health().pendingBytes}));
+  console.log('NA_DISK_FULL',JSON.stringify({sqliteFull:true,hostFaults:faults.length,rowsLost:1-s.readPage(s.token(key),null,1).lines.length,pendingAfterRetry:s.health().pendingBytes}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -224,13 +224,15 @@ test('newarch: random external SIGKILL x40 crosses eviction, independent durable
    const script=`import {createProjectionStore} from ${JSON.stringify(module)};
     import {openSync,writeSync,fsyncSync,closeSync,renameSync} from 'node:fs';
     const s=createProjectionStore({historyRoot:${JSON.stringify(root)},mode:'recover'}),key=${JSON.stringify(key)};
+    console.log('ready');
     for(let n=s.token(key).nextLineId;;n++) {
       await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n+1,softWrap:false,physicalRow:{text:String(n),cells:[]}});
-      if(n%31===0){s.flush();const fd=openSync(${JSON.stringify(oracle+'.next')},'w');writeSync(fd,JSON.stringify({next:s.token(key).nextLineId}));fsyncSync(fd);closeSync(fd);renameSync(${JSON.stringify(oracle+'.next')},${JSON.stringify(oracle)});}
+      if(n%31===0){if(${trial}%2===0)s.flush();const fd=openSync(${JSON.stringify(oracle+'.next')},'w');writeSync(fd,JSON.stringify({next:s.token(key).durableRevision}));fsyncSync(fd);closeSync(fd);renameSync(${JSON.stringify(oracle+'.next')},${JSON.stringify(oracle)});}
       if(n%8===0)await Bun.sleep(1);
     }`;
-   const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'ignore',stderr:'pipe'});
-   await Bun.sleep(150+Math.floor(Math.random()*200));child.kill('SIGKILL');await child.exited;
+   const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+   const ready=child.stdout.getReader();const started=await ready.read();expect(new TextDecoder().decode(started.value)).toContain('ready');ready.releaseLock();
+   await Bun.sleep(75+Math.floor(Math.random()*200));child.kill('SIGKILL');await child.exited;
    expect(child.signalCode).toBe('SIGKILL');
    const expected=JSON.parse(readFileSync(oracle,'utf8')).next;
    const s=createProjectionStore({historyRoot:root,mode:'recover'});
