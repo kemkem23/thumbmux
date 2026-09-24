@@ -506,3 +506,29 @@ test('newarch: admission freezes cell content before caller mutates the original
   const line=s.readPage(s.token(key),null,1).lines[0];expect(line.text).toBe(expected.text);expect(line.cells).toEqual(expected.cells);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+
+test('newarch: screen generation transitions preserve accepted scroll ordering',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('seed',0));
+  const old=s.appendScroll(naEvent('accepted before resize',1));
+  const resized=s.replaceScreen({...naFrame(),geometryGeneration:2});
+  const latest=s.replaceScreen({...naFrame(),geometryGeneration:2,receiveSeq:3,cells:[[naCell('Z'),naCell(' ')]]});
+  await Promise.all([old,resized,latest]);s.flush();
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toContain('accepted before resize');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('Z');
+  await s.appendScroll({...naEvent('after resize',4),geometryGeneration:2});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('newarch: capacity rejection cannot advance generation past accepted history',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-reject-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const old=s.appendScroll(naEvent('accepted',1));
+  const rejected=s.appendScroll({...naEvent('',2),sourceEpoch:2,geometryGeneration:2,physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}});
+  await expect(rejected).rejects.toThrow('ingest-capacity');await old;s.flush();
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['accepted']);
+  expect(s.health().rejectedRows).toBe(1);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});

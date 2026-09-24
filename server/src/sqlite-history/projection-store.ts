@@ -77,7 +77,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   });
 }
 
-type Job={bytes:number;at:number;run:()=>ProjectionReceipt;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
+type Job={liveFrame:boolean;sourceEpoch:number;geometryGeneration:number;bytes:number;at:number;run:()=>ProjectionReceipt;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
 
 /** One RAM writer, one disk writer, round-robin pane queues, independent of viewers. */
 export class ProjectionStore implements ProjectionWriterPort {
@@ -197,20 +197,25 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
-  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true):Promise<ProjectionReceipt> {
+  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true,liveFrame=false):Promise<ProjectionReceipt> {
     try {
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
       const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
-      if(this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX) {
+      const value=(isScroll || liveFrame?frozen:frozen.capture) as ScrollEvent;
+      const id=paneId(key);
+      if(!liveFrame && (this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX)) {
         this.stopped=true;if(isScroll)this.rejectedRows++;
-        const value=(isScroll?input:(input as ProjectionCalibration).capture) as ScrollEvent;this.ram.ensure(key,value.sourceEpoch,value.geometryGeneration);
+        // Rejection must not advance generations ahead of already accepted jobs.
+        if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
+          const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
+        }
         this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key,isScroll?1:0);
         throw new Error('ingest-capacity');
       }
-      const id=paneId(key);this.queuedBytes+=bytes;
+      this.queuedBytes+=bytes;
       const result=new Promise<ProjectionReceipt>((resolve,reject)=>{
-        const q=this.queues.get(id)??[];q.push({bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
+        const q=this.queues.get(id)??[];q.push({liveFrame,sourceEpoch:value.sourceEpoch,geometryGeneration:value.geometryGeneration,bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
       });
       if(!this.pumping) {
         this.pumping=true;
@@ -236,7 +241,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       try {
         const receipt=this.ram.db.transaction(()=>{
           const receipt=job.run();
-          if(this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
+          if(!job.liveFrame && this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
           return receipt;
         })();
         this.dirtyBytes+=job.bytes;this.dirtySince??=job.at;job.resolve(receipt);
@@ -258,9 +263,14 @@ export class ProjectionStore implements ProjectionWriterPort {
     }catch(error){return Promise.reject(error);}
   }
   replaceScreen(frame:ProjectionFrame):Promise<ProjectionReceipt> {
-    // A live frame replaces the previous frame immediately, even under scroll pressure.
+    // Same-generation frames bypass scroll pressure. A generation transition
+    // stays behind previously accepted jobs so it cannot invalidate their rows.
     try {
       this.owner();if(this.closing)throw new Error('store-closing');
+      const queued=this.queues.get(paneId(frame.paneKey));
+      if(queued?.some(job=>job.liveFrame || job.sourceEpoch!==frame.sourceEpoch || job.geometryGeneration!==frame.geometryGeneration)) {
+        return this.enqueue(frame.paneKey,frame,f=>{this.ram.screen(f);return this.ram.bump(f.paneKey);},false,true);
+      }
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame);return this.ram.bump(frame.paneKey);})();
       const id=paneId(frame.paneKey)+':'+frame.kind;
       const encoded=this.ram.db.query('SELECT cells_json FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(frame.paneKey),frame.kind) as SqlRow;
