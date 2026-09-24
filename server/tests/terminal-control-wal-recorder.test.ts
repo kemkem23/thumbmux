@@ -707,7 +707,7 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     expect(match.repairs).toHaveLength(0);
     expect(match.checks.map(c => c.lineId)).toEqual([5, 6, 7]);
   });
-  test('20,000 callback rows survive retained-ring overflow with exact receipt mapping', () => {
+  test('20,000-row fixture remains unchanged when only the retained tail can be checked', () => {
     const rows = naRows(Array.from({ length: 20000 }, (_, i) => `row-${i}`));
     const retained = rows.slice(-4500);
     const match = matchHistoryRows(rows, retained, naScope);
@@ -868,9 +868,11 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
   for (const active of [true, false]) for (let round = 1; round <= 3; round++) for (const mode of ['baseline', 'full', 'incremental'] as const) {
     test(`60s round=${round} active=${active} capture=${mode} 1/21 panes 80x24/120x40`, async () => {
       const root = mkdtempSync(join(tmpdir(), 'newarch-c-cpu-'));
+      const privateEnv = { ...process.env };
+      delete privateEnv.TMUX; delete privateEnv.TMUX_PANE;
       const configs: Array<{ socket: string; panes: string[]; pid: number; cols: number; rows: number; count: number; ticks: number; bytes: number; samples: number; latencies: number[] }> = [];
       const tmux = (socket: string, args: string[]) => {
-        const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+        const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, env: privateEnv });
         if (result.status !== 0) throw new Error(`private tmux exit=${result.status}: ${result.stderr}`);
         return result.stdout;
       };
@@ -886,6 +888,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           'end=time.monotonic()+100',
           'while time.monotonic()<end:',
           active ? ' for n in range(10):\n  sys.stdout.write("\\x1b[%dmrow-%08d ไทย 你 😀\\x1b[0m\\r\\n" % (31+i%7,i)); i+=1' : ' pass',
+          active ? ' if i%200==0: sys.stdout.write("\\x1b7\\x1b[Hstatus ไทย 你 😀\\x1b8")' : ' pass',
           ' sys.stdout.flush(); time.sleep(.1)',
         ].join('\n'));
         for (const [cols, rows] of [[80, 24], [120, 40]]) for (const count of [1, 21]) {
@@ -941,7 +944,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           if (mode !== 'baseline') expect(c.samples).toBeGreaterThan(0);
         }
       } finally {
-        for (const c of configs) spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8' });
+        for (const c of configs) spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
         rmSync(root, { recursive: true, force: true });
       }
     });
