@@ -10,7 +10,7 @@ export class HistoryWatchdog {
   constructor(private now: () => number, private fault: (fault: HistoryFault) => void) {
     this.heartbeatAt = now();
   }
-  heartbeat(): void { this.heartbeatAt = this.now(); }
+  heartbeat(): void { this.heartbeatAt = this.now(); this.emitted.delete('heartbeat-timeout'); }
   receive(seq: number): void {
     if (seq > this.receiveSeq) {
       this.receiveSeq = seq;

@@ -651,7 +651,7 @@ describe("ordered tmux control WAL recorder with a disposable private tmux serve
 });
 
 import { HistoryCalibrator, equalCalibrationFrames, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts } from '../src/history-calibrator';
-import { matchHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
+import { rowKey, matchHistoryRows, IncrementalHistoryMatcher, equalHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
 import { HistoryWatchdog } from '../src/history-watchdog';
 
 const naRow = (text: string): CapturedRow => ({ softWrap: false, cells: Array.from(text, grapheme => ({ grapheme, width: 1 as const, continuation: false, fg: 'default', bg: 'default', style: 0 })) });
@@ -714,7 +714,7 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     expect(rows).toHaveLength(20000);
     expect(match.checks).toHaveLength(4500);
     for (const check of match.checks) expect(rows[check.lineId - 1]).toEqual(retained[check.capturedRow]);
-    console.log('NEWARCH_C_OVERFLOW', JSON.stringify({ denominator: rows.length, checked: match.checks.length, unchecked: 15500, reason: 'evicted-before-check', missing: 0, extra: 0, wrong: 0, falseChecked: 0, scope: 'fake scroll store; not real collector' }));
+    console.log('NEWARCH_C_OVERFLOW', JSON.stringify({ denominator: rows.length, checked: match.checks.length, unchecked: rows.length - match.checks.length, reason: 'evicted-before-check', falseChecked: match.checks.filter(c => !equalHistoryRows(rows[c.lineId - 1]!, retained[c.capturedRow]!)).length, scope: 'fake scroll store; not real collector' }));
   });
   test('all screen/check/repair mutations share one CAS and conflict recaptures', async () => {
     const h = naHarness(); h.conflict();
@@ -852,4 +852,184 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
       expect(samples[24]!).toBeLessThanOrEqual(500);
     }
   });
+});
+
+// Reviewer seed, operations and all 3,000 cases preserved verbatim.
+test('FIX1 reviewer adversarial corpus', () => {
+// Adversarial probe for matchHistoryRows. Each row carries a hidden true id
+// (oracle) that the matcher never sees. A check is "false" if content differs
+// (content-false) or if the parser row and the captured row are different
+// true lines (identity-false). Repairs must copy tmux content exactly.
+type L = { id: number; text: string; fg?: string };
+const cell = (g: string, fg = 'default') => ({ grapheme: g, width: 1 as const, continuation: false, fg, bg: 'default', style: 0 });
+const cap = (l: L): CapturedRow => ({ softWrap: false, cells: Array.from(l.text.padEnd(8), g => cell(g, l.fg)) });
+let seed = 12345; const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+const scope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function run(name: string, parser: L[], tmux: L[]) {
+  const recent: HistoryRow[] = parser.map((l, i) => ({ ...cap(l), lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
+  const captured = tmux.map(cap);
+  const m = matchHistoryRows(recent, captured, scope);
+  let contentFalse = 0, identityFalse = 0, repairNotTmux = 0, repairWrongLine = 0, repairDestroysCorrect = 0;
+  for (const c of m.checks) {
+    if (rowKey(recent[c.lineId]!) !== rowKey(captured[c.capturedRow]!)) contentFalse++;
+    if (parser[c.lineId]!.id !== tmux[c.capturedRow]!.id) identityFalse++;
+  }
+  for (const r of m.repairs) {
+    if (rowKey(r.row) !== rowKey(captured[r.capturedRow]!)) repairNotTmux++;
+    if (parser[r.lineId]!.id !== tmux[r.capturedRow]!.id) repairWrongLine++;
+    // parser row was already a correct copy of its true line and the repair replaces it with another line's content
+    const own = tmux.find(t => t.id === parser[r.lineId]!.id);
+    if (own && rowKey(cap(own)) === rowKey(recent[r.lineId]!) && rowKey(r.row) !== rowKey(recent[r.lineId]!)) repairDestroysCorrect++;
+  }
+  const before = parser.map(l => l.id); const after = before.slice();
+  for (const r of m.repairs) after[r.lineId] = tmux[r.capturedRow]!.id;
+  const cnt = (xs: number[]) => xs.reduce((mp, x) => mp.set(x, (mp.get(x) ?? 0) + 1), new Map<number, number>());
+  const cb = cnt(before), ca = cnt(after); let lostByRepair = 0, dupByRepair = 0;
+  const lostIds: number[] = []; for (const [id] of cb) if (id >= 0 && !ca.has(id)) { lostByRepair++; lostIds.push(id); }
+  if (lostIds.length && (globalThis as any).dumped !== true && name.startsWith('fuzz')) { (globalThis as any).dumped = true; const ringStart = tmux[0]!.id; console.log('LOSS-DUMP', JSON.stringify({ name, lostIds: lostIds.slice(0,10), ringIds: [tmux[0]!.id, tmux.at(-1)!.id], repairsOnLost: m.repairs.filter(r => lostIds.includes(parser[r.lineId]!.id)).slice(0,5).map(r => ({ lineId: r.lineId, parserId: parser[r.lineId]!.id, parserText: parser[r.lineId]!.text, parserFg: parser[r.lineId]!.fg, tmuxId: tmux[r.capturedRow]!.id, tmuxText: tmux[r.capturedRow]!.text })) })); }
+  for (const [id, n] of ca) if (n > 1 && n > (cb.get(id) ?? 0)) dupByRepair++;
+  return { lostByRepair, dupByRepair, name, reason: m.reason, checks: m.checks.length, repairs: m.repairs.length, contentFalse, identityFalse, repairNotTmux, repairWrongLine, repairDestroysCorrect };
+}
+const stream = (n: number, vocab: number, start = 0) => Array.from({ length: n }, (_, i) => ({ id: start + i, text: vocab ? `v${Math.floor(rnd() * vocab)}` : `row-${start + i}` }));
+const out: any[] = [];
+// 1 long run of identical rows at the tail
+{ const s = [...stream(50, 0), ...Array.from({ length: 200 }, (_, i) => ({ id: 1000 + i, text: '' }))]; out.push(run('long-identical-tail', s, s)); }
+// 1b identical run with parser behind by 5 blank rows
+{ const s = [...stream(50, 0), ...Array.from({ length: 200 }, (_, i) => ({ id: 1000 + i, text: '' }))]; out.push(run('identical-run-parser-behind', s.slice(0, -5), s)); }
+// 2 clear mid-way: tmux ring cleared (clear-history) then new output
+{ const s = stream(300, 0); const after = stream(100, 0, 300); out.push(run('clear-history-midway', [...s, ...after], after)); }
+// 2b clear-screen that pushes the same visible rows into history twice (scroll-on-clear)
+{ const s = stream(100, 0); const dup = s.slice(-24).map(l => ({ id: l.id + 10000, text: l.text })); out.push(run('scroll-on-clear-duplicate', s, [...s, ...dup])); }
+// 3 overflow beyond history-limit between two rounds
+{ const s = stream(20000, 0); out.push(run('overflow-20000-limit-4500', s, s.slice(-4500))); }
+// 3b overflow while parser lost 7 rows in the middle of the retained part
+{ const s = stream(20000, 0); const p = [...s.slice(0, 17000), ...s.slice(17007)]; out.push(run('overflow-with-lost-rows', p, s.slice(-4500))); }
+// 4 color-only change inside the tail
+{ const s = stream(100, 0); const t = s.map(l => ({ ...l })); t[60]!.fg = 'index:1'; t[99]!.fg = 'index:2'; out.push(run('color-only-change', s, t)); }
+{ const s = stream(100, 0); const t = s.map(l => ({ ...l })); t[60]!.fg = 'index:1'; out.push(run('color-only-change-mid', s, t)); }
+// 5 periodic content (a b c a b c ...)
+{ const s = Array.from({ length: 300 }, (_, i) => ({ id: i, text: 'abc'[i % 3]! })); out.push(run('periodic-abc', s, s)); }
+// 6 shift inside a bounded gap (delete one row at gap start, insert one at gap end)
+{ const s: L[] = ['A1','A2','A3','P','Q','Q','B1','B2','B3'].map((t, i) => ({ id: i, text: t }));
+  const t: L[] = [s[0]!, s[1]!, s[2]!, s[4]!, s[5]!, { id: 99, text: 'R' }, s[6]!, s[7]!, s[8]!];
+  out.push(run('equal-length-shift-in-gap', s, t)); }
+// 7 randomized fuzz: small vocab, random drops/dups/phantoms/colour edits, ring truncation
+const agg = { lostByRepair: 0, dupByRepair: 0, lossCases: [] as any[], cases: 0, checks: 0, repairs: 0, contentFalse: 0, identityFalse: 0, repairNotTmux: 0, repairWrongLine: 0, repairDestroysCorrect: 0, destroyCases: [] as any[], identityFalseCases: [] as any[] };
+for (let k = 0; k < 3000; k++) {
+  const vocab = [0, 2, 3, 5, 20][k % 5]!;
+  const truth = stream(40 + Math.floor(rnd() * 200), vocab);
+  const ring = truth.slice(-Math.max(3, Math.floor(truth.length * (0.3 + rnd() * 0.7))));
+  const parser: L[] = [];
+  for (const l of truth) {
+    const r = rnd();
+    if (r < 0.03) continue; // lost row
+    if (r < 0.05) { parser.push(l, { ...l }); continue; } // duplicated row
+    if (r < 0.07) { parser.push({ id: -1 - k, text: 'phantom' }, l); continue; }
+    if (r < 0.10) { parser.push({ ...l, fg: 'index:9' }); continue; } // colour drift
+    parser.push(l);
+  }
+  const behind = Math.floor(rnd() * 3);
+  const res = run(`fuzz-${k}`, parser, ring.slice(0, ring.length - behind || undefined));
+  agg.cases++; agg.checks += res.checks; agg.repairs += res.repairs; agg.contentFalse += res.contentFalse; agg.identityFalse += res.identityFalse; agg.lostByRepair += res.lostByRepair; agg.dupByRepair += res.dupByRepair; if ((res.lostByRepair||res.dupByRepair) && agg.lossCases.length < 3) agg.lossCases.push({k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res}); agg.repairNotTmux += res.repairNotTmux; agg.repairWrongLine += res.repairWrongLine; agg.repairDestroysCorrect += res.repairDestroysCorrect; if (res.repairDestroysCorrect && agg.destroyCases.length < 5) agg.destroyCases.push({ k, vocab, ...res });
+  if (res.identityFalse && agg.identityFalseCases.length < 5) agg.identityFalseCases.push({ k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res });
+}
+for (const o of out) { expect(o.contentFalse).toBe(0); expect(o.repairNotTmux).toBe(0); }
+console.log('NEWARCH_FIX1_FUZZ', JSON.stringify({ cases: agg.cases, checks: agg.checks, falseChecked: agg.contentFalse, repairs: agg.repairs, repairNotTmux: agg.repairNotTmux, identityFalse: agg.identityFalse }));
+expect(agg.cases).toBe(3000); expect(agg.checks).toBeGreaterThan(0); expect(agg.contentFalse).toBe(0); expect(agg.repairNotTmux).toBe(0);
+});
+
+test('FIX1 full matcher p95 at 4500 rows, independent cells and collision buckets', () => {
+  for (const cols of [80, 120]) {
+    const recent = naRows(Array.from({ length: 4500 }, (_, i) => `row-${String(i).padStart(8, '0')}`.padEnd(cols, 'x')));
+    const captured = recent.map(r => ({ softWrap: r.softWrap, cells: r.cells.map(c => ({ ...c })) }));
+    const times: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      const started = performance.now();
+      const result = matchHistoryRows(recent, captured, naScope);
+      times.push(performance.now() - started);
+      expect(result.checks).toHaveLength(4500);
+    }
+    times.sort((a, b) => a - b);
+    console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29] }));
+    expect(times[28]!).toBeLessThanOrEqual(20);
+    // Same sampled prefix, different final cells: never trust the bucket key.
+    captured[2200]!.cells[cols - 1]!.fg = 'index:9';
+    const result = matchHistoryRows(recent, captured, naScope);
+    expect(result.checks.some(c => c.lineId === 2201)).toBe(false);
+    expect(result.repairs.some(c => c.lineId === 2201)).toBe(true);
+  }
+});
+
+test('FIX1 incremental checked coverage and fail-closed anchor loss', () => {
+  const matcher = new IncrementalHistoryMatcher();
+  const all = naRows(Array.from({ length: 8000 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 4500);
+  const initial = matcher.match(recent, recent, naScope);
+  matcher.remember(recent, recent, initial);
+  const checked = new Set<number>();
+  for (let end = 4520; end <= 7500; end += 20) {
+    recent = all.slice(end - 4500, end);
+    const captured = recent.slice(-23);
+    const result = matcher.match(recent, captured, { ...naScope, completeRetainedTail: false });
+    for (const c of result.checks) {
+      expect(equalHistoryRows(all[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
+      if (c.lineId > 4500) checked.add(c.lineId);
+    }
+    matcher.remember(recent, captured, result);
+  }
+  console.log('NEWARCH_FIX1_INCREMENTAL', JSON.stringify({ scrolled: 3000, checked: checked.size, ratio: checked.size / 3000 }));
+  expect(checked.size).toBe(3000);
+  matcher.reset();
+  expect(matcher.match(recent, recent.slice(-23), { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
+});
+
+test('FIX1 capture errors, unstable metadata and CAS do not freeze pipe', async () => {
+  for (const kind of ['throw', 'unstable', 'cas']) {
+    const h = naHarness();
+    if (kind === 'throw') h.ports.capture = async () => { throw new Error('fixture capture fault'); };
+    if (kind === 'unstable') h.stale();
+    if (kind === 'cas') h.conflict();
+    let published = 0;
+    h.calibrator.output(() => published++);
+    await h.calibrator.runDue();
+    h.time(16); await h.calibrator.runDue();
+    expect(h.calibrator.acceptsPipeFrame).toBe(true);
+    expect(published).toBe(1);
+  }
+});
+
+test('FIX1 pipe publishes during capture and revision is read after 100 rows/s output', async () => {
+  const h = naHarness();
+  const capture = h.ports.capture;
+  const read = h.ports.read;
+  let revision = 1, commits = 0, pipe = 0;
+  h.ports.read = () => ({ ...read(), revision });
+  h.ports.calibrate = async input => {
+    expect(input.expectedRevision).toBe(revision);
+    commits++; return { revision: ++revision, durableRevision: 0, nextLineId: 4 };
+  };
+  h.ports.capture = async (key, limit) => {
+    for (let n = 0; n < 10; n++) {
+      await new Promise(resolve => setTimeout(resolve, 10)); revision++;
+      h.time(n * 10); h.calibrator.output(() => pipe++);
+      await h.calibrator.runDue();
+    }
+    return capture(key, limit);
+  };
+  await h.calibrator.runDue();
+  expect(commits).toBe(1); expect(pipe).toBeGreaterThan(0);
+  console.log('NEWARCH_FIX1_CAS', JSON.stringify({ rowsPerSecond: 100, commits, pipe }));
+});
+
+test('FIX1 hung capture has a deadline and heartbeat can alert after recovery', async () => {
+  const h = naHarness(); let aborted = false;
+  h.ports.capture = (_, __, signal) => new Promise(() => { signal?.addEventListener('abort', () => { aborted = true; }); });
+  const at = performance.now(); await h.calibrator.runDue();
+  expect(performance.now() - at).toBeLessThan(1500);
+  expect(aborted).toBe(true); expect(h.calibrator.acceptsPipeFrame).toBe(true);
+  let now = 0; const faults: string[] = [];
+  const watchdog = new HistoryWatchdog(() => now, f => faults.push(f.kind));
+  now = 3000; watchdog.tick(); watchdog.heartbeat();
+  now = 6000; watchdog.tick();
+  expect(faults).toEqual(['heartbeat-timeout', 'heartbeat-timeout']);
 });

@@ -30,8 +30,35 @@ export interface RowMatch {
   reason: 'matched' | 'ambiguous' | 'partial-tail' | 'generation' | 'no-anchor';
 }
 
-// Z over interned exact row strings, not a hash-only comparison or edit distance.
-function zValues(values: readonly (string | null)[]): number[] {
+/** Hash buckets are only an accelerator: exact cell comparison assigns IDs.
+ * Nothing is cached across calls, so mutable caller rows cannot retain stale keys. */
+export function equalHistoryRows(a: CapturedRow, b: CapturedRow): boolean {
+  if (a.softWrap !== b.softWrap || a.cells.length !== b.cells.length) return false;
+  if (a.cells === b.cells) return true;
+  for (let x = 0; x < a.cells.length; x++) {
+    const c = a.cells[x]!, d = b.cells[x]!;
+    if (c.grapheme !== d.grapheme || c.width !== d.width || c.continuation !== d.continuation
+      || c.fg !== d.fg || c.bg !== d.bg || c.style !== d.style) return false;
+  }
+  return true;
+}
+function internRows(rows: readonly CapturedRow[][]): number[][] {
+  const buckets = new Map<string, Array<{ row: CapturedRow; id: number }>>();
+  let id = 0;
+  return rows.map(part => part.map(row => {
+    // Sample glyphs to keep keys small. A bucket collision is resolved exactly.
+    let key = `${row.softWrap}/${row.cells.length}/`;
+    for (let x = 0; x < Math.min(16, row.cells.length); x++) key += row.cells[x]!.grapheme + '\0';
+    const bucket = buckets.get(key);
+    const found = bucket?.find(entry => equalHistoryRows(entry.row, row));
+    if (found) return found.id;
+    const entry = { row, id: ++id };
+    if (bucket) bucket.push(entry); else buckets.set(key, [entry]);
+    return entry.id;
+  }));
+}
+// Z over exact row IDs; triples contain three integers instead of three full rows.
+function zValues(values: readonly (number | null)[]): number[] {
   const z = Array<number>(values.length).fill(0);
   let left = 0, right = 0;
   for (let i = 1; i < values.length; i++) {
@@ -41,17 +68,17 @@ function zValues(values: readonly (string | null)[]): number[] {
   }
   return z;
 }
-function occurrences(pattern: string[], values: string[]): number {
+function occurrences(pattern: number[], values: number[]): number {
   const z = zValues([...pattern, null, ...values]);
   let count = 0;
   for (let i = pattern.length + 1; i < z.length; i++) if (z[i]! >= pattern.length) count++;
   return count;
 }
-function triples(values: string[]): Map<string, number[]> {
+function triples(values: number[]): Map<string, number[]> {
   const map = new Map<string, number[]>();
   for (let i = 0; i + 2 < values.length; i++) {
     if (values[i] === values[i + 1] && values[i] === values[i + 2]) continue;
-    const key = JSON.stringify(values.slice(i, i + 3));
+    const key = `${values[i]},${values[i + 1]},${values[i + 2]}`;
     const positions = map.get(key) ?? [];
     positions.push(i); map.set(key, positions);
   }
@@ -67,7 +94,7 @@ export function matchHistoryRows(
   const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
   if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
-  const a = recent.map(rowKey), b = captured.map(rowKey);
+  const [a, b] = internRows([recent as CapturedRow[], captured as CapturedRow[]]) as [number[], number[]];
   if (a.length < 3 || b.length < 3) return empty('no-anchor');
   const reversed = a.slice().reverse();
   const z = zValues([...reversed, null, ...b.slice().reverse()]);
@@ -110,4 +137,46 @@ export function matchHistoryRows(
     }
   }
   return result;
+}
+
+/** A committed full capture seeds this chain. Partial captures must overlap a
+ * previously checked, still exact, unique triple. Never infer across a gap.
+ * The host must reset on every clear/resize/epoch transition and only remember
+ * successful transactions. Receipts certify observed content, not hidden IDs. */
+export class IncrementalHistoryMatcher {
+  private checked = new Map<number, CapturedRow>();
+  reset(): void { this.checked.clear(); }
+  match(recent: readonly HistoryRow[], captured: readonly CapturedRow[], scope: Parameters<typeof matchHistoryRows>[2]): RowMatch {
+    if (scope.completeRetainedTail) return matchHistoryRows(recent, captured, scope);
+    const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
+    if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
+    const [a, b] = internRows([recent as CapturedRow[], captured as CapturedRow[]]) as [number[], number[]];
+    const at = triples(a), bt = triples(b);
+    const anchors: Array<[number, number]> = [];
+    for (const [key, positions] of at) {
+      const other = bt.get(key);
+      if (positions.length !== 1 || other?.length !== 1) continue;
+      const i = positions[0]!, j = other[0]!;
+      if ([0, 1, 2].every(n => {
+        const row = recent[i + n]!, prior = this.checked.get(row.lineId);
+        return prior !== undefined && equalHistoryRows(prior, row);
+      })) anchors.push([i, j]);
+    }
+    if (!anchors.length) return empty('partial-tail');
+    const offset = anchors[0]![1] - anchors[0]![0];
+    if (anchors.some(([i, j]) => j - i !== offset)) return empty('ambiguous');
+    const result = empty('matched');
+    const [start, captureStart] = anchors[0]!;
+    for (let i = start, j = captureStart; i < a.length && j < b.length; i++, j++) {
+      if (a[i] !== b[j]) { result.reason = 'ambiguous'; break; }
+      result.checks.push({ lineId: recent[i]!.lineId, capturedRow: j });
+    }
+    return result;
+  }
+  remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {
+    const retained = new Set(recent.map(row => row.lineId));
+    for (const id of this.checked.keys()) if (!retained.has(id)) this.checked.delete(id);
+    this.checked.clear();
+    for (const check of match.checks.slice(-128)) this.checked.set(check.lineId, structuredClone(captured[check.capturedRow]!));
+  }
 }

@@ -1,4 +1,4 @@
-import { charCellWidth } from '@thumbmux/core';
+import { charCellWidth, stringCells } from '@thumbmux/core';
 
 const ESC = 0x1b;
 const BEL = 0x07;
@@ -114,6 +114,12 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
   if (lines.at(-1) === '') lines.pop();
   const rows: TmuxObservedCell[][] = [];
   const applySgr = (body: string) => {
+    // tmux uses colon subparameters for underline variants and overline.
+    // These decorations are outside this projection; consume them without
+    // mistaking their parameters for bold, blink, or foreground colours.
+    body = body.replace(/\b(4|5):[0-9]+/g, (_, kind) => kind === '4' ? '4' : '53')
+      .replace(/(38|48|58):2::?(\d+):(\d+):(\d+)/g, '$1;2;$2;$3;$4')
+      .replace(/(38|48|58):5:(\d+)/g, '$1;5;$2');
     if (!/^[0-9;]*$/.test(body)) throw new Error('unsupported capture SGR');
     const codes = body === '' ? [0] : body.split(';').map(x => x === '' ? 0 : Number(x));
     for (let i = 0; i < codes.length; i++) {
@@ -134,7 +140,8 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
       else if (n >= 40 && n <= 47) bg = `index:${n - 40}`;
       else if (n >= 90 && n <= 97) fg = `index:${n - 90 + 8}`;
       else if (n >= 100 && n <= 107) bg = `index:${n - 100 + 8}`;
-      else if (n === 38 || n === 48) {
+      else if (n === 53 || n === 55 || n === 59) { /* unobserved decoration */ }
+      else if (n === 38 || n === 48 || n === 58) {
         const mode = codes[++i];
         const count = mode === 5 ? 1 : mode === 2 ? 3 : 0;
         if (!count) throw new Error('unsupported capture color');
@@ -142,7 +149,7 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
         if (values.length !== count || values.some(v => !Number.isInteger(v) || v < 0 || v > 255)) throw new Error('invalid capture color');
         i += count;
         const color = mode === 5 ? `index:${values[0]}` : `rgb:${values.join(',')}`;
-        if (n === 38) fg = color; else bg = color;
+        if (n === 38) fg = color; else if (n === 48) bg = color;
       } else throw new Error(`unobserved capture SGR ${n}`);
     }
   };
@@ -151,16 +158,22 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
     let at = 0;
     while (at < line.length) {
       if (line.charCodeAt(at) === ESC) {
+        if (line.startsWith('\x1b]8;', at)) { at = escapeEnd(line, at); continue; }
         const match = /^\x1b\[([0-9;:]*)m/.exec(line.slice(at));
         if (!match) throw new Error('unsupported capture escape');
         applySgr(match[1]!); at += match[0].length; continue;
       }
       const next = line.indexOf('\x1b', at);
       const text = line.slice(at, next < 0 ? line.length : next);
-      for (const { segment } of segmenter.segment(text)) {
+      for (const { segment: cluster } of segmenter.segment(text)) {
+        // tmux merges emoji ZWJ/flag/skin-tone clusters, but Thai spacing
+        // vowels remain separate cells even inside a Unicode grapheme.
+        const pieces = /[\u0e00-\u0e7f]/u.test(cluster)
+          ? cluster.match(/[^\p{Mark}][\p{Mark}]*/gu) ?? [cluster] : [cluster];
+        for (const segment of pieces) {
         if (/[\x00-\x1f\x7f]/.test(segment)) throw new Error('control byte in capture cells');
         let width: 0 | 1 | 2 = 0;
-        for (const ch of segment) width = Math.max(width, charCellWidth(ch.codePointAt(0)!)) as 0 | 1 | 2;
+        width = Math.min(2, stringCells(segment)) as 0 | 1 | 2;
         if (segment.includes('\ufe0f') && width === 1) width = 2;
         if (width === 0) {
           const previous = cells.findLast(c => !c.continuation);
@@ -170,6 +183,7 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
         }
         cells.push({ grapheme: segment, width, continuation: false, fg, bg, style });
         if (width === 2) cells.push({ grapheme: '', width: 0, continuation: true, fg, bg, style });
+      }
       }
       at += text.length;
     }

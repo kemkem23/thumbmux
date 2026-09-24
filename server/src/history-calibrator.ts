@@ -1,4 +1,4 @@
-import { cellKey, matchHistoryRows, type CapturedRow, type HistoryCell, type HistoryRow, type RowMatch } from './history-row-matcher';
+import { cellKey, IncrementalHistoryMatcher, type CapturedRow, type HistoryCell, type HistoryRow, type RowMatch } from './history-row-matcher';
 
 export interface PaneKey { serverIdentity: string; paneId: string; birthGeneration: number }
 export interface CalibrationFrame {
@@ -27,7 +27,7 @@ export interface CalibrationSnapshot {
 export interface CalibrationCommit { revision: number; durableRevision: number; nextLineId: number }
 export interface CalibrationPorts {
   now(): number;
-  capture(paneKey: PaneKey, tailLimit: number): Promise<CalibrationCapture>;
+  capture(paneKey: PaneKey, tailLimit: number, signal?: AbortSignal): Promise<CalibrationCapture>;
   schedule(deadline: number): void;
   read(): CalibrationSnapshot;
   // null is a CAS conflict; every screen/check/repair is in this one transaction.
@@ -48,8 +48,9 @@ export type CalibrationEvent = 'birth' | 'reconnect' | 'resize' | 'clear' | 'alt
 
 /** One instance per pane. The host owns the deadline queue and invokes runDue.
  * Full-tail is the safe default. Incremental mode is opt-in and never issues
- * checks on an incomplete retained ring; no history_size delta is trusted. */
+ * checks only through a committed anchor chain; no history_size delta is trusted. */
 export class HistoryCalibrator {
+  private matcher = new IncrementalHistoryMatcher();
   mode: 'PIPE' | 'CAPTURE' = 'PIPE';
   private deadline = Infinity;
   private lastCaptureAt = -Infinity;
@@ -86,7 +87,7 @@ export class HistoryCalibrator {
     this.output();
   }
   event(_kind: CalibrationEvent): void {
-    this.eventGeneration++; this.forceFull = true;
+    this.eventGeneration++; this.forceFull = true; this.matcher.reset();
     // A generation change immediately prevents stale parser frames being shown.
     this.enterCapture();
     this.request(Math.max(this.ports.now(), this.lastCaptureAt + 50));
@@ -100,12 +101,16 @@ export class HistoryCalibrator {
   }
   async runDue(): Promise<void> {
     const now = this.ports.now();
-    if (this.inFlight) return;
+    if (this.latchAt !== undefined && now - this.latchAt >= 1000) {
+      if (!this.degraded) this.ports.fault({ kind: 'capture-latch-degraded', at: now, missingCount: null });
+      this.degraded = true; this.mode = 'PIPE'; this.latchAt = undefined;
+    }
     if (now >= this.nextPipePublish) {
       const publish = this.pendingPipe;
       this.nextPipePublish = Infinity; this.pendingPipe = undefined;
       if (this.mode === 'PIPE') publish?.();
     }
+    if (this.inFlight) return;
     if (now < this.deadline) { this.ports.schedule(this.dueAt); return; }
     this.inFlight = true; this.deadline = Infinity;
     const startedGeneration = this.eventGeneration;
@@ -113,10 +118,18 @@ export class HistoryCalibrator {
     const requestedScrolls = this.scrolls;
     const limit = this.options.historyLimit ?? 4500;
     const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 3);
-    const read = this.ports.read();
     let successful = false;
     try {
-      const capture = await this.ports.capture(this.paneKey, tailLimit);
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const capture = await Promise.race([
+        this.ports.capture(this.paneKey, tailLimit, controller.signal),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => {
+          controller.abort(); reject(new Error('capture deadline exceeded'));
+        }, 1000); }),
+      ]).finally(() => { clearTimeout(timer); });
+      // The capture subprocess must finish BEFORE selecting a CAS revision.
+      const read = this.ports.read();
       const meta = capture.after;
       const stable = samePane(capture.paneKey, this.paneKey)
         && JSON.stringify(capture.before) === JSON.stringify(meta)
@@ -126,29 +139,34 @@ export class HistoryCalibrator {
         && capture.frame.cursor !== null
         && capture.frame.cells.length === meta.rows && capture.frame.cells.every(row => row.length === meta.cols)
         && startedGeneration === this.eventGeneration;
-      if (!stable) { this.forceFull = true; this.enterCapture(); return; }
-      const match = matchHistoryRows(read.recentHistory, capture.history, {
+      if (!stable) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
+      const match = this.matcher.match(read.recentHistory, capture.history, {
         sourceEpoch: read.sourceEpoch, geometryGeneration: read.geometryGeneration,
         completeRetainedTail: historyDue && capture.completeRetainedTail && meta.kind === 'normal',
       });
       const committed = await this.ports.calibrate({ capture, checks: match.checks, repairs: match.repairs, expectedRevision: read.revision });
-      if (!committed) { this.forceFull = true; this.enterCapture(); return; }
+      if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       // Only the transaction revision is published. A concurrent lifecycle event
       // suppresses this result and requests another capture, never an old frame.
       if (startedGeneration !== this.eventGeneration) { this.enterCapture(); return; }
       const latest = this.ports.read();
-      if (latest.revision !== committed.revision) { this.enterCapture(); return; }
-      if (equalCalibrationFrames(latest.parserFrame, capture.frame)) {
+      this.matcher.remember(read.recentHistory, capture.history, match);
+      const comparable = latest.revision === committed.revision
+        && read.parserFrame.receiveSeq === capture.frame.receiveSeq
+        && latest.parserFrame.receiveSeq === capture.frame.receiveSeq;
+      if (!comparable || equalCalibrationFrames(latest.parserFrame, capture.frame)) {
         this.mode = 'PIPE'; this.latchAt = undefined; this.degraded = false;
       } else this.enterCapture();
       // A committed capture supersedes any pipe publish queued before it.
-      this.pendingPipe = undefined; this.nextPipePublish = Infinity;
-      this.ports.publish(committed, capture.frame);
+      if (comparable) {
+        this.pendingPipe = undefined; this.nextPipePublish = Infinity;
+        this.ports.publish(committed, capture.frame);
+      }
       successful = true;
-      this.forceFull = false;
+      this.forceFull = historyDue && (match.reason === 'partial-tail' || match.reason === 'ambiguous');
       if (historyDue) { this.lastHistoryAt = now; this.scrolls = Math.max(0, this.scrolls - requestedScrolls); }
     } catch (error) {
-      this.forceFull = true; this.enterCapture();
+      this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined;
       this.ports.fault({ kind: 'capture-fault', at: this.ports.now(), missingCount: null });
     } finally {
       this.inFlight = false; this.lastCaptureAt = now;
