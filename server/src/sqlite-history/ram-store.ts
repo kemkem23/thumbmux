@@ -47,16 +47,8 @@ export function upsert(db: Database, table: string, row: SqlRow): void {
   if (!/^na_(pane|capture|line|screen|issue|commit)$/.test(table)) throw new Error('invalid-table');
   const columns = Object.keys(row);
   if (columns.some(c => !/^[a-z_]+$/.test(c))) throw new Error('invalid-column');
-  // Updating an unchanged parent key still makes SQLite inspect referencing
-  // rows. Keep identity columns out of the update on every projection flush.
-  const keys: Record<string,string[]> = {
-    na_pane:['pane_key'], na_capture:['pane_key','capture_id'],
-    na_line:['pane_key','line_id'], na_screen:['pane_key','screen_kind'],
-    na_issue:['issue_id'], na_commit:['commit_id'],
-  };
-  const updates=columns.filter(c=>!keys[table].includes(c));
   db.query(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})
-    ON CONFLICT DO UPDATE SET ${updates.map(c=>`${c}=excluded.${c}`).join(',')}`).run(...Object.values(row));
+    ON CONFLICT DO UPDATE SET ${columns.map(c=>`${c}=excluded.${c}`).join(',')}`).run(...Object.values(row));
 }
 
 /** Only the bounded live working set lives here. Disk history is never loaded wholesale. */
@@ -153,13 +145,9 @@ export class ProjectionRam {
   }
   evict(): void {
     // 4500 unchecked-history candidates + 500 physical-row tray, including screen.
-    // Seek only the evictable prefix of each pane instead of scanning every
-    // retained line on every flush. The durable-revision fence is unchanged.
-    for(const p of this.db.query('SELECT pane_key,next_line_id,durable_revision FROM na_pane').all() as SqlRow[]) {
-      this.db.query('DELETE FROM na_line WHERE pane_key=? AND line_id<? AND revision<=?')
-        .run(p.pane_key,Math.max(0,Number(p.next_line_id)-5000),p.durable_revision);
-    }
-    this.db.exec(`DELETE FROM na_capture WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_capture.pane_key)
+    this.db.exec(`DELETE FROM na_line WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_line.pane_key)
+      AND line_id < (SELECT max(0,next_line_id-5000) FROM na_pane p WHERE p.pane_key=na_line.pane_key);
+      DELETE FROM na_capture WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_capture.pane_key)
       AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=na_capture.pane_key AND l.checked_capture_id=na_capture.capture_id)
       AND NOT EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_key=na_capture.pane_key AND s.last_capture_id=na_capture.capture_id);
       DELETE FROM na_issue WHERE revision <= (SELECT durable_revision FROM na_pane p WHERE p.pane_key=na_issue.pane_key);`);
