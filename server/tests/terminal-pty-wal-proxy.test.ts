@@ -38,7 +38,7 @@ function pythonProbeEnv(baseEnvironment: NodeJS.ProcessEnv = process.env): NodeJ
 
 afterEach(() => {
   for (const socket of sockets.splice(0)) {
-    spawnSync("tmux", ["-S", socket, "kill-server"], { stdio: "ignore" });
+    tmux(socket, "kill-server");
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -62,7 +62,10 @@ async function eventually(check: () => boolean, label: string, timeoutMs = 10_00
 }
 
 function tmux(socket: string, ...args: string[]): ReturnType<typeof spawnSync> {
-  return spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8" });
+  const env = { ...process.env };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  return spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8", env });
 }
 
 function lifecycle(record: OutputWalRecord): TerminalWalLifecycleRecord {
@@ -653,6 +656,26 @@ describe("direct child PTY durable WAL proxy", () => {
     ].join("\n");
     const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, root], { env: pythonProbeEnv(), encoding: "utf8" });
     expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
+  });
+
+  test("freezer guard thaws after abrupt proxy exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tmptywal-thaw-"));
+    roots.push(root);
+    const scriptPath = createTerminalPtyWalProxyLaunchSpec({
+      directory: join(root, "lane"),
+      identity: { session: "sh-thaw", instanceId: "thaw", paneTarget: "=sh-thaw:0.0" },
+      argv: ["/bin/true"],
+    }, {}).args[1]!;
+    const probe = [
+      "import importlib.util,os,sys",
+      "spec=importlib.util.spec_from_file_location('proxy',sys.argv[1])",
+      "m=importlib.util.module_from_spec(spec);sys.modules['proxy']=m;spec.loader.exec_module(m)",
+      "freezer=m.ChildFreezer(sys.argv[2]);freezer.start_guard();freezer.set_frozen(True)",
+      "os._exit(0)",
+    ].join("\n");
+    const result = spawnSync("python3", ["-B", "-c", probe, scriptPath, root], { env: pythonProbeEnv(), encoding: "utf8" });
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
+    await eventually(() => readFileSync(join(root, "cgroup.freeze"), "utf8") === "0", "crash guard thaw");
   });
 
   test("real tmux preserves bytes, resumes with a new generation, orders resize, and ACKs END after EOF", async () => {

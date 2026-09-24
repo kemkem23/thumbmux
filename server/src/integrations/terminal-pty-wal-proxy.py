@@ -1060,7 +1060,13 @@ def query_source(config: dict[str, Any], generation: str) -> tuple[dict[str, Any
         config["identity"]["paneTarget"],
         SOURCE_FORMAT,
     ]
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    environment = os.environ.copy()
+    if tmux_selector(tmux):
+        # An explicit socket owns this query, not an inherited pane binding.
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+    result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()[:2048]
         raise ProxyError(f"tmux identity query failed ({result.returncode}): {detail}")
@@ -1216,6 +1222,36 @@ class ChildFreezer:
 
     def __init__(self, path: str) -> None:
         self.path = path
+        self.guard_fd = -1
+
+    def start_guard(self) -> None:
+        # The guard stays outside the frozen cgroup. Even SIGKILL of the
+        # proxy closes this pipe, so a crash cannot strand frozen descendants.
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        try:
+            pid = os.fork()
+        except BaseException:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+        if pid == 0:
+            try:
+                signal.set_wakeup_fd(-1)
+                os.setsid()
+                for selected in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                    signal.signal(selected, signal.SIG_IGN)
+                close_child_fds({read_fd})
+                while os.read(read_fd, 1):
+                    pass
+                self.set_frozen(False)
+                try:
+                    os.rmdir(self.path)
+                except OSError:
+                    pass
+            finally:
+                os._exit(0)
+        os.close(read_fd)
+        self.guard_fd = write_fd
 
     @staticmethod
     def attach(pid: int) -> Optional["ChildFreezer"]:
@@ -1233,7 +1269,9 @@ class ChildFreezer:
                 target.write("0")
             with open(os.path.join(path, "cgroup.procs"), "w", encoding="ascii") as target:
                 target.write(str(pid))
-            return ChildFreezer(path)
+            freezer = ChildFreezer(path)
+            freezer.start_guard()
+            return freezer
         except (OSError, StopIteration):
             if path is not None:
                 try:
@@ -1263,7 +1301,12 @@ class ChildFreezer:
         return False
 
     def close(self) -> None:
-        self.set_frozen(False)
+        try:
+            self.set_frozen(False)
+        finally:
+            if self.guard_fd >= 0:
+                os.close(self.guard_fd)
+                self.guard_fd = -1
         try:
             os.rmdir(self.path)
         except OSError:
