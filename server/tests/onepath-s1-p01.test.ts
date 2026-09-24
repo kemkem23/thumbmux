@@ -13,7 +13,8 @@
  *  A: Corrupt one row's text directly in the DB.  Reader MUST throw.
  *  B: After fixing the DB, reader MUST pass again.
  *
- * No tmux, no brain.db, no production history, no network.
+ * P01 uses no tmux; the G0 appendix uses only private /tmp tmux sockets.
+ * No brain.db, no production history, no outbound network.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
@@ -396,7 +397,8 @@ class PrivateTmuxProbe {
     writeFileSync(this.source, payload);
     if (options.preAttach) writeFileSync(this.preAttach, options.preAttach);
 
-    const lines = ['set -eu'];
+    // Preserve producer bytes across the PTY: default ONLCR rewrites LF to CRLF.
+    const lines = ['set -eu', 'stty -opost'];
     if (options.preAttach) {
       lines.push(`cat ${shQuote(this.preAttach)}`);
       lines.push(`: > ${shQuote(this.preDone)}`);
@@ -522,7 +524,7 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
         await probe.waitProducerDone();
         await probe.waitPipeEquals(fixture.bytes);
         expect(probe.pipeBytes()).toEqual(fixture.bytes);
-        expect(probe.panePipe().length).toBeGreaterThan(0);
+        expect(probe.panePipe()).toBe('1');
         corpus(fixture.name, 2);
       } finally {
         await probe.close();
@@ -537,7 +539,7 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
       await probe.waitProducerDone();
       await probe.waitPipeEquals(Buffer.alloc(0));
       expect(probe.pipeBytes()).toHaveLength(0);
-      expect(probe.panePipe().length).toBeGreaterThan(0);
+      expect(probe.panePipe()).toBe('1');
       expect(existsSync(probe.producerDone)).toBe(true);
       corpus('idle', 3);
     } finally {
@@ -586,8 +588,9 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
       await probe.start();
       const command = `tmux -S ${shQuote(probe.socket)} attach-session -t ${shQuote(`=${probe.session}`)}`;
       const attached = Bun.spawnSync(['script', '-qfec', command, '/dev/null'], {
-        env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined },
+        env: { ...process.env, TERM: 'xterm-256color', TMUX: undefined, TMUX_PANE: undefined },
       });
+      requireTmux(attached, 'private client attach/detach');
       expect(attached.exitCode).toBe(0);
       await probe.waitProducerDone();
       await probe.waitPipeEquals(payload);
@@ -609,12 +612,12 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
       await probe.start();
       await probe.waitProducerDone();
       await waitUntil('short pipe output', () => probe.pipeBytes().length === 4);
-      await waitUntil('pane_pipe EOF state', () => probe.panePipe() === '');
+      await waitUntil('pane_pipe EOF state', () => probe.panePipe() === '0');
       expect(probe.pipeBytes().toString()).toBe('ABCD');
-      expect(probe.panePipe()).toBe('');
+      expect(probe.panePipe()).toBe('0');
       expect(probe.pipeBytes()).not.toEqual(payload);
       corpus('pipe EOF', 3, 'unknown');
-      fault('pipe reader EOF', probe.panePipe() === '' && probe.pipeBytes().length !== payload.length);
+      fault('pipe reader EOF', probe.panePipe() === '0' && probe.pipeBytes().length !== payload.length);
     } finally {
       await probe.close();
     }
@@ -628,7 +631,7 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
     try {
       await probe.start();
       await Bun.sleep(50);
-      const stalled = !existsSync(probe.producerDone) && probe.panePipe().length > 0;
+      const stalled = !existsSync(probe.producerDone) && probe.panePipe() === '1';
       expect(stalled).toBe(true);
       await probe.waitProducerDone();
       await probe.waitPipeEquals(payload);
