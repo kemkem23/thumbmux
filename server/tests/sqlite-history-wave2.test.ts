@@ -281,3 +281,31 @@ test('newarch: close releases timer and handles even when final flush throws',as
   expect(()=>s.health()).toThrow('store-closed');expect(()=>disk.query('SELECT 1').get()).toThrow();
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 });
+
+
+test('newarch: faults are throttled and health recovers while newer screen revisions keep arriving',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-health-progress-')),faults:any[]=[];
+ const key={serverIdentity:'health-progress',paneId:'%1',birthGeneration:1};
+ const frame={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:1,rows:1,kind:'normal' as const,
+   cells:[[{grapheme:' ',width:1,continuation:false,fg:null,bg:null,style:0}]],cursor:null};
+ let active=false,frameUpdates=0;
+ const s=createProjectionStore({historyRoot:root,mode:'create',onFault:f=>faults.push(f),checkpoint:phase=>{
+   if(active&&phase==='after-disk-commit'){frameUpdates++;void s.replaceScreen(frame);}
+ }});
+ try {
+  await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'kept',cells:[]}});
+  for(let i=0;i<200;i++)(s as any).fault('flush-overdue','injected stalled flush');
+  expect(faults).toHaveLength(1);expect(s.health().status).toBe('degraded');
+  active=true;const until=Date.now()+1000;
+  while(s.health().status!=='healthy'&&Date.now()<until)await Bun.sleep(5);
+  expect(frameUpdates).toBeGreaterThan(0);expect(s.health().status).toBe('healthy');
+  active=false;s.flush();
+  const db=new Database(s.file,{readonly:true});
+  try {
+   expect(db.query('SELECT health FROM na_pane').get()).toEqual({health:'healthy'});
+   const issues=(db.query("SELECT count(*) AS n FROM na_issue WHERE kind='flush-overdue'").get() as any).n;
+   expect(issues).toBe(1);
+   console.log('NA_HEALTH_PROGRESS',JSON.stringify({injectedFaults:200,notifications:faults.length,issues,frameUpdates,health:s.health().status}));
+  }finally{db.close();}
+ }finally{active=false;await s.close();rmSync(root,{recursive:true,force:true});}
+});

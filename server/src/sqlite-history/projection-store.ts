@@ -73,7 +73,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,errors.length);
       errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
     }
-    Atomics.notify(signal,0);
+    Atomics.notify(signal,0);parentPort!.postMessage(batch.id);
   });
 }
 
@@ -105,7 +105,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private screenBytes=new Map<string,number>();
   private dirtyFaults=new Set<string>();
   private faultEmitted=new Map<string,number>();
-  private faults=new Map<string,{id:string;pane:string;last:number;count:number}>();
+  private faults=new Map<string,{id:string;pane:string;last:number;count:number;revision:number}>();
   private lastCommitAt:number|null=null;
   private lastFlushAgeMs=0;
   constructor(private readonly options:ProjectionOptions) {
@@ -133,7 +133,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=20)))this.flushAsync();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=5)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
@@ -184,7 +184,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.ram.db.query(`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
           ON CONFLICT(issue_id) DO UPDATE SET revision=excluded.revision,missing_count=excluded.missing_count,reason=excluded.reason`)
           .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,kind==='ingest-capacity'?count:null,now);
-        this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,count});
+        this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,count,revision:Number(p.revision)+1});
         // Updates coalesce under one issue id; account metadata once per pending episode.
         if(!this.dirtyFaults.has(tag)){this.dirtyBytes+=1024;this.dirtyFaults.add(tag);}
         this.dirtySince??=now;
@@ -306,8 +306,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
       for(const p of batch.panes) {
-        const current=this.ram.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(p.pane_key) as SqlRow;
-        if(p.health==='degraded' && current.revision===p.revision) {
+        if(p.health==='degraded' && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
           this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
           for(const [tag,f] of this.faults)if(f.pane===p.pane_key)this.faults.delete(tag);
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
@@ -333,6 +332,13 @@ export class ProjectionStore implements ProjectionWriterPort {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
       new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
     };
+    this.worker.on('message',(id:string)=>{
+      if(this.closed || !this.inFlight || this.retry?.id!==id)return;
+      try {
+        this.finishWorker();
+        if(!this.closing && (this.dirtyBytes || this.dirtySince!==null))this.flushAsync();
+      }catch(error){this.fault('flush-failed',String(error));}
+    });
     this.worker.on('error',failed);
     this.worker.on('exit',code=>{this.worker=null;if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
     this.worker.unref();
