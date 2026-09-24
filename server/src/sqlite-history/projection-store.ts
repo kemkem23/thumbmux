@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from './schema';
-import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, validateRow, type SqlRow } from './ram-store';
+import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
 import { readProjectionPage } from './projection-reader';
 import type { PaneKey, ProjectionCalibration, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -43,7 +43,7 @@ function admitPath(options: ProjectionOptions): string {
   return file;
 }
 
-type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number};
+type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
 function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void) {
   const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
@@ -63,7 +63,8 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const errors=new Uint8Array(workerData.signal,8);
   const disk=new Database(workerData.file,{strict:true});
   disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
-  parentPort!.on('message',(batch:Batch)=>{
+  parentPort!.on('message',(batch:Batch|'close')=>{
+    if(batch==='close'){disk.close();parentPort!.postMessage('closed');parentPort!.close();return;}
     try {
       const timing=commitBatch(disk,workerData.fence,batch);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
@@ -87,6 +88,10 @@ export class ProjectionStore implements ProjectionWriterPort {
   private fence=0;
   private queues=new Map<string,Job[]>();
   private queuedBytes=0;
+  // Reservations follow a pane through queue, RAM and the unacknowledged batch.
+  private pendingByPane=new Map<string,number>();
+  private dirtyByPane=new Map<string,number>();
+  private capacityLosses=new Map<string,{key:PaneKey;count:number}>();
   private dirtyBytes=0;
   private dirtySince:number|null=null;
   private pumping=false;
@@ -113,7 +118,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     options.beforeOpen?.(this.file);
     this.disk=new Database(this.file,{strict:true});
     try {
-      this.disk.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
+      this.disk.exec('PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192;');
       this.disk.transaction(()=>{
         const version=Number(Object.values(this.disk.query('PRAGMA user_version').get()!)[0]);
         if(options.mode==='create') {
@@ -148,6 +153,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const row of this.disk.query('SELECT * FROM na_pane').all() as SqlRow[]) {
         if(row.revision!==row.durable_revision) throw new Error('durable-watermark-corrupt');
         upsert(this.ram.db,'na_pane',row);
+        this.pendingByPane.set(String(row.pane_key),0);
         const id=String(row.pane_key), floor=Math.max(0,Number(row.next_line_id)-5000);
         const captures=this.disk.query(`SELECT * FROM na_capture c WHERE c.pane_key=? AND
           (EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)
@@ -178,6 +184,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         const tag=String(p.pane_key)+':'+kind, previous=this.faults.get(tag);
         const count=(previous?.count??0)+(kind==='ingest-capacity'?lostRows:0);
         if(previous && kind!=='ingest-capacity' && now-previous.last<1000)continue;
+        if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
         if(!previous || now-previous.last>=1000)emit=true;
         const id=previous?.id??randomUUID();
         this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run('degraded',p.pane_key);
@@ -197,23 +204,51 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
-  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true,liveFrame=false):Promise<ProjectionReceipt> {
+  private capacity(key:PaneKey,bytes:number):boolean {
+    const id=paneId(key);
+    if(!this.pendingByPane.has(id))this.pendingByPane.set(id,0);
+    const share=Math.floor((PENDING_MAX-64*1024)/Math.max(2,this.pendingByPane.size));
+    return (this.pendingByPane.get(id)??0)+bytes<=share
+      && this.pendingBytes()+bytes<=PENDING_MAX-64*1024;
+  }
+  private rejectCapacity(key:PaneKey,value:{sourceEpoch:number;geometryGeneration:number},isScroll:boolean):never {
+    this.stopped=true;this.degraded=true;if(isScroll)this.rejectedRows++;
+    const id=paneId(key),pending=this.capacityLosses.get(id);
+    if(pending){if(isScroll)pending.count++;}
+    else {
+      // First rejection publishes health immediately; subsequent rows only add
+      // a counter. Never copy, serialize or run SQL for each rejected row.
+      if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
+        const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
+      }
+      this.capacityLosses.set(id,{key:{...key},count:isScroll?1:0});
+      this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key,0);
+    }
+    throw new Error('ingest-capacity');
+  }
+  private drainLosses():void {
+    for(const [id,loss] of this.capacityLosses) {
+      const tag=id+':ingest-capacity';
+      if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
+      this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',loss.key,loss.count);
+      this.capacityLosses.delete(id);
+    }
+  }
+  private reserve(id:string,bytes:number,dirty=false):void {
+    this.pendingByPane.set(id,(this.pendingByPane.get(id)??0)+bytes);
+    if(dirty)this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+bytes);
+  }
+  private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true,liveFrame=false,preparedBytes?:number):Promise<ProjectionReceipt> {
     try {
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
-      const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
-      const value=(isScroll || liveFrame?frozen:(frozen as ProjectionCalibration).capture) as ScrollEvent;
+      const value=(isScroll || liveFrame?input:(input as ProjectionCalibration).capture) as ScrollEvent;
       const id=paneId(key);
-      if(!liveFrame && (this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX)) {
-        this.stopped=true;if(isScroll)this.rejectedRows++;
-        // Rejection must not advance generations ahead of already accepted jobs.
-        if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
-          const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
-        }
-        this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',key,isScroll?1:0);
-        throw new Error('ingest-capacity');
-      }
-      this.queuedBytes+=bytes;
+      if(!this.capacity(key,512))this.rejectCapacity(key,value,isScroll);
+      const bytes=preparedBytes??Buffer.byteLength(JSON.stringify(input))+512;
+      if(!this.capacity(key,bytes) || this.ram.bytes()+bytes>CACHE_MAX)this.rejectCapacity(key,value,isScroll);
+      const frozen=preparedBytes===undefined?structuredClone(input):input;
+      this.reserve(id,bytes);this.queuedBytes+=bytes;
       const result=new Promise<ProjectionReceipt>((resolve,reject)=>{
         const q=this.queues.get(id)??[];q.push({liveFrame,sourceEpoch:value.sourceEpoch,geometryGeneration:value.geometryGeneration,bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
       });
@@ -229,7 +264,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     // Admission is only a reservation. Check the fence before applying the
     // queued batch; commitBatch independently checks again inside the disk TX.
     try {this.owner();}catch(error) {
-      for(const q of this.queues.values())for(const job of q)job.reject(error);
+      for(const [id,q] of this.queues)for(const job of q){this.reserve(id,-job.bytes);job.reject(error);}
       this.queues.clear();this.queuedBytes=0;this.pumping=false;return;
     }
     let processed=0;const started=performance.now();
@@ -244,8 +279,9 @@ export class ProjectionStore implements ProjectionWriterPort {
           if(!job.liveFrame && this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
           return receipt;
         })();
+        this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+job.bytes);
         this.dirtyBytes+=job.bytes;this.dirtySince??=job.at;job.resolve(receipt);
-      }catch(error){job.reject(error);}
+      }catch(error){this.reserve(id,-job.bytes);job.reject(error);}
       processed++;
     }
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
@@ -255,11 +291,17 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       // Freeze the physical cells once, in the same lossless representation held
       // by RAM/disk. Queues retain strings, not hundreds of cloned cell objects.
-      const text=event.physicalRow.text,cells=event.physicalRow.cells;
+      if(this.closed)throw new Error('store-closed');
+      if(this.closing)throw new Error('store-closing');
+      if(!this.capacity(event.paneKey,512))this.rejectCapacity(event.paneKey,event,true);
+      const text=event.physicalRow.text;
+      if(!this.capacity(event.paneKey,text.length+512))this.rejectCapacity(event.paneKey,event,true);
+      const cells=event.physicalRow.cells;
       validateRow({text,cells});
       const frozen={paneKey:{...event.paneKey},sourceEpoch:event.sourceEpoch,geometryGeneration:event.geometryGeneration,
         receiveSeq:event.receiveSeq,softWrap:event.softWrap,physicalRow:{text,cells:[]},encodedCells:encodeCells(cells)};
-      return this.enqueue(frozen.paneKey,frozen,e=>this.ram.append(e,e.encodedCells));
+      const bytes=Buffer.byteLength(text)+Buffer.byteLength(frozen.encodedCells)+Buffer.byteLength(paneId(frozen.paneKey))+512;
+      return this.enqueue(frozen.paneKey,frozen,e=>this.ram.append(e,e.encodedCells),true,false,bytes);
     }catch(error){return Promise.reject(error);}
   }
   replaceScreen(frame:ProjectionFrame):Promise<ProjectionReceipt> {
@@ -271,11 +313,15 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(queued?.some(job=>job.liveFrame || job.sourceEpoch!==frame.sourceEpoch || job.geometryGeneration!==frame.geometryGeneration)) {
         return this.enqueue(frame.paneKey,frame,f=>{this.ram.screen(f);return this.ram.bump(f.paneKey);},false,true);
       }
-      const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame);return this.ram.bump(frame.paneKey);})();
-      const id=paneId(frame.paneKey)+':'+frame.kind;
-      const encoded=this.ram.db.query('SELECT cells_json FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(frame.paneKey),frame.kind) as SqlRow;
-      const bytes=Buffer.byteLength(String(encoded.cells_json))+512;
-      this.dirtyBytes+=bytes-(this.screenBytes.get(id)??0);this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
+      const pane=paneId(frame.paneKey),id=pane+':'+frame.kind;
+      const previous=this.screenBytes.get(id)??0;
+      if(!this.capacity(frame.paneKey,512-previous))this.rejectCapacity(frame.paneKey,frame,false);
+      validateFrame(frame);
+      const encoded=encodeFrameCells(frame.cells);
+      const bytes=Buffer.byteLength(encoded)+Buffer.byteLength(pane)+512,delta=bytes-previous;
+      if(!this.capacity(frame.paneKey,delta) || this.ram.bytes()+Math.max(0,delta)>CACHE_MAX)this.rejectCapacity(frame.paneKey,frame,false);
+      const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame,null,null,[],encoded);return this.ram.bump(frame.paneKey);})();
+      this.reserve(pane,delta,true);this.dirtyBytes+=delta;this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
       return Promise.resolve(receipt);
     }catch(error){return Promise.reject(error);}
   }
@@ -288,6 +334,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
   private snapshot():Batch|null {
     if(this.retry)return this.retry;
+    this.drainLosses();
     if(!this.dirtyBytes && this.dirtySince===null)return null;
     const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
     const tables=new Map<string,SqlRow[]>();
@@ -297,8 +344,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       tables.set(table,rows);
     }
     const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
-    this.retry={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince??Date.now()};
-    this.dirtyBytes=0;this.dirtySince=null;this.screenBytes.clear();this.dirtyFaults.clear();
+    this.retry={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince??Date.now(),byPane:this.dirtyByPane};
+    this.dirtyBytes=0;this.dirtyByPane=new Map();this.dirtySince=null;this.screenBytes.clear();this.dirtyFaults.clear();
     return this.retry;
   }
   private acknowledge():void {
@@ -310,13 +357,15 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.ram.evict(batch.panes);
     })();
     this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
+    for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
     this.retry=null;
+    this.drainLosses();
     if(this.pendingBytes()<PENDING_MAX/2) {
       this.stopped=false;
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
       for(const p of batch.panes) {
-        if(p.health==='degraded' && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
+        if(p.health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
           this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
           for(const [tag,f] of this.faults)if(f.pane===p.pane_key)this.faults.delete(tag);
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
@@ -390,8 +439,16 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.flush();
     } finally {
       this.closed=true;
-      if(this.worker)await this.worker.terminate();
-      this.ram.db.close();this.disk.close();
+      try {
+        const worker=this.worker;
+        if(worker)await new Promise<void>((resolve,reject)=>{
+          const timer=setTimeout(()=>reject(new Error('disk-worker-close-timeout')),5000);
+          worker.once('error',error=>{clearTimeout(timer);reject(error);});
+          worker.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(new Error(`disk-worker-close:${code}`));});
+          // DB.close() runs in its owning thread before the worker exits.
+          worker.postMessage('close');
+        });
+      } finally {this.ram.db.close();this.disk.close();}
     }
   }
 }

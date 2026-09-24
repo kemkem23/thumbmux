@@ -29,7 +29,7 @@ type CellRun=[string,number,boolean,string|number|null,string|number|null,number
 function cellRuns(cells:PhysicalRow['cells']):CellRun[] {
   const runs:CellRun[]=[];
   for(const c of cells) {
-    const last=runs.at(-1);
+    const last=runs[runs.length-1];
     if(last && last[0]===c.grapheme && last[1]===c.width && last[2]===c.continuation
       && last[3]===c.fg && last[4]===c.bg && last[5]===c.style)last[6]++;
     else runs.push([c.grapheme,c.width,c.continuation,c.fg,c.bg,c.style,1]);
@@ -119,11 +119,11 @@ export class ProjectionRam {
     return this.pane(key);
   }
   bump(key: PaneKey): ProjectionReceipt {
-    const p=this.pane(key); integer(Number(p.revision)+1);
-    this.db.query('UPDATE na_pane SET revision=revision+1 WHERE pane_key=?').run(paneId(key));
-    const {revision,durableRevision,nextLineId}=this.token(key);
-    return {revision,durableRevision,nextLineId};
+    const row=this.db.query('UPDATE na_pane SET revision=revision+1 WHERE pane_key=? AND revision<9007199254740991 RETURNING revision,durable_revision,next_line_id').get(paneId(key)) as SqlRow|null;
+    if(!row)throw new Error('unknown-pane-or-revision-overflow');
+    return {revision:Number(row.revision),durableRevision:Number(row.durable_revision),nextLineId:Number(row.next_line_id)};
   }
+
   append(event: ScrollEvent, preparedCells?:string): ProjectionReceipt {
     validateRow(event.physicalRow); integer(event.receiveSeq);
     if (typeof event.softWrap !== 'boolean') throw new Error('invalid-soft-wrap');
@@ -138,11 +138,11 @@ export class ProjectionRam {
       .run(Number(p.revision)+1,id,Number(p.next_line_id)-4500);
     return this.bump(event.paneKey);
   }
-  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = []): void {
-    validateFrame(frame);
+  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string): void {
+    if(preparedCells===undefined)validateFrame(frame);
     const p=this.ensure(frame.paneKey,frame.sourceEpoch,frame.geometryGeneration), id=paneId(frame.paneKey);
     this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json')
-      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
+      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
   calibrate(change: ProjectionCalibration): ProjectionReceipt {

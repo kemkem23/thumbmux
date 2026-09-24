@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, ids, observation, evidence } from './sqlite-history/helpers';
 import { OptInHistoryBridge, legacyProjectionDigest } from '../src/sqlite-history/bridge';
@@ -310,3 +310,126 @@ test('newarch: faults are throttled and health recovers while newer screen revis
   }finally{db.close();}
  }finally{active=false;await s.close();rmSync(root,{recursive:true,force:true});}
 });
+
+
+test('newarch FIX2: one pane at 10x cannot consume twenty other admission shares',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-fair-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'}),internal=s as any;
+ const keys=Array.from({length:21},(_,i)=>({serverIdentity:'fair',paneId:`%${i}`,birthGeneration:1}));
+ const event=(i:number,n:number,text='x'.repeat(4096))=>({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text,cells:[]}});
+ try {
+  await Promise.all(keys.map((_,i)=>s.appendScroll(event(i,0,'init'))));s.flush();
+  let hotRefused=0,normalRefused=0,maxPending=0,faultCalls=0,poisonReads=0;
+  const fault=internal.fault.bind(s);internal.fault=(...args:any[])=>{faultCalls++;return fault(...args);};
+  const jobs:Promise<unknown>[]=[];
+  // A blocked producer turn: ten hot rows before every row on each normal pane.
+  for(let n=1;n<=100;n++) {
+   for(let j=0;j<10;j++)jobs.push(s.appendScroll(event(0,n*10+j)).catch(()=>{hotRefused++;}));
+   for(let i=1;i<21;i++)jobs.push(s.appendScroll(event(i,n)).catch(()=>{normalRefused++;}));
+   maxPending=Math.max(maxPending,internal.pendingBytes());
+  }
+  const before=faultCalls;
+  for(let n=0;n<2000;n++) {
+   const rejected=event(0,2000+n,'x'.repeat(1024*1024));
+   Object.defineProperty(rejected.physicalRow,'cells',{get(){poisonReads++;throw Error('copied-rejected-cells');}});
+   jobs.push(s.appendScroll(rejected).then(()=>{throw Error('oversize-admitted');},error=>{
+    expect(String(error)).toContain('ingest-capacity');hotRefused++;
+   }));
+  }
+  expect(faultCalls-before).toBe(0);expect(poisonReads).toBe(0);
+  await Promise.all(jobs);s.flush();
+  const disk=new Database(s.file,{readonly:true});
+  try {
+   expect(disk.query("SELECT sum(missing_count) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:hotRefused});
+   for(let i=1;i<21;i++)expect(s.token(keys[i]).nextLineId).toBe(101);
+  }finally{disk.close();}
+  expect(normalRefused).toBe(0);expect(hotRefused).toBeGreaterThan(0);
+  expect(maxPending).toBeLessThanOrEqual(16*1024*1024);expect(s.health().pendingBytes).toBe(0);
+  console.log('NA_FIX2_FAIR',JSON.stringify({normalRefused,hotRefused,maxPending,poisonReads,faultCalls}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery share the hard cap',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-all-inputs-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'}),internal=s as any;
+ const key={serverIdentity:'all-inputs',paneId:'%1',birthGeneration:1};
+ const cell={grapheme:'x',width:1 as const,continuation:false,fg:null,bg:null,style:0};
+ const frame={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:1,rows:1,kind:'normal' as const,cells:[[cell]],cursor:null};
+ try {
+  await s.replaceScreen(frame);
+  const first=s.health().pendingBytes;
+  await s.replaceScreen(frame);expect(s.health().pendingBytes).toBe(first);
+  s.flush();expect(s.health().pendingBytes).toBe(0);
+  const before=s.token(key).revision;
+  await expect(s.replaceScreen({...frame,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]})).rejects.toThrow('ingest-capacity');
+  expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('x');
+  expect(s.token(key).revision).toBeGreaterThan(before); // explicit fault, not the rejected screen
+  s.flush();
+  // Queue a generation transition behind an accepted scroll, then an oversized frame.
+  const row=s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:2,softWrap:false,physicalRow:{text:'kept',cells:[]}});
+  const transition=s.replaceScreen({...frame,sourceEpoch:2});
+  const oversized=s.replaceScreen({...frame,sourceEpoch:2,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]});
+  await expect(oversized).rejects.toThrow('ingest-capacity');await Promise.all([row,transition]);
+  let maxPending=s.health().pendingBytes;
+  // Fault kinds deliberately differ, so throttling cannot hide budget growth.
+  const originalError=console.error;console.error=()=>{};
+  try {for(let i=0;i<17000;i++) {
+   internal.fault(`fixture-${i}`,'metadata cap',key);
+   maxPending=Math.max(maxPending,internal.pendingBytes());
+  }}finally{console.error=originalError;}
+  expect(maxPending).toBeLessThanOrEqual(16*1024*1024);
+  s.flush();expect(s.health().pendingBytes).toBe(0);
+  console.log('NA_FIX2_ALL_INPUTS',JSON.stringify({maxPending,cap:16*1024*1024,firstScreenBytes:first}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('newarch FIX2: close leaves no fixture fds and immediate reopen never needs a retry',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-close-fds-'));
+ const key={serverIdentity:'close-fds',paneId:'%1',birthGeneration:1};
+ let maxAfterClose=0;
+ try {
+  for(let round=0;round<30;round++) {
+   const s=createProjectionStore({historyRoot:root,mode:round===0?'create':'recover'});
+   try {
+    for(let n=0;n<2000;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:round*2000+n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+   }finally{await s.close();}
+   const fds=readdirSync('/proc/self/fd').filter(fd=>{try{return readlinkSync('/proc/self/fd/'+fd).startsWith(root+'/');}catch{return false;}});
+   maxAfterClose=Math.max(maxAfterClose,fds.length);expect(fds).toHaveLength(0);
+  }
+  console.log('NA_FIX2_CLOSE',JSON.stringify({rounds:30,rowsPerRound:2000,maxAfterClose}));
+ }finally{rmSync(root,{recursive:true,force:true});}
+},60000);
+
+test('newarch FIX2: open loop hot pane 1000 per second plus twenty panes at 100',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-hot-loop-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'});
+ const keys=Array.from({length:21},(_,i)=>({serverIdentity:'hot-loop',paneId:`%${i}`,birthGeneration:1}));
+ const produced=keys.map(()=>0),refused=keys.map(()=>0),accepted=keys.map(()=>0),jobs=new Set<Promise<unknown>>();
+ let maxPending=0;
+ try {
+  const start=performance.now();
+  const feed=(elapsed:number)=>{
+   for(let i=0;i<21;i++) {
+    const due=Math.floor(elapsed*(i===0?1000:100)/1000);
+    while(produced[i]<due) {
+     const seq=produced[i]++,text=`${i}:${seq}`.padEnd(80,' ');
+     const job=s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:seq,softWrap:false,
+      physicalRow:{text,cells:[...text].map(grapheme=>({grapheme,width:1 as const,continuation:false,fg:null,bg:null,style:0}))}})
+      .then(()=>{accepted[i]++;},()=>{refused[i]++;});
+     jobs.add(job);void job.then(()=>jobs.delete(job));
+    }
+   }
+  };
+  while(performance.now()-start<10000){feed(performance.now()-start);maxPending=Math.max(maxPending,s.health().pendingBytes);await Bun.sleep(2);}
+  feed(10000);await Promise.all(jobs);s.flush();
+  let wrong=0,missing=0;
+  for(let i=1;i<21;i++) {
+   const token=s.token(keys[i]);const page=s.readPage(token,null,2000);
+   missing+=Math.max(0,1000-page.lines.length);
+   wrong+=page.lines.filter((line,n)=>line.text!==`${i}:${n}`.padEnd(80,' ')).length;
+  }
+  const normalRefused=refused.slice(1).reduce((a,b)=>a+b,0);
+  console.log('NA_FIX2_HOT_LOOP',JSON.stringify({durationMs:10000,hotRate:1000,normalRate:100,normalPanes:20,normalRefused,hotRefused:refused[0],accepted,maxPending,wrong,missing}));
+  expect(normalRefused).toBe(0);expect(wrong+missing).toBe(0);expect(maxPending).toBeLessThanOrEqual(16*1024*1024);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
