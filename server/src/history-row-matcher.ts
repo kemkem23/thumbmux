@@ -42,7 +42,7 @@ export function equalHistoryRows(a: CapturedRow, b: CapturedRow): boolean {
   }
   return true;
 }
-function internRows(rows: readonly CapturedRow[][]): number[][] {
+function internRows(rows: readonly (readonly CapturedRow[])[]): number[][] {
   const buckets = new Map<string, Array<{ row: CapturedRow; id: number }>>();
   let id = 0;
   return rows.map(part => part.map(row => {
@@ -94,7 +94,7 @@ export function matchHistoryRows(
   const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
   if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
-  const [a, b] = internRows([recent as CapturedRow[], captured as CapturedRow[]]) as [number[], number[]];
+  const [a, b] = internRows([recent, captured]) as [number[], number[]];
   if (a.length < 3 || b.length < 3) return empty('no-anchor');
   const reversed = a.slice().reverse();
   const z = zValues([...reversed, null, ...b.slice().reverse()]);
@@ -145,12 +145,15 @@ export function matchHistoryRows(
  * successful transactions. Receipts certify observed content, not hidden IDs. */
 export class IncrementalHistoryMatcher {
   private checked = new Map<number, CapturedRow>();
+  private generation = '';
   reset(): void { this.checked.clear(); }
   match(recent: readonly HistoryRow[], captured: readonly CapturedRow[], scope: Parameters<typeof matchHistoryRows>[2]): RowMatch {
+    const generation = `${scope.sourceEpoch}/${scope.geometryGeneration}`;
+    if (this.generation !== generation) { this.reset(); this.generation = generation; }
     if (scope.completeRetainedTail) return matchHistoryRows(recent, captured, scope);
     const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
     if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
-    const [a, b] = internRows([recent as CapturedRow[], captured as CapturedRow[]]) as [number[], number[]];
+    const [a, b] = internRows([recent, captured]) as [number[], number[]];
     const at = triples(a), bt = triples(b);
     const anchors: Array<[number, number]> = [];
     for (const [key, positions] of at) {

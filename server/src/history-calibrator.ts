@@ -140,7 +140,7 @@ export class HistoryCalibrator {
         && capture.frame.cells.length === meta.rows && capture.frame.cells.every(row => row.length === meta.cols)
         && startedGeneration === this.eventGeneration;
       if (!stable) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
-      const match = this.matcher.match(read.recentHistory, capture.history, {
+      const match: RowMatch = !historyDue || meta.kind !== 'normal' ? { checks: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(read.recentHistory, capture.history, {
         sourceEpoch: read.sourceEpoch, geometryGeneration: read.geometryGeneration,
         completeRetainedTail: historyDue && capture.completeRetainedTail && meta.kind === 'normal',
       });
