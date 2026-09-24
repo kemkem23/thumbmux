@@ -309,7 +309,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
       let batch:Batch|null;
       while((batch=this.snapshot())) {
-        commitBatch(this.disk,this.fence,batch,()=>this.options.checkpoint?.('before-disk-commit',batch.id));
+        const current=batch;
+        commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id));
         this.acknowledge();
       }
     }catch(error){this.fault('flush-failed',String(error));throw error;}
