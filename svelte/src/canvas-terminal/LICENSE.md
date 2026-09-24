@@ -4,7 +4,7 @@ ASCII: Hershey Roman Simplex, public-domain centerline data distributed in James
 Source: https://github.com/bjnortier/hershey/blob/6118f267f7758025bb81f8d711ca2d27d8bdf00b/font/jhf/rowmans.jhf
 SHA-256 of upstream JHF: `8718fb129c0f6bce89c84fe41bc467e39534d215a6f7c3220cc5789a8a7d8618`.
 Converted to normalized polylines (not NTIS format). No library code copied.
-Upstream intentionally shares I/l; its ASCII caret is the historical arrow substitution.
+Upstream intentionally shares I/l; for ASCII caret we keep the roof stroke of upstream glyph 2262 and omit its historical arrow stem.
 Box drawing: original geometric paths derived from Unicode character names, CC0-1.0.
 Thai and CJK have no centerline data and remain outline fallback.
 

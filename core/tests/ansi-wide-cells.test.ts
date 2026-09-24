@@ -246,6 +246,14 @@ describe('Canvas FIX1 regressions', () => {
     expect(corner.strokes.flat()).toContainEqual([1, .5]);
     expect(corner.strokes.flat()).toContainEqual([.5, 1]);
     expect(singleLineGlyph('┄')!.strokes).toHaveLength(3);
+    expect(singleLineGlyph('^')!.strokes).toHaveLength(1);
+    // Mixed single/double corner reaches BOTH rails, not a disconnected stub.
+    expect(singleLineGlyph('╒')!.strokes).toContainEqual([[.5, 1], [.5, .4]]);
+    for (const [char, edges] of [['┌', 'ES'], ['┐', 'WS'], ['└', 'EN'], ['┘', 'WN'], ['├', 'ENS'], ['┤', 'WNS'], ['┬', 'EWS'], ['┴', 'EWN']] as const) {
+      const points = singleLineGlyph(char)!.strokes.flat();
+      const actual = [points.some(([x]) => x === 1) ? 'E' : '', points.some(([x]) => x === 0) ? 'W' : '', points.some(([, y]) => y === 0) ? 'N' : '', points.some(([, y]) => y === 1) ? 'S' : ''].join('');
+      expect(actual).toBe(edges);
+    }
     expect(singleLineGlyph('━')!.weights!.every(w => w === 2)).toBe(true);
     expect(new Set(['A', '0', '!'].map(c => glyphShapeKey(singleLineGlyph(c)!))).size).toBe(3);
     expect(singleLineGlyph('Aิ')).toBeNull();
