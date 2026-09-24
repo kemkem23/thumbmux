@@ -256,11 +256,12 @@ test('newarch: scroll pressure recovers, live screen survives, exact loss issue 
  const event=(text:string,receiveSeq:number)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq,softWrap:false,physicalRow:{text,cells:[]}});
  try {
   // Queue pressure is deterministic; no producer waits for a prior receipt.
-  const outcomes=await Promise.all(Array.from({length:20},(_,i)=>s.appendScroll(event('x'.repeat(1024*1024),i)).then(()=>true,()=>false)));
+  const queued=Array.from({length:20},(_,i)=>s.appendScroll(event('x'.repeat(1024*1024),i)).then(()=>true,()=>false));
+  expect((s as any).ram.pane(key).health).toBe('degraded');
+  const outcomes=await Promise.all(queued);
   const refused=outcomes.filter(v=>!v).length;expect(refused).toBeGreaterThan(0);expect(s.health().rejectedRows).toBe(refused);
   await s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:20,cols:1,rows:1,kind:'normal',cells:[[{grapheme:'Z',width:1,continuation:false,fg:null,bg:null,style:0}]],cursor:null});
   expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('Z');
-  expect((s as any).ram.pane(key).health).toBe('degraded');
   s.flush();await s.appendScroll(event('recovered',21));s.flush();expect(s.health().status).toBe('healthy');
   const disk=new Database(s.file,{readonly:true});
   try {
