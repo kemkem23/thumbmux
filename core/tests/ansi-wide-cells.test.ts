@@ -8,6 +8,11 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createSgrState, lineToHtml, type AnsiPalette } from "../src/ansi-html";
+import {
+  createCanvasModelRows,
+  lineToCanvasCells,
+  selectedModelText,
+} from "../../svelte/src/canvas-terminal/model";
 
 const pal: AnsiPalette = {
   base: [
@@ -142,5 +147,23 @@ describe("dual-width cell spans (mtv-w2)", () => {
     const line = "│ 漢字 pad │";
     const html = lineToHtml(line, createSgrState(), pal);
     expect(html).toBe(`│ ${w2("漢")}${w2("字")} pad │`);
+  });
+});
+
+describe("Canvas terminal canonical cell model", () => {
+  test("attaches every zero-width Thai mark to its base cell", () => {
+    const cells = lineToCanvasCells("กิ กุ กี้ กุ้ กุ์ กิ้ น้ำ");
+    const bases = cells.filter((cell) => !cell.continuation);
+    expect(bases.map((cell) => cell.text).join("")).toBe("กิ กุ กี้ กุ้ กุ์ กิ้ น้ำ");
+    expect(bases.some((cell) => cell.text.includes("ิ"))).toBe(true);
+  });
+
+  test("copy is model-backed and never emits a wide continuation blank", () => {
+    const rows = createCanvasModelRows(["A漢B", "กิX"]);
+    expect(rows[0]!.cells.some((cell) => cell.continuation)).toBe(true);
+    expect(selectedModelText(rows, {
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 3 },
+    })).toBe("A漢B\nกิX");
   });
 });

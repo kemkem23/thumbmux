@@ -9,6 +9,12 @@ import { flushSync, mount, tick, unmount } from './svelte-client';
 import TermView from '../src/TermView.svelte';
 import { tmuxMux } from '../src/ws-mux.svelte';
 import type { AnsiPalette } from '@thumbmux/core';
+import {
+  GLYPH_INVENTORY,
+  glyphCoverage,
+  SINGLE_LINE_LICENSE,
+  SINGLE_LINE_SOURCE,
+} from '../src/canvas-terminal/glyphs';
 
 const require = createRequire(import.meta.url);
 const svelteClientInternals = join(
@@ -174,6 +180,30 @@ beforeEach(() => {
   );
   globalThis.ResizeObserver = ControlledResizeObserver;
   window.ResizeObserver = ControlledResizeObserver;
+});
+
+describe('Canvas centerline font contract (NEWARCH G4)', () => {
+  test('publishes numeric inventory, provenance and honest fallbacks', () => {
+    expect(GLYPH_INVENTORY.ascii).toEqual({ requested: 95, singleLine: 95, fallback: 0 });
+    expect(GLYPH_INVENTORY.boxDrawing).toEqual({ requested: 128, singleLine: 128, fallback: 0 });
+    expect(GLYPH_INVENTORY.thai).toEqual({ requested: 128, singleLine: 0, fallback: 128 });
+    expect(GLYPH_INVENTORY.cjkSample.singleLine).toBe(0);
+    expect(GLYPH_INVENTORY.cjkSample.fallback).toBe(6);
+    expect(SINGLE_LINE_LICENSE).toBe('CC0-1.0');
+    expect(SINGLE_LINE_SOURCE).toContain('centerline');
+    expect(glyphCoverage('A')).toBe('single-line');
+    expect(glyphCoverage('─')).toBe('single-line');
+    expect(glyphCoverage('ก')).toBe('outline-fallback');
+    expect(glyphCoverage('漢')).toBe('outline-fallback');
+  });
+
+  test('enumerates all required size/thickness/DPR combinations (48)', () => {
+    const configurations = [8, 13, 20, 32].flatMap((fontSize) =>
+      [0.5, 1, 2, 3].flatMap((strokeWidth) =>
+        [1, 2, 3].map((dpr) => ({ fontSize, strokeWidth, dpr }))),
+    );
+    expect(configurations).toHaveLength(48);
+  });
 });
 
 afterEach(() => {

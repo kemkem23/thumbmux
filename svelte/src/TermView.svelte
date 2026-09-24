@@ -21,6 +21,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import { tmuxMux } from './ws-mux.svelte';
   import TermSearch from './TermSearch.svelte';
+  import CanvasTerminal from './canvas-terminal/CanvasTerminal.svelte';
   import {
     contentLinesChangeSource, createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
     updatePendingContentCursor,
@@ -150,6 +151,10 @@
     session,
     palette,
     fontPx = 13,
+    renderer = 'dom',
+    canvasFontFamily = 'var(--font-mono, ui-monospace, monospace)',
+    canvasVectorFont = false,
+    canvasStrokeWidth = 1,
     minCols = 20,
     minRows = 15,
     maxRows = 60,
@@ -192,6 +197,11 @@
     session: string;
     palette: AnsiPalette;
     fontPx?: number;
+    /** Opt-in preview. DOM remains the default until the full parity gate passes. */
+    renderer?: 'dom' | 'canvas';
+    canvasFontFamily?: string;
+    canvasVectorFont?: boolean;
+    canvasStrokeWidth?: number;
     minCols?: number;
     minRows?: number;
     maxRows?: number;
@@ -6965,6 +6975,26 @@
     connectedGeometryPushed = true;
     scheduleDeferredFrame(() => pushGeometry({ force: true }));
   });
+
+  /** Canvas consumes the same virtual projection and line ids as the DOM
+   * renderer. It owns no history store, so switching engines cannot fork the
+   * canonical bytes or the scroll window. */
+  function canvasWindowLines(): string[] {
+    const output: string[] = [];
+    for (let visualRow = winStart; visualRow < winEnd; visualRow += 1) {
+      output.push(projectionRowAt(visualRow)?.line ?? '');
+    }
+    return output;
+  }
+
+  function canvasWindowLinks(): (LineLinkRange[] | undefined)[] {
+    const output: (LineLinkRange[] | undefined)[] = [];
+    for (let visualRow = winStart; visualRow < winEnd; visualRow += 1) {
+      const rawLine = projectionRowAt(visualRow)?.rawRange.startLine;
+      output.push(rawLine === undefined ? undefined : linksByLine[rawLine]);
+    }
+    return output;
+  }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -7057,6 +7087,21 @@
     </div>
   {/if}
   <div bind:this={layerEl} class="mtv-layer">
+    {#if renderer === 'canvas'}
+      <CanvasTerminal
+        lines={canvasWindowLines()}
+        linksByRow={canvasWindowLinks()}
+        firstLineId={archiveOffset + winStart}
+        cols={Math.max(1, lastPushedCols)}
+        cellWidth={charW}
+        lineHeight={lineH}
+        fontSize={fontPx}
+        fontFamily={canvasFontFamily}
+        vectorFont={canvasVectorFont}
+        strokeWidth={canvasStrokeWidth}
+        {palette}
+      />
+    {:else}
     {#key renderEpoch}
       {#each { length: winEnd - winStart } as _, i (visualRowKey(winStart + i))}
         {@const visualRow = winStart + i}
@@ -7160,6 +7205,7 @@
       {/if}
     {/if}
     {/key}
+    {/if}
   </div>
   {#if !connected}
     <div class="mtv-wait" lang="th">กำลังเชื่อมต่อ…</div>
