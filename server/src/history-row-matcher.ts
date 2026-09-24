@@ -43,12 +43,16 @@ export function equalHistoryRows(a: CapturedRow, b: CapturedRow): boolean {
   return true;
 }
 function internRows(rows: readonly (readonly CapturedRow[])[]): number[][] {
-  const buckets = new Map<string, Array<{ row: CapturedRow; id: number }>>();
+  const buckets = new Map<number, Array<{ row: CapturedRow; id: number }>>();
   let id = 0;
   return rows.map(part => part.map(row => {
     // Sample glyphs to keep keys small. A bucket collision is resolved exactly.
-    let key = `${row.softWrap}/${row.cells.length}/`;
-    for (let x = 0; x < Math.min(16, row.cells.length); x++) key += row.cells[x]!.grapheme + '\0';
+    let key = row.cells.length ^ (row.softWrap ? 0x40000000 : 0);
+    for (let x = 0; x < Math.min(16, row.cells.length); x++) {
+      const glyph = row.cells[x]!.grapheme;
+      for (let c = 0; c < glyph.length; c++) key = Math.imul(key ^ glyph.charCodeAt(c), 16777619);
+      key = Math.imul(key ^ 0xff, 16777619);
+    }
     const bucket = buckets.get(key);
     const found = bucket?.find(entry => equalHistoryRows(entry.row, row));
     if (found) return found.id;

@@ -128,7 +128,7 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
     expect(r.status).toBe(0); return r.stdout;
   };
   try {
-    const cases = ['ไทย น้ำ ที่', '\x1b]8;;https://example.test\x1b\\LINK\x1b]8;;\x1b\\', '\x1b[4:3mCURL', '\x1b[58;2;1;2;3m\x1b[4mUNDER', '\x1b[53mOVER', '👩‍💻🇹🇭👍🏽❤️'];
+    const cases = ['ไทย น้ำ ที่', '\x1b]8;;https://example.test\x1b\\LINK\x1b]8;;\x1b\\', '\x1b[4:3mCURL', '\x1b[58;2;1;2;3m\x1b[4mUNDER', '\x1b[53mOVER', '👩‍💻x', '🇹🇭x', '👍🏽x', '❤️x', '👩‍💻🇹🇭👍🏽❤️'];
     for (let i = 0; i < cases.length; i++) {
       const path = join(root, `text-${i}`); writeFileSync(path, cases[i]!);
       const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; sleep 5`).trim();
@@ -137,6 +137,7 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
       const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
       const row = decodeTmuxCaptureRows(raw, 80)[0]!;
       let end = row.length; while (end > 0 && row[end - 1]!.grapheme === ' ') end--;
+      console.log('NEWARCH_FIX1_WIDTH', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, end }));
       expect(end).toBe(cursor);
       if (i === 0) { expect(cursor).toBe(8); expect(row.slice(0, end).map(c => c.grapheme).join('')).toBe(cases[i]!); }
       console.log('NEWARCH_FIX1_DECODER', JSON.stringify({ case: i, cursor, decodedWidth: end, raw: raw.split('\n')[0] }));

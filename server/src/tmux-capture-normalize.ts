@@ -117,9 +117,9 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
     // tmux uses colon subparameters for underline variants and overline.
     // These decorations are outside this projection; consume them without
     // mistaking their parameters for bold, blink, or foreground colours.
-    body = body.replace(/\b(4|5):[0-9]+/g, (_, kind) => kind === '4' ? '4' : '53')
-      .replace(/(38|48|58):2::?(\d+):(\d+):(\d+)/g, '$1;2;$2;$3;$4')
-      .replace(/(38|48|58):5:(\d+)/g, '$1;5;$2');
+    body = body.replace(/(38|48|58):2::?(\d+):(\d+):(\d+)/g, '$1;2;$2;$3;$4')
+      .replace(/(38|48|58):5:(\d+)/g, '$1;5;$2')
+      .replace(/\b(4|5):[0-9]+/g, (_, kind) => kind === '4' ? '4' : '53');
     if (!/^[0-9;]*$/.test(body)) throw new Error('unsupported capture SGR');
     const codes = body === '' ? [0] : body.split(';').map(x => x === '' ? 0 : Number(x));
     for (let i = 0; i < codes.length; i++) {
