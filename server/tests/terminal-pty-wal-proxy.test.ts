@@ -54,7 +54,11 @@ async function eventually(check: () => boolean, label: string, timeoutMs = 10_00
     }
     await Bun.sleep(25);
   }
-  throw new Error(`timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}`);
+  const diagnostics = roots.flatMap(root => {
+    const path = join(root, "lane", "pty-proxy-diagnostics.log");
+    return existsSync(path) ? [readFileSync(path, "utf8")] : [];
+  }).join("\n");
+  throw new Error(`timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}\n${diagnostics}`);
 }
 
 function tmux(socket: string, ...args: string[]): ReturnType<typeof spawnSync> {
