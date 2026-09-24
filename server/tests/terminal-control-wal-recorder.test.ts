@@ -1037,3 +1037,52 @@ test('FIX1 hung capture has a deadline and heartbeat can alert after recovery', 
   now = 6000; watchdog.tick();
   expect(faults).toEqual(['heartbeat-timeout', 'heartbeat-timeout']);
 });
+
+test('FIX1 reviewer 16000 repair-distance cases never worsen history', () => {
+// Does applying the matcher's repairs ever move the recorded window FURTHER from
+// the truth? Metric: edit distance (insert/delete/substitute) between the DB
+// window content and the true content of the same line range, before vs after
+// repairs. Parser faults: dropped rows, duplicated rows, phantom rows, colour drift.
+const key = (t: string, fg: string) => `${t}|${fg}`;
+const row = (t: string, fg = 'default'): CapturedRow => ({ softWrap: false, cells: Array.from(t.padEnd(5), g => ({ grapheme: g, width: 1 as const, continuation: false, fg, bg: 'default', style: 0 })) });
+const scope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function ed(a: string[], b: string[]) { const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]); for (let j = 1; j <= b.length; j++) d[0]![j] = j; for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i]![j] = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length]![b.length]!; }
+let seed = 4242; const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+const out: Record<string, any> = {}; let example: any;
+for (const vocab of [0, 3, 8, 50]) {
+  const t = { cases: 0, matched: 0, repairs: 0, better: 0, same: 0, worse: 0, worseBy: 0 };
+  for (let k = 0; k < 4000; k++) {
+    const R = 80 + Math.floor(rnd() * 80), W = 20 + Math.floor(rnd() * 50);
+    const truth = Array.from({ length: R }, (_, i) => vocab ? String.fromCharCode(97 + Math.floor(rnd() * vocab)) : `r${i}`);
+    const p: { t: string; fg: string }[] = [];
+    for (let i = R - W; i < R; i++) { const r = rnd(); if (r < 0.03) continue; if (r < 0.06) { p.push({ t: truth[i]!, fg: 'default' }, { t: truth[i]!, fg: 'default' }); continue; } if (r < 0.08) p.push({ t: 'PH', fg: 'default' }); if (r > 0.95) { p.push({ t: truth[i]!, fg: 'red' }); continue; } p.push({ t: truth[i]!, fg: 'default' }); }
+    const behind = Math.floor(rnd() * 3); const ring = truth.slice(0, R - behind);
+    const m = matchHistoryRows(p.map((x, i) => ({ ...row(x.t, x.fg), lineId: i, sourceEpoch: 1, geometryGeneration: 1 }) as HistoryRow), ring.map(x => row(x)), scope);
+    t.cases++; if (m.reason === 'matched') t.matched++; t.repairs += m.repairs.length;
+    if (!m.repairs.length) continue;
+    const before = p.map(x => key(x.t, x.fg)); const after = before.slice();
+    for (const r of m.repairs) after[r.lineId] = key(ring[r.capturedRow]!, 'default');
+    const target = truth.slice(R - W).map(x => key(x, 'default'));
+    const eb = ed(before, target), ea = ed(after, target);
+    if (ea < eb) t.better++; else if (ea === eb) t.same++; else { t.worse++; t.worseBy += ea - eb; if (!example || before.length < example.before.length) example = { vocab, before: before.map(s => s.replace('|default', '').replace('|red', '(red)')), after: after.map(s => s.replace('|default', '').replace('|red', '(red)')), truthWindow: truth.slice(R - W), ringTail: ring.slice(-W - 5), repairs: m.repairs.map(r => `${r.lineId}:=ring[${r.capturedRow}]`), checks: m.checks.length, eb, ea }; }
+  }
+  out[`vocab=${vocab || 'unique'}`] = t;
+}
+console.log('NEWARCH_FIX1_REPAIR_DISTANCE', JSON.stringify(out));
+for (const result of Object.values(out)) { expect(result.cases).toBe(4000); expect(result.worse).toBe(0); }
+expect(example).toBeUndefined();
+});
+
+
+test('FIX1 partial capture certifies separate exact runs around an unchecked changed row', () => {
+  const rows = naRows(Array.from({ length: 100 }, (_, i) => `row-${i}`));
+  const matcher = new IncrementalHistoryMatcher();
+  const initial = matcher.match(rows.slice(0, 80), rows.slice(0, 80), naScope);
+  matcher.remember(rows.slice(0, 80), rows.slice(0, 80), initial);
+  const captured = rows.slice(60).map(row => ({ ...row })); captured[25] = naRow('changed');
+  const result = matcher.match(rows, captured, { ...naScope, completeRetainedTail: false });
+  expect(result.reason).toBe('matched'); expect(result.repairs).toHaveLength(0);
+  expect(result.checks.some(c => c.lineId === 86)).toBe(false);
+  expect(result.checks.some(c => c.lineId === 100)).toBe(true);
+  for (const c of result.checks) expect(equalHistoryRows(rows[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
+});

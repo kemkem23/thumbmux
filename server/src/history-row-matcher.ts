@@ -99,10 +99,33 @@ export function matchHistoryRows(
   const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
   if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
-  if (recent.length >= 3 && recent.length === captured.length
-    && recent.every((row, i) => equalHistoryRows(row, captured[i]!))) {
-    if (recent.every(row => equalHistoryRows(row, recent[0]!))) return empty('ambiguous');
-    return { reason: 'matched', repairs: [], checks: recent.map((row, i) => ({ lineId: row.lineId, capturedRow: i })) };
+  if (recent.length >= 3 && recent.length === captured.length) {
+    // Common steady state: aligned rings with at most one cell-drift row.
+    // Scan exact cells once; avoid constructing 9,000 row/triple entries.
+    let mismatch = -1, differences = 0;
+    for (let i = 0; i < recent.length; i++) {
+      if (!equalHistoryRows(recent[i]!, captured[i]!)) { mismatch = i; if (++differences > 1) break; }
+    }
+    const uniqueTriple = (start: number, rows: readonly CapturedRow[]) => {
+      const pattern = recent.slice(start, start + 3);
+      if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return false;
+      let hits = 0;
+      for (let i = 0; i + 2 < rows.length; i++) {
+        if (equalHistoryRows(pattern[0]!, rows[i]!) && equalHistoryRows(pattern[1]!, rows[i + 1]!)
+          && equalHistoryRows(pattern[2]!, rows[i + 2]!) && ++hits > 1) return false;
+      }
+      return hits === 1;
+    };
+    if (differences === 0) {
+      if (recent.every(row => equalHistoryRows(row, recent[0]!))) return empty('ambiguous');
+      return { reason: 'matched', repairs: [], checks: recent.map((row, i) => ({ lineId: row.lineId, capturedRow: i })) };
+    }
+    if (differences === 1 && mismatch >= 3 && mismatch + 3 < recent.length
+      && [mismatch - 3, mismatch + 1].every(start => uniqueTriple(start, recent) && uniqueTriple(start, captured))) {
+      return { reason: 'matched',
+        checks: recent.flatMap((row, i) => i === mismatch ? [] : [{ lineId: row.lineId, capturedRow: i }]),
+        repairs: [{ lineId: recent[mismatch]!.lineId, capturedRow: mismatch, row: captured[mismatch]! }] };
+    }
   }
   const [a, b] = internRows([recent, captured]) as [number[], number[]];
   if (a.length < 3 || b.length < 3) return empty('no-anchor');
@@ -170,10 +193,12 @@ export class IncrementalHistoryMatcher {
     const base = a.length + b.length + 1;
   const at = triples(a, base), bt = triples(b, base);
     const anchors: Array<[number, number]> = [];
+    const exactAnchors: Array<[number, number]> = [];
     for (const [key, positions] of at) {
       const other = bt.get(key);
       if (positions.length !== 1 || other?.length !== 1) continue;
       const i = positions[0]!, j = other[0]!;
+      exactAnchors.push([i, j]);
       if ([0, 1, 2].every(n => {
         const row = recent[i + n]!, prior = this.checked.get(row.lineId);
         return prior !== undefined && equalHistoryRows(prior, row);
@@ -181,13 +206,22 @@ export class IncrementalHistoryMatcher {
     }
     if (!anchors.length) return empty('partial-tail');
     const offset = anchors[0]![1] - anchors[0]![0];
-    if (anchors.some(([i, j]) => j - i !== offset)) return empty('ambiguous');
+    if (exactAnchors.some(([i, j]) => j - i !== offset)) return empty('ambiguous');
     const result = empty('matched');
-    const [start, captureStart] = anchors[0]!;
-    for (let i = start, j = captureStart; i < a.length && j < b.length; i++, j++) {
-      if (a[i] !== b[j]) { result.reason = 'ambiguous'; break; }
-      result.checks.push({ lineId: recent[i]!.lineId, capturedRow: j });
+    const checked = new Set<number>();
+    // A changed row remains unchecked. Independent unique triples on each
+    // side can certify their own exact runs, but never repair across the gap.
+    for (const [start, captureStart] of exactAnchors) {
+      for (const direction of [1, -1]) {
+        for (let i = start, j = captureStart; i >= 0 && j >= 0 && i < a.length && j < b.length; i += direction, j += direction) {
+          if (a[i] !== b[j]) break;
+          if (checked.has(i)) { if (i !== start) break; else continue; }
+          checked.add(i);
+          result.checks.push({ lineId: recent[i]!.lineId, capturedRow: j });
+        }
+      }
     }
+    result.checks.sort((x, y) => x.capturedRow - y.capturedRow);
     return result;
   }
   remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {

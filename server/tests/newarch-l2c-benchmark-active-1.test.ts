@@ -35,6 +35,9 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       };
       const states = new Map<string, { matcher: IncrementalHistoryMatcher; checked: Set<number>; start: number; last: number; full: boolean }>();
       let falseChecked = 0;
+      const targets: Array<{ coverage: number; delta: number; panes: number }> = [];
+      const reasons: Record<string, number> = {};
+      let fullCaptures = 0, partialCaptures = 0;
       const configs: Array<{ socket: string; panes: string[]; sidecars: string[]; producedBefore: number; pid: number; cols: number; rows: number; count: number; ticks: number; bytes: number; samples: number; latencies: number[] }> = [];
       const tmux = (socket: string, args: string[]) => {
         const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, env: privateEnv });
@@ -106,6 +109,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
               // Extra overlap covers output arriving while the capture executes.
               const tail = mode === 'full' || state.full ? 4500 : Math.min(4500, Math.max(3, counts[i]! - state.last + 128));
               tails.push(tail);
+              if (tail === 4500) fullCaptures++; else partialCaptures++;
               if (args.length) args.push(';');
               args.push('display-message', '-p', `L2C-PANE-${i}`, ';', 'capture-pane', '-p', '-e', '-N', '-t', c.panes[i]!, '-S', `-${tail}`);
             }
@@ -125,6 +129,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
               const end = counts[i]! - c.rows + 1;
               const recent = Array.from({ length: 4500 }, (_, x) => modelRow(end - 4500 + x, c.cols));
               const result = state.matcher.match(recent, captured, { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: tails[i] === 4500 });
+              reasons[result.reason] = (reasons[result.reason] ?? 0) + 1;
               for (const check of result.checks) {
                 if (!equalHistoryRows(modelRow(check.lineId, c.cols), captured[check.capturedRow]!)) falseChecked++;
                 if (check.lineId >= state.start) state.checked.add(check.lineId);
@@ -151,13 +156,17 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           const percentile = (p: number) => c.latencies.length ? c.latencies[Math.min(c.latencies.length - 1, Math.ceil(c.latencies.length * p) - 1)] : null;
           const delta = server - base.server;
           const checkedRows = c.panes.reduce((sum, _, i) => sum + states.get(`${c.socket}/${i}`)!.checked.size, 0);
-          console.log('NEWARCH_C_CPU' , JSON.stringify({ mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, producedRows, checkedRows, checkedPerScrolled: producedRows > 0 ? checkedRows / producedRows : null, falseChecked, producedRowsPerSecondPerPane: producedRows / (elapsed / 1000) / c.count, samples: c.samples, captureBytes: c.bytes, serverCpuPercentOneCore: server, baselineServerCpu: base.server, serverDelta: delta, serverTargetPass: mode === 'baseline' ? null : c.count === 21 && active ? delta <= 10 : null, captureBatchP50: percentile(.5), captureBatchP95: percentile(.95), captureBatchP99: percentile(.99), captureBatchMax: c.latencies.at(-1) ?? null, allFourConfigsCallerAndCaptureChildrenCpu: caller, allFourConfigsCallerDelta: caller - base.caller, hz, cpu: cpus()[0]?.model, tmuxVersion: tmux(c.socket, ['-V']).trim(), scope: '4 private servers; real capture+decode+matcher; independent producer row model; no worker/writer; adaptive incremental overlap; CPU and unique checked rows measured together' }));
+          console.log('NEWARCH_C_CPU' , JSON.stringify({ mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, producedRows, checkedRows, checkedPerScrolled: producedRows > 0 ? checkedRows / producedRows : null, falseChecked, fullCaptures, partialCaptures, reasons, producedRowsPerSecondPerPane: producedRows / (elapsed / 1000) / c.count, samples: c.samples, captureBytes: c.bytes, serverCpuPercentOneCore: server, baselineServerCpu: base.server, serverDelta: delta, serverTargetPass: mode === 'baseline' ? null : c.count === 21 && active ? delta <= 10 : null, captureBatchP50: percentile(.5), captureBatchP95: percentile(.95), captureBatchP99: percentile(.99), captureBatchMax: c.latencies.at(-1) ?? null, allFourConfigsCallerAndCaptureChildrenCpu: caller, allFourConfigsCallerDelta: caller - base.caller, hz, cpu: cpus()[0]?.model, tmuxVersion: tmux(c.socket, ['-V']).trim(), scope: '4 private servers; real capture+decode+matcher; independent producer row model; no worker/writer; adaptive incremental overlap; CPU and unique checked rows measured together' }));
           expect(falseChecked).toBe(0);
-          if (mode === 'incremental' && active) expect(checkedRows / producedRows).toBeGreaterThanOrEqual(.99);
-          if (mode === 'incremental' && active && c.count === 21) expect(delta).toBeLessThanOrEqual(10);
+          if (mode === 'incremental' && active) targets.push({ coverage: checkedRows / producedRows, delta, panes: c.count });
           expect(Number.isFinite(server)).toBe(true);
           expect(elapsed).toBeGreaterThanOrEqual(60000);
           if (mode !== 'baseline') expect(c.samples).toBeGreaterThan(0);
+        }
+        // Emit every configuration before asserting any target.
+        for (const target of targets) {
+          expect(target.coverage).toBeGreaterThanOrEqual(.99);
+          if (target.panes === 21) expect(target.delta).toBeLessThanOrEqual(10);
         }
       } finally {
         for (const c of configs) spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
