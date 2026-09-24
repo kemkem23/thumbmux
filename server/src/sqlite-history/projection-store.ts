@@ -63,8 +63,13 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const errors=new Uint8Array(workerData.signal,8);
   const disk=new Database(workerData.file,{strict:true});
   disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
-  parentPort!.on('message',(batch:Batch|'close')=>{
-    if(batch==='close'){disk.close();parentPort!.postMessage('closed');parentPort!.close();return;}
+  const onMessage=(batch:Batch|'close')=>{
+    if(batch==='close') {
+      try {disk.close();}catch(error){console.error('[newarch] disk worker close failed',String(error));}
+      // Bun keeps a worker alive while a parentPort 'message' listener is attached;
+      // parentPort.close() alone does not release it, so the thread never exits.
+      parentPort!.off('message',onMessage);parentPort!.close();return;
+    }
     try {
       const timing=commitBatch(disk,workerData.fence,batch);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
@@ -75,7 +80,8 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
     }
     Atomics.notify(signal,0);parentPort!.postMessage(batch.id);
-  });
+  };
+  parentPort!.on('message',onMessage);
 }
 
 type Job={liveFrame:boolean;sourceEpoch:number;geometryGeneration:number;bytes:number;at:number;run:()=>ProjectionReceipt;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
@@ -439,16 +445,21 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.flush();
     } finally {
       this.closed=true;
-      try {
-        const worker=this.worker;
-        if(worker)await new Promise<void>((resolve,reject)=>{
-          const timer=setTimeout(()=>reject(new Error('disk-worker-close-timeout')),5000);
-          worker.once('error',error=>{clearTimeout(timer);reject(error);});
-          worker.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(new Error(`disk-worker-close:${code}`));});
-          // DB.close() runs in its owning thread before the worker exits.
-          worker.postMessage('close');
-        });
-      } finally {this.ram.db.close();this.disk.close();}
+      try {await this.stopWorker();}
+      finally {this.ram.db.close();this.disk.close();}
+    }
+  }
+  /** DB.close() runs in its owning thread; a stuck worker is terminated, never thrown at the caller. */
+  private async stopWorker():Promise<void> {
+    const worker=this.worker;if(!worker)return;
+    const exited=await new Promise<boolean>(resolve=>{
+      const timer=setTimeout(()=>resolve(false),5000);
+      worker.once('exit',()=>{clearTimeout(timer);resolve(true);});
+      worker.postMessage('close');
+    });
+    if(!exited) {
+      console.error('[newarch] disk worker did not exit after close; terminating');
+      await worker.terminate().catch(()=>{});
     }
   }
 }

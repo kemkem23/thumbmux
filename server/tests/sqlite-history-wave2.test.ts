@@ -386,19 +386,42 @@ test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery
 test('newarch FIX2: close leaves no fixture fds and immediate reopen never needs a retry',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-close-fds-'));
  const key={serverIdentity:'close-fds',paneId:'%1',birthGeneration:1};
- let maxAfterClose=0;
+ let maxAfterClose=0,maxCloseMs=0;
  try {
   for(let round=0;round<30;round++) {
    const s=createProjectionStore({historyRoot:root,mode:round===0?'create':'recover'});
    try {
     for(let n=0;n<2000;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:round*2000+n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
-   }finally{await s.close();}
+   }finally{const started=performance.now();await s.close();maxCloseMs=Math.max(maxCloseMs,performance.now()-started);}
    const fds=readdirSync('/proc/self/fd').filter(fd=>{try{return readlinkSync('/proc/self/fd/'+fd).startsWith(root+'/');}catch{return false;}});
    maxAfterClose=Math.max(maxAfterClose,fds.length);expect(fds).toHaveLength(0);
   }
-  console.log('NA_FIX2_CLOSE',JSON.stringify({rounds:30,rowsPerRound:2000,maxAfterClose}));
+  // The normal path must never ride the 5 s stuck-worker fallback.
+  expect(maxCloseMs).toBeLessThan(1000);
+  console.log('NA_FIX2_CLOSE',JSON.stringify({rounds:30,rowsPerRound:2000,maxAfterClose,maxCloseMs:Math.round(maxCloseMs)}));
  }finally{rmSync(root,{recursive:true,force:true});}
 },60000);
+
+test('newarch DEBT: a disk worker that never exits is terminated without throwing at close',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-close-stuck-'));
+ const key={serverIdentity:'close-stuck',paneId:'%1',birthGeneration:1};
+ const s=createProjectionStore({historyRoot:root,mode:'create'});
+ try {
+  for(let n=0;n<200;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+  s.flush();
+  // Swallow the close request: from the store's side the worker is alive and never exits.
+  const worker=(s as any).worker;expect(worker).toBeTruthy();worker.postMessage=()=>{};
+  const started=performance.now();await s.close();const closeMs=performance.now()-started;
+  expect((s as any).worker).toBeNull();expect(closeMs).toBeLessThan(10000);
+  const fds=readdirSync('/proc/self/fd').filter(fd=>{try{return readlinkSync('/proc/self/fd/'+fd).startsWith(root+'/');}catch{return false;}});
+  // Normal close proves fd=0 above. A terminated worker cannot finalize its own
+  // SQLite handle; only that bounded set may remain, and it must not block reopen.
+  expect(fds.length).toBeLessThanOrEqual(4);
+  const again=createProjectionStore({historyRoot:root,mode:'recover'});
+  try {expect(again.token(key).nextLineId).toBe(200);}finally{await again.close();}
+  console.log('NA_DEBT_STUCK_CLOSE',JSON.stringify({closeMs:Math.round(closeMs),fdsAfterClose:fds.length}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
 
 test('newarch FIX2: open loop hot pane 1000 per second plus twenty panes at 100',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-hot-loop-'));
