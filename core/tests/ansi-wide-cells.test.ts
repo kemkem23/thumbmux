@@ -181,6 +181,8 @@ describe('Canvas FIX1 regressions', () => {
       const bases = cells.filter(c => !c.continuation);
       expect(bases.map(c => c.text).join('')).toBe(text);
       expect(bases.find(c => c.text === 'h')!.col).toBe(expected + 1);
+      expect(canvasLinkHits([text], 200)[0]!.startCol).toBe(expected + 1);
+      expect(canvasLinkHits([text], 200)[0]!.endCol).toBe(stringCells(text));
       expect(cells.length).toBe(stringCells(text));
       expect(bases.reduce((sum, c) => sum + c.width, 0)).toBe(stringCells(text));
       const linked = `\x1b]8;;https://real.example\x07${text}\x1b]8;;\x07`;

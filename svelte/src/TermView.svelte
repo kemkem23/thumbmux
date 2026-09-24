@@ -22,6 +22,7 @@
   import { tmuxMux } from './ws-mux.svelte';
   import TermSearch from './TermSearch.svelte';
   import CanvasTerminal from './canvas-terminal/CanvasTerminal.svelte';
+  import { canvasLineHtml } from './canvas-terminal/links';
   import {
     contentLinesChangeSource, createContentUpdateGate, flushContentUpdate, receiveContentUpdate,
     updatePendingContentCursor,
@@ -6990,7 +6991,14 @@
 
   function canvasWindowHtml(): string[] {
     renderEpoch;
-    return Array.from({ length: winEnd - winStart }, (_, i) => cachedLineHtml(winStart + i, contentEpoch));
+    return Array.from({ length: winEnd - winStart }, (_, i) => {
+      const visual = winStart + i;
+      const row = projectionRowAt(visual);
+      if (!row || row.kind === 'bash-placeholder' || row.kind === 'tool-placeholder') return cachedLineHtml(visual, contentEpoch);
+      const idx = row.rawRange.startLine;
+      const entry = renderEntryStates.get(idx);
+      return entry ? canvasLineHtml(row.line, cloneSgrState(entry), palette, linksByLine[idx]) : cachedLineHtml(visual, contentEpoch);
+    });
   }
 
   function canvasWindowGeometry() {
