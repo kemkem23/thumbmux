@@ -1205,6 +1205,73 @@ def fork_child(config: dict[str, Any], geometry: dict[str, int], outer_attribute
     return ChildPty(pid, master_fd, gate_write, error_read)
 
 
+class ChildFreezer:
+    """Freeze only a private child cgroup, never the proxy or a shared scope.
+
+    The gated child joins before exec, so ordinary descendants inherit it.
+    A delegated cgroup v2 hierarchy is optional: without one, boundaries drain
+    available bytes but cannot promise a quiescent producer across a resize.
+    SIGSTOP is not a substitute: interactive shells observe it as job control.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    @staticmethod
+    def attach(pid: int) -> Optional["ChildFreezer"]:
+        path = None
+        try:
+            with open("/proc/self/cgroup", encoding="ascii") as source:
+                relative = next(line.strip()[3:] for line in source if line.startswith("0::"))
+            if not relative.startswith("/") or ".." in relative.split("/"):
+                return None
+            parent = "/sys/fs/cgroup" + relative.rstrip("/")
+            path = os.path.join(parent, f"thumbmux-pty-{pid}-{uuid.uuid4().hex}")
+            os.mkdir(path, 0o700)
+            # Probe availability before moving the still-gated child.
+            with open(os.path.join(path, "cgroup.freeze"), "w", encoding="ascii") as target:
+                target.write("0")
+            with open(os.path.join(path, "cgroup.procs"), "w", encoding="ascii") as target:
+                target.write(str(pid))
+            return ChildFreezer(path)
+        except (OSError, StopIteration):
+            if path is not None:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+            return None
+
+    def set_frozen(self, frozen: bool) -> None:
+        with open(os.path.join(self.path, "cgroup.freeze"), "w", encoding="ascii") as target:
+            target.write("1" if frozen else "0")
+
+    def freeze(self) -> bool:
+        try:
+            self.set_frozen(True)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with open(os.path.join(self.path, "cgroup.events"), encoding="ascii") as events:
+                    if "frozen 1" in events.read().splitlines():
+                        return True
+                time.sleep(0.001)
+        except OSError:
+            pass
+        # A timeout may leave a partially frozen group. Thaw before fallback;
+        # inability to thaw is fatal, never a successful unpaused boundary.
+        self.set_frozen(False)
+        return False
+
+    def close(self) -> None:
+        self.set_frozen(False)
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            # Remaining descendants can outlive the leader. Do not kill them
+            # or remove anybody else's scope just to reclaim this directory.
+            pass
+
+
 class Proxy:
     def __init__(self, config: dict[str, Any], asset_sha256: str = "") -> None:
         self.config = config
@@ -1219,6 +1286,7 @@ class Proxy:
         self.server: Optional[socket.socket] = None
         self.clients: dict[socket.socket, bytearray] = {}
         self.child: Optional[ChildPty] = None
+        self.freezer: Optional[ChildFreezer] = None
         self.child_status: Optional[int] = None
         self.child_exit_code: Optional[int] = None
         self.master_eof = False
@@ -1562,9 +1630,16 @@ class Proxy:
         return True
 
     def drain_master(self) -> None:
-        """Empty the inner PTY. Live I/O must not call this."""
+        """Drain available bytes with a bound for the unfrozen fallback.
+
+        WAL-before-display remains strict; producer-before-boundary ordering
+        is best effort when cgroup freezing is unavailable (including tasks
+        moved into a different scope by the launched command).
+        """
+        deadline = time.monotonic() + 0.1
         while self.read_master_once():
-            pass
+            if time.monotonic() >= deadline:
+                break
 
     def service_outer_input(self) -> None:
         self.read_outer()
@@ -1634,39 +1709,13 @@ class Proxy:
         return True
 
     def freeze_child(self) -> bool:
-        if self.child is None or self.reap_child():
+        if self.child is None or self.reap_child() or self.freezer is None:
             return False
-        try:
-            self.signal_child_groups(signal.SIGSTOP)
-        except ProcessLookupError:
-            self.reap_child()
-            return False
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            try:
-                pid, status_value = os.waitpid(self.child.pid, os.WNOHANG | os.WUNTRACED)
-            except ChildProcessError:
-                return False
-            if pid == 0:
-                time.sleep(0.001)
-                continue
-            if os.WIFSTOPPED(status_value):
-                return True
-            self.child_status = status_value
-            if os.WIFEXITED(status_value):
-                self.child_exit_code = os.WEXITSTATUS(status_value)
-            elif os.WIFSIGNALED(status_value):
-                self.child_exit_code = 128 + os.WTERMSIG(status_value)
-            return False
-        raise ProxyError("child process group did not stop for ordered boundary")
+        return self.freezer.freeze()
 
     def resume_child(self) -> None:
-        if self.child is None or self.child_status is not None:
-            return
-        try:
-            self.signal_child_groups(signal.SIGCONT)
-        except ProcessLookupError:
-            self.reap_child()
+        if self.freezer is not None:
+            self.freezer.set_frozen(False)
 
     def signal_child_groups(self, selected_signal: int) -> None:
         if self.child is None:
@@ -1725,7 +1774,7 @@ class Proxy:
         if target == self.geometry:
             return
         stopped = self.freeze_child()
-        if not stopped:
+        if self.child_status is not None:
             return
         self.state = "resizing"
         self.write_health(True)
@@ -1744,7 +1793,8 @@ class Proxy:
         self.geometry = target
         self.state = "ready" if self.activated else "armed"
         self.write_health(True)
-        self.resume_child()
+        if stopped:
+            self.resume_child()
 
     def ordered_activate(self, generation: str) -> WalRecord:
         if generation != self.generation:
@@ -2101,6 +2151,9 @@ class Proxy:
 
         self.original_outer_attributes = termios.tcgetattr(0)
         self.child = fork_child(self.config, self.geometry, self.original_outer_attributes)
+        self.freezer = ChildFreezer.attach(self.child.pid)
+        if self.freezer is None:
+            self.log.write("cgroup freezer unavailable; boundaries drain without producer quiescence")
         self.prepare_socket()
         lifecycle = "start" if existing.empty else "resume"
         self.activation_record = self.append_json(
@@ -2131,7 +2184,7 @@ class Proxy:
         self.state = "fatal"
         if self.child is not None and self.child_status is None:
             try:
-                self.signal_child_groups(signal.SIGSTOP)
+                self.signal_child_groups(signal.SIGKILL)
             except OSError:
                 pass
         if self.log is not None:
@@ -2146,6 +2199,11 @@ class Proxy:
 
     def cleanup(self) -> None:
         signal.set_wakeup_fd(-1)
+        if self.freezer is not None:
+            try:
+                self.freezer.close()
+            except OSError:
+                pass
         if self.child is not None and self.child.gate_fd >= 0:
             try:
                 os.close(self.child.gate_fd)
