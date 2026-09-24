@@ -572,3 +572,55 @@ describe('wave 6 expansion wiring (second half)', () => {
     } finally { await f.cleanup(); }
   }, 60000);
 });
+
+import { mkdtempSync } from 'node:fs';
+import { tmpdir, cpus } from 'node:os';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import type { ProjectionCell } from '../src/sqlite-history/types';
+
+test('newarch L1: steady writer RAM/pending/flush measurements, 1 and 21 panes, 60s x3',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-steady-'));
+ const percentiles=(values:number[])=>{
+  const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;
+  const at=(p:number)=>sorted[Math.min(n-1,Math.ceil(n*p)-1)]??null;
+  return {n,p50:at(.5),p95:at(.95),p99:at(.99),max:n?sorted[n-1]:null};
+ };
+ try{
+  for(const panes of [1,21])for(let round=0;round<3;round++){
+   const cols=round===1?120:80,rows=round===1?40:24;
+   const dir=join(root,`${panes}-${round}`);mkdirSync(dir);
+   const s=createProjectionStore({historyRoot:dir,mode:'create'});
+   const keys=Array.from({length:panes},(_,i)=>({serverIdentity:'steady-fixture',paneId:`%${i}`,birthGeneration:1}));
+   const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+   const blank=cell(' ');const rss:number[]=[],ram:number[]=[],pending:number[]=[],ages:number[]=[];
+   const cpu=process.cpuUsage(),start=performance.now();let produced=0,lastCommit:number|null=null;
+   try{
+    for(const key of keys)await s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:0,cols,rows,kind:'normal',cells:Array.from({length:rows},()=>Array.from({length:cols},()=>({...blank}))),cursor:{row:0,col:0,visible:true}});
+    // 6000 actual accepted rows per pane. The producer oracle is independent of storage.
+    while(produced<6000){
+     const due=Math.min(6000,Math.floor((performance.now()-start)/10));
+     if(due<=produced){await Bun.sleep(1);continue;}
+     for(let n=produced;n<due;n++)await Promise.all(keys.map((key,i)=>{
+      const text=`${i}:${n}`.padEnd(cols,' ');
+      return s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n+1,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}});
+     }));
+     produced=due;const h=s.health();rss.push(h.rssBytes);ram.push(h.ramBytes);pending.push(h.pendingBytes);
+     if(h.lastCommitAt!==null&&h.lastCommitAt!==lastCommit){ages.push(h.lastFlushAgeMs);lastCommit=h.lastCommitAt;}
+    }
+    s.flush();const elapsed=performance.now()-start,usage=process.cpuUsage(cpu);
+    for(let i=0;i<keys.length;i++){
+     const token=s.token(keys[i]);let anchor:number|null=null,seen=0;
+     do{const page=s.readPage(token,anchor,2000);for(const line of page.lines){expect(line.text).toBe(`${i}:${seen}`.padEnd(cols,' '));seen++;}anchor=page.hasMore?page.nextAnchor:null;}while(anchor!==null);
+     expect(seen).toBe(6000);
+    }
+    const result={scope:'writer + Bun test process; no VT worker/tmux/browser',bun:Bun.version,cpu:cpus()[0]?.model,
+      panes,round:round+1,cols,rows,elapsedMs:elapsed,acceptedRows:produced*panes,
+      rssBytes:percentiles(rss),ramBytes:percentiles(ram),pendingBytes:percentiles(pending),flushAgeMs:percentiles(ages),
+      processCpuPercent:(usage.user+usage.system)/1000/elapsed*100,missing:0,extra:0,wrong:0,
+      pass:{cache:Math.max(...ram)<=256*1024*1024,pending:Math.max(...pending)<=16*1024*1024,flushAge:(percentiles(ages).p95??Infinity)<=150}};
+    console.log('NA_STEADY',JSON.stringify(result));
+    expect(ages.length).toBeGreaterThan(0);expect(result.pass.cache).toBe(true);expect(result.pass.pending).toBe(true);expect(result.pass.flushAge).toBe(true);
+   }finally{await s.close();}
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+},480000);

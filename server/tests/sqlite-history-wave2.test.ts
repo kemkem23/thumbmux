@@ -149,3 +149,60 @@ test('default package barrel still has no sqlite import and the opt-in entry has
   expect(readFileSync(join(import.meta.dir,'../src/index.ts'),'utf8')).not.toContain('sqlite-history');
   const module=await import('../src/sqlite-history');expect(typeof module.createSqliteHistoryStore).toBe('function');
 });
+
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+
+test('newarch: real SIGKILL before disk commit, after commit, before RAM watermark, 20 trials each',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-crash-'));
+ const key={serverIdentity:'crash-fixture',paneId:'%1',birthGeneration:1};
+ const module=join(import.meta.dir,'../src/sqlite-history/projection-store.ts');
+ const summary=[];
+ try{
+  for(const phase of ['before-disk-commit','after-disk-commit','before-watermark']) {
+   for(let trial=0;trial<20;trial++) {
+    const dir=join(root,`${phase}-${trial}`);mkdirSync(dir);
+    const script=`import {createProjectionStore} from ${JSON.stringify(module)};
+      let armed=false;
+      const s=createProjectionStore({historyRoot:${JSON.stringify(dir)},mode:'create',checkpoint:(phase)=>{if(armed&&phase===${JSON.stringify(phase)})process.kill(process.pid,'SIGKILL');}});
+      const key=${JSON.stringify(key)};
+      const event=(text,seq)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:seq,softWrap:false,physicalRow:{text,cells:[]}});
+      await s.appendScroll(event('durable-before',1));s.flush();
+      await s.appendScroll(event('in-flight',2));armed=true;s.flush();throw Error('kill-not-reached');`;
+    const child=Bun.spawnSync([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+    expect(child.signalCode).toBe('SIGKILL');
+    const s=createProjectionStore({historyRoot:dir,mode:'recover'});
+    try{
+     const expected=phase==='before-disk-commit'?['durable-before']:['durable-before','in-flight'];
+     const token=s.token(key);expect(token.revision).toBe(expected.length);expect(token.durableRevision).toBe(expected.length);
+     expect(s.readPage(token,null,10).lines.map(r=>r.text)).toEqual(expected);
+     await s.appendScroll({paneKey:key,sourceEpoch:2,geometryGeneration:1,receiveSeq:0,softWrap:false,physicalRow:{text:'restarted',cells:[]}});
+     s.flush();expect(s.token(key).nextLineId).toBe(expected.length+1);
+    }finally{await s.close();}
+   }
+   summary.push({phase,trials:20,signal:'SIGKILL',durableRowsLost:0});
+  }
+  console.log('NA_CRASH_PROOF',JSON.stringify(summary));
+ }finally{rmSync(root,{recursive:true,force:true});}
+},60000);
+
+test('newarch: actual SQLITE_FULL preserves pending rows and reports host fault before retry',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-full-')),faults:any[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',onFault:f=>faults.push(f)});
+ const key={serverIdentity:'full-fixture',paneId:'%1',birthGeneration:1};
+ try{
+  const disk=(s as any).disk as Database;
+  const pages=(disk.query('PRAGMA page_count').get() as any).page_count;
+  disk.exec(`PRAGMA max_page_count=${pages}`);
+  const event={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'x'.repeat(300000),cells:[]}};
+  await s.appendScroll(event);
+  expect(faults.some(f=>/full/i.test(f.reason))).toBe(true);
+  expect(s.health().status).toBe('degraded');expect(s.token(key).durableRevision).toBe(0);
+  expect(s.readPage(s.token(key),null,1).lines[0].text).toBe(event.physicalRow.text);
+  expect(s.health().pendingBytes).toBeGreaterThan(0);
+  disk.exec('PRAGMA max_page_count=1073741823');s.flush();
+  expect(s.token(key).durableRevision).toBe(1);expect(s.health().pendingBytes).toBe(0);
+  console.log('NA_DISK_FULL',JSON.stringify({sqliteFull:true,hostFaults:faults.length,rowsLost:0,pendingAfterRetry:s.health().pendingBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});

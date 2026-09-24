@@ -153,3 +153,55 @@ export interface ShadowRuntimeState {
 export interface HistoryCaptureCoordinator {
   start():void; probe(sessionId:string):Promise<CaptureReceipt>; stopAndDrain():Promise<void>;
 }
+
+// newarch-frame-v1: opt-in projection contract; v1 callers retain their types.
+export interface PaneKey { serverIdentity: string; paneId: string; birthGeneration: number }
+export interface ProjectionCell {
+  grapheme: string; width: number; continuation: boolean;
+  fg: string | number | null; bg: string | number | null; style: number;
+}
+export interface PhysicalRow { text: string; cells: ProjectionCell[] }
+export interface ScrollEvent {
+  paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
+  physicalRow: PhysicalRow; softWrap: boolean; receiveSeq: number;
+}
+export interface ProjectionFrame {
+  paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number; receiveSeq: number;
+  cells: ProjectionCell[][]; cursor: { row: number; col: number; visible: boolean } | null;
+  kind: 'normal' | 'alternate'; cols: number; rows: number;
+}
+export interface ProjectionCapture extends ProjectionFrame {
+  captureId: string; requestedAt: number; completedAt: number;
+  firstHistoryRow: number; history: PhysicalRow[]; observedFields: string[];
+  ambiguousRows: number; result: string;
+}
+export interface ProjectionCalibration {
+  capture: ProjectionCapture; expectedRevision: number;
+  checks: Array<{ lineId: number; captureRow: number }>;
+  repairs: Array<{ lineId: number; captureRow: number; physicalRow: PhysicalRow }>;
+}
+export interface ProjectionReceipt { revision: number; durableRevision: number; nextLineId: number }
+export interface ProjectionToken extends ProjectionReceipt {
+  paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
+}
+export interface ProjectionLine extends PhysicalRow {
+  lineId: number; sourceEpoch: number; geometryGeneration: number; revision: number; softWrap: boolean;
+  checkState: 'unchecked' | 'checked'; checkReason: string;
+  checkedCaptureId: string | null; checkedRow: number | null;
+}
+export interface ProjectionPage {
+  token: ProjectionToken; lines: ProjectionLine[]; nextAnchor: number; hasMore: boolean;
+}
+export interface ProjectionFault { kind: string; at: number; reason: string; pendingBytes: number }
+export interface ProjectionHealth {
+  status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number;
+  ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
+  panes: ProjectionToken[];
+}
+export interface ProjectionWriterPort {
+  appendScroll(event: ScrollEvent): Promise<ProjectionReceipt>;
+  replaceScreen(frame: ProjectionFrame): Promise<ProjectionReceipt>;
+  calibrate(change: ProjectionCalibration): Promise<ProjectionReceipt>;
+  readPage(token: ProjectionToken, anchor: number | null, limit: number): ProjectionPage;
+  flush(): void; health(): ProjectionHealth;
+}
