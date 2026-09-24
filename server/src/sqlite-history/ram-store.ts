@@ -84,7 +84,12 @@ export function upsert(db: Database, table: string, row: SqlRow): void {
 /** Only the bounded live working set lives here. Disk history is never loaded wholesale. */
 export class ProjectionRam {
   readonly db = new Database(':memory:', {strict:true});
-  constructor() { this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;'); this.db.exec(PROJECTION_SCHEMA);this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_key,checked_capture_id)'); }
+  private readonly pageSize:number;
+  constructor() {
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;');this.db.exec(PROJECTION_SCHEMA);
+    this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_key,checked_capture_id)');
+    this.pageSize=Number((this.db.query('PRAGMA page_size').get() as {page_size:number}).page_size);
+  }
   pane(key: PaneKey): SqlRow {
     const row = this.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(paneId(key)) as SqlRow | null;
     if (!row) throw new Error('unknown-pane');
@@ -97,11 +102,17 @@ export class ProjectionRam {
   }
   ensure(key: PaneKey, epoch: number, geometry: number): SqlRow {
     const id=paneId(key); integer(epoch); integer(geometry);
-    this.db.query(`INSERT OR IGNORE INTO na_pane
-      (pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind)
-      VALUES (?,?,?,?,?,?,?,0,0,'normal')`).run(id,randomUUID(),key.serverIdentity,key.paneId,key.birthGeneration,epoch,geometry);
-    const p=this.pane(key);
-    if (epoch < Number(p.source_epoch) || geometry < Number(p.geometry_generation)) throw new Error('stale-generation');
+    const p=this.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(id) as SqlRow|null;
+    if(!p) {
+      this.db.query(`INSERT INTO na_pane
+        (pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind)
+        VALUES (?,?,?,?,?,?,?,0,0,'normal')`).run(id,randomUUID(),key.serverIdentity,key.paneId,key.birthGeneration,epoch,geometry);
+      return this.pane(key);
+    }
+    if(epoch<Number(p.source_epoch) || geometry<Number(p.geometry_generation))throw new Error('stale-generation');
+    // Most rows and frames belong to the current generation. There is no metadata
+    // transition to write, and the freshly read pane already contains the receipt.
+    if(epoch===Number(p.source_epoch) && geometry===Number(p.geometry_generation))return p;
     if (epoch > Number(p.source_epoch)) this.db.query('INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)').run(
       randomUUID(),id,epoch,Number(p.revision)+1,p.next_line_id,'gap','source-epoch-changed',null,Date.now());
     this.db.query('UPDATE na_pane SET source_epoch=?,geometry_generation=?,receive_seq=? WHERE pane_key=?').run(epoch,geometry,epoch>Number(p.source_epoch)?-1:p.receive_seq,id);
@@ -170,8 +181,7 @@ export class ProjectionRam {
   }
   bytes(): number {
     const pages=this.db.query('PRAGMA page_count').get() as {page_count:number};
-    const size=this.db.query('PRAGMA page_size').get() as {page_size:number};
-    return pages.page_count*size.page_size;
+    return pages.page_count*this.pageSize;
   }
   evict(panes: SqlRow[]): void {
     // Indexed ranges only for committed panes; never visit every resident line.

@@ -227,21 +227,21 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const q of this.queues.values())for(const job of q)job.reject(error);
       this.queues.clear();this.queuedBytes=0;this.pumping=false;return;
     }
-    let processed=0;
-    while(this.queues.size && processed<128) {
-      for(const [id,q] of this.queues) {
-        const job=q.shift()!;if(!q.length)this.queues.delete(id);
-        this.queuedBytes-=job.bytes;
-        try {
-          const receipt=this.ram.db.transaction(()=>{
-            const receipt=job.run();
-            if(this.ram.bytes()>CACHE_MAX) throw new Error('ram-cache-limit');
-            return receipt;
-          })();
-          this.dirtyBytes+=job.bytes;this.dirtySince??=job.at;job.resolve(receipt);
-        }catch(error){job.reject(error);}
-        processed++;
-      }
+    let processed=0;const started=performance.now();
+    while(this.queues.size && processed<128 && (processed===0 || performance.now()-started<4)) {
+      // Rotate after each row, including when the time slice ends mid-round.
+      const [id,q]=this.queues.entries().next().value!;
+      this.queues.delete(id);const job=q.shift()!;if(q.length)this.queues.set(id,q);
+      this.queuedBytes-=job.bytes;
+      try {
+        const receipt=this.ram.db.transaction(()=>{
+          const receipt=job.run();
+          if(this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
+          return receipt;
+        })();
+        this.dirtyBytes+=job.bytes;this.dirtySince??=job.at;job.resolve(receipt);
+      }catch(error){job.reject(error);}
+      processed++;
     }
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
 
