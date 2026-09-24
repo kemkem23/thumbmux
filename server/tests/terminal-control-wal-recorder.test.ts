@@ -649,3 +649,271 @@ describe("ordered tmux control WAL recorder with a disposable private tmux serve
     }
   }, 15_000);
 });
+
+import { HistoryCalibrator, equalCalibrationFrames, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts } from '../src/history-calibrator';
+import { matchHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
+import { HistoryWatchdog } from '../src/history-watchdog';
+
+const naRow = (text: string): CapturedRow => ({ softWrap: false, cells: Array.from(text, grapheme => ({ grapheme, width: 1 as const, continuation: false, fg: 'default', bg: 'default', style: 0 })) });
+const naRows = (texts: string[]): HistoryRow[] => texts.map((text, i) => ({ ...naRow(text), lineId: i + 1, sourceEpoch: 1, geometryGeneration: 1 }));
+const naScope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function naHarness(incremental = false) {
+  let time = 0, revision = 1;
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const history = naRows(['a', 'b', 'c']);
+  let parser = structuredClone(frame);
+  const limits: number[] = [], scheduled: number[] = [], published: number[] = [], faults: string[] = [], writes: Parameters<CalibrationPorts['calibrate']>[0][] = [];
+  let conflict = false, stale = false;
+  const ports: CalibrationPorts = {
+    now: () => time,
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: history, parserFrame: parser }),
+    schedule: at => { scheduled.push(at); },
+    capture: async (_, limit) => {
+      limits.push(limit);
+      const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+      return { paneKey, captureId: `capture-${limits.length}`, requestedAt: time, completedAt: time, before: meta, after: stale ? { ...meta, cols: 5 } : meta, frame, history, completeRetainedTail: limit >= history.length, observedFields: ['cells', 'cursor'] };
+    },
+    calibrate: async input => { writes.push(input); if (conflict || input.expectedRevision !== revision) { conflict = false; revision++; return null; } return { revision: ++revision, durableRevision: 0, nextLineId: 4 }; },
+    publish: commit => { published.push(commit.revision); },
+    fault: fault => { faults.push(fault.kind); },
+  };
+  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental });
+  return { calibrator, ports, frame, history, limits, scheduled, published, faults, writes,
+    time: (at: number) => { time = at; },
+    parser: (value: CalibrationFrame) => { parser = value; },
+    conflict: () => { conflict = true; }, stale: () => { stale = true; },
+  };
+}
+
+describe('NEWARCH L2-C matcher and calibration ports', () => {
+  test('unique suffix checks exact cells and repairs only bounded equal-length mismatch', () => {
+    const rows = naRows(['L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3']);
+    const capture = ['L1', 'L2', 'L3', 'good', 'R1', 'R2', 'R3'].map(naRow);
+    const match = matchHistoryRows(rows, capture, naScope);
+    expect(match.checks).toHaveLength(6);
+    expect(match.repairs).toEqual([{ lineId: 4, capturedRow: 3, row: capture[3]! }]);
+    expect(matchHistoryRows(rows, capture, { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
+    expect(matchHistoryRows(rows, capture, { ...naScope, geometryGeneration: 2 }).checks).toHaveLength(0);
+  });
+  test('constant, repeated, deleted and partial tails never acquire false checks', () => {
+    for (const values of [['', '', '', ''], ['a', 'b', 'c', 'a', 'b', 'c']]) {
+      const match = matchHistoryRows(naRows(values.slice(-3)), values.map(naRow), naScope);
+      expect(match.checks).toHaveLength(0);
+      expect(match.repairs).toHaveLength(0);
+    }
+    const rows = naRows(['a', 'b', 'c', 'missing', 'd', 'e', 'f']);
+    const match = matchHistoryRows(rows, ['a', 'b', 'c', 'd', 'e', 'f'].map(naRow), naScope);
+    expect(match.repairs).toHaveLength(0);
+    expect(match.checks.map(c => c.lineId)).toEqual([5, 6, 7]);
+  });
+  test('20,000 callback rows survive retained-ring overflow with exact receipt mapping', () => {
+    const rows = naRows(Array.from({ length: 20000 }, (_, i) => `row-${i}`));
+    const retained = rows.slice(-4500);
+    const match = matchHistoryRows(rows, retained, naScope);
+    expect(rows).toHaveLength(20000);
+    expect(match.checks).toHaveLength(4500);
+    for (const check of match.checks) expect(rows[check.lineId - 1]).toEqual(retained[check.capturedRow]);
+    console.log('NEWARCH_C_OVERFLOW', JSON.stringify({ denominator: rows.length, checked: match.checks.length, unchecked: 15500, reason: 'evicted-before-check', missing: 0, extra: 0, wrong: 0, falseChecked: 0, scope: 'fake scroll store; not real collector' }));
+  });
+  test('all screen/check/repair mutations share one CAS and conflict recaptures', async () => {
+    const h = naHarness(); h.conflict();
+    await h.calibrator.runDue();
+    expect(h.published).toHaveLength(0);
+    expect(h.writes[0]!.expectedRevision).toBe(1);
+    h.time(50); await h.calibrator.runDue();
+    expect(h.writes[1]!.expectedRevision).toBe(2);
+    expect(h.published).toEqual([3]);
+  });
+  test('geometry transition discards capture and lifecycle events append no phantom rows', async () => {
+    const h = naHarness(); h.stale();
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(0);
+    for (const event of ['clear', 'alt', 'resize', 'reconnect', 'fault'] as const) h.calibrator.event(event);
+    expect(h.history.map(r => r.lineId)).toEqual([1, 2, 3]);
+    expect(h.calibrator.acceptsPipeFrame).toBe(false);
+  });
+  test('CAPTURE latch prevents parser overwrite, keeps scroll ingestion and returns only on equality', async () => {
+    const h = naHarness();
+    const wrong = structuredClone(h.frame); wrong.cells = [naRow('bad ').cells]; h.parser(wrong);
+    await h.calibrator.runDue();
+    expect(h.calibrator.mode).toBe('CAPTURE');
+    let pipePublishes = 0;
+    h.calibrator.output(() => pipePublishes++); h.calibrator.scroll(20000);
+    h.time(50); await h.calibrator.runDue();
+    expect(h.limits).toEqual([4500, 0]);
+    expect(pipePublishes).toBe(0);
+    h.time(1051); await h.calibrator.runDue();
+    expect(h.faults).toContain('capture-latch-degraded');
+    h.parser(structuredClone(h.frame)); h.time(1101); await h.calibrator.runDue();
+    expect(h.calibrator.mode).toBe('PIPE');
+    h.calibrator.output(() => pipePublishes++); h.time(1117); await h.calibrator.runDue();
+    expect(pipePublishes).toBe(1);
+  });
+  test('incremental capture reads new scrolls plus anchor, full only on lifecycle/fault', async () => {
+    const h = naHarness(true);
+    await h.calibrator.runDue();
+    h.time(10); h.calibrator.scroll(20); h.time(200); await h.calibrator.runDue();
+    expect(h.limits).toEqual([4500, 23]);
+    h.time(201); h.calibrator.event('clear'); h.time(250); await h.calibrator.runDue();
+    expect(h.limits.at(-1)).toBe(4500);
+  });
+  test('output cannot debounce calibration forever and inactive panes settle to 1s', async () => {
+    const h = naHarness(); await h.calibrator.runDue();
+    for (let t = 1; t <= 199; t++) { h.time(t); h.calibrator.output(); }
+    expect(h.calibrator.dueAt).toBe(200);
+    h.time(200); await h.calibrator.runDue();
+    expect(h.limits).toHaveLength(2);
+    h.time(400); await h.calibrator.runDue();
+    expect(h.calibrator.dueAt).toBe(1400);
+  });
+  test('dead reader and independent heartbeat detect failure even when pane_pipe would remain 1', () => {
+    let at = 0; const faults: string[] = [];
+    const wd = new HistoryWatchdog(() => at, f => { expect(f.missingCount).toBeNull(); faults.push(f.kind); });
+    wd.capture('a'); wd.capture('b');
+    at = 1000; wd.tick(); expect(faults).toEqual(['reader-stalled']);
+    wd.receive(1); wd.heartbeat();
+    at = 3999; wd.tick(); expect(faults).toHaveLength(1);
+    at = 4000; wd.tick(); expect(faults).toContain('heartbeat-timeout');
+    wd.dead('reader-eof'); expect(faults).toContain('reader-eof');
+    wd.dead('reader-eof'); expect(faults.filter(f => f === 'reader-eof')).toHaveLength(1);
+  });
+  test('independently timed glyph/color/blank/cursor faults correct at next scheduled publish', async () => {
+    // Real monotonic wall time and timers; fake parser/store/capture ports. This
+    // measures the C lane only and cannot certify the later integrated path.
+    const results: Record<string, number[]> = {};
+    for (const kind of ['glyph', 'color', 'blank', 'cursor']) {
+      const samples: number[] = [];
+      const h = naHarness();
+      const started = performance.now();
+      h.ports.now = () => performance.now() - started;
+      let injected = 0, corrected = 0;
+      h.ports.publish = (_, frame) => {
+        expect(equalCalibrationFrames(frame, h.frame)).toBe(true);
+        corrected = performance.now();
+      };
+      for (let n = 0; n < 25; n++) {
+        const wrong = structuredClone(h.frame);
+        if (kind === 'cursor') wrong.cursor!.x = 2;
+        else {
+          const cells = wrong.cells.map(row => row.map(c => ({ ...c })));
+          if (kind === 'color') cells[0]![0]!.fg = 'index:1';
+          else cells[0]![0]!.grapheme = kind === 'blank' ? ' ' : 'X';
+          wrong.cells = cells;
+        }
+        // Offset injection from calibration; include all waiting and publish.
+        await new Promise(resolve => setTimeout(resolve, 7 + (n * 17) % 37));
+        injected = performance.now(); h.parser(wrong); h.calibrator.output();
+        const delay = Math.max(0, h.calibrator.dueAt - h.ports.now());
+        await new Promise(resolve => setTimeout(resolve, Math.ceil(delay)));
+        await h.calibrator.runDue();
+        samples.push(corrected - injected);
+        expect(corrected).toBeGreaterThanOrEqual(injected);
+        h.parser(structuredClone(h.frame));
+        await new Promise(resolve => setTimeout(resolve, 51));
+        await h.calibrator.runDue();
+      }
+      samples.sort((a, b) => a - b); results[kind] = samples;
+      console.log('NEWARCH_C_CORRECTION', JSON.stringify({ kind, n: samples.length, p50: samples[12], p95: samples[23], p99: samples[24], max: samples[24], correctedCellDifference: 0, scope: 'C fake ports, real timers' }));
+      expect(samples[23]!).toBeLessThanOrEqual(300);
+      expect(samples[24]!).toBeLessThanOrEqual(500);
+    }
+  });
+});
+
+import { readFileSync, writeFileSync } from 'node:fs';
+import { cpus } from 'node:os';
+
+// Run the four configurations together to fit the existing 1500s suite ceiling.
+// Each server has its own socket/PID. Report contention and raw per-round values;
+// do not average percentiles or mistake the fake writer for an integrated DB.
+describe('NEWARCH L2-C private tmux CPU measurement', () => {
+  const measurements = new Map<string, { server: number; caller: number }>();
+  const procTicks = (pid: number) => {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return { own: Number(fields[11]) + Number(fields[12]), children: Number(fields[13]) + Number(fields[14]) };
+  };
+  const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+  for (const active of [true, false]) for (let round = 1; round <= 3; round++) for (const mode of ['baseline', 'full', 'incremental'] as const) {
+    test(`60s round=${round} active=${active} capture=${mode} 1/21 panes 80x24/120x40`, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'newarch-c-cpu-'));
+      const configs: Array<{ socket: string; panes: string[]; pid: number; cols: number; rows: number; count: number; ticks: number; bytes: number; samples: number; latencies: number[] }> = [];
+      const tmux = (socket: string, args: string[]) => {
+        const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+        if (result.status !== 0) throw new Error(`private tmux exit=${result.status}: ${result.stderr}`);
+        return result.stdout;
+      };
+      try {
+        const conf = join(root, 'tmux.conf');
+        writeFileSync(conf, 'set -g history-limit 4500\nset -g status off\n');
+        const producer = join(root, 'producer.py');
+        writeFileSync(producer, [
+          'import sys,time',
+          'for i in range(5000): sys.stdout.write("seed-%06d ไทย 你 😀\\r\\n" % i)',
+          'sys.stdout.flush()',
+          'i=0',
+          'end=time.monotonic()+100',
+          'while time.monotonic()<end:',
+          active ? ' for n in range(10):\n  sys.stdout.write("\\x1b[%dmrow-%08d ไทย 你 😀\\x1b[0m\\r\\n" % (31+i%7,i)); i+=1' : ' pass',
+          ' sys.stdout.flush(); time.sleep(.1)',
+        ].join('\n'));
+        for (const [cols, rows] of [[80, 24], [120, 40]]) for (const count of [1, 21]) {
+          const socket = join(root, `${cols}-${count}.sock`);
+          const panes: string[] = [];
+          // Register the socket before creating it so cleanup also covers a
+          // partial setup failure; no default server is ever addressed.
+          const c = { socket, panes, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, samples: 0, latencies: [] as number[] };
+          configs.push(c);
+          for (let pane = 0; pane < count; pane++) {
+            panes.push(tmux(socket, ['-f', conf, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${pane}`, '-x', String(cols), '-y', String(rows), `python3 -u ${quote(producer)}`]).trim());
+          }
+          c.pid = Number(tmux(socket, ['display-message', '-p', '-t', panes[0]!, '#{pid}']).trim());
+          expect(c.pid).toBeGreaterThan(0);
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const hz = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim());
+        expect(hz).toBeGreaterThan(0);
+        for (const c of configs) c.ticks = procTicks(c.pid).own;
+        const parent = procTicks(process.pid);
+        const started = performance.now();
+        let next = started;
+        while (performance.now() - started < 60000) {
+          if (mode === 'baseline') { await new Promise(resolve => setTimeout(resolve, 100)); continue; }
+          for (const c of configs) {
+            const tail = mode === 'full' ? 4500 : active ? 23 : 3;
+            const args: string[] = [];
+            for (const pane of c.panes) {
+              if (args.length) args.push(';');
+              args.push('capture-pane', '-p', '-e', '-N', '-t', pane, '-S', `-${tail}`);
+            }
+            const at = performance.now();
+            c.bytes += Buffer.byteLength(tmux(c.socket, args));
+            c.latencies.push(performance.now() - at); c.samples++;
+          }
+          next += active ? 200 : 1000;
+          await new Promise(resolve => setTimeout(resolve, Math.max(0, next - performance.now())));
+        }
+        const elapsed = performance.now() - started;
+        const after = procTicks(process.pid);
+        const caller = ((after.own + after.children - parent.own - parent.children) / hz) / (elapsed / 1000) * 100;
+        for (const c of configs) {
+          const server = (procTicks(c.pid).own - c.ticks) / hz / (elapsed / 1000) * 100;
+          const key = `${active}/${round}/${c.cols}/${c.count}`;
+          if (mode === 'baseline') measurements.set(key, { server, caller });
+          const base = measurements.get(key)!;
+          c.latencies.sort((a, b) => a - b);
+          const percentile = (p: number) => c.latencies.length ? c.latencies[Math.min(c.latencies.length - 1, Math.ceil(c.latencies.length * p) - 1)] : null;
+          const delta = server - base.server;
+          console.log('NEWARCH_C_CPU', JSON.stringify({ mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, samples: c.samples, captureBytes: c.bytes, serverCpuPercentOneCore: server, baselineServerCpu: base.server, serverDelta: delta, serverTargetPass: mode === 'baseline' ? null : c.count === 21 && active ? delta <= 10 : null, captureBatchP50: percentile(.5), captureBatchP95: percentile(.95), captureBatchP99: percentile(.99), captureBatchMax: c.latencies.at(-1) ?? null, allFourConfigsCallerAndCaptureChildrenCpu: caller, allFourConfigsCallerDelta: caller - base.caller, hz, cpu: cpus()[0]?.model, tmuxVersion: tmux(c.socket, ['-V']).trim(), scope: '4 servers measured concurrently, capture-only; no worker/writer; fixed incremental 20 new rows + 3 anchor at 100 rows/s' }));
+          expect(Number.isFinite(server)).toBe(true);
+          expect(elapsed).toBeGreaterThanOrEqual(60000);
+          if (mode !== 'baseline') expect(c.samples).toBeGreaterThan(0);
+        }
+      } finally {
+        for (const c of configs) spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8' });
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});

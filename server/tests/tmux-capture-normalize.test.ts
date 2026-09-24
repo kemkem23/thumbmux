@@ -89,3 +89,28 @@ describe('tmux capture cell normalization', () => {
     console.log('G0_NORMALIZE', JSON.stringify({ case: 'geometry-change', verdict: 'unknown', assertions: 2 }));
   });
 });
+
+import { decodeTmuxCaptureRows } from '../src/tmux-capture-normalize';
+describe('NEWARCH L2-C observed snapshot cells', () => {
+  test('preserves trailing spaces, blank color, style and default resets', () => {
+    const [row] = decodeTmuxCaptureRows('\x1b[31;44;1mA  \x1b[0m \n', 4);
+    expect(row).toHaveLength(4);
+    expect(row![1]).toEqual({ grapheme: ' ', width: 1, continuation: false, fg: 'index:1', bg: 'index:4', style: 1 });
+    expect(row![3]!.fg).toBe('default');
+    expect(row![3]!.style).toBe(0);
+    expect(decodeTmuxCaptureRows('A  \n\n', 3)).toHaveLength(2);
+  });
+  test('decodes truecolor and wide/Thai cells without Unicode normalization', () => {
+    const [row] = decodeTmuxCaptureRows('\x1b[38;2;1;2;3mก้你❤️ B\n', 6);
+    expect(row!.map(c => c.grapheme)).toEqual(['ก้', '你', '', '❤️', '', 'B']);
+    expect(row![0]!.fg).toBe('rgb:1,2,3');
+    expect(row![2]!.continuation).toBe(true);
+    expect(decodeTmuxCaptureRows('e\u0301\n', 1)[0]![0]!.grapheme).toBe('e\u0301');
+  });
+  test('rejects unsupported escapes, invalid color, and geometry overflow', () => {
+    expect(() => decodeTmuxCaptureRows('\x1b[2J', 8)).toThrow();
+    expect(() => decodeTmuxCaptureRows('\x1b[38;2;300;0;0mX', 8)).toThrow();
+    expect(() => decodeTmuxCaptureRows('你', 1)).toThrow();
+    expect(() => decodeTmuxCaptureRows('X', 0)).toThrow();
+  });
+});

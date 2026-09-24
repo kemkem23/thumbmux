@@ -92,3 +92,90 @@ export function normalizeTmuxCaptureCells(text: string): string {
 
   return normalized;
 }
+
+/** Exact observed cell projection of a capture-pane -e -N row stream.
+ * This decodes a snapshot, not a VT emulator. Unsupported escapes fail closed.
+ * OSC8 and hidden parser state are deliberately not certified by this decoder. */
+export interface TmuxObservedCell {
+  grapheme: string;
+  width: 0 | 1 | 2;
+  continuation: boolean;
+  fg: string;
+  bg: string;
+  style: number;
+}
+export const TMUX_OBSERVED_FIELDS = ['grapheme', 'width', 'continuation', 'fg', 'bg', 'style', 'cursor-position', 'cursor-visible'] as const;
+export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCell[][] {
+  if (!Number.isSafeInteger(cols) || cols < 1) throw new Error('invalid capture width');
+  let fg = 'default', bg = 'default', style = 0;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const lines = normalizeTmuxCaptureCells(raw).split('\n');
+  // capture-pane terminates its serialized last physical row with one LF.
+  if (lines.at(-1) === '') lines.pop();
+  const rows: TmuxObservedCell[][] = [];
+  const applySgr = (body: string) => {
+    if (!/^[0-9;]*$/.test(body)) throw new Error('unsupported capture SGR');
+    const codes = body === '' ? [0] : body.split(';').map(x => x === '' ? 0 : Number(x));
+    for (let i = 0; i < codes.length; i++) {
+      const n = codes[i]!;
+      if (n === 0) { fg = bg = 'default'; style = 0; }
+      else if (n >= 1 && n <= 9) style |= 1 << (n - 1);
+      else if (n === 21) style = (style & ~8) | 512;
+      else if (n === 22) style &= ~3;
+      else if (n === 23) style &= ~4;
+      else if (n === 24) style &= ~(8 | 512);
+      else if (n === 25) style &= ~(16 | 32);
+      else if (n === 27) style &= ~64;
+      else if (n === 28) style &= ~128;
+      else if (n === 29) style &= ~256;
+      else if (n === 39) fg = 'default';
+      else if (n === 49) bg = 'default';
+      else if (n >= 30 && n <= 37) fg = `index:${n - 30}`;
+      else if (n >= 40 && n <= 47) bg = `index:${n - 40}`;
+      else if (n >= 90 && n <= 97) fg = `index:${n - 90 + 8}`;
+      else if (n >= 100 && n <= 107) bg = `index:${n - 100 + 8}`;
+      else if (n === 38 || n === 48) {
+        const mode = codes[++i];
+        const count = mode === 5 ? 1 : mode === 2 ? 3 : 0;
+        if (!count) throw new Error('unsupported capture color');
+        const values = codes.slice(i + 1, i + count + 1);
+        if (values.length !== count || values.some(v => !Number.isInteger(v) || v < 0 || v > 255)) throw new Error('invalid capture color');
+        i += count;
+        const color = mode === 5 ? `index:${values[0]}` : `rgb:${values.join(',')}`;
+        if (n === 38) fg = color; else bg = color;
+      } else throw new Error(`unobserved capture SGR ${n}`);
+    }
+  };
+  for (const line of lines) {
+    const cells: TmuxObservedCell[] = [];
+    let at = 0;
+    while (at < line.length) {
+      if (line.charCodeAt(at) === ESC) {
+        const match = /^\x1b\[([0-9;:]*)m/.exec(line.slice(at));
+        if (!match) throw new Error('unsupported capture escape');
+        applySgr(match[1]!); at += match[0].length; continue;
+      }
+      const next = line.indexOf('\x1b', at);
+      const text = line.slice(at, next < 0 ? line.length : next);
+      for (const { segment } of segmenter.segment(text)) {
+        if (/[\x00-\x1f\x7f]/.test(segment)) throw new Error('control byte in capture cells');
+        let width: 0 | 1 | 2 = 0;
+        for (const ch of segment) width = Math.max(width, charCellWidth(ch.codePointAt(0)!)) as 0 | 1 | 2;
+        if (segment.includes('\ufe0f') && width === 1) width = 2;
+        if (width === 0) {
+          const previous = cells.findLast(c => !c.continuation);
+          if (!previous) throw new Error('orphan combining capture cell');
+          previous.grapheme += segment;
+          continue;
+        }
+        cells.push({ grapheme: segment, width, continuation: false, fg, bg, style });
+        if (width === 2) cells.push({ grapheme: '', width: 0, continuation: true, fg, bg, style });
+      }
+      at += text.length;
+    }
+    if (cells.length > cols) throw new Error('capture row exceeds geometry');
+    while (cells.length < cols) cells.push({ grapheme: ' ', width: 1, continuation: false, fg: 'default', bg: 'default', style: 0 });
+    rows.push(cells);
+  }
+  return rows;
+}
