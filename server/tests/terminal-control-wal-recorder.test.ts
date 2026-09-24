@@ -961,6 +961,11 @@ test('FIX1 full matcher p95 at 4500 rows, independent cells and collision bucket
     const result = matchHistoryRows(recent, captured, naScope);
     expect(result.checks.some(c => c.lineId === 2201)).toBe(false);
     expect(result.repairs.some(c => c.lineId === 2201)).toBe(true);
+    // Two drifts force the general interning path, not the single-row fast path.
+    captured[2202]!.cells[cols - 1]!.fg = 'index:8';
+    const general = matchHistoryRows(recent, captured, naScope);
+    expect(general.checks.some(c => c.lineId === 2201 || c.lineId === 2203)).toBe(false);
+    expect(general.repairs.map(r => r.lineId)).toEqual([2201, 2203]);
   }
 });
 
@@ -1006,23 +1011,28 @@ test('FIX1 pipe publishes during capture and revision is read after 100 rows/s o
   const h = naHarness();
   const capture = h.ports.capture;
   const read = h.ports.read;
-  let revision = 1, commits = 0, pipe = 0;
+  let revision = 1, commits = 0, pipe = 0, updates = 0, flowingMs = 0;
+  const started = performance.now();
+  h.ports.now = () => performance.now() - started;
   h.ports.read = () => ({ ...read(), revision });
   h.ports.calibrate = async input => {
     expect(input.expectedRevision).toBe(revision);
     commits++; return { revision: ++revision, durableRevision: 0, nextLineId: 4 };
   };
   h.ports.capture = async (key, limit) => {
+    const flowStarted = performance.now();
     for (let n = 0; n < 10; n++) {
-      await new Promise(resolve => setTimeout(resolve, 10)); revision++;
-      h.time(n * 10); h.calibrator.output(() => pipe++);
+      const deadline = flowStarted + (n + 1) * 10;
+      while (performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, Math.max(1, deadline - performance.now())));
+      revision++; updates++; h.calibrator.output(() => pipe++);
       await h.calibrator.runDue();
     }
+    flowingMs = performance.now() - flowStarted;
     return capture(key, limit);
   };
   await h.calibrator.runDue();
   expect(commits).toBe(1); expect(pipe).toBeGreaterThan(0);
-  console.log('NEWARCH_FIX1_CAS', JSON.stringify({ rowsPerSecond: 100, commits, pipe }));
+  console.log('NEWARCH_FIX1_CAS', JSON.stringify({ targetRowsPerSecond: 100, revisionUpdates: updates, elapsedMs: flowingMs, observedUpdatesPerSecond: updates * 1000 / flowingMs, commits, pipe, scope: 'revision-per-row simulation during capture; fake writer' }));
 });
 
 test('FIX1 hung capture has a deadline and heartbeat can alert after recovery', async () => {
