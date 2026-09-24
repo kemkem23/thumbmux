@@ -199,39 +199,49 @@ export class IncrementalHistoryMatcher {
     if (scope.completeRetainedTail) return matchHistoryRows(recent, captured, scope);
     const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
     if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
-    const [a, b] = internRows([recent, captured]) as [number[], number[]];
-    const base = a.length + b.length + 1;
-  const at = triples(a, base), bt = triples(b, base);
-    const anchors: Array<[number, number]> = [];
-    const exactAnchors: Array<[number, number]> = [];
-    for (const [key, positions] of at) {
-      const other = bt.get(key);
-      if (positions.length !== 1 || other?.length !== 1) continue;
-      const i = positions[0]!, j = other[0]!;
-      exactAnchors.push([i, j]);
-      if ([0, 1, 2].every(n => {
-        const row = recent[i + n]!, prior = this.checked.get(row.lineId);
-        return prior !== undefined && equalHistoryRows(prior, row);
-      })) anchors.push([i, j]);
-    }
-    if (!anchors.length) return empty('partial-tail');
-    const offset = anchors[0]![1] - anchors[0]![0];
-    if (exactAnchors.some(([i, j]) => j - i !== offset)) return empty('ambiguous');
-    const result = empty('matched');
-    const checked = new Set<number>();
-    // A changed row remains unchecked. Independent unique triples on each
-    // side can certify their own exact runs, but never repair across the gap.
-    for (const [start, captureStart] of exactAnchors) {
-      for (const direction of [1, -1]) {
-        for (let i = start, j = captureStart; i >= 0 && j >= 0 && i < a.length && j < b.length; i += direction, j += direction) {
-          if (a[i] !== b[j]) break;
-          if (checked.has(i)) { if (i !== start) break; else continue; }
-          checked.add(i);
-          result.checks.push({ lineId: recent[i]!.lineId, capturedRow: j });
+    const prior = [...this.checked.entries()];
+    if (prior.length !== 3) return empty('partial-tail');
+    const first = recent.findIndex(row => row.lineId === prior[0]![0]);
+    if (first < 0 || prior.some(([id, row], n) => recent[first + n]?.lineId !== id || !equalHistoryRows(row, recent[first + n]!))) return empty('partial-tail');
+    const locate = (rows: readonly CapturedRow[], pattern: readonly CapturedRow[]): number => {
+      if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return -1;
+      let probe = 0;
+      for (let x = 0; x < pattern[0]!.cells.length; x++) {
+        if (pattern[0]!.cells[x]!.grapheme !== pattern[1]!.cells[x]?.grapheme
+          || pattern[0]!.cells[x]!.grapheme !== pattern[2]!.cells[x]?.grapheme) { probe = x; break; }
+      }
+      const glyph = pattern[0]!.cells[probe]?.grapheme;
+      let found = -1;
+      for (let i = 0; i + 2 < rows.length; i++) {
+        if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
+        if (equalHistoryRows(rows[i]!, pattern[0]!) && equalHistoryRows(rows[i + 1]!, pattern[1]!) && equalHistoryRows(rows[i + 2]!, pattern[2]!)) {
+          if (found >= 0) return -1;
+          found = i;
         }
       }
+      return found;
+    };
+    const pattern = prior.map(([, row]) => row);
+    const at = locate(captured, pattern);
+    if (at < 0 || locate(recent, pattern) !== first) return empty('ambiguous');
+    const offset = at - first;
+    const result = empty('matched');
+    // Scan only the captured overlap. The saved triple certifies its exact run;
+    // runs beyond changed rows need their own globally unique triple. No repair
+    // or inferred index shift is ever made by an incremental capture.
+    let i = Math.max(0, -offset);
+    while (i < recent.length && i + offset < captured.length) {
+      if (!equalHistoryRows(recent[i]!, captured[i + offset]!)) { i++; continue; }
+      const start = i;
+      while (i < recent.length && i + offset < captured.length && equalHistoryRows(recent[i]!, captured[i + offset]!)) i++;
+      let anchored = start <= first && i >= first + 3;
+      for (let k = start; !anchored && k + 2 < i; k++) {
+        const triple = recent.slice(k, k + 3);
+        anchored = locate(recent, triple) === k && locate(captured, triple) === k + offset;
+      }
+      if (anchored) for (let k = start; k < i; k++) result.checks.push({ lineId: recent[k]!.lineId, capturedRow: k + offset });
     }
-    result.checks.sort((x, y) => x.capturedRow - y.capturedRow);
+    if (at + 3 < captured.length && !result.checks.some(check => check.capturedRow >= at + 3)) result.reason = 'ambiguous';
     return result;
   }
   remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {

@@ -72,7 +72,7 @@ export function normalizeTmuxCaptureCells(text: string): string {
       continue;
     }
 
-    const width = charCellWidth(codePoint);
+    const width = codePoint >= 0x20 && codePoint < 0x7f ? 1 : charCellWidth(codePoint);
     if (promotedPaddingPending && codePoint === 0x20) {
       promotedPaddingPending = false;
       index += 1;
@@ -176,7 +176,8 @@ export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCe
         for (const segment of pieces) {
         if (/[\x00-\x1f\x7f]/.test(segment)) throw new Error('control byte in capture cells');
         let width: 0 | 1 | 2 = 0;
-        width = Math.min(2, stringCells(segment)) as 0 | 1 | 2;
+        width = segment.length === 1 && segment.charCodeAt(0) >= 0x20 && segment.charCodeAt(0) < 0x7f
+          ? 1 : Math.min(2, stringCells(segment)) as 0 | 1 | 2;
         if (segment.includes('\ufe0f') && width === 1) width = 2;
         if (width === 0) {
           const previous = cells.findLast(c => !c.continuation);
