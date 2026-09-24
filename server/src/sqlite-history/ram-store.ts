@@ -102,14 +102,14 @@ export class ProjectionRam {
     const {revision,durableRevision,nextLineId}=this.token(key);
     return {revision,durableRevision,nextLineId};
   }
-  append(event: ScrollEvent): ProjectionReceipt {
+  append(event: ScrollEvent, preparedCells?:string): ProjectionReceipt {
     validateRow(event.physicalRow); integer(event.receiveSeq);
     if (typeof event.softWrap !== 'boolean') throw new Error('invalid-soft-wrap');
     const p=this.ensure(event.paneKey,event.sourceEpoch,event.geometryGeneration), id=paneId(event.paneKey);
     integer(Number(p.next_line_id)+1);
     if (event.sourceEpoch === Number(p.source_epoch) && event.receiveSeq < Number(p.receive_seq)) throw new Error('stale-receive-seq');
     this.db.query('INSERT INTO na_line VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)').run(id,event.sourceEpoch,p.next_line_id,
-      Number(p.revision)+1,event.geometryGeneration,event.physicalRow.text,encodeCells(event.physicalRow.cells),
+      Number(p.revision)+1,event.geometryGeneration,event.physicalRow.text,preparedCells??encodeCells(event.physicalRow.cells),
       +event.softWrap,'unchecked','awaiting-capture');
     this.db.query('UPDATE na_pane SET next_line_id=next_line_id+1,receive_seq=? WHERE pane_key=?').run(event.receiveSeq,id);
     this.db.query("UPDATE na_line SET check_reason='evicted-before-check',revision=? WHERE pane_key=? AND line_id=? AND check_state='unchecked'")

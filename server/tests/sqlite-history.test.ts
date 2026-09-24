@@ -494,3 +494,15 @@ test('newarch: eviction query plan seeks the line-id range, never the whole dura
   expect(actual.some(r=>r.detail.includes('sqlite_autoindex_na_line_2')&&r.detail.includes('line_id<?'))).toBe(true);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+
+test('newarch: admission freezes cell content before caller mutates the original event',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-freeze-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const event=naEvent('AB',1),expected=structuredClone(event.physicalRow),key={...event.paneKey};
+  const pending=s.appendScroll(event);
+  event.physicalRow.text='changed';event.physicalRow.cells[0].grapheme='X';event.paneKey={...key,paneId:'%other'};
+  await pending;s.flush();
+  const line=s.readPage(s.token(key),null,1).lines[0];expect(line.text).toBe(expected.text);expect(line.cells).toEqual(expected.cells);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});

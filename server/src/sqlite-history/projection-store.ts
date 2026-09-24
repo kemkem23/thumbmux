@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from './schema';
-import { ProjectionRam, paneId, upsert, decodeFrameCells, type SqlRow } from './ram-store';
+import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, validateRow, type SqlRow } from './ram-store';
 import { readProjectionPage } from './projection-reader';
 import type { PaneKey, ProjectionCalibration, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -126,7 +126,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=75)))this.flushAsync();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=50)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
@@ -239,7 +239,17 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
 
   }
-  appendScroll(event:ScrollEvent):Promise<ProjectionReceipt> {return this.enqueue(event.paneKey,event,e=>this.ram.append(e));}
+  appendScroll(event:ScrollEvent):Promise<ProjectionReceipt> {
+    try {
+      // Freeze the physical cells once, in the same lossless representation held
+      // by RAM/disk. Queues retain strings, not hundreds of cloned cell objects.
+      const text=event.physicalRow.text,cells=event.physicalRow.cells;
+      validateRow({text,cells});
+      const frozen={paneKey:{...event.paneKey},sourceEpoch:event.sourceEpoch,geometryGeneration:event.geometryGeneration,
+        receiveSeq:event.receiveSeq,softWrap:event.softWrap,physicalRow:{text,cells:[]},encodedCells:encodeCells(cells)};
+      return this.enqueue(frozen.paneKey,frozen,e=>this.ram.append(e,e.encodedCells));
+    }catch(error){return Promise.reject(error);}
+  }
   replaceScreen(frame:ProjectionFrame):Promise<ProjectionReceipt> {
     // A live frame replaces the previous frame immediately, even under scroll pressure.
     try {

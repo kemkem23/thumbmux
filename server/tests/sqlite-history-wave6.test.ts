@@ -586,15 +586,15 @@ async function measureProjectionLoad(cols:number,rows:number) {
    const timings:Record<string,{calls:number,totalMs:number,maxMs:number}>={};
    const instrument=(target:any,name:string,label=name)=>{
      const original=target[name].bind(target),t=timings[label]={calls:0,totalMs:0,maxMs:0};
-     target[name]=(...args:any[])=>{const start=performance.now();try{return original(...args);}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
+     target[name]=(...args:any[])=>{const start=performance.now();try{const result=original(...args);if(name==='acknowledge')ages.push((s as any).lastFlushAgeMs);return result;}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
    };
-   for(const name of ['owner','enqueue','pump','snapshot','acknowledge','replaceScreen'])instrument(s,name);
+   for(const name of ['owner','appendScroll','enqueue','pump','snapshot','acknowledge','replaceScreen'])instrument(s,name);
    for(const name of ['append','screen','bytes','evict'])instrument((s as any).ram,name,'ram.'+name);
    const keys=Array.from({length:21},(_,i)=>({serverIdentity:'open-loop',paneId:`%${i}`,birthGeneration:1}));
    const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
    const cells=Array.from({length:rows},()=>Array.from({length:cols},()=>cell(' ')));
    const pending:number[]=[],ages:number[]=[],rss:number[]=[],screens:number[]=[],sampleGaps:number[]=[];
-   const active=new Set<Promise<unknown>>();let refused=0,screenRefused=0,accepted=0,produced=0,frames=0,lastCommit:number|null=null;
+   const active=new Set<Promise<unknown>>();let refused=0,screenRefused=0,accepted=0,produced=0,frames=0;
    let missing=0,extra=0,wrong=0;
    const track=(p:Promise<unknown>)=>{active.add(p);void p.finally(()=>active.delete(p));};
    try{
@@ -619,7 +619,6 @@ async function measureProjectionLoad(cols:number,rows:number) {
       }
       if(now>=nextSample) {
         const h=s.health();pending.push(h.pendingBytes);rss.push(h.rssBytes);sampleGaps.push(now-sampled);sampled=now;nextSample=now+20;
-        if(h.lastCommitAt!==null&&h.lastCommitAt!==lastCommit){ages.push(h.lastFlushAgeMs);lastCommit=h.lastCommitAt;}
       }
       await Bun.sleep(1);
     }
