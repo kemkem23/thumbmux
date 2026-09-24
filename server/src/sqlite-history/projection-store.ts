@@ -202,7 +202,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
       const frozen=structuredClone(input), bytes=Buffer.byteLength(JSON.stringify(frozen))+512;
-      const value=(isScroll || liveFrame?frozen:frozen.capture) as ScrollEvent;
+      const value=(isScroll || liveFrame?frozen:(frozen as ProjectionCalibration).capture) as ScrollEvent;
       const id=paneId(key);
       if(!liveFrame && (this.pendingBytes()+bytes>PENDING_MAX-64*1024 || this.ram.bytes()+bytes>CACHE_MAX)) {
         this.stopped=true;if(isScroll)this.rejectedRows++;
