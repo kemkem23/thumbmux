@@ -410,7 +410,7 @@ class PrivateTmuxProbe {
     lines.push(`cat ${shQuote(this.source)}`);
     lines.push(`: > ${shQuote(this.producerDone)}`);
     if (options.waitForClientBeforePayload) {
-      lines.push(`/usr/bin/tmux -S ${shQuote(this.socket)} detach-client -a`);
+      lines.push(`/usr/bin/tmux -S ${shQuote(this.socket)} detach-client -s ${shQuote(this.session)}`);
       lines.push(`: > ${shQuote(this.detached)}`);
     }
     lines.push(`while [ ! -f ${shQuote(this.stop)} ]; do sleep 0.01; done`);
@@ -603,21 +603,22 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
     }
   });
 
-  test('corpus: pipe EOF is observable but bytes after EOF are not recoverable from the pipe', async () => {
+  test('corpus: independent reader EOF marker detects truncation even if pane_pipe stays active', async () => {
     const payload = Buffer.from('ABCDEFGHIJ');
     const probe = new PrivateTmuxProbe(payload, {
-      pipeCommand: output => `head -c 4 > ${shQuote(output)}`,
+      pipeCommand: output => `head -c 4 > ${shQuote(output)}; : > ${shQuote(`${output}.eof`)}`,
     });
     try {
       await probe.start();
       await probe.waitProducerDone();
       await waitUntil('short pipe output', () => probe.pipeBytes().length === 4);
-      await waitUntil('pane_pipe EOF state', () => probe.panePipe() === '0');
+      await waitUntil('independent reader EOF marker', () => existsSync(`${probe.pipeOutput}.eof`));
       expect(probe.pipeBytes().toString()).toBe('ABCD');
-      expect(probe.panePipe()).toBe('0');
+      expect(existsSync(`${probe.pipeOutput}.eof`)).toBe(true);
       expect(probe.pipeBytes()).not.toEqual(payload);
       corpus('pipe EOF', 3, 'unknown');
-      fault('pipe reader EOF', probe.panePipe() === '0' && probe.pipeBytes().length !== payload.length);
+      console.log('G0_EOF_OBSERVATION', JSON.stringify({ panePipe: probe.panePipe(), readerClosed: true, received: probe.pipeBytes().length, produced: payload.length }));
+      fault('pipe reader EOF', existsSync(`${probe.pipeOutput}.eof`) && probe.pipeBytes().length !== payload.length);
     } finally {
       await probe.close();
     }
