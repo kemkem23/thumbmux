@@ -585,6 +585,13 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
  try{
   for(const [cols,rows] of [[80,24],[120,40]]) {
    const s=createProjectionStore({historyRoot:join(root,`${cols}`),mode:'create'});
+   const timings:Record<string,{calls:number,totalMs:number,maxMs:number}>={};
+   const instrument=(target:any,name:string,label=name)=>{
+     const original=target[name].bind(target),t=timings[label]={calls:0,totalMs:0,maxMs:0};
+     target[name]=(...args:any[])=>{const start=performance.now();try{return original(...args);}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
+   };
+   for(const name of ['owner','enqueue','pump','snapshot','acknowledge','replaceScreen'])instrument(s,name);
+   for(const name of ['append','screen','bytes','evict'])instrument((s as any).ram,name,'ram.'+name);
    const keys=Array.from({length:21},(_,i)=>({serverIdentity:'open-loop',paneId:`%${i}`,birthGeneration:1}));
    const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
    const cells=Array.from({length:rows},()=>Array.from({length:cols},()=>cell(' ')));
@@ -593,6 +600,7 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
    let missing=0,extra=0,wrong=0;
    const track=(p:Promise<unknown>)=>{active.add(p);void p.finally(()=>active.delete(p));};
    try{
+    const cpuStart=process.cpuUsage(),rssStart=process.memoryUsage().rss;
     const start=performance.now();let sampled=start,nextSample=start;
     const feed=(due:number)=>{
       for(;produced<due;produced++)for(let i=0;i<keys.length;i++) {
@@ -628,7 +636,8 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
       }while(anchor!==null);
       missing+=Math.max(0,6000-seen);extra+=Math.max(0,seen-6000);
     }
-    const result={panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
+    const cpu=process.cpuUsage(cpuStart);
+    const result={timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
       pendingBytes:stats(pending),flushAgeMs:stats(ages),screenResolveMs:stats(screens),rssBytes:stats(rss),healthSampleGapMs:stats(sampleGaps),missing,extra,wrong};
     results.push(result);console.log('NA_OPEN_LOOP',JSON.stringify(result));
    }finally{await s.close();}
