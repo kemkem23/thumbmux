@@ -3,6 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { PROJECTION_SCHEMA } from './schema';
 import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
+// Schema 2's UNIQUE(pane_key,line_id) is sqlite_autoindex_na_line_2.
+// Pin that range: the revision index otherwise walks every durable resident row.
+export const EVICT_LINES_SQL='DELETE FROM na_line INDEXED BY sqlite_autoindex_na_line_2 WHERE pane_key=? AND line_id<? AND revision<=?';
+
 export type SqlRow = Record<string, string | number | null>;
 export const paneId = (key: PaneKey): string => {
   if (!key.serverIdentity || !key.paneId) throw new Error('invalid-pane-key');
@@ -69,7 +73,7 @@ export function upsert(db: Database, table: string, row: SqlRow): void {
 /** Only the bounded live working set lives here. Disk history is never loaded wholesale. */
 export class ProjectionRam {
   readonly db = new Database(':memory:', {strict:true});
-  constructor() { this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;'); this.db.exec(PROJECTION_SCHEMA); }
+  constructor() { this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;'); this.db.exec(PROJECTION_SCHEMA);this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_key,checked_capture_id)'); }
   pane(key: PaneKey): SqlRow {
     const row = this.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(paneId(key)) as SqlRow | null;
     if (!row) throw new Error('unknown-pane');
@@ -161,7 +165,7 @@ export class ProjectionRam {
   evict(panes: SqlRow[]): void {
     // Indexed ranges only for committed panes; never visit every resident line.
     for (const p of panes) {
-      this.db.query('DELETE FROM na_line WHERE pane_key=? AND line_id<? AND revision<=?')
+      this.db.query(EVICT_LINES_SQL)
         .run(p.pane_key, Math.max(0, Number(p.next_line_id)-5000), p.revision);
       this.db.query(`DELETE FROM na_capture WHERE pane_key=? AND revision<=?
         AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=na_capture.pane_key AND l.checked_capture_id=na_capture.capture_id)

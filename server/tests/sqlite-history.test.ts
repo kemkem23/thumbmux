@@ -449,7 +449,7 @@ test('newarch v2: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
 },30000);
 
 
-import { encodeCells, decodeCells } from '../src/sqlite-history/ram-store';
+import { encodeCells, decodeCells, EVICT_LINES_SQL } from '../src/sqlite-history/ram-store';
 test('newarch: compact cells preserve every field, legacy v2 runs and screen recovery',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-cell-runs-'));
  const cells:ProjectionCell[]=[{grapheme:'漢',width:2,continuation:false,fg:'#123456',bg:4,style:7},
@@ -480,4 +480,17 @@ test('newarch: queued old writer is fenced before RAM acknowledgement and disk c
   await current.appendScroll(naEvent('new writer',2));current.flush();
   expect(current.readPage(current.token(naKey),null,10).lines.map(r=>r.text)).toEqual(['durable','new writer']);
  }finally{await old.close();await current?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: eviction query plan seeks the line-id range, never the whole durable revision range',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-evict-plan-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const db=(s as any).ram.db as Database;
+  const plan=(sql:string)=>db.query('EXPLAIN QUERY PLAN '+sql).all('pane',1000,6000) as Array<{detail:string}>;
+  const previous=plan(EVICT_LINES_SQL.replace(' INDEXED BY sqlite_autoindex_na_line_2',''));
+  const actual=plan(EVICT_LINES_SQL);
+  console.log('NA_EVICT_PLAN',JSON.stringify({previous,actual}));
+  expect(actual.some(r=>r.detail.includes('sqlite_autoindex_na_line_2')&&r.detail.includes('line_id<?'))).toBe(true);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
