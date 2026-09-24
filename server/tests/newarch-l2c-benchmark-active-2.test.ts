@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir, cpus } from 'node:os';
 import { join } from 'node:path';
 
@@ -59,6 +59,13 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           }
           c.pid = Number(tmux(socket, ['display-message', '-p', '-t', panes[0]!, '#{pid}']).trim());
           expect(c.pid).toBeGreaterThan(0);
+        }
+        // Seeding 44 panes is asynchronous; a fixed sleep can precede the
+        // final producer's first sidecar. Begin measurement only after all are ready.
+        const readyBy = performance.now() + 10000;
+        while (!configs.every(c => c.sidecars.every(path => existsSync(path)))) {
+          if (performance.now() >= readyBy) throw new Error('producer sidecars not ready');
+          await new Promise(resolve => setTimeout(resolve, 25));
         }
         await new Promise(resolve => setTimeout(resolve, 500));
         const hz = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim());

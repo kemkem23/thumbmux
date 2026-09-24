@@ -834,8 +834,11 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
         // Offset injection from calibration; include all waiting and publish.
         await new Promise(resolve => setTimeout(resolve, 7 + (n * 17) % 37));
         injected = performance.now(); h.parser(wrong); h.calibrator.output();
-        const delay = Math.max(0, h.calibrator.dueAt - h.ports.now());
-        await new Promise(resolve => setTimeout(resolve, Math.ceil(delay)));
+        // Timers can wake before a fractional monotonic deadline. The host
+        // re-arms in that case; model that wait instead of reading an old publish.
+        while (h.ports.now() < h.calibrator.dueAt) {
+          await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(h.calibrator.dueAt - h.ports.now()))));
+        }
         await h.calibrator.runDue();
         samples.push(corrected - injected);
         expect(corrected).toBeGreaterThanOrEqual(injected);
