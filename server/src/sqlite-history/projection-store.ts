@@ -20,7 +20,7 @@ function admitPath(options: ProjectionOptions): string {
   if(file===root || !file.startsWith(root+sep) || file.split(sep).some(p=>/^brain\.db(?:$|[-.])/i.test(p))) throw new Error('forbidden-database-path');
   // Check every existing component before creating anything or calling SQLite.
   for(const candidate of [file,file+'-wal',file+'-shm',file+'-journal']) {
-    let current=sep;
+    let current:string=sep;
     for(const part of candidate.split(sep).filter(Boolean)) {
       current=join(current,part);
       let stat; try { stat=lstatSync(current); } catch(error) { if((error as NodeJS.ErrnoException).code==='ENOENT') continue; throw error; }
