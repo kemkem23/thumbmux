@@ -1459,7 +1459,7 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
     };
     const label = (text: string) => text.replace(/\s+$/, '').slice(0, 40);
     let disrupted = false;
-    
+
     let calibrator!: HistoryCalibrator;
     const resize = () => {
       const [x, y] = opts.resizeTo ?? [40, 12];
@@ -1615,7 +1615,7 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
 }
 
 
- test('DEBT2 clear-history then reprint the same tail must certify no deleted identities', async () => {
+test('DEBT2 clear-history then reprint the same tail must certify no deleted identities', async () => {
   const sig = Array.from({ length: 8 }, (_, i) => `sig-${i}-UNIQUE-TAIL`);
   const screen = Array.from({ length: 24 }, (_, i) => `screen-A-${i}`);
   const result = await runScenario('clear-reprint', 'clear-reprint-before', {
@@ -1630,7 +1630,7 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
   expect(result.commits).toBe(0);
 }, 15000);
 
- test('DEBT2 missing, changed and invalid history epochs fail closed; valid epoch recovers', async () => {
+test('DEBT2 missing, changed and invalid history epochs fail closed; valid epoch recovers', async () => {
   for (const epoch of [undefined, NaN, Infinity, -1, 1.5, 2]) {
     const h = naHarness(true);
     const capture = h.ports.capture;
