@@ -73,6 +73,7 @@ export type PipeVtFrame = {
 };
 
 export type PipeVtUpdate = {
+  epoch: number;
   seqFrom: number | null;
   seqTo: number | null;
   gen: number;
@@ -85,7 +86,7 @@ export type PipeVtUpdate = {
 export type PipeVtReady = { vendorSha256: string; cols: number; rows: number; pid: number };
 
 export type PipeVtFault = {
-  kind: "worker-exit" | "worker-error" | "protocol" | "vendor-hash" | "spawn";
+  kind: "worker-exit" | "worker-error" | "protocol" | "vendor-hash" | "spawn" | "clear-policy-unknown";
   at: number;
   message: string;
 };
@@ -116,10 +117,10 @@ export function verifyPipeVtAssets(assets: PipeVtAssets): string {
 
 export type PipeVtWorkerOptions = {
   sourceEpoch?: number;
-  onHistoryClear?: (event: { seq: number; epoch: number }) => void;
+  onHistoryClear?: (event: { seq: number; epoch: number }) => unknown;
   cols: number;
   rows: number;
-  onUpdate: (update: PipeVtUpdate) => void;
+  onUpdate: (update: PipeVtUpdate) => unknown;
   onFault: (fault: PipeVtFault) => void;
   assets?: PipeVtAssets;
   python?: string;
@@ -144,6 +145,8 @@ export class PipeVtWorker {
   private inputDir: string | null = null;
   private inputFd: number | null = null;
   private queue: Buffer[] = [];
+  private queuedBytes = 0;
+  private outputTail: Promise<void> = Promise.resolve();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
@@ -195,12 +198,17 @@ export class PipeVtWorker {
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
     });
-    child.stdout?.on("data", (chunk: Buffer) => this.onStdout(chunk));
+    child.stdout?.on("data", (chunk: Buffer) => {
+      child.stdout?.pause();
+      this.outputTail = this.outputTail.then(() => this.onStdout(chunk)).catch((error) => {
+        this.notifyFault({ kind: "protocol", at: now(), message: String(error) });
+      }).finally(() => child.stdout?.resume());
+    });
     child.on("error", (error) => {
       this.notifyFault({ kind: "spawn", at: now(), message: error.message });
       this.readyReject?.(error);
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       this.exited = true;
       this.releaseInput();
       if (!this.closing) {
@@ -213,12 +221,17 @@ export class PipeVtWorker {
     return this.ready;
   }
 
-  private onStdout(chunk: Buffer): void {
+  private async onStdout(chunk: Buffer): Promise<void> {
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
     let offset = 0;
     while (this.pending.length - offset >= 5) {
       const kind = String.fromCharCode(this.pending[offset]!);
       const length = this.pending.readUInt32BE(offset + 1);
+      if (length > 16 * 1024 * 1024) {
+        this.pending = Buffer.alloc(0);
+        this.child?.kill("SIGKILL");
+        throw new Error("worker output exceeds 16 MiB frame bound");
+      }
       if (this.pending.length - offset < 5 + length) break;
       const body = this.pending.subarray(offset + 5, offset + 5 + length).toString("utf8");
       offset += 5 + length;
@@ -229,15 +242,21 @@ export class PipeVtWorker {
         this.notifyFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: (error as Error).message });
         continue;
       }
-      if (kind === "U") this.options.onUpdate(message as PipeVtUpdate);
-      else if (kind === "H") this.options.onHistoryClear?.(message as { seq: number; epoch: number });
+      if (kind === "U" || kind === "H") {
+        try {
+          if (kind === "U") await this.options.onUpdate(message as PipeVtUpdate);
+          else await this.options.onHistoryClear?.(message as { seq: number; epoch: number });
+        } catch (error) {
+          this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
+        }
+      }
       else if (kind === "R") {
         this.readyResolve?.(message as PipeVtReady);
         this.readyResolve = null;
       } else if (kind === "E") {
         const error = message as { kind?: string; message?: string };
         this.notifyFault({
-          kind: error.kind === "vendor-hash" ? "vendor-hash" : "worker-error",
+          kind: error.kind === "vendor-hash" ? "vendor-hash" : error.kind === "clear-policy-unknown" ? "clear-policy-unknown" : "worker-error",
           at: (this.options.now ?? Date.now)(),
           message: String(error.message ?? ""),
         });
@@ -250,7 +269,10 @@ export class PipeVtWorker {
 
   private write(parts: Buffer[]): boolean {
     if (this.inputFd === null || this.exited) return false;
+    const bytes = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    if (this.queuedBytes + bytes > 1024 * 1024) return false;
     this.queue.push(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
+    this.queuedBytes += bytes;
     this.flush();
     return this.inputFd !== null;
   }
@@ -273,10 +295,11 @@ export class PipeVtWorker {
         }
       }
       if (written === head.length) {
+        this.queuedBytes -= written;
         this.queue.shift();
         continue;
       }
-      if (written > 0) this.queue[0] = head.subarray(written);
+      if (written > 0) { this.queuedBytes -= written; this.queue[0] = head.subarray(written); }
       this.flushTimer ??= setTimeout(() => this.flush(), 1);
       return;
     }
@@ -286,6 +309,7 @@ export class PipeVtWorker {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     this.queue = [];
+    this.queuedBytes = 0;
     if (this.inputFd !== null) {
       try { closeSync(this.inputFd); } catch {}
       this.inputFd = null;
@@ -306,6 +330,13 @@ export class PipeVtWorker {
 
   setScrollOnClear(enabled: boolean): boolean {
     return this.write([header("C", 1), Buffer.from([Number(enabled)])]);
+  }
+
+  /** Ordered parser reset: unlike RIS, drops alt, decoder, DCS and saved modes. */
+  reset(epoch: number): boolean {
+    const payload = Buffer.allocUnsafe(8);
+    payload.writeBigUInt64BE(BigInt(epoch));
+    return this.write([header("X", 8), payload]);
   }
 
   resize(cols: number, rows: number, geometryGeneration: number): boolean {
@@ -329,7 +360,7 @@ export class PipeVtWorker {
     const exited = new Promise<void>((resolve) => this.exitWaiters.push(resolve));
     this.write([header("Q", 0)]);
     const timer = setTimeout(() => this.child?.kill("SIGKILL"), timeoutMs);
-    return exited.finally(() => clearTimeout(timer));
+    return exited.then(() => this.outputTail).finally(() => clearTimeout(timer));
   }
 
   /** Test/fault hook: kill the worker without the orderly quit frame. */

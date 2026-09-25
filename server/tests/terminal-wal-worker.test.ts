@@ -949,6 +949,7 @@ type MeasureConfig = {
   baseline: boolean;
   idleSeconds: number;
   count?: number;
+  warmupSeconds?: number;
 };
 
 const MEASURE_CONFIGS: Record<typeof L2P_MEASURE, MeasureConfig> = {
@@ -1094,7 +1095,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
   const socket = join(dir, "x.sock");
   const producer = join(dir, "producer.py");
   writeFileSync(producer, PRODUCER_SCRIPT);
-  const count = cfg.count ?? cfg.rate * (cfg.seconds + 3);
+  const count = cfg.count ?? cfg.rate * (cfg.seconds + (cfg.warmupSeconds ?? 0) + 3);
   const panes: Array<{ name: string; fifo: string; pane?: LightPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
   const samples = JSON.stringify(PRODUCER_SAMPLES);
   const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
@@ -1123,6 +1124,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     const serverPid = Number(privateTmux(socket, ["display-message", "-p", "#{pid}"]).trim());
     await sleep(200); // let tmux's `sh -c exec cat` writers finish their exec
     for (const entry of panes) if (withPipe) entry.writer = writerPid(entry.fifo);
+    if (cfg.warmupSeconds) await sleep(cfg.warmupSeconds * 1000);
     const components = () => ({
       worker: panes.reduce((sum, e) => sum + cpuSeconds(e.pane?.collector.workerPid), 0),
       reader: panes.reduce((sum, e) => sum + cpuSeconds(e.reader?.pid), 0),
@@ -1218,6 +1220,27 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     spawnSync("tmux", ["-S", socket, "kill-server"]);
     for (const entry of panes) await entry.pane?.collector.close();
   }
+}
+
+for (const panes of [1, 21]) for (const [cols, rows] of [[80, 24], [120, 40]] as const) {
+  test(`I1 CPU profile ${panes} panes ${cols}x${rows} 60s x3 after 10s warmup`, async () => {
+    const cfg: MeasureConfig = { name: `I1-${panes}-${cols}x${rows}`, panes, cols, rows,
+      rate: 100, seconds: 60, rounds: 3, baseline: true, idleSeconds: 0, warmupSeconds: 10 };
+    const base = await measureRound(cfg, 0, false);
+    console.log(`I1 CPU ${JSON.stringify(base)}`);
+    for (let round = 1; round <= 3; round++) {
+      const result = await measureRound(cfg, round, true);
+      const active = result.active as Record<string, number>;
+      const baseline = base.active as Record<string, number>;
+      const seconds = result.activeSeconds as number;
+      const cores = (active.worker! + active.reader! + active.writer! + active.host!) / seconds;
+      const tmuxDeltaPercent = 100 * (active.tmux! / seconds - baseline.tmux! / (base.activeSeconds as number));
+      console.log(`I1 CPU ${JSON.stringify({ ...result, cores, tmuxDeltaPercent,
+        parserTargetLe1Core: cores <= 1, tmuxDeltaLe10Percent: tmuxDeltaPercent <= 10,
+        aggregateIncludesCaptureAndDisk: false })}`);
+      expect((result.oracle as { missing: number }).missing).toBe(0);
+    }
+  }, 900_000);
 }
 
 describe("L2-P real pipe-pane on a private tmux socket", () => {
@@ -1328,6 +1351,71 @@ describe("L2-P FIX2 recovery regressions", () => {
 });
 
 
+test("I1 scroll receipts precede frame publication and rejected receipts release waiters", async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let block = true;
+  let scrollStarted = false;
+  let frameAfterInput = false;
+  const faults: PipeFaultEvent[] = [];
+  const pane = await collectPane(80, 3, { ports: {
+    onScroll: async () => { scrollStarted = true; if (block) await held; throw new Error("I1 disk rejection"); },
+    onFrame: event => { if (event.receiveSeq > 0) frameAfterInput = true; },
+    onFault: event => { faults.push(event); },
+  } });
+  pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
+  await untilFix1(() => scrollStarted);
+  expect(frameAfterInput).toBe(false);
+  expect(pane.collector.stats().inflightBytes).toBeGreaterThan(0);
+  block = false;
+  release();
+  await untilFix1(() => faults.some(f => f.kind === "consumer-rejected"));
+  expect(frameAfterInput).toBe(false);
+  expect(pane.collector.stats().inflightBytes).toBe(0);
+  const fault = faults.find(f => f.kind === "consumer-rejected")!;
+  expect(fault.missingCount).toBeNull();
+  expect(fault.paneKey).toEqual(pane.collector.paneKey);
+  expect(fault.receiveSeqFrom).toBe(1);
+  expect(fault.receiveSeqTo).toBe(1);
+  await pane.collector.drained();
+});
+
+test("I1 owner reset discards alternate and partial UTF8/ESC state before next epoch", async () => {
+  const pane = await collectPane(80, 3);
+  pane.collector.ingest(encoder.encode("\x1b[?1049hALT\x1b[31"));
+  await settle(pane);
+  expect(pane.last?.kind).toBe("alternate");
+  pane.collector.beginSourceEpoch(2);
+  pane.collector.ingest(encoder.encode("mNORMAL\r\nA\r\nB\r\nC\r\n"));
+  await settle(pane);
+  expect(pane.last?.kind).toBe("normal");
+  expect(pane.last?.sourceEpoch).toBe(2);
+  expect(pane.scrolls.some(s => rowText(s.physicalRow).startsWith("mNORMAL") && s.sourceEpoch === 2)).toBe(true);
+  expect(pane.faults.some(f => f.kind === "source-reset" && f.missingCount === null)).toBe(true);
+  pane.collector.ingest(Uint8Array.of(0xe0, 0xb8));
+  await settle(pane);
+  pane.collector.beginSourceEpoch(3);
+  pane.collector.ingest(encoder.encode("plain"));
+  await settle(pane);
+  expect(screenRows(pane).map(r => r.text).join("")).toContain("plain");
+  expect(screenRows(pane).map(r => r.text).join("")).not.toContain("�");
+});
+
+test("I1 oversized admission is bounded and marks the exact rejected sequence", async () => {
+  const pane = await collectPane(80, 3, { queueLimitBytes: 64 });
+  const seq = pane.collector.stats().receiveSeq + 1;
+  expect(pane.collector.ingest(new Uint8Array(64 * 1024 + 65))).toBe(false);
+  expect(pane.collector.stats().inflightBytes).toBe(0);
+  const fault = pane.faults.at(-1)!;
+  expect(fault.kind).toBe("parser-backlog");
+  expect(fault.receiveSeqFrom).toBe(seq);
+  expect(fault.receiveSeqTo).toBe(seq);
+  expect(fault.missingCount).toBeNull();
+  pane.collector.ingest(encoder.encode("recovered"));
+  await settle(pane);
+  expect(pane.collector.health()).toBe("ok");
+});
+
 describe("L2-P DEBT recovery", () => {
   test("55 five separated recoveries keep the first resized row in the collector epoch", async () => {
     const pane = await collectPane(80, 24, { sourceEpoch: 7 });
@@ -1373,18 +1461,24 @@ describe("L2-P DEBT recovery", () => {
 
 test("51 five clears with unknown policy remain explicit faults and recover", async () => {
   const pane = await collectPane(80, 24, { scrollOnClear: undefined });
+  const pid = pane.collector.workerPid;
   for (let round = 1; round <= 5; round++) {
     pane.collector.ingest(encoder.encode(`before-${round}\r\n`));
     await settle(pane);
     pane.collector.ingest(encoder.encode("\x1b[H\x1b[2J"));
-    await untilFix1(() => pane.faults.filter(f => f.kind === "worker-restarted").length === round);
-    expect(pane.collector.health()).toBe("ok");
+    await settle(pane);
+    expect(pane.faults.filter(f => f.kind === "clear-policy-unknown").length).toBe(round);
+    expect(pane.collector.health()).toBe("degraded");
+    expect(pane.collector.workerPid).toBe(pid);
   }
+  pane.collector.setScrollOnClear(true);
   pane.collector.ingest(encoder.encode("after-five-clears"));
   await settle(pane);
   expect(screenRows(pane).map(row => row.text).join("\n")).toContain("after-five-clears");
-  expect(pane.faults.filter(f => f.kind === "worker-error").length).toBe(5);
-  console.log("DEBT unknown policy: 5 explicit faults, 5 recoveries, subsequent output received");
+  expect(pane.collector.health()).toBe("ok");
+  expect(pane.faults.filter(f => f.kind === "worker-restarted").length).toBe(0);
+  expect(pane.faults.filter(f => f.missingCount === null).length).toBe(5);
+  console.log("I1 unknown policy: 5 explicit faults, zero respawns, ordered known policy restores health");
 }, 30_000);
 
 // Negative controls mutate only a private copy of the Python worker assets.

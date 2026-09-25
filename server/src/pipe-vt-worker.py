@@ -545,6 +545,7 @@ class Worker:
         pads = [y for y in ys if row_padded(s.buffer[y], s.columns)]
         encode_ns = time.monotonic_ns() - t
         send(b"U", {
+            "epoch": s.epoch,
             "seqFrom": self.seq_from,
             "seqTo": self.seq_to if ack else self.emitted_seq,
             "gen": self.gen,
@@ -605,6 +606,20 @@ def main():
                 batch_bytes += len(payload) - 16
             elif kind == b"C":
                 worker.screen.scroll_on_clear = bool(payload[0])
+            elif kind == b"X":
+                # Drain the old parser before discarding its hidden state.
+                worker.screen.preserve_on_clear()
+                if worker.pending():
+                    worker.emit()
+                old = worker
+                worker = Worker(old.screen.columns, old.screen.lines, struct.unpack(">Q", payload)[0])
+                worker.gen = old.gen
+                worker.screen.scroll_on_clear = old.screen.scroll_on_clear
+                worker.seq_to = old.seq_to
+                worker.emitted_seq = old.emitted_seq
+                worker.emit()
+                batch_started = None
+                batch_bytes = 0
             elif kind == b"Z":
                 c, r, g = struct.unpack(">HHI", payload[:8])
                 worker.resize(c, r, g)

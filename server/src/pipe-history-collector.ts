@@ -36,6 +36,8 @@ export type PipeScrollEvent = {
 };
 
 export type PipeFrameEvent = {
+  paneKey: PaneKey;
+  sourceEpoch: number;
   cells: {
     full: boolean;
     cols: number;
@@ -56,7 +58,10 @@ export type PipeFrameEvent = {
 };
 
 export type PipeFaultEvent = {
-  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed";
+  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed" | "consumer-rejected" | "source-reset";
+  paneKey?: PaneKey;
+  sourceEpoch?: number;
+  missingCount?: null;
   at: number;
   message?: string;
   /** Bytes whose parsing could not be acknowledged; not a guessed row count. */
@@ -67,9 +72,9 @@ export type PipeFaultEvent = {
 };
 
 export interface PipeCollectorPorts {
-  onScroll(event: PipeScrollEvent): void;
-  onFrame(event: PipeFrameEvent): void;
-  onFault(event: PipeFaultEvent): void;
+  onScroll(event: PipeScrollEvent): unknown;
+  onFrame(event: PipeFrameEvent): unknown;
+  onFault(event: PipeFaultEvent): unknown;
 }
 
 export type PipeCollectorHealth = "starting" | "ok" | "degraded" | "broken" | "closed";
@@ -140,6 +145,7 @@ export class PipeHistoryCollector {
   private workerParseNs = 0;
   private workerEncodeNs = 0;
   private hostHandleNs = 0n;
+  private policyUnverified = false;
 
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
@@ -172,7 +178,12 @@ export class PipeHistoryCollector {
       python: this.options.python,
       now: this.now,
       onUpdate: (update) => this.onUpdate(update),
-      onFault: (fault) => this.fault(fault.kind, fault.message, "broken"),
+      onFault: (fault) => {
+        if (fault.kind === "clear-policy-unknown") {
+          this.policyUnverified = true;
+          this.fault(fault.kind, fault.message, "degraded");
+        } else this.fault(fault.kind, fault.message, "broken");
+      },
     });
   }
 
@@ -193,13 +204,21 @@ export class PipeHistoryCollector {
   /**
    * Accept raw pipe bytes. Returns false while the parser backlog is over
    * its limit: the caller should await `drained()` before reading more.
-   * Nothing is dropped either way.
+   * One delivery may exceed the watermark by at most 64 KiB. A caller that
+   * ignores drain, or sends an oversized delivery, gets an explicit loss issue.
    */
   ingest(bytes: Uint8Array, receivedAtNs: bigint = this.nowNs()): boolean {
     if (this.healthState === "closed") return false;
     if (this.healthState === "broken") {
       const seq = ++this.receiveSeq;
       this.notifyFault({ kind: "worker-exit", at: this.now(), message: "bytes rejected by dead parser", unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
+      return false;
+    }
+    if (this.inflightBytes > this.queueLimit || bytes.byteLength > this.queueLimit + 64 * 1024) {
+      const seq = ++this.receiveSeq;
+      this.healthState = "degraded";
+      this.notifyFault({ kind: "parser-backlog", at: this.now(), message: "input rejected at bounded parser admission; drain before retrying new bytes",
+        unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
       return false;
     }
     const seq = ++this.receiveSeq;
@@ -238,11 +257,15 @@ export class PipeHistoryCollector {
     this.upstreamEpoch = epoch;
     // Parser recovery and upstream pipe restarts are independent breaks.
     this.sourceEpoch = Math.max(this.sourceEpoch + 1, epoch);
+    this.notifyFault({ kind: "source-reset", at: this.now(), message: "owner requested parser reset; external reset ordering remains unverified",
+      receiveSeqFrom: this.ackedSeq + 1, receiveSeqTo: this.receiveSeq, lostRows: "unknown" });
+    if (!this.worker.reset(this.sourceEpoch)) this.fault("worker-error", "parser reset admission failed", "broken");
   }
 
   setScrollOnClear(enabled: boolean): void {
     this.scrollOnClear = enabled;
-    this.worker.setScrollOnClear(enabled);
+    if (!this.worker.setScrollOnClear(enabled)) this.fault("worker-error", "clear policy admission failed", "broken");
+    else this.policyUnverified = false;
   }
 
   currentSourceEpoch(): number {
@@ -312,14 +335,16 @@ export class PipeHistoryCollector {
 
   /** Consumer faults cannot interrupt cleanup, waiter release or recovery. */
   private notifyFault(event: PipeFaultEvent): void {
-    try { this.options.ports.onFault(event); }
+    const contextual = { paneKey: this.paneKey, sourceEpoch: this.sourceEpoch,
+      ...(event.lostRows === "unknown" ? { missingCount: null } : {}), ...event };
+    try { Promise.resolve(this.options.ports.onFault(contextual)).catch(error => console.error("[pipe-history] onFault callback failed:", error)); }
     catch (error) { console.error("[pipe-history] onFault callback failed:", error); }
   }
 
   private fault(kind: PipeFaultEvent["kind"], message: string | undefined, health: PipeCollectorHealth): void {
     if (this.healthState === "closed") return;
     if (health === "broken" || this.healthState !== "broken") this.healthState = health;
-    const loss = health === "broken" ? {
+    const loss = health === "broken" || kind === "clear-policy-unknown" ? {
       unacknowledgedBytes: this.inflightBytes,
       receiveSeqFrom: this.ackedSeq + 1,
       receiveSeqTo: this.receiveSeq,
@@ -352,9 +377,9 @@ export class PipeHistoryCollector {
     }
   }
 
-  private pushRing(event: PipeScrollEvent): void {
+  private async pushRing(event: PipeScrollEvent): Promise<void> {
     // The port sees the row first; only then may the tray make room.
-    this.options.ports.onScroll(event);
+    await this.options.ports.onScroll(event);
     this.scrollCount += 1;
     this.ring.push(event);
     while (this.ring.length - this.ringStart > this.ringRows) {
@@ -368,13 +393,14 @@ export class PipeHistoryCollector {
     }
   }
 
-  private onUpdate(update: PipeVtUpdate): void {
+  private async onUpdate(update: PipeVtUpdate): Promise<void> {
     if (this.healthState === "broken" || this.healthState === "closed") return;
     const began = this.nowNs();
     this.workerParseNs += update.parseNs;
     this.workerEncodeNs += update.encodeNs;
+    try {
     for (const scroll of update.scrolls) {
-      this.pushRing({
+      await this.pushRing({
         paneKey: this.paneKey,
         sourceEpoch: scroll.epoch,
         geometryGeneration: scroll.gen,
@@ -389,7 +415,9 @@ export class PipeHistoryCollector {
     const softWrap: Record<number, boolean> = {};
     for (const [y, row] of Object.entries(update.frame.dirty)) dirty[Number(y)] = row;
     for (const [y, wrap] of Object.entries(update.frame.wraps)) softWrap[Number(y)] = wrap;
-    this.options.ports.onFrame({
+    await this.options.ports.onFrame({
+      paneKey: this.paneKey,
+      sourceEpoch: update.epoch,
       cells: {
         full: update.frame.full,
         shift: update.frame.shift,
@@ -421,8 +449,11 @@ export class PipeHistoryCollector {
     }
     this.hostHandleNs += published - began;
     if (this.inflightBytes <= this.queueLimit) {
-      if (this.healthState === "degraded") this.healthState = "ok";
+      if (this.healthState === "degraded" && !this.policyUnverified) this.healthState = "ok";
       for (const waiter of this.drainWaiters.splice(0)) waiter();
+    }
+    } catch (error) {
+      this.fault("consumer-rejected", `scroll/frame receipt rejected: ${String(error)}`, "broken");
     }
   }
 }
