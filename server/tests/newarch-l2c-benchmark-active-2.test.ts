@@ -174,9 +174,12 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         flush(c);
         rearm(c);
       };
+      // This private workload only appends and never resets its history.
+      // Its owner therefore keeps epoch 1 for the whole fixture. Production
+      // adapters must observe reset/clear and rotate the epoch independently.
       const meta = (pane: Pane, fields: string): CaptureMetadata => {
         const [w, h, x, y, alt] = fields.split(' ').map(Number);
-        return { sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
+        return { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
       };
       // All captures requested in one tick share a tmux client. One
       // list-panes before and one after bracket every capture of the batch

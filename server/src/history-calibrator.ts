@@ -9,6 +9,11 @@ export interface CalibrationFrame {
   receiveSeq: number;
 }
 export interface CaptureMetadata {
+  /** Authoritative retained-history epoch, in the same namespace as sourceEpoch.
+   * Read from the history owner before/after capture, never copied from parser
+   * state. Every destructive reset (including external clear-history) rotates
+   * it before any replacement rows can be certified. Unobserved = no evidence. */
+  historyEpoch: number;
   sourceEpoch: number; geometryGeneration: number;
   cols: number; rows: number; kind: 'normal' | 'alternate';
   cursor: CalibrationFrame['cursor'];
@@ -139,10 +144,10 @@ export class HistoryCalibrator {
     const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 128);
     let successful = false;
     try {
-      // Fence: every row the parser holds before capture starts is already in
-      // tmux history (the pipe trails tmux). Rows appended during the capture
-      // may be missing from it, so they are left to the next capture. The CAS
-      // revision still comes from the read after capture (no starvation).
+      // The fence is (pane identity, source/history epoch, geometry, last ID).
+      // Content equality cannot prove identity across a history reset. The
+      // capture owner must independently attest its epoch; appended rows are
+      // left to the next capture. CAS still uses the post-capture revision.
       const fence = this.ports.read();
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -157,6 +162,8 @@ export class HistoryCalibrator {
       const meta = capture.after;
       const stable = samePane(capture.paneKey, this.paneKey)
         && JSON.stringify(capture.before) === JSON.stringify(meta)
+        && Number.isSafeInteger(meta.historyEpoch) && meta.historyEpoch >= 0
+        && meta.historyEpoch === fence.sourceEpoch
         && meta.sourceEpoch === read.sourceEpoch && meta.geometryGeneration === read.geometryGeneration
         && capture.frame.geometryGeneration === meta.geometryGeneration && capture.frame.kind === meta.kind
         && JSON.stringify(capture.frame.cursor) === JSON.stringify(meta.cursor)
@@ -164,7 +171,7 @@ export class HistoryCalibrator {
         && capture.frame.cells.length === meta.rows && capture.frame.cells.every(row => row.length === meta.cols)
         && fence.sourceEpoch === read.sourceEpoch && fence.geometryGeneration === read.geometryGeneration
         && startedGeneration === this.eventGeneration;
-      if (!stable) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
+      if (!stable) { this.matcher.reset(); this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       const matched = historyDue && meta.kind === 'normal';
       const recent = matched ? fencedHistory(read.recentHistory, fence.recentHistory) : read.recentHistory;
       const match: RowMatch = !matched ? { checks: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, capture.history, {

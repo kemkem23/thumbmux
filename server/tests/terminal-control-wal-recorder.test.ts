@@ -671,7 +671,7 @@ function naHarness(incremental = false) {
     schedule: at => { scheduled.push(at); },
     capture: async (_, limit) => {
       limits.push(limit);
-      const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+      const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
       return { paneKey, captureId: `capture-${limits.length}`, requestedAt: time, completedAt: time, before: meta, after: stale ? { ...meta, cols: 5 } : meta, frame, history, completeRetainedTail: limit >= history.length, observedFields: ['cells', 'cursor'] };
     },
     calibrate: async input => { writes.push(input); if (conflict || input.expectedRevision !== revision) { conflict = false; revision++; return null; } return { revision: ++revision, durableRevision: 0, nextLineId: 4 }; },
@@ -1127,7 +1127,7 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
   const rows = new Map<string, CapturedRow>();
   const rowOf = (t: string) => { let r = rows.get(t); if (!r) { r = naRow(t.padEnd(12)); rows.set(t, r); } return r; };
   const frame: CalibrationFrame = { cells: [naRow('scr ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
-  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
   const paneKey = { serverIdentity: 'private', paneId: '%9', birthGeneration: 1 };
   // A comparable parser screen that never matches keeps the calibrator in
   // CAPTURE mode: screen-only captures every 50ms between history captures.
@@ -1241,7 +1241,7 @@ test('DEBT 2 a screen-only capture does not erase the incremental seed', async (
   let recent = all.slice(0, 300), time = 0, revision = 1;
   const tails: number[] = [], checks: number[] = [];
   const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
-  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
   const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
   let parserFrame: CalibrationFrame = { ...frame, cells: [naRow('bad ').cells] };
   const calibrator = new HistoryCalibrator(paneKey, {
@@ -1277,7 +1277,7 @@ test('DEBT 3 a failed capture keeps the incremental seed instead of forcing a fu
   let recent = all.slice(0, 300), time = 0, revision = 1, fail = false;
   const tails: number[] = [], checks: number[] = [], faults: string[] = [];
   const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
-  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
   const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
   const calibrator = new HistoryCalibrator(paneKey, {
     now: () => time, schedule: () => {},
@@ -1627,3 +1627,29 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
   expect(result.certifiedCleared).toBe(0);
   expect(result.commits).toBe(0);
 }, 15000);
+
+ test('DEBT2 missing, changed and invalid history epochs fail closed; valid epoch recovers', async () => {
+  for (const epoch of [undefined, NaN, Infinity, -1, 1.5, 2]) {
+    const h = naHarness(true);
+    const capture = h.ports.capture;
+    h.ports.capture = async (...args) => {
+      const c = await capture(...args);
+      return { ...c, before: { ...c.before, historyEpoch: epoch as number }, after: { ...c.after, historyEpoch: epoch as number } };
+    };
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(0);
+    h.ports.capture = capture;
+    h.time(1000); await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]!.checks).toHaveLength(3);
+    expect(h.limits).toEqual([4500, 4500]);
+  }
+  const h = naHarness(true);
+  const capture = h.ports.capture;
+  h.ports.capture = async (...args) => {
+    const c = await capture(...args);
+    return { ...c, after: { ...c.after, historyEpoch: 2 } };
+  };
+  await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(0);
+});
