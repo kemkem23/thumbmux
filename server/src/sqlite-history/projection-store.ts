@@ -5,8 +5,8 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from './schema';
 import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
-import { readProjectionPage } from './projection-reader';
-import type { PaneKey, ProjectionCalibration, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
+import { readProjectionPage, readProjectionIssues } from './projection-reader';
+import type { PaneKey, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=256*1024;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
@@ -201,7 +201,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
         if(!previous || now-previous.last>=1000)emit=true;
         const id=previous?.id??randomUUID();
-        this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run('degraded',p.pane_key);
+        this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run(p.health==='unverified'?'unverified':'degraded',p.pane_key);
         this.ram.db.query(`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
           ON CONFLICT(issue_id) DO UPDATE SET revision=excluded.revision,missing_count=excluded.missing_count,reason=excluded.reason`)
           .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,capacity?count:null,previous?.detected??now);
@@ -267,7 +267,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
-      const value=(isScroll || liveFrame?input:(input as ProjectionCalibration).capture) as ScrollEvent;
+      const value=((input as ProjectionCalibration).capture??input) as ScrollEvent;
       const id=paneId(key);
       let scope=this.capacity(key,512,liveFrame);if(scope!=='ok')this.rejectCapacity(key,value,isScroll,scope);
       const bytes=preparedBytes??Buffer.byteLength(JSON.stringify(input))+512;
@@ -303,7 +303,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       try {
         const receipt=this.ram.db.transaction(()=>{
           const receipt=job.run();
-          if(!job.liveFrame && this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
+          if(this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
           return receipt;
         })();
         // A frame replaces the pane's previous unflushed frame of the same kind:
@@ -341,10 +341,20 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       this.owner();if(this.closing)throw new Error('store-closing');
       const queued=this.queues.get(paneId(frame.paneKey));
-      if(queued?.some(job=>job.liveFrame || job.sourceEpoch!==frame.sourceEpoch || job.geometryGeneration!==frame.geometryGeneration)) {
+      if(queued?.length) {
+        const prior=queued.findIndex(job=>job.screenKey===paneId(frame.paneKey)+':'+frame.kind && job.sourceEpoch===frame.sourceEpoch && job.geometryGeneration===frame.geometryGeneration);
+        if(prior>=0 && queued.slice(prior).every(job=>job.sourceEpoch===frame.sourceEpoch && job.geometryGeneration===frame.geometryGeneration)) {
+          const job=queued[prior];
+          const result=this.coalesce(job,frame);
+          // Move the newer frame behind every accepted scroll. Its older waiters
+          // acknowledge the superseding frame, never a screen ahead of history.
+          queued.splice(prior,1);queued.push(job);return result;
+        }
         const tail=queued.at(-1)!;
         if(tail.screenKey===paneId(frame.paneKey)+':'+frame.kind && tail.sourceEpoch===frame.sourceEpoch && tail.geometryGeneration===frame.geometryGeneration)return this.coalesce(tail,frame);
-        return this.enqueue(frame.paneKey,frame,f=>{this.ram.screen(f);return this.ram.bump(f.paneKey);},false,true);
+        validateFrame(frame);
+        const encoded=encodeFrameCells(frame.cells), frozen={...structuredClone({...frame,cells:[]}),encodedCells:encoded};
+        return this.enqueue(frame.paneKey,frozen,f=>{this.ram.screen(f,null,null,[],f.encodedCells);return this.ram.bump(f.paneKey);},false,true,Buffer.byteLength(encoded)+Buffer.byteLength(paneId(frame.paneKey))+512);
       }
       const pane=paneId(frame.paneKey),id=pane+':'+frame.kind;
       const previous=this.screenBytes.get(id)??0;
@@ -363,13 +373,28 @@ export class ProjectionStore implements ProjectionWriterPort {
   private coalesce(tail:Job,frame:ProjectionFrame):Promise<ProjectionReceipt> {
     // Validate before touching the tail: a bad frame is refused alone, the queued frame keeps its job.
     validateFrame(frame);
-    const id=paneId(frame.paneKey),bytes=Buffer.byteLength(JSON.stringify(frame))+512,delta=bytes-tail.bytes;
+    const id=paneId(frame.paneKey),encoded=encodeFrameCells(frame.cells),bytes=Buffer.byteLength(encoded)+Buffer.byteLength(id)+512+128*((tail.waiters?.length??0)+1),delta=bytes-tail.bytes;
     const scope=this.ram.bytes()+Math.max(0,delta)>CACHE_MAX?'store':this.capacity(frame.paneKey,delta,true);
     if(scope!=='ok')this.rejectCapacity(frame.paneKey,frame,false,scope);
-    const frozen=structuredClone(frame);
-    tail.run=()=>{this.ram.screen(frozen);return this.ram.bump(frozen.paneKey);};
+    const frozen=structuredClone({...frame,cells:[]});
+    tail.run=()=>{this.ram.screen(frozen,null,null,[],encoded);return this.ram.bump(frozen.paneKey);};
     this.reserve(id,delta);this.queuedBytes+=delta;tail.bytes=bytes;
     return new Promise<ProjectionReceipt>((resolve,reject)=>{(tail.waiters??=[]).push({resolve,reject});});
+  }
+  recordIssue(issue:ProjectionIssueInput):Promise<ProjectionReceipt> {
+    return this.enqueue(issue.paneKey,issue,value=>{
+      const receipt=this.ram.recordIssue(value);this.degraded=true;return receipt;
+    },false).catch(error=>{this.externalFault(issue,error);throw error;});
+  }
+  transitionEpoch(change:ProjectionEpochTransition):Promise<ProjectionReceipt> {
+    return this.enqueue(change.paneKey,change,value=>{
+      const receipt=this.ram.recordIssue(value,value.nextEpoch);this.degraded=true;return receipt;
+    },false).then(receipt=>{this.flush();return {...receipt,durableRevision:this.token(change.paneKey).durableRevision};}).catch(error=>{this.externalFault(change,error);throw error;});
+  }
+  private externalFault(issue:ProjectionIssueInput,error:unknown):void {
+    // The independent host sink remains available when journal admission fails.
+    try {this.options.onFault?.({kind:issue.kind,reason:issue.reason+'; journal rejected: '+String(error),at:Date.now(),pendingBytes:this.pendingBytes()});}
+    catch {console.error('[newarch] fault sink failed');}
   }
   calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c),false);}
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
@@ -406,12 +431,12 @@ export class ProjectionStore implements ProjectionWriterPort {
     for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
     this.retry=null;
     this.drainLosses();
-    if(this.pendingBytes()<PENDING_MAX/2) {
+    if(this.pendingBytes()<PENDING_MAX/2 && this.ram.bytes()<=CACHE_MAX) {
       this.stopped=false;
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
       for(const p of batch.panes) {
-        if(p.health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
+        if(p.health==='degraded' && this.ram.pane({serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)}).health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
           this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
           // Keep capacity episodes open so a refusal right after recovery reuses the issue.
           for(const [tag,f] of this.faults)if(f.pane===p.pane_key && !tag.endsWith(':ingest-capacity'))this.faults.delete(tag);
@@ -476,8 +501,12 @@ export class ProjectionStore implements ProjectionWriterPort {
   health():ProjectionHealth {
     this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
     const panes=(this.ram.db.query('SELECT server_identity,pane_id,birth_generation FROM na_pane').all() as SqlRow[])
-      .map(p=>this.ram.token({serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)}));
-    return {status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
+      .map(p=>{
+        const key={serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)};
+        const token=this.ram.token(key);
+        return {...token,status:this.ram.pane(key).health==='healthy'?'healthy' as const:'degraded' as const,issues:readProjectionIssues(this.ram,this.disk,token)};
+      });
+    return {pressure:this.stopped?'recoverable':'none',status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
       pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,panes};
   }
   async close():Promise<void> {
@@ -502,6 +531,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     });
     if(!exited) {
       console.error('[newarch] disk worker did not exit after close; terminating');
+      try {this.options.onFault?.({kind:'shutdown-timeout',reason:'disk worker did not acknowledge close; emergency termination',at:Date.now(),pendingBytes:this.pendingBytes()});}catch{console.error('[newarch] fault sink failed');}
       await worker.terminate().catch(()=>{});
     }
   }

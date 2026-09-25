@@ -390,12 +390,12 @@ test('newarch v2: atomic CAS, exact checked receipt, repair, alternate screen an
  try {
   await s.appendScroll(naEvent('wrong',1));await s.appendScroll(naEvent('',2));
   await s.replaceScreen(naFrame());const old=s.token(naKey);
-  const capture:ProjectionCapture={...naFrame(),captureId:'cap-1',requestedAt:1,completedAt:2,firstHistoryRow:0,
+  const capture:ProjectionCapture={...naFrame(),receiveSeq:2,captureId:'cap-1',requestedAt:1,completedAt:2,firstHistoryRow:0,
     history:[naRow('right'),naRow('')],observedFields:['grapheme','style','cursor'],ambiguousRows:0,result:'exact'};
   await expect(s.calibrate({capture,expectedRevision:old.revision-1,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
   await expect(s.calibrate({capture,expectedRevision:old.revision,checks:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
   expect(s.token(naKey)).toEqual(old);
-  const receipt=await s.calibrate({capture,expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
+  const receipt=await s.calibrate({capture,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:capture.receiveSeq},expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
   expect(receipt.durableRevision).toBe(0);expect(receipt.nextLineId).toBe(2);
   expect(()=>s.readPage(old,null,2)).toThrow('page-retry');
   let rows=s.readPage(s.token(naKey),null,2).lines;
@@ -530,5 +530,56 @@ test('newarch: capacity rejection cannot advance generation past accepted histor
   await expect(rejected).rejects.toThrow('ingest-capacity');await old;s.flush();
   expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['accepted']);
   expect(s.health().rejectedRows).toBe(1);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2: issue and monotonic epoch CAS survive reopen with unknown loss and archived rows',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-epoch-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('old',1));
+  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:s.token(naKey).revision,
+   kind:'reader-lost',reason:'unknown bytes after disconnect',missingCount:null,boundaryLineId:1,recoverable:false};
+  await s.recordIssue(issue);
+  await expect(s.transitionEpoch({...issue,nextEpoch:2})).rejects.toThrow('stale-revision');
+  const transition={...issue,expectedRevision:s.token(naKey).revision,nextEpoch:2};
+  await expect(s.transitionEpoch({...transition,nextEpoch:1})).rejects.toThrow('nonmonotonic-epoch');
+  await s.transitionEpoch(transition);
+  await expect(s.appendScroll(naEvent('stale',2))).rejects.toThrow('stale-generation');
+  await s.appendScroll({...naEvent('new',0),sourceEpoch:2});
+  s.flush();expect(s.health().panes[0].status).toBe('degraded');
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  const page=s.readPage(s.token(naKey),null,10);
+  expect(page.lines.map(r=>[r.text,r.sourceEpoch])).toEqual([['old',1],['new',2]]);
+  expect(page.issues).toHaveLength(2);expect(page.issues.every(i=>i.missingCount===null && i.boundaryLineId===1)).toBe(true);
+  expect(s.health().panes[0]).toMatchObject({sourceEpoch:2,status:'degraded'});
+  expect(s.health().panes[0].issues).toEqual(page.issues);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2: unfenced capture checks history without replacing screen and invalid fences roll back atomically',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fence-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('history',1));await s.replaceScreen(naFrame());
+  const capture:ProjectionCapture={...naFrame(),cells:[[naCell('Z'),naCell(' ')]],captureId:'unfenced',requestedAt:1,completedAt:2,
+   firstHistoryRow:0,history:[naRow('history')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,captureEvidence:{kind:'unfenced',reason:'no byte fence'},checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(s.screen(naKey)?.display_source).toBe('pipe');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('A');
+  expect(s.readPage(s.token(naKey),null,10).lines[0].checkState).toBe('checked');
+  const token=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'bad'},expectedRevision:token.revision,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:2},checks:[],repairs:[]})).rejects.toThrow('capture-fence-mismatch');
+  expect(s.token(naKey)).toEqual(token);
+  await s.calibrate({capture:{...capture,captureId:'good'},expectedRevision:token.revision,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:1},checks:[],repairs:[]});
+  expect(s.screen(naKey)?.display_source).toBe('tmux');
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2: same-generation frame receipt follows every accepted scroll',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-seam-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const events:string[]=[];
+  const a=s.appendScroll(naEvent('first',1)).then(()=>events.push('scroll'));
+  const b=s.replaceScreen(naFrame()).then(r=>{events.push('frame');expect(r.nextLineId).toBe(1);});
+  await Promise.all([a,b]);expect(events).toEqual(['scroll','frame']);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });

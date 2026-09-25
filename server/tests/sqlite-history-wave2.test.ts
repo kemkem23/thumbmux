@@ -551,7 +551,7 @@ test('newarch DEBT2: queued frames of one pane coalesce to the latest and releas
   const smallBytes=Buffer.byteLength(JSON.stringify(small(0,0)))+512;
   const mixed:Promise<unknown>[]=[row(99,2),s.replaceScreen(small(100,0))];
   for(let a=1;a<=10;a++)mixed.push(row(100+2*a,3),s.replaceScreen(small(101+2*a,a)));
-  expect([...internal.queues.values()][0].length).toBe(22);
+  expect([...internal.queues.values()][0].length).toBe(12);
   await Promise.all(mixed);
   const pending=internal.pendingBytes();
   expect(pending).toBeLessThan(2*smallBytes);
@@ -671,5 +671,39 @@ test('I2 probe: measure A borrowing before B through E arrive without disk ackno
   }
   console.log('I2_BORROW_PROBE',JSON.stringify({admitted,refused,health:s.health()}));
   expect(s.health().pendingBytes).toBeLessThanOrEqual(16*1024*1024);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2: acknowledgement cannot clear RAM pressure before cache also recovers',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-cache-')),s=createProjectionStore({historyRoot:root,mode:'create'}),internal=s as any;
+ const key={serverIdentity:'cache',paneId:'%1',birthGeneration:1};
+ const bytes=internal.ram.bytes.bind(internal.ram);
+ try {
+  await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'keep',cells:[]}});
+  internal.ram.bytes=()=>256*1024*1024+1;
+  await expect(s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:2,softWrap:false,physicalRow:{text:'pressure',cells:[]}})).rejects.toThrow('ingest-capacity');
+  s.flush();expect(s.health()).toMatchObject({status:'stopped',pressure:'recoverable'});
+  expect(s.health().panes[0].status).toBe('degraded');
+  internal.ram.bytes=bytes;
+  await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:3,softWrap:false,physicalRow:{text:'recovered',cells:[]}});
+  s.flush();expect(s.health().status).toBe('healthy');
+ }finally{internal.ram.bytes=bytes;await s.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('I2: 208x60 interleaved frames retain all scrolls under one bounded latest-frame reservation',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-interleave-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ const key={serverIdentity:'interleave',paneId:'%1',birthGeneration:1};
+ const cell=(grapheme:string)=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+ try {
+  const jobs:Promise<unknown>[]=[];
+  for(let n=0;n<40;n++) {
+   jobs.push(s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}}));
+   jobs.push(s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,n,true),cursor:null}));
+  }
+  expect(s.health().pendingBytes).toBeLessThan(1024*1024);
+  await Promise.all(jobs);s.flush();
+  expect(s.readPage(s.token(key),null,100).lines.map(r=>r.text)).toEqual(Array.from({length:40},(_,n)=>String(n)));
+  expect(JSON.parse(String(s.screen(key)!.cells_json))[59][207]).toEqual(textFrame(cell,208,60,39,true)[59][207]);
+  expect(s.health().pendingBytes).toBe(0);
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);

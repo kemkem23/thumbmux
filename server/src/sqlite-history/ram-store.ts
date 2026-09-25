@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { PROJECTION_SCHEMA } from './schema';
-import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
+import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionIssueInput, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
 // Schema 2's UNIQUE(pane_key,line_id) is sqlite_autoindex_na_line_2.
 // Pin that range: the revision index otherwise walks every durable resident row.
@@ -145,6 +145,22 @@ export class ProjectionRam {
       .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
+  recordIssue(issue: ProjectionIssueInput, nextEpoch?: number): ProjectionReceipt {
+    const p=this.pane(issue.paneKey), id=paneId(issue.paneKey);
+    if(p.revision!==issue.expectedRevision)throw new Error('stale-revision');
+    if(p.source_epoch!==issue.sourceEpoch || p.geometry_generation!==issue.geometryGeneration)throw new Error('stale-generation');
+    integer(issue.boundaryLineId);
+    if(issue.boundaryLineId>Number(p.next_line_id) || !issue.kind || !issue.reason || typeof issue.recoverable!=='boolean')throw new Error('invalid-issue');
+    if(issue.missingCount!==null)integer(issue.missingCount);
+    if(nextEpoch!==undefined) {
+      integer(nextEpoch);if(nextEpoch<=Number(p.source_epoch))throw new Error('nonmonotonic-epoch');
+      this.db.query('UPDATE na_pane SET source_epoch=?,receive_seq=-1 WHERE pane_key=?').run(nextEpoch,id);
+    }
+    this.db.query('INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)').run(randomUUID(),id,nextEpoch??p.source_epoch,
+      Number(p.revision)+1,issue.boundaryLineId,issue.kind,issue.reason,issue.missingCount,Date.now());
+    this.db.query("UPDATE na_pane SET health=? WHERE pane_key=?").run(issue.recoverable?'degraded':'unverified',id);
+    return this.bump(issue.paneKey);
+  }
   calibrate(change: ProjectionCalibration): ProjectionReceipt {
     const c=change.capture, p=this.pane(c.paneKey), id=paneId(c.paneKey);
     if (p.revision !== change.expectedRevision) throw new Error('stale-revision');
@@ -176,7 +192,13 @@ export class ProjectionRam {
       this.db.query("UPDATE na_line SET revision=?,text=?,cells_json=?,check_state='checked',check_reason='exact-capture',checked_capture_id=?,checked_row=? WHERE pane_key=? AND line_id=?")
         .run(Number(p.revision)+1,expected.text,encodeCells(expected.cells),c.captureId,m.captureRow,id,m.lineId);
     }
-    this.screen(c,c.captureId,c.completedAt,c.observedFields);
+    const evidence=change.captureEvidence;
+    if(evidence?.kind==='byte-fence') {
+      integer(evidence.receiveSeq);
+      if(evidence.sourceEpoch!==c.sourceEpoch || evidence.receiveSeq!==c.receiveSeq || evidence.receiveSeq!==p.receive_seq)throw new Error('capture-fence-mismatch');
+      this.screen(c,c.captureId,c.completedAt,c.observedFields);
+    }
+    // Unfenced captures may check proven history mappings, but never replace a live screen.
     return this.bump(c.paneKey);
   }
   bytes(): number {

@@ -175,8 +175,22 @@ export interface ProjectionCapture extends ProjectionFrame {
   firstHistoryRow: number; history: PhysicalRow[]; observedFields: string[];
   ambiguousRows: number; result: string;
 }
+export type CaptureEvidence =
+  | { kind: 'byte-fence'; sourceEpoch: number; receiveSeq: number }
+  | { kind: 'unfenced'; reason: string };
+export interface ProjectionIssueInput {
+  paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
+  expectedRevision: number; kind: string; reason: string; missingCount: number | null;
+  boundaryLineId: number; recoverable: boolean;
+}
+export interface ProjectionIssue {
+  issueId: string; sourceEpoch: number; revision: number; boundaryLineId: number | null;
+  kind: string; reason: string; missingCount: number | null; detectedAt: number; resolvedAt: number | null;
+}
+export interface ProjectionEpochTransition extends ProjectionIssueInput { nextEpoch: number }
 export interface ProjectionCalibration {
   capture: ProjectionCapture; expectedRevision: number;
+  captureEvidence?: CaptureEvidence;
   checks: Array<{ lineId: number; captureRow: number }>;
   repairs: Array<{ lineId: number; captureRow: number; physicalRow: PhysicalRow }>;
 }
@@ -190,15 +204,18 @@ export interface ProjectionLine extends PhysicalRow {
   checkedCaptureId: string | null; checkedRow: number | null;
 }
 export interface ProjectionPage {
-  token: ProjectionToken; lines: ProjectionLine[]; nextAnchor: number; hasMore: boolean;
+  token: ProjectionToken; lines: ProjectionLine[]; issues: ProjectionIssue[]; nextAnchor: number; hasMore: boolean;
 }
 export interface ProjectionFault { kind: string; at: number; reason: string; pendingBytes: number }
 export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
-  panes: ProjectionToken[];
+  pressure: 'none' | 'recoverable';
+  panes: Array<ProjectionToken & { status: 'healthy' | 'degraded'; issues: ProjectionIssue[] }>;
 }
 export interface ProjectionWriterPort {
+  recordIssue(issue: ProjectionIssueInput): Promise<ProjectionReceipt>;
+  transitionEpoch(change: ProjectionEpochTransition): Promise<ProjectionReceipt>;
   appendScroll(event: ScrollEvent): Promise<ProjectionReceipt>;
   replaceScreen(frame: ProjectionFrame): Promise<ProjectionReceipt>;
   calibrate(change: ProjectionCalibration): Promise<ProjectionReceipt>;
