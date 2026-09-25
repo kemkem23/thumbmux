@@ -771,7 +771,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.screen.get(1)!.row[0]![3]).toEqual(["中", "", "e\u0301", "x", ...Array(16).fill(" ")]);
   });
 
-  test("scrolling inside a DECSTBM region never becomes history; full-screen scrolls do", async () => {
+  test("DECSTBM region and full-screen upward scrolls both enter tmux history", async () => {
     const pane = await collectPane(40, 10);
     const lines: string[] = [];
     for (let i = 0; i < 10; i++) lines.push(`base ${i}`);
@@ -783,13 +783,14 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     for (let i = 0; i < 50; i++) region += `\r\nregion ${i}`;
     pane.collector.ingest(encoder.encode(region));
     await settle(pane);
-    expect(pane.scrolls.length).toBe(0);
+    expect(pane.scrolls.length).toBe(50);
+    expect(pane.scrolls.slice(0, 6).map(s => rowText(s.physicalRow).trimEnd())).toEqual(["base 2", "base 3", "base 4", "base 5", "base 6", "base 7"]);
     expect(screenRows(pane)[0]!.text.trimEnd()).toBe("base 0");
     expect(screenRows(pane)[7]!.text.trimEnd()).toBe("region 49");
     // Reset the region: the next full-screen scrolls are history again.
     pane.collector.ingest(encoder.encode("\x1b[r\x1b[10;1H\r\nafter 0\r\nafter 1"));
     await settle(pane);
-    expect(pane.scrolls.map((s) => rowText(s.physicalRow).trimEnd())).toEqual(["base 0", "base 1"]);
+    expect(pane.scrolls.slice(50).map((s) => rowText(s.physicalRow).trimEnd())).toEqual(["base 0", "base 1"]);
   });
 
   for (const mode of [47, 1047, 1049]) {

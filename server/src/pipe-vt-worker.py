@@ -115,13 +115,14 @@ class Screen(pyte.Screen):
     def erase_in_display(self, how=0, *args, **kw):
         if how == 3:
             # tmux E3 clears scrollback only; pyte treats it as ED2.
-            if not self.alt and self.on_history_clear is not None:
+            if (not args or args[0] == 0) and self.on_history_clear is not None:
                 self.on_history_clear()
             return
-        if how == 2:
+        whole = how == 2 or (how == 0 and self.cursor.x == 0 and self.cursor.y == 0)
+        if whole:
             self.preserve_on_clear()
         super().erase_in_display(how, *args, **kw)
-        if how == 2:
+        if whole:
             for row in self.buffer.values():
                 row.wrapped = row.pad = False
                 row.epoch = self.epoch
@@ -130,14 +131,14 @@ class Screen(pyte.Screen):
     def scroll_up(self, count=1):
         y = self.cursor.y
         self.cursor.y = (self.margins or (0, self.lines - 1))[1]
-        for _ in range(min(count or 1, self.lines)):
+        for _ in range(min(count or 1, (self.margins or (0, self.lines - 1))[1] - (self.margins or (0, self.lines - 1))[0] + 1)):
             self.index()
         self.cursor.y = y
 
     def scroll_down(self, count=1):
         y = self.cursor.y
         self.cursor.y = (self.margins or (0, self.lines - 1))[0]
-        for _ in range(min(count or 1, self.lines)):
+        for _ in range(min(count or 1, (self.margins or (0, self.lines - 1))[1] - (self.margins or (0, self.lines - 1))[0] + 1)):
             self.reverse_index()
         self.cursor.y = y
 
@@ -145,7 +146,7 @@ class Screen(pyte.Screen):
     def index(self):
         top, bottom = self.margins or (0, self.lines - 1)
         full = self.cursor.y == bottom and top == 0 and bottom == self.lines - 1
-        if full and not self.alt and self.on_scroll is not None:
+        if self.cursor.y == bottom and not self.alt and self.on_scroll is not None:
             self.on_scroll(self.buffer[top])
         if not full:
             super().index()
