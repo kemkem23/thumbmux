@@ -1122,13 +1122,16 @@ test('FIX2 remember seeds the terminal triple after a general full match', () =>
 // DEBT items 1/2/6 through the real HistoryCalibrator: tmux keeps producing
 // while capture runs, the parser trails the pipe by `lagMs` and is therefore
 // AHEAD of the capture snapshot when read after it. Fake clock, true ids hidden.
-async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string }) {
+async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string; wrongScreen?: boolean }) {
   const text = o.text ?? ((i: number) => `row-${i}`);
   const rows = new Map<string, CapturedRow>();
   const rowOf = (t: string) => { let r = rows.get(t); if (!r) { r = naRow(t.padEnd(12)); rows.set(t, r); } return r; };
   const frame: CalibrationFrame = { cells: [naRow('scr ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
   const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
   const paneKey = { serverIdentity: 'private', paneId: '%9', birthGeneration: 1 };
+  // A comparable parser screen that never matches keeps the calibrator in
+  // CAPTURE mode: screen-only captures every 50ms between history captures.
+  const parserFrame: CalibrationFrame = o.wrongScreen ? { ...frame, cells: [naRow('bad ').cells] } : frame;
   let now = 0, revision = 1, produced = 0, applied = 0, inFlight = false;
   const tmuxRing: number[] = [], parser: Array<{ id: number; lineId: number }> = [], producedAt: number[] = [];
   let pending: { at: number; resolve: (c: CalibrationCapture) => void; value: CalibrationCapture; snap: number[] } | undefined;
@@ -1136,7 +1139,7 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
   const end = o.seconds * 1000;
   const ports: CalibrationPorts = {
     now: () => now, schedule: () => {},
-    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, parserFrame: frame,
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, parserFrame,
       recentHistory: parser.map(p => ({ ...rowOf(text(p.id)), lineId: p.lineId, sourceEpoch: 1, geometryGeneration: 1 })) }),
     capture: (_, tail) => {
       st.limits.push(tail); inFlight = true;
@@ -1194,6 +1197,10 @@ test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser 
       // bumps during capture never starve the commit.
       expect(r.staleRevision).toBe(0);
       expect(r.commits).toBe(r.captures);
+      // PIPE mode: one history capture per 200ms, no screen-only capture in
+      // between (output during a capture used to re-arm it 50ms later).
+      expect(r.screenOnly).toBe(0);
+      expect(r.captures).toBeGreaterThanOrEqual(290);
     }
   }
 });
@@ -1208,30 +1215,30 @@ test('DEBT 1 periodic output after the fence never pairs a row with an older cop
 });
 
 test('DEBT 2 a screen-only capture does not erase the incremental seed', async () => {
-  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40 });
-  // Every history capture is followed by a screen-only one while output flows.
-  expect(r.screenOnly).toBeGreaterThan(100);
+  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, wrongScreen: true });
+  console.log('NEWARCH_DEBT2_CAPTURE_MODE', JSON.stringify(r));
+  // CAPTURE mode puts screen-only captures between the history captures.
+  expect(r.screenOnly).toBeGreaterThan(300);
   // Seed survives them: only the birth capture (and the first no-history
   // capture after it) is full; round 2 alternated full/partial ~300 times.
   expect(r.fullCaptures).toBeLessThanOrEqual(3);
   expect(r.coverage).toBeGreaterThanOrEqual(0.99);
   // Direct: history (full) -> screen-only -> incremental history still matched.
-  // Output during the history capture re-arms the lane 50ms later, before the
-  // 200ms history interval, so the next capture carries no history rows.
+  // A wrong parser screen latches CAPTURE mode and re-arms the lane 50ms
+  // later, before the 200ms history interval: that capture has no history.
   const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
   let recent = all.slice(0, 300), time = 0, revision = 1;
   const tails: number[] = [], checks: number[] = [];
   const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
   const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
   const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
-  let calibrator!: HistoryCalibrator;
-  calibrator = new HistoryCalibrator(paneKey, {
+  let parserFrame: CalibrationFrame = { ...frame, cells: [naRow('bad ').cells] };
+  const calibrator = new HistoryCalibrator(paneKey, {
     now: () => time, schedule: () => {},
-    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame: frame }),
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame }),
     capture: async (_, tail) => {
       tails.push(tail);
       const history = recent.slice(Math.max(0, recent.length - tail));
-      if (tails.length === 1) { time = 10; calibrator.output(); }
       return { paneKey, captureId: String(tails.length), requestedAt: time, completedAt: time, before: meta, after: meta, frame, history, completeRetainedTail: tail >= recent.length, observedFields: [] };
     },
     calibrate: async input => { checks.push(input.checks.length); return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
@@ -1239,8 +1246,11 @@ test('DEBT 2 a screen-only capture does not erase the incremental seed', async (
   }, { incremental: true });
   await calibrator.runDue();
   expect(calibrator.dueAt).toBe(50);
+  expect(calibrator.mode).toBe('CAPTURE');
+  parserFrame = frame;
   time = 50; await calibrator.runDue();
   expect(tails).toEqual([4500, 0]);
+  expect(calibrator.mode).toBe('PIPE');
   recent = all.slice(0, 320); calibrator.scroll(20);
   time = 250; await calibrator.runDue();
   // Round 2: the empty screen-only match erased the seed -> partial-tail, 0 checks, then full.

@@ -123,7 +123,10 @@ export class HistoryCalibrator {
     }
     if (this.inFlight) return;
     if (now < this.deadline) { this.ports.schedule(this.dueAt); return; }
-    this.inFlight = true; this.deadline = Infinity;
+    // Output during this capture is spaced from THIS start, not the previous
+    // one; otherwise every history capture was followed by a screen-only
+    // capture 50ms later while in PIPE mode (PLAN §4 allows that only in CAPTURE).
+    this.inFlight = true; this.deadline = Infinity; this.lastCaptureAt = now;
     const startedGeneration = this.eventGeneration;
     const historyDue = this.forceFull || now - this.lastHistoryAt >= 200;
     const requestedScrolls = this.scrolls;
