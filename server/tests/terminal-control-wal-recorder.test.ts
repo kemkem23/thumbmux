@@ -1655,3 +1655,26 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
   await h.calibrator.runDue();
   expect(h.writes).toHaveLength(0);
 });
+
+test('DEBT2 source reset across the fence discards capture then resumes in the new epoch', async () => {
+  const h = naHarness(true);
+  const read = h.ports.read, capture = h.ports.capture;
+  let epoch = 1;
+  h.ports.read = () => {
+    const snapshot = read();
+    return { ...snapshot, sourceEpoch: epoch,
+      recentHistory: snapshot.recentHistory.map(row => ({ ...row, sourceEpoch: epoch })) };
+  };
+  h.ports.capture = async (...args) => {
+    const c = await capture(...args);
+    epoch = 2;
+    const meta = { ...c.after, sourceEpoch: epoch, historyEpoch: epoch };
+    return { ...c, before: meta, after: meta };
+  };
+  await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(0);
+  h.time(1000); await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(1);
+  expect(h.writes[0]!.checks).toHaveLength(3);
+  expect(h.limits).toEqual([4500, 4500]);
+});
