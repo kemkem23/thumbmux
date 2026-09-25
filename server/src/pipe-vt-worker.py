@@ -7,7 +7,8 @@ screen apart from the alternate one. Added here: 47/1047, soft-wrap flags,
 wide glyph wrap at the last column, reflow on resize, and a scroll hook that
 reports each normal-screen row *before* pyte drops it from the buffer.
 
-IPC is stdlib-only, length-prefixed binary on stdin/stdout:
+IPC is stdlib-only, length-prefixed binary; input comes from the FIFO path
+in argv[3] (stdin when absent), output goes to stdout:
   frame  = type:1 byte, length:uint32 BE, payload
   host -> worker
     D  seq:uint64 BE + raw pipe bytes (never decoded by the host)
@@ -29,6 +30,8 @@ import select
 import struct
 import sys
 import time
+from itertools import groupby
+from operator import itemgetter
 
 sys.dont_write_bytecode = True
 
@@ -76,6 +79,7 @@ def row_padded(row, cols):
 class Screen(pyte.Screen):
     def __init__(self, cols, rows):
         self.on_scroll = None
+        self.shift = 0
         self.alt = False
         self.saved_normal = None
         self._drawing = False
@@ -84,10 +88,20 @@ class Screen(pyte.Screen):
     # -- scroll hook: report the row before pyte's index() discards it --
     def index(self):
         top, bottom = self.margins or (0, self.lines - 1)
-        if (self.cursor.y == bottom and top == 0 and bottom == self.lines - 1
-                and not self.alt and self.on_scroll is not None):
+        full = self.cursor.y == bottom and top == 0 and bottom == self.lines - 1
+        if full and not self.alt and self.on_scroll is not None:
             self.on_scroll(self.buffer[top])
+        if not full:
+            super().index()
+            return
+        # pyte marks every row dirty on a scroll. Record a shift instead and
+        # keep only rows that really changed, moved up with the content.
+        before = self.dirty
+        self.dirty = set()
         super().index()
+        self.dirty = {y - 1 for y in before if y > 0}
+        self.dirty.add(bottom)
+        self.shift += 1
 
     def linefeed(self):
         if self._drawing:
@@ -273,22 +287,36 @@ class Screen(pyte.Screen):
         self.dirty.update(range(rows))
 
 
+_STYLE = itemgetter(1, 2, 3, 4, 5, 6, 7, 8)
+
+
 def encode_row(row, cols, default):
-    """Runs of [fg, bg, attrs, graphemes]; '' marks a wide glyph's stub cell."""
+    """Runs of [fg, bg, attrs, cells]. `cells` is a string when every cell is
+    one BMP code unit of width 1 (one character per cell); otherwise a list
+    of graphemes where "" marks the stub cell of a wide glyph."""
+    get = row.get
     runs = []
-    key = None
-    run = None
-    for x in range(cols):
-        c = row[x]
-        attrs = (c.bold | (c.italics << 1) | (c.underscore << 2) | (c.strikethrough << 3)
-                 | (c.reverse << 4) | (c.blink << 5))
-        k = (c.fg, c.bg, attrs)
-        if k != key:
-            run = [c.fg, c.bg, attrs, []]
-            runs.append(run)
-            key = k
-        run[3].append(c.data)
+    for style, group in groupby([get(x, default) for x in range(cols)], _STYLE):
+        data = [c[0] for c in group]
+        joined = "".join(data)
+        if len(joined) == len(data) and "" not in data and max(joined) < "\ud800":
+            payload = joined
+        else:
+            payload = data
+        fg, bg, bold, italics, underscore, strike, reverse, blink = style
+        runs.append([fg, bg, bold | (italics << 1) | (underscore << 2) | (strike << 3)
+                     | (reverse << 4) | (blink << 5), payload])
     return runs
+
+
+def encode_cached(row, cols, default):
+    """Reuse the runs of a row that has not changed since it was last sent.
+    Every pyte mutation marks its row dirty, and emit() refreshes the cache
+    of each dirty row, so a clean row's cache is its current content."""
+    cached = getattr(row, "enc", None)
+    if cached is not None and cached[0] == cols:
+        return cached[1]
+    return encode_row(row, cols, default)
 
 
 class Worker:
@@ -306,8 +334,11 @@ class Worker:
 
     def _on_scroll(self, row):
         s = self.screen
+        # The row leaving is at the top (y=0); if it is not dirty its cache
+        # from the last emitted frame is exactly its content.
+        clean = 0 not in s.dirty and not self.full
         self.scrolls.append({
-            "row": encode_row(row, s.columns, s.default_char),
+            "row": encode_cached(row, s.columns, s.default_char) if clean else encode_row(row, s.columns, s.default_char),
             "wrap": row_wrapped(row),
             "pad": row_padded(row, s.columns),
             "gen": self.gen,
@@ -336,8 +367,14 @@ class Worker:
     def emit(self):
         s = self.screen
         t = time.monotonic_ns()
+        shift = 0 if self.full else min(s.shift, s.lines)
         ys = range(s.lines) if self.full else sorted(y for y in s.dirty if 0 <= y < s.lines)
-        dirty = {str(y): encode_row(s.buffer[y], s.columns, s.default_char) for y in ys}
+        dirty = {}
+        for y in ys:
+            row = s.buffer[y]
+            runs = encode_row(row, s.columns, s.default_char)
+            row.enc = (s.columns, runs)
+            dirty[str(y)] = runs
         wraps = {str(y): row_wrapped(s.buffer[y]) for y in ys}
         pads = [y for y in ys if row_padded(s.buffer[y], s.columns)]
         encode_ns = time.monotonic_ns() - t
@@ -351,6 +388,7 @@ class Worker:
                 "cols": s.columns,
                 "rows": s.lines,
                 "full": self.full,
+                "shift": shift,
                 "dirty": dirty,
                 "wraps": wraps,
                 "pads": pads,
@@ -361,6 +399,7 @@ class Worker:
             "encodeNs": encode_ns,
         })
         s.dirty.clear()
+        s.shift = 0
         self.emitted_seq = self.seq_to
         self.scrolls = []
         self.seq_from = None
@@ -373,7 +412,7 @@ def main():
     rows = int(sys.argv[2]) if len(sys.argv) > 2 else 24
     worker = Worker(cols, rows)
     send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
-    fd = sys.stdin.buffer.fileno()
+    fd = os.open(sys.argv[3], os.O_RDONLY) if len(sys.argv) > 3 else sys.stdin.buffer.fileno()
     buf = bytearray()
     batch_started = None
     batch_bytes = 0

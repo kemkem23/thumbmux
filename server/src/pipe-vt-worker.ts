@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -11,6 +12,10 @@ import { join } from "node:path";
  * so UTF-8 and escape sequences may split anywhere. The worker answers with
  * `U` updates carrying scrolled rows (always before the frame of the same
  * update, and before pyte drops them) and the dirty rows of the screen.
+ *
+ * Host->worker input goes through a private FIFO written with non-blocking
+ * writeSync, not the child's stdin: measured on Bun 1.3.11, 100 small
+ * stdin writes/s cost ~20% of a core in the host, the FIFO ~2.6%.
  */
 
 export const PIPE_VT_VENDOR_SHA256 = "626c68240ce421066a4c915fca0ca0b44576a274fc14d89cae85e6105a79940d";
@@ -18,9 +23,19 @@ export const PIPE_VT_WORKER_FILE = "pipe-vt-worker.py";
 export const PIPE_VT_VENDOR_FILE = "pipe-vt-vendor.zip";
 export const PIPE_VT_LICENSE_FILE = "pipe-vt-LICENSE.txt";
 
-/** [fg, bg, attrs bitmask, graphemes]; "" is the stub cell of a wide glyph. */
-export type PipeVtRun = [fg: string, bg: string, attrs: number, graphemes: string[]];
+/**
+ * [fg, bg, attrs bitmask, cells]. `cells` is a string when every cell is a
+ * single BMP code unit of width 1 (one UTF-16 unit per cell), otherwise one
+ * grapheme per cell with "" as the stub cell of a wide glyph. The compact
+ * form keeps plain rows to a few strings instead of one string per cell.
+ */
+export type PipeVtRun = [fg: string, bg: string, attrs: number, cells: string | string[]];
 export type PipeVtRow = PipeVtRun[];
+
+/** One entry per terminal cell, whichever form the run uses. */
+export function pipeVtRunCells(run: PipeVtRun): string[] {
+  return typeof run[3] === "string" ? run[3].split("") : run[3];
+}
 
 export const PIPE_VT_ATTR = {
   bold: 1,
@@ -48,6 +63,8 @@ export type PipeVtFrame = {
   cols: number;
   rows: number;
   full: boolean;
+  /** Rows the screen scrolled up by before `dirty` applies (0 when full). */
+  shift: number;
   dirty: Record<string, PipeVtRow>;
   wraps: Record<string, boolean>;
   pads: number[];
@@ -121,6 +138,10 @@ export class PipeVtWorker {
   private readyResolve: ((ready: PipeVtReady) => void) | null = null;
   private readyReject: ((error: Error) => void) | null = null;
   private exitWaiters: Array<() => void> = [];
+  private inputDir: string | null = null;
+  private inputFd: number | null = null;
+  private queue: Buffer[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
 
@@ -143,10 +164,22 @@ export class PipeVtWorker {
       this.readyReject?.(new Error(message));
       return this.ready;
     }
+    // Private FIFO for input; O_RDWR so neither side blocks on open and the
+    // worker only sees EOF once we close it.
+    this.inputDir = mkdtempSync(join(tmpdir(), "pipe-vt-"));
+    const fifo = join(this.inputDir, "in.fifo");
+    if (spawnSync("mkfifo", ["-m", "600", fifo]).status !== 0) {
+      const message = `mkfifo failed for ${fifo}`;
+      this.options.onFault({ kind: "spawn", at: now(), message });
+      this.readyReject?.(new Error(message));
+      this.releaseInput();
+      return this.ready;
+    }
+    this.inputFd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
     const child = spawn(
       this.options.python ?? "python3",
-      ["-B", assets.worker, String(this.options.cols), String(this.options.rows)],
-      { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONDONTWRITEBYTECODE: "1", LANG: "C.UTF-8" } },
+      ["-B", assets.worker, String(this.options.cols), String(this.options.rows), fifo],
+      { stdio: ["ignore", "pipe", "pipe"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONDONTWRITEBYTECODE: "1", LANG: "C.UTF-8" } },
     );
     this.child = child;
     this.pid = child.pid ?? null;
@@ -155,13 +188,13 @@ export class PipeVtWorker {
       if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
     });
     child.stdout?.on("data", (chunk: Buffer) => this.onStdout(chunk));
-    child.stdin?.on("error", () => {});
     child.on("error", (error) => {
       this.options.onFault({ kind: "spawn", at: now(), message: error.message });
       this.readyReject?.(error);
     });
     child.on("exit", (code, signal) => {
       this.exited = true;
+      this.releaseInput();
       if (!this.closing) {
         const message = `worker exited code=${code} signal=${signal} ${stderr.slice(-2000)}`.trim();
         this.options.onFault({ kind: "worker-exit", at: now(), message });
@@ -207,9 +240,45 @@ export class PipeVtWorker {
   }
 
   private write(parts: Buffer[]): boolean {
-    const stdin = this.child?.stdin;
-    if (!stdin || this.exited || stdin.destroyed) return false;
-    return stdin.write(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
+    if (this.inputFd === null || this.exited) return false;
+    this.queue.push(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
+    this.flush();
+    return true;
+  }
+
+  /** Write queued frames; a full FIFO (EAGAIN) retries shortly, never drops. */
+  private flush(): void {
+    this.flushTimer = null;
+    while (this.queue.length && this.inputFd !== null) {
+      const head = this.queue[0]!;
+      let written = 0;
+      try {
+        written = writeSync(this.inputFd, head);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+      }
+      if (written === head.length) {
+        this.queue.shift();
+        continue;
+      }
+      if (written > 0) this.queue[0] = head.subarray(written);
+      this.flushTimer ??= setTimeout(() => this.flush(), 1);
+      return;
+    }
+  }
+
+  private releaseInput(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.queue = [];
+    if (this.inputFd !== null) {
+      try { closeSync(this.inputFd); } catch {}
+      this.inputFd = null;
+    }
+    if (this.inputDir) {
+      rmSync(this.inputDir, { recursive: true, force: true });
+      this.inputDir = null;
+    }
   }
 
   /** Forward raw pipe bytes untouched; `seq` is the receive sequence. */
@@ -239,7 +308,6 @@ export class PipeVtWorker {
     this.closing = true;
     const exited = new Promise<void>((resolve) => this.exitWaiters.push(resolve));
     this.write([header("Q", 0)]);
-    this.child.stdin?.end();
     const timer = setTimeout(() => this.child?.kill("SIGKILL"), timeoutMs);
     return exited.finally(() => clearTimeout(timer));
   }
