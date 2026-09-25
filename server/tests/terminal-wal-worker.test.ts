@@ -1380,6 +1380,20 @@ test("I1 scroll receipts precede frame publication and rejected receipts release
   await pane.collector.drained();
 });
 
+test("I1 frame Promise rejection becomes a contextual issue without an unhandled rejection", async () => {
+  const faults: PipeFaultEvent[] = [];
+  const pane = await collectPane(80, 3, { ports: {
+    onScroll: () => {},
+    onFrame: async e => { if (e.receiveSeq > 0) throw new Error("frame publish rejected"); },
+    onFault: e => { faults.push(e); },
+  } });
+  pane.collector.ingest(encoder.encode("frame"));
+  await untilFix1(() => faults.some(f => f.kind === "consumer-rejected"));
+  expect(faults.find(f => f.kind === "consumer-rejected")?.missingCount).toBeNull();
+  expect(pane.collector.stats().inflightBytes).toBe(0);
+  await pane.collector.drained();
+});
+
 test("I1 owner reset discards alternate and partial UTF8/ESC state before next epoch", async () => {
   const pane = await collectPane(80, 3);
   pane.collector.ingest(encoder.encode("\x1b[?1049hALT\x1b[31"));
