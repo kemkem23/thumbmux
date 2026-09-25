@@ -16,6 +16,8 @@ import { flushSync, mount, unmount, tick } from "./svelte-client";
 import TermView from "../src/TermView.svelte";
 import { tmuxMux } from "../src/ws-mux.svelte";
 import type { AnsiPalette } from "@thumbmux/core";
+import { canvasLinkHits } from "../src/canvas-terminal/links";
+import { createCanvasModelRows } from "../src/canvas-terminal/model";
 
 const require = createRequire(import.meta.url);
 const svelteClientInternals = join(
@@ -723,6 +725,24 @@ beforeEach(() => {
   window.requestIdleCallback = requestControlledIdle;
   window.cancelIdleCallback = cancelControlledIdle;
   jest.spyOn(performance, "now").mockImplementation(() => frameNow);
+});
+
+describe("Canvas fixture engine (NEWARCH G4)", () => {
+  test("keeps the client model bounded to the supplied 10k-row window", () => {
+    const millionRowSource = { length: 1_000_000 };
+    const window = Array.from({ length: 10_000 }, (_, index) => `row-${index}`);
+    const rows = createCanvasModelRows(window, millionRowSource.length - window.length);
+    expect(rows).toHaveLength(10_000);
+    expect(rows[0]!.id).toBe(990_000);
+    expect(rows.at(-1)!.id).toBe(999_999);
+  });
+
+  test("creates cell hit regions for every URL in a 100-link fixture", () => {
+    const lines = Array.from({ length: 100 }, (_, index) => `https://example.test/${index}`);
+    const hits = canvasLinkHits(lines, 80);
+    expect(hits).toHaveLength(100);
+    expect(hits.every((hit, index) => hit.row === index && hit.startCol === 0)).toBe(true);
+  });
 });
 
 afterEach(() => {
