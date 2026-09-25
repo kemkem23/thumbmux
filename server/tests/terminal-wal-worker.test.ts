@@ -757,14 +757,14 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(row[3]).toEqual(["default", "default", 0, " "]);
     // EL with a blue background paints the rest of the line, blanks and all.
     expect(row[4]).toEqual(["default", "blue", 0, " ".repeat(16)]);
-    // A run with a wide glyph or a combining mark keeps one entry per cell.
-    pane.collector.ingest(encoder.encode("中e\u0301x\r\n"));
-    await settle(pane);
-    expect(pane.screen.get(1)!.row[0]![3]).toEqual(["中", "", "e\u0301", "x", ...Array(16).fill(" ")]);
     expect(pane.last!.cursor).toEqual({ x: 0, y: 1, visible: true });
     pane.collector.ingest(encoder.encode("\x1b[?25l"));
     await settle(pane);
     expect(pane.last!.cursor.visible).toBe(false);
+    // A run with a wide glyph or a combining mark keeps one entry per cell.
+    pane.collector.ingest(encoder.encode("中e\u0301x\r\n"));
+    await settle(pane);
+    expect(pane.screen.get(1)!.row[0]![3]).toEqual(["中", "", "e\u0301", "x", ...Array(16).fill(" ")]);
   });
 
   test("scrolling inside a DECSTBM region never becomes history; full-screen scrolls do", async () => {
@@ -1011,6 +1011,64 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type RoundResult = Record<string, unknown>;
 
+/**
+ * Measurement pane: keeps only row text for the oracle, so the harness's own
+ * retained heap does not inflate the host GC cost being measured.
+ */
+type LightPane = {
+  collector: PipeHistoryCollector;
+  history: Array<{ text: string; wrap: boolean }>;
+  screen: Map<number, { text: string; wrap: boolean }>;
+  faults: PipeFaultEvent[];
+};
+
+async function lightPane(cols: number, rows: number, paneKey: PaneKeyLike): Promise<LightPane> {
+  const pane: LightPane = { collector: undefined as unknown as PipeHistoryCollector, history: [], screen: new Map(), faults: [] };
+  pane.collector = new PipeHistoryCollector({
+    paneKey,
+    sourceEpoch: 1,
+    cols,
+    rows,
+    latencySampleLimit: 2_000_000,
+    ports: {
+      onScroll: (event) => pane.history.push({ text: rowText(event.physicalRow, event.wrapPad), wrap: event.softWrap }),
+      onFrame: (event) => {
+        if (event.cells.full) pane.screen.clear();
+        else if (event.cells.shift > 0) {
+          const moved = new Map<number, { text: string; wrap: boolean }>();
+          for (const [y, entry] of pane.screen) if (y - event.cells.shift >= 0) moved.set(y - event.cells.shift, entry);
+          pane.screen = moved;
+        }
+        for (const [y, row] of Object.entries(event.cells.dirty)) {
+          const index = Number(y);
+          pane.screen.set(index, { text: rowText(row, event.cells.wrapPad.includes(index)), wrap: event.cells.softWrap[index] ?? false });
+        }
+      },
+      onFault: (event) => pane.faults.push(event),
+    },
+  });
+  await pane.collector.start();
+  return pane;
+}
+
+function lightLogical(pane: LightPane): string[] {
+  const physical = [...pane.history, ...[...pane.screen.keys()].sort((a, b) => a - b).map((y) => pane.screen.get(y)!)];
+  const lines: string[] = [];
+  let current = "";
+  for (const row of physical) {
+    if (row.wrap) {
+      current += row.text;
+      continue;
+    }
+    lines.push((current + row.text).replace(/ +$/, ""));
+    current = "";
+  }
+  if (current) lines.push(current.replace(/ +$/, ""));
+  return lines;
+}
+
+type PaneKeyLike = { serverIdentity: string; paneId: string; birthGeneration: number };
+
 async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean): Promise<RoundResult> {
   const dir = mkdtempSync(join(tmpdir(), "l2p-"));
   roots.push(dir);
@@ -1018,7 +1076,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
   const producer = join(dir, "producer.py");
   writeFileSync(producer, PRODUCER_SCRIPT);
   const count = cfg.count ?? cfg.rate * (cfg.seconds + 3);
-  const panes: Array<{ name: string; fifo: string; pane?: CollectedPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
+  const panes: Array<{ name: string; fifo: string; pane?: LightPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
   const samples = JSON.stringify(PRODUCER_SAMPLES);
   const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   try {
@@ -1033,10 +1091,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
       ];
       if (withPipe) {
         expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
-        entry.pane = await collectPane(cfg.cols, cfg.rows, {
-          paneKey: { serverIdentity: socket, paneId: name, birthGeneration: 1 },
-          latencySampleLimit: 2_000_000,
-        });
+        entry.pane = await lightPane(cfg.cols, cfg.rows, { serverIdentity: socket, paneId: name, birthGeneration: 1 });
         entry.reader = Bun.spawn(["cat", fifo], { stdout: "pipe", stderr: "ignore" });
         entry.pump = pumpBinaryStream(entry.reader.stdout as ReadableStream<Uint8Array>, entry.pane.collector);
         // Same tmux command as the birth: the reader sees byte 0.
@@ -1067,8 +1122,8 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     const started = performance.now();
     const t0 = components();
     const allDone = () => panes.every((e) => e.pane && [
-      ...screenRows(e.pane).map((r) => r.text),
-      ...e.pane.scrolls.slice(-50).map((s) => rowText(s.physicalRow)),
+      ...[...e.pane.screen.values()].map((r) => r.text),
+      ...e.pane.history.slice(-50).map((r) => r.text),
     ].some((text) => text.startsWith(`${e.name} DONE`)));
     if (cfg.seconds > 0) {
       await sleep(cfg.seconds * 1000);
@@ -1083,7 +1138,14 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
 
     const deadline = Date.now() + 60_000;
     while (!allDone() && Date.now() < deadline) await sleep(50);
-    for (const entry of panes) await settle(entry.pane!, 30_000);
+    for (const entry of panes) {
+      const settleBy = Date.now() + 30_000;
+      while (Date.now() < settleBy) {
+        const stats = entry.pane!.collector.stats();
+        if (stats.ackedSeq === stats.receiveSeq && stats.inflightBytes === 0) break;
+        await sleep(5);
+      }
+    }
     if (cfg.idleSeconds > 0) {
       const i0 = components();
       await sleep(cfg.idleSeconds * 1000);
@@ -1098,7 +1160,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     for (const entry of panes) {
       const pane = entry.pane!;
       const ids: number[] = [];
-      for (const line of logicalLines(pane)) {
+      for (const line of lightLogical(pane)) {
         const match = new RegExp(`^${entry.name} (\\d{6}) (.*)$`).exec(line);
         if (!match) continue;
         const id = Number(match[1]);
