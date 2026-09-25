@@ -1,7 +1,9 @@
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -31,6 +33,7 @@ import {
 } from "../src/integrations/terminal-wal";
 import {
   PipeHistoryCollector,
+  pumpBinaryStream,
   type PipeFaultEvent,
   type PipeFrameEvent,
   type PipeHistoryCollectorOptions,
@@ -40,6 +43,7 @@ import {
   PIPE_VT_ATTR,
   PIPE_VT_VENDOR_SHA256,
   pipeVtAssets,
+  pipeVtRunCells,
   verifyPipeVtAssets,
   type PipeVtRow,
 } from "../src/pipe-vt-worker";
@@ -542,6 +546,11 @@ async function collectPane(cols = 80, rows = 24, extra: Partial<PipeHistoryColle
         pane.frames.push(event);
         pane.last = event;
         if (event.cells.full) pane.screen.clear();
+        else if (event.cells.shift > 0) {
+          const moved = new Map<number, { row: PipeVtRow; wrap: boolean; pad: boolean }>();
+          for (const [y, entry] of pane.screen) if (y - event.cells.shift >= 0) moved.set(y - event.cells.shift, entry);
+          pane.screen = moved;
+        }
         for (const [y, row] of Object.entries(event.cells.dirty)) {
           const index = Number(y);
           pane.screen.set(index, {
@@ -578,7 +587,7 @@ function feedSplit(pane: CollectedPane, bytes: Uint8Array, size: number): void {
 }
 
 function cellsOf(row: PipeVtRow): string[] {
-  return row.flatMap((run) => run[3]);
+  return row.flatMap((run) => pipeVtRunCells(run));
 }
 
 function rowText(row: PipeVtRow, pad = false): string {
@@ -742,12 +751,16 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     await settle(pane);
     const row = pane.screen.get(0)!.row;
     expect(cellsOf(row).length).toBe(20);
-    expect(row[0]).toEqual(["red", "default", PIPE_VT_ATTR.bold, ["R"]]);
-    expect(row[1]).toEqual(["default", "green", PIPE_VT_ATTR.underscore, ["U"]]);
-    expect(row[2]).toEqual(["default", "default", PIPE_VT_ATTR.reverse, ["V"]]);
-    expect(row[3]).toEqual(["default", "default", 0, [" "]]);
+    expect(row[0]).toEqual(["red", "default", PIPE_VT_ATTR.bold, "R"]);
+    expect(row[1]).toEqual(["default", "green", PIPE_VT_ATTR.underscore, "U"]);
+    expect(row[2]).toEqual(["default", "default", PIPE_VT_ATTR.reverse, "V"]);
+    expect(row[3]).toEqual(["default", "default", 0, " "]);
     // EL with a blue background paints the rest of the line, blanks and all.
-    expect(row[4]).toEqual(["default", "blue", 0, Array(16).fill(" ")]);
+    expect(row[4]).toEqual(["default", "blue", 0, " ".repeat(16)]);
+    // A run with a wide glyph or a combining mark keeps one entry per cell.
+    pane.collector.ingest(encoder.encode("中e\u0301x\r\n"));
+    await settle(pane);
+    expect(pane.screen.get(1)!.row[0]![3]).toEqual(["中", "", "e\u0301", "x", ...Array(16).fill(" ")]);
     expect(pane.last!.cursor).toEqual({ x: 0, y: 1, visible: true });
     pane.collector.ingest(encoder.encode("\x1b[?25l"));
     await settle(pane);
@@ -811,7 +824,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     };
     const alphabet = ["a", "b", "c", "d", "e", "中", "文", "ก", "ข", "่", "1", "2"];
     const lines: string[] = [];
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 90; i++) {
       const length = Math.floor(random() * 170);
       let line = `L${i}:`;
       for (let j = 0; j < length; j++) line += alphabet[Math.floor(random() * alphabet.length)];
@@ -821,13 +834,13 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     const write = (from: number, to: number) => {
       for (const line of lines.slice(from, to)) feedSplit(pane, encoder.encode(`${line}\r\n`), 5);
     };
-    write(0, 20);
+    write(0, 30);
     await settle(pane);
     expect(pane.collector.resize(37, 24)).toBe(1);
-    write(20, 40);
+    write(30, 60);
     await settle(pane);
-    expect(pane.collector.resize(120, 40)).toBe(2);
-    write(40, 60);
+    expect(pane.collector.resize(120, 24)).toBe(2);
+    write(60, 90);
     await settle(pane);
     expect(logicalLines(pane)).toEqual(lines);
     const generations = new Set(pane.scrolls.map((s) => s.geometryGeneration));
@@ -835,8 +848,9 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     // Rows pushed out by the shrink are 37 cells wide; none are repeated.
     expect(pane.scrolls.filter((s) => s.geometryGeneration === 1).every((s) => cellsOf(s.physicalRow).length === 37)).toBe(true);
     expect(pane.scrolls.some((s) => s.softWrap && s.wrapPad)).toBe(true);
+    expect(pane.scrolls.filter((s) => s.geometryGeneration === 2).every((s) => cellsOf(s.physicalRow).length === 120)).toBe(true);
     expect(pane.last!.cells.cols).toBe(120);
-    expect(pane.last!.cells.rows).toBe(40);
+    expect(pane.last!.cells.rows).toBe(24);
   }, 30_000);
 
   test("a 20,000-row burst reaches onScroll in order, each row before the ring evicts it", async () => {
@@ -885,4 +899,285 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.faults.map((f) => f.kind)).toEqual(["worker-exit"]);
     expect(pane.collector.health()).toBe("broken");
   });
+});
+
+// ---------------------------------------------------------------------------
+// L2-P real pipe: private tmux socket only (never the default server), the
+// pipe opened in the same tmux command as new-session, a producer whose
+// sequence ids are the independent oracle (missing/extra/wrong must be 0),
+// and PLAN §6 receive->frame latency and CPU per pane of the real worker.
+//
+// L2P_MEASURE picks the load. The committed default "smoke" (1 pane, 10 s)
+// keeps this suite short; the §6 evidence runs set "steady-1" (80x24),
+// "steady-21" (21 panes, 120x40) or "burst" (20,000 rows) in a separate
+// commit, because one 60 s x3 set per invocation is what fits the cage and
+// the runner's wall clock. The commit of every evidence run is in REPORT.md.
+// Numbers are printed as `L2P-MEASURE {json}`; §6 targets are reported, not
+// asserted, so a miss is visible instead of turning into a lowered load.
+// ---------------------------------------------------------------------------
+
+const L2P_MEASURE = "smoke" as "smoke" | "steady-1" | "steady-21" | "burst";
+const LIVE_TMUX = process.env.GITHUB_ACTIONS !== "true";
+
+type MeasureConfig = {
+  name: string;
+  panes: number;
+  cols: number;
+  rows: number;
+  rate: number;
+  seconds: number;
+  rounds: number;
+  baseline: boolean;
+  idleSeconds: number;
+  count?: number;
+};
+
+const MEASURE_CONFIGS: Record<typeof L2P_MEASURE, MeasureConfig> = {
+  smoke: { name: "smoke", panes: 1, cols: 80, rows: 24, rate: 100, seconds: 10, rounds: 1, baseline: false, idleSeconds: 0 },
+  "steady-1": { name: "steady-1", panes: 1, cols: 80, rows: 24, rate: 100, seconds: 60, rounds: 3, baseline: true, idleSeconds: 15 },
+  "steady-21": { name: "steady-21", panes: 21, cols: 120, rows: 40, rate: 100, seconds: 60, rounds: 3, baseline: true, idleSeconds: 15 },
+  burst: { name: "burst", panes: 1, cols: 80, rows: 24, rate: 0, seconds: 0, rounds: 1, baseline: false, idleSeconds: 0, count: 20_000 },
+};
+
+/** [raw bytes the producer writes, text the screen must show]. */
+const PRODUCER_SAMPLES: Array<[string, string]> = [
+  ["\x1b[31mred\x1b[0m plain ascii", "red plain ascii"],
+  ["ภาษาไทย สระ ที่ น้ำ", "ภาษาไทย สระ ที่ น้ำ"],
+  ["中文 漢字 かな 한국어", "中文 漢字 かな 한국어"],
+  ["emoji 👨‍👩‍👧 🇹🇭 👍🏽", "emoji 👨‍👩‍👧 🇹🇭 👍🏽"],
+  ["\x1b[1;44m bold on blue \x1b[0m end", " bold on blue  end"],
+  ["combining é ä", "combining é ä"],
+];
+
+const PRODUCER_SCRIPT = `
+import json, sys, time
+pane, rate, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+samples = [raw for raw, _ in json.loads(sys.argv[4])]
+out = sys.stdout.buffer
+start = time.monotonic()
+for i in range(count):
+    if rate > 0:
+        delay = start + i / rate - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+    if i % 50 == 25:
+        # TUI-style status: save cursor, paint at row 1 col 60, restore.
+        out.write(b"\\x1b7\\x1b[1;60H\\x1b[7mstatus\\x1b[0m\\x1b8")
+    out.write(f"{pane} {i:06d} {samples[i % len(samples)]}\\r\\n".encode())
+    if rate > 0:
+        out.flush()
+out.write(f"{pane} DONE\\r\\n".encode())
+out.flush()
+time.sleep(3600)
+`;
+
+let clockTicks = 0;
+function cpuSeconds(pid: number | null | undefined): number {
+  if (!pid) return 0;
+  if (!clockTicks) clockTicks = Number(spawnSync("getconf", ["CLK_TCK"]).stdout.toString().trim()) || 100;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return (Number(fields[11]) + Number(fields[12])) / clockTicks;
+  } catch {
+    return 0;
+  }
+}
+
+function hostCpuSeconds(): number {
+  const usage = process.cpuUsage();
+  return (usage.user + usage.system) / 1e6;
+}
+
+/** tmux's `exec cat > fifo` writer: argv `cat`, stdout on our FIFO. */
+function writerPid(fifo: string): number | null {
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const argv = readFileSync(`/proc/${name}/cmdline`, "utf8").split("\0").filter(Boolean);
+      if (argv.length === 1 && /(?:^|\/)cat$/.test(argv[0]!) && readlinkSync(`/proc/${name}/fd/1`) === fifo) return Number(name);
+    } catch {}
+  }
+  return null;
+}
+
+function privateTmux(socket: string, args: string[]) {
+  const result = spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`tmux ${args[0]} failed: ${result.stderr}`);
+  return result.stdout;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type RoundResult = Record<string, unknown>;
+
+async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean): Promise<RoundResult> {
+  const dir = mkdtempSync(join(tmpdir(), "l2p-"));
+  roots.push(dir);
+  const socket = join(dir, "x.sock");
+  const producer = join(dir, "producer.py");
+  writeFileSync(producer, PRODUCER_SCRIPT);
+  const count = cfg.count ?? cfg.rate * (cfg.seconds + 3);
+  const panes: Array<{ name: string; fifo: string; pane?: CollectedPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
+  const samples = JSON.stringify(PRODUCER_SAMPLES);
+  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  try {
+    for (let p = 0; p < cfg.panes; p++) {
+      const name = `p${p}`;
+      const fifo = join(dir, `${name}.fifo`);
+      const entry: (typeof panes)[number] = { name, fifo };
+      const command = `exec python3 -B ${shellQuote(producer)} ${name} ${cfg.rate} ${count} ${shellQuote(samples)}`;
+      const birth = [
+        ...(p === 0 ? ["-f", "/dev/null"] : []),
+        "new-session", "-d", "-s", name, "-x", String(cfg.cols), "-y", String(cfg.rows), command,
+      ];
+      if (withPipe) {
+        expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+        entry.pane = await collectPane(cfg.cols, cfg.rows, {
+          paneKey: { serverIdentity: socket, paneId: name, birthGeneration: 1 },
+          latencySampleLimit: 2_000_000,
+        });
+        entry.reader = Bun.spawn(["cat", fifo], { stdout: "pipe", stderr: "ignore" });
+        entry.pump = pumpBinaryStream(entry.reader.stdout as ReadableStream<Uint8Array>, entry.pane.collector);
+        // Same tmux command as the birth: the reader sees byte 0.
+        privateTmux(socket, [...birth, ";", "pipe-pane", "-O", `exec cat > ${shellQuote(fifo)}`]);
+      } else {
+        privateTmux(socket, birth);
+      }
+      panes.push(entry);
+    }
+    const serverPid = Number(privateTmux(socket, ["display-message", "-p", "#{pid}"]).trim());
+    await sleep(200); // let tmux's `sh -c exec cat` writers finish their exec
+    for (const entry of panes) if (withPipe) entry.writer = writerPid(entry.fifo);
+    const components = () => ({
+      worker: panes.reduce((sum, e) => sum + cpuSeconds(e.pane?.collector.workerPid), 0),
+      reader: panes.reduce((sum, e) => sum + cpuSeconds(e.reader?.pid), 0),
+      writer: panes.reduce((sum, e) => sum + cpuSeconds(e.writer), 0),
+      tmux: cpuSeconds(serverPid),
+      host: hostCpuSeconds(),
+    });
+    const diff = (a: ReturnType<typeof components>, b: ReturnType<typeof components>) => ({
+      worker: b.worker - a.worker,
+      reader: b.reader - a.reader,
+      writer: b.writer - a.writer,
+      tmux: b.tmux - a.tmux,
+      host: b.host - a.host,
+    });
+    for (const entry of panes) entry.pane?.collector.resetLatency();
+    const started = performance.now();
+    const t0 = components();
+    const allDone = () => panes.every((e) => e.pane && [
+      ...screenRows(e.pane).map((r) => r.text),
+      ...e.pane.scrolls.slice(-50).map((s) => rowText(s.physicalRow)),
+    ].some((text) => text.startsWith(`${e.name} DONE`)));
+    if (cfg.seconds > 0) {
+      await sleep(cfg.seconds * 1000);
+    } else {
+      const deadline = Date.now() + 240_000;
+      while (!allDone() && Date.now() < deadline) await sleep(20);
+    }
+    const t1 = components();
+    const activeSeconds = (performance.now() - started) / 1000;
+    const result: RoundResult = { config: cfg.name, round, withPipe, panes: cfg.panes, geometry: `${cfg.cols}x${cfg.rows}`, ratePerPane: cfg.rate, activeSeconds, active: diff(t0, t1) };
+    if (!withPipe) return result;
+
+    const deadline = Date.now() + 60_000;
+    while (!allDone() && Date.now() < deadline) await sleep(50);
+    for (const entry of panes) await settle(entry.pane!, 30_000);
+    if (cfg.idleSeconds > 0) {
+      const i0 = components();
+      await sleep(cfg.idleSeconds * 1000);
+      result.idleSeconds = cfg.idleSeconds;
+      result.idle = diff(i0, components());
+    }
+
+    // Oracle: every producer id exactly once, in order, with its exact text.
+    let missing = 0;
+    let extra = 0;
+    let wrong = 0;
+    for (const entry of panes) {
+      const pane = entry.pane!;
+      const ids: number[] = [];
+      for (const line of logicalLines(pane)) {
+        const match = new RegExp(`^${entry.name} (\\d{6}) (.*)$`).exec(line);
+        if (!match) continue;
+        const id = Number(match[1]);
+        ids.push(id);
+        const expected = PRODUCER_SAMPLES[id % PRODUCER_SAMPLES.length]![1];
+        const shown = match[2]!.replace(/ +status$/, "").replace(/ +$/, "");
+        if (shown !== expected.replace(/ +$/, "")) wrong += 1;
+      }
+      const seen = new Set<number>();
+      for (const id of ids) {
+        if (seen.has(id) || id >= count) extra += 1;
+        seen.add(id);
+      }
+      for (let id = 0; id < count; id++) if (!seen.has(id)) missing += 1;
+      expect(ids[0]).toBe(0); // byte 0: the pipe opened with the pane
+      expect(pane.faults).toEqual([]);
+    }
+    const latencies = panes.flatMap((e) => [...e.pane!.collector.latencySamples()]).sort((a, b) => a - b);
+    const pick = (p: number) => latencies.length ? latencies[Math.min(latencies.length - 1, Math.floor((latencies.length - 1) * p))]! : null;
+    const stats = panes.map((e) => e.pane!.collector.stats());
+    result.rowsPerPane = count;
+    result.latencyMs = { samples: latencies.length, p50: pick(0.5), p95: pick(0.95), p99: pick(0.99), max: latencies.at(-1) ?? null };
+    result.worstPaneP95Ms = Math.max(...stats.map((s) => s.latency.p95Ms ?? 0));
+    result.timeSplitMs = {
+      workerParse: stats.reduce((sum, s) => sum + s.workerParseMs, 0),
+      workerEncode: stats.reduce((sum, s) => sum + s.workerEncodeMs, 0),
+      hostHandle: stats.reduce((sum, s) => sum + s.hostHandleMs, 0),
+    };
+    result.scrolls = stats.reduce((sum, s) => sum + s.scrolls, 0);
+    result.frames = stats.reduce((sum, s) => sum + s.frames, 0);
+    result.oracle = { missing, extra, wrong };
+    expect({ missing, extra, wrong }).toEqual({ missing: 0, extra: 0, wrong: 0 });
+    return result;
+  } finally {
+    for (const entry of panes) entry.reader?.kill();
+    spawnSync("tmux", ["-S", socket, "kill-server"]);
+    for (const entry of panes) await entry.pane?.collector.close();
+  }
+}
+
+describe("L2-P real pipe-pane on a private tmux socket", () => {
+  test.skipIf(!LIVE_TMUX)(`measure ${L2P_MEASURE}: birth pipe, oracle 0 missing/extra/wrong, latency and CPU`, async () => {
+    const cfg = MEASURE_CONFIGS[L2P_MEASURE];
+    const results: RoundResult[] = [];
+    let base: RoundResult | null = null;
+    if (cfg.baseline) {
+      base = await measureRound(cfg, 0, false);
+      console.log(`L2P-MEASURE ${JSON.stringify(base)}`);
+    }
+    for (let round = 1; round <= cfg.rounds; round++) {
+      const result = await measureRound(cfg, round, true);
+      const active = result.active as Record<string, number>;
+      const baseActive = base?.active as Record<string, number> | undefined;
+      const seconds = result.activeSeconds as number;
+      const tmuxExtra = active.tmux! - (baseActive ? baseActive.tmux! * (seconds / (base!.activeSeconds as number)) : 0);
+      const hostExtra = active.host! - (baseActive ? baseActive.host! * (seconds / (base!.activeSeconds as number)) : 0);
+      const ownCpu = active.worker! + active.reader! + active.writer!;
+      result.cpuPercentPerPane = {
+        workerReaderWriter: (ownCpu / seconds / cfg.panes) * 100,
+        withTmuxAndHostOverBaseline: ((ownCpu + tmuxExtra + hostExtra) / seconds / cfg.panes) * 100,
+        workerOnly: (active.worker! / seconds / cfg.panes) * 100,
+        totalCores: (ownCpu + tmuxExtra + hostExtra) / seconds,
+      };
+      if (result.idle) {
+        const idle = result.idle as Record<string, number>;
+        result.idleCpuPercentPerPane = ((idle.worker! + idle.reader! + idle.writer!) / cfg.idleSeconds / cfg.panes) * 100;
+      }
+      const latency = result.latencyMs as { p95: number; p99: number };
+      result.targets = {
+        latencyP95le16: latency.p95 <= 16,
+        latencyP99le33: latency.p99 <= 33,
+        activeCpuLe5pct: (result.cpuPercentPerPane as { withTmuxAndHostOverBaseline: number }).withTmuxAndHostOverBaseline <= 5,
+        idleCpuLe05pct: result.idleCpuPercentPerPane === undefined ? null : (result.idleCpuPercentPerPane as number) <= 0.5,
+        totalLe1Core: (result.cpuPercentPerPane as { totalCores: number }).totalCores <= 1,
+      };
+      console.log(`L2P-MEASURE ${JSON.stringify(result)}`);
+      results.push(result);
+    }
+    expect(results.length).toBe(cfg.rounds);
+    for (const result of results) expect((result.latencyMs as { samples: number }).samples).toBeGreaterThan(0);
+  }, 900_000);
 });
