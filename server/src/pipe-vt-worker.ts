@@ -115,6 +115,8 @@ export function verifyPipeVtAssets(assets: PipeVtAssets): string {
 }
 
 export type PipeVtWorkerOptions = {
+  sourceEpoch?: number;
+  onHistoryClear?: (event: { seq: number; epoch: number }) => void;
   cols: number;
   rows: number;
   onUpdate: (update: PipeVtUpdate) => void;
@@ -184,7 +186,7 @@ export class PipeVtWorker {
     this.inputFd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
     const child = spawn(
       this.options.python ?? "python3",
-      ["-B", assets.worker, String(this.options.cols), String(this.options.rows), fifo],
+      ["-B", assets.worker, String(this.options.cols), String(this.options.rows), fifo, String(this.options.sourceEpoch ?? 1)],
       { stdio: ["ignore", "pipe", "pipe"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONDONTWRITEBYTECODE: "1", LANG: "C.UTF-8" } },
     );
     this.child = child;
@@ -228,6 +230,7 @@ export class PipeVtWorker {
         continue;
       }
       if (kind === "U") this.options.onUpdate(message as PipeVtUpdate);
+      else if (kind === "H") this.options.onHistoryClear?.(message as { seq: number; epoch: number });
       else if (kind === "R") {
         this.readyResolve?.(message as PipeVtReady);
         this.readyResolve = null;

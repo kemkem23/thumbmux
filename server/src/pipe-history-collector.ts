@@ -56,7 +56,7 @@ export type PipeFrameEvent = {
 };
 
 export type PipeFaultEvent = {
-  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "closed";
+  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed";
   at: number;
   message?: string;
   /** Bytes whose parsing could not be acknowledged; not a guessed row count. */
@@ -158,6 +158,14 @@ export class PipeHistoryCollector {
 
   private makeWorker(): PipeVtWorker {
     return new PipeVtWorker({
+      sourceEpoch: this.sourceEpoch,
+      onHistoryClear: ({ seq, epoch }) => {
+        this.ring.length = 0;
+        this.ringStart = 0;
+        this.notifyFault({ kind: "history-cleared", at: this.now(),
+          message: `CSI 3J cleared history in source epoch ${epoch}; visible screen retained`,
+          receiveSeqFrom: seq, receiveSeqTo: seq });
+      },
       cols: this.cols,
       rows: this.rows,
       assets: this.options.assets,
@@ -406,7 +414,11 @@ export class PipeHistoryCollector {
         this.latencyMs.push(Number(published - entry.at) / 1e6);
       }
     }
-    if (seqTo > this.ackedSeq) this.ackedSeq = seqTo;
+    // A parsed input acknowledgment, not process readiness, proves recovery.
+    if (seqTo > this.ackedSeq) {
+      this.ackedSeq = seqTo;
+      this.recoveryAttempts = 0;
+    }
     this.hostHandleNs += published - began;
     if (this.inflightBytes <= this.queueLimit) {
       if (this.healthState === "degraded") this.healthState = "ok";

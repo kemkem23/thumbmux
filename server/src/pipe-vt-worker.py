@@ -77,11 +77,12 @@ def row_padded(row, cols):
 
 
 class Screen(pyte.Screen):
-    def __init__(self, cols, rows):
-        self.epoch = 1
+    def __init__(self, cols, rows, epoch=1):
+        self.epoch = epoch
         self.receive_seq = 0
         self.scroll_on_clear = None
         self.on_scroll = None
+        self.on_history_clear = None
         self.shift = 0
         self.alt = False
         self.saved_normal = None
@@ -90,21 +91,35 @@ class Screen(pyte.Screen):
 
     def stamp(self):
         row = self.buffer[self.cursor.y]
-        if not hasattr(row, "epoch"):
+        if not hasattr(row, "epoch") or getattr(row, "origin_seq", 0) == 0:
             row.epoch = self.epoch
             row.origin_seq = self.receive_seq
 
+    def preserve_on_clear(self):
+        if self.alt or self.on_scroll is None:
+            return
+        if self.scroll_on_clear is None:
+            send(b"E", {"kind": "clear-policy-unknown", "message": "scroll-on-clear was not read from the pane; clear may discard normal rows"})
+        elif self.scroll_on_clear:
+            last = max((y for y, row in self.buffer.items()
+                        if any(c.data != " " for c in row.values())), default=-1)
+            for y in range(last + 1):
+                self.on_scroll(self.buffer[y])
+
+    def reset(self):
+        # pyte also calls reset during construction, before a hook exists.
+        self.preserve_on_clear()
+        super().reset()
+        self.shift = 0
+
     def erase_in_display(self, how=0, *args, **kw):
-        if how == 2 and not self.alt:
-            if self.scroll_on_clear is None:
-                send(b"E", {"kind": "clear-policy-unknown", "message": "scroll-on-clear was not read from the pane; clear may discard normal rows"})
-            elif self.scroll_on_clear and self.on_scroll is not None:
-                # tmux preserves through the last nonblank line, not trailing
-                # empty display rows, when the whole display is cleared.
-                last = max((y for y, row in self.buffer.items()
-                            if any(c.data != " " for c in row.values())), default=-1)
-                for y in range(last + 1):
-                    self.on_scroll(self.buffer[y])
+        if how == 3:
+            # tmux E3 clears scrollback only; pyte treats it as ED2.
+            if not self.alt and self.on_history_clear is not None:
+                self.on_history_clear()
+            return
+        if how == 2:
+            self.preserve_on_clear()
         super().erase_in_display(how, *args, **kw)
         if how == 2:
             for row in self.buffer.values():
@@ -378,8 +393,8 @@ def encode_cached(row, cols, default):
 
 
 class Worker:
-    def __init__(self, cols, rows):
-        self.screen = Screen(cols, rows)
+    def __init__(self, cols, rows, epoch=1):
+        self.screen = Screen(cols, rows, epoch)
         stream_type = type("TmuxByteStream", (pyte.ByteStream,), {"csi": {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}, "events": pyte.ByteStream.events | {"scroll_up", "scroll_down"}})
         self.stream = stream_type(self.screen)
         self.gen = 0
@@ -390,6 +405,12 @@ class Worker:
         self.parse_ns = 0
         self.emitted_seq = None
         self.screen.on_scroll = self._on_scroll
+        self.screen.on_history_clear = self._on_history_clear
+
+    def _on_history_clear(self):
+        # Publish earlier rows before the clear marker, even within one D.
+        self.emit(ack=False)
+        send(b"H", {"seq": self.seq_to, "epoch": self.screen.epoch})
 
     def _on_scroll(self, row):
         s = self.screen
@@ -426,7 +447,7 @@ class Worker:
         return bool(self.scrolls or self.screen.dirty or self.full
                     or (self.seq_to is not None and self.seq_to != self.emitted_seq))
 
-    def emit(self):
+    def emit(self, ack=True):
         s = self.screen
         t = time.monotonic_ns()
         shift = 0 if self.full else min(s.shift, s.lines)
@@ -442,7 +463,7 @@ class Worker:
         encode_ns = time.monotonic_ns() - t
         send(b"U", {
             "seqFrom": self.seq_from,
-            "seqTo": self.seq_to,
+            "seqTo": self.seq_to if ack else self.emitted_seq,
             "gen": self.gen,
             "scrolls": self.scrolls,
             "frame": {
@@ -462,7 +483,8 @@ class Worker:
         })
         s.dirty.clear()
         s.shift = 0
-        self.emitted_seq = self.seq_to
+        if ack:
+            self.emitted_seq = self.seq_to
         self.scrolls = []
         self.seq_from = None
         self.full = False
@@ -472,7 +494,7 @@ class Worker:
 def main():
     cols = int(sys.argv[1]) if len(sys.argv) > 1 else 80
     rows = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-    worker = Worker(cols, rows)
+    worker = Worker(cols, rows, int(sys.argv[4]) if len(sys.argv) > 4 else 1)
     send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
     fd = os.open(sys.argv[3], os.O_RDONLY) if len(sys.argv) > 3 else sys.stdin.buffer.fileno()
     buf = bytearray()

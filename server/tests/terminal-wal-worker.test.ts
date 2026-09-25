@@ -1325,3 +1325,46 @@ describe("L2-P FIX2 recovery regressions", () => {
     } finally { await worker.close(); }
   }, 15_000);
 });
+
+
+describe("L2-P DEBT recovery", () => {
+  test("55 five separated recoveries keep the first resized row in the collector epoch", async () => {
+    const pane = await collectPane(80, 24, { sourceEpoch: 7 });
+    const c = pane.collector;
+    for (let round = 1; round <= 5; round++) {
+      c.killWorker();
+      c.resize(80, 23 + round);
+      await untilFix1(() => pane.faults.filter(f => f.kind === "worker-restarted").length === round);
+      c.resize(80, 24);
+      const firstSeq = c.stats().receiveSeq + 1;
+      const first = pane.scrolls.length;
+      c.ingest(encoder.encode(Array.from({ length: 40 }, (_, i) => `R${round}-${i}`).join("\r\n")));
+      await settle(pane);
+      const added = pane.scrolls.slice(first);
+      expect(added.length).toBeGreaterThan(0);
+      expect(rowText(added[0]!.physicalRow).trimEnd()).toBe(`R${round}-0`);
+      for (const row of added) {
+        expect(row.sourceEpoch).toBe(7 + round);
+        expect(row.receiveSeq).toBe(firstSeq);
+      }
+      expect(c.currentSourceEpoch()).toBe(7 + round);
+      expect(c.health()).toBe("ok");
+      await sleep(100);
+    }
+    console.log("DEBT five recoveries: first row epoch/receiveSeq correct, health ok");
+  }, 30_000);
+
+  test("E3 marker orders earlier and later scrolls within one input without discarding the screen", async () => {
+    const events: string[] = [];
+    const pane = await collectPane(80, 3, { ports: {
+      onScroll: e => events.push(rowText(e.physicalRow).trimEnd()),
+      onFrame: () => {},
+      onFault: f => events.push(f.kind),
+    } });
+    pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\x1b[3J\r\nE\r\nF"));
+    await settle(pane);
+    expect(events).toEqual(["A", "history-cleared", "B", "C"]);
+    expect(pane.collector.ringSnapshot().map(e => rowText(e.physicalRow).trimEnd())).toEqual(["B", "C"]);
+    expect(pane.collector.health()).toBe("ok");
+  });
+});
