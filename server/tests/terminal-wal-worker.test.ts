@@ -873,6 +873,19 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.collector.stats().scrolls).toBe(pane.scrolls.length);
   }, 180_000);
 
+  test("a 3-row ring never evicts a row the port has not seen, even in one 1,000-row update", async () => {
+    const pane = await collectPane(80, 24, { ringRows: 3 });
+    let text = "";
+    for (let i = 0; i < 1000; i++) text += `tiny ring ${String(i).padStart(4, "0")}\r\n`;
+    pane.collector.ingest(encoder.encode(text));
+    await settle(pane);
+    expect(pane.scrolls.length).toBe(1001 - 24);
+    expect(pane.evictedBeforeSeen).toBe(0);
+    expect(pane.collector.ringSnapshot().map((e) => rowText(e.physicalRow).trimEnd())).toEqual([
+      "tiny ring 0974", "tiny ring 0975", "tiny ring 0976",
+    ]);
+  });
+
   test("parser backlog over its limit reports degraded, drops nothing, and recovers", async () => {
     const pane = await collectPane(80, 24, { queueLimitBytes: 64 * 1024 });
     let accepted = true;
