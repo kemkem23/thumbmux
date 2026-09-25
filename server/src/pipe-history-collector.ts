@@ -56,7 +56,7 @@ export type PipeFrameEvent = {
 };
 
 export type PipeFaultEvent = {
-  kind: PipeVtFault["kind"] | "parser-backlog" | "closed";
+  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "closed";
   at: number;
   message?: string;
   /** Bytes whose parsing could not be acknowledged; not a guessed row count. */
@@ -121,7 +121,13 @@ export class PipeHistoryCollector {
   private ringStart = 0;
   private readonly ringRows: number;
   private readonly queueLimit: number;
-  private readonly worker: PipeVtWorker;
+  private worker: PipeVtWorker;
+  private recovering: Promise<void> | null = null;
+  private recoveryAttempts = 0;
+  private closing = false;
+  private cols: number;
+  private rows: number;
+  private scrollOnClear: boolean | undefined;
   private readonly nowNs: () => bigint;
   private readonly now: () => number;
   private drainWaiters: Array<() => void> = [];
@@ -142,11 +148,18 @@ export class PipeHistoryCollector {
     this.nowNs = options.nowNs ?? (() => process.hrtime.bigint());
     this.now = options.now ?? Date.now;
     this.latencyLimit = options.latencySampleLimit ?? 1_000_000;
-    this.worker = new PipeVtWorker({
-      cols: options.cols,
-      rows: options.rows,
-      assets: options.assets,
-      python: options.python,
+    this.cols = options.cols;
+    this.rows = options.rows;
+    this.scrollOnClear = options.scrollOnClear;
+    this.worker = this.makeWorker();
+  }
+
+  private makeWorker(): PipeVtWorker {
+    return new PipeVtWorker({
+      cols: this.cols,
+      rows: this.rows,
+      assets: this.options.assets,
+      python: this.options.python,
       now: this.now,
       onUpdate: (update) => this.onUpdate(update),
       onFault: (fault) => this.fault(fault.kind, fault.message, "broken"),
@@ -155,7 +168,7 @@ export class PipeHistoryCollector {
 
   async start(): Promise<void> {
     await this.worker.start();
-    if (this.options.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.options.scrollOnClear);
+    if (this.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.scrollOnClear);
     if (this.healthState === "starting") this.healthState = "ok";
   }
 
@@ -202,6 +215,8 @@ export class PipeHistoryCollector {
 
   /** Geometry changed: new generation; the worker reflows and re-sends. */
   resize(cols: number, rows: number): number {
+    this.cols = cols;
+    this.rows = rows;
     this.geometryGeneration += 1;
     this.worker.resize(cols, rows, this.geometryGeneration);
     return this.geometryGeneration;
@@ -214,6 +229,7 @@ export class PipeHistoryCollector {
   }
 
   setScrollOnClear(enabled: boolean): void {
+    this.scrollOnClear = enabled;
     this.worker.setScrollOnClear(enabled);
   }
 
@@ -270,6 +286,8 @@ export class PipeHistoryCollector {
 
   async close(): Promise<void> {
     if (this.healthState === "closed") return;
+    this.closing = true;
+    await this.recovering;
     await this.worker.close();
     this.healthState = "closed";
     for (const waiter of this.drainWaiters.splice(0)) waiter();
@@ -295,6 +313,25 @@ export class PipeHistoryCollector {
       for (const waiter of this.drainWaiters.splice(0)) waiter();
     }
     this.options.ports.onFault({ kind, at: this.now(), message, ...loss });
+    if (health === "broken" && !this.closing && !this.recovering && kind !== "vendor-hash" && this.recoveryAttempts < 3) {
+      // Defer until the current exit/input callback has finished. No waiter
+      // depends on recovery completing; rejected bytes remain explicit faults.
+      this.recoveryAttempts++;
+      this.recovering = Promise.resolve().then(async () => {
+        await this.worker.close();
+        if (this.closing) return;
+        this.sourceEpoch++;
+        this.worker = this.makeWorker();
+        await this.worker.start();
+        if (this.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.scrollOnClear);
+        this.worker.resize(this.cols, this.rows, this.geometryGeneration);
+        this.healthState = "ok";
+        this.options.ports.onFault({ kind: "worker-restarted", at: this.now(), message: `parser respawned; source epoch ${this.sourceEpoch}; calibration required` });
+      }).catch((error) => {
+        this.healthState = "broken";
+        this.options.ports.onFault({ kind: "spawn", at: this.now(), message: String(error), lostRows: "unknown" });
+      }).finally(() => { this.recovering = null; });
+    }
   }
 
   private pushRing(event: PipeScrollEvent): void {
