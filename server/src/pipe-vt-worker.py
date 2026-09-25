@@ -419,6 +419,7 @@ class Worker:
         self.full = True
         self.parse_ns = 0
         self.emitted_seq = None
+        self.trailing_escape = False
         self.screen.on_scroll = self._on_scroll
         self.screen.on_history_clear = self._on_history_clear
 
@@ -447,6 +448,15 @@ class Worker:
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
+        # DCS can contain SIXEL, whose image height scrolls tmux history.
+        # pyte does not implement it: explicitly break the source instead of
+        # silently treating the image payload as printable terminal text.
+        # Remember an ESC across D packets, without buffering the payload.
+        probe = (b"\x1b" if self.trailing_escape else b"") + data
+        self.trailing_escape = data.endswith(b"\x1b")
+        if b"\x1bP" in probe:
+            send(b"E", {"kind": "unsupported-dcs", "message": "DCS/SIXEL may scroll history; parser does not support it; source recovery required"})
+            return
         t = time.monotonic_ns()
         self.stream.feed(data)
         self.parse_ns += time.monotonic_ns() - t
