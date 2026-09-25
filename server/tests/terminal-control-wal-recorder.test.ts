@@ -1678,3 +1678,60 @@ test('DEBT2 source reset across the fence discards capture then resumes in the n
   expect(h.writes[0]!.checks).toHaveLength(3);
   expect(h.limits).toEqual([4500, 4500]);
 });
+
+
+test('I3 PROBE compensated insert/delete exposes hidden identity uncertainty in 3000 cases', () => {
+  let falseIdentity = 0;
+  for (let n = 0; n < 3000; n++) {
+    const text = ['A1', 'A2', 'A3', 'P', 'Q', 'Q', 'B1', 'B2', 'B3'].map(s => `${n}:${s}`);
+    const hidden = [0, 1, 2, 4, 5, 99, 6, 7, 8];
+    const captured = hidden.map(id => naRow(id === 99 ? `${n}:R` : text[id]!));
+    const result = matchHistoryRows(naRows(text), captured, naScope);
+    falseIdentity += result.checks.filter(c => c.lineId - 1 !== hidden[c.capturedRow]).length;
+    falseIdentity += result.repairs.filter(c => c.lineId - 1 !== hidden[c.capturedRow]).length;
+  }
+  console.log('I3_PROBE_IDENTITY', JSON.stringify({ cases: 3000, falseIdentity, verdict: 'content anchors do not prove row identity' }));
+  expect(falseIdentity).toBeGreaterThan(0);
+});
+
+test('I3 PROBE private tmux identical snapshots hide split ESC and UTF8 parser state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'i3-fence-'));
+  const socket = join(root, 'x.sock');
+  const env = { ...process.env }; delete env.TMUX; delete env.TMUX_PANE;
+  const tmux = (...args: string[]) => {
+    const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env });
+    expect(result.status).toBe(0); return result.stdout;
+  };
+  const script = join(root, 'producer.py');
+  writeFileSync(script, `import os,time,pathlib
+r=pathlib.Path(${JSON.stringify(root)})
+def phase(n,b):
+ while not (r/str(n)).exists(): time.sleep(.005)
+ os.write(1,b)
+ (r/(str(n)+'done')).touch()
+phase(1,b'X')
+phase(2,bytes([27,91]))
+phase(3,b'31m')
+phase(4,bytes([0xe4,0xbd]))
+phase(5,bytes([0xa0]))
+time.sleep(30)
+`);
+  try {
+    const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-x', '80', '-y', '24', `python3 '${script}'`).trim();
+    const captures: string[] = [];
+    for (let phase = 1; phase <= 5; phase++) {
+      writeFileSync(join(root, String(phase)), '');
+      await eventually(() => existsSync(join(root, `${phase}done`)), 'producer phase');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      captures.push(tmux('capture-pane', '-p', '-e', '-t', pane));
+    }
+    expect(captures[1]).toBe(captures[0]);
+    expect(captures[2]).toBe(captures[0]);
+    expect(captures[3]).toBe(captures[0]);
+    expect(captures[4]).toContain('你');
+    console.log('I3_PROBE_FENCE', JSON.stringify({ phases: 5, indistinguishableStates: 4, byteFence: false, socket: 'private' }));
+  } finally {
+    spawnSync('tmux', ['-S', socket, 'kill-server'], { env });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
