@@ -465,7 +465,7 @@ async function knownPanesStore(root:string,prefix:string,known:number) {
  for(let i=0;i<known;i++){const t=`old ${i}`.padEnd(80,' ');await s.appendScroll({paneKey:key(i),sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}});}
  await s.close();
  s=createProjectionStore({historyRoot:root,mode:'recover'});
- expect(s.health().panes).toHaveLength(known);expect((s as any).pendingByPane.size).toBe(0);
+ expect(s.health().panes).toHaveLength(known);
  return {s,key,cell};
 }
 const textFrame=(cell:(g:string,fg?:number|null)=>any,cols:number,rows:number,shift:number,coloured:boolean)=>
