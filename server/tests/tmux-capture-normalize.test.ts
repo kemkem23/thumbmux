@@ -128,14 +128,19 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
     expect(r.status).toBe(0); return r.stdout;
   };
   try {
-    const cases = ['ไทย น้ำ ที่', '\x1b]8;;https://example.test\x1b\\LINK\x1b]8;;\x1b\\', '\x1b[4:3mCURL', '\x1b[58;2;1;2;3m\x1b[4mUNDER', '\x1b[53mOVER', '👩‍💻x', '🇹🇭x', '👍🏽x', '❤️x', '👩‍💻🇹🇭👍🏽❤️'];
+    const cases = ['ไทย น้ำ ที่', '\x1b]8;;https://example.test\x1b\\LINK\x1b]8;;\x1b\\', '\x1b[4:3mCURL', '\x1b[58;2;1;2;3m\x1b[4mUNDER', '\x1b[53mOVER', '👩‍💻x', '🇹🇭x', '👍🏽x', '❤️x', '👩‍💻🇹🇭👍🏽❤️',
+      // DEBT item 5: tmux 3.4 cell counts differ from Unicode for these (review2 probe-emoji).
+      '\u{1f1f9}\u{1f1ed}\u{1f1fa}x', '\u{1f3f3}\ufe0f\u200d\u{1f308}x', '\u{1f9d1}\u{1f3fb}\u200d\u{1f91d}\u200d\u{1f9d1}\u{1f3ff}x', '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}\u{1f3fd}x',
+      // Same raw shape as the rainbow flag (VS16, pad, ZWJ) but tmux agrees: must still decode.
+      '\u2764\ufe0f\u200d\u{1f525}x'];
+    const ambiguous = new Set(['👩‍💻🇹🇭👍🏽❤️', '\u{1f1f9}\u{1f1ed}\u{1f1fa}x', '\u{1f3f3}\ufe0f\u200d\u{1f308}x', '\u{1f9d1}\u{1f3fb}\u200d\u{1f91d}\u200d\u{1f9d1}\u{1f3ff}x', '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}\u{1f3fd}x']);
     for (let i = 0; i < cases.length; i++) {
       const path = join(root, `text-${i}`); writeFileSync(path, cases[i]!);
       const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; sleep 5`).trim();
       await new Promise(resolve => setTimeout(resolve, 100));
       const raw = tmux('capture-pane', '-p', '-e', '-N', '-t', pane);
       const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
-      if (cases[i] === '👩‍💻🇹🇭👍🏽❤️') {
+      if (ambiguous.has(cases[i]!)) {
         console.log('NEWARCH_FIX1_AMBIGUOUS', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, disposition: 'reject certification; pipe remains live' }));
         expect(() => decodeTmuxCaptureRows(raw, 80)).toThrow('ambiguous tmux emoji cell boundary');
         continue;

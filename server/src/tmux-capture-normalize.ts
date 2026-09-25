@@ -233,7 +233,10 @@ function checkedCols(cols: number): void {
 }
 // tmux can merge a spacing heart into the preceding skin-tone cell. Its
 // serialized text loses that cell boundary; do not certify a guessed width.
-const AMBIGUOUS_EMOJI = /[\u{1f3fb}-\u{1f3ff}]\u2764/u;
+// tmux 3.4 also splits/merges cells unlike Unicode for: a third regional
+// indicator, skin tones joined by ZWJ (either side), and ZWJ flag sequences
+// (capture pads the VS16 cell with a space before the ZWJ).
+const AMBIGUOUS_EMOJI = /[\u{1f3fb}-\u{1f3ff}](?:\u2764|\u200d)|\u200d\p{Extended_Pictographic}\ufe0f?[\u{1f3fb}-\u{1f3ff}]|[\u{1f1e6}-\u{1f1ff}]{3}|[\u{1f3f3}\u{1f3f4}]\ufe0f? ?\u200d/u;
 export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCell[][] {
   checkedCols(cols);
   if (AMBIGUOUS_EMOJI.test(raw)) throw new Error('ambiguous tmux emoji cell boundary');
