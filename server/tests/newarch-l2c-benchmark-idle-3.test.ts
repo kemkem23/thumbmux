@@ -74,13 +74,13 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         calibrator: HistoryCalibrator; decoder: TmuxCaptureDecoder; running: Promise<void> | undefined;
         checked: Set<number>; start: number; bound: number; falseChecked: number; falseSamples: unknown[];
         spanAt: number | null; history: number; historyAt: number[]; screenOnly: number; full: number; partialCaptures: number;
-        reasons: Record<string, number>; settledAt: number | null; staleRevision: number; afterSettle: Record<string, number>;
+        reasons: Record<string, number>; settledAt: number | null; staleRevision: number; afterSettle: Record<string, number>; polledAt: number;
       };
       type Config = {
         socket: string; panes: Pane[]; sidecars: string[]; producedBefore: number; pid: number; cols: number; rows: number; count: number;
         ticks: number; bytes: number; batches: number; latencies: number[]; calibratorUs: number; childUs: number; oracleUs: number; modelUs: number;
         timer: ReturnType<typeof setTimeout> | undefined; timerAt: number; batch: Array<{ pane: Pane; tail: number; resolve: (c: CalibrationCapture) => void; reject: (e: unknown) => void; requestedAt: number }>;
-        flushQueued: boolean; faults: Record<string, number>; captureErrors: number; errorSamples: string[]; clientInFlight: boolean; next: number;
+        flushQueued: boolean; faults: Record<string, number>; captureErrors: number; errorSamples: string[]; clientInFlight: boolean; next: number; msPerRow: number;
       };
       const configs: Config[] = [];
       let stopped = false;
@@ -109,6 +109,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       const buffer = Buffer.alloc(1 << 20);
       const pollPipe = (pane: Pane) => {
         const t0 = spanMicros();
+        pane.polledAt = performance.now();
         let text = '';
         for (;;) {
           const n = readSync(pane.fd, buffer, 0, buffer.length, pane.offset);
@@ -152,13 +153,17 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       // start round-robin until the batch requests ROW_BUDGET history rows;
       // the rest start in the next batch, so a pane's 1s capture deadline
       // never includes time spent queued behind another client.
-      const ROW_BUDGET = 20000, COALESCE_MS = 4;
+      // The row budget adapts to measured client latency per requested row so
+      // a batch stays near BATCH_TARGET_MS: under the cage's ptrace a 21-pane
+      // batch took 1.4s, past the calibrator's 1s capture deadline.
+      const ROW_BUDGET_MAX = 20000, BATCH_TARGET_MS = 400, COALESCE_MS = 4;
       const tick = (c: Config) => {
         if (stopped || c.clientInFlight) return;
         const now = performance.now();
         let rows = 0;
+        const budget = Math.min(ROW_BUDGET_MAX, BATCH_TARGET_MS / c.msPerRow);
         const first = c.next;
-        for (let k = 0; k < c.panes.length && rows < ROW_BUDGET; k++) {
+        for (let k = 0; k < c.panes.length && rows < budget; k++) {
           const pane = c.panes[(first + k) % c.panes.length]!;
           if (!pane.calibrator || pane.running || pane.calibrator.dueAt > now) continue;
           const before = c.batch.length;
@@ -196,6 +201,8 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         void (async () => {
           const [raw, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
           c.latencies.push(performance.now() - at); c.batches++;
+          const requested = batch.reduce((sum, item) => sum + item.tail + c.rows, 0);
+          c.msPerRow = 0.7 * c.msPerRow + 0.3 * ((performance.now() - at) / requested);
           c.childUs += Number(proc.resourceUsage()?.cpuTime.total ?? 0);
           c.bytes += Buffer.byteLength(raw);
           if (code !== 0) { c.clientInFlight = false; c.captureErrors++; if (c.errorSamples.length < 3) c.errorSamples.push(`exit=${code}: ${err.slice(0, 200)}`); for (const item of batch) item.reject(new Error(`private tmux exit=${code}: ${err}`)); rearm(c); return; }
@@ -239,7 +246,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         },
         read: () => {
           const c = config(pane);
-          c.modelUs += pollPipe(pane);
+          if (performance.now() - pane.polledAt >= 10) c.modelUs += pollPipe(pane);
           const t0 = spanMicros();
           const recentHistory = modelRing(pane, pane.count - pane.rows + 1);
           const snapshot = { revision: pane.revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory,
@@ -298,7 +305,9 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           'i=0',
           'sidecar=sys.argv[1]',
           'with open(sidecar,"w") as f: f.write("0")',
-          'end=time.monotonic()+100',
+          // Lives past setup + 60s window + settling even under the cage's
+          // tracer; kill-server ends it. Rate and content are unchanged.
+          'end=time.monotonic()+200',
           'while time.monotonic()<end:',
           active ? ' for n in range(10):\n  sys.stdout.write("\\x1b[%dmrow-%08d ไทย 你 😀\\x1b[0m\\r\\n" % (31+i%7,i)); i+=1' : ' pass',
           active ? ' if i%200==0: sys.stdout.write("\\x1b7\\x1b[Hstatus ไทย 你 😀\\x1b8")' : ' pass',
@@ -310,7 +319,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           const socket = join(root, `${cols}-${count}.sock`);
           // Register the socket before creating it so cleanup also covers a
           // partial setup failure; no default server is ever addressed.
-          const c: Config = { socket, panes: [], sidecars: [], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, batches: 0, latencies: [], calibratorUs: 0, childUs: 0, oracleUs: 0, modelUs: 0, timer: undefined, timerAt: Infinity, batch: [], flushQueued: false, faults: {}, captureErrors: 0, errorSamples: [], clientInFlight: false, next: 0 };
+          const c: Config = { socket, panes: [], sidecars: [], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, batches: 0, latencies: [], calibratorUs: 0, childUs: 0, oracleUs: 0, modelUs: 0, timer: undefined, timerAt: Infinity, batch: [], flushQueued: false, faults: {}, captureErrors: 0, errorSamples: [], clientInFlight: false, next: 0, msPerRow: 0.02 };
           configs.push(c);
           for (let pane = 0; pane < count; pane++) {
             const sidecar = join(root, `${cols}-${count}-${pane}.rows`); c.sidecars.push(sidecar);
@@ -319,11 +328,11 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             // runs `sleep` until pipe-pane is in place, then the producer.
             const gate = join(root, `${cols}-${count}-${pane}.go`);
             const id = tmux(socket, ['-f', conf, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${pane}`, '-x', String(cols), '-y', String(rows), `while [ ! -e ${quote(gate)} ]; do sleep 0.01; done; exec python3 -u ${quote(producer)} ${quote(sidecar)}`]).trim();
-            tmux(socket, ['pipe-pane', '-t', id, `cat >> ${quote(pipe)}`]);
+            tmux(socket, ['pipe-pane', '-t', id, `exec cat >> ${quote(pipe)}`]);
             writeFileSync(gate, '');
             c.panes.push({ id, cols: cols!, rows: rows!, pipe, fd: openSync(pipe, 'r'), offset: 0, partial: '', count: 0, revision: 1, ring: [], ringEnd: 0, snapshot: null,
               calibrator: undefined as unknown as HistoryCalibrator, decoder: new TmuxCaptureDecoder(cols!, 5000), running: undefined, checked: new Set(), start: 0, bound: Infinity,
-              falseChecked: 0, falseSamples: [], spanAt: null, history: 0, historyAt: [], screenOnly: 0, full: 0, partialCaptures: 0, reasons: {}, settledAt: null, staleRevision: 0, afterSettle: {} });
+              falseChecked: 0, falseSamples: [], spanAt: null, history: 0, historyAt: [], screenOnly: 0, full: 0, partialCaptures: 0, reasons: {}, settledAt: null, staleRevision: 0, afterSettle: {}, polledAt: 0 });
           }
           c.pid = Number(tmux(socket, ['display-message', '-p', '-t', c.panes[0]!.id, '#{pid}']).trim());
           expect(c.pid).toBeGreaterThan(0);
@@ -347,11 +356,11 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           }
           c.producedBefore = c.sidecars.reduce((sum, path) => sum + Number(readFileSync(path, 'utf8')), 0);
         }
-        // The pipe reader: in production bytes are pushed; here every 50ms, and
-        // every read() port call reads the pipe again first.
+        // The pipe reader: in production bytes are pushed; here every 100ms, and
+        // a read() port call reads the pipe again first (at most every 10ms).
         const poller = mode === 'baseline' ? undefined : setInterval(() => {
           for (const c of configs) for (const pane of c.panes) c.modelUs += pollPipe(pane);
-        }, 50);
+        }, 100);
         const parent = procTicks(process.pid);
         const cpuStart = cpuMicros();
         const started = performance.now();
@@ -427,7 +436,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             finalPass, checkedRows, coverage: denominator && finalPass ? checkedRows / denominator : null, unchecked, falseChecked, falseSamples: c.panes.flatMap(p => p.falseSamples).slice(0, 3),
             staleRevision: c.panes.reduce((s, p) => s + p.staleRevision, 0),
             unsettled: c.panes.filter(p => p.settledAt === null).slice(0, 3).map(p => ({ pane: p.id, afterSettle: p.afterSettle, captures: p.historyAt.filter(t => t >= settle.from).length })),
-            settleMs: c.panes.reduce((m, p) => Math.max(m, p.settledAt === null ? Infinity : p.settledAt - settle.from), 0), faults: c.faults, captureErrors: c.captureErrors, captureErrorSamples: c.errorSamples, reasons,
+            settleMs: c.panes.reduce((m, p) => Math.max(m, p.settledAt === null ? Infinity : p.settledAt - settle.from), 0), faults: c.faults, captureErrors: c.captureErrors, captureErrorSamples: c.errorSamples, msPerRowAtEnd: c.msPerRow, reasons,
             historyCapturesPerPane: historyPerPane, historyIntervalP50: percentile(w.intervals, .5), historyIntervalP95: percentile(w.intervals, .95), historyIntervalMax: percentile(w.intervals, 1),
             fullCaptures: w.full, partialCaptures: w.partial, screenOnlyCaptures: w.screenOnly, batches: w.batches, captureBytes: c.bytes,
             batchP50: percentile(w.latencies, .5), batchP95: percentile(w.latencies, .95), batchP99: percentile(w.latencies, .99), batchMax: percentile(w.latencies, 1),
