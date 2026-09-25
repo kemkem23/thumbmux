@@ -123,12 +123,17 @@ export class HistoryCalibrator {
     }
     if (this.inFlight) return;
     if (now < this.deadline) { this.ports.schedule(this.dueAt); return; }
+    // Period anchor: the planned deadline when this start is less than one
+    // active period late, so host lateness is not added to every cycle
+    // (PLAN §4: every 200ms while active). The 50ms spacing uses `now`.
+    const planned = this.deadline;
+    const anchor = now - planned < 200 ? planned : now;
     // Output during this capture is spaced from THIS start, not the previous
     // one; otherwise every history capture was followed by a screen-only
     // capture 50ms later while in PIPE mode (PLAN §4 allows that only in CAPTURE).
-    this.inFlight = true; this.deadline = Infinity; this.lastCaptureAt = now;
+    this.inFlight = true; this.deadline = Infinity; this.lastCaptureAt = anchor;
     const startedGeneration = this.eventGeneration;
-    const historyDue = this.forceFull || now - this.lastHistoryAt >= 200;
+    const historyDue = this.forceFull || anchor - this.lastHistoryAt >= 200;
     const requestedScrolls = this.scrolls;
     const limit = this.options.historyLimit ?? 4500;
     const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 128);
@@ -189,12 +194,12 @@ export class HistoryCalibrator {
       }
       successful = true;
       this.forceFull = historyDue && match.reason !== 'matched' && match.reason !== 'generation';
-      if (historyDue) { this.lastHistoryAt = now; this.scrolls = Math.max(0, this.scrolls - requestedScrolls); }
+      if (historyDue) { this.lastHistoryAt = anchor; this.scrolls = Math.max(0, this.scrolls - requestedScrolls); }
     } catch (error) {
       this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined;
       this.ports.fault({ kind: 'capture-fault', at: this.ports.now(), missingCount: null });
     } finally {
-      this.inFlight = false; this.lastCaptureAt = now;
+      this.inFlight = false; this.lastCaptureAt = anchor;
       const at = this.ports.now();
       if (this.latchAt !== undefined && at - this.latchAt > 1000 && !this.degraded) {
         this.degraded = true;
@@ -203,7 +208,7 @@ export class HistoryCalibrator {
       const interval = !successful || this.mode === 'CAPTURE' ? 50 : at - this.outputAt <= 200 ? 200 : 1000;
       // An event timer may have fired while capture was in flight. Re-arm
       // explicitly, and retain the 50ms minimum between capture starts.
-      this.deadline = Math.max(now + 50, Math.min(this.deadline, Math.max(at, now + interval)));
+      this.deadline = Math.max(now + 50, Math.min(this.deadline, Math.max(at, anchor + interval)));
       this.ports.schedule(this.dueAt);
     }
   }

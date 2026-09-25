@@ -1122,7 +1122,7 @@ test('FIX2 remember seeds the terminal triple after a general full match', () =>
 // DEBT items 1/2/6 through the real HistoryCalibrator: tmux keeps producing
 // while capture runs, the parser trails the pipe by `lagMs` and is therefore
 // AHEAD of the capture snapshot when read after it. Fake clock, true ids hidden.
-async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string; wrongScreen?: boolean }) {
+async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string; wrongScreen?: boolean; lateMs?: number }) {
   const text = o.text ?? ((i: number) => `row-${i}`);
   const rows = new Map<string, CapturedRow>();
   const rowOf = (t: string) => { let r = rows.get(t); if (!r) { r = naRow(t.padEnd(12)); rows.set(t, r); } return r; };
@@ -1173,7 +1173,7 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
     }
     if (n) calibrator.scroll(n);
     if (pending && now >= pending.at) { const p = pending; pending = undefined; (st as any).snap = p.snap; p.resolve(p.value); inFlight = false; await new Promise(r => setImmediate(r)); }
-    if (!inFlight && now >= calibrator.dueAt) { void calibrator.runDue(); await new Promise(r => setImmediate(r)); }
+    if (!inFlight && now >= calibrator.dueAt + (o.lateMs ?? 0)) { void calibrator.runDue(); await new Promise(r => setImmediate(r)); }
   }
   // Coverage over every produced row except the final 128 still in overlap.
   const eligible = Math.max(0, produced - 128);
@@ -1203,6 +1203,17 @@ test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser 
       expect(r.captures).toBeGreaterThanOrEqual(290);
     }
   }
+});
+
+test('DEBT 3 host lateness below one period does not stretch the 200ms cadence', async () => {
+  // The benchmark host starts captures ~20ms late (shared event loop). Each
+  // late start used to become the next anchor: 230ms cycles, 260/min.
+  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, lateMs: 30 });
+  console.log('NEWARCH_DEBT3_LATE_HOST', JSON.stringify(r));
+  expect(r.captures).toBeGreaterThanOrEqual(295);
+  expect(r.screenOnly).toBe(0);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+  expect(r.falseChecked).toBe(0);
 });
 
 test('DEBT 1 periodic output after the fence never pairs a row with an older copy', async () => {
