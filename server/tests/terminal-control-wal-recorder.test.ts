@@ -1118,3 +1118,155 @@ test('FIX2 remember seeds the terminal triple after a general full match', () =>
   expect(next.checks.at(-1)!.lineId).toBe(4700);
   for (const c of next.checks) expect(equalHistoryRows(all[c.lineId - 1]!, tail[c.capturedRow]!)).toBe(true);
 });
+
+// DEBT items 1/2/6 through the real HistoryCalibrator: tmux keeps producing
+// while capture runs, the parser trails the pipe by `lagMs` and is therefore
+// AHEAD of the capture snapshot when read after it. Fake clock, true ids hidden.
+async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string }) {
+  const text = o.text ?? ((i: number) => `row-${i}`);
+  const rows = new Map<string, CapturedRow>();
+  const rowOf = (t: string) => { let r = rows.get(t); if (!r) { r = naRow(t.padEnd(12)); rows.set(t, r); } return r; };
+  const frame: CalibrationFrame = { cells: [naRow('scr ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%9', birthGeneration: 1 };
+  let now = 0, revision = 1, produced = 0, applied = 0, inFlight = false;
+  const tmuxRing: number[] = [], parser: Array<{ id: number; lineId: number }> = [], producedAt: number[] = [];
+  let pending: { at: number; resolve: (c: CalibrationCapture) => void; value: CalibrationCapture; snap: number[] } | undefined;
+  const st = { checks: 0, checksWhileFlowing: 0, falseChecked: 0, identityFalse: 0, commits: 0, staleRevision: 0, limits: [] as number[], verified: new Set<number>() };
+  const end = o.seconds * 1000;
+  const ports: CalibrationPorts = {
+    now: () => now, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, parserFrame: frame,
+      recentHistory: parser.map(p => ({ ...rowOf(text(p.id)), lineId: p.lineId, sourceEpoch: 1, geometryGeneration: 1 })) }),
+    capture: (_, tail) => {
+      st.limits.push(tail); inFlight = true;
+      const snap = tmuxRing.slice(Math.max(0, tmuxRing.length - tail));
+      const value = { paneKey, captureId: String(st.limits.length), requestedAt: now, completedAt: now + o.captureMs, before: meta, after: meta, frame,
+        history: snap.map(id => rowOf(text(id))), completeRetainedTail: tail >= tmuxRing.length, observedFields: [] } as CalibrationCapture;
+      return new Promise(resolve => { pending = { at: now + o.captureMs, resolve, value, snap }; });
+    },
+    calibrate: async input => {
+      if (input.expectedRevision !== revision) { st.staleRevision++; return null; }
+      const snap = (st as any).snap as number[];
+      const byLine = new Map(parser.map(p => [p.lineId, p.id]));
+      for (const c of input.checks) {
+        const id = byLine.get(c.lineId)!, tmuxId = snap[c.capturedRow]!;
+        st.checks++; if (now < end) st.checksWhileFlowing++;
+        if (!equalHistoryRows(rowOf(text(id)), rowOf(text(tmuxId)))) st.falseChecked++;
+        if (id !== tmuxId) st.identityFalse++; else st.verified.add(id);
+      }
+      st.commits++; return { revision: ++revision, durableRevision: 0, nextLineId: parser.length };
+    },
+    publish: () => {}, fault: () => {},
+  };
+  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental: o.incremental });
+  const step = 1000 / o.rate;
+  for (now = 0; now <= end + 2000; now++) {
+    while (now < end && produced * step <= now) { producedAt.push(now); tmuxRing.push(produced++); if (tmuxRing.length > 4500) tmuxRing.shift(); }
+    let n = 0;
+    while (applied < produced && producedAt[applied]! + o.lagMs <= now) {
+      parser.push({ id: applied, lineId: applied }); applied++; n++; revision++;
+      if (parser.length > 4500) parser.shift();
+    }
+    if (n) calibrator.scroll(n);
+    if (pending && now >= pending.at) { const p = pending; pending = undefined; (st as any).snap = p.snap; p.resolve(p.value); inFlight = false; await new Promise(r => setImmediate(r)); }
+    if (!inFlight && now >= calibrator.dueAt) { void calibrator.runDue(); await new Promise(r => setImmediate(r)); }
+  }
+  // Coverage over every produced row except the final 128 still in overlap.
+  const eligible = Math.max(0, produced - 128);
+  let covered = 0; for (let id = 0; id < eligible; id++) if (st.verified.has(id)) covered++;
+  return { produced, coverage: eligible ? covered / eligible : 0, checks: st.checks, checksWhileFlowing: st.checksWhileFlowing, falseChecked: st.falseChecked,
+    identityFalse: st.identityFalse, commits: st.commits, staleRevision: st.staleRevision, fullCaptures: st.limits.filter(l => l === 4500).length, screenOnly: st.limits.filter(l => l === 0).length, captures: st.limits.length };
+}
+
+test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser ahead of the capture', async () => {
+  for (const incremental of [false, true]) {
+    for (const lagMs of [5, 300]) {
+      const r = await debtFlow({ incremental, seconds: 60, rate: 100, lagMs, captureMs: 40 });
+      console.log('NEWARCH_DEBT1_FLOW', JSON.stringify({ incremental, lagMs, ...r, scope: 'real HistoryCalibrator; fake clock/ports; parser trails tmux, read after capture' }));
+      expect(r.produced).toBe(6000);
+      // Round 2 measured 0 checks while flowing and 49.3% coverage here.
+      expect(r.checksWhileFlowing).toBeGreaterThan(r.produced);
+      expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+      expect(r.falseChecked).toBe(0);
+      expect(r.identityFalse).toBe(0);
+      // agy round 1: the CAS revision is the post-capture one, so revision
+      // bumps during capture never starve the commit.
+      expect(r.staleRevision).toBe(0);
+      expect(r.commits).toBe(r.captures);
+    }
+  }
+});
+
+test('DEBT 1 periodic output after the fence never pairs a row with an older copy', async () => {
+  // Text repeats every 3000 rows, so a parser row newer than the capture has
+  // an exact older copy in tmux; the fence plus tail bound must not use it.
+  const r = await debtFlow({ incremental: false, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, text: i => `file-line-${i % 3000}` });
+  console.log('NEWARCH_DEBT1_PERIODIC', JSON.stringify(r));
+  expect(r.identityFalse).toBe(0); expect(r.falseChecked).toBe(0);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+});
+
+test('DEBT 2 a screen-only capture does not erase the incremental seed', async () => {
+  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40 });
+  // Every history capture is followed by a screen-only one while output flows.
+  expect(r.screenOnly).toBeGreaterThan(100);
+  // Seed survives them: only the birth capture (and the first no-history
+  // capture after it) is full; round 2 alternated full/partial ~300 times.
+  expect(r.fullCaptures).toBeLessThanOrEqual(3);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+  // Direct: history (full) -> screen-only -> incremental history still matched.
+  // Output during the history capture re-arms the lane 50ms later, before the
+  // 200ms history interval, so the next capture carries no history rows.
+  const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 300), time = 0, revision = 1;
+  const tails: number[] = [], checks: number[] = [];
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  let calibrator!: HistoryCalibrator;
+  calibrator = new HistoryCalibrator(paneKey, {
+    now: () => time, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame: frame }),
+    capture: async (_, tail) => {
+      tails.push(tail);
+      const history = recent.slice(Math.max(0, recent.length - tail));
+      if (tails.length === 1) { time = 10; calibrator.output(); }
+      return { paneKey, captureId: String(tails.length), requestedAt: time, completedAt: time, before: meta, after: meta, frame, history, completeRetainedTail: tail >= recent.length, observedFields: [] };
+    },
+    calibrate: async input => { checks.push(input.checks.length); return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
+    publish: () => {}, fault: () => {},
+  }, { incremental: true });
+  await calibrator.runDue();
+  expect(calibrator.dueAt).toBe(50);
+  time = 50; await calibrator.runDue();
+  expect(tails).toEqual([4500, 0]);
+  recent = all.slice(0, 320); calibrator.scroll(20);
+  time = 250; await calibrator.runDue();
+  // Round 2: the empty screen-only match erased the seed -> partial-tail, 0 checks, then full.
+  expect(tails).toEqual([4500, 0, 148]);
+  expect(checks.at(-1)).toBe(148);
+});
+
+test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full', async () => {
+  // A plain copy 700 rows back is the only exact match of the parser tail
+  // (the parser lost the colour of the re-print). The bound refuses it.
+  const plain = (k: number) => naRow(`result ${k}`);
+  const red = (k: number) => { const r = naRow(`result ${k}`); return { ...r, cells: r.cells.map(c => ({ ...c, fg: 'index:1' })) }; };
+  const pre = [...Array.from({ length: 300 }, (_, k) => naRow(`pre-${k}`)), ...Array.from({ length: 200 }, (_, k) => plain(k))];
+  const post = [...Array.from({ length: 500 }, (_, k) => naRow(`post-${k}`)), ...Array.from({ length: 200 }, (_, k) => red(k))];
+  const parser = [...post.slice(0, 500), ...Array.from({ length: 200 }, (_, k) => plain(k))].map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
+  expect(matchHistoryRows(parser, [...pre, ...post], naScope).checks).toHaveLength(200); // unbounded: wrong 200
+  const bounded = matchHistoryRows(parser, [...pre, ...post], { ...naScope, maxTailGap: 256 });
+  expect(bounded.reason).toBe('no-anchor'); expect(bounded.checks).toHaveLength(0);
+  // The correct print is still accepted with the same bound.
+  expect(matchHistoryRows(post.map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 })), [...pre, ...post], { ...naScope, maxTailGap: 256 }).checks).toHaveLength(700);
+  // Item 6: an incremental calibrator whose full capture finds no anchor
+  // requests a full capture next time instead of an unseeded partial one.
+  const h = naHarness(true);
+  h.ports.read = () => ({ revision: 1, sourceEpoch: 1, geometryGeneration: 1, recentHistory: naRows(['x', 'y', 'z']), parserFrame: h.frame });
+  h.ports.calibrate = async () => ({ revision: 2, durableRevision: 0, nextLineId: 4 });
+  await h.calibrator.runDue();
+  h.time(10); h.calibrator.scroll(5); h.time(250); await h.calibrator.runDue();
+  expect(h.limits).toEqual([4500, 4500]);
+});
