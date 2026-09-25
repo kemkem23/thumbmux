@@ -1,3 +1,8 @@
+export interface WatchdogContext {
+  sourceEpoch: number;
+  geometryGeneration: number;
+  kind: 'normal' | 'alternate';
+}
 export type HistoryFault = { kind: string; at: number; missingCount: null };
 /** Host heartbeat must be called from outside the worker event loop. */
 export class HistoryWatchdog {
@@ -5,6 +10,7 @@ export class HistoryWatchdog {
   private receiveSeq = 0;
   private image: string | undefined;
   private imageSeq = 0;
+  private contextKey: string | undefined;
   private movementWithoutReceiveAt: number | undefined;
   private emitted = new Set<string>();
   constructor(private now: () => number, private fault: (fault: HistoryFault) => void) {
@@ -18,7 +24,15 @@ export class HistoryWatchdog {
       this.emitted.delete('reader-stalled');
     }
   }
-  capture(image: string): void {
+  capture(image: string, context?: WatchdogContext): void {
+    const key = context === undefined ? undefined
+      : `${context.sourceEpoch}/${context.geometryGeneration}/${context.kind}`;
+    if (key !== this.contextKey) {
+      this.contextKey = key;
+      this.image = undefined;
+      this.movementWithoutReceiveAt = undefined;
+      this.emitted.delete('reader-stalled');
+    }
     if (this.image !== undefined && image !== this.image && this.imageSeq === this.receiveSeq)
       this.movementWithoutReceiveAt ??= this.now();
     this.image = image; this.imageSeq = this.receiveSeq;

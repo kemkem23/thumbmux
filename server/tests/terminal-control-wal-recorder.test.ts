@@ -687,12 +687,12 @@ function naHarness(incremental = false) {
 }
 
 describe('NEWARCH L2-C matcher and calibration ports', () => {
-  test('unique suffix checks exact cells and repairs only bounded equal-length mismatch', () => {
+  test('unique suffix checks exact cells and leaves bounded mismatch untouched', () => {
     const rows = naRows(['L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3']);
     const capture = ['L1', 'L2', 'L3', 'good', 'R1', 'R2', 'R3'].map(naRow);
     const match = matchHistoryRows(rows, capture, naScope);
     expect(match.checks).toHaveLength(6);
-    expect(match.repairs).toEqual([{ lineId: 4, capturedRow: 3, row: capture[3]! }]);
+    expect(match.repairs).toHaveLength(0);
     expect(matchHistoryRows(rows, capture, { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
     expect(matchHistoryRows(rows, capture, { ...naScope, geometryGeneration: 2 }).checks).toHaveLength(0);
   });
@@ -951,7 +951,7 @@ test('FIX1 full matcher p95 at 4500 rows, independent cells and collision bucket
       const result = matchHistoryRows(recent, captured, naScope);
       times.push(performance.now() - started);
       expect(result.checks).toHaveLength(4499);
-      expect(result.repairs).toHaveLength(1);
+      expect(result.repairs).toHaveLength(0);
     }
     times.sort((a, b) => a - b);
     console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29], cadenceMs: 200, driftedRows: 1 }));
@@ -960,12 +960,12 @@ test('FIX1 full matcher p95 at 4500 rows, independent cells and collision bucket
     captured[2200]!.cells[cols - 1]!.fg = 'index:9';
     const result = matchHistoryRows(recent, captured, naScope);
     expect(result.checks.some(c => c.lineId === 2201)).toBe(false);
-    expect(result.repairs.some(c => c.lineId === 2201)).toBe(true);
+    expect(result.repairs).toHaveLength(0);
     // Two drifts force the general interning path, not the single-row fast path.
     captured[2202]!.cells[cols - 1]!.fg = 'index:8';
     const general = matchHistoryRows(recent, captured, naScope);
     expect(general.checks.some(c => c.lineId === 2201 || c.lineId === 2203)).toBe(false);
-    expect(general.repairs.map(r => r.lineId)).toEqual([2201, 2203]);
+    expect(general.repairs).toHaveLength(0);
   }
 });
 
@@ -1691,7 +1691,7 @@ test('I3 PROBE compensated insert/delete exposes hidden identity uncertainty in 
     falseIdentity += result.repairs.filter(c => c.lineId - 1 !== hidden[c.capturedRow]).length;
   }
   console.log('I3_PROBE_IDENTITY', JSON.stringify({ cases: 3000, falseIdentity, verdict: 'content anchors do not prove row identity' }));
-  expect(falseIdentity).toBeGreaterThan(0);
+  expect(falseIdentity).toBe(0);
 });
 
 test('I3 PROBE private tmux identical snapshots hide split ESC and UTF8 parser state', async () => {
@@ -1735,3 +1735,75 @@ time.sleep(30)
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('I3 injected timeout cancels at exactly 1s and late capture never commits', async () => {
+  const h = naHarness();
+  let deadline = Infinity, fire: (() => void) | undefined, cancelled = 0, aborted = false;
+  let complete!: (capture: CalibrationCapture) => void;
+  const original = await h.ports.capture(h.calibrator.paneKey, 4500);
+  h.ports.timeout = (callback, delay) => {
+    deadline = delay; fire = callback;
+    return () => { cancelled++; fire = undefined; };
+  };
+  h.ports.capture = (_, __, signal) => new Promise(resolve => {
+    complete = resolve;
+    signal!.addEventListener('abort', () => { aborted = true; });
+  });
+  const running = h.calibrator.runDue();
+  expect(deadline).toBe(1000);
+  h.time(999); expect(aborted).toBe(false); expect(h.writes).toHaveLength(0);
+  h.time(1000); fire!(); await running;
+  expect(aborted).toBe(true); expect(cancelled).toBe(1);
+  complete(original); await Promise.resolve();
+  expect(h.writes).toHaveLength(0); expect(h.published).toHaveLength(0);
+  expect(h.faults).toEqual(['capture-fault']);
+  h.ports.capture = async () => original;
+  h.time(1050); await h.calibrator.runDue();
+  expect(cancelled).toBe(2); expect(fire).toBeUndefined();
+  expect(h.writes).toHaveLength(1);
+});
+
+test('I3 resize resets image comparison without suppressing dead-reader or heartbeat faults', () => {
+  let now = 0; const faults: string[] = [];
+  const wd = new HistoryWatchdog(() => now, issue => faults.push(issue.kind));
+  const before = { sourceEpoch: 1, geometryGeneration: 1, kind: 'normal' as const };
+  const after = { ...before, geometryGeneration: 2 };
+  wd.capture('old', before);
+  now = 100; wd.capture('reflow', after);
+  now = 1100; wd.tick(); expect(faults).toEqual([]);
+  wd.capture('new output with reader dead', after);
+  now = 2100; wd.tick(); expect(faults).toEqual(['reader-stalled']);
+  wd.dead('reader-dead'); expect(faults).toContain('reader-dead');
+  now = 3100; wd.capture('another reflow', { ...after, geometryGeneration: 3 }); wd.tick();
+  expect(faults).toContain('heartbeat-timeout');
+  wd.receive(1); wd.heartbeat();
+  wd.capture('post-recovery', { ...after, geometryGeneration: 3 });
+  now = 3200; wd.capture('stalled again', { ...after, geometryGeneration: 3 });
+  now = 4200; wd.tick();
+  expect(faults.filter(kind => kind === 'reader-stalled')).toHaveLength(2);
+});
+
+test('I3 20k and 200k backlog cannot certify an evicted pre-capture fence', () => {
+  for (const burst of [20000, 200000]) {
+    const retained = naRows(Array.from({ length: 4500 }, (_, i) => `new-${burst - 4500 + i}`));
+    const old = naRows(['old-a', 'old-b', 'old-c']);
+    const result = matchHistoryRows(old, retained, { ...naScope, maxTailGap: 0 });
+    expect(result.checks).toHaveLength(0); expect(result.repairs).toHaveLength(0);
+    expect(old.map(row => row.lineId)).toEqual([1, 2, 3]);
+    console.log('I3_BACKLOG', JSON.stringify({ burst, retained: retained.length, checked: result.checks.length, reason: result.reason, scope: 'matcher fixture, not pipe-loss proof' }));
+  }
+});
+
+test('I3 real reflow 80 to 37 and 37 to 120 does not certify across geometry', async () => {
+  for (const [cols, next] of [[80, 37], [37, 120]] as const) {
+    const result = await runScenario(`I3-reflow-${cols}-${next}`, 'reflow-before', {
+      cols, rows: 24, historyLimit: 4500,
+      seed: Array.from({ length: 100 }, (_, i) => `row-${i}-` + 'long-line-'.repeat(20)),
+      resizeTo: [next, 24],
+    });
+    console.log('I3_REFLOW', JSON.stringify(result));
+    expect(result.contentFalse).toBe(0);
+    expect(result.repairs).toBe(0);
+    expect(result.checks).toBe(0);
+  }
+}, 15000);

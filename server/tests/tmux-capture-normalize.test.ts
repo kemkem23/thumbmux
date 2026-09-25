@@ -219,3 +219,22 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
     expect(JSON.stringify(rows.slice(0, 50))).toBe(JSON.stringify(decodeTmuxCaptureRows(wideRaw(50), 120)));
   });
 });
+
+import { decodeTmuxCaptureEvidence } from '../src/tmux-capture-normalize';
+test('I3 uncertainty stays on the ambiguous row and preserves following ANSI state', () => {
+  const evidence = decodeTmuxCaptureEvidence('plain\n\x1b[31m🏳️ ‍🌈x\nnext\n', 20);
+  expect(evidence.complete).toBe(false);
+  expect(evidence.rows).toHaveLength(3);
+  expect(evidence.rows[0]!.cells![0]!.grapheme).toBe('p');
+  expect(evidence.rows[1]).toEqual({ cells: null, reason: 'ambiguous-cell-boundary' });
+  expect(evidence.rows[2]!.cells![0]!.fg).toBe('index:1');
+  expect(() => decodeTmuxCaptureRows('plain\n🏳️ ‍🌈x\nnext\n', 20)).toThrow();
+});
+test('I3 unsupported escape poisons style until an explicit reset without inventing blank rows', () => {
+  const evidence = decodeTmuxCaptureEvidence('ok\n\x1b[38;2;300;0;0mX\nunknown\n\x1b[0mrecovered\n\n', 12);
+  expect(evidence.rows.map(row => row.reason)).toEqual(['observed', 'unsupported-row', 'unknown-style-state', 'observed', 'observed']);
+  expect(evidence.rows[2]!.cells).toBeNull();
+  expect(evidence.rows[3]!.cells![0]!.fg).toBe('default');
+  expect(evidence.rows[4]!.cells).toHaveLength(12);
+  expect(decodeTmuxCaptureEvidence('a\n\n', 12).complete).toBe(true);
+});

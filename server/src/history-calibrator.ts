@@ -32,6 +32,8 @@ export interface CalibrationSnapshot {
 export interface CalibrationCommit { revision: number; durableRevision: number; nextLineId: number }
 export interface CalibrationPorts {
   now(): number;
+  /** Same clock domain as now(); returns an idempotent cancellation callback. */
+  timeout?(callback: () => void, delayMs: number): () => void;
   capture(paneKey: PaneKey, tailLimit: number, signal?: AbortSignal): Promise<CalibrationCapture>;
   schedule(deadline: number): void;
   read(): CalibrationSnapshot;
@@ -150,13 +152,15 @@ export class HistoryCalibrator {
       // left to the next capture. CAS still uses the post-capture revision.
       const fence = this.ports.read();
       const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      let cancelTimeout: (() => void) | undefined;
       const capture = await Promise.race([
         this.ports.capture(this.paneKey, tailLimit, controller.signal),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => {
-          controller.abort(); reject(new Error('capture deadline exceeded'));
-        }, 1000); }),
-      ]).finally(() => { clearTimeout(timer); });
+        new Promise<never>((_, reject) => {
+          const expire = () => { controller.abort(); reject(new Error('capture deadline exceeded')); };
+          if (this.ports.timeout) cancelTimeout = this.ports.timeout(expire, 1000);
+          else { const timer = setTimeout(expire, 1000); cancelTimeout = () => clearTimeout(timer); }
+        }),
+      ]).finally(() => { cancelTimeout?.(); });
       // The capture subprocess must finish BEFORE selecting a CAS revision.
       const read = this.ports.read();
       const meta = capture.after;

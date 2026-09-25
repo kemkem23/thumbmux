@@ -340,3 +340,37 @@ export class TmuxCaptureDecoder {
     return rows;
   }
 }
+
+export interface TmuxCaptureRowEvidence {
+  cells: readonly TmuxObservedCell[] | null;
+  reason: 'observed' | 'ambiguous-cell-boundary' | 'unsupported-row' | 'unknown-style-state';
+}
+/** Diagnostic projection. Unknown cells are never padded into invented blanks.
+ * A partial result is NOT a calibrated screen; the strict decoder stays strict.
+ * Carry SGR through ambiguous glyphs, and fail closed after an unparsed escape
+ * until an explicit reset establishes the next row's style state again. */
+export function decodeTmuxCaptureEvidence(raw: string, cols: number): {
+  rows: TmuxCaptureRowEvidence[]; complete: boolean;
+} {
+  checkedCols(cols);
+  const lines = raw.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const state: SgrState = { fg: 'default', bg: 'default', style: 0 };
+  let known = true;
+  const rows: TmuxCaptureRowEvidence[] = [];
+  for (const line of lines) {
+    if (!known && (line.startsWith('\x1b[0m') || line.startsWith('\x1b[m'))) known = true;
+    if (!known) { rows.push({ cells: null, reason: 'unknown-style-state' }); continue; }
+    try {
+      if (!escapesCloseInLine(line)) throw new Error('open escape');
+      const cells = decodeLine(normalizeTmuxCaptureCells(line), cols, state);
+      rows.push(AMBIGUOUS_EMOJI.test(line)
+        ? { cells: null, reason: 'ambiguous-cell-boundary' }
+        : { cells, reason: 'observed' });
+    } catch {
+      known = false;
+      rows.push({ cells: null, reason: 'unsupported-row' });
+    }
+  }
+  return { rows, complete: rows.every(row => row.cells !== null) };
+}

@@ -150,7 +150,7 @@ export function matchHistoryRows(
       const checks: RowMatch['checks'] = [];
       for (let i = 0; i < recent.length; i++) if (i !== mismatch) checks.push({ lineId: recent[i]!.lineId, capturedRow: i });
       return { reason: 'matched', checks,
-        repairs: [{ lineId: recent[mismatch]!.lineId, capturedRow: mismatch, row: captured[mismatch]! }] };
+        repairs: [] };
     }
   }
   const [a, b] = internRows([recent, captured]) as [number[], number[]];
@@ -180,7 +180,7 @@ export function matchHistoryRows(
 
   if (length === a.length) return result;
 
-  // A mismatch can only be repaired between two independently unique triples
+  // Only the independently unique triples are compared; never repair a gap
   // with identical row counts. No insertion/deletion or renumbering is inferred.
   const base = a.length + b.length + 1;
   const at = triples(a, base), bt = triples(b, base);
@@ -194,13 +194,9 @@ export function matchHistoryRows(
   for (let k = 0; k < anchors.length; k++) {
     const [i, j] = anchors[k]!;
     for (let n = 0; n < 3; n++) check(i + n, j + n);
-    const next = anchors[k + 1];
-    if (!next || next[0] <= i + 3) continue;
-    for (let x = i + 3; x < next[0]; x++) {
-      const y = x + offset;
-      if (a[x] === b[y]) check(x, y);
-      else result.repairs.push({ lineId: recent[x]!.lineId, capturedRow: y, row: captured[y]! });
-    }
+    // Interior gaps remain untouched: compensating insert/delete can keep
+    // their length while changing every hidden row identity.
+
   }
   return result;
 }
