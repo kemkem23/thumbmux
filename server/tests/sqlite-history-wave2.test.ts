@@ -633,3 +633,43 @@ test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episod
   expect(issues).toEqual({n:1,missing:hotRefused});
  }finally{console.error=originalError;await s.close();rmSync(root,{recursive:true,force:true});}
 },60000);
+
+// I2 §7: probe the disk writer independently of parser/capture and the host package.
+test('I2 probe: bundled projection worker drains and reopens its own durable database',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-bundle-'));
+ try {
+  const build=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir:join(root,'bundle'),target:'bun'});
+  expect(build.success).toBe(true);
+  const script=`import {createProjectionStore} from ${JSON.stringify(join(root,'bundle/projection-store.js'))};
+   const key={serverIdentity:'bundle',paneId:'%1',birthGeneration:1};
+   let s=createProjectionStore({historyRoot:${JSON.stringify(join(root,'data'))},mode:'create'});
+   const cpu=process.cpuUsage(),start=performance.now();
+   for(let n=0;n<2000;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:'ไทย '+n,cells:[]}});
+   await new Promise(r=>setTimeout(r,100));
+   const durableBeforeClose=s.token(key).durableRevision;await s.close();
+   s=createProjectionStore({historyRoot:${JSON.stringify(join(root,'data'))},mode:'recover'});
+   const count=s.token(key).nextLineId;await s.close();
+   console.log('I2_BUNDLE_PROBE',JSON.stringify({count,durableBeforeClose,elapsedMs:performance.now()-start,cpu:process.cpuUsage(cpu)}));
+   if(count!==2000 || durableBeforeClose===0)process.exitCode=1;`;
+  const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+  const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  console.log(out);if(err)console.error(err);expect(exit).toBe(0);
+ }finally{rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2 probe: measure A borrowing before B through E arrive without disk acknowledgements',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-borrow-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'});clearInterval((s as any).timer);
+ const admitted:number[]=[],refused:number[]=[];
+ try {
+  for(let pane=0;pane<5;pane++) {
+   admitted[pane]=0;refused[pane]=0;
+   for(let n=0;n<(pane===0?7:2);n++) {
+    try {await s.appendScroll({paneKey:{serverIdentity:'borrow',paneId:`%${pane}`,birthGeneration:1},sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:'x'.repeat(1024*1024),cells:[]}});admitted[pane]++;}
+    catch(error){expect(String(error)).toContain('ingest-capacity');refused[pane]++;}
+   }
+  }
+  console.log('I2_BORROW_PROBE',JSON.stringify({admitted,refused,health:s.health()}));
+  expect(s.health().pendingBytes).toBeLessThanOrEqual(16*1024*1024);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
