@@ -59,6 +59,11 @@ export type PipeFaultEvent = {
   kind: PipeVtFault["kind"] | "parser-backlog" | "closed";
   at: number;
   message?: string;
+  /** Bytes whose parsing could not be acknowledged; not a guessed row count. */
+  unacknowledgedBytes?: number;
+  receiveSeqFrom?: number;
+  receiveSeqTo?: number;
+  lostRows?: "unknown";
 };
 
 export interface PipeCollectorPorts {
@@ -80,6 +85,8 @@ export type PipeLatencySummary = {
 export type PipeHistoryCollectorOptions = {
   paneKey: PaneKey;
   sourceEpoch: number;
+  /** Actual pane option; unknown clear policy raises a fault, never guessed. */
+  scrollOnClear?: boolean;
   cols: number;
   rows: number;
   ports: PipeCollectorPorts;
@@ -148,6 +155,7 @@ export class PipeHistoryCollector {
 
   async start(): Promise<void> {
     await this.worker.start();
+    if (this.options.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.options.scrollOnClear);
     if (this.healthState === "starting") this.healthState = "ok";
   }
 
@@ -166,10 +174,18 @@ export class PipeHistoryCollector {
    */
   ingest(bytes: Uint8Array, receivedAtNs: bigint = this.nowNs()): boolean {
     if (this.healthState === "closed") return false;
+    if (this.healthState === "broken") {
+      const seq = ++this.receiveSeq;
+      this.options.ports.onFault({ kind: "worker-exit", at: this.now(), message: "bytes rejected by dead parser", unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
+      return false;
+    }
     const seq = ++this.receiveSeq;
     this.inflight.push({ seq, bytes: bytes.byteLength, at: receivedAtNs });
     this.inflightBytes += bytes.byteLength;
-    this.worker.feed(seq, bytes);
+    if (!this.worker.feed(seq, bytes, this.sourceEpoch)) {
+      this.fault("worker-exit", "parser rejected input", "broken");
+      return false;
+    }
     if (this.inflightBytes > this.queueLimit) {
       if (this.healthState === "ok") {
         this.fault("parser-backlog", `parser backlog ${this.inflightBytes} bytes > ${this.queueLimit}`, "degraded");
@@ -180,7 +196,7 @@ export class PipeHistoryCollector {
   }
 
   drained(): Promise<void> {
-    if (this.inflightBytes <= this.queueLimit) return Promise.resolve();
+    if (this.healthState === "broken" || this.healthState === "closed" || this.inflightBytes <= this.queueLimit) return Promise.resolve();
     return new Promise((resolve) => this.drainWaiters.push(resolve));
   }
 
@@ -195,6 +211,10 @@ export class PipeHistoryCollector {
   beginSourceEpoch(epoch: number): void {
     if (epoch <= this.sourceEpoch) throw new Error(`source epoch must increase (${this.sourceEpoch} -> ${epoch})`);
     this.sourceEpoch = epoch;
+  }
+
+  setScrollOnClear(enabled: boolean): void {
+    this.worker.setScrollOnClear(enabled);
   }
 
   currentSourceEpoch(): number {
@@ -263,7 +283,18 @@ export class PipeHistoryCollector {
   private fault(kind: PipeFaultEvent["kind"], message: string | undefined, health: PipeCollectorHealth): void {
     if (this.healthState === "closed") return;
     if (health === "broken" || this.healthState !== "broken") this.healthState = health;
-    this.options.ports.onFault({ kind, at: this.now(), message });
+    const loss = health === "broken" ? {
+      unacknowledgedBytes: this.inflightBytes,
+      receiveSeqFrom: this.ackedSeq + 1,
+      receiveSeqTo: this.receiveSeq,
+      lostRows: "unknown" as const,
+    } : {};
+    if (health === "broken") {
+      this.inflight = [];
+      this.inflightBytes = 0;
+      for (const waiter of this.drainWaiters.splice(0)) waiter();
+    }
+    this.options.ports.onFault({ kind, at: this.now(), message, ...loss });
   }
 
   private pushRing(event: PipeScrollEvent): void {
@@ -283,13 +314,14 @@ export class PipeHistoryCollector {
   }
 
   private onUpdate(update: PipeVtUpdate): void {
+    if (this.healthState === "broken" || this.healthState === "closed") return;
     const began = this.nowNs();
     this.workerParseNs += update.parseNs;
     this.workerEncodeNs += update.encodeNs;
     for (const scroll of update.scrolls) {
       this.pushRing({
         paneKey: this.paneKey,
-        sourceEpoch: this.sourceEpoch,
+        sourceEpoch: scroll.epoch,
         geometryGeneration: scroll.gen,
         physicalRow: scroll.row,
         softWrap: scroll.wrap,
@@ -347,7 +379,16 @@ export async function pumpBinaryStream(
   let total = 0;
   const iterable = Symbol.asyncIterator in (stream as object)
     ? (stream as AsyncIterable<Uint8Array>)
-    : { [Symbol.asyncIterator]: () => (stream as ReadableStream<Uint8Array>).getReader() as unknown as AsyncIterator<Uint8Array> };
+    : { async *[Symbol.asyncIterator]() {
+      const reader = (stream as ReadableStream<Uint8Array>).getReader();
+      try {
+        while (true) {
+          const value = await reader.read();
+          if (value.done) break;
+          yield value.value;
+        }
+      } finally { reader.releaseLock(); }
+    } };
   for await (const chunk of iterable) {
     total += chunk.byteLength;
     if (!collector.ingest(chunk)) await collector.drained();

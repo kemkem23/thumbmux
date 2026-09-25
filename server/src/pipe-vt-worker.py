@@ -78,12 +78,53 @@ def row_padded(row, cols):
 
 class Screen(pyte.Screen):
     def __init__(self, cols, rows):
+        self.epoch = 1
+        self.receive_seq = 0
+        self.scroll_on_clear = None
         self.on_scroll = None
         self.shift = 0
         self.alt = False
         self.saved_normal = None
         self._drawing = False
         super().__init__(cols, rows)
+
+    def stamp(self):
+        row = self.buffer[self.cursor.y]
+        if not hasattr(row, "epoch"):
+            row.epoch = self.epoch
+            row.origin_seq = self.receive_seq
+
+    def erase_in_display(self, how=0, *args, **kw):
+        if how == 2 and not self.alt:
+            if self.scroll_on_clear is None:
+                send(b"E", {"kind": "clear-policy-unknown", "message": "scroll-on-clear was not read from the pane; clear may discard normal rows"})
+            elif self.scroll_on_clear and self.on_scroll is not None:
+                # tmux preserves through the last nonblank line, not trailing
+                # empty display rows, when the whole display is cleared.
+                last = max((y for y, row in self.buffer.items()
+                            if any(c.data != " " for c in row.values())), default=-1)
+                for y in range(last + 1):
+                    self.on_scroll(self.buffer[y])
+        super().erase_in_display(how, *args, **kw)
+        if how == 2:
+            for row in self.buffer.values():
+                row.wrapped = row.pad = False
+                row.epoch = self.epoch
+                row.origin_seq = self.receive_seq
+
+    def scroll_up(self, count=1):
+        y = self.cursor.y
+        self.cursor.y = (self.margins or (0, self.lines - 1))[1]
+        for _ in range(min(count or 1, self.lines)):
+            self.index()
+        self.cursor.y = y
+
+    def scroll_down(self, count=1):
+        y = self.cursor.y
+        self.cursor.y = (self.margins or (0, self.lines - 1))[0]
+        for _ in range(min(count or 1, self.lines)):
+            self.reverse_index()
+        self.cursor.y = y
 
     # -- scroll hook: report the row before pyte's index() discards it --
     def index(self):
@@ -108,16 +149,22 @@ class Screen(pyte.Screen):
             # draw() only line-feeds for DECAWM auto-wrap: mark a soft wrap.
             self.buffer[self.cursor.y].wrapped = True
         super().linefeed()
+        if self._drawing:
+            self.stamp()
 
     def erase_in_line(self, how=0, private=False):
         if how in (0, 2):
             self.buffer[self.cursor.y].wrapped = False
             self.buffer[self.cursor.y].pad = False
         super().erase_in_line(how, private)
+        if how == 2:
+            row = self.buffer[self.cursor.y]
+            row.epoch, row.origin_seq = self.epoch, self.receive_seq
 
     # -- PIPETRAY repair + wide glyph wrap at the last column --
     def draw(self, data):
         self._drawing = True
+        self.stamp()
         try:
             if data.isascii():
                 super().draw(data)
@@ -180,7 +227,7 @@ class Screen(pyte.Screen):
                 cursor = None
                 if 1049 in alt:
                     cursor = (self.cursor.x, self.cursor.y, self.cursor.attrs, self.cursor.hidden)
-                self.saved_normal = (self.buffer, cursor, self.margins)
+                self.saved_normal = (self.buffer, cursor, self.margins, self.columns, self.lines)
                 self.buffer = self._fresh_buffer()
                 self.alt = True
                 self.dirty.update(range(self.lines))
@@ -195,13 +242,17 @@ class Screen(pyte.Screen):
         if kw.get("private"):
             alt = [m for m in modes if m in ALT_MODES]
             if alt and self.alt:
-                buffer, cursor, margins = self.saved_normal
+                buffer, cursor, margins, old_cols, old_rows = self.saved_normal
+                cols, rows = self.columns, self.lines
                 self.buffer = buffer
                 self.saved_normal = None
                 self.alt = False
                 self.margins = margins
                 if cursor is not None:
                     self.cursor.x, self.cursor.y, self.cursor.attrs, self.cursor.hidden = cursor
+                self.columns, self.lines = old_cols, old_rows
+                if (cols, rows) != (old_cols, old_rows):
+                    self.reflow(cols, rows)
                 self.dirty.update(range(self.lines))
             modes = tuple(m for m in modes if m not in ALT_MODES)
             if not modes:
@@ -225,10 +276,14 @@ class Screen(pyte.Screen):
             if y > last and y < self.lines and any(c != default for c in row.values()):
                 last = y
         logical = []
+        origins = []
+        origin = None
         current = []
         cursor_at = (0, 0)
         for y in range(last + 1):
             row = self.buffer[y]
+            if origin is None:
+                origin = (getattr(row, "epoch", self.epoch), getattr(row, "origin_seq", self.receive_seq))
             if y == self.cursor.y:
                 cursor_at = (len(logical), len(current) + min(self.cursor.x, self.columns))
             cells = [row[x] for x in range(self.columns)]
@@ -239,6 +294,8 @@ class Screen(pyte.Screen):
                 cells.pop()
             current.extend(cells)
             logical.append(current)
+            origins.append(origin)
+            origin = None
             current = []
         physical = []  # (cells, wrapped)
         cursor_row, cursor_col = 0, 0
@@ -249,11 +306,11 @@ class Screen(pyte.Screen):
             while i < len(cells):
                 width = 2 if (i + 1 < len(cells) and cells[i + 1].data == "" and cells[i].data != "") else 1
                 if len(chunk) + width > cols:
-                    physical.append((chunk, True, len(chunk) < cols))
+                    physical.append((chunk, True, len(chunk) < cols, origins[li]))
                     chunk = []
                 chunk.extend(cells[i:i + width])
                 i += width
-            physical.append((chunk, False, False))
+            physical.append((chunk, False, False, origins[li]))
             if li == cursor_at[0]:
                 offset = cursor_at[1]
                 used = 0
@@ -269,10 +326,11 @@ class Screen(pyte.Screen):
         self.lines, self.columns = rows, cols
         factory = self.buffer.default_factory
         fresh = self._fresh_buffer()
-        for k, (cells, wrapped, pad) in enumerate(physical):
+        for k, (cells, wrapped, pad, origin) in enumerate(physical):
             row = factory()
             for x, c in enumerate(cells[:cols]):
                 row[x] = c
+            row.epoch, row.origin_seq = origin
             row.wrapped = wrapped
             row.pad = pad
             if k < overflow:
@@ -322,7 +380,8 @@ def encode_cached(row, cols, default):
 class Worker:
     def __init__(self, cols, rows):
         self.screen = Screen(cols, rows)
-        self.stream = pyte.ByteStream(self.screen)
+        stream_type = type("TmuxByteStream", (pyte.ByteStream,), {"csi": {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}, "events": pyte.ByteStream.events | {"scroll_up", "scroll_down"}})
+        self.stream = stream_type(self.screen)
         self.gen = 0
         self.scrolls = []
         self.seq_from = None
@@ -338,14 +397,17 @@ class Worker:
         # from the last emitted frame is exactly its content.
         clean = 0 not in s.dirty and not self.full
         self.scrolls.append({
-            "row": encode_cached(row, s.columns, s.default_char) if clean else encode_row(row, s.columns, s.default_char),
+            "row": encode_row(row, s.columns, s.default_char),
             "wrap": row_wrapped(row),
             "pad": row_padded(row, s.columns),
             "gen": self.gen,
-            "seq": self.seq_to,
+            "seq": getattr(row, "origin_seq", self.seq_to),
+            "epoch": getattr(row, "epoch", s.epoch),
         })
 
-    def feed(self, seq, data):
+    def feed(self, seq, epoch, data):
+        self.screen.epoch = epoch
+        self.screen.receive_seq = seq
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
@@ -433,8 +495,11 @@ def main():
                 seq = struct.unpack(">Q", payload[:8])[0]
                 if batch_started is None:
                     batch_started = time.monotonic_ns()
-                worker.feed(seq, payload[8:])
-                batch_bytes += len(payload) - 8
+                epoch = struct.unpack(">Q", payload[8:16])[0]
+                worker.feed(seq, epoch, payload[16:])
+                batch_bytes += len(payload) - 16
+            elif kind == b"C":
+                worker.screen.scroll_on_clear = bool(payload[0])
             elif kind == b"Z":
                 c, r, g = struct.unpack(">HHI", payload[:8])
                 worker.resize(c, r, g)

@@ -54,6 +54,7 @@ export type PipeVtScroll = {
   pad: boolean;
   gen: number;
   seq: number | null;
+  epoch: number;
 };
 
 export type PipeVtCursor = { x: number; y: number; visible: boolean };
@@ -243,11 +244,12 @@ export class PipeVtWorker {
     if (this.inputFd === null || this.exited) return false;
     this.queue.push(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
     this.flush();
-    return true;
+    return this.inputFd !== null;
   }
 
   /** Write queued frames; a full FIFO (EAGAIN) retries shortly, never drops. */
   private flush(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     while (this.queue.length && this.inputFd !== null) {
       const head = this.queue[0]!;
@@ -255,7 +257,12 @@ export class PipeVtWorker {
       try {
         written = writeSync(this.inputFd, head);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+        if ((error as NodeJS.ErrnoException).code !== "EAGAIN") {
+          this.releaseInput();
+          this.options.onFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `worker input failed: ${(error as Error).message}` });
+          this.child?.kill("SIGKILL");
+          return;
+        }
       }
       if (written === head.length) {
         this.queue.shift();
@@ -282,10 +289,15 @@ export class PipeVtWorker {
   }
 
   /** Forward raw pipe bytes untouched; `seq` is the receive sequence. */
-  feed(seq: number, bytes: Uint8Array): boolean {
-    const prefix = Buffer.allocUnsafe(8);
+  feed(seq: number, bytes: Uint8Array, epoch = 1): boolean {
+    const prefix = Buffer.allocUnsafe(16);
     prefix.writeBigUInt64BE(BigInt(seq));
-    return this.write([header("D", 8 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)]);
+    prefix.writeBigUInt64BE(BigInt(epoch), 8);
+    return this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)]);
+  }
+
+  setScrollOnClear(enabled: boolean): boolean {
+    return this.write([header("C", 1), Buffer.from([Number(enabled)])]);
   }
 
   resize(cols: number, rows: number, geometryGeneration: number): boolean {
