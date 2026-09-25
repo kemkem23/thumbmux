@@ -269,7 +269,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
-      const value=((input as ProjectionCalibration).capture??input) as ScrollEvent;
+      const value=((input as ProjectionCalibration).capture??input) as Pick<ScrollEvent,'sourceEpoch'|'geometryGeneration'>;
       const id=paneId(key);
       let scope=this.capacity(key,512,liveFrame);if(scope!=='ok')this.rejectCapacity(key,value,isScroll,scope);
       const bytes=preparedBytes??Buffer.byteLength(JSON.stringify(input))+512;
