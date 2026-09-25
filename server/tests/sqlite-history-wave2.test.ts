@@ -707,3 +707,56 @@ test('I2: 208x60 interleaved frames retain all scrolls under one bounded latest-
   expect(s.health().pendingBytes).toBe(0);
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
+
+test('I2 mutations: stale issue, unfenced screen and cache recovery each make an independent oracle fail',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
+ const cases=[
+  {name:'issue-cas',file:'ram-store.ts',before:"if(p.revision!==issue.expectedRevision)throw new Error('stale-revision');",after:'/* mutation: removed issue CAS */'},
+  {name:'capture-fence',file:'ram-store.ts',before:"if(evidence?.kind==='byte-fence') {",after:"if(true) {"},
+  {name:'cache-recovery',file:'projection-store.ts',before:'if(this.pendingBytes()<PENDING_MAX/2 && this.ram.bytes()<=CACHE_MAX) {',after:'if(this.pendingBytes()<PENDING_MAX/2) {'},
+ ];
+ try {
+  for(const mutation of cases)for(const broken of [false,true]) {
+   const outdir=join(root,mutation.name+'-'+broken);
+   const result=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir,target:'bun',plugins:[{
+    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store)\.ts$/},args=>{
+     let contents=readFileSync(args.path,'utf8');
+     if(broken && args.path.endsWith('/'+mutation.file)) {
+      expect(contents).toContain(mutation.before);contents=contents.replace(mutation.before,mutation.after);
+      // Remove the remaining fence validations too: the mutant represents the old unconditional capture-screen write.
+      if(mutation.name==='capture-fence')contents=contents.replace('integer(evidence.receiveSeq);','').replace("if(evidence.sourceEpoch!==c.sourceEpoch || evidence.receiveSeq!==c.receiveSeq || evidence.receiveSeq!==p.receive_seq)throw new Error('capture-fence-mismatch');",'');
+     }
+     return {contents,loader:'ts'};
+    });}
+   }]});
+   expect(result.success).toBe(true);
+   const script=`import {createProjectionStore} from ${JSON.stringify(join(outdir,'projection-store.js'))};
+    const key={serverIdentity:'mutation',paneId:'%1',birthGeneration:1};
+    const s=createProjectionStore({historyRoot:${JSON.stringify(join(outdir,'data'))},mode:'create'});
+    const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
+    const row={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'one',cells:[]}};
+    try {
+     await s.appendScroll(row);
+     if(${JSON.stringify(mutation.name)}==='issue-cas') {
+      let rejected=false;try {await s.recordIssue({paneKey:key,sourceEpoch:1,geometryGeneration:1,expectedRevision:0,boundaryLineId:1,kind:'fault',reason:'fixture',missingCount:null,recoverable:false});}catch(e){rejected=String(e).includes('stale-revision');}
+      assert(rejected,'stale issue must be refused');
+     } else if(${JSON.stringify(mutation.name)}==='capture-fence') {
+      const cell={grapheme:'A',width:1,continuation:false,fg:null,bg:null,style:0};
+      const frame={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:1,rows:1,kind:'normal',cells:[[cell]],cursor:null};
+      await s.replaceScreen(frame);
+      await s.calibrate({capture:{...frame,captureId:'unfenced',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:[],ambiguousRows:0,result:'fixture'},expectedRevision:s.token(key).revision,captureEvidence:{kind:'unfenced',reason:'fixture'},checks:[],repairs:[]});
+      assert(s.screen(key).display_source==='pipe','unfenced capture must not replace screen');
+     } else {
+      const bytes=s.ram.bytes.bind(s.ram);s.ram.bytes=()=>256*1024*1024+1;
+      try {await s.appendScroll({...row,receiveSeq:2});}catch{}
+      s.flush();const state=s.health().status;s.ram.bytes=bytes;
+      assert(state==='stopped','cache pressure must remain stopped');
+     }
+    } finally {await s.close();}`;
+   const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+   const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+   console.log('I2_MUTATION',JSON.stringify({name:mutation.name,broken,exit,stdout:out,stderr:err}));
+   expect(exit).toBe(broken?1:0);if(broken)expect(err).toContain('MUTATION_RED:');
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+},60000);
