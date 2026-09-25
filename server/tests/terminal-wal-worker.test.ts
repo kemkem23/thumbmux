@@ -950,6 +950,7 @@ type MeasureConfig = {
   idleSeconds: number;
   count?: number;
   warmupSeconds?: number;
+  hotRate?: number;
 };
 
 const MEASURE_CONFIGS: Record<typeof L2P_MEASURE, MeasureConfig> = {
@@ -1099,16 +1100,18 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
   const producer = join(dir, "producer.py");
   writeFileSync(producer, PRODUCER_SCRIPT);
   const count = cfg.count ?? cfg.rate * (cfg.seconds + (cfg.warmupSeconds ?? 0) + 3);
-  const panes: Array<{ name: string; fifo: string; pane?: LightPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
+  const panes: Array<{ name: string; fifo: string; count: number; pane?: LightPane; reader?: ReturnType<typeof Bun.spawn>; pump?: Promise<number>; writer?: number | null }> = [];
   const samples = JSON.stringify(PRODUCER_SAMPLES);
   const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   try {
     for (let p = 0; p < cfg.panes; p++) {
       const name = `p${p}`;
       const fifo = join(dir, `${name}.fifo`);
-      const entry: (typeof panes)[number] = { name, fifo };
+      const rate = p === 0 && cfg.hotRate ? cfg.hotRate : cfg.rate;
+      const paneCount = cfg.count ?? rate * (cfg.seconds + (cfg.warmupSeconds ?? 0) + 3);
+      const entry: (typeof panes)[number] = { name, fifo, count: paneCount };
       const barrier = cfg.warmupSeconds ? ` ${shellQuote(join(dir, "start"))}` : "";
-      const command = `exec python3 -B ${shellQuote(producer)} ${name} ${cfg.rate} ${count} ${shellQuote(samples)}${barrier}`;
+      const command = `exec python3 -B ${shellQuote(producer)} ${name} ${rate} ${paneCount} ${shellQuote(samples)}${barrier}`;
       const birth = [
         ...(p === 0 ? ["-f", "/dev/null"] : []),
         "new-session", "-d", "-s", name, "-x", String(cfg.cols), "-y", String(cfg.rows), command,
@@ -1183,8 +1186,10 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     let missing = 0;
     let extra = 0;
     let wrong = 0;
+    const perPane: object[] = [];
     for (const entry of panes) {
       const pane = entry.pane!;
+      const before = { missing, extra, wrong };
       const ids: number[] = [];
       for (const line of lightLogical(pane)) {
         const match = new RegExp(`^${entry.name} (\\d{6}) (.*)$`).exec(line);
@@ -1197,17 +1202,25 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
       }
       const seen = new Set<number>();
       for (const id of ids) {
-        if (seen.has(id) || id >= count) extra += 1;
+        if (seen.has(id) || id >= entry.count) extra += 1;
         seen.add(id);
       }
-      for (let id = 0; id < count; id++) if (!seen.has(id)) missing += 1;
+      for (let id = 0; id < entry.count; id++) if (!seen.has(id)) missing += 1;
       expect(ids[0]).toBe(0); // byte 0: the pipe opened with the pane
-      expect(pane.faults).toEqual([]);
+      const oracle = { missing: missing - before.missing, extra: extra - before.extra, wrong: wrong - before.wrong };
+      perPane.push({ pane: entry.name, produced: entry.count, oracle,
+        acceptedBytes: pane.collector.stats().acceptedBytes, refusedBytes: pane.collector.stats().refusedBytes,
+        faults: pane.faults });
+      if (!cfg.hotRate || entry.name !== "p0") {
+        expect(pane.faults).toEqual([]);
+        expect(oracle).toEqual({ missing: 0, extra: 0, wrong: 0 });
+      }
     }
     const latencies = panes.flatMap((e) => [...e.pane!.collector.latencySamples()]).sort((a, b) => a - b);
     const pick = (p: number) => latencies.length ? latencies[Math.min(latencies.length - 1, Math.floor((latencies.length - 1) * p))]! : null;
     const stats = panes.map((e) => e.pane!.collector.stats());
-    result.rowsPerPane = count;
+    result.rowsPerPane = cfg.hotRate ? panes.map(e => ({ pane: e.name, rows: e.count })) : count;
+    if (cfg.hotRate) result.hotRate = cfg.hotRate;
     result.latencyMs = { samples: latencies.length, p50: pick(0.5), p95: pick(0.95), p99: pick(0.99), max: latencies.at(-1) ?? null };
     result.worstPaneP95Ms = Math.max(...stats.map((s) => s.latency.p95Ms ?? 0));
     result.timeSplitMs = {
@@ -1220,7 +1233,8 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     result.admission = { acceptedBytes: stats.reduce((sum, s) => sum + s.acceptedBytes, 0),
       refusedBytes: stats.reduce((sum, s) => sum + s.refusedBytes, 0) };
     result.oracle = { missing, extra, wrong };
-    expect({ missing, extra, wrong }).toEqual({ missing: 0, extra: 0, wrong: 0 });
+    if (cfg.hotRate) result.perPane = perPane;
+    else expect({ missing, extra, wrong }).toEqual({ missing: 0, extra: 0, wrong: 0 });
     return result;
   } finally {
     for (const entry of panes) entry.reader?.kill();
@@ -1228,6 +1242,17 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     for (const entry of panes) await entry.pane?.collector.close();
   }
 }
+
+test("I1 profile hot 20k rows/s alongside twenty normal panes", async () => {
+  const result = await measureRound({ name: "I1-hot", panes: 21, cols: 80, rows: 24,
+    rate: 100, hotRate: 20_000, seconds: 10, rounds: 1, baseline: false, idleSeconds: 0, warmupSeconds: 1 }, 1, true);
+  const active = result.active as Record<string, number>;
+  const cores = (active.worker! + active.reader! + active.writer! + active.host!) / (result.activeSeconds as number);
+  console.log(`I1 HOT ${JSON.stringify({ ...result, cores, durableAndWsIntervalsVerified: false })}`);
+  // Pane-normal assertions are in measureRound. Unknown hot losses need I4
+  // durable/WS interval proof; fault presence alone is not that proof.
+  expect((result.perPane as object[]).length).toBe(21);
+}, 900_000);
 
 for (const panes of [1, 21]) for (const [cols, rows] of [[80, 24], [120, 40]] as const) {
   test(`I1 CPU profile ${panes} panes ${cols}x${rows} 60s x3 after 10s warmup`, async () => {
