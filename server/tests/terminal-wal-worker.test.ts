@@ -916,7 +916,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
 // asserted, so a miss is visible instead of turning into a lowered load.
 // ---------------------------------------------------------------------------
 
-const L2P_MEASURE = "steady-1" as "smoke" | "steady-1" | "steady-21" | "burst";
+const L2P_MEASURE = "steady-21" as "smoke" | "steady-1" | "steady-21" | "burst";
 const LIVE_TMUX = process.env.GITHUB_ACTIONS !== "true";
 
 type MeasureConfig = {
