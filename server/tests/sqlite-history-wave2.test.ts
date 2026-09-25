@@ -516,13 +516,15 @@ test('newarch DEBT2 D10: full-text frames up to 208x60 are never refused on an i
   }
   // A pane already over its history share (queue empty) still publishes its screen.
   const big='x'.repeat(1024*1024);let refusedRows=0;
-  await Promise.all(Array.from({length:12},(_,n)=>s.appendScroll({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:10+n,softWrap:false,physicalRow:{text:big,cells:[]}}).catch(()=>{refusedRows++;})));
-  expect(refusedRows).toBeGreaterThan(0);
-  await s.replaceScreen({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:30,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,0,true),cursor:null});
+  const rows=Array.from({length:12},(_,n)=>s.appendScroll({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:10+n,softWrap:false,physicalRow:{text:big,cells:[]}}).catch(()=>{refusedRows++;}));
+  // Refusal is decided synchronously; read status before any flush can recover the pane.
   // One pane over its share degrades that pane, not the whole store (O9).
-  expect(s.health().status).toBe('degraded');
+  const statusAtRefusal=s.health().status;
+  const shown=s.replaceScreen({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:30,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,0,true),cursor:null});
+  await Promise.all(rows);await shown;
+  expect(refusedRows).toBeGreaterThan(0);expect(statusAtRefusal).toBe('degraded');
   s.flush();expect(s.health().pendingBytes).toBe(0);
-  console.log('NA_DEBT2_FRAMES',JSON.stringify({known:2000,results:out,hotPaneRefusedRows:refusedRows}));
+  console.log('NA_DEBT2_FRAMES',JSON.stringify({known:2000,results:out,hotPaneRefusedRows:refusedRows,statusAtRefusal}));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },120000);
 
