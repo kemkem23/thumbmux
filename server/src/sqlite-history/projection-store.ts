@@ -214,7 +214,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(!emit && panes.length)return;
     if(now-(this.faultEmitted.get(kind)??0)<1000)return;
     this.faultEmitted.set(kind,now);
-    const fault={kind,reason,at:now,pendingBytes:this.pendingBytes()};
+    const fault={kind,reason,at:now,pendingBytes:this.pendingBytes(),panes:panes.map(p=>({
+      paneKey:{serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)},
+      sourceEpoch:Number(p.source_epoch),boundaryLineId:Number(p.next_line_id),missingCount:kind==='ingest-capacity'?lostRows:null}))};
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
@@ -393,7 +395,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   private externalFault(issue:ProjectionIssueInput,error:unknown):void {
     // The independent host sink remains available when journal admission fails.
-    try {this.options.onFault?.({kind:issue.kind,reason:issue.reason+'; journal rejected: '+String(error),at:Date.now(),pendingBytes:this.pendingBytes()});}
+    try {this.options.onFault?.({kind:issue.kind,reason:issue.reason+'; journal rejected: '+String(error),at:Date.now(),pendingBytes:this.pendingBytes(),panes:[{paneKey:{...issue.paneKey},sourceEpoch:issue.sourceEpoch,boundaryLineId:issue.boundaryLineId,missingCount:issue.missingCount}]});}
     catch {console.error('[newarch] fault sink failed');}
   }
   calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c),false);}

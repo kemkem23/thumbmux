@@ -583,3 +583,15 @@ test('I2: same-generation frame receipt follows every accepted scroll',async()=>
   await Promise.all([a,b]);expect(events).toEqual(['scroll','frame']);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('I2: first epoch and pre-output fault persist without a fabricated initial frame',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-birth-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const receipt=await s.transitionEpoch({paneKey:naKey,sourceEpoch:0,nextEpoch:1,geometryGeneration:1,expectedRevision:0,
+   boundaryLineId:0,kind:'reader-start',reason:'no prior byte boundary',missingCount:null,recoverable:false});
+  expect(receipt.durableRevision).toBe(receipt.revision);expect(s.screen(naKey)).toBeNull();
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.token(naKey)).toMatchObject({sourceEpoch:1,nextLineId:0});
+  expect(s.readPage(s.token(naKey),null,1).issues[0]).toMatchObject({boundaryLineId:0,missingCount:null,sourceEpoch:1});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});

@@ -146,7 +146,8 @@ export class ProjectionRam {
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
   recordIssue(issue: ProjectionIssueInput, nextEpoch?: number): ProjectionReceipt {
-    const p=this.pane(issue.paneKey), id=paneId(issue.paneKey);
+    const id=paneId(issue.paneKey);
+    const p=(this.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(id) as SqlRow|null)??this.ensure(issue.paneKey,issue.sourceEpoch,issue.geometryGeneration);
     if(p.revision!==issue.expectedRevision)throw new Error('stale-revision');
     if(p.source_epoch!==issue.sourceEpoch || p.geometry_generation!==issue.geometryGeneration)throw new Error('stale-generation');
     integer(issue.boundaryLineId);

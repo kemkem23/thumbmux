@@ -206,7 +206,10 @@ export interface ProjectionLine extends PhysicalRow {
 export interface ProjectionPage {
   token: ProjectionToken; lines: ProjectionLine[]; issues: ProjectionIssue[]; nextAnchor: number; hasMore: boolean;
 }
-export interface ProjectionFault { kind: string; at: number; reason: string; pendingBytes: number }
+export interface ProjectionFault {
+  kind: string; at: number; reason: string; pendingBytes: number;
+  panes?: Array<{ paneKey: PaneKey; sourceEpoch: number; boundaryLineId: number; missingCount: number | null }>;
+}
 export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
