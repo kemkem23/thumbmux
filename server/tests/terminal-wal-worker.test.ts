@@ -1442,3 +1442,36 @@ for (const mutation of [false, true]) test(`DEBT2 ED0 split-byte regression muta
   expect(pane.faults).toEqual([]);
   console.log(`DEBT2 ED0 mutation=${mutation} missing=${mutation ? 10 : 0} extra=0 duplicate=0 faults=0`);
 });
+
+
+for (const size of [1, 7, 65536]) test(`DEBT3 DCS queries, embedded escapes and cancellation chunk=${size}`, async () => {
+  const pane = await collectPane();
+  const ignored = [
+    "\x1bP+q544e\x1b\\", "\x1bP$qm\x1b\\",
+    "\x1bPtmux;\x1b\x1b[2J\x1b\\", "\x1bPzdata\x1bPqignored\x1b\\",
+    "\x1bP12:bad\x1b\\", "\x1bP12\x18", "\x1bP$\x1a",
+  ];
+  const body = Array.from({ length: 140 }, (_, i) => `L${String(i + 1).padStart(6, "0")}\r\n${ignored[i % ignored.length]}`).join("");
+  feedSplit(pane, encoder.encode(body), size);
+  await settle(pane);
+  const ids = (pane.scrolls.map(e => rowText(e.physicalRow)).join("\n") + screenRows(pane).map(r => r.text).join("\n")).match(/L\d{6}/g) ?? [];
+  expect(ids).toEqual(Array.from({ length: 140 }, (_, i) => `L${String(i + 1).padStart(6, "0")}`));
+  expect(pane.faults).toEqual([]);
+  expect(pane.collector.currentSourceEpoch()).toBe(1);
+  expect(pane.collector.health()).toBe("ok");
+});
+
+for (const header of ["q", "0;1;0q"]) test(`DEBT3 split SIXEL ${header} faults only after ST and recovers`, async () => {
+  const pane = await collectPane();
+  feedSplit(pane, encoder.encode(`\x1bP${header}\"1;1;10;60~`), 1);
+  await settle(pane);
+  expect(pane.faults).toEqual([]);
+  feedSplit(pane, encoder.encode("\x1b\\"), 1);
+  await untilFix1(() => pane.faults.some(f => f.kind === "worker-restarted"));
+  expect(pane.faults.filter(f => f.kind === "worker-error").length).toBe(1);
+  expect(pane.faults.find(f => f.kind === "worker-error")?.message).toContain("DCS/SIXEL");
+  pane.collector.ingest(encoder.encode("after-sixel\r\n"));
+  await settle(pane);
+  expect(screenRows(pane).map(r => r.text).join("\n")).toContain("after-sixel");
+  expect(pane.collector.currentSourceEpoch()).toBe(2);
+});

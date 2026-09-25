@@ -419,7 +419,9 @@ class Worker:
         self.full = True
         self.parse_ns = 0
         self.emitted_seq = None
-        self.trailing_escape = False
+        self.dcs_state = "ground"
+        self.dcs_sixel = False
+        self.dcs_intermediate = False
         self.screen.on_scroll = self._on_scroll
         self.screen.on_history_clear = self._on_history_clear
 
@@ -448,18 +450,74 @@ class Worker:
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
-        # DCS can contain SIXEL, whose image height scrolls tmux history.
-        # pyte does not implement it: explicitly break the source instead of
-        # silently treating the image payload as printable terminal text.
-        # Remember an ESC across D packets, without buffering the payload.
-        probe = (b"\x1b" if self.trailing_escape else b"") + data
-        self.trailing_escape = data.endswith(b"\x1b")
-        if b"\x1bP" in probe:
-            send(b"E", {"kind": "unsupported-dcs", "message": "DCS/SIXEL may scroll history; parser does not support it; source recovery required"})
-            return
         t = time.monotonic_ns()
-        self.stream.feed(data)
+        data = self.filter_dcs(data)
+        if data is not None:
+            self.stream.feed(data)
         self.parse_ns += time.monotonic_ns() - t
+
+    def filter_dcs(self, data):
+        """Consume DCS without exposing its payload to pyte (which lacks DCS).
+
+        tmux 3.4 input.c's enter/parameter/intermediate/handler/escape states
+        distinguish queries and passthrough from SIXEL. Keep only constant
+        state, including across input packets; an ignored string can be huge.
+        ESC inside a payload quotes the next byte unless it is ST (ESC \\).
+        """
+        out = bytearray()
+        for ch in data:
+            state = self.dcs_state
+            if state == "ground":
+                if ch == 0x1b:
+                    self.dcs_state = "escape"
+                else:
+                    out.append(ch)
+            elif state == "escape":
+                if ch == ord("P"):
+                    self.dcs_state = "enter"
+                    self.dcs_intermediate = False
+                    self.dcs_sixel = False
+                else:
+                    out.append(0x1b)
+                    self.dcs_state = "escape" if ch == 0x1b else "ground"
+                    if ch != 0x1b:
+                        out.append(ch)
+            elif state in ("body", "body-escape"):
+                if state == "body-escape":
+                    if ch == ord("\\"):
+                        self.dcs_state = "ground"
+                        if self.dcs_sixel:
+                            # Publish pre-DCS text, then require source recovery.
+                            self.stream.feed(bytes(out))
+                            self.emit(ack=False)
+                            send(b"E", {"kind": "unsupported-sixel", "message": "DCS/SIXEL may scroll history; parser does not support it; source recovery required"})
+                            return None
+                    else:
+                        self.dcs_state = "body"
+                elif ch == 0x1b:
+                    self.dcs_state = "body-escape"
+            elif ch in (0x18, 0x1a):  # CAN/SUB cancel a header, not a body.
+                self.dcs_state = "ground"
+            elif ch == 0x1b:
+                self.dcs_state = "escape"
+            elif state == "ignore":
+                pass
+            elif ch < 0x20 or ch >= 0x7f:
+                pass
+            elif 0x20 <= ch <= 0x2f:
+                self.dcs_intermediate = True
+                self.dcs_state = "intermediate"
+            elif 0x30 <= ch <= 0x3f:
+                if state == "intermediate" or ch == 0x3a or (state == "parameter" and ch >= 0x3c):
+                    self.dcs_state = "ignore"
+                else:
+                    if ch >= 0x3c:
+                        self.dcs_intermediate = True
+                    self.dcs_state = "parameter"
+            else:  # Final byte; +q (XTGETTCAP) and $q (DECRQSS) are queries.
+                self.dcs_sixel = ch == ord("q") and not self.dcs_intermediate
+                self.dcs_state = "body"
+        return bytes(out)
 
     def resize(self, cols, rows, gen):
         self.gen = gen
