@@ -1368,3 +1368,52 @@ describe("L2-P DEBT recovery", () => {
     expect(pane.collector.health()).toBe("ok");
   });
 });
+
+
+test("51 five clears with unknown policy remain explicit faults and recover", async () => {
+  const pane = await collectPane(80, 24, { scrollOnClear: undefined });
+  for (let round = 1; round <= 5; round++) {
+    pane.collector.ingest(encoder.encode(`before-${round}\r\n`));
+    await settle(pane);
+    pane.collector.ingest(encoder.encode("\x1b[H\x1b[2J"));
+    await untilFix1(() => pane.faults.filter(f => f.kind === "worker-restarted").length === round);
+    expect(pane.collector.health()).toBe("ok");
+  }
+  pane.collector.ingest(encoder.encode("after-five-clears"));
+  await settle(pane);
+  expect(screenRows(pane).map(row => row.text).join("\n")).toContain("after-five-clears");
+  expect(pane.faults.filter(f => f.kind === "worker-error").length).toBe(5);
+  console.log("DEBT unknown policy: 5 explicit faults, 5 recoveries, subsequent output received");
+}, 30_000);
+
+// Negative controls mutate only a private copy of the Python worker assets.
+for (const kind of ["RIS", "E3"] as const) test(`DEBT mutation ${kind} reproduces ten silently lost rows`, async () => {
+  const assets = pipeVtAssets();
+  const root = mkdtempSync(join(tmpdir(), "l2p-debt-mutation-"));
+  roots.push(root);
+  let source = readFileSync(assets.worker, "utf8");
+  if (kind === "RIS") {
+    const original = "self.preserve_on_clear()\n        super().reset()";
+    expect(source).toContain(original);
+    source = source.replace(original, "super().reset()");
+  } else {
+    expect(source).toContain("if how == 3:");
+    source = source.replace("if how == 3:", "if how == -999:");
+  }
+  writeFileSync(join(root, "pipe-vt-worker.py"), source);
+  writeFileSync(join(root, "pipe-vt-vendor.zip"), readFileSync(assets.vendor));
+  writeFileSync(join(root, "pipe-vt-LICENSE.txt"), readFileSync(assets.license));
+  const pane = await collectPane(80, 24, { assets: pipeVtAssets(root) });
+  const lines = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `L${String(from + i).padStart(6, "0")}\r\n`).join("");
+  pane.collector.ingest(encoder.encode(lines(1, 10)));
+  await settle(pane);
+  pane.collector.ingest(encoder.encode(kind === "RIS" ? "\x1bc" : "\x1b[3J"));
+  pane.collector.ingest(encoder.encode(lines(11, 60)));
+  await settle(pane);
+  const seen = (pane.scrolls.map(e => rowText(e.physicalRow)).join("\n") + screenRows(pane).map(row => row.text).join("\n")).match(/L\d{6}/g) ?? [];
+  expect(seen.length).toBe(50);
+  expect(seen).not.toContain("L000001");
+  expect(seen).toContain("L000060");
+  expect(pane.faults).toEqual([]);
+  console.log(`DEBT mutation ${kind}: missing=10 extra=0 duplicate=0 faults=0 (negative control detected)`);
+});
