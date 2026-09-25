@@ -302,8 +302,10 @@ export class TmuxCaptureDecoder {
       let entry = this.cache.get(key);
       if (entry) {
         this.hits++;
-        // Refresh recency; Map iteration order is the eviction order.
-        this.cache.delete(key); this.cache.set(key, entry);
+        // No recency refresh: a delete+set per hit churned ~94k Map entries per
+        // 21-pane full capture (heap 446 -> 175 MB without it). History rows
+        // age in insertion order, so FIFO evicts rows that left tmux first; an
+        // early eviction of a repeated row only costs one re-decode.
       } else {
         this.misses++;
         const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(internCell);
