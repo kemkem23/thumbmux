@@ -9,6 +9,7 @@ import { readProjectionPage } from './projection-reader';
 import type { PaneKey, ProjectionCalibration, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=256*1024;
+const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   onFault?: (fault: ProjectionFault)=>void;
@@ -84,7 +85,9 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   parentPort!.on('message',onMessage);
 }
 
-type Job={liveFrame:boolean;sourceEpoch:number;geometryGeneration:number;bytes:number;at:number;run:()=>ProjectionReceipt;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
+type Waiter={resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void};
+type Job=Waiter&{liveFrame:boolean;screenKey?:string;sourceEpoch:number;geometryGeneration:number;bytes:number;at:number;run:()=>ProjectionReceipt;waiters?:Waiter[]};
+const settle=(job:Job,ok:boolean,value:any)=>{for(const w of [job,...(job.waiters??[])])ok?w.resolve(value):w.reject(value);};
 
 /** One RAM writer, one disk writer, round-robin pane queues, independent of viewers. */
 export class ProjectionStore implements ProjectionWriterPort {
@@ -95,6 +98,8 @@ export class ProjectionStore implements ProjectionWriterPort {
   private queues=new Map<string,Job[]>();
   private queuedBytes=0;
   // Reservations follow a pane through queue, RAM and the unacknowledged batch.
+  // Only panes holding bytes have a key, so its size is the number of panes
+  // competing for the cap right now, not every pane the store has ever seen.
   private pendingByPane=new Map<string,number>();
   private dirtyByPane=new Map<string,number>();
   private capacityLosses=new Map<string,{key:PaneKey;count:number}>();
@@ -116,7 +121,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private screenBytes=new Map<string,number>();
   private dirtyFaults=new Set<string>();
   private faultEmitted=new Map<string,number>();
-  private faults=new Map<string,{id:string;pane:string;last:number;count:number;revision:number}>();
+  private faults=new Map<string,{id:string;pane:string;last:number;seen:number;detected:number;count:number;revision:number}>();
   private lastCommitAt:number|null=null;
   private lastFlushAgeMs=0;
   constructor(private readonly options:ProjectionOptions) {
@@ -159,7 +164,6 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const row of this.disk.query('SELECT * FROM na_pane').all() as SqlRow[]) {
         if(row.revision!==row.durable_revision) throw new Error('durable-watermark-corrupt');
         upsert(this.ram.db,'na_pane',row);
-        this.pendingByPane.set(String(row.pane_key),0);
         const id=String(row.pane_key), floor=Math.max(0,Number(row.next_line_id)-5000);
         const captures=this.disk.query(`SELECT * FROM na_capture c WHERE c.pane_key=? AND
           (EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)
@@ -187,8 +191,12 @@ export class ProjectionStore implements ProjectionWriterPort {
     let emit=false;
     this.ram.db.transaction(()=>{
       for(const p of panes) {
-        const tag=String(p.pane_key)+':'+kind, previous=this.faults.get(tag);
-        const count=(previous?.count??0)+(kind==='ingest-capacity'?lostRows:0);
+        const tag=String(p.pane_key)+':'+kind, capacity=kind==='ingest-capacity';
+        // Capacity refusals that keep recurring are one episode with one issue id,
+        // even when the pane briefly recovers between them.
+        let previous=this.faults.get(tag);
+        if(previous && capacity && now-previous.seen>CAPACITY_EPISODE_MS)previous=undefined;
+        const count=(previous?.count??0)+(capacity?lostRows:0);
         if(previous && kind!=='ingest-capacity' && now-previous.last<1000)continue;
         if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
         if(!previous || now-previous.last>=1000)emit=true;
@@ -196,8 +204,8 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run('degraded',p.pane_key);
         this.ram.db.query(`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
           ON CONFLICT(issue_id) DO UPDATE SET revision=excluded.revision,missing_count=excluded.missing_count,reason=excluded.reason`)
-          .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,kind==='ingest-capacity'?count:null,now);
-        this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,count,revision:Number(p.revision)+1});
+          .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,capacity?count:null,previous?.detected??now);
+        this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,seen:now,detected:previous?.detected??now,count,revision:Number(p.revision)+1});
         // Updates coalesce under one issue id; account metadata once per pending episode.
         if(!this.dirtyFaults.has(tag)){this.dirtyBytes+=1024;this.dirtyFaults.add(tag);}
         this.dirtySince??=now;
@@ -210,15 +218,25 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
-  private capacity(key:PaneKey,bytes:number):boolean {
-    const id=paneId(key);
-    if(!this.pendingByPane.has(id))this.pendingByPane.set(id,0);
-    const share=Math.floor((PENDING_MAX-64*1024)/Math.max(2,this.pendingByPane.size));
-    return (this.pendingByPane.get(id)??0)+bytes<=share
-      && this.pendingBytes()+bytes<=PENDING_MAX-64*1024;
+  /**
+   * 'store' = the shared cap is full; 'pane' = only this pane is over its share.
+   * The share divides the cap among panes holding bytes now plus this pane, and
+   * keeps one share free for a pane that has not arrived yet: an idle store lends
+   * a burst half the cap, twenty-one busy panes each get 1/22.
+   * Screen frames skip the share: each pane/kind keeps only its latest frame, so
+   * their reservation is bounded by the frame size itself, never by pane count.
+   */
+  private capacity(key:PaneKey,bytes:number,frame=false):'ok'|'pane'|'store' {
+    if(this.pendingBytes()+bytes>ADMIT_MAX)return 'store';
+    if(frame)return 'ok';
+    const id=paneId(key),mine=this.pendingByPane.get(id)??0;
+    const competing=this.pendingByPane.size+(mine>0?0:1);
+    return mine+bytes<=Math.floor(ADMIT_MAX/(competing+1))?'ok':'pane';
   }
-  private rejectCapacity(key:PaneKey,value:{sourceEpoch:number;geometryGeneration:number},isScroll:boolean):never {
-    this.stopped=true;this.degraded=true;if(isScroll)this.rejectedRows++;
+  private rejectCapacity(key:PaneKey,value:{sourceEpoch:number;geometryGeneration:number},isScroll:boolean,scope:'pane'|'store'):never {
+    // One pane over its share degrades that pane; only a full store stops the store.
+    if(scope==='store')this.stopped=true;
+    this.degraded=true;if(isScroll)this.rejectedRows++;
     const id=paneId(key),pending=this.capacityLosses.get(id);
     if(pending){if(isScroll)pending.count++;}
     else {
@@ -241,7 +259,8 @@ export class ProjectionStore implements ProjectionWriterPort {
     }
   }
   private reserve(id:string,bytes:number,dirty=false):void {
-    this.pendingByPane.set(id,(this.pendingByPane.get(id)??0)+bytes);
+    const next=(this.pendingByPane.get(id)??0)+bytes;
+    if(next===0)this.pendingByPane.delete(id);else this.pendingByPane.set(id,next);
     if(dirty)this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+bytes);
   }
   private enqueue(key:PaneKey,input:unknown,operation:(frozen:any)=>ProjectionReceipt,isScroll=true,liveFrame=false,preparedBytes?:number):Promise<ProjectionReceipt> {
@@ -250,13 +269,15 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(this.closing)throw new Error('store-closing');
       const value=(isScroll || liveFrame?input:(input as ProjectionCalibration).capture) as ScrollEvent;
       const id=paneId(key);
-      if(!this.capacity(key,512))this.rejectCapacity(key,value,isScroll);
+      let scope=this.capacity(key,512,liveFrame);if(scope!=='ok')this.rejectCapacity(key,value,isScroll,scope);
       const bytes=preparedBytes??Buffer.byteLength(JSON.stringify(input))+512;
-      if(!this.capacity(key,bytes) || this.ram.bytes()+bytes>CACHE_MAX)this.rejectCapacity(key,value,isScroll);
+      scope=this.ram.bytes()+bytes>CACHE_MAX?'store':this.capacity(key,bytes,liveFrame);
+      if(scope!=='ok')this.rejectCapacity(key,value,isScroll,scope);
       const frozen=preparedBytes===undefined?structuredClone(input):input;
       this.reserve(id,bytes);this.queuedBytes+=bytes;
+      const screenKey=liveFrame?id+':'+(input as ProjectionFrame).kind:undefined;
       const result=new Promise<ProjectionReceipt>((resolve,reject)=>{
-        const q=this.queues.get(id)??[];q.push({liveFrame,sourceEpoch:value.sourceEpoch,geometryGeneration:value.geometryGeneration,bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
+        const q=this.queues.get(id)??[];q.push({liveFrame,screenKey,sourceEpoch:value.sourceEpoch,geometryGeneration:value.geometryGeneration,bytes,at:Date.now(),run:()=>operation(frozen),resolve,reject});this.queues.set(id,q);
       });
       if(!this.pumping) {
         this.pumping=true;
@@ -270,7 +291,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     // Admission is only a reservation. Check the fence before applying the
     // queued batch; commitBatch independently checks again inside the disk TX.
     try {this.owner();}catch(error) {
-      for(const [id,q] of this.queues)for(const job of q){this.reserve(id,-job.bytes);job.reject(error);}
+      for(const [id,q] of this.queues)for(const job of q){this.reserve(id,-job.bytes);settle(job,false,error);}
       this.queues.clear();this.queuedBytes=0;this.pumping=false;return;
     }
     let processed=0;const started=performance.now();
@@ -285,9 +306,13 @@ export class ProjectionStore implements ProjectionWriterPort {
           if(!job.liveFrame && this.ram.bytes()>CACHE_MAX)throw new Error('ram-cache-limit');
           return receipt;
         })();
-        this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+job.bytes);
-        this.dirtyBytes+=job.bytes;this.dirtySince??=job.at;job.resolve(receipt);
-      }catch(error){this.reserve(id,-job.bytes);job.reject(error);}
+        // A frame replaces the pane's previous unflushed frame of the same kind:
+        // release that one, exactly as the fast path reserves only the delta.
+        const replaced=job.screenKey?this.screenBytes.get(job.screenKey)??0:0;
+        if(job.screenKey){this.screenBytes.set(job.screenKey,job.bytes);this.reserve(id,-replaced);}
+        this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+job.bytes-replaced);
+        this.dirtyBytes+=job.bytes-replaced;this.dirtySince??=job.at;settle(job,true,receipt);
+      }catch(error){this.reserve(id,-job.bytes);settle(job,false,error);}
       processed++;
     }
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
@@ -299,9 +324,9 @@ export class ProjectionStore implements ProjectionWriterPort {
       // by RAM/disk. Queues retain strings, not hundreds of cloned cell objects.
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
-      if(!this.capacity(event.paneKey,512))this.rejectCapacity(event.paneKey,event,true);
+      let scope=this.capacity(event.paneKey,512);if(scope!=='ok')this.rejectCapacity(event.paneKey,event,true,scope);
       const text=event.physicalRow.text;
-      if(!this.capacity(event.paneKey,text.length+512))this.rejectCapacity(event.paneKey,event,true);
+      scope=this.capacity(event.paneKey,text.length+512);if(scope!=='ok')this.rejectCapacity(event.paneKey,event,true,scope);
       const cells=event.physicalRow.cells;
       validateRow({text,cells});
       const frozen={paneKey:{...event.paneKey},sourceEpoch:event.sourceEpoch,geometryGeneration:event.geometryGeneration,
@@ -317,19 +342,32 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.owner();if(this.closing)throw new Error('store-closing');
       const queued=this.queues.get(paneId(frame.paneKey));
       if(queued?.some(job=>job.liveFrame || job.sourceEpoch!==frame.sourceEpoch || job.geometryGeneration!==frame.geometryGeneration)) {
+        const tail=queued.at(-1)!;
+        if(tail.screenKey===paneId(frame.paneKey)+':'+frame.kind && tail.sourceEpoch===frame.sourceEpoch && tail.geometryGeneration===frame.geometryGeneration)return this.coalesce(tail,frame);
         return this.enqueue(frame.paneKey,frame,f=>{this.ram.screen(f);return this.ram.bump(f.paneKey);},false,true);
       }
       const pane=paneId(frame.paneKey),id=pane+':'+frame.kind;
       const previous=this.screenBytes.get(id)??0;
-      if(!this.capacity(frame.paneKey,512-previous))this.rejectCapacity(frame.paneKey,frame,false);
+      let scope=this.capacity(frame.paneKey,512-previous,true);if(scope!=='ok')this.rejectCapacity(frame.paneKey,frame,false,scope);
       validateFrame(frame);
       const encoded=encodeFrameCells(frame.cells);
       const bytes=Buffer.byteLength(encoded)+Buffer.byteLength(pane)+512,delta=bytes-previous;
-      if(!this.capacity(frame.paneKey,delta) || this.ram.bytes()+Math.max(0,delta)>CACHE_MAX)this.rejectCapacity(frame.paneKey,frame,false);
+      scope=this.ram.bytes()+Math.max(0,delta)>CACHE_MAX?'store':this.capacity(frame.paneKey,delta,true);
+      if(scope!=='ok')this.rejectCapacity(frame.paneKey,frame,false,scope);
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame,null,null,[],encoded);return this.ram.bump(frame.paneKey);})();
       this.reserve(pane,delta,true);this.dirtyBytes+=delta;this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
       return Promise.resolve(receipt);
     }catch(error){return Promise.reject(error);}
+  }
+  /** The queue's last job is a frame of the same pane/kind/generation: the newer frame takes its place and reservation. */
+  private coalesce(tail:Job,frame:ProjectionFrame):Promise<ProjectionReceipt> {
+    const id=paneId(frame.paneKey),bytes=Buffer.byteLength(JSON.stringify(frame))+512,delta=bytes-tail.bytes;
+    const scope=this.ram.bytes()+Math.max(0,delta)>CACHE_MAX?'store':this.capacity(frame.paneKey,delta,true);
+    if(scope!=='ok')this.rejectCapacity(frame.paneKey,frame,false,scope);
+    const frozen=structuredClone(frame);
+    tail.run=()=>{this.ram.screen(frozen);return this.ram.bump(frozen.paneKey);};
+    this.reserve(id,delta);this.queuedBytes+=delta;tail.bytes=bytes;
+    return new Promise<ProjectionReceipt>((resolve,reject)=>{(tail.waiters??=[]).push({resolve,reject});});
   }
   calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c),false);}
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
@@ -373,12 +411,15 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const p of batch.panes) {
         if(p.health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
           this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
-          for(const [tag,f] of this.faults)if(f.pane===p.pane_key)this.faults.delete(tag);
+          // Keep capacity episodes open so a refusal right after recovery reuses the issue.
+          for(const [tag,f] of this.faults)if(f.pane===p.pane_key && !tag.endsWith(':ingest-capacity'))this.faults.delete(tag);
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
         }
       }
       this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     }
+    const now=Date.now();
+    for(const [tag,f] of this.faults)if(tag.endsWith(':ingest-capacity') && now-f.seen>CAPACITY_EPISODE_MS && !this.capacityLosses.has(f.pane))this.faults.delete(tag);
   }
   private finishWorker():void {
     const state=Atomics.load(this.signal,0);
