@@ -1,17 +1,23 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { tmpdir, cpus } from 'node:os';
 import { join } from 'node:path';
 
-import { IncrementalHistoryMatcher, equalHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
+import { HistoryCalibrator, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts, type CaptureMetadata } from '../src/history-calibrator';
+import { equalHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
 import { decodeTmuxCaptureRows, TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
 
 // One complete baseline/full/incremental round per cage command.
-// Preserve all four concurrent private-server configurations and 60s samples.
-// CPU is split three ways: calibrator (split+decode+match+remember), capture
-// children (each tmux client's own rusage), and the test's producer model and
-// false-check oracle. The oracle never feeds the calibrator's CPU figure.
+// Four concurrent private-server configurations, 60s window each mode.
+// Every pane is driven by the real HistoryCalibrator: its own deadlines (via
+// the schedule port) decide when and what to capture, including screen-only
+// captures. The host side here is a deadline queue per server that runs every
+// due pane in one timer tick and sends their captures as one tmux client.
+// The parser model is fed from a real `pipe-pane` of the same pane, so, as in
+// production, it trails tmux and can be AHEAD of a capture when read after it.
+// CPU is split: calibrator (decode + matcher + remember + host batching),
+// capture children (tmux client rusage), and test-only model/oracle work.
 describe('NEWARCH L2-C private tmux CPU measurement', () => {
   const measurements = new Map<string, { server: number; caller: number }>();
   const procTicks = (pid: number) => {
@@ -21,6 +27,10 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
   };
   const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
   const cpuMicros = () => { const u = process.cpuUsage(); return u.user + u.system; };
+  // The cage runs bun under `strace -f`, which stops every syscall of bun,
+  // tmux and the producers (FIX2: 300 -> 85 captures/min). Timing is printed
+  // everywhere but only asserted when no tracer is attached.
+  const tracerPid = Number(/^TracerPid:\s*(\d+)/m.exec(readFileSync('/proc/self/status', 'utf8'))?.[1] ?? 0);
   const active = false;
   const round = 3;
   for (const mode of ['baseline', 'full', 'incremental'] as const) {
@@ -29,9 +39,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       const privateEnv = { ...process.env };
       delete privateEnv.TMUX; delete privateEnv.TMUX_PANE;
       const modelCache = new Map<string, HistoryRow>();
-      // Oracle cells are interned here, apart from the decoder under test: one
-      // object per cell for ~11k rows x 2 widths was ~2.2M live objects and,
-      // with the 3 GB cage also holding the repo snapshot, stalled full mode.
+      // Oracle cells are interned here, apart from the decoder under test.
       const oracleCells = new Map<string, HistoryRow['cells'][number]>();
       const oracleCell = (cell: HistoryRow['cells'][number]) => {
         const key = JSON.stringify(cell);
@@ -46,35 +54,231 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         const row = { lineId: id, sourceEpoch: 1, geometryGeneration: 1, softWrap: false, cells: decodeTmuxCaptureRows(raw, cols)[0]!.map(oracleCell) };
         modelCache.set(key, row); return row;
       };
-      const states = new Map<string, { matcher: IncrementalHistoryMatcher; decoder: TmuxCaptureDecoder; ring: HistoryRow[]; ringEnd: number; checked: Set<number>; start: number; last: number; capturedEnd: number; full: boolean }>();
-      // Rolling producer model: ids [end-4500, end) exactly as a fresh
-      // Array.from would build, without re-reading 4500 cached rows per tick.
-      const modelRing = (state: { ring: HistoryRow[]; ringEnd: number }, end: number, cols: number): HistoryRow[] => {
-        if (state.ringEnd !== end) {
-          if (!state.ring.length || end < state.ringEnd || end - state.ringEnd >= 4500) state.ring = Array.from({ length: 4500 }, (_, x) => modelRow(end - 4500 + x, cols));
-          else { for (let id = state.ringEnd; id < end; id++) state.ring.push(modelRow(id, cols)); state.ring.splice(0, state.ring.length - 4500); }
-          state.ringEnd = end;
-        }
-        if (state.ring.length !== 4500 || state.ring[0]!.lineId !== end - 4500 || state.ring[4499]!.lineId !== end - 1) throw new Error('producer model ring misaligned');
-        return state.ring;
+      // Truth for a captured row comes from its own printed label, never from
+      // the matcher: row-%08d -> id, seed-%06d -> id-5000, else unknown.
+      const labels = new WeakMap<readonly unknown[], number | null>();
+      const labelOf = (row: CapturedRow): number | null => {
+        const known = labels.get(row.cells); if (known !== undefined) return known;
+        let text = ''; for (let x = 0; x < Math.min(15, row.cells.length); x++) text += row.cells[x]!.grapheme;
+        const m = /^(row|seed)-(\d{6,8})/.exec(text);
+        const id = !m ? null : m[1] === 'row' ? Number(m[2]) : Number(m[2]) - 5000;
+        labels.set(row.cells, id); return id;
       };
-      let falseChecked = 0;
-      const targets: Array<{ coverage: number; delta: number; panes: number; samples: number; calibratorPlusChildren: number }> = [];
-      const reasons: Record<string, number> = {};
-      let fullCaptures = 0, partialCaptures = 0;
-      const configs: Array<{ socket: string; panes: string[]; sidecars: string[]; producedBefore: number; pid: number; cols: number; rows: number; count: number; ticks: number; bytes: number; samples: number; latencies: number[]; calibratorUs: number; childUs: number; oracleUs: number }> = [];
+      type Pane = {
+        id: string; cols: number; rows: number; pipe: string; fd: number; offset: number; partial: string;
+        count: number; revision: number; ring: HistoryRow[]; ringEnd: number; snapshot: HistoryRow[] | null;
+        calibrator: HistoryCalibrator; decoder: TmuxCaptureDecoder; running: Promise<void> | undefined;
+        checked: Set<number>; start: number; bound: number; falseChecked: number; falseSamples: unknown[];
+        spanAt: number | null; history: number; historyAt: number[]; screenOnly: number; full: number; partialCaptures: number;
+        reasons: Record<string, number>; settledAt: number | null; staleRevision: number; afterSettle: Record<string, number>;
+      };
+      type Config = {
+        socket: string; panes: Pane[]; sidecars: string[]; producedBefore: number; pid: number; cols: number; rows: number; count: number;
+        ticks: number; bytes: number; batches: number; latencies: number[]; calibratorUs: number; childUs: number; oracleUs: number; modelUs: number;
+        timer: ReturnType<typeof setTimeout> | undefined; timerAt: number; batch: Array<{ pane: Pane; tail: number; resolve: (c: CalibrationCapture) => void; reject: (e: unknown) => void; requestedAt: number }>;
+        flushQueued: boolean; faults: Record<string, number>; captureErrors: number; clientInFlight: boolean; next: number;
+      };
+      const configs: Config[] = [];
+      let stopped = false;
+      // Settle start lives in an object: as a captured `let`, the hot calibrate
+      // port kept reading Infinity after assignment in some runs (bun 1.3.11),
+      // so no pane ever settled although every capture committed.
+      const settle = { from: Infinity };
       const tmux = (socket: string, args: string[]) => {
         const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, env: privateEnv });
         if (result.status !== 0) throw new Error(`private tmux exit=${result.status}: ${result.stderr}`);
         return result.stdout;
       };
-      // Capture spawns report the child's own rusage so it is attributed to
-      // its configuration; /proc children ticks only give the four-config sum.
-      const capture = (socket: string, args: string[]) => {
-        const result = Bun.spawnSync(['tmux', '-S', socket, ...args], { env: privateEnv, stdout: 'pipe', stderr: 'pipe' });
-        if (result.exitCode !== 0) throw new Error(`private tmux exit=${result.exitCode}: ${result.stderr.toString()}`);
-        return { stdout: result.stdout.toString(), childUs: Number(result.resourceUsage.cpuTime.total) };
+      // Rolling producer model: ids [end-4500, end). The array handed to the
+      // calibrator is a snapshot; the calibrator keeps it across an await.
+      const modelRing = (pane: Pane, end: number): HistoryRow[] => {
+        if (pane.ringEnd !== end || !pane.snapshot) {
+          if (!pane.ring.length || end < pane.ringEnd || end - pane.ringEnd >= 4500) pane.ring = Array.from({ length: 4500 }, (_, x) => modelRow(end - 4500 + x, pane.cols));
+          else { for (let id = pane.ringEnd; id < end; id++) pane.ring.push(modelRow(id, pane.cols)); pane.ring.splice(0, pane.ring.length - 4500); }
+          pane.ringEnd = end; pane.snapshot = pane.ring.slice();
+        }
+        if (pane.snapshot.length !== 4500 || pane.snapshot[0]!.lineId !== end - 4500 || pane.snapshot[4499]!.lineId !== end - 1) throw new Error('producer model ring misaligned');
+        return pane.snapshot;
       };
+      // Parser model: rows the pane's pipe has delivered. tmux writes a chunk
+      // to the pipe only after parsing it, so this never leads tmux.
+      const buffer = Buffer.alloc(1 << 20);
+      const pollPipe = (pane: Pane) => {
+        const t0 = cpuMicros();
+        let text = '';
+        for (;;) {
+          const n = readSync(pane.fd, buffer, 0, buffer.length, pane.offset);
+          if (n <= 0) break;
+          pane.offset += n; text += buffer.toString('latin1', 0, n);
+        }
+        if (text) {
+          text = pane.partial + text;
+          const cut = text.lastIndexOf('\n');
+          pane.partial = text.slice(cut + 1);
+          const complete = text.slice(0, cut + 1);
+          let at = complete.lastIndexOf('row-');
+          while (at >= 0 && !/^row-\d{8}/.test(complete.slice(at, at + 12))) at = complete.lastIndexOf('row-', at - 1);
+          if (at >= 0) {
+            const count = Number(complete.slice(at + 4, at + 12)) + 1;
+            if (count > pane.count) {
+              const scrolled = count - pane.count; pane.count = count; pane.revision += scrolled;
+              if (pane.calibrator && !stopped) pane.calibrator.scroll(scrolled);
+            }
+          }
+        }
+        return cpuMicros() - t0;
+      };
+      const config = (pane: Pane) => configs.find(c => c.panes.includes(pane))!;
+      const rearm = (c: Config) => {
+        if (stopped || c.clientInFlight) return;
+        // A pane with a capture in flight re-arms when it completes; counting
+        // its (possibly past) deadline here would spin the timer meanwhile.
+        const at = Math.min(...c.panes.filter(p => p.calibrator && !p.running).map(p => p.calibrator.dueAt));
+        if (at === Infinity) return;
+        // Coalesce: fire a little after the earliest deadline so panes that
+        // started a few ms apart in the last tick share the next client.
+        const fireAt = at + COALESCE_MS;
+        if (c.timer && c.timerAt <= fireAt) return;
+        if (c.timer) clearTimeout(c.timer);
+        c.timerAt = fireAt;
+        c.timer = setTimeout(() => { c.timer = undefined; tick(c); }, Math.max(0, fireAt - performance.now()));
+      };
+      // Host deadline queue, one tmux client in flight per server. Due panes
+      // start round-robin until the batch requests ROW_BUDGET history rows;
+      // the rest start in the next batch, so a pane's 1s capture deadline
+      // never includes time spent queued behind another client.
+      const ROW_BUDGET = 20000, COALESCE_MS = 4;
+      const tick = (c: Config) => {
+        if (stopped || c.clientInFlight) return;
+        const now = performance.now();
+        let rows = 0;
+        const first = c.next;
+        for (let k = 0; k < c.panes.length && rows < ROW_BUDGET; k++) {
+          const pane = c.panes[(first + k) % c.panes.length]!;
+          if (!pane.calibrator || pane.running || pane.calibrator.dueAt > now) continue;
+          const before = c.batch.length;
+          pane.running = pane.calibrator.runDue().finally(() => { pane.running = undefined; rearm(c); });
+          if (c.batch.length > before) rows += c.batch.at(-1)!.tail + c.rows;
+          c.next = (first + k + 1) % c.panes.length;
+        }
+        flush(c);
+        rearm(c);
+      };
+      const meta = (pane: Pane, fields: string): CaptureMetadata => {
+        const [w, h, x, y, alt] = fields.split(' ').map(Number);
+        return { sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
+      };
+      // All captures requested in one tick share a tmux client. Markers
+      // bracket each pane's metadata-before, capture and metadata-after.
+      const flush = (c: Config) => {
+        c.flushQueued = false;
+        const batch = c.batch.splice(0);
+        if (!batch.length) return;
+        c.clientInFlight = true;
+        let t0 = cpuMicros();
+        const args: string[] = [];
+        const format = '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on}';
+        batch.forEach((item, k) => {
+          if (args.length) args.push(';');
+          args.push('display-message', '-p', '-t', item.pane.id, `L2C-B-${k} ${format}`, ';',
+            'capture-pane', '-p', '-e', '-N', '-t', item.pane.id, ...(item.tail > 0 ? ['-S', `-${item.tail}`] : []), ';',
+            'display-message', '-p', '-t', item.pane.id, `L2C-A-${k} ${format}`);
+        });
+        c.calibratorUs += cpuMicros() - t0;
+        const at = performance.now();
+        const proc = Bun.spawn(['tmux', '-S', c.socket, ...args], { env: privateEnv, stdout: 'pipe', stderr: 'pipe' });
+        void (async () => {
+          const [raw, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+          c.latencies.push(performance.now() - at); c.batches++;
+          c.childUs += Number(proc.resourceUsage()?.cpuTime.total ?? 0);
+          c.bytes += Buffer.byteLength(raw);
+          if (code !== 0) { c.clientInFlight = false; c.captureErrors++; for (const item of batch) item.reject(new Error(`private tmux exit=${code}: ${err}`)); rearm(c); return; }
+          t0 = cpuMicros();
+          const parts = raw.split(/^L2C-([AB])-(\d+) (.*)\n/m);
+          const found = new Map<number, { before?: string; after?: string; body?: string }>();
+          for (let i = 1; i + 3 < parts.length; i += 4) {
+            const entry = found.get(Number(parts[i + 1])) ?? {};
+            if (parts[i] === 'B') { entry.before = parts[i + 2]; entry.body = parts[i + 3]; } else entry.after = parts[i + 2];
+            found.set(Number(parts[i + 1]), entry);
+          }
+          c.calibratorUs += cpuMicros() - t0;
+          t0 = cpuMicros();
+          const results: Array<[typeof batch[number], CalibrationCapture | Error]> = [];
+          batch.forEach((item, k) => {
+            try {
+              const entry = found.get(k);
+              if (!entry?.before || !entry.after || entry.body === undefined) throw new Error('capture batch part missing');
+              const before = meta(item.pane, entry.before), after = meta(item.pane, entry.after);
+              const decoded = item.pane.decoder.decode(entry.body);
+              const screen = decoded.slice(Math.max(0, decoded.length - after.rows));
+              const history: CapturedRow[] = decoded.slice(0, decoded.length - screen.length).map(cells => ({ cells, softWrap: false }));
+              const frame: CalibrationFrame = { cells: screen, cursor: after.cursor, kind: after.kind, geometryGeneration: 1, receiveSeq: -1 };
+              results.push([item, { paneKey: { serverIdentity: c.socket, paneId: item.pane.id, birthGeneration: 1 }, captureId: `${c.batches}/${k}`, requestedAt: item.requestedAt, completedAt: performance.now(),
+                before, after, frame, history, completeRetainedTail: item.tail > 0 && (item.tail >= 4500 || history.length < item.tail), observedFields: ['cells', 'cursor'] }]);
+            } catch (error) { results.push([item, error as Error]); }
+          });
+          c.calibratorUs += cpuMicros() - t0;
+          c.clientInFlight = false;
+          for (const [item, result] of results) result instanceof Error ? item.reject(result) : item.resolve(result);
+          rearm(c);
+        })();
+      };
+      const makePorts = (pane: Pane): CalibrationPorts => ({
+        now: () => performance.now(),
+        schedule: () => {
+          if (pane.spanAt !== null) { config(pane).calibratorUs += cpuMicros() - pane.spanAt; pane.spanAt = null; }
+          rearm(config(pane));
+        },
+        read: () => {
+          const c = config(pane);
+          c.modelUs += pollPipe(pane);
+          const t0 = cpuMicros();
+          const recentHistory = modelRing(pane, pane.count - pane.rows + 1);
+          const snapshot = { revision: pane.revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory,
+            parserFrame: { cells: [], cursor: { x: 0, y: pane.rows - 1, visible: true }, kind: 'normal' as const, geometryGeneration: 1, receiveSeq: pane.offset } };
+          const t1 = cpuMicros(); c.modelUs += t1 - t0;
+          pane.spanAt = t1;
+          return snapshot;
+        },
+        capture: (_key, tail, _signal) => new Promise((resolve, reject) => {
+          const c = config(pane);
+          pane.spanAt = null;
+          if (tail > 0) { pane.history++; pane.historyAt.push(performance.now()); if (tail >= 4500) pane.full++; else pane.partialCaptures++; }
+          else pane.screenOnly++;
+          c.batch.push({ pane, tail, resolve, reject, requestedAt: performance.now() });
+          if (!c.flushQueued) { c.flushQueued = true; setImmediate(() => { if (c.flushQueued) flush(c); }); }
+        }),
+        calibrate: async input => {
+          const c = config(pane);
+          if (pane.spanAt !== null) { c.calibratorUs += cpuMicros() - pane.spanAt; pane.spanAt = null; }
+          const t0 = cpuMicros();
+          if (input.expectedRevision !== pane.revision) {
+            pane.staleRevision++; if (settle.from !== Infinity) pane.afterSettle.stale = (pane.afterSettle.stale ?? 0) + 1;
+            c.oracleUs += cpuMicros() - t0; return null;
+          }
+          for (const check of input.checks) {
+            const captured = input.capture.history[check.capturedRow]!;
+            const model = modelRow(check.lineId, pane.cols);
+            const truth = labelOf(captured);
+            if (truth !== check.lineId || !equalHistoryRows(model, captured)) {
+              pane.falseChecked++;
+              if (pane.falseSamples.length < 3) pane.falseSamples.push({ lineId: check.lineId, capturedRow: check.capturedRow, truth });
+            } else if (check.lineId >= pane.start && check.lineId < pane.bound) pane.checked.add(check.lineId);
+          }
+          const reason = input.capture.history.length === 0 ? 'screen-only' : input.checks.length ? 'checked' : 'unchecked';
+          pane.reasons[reason] = (pane.reasons[reason] ?? 0) + 1;
+          if (settle.from !== Infinity) {
+            const key = `${input.capture.requestedAt >= settle.from ? 'new' : 'old'}:${input.capture.history.length ? 'history' : 'screen'}`;
+            pane.afterSettle[key] = (pane.afterSettle[key] ?? 0) + 1;
+          }
+          if (input.capture.requestedAt >= settle.from && input.capture.history.length) pane.settledAt ??= performance.now();
+          pane.revision++;
+          c.oracleUs += cpuMicros() - t0;
+          return { revision: pane.revision, durableRevision: 0, nextLineId: pane.count };
+        },
+        publish: () => {},
+        fault: issue => { const c = config(pane); c.faults[issue.kind] = (c.faults[issue.kind] ?? 0) + 1; },
+      });
       try {
         const conf = join(root, 'tmux.conf');
         writeFileSync(conf, 'set -g history-limit 4500\nset -g status off\n');
@@ -96,20 +300,28 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         ].join('\n'));
         for (const [cols, rows] of [[80, 24], [120, 40]]) for (const count of [1, 21]) {
           const socket = join(root, `${cols}-${count}.sock`);
-          const panes: string[] = [];
           // Register the socket before creating it so cleanup also covers a
           // partial setup failure; no default server is ever addressed.
-          const c = { socket, panes, sidecars: [] as string[], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, samples: 0, latencies: [] as number[], calibratorUs: 0, childUs: 0, oracleUs: 0 };
+          const c: Config = { socket, panes: [], sidecars: [], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, batches: 0, latencies: [], calibratorUs: 0, childUs: 0, oracleUs: 0, modelUs: 0, timer: undefined, timerAt: Infinity, batch: [], flushQueued: false, faults: {}, captureErrors: 0, clientInFlight: false, next: 0 };
           configs.push(c);
           for (let pane = 0; pane < count; pane++) {
             const sidecar = join(root, `${cols}-${count}-${pane}.rows`); c.sidecars.push(sidecar);
-            panes.push(tmux(socket, ['-f', conf, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${pane}`, '-x', String(cols), '-y', String(rows), `python3 -u ${quote(producer)} ${quote(sidecar)}`]).trim());
+            const pipe = join(root, `${cols}-${count}-${pane}.pipe`); writeFileSync(pipe, '');
+            // The pipe is attached before the producer starts: new-session
+            // runs `sleep` until pipe-pane is in place, then the producer.
+            const gate = join(root, `${cols}-${count}-${pane}.go`);
+            const id = tmux(socket, ['-f', conf, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${pane}`, '-x', String(cols), '-y', String(rows), `while [ ! -e ${quote(gate)} ]; do sleep 0.01; done; exec python3 -u ${quote(producer)} ${quote(sidecar)}`]).trim();
+            tmux(socket, ['pipe-pane', '-t', id, `cat >> ${quote(pipe)}`]);
+            writeFileSync(gate, '');
+            c.panes.push({ id, cols: cols!, rows: rows!, pipe, fd: openSync(pipe, 'r'), offset: 0, partial: '', count: 0, revision: 1, ring: [], ringEnd: 0, snapshot: null,
+              calibrator: undefined as unknown as HistoryCalibrator, decoder: new TmuxCaptureDecoder(cols!, 5000), running: undefined, checked: new Set(), start: 0, bound: Infinity,
+              falseChecked: 0, falseSamples: [], spanAt: null, history: 0, historyAt: [], screenOnly: 0, full: 0, partialCaptures: 0, reasons: {}, settledAt: null, staleRevision: 0, afterSettle: {} });
           }
-          c.pid = Number(tmux(socket, ['display-message', '-p', '-t', panes[0]!, '#{pid}']).trim());
+          c.pid = Number(tmux(socket, ['display-message', '-p', '-t', c.panes[0]!.id, '#{pid}']).trim());
           expect(c.pid).toBeGreaterThan(0);
         }
-        // Seeding 44 panes is asynchronous; a fixed sleep can precede the
-        // final producer's first sidecar. Begin measurement only after all are ready.
+        // Seeding 44 panes is asynchronous; begin only after every producer
+        // has flushed its seed and written its sidecar.
         const readyBy = performance.now() + 10000;
         while (!configs.every(c => c.sidecars.every(path => existsSync(path)))) {
           if (performance.now() >= readyBy) throw new Error('producer sidecars not ready');
@@ -118,109 +330,62 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         await new Promise(resolve => setTimeout(resolve, 500));
         const hz = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim());
         expect(hz).toBeGreaterThan(0);
-        // Decoder memo sized to history-limit 4500 plus one pass of new rows;
-        // the 9000 default kept rows that had already left tmux history.
         for (const c of configs) {
           c.ticks = procTicks(c.pid).own;
-          for (let i = 0; i < c.panes.length; i++) {
-            const count = Number(readFileSync(c.sidecars[i]!, 'utf8'));
-            states.set(`${c.socket}/${i}`, { matcher: new IncrementalHistoryMatcher(), decoder: new TmuxCaptureDecoder(c.cols, 5000), ring: [], ringEnd: 0, checked: new Set(), start: count - c.rows + 1, last: count, capturedEnd: count - c.rows + 1, full: true });
+          for (const pane of c.panes) {
+            pollPipe(pane);
+            pane.start = pane.count - pane.rows + 1;
+            if (mode !== 'baseline') pane.calibrator = new HistoryCalibrator({ serverIdentity: c.socket, paneId: pane.id, birthGeneration: 1 }, makePorts(pane), { incremental: mode === 'incremental' });
           }
           c.producedBefore = c.sidecars.reduce((sum, path) => sum + Number(readFileSync(path, 'utf8')), 0);
         }
-        // One capture pass over a configuration. `bounds[i]` is the exclusive id
-        // bound per pane; the final pass may only settle rows of the window.
-        const pass = (c: typeof configs[number], bounds?: number[]) => {
-            let t0 = cpuMicros();
-            const counts = c.sidecars.map(path => Number(readFileSync(path, 'utf8')));
-            const args: string[] = [];
-            const tails: number[] = [];
-            for (let i = 0; i < c.panes.length; i++) {
-              const state = states.get(`${c.socket}/${i}`)!;
-              // Extra overlap covers output arriving while the capture executes.
-              const tail = mode === 'full' || state.full ? 4500 : Math.min(4500, Math.max(3, counts[i]! - state.last + 128));
-              tails.push(tail);
-              if (tail === 4500) fullCaptures++; else partialCaptures++;
-              if (args.length) args.push(';');
-              args.push('display-message', '-p', `L2C-PANE-${i}`, ';', 'capture-pane', '-p', '-e', '-N', '-t', c.panes[i]!, '-S', `-${tail}`);
-            }
-            c.oracleUs += cpuMicros() - t0;
-            const at = performance.now();
-            const spawned = capture(c.socket, args);
-            const raw = spawned.stdout;
-            c.childUs += spawned.childUs;
-            c.bytes += Buffer.byteLength(raw);
-            t0 = cpuMicros();
-            const blocks = raw.split(/L2C-PANE-\d+\n/).slice(1);
-            c.calibratorUs += cpuMicros() - t0;
-            expect(blocks.length).toBe(c.count);
-            for (let i = 0; i < c.panes.length; i++) {
-              const state = states.get(`${c.socket}/${i}`)!;
-              // Independent producer model sampled BEFORE capture, never inferred
-              // from captured row labels. Cursor starts at row zero after seeding.
-              t0 = cpuMicros();
-              const end = counts[i]! - c.rows + 1;
-              const recent = modelRing(state, end, c.cols);
-              const t1 = cpuMicros(); c.oracleUs += t1 - t0;
-              const lines = blocks[i]!.split('\n');
-              if (lines.at(-1) === '') lines.pop();
-              const historyText = lines.slice(0, Math.max(0, lines.length - c.rows)).join('\n') + '\n';
-              const captured: CapturedRow[] = state.decoder.decode(historyText).map(cells => ({ cells, softWrap: false }));
-              const result = state.matcher.match(recent, captured, { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: tails[i] === 4500 });
-              state.matcher.remember(recent, captured, result);
-              t0 = cpuMicros(); c.calibratorUs += t0 - t1;
-              reasons[result.reason] = (reasons[result.reason] ?? 0) + 1;
-              for (const check of result.checks) {
-                if (!equalHistoryRows(modelRow(check.lineId, c.cols), captured[check.capturedRow]!)) falseChecked++;
-                if (check.lineId >= state.start && check.lineId < (bounds?.[i] ?? Infinity)) state.checked.add(check.lineId);
-              }
-              state.full = result.reason !== 'matched'; state.last = counts[i]!; state.capturedEnd = end;
-              c.oracleUs += cpuMicros() - t0;
-            }
-            c.latencies.push(performance.now() - at); c.samples++;
-        };
+        // The pipe reader: in production bytes are pushed; here every 16ms.
+        const poller = mode === 'baseline' ? undefined : setInterval(() => {
+          for (const c of configs) for (const pane of c.panes) c.modelUs += pollPipe(pane);
+        }, 16);
         const parent = procTicks(process.pid);
         const cpuStart = cpuMicros();
         const started = performance.now();
-        let next = started;
-        while (performance.now() - started < 60000) {
-          if (mode === 'baseline') { await new Promise(resolve => setTimeout(resolve, 100)); continue; }
-          for (const c of configs) pass(c);
-          next += active ? 200 : 1000;
-          await new Promise(resolve => setTimeout(resolve, Math.max(0, next - performance.now())));
-        }
+        for (const c of configs) if (mode !== 'baseline') rearm(c);
+        await new Promise(resolve => setTimeout(resolve, 60000 - (performance.now() - started)));
+        while (performance.now() - started < 60000) await new Promise(resolve => setTimeout(resolve, 5));
         const elapsed = performance.now() - started;
         const after = procTicks(process.pid);
         const cpuEnd = cpuMicros();
         const caller = ((after.own + after.children - parent.own - parent.children) / hz) / (elapsed / 1000) * 100;
-        // Window boundary: freeze counts, CPU sections and servers before the
-        // final settling pass so none of that pass is billed to the window.
+        // Window boundary: freeze counts, CPU sections and servers. Captures
+        // after this point only settle rows that entered history in the window.
         const windowCounts = configs.map(c => c.sidecars.map(path => Number(readFileSync(path, 'utf8'))));
         const windowServer = configs.map(c => procTicks(c.pid).own);
-        const windowSections = configs.map(c => ({ calibratorUs: c.calibratorUs, childUs: c.childUs, oracleUs: c.oracleUs, samples: c.samples, latencies: c.latencies.slice() }));
-        // Pending = window rows whose history slot was newer than the pane's
-        // last capture model; they cannot have been checked yet.
-        const pendingAtWindowEnd = configs.map((c, k) => c.panes.reduce((sum, _, i) => {
-          const state = states.get(`${c.socket}/${i}`)!;
-          let pending = 0;
-          for (let id = Math.max(state.start, state.capturedEnd); id < windowCounts[k]![i]! - c.rows + 1; id++) if (!state.checked.has(id)) pending++;
-          return sum + pending;
-        }, 0));
-        const checkedAtWindowEnd = configs.map(c => c.panes.reduce((sum, _, i) => sum + states.get(`${c.socket}/${i}`)!.checked.size, 0));
+        const windowSections = configs.map(c => ({ calibratorUs: c.calibratorUs, childUs: c.childUs, oracleUs: c.oracleUs, modelUs: c.modelUs, batches: c.batches, latencies: c.latencies.slice(),
+          history: c.panes.map(p => p.historyAt.filter(t => t < started + elapsed).length), intervals: c.panes.flatMap(p => { const at = p.historyAt.filter(t => t < started + elapsed); return at.slice(1).map((t, i) => t - at[i]!); }),
+          screenOnly: c.panes.reduce((s, p) => s + p.screenOnly, 0), full: c.panes.reduce((s, p) => s + p.full, 0), partial: c.panes.reduce((s, p) => s + p.partialCaptures, 0) }));
+        for (const c of configs) for (const pane of c.panes) pane.bound = pane.count - pane.rows + 1;
+        const checkedAtWindowEnd = configs.map(c => c.panes.reduce((sum, p) => sum + p.checked.size, 0));
         let finalPass = false;
         if (mode !== 'baseline' && active) {
           // PLAN §6: coverage is counted after a final capture. Wait until every
           // window row is past the screen (plus the producer's unflushed
-          // 10-row batch), then run one more ordinary pass per configuration.
+          // batch), then until every pane commits a history capture requested
+          // after that point. The calibrator keeps its own schedule throughout.
           const settleBy = performance.now() + 10000;
           while (!configs.every((c, k) => c.sidecars.every((path, i) => Number(readFileSync(path, 'utf8')) >= windowCounts[k]![i]! + c.rows + 20))) {
             if (performance.now() >= settleBy) throw new Error('producer did not advance past the window');
             await new Promise(resolve => setTimeout(resolve, 25));
           }
-          // Only ids that entered history inside the window may be settled.
-          for (const [k, c] of configs.entries()) pass(c, windowCounts[k]!.map(n => n - c.rows + 1));
-          finalPass = true;
+          settle.from = performance.now();
+          const finalBy = performance.now() + 30000;
+          while (!configs.every(c => c.panes.every(p => p.settledAt !== null))) {
+            if (performance.now() >= finalBy) break;
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+          finalPass = configs.every(c => c.panes.every(p => p.settledAt !== null));
         }
+        stopped = true;
+        if (poller) clearInterval(poller);
+        for (const c of configs) if (c.timer) clearTimeout(c.timer);
+        await Promise.all(configs.flatMap(c => c.panes.map(p => p.running)));
+        const targets: Array<() => void> = [];
         for (const [k, c] of configs.entries()) {
           const producedRows = windowCounts[k]!.reduce((sum, n) => sum + n, 0) - c.producedBefore;
           expect(active ? producedRows > 0 : producedRows === 0).toBe(true);
@@ -230,41 +395,67 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           const key = `${active}/${round}/${c.cols}/${c.count}`;
           if (mode === 'baseline') measurements.set(key, { server, caller });
           const base = measurements.get(key)!;
-          const latencies = w.latencies.sort((a, b) => a - b);
-          const percentile = (p: number) => latencies.length ? latencies[Math.min(latencies.length - 1, Math.ceil(latencies.length * p) - 1)] : null;
+          const percentile = (values: number[], p: number) => { const v = values.slice().sort((a, b) => a - b); return v.length ? v[Math.min(v.length - 1, Math.ceil(v.length * p) - 1)]! : null; };
           const delta = server - base.server;
-          const checkedRows = c.panes.reduce((sum, _, i) => sum + states.get(`${c.socket}/${i}`)!.checked.size, 0);
-          // Unchecked after the final pass, classified: the producer overwrites
-          // the top screen row with a status line whenever i%200==0, so tmux
-          // legitimately differs from the model at id+rows-1 ≡ 0 (mod 200).
+          // Denominator: every row that entered history inside the window.
+          const denominator = c.panes.reduce((sum, p) => sum + Math.max(0, p.bound - p.start), 0);
+          const checkedRows = c.panes.reduce((sum, p) => sum + p.checked.size, 0);
+          // Unchecked after the final capture, classified: the producer
+          // overwrites the top screen row with a status line whenever i%200==0.
           const unchecked = { statusOverwrite: 0, other: 0, oldestOther: null as number | null };
-          if (finalPass) c.panes.forEach((_, i) => {
-            const state = states.get(`${c.socket}/${i}`)!;
-            for (let id = state.start; id < windowCounts[k]![i]! - c.rows + 1; id++) {
-              if (state.checked.has(id)) continue;
-              if ((id + c.rows - 1) % 200 === 0 && id + c.rows - 1 > 0) unchecked.statusOverwrite++;
-              else { unchecked.other++; unchecked.oldestOther ??= id; }
+          if (finalPass) for (const p of c.panes) for (let id = p.start; id < p.bound; id++) {
+            if (p.checked.has(id)) continue;
+            if ((id + c.rows - 1) % 200 === 0 && id + c.rows - 1 > 0) unchecked.statusOverwrite++;
+            else { unchecked.other++; unchecked.oldestOther ??= id; }
+          }
+          const falseChecked = c.panes.reduce((sum, p) => sum + p.falseChecked, 0);
+          const historyPerPane = { min: Math.min(...w.history), max: Math.max(...w.history) };
+          const calibratorCpu = pct(w.calibratorUs), childCpu = pct(w.childUs), oracleCpu = pct(w.oracleUs), modelCpu = pct(w.modelUs);
+          const reasons: Record<string, number> = {};
+          for (const p of c.panes) for (const [r, n] of Object.entries(p.reasons)) reasons[r] = (reasons[r] ?? 0) + n;
+          const record = { mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, tracerPid, timingAsserted: tracerPid === 0,
+            producedRows, denominator, checkedAtWindowEnd: checkedAtWindowEnd[k], checkedPerDenominatorAtWindowEnd: denominator ? checkedAtWindowEnd[k]! / denominator : null,
+            finalPass, checkedRows, coverage: denominator && finalPass ? checkedRows / denominator : null, unchecked, falseChecked, falseSamples: c.panes.flatMap(p => p.falseSamples).slice(0, 3),
+            staleRevision: c.panes.reduce((s, p) => s + p.staleRevision, 0),
+            unsettled: c.panes.filter(p => p.settledAt === null).slice(0, 3).map(p => ({ pane: p.id, afterSettle: p.afterSettle, captures: p.historyAt.filter(t => t >= settle.from).length })),
+            settleMs: c.panes.reduce((m, p) => Math.max(m, p.settledAt === null ? Infinity : p.settledAt - settle.from), 0), faults: c.faults, captureErrors: c.captureErrors, reasons,
+            historyCapturesPerPane: historyPerPane, historyIntervalP50: percentile(w.intervals, .5), historyIntervalP95: percentile(w.intervals, .95), historyIntervalMax: percentile(w.intervals, 1),
+            fullCaptures: w.full, partialCaptures: w.partial, screenOnlyCaptures: w.screenOnly, batches: w.batches, captureBytes: c.bytes,
+            batchP50: percentile(w.latencies, .5), batchP95: percentile(w.latencies, .95), batchP99: percentile(w.latencies, .99), batchMax: percentile(w.latencies, 1),
+            producedRowsPerSecondPerPane: producedRows / (elapsed / 1000) / c.count,
+            serverCpuPercentOneCore: server, baselineServerCpu: base.server, serverDelta: delta, serverTargetPass: mode === 'baseline' ? null : c.count === 21 && active ? delta <= 10 : null,
+            calibratorCpuPercentOneCore: calibratorCpu, captureChildrenCpuPercentOneCore: childCpu, calibratorPlusChildrenCpu: calibratorCpu + childCpu,
+            testModelCpuPercentOneCore: modelCpu, testOracleCpuPercentOneCore: oracleCpu,
+            allFourConfigsProcessCpuUsage: (cpuEnd - cpuStart) / 1000 / elapsed * 100, allFourConfigsCallerAndCaptureChildrenCpu: caller, allFourConfigsCallerDelta: caller - base.caller,
+            decoderHits: c.panes.reduce((sum, p) => sum + p.decoder.hits, 0), decoderMisses: c.panes.reduce((sum, p) => sum + p.decoder.misses, 0), hz, cpu: cpus()[0]?.model, tmuxVersion: tmux(c.socket, ['-V']).trim(),
+            scope: '4 private servers; real HistoryCalibrator per pane on its own deadlines; host deadline queue batches due panes per tick into one tmux client; parser model fed by pipe-pane (trails tmux); screen-only captures included; frames not comparable (no byte fence); identity+content oracle from printed labels; window stats frozen before settling' };
+          console.log('NEWARCH_C_CPU', JSON.stringify(record));
+          // Emit every configuration before asserting any target.
+          targets.push(() => {
+            expect(falseChecked).toBe(0);
+            expect(c.captureErrors).toBe(0);
+            expect(Number.isFinite(server)).toBe(true);
+            expect(elapsed).toBeGreaterThanOrEqual(60000);
+            if (mode !== 'baseline') expect(historyPerPane.min).toBeGreaterThan(0);
+            if (mode === 'incremental' && active) {
+              expect(finalPass).toBe(true);
+              expect(record.coverage!).toBeGreaterThanOrEqual(.99);
+              if (c.count === 21) expect(delta).toBeLessThanOrEqual(10);
+              // calibrator+capture children within one core for 21 panes.
+              if (c.count === 21) expect(calibratorCpu + childCpu).toBeLessThanOrEqual(100);
+              // Timing: >=250 history captures per pane in 60s (200ms cadence).
+              if (tracerPid === 0) expect(historyPerPane.min).toBeGreaterThanOrEqual(250);
             }
           });
-          const calibratorCpu = pct(w.calibratorUs), childCpu = pct(w.childUs), oracleCpu = pct(w.oracleUs);
-          console.log('NEWARCH_C_CPU' , JSON.stringify({ mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, producedRows, checkedAtWindowEnd: checkedAtWindowEnd[k], checkedPerScrolledAtWindowEnd: producedRows > 0 ? checkedAtWindowEnd[k]! / producedRows : null, pendingAtWindowEnd: pendingAtWindowEnd[k], finalPass, checkedRows, checkedPerScrolled: producedRows > 0 && finalPass ? checkedRows / producedRows : null, unchecked, falseChecked, fullCaptures, partialCaptures, reasons, producedRowsPerSecondPerPane: producedRows / (elapsed / 1000) / c.count, samples: w.samples, capturesPerMinute: w.samples / (elapsed / 60000), captureBytes: c.bytes, serverCpuPercentOneCore: server, baselineServerCpu: base.server, serverDelta: delta, serverTargetPass: mode === 'baseline' ? null : c.count === 21 && active ? delta <= 10 : null, captureBatchP50: percentile(.5), captureBatchP95: percentile(.95), captureBatchP99: percentile(.99), captureBatchMax: c.latencies.at(-1) ?? null, calibratorCpuPercentOneCore: calibratorCpu, captureChildrenCpuPercentOneCore: childCpu, calibratorPlusChildrenCpu: calibratorCpu + childCpu, testOracleCpuPercentOneCore: oracleCpu, allFourConfigsProcessCpuUsage: (cpuEnd - cpuStart) / 1000 / elapsed * 100, allFourConfigsCallerAndCaptureChildrenCpu: caller, allFourConfigsCallerDelta: caller - base.caller, decoderHits: c.panes.reduce((sum, _, i) => sum + states.get(`${c.socket}/${i}`)!.decoder.hits, 0), decoderMisses: c.panes.reduce((sum, _, i) => sum + states.get(`${c.socket}/${i}`)!.decoder.misses, 0), hz, cpu: cpus()[0]?.model, tmuxVersion: tmux(c.socket, ['-V']).trim(), scope: '4 private servers; real capture+memo decode+matcher; independent producer row model; no worker/writer; adaptive incremental overlap; calibrator/children/oracle CPU split; window stats frozen before one final settling pass' }));
-          expect(falseChecked).toBe(0);
-          if (mode === 'incremental' && active) targets.push({ coverage: checkedRows / producedRows, delta, panes: c.count, samples: w.samples, calibratorPlusChildren: calibratorCpu + childCpu });
-          expect(Number.isFinite(server)).toBe(true);
-          expect(elapsed).toBeGreaterThanOrEqual(60000);
-          if (mode !== 'baseline') expect(c.samples).toBeGreaterThan(0);
         }
-        // Emit every configuration before asserting any target.
-        for (const target of targets) {
-          expect(target.coverage).toBeGreaterThanOrEqual(.99);
-          if (target.panes === 21) expect(target.delta).toBeLessThanOrEqual(10);
-          // FIX2 targets: >=250 captures per configuration in the 60s window,
-          // and calibrator+capture children within one core for 21 panes.
-          expect(target.samples).toBeGreaterThanOrEqual(250);
-          if (target.panes === 21) expect(target.calibratorPlusChildren).toBeLessThanOrEqual(100);
-        }
+        for (const target of targets) target();
       } finally {
-        for (const c of configs) spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
+        stopped = true;
+        for (const c of configs) {
+          if (c.timer) clearTimeout(c.timer);
+          for (const p of c.panes) { try { closeSync(p.fd); } catch {} }
+          spawnSync('tmux', ['-S', c.socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
+        }
         rmSync(root, { recursive: true, force: true });
       }
     });
