@@ -456,3 +456,143 @@ test('newarch FIX2: open loop hot pane 1000 per second plus twenty panes at 100'
   expect(normalRefused).toBe(0);expect(wrong+missing).toBe(0);expect(maxPending).toBeLessThanOrEqual(16*1024*1024);
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
+
+// DEBT2 (review3 04a/04b/04c/01c): admission must follow panes with work now, not every pane ever seen.
+async function knownPanesStore(root:string,prefix:string,known:number) {
+ const key=(i:number)=>({serverIdentity:prefix,paneId:`%${i}`,birthGeneration:1});
+ const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ let s=createProjectionStore({historyRoot:root,mode:'create'});
+ for(let i=0;i<known;i++){const t=`old ${i}`.padEnd(80,' ');await s.appendScroll({paneKey:key(i),sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}});}
+ await s.close();
+ s=createProjectionStore({historyRoot:root,mode:'recover'});
+ expect(s.health().panes).toHaveLength(known);expect((s as any).pendingByPane.size).toBe(0);
+ return {s,key,cell};
+}
+const textFrame=(cell:(g:string,fg?:number|null)=>any,cols:number,rows:number,shift:number,coloured:boolean)=>
+ Array.from({length:rows},(_,y)=>Array.from({length:cols},(_,x)=>({...cell(String.fromCharCode(33+((y*7+x+shift)%90))),fg:coloured?(x>>3)%8:null})));
+
+test('newarch DEBT2 D9: an idle store with 21..2000 known panes takes a 3000-row burst from one pane',async()=>{
+ const out:any[]=[];
+ for(const known of [21,100,500,2000]) {
+  const root=mkdtempSync(join(tmpdir(),'na-debt2-burst-'));
+  const {s,key,cell}=await knownPanesStore(root,'burst',known);
+  try {
+   expect(s.health()).toMatchObject({status:'healthy',pendingBytes:0});
+   let ok=0,refused=0;const jobs:Promise<unknown>[]=[];
+   // `cat` of a big file: the pipe reader hands over 3000 rows in one tick.
+   for(let n=0;n<3000;n++){const t=`line ${n} of a big file`.padEnd(80,' ');
+    jobs.push(s.appendScroll({paneKey:key(0),sourceEpoch:1,geometryGeneration:1,receiveSeq:n+2,softWrap:false,physicalRow:{text:t,cells:[...t].map(g=>cell(g))}}).then(()=>{ok++;},()=>{refused++;}));}
+   const pendingAtBurst=s.health().pendingBytes;
+   let frame='accepted';
+   try {await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:9,cols:120,rows:40,kind:'normal',cells:textFrame(cell,120,40,0,false),cursor:{row:0,col:0,visible:true}});}
+   catch(error){frame=String(error);}
+   await Promise.all(jobs);s.flush();
+   expect(s.token(key(0)).nextLineId).toBe(3001);
+   out.push({known,ok,refused,pendingAtBurst,frame,rejectedRows:s.health().rejectedRows,status:s.health().status});
+   expect(refused).toBe(0);expect(frame).toBe('accepted');expect(s.health().rejectedRows).toBe(0);
+   expect((s as any).pendingByPane.size).toBe(0);
+  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+ }
+ console.log('NA_DEBT2_BURST',JSON.stringify(out));
+},120000);
+
+test('newarch DEBT2 D10: full-text frames up to 208x60 are never refused on an idle store with 2000 known panes',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-debt2-frames-'));
+ const {s,key,cell}=await knownPanesStore(root,'frames',2000);
+ const out:any[]=[];
+ try {
+  for(const [cols,rows] of [[80,24],[120,40],[200,60],[208,60]])for(const coloured of [false,true]) {
+   const tries:string[]=[];
+   for(let a=0;a<5;a++) {
+    const cells=textFrame(cell,cols,rows,a,coloured);
+    try {await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:2+a,cols,rows,kind:'normal',cells,cursor:{row:0,col:0,visible:true}});tries.push('accepted');}
+    catch(error){tries.push(String(error));}
+    if(a%2)s.flush();else await Bun.sleep(20);
+   }
+   const shown=JSON.parse(String(s.screen(key(1))!.cells_json));
+   out.push({cols,rows,coloured,tries,lastCell:shown[rows-1][cols-1].grapheme});
+   expect(tries).toEqual(Array(5).fill('accepted'));
+   expect(shown[rows-1][cols-1]).toMatchObject(textFrame(cell,cols,rows,4,coloured)[rows-1][cols-1]);
+  }
+  // A pane already over its history share (queue empty) still publishes its screen.
+  const big='x'.repeat(1024*1024);let refusedRows=0;
+  await Promise.all(Array.from({length:12},(_,n)=>s.appendScroll({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:10+n,softWrap:false,physicalRow:{text:big,cells:[]}}).catch(()=>{refusedRows++;})));
+  expect(refusedRows).toBeGreaterThan(0);
+  await s.replaceScreen({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:30,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,0,true),cursor:null});
+  // One pane over its share degrades that pane, not the whole store (O9).
+  expect(s.health().status).toBe('degraded');
+  s.flush();expect(s.health().pendingBytes).toBe(0);
+  console.log('NA_DEBT2_FRAMES',JSON.stringify({known:2000,results:out,hotPaneRefusedRows:refusedRows}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},120000);
+
+test('newarch DEBT2: queued frames of one pane coalesce to the latest and release replaced bytes',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-debt2-coalesce-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'}),internal=s as any;
+ clearInterval(internal.timer); // explicit flushes only, so pending bytes are exact
+ const key={serverIdentity:'coalesce',paneId:'%1',birthGeneration:1};
+ const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ const row=(seq:number,epoch:number)=>s.appendScroll({paneKey:key,sourceEpoch:epoch,geometryGeneration:1,receiveSeq:seq,softWrap:false,physicalRow:{text:'r'+seq,cells:[]}});
+ const frame=(seq:number,shift:number)=>({paneKey:key,sourceEpoch:2,geometryGeneration:1,receiveSeq:seq,cols:208,rows:60,kind:'normal' as const,cells:textFrame(cell,208,60,shift,false),cursor:null});
+ const frameJobBytes=Buffer.byteLength(JSON.stringify(frame(0,0)))+512;
+ try {
+  // A source-epoch transition queues behind the row; every later frame lands on the queued tail.
+  const first=[row(1,1),...Array.from({length:50},(_,a)=>s.replaceScreen(frame(2+a,a)))];
+  expect([...internal.queues.values()].map((q:any[])=>q.length)).toEqual([2]);
+  expect(internal.pendingBytes()).toBeLessThan(2*frameJobBytes);
+  await Promise.all(first);
+  expect(JSON.parse(String(s.screen(key)!.cells_json))[59][207].grapheme).toBe(textFrame(cell,208,60,49,false)[59][207].grapheme);
+  s.flush();expect(s.health().pendingBytes).toBe(0);
+  // Frames that cannot coalesce (a row sits between them) are pumped one by one;
+  // each replaces the previous unflushed frame instead of adding to it.
+  const small=(seq:number,shift:number)=>({...frame(seq,shift),sourceEpoch:3,cols:80,rows:24,cells:textFrame(cell,80,24,shift,false)});
+  const smallBytes=Buffer.byteLength(JSON.stringify(small(0,0)))+512;
+  const mixed:Promise<unknown>[]=[row(99,2),s.replaceScreen(small(100,0))];
+  for(let a=1;a<=10;a++)mixed.push(row(100+2*a,3),s.replaceScreen(small(101+2*a,a)));
+  expect([...internal.queues.values()][0].length).toBe(22);
+  await Promise.all(mixed);
+  const pending=internal.pendingBytes();
+  expect(pending).toBeLessThan(2*smallBytes);
+  s.flush();expect(s.health().pendingBytes).toBe(0);expect(internal.pendingByPane.size).toBe(0);
+  console.log('NA_DEBT2_COALESCE',JSON.stringify({framesOffered:50,queuedJobs:2,frameJobBytes,smallFrameJobBytes:smallBytes,pendingAfterElevenPumpedFrames:pending,naiveSum:11*smallBytes}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episode, store never stopped',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-debt2-hot-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'});
+ const keys=Array.from({length:21},(_,i)=>({serverIdentity:'hot20k',paneId:`%${i}`,birthGeneration:1}));
+ const hot={serverIdentity:'hot20k',paneId:'%hot',birthGeneration:1};
+ const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ const jobs=new Set<Promise<unknown>>(),statusSeen=new Set<string>();
+ let produced=0,hotProduced=0,hotOk=0,hotRefused=0,normalRefused=0,frameRefused=0,lastFrame=-1e9,fseq=0;
+ const track=(p:Promise<unknown>)=>{jobs.add(p);void p.finally(()=>jobs.delete(p));};
+ const originalError=console.error;console.error=()=>{};
+ try {
+  const start=performance.now();
+  while(performance.now()-start<10000) {
+   const now=performance.now()-start;
+   for(const due=Math.floor(now/10);produced<due;produced++)for(let i=0;i<21;i++){const t=`${i}:${produced}`.padEnd(80,' ');
+    track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).catch(()=>{normalRefused++;}));}
+   for(const due=Math.floor(now*20);hotProduced<due;hotProduced++){const t=`h:${hotProduced}`.padEnd(80,' ');
+    track(s.appendScroll({paneKey:hot,sourceEpoch:1,geometryGeneration:1,receiveSeq:hotProduced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(()=>{hotOk++;},()=>{hotRefused++;}));}
+   if(now-lastFrame>=100){lastFrame=now;fseq++;for(const k of [...keys,hot])
+    track(s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:fseq,cols:80,rows:24,kind:'normal',cells:textFrame(cell,80,24,fseq,false),cursor:null}).catch(()=>{frameRefused++;}));}
+   statusSeen.add(s.health().status);
+   await Bun.sleep(10);
+  }
+  await Promise.all(jobs);s.flush();
+  let missing=0,wrong=0;
+  for(let i=0;i<21;i++){const page=s.readPage(s.token(keys[i]),null,2000);missing+=produced-page.lines.length;
+   wrong+=page.lines.filter((l,n)=>l.text!==`${i}:${n}`.padEnd(80,' ')).length;}
+  const disk=new Database(s.file,{readonly:true});
+  let issues:any;
+  try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-capacity'").get();}finally{disk.close();}
+  console.error=originalError;
+  console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,hotOk,hotRefused,normalRefused,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
+  expect(normalRefused).toBe(0);expect(frameRefused).toBe(0);expect(missing+wrong).toBe(0);
+  expect(hotRefused).toBeGreaterThan(0);expect(statusSeen.has('stopped')).toBe(false);
+  // Review3 saw 677 issue rows for one continuous 30 s episode; it is one episode here.
+  expect(issues).toEqual({n:1,missing:hotRefused});
+ }finally{console.error=originalError;await s.close();rmSync(root,{recursive:true,force:true});}
+},60000);
