@@ -110,7 +110,7 @@ function triples(values: number[], base: number): Map<number | string, number[]>
  * substitute for evidence about the unseen ring, even if receiveSeq advanced. */
 export function matchHistoryRows(
   recent: readonly HistoryRow[], captured: readonly CapturedRow[],
-  scope: { sourceEpoch: number; geometryGeneration: number; completeRetainedTail: boolean },
+  scope: { sourceEpoch: number; geometryGeneration: number; completeRetainedTail: boolean; maxTailGap?: number },
 ): RowMatch {
   const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
@@ -164,6 +164,10 @@ export function matchHistoryRows(
     else if (n === length) count++;
   }
   if (length < 3) return empty('no-anchor');
+  // The recent suffix is the parser's newest row at the fence, so tmux can
+  // only hold the rows that arrived after it. A unique copy further back is
+  // an older print of the same text (e.g. before a resize), never this row.
+  if (scope.maxTailGap !== undefined && b.length - end > scope.maxTailGap) return empty('no-anchor');
   const anchor = a.slice(a.length - length);
   if (count !== 1 || new Set(anchor).size < 2 || occurrences(anchor, a) !== 1 || occurrences(anchor, b) !== 1) return empty('ambiguous');
   const result: RowMatch = { checks: [], repairs: [], reason: 'matched' };

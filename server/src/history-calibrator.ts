@@ -44,6 +44,17 @@ export function equalCalibrationFrames(a: CalibrationFrame, b: CalibrationFrame)
 function samePane(a: PaneKey, b: PaneKey): boolean {
   return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
 }
+// Rows tmux may hold beyond the fenced parser tail: pipe backlog at the fence
+// plus rows scrolled while capture ran (the latter is added per capture).
+const TAIL_GAP_SLACK = 256;
+/** `recent` cut at the newest row of the pre-capture snapshot. An empty
+ * snapshot, or a fence evicted from the ring, leaves nothing provable. */
+function fencedHistory(recent: readonly HistoryRow[], before: readonly HistoryRow[]): readonly HistoryRow[] {
+  const last = before.at(-1)?.lineId;
+  if (last === undefined) return [];
+  for (let i = recent.length - 1; i >= 0; i--) if (recent[i]!.lineId === last) return i === recent.length - 1 ? recent : recent.slice(0, i + 1);
+  return [];
+}
 export type CalibrationEvent = 'birth' | 'reconnect' | 'resize' | 'clear' | 'alt' | 'fault';
 
 /** One instance per pane. The host owns the deadline queue and invokes runDue.
@@ -120,6 +131,11 @@ export class HistoryCalibrator {
     const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 128);
     let successful = false;
     try {
+      // Fence: every row the parser holds before capture starts is already in
+      // tmux history (the pipe trails tmux). Rows appended during the capture
+      // may be missing from it, so they are left to the next capture. The CAS
+      // revision still comes from the read after capture (no starvation).
+      const fence = this.ports.read();
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const capture = await Promise.race([
@@ -138,11 +154,15 @@ export class HistoryCalibrator {
         && JSON.stringify(capture.frame.cursor) === JSON.stringify(meta.cursor)
         && capture.frame.cursor !== null
         && capture.frame.cells.length === meta.rows && capture.frame.cells.every(row => row.length === meta.cols)
+        && fence.sourceEpoch === read.sourceEpoch && fence.geometryGeneration === read.geometryGeneration
         && startedGeneration === this.eventGeneration;
       if (!stable) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
-      const match: RowMatch = !historyDue || meta.kind !== 'normal' ? { checks: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(read.recentHistory, capture.history, {
+      const matched = historyDue && meta.kind === 'normal';
+      const recent = matched ? fencedHistory(read.recentHistory, fence.recentHistory) : read.recentHistory;
+      const match: RowMatch = !matched ? { checks: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, capture.history, {
         sourceEpoch: read.sourceEpoch, geometryGeneration: read.geometryGeneration,
-        completeRetainedTail: historyDue && capture.completeRetainedTail && meta.kind === 'normal',
+        completeRetainedTail: capture.completeRetainedTail,
+        maxTailGap: read.recentHistory.length - recent.length + TAIL_GAP_SLACK,
       });
       const committed = await this.ports.calibrate({ capture, checks: match.checks, repairs: match.repairs, expectedRevision: read.revision });
       if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
@@ -150,7 +170,9 @@ export class HistoryCalibrator {
       // suppresses this result and requests another capture, never an old frame.
       if (startedGeneration !== this.eventGeneration) { this.enterCapture(); return; }
       const latest = this.ports.read();
-      this.matcher.remember(read.recentHistory, capture.history, match);
+      // A screen-only capture carries no history evidence; remembering its
+      // empty match would erase the seed of the incremental chain.
+      if (matched) this.matcher.remember(recent, capture.history, match);
       const comparable = latest.revision === committed.revision
         && read.parserFrame.receiveSeq === capture.frame.receiveSeq
         && latest.parserFrame.receiveSeq === capture.frame.receiveSeq;
@@ -163,7 +185,7 @@ export class HistoryCalibrator {
         this.ports.publish(committed, capture.frame);
       }
       successful = true;
-      this.forceFull = historyDue && (match.reason === 'partial-tail' || match.reason === 'ambiguous');
+      this.forceFull = historyDue && match.reason !== 'matched' && match.reason !== 'generation';
       if (historyDue) { this.lastHistoryAt = now; this.scrolls = Math.max(0, this.scrolls - requestedScrolls); }
     } catch (error) {
       this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined;
