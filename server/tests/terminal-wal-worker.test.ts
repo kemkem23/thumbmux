@@ -1418,3 +1418,27 @@ for (const kind of ["RIS", "E3"] as const) test(`DEBT mutation ${kind} reproduce
   expect(pane.faults).toEqual([]);
   console.log(`DEBT mutation ${kind}: missing=10 extra=0 duplicate=0 faults=0 (negative control detected)`);
 });
+
+for (const mutation of [false, true]) test(`DEBT2 ED0 split-byte regression mutation=${mutation}`, async () => {
+  const assets = pipeVtAssets();
+  let selected = assets;
+  if (mutation) {
+    const root = mkdtempSync(join(tmpdir(), "l2p-debt2-mutation-"));
+    roots.push(root);
+    const source = readFileSync(assets.worker, "utf8");
+    const clause = "how == 2 or (how == 0 and self.cursor.x == 0 and self.cursor.y == 0)";
+    expect(source).toContain(clause);
+    writeFileSync(join(root, "pipe-vt-worker.py"), source.replace(clause, "how == 2"));
+    writeFileSync(join(root, "pipe-vt-vendor.zip"), readFileSync(assets.vendor));
+    writeFileSync(join(root, "pipe-vt-LICENSE.txt"), readFileSync(assets.license));
+    selected = pipeVtAssets(root);
+  }
+  const pane = await collectPane(80, 24, { assets: selected });
+  const lines = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `L${String(from + i).padStart(6, "0")}\r\n`).join("");
+  feedSplit(pane, encoder.encode(lines(1, 10) + "\x1b[H\x1b[J" + lines(11, 60)), 1);
+  await settle(pane);
+  const ids = (pane.scrolls.map(e => rowText(e.physicalRow)).join("\n") + screenRows(pane).map(row => row.text).join("\n")).match(/L\d{6}/g) ?? [];
+  expect(ids).toEqual(Array.from({ length: mutation ? 50 : 60 }, (_, i) => `L${String(i + (mutation ? 11 : 1)).padStart(6, "0")}`));
+  expect(pane.faults).toEqual([]);
+  console.log(`DEBT2 ED0 mutation=${mutation} missing=${mutation ? 10 : 0} extra=0 duplicate=0 faults=0`);
+});

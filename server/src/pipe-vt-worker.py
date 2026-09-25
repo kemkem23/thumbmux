@@ -113,8 +113,12 @@ class Screen(pyte.Screen):
         self.shift = 0
 
     def erase_in_display(self, how=0, *args, **kw):
+        # tmux input_csi_table accepts ED only without a private prefix.
+        if kw.get("private") or how not in (0, 1, 2, 3):
+            return
         if how == 3:
-            # tmux E3 clears scrollback only; pyte treats it as ED2.
+            # tmux E3 clears the shared history even while alt is active;
+            # pyte instead treats it as ED2. A nonzero second arg is ignored.
             if (not args or args[0] == 0) and self.on_history_clear is not None:
                 self.on_history_clear()
             return
@@ -238,6 +242,11 @@ class Screen(pyte.Screen):
 
     def set_mode(self, *modes, **kw):
         if kw.get("private"):
+            # tmux treats DECCOLM as home + clear, never a pane resize.
+            if 3 in modes:
+                self.cursor_position()
+                self.erase_in_display(2)
+                modes = tuple(m for m in modes if m != 3)
             alt = [m for m in modes if m in ALT_MODES]
             if alt and not self.alt:
                 cursor = None
@@ -256,6 +265,11 @@ class Screen(pyte.Screen):
 
     def reset_mode(self, *modes, **kw):
         if kw.get("private"):
+            # tmux treats DECCOLM as home + clear, never a pane resize.
+            if 3 in modes:
+                self.cursor_position()
+                self.erase_in_display(2)
+                modes = tuple(m for m in modes if m != 3)
             alt = [m for m in modes if m in ALT_MODES]
             if alt and self.alt:
                 buffer, cursor, margins, old_cols, old_rows = self.saved_normal
