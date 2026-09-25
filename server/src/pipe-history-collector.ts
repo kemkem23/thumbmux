@@ -246,9 +246,9 @@ export class PipeHistoryCollector {
       return false;
     }
     this.acceptedBytes += bytes.byteLength;
-    if (this.inflightBytes > this.queueLimit) {
-      if (this.healthState === "ok") {
-        this.fault("parser-backlog", `parser backlog ${this.inflightBytes} bytes > ${this.queueLimit}`, "degraded");
+    if (!this.readyForDelivery()) {
+      if (this.inflightBytes > this.queueLimit && this.healthState === "ok") {
+        this.fault("parser-backlog", `parser pressure: ${this.inflightBytes} inflight bytes; next delivery must wait for IPC and parser capacity`, "degraded");
       }
       return false;
     }
@@ -256,8 +256,12 @@ export class PipeHistoryCollector {
   }
 
   drained(): Promise<void> {
-    if (this.healthState === "broken" || this.healthState === "closed" || this.inflightBytes <= this.queueLimit) return Promise.resolve();
+    if (this.healthState === "broken" || this.healthState === "closed" || this.readyForDelivery()) return Promise.resolve();
     return new Promise((resolve) => this.drainWaiters.push(resolve));
+  }
+
+  private readyForDelivery(): boolean {
+    return this.inflightBytes <= this.queueLimit && this.worker.canAccept(64 * 1024);
   }
 
   /** Geometry changed: new generation; the worker reflows and re-sends. */
@@ -435,7 +439,7 @@ export class PipeHistoryCollector {
         this.recoveryAttempts = 0;
       }
       this.hostHandleNs += published - began;
-      if (this.inflightBytes <= this.queueLimit) {
+      if (this.readyForDelivery()) {
         if (this.scrollOnClear !== undefined && update.scrollOnClear === this.scrollOnClear) this.policyUnverified = false;
         if (this.healthState === "degraded" && !this.policyUnverified) this.healthState = "ok";
         for (const waiter of this.drainWaiters.splice(0)) waiter();
@@ -500,7 +504,9 @@ export async function pumpBinaryStream(
     } };
   for await (const chunk of iterable) {
     total += chunk.byteLength;
-    if (!collector.ingest(chunk)) await collector.drained();
+    for (let offset = 0; offset < chunk.byteLength; offset += 64 * 1024) {
+      if (!collector.ingest(chunk.subarray(offset, offset + 64 * 1024))) await collector.drained();
+    }
   }
   return total;
 }
