@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, openSync, readSync, closeSync, existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -648,4 +648,1033 @@ describe("ordered tmux control WAL recorder with a disposable private tmux serve
       if (existsSync(socketPath)) unlinkSync(socketPath);
     }
   }, 15_000);
+});
+
+import { HistoryCalibrator, equalCalibrationFrames, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts } from '../src/history-calibrator';
+import { rowKey, matchHistoryRows, IncrementalHistoryMatcher, equalHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
+import { HistoryWatchdog } from '../src/history-watchdog';
+
+const naRow = (text: string): CapturedRow => ({ softWrap: false, cells: Array.from(text, grapheme => ({ grapheme, width: 1 as const, continuation: false, fg: 'default', bg: 'default', style: 0 })) });
+const naRows = (texts: string[]): HistoryRow[] => texts.map((text, i) => ({ ...naRow(text), lineId: i + 1, sourceEpoch: 1, geometryGeneration: 1 }));
+const naScope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function naHarness(incremental = false) {
+  let time = 0, revision = 1;
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const history = naRows(['a', 'b', 'c']);
+  let parser = structuredClone(frame);
+  const limits: number[] = [], scheduled: number[] = [], published: number[] = [], faults: string[] = [], writes: Parameters<CalibrationPorts['calibrate']>[0][] = [];
+  let conflict = false, stale = false;
+  const ports: CalibrationPorts = {
+    now: () => time,
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: history, parserFrame: parser }),
+    schedule: at => { scheduled.push(at); },
+    capture: async (_, limit) => {
+      limits.push(limit);
+      const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+      return { paneKey, captureId: `capture-${limits.length}`, requestedAt: time, completedAt: time, before: meta, after: stale ? { ...meta, cols: 5 } : meta, frame, history, completeRetainedTail: limit >= history.length, observedFields: ['cells', 'cursor'] };
+    },
+    calibrate: async input => { writes.push(input); if (conflict || input.expectedRevision !== revision) { conflict = false; revision++; return null; } return { revision: ++revision, durableRevision: 0, nextLineId: 4 }; },
+    publish: commit => { published.push(commit.revision); },
+    fault: fault => { faults.push(fault.kind); },
+  };
+  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental });
+  return { calibrator, ports, frame, history, limits, scheduled, published, faults, writes,
+    time: (at: number) => { time = at; },
+    parser: (value: CalibrationFrame) => { parser = value; },
+    conflict: () => { conflict = true; }, stale: () => { stale = true; },
+  };
+}
+
+describe('NEWARCH L2-C matcher and calibration ports', () => {
+  test('unique suffix checks exact cells and repairs only bounded equal-length mismatch', () => {
+    const rows = naRows(['L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3']);
+    const capture = ['L1', 'L2', 'L3', 'good', 'R1', 'R2', 'R3'].map(naRow);
+    const match = matchHistoryRows(rows, capture, naScope);
+    expect(match.checks).toHaveLength(6);
+    expect(match.repairs).toEqual([{ lineId: 4, capturedRow: 3, row: capture[3]! }]);
+    expect(matchHistoryRows(rows, capture, { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
+    expect(matchHistoryRows(rows, capture, { ...naScope, geometryGeneration: 2 }).checks).toHaveLength(0);
+  });
+  test('constant, repeated, deleted and partial tails never acquire false checks', () => {
+    for (const values of [['', '', '', ''], ['a', 'b', 'c', 'a', 'b', 'c']]) {
+      const match = matchHistoryRows(naRows(values.slice(-3)), values.map(naRow), naScope);
+      expect(match.checks).toHaveLength(0);
+      expect(match.repairs).toHaveLength(0);
+    }
+    const rows = naRows(['a', 'b', 'c', 'missing', 'd', 'e', 'f']);
+    const match = matchHistoryRows(rows, ['a', 'b', 'c', 'd', 'e', 'f'].map(naRow), naScope);
+    expect(match.repairs).toHaveLength(0);
+    expect(match.checks.map(c => c.lineId)).toEqual([5, 6, 7]);
+  });
+  test('20,000-row fixture remains unchanged when only the retained tail can be checked', () => {
+    const rows = naRows(Array.from({ length: 20000 }, (_, i) => `row-${i}`));
+    const retained = rows.slice(-4500);
+    const match = matchHistoryRows(rows, retained, naScope);
+    expect(rows).toHaveLength(20000);
+    expect(match.checks).toHaveLength(4500);
+    for (const check of match.checks) expect(rows[check.lineId - 1]).toEqual(retained[check.capturedRow]);
+    console.log('NEWARCH_C_OVERFLOW', JSON.stringify({ denominator: rows.length, checked: match.checks.length, unchecked: rows.length - match.checks.length, reason: 'evicted-before-check', falseChecked: match.checks.filter(c => !equalHistoryRows(rows[c.lineId - 1]!, retained[c.capturedRow]!)).length, scope: 'fake scroll store; not real collector' }));
+  });
+  test('all screen/check/repair mutations share one CAS and conflict recaptures', async () => {
+    const h = naHarness(); h.conflict();
+    await h.calibrator.runDue();
+    expect(h.published).toHaveLength(0);
+    expect(h.writes[0]!.expectedRevision).toBe(1);
+    h.time(50); await h.calibrator.runDue();
+    expect(h.writes[1]!.expectedRevision).toBe(2);
+    expect(h.published).toEqual([3]);
+  });
+  test('geometry transition discards capture and lifecycle events append no phantom rows', async () => {
+    const h = naHarness(); h.stale();
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(0);
+    for (const event of ['clear', 'alt', 'resize', 'reconnect', 'fault'] as const) h.calibrator.event(event);
+    expect(h.history.map(r => r.lineId)).toEqual([1, 2, 3]);
+    expect(h.calibrator.acceptsPipeFrame).toBe(false);
+  });
+  test('CAPTURE latch prevents parser overwrite, keeps scroll ingestion and returns only on equality', async () => {
+    const h = naHarness();
+    const wrong = structuredClone(h.frame); wrong.cells = [naRow('bad ').cells]; h.parser(wrong);
+    await h.calibrator.runDue();
+    expect(h.calibrator.mode).toBe('CAPTURE');
+    let pipePublishes = 0;
+    h.calibrator.output(() => pipePublishes++); h.calibrator.scroll(20000);
+    h.time(50); await h.calibrator.runDue();
+    expect(h.limits).toEqual([4500, 0]);
+    expect(pipePublishes).toBe(0);
+    h.time(1051); await h.calibrator.runDue();
+    expect(h.faults).toContain('capture-latch-degraded');
+    h.parser(structuredClone(h.frame)); h.time(1101); await h.calibrator.runDue();
+    expect(h.calibrator.mode).toBe('PIPE');
+    h.calibrator.output(() => pipePublishes++); h.time(1117); await h.calibrator.runDue();
+    expect(pipePublishes).toBe(1);
+  });
+  test('incremental capture reads new scrolls plus anchor, full only on lifecycle/fault', async () => {
+    const h = naHarness(true);
+    await h.calibrator.runDue();
+    h.time(10); h.calibrator.scroll(20); h.time(200); await h.calibrator.runDue();
+    expect(h.limits).toEqual([4500, 148]);
+    h.time(201); h.calibrator.event('clear'); h.time(250); await h.calibrator.runDue();
+    expect(h.limits.at(-1)).toBe(4500);
+  });
+  test('output cannot debounce calibration forever and inactive panes settle to 1s', async () => {
+    const h = naHarness(); await h.calibrator.runDue();
+    for (let t = 1; t <= 199; t++) { h.time(t); h.calibrator.output(); }
+    expect(h.calibrator.dueAt).toBe(200);
+    h.time(200); await h.calibrator.runDue();
+    expect(h.limits).toHaveLength(2);
+    h.time(400); await h.calibrator.runDue();
+    expect(h.calibrator.dueAt).toBe(1400);
+  });
+  test('an event whose timer fires during capture is re-armed after completion', async () => {
+    const h = naHarness();
+    const capture = h.ports.capture;
+    let release!: () => void;
+    h.ports.capture = async (...args) => {
+      const result = await capture(...args);
+      return new Promise(resolve => { release = resolve.bind(null, result); });
+    };
+    const running = h.calibrator.runDue();
+    await Promise.resolve(); await Promise.resolve();
+    h.time(10); h.calibrator.event('resize');
+    await h.calibrator.runDue(); // The host dequeued the event, but capture owns the lane.
+    release();
+    await running;
+    expect(h.published).toHaveLength(0);
+    expect(h.calibrator.dueAt).toBe(50);
+    expect(h.scheduled.at(-1)).toBe(50);
+    h.ports.capture = capture;
+    h.time(50); await h.calibrator.runDue();
+    expect(h.published).toHaveLength(1);
+  });
+  test('a capture commit cancels the older queued pipe publish even when parser matches', async () => {
+    const h = naHarness();
+    let stalePublishes = 0;
+    h.calibrator.output(() => stalePublishes++);
+    await h.calibrator.runDue();
+    h.time(16); await h.calibrator.runDue();
+    expect(stalePublishes).toBe(0);
+    expect(h.published).toHaveLength(1);
+  });
+  test('dead reader and independent heartbeat detect failure even when pane_pipe would remain 1', () => {
+    let at = 0; const faults: string[] = [];
+    const wd = new HistoryWatchdog(() => at, f => { expect(f.missingCount).toBeNull(); faults.push(f.kind); });
+    wd.capture('a'); wd.capture('b');
+    at = 1000; wd.tick(); expect(faults).toEqual(['reader-stalled']);
+    wd.receive(1); wd.heartbeat();
+    at = 3999; wd.tick(); expect(faults).toHaveLength(1);
+    at = 4000; wd.tick(); expect(faults).toContain('heartbeat-timeout');
+    wd.dead('reader-eof'); expect(faults).toContain('reader-eof');
+    wd.dead('reader-eof'); expect(faults.filter(f => f === 'reader-eof')).toHaveLength(1);
+  });
+  test('independently timed glyph/color/blank/cursor faults correct at next scheduled publish', async () => {
+    // Real monotonic wall time and timers; fake parser/store/capture ports. This
+    // measures the C lane only and cannot certify the later integrated path.
+    const results: Record<string, number[]> = {};
+    for (const kind of ['glyph', 'color', 'blank', 'cursor']) {
+      const samples: number[] = [];
+      const h = naHarness();
+      const started = performance.now();
+      h.ports.now = () => performance.now() - started;
+      let injected = 0, corrected = 0;
+      h.ports.publish = (_, frame) => {
+        expect(equalCalibrationFrames(frame, h.frame)).toBe(true);
+        corrected = performance.now();
+      };
+      for (let n = 0; n < 25; n++) {
+        const wrong = structuredClone(h.frame);
+        if (kind === 'cursor') wrong.cursor!.x = 2;
+        else {
+          const cells = wrong.cells.map(row => row.map(c => ({ ...c })));
+          if (kind === 'color') cells[0]![0]!.fg = 'index:1';
+          else cells[0]![0]!.grapheme = kind === 'blank' ? ' ' : 'X';
+          wrong.cells = cells;
+        }
+        // Offset injection from calibration; include all waiting and publish.
+        await new Promise(resolve => setTimeout(resolve, 7 + (n * 17) % 37));
+        injected = performance.now(); h.parser(wrong); h.calibrator.output();
+        // Timers can wake before a fractional monotonic deadline. The host
+        // re-arms in that case; model that wait instead of reading an old publish.
+        while (h.ports.now() < h.calibrator.dueAt) {
+          await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(h.calibrator.dueAt - h.ports.now()))));
+        }
+        await h.calibrator.runDue();
+        samples.push(corrected - injected);
+        expect(corrected).toBeGreaterThanOrEqual(injected);
+        h.parser(structuredClone(h.frame));
+        await new Promise(resolve => setTimeout(resolve, 51));
+        await h.calibrator.runDue();
+      }
+      samples.sort((a, b) => a - b); results[kind] = samples;
+      console.log('NEWARCH_C_CORRECTION', JSON.stringify({ kind, n: samples.length, p50: samples[12], p95: samples[23], p99: samples[24], max: samples[24], correctedCellDifference: 0, scope: 'C fake ports, real timers' }));
+      expect(samples[23]!).toBeLessThanOrEqual(300);
+      expect(samples[24]!).toBeLessThanOrEqual(500);
+    }
+  });
+});
+
+// Reviewer seed, operations and all 3,000 cases preserved verbatim.
+test('FIX1 reviewer adversarial corpus', () => {
+// Adversarial probe for matchHistoryRows. Each row carries a hidden true id
+// (oracle) that the matcher never sees. A check is "false" if content differs
+// (content-false) or if the parser row and the captured row are different
+// true lines (identity-false). Repairs must copy tmux content exactly.
+type L = { id: number; text: string; fg?: string };
+const cell = (g: string, fg = 'default') => ({ grapheme: g, width: 1 as const, continuation: false, fg, bg: 'default', style: 0 });
+const cap = (l: L): CapturedRow => ({ softWrap: false, cells: Array.from(l.text.padEnd(8), g => cell(g, l.fg)) });
+let seed = 12345; const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+const scope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function run(name: string, parser: L[], tmux: L[]) {
+  const recent: HistoryRow[] = parser.map((l, i) => ({ ...cap(l), lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
+  const captured = tmux.map(cap);
+  const m = matchHistoryRows(recent, captured, scope);
+  let contentFalse = 0, identityFalse = 0, repairNotTmux = 0, repairWrongLine = 0, repairDestroysCorrect = 0;
+  for (const c of m.checks) {
+    if (rowKey(recent[c.lineId]!) !== rowKey(captured[c.capturedRow]!)) contentFalse++;
+    if (parser[c.lineId]!.id !== tmux[c.capturedRow]!.id) identityFalse++;
+  }
+  for (const r of m.repairs) {
+    if (rowKey(r.row) !== rowKey(captured[r.capturedRow]!)) repairNotTmux++;
+    if (parser[r.lineId]!.id !== tmux[r.capturedRow]!.id) repairWrongLine++;
+    // parser row was already a correct copy of its true line and the repair replaces it with another line's content
+    const own = tmux.find(t => t.id === parser[r.lineId]!.id);
+    if (own && rowKey(cap(own)) === rowKey(recent[r.lineId]!) && rowKey(r.row) !== rowKey(recent[r.lineId]!)) repairDestroysCorrect++;
+  }
+  const before = parser.map(l => l.id); const after = before.slice();
+  for (const r of m.repairs) after[r.lineId] = tmux[r.capturedRow]!.id;
+  const cnt = (xs: number[]) => xs.reduce((mp, x) => mp.set(x, (mp.get(x) ?? 0) + 1), new Map<number, number>());
+  const cb = cnt(before), ca = cnt(after); let lostByRepair = 0, dupByRepair = 0;
+  const lostIds: number[] = []; for (const [id] of cb) if (id >= 0 && !ca.has(id)) { lostByRepair++; lostIds.push(id); }
+  if (lostIds.length && (globalThis as any).dumped !== true && name.startsWith('fuzz')) { (globalThis as any).dumped = true; const ringStart = tmux[0]!.id; console.log('LOSS-DUMP', JSON.stringify({ name, lostIds: lostIds.slice(0,10), ringIds: [tmux[0]!.id, tmux.at(-1)!.id], repairsOnLost: m.repairs.filter(r => lostIds.includes(parser[r.lineId]!.id)).slice(0,5).map(r => ({ lineId: r.lineId, parserId: parser[r.lineId]!.id, parserText: parser[r.lineId]!.text, parserFg: parser[r.lineId]!.fg, tmuxId: tmux[r.capturedRow]!.id, tmuxText: tmux[r.capturedRow]!.text })) })); }
+  for (const [id, n] of ca) if (n > 1 && n > (cb.get(id) ?? 0)) dupByRepair++;
+  return { lostByRepair, dupByRepair, name, reason: m.reason, checks: m.checks.length, repairs: m.repairs.length, contentFalse, identityFalse, repairNotTmux, repairWrongLine, repairDestroysCorrect };
+}
+const stream = (n: number, vocab: number, start = 0) => Array.from({ length: n }, (_, i) => ({ id: start + i, text: vocab ? `v${Math.floor(rnd() * vocab)}` : `row-${start + i}` }));
+const out: any[] = [];
+// 1 long run of identical rows at the tail
+{ const s = [...stream(50, 0), ...Array.from({ length: 200 }, (_, i) => ({ id: 1000 + i, text: '' }))]; out.push(run('long-identical-tail', s, s)); }
+// 1b identical run with parser behind by 5 blank rows
+{ const s = [...stream(50, 0), ...Array.from({ length: 200 }, (_, i) => ({ id: 1000 + i, text: '' }))]; out.push(run('identical-run-parser-behind', s.slice(0, -5), s)); }
+// 2 clear mid-way: tmux ring cleared (clear-history) then new output
+{ const s = stream(300, 0); const after = stream(100, 0, 300); out.push(run('clear-history-midway', [...s, ...after], after)); }
+// 2b clear-screen that pushes the same visible rows into history twice (scroll-on-clear)
+{ const s = stream(100, 0); const dup = s.slice(-24).map(l => ({ id: l.id + 10000, text: l.text })); out.push(run('scroll-on-clear-duplicate', s, [...s, ...dup])); }
+// 3 overflow beyond history-limit between two rounds
+{ const s = stream(20000, 0); out.push(run('overflow-20000-limit-4500', s, s.slice(-4500))); }
+// 3b overflow while parser lost 7 rows in the middle of the retained part
+{ const s = stream(20000, 0); const p = [...s.slice(0, 17000), ...s.slice(17007)]; out.push(run('overflow-with-lost-rows', p, s.slice(-4500))); }
+// 4 color-only change inside the tail
+{ const s = stream(100, 0); const t = s.map(l => ({ ...l })); t[60]!.fg = 'index:1'; t[99]!.fg = 'index:2'; out.push(run('color-only-change', s, t)); }
+{ const s = stream(100, 0); const t = s.map(l => ({ ...l })); t[60]!.fg = 'index:1'; out.push(run('color-only-change-mid', s, t)); }
+// 5 periodic content (a b c a b c ...)
+{ const s = Array.from({ length: 300 }, (_, i) => ({ id: i, text: 'abc'[i % 3]! })); out.push(run('periodic-abc', s, s)); }
+// 6 shift inside a bounded gap (delete one row at gap start, insert one at gap end)
+{ const s: L[] = ['A1','A2','A3','P','Q','Q','B1','B2','B3'].map((t, i) => ({ id: i, text: t }));
+  const t: L[] = [s[0]!, s[1]!, s[2]!, s[4]!, s[5]!, { id: 99, text: 'R' }, s[6]!, s[7]!, s[8]!];
+  out.push(run('equal-length-shift-in-gap', s, t)); }
+// 7 randomized fuzz: small vocab, random drops/dups/phantoms/colour edits, ring truncation
+const agg = { lostByRepair: 0, dupByRepair: 0, lossCases: [] as any[], cases: 0, checks: 0, repairs: 0, contentFalse: 0, identityFalse: 0, repairNotTmux: 0, repairWrongLine: 0, repairDestroysCorrect: 0, destroyCases: [] as any[], identityFalseCases: [] as any[] };
+for (let k = 0; k < 3000; k++) {
+  const vocab = [0, 2, 3, 5, 20][k % 5]!;
+  const truth = stream(40 + Math.floor(rnd() * 200), vocab);
+  const ring = truth.slice(-Math.max(3, Math.floor(truth.length * (0.3 + rnd() * 0.7))));
+  const parser: L[] = [];
+  for (const l of truth) {
+    const r = rnd();
+    if (r < 0.03) continue; // lost row
+    if (r < 0.05) { parser.push(l, { ...l }); continue; } // duplicated row
+    if (r < 0.07) { parser.push({ id: -1 - k, text: 'phantom' }, l); continue; }
+    if (r < 0.10) { parser.push({ ...l, fg: 'index:9' }); continue; } // colour drift
+    parser.push(l);
+  }
+  const behind = Math.floor(rnd() * 3);
+  const res = run(`fuzz-${k}`, parser, ring.slice(0, ring.length - behind || undefined));
+  agg.cases++; agg.checks += res.checks; agg.repairs += res.repairs; agg.contentFalse += res.contentFalse; agg.identityFalse += res.identityFalse; agg.lostByRepair += res.lostByRepair; agg.dupByRepair += res.dupByRepair; if ((res.lostByRepair||res.dupByRepair) && agg.lossCases.length < 3) agg.lossCases.push({k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res}); agg.repairNotTmux += res.repairNotTmux; agg.repairWrongLine += res.repairWrongLine; agg.repairDestroysCorrect += res.repairDestroysCorrect; if (res.repairDestroysCorrect && agg.destroyCases.length < 5) agg.destroyCases.push({ k, vocab, ...res });
+  if (res.identityFalse && agg.identityFalseCases.length < 5) agg.identityFalseCases.push({ k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res });
+}
+for (const o of out) { expect(o.contentFalse).toBe(0); expect(o.repairNotTmux).toBe(0); }
+console.log('NEWARCH_FIX1_FUZZ', JSON.stringify({ cases: agg.cases, checks: agg.checks, falseChecked: agg.contentFalse, repairs: agg.repairs, repairNotTmux: agg.repairNotTmux, identityFalse: agg.identityFalse }));
+expect(agg.cases).toBe(3000); expect(agg.checks).toBeGreaterThan(0); expect(agg.contentFalse).toBe(0); expect(agg.repairNotTmux).toBe(0);
+});
+
+test('FIX1 full matcher p95 at 4500 rows, independent cells and collision buckets', async () => {
+  for (const cols of [80, 120]) {
+    const recent = naRows(Array.from({ length: 4500 }, (_, i) => `row-${String(i).padStart(8, '0')}`.padEnd(cols, 'x')));
+    const captured = recent.map(r => ({ softWrap: r.softWrap, cells: r.cells.map(c => ({ ...c })) }));
+    captured[2200]!.cells[cols - 1]!.fg = 'index:9';
+    const times: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      // Match the specified per-pane 200ms cadence; do not time the sleep.
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const started = performance.now();
+      const result = matchHistoryRows(recent, captured, naScope);
+      times.push(performance.now() - started);
+      expect(result.checks).toHaveLength(4499);
+      expect(result.repairs).toHaveLength(1);
+    }
+    times.sort((a, b) => a - b);
+    console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29], cadenceMs: 200, driftedRows: 1 }));
+    expect(times[28]!).toBeLessThanOrEqual(20);
+    // Same sampled prefix, different final cells: never trust the bucket key.
+    captured[2200]!.cells[cols - 1]!.fg = 'index:9';
+    const result = matchHistoryRows(recent, captured, naScope);
+    expect(result.checks.some(c => c.lineId === 2201)).toBe(false);
+    expect(result.repairs.some(c => c.lineId === 2201)).toBe(true);
+    // Two drifts force the general interning path, not the single-row fast path.
+    captured[2202]!.cells[cols - 1]!.fg = 'index:8';
+    const general = matchHistoryRows(recent, captured, naScope);
+    expect(general.checks.some(c => c.lineId === 2201 || c.lineId === 2203)).toBe(false);
+    expect(general.repairs.map(r => r.lineId)).toEqual([2201, 2203]);
+  }
+});
+
+test('FIX1 incremental checked coverage and fail-closed anchor loss', () => {
+  const matcher = new IncrementalHistoryMatcher();
+  const all = naRows(Array.from({ length: 8000 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 4500);
+  const initial = matcher.match(recent, recent, naScope);
+  matcher.remember(recent, recent, initial);
+  const checked = new Set<number>();
+  for (let end = 4520; end <= 7500; end += 20) {
+    recent = all.slice(end - 4500, end);
+    const captured = recent.slice(-23);
+    const result = matcher.match(recent, captured, { ...naScope, completeRetainedTail: false });
+    for (const c of result.checks) {
+      expect(equalHistoryRows(all[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
+      if (c.lineId > 4500) checked.add(c.lineId);
+    }
+    matcher.remember(recent, captured, result);
+  }
+  console.log('NEWARCH_FIX1_INCREMENTAL', JSON.stringify({ scrolled: 3000, checked: checked.size, ratio: checked.size / 3000 }));
+  expect(checked.size).toBe(3000);
+  matcher.reset();
+  expect(matcher.match(recent, recent.slice(-23), { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
+});
+
+test('FIX1 capture errors, unstable metadata and CAS do not freeze pipe', async () => {
+  for (const kind of ['throw', 'unstable', 'cas']) {
+    const h = naHarness();
+    if (kind === 'throw') h.ports.capture = async () => { throw new Error('fixture capture fault'); };
+    if (kind === 'unstable') h.stale();
+    if (kind === 'cas') h.conflict();
+    let published = 0;
+    h.calibrator.output(() => published++);
+    await h.calibrator.runDue();
+    h.time(16); await h.calibrator.runDue();
+    expect(h.calibrator.acceptsPipeFrame).toBe(true);
+    expect(published).toBe(1);
+  }
+});
+
+test('FIX1 pipe publishes during capture and revision is read after 100 rows/s output', async () => {
+  const h = naHarness();
+  const capture = h.ports.capture;
+  const read = h.ports.read;
+  let revision = 1, commits = 0, pipe = 0, updates = 0, flowingMs = 0;
+  const started = performance.now();
+  h.ports.now = () => performance.now() - started;
+  h.ports.read = () => ({ ...read(), revision });
+  h.ports.calibrate = async input => {
+    expect(input.expectedRevision).toBe(revision);
+    commits++; return { revision: ++revision, durableRevision: 0, nextLineId: 4 };
+  };
+  h.ports.capture = async (key, limit) => {
+    const flowStarted = performance.now();
+    for (let n = 0; n < 10; n++) {
+      const deadline = flowStarted + (n + 1) * 10;
+      while (performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, Math.max(1, deadline - performance.now())));
+      revision++; updates++; h.calibrator.output(() => pipe++);
+      await h.calibrator.runDue();
+    }
+    flowingMs = performance.now() - flowStarted;
+    return capture(key, limit);
+  };
+  await h.calibrator.runDue();
+  expect(commits).toBe(1); expect(pipe).toBeGreaterThan(0);
+  console.log('NEWARCH_FIX1_CAS', JSON.stringify({ targetRowsPerSecond: 100, revisionUpdates: updates, elapsedMs: flowingMs, observedUpdatesPerSecond: updates * 1000 / flowingMs, commits, pipe, scope: 'revision-per-row simulation during capture; fake writer' }));
+});
+
+test('FIX1 hung capture has a deadline and heartbeat can alert after recovery', async () => {
+  const h = naHarness(); let aborted = false;
+  h.ports.capture = (_, __, signal) => new Promise(() => { signal?.addEventListener('abort', () => { aborted = true; }); });
+  const at = performance.now(); await h.calibrator.runDue();
+  expect(performance.now() - at).toBeLessThan(1500);
+  expect(aborted).toBe(true); expect(h.calibrator.acceptsPipeFrame).toBe(true);
+  let now = 0; const faults: string[] = [];
+  const watchdog = new HistoryWatchdog(() => now, f => faults.push(f.kind));
+  now = 3000; watchdog.tick(); watchdog.heartbeat();
+  now = 6000; watchdog.tick();
+  expect(faults).toEqual(['heartbeat-timeout', 'heartbeat-timeout']);
+});
+
+test('FIX1 reviewer 16000 repair-distance cases never worsen history', () => {
+// Does applying the matcher's repairs ever move the recorded window FURTHER from
+// the truth? Metric: edit distance (insert/delete/substitute) between the DB
+// window content and the true content of the same line range, before vs after
+// repairs. Parser faults: dropped rows, duplicated rows, phantom rows, colour drift.
+const key = (t: string, fg: string) => `${t}|${fg}`;
+const row = (t: string, fg = 'default'): CapturedRow => ({ softWrap: false, cells: Array.from(t.padEnd(5), g => ({ grapheme: g, width: 1 as const, continuation: false, fg, bg: 'default', style: 0 })) });
+const scope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
+function ed(a: string[], b: string[]) { const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]); for (let j = 1; j <= b.length; j++) d[0]![j] = j; for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i]![j] = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length]![b.length]!; }
+let seed = 4242; const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+const out: Record<string, any> = {}; let example: any;
+for (const vocab of [0, 3, 8, 50]) {
+  const t = { cases: 0, matched: 0, repairs: 0, better: 0, same: 0, worse: 0, worseBy: 0 };
+  for (let k = 0; k < 4000; k++) {
+    const R = 80 + Math.floor(rnd() * 80), W = 20 + Math.floor(rnd() * 50);
+    const truth = Array.from({ length: R }, (_, i) => vocab ? String.fromCharCode(97 + Math.floor(rnd() * vocab)) : `r${i}`);
+    const p: { t: string; fg: string }[] = [];
+    for (let i = R - W; i < R; i++) { const r = rnd(); if (r < 0.03) continue; if (r < 0.06) { p.push({ t: truth[i]!, fg: 'default' }, { t: truth[i]!, fg: 'default' }); continue; } if (r < 0.08) p.push({ t: 'PH', fg: 'default' }); if (r > 0.95) { p.push({ t: truth[i]!, fg: 'red' }); continue; } p.push({ t: truth[i]!, fg: 'default' }); }
+    const behind = Math.floor(rnd() * 3); const ring = truth.slice(0, R - behind);
+    const m = matchHistoryRows(p.map((x, i) => ({ ...row(x.t, x.fg), lineId: i, sourceEpoch: 1, geometryGeneration: 1 }) as HistoryRow), ring.map(x => row(x)), scope);
+    t.cases++; if (m.reason === 'matched') t.matched++; t.repairs += m.repairs.length;
+    if (!m.repairs.length) continue;
+    const before = p.map(x => key(x.t, x.fg)); const after = before.slice();
+    for (const r of m.repairs) after[r.lineId] = key(ring[r.capturedRow]!, 'default');
+    const target = truth.slice(R - W).map(x => key(x, 'default'));
+    const eb = ed(before, target), ea = ed(after, target);
+    if (ea < eb) t.better++; else if (ea === eb) t.same++; else { t.worse++; t.worseBy += ea - eb; if (!example || before.length < example.before.length) example = { vocab, before: before.map(s => s.replace('|default', '').replace('|red', '(red)')), after: after.map(s => s.replace('|default', '').replace('|red', '(red)')), truthWindow: truth.slice(R - W), ringTail: ring.slice(-W - 5), repairs: m.repairs.map(r => `${r.lineId}:=ring[${r.capturedRow}]`), checks: m.checks.length, eb, ea }; }
+  }
+  out[`vocab=${vocab || 'unique'}`] = t;
+}
+console.log('NEWARCH_FIX1_REPAIR_DISTANCE', JSON.stringify(out));
+for (const result of Object.values(out)) { expect(result.cases).toBe(4000); expect(result.worse).toBe(0); }
+expect(example).toBeUndefined();
+});
+
+
+test('FIX1 partial capture certifies separate exact runs around an unchecked changed row', () => {
+  const rows = naRows(Array.from({ length: 100 }, (_, i) => `row-${i}`));
+  const matcher = new IncrementalHistoryMatcher();
+  const initial = matcher.match(rows.slice(0, 80), rows.slice(0, 80), naScope);
+  matcher.remember(rows.slice(0, 80), rows.slice(0, 80), initial);
+  const captured = rows.slice(60).map(row => ({ ...row })); captured[25] = naRow('changed');
+  const result = matcher.match(rows, captured, { ...naScope, completeRetainedTail: false });
+  expect(result.reason).toBe('matched'); expect(result.repairs).toHaveLength(0);
+  expect(result.checks.some(c => c.lineId === 86)).toBe(false);
+  expect(result.checks.some(c => c.lineId === 100)).toBe(true);
+  for (const c of result.checks) expect(equalHistoryRows(rows[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
+});
+
+test('FIX2 remember seeds the terminal triple after a general full match', () => {
+  // Two drifted rows force the general path, whose checks list the suffix
+  // before interior anchors. The seed must still be the last three rows, so
+  // a scrolls+overlap tail continues without a full recapture.
+  const all = naRows(Array.from({ length: 4700 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 4500);
+  const captured = recent.map(r => ({ softWrap: r.softWrap, cells: r.cells.map(c => ({ ...c })) }));
+  captured[1000]!.cells[0]!.fg = 'index:1';
+  captured[3000]!.cells[0]!.fg = 'index:2';
+  const matcher = new IncrementalHistoryMatcher();
+  const full = matcher.match(recent, captured, naScope);
+  expect(full.reason).toBe('matched');
+  expect(Math.max(...full.checks.slice(-3).map(c => c.lineId))).toBeLessThan(4500);
+  matcher.remember(recent, captured, full);
+  recent = all.slice(200, 4700);
+  const tail = recent.slice(-(200 + 16));
+  const next = matcher.match(recent, tail, { ...naScope, completeRetainedTail: false });
+  expect(next.reason).toBe('matched');
+  expect(next.checks.at(-1)!.lineId).toBe(4700);
+  for (const c of next.checks) expect(equalHistoryRows(all[c.lineId - 1]!, tail[c.capturedRow]!)).toBe(true);
+});
+
+// DEBT items 1/2/6 through the real HistoryCalibrator: tmux keeps producing
+// while capture runs, the parser trails the pipe by `lagMs` and is therefore
+// AHEAD of the capture snapshot when read after it. Fake clock, true ids hidden.
+async function debtFlow(o: { incremental: boolean; seconds: number; rate: number; lagMs: number; captureMs: number; text?: (i: number) => string; wrongScreen?: boolean; lateMs?: number }) {
+  const text = o.text ?? ((i: number) => `row-${i}`);
+  const rows = new Map<string, CapturedRow>();
+  const rowOf = (t: string) => { let r = rows.get(t); if (!r) { r = naRow(t.padEnd(12)); rows.set(t, r); } return r; };
+  const frame: CalibrationFrame = { cells: [naRow('scr ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%9', birthGeneration: 1 };
+  // A comparable parser screen that never matches keeps the calibrator in
+  // CAPTURE mode: screen-only captures every 50ms between history captures.
+  const parserFrame: CalibrationFrame = o.wrongScreen ? { ...frame, cells: [naRow('bad ').cells] } : frame;
+  let now = 0, revision = 1, produced = 0, applied = 0, inFlight = false;
+  const tmuxRing: number[] = [], parser: Array<{ id: number; lineId: number }> = [], producedAt: number[] = [];
+  let pending: { at: number; resolve: (c: CalibrationCapture) => void; value: CalibrationCapture; snap: number[] } | undefined;
+  const st = { checks: 0, checksWhileFlowing: 0, falseChecked: 0, identityFalse: 0, commits: 0, staleRevision: 0, limits: [] as number[], verified: new Set<number>() };
+  const end = o.seconds * 1000;
+  const ports: CalibrationPorts = {
+    now: () => now, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, parserFrame,
+      recentHistory: parser.map(p => ({ ...rowOf(text(p.id)), lineId: p.lineId, sourceEpoch: 1, geometryGeneration: 1 })) }),
+    capture: (_, tail) => {
+      st.limits.push(tail); inFlight = true;
+      const snap = tmuxRing.slice(Math.max(0, tmuxRing.length - tail));
+      const value = { paneKey, captureId: String(st.limits.length), requestedAt: now, completedAt: now + o.captureMs, before: meta, after: meta, frame,
+        history: snap.map(id => rowOf(text(id))), completeRetainedTail: tail >= tmuxRing.length, observedFields: [] } as CalibrationCapture;
+      return new Promise(resolve => { pending = { at: now + o.captureMs, resolve, value, snap }; });
+    },
+    calibrate: async input => {
+      if (input.expectedRevision !== revision) { st.staleRevision++; return null; }
+      const snap = (st as any).snap as number[];
+      const byLine = new Map(parser.map(p => [p.lineId, p.id]));
+      for (const c of input.checks) {
+        const id = byLine.get(c.lineId)!, tmuxId = snap[c.capturedRow]!;
+        st.checks++; if (now < end) st.checksWhileFlowing++;
+        if (!equalHistoryRows(rowOf(text(id)), rowOf(text(tmuxId)))) st.falseChecked++;
+        if (id !== tmuxId) st.identityFalse++; else st.verified.add(id);
+      }
+      st.commits++; return { revision: ++revision, durableRevision: 0, nextLineId: parser.length };
+    },
+    publish: () => {}, fault: () => {},
+  };
+  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental: o.incremental });
+  const step = 1000 / o.rate;
+  for (now = 0; now <= end + 2000; now++) {
+    while (now < end && produced * step <= now) { producedAt.push(now); tmuxRing.push(produced++); if (tmuxRing.length > 4500) tmuxRing.shift(); }
+    let n = 0;
+    while (applied < produced && producedAt[applied]! + o.lagMs <= now) {
+      parser.push({ id: applied, lineId: applied }); applied++; n++; revision++;
+      if (parser.length > 4500) parser.shift();
+    }
+    if (n) calibrator.scroll(n);
+    if (pending && now >= pending.at) { const p = pending; pending = undefined; (st as any).snap = p.snap; p.resolve(p.value); inFlight = false; await new Promise(r => setImmediate(r)); }
+    if (!inFlight && now >= calibrator.dueAt + (o.lateMs ?? 0)) { void calibrator.runDue(); await new Promise(r => setImmediate(r)); }
+  }
+  // Coverage over every produced row except the final 128 still in overlap.
+  const eligible = Math.max(0, produced - 128);
+  let covered = 0; for (let id = 0; id < eligible; id++) if (st.verified.has(id)) covered++;
+  return { produced, coverage: eligible ? covered / eligible : 0, checks: st.checks, checksWhileFlowing: st.checksWhileFlowing, falseChecked: st.falseChecked,
+    identityFalse: st.identityFalse, commits: st.commits, staleRevision: st.staleRevision, fullCaptures: st.limits.filter(l => l === 4500).length, screenOnly: st.limits.filter(l => l === 0).length, captures: st.limits.length };
+}
+
+test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser ahead of the capture', async () => {
+  for (const incremental of [false, true]) {
+    for (const lagMs of [5, 300]) {
+      const r = await debtFlow({ incremental, seconds: 60, rate: 100, lagMs, captureMs: 40 });
+      console.log('NEWARCH_DEBT1_FLOW', JSON.stringify({ incremental, lagMs, ...r, scope: 'real HistoryCalibrator; fake clock/ports; parser trails tmux, read after capture' }));
+      expect(r.produced).toBe(6000);
+      // Round 2 measured 0 checks while flowing and 49.3% coverage here.
+      expect(r.checksWhileFlowing).toBeGreaterThan(r.produced);
+      expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+      expect(r.falseChecked).toBe(0);
+      expect(r.identityFalse).toBe(0);
+      // agy round 1: the CAS revision is the post-capture one, so revision
+      // bumps during capture never starve the commit.
+      expect(r.staleRevision).toBe(0);
+      expect(r.commits).toBe(r.captures);
+      // PIPE mode: one history capture per 200ms, no screen-only capture in
+      // between (output during a capture used to re-arm it 50ms later).
+      expect(r.screenOnly).toBe(0);
+      expect(r.captures).toBeGreaterThanOrEqual(290);
+    }
+  }
+});
+
+test('DEBT 3 host lateness below one period does not stretch the 200ms cadence', async () => {
+  // The benchmark host starts captures ~20ms late (shared event loop). Each
+  // late start used to become the next anchor: 230ms cycles, 260/min.
+  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, lateMs: 30 });
+  console.log('NEWARCH_DEBT3_LATE_HOST', JSON.stringify(r));
+  expect(r.captures).toBeGreaterThanOrEqual(295);
+  expect(r.screenOnly).toBe(0);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+  expect(r.falseChecked).toBe(0);
+});
+
+test('DEBT 1 periodic output after the fence never pairs a row with an older copy', async () => {
+  // Text repeats every 3000 rows, so a parser row newer than the capture has
+  // an exact older copy in tmux; the fence plus tail bound must not use it.
+  const r = await debtFlow({ incremental: false, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, text: i => `file-line-${i % 3000}` });
+  console.log('NEWARCH_DEBT1_PERIODIC', JSON.stringify(r));
+  expect(r.identityFalse).toBe(0); expect(r.falseChecked).toBe(0);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+});
+
+test('DEBT 2 a screen-only capture does not erase the incremental seed', async () => {
+  const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, wrongScreen: true });
+  console.log('NEWARCH_DEBT2_CAPTURE_MODE', JSON.stringify(r));
+  // CAPTURE mode puts screen-only captures between the history captures.
+  expect(r.screenOnly).toBeGreaterThan(300);
+  // Seed survives them: only the birth capture (and the first no-history
+  // capture after it) is full; round 2 alternated full/partial ~300 times.
+  expect(r.fullCaptures).toBeLessThanOrEqual(3);
+  expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+  // Direct: history (full) -> screen-only -> incremental history still matched.
+  // A wrong parser screen latches CAPTURE mode and re-arms the lane 50ms
+  // later, before the 200ms history interval: that capture has no history.
+  const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 300), time = 0, revision = 1;
+  const tails: number[] = [], checks: number[] = [];
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  let parserFrame: CalibrationFrame = { ...frame, cells: [naRow('bad ').cells] };
+  const calibrator = new HistoryCalibrator(paneKey, {
+    now: () => time, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame }),
+    capture: async (_, tail) => {
+      tails.push(tail);
+      const history = recent.slice(Math.max(0, recent.length - tail));
+      return { paneKey, captureId: String(tails.length), requestedAt: time, completedAt: time, before: meta, after: meta, frame, history, completeRetainedTail: tail >= recent.length, observedFields: [] };
+    },
+    calibrate: async input => { checks.push(input.checks.length); return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
+    publish: () => {}, fault: () => {},
+  }, { incremental: true });
+  await calibrator.runDue();
+  expect(calibrator.dueAt).toBe(50);
+  expect(calibrator.mode).toBe('CAPTURE');
+  parserFrame = frame;
+  time = 50; await calibrator.runDue();
+  expect(tails).toEqual([4500, 0]);
+  expect(calibrator.mode).toBe('PIPE');
+  recent = all.slice(0, 320); calibrator.scroll(20);
+  time = 250; await calibrator.runDue();
+  // Round 2: the empty screen-only match erased the seed -> partial-tail, 0 checks, then full.
+  expect(tails).toEqual([4500, 0, 148]);
+  expect(checks.at(-1)).toBe(148);
+});
+
+test('DEBT 3 a failed capture keeps the incremental seed instead of forcing a full capture', async () => {
+  // Under ptrace a 21-pane batch passed the 1s capture deadline; each fault
+  // forced a 4500-row capture, which timed out again (cage: 230 faults, 7
+  // history captures per pane per minute). The seed stays exact after a fault.
+  const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 300), time = 0, revision = 1, fail = false;
+  const tails: number[] = [], checks: number[] = [], faults: string[] = [];
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  const calibrator = new HistoryCalibrator(paneKey, {
+    now: () => time, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame: frame }),
+    capture: async (_, tail) => {
+      tails.push(tail);
+      if (fail) { fail = false; throw new Error('capture deadline exceeded'); }
+      return { paneKey, captureId: String(tails.length), requestedAt: time, completedAt: time, before: meta, after: meta, frame, history: recent.slice(Math.max(0, recent.length - tail)), completeRetainedTail: tail >= recent.length, observedFields: [] };
+    },
+    calibrate: async input => { checks.push(input.checks.length); return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
+    publish: () => {}, fault: f => { faults.push(f.kind); },
+  }, { incremental: true });
+  await calibrator.runDue();
+  recent = all.slice(0, 320); calibrator.scroll(20);
+  fail = true; time = 200; await calibrator.runDue();
+  expect(faults).toEqual(['capture-fault']);
+  expect(calibrator.dueAt).toBe(250);
+  time = 250; await calibrator.runDue();
+  expect(tails).toEqual([4500, 148, 148]);
+  expect(checks.at(-1)).toBe(148);
+});
+
+test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full', async () => {
+  // A plain copy 700 rows back is the only exact match of the parser tail
+  // (the parser lost the colour of the re-print). The bound refuses it.
+  const plain = (k: number) => naRow(`result ${k}`);
+  const red = (k: number) => { const r = naRow(`result ${k}`); return { ...r, cells: r.cells.map(c => ({ ...c, fg: 'index:1' })) }; };
+  const pre = [...Array.from({ length: 300 }, (_, k) => naRow(`pre-${k}`)), ...Array.from({ length: 200 }, (_, k) => plain(k))];
+  const post = [...Array.from({ length: 500 }, (_, k) => naRow(`post-${k}`)), ...Array.from({ length: 200 }, (_, k) => red(k))];
+  const parser = [...post.slice(0, 500), ...Array.from({ length: 200 }, (_, k) => plain(k))].map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
+  expect(matchHistoryRows(parser, [...pre, ...post], naScope).checks).toHaveLength(200); // unbounded: wrong 200
+  const bounded = matchHistoryRows(parser, [...pre, ...post], { ...naScope, maxTailGap: 256 });
+  expect(bounded.reason).toBe('no-anchor'); expect(bounded.checks).toHaveLength(0);
+  // The correct print is still accepted with the same bound.
+  expect(matchHistoryRows(post.map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 })), [...pre, ...post], { ...naScope, maxTailGap: 256 }).checks).toHaveLength(700);
+  // Item 6: an incremental calibrator whose full capture finds no anchor
+  // requests a full capture next time instead of an unseeded partial one.
+  const h = naHarness(true);
+  h.ports.read = () => ({ revision: 1, sourceEpoch: 1, geometryGeneration: 1, recentHistory: naRows(['x', 'y', 'z']), parserFrame: h.frame });
+  h.ports.calibrate = async () => ({ revision: 2, durableRevision: 0, nextLineId: 4 });
+  await h.calibrator.runDue();
+  h.time(10); h.calibrator.scroll(5); h.time(250); await h.calibrator.runDue();
+  expect(h.limits).toEqual([4500, 4500]);
+});
+
+// DEBT2: independent reproduction from the round-3 grok review.
+import { decodeTmuxCaptureRows } from "../src/tmux-capture-normalize";
+import type { CaptureMetadata } from "../src/history-calibrator";
+const privateEnv = { ...process.env };
+delete privateEnv.TMUX;
+delete privateEnv.TMUX_PANE;
+
+const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+const tmux = (socket: string, args: string[]) => {
+  const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: privateEnv });
+  if (result.status !== 0) throw new Error(`tmux ${args[0]} exit=${result.status}: ${result.stderr}`);
+  return result.stdout;
+};
+
+type Disrupt =
+  | 'none'
+  | 'resize-before'
+  | 'resize-between'
+  | 'resize-event'
+  | 'clear-before'
+  | 'clear-between'
+  | 'alt-before'
+  | 'alt-sandwich'
+  | 'pipe-before'
+  | 'pipe-between'
+  | 'clear-reprint-before'
+  | 'clear-event'
+  | 'flow-during'
+  | 'evict-during'
+  | 'reflow-before';
+
+const producerPy = [
+  'import sys, os, time',
+  'cmd, ack, dump = sys.argv[1:]',
+  'def note(s):',
+  '    open(ack, "w").write(s); sys.stdout.flush()',
+  'end = time.monotonic() + 40',
+  'while time.monotonic() < end:',
+  '    if os.path.exists(cmd):',
+  '        c = open(cmd).read().strip(); os.remove(cmd)',
+  '        if c == "alt":',
+  '            sys.stdout.write("\\033[?1049h"); note("alt")',
+  '        elif c == "alt-off":',
+  '            sys.stdout.write("\\033[?1049l"); note("alt-off")',
+  '        elif c == "dump":',
+  '            sys.stdout.write(open(dump).read()); note("dump")',
+  '        elif c == "quit":',
+  '            note("quit"); break',
+  '        else:',
+  '            note("bad:"+c)',
+  '    else:',
+  '        time.sleep(0.01)',
+].join('\n');
+
+function cellsOf(text: string, cols: number): HistoryRow['cells'] {
+  return decodeTmuxCaptureRows(text, cols)[0]!;
+}
+
+async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number; rows: number; historyLimit: number; seed: string[]; reprint?: string[]; resizeTo?: [number, number]; freezeWidth?: boolean }) {
+  const root = mkdtempSync(join(tmpdir(), 'l2cr3g-'));
+  const socket = join(root, 'tmux.sock');
+  const pipe = join(root, 'pane.pipe');
+  const cmd = join(root, 'cmd');
+  const ack = join(root, 'ack');
+  const dump = join(root, 'dump');
+  writeFileSync(pipe, '');
+  writeFileSync(join(root, 'tmux.conf'), `set -g history-limit ${opts.historyLimit}\nset -g status off\n`);
+  writeFileSync(join(root, 'producer.py'), producerPy);
+  writeFileSync(dump, '');
+  const signal = (c: string) => {
+    writeFileSync(cmd, c);
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      if (existsSync(ack) && readFileSync(ack, 'utf8').trim() === c) return;
+      spawnSync('sleep', ['0.01']);
+    }
+    throw new Error(`producer did not ack ${c}`);
+  };
+  let paneId = '';
+  let fd = -1;
+  const stats = {
+    name, disrupt, contentFalse: 0, checks: 0, repairs: 0, reason: '', commits: 0, unstable: 0,
+    fenceRows: 0, fenceMissing: 0, historyRows: 0, samples: [] as unknown[],
+    certifiedCleared: 0, clearedLineIds: 0, faults: [] as string[],
+    altEngaged: undefined as boolean | undefined, altReleased: undefined as boolean | undefined,
+  };
+  const clearedIds = new Set<number>();
+  try {
+    const py = join(root, 'producer.py');
+    paneId = tmux(socket, ['-f', join(root, 'tmux.conf'), 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'p0', '-x', String(opts.cols), '-y', String(opts.rows), `exec python3 -u ${quote(py)} ${quote(cmd)} ${quote(ack)} ${quote(dump)}`]).trim();
+    tmux(socket, ['set-option', '-p', '-t', paneId, '@l2c-history-epoch', '1']);
+    tmux(socket, ['pipe-pane', '-t', paneId, `exec cat >> ${quote(pipe)}`]);
+    const seed = opts.seed.join('\n') + '\n';
+    writeFileSync(dump, seed);
+    signal('dump');
+    spawnSync('sleep', ['0.15']);
+    fd = openSync(pipe, 'r');
+    const lines: string[] = [];
+    let offset = 0, partial = '';
+    const buffer = Buffer.alloc(1 << 20);
+    const poll = () => {
+      let text = '';
+      for (;;) {
+        const n = readSync(fd, buffer, 0, buffer.length, offset);
+        if (n <= 0) break;
+        offset += n; text += buffer.toString('latin1', 0, n);
+        if (n < buffer.length) break;
+      }
+      if (!text) return;
+      text = partial + text;
+      const cut = text.lastIndexOf('\n');
+      partial = text.slice(cut + 1);
+      for (const raw of text.slice(0, cut + 1).split('\n')) {
+        const line = raw.replace(/\r$/, '');
+        if (line.length) lines.push(line);
+      }
+    };
+    poll();
+    const pane = { cols: opts.cols, rows: opts.rows, revision: 1 };
+    let fenceIds: number[] = [];
+    let sawClear = false;
+    const modelCols = () => opts.freezeWidth ? opts.cols : pane.cols;
+    const modelRow = (id: number): HistoryRow => ({
+      lineId: id, sourceEpoch: 1, geometryGeneration: 1, softWrap: false,
+      cells: cellsOf(lines[id]!, modelCols()),
+    });
+    // Same screen exclusion as the benchmark host: last history id is count-rows.
+    const recentOf = (): HistoryRow[] => {
+      const end = lines.length - pane.rows + 1;
+      const start = Math.max(0, end - opts.historyLimit);
+      const out: HistoryRow[] = [];
+      for (let id = start; id < end; id++) out.push(modelRow(id));
+      return out;
+    };
+    const label = (text: string) => text.replace(/\s+$/, '').slice(0, 40);
+    let disrupted = false;
+
+    let calibrator!: HistoryCalibrator;
+    const resize = () => {
+      const [x, y] = opts.resizeTo ?? [40, 12];
+      tmux(socket, ['resize-window', '-t', 'p0', '-x', String(x), '-y', String(y)]);
+      pane.cols = x; pane.rows = y;
+    };
+    const altOn = () => tmux(socket, ['display-message', '-p', '-t', paneId, '#{alternate_on}']).trim() === '1';
+    const waitAlt = (want: boolean) => {
+      const until = Date.now() + 2000;
+      while (Date.now() < until) {
+        if (altOn() === want) return true;
+        spawnSync('sleep', ['0.02']);
+      }
+      return false;
+    };
+    const doDisrupt = (where: 'before' | 'between') => {
+      const want = !disrupted && (disrupt.endsWith(where) || (disrupt === 'resize-event' && where === 'before') || (disrupt === 'clear-reprint-before' && where === 'before') || (disrupt === 'alt-sandwich' && where === 'between') || (disrupt === 'flow-during' && where === 'before') || (disrupt === 'evict-during' && where === 'before') || (disrupt === 'reflow-before' && where === 'before') || (disrupt === 'clear-event' && where === 'before'));
+      if (!want) return;
+      disrupted = true;
+      if (disrupt.startsWith('resize') || disrupt === 'reflow-before') resize();
+      if (disrupt === 'resize-event') calibrator.event('resize');
+      if (disrupt.startsWith('clear') || disrupt === 'clear-event') {
+        const end = lines.length - pane.rows + 1;
+        for (let id = 0; id < end; id++) clearedIds.add(id);
+        sawClear = true;
+        // The private history owner rotates its epoch in the same command queue.
+        // tmux 3.4 has no after-clear-history hook: production must mediate
+        // resets or leave the authoritative epoch unavailable (fail closed).
+        tmux(socket, ['set-option', '-p', '-t', paneId, '@l2c-history-epoch', '2', ';', 'clear-history', '-t', paneId]);
+      }
+      if (disrupt === 'clear-event') calibrator.event('clear');
+      if ((disrupt === 'clear-reprint-before' || disrupt === 'clear-event' || disrupt === 'flow-during' || disrupt === 'evict-during') && opts.reprint) {
+        writeFileSync(dump, opts.reprint.join('\n') + '\n');
+        signal('dump');
+        spawnSync('sleep', ['0.15']);
+        poll();
+      }
+      if (disrupt === 'alt-before' || disrupt === 'alt-sandwich') {
+        signal('alt');
+        stats.altEngaged = waitAlt(true);
+      }
+      if (disrupt.startsWith('pipe')) tmux(socket, ['pipe-pane', '-t', paneId]);
+    };
+    const metaOf = (fields: string): CaptureMetadata => {
+      const [w, h, x, y, alt, historyEpoch] = fields.split(' ').map(Number);
+      return { historyEpoch: historyEpoch!, sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
+    };
+    const ports: CalibrationPorts = {
+      now: () => performance.now(),
+      schedule: () => {},
+      read: () => {
+        poll();
+        const recentHistory = recentOf();
+        fenceIds = recentHistory.map(r => r.lineId);
+        return {
+          revision: pane.revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory,
+          parserFrame: { cells: [], cursor: { x: 0, y: pane.rows - 1, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: -1 },
+        };
+      },
+      capture: () => {
+        doDisrupt('before');
+        const format = '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{@l2c-history-epoch}';
+        const beforeText = tmux(socket, ['display-message', '-p', '-t', paneId, format]).trim();
+        doDisrupt('between');
+        const body = tmux(socket, ['capture-pane', '-p', '-e', '-N', '-t', paneId, '-S', '-4500']);
+        if (disrupt === 'alt-sandwich') { signal('alt-off'); stats.altReleased = waitAlt(false); }
+        const afterText = tmux(socket, ['display-message', '-p', '-t', paneId, format]).trim();
+        const before = metaOf(beforeText), after = metaOf(afterText);
+        const decoded = decodeTmuxCaptureRows(body, after.cols);
+        const screen = decoded.slice(Math.max(0, decoded.length - after.rows));
+        const history = decoded.slice(0, decoded.length - screen.length).map(cells => ({ cells, softWrap: false as const }));
+        const rawLines = body.split('\n');
+        if (rawLines.at(-1) === '') rawLines.pop();
+        const histText = rawLines.slice(0, Math.max(0, rawLines.length - after.rows));
+        const frame: CalibrationFrame = { cells: screen, cursor: after.cursor, kind: after.kind, geometryGeneration: 1, receiveSeq: -1 };
+        const capture: CalibrationCapture = {
+          paneKey: { serverIdentity: socket, paneId, birthGeneration: 1 }, captureId: name, requestedAt: performance.now(), completedAt: performance.now(),
+          before, after, frame, history, completeRetainedTail: history.length < 4500, observedFields: ['cells'],
+        };
+        const recent = recentOf();
+        const capLabels = new Set(histText.map(label));
+        stats.fenceRows = fenceIds.length;
+        stats.historyRows = history.length;
+        stats.fenceMissing = fenceIds.filter(id => lines[id] && !capLabels.has(label(lines[id]!))).length;
+        (capture as CalibrationCapture & { histText: string[] }).histText = histText;
+        stats.clearedLineIds = clearedIds.size;
+        (stats as { histTail?: string[] }).histTail = histText.slice(-6);
+        void recent;
+        return Promise.resolve(capture);
+      },
+      calibrate: async input => {
+        const cap = input.capture as CalibrationCapture & { histText?: string[] };
+        let contentFalse = 0, certifiedCleared = 0;
+        for (const check of input.checks) {
+          const captured = input.capture.history[check.capturedRow];
+          const model = lines[check.lineId] ? { softWrap: false, cells: cellsOf(lines[check.lineId]!, modelCols()) } : undefined;
+          const same = !!captured && !!model && equalHistoryRows(model, captured);
+          if (!same) contentFalse++;
+          if (clearedIds.has(check.lineId)) certifiedCleared++;
+          if (stats.samples.length < 4 && (!same || clearedIds.has(check.lineId))) {
+            stats.samples.push({
+              lineId: check.lineId, capturedRow: check.capturedRow, same,
+              model: lines[check.lineId]?.slice(0, 40),
+              captured: cap.histText?.[check.capturedRow]?.slice(0, 40),
+              cleared: clearedIds.has(check.lineId),
+            });
+          }
+        }
+        stats.contentFalse += contentFalse;
+        stats.certifiedCleared += certifiedCleared;
+        stats.checks += input.checks.length;
+        stats.repairs += input.repairs.length;
+        stats.commits++;
+        pane.revision++;
+        return { revision: pane.revision, durableRevision: 0, nextLineId: lines.length };
+      },
+      publish: () => {},
+      fault: issue => { stats.faults.push(issue.kind); },
+    };
+    calibrator = new HistoryCalibrator({ serverIdentity: socket, paneId, birthGeneration: 1 }, ports, { incremental: true, historyLimit: 4500 });
+    const deadline = performance.now() + 2000;
+    while (performance.now() < deadline && performance.now() + 1 < calibrator.dueAt) spawnSync('sleep', ['0.02']);
+    await calibrator.runDue();
+    if (stats.commits < 1) stats.unstable++;
+    if (disrupt === 'clear-reprint-before' && stats.commits) {
+      (stats as any).first = { checks: stats.checks, contentFalse: stats.contentFalse, certifiedCleared: stats.certifiedCleared, fenceRows: stats.fenceRows, fenceMissing: stats.fenceMissing, historyRows: stats.historyRows, commits: stats.commits };
+      const mark = { checks: stats.checks, contentFalse: stats.contentFalse, commits: stats.commits, certifiedCleared: stats.certifiedCleared };
+      const follow = Array.from({ length: 36 }, (_, i) => `after-${String(i).padStart(4, '0')}-NOT-THE-OLD-ROW`);
+      writeFileSync(dump, follow.join('\n') + '\n');
+      signal('dump');
+      spawnSync('sleep', ['0.15']);
+      poll();
+      calibrator.scroll(follow.length);
+      const until = performance.now() + 3000;
+      while (performance.now() < until && performance.now() + 1 < calibrator.dueAt) spawnSync('sleep', ['0.02']);
+      await calibrator.runDue();
+      (stats as any).followup = {
+        commits: stats.commits - mark.commits,
+        checks: stats.checks - mark.checks,
+        contentFalse: stats.contentFalse - mark.contentFalse,
+        certifiedCleared: stats.certifiedCleared - mark.certifiedCleared,
+      };
+    }
+    // reason is not returned; recover it by looking at whether checks happened
+    stats.reason = stats.commits ? (stats.checks ? 'committed-with-checks' : 'committed-no-checks') : (stats.faults.length ? 'fault' : 'no-commit');
+    void sawClear;
+    return stats;
+  } finally {
+    try { if (fd >= 0) closeSync(fd); } catch {}
+    spawnSync('tmux', ['-S', socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+
+test('DEBT2 clear-history then reprint the same tail must certify no deleted identities', async () => {
+  const sig = Array.from({ length: 8 }, (_, i) => `sig-${i}-UNIQUE-TAIL`);
+  const screen = Array.from({ length: 24 }, (_, i) => `screen-A-${i}`);
+  const result = await runScenario('clear-reprint', 'clear-reprint-before', {
+    cols: 80, rows: 24, historyLimit: 2000,
+    seed: [...Array.from({ length: 40 }, (_, i) => `fill-${i}`), ...sig, ...screen],
+    reprint: [...sig, ...screen],
+  });
+  console.log('DEBT2_REAL_CLEAR', JSON.stringify(result));
+  expect(result.faults).toEqual([]);
+  expect(result.clearedLineIds).toBe(49);
+  expect(result.certifiedCleared).toBe(0);
+  expect(result.commits).toBe(0);
+}, 15000);
+
+test('DEBT2 missing, changed and invalid history epochs fail closed; valid epoch recovers', async () => {
+  for (const epoch of [undefined, NaN, Infinity, -1, 1.5, 2]) {
+    const h = naHarness(true);
+    const capture = h.ports.capture;
+    h.ports.capture = async (...args) => {
+      const c = await capture(...args);
+      return { ...c, before: { ...c.before, historyEpoch: epoch as number }, after: { ...c.after, historyEpoch: epoch as number } };
+    };
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(0);
+    h.ports.capture = capture;
+    h.time(1000); await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]!.checks).toHaveLength(3);
+    expect(h.limits).toEqual([4500, 4500]);
+  }
+  const h = naHarness(true);
+  const capture = h.ports.capture;
+  h.ports.capture = async (...args) => {
+    const c = await capture(...args);
+    return { ...c, after: { ...c.after, historyEpoch: 2 } };
+  };
+  await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(0);
+});
+
+test('DEBT2 source reset across the fence discards capture then resumes in the new epoch', async () => {
+  const h = naHarness(true);
+  const read = h.ports.read, capture = h.ports.capture;
+  let epoch = 1;
+  h.ports.read = () => {
+    const snapshot = read();
+    return { ...snapshot, sourceEpoch: epoch,
+      recentHistory: snapshot.recentHistory.map(row => ({ ...row, sourceEpoch: epoch })) };
+  };
+  h.ports.capture = async (...args) => {
+    const c = await capture(...args);
+    epoch = 2;
+    const meta = { ...c.after, sourceEpoch: epoch, historyEpoch: epoch };
+    return { ...c, before: meta, after: meta };
+  };
+  await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(0);
+  h.time(1000); await h.calibrator.runDue();
+  expect(h.writes).toHaveLength(1);
+  expect(h.writes[0]!.checks).toHaveLength(3);
+  expect(h.limits).toEqual([4500, 4500]);
 });
