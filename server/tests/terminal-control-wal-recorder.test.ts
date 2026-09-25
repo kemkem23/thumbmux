@@ -1414,7 +1414,6 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
     const py = join(root, 'producer.py');
     paneId = tmux(socket, ['-f', join(root, 'tmux.conf'), 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'p0', '-x', String(opts.cols), '-y', String(opts.rows), `exec python3 -u ${quote(py)} ${quote(cmd)} ${quote(ack)} ${quote(dump)}`]).trim();
     tmux(socket, ['set-option', '-p', '-t', paneId, '@l2c-history-epoch', '1']);
-    tmux(socket, ['set-hook', '-t', 'p0', 'after-clear-history', 'set-option -p @l2c-history-epoch 2']);
     tmux(socket, ['pipe-pane', '-t', paneId, `exec cat >> ${quote(pipe)}`]);
     const seed = opts.seed.join('\n') + '\n';
     writeFileSync(dump, seed);
@@ -1486,7 +1485,10 @@ async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number;
         const end = lines.length - pane.rows + 1;
         for (let id = 0; id < end; id++) clearedIds.add(id);
         sawClear = true;
-        tmux(socket, ['clear-history', '-t', paneId]);
+        // The private history owner rotates its epoch in the same command queue.
+        // tmux 3.4 has no after-clear-history hook: production must mediate
+        // resets or leave the authoritative epoch unavailable (fail closed).
+        tmux(socket, ['set-option', '-p', '-t', paneId, '@l2c-history-epoch', '2', ';', 'clear-history', '-t', paneId]);
       }
       if (disrupt === 'clear-event') calibrator.event('clear');
       if ((disrupt === 'clear-reprint-before' || disrupt === 'clear-event' || disrupt === 'flow-during' || disrupt === 'evict-during') && opts.reprint) {
