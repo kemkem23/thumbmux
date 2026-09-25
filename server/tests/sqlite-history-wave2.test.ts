@@ -560,6 +560,41 @@ test('newarch DEBT2: queued frames of one pane coalesce to the latest and releas
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
+test('newarch D11: a malformed frame landing on a queued frame is refused alone; the queued frame stays durable',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-d11-coalesce-'));
+ let s=createProjectionStore({historyRoot:root,mode:'create'});const internal=s as any;
+ clearInterval(internal.timer); // explicit flushes only, so the queue shape and pending bytes are exact
+ const key={serverIdentity:'d11',paneId:'%1',birthGeneration:1};
+ const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ const good={paneKey:key,sourceEpoch:2,geometryGeneration:1,receiveSeq:2,cols:80,rows:24,kind:'normal' as const,cells:textFrame(cell,80,24,7,false),cursor:null};
+ const bad=[
+  {...good,receiveSeq:3,cells:good.cells.slice(0,23)},                      // rows != cells.length
+  {...good,receiveSeq:4,cursor:{row:24,col:0,visible:true}},                 // cursor outside the frame
+ ];
+ const out:any={};
+ try {
+  // The source-epoch transition queues the good frame behind a row, so later frames take the coalesce path.
+  const r=s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'r1',cells:[]}});
+  const kept=s.replaceScreen(good);
+  const q=[...internal.queues.values()][0];expect(q.length).toBe(2);
+  const pendingBefore=internal.pendingBytes(),tailBytes=q[1].bytes;
+  out.refusals=[];
+  for(const f of bad){try{await s.replaceScreen(f);out.refusals.push('accepted');}catch(error){out.refusals.push(String(error));}}
+  // Refused synchronously, before the queued tail or any reservation moved.
+  expect(out.refusals).toEqual(['Error: invalid-frame','Error: invalid-cursor']);
+  expect(q[1].bytes).toBe(tailBytes);expect(internal.pendingBytes()).toBe(pendingBefore);
+  await r;out.goodReceipt=await kept.then(()=>'resolved',e=>String(e));
+  expect(out.goodReceipt).toBe('resolved');
+  s.flush();expect(s.health().pendingBytes).toBe(0);expect(internal.pendingByPane.size).toBe(0);
+  await s.close();
+  s=createProjectionStore({historyRoot:root,mode:'recover'});
+  const shown=JSON.parse(String(s.screen(key)!.cells_json));
+  out.durableRows=shown.length;out.durableLastCell=shown[23][79].grapheme;
+  expect(shown).toHaveLength(24);expect(shown[23][79].grapheme).toBe(good.cells[23][79].grapheme);
+  console.log('NA_D11_COALESCE_VALIDATE',JSON.stringify(out));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
 test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episode, store never stopped',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-debt2-hot-'));
  const s=createProjectionStore({historyRoot:root,mode:'create'});
