@@ -29,12 +29,21 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       const privateEnv = { ...process.env };
       delete privateEnv.TMUX; delete privateEnv.TMUX_PANE;
       const modelCache = new Map<string, HistoryRow>();
+      // Oracle cells are interned here, apart from the decoder under test: one
+      // object per cell for ~11k rows x 2 widths was ~2.2M live objects and,
+      // with the 3 GB cage also holding the repo snapshot, stalled full mode.
+      const oracleCells = new Map<string, HistoryRow['cells'][number]>();
+      const oracleCell = (cell: HistoryRow['cells'][number]) => {
+        const key = JSON.stringify(cell);
+        const old = oracleCells.get(key); if (old) return old;
+        oracleCells.set(key, cell); return cell;
+      };
       const modelRow = (id: number, cols: number): HistoryRow => {
         const key = `${cols}/${id}`;
         const old = modelCache.get(key); if (old) return old;
         const raw = id < 0 ? `seed-${String(id + 5000).padStart(6, '0')} ไทย 你 😀`
           : `\x1b[${31 + id % 7}mrow-${String(id).padStart(8, '0')} ไทย 你 😀\x1b[0m`;
-        const row = { lineId: id, sourceEpoch: 1, geometryGeneration: 1, softWrap: false, cells: decodeTmuxCaptureRows(raw, cols)[0]! };
+        const row = { lineId: id, sourceEpoch: 1, geometryGeneration: 1, softWrap: false, cells: decodeTmuxCaptureRows(raw, cols)[0]!.map(oracleCell) };
         modelCache.set(key, row); return row;
       };
       const states = new Map<string, { matcher: IncrementalHistoryMatcher; decoder: TmuxCaptureDecoder; ring: HistoryRow[]; ringEnd: number; checked: Set<number>; start: number; last: number; capturedEnd: number; full: boolean }>();
@@ -109,11 +118,13 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         await new Promise(resolve => setTimeout(resolve, 500));
         const hz = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim());
         expect(hz).toBeGreaterThan(0);
+        // Decoder memo sized to history-limit 4500 plus one pass of new rows;
+        // the 9000 default kept rows that had already left tmux history.
         for (const c of configs) {
           c.ticks = procTicks(c.pid).own;
           for (let i = 0; i < c.panes.length; i++) {
             const count = Number(readFileSync(c.sidecars[i]!, 'utf8'));
-            states.set(`${c.socket}/${i}`, { matcher: new IncrementalHistoryMatcher(), decoder: new TmuxCaptureDecoder(c.cols), ring: [], ringEnd: 0, checked: new Set(), start: count - c.rows + 1, last: count, capturedEnd: count - c.rows + 1, full: true });
+            states.set(`${c.socket}/${i}`, { matcher: new IncrementalHistoryMatcher(), decoder: new TmuxCaptureDecoder(c.cols, 5000), ring: [], ringEnd: 0, checked: new Set(), start: count - c.rows + 1, last: count, capturedEnd: count - c.rows + 1, full: true });
           }
           c.producedBefore = c.sidecars.reduce((sum, path) => sum + Number(readFileSync(path, 'utf8')), 0);
         }
