@@ -268,14 +268,32 @@ function escapesCloseInLine(line: string): boolean {
 // cells leave one pointer per column. The table only bounds sharing: clearing
 // it never changes a decoded value.
 const CELL_INTERN_LIMIT = 65536;
-const internedCells = new Map<string, Readonly<TmuxObservedCell>>();
+// Two levels: SGR state, then (width, continuation) slot keyed by grapheme.
+// Runs of cells share one state, so the last bucket is reused without
+// building any key per cell (a six-part key per cell was ~24% of benchmark CPU).
+type InternBucket = Map<string, Readonly<TmuxObservedCell>>[];
+const internedCells = new Map<string, InternBucket>();
+let internedCount = 0;
+let lastFg = '', lastBg = '', lastStyle = -1;
+let lastBucket: InternBucket | undefined;
 function internCell(cell: TmuxObservedCell): Readonly<TmuxObservedCell> {
-  const key = `${cell.grapheme}\u0000${cell.width}${cell.continuation ? 1 : 0}\u0000${cell.fg}\u0000${cell.bg}\u0000${cell.style}`;
-  let shared = internedCells.get(key);
+  if (!lastBucket || cell.fg !== lastFg || cell.bg !== lastBg || cell.style !== lastStyle) {
+    const style = `${cell.fg}\u0000${cell.bg}\u0000${cell.style}`;
+    lastBucket = internedCells.get(style);
+    if (!lastBucket) { lastBucket = [new Map(), new Map(), new Map(), new Map(), new Map(), new Map()]; internedCells.set(style, lastBucket); }
+    lastFg = cell.fg; lastBg = cell.bg; lastStyle = cell.style;
+  }
+  const slot = lastBucket[cell.width * 2 + (cell.continuation ? 1 : 0)]!;
+  let shared = slot.get(cell.grapheme);
   if (!shared) {
-    if (internedCells.size >= CELL_INTERN_LIMIT) internedCells.clear();
+    if (internedCount >= CELL_INTERN_LIMIT) {
+      // Bounding only: drop every bucket, keep this state's (now empty) one.
+      internedCells.clear(); internedCount = 0;
+      for (const map of lastBucket) map.clear();
+      internedCells.set(`${cell.fg}\u0000${cell.bg}\u0000${cell.style}`, lastBucket);
+    }
     shared = Object.freeze(cell);
-    internedCells.set(key, shared);
+    slot.set(cell.grapheme, shared); internedCount++;
   }
   return shared;
 }
