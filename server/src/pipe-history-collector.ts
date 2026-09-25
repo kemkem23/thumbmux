@@ -265,7 +265,6 @@ export class PipeHistoryCollector {
   setScrollOnClear(enabled: boolean): void {
     this.scrollOnClear = enabled;
     if (!this.worker.setScrollOnClear(enabled)) this.fault("worker-error", "clear policy admission failed", "broken");
-    else this.policyUnverified = false;
   }
 
   currentSourceEpoch(): number {
@@ -368,7 +367,7 @@ export class PipeHistoryCollector {
         await this.worker.start();
         if (this.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.scrollOnClear);
         this.worker.resize(this.cols, this.rows, this.geometryGeneration);
-        this.healthState = "ok";
+        this.healthState = this.policyUnverified ? "degraded" : "ok";
         this.notifyFault({ kind: "worker-restarted", at: this.now(), message: `parser respawned; source epoch ${this.sourceEpoch}; calibration required` });
       }).catch((error) => {
         this.healthState = "broken";
@@ -449,6 +448,7 @@ export class PipeHistoryCollector {
     }
     this.hostHandleNs += published - began;
     if (this.inflightBytes <= this.queueLimit) {
+      if (this.scrollOnClear !== undefined && update.scrollOnClear === this.scrollOnClear) this.policyUnverified = false;
       if (this.healthState === "degraded" && !this.policyUnverified) this.healthState = "ok";
       for (const waiter of this.drainWaiters.splice(0)) waiter();
     }

@@ -1486,6 +1486,7 @@ test("51 five clears with unknown policy remain explicit faults and recover", as
     expect(pane.collector.workerPid).toBe(pid);
   }
   pane.collector.setScrollOnClear(true);
+  expect(pane.collector.health()).toBe("degraded"); // only a parser receipt restores health
   pane.collector.ingest(encoder.encode("after-five-clears"));
   await settle(pane);
   expect(screenRows(pane).map(row => row.text).join("\n")).toContain("after-five-clears");

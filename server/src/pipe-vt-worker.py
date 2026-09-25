@@ -546,6 +546,7 @@ class Worker:
         encode_ns = time.monotonic_ns() - t
         send(b"U", {
             "epoch": s.epoch,
+            "scrollOnClear": s.scroll_on_clear,
             "seqFrom": self.seq_from,
             "seqTo": self.seq_to if ack else self.emitted_seq,
             "gen": self.gen,

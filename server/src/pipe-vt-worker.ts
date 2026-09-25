@@ -74,6 +74,7 @@ export type PipeVtFrame = {
 
 export type PipeVtUpdate = {
   epoch: number;
+  scrollOnClear: boolean | null;
   seqFrom: number | null;
   seqTo: number | null;
   gen: number;
