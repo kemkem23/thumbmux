@@ -196,7 +196,11 @@ export class HistoryCalibrator {
       this.forceFull = historyDue && match.reason !== 'matched' && match.reason !== 'generation';
       if (historyDue) { this.lastHistoryAt = anchor; this.scrolls = Math.max(0, this.scrolls - requestedScrolls); }
     } catch (error) {
-      this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined;
+      // A failed or timed-out capture observed nothing, so the incremental
+      // seed is still exact and the next tail still covers every unconsumed
+      // scroll. Forcing a full capture here turned one slow capture into a
+      // cascade: 4500-row captures are slower still and time out again.
+      this.mode = 'PIPE'; this.latchAt = undefined;
       this.ports.fault({ kind: 'capture-fault', at: this.ports.now(), missingCount: null });
     } finally {
       this.inFlight = false; this.lastCaptureAt = anchor;

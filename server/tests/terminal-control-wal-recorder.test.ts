@@ -1269,6 +1269,37 @@ test('DEBT 2 a screen-only capture does not erase the incremental seed', async (
   expect(checks.at(-1)).toBe(148);
 });
 
+test('DEBT 3 a failed capture keeps the incremental seed instead of forcing a full capture', async () => {
+  // Under ptrace a 21-pane batch passed the 1s capture deadline; each fault
+  // forced a 4500-row capture, which timed out again (cage: 230 faults, 7
+  // history captures per pane per minute). The seed stays exact after a fault.
+  const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 300), time = 0, revision = 1, fail = false;
+  const tails: number[] = [], checks: number[] = [], faults: string[] = [];
+  const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+  const meta = { sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+  const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+  const calibrator = new HistoryCalibrator(paneKey, {
+    now: () => time, schedule: () => {},
+    read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory: recent, parserFrame: frame }),
+    capture: async (_, tail) => {
+      tails.push(tail);
+      if (fail) { fail = false; throw new Error('capture deadline exceeded'); }
+      return { paneKey, captureId: String(tails.length), requestedAt: time, completedAt: time, before: meta, after: meta, frame, history: recent.slice(Math.max(0, recent.length - tail)), completeRetainedTail: tail >= recent.length, observedFields: [] };
+    },
+    calibrate: async input => { checks.push(input.checks.length); return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
+    publish: () => {}, fault: f => { faults.push(f.kind); },
+  }, { incremental: true });
+  await calibrator.runDue();
+  recent = all.slice(0, 320); calibrator.scroll(20);
+  fail = true; time = 200; await calibrator.runDue();
+  expect(faults).toEqual(['capture-fault']);
+  expect(calibrator.dueAt).toBe(250);
+  time = 250; await calibrator.runDue();
+  expect(tails).toEqual([4500, 148, 148]);
+  expect(checks.at(-1)).toBe(148);
+});
+
 test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full', async () => {
   // A plain copy 700 rows back is the only exact match of the parser tail
   // (the parser lost the colour of the re-print). The bound refuses it.
