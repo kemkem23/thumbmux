@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { normalizeTmuxCaptureCells } from '../src/tmux-capture-normalize';
+import { normalizeTmuxCaptureCells, TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
 
 describe('tmux capture cell normalization', () => {
   test('removes exactly one VS16 promotion continuation cell', () => {
@@ -151,4 +151,53 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
     spawnSync('tmux', ['-S', socket, 'kill-server'], { env });
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
+  // Expected cells were produced by the FIX1 decoder (Segmenter over every
+  // run). They pin the ASCII/non-ASCII island boundary: combining marks,
+  // Prepend, ZWJ and regional indicators must join the ASCII unit beside them.
+  const pinned: Array<[string, Array<[string, number]>]> = [
+    ['ae\u0301b', [['a', 1], ['e\u0301', 1], ['b', 1]]],
+    ['\u0600ab', [['\u0600a', 2], ['', 0], ['b', 1]]],
+    ['x\u{1f1f9}\u{1f1ed}\u{1f1f9}y', [['x', 1], ['\u{1f1f9}\u{1f1ed}', 2], ['', 0], ['\u{1f1f9}', 2], ['', 0], ['y', 1]]],
+    ['a\u200db', [['a\u200d', 1], ['b', 1]]],
+    ['ไทย น้ำ', [['ไ', 1], ['ท', 1], ['ย', 1], [' ', 1], ['น้', 1], ['ำ', 1]]],
+    ['A❤️ B', [['A', 1], ['❤️', 2], ['', 0], ['B', 1]]],
+    ['row-1 你 😀', [['r', 1], ['o', 1], ['w', 1], ['-', 1], ['1', 1], [' ', 1], ['你', 2], ['', 0], [' ', 1], ['😀', 2], ['', 0], [' ', 1]]],
+    ['\u1100\u1161\u11a8z', [['\u1100\u1161\u11a8', 2], ['', 0], ['z', 1]]],
+  ];
+  test('island segmentation matches whole-run segmentation on boundary cases', () => {
+    for (const [text, cells] of pinned) {
+      const row = decodeTmuxCaptureRows(text + '\n', 12)[0]!;
+      expect(row.slice(0, cells.length).map(c => [c.grapheme, c.width])).toEqual(cells);
+      expect(row.slice(cells.length).every(c => c.grapheme === ' ' && c.width === 1)).toBe(true);
+    }
+  });
+  test('memo decoder equals the uncached decoder, cold and warm, and falls back on open escapes', () => {
+    let seed = 99;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const atoms = ['a', ' ', '-', '9', 'ก', 'ั', '่', 'ำ', '你', '😀', '\u200d', '\ufe0f', '❤', 'e', '\u0301', '\u0600', '\u{1f1f9}', '\x1b[31m', '\x1b[0m', '\x1b[4:3m', '\x1b]8;;u\x1b\\', '\x1b[1', '\x1b'];
+    const outcome = (f: () => unknown) => { try { return JSON.stringify(f()); } catch (error) { return `ERR ${(error as Error).message}`; } };
+    let decoded = 0;
+    for (let n = 0; n < 2000; n++) {
+      const lines = Array.from({ length: 1 + Math.floor(rnd() * 3) }, () =>
+        Array.from({ length: Math.floor(rnd() * 12) }, () => atoms[Math.floor(rnd() * atoms.length)]!).join(''));
+      const raw = lines.join('\n') + '\n';
+      const expected = outcome(() => decodeTmuxCaptureRows(raw, 30));
+      const memo = new TmuxCaptureDecoder(30, 3);
+      expect(outcome(() => memo.decode(raw))).toBe(expected);
+      expect(outcome(() => memo.decode(raw))).toBe(expected);
+      if (!expected.startsWith('ERR')) decoded++;
+    }
+    expect(decoded).toBeGreaterThan(200);
+    // An SGR carried across a row boundary is part of the memo key.
+    const memo = new TmuxCaptureDecoder(4);
+    const plain = memo.decode('ab\n');
+    const red = memo.decode('\x1b[31mx\nab\n');
+    expect(plain[0]![0]!.fg).toBe('default');
+    expect(red[1]![0]!.fg).toBe('index:1');
+    expect(memo.decode('ab\n')[0]).toBe(plain[0]!);
+    expect(memo.hits).toBe(1);
+  });
 });
