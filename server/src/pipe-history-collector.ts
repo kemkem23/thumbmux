@@ -40,6 +40,11 @@ export type PipeFrameEvent = {
     full: boolean;
     cols: number;
     rows: number;
+    /**
+     * Apply first: move the previous screen up by this many rows (the
+     * scrolled-out rows already went to onScroll), then patch `dirty`.
+     */
+    shift: number;
     dirty: Record<number, PipeVtRow>;
     softWrap: Record<number, boolean>;
     wrapPad: number[];
@@ -231,6 +236,11 @@ export class PipeHistoryCollector {
     };
   }
 
+  /** Raw receive->frame samples in ms, for pooled percentiles across panes. */
+  latencySamples(): readonly number[] {
+    return this.latencyMs;
+  }
+
   resetLatency(): void {
     this.latencyMs = [];
     this.workerParseNs = 0;
@@ -295,6 +305,7 @@ export class PipeHistoryCollector {
     this.options.ports.onFrame({
       cells: {
         full: update.frame.full,
+        shift: update.frame.shift,
         cols: update.frame.cols,
         rows: update.frame.rows,
         dirty,
