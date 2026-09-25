@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, openSync, readSync, closeSync, existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -1322,3 +1322,308 @@ test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full'
   h.time(10); h.calibrator.scroll(5); h.time(250); await h.calibrator.runDue();
   expect(h.limits).toEqual([4500, 4500]);
 });
+
+// DEBT2: independent reproduction from the round-3 grok review.
+import { decodeTmuxCaptureRows } from "../src/tmux-capture-normalize";
+import type { CaptureMetadata } from "../src/history-calibrator";
+const privateEnv = { ...process.env };
+delete privateEnv.TMUX;
+delete privateEnv.TMUX_PANE;
+
+const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+const tmux = (socket: string, args: string[]) => {
+  const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: privateEnv });
+  if (result.status !== 0) throw new Error(`tmux ${args[0]} exit=${result.status}: ${result.stderr}`);
+  return result.stdout;
+};
+
+type Disrupt =
+  | 'none'
+  | 'resize-before'
+  | 'resize-between'
+  | 'resize-event'
+  | 'clear-before'
+  | 'clear-between'
+  | 'alt-before'
+  | 'alt-sandwich'
+  | 'pipe-before'
+  | 'pipe-between'
+  | 'clear-reprint-before'
+  | 'clear-event'
+  | 'flow-during'
+  | 'evict-during'
+  | 'reflow-before';
+
+const producerPy = [
+  'import sys, os, time',
+  'cmd, ack, dump = sys.argv[1:]',
+  'def note(s):',
+  '    open(ack, "w").write(s); sys.stdout.flush()',
+  'end = time.monotonic() + 40',
+  'while time.monotonic() < end:',
+  '    if os.path.exists(cmd):',
+  '        c = open(cmd).read().strip(); os.remove(cmd)',
+  '        if c == "alt":',
+  '            sys.stdout.write("\\033[?1049h"); note("alt")',
+  '        elif c == "alt-off":',
+  '            sys.stdout.write("\\033[?1049l"); note("alt-off")',
+  '        elif c == "dump":',
+  '            sys.stdout.write(open(dump).read()); note("dump")',
+  '        elif c == "quit":',
+  '            note("quit"); break',
+  '        else:',
+  '            note("bad:"+c)',
+  '    else:',
+  '        time.sleep(0.01)',
+].join('\n');
+
+function cellsOf(text: string, cols: number): HistoryRow['cells'] {
+  return decodeTmuxCaptureRows(text, cols)[0]!;
+}
+
+async function runScenario(name: string, disrupt: Disrupt, opts: { cols: number; rows: number; historyLimit: number; seed: string[]; reprint?: string[]; resizeTo?: [number, number]; freezeWidth?: boolean }) {
+  const root = mkdtempSync(join(tmpdir(), 'l2cr3g-'));
+  const socket = join(root, 'tmux.sock');
+  const pipe = join(root, 'pane.pipe');
+  const cmd = join(root, 'cmd');
+  const ack = join(root, 'ack');
+  const dump = join(root, 'dump');
+  writeFileSync(pipe, '');
+  writeFileSync(join(root, 'tmux.conf'), `set -g history-limit ${opts.historyLimit}\nset -g status off\n`);
+  writeFileSync(join(root, 'producer.py'), producerPy);
+  writeFileSync(dump, '');
+  const signal = (c: string) => {
+    writeFileSync(cmd, c);
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      if (existsSync(ack) && readFileSync(ack, 'utf8').trim() === c) return;
+      spawnSync('sleep', ['0.01']);
+    }
+    throw new Error(`producer did not ack ${c}`);
+  };
+  let paneId = '';
+  let fd = -1;
+  const stats = {
+    name, disrupt, contentFalse: 0, checks: 0, repairs: 0, reason: '', commits: 0, unstable: 0,
+    fenceRows: 0, fenceMissing: 0, historyRows: 0, samples: [] as unknown[],
+    certifiedCleared: 0, clearedLineIds: 0, faults: [] as string[],
+    altEngaged: undefined as boolean | undefined, altReleased: undefined as boolean | undefined,
+  };
+  const clearedIds = new Set<number>();
+  try {
+    const py = join(root, 'producer.py');
+    paneId = tmux(socket, ['-f', join(root, 'tmux.conf'), 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'p0', '-x', String(opts.cols), '-y', String(opts.rows), `exec python3 -u ${quote(py)} ${quote(cmd)} ${quote(ack)} ${quote(dump)}`]).trim();
+    tmux(socket, ['set-option', '-p', '-t', paneId, '@l2c-history-epoch', '1']);
+    tmux(socket, ['set-hook', '-t', 'p0', 'after-clear-history', 'set-option -p @l2c-history-epoch 2']);
+    tmux(socket, ['pipe-pane', '-t', paneId, `exec cat >> ${quote(pipe)}`]);
+    const seed = opts.seed.join('\n') + '\n';
+    writeFileSync(dump, seed);
+    signal('dump');
+    spawnSync('sleep', ['0.15']);
+    fd = openSync(pipe, 'r');
+    const lines: string[] = [];
+    let offset = 0, partial = '';
+    const buffer = Buffer.alloc(1 << 20);
+    const poll = () => {
+      let text = '';
+      for (;;) {
+        const n = readSync(fd, buffer, 0, buffer.length, offset);
+        if (n <= 0) break;
+        offset += n; text += buffer.toString('latin1', 0, n);
+        if (n < buffer.length) break;
+      }
+      if (!text) return;
+      text = partial + text;
+      const cut = text.lastIndexOf('\n');
+      partial = text.slice(cut + 1);
+      for (const raw of text.slice(0, cut + 1).split('\n')) {
+        const line = raw.replace(/\r$/, '');
+        if (line.length) lines.push(line);
+      }
+    };
+    poll();
+    const pane = { cols: opts.cols, rows: opts.rows, revision: 1 };
+    let fenceIds: number[] = [];
+    let sawClear = false;
+    const modelCols = () => opts.freezeWidth ? opts.cols : pane.cols;
+    const modelRow = (id: number): HistoryRow => ({
+      lineId: id, sourceEpoch: 1, geometryGeneration: 1, softWrap: false,
+      cells: cellsOf(lines[id]!, modelCols()),
+    });
+    // Same screen exclusion as the benchmark host: last history id is count-rows.
+    const recentOf = (): HistoryRow[] => {
+      const end = lines.length - pane.rows + 1;
+      const start = Math.max(0, end - opts.historyLimit);
+      const out: HistoryRow[] = [];
+      for (let id = start; id < end; id++) out.push(modelRow(id));
+      return out;
+    };
+    const label = (text: string) => text.replace(/\s+$/, '').slice(0, 40);
+    let disrupted = false;
+    
+    let calibrator!: HistoryCalibrator;
+    const resize = () => {
+      const [x, y] = opts.resizeTo ?? [40, 12];
+      tmux(socket, ['resize-window', '-t', 'p0', '-x', String(x), '-y', String(y)]);
+      pane.cols = x; pane.rows = y;
+    };
+    const altOn = () => tmux(socket, ['display-message', '-p', '-t', paneId, '#{alternate_on}']).trim() === '1';
+    const waitAlt = (want: boolean) => {
+      const until = Date.now() + 2000;
+      while (Date.now() < until) {
+        if (altOn() === want) return true;
+        spawnSync('sleep', ['0.02']);
+      }
+      return false;
+    };
+    const doDisrupt = (where: 'before' | 'between') => {
+      const want = !disrupted && (disrupt.endsWith(where) || (disrupt === 'resize-event' && where === 'before') || (disrupt === 'clear-reprint-before' && where === 'before') || (disrupt === 'alt-sandwich' && where === 'between') || (disrupt === 'flow-during' && where === 'before') || (disrupt === 'evict-during' && where === 'before') || (disrupt === 'reflow-before' && where === 'before') || (disrupt === 'clear-event' && where === 'before'));
+      if (!want) return;
+      disrupted = true;
+      if (disrupt.startsWith('resize') || disrupt === 'reflow-before') resize();
+      if (disrupt === 'resize-event') calibrator.event('resize');
+      if (disrupt.startsWith('clear') || disrupt === 'clear-event') {
+        const end = lines.length - pane.rows + 1;
+        for (let id = 0; id < end; id++) clearedIds.add(id);
+        sawClear = true;
+        tmux(socket, ['clear-history', '-t', paneId]);
+      }
+      if (disrupt === 'clear-event') calibrator.event('clear');
+      if ((disrupt === 'clear-reprint-before' || disrupt === 'clear-event' || disrupt === 'flow-during' || disrupt === 'evict-during') && opts.reprint) {
+        writeFileSync(dump, opts.reprint.join('\n') + '\n');
+        signal('dump');
+        spawnSync('sleep', ['0.15']);
+        poll();
+      }
+      if (disrupt === 'alt-before' || disrupt === 'alt-sandwich') {
+        signal('alt');
+        stats.altEngaged = waitAlt(true);
+      }
+      if (disrupt.startsWith('pipe')) tmux(socket, ['pipe-pane', '-t', paneId]);
+    };
+    const metaOf = (fields: string): CaptureMetadata => {
+      const [w, h, x, y, alt, historyEpoch] = fields.split(' ').map(Number);
+      return { historyEpoch: historyEpoch!, sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
+    };
+    const ports: CalibrationPorts = {
+      now: () => performance.now(),
+      schedule: () => {},
+      read: () => {
+        poll();
+        const recentHistory = recentOf();
+        fenceIds = recentHistory.map(r => r.lineId);
+        return {
+          revision: pane.revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory,
+          parserFrame: { cells: [], cursor: { x: 0, y: pane.rows - 1, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: -1 },
+        };
+      },
+      capture: () => {
+        doDisrupt('before');
+        const format = '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{@l2c-history-epoch}';
+        const beforeText = tmux(socket, ['display-message', '-p', '-t', paneId, format]).trim();
+        doDisrupt('between');
+        const body = tmux(socket, ['capture-pane', '-p', '-e', '-N', '-t', paneId, '-S', '-4500']);
+        if (disrupt === 'alt-sandwich') { signal('alt-off'); stats.altReleased = waitAlt(false); }
+        const afterText = tmux(socket, ['display-message', '-p', '-t', paneId, format]).trim();
+        const before = metaOf(beforeText), after = metaOf(afterText);
+        const decoded = decodeTmuxCaptureRows(body, after.cols);
+        const screen = decoded.slice(Math.max(0, decoded.length - after.rows));
+        const history = decoded.slice(0, decoded.length - screen.length).map(cells => ({ cells, softWrap: false as const }));
+        const rawLines = body.split('\n');
+        if (rawLines.at(-1) === '') rawLines.pop();
+        const histText = rawLines.slice(0, Math.max(0, rawLines.length - after.rows));
+        const frame: CalibrationFrame = { cells: screen, cursor: after.cursor, kind: after.kind, geometryGeneration: 1, receiveSeq: -1 };
+        const capture: CalibrationCapture = {
+          paneKey: { serverIdentity: socket, paneId, birthGeneration: 1 }, captureId: name, requestedAt: performance.now(), completedAt: performance.now(),
+          before, after, frame, history, completeRetainedTail: history.length < 4500, observedFields: ['cells'],
+        };
+        const recent = recentOf();
+        const capLabels = new Set(histText.map(label));
+        stats.fenceRows = fenceIds.length;
+        stats.historyRows = history.length;
+        stats.fenceMissing = fenceIds.filter(id => lines[id] && !capLabels.has(label(lines[id]!))).length;
+        (capture as CalibrationCapture & { histText: string[] }).histText = histText;
+        stats.clearedLineIds = clearedIds.size;
+        (stats as { histTail?: string[] }).histTail = histText.slice(-6);
+        void recent;
+        return Promise.resolve(capture);
+      },
+      calibrate: async input => {
+        const cap = input.capture as CalibrationCapture & { histText?: string[] };
+        let contentFalse = 0, certifiedCleared = 0;
+        for (const check of input.checks) {
+          const captured = input.capture.history[check.capturedRow];
+          const model = lines[check.lineId] ? { softWrap: false, cells: cellsOf(lines[check.lineId]!, modelCols()) } : undefined;
+          const same = !!captured && !!model && equalHistoryRows(model, captured);
+          if (!same) contentFalse++;
+          if (clearedIds.has(check.lineId)) certifiedCleared++;
+          if (stats.samples.length < 4 && (!same || clearedIds.has(check.lineId))) {
+            stats.samples.push({
+              lineId: check.lineId, capturedRow: check.capturedRow, same,
+              model: lines[check.lineId]?.slice(0, 40),
+              captured: cap.histText?.[check.capturedRow]?.slice(0, 40),
+              cleared: clearedIds.has(check.lineId),
+            });
+          }
+        }
+        stats.contentFalse += contentFalse;
+        stats.certifiedCleared += certifiedCleared;
+        stats.checks += input.checks.length;
+        stats.repairs += input.repairs.length;
+        stats.commits++;
+        pane.revision++;
+        return { revision: pane.revision, durableRevision: 0, nextLineId: lines.length };
+      },
+      publish: () => {},
+      fault: issue => { stats.faults.push(issue.kind); },
+    };
+    calibrator = new HistoryCalibrator({ serverIdentity: socket, paneId, birthGeneration: 1 }, ports, { incremental: true, historyLimit: 4500 });
+    const deadline = performance.now() + 2000;
+    while (performance.now() < deadline && performance.now() + 1 < calibrator.dueAt) spawnSync('sleep', ['0.02']);
+    await calibrator.runDue();
+    if (stats.commits < 1) stats.unstable++;
+    if (disrupt === 'clear-reprint-before' && stats.commits) {
+      (stats as any).first = { checks: stats.checks, contentFalse: stats.contentFalse, certifiedCleared: stats.certifiedCleared, fenceRows: stats.fenceRows, fenceMissing: stats.fenceMissing, historyRows: stats.historyRows, commits: stats.commits };
+      const mark = { checks: stats.checks, contentFalse: stats.contentFalse, commits: stats.commits, certifiedCleared: stats.certifiedCleared };
+      const follow = Array.from({ length: 36 }, (_, i) => `after-${String(i).padStart(4, '0')}-NOT-THE-OLD-ROW`);
+      writeFileSync(dump, follow.join('\n') + '\n');
+      signal('dump');
+      spawnSync('sleep', ['0.15']);
+      poll();
+      calibrator.scroll(follow.length);
+      const until = performance.now() + 3000;
+      while (performance.now() < until && performance.now() + 1 < calibrator.dueAt) spawnSync('sleep', ['0.02']);
+      await calibrator.runDue();
+      (stats as any).followup = {
+        commits: stats.commits - mark.commits,
+        checks: stats.checks - mark.checks,
+        contentFalse: stats.contentFalse - mark.contentFalse,
+        certifiedCleared: stats.certifiedCleared - mark.certifiedCleared,
+      };
+    }
+    // reason is not returned; recover it by looking at whether checks happened
+    stats.reason = stats.commits ? (stats.checks ? 'committed-with-checks' : 'committed-no-checks') : (stats.faults.length ? 'fault' : 'no-commit');
+    void sawClear;
+    return stats;
+  } finally {
+    try { if (fd >= 0) closeSync(fd); } catch {}
+    spawnSync('tmux', ['-S', socket, 'kill-server'], { encoding: 'utf8', env: privateEnv });
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+
+ test('DEBT2 clear-history then reprint the same tail must certify no deleted identities', async () => {
+  const sig = Array.from({ length: 8 }, (_, i) => `sig-${i}-UNIQUE-TAIL`);
+  const screen = Array.from({ length: 24 }, (_, i) => `screen-A-${i}`);
+  const result = await runScenario('clear-reprint', 'clear-reprint-before', {
+    cols: 80, rows: 24, historyLimit: 2000,
+    seed: [...Array.from({ length: 40 }, (_, i) => `fill-${i}`), ...sig, ...screen],
+    reprint: [...sig, ...screen],
+  });
+  console.log('DEBT2_REAL_CLEAR', JSON.stringify(result));
+  expect(result.faults).toEqual([]);
+  expect(result.clearedLineIds).toBe(49);
+  expect(result.certifiedCleared).toBe(0);
+  expect(result.commits).toBe(0);
+}, 15000);
