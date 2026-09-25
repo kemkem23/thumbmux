@@ -199,5 +199,14 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
     expect(red[1]![0]!.fg).toBe('index:1');
     expect(memo.decode('ab\n')[0]).toBe(plain[0]!);
     expect(memo.hits).toBe(1);
+    // Cached rows share frozen cells: 9000 distinct 120-column rows over a
+    // small alphabet must not hold a fresh object per cell (FIX2 cage stall).
+    const wideRaw = (n: number) => Array.from({ length: n }, (_, i) => `\x1b[${31 + i % 7}mrow-${String(i).padStart(8, '0')} ไทย 你 😀\x1b[0m`).join('\n') + '\n';
+    const rows = new TmuxCaptureDecoder(120).decode(wideRaw(9000));
+    const objects = new Set(rows.flat());
+    expect(rows.length).toBe(9000);
+    expect(objects.size).toBeLessThan(200);
+    expect([...objects].every(cell => Object.isFrozen(cell))).toBe(true);
+    expect(JSON.stringify(rows.slice(0, 50))).toBe(JSON.stringify(decodeTmuxCaptureRows(wideRaw(50), 120)));
   });
 });

@@ -260,11 +260,29 @@ function escapesCloseInLine(line: string): boolean {
   return true;
 }
 
+// Cached rows hold interned cells. A fresh object per cell cost ~2.4 GB for
+// 44 panes x 9000 cached rows and stalled the 3 GB test cage; shared frozen
+// cells leave one pointer per column. The table only bounds sharing: clearing
+// it never changes a decoded value.
+const CELL_INTERN_LIMIT = 65536;
+const internedCells = new Map<string, Readonly<TmuxObservedCell>>();
+function internCell(cell: TmuxObservedCell): Readonly<TmuxObservedCell> {
+  const key = `${cell.grapheme}\u0000${cell.width}${cell.continuation ? 1 : 0}\u0000${cell.fg}\u0000${cell.bg}\u0000${cell.style}`;
+  let shared = internedCells.get(key);
+  if (!shared) {
+    if (internedCells.size >= CELL_INTERN_LIMIT) internedCells.clear();
+    shared = Object.freeze(cell);
+    internedCells.set(key, shared);
+  }
+  return shared;
+}
+
 /** Exact per-line memo for one pane's repeated overlap. The key is the raw
  * physical row plus the SGR state carried into it, so a hit returns exactly
  * what decodeTmuxCaptureRows would. Returned rows are shared between calls and
  * typed read-only; freezing them doubled cold decode time, so callers must not
- * mutate them (the matcher clones what it keeps). */
+ * mutate them (the matcher clones what it keeps). Their cells are interned and
+ * frozen, so one cell object can appear in many rows. */
 export class TmuxCaptureDecoder {
   private cache = new Map<string, { cells: readonly Readonly<TmuxObservedCell>[]; fg: string; bg: string; style: number }>();
   hits = 0; misses = 0;
@@ -288,7 +306,7 @@ export class TmuxCaptureDecoder {
         this.cache.delete(key); this.cache.set(key, entry);
       } else {
         this.misses++;
-        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state);
+        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(internCell);
         entry = { cells, fg: state.fg, bg: state.bg, style: state.style };
         this.cache.set(key, entry);
         if (this.cache.size > this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
