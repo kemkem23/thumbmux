@@ -165,7 +165,10 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
   const pinned: Array<[string, Array<[string, number]>]> = [
     ['ae\u0301b', [['a', 1], ['e\u0301', 1], ['b', 1]]],
     ['\u0600ab', [['\u0600a', 2], ['', 0], ['b', 1]]],
-    ['x\u{1f1f9}\u{1f1ed}\u{1f1f9}y', [['x', 1], ['\u{1f1f9}\u{1f1ed}', 2], ['', 0], ['\u{1f1f9}', 2], ['', 0], ['y', 1]]],
+    // A third regional indicator is refused since DEBT item 5 (tmux 3.4 draws
+    // 🇹🇭🇺 in 2 cells, this projection in 4); the island boundary is pinned
+    // with a pair instead.
+    ['x\u{1f1f9}\u{1f1ed}y', [['x', 1], ['\u{1f1f9}\u{1f1ed}', 2], ['', 0], ['y', 1]]],
     ['a\u200db', [['a\u200d', 1], ['b', 1]]],
     ['ไทย น้ำ', [['ไ', 1], ['ท', 1], ['ย', 1], [' ', 1], ['น้', 1], ['ำ', 1]]],
     ['A❤️ B', [['A', 1], ['❤️', 2], ['', 0], ['B', 1]]],
@@ -178,6 +181,7 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
       expect(row.slice(0, cells.length).map(c => [c.grapheme, c.width])).toEqual(cells);
       expect(row.slice(cells.length).every(c => c.grapheme === ' ' && c.width === 1)).toBe(true);
     }
+    expect(() => decodeTmuxCaptureRows('x\u{1f1f9}\u{1f1ed}\u{1f1f9}y\n', 12)).toThrow('ambiguous tmux emoji cell boundary');
   });
   test('memo decoder equals the uncached decoder, cold and warm, and falls back on open escapes', () => {
     let seed = 99;
