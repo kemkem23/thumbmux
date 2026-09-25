@@ -1096,3 +1096,25 @@ test('FIX1 partial capture certifies separate exact runs around an unchecked cha
   expect(result.checks.some(c => c.lineId === 100)).toBe(true);
   for (const c of result.checks) expect(equalHistoryRows(rows[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
 });
+
+test('FIX2 remember seeds the terminal triple after a general full match', () => {
+  // Two drifted rows force the general path, whose checks list the suffix
+  // before interior anchors. The seed must still be the last three rows, so
+  // a scrolls+overlap tail continues without a full recapture.
+  const all = naRows(Array.from({ length: 4700 }, (_, i) => `line-${i}`));
+  let recent = all.slice(0, 4500);
+  const captured = recent.map(r => ({ softWrap: r.softWrap, cells: r.cells.map(c => ({ ...c })) }));
+  captured[1000]!.cells[0]!.fg = 'index:1';
+  captured[3000]!.cells[0]!.fg = 'index:2';
+  const matcher = new IncrementalHistoryMatcher();
+  const full = matcher.match(recent, captured, naScope);
+  expect(full.reason).toBe('matched');
+  expect(Math.max(...full.checks.slice(-3).map(c => c.lineId))).toBeLessThan(4500);
+  matcher.remember(recent, captured, full);
+  recent = all.slice(200, 4700);
+  const tail = recent.slice(-(200 + 16));
+  const next = matcher.match(recent, tail, { ...naScope, completeRetainedTail: false });
+  expect(next.reason).toBe('matched');
+  expect(next.checks.at(-1)!.lineId).toBe(4700);
+  for (const c of next.checks) expect(equalHistoryRows(all[c.lineId - 1]!, tail[c.capturedRow]!)).toBe(true);
+});

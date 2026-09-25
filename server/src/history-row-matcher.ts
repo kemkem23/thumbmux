@@ -42,6 +42,22 @@ export function equalHistoryRows(a: CapturedRow, b: CapturedRow): boolean {
   }
   return true;
 }
+/** equalHistoryRows, comparing outward from `probe` first. Candidates in a
+ * locate scan already share the probe glyph and usually differ in the cell
+ * beside it (row counters), not in the shared prefix. Same result, fewer reads. */
+function equalRowsAround(a: CapturedRow, b: CapturedRow, probe: number): boolean {
+  if (a.softWrap !== b.softWrap || a.cells.length !== b.cells.length) return false;
+  if (a.cells === b.cells) return true;
+  const same = (x: number) => {
+    const c = a.cells[x]!, d = b.cells[x]!;
+    return c.grapheme === d.grapheme && c.width === d.width && c.continuation === d.continuation
+      && c.fg === d.fg && c.bg === d.bg && c.style === d.style;
+  };
+  const start = Math.min(probe, a.cells.length - 1);
+  for (let x = start; x >= 0; x--) if (!same(x)) return false;
+  for (let x = start + 1; x < a.cells.length; x++) if (!same(x)) return false;
+  return true;
+}
 function internRows(rows: readonly (readonly CapturedRow[])[]): number[][] {
   const buckets = new Map<number, Array<{ row: CapturedRow; id: number }>>();
   let id = 0;
@@ -120,8 +136,8 @@ export function matchHistoryRows(
       let hits = 0;
       for (let i = 0; i + 2 < rows.length; i++) {
         if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
-        if (equalHistoryRows(pattern[0]!, rows[i]!) && equalHistoryRows(pattern[1]!, rows[i + 1]!)
-          && equalHistoryRows(pattern[2]!, rows[i + 2]!) && ++hits > 1) return false;
+        if (equalRowsAround(pattern[0]!, rows[i]!, probe) && equalRowsAround(pattern[1]!, rows[i + 1]!, probe)
+          && equalRowsAround(pattern[2]!, rows[i + 2]!, probe) && ++hits > 1) return false;
       }
       return hits === 1;
     };
@@ -214,7 +230,7 @@ export class IncrementalHistoryMatcher {
       let found = -1;
       for (let i = 0; i + 2 < rows.length; i++) {
         if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
-        if (equalHistoryRows(rows[i]!, pattern[0]!) && equalHistoryRows(rows[i + 1]!, pattern[1]!) && equalHistoryRows(rows[i + 2]!, pattern[2]!)) {
+        if (equalRowsAround(rows[i]!, pattern[0]!, probe) && equalRowsAround(rows[i + 1]!, pattern[1]!, probe) && equalRowsAround(rows[i + 2]!, pattern[2]!, probe)) {
           if (found >= 0) return -1;
           found = i;
         }
@@ -247,7 +263,36 @@ export class IncrementalHistoryMatcher {
   remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {
     // Only the terminal verified triple is needed to seed the next chain.
     // Copying 128 full rows on every 200ms tick dominated collector work.
+    // The full matcher emits its suffix before interior anchors, so the last
+    // three emitted checks can sit hundreds of rows before the end. That seed
+    // falls outside the next scrolls+128 tail and forces a full recapture.
+    // Seed from the last three checks that are consecutive in both captured
+    // rows and the recent ring instead; any checked exact triple is valid.
     this.checked.clear();
-    for (const check of match.checks.slice(-3)) this.checked.set(check.lineId, structuredClone(captured[check.capturedRow]!));
+    const checks = match.checks.slice();
+    if (checks.some((check, k) => k > 0 && checks[k - 1]!.capturedRow > check.capturedRow)) checks.sort((a, b) => a.capturedRow - b.capturedRow);
+    let index: Map<number, number> | undefined;
+    for (let k = checks.length - 1; k >= 2; k--) {
+      const triple = [checks[k - 2]!, checks[k - 1]!, checks[k]!];
+      if (triple[1]!.capturedRow !== triple[0]!.capturedRow + 1 || triple[2]!.capturedRow !== triple[1]!.capturedRow + 1) continue;
+      // The terminal triple is normally near the ring end; scan back once and
+      // index the ring only if that first candidate does not line up.
+      let at: number | undefined;
+      if (!index) {
+        for (let i = recent.length - 1; i >= 0; i--) if (recent[i]!.lineId === triple[0]!.lineId) { at = i; break; }
+        index = new Map();
+      } else {
+        if (!index.size) recent.forEach((row, i) => index!.set(row.lineId, i));
+        at = index.get(triple[0]!.lineId);
+      }
+      if (at === undefined || recent[at + 1]?.lineId !== triple[1]!.lineId || recent[at + 2]?.lineId !== triple[2]!.lineId) continue;
+      // Plain-field copy; structuredClone of three 80-cell rows per pane per
+      // tick was the matcher's largest single cost.
+      for (const check of triple) {
+        const row = captured[check.capturedRow]!;
+        this.checked.set(check.lineId, { softWrap: row.softWrap, cells: row.cells.map(cell => ({ ...cell })) });
+      }
+      return;
+    }
   }
 }
