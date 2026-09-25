@@ -112,6 +112,7 @@ export function percentile(sorted: number[], p: number): number | null {
 export class PipeHistoryCollector {
   readonly paneKey: PaneKey;
   private sourceEpoch: number;
+  private upstreamEpoch: number;
   private geometryGeneration = 0;
   private receiveSeq = 0;
   private ackedSeq = 0;
@@ -143,6 +144,7 @@ export class PipeHistoryCollector {
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
     this.sourceEpoch = options.sourceEpoch;
+    this.upstreamEpoch = options.sourceEpoch;
     this.ringRows = options.ringRows ?? 500;
     this.queueLimit = options.queueLimitBytes ?? 1024 * 1024;
     this.nowNs = options.nowNs ?? (() => process.hrtime.bigint());
@@ -189,7 +191,7 @@ export class PipeHistoryCollector {
     if (this.healthState === "closed") return false;
     if (this.healthState === "broken") {
       const seq = ++this.receiveSeq;
-      this.options.ports.onFault({ kind: "worker-exit", at: this.now(), message: "bytes rejected by dead parser", unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
+      this.notifyFault({ kind: "worker-exit", at: this.now(), message: "bytes rejected by dead parser", unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
       return false;
     }
     const seq = ++this.receiveSeq;
@@ -224,8 +226,10 @@ export class PipeHistoryCollector {
 
   /** Continuity broke (pipe gap, restart): later rows belong to a new epoch. */
   beginSourceEpoch(epoch: number): void {
-    if (epoch <= this.sourceEpoch) throw new Error(`source epoch must increase (${this.sourceEpoch} -> ${epoch})`);
-    this.sourceEpoch = epoch;
+    if (epoch <= this.upstreamEpoch) throw new Error(`upstream epoch must increase (${this.upstreamEpoch} -> ${epoch})`);
+    this.upstreamEpoch = epoch;
+    // Parser recovery and upstream pipe restarts are independent breaks.
+    this.sourceEpoch = Math.max(this.sourceEpoch + 1, epoch);
   }
 
   setScrollOnClear(enabled: boolean): void {
@@ -298,6 +302,12 @@ export class PipeHistoryCollector {
     this.worker.kill("SIGKILL");
   }
 
+  /** Consumer faults cannot interrupt cleanup, waiter release or recovery. */
+  private notifyFault(event: PipeFaultEvent): void {
+    try { this.options.ports.onFault(event); }
+    catch (error) { console.error("[pipe-history] onFault callback failed:", error); }
+  }
+
   private fault(kind: PipeFaultEvent["kind"], message: string | undefined, health: PipeCollectorHealth): void {
     if (this.healthState === "closed") return;
     if (health === "broken" || this.healthState !== "broken") this.healthState = health;
@@ -312,7 +322,7 @@ export class PipeHistoryCollector {
       this.inflightBytes = 0;
       for (const waiter of this.drainWaiters.splice(0)) waiter();
     }
-    this.options.ports.onFault({ kind, at: this.now(), message, ...loss });
+    this.notifyFault({ kind, at: this.now(), message, ...loss });
     if (health === "broken" && !this.closing && !this.recovering && kind !== "vendor-hash" && this.recoveryAttempts < 3) {
       // Defer until the current exit/input callback has finished. No waiter
       // depends on recovery completing; rejected bytes remain explicit faults.
@@ -326,10 +336,10 @@ export class PipeHistoryCollector {
         if (this.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.scrollOnClear);
         this.worker.resize(this.cols, this.rows, this.geometryGeneration);
         this.healthState = "ok";
-        this.options.ports.onFault({ kind: "worker-restarted", at: this.now(), message: `parser respawned; source epoch ${this.sourceEpoch}; calibration required` });
+        this.notifyFault({ kind: "worker-restarted", at: this.now(), message: `parser respawned; source epoch ${this.sourceEpoch}; calibration required` });
       }).catch((error) => {
         this.healthState = "broken";
-        this.options.ports.onFault({ kind: "spawn", at: this.now(), message: String(error), lostRows: "unknown" });
+        this.notifyFault({ kind: "spawn", at: this.now(), message: String(error), lostRows: "unknown" });
       }).finally(() => { this.recovering = null; });
     }
   }

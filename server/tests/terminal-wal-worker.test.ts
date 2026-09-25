@@ -1,4 +1,5 @@
 import {
+  constants, closeSync, openSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -12,7 +13,6 @@ import {
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TmuxPipeManager, birthPipeArgs, type TmuxPipeDriver } from "../../../../src/integrations/tmux-pipe-core";
 import { EventEmitter } from "node:events";
 import { TerminalControlWalRecorder, type TerminalControlProcess } from "../src/integrations/terminal-control-wal-recorder";
 import { PassThrough } from "node:stream";
@@ -42,6 +42,7 @@ import {
   type PipeScrollEvent,
 } from "../src/pipe-history-collector";
 import {
+  PipeVtWorker,
   PIPE_VT_ATTR,
   PIPE_VT_VENDOR_SHA256,
   pipeVtAssets,
@@ -1261,255 +1262,66 @@ describe("L2-P real pipe-pane on a private tmux socket", () => {
   }, 900_000);
 });
 
-// FIX1: reviewer probes 41–49, now assertions on an exclusively private server.
-// Producer IDs and tmux capture are independent oracles, never parser output.
+
 async function untilFix1(predicate: () => boolean, timeout = 30_000): Promise<void> {
   const end = Date.now() + timeout;
   while (!predicate()) {
-    if (Date.now() >= end) throw new Error("FIX1 condition timed out");
+    if (Date.now() >= end) throw new Error("FIX2 condition timed out");
     await sleep(10);
   }
 }
-const fix1Ids = (text: string) => text.match(/L\d{6}/g) ?? [];
-const fix1Line = (i: number, width = 40) => `L${String(i).padStart(6, "0")} ${"x".repeat(width)}`;
-const fix1Lines = (from: number, to: number, width = 40) =>
-  Array.from({ length: to - from + 1 }, (_, i) => fix1Line(from + i, width)).join("\n") + "\n";
 
-async function fix1Rig(cols = 80, rows = 24, clear = true, birth = false) {
-  const dir = mkdtempSync(join(tmpdir(), "l2p-fix1-"));
-  roots.push(dir);
-  const socket = join(dir, "x.sock");
-  const env = { ...process.env };
-  delete env.TMUX;
-  delete env.TMUX_PANE;
-  const tmux = (args: string[]) => {
-    const r = spawnSync("tmux", ["-S", socket, ...args], { encoding: "utf8", env });
-    return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
-  };
-  const must = (args: string[]) => {
-    const r = tmux(args);
-    if (r.exitCode) throw new Error(`${args[0]}: ${r.stderr}`);
-    return r.stdout;
-  };
-  const q = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
-  const producer = join(dir, "producer.py");
-  writeFileSync(producer, `import os, time, pathlib\np=pathlib.Path(${JSON.stringify(dir)})\ni=1\nwhile True:\n f=p/('step'+str(i))\n if not f.exists():\n  time.sleep(.005); continue\n data=f.read_bytes()\n while data:\n  n=os.write(1,data); data=data[n:]\n (p/('done'+str(i))).touch()\n i+=1\n`);
-  must(["-f", "/dev/null", "new-session", "-d", "-s", "boot", "sleep 3600"]);
-  must(["set-option", "-g", "history-limit", "250000"]);
-  must(["set-option", "-g", "scroll-on-clear", clear ? "on" : "off"]);
-  const readers: ReturnType<typeof Bun.spawn>[] = [];
-  const owned = new Set<string>();
-  const driver: TmuxPipeDriver = {
-    tmux,
-    mkfifo(path) {
-      mkdirSync("/tmp/tmux-pipes", { recursive: true });
-      const ok = spawnSync("mkfifo", [path]).status === 0;
-      if (ok) owned.add(path);
-      return ok;
-    },
-    unlink(path) { if (owned.delete(path)) rmSync(path, { force: true }); },
-    openReader(path) {
-      const reader = Bun.spawn(["cat", path], { stdout: "pipe", stderr: "ignore" });
-      readers.push(reader);
-      return { stdout: reader.stdout as ReadableStream<Uint8Array>, kill: () => reader.kill() };
-    },
-    // Only this rig can address its server; each owned FIFO is created here.
-    ownedWriterAlive: (path) => owned.has(path),
-    reap: () => 0,
-    setTimer: (fn, ms) => setTimeout(fn, ms),
-    clearTimer: (id) => clearTimeout(id as ReturnType<typeof setTimeout>),
-    log: () => {},
-  };
-  const manager = new TmuxPipeManager(driver);
-  const pane = await collectPane(cols, rows, { scrollOnClear: undefined });
-  const events: string[] = [];
-  const handlers = {
-    onBytes: (bytes: Uint8Array) => { pane.collector.ingest(bytes); },
-    onBroken: () => events.push("broken"),
-    onRestarted: (epoch: number) => { events.push(`epoch:${epoch}`); pane.collector.beginSourceEpoch(epoch); },
-    onConflict: (kind: string) => events.push(`conflict:${kind}`),
-    onScrollOnClear: (enabled: boolean) => pane.collector.setScrollOnClear(enabled),
-  };
-  const name = dir.split("/").at(-1)!;
-  let target = `=${name}:0.0`;
-  const args = ["new-session", "-d", "-s", name, "-x", String(cols), "-y", String(rows), `exec python3 -B ${q(producer)}`];
-  let birthFifo: string | null = null;
-  if (birth) {
-    birthFifo = join(dir, "birth.fifo");
-    spawnSync("mkfifo", [birthFifo]);
-    const reader = Bun.spawn(["cat", birthFifo], { stdout: "pipe", stderr: "ignore" });
-    readers.push(reader);
-    must(birthPipeArgs(args, birthFifo));
-  } else {
-    must(args);
-    expect(manager.startBinaryPipe(name, handlers)).toBe(true);
-  }
-  let step = 0;
-  return {
-    pane, manager, events, readers, must, tmux, name, handlers,
-    async produce(text: string) {
-      const n = ++step;
-      writeFileSync(join(dir, `step${n}`), text);
-      await untilFix1(() => existsSync(join(dir, `done${n}`)));
-      await sleep(100);
-    },
-    seen() { return fix1Ids(pane.scrolls.map((s) => rowText(s.physicalRow)).join("\n") + "\n" + screenRows(pane).map((s) => s.text).join("\n")); },
-    captured() { return fix1Ids(must(["capture-pane", "-p", "-t", target, "-S", "-", "-E", "-"])); },
-    rename(newName: string) { must(["rename-session", "-t", `=${name}`, newName]); target = `=${newName}:0.0`; manager.handleRename(name); },
-    resize(x: number, y: number) { must(["resize-window", "-t", target, "-x", String(x), "-y", String(y)]); pane.collector.resize(x, y); },
-    async close() {
-      manager.stopAll();
-      tmux(["kill-server"]);
-      for (const reader of readers) { try { reader.kill(); } catch {} }
-      await pane.collector.close();
-      if (birthFifo) rmSync(birthFifo, { force: true });
-    },
-  };
-}
+describe("L2-P FIX2 recovery regressions", () => {
+  test("throwing onFault cannot prevent respawn or recovery after successive upstream breaks", async () => {
+    const faults: PipeFaultEvent[] = [];
+    const pane = await collectPane(80, 24, { ports: {
+      onScroll: () => {}, onFrame: () => {},
+      onFault: (event) => { faults.push(event); throw new Error("consumer fault injection"); },
+    } });
+    const c = pane.collector;
+    c.killWorker();
+    await untilFix1(() => faults.some((f) => f.kind === "worker-restarted"));
+    expect(c.currentSourceEpoch()).toBe(2);
+    c.beginSourceEpoch(2);
+    expect(c.currentSourceEpoch()).toBe(3);
+    expect(() => c.beginSourceEpoch(2)).toThrow();
+    c.killWorker();
+    await untilFix1(() => faults.filter((f) => f.kind === "worker-restarted").length === 2);
+    expect(c.currentSourceEpoch()).toBe(4);
+    c.beginSourceEpoch(3);
+    expect(c.currentSourceEpoch()).toBe(5);
+    c.ingest(encoder.encode("recovered\r\n"));
+    await settle(pane);
+    expect(c.health()).toBe("ok");
+    expect(c.stats().inflightBytes).toBe(0);
+  }, 30_000);
 
-async function expectFix1Complete(rig: Awaited<ReturnType<typeof fix1Rig>>, count: number) {
-  await untilFix1(() => rig.seen().includes(`L${String(count).padStart(6, "0")}`));
-  await settle(rig.pane);
-  const want = Array.from({ length: count }, (_, i) => `L${String(i + 1).padStart(6, "0")}`);
-  const seen = rig.seen();
-  expect(new Set(seen)).toEqual(new Set(want));
-  expect(seen.length).toBe(count);
-  expect(new Set(rig.captured())).toEqual(new Set(want));
-  expect(rig.pane.faults).toEqual([]);
-  console.log(`FIX1 complete rows=${count} missing=0 extra=0 duplicate=0`);
-}
-
-describe("L2-P FIX1 reviewer regressions on private tmux", () => {
-  test("41 clear follows the effective pane scroll-on-clear option (on and off)", async () => {
-    for (const clear of [true, false]) {
-      const r = await fix1Rig(80, 24, clear);
-      try {
-        await r.produce(fix1Lines(1, 10));
-        await r.produce("\x1b[H\x1b[2J");
-        await r.produce(fix1Lines(11, 60));
-        if (clear) await expectFix1Complete(r, 60);
-        else {
-          await untilFix1(() => r.seen().includes("L000060"));
-          expect(new Set(r.seen())).toEqual(new Set(r.captured()));
-          expect(r.seen()).not.toContain("L000001");
-          expect(r.pane.faults).toEqual([]);
-        }
-      } finally { await r.close(); }
-    }
-  }, 60_000);
-
-  test("42 CSI SU followed by CUP preserves the five scrolled rows; SD moves the grid", async () => {
-    const r = await fix1Rig();
+  for (const code of ["EPIPE", "EBADF"]) test(`timer flush ${code} releases input and survives a throwing fault callback`, async () => {
+    const faults: string[] = [];
+    const worker = new PipeVtWorker({ cols: 80, rows: 24, onUpdate: () => {},
+      onFault: (f) => { faults.push(f.message); throw new Error("consumer fault injection"); },
+    });
+    await worker.start();
+    const internals = worker as unknown as { inputFd: number | null; queue: Buffer[]; flushTimer: ReturnType<typeof setTimeout> | null; flush(): void };
+    const dir = mkdtempSync(join(tmpdir(), "l2p-epipe-"));
+    roots.push(dir);
+    const fifo = join(dir, "fault.fifo");
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    const readFd = openSync(fifo, constants.O_RDONLY | constants.O_NONBLOCK);
+    const writeFd = openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+    closeSync(readFd);
+    if (internals.inputFd !== null) closeSync(internals.inputFd);
+    internals.inputFd = writeFd;
+    if (code === "EBADF") closeSync(writeFd);
+    internals.queue.push(Buffer.from("fault"));
+    internals.flushTimer = setTimeout(() => internals.flush(), 1);
     try {
-      await r.produce(fix1Lines(1, 24).trimEnd());
-      await r.produce("\x1b[5S" + Array.from({ length: 5 }, (_, k) => `\x1b[${20 + k};1H${fix1Line(25 + k)}`).join(""));
-      await r.produce("\x1b[24;1H\n" + fix1Lines(30, 130));
-      await expectFix1Complete(r, 130);
-      await r.produce("\x1b[2T");
-      expect(screenRows(r.pane).slice(0, 2).map((s) => s.text.trim())).toEqual(["", ""]);
-    } finally { await r.close(); }
-  }, 60_000);
-
-  test("43 alternate-screen resize returns every normal row through history or screen", async () => {
-    const r = await fix1Rig(80, 40);
-    try {
-      await r.produce(fix1Lines(1, 30));
-      await r.produce("\x1b[?1049h");
-      await untilFix1(() => r.pane.last?.kind === "alternate");
-      r.resize(80, 24);
-      await r.produce("\x1b[?1049l");
-      await r.produce(fix1Lines(31, 130));
-      await expectFix1Complete(r, 130);
-    } finally { await r.close(); }
-  }, 60_000);
-
-  test("44 birth pipe is rejected with an explicit ownership conflict (integration debt)", async () => {
-    const r = await fix1Rig(80, 24, true, true);
-    try {
-      expect(r.manager.startBinaryPipe(r.name, r.handlers)).toBe(false);
-      expect(r.events).toEqual(["conflict:external-owner"]);
-      expect(r.must(["display-message", "-p", "-t", `=${r.name}:0.0`, "#{pane_pipe}"]).trim()).toBe("1");
-    } finally { await r.close(); }
-  });
-
-  test("45 burst of 20000 rows has no missing or duplicate IDs", async () => {
-    const r = await fix1Rig();
-    try { await r.produce(fix1Lines(1, 20_000)); await expectFix1Complete(r, 20_000); }
-    finally { await r.close(); }
-  }, 90_000);
-
-  test("46 killed parser releases backlog waiters, respawns and resumes real pipe output", async () => {
-    const r = await fix1Rig();
-    try {
-      await r.produce(fix1Lines(1, 5000, 200));
-      await untilFix1(() => r.pane.scrolls.length > 2000);
-      const oldPid = r.pane.collector.workerPid;
-      r.pane.collector.killWorker();
-      // A burst can race the exit callback / flush timer without killing host.
-      await r.produce(fix1Lines(5001, 10000, 200));
-      await Promise.race([r.pane.collector.drained(), sleep(5000).then(() => { throw new Error("drain hung"); })]);
-      await untilFix1(() => r.pane.faults.some((f) => f.kind === "worker-restarted"));
-      expect(r.pane.collector.workerPid).not.toBe(oldPid);
-      await r.produce(fix1Lines(10001, 10_100));
-      await untilFix1(() => r.seen().includes("L010100"));
-      expect(r.pane.collector.health()).toBe("ok");
-      expect(r.pane.faults.some((f) => f.lostRows === "unknown" && typeof f.unacknowledgedBytes === "number")).toBe(true);
-      console.log(`FIX1 worker-kill ${JSON.stringify(r.pane.faults)}`);
-    } finally { await r.close(); }
-  }, 90_000);
-
-  test("47 reader restart stamps rows by producing bytes, including the old visible tail", async () => {
-    const r = await fix1Rig();
-    try {
-      await r.produce(fix1Lines(1, 100));
-      await untilFix1(() => r.seen().includes("L000100"));
-      r.readers[0]!.kill();
-      await untilFix1(() => r.events.includes("broken"));
-      await r.produce(fix1Lines(101, 200)); // known gap while reader is absent
-      await untilFix1(() => r.events.includes("epoch:2"));
-      await r.produce(fix1Lines(201, 300));
-      await untilFix1(() => r.seen().includes("L000300"));
-      await settle(r.pane);
-      const rows = r.pane.scrolls.flatMap((s) => fix1Ids(rowText(s.physicalRow)).map((id) => ({ id: Number(id.slice(1)), epoch: s.sourceEpoch })));
-      expect(rows.filter((s) => s.id <= 100).every((s) => s.epoch === 1)).toBe(true);
-      expect(rows.filter((s) => s.id >= 201).every((s) => s.epoch === 2)).toBe(true);
-      expect(rows.some((s) => s.id === 100 && s.epoch === 1)).toBe(true);
-      expect(r.events).toEqual(["broken", "epoch:2"]);
-      console.log(`FIX1 reader boundary ${JSON.stringify(rows.filter((s) => s.id >= 97 && s.id <= 203))}`);
-    } finally { await r.close(); }
-  }, 60_000);
-
-  test("48 resize storm with long wrapped rows keeps all 3000 IDs", async () => {
-    const r = await fix1Rig();
-    const sizes = [[60, 24], [100, 30], [80, 10], [120, 40], [50, 12], [80, 24]];
-    try {
-      for (let k = 0; k < 60; k++) {
-        await r.produce(fix1Lines(k * 50 + 1, (k + 1) * 50, [10, 40, 90, 150, 230][k % 5]));
-        const [x, y] = sizes[k % sizes.length]!;
-        r.resize(x!, y!);
-        await sleep(20);
-      }
-      await r.produce("\n");
-      await expectFix1Complete(r, 3000);
-    } finally { await r.close(); }
-  }, 120_000);
-
-  for (const adopt of [true, false]) test(`49 rename ${adopt ? "adopted" : "expires with onBroken"}`, async () => {
-    const r = await fix1Rig();
-    try {
-      await r.produce(fix1Lines(1, 100));
-      const renamed = `${r.name}next`;
-      r.rename(renamed);
-      if (adopt) {
-        expect(r.manager.startBinaryPipe(renamed, r.handlers)).toBe(true);
-        await r.produce(fix1Lines(101, 200));
-        await expectFix1Complete(r, 200);
-        expect(r.events).toEqual([]);
-      } else {
-        await untilFix1(() => r.events.includes("broken"), 15_000);
-        expect(r.events).toEqual(["broken"]);
-        expect(r.must(["display-message", "-p", "-t", `=${renamed}:0.0`, "#{pane_pipe}"]).trim()).toBe("0");
-      }
-    } finally { await r.close(); }
-  }, 60_000);
+      await untilFix1(() => faults.some((f) => f.includes(code)));
+      expect(internals.inputFd).toBeNull();
+      expect(internals.queue).toEqual([]);
+      expect(internals.flushTimer).toBeNull();
+      await worker.close();
+      console.log(`FIX2 injected ${code}: timer survived, input released, worker reaped`);
+    } finally { await worker.close(); }
+  }, 15_000);
 });

@@ -154,6 +154,11 @@ export class PipeVtWorker {
     this.ready.catch(() => {});
   }
 
+  private notifyFault(event: PipeVtFault): void {
+    try { this.options.onFault(event); }
+    catch (error) { console.error("[pipe-vt] onFault callback failed:", error); }
+  }
+
   start(): Promise<PipeVtReady> {
     const assets = this.options.assets ?? pipeVtAssets();
     const now = this.options.now ?? Date.now;
@@ -161,7 +166,7 @@ export class PipeVtWorker {
       verifyPipeVtAssets(assets);
     } catch (error) {
       const message = (error as Error).message;
-      this.options.onFault({ kind: "vendor-hash", at: now(), message });
+      this.notifyFault({ kind: "vendor-hash", at: now(), message });
       this.readyReject?.(new Error(message));
       return this.ready;
     }
@@ -171,7 +176,7 @@ export class PipeVtWorker {
     const fifo = join(this.inputDir, "in.fifo");
     if (spawnSync("mkfifo", ["-m", "600", fifo]).status !== 0) {
       const message = `mkfifo failed for ${fifo}`;
-      this.options.onFault({ kind: "spawn", at: now(), message });
+      this.notifyFault({ kind: "spawn", at: now(), message });
       this.readyReject?.(new Error(message));
       this.releaseInput();
       return this.ready;
@@ -190,7 +195,7 @@ export class PipeVtWorker {
     });
     child.stdout?.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.on("error", (error) => {
-      this.options.onFault({ kind: "spawn", at: now(), message: error.message });
+      this.notifyFault({ kind: "spawn", at: now(), message: error.message });
       this.readyReject?.(error);
     });
     child.on("exit", (code, signal) => {
@@ -198,7 +203,7 @@ export class PipeVtWorker {
       this.releaseInput();
       if (!this.closing) {
         const message = `worker exited code=${code} signal=${signal} ${stderr.slice(-2000)}`.trim();
-        this.options.onFault({ kind: "worker-exit", at: now(), message });
+        this.notifyFault({ kind: "worker-exit", at: now(), message });
         this.readyReject?.(new Error(message));
       }
       for (const waiter of this.exitWaiters.splice(0)) waiter();
@@ -219,7 +224,7 @@ export class PipeVtWorker {
       try {
         message = JSON.parse(body);
       } catch (error) {
-        this.options.onFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: (error as Error).message });
+        this.notifyFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: (error as Error).message });
         continue;
       }
       if (kind === "U") this.options.onUpdate(message as PipeVtUpdate);
@@ -228,13 +233,13 @@ export class PipeVtWorker {
         this.readyResolve = null;
       } else if (kind === "E") {
         const error = message as { kind?: string; message?: string };
-        this.options.onFault({
+        this.notifyFault({
           kind: error.kind === "vendor-hash" ? "vendor-hash" : "worker-error",
           at: (this.options.now ?? Date.now)(),
           message: String(error.message ?? ""),
         });
       } else {
-        this.options.onFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: `unknown frame ${kind}` });
+        this.notifyFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: `unknown frame ${kind}` });
       }
     }
     this.pending = offset === this.pending.length ? Buffer.alloc(0) : this.pending.subarray(offset);
@@ -259,7 +264,7 @@ export class PipeVtWorker {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EAGAIN") {
           this.releaseInput();
-          this.options.onFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `worker input failed: ${(error as Error).message}` });
+          this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `worker input failed: ${(error as Error).message}` });
           this.child?.kill("SIGKILL");
           return;
         }
