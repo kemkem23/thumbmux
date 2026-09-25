@@ -361,6 +361,8 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   /** The queue's last job is a frame of the same pane/kind/generation: the newer frame takes its place and reservation. */
   private coalesce(tail:Job,frame:ProjectionFrame):Promise<ProjectionReceipt> {
+    // Validate before touching the tail: a bad frame is refused alone, the queued frame keeps its job.
+    validateFrame(frame);
     const id=paneId(frame.paneKey),bytes=Buffer.byteLength(JSON.stringify(frame))+512,delta=bytes-tail.bytes;
     const scope=this.ram.bytes()+Math.max(0,delta)>CACHE_MAX?'store':this.capacity(frame.paneKey,delta,true);
     if(scope!=='ok')this.rejectCapacity(frame.paneKey,frame,false,scope);
