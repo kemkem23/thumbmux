@@ -5,7 +5,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from './schema';
 import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
-import { readProjectionPage, readProjectionIssues } from './projection-reader';
+import { readProjectionPage, projectionIssue } from './projection-reader';
 import type { PaneKey, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=256*1024;
@@ -502,12 +502,25 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   health():ProjectionHealth {
     this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
-    const panes=(this.ram.db.query('SELECT server_identity,pane_id,birth_generation FROM na_pane').all() as SqlRow[])
-      .map(p=>{
-        const key={serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)};
-        const token=this.ram.token(key);
-        return {...token,status:this.ram.pane(key).health==='healthy'?'healthy' as const:'degraded' as const,issues:readProjectionIssues(this.ram,this.disk,token)};
-      });
+    const rows=this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[];
+    const revisions=new Map(rows.map(p=>[String(p.pane_key),Number(p.revision)]));
+    const byPane=new Map<string,Map<string,SqlRow>>();
+    // Health is sampled on the ingest thread. Two bulk issue reads replace
+    // four SQL lookups per pane; RAM still overlays the durable revision.
+    for(const db of [this.disk,this.ram.db])for(const issue of db.query('SELECT * FROM na_issue').all() as SqlRow[]) {
+      const id=String(issue.pane_key);
+      if(Number(issue.revision)>(revisions.get(id)??-1))continue;
+      let issues=byPane.get(id);if(!issues){issues=new Map();byPane.set(id,issues);}
+      issues.set(String(issue.issue_id),issue);
+    }
+    const panes=rows.map(p=>({
+      paneKey:{serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)},
+      sourceEpoch:Number(p.source_epoch),geometryGeneration:Number(p.geometry_generation),revision:Number(p.revision),
+      durableRevision:Number(p.durable_revision),nextLineId:Number(p.next_line_id),
+      status:p.health==='healthy'?'healthy' as const:'degraded' as const,
+      recovery:p.health==='unverified'?'external' as const:'automatic' as const,
+      issues:[...(byPane.get(String(p.pane_key))?.values()??[])].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue)
+    }));
     return {pressure:this.stopped?'recoverable':'none',status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
       pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,panes};
   }

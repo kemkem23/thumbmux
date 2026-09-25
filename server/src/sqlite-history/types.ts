@@ -214,7 +214,7 @@ export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
   pressure: 'none' | 'recoverable';
-  panes: Array<ProjectionToken & { status: 'healthy' | 'degraded'; issues: ProjectionIssue[] }>;
+  panes: Array<ProjectionToken & { status: 'healthy' | 'degraded'; recovery: 'automatic' | 'external'; issues: ProjectionIssue[] }>;
 }
 export interface ProjectionWriterPort {
   recordIssue(issue: ProjectionIssueInput): Promise<ProjectionReceipt>;

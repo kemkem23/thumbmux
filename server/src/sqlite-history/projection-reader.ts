@@ -6,9 +6,12 @@ import type { ProjectionIssue, ProjectionPage, ProjectionToken } from './types';
 export function readProjectionIssues(ram:ProjectionRam,disk:Database,token:ProjectionToken):ProjectionIssue[] {
   const found=new Map<string,SqlRow>();
   for(const db of [disk,ram.db])for(const row of db.query('SELECT * FROM na_issue WHERE pane_key=? AND revision<=?').all(paneId(token.paneKey),token.revision) as SqlRow[])found.set(String(row.issue_id),row);
-  return [...found.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(r=>({
-    issueId:String(r.issue_id),sourceEpoch:Number(r.source_epoch),revision:Number(r.revision),boundaryLineId:r.boundary_line_id===null?null:Number(r.boundary_line_id),
-    kind:String(r.kind),reason:String(r.reason),missingCount:r.missing_count===null?null:Number(r.missing_count),detectedAt:Number(r.detected_at),resolvedAt:r.resolved_at===null?null:Number(r.resolved_at)}));
+  return [...found.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue);
+}
+
+export function projectionIssue(r:SqlRow):ProjectionIssue {
+  return {issueId:String(r.issue_id),sourceEpoch:Number(r.source_epoch),revision:Number(r.revision),boundaryLineId:r.boundary_line_id===null?null:Number(r.boundary_line_id),
+    kind:String(r.kind),reason:String(r.reason),missingCount:r.missing_count===null?null:Number(r.missing_count),detectedAt:Number(r.detected_at),resolvedAt:r.resolved_at===null?null:Number(r.resolved_at)};
 }
 
 /** One revision token spans disk pages and the RAM tail. A changed revision is a retry. */
