@@ -760,3 +760,35 @@ test('I2 mutations: stale issue, unfenced screen and cache recovery each make an
   }
  }finally{rmSync(root,{recursive:true,force:true});}
 },60000);
+
+test('I2 contract probe: late B through E burst exceeds the existing borrow budget',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ clearInterval((s as any).timer);
+ const admitted=Array(5).fill(0),refused=Array(5).fill(0),jobs:Promise<unknown>[]=[];
+ try {
+  const cell=(grapheme:string)=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+  for(let pane=0;pane<5;pane++)for(let n=0;n<(pane===0?6000:3000);n++) {
+   const text=`line ${n} of a big file`.padEnd(80,' ');
+   jobs.push(s.appendScroll({paneKey:{serverIdentity:'d12',paneId:`%${pane}`,birthGeneration:1},sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}}).then(()=>{admitted[pane]++;},()=>{refused[pane]++;}));
+  }
+  await Promise.all(jobs);
+  console.log('I2_D12_CONTRACT_PROBE',JSON.stringify({admitted,refused,pendingBytes:s.health().pendingBytes,normalRefused:refused.slice(1).reduce((a,b)=>a+b,0)}));
+  expect(s.health().pendingBytes).toBeLessThanOrEqual(16*1024*1024);
+  // Observation of an OPEN debt, not an acceptance assertion that normal loss is OK.
+  expect(refused.slice(1).reduce((a,b)=>a+b,0)).toBeGreaterThan(0);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2: shutdown after 2000 and 20000 accepted rows has durable receipts and immediate reopen',async()=>{
+ for(const count of [2000,20000]) {
+  const root=mkdtempSync(join(tmpdir(),'na-i2-drain-')),key={serverIdentity:'drain',paneId:'%1',birthGeneration:1};
+  let s=createProjectionStore({historyRoot:root,mode:'create'});
+  try {
+   for(let n=0;n<count;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+   const pendingAtClose=s.health().pendingBytes,started=performance.now();await s.close();const closeMs=performance.now()-started;
+   s=createProjectionStore({historyRoot:root,mode:'recover'});
+   expect(s.token(key).nextLineId).toBe(count);expect(s.token(key).revision).toBe(s.token(key).durableRevision);
+   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs}));
+  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+ }
+},60000);
