@@ -27,6 +27,10 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
   };
   const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
   const cpuMicros = () => { const u = process.cpuUsage(); return u.user + u.system; };
+  // Sections are timed with the monotonic clock (µs) around synchronous code:
+  // getrusage per section was thousands of ptrace stops per second in the cage.
+  // For synchronous JS this is an upper bound of its CPU time.
+  const spanMicros = () => performance.now() * 1000;
   // The cage runs bun under `strace -f`, which stops every syscall of bun,
   // tmux and the producers (FIX2: 300 -> 85 captures/min). Timing is printed
   // everywhere but only asserted when no tracer is attached.
@@ -76,7 +80,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         socket: string; panes: Pane[]; sidecars: string[]; producedBefore: number; pid: number; cols: number; rows: number; count: number;
         ticks: number; bytes: number; batches: number; latencies: number[]; calibratorUs: number; childUs: number; oracleUs: number; modelUs: number;
         timer: ReturnType<typeof setTimeout> | undefined; timerAt: number; batch: Array<{ pane: Pane; tail: number; resolve: (c: CalibrationCapture) => void; reject: (e: unknown) => void; requestedAt: number }>;
-        flushQueued: boolean; faults: Record<string, number>; captureErrors: number; clientInFlight: boolean; next: number;
+        flushQueued: boolean; faults: Record<string, number>; captureErrors: number; errorSamples: string[]; clientInFlight: boolean; next: number;
       };
       const configs: Config[] = [];
       let stopped = false;
@@ -104,12 +108,13 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       // to the pipe only after parsing it, so this never leads tmux.
       const buffer = Buffer.alloc(1 << 20);
       const pollPipe = (pane: Pane) => {
-        const t0 = cpuMicros();
+        const t0 = spanMicros();
         let text = '';
         for (;;) {
           const n = readSync(pane.fd, buffer, 0, buffer.length, pane.offset);
           if (n <= 0) break;
           pane.offset += n; text += buffer.toString('latin1', 0, n);
+          if (n < buffer.length) break;
         }
         if (text) {
           text = pane.partial + text;
@@ -126,7 +131,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             }
           }
         }
-        return cpuMicros() - t0;
+        return spanMicros() - t0;
       };
       const config = (pane: Pane) => configs.find(c => c.panes.includes(pane))!;
       const rearm = (c: Config) => {
@@ -168,23 +173,24 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         const [w, h, x, y, alt] = fields.split(' ').map(Number);
         return { sourceEpoch: 1, geometryGeneration: 1, cols: w!, rows: h!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
       };
-      // All captures requested in one tick share a tmux client. Markers
-      // bracket each pane's metadata-before, capture and metadata-after.
+      // All captures requested in one tick share a tmux client. One
+      // list-panes before and one after bracket every capture of the batch
+      // (metadata-before/after per pane); a marker line separates captures.
       const flush = (c: Config) => {
         c.flushQueued = false;
         const batch = c.batch.splice(0);
         if (!batch.length) return;
         c.clientInFlight = true;
-        let t0 = cpuMicros();
+        let t0 = spanMicros();
         const args: string[] = [];
-        const format = '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on}';
+        const format = '#{pane_id} #{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on}';
+        args.push('list-panes', '-a', '-F', `L2C-B ${format}`);
         batch.forEach((item, k) => {
-          if (args.length) args.push(';');
-          args.push('display-message', '-p', '-t', item.pane.id, `L2C-B-${k} ${format}`, ';',
-            'capture-pane', '-p', '-e', '-N', '-t', item.pane.id, ...(item.tail > 0 ? ['-S', `-${item.tail}`] : []), ';',
-            'display-message', '-p', '-t', item.pane.id, `L2C-A-${k} ${format}`);
+          args.push(';', 'display-message', '-p', '-t', item.pane.id, `L2C-S-${k}`, ';',
+            'capture-pane', '-p', '-e', '-N', '-t', item.pane.id, ...(item.tail > 0 ? ['-S', `-${item.tail}`] : []));
         });
-        c.calibratorUs += cpuMicros() - t0;
+        args.push(';', 'display-message', '-p', '-t', batch[0]!.pane.id, 'L2C-E', ';', 'list-panes', '-a', '-F', `L2C-A ${format}`);
+        c.calibratorUs += spanMicros() - t0;
         const at = performance.now();
         const proc = Bun.spawn(['tmux', '-S', c.socket, ...args], { env: privateEnv, stdout: 'pipe', stderr: 'pipe' });
         void (async () => {
@@ -192,32 +198,34 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           c.latencies.push(performance.now() - at); c.batches++;
           c.childUs += Number(proc.resourceUsage()?.cpuTime.total ?? 0);
           c.bytes += Buffer.byteLength(raw);
-          if (code !== 0) { c.clientInFlight = false; c.captureErrors++; for (const item of batch) item.reject(new Error(`private tmux exit=${code}: ${err}`)); rearm(c); return; }
-          t0 = cpuMicros();
-          const parts = raw.split(/^L2C-([AB])-(\d+) (.*)\n/m);
-          const found = new Map<number, { before?: string; after?: string; body?: string }>();
-          for (let i = 1; i + 3 < parts.length; i += 4) {
-            const entry = found.get(Number(parts[i + 1])) ?? {};
-            if (parts[i] === 'B') { entry.before = parts[i + 2]; entry.body = parts[i + 3]; } else entry.after = parts[i + 2];
-            found.set(Number(parts[i + 1]), entry);
+          if (code !== 0) { c.clientInFlight = false; c.captureErrors++; if (c.errorSamples.length < 3) c.errorSamples.push(`exit=${code}: ${err.slice(0, 200)}`); for (const item of batch) item.reject(new Error(`private tmux exit=${code}: ${err}`)); rearm(c); return; }
+          t0 = spanMicros();
+          const before = new Map<string, string>(), after = new Map<string, string>();
+          const found = new Map<number, { body: string }>();
+          const head = raw.indexOf('L2C-S-0\n'), tailAt = raw.lastIndexOf('L2C-E\n');
+          for (const line of raw.slice(0, Math.max(0, head)).split('\n')) if (line.startsWith('L2C-B ')) { const [id, ...rest] = line.slice(6).split(' '); before.set(id!, rest.join(' ')); }
+          for (const line of raw.slice(tailAt + 6).split('\n')) if (line.startsWith('L2C-A ')) { const [id, ...rest] = line.slice(6).split(' '); after.set(id!, rest.join(' ')); }
+          if (head >= 0 && tailAt > head) {
+            const sections = raw.slice(head, tailAt).split(/^L2C-S-(\d+)\n/m);
+            for (let i = 1; i + 1 < sections.length; i += 2) found.set(Number(sections[i]), { body: sections[i + 1]! });
           }
-          c.calibratorUs += cpuMicros() - t0;
-          t0 = cpuMicros();
+          c.calibratorUs += spanMicros() - t0;
+          t0 = spanMicros();
           const results: Array<[typeof batch[number], CalibrationCapture | Error]> = [];
           batch.forEach((item, k) => {
             try {
-              const entry = found.get(k);
-              if (!entry?.before || !entry.after || entry.body === undefined) throw new Error('capture batch part missing');
-              const before = meta(item.pane, entry.before), after = meta(item.pane, entry.after);
+              const entry = found.get(k), b = before.get(item.pane.id), a = after.get(item.pane.id);
+              if (!entry || !b || !a) throw new Error('capture batch part missing');
+              const metaBefore = meta(item.pane, b), metaAfter = meta(item.pane, a);
               const decoded = item.pane.decoder.decode(entry.body);
-              const screen = decoded.slice(Math.max(0, decoded.length - after.rows));
+              const screen = decoded.slice(Math.max(0, decoded.length - metaAfter.rows));
               const history: CapturedRow[] = decoded.slice(0, decoded.length - screen.length).map(cells => ({ cells, softWrap: false }));
-              const frame: CalibrationFrame = { cells: screen, cursor: after.cursor, kind: after.kind, geometryGeneration: 1, receiveSeq: -1 };
+              const frame: CalibrationFrame = { cells: screen, cursor: metaAfter.cursor, kind: metaAfter.kind, geometryGeneration: 1, receiveSeq: -1 };
               results.push([item, { paneKey: { serverIdentity: c.socket, paneId: item.pane.id, birthGeneration: 1 }, captureId: `${c.batches}/${k}`, requestedAt: item.requestedAt, completedAt: performance.now(),
-                before, after, frame, history, completeRetainedTail: item.tail > 0 && (item.tail >= 4500 || history.length < item.tail), observedFields: ['cells', 'cursor'] }]);
+                before: metaBefore, after: metaAfter, frame, history, completeRetainedTail: item.tail > 0 && (item.tail >= 4500 || history.length < item.tail), observedFields: ['cells', 'cursor'] }]);
             } catch (error) { results.push([item, error as Error]); }
           });
-          c.calibratorUs += cpuMicros() - t0;
+          c.calibratorUs += spanMicros() - t0;
           c.clientInFlight = false;
           for (const [item, result] of results) result instanceof Error ? item.reject(result) : item.resolve(result);
           rearm(c);
@@ -226,17 +234,17 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
       const makePorts = (pane: Pane): CalibrationPorts => ({
         now: () => performance.now(),
         schedule: () => {
-          if (pane.spanAt !== null) { config(pane).calibratorUs += cpuMicros() - pane.spanAt; pane.spanAt = null; }
+          if (pane.spanAt !== null) { config(pane).calibratorUs += spanMicros() - pane.spanAt; pane.spanAt = null; }
           rearm(config(pane));
         },
         read: () => {
           const c = config(pane);
           c.modelUs += pollPipe(pane);
-          const t0 = cpuMicros();
+          const t0 = spanMicros();
           const recentHistory = modelRing(pane, pane.count - pane.rows + 1);
           const snapshot = { revision: pane.revision, sourceEpoch: 1, geometryGeneration: 1, recentHistory,
             parserFrame: { cells: [], cursor: { x: 0, y: pane.rows - 1, visible: true }, kind: 'normal' as const, geometryGeneration: 1, receiveSeq: pane.offset } };
-          const t1 = cpuMicros(); c.modelUs += t1 - t0;
+          const t1 = spanMicros(); c.modelUs += t1 - t0;
           pane.spanAt = t1;
           return snapshot;
         },
@@ -250,11 +258,11 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         }),
         calibrate: async input => {
           const c = config(pane);
-          if (pane.spanAt !== null) { c.calibratorUs += cpuMicros() - pane.spanAt; pane.spanAt = null; }
-          const t0 = cpuMicros();
+          if (pane.spanAt !== null) { c.calibratorUs += spanMicros() - pane.spanAt; pane.spanAt = null; }
+          const t0 = spanMicros();
           if (input.expectedRevision !== pane.revision) {
             pane.staleRevision++; if (settle.from !== Infinity) pane.afterSettle.stale = (pane.afterSettle.stale ?? 0) + 1;
-            c.oracleUs += cpuMicros() - t0; return null;
+            c.oracleUs += spanMicros() - t0; return null;
           }
           for (const check of input.checks) {
             const captured = input.capture.history[check.capturedRow]!;
@@ -273,7 +281,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           }
           if (input.capture.requestedAt >= settle.from && input.capture.history.length) pane.settledAt ??= performance.now();
           pane.revision++;
-          c.oracleUs += cpuMicros() - t0;
+          c.oracleUs += spanMicros() - t0;
           return { revision: pane.revision, durableRevision: 0, nextLineId: pane.count };
         },
         publish: () => {},
@@ -302,7 +310,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           const socket = join(root, `${cols}-${count}.sock`);
           // Register the socket before creating it so cleanup also covers a
           // partial setup failure; no default server is ever addressed.
-          const c: Config = { socket, panes: [], sidecars: [], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, batches: 0, latencies: [], calibratorUs: 0, childUs: 0, oracleUs: 0, modelUs: 0, timer: undefined, timerAt: Infinity, batch: [], flushQueued: false, faults: {}, captureErrors: 0, clientInFlight: false, next: 0 };
+          const c: Config = { socket, panes: [], sidecars: [], producedBefore: 0, pid: 0, cols: cols!, rows: rows!, count, ticks: 0, bytes: 0, batches: 0, latencies: [], calibratorUs: 0, childUs: 0, oracleUs: 0, modelUs: 0, timer: undefined, timerAt: Infinity, batch: [], flushQueued: false, faults: {}, captureErrors: 0, errorSamples: [], clientInFlight: false, next: 0 };
           configs.push(c);
           for (let pane = 0; pane < count; pane++) {
             const sidecar = join(root, `${cols}-${count}-${pane}.rows`); c.sidecars.push(sidecar);
@@ -339,10 +347,11 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           }
           c.producedBefore = c.sidecars.reduce((sum, path) => sum + Number(readFileSync(path, 'utf8')), 0);
         }
-        // The pipe reader: in production bytes are pushed; here every 16ms.
+        // The pipe reader: in production bytes are pushed; here every 50ms, and
+        // every read() port call reads the pipe again first.
         const poller = mode === 'baseline' ? undefined : setInterval(() => {
           for (const c of configs) for (const pane of c.panes) c.modelUs += pollPipe(pane);
-        }, 16);
+        }, 50);
         const parent = procTicks(process.pid);
         const cpuStart = cpuMicros();
         const started = performance.now();
@@ -418,7 +427,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             finalPass, checkedRows, coverage: denominator && finalPass ? checkedRows / denominator : null, unchecked, falseChecked, falseSamples: c.panes.flatMap(p => p.falseSamples).slice(0, 3),
             staleRevision: c.panes.reduce((s, p) => s + p.staleRevision, 0),
             unsettled: c.panes.filter(p => p.settledAt === null).slice(0, 3).map(p => ({ pane: p.id, afterSettle: p.afterSettle, captures: p.historyAt.filter(t => t >= settle.from).length })),
-            settleMs: c.panes.reduce((m, p) => Math.max(m, p.settledAt === null ? Infinity : p.settledAt - settle.from), 0), faults: c.faults, captureErrors: c.captureErrors, reasons,
+            settleMs: c.panes.reduce((m, p) => Math.max(m, p.settledAt === null ? Infinity : p.settledAt - settle.from), 0), faults: c.faults, captureErrors: c.captureErrors, captureErrorSamples: c.errorSamples, reasons,
             historyCapturesPerPane: historyPerPane, historyIntervalP50: percentile(w.intervals, .5), historyIntervalP95: percentile(w.intervals, .95), historyIntervalMax: percentile(w.intervals, 1),
             fullCaptures: w.full, partialCaptures: w.partial, screenOnlyCaptures: w.screenOnly, batches: w.batches, captureBytes: c.bytes,
             batchP50: percentile(w.latencies, .5), batchP95: percentile(w.latencies, .95), batchP99: percentile(w.latencies, .99), batchMax: percentile(w.latencies, 1),
