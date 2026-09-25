@@ -116,7 +116,7 @@ describe('NEWARCH L2-C observed snapshot cells', () => {
 });
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing', async () => {
@@ -237,4 +237,26 @@ test('I3 unsupported escape poisons style until an explicit reset without invent
   expect(evidence.rows[3]!.cells![0]!.fg).toBe('default');
   expect(evidence.rows[4]!.cells).toHaveLength(12);
   expect(decodeTmuxCaptureEvidence('a\n\n', 12).complete).toBe(true);
+});
+
+test('I3 mutation control: certifying ambiguous cells fails and original stays intact', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i3-decoder-mutation-'));
+  try {
+    const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+    const from = "? { cells: null, reason: 'ambiguous-cell-boundary' }";
+    expect(original.split(from)).toHaveLength(2);
+    writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
+import {decodeTmuxCaptureEvidence} from './subject.ts';
+const result=decodeTmuxCaptureEvidence('ok\\n🏳️ ‍🌈x\\nnext\\n',20);
+assert.equal(result.complete,false,'MUTATION ambiguous cells');
+assert.equal(result.rows[1].cells,null,'MUTATION unknown row');`);
+    for (const mutated of [false, true]) {
+      writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, "? { cells, reason: 'ambiguous-cell-boundary' }") : original);
+      const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+      console.log('I3_MUTATION', JSON.stringify({ name: 'ambiguous-cells', mutated, exit: result.status, stderr: result.stderr }));
+      expect(result.status).toBe(mutated ? 1 : 0);
+      if (mutated) expect(result.stderr).toContain('MUTATION');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

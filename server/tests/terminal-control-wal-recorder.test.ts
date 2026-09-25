@@ -1807,3 +1807,45 @@ test('I3 real reflow 80 to 37 and 37 to 120 does not certify across geometry', a
     expect(result.checks).toBe(0);
   }
 }, 15000);
+
+test('I3 mutation controls: timeout abort and resize comparison guards fail independently', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i3-mutation-'));
+  const cases = [
+    {
+      name: 'timeout-abort', file: 'history-calibrator.ts', from: 'controller.abort();', to: '',
+      body: `const {HistoryCalibrator}=await import('./subject.ts');
+let fire, signal;
+const c=new HistoryCalibrator({serverIdentity:'fixture',paneId:'%0',birthGeneration:1}, {
+ now:()=>0,schedule:()=>{},read:()=>({}),
+ timeout:(f)=>{fire=f;return ()=>{}},
+ capture:(_,__,s)=>{signal=s;return new Promise(()=>{})},fault:()=>{},
+ calibrate:()=>{throw Error('unexpected commit')},publish:()=>{throw Error('unexpected publish')}
+});
+const running=c.runDue();fire();await running;
+assert.equal(signal.aborted,true,'MUTATION timeout abort');`,
+    },
+    {
+      name: 'resize-comparison', file: 'history-watchdog.ts', from: 'this.image = undefined;', to: '',
+      body: `const {HistoryWatchdog}=await import('./subject.ts');
+let now=0;const faults=[];const wd=new HistoryWatchdog(()=>now,f=>faults.push(f.kind));
+wd.capture('old',{sourceEpoch:1,geometryGeneration:1,kind:'normal'});
+now=100;wd.capture('reflow',{sourceEpoch:1,geometryGeneration:2,kind:'normal'});
+now=1100;wd.tick();assert.deepEqual(faults,[],'MUTATION resize comparison');`,
+    },
+  ];
+  try {
+    writeFileSync(join(root, 'history-row-matcher.ts'), readFileSync(new URL('../src/history-row-matcher.ts', import.meta.url)));
+    for (const item of cases) {
+      const original = readFileSync(new URL(`../src/${item.file}`, import.meta.url), 'utf8');
+      expect(original.split(item.from)).toHaveLength(2);
+      writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';\n${item.body}`);
+      for (const mutated of [false, true]) {
+        writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(item.from, item.to) : original);
+        const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+        console.log('I3_MUTATION', JSON.stringify({ name: item.name, mutated, exit: result.status, stderr: result.stderr }));
+        expect(result.status).toBe(mutated ? 1 : 0);
+        if (mutated) expect(result.stderr).toContain('MUTATION');
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
