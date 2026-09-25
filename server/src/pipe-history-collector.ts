@@ -109,6 +109,11 @@ export type PipeHistoryCollectorOptions = {
   latencySampleLimit?: number;
 };
 
+function isReceipt(value: unknown): value is PromiseLike<unknown> {
+  return value !== null && (typeof value === "object" || typeof value === "function")
+    && typeof (value as { then?: unknown }).then === "function";
+}
+
 export function percentile(sorted: number[], p: number): number | null {
   if (sorted.length === 0) return null;
   return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))]!;
@@ -146,6 +151,8 @@ export class PipeHistoryCollector {
   private workerEncodeNs = 0;
   private hostHandleNs = 0n;
   private policyUnverified = false;
+  private acceptedBytes = 0;
+  private refusedBytes = 0;
 
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
@@ -208,13 +215,22 @@ export class PipeHistoryCollector {
    * ignores drain, or sends an oversized delivery, gets an explicit loss issue.
    */
   ingest(bytes: Uint8Array, receivedAtNs: bigint = this.nowNs()): boolean {
-    if (this.healthState === "closed") return false;
+    if (this.healthState === "closed") {
+      this.refusedBytes += bytes.byteLength;
+      const seq = ++this.receiveSeq;
+      this.notifyFault({ kind: "closed", at: this.now(), unacknowledgedBytes: bytes.byteLength,
+        receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
+      return false;
+    }
     if (this.healthState === "broken") {
+      this.refusedBytes += bytes.byteLength;
       const seq = ++this.receiveSeq;
       this.notifyFault({ kind: "worker-exit", at: this.now(), message: "bytes rejected by dead parser", unacknowledgedBytes: bytes.byteLength, receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
       return false;
     }
-    if (this.inflightBytes > this.queueLimit || bytes.byteLength > this.queueLimit + 64 * 1024) {
+    if (this.inflightBytes > this.queueLimit || bytes.byteLength > this.queueLimit + 64 * 1024
+      || !this.worker.canAccept(bytes.byteLength)) {
+      this.refusedBytes += bytes.byteLength;
       const seq = ++this.receiveSeq;
       this.healthState = "degraded";
       this.notifyFault({ kind: "parser-backlog", at: this.now(), message: "input rejected at bounded parser admission; drain before retrying new bytes",
@@ -225,9 +241,11 @@ export class PipeHistoryCollector {
     this.inflight.push({ seq, bytes: bytes.byteLength, at: receivedAtNs });
     this.inflightBytes += bytes.byteLength;
     if (!this.worker.feed(seq, bytes, this.sourceEpoch)) {
+      this.refusedBytes += bytes.byteLength;
       this.fault("worker-exit", "parser rejected input", "broken");
       return false;
     }
+    this.acceptedBytes += bytes.byteLength;
     if (this.inflightBytes > this.queueLimit) {
       if (this.healthState === "ok") {
         this.fault("parser-backlog", `parser backlog ${this.inflightBytes} bytes > ${this.queueLimit}`, "degraded");
@@ -255,10 +273,11 @@ export class PipeHistoryCollector {
   beginSourceEpoch(epoch: number): void {
     if (epoch <= this.upstreamEpoch) throw new Error(`upstream epoch must increase (${this.upstreamEpoch} -> ${epoch})`);
     this.upstreamEpoch = epoch;
+    const previousEpoch = this.sourceEpoch;
     // Parser recovery and upstream pipe restarts are independent breaks.
     this.sourceEpoch = Math.max(this.sourceEpoch + 1, epoch);
     this.notifyFault({ kind: "source-reset", at: this.now(), message: "owner requested parser reset; external reset ordering remains unverified",
-      receiveSeqFrom: this.ackedSeq + 1, receiveSeqTo: this.receiveSeq, lostRows: "unknown" });
+      sourceEpoch: previousEpoch, receiveSeqFrom: 0, receiveSeqTo: this.receiveSeq, lostRows: "unknown" });
     if (!this.worker.reset(this.sourceEpoch)) this.fault("worker-error", "parser reset admission failed", "broken");
   }
 
@@ -297,6 +316,8 @@ export class PipeHistoryCollector {
       receiveSeq: this.receiveSeq,
       ackedSeq: this.ackedSeq,
       inflightBytes: this.inflightBytes,
+      acceptedBytes: this.acceptedBytes,
+      refusedBytes: this.refusedBytes,
       scrolls: this.scrollCount,
       frames: this.frameCount,
       workerParseMs: this.workerParseNs / 1e6,
@@ -345,7 +366,7 @@ export class PipeHistoryCollector {
     if (health === "broken" || this.healthState !== "broken") this.healthState = health;
     const loss = health === "broken" || kind === "clear-policy-unknown" ? {
       unacknowledgedBytes: this.inflightBytes,
-      receiveSeqFrom: this.ackedSeq + 1,
+      receiveSeqFrom: Math.min(this.ackedSeq + 1, this.receiveSeq),
       receiveSeqTo: this.receiveSeq,
       lostRows: "unknown" as const,
     } : {};
@@ -376,86 +397,84 @@ export class PipeHistoryCollector {
     }
   }
 
-  private async pushRing(event: PipeScrollEvent): Promise<void> {
-    // The port sees the row first; only then may the tray make room.
-    await this.options.ports.onScroll(event);
-    this.scrollCount += 1;
-    this.ring.push(event);
-    while (this.ring.length - this.ringStart > this.ringRows) {
-      const evicted = this.ring[this.ringStart]!;
-      this.ringStart += 1;
-      this.options.onEvict?.(evicted);
-    }
-    if (this.ringStart > 4096 && this.ringStart * 2 > this.ring.length) {
-      this.ring.splice(0, this.ringStart);
-      this.ringStart = 0;
-    }
+  private pushRing(event: PipeScrollEvent): unknown {
+    const accepted = this.options.ports.onScroll(event);
+    const remember = () => {
+      this.scrollCount += 1;
+      this.ring.push(event);
+      while (this.ring.length - this.ringStart > this.ringRows) {
+        const evicted = this.ring[this.ringStart]!;
+        this.ringStart += 1;
+        this.options.onEvict?.(evicted);
+      }
+      if (this.ringStart > 4096 && this.ringStart * 2 > this.ring.length) {
+        this.ring.splice(0, this.ringStart);
+        this.ringStart = 0;
+      }
+    };
+    if (isReceipt(accepted)) return Promise.resolve(accepted).then(remember);
+    remember();
   }
 
-  private async onUpdate(update: PipeVtUpdate): Promise<void> {
+  private onUpdate(update: PipeVtUpdate): unknown {
     if (this.healthState === "broken" || this.healthState === "closed") return;
     const began = this.nowNs();
     this.workerParseNs += update.parseNs;
     this.workerEncodeNs += update.encodeNs;
-    try {
-    for (const scroll of update.scrolls) {
-      await this.pushRing({
-        paneKey: this.paneKey,
-        sourceEpoch: scroll.epoch,
-        geometryGeneration: scroll.gen,
-        physicalRow: scroll.row,
-        softWrap: scroll.wrap,
-        wrapPad: scroll.pad,
-        receiveSeq: scroll.seq ?? this.ackedSeq,
-      });
-    }
     const seqTo = update.seqTo ?? this.ackedSeq;
-    const dirty: Record<number, PipeVtRow> = {};
-    const softWrap: Record<number, boolean> = {};
-    for (const [y, row] of Object.entries(update.frame.dirty)) dirty[Number(y)] = row;
-    for (const [y, wrap] of Object.entries(update.frame.wraps)) softWrap[Number(y)] = wrap;
-    await this.options.ports.onFrame({
-      paneKey: this.paneKey,
-      sourceEpoch: update.epoch,
-      cells: {
-        full: update.frame.full,
-        shift: update.frame.shift,
-        cols: update.frame.cols,
-        rows: update.frame.rows,
-        dirty,
-        softWrap,
-        wrapPad: update.frame.pads,
-      },
-      cursor: update.frame.cursor,
-      kind: update.frame.kind,
-      geometryGeneration: update.gen,
-      receiveSeq: seqTo,
-    });
-    this.frameCount += 1;
-    // Everything up to seqTo is now published: record receive->frame latency.
-    const published = this.nowNs();
-    while (this.inflight.length && this.inflight[0]!.seq <= seqTo) {
-      const entry = this.inflight.shift()!;
-      this.inflightBytes -= entry.bytes;
-      if (this.latencyMs.length < this.latencyLimit) {
-        this.latencyMs.push(Number(published - entry.at) / 1e6);
+    const complete = () => {
+      this.frameCount += 1;
+      const published = this.nowNs();
+      while (this.inflight.length && this.inflight[0]!.seq <= seqTo) {
+        const entry = this.inflight.shift()!;
+        this.inflightBytes -= entry.bytes;
+        if (this.latencyMs.length < this.latencyLimit) this.latencyMs.push(Number(published - entry.at) / 1e6);
       }
-    }
-    // A parsed input acknowledgment, not process readiness, proves recovery.
-    if (seqTo > this.ackedSeq) {
-      this.ackedSeq = seqTo;
-      this.recoveryAttempts = 0;
-    }
-    this.hostHandleNs += published - began;
-    if (this.inflightBytes <= this.queueLimit) {
-      if (this.scrollOnClear !== undefined && update.scrollOnClear === this.scrollOnClear) this.policyUnverified = false;
-      if (this.healthState === "degraded" && !this.policyUnverified) this.healthState = "ok";
-      for (const waiter of this.drainWaiters.splice(0)) waiter();
-    }
-    } catch (error) {
+      if (seqTo > this.ackedSeq) {
+        this.ackedSeq = seqTo;
+        this.recoveryAttempts = 0;
+      }
+      this.hostHandleNs += published - began;
+      if (this.inflightBytes <= this.queueLimit) {
+        if (this.scrollOnClear !== undefined && update.scrollOnClear === this.scrollOnClear) this.policyUnverified = false;
+        if (this.healthState === "degraded" && !this.policyUnverified) this.healthState = "ok";
+        for (const waiter of this.drainWaiters.splice(0)) waiter();
+      }
+    };
+    const publish = () => {
+      const dirty: Record<number, PipeVtRow> = {};
+      const softWrap: Record<number, boolean> = {};
+      for (const [y, row] of Object.entries(update.frame.dirty)) dirty[Number(y)] = row;
+      for (const [y, wrap] of Object.entries(update.frame.wraps)) softWrap[Number(y)] = wrap;
+      const receipt = this.options.ports.onFrame({
+        paneKey: this.paneKey, sourceEpoch: update.epoch,
+        cells: { full: update.frame.full, shift: update.frame.shift,
+          cols: update.frame.cols, rows: update.frame.rows, dirty, softWrap, wrapPad: update.frame.pads },
+        cursor: update.frame.cursor, kind: update.frame.kind,
+        geometryGeneration: update.gen, receiveSeq: seqTo,
+      });
+      if (isReceipt(receipt)) return Promise.resolve(receipt).then(complete);
+      complete();
+    };
+    const next = (index: number): unknown => {
+      for (let i = index; i < update.scrolls.length; i++) {
+        const scroll = update.scrolls[i]!;
+        const receipt = this.pushRing({ paneKey: this.paneKey, sourceEpoch: scroll.epoch,
+          geometryGeneration: scroll.gen, physicalRow: scroll.row,
+          softWrap: scroll.wrap, wrapPad: scroll.pad, receiveSeq: scroll.seq ?? this.ackedSeq });
+        if (isReceipt(receipt)) return Promise.resolve(receipt).then(() => next(i + 1));
+      }
+      return publish();
+    };
+    const rejected = (error: unknown) => {
       this.fault("consumer-rejected", `scroll/frame receipt rejected: ${String(error)}`, "broken");
-    }
+    };
+    try {
+      const receipt = next(0);
+      if (isReceipt(receipt)) return Promise.resolve(receipt).catch(rejected);
+    } catch (error) { rejected(error); }
   }
+
 }
 
 /**

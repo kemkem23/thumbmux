@@ -200,10 +200,9 @@ export class PipeVtWorker {
       if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
     });
     child.stdout?.on("data", (chunk: Buffer) => {
-      child.stdout?.pause();
       this.outputTail = this.outputTail.then(() => this.onStdout(chunk)).catch((error) => {
         this.notifyFault({ kind: "protocol", at: now(), message: String(error) });
-      }).finally(() => child.stdout?.resume());
+      });
     });
     child.on("error", (error) => {
       this.notifyFault({ kind: "spawn", at: now(), message: error.message });
@@ -245,8 +244,14 @@ export class PipeVtWorker {
       }
       if (kind === "U" || kind === "H") {
         try {
-          if (kind === "U") await this.options.onUpdate(message as PipeVtUpdate);
-          else await this.options.onHistoryClear?.(message as { seq: number; epoch: number });
+          const receipt = kind === "U" ? this.options.onUpdate(message as PipeVtUpdate)
+            : this.options.onHistoryClear?.(message as { seq: number; epoch: number });
+          if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") {
+            // Bun's pipe pause/resume is costly at frame cadence. Only use it
+            // when the consumer actually has an outstanding async receipt.
+            this.child?.stdout?.pause();
+            try { await receipt; } finally { this.child?.stdout?.resume(); }
+          }
         } catch (error) {
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
@@ -322,6 +327,10 @@ export class PipeVtWorker {
   }
 
   /** Forward raw pipe bytes untouched; `seq` is the receive sequence. */
+  canAccept(bytes: number): boolean {
+    return this.queuedBytes + bytes + 21 <= 1024 * 1024;
+  }
+
   feed(seq: number, bytes: Uint8Array, epoch = 1): boolean {
     const prefix = Buffer.allocUnsafe(16);
     prefix.writeBigUInt64BE(BigInt(seq));

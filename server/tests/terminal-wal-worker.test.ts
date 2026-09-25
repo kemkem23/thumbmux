@@ -970,10 +970,13 @@ const PRODUCER_SAMPLES: Array<[string, string]> = [
 ];
 
 const PRODUCER_SCRIPT = `
-import json, sys, time
+import json, sys, time, os
 pane, rate, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 samples = [raw for raw, _ in json.loads(sys.argv[4])]
 out = sys.stdout.buffer
+if len(sys.argv) > 5:
+    while not os.path.exists(sys.argv[5]):
+        time.sleep(.005)
 start = time.monotonic()
 for i in range(count):
     if rate > 0:
@@ -1104,7 +1107,8 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
       const name = `p${p}`;
       const fifo = join(dir, `${name}.fifo`);
       const entry: (typeof panes)[number] = { name, fifo };
-      const command = `exec python3 -B ${shellQuote(producer)} ${name} ${cfg.rate} ${count} ${shellQuote(samples)}`;
+      const barrier = cfg.warmupSeconds ? ` ${shellQuote(join(dir, "start"))}` : "";
+      const command = `exec python3 -B ${shellQuote(producer)} ${name} ${cfg.rate} ${count} ${shellQuote(samples)}${barrier}`;
       const birth = [
         ...(p === 0 ? ["-f", "/dev/null"] : []),
         "new-session", "-d", "-s", name, "-x", String(cfg.cols), "-y", String(cfg.rows), command,
@@ -1122,6 +1126,7 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
       panes.push(entry);
     }
     const serverPid = Number(privateTmux(socket, ["display-message", "-p", "#{pid}"]).trim());
+    if (cfg.warmupSeconds) writeFileSync(join(dir, "start"), "start");
     await sleep(200); // let tmux's `sh -c exec cat` writers finish their exec
     for (const entry of panes) if (withPipe) entry.writer = writerPid(entry.fifo);
     if (cfg.warmupSeconds) await sleep(cfg.warmupSeconds * 1000);
@@ -1212,6 +1217,8 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
     };
     result.scrolls = stats.reduce((sum, s) => sum + s.scrolls, 0);
     result.frames = stats.reduce((sum, s) => sum + s.frames, 0);
+    result.admission = { acceptedBytes: stats.reduce((sum, s) => sum + s.acceptedBytes, 0),
+      refusedBytes: stats.reduce((sum, s) => sum + s.refusedBytes, 0) };
     result.oracle = { missing, extra, wrong };
     expect({ missing, extra, wrong }).toEqual({ missing: 0, extra: 0, wrong: 0 });
     return result;
@@ -1421,6 +1428,7 @@ test("I1 oversized admission is bounded and marks the exact rejected sequence", 
   expect(pane.collector.ingest(new Uint8Array(64 * 1024 + 65))).toBe(false);
   expect(pane.collector.stats().inflightBytes).toBe(0);
   const fault = pane.faults.at(-1)!;
+  expect(pane.collector.stats().refusedBytes).toBe(64 * 1024 + 65);
   expect(fault.kind).toBe("parser-backlog");
   expect(fault.receiveSeqFrom).toBe(seq);
   expect(fault.receiveSeqTo).toBe(seq);
