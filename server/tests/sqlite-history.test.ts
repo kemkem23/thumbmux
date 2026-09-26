@@ -354,6 +354,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
 import { PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from '../src/sqlite-history/schema';
+import { PROJECTION_OVERSIZE } from '../src/sqlite-history/types';
 import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell } from '../src/sqlite-history/types';
 const naKey:PaneKey={serverIdentity:'fixture-server',paneId:'%1',birthGeneration:1};
 const naCell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
@@ -393,7 +394,9 @@ test('newarch v2: atomic CAS, exact checked receipt, repair, alternate screen an
   await s.replaceScreen(naFrame());const old=s.token(naKey);
   const capture:ProjectionCapture={...naFrame(),receiveSeq:2,captureId:'cap-1',requestedAt:1,completedAt:2,firstHistoryRow:0,
     history:[naRow('right'),naRow('')],observedFields:['grapheme','style','cursor'],ambiguousRows:0,result:'exact'};
-  await expect(s.calibrate({capture,expectedRevision:old.revision-1,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  // The strict CAS belongs to screen evidence (FIX2 M2); history-only is covered by the FIX2 M2 case.
+  const quietCas={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2};
+  await expect(s.calibrate({capture,captureEvidence:quietCas,expectedRevision:old.revision-1,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
   await expect(s.calibrate({capture,expectedRevision:old.revision,checks:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
   expect(s.token(naKey)).toEqual(old);
   const receipt=await s.calibrate({capture,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2},expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
@@ -592,6 +595,101 @@ test('I2 FIX1 A-B2/C-F19: quiescent capture calibrates the displayed screen in t
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('I2 FIX2 B1: null evidence checks history without touching the screen; uncertain emoji rows are drawn but kept uncertified',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-b1-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('history',1));await s.replaceScreen({...naFrame(),rows:2,cells:[[naCell('A'),naCell(' ')],[naCell('B'),naCell(' ')]]});
+  const capture:ProjectionCapture={...naFrame(),rows:2,cells:[[naCell('Z'),naCell(' ')],[naCell('Y'),naCell(' ')]],captureId:'null-evidence',requestedAt:1,completedAt:2,
+   firstHistoryRow:0,history:[naRow('history')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  // I3 sends null when bytes moved during the capture: history only, no error.
+  const before=s.token(naKey);
+  const receipt=await s.calibrate({capture,expectedRevision:before.revision,captureEvidence:null,checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(receipt.revision).toBe(before.revision+1);
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null,uncertain_rows_json:'[]'});
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[1][0].grapheme).toBe('B');
+  expect(s.readPage(s.token(naKey),null,10).lines[0]).toMatchObject({checkState:'checked',checkedCaptureId:'null-evidence'});
+  // Quiescent with an uncertain emoji row: the whole capture is drawn, the row index is kept apart.
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:4,receiveSeqAfter:4};
+  const bad=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'bad-row'},expectedRevision:bad.revision,captureEvidence:{...quiet,uncertainRows:[2]},checks:[],repairs:[]})).rejects.toThrow('invalid-uncertain-rows');
+  expect(s.token(naKey)).toEqual(bad);
+  await s.calibrate({capture:{...capture,captureId:'emoji'},expectedRevision:bad.revision,captureEvidence:{...quiet,uncertainRows:[1,1]},checks:[],repairs:[]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'emoji',uncertain_rows_json:'[1]'});
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json)).map((r:any)=>r[0].grapheme)).toEqual(['Z','Y']);
+  // Evidence without the optional field is the plain quiescent shape: nothing uncertain.
+  await s.calibrate({capture:{...capture,captureId:'plain'},expectedRevision:s.token(naKey).revision,captureEvidence:quiet,checks:[],repairs:[]});
+  expect(s.screen(naKey)).toMatchObject({last_capture_id:'plain',uncertain_rows_json:'[]'});
+  await s.calibrate({capture:{...capture,captureId:'emoji2'},expectedRevision:s.token(naKey).revision,captureEvidence:{...quiet,uncertainRows:[0]},checks:[],repairs:[]});
+  // Durable with the screen, and the next pipe frame renders over it and clears the mark.
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'emoji2',uncertain_rows_json:'[0]'});
+  await s.replaceScreen({...naFrame(),rows:2,cells:[[naCell('N'),naCell(' ')],[naCell('M'),naCell(' ')]]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null,uncertain_rows_json:'[]'});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX2 M2: a history-only calibration is not refused for queued rows or a moved revision; screen evidence still is',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-m2-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('stable',1));
+  const read=s.token(naKey);
+  const capture:ProjectionCapture={...naFrame(),captureId:'busy',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:[naRow('stable')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  // Output keeps flowing: rows applied since the read and rows still queued behind it.
+  await s.appendScroll(naEvent('moved',2));
+  const queued=Array.from({length:50},(_,n)=>s.appendScroll(naEvent('q'+n,3+n)));
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2};
+  await expect(s.calibrate({capture,expectedRevision:read.revision,captureEvidence:quiet,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  for(const evidence of [null,undefined,{kind:'unfenced' as const,reason:'bytes arrived'}]) {
+   const receipt=await s.calibrate({capture:{...capture,captureId:'busy-'+String(evidence?.kind??evidence)},expectedRevision:read.revision,captureEvidence:evidence,checks:[{lineId:0,captureRow:0}],repairs:[]});
+   expect(receipt.revision).toBeGreaterThan(read.revision);
+  }
+  await Promise.all(queued);
+  const lines=s.readPage(s.token(naKey),null,100).lines;
+  expect(lines.length).toBe(52);
+  expect(lines[0]).toMatchObject({checkState:'checked',checkedCaptureId:'busy-unfenced'});
+  expect(s.screen(naKey)).toBeNull(); // history only: no screen was written
+  // Rows are still compared byte for byte: a stale mapping is refused atomically, never applied.
+  const t=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'wrong'},expectedRevision:read.revision,captureEvidence:null,checks:[{lineId:1,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
+  expect(s.token(naKey)).toEqual(t);
+  // A revision the pane never had is still the one CAS error.
+  await expect(s.calibrate({capture,expectedRevision:t.revision+1,captureEvidence:null,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX2 M1: an oversized event is ingest-oversize, never capacity-pressure, and counts once however often it is re-offered',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-m1-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const originalError=console.error;console.error=()=>{};
+ try {
+  await s.appendScroll(naEvent('kept',1));
+  const huge={...naEvent('',2),physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}};
+  for(let i=0;i<5;i++) {
+   const error=await s.appendScroll(huge).then(()=>null,e=>e);
+   expect(String(error)).toContain(PROJECTION_OVERSIZE);expect(String(error)).not.toContain('capacity');
+  }
+  expect(s.health().rejectedRows).toBe(1);
+  s.flush();
+  // A different oversized event is a second loss; re-offering it adds nothing.
+  const other={...naEvent('',3),physicalRow:{text:'y'.repeat(17*1024*1024),cells:[]}};
+  for(let i=0;i<3;i++)await expect(s.appendScroll(other)).rejects.toThrow(PROJECTION_OVERSIZE);
+  expect(s.health().rejectedRows).toBe(2);
+  // An oversized frame re-offered is refused each time, never counted as a row.
+  const bigFrame={...naFrame(),cells:[[{...naCell('z'),grapheme:'z'.repeat(17*1024*1024)},naCell(' ')]]};
+  for(let i=0;i<3;i++)await expect(s.replaceScreen(bigFrame)).rejects.toThrow(PROJECTION_OVERSIZE);
+  expect(s.health().rejectedRows).toBe(2);
+  await s.appendScroll(naEvent('after',4));s.flush();
+  const disk=new Database(s.file,{readonly:true});
+  try {
+   expect(disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind=?").get(PROJECTION_OVERSIZE)).toEqual({n:2});
+   expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-capacity' OR kind LIKE '%pressure%'").get()).toEqual({n:0});
+  }finally{disk.close();}
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['kept','after']);
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.health().rejectedRows).toBe(2);
+ }finally{console.error=originalError;await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, never downgrade a checked row, and survive reopen',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-i2-content-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
@@ -622,6 +720,16 @@ test('I2 FIX1: a v2 file carrying the pre-FIX1 CHECK lists is refused on recover
   db.exec(PROJECTION_SCHEMA.replace("'unchecked','checked','content-matched'","'unchecked','checked'").replace("'pipe','tmux-calibrated'","'pipe','tmux'"));
   db.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);db.close();
   expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('projection-schema-outdated');
+  // A FIX1 file (widened lists, no uncertain_rows_json) is refused too (FIX2 B1).
+  const fix1=mkdtempSync(join(tmpdir(),'na-i2-fix1-file-'));
+  try {
+   mkdirSync(join(fix1,'newarch-v2'),{recursive:true});
+   const old=new Database(join(fix1,'newarch-v2/history.sqlite3'));
+   const withoutColumn=PROJECTION_SCHEMA.replace(" uncertain_rows_json TEXT NOT NULL DEFAULT '[]',\n","");
+   expect(withoutColumn).not.toContain('uncertain_rows_json');
+   old.exec(withoutColumn);old.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);old.close();
+   expect(()=>createProjectionStore({historyRoot:fix1,mode:'recover'})).toThrow('projection-schema-outdated');
+  }finally{rmSync(fix1,{recursive:true,force:true});}
   // The current factory's own file passes the same check.
   const fresh=mkdtempSync(join(tmpdir(),'na-i2-current-'));
   try {const s=createProjectionStore({historyRoot:fresh,mode:'create'});await s.close();const r=createProjectionStore({historyRoot:fresh,mode:'recover'});await r.close();}

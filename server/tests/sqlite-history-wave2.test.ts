@@ -730,16 +730,25 @@ test('I2: 208x60 interleaved frames retain all scrolls under one bounded latest-
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',async()=>{
- const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
- const cases=[
+const I2_FIX1_MUTATIONS=[
   {name:'A-B2 quiescent-check',file:'ram-store.ts',before:"|| evidence.receiveSeqBefore!==evidence.receiveSeqAfter)throw new Error('capture-not-quiescent');",after:")throw new Error('capture-not-quiescent');"},
   {name:'C-F13 freelist',file:'ram-store.ts',before:'return (pages.page_count-free.freelist_count)*this.pageSize;',after:'return pages.page_count*this.pageSize;'},
   {name:'A-B4 guarantee',file:'projection-store.ts',before:"return mineBorrow<=Math.floor(pool/Math.max(2,borrowers)) && borrowed+mineBorrow<=pool?'ok':'pane';",after:"return 'ok';"},
   {name:'A-B1 fast-path',file:'projection-store.ts',before:'if(fence>=0) {',after:'if(queued.length) {'},
   {name:'C-F12 cas-at-admission',file:'projection-store.ts',before:'const receipt=this.ram.recordIssue(value,undefined,true);',after:'const receipt=this.ram.recordIssue(value);'},
   {name:'C-F11 async-epoch',file:'projection-store.ts',before:'.then(receipt=>{this.kickFlush();return receipt;}',after:'.then(receipt=>{this.flush();return receipt;}'},
- ];
+];
+// FIX2: each mutant removes one repair of this round; its oracle must go red.
+const I2_FIX2_MUTATIONS=[
+  {name:'FIX2-M2 history-only admission',file:'projection-store.ts',before:"if(historyOnly?change.expectedRevision>revision:this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');",after:"if(this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');"},
+  {name:'FIX2-M2 history-only run-time',file:'ram-store.ts',before:'if (historyOnly ? change.expectedRevision > Number(p.revision) : p.revision !== change.expectedRevision) throw',after:'if (p.revision !== change.expectedRevision) throw'},
+  {name:'FIX2-M1 count-once',file:'projection-store.ts',before:'if(identity===null || this.lastOversize.get(id)!==identity) {',after:'if(true) {'},
+  {name:'FIX2-M1 own-name',file:'projection-store.ts',before:'throw new Error(PROJECTION_OVERSIZE);',after:"throw new Error('ingest-capacity');"},
+  {name:'FIX2-B1 null-evidence',file:'ram-store.ts',before:"if(evidence?.kind==='quiescent') {",after:'if(evidence!==undefined) {'},
+  {name:'FIX2-B1 uncertain-rows',file:'ram-store.ts',before:'this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);',after:'this.screen(c,c.captureId,c.completedAt,c.observedFields);'},
+];
+async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
+ const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
  const results:any[]=[];
  try {
   for(const mutation of cases)for(const broken of [false,true]) {
@@ -762,7 +771,28 @@ test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when 
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
     const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.includes('quiescent')) {
+     if(name.startsWith('FIX2-M2')) {
+      await s.appendScroll(row('stable',1));const read=s.token(key);
+      await s.appendScroll(row('moved',2));
+      const queued=Array.from({length:20},(_,n)=>s.appendScroll(row('q'+n,3+n)));
+      let ok=true;
+      try {await s.calibrate({capture:{...frame('Z'),captureId:'history-only',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[{text:'stable',cells:[...'stable'].map(cell)}],observedFields:[],ambiguousRows:0,result:'fixture'},expectedRevision:read.revision,captureEvidence:null,checks:[{lineId:0,captureRow:0}],repairs:[]});}catch{ok=false;}
+      await Promise.all(queued);
+      assert(ok && s.readPage(s.token(key),null,5).lines[0].checkState==='checked','history-only calibration must not be refused for queued rows or a moved revision');
+     } else if(name.startsWith('FIX2-M1')) {
+      const huge={...row('',2),physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}};
+      const errors=[];for(let i=0;i<3;i++)errors.push(String(await s.appendScroll(huge).then(()=>'accepted',e=>e)));
+      assert(errors.every(e=>e.includes('ingest-oversize')),'oversize must reject under its own name: '+errors[0]);
+      assert(s.health().rejectedRows===1,'one oversized event re-offered 3 times is one loss, got '+s.health().rejectedRows);
+     } else if(name.startsWith('FIX2-B1')) {
+      await s.replaceScreen(frame('A'));
+      const capture=id=>({...frame('Z'),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:[],ambiguousRows:0,result:'fixture'});
+      let ok=true;
+      try {await s.calibrate({capture:capture('null'),expectedRevision:s.token(key).revision,captureEvidence:null,checks:[],repairs:[]});}catch{ok=false;}
+      assert(ok && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='A','null evidence checks history only, without an error');
+      await s.calibrate({capture:capture('emoji'),expectedRevision:s.token(key).revision,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:1,uncertainRows:[0]},checks:[],repairs:[]});
+      assert(s.screen(key).uncertain_rows_json==='[0]' && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='Z','an uncertain row is drawn and kept uncertified');
+     } else if(name.includes('quiescent')) {
       await s.replaceScreen(frame('A'));
       let rejected=false;
       try {await s.calibrate({capture:{...frame('Z'),captureId:'moving',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:[],ambiguousRows:0,result:'fixture'},expectedRevision:s.token(key).revision,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:2},checks:[],repairs:[]});}
@@ -808,9 +838,11 @@ test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when 
    console.log('I2_MUTATION',JSON.stringify({name:mutation.name,broken,exit,red,stderrTail:red?undefined:err.slice(-400)}));
    expect(exit).toBe(broken?1:0);if(broken)expect(err).toContain('MUTATION_RED:');
   }
-  console.log('I2_FIX1_MUTATIONS',JSON.stringify(results));
+  console.log(label,JSON.stringify(results));
  }finally{rmSync(root,{recursive:true,force:true});}
-},180000);
+}
+test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',()=>runI2Mutations(I2_FIX1_MUTATIONS,'I2_FIX1_MUTATIONS'),180000);
+test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
 
 test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
