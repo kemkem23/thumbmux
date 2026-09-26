@@ -37,17 +37,15 @@ export interface CalibrationCapture {
 /** FIX1-PLAN §1.2 evidence for drawing a capture over displayedScreen. There
  * is no byte fence: the claim is only that metadata was stable around the
  * capture and the parser received no pipe byte between the pre-capture read
- * and the post-capture read (a quiescent window). parserFrame is never fed. */
-export interface ScreenCalibrationEvidence {
-  kind: 'quiescent-capture';
-  displaySource: 'tmux-calibrated';
-  captureId: string;
-  sourceEpoch: number;
-  geometryGeneration: number;
-  /** Parser receive counter observed both before and after the capture. */
-  receiveSeq: number;
-  uncertainRows: readonly number[];
-}
+ * and the post-capture read (a quiescent window). parserFrame is never fed.
+ * Field-for-field the store's port (lot I2 `sqlite-history/types.ts`
+ * `CaptureEvidence`): the store draws the screen only for kind 'quiescent'
+ * and re-checks receiveSeqBefore === receiveSeqAfter itself; 'unfenced'
+ * commits history evidence only. Decoder-uncertain screen rows travel on the
+ * capture (`uncertainScreenRows`); I2's `ProjectionCapture.ambiguousRows`. */
+export type CaptureEvidence =
+  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number }
+  | { kind: 'unfenced'; reason: string };
 export interface CalibrationSnapshot {
   revision: number; sourceEpoch: number; geometryGeneration: number;
   recentHistory: readonly HistoryRow[]; parserFrame: CalibrationFrame;
@@ -61,11 +59,11 @@ export interface CalibrationPorts {
   schedule(deadline: number): void;
   read(): CalibrationSnapshot;
   // null is a CAS conflict; every screen/check/content-match/repair is in this
-  // one transaction. captureEvidence null = history only: the store must not
-  // replace displayedScreen with this capture.
+  // one transaction. Only kind 'quiescent' may replace displayedScreen;
+  // 'unfenced' = history only.
   calibrate(input: {
     capture: CalibrationCapture; checks: RowMatch['checks']; contentMatches: RowMatch['contentMatches'];
-    repairs: RowMatch['repairs']; expectedRevision: number; captureEvidence: ScreenCalibrationEvidence | null;
+    repairs: RowMatch['repairs']; expectedRevision: number; captureEvidence: CaptureEvidence;
   }): Promise<CalibrationCommit | null>;
   /** Called only with a frame the store committed in `commit`. */
   publish(commit: CalibrationCommit, frame: CalibrationFrame): void;
@@ -219,11 +217,10 @@ export class HistoryCalibrator {
       // FIX1-PLAN §1.2: no byte fence. The capture may replace displayedScreen
       // only when the parser received nothing while it ran; otherwise the pipe
       // frame is newer and this transaction carries history evidence only.
-      const receiveSeq = read.parserFrame.receiveSeq;
-      const captureEvidence: ScreenCalibrationEvidence | null = fence.parserFrame.receiveSeq !== receiveSeq ? null : {
-        kind: 'quiescent-capture', displaySource: 'tmux-calibrated', captureId: capture.captureId,
-        sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration, receiveSeq,
-        uncertainRows: capture.uncertainScreenRows ?? [],
+      const receiveSeqBefore = fence.parserFrame.receiveSeq, receiveSeq = read.parserFrame.receiveSeq;
+      const captureEvidence: CaptureEvidence = receiveSeqBefore !== receiveSeq ? { kind: 'unfenced', reason: 'received-during-capture' } : {
+        kind: 'quiescent', sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration,
+        receiveSeqBefore, receiveSeqAfter: receiveSeq,
       };
       const committed = await this.ports.calibrate({ capture, checks: match.checks, contentMatches: match.contentMatches, repairs: match.repairs, expectedRevision: read.revision, captureEvidence });
       if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
@@ -240,7 +237,7 @@ export class HistoryCalibrator {
       this.mode = 'PIPE'; this.latchAt = undefined; this.degraded = false;
       // Publish only the frame the store committed, and only if nothing newer
       // arrived since: a later byte or revision already supersedes it.
-      if (captureEvidence && latest.revision === committed.revision && latest.parserFrame.receiveSeq === receiveSeq) {
+      if (captureEvidence.kind === 'quiescent' && latest.revision === committed.revision && latest.parserFrame.receiveSeq === receiveSeq) {
         this.pendingPipe = undefined; this.nextPipePublish = Infinity;
         this.ports.publish(committed, capture.frame);
         // A parser frame without rows makes no screen claim to compare.

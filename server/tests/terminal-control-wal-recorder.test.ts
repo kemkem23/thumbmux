@@ -753,7 +753,7 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     const h = naHarness();
     const wrong = structuredClone(h.frame); wrong.cells = [naRow('bad ').cells]; h.parser(wrong);
     await h.calibrator.runDue();
-    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'quiescent-capture', displaySource: 'tmux-calibrated', captureId: 'capture-1', sourceEpoch: 1, geometryGeneration: 1, receiveSeq: 0, uncertainRows: [] });
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'quiescent', sourceEpoch: 1, geometryGeneration: 1, receiveSeqBefore: 0, receiveSeqAfter: 0 });
     expect(h.published).toEqual([2]);
     expect(h.calibrator.mode).toBe('PIPE');
     // Divergence re-arms 50ms: the next pipe byte redraws the parser cells.
@@ -1277,6 +1277,12 @@ test('DEBT 1 periodic output after the fence never pairs a row with an older cop
   // complete, without claiming which copy it is.
   expect(r.coverage).toBeGreaterThanOrEqual(0.99);
   expect(r.checkedCoverage).toBeLessThan(r.coverage);
+  // FIX2 m5 floor: coverage alone stays 1 if the matcher stops checking.
+  // Measured 4500/5872 = 0.76635 in both round-1 runs (fake clock, one
+  // input, so deterministic): rows are checked until their text repeats
+  // (row 3000 onwards has an older copy in the 4500-row ring). 0.75 leaves
+  // ~95 rows of slack for scheduling changes, not for a matcher that stops.
+  expect(r.checkedCoverage).toBeGreaterThanOrEqual(0.75);
 });
 
 test('DEBT 2 a screen-only capture does not erase the incremental seed', async () => {
@@ -1915,7 +1921,7 @@ describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', 
     h.ports.publish = (commit, frame) => { h.published.push(commit.revision); publishedFrame = frame; };
     await h.calibrator.runDue();
     expect(h.writes).toHaveLength(1);
-    expect(h.writes[0]!.captureEvidence).toMatchObject({ kind: 'quiescent-capture', displaySource: 'tmux-calibrated', receiveSeq: 0 });
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'quiescent', sourceEpoch: 1, geometryGeneration: 1, receiveSeqBefore: 0, receiveSeqAfter: 0 });
     expect(h.published).toEqual([2]);
     expect(equalCalibrationFrames(publishedFrame!, h.frame)).toBe(true);
   });
@@ -1931,7 +1937,7 @@ describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', 
     h.calibrator.output(() => pipe++);
     await h.calibrator.runDue();
     expect(h.writes).toHaveLength(1);
-    expect(h.writes[0]!.captureEvidence).toBeNull();
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'unfenced', reason: 'received-during-capture' });
     expect(h.writes[0]!.checks.map(c => c.lineId)).toEqual([2, 3, 4]);
     expect(h.published).toEqual([]);
     // The queued pipe frame is not cancelled: the pipe owns the screen.
@@ -1947,15 +1953,51 @@ describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', 
       return commit;
     };
     await h.calibrator.runDue();
-    expect(h.writes[0]!.captureEvidence).not.toBeNull();
+    expect(h.writes[0]!.captureEvidence.kind).toBe('quiescent');
     expect(h.published).toEqual([]);
     expect(h.calibrator.acceptsPipeFrame).toBe(true);
   });
   test('C-F19 a CAS conflict publishes nothing even with quiescent evidence', async () => {
     const h = naHarness(); h.conflict();
     await h.calibrator.runDue();
-    expect(h.writes[0]!.captureEvidence).not.toBeNull();
+    expect(h.writes[0]!.captureEvidence.kind).toBe('quiescent');
     expect(h.published).toEqual([]);
+  });
+  test('FIX2 B1 the evidence is the store port field for field: an I2-rule store draws the quiescent capture and never throws on an unfenced one', async () => {
+    // Store rule copied from lot I2 `sqlite-history/ram-store.ts` calibrate()
+    // at 6cf41a353: `evidence?.kind==='quiescent'`, integer seqs, epoch and
+    // geometry equal to the capture, before === after, else 'capture-not-quiescent'.
+    // Round 1 sent kind 'quiescent-capture' with one `receiveSeq`: this store
+    // skipped it silently and never drew the tmux screen.
+    const i2Store = (drawn: string[], commit: CalibrationPorts['calibrate']): CalibrationPorts['calibrate'] => async input => {
+      const evidence = input.captureEvidence, c = input.capture.after;
+      if (evidence?.kind === 'quiescent') {
+        if (!Number.isSafeInteger(evidence.receiveSeqBefore) || !Number.isSafeInteger(evidence.receiveSeqAfter)) throw new Error('invalid-integer');
+        if (evidence.sourceEpoch !== c.sourceEpoch || evidence.geometryGeneration !== c.geometryGeneration
+          || evidence.receiveSeqBefore !== evidence.receiveSeqAfter) throw new Error('capture-not-quiescent');
+        drawn.push(input.capture.captureId);
+      }
+      return commit(input);
+    };
+    const quiet = naHarness(), drawn: string[] = [];
+    quiet.ports.calibrate = i2Store(drawn, quiet.ports.calibrate);
+    await quiet.calibrator.runDue();
+    expect(Object.keys(quiet.writes[0]!.captureEvidence).sort()).toEqual(['geometryGeneration', 'kind', 'receiveSeqAfter', 'receiveSeqBefore', 'sourceEpoch']);
+    expect(drawn).toEqual(['capture-1']);
+    expect(quiet.published).toEqual([2]);
+    expect(quiet.faults).toEqual([]);
+    // Bytes during the capture: history still commits (checks reach the
+    // store), the screen is not drawn, and the store has nothing to reject.
+    const busy = naHarness(), busyDrawn: string[] = [];
+    const capture = busy.ports.capture;
+    busy.ports.capture = async (...args) => { const r = await capture(...args); busy.parser({ ...structuredClone(busy.frame), receiveSeq: 3 }); return r; };
+    busy.ports.calibrate = i2Store(busyDrawn, busy.ports.calibrate);
+    await busy.calibrator.runDue();
+    expect(busy.writes[0]!.captureEvidence).toEqual({ kind: 'unfenced', reason: 'received-during-capture' });
+    expect(busy.writes[0]!.checks.map(c => c.lineId)).toEqual([2, 3, 4]);
+    expect(busyDrawn).toEqual([]);
+    expect(busy.faults).toEqual([]);
+    expect(busy.published).toEqual([]);
   });
   test('A-M3 uncertain captured rows are never checked or content-matched, and screen uncertainty reaches the evidence', async () => {
     const rows = naRows(Array.from({ length: 12 }, (_, i) => `row-${i}`));
@@ -1969,7 +2011,9 @@ describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', 
     const capture = h.ports.capture;
     h.ports.capture = async (...args) => ({ ...(await capture(...args)), uncertainScreenRows: [0], uncertainHistoryRows: [2] });
     await h.calibrator.runDue();
-    expect(h.writes[0]!.captureEvidence!.uncertainRows).toEqual([0]);
+    // I2's CaptureEvidence has no row list: the rows ride on the capture.
+    expect(h.writes[0]!.captureEvidence.kind).toBe('quiescent');
+    expect(h.writes[0]!.capture.uncertainScreenRows).toEqual([0]);
     expect([...h.writes[0]!.checks, ...h.writes[0]!.contentMatches].some(c => c.capturedRow === 2)).toBe(false);
     expect(h.published).toEqual([2]);
   });
