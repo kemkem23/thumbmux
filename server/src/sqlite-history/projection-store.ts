@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
-import { prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
+import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
 import { readProjectionPage, projectionIssue } from './projection-reader';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
@@ -78,7 +78,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   let commits=0;
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
-      try {disk.close();}catch(error){console.error('[newarch] disk worker close failed',String(error));}
+      try {closePrepared(disk);}catch(error){console.error('[newarch] disk worker close failed',String(error));}
       // Bun keeps a worker alive while a parentPort 'message' listener is attached;
       // parentPort.close() alone does not release it, so the thread never exits.
       parentPort!.off('message',onMessage);parentPort!.close();return;
@@ -173,8 +173,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.disk.exec('PRAGMA wal_checkpoint(FULL)');
       const fd=openSync(dirname(this.file),'r');try {fsyncSync(fd);}finally {closeSync(fd);}
       this.recover();
-    } catch(error) { this.disk.close();this.ram.db.close();throw error; }
-    try {this.ensureWorker();}catch(error){this.ram.db.close();this.disk.close();throw error;}
+    } catch(error) { closePrepared(this.disk);closePrepared(this.ram.db);throw error; }
+    try {this.ensureWorker();}catch(error){closePrepared(this.ram.db);closePrepared(this.disk);throw error;}
     this.timer=setInterval(()=>{
       try {
         if(this.stopped)this.relievePressure();
@@ -813,7 +813,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const w of this.drainWaiters.splice(0))w.reject(new Error('store-closed'));
       this.closed=true;
       try {await this.stopWorker();}
-      finally {this.ram.db.close();this.disk.close();}
+      finally {closePrepared(this.ram.db);closePrepared(this.disk);}
     }
   }
   /** DB.close() runs in its owning thread; a stuck worker is terminated, never thrown at the caller. */

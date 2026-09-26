@@ -68,10 +68,17 @@ const PREPARED=new WeakMap<Database,Map<string,ReturnType<Database['query']>>>()
 /** Hold each statement for the lifetime of its DB, independently of Bun's 20-entry query cache. */
 export function prepared(db:Database,sql:string):ReturnType<Database['query']> {
   let cache=PREPARED.get(db);if(!cache){cache=new Map();PREPARED.set(db,cache);}
-  let statement=cache.get(sql);if(!statement){statement=db.prepare(sql);cache.set(sql,statement);}
+  let statement=cache.get(sql);if(!statement){statement=db.query(sql);cache.set(sql,statement);}
   return statement;
 }
 const UPSERT_STATEMENTS=new WeakMap<Database,Map<string,ReturnType<Database['query']>>>();
+/** Explicitly finalize the statements held outside Bun's query cache before closing SQLite. */
+export function closePrepared(db:Database):void {
+  const statements=PREPARED.get(db);
+  PREPARED.delete(db);UPSERT_STATEMENTS.delete(db);
+  try {if(statements)for(const statement of statements.values())statement.finalize();}
+  finally {db.close();}
+}
 export function upsert(db: Database, table: string, row: SqlRow): void {
   // All identifiers come exclusively from the schema and SQLite column metadata.
   if (!/^na_(pane|capture|line|screen|issue|commit)$/.test(table)) throw new Error('invalid-table');

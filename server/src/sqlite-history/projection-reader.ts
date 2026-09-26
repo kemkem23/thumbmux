@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
-import { prepared, decodeCells, integer, paneId, type ProjectionRam, type SqlRow } from './ram-store';
+import { closePrepared, prepared, decodeCells, integer, paneId, type ProjectionRam, type SqlRow } from './ram-store';
 import type { PaneKey, ProjectionArchiveReaderPort, ProjectionCheckState, ProjectionIssue, ProjectionPage, ProjectionToken } from './types';
 
 /** Overlay pending issue updates on their durable copies, just as for history rows. */
@@ -81,5 +81,5 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
       sourceEpoch:Number(row.source_epoch),geometryGeneration:Number(row.geometry_generation),revision:Number(row.revision),text:String(row.text),
       cells:decodeCells(String(row.cells_json)),softWrap:!!row.soft_wrap,checkState:row.check_state as ProjectionCheckState,
       checkReason:String(row.check_reason),checkedCaptureId:row.checked_capture_id as string|null,checkedRow:row.checked_row as number|null}))};
-  },close(){if(!closed){closed=true;db.close();}}};
+  },close(){if(!closed){closed=true;closePrepared(db);}}};
 }
