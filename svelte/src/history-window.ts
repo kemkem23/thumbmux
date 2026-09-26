@@ -457,7 +457,7 @@ export function applyHistoryWindowPage(
   const oldCount = state.lines.length;
   const combinedStart = page.direction === 'before' ? page.startLine : state.startLine;
   const combinedLines = page.direction === 'before'
-    ? [...state.lines, ...page.lines] // MUTANT M2: older page lands after the resident rows
+    ? [...page.lines, ...state.lines]
     : [...state.lines, ...page.lines];
   const combinedBytes = page.direction === 'before'
     ? [...pageBytes, ...state.lineBytes]
