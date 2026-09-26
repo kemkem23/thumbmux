@@ -1245,6 +1245,144 @@ async function measureRound(cfg: MeasureConfig, round: number, withPipe: boolean
   }
 }
 
+// FIX2-T: real shared interpreter, independent channel state and receipts.
+describe("FIX2-T multiplex", () => {
+  test("21 panes share one pid, keep split UTF-8 and row order separate, drain individually", async () => {
+    const pool = new PipeVtPool();
+    const panes: CollectedPane[] = [];
+    try {
+      for (let i = 0; i < 21; i++) panes.push(await collectPane(80, 3, {
+        pool, paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 },
+      }));
+      expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
+      for (const [i, pane] of panes.entries()) {
+        feedSplit(pane, encoder.encode(fixLines(`P${i}ไทย😀-`, 40).join("\r\n") + "\r\n"), 7);
+      }
+      for (const [i, pane] of panes.entries()) {
+        const receipt = await pane.collector.close();
+        expect(receipt.unknownTail).toBe(false);
+        expect(receipt.lastAckedSequence).toBe(receipt.lastAdmittedSequence);
+        expect(pane.scrolls.map(r => rowText(r.physicalRow).trimEnd())).toEqual(fixLines(`P${i}ไทย😀-`, 40).slice(0, 38));
+        expect(pane.faults).toEqual([]);
+      }
+    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
+  }, 30_000);
+
+  test("blocked consumer and timed out close do not stop a sibling", async () => {
+    const pool = new PipeVtPool();
+    let blocked = false;
+    const a = new PipeVtWorker({ pool, cols: 80, rows: 3, onFault: () => {}, onUpdate: () => {
+      blocked = true; return new Promise(() => {});
+    } });
+    let b: CollectedPane | undefined;
+    try {
+      await a.start(); b = await collectPane(80, 3, { pool });
+      a.feed(1, encoder.encode("blocked\r\n"));
+      await untilFix1(() => blocked);
+      b.collector.ingest(encoder.encode("B0\r\nB1\r\nB2\r\nB3\r\n"));
+      await settle(b, 3000);
+      expect(b.scrolls.map(r => rowText(r.physicalRow).trimEnd())).toEqual(["B0", "B1"]);
+      const r = await a.close(100);
+      expect(r.unknownTail).toBe(true);
+      expect(r.outputDrained).toBe(false);
+      b.collector.ingest(encoder.encode("B4\r\n"));
+      await settle(b, 3000);
+      expect(b.collector.stats().restartCount).toBe(0);
+      expect((await b.collector.close()).unknownTail).toBe(false);
+    } finally { await a.close(100); await b?.collector.close(); await pool.close(); }
+  }, 15_000);
+
+  for (const failure of ["SIGKILL", "control-EOF"] as const) test(`shared ${failure} marks every pane and restarts once into one new process`, async () => {
+    const pool = new PipeVtPool();
+    const panes: CollectedPane[] = [];
+    try {
+      for (let i = 0; i < 21; i++) panes.push(await collectPane(80, 3, { pool,
+        paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 } }));
+      const pid = panes[0]!.collector.workerPid;
+      // A paused pane must still receive the shared-process death marker.
+      ((panes[3]!.collector as unknown as WorkerInternals).worker as unknown as { socket: { pause(): void } }).socket.pause();
+      if (failure === "SIGKILL") panes[0]!.collector.killWorker();
+      else (pool as unknown as { current: { child: { stdin: { end(): void } } } }).current.child.stdin.end();
+      await untilFix1(() => panes.every(p => p.faults.some(f => f.kind === "worker-restarted")));
+      expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
+      expect(panes[0]!.collector.workerPid).not.toBe(pid);
+      for (const p of panes) {
+        const fault = p.faults.find(f => f.kind === "worker-exit")!;
+        expect(fault.paneKey).toEqual(p.collector.paneKey);
+        expect(fault.lostRows).toBe("unknown");
+        expect(fault.missingCount).toBeNull();
+        expect(p.collector.stats().restartCount).toBe(1);
+        expect(p.collector.currentSourceEpoch()).toBe(2);
+        p.collector.ingest(encoder.encode("after\r\n"));
+        await settle(p);
+      }
+    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
+  }, 30_000);
+
+  for (const malformed of ["reset", "oversize-header"] as const) test(`pane ${malformed} exception restarts only that pane and preserves sibling state`, async () => {
+    const pool = new PipeVtPool();
+    const panes: CollectedPane[] = [];
+    try {
+      const a = await collectPane(80, 3, { pool }); panes.push(a);
+      const b = await collectPane(80, 3, { pool }); panes.push(b);
+      b.collector.ingest(encoder.encode("keep")); await settle(b);
+      const pid = b.collector.workerPid;
+      // Malformed real X command raises in the Python dispatcher.
+      const worker = (a.collector as unknown as WorkerInternals).worker;
+      (worker as unknown as { write(parts: Buffer[]): boolean }).write([Buffer.from(malformed === "reset" ? [88, 0, 0, 0, 1, 0] : [68, 255, 255, 255, 255])]);
+      await untilFix1(() => a.faults.some(f => f.kind === "worker-restarted"));
+      b.collector.ingest(encoder.encode("-alive\r\n")); await settle(b);
+      expect(b.collector.workerPid).toBe(pid);
+      expect(b.collector.stats().restartCount).toBe(0);
+      expect(screenRows(b).map(r => r.text.trimEnd())).toContain("keep-alive");
+      expect(a.collector.stats().restartCount).toBe(1);
+    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
+  }, 30_000);
+});
+
+for (const [name, before, after] of [
+  ["shared-state", 'c["worker"] = Worker(cols, rows, epoch)', 'c["worker"] = next((v["worker"] for v in channels.values() if v["worker"] is not None), None) or Worker(cols, rows, epoch)'],
+  ["quit-ack", 'send(b"B", {"workerEof": True})', 'send(b"B", {"workerEof": False})'],
+  ["sequence-ack", '"seqTo": self.seq_to if ack else self.emitted_seq,', '"seqTo": 0,'],
+]) test(`FIX2-T mutation ${name}: clean passes and damaged real parser is detected`, async () => {
+  const assert = (await import("node:assert/strict")).default;
+  const root = mkdtempSync(join(tmpdir(), "multiplex-mutation-")); roots.push(root);
+  const original = pipeVtAssets();
+  const source = readFileSync(original.worker, "utf8");
+  expect(source.includes(before!)).toBe(true);
+  async function witness(mutated: boolean) {
+    const dir = join(root, mutated ? "damaged" : "clean"); mkdirSync(dir);
+    const assets = pipeVtAssets(dir);
+    writeFileSync(assets.worker, mutated ? source.replace(before!, after!) : source);
+    writeFileSync(assets.vendor, readFileSync(original.vendor));
+    writeFileSync(assets.license, readFileSync(original.license));
+    const pool = new PipeVtPool({ assets });
+    const snapshots: string[][] = [[], []];
+    const sequences: Array<Array<number | null>> = [[], []];
+    const panes = [0, 1].map(i => new PipeVtWorker({ pool, assets, cols: 80, rows: 3,
+      onFault: () => {}, onUpdate: u => {
+        if (u.frame.dirty["0"]) snapshots[i]!.push(rowText(u.frame.dirty["0"]).trimEnd());
+        sequences[i]!.push(u.seqTo);
+      } }));
+    try {
+      await Promise.all(panes.map(p => p.start()));
+      assert.equal(panes[0]!.pid, panes[1]!.pid);
+      panes[0]!.feed(1, encoder.encode("alpha"));
+      await sleep(30);
+      panes[1]!.feed(1, encoder.encode("bravo"));
+      await sleep(30);
+      panes[0]!.requestFull(1); panes[1]!.requestFull(1);
+      const receipts = await Promise.all(panes.map(p => p.close(1000)));
+      assert.deepEqual(snapshots.map(xs => xs.at(-1)), ["alpha", "bravo"]);
+      assert.deepEqual(sequences.map(xs => xs.at(-1)), [1, 1]);
+      assert.ok(receipts.every(r => r.workerEof && r.outputDrained && !r.unknownTail));
+    } finally { await Promise.all(panes.map(p => p.close(1000))); await pool.close(); }
+  }
+  await witness(false);
+  await assert.rejects(witness(true), { name: "AssertionError" });
+  console.log(`FIX2-T mutation ${name}: clean=PASS damaged=DETECTED (real multiplex Python)`);
+}, 20_000);
+
 test("I1 profile hot 20k rows/s alongside twenty normal panes", async () => {
   const result = await measureRound({ name: "I1-hot", panes: 21, cols: 80, rows: 24,
     rate: 100, hotRate: 20_000, seconds: 10, rounds: 1, baseline: false, idleSeconds: 0, warmupSeconds: 1 }, 1, true);
@@ -1968,140 +2106,3 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
   }, 30_000);
 });
 
-// FIX2-T: real shared interpreter, independent channel state and receipts.
-describe("FIX2-T multiplex", () => {
-  test("21 panes share one pid, keep split UTF-8 and row order separate, drain individually", async () => {
-    const pool = new PipeVtPool();
-    const panes: CollectedPane[] = [];
-    try {
-      for (let i = 0; i < 21; i++) panes.push(await collectPane(80, 3, {
-        pool, paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 },
-      }));
-      expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
-      for (const [i, pane] of panes.entries()) {
-        feedSplit(pane, encoder.encode(fixLines(`P${i}ไทย😀-`, 40).join("\r\n") + "\r\n"), 7);
-      }
-      for (const [i, pane] of panes.entries()) {
-        const receipt = await pane.collector.close();
-        expect(receipt.unknownTail).toBe(false);
-        expect(receipt.lastAckedSequence).toBe(receipt.lastAdmittedSequence);
-        expect(pane.scrolls.map(r => rowText(r.physicalRow).trimEnd())).toEqual(fixLines(`P${i}ไทย😀-`, 40).slice(0, 38));
-        expect(pane.faults).toEqual([]);
-      }
-    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
-  }, 30_000);
-
-  test("blocked consumer and timed out close do not stop a sibling", async () => {
-    const pool = new PipeVtPool();
-    let blocked = false;
-    const a = new PipeVtWorker({ pool, cols: 80, rows: 3, onFault: () => {}, onUpdate: () => {
-      blocked = true; return new Promise(() => {});
-    } });
-    let b: CollectedPane | undefined;
-    try {
-      await a.start(); b = await collectPane(80, 3, { pool });
-      a.feed(1, encoder.encode("blocked\r\n"));
-      await untilFix1(() => blocked);
-      b.collector.ingest(encoder.encode("B0\r\nB1\r\nB2\r\nB3\r\n"));
-      await settle(b, 3000);
-      expect(b.scrolls.map(r => rowText(r.physicalRow).trimEnd())).toEqual(["B0", "B1"]);
-      const r = await a.close(100);
-      expect(r.unknownTail).toBe(true);
-      expect(r.outputDrained).toBe(false);
-      b.collector.ingest(encoder.encode("B4\r\n"));
-      await settle(b, 3000);
-      expect(b.collector.stats().restartCount).toBe(0);
-      expect((await b.collector.close()).unknownTail).toBe(false);
-    } finally { await a.close(100); await b?.collector.close(); await pool.close(); }
-  }, 15_000);
-
-  for (const failure of ["SIGKILL", "control-EOF"] as const) test(`shared ${failure} marks every pane and restarts once into one new process`, async () => {
-    const pool = new PipeVtPool();
-    const panes: CollectedPane[] = [];
-    try {
-      for (let i = 0; i < 21; i++) panes.push(await collectPane(80, 3, { pool,
-        paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 } }));
-      const pid = panes[0]!.collector.workerPid;
-      // A paused pane must still receive the shared-process death marker.
-      ((panes[3]!.collector as unknown as WorkerInternals).worker as unknown as { socket: { pause(): void } }).socket.pause();
-      if (failure === "SIGKILL") panes[0]!.collector.killWorker();
-      else (pool as unknown as { current: { child: { stdin: { end(): void } } } }).current.child.stdin.end();
-      await untilFix1(() => panes.every(p => p.faults.some(f => f.kind === "worker-restarted")));
-      expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
-      expect(panes[0]!.collector.workerPid).not.toBe(pid);
-      for (const p of panes) {
-        const fault = p.faults.find(f => f.kind === "worker-exit")!;
-        expect(fault.paneKey).toEqual(p.collector.paneKey);
-        expect(fault.lostRows).toBe("unknown");
-        expect(fault.missingCount).toBeNull();
-        expect(p.collector.stats().restartCount).toBe(1);
-        expect(p.collector.currentSourceEpoch()).toBe(2);
-        p.collector.ingest(encoder.encode("after\r\n"));
-        await settle(p);
-      }
-    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
-  }, 30_000);
-
-  for (const malformed of ["reset", "oversize-header"] as const) test(`pane ${malformed} exception restarts only that pane and preserves sibling state`, async () => {
-    const pool = new PipeVtPool();
-    const panes: CollectedPane[] = [];
-    try {
-      const a = await collectPane(80, 3, { pool }); panes.push(a);
-      const b = await collectPane(80, 3, { pool }); panes.push(b);
-      b.collector.ingest(encoder.encode("keep")); await settle(b);
-      const pid = b.collector.workerPid;
-      // Malformed real X command raises in the Python dispatcher.
-      const worker = (a.collector as unknown as WorkerInternals).worker;
-      (worker as unknown as { write(parts: Buffer[]): boolean }).write([Buffer.from(malformed === "reset" ? [88, 0, 0, 0, 1, 0] : [68, 255, 255, 255, 255])]);
-      await untilFix1(() => a.faults.some(f => f.kind === "worker-restarted"));
-      b.collector.ingest(encoder.encode("-alive\r\n")); await settle(b);
-      expect(b.collector.workerPid).toBe(pid);
-      expect(b.collector.stats().restartCount).toBe(0);
-      expect(screenRows(b).map(r => r.text.trimEnd())).toContain("keep-alive");
-      expect(a.collector.stats().restartCount).toBe(1);
-    } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
-  }, 30_000);
-});
-
-for (const [name, before, after] of [
-  ["shared-state", 'c["worker"] = Worker(cols, rows, epoch)', 'c["worker"] = next((v["worker"] for v in channels.values() if v["worker"] is not None), None) or Worker(cols, rows, epoch)'],
-  ["quit-ack", 'send(b"B", {"workerEof": True})', 'send(b"B", {"workerEof": False})'],
-  ["sequence-ack", '"seqTo": self.seq_to if ack else self.emitted_seq,', '"seqTo": 0,'],
-]) test(`FIX2-T mutation ${name}: clean passes and damaged real parser is detected`, async () => {
-  const assert = (await import("node:assert/strict")).default;
-  const root = mkdtempSync(join(tmpdir(), "multiplex-mutation-")); roots.push(root);
-  const original = pipeVtAssets();
-  const source = readFileSync(original.worker, "utf8");
-  expect(source.includes(before!)).toBe(true);
-  async function witness(mutated: boolean) {
-    const dir = join(root, mutated ? "damaged" : "clean"); mkdirSync(dir);
-    const assets = pipeVtAssets(dir);
-    writeFileSync(assets.worker, mutated ? source.replace(before!, after!) : source);
-    writeFileSync(assets.vendor, readFileSync(original.vendor));
-    writeFileSync(assets.license, readFileSync(original.license));
-    const pool = new PipeVtPool({ assets });
-    const snapshots: string[][] = [[], []];
-    const sequences: Array<Array<number | null>> = [[], []];
-    const panes = [0, 1].map(i => new PipeVtWorker({ pool, assets, cols: 80, rows: 3,
-      onFault: () => {}, onUpdate: u => {
-        if (u.frame.dirty["0"]) snapshots[i]!.push(rowText(u.frame.dirty["0"]).trimEnd());
-        sequences[i]!.push(u.seqTo);
-      } }));
-    try {
-      await Promise.all(panes.map(p => p.start()));
-      assert.equal(panes[0]!.pid, panes[1]!.pid);
-      panes[0]!.feed(1, encoder.encode("alpha"));
-      await sleep(30);
-      panes[1]!.feed(1, encoder.encode("bravo"));
-      await sleep(30);
-      panes[0]!.requestFull(1); panes[1]!.requestFull(1);
-      const receipts = await Promise.all(panes.map(p => p.close(1000)));
-      assert.deepEqual(snapshots.map(xs => xs.at(-1)), ["alpha", "bravo"]);
-      assert.deepEqual(sequences.map(xs => xs.at(-1)), [1, 1]);
-      assert.ok(receipts.every(r => r.workerEof && r.outputDrained && !r.unknownTail));
-    } finally { await Promise.all(panes.map(p => p.close(1000))); await pool.close(); }
-  }
-  await witness(false);
-  await assert.rejects(witness(true), { name: "AssertionError" });
-  console.log(`FIX2-T mutation ${name}: clean=PASS damaged=DETECTED (real multiplex Python)`);
-}, 20_000);
