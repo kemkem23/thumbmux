@@ -184,12 +184,12 @@ test("NEWARCH I4: an alternate screen publishes only the screen, the seam at the
   expect(alt.content.split("\n")).toHaveLength(4);
 });
 
-test("NEWARCH I4: rows tmux pulled back onto a taller screen are not shown twice", () => {
+test("NEWARCH FIX1: equal history and screen text is preserved without explicit resize mapping", () => {
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(10)]], 10);
   const blank = parserRowCells([], 10);
   const ring = ["a", "b", "c", "d"].map((t) => ({ cells: row(t) }));
-  expect(screenOverlap(ring, [row("c"), row("d"), row("e")])).toBe(2);
+  expect(screenOverlap(ring, [row("c"), row("d"), row("e")])).toBe(0);
   expect(screenOverlap(ring, [row("e"), row("f")])).toBe(0);
-  // Blank rows alone never count as an overlap.
+  // Blank equality is no stronger evidence than nonblank equality.
   expect(screenOverlap([...ring, { cells: blank }], [blank, row("x")])).toBe(0);
 });
