@@ -208,7 +208,7 @@ function pushText(cells: TmuxObservedCell[], text: string, state: SgrState): voi
     at = end;
   }
 }
-function decodeLine(line: string, cols: number, state: SgrState): TmuxObservedCell[] {
+function decodeLine(line: string, cols: number, state: SgrState, clip = false): TmuxObservedCell[] {
   const cells: TmuxObservedCell[] = [];
   let at = 0;
   while (at < line.length) {
@@ -224,7 +224,13 @@ function decodeLine(line: string, cols: number, state: SgrState): TmuxObservedCe
     pushText(cells, text, state);
     at += text.length;
   }
-  if (cells.length > cols) throw new Error('capture row exceeds geometry');
+  if (cells.length > cols) {
+    if (!clip) throw new Error('capture row exceeds geometry');
+    cells.length = cols;
+    // A wide cell cut at the right edge loses its continuation: draw a blank.
+    const last = cells[cols - 1]!;
+    if (last.width === 2) cells[cols - 1] = { grapheme: ' ', width: 1, continuation: false, fg: last.fg, bg: last.bg, style: last.style };
+  }
   while (cells.length < cols) cells.push({ grapheme: ' ', width: 1, continuation: false, fg: 'default', bg: 'default', style: 0 });
   return cells;
 }
@@ -237,6 +243,36 @@ function checkedCols(cols: number): void {
 // indicator, skin tones joined by ZWJ (either side), and ZWJ flag sequences
 // (capture pads the VS16 cell with a space before the ZWJ).
 const AMBIGUOUS_EMOJI = /[\u{1f3fb}-\u{1f3ff}](?:\u2764|\u200d)|\u200d\p{Extended_Pictographic}\ufe0f?[\u{1f3fb}-\u{1f3ff}]|[\u{1f1e6}-\u{1f1ff}]{3}|[\u{1f3f3}\u{1f3f4}]\ufe0f? ?\u200d/u;
+/** Best-effort cells for a row whose tmux cell boundary is ambiguous: Unicode
+ * (wcwidth) widths, clipped to the pane width. Never certified as exact. */
+function decodeUncertainLine(line: string, cols: number, state: SgrState): TmuxObservedCell[] {
+  return decodeLine(line, cols, state, true);
+}
+/** Screen decode with row isolation (FIX1-PLAN §7.4 / A-M3): an emoji whose
+ * tmux cell boundary cannot be recovered makes only its own row uncertain.
+ * The row is still drawn with Unicode widths; `uncertainRows` tells the
+ * calibrator never to certify it. Any other decode fault still throws. */
+export function decodeTmuxCaptureScreen(raw: string, cols: number): { rows: TmuxObservedCell[][]; uncertainRows: number[] } {
+  checkedCols(cols);
+  const rawLines = raw.split('\n');
+  if (rawLines.at(-1) === '') rawLines.pop();
+  const uncertain = rawLines.map(line => AMBIGUOUS_EMOJI.test(line));
+  if (!uncertain.some(Boolean)) return { rows: decodeTmuxCaptureRows(raw, cols), uncertainRows: [] };
+  const lines = normalizeTmuxCaptureCells(raw).split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  // An escape spanning a line break would misalign flags and rows.
+  if (lines.length !== rawLines.length || !rawLines.every(escapesCloseInLine)) throw new Error('ambiguous tmux emoji cell boundary');
+  const state: SgrState = { fg: 'default', bg: 'default', style: 0 };
+  const uncertainRows: number[] = [];
+  const rows = lines.map((line, y) => {
+    if (!uncertain[y]) return decodeLine(line, cols, state);
+    uncertainRows.push(y);
+    return decodeUncertainLine(line, cols, state);
+  });
+  return { rows, uncertainRows };
+}
+/** Strict decode: throws on any ambiguous emoji boundary. Oracle use only;
+ * the capture path uses decodeTmuxCaptureScreen / TmuxCaptureDecoder. */
 export function decodeTmuxCaptureRows(raw: string, cols: number): TmuxObservedCell[][] {
   checkedCols(cols);
   if (AMBIGUOUS_EMOJI.test(raw)) throw new Error('ambiguous tmux emoji cell boundary');
@@ -307,18 +343,30 @@ function internCell(cell: TmuxObservedCell): Readonly<TmuxObservedCell> {
 export class TmuxCaptureDecoder {
   private cache = new Map<string, { cells: readonly Readonly<TmuxObservedCell>[]; fg: string; bg: string; style: number }>();
   hits = 0; misses = 0;
+  /** Row indexes of the last decode() that are isolated as uncertain. */
+  uncertainRows: number[] = [];
   constructor(readonly cols: number, private readonly maxEntries = 9000) {
     checkedCols(cols);
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('invalid decoder cache size');
   }
   decode(raw: string): (readonly Readonly<TmuxObservedCell>[])[] {
-    if (AMBIGUOUS_EMOJI.test(raw)) throw new Error('ambiguous tmux emoji cell boundary');
+    this.uncertainRows = [];
     const lines = raw.split('\n');
     if (lines.at(-1) === '') lines.pop();
-    if (!lines.every(escapesCloseInLine)) return decodeTmuxCaptureRows(raw, this.cols);
+    if (!lines.every(escapesCloseInLine)) {
+      const screen = decodeTmuxCaptureScreen(raw, this.cols);
+      this.uncertainRows = screen.uncertainRows;
+      return screen.rows;
+    }
     const state: SgrState = { fg: 'default', bg: 'default', style: 0 };
     const rows: (readonly Readonly<TmuxObservedCell>[])[] = [];
     for (const line of lines) {
+      if (AMBIGUOUS_EMOJI.test(line)) {
+        // Row isolation: drawn best-effort, never cached, never certified.
+        this.uncertainRows.push(rows.length);
+        rows.push(decodeUncertainLine(normalizeTmuxCaptureCells(line), this.cols, state));
+        continue;
+      }
       const key = `${state.fg}\u0000${state.bg}\u0000${state.style}\u0000${line}`;
       let entry = this.cache.get(key);
       if (entry) {
@@ -343,14 +391,17 @@ export class TmuxCaptureDecoder {
 
 export interface TmuxCaptureRowEvidence {
   cells: readonly TmuxObservedCell[] | null;
+  /** True only for rows decoded exactly as tmux serialized them. */
+  certain: boolean;
   reason: 'observed' | 'ambiguous-cell-boundary' | 'unsupported-row' | 'unknown-style-state';
 }
 /** Diagnostic projection. Unknown cells are never padded into invented blanks.
- * A partial result is NOT a calibrated screen; the strict decoder stays strict.
- * Carry SGR through ambiguous glyphs, and fail closed after an unparsed escape
- * until an explicit reset establishes the next row's style state again. */
+ * An ambiguous emoji row keeps best-effort Unicode-width cells with
+ * certain=false (row isolation): the screen stays drawable and `complete`,
+ * only that row is uncertain. Fail closed after an unparsed escape until an
+ * explicit reset establishes the next row's style state again. */
 export function decodeTmuxCaptureEvidence(raw: string, cols: number): {
-  rows: TmuxCaptureRowEvidence[]; complete: boolean;
+  rows: TmuxCaptureRowEvidence[]; complete: boolean; uncertainRows: number[];
 } {
   checkedCols(cols);
   const lines = raw.split('\n');
@@ -360,17 +411,18 @@ export function decodeTmuxCaptureEvidence(raw: string, cols: number): {
   const rows: TmuxCaptureRowEvidence[] = [];
   for (const line of lines) {
     if (!known && (line.startsWith('\x1b[0m') || line.startsWith('\x1b[m'))) known = true;
-    if (!known) { rows.push({ cells: null, reason: 'unknown-style-state' }); continue; }
+    if (!known) { rows.push({ cells: null, certain: false, reason: 'unknown-style-state' }); continue; }
     try {
       if (!escapesCloseInLine(line)) throw new Error('open escape');
-      const cells = decodeLine(normalizeTmuxCaptureCells(line), cols, state);
+      const normalized = normalizeTmuxCaptureCells(line);
       rows.push(AMBIGUOUS_EMOJI.test(line)
-        ? { cells: null, reason: 'ambiguous-cell-boundary' }
-        : { cells, reason: 'observed' });
+        ? { cells: decodeUncertainLine(normalized, cols, state), certain: false, reason: 'ambiguous-cell-boundary' }
+        : { cells: decodeLine(normalized, cols, state), certain: true, reason: 'observed' });
     } catch {
       known = false;
-      rows.push({ cells: null, reason: 'unsupported-row' });
+      rows.push({ cells: null, certain: false, reason: 'unsupported-row' });
     }
   }
-  return { rows, complete: rows.every(row => row.cells !== null) };
+  return { rows, complete: rows.every(row => row.cells !== null),
+    uncertainRows: rows.flatMap((row, y) => row.cells !== null && !row.certain ? [y] : []) };
 }

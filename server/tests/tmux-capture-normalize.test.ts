@@ -141,8 +141,15 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
       const raw = tmux('capture-pane', '-p', '-e', '-N', '-t', pane);
       const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
       if (ambiguous.has(cases[i]!)) {
-        console.log('NEWARCH_FIX1_AMBIGUOUS', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, disposition: 'reject certification; pipe remains live' }));
+        // A-M3 row isolation: the strict oracle refuses, the capture path keeps
+        // the whole 24-row screen and marks only this row uncertain.
         expect(() => decodeTmuxCaptureRows(raw, 80)).toThrow('ambiguous tmux emoji cell boundary');
+        const screen = decodeTmuxCaptureScreen(raw, 80);
+        console.log('NEWARCH_FIX1_AMBIGUOUS', JSON.stringify({ input: cases[i], raw: raw.split('\n')[0], cursor, rows: screen.rows.length, uncertainRows: screen.uncertainRows, disposition: 'screen drawn; row uncertain, never certified' }));
+        expect(screen.rows).toHaveLength(24);
+        expect(screen.uncertainRows).toEqual([0]);
+        expect(screen.rows.every(row => row.length === 80)).toBe(true);
+        expect(screen.rows[0]![0]!.grapheme).not.toBe(' ');
         continue;
       }
       const row = decodeTmuxCaptureRows(raw, 80)[0]!;
@@ -182,6 +189,14 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
       expect(row.slice(cells.length).every(c => c.grapheme === ' ' && c.width === 1)).toBe(true);
     }
     expect(() => decodeTmuxCaptureRows('x\u{1f1f9}\u{1f1ed}\u{1f1f9}y\n', 12)).toThrow('ambiguous tmux emoji cell boundary');
+    const isolated = decodeTmuxCaptureScreen('ok\nx\u{1f1f9}\u{1f1ed}\u{1f1f9}y\nnext\n', 12);
+    expect(isolated.uncertainRows).toEqual([1]);
+    expect(isolated.rows.map(row => row.length)).toEqual([12, 12, 12]);
+    expect(isolated.rows[2]!.slice(0, 4).map(c => c.grapheme).join('')).toBe('next');
+    // Clipped at the pane edge: a wide cell cut in half becomes a blank.
+    const clipped = decodeTmuxCaptureScreen('\u{1f1f9}\u{1f1ed}\u{1f1f9}\u{1f1ed}\u{1f1f9}\n', 5).rows[0]!;
+    expect(clipped).toHaveLength(5);
+    expect(clipped[4]).toMatchObject({ grapheme: ' ', width: 1, continuation: false });
   });
   test('memo decoder equals the uncached decoder, cold and warm, and falls back on open escapes', () => {
     let seed = 99;
@@ -193,10 +208,12 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
       const lines = Array.from({ length: 1 + Math.floor(rnd() * 3) }, () =>
         Array.from({ length: Math.floor(rnd() * 12) }, () => atoms[Math.floor(rnd() * atoms.length)]!).join(''));
       const raw = lines.join('\n') + '\n';
-      const expected = outcome(() => decodeTmuxCaptureRows(raw, 30));
+      // The memo decoder is the capture path: it isolates ambiguous rows.
+      const expected = outcome(() => decodeTmuxCaptureScreen(raw, 30));
       const memo = new TmuxCaptureDecoder(30, 3);
-      expect(outcome(() => memo.decode(raw))).toBe(expected);
-      expect(outcome(() => memo.decode(raw))).toBe(expected);
+      const viaMemo = () => ({ rows: memo.decode(raw), uncertainRows: memo.uncertainRows });
+      expect(outcome(viaMemo)).toBe(expected);
+      expect(outcome(viaMemo)).toBe(expected);
       if (!expected.startsWith('ERR')) decoded++;
     }
     expect(decoded).toBeGreaterThan(200);
@@ -220,15 +237,25 @@ describe('FIX2 decoder fast paths keep the FIX1 projection', () => {
   });
 });
 
-import { decodeTmuxCaptureEvidence } from '../src/tmux-capture-normalize';
+import { decodeTmuxCaptureEvidence, decodeTmuxCaptureScreen } from '../src/tmux-capture-normalize';
 test('I3 uncertainty stays on the ambiguous row and preserves following ANSI state', () => {
+  // A-M3: the ambiguous row keeps drawable Unicode-width cells, flagged
+  // uncertain; the screen stays complete instead of refusing calibration.
   const evidence = decodeTmuxCaptureEvidence('plain\n\x1b[31m🏳️ ‍🌈x\nnext\n', 20);
-  expect(evidence.complete).toBe(false);
+  expect(evidence.complete).toBe(true);
+  expect(evidence.uncertainRows).toEqual([1]);
   expect(evidence.rows).toHaveLength(3);
   expect(evidence.rows[0]!.cells![0]!.grapheme).toBe('p');
-  expect(evidence.rows[1]).toEqual({ cells: null, reason: 'ambiguous-cell-boundary' });
+  expect(evidence.rows[0]!.certain).toBe(true);
+  expect(evidence.rows[1]!.reason).toBe('ambiguous-cell-boundary');
+  expect(evidence.rows[1]!.certain).toBe(false);
+  expect(evidence.rows[1]!.cells).toHaveLength(20);
+  expect(evidence.rows[1]!.cells![0]!.fg).toBe('index:1');
   expect(evidence.rows[2]!.cells![0]!.fg).toBe('index:1');
   expect(() => decodeTmuxCaptureRows('plain\n🏳️ ‍🌈x\nnext\n', 20)).toThrow();
+  const screen = decodeTmuxCaptureScreen('plain\n\x1b[31m🏳️ ‍🌈x\nnext\n', 20);
+  expect(screen.uncertainRows).toEqual([1]);
+  expect(JSON.stringify(screen.rows)).toBe(JSON.stringify(evidence.rows.map(row => row.cells)));
 });
 test('I3 unsupported escape poisons style until an explicit reset without inventing blank rows', () => {
   const evidence = decodeTmuxCaptureEvidence('ok\n\x1b[38;2;300;0;0mX\nunknown\n\x1b[0mrecovered\n\n', 12);
@@ -237,6 +264,7 @@ test('I3 unsupported escape poisons style until an explicit reset without invent
   expect(evidence.rows[3]!.cells![0]!.fg).toBe('default');
   expect(evidence.rows[4]!.cells).toHaveLength(12);
   expect(decodeTmuxCaptureEvidence('a\n\n', 12).complete).toBe(true);
+  expect(decodeTmuxCaptureEvidence('ok\n\x1b[38;2;300;0;0mX\n', 12).complete).toBe(false);
 });
 
 test('I3 mutation control: certifying ambiguous cells fails and original stays intact', () => {
@@ -244,15 +272,15 @@ test('I3 mutation control: certifying ambiguous cells fails and original stays i
   try {
     const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
       .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
-    const from = "? { cells: null, reason: 'ambiguous-cell-boundary' }";
+    const from = "certain: false, reason: 'ambiguous-cell-boundary' }";
     expect(original.split(from)).toHaveLength(2);
     writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
 import {decodeTmuxCaptureEvidence} from './subject.ts';
 const result=decodeTmuxCaptureEvidence('ok\\n🏳️ ‍🌈x\\nnext\\n',20);
-assert.equal(result.complete,false,'MUTATION ambiguous cells');
-assert.equal(result.rows[1].cells,null,'MUTATION unknown row');`);
+assert.equal(result.rows[1].certain,false,'MUTATION ambiguous cells certified');
+assert.deepEqual(result.uncertainRows,[1],'MUTATION uncertain row lost');`);
     for (const mutated of [false, true]) {
-      writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, "? { cells, reason: 'ambiguous-cell-boundary' }") : original);
+      writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, "certain: true, reason: 'ambiguous-cell-boundary' }") : original);
       const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
       console.log('I3_MUTATION', JSON.stringify({ name: 'ambiguous-cells', mutated, exit: result.status, stderr: result.stderr }));
       expect(result.status).toBe(mutated ? 1 : 0);
