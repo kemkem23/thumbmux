@@ -156,7 +156,7 @@ type SharedGeneration = {
   child: ChildProcess; directory: string; path: string; ready: Promise<void>;
   done: Promise<void>; users: number; dead: boolean; sockets: Set<Socket>;
 };
-type SharedLease = { socket: Socket; pid: number; release(): Promise<void>; kill(signal: NodeJS.Signals): void };
+type SharedLease = { socket: Socket; pid: number; done: Promise<void>; release(): Promise<void>; kill(signal: NodeJS.Signals): void };
 
 /** One interpreter, independent bounded duplex channels and parser state per pane.
  * A dead generation is never reused. Every attached socket sees EOF on process
@@ -230,7 +230,7 @@ export class PipeVtPool {
       const socket = createConnection({ path: gen.path });
       gen.sockets.add(socket);
       socket.once("close", () => gen.sockets.delete(socket));
-      return { socket, pid: gen.child.pid!, release, kill: signal => {
+      return { socket, pid: gen.child.pid!, done: gen.done, release, kill: signal => {
         gen.dead = true; if (this.current === gen) this.current = null; gen.child.kill(signal);
       } };
     } catch (error) { await release(); throw error; }
@@ -289,19 +289,31 @@ export class PipeVtWorker {
       this.pid = lease.pid;
       const socket = this.socket = lease.socket;
       socket.on("data", (chunk: Buffer) => this.receiveOutput(chunk));
+      let channelError: Error | undefined;
       socket.on("error", (error) => {
-        this.readyReject?.(error);
-        this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: error.message });
+        channelError = error;
+        // close owns fault delivery: a socket error can precede the child exit
+        // event, while the pool still points at the dying generation.
       });
       socket.on("close", () => {
         this.exited = true;
         this.leaseDone = lease.release();
-        if (!this.closing) {
-          const message = "shared parser channel closed unexpectedly; unacknowledged tail is unknown";
-          this.readyReject?.(new Error(message));
-          this.notifyFault({ kind: "worker-exit", at: (this.options.now ?? Date.now)(), message });
-        }
         for (const waiter of this.exitWaiters.splice(0)) waiter();
+        void (async () => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            // Let process close invalidate the generation before recovery. A
+            // channel-only failure must remain bounded and spare its siblings.
+            await Promise.race([lease.done, new Promise<void>(resolve => {
+              timer = setTimeout(resolve, 100);
+            })]);
+          } finally { if (timer) clearTimeout(timer); }
+          const message = channelError?.message ?? "shared parser channel closed unexpectedly; unacknowledged tail is unknown";
+          this.readyReject?.(new Error(message));
+          if (!this.closing) {
+            this.notifyFault({ kind: "worker-exit", at: (this.options.now ?? Date.now)(), message });
+          }
+        })();
       });
       const attach = Buffer.alloc(12);
       attach.writeUInt16BE(this.options.cols); attach.writeUInt16BE(this.options.rows, 2);
