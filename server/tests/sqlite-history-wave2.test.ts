@@ -281,7 +281,7 @@ test('I2 FIX1 A-B4: scroll pressure pauses one pane without loss, its live scree
   expect(s.health()).toMatchObject({status:'healthy',pressure:'none',rejectedRows:0});
   expect(s.readPage(s.token(key),null,30).lines.map(l=>l.text.split(':')[0])).toEqual([...Array.from({length:20},(_,i)=>String(i)),'recovered']);
   const disk=new Database(s.file,{readonly:true});
-  try {expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:0});}finally{disk.close();}
+  try {expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-oversize'").get()).toEqual({n:0});}finally{disk.close();}
   console.log('NA_PRESSURE',JSON.stringify({firstRefused:first,reofferedAfterWait:waits,faults:faults.length,screen:'Z',health:s.health().status}));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
@@ -354,7 +354,7 @@ test('newarch FIX2: one pane at 10x cannot consume twenty other admission shares
   const disk=new Database(s.file,{readonly:true});
   try {
    // Backpressure is not loss: no capacity issue rows at all.
-   expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:0});
+   expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-oversize'").get()).toEqual({n:0});
    for(let i=1;i<21;i++)expect(s.token(keys[i]).nextLineId).toBe(101);
   }finally{disk.close();}
   expect(normalRefused).toBe(0);expect(hotRefused).toBeGreaterThan(0);
@@ -375,7 +375,7 @@ test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery
   await s.replaceScreen(frame);expect(s.health().pendingBytes).toBe(first);
   s.flush();expect(s.health().pendingBytes).toBe(0);
   const before=s.token(key).revision;
-  await expect(s.replaceScreen({...frame,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]})).rejects.toThrow('ingest-capacity');
+  await expect(s.replaceScreen({...frame,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]})).rejects.toThrow('ingest-oversize');
   expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('x');
   expect(s.token(key).revision).toBeGreaterThan(before); // explicit fault, not the rejected screen
   s.flush();
@@ -383,7 +383,7 @@ test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery
   const row=s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:2,softWrap:false,physicalRow:{text:'kept',cells:[]}});
   const transition=s.replaceScreen({...frame,sourceEpoch:2});
   const oversized=s.replaceScreen({...frame,sourceEpoch:2,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]});
-  await expect(oversized).rejects.toThrow('ingest-capacity');await Promise.all([row,transition]);
+  await expect(oversized).rejects.toThrow('ingest-oversize');await Promise.all([row,transition]);
   let maxPending=s.health().pendingBytes;
   // Fault kinds deliberately differ, so throttling cannot hide budget growth.
   const originalError=console.error;console.error=()=>{};
@@ -638,7 +638,7 @@ test('I2 FIX1 A-B4: hot pane 20000 rows/s beside 21 panes: backpressure on the h
    wrong+=page.lines.filter((l,n)=>l.text!==`${i}:${n}`.padEnd(80,' ')).length;}
   const disk=new Database(s.file,{readonly:true});
   let issues:any;
-  try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-capacity'").get();}finally{disk.close();}
+  try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-oversize'").get();}finally{disk.close();}
   console.error=originalError;
   console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,hotOk,hotPressure:hotRefused,hotLost,normalRefused,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
   expect(normalRefused).toBe(0);expect(frameRefused).toBe(0);expect(missing+wrong).toBe(0);

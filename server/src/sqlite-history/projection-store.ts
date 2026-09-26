@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
 import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
 import { readProjectionPage, projectionIssue } from './projection-reader';
+import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=256*1024;
@@ -137,6 +138,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private pressureRefusals=0;
   private ramBytesCache=-1;
   private refusedBytes=new Map<string,number>();
+  private lastOversize=new Map<string,string>();
   private drainWaiters:Array<{id:string;key:PaneKey;resolve:()=>void;reject:(e:unknown)=>void}>=[];
   private durableWaiters:Array<{key:PaneKey;revision:number;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void}>=[];
   constructor(private readonly options:ProjectionOptions) {
@@ -194,7 +196,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
     })();
     if(this.ram.bytes()>this.cacheMax) throw new Error('recovery-cache-limit');
-    this.rejectedRows=Number((this.disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind='ingest-capacity'").get() as SqlRow).n);
+    this.rejectedRows=Number((this.disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind IN (?,'ingest-capacity')").get(PROJECTION_OVERSIZE) as SqlRow).n);
     this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     const last=this.disk.query('SELECT committed_at FROM na_commit ORDER BY committed_at DESC LIMIT 1').get() as SqlRow|null;
     this.lastCommitAt=last?Number(last.committed_at):null;
@@ -211,13 +213,13 @@ export class ProjectionStore implements ProjectionWriterPort {
     let emit=false;
     this.ram.db.transaction(()=>{
       for(const p of panes) {
-        const tag=String(p.pane_key)+':'+kind, capacity=kind==='ingest-capacity';
+        const tag=String(p.pane_key)+':'+kind, capacity=kind===PROJECTION_OVERSIZE;
         // Capacity refusals that keep recurring are one episode with one issue id,
         // even when the pane briefly recovers between them.
         let previous=this.faults.get(tag);
         if(previous && capacity && now-previous.seen>CAPACITY_EPISODE_MS)previous=undefined;
         const count=(previous?.count??0)+(capacity?lostRows:0);
-        if(previous && kind!=='ingest-capacity' && now-previous.last<1000)continue;
+        if(previous && kind!==PROJECTION_OVERSIZE && now-previous.last<1000)continue;
         if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
         if(!previous || now-previous.last>=1000)emit=true;
         const id=previous?.id??randomUUID();
@@ -236,7 +238,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.faultEmitted.set(kind,now);
     const fault={kind,reason,at:now,pendingBytes:this.pendingBytes(),panes:panes.map(p=>({
       paneKey:{serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)},
-      sourceEpoch:Number(p.source_epoch),boundaryLineId:Number(p.next_line_id),missingCount:kind==='ingest-capacity'?lostRows:null}))};
+      sourceEpoch:Number(p.source_epoch),boundaryLineId:Number(p.next_line_id),missingCount:kind===PROJECTION_OVERSIZE?lostRows:null}))};
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
@@ -299,19 +301,28 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.kickFlush();
     return {accepted:false,reason:'capacity-pressure',scope};
   }
-  /** An event bigger than an idle store admits: waiting cannot help, so it is a recorded loss. */
-  private rejectOversize(key:PaneKey,value:{sourceEpoch:number;geometryGeneration:number},isScroll:boolean):never {
-    this.degraded=true;if(isScroll)this.rejectedRows++;
-    const id=paneId(key),pending=this.capacityLosses.get(id);
-    if(pending){if(isScroll)pending.count++;}
-    else {
-      if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
-        const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
+  /**
+   * An event bigger than an idle store admits: waiting cannot help, so it is a
+   * recorded loss under its own name (M1), never the transient 'capacity-pressure'.
+   * `identity` names the event; the same event offered again is refused again
+   * but counted once, so a caller that retries cannot grow the loss counters.
+   */
+  private rejectOversize(key:PaneKey,value:{sourceEpoch:number;geometryGeneration:number},isScroll:boolean,identity:string|null=null):never {
+    const id=paneId(key);
+    if(identity===null || this.lastOversize.get(id)!==identity) {
+      if(identity!==null)this.lastOversize.set(id,identity);
+      this.degraded=true;if(isScroll)this.rejectedRows++;
+      const pending=this.capacityLosses.get(id);
+      if(pending){if(isScroll)pending.count++;}
+      else {
+        if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
+          const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
+        }
+        this.capacityLosses.set(id,{key:{...key},count:isScroll?1:0});
+        this.fault(PROJECTION_OVERSIZE,'incoming event larger than an idle store admits; accepted rows retained',key,0);
       }
-      this.capacityLosses.set(id,{key:{...key},count:isScroll?1:0});
-      this.fault('ingest-capacity','incoming event larger than an idle store admits; accepted rows retained',key,0);
     }
-    throw new Error('ingest-capacity');
+    throw new Error(PROJECTION_OVERSIZE);
   }
   /** Resolves when the pane may offer the event it was refused, sized as refused. */
   drained(key:PaneKey):Promise<void> {
@@ -361,9 +372,9 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   private drainLosses():void {
     for(const [id,loss] of this.capacityLosses) {
-      const tag=id+':ingest-capacity';
+      const tag=id+':'+PROJECTION_OVERSIZE;
       if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
-      this.fault('ingest-capacity','incoming history event rejected; accepted rows retained',loss.key,loss.count);
+      this.fault(PROJECTION_OVERSIZE,'incoming history event rejected; accepted rows retained',loss.key,loss.count);
       this.capacityLosses.delete(id);
     }
   }
@@ -443,7 +454,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(this.closing)throw new Error('store-closing');
       const id=paneId(event.paneKey),text=event.physicalRow.text,estimate=text.length+512;
       // Decide from the text size before touching cells: a refused row is never copied.
-      if(estimate>this.maxEvent())this.rejectOversize(event.paneKey,event,true);
+      if(estimate>this.maxEvent())this.rejectOversize(event.paneKey,event,true,`${event.sourceEpoch}:${event.receiveSeq}:${text.length}:${text.slice(0,32)}:${text.slice(-32)}`);
       // A pane with a refused row stays paused until that row fits again, so no
       // later row can overtake it (the caller re-offers the refused row first).
       const paused=this.refusedBytes.get(id);
@@ -490,7 +501,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       validateFrame(frame);
       const encoded=encodeFrameCells(frame.cells);
       const bytes=Buffer.byteLength(encoded)+Buffer.byteLength(pane)+512,delta=bytes-previous;
-      if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false);
+      if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false,`frame:${frame.sourceEpoch}:${frame.receiveSeq}:${bytes}`);
       const scope=this.liveRam()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
       if(scope!=='ok')return Promise.resolve(this.pressure(frame.paneKey,bytes,scope,false));
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame,null,null,[],encoded);return this.ram.bump(frame.paneKey);})();
@@ -510,7 +521,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     // Validate before touching the tail: a bad frame is refused alone, the queued frame keeps its job.
     validateFrame(frame);
     const id=paneId(frame.paneKey),encoded=encodeFrameCells(frame.cells),bytes=Buffer.byteLength(encoded)+Buffer.byteLength(id)+512+128*((tail.waiters?.length??0)+1),delta=bytes-tail.bytes;
-    if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false);
+    if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false,`frame:${frame.sourceEpoch}:${frame.receiveSeq}:${bytes}`);
     const scope=this.liveRam()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
     if(scope!=='ok')return Promise.resolve(this.pressure(frame.paneKey,bytes,scope,false));
     const frozen=structuredClone({...frame,cells:[]});
@@ -551,18 +562,22 @@ export class ProjectionStore implements ProjectionWriterPort {
     catch {console.error('[newarch] fault sink failed');}
   }
   /**
-   * Calibration keeps its strict run-time CAS: any frame or row admitted since
-   * the caller's read bumps the revision, which is exactly the quiescence the
-   * displayed-screen overwrite needs (FIX1 §1.2). A pane with queued work fails
-   * fast instead of waiting to fail.
+   * A calibration with screen evidence keeps its strict run-time CAS: any frame
+   * or row admitted since the caller's read bumps the revision, which is exactly
+   * the quiescence the displayed-screen overwrite needs (FIX1 §1.2), so a pane
+   * with queued work fails fast instead of waiting to fail. A history-only
+   * calibration (no quiescent evidence) is never refused for queued work or a
+   * moved revision (M2): it runs in queue order and its rows are compared byte
+   * for byte in the transaction. 'stale-revision' is the one CAS conflict error.
    */
   calibrate(change:ProjectionCalibration):Promise<ProjectionReceipt> {
+    const historyOnly=change.captureEvidence?.kind!=='quiescent';
     try {
       if(this.closed)throw new Error('store-closed');
-      const pane=paneId(change.capture.paneKey);
-      if(this.queues.get(pane)?.length || this.ram.revisionOf(change.capture.paneKey)!==change.expectedRevision)throw new Error('stale-revision');
+      const pane=paneId(change.capture.paneKey),revision=this.ram.revisionOf(change.capture.paneKey);
+      if(historyOnly?change.expectedRevision>revision:this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');
     }catch(error){return Promise.reject(error);}
-    return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c),'barrier') as Promise<ProjectionReceipt>;
+    return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c,historyOnly),'barrier') as Promise<ProjectionReceipt>;
   }
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
   screen(key:PaneKey,kind:'normal'|'alternate'='normal'):SqlRow|null {
@@ -608,14 +623,14 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(p.health==='degraded' && this.ram.pane({serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)}).health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
           this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
           // Keep capacity episodes open so a refusal right after recovery reuses the issue.
-          for(const [tag,f] of this.faults)if(f.pane===p.pane_key && !tag.endsWith(':ingest-capacity'))this.faults.delete(tag);
+          for(const [tag,f] of this.faults)if(f.pane===p.pane_key && !tag.endsWith(':'+PROJECTION_OVERSIZE))this.faults.delete(tag);
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
         }
       }
       this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     }
     const now=Date.now();
-    for(const [tag,f] of this.faults)if(tag.endsWith(':ingest-capacity') && now-f.seen>CAPACITY_EPISODE_MS && !this.capacityLosses.has(f.pane))this.faults.delete(tag);
+    for(const [tag,f] of this.faults)if(tag.endsWith(':'+PROJECTION_OVERSIZE) && now-f.seen>CAPACITY_EPISODE_MS && !this.capacityLosses.has(f.pane))this.faults.delete(tag);
     this.settleDurable();this.settleDrains();
   }
   private finishWorker():void {

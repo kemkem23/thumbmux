@@ -528,7 +528,7 @@ test('newarch: capacity rejection cannot advance generation past accepted histor
  try {
   const old=s.appendScroll(naEvent('accepted',1));
   const rejected=s.appendScroll({...naEvent('',2),sourceEpoch:2,geometryGeneration:2,physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}});
-  await expect(rejected).rejects.toThrow('ingest-capacity');await old;s.flush();
+  await expect(rejected).rejects.toThrow('ingest-oversize');await old;s.flush();
   expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['accepted']);
   expect(s.health().rejectedRows).toBe(1);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
