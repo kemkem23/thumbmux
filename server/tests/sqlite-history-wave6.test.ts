@@ -605,7 +605,7 @@ async function measureProjectionLoad(cols:number,rows:number) {
       for(;produced<due;produced++)for(let i=0;i<keys.length;i++) {
         const text=`${i}:${produced}`.padEnd(80,' '); // exactly 80 history columns in both screen geometries
         track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}})
-          .then(()=>{accepted++;},()=>{refused++;}));
+          .then((r:any)=>{if(r?.accepted===false)refused++;else accepted++;},()=>{refused++;}));
       }
     };
     while(performance.now()-start<60000) {
@@ -616,7 +616,7 @@ async function measureProjectionLoad(cols:number,rows:number) {
       for(;frames<dueFrames;frames++) {
         const i=frames%21,t=performance.now();
         track(s.replaceScreen({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced,cols,rows,kind:'normal',cells,cursor:{row:frames%rows,col:0,visible:true}})
-          .then(()=>{screens.push(performance.now()-t);},()=>{screenRefused++;}));
+          .then((r:any)=>{if(r?.accepted===false)screenRefused++;else screens.push(performance.now()-t);},()=>{screenRefused++;}));
       }
       if(now>=nextSample) {
         const h=s.health();pending.push(h.pendingBytes);rss.push(h.rssBytes);sampleGaps.push(now-sampled);sampled=now;nextSample=now+20;
@@ -659,7 +659,9 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
     expect(r.refused).toBe(0);expect(r.screenRefused).toBe(0);expect(r.accepted).toBe(126000);
     expect(r.producerMs).toBeLessThan(61000);expect(r.healthSampleGapMs.max).toBeLessThanOrEqual(100);
     expect(r.flushAgeMs.n).toBeGreaterThan(100);expect(r.flushAgeMs.p95).toBeLessThanOrEqual(150);
-    expect(r.screenResolveMs.p95).toBeLessThanOrEqual(16);expect(r.pendingBytes.max).toBeLessThan(16*1024*1024);
+    // FIX1 §4: frame receipt through the fast path, p95 ≤ 16 ms and p99 ≤ 50 ms (F17).
+    expect(r.screenResolveMs.p95).toBeLessThanOrEqual(16);expect(r.screenResolveMs.p99).toBeLessThanOrEqual(50);
+    expect(r.pendingBytes.max).toBeLessThan(16*1024*1024);
     expect(r.rssBytes.max).toBeLessThanOrEqual(256*1024*1024);
     expect(r.missing+r.extra+r.wrong).toBe(0);
   }

@@ -395,12 +395,12 @@ test('newarch v2: atomic CAS, exact checked receipt, repair, alternate screen an
   await expect(s.calibrate({capture,expectedRevision:old.revision-1,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
   await expect(s.calibrate({capture,expectedRevision:old.revision,checks:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
   expect(s.token(naKey)).toEqual(old);
-  const receipt=await s.calibrate({capture,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:capture.receiveSeq},expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
+  const receipt=await s.calibrate({capture,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2},expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
   expect(receipt.durableRevision).toBe(0);expect(receipt.nextLineId).toBe(2);
   expect(()=>s.readPage(old,null,2)).toThrow('page-retry');
   let rows=s.readPage(s.token(naKey),null,2).lines;
   expect(rows.map(r=>r.text)).toEqual(['right','']);expect(rows.every(r=>r.checkState==='checked'&&r.checkedCaptureId==='cap-1')).toBe(true);
-  expect(s.screen(naKey)?.display_source).toBe('tmux');
+  expect(s.screen(naKey)?.display_source).toBe('tmux-calibrated');
   await s.replaceScreen({...naFrame(),kind:'alternate'});expect(s.token(naKey).nextLineId).toBe(2);
   expect(s.screen(naKey,'normal')?.last_capture_id).toBe('cap-1');
   expect(s.screen(naKey,'alternate')?.display_source).toBe('pipe');
@@ -556,40 +556,167 @@ test('I2: issue and monotonic epoch CAS survive reopen with unknown loss and arc
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('I2: unfenced capture checks history without replacing screen and invalid fences roll back atomically',async()=>{
- const dir=mkdtempSync(join(tmpdir(),'na-i2-fence-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+test('I2 FIX1 A-B2/C-F19: quiescent capture calibrates the displayed screen in the same transaction; unfenced or moving captures never do',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fence-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   await s.appendScroll(naEvent('history',1));await s.replaceScreen(naFrame());
   const capture:ProjectionCapture={...naFrame(),cells:[[naCell('Z'),naCell(' ')]],captureId:'unfenced',requestedAt:1,completedAt:2,
    firstHistoryRow:0,history:[naRow('history')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
-  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,captureEvidence:{kind:'unfenced',reason:'no byte fence'},checks:[{lineId:0,captureRow:0}],repairs:[]});
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,captureEvidence:{kind:'unfenced',reason:'bytes arrived during capture'},checks:[{lineId:0,captureRow:0}],repairs:[]});
   expect(s.screen(naKey)?.display_source).toBe('pipe');
   expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('A');
   expect(s.readPage(s.token(naKey),null,10).lines[0].checkState).toBe('checked');
+  // Bytes arrived while capturing: the whole calibration rolls back.
   const token=s.token(naKey);
-  await expect(s.calibrate({capture:{...capture,captureId:'bad'},expectedRevision:token.revision,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:2},checks:[],repairs:[]})).rejects.toThrow('capture-fence-mismatch');
+  const moving={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:2};
+  await expect(s.calibrate({capture:{...capture,captureId:'moving'},expectedRevision:token.revision,captureEvidence:moving,checks:[],repairs:[]})).rejects.toThrow('capture-not-quiescent');
   expect(s.token(naKey)).toEqual(token);
-  await s.calibrate({capture:{...capture,captureId:'good'},expectedRevision:token.revision,captureEvidence:{kind:'byte-fence',sourceEpoch:1,receiveSeq:1},checks:[],repairs:[]});
-  expect(s.screen(naKey)?.display_source).toBe('tmux');
+  // A pipe frame after the caller's read is newer than the capture: CAS refuses it.
+  const read=s.token(naKey);await s.replaceScreen({...naFrame(),cells:[[naCell('P'),naCell(' ')]]});
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:3,receiveSeqAfter:3};
+  await expect(s.calibrate({capture:{...capture,captureId:'late'},expectedRevision:read.revision,captureEvidence:quiet,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('P');
+  // No receiveSeq equality with the parser is required (tmux has no byte fence).
+  const receipt=await s.calibrate({capture:{...capture,captureId:'good',receiveSeq:0},expectedRevision:s.token(naKey).revision,captureEvidence:quiet,checks:[],repairs:[]});
+  const shown=s.screen(naKey)!;
+  expect(shown).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'good',revision:receipt.revision});
+  expect(JSON.parse(String(shown.cells_json))[0][0].grapheme).toBe('Z');
+  // The store and a reopened reader see the calibrated screen, not the parser frame.
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'good'});
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('Z');
+  // The next pipe frame renders over the calibrated screen at once.
+  await s.replaceScreen({...naFrame(),cells:[[naCell('N'),naCell(' ')]]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null});
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('I2: same-generation frame receipt follows every accepted scroll',async()=>{
+test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, never downgrade a checked row, and survive reopen',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-content-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  for(const [i,t] of ['$ ','unique','$ ','$ '].entries())await s.appendScroll(naEvent(t,i+1));
+  const capture:ProjectionCapture={...naFrame(),captureId:'c1',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:['$ ','unique','$ ','$ '].map(naRow),observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,checks:[{lineId:1,captureRow:1}],contentMatches:[{lineId:0,captureRow:0},{lineId:2,captureRow:2}],repairs:[]});
+  let lines=s.readPage(s.token(naKey),null,10).lines;
+  expect(lines.map(l=>[l.checkState,l.checkReason])).toEqual([['content-matched','content-capture'],['checked','exact-capture'],['content-matched','content-capture'],['unchecked','awaiting-capture']]);
+  // Content never lies: a content match with different text is refused atomically.
+  const before=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'c2',history:['x','unique','$ ','$ '].map(naRow)},expectedRevision:before.revision,checks:[],contentMatches:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
+  expect(s.token(naKey)).toEqual(before);
+  // A later content match keeps the identity proven by anchors.
+  await s.calibrate({capture:{...capture,captureId:'c3'},expectedRevision:before.revision,checks:[],contentMatches:[{lineId:1,captureRow:1},{lineId:3,captureRow:3}],repairs:[]});
+  s.flush();await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  lines=s.readPage(s.token(naKey),null,10).lines;
+  expect(lines.map(l=>[l.checkState,l.checkedCaptureId])).toEqual([['content-matched','c1'],['checked','c1'],['content-matched','c1'],['content-matched','c3']]);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1: a v2 file carrying the pre-FIX1 CHECK lists is refused on recover',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-outdated-'));
+ try {
+  const s=createProjectionStore({historyRoot:dir,mode:'create'});const file=s.file;await s.close();
+  const db=new Database(file);
+  db.exec("PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=replace(sql,\"'tmux-calibrated'\",\"'tmux'\") WHERE name='na_screen'; PRAGMA writable_schema=OFF;");db.close();
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('projection-schema-outdated');
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 A-B1: a same-generation frame is published at once, ahead of queued scrolls, with the committed history seam',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-i2-seam-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   const events:string[]=[];
-  const a=s.appendScroll(naEvent('first',1)).then(()=>events.push('scroll'));
-  const b=s.replaceScreen(naFrame()).then(r=>{events.push('frame');expect(r.nextLineId).toBe(1);});
-  await Promise.all([a,b]);expect(events).toEqual(['scroll','frame']);
+  const rows=Array.from({length:500},(_,i)=>s.appendScroll(naEvent(`row ${i}`,i+1)));
+  const a=Promise.all(rows).then(()=>events.push('scroll'));
+  const started=performance.now();
+  const b=s.replaceScreen({...naFrame(),cells:[[naCell('F'),naCell(' ')]]}).then(r=>{events.push('frame');return {r,ms:performance.now()-started};});
+  // Written to RAM synchronously: visible before any queued row was applied.
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('F');
+  expect(s.token(naKey).nextLineId).toBe(0);
+  const [{r,ms}]=await Promise.all([b,a]);
+  expect(events).toEqual(['frame','scroll']);
+  expect(r).toMatchObject({nextLineId:0});expect(ms).toBeLessThan(16);
+  expect(s.token(naKey).nextLineId).toBe(500);
+  // Queued rows never overwrite the newer screen, and every row is kept in order.
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('F');
+  expect(s.readPage(s.token(naKey),null,600).lines.map(l=>l.text)).toEqual(Array.from({length:500},(_,i)=>`row ${i}`));
+  console.log('I2_FIX1_FASTPATH',JSON.stringify({queuedRows:500,frameResolveMs:ms,frameNextLineId:(r as {nextLineId:number}).nextLineId}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('I2 FIX1 C-F12: issue and transition CAS is checked at admission, not after queued output of the same pane',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-cas-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('seed',1));
+  // Output keeps arriving: rows and a frame are queued/applied before the issue runs.
+  const rows=Array.from({length:50},(_,i)=>s.appendScroll(naEvent(`busy ${i}`,i+2)));
+  const read=s.token(naKey);
+  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:read.revision,kind:'reader-lost',reason:'fixture',missingCount:null,boundaryLineId:read.nextLineId,recoverable:true};
+  const recorded=s.recordIssue(issue);
+  const transition=s.transitionEpoch({...issue,expectedRevision:read.revision,nextEpoch:2});
+  // A caller that read before a published frame is stale by definition.
+  await s.replaceScreen(naFrame());
+  await expect(s.recordIssue({...issue,expectedRevision:read.revision})).rejects.toThrow('stale-revision');
+  await Promise.all(rows);
+  const [r1,r2]=await Promise.all([recorded,transition]);
+  expect(r2.revision).toBeGreaterThan(r1.revision);
+  expect(s.token(naKey)).toMatchObject({sourceEpoch:2,nextLineId:51});
+  const page=s.readPage(s.token(naKey),null,100);
+  expect(page.lines.map(l=>l.text)).toEqual(['seed',...Array.from({length:50},(_,i)=>`busy ${i}`)]);
+  expect(page.issues.map(i=>i.boundaryLineId)).toEqual([1,1]);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 C-F11: transitionEpoch returns the RAM receipt while the disk is locked; durable() follows without blocking',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-async-epoch-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const lock=new Database(s.file);
+ try {
+  await s.appendScroll(naEvent('before',1));s.flush();
+  lock.exec('BEGIN IMMEDIATE');   // a real writer holds the disk: every commit waits busy_timeout then fails
+  const started=performance.now();
+  const receipt=await s.transitionEpoch({paneKey:naKey,sourceEpoch:1,nextEpoch:2,geometryGeneration:1,expectedRevision:s.token(naKey).revision,
+   boundaryLineId:1,kind:'reader-restart',reason:'fixture',missingCount:null,recoverable:true});
+  const ms=performance.now()-started;
+  expect(ms).toBeLessThan(50);expect(receipt.durableRevision).toBeLessThan(receipt.revision);
+  expect(s.token(naKey).sourceEpoch).toBe(2);
+  let durable=false;const pending=s.durable(naKey,receipt.revision).then(r=>{durable=true;return r;});
+  await Bun.sleep(400);expect(durable).toBe(false);
+  lock.exec('COMMIT');
+  const done=await pending;expect(done.durableRevision).toBeGreaterThanOrEqual(receipt.revision);
+  console.log('I2_FIX1_ASYNC_EPOCH',JSON.stringify({transitionMs:ms,durableAfterUnlock:true}));
+ }finally{try{lock.exec('ROLLBACK');}catch{}lock.close();await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 C-F13: RAM pressure clears after real eviction; freelist pages are not counted as live',async()=>{
+ // A 6 MiB cache with real ~1 KB rows; no stubbed byte counter. The 5000 lines kept after eviction fit, a 6300-line burst does not.
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-freelist-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:6*1024*1024}),ram=(s as any).ram;
+ clearInterval((s as any).timer);
+ try {
+  let n=0,refusal:any=null;
+  // A pane-share refusal is flushed away (the pane may hold ~4.8 MiB); only RAM pressure ends the fill.
+  while(!refusal && n<20000){const r:any=await s.appendScroll(naEvent(`row ${n} `.padEnd(400,'x'),n+1));if(r.accepted!==false)n++;else if(r.scope==='pane')s.flush();else refusal=r;}
+  const full=ram.bytes();
+  expect(refusal).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  expect(s.health()).toMatchObject({status:'stopped',pressure:'recoverable',rejectedRows:0});
+  s.flush();   // acknowledge evicts all but the last 5000 lines of the pane
+  const pages=(ram.db.query('PRAGMA page_count').get() as any).page_count,free=(ram.db.query('PRAGMA freelist_count').get() as any).freelist_count;
+  const after=ram.bytes();
+  const drained=await Promise.race([s.drained(naKey).then(()=>'drained'),Bun.sleep(2000).then(()=>'stuck')]);
+  console.log('I2_FIX1_FREELIST',JSON.stringify({rowsBeforePressure:n,full,after,pages,free,drained}));
+  expect(free).toBeGreaterThan(0);expect(after).toBeLessThan(full);expect(s.health().ramBytes).toBe(after);
+  expect(drained).toBe('drained');
+  expect(await s.appendScroll(naEvent(`row ${n} `.padEnd(400,'x'),n+1))).toMatchObject({nextLineId:n+1});
+  s.flush();expect(s.health().status).not.toBe('stopped');
+  expect(s.readPage(s.token(naKey),null,10).lines[0].text).toBe('row 0 '.padEnd(400,'x'));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},60000);
 
 test('I2: first epoch and pre-output fault persist without a fabricated initial frame',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-i2-birth-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   const receipt=await s.transitionEpoch({paneKey:naKey,sourceEpoch:0,nextEpoch:1,geometryGeneration:1,expectedRevision:0,
    boundaryLineId:0,kind:'reader-start',reason:'no prior byte boundary',missingCount:null,recoverable:false});
-  expect(receipt.durableRevision).toBe(receipt.revision);expect(s.screen(naKey)).toBeNull();
+  expect((await s.durable(naKey,receipt.revision)).durableRevision).toBe(receipt.revision);expect(s.screen(naKey)).toBeNull();
   await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
   expect(s.token(naKey)).toMatchObject({sourceEpoch:1,nextLineId:0});
   expect(s.readPage(s.token(naKey),null,1).issues[0]).toMatchObject({boundaryLineId:0,missingCount:null,sourceEpoch:1});
