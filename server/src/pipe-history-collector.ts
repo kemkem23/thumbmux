@@ -107,6 +107,16 @@ export type PipeLatencySummary = {
   maxMs: number | null;
 };
 
+export type PipeCollectorDrainReceipt = {
+  lastAdmittedSequence: number;
+  lastAckedSequence: number;
+  /** Filled by the runtime/store adapter, which owns these revision spaces. */
+  ramRevision: number | null;
+  durableRevision: number | null;
+  issues: string[];
+  unknownTail: boolean;
+};
+
 export type PipeHistoryCollectorOptions = {
   paneKey: PaneKey;
   sourceEpoch: number;
@@ -467,13 +477,25 @@ export class PipeHistoryCollector {
     this.hostHandleNs = 0n;
   }
 
-  async close(): Promise<void> {
-    if (this.healthState === "closed") return;
+  async close(): Promise<PipeCollectorDrainReceipt> {
+    if (this.healthState === "closed") return this.shutdownReceipt(["collector was already closed"]);
     this.closing = true;
     await this.recovering;
-    await this.worker.close(this.options.closeTimeoutMs);
+    const worker = await this.worker.close(this.options.closeTimeoutMs);
     this.healthState = "closed";
     for (const waiter of this.drainWaiters.splice(0)) waiter();
+    return this.shutdownReceipt(worker.issues, worker.unknownTail);
+  }
+
+  private shutdownReceipt(issues: string[], workerUnknown = false): PipeCollectorDrainReceipt {
+    return {
+      lastAdmittedSequence: this.receiveSeq,
+      lastAckedSequence: this.ackedSeq,
+      ramRevision: null,
+      durableRevision: null,
+      issues: [...issues],
+      unknownTail: workerUnknown || this.ackedSeq !== this.receiveSeq || this.inflightBytes !== 0 || this.held.length !== 0,
+    };
   }
 
   /** Fault injection for tests: the parser process dies abruptly. */

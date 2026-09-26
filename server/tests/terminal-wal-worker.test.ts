@@ -1884,6 +1884,33 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
     expect(faults.some((f) => f.kind === "shutdown-timeout" && f.lostRows === "unknown")).toBe(true);
   }, 15_000);
 
+  test("I4-T orderly close reports the exact admitted/acked parser fence", async () => {
+    const pane = await collectPane(80, 3);
+    pane.collector.ingest(encoder.encode(fixLines("D", 80).join("\r\n") + "\r\n"));
+    const receipt = await pane.collector.close();
+    expect(receipt.lastAdmittedSequence).toBeGreaterThan(0);
+    expect(receipt.lastAckedSequence).toBe(receipt.lastAdmittedSequence);
+    expect(receipt.unknownTail).toBe(false);
+    expect(receipt.issues).toEqual([]);
+    expect(receipt.ramRevision).toBeNull();
+    expect(receipt.durableRevision).toBeNull();
+    expect(pane.scrolls.map((row) => rowText(row.physicalRow).trimEnd()))
+      .toEqual(fixLines("D", 80).slice(0, 80 + 1 - 3));
+  });
+
+  test("I4-T consumer timeout returns an unknown sequence tail", async () => {
+    const pane = await collectPane(80, 3, { closeTimeoutMs: 50, ports: {
+      onScroll: () => new Promise(() => {}), onFrame: () => {}, onFault: (f) => { pane.faults.push(f); },
+    } });
+    pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
+    await sleep(25);
+    const receipt = await pane.collector.close();
+    expect(receipt.lastAdmittedSequence).toBeGreaterThan(receipt.lastAckedSequence);
+    expect(receipt.unknownTail).toBe(true);
+    expect(receipt.issues.join(" ")).toContain("remaining updates dropped");
+    expect(pane.faults.some((f) => f.kind === "shutdown-timeout" && f.lostRows === "unknown")).toBe(true);
+  }, 15_000);
+
   test("C-F4 resize and full-frame requests are admitted while the data queue is full", async () => {
     const pane = await collectPane(80, 24, { queueLimitBytes: 4 * 1024 * 1024 });
     const pid = pane.collector.workerPid!;

@@ -92,6 +92,13 @@ export type PipeVtFault = {
   message: string;
 };
 
+export type PipeVtDrainReceipt = {
+  workerEof: boolean;
+  outputDrained: boolean;
+  issues: string[];
+  unknownTail: boolean;
+};
+
 export type PipeVtAssets = { worker: string; vendor: string; license: string };
 
 export function pipeVtAssets(directory: string = import.meta.dir): PipeVtAssets {
@@ -160,7 +167,7 @@ export class PipeVtWorker {
   private outputPaused = false;
   /** Set after a bounded close gave up on the consumer: later output is dropped. */
   private abandoned = false;
-  private closePromise: Promise<void> | null = null;
+  private closePromise: Promise<PipeVtDrainReceipt> | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
@@ -402,32 +409,44 @@ export class PipeVtWorker {
    * consumer receipt that never settles ends in a `shutdown-timeout` fault
    * and the remaining output is dropped, so close always returns.
    */
-  close(timeoutMs = 5_000): Promise<void> {
+  close(timeoutMs = 5_000): Promise<PipeVtDrainReceipt> {
     if (this.closePromise) return this.closePromise;
-    if (!this.child) return Promise.resolve();
+    if (!this.child) return Promise.resolve({ workerEof: false, outputDrained: false,
+      issues: ["worker was never started"], unknownTail: true });
+    const exitedBeforeClose = this.exited;
     this.closing = true;
-    if (this.exited) return this.closePromise = this.settleOutput(timeoutMs);
+    if (this.exited) return this.closePromise = this.settleOutput(timeoutMs, false,
+      ["worker exited before orderly shutdown"]);
     const exited = new Promise<void>((resolve) => this.exitWaiters.push(resolve));
-    if (!this.write([header("Q", 0)])) this.child.kill("SIGKILL");
+    const quitQueued = this.write([header("Q", 0)]);
+    let forced = !quitQueued;
+    if (!quitQueued) this.child.kill("SIGKILL");
     const timer = setTimeout(() => {
+      forced = true;
       this.child?.kill("SIGKILL");
       // A paused stdout never ends, so the close event would never fire.
       this.outputPaused = false;
       this.child?.stdout?.resume();
     }, timeoutMs);
-    return this.closePromise = exited.finally(() => clearTimeout(timer)).then(() => this.settleOutput(timeoutMs));
+    return this.closePromise = exited.finally(() => clearTimeout(timer)).then(() => this.settleOutput(
+      timeoutMs, quitQueued && !forced && !exitedBeforeClose,
+      forced ? [`worker did not exit after quit within ${timeoutMs}ms`] : [],
+    ));
   }
 
-  private settleOutput(timeoutMs: number): Promise<void> {
+  private settleOutput(timeoutMs: number, workerEof: boolean, issues: string[]): Promise<PipeVtDrainReceipt> {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const deadline = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
     return Promise.race([this.outputTail.then(() => "done" as const), deadline]).then((result) => {
       if (timer) clearTimeout(timer);
-      if (result === "done") return;
-      this.abandoned = true;
-      this.child?.kill("SIGKILL");
-      this.notifyFault({ kind: "shutdown-timeout", at: (this.options.now ?? Date.now)(),
-        message: `worker output consumer did not settle within ${timeoutMs}ms; remaining updates dropped` });
+      const outputDrained = result === "done";
+      if (!outputDrained) {
+        this.abandoned = true;
+        this.child?.kill("SIGKILL");
+        issues.push(`worker output consumer did not settle within ${timeoutMs}ms; remaining updates dropped`);
+        this.notifyFault({ kind: "shutdown-timeout", at: (this.options.now ?? Date.now)(), message: issues.at(-1)! });
+      }
+      return { workerEof, outputDrained, issues, unknownTail: !workerEof || !outputDrained || issues.length > 0 };
     });
   }
 
