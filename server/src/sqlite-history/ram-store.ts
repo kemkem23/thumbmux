@@ -138,11 +138,12 @@ export class ProjectionRam {
       .run(Number(p.revision)+1,id,Number(p.next_line_id)-4500);
     return this.bump(event.paneKey);
   }
-  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string): void {
+  /** `uncertain`: capture rows drawn but not certified (D18); a pipe frame always clears them. */
+  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string, uncertain: readonly number[] = []): void {
     if(preparedCells===undefined)validateFrame(frame);
     const p=this.ensure(frame.paneKey,frame.sourceEpoch,frame.geometryGeneration), id=paneId(frame.paneKey);
-    this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json')
-      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux-calibrated':'pipe',JSON.stringify(observed));
+    this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json,uncertain_rows_json=excluded.uncertain_rows_json')
+      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux-calibrated':'pipe',JSON.stringify(observed),JSON.stringify(uncertain));
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
   /** Revision the caller's CAS is compared with; a pane not yet seen is revision 0. */
@@ -172,9 +173,15 @@ export class ProjectionRam {
     this.db.query("UPDATE na_pane SET health=? WHERE pane_key=?").run(issue.recoverable?'degraded':'unverified',id);
     return this.bump(issue.paneKey);
   }
-  calibrate(change: ProjectionCalibration): ProjectionReceipt {
+  /**
+   * `historyOnly` (M2): without screen evidence nothing on screen is replaced,
+   * and every checked or repaired history row is compared byte for byte below,
+   * so rows and frames that arrived after the caller's read cannot make it
+   * wrong. Only a revision the pane never had (from the future) is refused.
+   */
+  calibrate(change: ProjectionCalibration, historyOnly=false): ProjectionReceipt {
     const c=change.capture, p=this.pane(c.paneKey), id=paneId(c.paneKey);
-    if (p.revision !== change.expectedRevision) throw new Error('stale-revision');
+    if (historyOnly ? change.expectedRevision > Number(p.revision) : p.revision !== change.expectedRevision) throw new Error('stale-revision');
     if (p.source_epoch !== c.sourceEpoch || p.geometry_generation !== c.geometryGeneration) throw new Error('stale-generation');
     validateFrame(c); c.history.forEach(validateRow);
     if (!c.captureId || !Number.isFinite(c.requestedAt) || !Number.isFinite(c.completedAt) || c.completedAt<c.requestedAt) throw new Error('invalid-capture');
@@ -218,9 +225,13 @@ export class ProjectionRam {
       integer(evidence.receiveSeqBefore);integer(evidence.receiveSeqAfter);
       if(evidence.sourceEpoch!==c.sourceEpoch || evidence.geometryGeneration!==c.geometryGeneration
         || evidence.receiveSeqBefore!==evidence.receiveSeqAfter)throw new Error('capture-not-quiescent');
-      this.screen(c,c.captureId,c.completedAt,c.observedFields);
+      // §7.4 D18: uncertain emoji rows are drawn with the capture but kept apart
+      // as not certified, never a reason to refuse the rest of the screen.
+      const uncertain=[...new Set(evidence.uncertainRows??[])].sort((a,b)=>a-b);
+      if(uncertain.some(r=>!Number.isSafeInteger(r) || r<0 || r>=c.rows))throw new Error('invalid-uncertain-rows');
+      this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);
     }
-    // Without quiescent evidence a capture checks history only, never the screen.
+    // Without quiescent evidence (unfenced, null or absent) a capture checks history only, never the screen.
     return this.bump(c.paneKey);
   }
   /** Live pages only: eviction returns pages to the freelist, which page_count still counts (F13). */

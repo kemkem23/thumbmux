@@ -151,9 +151,9 @@ CREATE TRIGGER frame_immutable BEFORE UPDATE ON history_frame BEGIN SELECT RAISE
 `;
 
 // Separate factory and database. Do not change SCHEMA_VERSION (the v1 factory).
-// FIX1 widened two CHECK lists in place (no v2 file was ever deployed); recovery
-// refuses a v2 file whose tables still carry the pre-FIX1 lists.
-export const PROJECTION_SCHEMA_MARKERS = ["'content-matched'","'tmux-calibrated'"];
+// FIX1 widened two CHECK lists in place and FIX2 added na_screen.uncertain_rows_json
+// (no v2 file was ever deployed); recovery refuses a v2 file missing any marker.
+export const PROJECTION_SCHEMA_MARKERS = ["'content-matched'","'tmux-calibrated'","uncertain_rows_json"];
 export const PROJECTION_SCHEMA_VERSION = 2;
 export const PROJECTION_MIGRATION = '002-newarch-projection';
 export const PROJECTION_SCHEMA = `
@@ -194,6 +194,7 @@ CREATE TABLE na_screen (
  revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
  cells_json TEXT NOT NULL, cursor_json TEXT NOT NULL, last_capture_id TEXT, captured_at REAL,
  display_source TEXT NOT NULL CHECK(display_source IN('pipe','tmux-calibrated')), observed_fields_json TEXT NOT NULL,
+ uncertain_rows_json TEXT NOT NULL DEFAULT '[]',
  PRIMARY KEY(pane_key,screen_kind), FOREIGN KEY(pane_key,last_capture_id) REFERENCES na_capture(pane_key,capture_id)
 ) STRICT;
 CREATE TABLE na_issue (

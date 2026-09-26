@@ -179,10 +179,14 @@ export interface ProjectionCapture extends ProjectionFrame {
  * FIX1 §1.2: tmux 3.4 has no byte fence between pipe-pane and capture-pane.
  * A capture may overwrite the displayed screen (never the parser frame) only
  * when the collector saw no new byte while it ran ('quiescent'); the store
- * additionally requires the revision CAS. 'unfenced' checks history only.
+ * additionally requires the revision CAS. 'unfenced', null or absent evidence
+ * checks history only: the screen stays as it is and nothing is refused for it.
+ * `uncertainRows` (§7.4 D18): screen rows whose cell boundaries the capture
+ * could not settle (complex emoji). They are drawn with the rest of the
+ * capture but not certified; the store keeps their indices with the screen.
  */
 export type CaptureEvidence =
-  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number }
+  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number; uncertainRows?: readonly number[] }
   | { kind: 'unfenced'; reason: string };
 export interface ProjectionIssueInput {
   paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
@@ -196,7 +200,7 @@ export interface ProjectionIssue {
 export interface ProjectionEpochTransition extends ProjectionIssueInput { nextEpoch: number }
 export interface ProjectionCalibration {
   capture: ProjectionCapture; expectedRevision: number;
-  captureEvidence?: CaptureEvidence;
+  captureEvidence?: CaptureEvidence | null;
   /** Rows proven by unique triple anchors on both sides (D16 identity). */
   checks: Array<{ lineId: number; captureRow: number }>;
   /** FIX1 §2: exact content match of repeated rows with no unique anchor. */
@@ -212,6 +216,13 @@ export interface ProjectionReceipt { revision: number; durableRevision: number; 
  */
 export interface ProjectionRefusal { accepted: false; reason: 'capacity-pressure'; scope: 'pane' | 'store' }
 export type ProjectionAdmission = ProjectionReceipt | ProjectionRefusal;
+/**
+ * Rejection message (and na_issue kind) of an event larger than an idle store
+ * admits. Waiting never helps: the caller must not offer it again. The store
+ * records the loss once per event, however often the same event is re-offered.
+ * Rejections for transient pressure never use this name.
+ */
+export const PROJECTION_OVERSIZE = 'ingest-oversize';
 export const isProjectionRefusal = (value: unknown): value is ProjectionRefusal =>
   typeof value === 'object' && value !== null && (value as ProjectionRefusal).accepted === false;
 export type ProjectionCheckState = 'unchecked' | 'checked' | 'content-matched';
