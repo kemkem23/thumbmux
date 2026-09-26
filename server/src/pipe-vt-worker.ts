@@ -87,7 +87,7 @@ export type PipeVtUpdate = {
 export type PipeVtReady = { vendorSha256: string; cols: number; rows: number; pid: number };
 
 export type PipeVtFault = {
-  kind: "worker-exit" | "worker-error" | "protocol" | "vendor-hash" | "spawn" | "clear-policy-unknown";
+  kind: "worker-exit" | "worker-error" | "protocol" | "vendor-hash" | "spawn" | "clear-policy-unknown" | "shutdown-timeout";
   at: number;
   message: string;
 };
@@ -128,6 +128,14 @@ export type PipeVtWorkerOptions = {
   now?: () => number;
 };
 
+/** Data frames share this budget; control frames (Z/F/X/C/Q) never compete for it. */
+export const PIPE_VT_DATA_QUEUE_BYTES = 1024 * 1024;
+/** Extra room reserved for control frames only, on top of the data budget. */
+export const PIPE_VT_CONTROL_RESERVE_BYTES = 64 * 1024;
+/** Unprocessed worker output above this pauses stdout; below the low mark resumes. */
+const OUTPUT_HIGH_WATERMARK = 1024 * 1024;
+const OUTPUT_LOW_WATERMARK = 256 * 1024;
+
 function header(kind: string, length: number): Buffer {
   const out = Buffer.allocUnsafe(5);
   out.write(kind, 0, "latin1");
@@ -148,6 +156,11 @@ export class PipeVtWorker {
   private queue: Buffer[] = [];
   private queuedBytes = 0;
   private outputTail: Promise<void> = Promise.resolve();
+  private outputPendingBytes = 0;
+  private outputPaused = false;
+  /** Set after a bounded close gave up on the consumer: later output is dropped. */
+  private abandoned = false;
+  private closePromise: Promise<void> | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
@@ -200,9 +213,16 @@ export class PipeVtWorker {
       if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
     });
     child.stdout?.on("data", (chunk: Buffer) => {
+      // Pause only when unprocessed output crosses the high watermark, never
+      // per update: Bun's pause/resume is costly at frame cadence.
+      this.outputPendingBytes += chunk.byteLength;
+      if (!this.outputPaused && this.outputPendingBytes > OUTPUT_HIGH_WATERMARK) {
+        this.outputPaused = true;
+        child.stdout?.pause();
+      }
       this.outputTail = this.outputTail.then(() => this.onStdout(chunk)).catch((error) => {
         this.notifyFault({ kind: "protocol", at: now(), message: String(error) });
-      });
+      }).then(() => this.releaseOutput(chunk.byteLength));
     });
     child.on("error", (error) => {
       this.notifyFault({ kind: "spawn", at: now(), message: error.message });
@@ -221,7 +241,21 @@ export class PipeVtWorker {
     return this.ready;
   }
 
+  private releaseOutput(bytes: number): void {
+    this.outputPendingBytes -= bytes;
+    if (this.outputPaused && this.outputPendingBytes <= OUTPUT_LOW_WATERMARK) {
+      this.outputPaused = false;
+      this.child?.stdout?.resume();
+    }
+  }
+
+  /** Unprocessed worker output bytes (test observability). */
+  outputBacklogBytes(): number {
+    return this.outputPendingBytes;
+  }
+
   private async onStdout(chunk: Buffer): Promise<void> {
+    if (this.abandoned) return;
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
     let offset = 0;
     while (this.pending.length - offset >= 5) {
@@ -246,12 +280,10 @@ export class PipeVtWorker {
         try {
           const receipt = kind === "U" ? this.options.onUpdate(message as PipeVtUpdate)
             : this.options.onHistoryClear?.(message as { seq: number; epoch: number });
-          if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") {
-            // Bun's pipe pause/resume is costly at frame cadence. Only use it
-            // when the consumer actually has an outstanding async receipt.
-            this.child?.stdout?.pause();
-            try { await receipt; } finally { this.child?.stdout?.resume(); }
-          }
+          // Messages stay ordered by awaiting the receipt here; stdout keeps
+          // flowing into the bounded backlog instead of pausing per update.
+          if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") await receipt;
+          if (this.abandoned) return;
         } catch (error) {
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
@@ -273,10 +305,11 @@ export class PipeVtWorker {
     this.pending = offset === this.pending.length ? Buffer.alloc(0) : this.pending.subarray(offset);
   }
 
-  private write(parts: Buffer[]): boolean {
+  private write(parts: Buffer[], control = true): boolean {
     if (this.inputFd === null || this.exited) return false;
     const bytes = parts.reduce((sum, part) => sum + part.byteLength, 0);
-    if (this.queuedBytes + bytes > 1024 * 1024) return false;
+    const limit = PIPE_VT_DATA_QUEUE_BYTES + (control ? PIPE_VT_CONTROL_RESERVE_BYTES : 0);
+    if (this.queuedBytes + bytes > limit) return false;
     this.queue.push(parts.length === 1 ? parts[0]! : Buffer.concat(parts));
     this.queuedBytes += bytes;
     this.flush();
@@ -328,14 +361,14 @@ export class PipeVtWorker {
 
   /** Forward raw pipe bytes untouched; `seq` is the receive sequence. */
   canAccept(bytes: number): boolean {
-    return this.queuedBytes + bytes + 21 <= 1024 * 1024;
+    return this.queuedBytes + bytes + 21 <= PIPE_VT_DATA_QUEUE_BYTES;
   }
 
   feed(seq: number, bytes: Uint8Array, epoch = 1): boolean {
     const prefix = Buffer.allocUnsafe(16);
     prefix.writeBigUInt64BE(BigInt(seq));
     prefix.writeBigUInt64BE(BigInt(epoch), 8);
-    return this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)]);
+    return this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
   }
 
   setScrollOnClear(enabled: boolean): boolean {
@@ -363,14 +396,39 @@ export class PipeVtWorker {
     return this.write([header("F", 8), payload]);
   }
 
-  /** Drain queued input, flush the last update, then wait for exit. */
+  /**
+   * Drain queued input, flush the last update, then wait for exit and for
+   * every already-read update to be consumed. Both waits are bounded: a
+   * consumer receipt that never settles ends in a `shutdown-timeout` fault
+   * and the remaining output is dropped, so close always returns.
+   */
   close(timeoutMs = 5_000): Promise<void> {
-    if (!this.child || this.exited) return Promise.resolve();
+    if (this.closePromise) return this.closePromise;
+    if (!this.child) return Promise.resolve();
     this.closing = true;
+    if (this.exited) return this.closePromise = this.settleOutput(timeoutMs);
     const exited = new Promise<void>((resolve) => this.exitWaiters.push(resolve));
-    this.write([header("Q", 0)]);
-    const timer = setTimeout(() => this.child?.kill("SIGKILL"), timeoutMs);
-    return exited.then(() => this.outputTail).finally(() => clearTimeout(timer));
+    if (!this.write([header("Q", 0)])) this.child.kill("SIGKILL");
+    const timer = setTimeout(() => {
+      this.child?.kill("SIGKILL");
+      // A paused stdout never ends, so the close event would never fire.
+      this.outputPaused = false;
+      this.child?.stdout?.resume();
+    }, timeoutMs);
+    return this.closePromise = exited.finally(() => clearTimeout(timer)).then(() => this.settleOutput(timeoutMs));
+  }
+
+  private settleOutput(timeoutMs: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const deadline = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
+    return Promise.race([this.outputTail.then(() => "done" as const), deadline]).then((result) => {
+      if (timer) clearTimeout(timer);
+      if (result === "done") return;
+      this.abandoned = true;
+      this.child?.kill("SIGKILL");
+      this.notifyFault({ kind: "shutdown-timeout", at: (this.options.now ?? Date.now)(),
+        message: `worker output consumer did not settle within ${timeoutMs}ms; remaining updates dropped` });
+    });
   }
 
   /** Test/fault hook: kill the worker without the orderly quit frame. */
