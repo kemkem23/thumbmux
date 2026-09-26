@@ -2022,6 +2022,8 @@ describe("FIX2-T multiplex", () => {
       for (let i = 0; i < 4; i++) panes.push(await collectPane(80, 3, { pool,
         paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 } }));
       const pid = panes[0]!.collector.workerPid;
+      // A paused pane must still receive the shared-process death marker.
+      ((panes[3]!.collector as unknown as WorkerInternals).worker as unknown as { socket: { pause(): void } }).socket.pause();
       panes[0]!.collector.killWorker();
       await untilFix1(() => panes.every(p => p.faults.some(f => f.kind === "worker-restarted")));
       expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
@@ -2059,3 +2061,46 @@ describe("FIX2-T multiplex", () => {
     } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
   }, 30_000);
 });
+
+for (const [name, before, after] of [
+  ["shared-state", 'c["worker"] = Worker(cols, rows, epoch)', 'c["worker"] = next((v["worker"] for v in channels.values() if v["worker"] is not None), None) or Worker(cols, rows, epoch)'],
+  ["quit-ack", 'send(b"B", {"workerEof": True})', 'send(b"B", {"workerEof": False})'],
+  ["sequence-ack", '"seqTo": self.seq_to if ack else self.emitted_seq,', '"seqTo": 0,'],
+]) test(`FIX2-T mutation ${name}: clean passes and damaged real parser is detected`, async () => {
+  const assert = (await import("node:assert/strict")).default;
+  const root = mkdtempSync(join(tmpdir(), "multiplex-mutation-")); roots.push(root);
+  const original = pipeVtAssets();
+  const source = readFileSync(original.worker, "utf8");
+  expect(source.includes(before!)).toBe(true);
+  async function witness(mutated: boolean) {
+    const dir = join(root, mutated ? "damaged" : "clean"); mkdirSync(dir);
+    const assets = pipeVtAssets(dir);
+    writeFileSync(assets.worker, mutated ? source.replace(before!, after!) : source);
+    writeFileSync(assets.vendor, readFileSync(original.vendor));
+    writeFileSync(assets.license, readFileSync(original.license));
+    const pool = new PipeVtPool({ assets });
+    const snapshots: string[][] = [[], []];
+    const sequences: Array<Array<number | null>> = [[], []];
+    const panes = [0, 1].map(i => new PipeVtWorker({ pool, assets, cols: 80, rows: 3,
+      onFault: () => {}, onUpdate: u => {
+        if (u.frame.dirty["0"]) snapshots[i]!.push(rowText(u.frame.dirty["0"]).trimEnd());
+        sequences[i]!.push(u.seqTo);
+      } }));
+    try {
+      await Promise.all(panes.map(p => p.start()));
+      assert.equal(panes[0]!.pid, panes[1]!.pid);
+      panes[0]!.feed(1, encoder.encode("alpha"));
+      await sleep(30);
+      panes[1]!.feed(1, encoder.encode("bravo"));
+      await sleep(30);
+      panes[0]!.requestFull(1); panes[1]!.requestFull(1);
+      const receipts = await Promise.all(panes.map(p => p.close(1000)));
+      assert.deepEqual(snapshots.map(xs => xs.at(-1)), ["alpha", "bravo"]);
+      assert.deepEqual(sequences.map(xs => xs.at(-1)), [1, 1]);
+      assert.ok(receipts.every(r => r.workerEof && r.outputDrained && !r.unknownTail));
+    } finally { await Promise.all(panes.map(p => p.close(1000))); await pool.close(); }
+  }
+  await witness(false);
+  await assert.rejects(witness(true), { name: "AssertionError" });
+  console.log(`FIX2-T mutation ${name}: clean=PASS damaged=DETECTED (real multiplex Python)`);
+}, 20_000);

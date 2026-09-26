@@ -956,9 +956,8 @@ export class PipeHistoryRuntime {
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     clearInterval(this.heartbeat);
-    await Promise.all([...this.panesByKey.values()].map(pane => pane.close()));
-    this.panesByKey.clear();
-    await this.parserPool?.close();
+    try { await Promise.all([...this.panesByKey.values()].map(pane => pane.close())); }
+    finally { this.panesByKey.clear(); await this.parserPool?.close(); }
   }
 }
 

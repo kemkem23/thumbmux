@@ -154,7 +154,7 @@ function header(kind: string, length: number): Buffer {
 
 type SharedGeneration = {
   child: ChildProcess; directory: string; path: string; ready: Promise<void>;
-  done: Promise<void>; users: number; dead: boolean;
+  done: Promise<void>; users: number; dead: boolean; sockets: Set<Socket>;
 };
 type SharedLease = { socket: Socket; pid: number; release(): Promise<void>; kill(signal: NodeJS.Signals): void };
 
@@ -181,7 +181,7 @@ export class PipeVtPool {
     const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     ready.catch(() => {});
     const done = new Promise<void>(resolve => { resolveDone = resolve; });
-    const generation = { child, directory, path, ready, done, users: 0, dead: false };
+    const generation: SharedGeneration = { child, directory, path, ready, done, users: 0, dead: false, sockets: new Set() };
     this.generations.add(generation);
     let stderr = "", output = "";
     const timer = setTimeout(() => { rejectReady(new Error("shared parser startup timed out")); child.kill("SIGKILL"); }, 5000);
@@ -191,7 +191,12 @@ export class PipeVtPool {
       if (output.includes("MULTIPLEX_READY\n")) { clearTimeout(timer); resolveReady(); }
     });
     child.on("error", rejectReady);
-    child.on("exit", () => { generation.dead = true; });
+    child.on("exit", () => {
+      generation.dead = true;
+      // EOF cannot reach a paused socket until its consumer drains. Destroy
+      // explicitly so even a blocked pane reports process death immediately.
+      for (const socket of generation.sockets) socket.destroy();
+    });
     child.on("close", () => {
       generation.dead = true; clearTimeout(timer);
       rejectReady(new Error(`shared parser exited: ${stderr}`));
@@ -222,6 +227,8 @@ export class PipeVtPool {
       if (gen.dead || this.closed) throw new Error("shared parser exited during attach");
       // Caller installs data/close listeners before sending its A frame.
       const socket = createConnection({ path: gen.path });
+      gen.sockets.add(socket);
+      socket.once("close", () => gen.sockets.delete(socket));
       return { socket, pid: gen.child.pid!, release, kill: signal => {
         gen.dead = true; if (this.current === gen) this.current = null; gen.child.kill(signal);
       } };
@@ -300,13 +307,14 @@ export class PipeVtWorker {
       attach.writeBigUInt64BE(BigInt(this.options.sourceEpoch ?? 1), 4);
       socket.write(Buffer.concat([header("A", attach.length), attach]));
     } catch (error) {
+      this.socket?.destroy();
+      await this.lease?.release();
       this.readyReject?.(error as Error);
       this.notifyFault({ kind: "spawn", at: (this.options.now ?? Date.now)(), message: String(error) });
     }
   }
 
   start(): Promise<PipeVtReady> {
-    if (this.options.pool) { void this.startShared(); return this.ready; }
     const assets = this.options.assets ?? pipeVtAssets();
     const now = this.options.now ?? Date.now;
     try {
@@ -317,6 +325,7 @@ export class PipeVtWorker {
       this.readyReject?.(new Error(message));
       return this.ready;
     }
+    if (this.options.pool) { void this.startShared(); return this.ready; }
     // Private FIFO for input; O_RDWR so neither side blocks on open and the
     // worker only sees EOF once we close it.
     this.inputDir = mkdtempSync(join(tmpdir(), "pipe-vt-"));
@@ -382,6 +391,8 @@ export class PipeVtWorker {
       (this.socket ?? this.child?.stdout)?.resume();
     }
   }
+
+  inputBacklogBytes(): number { return this.socket?.writableLength ?? this.queuedBytes; }
 
   /** Unprocessed worker output bytes (test observability). */
   outputBacklogBytes(): number {
