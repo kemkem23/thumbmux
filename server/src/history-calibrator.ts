@@ -39,12 +39,12 @@ export interface CalibrationCapture {
  * capture and the parser received no pipe byte between the pre-capture read
  * and the post-capture read (a quiescent window). parserFrame is never fed.
  * Field-for-field the store's port (lot I2 `sqlite-history/types.ts`
- * `CaptureEvidence`): the store draws the screen only for kind 'quiescent'
- * and re-checks receiveSeqBefore === receiveSeqAfter itself; 'unfenced'
- * commits history evidence only. Decoder-uncertain screen rows travel on the
- * capture (`uncertainScreenRows`); I2's `ProjectionCapture.ambiguousRows`. */
+ * `CaptureEvidence` at FIX2 4ea4fb585): the store draws the screen only for
+ * kind 'quiescent' and re-checks receiveSeqBefore === receiveSeqAfter itself;
+ * 'unfenced' commits history evidence only. uncertainRows (§7.4 D18) = the
+ * capture's decoder-uncertain screen rows: drawn, kept apart, not certified. */
 export type CaptureEvidence =
-  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number }
+  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number; uncertainRows?: readonly number[] }
   | { kind: 'unfenced'; reason: string };
 export interface CalibrationSnapshot {
   revision: number; sourceEpoch: number; geometryGeneration: number;
@@ -220,7 +220,7 @@ export class HistoryCalibrator {
       const receiveSeqBefore = fence.parserFrame.receiveSeq, receiveSeq = read.parserFrame.receiveSeq;
       const captureEvidence: CaptureEvidence = receiveSeqBefore !== receiveSeq ? { kind: 'unfenced', reason: 'received-during-capture' } : {
         kind: 'quiescent', sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration,
-        receiveSeqBefore, receiveSeqAfter: receiveSeq,
+        receiveSeqBefore, receiveSeqAfter: receiveSeq, uncertainRows: capture.uncertainScreenRows ?? [],
       };
       const committed = await this.ports.calibrate({ capture, checks: match.checks, contentMatches: match.contentMatches, repairs: match.repairs, expectedRevision: read.revision, captureEvidence });
       if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
