@@ -9,7 +9,7 @@ import { readProjectionPage, projectionIssue } from './projection-reader';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
-const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=100;
+const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=50;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 // D12 (FIX1 §3): every pane in the live roster owns a guaranteed quota; the
 // rest of the cap is a borrow pool. A pane that sent nothing for ROSTER_MS
@@ -52,7 +52,7 @@ function admitPath(options: ProjectionOptions): string {
 }
 
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
-function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void) {
+function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false) {
   const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
     if(Number(Object.values(disk.query('PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
@@ -63,10 +63,10 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void)
     disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     before?.();writeMs=performance.now()-started;
   }).immediate();
-  // Keep physical growth tied to durable rows rather than retaining a second
-  // database-sized WAL forever. This is a SQLite checkpoint, not unlinking or
-  // subtracting a sidecar from accounting; failures remain flush failures.
-  disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  // Bound physical WAL growth without checkpointing every transaction. The
+  // measurement includes DB+WAL+SHM; this is normal SQLite maintenance, not
+  // subtracting a sidecar from the result.
+  if(checkpoint)disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs};
 }
 // Same module in source and compiled distributions: no extra worker asset/factory.
@@ -75,6 +75,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const errors=new Uint8Array(workerData.signal,8);
   const disk=new Database(workerData.file,{strict:true});
   disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
+  let commits=0;
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
       try {disk.close();}catch(error){console.error('[newarch] disk worker close failed',String(error));}
@@ -83,7 +84,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       parentPort!.off('message',onMessage);parentPort!.close();return;
     }
     try {
-      const timing=commitBatch(disk,workerData.fence,batch);
+      const timing=commitBatch(disk,workerData.fence,batch,undefined,++commits%10===0);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
       Atomics.store(signal,0,1);
     }
@@ -697,6 +698,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id));
         this.acknowledge();
       }
+      this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     }catch(error){this.fault('flush-failed',String(error));throw error;}
   }
   health():ProjectionHealth {
