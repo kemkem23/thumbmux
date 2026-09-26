@@ -218,7 +218,8 @@ export class PipeVtPool {
       if (--gen.users === 0) {
         if (this.current === gen) this.current = null;
         gen.dead = true;
-        gen.child.kill("SIGTERM");
+        // All pane channels have closed; no parser state remains to flush.
+        gen.child.kill("SIGKILL");
         await gen.done;
       }
     };

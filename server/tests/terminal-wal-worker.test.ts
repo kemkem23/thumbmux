@@ -2015,16 +2015,17 @@ describe("FIX2-T multiplex", () => {
     } finally { await a.close(100); await b?.collector.close(); await pool.close(); }
   }, 15_000);
 
-  test("shared SIGKILL marks every pane and restarts once into one new process", async () => {
+  for (const failure of ["SIGKILL", "control-EOF"] as const) test(`shared ${failure} marks every pane and restarts once into one new process`, async () => {
     const pool = new PipeVtPool();
     const panes: CollectedPane[] = [];
     try {
-      for (let i = 0; i < 4; i++) panes.push(await collectPane(80, 3, { pool,
+      for (let i = 0; i < 21; i++) panes.push(await collectPane(80, 3, { pool,
         paneKey: { serverIdentity: "multiplex", paneId: `%${i}`, birthGeneration: 1 } }));
       const pid = panes[0]!.collector.workerPid;
       // A paused pane must still receive the shared-process death marker.
       ((panes[3]!.collector as unknown as WorkerInternals).worker as unknown as { socket: { pause(): void } }).socket.pause();
-      panes[0]!.collector.killWorker();
+      if (failure === "SIGKILL") panes[0]!.collector.killWorker();
+      else (pool as unknown as { current: { child: { stdin: { end(): void } } } }).current.child.stdin.end();
       await untilFix1(() => panes.every(p => p.faults.some(f => f.kind === "worker-restarted")));
       expect(new Set(panes.map(p => p.collector.workerPid)).size).toBe(1);
       expect(panes[0]!.collector.workerPid).not.toBe(pid);
@@ -2041,7 +2042,7 @@ describe("FIX2-T multiplex", () => {
     } finally { await Promise.all(panes.map(p => p.collector.close())); await pool.close(); }
   }, 30_000);
 
-  test("pane parser exception restarts only that pane and preserves sibling state", async () => {
+  for (const malformed of ["reset", "oversize-header"] as const) test(`pane ${malformed} exception restarts only that pane and preserves sibling state`, async () => {
     const pool = new PipeVtPool();
     const panes: CollectedPane[] = [];
     try {
@@ -2051,7 +2052,7 @@ describe("FIX2-T multiplex", () => {
       const pid = b.collector.workerPid;
       // Malformed real X command raises in the Python dispatcher.
       const worker = (a.collector as unknown as WorkerInternals).worker;
-      (worker as unknown as { write(parts: Buffer[]): boolean }).write([Buffer.from([88, 0, 0, 0, 1, 0])]);
+      (worker as unknown as { write(parts: Buffer[]): boolean }).write([Buffer.from(malformed === "reset" ? [88, 0, 0, 0, 1, 0] : [68, 255, 255, 255, 255])]);
       await untilFix1(() => a.faults.some(f => f.kind === "worker-restarted"));
       b.collector.ingest(encoder.encode("-alive\r\n")); await settle(b);
       expect(b.collector.workerPid).toBe(pid);

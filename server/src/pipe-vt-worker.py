@@ -629,6 +629,7 @@ def multiplex(path):
     server.listen(128)
     server.setblocking(False)
     channels = {}
+    control_fd = sys.stdin.buffer.fileno()
     high_water = 1024 * 1024
     max_input = high_water + 65536 + 21
 
@@ -643,7 +644,7 @@ def multiplex(path):
     print("MULTIPLEX_READY", flush=True)
     try:
         while True:
-            readable = [server]
+            readable = [server, control_fd]
             writable = []
             runnable = False
             for sock, c in channels.items():
@@ -653,6 +654,8 @@ def multiplex(path):
                 if c["output"]:
                     writable.append(sock)
             reads, writes, _ = select.select(readable, writable, [], 0 if runnable else None)
+            if control_fd in reads and not os.read(control_fd, 1024):
+                return  # Parent died: close all channels, leave no orphan interpreter.
             if server in reads:
                 sock, _ = server.accept()
                 sock.setblocking(False)
@@ -670,7 +673,7 @@ def multiplex(path):
                             continue
                         c["input"].extend(data)
                     buf = c["input"]
-                    if len(buf) >= 5 and struct.unpack(">I", buf[1:5])[0] > max_input:
+                    if not c["closing"] and len(buf) >= 5 and struct.unpack(">I", buf[1:5])[0] > max_input:
                         raise ValueError("pane input exceeds frame bound")
                     began = time.monotonic_ns()
                     processed = 0
@@ -711,6 +714,7 @@ def multiplex(path):
                     c["closing"] = True
                     c["quit_ack"] = True
                     c["worker"] = None
+                    c["input"].clear()
                 finally:
                     output_sink = None
     finally:
