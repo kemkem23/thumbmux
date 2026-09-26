@@ -21,6 +21,28 @@ export interface CapturedRow {
 export function cellKey(cell: HistoryCell): string {
   return JSON.stringify([cell.grapheme, cell.width, cell.continuation, cell.fg, cell.bg, cell.style]);
 }
+/** Cell equality; style bits outside `styleMask` are not compared. */
+export function equalCells(a: HistoryCell, b: HistoryCell, styleMask = -1): boolean {
+  return a.grapheme === b.grapheme && a.width === b.width && a.continuation === b.continuation
+    && a.fg === b.fg && a.bg === b.bg && ((a.style ^ b.style) & styleMask) === 0;
+}
+// Projections are memoized per source cells array (decoder rows are shared).
+const certifiedCache = new Map<number, WeakMap<readonly HistoryCell[], readonly HistoryCell[]>>();
+/** Rows projected to the style bits a comparator may certify. For matching
+ * only: the projection is never stored as, or drawn instead of, the capture. */
+export function certifiedRows(rows: readonly CapturedRow[], styleMask: number): CapturedRow[] {
+  let cache = certifiedCache.get(styleMask);
+  if (!cache) { cache = new WeakMap(); certifiedCache.set(styleMask, cache); }
+  return rows.map(row => {
+    let cells = cache!.get(row.cells);
+    if (!cells) {
+      cells = row.cells.every(cell => (cell.style & ~styleMask) === 0) ? row.cells
+        : row.cells.map(cell => (cell.style & ~styleMask) === 0 ? cell : { ...cell, style: cell.style & styleMask });
+      cache!.set(row.cells, cells);
+    }
+    return cells === row.cells ? row : { cells, softWrap: row.softWrap };
+  });
+}
 export function rowKey(row: CapturedRow): string {
   return JSON.stringify([row.softWrap, row.cells.map(cellKey)]);
 }

@@ -650,14 +650,14 @@ describe("ordered tmux control WAL recorder with a disposable private tmux serve
   }, 15_000);
 });
 
-import { HistoryCalibrator, equalCalibrationFrames, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts } from '../src/history-calibrator';
+import { HistoryCalibrator, equalCalibrationFrames, CAPTURE_CADENCE, type CalibrationCapture, type CalibrationFrame, type CalibrationPorts, type CalibratorOptions } from '../src/history-calibrator';
 import { rowKey, matchHistoryRows, IncrementalHistoryMatcher, equalHistoryRows, type HistoryRow, type CapturedRow } from '../src/history-row-matcher';
 import { HistoryWatchdog } from '../src/history-watchdog';
 
 const naRow = (text: string): CapturedRow => ({ softWrap: false, cells: Array.from(text, grapheme => ({ grapheme, width: 1 as const, continuation: false, fg: 'default', bg: 'default', style: 0 })) });
 const naRows = (texts: string[]): HistoryRow[] => texts.map((text, i) => ({ ...naRow(text), lineId: i + 1, sourceEpoch: 1, geometryGeneration: 1 }));
 const naScope = { sourceEpoch: 1, geometryGeneration: 1, completeRetainedTail: true };
-function naHarness(incremental = false) {
+function naHarness(incremental = false, options: CalibratorOptions = {}) {
   let time = 0, revision = 1;
   const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
   const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
@@ -680,7 +680,7 @@ function naHarness(incremental = false) {
     publish: commit => { published.push(commit.revision); },
     fault: fault => { faults.push(fault.kind); },
   };
-  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental });
+  const calibrator = new HistoryCalibrator(paneKey, ports, { incremental, ...options });
   return { calibrator, ports, frame, history, limits, scheduled, published, faults, writes,
     time: (at: number) => { time = at; },
     parser: (value: CalibrationFrame) => { parser = value; },
@@ -1385,7 +1385,7 @@ test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full'
 });
 
 // DEBT2: independent reproduction from the round-3 grok review.
-import { decodeTmuxCaptureRows } from "../src/tmux-capture-normalize";
+import { decodeTmuxCaptureRows, TmuxCaptureDecoder } from "../src/tmux-capture-normalize";
 import type { CaptureMetadata } from "../src/history-calibrator";
 const privateEnv = { ...process.env };
 delete privateEnv.TMUX;
@@ -2061,4 +2061,303 @@ describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', 
     at = 3000; wd.heartbeat(); wd.tick();
     expect(faults).toEqual(['reader-stalled']);
   });
+});
+
+describe('I4-FIX1 lot C: capture deadline, viewer cadence, full-fidelity capture, forced correction', () => {
+  // The bits pyte observes (runtime OBSERVED_STYLE_MASK): no dim/rapid blink/hidden.
+  const PARSER_BITS = 1 | 4 | 8 | 16 | 64 | 256;
+  const styled = (row: CapturedRow, style: number): CapturedRow => ({ softWrap: row.softWrap, cells: row.cells.map(cell => ({ ...cell, style })) });
+
+  test('M5 close() aborts a capture that ignores its signal; nothing it returns later is committed or published', async () => {
+    const h = naHarness();
+    const original = await h.ports.capture(h.calibrator.paneKey, 4500);
+    let complete!: (capture: CalibrationCapture) => void; let aborted = 0;
+    h.ports.timeout = () => () => {}; // the deadline never fires: only close() can end this capture
+    h.ports.capture = (_, __, signal) => new Promise(resolve => { complete = resolve; signal!.addEventListener('abort', () => { aborted++; }); });
+    const running = h.calibrator.runDue();
+    expect(h.calibrator.capturing).toBe(true);
+    const scheduled = h.scheduled.length;
+    h.calibrator.close();
+    await running;
+    expect(aborted).toBe(1);
+    expect(h.calibrator.capturing).toBe(false);
+    complete(original); await Promise.resolve(); await Promise.resolve();
+    expect(h.writes).toHaveLength(0); expect(h.published).toHaveLength(0); expect(h.faults).toEqual([]);
+    h.calibrator.output(() => { throw new Error('closed pane published'); });
+    h.calibrator.scroll(5); h.calibrator.event('resize'); h.calibrator.setViewers(1);
+    expect(h.calibrator.dueAt).toBe(Infinity);
+    expect(h.scheduled.length).toBe(scheduled);
+    h.time(5000); await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(0); expect(h.limits).toHaveLength(1);
+  });
+
+  test('M5 close() during the store commit publishes nothing', async () => {
+    const h = naHarness();
+    const calibrate = h.ports.calibrate;
+    let release!: () => void;
+    h.ports.calibrate = input => new Promise(resolve => { release = () => resolve(calibrate(input)); });
+    const running = h.calibrator.runDue();
+    for (let i = 0; i < 5 && !release; i++) await Promise.resolve();
+    h.calibrator.close(); release(); await running;
+    expect(h.writes).toHaveLength(1); expect(h.published).toHaveLength(0); expect(h.calibrator.dueAt).toBe(Infinity);
+  });
+
+  test('M5 a capture that never settles and ignores abort cannot hold the pane: the next capture runs after the 1s deadline', async () => {
+    const h = naHarness();
+    let fire: (() => void) | undefined, delay = 0, aborted = 0;
+    h.ports.timeout = (callback, ms) => { fire = callback; delay = ms; return () => { fire = undefined; }; };
+    const good = h.ports.capture;
+    h.ports.capture = (_, __, signal) => { signal!.addEventListener('abort', () => { aborted++; }); return new Promise(() => {}); };
+    const running = h.calibrator.runDue();
+    expect(delay).toBe(CAPTURE_CADENCE.deadlineMs);
+    h.time(1000); fire!(); await running;
+    expect(aborted).toBe(1); expect(h.calibrator.capturing).toBe(false);
+    expect(h.faults).toEqual(['capture-fault']);
+    expect(h.calibrator.dueAt).toBe(1000);
+    h.ports.capture = good;
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(1); expect(h.published).toHaveLength(1);
+  });
+
+  test('§5.4 cadence: viewed 200ms under output, unviewed 5s, events 50ms, a first viewer is captured at once with history', async () => {
+    const run = async (options: CalibratorOptions) => {
+      const h = naHarness(true, options);
+      let captures = 0;
+      for (let t = 0; t <= 60000; t += 10) {
+        h.time(t); if (t > 0) h.calibrator.scroll(1);
+        if (h.calibrator.dueAt <= t) { await h.calibrator.runDue(); captures++; }
+      }
+      return { h, captures };
+    };
+    const viewed = await run({ viewers: 1 }), legacy = await run({}), unviewed = await run({ viewers: 0 });
+    console.log('NEWARCH_I4C_CADENCE', JSON.stringify({ window: '60s fake clock, 100 rows/s', viewed: viewed.captures, unreported: legacy.captures, unviewed: unviewed.captures }));
+    expect(viewed.captures).toBeGreaterThanOrEqual(250);
+    expect(legacy.captures).toBe(viewed.captures);
+    expect(unviewed.captures).toBeGreaterThanOrEqual(10);
+    expect(unviewed.captures).toBeLessThanOrEqual(13);
+    const h = unviewed.h;
+    expect(h.calibrator.dueAt).toBe(65000);
+    // Lifecycle event: 50ms even without a viewer.
+    h.time(60010); h.calibrator.event('resize');
+    expect(h.calibrator.dueAt).toBe(60050);
+    h.time(60050); await h.calibrator.runDue();
+    expect(h.limits.at(-1)).toBe(4500);
+    // Unviewed and idle: 5s, not 1s.
+    h.time(60100); expect(h.calibrator.dueAt).toBe(65050);
+    // First viewer: captured now (50ms spacing), history included.
+    const before = h.limits.length;
+    h.time(61000); h.calibrator.setViewers(1);
+    expect(h.calibrator.dueAt).toBe(61000);
+    await h.calibrator.runDue();
+    expect(h.limits.length).toBe(before + 1); expect(h.limits.at(-1)).toBeGreaterThan(0);
+    expect(h.calibrator.dueAt).toBe(62000);
+    // Losing the last viewer: the following period is 5s again.
+    h.calibrator.setViewers(0); h.time(62000); await h.calibrator.runDue();
+    expect(h.calibrator.dueAt).toBe(67000);
+    expect(() => h.calibrator.setViewers(-1)).toThrow('invalid viewer count');
+  });
+
+  test('§5.4 an unviewed divergence is not recaptured every 50ms; a viewed one is', async () => {
+    for (const viewers of [0, 1]) {
+      const h = naHarness(false, { viewers });
+      const wrong = structuredClone(h.frame); wrong.cells = [naRow('bad ').cells]; h.parser(wrong);
+      await h.calibrator.runDue();
+      expect(h.published).toEqual([2]);
+      expect(h.calibrator.dueAt).toBe(viewers ? 50 : 5000);
+    }
+  });
+
+  test('M9 dim, rapid blink and hidden stay in the drawn capture; only the parser comparison is limited to certified bits', async () => {
+    const results: Record<string, unknown> = {};
+    for (const mask of [PARSER_BITS, undefined]) {
+      const h = naHarness(false, mask === undefined ? {} : { certifiedStyleMask: mask });
+      const frame = structuredClone(h.frame); frame.cells = [styled(naRow('abc '), 1 | 2 | 32 | 128).cells];
+      const history = h.history.map((row, i) => i === 2 ? styled(row, 2) : { cells: row.cells, softWrap: row.softWrap });
+      const original = h.ports.capture;
+      let drawn: CalibrationFrame | undefined;
+      h.ports.capture = async (...args) => ({ ...(await original(...args)), frame, history });
+      h.ports.publish = (commit, published) => { h.published.push(commit.revision); drawn = published; };
+      // The parser saw bold only: the bit it can observe.
+      const parser = structuredClone(h.frame); parser.cells = [styled(naRow('abc '), 1).cells]; h.parser(parser);
+      await h.calibrator.runDue();
+      expect(drawn).toBe(frame);
+      expect(drawn!.cells[0]!.map(cell => cell.style)).toEqual([163, 163, 163, 163]);
+      const write = h.writes[0]!;
+      expect(write.capture.history[2]!.cells[0]!.style).toBe(2);
+      results[String(mask)] = { dueAt: h.calibrator.dueAt, checks: write.checks.map(c => c.lineId), uncertified: write.uncertifiedStyle ?? null };
+      if (mask !== undefined) {
+        expect(h.calibrator.dueAt).toBe(1000);
+        expect(write.checks.map(c => c.lineId)).toContain(3);
+        expect(write.uncertifiedStyle).toEqual({ mask, historyRows: [2], screenRows: [0] });
+      } else {
+        expect(h.calibrator.dueAt).toBe(50);
+        expect(write.checks.map(c => c.lineId)).not.toContain(3);
+        expect(write.uncertifiedStyle).toBeUndefined();
+      }
+    }
+    console.log('NEWARCH_I4C_M9', JSON.stringify(results));
+    // The comparator restriction never leaks into equality of drawn cells.
+    const a = { ...h0Frame(), cells: [styled(naRow('x'), 2).cells] }, b = { ...h0Frame(), cells: [styled(naRow('x'), 0).cells] };
+    expect(equalCalibrationFrames(a, b)).toBe(false);
+    expect(equalCalibrationFrames(a, b, PARSER_BITS)).toBe(true);
+    expect(equalCalibrationFrames(a, { ...b, cells: [styled(naRow('x'), 1).cells] }, PARSER_BITS)).toBe(false);
+  });
+  const h0Frame = (): CalibrationFrame => ({ cells: [], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 });
+
+  test('F9 21 private panes: a parser screen made wrong by a taller resize is corrected by a quiescent capture within 1s', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'i4c-f9-'));
+    const socket = join(root, 'f9.sock');
+    const env = { ...process.env }; delete env.TMUX; delete env.TMUX_PANE;
+    const tmux = (...args: string[]) => {
+      const r = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 });
+      if (r.status !== 0) throw new Error(`private tmux ${args[0]} exit=${r.status}: ${r.stderr}`);
+      return r.stdout;
+    };
+    // Independent oracle: plain capture-pane text (no -e, no decoder) and the
+    // fixture's own colour rule; the decoder under test is never consulted.
+    const plain = (id: string) => tmux('capture-pane', '-p', '-t', id).replace(/\n$/, '').split('\n').map(line => line.trimEnd());
+    const cursorOf = (id: string) => { const [x, y] = tmux('display-message', '-p', '-t', id, '#{cursor_x} #{cursor_y}').trim().split(' ').map(Number); return { x: x!, y: y! }; };
+    const text = (cells: readonly { grapheme: string; continuation: boolean }[]) => cells.filter(c => !c.continuation).map(c => c.grapheme).join('').trimEnd();
+    const mismatch = (frame: CalibrationFrame, id: string) => {
+      const oracle = plain(id), cursor = cursorOf(id);
+      let rows = 0;
+      for (let y = 0; y < Math.max(oracle.length, frame.cells.length); y++) if ((oracle[y] ?? '') !== (frame.cells[y] ? text(frame.cells[y]!) : '')) rows++;
+      return { rows, cursor: frame.cursor?.x === cursor.x && frame.cursor?.y === cursor.y ? 0 : 1 };
+    };
+    const report: unknown[] = [];
+    try {
+      writeFileSync(join(root, 'tmux.conf'), 'set -g status off\nset -g history-limit 2000\n');
+      const panes: string[] = [];
+      for (let p = 0; p < 21; p++) {
+        const script = join(root, `p${p}.sh`);
+        // Line i is printed in colour 31+i%7; line 25 is dim (SGR 2).
+        writeFileSync(script, "for i in $(seq 1 30); do if [ $i = 25 ]; then printf '\\033[2mdim-%02d-p" + p + "\\033[0m\\n' $i; else printf '\\033[%dmrow-%02d-p" + p + "\\033[0m\\n' $((31 + i % 7)) $i; fi; done; exec sleep 600\n");
+        panes.push(tmux('-f', join(root, 'tmux.conf'), 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `f${p}`, '-x', '40', '-y', '10', `sh ${script}`).trim());
+      }
+      const readyBy = performance.now() + 10000;
+      while (!panes.every(id => plain(id).some(line => line.startsWith('row-30-')))) {
+        if (performance.now() > readyBy) throw new Error('fixture panes not ready');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      for (const [p, id] of panes.entries()) {
+        const decoder = new TmuxCaptureDecoder(40);
+        const screenAt = (rows: number) => decoder.decode(tmux('capture-pane', '-p', '-e', '-N', '-t', id)).slice(-rows);
+        // Parser model before the resize, then the classic D-RESIZE error: the
+        // parser grows at the bottom while tmux pulls history rows down.
+        const old = screenAt(10);
+        tmux('resize-window', '-t', `f${p}`, '-y', '14');
+        const blank = Array.from({ length: 40 }, () => ({ grapheme: ' ', width: 1 as const, continuation: false, fg: 'default', bg: 'default', style: 0 }));
+        const parser: CalibrationFrame = { cells: [...old, blank, blank, blank, blank], cursor: { x: 0, y: 9, visible: true }, kind: 'normal', geometryGeneration: 2, receiveSeq: 7 };
+        const before = mismatch(parser, id);
+        let revision = 1, commits = 0, drawn: CalibrationFrame | undefined, drawnAt = 0;
+        const meta = (): CaptureMetadata => {
+          const [w, hh, x, y, alt] = tmux('display-message', '-p', '-t', id, '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on}').trim().split(' ').map(Number);
+          return { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 2, cols: w!, rows: hh!, kind: alt ? 'alternate' : 'normal', cursor: { x: x!, y: y!, visible: true } };
+        };
+        const paneKey = { serverIdentity: socket, paneId: id, birthGeneration: 1 };
+        const calibrator = new HistoryCalibrator(paneKey, {
+          now: () => performance.now(), schedule: () => {},
+          read: () => ({ revision, sourceEpoch: 1, geometryGeneration: 2, recentHistory: [], parserFrame: parser }),
+          capture: async (_key, tail) => {
+            const m0 = meta(), requestedAt = performance.now();
+            const body = tmux('capture-pane', '-p', '-e', '-N', '-t', id, ...(tail > 0 ? ['-S', `-${tail}`] : []));
+            const m1 = meta();
+            const rows = decoder.decode(body), screen = rows.slice(-m1.rows);
+            return { paneKey, captureId: `f9-${p}`, requestedAt, completedAt: performance.now(), before: m0, after: m1,
+              frame: { cells: screen, cursor: m1.cursor, kind: m1.kind, geometryGeneration: 2, receiveSeq: -1 },
+              history: rows.slice(0, rows.length - screen.length).map(cells => ({ cells, softWrap: false })), completeRetainedTail: true, observedFields: ['cells', 'cursor'] };
+          },
+          calibrate: async input => { if (input.expectedRevision !== revision) return null; commits++; return { revision: ++revision, durableRevision: 0, nextLineId: 0 }; },
+          publish: (_commit, frame) => { drawn ??= frame; drawnAt ||= performance.now(); },
+          fault: issue => { throw new Error(`unexpected fault ${issue.kind}`); },
+        }, { viewers: 1, certifiedStyleMask: PARSER_BITS });
+        const quiescentAt = performance.now();
+        calibrator.event('resize');
+        while (!drawn && performance.now() - quiescentAt < 1000) {
+          if (calibrator.dueAt <= performance.now()) await calibrator.runDue();
+          else await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        calibrator.close();
+        expect(drawn).toBeDefined();
+        const after = mismatch(drawn!, id);
+        // Fixture colours and the dim row, read from the drawn cells.
+        let colours = 0, dim = 0;
+        for (const row of drawn!.cells) {
+          const label = /^(row|dim)-(\d\d)-/.exec(text(row));
+          if (!label) continue;
+          if (label[1] === 'dim') { expect(row[0]!.style & 2).toBe(2); dim++; continue; }
+          expect(row[0]!.fg).toBe(`index:${1 + Number(label[2]) % 7}`); colours++;
+        }
+        const latency = drawnAt - quiescentAt;
+        report.push({ pane: id, before, after, commits, latencyMs: Math.round(latency), displaySource: drawn!.receiveSeq === -1 ? 'tmux-calibrated' : 'pipe', colours, dim });
+        expect(before.rows).toBeGreaterThan(0); expect(before.cursor).toBe(1);
+        expect(commits).toBeGreaterThanOrEqual(1);
+        expect(after).toEqual({ rows: 0, cursor: 0 });
+        expect(drawn!.receiveSeq).toBe(-1);
+        expect(dim).toBe(1); expect(colours).toBe(12);
+        expect(latency).toBeLessThanOrEqual(1000);
+      }
+      console.log('NEWARCH_I4C_F9', JSON.stringify({ panes: report.length, scope: 'private tmux 3.4 socket; real HistoryCalibrator + TmuxCaptureDecoder; oracle = plain capture-pane text + fixture colour rule', report }));
+    } finally {
+      spawnSync('tmux', ['-S', socket, 'kill-server'], { encoding: 'utf8', env });
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+test('I4-FIX1 C mutation controls: close abort, late commit, unviewed cadence, certified divergence, full-fidelity commit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i4c-mutation-'));
+  const prelude = `import assert from 'node:assert/strict';
+const {HistoryCalibrator}=await import('./subject.ts');
+let t=0, rev=1;
+const cell=(g,style=0)=>({grapheme:g,width:1,continuation:false,fg:'default',bg:'default',style});
+const row=(s,style=0)=>Array.from(s,g=>cell(g,style));
+const key={serverIdentity:'fixture',paneId:'%0',birthGeneration:1};
+const meta={historyEpoch:1,sourceEpoch:1,geometryGeneration:1,cols:4,rows:1,kind:'normal',cursor:{x:0,y:0,visible:true}};
+let parser={cells:[row('abc ')],cursor:meta.cursor,kind:'normal',geometryGeneration:1,receiveSeq:0};
+let frame={cells:[row('abc ')],cursor:meta.cursor,kind:'normal',geometryGeneration:1,receiveSeq:-1};
+let history=[];
+const writes=[], published=[];
+const ports={now:()=>t,schedule:()=>{},read:()=>({revision:rev,sourceEpoch:1,geometryGeneration:1,recentHistory:[],parserFrame:parser}),
+ capture:async()=>({paneKey:key,captureId:'c',requestedAt:t,completedAt:t,before:meta,after:meta,frame,history,completeRetainedTail:true,observedFields:[]}),
+ calibrate:async i=>{writes.push(i);return {revision:++rev,durableRevision:0,nextLineId:0}},
+ publish:(c,f)=>published.push(f),fault:()=>{}};
+`;
+  const cases = [
+    { name: 'close-aborts-capture', from: "this.abortInFlight = () => expire('calibrator closed');", to: 'this.abortInFlight = () => {};',
+      body: `let signal; ports.timeout=()=>()=>{}; ports.capture=(_,__,s)=>{signal=s;return new Promise(()=>{})};
+const c=new HistoryCalibrator(key,ports); const running=c.runDue(); c.close();
+const r=await Promise.race([running.then(()=>'done'),new Promise(res=>setTimeout(()=>res('hung'),300))]);
+assert.equal(r,'done','MUTATION close left the capture holding the pane'); assert.equal(signal.aborted,true,'MUTATION close did not abort');` },
+    { name: 'close-during-commit', from: 'if (this.closed) return;\n      if (!committed)', to: 'if (!committed)',
+      body: `let release; const calibrate=ports.calibrate; ports.calibrate=i=>new Promise(res=>{release=()=>res(calibrate(i))});
+const c=new HistoryCalibrator(key,ports); const running=c.runDue(); for(let i=0;i<5&&!release;i++) await Promise.resolve();
+c.close(); release(); await running; assert.equal(published.length,0,'MUTATION closed pane published');` },
+    { name: 'unviewed-cadence', from: ': !this.viewed ? CAPTURE_CADENCE.unviewedMs', to: ': false ? CAPTURE_CADENCE.unviewedMs',
+      body: `const c=new HistoryCalibrator(key,ports,{viewers:0}); await c.runDue(); assert.equal(c.dueAt,5000,'MUTATION unviewed pane on the 1s cadence');` },
+    { name: 'certified-divergence', from: 'capture.frame, mask);', to: 'capture.frame);',
+      body: `parser={...parser,cells:[row('abc ',1)]}; frame={...frame,cells:[row('abc ',1|2)]};
+const c=new HistoryCalibrator(key,ports,{certifiedStyleMask:1|4|8|16|64|256}); await c.runDue();
+assert.equal(published[0],frame); assert.equal(c.dueAt,1000,'MUTATION dim alone read as a parser divergence');` },
+    { name: 'full-fidelity-commit', from: 'await this.ports.calibrate({ capture, checks', to: 'await this.ports.calibrate({ capture: { ...capture, history: certified }, checks',
+      body: `history=[{cells:row('ab  ',2),softWrap:false}];
+const c=new HistoryCalibrator(key,ports,{certifiedStyleMask:1|4|8|16|64|256}); await c.runDue();
+assert.equal(writes[0].capture.history[0].cells[0].style,2,'MUTATION committed capture lost dim');
+assert.deepEqual(writes[0].uncertifiedStyle.historyRows,[0]);` },
+  ];
+  try {
+    writeFileSync(join(root, 'history-row-matcher.ts'), readFileSync(new URL('../src/history-row-matcher.ts', import.meta.url)));
+    const original = readFileSync(new URL('../src/history-calibrator.ts', import.meta.url), 'utf8');
+    for (const item of cases) {
+      expect(original.split(item.from)).toHaveLength(2);
+      writeFileSync(join(root, 'runner.ts'), prelude + item.body);
+      for (const mutated of [false, true]) {
+        writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(item.from, item.to) : original);
+        const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+        console.log('I4C_MUTATION', JSON.stringify({ name: item.name, mutated, exit: result.status, stderr: result.stderr.slice(0, 300) }));
+        expect(result.status).toBe(mutated ? 1 : 0);
+        if (mutated) expect(result.stderr).toContain('MUTATION');
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

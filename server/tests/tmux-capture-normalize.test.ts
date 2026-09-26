@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { normalizeTmuxCaptureCells, TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
+import { normalizeTmuxCaptureCells, TmuxCaptureDecoder, TMUX_STYLE_BITS } from '../src/tmux-capture-normalize';
 
 describe('tmux capture cell normalization', () => {
   test('removes exactly one VS16 promotion continuation cell', () => {
@@ -283,6 +283,70 @@ assert.deepEqual(result.uncertainRows,[1],'MUTATION uncertain row lost');`);
       writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, "certain: true, reason: 'ambiguous-cell-boundary' }") : original);
       const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
       console.log('I3_MUTATION', JSON.stringify({ name: 'ambiguous-cells', mutated, exit: result.status, stderr: result.stderr }));
+      expect(result.status).toBe(mutated ? 1 : 0);
+      if (mutated) expect(result.stderr).toContain('MUTATION');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+describe('I4-FIX1 lot C decoder fidelity and retention', () => {
+  test('M9 dim, blink, rapid blink, hidden, strike and double underline survive decode as distinct bits', () => {
+    const cases: Array<[string, number]> = [
+      ['1', TMUX_STYLE_BITS.BOLD], ['2', TMUX_STYLE_BITS.DIM], ['3', TMUX_STYLE_BITS.ITALIC], ['4', TMUX_STYLE_BITS.UNDERLINE],
+      ['5', TMUX_STYLE_BITS.BLINK], ['6', TMUX_STYLE_BITS.RAPID_BLINK], ['7', TMUX_STYLE_BITS.REVERSE], ['8', TMUX_STYLE_BITS.HIDDEN],
+      ['9', TMUX_STYLE_BITS.STRIKE], ['21', TMUX_STYLE_BITS.DOUBLE_UNDERLINE], ['2;6;8', 2 | 32 | 128],
+    ];
+    for (const [sgr, bits] of cases) {
+      const warm = new TmuxCaptureDecoder(4);
+      const raw = `\x1b[${sgr}mab\x1b[0mc\n`;
+      for (const rows of [decodeTmuxCaptureRows(raw, 4), warm.decode(raw), warm.decode(raw)]) {
+        expect(rows[0]!.map(cell => cell.style)).toEqual([bits, bits, 0, 0]);
+      }
+    }
+    // Resets clear exactly their own bits.
+    expect(decodeTmuxCaptureRows('\x1b[1;2;6;8mA\x1b[22mB\x1b[25mC\x1b[28mD\n', 4)[0]!.map(c => c.style)).toEqual([1 | 2 | 32 | 128, 32 | 128, 128, 0]);
+  });
+
+  test('F11 retention follows the capture in use: a steady tail keeps <=1024 rows, consecutive full captures stay warm', () => {
+    const line = (i: number) => `\x1b[${31 + i % 7}mrow-${String(i).padStart(8, '0')} ไทย 你\x1b[0m`;
+    const body = (from: number, count: number) => Array.from({ length: count }, (_, k) => line(from + k)).join('\n') + '\n';
+    const adaptive = new TmuxCaptureDecoder(80), fixed = new TmuxCaptureDecoder(80, 9000, 9000);
+    let end = 4540;
+    for (const d of [adaptive, fixed]) d.decode(body(0, 4540));
+    expect(adaptive.size).toBe(4540);
+    for (let t = 0; t < 300; t++) { end += 20; for (const d of [adaptive, fixed]) d.decode(body(end - 188, 188)); }
+    console.log('NEWARCH_I4C_DECODER_RETENTION', JSON.stringify({ adaptive: { size: adaptive.size, hits: adaptive.hits, misses: adaptive.misses }, fixed9000: { size: fixed.size, hits: fixed.hits, misses: fixed.misses } }));
+    expect(adaptive.size).toBeLessThanOrEqual(1024);
+    expect(fixed.size).toBe(9000);
+    // Same memo effect in steady flow.
+    expect(adaptive.hits).toBe(fixed.hits); expect(adaptive.misses).toBe(fixed.misses);
+    // A full capture regrows it; the next full capture is all hits.
+    const full = body(end - 4540, 4540);
+    adaptive.decode(full);
+    const hits = adaptive.hits, misses = adaptive.misses;
+    adaptive.decode(full);
+    expect(adaptive.hits - hits).toBe(4540); expect(adaptive.misses).toBe(misses);
+    expect(() => new TmuxCaptureDecoder(80, 9000, 0)).toThrow('invalid decoder cache size');
+  });
+});
+
+test('I4-FIX1 C mutation control: a memo that never trims keeps 9000 rows and fails the retention bound', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i4c-decoder-mutation-'));
+  try {
+    const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+    const from = 'if (this.cache.size <= keep) return;';
+    expect(original.split(from)).toHaveLength(2);
+    writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
+import {TmuxCaptureDecoder} from './subject.ts';
+const body=(a,n)=>Array.from({length:n},(_,k)=>'row-'+String(a+k).padStart(8,'0')).join('\\n')+'\\n';
+const d=new TmuxCaptureDecoder(40); d.decode(body(0,4540));
+let end=4540; for(let t=0;t<100;t++){end+=40; d.decode(body(end-188,188));}
+assert.ok(d.size<=1024,'MUTATION memo kept '+d.size+' rows');`);
+    for (const mutated of [false, true]) {
+      writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, 'return;') : original);
+      const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+      console.log('I4C_MUTATION', JSON.stringify({ name: 'decoder-retention', mutated, exit: result.status, stderr: result.stderr.slice(0, 300) }));
       expect(result.status).toBe(mutated ? 1 : 0);
       if (mutated) expect(result.stderr).toContain('MUTATION');
     }
