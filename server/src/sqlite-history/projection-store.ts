@@ -9,7 +9,7 @@ import { readProjectionPage, projectionIssue } from './projection-reader';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
-const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=40;
+const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=20;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 // D12 (FIX1 §3): every pane in the live roster owns a guaranteed quota; the
 // rest of the cap is a borrow pool. A pane that sent nothing for ROSTER_MS
@@ -124,7 +124,6 @@ export class ProjectionStore implements ProjectionWriterPort {
   private stopped=false;
   private timer:ReturnType<typeof setInterval>;
   private retry:Batch|null=null;
-  private staged:Batch|null=null;
   private worker:Worker|null=null;
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
@@ -179,8 +178,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(this.inFlight && !this.staged && (this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.stageSnapshot();
-        if(!this.inFlight && (this.retry || this.staged || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
@@ -209,10 +207,10 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.lastCommitAt=last?Number(last.committed_at):null;
   }
   private pendingAge():number {
-    const times=[...(this.retry?[this.retry.since]:[]),...(this.staged?[this.staged.since]:[]),...(this.dirtySince===null?[]:[this.dirtySince]),...[...this.queues.values()].map(q=>q[0]?.at).filter((v):v is number=>v!==undefined)];
+    const times=[...(this.retry?[this.retry.since]:[]),...(this.dirtySince===null?[]:[this.dirtySince]),...[...this.queues.values()].map(q=>q[0]?.at).filter((v):v is number=>v!==undefined)];
     return times.length?Math.max(0,Date.now()-Math.min(...times)):0;
   }
-  private pendingBytes():number {return this.dirtyBytes+this.queuedBytes+(this.retry?.bytes??0)+(this.staged?.bytes??0);}
+  private pendingBytes():number {return this.dirtyBytes+this.queuedBytes+(this.retry?.bytes??0);}
   private fault(kind:string,reason:string,key?:PaneKey,lostRows=1):void {
     this.degraded=true;
     const now=Date.now();
@@ -604,34 +602,20 @@ export class ProjectionStore implements ProjectionWriterPort {
     return row?{...row,cells_json:JSON.stringify(decodeFrameCells(String(row.cells_json)))}:null;
   }
   readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
-  private buildSnapshot(base:Batch|null):Batch|null {
+  private snapshot():Batch|null {
+    if(this.retry)return this.retry;
     this.drainLosses();
     if(!this.dirtyBytes && this.dirtySince===null)return null;
-    const baseRevisions=new Map((base?.panes??[]).map(p=>[String(p.pane_key),Number(p.revision)]));
-    const panes=(this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[]).filter(p=>
-      Number(p.revision)>(baseRevisions.get(String(p.pane_key))??Number(p.durable_revision)));
+    const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
     const tables=new Map<string,SqlRow[]>();
     for(const table of ['na_capture','na_line','na_issue']) {
-      const rows:SqlRow[]=[];
-      for(const p of panes) {
-        const lower=baseRevisions.get(String(p.pane_key))??Number(p.durable_revision);
-        rows.push(...this.ram.db.query(`SELECT * FROM ${table} WHERE pane_key=? AND revision>? AND revision<=?`).all(p.pane_key,lower,p.revision) as SqlRow[]);
-      }
+      const rows=this.ram.db.query(`SELECT t.* FROM ${table} t JOIN na_pane p ON p.pane_key=t.pane_key WHERE t.revision>p.durable_revision`).all() as SqlRow[];
       tables.set(table,rows);
     }
     const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
-    const batch={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince??Date.now(),byPane:this.dirtyByPane};
+    this.retry={id:randomUUID(),digest,panes,tables,bytes:this.dirtyBytes,since:this.dirtySince??Date.now(),byPane:this.dirtyByPane};
     this.dirtyBytes=0;this.dirtyByPane=new Map();this.dirtySince=null;this.screenBytes.clear();this.dirtyFaults.clear();
-    return batch;
-  }
-  private snapshot():Batch|null {
-    if(this.retry)return this.retry;
-    if(this.staged) {this.retry=this.staged;this.staged=null;return this.retry;}
-    this.retry=this.buildSnapshot(null);return this.retry;
-  }
-  private stageSnapshot():void {
-    if(!this.inFlight || !this.retry || this.staged)return;
-    this.staged=this.buildSnapshot(this.retry);
+    return this.retry;
   }
   private acknowledge():void {
     const batch=this.retry!;
@@ -686,7 +670,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(this.closed || !this.inFlight || this.retry?.id!==id)return;
       try {
         this.finishWorker();
-        if(!this.closing && (this.staged || this.dirtyBytes || this.dirtySince!==null))this.flushAsync();
+        if(!this.closing && (this.dirtyBytes || this.dirtySince!==null))this.flushAsync();
       }catch(error){this.fault('flush-failed',String(error));}
     });
     this.worker.on('error',failed);
