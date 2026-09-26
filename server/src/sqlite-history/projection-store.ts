@@ -450,6 +450,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     while(this.queues.size && processed<128 && (processed===0 || performance.now()-started<4)) {
       // Rotate after each row, including when the time slice ends mid-round.
       const [id,q]=this.queues.entries().next().value!;
+      // A calibration barrier owns its transaction: at most 256 mapped rows,
+      // without preceding scroll jobs enlarging that commit.
+      if(q[0]!.barrier && work.length)break;
       this.queues.delete(id);const job=q.shift()!;if(q.length)this.queues.set(id,q);
       this.queuedBytes-=job.bytes;
       work.push({id,job});processed++;
