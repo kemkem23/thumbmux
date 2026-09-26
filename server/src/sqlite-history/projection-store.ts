@@ -181,7 +181,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
-    },2);
+    },5);
     this.timer.unref();
   }
   private owner():void {
