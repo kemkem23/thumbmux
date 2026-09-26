@@ -273,7 +273,7 @@ export interface PipeHistoryRuntimeOptions {
 
 const RING_ROWS = 4500;
 /** Minimum spacing of full-screen writes to the store per pane (leading edge immediate). */
-export const FRAME_WRITE_MS = 16;
+export const FRAME_WRITE_MS = 8;
 
 // ─── screen assembly ──────────────────────────────────────────────────────
 
