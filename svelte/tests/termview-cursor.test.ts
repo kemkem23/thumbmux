@@ -272,6 +272,11 @@ describe('Canvas FIX1 integration', () => {
         };
       },
     });
+    // A host defines --font-mono (the default family is `var(--font-mono, …)`).
+    // happy-dom 20.11 resolves var() only for a defined variable and never
+    // applies the fallback, which left the unresolved `var(` in the canvas font
+    // on every run (red on the H base 5d8a88680 as well). Browsers apply it.
+    document.documentElement.style.setProperty('--font-mono', 'monospace');
     try {
       const viewport = mountView('off', 'canvas');
       const host = viewport.querySelector<HTMLElement>('.canvas-terminal')!;
@@ -293,6 +298,7 @@ describe('Canvas FIX1 integration', () => {
       expect(links).toHaveLength(1);
       expect(links[0]!.getAttribute('href')).toBe('https://real.example/secret');
     } finally {
+      document.documentElement.style.removeProperty('--font-mono');
       if (descriptor) Object.defineProperty(window.HTMLCanvasElement.prototype, 'getContext', descriptor);
       else Reflect.deleteProperty(window.HTMLCanvasElement.prototype, 'getContext');
     }
