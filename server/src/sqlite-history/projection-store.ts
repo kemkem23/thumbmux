@@ -181,7 +181,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
-    },5);
+    },2);
     this.timer.unref();
   }
   private owner():void {
@@ -609,7 +609,8 @@ export class ProjectionStore implements ProjectionWriterPort {
     const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
     const tables=new Map<string,SqlRow[]>();
     for(const table of ['na_capture','na_line','na_issue']) {
-      const rows=this.ram.db.query(`SELECT t.* FROM ${table} t JOIN na_pane p ON p.pane_key=t.pane_key WHERE t.revision>p.durable_revision`).all() as SqlRow[];
+      const rows:SqlRow[]=[];
+      for(const p of panes)rows.push(...this.ram.db.query(`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
       tables.set(table,rows);
     }
     const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');

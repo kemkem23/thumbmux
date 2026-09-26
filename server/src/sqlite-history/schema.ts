@@ -204,6 +204,7 @@ CREATE TABLE na_commit (
 
 /** Volatile display state. This schema is installed only in ProjectionRam. */
 export const PROJECTION_RAM_SCREEN_SCHEMA = `
+CREATE INDEX na_line_pending_revision ON na_line(pane_key,revision);
 CREATE TABLE na_screen (
  pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), screen_kind TEXT NOT NULL,
  revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
