@@ -749,6 +749,11 @@ const I2_FIX2_MUTATIONS=[
   {name:'FIX2-B1 null-evidence',file:'ram-store.ts',before:"if(evidence?.kind==='quiescent') {",after:'if(evidence!==undefined) {'},
   {name:'FIX2-B1 uncertain-rows',file:'ram-store.ts',before:'this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);',after:'this.screen(c,c.captureId,c.completedAt,c.observedFields);'},
 ];
+const I4_FIX1_S_MUTATIONS=[
+  {name:'I4-S capture-payload-columns',file:'schema.ts',before:'screen_hash TEXT NOT NULL, history_hash TEXT NOT NULL,',after:'screen_cells_json TEXT NOT NULL, history_cells_json TEXT NOT NULL,'},
+  {name:'I4-S metadata-screen-hash',file:'ram-store.ts',before:"screenHash.digest('hex'),historyHash.digest('hex')",after:"'0'.repeat(64),historyHash.digest('hex')"},
+  {name:'I4-S persist-screen-table',file:'projection-store.ts',before:"['na_capture','na_line','na_issue']",after:"['na_capture','na_line','na_screen','na_issue']"},
+];
 async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
  const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
  const results:any[]=[];
@@ -756,7 +761,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
   for(const mutation of cases)for(const broken of [false,true]) {
    const outdir=join(root,mutation.name.replace(/\W+/g,'-')+'-'+broken);
    const result=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir,target:'bun',plugins:[{
-    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store)\.ts$/},args=>{
+    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store|schema)\.ts$/},args=>{
      let contents=readFileSync(args.path,'utf8');
      if(broken && args.path.endsWith('/'+mutation.file)) {expect(contents).toContain(mutation.before);contents=contents.replace(mutation.before,mutation.after);}
      return {contents,loader:'ts'};
@@ -773,7 +778,22 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
     const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.startsWith('FIX2-M2')) {
+     if(name.includes('capture-payload-columns')) {
+      const disk=new Database(s.file,{readonly:true});
+      const payload=disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name LIKE '%cells%' OR name LIKE '%payload%'").all();disk.close();
+      assert(payload.length===0,'capture receipt schema must have no payload-capable columns');
+     } else if(name.includes('metadata-screen-hash')) {
+      const capture=(id,g)=>({...frame(g),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:['grapheme'],ambiguousRows:0,result:'fixture'});
+      const quiet={kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:1};
+      await s.replaceScreen(frame('A'));await s.calibrate({capture:capture('one','A'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
+      await s.calibrate({capture:capture('two','Z'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
+      const hashes=s.ram.db.query('SELECT screen_hash FROM na_capture ORDER BY capture_id').all().map(row=>row.screen_hash);
+      assert(hashes.length===2 && hashes[0]!==hashes[1],'metadata hash must change when capture cells change');
+     } else if(name.includes('persist-screen-table')) {
+      await s.replaceScreen(frame('A'));let ok=true;try{s.flush();}catch{ok=false;}
+      const disk=new Database(s.file,{readonly:true});const durableScreen=disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get();disk.close();
+      assert(ok && durableScreen===null,'screen must remain RAM-only and flushable without a disk table');
+     } else if(name.startsWith('FIX2-M2')) {
       await s.appendScroll(row('stable',1));const read=s.token(key);
       await s.appendScroll(row('moved',2));
       const queued=Array.from({length:20},(_,n)=>s.appendScroll(row('q'+n,3+n)));
@@ -845,6 +865,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
 }
 test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',()=>runI2Mutations(I2_FIX1_MUTATIONS,'I2_FIX1_MUTATIONS'),180000);
 test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
+test('I4 FIX1 S mutations: capture payload, swallowed metadata hash and durable screen each go red',()=>runI2Mutations(I4_FIX1_S_MUTATIONS,'I4_FIX1_S_MUTATIONS'),180000);
 
 test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
