@@ -353,6 +353,7 @@ import { mkdtempSync, rmSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from '../src/sqlite-history/schema';
 import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell } from '../src/sqlite-history/types';
 const naKey:PaneKey={serverIdentity:'fixture-server',paneId:'%1',birthGeneration:1};
 const naCell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
@@ -613,12 +614,18 @@ test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, nev
 });
 
 test('I2 FIX1: a v2 file carrying the pre-FIX1 CHECK lists is refused on recover',async()=>{
- const dir=mkdtempSync(join(tmpdir(),'na-i2-outdated-'));
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-outdated-')),file=join(dir,'newarch-v2/history.sqlite3');
  try {
-  const s=createProjectionStore({historyRoot:dir,mode:'create'});const file=s.file;await s.close();
+  // Build the file exactly as the pre-FIX1 factory did: same schema text with the old CHECK lists.
+  mkdirSync(join(dir,'newarch-v2'),{recursive:true});
   const db=new Database(file);
-  db.exec("PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=replace(sql,\"'tmux-calibrated'\",\"'tmux'\") WHERE name='na_screen'; PRAGMA writable_schema=OFF;");db.close();
+  db.exec(PROJECTION_SCHEMA.replace("'unchecked','checked','content-matched'","'unchecked','checked'").replace("'pipe','tmux-calibrated'","'pipe','tmux'"));
+  db.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);db.close();
   expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('projection-schema-outdated');
+  // The current factory's own file passes the same check.
+  const fresh=mkdtempSync(join(tmpdir(),'na-i2-current-'));
+  try {const s=createProjectionStore({historyRoot:fresh,mode:'create'});await s.close();const r=createProjectionStore({historyRoot:fresh,mode:'recover'});await r.close();}
+  finally{rmSync(fresh,{recursive:true,force:true});}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -648,15 +655,15 @@ test('I2 FIX1 C-F12: issue and transition CAS is checked at admission, not after
  const dir=mkdtempSync(join(tmpdir(),'na-i2-cas-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   await s.appendScroll(naEvent('seed',1));
-  // Output keeps arriving: rows and a frame are queued/applied before the issue runs.
+  // A caller that read before a published frame is stale by definition.
+  const early=s.token(naKey);await s.replaceScreen(naFrame());
+  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:early.revision,kind:'reader-lost',reason:'fixture',missingCount:null,boundaryLineId:early.nextLineId,recoverable:true};
+  await expect(s.recordIssue(issue)).rejects.toThrow('stale-revision');
+  // Output keeps arriving: rows are queued ahead of the issue and the transition.
   const rows=Array.from({length:50},(_,i)=>s.appendScroll(naEvent(`busy ${i}`,i+2)));
   const read=s.token(naKey);
-  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:read.revision,kind:'reader-lost',reason:'fixture',missingCount:null,boundaryLineId:read.nextLineId,recoverable:true};
-  const recorded=s.recordIssue(issue);
+  const recorded=s.recordIssue({...issue,expectedRevision:read.revision});
   const transition=s.transitionEpoch({...issue,expectedRevision:read.revision,nextEpoch:2});
-  // A caller that read before a published frame is stale by definition.
-  await s.replaceScreen(naFrame());
-  await expect(s.recordIssue({...issue,expectedRevision:read.revision})).rejects.toThrow('stale-revision');
   await Promise.all(rows);
   const [r1,r2]=await Promise.all([recorded,transition]);
   expect(r2.revision).toBeGreaterThan(r1.revision);

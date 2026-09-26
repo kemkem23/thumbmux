@@ -776,8 +776,10 @@ test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when 
       assert(state==='drained','eviction must clear RAM pressure');
      } else if(name.includes('guarantee')) {
       clearInterval(s.timer);
-      for(let n=0;n<20;n++)await s.appendScroll(row(('A'+n).padEnd(1024*1024,'a'),n,{...key,paneId:'%A'}));
-      const b=await s.appendScroll(row('B first row',1,{...key,paneId:'%B'}));
+      // A fills whatever it is allowed in 8 KiB rows (no disk acknowledgement), then B offers one 8 KiB row.
+      const text=n=>('A'+n).padEnd(8192,'a');let n=0;
+      while(n<4000 && (await s.appendScroll({...row('',n,{...key,paneId:'%A'}),physicalRow:{text:text(n),cells:[]}})).accepted!==false)n++;
+      const b=await s.appendScroll({...row('',1,{...key,paneId:'%B'}),physicalRow:{text:text(0).replace('A','B'),cells:[]}});
       assert(b.accepted!==false,'a late pane gets its guaranteed quota while A borrows');
      } else if(name.includes('fast-path')) {
       for(let n=0;n<200;n++)void s.appendScroll(row('r'+n,n));
@@ -801,7 +803,7 @@ test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when 
     } finally {try{await s.close();}catch{}}`;
    const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
    const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
-   const red=err.match(/MUTATION_RED: [^\n]*/)?.[0]??null;
+   const red=err.match(/error: (MUTATION_RED: [^\n]*)/)?.[1]??null;
    results.push({name:mutation.name,broken,exit,red});
    console.log('I2_MUTATION',JSON.stringify({name:mutation.name,broken,exit,red,stderrTail:red?undefined:err.slice(-400)}));
    expect(exit).toBe(broken?1:0);if(broken)expect(err).toContain('MUTATION_RED:');
