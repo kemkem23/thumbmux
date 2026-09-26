@@ -86,7 +86,7 @@ test("a throwing live boundary returns a retryable error without reading a dupli
 
 // ── NEWARCH L2-I lot I4: the projection live window and its seam ─────────────
 import { muxHistoryBoundaryTransition, validateMuxHistoryBoundary, validateNewarchFrameMeta } from "../../core/src/protocol";
-import { BLANK_CELL, ProjectionLiveWindow, parserRowCells, type PipeHistoryPane } from "../src/pipe-history-runtime";
+import { BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOverlap, type PipeHistoryPane } from "../src/pipe-history-runtime";
 
 /** A pane double with exactly the surface the live window reads. */
 function fakePane(cols = 20, rows = 4) {
@@ -182,4 +182,14 @@ test("NEWARCH I4: an alternate screen publishes only the screen, the seam at the
   expect(alt.screen.alt).toBe(true);
   expect(alt.boundary.liveStartLine).toBe(12);
   expect(alt.content.split("\n")).toHaveLength(4);
+});
+
+test("NEWARCH I4: rows tmux pulled back onto a taller screen are not shown twice", () => {
+  const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(10)]], 10);
+  const blank = parserRowCells([], 10);
+  const ring = ["a", "b", "c", "d"].map((t) => ({ cells: row(t) }));
+  expect(screenOverlap(ring, [row("c"), row("d"), row("e")])).toBe(2);
+  expect(screenOverlap(ring, [row("e"), row("f")])).toBe(0);
+  // Blank rows alone never count as an overlap.
+  expect(screenOverlap([...ring, { cells: blank }], [blank, row("x")])).toBe(0);
 });

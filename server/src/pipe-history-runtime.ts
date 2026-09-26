@@ -977,6 +977,33 @@ export interface ProjectedHistoryPage {
   markers: Array<{ lineId: number | null; kind: string; reason: string; missingCount: number | null }>;
 }
 
+function sameRow(a: readonly HistoryCell[], b: readonly HistoryCell[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let x = 0; x < a.length; x++) {
+    const p = a[x]!, q = b[x]!;
+    if (p !== q && (p.grapheme !== q.grapheme || p.width !== q.width || p.continuation !== q.continuation
+      || p.fg !== q.fg || p.bg !== q.bg || p.style !== q.style)) return false;
+  }
+  return true;
+}
+/** Largest k: the last k ring rows equal the first k screen rows, one of them not blank. */
+export function screenOverlap(ring: readonly { cells: readonly HistoryCell[] }[], screen: readonly (readonly HistoryCell[])[]): number {
+  const limit = Math.min(ring.length, screen.length);
+  const first = screen[0];
+  if (!first) return 0;
+  for (let k = limit; k >= 1; k--) {
+    if (!sameRow(ring[ring.length - k]!.cells, first)) continue;
+    let equal = true, content = false;
+    for (let i = 0; i < k && equal; i++) {
+      const row = screen[i]!;
+      equal = sameRow(ring[ring.length - k + i]!.cells, row);
+      if (!content && row.some(cell => !isDefaultBlank(cell))) content = true;
+    }
+    if (equal && content) return k;
+  }
+  return 0;
+}
+
 function fnv(value: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < value.length; i++) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 0x01000193) >>> 0; }
@@ -1013,9 +1040,14 @@ export class ProjectionLiveWindow {
     }
     this.starts.set(id, start);
     const lines: string[] = [];
+    // tmux pulls rows back from history into the screen when a pane grows
+    // taller; the journal already holds them as history. Rows the screen
+    // shows again are left out of the live window (never out of the journal
+    // or its pages), so no row appears twice.
+    const overlap = alternate ? 0 : screenOverlap(ring, view.cells);
     if (!alternate) {
       const offset = ring.length - (token.nextLineId - start);
-      for (let i = Math.max(0, offset); i < ring.length; i++) {
+      for (let i = Math.max(0, offset); i < ring.length - overlap; i++) {
         const row = ring[i]!;
         lines.push(row.ansi ??= cellsToAnsi(row.cells));
       }
