@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, ids, observation, evidence } from './sqlite-history/helpers';
 import { OptInHistoryBridge, legacyProjectionDigest } from '../src/sqlite-history/bridge';
@@ -153,6 +153,7 @@ test('default package barrel still has no sqlite import and the opt-in entry has
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { encodeCells } from '../src/sqlite-history/ram-store';
 import { isProjectionRefusal, type ScrollEvent } from '../src/sqlite-history/types';
 // FIX1 §3 caller contract: a refused row still belongs to the caller, which
 // waits for drained() and offers the same row again. Nothing is dropped.
@@ -674,6 +675,42 @@ test('I2 probe: bundled projection worker drains and reopens its own durable dat
   console.log(out);if(err)console.error(err);expect(exit).toBe(0);
  }finally{rmSync(root,{recursive:true,force:true});}
 },30000);
+
+test('I4 FIX1 S: 126000 rows in 60s batch across 21 panes without capture payload growth',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i4-s-126k-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ const keys=Array.from({length:21},(_,pane)=>({serverIdentity:'i4-s-load',paneId:`%${pane}`,birthGeneration:1}));
+ const cell=(grapheme:string)=>({grapheme,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ const physical=()=>readdirSync(join(root,'newarch-v3')).filter(name=>name.startsWith('history.sqlite3')).reduce((sum,name)=>sum+statSync(join(root,'newarch-v3',name)).size,0);
+ let logicalBytes=0,peakIncrement=0,refused=0,maxFlushAgeMs=0;
+ try {
+  const disk0=physical(),cpu0=process.cpuUsage(),started=performance.now();
+  for(let tick=0;tick<6000;tick++) {
+   const target=started+(tick+1)*10,delay=target-performance.now();if(delay>0)await Bun.sleep(delay);
+   const jobs=keys.map((key,pane)=>{
+    const text=`${pane}:${tick} ไทย`.padEnd(80,String((pane+tick)%10)),cells=[...text].map(cell);
+    logicalBytes+=Buffer.byteLength(text)+Buffer.byteLength(encodeCells(cells));
+    return s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:tick+1,softWrap:false,physicalRow:{text,cells}}).then(result=>{if(isProjectionRefusal(result))refused++;});
+   });
+   await Promise.all(jobs);
+   if(tick%100===0){peakIncrement=Math.max(peakIncrement,physical()-disk0);maxFlushAgeMs=Math.max(maxFlushAgeMs,s.health().lastFlushAgeMs);}
+  }
+  s.flush();peakIncrement=Math.max(peakIncrement,physical()-disk0);maxFlushAgeMs=Math.max(maxFlushAgeMs,s.health().lastFlushAgeMs);
+  const elapsedMs=performance.now()-started,cpu=process.cpuUsage(cpu0),cpuCores=(cpu.user+cpu.system)/1000/elapsedMs;
+  const disk=new Database(s.file,{readonly:true});
+  const commits=Number((disk.query('SELECT count(*) AS n FROM na_commit').get() as any).n);
+  const rows=Number((disk.query('SELECT count(*) AS n FROM na_line').get() as any).n);
+  const captures=Number((disk.query('SELECT count(*) AS n FROM na_capture').get() as any).n);
+  const durableScreen=disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get();disk.close();
+  const health=s.health(),diskIncrement=physical()-disk0,ratio=diskIncrement/logicalBytes;
+  console.log('I4_S_126K',JSON.stringify({rows,elapsedMs,cpuCores,commits,rowsPerTransaction:rows/commits,ramBatches:health.ramBatches,
+   averageRamOperationsPerBatch:health.averageRamOperationsPerBatch,refused,maxFlushAgeMs,diskIncrement,peakIncrement,logicalBytes,ratio,captures,durableScreen}));
+  expect(rows).toBe(126000);expect(refused).toBe(0);expect(elapsedMs).toBeLessThan(65000);
+  expect(commits).toBeLessThanOrEqual(6000);expect(rows/commits).toBeGreaterThanOrEqual(21);
+  expect(health.averageRamOperationsPerBatch).toBeGreaterThanOrEqual(21);
+  expect(maxFlushAgeMs).toBeLessThanOrEqual(150);expect(ratio).toBeLessThanOrEqual(1.5);expect(peakIncrement/logicalBytes).toBeLessThanOrEqual(1.5);
+  expect(captures).toBe(0);expect(durableScreen).toBeNull();
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},90000);
 
 test('I2 probe: measure A borrowing before B through E arrive without disk acknowledgements',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-borrow-'));
