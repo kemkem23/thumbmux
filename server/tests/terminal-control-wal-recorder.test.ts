@@ -2304,3 +2304,60 @@ describe('I4-FIX1 lot C: capture deadline, viewer cadence, full-fidelity capture
     }
   }, 60_000);
 });
+
+test('I4-FIX1 C mutation controls: close abort, late commit, unviewed cadence, certified divergence, full-fidelity commit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i4c-mutation-'));
+  const prelude = `import assert from 'node:assert/strict';
+const {HistoryCalibrator}=await import('./subject.ts');
+let t=0, rev=1;
+const cell=(g,style=0)=>({grapheme:g,width:1,continuation:false,fg:'default',bg:'default',style});
+const row=(s,style=0)=>Array.from(s,g=>cell(g,style));
+const key={serverIdentity:'fixture',paneId:'%0',birthGeneration:1};
+const meta={historyEpoch:1,sourceEpoch:1,geometryGeneration:1,cols:4,rows:1,kind:'normal',cursor:{x:0,y:0,visible:true}};
+let parser={cells:[row('abc ')],cursor:meta.cursor,kind:'normal',geometryGeneration:1,receiveSeq:0};
+let frame={cells:[row('abc ')],cursor:meta.cursor,kind:'normal',geometryGeneration:1,receiveSeq:-1};
+let history=[];
+const writes=[], published=[];
+const ports={now:()=>t,schedule:()=>{},read:()=>({revision:rev,sourceEpoch:1,geometryGeneration:1,recentHistory:[],parserFrame:parser}),
+ capture:async()=>({paneKey:key,captureId:'c',requestedAt:t,completedAt:t,before:meta,after:meta,frame,history,completeRetainedTail:true,observedFields:[]}),
+ calibrate:async i=>{writes.push(i);return {revision:++rev,durableRevision:0,nextLineId:0}},
+ publish:(c,f)=>published.push(f),fault:()=>{}};
+`;
+  const cases = [
+    { name: 'close-aborts-capture', from: "this.abortInFlight = () => expire('calibrator closed');", to: 'this.abortInFlight = () => {};',
+      body: `let signal; ports.timeout=()=>()=>{}; ports.capture=(_,__,s)=>{signal=s;return new Promise(()=>{})};
+const c=new HistoryCalibrator(key,ports); const running=c.runDue(); c.close();
+const r=await Promise.race([running.then(()=>'done'),new Promise(res=>setTimeout(()=>res('hung'),300))]);
+assert.equal(r,'done','MUTATION close left the capture holding the pane'); assert.equal(signal.aborted,true,'MUTATION close did not abort');` },
+    { name: 'close-during-commit', from: 'if (this.closed) return;\n      if (!committed)', to: 'if (!committed)',
+      body: `let release; const calibrate=ports.calibrate; ports.calibrate=i=>new Promise(res=>{release=()=>res(calibrate(i))});
+const c=new HistoryCalibrator(key,ports); const running=c.runDue(); for(let i=0;i<5&&!release;i++) await Promise.resolve();
+c.close(); release(); await running; assert.equal(published.length,0,'MUTATION closed pane published');` },
+    { name: 'unviewed-cadence', from: ': !this.viewed ? CAPTURE_CADENCE.unviewedMs', to: ': false ? CAPTURE_CADENCE.unviewedMs',
+      body: `const c=new HistoryCalibrator(key,ports,{viewers:0}); await c.runDue(); assert.equal(c.dueAt,5000,'MUTATION unviewed pane on the 1s cadence');` },
+    { name: 'certified-divergence', from: 'capture.frame, mask);', to: 'capture.frame);',
+      body: `parser={...parser,cells:[row('abc ',1)]}; frame={...frame,cells:[row('abc ',1|2)]};
+const c=new HistoryCalibrator(key,ports,{certifiedStyleMask:1|4|8|16|64|256}); await c.runDue();
+assert.equal(published[0],frame); assert.equal(c.dueAt,1000,'MUTATION dim alone read as a parser divergence');` },
+    { name: 'full-fidelity-commit', from: 'await this.ports.calibrate({ capture, checks', to: 'await this.ports.calibrate({ capture: { ...capture, history: certified }, checks',
+      body: `history=[{cells:row('ab  ',2),softWrap:false}];
+const c=new HistoryCalibrator(key,ports,{certifiedStyleMask:1|4|8|16|64|256}); await c.runDue();
+assert.equal(writes[0].capture.history[0].cells[0].style,2,'MUTATION committed capture lost dim');
+assert.deepEqual(writes[0].uncertifiedStyle.historyRows,[0]);` },
+  ];
+  try {
+    writeFileSync(join(root, 'history-row-matcher.ts'), readFileSync(new URL('../src/history-row-matcher.ts', import.meta.url)));
+    const original = readFileSync(new URL('../src/history-calibrator.ts', import.meta.url), 'utf8');
+    for (const item of cases) {
+      expect(original.split(item.from)).toHaveLength(2);
+      writeFileSync(join(root, 'runner.ts'), prelude + item.body);
+      for (const mutated of [false, true]) {
+        writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(item.from, item.to) : original);
+        const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+        console.log('I4C_MUTATION', JSON.stringify({ name: item.name, mutated, exit: result.status, stderr: result.stderr.slice(0, 300) }));
+        expect(result.status).toBe(mutated ? 1 : 0);
+        if (mutated) expect(result.stderr).toContain('MUTATION');
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

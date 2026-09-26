@@ -329,3 +329,26 @@ describe('I4-FIX1 lot C decoder fidelity and retention', () => {
     expect(() => new TmuxCaptureDecoder(80, 9000, 0)).toThrow('invalid decoder cache size');
   });
 });
+
+test('I4-FIX1 C mutation control: a memo that never trims keeps 9000 rows and fails the retention bound', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i4c-decoder-mutation-'));
+  try {
+    const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+    const from = 'if (this.cache.size <= keep) return;';
+    expect(original.split(from)).toHaveLength(2);
+    writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
+import {TmuxCaptureDecoder} from './subject.ts';
+const body=(a,n)=>Array.from({length:n},(_,k)=>'row-'+String(a+k).padStart(8,'0')).join('\\n')+'\\n';
+const d=new TmuxCaptureDecoder(40); d.decode(body(0,4540));
+let end=4540; for(let t=0;t<100;t++){end+=40; d.decode(body(end-188,188));}
+assert.ok(d.size<=1024,'MUTATION memo kept '+d.size+' rows');`);
+    for (const mutated of [false, true]) {
+      writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(from, 'return;') : original);
+      const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+      console.log('I4C_MUTATION', JSON.stringify({ name: 'decoder-retention', mutated, exit: result.status, stderr: result.stderr.slice(0, 300) }));
+      expect(result.status).toBe(mutated ? 1 : 0);
+      if (mutated) expect(result.stderr).toContain('MUTATION');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
