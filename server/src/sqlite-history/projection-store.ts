@@ -135,6 +135,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private rosterSize=0;
   private rosterAt=0;
   private pressureRefusals=0;
+  private ramBytesCache=-1;
   private refusedBytes=new Map<string,number>();
   private drainWaiters:Array<{id:string;key:PaneKey;resolve:()=>void;reject:(e:unknown)=>void}>=[];
   private durableWaiters:Array<{key:PaneKey;revision:number;resolve:(r:ProjectionReceipt)=>void;reject:(e:unknown)=>void}>=[];
@@ -239,6 +240,15 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {this.options.onFault?.(fault);}catch{console.error('[newarch] fault sink failed');}
     console.error('[newarch]',JSON.stringify(fault));
   }
+  /**
+   * Admission reads RAM size once per pump turn, not twice per row: it only
+   * grows when the pump applies jobs and shrinks on eviction, and both drop
+   * the cache. Pending bytes still bound what was admitted but not applied.
+   */
+  private liveRam():number {
+    if(this.ramBytesCache<0)this.ramBytesCache=this.ram.bytes();
+    return this.ramBytesCache;
+  }
   /** Live roster size, refreshed at most every 250 ms (never a per-row scan). */
   private rosterCount(id:string,now:number):number {
     const seen=this.roster.get(id);this.roster.set(id,now);
@@ -315,7 +325,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   private admissible(id:string,key:PaneKey):boolean {
     const bytes=this.refusedBytes.get(id)??512;
-    return !this.stopped && this.ram.bytes()+bytes<=this.cacheMax && this.capacity(key,bytes)==='ok';
+    return !this.stopped && this.liveRam()+bytes<=this.cacheMax && this.capacity(key,bytes)==='ok';
   }
   private settleDrains():void {
     if(!this.drainWaiters.length)return;
@@ -376,7 +386,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       const id=paneId(key),isScroll=kind==='scroll',storeOnly=kind!=='scroll';
       const bytes=preparedBytes??Buffer.byteLength(JSON.stringify(input))+512;
       if(bytes>this.maxEvent())this.rejectOversize(key,value,isScroll);
-      const scope=this.ram.bytes()+bytes>this.cacheMax?'store':this.capacity(key,bytes,storeOnly);
+      const scope=this.liveRam()+bytes>this.cacheMax?'store':this.capacity(key,bytes,storeOnly);
       if(scope!=='ok') {
         if(kind==='barrier'){this.pressure(key,bytes,scope,false);throw new Error('capacity-pressure');}
         return Promise.resolve(this.pressure(key,bytes,scope,isScroll));
@@ -410,13 +420,9 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.queues.delete(id);const job=q.shift()!;if(q.length)this.queues.set(id,q);
       this.queuedBytes-=job.bytes;
       try {
-        // Admission already bounded RAM; an admitted job is never dropped for
-        // cache pressure (FIX1 §3). Only a runaway past cap+admission fails.
-        const receipt=this.ram.db.transaction(()=>{
-          const receipt=job.run();
-          if(this.ram.bytes()>this.cacheMax+PENDING_MAX)throw new Error('ram-cache-limit');
-          return receipt;
-        })();
+        // Admission already bounded RAM (cap plus at most the pending budget);
+        // an admitted job is never dropped for cache pressure (FIX1 §3).
+        const receipt=this.ram.db.transaction(()=>job.run())();
         // A frame replaces the pane's previous unflushed frame of the same kind:
         // release that one, exactly as the fast path reserves only the delta.
         const replaced=job.screenKey?this.screenBytes.get(job.screenKey)??0:0;
@@ -426,6 +432,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       }catch(error){this.reserve(id,-job.bytes);settle(job,false,error);}
       processed++;
     }
+    this.ramBytesCache=-1;
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
   }
   appendScroll(event:ScrollEvent):Promise<ProjectionAdmission> {
@@ -441,7 +448,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       // later row can overtake it (the caller re-offers the refused row first).
       const paused=this.refusedBytes.get(id);
       if(paused!==undefined && !this.admissible(id,event.paneKey))return Promise.resolve(this.pressure(event.paneKey,Math.max(paused,estimate),'pane',true));
-      const scope=this.ram.bytes()+estimate>this.cacheMax?'store':this.capacity(event.paneKey,estimate);
+      const scope=this.liveRam()+estimate>this.cacheMax?'store':this.capacity(event.paneKey,estimate);
       if(scope!=='ok')return Promise.resolve(this.pressure(event.paneKey,estimate,scope,true));
       const cells=event.physicalRow.cells;
       validateRow({text,cells});
@@ -484,9 +491,10 @@ export class ProjectionStore implements ProjectionWriterPort {
       const encoded=encodeFrameCells(frame.cells);
       const bytes=Buffer.byteLength(encoded)+Buffer.byteLength(pane)+512,delta=bytes-previous;
       if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false);
-      const scope=this.ram.bytes()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
+      const scope=this.liveRam()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
       if(scope!=='ok')return Promise.resolve(this.pressure(frame.paneKey,bytes,scope,false));
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame,null,null,[],encoded);return this.ram.bump(frame.paneKey);})();
+      if(delta>0)this.ramBytesCache=-1;
       this.reserve(pane,delta,true);this.dirtyBytes+=delta;this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
       // An older frame of this kind still queued (behind a barrier that has since
       // run) is superseded: it must never land over the newer screen.
@@ -503,7 +511,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     validateFrame(frame);
     const id=paneId(frame.paneKey),encoded=encodeFrameCells(frame.cells),bytes=Buffer.byteLength(encoded)+Buffer.byteLength(id)+512+128*((tail.waiters?.length??0)+1),delta=bytes-tail.bytes;
     if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false);
-    const scope=this.ram.bytes()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
+    const scope=this.liveRam()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
     if(scope!=='ok')return Promise.resolve(this.pressure(frame.paneKey,bytes,scope,false));
     const frozen=structuredClone({...frame,cells:[]});
     tail.run=()=>{this.ram.screen(frozen,null,null,[],encoded);return this.ram.bump(frozen.paneKey);};
@@ -590,7 +598,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
     this.retry=null;
     this.drainLosses();
-    if(this.pendingBytes()<PENDING_MAX/2 && this.ram.bytes()<=this.cacheMax) {
+    // Pressure clears only once RAM has room for an event again, not merely when disk caught up.
+    this.ramBytesCache=-1;
+    if(this.pendingBytes()<PENDING_MAX/2 && this.liveRam()+512<=this.cacheMax) {
       this.stopped=false;
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
