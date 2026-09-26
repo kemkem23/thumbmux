@@ -63,10 +63,10 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     before?.();writeMs=performance.now()-started;
   }).immediate();
-  // Bound physical WAL growth without checkpointing every transaction. The
-  // measurement includes DB+WAL+SHM; this is normal SQLite maintenance, not
-  // subtracting a sidecar from the result.
-  if(checkpoint)disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  // Bound physical WAL growth without forcing a truncate into the ingest
+  // latency tail. Explicit durability barriers below still truncate the WAL;
+  // the background path only advances the checkpoint non-blockingly.
+  if(checkpoint)disk.exec('PRAGMA wal_checkpoint(PASSIVE)');
   const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs};
 }
 // Same module in source and compiled distributions: no extra worker asset/factory.
