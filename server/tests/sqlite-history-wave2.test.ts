@@ -574,7 +574,7 @@ test('newarch DEBT2: queued frames of one pane coalesce to the latest and releas
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('newarch D11: a malformed frame landing on a queued frame is refused alone; the queued frame stays durable',async()=>{
+test('newarch D11: a malformed frame is refused alone; the queued frame stays live until restart',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-d11-coalesce-'));
  let s=createProjectionStore({historyRoot:root,mode:'create'});const internal=s as any;
  clearInterval(internal.timer); // explicit flushes only, so the queue shape and pending bytes are exact
@@ -599,12 +599,14 @@ test('newarch D11: a malformed frame landing on a queued frame is refused alone;
   expect(q[1].bytes).toBe(tailBytes);expect(internal.pendingBytes()).toBe(pendingBefore);
   await r;out.goodReceipt=await kept.then(()=>'resolved',e=>String(e));
   expect(out.goodReceipt).toBe('resolved');
+  const shown=JSON.parse(String(s.screen(key)!.cells_json));
+  out.liveRows=shown.length;out.liveLastCell=shown[23][79].grapheme;
+  expect(shown).toHaveLength(24);expect(shown[23][79].grapheme).toBe(good.cells[23][79].grapheme);
   s.flush();expect(s.health().pendingBytes).toBe(0);expect(internal.pendingByPane.size).toBe(0);
   await s.close();
   s=createProjectionStore({historyRoot:root,mode:'recover'});
-  const shown=JSON.parse(String(s.screen(key)!.cells_json));
-  out.durableRows=shown.length;out.durableLastCell=shown[23][79].grapheme;
-  expect(shown).toHaveLength(24);expect(shown[23][79].grapheme).toBe(good.cells[23][79].grapheme);
+  out.screenAfterRestart=s.screen(key);expect(out.screenAfterRestart).toBeNull();
+  expect(s.readPage(s.token(key),null,2).lines.map(line=>line.text)).toEqual(['r1']);
   console.log('NA_D11_COALESCE_VALIDATE',JSON.stringify(out));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
