@@ -27,6 +27,7 @@ import {
   type MuxHistoryBoundary,
   type MuxPaneScreen,
   type MuxServerMessage,
+  type NewarchFrameMeta,
   type SessionListItem,
   type SessionListRow,
 } from "@thumbmux/core";
@@ -172,6 +173,43 @@ export interface HistoryArchiveLike {
   renameSession(oldSession: string, newSession: string): void;
   /** Optional durable-history purge used when a host invalidates a session. */
   dropSession?(session: string): void;
+}
+
+/**
+ * One snapshot of a session routed to the pipe-pane projection (NEWARCH
+ * L2-I). `content`/`cursor`/`screen` follow the capture wire contract exactly,
+ * so full/delta framing and every viewer stay unchanged; `boundary` pairs the
+ * live window with history pages whose line numbers are projection line ids.
+ */
+export type MuxProjectionSnapshot = {
+  content: string;
+  cursor: { row: number; col: number } | null;
+  screen: MuxPaneScreen | null;
+  boundary: MuxHistoryBoundary;
+  newarch: NewarchFrameMeta;
+};
+
+/**
+ * Optional source for sessions routed away from tmux polling. A routed session
+ * gets no capture, no pipe-pane dirty signal and no archive ingest from this
+ * mux: its frames come from `snapshot`, pushed by `watch`, and its history
+ * pages from `readBefore`/`readAfter`. Every other session is untouched.
+ */
+export interface MuxProjectionSource {
+  /** The session is routed to the projection now (even before its first frame). */
+  owns(session: string): boolean;
+  /** Current routed snapshot, or null when not routed / nothing published yet. */
+  snapshot(session: string): MuxProjectionSnapshot | null;
+  /** Monotonic route generation of the session (changes on every switch). */
+  routeGeneration(session: string): number;
+  /** Change notifications while the session has viewers. Returns an unsubscribe. */
+  watch(session: string, onChange: () => void): () => void;
+  /** A session's route changed; the mux resets that session's viewers. */
+  onRouteChange(listener: (session: string) => void): () => void;
+  readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
+  readAfter(session: string, afterLine: number | null, limit?: number): unknown;
+  /** A viewer resized the pane: re-read its geometry soon. */
+  noteResize?(session: string): void;
 }
 
 export type InvalidateSessionOptions = {
@@ -337,6 +375,8 @@ export type TmuxWsMuxOptions<
   driver: TmuxDriver<SessionRow>;
   pipes?: PipeManagerLike | null;
   archive?: HistoryArchiveLike | null;
+  /** NEWARCH projection for routed sessions (default none: every session polls). */
+  projection?: MuxProjectionSource | null;
   hooks?: MuxHooks<WS, SessionRow>;
   profile?: (session: string) => SessionProfile;
   /** live scrollback window (lines) kept in the fast path */
@@ -372,6 +412,12 @@ export class TmuxWsMux<
   private driver: TmuxDriver<SessionRow>;
   private pipes: PipeManagerLike | null;
   private archive: HistoryArchiveLike | null;
+  private projection: MuxProjectionSource | null;
+  /** Projection change subscriptions of routed sessions with viewers. */
+  private projectionWatches = new Map<string, () => void>();
+  /** newarch-frame-v1 of the last projected snapshot sent per session. */
+  private lastNewarch = new Map<string, NewarchFrameMeta>();
+  private projectionRouteOff: (() => void) | null = null;
   private hooks: MuxHooks<WS, SessionRow>;
   private profileOf: (session: string) => SessionProfile;
   private liveLineLimit: number;
@@ -473,6 +519,8 @@ export class TmuxWsMux<
     this.driver = opts.driver;
     this.pipes = opts.pipes ?? null;
     this.archive = opts.archive ?? null;
+    this.projection = opts.projection ?? null;
+    this.projectionRouteOff = this.projection?.onRouteChange((session) => this.handleProjectionRouteChange(session)) ?? null;
     this.hooks = opts.hooks ?? {};
     this.profileOf = opts.profile ?? (() => DEFAULT_PROFILE);
     this.liveLineLimit = opts.liveLineLimit ?? 2000;
@@ -564,6 +612,14 @@ export class TmuxWsMux<
         : this.INITIAL_CAPTURE_START_LINE;
       this.captureStartLines.set(session, startLine);
     }
+    if (this.projection?.owns(session)) {
+      // Routed: the projection owns pipe, history and frames for this session.
+      this.watchProjection(session);
+      this.queueCapture(session);
+      this.ensurePolling();
+      this.refreshSessionListSchedule();
+      return;
+    }
     const wantsArchive = profile.archive && !this.archiveSeeded.has(session) && !(opts.tail && opts.tail > 0);
     this.queueCapture(session, { fullHistory: wantsArchive });
     this.ensurePolling();
@@ -572,6 +628,53 @@ export class TmuxWsMux<
     // Start pipe if not already piped
     if (!this.piped.has(session)) {
       this.tryStartPipe(session);
+    }
+  }
+
+  private watchProjection(session: string) {
+    if (!this.projection || this.projectionWatches.has(session)) return;
+    const viewers = this.subscribers.get(session);
+    this.projectionWatches.set(session, this.projection.watch(session, () => {
+      if (viewers && this.ownsSessionLifecycle(session, viewers)) void this.queueCapture(session);
+    }));
+  }
+
+  private unwatchProjection(session: string) {
+    const off = this.projectionWatches.get(session);
+    this.projectionWatches.delete(session);
+    try { off?.(); } catch {}
+  }
+
+  /**
+   * The projection switched this session's route (legacy <-> newarch). Old
+   * bases, caches and in-flight results belong to the previous route: drop
+   * them, stop any legacy dirty pipe, and give every viewer one complete frame
+   * marked `resync` from the new route.
+   */
+  handleProjectionRouteChange(session: string): void {
+    const viewers = this.subscribers.get(session);
+    this.unwatchProjection(session);
+    this.lastNewarch.delete(session);
+    if (this.projection?.owns(session) && this.piped.delete(session)) {
+      this.clearPipeCaptureTimers(session);
+      try { this.pipes?.stopPipe(session); } catch {}
+    }
+    if (!viewers || viewers.size === 0) return;
+    this.contents.delete(session);
+    this.hashes.delete(session);
+    this.lastCursor.delete(session);
+    this.lastScreen.delete(session);
+    this.lastBoundary.delete(session);
+    this.archiveSeeded.delete(session);
+    this.captureStartLines.delete(session);
+    this.invalidateOutputBases(session);
+    for (const ws of viewers) this.requireResetOutput(session, ws, "resync");
+    if (this.projection?.owns(session)) {
+      this.watchProjection(session);
+      this.queueCapture(session);
+    } else {
+      this.queueCapture(session, { fullHistory: this.profileOf(session).archive });
+      if (!this.piped.has(session)) this.tryStartPipe(session);
     }
   }
 
@@ -1038,6 +1141,9 @@ export class TmuxWsMux<
     this.blockedTimeouts.clear();
     for (const session of this.piped) this.pipes?.stopPipe(session);
     this.piped.clear();
+    for (const session of [...this.projectionWatches.keys()]) this.unwatchProjection(session);
+    try { this.projectionRouteOff?.(); } catch {}
+    this.projectionRouteOff = null;
   }
 
   /** Slice to a socket's tail preference (full content when none). Trailing
@@ -1254,6 +1360,7 @@ export class TmuxWsMux<
         cursor,
         ...(this.lastScreen.has(session) ? { screen: this.lastScreen.get(session) ?? null } : {}),
         ...(this.lastBoundary.has(session) ? { boundary: this.lastBoundary.get(session)! } : {}),
+        ...(this.lastNewarch.has(session) ? { newarch: this.lastNewarch.get(session)! } : {}),
       };
       const frame: MuxFullOutputFrame = group.reset ? { ...full, reset: group.reset } : full;
       const output = group.base === undefined
@@ -1433,10 +1540,11 @@ export class TmuxWsMux<
     this.lastCursor.delete(session);
     this.lastScreen.delete(session);
     this.lastBoundary.delete(session);
+    this.lastNewarch.delete(session);
     this.archiveSeeded.delete(session);
     this.captureStartLines.delete(session);
     for (const ws of viewers) this.requireResetOutput(session, ws, "resync");
-    this.queueCapture(session, { fullHistory: true });
+    this.queueCapture(session, { fullHistory: !this.projection?.owns(session) });
     return viewers.size;
   }
 
@@ -1455,6 +1563,8 @@ export class TmuxWsMux<
     this.lastCursor.delete(session);
     this.lastScreen.delete(session);
     this.lastBoundary.delete(session);
+    this.lastNewarch.delete(session);
+    this.unwatchProjection(session);
     this.contents.delete(session);
     this.hashes.delete(session);
     this.lastActivity.delete(session);
@@ -1553,6 +1663,7 @@ export class TmuxWsMux<
       if (last?.cols === cols && last.rows === rows) return;
       this.driver.resizeWindow(session, cols, rows);
       this.lastAppliedGeometry.set(session, { cols, rows });
+      try { this.projection?.noteResize?.(session); } catch {}
       const generation = ++this.geometryGeneration;
       this.geometryGenerations.set(session, generation);
       this.pendingArchiveReflows.set(session, generation);
@@ -1586,7 +1697,7 @@ export class TmuxWsMux<
     if (ws) this.hooks.onKeys?.(session, ws, client);
     try {
       this.driver.sendKeys(session, data);
-      if (this.piped.has(session)) return;
+      if (this.piped.has(session) || this.projection?.owns(session)) return;
       this.enterBurst();
       this.scheduleImmediateCapture(session);
     } catch (e: any) {
@@ -1625,6 +1736,19 @@ export class TmuxWsMux<
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
+    if (this.projection?.owns(session)) {
+      try {
+        history = this.projection.readBefore(session, beforeLine ?? null, limit);
+      } catch (e: unknown) {
+        this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+        this.sendHistoryReadErrorBestEffort(session, ws);
+        return;
+      }
+      try {
+        this.wsSend(ws, JSON.stringify({ channel: session, type: "history", data: JSON.stringify(history) } satisfies MuxServerMessage));
+      } catch {}
+      return;
+    }
     // SessionProfile.archive gates history_expand as well as capture feed
     // (A3-6). A current-pane-only / non-archived profile must not surface
     // durable rows retained under the same session name.
@@ -1670,6 +1794,19 @@ export class TmuxWsMux<
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
+    if (this.projection?.owns(session)) {
+      try {
+        history = this.projection.readAfter(session, afterLine, limit);
+      } catch (e: unknown) {
+        this.reportArchiveReadErrorBestEffort("readAfter", session, e);
+        this.sendHistoryReadErrorBestEffort(session, ws);
+        return;
+      }
+      try {
+        this.wsSend(ws, JSON.stringify({ channel: session, type: "history", data: JSON.stringify(history) } satisfies MuxServerMessage));
+      } catch {}
+      return;
+    }
     if (this.archive?.readAfter && this.profileOf(session).archive) {
       try {
         history = this.archive.readAfter(session, afterLine, limit);
@@ -2001,6 +2138,13 @@ export class TmuxWsMux<
     opts: { fullHistory?: boolean } = {},
   ) {
     if (!this.ownsSessionLifecycle(session, viewers)) return;
+    if (this.projection?.owns(session)) {
+      this.broadcastProjected(session, viewers);
+      return;
+    }
+    // A legacy capture that started before a route switch must never publish
+    // after it: the switch already reset every viewer to the projection.
+    const routeGeneration = this.projection?.routeGeneration(session);
     // Snapshot before the first await. A resize accepted while this capture is
     // in flight belongs to a later capture; the old physical wrapping must not
     // mutate archive/content/base/reset state or reach any viewer.
@@ -2058,6 +2202,7 @@ export class TmuxWsMux<
         content = await this.driver.capturePane(session, captureOpts);
       }
       if (!this.ownsSessionLifecycle(session, viewers)) return;
+      if (this.projection && (this.projection.owns(session) || this.projection.routeGeneration(session) !== routeGeneration)) return;
       if (this.geometryGenerations.get(session) !== geometryGeneration) {
         // queueCapture coalesces work per session. If the invalidated capture
         // owned the one-shot archive seed, hand that intent back to the queued
@@ -2291,6 +2436,55 @@ export class TmuxWsMux<
         try { this.wsSend(ws, errMsg); } catch {}
       }
     }
+  }
+
+  /**
+   * Publish the routed snapshot. Same wire contract as a capture: hash dedupe,
+   * grouped full/delta frames, cursor-only frames. A snapshot whose epoch,
+   * geometry, route or live-window start moved cannot continue any delta base
+   * (newarch-frame-v1), so every viewer gets a complete frame then.
+   */
+  private broadcastProjected(session: string, viewers: Set<WS>) {
+    let snapshot: MuxProjectionSnapshot | null;
+    try {
+      snapshot = this.projection!.snapshot(session);
+    } catch (cause) {
+      try { this.logError(`[thumbmux-mux] projection snapshot error for "${session}":`, cause instanceof Error ? cause.message : String(cause)); } catch {}
+      return;
+    }
+    if (!snapshot) return;
+    // A projection has no archive reflow to wait for.
+    this.pendingArchiveReflows.delete(session);
+    const previous = this.lastNewarch.get(session);
+    const next = snapshot.newarch;
+    if (previous && (previous.sourceEpoch !== next.sourceEpoch || previous.geometryGeneration !== next.geometryGeneration
+      || previous.routeGeneration !== next.routeGeneration || previous.liveStartLine !== next.liveStartLine
+      || previous.paneKey.paneId !== next.paneKey.paneId || previous.paneKey.serverIdentity !== next.paneKey.serverIdentity)) {
+      this.invalidateOutputBases(session);
+      for (const ws of viewers) this.requireFullOutput(session, ws);
+    }
+    this.lastNewarch.set(session, next);
+    const hash = this.driver.hash(snapshot.content);
+    const screenMoved = !this.screenEq(snapshot.screen, this.lastScreen.get(session));
+    const cursorMoved = !this.cursorEq(snapshot.cursor, this.lastCursor.get(session));
+    this.contents.set(session, snapshot.content);
+    this.lastBoundary.set(session, snapshot.boundary);
+    this.lastScreen.set(session, snapshot.screen);
+    this.lastCursor.set(session, snapshot.cursor);
+    if (hash === this.hashes.get(session) && !screenMoved) {
+      if (this.hasPendingOutputFrame(session, viewers)) {
+        this.sendPendingOutputFrames(session, viewers, snapshot.content, snapshot.cursor);
+      } else if (cursorMoved) {
+        const cursorMsg = JSON.stringify({ channel: session, type: "cursor", cursor: snapshot.cursor } satisfies MuxServerMessage);
+        for (const ws of viewers) this.sendCursorFrame(session, ws, cursorMsg);
+      }
+      return;
+    }
+    this.hashes.set(session, hash);
+    if (this.hooks.onOutput) {
+      this.emitOutputHook(session, snapshot.content, snapshot.cursor, undefined, snapshot.screen, snapshot.boundary);
+    }
+    this.sendGroupedOutputFrames(session, viewers, snapshot.content, snapshot.cursor);
   }
 
   private ownsSessionLifecycle(session: string, viewers: Set<WS>): boolean {
