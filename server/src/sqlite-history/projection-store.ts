@@ -122,6 +122,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private closed=false;
   private degraded=false;
   private stopped=false;
+  private pressureBytes=0;
   private timer:ReturnType<typeof setInterval>;
   private retry:Batch|null=null;
   private worker:Worker|null=null;
@@ -301,7 +302,7 @@ export class ProjectionStore implements ProjectionWriterPort {
    * lost-row counter, no parser fault: pressure is not loss.
    */
   private pressure(key:PaneKey,bytes:number,scope:'pane'|'store',isScroll:boolean):ProjectionRefusal {
-    if(scope==='store')this.stopped=true;
+    if(scope==='store'){this.stopped=true;this.pressureBytes=Math.max(this.pressureBytes,bytes);}
     this.pressureRefusals++;
     // Only a refused history row pauses the pane; a refused frame is superseded by the next one.
     if(isScroll)this.refusedBytes.set(paneId(key),bytes);
@@ -375,7 +376,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   /** Reclaim only acknowledged history; no flush is needed to reopen an idle full cache. */
   private relievePressure():void {
-    const reserve=Math.max(512,...this.refusedBytes.values());
+    const reserve=Math.max(512,this.pressureBytes,...this.refusedBytes.values());
     if(this.liveRam()+reserve>this.cacheMax) {
       const panes=(prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[]).map(p=>({...p,revision:p.durable_revision}));
       // Eviction is a cache operation: archived rows remain readable from disk.
@@ -385,7 +386,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(keep===0)break;
       }
     }
-    if(this.liveRam()+reserve<=this.cacheMax && this.pendingBytes()<PENDING_MAX/2)this.stopped=false;
+    if(this.liveRam()+reserve<=this.cacheMax && this.pendingBytes()<PENDING_MAX/2){this.stopped=false;this.pressureBytes=0;}
     this.settleDrains();
   }
   private kickFlush():void {
@@ -707,8 +708,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     // Pressure clears only once RAM has room for an event again, not merely when disk caught up.
     this.ramBytesCache=-1;
     this.relievePressure();
-    if(this.pendingBytes()<PENDING_MAX/2 && this.liveRam()+512<=this.cacheMax) {
-      this.stopped=false;
+    if(!this.stopped && this.pendingBytes()<PENDING_MAX/2 && this.liveRam()+512<=this.cacheMax) {
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
       for(const p of batch.panes) {

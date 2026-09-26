@@ -928,3 +928,25 @@ test('I4 FIX2 F2: 800-row calibration freezes RLE, bounds each commit to 256, an
   console.log('FIX2_CALIBRATION',JSON.stringify({queued,commits:counts}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },30000);
+
+
+test('I4 FIX2 F1: refused frame reserves its actual size when an idle durable cache reopens',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-frame-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:1024*1024});
+ try {
+  const row=fix2Row();let seq=0;
+  while(s.health().ramBytes<950000 && seq<1000) {
+   expect(await s.appendScroll({...naEvent('',++seq),physicalRow:row})).not.toHaveProperty('accepted',false);
+   if(seq%20===0)s.flush();
+  }
+  s.flush();expect(s.health().ramBytes).toBeGreaterThanOrEqual(950000);
+  expect(s.health().ramBytes+512).toBeLessThan(1024*1024);
+  const frame={...naFrame(),cols:120,rows:40,receiveSeq:seq+1,
+   cells:Array.from({length:40},()=>Array.from({length:120},(_,i)=>naCell(String.fromCharCode(65+i%26))))};
+  expect(await s.replaceScreen(frame)).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  expect(await Promise.race([s.drained(naKey).then(()=>true),Bun.sleep(2000).then(()=>false)])).toBe(true);
+  expect(await s.replaceScreen(frame)).not.toHaveProperty('accepted',false);
+  expect(s.screen(naKey)?.cells).toEqual(frame.cells);
+  expect(s.readPage(s.token(naKey),0,1).lines[0].text).toBe(row.text);
+  console.log('FIX2_FRAME_RECOVERY',JSON.stringify({historyRows:seq,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
