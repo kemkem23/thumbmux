@@ -352,14 +352,30 @@ export class TmuxCaptureDecoder {
   hits = 0; misses = 0;
   /** Row indexes of the last decode() that are isolated as uncertain. */
   uncertainRows: number[] = [];
-  constructor(readonly cols: number, private readonly maxEntries = 9000) {
+  /** Retention follows the capture in use (I4-FIX1 F11): after each decode
+   * the memo keeps at most twice that capture's line count, never fewer than
+   * `minEntries` nor more than `maxEntries`. A run of full 4500-row captures
+   * stays warm; a steady incremental tail no longer pins 9000 rows per pane
+   * (21 panes x 120 cols: 278 MiB of heap at a fixed 9000, 35 MiB at 1024). */
+  constructor(readonly cols: number, private readonly maxEntries = 9000, private readonly minEntries = 1024) {
     checkedCols(cols);
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('invalid decoder cache size');
+    if (!Number.isSafeInteger(minEntries) || minEntries < 1) throw new Error('invalid decoder cache size');
+  }
+  get size(): number { return this.cache.size; }
+  private trim(lines: number): void {
+    const keep = Math.min(this.maxEntries, Math.max(this.minEntries, lines * 2));
+    if (this.cache.size <= keep) return;
+    const keys = this.cache.keys();
+    for (let n = this.cache.size - keep; n > 0; n--) this.cache.delete(keys.next().value!);
   }
   decode(raw: string): (readonly Readonly<TmuxObservedCell>[])[] {
     this.uncertainRows = [];
     const lines = raw.split('\n');
     if (lines.at(-1) === '') lines.pop();
+    try { return this.decodeLines(raw, lines); } finally { this.trim(lines.length); }
+  }
+  private decodeLines(raw: string, lines: string[]): (readonly Readonly<TmuxObservedCell>[])[] {
     if (!lines.every(escapesCloseInLine)) {
       const screen = decodeTmuxCaptureScreen(raw, this.cols);
       this.uncertainRows = screen.uncertainRows;
