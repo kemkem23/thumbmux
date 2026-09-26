@@ -19,9 +19,9 @@
  *   screen and the parser screen are kept apart.
  *
  * One cell codec (review 2 M5) maps both producers into the capture's
- * namespace: colours `default` / `index:N` (0-15) / `rgb:r,g,b` and the style
- * bits the parser can observe. Everything the capture shows but the parser
- * cannot represent is masked on both sides, so equal cells mean equal content.
+ * namespace: colours `default` / `index:N` (0-15) / `rgb:r,g,b`. Captured
+ * display cells keep every tmux-observable style bit; certification alone is
+ * limited to fields the parser can observe.
  */
 import { PipeHistoryCollector, type PipeFaultEvent, type PipeFrameEvent, type PipeScrollEvent } from './pipe-history-collector';
 import { pipeVtRunCells, type PipeVtAssets, type PipeVtRow } from './pipe-vt-worker';
@@ -44,6 +44,14 @@ import {
   type ProjectionToken,
   type ProjectionWriterPort,
 } from './sqlite-history/types';
+
+/** Fail-closed handshake for hosts loading this optional runtime entrypoint. */
+export const PIPE_HISTORY_RUNTIME_CAPABILITY = Object.freeze({
+  wire: 'newarch-frame-v1',
+  projectionSchema: 3,
+  metadataRevision: true,
+  archiveReadVersions: Object.freeze([2, 3] as const),
+});
 
 // ─── cell codec ───────────────────────────────────────────────────────────
 
@@ -139,7 +147,7 @@ function canonicalCell(cell: Readonly<HistoryCell>): HistoryCell {
   let mapped = canonicalCells.get(cell);
   if (!mapped) {
     mapped = internCell(cell.grapheme, cell.width, cell.continuation, canonicalCaptureColor(cell.fg),
-      canonicalCaptureColor(cell.bg), cell.style & OBSERVED_STYLE_MASK);
+      canonicalCaptureColor(cell.bg), cell.style);
     if (Object.isFrozen(cell)) canonicalCells.set(cell, mapped);
   }
   return mapped;
@@ -383,7 +391,11 @@ export class PipeHistoryPane {
       calibrate: input => this.commitCalibration(input),
       publish: (commit, frame) => this.publishCapture(commit, frame),
       fault: issue => this.onRuntimeFault(issue.kind, 'calibrator', null),
-    }, { incremental: options.incremental ?? true, historyLimit: options.historyLimit });
+    }, {
+      incremental: options.incremental ?? true,
+      historyLimit: options.historyLimit,
+      certifiedStyleMask: OBSERVED_STYLE_MASK,
+    });
   }
 
   async start(): Promise<void> {
@@ -793,6 +805,8 @@ export class PipeHistoryPane {
   }
 
   // ── viewers ──
+  setViewers(count: number): void { this.calibrator?.setViewers(count); }
+
   subscribe(listener: (update: PaneUpdate) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -966,6 +980,7 @@ export interface ProjectedPaneSnapshot {
   newarch: {
     v: 'newarch-frame-v1';
     paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number; routeGeneration: number;
+    metadataRevision: number;
     cols: number; rows: number; revision: number; durableRevision: number; nextLineId: number; liveStartLine: number;
     displaySource: 'pipe' | 'tmux-calibrated'; degraded: boolean;
     markers: Array<{ lineId: number | null; kind: string; missingCount: number | null }>;
@@ -977,30 +992,9 @@ export interface ProjectedHistoryPage {
   markers: Array<{ lineId: number | null; kind: string; reason: string; missingCount: number | null }>;
 }
 
-function sameRow(a: readonly HistoryCell[], b: readonly HistoryCell[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let x = 0; x < a.length; x++) {
-    const p = a[x]!, q = b[x]!;
-    if (p !== q && (p.grapheme !== q.grapheme || p.width !== q.width || p.continuation !== q.continuation
-      || p.fg !== q.fg || p.bg !== q.bg || p.style !== q.style)) return false;
-  }
-  return true;
-}
-/** Largest k: the last k ring rows equal the first k screen rows, one of them not blank. */
+/** Content equality is not proof that a history row moved back onto screen. */
 export function screenOverlap(ring: readonly { cells: readonly HistoryCell[] }[], screen: readonly (readonly HistoryCell[])[]): number {
-  const limit = Math.min(ring.length, screen.length);
-  const first = screen[0];
-  if (!first) return 0;
-  for (let k = limit; k >= 1; k--) {
-    if (!sameRow(ring[ring.length - k]!.cells, first)) continue;
-    let equal = true, content = false;
-    for (let i = 0; i < k && equal; i++) {
-      const row = screen[i]!;
-      equal = sameRow(ring[ring.length - k + i]!.cells, row);
-      if (!content && row.some(cell => !isDefaultBlank(cell))) content = true;
-    }
-    if (equal && content) return k;
-  }
+  void ring; void screen;
   return 0;
 }
 
@@ -1059,6 +1053,7 @@ export class ProjectionLiveWindow {
     const cursor = view.cursor && view.cursor.visible
       ? { row: view.rows - 1 - trailing - view.cursor.y, col: Math.max(0, view.cursor.x) } : null;
     const markers = view.issues.slice(-16).map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind.slice(0, 64), missingCount: issue.missingCount }));
+    const metadataRevision = view.issues.reduce((revision, issue) => Math.max(revision, issue.revision), 0);
     return {
       content: lines.join('\n'), cursor,
       screen: { alt: alternate, mouseSgr: view.mouseSgr, mouseAny: view.mouseAny },
@@ -1068,7 +1063,7 @@ export class ProjectionLiveWindow {
       },
       newarch: {
         v: 'newarch-frame-v1', paneKey: { ...pane.paneKey }, sourceEpoch: view.sourceEpoch,
-        geometryGeneration: view.geometryGeneration, routeGeneration, cols: view.cols, rows: view.rows,
+        geometryGeneration: view.geometryGeneration, routeGeneration, metadataRevision, cols: view.cols, rows: view.rows,
         revision: token.revision, durableRevision: token.durableRevision, nextLineId: token.nextLineId,
         liveStartLine: start, displaySource: view.displaySource, degraded: view.degraded, markers,
       },

@@ -15,6 +15,7 @@ import {
   copyServerRuntimeAssets,
   TERMINAL_PTY_WAL_PROXY_ASSET,
 } from "../scripts/copy-runtime-assets";
+import { PIPE_HISTORY_RUNTIME_CAPABILITY } from "../src/pipe-history-runtime";
 
 const roots: string[] = [];
 
@@ -34,6 +35,11 @@ function fixture(contents = "#!/usr/bin/env python3\nprint('proxy fixture')\n", 
 }
 
 describe("server runtime asset build", () => {
+  test("advertises the exact optional pipe-history runtime capability", () => {
+    expect(PIPE_HISTORY_RUNTIME_CAPABILITY).toEqual({
+      wire: "newarch-frame-v1", projectionSchema: 3, metadataRevision: true, archiveReadVersions: [2, 3],
+    });
+  });
   test("copies the exact Python helper beside the bundled server entrypoint", () => {
     const root = fixture();
     const target = copyServerRuntimeAssets(root);

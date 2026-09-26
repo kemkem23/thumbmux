@@ -113,6 +113,8 @@ export type NewarchFrameMeta = {
   sourceEpoch: number;
   geometryGeneration: number;
   routeGeneration: number;
+  /** Advances for marker/health changes even when terminal cells do not. */
+  metadataRevision?: number;
   cols: number;
   rows: number;
   revision: number;
@@ -139,6 +141,7 @@ export function validateNewarchFrameMeta(value: unknown): NewarchFrameMeta | nul
     || typeof key.paneId !== "string" || key.paneId.length === 0 || key.paneId.length > 64
     || !count(key.birthGeneration)
     || !count(meta.sourceEpoch) || !count(meta.geometryGeneration) || !count(meta.routeGeneration)
+    || (meta.metadataRevision !== undefined && !count(meta.metadataRevision))
     || !count(meta.cols, 1) || !count(meta.rows, 1)
     || !count(meta.revision) || !count(meta.durableRevision) || !count(meta.nextLineId) || !count(meta.liveStartLine)
     || (meta.durableRevision as number) > (meta.revision as number)
@@ -159,7 +162,9 @@ export function validateNewarchFrameMeta(value: unknown): NewarchFrameMeta | nul
     v: "newarch-frame-v1",
     paneKey: { serverIdentity: key.serverIdentity, paneId: key.paneId, birthGeneration: key.birthGeneration as number },
     sourceEpoch: meta.sourceEpoch as number, geometryGeneration: meta.geometryGeneration as number,
-    routeGeneration: meta.routeGeneration as number, cols: meta.cols as number, rows: meta.rows as number,
+    routeGeneration: meta.routeGeneration as number,
+    ...(meta.metadataRevision === undefined ? {} : { metadataRevision: meta.metadataRevision as number }),
+    cols: meta.cols as number, rows: meta.rows as number,
     revision: meta.revision as number, durableRevision: meta.durableRevision as number,
     nextLineId: meta.nextLineId as number, liveStartLine: meta.liveStartLine as number,
     displaySource: meta.displaySource, degraded: meta.degraded, markers,
@@ -174,6 +179,7 @@ export function newarchDeltaContinues(base: NewarchFrameMeta, next: NewarchFrame
     && base.sourceEpoch === next.sourceEpoch
     && base.geometryGeneration === next.geometryGeneration
     && base.routeGeneration === next.routeGeneration
+    && (next.metadataRevision ?? 0) >= (base.metadataRevision ?? 0)
     && base.liveStartLine === next.liveStartLine
     && next.revision >= base.revision
     && next.nextLineId >= base.nextLineId;

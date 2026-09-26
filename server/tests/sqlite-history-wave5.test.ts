@@ -347,7 +347,7 @@ import { tmpdir as i4TmpDir } from 'node:os';
 import { join as i4Join } from 'node:path';
 import {
   BLANK_CELL, applyFrameDelta, canonicalCaptureCells, canonicalCaptureColor, canonicalParserColor, cellsToAnsi,
-  createPipeHistoryRuntime, parserRowCells, parserStyle, rowText, type PaneTmuxMeta, type RawPaneCapture,
+  createPipeHistoryRuntime, parserRowCells, parserStyle, rowText, screenOverlap, type PaneTmuxMeta, type RawPaneCapture,
 } from '../src/pipe-history-runtime';
 import { TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
@@ -386,6 +386,15 @@ describe('NEWARCH I4 cell codec (one codec, both producers)', () => {
     expect(decoded).toEqual(row);
     expect(rowText(decoded)).toBe(rowText(row));
     expect(cellsToAnsi(new Array(40).fill(BLANK_CELL))).toBe('');
+  });
+
+  test('capture keeps dim, rapid blink and hidden while repeated rows are never content-deduplicated', () => {
+    const captured = canonicalCaptureCells([{
+      grapheme: 'x', width: 1, continuation: false, fg: 'default', bg: 'default', style: 2 | 32 | 128,
+    }], 1);
+    expect(captured[0]!.style).toBe(2 | 32 | 128);
+    const repeated = [{ cells: captured }, { cells: captured }];
+    expect(screenOverlap(repeated, [captured, captured, captured])).toBe(0);
   });
 
   test('frame deltas: shift first, then dirty rows; a geometry change without every row is incomplete', () => {

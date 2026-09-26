@@ -104,6 +104,8 @@ function projectionHarness(options: { owns: boolean; capture?: (call: number) =>
   let generation = 1;
   let watchers = new Set<() => void>();
   const routeListeners = new Set<(session: string) => void>();
+  const viewerCounts: number[] = [];
+  const ready: number[] = [];
   let snapshot: MuxProjectionSnapshot = {
     content: [...HISTORY, "screen-a", "screen-b"].join("\n"),
     cursor: { row: 0, col: 3 },
@@ -112,6 +114,7 @@ function projectionHarness(options: { owns: boolean; capture?: (call: number) =>
     newarch: {
       v: "newarch-frame-v1", paneKey: { serverIdentity: "srv", paneId: "%1", birthGeneration: 1 },
       sourceEpoch: 1, geometryGeneration: 0, routeGeneration: 1, cols: 80, rows: 2, revision: 5, durableRevision: 4,
+      metadataRevision: 0,
       nextLineId: 12, liveStartLine: 10, displaySource: "pipe", degraded: false, markers: [],
     },
   };
@@ -122,6 +125,8 @@ function projectionHarness(options: { owns: boolean; capture?: (call: number) =>
     routeGeneration: () => generation,
     watch: (_session, onChange) => { watchers.add(onChange); return () => { watchers.delete(onChange); }; },
     onRouteChange: (listener) => { routeListeners.add(listener); return () => { routeListeners.delete(listener); }; },
+    setViewers: (_session, count) => { viewerCounts.push(count); },
+    fullReady: (_session, routeGeneration) => { ready.push(routeGeneration); },
     readBefore: (_session, beforeLine) => { reads.push(["before", beforeLine]); return { lines: ["h9"], startLine: 9, hasMore: true }; },
     readAfter: (_session, afterLine) => { reads.push(["after", afterLine]); return { lines: [], startLine: null, hasMore: false }; },
   };
@@ -146,7 +151,7 @@ function projectionHarness(options: { owns: boolean; capture?: (call: number) =>
   });
   harnesses.push({ mux, root: mkdtempSync(join(tmpdir(), "newarch-mux-")) });
   return {
-    mux, spy, reads,
+    mux, spy, reads, viewerCounts, ready,
     set(next: Partial<MuxProjectionSnapshot> & { newarch?: Partial<MuxProjectionSnapshot["newarch"]> }) {
       snapshot = { ...snapshot, ...next, newarch: { ...snapshot.newarch, ...(next.newarch ?? {}) } };
     },
@@ -167,6 +172,8 @@ describe("NEWARCH I4: projection-routed sessions", () => {
     expect(first.data).toBe([...HISTORY, "screen-a", "screen-b"].join("\n"));
     expect(first.newarch.v).toBe("newarch-frame-v1");
     expect(first.boundary.liveStartLine).toBe(10);
+    expect(h.viewerCounts.at(-1)).toBe(1);
+    expect(h.ready).toContain(1);
 
     // An append continues the base: a delta that carries the new descriptor.
     h.set({ content: [...HISTORY, "history row 0070", "screen-a", "screen-c"].join("\n"), newarch: { revision: 7, nextLineId: 71 }, boundary: { generation: "newarch:x:%1:1:r1", liveStartLine: 10, walSequence: "7", walOffset: 7 } });
@@ -192,6 +199,24 @@ describe("NEWARCH I4: projection-routed sessions", () => {
     await new Promise((resolve) => setTimeout(resolve, 40));
     // Legacy ingress for the routed session: no capture, no dirty pipe, no archive ingest.
     expect(h.spy).toEqual({ captures: 0, pipes: 0, ingests: 0 });
+  });
+
+  test("metadata-only changes bypass content hash dedupe and reach an idle viewer", async () => {
+    const h = projectionHarness({ owns: true });
+    const ws = new FakeWS();
+    h.mux.handleMessage({ type: "subscribe", session: SESSION }, ws);
+    await until(() => frames(ws).some((frame) => frame.type === "output"));
+    const before = frames(ws).length;
+    h.set({ newarch: {
+      metadataRevision: 1,
+      degraded: true,
+      markers: [{ lineId: null, kind: "worker-dead", missingCount: null }],
+    } });
+    h.fire();
+    await until(() => frames(ws).length > before);
+    expect(frames(ws).at(-1)!.newarch.markers[0].kind).toBe("worker-dead");
+    h.mux.handleMessage({ type: "unsubscribe", session: SESSION }, ws);
+    expect(h.viewerCounts.at(-1)).toBe(0);
   });
 
   test("a route switch resets viewers with resync and a legacy capture already in flight never publishes", async () => {

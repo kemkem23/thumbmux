@@ -273,7 +273,7 @@ import { newarchDeltaContinues, validateNewarchFrameMeta, type NewarchFrameMeta 
 describe("newarch-frame-v1", () => {
   const base: NewarchFrameMeta = {
     v: "newarch-frame-v1", paneKey: { serverIdentity: "srv", paneId: "%3", birthGeneration: 1 },
-    sourceEpoch: 2, geometryGeneration: 1, routeGeneration: 4, cols: 80, rows: 24, revision: 30, durableRevision: 28,
+    sourceEpoch: 2, geometryGeneration: 1, routeGeneration: 4, metadataRevision: 7, cols: 80, rows: 24, revision: 30, durableRevision: 28,
     nextLineId: 900, liveStartLine: 500, displaySource: "tmux-calibrated", degraded: true,
     markers: [{ lineId: 700, kind: "history-cleared-external", missingCount: null }],
   };
@@ -284,6 +284,7 @@ describe("newarch-frame-v1", () => {
     expect(parsed).not.toBe(base);
     for (const bad of [
       { ...base, v: "newarch-frame-v2" }, { ...base, revision: -1 }, { ...base, durableRevision: 31 },
+      { ...base, metadataRevision: -1 },
       { ...base, liveStartLine: 901 }, { ...base, cols: 0 }, { ...base, displaySource: "guess" },
       { ...base, paneKey: { ...base.paneKey, paneId: "" } }, { ...base, markers: new Array(17).fill(base.markers[0]) },
       { ...base, markers: [{ lineId: -2, kind: "x", missingCount: null }] }, null, [],
@@ -296,6 +297,7 @@ describe("newarch-frame-v1", () => {
     for (const change of [
       { sourceEpoch: 3 }, { geometryGeneration: 2 }, { routeGeneration: 5 }, { liveStartLine: 600 },
       { revision: 29 }, { nextLineId: 899 }, { paneKey: { ...base.paneKey, paneId: "%4" } },
+      { metadataRevision: 6 },
       { paneKey: { ...base.paneKey, birthGeneration: 2 } },
     ]) expect(newarchDeltaContinues(base, { ...base, ...change } as NewarchFrameMeta)).toBe(false);
   });

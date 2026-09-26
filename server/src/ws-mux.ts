@@ -198,6 +198,8 @@ export type MuxProjectionSnapshot = {
 export interface MuxProjectionSource {
   /** The session is routed to the projection now (even before its first frame). */
   owns(session: string): boolean;
+  /** True in shadow and newarch: there is one shared binary pipe owner. */
+  ownsPipe?(session: string): boolean;
   /** Current routed snapshot, or null when not routed / nothing published yet. */
   snapshot(session: string): MuxProjectionSnapshot | null;
   /** Monotonic route generation of the session (changes on every switch). */
@@ -206,6 +208,12 @@ export interface MuxProjectionSource {
   watch(session: string, onChange: () => void): () => void;
   /** A session's route changed; the mux resets that session's viewers. */
   onRouteChange(listener: (session: string) => void): () => void;
+  /** Shared-fanout dirty signal for shadow's authoritative legacy capture. */
+  onLegacyDirty?(listener: (session: string) => void): () => void;
+  /** Actual admitted viewer count, used by calibration cadence. */
+  setViewers?(session: string, count: number): void;
+  /** Complete frame for this route generation was offered to current viewers. */
+  fullReady?(session: string, routeGeneration: number): void;
   readBefore(session: string, beforeLine: number | null, limit?: number): unknown;
   readAfter(session: string, afterLine: number | null, limit?: number): unknown;
   /** A viewer resized the pane: re-read its geometry soon. */
@@ -418,6 +426,7 @@ export class TmuxWsMux<
   /** newarch-frame-v1 of the last projected snapshot sent per session. */
   private lastNewarch = new Map<string, NewarchFrameMeta>();
   private projectionRouteOff: (() => void) | null = null;
+  private projectionDirtyOff: (() => void) | null = null;
   private hooks: MuxHooks<WS, SessionRow>;
   private profileOf: (session: string) => SessionProfile;
   private liveLineLimit: number;
@@ -521,6 +530,11 @@ export class TmuxWsMux<
     this.archive = opts.archive ?? null;
     this.projection = opts.projection ?? null;
     this.projectionRouteOff = this.projection?.onRouteChange((session) => this.handleProjectionRouteChange(session)) ?? null;
+    this.projectionDirtyOff = this.projection?.onLegacyDirty?.((session) => {
+      if (this.projection?.owns(session)) return;
+      const viewers = this.subscribers.get(session);
+      if (viewers && viewers.size > 0) this.queueCapture(session);
+    }) ?? null;
     this.hooks = opts.hooks ?? {};
     this.profileOf = opts.profile ?? (() => DEFAULT_PROFILE);
     this.liveLineLimit = opts.liveLineLimit ?? 2000;
@@ -559,6 +573,7 @@ export class TmuxWsMux<
     }
 
     set.add(ws);
+    this.projection?.setViewers?.(session, set.size);
     // Tail mode (thumbnails): stream only the last N lines to this socket.
     // A later full subscribe from the same socket upgrades it.
     if (opts.tail && opts.tail > 0) {
@@ -627,7 +642,7 @@ export class TmuxWsMux<
     this.refreshSessionListSchedule();
 
     // Start pipe if not already piped
-    if (!this.piped.has(session)) {
+    if (!this.piped.has(session) && !this.projection?.ownsPipe?.(session)) {
       this.tryStartPipe(session);
     }
   }
@@ -656,7 +671,7 @@ export class TmuxWsMux<
     const viewers = this.subscribers.get(session);
     this.unwatchProjection(session);
     this.lastNewarch.delete(session);
-    if (this.projection?.owns(session) && this.piped.delete(session)) {
+    if (this.projection?.ownsPipe?.(session) && this.piped.delete(session)) {
       this.clearPipeCaptureTimers(session);
       try { this.pipes?.stopPipe(session); } catch {}
     }
@@ -677,7 +692,7 @@ export class TmuxWsMux<
       this.broadcastProjected(session, viewers);
     } else {
       this.queueCapture(session, { fullHistory: this.profileOf(session).archive });
-      if (!this.piped.has(session)) this.tryStartPipe(session);
+      if (!this.piped.has(session) && !this.projection?.ownsPipe?.(session)) this.tryStartPipe(session);
     }
   }
 
@@ -688,6 +703,7 @@ export class TmuxWsMux<
     const set = this.subscribers.get(session);
     if (set) {
       set.delete(ws);
+      this.projection?.setViewers?.(session, set.size);
       if (set.size === 0) {
         this.dropSessionState(session);
       }
@@ -705,6 +721,7 @@ export class TmuxWsMux<
     this.clearBackpressureState(ws);
     for (const [session, set] of this.subscribers) {
       set.delete(ws);
+      this.projection?.setViewers?.(session, set.size);
       if (set.size === 0) {
         this.dropSessionState(session);
       }
@@ -1147,6 +1164,8 @@ export class TmuxWsMux<
     for (const session of [...this.projectionWatches.keys()]) this.unwatchProjection(session);
     try { this.projectionRouteOff?.(); } catch {}
     this.projectionRouteOff = null;
+    try { this.projectionDirtyOff?.(); } catch {}
+    this.projectionDirtyOff = null;
   }
 
   /** Slice to a socket's tail preference (full content when none). Trailing
@@ -2470,11 +2489,13 @@ export class TmuxWsMux<
     const hash = this.driver.hash(snapshot.content);
     const screenMoved = !this.screenEq(snapshot.screen, this.lastScreen.get(session));
     const cursorMoved = !this.cursorEq(snapshot.cursor, this.lastCursor.get(session));
+    const metadataMoved = !previous || (previous.metadataRevision ?? 0) !== (next.metadataRevision ?? 0)
+      || previous.degraded !== next.degraded || JSON.stringify(previous.markers) !== JSON.stringify(next.markers);
     this.contents.set(session, snapshot.content);
     this.lastBoundary.set(session, snapshot.boundary);
     this.lastScreen.set(session, snapshot.screen);
     this.lastCursor.set(session, snapshot.cursor);
-    if (hash === this.hashes.get(session) && !screenMoved) {
+    if (hash === this.hashes.get(session) && !screenMoved && !metadataMoved) {
       if (this.hasPendingOutputFrame(session, viewers)) {
         this.sendPendingOutputFrames(session, viewers, snapshot.content, snapshot.cursor);
       } else if (cursorMoved) {
@@ -2488,6 +2509,7 @@ export class TmuxWsMux<
       this.emitOutputHook(session, snapshot.content, snapshot.cursor, undefined, snapshot.screen, snapshot.boundary);
     }
     this.sendGroupedOutputFrames(session, viewers, snapshot.content, snapshot.cursor);
+    this.projection?.fullReady?.(session, next.routeGeneration);
   }
 
   private ownsSessionLifecycle(session: string, viewers: Set<WS>): boolean {
