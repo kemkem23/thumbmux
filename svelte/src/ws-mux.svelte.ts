@@ -988,6 +988,15 @@ export class TmuxMux {
           // Guard first: a non-string data field is a complete no-op for the
           // session (do not drop a still-valid deferred queue or hash cache).
           if (typeof msg.data !== 'string') return;
+          // A resync frame that adds or drops the newarch descriptor is a route
+          // switch (NEWARCH L2-I): the old route's seam requirement ends with it,
+          // or every legacy frame after a rollback would be refused for lacking a
+          // boundary it never had.
+          if (msg.reset === 'resync'
+            && this.lastNewarch.has(msg.channel) !== Object.prototype.hasOwnProperty.call(msg, 'newarch')) {
+            this.lastBoundary.delete(msg.channel);
+            this.boundaryRequired.delete(msg.channel);
+          }
           const boundary = this.boundaryFromFrame(
             msg.channel,
             msg,

@@ -873,6 +873,27 @@ describe('TmuxMux newarch-frame-v1', () => {
     mux.dispose();
   });
 
+  test('a rollback to legacy (resync frame without descriptor or seam) is delivered, and later legacy frames too', () => {
+    const deliveries: string[] = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type) => { if (type === 'output') deliveries.push(data); });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    const boundary = { generation: 'newarch:x:%1:1:r2', liveStartLine: 40, walSequence: '10', walOffset: 10 };
+    socket.receive({ channel: 'work', type: 'output', data: 'projected', cursor: null, boundary, newarch: meta() });
+    socket.receive({ channel: 'work', type: 'output', data: 'legacy one', cursor: null, reset: 'resync' });
+    socket.receive({ channel: 'work', type: 'output', data: 'legacy two', cursor: null });
+    expect(deliveries).toEqual(['projected', 'legacy one', 'legacy two']);
+    expect(socket.frames().filter((frame) => frame.type === 'resync')).toEqual([]);
+    // Without a route switch, dropping the seam is still refused.
+    socket.receive({ channel: 'work', type: 'output', data: 'projected again', cursor: null, reset: 'resync', boundary: { ...boundary, generation: 'newarch:x:%1:1:r3' }, newarch: meta({ routeGeneration: 3 }) });
+    socket.receive({ channel: 'work', type: 'output', data: 'seamless', cursor: null });
+    expect(deliveries).toEqual(['projected', 'legacy one', 'legacy two', 'projected again']);
+    unsubscribe();
+    socket.finishClose();
+    mux.dispose();
+  });
+
   test('a malformed descriptor on a full frame is refused, not delivered', () => {
     const deliveries: string[] = [];
     const mux = new TmuxMux();
