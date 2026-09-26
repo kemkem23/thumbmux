@@ -134,7 +134,7 @@ describe("NEWARCH I4 pipe-vt runtime assets", () => {
       while (pane.recentRows().length < 6 && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 20));
       expect(pane.recentRows().length).toBeGreaterThanOrEqual(6);
       store.flush();
-      const db = new Database(join(history, "newarch-v2/history.sqlite3"), { readonly: true });
+      const db = new Database(join(history, "newarch-v3/history.sqlite3"), { readonly: true });
       const rows = db.query("SELECT text FROM na_line ORDER BY line_id").all() as Array<{ text: string }>;
       db.close();
       expect(rows[0]!.text.trimEnd()).toBe("ไทย 漢字 😀 0");
