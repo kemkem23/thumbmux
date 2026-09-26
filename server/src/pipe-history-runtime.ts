@@ -221,6 +221,7 @@ export interface PaneView {
 export interface PaneStats {
   received: number; published: number; latencyMs: number[];
   captures: number; captureFaults: number; captureConflicts: number; screenCalibrations: number;
+  storeCommits: number; skippedCommits: number;
   captureIntervalMaxMs: number; captureAt: number[];
   faults: Record<string, number>;
 }
@@ -232,6 +233,12 @@ export interface PipeHistoryPaneOptions {
   calibrate?: boolean;
   incremental?: boolean;
   historyLimit?: number;
+  /**
+   * Longest wait before rows a capture matched are committed as certified
+   * (default 1000 ms; 64 pending rows commit at once). Captures that change
+   * nothing observable are not journaled at all.
+   */
+  commitIntervalMs?: number;
 }
 export interface PipeHistoryRuntimeOptions {
   store: RuntimeStore;
@@ -278,6 +285,17 @@ export function applyFrameDelta(screen: ParserScreen | undefined, cells: PipeFra
 // ─── pane ─────────────────────────────────────────────────────────────────
 
 interface RingRow extends HistoryRow { ansi: string }
+function sameScreen(a: readonly (readonly HistoryCell[])[], b: readonly (readonly HistoryCell[])[],
+  ca: { x: number; y: number; visible: boolean } | null, cb: { x: number; y: number; visible: boolean } | null): boolean {
+  if (a.length !== b.length || JSON.stringify(ca) !== JSON.stringify(cb)) return false;
+  for (let y = 0; y < a.length; y++) {
+    const ra = a[y]!, rb = b[y]!;
+    if (ra.length !== rb.length) return false;
+    // Interned cells: equal cells are the same object.
+    for (let x = 0; x < ra.length; x++) if (ra[x] !== rb[x]) return false;
+  }
+  return true;
+}
 const clampCursor = (cursor: { x: number; y: number; visible: boolean }, cols: number, rows: number) => ({
   x: Math.max(0, Math.min(cols - 1, cursor.x)), y: Math.max(0, Math.min(rows - 1, cursor.y)), visible: cursor.visible,
 });
@@ -293,6 +311,8 @@ export class PipeHistoryPane {
   private parserCursor: { x: number; y: number; visible: boolean } = { x: 0, y: 0, visible: true };
   private displayed: { cells: HistoryCell[][]; cursor: { x: number; y: number; visible: boolean } | null; kind: 'normal' | 'alternate'; cols: number; rows: number; source: 'pipe' | 'tmux-calibrated' } | null = null;
   private ring: RingRow[] = [];
+  private scrollSeq = 0;
+  private scrollSeqEpoch = -1;
   private received = 0;
   private receiveTimes: Array<{ seq: number; at: bigint }> = [];
   private receiveHead = 0;
@@ -301,11 +321,15 @@ export class PipeHistoryPane {
   private decoder: TmuxCaptureDecoder | null = null;
   private closed = false;
   private lastCaptureAt: number | null = null;
+  private lastStoreCommitAt = -Infinity;
+  private skippedCommit = false;
+  /** Line ids some committed calibration already checked or content-matched. */
+  private certified = new Set<number>();
   private pendingPublish: { frame: ProjectionFrame; receipt: ProjectionReceipt } | null = null;
   private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
-    screenCalibrations: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
+    screenCalibrations: 0, storeCommits: 0, skippedCommits: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
   };
 
   constructor(private readonly runtime: PipeHistoryRuntime, private readonly options: PipeHistoryPaneOptions) {
@@ -379,9 +403,19 @@ export class PipeHistoryPane {
   // ── collector ports ──
   private onScroll(event: PipeScrollEvent): unknown {
     const cells = parserRowCells(event.physicalRow);
+    // The worker stamps a scrolled row with the seq of the chunk that last
+    // wrote it; a never-written blank row gets the seq of the chunk that
+    // scrolled it. Rows therefore leave in order but their seqs can go
+    // backwards (a blank row at 75, then a row written at 53), while the store
+    // requires a non-decreasing receiveSeq per epoch (`stale-receive-seq`,
+    // which the collector treats as a broken parser). Offer the running max:
+    // the row order is the worker's, the seq only never goes back.
+    if (event.sourceEpoch !== this.scrollSeqEpoch) { this.scrollSeqEpoch = event.sourceEpoch; this.scrollSeq = 0; }
+    const receiveSeq = Math.max(this.scrollSeq, event.receiveSeq);
+    this.scrollSeq = receiveSeq;
     const answer = this.runtime.store.appendScroll({
       paneKey: this.paneKey, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration,
-      physicalRow: toPhysicalRow(cells), softWrap: event.softWrap, receiveSeq: event.receiveSeq,
+      physicalRow: toPhysicalRow(cells), softWrap: event.softWrap, receiveSeq,
     });
     // Observe the receipt without replacing it: the collector still reads the
     // store's own promise for pressure / oversize decisions.
@@ -548,7 +582,8 @@ export class PipeHistoryPane {
       revision: token?.revision ?? 0,
       sourceEpoch: token?.sourceEpoch ?? this.collector.currentSourceEpoch(),
       geometryGeneration: token?.geometryGeneration ?? this.collector.currentGeometryGeneration(),
-      recentHistory: this.ring, parserFrame,
+      // A copy: the ring keeps growing while the calibrator holds this snapshot.
+      recentHistory: this.ring.slice(), parserFrame,
     };
   }
 
@@ -592,23 +627,58 @@ export class PipeHistoryPane {
   }) {
     const c = input.capture;
     const meta = c.after;
+    // Commit budget (see PipeHistoryPaneOptions.commitIntervalMs). The store
+    // journals every committed capture in full, so a transaction is written
+    // only when it changes something a viewer or an audit can observe: a
+    // repair, a quiescent screen that differs from the one displayed, or a
+    // batch of rows not yet certified. Uncertified rows wait at most
+    // `commitIntervalMs` or 64 rows, which the matcher's 128-row overlap
+    // re-matches, so a skipped capture never costs a row its certification.
+    const fresh = [...input.checks, ...input.contentMatches].filter(m => !this.certified.has(m.lineId));
+    const screenChanged = input.captureEvidence.kind === 'quiescent'
+      && (this.displayed?.source !== 'tmux-calibrated' || !sameScreen(this.displayed.cells, c.frame.cells as HistoryCell[][], this.displayed.cursor, c.frame.cursor));
+    const due = this.runtime.now() - this.lastStoreCommitAt >= (this.options.commitIntervalMs ?? 1000);
+    if (!input.repairs.length && !screenChanged && (fresh.length === 0 || (!due && fresh.length < 64))) {
+      const token = this.tokenOrNull();
+      if (token) {
+        this.stats.skippedCommits++;
+        this.countCapture();
+        this.skippedCommit = true;
+        return { revision: token.revision, durableRevision: token.durableRevision, nextLineId: token.nextLineId };
+      }
+    }
+    this.skippedCommit = false;
+    // A row a committed capture already certified is not journaled again;
+    // only the captured rows this transaction maps are stored with it.
+    const checks = input.checks.filter(m => !this.certified.has(m.lineId));
+    const contentMatches = input.contentMatches.filter(m => !this.certified.has(m.lineId));
+    const used = [...new Set([...checks, ...contentMatches, ...input.repairs].map(m => m.capturedRow))].sort((a, b) => a - b);
+    const index = new Map(used.map((row, i) => [row, i]));
+    const mapRow = (row: number) => index.get(row)!;
     const projected = {
       paneKey: this.paneKey, sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration, receiveSeq: 0,
       cells: c.frame.cells as HistoryCell[][], kind: meta.kind, cols: meta.cols, rows: meta.rows,
       cursor: meta.cursor ? { row: meta.cursor.y, col: meta.cursor.x, visible: meta.cursor.visible } : null,
       captureId: c.captureId, requestedAt: c.requestedAt, completedAt: c.completedAt,
-      firstHistoryRow: 0, history: c.history.map(row => toPhysicalRow(row.cells)),
+      firstHistoryRow: used[0] ?? 0, history: used.map(row => toPhysicalRow(c.history[row]!.cells)),
       observedFields: [...c.observedFields], ambiguousRows: (c.uncertainHistoryRows?.length ?? 0) + (c.uncertainScreenRows?.length ?? 0),
       result: input.captureEvidence.kind,
     };
     try {
       const receipt = await this.runtime.store.calibrate({
         capture: projected, expectedRevision: input.expectedRevision, captureEvidence: input.captureEvidence,
-        checks: input.checks.map(m => ({ lineId: m.lineId, captureRow: m.capturedRow })),
-        contentMatches: input.contentMatches.map(m => ({ lineId: m.lineId, captureRow: m.capturedRow })),
-        repairs: input.repairs.map(m => ({ lineId: m.lineId, captureRow: m.capturedRow, physicalRow: toPhysicalRow(m.row.cells) })),
+        checks: checks.map(m => ({ lineId: m.lineId, captureRow: mapRow(m.capturedRow) })),
+        contentMatches: contentMatches.map(m => ({ lineId: m.lineId, captureRow: mapRow(m.capturedRow) })),
+        repairs: input.repairs.map(m => ({ lineId: m.lineId, captureRow: mapRow(m.capturedRow), physicalRow: toPhysicalRow(m.row.cells) })),
       });
       this.countCapture();
+      this.lastStoreCommitAt = this.runtime.now();
+      this.stats.storeCommits++;
+      for (const m of [...checks, ...contentMatches, ...input.repairs]) this.certified.add(m.lineId);
+      if (this.certified.size > 20_000) {
+        const floor = this.ring[0]?.lineId ?? 0;
+        for (const id of this.certified) if (id < floor) this.certified.delete(id);
+      }
       if (input.repairs.length) {
         const byId = new Map(input.repairs.map(r => [r.lineId, r.row.cells]));
         for (const row of this.ring) {
@@ -637,6 +707,8 @@ export class PipeHistoryPane {
 
   private publishCapture(commit: { revision: number }, frame: CalibrationFrame): void {
     const cells = frame.cells as HistoryCell[][];
+    // A skipped commit only confirmed what is already displayed.
+    if (this.skippedCommit) { this.skippedCommit = false; return; }
     this.displayed = {
       cells, cursor: frame.cursor, kind: frame.kind, cols: cells[0]?.length ?? this.meta.cols, rows: cells.length,
       source: 'tmux-calibrated',
