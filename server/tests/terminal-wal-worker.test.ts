@@ -48,6 +48,7 @@ import {
   pipeVtAssets,
   pipeVtRunCells,
   verifyPipeVtAssets,
+  type PipeVtFault,
   type PipeVtRow,
 } from "../src/pipe-vt-worker";
 
@@ -1616,4 +1617,241 @@ for (const header of ["q", "0;1;0q"]) test(`DEBT3 split SIXEL ${header} faults o
   await settle(pane);
   expect(screenRows(pane).map(r => r.text).join("\n")).toContain("after-sixel");
   expect(pane.collector.currentSourceEpoch()).toBe(2);
+});
+
+// ---------------------------------------------------------------------------
+// NEWARCH L2-I FIX1 (I1): findings A-M1, C-F2..C-F7 against the real worker.
+// Each case drives the real collector/worker; only the consumer ports are
+// test doubles, because the consumer (the store) is the other side of the
+// contract being fixed. Oracles are the literal input lines.
+// ---------------------------------------------------------------------------
+
+type WorkerInternals = { worker: PipeVtWorker };
+type ChildInternals = { child: { pid: number; stdout: { pause(): unknown } } | null };
+const fixLines = (prefix: string, count: number) => Array.from({ length: count }, (_, i) => `${prefix}${String(i).padStart(4, "0")}`);
+
+describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
+  test("A-M1 scrolls of one update are offered as a pipelined batch, in order, before the frame, without per-update stdout pause", async () => {
+    let pendingNow = 0;
+    let maxPending = 0;
+    const order: string[] = [];
+    const pane = await collectPane(80, 3, { ports: {
+      onScroll: async (event) => {
+        pendingNow++;
+        maxPending = Math.max(maxPending, pendingNow);
+        order.push(rowText(event.physicalRow).trimEnd());
+        await sleep(1);
+        pendingNow--;
+      },
+      onFrame: async (event) => { if (event.receiveSeq > 0) order.push(`frame:${pendingNow}`); },
+      onFault: (event) => { pane.faults.push(event); },
+    } });
+    const child = ((pane.collector as unknown as WorkerInternals).worker as unknown as ChildInternals).child!;
+    let pauses = 0;
+    const pause = child.stdout.pause.bind(child.stdout);
+    child.stdout.pause = () => { pauses++; return pause(); };
+    const lines = fixLines("B", 200);
+    pane.collector.ingest(encoder.encode(lines.join("\r\n") + "\r\n"));
+    await settle(pane);
+    // All scrolled rows were in flight together, not chained one receipt at a time.
+    expect(maxPending).toBeGreaterThan(1);
+    const rows = order.filter((entry) => !entry.startsWith("frame:"));
+    expect(rows).toEqual(lines.slice(0, rows.length));
+    expect(rows.length).toBe(200 + 1 - 3);
+    // Every frame was published with no scroll receipt outstanding.
+    expect(order.filter((entry) => entry.startsWith("frame:")).every((entry) => entry === "frame:0")).toBe(true);
+    expect(pauses).toBe(0);
+    expect(pane.faults).toEqual([]);
+    console.log(`FIX1 A-M1 rows=${rows.length} maxPendingScrollReceipts=${maxPending} stdoutPauses=${pauses}`);
+  });
+
+  for (const shape of ["sync-object", "rejected-error", "resolved-object"] as const) test(`C-F5 capacity pressure (${shape}) holds and retries without parser restart, loss or reorder`, async () => {
+    const stored: string[] = [];
+    let refusals = 0;
+    const pane = await collectPane(80, 3, { pressureRetryMs: 1, ports: {
+      onScroll: (event) => {
+        const text = rowText(event.physicalRow).trimEnd();
+        if (text === "P0040" && refusals < 5) {
+          refusals++;
+          if (shape === "sync-object") return { accepted: false, reason: "capacity-pressure" };
+          if (shape === "rejected-error") return Promise.reject(Object.assign(new Error("ingest-capacity"), { reason: "capacity-pressure" }));
+          return Promise.resolve({ accepted: false, reason: "capacity-pressure" });
+        }
+        stored.push(text);
+        return shape === "sync-object" ? undefined : Promise.resolve({ accepted: true });
+      },
+      onFrame: () => {},
+      onFault: (event) => { pane.faults.push(event); },
+    } });
+    const pid = pane.collector.workerPid;
+    const lines = fixLines("P", 120);
+    pane.collector.ingest(encoder.encode(lines.join("\r\n") + "\r\n"));
+    await settle(pane);
+    expect(refusals).toBe(5);
+    expect(stored).toEqual(lines.slice(0, 120 + 1 - 3));
+    expect(pane.collector.workerPid).toBe(pid);
+    expect(pane.collector.currentSourceEpoch()).toBe(1);
+    expect(pane.collector.health()).toBe("ok");
+    expect(pane.faults.map((f) => f.kind)).toEqual(["consumer-pressure", "consumer-pressure-cleared"]);
+    expect(pane.collector.stats().pressureRetries).toBe(5);
+    console.log(`FIX1 C-F5 ${shape}: refusals=5 stored=${stored.length} missing=0 reordered=0 restarts=0`);
+  });
+
+  test("C-F5 a non-capacity refusal is still a fault (fatal class unchanged)", async () => {
+    const pane = await collectPane(80, 3, { ports: {
+      onScroll: () => ({ accepted: false, reason: "schema-violation" }),
+      onFrame: () => {},
+      onFault: (event) => { pane.faults.push(event); },
+    } });
+    pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
+    await untilFix1(() => pane.faults.some((f) => f.kind === "consumer-rejected"));
+    expect(pane.faults.find((f) => f.kind === "consumer-rejected")?.message).toContain("schema-violation");
+  });
+
+  test("C-F2 bytes arriving while the parser respawns are held and parsed by the new worker; drained waits for it", async () => {
+    // A slow interpreter start keeps the respawn window open deterministically.
+    const dir = mkdtempSync(join(tmpdir(), "l2i-fix1-slow-"));
+    roots.push(dir);
+    const python = join(dir, "slow-python");
+    writeFileSync(python, "#!/bin/sh\nsleep 1\nexec python3 \"$@\"\n", { mode: 0o755 });
+    const pane = await collectPane(80, 24, { python });
+    pane.collector.ingest(encoder.encode("before\r\n"));
+    await settle(pane);
+    pane.collector.killWorker();
+    await untilFix1(() => pane.faults.some((f) => f.kind === "worker-exit"));
+    expect(pane.collector.health()).toBe("broken");
+    const held = fixLines("H", 40).join("\r\n") + "\r\n";
+    expect(pane.collector.ingest(encoder.encode(held))).toBe(false);
+    let drainedAt = 0;
+    const drained = pane.collector.drained().then(() => { drainedAt = pane.faults.filter((f) => f.kind === "worker-restarted").length; });
+    await drained;
+    expect(drainedAt).toBe(1);
+    await settle(pane);
+    const seen = [...pane.scrolls.map((s) => rowText(s.physicalRow)), ...screenRows(pane).map((r) => r.text)].join("\n");
+    expect([...(seen.match(/H\d{4}/g) ?? [])]).toEqual(fixLines("H", 40));
+    expect(pane.scrolls.filter((s) => /H\d{4}/.test(rowText(s.physicalRow))).every((s) => s.sourceEpoch === 2)).toBe(true);
+    expect(pane.collector.stats().refusedBytes).toBe(0);
+    expect(pane.faults.some((f) => f.message === "bytes rejected by dead parser")).toBe(false);
+    console.log("FIX1 C-F2 held rows=40 missing=0 refusedBytes=0 drained-after-respawn=true");
+  }, 30_000);
+
+  test("C-F3 a replaced worker's late update never reaches the new epoch", async () => {
+    const pane = await collectPane(80, 3);
+    const old = (pane.collector as unknown as WorkerInternals).worker;
+    pane.collector.killWorker();
+    await untilFix1(() => pane.faults.some((f) => f.kind === "worker-restarted"));
+    const frames = pane.frames.length;
+    const scrolls = pane.scrolls.length;
+    const late = { epoch: 1, scrollOnClear: true, seqFrom: 1, seqTo: 1, gen: 0, parseNs: 0, encodeNs: 0,
+      scrolls: [{ row: [["default", "default", 0, "stale"]], wrap: false, pad: false, gen: 0, seq: 1, epoch: 1 }],
+      frame: { kind: "normal", cols: 80, rows: 3, full: true, shift: 0, dirty: {}, wraps: {}, pads: [], cursor: { x: 0, y: 0, visible: true } } };
+    (old as unknown as { options: { onUpdate(u: unknown): unknown } }).options.onUpdate(late);
+    expect(pane.frames.length).toBe(frames);
+    expect(pane.scrolls.length).toBe(scrolls);
+  }, 30_000);
+
+  test("C-F3 close() of an already exited worker still waits for its unconsumed output", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let updates = 0;
+    const worker = new PipeVtWorker({ cols: 80, rows: 3, onFault: () => {},
+      onUpdate: () => { updates++; return held; } });
+    await worker.start();
+    worker.feed(1, encoder.encode("one\r\n"));
+    await untilFix1(() => updates === 1);
+    worker.kill("SIGKILL");
+    await untilFix1(() => (worker as unknown as { exited: boolean }).exited);
+    let closed = false;
+    const closing = worker.close(5_000).then(() => { closed = true; });
+    await sleep(150);
+    expect(closed).toBe(false);
+    release();
+    await closing;
+    expect(closed).toBe(true);
+  }, 15_000);
+
+  test("C-F7 close() is bounded when a consumer receipt never settles", async () => {
+    const faults: PipeVtFault[] = [];
+    let updates = 0;
+    const worker = new PipeVtWorker({ cols: 80, rows: 3, onFault: (f) => { faults.push(f); },
+      onUpdate: () => { updates++; return new Promise(() => {}); } });
+    await worker.start();
+    worker.feed(1, encoder.encode("stuck\r\n"));
+    await untilFix1(() => updates === 1);
+    const began = Date.now();
+    await worker.close(300);
+    const elapsed = Date.now() - began;
+    expect(elapsed).toBeLessThan(3_000);
+    expect(faults.map((f) => f.kind)).toContain("shutdown-timeout");
+    console.log(`FIX1 C-F7 bounded close elapsed=${elapsed}ms faults=${faults.map((f) => f.kind).join(",")}`);
+  }, 15_000);
+
+  test("C-F7 collector close and recovery return when the consumer hangs", async () => {
+    const faults: PipeFaultEvent[] = [];
+    const pane = await collectPane(80, 3, { closeTimeoutMs: 200, ports: {
+      onScroll: () => new Promise(() => {}), onFrame: () => {}, onFault: (f) => { faults.push(f); },
+    } });
+    pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
+    await sleep(200);
+    const began = Date.now();
+    await pane.collector.close();
+    expect(Date.now() - began).toBeLessThan(3_000);
+    expect(pane.collector.health()).toBe("closed");
+    expect(faults.some((f) => f.kind === "shutdown-timeout" && f.lostRows === "unknown")).toBe(true);
+  }, 15_000);
+
+  test("C-F4 resize and full-frame requests are admitted while the data queue is full", async () => {
+    const pane = await collectPane(80, 24, { queueLimitBytes: 4 * 1024 * 1024 });
+    const pid = pane.collector.workerPid!;
+    process.kill(pid, "SIGSTOP");
+    try {
+      const chunk = encoder.encode(fixLines("Q", 3000).join("\r\n").slice(0, 60 * 1024));
+      let deliveries = 0;
+      while (pane.collector.ingest(chunk) && deliveries < 200) deliveries++;
+      const worker = (pane.collector as unknown as WorkerInternals).worker;
+      // Fill the data budget to the byte: a data frame is 21 bytes + payload.
+      const queued = () => (worker as unknown as { queuedBytes: number }).queuedBytes;
+      const room = 1024 * 1024 - queued() - 21;
+      if (room > 0) pane.collector.ingest(new Uint8Array(room).fill(0x41));
+      expect(queued()).toBe(1024 * 1024);
+      expect(worker.canAccept(1)).toBe(false);
+      pane.collector.resize(100, 30);
+      expect(pane.collector.requestFullFrame()).toBe(true);
+      expect(pane.faults.filter((f) => f.kind !== "parser-backlog")).toEqual([]);
+    } finally { process.kill(pid, "SIGCONT"); }
+    await pane.collector.drained();
+    await settle(pane, 60_000);
+    expect(pane.last!.cells.cols).toBe(100);
+    expect(pane.last!.cells.rows).toBe(30);
+    expect(pane.last!.geometryGeneration).toBe(1);
+    expect(pane.collector.workerPid).toBe(pid);
+    expect(pane.faults.some((f) => f.kind === "worker-restarted")).toBe(false);
+  }, 90_000);
+
+  test("C-F6 source-reset marker covers only the unacknowledged tail", async () => {
+    const pane = await collectPane(80, 3);
+    pane.collector.ingest(encoder.encode("acked\r\n"));
+    await settle(pane);
+    const acked = pane.collector.stats().ackedSeq;
+    expect(acked).toBeGreaterThan(0);
+    pane.collector.beginSourceEpoch(2);
+    const boundary = pane.faults.find((f) => f.kind === "source-reset")!;
+    expect(boundary.receiveSeqFrom).toBe(acked + 1);
+    expect(boundary.receiveSeqTo).toBe(acked);
+    await settle(pane);
+    const pid = pane.collector.workerPid!;
+    process.kill(pid, "SIGSTOP");
+    try {
+      pane.collector.ingest(encoder.encode("tail-1\r\n"));
+      pane.collector.ingest(encoder.encode("tail-2\r\n"));
+      const stats = pane.collector.stats();
+      pane.collector.beginSourceEpoch(3);
+      const tail = pane.faults.filter((f) => f.kind === "source-reset").at(-1)!;
+      expect(tail.receiveSeqFrom).toBe(stats.ackedSeq + 1);
+      expect(tail.receiveSeqTo).toBe(stats.receiveSeq);
+      expect(tail.receiveSeqFrom).toBeGreaterThan(1);
+      expect(tail.missingCount).toBeNull();
+    } finally { process.kill(pid, "SIGCONT"); }
+    await settle(pane);
+  }, 30_000);
 });
