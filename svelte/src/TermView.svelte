@@ -5639,7 +5639,6 @@
 
   /** Markers travel with the snapshot they describe; a legacy frame has none. */
   function applyLossMarkers(meta: MuxDeliveryMeta, frameLines: readonly string[]): void {
-    if (meta) return; // MUTANT M1: markers stay in meta only
     const newarch = meta.newarch;
     if (!newarch) {
       lossMarkerFrame = null;
