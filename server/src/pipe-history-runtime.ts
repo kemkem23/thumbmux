@@ -302,6 +302,7 @@ export class PipeHistoryPane {
   private closed = false;
   private lastCaptureAt: number | null = null;
   private pendingPublish: { frame: ProjectionFrame; receipt: ProjectionReceipt } | null = null;
+  private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
     screenCalibrations: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
@@ -355,6 +356,26 @@ export class PipeHistoryPane {
   drained(): Promise<void> { return this.collector.drained(); }
   receiveCounter(): number { return this.received; }
 
+  /**
+   * Attach mid-stream only: give a fresh parser the screen tmux shows now,
+   * once, BEFORE the first pipe byte. Without it the parser starts blank and
+   * every pipe frame would redraw a mostly empty screen over the real one.
+   * This is not calibration: calibration captures are never fed to the
+   * parser; a seed after any pipe byte is refused. Output between this
+   * capture and the pipe start is not journaled (the host marks it).
+   */
+  seed(raw: string, meta: PaneTmuxMeta): void {
+    if (this.received > 0) throw new Error('seed after pipe bytes');
+    const lines = raw.split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const screen = lines.slice(Math.max(0, lines.length - meta.rows));
+    const cursor = clampCursor(meta.cursor, meta.cols, meta.rows);
+    let text = meta.alternate ? '\x1b[?1049h' : '';
+    screen.forEach((line, y) => { text += `\x1b[${y + 1};1H\x1b[0m${line}`; });
+    text += `\x1b[0m\x1b[${cursor.y + 1};${cursor.x + 1}H${cursor.visible ? '\x1b[?25h' : '\x1b[?25l'}`;
+    this.ingest(new TextEncoder().encode(text));
+  }
+
   // ── collector ports ──
   private onScroll(event: PipeScrollEvent): unknown {
     const cells = parserRowCells(event.physicalRow);
@@ -392,6 +413,9 @@ export class PipeHistoryPane {
       // Accepted: only now does the delta become the parser screen (I1 m1).
       this.screens[event.kind] = screen;
       this.parserKind = event.kind;
+      if (this.pendingIssues.length) {
+        for (const issue of this.pendingIssues.splice(0)) this.recordIssue(issue.kind, issue.reason, issue.missingCount, issue.recoverable);
+      }
       this.parserCursor = cursor;
       if (!complete) this.collector.requestFullFrame();
       this.calibrator?.output();
@@ -464,7 +488,11 @@ export class PipeHistoryPane {
 
   recordIssue(kind: string, reason: string, missingCount: number | null, recoverable = true): void {
     const token = this.tokenOrNull();
-    if (!token) return;
+    if (!token) {
+      // The store knows a pane from its first event; hold the marker until then.
+      if (this.pendingIssues.length < 64) this.pendingIssues.push({ kind, reason, missingCount, recoverable });
+      return;
+    }
     this.runtime.store.recordIssue({
       paneKey: this.paneKey, sourceEpoch: token.sourceEpoch, geometryGeneration: token.geometryGeneration,
       expectedRevision: token.revision, kind, reason, missingCount, boundaryLineId: token.nextLineId, recoverable,
@@ -786,4 +814,112 @@ export function pooledPercentile(samples: readonly number[], p: number): number 
   if (!samples.length) return null;
   const sorted = [...samples].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))]!;
+}
+
+// ─── mux-facing projection (live window + history pages) ─────────────────
+
+export interface ProjectedPaneSnapshot {
+  content: string;
+  cursor: { row: number; col: number } | null;
+  screen: { alt: boolean; mouseSgr: boolean; mouseAny: boolean };
+  boundary: { generation: string; liveStartLine: number; walSequence: string; walOffset: number };
+  newarch: {
+    v: 'newarch-frame-v1';
+    paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number; routeGeneration: number;
+    cols: number; rows: number; revision: number; durableRevision: number; nextLineId: number; liveStartLine: number;
+    displaySource: 'pipe' | 'tmux-calibrated'; degraded: boolean;
+    markers: Array<{ lineId: number | null; kind: string; missingCount: number | null }>;
+  };
+}
+export interface ProjectedHistoryPage {
+  lines: string[]; startLine: number | null; hasMore: boolean;
+  /** Loss / unverified-reset markers whose boundary falls inside this page. */
+  markers: Array<{ lineId: number | null; kind: string; reason: string; missingCount: number | null }>;
+}
+
+function fnv(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 0x01000193) >>> 0; }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * The live window a viewer receives: history rows from `liveStartLine` (held
+ * in the pane's RAM ring) followed by the displayed screen. The start only
+ * moves forward, and only in whole windows, so between moves every update is
+ * an append and the mux sends a small delta. Older rows are served as pages
+ * whose line numbers are projection line ids (one token per page).
+ */
+export class ProjectionLiveWindow {
+  private starts = new Map<string, number>();
+  constructor(private readonly windowRows = 1000) {}
+
+  snapshot(pane: PipeHistoryPane, routeGeneration: number): ProjectedPaneSnapshot | null {
+    const view = pane.view();
+    if (view.displaySource === 'none' || !view.token || view.cells.length === 0) return null;
+    const token = view.token;
+    const ring = pane.recentRows();
+    const id = keyOf(pane.paneKey);
+    const alternate = view.kind === 'alternate';
+    // The ring can only serve a contiguous run that reaches the newest row.
+    let firstContiguous = token.nextLineId;
+    for (let i = ring.length - 1; i >= 0 && ring[i]!.lineId === firstContiguous - 1; i--) firstContiguous = ring[i]!.lineId;
+    let start = this.starts.get(id) ?? Math.max(firstContiguous, token.nextLineId - this.windowRows);
+    if (alternate) start = token.nextLineId;
+    else {
+      if (start < firstContiguous) start = firstContiguous;
+      if (token.nextLineId - start > 2 * this.windowRows) start = token.nextLineId - this.windowRows;
+      if (start > token.nextLineId) start = token.nextLineId;
+    }
+    this.starts.set(id, start);
+    const lines: string[] = [];
+    if (!alternate) {
+      const offset = ring.length - (token.nextLineId - start);
+      for (let i = Math.max(0, offset); i < ring.length; i++) lines.push(ring[i]!.ansi);
+    }
+    const screenLines = view.cells.map(row => cellsToAnsi(row));
+    let trailing = 0;
+    for (let i = screenLines.length - 1; i >= 0 && screenLines[i] === ''; i--) trailing++;
+    lines.push(...screenLines);
+    const cursor = view.cursor && view.cursor.visible
+      ? { row: view.rows - 1 - trailing - view.cursor.y, col: Math.max(0, view.cursor.x) } : null;
+    const markers = view.issues.slice(-16).map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind.slice(0, 64), missingCount: issue.missingCount }));
+    return {
+      content: lines.join('\n'), cursor,
+      screen: { alt: alternate, mouseSgr: view.mouseSgr, mouseAny: view.mouseAny },
+      boundary: {
+        generation: `newarch:${fnv(pane.paneKey.serverIdentity)}:${pane.paneKey.paneId}:${pane.paneKey.birthGeneration}:r${routeGeneration}`,
+        liveStartLine: start, walSequence: String(token.revision), walOffset: token.revision,
+      },
+      newarch: {
+        v: 'newarch-frame-v1', paneKey: { ...pane.paneKey }, sourceEpoch: view.sourceEpoch,
+        geometryGeneration: view.geometryGeneration, routeGeneration, cols: view.cols, rows: view.rows,
+        revision: token.revision, durableRevision: token.durableRevision, nextLineId: token.nextLineId,
+        liveStartLine: start, displaySource: view.displaySource, degraded: view.degraded, markers,
+      },
+    };
+  }
+
+  /** Rows before `beforeLine` (default: the live window start), newest `limit` of them. */
+  readBefore(pane: PipeHistoryPane, beforeLine: number | null, limit = 500): ProjectedHistoryPage {
+    const end = beforeLine ?? this.starts.get(keyOf(pane.paneKey)) ?? pane.view().token?.nextLineId ?? 0;
+    const start = Math.max(0, end - Math.max(1, Math.min(2000, limit)));
+    return this.page(pane, start, end);
+  }
+  /** Rows after `afterLine` (exclusive), up to the live window start. */
+  readAfter(pane: PipeHistoryPane, afterLine: number | null, limit = 500): ProjectedHistoryPage {
+    const live = this.starts.get(keyOf(pane.paneKey)) ?? pane.view().token?.nextLineId ?? 0;
+    const start = afterLine === null ? 0 : afterLine + 1;
+    return this.page(pane, start, Math.min(live, start + Math.max(1, Math.min(2000, limit))));
+  }
+  private page(pane: PipeHistoryPane, start: number, end: number): ProjectedHistoryPage {
+    if (end <= start) return { lines: [], startLine: null, hasMore: false, markers: [] };
+    const range = pane.readRange(start, end);
+    if (!range || range.lines.length === 0) return { lines: [], startLine: null, hasMore: false, markers: [] };
+    return {
+      lines: range.lines, startLine: range.startLine, hasMore: range.startLine > 0,
+      markers: range.issues.map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind, reason: issue.reason, missingCount: issue.missingCount })),
+    };
+  }
+  forget(pane: PaneKey): void { this.starts.delete(keyOf(pane)); }
 }

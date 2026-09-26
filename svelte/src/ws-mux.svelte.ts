@@ -6,8 +6,11 @@
 
 import {
   muxHistoryBoundaryTransition,
+  newarchDeltaContinues,
   splitMuxOutputData,
   validateMuxHistoryBoundary,
+  validateNewarchFrameMeta,
+  type NewarchFrameMeta,
   type MuxAuthErrorFrame,
   type MuxClientInfo,
   type MuxHistoryBoundary,
@@ -23,6 +26,8 @@ export type MuxDeliveryMeta = {
   screen?: MuxPaneScreen | null;
   /** Sticky durable archive/live seam paired with this output snapshot. */
   boundary?: MuxHistoryBoundary;
+  /** newarch-frame-v1 of the delivered snapshot (pipe-pane route only). */
+  newarch?: NewarchFrameMeta;
   /**
    * Present only when an additive `error` wire frame settles a failed history
    * read. The ordinary output fields stay populated for callback compatibility;
@@ -211,6 +216,8 @@ export class TmuxMux {
   private lastBoundary = new Map<string, MuxHistoryBoundary>();
   /** A seen boundary field makes that channel fail closed against downgrade. */
   private boundaryRequired = new Set<string>();
+  /** newarch-frame-v1 of each session's current base (absent on the legacy route). */
+  private lastNewarch = new Map<string, NewarchFrameMeta>();
   private settleScheduled = false;
   private settleCancel: (() => void) | null = null;
   /** A failed delta requests one full replacement; later deltas wait for it. */
@@ -499,6 +506,31 @@ export class TmuxMux {
     if (boundary !== undefined) this.lastBoundary.set(session, boundary);
   }
 
+  /**
+   * newarch-frame-v1 check without side effects. A full frame may start,
+   * change or drop the descriptor (a route switch arrives as a resync). A
+   * delta must continue its base's descriptor exactly (same pane, epoch,
+   * geometry, route and live window; revision not going back); a delta
+   * that drops or adds one is refused. `undefined` = legacy frame.
+   */
+  private newarchFromFrame(session: string, frame: unknown, full: boolean): NewarchFrameMeta | undefined | null {
+    if (typeof frame !== 'object' || frame === null) return null;
+    const candidate = frame as Record<string, unknown>;
+    const previous = this.lastNewarch.get(session);
+    if (!Object.prototype.hasOwnProperty.call(candidate, 'newarch')) {
+      return full || previous === undefined ? undefined : null;
+    }
+    const next = validateNewarchFrameMeta(candidate.newarch);
+    if (!next) return null;
+    if (full) return next;
+    return previous !== undefined && newarchDeltaContinues(previous, next) ? next : null;
+  }
+
+  private rememberNewarch(session: string, meta: NewarchFrameMeta | undefined, full: boolean): void {
+    if (meta !== undefined) this.lastNewarch.set(session, meta);
+    else if (full) this.lastNewarch.delete(session);
+  }
+
   /** Build delivery meta, attaching last-known screen when one exists. */
   private deliveryMeta(
     source: 'full' | 'delta',
@@ -512,6 +544,8 @@ export class TmuxMux {
     if (this.lastBoundary.has(session)) {
       meta.boundary = { ...this.lastBoundary.get(session)! };
     }
+    const newarch = this.lastNewarch.get(session);
+    if (newarch) meta.newarch = { ...newarch, paneKey: { ...newarch.paneKey }, markers: newarch.markers.map(m => ({ ...m })) };
     return meta;
   }
 
@@ -523,6 +557,7 @@ export class TmuxMux {
     this.discardLastScreen(session);
     this.lastBoundary.delete(session);
     this.boundaryRequired.delete(session);
+    this.lastNewarch.delete(session);
   }
 
   private invalidateAllOutputBases() {
@@ -534,6 +569,7 @@ export class TmuxMux {
     this.lastScreen.clear();
     this.lastBoundary.clear();
     this.boundaryRequired.clear();
+    this.lastNewarch.clear();
   }
 
   private requestResync(session: string) {
@@ -585,6 +621,7 @@ export class TmuxMux {
     cursor: MuxServerMessage['cursor'] | undefined;
     cursorPresent: boolean;
     boundary: MuxHistoryBoundary | undefined;
+    newarch: NewarchFrameMeta | undefined;
   } | null {
     if (typeof frame !== 'object' || frame === null) return null;
     const candidate = frame as Record<string, unknown>;
@@ -608,6 +645,8 @@ export class TmuxMux {
     if (cursorPresent && !isMuxCursor(candidate.cursor)) return null;
     const boundary = this.boundaryFromFrame(session, frame, false);
     if (boundary === null) return null;
+    const newarch = this.newarchFromFrame(session, frame, false);
+    if (newarch === null) return null;
 
     return {
       prefix: p,
@@ -615,6 +654,7 @@ export class TmuxMux {
       cursor: cursorPresent ? (candidate.cursor as MuxServerMessage['cursor']) : undefined,
       cursorPresent,
       boundary,
+      newarch,
     };
   }
 
@@ -632,6 +672,7 @@ export class TmuxMux {
     cursor: MuxServerMessage['cursor'] | undefined;
     cursorPresent: boolean;
     boundary: MuxHistoryBoundary | undefined;
+    newarch: NewarchFrameMeta | undefined;
   } | null {
     const delta = this.validateDeltaLocal(session, frame, base);
     if (!delta) return null;
@@ -650,6 +691,7 @@ export class TmuxMux {
       cursor: delta.cursor,
       cursorPresent: delta.cursorPresent,
       boundary: delta.boundary,
+      newarch: delta.newarch,
     };
   }
 
@@ -772,6 +814,7 @@ export class TmuxMux {
         return;
       }
       this.rememberBoundary(session, result.boundary);
+      this.rememberNewarch(session, result.newarch, false);
       this.rememberScreen(session, frame);
       base = result.next;
       applied = true;
@@ -954,6 +997,11 @@ export class TmuxMux {
             this.requestResync(msg.channel);
             return;
           }
+          const newarch = this.newarchFromFrame(msg.channel, msg, true);
+          if (newarch === null) {
+            this.requestResync(msg.channel);
+            return;
+          }
           // A full frame supersedes any deferred deltas for this session —
           // discard without delivering them, then install the new base.
           this.discardDeferred(msg.channel);
@@ -961,6 +1009,7 @@ export class TmuxMux {
           this.outputBases.set(msg.channel, splitMuxOutputData(msg.data));
           this.resyncingSessions.delete(msg.channel);
           this.rememberBoundary(msg.channel, boundary);
+          this.rememberNewarch(msg.channel, newarch, true);
           this.rememberScreen(msg.channel, msg);
           const meta = this.deliveryMeta(
             'full',
@@ -1002,6 +1051,7 @@ export class TmuxMux {
             return;
           }
           this.rememberBoundary(msg.channel, applied.boundary);
+          this.rememberNewarch(msg.channel, applied.newarch, false);
           this.rememberScreen(msg.channel, msg);
           this.deliverDelta(
             msg.channel,
