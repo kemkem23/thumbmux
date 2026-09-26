@@ -15,6 +15,10 @@
     "./sqlite-history": {
       "types": "./dist/sqlite-history.d.ts",
       "import": "./dist/sqlite-history.js"
+    },
+    "./pipe-history-runtime": {
+      "types": "./dist/pipe-history-runtime.d.ts",
+      "import": "./dist/pipe-history-runtime.js"
     }
   },
   "license": "MIT",
@@ -28,7 +32,7 @@
     "!**/*.pyo"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/terminal-replay-worker-entry.ts src/recall-handler.ts src/sqlite-history.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json && bun run ./scripts/copy-runtime-assets.ts"
+    "build": "rm -rf dist && bun build src/index.ts src/terminal-replay-worker-entry.ts src/recall-handler.ts src/sqlite-history.ts src/pipe-history-runtime.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json && bun run ./scripts/copy-runtime-assets.ts"
   },
   "dependencies": {
     "@thumbmux/core": "^0.20.2"

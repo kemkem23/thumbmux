@@ -340,3 +340,141 @@ describe('wave 5 authoritative writer', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 15000);
 });
+
+// ── NEWARCH L2-I lot I4: runtime adapter (collector I1 -> store I2 -> calibrator I3) ──
+import { mkdtempSync as i4Tmp, rmSync as i4Rm } from 'node:fs';
+import { tmpdir as i4TmpDir } from 'node:os';
+import { join as i4Join } from 'node:path';
+import {
+  BLANK_CELL, applyFrameDelta, canonicalCaptureCells, canonicalCaptureColor, canonicalParserColor, cellsToAnsi,
+  createPipeHistoryRuntime, parserRowCells, parserStyle, rowText, type PaneTmuxMeta, type RawPaneCapture,
+} from '../src/pipe-history-runtime';
+import { TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+
+const I4_META: PaneTmuxMeta = { cols: 40, rows: 6, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 2000, panePid: 1, mouseSgr: false, mouseAny: false };
+async function i4Until(predicate: () => boolean, ms = 15_000) {
+  const end = Date.now() + ms;
+  while (!predicate()) { if (Date.now() > end) throw new Error('condition not met'); await new Promise(r => setTimeout(r, 10)); }
+}
+
+describe('NEWARCH I4 cell codec (one codec, both producers)', () => {
+  test('parser colours and styles land in the capture namespace', () => {
+    expect(canonicalParserColor('default')).toBe('default');
+    expect(canonicalParserColor('red')).toBe('index:1');
+    expect(canonicalParserColor('brown')).toBe('index:3');
+    expect(canonicalParserColor('brightblue')).toBe('index:12');
+    // 38;5;9 reaches pyte as the palette hex; the 16 base colours keep their index.
+    expect(canonicalParserColor('ff0000')).toBe('index:9');
+    // Palette 16-255 and truecolor compare as rgb on both sides.
+    expect(canonicalParserColor('5f87af')).toBe('rgb:95,135,175');
+    expect(canonicalCaptureColor('index:67')).toBe('rgb:95,135,175');
+    expect(canonicalCaptureColor('index:3')).toBe('index:3');
+    // bold, italics, underscore, strike, reverse, blink.
+    expect([1, 2, 4, 8, 16, 32].map(parserStyle)).toEqual([1, 4, 8, 256, 64, 16]);
+  });
+
+  test('cells -> ANSI -> tmux capture decoder -> canonical cells is the identity', () => {
+    const row = parserRowCells([
+      ['red', 'default', 1, 'bold red '], ['5f87af', '000000', 2 | 4, 'ital'],
+      ['brightgreen', 'default', 16, ['漢', '', '😀', '', 'ไ', 'ท', 'ย']], ['default', 'default', 8 | 32, ' x'],
+    ], 40);
+    expect(row[13]).toMatchObject({ grapheme: '漢', width: 2, continuation: false });
+    expect(row[14]).toMatchObject({ grapheme: '', width: 0, continuation: true });
+    const decoder = new TmuxCaptureDecoder(40);
+    const decoded = canonicalCaptureCells(decoder.decode(cellsToAnsi(row) + '\n')[0]!, 40);
+    expect(decoded).toEqual(row);
+    expect(rowText(decoded)).toBe(rowText(row));
+    expect(cellsToAnsi(new Array(40).fill(BLANK_CELL))).toBe('');
+  });
+
+  test('frame deltas: shift first, then dirty rows; a geometry change without every row is incomplete', () => {
+    const base = applyFrameDelta(undefined, { full: true, cols: 4, rows: 3, shift: 0, dirty: { 0: [['default', 'default', 0, 'aaaa']], 1: [['default', 'default', 0, 'bbbb']], 2: [['default', 'default', 0, 'cccc']] }, softWrap: {}, wrapPad: [] });
+    const next = applyFrameDelta(base.screen, { full: false, cols: 4, rows: 3, shift: 1, dirty: { 2: [['default', 'default', 0, 'dddd']] }, softWrap: {}, wrapPad: [] });
+    expect(next.complete).toBe(true);
+    expect(next.screen.cells.map(rowText)).toEqual(['bbbb', 'cccc', 'dddd']);
+    expect(base.screen.cells.map(rowText)).toEqual(['aaaa', 'bbbb', 'cccc']);
+    const resized = applyFrameDelta(next.screen, { full: false, cols: 5, rows: 3, shift: 0, dirty: { 0: [['default', 'default', 0, 'eeeee']] }, softWrap: {}, wrapPad: [] });
+    expect(resized.complete).toBe(false);
+  });
+});
+
+describe('NEWARCH I4 runtime against the real VT worker and projection store', () => {
+  test('blank rows scroll with an out-of-order worker seq and still land in order, without a parser restart', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'i4-runtime-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const faults: string[] = [];
+    const runtime = createPipeHistoryRuntime({ store, onFault: f => faults.push(f.kind) });
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 't', paneId: '%1', birthGeneration: 1 }, session: 's', meta: I4_META, calibrate: false, capture: () => Promise.reject(new Error('unused')) });
+      const enc = new TextEncoder();
+      // A blank line every 5 rows: the worker stamps the blank row with the
+      // seq that scrolled it, later than the next written row's seq.
+      for (let i = 1; i <= 60; i++) pane.ingest(enc.encode(`row ${String(i).padStart(3, '0')} \x1b[3${i % 7}mok\x1b[0m\r\n${i % 5 === 0 ? '\r\n' : ''}`));
+      await i4Until(() => pane.recentRows().some(r => rowText(r.cells).startsWith('row 055')));
+      const texts = pane.recentRows().map(r => rowText(r.cells).trimEnd());
+      const ids = texts.filter(t => t.startsWith('row ')).map(t => Number(t.slice(4, 7)));
+      expect(ids).toEqual(Array.from({ length: ids.length }, (_, i) => i + 1));
+      expect(pane.recentRows().map(r => r.lineId)).toEqual(Array.from({ length: texts.length }, (_, i) => i));
+      expect(texts.filter(t => t === '').length).toBeGreaterThanOrEqual(10);
+      expect(faults.filter(k => k === 'consumer-rejected' || k === 'worker-restarted')).toEqual([]);
+      expect(pane.stats.latencyMs.length).toBeGreaterThan(0);
+      const range = pane.readRange(0, 5)!;
+      expect(range.lines[0]).toContain('row 001');
+      expect(pane.view().displaySource).toBe('pipe');
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('calibration certifies rows against a capture, journals a capture only when it changes something, and maps stale-revision to a CAS null', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'i4-calibrate-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    let staleOnce = false;
+    const proxy = new Proxy(store, { get(target, key, receiver) {
+      if (key === 'calibrate') return (change: Parameters<typeof store.calibrate>[0]) => {
+        if (staleOnce) { staleOnce = false; return Promise.reject(new Error('stale-revision')); }
+        return target.calibrate(change);
+      };
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const faults: string[] = [];
+    const runtime = createPipeHistoryRuntime({ store: proxy, onFault: f => faults.push(f.kind) });
+    let paneRef: import('../src/pipe-history-runtime').PipeHistoryPane | null = null;
+    let calls = 0;
+    // The capture double renders exactly what tmux would show: the parser's
+    // accepted rows and its screen, through the same ANSI serialisation.
+    const capture = async (tail: number): Promise<RawPaneCapture> => {
+      calls++;
+      const pane = paneRef!;
+      const view = pane.view();
+      const history = pane.recentRows().slice(-Math.max(0, tail)).map(r => cellsToAnsi(r.cells));
+      const screen = (view.cells.length ? view.cells : Array.from({ length: I4_META.rows }, () => [])).map(r => cellsToAnsi(r as never));
+      const meta = { ...I4_META, cursor: view.cursor ?? I4_META.cursor };
+      return { captureId: `c${calls}`, requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: [...history, ...screen].join('\n') + '\n', tail };
+    };
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 't', paneId: '%2', birthGeneration: 1 }, session: 's', meta: I4_META, capture, commitIntervalMs: 50 });
+      paneRef = pane;
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 30; i++) pane.ingest(enc.encode(`line ${String(i).padStart(3, '0')} unique ${i * 7919}\r\n`));
+      await i4Until(() => pane.recentRows().length >= 24 && pane.stats.storeCommits > 0);
+      const token = store.token(pane.paneKey);
+      await i4Until(() => store.readPage(store.token(pane.paneKey), 0, 20).lines.filter(l => l.checkState !== 'unchecked').length >= 15);
+      const page = store.readPage(store.token(pane.paneKey), 0, 20);
+      expect(page.lines.filter(l => l.checkState === 'checked').length).toBeGreaterThanOrEqual(10);
+      expect(token.nextLineId).toBeGreaterThanOrEqual(24);
+      // Idle: the next captures confirm what is certified and displayed; they are not journaled.
+      const commits = pane.stats.storeCommits;
+      await i4Until(() => pane.stats.skippedCommits >= 2, 10_000);
+      expect(pane.stats.storeCommits).toBe(commits);
+      expect(pane.view().displaySource).toBe('tmux-calibrated');
+      // A CAS conflict is a null, never a capture fault.
+      staleOnce = true;
+      pane.ingest(enc.encode('after conflict\r\n'));
+      await i4Until(() => pane.stats.captureConflicts === 1 || pane.stats.captureFaults > 0, 10_000);
+      expect(pane.stats.captureConflicts).toBe(1);
+      expect(pane.stats.captureFaults).toBe(0);
+      expect(faults.filter(k => k === 'capture-fault')).toEqual([]);
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+});

@@ -614,8 +614,9 @@ export class TmuxWsMux<
     }
     if (this.projection?.owns(session)) {
       // Routed: the projection owns pipe, history and frames for this session.
+      // A projected frame is synchronous; it never waits in the capture lane.
       this.watchProjection(session);
-      this.queueCapture(session);
+      this.broadcastProjected(session, set);
       this.ensurePolling();
       this.refreshSessionListSchedule();
       return;
@@ -635,7 +636,7 @@ export class TmuxWsMux<
     if (!this.projection || this.projectionWatches.has(session)) return;
     const viewers = this.subscribers.get(session);
     this.projectionWatches.set(session, this.projection.watch(session, () => {
-      if (viewers && this.ownsSessionLifecycle(session, viewers)) void this.queueCapture(session);
+      if (viewers && this.ownsSessionLifecycle(session, viewers) && this.projection?.owns(session)) this.broadcastProjected(session, viewers);
     }));
   }
 
@@ -670,8 +671,10 @@ export class TmuxWsMux<
     this.invalidateOutputBases(session);
     for (const ws of viewers) this.requireResetOutput(session, ws, "resync");
     if (this.projection?.owns(session)) {
+      // Not through the capture lane: a legacy capture still in flight there
+      // must not delay the new route's first frame (it is discarded on return).
       this.watchProjection(session);
-      this.queueCapture(session);
+      this.broadcastProjected(session, viewers);
     } else {
       this.queueCapture(session, { fullHistory: this.profileOf(session).archive });
       if (!this.piped.has(session)) this.tryStartPipe(session);

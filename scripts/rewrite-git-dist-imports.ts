@@ -31,6 +31,14 @@ const REWRITE_TARGETS = ["core", "svelte"] as const;
 export const GIT_DIST_RUNTIME_ASSETS = [
   "git-dist/server/terminal-pty-wal-proxy.py",
 ] as const;
+/** Entry of the NEWARCH pipe-pane projection; its presence requires the assets below. */
+export const GIT_DIST_PIPE_VT_ENTRY = "git-dist/server/pipe-history-runtime.js";
+/** VT worker assets resolved beside that bundle via import.meta.dir. */
+export const GIT_DIST_PIPE_VT_ASSETS = [
+  "git-dist/server/pipe-vt-worker.py",
+  "git-dist/server/pipe-vt-vendor.zip",
+  "git-dist/server/pipe-vt-LICENSE.txt",
+] as const;
 type RewriteTarget = (typeof REWRITE_TARGETS)[number];
 const WORKSPACE_SPECIFIER = /^@thumbmux\/(core|server|svelte|app)(?:\/.*)?$/;
 
@@ -887,6 +895,15 @@ export function assertGitDistInvariants(
     if (GIT_DIST_RUNTIME_ASSETS.includes(rel as (typeof GIT_DIST_RUNTIME_ASSETS)[number])
       && (statSync(abs).mode & 0o555) !== 0o555) {
       throw new Error(`git-dist runtime asset is not readable/executable: ${rel}`);
+    }
+  }
+
+  // A build that ships the pipe-pane projection must ship its VT worker too.
+  if (existsSync(resolve(root, GIT_DIST_PIPE_VT_ENTRY))) {
+    for (const rel of GIT_DIST_PIPE_VT_ASSETS) {
+      const abs = resolve(root, rel);
+      if (!existsSync(abs) || statSync(abs).size === 0) throw new Error(`missing git-dist pipe-vt asset: ${rel}`);
+      if ((statSync(abs).mode & 0o444) !== 0o444) throw new Error(`git-dist pipe-vt asset is not readable: ${rel}`);
     }
   }
 

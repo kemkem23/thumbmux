@@ -29,6 +29,8 @@ import { HistoryCalibrator, type CalibrationCapture, type CalibrationFrame, type
 import { HistoryWatchdog } from './history-watchdog';
 import type { CapturedRow, HistoryCell, HistoryRow, RowMatch } from './history-row-matcher';
 import { TmuxCaptureDecoder, TMUX_OBSERVED_FIELDS } from './tmux-capture-normalize';
+import { createProjectionStore as createProjectionStoreValue } from './sqlite-history/projection-store';
+import { pipeVtAssets as pipeVtAssetsValue, verifyPipeVtAssets as verifyPipeVtAssetsValue } from './pipe-vt-worker';
 import {
   isProjectionRefusal,
   type PaneKey,
@@ -236,7 +238,7 @@ export interface PaneView {
 export interface PaneStats {
   received: number; published: number; latencyMs: number[];
   captures: number; captureFaults: number; captureConflicts: number; screenCalibrations: number;
-  storeCommits: number; skippedCommits: number;
+  storeCommits: number; skippedCommits: number; notReady: number;
   captureIntervalMaxMs: number; captureAt: number[];
   faults: Record<string, number>;
 }
@@ -350,7 +352,7 @@ export class PipeHistoryPane {
   private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
-    screenCalibrations: 0, storeCommits: 0, skippedCommits: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
+    screenCalibrations: 0, storeCommits: 0, skippedCommits: 0, notReady: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
   };
 
   constructor(private readonly runtime: PipeHistoryRuntime, private readonly options: PipeHistoryPaneOptions) {
@@ -685,6 +687,10 @@ export class PipeHistoryPane {
   }) {
     const c = input.capture;
     const meta = c.after;
+    // The store knows a pane from its first event. A capture that lands before
+    // it (the calibrator captures at birth) has nothing to commit against:
+    // not ready, like a CAS conflict (recapture), never a capture fault.
+    if (!this.tokenOrNull()) { this.stats.notReady++; return null; }
     // Commit budget (see PipeHistoryPaneOptions.commitIntervalMs). The store
     // journals every committed capture in full, so a transaction is written
     // only when it changes something a viewer or an audit can observe: a
@@ -1060,3 +1066,12 @@ export class ProjectionLiveWindow {
   }
   forget(pane: PaneKey): void { this.starts.delete(keyOf(pane)); }
 }
+
+// Opt-in v2 entry (package export "./pipe-history-runtime"): importing it opens
+// no database and starts no timer. Const aliases, not re-exports: Bun 1.3.11
+// can leave a dangling symbol for a barrel re-export (see index.ts).
+/** The projection store (L1/I2) this runtime writes to. */
+export const createProjectionStore = createProjectionStoreValue;
+/** VT worker assets beside this module (dist or source) and their pinned-hash check. */
+export const pipeVtAssets = pipeVtAssetsValue;
+export const verifyPipeVtAssets = verifyPipeVtAssetsValue;

@@ -826,3 +826,64 @@ describe('A6-14 history reply after final unsubscribe is not delivered to a new 
     mux.dispose();
   });
 });
+
+// ── NEWARCH L2-I lot I4: newarch-frame-v1 continuity before any subscriber ───
+describe('TmuxMux newarch-frame-v1', () => {
+  const meta = (over: Record<string, unknown> = {}) => ({
+    v: 'newarch-frame-v1', paneKey: { serverIdentity: 'srv', paneId: '%1', birthGeneration: 1 },
+    sourceEpoch: 1, geometryGeneration: 0, routeGeneration: 2, cols: 80, rows: 24, revision: 10, durableRevision: 9,
+    nextLineId: 50, liveStartLine: 40, displaySource: 'pipe', degraded: false,
+    markers: [{ lineId: 45, kind: 'attach', missingCount: null }], ...over,
+  });
+
+  test('a delta must continue its base descriptor; a full frame may start or drop one', () => {
+    const deliveries: Array<{ data: string; meta: any }> = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type, _cursor, deliveryMeta) => {
+      if (type === 'output') deliveries.push({ data, meta: deliveryMeta });
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    const base = ['h40', 'h41', 'row a', 'row b'];
+    socket.receive({ channel: 'work', type: 'output', data: base.join('\n'), cursor: null, newarch: meta() });
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.meta.newarch.revision).toBe(10);
+    expect(deliveries[0]!.meta.newarch.markers).toEqual([{ lineId: 45, kind: 'attach', missingCount: null }]);
+
+    const grown = ['h40', 'h41', 'h42', 'row a', 'row c'];
+    socket.receive({ ...createMuxDeltaFrame('work', base, grown), newarch: meta({ revision: 11, nextLineId: 51 }) });
+    expect(deliveries.map((d) => d.data)).toEqual([base.join('\n'), grown.join('\n')]);
+    expect(deliveries[1]!.meta.newarch.revision).toBe(11);
+
+    // A new source epoch cannot patch the old base: nothing reaches the subscriber, one resync goes out.
+    socket.receive({ ...createMuxDeltaFrame('work', grown, [...grown, 'x']), newarch: meta({ sourceEpoch: 2, revision: 12, nextLineId: 51 }) });
+    expect(deliveries).toHaveLength(2);
+    expect(socket.frames().filter((frame) => frame.type === 'resync')).toEqual([{ type: 'resync', session: 'work' }]);
+
+    // The route went back to legacy: a complete resync frame without a descriptor clears it.
+    socket.receive({ channel: 'work', type: 'output', data: 'legacy', cursor: null, reset: 'resync' });
+    expect(deliveries).toHaveLength(3);
+    expect(deliveries[2]!.meta.newarch).toBeUndefined();
+
+    // A delta that adds a descriptor to a legacy base is refused as well.
+    socket.receive({ ...createMuxDeltaFrame('work', ['legacy'], ['legacy', 'y']), newarch: meta() });
+    expect(deliveries).toHaveLength(3);
+    unsubscribe();
+    socket.finishClose();
+    mux.dispose();
+  });
+
+  test('a malformed descriptor on a full frame is refused, not delivered', () => {
+    const deliveries: string[] = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type) => { if (type === 'output') deliveries.push(data); });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.receive({ channel: 'work', type: 'output', data: 'x', cursor: null, newarch: meta({ liveStartLine: 99, nextLineId: 50 }) });
+    expect(deliveries).toEqual([]);
+    expect(socket.frames().some((frame) => frame.type === 'resync')).toBe(true);
+    unsubscribe();
+    socket.finishClose();
+    mux.dispose();
+  });
+});

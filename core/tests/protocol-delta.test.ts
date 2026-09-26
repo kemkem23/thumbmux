@@ -266,3 +266,45 @@ describe("mux delta protocol", () => {
     expect(shouldUseMuxDelta({ ...full, reset: "resize" }, delta)).toBe(false);
   });
 });
+
+// ── NEWARCH L2-I lot I4: newarch-frame-v1 ────────────────────────────────────
+import { newarchDeltaContinues, validateNewarchFrameMeta, type NewarchFrameMeta } from "../src/protocol";
+
+describe("newarch-frame-v1", () => {
+  const base: NewarchFrameMeta = {
+    v: "newarch-frame-v1", paneKey: { serverIdentity: "srv", paneId: "%3", birthGeneration: 1 },
+    sourceEpoch: 2, geometryGeneration: 1, routeGeneration: 4, cols: 80, rows: 24, revision: 30, durableRevision: 28,
+    nextLineId: 900, liveStartLine: 500, displaySource: "tmux-calibrated", degraded: true,
+    markers: [{ lineId: 700, kind: "history-cleared-external", missingCount: null }],
+  };
+
+  test("validates and clones; malformed descriptors are null", () => {
+    const parsed = validateNewarchFrameMeta(JSON.parse(JSON.stringify(base)));
+    expect(parsed).toEqual(base);
+    expect(parsed).not.toBe(base);
+    for (const bad of [
+      { ...base, v: "newarch-frame-v2" }, { ...base, revision: -1 }, { ...base, durableRevision: 31 },
+      { ...base, liveStartLine: 901 }, { ...base, cols: 0 }, { ...base, displaySource: "guess" },
+      { ...base, paneKey: { ...base.paneKey, paneId: "" } }, { ...base, markers: new Array(17).fill(base.markers[0]) },
+      { ...base, markers: [{ lineId: -2, kind: "x", missingCount: null }] }, null, [],
+    ]) expect(validateNewarchFrameMeta(bad)).toBeNull();
+  });
+
+  test("a delta continues only the same pane, epoch, geometry, route and live window, never going back", () => {
+    expect(newarchDeltaContinues(base, { ...base, revision: 31, nextLineId: 901, durableRevision: 30 })).toBe(true);
+    expect(newarchDeltaContinues(base, { ...base })).toBe(true);
+    for (const change of [
+      { sourceEpoch: 3 }, { geometryGeneration: 2 }, { routeGeneration: 5 }, { liveStartLine: 600 },
+      { revision: 29 }, { nextLineId: 899 }, { paneKey: { ...base.paneKey, paneId: "%4" } },
+      { paneKey: { ...base.paneKey, birthGeneration: 2 } },
+    ]) expect(newarchDeltaContinues(base, { ...base, ...change } as NewarchFrameMeta)).toBe(false);
+  });
+
+  test("chooseMuxOutputFrame carries the descriptor onto a delta", () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `row ${i} with some padding text`);
+    const full: MuxFullOutputFrame = { channel: "s", type: "output", data: [...lines, "tail"].join("\n"), cursor: null, newarch: base };
+    const chosen = chooseMuxOutputFrame(full, lines);
+    expect(chosen.type).toBe("delta");
+    expect(chosen.newarch).toEqual(base);
+  });
+});
