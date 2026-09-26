@@ -129,14 +129,29 @@ export function parserRowCells(row: PipeVtRow, cols?: number): HistoryCell[] {
   }
   return cells;
 }
+// The capture decoder memoizes rows and interns cells (frozen, shared), so a
+// row it returns again, or a cell it shares, maps to the same canonical value.
+const canonicalRows = new WeakMap<object, HistoryCell[]>();
+const canonicalCells = new WeakMap<object, HistoryCell>();
+function canonicalCell(cell: Readonly<HistoryCell>): HistoryCell {
+  let mapped = canonicalCells.get(cell);
+  if (!mapped) {
+    mapped = internCell(cell.grapheme, cell.width, cell.continuation, canonicalCaptureColor(cell.fg),
+      canonicalCaptureColor(cell.bg), cell.style & OBSERVED_STYLE_MASK);
+    if (Object.isFrozen(cell)) canonicalCells.set(cell, mapped);
+  }
+  return mapped;
+}
 /** Decoder cells (tmux-capture-normalize) -> canonical cells. */
 export function canonicalCaptureCells(row: readonly Readonly<HistoryCell>[], cols: number): HistoryCell[] {
+  const cached = canonicalRows.get(row);
+  if (cached && cached.length === cols) return cached;
   const cells = new Array<HistoryCell>(cols);
   for (let x = 0; x < cols; x++) {
     const cell = row[x];
-    cells[x] = cell ? internCell(cell.grapheme, cell.width, cell.continuation, canonicalCaptureColor(cell.fg),
-      canonicalCaptureColor(cell.bg), cell.style & OBSERVED_STYLE_MASK) : BLANK_CELL;
+    cells[x] = cell ? canonicalCell(cell) : BLANK_CELL;
   }
+  if (Object.isFrozen(row) || Array.isArray(row)) canonicalRows.set(row, cells);
   return cells;
 }
 /** Text of a physical row: a pure function of its cells (store `check-not-exact` compares it). */
@@ -255,6 +270,8 @@ export interface PipeHistoryRuntimeOptions {
 }
 
 const RING_ROWS = 4500;
+/** Minimum spacing of full-screen writes to the store per pane (leading edge immediate). */
+export const FRAME_WRITE_MS = 16;
 
 // ─── screen assembly ──────────────────────────────────────────────────────
 
@@ -284,7 +301,7 @@ export function applyFrameDelta(screen: ParserScreen | undefined, cells: PipeFra
 
 // ─── pane ─────────────────────────────────────────────────────────────────
 
-interface RingRow extends HistoryRow { ansi: string }
+interface RingRow extends HistoryRow { ansi?: string }
 function sameScreen(a: readonly (readonly HistoryCell[])[], b: readonly (readonly HistoryCell[])[],
   ca: { x: number; y: number; visible: boolean } | null, cb: { x: number; y: number; visible: boolean } | null): boolean {
   if (a.length !== b.length || JSON.stringify(ca) !== JSON.stringify(cb)) return false;
@@ -326,6 +343,10 @@ export class PipeHistoryPane {
   /** Line ids some committed calibration already checked or content-matched. */
   private certified = new Set<number>();
   private pendingPublish: { frame: ProjectionFrame; receipt: ProjectionReceipt } | null = null;
+  private pendingFrame: ProjectionFrame | null = null;
+  private frameTimer: ReturnType<typeof setTimeout> | null = null;
+  private frameWriting = false;
+  private lastFrameWriteAt = -Infinity;
   private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
@@ -421,7 +442,7 @@ export class PipeHistoryPane {
     // store's own promise for pressure / oversize decisions.
     answer.then(receipt => {
       if (isProjectionRefusal(receipt)) return;
-      this.remember({ lineId: receipt.nextLineId - 1, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration, cells, softWrap: false, ansi: cellsToAnsi(cells) });
+      this.remember({ lineId: receipt.nextLineId - 1, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration, cells, softWrap: false });
       this.calibrator?.scroll(1);
     }, () => {});
     return answer;
@@ -433,29 +454,66 @@ export class PipeHistoryPane {
     if (this.ring.length > limit + 512) this.ring.splice(0, this.ring.length - limit);
   }
 
+  /**
+   * The adapter is the frame consumer (I1 m1): it applies each delta to its
+   * own parser screen atomically and answers "accepted" at once. The store
+   * receives the newest full screen at most every FRAME_WRITE_MS per pane
+   * (leading edge immediately): every frame is a full replacement of the
+   * previous one, so an intermediate screen the store never saw loses
+   * nothing, and one store transaction per parser update was the largest
+   * main-thread cost at 21 panes. Viewers see a frame once its RAM receipt
+   * exists (FIX1 §4: publish after RAM commit).
+   */
   private onFrame(event: PipeFrameEvent): unknown {
     const previous = this.screens[event.kind];
     const { screen, complete } = applyFrameDelta(previous, event.cells);
     const cursor = clampCursor(event.cursor, screen.cols, screen.rows);
-    const frame: ProjectionFrame = {
+    this.screens[event.kind] = screen;
+    this.parserKind = event.kind;
+    this.parserCursor = cursor;
+    if (!complete) this.collector.requestFullFrame();
+    this.pendingFrame = {
       paneKey: this.paneKey, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration,
       receiveSeq: event.receiveSeq, cells: screen.cells, kind: event.kind, cols: screen.cols, rows: screen.rows,
       cursor: { row: cursor.y, col: cursor.x, visible: cursor.visible },
     };
-    return this.runtime.store.replaceScreen(frame).then((receipt: ProjectionAdmission) => {
-      if (isProjectionRefusal(receipt)) return receipt;
-      // Accepted: only now does the delta become the parser screen (I1 m1).
-      this.screens[event.kind] = screen;
-      this.parserKind = event.kind;
+    this.calibrator?.output();
+    this.scheduleFrameWrite();
+    return undefined;
+  }
+
+  private scheduleFrameWrite(): void {
+    if (this.frameTimer || this.frameWriting || !this.pendingFrame || this.closed) return;
+    const wait = this.lastFrameWriteAt + FRAME_WRITE_MS - this.runtime.now();
+    if (wait <= 0) { this.writeFrame(); return; }
+    this.frameTimer = setTimeout(() => { this.frameTimer = null; this.writeFrame(); }, wait);
+  }
+
+  private writeFrame(): void {
+    const frame = this.pendingFrame;
+    if (!frame || this.closed) return;
+    this.pendingFrame = null;
+    this.frameWriting = true;
+    this.lastFrameWriteAt = this.runtime.now();
+    this.runtime.store.replaceScreen(frame).then((receipt: ProjectionAdmission) => {
+      if (isProjectionRefusal(receipt)) {
+        // Pressure: keep the newest screen and offer it again shortly.
+        this.pendingFrame ??= frame;
+        this.bump('frame-pressure');
+        return;
+      }
       if (this.pendingIssues.length) {
         for (const issue of this.pendingIssues.splice(0)) this.recordIssue(issue.kind, issue.reason, issue.missingCount, issue.recoverable);
       }
-      this.parserCursor = cursor;
-      if (!complete) this.collector.requestFullFrame();
-      this.calibrator?.output();
       if (!this.calibrator || this.calibrator.acceptsPipeFrame) this.publishPipe(frame, receipt);
       else this.pendingPublish = { frame, receipt };
-      return receipt;
+    }, (error: unknown) => {
+      // Oversize or a closing store: the store records its own issue; the
+      // next parser frame supersedes this one.
+      this.onRuntimeFault('frame-write-failed', String((error as Error)?.message ?? error), null);
+    }).finally(() => {
+      this.frameWriting = false;
+      this.scheduleFrameWrite();
     });
   }
 
@@ -683,7 +741,7 @@ export class PipeHistoryPane {
         const byId = new Map(input.repairs.map(r => [r.lineId, r.row.cells]));
         for (const row of this.ring) {
           const cells = byId.get(row.lineId);
-          if (cells) { row.cells = cells; row.ansi = cellsToAnsi(cells as HistoryCell[]); }
+          if (cells) { row.cells = cells; row.ansi = undefined; }
         }
       }
       return receipt;
@@ -791,9 +849,13 @@ export class PipeHistoryPane {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    await this.collector.close();
+    // The newest parser screen still reaches the store before the pane stops.
+    if (this.frameTimer) { clearTimeout(this.frameTimer); this.frameTimer = null; }
+    if (this.pendingFrame && !this.frameWriting) this.writeFrame();
+    for (let i = 0; i < 100 && this.frameWriting; i++) await new Promise(resolve => setTimeout(resolve, 5));
     this.closed = true;
     this.listeners.clear();
-    await this.collector.close();
   }
 }
 
@@ -947,7 +1009,10 @@ export class ProjectionLiveWindow {
     const lines: string[] = [];
     if (!alternate) {
       const offset = ring.length - (token.nextLineId - start);
-      for (let i = Math.max(0, offset); i < ring.length; i++) lines.push(ring[i]!.ansi);
+      for (let i = Math.max(0, offset); i < ring.length; i++) {
+        const row = ring[i]!;
+        lines.push(row.ansi ??= cellsToAnsi(row.cells));
+      }
     }
     const screenLines = view.cells.map(row => cellsToAnsi(row));
     let trailing = 0;
