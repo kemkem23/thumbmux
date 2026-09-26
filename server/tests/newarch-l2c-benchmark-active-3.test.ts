@@ -485,6 +485,16 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             expect(Number.isFinite(server)).toBe(true);
             expect(elapsed).toBeGreaterThanOrEqual(60000);
             if (mode !== 'baseline') expect(historyPerPane.min).toBeGreaterThan(0);
+            // FIX2 m5: no window row missing without a reason. Every row is
+            // checked, content-matched, or overwritten by the status line.
+            if (finalPass) expect(unchecked.other).toBe(0);
+            // FIX2 m5 floor: coverage counts content-matched rows, so it stays
+            // >= .99 if the matcher stops checking. Round 1 measured
+            // checkedCoverage 0.98479..0.98542 over 24 active records (full and
+            // incremental, 1/21 panes, 80x24/120x40); the gap to coverage is
+            // the rows next to each status overwrite (1 per 200 rows), which
+            // lose an anchor on one side. 0.98 is below that by ~0.5pp.
+            if (finalPass && active) expect(record.checkedCoverage!).toBeGreaterThanOrEqual(.98);
             if (mode === 'incremental' && active) {
               expect(finalPass).toBe(true);
               expect(record.coverage!).toBeGreaterThanOrEqual(.99);
