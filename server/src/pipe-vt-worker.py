@@ -44,9 +44,16 @@ MAX_COALESCE_NS = 16_000_000
 MAX_COALESCE_BYTES = 256 * 1024
 
 
+output_sink = None  # Set only during one synchronous multiplex channel turn.
+
+
 def send(kind, obj):
     body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(kind + struct.pack(">I", len(body)) + body)
+    packet = kind + struct.pack(">I", len(body)) + body
+    if output_sink is not None:
+        output_sink(packet)
+        return
+    sys.stdout.buffer.write(packet)
     sys.stdout.buffer.flush()
 
 
@@ -576,6 +583,142 @@ class Worker:
         self.parse_ns = 0
 
 
+def dispatch(worker, kind, payload):
+    """The same ordered command implementation for dedicated and shared parsers."""
+    if kind == b"D":
+        seq, epoch = struct.unpack(">QQ", payload[:16])
+        worker.feed(seq, epoch, payload[16:])
+    elif kind == b"C":
+        worker.screen.scroll_on_clear = bool(payload[0])
+    elif kind == b"X":
+        worker.screen.preserve_on_clear()
+        if worker.pending():
+            worker.emit()
+        old = worker
+        worker = Worker(old.screen.columns, old.screen.lines, struct.unpack(">Q", payload)[0])
+        worker.gen = old.gen
+        worker.screen.scroll_on_clear = old.screen.scroll_on_clear
+        worker.seq_to = old.seq_to
+        worker.emitted_seq = old.emitted_seq
+        worker.emit()
+    elif kind == b"Z":
+        worker.resize(*struct.unpack(">HHI", payload[:8]))
+    elif kind == b"F":
+        worker.full = True
+        seq = struct.unpack(">Q", payload[:8])[0]
+        worker.seq_to = seq if worker.seq_to is None else worker.seq_to
+    elif kind == b"Q":
+        return worker, True
+    else:
+        raise ValueError(f"unknown frame {kind!r}")
+    return worker, False
+
+
+def multiplex(path):
+    """Single-threaded fair selector; each connection owns parser and buffers.
+
+    Slow consumers only stop reads on their own socket. No shared stdout queue
+    can block healthy panes. A parser exception closes just that channel after
+    an E marker; interpreter death closes ALL channels (host marks each pane).
+    """
+    import socket
+    global output_sink
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.chmod(path, 0o600)
+    server.listen(128)
+    server.setblocking(False)
+    channels = {}
+    high_water = 1024 * 1024
+    max_input = high_water + 65536 + 21
+
+    def complete(c):
+        b = c["input"]
+        return len(b) >= 5 and len(b) >= 5 + struct.unpack(">I", b[1:5])[0]
+
+    def drop(sock):
+        channels.pop(sock, None)
+        sock.close()
+
+    print("MULTIPLEX_READY", flush=True)
+    try:
+        while True:
+            readable = [server]
+            writable = []
+            runnable = False
+            for sock, c in channels.items():
+                if not c["closing"] and len(c["output"]) < high_water:
+                    readable.append(sock)
+                    runnable = runnable or complete(c)
+                if c["output"]:
+                    writable.append(sock)
+            reads, writes, _ = select.select(readable, writable, [], 0 if runnable else None)
+            if server in reads:
+                sock, _ = server.accept()
+                sock.setblocking(False)
+                channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False}
+            for sock, c in list(channels.items()):
+                output_sink = c["output"].extend
+                try:
+                    if sock in writes:
+                        n = sock.send(c["output"])
+                        del c["output"][:n]
+                    if sock in reads:
+                        data = sock.recv(65536)
+                        if not data:
+                            drop(sock)
+                            continue
+                        c["input"].extend(data)
+                    buf = c["input"]
+                    if len(buf) >= 5 and struct.unpack(">I", buf[1:5])[0] > max_input:
+                        raise ValueError("pane input exceeds frame bound")
+                    began = time.monotonic_ns()
+                    processed = 0
+                    while not c["closing"] and len(c["output"]) < high_water and complete(c):
+                        kind = bytes(buf[:1])
+                        length = struct.unpack(">I", buf[1:5])[0]
+                        if length > max_input:
+                            raise ValueError("pane input exceeds frame bound")
+                        payload = bytes(buf[5:5 + length])
+                        del buf[:5 + length]
+                        if c["worker"] is None:
+                            if kind != b"A":
+                                raise ValueError("pane must attach before data")
+                            cols, rows, epoch = struct.unpack(">HHQ", payload)
+                            if not (0 < cols <= 4096 and 0 < rows <= 4096):
+                                raise ValueError("invalid pane geometry")
+                            c["worker"] = Worker(cols, rows, epoch)
+                            send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
+                        else:
+                            c["worker"], c["closing"] = dispatch(c["worker"], kind, payload)
+                        processed += length
+                        if processed >= 65536 or time.monotonic_ns() - began >= MAX_COALESCE_NS:
+                            break
+                    if c["worker"] is not None and c["worker"].pending():
+                        c["worker"].emit()
+                    if c["closing"] and not c.get("quit_ack"):
+                        send(b"B", {"workerEof": True})
+                        c["quit_ack"] = True
+                    if c["closing"] and not c["output"]:
+                        drop(sock)
+                except (BrokenPipeError, ConnectionResetError):
+                    drop(sock)
+                except BlockingIOError:
+                    pass
+                except Exception as error:
+                    # Never falsely acknowledge Q after a parser exception.
+                    send(b"E", {"kind": "worker-error", "message": str(error)})
+                    c["closing"] = True
+                    c["quit_ack"] = True
+                    c["worker"] = None
+                finally:
+                    output_sink = None
+    finally:
+        for sock in list(channels):
+            drop(sock)
+        server.close()
+
+
 def main():
     cols = int(sys.argv[1]) if len(sys.argv) > 1 else 80
     rows = int(sys.argv[2]) if len(sys.argv) > 2 else 24
@@ -599,40 +742,15 @@ def main():
             payload = bytes(buf[5:5 + length])
             del buf[:5 + length]
             if kind == b"D":
-                seq = struct.unpack(">Q", payload[:8])[0]
                 if batch_started is None:
                     batch_started = time.monotonic_ns()
-                epoch = struct.unpack(">Q", payload[8:16])[0]
-                worker.feed(seq, epoch, payload[16:])
                 batch_bytes += len(payload) - 16
-            elif kind == b"C":
-                worker.screen.scroll_on_clear = bool(payload[0])
-            elif kind == b"X":
-                # Drain the old parser before discarding its hidden state.
-                worker.screen.preserve_on_clear()
-                if worker.pending():
-                    worker.emit()
-                old = worker
-                worker = Worker(old.screen.columns, old.screen.lines, struct.unpack(">Q", payload)[0])
-                worker.gen = old.gen
-                worker.screen.scroll_on_clear = old.screen.scroll_on_clear
-                worker.seq_to = old.seq_to
-                worker.emitted_seq = old.emitted_seq
-                worker.emit()
+            worker, eof = dispatch(worker, kind, payload)
+            if kind == b"X":
                 batch_started = None
                 batch_bytes = 0
-            elif kind == b"Z":
-                c, r, g = struct.unpack(">HHI", payload[:8])
-                worker.resize(c, r, g)
-            elif kind == b"F":
-                worker.full = True
-                seq = struct.unpack(">Q", payload[:8])[0]
-                worker.seq_to = seq if worker.seq_to is None else worker.seq_to
-            elif kind == b"Q":
-                eof = True
+            if eof:
                 break
-            else:
-                send(b"E", {"kind": "protocol", "message": f"unknown frame {kind!r}"})
         # Coalesce while more input is already waiting, but never past one
         # frame interval or 256 KiB, so scroll events are never starved.
         more = bool(select.select([fd], [], [], 0)[0]) and not eof
@@ -647,4 +765,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--multiplex":
+        multiplex(sys.argv[2])
+    else:
+        main()
