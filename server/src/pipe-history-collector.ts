@@ -58,7 +58,8 @@ export type PipeFrameEvent = {
 };
 
 export type PipeFaultEvent = {
-  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed" | "consumer-rejected" | "source-reset";
+  kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed" | "consumer-rejected" | "source-reset"
+    | "consumer-pressure" | "consumer-pressure-cleared";
   paneKey?: PaneKey;
   sourceEpoch?: number;
   missingCount?: null;
@@ -107,7 +108,43 @@ export type PipeHistoryCollectorOptions = {
   now?: () => number;
   /** Keep per-seq latency samples (bounded) for measurement. */
   latencySampleLimit?: number;
+  /** Bound for the worker's orderly close and output drain (default 5 s). */
+  closeTimeoutMs?: number;
+  /** First retry delay after a capacity-pressure receipt; doubles to 100 ms. */
+  pressureRetryMs?: number;
 };
+
+/**
+ * A consumer answer meaning "full for now, nothing was kept": the store's
+ * `{ accepted: false, reason: "capacity-pressure" }` receipt, or an error with
+ * that reason (or a capacity error message) from a store that still throws.
+ * It is backpressure, never a parser fault: the same event is offered again.
+ */
+export function isCapacityPressure(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const answer = value as { reason?: unknown; message?: unknown };
+  if (answer.reason === "capacity-pressure") return true;
+  return value instanceof Error && /\b(?:capacity-pressure|ingest-capacity)\b/.test(String(answer.message));
+}
+
+/** A resolved receipt that explicitly refuses for a reason other than pressure. */
+function isRefusal(value: unknown): boolean {
+  return value !== null && typeof value === "object" && (value as { accepted?: unknown }).accepted === false
+    && !isCapacityPressure(value);
+}
+
+type BunPeek = { peek?: ((promise: unknown) => unknown) & { status?: (promise: unknown) => string } };
+
+/**
+ * A receipt that is already settled as "not accepted" (rejected, or fulfilled
+ * with a capacity-pressure answer), read without awaiting it (Bun only).
+ */
+function refusedNow(receipt: PromiseLike<unknown>): boolean {
+  const peek = (globalThis as { Bun?: BunPeek }).Bun?.peek;
+  const status = peek?.status?.(receipt);
+  if (status === "rejected") return true;
+  return status === "fulfilled" && isCapacityPressure(peek!(receipt));
+}
 
 function isReceipt(value: unknown): value is PromiseLike<unknown> {
   return value !== null && (typeof value === "object" || typeof value === "function")
@@ -153,6 +190,10 @@ export class PipeHistoryCollector {
   private policyUnverified = false;
   private acceptedBytes = 0;
   private refusedBytes = 0;
+  /** Bytes received while a dead parser is being replaced; fed to the new one. */
+  private held: Array<{ seq: number; bytes: Uint8Array }> = [];
+  private pressureEpisode = false;
+  private pressureRetries = 0;
 
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
@@ -170,9 +211,12 @@ export class PipeHistoryCollector {
   }
 
   private makeWorker(): PipeVtWorker {
-    return new PipeVtWorker({
+    // Callbacks are bound to this instance: output of a replaced worker that
+    // is still draining must never land in the new epoch.
+    const worker: PipeVtWorker = new PipeVtWorker({
       sourceEpoch: this.sourceEpoch,
       onHistoryClear: ({ seq, epoch }) => {
+        if (worker !== this.worker) return;
         this.ring.length = 0;
         this.ringStart = 0;
         this.notifyFault({ kind: "history-cleared", at: this.now(),
@@ -184,14 +228,21 @@ export class PipeHistoryCollector {
       assets: this.options.assets,
       python: this.options.python,
       now: this.now,
-      onUpdate: (update) => this.onUpdate(update),
+      onUpdate: (update) => worker === this.worker ? this.onUpdate(update) : undefined,
       onFault: (fault) => {
+        if (fault.kind === "shutdown-timeout") {
+          // Reported by the worker being closed; its unconsumed updates are gone.
+          this.notifyFault({ kind: fault.kind, at: this.now(), message: fault.message, lostRows: "unknown" });
+          return;
+        }
+        if (worker !== this.worker) return;
         if (fault.kind === "clear-policy-unknown") {
           this.policyUnverified = true;
           this.fault(fault.kind, fault.message, "degraded");
         } else this.fault(fault.kind, fault.message, "broken");
       },
     });
+    return worker;
   }
 
   async start(): Promise<void> {
@@ -221,6 +272,18 @@ export class PipeHistoryCollector {
       this.notifyFault({ kind: "closed", at: this.now(), unacknowledgedBytes: bytes.byteLength,
         receiveSeqFrom: seq, receiveSeqTo: seq, lostRows: "unknown" });
       return false;
+    }
+    if (this.healthState === "broken" && this.recovering && !this.closing) {
+      // The replacement parser is starting: keep the bytes (the caller waits
+      // on drained() for the recovery) instead of reading the FIFO and
+      // throwing them away. Only bytes beyond the bound are refused.
+      if (this.inflightBytes + bytes.byteLength <= this.queueLimit + 64 * 1024) {
+        const seq = ++this.receiveSeq;
+        this.inflight.push({ seq, bytes: bytes.byteLength, at: receivedAtNs });
+        this.inflightBytes += bytes.byteLength;
+        this.held.push({ seq, bytes: bytes.slice() });
+        return false;
+      }
     }
     if (this.healthState === "broken") {
       this.refusedBytes += bytes.byteLength;
@@ -255,8 +318,15 @@ export class PipeHistoryCollector {
     return true;
   }
 
+  /**
+   * Resolves when the next delivery can be accepted. While a dead parser is
+   * being replaced this waits for the replacement, so the reader leaves the
+   * bytes in the FIFO instead of reading and discarding them.
+   */
   drained(): Promise<void> {
-    if (this.healthState === "broken" || this.healthState === "closed" || this.readyForDelivery()) return Promise.resolve();
+    if (this.healthState === "closed") return Promise.resolve();
+    if (this.recovering) return this.recovering.then(() => this.drained());
+    if (this.healthState === "broken" || this.readyForDelivery()) return Promise.resolve();
     return new Promise((resolve) => this.drainWaiters.push(resolve));
   }
 
@@ -269,8 +339,16 @@ export class PipeHistoryCollector {
     this.cols = cols;
     this.rows = rows;
     this.geometryGeneration += 1;
-    this.worker.resize(cols, rows, this.geometryGeneration);
+    // A respawning parser receives the current geometry once it starts.
+    if (this.parserLive() && !this.worker.resize(cols, rows, this.geometryGeneration)) {
+      this.fault("worker-error", "resize admission failed", "broken");
+    }
     return this.geometryGeneration;
+  }
+
+  /** The current worker accepts control frames (not dead, closing or respawning). */
+  private parserLive(): boolean {
+    return this.healthState !== "broken" && this.healthState !== "closed" && !this.recovering;
   }
 
   /** Continuity broke (pipe gap, restart): later rows belong to a new epoch. */
@@ -280,14 +358,18 @@ export class PipeHistoryCollector {
     const previousEpoch = this.sourceEpoch;
     // Parser recovery and upstream pipe restarts are independent breaks.
     this.sourceEpoch = Math.max(this.sourceEpoch + 1, epoch);
+    // Only the unacknowledged tail can be affected; acknowledged rows are
+    // kept. `receiveSeqFrom = receiveSeqTo + 1` is a pure boundary after
+    // receiveSeqTo: the upstream gap before the next byte is of unknown size.
     this.notifyFault({ kind: "source-reset", at: this.now(), message: "owner requested parser reset; external reset ordering remains unverified",
-      sourceEpoch: previousEpoch, receiveSeqFrom: 0, receiveSeqTo: this.receiveSeq, lostRows: "unknown" });
-    if (!this.worker.reset(this.sourceEpoch)) this.fault("worker-error", "parser reset admission failed", "broken");
+      sourceEpoch: previousEpoch, receiveSeqFrom: this.ackedSeq + 1, receiveSeqTo: this.receiveSeq, lostRows: "unknown" });
+    // A respawning parser already starts in the new epoch with a fresh state.
+    if (this.parserLive() && !this.worker.reset(this.sourceEpoch)) this.fault("worker-error", "parser reset admission failed", "broken");
   }
 
   setScrollOnClear(enabled: boolean): void {
     this.scrollOnClear = enabled;
-    if (!this.worker.setScrollOnClear(enabled)) this.fault("worker-error", "clear policy admission failed", "broken");
+    if (this.parserLive() && !this.worker.setScrollOnClear(enabled)) this.fault("worker-error", "clear policy admission failed", "broken");
   }
 
   currentSourceEpoch(): number {
@@ -298,8 +380,11 @@ export class PipeHistoryCollector {
     return this.geometryGeneration;
   }
 
-  requestFullFrame(): void {
-    this.worker.requestFull(this.receiveSeq);
+  requestFullFrame(): boolean {
+    if (!this.parserLive()) return false;
+    if (this.worker.requestFull(this.receiveSeq)) return true;
+    this.fault("worker-error", "full-frame request admission failed", "broken");
+    return false;
   }
 
   /** Rows still held by the tray ring, oldest first. */
@@ -322,6 +407,7 @@ export class PipeHistoryCollector {
       inflightBytes: this.inflightBytes,
       acceptedBytes: this.acceptedBytes,
       refusedBytes: this.refusedBytes,
+      pressureRetries: this.pressureRetries,
       scrolls: this.scrollCount,
       frames: this.frameCount,
       workerParseMs: this.workerParseNs / 1e6,
@@ -347,7 +433,7 @@ export class PipeHistoryCollector {
     if (this.healthState === "closed") return;
     this.closing = true;
     await this.recovering;
-    await this.worker.close();
+    await this.worker.close(this.options.closeTimeoutMs);
     this.healthState = "closed";
     for (const waiter of this.drainWaiters.splice(0)) waiter();
   }
@@ -377,47 +463,147 @@ export class PipeHistoryCollector {
     if (health === "broken") {
       this.inflight = [];
       this.inflightBytes = 0;
-      for (const waiter of this.drainWaiters.splice(0)) waiter();
+      this.held = [];
     }
     this.notifyFault({ kind, at: this.now(), message, ...loss });
     if (health === "broken" && !this.closing && !this.recovering && kind !== "vendor-hash" && this.recoveryAttempts < 3) {
-      // Defer until the current exit/input callback has finished. No waiter
-      // depends on recovery completing; rejected bytes remain explicit faults.
+      // Defer until the current exit/input callback has finished. Drain
+      // waiters wait for the replacement; bytes received meanwhile are held.
       this.recoveryAttempts++;
       this.recovering = Promise.resolve().then(async () => {
-        await this.worker.close();
+        await this.worker.close(this.options.closeTimeoutMs);
         if (this.closing) return;
         this.sourceEpoch++;
         this.worker = this.makeWorker();
         await this.worker.start();
         if (this.scrollOnClear !== undefined) this.worker.setScrollOnClear(this.scrollOnClear);
         this.worker.resize(this.cols, this.rows, this.geometryGeneration);
+        for (const entry of this.held.splice(0)) {
+          if (!this.worker.feed(entry.seq, entry.bytes, this.sourceEpoch)) throw new Error("replacement parser refused held bytes");
+          this.acceptedBytes += entry.bytes.byteLength;
+        }
         this.healthState = this.policyUnverified ? "degraded" : "ok";
         this.notifyFault({ kind: "worker-restarted", at: this.now(), message: `parser respawned; source epoch ${this.sourceEpoch}; calibration required` });
       }).catch((error) => {
         this.healthState = "broken";
-        this.notifyFault({ kind: "spawn", at: this.now(), message: String(error), lostRows: "unknown" });
-      }).finally(() => { this.recovering = null; });
+        const lost = this.held.splice(0);
+        this.inflight = [];
+        this.inflightBytes = 0;
+        this.notifyFault({ kind: "spawn", at: this.now(), message: String(error), lostRows: "unknown",
+          ...(lost.length ? { receiveSeqFrom: lost[0]!.seq, receiveSeqTo: lost.at(-1)!.seq,
+            unacknowledgedBytes: lost.reduce((sum, entry) => sum + entry.bytes.byteLength, 0) } : {}) });
+      }).finally(() => {
+        this.recovering = null;
+        for (const waiter of this.drainWaiters.splice(0)) waiter();
+      });
+    } else if (health === "broken") {
+      for (const waiter of this.drainWaiters.splice(0)) waiter();
     }
   }
 
-  private pushRing(event: PipeScrollEvent): unknown {
-    const accepted = this.options.ports.onScroll(event);
-    const remember = () => {
-      this.scrollCount += 1;
-      this.ring.push(event);
-      while (this.ring.length - this.ringStart > this.ringRows) {
-        const evicted = this.ring[this.ringStart]!;
-        this.ringStart += 1;
-        this.options.onEvict?.(evicted);
+  /**
+   * Offer one event to a consumer port. Accepted synchronously -> undefined;
+   * pending -> a Promise that settles once the event is accepted. Capacity
+   * pressure retries the same event (bounded backoff, forever until close);
+   * any other refusal rejects and becomes a parser-independent fault.
+   */
+  private deliver(send: () => unknown): { receipt: unknown; pressured: boolean } {
+    let answer: unknown;
+    try { answer = send(); }
+    catch (error) {
+      if (isCapacityPressure(error)) return { receipt: this.retryPressure(send), pressured: true };
+      throw error;
+    }
+    if (isReceipt(answer)) {
+      // A store that decides admission synchronously answers with an already
+      // rejected Promise: stop the batch there so later rows cannot pass it.
+      const pressured = refusedNow(answer);
+      const receipt = Promise.resolve(answer).then(
+        (value) => {
+          if (isCapacityPressure(value)) return this.retryPressure(send);
+          if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
+        },
+        (error) => {
+          if (isCapacityPressure(error)) return this.retryPressure(send);
+          throw error;
+        },
+      );
+      return { receipt, pressured };
+    }
+    if (isCapacityPressure(answer)) return { receipt: this.retryPressure(send), pressured: true };
+    if (isRefusal(answer)) throw new Error(`consumer refused: ${JSON.stringify(answer)}`);
+    return { receipt: undefined, pressured: false };
+  }
+
+  private async retryPressure(send: () => unknown): Promise<void> {
+    if (!this.pressureEpisode) {
+      this.pressureEpisode = true;
+      if (this.healthState === "ok") this.healthState = "degraded";
+      this.notifyFault({ kind: "consumer-pressure", at: this.now(),
+        message: "consumer at capacity; parser output held and pipe reads paused until it accepts" });
+    }
+    let delay = this.options.pressureRetryMs ?? 2;
+    for (;;) {
+      if (this.closing || this.healthState === "closed") throw new Error("collector closed while the consumer was under capacity pressure");
+      if (this.healthState === "broken") throw new Error("parser broke while the consumer was under capacity pressure");
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 100);
+      this.pressureRetries += 1;
+      let value: unknown;
+      try { value = await send(); }
+      catch (error) {
+        if (isCapacityPressure(error)) continue;
+        throw error;
       }
-      if (this.ringStart > 4096 && this.ringStart * 2 > this.ring.length) {
-        this.ring.splice(0, this.ringStart);
-        this.ringStart = 0;
-      }
-    };
-    if (isReceipt(accepted)) return Promise.resolve(accepted).then(remember);
-    remember();
+      if (isCapacityPressure(value)) continue;
+      if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
+      return;
+    }
+  }
+
+  private endPressure(): void {
+    if (!this.pressureEpisode) return;
+    this.pressureEpisode = false;
+    this.notifyFault({ kind: "consumer-pressure-cleared", at: this.now(), message: "consumer accepts again" });
+  }
+
+  private remember(event: PipeScrollEvent): void {
+    this.scrollCount += 1;
+    this.ring.push(event);
+    while (this.ring.length - this.ringStart > this.ringRows) {
+      const evicted = this.ring[this.ringStart]!;
+      this.ringStart += 1;
+      this.options.onEvict?.(evicted);
+    }
+    if (this.ringStart > 4096 && this.ringStart * 2 > this.ring.length) {
+      this.ring.splice(0, this.ringStart);
+      this.ringStart = 0;
+    }
+  }
+
+  /**
+   * Offer scrolled rows from `index` on as one pipelined batch: every row is
+   * handed to onScroll in order without waiting for the previous receipt.
+   * A row that meets synchronous capacity pressure ends the batch there (it
+   * is retried alone), so no later row is offered before it is accepted.
+   * Rows enter the tray ring only once accepted, still in order.
+   */
+  private offerScrolls(events: PipeScrollEvent[], index: number): unknown {
+    const pending: unknown[] = [];
+    let accepted = index;
+    let stop = events.length;
+    for (let i = index; i < events.length; i++) {
+      const event = events[i]!;
+      const { receipt, pressured } = this.deliver(() => this.options.ports.onScroll(event));
+      if (receipt === undefined && pending.length === 0) { this.remember(event); accepted = i + 1; continue; }
+      pending.push(receipt);
+      if (pressured) { stop = i + 1; break; }
+    }
+    if (pending.length === 0) return;
+    return Promise.all(pending).then(() => {
+      for (let i = accepted; i < stop; i++) this.remember(events[i]!);
+      if (stop < events.length) return this.offerScrolls(events, stop);
+    });
   }
 
   private onUpdate(update: PipeVtUpdate): unknown {
@@ -428,6 +614,7 @@ export class PipeHistoryCollector {
     const seqTo = update.seqTo ?? this.ackedSeq;
     const complete = () => {
       this.frameCount += 1;
+      this.endPressure();
       const published = this.nowNs();
       while (this.inflight.length && this.inflight[0]!.seq <= seqTo) {
         const entry = this.inflight.shift()!;
@@ -446,36 +633,33 @@ export class PipeHistoryCollector {
       }
     };
     const publish = () => {
+      if (this.healthState === "broken" || this.healthState === "closed") return;
       const dirty: Record<number, PipeVtRow> = {};
       const softWrap: Record<number, boolean> = {};
       for (const [y, row] of Object.entries(update.frame.dirty)) dirty[Number(y)] = row;
       for (const [y, wrap] of Object.entries(update.frame.wraps)) softWrap[Number(y)] = wrap;
-      const receipt = this.options.ports.onFrame({
+      const frame: PipeFrameEvent = {
         paneKey: this.paneKey, sourceEpoch: update.epoch,
         cells: { full: update.frame.full, shift: update.frame.shift,
           cols: update.frame.cols, rows: update.frame.rows, dirty, softWrap, wrapPad: update.frame.pads },
         cursor: update.frame.cursor, kind: update.frame.kind,
         geometryGeneration: update.gen, receiveSeq: seqTo,
-      });
-      if (isReceipt(receipt)) return Promise.resolve(receipt).then(complete);
+      };
+      const { receipt } = this.deliver(() => this.options.ports.onFrame(frame));
+      if (isReceipt(receipt)) return receipt.then(complete);
       complete();
-    };
-    const next = (index: number): unknown => {
-      for (let i = index; i < update.scrolls.length; i++) {
-        const scroll = update.scrolls[i]!;
-        const receipt = this.pushRing({ paneKey: this.paneKey, sourceEpoch: scroll.epoch,
-          geometryGeneration: scroll.gen, physicalRow: scroll.row,
-          softWrap: scroll.wrap, wrapPad: scroll.pad, receiveSeq: scroll.seq ?? this.ackedSeq });
-        if (isReceipt(receipt)) return Promise.resolve(receipt).then(() => next(i + 1));
-      }
-      return publish();
     };
     const rejected = (error: unknown) => {
       this.fault("consumer-rejected", `scroll/frame receipt rejected: ${String(error)}`, "broken");
     };
     try {
-      const receipt = next(0);
-      if (isReceipt(receipt)) return Promise.resolve(receipt).catch(rejected);
+      const scrolls = update.scrolls.map((scroll) => ({ paneKey: this.paneKey, sourceEpoch: scroll.epoch,
+        geometryGeneration: scroll.gen, physicalRow: scroll.row,
+        softWrap: scroll.wrap, wrapPad: scroll.pad, receiveSeq: scroll.seq ?? this.ackedSeq }));
+      const receipt = this.offerScrolls(scrolls, 0);
+      if (isReceipt(receipt)) return Promise.resolve(receipt).then(publish).catch(rejected);
+      const published = publish();
+      if (isReceipt(published)) return Promise.resolve(published).catch(rejected);
     } catch (error) { rejected(error); }
   }
 
