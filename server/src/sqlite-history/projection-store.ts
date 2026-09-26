@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
-import { ProjectionRam, paneId, upsert, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
+import { prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
 import { readProjectionPage, projectionIssue } from './projection-reader';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
@@ -55,12 +55,12 @@ type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;b
 function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false) {
   const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
-    if(Number(Object.values(disk.query('PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
-    const existing=disk.query('SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
+    if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
+    const existing=prepared(disk,'SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
     if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');writeMs=performance.now()-started;return;}
     for(const p of batch.panes) upsert(disk,'na_pane',{...p,durable_revision:p.revision});
     for(const [table,rows] of batch.tables)for(const row of rows)upsert(disk,table,row);
-    disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
+    prepared(disk,'INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     before?.();writeMs=performance.now()-started;
   }).immediate();
   // Bound physical WAL growth without forcing a truncate into the ingest
@@ -156,16 +156,16 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {
       this.disk.exec('PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192;');
       this.disk.transaction(()=>{
-        const version=Number(Object.values(this.disk.query('PRAGMA user_version').get()!)[0]);
+        const version=Number(Object.values(prepared(this.disk,'PRAGMA user_version').get()!)[0]);
         if(options.mode==='create') {
-          if(version!==0 || this.disk.query("SELECT name FROM sqlite_master WHERE type='table'").all().length) throw new Error('new-file-required');
+          if(version!==0 || prepared(this.disk,"SELECT name FROM sqlite_master WHERE type='table'").all().length) throw new Error('new-file-required');
           this.disk.exec(PROJECTION_SCHEMA);this.disk.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);
         } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v3');
         else {
-          const sql=(this.disk.query("SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture')").get() as SqlRow).s;
+          const sql=(prepared(this.disk,"SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture')").get() as SqlRow).s;
           if(PROJECTION_SCHEMA_MARKERS.some(m=>!String(sql).includes(m))) throw new Error('projection-schema-outdated');
         }
-        const epoch=Number(Object.values(this.disk.query('PRAGMA application_id').get()!)[0]);
+        const epoch=Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0]);
         if(epoch<0 || epoch>=2147483647) throw new Error('writer-fence-exhausted');
         this.fence=epoch+1;this.disk.exec(`PRAGMA application_id=${this.fence}`);
       }).immediate();
@@ -177,6 +177,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     try {this.ensureWorker();}catch(error){this.ram.db.close();this.disk.close();throw error;}
     this.timer=setInterval(()=>{
       try {
+        if(this.stopped)this.relievePressure();
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
         if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
@@ -186,24 +187,25 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   private owner():void {
     if(this.closed) throw new Error('store-closed');
-    if(Number(Object.values(this.disk.query('PRAGMA application_id').get()!)[0])!==this.fence) throw new Error('stale-writer');
+    if(Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0])!==this.fence) throw new Error('stale-writer');
   }
   private recover():void {
     this.ram.db.transaction(()=>{
-      for(const row of this.disk.query('SELECT * FROM na_pane').all() as SqlRow[]) {
+      for(const row of prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[]) {
         if(row.revision!==row.durable_revision) throw new Error('durable-watermark-corrupt');
         upsert(this.ram.db,'na_pane',row);
         const id=String(row.pane_key), floor=Math.max(0,Number(row.next_line_id)-5000);
-        const captures=this.disk.query(`SELECT * FROM na_capture c WHERE c.pane_key=? AND
+        const captures=prepared(this.disk,`SELECT * FROM na_capture c WHERE c.pane_key=? AND
           EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)`).all(id,floor) as SqlRow[];
         for(const c of captures) upsert(this.ram.db,'na_capture',c);
-        for(const line of this.disk.query('SELECT * FROM na_line WHERE pane_key=? AND line_id>=?').all(id,floor) as SqlRow[]) upsert(this.ram.db,'na_line',line);
+        for(const line of prepared(this.disk,'SELECT * FROM na_line WHERE pane_key=? AND line_id>=?').all(id,floor) as SqlRow[]) upsert(this.ram.db,'na_line',line);
       }
     })();
+    this.relievePressure();
     if(this.ram.bytes()>this.cacheMax) throw new Error('recovery-cache-limit');
-    this.rejectedRows=Number((this.disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind IN (?,'ingest-capacity')").get(PROJECTION_OVERSIZE) as SqlRow).n);
-    this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
-    const last=this.disk.query('SELECT committed_at FROM na_commit ORDER BY committed_at DESC LIMIT 1').get() as SqlRow|null;
+    this.rejectedRows=Number((prepared(this.disk,"SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind IN (?,'ingest-capacity')").get(PROJECTION_OVERSIZE) as SqlRow).n);
+    this.degraded=!!prepared(this.ram.db,"SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
+    const last=prepared(this.disk,'SELECT committed_at FROM na_commit ORDER BY committed_at DESC LIMIT 1').get() as SqlRow|null;
     this.lastCommitAt=last?Number(last.committed_at):null;
   }
   private pendingAge():number {
@@ -214,7 +216,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private fault(kind:string,reason:string,key?:PaneKey,lostRows=1):void {
     this.degraded=true;
     const now=Date.now();
-    const panes=key?[this.ram.pane(key)]:this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[];
+    const panes=key?[this.ram.pane(key)]:prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[];
     let emit=false;
     this.ram.db.transaction(()=>{
       for(const p of panes) {
@@ -228,8 +230,8 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(!this.dirtyFaults.has(tag) && this.pendingBytes()+1024>PENDING_MAX)continue;
         if(!previous || now-previous.last>=1000)emit=true;
         const id=previous?.id??randomUUID();
-        this.ram.db.query('UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run(p.health==='unverified'?'unverified':'degraded',p.pane_key);
-        this.ram.db.query(`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
+        prepared(this.ram.db,'UPDATE na_pane SET health=?,revision=revision+1 WHERE pane_key=?').run(p.health==='unverified'?'unverified':'degraded',p.pane_key);
+        prepared(this.ram.db,`INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)
           ON CONFLICT(issue_id) DO UPDATE SET revision=excluded.revision,missing_count=excluded.missing_count,reason=excluded.reason`)
           .run(id,p.pane_key,p.source_epoch,Number(p.revision)+1,p.next_line_id,kind,reason,capacity?count:null,previous?.detected??now);
         this.faults.set(tag,{id,pane:String(p.pane_key),last:emit?now:previous!.last,seen:now,detected:previous?.detected??now,count,revision:Number(p.revision)+1});
@@ -320,7 +322,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       const pending=this.capacityLosses.get(id);
       if(pending){if(isScroll)pending.count++;}
       else {
-        if(!this.ram.db.query('SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
+        if(!prepared(this.ram.db,'SELECT 1 FROM na_pane WHERE pane_key=?').get(id)) {
           const first=this.queues.get(id)?.[0]??value;this.ram.ensure(key,first.sourceEpoch,first.geometryGeneration);
         }
         this.capacityLosses.set(id,{key:{...key},count:isScroll?1:0});
@@ -370,6 +372,21 @@ export class ProjectionStore implements ProjectionWriterPort {
       else if(final)w.reject(new Error('store-closed'));
       else this.durableWaiters.push(w);
     }
+  }
+  /** Reclaim only acknowledged history; no flush is needed to reopen an idle full cache. */
+  private relievePressure():void {
+    const reserve=Math.max(512,...this.refusedBytes.values());
+    if(this.liveRam()+reserve>this.cacheMax) {
+      const panes=(prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[]).map(p=>({...p,revision:p.durable_revision}));
+      // Eviction is a cache operation: archived rows remain readable from disk.
+      // Halving bounds the number of scans, even with many quiet panes.
+      for(let keep=2500;this.liveRam()+reserve>this.cacheMax;keep=Math.floor(keep/2)) {
+        this.ram.db.transaction(()=>this.ram.evict(panes,keep))();this.ramBytesCache=-1;
+        if(keep===0)break;
+      }
+    }
+    if(this.liveRam()+reserve<=this.cacheMax && this.pendingBytes()<PENDING_MAX/2)this.stopped=false;
+    this.settleDrains();
   }
   private kickFlush():void {
     if(this.inFlight || this.closed || this.closing)return;
@@ -436,6 +453,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       this.queues.delete(id);const job=q.shift()!;if(q.length)this.queues.set(id,q);
       this.queuedBytes-=job.bytes;
       work.push({id,job});processed++;
+      if(job.barrier)break;
     }
     const results:Array<{id:string;job:Job;receipt?:ProjectionReceipt;error?:unknown}>=[];
     try {
@@ -594,11 +612,64 @@ export class ProjectionStore implements ProjectionWriterPort {
       const pane=paneId(change.capture.paneKey),revision=this.ram.revisionOf(change.capture.paneKey);
       if(historyOnly?change.expectedRevision>revision:this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');
     }catch(error){return Promise.reject(error);}
-    return this.enqueue(change.capture.paneKey,change,c=>this.ram.calibrate(c,historyOnly),'barrier') as Promise<ProjectionReceipt>;
+    try {
+      // Freeze in the lossless on-disk representation. No full-cell JSON copy,
+      // and no request can silently certify rows omitted by a size limit.
+      const c=change.capture;
+      validateFrame(c);
+      const seenLines=new Set<number>(),seenRows=new Set<number>();
+      for(const m of [...change.checks,...change.repairs,...(change.contentMatches??[])]) {
+        if(!Number.isSafeInteger(m.lineId) || m.lineId<0 || !Number.isSafeInteger(m.captureRow)
+          || m.captureRow<0 || !c.history[m.captureRow] || seenLines.has(m.lineId) || seenRows.has(m.captureRow))throw new Error('duplicate-or-invalid-mapping');
+        seenLines.add(m.lineId);seenRows.add(m.captureRow);
+      }
+      const history=c.history.map(row=>{validateRow(row);return {text:row.text,encoded:encodeCells(row.cells)};});
+      const encodedScreen=encodeFrameCells(c.cells);
+      const metadata=structuredClone({...change,capture:{...c,cells:[],history:[]},checks:[],repairs:[],contentMatches:[]});
+      const repairs=change.repairs.map(r=>{validateRow(r.physicalRow);return {...r,physicalRow:{text:r.physicalRow.text,encoded:encodeCells(r.physicalRow.cells)}};});
+      const checks=change.checks.map(r=>({...r})),matches=(change.contentMatches??[]).map(r=>({...r}));
+      const chunkSize=256, count=Math.max(1,Math.ceil(history.length/chunkSize)),batchId=randomUUID();
+      const chunks=Array.from({length:count},(_,i)=>{
+        const start=i*chunkSize,end=start+chunkSize;
+        const mapped=<T extends {captureRow:number}>(rows:T[])=>rows.filter(r=>r.captureRow>=start && r.captureRow<end).map(r=>({...r,captureRow:r.captureRow-start}));
+        const chunk={...metadata,expectedRevision:change.expectedRevision+i,
+          captureEvidence:i===count-1?metadata.captureEvidence:null,
+          capture:{...metadata.capture,encodedScreen,history:history.slice(start,end),
+            captureId:count===1?c.captureId:`${c.captureId}:${batchId}:${i}`,firstHistoryRow:c.firstHistoryRow+start},
+          checks:mapped(checks),contentMatches:mapped(matches),repairs:mapped(repairs)};
+        // JSON now contains RLE strings, never expanded cell objects.
+        return {chunk,bytes:Buffer.byteLength(JSON.stringify(chunk))+512};
+      });
+      const jobs=chunks.map(({chunk,bytes})=>this.enqueue(c.paneKey,chunk,f=>{
+        const physical=(row:{text:string;encoded:string})=>({text:row.text,cells:decodeCells(row.encoded)});
+        const thawed={...f,capture:{...f.capture,cells:decodeFrameCells(f.capture.encodedScreen),history:f.capture.history.map(physical)},
+          repairs:f.repairs.map((r:any)=>({...r,physicalRow:physical(r.physicalRow)}))};
+        // All chunks of a quiescent request retain CAS, even though only the
+        // last chunk replaces the screen. Moving output must never be hidden.
+        // Pressure may have evicted durable rows needed by this capture.
+        // Reload only this bounded chunk, including its existing FK receipts.
+        const id=paneId(f.capture.paneKey);
+        for(const m of [...f.checks,...f.repairs,...f.contentMatches]) {
+          if(prepared(this.ram.db,'SELECT 1 FROM na_line WHERE pane_key=? AND line_id=?').get(id,m.lineId))continue;
+          const row=prepared(this.disk,'SELECT * FROM na_line WHERE pane_key=? AND line_id=?').get(id,m.lineId) as SqlRow|null;
+          if(!row)continue;
+          if(row.checked_capture_id!==null) {
+            const receipt=prepared(this.disk,'SELECT * FROM na_capture WHERE pane_key=? AND capture_id=?').get(id,row.checked_capture_id) as SqlRow;
+            upsert(this.ram.db,'na_capture',receipt);
+          }
+          upsert(this.ram.db,'na_line',row);
+        }
+        return this.ram.calibrate(thawed,historyOnly);
+      },'barrier',bytes) as Promise<ProjectionReceipt>);
+      return Promise.allSettled(jobs).then(results=>{
+        const failed=results.find(r=>r.status==='rejected');if(failed?.status==='rejected')throw failed.reason;
+        return (results[results.length-1] as PromiseFulfilledResult<ProjectionReceipt>).value;
+      });
+    }catch(error){return Promise.reject(error);}
   }
   token(key:PaneKey):ProjectionToken {this.owner();return this.ram.token(key);}
   screen(key:PaneKey,kind:'normal'|'alternate'='normal'):SqlRow|null {
-    this.owner();const row=this.ram.db.query('SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
+    this.owner();const row=prepared(this.ram.db,'SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
     return row?{...row,cells_json:JSON.stringify(decodeFrameCells(String(row.cells_json)))}:null;
   }
   readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
@@ -606,11 +677,11 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(this.retry)return this.retry;
     this.drainLosses();
     if(!this.dirtyBytes && this.dirtySince===null)return null;
-    const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
+    const panes=prepared(this.ram.db,'SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
     const tables=new Map<string,SqlRow[]>();
     for(const table of ['na_capture','na_line','na_issue']) {
       const rows:SqlRow[]=[];
-      for(const p of panes)rows.push(...this.ram.db.query(`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
+      for(const p of panes)rows.push(...prepared(this.ram.db,`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
       tables.set(table,rows);
     }
     const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
@@ -623,7 +694,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.options.checkpoint?.('after-disk-commit',batch.id);
     this.options.checkpoint?.('before-watermark',batch.id);
     this.ram.db.transaction(()=>{
-      for(const p of batch.panes)this.ram.db.query('UPDATE na_pane SET durable_revision=? WHERE pane_key=?').run(p.revision,p.pane_key);
+      for(const p of batch.panes)prepared(this.ram.db,'UPDATE na_pane SET durable_revision=? WHERE pane_key=?').run(p.revision,p.pane_key);
       this.ram.evict(batch.panes);
     })();
     this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
@@ -632,19 +703,20 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.drainLosses();
     // Pressure clears only once RAM has room for an event again, not merely when disk caught up.
     this.ramBytesCache=-1;
+    this.relievePressure();
     if(this.pendingBytes()<PENDING_MAX/2 && this.liveRam()+512<=this.cacheMax) {
       this.stopped=false;
       // Only clear a fault once its latest revision reached disk. Recovery itself
       // is another dirty pane revision, so the persisted health follows reality.
       for(const p of batch.panes) {
         if(p.health==='degraded' && this.ram.pane({serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)}).health==='degraded' && this.pendingBytes()+512<=PENDING_MAX && !this.capacityLosses.has(String(p.pane_key)) && ![...this.faults.values()].some(f=>f.pane===p.pane_key && f.revision>Number(p.revision))) {
-          this.ram.db.query("UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
+          prepared(this.ram.db,"UPDATE na_pane SET health='healthy',revision=revision+1 WHERE pane_key=?").run(p.pane_key);
           // Keep capacity episodes open so a refusal right after recovery reuses the issue.
           for(const [tag,f] of this.faults)if(f.pane===p.pane_key && !tag.endsWith(':'+PROJECTION_OVERSIZE))this.faults.delete(tag);
           this.dirtyBytes+=512;this.dirtySince??=Date.now();
         }
       }
-      this.degraded=!!this.ram.db.query("SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
+      this.degraded=!!prepared(this.ram.db,"SELECT 1 FROM na_pane WHERE health!='healthy' LIMIT 1").get();
     }
     const now=Date.now();
     for(const [tag,f] of this.faults)if(tag.endsWith(':'+PROJECTION_OVERSIZE) && now-f.seen>CAPACITY_EPISODE_MS && !this.capacityLosses.has(f.pane))this.faults.delete(tag);
@@ -703,12 +775,12 @@ export class ProjectionStore implements ProjectionWriterPort {
   }
   health():ProjectionHealth {
     this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
-    const rows=this.ram.db.query('SELECT * FROM na_pane').all() as SqlRow[];
+    const rows=prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[];
     const revisions=new Map(rows.map(p=>[String(p.pane_key),Number(p.revision)]));
     const byPane=new Map<string,Map<string,SqlRow>>();
     // Health is sampled on the ingest thread. Two bulk issue reads replace
     // four SQL lookups per pane; RAM still overlays the durable revision.
-    for(const db of [this.disk,this.ram.db])for(const issue of db.query('SELECT * FROM na_issue').all() as SqlRow[]) {
+    for(const db of [this.disk,this.ram.db])for(const issue of prepared(db,'SELECT * FROM na_issue').all() as SqlRow[]) {
       const id=String(issue.pane_key);
       if(Number(issue.revision)>(revisions.get(id)??-1))continue;
       let issues=byPane.get(id);if(!issues){issues=new Map();byPane.set(id,issues);}

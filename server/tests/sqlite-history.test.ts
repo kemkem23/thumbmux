@@ -853,3 +853,78 @@ test('I2: first epoch and pre-output fault persist without a fabricated initial 
   expect(s.readPage(s.token(naKey),null,1).issues[0]).toMatchObject({boundaryLineId:0,missingCount:null,sourceEpoch:1});
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+// A realistic ~1.2 KiB encoded row crosses SQLite's 4 KiB index-page overflow
+// threshold, unlike repeated-cell fixtures. Keep the same data for 10/12 panes.
+const fix2Row=():PhysicalRow=>({text:'P01 000123 color3 ไทย漢字😀 '+ 'x'.repeat(80),
+ cells:Array.from({length:120},(_,i)=>({...naCell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))});
+for(const paneCount of [10,12])test(`I4 FIX2 F1: ${paneCount} panes retain 5000 realistic rows and keep admitting`,async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-cap-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const physicalRow=fix2Row();let accepted=0;
+  const keys=Array.from({length:paneCount},(_,i)=>({...naKey,paneId:`%${i}`}));
+  for(let n=0;n<5100;n+=100) {
+   for(const key of keys)for(let i=n;i<n+100;i++) {
+    const result=await s.appendScroll({...naEvent('',i+1,key),physicalRow});
+    expect(result).not.toHaveProperty('accepted',false);accepted++;
+   }
+   s.flush();
+  }
+  expect(s.health().status).not.toBe('stopped');
+  expect(s.health().ramBytes/(paneCount*5000)).toBeLessThan(2000);
+  for(const key of keys) {
+   expect(s.token(key).nextLineId).toBe(5100);
+   expect(s.readPage(s.token(key),0,1).lines[0].text).toBe(physicalRow.text);
+  }
+  console.log('FIX2_CAP',JSON.stringify({paneCount,accepted,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},120000);
+
+test('I4 FIX2 F1: idle durable cache pressure wakes drained without another flush and preserves disk history',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-idle-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:1024*1024});
+ try {
+  let accepted=0,pressure=0;const row=fix2Row();
+  for(let i=0;i<2400;i++) {
+   const event={...naEvent('',i+1),physicalRow:row};
+   let result=await s.appendScroll(event);
+   if('accepted' in result) {
+    pressure++;
+    expect(await Promise.race([s.drained(naKey).then(()=>true),Bun.sleep(2000).then(()=>false)])).toBe(true);
+    result=await s.appendScroll(event);
+   }
+   expect(result).not.toHaveProperty('accepted',false);accepted++;
+   // Make rows durable frequently: retained rows, not pending IO, fill RAM.
+   if(i%40===39)s.flush();
+  }
+  s.flush();expect(pressure).toBeGreaterThan(0);expect(accepted).toBe(2400);
+  expect(s.readPage(s.token(naKey),0,20).lines.map(l=>l.text)).toEqual(Array(20).fill(row.text));
+  const capture:ProjectionCapture={...naFrame(),captureId:'after-eviction',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[row],observedFields:[],ambiguousRows:0,result:'exact'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(s.readPage(s.token(naKey),0,1).lines[0].checkState).toBe('checked');
+  console.log('FIX2_IDLE_RECOVERY',JSON.stringify({accepted,pressure,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
+
+test('I4 FIX2 F2: 800-row calibration freezes RLE, bounds each commit to 256, and certifies every row',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-cal-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const row=fix2Row();
+  for(let i=0;i<800;i++)await s.appendScroll({...naEvent('',i+1),physicalRow:row});
+  s.flush();const revision=s.token(naKey).revision;
+  const capture:ProjectionCapture={...naFrame(),captureId:'bounded',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:Array.from({length:800},()=>structuredClone(row)),observedFields:[],ambiguousRows:0,result:'exact'};
+  const promise=s.calibrate({capture,expectedRevision:revision,checks:Array.from({length:800},(_,i)=>({lineId:i,captureRow:i})),repairs:[]});
+  const queued=(s as any).queuedBytes;
+  expect(queued).toBeLessThan(2*1024*1024);
+  capture.history[0].cells[0].grapheme='MUTATED';
+  const receipt=await promise;expect(receipt.revision-revision).toBe(4);
+  const ram=(s as any).ram;
+  const counts=ram.db.query('SELECT compared_rows,history_count FROM na_capture').all();
+  expect(counts.length).toBe(4);
+  expect(counts.every((r:any)=>r.compared_rows<=256 && r.history_count<=256)).toBe(true);
+  const lines=s.readPage(s.token(naKey),0,800).lines;
+  expect(lines.filter(l=>l.checkState==='checked').length).toBe(800);
+  expect(lines[0].cells).toEqual(row.cells);
+  console.log('FIX2_CALIBRATION',JSON.stringify({queued,commits:counts}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);

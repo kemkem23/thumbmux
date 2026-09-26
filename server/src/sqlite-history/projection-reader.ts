@@ -1,13 +1,13 @@
 import { Database } from 'bun:sqlite';
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
-import { decodeCells, integer, paneId, type ProjectionRam, type SqlRow } from './ram-store';
+import { prepared, decodeCells, integer, paneId, type ProjectionRam, type SqlRow } from './ram-store';
 import type { PaneKey, ProjectionArchiveReaderPort, ProjectionCheckState, ProjectionIssue, ProjectionPage, ProjectionToken } from './types';
 
 /** Overlay pending issue updates on their durable copies, just as for history rows. */
 export function readProjectionIssues(ram:ProjectionRam,disk:Database,token:ProjectionToken):ProjectionIssue[] {
   const found=new Map<string,SqlRow>();
-  for(const db of [disk,ram.db])for(const row of db.query('SELECT * FROM na_issue WHERE pane_key=? AND revision<=?').all(paneId(token.paneKey),token.revision) as SqlRow[])found.set(String(row.issue_id),row);
+  for(const db of [disk,ram.db])for(const row of prepared(db,'SELECT * FROM na_issue WHERE pane_key=? AND revision<=?').all(paneId(token.paneKey),token.revision) as SqlRow[])found.set(String(row.issue_id),row);
   return [...found.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue);
 }
 
@@ -31,7 +31,7 @@ export function readProjectionPage(ram: ProjectionRam, disk: Database, token: Pr
   const id=paneId(token.paneKey), byId=new Map<number,SqlRow>();
   // RAM overlays durable rows that were corrected after the last disk commit.
   const query='SELECT * FROM na_line WHERE pane_key=? AND line_id>=? AND line_id<? ORDER BY line_id';
-  for(const db of [disk,ram.db]) for(const row of db.query(query).all(id,start,end) as SqlRow[]) byId.set(Number(row.line_id),row);
+  for(const db of [disk,ram.db]) for(const row of prepared(db,query).all(id,start,end) as SqlRow[]) byId.set(Number(row.line_id),row);
   const values=[...byId.values()].sort((a,b)=>Number(a.line_id)-Number(b.line_id));
   if(values.length!==end-start || values.some((r,i)=>r.line_id!==start+i || Number(r.revision)>token.revision)) throw new Error('page-seam-hole');
   matches();
@@ -61,7 +61,7 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
   let closed=false;
   const ensure=()=>{if(closed)throw new Error('archive-closed');};
   const token=(key:PaneKey):ProjectionToken=>{
-    ensure();const row=db.query('SELECT * FROM na_pane WHERE pane_key=?').get(paneId(key)) as SqlRow|null;
+    ensure();const row=prepared(db,'SELECT * FROM na_pane WHERE pane_key=?').get(paneId(key)) as SqlRow|null;
     if(!row)throw new Error('unknown-pane');
     if(Number(row.revision)!==Number(row.durable_revision))throw new Error('archive-watermark-corrupt');
     return {paneKey:{...key},sourceEpoch:Number(row.source_epoch),geometryGeneration:Number(row.geometry_generation),
@@ -74,9 +74,9 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
       || current.geometryGeneration!==expected.geometryGeneration || current.nextLineId!==expected.nextLineId)throw new Error('page-retry');
     const start=anchor===null?0:integer(anchor),end=Math.min(current.nextLineId,start+limit);
     if(start>current.nextLineId)throw new Error('page-anchor');
-    const rows=db.query('SELECT * FROM na_line WHERE pane_key=? AND line_id>=? AND line_id<? ORDER BY line_id').all(paneId(expected.paneKey),start,end) as SqlRow[];
+    const rows=prepared(db,'SELECT * FROM na_line WHERE pane_key=? AND line_id>=? AND line_id<? ORDER BY line_id').all(paneId(expected.paneKey),start,end) as SqlRow[];
     if(rows.length!==end-start || rows.some((row,index)=>Number(row.line_id)!==start+index || Number(row.revision)>expected.revision))throw new Error('page-seam-hole');
-    const issues=(db.query('SELECT * FROM na_issue WHERE pane_key=? AND revision<=? ORDER BY revision').all(paneId(expected.paneKey),expected.revision) as SqlRow[]).map(projectionIssue);
+    const issues=(prepared(db,'SELECT * FROM na_issue WHERE pane_key=? AND revision<=? ORDER BY revision').all(paneId(expected.paneKey),expected.revision) as SqlRow[]).map(projectionIssue);
     return {token:{...current},issues,nextAnchor:end,hasMore:end<current.nextLineId,lines:rows.map(row=>({lineId:Number(row.line_id),
       sourceEpoch:Number(row.source_epoch),geometryGeneration:Number(row.geometry_generation),revision:Number(row.revision),text:String(row.text),
       cells:decodeCells(String(row.cells_json)),softWrap:!!row.soft_wrap,checkState:row.check_state as ProjectionCheckState,

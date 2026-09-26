@@ -798,6 +798,11 @@ const I4_FIX1_S_MUTATIONS=[
   {name:'I4-S metadata-screen-hash',file:'ram-store.ts',before:"screenHash.digest('hex'),historyHash.digest('hex')",after:"'0'.repeat(64),historyHash.digest('hex')"},
   {name:'I4-S persist-screen-table',file:'projection-store.ts',before:"['na_capture','na_line','na_issue']",after:"['na_capture','na_line','na_screen','na_issue']"},
 ];
+const I4_FIX2_S_MUTATIONS=[
+ {name:'I4-S2 page-size',file:'ram-store.ts',before:'PRAGMA page_size=8192;',after:'PRAGMA page_size=4096;'},
+ {name:'I4-S2 reclaim',file:'projection-store.ts',before:'this.ram.evict(panes,keep)',after:'this.ram.evict(panes,5000)'},
+ {name:'I4-S2 chunk-bound',file:'projection-store.ts',before:'const chunkSize=256,',after:'const chunkSize=512,'},
+];
 async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
  const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
  const results:any[]=[];
@@ -820,9 +825,28 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
     const row=(text,n,k=key)=>({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}});
     const frame=(g)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:1,rows:1,kind:'normal',cells:[[cell(g)]],cursor:null});
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
-    const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('freelist')?6*1024*1024:undefined});
+    const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('reclaim')?1024*1024:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.includes('capture-payload-columns')) {
+     if(name.startsWith('I4-S2')) {
+      const physical={text:'P01 000123 color3 ไทย漢字😀 '+'x'.repeat(80),cells:Array.from({length:120},(_,i)=>({...cell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))};
+      let pressure=0;
+      const n=name.includes('page-size')?5000:name.includes('reclaim')?1600:800;
+      for(let i=0;i<n;i++) {
+       const event={...row('',i+1),physicalRow:physical};let r=await s.appendScroll(event);
+       if(r.accepted===false){pressure++;const done=await Promise.race([s.drained(key).then(()=>true),Bun.sleep(250).then(()=>false)]);assert(done,'durable cache must reopen without new dirty data');r=await s.appendScroll(event);}
+       assert(r.accepted!==false,'refused row must become admissible');if(i%40===39)s.flush();
+      }
+      s.flush();
+      if(name.includes('page-size'))assert(s.health().ramBytes/n<2000,'realistic row footprint must avoid overflow page');
+      else if(name.includes('reclaim'))assert(pressure>0,'fixture must reach real RAM pressure');
+      else {
+       const capture={...frame('A'),captureId:'chunks',requestedAt:1,completedAt:2,firstHistoryRow:0,history:Array.from({length:n},()=>physical),observedFields:[],ambiguousRows:0,result:'fixture'};
+       await s.calibrate({capture,expectedRevision:s.token(key).revision,checks:Array.from({length:n},(_,i)=>({lineId:i,captureRow:i})),repairs:[]});
+       const counts=s.ram.db.query('SELECT compared_rows FROM na_capture').all();
+       assert(counts.every(r=>r.compared_rows<=256),'every calibration commit must map at most 256 rows');
+       assert(s.readPage(s.token(key),0,n).lines.every(r=>r.checkState==='checked'),'all requested rows must be checked');
+      }
+     } else if(name.includes('capture-payload-columns')) {
       const disk=new Database(s.file,{readonly:true});
       const payload=disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name IN ('screen_cells_json','history_cells_json','cells_json','payload_json')").all();disk.close();
       assert(payload.length===0,'capture receipt schema must have no payload-capable columns');
@@ -962,3 +986,5 @@ test('I2: shutdown after 2000 and 20000 accepted rows has durable receipts and i
   }finally{await s.close();rmSync(root,{recursive:true,force:true});}
  }
 },60000);
+
+ test('I4 FIX2 S mutations: footprint, idle recovery, and calibration bound',()=>runI2Mutations(I4_FIX2_S_MUTATIONS,'I4_FIX2_S_MUTATION_PROOF'),60000);
