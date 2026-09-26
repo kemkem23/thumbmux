@@ -5214,7 +5214,7 @@
       total = rawLines.length;
       const nextScrollTop = Math.max(0, Math.min(
         maxOffset(),
-        options.nextScrollTop ?? options.oldScrollTop + options.indexDelta * lineH,
+        options.nextScrollTop ?? options.oldScrollTop, // MUTANT M3: anchor ignores the inserted rows
       ));
       bottomOffsetPx = Math.max(0, maxOffset() - nextScrollTop);
     }
