@@ -25,7 +25,7 @@ export interface ProjectionOptions {
   beforeOpen?: (file:string)=>void;
 }
 function admitPath(options: ProjectionOptions): string {
-  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,'newarch-v2/history.sqlite3'));
+  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,'newarch-v3/history.sqlite3'));
   if(file===root || !file.startsWith(root+sep) || file.split(sep).some(p=>/^brain\.db(?:$|[-.])/i.test(p))) throw new Error('forbidden-database-path');
   // Check every existing component before creating anything or calling SQLite.
   for(const candidate of [file,file+'-wal',file+'-shm',file+'-journal']) {
@@ -42,7 +42,7 @@ function admitPath(options: ProjectionOptions): string {
     const fd=openSync(file,'r');
     try {
       const head=Buffer.alloc(100); const n=readSync(fd,head,0,100,0);
-      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v2');
+      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v3');
     } finally { closeSync(fd); }
   } else {
     mkdirSync(dirname(file),{recursive:true,mode:0o700});
@@ -136,6 +136,8 @@ export class ProjectionStore implements ProjectionWriterPort {
   private rosterSize=0;
   private rosterAt=0;
   private pressureRefusals=0;
+  private ramBatches=0;
+  private ramBatchOperations=0;
   private ramBytesCache=-1;
   private refusedBytes=new Map<string,number>();
   private lastOversize=new Map<string,string>();
@@ -153,9 +155,9 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(options.mode==='create') {
           if(version!==0 || this.disk.query("SELECT name FROM sqlite_master WHERE type='table'").all().length) throw new Error('new-file-required');
           this.disk.exec(PROJECTION_SCHEMA);this.disk.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);
-        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v2');
+        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v3');
         else {
-          const sql=(this.disk.query("SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_screen')").get() as SqlRow).s;
+          const sql=(this.disk.query("SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture')").get() as SqlRow).s;
           if(PROJECTION_SCHEMA_MARKERS.some(m=>!String(sql).includes(m))) throw new Error('projection-schema-outdated');
         }
         const epoch=Number(Object.values(this.disk.query('PRAGMA application_id').get()!)[0]);
@@ -171,7 +173,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=5)))this.flushAsync();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=4)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
@@ -188,11 +190,9 @@ export class ProjectionStore implements ProjectionWriterPort {
         upsert(this.ram.db,'na_pane',row);
         const id=String(row.pane_key), floor=Math.max(0,Number(row.next_line_id)-5000);
         const captures=this.disk.query(`SELECT * FROM na_capture c WHERE c.pane_key=? AND
-          (EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)
-          OR EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_key=c.pane_key AND s.last_capture_id=c.capture_id))`).all(id,floor) as SqlRow[];
+          EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)`).all(id,floor) as SqlRow[];
         for(const c of captures) upsert(this.ram.db,'na_capture',c);
         for(const line of this.disk.query('SELECT * FROM na_line WHERE pane_key=? AND line_id>=?').all(id,floor) as SqlRow[]) upsert(this.ram.db,'na_line',line);
-        for(const screen of this.disk.query('SELECT * FROM na_screen WHERE pane_key=?').all(id) as SqlRow[]) upsert(this.ram.db,'na_screen',screen);
       }
     })();
     if(this.ram.bytes()>this.cacheMax) throw new Error('recovery-cache-limit');
@@ -424,24 +424,36 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const [id,q] of this.queues)for(const job of q){this.reserve(id,-job.bytes);settle(job,false,error);}
       this.queues.clear();this.queuedBytes=0;this.pumping=false;return;
     }
-    let processed=0;const started=performance.now();
+    let processed=0;const started=performance.now(),work:Array<{id:string;job:Job}>=[];
     while(this.queues.size && processed<128 && (processed===0 || performance.now()-started<4)) {
       // Rotate after each row, including when the time slice ends mid-round.
       const [id,q]=this.queues.entries().next().value!;
       this.queues.delete(id);const job=q.shift()!;if(q.length)this.queues.set(id,q);
       this.queuedBytes-=job.bytes;
-      try {
-        // Admission already bounded RAM (cap plus at most the pending budget);
-        // an admitted job is never dropped for cache pressure (FIX1 §3).
-        const receipt=this.ram.db.transaction(()=>job.run())();
+      work.push({id,job});processed++;
+    }
+    const results:Array<{id:string;job:Job;receipt?:ProjectionReceipt;error?:unknown}>=[];
+    try {
+      // One outer RAM transaction amortizes SQLite transaction overhead across
+      // all panes ready in this pump turn. Each job keeps a nested savepoint so
+      // one malformed event cannot leave a partial mutation behind.
+      this.ram.db.transaction(()=>{
+        for(const {id,job} of work)try {
+          const receipt=this.ram.db.transaction(()=>job.run())();
+          results.push({id,job,receipt});
+        }catch(error){results.push({id,job,error});}
+      })();
+      this.ramBatches++;this.ramBatchOperations+=work.length;
+      for(const {id,job,receipt,error} of results)if(error===undefined) {
         // A frame replaces the pane's previous unflushed frame of the same kind:
         // release that one, exactly as the fast path reserves only the delta.
         const replaced=job.screenKey?this.screenBytes.get(job.screenKey)??0:0;
         if(job.screenKey){this.screenBytes.set(job.screenKey,job.bytes);this.reserve(id,-replaced);}
         this.dirtyByPane.set(id,(this.dirtyByPane.get(id)??0)+job.bytes-replaced);
-        this.dirtyBytes+=job.bytes-replaced;this.dirtySince??=job.at;settle(job,true,receipt);
-      }catch(error){this.reserve(id,-job.bytes);settle(job,false,error);}
-      processed++;
+        this.dirtyBytes+=job.bytes-replaced;this.dirtySince??=job.at;settle(job,true,receipt!);
+      } else {this.reserve(id,-job.bytes);settle(job,false,error);}
+    }catch(error) {
+      for(const {id,job} of work){this.reserve(id,-job.bytes);settle(job,false,error);}
     }
     this.ramBytesCache=-1;
     if(this.queues.size)setTimeout(()=>{this.pumpTurnAt=performance.now();this.pump();},0);else this.pumping=false;
@@ -591,7 +603,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     if(!this.dirtyBytes && this.dirtySince===null)return null;
     const panes=this.ram.db.query('SELECT * FROM na_pane WHERE revision>durable_revision').all() as SqlRow[];
     const tables=new Map<string,SqlRow[]>();
-    for(const table of ['na_capture','na_line','na_screen','na_issue']) {
+    for(const table of ['na_capture','na_line','na_issue']) {
       const rows:SqlRow[]=[];
       for(const p of panes)rows.push(...this.ram.db.query(`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
       tables.set(table,rows);
@@ -705,7 +717,9 @@ export class ProjectionStore implements ProjectionWriterPort {
       issues:[...(byPane.get(String(p.pane_key))?.values()??[])].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue)
     }));
     return {pressure:this.stopped || this.refusedBytes.size?'recoverable':'none',pressureRefusals:this.pressureRefusals,status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
-      pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,panes};
+      pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,
+      ramBatches:this.ramBatches,ramBatchOperations:this.ramBatchOperations,
+      averageRamOperationsPerBatch:this.ramBatches?this.ramBatchOperations/this.ramBatches:0,panes};
   }
   async close():Promise<void> {
     if(this.closed)return;

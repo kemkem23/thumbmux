@@ -244,6 +244,7 @@ export interface ProjectionFault {
 export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
+  ramBatches: number; ramBatchOperations: number; averageRamOperationsPerBatch: number;
   /** 'recoverable' while the store is stopped or any pane holds a refused row. */
   pressure: 'none' | 'recoverable';
   /** Backpressure refusals since open (FIX1 §3); not losses, see rejectedRows for those. */
@@ -262,4 +263,10 @@ export interface ProjectionWriterPort {
   calibrate(change: ProjectionCalibration): Promise<ProjectionReceipt>;
   readPage(token: ProjectionToken, anchor: number | null, limit: number): ProjectionPage;
   flush(): void; health(): ProjectionHealth;
+}
+export interface ProjectionArchiveReaderPort {
+  readonly schemaVersion: 2 | 3;
+  token(key: PaneKey): ProjectionToken;
+  readPage(token: ProjectionToken, anchor: number | null, limit: number): ProjectionPage;
+  close(): void;
 }

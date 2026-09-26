@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
-import { randomUUID } from 'node:crypto';
-import { PROJECTION_SCHEMA } from './schema';
+import { createHash, randomUUID } from 'node:crypto';
+import { PROJECTION_RAM_SCREEN_SCHEMA, PROJECTION_SCHEMA } from './schema';
 import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionIssueInput, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
 // Schema 2's UNIQUE(pane_key,line_id) is sqlite_autoindex_na_line_2.
@@ -64,6 +64,7 @@ export function validateFrame(frame: ProjectionFrame): void {
 const UPSERT_IDENTITIES:Record<string,string[]>={na_pane:['pane_key'],na_capture:['pane_key','capture_id'],
   na_line:['pane_key','line_id'],na_screen:['pane_key','screen_kind'],na_issue:['issue_id'],na_commit:['commit_id']};
 const UPSERT_SQL=new Map<string,string>();
+const UPSERT_STATEMENTS=new WeakMap<Database,Map<string,ReturnType<Database['query']>>>();
 export function upsert(db: Database, table: string, row: SqlRow): void {
   // All identifiers come exclusively from the schema and SQLite column metadata.
   if (!/^na_(pane|capture|line|screen|issue|commit)$/.test(table)) throw new Error('invalid-table');
@@ -78,7 +79,11 @@ export function upsert(db: Database, table: string, row: SqlRow): void {
       ON CONFLICT DO UPDATE SET ${mutable.map(c=>`${c}=excluded.${c}`).join(',')}`;
     UPSERT_SQL.set(signature,sql);
   }
-  db.query(sql).run(...Object.values(row));
+  let statements=UPSERT_STATEMENTS.get(db);
+  if(!statements){statements=new Map();UPSERT_STATEMENTS.set(db,statements);}
+  let statement=statements.get(signature);
+  if(!statement){statement=db.query(sql);statements.set(signature,statement);}
+  statement.run(...Object.values(row));
 }
 
 /** Only the bounded live working set lives here. Disk history is never loaded wholesale. */
@@ -86,7 +91,8 @@ export class ProjectionRam {
   readonly db = new Database(':memory:', {strict:true});
   private readonly pageSize:number;
   constructor() {
-    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;');this.db.exec(PROJECTION_SCHEMA);
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;');
+    this.db.exec(PROJECTION_SCHEMA);this.db.exec(PROJECTION_RAM_SCREEN_SCHEMA);
     this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_key,checked_capture_id)');
     this.pageSize=Number((this.db.query('PRAGMA page_size').get() as {page_size:number}).page_size);
   }
@@ -208,7 +214,12 @@ export class ProjectionRam {
       // A content match never downgrades an identity already proven by anchors.
       m.keep=m.state==='content-matched' && row.check_state==='checked';
     }
-    this.db.query('INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,JSON.stringify(c.cells),JSON.stringify(c.history),mapped.size,correctedCells,c.ambiguousRows,c.result);
+    // Hash one row at a time. The transient capture is never assembled into a
+    // giant JSON value and there is no durable column capable of storing it.
+    const screenHash=createHash('sha256'),historyHash=createHash('sha256');
+    for(const cells of c.cells)screenHash.update(encodeCells(cells)).update('\n');
+    for(const row of c.history)historyHash.update(row.text).update('\0').update(encodeCells(row.cells)).update('\n');
+    this.db.query('INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,screenHash.digest('hex'),historyHash.digest('hex'),JSON.stringify(c.observedFields),mapped.size,correctedCells,c.ambiguousRows,c.result);
     for(const m of mutations) {
       if(m.keep)continue;
       const expected=c.history[m.captureRow];
