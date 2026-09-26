@@ -1,4 +1,4 @@
-import { cellKey, IncrementalHistoryMatcher, type CapturedRow, type HistoryCell, type HistoryRow, type RowMatch } from './history-row-matcher';
+import { certifiedRows, equalCells, IncrementalHistoryMatcher, type CapturedRow, type HistoryCell, type HistoryRow, type RowMatch } from './history-row-matcher';
 
 export interface PaneKey { serverIdentity: string; paneId: string; birthGeneration: number }
 export interface CalibrationFrame {
@@ -64,16 +64,27 @@ export interface CalibrationPorts {
   calibrate(input: {
     capture: CalibrationCapture; checks: RowMatch['checks']; contentMatches: RowMatch['contentMatches'];
     repairs: RowMatch['repairs']; expectedRevision: number; captureEvidence: CaptureEvidence;
+    /** Present only with `certifiedStyleMask`: captured rows (history index /
+     * screen row) holding style bits outside the mask. Their cells are kept
+     * and drawn in full fidelity; the claim about those bits is uncertain. */
+    uncertifiedStyle?: { mask: number; historyRows: readonly number[]; screenRows: readonly number[] };
   }): Promise<CalibrationCommit | null>;
   /** Called only with a frame the store committed in `commit`. */
   publish(commit: CalibrationCommit, frame: CalibrationFrame): void;
   fault(issue: { kind: string; at: number; missingCount: null }): void;
 }
-export function equalCalibrationFrames(a: CalibrationFrame, b: CalibrationFrame): boolean {
+/** Frames equal in every field; with `styleMask`, style bits outside it are
+ * not compared (a comparator restriction only, never applied to drawn cells). */
+export function equalCalibrationFrames(a: CalibrationFrame, b: CalibrationFrame, styleMask = -1): boolean {
   return a.kind === b.kind && a.geometryGeneration === b.geometryGeneration
     && JSON.stringify(a.cursor) === JSON.stringify(b.cursor)
     && a.cells.length === b.cells.length
-    && a.cells.every((row, y) => row.length === b.cells[y]!.length && row.every((cell, x) => cellKey(cell) === cellKey(b.cells[y]![x]!)));
+    && a.cells.every((row, y) => row.length === b.cells[y]!.length && row.every((cell, x) => equalCells(cell, b.cells[y]![x]!, styleMask)));
+}
+function uncertifiedRows(rows: readonly CapturedRow[], mask: number): number[] {
+  const out: number[] = [];
+  rows.forEach((row, y) => { if (row.cells.some(cell => (cell.style & ~mask) !== 0)) out.push(y); });
+  return out;
 }
 function samePane(a: PaneKey, b: PaneKey): boolean {
   return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
@@ -90,6 +101,20 @@ function fencedHistory(recent: readonly HistoryRow[], before: readonly HistoryRo
   return [];
 }
 export type CalibrationEvent = 'birth' | 'reconnect' | 'resize' | 'clear' | 'alt' | 'fault';
+/** Capture cadence (I4-FIX1-PLAN §5.4). A pane with a viewer calibrates the
+ * displayed screen: 200ms while output flows, 1s when idle. A pane without a
+ * viewer keeps every row through the pipe and only needs history evidence:
+ * one capture per 5s. Lifecycle events are 50ms either way. */
+export const CAPTURE_CADENCE = { eventMs: 50, activeMs: 200, idleMs: 1000, unviewedMs: 5000, deadlineMs: 1000 } as const;
+export interface CalibratorOptions {
+  historyLimit?: number; incremental?: boolean;
+  /** Initial viewer count; undefined = not reported, treated as viewed. */
+  viewers?: number;
+  /** Style bits the parser can observe. Captured cells keep every bit; only
+   * the parser comparison (history identity, screen divergence) is limited
+   * to this mask. Undefined = compare every bit. */
+  certifiedStyleMask?: number;
+}
 
 /** One instance per pane. The host owns the deadline queue and invokes runDue.
  * Full-tail is the safe default. Incremental mode is opt-in and never issues
@@ -109,14 +134,49 @@ export class HistoryCalibrator {
   private degraded = false;
   private nextPipePublish = Infinity;
   private pendingPipe: (() => void) | undefined;
+  private viewers: number | undefined;
+  private closed = false;
+  /** Aborts the capture in flight (deadline or close). */
+  private abortInFlight: (() => void) | undefined;
   constructor(readonly paneKey: PaneKey, private ports: CalibrationPorts,
-    private options: { historyLimit?: number; incremental?: boolean } = {}) {
+    private options: CalibratorOptions = {}) {
     if (options.historyLimit !== undefined && (!Number.isInteger(options.historyLimit) || options.historyLimit < 0 || options.historyLimit > 4500)) throw new Error('invalid history limit');
+    if (options.certifiedStyleMask !== undefined && !Number.isSafeInteger(options.certifiedStyleMask)) throw new Error('invalid style mask');
+    if (options.viewers !== undefined) this.checkViewers(options.viewers);
+    this.viewers = options.viewers;
     this.request(this.ports.now());
   }
-  get dueAt(): number { return Math.min(this.deadline, this.nextPipePublish); }
+  get dueAt(): number { return this.closed ? Infinity : Math.min(this.deadline, this.nextPipePublish); }
   get acceptsPipeFrame(): boolean { return this.mode === 'PIPE'; }
+  get capturing(): boolean { return this.inFlight; }
+  private get viewed(): boolean { return this.viewers === undefined || this.viewers > 0; }
+  private checkViewers(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('invalid viewer count');
+  }
+  /** Host viewer count for this pane. A pane gaining its first viewer is
+   * captured now (history included), so its screen is fresh within one
+   * capture deadline instead of waiting out the unviewed period. */
+  setViewers(count: number): void {
+    this.checkViewers(count);
+    if (this.closed) return;
+    const was = this.viewed;
+    this.viewers = count;
+    if (!was && this.viewed) {
+      this.lastHistoryAt = -Infinity;
+      this.request(Math.max(this.ports.now(), this.lastCaptureAt + CAPTURE_CADENCE.eventMs));
+    }
+  }
+  /** Stops this pane: aborts the capture in flight (its signal fires now),
+   * never commits or publishes a result that lands later, and schedules
+   * nothing again. Idempotent. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.deadline = Infinity; this.nextPipePublish = Infinity; this.pendingPipe = undefined;
+    this.abortInFlight?.();
+  }
   output(publishPipe?: () => void): void {
+    if (this.closed) return;
     const now = this.ports.now();
     this.outputAt = now;
     if (publishPipe && this.mode === 'PIPE') {
@@ -124,7 +184,7 @@ export class HistoryCalibrator {
       this.nextPipePublish = Math.min(this.nextPipePublish, now + 16);
       this.ports.schedule(this.dueAt);
     }
-    this.request(Math.max(now, this.lastCaptureAt + 200));
+    this.request(Math.max(now, this.lastCaptureAt + (this.viewed ? CAPTURE_CADENCE.activeMs : CAPTURE_CADENCE.unviewedMs)));
   }
   scroll(count = 1): void {
     if (!Number.isSafeInteger(count) || count < 0) throw new Error('invalid scroll count');
@@ -132,12 +192,14 @@ export class HistoryCalibrator {
     this.output();
   }
   event(_kind: CalibrationEvent): void {
+    if (this.closed) return;
     this.eventGeneration++; this.forceFull = true; this.matcher.reset();
     // A generation change immediately prevents stale parser frames being shown.
     this.enterCapture();
-    this.request(Math.max(this.ports.now(), this.lastCaptureAt + 50));
+    this.request(Math.max(this.ports.now(), this.lastCaptureAt + CAPTURE_CADENCE.eventMs));
   }
   private request(at: number): void {
+    if (this.closed) return;
     if (at < this.deadline) { this.deadline = at; this.ports.schedule(this.dueAt); }
   }
   private enterCapture(): void {
@@ -145,6 +207,7 @@ export class HistoryCalibrator {
     this.pendingPipe = undefined; this.nextPipePublish = Infinity;
   }
   async runDue(): Promise<void> {
+    if (this.closed) return;
     const now = this.ports.now();
     if (this.latchAt !== undefined && now - this.latchAt >= 1000) {
       if (!this.degraded) this.ports.fault({ kind: 'capture-latch-degraded', at: now, missingCount: null });
@@ -186,11 +249,15 @@ export class HistoryCalibrator {
       const capture = await Promise.race([
         this.ports.capture(this.paneKey, tailLimit, controller.signal),
         new Promise<never>((_, reject) => {
-          const expire = () => { controller.abort(); reject(new Error('capture deadline exceeded')); };
-          if (this.ports.timeout) cancelTimeout = this.ports.timeout(expire, 1000);
-          else { const timer = setTimeout(expire, 1000); cancelTimeout = () => clearTimeout(timer); }
+          // Deadline and close() both abort the capture port (the host kills
+          // and reaps its subprocess on this signal) and release this pane
+          // at once: a capture port that ignores the signal cannot hold it.
+          const expire = (reason: string) => { controller.abort(); reject(new Error(reason)); };
+          this.abortInFlight = () => expire('calibrator closed');
+          if (this.ports.timeout) cancelTimeout = this.ports.timeout(() => expire('capture deadline exceeded'), CAPTURE_CADENCE.deadlineMs);
+          else { const timer = setTimeout(() => expire('capture deadline exceeded'), CAPTURE_CADENCE.deadlineMs); cancelTimeout = () => clearTimeout(timer); }
         }),
-      ]).finally(() => { cancelTimeout?.(); });
+      ]).finally(() => { cancelTimeout?.(); this.abortInFlight = undefined; });
       // The capture subprocess must finish BEFORE selecting a CAS revision.
       const read = this.ports.read();
       const meta = capture.after;
@@ -208,7 +275,10 @@ export class HistoryCalibrator {
       if (!stable) { this.matcher.reset(); this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       const matched = historyDue && meta.kind === 'normal';
       const recent = matched ? fencedHistory(read.recentHistory, fence.recentHistory) : read.recentHistory;
-      const match: RowMatch = !matched ? { checks: [], contentMatches: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, capture.history, {
+      // The parser comparison sees certified bits only; `capture` keeps all.
+      const mask = this.options.certifiedStyleMask;
+      const certified = mask === undefined ? capture.history : certifiedRows(capture.history, mask);
+      const match: RowMatch = !matched ? { checks: [], contentMatches: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, certified, {
         sourceEpoch: read.sourceEpoch, geometryGeneration: read.geometryGeneration,
         completeRetainedTail: capture.completeRetainedTail,
         maxTailGap: read.recentHistory.length - recent.length + TAIL_GAP_SLACK,
@@ -222,7 +292,13 @@ export class HistoryCalibrator {
         kind: 'quiescent', sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration,
         receiveSeqBefore, receiveSeqAfter: receiveSeq, uncertainRows: capture.uncertainScreenRows ?? [],
       };
-      const committed = await this.ports.calibrate({ capture, checks: match.checks, contentMatches: match.contentMatches, repairs: match.repairs, expectedRevision: read.revision, captureEvidence });
+      const uncertifiedStyle = mask === undefined ? undefined : {
+        mask, historyRows: uncertifiedRows(capture.history, mask),
+        screenRows: uncertifiedRows(capture.frame.cells.map(cells => ({ cells, softWrap: false })), mask),
+      };
+      if (this.closed) return;
+      const committed = await this.ports.calibrate({ capture, checks: match.checks, contentMatches: match.contentMatches, repairs: match.repairs, expectedRevision: read.revision, captureEvidence, ...(uncertifiedStyle ? { uncertifiedStyle } : {}) });
+      if (this.closed) return;
       if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       // Only the transaction revision is published. A concurrent lifecycle event
       // suppresses this result and requests another capture, never an old frame.
@@ -230,7 +306,7 @@ export class HistoryCalibrator {
       const latest = this.ports.read();
       // A screen-only capture carries no history evidence; remembering its
       // empty match would erase the seed of the incremental chain.
-      if (matched) this.matcher.remember(recent, capture.history, match);
+      if (matched) this.matcher.remember(recent, certified, match);
       // The pipe always owns the next frame: a committed capture ends any
       // lifecycle latch, and a mismatch is corrected by the next capture
       // instead of freezing pipe publishes (FIX1-PLAN §1.2, never blank).
@@ -241,7 +317,7 @@ export class HistoryCalibrator {
         this.pendingPipe = undefined; this.nextPipePublish = Infinity;
         this.ports.publish(committed, capture.frame);
         // A parser frame without rows makes no screen claim to compare.
-        diverged = latest.parserFrame.cells.length === capture.frame.cells.length && !equalCalibrationFrames(latest.parserFrame, capture.frame);
+        diverged = latest.parserFrame.cells.length === capture.frame.cells.length && !equalCalibrationFrames(latest.parserFrame, capture.frame, mask);
       }
       successful = true;
       this.forceFull = historyDue && match.reason !== 'matched' && match.reason !== 'generation';
@@ -252,15 +328,19 @@ export class HistoryCalibrator {
       // scroll. Forcing a full capture here turned one slow capture into a
       // cascade: 4500-row captures are slower still and time out again.
       this.mode = 'PIPE'; this.latchAt = undefined;
-      this.ports.fault({ kind: 'capture-fault', at: this.ports.now(), missingCount: null });
+      if (!this.closed) this.ports.fault({ kind: 'capture-fault', at: this.ports.now(), missingCount: null });
     } finally {
       this.inFlight = false; this.lastCaptureAt = anchor;
+      if (this.closed) return;
       const at = this.ports.now();
       if (this.latchAt !== undefined && at - this.latchAt > 1000 && !this.degraded) {
         this.degraded = true;
         this.ports.fault({ kind: 'capture-latch-degraded', at, missingCount: null });
       }
-      const interval = !successful || diverged || this.mode === 'CAPTURE' ? 50 : at - this.outputAt <= 200 ? 200 : 1000;
+      // A divergence is recaptured fast only where someone sees the screen.
+      const interval = !successful || this.mode === 'CAPTURE' || (diverged && this.viewed) ? CAPTURE_CADENCE.eventMs
+        : !this.viewed ? CAPTURE_CADENCE.unviewedMs
+        : at - this.outputAt <= CAPTURE_CADENCE.activeMs ? CAPTURE_CADENCE.activeMs : CAPTURE_CADENCE.idleMs;
       // An event timer may have fired while capture was in flight. Re-arm
       // explicitly, and retain the 50ms minimum between capture starts.
       this.deadline = Math.max(now + 50, Math.min(this.deadline, Math.max(at, anchor + interval)));

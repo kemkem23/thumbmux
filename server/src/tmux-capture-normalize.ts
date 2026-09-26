@@ -105,6 +105,13 @@ export interface TmuxObservedCell {
   style: number;
 }
 export const TMUX_OBSERVED_FIELDS = ['grapheme', 'width', 'continuation', 'fg', 'bg', 'style', 'cursor-position', 'cursor-visible'] as const;
+/** `TmuxObservedCell.style` bits: SGR n (1..9) sets bit n-1, SGR 21 sets
+ * DOUBLE_UNDERLINE. The decoder keeps every bit it reads (dim, rapid blink,
+ * hidden included); a consumer that compares against a parser limited to a
+ * subset must mask its comparison, never these cells. */
+export const TMUX_STYLE_BITS = {
+  BOLD: 1, DIM: 2, ITALIC: 4, UNDERLINE: 8, BLINK: 16, RAPID_BLINK: 32, REVERSE: 64, HIDDEN: 128, STRIKE: 256, DOUBLE_UNDERLINE: 512,
+} as const;
 // Segmenter instances are stateless between segment() calls. Constructing one
 // per capture cost ~10us, which dominated one-row decodes.
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
