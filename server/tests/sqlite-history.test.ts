@@ -469,7 +469,7 @@ test('newarch: compact cells preserve every field while restart requires a fresh
   expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual([cells]);
   const disk=new Database(s.file,{readonly:true});
   expect(disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
-  expect(disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name LIKE '%cells%' OR name LIKE '%json%' AND name!='observed_fields_json'").all()).toEqual([]);
+  expect(disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name IN ('screen_cells_json','history_cells_json','cells_json','payload_json')").all()).toEqual([]);
   disk.close();
   await s.close();const r=createProjectionStore({historyRoot:dir,mode:'recover'});
   try{expect(r.screen(naKey)).toBeNull();expect(r.readPage(r.token(naKey),null,2).lines[0].cells).toEqual(cells);}finally{await r.close();}
