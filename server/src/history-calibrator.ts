@@ -6,6 +6,9 @@ export interface CalibrationFrame {
   cursor: { x: number; y: number; visible: boolean } | null;
   kind: 'normal' | 'alternate';
   geometryGeneration: number;
+  /** Parser frames: bytes received from the pipe when the frame was built.
+   * Capture frames carry no byte position (tmux 3.4 has no byte fence); the
+   * calibrator never reads this field from a capture. */
   receiveSeq: number;
 }
 export interface CaptureMetadata {
@@ -24,7 +27,25 @@ export interface CalibrationCapture {
   frame: CalibrationFrame; history: readonly CapturedRow[];
   completeRetainedTail: boolean;
   observedFields: readonly string[];
+  /** Decoder row isolation (tmux-capture-normalize): rows whose cell boundary
+   * tmux does not serialize exactly. Indexes into `history` / `frame.cells`.
+   * History rows listed here are never checked or content-matched; screen
+   * rows are still drawn and are reported in the screen evidence. */
+  uncertainHistoryRows?: readonly number[];
+  uncertainScreenRows?: readonly number[];
 }
+/** FIX1-PLAN §1.2 evidence for drawing a capture over displayedScreen. There
+ * is no byte fence: the claim is only that metadata was stable around the
+ * capture and the parser received no pipe byte between the pre-capture read
+ * and the post-capture read (a quiescent window). parserFrame is never fed.
+ * Field-for-field the store's port (lot I2 `sqlite-history/types.ts`
+ * `CaptureEvidence` at FIX2 4ea4fb585): the store draws the screen only for
+ * kind 'quiescent' and re-checks receiveSeqBefore === receiveSeqAfter itself;
+ * 'unfenced' commits history evidence only. uncertainRows (§7.4 D18) = the
+ * capture's decoder-uncertain screen rows: drawn, kept apart, not certified. */
+export type CaptureEvidence =
+  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number; uncertainRows?: readonly number[] }
+  | { kind: 'unfenced'; reason: string };
 export interface CalibrationSnapshot {
   revision: number; sourceEpoch: number; geometryGeneration: number;
   recentHistory: readonly HistoryRow[]; parserFrame: CalibrationFrame;
@@ -32,11 +53,19 @@ export interface CalibrationSnapshot {
 export interface CalibrationCommit { revision: number; durableRevision: number; nextLineId: number }
 export interface CalibrationPorts {
   now(): number;
+  /** Same clock domain as now(); returns an idempotent cancellation callback. */
+  timeout?(callback: () => void, delayMs: number): () => void;
   capture(paneKey: PaneKey, tailLimit: number, signal?: AbortSignal): Promise<CalibrationCapture>;
   schedule(deadline: number): void;
   read(): CalibrationSnapshot;
-  // null is a CAS conflict; every screen/check/repair is in this one transaction.
-  calibrate(input: { capture: CalibrationCapture; checks: RowMatch['checks']; repairs: RowMatch['repairs']; expectedRevision: number }): Promise<CalibrationCommit | null>;
+  // null is a CAS conflict; every screen/check/content-match/repair is in this
+  // one transaction. Only kind 'quiescent' may replace displayedScreen;
+  // 'unfenced' = history only.
+  calibrate(input: {
+    capture: CalibrationCapture; checks: RowMatch['checks']; contentMatches: RowMatch['contentMatches'];
+    repairs: RowMatch['repairs']; expectedRevision: number; captureEvidence: CaptureEvidence;
+  }): Promise<CalibrationCommit | null>;
+  /** Called only with a frame the store committed in `commit`. */
   publish(commit: CalibrationCommit, frame: CalibrationFrame): void;
   fault(issue: { kind: string; at: number; missingCount: null }): void;
 }
@@ -143,6 +172,9 @@ export class HistoryCalibrator {
     const limit = this.options.historyLimit ?? 4500;
     const tailLimit = !historyDue ? 0 : this.forceFull || !this.options.incremental ? limit : Math.min(limit, requestedScrolls + 128);
     let successful = false;
+    // A committed quiescent capture that differs from the parser screen: the
+    // next pipe byte redraws the parser's cells, so recapture in 50ms.
+    let diverged = false;
     try {
       // The fence is (pane identity, source/history epoch, geometry, last ID).
       // Content equality cannot prove identity across a history reset. The
@@ -150,13 +182,15 @@ export class HistoryCalibrator {
       // left to the next capture. CAS still uses the post-capture revision.
       const fence = this.ports.read();
       const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      let cancelTimeout: (() => void) | undefined;
       const capture = await Promise.race([
         this.ports.capture(this.paneKey, tailLimit, controller.signal),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => {
-          controller.abort(); reject(new Error('capture deadline exceeded'));
-        }, 1000); }),
-      ]).finally(() => { clearTimeout(timer); });
+        new Promise<never>((_, reject) => {
+          const expire = () => { controller.abort(); reject(new Error('capture deadline exceeded')); };
+          if (this.ports.timeout) cancelTimeout = this.ports.timeout(expire, 1000);
+          else { const timer = setTimeout(expire, 1000); cancelTimeout = () => clearTimeout(timer); }
+        }),
+      ]).finally(() => { cancelTimeout?.(); });
       // The capture subprocess must finish BEFORE selecting a CAS revision.
       const read = this.ports.read();
       const meta = capture.after;
@@ -174,12 +208,21 @@ export class HistoryCalibrator {
       if (!stable) { this.matcher.reset(); this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       const matched = historyDue && meta.kind === 'normal';
       const recent = matched ? fencedHistory(read.recentHistory, fence.recentHistory) : read.recentHistory;
-      const match: RowMatch = !matched ? { checks: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, capture.history, {
+      const match: RowMatch = !matched ? { checks: [], contentMatches: [], repairs: [], reason: 'partial-tail' } : this.matcher.match(recent, capture.history, {
         sourceEpoch: read.sourceEpoch, geometryGeneration: read.geometryGeneration,
         completeRetainedTail: capture.completeRetainedTail,
         maxTailGap: read.recentHistory.length - recent.length + TAIL_GAP_SLACK,
+        uncertainCapturedRows: capture.uncertainHistoryRows?.length ? new Set(capture.uncertainHistoryRows) : undefined,
       });
-      const committed = await this.ports.calibrate({ capture, checks: match.checks, repairs: match.repairs, expectedRevision: read.revision });
+      // FIX1-PLAN §1.2: no byte fence. The capture may replace displayedScreen
+      // only when the parser received nothing while it ran; otherwise the pipe
+      // frame is newer and this transaction carries history evidence only.
+      const receiveSeqBefore = fence.parserFrame.receiveSeq, receiveSeq = read.parserFrame.receiveSeq;
+      const captureEvidence: CaptureEvidence = receiveSeqBefore !== receiveSeq ? { kind: 'unfenced', reason: 'received-during-capture' } : {
+        kind: 'quiescent', sourceEpoch: meta.sourceEpoch, geometryGeneration: meta.geometryGeneration,
+        receiveSeqBefore, receiveSeqAfter: receiveSeq, uncertainRows: capture.uncertainScreenRows ?? [],
+      };
+      const committed = await this.ports.calibrate({ capture, checks: match.checks, contentMatches: match.contentMatches, repairs: match.repairs, expectedRevision: read.revision, captureEvidence });
       if (!committed) { this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       // Only the transaction revision is published. A concurrent lifecycle event
       // suppresses this result and requests another capture, never an old frame.
@@ -188,16 +231,17 @@ export class HistoryCalibrator {
       // A screen-only capture carries no history evidence; remembering its
       // empty match would erase the seed of the incremental chain.
       if (matched) this.matcher.remember(recent, capture.history, match);
-      const comparable = latest.revision === committed.revision
-        && read.parserFrame.receiveSeq === capture.frame.receiveSeq
-        && latest.parserFrame.receiveSeq === capture.frame.receiveSeq;
-      if (!comparable || equalCalibrationFrames(latest.parserFrame, capture.frame)) {
-        this.mode = 'PIPE'; this.latchAt = undefined; this.degraded = false;
-      } else this.enterCapture();
-      // A committed capture supersedes any pipe publish queued before it.
-      if (comparable) {
+      // The pipe always owns the next frame: a committed capture ends any
+      // lifecycle latch, and a mismatch is corrected by the next capture
+      // instead of freezing pipe publishes (FIX1-PLAN §1.2, never blank).
+      this.mode = 'PIPE'; this.latchAt = undefined; this.degraded = false;
+      // Publish only the frame the store committed, and only if nothing newer
+      // arrived since: a later byte or revision already supersedes it.
+      if (captureEvidence.kind === 'quiescent' && latest.revision === committed.revision && latest.parserFrame.receiveSeq === receiveSeq) {
         this.pendingPipe = undefined; this.nextPipePublish = Infinity;
         this.ports.publish(committed, capture.frame);
+        // A parser frame without rows makes no screen claim to compare.
+        diverged = latest.parserFrame.cells.length === capture.frame.cells.length && !equalCalibrationFrames(latest.parserFrame, capture.frame);
       }
       successful = true;
       this.forceFull = historyDue && match.reason !== 'matched' && match.reason !== 'generation';
@@ -216,7 +260,7 @@ export class HistoryCalibrator {
         this.degraded = true;
         this.ports.fault({ kind: 'capture-latch-degraded', at, missingCount: null });
       }
-      const interval = !successful || this.mode === 'CAPTURE' ? 50 : at - this.outputAt <= 200 ? 200 : 1000;
+      const interval = !successful || diverged || this.mode === 'CAPTURE' ? 50 : at - this.outputAt <= 200 ? 200 : 1000;
       // An event timer may have fired while capture was in flight. Re-arm
       // explicitly, and retain the 50ms minimum between capture starts.
       this.deadline = Math.max(now + 50, Math.min(this.deadline, Math.max(at, anchor + interval)));

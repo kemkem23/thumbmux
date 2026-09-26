@@ -661,7 +661,9 @@ function naHarness(incremental = false) {
   let time = 0, revision = 1;
   const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
   const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
-  const history = naRows(['a', 'b', 'c']);
+  // Five rows: FIX1-PLAN §2 checks b..d (two unique triples bracket them); a
+  // three-row ring has one triple and can only be content-matched.
+  const history = naRows(['a', 'b', 'c', 'd', 'e']);
   let parser = structuredClone(frame);
   const limits: number[] = [], scheduled: number[] = [], published: number[] = [], faults: string[] = [], writes: Parameters<CalibrationPorts['calibrate']>[0][] = [];
   let conflict = false, stale = false;
@@ -687,12 +689,20 @@ function naHarness(incremental = false) {
 }
 
 describe('NEWARCH L2-C matcher and calibration ports', () => {
-  test('unique suffix checks exact cells and repairs only bounded equal-length mismatch', () => {
+  test('unique suffix checks exact cells and leaves bounded mismatch untouched', () => {
     const rows = naRows(['L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3']);
     const capture = ['L1', 'L2', 'L3', 'good', 'R1', 'R2', 'R3'].map(naRow);
     const match = matchHistoryRows(rows, capture, naScope);
-    expect(match.checks).toHaveLength(6);
-    expect(match.repairs).toEqual([{ lineId: 4, capturedRow: 3, row: capture[3]! }]);
+    // FIX1-PLAN §2: each side of the mismatch holds one triple, so no row has
+    // anchors above and below it. Content is proven, identity is not.
+    expect(match.checks).toHaveLength(0);
+    expect(match.contentMatches.map(c => c.lineId)).toEqual([1, 2, 3, 5, 6, 7]);
+    expect(match.repairs).toHaveLength(0);
+    const longer = naRows(['L0', 'L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3', 'R4']);
+    const longerCapture = ['L0', 'L1', 'L2', 'L3', 'good', 'R1', 'R2', 'R3', 'R4'].map(naRow);
+    const bracketed = matchHistoryRows(longer, longerCapture, naScope);
+    expect(bracketed.checks.map(c => c.lineId)).toEqual([2, 3, 7, 8]);
+    expect(bracketed.contentMatches.map(c => c.lineId)).toEqual([1, 4, 6, 9]);
     expect(matchHistoryRows(rows, capture, { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
     expect(matchHistoryRows(rows, capture, { ...naScope, geometryGeneration: 2 }).checks).toHaveLength(0);
   });
@@ -705,14 +715,18 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     const rows = naRows(['a', 'b', 'c', 'missing', 'd', 'e', 'f']);
     const match = matchHistoryRows(rows, ['a', 'b', 'c', 'd', 'e', 'f'].map(naRow), naScope);
     expect(match.repairs).toHaveLength(0);
-    expect(match.checks.map(c => c.lineId)).toEqual([5, 6, 7]);
+    // The unique suffix fixes the offset; one triple cannot bracket a row.
+    expect(match.checks).toHaveLength(0);
+    expect(match.contentMatches.map(c => c.lineId)).toEqual([5, 6, 7]);
   });
   test('20,000-row fixture remains unchanged when only the retained tail can be checked', () => {
     const rows = naRows(Array.from({ length: 20000 }, (_, i) => `row-${i}`));
     const retained = rows.slice(-4500);
     const match = matchHistoryRows(rows, retained, naScope);
     expect(rows).toHaveLength(20000);
-    expect(match.checks).toHaveLength(4500);
+    // Oldest and newest retained rows have no anchor on one side.
+    expect(match.checks).toHaveLength(4498);
+    expect(match.contentMatches.map(c => c.lineId)).toEqual([15501, 20000]);
     for (const check of match.checks) expect(rows[check.lineId - 1]).toEqual(retained[check.capturedRow]);
     console.log('NEWARCH_C_OVERFLOW', JSON.stringify({ denominator: rows.length, checked: match.checks.length, unchecked: rows.length - match.checks.length, reason: 'evicted-before-check', falseChecked: match.checks.filter(c => !equalHistoryRows(rows[c.lineId - 1]!, retained[c.capturedRow]!)).length, scope: 'fake scroll store; not real collector' }));
   });
@@ -730,25 +744,31 @@ describe('NEWARCH L2-C matcher and calibration ports', () => {
     await h.calibrator.runDue();
     expect(h.writes).toHaveLength(0);
     for (const event of ['clear', 'alt', 'resize', 'reconnect', 'fault'] as const) h.calibrator.event(event);
-    expect(h.history.map(r => r.lineId)).toEqual([1, 2, 3]);
+    expect(h.history.map(r => r.lineId)).toEqual([1, 2, 3, 4, 5]);
     expect(h.calibrator.acceptsPipeFrame).toBe(false);
   });
-  test('CAPTURE latch prevents parser overwrite, keeps scroll ingestion and returns only on equality', async () => {
+  test('FIX1-PLAN §1.2 a wrong parser screen is drawn over by the committed capture and the pipe stays live', async () => {
+    // Replaces the CAPTURE latch: pipe publishes were frozen for up to 1s
+    // while parser and capture differed (never blank the screen, §1.3).
     const h = naHarness();
     const wrong = structuredClone(h.frame); wrong.cells = [naRow('bad ').cells]; h.parser(wrong);
     await h.calibrator.runDue();
-    expect(h.calibrator.mode).toBe('CAPTURE');
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'quiescent', sourceEpoch: 1, geometryGeneration: 1, receiveSeqBefore: 0, receiveSeqAfter: 0, uncertainRows: [] });
+    expect(h.published).toEqual([2]);
+    expect(h.calibrator.mode).toBe('PIPE');
+    // Divergence re-arms 50ms: the next pipe byte redraws the parser cells.
+    expect(h.calibrator.dueAt).toBe(50);
     let pipePublishes = 0;
     h.calibrator.output(() => pipePublishes++); h.calibrator.scroll(20000);
+    h.time(16); await h.calibrator.runDue();
+    expect(pipePublishes).toBe(1);
     h.time(50); await h.calibrator.runDue();
     expect(h.limits).toEqual([4500, 0]);
-    expect(pipePublishes).toBe(0);
-    h.time(1051); await h.calibrator.runDue();
-    expect(h.faults).toContain('capture-latch-degraded');
-    h.parser(structuredClone(h.frame)); h.time(1101); await h.calibrator.runDue();
-    expect(h.calibrator.mode).toBe('PIPE');
-    h.calibrator.output(() => pipePublishes++); h.time(1117); await h.calibrator.runDue();
-    expect(pipePublishes).toBe(1);
+    expect(h.published).toEqual([2, 3]);
+    h.parser(structuredClone(h.frame)); h.time(100); await h.calibrator.runDue();
+    expect(h.published).toEqual([2, 3, 4]);
+    expect(h.calibrator.dueAt).toBe(300);
+    expect(h.faults).toEqual([]);
   });
   test('incremental capture reads new scrolls plus anchor, full only on lifecycle/fault', async () => {
     const h = naHarness(true);
@@ -869,11 +889,13 @@ function run(name: string, parser: L[], tmux: L[]) {
   const recent: HistoryRow[] = parser.map((l, i) => ({ ...cap(l), lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
   const captured = tmux.map(cap);
   const m = matchHistoryRows(recent, captured, scope);
-  let contentFalse = 0, identityFalse = 0, repairNotTmux = 0, repairWrongLine = 0, repairDestroysCorrect = 0;
+  let contentFalse = 0, identityFalse = 0, repairNotTmux = 0, repairWrongLine = 0, repairDestroysCorrect = 0, matchedContentFalse = 0;
   for (const c of m.checks) {
     if (rowKey(recent[c.lineId]!) !== rowKey(captured[c.capturedRow]!)) contentFalse++;
     if (parser[c.lineId]!.id !== tmux[c.capturedRow]!.id) identityFalse++;
   }
+  // FIX1-PLAN §2 content-matched rows claim content only (contentFalse).
+  for (const c of m.contentMatches) if (rowKey(recent[c.lineId]!) !== rowKey(captured[c.capturedRow]!)) matchedContentFalse++;
   for (const r of m.repairs) {
     if (rowKey(r.row) !== rowKey(captured[r.capturedRow]!)) repairNotTmux++;
     if (parser[r.lineId]!.id !== tmux[r.capturedRow]!.id) repairWrongLine++;
@@ -888,7 +910,7 @@ function run(name: string, parser: L[], tmux: L[]) {
   const lostIds: number[] = []; for (const [id] of cb) if (id >= 0 && !ca.has(id)) { lostByRepair++; lostIds.push(id); }
   if (lostIds.length && (globalThis as any).dumped !== true && name.startsWith('fuzz')) { (globalThis as any).dumped = true; const ringStart = tmux[0]!.id; console.log('LOSS-DUMP', JSON.stringify({ name, lostIds: lostIds.slice(0,10), ringIds: [tmux[0]!.id, tmux.at(-1)!.id], repairsOnLost: m.repairs.filter(r => lostIds.includes(parser[r.lineId]!.id)).slice(0,5).map(r => ({ lineId: r.lineId, parserId: parser[r.lineId]!.id, parserText: parser[r.lineId]!.text, parserFg: parser[r.lineId]!.fg, tmuxId: tmux[r.capturedRow]!.id, tmuxText: tmux[r.capturedRow]!.text })) })); }
   for (const [id, n] of ca) if (n > 1 && n > (cb.get(id) ?? 0)) dupByRepair++;
-  return { lostByRepair, dupByRepair, name, reason: m.reason, checks: m.checks.length, repairs: m.repairs.length, contentFalse, identityFalse, repairNotTmux, repairWrongLine, repairDestroysCorrect };
+  return { lostByRepair, dupByRepair, name, reason: m.reason, checks: m.checks.length, contentMatches: m.contentMatches.length, matchedContentFalse, repairs: m.repairs.length, contentFalse, identityFalse, repairNotTmux, repairWrongLine, repairDestroysCorrect };
 }
 const stream = (n: number, vocab: number, start = 0) => Array.from({ length: n }, (_, i) => ({ id: start + i, text: vocab ? `v${Math.floor(rnd() * vocab)}` : `row-${start + i}` }));
 const out: any[] = [];
@@ -914,7 +936,7 @@ const out: any[] = [];
   const t: L[] = [s[0]!, s[1]!, s[2]!, s[4]!, s[5]!, { id: 99, text: 'R' }, s[6]!, s[7]!, s[8]!];
   out.push(run('equal-length-shift-in-gap', s, t)); }
 // 7 randomized fuzz: small vocab, random drops/dups/phantoms/colour edits, ring truncation
-const agg = { lostByRepair: 0, dupByRepair: 0, lossCases: [] as any[], cases: 0, checks: 0, repairs: 0, contentFalse: 0, identityFalse: 0, repairNotTmux: 0, repairWrongLine: 0, repairDestroysCorrect: 0, destroyCases: [] as any[], identityFalseCases: [] as any[] };
+const agg = { contentMatches: 0, matchedContentFalse: 0, lostByRepair: 0, dupByRepair: 0, lossCases: [] as any[], cases: 0, checks: 0, repairs: 0, contentFalse: 0, identityFalse: 0, repairNotTmux: 0, repairWrongLine: 0, repairDestroysCorrect: 0, destroyCases: [] as any[], identityFalseCases: [] as any[] };
 for (let k = 0; k < 3000; k++) {
   const vocab = [0, 2, 3, 5, 20][k % 5]!;
   const truth = stream(40 + Math.floor(rnd() * 200), vocab);
@@ -930,12 +952,17 @@ for (let k = 0; k < 3000; k++) {
   }
   const behind = Math.floor(rnd() * 3);
   const res = run(`fuzz-${k}`, parser, ring.slice(0, ring.length - behind || undefined));
+  agg.contentMatches += res.contentMatches; agg.matchedContentFalse += res.matchedContentFalse;
   agg.cases++; agg.checks += res.checks; agg.repairs += res.repairs; agg.contentFalse += res.contentFalse; agg.identityFalse += res.identityFalse; agg.lostByRepair += res.lostByRepair; agg.dupByRepair += res.dupByRepair; if ((res.lostByRepair||res.dupByRepair) && agg.lossCases.length < 3) agg.lossCases.push({k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res}); agg.repairNotTmux += res.repairNotTmux; agg.repairWrongLine += res.repairWrongLine; agg.repairDestroysCorrect += res.repairDestroysCorrect; if (res.repairDestroysCorrect && agg.destroyCases.length < 5) agg.destroyCases.push({ k, vocab, ...res });
   if (res.identityFalse && agg.identityFalseCases.length < 5) agg.identityFalseCases.push({ k, vocab, parser: parser.map(l=>l.text+'#'+l.id).join(' '), tmux: ring.slice(0, ring.length - behind || undefined).map(l=>l.text+'#'+l.id).join(' '), ...res });
 }
-for (const o of out) { expect(o.contentFalse).toBe(0); expect(o.repairNotTmux).toBe(0); }
-console.log('NEWARCH_FIX1_FUZZ', JSON.stringify({ cases: agg.cases, checks: agg.checks, falseChecked: agg.contentFalse, repairs: agg.repairs, repairNotTmux: agg.repairNotTmux, identityFalse: agg.identityFalse }));
+for (const o of out) { expect(o.contentFalse).toBe(0); expect(o.repairNotTmux).toBe(0); expect(o.identityFalse).toBe(0); expect(o.matchedContentFalse).toBe(0); }
+console.log('NEWARCH_FIX1_FUZZ', JSON.stringify({ cases: agg.cases, checks: agg.checks, falseChecked: agg.contentFalse, repairs: agg.repairs, repairNotTmux: agg.repairNotTmux, identityFalse: agg.identityFalse, contentMatches: agg.contentMatches, matchedContentFalse: agg.matchedContentFalse, identityFalseCases: agg.identityFalseCases.slice(0, 2) }));
 expect(agg.cases).toBe(3000); expect(agg.checks).toBeGreaterThan(0); expect(agg.contentFalse).toBe(0); expect(agg.repairNotTmux).toBe(0);
+// C-F20 / A-B3 (FIX1-PLAN §2): D16 identityFalse = 0 on checked rows. Round 1
+// certified 832 identity-false rows here while every one was content-equal.
+expect(agg.identityFalse).toBe(0);
+expect(agg.contentMatches).toBeGreaterThan(0); expect(agg.matchedContentFalse).toBe(0);
 });
 
 test('FIX1 full matcher p95 at 4500 rows, independent cells and collision buckets', async () => {
@@ -950,8 +977,11 @@ test('FIX1 full matcher p95 at 4500 rows, independent cells and collision bucket
       const started = performance.now();
       const result = matchHistoryRows(recent, captured, naScope);
       times.push(performance.now() - started);
-      expect(result.checks).toHaveLength(4499);
-      expect(result.repairs).toHaveLength(1);
+      // FIX1-PLAN §2: the first/last ring rows and the drift's neighbours lack
+      // an anchor on one side; they are content-matched, not checked.
+      expect(result.checks).toHaveLength(4495);
+      expect(result.contentMatches.map(c => c.lineId)).toEqual([1, 2200, 2202, 4500]);
+      expect(result.repairs).toHaveLength(0);
     }
     times.sort((a, b) => a - b);
     console.log('NEWARCH_FIX1_MATCHER', JSON.stringify({ cols, rows: 4500, samples: times.length, p95: times[28], max: times[29], cadenceMs: 200, driftedRows: 1 }));
@@ -960,12 +990,12 @@ test('FIX1 full matcher p95 at 4500 rows, independent cells and collision bucket
     captured[2200]!.cells[cols - 1]!.fg = 'index:9';
     const result = matchHistoryRows(recent, captured, naScope);
     expect(result.checks.some(c => c.lineId === 2201)).toBe(false);
-    expect(result.repairs.some(c => c.lineId === 2201)).toBe(true);
+    expect(result.repairs).toHaveLength(0);
     // Two drifts force the general interning path, not the single-row fast path.
     captured[2202]!.cells[cols - 1]!.fg = 'index:8';
     const general = matchHistoryRows(recent, captured, naScope);
     expect(general.checks.some(c => c.lineId === 2201 || c.lineId === 2203)).toBe(false);
-    expect(general.repairs.map(r => r.lineId)).toEqual([2201, 2203]);
+    expect(general.repairs).toHaveLength(0);
   }
 });
 
@@ -978,7 +1008,8 @@ test('FIX1 incremental checked coverage and fail-closed anchor loss', () => {
   const checked = new Set<number>();
   for (let end = 4520; end <= 7500; end += 20) {
     recent = all.slice(end - 4500, end);
-    const captured = recent.slice(-23);
+    // The calibrator's partial tail is scrolls + 128 rows.
+    const captured = recent.slice(-(20 + 128));
     const result = matcher.match(recent, captured, { ...naScope, completeRetainedTail: false });
     for (const c of result.checks) {
       expect(equalHistoryRows(all[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
@@ -987,7 +1018,9 @@ test('FIX1 incremental checked coverage and fail-closed anchor loss', () => {
     matcher.remember(recent, captured, result);
   }
   console.log('NEWARCH_FIX1_INCREMENTAL', JSON.stringify({ scrolled: 3000, checked: checked.size, ratio: checked.size / 3000 }));
-  expect(checked.size).toBe(3000);
+  // The newest row (7500) has no anchor below it yet: content-matched only.
+  expect(checked.size).toBe(2999);
+  expect(checked.has(7500)).toBe(false);
   matcher.reset();
   expect(matcher.match(recent, recent.slice(-23), { ...naScope, completeRetainedTail: false }).checks).toHaveLength(0);
 });
@@ -1093,7 +1126,8 @@ test('FIX1 partial capture certifies separate exact runs around an unchecked cha
   const result = matcher.match(rows, captured, { ...naScope, completeRetainedTail: false });
   expect(result.reason).toBe('matched'); expect(result.repairs).toHaveLength(0);
   expect(result.checks.some(c => c.lineId === 86)).toBe(false);
-  expect(result.checks.some(c => c.lineId === 100)).toBe(true);
+  expect(result.checks.some(c => c.lineId === 99)).toBe(true);
+  expect(result.contentMatches.map(c => c.lineId)).toContain(100);
   for (const c of result.checks) expect(equalHistoryRows(rows[c.lineId - 1]!, captured[c.capturedRow]!)).toBe(true);
 });
 
@@ -1109,13 +1143,15 @@ test('FIX2 remember seeds the terminal triple after a general full match', () =>
   const matcher = new IncrementalHistoryMatcher();
   const full = matcher.match(recent, captured, naScope);
   expect(full.reason).toBe('matched');
-  expect(Math.max(...full.checks.slice(-3).map(c => c.lineId))).toBeLessThan(4500);
+  // Checks are ordered by row; the newest row has no anchor below it.
+  expect(full.checks.every((c, k) => k === 0 || full.checks[k - 1]!.capturedRow < c.capturedRow)).toBe(true);
+  expect(full.checks.at(-1)!.lineId).toBe(4499);
   matcher.remember(recent, captured, full);
   recent = all.slice(200, 4700);
   const tail = recent.slice(-(200 + 16));
   const next = matcher.match(recent, tail, { ...naScope, completeRetainedTail: false });
   expect(next.reason).toBe('matched');
-  expect(next.checks.at(-1)!.lineId).toBe(4700);
+  expect(next.checks.at(-1)!.lineId).toBe(4699);
   for (const c of next.checks) expect(equalHistoryRows(all[c.lineId - 1]!, tail[c.capturedRow]!)).toBe(true);
 });
 
@@ -1135,7 +1171,7 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
   let now = 0, revision = 1, produced = 0, applied = 0, inFlight = false;
   const tmuxRing: number[] = [], parser: Array<{ id: number; lineId: number }> = [], producedAt: number[] = [];
   let pending: { at: number; resolve: (c: CalibrationCapture) => void; value: CalibrationCapture; snap: number[] } | undefined;
-  const st = { checks: 0, checksWhileFlowing: 0, falseChecked: 0, identityFalse: 0, commits: 0, staleRevision: 0, limits: [] as number[], verified: new Set<number>() };
+  const st = { checks: 0, checksWhileFlowing: 0, falseChecked: 0, identityFalse: 0, contentMatches: 0, contentFalse: 0, commits: 0, staleRevision: 0, limits: [] as number[], verified: new Set<number>(), contentVerified: new Set<number>() };
   const end = o.seconds * 1000;
   const ports: CalibrationPorts = {
     now: () => now, schedule: () => {},
@@ -1158,6 +1194,12 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
         if (!equalHistoryRows(rowOf(text(id)), rowOf(text(tmuxId)))) st.falseChecked++;
         if (id !== tmuxId) st.identityFalse++; else st.verified.add(id);
       }
+      // FIX1-PLAN §2 content-matched rows: content is the only claim.
+      for (const c of input.contentMatches) {
+        const id = byLine.get(c.lineId)!, tmuxId = snap[c.capturedRow]!;
+        st.contentMatches++;
+        if (!equalHistoryRows(rowOf(text(id)), rowOf(text(tmuxId)))) st.contentFalse++; else st.contentVerified.add(id);
+      }
       st.commits++; return { revision: ++revision, durableRevision: 0, nextLineId: parser.length };
     },
     publish: () => {}, fault: () => {},
@@ -1177,9 +1219,15 @@ async function debtFlow(o: { incremental: boolean; seconds: number; rate: number
   }
   // Coverage over every produced row except the final 128 still in overlap.
   const eligible = Math.max(0, produced - 128);
-  let covered = 0; for (let id = 0; id < eligible; id++) if (st.verified.has(id)) covered++;
-  return { produced, coverage: eligible ? covered / eligible : 0, checks: st.checks, checksWhileFlowing: st.checksWhileFlowing, falseChecked: st.falseChecked,
-    identityFalse: st.identityFalse, commits: st.commits, staleRevision: st.staleRevision, fullCaptures: st.limits.filter(l => l === 4500).length, screenOnly: st.limits.filter(l => l === 0).length, captures: st.limits.length };
+  // coverage = checked or content-matched (history shown complete, §2.3);
+  // checkedCoverage = rows carrying an identity claim.
+  let covered = 0, checkedCovered = 0;
+  for (let id = 0; id < eligible; id++) {
+    if (st.verified.has(id)) checkedCovered++;
+    if (st.verified.has(id) || st.contentVerified.has(id)) covered++;
+  }
+  return { produced, coverage: eligible ? covered / eligible : 0, checkedCoverage: eligible ? checkedCovered / eligible : 0, checks: st.checks, checksWhileFlowing: st.checksWhileFlowing, falseChecked: st.falseChecked,
+    identityFalse: st.identityFalse, contentMatches: st.contentMatches, contentFalse: st.contentFalse, commits: st.commits, staleRevision: st.staleRevision, fullCaptures: st.limits.filter(l => l === 4500).length, screenOnly: st.limits.filter(l => l === 0).length, captures: st.limits.length };
 }
 
 test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser ahead of the capture', async () => {
@@ -1193,6 +1241,9 @@ test('DEBT 1 calibrator checks while output flows at 100 rows/s with the parser 
       expect(r.coverage).toBeGreaterThanOrEqual(0.99);
       expect(r.falseChecked).toBe(0);
       expect(r.identityFalse).toBe(0);
+      expect(r.contentFalse).toBe(0);
+      // Unique rows: every eligible row carries an identity claim.
+      expect(r.checkedCoverage).toBeGreaterThanOrEqual(0.99);
       // agy round 1: the CAS revision is the post-capture one, so revision
       // bumps during capture never starve the commit.
       expect(r.staleRevision).toBe(0);
@@ -1221,22 +1272,31 @@ test('DEBT 1 periodic output after the fence never pairs a row with an older cop
   // an exact older copy in tmux; the fence plus tail bound must not use it.
   const r = await debtFlow({ incremental: false, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, text: i => `file-line-${i % 3000}` });
   console.log('NEWARCH_DEBT1_PERIODIC', JSON.stringify(r));
-  expect(r.identityFalse).toBe(0); expect(r.falseChecked).toBe(0);
+  expect(r.identityFalse).toBe(0); expect(r.falseChecked).toBe(0); expect(r.contentFalse).toBe(0);
+  // Repeated text is content-matched, not checked (FIX1-PLAN §2): shown
+  // complete, without claiming which copy it is.
   expect(r.coverage).toBeGreaterThanOrEqual(0.99);
+  expect(r.checkedCoverage).toBeLessThan(r.coverage);
+  // FIX2 m5 floor: coverage alone stays 1 if the matcher stops checking.
+  // Measured 4500/5872 = 0.76635 in both round-1 runs (fake clock, one
+  // input, so deterministic): rows are checked until their text repeats
+  // (row 3000 onwards has an older copy in the 4500-row ring). 0.75 leaves
+  // ~95 rows of slack for scheduling changes, not for a matcher that stops.
+  expect(r.checkedCoverage).toBeGreaterThanOrEqual(0.75);
 });
 
 test('DEBT 2 a screen-only capture does not erase the incremental seed', async () => {
   const r = await debtFlow({ incremental: true, seconds: 60, rate: 100, lagMs: 5, captureMs: 40, wrongScreen: true });
   console.log('NEWARCH_DEBT2_CAPTURE_MODE', JSON.stringify(r));
-  // CAPTURE mode puts screen-only captures between the history captures.
+  // A diverged screen re-arms 50ms: screen-only captures between history ones.
   expect(r.screenOnly).toBeGreaterThan(300);
   // Seed survives them: only the birth capture (and the first no-history
   // capture after it) is full; round 2 alternated full/partial ~300 times.
   expect(r.fullCaptures).toBeLessThanOrEqual(3);
   expect(r.coverage).toBeGreaterThanOrEqual(0.99);
   // Direct: history (full) -> screen-only -> incremental history still matched.
-  // A wrong parser screen latches CAPTURE mode and re-arms the lane 50ms
-  // later, before the 200ms history interval: that capture has no history.
+  // A wrong parser screen re-arms the lane 50ms later, before the 200ms
+  // history interval: that capture has no history.
   const all = naRows(Array.from({ length: 400 }, (_, i) => `line-${i}`));
   let recent = all.slice(0, 300), time = 0, revision = 1;
   const tails: number[] = [], checks: number[] = [];
@@ -1257,7 +1317,7 @@ test('DEBT 2 a screen-only capture does not erase the incremental seed', async (
   }, { incremental: true });
   await calibrator.runDue();
   expect(calibrator.dueAt).toBe(50);
-  expect(calibrator.mode).toBe('CAPTURE');
+  expect(calibrator.mode).toBe('PIPE');
   parserFrame = frame;
   time = 50; await calibrator.runDue();
   expect(tails).toEqual([4500, 0]);
@@ -1265,8 +1325,9 @@ test('DEBT 2 a screen-only capture does not erase the incremental seed', async (
   recent = all.slice(0, 320); calibrator.scroll(20);
   time = 250; await calibrator.runDue();
   // Round 2: the empty screen-only match erased the seed -> partial-tail, 0 checks, then full.
+  // 148 captured rows: the oldest and newest have no anchor on one side.
   expect(tails).toEqual([4500, 0, 148]);
-  expect(checks.at(-1)).toBe(148);
+  expect(checks.at(-1)).toBe(146);
 });
 
 test('DEBT 3 a failed capture keeps the incremental seed instead of forcing a full capture', async () => {
@@ -1297,7 +1358,7 @@ test('DEBT 3 a failed capture keeps the incremental seed instead of forcing a fu
   expect(calibrator.dueAt).toBe(250);
   time = 250; await calibrator.runDue();
   expect(tails).toEqual([4500, 148, 148]);
-  expect(checks.at(-1)).toBe(148);
+  expect(checks.at(-1)).toBe(146);
 });
 
 test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full', async () => {
@@ -1308,11 +1369,11 @@ test('DEBT 4/6 far anchor is refused and no-anchor forces the next capture full'
   const pre = [...Array.from({ length: 300 }, (_, k) => naRow(`pre-${k}`)), ...Array.from({ length: 200 }, (_, k) => plain(k))];
   const post = [...Array.from({ length: 500 }, (_, k) => naRow(`post-${k}`)), ...Array.from({ length: 200 }, (_, k) => red(k))];
   const parser = [...post.slice(0, 500), ...Array.from({ length: 200 }, (_, k) => plain(k))].map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 }));
-  expect(matchHistoryRows(parser, [...pre, ...post], naScope).checks).toHaveLength(200); // unbounded: wrong 200
+  expect(matchHistoryRows(parser, [...pre, ...post], naScope).checks).toHaveLength(198); // unbounded: wrong 198 (200 minus the unanchored ends)
   const bounded = matchHistoryRows(parser, [...pre, ...post], { ...naScope, maxTailGap: 256 });
   expect(bounded.reason).toBe('no-anchor'); expect(bounded.checks).toHaveLength(0);
   // The correct print is still accepted with the same bound.
-  expect(matchHistoryRows(post.map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 })), [...pre, ...post], { ...naScope, maxTailGap: 256 }).checks).toHaveLength(700);
+  expect(matchHistoryRows(post.map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 1 })), [...pre, ...post], { ...naScope, maxTailGap: 256 }).checks).toHaveLength(698);
   // Item 6: an incremental calibrator whose full capture finds no anchor
   // requests a full capture next time instead of an unseeded partial one.
   const h = naHarness(true);
@@ -1677,4 +1738,327 @@ test('DEBT2 source reset across the fence discards capture then resumes in the n
   expect(h.writes).toHaveLength(1);
   expect(h.writes[0]!.checks).toHaveLength(3);
   expect(h.limits).toEqual([4500, 4500]);
+});
+
+
+test('I3 PROBE compensated insert/delete exposes hidden identity uncertainty in 3000 cases', () => {
+  let falseIdentity = 0;
+  for (let n = 0; n < 3000; n++) {
+    const text = ['A1', 'A2', 'A3', 'P', 'Q', 'Q', 'B1', 'B2', 'B3'].map(s => `${n}:${s}`);
+    const hidden = [0, 1, 2, 4, 5, 99, 6, 7, 8];
+    const captured = hidden.map(id => naRow(id === 99 ? `${n}:R` : text[id]!));
+    const result = matchHistoryRows(naRows(text), captured, naScope);
+    falseIdentity += result.checks.filter(c => c.lineId - 1 !== hidden[c.capturedRow]).length;
+    falseIdentity += result.repairs.filter(c => c.lineId - 1 !== hidden[c.capturedRow]).length;
+  }
+  console.log('I3_PROBE_IDENTITY', JSON.stringify({ cases: 3000, falseIdentity, verdict: 'content anchors do not prove row identity' }));
+  expect(falseIdentity).toBe(0);
+});
+
+test('I3 PROBE private tmux identical snapshots hide split ESC and UTF8 parser state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'i3-fence-'));
+  const socket = join(root, 'x.sock');
+  const env = { ...process.env }; delete env.TMUX; delete env.TMUX_PANE;
+  const tmux = (...args: string[]) => {
+    const result = spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env });
+    expect(result.status).toBe(0); return result.stdout;
+  };
+  const script = join(root, 'producer.py');
+  writeFileSync(script, `import os,time,pathlib
+r=pathlib.Path(${JSON.stringify(root)})
+def phase(n,b):
+ while not (r/str(n)).exists(): time.sleep(.005)
+ os.write(1,b)
+ (r/(str(n)+'done')).touch()
+phase(1,b'X')
+phase(2,bytes([27,91]))
+phase(3,b'31m')
+phase(4,bytes([0xe4,0xbd]))
+phase(5,bytes([0xa0]))
+time.sleep(30)
+`);
+  try {
+    const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-x', '80', '-y', '24', `python3 '${script}'`).trim();
+    const captures: string[] = [];
+    for (let phase = 1; phase <= 5; phase++) {
+      writeFileSync(join(root, String(phase)), '');
+      await eventually(() => existsSync(join(root, `${phase}done`)), 'producer phase');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      captures.push(tmux('capture-pane', '-p', '-e', '-t', pane));
+    }
+    expect(captures[1]).toBe(captures[0]);
+    expect(captures[2]).toBe(captures[0]);
+    expect(captures[3]).toBe(captures[0]);
+    expect(captures[4]).toContain('你');
+    console.log('I3_PROBE_FENCE', JSON.stringify({ phases: 5, indistinguishableStates: 4, byteFence: false, socket: 'private' }));
+  } finally {
+    spawnSync('tmux', ['-S', socket, 'kill-server'], { env });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('I3 injected timeout cancels at exactly 1s and late capture never commits', async () => {
+  const h = naHarness();
+  let deadline = Infinity, fire: (() => void) | undefined, cancelled = 0, aborted = false;
+  let complete!: (capture: CalibrationCapture) => void;
+  const original = await h.ports.capture(h.calibrator.paneKey, 4500);
+  h.ports.timeout = (callback, delay) => {
+    deadline = delay; fire = callback;
+    return () => { cancelled++; fire = undefined; };
+  };
+  h.ports.capture = (_, __, signal) => new Promise(resolve => {
+    complete = resolve;
+    signal!.addEventListener('abort', () => { aborted = true; });
+  });
+  const running = h.calibrator.runDue();
+  expect(deadline).toBe(1000);
+  h.time(999); expect(aborted).toBe(false); expect(h.writes).toHaveLength(0);
+  h.time(1000); fire!(); await running;
+  expect(aborted).toBe(true); expect(cancelled).toBe(1);
+  complete(original); await Promise.resolve();
+  expect(h.writes).toHaveLength(0); expect(h.published).toHaveLength(0);
+  expect(h.faults).toEqual(['capture-fault']);
+  h.ports.capture = async () => original;
+  h.time(1050); await h.calibrator.runDue();
+  expect(cancelled).toBe(2); expect(fire).toBeUndefined();
+  expect(h.writes).toHaveLength(1);
+});
+
+test('I3 resize resets image comparison without suppressing dead-reader or heartbeat faults', () => {
+  let now = 0; const faults: string[] = [];
+  const wd = new HistoryWatchdog(() => now, issue => faults.push(issue.kind));
+  const before = { sourceEpoch: 1, geometryGeneration: 1, kind: 'normal' as const };
+  const after = { ...before, geometryGeneration: 2 };
+  wd.capture('old', before);
+  now = 100; wd.capture('reflow', after);
+  now = 1100; wd.tick(); expect(faults).toEqual([]);
+  wd.capture('new output with reader dead', after);
+  now = 2100; wd.tick(); expect(faults).toEqual(['reader-stalled']);
+  wd.dead('reader-dead'); expect(faults).toContain('reader-dead');
+  now = 3100; wd.capture('another reflow', { ...after, geometryGeneration: 3 }); wd.tick();
+  expect(faults).toContain('heartbeat-timeout');
+  wd.receive(1); wd.heartbeat();
+  wd.capture('post-recovery', { ...after, geometryGeneration: 3 });
+  now = 3200; wd.capture('stalled again', { ...after, geometryGeneration: 3 });
+  now = 4200; wd.tick();
+  expect(faults.filter(kind => kind === 'reader-stalled')).toHaveLength(2);
+});
+
+test('I3 20k and 200k backlog cannot certify an evicted pre-capture fence', () => {
+  for (const burst of [20000, 200000]) {
+    const retained = naRows(Array.from({ length: 4500 }, (_, i) => `new-${burst - 4500 + i}`));
+    const old = naRows(['old-a', 'old-b', 'old-c']);
+    const result = matchHistoryRows(old, retained, { ...naScope, maxTailGap: 0 });
+    expect(result.checks).toHaveLength(0); expect(result.repairs).toHaveLength(0);
+    expect(old.map(row => row.lineId)).toEqual([1, 2, 3]);
+    console.log('I3_BACKLOG', JSON.stringify({ burst, retained: retained.length, checked: result.checks.length, reason: result.reason, scope: 'matcher fixture, not pipe-loss proof' }));
+  }
+});
+
+test('I3 real reflow 80 to 37 and 37 to 120 does not certify across geometry', async () => {
+  for (const [cols, next] of [[80, 37], [37, 120]] as const) {
+    const result = await runScenario(`I3-reflow-${cols}-${next}`, 'reflow-before', {
+      cols, rows: 24, historyLimit: 4500,
+      seed: Array.from({ length: 100 }, (_, i) => `row-${i}-` + 'long-line-'.repeat(20)),
+      resizeTo: [next, 24],
+    });
+    console.log('I3_REFLOW', JSON.stringify(result));
+    expect(result.contentFalse).toBe(0);
+    expect(result.repairs).toBe(0);
+    expect(result.checks).toBe(0);
+  }
+}, 15000);
+
+test('I3 mutation controls: timeout abort and resize comparison guards fail independently', () => {
+  const root = mkdtempSync(join(tmpdir(), 'i3-mutation-'));
+  const cases = [
+    {
+      name: 'timeout-abort', file: 'history-calibrator.ts', from: 'controller.abort();', to: '',
+      body: `const {HistoryCalibrator}=await import('./subject.ts');
+let fire, signal;
+const c=new HistoryCalibrator({serverIdentity:'fixture',paneId:'%0',birthGeneration:1}, {
+ now:()=>0,schedule:()=>{},read:()=>({}),
+ timeout:(f)=>{fire=f;return ()=>{}},
+ capture:(_,__,s)=>{signal=s;return new Promise(()=>{})},fault:()=>{},
+ calibrate:()=>{throw Error('unexpected commit')},publish:()=>{throw Error('unexpected publish')}
+});
+const running=c.runDue();fire();await running;
+assert.equal(signal.aborted,true,'MUTATION timeout abort');`,
+    },
+    {
+      name: 'resize-comparison', file: 'history-watchdog.ts', from: 'this.image = undefined;', to: '',
+      body: `const {HistoryWatchdog}=await import('./subject.ts');
+let now=0;const faults=[];const wd=new HistoryWatchdog(()=>now,f=>faults.push(f.kind));
+wd.capture('old',{sourceEpoch:1,geometryGeneration:1,kind:'normal'});
+now=100;wd.capture('reflow',{sourceEpoch:1,geometryGeneration:2,kind:'normal'});
+now=1100;wd.tick();assert.deepEqual(faults,[],'MUTATION resize comparison');`,
+    },
+  ];
+  try {
+    writeFileSync(join(root, 'history-row-matcher.ts'), readFileSync(new URL('../src/history-row-matcher.ts', import.meta.url)));
+    for (const item of cases) {
+      const original = readFileSync(new URL(`../src/${item.file}`, import.meta.url), 'utf8');
+      expect(original.split(item.from)).toHaveLength(2);
+      writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';\n${item.body}`);
+      for (const mutated of [false, true]) {
+        writeFileSync(join(root, 'subject.ts'), mutated ? original.replace(item.from, item.to) : original);
+        const result = spawnSync(process.execPath, [join(root, 'runner.ts')], { encoding: 'utf8', timeout: 10000 });
+        console.log('I3_MUTATION', JSON.stringify({ name: item.name, mutated, exit: result.status, stderr: result.stderr }));
+        expect(result.status).toBe(mutated ? 1 : 0);
+        if (mutated) expect(result.stderr).toContain('MUTATION');
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+describe('FIX1 I3 last-screen contract (FIX1-PLAN §1) and row identity (§2)', () => {
+  test('A-M4 / C-F19 a capture frame receiveSeq is never a fence: a quiescent capture is committed with evidence, then published', async () => {
+    const h = naHarness();
+    // tmux capture-pane has no byte position; any value here must be ignored.
+    const capture = h.ports.capture;
+    h.ports.capture = async (...args) => ({ ...(await capture(...args)), frame: { ...h.frame, receiveSeq: 987654 } });
+    let publishedFrame: CalibrationFrame | undefined;
+    h.ports.publish = (commit, frame) => { h.published.push(commit.revision); publishedFrame = frame; };
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'quiescent', sourceEpoch: 1, geometryGeneration: 1, receiveSeqBefore: 0, receiveSeqAfter: 0, uncertainRows: [] });
+    expect(h.published).toEqual([2]);
+    expect(equalCalibrationFrames(publishedFrame!, h.frame)).toBe(true);
+  });
+  test('C-F19 bytes received during the capture: history is committed without screen evidence and nothing is published', async () => {
+    const h = naHarness();
+    const capture = h.ports.capture;
+    h.ports.capture = async (...args) => {
+      const result = await capture(...args);
+      h.parser({ ...structuredClone(h.frame), receiveSeq: 7 }); // a pipe byte arrived meanwhile
+      return result;
+    };
+    let pipe = 0;
+    h.calibrator.output(() => pipe++);
+    await h.calibrator.runDue();
+    expect(h.writes).toHaveLength(1);
+    expect(h.writes[0]!.captureEvidence).toEqual({ kind: 'unfenced', reason: 'received-during-capture' });
+    expect(h.writes[0]!.checks.map(c => c.lineId)).toEqual([2, 3, 4]);
+    expect(h.published).toEqual([]);
+    // The queued pipe frame is not cancelled: the pipe owns the screen.
+    h.time(16); await h.calibrator.runDue();
+    expect(pipe).toBe(1);
+  });
+  test('C-F19 a byte after the commit supersedes the committed capture: no stale publish', async () => {
+    const h = naHarness();
+    const calibrate = h.ports.calibrate;
+    h.ports.calibrate = async input => {
+      const commit = await calibrate(input);
+      h.parser({ ...structuredClone(h.frame), receiveSeq: 1 });
+      return commit;
+    };
+    await h.calibrator.runDue();
+    expect(h.writes[0]!.captureEvidence.kind).toBe('quiescent');
+    expect(h.published).toEqual([]);
+    expect(h.calibrator.acceptsPipeFrame).toBe(true);
+  });
+  test('C-F19 a CAS conflict publishes nothing even with quiescent evidence', async () => {
+    const h = naHarness(); h.conflict();
+    await h.calibrator.runDue();
+    expect(h.writes[0]!.captureEvidence.kind).toBe('quiescent');
+    expect(h.published).toEqual([]);
+  });
+  test('FIX2 B1 the evidence is the store port field for field: an I2-rule store draws the quiescent capture and never throws on an unfenced one', async () => {
+    // Store rule copied from lot I2 `sqlite-history/ram-store.ts` calibrate()
+    // at FIX2 4ea4fb585: `evidence?.kind==='quiescent'`, integer seqs, epoch and
+    // geometry equal to the capture, before === after, else 'capture-not-quiescent';
+    // uncertainRows deduped, sorted, each an integer row of the screen.
+    // Round 1 sent kind 'quiescent-capture' with one `receiveSeq`: this store
+    // skipped it silently and never drew the tmux screen.
+    const i2Store = (drawn: string[], commit: CalibrationPorts['calibrate']): CalibrationPorts['calibrate'] => async input => {
+      const evidence = input.captureEvidence, c = input.capture.after;
+      if (evidence?.kind === 'quiescent') {
+        if (!Number.isSafeInteger(evidence.receiveSeqBefore) || !Number.isSafeInteger(evidence.receiveSeqAfter)) throw new Error('invalid-integer');
+        if (evidence.sourceEpoch !== c.sourceEpoch || evidence.geometryGeneration !== c.geometryGeneration
+          || evidence.receiveSeqBefore !== evidence.receiveSeqAfter) throw new Error('capture-not-quiescent');
+        const uncertain = [...new Set(evidence.uncertainRows ?? [])].sort((a, b) => a - b);
+        if (uncertain.some(r => !Number.isSafeInteger(r) || r < 0 || r >= c.rows)) throw new Error('invalid-uncertain-rows');
+        drawn.push(`${input.capture.captureId} uncertain=${uncertain.join(',')}`);
+      }
+      return commit(input);
+    };
+    const quiet = naHarness(), drawn: string[] = [];
+    quiet.ports.calibrate = i2Store(drawn, quiet.ports.calibrate);
+    await quiet.calibrator.runDue();
+    expect(Object.keys(quiet.writes[0]!.captureEvidence).sort()).toEqual(['geometryGeneration', 'kind', 'receiveSeqAfter', 'receiveSeqBefore', 'sourceEpoch', 'uncertainRows']);
+    expect(drawn).toEqual(['capture-1 uncertain=']);
+    expect(quiet.published).toEqual([2]);
+    expect(quiet.faults).toEqual([]);
+    // Bytes during the capture: history still commits (checks reach the
+    // store), the screen is not drawn, and the store has nothing to reject.
+    const busy = naHarness(), busyDrawn: string[] = [];
+    const capture = busy.ports.capture;
+    busy.ports.capture = async (...args) => { const r = await capture(...args); busy.parser({ ...structuredClone(busy.frame), receiveSeq: 3 }); return r; };
+    busy.ports.calibrate = i2Store(busyDrawn, busy.ports.calibrate);
+    await busy.calibrator.runDue();
+    expect(busy.writes[0]!.captureEvidence).toEqual({ kind: 'unfenced', reason: 'received-during-capture' });
+    expect(busy.writes[0]!.checks.map(c => c.lineId)).toEqual([2, 3, 4]);
+    expect(busyDrawn).toEqual([]);
+    expect(busy.faults).toEqual([]);
+    expect(busy.published).toEqual([]);
+    // Emoji rows the decoder could not settle reach the store with the screen.
+    const emoji = naHarness(), emojiDrawn: string[] = [];
+    const plain = emoji.ports.capture;
+    emoji.ports.capture = async (...args) => ({ ...(await plain(...args)), uncertainScreenRows: [0] });
+    emoji.ports.calibrate = i2Store(emojiDrawn, emoji.ports.calibrate);
+    await emoji.calibrator.runDue();
+    expect(emojiDrawn).toEqual(['capture-1 uncertain=0']);
+    expect(emoji.faults).toEqual([]);
+  });
+  test('A-M3 uncertain captured rows are never checked or content-matched, and screen uncertainty reaches the evidence', async () => {
+    const rows = naRows(Array.from({ length: 12 }, (_, i) => `row-${i}`));
+    const captured = rows.map(r => ({ softWrap: r.softWrap, cells: r.cells }));
+    const plain = matchHistoryRows(rows, captured, naScope);
+    expect(plain.checks.map(c => c.capturedRow)).toContain(6);
+    const isolated = matchHistoryRows(rows, captured, { ...naScope, uncertainCapturedRows: new Set([6]) });
+    expect([...isolated.checks, ...isolated.contentMatches].some(c => c.capturedRow === 6)).toBe(false);
+    for (const c of isolated.checks) expect(Math.abs(c.capturedRow - 6)).toBeGreaterThan(1);
+    const h = naHarness();
+    const capture = h.ports.capture;
+    h.ports.capture = async (...args) => ({ ...(await capture(...args)), uncertainScreenRows: [0], uncertainHistoryRows: [2] });
+    await h.calibrator.runDue();
+    expect(h.writes[0]!.captureEvidence).toMatchObject({ kind: 'quiescent', uncertainRows: [0] });
+    expect([...h.writes[0]!.checks, ...h.writes[0]!.contentMatches].some(c => c.capturedRow === 2)).toBe(false);
+    expect(h.published).toEqual([2]);
+  });
+  test('C-F20 a duplicated row inside identical text and an isolated coincidental anchor are content-matched, never checked', () => {
+    // Hidden identities: parser duplicated #83 inside a run of v13 (round 1
+    // certified the shifted copy as checked).
+    // Fuzz case k=59 of the reviewer corpus, reduced.
+    const parser = ['v5', 'v18', 'v5', 'v11', 'v13', 'v13', 'v13', 'v13', 'v5', 'v5', 'v13', 'v4'];
+    const parserIds = [79, 80, 81, 82, 83, 83, 84, 85, 86, 87, 88, 89];
+    const tmux = ['v5', 'v18', 'v5', 'v11', 'v13', 'v13', 'v13', 'v5', 'v5', 'v13', 'v4'];
+    const tmuxIds = [79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89];
+    const recent = naRows(parser);
+    const m = matchHistoryRows(recent, tmux.map(naRow), naScope);
+    expect(m.checks.length).toBeGreaterThan(0);
+    for (const c of m.checks) expect(parserIds[c.lineId - 1]).toBe(tmuxIds[c.capturedRow]);
+    // The run of v13 (parser rows 6..8) is content-matched: equal text,
+    // identity unproven. Round 1 checked the shifted copy.
+    expect(m.checks.some(c => c.lineId >= 5 && c.lineId <= 8)).toBe(false);
+    expect(m.contentMatches.filter(c => c.lineId >= 6 && c.lineId <= 8)).toHaveLength(3);
+    for (const c of [...m.checks, ...m.contentMatches]) expect(rowKey(recent[c.lineId - 1]!)).toBe(rowKey(naRow(tmux[c.capturedRow]!)));
+    // Isolated coincidence (fuzz k=203): the parser's newest rows match an
+    // older print once; a single anchor cannot certify the wrong offset.
+    const olderPrint = matchHistoryRows(naRows(['v3', 'v4', 'v0', 'v1', 'v4']), ['v1', 'v2', 'v4', 'v0', 'v0', 'v1', 'v4', 'v1', 'v2', 'v4', 'v0', 'v2', 'v3'].map(naRow), naScope);
+    expect(olderPrint.checks).toHaveLength(0);
+  });
+  test('C-F22 a capture without context keeps the previous context and still detects a stalled reader', () => {
+    let at = 0; const faults: string[] = [];
+    const wd = new HistoryWatchdog(() => at, f => faults.push(f.kind));
+    wd.capture('a', { sourceEpoch: 1, geometryGeneration: 1, kind: 'normal' });
+    wd.capture('b');
+    at = 1000; wd.tick();
+    expect(faults).toEqual(['reader-stalled']);
+    // A real context change still resets the comparison.
+    wd.receive(1);
+    wd.capture('c', { sourceEpoch: 2, geometryGeneration: 1, kind: 'normal' }); wd.capture('d', { sourceEpoch: 3, geometryGeneration: 1, kind: 'normal' });
+    at = 3000; wd.heartbeat(); wd.tick();
+    expect(faults).toEqual(['reader-stalled']);
+  });
 });

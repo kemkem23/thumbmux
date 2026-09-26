@@ -25,10 +25,23 @@ export function rowKey(row: CapturedRow): string {
   return JSON.stringify([row.softWrap, row.cells.map(cellKey)]);
 }
 export interface RowMatch {
+  /** Rows inside a triple that is unique and aligned in both the parser ring
+   * and the capture. Only these carry an identity claim (D16 identityFalse). */
   checks: Array<{ lineId: number; capturedRow: number }>;
+  /** Rows whose cells equal the aligned capture row but that no unique triple
+   * covers (blank runs, repeated prompts). Content is proven, hidden identity
+   * is not: FIX1-PLAN §2 `content-matched`, measured by contentFalse only. */
+  contentMatches: Array<{ lineId: number; capturedRow: number }>;
   repairs: Array<{ lineId: number; capturedRow: number; row: CapturedRow }>;
   reason: 'matched' | 'ambiguous' | 'partial-tail' | 'generation' | 'no-anchor';
 }
+export type MatchScope = {
+  sourceEpoch: number; geometryGeneration: number; completeRetainedTail: boolean; maxTailGap?: number;
+  /** Captured rows whose cell boundaries tmux does not serialize exactly
+   * (decoder row isolation). They never equal anything, so they are neither
+   * checked, content-matched, nor part of an anchor. */
+  uncertainCapturedRows?: ReadonlySet<number>;
+};
 
 /** Hash buckets are only an accelerator: exact cell comparison assigns IDs.
  * Nothing is cached across calls, so mutable caller rows cannot retain stale keys. */
@@ -58,17 +71,29 @@ function equalRowsAround(a: CapturedRow, b: CapturedRow, probe: number): boolean
   for (let x = start + 1; x < a.cells.length; x++) if (!same(x)) return false;
   return true;
 }
-function internRows(rows: readonly (readonly CapturedRow[])[]): number[][] {
+/** Sampled glyph key: first 16 glyphs, every 8th after, and the last. Equal
+ * rows always share it; different rows may too and are resolved exactly. */
+function rowSampleKey(row: CapturedRow): number {
+  const cells = row.cells;
+  let key = cells.length ^ (row.softWrap ? 0x40000000 : 0);
+  const mix = (x: number) => {
+    const glyph = cells[x]!.grapheme;
+    for (let c = 0; c < glyph.length; c++) key = Math.imul(key ^ glyph.charCodeAt(c), 16777619);
+    key = Math.imul(key ^ 0xff, 16777619);
+  };
+  const head = Math.min(16, cells.length);
+  for (let x = 0; x < head; x++) mix(x);
+  for (let x = head + 7; x < cells.length - 1; x += 8) mix(x);
+  if (cells.length > head) mix(cells.length - 1);
+  return key;
+}
+function internRows(rows: readonly (readonly CapturedRow[])[], uncertain?: ReadonlySet<number>): number[][] {
   const buckets = new Map<number, Array<{ row: CapturedRow; id: number }>>();
   let id = 0;
-  return rows.map(part => part.map(row => {
-    // Sample glyphs to keep keys small. A bucket collision is resolved exactly.
-    let key = row.cells.length ^ (row.softWrap ? 0x40000000 : 0);
-    for (let x = 0; x < Math.min(16, row.cells.length); x++) {
-      const glyph = row.cells[x]!.grapheme;
-      for (let c = 0; c < glyph.length; c++) key = Math.imul(key ^ glyph.charCodeAt(c), 16777619);
-      key = Math.imul(key ^ 0xff, 16777619);
-    }
+  return rows.map((part, p) => part.map((row, y) => {
+    // An uncertain captured row gets a private ID: it equals nothing.
+    if (p === 1 && uncertain?.has(y)) return ++id;
+    const key = rowSampleKey(row);
     const bucket = buckets.get(key);
     const found = bucket?.find(entry => equalHistoryRows(entry.row, row));
     if (found) return found.id;
@@ -94,66 +119,87 @@ function occurrences(pattern: number[], values: number[]): number {
   for (let i = pattern.length + 1; i < z.length; i++) if (z[i]! >= pattern.length) count++;
   return count;
 }
-function triples(values: number[], base: number): Map<number | string, number[]> {
-  const map = new Map<number | string, number[]>();
+function tripleCounts(values: readonly number[], base: number): Map<number | string, number> {
+  const counts = new Map<number | string, number>();
   for (let i = 0; i + 2 < values.length; i++) {
     if (values[i] === values[i + 1] && values[i] === values[i + 2]) continue;
-    const key = base < 200000 ? (values[i]! * base + values[i + 1]!) * base + values[i + 2]!
-      : `${values[i]},${values[i + 1]},${values[i + 2]}`;
-    const positions = map.get(key) ?? [];
-    positions.push(i); map.set(key, positions);
+    const key = tripleKey(values, i, base);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  return map;
+  return counts;
+}
+function tripleKey(values: readonly number[], i: number, base: number): number | string {
+  return base < 200000 ? (values[i]! * base + values[i + 1]!) * base + values[i + 2]!
+    : `${values[i]},${values[i + 1]},${values[i + 2]}`;
+}
+/** FIX1-PLAN §2 checked rows. Inside one run of rows equal at the offset, a
+ * row is checked only when (1) a unique-in-both triple starts above it and a
+ * different one ends below it, so two independent anchors fix the offset on
+ * both sides, and (2) its content differs from both neighbours: a dropped and
+ * a duplicated row inside a run of identical text keep every cell equal while
+ * shifting hidden identities. Every other equal row is content-matched. */
+function classify(from: number, to: number, equal: (i: number) => boolean, sameAsNext: (i: number) => boolean,
+  unique: (i: number) => boolean): Uint8Array {
+  const covered = new Uint8Array(Math.max(0, to - from));
+  // Only the first and last anchor of a run matter; scan inward from both ends.
+  const anchor = (i: number) => !(sameAsNext(i) && sameAsNext(i + 1)) && unique(i);
+  for (let start = from; start < to;) {
+    if (!equal(start)) { start++; continue; }
+    let end = start;
+    while (end < to && equal(end)) end++;
+    let first = start;
+    while (first + 2 < end && !anchor(first)) first++;
+    let last = end - 3;
+    while (last > first && !anchor(last)) last--;
+    if (first + 2 < end && last > first) {
+      for (let x = first + 1; x <= last + 1; x++) if (!sameAsNext(x - 1) && !sameAsNext(x)) covered[x - from] = 1;
+    }
+    start = end;
+  }
+  return covered;
+}
+function certify(recent: readonly HistoryRow[], a: readonly number[], b: readonly number[], offset: number, reason: RowMatch['reason']): RowMatch {
+  const result: RowMatch = { checks: [], contentMatches: [], repairs: [], reason };
+  const from = Math.max(0, -offset), to = Math.min(a.length, b.length - offset);
+  if (to <= from) return result;
+  const base = Math.max(a.length, b.length) * 2 + 2;
+  const countA = tripleCounts(a, base), countB = tripleCounts(b, base);
+  const covered = classify(from, to, i => a[i] === b[i + offset], i => a[i] === a[i + 1], i => {
+    const key = tripleKey(a, i, base);
+    return countA.get(key) === 1 && countB.get(key) === 1;
+  });
+  for (let i = from; i < to; i++) {
+    if (a[i] !== b[i + offset]) continue;
+    (covered[i - from] ? result.checks : result.contentMatches).push({ lineId: recent[i]!.lineId, capturedRow: i + offset });
+  }
+  return result;
 }
 
 /** Only full retained captures certify uniqueness. A reduced tail is never a
  * substitute for evidence about the unseen ring, even if receiveSeq advanced. */
 export function matchHistoryRows(
-  recent: readonly HistoryRow[], captured: readonly CapturedRow[],
-  scope: { sourceEpoch: number; geometryGeneration: number; completeRetainedTail: boolean; maxTailGap?: number },
+  recent: readonly HistoryRow[], captured: readonly CapturedRow[], scope: MatchScope,
 ): RowMatch {
-  const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
+  const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], contentMatches: [], repairs: [], reason });
   if (!scope.completeRetainedTail) return empty('partial-tail');
   if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
+  const uncertain = scope.uncertainCapturedRows;
+  // Common steady state: aligned rings with at most one drifted row. The
+  // alignment is only a hypothesis; certifyAligned still demands unique
+  // triples, and this path avoids interning 9,000 rows.
   if (recent.length >= 3 && recent.length === captured.length) {
-    // Common steady state: aligned rings with at most one cell-drift row.
-    // Scan exact cells once; avoid constructing 9,000 row/triple entries.
-    let mismatch = -1, differences = 0;
-    for (let i = 0; i < recent.length; i++) {
-      if (!equalHistoryRows(recent[i]!, captured[i]!)) { mismatch = i; if (++differences > 1) break; }
+    const equal = new Uint8Array(recent.length);
+    let differences = 0;
+    for (let i = 0; i < recent.length && differences < 2; i++) {
+      if (!uncertain?.has(i) && equalHistoryRows(recent[i]!, captured[i]!)) equal[i] = 1; else differences++;
     }
-    const uniqueTriple = (start: number, rows: readonly CapturedRow[]) => {
-      const pattern = recent.slice(start, start + 3);
-      if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return false;
-      // Pick a discriminating glyph once, avoiding full scans of candidates
-      // whose ordinary row labels differ only near the end of their prefix.
-      let probe = 0;
-      for (let x = 0; x < pattern[0]!.cells.length; x++) {
-        if (pattern[0]!.cells[x]!.grapheme !== pattern[1]!.cells[x]?.grapheme
-          || pattern[0]!.cells[x]!.grapheme !== pattern[2]!.cells[x]?.grapheme) { probe = x; break; }
-      }
-      const glyph = pattern[0]!.cells[probe]?.grapheme;
-      let hits = 0;
-      for (let i = 0; i + 2 < rows.length; i++) {
-        if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
-        if (equalRowsAround(pattern[0]!, rows[i]!, probe) && equalRowsAround(pattern[1]!, rows[i + 1]!, probe)
-          && equalRowsAround(pattern[2]!, rows[i + 2]!, probe) && ++hits > 1) return false;
-      }
-      return hits === 1;
-    };
-    if (differences === 0) {
-      if (recent.every(row => equalHistoryRows(row, recent[0]!))) return empty('ambiguous');
-      return { reason: 'matched', repairs: [], checks: recent.map((row, i) => ({ lineId: row.lineId, capturedRow: i })) };
-    }
-    if (differences === 1 && mismatch >= 3 && mismatch + 3 < recent.length
-      && [mismatch - 3, mismatch + 1].every(start => uniqueTriple(start, recent) && uniqueTriple(start, captured))) {
-      const checks: RowMatch['checks'] = [];
-      for (let i = 0; i < recent.length; i++) if (i !== mismatch) checks.push({ lineId: recent[i]!.lineId, capturedRow: i });
-      return { reason: 'matched', checks,
-        repairs: [{ lineId: recent[mismatch]!.lineId, capturedRow: mismatch, row: captured[mismatch]! }] };
+    if (differences < 2) {
+      const aligned = certifyAligned(recent, captured, 0, 0, equal, 'matched');
+      if (!aligned.checks.length) aligned.reason = 'ambiguous';
+      return aligned;
     }
   }
-  const [a, b] = internRows([recent, captured]) as [number[], number[]];
+  const [a, b] = internRows([recent, captured], uncertain) as [number[], number[]];
   if (a.length < 3 || b.length < 3) return empty('no-anchor');
   const reversed = a.slice().reverse();
   const z = zValues([...reversed, null, ...b.slice().reverse()]);
@@ -170,37 +216,104 @@ export function matchHistoryRows(
   if (scope.maxTailGap !== undefined && b.length - end > scope.maxTailGap) return empty('no-anchor');
   const anchor = a.slice(a.length - length);
   if (count !== 1 || new Set(anchor).size < 2 || occurrences(anchor, a) !== 1 || occurrences(anchor, b) !== 1) return empty('ambiguous');
-  const result: RowMatch = { checks: [], repairs: [], reason: 'matched' };
-  const offset = end - a.length;
-  const checked = new Set<number>();
-  const check = (i: number, j: number) => {
-    if (!checked.has(i)) { result.checks.push({ lineId: recent[i]!.lineId, capturedRow: j }); checked.add(i); }
-  };
-  for (let i = a.length - length; i < a.length; i++) check(i, i + offset);
+  // The unique suffix fixes the offset only. Rows inside it are certified by
+  // their own unique triples like every other row: a unique suffix can still
+  // hold a blank run whose hidden identities were dropped/duplicated.
+  const result = certify(recent, a, b, end - a.length, 'matched');
+  if (!result.checks.length) result.reason = 'ambiguous';
+  return result;
+}
 
-  if (length === a.length) return result;
-
-  // A mismatch can only be repaired between two independently unique triples
-  // with identical row counts. No insertion/deletion or renumbering is inferred.
-  const base = a.length + b.length + 1;
-  const at = triples(a, base), bt = triples(b, base);
-  const anchors: Array<[number, number]> = [];
-  for (const [key, positions] of at) {
-    const other = bt.get(key);
-    if (positions.length === 1 && other?.length === 1 && other[0]! - positions[0]! === offset)
-      anchors.push([positions[0]!, other[0]!]);
+/** Index of the only exact occurrence of `pattern` (3 rows), else -1. A run
+ * of three identical rows is never an anchor. */
+function locateTriple(rows: readonly CapturedRow[], pattern: readonly CapturedRow[]): number {
+  if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return -1;
+  let probe = 0;
+  for (let x = 0; x < pattern[0]!.cells.length; x++) {
+    if (pattern[0]!.cells[x]!.grapheme !== pattern[1]!.cells[x]?.grapheme
+      || pattern[0]!.cells[x]!.grapheme !== pattern[2]!.cells[x]?.grapheme) { probe = x; break; }
   }
-  // Map iteration follows row order, so no O(n log n) sorting is needed.
-  for (let k = 0; k < anchors.length; k++) {
-    const [i, j] = anchors[k]!;
-    for (let n = 0; n < 3; n++) check(i + n, j + n);
-    const next = anchors[k + 1];
-    if (!next || next[0] <= i + 3) continue;
-    for (let x = i + 3; x < next[0]; x++) {
-      const y = x + offset;
-      if (a[x] === b[y]) check(x, y);
-      else result.repairs.push({ lineId: recent[x]!.lineId, capturedRow: y, row: captured[y]! });
+  const glyph = pattern[0]!.cells[probe]?.grapheme;
+  let found = -1;
+  for (let i = 0; i + 2 < rows.length; i++) {
+    if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
+    if (equalRowsAround(rows[i]!, pattern[0]!, probe) && equalRowsAround(rows[i + 1]!, pattern[1]!, probe) && equalRowsAround(rows[i + 2]!, pattern[2]!, probe)) {
+      if (found >= 0) return -1;
+      found = i;
     }
+  }
+  return found;
+}
+/** Uniqueness of a 3-row window. The first queries use an exact scan
+ * (locateTriple); a caller that keeps asking gets a sampled index instead:
+ * a sampled triple key seen once is exactly unique (an exact duplicate always
+ * shares it); a repeated key is decided by exact comparison within its group.
+ * Computed per call: caller rows may be mutated between captures. */
+function tripleIndex(rows: readonly CapturedRow[]): (i: number) => boolean {
+  let scans = 0;
+  let indexed: ((i: number) => boolean) | undefined;
+  return (i: number) => {
+    if (!indexed && scans++ < 8) return locateTriple(rows, [rows[i]!, rows[i + 1]!, rows[i + 2]!]) === i;
+    return (indexed ??= sampledTripleIndex(rows))(i);
+  };
+}
+function sampledTripleIndex(rows: readonly CapturedRow[]): (i: number) => boolean {
+  const keys = new Int32Array(rows.length);
+  for (let y = 0; y < rows.length; y++) keys[y] = rowSampleKey(rows[y]!);
+  const key = (i: number) => Math.imul(Math.imul(keys[i]! ^ 0x9e3779b9, 16777619) ^ keys[i + 1]!, 16777619) ^ Math.imul(keys[i + 2]!, 0x85ebca6b);
+  const counts = new Map<number, number>();
+  for (let i = 0; i + 2 < rows.length; i++) { const k = key(i); counts.set(k, (counts.get(k) ?? 0) + 1); }
+  let groups: Map<number, number[]> | undefined;
+  return (i: number) => {
+    const k = key(i);
+    if (counts.get(k) === 1) return true;
+    if (!groups) {
+      groups = new Map();
+      for (let j = 0; j + 2 < rows.length; j++) {
+        const g = key(j);
+        if (counts.get(g)! > 1) { const list = groups.get(g); if (list) list.push(j); else groups.set(g, [j]); }
+      }
+    }
+    let same = 0;
+    for (const j of groups.get(k)!) {
+      if (j === i || (equalHistoryRows(rows[j]!, rows[i]!) && equalHistoryRows(rows[j + 1]!, rows[i + 1]!) && equalHistoryRows(rows[j + 2]!, rows[i + 2]!))) {
+        if (++same > 1) return false;
+      }
+    }
+    return true;
+  };
+}
+/** certify() for callers without interned IDs: `equal[i - from]` says whether
+ * recent[i] equals captured[i + offset] exactly. */
+function certifyAligned(recent: readonly HistoryRow[], captured: readonly CapturedRow[], offset: number, from: number, equal: Uint8Array, reason: RowMatch['reason']): RowMatch {
+  const result: RowMatch = { checks: [], contentMatches: [], repairs: [], reason };
+  const to = from + equal.length;
+  let uniqueR: ((i: number) => boolean) | undefined, uniqueC: ((i: number) => boolean) | undefined;
+  const same = new Int8Array(equal.length).fill(-1);
+  // Neighbouring rows usually differ in the same column (counters, stamps):
+  // test the column where the previous pair differed before a full compare.
+  let probe = 0;
+  const sameAsNext = (i: number) => {
+    const k = i - from;
+    if (same[k] === -1) {
+      const x = recent[i]!, y = recent[i + 1]!;
+      if (x.cells.length === y.cells.length && probe < x.cells.length && x.cells[probe]!.grapheme !== y.cells[probe]!.grapheme) same[k] = 0;
+      else if (equalHistoryRows(x, y)) same[k] = 1;
+      else {
+        same[k] = 0;
+        const n = Math.min(x.cells.length, y.cells.length);
+        for (let c = 0; c < n; c++) if (x.cells[c]!.grapheme !== y.cells[c]!.grapheme) { probe = c; break; }
+      }
+    }
+    return same[k] === 1;
+  };
+  const covered = classify(from, to, i => equal[i - from] === 1, sameAsNext, i => {
+    uniqueR ??= tripleIndex(recent); uniqueC ??= tripleIndex(captured);
+    return uniqueR(i) && uniqueC(i + offset);
+  });
+  for (let i = from; i < to; i++) {
+    if (!equal[i - from]) continue;
+    (covered[i - from] ? result.checks : result.contentMatches).push({ lineId: recent[i]!.lineId, capturedRow: i + offset });
   }
   return result;
 }
@@ -213,65 +326,39 @@ export class IncrementalHistoryMatcher {
   private checked = new Map<number, CapturedRow>();
   private generation = '';
   reset(): void { this.checked.clear(); }
-  match(recent: readonly HistoryRow[], captured: readonly CapturedRow[], scope: Parameters<typeof matchHistoryRows>[2]): RowMatch {
+  match(recent: readonly HistoryRow[], captured: readonly CapturedRow[], scope: MatchScope): RowMatch {
     const generation = `${scope.sourceEpoch}/${scope.geometryGeneration}`;
     if (this.generation !== generation) { this.reset(); this.generation = generation; }
     if (scope.completeRetainedTail) return matchHistoryRows(recent, captured, scope);
-    const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], repairs: [], reason });
+    const empty = (reason: RowMatch['reason']): RowMatch => ({ checks: [], contentMatches: [], repairs: [], reason });
     if (recent.some(r => r.sourceEpoch !== scope.sourceEpoch || r.geometryGeneration !== scope.geometryGeneration)) return empty('generation');
     const prior = [...this.checked.entries()];
     if (prior.length !== 3) return empty('partial-tail');
     const first = recent.findIndex(row => row.lineId === prior[0]![0]);
     if (first < 0 || prior.some(([id, row], n) => recent[first + n]?.lineId !== id || !equalHistoryRows(row, recent[first + n]!))) return empty('partial-tail');
-    const locate = (rows: readonly CapturedRow[], pattern: readonly CapturedRow[]): number => {
-      if (equalHistoryRows(pattern[0]!, pattern[1]!) && equalHistoryRows(pattern[0]!, pattern[2]!)) return -1;
-      let probe = 0;
-      for (let x = 0; x < pattern[0]!.cells.length; x++) {
-        if (pattern[0]!.cells[x]!.grapheme !== pattern[1]!.cells[x]?.grapheme
-          || pattern[0]!.cells[x]!.grapheme !== pattern[2]!.cells[x]?.grapheme) { probe = x; break; }
-      }
-      const glyph = pattern[0]!.cells[probe]?.grapheme;
-      let found = -1;
-      for (let i = 0; i + 2 < rows.length; i++) {
-        if (rows[i]!.cells[probe]?.grapheme !== glyph) continue;
-        if (equalRowsAround(rows[i]!, pattern[0]!, probe) && equalRowsAround(rows[i + 1]!, pattern[1]!, probe) && equalRowsAround(rows[i + 2]!, pattern[2]!, probe)) {
-          if (found >= 0) return -1;
-          found = i;
-        }
-      }
-      return found;
-    };
+    const uncertain = scope.uncertainCapturedRows;
     const pattern = prior.map(([, row]) => row);
-    const at = locate(captured, pattern);
-    if (at < 0 || locate(recent, pattern) !== first) return empty('ambiguous');
+    const at = locateTriple(captured, pattern);
+    if (at < 0 || locateTriple(recent, pattern) !== first || [0, 1, 2].some(n => uncertain?.has(at + n))) return empty('ambiguous');
     const offset = at - first;
-    const result = empty('matched');
-    // Scan only the captured overlap. The saved triple certifies its exact run;
-    // runs beyond changed rows need their own globally unique triple. No repair
-    // or inferred index shift is ever made by an incremental capture.
-    let i = Math.max(0, -offset);
-    while (i < recent.length && i + offset < captured.length) {
-      if (!equalHistoryRows(recent[i]!, captured[i + offset]!)) { i++; continue; }
-      const start = i;
-      while (i < recent.length && i + offset < captured.length && equalHistoryRows(recent[i]!, captured[i + offset]!)) i++;
-      let anchored = start <= first && i >= first + 3;
-      for (let k = start; !anchored && k + 2 < i; k++) {
-        const triple = recent.slice(k, k + 3);
-        anchored = locate(recent, triple) === k && locate(captured, triple) === k + offset;
-      }
-      if (anchored) for (let k = start; k < i; k++) result.checks.push({ lineId: recent[k]!.lineId, capturedRow: k + offset });
-    }
-    if (at + 3 < captured.length && !result.checks.some(check => check.capturedRow >= at + 3)) result.reason = 'ambiguous';
+    // Scan only the captured overlap. A row is checked only inside a triple
+    // unique in the parser ring and in this capture (FIX1-PLAN §2); other equal
+    // rows are content-matched. No repair or index shift is ever inferred.
+    const from = Math.max(0, -offset), to = Math.min(recent.length, captured.length - offset);
+    const equal = new Uint8Array(Math.max(0, to - from));
+    for (let i = from; i < to; i++) equal[i - from] = !uncertain?.has(i + offset) && equalHistoryRows(recent[i]!, captured[i + offset]!) ? 1 : 0;
+    const result = certifyAligned(recent, captured, offset, from, equal, 'matched');
+    // The newest captured row is never checked (no anchor below it), so the
+    // chain only needs to advance when a row exists past the one after the seed.
+    if (at + 4 < captured.length && !result.checks.some(check => check.capturedRow >= at + 3)) result.reason = 'ambiguous';
     return result;
   }
   remember(recent: readonly HistoryRow[], captured: readonly CapturedRow[], match: RowMatch): void {
     // Only the terminal verified triple is needed to seed the next chain.
     // Copying 128 full rows on every 200ms tick dominated collector work.
-    // The full matcher emits its suffix before interior anchors, so the last
-    // three emitted checks can sit hundreds of rows before the end. That seed
-    // falls outside the next scrolls+128 tail and forces a full recapture.
     // Seed from the last three checks that are consecutive in both captured
-    // rows and the recent ring instead; any checked exact triple is valid.
+    // rows and the recent ring; any checked exact triple is valid. Checks are
+    // normally ordered by row; sort defensively for other producers.
     this.checked.clear();
     const checks = match.checks.slice();
     if (checks.some((check, k) => k > 0 && checks[k - 1]!.capturedRow > check.capturedRow)) checks.sort((a, b) => a.capturedRow - b.capturedRow);
