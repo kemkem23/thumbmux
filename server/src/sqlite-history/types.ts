@@ -175,32 +175,90 @@ export interface ProjectionCapture extends ProjectionFrame {
   firstHistoryRow: number; history: PhysicalRow[]; observedFields: string[];
   ambiguousRows: number; result: string;
 }
+/**
+ * FIX1 §1.2: tmux 3.4 has no byte fence between pipe-pane and capture-pane.
+ * A capture may overwrite the displayed screen (never the parser frame) only
+ * when the collector saw no new byte while it ran ('quiescent'); the store
+ * additionally requires the revision CAS. 'unfenced', null or absent evidence
+ * checks history only: the screen stays as it is and nothing is refused for it.
+ * `uncertainRows` (§7.4 D18): screen rows whose cell boundaries the capture
+ * could not settle (complex emoji). They are drawn with the rest of the
+ * capture but not certified; the store keeps their indices with the screen.
+ */
+export type CaptureEvidence =
+  | { kind: 'quiescent'; sourceEpoch: number; geometryGeneration: number; receiveSeqBefore: number; receiveSeqAfter: number; uncertainRows?: readonly number[] }
+  | { kind: 'unfenced'; reason: string };
+export interface ProjectionIssueInput {
+  paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
+  expectedRevision: number; kind: string; reason: string; missingCount: number | null;
+  boundaryLineId: number; recoverable: boolean;
+}
+export interface ProjectionIssue {
+  issueId: string; sourceEpoch: number; revision: number; boundaryLineId: number | null;
+  kind: string; reason: string; missingCount: number | null; detectedAt: number; resolvedAt: number | null;
+}
+export interface ProjectionEpochTransition extends ProjectionIssueInput { nextEpoch: number }
 export interface ProjectionCalibration {
   capture: ProjectionCapture; expectedRevision: number;
+  captureEvidence?: CaptureEvidence | null;
+  /** Rows proven by unique triple anchors on both sides (D16 identity). */
   checks: Array<{ lineId: number; captureRow: number }>;
+  /** FIX1 §2: exact content match of repeated rows with no unique anchor. */
+  contentMatches?: Array<{ lineId: number; captureRow: number }>;
   repairs: Array<{ lineId: number; captureRow: number; physicalRow: PhysicalRow }>;
 }
 export interface ProjectionReceipt { revision: number; durableRevision: number; nextLineId: number }
+/**
+ * FIX1 §3 (D12): recoverable store pressure. The event was NOT stored and NOT
+ * dropped: the caller still owns it, pauses its source (stops reading the
+ * FIFO), awaits drained(paneKey) and offers the same event again. Never a
+ * parser fault, never an epoch change.
+ */
+export interface ProjectionRefusal { accepted: false; reason: 'capacity-pressure'; scope: 'pane' | 'store' }
+export type ProjectionAdmission = ProjectionReceipt | ProjectionRefusal;
+/**
+ * Rejection message (and na_issue kind) of an event larger than an idle store
+ * admits. Waiting never helps: the caller must not offer it again. The store
+ * records the loss once per event, however often the same event is re-offered.
+ * Rejections for transient pressure never use this name.
+ */
+export const PROJECTION_OVERSIZE = 'ingest-oversize';
+export const isProjectionRefusal = (value: unknown): value is ProjectionRefusal =>
+  typeof value === 'object' && value !== null && (value as ProjectionRefusal).accepted === false;
+export type ProjectionCheckState = 'unchecked' | 'checked' | 'content-matched';
 export interface ProjectionToken extends ProjectionReceipt {
   paneKey: PaneKey; sourceEpoch: number; geometryGeneration: number;
 }
 export interface ProjectionLine extends PhysicalRow {
   lineId: number; sourceEpoch: number; geometryGeneration: number; revision: number; softWrap: boolean;
-  checkState: 'unchecked' | 'checked'; checkReason: string;
+  checkState: ProjectionCheckState; checkReason: string;
   checkedCaptureId: string | null; checkedRow: number | null;
 }
 export interface ProjectionPage {
-  token: ProjectionToken; lines: ProjectionLine[]; nextAnchor: number; hasMore: boolean;
+  token: ProjectionToken; lines: ProjectionLine[]; issues: ProjectionIssue[]; nextAnchor: number; hasMore: boolean;
 }
-export interface ProjectionFault { kind: string; at: number; reason: string; pendingBytes: number }
+export interface ProjectionFault {
+  kind: string; at: number; reason: string; pendingBytes: number;
+  panes?: Array<{ paneKey: PaneKey; sourceEpoch: number; boundaryLineId: number; missingCount: number | null }>;
+}
 export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
-  panes: ProjectionToken[];
+  /** 'recoverable' while the store is stopped or any pane holds a refused row. */
+  pressure: 'none' | 'recoverable';
+  /** Backpressure refusals since open (FIX1 §3); not losses, see rejectedRows for those. */
+  pressureRefusals: number;
+  panes: Array<ProjectionToken & { status: 'healthy' | 'degraded'; recovery: 'automatic' | 'external'; issues: ProjectionIssue[] }>;
 }
 export interface ProjectionWriterPort {
-  appendScroll(event: ScrollEvent): Promise<ProjectionReceipt>;
-  replaceScreen(frame: ProjectionFrame): Promise<ProjectionReceipt>;
+  recordIssue(issue: ProjectionIssueInput): Promise<ProjectionReceipt>;
+  transitionEpoch(change: ProjectionEpochTransition): Promise<ProjectionReceipt>;
+  appendScroll(event: ScrollEvent): Promise<ProjectionAdmission>;
+  replaceScreen(frame: ProjectionFrame): Promise<ProjectionAdmission>;
+  /** Resolves once a refused pane may offer events again (FIX1 §3). */
+  drained(key: PaneKey): Promise<void>;
+  /** Resolves once `revision` of the pane is on disk; never blocks the caller (FIX1 §4.3). */
+  durable(key: PaneKey, revision: number): Promise<ProjectionReceipt>;
   calibrate(change: ProjectionCalibration): Promise<ProjectionReceipt>;
   readPage(token: ProjectionToken, anchor: number | null, limit: number): ProjectionPage;
   flush(): void; health(): ProjectionHealth;

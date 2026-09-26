@@ -151,6 +151,9 @@ CREATE TRIGGER frame_immutable BEFORE UPDATE ON history_frame BEGIN SELECT RAISE
 `;
 
 // Separate factory and database. Do not change SCHEMA_VERSION (the v1 factory).
+// FIX1 widened two CHECK lists in place and FIX2 added na_screen.uncertain_rows_json
+// (no v2 file was ever deployed); recovery refuses a v2 file missing any marker.
+export const PROJECTION_SCHEMA_MARKERS = ["'content-matched'","'tmux-calibrated'","uncertain_rows_json"];
 export const PROJECTION_SCHEMA_VERSION = 2;
 export const PROJECTION_MIGRATION = '002-newarch-projection';
 export const PROJECTION_SCHEMA = `
@@ -178,19 +181,20 @@ CREATE TABLE na_line (
  pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), source_epoch INTEGER NOT NULL,
  line_id INTEGER NOT NULL, revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL,
  text TEXT NOT NULL, cells_json TEXT NOT NULL, soft_wrap INTEGER NOT NULL CHECK(soft_wrap IN(0,1)),
- check_state TEXT NOT NULL CHECK(check_state IN('unchecked','checked')), check_reason TEXT NOT NULL,
+ check_state TEXT NOT NULL CHECK(check_state IN('unchecked','checked','content-matched')), check_reason TEXT NOT NULL,
  checked_capture_id TEXT, checked_row INTEGER,
  PRIMARY KEY(pane_key,source_epoch,line_id), UNIQUE(pane_key,line_id),
  FOREIGN KEY(pane_key,checked_capture_id,source_epoch,geometry_generation)
  REFERENCES na_capture(pane_key,capture_id,source_epoch,geometry_generation),
  CHECK((check_state='unchecked' AND checked_capture_id IS NULL AND checked_row IS NULL)
- OR (check_state='checked' AND checked_capture_id IS NOT NULL AND checked_row>=0))
+ OR (check_state IN('checked','content-matched') AND checked_capture_id IS NOT NULL AND checked_row>=0))
 ) STRICT;
 CREATE TABLE na_screen (
  pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), screen_kind TEXT NOT NULL,
  revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
  cells_json TEXT NOT NULL, cursor_json TEXT NOT NULL, last_capture_id TEXT, captured_at REAL,
- display_source TEXT NOT NULL CHECK(display_source IN('pipe','tmux')), observed_fields_json TEXT NOT NULL,
+ display_source TEXT NOT NULL CHECK(display_source IN('pipe','tmux-calibrated')), observed_fields_json TEXT NOT NULL,
+ uncertain_rows_json TEXT NOT NULL DEFAULT '[]',
  PRIMARY KEY(pane_key,screen_kind), FOREIGN KEY(pane_key,last_capture_id) REFERENCES na_capture(pane_key,capture_id)
 ) STRICT;
 CREATE TABLE na_issue (

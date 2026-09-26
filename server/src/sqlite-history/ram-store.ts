@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { PROJECTION_SCHEMA } from './schema';
-import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
+import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionIssueInput, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
 // Schema 2's UNIQUE(pane_key,line_id) is sqlite_autoindex_na_line_2.
 // Pin that range: the revision index otherwise walks every durable resident row.
@@ -138,22 +138,59 @@ export class ProjectionRam {
       .run(Number(p.revision)+1,id,Number(p.next_line_id)-4500);
     return this.bump(event.paneKey);
   }
-  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string): void {
+  /** `uncertain`: capture rows drawn but not certified (D18); a pipe frame always clears them. */
+  screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string, uncertain: readonly number[] = []): void {
     if(preparedCells===undefined)validateFrame(frame);
     const p=this.ensure(frame.paneKey,frame.sourceEpoch,frame.geometryGeneration), id=paneId(frame.paneKey);
-    this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json')
-      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux':'pipe',JSON.stringify(observed));
+    this.db.query('INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json,uncertain_rows_json=excluded.uncertain_rows_json')
+      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux-calibrated':'pipe',JSON.stringify(observed),JSON.stringify(uncertain));
     this.db.query('UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
-  calibrate(change: ProjectionCalibration): ProjectionReceipt {
+  /** Revision the caller's CAS is compared with; a pane not yet seen is revision 0. */
+  revisionOf(key: PaneKey): number {
+    const row=this.db.query('SELECT revision FROM na_pane WHERE pane_key=?').get(paneId(key)) as SqlRow|null;
+    return row?Number(row.revision):0;
+  }
+  /**
+   * `casAtAdmission`: the store already compared expectedRevision when it
+   * admitted the job (F12); jobs admitted earlier for the same pane then run
+   * first by queue order, so the run-time revision is no longer the caller's.
+   */
+  recordIssue(issue: ProjectionIssueInput, nextEpoch?: number, casAtAdmission=false): ProjectionReceipt {
+    const id=paneId(issue.paneKey);
+    const p=(this.db.query('SELECT * FROM na_pane WHERE pane_key=?').get(id) as SqlRow|null)??this.ensure(issue.paneKey,issue.sourceEpoch,issue.geometryGeneration);
+    if(!casAtAdmission && p.revision!==issue.expectedRevision)throw new Error('stale-revision');
+    if(p.source_epoch!==issue.sourceEpoch || p.geometry_generation!==issue.geometryGeneration)throw new Error('stale-generation');
+    integer(issue.boundaryLineId);
+    if(issue.boundaryLineId>Number(p.next_line_id) || !issue.kind || !issue.reason || typeof issue.recoverable!=='boolean')throw new Error('invalid-issue');
+    if(issue.missingCount!==null)integer(issue.missingCount);
+    if(nextEpoch!==undefined) {
+      integer(nextEpoch);if(nextEpoch<=Number(p.source_epoch))throw new Error('nonmonotonic-epoch');
+      this.db.query('UPDATE na_pane SET source_epoch=?,receive_seq=-1 WHERE pane_key=?').run(nextEpoch,id);
+    }
+    this.db.query('INSERT INTO na_issue VALUES (?,?,?,?,?,?,?,?,?,NULL)').run(randomUUID(),id,nextEpoch??p.source_epoch,
+      Number(p.revision)+1,issue.boundaryLineId,issue.kind,issue.reason,issue.missingCount,Date.now());
+    this.db.query("UPDATE na_pane SET health=? WHERE pane_key=?").run(issue.recoverable?'degraded':'unverified',id);
+    return this.bump(issue.paneKey);
+  }
+  /**
+   * `historyOnly` (M2): without screen evidence nothing on screen is replaced,
+   * and every checked or repaired history row is compared byte for byte below,
+   * so rows and frames that arrived after the caller's read cannot make it
+   * wrong. Only a revision the pane never had (from the future) is refused.
+   */
+  calibrate(change: ProjectionCalibration, historyOnly=false): ProjectionReceipt {
     const c=change.capture, p=this.pane(c.paneKey), id=paneId(c.paneKey);
-    if (p.revision !== change.expectedRevision) throw new Error('stale-revision');
+    if (historyOnly ? change.expectedRevision > Number(p.revision) : p.revision !== change.expectedRevision) throw new Error('stale-revision');
     if (p.source_epoch !== c.sourceEpoch || p.geometry_generation !== c.geometryGeneration) throw new Error('stale-generation');
     validateFrame(c); c.history.forEach(validateRow);
     if (!c.captureId || !Number.isFinite(c.requestedAt) || !Number.isFinite(c.completedAt) || c.completedAt<c.requestedAt) throw new Error('invalid-capture');
     integer(c.firstHistoryRow); integer(c.ambiguousRows);
     const mapped=new Set<number>(), captureRows=new Set<number>();
-    const mutations=[...change.repairs.map(r=>({...r,repair:true})),...change.checks.map(r=>({...r,repair:false}))];
+    type Mutation={lineId:number;captureRow:number;repair:boolean;state:'checked'|'content-matched';keep?:boolean};
+    const mutations:Mutation[]=[...change.repairs.map(r=>({...r,repair:true,state:'checked' as const})),
+      ...change.checks.map(r=>({...r,repair:false,state:'checked' as const})),
+      ...(change.contentMatches??[]).map(r=>({...r,repair:false,state:'content-matched' as const}))];
     let correctedCells=0;
     for(const m of mutations) {
       integer(m.lineId); integer(m.captureRow);
@@ -168,20 +205,40 @@ export class ProjectionRam {
         const previous=decodeCells(String(row.cells_json));
         correctedCells+=expected.cells.filter((cell,i)=>JSON.stringify(cell)!==JSON.stringify(previous[i])).length;
       } else if(row.text!==expected.text || JSON.stringify(decodeCells(String(row.cells_json)))!==JSON.stringify(expected.cells)) throw new Error('check-not-exact');
+      // A content match never downgrades an identity already proven by anchors.
+      m.keep=m.state==='content-matched' && row.check_state==='checked';
     }
     this.db.query('INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,JSON.stringify(c.cells),JSON.stringify(c.history),mapped.size,correctedCells,c.ambiguousRows,c.result);
     for(const m of mutations) {
+      if(m.keep)continue;
       const expected=c.history[m.captureRow];
       // Changing content and its receipt is one transaction; no old label survives.
-      this.db.query("UPDATE na_line SET revision=?,text=?,cells_json=?,check_state='checked',check_reason='exact-capture',checked_capture_id=?,checked_row=? WHERE pane_key=? AND line_id=?")
-        .run(Number(p.revision)+1,expected.text,encodeCells(expected.cells),c.captureId,m.captureRow,id,m.lineId);
+      this.db.query('UPDATE na_line SET revision=?,text=?,cells_json=?,check_state=?,check_reason=?,checked_capture_id=?,checked_row=? WHERE pane_key=? AND line_id=?')
+        .run(Number(p.revision)+1,expected.text,encodeCells(expected.cells),m.state,m.state==='checked'?'exact-capture':'content-capture',c.captureId,m.captureRow,id,m.lineId);
     }
-    this.screen(c,c.captureId,c.completedAt,c.observedFields);
+    const evidence=change.captureEvidence;
+    if(evidence?.kind==='quiescent') {
+      // FIX1 §1.2: stable metadata, no byte received while capturing, and the
+      // revision CAS above (every pipe frame or row bumps the revision). The
+      // capture becomes the displayed screen in this same transaction; the next
+      // pipe frame renders over it again. The parser frame is never fed from it.
+      integer(evidence.receiveSeqBefore);integer(evidence.receiveSeqAfter);
+      if(evidence.sourceEpoch!==c.sourceEpoch || evidence.geometryGeneration!==c.geometryGeneration
+        || evidence.receiveSeqBefore!==evidence.receiveSeqAfter)throw new Error('capture-not-quiescent');
+      // §7.4 D18: uncertain emoji rows are drawn with the capture but kept apart
+      // as not certified, never a reason to refuse the rest of the screen.
+      const uncertain=[...new Set(evidence.uncertainRows??[])].sort((a,b)=>a-b);
+      if(uncertain.some(r=>!Number.isSafeInteger(r) || r<0 || r>=c.rows))throw new Error('invalid-uncertain-rows');
+      this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);
+    }
+    // Without quiescent evidence (unfenced, null or absent) a capture checks history only, never the screen.
     return this.bump(c.paneKey);
   }
+  /** Live pages only: eviction returns pages to the freelist, which page_count still counts (F13). */
   bytes(): number {
     const pages=this.db.query('PRAGMA page_count').get() as {page_count:number};
-    return pages.page_count*this.pageSize;
+    const free=this.db.query('PRAGMA freelist_count').get() as {freelist_count:number};
+    return (pages.page_count-free.freelist_count)*this.pageSize;
   }
   evict(panes: SqlRow[]): void {
     // Indexed ranges only for committed panes; never visit every resident line.

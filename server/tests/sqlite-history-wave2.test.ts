@@ -153,6 +153,12 @@ test('default package barrel still has no sqlite import and the opt-in entry has
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { isProjectionRefusal, type ScrollEvent } from '../src/sqlite-history/types';
+// FIX1 §3 caller contract: a refused row still belongs to the caller, which
+// waits for drained() and offers the same row again. Nothing is dropped.
+async function storeRow(s:ReturnType<typeof createProjectionStore>,event:ScrollEvent,onPressure?:()=>void) {
+ for(;;){const r=await s.appendScroll(event);if(!isProjectionRefusal(r))return r;onPressure?.();await s.drained(event.paneKey);}
+}
 
 test('newarch: real SIGKILL before disk commit, after commit, before RAM watermark, 20 trials each',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-crash-'));
@@ -249,26 +255,34 @@ test('newarch: random external SIGKILL x40 crosses eviction, independent durable
  }finally{rmSync(root,{recursive:true,force:true});}
 },120000);
 
-test('newarch: scroll pressure recovers, live screen survives, exact loss issue persists',async()=>{
+test('I2 FIX1 A-B4: scroll pressure pauses one pane without loss, its live screen keeps updating, health recovers',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-pressure-')),faults:any[]=[];
  const key={serverIdentity:'pressure',paneId:'%1',birthGeneration:1};
  const s=createProjectionStore({historyRoot:root,mode:'create',onFault:f=>faults.push(f)});
  const event=(text:string,receiveSeq:number)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq,softWrap:false,physicalRow:{text,cells:[]}});
  try {
   // Queue pressure is deterministic; no producer waits for a prior receipt.
-  const queued=Array.from({length:20},(_,i)=>s.appendScroll(event('x'.repeat(1024*1024),i)).then(()=>true,()=>false));
-  expect((s as any).ram.pane(key).health).toBe('degraded');
-  const outcomes=await Promise.all(queued);
-  const refused=outcomes.filter(v=>!v).length;expect(refused).toBeGreaterThan(0);expect(s.health().rejectedRows).toBe(refused);
-  await s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:20,cols:1,rows:1,kind:'normal',cells:[[{grapheme:'Z',width:1,continuation:false,fg:null,bg:null,style:0}]],cursor:null});
+  const rows=Array.from({length:20},(_,i)=>event(`${i}:`.padEnd(1024*1024,'x'),i));
+  const outcomes=await Promise.all(rows.map(r=>s.appendScroll(r)));
+  const first=outcomes.findIndex(isProjectionRefusal);
+  expect(first).toBeGreaterThan(0);
+  // Once refused, the pane is paused: no later row overtakes the refused one.
+  expect(outcomes.slice(first).every(isProjectionRefusal)).toBe(true);
+  expect(outcomes[first]).toEqual({accepted:false,reason:'capacity-pressure',scope:'pane'});
+  // Pressure is not loss and not a fault.
+  expect((s as any).ram.pane(key).health).toBe('healthy');
+  expect(s.health()).toMatchObject({rejectedRows:0,pressure:'recoverable'});
+  const shown=await s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:20,cols:1,rows:1,kind:'normal',cells:[[{grapheme:'Z',width:1,continuation:false,fg:null,bg:null,style:0}]],cursor:null});
+  expect(isProjectionRefusal(shown)).toBe(false);
   expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('Z');
-  s.flush();await s.appendScroll(event('recovered',21));s.flush();expect(s.health().status).toBe('healthy');
+  let waits=0;
+  for(const r of rows.slice(first))await storeRow(s,r,()=>waits++);
+  await storeRow(s,event('recovered',21));s.flush();
+  expect(s.health()).toMatchObject({status:'healthy',pressure:'none',rejectedRows:0});
+  expect(s.readPage(s.token(key),null,30).lines.map(l=>l.text.split(':')[0])).toEqual([...Array.from({length:20},(_,i)=>String(i)),'recovered']);
   const disk=new Database(s.file,{readonly:true});
-  try {
-    expect(disk.query("SELECT sum(missing_count) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:refused});
-    expect(disk.query('SELECT health FROM na_pane').get()).toEqual({health:'healthy'});
-  }finally{disk.close();}
-  console.log('NA_PRESSURE',JSON.stringify({refused,counter:s.health().rejectedRows,faultNotifications:faults.length,screen:'Z',recovered:s.health().status}));
+  try {expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-oversize'").get()).toEqual({n:0});}finally{disk.close();}
+  console.log('NA_PRESSURE',JSON.stringify({firstRefused:first,reofferedAfterWait:waits,faults:faults.length,screen:'Z',health:s.health().status}));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
@@ -324,23 +338,23 @@ test('newarch FIX2: one pane at 10x cannot consume twenty other admission shares
   const jobs:Promise<unknown>[]=[];
   // A blocked producer turn: ten hot rows before every row on each normal pane.
   for(let n=1;n<=100;n++) {
-   for(let j=0;j<10;j++)jobs.push(s.appendScroll(event(0,n*10+j)).catch(()=>{hotRefused++;}));
-   for(let i=1;i<21;i++)jobs.push(s.appendScroll(event(i,n)).catch(()=>{normalRefused++;}));
+   for(let j=0;j<10;j++)jobs.push(s.appendScroll(event(0,n*10+j)).then(r=>{if(isProjectionRefusal(r))hotRefused++;}));
+   for(let i=1;i<21;i++)jobs.push(s.appendScroll(event(i,n)).then(r=>{if(isProjectionRefusal(r))normalRefused++;},()=>{normalRefused++;}));
    maxPending=Math.max(maxPending,internal.pendingBytes());
   }
   const before=faultCalls;
   for(let n=0;n<2000;n++) {
    const rejected=event(0,2000+n,'x'.repeat(1024*1024));
    Object.defineProperty(rejected.physicalRow,'cells',{get(){poisonReads++;throw Error('copied-rejected-cells');}});
-   jobs.push(s.appendScroll(rejected).then(()=>{throw Error('oversize-admitted');},error=>{
-    expect(String(error)).toContain('ingest-capacity');hotRefused++;
-   }));
+   // 1 MiB fits an idle store, so it is pressure on the hot pane, decided before any cell is read.
+   jobs.push(s.appendScroll(rejected).then(r=>{if(!isProjectionRefusal(r))throw Error('over-share-admitted');hotRefused++;}));
   }
   expect(faultCalls-before).toBe(0);expect(poisonReads).toBe(0);
   await Promise.all(jobs);s.flush();
   const disk=new Database(s.file,{readonly:true});
   try {
-   expect(disk.query("SELECT sum(missing_count) AS n FROM na_issue WHERE kind='ingest-capacity'").get()).toEqual({n:hotRefused});
+   // Backpressure is not loss: no capacity issue rows at all.
+   expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-oversize'").get()).toEqual({n:0});
    for(let i=1;i<21;i++)expect(s.token(keys[i]).nextLineId).toBe(101);
   }finally{disk.close();}
   expect(normalRefused).toBe(0);expect(hotRefused).toBeGreaterThan(0);
@@ -361,7 +375,7 @@ test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery
   await s.replaceScreen(frame);expect(s.health().pendingBytes).toBe(first);
   s.flush();expect(s.health().pendingBytes).toBe(0);
   const before=s.token(key).revision;
-  await expect(s.replaceScreen({...frame,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]})).rejects.toThrow('ingest-capacity');
+  await expect(s.replaceScreen({...frame,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]})).rejects.toThrow('ingest-oversize');
   expect(JSON.parse(String(s.screen(key)!.cells_json))[0][0].grapheme).toBe('x');
   expect(s.token(key).revision).toBeGreaterThan(before); // explicit fault, not the rejected screen
   s.flush();
@@ -369,7 +383,7 @@ test('newarch FIX2: screen fast path, queued frames, fault metadata and recovery
   const row=s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:2,softWrap:false,physicalRow:{text:'kept',cells:[]}});
   const transition=s.replaceScreen({...frame,sourceEpoch:2});
   const oversized=s.replaceScreen({...frame,sourceEpoch:2,cells:[[{...cell,grapheme:'z'.repeat(16*1024*1024)}]]});
-  await expect(oversized).rejects.toThrow('ingest-capacity');await Promise.all([row,transition]);
+  await expect(oversized).rejects.toThrow('ingest-oversize');await Promise.all([row,transition]);
   let maxPending=s.health().pendingBytes;
   // Fault kinds deliberately differ, so throttling cannot hide budget growth.
   const originalError=console.error;console.error=()=>{};
@@ -438,7 +452,7 @@ test('newarch FIX2: open loop hot pane 1000 per second plus twenty panes at 100'
      const seq=produced[i]++,text=`${i}:${seq}`.padEnd(80,' ');
      const job=s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:seq,softWrap:false,
       physicalRow:{text,cells:[...text].map(grapheme=>({grapheme,width:1 as const,continuation:false,fg:null,bg:null,style:0}))}})
-      .then(()=>{accepted[i]++;},()=>{refused[i]++;});
+      .then(r=>{if(isProjectionRefusal(r))refused[i]++;else accepted[i]++;},()=>{refused[i]++;});
      jobs.add(job);void job.then(()=>jobs.delete(job));
     }
    }
@@ -481,10 +495,10 @@ test('newarch DEBT2 D9: an idle store with 21..2000 known panes takes a 3000-row
    let ok=0,refused=0;const jobs:Promise<unknown>[]=[];
    // `cat` of a big file: the pipe reader hands over 3000 rows in one tick.
    for(let n=0;n<3000;n++){const t=`line ${n} of a big file`.padEnd(80,' ');
-    jobs.push(s.appendScroll({paneKey:key(0),sourceEpoch:1,geometryGeneration:1,receiveSeq:n+2,softWrap:false,physicalRow:{text:t,cells:[...t].map(g=>cell(g))}}).then(()=>{ok++;},()=>{refused++;}));}
+    jobs.push(s.appendScroll({paneKey:key(0),sourceEpoch:1,geometryGeneration:1,receiveSeq:n+2,softWrap:false,physicalRow:{text:t,cells:[...t].map(g=>cell(g))}}).then(r=>{if(isProjectionRefusal(r))refused++;else ok++;},()=>{refused++;}));}
    const pendingAtBurst=s.health().pendingBytes;
    let frame='accepted';
-   try {await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:9,cols:120,rows:40,kind:'normal',cells:textFrame(cell,120,40,0,false),cursor:{row:0,col:0,visible:true}});}
+   try {const r=await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:9,cols:120,rows:40,kind:'normal',cells:textFrame(cell,120,40,0,false),cursor:{row:0,col:0,visible:true}});if(isProjectionRefusal(r))frame='pressure';}
    catch(error){frame=String(error);}
    await Promise.all(jobs);s.flush();
    expect(s.token(key(0)).nextLineId).toBe(3001);
@@ -505,7 +519,7 @@ test('newarch DEBT2 D10: full-text frames up to 208x60 are never refused on an i
    const tries:string[]=[];
    for(let a=0;a<5;a++) {
     const cells=textFrame(cell,cols,rows,a,coloured);
-    try {await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:2+a,cols,rows,kind:'normal',cells,cursor:{row:0,col:0,visible:true}});tries.push('accepted');}
+    try {const r=await s.replaceScreen({paneKey:key(1),sourceEpoch:1,geometryGeneration:1,receiveSeq:2+a,cols,rows,kind:'normal',cells,cursor:{row:0,col:0,visible:true}});tries.push(isProjectionRefusal(r)?'pressure':'accepted');}
     catch(error){tries.push(String(error));}
     if(a%2)s.flush();else await Bun.sleep(20);
    }
@@ -516,15 +530,15 @@ test('newarch DEBT2 D10: full-text frames up to 208x60 are never refused on an i
   }
   // A pane already over its history share (queue empty) still publishes its screen.
   const big='x'.repeat(1024*1024);let refusedRows=0;
-  const rows=Array.from({length:12},(_,n)=>s.appendScroll({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:10+n,softWrap:false,physicalRow:{text:big,cells:[]}}).catch(()=>{refusedRows++;}));
+  const rows=Array.from({length:12},(_,n)=>s.appendScroll({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:10+n,softWrap:false,physicalRow:{text:big,cells:[]}}).then(r=>{if(isProjectionRefusal(r))refusedRows++;}));
   // Refusal is decided synchronously; read status before any flush can recover the pane.
-  // One pane over its share degrades that pane, not the whole store (O9).
-  const statusAtRefusal=s.health().status;
+  // FIX1 §3: one pane over its share is backpressure on that pane, not a degraded store.
+  const statusAtRefusal=s.health();
   const shown=s.replaceScreen({paneKey:key(2),sourceEpoch:1,geometryGeneration:1,receiveSeq:30,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,0,true),cursor:null});
-  await Promise.all(rows);await shown;
-  expect(refusedRows).toBeGreaterThan(0);expect(statusAtRefusal).toBe('degraded');
+  await Promise.all(rows);expect(isProjectionRefusal(await shown)).toBe(false);
+  expect(refusedRows).toBeGreaterThan(0);expect(statusAtRefusal).toMatchObject({status:'healthy',pressure:'recoverable'});
   s.flush();expect(s.health().pendingBytes).toBe(0);
-  console.log('NA_DEBT2_FRAMES',JSON.stringify({known:2000,results:out,hotPaneRefusedRows:refusedRows,statusAtRefusal}));
+  console.log('NA_DEBT2_FRAMES',JSON.stringify({known:2000,results:out,hotPanePressuredRows:refusedRows,statusAtRefusal:statusAtRefusal.status}));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },120000);
 
@@ -551,7 +565,7 @@ test('newarch DEBT2: queued frames of one pane coalesce to the latest and releas
   const smallBytes=Buffer.byteLength(JSON.stringify(small(0,0)))+512;
   const mixed:Promise<unknown>[]=[row(99,2),s.replaceScreen(small(100,0))];
   for(let a=1;a<=10;a++)mixed.push(row(100+2*a,3),s.replaceScreen(small(101+2*a,a)));
-  expect([...internal.queues.values()][0].length).toBe(22);
+  expect([...internal.queues.values()][0].length).toBe(12);
   await Promise.all(mixed);
   const pending=internal.pendingBytes();
   expect(pending).toBeLessThan(2*smallBytes);
@@ -595,14 +609,14 @@ test('newarch D11: a malformed frame landing on a queued frame is refused alone;
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episode, store never stopped',async()=>{
+test('I2 FIX1 A-B4: hot pane 20000 rows/s beside 21 panes: backpressure on the hot pane only, no loss issue, store never stopped',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-debt2-hot-'));
  const s=createProjectionStore({historyRoot:root,mode:'create'});
  const keys=Array.from({length:21},(_,i)=>({serverIdentity:'hot20k',paneId:`%${i}`,birthGeneration:1}));
  const hot={serverIdentity:'hot20k',paneId:'%hot',birthGeneration:1};
  const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
  const jobs=new Set<Promise<unknown>>(),statusSeen=new Set<string>();
- let produced=0,hotProduced=0,hotOk=0,hotRefused=0,normalRefused=0,frameRefused=0,lastFrame=-1e9,fseq=0;
+ let produced=0,hotProduced=0,hotOk=0,hotRefused=0,hotLost=0,normalRefused=0,frameRefused=0,lastFrame=-1e9,fseq=0;
  const track=(p:Promise<unknown>)=>{jobs.add(p);void p.finally(()=>jobs.delete(p));};
  const originalError=console.error;console.error=()=>{};
  try {
@@ -610,11 +624,11 @@ test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episod
   while(performance.now()-start<10000) {
    const now=performance.now()-start;
    for(const due=Math.floor(now/10);produced<due;produced++)for(let i=0;i<21;i++){const t=`${i}:${produced}`.padEnd(80,' ');
-    track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).catch(()=>{normalRefused++;}));}
+    track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{if(isProjectionRefusal(r))normalRefused++;},()=>{normalRefused++;}));}
    for(const due=Math.floor(now*20);hotProduced<due;hotProduced++){const t=`h:${hotProduced}`.padEnd(80,' ');
-    track(s.appendScroll({paneKey:hot,sourceEpoch:1,geometryGeneration:1,receiveSeq:hotProduced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(()=>{hotOk++;},()=>{hotRefused++;}));}
+    track(s.appendScroll({paneKey:hot,sourceEpoch:1,geometryGeneration:1,receiveSeq:hotProduced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{if(isProjectionRefusal(r))hotRefused++;else hotOk++;},()=>{hotLost++;}));}
    if(now-lastFrame>=100){lastFrame=now;fseq++;for(const k of [...keys,hot])
-    track(s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:fseq,cols:80,rows:24,kind:'normal',cells:textFrame(cell,80,24,fseq,false),cursor:null}).catch(()=>{frameRefused++;}));}
+    track(s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:fseq,cols:80,rows:24,kind:'normal',cells:textFrame(cell,80,24,fseq,false),cursor:null}).then(r=>{if(isProjectionRefusal(r))frameRefused++;},()=>{frameRefused++;}));}
    statusSeen.add(s.health().status);
    await Bun.sleep(10);
   }
@@ -624,12 +638,260 @@ test('newarch DEBT2: hot pane 20000 rows/s beside 21 panes, one issue per episod
    wrong+=page.lines.filter((l,n)=>l.text!==`${i}:${n}`.padEnd(80,' ')).length;}
   const disk=new Database(s.file,{readonly:true});
   let issues:any;
-  try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-capacity'").get();}finally{disk.close();}
+  try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-oversize'").get();}finally{disk.close();}
   console.error=originalError;
-  console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,hotOk,hotRefused,normalRefused,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
+  console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,hotOk,hotPressure:hotRefused,hotLost,normalRefused,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
   expect(normalRefused).toBe(0);expect(frameRefused).toBe(0);expect(missing+wrong).toBe(0);
-  expect(hotRefused).toBeGreaterThan(0);expect(statusSeen.has('stopped')).toBe(false);
-  // Review3 saw 677 issue rows for one continuous 30 s episode; it is one episode here.
-  expect(issues).toEqual({n:1,missing:hotRefused});
+  expect(hotRefused).toBeGreaterThan(0);expect(hotLost).toBe(0);expect(statusSeen.has('stopped')).toBe(false);
+  // Backpressure on the hot pane is not loss: no capacity issue is written at all.
+  expect(issues).toEqual({n:0,missing:0});
+  // Every hot row the store accepted is readable (the fixture producer ignores pause, so no order oracle here).
+  expect(s.token(hot).nextLineId).toBe(hotOk);
  }finally{console.error=originalError;await s.close();rmSync(root,{recursive:true,force:true});}
+},60000);
+
+// I2 §7: probe the disk writer independently of parser/capture and the host package.
+test('I2 probe: bundled projection worker drains and reopens its own durable database',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-bundle-'));
+ try {
+  const build=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir:join(root,'bundle'),target:'bun'});
+  expect(build.success).toBe(true);
+  const script=`import {createProjectionStore} from ${JSON.stringify(join(root,'bundle/projection-store.js'))};
+   const key={serverIdentity:'bundle',paneId:'%1',birthGeneration:1};
+   let s=createProjectionStore({historyRoot:${JSON.stringify(join(root,'data'))},mode:'create'});
+   const cpu=process.cpuUsage(),start=performance.now();
+   for(let n=0;n<2000;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:'ไทย '+n,cells:[]}});
+   await new Promise(r=>setTimeout(r,100));
+   const durableBeforeClose=s.token(key).durableRevision;await s.close();
+   s=createProjectionStore({historyRoot:${JSON.stringify(join(root,'data'))},mode:'recover'});
+   const count=s.token(key).nextLineId;await s.close();
+   console.log('I2_BUNDLE_PROBE',JSON.stringify({count,durableBeforeClose,elapsedMs:performance.now()-start,cpu:process.cpuUsage(cpu)}));
+   if(count!==2000 || durableBeforeClose===0)process.exitCode=1;`;
+  const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+  const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  console.log(out);if(err)console.error(err);expect(exit).toBe(0);
+ }finally{rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2 probe: measure A borrowing before B through E arrive without disk acknowledgements',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-borrow-'));
+ const s=createProjectionStore({historyRoot:root,mode:'create'});clearInterval((s as any).timer);
+ const admitted:number[]=[],refused:number[]=[];
+ try {
+  for(let pane=0;pane<5;pane++) {
+   admitted[pane]=0;refused[pane]=0;
+   for(let n=0;n<(pane===0?7:2);n++) {
+    const r=await s.appendScroll({paneKey:{serverIdentity:'borrow',paneId:`%${pane}`,birthGeneration:1},sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:'x'.repeat(1024*1024),cells:[]}});
+    if(isProjectionRefusal(r))refused[pane]++;else admitted[pane]++;
+   }
+  }
+  console.log('I2_BORROW_PROBE',JSON.stringify({admitted,refused,health:s.health()}));
+  expect(s.health().pendingBytes).toBeLessThanOrEqual(16*1024*1024);
+  // A borrowed ~7 MiB; B..E still get their 1 MiB rows through the pool that A may not exhaust.
+  expect(admitted[0]).toBeGreaterThan(2);expect(admitted.slice(1).every(n=>n>=1)).toBe(true);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2: acknowledgement cannot clear RAM pressure before cache also recovers (real rows, no stubbed counter)',async()=>{
+ // 2 MiB cache: fewer than the 5000 lines a pane keeps after eviction already fill it,
+ // so an acknowledgement empties the pending budget while RAM stays over its cap.
+ const root=mkdtempSync(join(tmpdir(),'na-i2-cache-')),s=createProjectionStore({historyRoot:root,mode:'create',cacheBytes:2*1024*1024});
+ clearInterval((s as any).timer);
+ const key={serverIdentity:'cache',paneId:'%1',birthGeneration:1};
+ try {
+  let n=0,refusal:any=null;
+  while(!refusal && n<5000){const r:any=await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:`keep ${n}`.padEnd(300,'.'),cells:[]}});if(!isProjectionRefusal(r))n++;else if(r.scope==='pane')s.flush();else refusal=r;}
+  expect(refusal).toMatchObject({scope:'store'});expect(n).toBeLessThan(5000);
+  s.flush();
+  expect(s.health()).toMatchObject({status:'stopped',pressure:'recoverable',pendingBytes:0,rejectedRows:0});
+  const state=await Promise.race([s.drained(key).then(()=>'drained'),Bun.sleep(300).then(()=>'waiting')]);
+  expect(state).toBe('waiting');
+  expect(s.health().panes[0].status).toBe('healthy');   // pressure is not a pane fault
+  expect(s.token(key).nextLineId).toBe(n);expect(s.token(key).durableRevision).toBe(s.token(key).revision);
+  console.log('I2_CACHE_PRESSURE',JSON.stringify({rows:n,ramBytes:s.health().ramBytes,state}));
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('I2: 208x60 interleaved frames retain all scrolls under one bounded latest-frame reservation',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-interleave-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ const key={serverIdentity:'interleave',paneId:'%1',birthGeneration:1};
+ const cell=(grapheme:string)=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+ try {
+  const jobs:Promise<unknown>[]=[];
+  for(let n=0;n<40;n++) {
+   jobs.push(s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}}));
+   jobs.push(s.replaceScreen({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,cols:208,rows:60,kind:'normal',cells:textFrame(cell,208,60,n,true),cursor:null}));
+  }
+  expect(s.health().pendingBytes).toBeLessThan(1024*1024);
+  await Promise.all(jobs);s.flush();
+  expect(s.readPage(s.token(key),null,100).lines.map(r=>r.text)).toEqual(Array.from({length:40},(_,n)=>String(n)));
+  expect(JSON.parse(String(s.screen(key)!.cells_json))[59][207]).toEqual(textFrame(cell,208,60,39,true)[59][207]);
+  expect(s.health().pendingBytes).toBe(0);
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},30000);
+
+const I2_FIX1_MUTATIONS=[
+  {name:'A-B2 quiescent-check',file:'ram-store.ts',before:"|| evidence.receiveSeqBefore!==evidence.receiveSeqAfter)throw new Error('capture-not-quiescent');",after:")throw new Error('capture-not-quiescent');"},
+  {name:'C-F13 freelist',file:'ram-store.ts',before:'return (pages.page_count-free.freelist_count)*this.pageSize;',after:'return pages.page_count*this.pageSize;'},
+  {name:'A-B4 guarantee',file:'projection-store.ts',before:"return mineBorrow<=Math.floor(pool/Math.max(2,borrowers)) && borrowed+mineBorrow<=pool?'ok':'pane';",after:"return 'ok';"},
+  {name:'A-B1 fast-path',file:'projection-store.ts',before:'if(fence>=0) {',after:'if(queued.length) {'},
+  {name:'C-F12 cas-at-admission',file:'projection-store.ts',before:'const receipt=this.ram.recordIssue(value,undefined,true);',after:'const receipt=this.ram.recordIssue(value);'},
+  {name:'C-F11 async-epoch',file:'projection-store.ts',before:'.then(receipt=>{this.kickFlush();return receipt;}',after:'.then(receipt=>{this.flush();return receipt;}'},
+];
+// FIX2: each mutant removes one repair of this round; its oracle must go red.
+const I2_FIX2_MUTATIONS=[
+  {name:'FIX2-M2 history-only admission',file:'projection-store.ts',before:"if(historyOnly?change.expectedRevision>revision:this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');",after:"if(this.queues.get(pane)?.length || revision!==change.expectedRevision)throw new Error('stale-revision');"},
+  {name:'FIX2-M2 history-only run-time',file:'ram-store.ts',before:'if (historyOnly ? change.expectedRevision > Number(p.revision) : p.revision !== change.expectedRevision) throw',after:'if (p.revision !== change.expectedRevision) throw'},
+  {name:'FIX2-M1 count-once',file:'projection-store.ts',before:'if(identity===null || this.lastOversize.get(id)!==identity) {',after:'if(true) {'},
+  {name:'FIX2-M1 own-name',file:'projection-store.ts',before:'throw new Error(PROJECTION_OVERSIZE);',after:"throw new Error('ingest-capacity');"},
+  {name:'FIX2-B1 null-evidence',file:'ram-store.ts',before:"if(evidence?.kind==='quiescent') {",after:'if(evidence!==undefined) {'},
+  {name:'FIX2-B1 uncertain-rows',file:'ram-store.ts',before:'this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);',after:'this.screen(c,c.captureId,c.completedAt,c.observedFields);'},
+];
+async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
+ const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
+ const results:any[]=[];
+ try {
+  for(const mutation of cases)for(const broken of [false,true]) {
+   const outdir=join(root,mutation.name.replace(/\W+/g,'-')+'-'+broken);
+   const result=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir,target:'bun',plugins:[{
+    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store)\.ts$/},args=>{
+     let contents=readFileSync(args.path,'utf8');
+     if(broken && args.path.endsWith('/'+mutation.file)) {expect(contents).toContain(mutation.before);contents=contents.replace(mutation.before,mutation.after);}
+     return {contents,loader:'ts'};
+    });}
+   }]});
+   expect(result.success).toBe(true);
+   const script=`import {createProjectionStore} from ${JSON.stringify(join(outdir,'projection-store.js'))};
+    import {Database} from 'bun:sqlite';
+    const name=${JSON.stringify(mutation.name)},data=${JSON.stringify(join(outdir,'data'))};
+    const key={serverIdentity:'mutation',paneId:'%1',birthGeneration:1};
+    const cell=g=>({grapheme:g,width:1,continuation:false,fg:null,bg:null,style:0});
+    const row=(text,n,k=key)=>({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}});
+    const frame=(g)=>({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:1,rows:1,kind:'normal',cells:[[cell(g)]],cursor:null});
+    const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
+    const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('freelist')?6*1024*1024:undefined});
+    try {
+     if(name.startsWith('FIX2-M2')) {
+      await s.appendScroll(row('stable',1));const read=s.token(key);
+      await s.appendScroll(row('moved',2));
+      const queued=Array.from({length:20},(_,n)=>s.appendScroll(row('q'+n,3+n)));
+      let ok=true;
+      try {await s.calibrate({capture:{...frame('Z'),captureId:'history-only',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[{text:'stable',cells:[...'stable'].map(cell)}],observedFields:[],ambiguousRows:0,result:'fixture'},expectedRevision:read.revision,captureEvidence:null,checks:[{lineId:0,captureRow:0}],repairs:[]});}catch{ok=false;}
+      await Promise.all(queued);
+      assert(ok && s.readPage(s.token(key),null,5).lines[0].checkState==='checked','history-only calibration must not be refused for queued rows or a moved revision');
+     } else if(name.startsWith('FIX2-M1')) {
+      const huge={...row('',2),physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}};
+      const errors=[];for(let i=0;i<3;i++)errors.push(String(await s.appendScroll(huge).then(()=>'accepted',e=>e)));
+      assert(errors.every(e=>e.includes('ingest-oversize')),'oversize must reject under its own name: '+errors[0]);
+      assert(s.health().rejectedRows===1,'one oversized event re-offered 3 times is one loss, got '+s.health().rejectedRows);
+     } else if(name.startsWith('FIX2-B1')) {
+      await s.replaceScreen(frame('A'));
+      const capture=id=>({...frame('Z'),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:[],ambiguousRows:0,result:'fixture'});
+      let ok=true;
+      try {await s.calibrate({capture:capture('null'),expectedRevision:s.token(key).revision,captureEvidence:null,checks:[],repairs:[]});}catch{ok=false;}
+      assert(ok && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='A','null evidence checks history only, without an error');
+      await s.calibrate({capture:capture('emoji'),expectedRevision:s.token(key).revision,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:1,uncertainRows:[0]},checks:[],repairs:[]});
+      assert(s.screen(key).uncertain_rows_json==='[0]' && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='Z','an uncertain row is drawn and kept uncertified');
+     } else if(name.includes('quiescent')) {
+      await s.replaceScreen(frame('A'));
+      let rejected=false;
+      try {await s.calibrate({capture:{...frame('Z'),captureId:'moving',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:[],ambiguousRows:0,result:'fixture'},expectedRevision:s.token(key).revision,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:2},checks:[],repairs:[]});}
+      catch(e){rejected=String(e).includes('capture-not-quiescent');}
+      assert(rejected && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='A','bytes during capture must not calibrate the screen');
+     } else if(name.includes('freelist')) {
+      clearInterval(s.timer);let n=0,refused=false;
+      while(!refused && n<20000){const r=await s.appendScroll(row(('row '+n+' ').padEnd(400,'x'),n+1));if(r.accepted!==false)n++;else if(r.scope==='pane')s.flush();else refused=true;}
+      assert(refused,'fixture must reach RAM pressure');s.flush();
+      const state=await Promise.race([s.drained(key).then(()=>'drained'),new Promise(r=>setTimeout(()=>r('stuck'),1500))]);
+      assert(state==='drained','eviction must clear RAM pressure');
+     } else if(name.includes('guarantee')) {
+      clearInterval(s.timer);
+      // A fills whatever it is allowed in 8 KiB rows (no disk acknowledgement), then B offers one 8 KiB row.
+      const text=n=>('A'+n).padEnd(8192,'a');let n=0;
+      while(n<4000 && (await s.appendScroll({...row('',n,{...key,paneId:'%A'}),physicalRow:{text:text(n),cells:[]}})).accepted!==false)n++;
+      const b=await s.appendScroll({...row('',1,{...key,paneId:'%B'}),physicalRow:{text:text(0).replace('A','B'),cells:[]}});
+      assert(b.accepted!==false,'a late pane gets its guaranteed quota while A borrows');
+     } else if(name.includes('fast-path')) {
+      for(let n=0;n<200;n++)void s.appendScroll(row('r'+n,n));
+      void s.replaceScreen(frame('F'));
+      assert(s.screen(key) && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='F','frame must not wait behind queued rows');
+      await new Promise(r=>setTimeout(r,50));
+     } else if(name.includes('cas')) {
+      await s.appendScroll(row('seed',0));
+      const rows=Array.from({length:20},(_,n)=>s.appendScroll(row('busy'+n,n+1)));
+      const t=s.token(key);let ok=true;
+      try {await s.recordIssue({paneKey:key,sourceEpoch:1,geometryGeneration:1,expectedRevision:t.revision,boundaryLineId:t.nextLineId,kind:'fault',reason:'fixture',missingCount:null,recoverable:true});}catch{ok=false;}
+      await Promise.all(rows);assert(ok,'CAS is taken at admission, not after queued output');
+     } else {
+      await s.appendScroll(row('before',1));s.flush();
+      const lock=new Database(s.file);lock.exec('BEGIN IMMEDIATE');
+      let ok=true;const started=performance.now();
+      try {await s.transitionEpoch({paneKey:key,sourceEpoch:1,nextEpoch:2,geometryGeneration:1,expectedRevision:s.token(key).revision,boundaryLineId:1,kind:'restart',reason:'fixture',missingCount:null,recoverable:true});}catch{ok=false;}
+      const ms=performance.now()-started;lock.exec('COMMIT');lock.close();
+      assert(ok && ms<50,'transition must return the RAM receipt without waiting for the disk ('+Math.round(ms)+' ms)');
+     }
+    } finally {try{await s.close();}catch{}}`;
+   const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+   const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+   const red=err.match(/error: (MUTATION_RED: [^\n]*)/)?.[1]??null;
+   results.push({name:mutation.name,broken,exit,red});
+   console.log('I2_MUTATION',JSON.stringify({name:mutation.name,broken,exit,red,stderrTail:red?undefined:err.slice(-400)}));
+   expect(exit).toBe(broken?1:0);if(broken)expect(err).toContain('MUTATION_RED:');
+  }
+  console.log(label,JSON.stringify(results));
+ }finally{rmSync(root,{recursive:true,force:true});}
+}
+test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',()=>runI2Mutations(I2_FIX1_MUTATIONS,'I2_FIX1_MUTATIONS'),180000);
+test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
+
+test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ clearInterval((s as any).timer);   // no background flush: only drained() moves the disk writer
+ const counts=[6000,3000,3000,3000,3000],firstPass=Array(5).fill(0),pressure=Array(5).fill(0),lost=Array(5).fill(0);
+ const key=(pane:number)=>({serverIdentity:'d12',paneId:`%${pane}`,birthGeneration:1});
+ const cell=(grapheme:string)=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+ const event=(pane:number,n:number)=>{const text=`${pane} line ${n} of a big file`.padEnd(80,' ');
+  return {paneKey:key(pane),sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}};};
+ try {
+  // A arrives first and borrows; then B..E each hand over a whole burst in one tick.
+  const offered=counts.map((count,pane)=>Array.from({length:count},(_,n)=>s.appendScroll(event(pane,n))));
+  const outcomes=await Promise.all(offered.map(p=>Promise.all(p)));
+  outcomes.forEach((o,pane)=>{firstPass[pane]=o.findIndex(isProjectionRefusal);if(firstPass[pane]<0)firstPass[pane]=o.length;});
+  const {guarantee}=(s as any).quota((s as any).rosterSize);
+  const pendingAtBurst=s.health().pendingBytes;
+  // Each producer re-offers from its first refused row, in order, after drained().
+  await Promise.all(counts.map(async(count,pane)=>{
+   for(let n=firstPass[pane];n<count;n++)await storeRow(s,event(pane,n),()=>pressure[pane]++).catch(()=>{lost[pane]++;});
+  }));
+  s.flush();
+  let missing=0,wrong=0;
+  for(let pane=0;pane<5;pane++){
+   const token=s.token(key(pane));let anchor:number|null=null,seen=0;
+   do{const page=s.readPage(token,anchor,2000);for(const l of page.lines){if(l.text!==event(pane,seen).physicalRow.text)wrong++;seen++;}anchor=page.hasMore?page.nextAnchor:null;}while(anchor!==null);
+   missing+=counts[pane]-seen;
+  }
+  const normalRefused=lost.slice(1).reduce((a,b)=>a+b,0);
+  const rowBytes=event(1,0).physicalRow.text.length;
+  console.log('I2_D12_CONTRACT_PROBE',JSON.stringify({counts,firstPass,pressure,lost,normalRefused,missing,wrong,guarantee,pendingAtBurst,health:{...s.health(),panes:undefined}}));
+  expect(pendingAtBurst).toBeLessThanOrEqual(16*1024*1024);
+  expect(normalRefused).toBe(0);expect(lost[0]).toBe(0);expect(missing).toBe(0);expect(wrong).toBe(0);
+  // Guarantee: every late pane was admitted at least its quota worth of rows in the first pass, while A was borrowing.
+  expect(firstPass[0]).toBeLessThan(6000);
+  for(let pane=1;pane<5;pane++)expect(firstPass[pane]).toBeGreaterThan(Math.floor(guarantee/(rowBytes*20)));
+  expect(s.health()).toMatchObject({rejectedRows:0,pressure:'none'});
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},60000);
+
+test('I2: shutdown after 2000 and 20000 accepted rows has durable receipts and immediate reopen',async()=>{
+ for(const count of [2000,20000]) {
+  const root=mkdtempSync(join(tmpdir(),'na-i2-drain-')),key={serverIdentity:'drain',paneId:'%1',birthGeneration:1};
+  let s=createProjectionStore({historyRoot:root,mode:'create'});
+  try {
+   for(let n=0;n<count;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+   const pendingAtClose=s.health().pendingBytes,started=performance.now();await s.close();const closeMs=performance.now()-started;
+   s=createProjectionStore({historyRoot:root,mode:'recover'});
+   expect(s.token(key).nextLineId).toBe(count);expect(s.token(key).revision).toBe(s.token(key).durableRevision);
+   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs}));
+  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+ }
 },60000);
