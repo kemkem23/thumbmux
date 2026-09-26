@@ -548,7 +548,7 @@ export class PipeHistoryCollector {
    * a parser-independent fault.
    */
   private deliver(send: () => unknown, drop: () => void): { receipt: unknown; pressured: boolean } {
-    const dropped = () => { drop(); return DROPPED; };
+    const dropped = (): typeof DROPPED => { drop(); return DROPPED; };
     let answer: unknown;
     try { answer = send(); }
     catch (error) {
