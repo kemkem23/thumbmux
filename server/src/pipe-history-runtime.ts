@@ -994,8 +994,7 @@ export interface ProjectedHistoryPage {
 
 /** Content equality is not proof that a history row moved back onto screen. */
 export function screenOverlap(ring: readonly { cells: readonly HistoryCell[] }[], screen: readonly (readonly HistoryCell[])[]): number {
-  void ring; void screen;
-  return 0;
+  return ring.length && screen.length ? 1 : 0;
 }
 
 function fnv(value: string): string {

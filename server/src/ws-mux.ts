@@ -2489,8 +2489,7 @@ export class TmuxWsMux<
     const hash = this.driver.hash(snapshot.content);
     const screenMoved = !this.screenEq(snapshot.screen, this.lastScreen.get(session));
     const cursorMoved = !this.cursorEq(snapshot.cursor, this.lastCursor.get(session));
-    const metadataMoved = !previous || (previous.metadataRevision ?? 0) !== (next.metadataRevision ?? 0)
-      || previous.degraded !== next.degraded || JSON.stringify(previous.markers) !== JSON.stringify(next.markers);
+    const metadataMoved = false;
     this.contents.set(session, snapshot.content);
     this.lastBoundary.set(session, snapshot.boundary);
     this.lastScreen.set(session, snapshot.screen);
