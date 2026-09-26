@@ -1674,7 +1674,7 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
         if (text === "P0040" && refusals < 5) {
           refusals++;
           if (shape === "sync-object") return { accepted: false, reason: "capacity-pressure" };
-          if (shape === "rejected-error") return Promise.reject(Object.assign(new Error("ingest-capacity"), { reason: "capacity-pressure" }));
+          if (shape === "rejected-error") return Promise.reject(Object.assign(new Error("store full"), { reason: "capacity-pressure" }));
           return Promise.resolve({ accepted: false, reason: "capacity-pressure" });
         }
         stored.push(text);
@@ -1706,6 +1706,90 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
     pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
     await untilFix1(() => pane.faults.some((f) => f.kind === "consumer-rejected"));
     expect(pane.faults.find((f) => f.kind === "consumer-rejected")?.message).toContain("schema-violation");
+  });
+
+  for (const shape of ["thrown-oversize", "rejected-legacy-capacity", "resolved-oversize", "pressure-then-oversize"] as const) test(`FIX2 M1 an oversize scroll (${shape}) is offered once, dropped, and declared by exactly one marker`, async () => {
+    const stored: string[] = [];
+    let offers = 0;
+    const pane = await collectPane(80, 3, { pressureRetryMs: 1, ports: {
+      onScroll: (event) => {
+        const text = rowText(event.physicalRow).trimEnd();
+        if (text === "O0040") {
+          offers++;
+          if (shape === "thrown-oversize") throw new Error("ingest-oversize");
+          if (shape === "rejected-legacy-capacity") return Promise.reject(new Error("ingest-capacity"));
+          if (shape === "resolved-oversize") return Promise.resolve({ accepted: false, reason: "ingest-oversize" });
+          if (offers === 1) return { accepted: false, reason: "capacity-pressure" };
+          return Promise.reject(new Error("ingest-oversize"));
+        }
+        stored.push(text);
+        return Promise.resolve({ accepted: true });
+      },
+      onFrame: () => {},
+      onFault: (event) => { pane.faults.push(event); },
+    } });
+    const pid = pane.collector.workerPid;
+    const lines = fixLines("O", 120);
+    pane.collector.ingest(encoder.encode(lines.join("\r\n") + "\r\n"));
+    await settle(pane);
+    await sleep(250);
+    // Not retried: a store that can never admit the row is asked once (twice
+    // when the first answer was transient pressure), never in a loop.
+    expect(offers).toBe(shape === "pressure-then-oversize" ? 2 : 1);
+    expect(stored).toEqual(lines.slice(0, 120 + 1 - 3).filter((line) => line !== "O0040"));
+    const markers = pane.faults.filter((f) => f.kind === "consumer-oversize");
+    expect(markers.length).toBe(1);
+    expect(markers[0]).toMatchObject({ droppedEvent: "scroll", lostRows: 1, missingCount: 1, sourceEpoch: 1 });
+    expect(markers[0]!.receiveSeqFrom).toBeGreaterThan(0);
+    expect(markers[0]!.receiveSeqTo).toBe(markers[0]!.receiveSeqFrom);
+    expect(pane.faults.some((f) => f.kind === "consumer-rejected")).toBe(false);
+    expect(pane.collector.stats().oversizeDrops).toBe(1);
+    expect(pane.collector.ringSnapshot().some((event) => rowText(event.physicalRow).trimEnd() === "O0040")).toBe(false);
+    expect(pane.collector.workerPid).toBe(pid);
+    expect(pane.collector.currentSourceEpoch()).toBe(1);
+    expect(pane.collector.health()).toBe("ok");
+    console.log(`FIX2 M1 ${shape}: offers=${offers} stored=${stored.length} markers=1 oversizeDrops=1 restarts=0`);
+  });
+
+  test("FIX2 M1 an oversize delta frame is dropped once, declared, and a full frame is requested once; an oversize full frame is not re-requested", async () => {
+    const offered: Array<{ full: boolean; refused: boolean }> = [];
+    let armed = false;
+    let refuseDelta = 1;
+    let refuseFull = 1;
+    const pane = await collectPane(80, 3, { ports: {
+      onScroll: () => {},
+      onFrame: (frame) => {
+        if (!armed) return;
+        const refuse = frame.cells.full ? refuseDelta === 0 && refuseFull-- > 0 : refuseDelta-- > 0;
+        offered.push({ full: frame.cells.full, refused: refuse });
+        if (refuse) throw new Error("ingest-oversize");
+      },
+      onFault: (event) => { pane.faults.push(event); },
+    } });
+    pane.collector.ingest(encoder.encode("one\r\n"));
+    await settle(pane);
+    await sleep(100);
+    armed = true;
+    pane.collector.ingest(encoder.encode("two\r\n"));
+    await untilFix1(() => offered.some((f) => f.full));
+    await settle(pane);
+    await sleep(300);
+    // delta refused -> one full frame requested -> that full frame refused ->
+    // no further request (it would loop); the pane then keeps flowing.
+    expect(offered).toEqual([{ full: false, refused: true }, { full: true, refused: true }]);
+    const markers = pane.faults.filter((f) => f.kind === "consumer-oversize");
+    expect(markers.map((f) => f.droppedEvent)).toEqual(["frame", "frame"]);
+    expect(markers.every((f) => f.lostRows === undefined && f.missingCount === undefined)).toBe(true);
+    pane.collector.ingest(encoder.encode("three\r\n"));
+    await settle(pane);
+    await sleep(100);
+    expect(offered.length).toBe(3);
+    expect(offered[2]).toEqual({ full: false, refused: false });
+    expect(pane.collector.stats().oversizeDrops).toBe(2);
+    expect(pane.faults.some((f) => f.kind === "consumer-rejected")).toBe(false);
+    expect(pane.collector.currentSourceEpoch()).toBe(1);
+    expect(pane.collector.health()).toBe("ok");
+    console.log(`FIX2 M1 frame: offers=${offered.length} markers=${markers.length} fullRequests=1`);
   });
 
   test("C-F2 bytes arriving while the parser respawns are held and parsed by the new worker; drained waits for it", async () => {

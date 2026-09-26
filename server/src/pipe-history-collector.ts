@@ -20,6 +20,21 @@ import {
  * - every scrolled row reaches `onScroll` before the tray ring evicts
  *   anything to make room for it, and before the frame of the same update;
  * - `receiveSeq` is our receive order, not a tmux offset or source fence.
+ *
+ * Consumer contract (review 2 m1, m4, M1):
+ * - `onFrame` carries a DELTA (`shift` then `dirty`), not a full screen.
+ *   Under capacity pressure the very same frame object is offered again,
+ *   unchanged. A consumer must apply a frame atomically and only when it
+ *   answers "accepted"; applying it and then refusing would apply `shift`
+ *   twice on the re-offer.
+ * - "The source is quiet" must be judged from the RECEIVE counter,
+ *   `stats().receiveSeq` (bytes taken off the pipe), read before and after a
+ *   capture. A frame's `receiveSeq` is the last PARSED seq; bytes received
+ *   but still in the parser are invisible to it.
+ * - Capacity pressure (`isCapacityPressure`) is transient: the event is
+ *   offered again until accepted. Oversize (`isOversize`: `ingest-oversize`,
+ *   legacy `ingest-capacity`) is permanent: the event is offered once,
+ *   dropped, and declared by exactly one `consumer-oversize` fault.
  */
 
 export type PaneKey = { serverIdentity: string; paneId: string; birthGeneration: number };
@@ -59,17 +74,21 @@ export type PipeFrameEvent = {
 
 export type PipeFaultEvent = {
   kind: PipeVtFault["kind"] | "parser-backlog" | "worker-restarted" | "history-cleared" | "closed" | "consumer-rejected" | "source-reset"
-    | "consumer-pressure" | "consumer-pressure-cleared";
+    | "consumer-pressure" | "consumer-pressure-cleared" | "consumer-oversize";
   paneKey?: PaneKey;
   sourceEpoch?: number;
-  missingCount?: null;
+  /** null = unknown; a number only on `consumer-oversize` of a scroll (1). */
+  missingCount?: number | null;
   at: number;
   message?: string;
   /** Bytes whose parsing could not be acknowledged; not a guessed row count. */
   unacknowledgedBytes?: number;
   receiveSeqFrom?: number;
   receiveSeqTo?: number;
-  lostRows?: "unknown";
+  /** "unknown", or the exact count of a declared drop (`consumer-oversize`). */
+  lostRows?: "unknown" | number;
+  /** `consumer-oversize` only: which event the consumer can never admit. */
+  droppedEvent?: "scroll" | "frame";
 };
 
 export interface PipeCollectorPorts {
@@ -117,21 +136,38 @@ export type PipeHistoryCollectorOptions = {
 /**
  * A consumer answer meaning "full for now, nothing was kept": the store's
  * `{ accepted: false, reason: "capacity-pressure" }` receipt, or an error with
- * that reason (or a capacity error message) from a store that still throws.
+ * that reason (or that word in its message) from a store that still throws.
  * It is backpressure, never a parser fault: the same event is offered again.
  */
 export function isCapacityPressure(value: unknown): boolean {
   if (value === null || typeof value !== "object") return false;
   const answer = value as { reason?: unknown; message?: unknown };
   if (answer.reason === "capacity-pressure") return true;
-  return value instanceof Error && /\b(?:capacity-pressure|ingest-capacity)\b/.test(String(answer.message));
+  return value instanceof Error && /\bcapacity-pressure\b/.test(String(answer.message));
+}
+
+/**
+ * A consumer answer meaning "this one event can never fit, even in an idle
+ * store" (review 2 M1): reason or error message `ingest-oversize` (I2 FIX2),
+ * or the legacy `ingest-capacity` message of the FIX1 store. Waiting cannot
+ * help, so the event is offered once, dropped, and declared with one
+ * `consumer-oversize` marker; the pane keeps flowing and the parser stays.
+ */
+export function isOversize(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || isCapacityPressure(value)) return false;
+  const answer = value as { reason?: unknown; message?: unknown };
+  if (answer.reason === "ingest-oversize" || answer.reason === "ingest-capacity") return true;
+  return value instanceof Error && /\b(?:ingest-oversize|ingest-capacity)\b/.test(String(answer.message));
 }
 
 /** A resolved receipt that explicitly refuses for a reason other than pressure. */
 function isRefusal(value: unknown): boolean {
   return value !== null && typeof value === "object" && (value as { accepted?: unknown }).accepted === false
-    && !isCapacityPressure(value);
+    && !isCapacityPressure(value) && !isOversize(value);
 }
+
+/** Receipt value of an event the consumer refused as oversize (dropped, declared). */
+const DROPPED = Symbol("pipe-history-dropped");
 
 type BunPeek = { peek?: ((promise: unknown) => unknown) & { status?: (promise: unknown) => string } };
 
@@ -194,6 +230,7 @@ export class PipeHistoryCollector {
   private held: Array<{ seq: number; bytes: Uint8Array }> = [];
   private pressureEpisode = false;
   private pressureRetries = 0;
+  private oversizeDrops = 0;
 
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
@@ -408,6 +445,7 @@ export class PipeHistoryCollector {
       acceptedBytes: this.acceptedBytes,
       refusedBytes: this.refusedBytes,
       pressureRetries: this.pressureRetries,
+      oversizeDrops: this.oversizeDrops,
       scrolls: this.scrollCount,
       frames: this.frameCount,
       workerParseMs: this.workerParseNs / 1e6,
@@ -503,15 +541,19 @@ export class PipeHistoryCollector {
 
   /**
    * Offer one event to a consumer port. Accepted synchronously -> undefined;
-   * pending -> a Promise that settles once the event is accepted. Capacity
-   * pressure retries the same event (bounded backoff, forever until close);
-   * any other refusal rejects and becomes a parser-independent fault.
+   * refused as oversize synchronously -> DROPPED (declared once via `drop`);
+   * pending -> a Promise that settles (undefined or DROPPED) once decided.
+   * Capacity pressure retries the same event (bounded backoff, forever until
+   * close); oversize is never retried; any other refusal rejects and becomes
+   * a parser-independent fault.
    */
-  private deliver(send: () => unknown): { receipt: unknown; pressured: boolean } {
+  private deliver(send: () => unknown, drop: () => void): { receipt: unknown; pressured: boolean } {
+    const dropped = () => { drop(); return DROPPED; };
     let answer: unknown;
     try { answer = send(); }
     catch (error) {
-      if (isCapacityPressure(error)) return { receipt: this.retryPressure(send), pressured: true };
+      if (isCapacityPressure(error)) return { receipt: this.retryPressure(send, dropped), pressured: true };
+      if (isOversize(error)) return { receipt: dropped(), pressured: false };
       throw error;
     }
     if (isReceipt(answer)) {
@@ -520,22 +562,39 @@ export class PipeHistoryCollector {
       const pressured = refusedNow(answer);
       const receipt = Promise.resolve(answer).then(
         (value) => {
-          if (isCapacityPressure(value)) return this.retryPressure(send);
+          if (isCapacityPressure(value)) return this.retryPressure(send, dropped);
+          if (isOversize(value)) return dropped();
           if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
         },
         (error) => {
-          if (isCapacityPressure(error)) return this.retryPressure(send);
+          if (isCapacityPressure(error)) return this.retryPressure(send, dropped);
+          if (isOversize(error)) return dropped();
           throw error;
         },
       );
       return { receipt, pressured };
     }
-    if (isCapacityPressure(answer)) return { receipt: this.retryPressure(send), pressured: true };
+    if (isCapacityPressure(answer)) return { receipt: this.retryPressure(send, dropped), pressured: true };
+    if (isOversize(answer)) return { receipt: dropped(), pressured: false };
     if (isRefusal(answer)) throw new Error(`consumer refused: ${JSON.stringify(answer)}`);
     return { receipt: undefined, pressured: false };
   }
 
-  private async retryPressure(send: () => unknown): Promise<void> {
+  /** One declared loss per event the consumer can never admit; never retried. */
+  private declareOversize(droppedEvent: "scroll" | "frame", receiveSeq: number, full = false): void {
+    this.oversizeDrops += 1;
+    this.notifyFault({ kind: "consumer-oversize", at: this.now(), droppedEvent,
+      receiveSeqFrom: receiveSeq, receiveSeqTo: receiveSeq,
+      ...(droppedEvent === "scroll" ? { lostRows: 1, missingCount: 1 } : {}),
+      message: droppedEvent === "scroll"
+        ? "consumer can never admit this scrolled row (oversize); dropped once, not retried"
+        : `consumer can never admit this ${full ? "full " : ""}frame (oversize); screen stale until a later frame is accepted` });
+    // A dropped delta leaves the consumer's screen behind: ask once for a
+    // full frame. A dropped full frame is not re-requested (it would loop).
+    if (droppedEvent === "frame" && !full) this.requestFullFrame();
+  }
+
+  private async retryPressure(send: () => unknown, dropped: () => typeof DROPPED): Promise<void | typeof DROPPED> {
     if (!this.pressureEpisode) {
       this.pressureEpisode = true;
       if (this.healthState === "ok") this.healthState = "degraded";
@@ -553,9 +612,11 @@ export class PipeHistoryCollector {
       try { value = await send(); }
       catch (error) {
         if (isCapacityPressure(error)) continue;
+        if (isOversize(error)) return dropped();
         throw error;
       }
       if (isCapacityPressure(value)) continue;
+      if (isOversize(value)) return dropped();
       if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
       return;
     }
@@ -594,14 +655,20 @@ export class PipeHistoryCollector {
     let stop = events.length;
     for (let i = index; i < events.length; i++) {
       const event = events[i]!;
-      const { receipt, pressured } = this.deliver(() => this.options.ports.onScroll(event));
-      if (receipt === undefined && pending.length === 0) { this.remember(event); accepted = i + 1; continue; }
+      const { receipt, pressured } = this.deliver(() => this.options.ports.onScroll(event),
+        () => this.declareOversize("scroll", event.receiveSeq));
+      if ((receipt === undefined || receipt === DROPPED) && pending.length === 0) {
+        if (receipt === undefined) this.remember(event);
+        accepted = i + 1;
+        continue;
+      }
       pending.push(receipt);
       if (pressured) { stop = i + 1; break; }
     }
     if (pending.length === 0) return;
-    return Promise.all(pending).then(() => {
-      for (let i = accepted; i < stop; i++) this.remember(events[i]!);
+    return Promise.all(pending).then((answers) => {
+      // A dropped row never enters the tray ring: only accepted rows do.
+      for (let i = accepted; i < stop; i++) if (answers[i - accepted] !== DROPPED) this.remember(events[i]!);
       if (stop < events.length) return this.offerScrolls(events, stop);
     });
   }
@@ -645,7 +712,8 @@ export class PipeHistoryCollector {
         cursor: update.frame.cursor, kind: update.frame.kind,
         geometryGeneration: update.gen, receiveSeq: seqTo,
       };
-      const { receipt } = this.deliver(() => this.options.ports.onFrame(frame));
+      const { receipt } = this.deliver(() => this.options.ports.onFrame(frame),
+        () => this.declareOversize("frame", seqTo, frame.cells.full));
       if (isReceipt(receipt)) return receipt.then(complete);
       complete();
     };
