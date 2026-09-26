@@ -84,7 +84,11 @@ afterEach(() => {
   window.ResizeObserver = originalWindowResizeObserver;
 });
 
-function mountView(mode: ClaudeBashMode = 'off', renderer: 'dom' | 'canvas' = 'dom'): HTMLElement {
+function mountView(
+  mode: ClaudeBashMode = 'off',
+  renderer: 'dom' | 'canvas' = 'dom',
+  extra: Record<string, unknown> = {},
+): HTMLElement {
   const target = document.createElement('div');
   target.style.cssText = 'position:relative;width:400px;height:320px;';
   document.body.appendChild(target);
@@ -100,6 +104,7 @@ function mountView(mode: ClaudeBashMode = 'off', renderer: 'dom' | 'canvas' = 'd
         claudeBashMode: mode,
         renderer,
         screen: { alt: false, mouseSgr: false, mouseAny: false },
+        ...extra,
       },
     }) as Record<string, unknown>;
   });
@@ -272,13 +277,15 @@ describe('Canvas FIX1 integration', () => {
         };
       },
     });
-    // A host defines --font-mono (the default family is `var(--font-mono, …)`).
-    // happy-dom 20.11 resolves var() only for a defined variable and never
-    // applies the fallback, which left the unresolved `var(` in the canvas font
-    // on every run (red on the H base 5d8a88680 as well). Browsers apply it.
+    // The canvas font must come from computed style, never a raw `var(`.
+    // happy-dom 20.11 cannot parse a var() fallback that itself holds commas
+    // (the default `var(--font-mono, ui-monospace, monospace)`), so it returned
+    // the raw string and this case was red on the H base 5d8a88680 as well.
+    // A host-defined variable with a one-family fallback still exercises the
+    // same resolution through getComputedStyle; browsers handle the default.
     document.documentElement.style.setProperty('--font-mono', 'monospace');
     try {
-      const viewport = mountView('off', 'canvas');
+      const viewport = mountView('off', 'canvas', { canvasFontFamily: 'var(--font-mono, monospace)' });
       const host = viewport.querySelector<HTMLElement>('.canvas-terminal')!;
       Object.defineProperty(host, 'clientWidth', { configurable: true, get: () => 388 });
       for (const observer of ControlledResizeObserver.all) observer.fire();
