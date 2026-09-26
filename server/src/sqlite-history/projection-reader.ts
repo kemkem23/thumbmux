@@ -1,6 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import { decodeCells, integer, paneId, type ProjectionRam, type SqlRow } from './ram-store';
-import type { ProjectionIssue, ProjectionPage, ProjectionToken } from './types';
+import type { ProjectionCheckState, ProjectionIssue, ProjectionPage, ProjectionToken } from './types';
 
 /** Overlay pending issue updates on their durable copies, just as for history rows. */
 export function readProjectionIssues(ram:ProjectionRam,disk:Database,token:ProjectionToken):ProjectionIssue[] {
@@ -36,6 +36,6 @@ export function readProjectionPage(ram: ProjectionRam, disk: Database, token: Pr
   return {token:{...current},issues:readProjectionIssues(ram,disk,current),nextAnchor:end,hasMore:end<current.nextLineId,lines:values.map(r=>({lineId:Number(r.line_id),
     sourceEpoch:Number(r.source_epoch),geometryGeneration:Number(r.geometry_generation),revision:Number(r.revision),
     text:String(r.text),cells:decodeCells(String(r.cells_json)),softWrap:!!r.soft_wrap,
-    checkState:r.check_state as 'checked'|'unchecked',checkReason:String(r.check_reason),
+    checkState:r.check_state as ProjectionCheckState,checkReason:String(r.check_reason),
     checkedCaptureId:r.checked_capture_id as string|null,checkedRow:r.checked_row as number|null}))};
 }
