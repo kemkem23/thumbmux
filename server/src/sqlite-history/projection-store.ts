@@ -9,7 +9,7 @@ import { readProjectionPage, projectionIssue } from './projection-reader';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
-const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=256*1024;
+const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=100;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 // D12 (FIX1 §3): every pane in the live roster owns a guaranteed quota; the
 // rest of the cap is a borrow pool. A pane that sent nothing for ROSTER_MS
@@ -63,6 +63,10 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void)
     disk.query('INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     before?.();writeMs=performance.now()-started;
   }).immediate();
+  // Keep physical growth tied to durable rows rather than retaining a second
+  // database-sized WAL forever. This is a SQLite checkpoint, not unlinking or
+  // subtracting a sidecar from accounting; failures remain flush failures.
+  disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs};
 }
 // Same module in source and compiled distributions: no extra worker asset/factory.
@@ -173,7 +177,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.timer=setInterval(()=>{
       try {
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=4)))this.flushAsync();
+        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.fault('flush-failed',String(error));}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);

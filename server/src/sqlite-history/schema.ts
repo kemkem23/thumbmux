@@ -185,12 +185,12 @@ CREATE TABLE na_line (
  text TEXT NOT NULL, cells_json TEXT NOT NULL, soft_wrap INTEGER NOT NULL CHECK(soft_wrap IN(0,1)),
  check_state TEXT NOT NULL CHECK(check_state IN('unchecked','checked','content-matched')), check_reason TEXT NOT NULL,
  checked_capture_id TEXT, checked_row INTEGER,
- PRIMARY KEY(pane_key,source_epoch,line_id), UNIQUE(pane_key,line_id),
+ PRIMARY KEY(pane_key,line_id),
  FOREIGN KEY(pane_key,checked_capture_id,source_epoch,geometry_generation)
  REFERENCES na_capture(pane_key,capture_id,source_epoch,geometry_generation),
  CHECK((check_state='unchecked' AND checked_capture_id IS NULL AND checked_row IS NULL)
  OR (check_state IN('checked','content-matched') AND checked_capture_id IS NOT NULL AND checked_row>=0))
-) STRICT;
+) STRICT, WITHOUT ROWID;
 CREATE TABLE na_issue (
  issue_id TEXT PRIMARY KEY, pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), source_epoch INTEGER NOT NULL,
  revision INTEGER NOT NULL, boundary_line_id INTEGER, kind TEXT NOT NULL, reason TEXT NOT NULL,
@@ -200,7 +200,6 @@ CREATE TABLE na_commit (
  commit_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, committed_at REAL NOT NULL,
  pane_watermarks_json TEXT NOT NULL, digest TEXT NOT NULL
 ) STRICT;
-CREATE INDEX na_line_revision ON na_line(pane_key,revision);
 `;
 
 /** Volatile display state. This schema is installed only in ProjectionRam. */

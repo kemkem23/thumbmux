@@ -3,9 +3,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_RAM_SCREEN_SCHEMA, PROJECTION_SCHEMA } from './schema';
 import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionIssueInput, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
-// Schema 2's UNIQUE(pane_key,line_id) is sqlite_autoindex_na_line_2.
-// Pin that range: the revision index otherwise walks every durable resident row.
-export const EVICT_LINES_SQL='DELETE FROM na_line INDEXED BY sqlite_autoindex_na_line_2 WHERE pane_key=? AND line_id<? AND revision<=?';
+// Version 3 stores lines WITHOUT ROWID under (pane_key,line_id), so this range
+// seeks the table primary key without maintaining duplicate identity indexes.
+export const EVICT_LINES_SQL='DELETE FROM na_line WHERE pane_key=? AND line_id<? AND revision<=?';
 
 export type SqlRow = Record<string, string | number | null>;
 export const paneId = (key: PaneKey): string => {

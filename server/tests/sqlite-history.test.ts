@@ -416,7 +416,7 @@ test('newarch v3: atomic CAS, exact checked receipt, repair, alternate screen an
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('newarch v3: 4ms flush, byte threshold, idempotent post-commit retry, epoch isolation',async()=>{
+test('newarch v3: 100ms flush, byte threshold, idempotent post-commit retry, epoch isolation',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-flush-'));let fail=false;const ids:string[]=[];
  const s=createProjectionStore({historyRoot:dir,mode:'create',checkpoint:(phase,id)=>{if(phase==='after-disk-commit'){ids.push(id);if(fail){fail=false;throw Error('watermark fault');}}}});
  try {
@@ -499,10 +499,9 @@ test('newarch: eviction query plan seeks the line-id range, never the whole dura
  try {
   const db=(s as any).ram.db as Database;
   const plan=(sql:string)=>db.query('EXPLAIN QUERY PLAN '+sql).all('pane',1000,6000) as Array<{detail:string}>;
-  const previous=plan(EVICT_LINES_SQL.replace(' INDEXED BY sqlite_autoindex_na_line_2',''));
   const actual=plan(EVICT_LINES_SQL);
-  console.log('NA_EVICT_PLAN',JSON.stringify({previous,actual}));
-  expect(actual.some(r=>r.detail.includes('sqlite_autoindex_na_line_2')&&r.detail.includes('line_id<?'))).toBe(true);
+  console.log('NA_EVICT_PLAN',JSON.stringify({actual}));
+  expect(actual.some(r=>r.detail.includes('PRIMARY KEY')&&r.detail.includes('line_id<?'))).toBe(true);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
