@@ -2210,4 +2210,108 @@ describe("TermView sliding archive window", () => {
       });
     }
   });
+
+  describe("newarch loss markers and archive availability (I4 FIX1 U)", () => {
+    type Marker = { lineId: number | null; kind: string; missingCount: number | null };
+    const NA_GEN = "newarch:u-marker:%0:1:r1";
+
+    function deliverNewarch(
+      lines: string[],
+      markers: Marker[],
+      metadataRevision: number,
+      delivery: { source?: "full" | "delta"; replace?: boolean } = {},
+    ): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      const meta = {
+        source: delivery.source ?? "delta",
+        replace: delivery.replace ?? false,
+        screen: { alt: false, mouseSgr: false, mouseAny: false },
+        boundary: historyBoundary(NA_GEN, 100, 7),
+        newarch: {
+          v: "newarch-frame-v1" as const,
+          paneKey: { serverIdentity: "u-fixture", paneId: "%0", birthGeneration: 1 },
+          sourceEpoch: 3, geometryGeneration: 1, routeGeneration: 1, metadataRevision,
+          cols: 40, rows: 20, revision: 7, durableRevision: 7, nextLineId: 110, liveStartLine: 100,
+          displaySource: "pipe" as const, degraded: false, markers,
+        },
+      };
+      (sessionCallback as unknown as (d: string, t: string, c: null, m: typeof meta) => void)(
+        lines.join("\n"), "output", null, meta,
+      );
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function markerFor(viewport: HTMLElement, text: string): HTMLElement | null {
+      return Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-loss-marker"))
+        .find((el) => (el.getAttribute("data-loss-marker") ?? "").includes(text)) ?? null;
+    }
+
+    function noteText(target: HTMLElement): string {
+      return target.querySelector('[data-testid="mtv-loss-notes"]')?.textContent ?? "";
+    }
+
+    test("a marker raised on a static screen is drawn on its row and noted until its row is seen", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      const lines = liveLines("na", 30);
+      const attach: Marker = { lineId: 100, kind: "attach", missingCount: null };
+      deliverNewarch(lines, [attach], 1, { source: "full", replace: true });
+      // Present at attach: drawn at its row, never promoted to a note.
+      const attachMarker = markerFor(viewport, "attach");
+      expect(attachMarker).not.toBeNull();
+      expect(attachMarker!.nextElementSibling?.textContent).toBe("na-0");
+      expect(noteText(target)).toBe("");
+
+      // Same cells, new metadata revision: an off-screen row gets a marker.
+      const dead: Marker = { lineId: 102, kind: "worker-dead", missingCount: null };
+      deliverNewarch(lines, [attach, dead], 2);
+      const deadMarker = markerFor(viewport, "worker-dead");
+      expect(deadMarker).not.toBeNull();
+      expect(deadMarker!.nextElementSibling?.textContent).toBe("na-2");
+      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("ไม่ทราบจำนวน");
+      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("ก่อนแถว 102");
+      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("pane %0 · epoch 3");
+      expect(noteText(target)).toContain("worker-dead");
+
+      // A visible row's marker is seen at once: row rule only, no note.
+      const loss: Marker = { lineId: 128, kind: "unknown-loss", missingCount: 5 };
+      deliverNewarch(lines, [attach, dead, loss], 3);
+      await settleUi();
+      const lossMarker = markerFor(viewport, "unknown-loss");
+      expect(lossMarker?.nextElementSibling?.textContent).toBe("na-28");
+      expect(lossMarker?.getAttribute("data-loss-marker")).toContain("5 แถว");
+      expect(noteText(target)).toContain("worker-dead");
+      expect(noteText(target)).not.toContain("unknown-loss");
+
+      // A marker with no line id has no row: it is noted, stating so.
+      deliverNewarch(lines, [attach, dead, loss, { lineId: null, kind: "archive-unavailable", missingCount: null }], 4);
+      expect(noteText(target)).toContain("archive-unavailable");
+      expect(noteText(target)).toContain("ไม่ทราบตำแหน่ง");
+
+      // A legacy resync (route rollback) carries no descriptor: markers go.
+      deliverOutput(lines, { alt: false, mouseSgr: false, mouseAny: false }, undefined, { replace: true });
+      expect(viewport.querySelectorAll(".mtv-loss-marker").length).toBe(0);
+      expect(noteText(target)).toBe("");
+    });
+
+    test("a retryable archive read error is shown until a page arrives", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(
+        liveLines("na-archive", 10),
+        { alt: false, mouseSgr: false, mouseAny: false },
+        historyBoundary("g-na-archive", 10_000, 1),
+      );
+      wheel(viewport, -84);
+      expect(historyCalls.length).toBe(1);
+      deliverHistoryError();
+      expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+      wheel(viewport, -42);
+      expect(historyCalls.length).toBe(2);
+      deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+      await settleUi();
+      expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).toBeNull();
+    });
+  });
 });
