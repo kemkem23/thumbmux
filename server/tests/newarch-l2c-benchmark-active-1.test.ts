@@ -72,7 +72,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
         id: string; cols: number; rows: number; pipe: string; fd: number; offset: number; partial: string;
         count: number; revision: number; ring: HistoryRow[]; ringEnd: number; snapshot: HistoryRow[] | null;
         calibrator: HistoryCalibrator; decoder: TmuxCaptureDecoder; running: Promise<void> | undefined;
-        checked: Set<number>; start: number; bound: number; falseChecked: number; falseSamples: unknown[]; contentMatches: number; contentFalse: number;
+        checked: Set<number>; contentShown: Set<number>; start: number; bound: number; falseChecked: number; falseSamples: unknown[]; contentMatches: number; contentFalse: number;
         spanAt: number | null; history: number; historyAt: number[]; screenOnly: number; full: number; partialCaptures: number;
         reasons: Record<string, number>; settledAt: number | null; staleRevision: number; afterSettle: Record<string, number>; polledAt: number;
       };
@@ -292,6 +292,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           for (const match of input.contentMatches) {
             pane.contentMatches++;
             if (!equalHistoryRows(modelRow(match.lineId, pane.cols), input.capture.history[match.capturedRow]!)) pane.contentFalse++;
+            else if (match.lineId >= pane.start && match.lineId < pane.bound) pane.contentShown.add(match.lineId);
           }
           const reason = input.capture.history.length === 0 ? 'screen-only' : input.checks.length ? 'checked' : 'unchecked';
           pane.reasons[reason] = (pane.reasons[reason] ?? 0) + 1;
@@ -344,7 +345,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
             tmux(socket, ['pipe-pane', '-t', id, `exec cat >> ${quote(pipe)}`]);
             writeFileSync(gate, '');
             c.panes.push({ id, cols: cols!, rows: rows!, pipe, fd: openSync(pipe, 'r'), offset: 0, partial: '', count: 0, revision: 1, ring: [], ringEnd: 0, snapshot: null,
-              calibrator: undefined as unknown as HistoryCalibrator, decoder: new TmuxCaptureDecoder(cols!, 5000), running: undefined, checked: new Set(), start: 0, bound: Infinity,
+              calibrator: undefined as unknown as HistoryCalibrator, decoder: new TmuxCaptureDecoder(cols!, 5000), running: undefined, checked: new Set(), contentShown: new Set(), start: 0, bound: Infinity,
               falseChecked: 0, falseSamples: [], contentMatches: 0, contentFalse: 0, spanAt: null, history: 0, historyAt: [], screenOnly: 0, full: 0, partialCaptures: 0, reasons: {}, settledAt: null, staleRevision: 0, afterSettle: {}, polledAt: 0 });
           }
           c.pid = Number(tmux(socket, ['display-message', '-p', '-t', c.panes[0]!.id, '#{pid}']).trim());
@@ -431,11 +432,16 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           // Denominator: every row that entered history inside the window.
           const denominator = c.panes.reduce((sum, p) => sum + Math.max(0, p.bound - p.start), 0);
           const checkedRows = c.panes.reduce((sum, p) => sum + p.checked.size, 0);
+          // FIX1-PLAN §2.3: a content-matched row is complete history (content
+          // proven, identity not claimed). Coverage = rows proven either way;
+          // checkedCoverage = rows carrying an identity claim, reported apart.
+          const provenRows = c.panes.reduce((sum, p) => { let n = p.checked.size; for (const id of p.contentShown) if (!p.checked.has(id)) n++; return sum + n; }, 0);
           // Unchecked after the final capture, classified: the producer
           // overwrites the top screen row with a status line whenever i%200==0.
-          const unchecked = { statusOverwrite: 0, other: 0, oldestOther: null as number | null };
+          const unchecked = { statusOverwrite: 0, other: 0, oldestOther: null as number | null, contentMatchedOnly: 0 };
           if (finalPass) for (const p of c.panes) for (let id = p.start; id < p.bound; id++) {
             if (p.checked.has(id)) continue;
+            if (p.contentShown.has(id)) { unchecked.contentMatchedOnly++; continue; }
             if ((id + c.rows - 1) % 200 === 0 && id + c.rows - 1 > 0) unchecked.statusOverwrite++;
             else { unchecked.other++; unchecked.oldestOther ??= id; }
           }
@@ -452,7 +458,7 @@ describe('NEWARCH L2-C private tmux CPU measurement', () => {
           for (const p of c.panes) for (const [r, n] of Object.entries(p.reasons)) reasons[r] = (reasons[r] ?? 0) + n;
           const record = { mode, active, round, cols: c.cols, rows: c.rows, panes: c.count, elapsedMs: elapsed, tracerPid, timingAsserted: tracerPid === 0,
             producedRows, denominator, checkedAtWindowEnd: checkedAtWindowEnd[k], checkedPerDenominatorAtWindowEnd: denominator ? checkedAtWindowEnd[k]! / denominator : null,
-            finalPass, checkedRows, coverage: denominator && finalPass ? checkedRows / denominator : null, unchecked, falseChecked, falseSamples: c.panes.flatMap(p => p.falseSamples).slice(0, 3), contentMatches, contentFalse,
+            finalPass, checkedRows, provenRows, coverage: denominator && finalPass ? provenRows / denominator : null, checkedCoverage: denominator && finalPass ? checkedRows / denominator : null, unchecked, falseChecked, falseSamples: c.panes.flatMap(p => p.falseSamples).slice(0, 3), contentMatches, contentFalse,
             captureFaults, captureFaultsPerPane: captureFaults / c.count, captureFaultPass: mode === 'baseline' ? null : captureFaults === 0,
             staleRevision: c.panes.reduce((s, p) => s + p.staleRevision, 0),
             unsettled: c.panes.filter(p => p.settledAt === null).slice(0, 3).map(p => ({ pane: p.id, afterSettle: p.afterSettle, captures: p.historyAt.filter(t => t >= settle.from).length })),
