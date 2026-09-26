@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, ids, observation, evidence } from './sqlite-history/helpers';
 import { OptInHistoryBridge, legacyProjectionDigest } from '../src/sqlite-history/bridge';
@@ -153,6 +153,7 @@ test('default package barrel still has no sqlite import and the opt-in entry has
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { encodeCells } from '../src/sqlite-history/ram-store';
 import { isProjectionRefusal, type ScrollEvent } from '../src/sqlite-history/types';
 // FIX1 §3 caller contract: a refused row still belongs to the caller, which
 // waits for drained() and offers the same row again. Nothing is dropped.
@@ -574,7 +575,7 @@ test('newarch DEBT2: queued frames of one pane coalesce to the latest and releas
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('newarch D11: a malformed frame landing on a queued frame is refused alone; the queued frame stays durable',async()=>{
+test('newarch D11: a malformed frame is refused alone; the queued frame stays live until restart',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-d11-coalesce-'));
  let s=createProjectionStore({historyRoot:root,mode:'create'});const internal=s as any;
  clearInterval(internal.timer); // explicit flushes only, so the queue shape and pending bytes are exact
@@ -599,12 +600,14 @@ test('newarch D11: a malformed frame landing on a queued frame is refused alone;
   expect(q[1].bytes).toBe(tailBytes);expect(internal.pendingBytes()).toBe(pendingBefore);
   await r;out.goodReceipt=await kept.then(()=>'resolved',e=>String(e));
   expect(out.goodReceipt).toBe('resolved');
+  const shown=JSON.parse(String(s.screen(key)!.cells_json));
+  out.liveRows=shown.length;out.liveLastCell=shown[23][79].grapheme;
+  expect(shown).toHaveLength(24);expect(shown[23][79].grapheme).toBe(good.cells[23][79].grapheme);
   s.flush();expect(s.health().pendingBytes).toBe(0);expect(internal.pendingByPane.size).toBe(0);
   await s.close();
   s=createProjectionStore({historyRoot:root,mode:'recover'});
-  const shown=JSON.parse(String(s.screen(key)!.cells_json));
-  out.durableRows=shown.length;out.durableLastCell=shown[23][79].grapheme;
-  expect(shown).toHaveLength(24);expect(shown[23][79].grapheme).toBe(good.cells[23][79].grapheme);
+  out.screenAfterRestart=s.screen(key);expect(out.screenAfterRestart).toBeNull();
+  expect(s.readPage(s.token(key),null,2).lines.map(line=>line.text)).toEqual(['r1']);
   console.log('NA_D11_COALESCE_VALIDATE',JSON.stringify(out));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
@@ -672,6 +675,49 @@ test('I2 probe: bundled projection worker drains and reopens its own durable dat
   console.log(out);if(err)console.error(err);expect(exit).toBe(0);
  }finally{rmSync(root,{recursive:true,force:true});}
 },30000);
+
+test('I4 FIX1 S: 126000 rows in 60s batch across 21 panes without capture payload growth',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-i4-s-126k-')),s=createProjectionStore({historyRoot:root,mode:'create'});
+ const keys=Array.from({length:21},(_,pane)=>({serverIdentity:'i4-s-load',paneId:`%${pane}`,birthGeneration:1}));
+ const cell=(grapheme:string)=>({grapheme,width:1 as const,continuation:false,fg:null,bg:null,style:0});
+ const physical=()=>readdirSync(join(root,'newarch-v3')).filter(name=>name.startsWith('history.sqlite3')).reduce((sum,name)=>sum+statSync(join(root,'newarch-v3',name)).size,0);
+ let logicalBytes=0,peakIncrement=0,refused=0;
+ const flushAges:number[]=[];
+ try {
+  const disk0=physical(),cpu0=process.cpuUsage(),started=performance.now();
+  for(let tick=0;tick<6000;tick++) {
+   const target=started+(tick+1)*10,delay=target-performance.now();if(delay>0)await Bun.sleep(delay);
+   const jobs=keys.map((key,pane)=>{
+    const text=`${pane}:${tick} ไทย`.padEnd(80,String((pane+tick)%10)),cells=[...text].map(cell);
+    logicalBytes+=Buffer.byteLength(text)+Buffer.byteLength(encodeCells(cells));
+    return s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:tick+1,softWrap:false,physicalRow:{text,cells}}).then(result=>{if(isProjectionRefusal(result))refused++;});
+   });
+   await Promise.all(jobs);
+   if(tick%100===0){peakIncrement=Math.max(peakIncrement,physical()-disk0);flushAges.push(s.health().lastFlushAgeMs);}
+  }
+  s.flush();peakIncrement=Math.max(peakIncrement,physical()-disk0);flushAges.push(s.health().lastFlushAgeMs);
+  const elapsedMs=performance.now()-started,cpu=process.cpuUsage(cpu0),cpuCores=(cpu.user+cpu.system)/1000/elapsedMs;
+  const disk=new Database(s.file,{readonly:true});
+  const commits=Number((disk.query('SELECT count(*) AS n FROM na_commit').get() as any).n);
+  const rows=Number((disk.query('SELECT count(*) AS n FROM na_line').get() as any).n);
+  const captures=Number((disk.query('SELECT count(*) AS n FROM na_capture').get() as any).n);
+  const durableScreen=disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get();disk.close();
+  const health=s.health(),diskIncrement=physical()-disk0,ratio=diskIncrement/logicalBytes;
+  const sortedFlushAges=flushAges.toSorted((a,b)=>a-b);
+  const flushAgeP95Ms=sortedFlushAges[Math.ceil(sortedFlushAges.length*.95)-1]??0;
+  const maxFlushAgeMs=sortedFlushAges.at(-1)??0;
+  console.log('I4_S_126K',JSON.stringify({rows,elapsedMs,cpuCores,commits,rowsPerTransaction:rows/commits,ramBatches:health.ramBatches,
+   averageRamOperationsPerBatch:health.averageRamOperationsPerBatch,refused,flushAgeP95Ms,maxFlushAgeMs,diskIncrement,peakIncrement,logicalBytes,ratio,captures,durableScreen}));
+  expect(rows).toBe(126000);expect(refused).toBe(0);expect(elapsedMs).toBeLessThan(65000);
+  expect(commits).toBeLessThanOrEqual(6000);expect(rows/commits).toBeGreaterThanOrEqual(21);
+  // The >=21 target is durable rows/transaction above. RAM turns may split at
+  // the 4 ms fairness boundary and are reported only as a scheduling metric.
+  // Wave 6 records every acknowledgement and owns the <=150 ms flush gate.
+  // This fixture samples once per second, which aliases periodic checkpoints.
+  expect(ratio).toBeLessThanOrEqual(1.5);expect(peakIncrement/logicalBytes).toBeLessThanOrEqual(1.5);
+  expect(captures).toBe(0);expect(durableScreen).toBeNull();
+ }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+},90000);
 
 test('I2 probe: measure A borrowing before B through E arrive without disk acknowledgements',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-borrow-'));
@@ -747,6 +793,11 @@ const I2_FIX2_MUTATIONS=[
   {name:'FIX2-B1 null-evidence',file:'ram-store.ts',before:"if(evidence?.kind==='quiescent') {",after:'if(evidence!==undefined) {'},
   {name:'FIX2-B1 uncertain-rows',file:'ram-store.ts',before:'this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);',after:'this.screen(c,c.captureId,c.completedAt,c.observedFields);'},
 ];
+const I4_FIX1_S_MUTATIONS=[
+  {name:'I4-S capture-payload-columns',file:'schema.ts',before:'screen_hash TEXT NOT NULL, history_hash TEXT NOT NULL,',after:'screen_cells_json TEXT NOT NULL, history_cells_json TEXT NOT NULL,'},
+  {name:'I4-S metadata-screen-hash',file:'ram-store.ts',before:"screenHash.digest('hex'),historyHash.digest('hex')",after:"'0'.repeat(64),historyHash.digest('hex')"},
+  {name:'I4-S persist-screen-table',file:'projection-store.ts',before:"['na_capture','na_line','na_issue']",after:"['na_capture','na_line','na_screen','na_issue']"},
+];
 async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
  const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
  const results:any[]=[];
@@ -754,7 +805,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
   for(const mutation of cases)for(const broken of [false,true]) {
    const outdir=join(root,mutation.name.replace(/\W+/g,'-')+'-'+broken);
    const result=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir,target:'bun',plugins:[{
-    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store)\.ts$/},args=>{
+    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store|schema)\.ts$/},args=>{
      let contents=readFileSync(args.path,'utf8');
      if(broken && args.path.endsWith('/'+mutation.file)) {expect(contents).toContain(mutation.before);contents=contents.replace(mutation.before,mutation.after);}
      return {contents,loader:'ts'};
@@ -771,7 +822,22 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
     const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.startsWith('FIX2-M2')) {
+     if(name.includes('capture-payload-columns')) {
+      const disk=new Database(s.file,{readonly:true});
+      const payload=disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name IN ('screen_cells_json','history_cells_json','cells_json','payload_json')").all();disk.close();
+      assert(payload.length===0,'capture receipt schema must have no payload-capable columns');
+     } else if(name.includes('metadata-screen-hash')) {
+      const capture=(id,g)=>({...frame(g),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:[],observedFields:['grapheme'],ambiguousRows:0,result:'fixture'});
+      const quiet={kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:1};
+      await s.replaceScreen(frame('A'));await s.calibrate({capture:capture('one','A'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
+      await s.calibrate({capture:capture('two','Z'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
+      const hashes=s.ram.db.query('SELECT screen_hash FROM na_capture ORDER BY capture_id').all().map(row=>row.screen_hash);
+      assert(hashes.length===2 && hashes[0]!==hashes[1],'metadata hash must change when capture cells change');
+     } else if(name.includes('persist-screen-table')) {
+      await s.replaceScreen(frame('A'));let ok=true;try{s.flush();}catch{ok=false;}
+      const disk=new Database(s.file,{readonly:true});const durableScreen=disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get();disk.close();
+      assert(ok && durableScreen===null,'screen must remain RAM-only and flushable without a disk table');
+     } else if(name.startsWith('FIX2-M2')) {
       await s.appendScroll(row('stable',1));const read=s.token(key);
       await s.appendScroll(row('moved',2));
       const queued=Array.from({length:20},(_,n)=>s.appendScroll(row('q'+n,3+n)));
@@ -843,6 +909,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
 }
 test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',()=>runI2Mutations(I2_FIX1_MUTATIONS,'I2_FIX1_MUTATIONS'),180000);
 test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
+test('I4 FIX1 S mutations: capture payload, swallowed metadata hash and durable screen each go red',()=>runI2Mutations(I4_FIX1_S_MUTATIONS,'I4_FIX1_S_MUTATIONS'),180000);
 
 test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});

@@ -353,6 +353,7 @@ import { mkdtempSync, rmSync, symlinkSync, linkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { openProjectionArchive } from '../src/sqlite-history/projection-reader';
 import { PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from '../src/sqlite-history/schema';
 import { PROJECTION_OVERSIZE } from '../src/sqlite-history/types';
 import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell } from '../src/sqlite-history/types';
@@ -362,32 +363,33 @@ const naRow=(text:string):PhysicalRow=>({text,cells:[...text].map(naCell)});
 const naEvent=(text:string,receiveSeq:number,paneKey=naKey)=>({paneKey,sourceEpoch:1,geometryGeneration:1,physicalRow:naRow(text),softWrap:false,receiveSeq});
 const naFrame=()=>({paneKey:naKey,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:2,rows:1,kind:'normal' as const,cells:[[naCell('A'),naCell(' ')]],cursor:{row:0,col:0,visible:true}});
 
-test('newarch v2: separate opt-in schema, new-file refusal and deny-open path spy',async()=>{
+test('newarch v3: metadata-only schema, new-file refusal and deny-open path spy',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-path-'));let opens=0;
  try {
   const store=createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++});
   await store.appendScroll(naEvent('one',1));store.flush();await store.close();
-  const db=new Database(join(dir,'newarch-v2/history.sqlite3'),{readonly:true});
-  expect(db.query('PRAGMA user_version').get()).toEqual({user_version:2});
-  expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(6);
+  const db=new Database(join(dir,'newarch-v3/history.sqlite3'),{readonly:true});
+  expect(db.query('PRAGMA user_version').get()).toEqual({user_version:3});
+  expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(5);
+  expect(db.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
   expect(db.query('PRAGMA journal_mode').get()).toEqual({journal_mode:'wal'});db.close();
   expect(()=>createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++})).toThrow('new-file-required');
   for(const name of ['brain.db','brain.db-wal','brain.db-shm','brain.db-journal']) {
    const fake=join(dir,name);writeFileSync(fake,'forbidden fixture');
    expect(()=>createProjectionStore({historyRoot:dir,file:fake,mode:'recover',beforeOpen:()=>{opens++;throw Error('deny-open');}})).toThrow('forbidden-database-path');
   }
-  symlinkSync(join(dir,'newarch-v2'),join(dir,'alias'));
+  symlinkSync(join(dir,'newarch-v3'),join(dir,'alias'));
   expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'alias/new.sqlite'),mode:'create',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
-  linkSync(join(dir,'newarch-v2/history.sqlite3'),join(dir,'hard.sqlite'));
+  linkSync(join(dir,'newarch-v3/history.sqlite3'),join(dir,'hard.sqlite'));
   expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'hard.sqlite'),mode:'recover',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
   const v1=join(dir,'old.sqlite');const old=new Database(v1);old.exec('PRAGMA user_version=1');old.close();
-  expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v2');
+  expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v3');
   expect(opens).toBe(1);
-  console.log('NA_PATH_PROOF',JSON.stringify({schema:2,migration:'002-newarch-projection',forbiddenSqliteOpens:0,fixtureHash:createHash('sha256').update(JSON.stringify(naEvent('one',1))).digest('hex')}));
+  console.log('NA_PATH_PROOF',JSON.stringify({schema:3,migration:'003-newarch-calibration-receipts',forbiddenSqliteOpens:0,fixtureHash:createHash('sha256').update(JSON.stringify(naEvent('one',1))).digest('hex')}));
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
-test('newarch v2: atomic CAS, exact checked receipt, repair, alternate screen and stale pages',async()=>{
+test('newarch v3: atomic CAS, exact checked receipt, repair, alternate screen and stale pages',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-cas-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   await s.appendScroll(naEvent('wrong',1));await s.appendScroll(naEvent('',2));
@@ -414,7 +416,7 @@ test('newarch v2: atomic CAS, exact checked receipt, repair, alternate screen an
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('newarch v2: 100ms flush, byte threshold, idempotent post-commit retry, epoch isolation',async()=>{
+test('newarch v3: 100ms flush, byte threshold, idempotent post-commit retry, epoch isolation',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-flush-'));let fail=false;const ids:string[]=[];
  const s=createProjectionStore({historyRoot:dir,mode:'create',checkpoint:(phase,id)=>{if(phase==='after-disk-commit'){ids.push(id);if(fail){fail=false;throw Error('watermark fault');}}}});
  try {
@@ -434,7 +436,7 @@ test('newarch v2: 100ms flush, byte threshold, idempotent post-commit retry, epo
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('newarch v2: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle mutation',async()=>{
+test('newarch v3: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle mutation',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-burst-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   const keys=Array.from({length:21},(_,i)=>({...naKey,paneId:`%${i}`}));
@@ -454,7 +456,7 @@ test('newarch v2: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
 
 
 import { encodeCells, decodeCells, EVICT_LINES_SQL } from '../src/sqlite-history/ram-store';
-test('newarch: compact cells preserve every field, legacy v2 runs and screen recovery',async()=>{
+test('newarch: compact cells preserve every field while restart requires a fresh screen',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-cell-runs-'));
  const cells:ProjectionCell[]=[{grapheme:'漢',width:2,continuation:false,fg:'#123456',bg:4,style:7},
    {grapheme:'',width:0,continuation:true,fg:'#123456',bg:4,style:7},naCell('ก้'),naCell(' '),naCell(' ')];
@@ -462,10 +464,15 @@ test('newarch: compact cells preserve every field, legacy v2 runs and screen rec
  expect(decodeCells(JSON.stringify(cells.map(c=>[c,1])))).toEqual(cells);
  const s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
+  await s.appendScroll({...naEvent('row',1),physicalRow:{text:'row',cells}});
   const frame={...naFrame(),cols:cells.length,cells:[cells]};await s.replaceScreen(frame);s.flush();
   expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual([cells]);
+  const disk=new Database(s.file,{readonly:true});
+  expect(disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
+  expect(disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name IN ('screen_cells_json','history_cells_json','cells_json','payload_json')").all()).toEqual([]);
+  disk.close();
   await s.close();const r=createProjectionStore({historyRoot:dir,mode:'recover'});
-  try{expect(JSON.parse(String(r.screen(naKey)!.cells_json))).toEqual([cells]);}finally{await r.close();}
+  try{expect(r.screen(naKey)).toBeNull();expect(r.readPage(r.token(naKey),null,2).lines[0].cells).toEqual(cells);}finally{await r.close();}
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -492,10 +499,9 @@ test('newarch: eviction query plan seeks the line-id range, never the whole dura
  try {
   const db=(s as any).ram.db as Database;
   const plan=(sql:string)=>db.query('EXPLAIN QUERY PLAN '+sql).all('pane',1000,6000) as Array<{detail:string}>;
-  const previous=plan(EVICT_LINES_SQL.replace(' INDEXED BY sqlite_autoindex_na_line_2',''));
   const actual=plan(EVICT_LINES_SQL);
-  console.log('NA_EVICT_PLAN',JSON.stringify({previous,actual}));
-  expect(actual.some(r=>r.detail.includes('sqlite_autoindex_na_line_2')&&r.detail.includes('line_id<?'))).toBe(true);
+  console.log('NA_EVICT_PLAN',JSON.stringify({actual}));
+  expect(actual.some(r=>r.detail.includes('PRIMARY KEY')&&r.detail.includes('line_id<?'))).toBe(true);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -585,10 +591,9 @@ test('I2 FIX1 A-B2/C-F19: quiescent capture calibrates the displayed screen in t
   const shown=s.screen(naKey)!;
   expect(shown).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'good',revision:receipt.revision});
   expect(JSON.parse(String(shown.cells_json))[0][0].grapheme).toBe('Z');
-  // The store and a reopened reader see the calibrated screen, not the parser frame.
+  // Display state is intentionally volatile: restart waits for a fresh frame.
   await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
-  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'good'});
-  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('Z');
+  expect(s.screen(naKey)).toBeNull();
   // The next pipe frame renders over the calibrated screen at once.
   await s.replaceScreen({...naFrame(),cells:[[naCell('N'),naCell(' ')]]});
   expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null});
@@ -620,9 +625,9 @@ test('I2 FIX2 B1: null evidence checks history without touching the screen; unce
   await s.calibrate({capture:{...capture,captureId:'plain'},expectedRevision:s.token(naKey).revision,captureEvidence:quiet,checks:[],repairs:[]});
   expect(s.screen(naKey)).toMatchObject({last_capture_id:'plain',uncertain_rows_json:'[]'});
   await s.calibrate({capture:{...capture,captureId:'emoji2'},expectedRevision:s.token(naKey).revision,captureEvidence:{...quiet,uncertainRows:[0]},checks:[],repairs:[]});
-  // Durable with the screen, and the next pipe frame renders over it and clears the mark.
+  // The receipt is durable but the screen is not; a fresh pipe frame restores readiness.
   await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
-  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'emoji2',uncertain_rows_json:'[0]'});
+  expect(s.screen(naKey)).toBeNull();
   await s.replaceScreen({...naFrame(),rows:2,cells:[[naCell('N'),naCell(' ')],[naCell('M'),naCell(' ')]]});
   expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null,uncertain_rows_json:'[]'});
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
@@ -711,29 +716,40 @@ test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, nev
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('I2 FIX1: a v2 file carrying the pre-FIX1 CHECK lists is refused on recover',async()=>{
- const dir=mkdtempSync(join(tmpdir(),'na-i2-outdated-')),file=join(dir,'newarch-v2/history.sqlite3');
+test('I4 FIX1: a v3 file missing receipt metadata is refused on recover',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i4-outdated-')),file=join(dir,'newarch-v3/history.sqlite3');
  try {
-  // Build the file exactly as the pre-FIX1 factory did: same schema text with the old CHECK lists.
-  mkdirSync(join(dir,'newarch-v2'),{recursive:true});
+  mkdirSync(join(dir,'newarch-v3'),{recursive:true});
   const db=new Database(file);
-  db.exec(PROJECTION_SCHEMA.replace("'unchecked','checked','content-matched'","'unchecked','checked'").replace("'pipe','tmux-calibrated'","'pipe','tmux'"));
+  db.exec(PROJECTION_SCHEMA.replace('screen_hash TEXT NOT NULL, history_hash TEXT NOT NULL,','capture_digest TEXT NOT NULL,'));
   db.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);db.close();
   expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('projection-schema-outdated');
-  // A FIX1 file (widened lists, no uncertain_rows_json) is refused too (FIX2 B1).
-  const fix1=mkdtempSync(join(tmpdir(),'na-i2-fix1-file-'));
-  try {
-   mkdirSync(join(fix1,'newarch-v2'),{recursive:true});
-   const old=new Database(join(fix1,'newarch-v2/history.sqlite3'));
-   const withoutColumn=PROJECTION_SCHEMA.replace(" uncertain_rows_json TEXT NOT NULL DEFAULT '[]',\n","");
-   expect(withoutColumn).not.toContain('uncertain_rows_json');
-   old.exec(withoutColumn);old.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);old.close();
-   expect(()=>createProjectionStore({historyRoot:fix1,mode:'recover'})).toThrow('projection-schema-outdated');
-  }finally{rmSync(fix1,{recursive:true,force:true});}
   // The current factory's own file passes the same check.
   const fresh=mkdtempSync(join(tmpdir(),'na-i2-current-'));
   try {const s=createProjectionStore({historyRoot:fresh,mode:'create'});await s.close();const r=createProjectionStore({historyRoot:fresh,mode:'recover'});await r.close();}
   finally{rmSync(fresh,{recursive:true,force:true});}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I4 FIX1: closed v2 archive is read without attaching it or restoring its screen',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i4-v2-archive-')),file=join(dir,'archive-v2.sqlite3');
+ const key={serverIdentity:'archive-server',paneId:'%7',birthGeneration:4},id=JSON.stringify([key.serverIdentity,key.paneId,key.birthGeneration]);
+ try {
+  const db=new Database(file);
+  db.exec(`PRAGMA user_version=2;
+   CREATE TABLE na_pane(pane_key TEXT PRIMARY KEY,session_uuid TEXT,server_identity TEXT,pane_id TEXT,birth_generation INTEGER,source_epoch INTEGER,geometry_generation INTEGER,cols INTEGER,rows INTEGER,screen_kind TEXT,next_line_id INTEGER,revision INTEGER,durable_revision INTEGER,health TEXT,receive_seq INTEGER);
+   CREATE TABLE na_line(pane_key TEXT,source_epoch INTEGER,line_id INTEGER,revision INTEGER,geometry_generation INTEGER,text TEXT,cells_json TEXT,soft_wrap INTEGER,check_state TEXT,check_reason TEXT,checked_capture_id TEXT,checked_row INTEGER);
+   CREATE TABLE na_issue(issue_id TEXT,pane_key TEXT,source_epoch INTEGER,revision INTEGER,boundary_line_id INTEGER,kind TEXT,reason TEXT,missing_count INTEGER,detected_at REAL,resolved_at REAL);
+   CREATE TABLE na_screen(pane_key TEXT,cells_json TEXT);`);
+  db.query('INSERT INTO na_pane VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'legacy-session',key.serverIdentity,key.paneId,key.birthGeneration,2,3,80,24,'normal',1,7,7,'healthy',9);
+  db.query('INSERT INTO na_line VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(id,2,0,7,3,'legacy-row',encodeCells([naCell('L')]),0,'unchecked','legacy-v2',null,null);
+  db.query('INSERT INTO na_screen VALUES (?,?)').run(id,JSON.stringify([[naCell('X')]]));db.close();
+  const archive=openProjectionArchive(file);
+  try {
+   expect(archive.schemaVersion).toBe(2);const token=archive.token(key);
+   expect(archive.readPage(token,null,10).lines[0]).toMatchObject({text:'legacy-row',checkReason:'legacy-v2'});
+   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v3');
+  }finally{archive.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
