@@ -25,7 +25,9 @@ export class HistoryWatchdog {
     }
   }
   capture(image: string, context?: WatchdogContext): void {
-    const key = context === undefined ? undefined
+    // An omitted context is "unchanged", not a context of its own: callers
+    // that pass it only sometimes must not reset the comparison each time.
+    const key = context === undefined ? this.contextKey
       : `${context.sourceEpoch}/${context.geometryGeneration}/${context.kind}`;
     if (key !== this.contextKey) {
       this.contextKey = key;
