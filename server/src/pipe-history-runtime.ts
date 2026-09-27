@@ -44,11 +44,12 @@ import {
   type ProjectionToken,
   type ProjectionWriterPort,
 } from './sqlite-history/types';
+import { PROJECTION_SCHEMA_VERSION } from './sqlite-history/schema';
 
 /** Fail-closed handshake for hosts loading this optional runtime entrypoint. */
 export const PIPE_HISTORY_RUNTIME_CAPABILITY = Object.freeze({
   wire: 'newarch-frame-v1',
-  projectionSchema: 3,
+  projectionSchema: PROJECTION_SCHEMA_VERSION,
   metadataRevision: true,
   archiveReadVersions: Object.freeze([2, 3] as const),
 });
@@ -233,6 +234,11 @@ export interface RuntimeFault {
   missingCount: number | null; receiveSeqFrom?: number; receiveSeqTo?: number;
 }
 export interface PaneUpdate { source: 'pipe' | 'tmux-calibrated' | 'issue'; revision: number }
+/**
+ * History rows a calibrated screen shows again: tmux pulled them back from
+ * history when the pane grew. `rows` rows ending before line id `endLine`.
+ */
+export interface PulledBack { rows: number; endLine: number }
 export interface PaneView {
   paneKey: PaneKey; session: string;
   cells: readonly (readonly HistoryCell[])[]; cursor: { x: number; y: number; visible: boolean } | null;
@@ -242,6 +248,8 @@ export interface PaneView {
   sourceEpoch: number; geometryGeneration: number;
   mouseSgr: boolean; mouseAny: boolean;
   degraded: boolean; issues: ProjectionIssue[];
+  /** Set only for a tmux-calibrated normal screen that holds pulled-back history rows. */
+  pulledBack?: PulledBack | null;
 }
 export interface PaneStats {
   received: number; published: number; latencyMs: number[];
@@ -338,7 +346,12 @@ export class PipeHistoryPane {
   private screens: { normal?: ParserScreen; alternate?: ParserScreen } = {};
   private parserKind: 'normal' | 'alternate' = 'normal';
   private parserCursor: { x: number; y: number; visible: boolean } = { x: 0, y: 0, visible: true };
-  private displayed: { cells: HistoryCell[][]; cursor: { x: number; y: number; visible: boolean } | null; kind: 'normal' | 'alternate'; cols: number; rows: number; source: 'pipe' | 'tmux-calibrated' } | null = null;
+  private displayed: { cells: HistoryCell[][]; cursor: { x: number; y: number; visible: boolean } | null; kind: 'normal' | 'alternate'; cols: number; rows: number; source: 'pipe' | 'tmux-calibrated'; pulledBack: PulledBack | null } | null = null;
+  /** History rows tmux shows on screen again, by tmux's own counters (see resizePullback). */
+  private pulled: PulledBack = { rows: 0, endLine: 0 };
+  /** Pull-back state as of the newest capture's metadata; the capture it came with may be published. */
+  private capturedPull: PulledBack | null = null;
+  private historySizeUnknown = false;
   private ring: RingRow[] = [];
   private scrollSeq = 0;
   private scrollSeqEpoch = -1;
@@ -535,12 +548,20 @@ export class PipeHistoryPane {
 
   private publishPipe(frame: ProjectionFrame, receipt: ProjectionReceipt): void {
     this.pendingPublish = null;
+    // The parser never pulls history back onto its screen (pipe-vt-worker reflow).
     this.displayed = {
       cells: frame.cells as HistoryCell[][], kind: frame.kind, cols: frame.cols, rows: frame.rows, source: 'pipe',
       cursor: frame.cursor ? { x: frame.cursor.col, y: frame.cursor.row, visible: frame.cursor.visible } : null,
+      pulledBack: null,
     };
+    this.settleReceipts(frame.receiveSeq);
+    this.notify({ source: 'pipe', revision: receipt.revision });
+  }
+
+  /** Close the latency entry of every received chunk up to `receiveSeq`: the viewer now sees it. */
+  private settleReceipts(receiveSeq: number): void {
     const now = this.runtime.nowNs();
-    while (this.receiveHead < this.receiveTimes.length && this.receiveTimes[this.receiveHead]!.seq <= frame.receiveSeq) {
+    while (this.receiveHead < this.receiveTimes.length && this.receiveTimes[this.receiveHead]!.seq <= receiveSeq) {
       const entry = this.receiveTimes[this.receiveHead++]!;
       if (this.stats.latencyMs.length < (this.runtime.options.latencySampleLimit ?? 200_000)) {
         this.stats.latencyMs.push(Number(now - entry.at) / 1e6);
@@ -550,8 +571,10 @@ export class PipeHistoryPane {
       this.receiveTimes.splice(0, this.receiveHead);
       this.receiveHead = 0;
     }
-    this.notify({ source: 'pipe', revision: receipt.revision });
   }
+
+  /** Received chunks whose latency entry is still open (not yet on a published screen). */
+  pendingReceipts(): number { return this.receiveTimes.length - this.receiveHead; }
 
   private onCollectorFault(event: PipeFaultEvent): void {
     const count = event.lostRows === 'unknown' ? null : typeof event.lostRows === 'number' ? event.lostRows : null;
@@ -631,8 +654,28 @@ export class PipeHistoryPane {
       this.collector.resize(meta.cols, meta.rows);
       this.calibrator?.event('resize');
     }
+    if (!historySizeReadable(meta)) {
+      // No number from tmux: nothing is hidden (never a guess from text) and the viewer is told.
+      this.pulled = { rows: 0, endLine: 0 };
+      if (!this.historySizeUnknown) {
+        this.historySizeUnknown = true;
+        this.recordIssue('history-size-unknown', 'tmux history_size unreadable; rows tmux pulled back on resize cannot be told apart and may show twice', null);
+      }
+      return;
+    }
+    this.historySizeUnknown = false;
+    if (!historySizeReadable(previous)) return;
+    const pull = resizePullback(previous, meta);
+    if (pull > 0) {
+      if (this.pulled.rows === 0) this.pulled = { rows: 0, endLine: this.tokenOrNull()?.nextLineId ?? 0 };
+      this.pulled = { rows: Math.min(meta.rows, this.pulled.rows + pull), endLine: this.pulled.endLine };
+    } else if (meta.historySize > previous.historySize && this.pulled.rows > 0) {
+      // tmux scrolls the pulled-back rows (the top of its screen) into history first.
+      this.pulled = { rows: Math.max(0, this.pulled.rows - (meta.historySize - previous.historySize)), endLine: this.pulled.endLine };
+    }
+    if (this.pulled.rows > meta.rows) this.pulled = { rows: meta.rows, endLine: this.pulled.endLine };
     const trimmed = previous.historySize >= previous.historyLimit * 0.9 && meta.historySize >= previous.historyLimit * 0.8;
-    if (meta.historySize < previous.historySize && !trimmed) {
+    if (meta.historySize + pull < previous.historySize && !trimmed) {
       this.recordIssue('history-cleared-external', `tmux history ${previous.historySize} -> ${meta.historySize} rows; older rows stay in the journal, tmux can no longer certify them`, null);
       this.calibrator?.event('clear');
     }
@@ -675,6 +718,7 @@ export class PipeHistoryPane {
     const raw = await this.options.capture(tail, signal);
     const after = epochOf();
     this.observe(raw.after);
+    this.capturedPull = !raw.after.alternate && this.pulled.rows > 0 ? { ...this.pulled } : null;
     const cols = raw.after.cols;
     if (!this.decoder || this.decoder.cols !== cols) this.decoder = new TmuxCaptureDecoder(cols);
     const decoded = this.decoder.decode(raw.body);
@@ -785,11 +829,14 @@ export class PipeHistoryPane {
 
   private publishCapture(commit: { revision: number }, frame: CalibrationFrame): void {
     const cells = frame.cells as HistoryCell[][];
+    // The calibrator publishes only when nothing was received after the
+    // capture's fence: the screen shown covers every received chunk.
+    this.settleReceipts(this.received);
     // A skipped commit only confirmed what is already displayed.
     if (this.skippedCommit) { this.skippedCommit = false; return; }
     this.displayed = {
       cells, cursor: frame.cursor, kind: frame.kind, cols: cells[0]?.length ?? this.meta.cols, rows: cells.length,
-      source: 'tmux-calibrated',
+      source: 'tmux-calibrated', pulledBack: frame.kind === 'normal' ? this.capturedPull : null,
     };
     this.pendingPublish = null;
     this.stats.screenCalibrations++;
@@ -838,6 +885,7 @@ export class PipeHistoryPane {
       sourceEpoch: token?.sourceEpoch ?? this.collector.currentSourceEpoch(),
       geometryGeneration: token?.geometryGeneration ?? this.collector.currentGeometryGeneration(),
       mouseSgr: this.meta.mouseSgr, mouseAny: this.meta.mouseAny, degraded, issues,
+      pulledBack: shown?.pulledBack ?? null,
     };
   }
 
@@ -996,10 +1044,31 @@ export interface ProjectedHistoryPage {
   markers: Array<{ lineId: number | null; kind: string; reason: string; missingCount: number | null }>;
 }
 
-/** Content equality is not proof that a history row moved back onto screen. */
-export function screenOverlap(ring: readonly { cells: readonly HistoryCell[] }[], screen: readonly (readonly HistoryCell[])[]): number {
-  void ring; void screen;
-  return 0;
+const historySizeReadable = (meta: PaneTmuxMeta) => Number.isSafeInteger(meta.historySize) && meta.historySize >= 0;
+
+/**
+ * Rows tmux pulled back from history onto the screen between two metadata
+ * reads: `history_size` before minus after, clamped to [0, rows added]. Only
+ * tmux's own counters count; content equality is never evidence (a program
+ * may print the same row twice). null when either history_size is unreadable.
+ */
+export function resizePullback(before: Pick<PaneTmuxMeta, 'rows' | 'historySize' | 'alternate'>, after: Pick<PaneTmuxMeta, 'rows' | 'historySize' | 'alternate'>): number {
+  if (!historySizeReadable(before as PaneTmuxMeta) || !historySizeReadable(after as PaneTmuxMeta)) return 0;
+  // tmux does not pull history into the alternate screen.
+  if (before.alternate || after.alternate) return 0;
+  const added = after.rows - before.rows;
+  if (added <= 0) return 0;
+  return Math.max(0, Math.min(added, before.historySize - after.historySize));
+}
+
+/**
+ * How many of the newest history rows the displayed screen shows again. The
+ * number comes from the pane's tmux-counter bookkeeping (resizePullback), and
+ * only a tmux-calibrated normal screen can hold such rows.
+ */
+export function screenOverlap(view: Pick<PaneView, 'displaySource' | 'kind' | 'pulledBack'>): number {
+  if (view.displaySource !== 'tmux-calibrated' || view.kind !== 'normal' || !view.pulledBack) return 0;
+  return Math.max(0, view.pulledBack.rows);
 }
 
 function fnv(value: string): string {
@@ -1042,11 +1111,13 @@ export class ProjectionLiveWindow {
     // taller; the journal already holds them as history. Rows the screen
     // shows again are left out of the live window (never out of the journal
     // or its pages), so no row appears twice.
-    const overlap = alternate ? 0 : screenOverlap(ring, view.cells);
+    const overlap = alternate ? 0 : screenOverlap(view);
     if (!alternate) {
+      const hideEnd = view.pulledBack?.endLine ?? 0, hideStart = hideEnd - overlap;
       const offset = ring.length - (token.nextLineId - start);
-      for (let i = Math.max(0, offset); i < ring.length - overlap; i++) {
+      for (let i = Math.max(0, offset); i < ring.length; i++) {
         const row = ring[i]!;
+        if (row.lineId >= hideStart && row.lineId < hideEnd) continue;
         lines.push(row.ansi ??= cellsToAnsi(row.cells));
       }
     }
