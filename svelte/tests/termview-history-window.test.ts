@@ -2244,7 +2244,34 @@ describe("TermView sliding archive window", () => {
 
     function markerFor(viewport: HTMLElement, text: string): HTMLElement | null {
       return Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-loss-marker"))
-        .find((el) => (el.getAttribute("data-loss-marker") ?? "").includes(text)) ?? null;
+        .find((el) => `${el.getAttribute("data-loss-marker") ?? ""} ${el.getAttribute("data-loss-detail") ?? ""}`.includes(text)) ?? null;
+    }
+
+    function deliverPage(startLine: number, lines: string[], markers: Marker[] | undefined, hasMore = false): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      sessionCallback(JSON.stringify({
+        lines, startLine, endLine: startLine + lines.length, hasMore,
+        ...(markers === undefined ? {} : { markers }),
+      }), "history");
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function rowTexted(viewport: HTMLElement, text: string): HTMLElement | null {
+      return Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+        .find((row) => row.textContent === text) ?? null;
+    }
+
+    /** Frame at live 100..129, then scroll into history and receive rows 0..99. */
+    async function scrollIntoPage(markers: Marker[] | undefined) {
+      const mountedView = mountTermView();
+      await tick();
+      deliverNewarch(liveLines("na", 30), [], 1, { source: "full", replace: true });
+      wheel(mountedView.viewport, -84);
+      expect(historyCalls.at(-1)).toMatchObject({ direction: "before" });
+      deliverPage(0, archiveLines(0, 100), markers);
+      await settleUi();
+      return mountedView;
     }
 
     function noteText(target: HTMLElement): string {
@@ -2269,10 +2296,11 @@ describe("TermView sliding archive window", () => {
       const deadMarker = markerFor(viewport, "worker-dead");
       expect(deadMarker).not.toBeNull();
       expect(deadMarker!.nextElementSibling?.textContent).toBe("na-2");
-      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("ไม่ทราบจำนวน");
-      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("ก่อนแถว 102");
-      expect(deadMarker!.getAttribute("data-loss-marker")).toContain("pane %0 · epoch 3");
-      expect(noteText(target)).toContain("worker-dead");
+      // Reader words on the rule; the internal line id is diagnostic detail only.
+      expect(deadMarker!.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · ไม่ทราบจำนวน");
+      expect(deadMarker!.textContent).not.toContain("102");
+      expect(deadMarker!.getAttribute("data-loss-detail")).toBe("worker-dead · line 102 · pane %0 · epoch 3");
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
 
       // A visible row's marker is seen at once: row rule only, no note.
       const loss: Marker = { lineId: 128, kind: "unknown-loss", missingCount: 5 };
@@ -2280,18 +2308,81 @@ describe("TermView sliding archive window", () => {
       await settleUi();
       const lossMarker = markerFor(viewport, "unknown-loss");
       expect(lossMarker?.nextElementSibling?.textContent).toBe("na-28");
-      expect(lossMarker?.getAttribute("data-loss-marker")).toContain("5 แถว");
-      expect(noteText(target)).toContain("worker-dead");
-      expect(noteText(target)).not.toContain("unknown-loss");
+      expect(lossMarker?.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · 5 แถว");
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
+      expect(noteText(target)).not.toContain("5 แถว");
 
       // A marker with no line id has no row: it is noted, stating so.
       deliverNewarch(lines, [attach, dead, loss, { lineId: null, kind: "archive-unavailable", missingCount: null }], 4);
-      expect(noteText(target)).toContain("archive-unavailable");
       expect(noteText(target)).toContain("ไม่ทราบตำแหน่ง");
+      expect(target.querySelector<HTMLButtonElement>(".mtv-loss-note-jump")?.disabled).toBe(true);
 
       // A legacy resync (route rollback) carries no descriptor: markers go.
       deliverOutput(lines, { alt: false, mouseSgr: false, mouseAny: false }, undefined, { replace: true });
       expect(viewport.querySelectorAll(".mtv-loss-marker").length).toBe(0);
+      expect(noteText(target)).toBe("");
+    });
+
+    test("a history page's marker is drawn on its row after scrolling up (U2)", async () => {
+      const gap: Marker = { lineId: 99, kind: "worker-dead", missingCount: null };
+      const { target, viewport } = await scrollIntoPage([gap]);
+      const rule = markerFor(viewport, "line 99");
+      expect(rule).not.toBeNull();
+      expect(rule!.nextElementSibling?.textContent).toBe("archive-99");
+      expect(rule!.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · ไม่ทราบจำนวน");
+      // History, not news: no header note for a page marker.
+      expect(noteText(target)).toBe("");
+
+      // A legacy frame (route rollback) drops page markers with the route.
+      deliverOutput(liveLines("legacy", 30), { alt: false, mouseSgr: false, mouseAny: false }, undefined, { replace: true });
+      expect(viewport.querySelectorAll(".mtv-loss-marker").length).toBe(0);
+    });
+
+    test("a page marker adds no row: anchor, row count and positions match the page without it (U2)", async () => {
+      const plain = await scrollIntoPage(undefined);
+      const plainTotal = numberAttr(plain.viewport, "data-total");
+      const plainOffset = numberAttr(plain.viewport, "data-bottom-offset");
+      const plainY = projectedScreenY(plain.viewport, rowTexted(plain.viewport, "archive-99")!);
+      const plainLiveY = projectedScreenY(plain.viewport, rowTexted(plain.viewport, "na-0")!);
+      const marked = await scrollIntoPage([
+        { lineId: 99, kind: "worker-dead", missingCount: null },
+        { lineId: 98, kind: "unknown-loss", missingCount: 3 },
+      ]);
+      expect(markerFor(marked.viewport, "line 98")).not.toBeNull();
+      expect(numberAttr(marked.viewport, "data-total")).toBe(plainTotal);
+      expect(numberAttr(marked.viewport, "data-bottom-offset")).toBe(plainOffset);
+      expect(projectedScreenY(marked.viewport, rowTexted(marked.viewport, "archive-99")!)).toBe(plainY);
+      expect(projectedScreenY(marked.viewport, rowTexted(marked.viewport, "na-0")!)).toBe(plainLiveY);
+    });
+
+    test("a page whose markers are malformed is refused, never drawn without its gaps (U2)", async () => {
+      const { viewport } = mountTermView();
+      await tick();
+      deliverNewarch(liveLines("na", 30), [], 1, { source: "full", replace: true });
+      wheel(viewport, -84);
+      deliverPage(0, archiveLines(0, 100), [{ lineId: -1, kind: "worker-dead", missingCount: null }]);
+      await settleUi();
+      expect(rowTexted(viewport, "archive-99")).toBeNull();
+    });
+
+    test("tapping the note brings the marker's row onto the screen (U2)", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      const lines = liveLines("na", 30);
+      deliverNewarch(lines, [], 1, { source: "full", replace: true });
+      deliverNewarch(lines, [{ lineId: 102, kind: "worker-dead", missingCount: null }], 2);
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
+      expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+      const note = target.querySelector<HTMLButtonElement>(".mtv-loss-note-jump");
+      expect(note?.disabled).toBe(false);
+      note!.click();
+      flushSync();
+      drainScheduledWork();
+      await settleUi();
+      expect(numberAttr(viewport, "data-bottom-offset")).toBeGreaterThan(0);
+      const rule = markerFor(viewport, "line 102");
+      expect(rule?.nextElementSibling?.textContent).toBe("na-2");
+      // Seen once on screen: the note has done its job.
       expect(noteText(target)).toBe("");
     });
 

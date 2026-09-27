@@ -567,6 +567,26 @@ describe('TmuxMux archive history paging', () => {
     socket.finishClose();
   });
 
+  test('a history page carries its loss markers to the subscriber byte for byte (U2)', () => {
+    const deliveries: Array<{ data: string; type?: string }> = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type) => { deliveries.push({ data, type }); });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    expect(mux.requestHistory('work', 100, 25)).toBe(true);
+    const page = JSON.stringify({
+      lines: ['a', 'b'], startLine: 98, hasMore: true,
+      markers: [{ lineId: 99, kind: 'worker-dead', reason: 'exit', missingCount: null }],
+    });
+    socket.receive({ channel: 'work', type: 'history', data: page });
+    const history = deliveries.filter((d) => d.type === 'history');
+    expect(history.length).toBe(1);
+    expect(history[0]!.data).toBe(page);
+    expect(JSON.parse(history[0]!.data).markers[0]).toEqual({ lineId: 99, kind: 'worker-dead', reason: 'exit', missingCount: null });
+    unsubscribe();
+    socket.finishClose();
+  });
+
   test('reports accepted, blocked, and pre-open history requests to the caller', () => {
     const mux = new TmuxMux();
     const unsubscribe = mux.subscribe('work', () => {});

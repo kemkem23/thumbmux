@@ -310,3 +310,31 @@ describe("newarch-frame-v1", () => {
     expect(chosen.newarch).toEqual(base);
   });
 });
+
+import { HISTORY_PAGE_MARKER_LIMIT, validateHistoryPageMarkers } from "../src/protocol";
+
+describe("history page markers (NEWARCH-SWITCHON U2)", () => {
+  test("a legacy page has none; valid markers are cloned with their row position", () => {
+    expect(validateHistoryPageMarkers(undefined)).toEqual([]);
+    const raw = [
+      { lineId: 40, kind: "worker-dead", reason: "exit 137", missingCount: null },
+      { lineId: null, kind: "respawn-observed", missingCount: 3 },
+    ];
+    const parsed = validateHistoryPageMarkers(JSON.parse(JSON.stringify(raw)));
+    expect(parsed).toEqual(raw);
+    expect(parsed![0]).not.toBe(raw[0]);
+  });
+
+  test("malformed or oversized marker lists are null, never a guessed position", () => {
+    const ok = { lineId: 1, kind: "gap", missingCount: 2 };
+    for (const bad of [
+      null, {}, "x", [null], [[]],
+      [{ ...ok, lineId: -1 }], [{ ...ok, lineId: 1.5 }], [{ ...ok, lineId: "1" }],
+      [{ ...ok, kind: "" }], [{ ...ok, kind: "k".repeat(65) }], [{ ...ok, kind: 3 }],
+      [{ ...ok, missingCount: -2 }], [{ ...ok, reason: 7 }], [{ ...ok, reason: "r".repeat(513) }],
+      Array.from({ length: HISTORY_PAGE_MARKER_LIMIT + 1 }, () => ok),
+    ]) expect(validateHistoryPageMarkers(bad)).toBeNull();
+    expect(validateHistoryPageMarkers(Array.from({ length: HISTORY_PAGE_MARKER_LIMIT }, () => ok))?.length)
+      .toBe(HISTORY_PAGE_MARKER_LIMIT);
+  });
+});

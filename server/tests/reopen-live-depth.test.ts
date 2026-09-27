@@ -98,7 +98,7 @@ describe("archive-seeded reopen capture depth", () => {
 import type { MuxProjectionSnapshot, MuxProjectionSource } from "../src/index";
 
 type Spy = { captures: number; pipes: number; ingests: number };
-function projectionHarness(options: { owns: boolean; capture?: (call: number) => Promise<string> }) {
+function projectionHarness(options: { owns: boolean; capture?: (call: number) => Promise<string>; page?: () => unknown }) {
   const spy: Spy = { captures: 0, pipes: 0, ingests: 0 };
   let owns = options.owns;
   let generation = 1;
@@ -127,8 +127,8 @@ function projectionHarness(options: { owns: boolean; capture?: (call: number) =>
     onRouteChange: (listener) => { routeListeners.add(listener); return () => { routeListeners.delete(listener); }; },
     setViewers: (_session, count) => { viewerCounts.push(count); },
     fullReady: (_session, routeGeneration) => { ready.push(routeGeneration); },
-    readBefore: (_session, beforeLine) => { reads.push(["before", beforeLine]); return { lines: ["h9"], startLine: 9, hasMore: true }; },
-    readAfter: (_session, afterLine) => { reads.push(["after", afterLine]); return { lines: [], startLine: null, hasMore: false }; },
+    readBefore: (_session, beforeLine) => { reads.push(["before", beforeLine]); return options.page ? options.page() : { lines: ["h9"], startLine: 9, hasMore: true }; },
+    readAfter: (_session, afterLine) => { reads.push(["after", afterLine]); return options.page ? options.page() : { lines: [], startLine: null, hasMore: false }; },
   };
   const driver: TmuxDriver = {
     listSessions: () => [item(SESSION)],
@@ -199,6 +199,36 @@ describe("NEWARCH I4: projection-routed sessions", () => {
     await new Promise((resolve) => setTimeout(resolve, 40));
     // Legacy ingress for the routed session: no capture, no dirty pipe, no archive ingest.
     expect(h.spy).toEqual({ captures: 0, pipes: 0, ingests: 0 });
+  });
+
+  test("a projection page's loss markers reach the wire with the page, bounded to the wire contract (U2)", async () => {
+    const valid = { lineId: 9, kind: "worker-dead", reason: "r".repeat(600), missingCount: null };
+    const markers: unknown[] = [
+      { lineId: 3, kind: "k".repeat(80), missingCount: 2 },
+      { lineId: -4, kind: "bad-position", missingCount: null },
+      { lineId: 5, kind: "bad-count", missingCount: 1.5 },
+      null,
+      ...Array.from({ length: 70 }, (_, i) => ({ lineId: 100 + i, kind: "gap", missingCount: i })),
+      valid,
+    ];
+    const h = projectionHarness({ owns: true, page: () => ({ lines: ["h9"], startLine: 9, hasMore: true, markers }) });
+    const ws = new FakeWS();
+    h.mux.handleMessage({ type: "history_expand", session: SESSION, beforeLine: 10, limit: 1 } as never, ws);
+    h.mux.handleMessage({ type: "history_expand", session: SESSION, afterLine: 8, limit: 1 } as never, ws);
+    const pages = frames(ws).filter((f) => f.type === "history").map((f) => JSON.parse(f.data));
+    expect(pages.length).toBe(2);
+    for (const page of pages) {
+      expect(page.lines).toEqual(["h9"]);
+      expect(page.markers.length).toBe(64);
+      // Newest kept; the unusable ones dropped, not guessed; long text clipped.
+      expect(page.markers.at(-1)).toEqual({ ...valid, reason: "r".repeat(512) });
+      expect(page.markers.some((m: { kind: string }) => m.kind.startsWith("bad-"))).toBe(false);
+      expect(page.markers[0]).toEqual({ lineId: 107, kind: "gap", missingCount: 7 });
+    }
+    const truncated = projectionHarness({ owns: true, page: () => ({ lines: [], startLine: null, hasMore: false, markers: [{ lineId: 3, kind: "k".repeat(80), missingCount: 2 }] }) });
+    const ws2 = new FakeWS();
+    truncated.mux.handleMessage({ type: "history_expand", session: SESSION, beforeLine: 10 } as never, ws2);
+    expect(JSON.parse(frames(ws2).find((f) => f.type === "history")!.data).markers).toEqual([{ lineId: 3, kind: "k".repeat(64), missingCount: 2 }]);
   });
 
   test("metadata-only changes bypass content hash dedupe and reach an idle viewer", async () => {
