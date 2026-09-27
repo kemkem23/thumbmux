@@ -184,12 +184,70 @@ test("NEWARCH I4: an alternate screen publishes only the screen, the seam at the
   expect(alt.content.split("\n")).toHaveLength(4);
 });
 
-test("NEWARCH FIX1: equal history and screen text is preserved without explicit resize mapping", () => {
-  const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(10)]], 10);
-  const blank = parserRowCells([], 10);
-  const ring = ["a", "b", "c", "d"].map((t) => ({ cells: row(t) }));
-  expect(screenOverlap(ring, [row("c"), row("d"), row("e")])).toBe(0);
-  expect(screenOverlap(ring, [row("e"), row("f")])).toBe(0);
-  // Blank equality is no stronger evidence than nonblank equality.
-  expect(screenOverlap([...ring, { cells: blank }], [blank, row("x")])).toBe(0);
+// ── NEWARCH-SWITCHON H2: rows tmux pulled back on resize, by tmux's own counters ──
+import { resizePullback } from "../src/pipe-history-runtime";
+
+/** A calibrated pane double: ring rows `ring` (line ids 0..), a screen of `screen` texts, an optional pull-back. */
+function calibratedPane(ring: string[], screen: string[], pulledBack: { rows: number; endLine: number } | null, displaySource: "pipe" | "tmux-calibrated" = "tmux-calibrated") {
+  const cols = 12;
+  const paneKey = { serverIdentity: "srv", paneId: "%9", birthGeneration: 1 };
+  const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
+  const rows = ring.map((text, lineId) => ({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: row(text), softWrap: false }));
+  const token = { paneKey, sourceEpoch: 1, geometryGeneration: 0, revision: 1, durableRevision: 1, nextLineId: ring.length };
+  const pane = {
+    paneKey,
+    recentRows: () => rows,
+    view: () => ({
+      paneKey, session: "s", cells: screen.map(row), cursor: { x: 0, y: screen.length - 1, visible: true }, kind: "normal" as const,
+      cols, rows: screen.length, displaySource, token, sourceEpoch: 1, geometryGeneration: 0, mouseSgr: false, mouseAny: false,
+      degraded: false, issues: [], pulledBack,
+    }),
+    readRange: () => null,
+  };
+  return pane as unknown as PipeHistoryPane;
+}
+const liveLines = (pane: PipeHistoryPane) => new ProjectionLiveWindow(1000).snapshot(pane, 1)!.content.split("\n").map((l) => l.trimEnd());
+
+test("SWITCHON H2: pull-back is history_size before - after, clamped to the rows added; never text", () => {
+  const meta = (rows: number, historySize: number, alternate = false) => ({ rows, historySize, alternate });
+  // 24 -> 37 with 100 rows of history: tmux pulls 13 back.
+  expect(resizePullback(meta(24, 100), meta(37, 87))).toBe(13);
+  // Only 5 rows of history: 5 come back, the rest of the growth is blank.
+  expect(resizePullback(meta(24, 5), meta(37, 0))).toBe(5);
+  // A clear-history during the growth drops more than the rows added: clamp.
+  expect(resizePullback(meta(24, 100), meta(37, 0))).toBe(13);
+  // Output scrolled 4 rows into history between the two reads: 9 still on screen.
+  expect(resizePullback(meta(24, 100), meta(37, 91))).toBe(9);
+  // Shrinking pushes rows into history; nothing is pulled.
+  expect(resizePullback(meta(37, 87), meta(24, 100))).toBe(0);
+  // Same height, history shrank (clear-history): not a pull-back.
+  expect(resizePullback(meta(24, 100), meta(24, 0))).toBe(0);
+  // tmux never pulls history into the alternate screen.
+  expect(resizePullback(meta(24, 100, true), meta(37, 87, true))).toBe(0);
+  // Unreadable history_size: no number, no guess.
+  expect(resizePullback(meta(24, Number.NaN), meta(37, 87))).toBe(0);
+  expect(resizePullback(meta(24, 100), meta(37, Number.NaN))).toBe(0);
+});
+
+test("SWITCHON H2: a calibrated screen hides exactly the pulled-back rows from the live window, in order", () => {
+  const ring = Array.from({ length: 50 }, (_, i) => `R-${String(i).padStart(3, "0")}`);
+  // tmux 24 -> 37: the newest 13 history rows (37..49) are back at the top of the screen.
+  const screen = [...ring.slice(37), ...Array.from({ length: 23 }, (_, i) => `R-${String(50 + i).padStart(3, "0")}`), ""];
+  const pane = calibratedPane(ring, screen, { rows: 13, endLine: 50 });
+  expect(screenOverlap(pane.view())).toBe(13);
+  const ids = liveLines(pane).filter((l) => l.startsWith("R-")).map((l) => Number(l.slice(2)));
+  expect(ids).toEqual(Array.from({ length: 73 }, (_, i) => i));
+  // A pipe screen never holds pulled-back rows (the parser does not pull history in).
+  expect(screenOverlap({ displaySource: "pipe", kind: "normal", pulledBack: { rows: 13, endLine: 50 } })).toBe(0);
+  expect(screenOverlap({ displaySource: "tmux-calibrated", kind: "alternate", pulledBack: { rows: 13, endLine: 50 } })).toBe(0);
+  expect(screenOverlap({ displaySource: "tmux-calibrated", kind: "normal", pulledBack: null })).toBe(0);
+});
+
+test("SWITCHON H2: A,A in history and A,A,B on screen is four A rows, not two (no content equality)", () => {
+  const pane = calibratedPane(["x", "A", "A"], ["A", "A", "B", ""], null);
+  expect(screenOverlap(pane.view())).toBe(0);
+  expect(liveLines(pane).filter((l) => l === "A")).toHaveLength(4);
+  // Blank rows are no stronger evidence than text rows.
+  const blank = calibratedPane(["x", ""], ["", "y"], null);
+  expect(liveLines(blank)).toEqual(["x", "", "", "y"]);
 });
