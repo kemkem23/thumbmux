@@ -98,6 +98,12 @@ export type SgrState = {
   underlineColor?: string | null;
   inverse: boolean;
   strike: boolean;
+  /**
+   * SGR 8 (conceal). Optional for back-compat with older object literals;
+   * missing counts as `false`. Ink is painted in the cell background colour,
+   * so the text stays in the DOM and can still be selected and copied (xterm).
+   */
+  hidden?: boolean;
   /** A validated active OSC 8 href, carried until an OSC 8 close. */
   osc8Href?: string | null;
 };
@@ -146,6 +152,7 @@ export function createSgrState(): SgrState {
     underlineColor: null,
     inverse: false,
     strike: false,
+    hidden: false,
     osc8Href: null,
   };
 }
@@ -164,6 +171,7 @@ export function cloneSgrState(s: SgrState): SgrState {
     underlineColor: s.underlineColor ?? null,
     inverse: s.inverse,
     strike: s.strike,
+    hidden: s.hidden ?? false,
     osc8Href: s.osc8Href ?? null,
   };
 }
@@ -181,6 +189,8 @@ export function sgrStateKey(s: SgrState): string {
     +s.inverse,
     +s.strike,
     s.osc8Href ?? '',
+    // Appended last so keys of non-hidden states are unchanged.
+    ...(s.hidden ? ['h'] : []),
   ].join('|');
 }
 
@@ -279,6 +289,7 @@ function resetSgr(st: SgrState): void {
   st.underlineColor = null;
   st.inverse = false;
   st.strike = false;
+  st.hidden = false;
 }
 
 function setUnderline(st: SgrState, style: UnderlineStyle | null): void {
@@ -345,6 +356,9 @@ function applySgrParams(raw: string, st: SgrState): void {
       case 7:
         st.inverse = true;
         break;
+      case 8:
+        st.hidden = true;
+        break;
       case 9:
         st.strike = true;
         break;
@@ -363,6 +377,9 @@ function applySgrParams(raw: string, st: SgrState): void {
         break;
       case 27:
         st.inverse = false;
+        break;
+      case 28:
+        st.hidden = false;
         break;
       case 29:
         st.strike = false;
@@ -523,7 +540,8 @@ function isDefaultSgrState(st: SgrState): boolean {
     (st.underlineStyle ?? null) === null &&
     (st.underlineColor ?? null) === null &&
     !st.inverse &&
-    !st.strike
+    !st.strike &&
+    !(st.hidden ?? false)
   );
 }
 
@@ -543,6 +561,9 @@ function styleDeclarations(st: SgrState, palette: AnsiPalette, linkUnderline = f
     const n = Number(st.fg);
     if (Number.isFinite(n) && n >= 0 && n < 8) fg = colorFor(palette, String(n + 8)) ?? fg;
   }
+  // SGR 8: glyph (and decoration) ink = the cell background after inverse.
+  const hidden = st.hidden ?? false;
+  if (hidden) fg = bg ?? defaultBg;
 
   const styles: string[] = [`color:${fg}`];
   if (bg) styles.push(`background-color:${bg}`);
@@ -563,8 +584,9 @@ function styleDeclarations(st: SgrState, palette: AnsiPalette, linkUnderline = f
     else if (underlineStyle === 'curly') styles.push('text-decoration-style:wavy');
 
     const underlineColor = colorFor(palette, st.underlineColor ?? null);
-    if (underlineColor) styles.push(`text-decoration-color:${underlineColor}`);
+    if (underlineColor && !hidden) styles.push(`text-decoration-color:${underlineColor}`);
   }
+  if (hidden && decoration.length) styles.push(`text-decoration-color:${fg}`);
 
   return styles;
 }
