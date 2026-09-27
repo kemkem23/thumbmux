@@ -1,5 +1,6 @@
 import {
   PipeVtWorker,
+  type PipeVtPool,
   type PipeVtAssets,
   type PipeVtCursor,
   type PipeVtFault,
@@ -118,6 +119,7 @@ export type PipeCollectorDrainReceipt = {
 };
 
 export type PipeHistoryCollectorOptions = {
+  pool?: PipeVtPool;
   paneKey: PaneKey;
   sourceEpoch: number;
   /** Actual pane option; unknown clear policy raises a fault, never guessed. */
@@ -261,6 +263,7 @@ export class PipeHistoryCollector {
     // Callbacks are bound to this instance: output of a replaced worker that
     // is still draining must never land in the new epoch.
     const worker: PipeVtWorker = new PipeVtWorker({
+      pool: this.options.pool,
       sourceEpoch: this.sourceEpoch,
       onHistoryClear: ({ seq, epoch }) => {
         if (worker !== this.worker) return;
@@ -449,6 +452,7 @@ export class PipeHistoryCollector {
       maxMs: sorted.length ? sorted[sorted.length - 1]! : null,
     };
     return {
+      restartCount: this.recoveryAttempts,
       receiveSeq: this.receiveSeq,
       ackedSeq: this.ackedSeq,
       inflightBytes: this.inflightBytes,

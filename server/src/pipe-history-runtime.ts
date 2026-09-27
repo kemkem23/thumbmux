@@ -24,7 +24,7 @@
  * limited to fields the parser can observe.
  */
 import { PipeHistoryCollector, type PipeFaultEvent, type PipeFrameEvent, type PipeScrollEvent } from './pipe-history-collector';
-import { pipeVtRunCells, type PipeVtAssets, type PipeVtRow } from './pipe-vt-worker';
+import { PipeVtPool, pipeVtRunCells, type PipeVtAssets, type PipeVtRow } from './pipe-vt-worker';
 import { HistoryCalibrator, type CalibrationCapture, type CalibrationFrame, type CaptureMetadata, type CaptureEvidence } from './history-calibrator';
 import { HistoryWatchdog } from './history-watchdog';
 import type { CapturedRow, HistoryCell, HistoryRow, RowMatch } from './history-row-matcher';
@@ -266,6 +266,8 @@ export interface PipeHistoryPaneOptions {
   commitIntervalMs?: number;
 }
 export interface PipeHistoryRuntimeOptions {
+  /** One shared interpreter per runtime by default; false is a diagnostic fallback. */
+  sharedParser?: boolean;
   store: RuntimeStore;
   now?: () => number;
   nowNs?: () => bigint;
@@ -281,7 +283,7 @@ export interface PipeHistoryRuntimeOptions {
 
 const RING_ROWS = 4500;
 /** Minimum spacing of full-screen writes to the store per pane (leading edge immediate). */
-export const FRAME_WRITE_MS = 8;
+export const FRAME_WRITE_MS = 16;
 
 // ─── screen assembly ──────────────────────────────────────────────────────
 
@@ -374,7 +376,7 @@ export class PipeHistoryPane {
       sourceEpoch: options.sourceEpoch ?? 1,
       scrollOnClear: options.scrollOnClear,
       cols: options.meta.cols, rows: options.meta.rows,
-      assets: runtime.options.assets, python: runtime.options.python,
+      assets: runtime.options.assets, python: runtime.options.python, pool: runtime.parserPool,
       nowNs: runtime.nowNs, now,
       latencySampleLimit: 0,
       ports: {
@@ -882,6 +884,7 @@ export class PipeHistoryPane {
 // ─── runtime ──────────────────────────────────────────────────────────────
 
 export class PipeHistoryRuntime {
+  readonly parserPool: PipeVtPool | undefined;
   readonly store: RuntimeStore;
   readonly now: () => number;
   readonly nowNs: () => bigint;
@@ -892,6 +895,7 @@ export class PipeHistoryRuntime {
   private closed = false;
 
   constructor(readonly options: PipeHistoryRuntimeOptions) {
+    this.parserPool = options.sharedParser === false ? undefined : new PipeVtPool({ assets: options.assets, python: options.python });
     this.store = options.store;
     this.now = options.now ?? Date.now;
     this.nowNs = options.nowNs ?? (() => process.hrtime.bigint());
@@ -952,8 +956,8 @@ export class PipeHistoryRuntime {
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     clearInterval(this.heartbeat);
-    await Promise.all([...this.panesByKey.values()].map(pane => pane.close()));
-    this.panesByKey.clear();
+    try { await Promise.all([...this.panesByKey.values()].map(pane => pane.close())); }
+    finally { this.panesByKey.clear(); await this.parserPool?.close(); }
   }
 }
 
