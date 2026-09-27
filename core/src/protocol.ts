@@ -171,6 +171,46 @@ export function validateNewarchFrameMeta(value: unknown): NewarchFrameMeta | nul
   };
 }
 
+/**
+ * One loss / unverified-reset marker on a projection history page (additive
+ * `markers` field of a newarch `history` payload). Same coordinates as
+ * {@link NewarchFrameMeta.markers}: the gap sits before row `lineId`.
+ */
+export type MuxHistoryPageMarker = {
+  lineId: number | null;
+  kind: string;
+  reason?: string;
+  missingCount: number | null;
+};
+
+/** Most markers one history page may carry on the wire. */
+export const HISTORY_PAGE_MARKER_LIMIT = 64;
+
+/**
+ * Parse and defensively clone a history page's `markers`. `undefined` (a
+ * legacy page) is an empty list; anything malformed or over the limit is null
+ * so a caller never draws a guessed position.
+ */
+export function validateHistoryPageMarkers(value: unknown): MuxHistoryPageMarker[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > HISTORY_PAGE_MARKER_LIMIT) return null;
+  const count = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  const markers: MuxHistoryPageMarker[] = [];
+  for (const raw of value as unknown[]) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const marker = raw as Record<string, unknown>;
+    if ((marker.lineId !== null && !count(marker.lineId)) || typeof marker.kind !== "string" || marker.kind.length === 0
+      || marker.kind.length > 64 || (marker.missingCount !== null && !count(marker.missingCount))
+      || (marker.reason !== undefined && (typeof marker.reason !== "string" || marker.reason.length > 512))) return null;
+    markers.push({
+      lineId: marker.lineId as number | null, kind: marker.kind,
+      ...(marker.reason === undefined ? {} : { reason: marker.reason as string }),
+      missingCount: marker.missingCount as number | null,
+    });
+  }
+  return markers;
+}
+
 /** A delta carrying `next` may apply on a base described by `base`. */
 export function newarchDeltaContinues(base: NewarchFrameMeta, next: NewarchFrameMeta): boolean {
   return base.paneKey.serverIdentity === next.paneKey.serverIdentity
