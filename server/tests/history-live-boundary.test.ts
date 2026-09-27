@@ -352,7 +352,7 @@ test("SWITCHON P: statistics rings keep at most the newest samples and drop old 
   expect(stamps.at(-1)).toBe(4095);
 });
 
-test("SWITCHON P: RAM frames round-trip through the compact row codec, and rle:1 frames still decode", () => {
+test("SWITCHON P: RAM frames encode each unchanged row once and still round-trip exactly", () => {
   const cols = 12;
   const row = (runs: Array<[string, string, number, string]>) => parserRowCells(runs, cols);
   const cells = [
@@ -365,13 +365,12 @@ test("SWITCHON P: RAM frames round-trip through the compact row codec, and rle:1
     cells, kind: "normal" as const, cols, rows: cells.length, cursor: { row: 0, col: 0, visible: true } };
   validateFrame(frame);
   const encoded = encodeFrameCells(cells);
-  expect(JSON.parse(encoded).rle).toBe(2);
+  expect(JSON.parse(encoded).rle).toBe(1);
   expect(JSON.stringify(decodeFrameCells(encoded))).toBe(JSON.stringify(cells));
   // The same row objects encode to the same text (the per-row cache), and a new row is encoded anew.
   expect(encodeFrameCells(cells)).toBe(encoded);
   const changed = [cells[0]!, row([["default", "default", 0, "new"]]), cells[2]!, cells[3]!];
   expect(JSON.stringify(decodeFrameCells(encodeFrameCells(changed)))).toBe(JSON.stringify(changed));
-  // A frame written before this change (legacy runs) is still readable.
-  const legacy = JSON.stringify({ rle: 1, rows: [[[" ", 1, false, "default", "default", 0, cols]]] });
-  expect(decodeFrameCells(legacy)[0]).toHaveLength(cols);
+  // The stored format is the one every reader already knows (one run of 12 blanks).
+  expect(JSON.parse(encoded).rows[3]).toEqual([[" ", 1, false, "default", "default", 0, cols]]);
 });
