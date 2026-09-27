@@ -894,6 +894,35 @@ describe('TmuxMux newarch-frame-v1', () => {
     mux.dispose();
   });
 
+  test('a metadata-only delta reaches the subscriber with its new marker; an older metadata revision is refused', () => {
+    const deliveries: Array<{ data: string; meta: any }> = [];
+    const mux = new TmuxMux();
+    const unsubscribe = mux.subscribe('work', (data, type, _cursor, deliveryMeta) => {
+      if (type === 'output') deliveries.push({ data, meta: deliveryMeta });
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    const screen = ['h40', 'row a', 'row b'];
+    socket.receive({ channel: 'work', type: 'output', data: screen.join('\n'), cursor: null, newarch: meta({ metadataRevision: 4 }) });
+    // Cells unchanged, a worker died: the marker must still be delivered.
+    const dead = { lineId: 50, kind: 'worker-dead', missingCount: null };
+    socket.receive({
+      ...createMuxDeltaFrame('work', screen, screen),
+      newarch: meta({ metadataRevision: 5, markers: [{ lineId: 45, kind: 'attach', missingCount: null }, dead] }),
+    });
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[1]!.data).toBe(screen.join('\n'));
+    expect(deliveries[1]!.meta.newarch.metadataRevision).toBe(5);
+    expect(deliveries[1]!.meta.newarch.markers).toContainEqual(dead);
+    // A delta whose metadata went backwards cannot patch this base.
+    socket.receive({ ...createMuxDeltaFrame('work', screen, screen), newarch: meta({ metadataRevision: 3 }) });
+    expect(deliveries).toHaveLength(2);
+    expect(socket.frames().filter((frame) => frame.type === 'resync')).toEqual([{ type: 'resync', session: 'work' }]);
+    unsubscribe();
+    socket.finishClose();
+    mux.dispose();
+  });
+
   test('a malformed descriptor on a full frame is refused, not delivered', () => {
     const deliveries: string[] = [];
     const mux = new TmuxMux();

@@ -73,6 +73,7 @@
     wheelDeltaToLines, consumeWholeWheelLines,
     muxHistoryBoundaryTransition,
     type MuxHistoryBoundary,
+    type NewarchFrameMeta,
     isClaudeActivityStatusLine,
     detectClaudeBashBlocks,
     detectClaudeBashBlocksWithActivityEvidence,
@@ -510,6 +511,23 @@
   let contentEpoch = $state(0);
   let renderEpoch = $state(0); // bump to force window re-render
 
+  // --- newarch loss markers (CX M6) ---
+  // A pane's loss / unverified-reset markers arrive as frame metadata and can
+  // change while the cells do not. They are drawn, never left in meta: at the
+  // row they sit before when that row is resident, otherwise as a note.
+  type LossMarker = { lineId: number | null; kind: string; missingCount: number | null };
+  let lossMarkers = $state.raw<readonly LossMarker[]>([]);
+  let lossMarkerPane = $state('');
+  /** The applied live frame the marker line ids index into (not a copy). */
+  let lossMarkerFrame: { liveStartLine: number; lines: readonly string[] } | null = null;
+  /** Marker keys this view already held when it attached to the route. */
+  let lossMarkerBaseline: Set<string> | null = null;
+  /** Markers raised while this view watched; noted until their row is seen. */
+  let freshLossKeys = $state.raw<ReadonlySet<string>>(new Set());
+  const seenFreshLossKeys = new Set<string>();
+  /** A history page read failed and nothing replaced it yet (CX M7). */
+  let archiveUnavailable = $state(false);
+
   // --- search + matching overlay ---
   let searchOpen = $state(false);
   let searchQuery = $state('');
@@ -624,6 +642,8 @@
     replace: boolean;
     screen?: { alt: boolean; mouseSgr: boolean; mouseAny: boolean } | null;
     boundary?: MuxHistoryBoundary;
+    /** newarch-frame-v1 of the delivered snapshot (pipe-pane route only). */
+    newarch?: NewarchFrameMeta;
     historyError?: {
       code: 'history_temporarily_unavailable';
       retryable: true;
@@ -4038,6 +4058,7 @@
       }
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
+      archiveUnavailable = false;
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
       return unchanged;
     }
@@ -5525,6 +5546,7 @@
     const direction = archiveInflightDirection;
     const requestAnchorLine = archiveInflightAnchorLine;
     archiveRequestActive = false;
+    archiveUnavailable = false;
     enqueuePrependWork(() => {
       if (archiveInflightRequestId !== requestId || !archiveLoading) return;
       if (historyPaging === 'sliding') {
@@ -5546,6 +5568,7 @@
     // into archive exhaustion; the next eligible scroll may ask again with
     // the same absolute cursor.
     if (!archiveRequestActive || archiveInflightRequestId === null) return;
+    archiveUnavailable = true;
     finishArchiveRequest('empty');
   }
 
@@ -5611,7 +5634,110 @@
       source,
       boundaryReconciliation,
     );
+    applyLossMarkers(meta, nextLive);
   }
+
+  /** Markers travel with the snapshot they describe; a legacy frame has none. */
+  function applyLossMarkers(meta: MuxDeliveryMeta, frameLines: readonly string[]): void {
+    const newarch = meta.newarch;
+    if (!newarch) {
+      lossMarkerFrame = null;
+      if (lossMarkers.length) lossMarkers = [];
+      lossMarkerPane = '';
+      lossMarkerBaseline = null;
+      if (freshLossKeys.size) freshLossKeys = new Set();
+      seenFreshLossKeys.clear();
+      return;
+    }
+    lossMarkerFrame = { liveStartLine: newarch.liveStartLine, lines: frameLines };
+    lossMarkers = newarch.markers.map(marker => ({ ...marker }));
+    lossMarkerPane = `pane ${newarch.paneKey.paneId} · epoch ${newarch.sourceEpoch}`;
+    const keys = lossMarkerKeys(lossMarkers);
+    if (lossMarkerBaseline === null) {
+      lossMarkerBaseline = new Set(keys);
+      return;
+    }
+    const baseline = lossMarkerBaseline;
+    const fresh = keys.filter(key => !baseline.has(key) && !seenFreshLossKeys.has(key));
+    if (fresh.length !== freshLossKeys.size || fresh.some(key => !freshLossKeys.has(key))) {
+      freshLossKeys = new Set(fresh);
+    }
+  }
+
+  /** Identity by what the marker says plus its occurrence, never by row text. */
+  function lossMarkerKeys(markers: readonly LossMarker[]): string[] {
+    const seen = new Map<string, number>();
+    return markers.map(marker => {
+      const base = `${marker.kind}|${marker.lineId ?? 'unknown'}|${marker.missingCount ?? 'unknown'}`;
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      return `${base}#${n}`;
+    });
+  }
+
+  function lossMarkerText(marker: LossMarker): string {
+    const count = marker.missingCount === null ? 'ไม่ทราบจำนวน' : `${marker.missingCount} แถว`;
+    const at = marker.lineId === null ? 'ไม่ทราบตำแหน่ง' : `ก่อนแถว ${marker.lineId}`;
+    return `ข้อมูลขาด · ${marker.kind} · ${count} · ${at} · ${lossMarkerPane}`;
+  }
+
+  /**
+   * Resident raw row a marker's projection line id names. Live rows are
+   * addressed from the end of the applied frame (rawLines ends with it while
+   * attached); archive rows by the page's own start line. The row text must
+   * still be the frame's row, otherwise the marker has no row (only a note while fresh).
+   */
+  function lossMarkerRawIndex(lineId: number): number | null {
+    const frame = lossMarkerFrame;
+    if (frame && (archiveWindow === null || archiveWindowAttachedToLive)) {
+      const offset = lineId - frame.liveStartLine;
+      if (offset >= 0 && offset < frame.lines.length) {
+        const index = rawLines.length - frame.lines.length + offset;
+        return index >= 0 && rawLines[index] === frame.lines[offset] ? index : null;
+      }
+    }
+    if (archiveWindow !== null) {
+      const index = lineId - archiveWindow.startLine;
+      if (index >= 0 && index < archivedLines.length) return index;
+    }
+    return null;
+  }
+
+  /**
+   * Every resident marker is drawn on its row. A marker raised while this view
+   * watches is also noted at the top until its row has been on screen, so a
+   * fault on a static screen reaches pixels even when its row is scrolled out
+   * of view (or not resident at all).
+   */
+  const lossMarkerPlacement = $derived.by(() => {
+    void contentEpoch;
+    void settledBottomOffsetPx;
+    const rows = new Map<number, string>();
+    const notes: string[] = [];
+    const seenNow: string[] = [];
+    const visible = total > 0 ? strictVisibleRowRange(settledBottomOffsetPx) : null;
+    const keys = lossMarkerKeys(lossMarkers);
+    lossMarkers.forEach((marker, i) => {
+      const index = marker.lineId === null ? null : lossMarkerRawIndex(marker.lineId);
+      const text = lossMarkerText(marker);
+      if (index !== null) rows.set(index, rows.has(index) ? `${rows.get(index)} | ${text}` : text);
+      const key = keys[i]!;
+      if (!freshLossKeys.has(key)) return;
+      const visual = index === null ? null : visualRowForRaw(index);
+      if (visible && visual !== null && visual >= visible.startIdx && visual < visible.endIdx) seenNow.push(key);
+      else notes.push(text);
+    });
+    return { rows, notes, seenNow };
+  });
+
+  $effect(() => {
+    const seenNow = lossMarkerPlacement.seenNow;
+    if (seenNow.length === 0) return;
+    for (const key of seenNow) seenFreshLossKeys.add(key);
+    untrack(() => {
+      freshLossKeys = new Set([...freshLossKeys].filter(key => !seenFreshLossKeys.has(key)));
+    });
+  });
 
   function receiveLiveContent(
     data: string,
@@ -7137,6 +7263,16 @@
         {@const toolSearchKind = compactTool && projectionRow
           ? placeholderSearchKind(projectionRow)
           : null}
+        {@const lossNote = lossMarkerPlacement.rows.get(rawLineIdx)}
+        {#if lossNote}<span
+            class="mtv-loss-marker"
+            role="note"
+            lang="th"
+            aria-label={lossNote}
+            title={lossNote}
+            data-loss-marker={lossNote}
+            style:top={`${presentationTop}px`}
+          ><span class="mtv-loss-marker-label">{lossNote}</span></span>{/if}
         {#if droppedRows > 0}<span
             class="mtv-gap-marker"
             role="note"
@@ -7249,6 +7385,24 @@
       <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
     </div>
   {/if}
+  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable}
+    <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
+      {#if lossMarkerPlacement.notes.length > 0}
+        {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]}
+        {@const more = lossMarkerPlacement.notes.length - 1}
+        {@const note = more > 0 ? `${newest} · และอีก ${more} รายการ` : newest}
+        <div class="mtv-loss-note" role="note" aria-label={lossMarkerPlacement.notes.join(' | ')} data-loss-note={note}>
+          <span class="mtv-signpost-text">{note}</span>
+        </div>
+      {/if}
+      {#if archiveUnavailable}
+        <div class="mtv-loss-note" role="note" data-testid="mtv-archive-unavailable"
+          aria-label="อ่านประวัติส่วนนี้ไม่ได้ตอนนี้ · เลื่อนอีกครั้งเพื่อลองใหม่">
+          <span class="mtv-signpost-text">อ่านประวัติส่วนนี้ไม่ได้ตอนนี้ · เลื่อนอีกครั้งเพื่อลองใหม่</span>
+        </div>
+      {/if}
+    </div>
+  {/if}
   {#if showHistoryCeiling}
     <!--
       Client retention ceiling (audit D4). Not a gap marker: no rows were
@@ -7305,6 +7459,52 @@
     -webkit-user-select: none;
     border-bottom: 1px solid color-mix(in srgb, var(--tfg) 32%, transparent);
     background: color-mix(in srgb, var(--tbg) 82%, var(--tfg));
+  }
+  /* Loss markers state a fact about the rows themselves (data missing or not
+     certified here), so they use the warning colour and are painted on top
+     of the terminal, not in the gutter. The rule sits on the row's top edge
+     and costs no row height, keeping scroll/prepend geometry unchanged. */
+  .mtv-loss-marker {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 0;
+    z-index: 3;
+    border-top: 2px solid #E0A020;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mtv-loss-marker-label {
+    position: absolute;
+    right: 4px;
+    top: 0;
+    max-width: calc(100% - 8px);
+    padding: 1px 4px;
+    box-sizing: border-box;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font: 600 11px / 1.35 var(--font-mono, ui-monospace, monospace);
+    letter-spacing: 0;
+    color: #141414;
+    background: #E0A020;
+  }
+  .mtv-loss-notes {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 4;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mtv-loss-note {
+    padding: 5px 8px;
+    box-sizing: border-box;
+    border-bottom: 2px solid #E0A020;
+    background: color-mix(in srgb, var(--tbg) 70%, #E0A020);
   }
   .mtv-signpost-text {
     display: block;
