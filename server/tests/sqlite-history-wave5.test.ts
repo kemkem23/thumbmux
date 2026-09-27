@@ -488,6 +488,85 @@ describe('NEWARCH I4 runtime against the real VT worker and projection store', (
   }, 60_000);
 });
 
+// ── NEWARCH-SWITCHON FIX1 F1-H: a paused store, seen from the runtime ──
+import { FRAME_PRESSURE_RETRY_MS, ProjectionLiveWindow as F1HWindow } from '../src/pipe-history-runtime';
+
+describe('NEWARCH-SWITCHON F1-H runtime under a full disk', () => {
+  test('overlay marker in frame and page, refused screens back off, drain receipt waits for the durable barrier, unstored screen shown', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'f1h-runtime-'));
+    const full = { on: false };
+    const store = createProjectionStore({ historyRoot: root, mode: 'create', checkpoint: phase => {
+      if (full.on && phase === 'before-disk-commit') throw new Error('SQLiteError: database or disk is full');
+    } });
+    let screens = 0;
+    const proxy = new Proxy(store, { get(target, key, receiver) {
+      if (key === 'replaceScreen') return (frame: Parameters<typeof store.replaceScreen>[0]) => { screens++; return target.replaceScreen(frame); };
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const runtime = createPipeHistoryRuntime({ store: proxy });
+    const window = new F1HWindow();
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 'f1h', paneId: '%1', birthGeneration: 1 }, session: 's', meta: I4_META, calibrate: false, capture: () => Promise.reject(new Error('unused')) });
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 20; i++) pane.ingest(enc.encode(`kept ${i}\r\n`));
+      await i4Until(() => pane.recentRows().some(r => rowText(r.cells).trimEnd() === 'kept 12'));
+      const clean = await pane.drainReceipt(5000);
+      expect(clean).toMatchObject({ unknownTail: false, issues: [] });
+      expect(clean.durableRevision).toBe(clean.ramRevision);
+      expect(clean.lastAckedSequence).toBe(clean.lastAdmittedSequence);
+
+      full.on = true;
+      pane.ingest(enc.encode('while full\r\n'));
+      await i4Until(() => store.health().storage.status === 'storage-paused', 5000);
+      const token = store.token(pane.paneKey);
+      pane.setStorageOverlay({ eventId: 'e-1', kind: 'storage-full', reason: 'paused', boundaryLineId: token.nextLineId, detectedAt: Date.now() });
+      expect(pane.view().degraded).toBe(true);
+      expect(pane.view().issues.at(-1)).toMatchObject({ kind: 'storage-full', boundaryLineId: token.nextLineId, revision: token.revision });
+      const frame = window.snapshot(pane, 1)!;
+      expect(frame.newarch.degraded).toBe(true);
+      expect(frame.newarch.markers.some(m => m.kind === 'storage-full' && m.lineId === token.nextLineId)).toBe(true);
+      expect(pane.readRange(0, token.nextLineId)!.issues.some(i => i.kind === 'storage-full')).toBe(true);
+
+      // A refused screen is offered again every FRAME_PRESSURE_RETRY_MS, not in a
+      // settled promise chain (which would also starve this very timer).
+      const before = screens;
+      pane.ingest(enc.encode('\x1b[1;1Hredraw'));
+      const t0 = performance.now();
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const waited = performance.now() - t0;
+      const offered = screens - before;
+      expect(waited).toBeLessThan(1500);
+      expect(offered).toBeGreaterThanOrEqual(1);
+      expect(offered).toBeLessThanOrEqual(Math.ceil(waited / FRAME_PRESSURE_RETRY_MS) + 3);
+
+      // No durable barrier while paused: an unknown tail that names it.
+      const paused = await pane.drainReceipt(300);
+      expect(paused.unknownTail).toBe(true);
+      expect(paused.issues.join(' ')).toMatch(/durable barrier|not settled/);
+
+      // Unstored display only while the overlay is up.
+      const meta = { ...I4_META, cursor: { x: 0, y: 1, visible: true } };
+      pane.showUnstored({ captureId: 'u1', requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: 'SEEN ON TMUX\n\n\n\n\n\n', tail: 0 });
+      expect(rowText(pane.view().cells[0] as never).trimEnd()).toBe('SEEN ON TMUX');
+      expect(pane.view().displaySource).toBe('tmux-calibrated');
+
+      full.on = false;
+      await i4Until(() => store.health().storage.status === 'healthy', 10_000);
+      const settled = await pane.drainReceipt(5000);
+      expect(settled.unknownTail).toBe(false);
+      expect(settled.durableRevision).toBe(settled.ramRevision);
+      pane.setStorageOverlay(null);
+      expect(pane.view().issues.some(i => i.kind === 'storage-full')).toBe(false);
+      pane.showUnstored({ captureId: 'u2', requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: 'IGNORED\n', tail: 0 });
+      expect(rowText(pane.view().cells[0] as never).trimEnd()).not.toBe('IGNORED');
+      const rows = store.readPage(store.token(pane.paneKey), 0, 100).lines.map(l => l.text.trimEnd()).filter(t => t.startsWith('kept '));
+      expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => `kept ${i + 1}`));
+      console.log('F1H_RUNTIME_PAUSE', JSON.stringify({ offered, waitedMs: Math.round(waited), retryMs: FRAME_PRESSURE_RETRY_MS, pausedIssues: paused.issues.length }));
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+});
+
 // ── NEWARCH-SWITCHON H2: the last page follows tmux across resizes; receipts close on capture ──
 import { spawnSync as h2Spawn } from 'node:child_process';
 import { appendFileSync as h2Append, openSync as h2Open, readSync as h2Read, closeSync as h2Close, writeFileSync as h2Write, existsSync as h2Exists } from 'node:fs';
