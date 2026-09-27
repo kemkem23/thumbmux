@@ -19,8 +19,10 @@
  */
 import {
   chooseMuxOutputFrame,
+  HISTORY_PAGE_MARKER_LIMIT,
   muxHistoryBoundaryTransition,
   splitMuxOutputData,
+  validateHistoryPageMarkers,
   validateMuxHistoryBoundary,
   type MuxClientMessage,
   type MuxFullOutputFrame,
@@ -405,6 +407,35 @@ export type TmuxWsMuxOptions<
 
 const DEFAULT_PROFILE: SessionProfile = { resize: true, currentPaneOnly: false, archive: true };
 const EMPTY_HISTORY_PAGE = { lines: [], startLine: null, hasMore: false };
+
+/**
+ * A projection page's loss markers are the only way a reader sees a gap at
+ * its row once it scrolls into history, so they travel with the page. Bound
+ * them to the wire contract here (newest {@link HISTORY_PAGE_MARKER_LIMIT},
+ * `kind` ≤64, `reason` ≤512) instead of letting one long reason make the
+ * client reject every marker of the page. An entry without a usable position
+ * or count is not guessed at: it is dropped. Pages without `markers` pass
+ * through unchanged.
+ */
+function boundProjectedHistoryPage(page: unknown): unknown {
+  if (typeof page !== "object" || page === null || Array.isArray(page)) return page;
+  const raw = (page as { markers?: unknown }).markers;
+  if (raw === undefined) return page;
+  const bounded: unknown[] = [];
+  for (const entry of Array.isArray(raw) ? raw : []) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const marker = entry as Record<string, unknown>;
+    const kind = typeof marker.kind === "string" ? marker.kind.slice(0, 64) : "";
+    const candidate = {
+      lineId: marker.lineId ?? null,
+      kind,
+      ...(typeof marker.reason === "string" ? { reason: marker.reason.slice(0, 512) } : {}),
+      missingCount: marker.missingCount ?? null,
+    };
+    if (validateHistoryPageMarkers([candidate]) !== null) bounded.push(candidate);
+  }
+  return { ...(page as object), markers: bounded.slice(-HISTORY_PAGE_MARKER_LIMIT) };
+}
 
 export class TmuxWsMux<
   WS extends WsLike = WsLike,
@@ -1760,7 +1791,7 @@ export class TmuxWsMux<
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = this.projection.readBefore(session, beforeLine ?? null, limit);
+        history = boundProjectedHistoryPage(this.projection.readBefore(session, beforeLine ?? null, limit));
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readBefore", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);
@@ -1818,7 +1849,7 @@ export class TmuxWsMux<
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = this.projection.readAfter(session, afterLine, limit);
+        history = boundProjectedHistoryPage(this.projection.readAfter(session, afterLine, limit));
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readAfter", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);

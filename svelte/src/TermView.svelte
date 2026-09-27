@@ -72,6 +72,7 @@
     sgrWheel, sgrClick, sgrSnapToBottom, DEFAULT_WHEEL_MAX_PER_CALL,
     wheelDeltaToLines, consumeWholeWheelLines,
     muxHistoryBoundaryTransition,
+    validateHistoryPageMarkers,
     type MuxHistoryBoundary,
     type NewarchFrameMeta,
     isClaudeActivityStatusLine,
@@ -522,6 +523,14 @@
   let lossMarkerFrame: { liveStartLine: number; lines: readonly string[] } | null = null;
   /** Marker keys this view already held when it attached to the route. */
   let lossMarkerBaseline: Set<string> | null = null;
+  /**
+   * Markers read from history pages (`markers` of a projection page). The
+   * frame carries only a pane's newest 16; an older gap reaches the reader
+   * only with the page that holds its row. Same pane identity only, bounded.
+   */
+  let pageLossMarkers = $state.raw<readonly LossMarker[]>([]);
+  let lossMarkerPaneIdentity = '';
+  const PAGE_LOSS_MARKER_LIMIT = 256;
   /** Markers raised while this view watched; noted until their row is seen. */
   let freshLossKeys = $state.raw<ReadonlySet<string>>(new Set());
   const seenFreshLossKeys = new Set<string>();
@@ -4851,6 +4860,7 @@
     endLine: number;
     totalArchivedLines: number;
     hasMore: boolean;
+    markers: LossMarker[];
   };
 
   function parseHistoryPage(data: string): ParsedHistoryPage | null {
@@ -4867,6 +4877,7 @@
       endLine?: unknown;
       totalArchivedLines?: unknown;
       hasMore?: unknown;
+      markers?: unknown;
     };
     const validStartLine = candidate.startLine === undefined || candidate.startLine === null || (
       typeof candidate.startLine === 'number' &&
@@ -4902,12 +4913,17 @@
       ? candidate.totalArchivedLines
       : endLine;
     if (endLine > totalArchivedLines) return null;
+    // A page whose markers cannot be read is refused like any malformed page:
+    // drawing its rows without their gaps would hide a loss.
+    const markers = validateHistoryPageMarkers(candidate.markers);
+    if (markers === null) return null;
     return {
       lines: [...lines],
       startLine,
       endLine,
       totalArchivedLines,
       hasMore: candidate.hasMore,
+      markers: markers.map(marker => ({ lineId: marker.lineId, kind: marker.kind, missingCount: marker.missingCount })),
     };
   }
 
@@ -5321,6 +5337,7 @@
       return;
     }
     archiveTotalHint = Math.max(archiveTotalHint, history.totalArchivedLines);
+    recordPageLossMarkers(history.markers);
     if (archiveWindow && isAwayFromLiveTail()) {
       detachSlidingArchiveFromLive(archiveTotalHint);
     }
@@ -5645,9 +5662,18 @@
       if (lossMarkers.length) lossMarkers = [];
       lossMarkerPane = '';
       lossMarkerBaseline = null;
+      lossMarkerPaneIdentity = '';
+      if (pageLossMarkers.length) pageLossMarkers = [];
       if (freshLossKeys.size) freshLossKeys = new Set();
       seenFreshLossKeys.clear();
       return;
+    }
+    // Line ids belong to one pane incarnation; another pane's page markers
+    // would name unrelated rows.
+    const identity = `${newarch.paneKey.serverIdentity}|${newarch.paneKey.paneId}|${newarch.paneKey.birthGeneration}`;
+    if (identity !== lossMarkerPaneIdentity) {
+      lossMarkerPaneIdentity = identity;
+      if (pageLossMarkers.length) pageLossMarkers = [];
     }
     lossMarkerFrame = { liveStartLine: newarch.liveStartLine, lines: frameLines };
     lossMarkers = newarch.markers.map(marker => ({ ...marker }));
@@ -5664,21 +5690,68 @@
     }
   }
 
+  /** Keep a page's markers (newest wins the bound) while a newarch route is shown. */
+  function recordPageLossMarkers(markers: readonly LossMarker[]): void {
+    if (!lossMarkerPaneIdentity || markers.length === 0) return;
+    const merged = new Map<string, LossMarker>();
+    for (const marker of pageLossMarkers) merged.set(lossMarkerBaseKey(marker), marker);
+    let changed = false;
+    for (const marker of markers) {
+      const key = lossMarkerBaseKey(marker);
+      if (merged.has(key)) continue;
+      merged.set(key, { lineId: marker.lineId, kind: marker.kind, missingCount: marker.missingCount });
+      changed = true;
+    }
+    if (!changed) return;
+    pageLossMarkers = [...merged.values()].slice(-PAGE_LOSS_MARKER_LIMIT);
+  }
+
+  function lossMarkerBaseKey(marker: LossMarker): string {
+    return `${marker.kind}|${marker.lineId ?? 'unknown'}|${marker.missingCount ?? 'unknown'}`;
+  }
+
   /** Identity by what the marker says plus its occurrence, never by row text. */
   function lossMarkerKeys(markers: readonly LossMarker[]): string[] {
     const seen = new Map<string, number>();
     return markers.map(marker => {
-      const base = `${marker.kind}|${marker.lineId ?? 'unknown'}|${marker.missingCount ?? 'unknown'}`;
+      const base = lossMarkerBaseKey(marker);
       const n = (seen.get(base) ?? 0) + 1;
       seen.set(base, n);
       return `${base}#${n}`;
     });
   }
 
+  /**
+   * Words a reader understands. The projection line id is internal (it is
+   * not the row's own text and reads like a number printed on screen), so it
+   * stays in the diagnostic detail with the kind, pane and epoch.
+   */
   function lossMarkerText(marker: LossMarker): string {
     const count = marker.missingCount === null ? 'ไม่ทราบจำนวน' : `${marker.missingCount} แถว`;
-    const at = marker.lineId === null ? 'ไม่ทราบตำแหน่ง' : `ก่อนแถว ${marker.lineId}`;
-    return `ข้อมูลขาด · ${marker.kind} · ${count} · ${at} · ${lossMarkerPane}`;
+    return `ข้อมูลหายตรงนี้ · ${count}`;
+  }
+
+  function lossMarkerNoteText(marker: LossMarker): string {
+    const count = marker.missingCount === null ? 'ไม่ทราบจำนวน' : `${marker.missingCount} แถว`;
+    return marker.lineId === null
+      ? `ข้อมูลหาย · ${count} · ไม่ทราบตำแหน่ง`
+      : `ข้อมูลหาย · ${count} · แตะเพื่อไปที่จุดนั้น`;
+  }
+
+  function lossMarkerDetail(marker: LossMarker): string {
+    const at = marker.lineId === null ? 'line ?' : `line ${marker.lineId}`;
+    return `${marker.kind} · ${at} · ${lossMarkerPane}`;
+  }
+
+  /**
+   * Tap on the note: bring the marker's row to the middle of the screen. A
+   * row that is not resident is older than every loaded row, so go to the
+   * oldest loaded row, which asks for the next older page.
+   */
+  function jumpToLossMarker(lineId: number | null): void {
+    if (lineId === null) return;
+    const index = lossMarkerRawIndex(lineId);
+    jumpToSearchLine(index ?? 0);
   }
 
   /**
@@ -5712,21 +5785,31 @@
   const lossMarkerPlacement = $derived.by(() => {
     void contentEpoch;
     void settledBottomOffsetPx;
-    const rows = new Map<number, string>();
-    const notes: string[] = [];
+    const rows = new Map<number, { text: string; detail: string }>();
+    const notes: Array<{ text: string; lineId: number | null }> = [];
     const seenNow: string[] = [];
     const visible = total > 0 ? strictVisibleRowRange(settledBottomOffsetPx) : null;
-    const keys = lossMarkerKeys(lossMarkers);
-    lossMarkers.forEach((marker, i) => {
+    const place = (marker: LossMarker): number | null => {
       const index = marker.lineId === null ? null : lossMarkerRawIndex(marker.lineId);
+      if (index === null) return null;
       const text = lossMarkerText(marker);
-      if (index !== null) rows.set(index, rows.has(index) ? `${rows.get(index)} | ${text}` : text);
+      const detail = lossMarkerDetail(marker);
+      const held = rows.get(index);
+      rows.set(index, held ? { text: `${held.text} | ${text}`, detail: `${held.detail} | ${detail}` } : { text, detail });
+      return index;
+    };
+    const keys = lossMarkerKeys(lossMarkers);
+    const framed = new Set(lossMarkers.map(lossMarkerBaseKey));
+    lossMarkers.forEach((marker, i) => {
+      const index = place(marker);
       const key = keys[i]!;
       if (!freshLossKeys.has(key)) return;
       const visual = index === null ? null : visualRowForRaw(index);
       if (visible && visual !== null && visual >= visible.startIdx && visual < visible.endIdx) seenNow.push(key);
-      else notes.push(text);
+      else notes.push({ text: lossMarkerNoteText(marker), lineId: marker.lineId });
     });
+    // Page markers draw their row only: they are history, not news.
+    for (const marker of pageLossMarkers) if (!framed.has(lossMarkerBaseKey(marker))) place(marker);
     return { rows, notes, seenNow };
   });
 
@@ -7268,11 +7351,12 @@
             class="mtv-loss-marker"
             role="note"
             lang="th"
-            aria-label={lossNote}
-            title={lossNote}
-            data-loss-marker={lossNote}
+            aria-label={lossNote.text}
+            title={`${lossNote.text} · ${lossNote.detail}`}
+            data-loss-marker={lossNote.text}
+            data-loss-detail={lossNote.detail}
             style:top={`${presentationTop}px`}
-          ><span class="mtv-loss-marker-label">{lossNote}</span></span>{/if}
+          ><span class="mtv-loss-marker-label">{lossNote.text}</span></span>{/if}
         {#if droppedRows > 0}<span
             class="mtv-gap-marker"
             role="note"
@@ -7388,12 +7472,19 @@
   {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable}
     <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
       {#if lossMarkerPlacement.notes.length > 0}
-        {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]}
+        {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]!}
         {@const more = lossMarkerPlacement.notes.length - 1}
-        {@const note = more > 0 ? `${newest} · และอีก ${more} รายการ` : newest}
-        <div class="mtv-loss-note" role="note" aria-label={lossMarkerPlacement.notes.join(' | ')} data-loss-note={note}>
+        {@const note = more > 0 ? `${newest.text} · และอีก ${more} รายการ` : newest.text}
+        <button
+          type="button"
+          class="mtv-loss-note mtv-loss-note-jump"
+          aria-label={lossMarkerPlacement.notes.map(n => n.text).join(' | ')}
+          data-loss-note={note}
+          disabled={newest.lineId === null}
+          onclick={() => jumpToLossMarker(newest.lineId)}
+        >
           <span class="mtv-signpost-text">{note}</span>
-        </div>
+        </button>
       {/if}
       {#if archiveUnavailable}
         <div class="mtv-loss-note" role="note" data-testid="mtv-archive-unavailable"
@@ -7505,6 +7596,28 @@
     box-sizing: border-box;
     border-bottom: 2px solid #E0A020;
     background: color-mix(in srgb, var(--tbg) 70%, #E0A020);
+  }
+  /* The note is the way to the rule: the one tappable part of the overlay. */
+  .mtv-loss-note-jump {
+    display: block;
+    width: 100%;
+    margin: 0;
+    border: 0;
+    border-bottom: 2px solid #E0A020;
+    border-radius: 0;
+    text-align: left;
+    color: inherit;
+    pointer-events: auto;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mtv-loss-note-jump:disabled {
+    cursor: default;
+  }
+  .mtv-loss-note-jump:focus-visible {
+    outline: 2px solid #E0A020;
+    outline-offset: -2px;
   }
   .mtv-signpost-text {
     display: block;
