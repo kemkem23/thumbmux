@@ -208,10 +208,12 @@ test('newarch: actual SQLITE_FULL preserves pending rows and reports host fault 
   await s.appendScroll(event);
   expect(()=>s.flush()).toThrow(/full/i);
   expect(faults.some(f=>/full/i.test(f.reason))).toBe(true);
-  expect(s.health().status).toBe('degraded');expect(s.token(key).durableRevision).toBe(0);
+  expect(s.health().status).toBe('stopped');expect(s.health().storage.status).toBe('storage-paused');expect(s.token(key).durableRevision).toBe(0);
   expect(s.readPage(s.token(key),null,1).lines[0].text).toBe(event.physicalRow.text);
   expect(s.health().pendingBytes).toBeGreaterThan(0);
-  disk.exec('PRAGMA max_page_count=1073741823');s.flush();
+  disk.exec('PRAGMA max_page_count=1073741823');
+  const started=Date.now();while(s.health().storage.status!=='healthy'&&Date.now()-started<4000)await Bun.sleep(25);
+  expect(s.health().storage.status).toBe('healthy');
   expect(s.token(key).durableRevision).toBe(s.token(key).revision);expect(s.health().pendingBytes).toBe(0);
   console.log('NA_DISK_FULL',JSON.stringify({sqliteFull:true,hostFaults:faults.length,rowsLost:1-s.readPage(s.token(key),null,1).lines.length,pendingAfterRetry:s.health().pendingBytes}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
@@ -293,7 +295,7 @@ test('newarch: close releases timer and handles even when final flush throws',as
  try {
   const pages=(disk.query('PRAGMA page_count').get() as any).page_count;disk.exec(`PRAGMA max_page_count=${pages}`);
   await s.appendScroll({paneKey:{serverIdentity:'close',paneId:'%1',birthGeneration:1},sourceEpoch:1,geometryGeneration:1,receiveSeq:1,softWrap:false,physicalRow:{text:'x'.repeat(300000),cells:[]}});
-  await expect(s.close()).rejects.toThrow(/full/i);await s.close();
+  expect(await s.close()).toMatchObject({drained:false,unknownTail:true,storage:{status:'closed-incomplete'}});await s.close();
   expect(()=>s.health()).toThrow('store-closed');expect(()=>disk.query('SELECT 1').get()).toThrow();
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 });
@@ -854,15 +856,15 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
      if(name.startsWith('F1-S ')) {
       const states=[];s.options.onStorageState=state=>states.push(structuredClone(state));
       await s.appendScroll(row('durable',1));s.flush();const before=s.token(key);
-      const limiter=new Database(s.file);const pages=limiter.query('PRAGMA page_count').get().page_count;
-      limiter.exec('PRAGMA max_page_count='+pages);limiter.close();
+      const limiter=s.disk;const pages=limiter.query('PRAGMA page_count').get().page_count;
+      limiter.exec('PRAGMA max_page_count='+pages);
       const large='x'.repeat(512*1024);await s.appendScroll({...row('',2),physicalRow:{text:large,cells:[]}});
       let full=false;try{s.flush();}catch{full=true;}assert(full,'fixture must reach real SQLITE_FULL');
       const paused=s.health();
       assert(paused.storage.status==='storage-paused','store must publish storage-paused');
       assert(s.token(key).durableRevision===before.durableRevision,'failed commit must not advance durable watermark');
       const refused=await s.appendScroll(row('must wait',3));assert(refused.accepted===false,'storage-paused must refuse new history');
-      const room=new Database(s.file);room.exec('PRAGMA max_page_count=2147483646');room.close();
+      limiter.exec('PRAGMA max_page_count=2147483646');
       const started=Date.now();while(s.health().storage.status!=='healthy'&&Date.now()-started<4000)await Bun.sleep(25);
       const recovery=states.find(state=>state.status==='recovering');
       assert(s.health().storage.status==='healthy','store must recover after space returns');
