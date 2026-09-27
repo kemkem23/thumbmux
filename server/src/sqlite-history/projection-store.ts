@@ -5,7 +5,8 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
 import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
-import { readProjectionPage, projectionIssue } from './projection-reader';
+import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
+import { decodeBlock, encodeBlock, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -15,6 +16,12 @@ const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 // rest of the cap is a borrow pool. A pane that sent nothing for ROSTER_MS
 // leaves the roster, so dead or quiet panes do not pin a share forever.
 const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
+// Disk layout (v4). Lines are sealed SEAL_LINES at a time into one deflated
+// na_block row once every line of the block is settled: certified by a
+// capture, marked evicted-before-check, or SEAL_UNCHECKED_LAG lines behind the
+// pane (past RAM's 4500-line check window). A later change to a sealed line
+// rewrites its block, so a line is never stored twice.
+const SEAL_LINES=256, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=4096, WAL_LIMIT=64*1024;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   /** RAM working-set cap; defaults to 256 MiB. Tests lower it to reach the cap with real rows. */
@@ -42,7 +49,7 @@ function admitPath(options: ProjectionOptions): string {
     const fd=openSync(file,'r');
     try {
       const head=Buffer.alloc(100); const n=readSync(fd,head,0,100,0);
-      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v3');
+      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v4');
     } finally { closeSync(fd); }
   } else {
     mkdirSync(dirname(file),{recursive:true,mode:0o700});
@@ -52,15 +59,63 @@ function admitPath(options: ProjectionOptions): string {
 }
 
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
-function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false) {
+const sealedUpTo=(disk:Database,paneNo:SqlRow[string])=>Number((prepared(disk,'SELECT first_line_id+line_count AS e FROM na_block WHERE pane_no=? ORDER BY first_line_id DESC LIMIT 1').get(paneNo) as SqlRow|null)?.e??0);
+const blockLine=(row:SqlRow)=>BLOCK_COLUMNS.map(column=>row[column]);
+/** Per-line upsert above the sealed floor; a line below it is patched into its block. */
+function writeLines(disk:Database,rows:SqlRow[]):void {
+  const floors=new Map<SqlRow[string],number>();
+  const patches=new Map<string,SqlRow[]>();
+  for(const row of rows) {
+    let floor=floors.get(row.pane_no);if(floor===undefined){floor=sealedUpTo(disk,row.pane_no);floors.set(row.pane_no,floor);}
+    if(Number(row.line_id)>=floor){upsert(disk,'na_line',row);continue;}
+    const block=prepared(disk,'SELECT block_no,first_line_id FROM na_block WHERE pane_no=? AND first_line_id<=? ORDER BY first_line_id DESC LIMIT 1').get(row.pane_no,row.line_id) as SqlRow|null;
+    if(!block)throw new Error('block-missing');
+    const list=patches.get(String(block.block_no))??[];list.push(row);patches.set(String(block.block_no),list);
+  }
+  for(const [blockNo,list] of patches) {
+    const block=prepared(disk,'SELECT * FROM na_block WHERE block_no=?').get(Number(blockNo)) as SqlRow;
+    const lines=decodeBlock(block.data as unknown as Uint8Array),first=Number(block.first_line_id);
+    let top=Number(block.max_revision);
+    for(const row of list) {
+      const i=Number(row.line_id)-first;if(i<0 || i>=lines.length)throw new Error('block-missing');
+      lines[i]=blockLine(row);top=Math.max(top,Number(row.revision));
+    }
+    prepared(disk,'UPDATE na_block SET data=?,max_revision=? WHERE block_no=?').run(encodeBlock(lines),top,Number(blockNo));
+  }
+}
+const sealAttempts=new WeakMap<Database,Map<SqlRow[string],number>>();
+/** Seal whole blocks of settled lines at the pane's sealed floor (see SEAL_LINES). */
+function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
+  let attempts=sealAttempts.get(disk);if(!attempts){attempts=new Map();sealAttempts.set(disk,attempts);}
+  const now=performance.now();
+  for(const p of panes) {
+    const next=Number(p.next_line_id);
+    let from=sealedUpTo(disk,p.pane_no);
+    if(from+SEAL_LINES>next || (!force && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS))continue;
+    attempts.set(p.pane_no,now);
+    for(;from+SEAL_LINES<=next;from+=SEAL_LINES) {
+      const rows=prepared(disk,'SELECT * FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<? ORDER BY line_id').all(p.pane_no,from,from+SEAL_LINES) as SqlRow[];
+      if(rows.length!==SEAL_LINES || rows.some((r,i)=>Number(r.line_id)!==from+i))break;
+      if(rows.some(r=>r.check_state===0 && r.check_reason!==1 && Number(r.line_id)>=next-SEAL_UNCHECKED_LAG))break;
+      prepared(disk,'INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,?,?,?)')
+        .run(p.pane_no,from,SEAL_LINES,Math.max(...rows.map(r=>Number(r.revision))),encodeBlock(rows.map(blockLine)));
+      prepared(disk,'DELETE FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<?').run(p.pane_no,from,from+SEAL_LINES);
+    }
+  }
+}
+function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false, forceSeal=false) {
   const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
     const existing=prepared(disk,'SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
     if(existing) {if(existing.digest!==batch.digest)throw new Error('commit-id-conflict');writeMs=performance.now()-started;return;}
     for(const p of batch.panes) upsert(disk,'na_pane',{...p,durable_revision:p.revision});
-    for(const [table,rows] of batch.tables)for(const row of rows)upsert(disk,table,row);
-    prepared(disk,'INSERT INTO na_commit VALUES (?,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
+    for(const [table,rows] of batch.tables) {if(table==='na_line')writeLines(disk,rows);else for(const row of rows)upsert(disk,table,row);}
+    // Only the latest commit is kept: a retry always re-offers the latest batch,
+    // and na_pane already holds every watermark. commit_seq counts all commits.
+    prepared(disk,'INSERT INTO na_commit VALUES (?,coalesce((SELECT max(commit_seq) FROM na_commit),0)+1,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
+    prepared(disk,'DELETE FROM na_commit WHERE commit_id<>?').run(batch.id);
+    sealBlocks(disk,batch.panes,forceSeal);
     before?.();writeMs=performance.now()-started;
   }).immediate();
   // Bound physical WAL growth without forcing a truncate into the ingest
@@ -74,7 +129,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const signal=new Int32Array(workerData.signal);
   const errors=new Uint8Array(workerData.signal,8);
   const disk=new Database(workerData.file,{strict:true});
-  disk.exec('PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192;');
+  disk.exec(`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
   let commits=0;
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
@@ -155,15 +210,16 @@ export class ProjectionStore implements ProjectionWriterPort {
     options.beforeOpen?.(this.file);
     this.disk=new Database(this.file,{strict:true});
     try {
-      this.disk.exec('PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192;');
+      // page_size only applies to a new file, so it must precede journal_mode.
+      this.disk.exec(`PRAGMA page_size=${DISK_PAGE_SIZE}; PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
       this.disk.transaction(()=>{
         const version=Number(Object.values(prepared(this.disk,'PRAGMA user_version').get()!)[0]);
         if(options.mode==='create') {
           if(version!==0 || prepared(this.disk,"SELECT name FROM sqlite_master WHERE type='table'").all().length) throw new Error('new-file-required');
           this.disk.exec(PROJECTION_SCHEMA);this.disk.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);
-        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v3');
+        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v4');
         else {
-          const sql=(prepared(this.disk,"SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture')").get() as SqlRow).s;
+          const sql=(prepared(this.disk,"SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture','na_block')").get() as SqlRow).s;
           if(PROJECTION_SCHEMA_MARKERS.some(m=>!String(sql).includes(m))) throw new Error('projection-schema-outdated');
         }
         const epoch=Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0]);
@@ -195,11 +251,11 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const row of prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[]) {
         if(row.revision!==row.durable_revision) throw new Error('durable-watermark-corrupt');
         upsert(this.ram.db,'na_pane',row);
-        const id=String(row.pane_key), floor=Math.max(0,Number(row.next_line_id)-5000);
-        const captures=prepared(this.disk,`SELECT * FROM na_capture c WHERE c.pane_key=? AND
-          EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=c.pane_key AND l.line_id>=? AND l.checked_capture_id=c.capture_id)`).all(id,floor) as SqlRow[];
-        for(const c of captures) upsert(this.ram.db,'na_capture',c);
-        for(const line of prepared(this.disk,'SELECT * FROM na_line WHERE pane_key=? AND line_id>=?').all(id,floor) as SqlRow[]) upsert(this.ram.db,'na_line',line);
+        const floor=Math.max(0,Number(row.next_line_id)-5000);
+        const lines=readDiskLines(this.disk,Number(row.pane_no),floor,Number(row.next_line_id));
+        for(const id of new Set(lines.map(l=>l.checked_capture_id).filter(id=>id!==null)))
+          upsert(this.ram.db,'na_capture',prepared(this.disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(row.pane_no,id) as SqlRow);
+        for(const line of lines) upsert(this.ram.db,'na_line',line);
       }
     })();
     this.relievePressure();
@@ -502,10 +558,11 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(scope!=='ok')return Promise.resolve(this.pressure(event.paneKey,estimate,scope,true));
       const cells=event.physicalRow.cells;
       validateRow({text,cells});
+      const stored=encodeRow(text,cells);
       const frozen={paneKey:{...event.paneKey},sourceEpoch:event.sourceEpoch,geometryGeneration:event.geometryGeneration,
-        receiveSeq:event.receiveSeq,softWrap:event.softWrap,physicalRow:{text,cells:[]},encodedCells:encodeCells(cells)};
-      const bytes=Buffer.byteLength(text)+Buffer.byteLength(frozen.encodedCells)+Buffer.byteLength(id)+512;
-      return this.enqueue(frozen.paneKey,frozen,e=>this.ram.append(e,e.encodedCells),'scroll',bytes);
+        receiveSeq:event.receiveSeq,softWrap:event.softWrap,physicalRow:{text,cells:[]},stored};
+      const bytes=Buffer.byteLength(stored.text)+Buffer.byteLength(stored.cells)+Buffer.byteLength(id)+512;
+      return this.enqueue(frozen.paneKey,frozen,e=>this.ram.append(e,e.stored),'scroll',bytes);
     }catch(error){return Promise.reject(error);}
   }
   /**
@@ -652,16 +709,19 @@ export class ProjectionStore implements ProjectionWriterPort {
         // last chunk replaces the screen. Moving output must never be hidden.
         // Pressure may have evicted durable rows needed by this capture.
         // Reload only this bounded chunk, including its existing FK receipts.
-        const id=paneId(f.capture.paneKey);
-        for(const m of [...f.checks,...f.repairs,...f.contentMatches]) {
-          if(prepared(this.ram.db,'SELECT 1 FROM na_line WHERE pane_key=? AND line_id=?').get(id,m.lineId))continue;
-          const row=prepared(this.disk,'SELECT * FROM na_line WHERE pane_key=? AND line_id=?').get(id,m.lineId) as SqlRow|null;
-          if(!row)continue;
-          if(row.checked_capture_id!==null) {
-            const receipt=prepared(this.disk,'SELECT * FROM na_capture WHERE pane_key=? AND capture_id=?').get(id,row.checked_capture_id) as SqlRow;
-            upsert(this.ram.db,'na_capture',receipt);
+        const no=this.ram.paneNo(f.capture.paneKey);
+        const missing=[...f.checks,...f.repairs,...f.contentMatches].map(m=>m.lineId)
+          .filter(lineId=>!prepared(this.ram.db,'SELECT 1 FROM na_line WHERE pane_no=? AND line_id=?').get(no,lineId));
+        if(missing.length) {
+          const wanted=new Set(missing);
+          for(const row of readDiskLines(this.disk,no,Math.min(...missing),Math.max(...missing)+1)) {
+            if(!wanted.has(Number(row.line_id)))continue;
+            if(row.checked_capture_id!==null) {
+              const receipt=prepared(this.disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(no,row.checked_capture_id) as SqlRow;
+              upsert(this.ram.db,'na_capture',receipt);
+            }
+            upsert(this.ram.db,'na_line',row);
           }
-          upsert(this.ram.db,'na_line',row);
         }
         return this.ram.calibrate(thawed,historyOnly);
       },'barrier',bytes) as Promise<ProjectionReceipt>);
@@ -685,7 +745,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     const tables=new Map<string,SqlRow[]>();
     for(const table of ['na_capture','na_line','na_issue']) {
       const rows:SqlRow[]=[];
-      for(const p of panes)rows.push(...prepared(this.ram.db,`SELECT * FROM ${table} WHERE pane_key=? AND revision>?`).all(p.pane_key,p.durable_revision) as SqlRow[]);
+      // na_issue is keyed by pane_key; receipts and lines by pane_no.
+      const column=table==='na_issue'?'pane_key':'pane_no';
+      for(const p of panes)rows.push(...prepared(this.ram.db,`SELECT * FROM ${table} WHERE ${column}=? AND revision>?`).all(p[column],p.durable_revision) as SqlRow[]);
       tables.set(table,rows);
     }
     const digest=createHash('sha256').update(JSON.stringify([panes,[...tables]])).digest('hex');
@@ -770,7 +832,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       let batch:Batch|null;
       while((batch=this.snapshot())) {
         const current=batch;
-        this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id));
+        this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id),false,true);
         this.acknowledge();
       }
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
