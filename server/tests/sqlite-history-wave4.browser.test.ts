@@ -12,10 +12,23 @@
  * that number is literal — 1,000 rows with `live_start` at 710, so a reopened
  * viewer renders 290 immutable live rows plus a 40-row pane and must recover
  * exactly 710 archived rows by scrolling. They are counted, not asserted away.
+ *
+ * Chromium never opens a socket of its own here. Its first HTTP connection
+ * always runs the host resolver's IPv6 reachability probe — a UDP connect to
+ * `[2001:4860:4860::8888]:443` — even for the `127.0.0.1` literal, and no
+ * launch flag stops it on Chrome for Testing 149 (`--host-resolver-rules`,
+ * `--disable-background-networking` and `EnableIPv6ReachabilityOverride`
+ * were each measured and still probed). The no-network cage traces that
+ * connect as a public-network attempt. So every request the page makes is
+ * carried by the test process instead: a context route forwards it over
+ * loopback to the real `Bun.serve` listener and fulfils the browser with the
+ * listener's own status, headers and body. The HTTP surface is still the real
+ * one; only the socket moved out of Chromium. The last case proves no request
+ * went around the route.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { createRequire } from 'node:module';
-import type { Browser, Page } from '@playwright/test';
+import type { Browser, BrowserContext, Page } from '@playwright/test';
 import type { Server } from 'bun';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
 import { sha } from '../src/sqlite-history/codec';
@@ -35,6 +48,14 @@ function rowText(n: number): string {
 }
 
 type Store = ReturnType<typeof fixture>['store'];
+
+/** Defence in depth only — none of these stops the reachability probe; the route does. */
+const OFFLINE_ARGS = [
+  '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1',
+  '--disable-background-networking',
+  '--dns-prefetch-disable',
+  '--disable-component-update',
+];
 
 function commitBatch(store: Store, sid: string, from: number, count: number, liveImmutable: number): CaptureBatch {
   const lines = Array.from({ length: count }, (_, i) => rowText(from + i));
@@ -56,7 +77,11 @@ function commitBatch(store: Store, sid: string, from: number, count: number, liv
 }
 
 let browser: Browser;
-let server: Server;
+let context: BrowserContext;
+let server: Server<undefined>;
+/** Requests the listener answered, and requests the route carried to it. */
+let served = 0;
+let routed = 0;
 let f: ReturnType<typeof fixture>;
 let sid: string;
 let origin: string;
@@ -74,6 +99,7 @@ beforeAll(async () => {
   server = Bun.serve({
     hostname: '127.0.0.1', port: 0,
     fetch(request) {
+      served++;
       if (new URL(request.url).pathname === '/') {
         return new Response(viewerHtml(), { headers: { 'content-type': 'text/html; charset=utf-8' } });
       }
@@ -81,11 +107,29 @@ beforeAll(async () => {
     },
   });
   origin = `http://127.0.0.1:${server.port}`;
-  browser = await (require('@playwright/test') as typeof import('@playwright/test')).chromium.launch();
+  browser = await (require('@playwright/test') as typeof import('@playwright/test')).chromium.launch({ args: OFFLINE_ARGS });
+  context = await browser.newContext();
+  await context.route('**/*', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    // Anything but the canary origin is refused, never fetched on the page's behalf.
+    if (url.origin !== origin) return route.abort('blockedbyclient');
+    routed++;
+    const response = await fetch(url, {
+      method: request.method(), headers: request.headers(), body: request.postData() ?? undefined,
+    });
+    const headers: Record<string, string> = {};
+    // Bun already decoded the body; the browser must not decode it again.
+    response.headers.forEach((value, name) => {
+      if (name !== 'content-encoding' && name !== 'content-length') headers[name] = value;
+    });
+    await route.fulfill({ status: response.status, headers, body: Buffer.from(await response.arrayBuffer()) });
+  });
   console.log('BROWSER', JSON.stringify({ engine: browser.version(), connected: browser.isConnected(), origin }));
 }, 180_000);
 
 afterAll(async () => {
+  await context?.close();
   await browser?.close();
   server?.stop(true);
   await f?.cleanup();
@@ -167,7 +211,7 @@ function viewerHtml(): string {
 }
 
 async function viewerPage(): Promise<Page> {
-  const page = await browser.newPage();
+  const page = await context.newPage();
   page.on('pageerror', error => { throw error; });
   await page.goto(origin, { waitUntil: 'load' });
   return page;
@@ -316,4 +360,20 @@ describe('wave 4 reader canary in a real browser', () => {
       expectContiguousFrom(all, 0);
     } finally { await page.close(); }
   }, 180_000);
+
+  test('no socket from Chromium: every page request was carried by the test process', async () => {
+    const page = await viewerPage();
+    try {
+      await page.evaluate('window.__viewer.open()');
+      await page.evaluate('window.__viewer.pageOnce("before", null, 10)');
+      // An origin other than the canary is refused by the route, not fetched.
+      const foreign = await page.evaluate(
+        'fetch("http://wave4.invalid/").then(() => "fetched", () => "refused")') as string;
+      expect(foreign).toBe('refused');
+    } finally { await page.close(); }
+    console.log('ROUTE', JSON.stringify({ routed, served }));
+    expect(routed).toBeGreaterThan(0);
+    // Every request the listener answered arrived through the route: none went around it.
+    expect(served).toBe(routed);
+  }, 60_000);
 });
