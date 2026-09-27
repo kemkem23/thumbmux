@@ -16,11 +16,13 @@ const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 // rest of the cap is a borrow pool. A pane that sent nothing for ROSTER_MS
 // leaves the roster, so dead or quiet panes do not pin a share forever.
 const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
-// Disk layout (v4). Lines are sealed SEAL_LINES at a time into one deflated
-// na_block row once every line of the block is settled: certified by a
-// capture, marked evicted-before-check, or SEAL_UNCHECKED_LAG lines behind the
-// pane (past RAM's 4500-line check window). A later change to a sealed line
-// rewrites its block, so a line is never stored twice.
+// Disk layout (v4). Lines are sealed in aligned blocks of SEAL_LINES
+// ([k*SEAL_LINES,(k+1)*SEAL_LINES)) into one deflated na_block row once every
+// line of the block is settled: certified by a capture, marked
+// evicted-before-check, or SEAL_UNCHECKED_LAG lines behind the pane (past RAM's
+// 4500-line check window). Blocks seal independently, so one uncertified block
+// never holds the rest back. A later change to a sealed line rewrites its
+// block, so a line is never stored twice.
 const SEAL_LINES=256, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=4096, WAL_LIMIT=64*1024;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
@@ -59,17 +61,13 @@ function admitPath(options: ProjectionOptions): string {
 }
 
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
-const sealedUpTo=(disk:Database,paneNo:SqlRow[string])=>Number((prepared(disk,'SELECT first_line_id+line_count AS e FROM na_block WHERE pane_no=? ORDER BY first_line_id DESC LIMIT 1').get(paneNo) as SqlRow|null)?.e??0);
 const blockLine=(row:SqlRow)=>BLOCK_COLUMNS.map(column=>row[column]);
-/** Per-line upsert above the sealed floor; a line below it is patched into its block. */
+/** Per-line upsert, unless a sealed block holds the line: then the block is patched. */
 function writeLines(disk:Database,rows:SqlRow[]):void {
-  const floors=new Map<SqlRow[string],number>();
   const patches=new Map<string,SqlRow[]>();
   for(const row of rows) {
-    let floor=floors.get(row.pane_no);if(floor===undefined){floor=sealedUpTo(disk,row.pane_no);floors.set(row.pane_no,floor);}
-    if(Number(row.line_id)>=floor){upsert(disk,'na_line',row);continue;}
-    const block=prepared(disk,'SELECT block_no,first_line_id FROM na_block WHERE pane_no=? AND first_line_id<=? ORDER BY first_line_id DESC LIMIT 1').get(row.pane_no,row.line_id) as SqlRow|null;
-    if(!block)throw new Error('block-missing');
+    const block=prepared(disk,'SELECT block_no,first_line_id,line_count FROM na_block WHERE pane_no=? AND first_line_id<=? ORDER BY first_line_id DESC LIMIT 1').get(row.pane_no,row.line_id) as SqlRow|null;
+    if(!block || Number(row.line_id)>=Number(block.first_line_id)+Number(block.line_count)){upsert(disk,'na_line',row);continue;}
     const list=patches.get(String(block.block_no))??[];list.push(row);patches.set(String(block.block_no),list);
   }
   for(const [blockNo,list] of patches) {
@@ -84,19 +82,21 @@ function writeLines(disk:Database,rows:SqlRow[]):void {
   }
 }
 const sealAttempts=new WeakMap<Database,Map<SqlRow[string],number>>();
-/** Seal whole blocks of settled lines at the pane's sealed floor (see SEAL_LINES). */
+/** Seal every complete aligned block of settled per-line rows (see SEAL_LINES). */
 function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
   let attempts=sealAttempts.get(disk);if(!attempts){attempts=new Map();sealAttempts.set(disk,attempts);}
   const now=performance.now();
   for(const p of panes) {
     const next=Number(p.next_line_id);
-    let from=sealedUpTo(disk,p.pane_no);
-    if(from+SEAL_LINES>next || (!force && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS))continue;
+    if(!force && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS)continue;
     attempts.set(p.pane_no,now);
-    for(;from+SEAL_LINES<=next;from+=SEAL_LINES) {
+    // Per aligned block: rows present and rows not yet settled.
+    const groups=prepared(disk,`SELECT line_id/${SEAL_LINES} AS b,count(*) AS n,
+      sum(check_state=0 AND check_reason<>1 AND line_id>=?) AS open FROM na_line WHERE pane_no=? GROUP BY b`).all(next-SEAL_UNCHECKED_LAG,p.pane_no) as SqlRow[];
+    for(const g of groups) {
+      const from=Number(g.b)*SEAL_LINES;
+      if(Number(g.n)!==SEAL_LINES || Number(g.open)!==0 || from+SEAL_LINES>next)continue;
       const rows=prepared(disk,'SELECT * FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<? ORDER BY line_id').all(p.pane_no,from,from+SEAL_LINES) as SqlRow[];
-      if(rows.length!==SEAL_LINES || rows.some((r,i)=>Number(r.line_id)!==from+i))break;
-      if(rows.some(r=>r.check_state===0 && r.check_reason!==1 && Number(r.line_id)>=next-SEAL_UNCHECKED_LAG))break;
       prepared(disk,'INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,?,?,?)')
         .run(p.pane_no,from,SEAL_LINES,Math.max(...rows.map(r=>Number(r.revision))),encodeBlock(rows.map(blockLine)));
       prepared(disk,'DELETE FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<?').run(p.pane_no,from,from+SEAL_LINES);
