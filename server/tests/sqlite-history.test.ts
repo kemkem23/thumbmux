@@ -441,8 +441,8 @@ test('F1-S: real SQLITE_FULL pauses admission, keeps one batch id and recovers o
  const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
  try {
   await s.appendScroll(naEvent('durable',1));s.flush();const durable=s.token(naKey);
-  const limiter=new Database(s.file);const pages=Number((limiter.query('PRAGMA page_count').get() as any).page_count);
-  limiter.exec(`PRAGMA max_page_count=${pages}`);limiter.close();
+  const disk=(s as any).disk as Database;const pages=Number((disk.query('PRAGMA page_count').get() as any).page_count);
+  disk.exec(`PRAGMA max_page_count=${pages}`);
   const large='x'.repeat(512*1024);
   await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
   expect(()=>s.flush()).toThrow();
@@ -453,7 +453,7 @@ test('F1-S: real SQLITE_FULL pauses admission, keeps one batch id and recovers o
   expect(await s.appendScroll(naEvent('must wait',3))).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
   await Bun.sleep(250);
   expect(states.filter(state=>state.status==='storage-paused')).toHaveLength(1);
-  const room=new Database(s.file);room.exec('PRAGMA max_page_count=2147483646');room.close();
+  disk.exec('PRAGMA max_page_count=2147483646');
   const started=Date.now();while(s.health().storage.status!=='healthy' && Date.now()-started<4000)await Bun.sleep(25);
   const recovered=s.health();expect(recovered.storage.status).toBe('healthy');
   expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
@@ -470,8 +470,8 @@ test('F1-S: close under real SQLITE_FULL cleans resources and reports a durable 
  const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
  try {
   await s.appendScroll(naEvent('durable',1));s.flush();
-  const limiter=new Database(s.file);const pages=Number((limiter.query('PRAGMA page_count').get() as any).page_count);
-  limiter.exec(`PRAGMA max_page_count=${pages}`);limiter.close();
+  const disk=(s as any).disk as Database;const pages=Number((disk.query('PRAGMA page_count').get() as any).page_count);
+  disk.exec(`PRAGMA max_page_count=${pages}`);
   const large='y'.repeat(512*1024);await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
   const receipt=await s.close();
   expect(receipt).toMatchObject({drained:false,unknownTail:true,storage:{status:'closed-incomplete',unknownTail:true}});

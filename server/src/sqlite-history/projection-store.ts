@@ -810,7 +810,8 @@ export class ProjectionStore implements ProjectionWriterPort {
     })();
     this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
     for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
-    this.storageBatchId=batch.id;this.retry=null;
+    if(this.storageStatus!=='healthy')this.storageBatchId=batch.id;
+    this.retry=null;
     if(this.storageStatus==='storage-paused') {
       this.storageStatus='recovering';this.storageRetryAt=null;this.storageResult='succeeded';this.emitStorage('recovering','succeeded');
     }
