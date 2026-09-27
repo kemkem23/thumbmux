@@ -766,6 +766,10 @@ def main():
             batch_bytes = 0
     if worker.pending():
         worker.emit()
+    # B is the ordered Q acknowledgement: it is emitted only after the final
+    # update has been serialized to stdout. Process exit alone is not proof
+    # that Q was parsed or that the final frame was preserved.
+    send(b"B", {"workerEof": True})
 
 
 if __name__ == "__main__":

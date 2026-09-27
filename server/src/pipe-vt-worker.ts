@@ -246,7 +246,8 @@ export class PipeVtPool {
 export class PipeVtWorker {
   private lease: SharedLease | null = null;
   private socket: Socket | null = null;
-  private sharedQuitAck = false;
+  /** Set only after Q was parsed and every final update was written before B. */
+  private quitAck = false;
   private leaseDone: Promise<void> = Promise.resolve();
   private child: ChildProcess | null = null;
   private pending: Buffer = Buffer.alloc(0);
@@ -446,8 +447,8 @@ export class PipeVtWorker {
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
       }
-      else if (kind === "B" && this.socket) {
-        this.sharedQuitAck = (message as { workerEof?: boolean }).workerEof === true;
+      else if (kind === "B") {
+        this.quitAck = (message as { workerEof?: boolean }).workerEof === true;
       } else if (kind === "R") {
         this.readyResolve?.(message as PipeVtReady);
         this.readyResolve = null;
@@ -574,7 +575,6 @@ export class PipeVtWorker {
     if (this.closePromise) return this.closePromise;
     if (!this.child && !this.lease) return Promise.resolve({ workerEof: false, outputDrained: false,
       issues: ["worker was never started"], unknownTail: true });
-    const exitedBeforeClose = this.exited;
     this.closing = true;
     if (this.exited) return this.closePromise = this.settleOutput(timeoutMs, false,
       ["worker exited before orderly shutdown"]);
@@ -590,7 +590,7 @@ export class PipeVtWorker {
       (this.socket ?? this.child?.stdout)?.resume();
     }, timeoutMs);
     return this.closePromise = exited.finally(() => clearTimeout(timer)).then(() => this.settleOutput(
-      timeoutMs, quitQueued && !forced && !exitedBeforeClose,
+      timeoutMs, quitQueued && !forced,
       forced ? [`worker did not exit after quit within ${timeoutMs}ms`] : [],
     ));
   }
@@ -601,9 +601,9 @@ export class PipeVtWorker {
     return Promise.race([this.outputTail.then(() => "done" as const), deadline]).then(async (result) => {
       if (timer) clearTimeout(timer);
       const outputDrained = result === "done";
-      if (this.socket && !this.sharedQuitAck) {
+      if (!this.quitAck) {
         workerEof = false;
-        issues.push("shared parser did not acknowledge orderly pane quit");
+        issues.push("parser did not acknowledge Q after its final update");
       }
       if (!outputDrained) {
         this.abandoned = true;
