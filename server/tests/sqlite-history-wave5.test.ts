@@ -492,6 +492,7 @@ describe('NEWARCH I4 runtime against the real VT worker and projection store', (
 import { spawnSync as h2Spawn } from 'node:child_process';
 import { appendFileSync as h2Append, openSync as h2Open, readSync as h2Read, closeSync as h2Close, writeFileSync as h2Write, existsSync as h2Exists } from 'node:fs';
 import { ProjectionLiveWindow as H2LiveWindow, type PipeHistoryPane as H2Pane } from '../src/pipe-history-runtime';
+import type { HistoryCell } from '../src/history-row-matcher';
 
 const H2_META_FORMAT = ['#{pane_width}', '#{pane_height}', '#{cursor_x}', '#{cursor_y}', '#{cursor_flag}', '#{alternate_on}', '#{history_size}', '#{history_limit}', '#{pane_pid}'].join('\t');
 /** One private tmux server (never the default socket): a pane running `tail -f` on a file, its output piped to another file. */
@@ -626,6 +627,48 @@ describe('NEWARCH-SWITCHON H2 resize against a private tmux', () => {
       expect(t.close()).toBe(true);
     }
   }, 120_000);
+
+  test('a capture that replaces a held pipe frame closes that chunk\'s latency entry (idle pane, VR:91-96)', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-receipts-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const runtime = createPipeHistoryRuntime({ store });
+    let paneRef: H2Pane | null = null;
+    let calls = 0, holdFirst = false;
+    // The capture double shows what tmux shows: the parser's screen once it has
+    // parsed every received byte. With holdFirst it waits until the pipe frame
+    // of the last chunk is held behind the latch, the sequence V measured.
+    const capture = async (tail: number): Promise<RawPaneCapture> => {
+      calls++;
+      // Private state of the pane under test, read (never written) by the double.
+      const pane = paneRef! as unknown as {
+        read(): { parserFrame: { cells: HistoryCell[][]; cursor: { x: number; y: number; visible: boolean } | null } };
+        pendingPublish: unknown; recentRows: H2Pane['recentRows']; currentMeta: H2Pane['currentMeta'];
+      };
+      if (holdFirst) { await i4Until(() => pane.pendingPublish !== null, 5_000); holdFirst = false; }
+      const frame = pane.read().parserFrame;
+      const history = pane.recentRows().slice(-Math.max(0, tail)).map(r => cellsToAnsi(r.cells));
+      const screen = (frame.cells.length ? frame.cells : Array.from({ length: I4_META.rows }, () => [])).map(r => cellsToAnsi(r as never));
+      const meta = { ...pane.currentMeta(), cursor: frame.cursor ?? I4_META.cursor };
+      return { captureId: `r${calls}`, requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: [...history, ...screen].join('\n') + '\n', tail };
+    };
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 'h2r', paneId: '%2', birthGeneration: 1 }, session: 's', meta: { ...I4_META, historySize: 10 }, capture, commitIntervalMs: 50 });
+      paneRef = pane;
+      pane.setViewers(1);
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 3; i++) pane.ingest(enc.encode(`line ${i}\r\n`));
+      await i4Until(() => pane.view().displaySource === 'tmux-calibrated' && pane.stats.skippedCommits >= 1 && pane.pendingReceipts() === 0, 15_000);
+      // An external clear-history latches the calibrator; the next chunk's pipe frame is held.
+      holdFirst = true;
+      pane.observe({ ...I4_META, historySize: 5 });
+      pane.ingest(enc.encode('IDLE-TAIL'));
+      await i4Until(() => pane.view().cells.some(r => rowText(r).startsWith('IDLE-TAIL')) && pane.view().displaySource === 'tmux-calibrated', 15_000);
+      expect(holdFirst).toBe(false);
+      // No later chunk will come to close it: the capture publish must.
+      await Bun.sleep(300);
+      expect(pane.pendingReceipts()).toBe(0);
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 30_000);
 
   test('an unreadable history_size leaves an uncertainty marker and hides nothing', async () => {
     const root = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-unknown-'));
