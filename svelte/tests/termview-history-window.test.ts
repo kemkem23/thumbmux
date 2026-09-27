@@ -2271,11 +2271,14 @@ describe("TermView sliding archive window", () => {
       expect(historyCalls.at(-1)).toMatchObject({ direction: "before" });
       deliverPage(0, archiveLines(0, 100), markers);
       await settleUi();
+      // Bring the newest page rows (archive-9x) into the rendered window.
+      wheel(mountedView.viewport, -560);
+      await settleUi();
       return mountedView;
     }
 
     function noteText(target: HTMLElement): string {
-      return target.querySelector('[data-testid="mtv-loss-notes"]')?.textContent ?? "";
+      return (target.querySelector('[data-testid="mtv-loss-notes"]')?.textContent ?? "").trim();
     }
 
     test("a marker raised on a static screen is drawn on its row and noted until its row is seen", async () => {
