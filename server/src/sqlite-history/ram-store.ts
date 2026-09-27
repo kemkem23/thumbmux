@@ -46,17 +46,35 @@ export function encodeObservedFields(fields:readonly string[]):number|string {
 export function decodeObservedFields(value:number|string):string[] {
   return typeof value==='number'?OBSERVED_CODEBOOK.filter((_,i)=>value&(1<<i)):JSON.parse(value);
 }
+// A parser screen keeps every unchanged row as the same (never mutated) array
+// from frame to frame, so a row is encoded and validated once, not once per
+// frame: the whole-screen JSON of every write was the largest frame-path cost
+// (P profile) and most of its garbage. Rows use the compact line codec
+// (codec.ts encodeRow, lossless, legacy runs inside when it cannot express a
+// row); na_screen lives in RAM only, and `rle:1` frames still decode.
+const FRAME_ROW_JSON=new WeakMap<readonly unknown[],string>();
+const VALID_ROWS=new WeakSet<readonly unknown[]>();
+const encodeFrameRow=(row:PhysicalRow['cells']):string=>{
+  let json=FRAME_ROW_JSON.get(row);
+  if(json===undefined) {
+    let text='';for(const c of row)if(!c.continuation)text+=c.grapheme;
+    const stored=encodeRow(text,row);json=JSON.stringify([stored.text,stored.cells]);FRAME_ROW_JSON.set(row,json);
+  }
+  return json;
+};
 export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
-  return '{"rle":1,"rows":['+cells.map(encodeCellRuns).join(',')+']}';
+  return '{"rle":2,"rows":['+cells.map(encodeFrameRow).join(',')+']}';
 }
 export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
-  const value=JSON.parse(encoded);return value.rle===1?value.rows.map(decodeCellRuns):value;
+  const value=JSON.parse(encoded);
+  return value.rle===2?value.rows.map(([text,cells]:[string,string])=>decodeRow(text,cells).cells)
+    :value.rle===1?value.rows.map(decodeCellRuns):value;
 }
 export function validateFrame(frame: ProjectionFrame): void {
   integer(frame.cols); integer(frame.rows); integer(frame.receiveSeq);
   if (!frame.cols || !frame.rows || !['normal','alternate'].includes(frame.kind)
     || frame.cells.length !== frame.rows || frame.cells.some(row => row.length !== frame.cols)) throw new Error('invalid-frame');
-  frame.cells.forEach(cells => validateRow({text:'',cells}));
+  for (const cells of frame.cells) if (!VALID_ROWS.has(cells)) { validateRow({text:'',cells}); VALID_ROWS.add(cells); }
   if (frame.cursor && (!Number.isInteger(frame.cursor.row) || !Number.isInteger(frame.cursor.col)
     || frame.cursor.row < 0 || frame.cursor.row >= frame.rows || frame.cursor.col < 0 || frame.cursor.col >= frame.cols
     || typeof frame.cursor.visible !== 'boolean')) throw new Error('invalid-cursor');

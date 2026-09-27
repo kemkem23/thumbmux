@@ -8,7 +8,7 @@ import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, de
 import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
 import { decodeBlock, encodeBlock, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
-import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
+import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=20;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
@@ -840,6 +840,21 @@ export class ProjectionStore implements ProjectionWriterPort {
       }
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     }catch(error){this.fault('flush-failed',String(error));throw error;}
+  }
+  /**
+   * One pane's status and issues, as `health()` reports them for that pane,
+   * without the store-wide figures (RSS, RAM pages, pending bytes) or the
+   * other panes' rows: a live snapshot reads this on every publish.
+   */
+  paneHealth(key:PaneKey):{status:'healthy'|'degraded';issues:ProjectionIssue[]}|null {
+    this.owner();
+    const id=paneId(key),p=prepared(this.ram.db,'SELECT health,revision FROM na_pane WHERE pane_key=?').get(id) as SqlRow|null;
+    if(!p)return null;
+    const issues=new Map<string,SqlRow>();
+    for(const db of [this.disk,this.ram.db])for(const issue of prepared(db,'SELECT * FROM na_issue WHERE pane_key=?').all(id) as SqlRow[])
+      if(Number(issue.revision)<=Number(p.revision))issues.set(String(issue.issue_id),issue);
+    return {status:p.health==='healthy'?'healthy':'degraded',
+      issues:[...issues.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue)};
   }
   health():ProjectionHealth {
     this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');

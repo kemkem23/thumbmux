@@ -105,27 +105,40 @@ export function parserStyle(attrs: number): number {
     | (attrs & 16 ? 64 : 0) | (attrs & 32 ? 16 : 0);
 }
 
-const interned = new Map<string, HistoryCell>();
-function internCell(grapheme: string, width: 0 | 1 | 2, continuation: boolean, fg: string, bg: string, style: number): HistoryCell {
-  const key = `${grapheme}\u0000${width}${continuation ? 1 : 0}\u0000${fg}\u0000${bg}\u0000${style}`;
-  let cell = interned.get(key);
+// Two levels (attributes, then grapheme): a parser row looks its attribute
+// table up once per run, not a composed key string per cell (P profile).
+const interned = new Map<string, Map<string, HistoryCell>>();
+let internedCells = 0;
+function internTable(width: 0 | 1 | 2, continuation: boolean, fg: string, bg: string, style: number): Map<string, HistoryCell> {
+  const key = `${width}${continuation ? 1 : 0}\u0000${fg}\u0000${bg}\u0000${style}`;
+  let table = interned.get(key);
+  if (!table) { table = new Map(); interned.set(key, table); }
+  return table;
+}
+function internIn(table: Map<string, HistoryCell>, grapheme: string, width: 0 | 1 | 2, continuation: boolean, fg: string, bg: string, style: number): HistoryCell {
+  let cell = table.get(grapheme);
   if (!cell) {
-    // Bounding only: dropping the table never changes a value.
-    if (interned.size >= 65536) interned.clear();
+    // Bounding only: dropping the tables never changes a value.
+    if (internedCells >= 65536) { interned.clear(); internedCells = 0; }
     // Field order equals the store's decoded cells, so JSON comparisons agree.
     cell = Object.freeze({ grapheme, width, continuation, fg, bg, style });
-    interned.set(key, cell);
+    table.set(grapheme, cell);
+    internedCells++;
   }
   return cell;
+}
+function internCell(grapheme: string, width: 0 | 1 | 2, continuation: boolean, fg: string, bg: string, style: number): HistoryCell {
+  return internIn(internTable(width, continuation, fg, bg, style), grapheme, width, continuation, fg, bg, style);
 }
 export const BLANK_CELL: HistoryCell = internCell(' ', 1, false, 'default', 'default', 0);
 
 /** One parser row (RLE runs) -> exactly `cols` canonical cells. */
+interface RunStyle { fg: string; bg: string; style: number; narrow?: Map<string, HistoryCell>; wide?: Map<string, HistoryCell>; cont?: Map<string, HistoryCell> }
 export function parserRowCells(row: PipeVtRow, cols?: number): HistoryCell[] {
   const glyphs: string[] = [];
-  const styles: Array<[string, string, number]> = [];
+  const styles: RunStyle[] = [];
   for (const run of row) {
-    const style: [string, string, number] = [canonicalParserColor(run[0]), canonicalParserColor(run[1]), parserStyle(run[2])];
+    const style: RunStyle = { fg: canonicalParserColor(run[0]), bg: canonicalParserColor(run[1]), style: parserStyle(run[2]) };
     for (const glyph of pipeVtRunCells(run)) { glyphs.push(glyph); styles.push(style); }
   }
   const width = cols ?? glyphs.length;
@@ -133,10 +146,10 @@ export function parserRowCells(row: PipeVtRow, cols?: number): HistoryCell[] {
   for (let x = 0; x < width; x++) {
     const glyph = glyphs[x];
     if (glyph === undefined) { cells[x] = BLANK_CELL; continue; }
-    const [fg, bg, style] = styles[x]!;
-    cells[x] = glyph === ''
-      ? internCell('', 0, true, fg, bg, style)
-      : internCell(glyph, glyphs[x + 1] === '' ? 2 : 1, false, fg, bg, style);
+    const s = styles[x]!;
+    if (glyph === '') cells[x] = internIn(s.cont ??= internTable(0, true, s.fg, s.bg, s.style), '', 0, true, s.fg, s.bg, s.style);
+    else if (glyphs[x + 1] === '') cells[x] = internIn(s.wide ??= internTable(2, false, s.fg, s.bg, s.style), glyph, 2, false, s.fg, s.bg, s.style);
+    else cells[x] = internIn(s.narrow ??= internTable(1, false, s.fg, s.bg, s.style), glyph, 1, false, s.fg, s.bg, s.style);
   }
   return cells;
 }
@@ -210,6 +223,17 @@ export function cellsToAnsi(cells: readonly HistoryCell[]): string {
   if (current !== 'default\u0000default\u00000') out += '\x1b[0m';
   return out;
 }
+/**
+ * Screen rows keep their identity while unchanged (applyFrameDelta reuses them
+ * and never mutates a row), so a live snapshot encodes only the rows that
+ * changed instead of the whole screen on every publish.
+ */
+const ANSI_ROWS = new WeakMap<readonly HistoryCell[], string>();
+function rowAnsi(cells: readonly HistoryCell[]): string {
+  let ansi = ANSI_ROWS.get(cells);
+  if (ansi === undefined) { ansi = cellsToAnsi(cells); ANSI_ROWS.set(cells, ansi); }
+  return ansi;
+}
 
 // ─── ports ────────────────────────────────────────────────────────────────
 
@@ -227,7 +251,11 @@ export interface RawPaneCapture {
   /** Physical rows: `tail` history rows (or fewer) then the screen rows. */
   body: string; tail: number;
 }
-export type RuntimeStore = ProjectionWriterPort & { token(key: PaneKey): ProjectionToken };
+export type RuntimeStore = ProjectionWriterPort & {
+  token(key: PaneKey): ProjectionToken;
+  /** One pane's slice of health(); a store without it is read through health(). */
+  paneHealth?(key: PaneKey): { status: 'healthy' | 'degraded'; issues: ProjectionIssue[] } | null;
+};
 
 export interface RuntimeFault {
   paneKey: PaneKey; session: string; kind: string; at: number; message?: string;
@@ -283,7 +311,7 @@ export interface PipeHistoryRuntimeOptions {
   python?: string;
   /** Independent sink (outside the DB) for every fault; a disk-full store still reports. */
   onFault?: (fault: RuntimeFault) => void;
-  /** Bounded latency samples kept per pane (default 200k). */
+  /** Newest latency samples kept per pane, also dropped after 5 minutes (default 32,768; 0 keeps none). */
   latencySampleLimit?: number;
   /** Recent history rows kept in RAM per pane for calibration and the live window. */
   ringRows?: number;
@@ -292,6 +320,50 @@ export interface PipeHistoryRuntimeOptions {
 const RING_ROWS = 4500;
 /** Minimum spacing of full-screen writes to the store per pane (leading edge immediate). */
 export const FRAME_WRITE_MS = 16;
+/**
+ * A frame is written (and published) as soon as it arrives while the frame
+ * path — store write plus viewer publish, timed on the main thread — uses less
+ * than this share of wall time; above it every pane falls back to one write per
+ * FRAME_WRITE_MS. The fixed spacing alone was most of receive→publish at one
+ * busy pane (P trace: 14.8 of 21.7 ms at p95), while 21 busy panes still need it.
+ * The share never lowers the publish rate below the fixed-spacing rule.
+ */
+export const FRAME_BUDGET_SHARE = 0.3;
+const FRAME_BUDGET_WINDOW_MS = 250;
+/** Per-pane statistics are rings: a long-lived pane keeps the newest samples of the last minutes only. */
+const STATS_MAX_SAMPLES = 32_768;
+const STATS_MAX_AGE_MS = 5 * 60_000;
+const RECEIVE_MAX_PENDING = 65_536;
+/** A received chunk not published after this long is closed with its age as a (lower-bound) sample. */
+const RECEIVE_MAX_AGE_NS = 120_000_000_000n;
+/** Loss markers a live frame carries: every one inside the live window, capped to the newest. */
+const FRAME_MARKERS_MAX = 256;
+
+/** Exponentially decayed main-thread cost of the frame path (time constant FRAME_BUDGET_WINDOW_MS). */
+export class FrameBudget {
+  private load = 0;
+  private at: number;
+  constructor(private readonly clock: () => number = () => performance.now()) { this.at = clock(); }
+  private decay(): void {
+    const now = this.clock();
+    if (now > this.at) { this.load *= Math.exp((this.at - now) / FRAME_BUDGET_WINDOW_MS); this.at = now; }
+  }
+  spend(ms: number): void { this.decay(); this.load += Math.max(0, ms); }
+  /** Share of the main thread the frame path used recently (steady rate → share). */
+  share(): number { this.decay(); return this.load / FRAME_BUDGET_WINDOW_MS; }
+  busy(): boolean { return this.share() > FRAME_BUDGET_SHARE; }
+}
+
+/**
+ * Drop the oldest entries of a statistics ring: beyond `limit` (amortized, a
+ * quarter at a time) and, every 1024 entries, those stamped before `floor`.
+ * `times[i]` is the stamp of `values[i]` (the same array for timestamp rings).
+ */
+function trimStatsRing(values: unknown[], times: number[], limit: number, floor: number): void {
+  let drop = values.length > limit + (limit >> 2) ? values.length - limit : 0;
+  if ((values.length & 1023) === 0 || drop > 0) while (drop < times.length && times[drop]! < floor) drop++;
+  if (drop > 0) { values.splice(0, drop); if (times !== values) times.splice(0, drop); }
+}
 
 // ─── screen assembly ──────────────────────────────────────────────────────
 
@@ -353,11 +425,16 @@ export class PipeHistoryPane {
   private capturedPull: PulledBack | null = null;
   private historySizeUnknown = false;
   private ring: RingRow[] = [];
+  /** Bumped whenever a ring row's content is replaced (a live window text built before is stale). */
+  ringRepairs = 0;
   private scrollSeq = 0;
   private scrollSeqEpoch = -1;
   private received = 0;
   private receiveTimes: Array<{ seq: number; at: bigint }> = [];
   private receiveHead = 0;
+  /** Stamps (runtime.now) of stats.latencyMs, index for index; reset when the host replaces the array. */
+  private latencyAt: number[] = [];
+  private latencyRef: number[] | null = null;
   private listeners = new Set<(update: PaneUpdate) => void>();
   private meta: PaneTmuxMeta;
   private decoder: TmuxCaptureDecoder | null = null;
@@ -423,7 +500,10 @@ export class PipeHistoryPane {
     const at = this.runtime.nowNs();
     const seq = ++this.received;
     this.stats.received = seq;
-    if (this.receiveTimes.length - this.receiveHead < 1_000_000) this.receiveTimes.push({ seq, at });
+    const head = this.receiveTimes[this.receiveHead];
+    if (head && at - head.at > RECEIVE_MAX_AGE_NS) this.expireReceipts(at);
+    if (this.receiveTimes.length - this.receiveHead < RECEIVE_MAX_PENDING) this.receiveTimes.push({ seq, at });
+    else this.bump('receipt-ring-full');
     this.watchdog.receive(seq);
     return this.collector.ingest(bytes, at);
   }
@@ -513,7 +593,8 @@ export class PipeHistoryPane {
 
   private scheduleFrameWrite(): void {
     if (this.frameTimer || this.frameWriting || !this.pendingFrame || this.closed) return;
-    const wait = this.lastFrameWriteAt + FRAME_WRITE_MS - this.runtime.now();
+    const spacing = this.runtime.frameBudget.busy() ? FRAME_WRITE_MS : 0;
+    const wait = this.lastFrameWriteAt + spacing - this.runtime.now();
     if (wait <= 0) { this.writeFrame(); return; }
     this.frameTimer = setTimeout(() => { this.frameTimer = null; this.writeFrame(); }, wait);
   }
@@ -524,7 +605,11 @@ export class PipeHistoryPane {
     this.pendingFrame = null;
     this.frameWriting = true;
     this.lastFrameWriteAt = this.runtime.now();
-    this.runtime.store.replaceScreen(frame).then((receipt: ProjectionAdmission) => {
+    const budget = this.runtime.frameBudget;
+    const started = performance.now();
+    const written = this.runtime.store.replaceScreen(frame);
+    budget.spend(performance.now() - started);
+    written.then((receipt: ProjectionAdmission) => {
       if (isProjectionRefusal(receipt)) {
         // Pressure: keep the newest screen and offer it again shortly.
         this.pendingFrame ??= frame;
@@ -534,8 +619,11 @@ export class PipeHistoryPane {
       if (this.pendingIssues.length) {
         for (const issue of this.pendingIssues.splice(0)) this.recordIssue(issue.kind, issue.reason, issue.missingCount, issue.recoverable);
       }
-      if (!this.calibrator || this.calibrator.acceptsPipeFrame) this.publishPipe(frame, receipt);
-      else this.pendingPublish = { frame, receipt };
+      if (!this.calibrator || this.calibrator.acceptsPipeFrame) {
+        const published = performance.now();
+        this.publishPipe(frame, receipt);
+        budget.spend(performance.now() - published);
+      } else this.pendingPublish = { frame, receipt };
     }, (error: unknown) => {
       // Oversize or a closing store: the store records its own issue; the
       // next parser frame supersedes this one.
@@ -563,14 +651,37 @@ export class PipeHistoryPane {
     const now = this.runtime.nowNs();
     while (this.receiveHead < this.receiveTimes.length && this.receiveTimes[this.receiveHead]!.seq <= receiveSeq) {
       const entry = this.receiveTimes[this.receiveHead++]!;
-      if (this.stats.latencyMs.length < (this.runtime.options.latencySampleLimit ?? 200_000)) {
-        this.stats.latencyMs.push(Number(now - entry.at) / 1e6);
-      }
+      this.sampleLatency(Number(now - entry.at) / 1e6);
     }
+    this.compactReceipts();
+  }
+
+  /** Close entries older than RECEIVE_MAX_AGE_NS: their age so far is recorded, never dropped silently. */
+  private expireReceipts(now: bigint): void {
+    while (this.receiveHead < this.receiveTimes.length && now - this.receiveTimes[this.receiveHead]!.at > RECEIVE_MAX_AGE_NS) {
+      const entry = this.receiveTimes[this.receiveHead++]!;
+      this.sampleLatency(Number(now - entry.at) / 1e6);
+      this.bump('receipt-expired');
+    }
+    this.compactReceipts();
+  }
+
+  private compactReceipts(): void {
     if (this.receiveHead > 4096 && this.receiveHead * 2 > this.receiveTimes.length) {
       this.receiveTimes.splice(0, this.receiveHead);
       this.receiveHead = 0;
     }
+  }
+
+  private sampleLatency(ms: number): void {
+    const limit = this.runtime.options.latencySampleLimit ?? STATS_MAX_SAMPLES;
+    if (limit <= 0) return;
+    const samples = this.stats.latencyMs, at = this.runtime.now();
+    // The host resets the array between measurement windows.
+    if (samples !== this.latencyRef) { this.latencyRef = samples; this.latencyAt = samples.map(() => at); }
+    samples.push(ms);
+    this.latencyAt.push(at);
+    trimStatsRing(samples, this.latencyAt, limit, at - STATS_MAX_AGE_MS);
   }
 
   /** Received chunks whose latency entry is still open (not yet on a published screen). */
@@ -807,6 +918,7 @@ export class PipeHistoryPane {
           const cells = byId.get(row.lineId);
           if (cells) { row.cells = cells; row.ansi = undefined; }
         }
+        this.ringRepairs++;
       }
       return receipt;
     } catch (error) {
@@ -824,7 +936,8 @@ export class PipeHistoryPane {
     if (this.lastCaptureAt !== null) this.stats.captureIntervalMaxMs = Math.max(this.stats.captureIntervalMaxMs, at - this.lastCaptureAt);
     this.lastCaptureAt = at;
     this.stats.captures++;
-    if (this.stats.captureAt.length < 100_000) this.stats.captureAt.push(at);
+    this.stats.captureAt.push(at);
+    trimStatsRing(this.stats.captureAt, this.stats.captureAt, STATS_MAX_SAMPLES, at - STATS_MAX_AGE_MS);
   }
 
   private publishCapture(commit: { revision: number }, frame: CalibrationFrame): void {
@@ -868,6 +981,10 @@ export class PipeHistoryPane {
   }
 
   health(health?: ProjectionHealth): { degraded: boolean; issues: ProjectionIssue[] } {
+    if (!health && this.runtime.store.paneHealth) {
+      const own = this.runtime.store.paneHealth(this.paneKey);
+      return { degraded: own?.status === 'degraded', issues: own?.issues ?? [] };
+    }
     const state = (health ?? this.runtime.store.health()).panes.find(p => p.paneKey.serverIdentity === this.paneKey.serverIdentity
       && p.paneKey.paneId === this.paneKey.paneId && p.paneKey.birthGeneration === this.paneKey.birthGeneration);
     return { degraded: state?.status === 'degraded', issues: state?.issues ?? [] };
@@ -936,6 +1053,8 @@ export class PipeHistoryRuntime {
   readonly store: RuntimeStore;
   readonly now: () => number;
   readonly nowNs: () => bigint;
+  /** Main-thread cost of every pane's frame path (see FRAME_BUDGET_SHARE). */
+  readonly frameBudget = new FrameBudget();
   private readonly panesByKey = new Map<string, PipeHistoryPane>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private heartbeat: ReturnType<typeof setInterval>;
@@ -1086,6 +1205,8 @@ function fnv(value: string): string {
  */
 export class ProjectionLiveWindow {
   private starts = new Map<string, number>();
+  /** Per pane: the joined history part of the last live window, extended while only rows are appended. */
+  private texts = new Map<string, { firstId: number; lastId: number; count: number; repairs: number; hide: string; text: string }>();
   constructor(private readonly windowRows = 1000) {}
 
   snapshot(pane: PipeHistoryPane, routeGeneration: number): ProjectedPaneSnapshot | null {
@@ -1106,7 +1227,7 @@ export class ProjectionLiveWindow {
       if (start > token.nextLineId) start = token.nextLineId;
     }
     this.starts.set(id, start);
-    const lines: string[] = [];
+    const rows: RingRow[] = [];
     // tmux pulls rows back from history into the screen when a pane grows
     // taller; the journal already holds them as history. Rows the screen
     // shows again are left out of the live window (never out of the journal
@@ -1118,19 +1239,26 @@ export class ProjectionLiveWindow {
       for (let i = Math.max(0, offset); i < ring.length; i++) {
         const row = ring[i]!;
         if (row.lineId >= hideStart && row.lineId < hideEnd) continue;
-        lines.push(row.ansi ??= cellsToAnsi(row.cells));
+        rows.push(row);
       }
     }
-    const screenLines = view.cells.map(row => cellsToAnsi(row));
+    const history = this.historyText(id, rows, pane.ringRepairs, alternate ? '' : `${view.pulledBack?.endLine ?? 0}:${overlap}`);
+    const screenLines = view.cells.map(rowAnsi);
     let trailing = 0;
     for (let i = screenLines.length - 1; i >= 0 && screenLines[i] === ''; i--) trailing++;
-    lines.push(...screenLines);
+    const screenText = screenLines.join('\n');
     const cursor = view.cursor && view.cursor.visible
       ? { row: view.rows - 1 - trailing - view.cursor.y, col: Math.max(0, view.cursor.x) } : null;
-    const markers = view.issues.slice(-16).map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind.slice(0, 64), missingCount: issue.missingCount }));
+    // Every marker inside the live window reaches the viewer (not only the
+    // newest 16), plus the newest 16 wherever they fall (the header warning).
+    const recentFrom = view.issues.length - 16;
+    const markers = view.issues
+      .filter((issue, i) => i >= recentFrom || (issue.boundaryLineId !== null && issue.boundaryLineId >= start))
+      .slice(-FRAME_MARKERS_MAX)
+      .map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind.slice(0, 64), missingCount: issue.missingCount }));
     const metadataRevision = view.issues.reduce((revision, issue) => Math.max(revision, issue.revision), 0);
     return {
-      content: lines.join('\n'), cursor,
+      content: rows.length ? [history, screenText].join('\n') : screenText, cursor,
       screen: { alt: alternate, mouseSgr: view.mouseSgr, mouseAny: view.mouseAny },
       boundary: {
         generation: `newarch:${fnv(pane.paneKey.serverIdentity)}:${pane.paneKey.paneId}:${pane.paneKey.birthGeneration}:r${routeGeneration}`,
@@ -1143,6 +1271,31 @@ export class ProjectionLiveWindow {
         liveStartLine: start, displaySource: view.displaySource, degraded: view.degraded, markers,
       },
     };
+  }
+
+  /**
+   * `rows` joined by newlines, equal to a fresh join. While the window start,
+   * the hidden pull-back range and every row already joined stay the same,
+   * only the rows appended since are encoded and joined (a publish at 100
+   * rows/s re-joined up to 2,000 rows each time).
+   */
+  private historyText(id: string, rows: readonly RingRow[], repairs: number, hide: string): string {
+    if (!rows.length) { this.texts.delete(id); return ''; }
+    const cached = this.texts.get(id);
+    let text: string, from: number;
+    if (cached && cached.repairs === repairs && cached.hide === hide && cached.firstId === rows[0]!.lineId
+      && cached.count <= rows.length && rows[cached.count - 1]!.lineId === cached.lastId) {
+      text = cached.text; from = cached.count;
+    } else { text = ''; from = 0; }
+    if (from < rows.length) {
+      // One join, never repeated `+`: a string built by appending stays a rope
+      // one level per row, and every later hash of the frame walks it.
+      const parts: string[] = from ? [text] : [];
+      for (let i = from; i < rows.length; i++) { const row = rows[i]!; parts.push(row.ansi ??= cellsToAnsi(row.cells)); }
+      text = parts.join('\n');
+    }
+    this.texts.set(id, { firstId: rows[0]!.lineId, lastId: rows[rows.length - 1]!.lineId, count: rows.length, repairs, hide, text });
+    return text;
   }
 
   /** Rows before `beforeLine` (default: the live window start), newest `limit` of them. */
@@ -1166,7 +1319,7 @@ export class ProjectionLiveWindow {
       markers: range.issues.map(issue => ({ lineId: issue.boundaryLineId, kind: issue.kind, reason: issue.reason, missingCount: issue.missingCount })),
     };
   }
-  forget(pane: PaneKey): void { this.starts.delete(keyOf(pane)); }
+  forget(pane: PaneKey): void { this.starts.delete(keyOf(pane)); this.texts.delete(keyOf(pane)); }
 }
 
 // Opt-in v2 entry (package export "./pipe-history-runtime"): importing it opens
