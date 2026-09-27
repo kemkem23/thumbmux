@@ -738,9 +738,9 @@ test('I2 probe: measure A borrowing before B through E arrive without disk ackno
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('I2: acknowledgement cannot clear RAM pressure before cache also recovers (real rows, no stubbed counter)',async()=>{
- // 2 MiB cache: fewer than the 5000 lines a pane keeps after eviction already fill it,
- // so an acknowledgement empties the pending budget while RAM stays over its cap.
+test('I2: acknowledgement clears pressure only after durable cache eviction (real rows, no stubbed counter)',async()=>{
+ // F1: fewer than 5000 real rows fill 2 MiB. Acknowledgement must reclaim
+ // durable cache rows before reopening admission; merely clearing stopped is insufficient.
  const root=mkdtempSync(join(tmpdir(),'na-i2-cache-')),s=createProjectionStore({historyRoot:root,mode:'create',cacheBytes:2*1024*1024});
  clearInterval((s as any).timer);
  const key={serverIdentity:'cache',paneId:'%1',birthGeneration:1};
@@ -749,12 +749,22 @@ test('I2: acknowledgement cannot clear RAM pressure before cache also recovers (
   while(!refusal && n<5000){const r:any=await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:`keep ${n}`.padEnd(300,'.'),cells:[]}});if(!isProjectionRefusal(r))n++;else if(r.scope==='pane')s.flush();else refusal=r;}
   expect(refusal).toMatchObject({scope:'store'});expect(n).toBeLessThan(5000);
   s.flush();
-  expect(s.health()).toMatchObject({status:'stopped',pressure:'recoverable',pendingBytes:0,rejectedRows:0});
+  expect(s.health()).toMatchObject({status:'healthy',pressure:'recoverable',pendingBytes:0,rejectedRows:0});
+  expect(s.health().ramBytes+1024).toBeLessThanOrEqual(2*1024*1024);
+  const resident=(s as any).ram.db.query('SELECT count(*) AS n FROM na_line').get().n;
+  expect(resident).toBeLessThan(n);
   const state=await Promise.race([s.drained(key).then(()=>'drained'),Bun.sleep(300).then(()=>'waiting')]);
-  expect(state).toBe('waiting');
+  expect(state).toBe('drained');
   expect(s.health().panes[0].status).toBe('healthy');   // pressure is not a pane fault
   expect(s.token(key).nextLineId).toBe(n);expect(s.token(key).durableRevision).toBe(s.token(key).revision);
-  console.log('I2_CACHE_PRESSURE',JSON.stringify({rows:n,ramBytes:s.health().ramBytes,state}));
+  for(let first=0;first<n;first+=100) {
+   const lines=s.readPage(s.token(key),first,Math.min(100,n-first)).lines;
+   expect(lines.length).toBe(Math.min(100,n-first));
+   for(let i=0;i<lines.length;i++)expect(lines[i].text).toBe(`keep ${first+i}`.padEnd(300,'.'));
+  }
+  expect(await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:`keep ${n}`.padEnd(300,'.'),cells:[]}})).not.toHaveProperty('accepted',false);
+  expect(s.token(key).nextLineId).toBe(n+1);expect(s.health().pressure).toBe('none');
+  console.log('I2_CACHE_PRESSURE',JSON.stringify({rows:n,resident,ramBytes:s.health().ramBytes,state}));
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 

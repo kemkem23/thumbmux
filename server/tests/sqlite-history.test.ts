@@ -945,7 +945,7 @@ test('I4 FIX2 F1: refused frame reserves its actual size when an idle durable ca
   expect(await s.replaceScreen(frame)).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
   expect(await Promise.race([s.drained(naKey).then(()=>true),Bun.sleep(2000).then(()=>false)])).toBe(true);
   expect(await s.replaceScreen(frame)).not.toHaveProperty('accepted',false);
-  expect(s.screen(naKey)?.cells).toEqual(frame.cells);
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual(frame.cells);
   expect(s.readPage(s.token(naKey),0,1).lines[0].text).toBe(row.text);
   console.log('FIX2_FRAME_RECOVERY',JSON.stringify({historyRows:seq,ramBytes:s.health().ramBytes}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
