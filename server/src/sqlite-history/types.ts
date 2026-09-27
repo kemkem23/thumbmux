@@ -265,7 +265,7 @@ export interface ProjectionWriterPort {
   flush(): void; health(): ProjectionHealth;
 }
 export interface ProjectionArchiveReaderPort {
-  readonly schemaVersion: 2 | 3;
+  readonly schemaVersion: 2 | 3 | 4;
   token(key: PaneKey): ProjectionToken;
   readPage(token: ProjectionToken, anchor: number | null, limit: number): ProjectionPage;
   close(): void;

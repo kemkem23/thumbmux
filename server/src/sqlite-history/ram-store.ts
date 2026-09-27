@@ -1,11 +1,12 @@
 import { Database } from 'bun:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { PROJECTION_RAM_SCREEN_SCHEMA, PROJECTION_SCHEMA } from './schema';
+import { CHECK_REASONS, CHECK_STATES, PROJECTION_RAM_SCREEN_SCHEMA, PROJECTION_SCHEMA } from './schema';
+import { decodeCellRuns, decodeRow, encodeCellRuns, encodeRow } from './codec';
 import type { PaneKey, PhysicalRow, ProjectionCalibration, ProjectionIssueInput, ProjectionFrame, ProjectionReceipt, ProjectionToken, ScrollEvent } from './types';
 
-// Version 3 stores lines WITHOUT ROWID under (pane_key,line_id), so this range
+// Lines are stored WITHOUT ROWID under (pane_no,line_id), so this range
 // seeks the table primary key without maintaining duplicate identity indexes.
-export const EVICT_LINES_SQL='DELETE FROM na_line WHERE pane_key=? AND line_id<? AND revision<=?';
+export const EVICT_LINES_SQL='DELETE FROM na_line WHERE pane_no=? AND line_id<? AND revision<=?';
 
 export type SqlRow = Record<string, string | number | null>;
 export const paneId = (key: PaneKey): string => {
@@ -25,32 +26,31 @@ export function validateRow(row: PhysicalRow): void {
       || ![c.fg,c.bg].every(v => v === null || typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)))) throw new Error('invalid-cell');
   }
 }
-type CellRun=[string,number,boolean,string|number|null,string|number|null,number,number];
-function cellRuns(cells:PhysicalRow['cells']):CellRun[] {
-  const runs:CellRun[]=[];
-  for(const c of cells) {
-    const last=runs[runs.length-1];
-    if(last && last[0]===c.grapheme && last[1]===c.width && last[2]===c.continuation
-      && last[3]===c.fg && last[4]===c.bg && last[5]===c.style)last[6]++;
-    else runs.push([c.grapheme,c.width,c.continuation,c.fg,c.bg,c.style,1]);
-  }
-  return runs;
+/** Legacy run-length JSON (frames in RAM, rows the compact codec cannot express, v2/v3 archives). */
+export function encodeCells(cells:PhysicalRow['cells']):string {return encodeCellRuns(cells);}
+export function decodeCells(encoded:string):PhysicalRow['cells'] {return decodeCellRuns(encoded);}
+/** Stored line (text + compact cells) → the physical row as offered. */
+export function lineRow(row:SqlRow):PhysicalRow {return decodeRow(String(row.text),String(row.cells));}
+export const checkState=(code:unknown)=>{const v=CHECK_STATES[Number(code)];if(v===undefined)throw new Error('check-state-corrupt');return v;};
+export const checkReason=(code:unknown)=>{const v=CHECK_REASONS[Number(code)];if(v===undefined)throw new Error('check-reason-corrupt');return v;};
+const STATE_CODE={unchecked:0,checked:1,'content-matched':2} as const;
+const REASON_CODE={'awaiting-capture':0,'evicted-before-check':1,'exact-capture':2,'content-capture':3} as const;
+// Frozen codebook for receipt field lists: a list that is an in-order subset
+// is stored as a bit mask, anything else as its JSON text.
+const OBSERVED_CODEBOOK=['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'];
+export function encodeObservedFields(fields:readonly string[]):number|string {
+  let mask=0,last=-1;
+  for(const f of fields){const i=OBSERVED_CODEBOOK.indexOf(f);if(i<=last)return JSON.stringify(fields);mask|=1<<i;last=i;}
+  return mask;
 }
-function expandRuns(runs:any[]):PhysicalRow['cells'] {
-  // Earlier v2 files used [cell,count]; both encodings are lossless/readable.
-  return runs.flatMap(run=>{
-    if(typeof run[0]==='object')return Array.from({length:run[1]},()=>({...run[0]}));
-    const [grapheme,width,continuation,fg,bg,style,n]=run;
-    return Array.from({length:n},()=>({grapheme,width,continuation,fg,bg,style}));
-  });
+export function decodeObservedFields(value:number|string):string[] {
+  return typeof value==='number'?OBSERVED_CODEBOOK.filter((_,i)=>value&(1<<i)):JSON.parse(value);
 }
-export function encodeCells(cells:PhysicalRow['cells']):string {return JSON.stringify(cellRuns(cells));}
-export function decodeCells(encoded:string):PhysicalRow['cells'] {return expandRuns(JSON.parse(encoded));}
 export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
-  return JSON.stringify({rle:1,rows:cells.map(cellRuns)});
+  return '{"rle":1,"rows":['+cells.map(encodeCellRuns).join(',')+']}';
 }
 export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
-  const value=JSON.parse(encoded);return value.rle===1?value.rows.map(expandRuns):value;
+  const value=JSON.parse(encoded);return value.rle===1?value.rows.map(decodeCellRuns):value;
 }
 export function validateFrame(frame: ProjectionFrame): void {
   integer(frame.cols); integer(frame.rows); integer(frame.receiveSeq);
@@ -61,8 +61,8 @@ export function validateFrame(frame: ProjectionFrame): void {
     || frame.cursor.row < 0 || frame.cursor.row >= frame.rows || frame.cursor.col < 0 || frame.cursor.col >= frame.cols
     || typeof frame.cursor.visible !== 'boolean')) throw new Error('invalid-cursor');
 }
-const UPSERT_IDENTITIES:Record<string,string[]>={na_pane:['pane_key'],na_capture:['pane_key','capture_id'],
-  na_line:['pane_key','line_id'],na_screen:['pane_key','screen_kind'],na_issue:['issue_id'],na_commit:['commit_id']};
+const UPSERT_IDENTITIES:Record<string,string[]>={na_pane:['pane_no','pane_key'],na_capture:['pane_no','capture_id'],
+  na_line:['pane_no','line_id'],na_screen:['pane_key','screen_kind'],na_issue:['issue_id'],na_commit:['commit_id']};
 const UPSERT_SQL=new Map<string,string>();
 const PREPARED=new WeakMap<Database,Map<string,ReturnType<Database['query']>>>();
 /** Hold each statement for the lifetime of its DB, independently of Bun's 20-entry query cache. */
@@ -107,7 +107,7 @@ export class ProjectionRam {
   constructor() {
     this.db.exec('PRAGMA page_size=8192; PRAGMA foreign_keys=ON; PRAGMA cache_size=-262144;');
     this.db.exec(PROJECTION_SCHEMA);this.db.exec(PROJECTION_RAM_SCREEN_SCHEMA);
-    this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_key,checked_capture_id)');
+    this.db.exec('CREATE INDEX na_line_capture ON na_line(pane_no,checked_capture_id)');
     this.pageSize=Number((prepared(this.db,'PRAGMA page_size').get() as {page_size:number}).page_size);
   }
   pane(key: PaneKey): SqlRow {
@@ -115,6 +115,7 @@ export class ProjectionRam {
     if (!row) throw new Error('unknown-pane');
     return row;
   }
+  paneNo(key: PaneKey): number {return Number(this.pane(key).pane_no);}
   token(key: PaneKey): ProjectionToken {
     const p=this.pane(key);
     return {paneKey:{...key},sourceEpoch:Number(p.source_epoch),geometryGeneration:Number(p.geometry_generation),
@@ -144,26 +145,27 @@ export class ProjectionRam {
     return {revision:Number(row.revision),durableRevision:Number(row.durable_revision),nextLineId:Number(row.next_line_id)};
   }
 
-  append(event: ScrollEvent, preparedCells?:string): ProjectionReceipt {
+  /** `stored`: the row already encoded by the caller (codec.ts encodeRow). */
+  append(event: ScrollEvent, stored?:{text:string;cells:string}): ProjectionReceipt {
     validateRow(event.physicalRow); integer(event.receiveSeq);
     if (typeof event.softWrap !== 'boolean') throw new Error('invalid-soft-wrap');
     const p=this.ensure(event.paneKey,event.sourceEpoch,event.geometryGeneration), id=paneId(event.paneKey);
     integer(Number(p.next_line_id)+1);
     if (event.sourceEpoch === Number(p.source_epoch) && event.receiveSeq < Number(p.receive_seq)) throw new Error('stale-receive-seq');
-    prepared(this.db,'INSERT INTO na_line VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)').run(id,event.sourceEpoch,p.next_line_id,
-      Number(p.revision)+1,event.geometryGeneration,event.physicalRow.text,preparedCells??encodeCells(event.physicalRow.cells),
-      +event.softWrap,'unchecked','awaiting-capture');
+    const row=stored??encodeRow(event.physicalRow.text,event.physicalRow.cells);
+    prepared(this.db,'INSERT INTO na_line VALUES (?,?,?,?,?,?,?,?,0,0,NULL,NULL)').run(p.pane_no,event.sourceEpoch,p.next_line_id,
+      Number(p.revision)+1,event.geometryGeneration,row.text,row.cells,+event.softWrap);
     prepared(this.db,'UPDATE na_pane SET next_line_id=next_line_id+1,receive_seq=? WHERE pane_key=?').run(event.receiveSeq,id);
-    prepared(this.db,"UPDATE na_line SET check_reason='evicted-before-check',revision=? WHERE pane_key=? AND line_id=? AND check_state='unchecked'")
-      .run(Number(p.revision)+1,id,Number(p.next_line_id)-4500);
+    prepared(this.db,'UPDATE na_line SET check_reason=1,revision=? WHERE pane_no=? AND line_id=? AND check_state=0')
+      .run(Number(p.revision)+1,p.pane_no,Number(p.next_line_id)-4500);
     return this.bump(event.paneKey);
   }
   /** `uncertain`: capture rows drawn but not certified (D18); a pipe frame always clears them. */
   screen(frame: ProjectionFrame, captureId: string | null = null, at: number | null = null, observed: string[] = [], preparedCells?:string, uncertain: readonly number[] = []): void {
     if(preparedCells===undefined)validateFrame(frame);
     const p=this.ensure(frame.paneKey,frame.sourceEpoch,frame.geometryGeneration), id=paneId(frame.paneKey);
-    prepared(this.db,'INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json,uncertain_rows_json=excluded.uncertain_rows_json')
-      .run(id,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux-calibrated':'pipe',JSON.stringify(observed),JSON.stringify(uncertain));
+    prepared(this.db,'INSERT INTO na_screen VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pane_key,screen_kind) DO UPDATE SET revision=excluded.revision,geometry_generation=excluded.geometry_generation,cols=excluded.cols,rows=excluded.rows,cells_json=excluded.cells_json,cursor_json=excluded.cursor_json,last_capture_id=excluded.last_capture_id,captured_at=excluded.captured_at,display_source=excluded.display_source,observed_fields_json=excluded.observed_fields_json,uncertain_rows_json=excluded.uncertain_rows_json')
+      .run(id,p.pane_no,frame.kind,Number(p.revision)+1,frame.geometryGeneration,frame.cols,frame.rows,preparedCells??encodeFrameCells(frame.cells),JSON.stringify(frame.cursor),captureId,at,captureId?'tmux-calibrated':'pipe',JSON.stringify(observed),JSON.stringify(uncertain));
     prepared(this.db,'UPDATE na_pane SET cols=?,rows=?,screen_kind=? WHERE pane_key=?').run(frame.cols,frame.rows,frame.kind,id);
   }
   /** Revision the caller's CAS is compared with; a pane not yet seen is revision 0. */
@@ -200,7 +202,7 @@ export class ProjectionRam {
    * wrong. Only a revision the pane never had (from the future) is refused.
    */
   calibrate(change: ProjectionCalibration, historyOnly=false): ProjectionReceipt {
-    const c=change.capture, p=this.pane(c.paneKey), id=paneId(c.paneKey);
+    const c=change.capture, p=this.pane(c.paneKey), no=p.pane_no;
     if (historyOnly ? change.expectedRevision > Number(p.revision) : p.revision !== change.expectedRevision) throw new Error('stale-revision');
     if (p.source_epoch !== c.sourceEpoch || p.geometry_generation !== c.geometryGeneration) throw new Error('stale-generation');
     validateFrame(c); c.history.forEach(validateRow);
@@ -216,30 +218,34 @@ export class ProjectionRam {
       integer(m.lineId); integer(m.captureRow);
       if(mapped.has(m.lineId) || captureRows.has(m.captureRow) || !c.history[m.captureRow]) throw new Error('duplicate-or-invalid-mapping');
       mapped.add(m.lineId);captureRows.add(m.captureRow);
-      const row=prepared(this.db,'SELECT * FROM na_line WHERE pane_key=? AND line_id=?').get(id,m.lineId) as SqlRow | null;
+      const row=prepared(this.db,'SELECT * FROM na_line WHERE pane_no=? AND line_id=?').get(no,m.lineId) as SqlRow | null;
       if(!row || row.source_epoch!==c.sourceEpoch || row.geometry_generation!==c.geometryGeneration) throw new Error('capture-line-generation');
       const expected=c.history[m.captureRow];
       if(m.repair) {
         const repair=m as typeof m & {physicalRow:PhysicalRow}; validateRow(repair.physicalRow);
         if(JSON.stringify(repair.physicalRow)!==JSON.stringify(expected)) throw new Error('repair-not-capture');
-        const previous=decodeCells(String(row.cells_json));
+        const previous=lineRow(row).cells;
         correctedCells+=expected.cells.filter((cell,i)=>JSON.stringify(cell)!==JSON.stringify(previous[i])).length;
-      } else if(row.text!==expected.text || JSON.stringify(decodeCells(String(row.cells_json)))!==JSON.stringify(expected.cells)) throw new Error('check-not-exact');
+      } else {
+        const stored=lineRow(row);
+        if(stored.text!==expected.text || JSON.stringify(stored.cells)!==JSON.stringify(expected.cells)) throw new Error('check-not-exact');
+      }
       // A content match never downgrades an identity already proven by anchors.
-      m.keep=m.state==='content-matched' && row.check_state==='checked';
+      m.keep=m.state==='content-matched' && row.check_state===STATE_CODE.checked;
     }
     // Hash one row at a time. The transient capture is never assembled into a
     // giant JSON value and there is no durable column capable of storing it.
     const screenHash=createHash('sha256'),historyHash=createHash('sha256');
     for(const cells of c.cells)screenHash.update(encodeCells(cells)).update('\n');
     for(const row of c.history)historyHash.update(row.text).update('\0').update(encodeCells(row.cells)).update('\n');
-    prepared(this.db,'INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,screenHash.digest('hex'),historyHash.digest('hex'),JSON.stringify(c.observedFields),mapped.size,correctedCells,c.ambiguousRows,c.result);
+    prepared(this.db,'INSERT INTO na_capture VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(no,c.captureId,Number(p.revision)+1,c.sourceEpoch,c.requestedAt,c.completedAt,c.geometryGeneration,c.firstHistoryRow,c.history.length,screenHash.digest(),historyHash.digest(),encodeObservedFields(c.observedFields),mapped.size,correctedCells,c.ambiguousRows,c.result);
     for(const m of mutations) {
       if(m.keep)continue;
       const expected=c.history[m.captureRow];
       // Changing content and its receipt is one transaction; no old label survives.
-      prepared(this.db,'UPDATE na_line SET revision=?,text=?,cells_json=?,check_state=?,check_reason=?,checked_capture_id=?,checked_row=? WHERE pane_key=? AND line_id=?')
-        .run(Number(p.revision)+1,expected.text,encodeCells(expected.cells),m.state,m.state==='checked'?'exact-capture':'content-capture',c.captureId,m.captureRow,id,m.lineId);
+      const stored=encodeRow(expected.text,expected.cells);
+      prepared(this.db,'UPDATE na_line SET revision=?,text=?,cells=?,check_state=?,check_reason=?,checked_capture_id=?,checked_row=? WHERE pane_no=? AND line_id=?')
+        .run(Number(p.revision)+1,stored.text,stored.cells,STATE_CODE[m.state],REASON_CODE[m.state==='checked'?'exact-capture':'content-capture'],c.captureId,m.captureRow,no,m.lineId);
     }
     const evidence=change.captureEvidence;
     if(evidence?.kind==='quiescent') {
@@ -269,11 +275,11 @@ export class ProjectionRam {
     // Indexed ranges only for committed panes; never visit every resident line.
     for (const p of panes) {
       prepared(this.db,EVICT_LINES_SQL)
-        .run(p.pane_key, Math.max(0, Number(p.next_line_id)-keep), p.revision);
-      prepared(this.db,`DELETE FROM na_capture WHERE pane_key=? AND revision<=?
-        AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_key=na_capture.pane_key AND l.checked_capture_id=na_capture.capture_id)
-        AND NOT EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_key=na_capture.pane_key AND s.last_capture_id=na_capture.capture_id)`)
-        .run(p.pane_key,p.revision);
+        .run(p.pane_no, Math.max(0, Number(p.next_line_id)-keep), p.revision);
+      prepared(this.db,`DELETE FROM na_capture WHERE pane_no=? AND revision<=?
+        AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_no=na_capture.pane_no AND l.checked_capture_id=na_capture.capture_id)
+        AND NOT EXISTS(SELECT 1 FROM na_screen s WHERE s.pane_no=na_capture.pane_no AND s.last_capture_id=na_capture.capture_id)`)
+        .run(p.pane_no,p.revision);
       prepared(this.db,'DELETE FROM na_issue WHERE pane_key=? AND revision<=?').run(p.pane_key,p.revision);
     }
   }

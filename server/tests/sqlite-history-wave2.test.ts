@@ -698,8 +698,10 @@ test('I4 FIX1 S: 126000 rows in 60s batch across 21 panes without capture payloa
   s.flush();peakIncrement=Math.max(peakIncrement,physical()-disk0);flushAges.push(s.health().lastFlushAgeMs);
   const elapsedMs=performance.now()-started,cpu=process.cpuUsage(cpu0),cpuCores=(cpu.user+cpu.system)/1000/elapsedMs;
   const disk=new Database(s.file,{readonly:true});
-  const commits=Number((disk.query('SELECT count(*) AS n FROM na_commit').get() as any).n);
-  const rows=Number((disk.query('SELECT count(*) AS n FROM na_line').get() as any).n);
+  // v4 keeps only the latest na_commit row; commit_seq counts every commit.
+  const commits=Number((disk.query('SELECT max(commit_seq) AS n FROM na_commit').get() as any).n);
+  // Settled lines are sealed into na_block; count both stores of durable lines.
+  const rows=Number((disk.query('SELECT (SELECT count(*) FROM na_line)+(SELECT coalesce(sum(line_count),0) FROM na_block) AS n').get() as any).n);
   const captures=Number((disk.query('SELECT count(*) AS n FROM na_capture').get() as any).n);
   const durableScreen=disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get();disk.close();
   const health=s.health(),diskIncrement=physical()-disk0,ratio=diskIncrement/logicalBytes;
@@ -804,14 +806,21 @@ const I2_FIX2_MUTATIONS=[
   {name:'FIX2-B1 uncertain-rows',file:'ram-store.ts',before:'this.screen(c,c.captureId,c.completedAt,c.observedFields,undefined,uncertain);',after:'this.screen(c,c.captureId,c.completedAt,c.observedFields);'},
 ];
 const I4_FIX1_S_MUTATIONS=[
-  {name:'I4-S capture-payload-columns',file:'schema.ts',before:'screen_hash TEXT NOT NULL, history_hash TEXT NOT NULL,',after:'screen_cells_json TEXT NOT NULL, history_cells_json TEXT NOT NULL,'},
-  {name:'I4-S metadata-screen-hash',file:'ram-store.ts',before:"screenHash.digest('hex'),historyHash.digest('hex')",after:"'0'.repeat(64),historyHash.digest('hex')"},
+  {name:'I4-S capture-payload-columns',file:'schema.ts',before:'screen_hash BLOB NOT NULL, history_hash BLOB NOT NULL,',after:'screen_cells_json BLOB NOT NULL, history_cells_json BLOB NOT NULL,'},
+  {name:'I4-S metadata-screen-hash',file:'ram-store.ts',before:"screenHash.digest(),historyHash.digest()",after:"Buffer.alloc(32),historyHash.digest()"},
   {name:'I4-S persist-screen-table',file:'projection-store.ts',before:"['na_capture','na_line','na_issue']",after:"['na_capture','na_line','na_screen','na_issue']"},
 ];
 const I4_FIX2_S_MUTATIONS=[
  {name:'I4-S2 page-size',file:'ram-store.ts',before:'PRAGMA page_size=8192;',after:'PRAGMA page_size=4096;'},
  {name:'I4-S2 reclaim',file:'projection-store.ts',before:'this.ram.evict(panes,keep)',after:'this.ram.evict(panes,5000)'},
  {name:'I4-S2 chunk-bound',file:'projection-store.ts',before:'const chunkSize=256,',after:'const chunkSize=512,'},
+];
+// NEWARCH-SWITCHON S2: each mutant undoes one part of the v4 compact store.
+const S2_MUTATIONS=[
+ {name:'S2 per-cell-json',file:'codec.ts',before:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n",after:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n  return legacy(text, cells);\n"},
+ {name:'S2 no-seal',file:'projection-store.ts',before:'sealBlocks(disk,batch.panes,forceSeal);',after:''},
+ {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
+ {name:'S2 v4-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 4;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
 async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
  const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
@@ -820,7 +829,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
   for(const mutation of cases)for(const broken of [false,true]) {
    const outdir=join(root,mutation.name.replace(/\W+/g,'-')+'-'+broken);
    const result=await Bun.build({entrypoints:[join(import.meta.dir,'../src/sqlite-history/projection-store.ts')],outdir,target:'bun',plugins:[{
-    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store|schema)\.ts$/},args=>{
+    name:'controlled-mutation',setup(build){build.onLoad({filter:/\/(ram-store|projection-store|schema|codec)\.ts$/},args=>{
      let contents=readFileSync(args.path,'utf8');
      if(broken && args.path.endsWith('/'+mutation.file)) {expect(contents).toContain(mutation.before);contents=contents.replace(mutation.before,mutation.after);}
      return {contents,loader:'ts'};
@@ -837,7 +846,39 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
     const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('reclaim')?1024*1024:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.startsWith('I4-S2')) {
+     if(name.startsWith('S2 ')) {
+      const blank=g=>({grapheme:g,width:1,continuation:false,fg:'default',bg:'default',style:0});
+      const pad=cells=>{while(cells.length<120)cells.push(blank(' '));return {text:cells.filter(c=>!c.continuation).map(c=>c.grapheme).join(''),cells};};
+      const text=(t,fg='default',style=0)=>[...t].map(g=>({...blank(g),fg,style}));
+      const wide=g=>[{...blank(g),width:2},{grapheme:'',width:0,continuation:true,fg:'default',bg:'default',style:0}];
+      const oracle=n=>pad([...text('P01 '+String(n).padStart(6,'0')+' '),...text('color'+n%10,'index:'+(1+n%7)),...text(' ไทย'),...wide('漢'),...wide('字'),...wide('😀'),...text(' '+'x'.repeat(n%13))]);
+      if(name.includes('hidden')) {
+       const hidden=pad([...text('pass: '),...text('secret','default',128)]);
+       await s.appendScroll({...row('',1),physicalRow:hidden});s.flush();
+       const line=s.readPage(s.token(key),0,1).lines[0];
+       assert(JSON.stringify({text:line.text,cells:line.cells})===JSON.stringify(hidden),'hidden (SGR 8) must round-trip');
+      } else if(name.includes('v4-as-v3')) {
+       await s.appendScroll(row('v4',1));s.flush();await s.close();
+       const {readFileSync}=await import('node:fs');
+       const version=readFileSync(s.file).readUInt32BE(60);
+       assert(version!==2 && version!==3,'a v3-era reader (accepts 2 or 3) must refuse a v4 file; header says '+version);
+      } else {
+       const {cellsToAnsi}=await import(${JSON.stringify(join(import.meta.dir,'../src/pipe-history-runtime.ts'))});
+       const {readdirSync,statSync}=await import('node:fs');
+       const observedFields=['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'];
+       for(let at=0;at<6000;at+=64) {
+        const slice=Array.from({length:64},(_,k)=>oracle(at+k+1));
+        for(const [k,physical] of slice.entries())await s.appendScroll({...row('',at+k+1),physicalRow:physical});
+        await s.calibrate({capture:{...frame('A'),captureId:'nonce-'+at+'/1',requestedAt:at,completedAt:at+1,firstHistoryRow:0,history:slice,observedFields,ambiguousRows:0,result:'unfenced'},
+         expectedRevision:s.token(key).revision,checks:slice.map((_,k)=>({lineId:at+k,captureRow:k})),repairs:[]});
+       }
+       s.flush();let R=0;
+       for(let at=0;at<6000;at+=2000)for(const l of s.readPage(s.token(key),at,2000).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells));
+       const folder=data+'/newarch-v3',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
+       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R}));
+       assert(D<=1.5*R,'disk must stay within 1.5 x the rows it holds: D/R='+(D/R).toFixed(3));
+      }
+     } else if(name.startsWith('I4-S2')) {
       const physical={text:'P01 000123 color3 ไทย漢字😀 '+'x'.repeat(80),cells:Array.from({length:120},(_,i)=>({...cell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))};
       let pressure=0;
       const n=name.includes('page-size')?5000:name.includes('reclaim')?1600:800;
@@ -865,7 +906,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
       const quiet={kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:1};
       await s.replaceScreen(frame('A'));await s.calibrate({capture:capture('one','A'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
       await s.calibrate({capture:capture('two','Z'),expectedRevision:s.token(key).revision,captureEvidence:quiet,checks:[],repairs:[]});
-      const hashes=s.ram.db.query('SELECT screen_hash FROM na_capture ORDER BY capture_id').all().map(row=>row.screen_hash);
+      const hashes=s.ram.db.query('SELECT screen_hash FROM na_capture ORDER BY capture_id').all().map(row=>Buffer.from(row.screen_hash).toString('hex'));
       assert(hashes.length===2 && hashes[0]!==hashes[1],'metadata hash must change when capture cells change');
      } else if(name.includes('persist-screen-table')) {
       await s.replaceScreen(frame('A'));let ok=true;try{s.flush();}catch{ok=false;}
@@ -900,7 +941,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
       assert(rejected && JSON.parse(s.screen(key).cells_json)[0][0].grapheme==='A','bytes during capture must not calibrate the screen');
      } else if(name.includes('freelist')) {
       clearInterval(s.timer);let n=0,refused=false;
-      while(!refused && n<20000){const r=await s.appendScroll(row(('row '+n+' ').padEnd(400,'x'),n+1));if(r.accepted!==false)n++;else if(r.scope==='pane')s.flush();else refused=true;}
+      while(!refused && n<20000){const r=await s.appendScroll(row(('row '+n+' ').padEnd(1000,'x'),n+1));if(r.accepted!==false)n++;else if(r.scope==='pane')s.flush();else refused=true;}
       assert(refused,'fixture must reach RAM pressure');s.flush();
       const state=await Promise.race([s.drained(key).then(()=>'drained'),new Promise(r=>setTimeout(()=>r('stuck'),1500))]);
       assert(state==='drained','eviction must clear RAM pressure');
@@ -944,11 +985,13 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
 test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when its fix is removed',()=>runI2Mutations(I2_FIX1_MUTATIONS,'I2_FIX1_MUTATIONS'),180000);
 test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
 test('I4 FIX1 S mutations: capture payload, swallowed metadata hash and durable screen each go red',()=>runI2Mutations(I4_FIX1_S_MUTATIONS,'I4_FIX1_S_MUTATIONS'),180000);
+test('SWITCHON S2 mutations: per-cell JSON, unsealed lines, a dropped hidden bit and a v3 header each go red',()=>runI2Mutations(S2_MUTATIONS,'S2_MUTATIONS'),180000);
 
 test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
  clearInterval((s as any).timer);   // no background flush: only drained() moves the disk writer
- const counts=[6000,3000,3000,3000,3000],firstPass=Array(5).fill(0),pressure=Array(5).fill(0),lost=Array(5).fill(0);
+ // v4 rows reserve ~0.6 KiB each, so A offers 12000 to still outrun its guarantee plus borrow share.
+ const counts=[12000,3000,3000,3000,3000],firstPass=Array(5).fill(0),pressure=Array(5).fill(0),lost=Array(5).fill(0);
  const key=(pane:number)=>({serverIdentity:'d12',paneId:`%${pane}`,birthGeneration:1});
  const cell=(grapheme:string)=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
  const event=(pane:number,n:number)=>{const text=`${pane} line ${n} of a big file`.padEnd(80,' ');
@@ -977,7 +1020,7 @@ test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A lo
   expect(pendingAtBurst).toBeLessThanOrEqual(16*1024*1024);
   expect(normalRefused).toBe(0);expect(lost[0]).toBe(0);expect(missing).toBe(0);expect(wrong).toBe(0);
   // Guarantee: every late pane was admitted at least its quota worth of rows in the first pass, while A was borrowing.
-  expect(firstPass[0]).toBeLessThan(6000);
+  expect(firstPass[0]).toBeLessThan(counts[0]);
   for(let pane=1;pane<5;pane++)expect(firstPass[pane]).toBeGreaterThan(Math.floor(guarantee/(rowBytes*20)));
   expect(s.health()).toMatchObject({rejectedRows:0,pressure:'none'});
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
