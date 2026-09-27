@@ -8,7 +8,7 @@ import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, de
 import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
 import { decodeBlock, encodeBlock, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
-import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
+import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionCloseReceipt, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionStorageState, ProjectionStorageStatus, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
 const PENDING_MAX=16*1024*1024, CACHE_MAX=256*1024*1024, FLUSH_BYTES=1024*1024, DURABLE_BATCH_MS=20;
 const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
@@ -32,9 +32,17 @@ export interface ProjectionOptions {
   /** RAM working-set cap; defaults to 256 MiB. Tests lower it to reach the cap with real rows. */
   cacheBytes?: number;
   onFault?: (fault: ProjectionFault)=>void;
+  /** Immediate, typed disk-fault/retry receipt for the host's durable journal. */
+  onStorageState?: (state: ProjectionStorageState)=>void;
   /** Fault/crash probes, never a replacement persistence backend. */
   checkpoint?: (phase:'before-disk-commit'|'after-disk-commit'|'before-watermark',commitId:string)=>void;
   beforeOpen?: (file:string)=>void;
+}
+const STORAGE_RETRY_MS=[1000,2000,5000] as const;
+function isStorageFull(error:unknown):boolean {
+  const value=error as NodeJS.ErrnoException;
+  return value?.code==='ENOSPC' || value?.code==='SQLITE_FULL'
+    || /(?:SQLITE_FULL|database or disk is full|\bENOSPC\b|no space left on device)/i.test(String(error));
 }
 function admitPath(options: ProjectionOptions): string {
   const root=resolve(options.historyRoot), file=resolve(options.file??join(root,'newarch-v3/history.sqlite3'));
@@ -183,6 +191,13 @@ export class ProjectionStore implements ProjectionWriterPort {
   private pressureBytes=0;
   private timer:ReturnType<typeof setInterval>;
   private retry:Batch|null=null;
+  private storageStatus:ProjectionStorageStatus='healthy';
+  private storageEventId:string|null=null;
+  private storageReason:string|null=null;
+  private storageAttempt=0;
+  private storageRetryAt:number|null=null;
+  private storageResult:'failed'|'succeeded'|null=null;
+  private closeReceipt:ProjectionCloseReceipt|null=null;
   private worker:Worker|null=null;
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
@@ -239,8 +254,9 @@ export class ProjectionStore implements ProjectionWriterPort {
       try {
         if(this.stopped)this.relievePressure();
         if(this.inFlight && Atomics.load(this.signal,0)!==0)this.finishWorker();
-        if(!this.inFlight && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
-      } catch(error) {this.fault('flush-failed',String(error));}
+        const retryDue=!this.retry || this.storageRetryAt===null || Date.now()>=this.storageRetryAt;
+        if(!this.inFlight && retryDue && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
+      } catch(error) {this.handleFlushFailure(error);}
       if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
     this.timer.unref();
@@ -273,6 +289,27 @@ export class ProjectionStore implements ProjectionWriterPort {
     return times.length?Math.max(0,Date.now()-Math.min(...times)):0;
   }
   private pendingBytes():number {return this.dirtyBytes+this.queuedBytes+(this.retry?.bytes??0);}
+  private storageSnapshot(status=this.storageStatus,result=this.storageResult):ProjectionStorageState {
+    const panes=(prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[]).map(p=>({
+      paneKey:{serverIdentity:String(p.server_identity),paneId:String(p.pane_id),birthGeneration:Number(p.birth_generation)},
+      sourceEpoch:Number(p.source_epoch),revision:Number(p.revision),durableRevision:Number(p.durable_revision),nextLineId:Number(p.next_line_id)
+    }));
+    return {status,eventId:this.storageEventId,at:Date.now(),reason:this.storageReason,pendingBytes:this.pendingBytes(),
+      unknownTail:status!=='healthy',retry:{batchId:this.retry?.id??null,attempt:this.storageAttempt,nextAt:this.storageRetryAt,result},panes};
+  }
+  private emitStorage(status=this.storageStatus,result=this.storageResult):void {
+    try {this.options.onStorageState?.(this.storageSnapshot(status,result));}
+    catch {console.error('[newarch] storage-state sink failed');}
+  }
+  private handleFlushFailure(error:unknown):void {
+    if(isStorageFull(error)) {
+      this.storageEventId??=randomUUID();this.storageStatus='storage-paused';this.storageReason=String(error);
+      this.storageAttempt++;this.storageResult='failed';
+      this.storageRetryAt=Date.now()+STORAGE_RETRY_MS[Math.min(this.storageAttempt-1,STORAGE_RETRY_MS.length-1)]!;
+      this.stopped=true;this.emitStorage();
+    }
+    this.fault('flush-failed',String(error));
+  }
   private fault(kind:string,reason:string,key?:PaneKey,lostRows=1):void {
     this.degraded=true;
     const now=Date.now();
@@ -445,12 +482,13 @@ export class ProjectionStore implements ProjectionWriterPort {
         if(keep===0)break;
       }
     }
-    if(this.liveRam()+reserve<=this.cacheMax && this.pendingBytes()<PENDING_MAX/2){this.stopped=false;this.pressureBytes=0;}
+    if(this.storageStatus==='healthy' && this.liveRam()+reserve<=this.cacheMax && this.pendingBytes()<PENDING_MAX/2){this.stopped=false;this.pressureBytes=0;}
     this.settleDrains();
   }
   private kickFlush():void {
     if(this.inFlight || this.closed || this.closing)return;
-    try {this.flushAsync();}catch(error){this.fault('flush-failed',String(error));}
+    if(this.retry && this.storageRetryAt!==null && Date.now()<this.storageRetryAt)return;
+    try {this.flushAsync();}catch(error){this.handleFlushFailure(error);}
   }
   private drainLosses():void {
     for(const [id,loss] of this.capacityLosses) {
@@ -550,6 +588,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       // by RAM/disk. Queues retain strings, not hundreds of cloned cell objects.
       if(this.closed)throw new Error('store-closed');
       if(this.closing)throw new Error('store-closing');
+      if(this.storageStatus!=='healthy')return Promise.resolve(this.pressure(event.paneKey,512,'store',true));
       const id=paneId(event.paneKey),text=event.physicalRow.text,estimate=text.length+512;
       // Decide from the text size before touching cells: a refused row is never copied.
       if(estimate>this.maxEvent())this.rejectOversize(event.paneKey,event,true,`${event.sourceEpoch}:${event.receiveSeq}:${text.length}:${text.slice(0,32)}:${text.slice(-32)}`);
@@ -580,6 +619,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   replaceScreen(frame:ProjectionFrame):Promise<ProjectionAdmission> {
     try {
       this.owner();if(this.closing)throw new Error('store-closing');
+      if(this.storageStatus!=='healthy')return Promise.resolve(this.pressure(frame.paneKey,512,'store',false));
       const pane=paneId(frame.paneKey),id=pane+':'+frame.kind;
       const same=(job:Job)=>job.sourceEpoch===frame.sourceEpoch && job.geometryGeneration===frame.geometryGeneration && !job.barrier;
       const queued=this.queues.get(pane)??[];
@@ -769,6 +809,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
     for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
     this.retry=null;
+    if(this.storageStatus!=='healthy') {
+      this.storageStatus='recovering';this.storageRetryAt=null;this.storageResult='succeeded';this.emitStorage('recovering','succeeded');
+    }
     this.drainLosses();
     // Pressure clears only once RAM has room for an event again, not merely when disk caught up.
     this.ramBytesCache=-1;
@@ -789,6 +832,11 @@ export class ProjectionStore implements ProjectionWriterPort {
     const now=Date.now();
     for(const [tag,f] of this.faults)if(tag.endsWith(':'+PROJECTION_OVERSIZE) && now-f.seen>CAPACITY_EPISODE_MS && !this.capacityLosses.has(f.pane))this.faults.delete(tag);
     this.settleDurable();this.settleDrains();
+    if(this.storageStatus==='recovering' && this.retry===null && this.dirtyBytes===0 && this.dirtySince===null) {
+      this.storageStatus='healthy';this.stopped=false;this.storageReason=null;this.storageRetryAt=null;this.emitStorage('healthy','succeeded');
+      this.storageEventId=null;this.storageAttempt=0;this.storageResult=null;
+      this.settleDrains();
+    }
   }
   private finishWorker():void {
     const state=Atomics.load(this.signal,0);
@@ -812,7 +860,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       try {
         this.finishWorker();
         if(!this.closing && (this.dirtyBytes || this.dirtySince!==null))this.flushAsync();
-      }catch(error){this.fault('flush-failed',String(error));}
+      }catch(error){this.handleFlushFailure(error);}
     });
     this.worker.on('error',failed);
     this.worker.on('exit',code=>{this.worker=null;if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
@@ -839,7 +887,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.acknowledge();
       }
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    }catch(error){this.fault('flush-failed',String(error));throw error;}
+    }catch(error){this.handleFlushFailure(error);throw error;}
   }
   /**
    * One pane's status and issues, as `health()` reports them for that pane,
@@ -880,21 +928,33 @@ export class ProjectionStore implements ProjectionWriterPort {
     return {pressure:this.stopped || this.refusedBytes.size?'recoverable':'none',pressureRefusals:this.pressureRefusals,status:this.stopped?'stopped':this.degraded?'degraded':'healthy',pendingBytes:this.pendingBytes(),rejectedRows:this.rejectedRows,
       pendingAgeMs:this.pendingAge(),ramBytes:this.ram.bytes(),rssBytes:process.memoryUsage().rss,lastFlushAgeMs:this.lastFlushAgeMs,lastCommitAt:this.lastCommitAt,
       ramBatches:this.ramBatches,ramBatchOperations:this.ramBatchOperations,
-      averageRamOperationsPerBatch:this.ramBatches?this.ramBatchOperations/this.ramBatches:0,panes};
+      averageRamOperationsPerBatch:this.ramBatches?this.ramBatchOperations/this.ramBatches:0,storage:this.storageSnapshot(),panes};
   }
-  async close():Promise<void> {
-    if(this.closed)return;
+  async close():Promise<ProjectionCloseReceipt> {
+    if(this.closed)return this.closeReceipt!;
     this.closing=true;clearInterval(this.timer);
     try {
       while(this.pumping)await new Promise(resolve=>setTimeout(resolve,1));
-      this.flush();
+      try {this.flush();}
+      catch(error) {
+        if(!isStorageFull(error))throw error;
+        this.storageStatus='closed-incomplete';this.storageReason=String(error);this.storageResult='failed';this.storageRetryAt=null;this.emitStorage();
+      }
+      const storage=this.storageSnapshot();
+      this.closeReceipt={drained:storage.status==='healthy' && storage.pendingBytes===0,
+        unknownTail:storage.status!=='healthy',pendingBytes:storage.pendingBytes,storage};
     } finally {
+      if(this.closeReceipt===null) {
+        const storage=this.storageSnapshot();
+        this.closeReceipt={drained:false,unknownTail:storage.status!=='healthy',pendingBytes:storage.pendingBytes,storage};
+      }
       try {this.settleDurable(true);}catch{for(const w of this.durableWaiters.splice(0))w.reject(new Error('store-closed'));}
       for(const w of this.drainWaiters.splice(0))w.reject(new Error('store-closed'));
       this.closed=true;
       try {await this.stopWorker();}
       finally {closePrepared(this.ram.db);closePrepared(this.disk);}
     }
+    return this.closeReceipt!;
   }
   /** DB.close() runs in its owning thread; a stuck worker is terminated, never thrown at the caller. */
   private async stopWorker():Promise<void> {

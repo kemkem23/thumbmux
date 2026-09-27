@@ -241,6 +241,25 @@ export interface ProjectionFault {
   kind: string; at: number; reason: string; pendingBytes: number;
   panes?: Array<{ paneKey: PaneKey; sourceEpoch: number; boundaryLineId: number; missingCount: number | null }>;
 }
+export type ProjectionStorageStatus = 'healthy' | 'storage-paused' | 'recovering' | 'closed-incomplete';
+export interface ProjectionStoragePaneWatermark {
+  paneKey: PaneKey; sourceEpoch: number; revision: number; durableRevision: number; nextLineId: number;
+}
+/**
+ * Store-to-host disk-fault contract. `eventId` stays stable for one outage and
+ * `batchId` stays stable while the exact failed transaction is retried.
+ * `unknownTail` is deliberately true until that transaction is durable.
+ */
+export interface ProjectionStorageState {
+  status: ProjectionStorageStatus; eventId: string | null; at: number;
+  reason: string | null; pendingBytes: number; unknownTail: boolean;
+  retry: { batchId: string | null; attempt: number; nextAt: number | null; result: 'failed' | 'succeeded' | null };
+  panes: ProjectionStoragePaneWatermark[];
+}
+export interface ProjectionCloseReceipt {
+  drained: boolean; unknownTail: boolean; pendingBytes: number;
+  storage: ProjectionStorageState;
+}
 export interface ProjectionHealth {
   status: 'healthy' | 'degraded' | 'stopped'; pendingBytes: number; pendingAgeMs: number; rejectedRows: number;
   ramBytes: number; rssBytes: number; lastFlushAgeMs: number; lastCommitAt: number | null;
@@ -249,6 +268,7 @@ export interface ProjectionHealth {
   pressure: 'none' | 'recoverable';
   /** Backpressure refusals since open (FIX1 §3); not losses, see rejectedRows for those. */
   pressureRefusals: number;
+  storage: ProjectionStorageState;
   panes: Array<ProjectionToken & { status: 'healthy' | 'degraded'; recovery: 'automatic' | 'external'; issues: ProjectionIssue[] }>;
 }
 export interface ProjectionWriterPort {

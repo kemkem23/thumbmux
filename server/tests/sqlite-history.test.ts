@@ -436,6 +436,52 @@ test('newarch v3: 100ms flush, byte threshold, idempotent post-commit retry, epo
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('F1-S: real SQLITE_FULL pauses admission, keeps one batch id and recovers on 1s backoff without advancing watermark',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-f1s-full-'));const states:any[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
+ try {
+  await s.appendScroll(naEvent('durable',1));s.flush();const durable=s.token(naKey);
+  const limiter=new Database(s.file);const pages=Number((limiter.query('PRAGMA page_count').get() as any).page_count);
+  limiter.exec(`PRAGMA max_page_count=${pages}`);limiter.close();
+  const large='x'.repeat(512*1024);
+  await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
+  expect(()=>s.flush()).toThrow();
+  const paused=s.health();
+  expect(paused.storage).toMatchObject({status:'storage-paused',unknownTail:true,retry:{attempt:1,result:'failed'}});
+  expect(paused.storage.retry.batchId).not.toBeNull();
+  expect(s.token(naKey).durableRevision).toBe(durable.durableRevision);
+  expect(await s.appendScroll(naEvent('must wait',3))).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  await Bun.sleep(250);
+  expect(states.filter(state=>state.status==='storage-paused')).toHaveLength(1);
+  const room=new Database(s.file);room.exec('PRAGMA max_page_count=2147483646');room.close();
+  const started=Date.now();while(s.health().storage.status!=='healthy' && Date.now()-started<4000)await Bun.sleep(25);
+  const recovered=s.health();expect(recovered.storage.status).toBe('healthy');
+  expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
+  const recovery=states.find(state=>state.status==='recovering');
+  expect(recovery.retry.batchId).toBe(paused.storage.retry.batchId);
+  expect(recovery.eventId).toBe(paused.storage.eventId);
+  expect(s.readPage(s.token(naKey),0,10).lines.map(line=>line.text)).toEqual(['durable',large]);
+  expect(states.map(state=>state.status)).toEqual(['storage-paused','recovering','healthy']);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},10000);
+
+test('F1-S: close under real SQLITE_FULL cleans resources and reports a durable incomplete watermark',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-f1s-close-full-'));const states:any[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
+ try {
+  await s.appendScroll(naEvent('durable',1));s.flush();
+  const limiter=new Database(s.file);const pages=Number((limiter.query('PRAGMA page_count').get() as any).page_count);
+  limiter.exec(`PRAGMA max_page_count=${pages}`);limiter.close();
+  const large='y'.repeat(512*1024);await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
+  const receipt=await s.close();
+  expect(receipt).toMatchObject({drained:false,unknownTail:true,storage:{status:'closed-incomplete',unknownTail:true}});
+  expect(receipt.storage.panes[0].durableRevision).toBeLessThan(receipt.storage.panes[0].revision);
+  expect(states.at(-1).status).toBe('closed-incomplete');
+  const db=new Database(s.file,{readonly:true});
+  expect(db.query('SELECT next_line_id,durable_revision,revision FROM na_pane').get()).toEqual({next_line_id:1,durable_revision:1,revision:1});db.close();
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},10000);
+
 test('newarch v3: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle mutation',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-burst-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
