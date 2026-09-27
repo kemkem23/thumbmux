@@ -251,3 +251,127 @@ test("SWITCHON H2: A,A in history and A,A,B on screen is four A rows, not two (n
   const blank = calibratedPane(["x", ""], ["", "y"], null);
   expect(liveLines(blank)).toEqual(["x", "", "", "y"]);
 });
+
+// ── NEWARCH-SWITCHON P: frame-path cost without changing what a viewer sees ──
+import { FRAME_BUDGET_SHARE, FrameBudget, trimStatsRing } from "../src/pipe-history-runtime";
+import { decodeFrameCells, encodeFrameCells, validateFrame } from "../src/sqlite-history/ram-store";
+
+/** fakePane plus issues and ring repairs (the surface snapshot reads). */
+function issuePane(cols = 20, rows = 4) {
+  const paneKey = { serverIdentity: "srv", paneId: "%8", birthGeneration: 1 };
+  const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
+  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof row>; softWrap: boolean; ansi?: string }> = [];
+  const issues: any[] = [];
+  let next = 0, revision = 0;
+  const pane: any = {
+    paneKey, ringRepairs: 0,
+    recentRows: () => ring,
+    view: () => ({
+      paneKey, session: "s", cells: Array.from({ length: rows }, (_, y) => row(`screen ${y}`)), cursor: null, kind: "normal", cols, rows,
+      displaySource: "pipe", token: { paneKey, sourceEpoch: 1, geometryGeneration: 0, revision, durableRevision: revision, nextLineId: next },
+      sourceEpoch: 1, geometryGeneration: 0, mouseSgr: false, mouseAny: false, degraded: issues.length > 0, issues,
+    }),
+    readRange: () => null,
+  };
+  return {
+    pane: pane as PipeHistoryPane,
+    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false }); next++; revision++; } },
+    issue(lineId: number, kind = "gap") { issues.push({ kind, reason: kind, missingCount: null, boundaryLineId: lineId, revision: ++revision }); },
+    repair(lineId: number, text: string) { const r = ring.find((x) => x.lineId === lineId)!; r.cells = row(text); r.ansi = undefined; pane.ringRepairs++; revision++; },
+  };
+}
+
+test("SWITCHON P: every marker inside the live window reaches the frame, not only the newest 16", () => {
+  const f = issuePane();
+  f.append(3000);
+  const window = new ProjectionLiveWindow(1000);
+  const start = window.snapshot(f.pane, 1)!.boundary.liveStartLine;
+  expect(start).toBe(2000);
+  // 5 markers below the window, 30 inside it, all older than the newest 16 would reach.
+  for (let i = 0; i < 5; i++) f.issue(100 + i);
+  for (let i = 0; i < 30; i++) f.issue(start + 10 * i);
+  f.append(1);
+  const markers = window.snapshot(f.pane, 1)!.newarch.markers;
+  const ids = markers.map((m) => m.lineId);
+  // All 30 in-window markers, in store order; below-window ones only if among the newest 16 (none here).
+  expect(ids).toEqual(Array.from({ length: 30 }, (_, i) => start + 10 * i));
+  // Below the window the newest 16 still ride along (the header warning) when they are the newest.
+  const g = issuePane();
+  g.append(3000);
+  const w2 = new ProjectionLiveWindow(1000);
+  w2.snapshot(g.pane, 1);
+  for (let i = 0; i < 20; i++) g.issue(50 + i);
+  const below = w2.snapshot(g.pane, 1)!.newarch.markers.map((m) => m.lineId);
+  expect(below).toEqual(Array.from({ length: 16 }, (_, i) => 54 + i));
+});
+
+test("SWITCHON P: the cached live window text equals a fresh join through appends, repairs and window moves", () => {
+  const f = issuePane();
+  const cached = new ProjectionLiveWindow(50);
+  const starts: number[] = [];
+  for (let step = 0; step < 60; step++) {
+    f.append(1 + (step % 7));
+    if (step % 11 === 5) f.repair(Math.max(0, cached.snapshot(f.pane, 1)!.boundary.liveStartLine + 1), `fixed ${step}`);
+    const got = cached.snapshot(f.pane, 1)!;
+    starts.push(got.boundary.liveStartLine);
+    const lines = got.content.split("\n");
+    const history = lines.slice(0, -4);
+    const ring = f.pane.recentRows().filter((r) => r.lineId >= got.boundary.liveStartLine);
+    expect(history).toEqual(ring.map((r) => r.cells.map((c) => c.grapheme).join("").trimEnd()));
+    expect(lines.slice(-4)).toEqual(["screen 0", "screen 1", "screen 2", "screen 3"]);
+  }
+  expect(new Set(starts).size).toBeGreaterThan(2);
+});
+
+test("SWITCHON P: the frame budget is idle below its share and busy above it (decayed, not cumulative)", () => {
+  let now = 0;
+  const budget = new FrameBudget(() => now);
+  // 1 ms of frame work every 10 ms = 10% of the thread: never busy.
+  for (let i = 0; i < 200; i++) { now += 10; budget.spend(1); }
+  expect(budget.share()).toBeLessThan(FRAME_BUDGET_SHARE);
+  expect(budget.busy()).toBe(false);
+  // 5 ms every 10 ms = 50%: busy.
+  for (let i = 0; i < 200; i++) { now += 10; budget.spend(5); }
+  expect(budget.busy()).toBe(true);
+  // Quiet again: the load decays, a later light pane is not throttled by old work.
+  now += 2000;
+  expect(budget.busy()).toBe(false);
+});
+
+test("SWITCHON P: statistics rings keep at most the newest samples and drop old stamps", () => {
+  const limit = 1024;
+  const values: number[] = [], times: number[] = [];
+  for (let i = 0; i < 100_000; i++) { values.push(i); times.push(i); trimStatsRing(values, times, limit, -Infinity); }
+  expect(values.length).toBeLessThanOrEqual(limit + (limit >> 2));
+  expect(values.length).toBe(times.length);
+  expect(values.at(-1)).toBe(99_999);
+  // Age: every stamp older than the floor goes at the next age check.
+  const stamps: number[] = [];
+  for (let i = 0; i < 4096; i++) { stamps.push(i); trimStatsRing(stamps, stamps, 1_000_000, i - 100); }
+  expect(stamps[0]).toBeGreaterThanOrEqual(4096 - 100 - 1024);
+  expect(stamps.at(-1)).toBe(4095);
+});
+
+test("SWITCHON P: RAM frames round-trip through the compact row codec, and rle:1 frames still decode", () => {
+  const cols = 12;
+  const row = (runs: Array<[string, string, number, string]>) => parserRowCells(runs, cols);
+  const cells = [
+    row([["index:1", "default", 1, "bold"], ["rgb:1,2,3", "index:200", 0, " 漢😀"]]),
+    row([["default", "default", 8 | 2, "hidden dim"]]),
+    row([["default", "index:4", 0, "ไทย  "]]),
+    new Array(cols).fill(BLANK_CELL),
+  ];
+  const frame = { paneKey: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, sourceEpoch: 1, geometryGeneration: 0, receiveSeq: 1,
+    cells, kind: "normal" as const, cols, rows: cells.length, cursor: { row: 0, col: 0, visible: true } };
+  validateFrame(frame);
+  const encoded = encodeFrameCells(cells);
+  expect(JSON.parse(encoded).rle).toBe(2);
+  expect(JSON.stringify(decodeFrameCells(encoded))).toBe(JSON.stringify(cells));
+  // The same row objects encode to the same text (the per-row cache), and a new row is encoded anew.
+  expect(encodeFrameCells(cells)).toBe(encoded);
+  const changed = [cells[0]!, row([["default", "default", 0, "new"]]), cells[2]!, cells[3]!];
+  expect(JSON.stringify(decodeFrameCells(encodeFrameCells(changed)))).toBe(JSON.stringify(changed));
+  // A frame written before this change (legacy runs) is still readable.
+  const legacy = JSON.stringify({ rle: 1, rows: [[[" ", 1, false, "default", "default", 0, cols]]] });
+  expect(decodeFrameCells(legacy)[0]).toHaveLength(cols);
+});

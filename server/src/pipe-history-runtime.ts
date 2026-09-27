@@ -359,7 +359,7 @@ export class FrameBudget {
  * quarter at a time) and, every 1024 entries, those stamped before `floor`.
  * `times[i]` is the stamp of `values[i]` (the same array for timestamp rings).
  */
-function trimStatsRing(values: unknown[], times: number[], limit: number, floor: number): void {
+export function trimStatsRing(values: unknown[], times: number[], limit: number, floor: number): void {
   let drop = values.length > limit + (limit >> 2) ? values.length - limit : 0;
   if ((values.length & 1023) === 0 || drop > 0) while (drop < times.length && times[drop]! < floor) drop++;
   if (drop > 0) { values.splice(0, drop); if (times !== values) times.splice(0, drop); }

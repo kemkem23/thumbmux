@@ -16,6 +16,7 @@ import {
   TERMINAL_PTY_WAL_PROXY_ASSET,
 } from "../scripts/copy-runtime-assets";
 import { PIPE_HISTORY_RUNTIME_CAPABILITY } from "../src/pipe-history-runtime";
+import { PROJECTION_SCHEMA_VERSION } from "../src/sqlite-history/schema";
 
 const roots: string[] = [];
 
@@ -37,7 +38,8 @@ function fixture(contents = "#!/usr/bin/env python3\nprint('proxy fixture')\n", 
 describe("server runtime asset build", () => {
   test("advertises the exact optional pipe-history runtime capability", () => {
     expect(PIPE_HISTORY_RUNTIME_CAPABILITY).toEqual({
-      wire: "newarch-frame-v1", projectionSchema: 3, metadataRevision: true, archiveReadVersions: [2, 3],
+      // The schema number is schema.ts's, never a copy here (S2 moved it 3 -> 4).
+      wire: "newarch-frame-v1", projectionSchema: PROJECTION_SCHEMA_VERSION, metadataRevision: true, archiveReadVersions: [2, 3],
     });
   });
   test("copies the exact Python helper beside the bundled server entrypoint", () => {
