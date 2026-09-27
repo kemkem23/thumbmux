@@ -197,6 +197,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private storageAttempt=0;
   private storageRetryAt:number|null=null;
   private storageResult:'failed'|'succeeded'|null=null;
+  private storageBatchId:string|null=null;
   private closeReceipt:ProjectionCloseReceipt|null=null;
   private worker:Worker|null=null;
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
@@ -257,7 +258,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         const retryDue=!this.retry || this.storageRetryAt===null || Date.now()>=this.storageRetryAt;
         if(!this.inFlight && retryDue && (this.retry || this.dirtyBytes>=FLUSH_BYTES || (this.dirtySince!==null && Date.now()-this.dirtySince>=DURABLE_BATCH_MS)))this.flushAsync();
       } catch(error) {this.handleFlushFailure(error);}
-      if(this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
+      if(this.storageStatus==='healthy' && this.pendingAge()>1000)this.fault('flush-overdue','pending age exceeded 1s');
     },5);
     this.timer.unref();
   }
@@ -295,7 +296,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       sourceEpoch:Number(p.source_epoch),revision:Number(p.revision),durableRevision:Number(p.durable_revision),nextLineId:Number(p.next_line_id)
     }));
     return {status,eventId:this.storageEventId,at:Date.now(),reason:this.storageReason,pendingBytes:this.pendingBytes(),
-      unknownTail:status!=='healthy',retry:{batchId:this.retry?.id??null,attempt:this.storageAttempt,nextAt:this.storageRetryAt,result},panes};
+      unknownTail:status!=='healthy',retry:{batchId:this.retry?.id??this.storageBatchId,attempt:this.storageAttempt,nextAt:this.storageRetryAt,result},panes};
   }
   private emitStorage(status=this.storageStatus,result=this.storageResult):void {
     try {this.options.onStorageState?.(this.storageSnapshot(status,result));}
@@ -304,6 +305,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private handleFlushFailure(error:unknown):void {
     if(isStorageFull(error)) {
       this.storageEventId??=randomUUID();this.storageStatus='storage-paused';this.storageReason=String(error);
+      this.storageBatchId=this.retry?.id??this.storageBatchId;
       this.storageAttempt++;this.storageResult='failed';
       this.storageRetryAt=Date.now()+STORAGE_RETRY_MS[Math.min(this.storageAttempt-1,STORAGE_RETRY_MS.length-1)]!;
       this.stopped=true;this.emitStorage();
@@ -808,7 +810,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     })();
     this.lastCommitAt=Date.now();this.lastFlushAgeMs=this.lastCommitAt-batch.since;
     for(const [id,bytes] of batch.byPane)this.reserve(id,-bytes);
-    this.retry=null;
+    this.storageBatchId=batch.id;this.retry=null;
     if(this.storageStatus==='storage-paused') {
       this.storageStatus='recovering';this.storageRetryAt=null;this.storageResult='succeeded';this.emitStorage('recovering','succeeded');
     }
@@ -834,7 +836,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.settleDurable();this.settleDrains();
     if(this.storageStatus==='recovering' && this.retry===null && this.dirtyBytes===0 && this.dirtySince===null) {
       this.storageStatus='healthy';this.stopped=false;this.storageReason=null;this.storageRetryAt=null;this.emitStorage('healthy','succeeded');
-      this.storageEventId=null;this.storageAttempt=0;this.storageResult=null;
+      this.storageEventId=null;this.storageAttempt=0;this.storageResult=null;this.storageBatchId=null;
       this.settleDrains();
     }
   }
@@ -905,7 +907,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       issues:[...issues.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue)};
   }
   health():ProjectionHealth {
-    this.owner();if(this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
+    this.owner();if(this.storageStatus==='healthy' && this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
     const rows=prepared(this.ram.db,'SELECT * FROM na_pane').all() as SqlRow[];
     const revisions=new Map(rows.map(p=>[String(p.pane_key),Number(p.revision)]));
     const byPane=new Map<string,Map<string,SqlRow>>();
