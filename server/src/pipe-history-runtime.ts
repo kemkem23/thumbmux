@@ -279,6 +279,15 @@ export interface PaneView {
   /** Set only for a tmux-calibrated normal screen that holds pulled-back history rows. */
   pulledBack?: PulledBack | null;
 }
+/**
+ * FIX1 §3.2 (7): the gap marker a host shows while the store cannot write
+ * (disk full). It lives only here, outside every database, so frame and page
+ * carry it even when no SQLite write can succeed; the host replaces it with
+ * a durable store marker once storage is back.
+ */
+export interface StorageOverlay {
+  eventId: string; kind: string; reason: string; boundaryLineId: number | null; detectedAt: number;
+}
 export interface PaneStats {
   received: number; published: number; latencyMs: number[];
   captures: number; captureFaults: number; captureConflicts: number; screenCalibrations: number;
@@ -320,6 +329,8 @@ export interface PipeHistoryRuntimeOptions {
 const RING_ROWS = 4500;
 /** Minimum spacing of full-screen writes to the store per pane (leading edge immediate). */
 export const FRAME_WRITE_MS = 16;
+/** A screen refused for pressure (or a paused store) is offered again after this long, never at once. */
+export const FRAME_PRESSURE_RETRY_MS = 50;
 /**
  * A frame is written (and published) as soon as it arrives while the frame
  * path — store write plus viewer publish, timed on the main thread — uses less
@@ -409,6 +420,18 @@ const clampCursor = (cursor: { x: number; y: number; visible: boolean }, cols: n
   x: Math.max(0, Math.min(cols - 1, cursor.x)), y: Math.max(0, Math.min(rows - 1, cursor.y)), visible: cursor.visible,
 });
 
+/** tmux's screen (capture-pane -p -e -N) as bytes that paint it on a fresh parser. */
+function seedBytes(raw: string, meta: PaneTmuxMeta): Uint8Array {
+  const lines = raw.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const screen = lines.slice(Math.max(0, lines.length - meta.rows));
+  const cursor = clampCursor(meta.cursor, meta.cols, meta.rows);
+  let text = meta.alternate ? '\x1b[?1049h' : '';
+  screen.forEach((line, y) => { text += `\x1b[${y + 1};1H\x1b[0m${line}`; });
+  text += `\x1b[0m\x1b[${cursor.y + 1};${cursor.x + 1}H${cursor.visible ? '\x1b[?25h' : '\x1b[?25l'}`;
+  return new TextEncoder().encode(text);
+}
+
 export class PipeHistoryPane {
   readonly paneKey: PaneKey;
   readonly session: string;
@@ -449,7 +472,11 @@ export class PipeHistoryPane {
   private frameTimer: ReturnType<typeof setTimeout> | null = null;
   private frameWriting = false;
   private lastFrameWriteAt = -Infinity;
+  /** Earliest re-offer of a screen the store refused (see FRAME_PRESSURE_RETRY_MS). */
+  private frameBackoffUntil = 0;
   private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
+  /** Storage-fault marker shown while the store cannot write (see StorageOverlay). */
+  private overlay: ProjectionIssue | null = null;
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
     screenCalibrations: 0, storeCommits: 0, skippedCommits: 0, notReady: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
@@ -520,14 +547,15 @@ export class PipeHistoryPane {
    */
   seed(raw: string, meta: PaneTmuxMeta): void {
     if (this.received > 0) throw new Error('seed after pipe bytes');
-    const lines = raw.split('\n');
-    if (lines.at(-1) === '') lines.pop();
-    const screen = lines.slice(Math.max(0, lines.length - meta.rows));
-    const cursor = clampCursor(meta.cursor, meta.cols, meta.rows);
-    let text = meta.alternate ? '\x1b[?1049h' : '';
-    screen.forEach((line, y) => { text += `\x1b[${y + 1};1H\x1b[0m${line}`; });
-    text += `\x1b[0m\x1b[${cursor.y + 1};${cursor.x + 1}H${cursor.visible ? '\x1b[?25h' : '\x1b[?25l'}`;
-    this.ingest(new TextEncoder().encode(text));
+    this.ingest(seedBytes(raw, meta));
+  }
+  /**
+   * The same seed for a pipe the host restarts in a new source epoch (after a
+   * storage pause): the caller has already called beginSourceEpoch, so the
+   * reset parser receives tmux's current screen before the first pipe byte.
+   */
+  reseed(raw: string, meta: PaneTmuxMeta): void {
+    this.ingest(seedBytes(raw, meta));
   }
 
   // ── collector ports ──
@@ -594,7 +622,7 @@ export class PipeHistoryPane {
   private scheduleFrameWrite(): void {
     if (this.frameTimer || this.frameWriting || !this.pendingFrame || this.closed) return;
     const spacing = this.runtime.frameBudget.busy() ? FRAME_WRITE_MS : 0;
-    const wait = this.lastFrameWriteAt + spacing - this.runtime.now();
+    const wait = Math.max(this.lastFrameWriteAt + spacing, this.frameBackoffUntil) - this.runtime.now();
     if (wait <= 0) { this.writeFrame(); return; }
     this.frameTimer = setTimeout(() => { this.frameTimer = null; this.writeFrame(); }, wait);
   }
@@ -611,11 +639,15 @@ export class PipeHistoryPane {
     budget.spend(performance.now() - started);
     written.then((receipt: ProjectionAdmission) => {
       if (isProjectionRefusal(receipt)) {
-        // Pressure: keep the newest screen and offer it again shortly.
+        // Pressure: keep the newest screen and offer it again shortly. The
+        // refusal is already settled, so an immediate re-offer would spin a
+        // promise chain that starves every timer while storage is paused.
         this.pendingFrame ??= frame;
+        this.frameBackoffUntil = this.runtime.now() + FRAME_PRESSURE_RETRY_MS;
         this.bump('frame-pressure');
         return;
       }
+      this.frameBackoffUntil = 0;
       if (this.pendingIssues.length) {
         for (const issue of this.pendingIssues.splice(0)) this.recordIssue(issue.kind, issue.reason, issue.missingCount, issue.recoverable);
       }
@@ -856,6 +888,9 @@ export class PipeHistoryPane {
   }) {
     const c = input.capture;
     const meta = c.after;
+    // FIX1 §3.2: while storage is paused nothing is journaled, a calibration
+    // included; the host re-calibrates after recovery (not ready, recapture).
+    if (this.overlay) { this.stats.notReady++; return null; }
     // The store knows a pane from its first event. A capture that lands before
     // it (the calibrator captures at birth) has nothing to commit against:
     // not ready, like a CAS conflict (recapture), never a capture fault.
@@ -990,10 +1025,51 @@ export class PipeHistoryPane {
     return { degraded: state?.status === 'degraded', issues: state?.issues ?? [] };
   }
 
+  /**
+   * FIX1 §3.2 (7): show (or clear) the storage-fault gap marker. It is part of
+   * every view and page until cleared, independent of the store, and its
+   * revision is the pane revision it was raised at, so a later durable marker
+   * always moves metadataRevision forward.
+   */
+  setStorageOverlay(marker: StorageOverlay | null): void {
+    if (!marker) {
+      if (!this.overlay) return;
+      this.overlay = null;
+    } else {
+      const token = this.tokenOrNull();
+      this.overlay = {
+        issueId: `storage-overlay:${marker.eventId}`, sourceEpoch: token?.sourceEpoch ?? this.collector.currentSourceEpoch(),
+        revision: token?.revision ?? 0, boundaryLineId: marker.boundaryLineId, kind: marker.kind, reason: marker.reason,
+        missingCount: null, detectedAt: marker.detectedAt, resolvedAt: null,
+      };
+    }
+    this.notify({ source: 'issue', revision: this.tokenOrNull()?.revision ?? 0 });
+  }
+  storageOverlay(): ProjectionIssue | null { return this.overlay; }
+
+  /**
+   * While storage is paused the pipe is stopped, so the screen would freeze on
+   * the last journaled frame. The host shows what tmux shows instead: decoded
+   * like a calibration capture, published, never stored and never certified.
+   */
+  showUnstored(raw: RawPaneCapture): void {
+    if (this.closed || !this.overlay) return;
+    const cols = raw.after.cols;
+    if (!this.decoder || this.decoder.cols !== cols) this.decoder = new TmuxCaptureDecoder(cols);
+    const rows = this.decoder.decode(raw.body).map(row => canonicalCaptureCells(row as readonly HistoryCell[], cols));
+    const cells = rows.slice(Math.max(0, rows.length - raw.after.rows));
+    const cursor = clampCursor(raw.after.cursor, cols, raw.after.rows);
+    this.observe(raw.after);
+    this.displayed = { cells, cursor, kind: raw.after.alternate ? 'alternate' : 'normal', cols, rows: cells.length, source: 'tmux-calibrated', pulledBack: null };
+    this.notify({ source: 'tmux-calibrated', revision: this.tokenOrNull()?.revision ?? 0 });
+  }
+
   view(health?: ProjectionHealth): PaneView {
     const token = this.tokenOrNull();
     const shown = this.displayed;
-    const { degraded, issues } = token ? this.health(health) : { degraded: false, issues: [] };
+    const own = token ? this.health(health) : { degraded: false, issues: [] };
+    const degraded = own.degraded || this.overlay !== null;
+    const issues = this.overlay ? [...own.issues, this.overlay] : own.issues;
     return {
       paneKey: this.paneKey, session: this.session,
       cells: shown?.cells ?? [], cursor: shown?.cursor ?? null, kind: shown?.kind ?? 'normal',
@@ -1026,12 +1102,60 @@ export class PipeHistoryPane {
           at = page.nextAnchor;
           if (page.lines.length === 0) break;
         }
+        if (this.overlay) issues = [...issues, this.overlay];
         return { lines, startLine: from, token, issues: issues.filter(i => i.boundaryLineId !== null && i.boundaryLineId >= from && i.boundaryLineId <= stop) };
       } catch (error) {
         if (!String((error as Error)?.message).includes('page-retry')) throw error;
       }
     }
     return null;
+  }
+
+  /**
+   * FIX1 §3.2 Q→H: the consumer fence a pipe stop waits for after FIFO EOF.
+   * Every admitted chunk acknowledged by the parser, the newest screen handed
+   * to the store, then the store's durable barrier at that revision. A parser
+   * ACK is never reported as a DB commit: `durableRevision` is what the store
+   * confirmed on disk, and anything short of that inside `timeoutMs` is an
+   * unknown tail with the fence that did not close.
+   */
+  async drainReceipt(timeoutMs = 5_000): Promise<{
+    lastAdmittedSequence: number | null; lastAckedSequence: number | null;
+    ramRevision: number | null; durableRevision: number | null; issues: string[]; unknownTail: boolean;
+  }> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const issues: string[] = [];
+    const settled = () => {
+      const stats = this.collector.stats();
+      return stats.ackedSeq >= stats.receiveSeq && stats.inflightBytes === 0 && !this.frameWriting && !this.pendingFrame;
+    };
+    while (!settled() && Date.now() < deadline && !this.closed) {
+      if (this.pendingFrame && !this.frameWriting && !this.frameTimer) this.writeFrame();
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const stats = this.collector.stats();
+    if (!settled()) issues.push(`consumer not settled within ${timeoutMs}ms: acked ${stats.ackedSeq} of ${stats.receiveSeq}, ${stats.inflightBytes} inflight bytes${this.pendingFrame || this.frameWriting ? ', newest screen not written' : ''}`);
+    const token = this.tokenOrNull();
+    let durableRevision: number | null = null;
+    if (token) {
+      const left = Math.max(0, deadline - Date.now());
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const receipt = await Promise.race([
+          this.runtime.store.durable(this.paneKey, token.revision),
+          new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), left); }),
+        ]);
+        if (receipt) durableRevision = receipt.durableRevision;
+        else issues.push(`store durable barrier at revision ${token.revision} did not settle within ${timeoutMs}ms`);
+      } catch (error) {
+        issues.push(`store durable barrier failed: ${String((error as Error)?.message ?? error)}`);
+      } finally { if (timer) clearTimeout(timer); }
+    } else if (stats.receiveSeq > 0) issues.push('store holds no token for this pane');
+    return {
+      lastAdmittedSequence: stats.receiveSeq, lastAckedSequence: stats.ackedSeq,
+      ramRevision: token?.revision ?? null, durableRevision,
+      issues, unknownTail: issues.length > 0,
+    };
   }
 
   async close(): Promise<void> {
