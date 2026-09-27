@@ -58,7 +58,13 @@ const encodeFrameRow=(row:PhysicalRow['cells']):string=>{
   return json;
 };
 export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
-  return '{"rle":1,"rows":['+cells.map(encodeFrameRow).join(',')+']}';
+  // One full-size string per frame: `head+join+tail` builds the join and then
+  // a rope that SQLite flattens into a second copy (P allocation probe: frame
+  // JSON is ~97% of the bytes the frame path allocates).
+  const parts=cells.map(encodeFrameRow);
+  if(!parts.length)return '{"rle":1,"rows":[]}';
+  parts[0]='{"rle":1,"rows":['+parts[0];parts[parts.length-1]+=']}';
+  return parts.join(',');
 }
 export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
   const value=JSON.parse(encoded);return value.rle===1?value.rows.map(decodeCellRuns):value;
