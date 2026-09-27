@@ -822,6 +822,11 @@ const S2_MUTATIONS=[
  {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
  {name:'S2 v4-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 4;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
+const F1_S_MUTATIONS=[
+ {name:'F1-S advance-watermark-on-full',file:'projection-store.ts',before:"if(isStorageFull(error)) {\n      this.storageEventId",after:"if(isStorageFull(error)) {\n      this.ram.db.exec('UPDATE na_pane SET durable_revision=revision');\n      this.storageEventId"},
+ {name:'F1-S discard-retry-batch',file:'projection-store.ts',before:"this.storageRetryAt=Date.now()+STORAGE_RETRY_MS",after:"this.retry=null;this.storageRetryAt=Date.now()+STORAGE_RETRY_MS"},
+ {name:'F1-S admit-during-pause',file:'projection-store.ts',before:"if(this.storageStatus!=='healthy')return Promise.resolve(this.pressure(event.paneKey,512,'store',true));",after:"if(false)return Promise.resolve(this.pressure(event.paneKey,512,'store',true));"},
+];
 async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
  const root=mkdtempSync(join(tmpdir(),'na-i2-mutation-'));
  const results:any[]=[];
@@ -846,7 +851,24 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
     const assert=(value,message)=>{if(!value)throw Error('MUTATION_RED: '+message);};
     const s=createProjectionStore({historyRoot:data,mode:'create',cacheBytes:name.includes('reclaim')?1024*1024:name.includes('freelist')?6*1024*1024:undefined});
     try {
-     if(name.startsWith('S2 ')) {
+     if(name.startsWith('F1-S ')) {
+      const states=[];s.options.onStorageState=state=>states.push(structuredClone(state));
+      await s.appendScroll(row('durable',1));s.flush();const before=s.token(key);
+      const limiter=new Database(s.file);const pages=limiter.query('PRAGMA page_count').get().page_count;
+      limiter.exec('PRAGMA max_page_count='+pages);limiter.close();
+      const large='x'.repeat(512*1024);await s.appendScroll({...row('',2),physicalRow:{text:large,cells:[]}});
+      let full=false;try{s.flush();}catch{full=true;}assert(full,'fixture must reach real SQLITE_FULL');
+      const paused=s.health();
+      assert(paused.storage.status==='storage-paused','store must publish storage-paused');
+      assert(s.token(key).durableRevision===before.durableRevision,'failed commit must not advance durable watermark');
+      const refused=await s.appendScroll(row('must wait',3));assert(refused.accepted===false,'storage-paused must refuse new history');
+      const room=new Database(s.file);room.exec('PRAGMA max_page_count=2147483646');room.close();
+      const started=Date.now();while(s.health().storage.status!=='healthy'&&Date.now()-started<4000)await Bun.sleep(25);
+      const recovery=states.find(state=>state.status==='recovering');
+      assert(s.health().storage.status==='healthy','store must recover after space returns');
+      assert(recovery?.retry.batchId===paused.storage.retry.batchId,'recovery must retry the same batch id');
+      assert(s.readPage(s.token(key),0,10).lines.map(line=>line.text).join('|')==='durable|'+large,'retry must make the admitted batch durable exactly once');
+     } else if(name.startsWith('S2 ')) {
       const blank=g=>({grapheme:g,width:1,continuation:false,fg:'default',bg:'default',style:0});
       const pad=cells=>{while(cells.length<120)cells.push(blank(' '));return {text:cells.filter(c=>!c.continuation).map(c=>c.grapheme).join(''),cells};};
       const text=(t,fg='default',style=0)=>[...t].map(g=>({...blank(g),fg,style}));
@@ -986,6 +1008,7 @@ test('I2 FIX1 mutations: each repaired finding has an oracle that goes red when 
 test('I2 FIX2 mutations: null evidence, uncertain rows, history-only calibration and oversize counting each go red when removed',()=>runI2Mutations(I2_FIX2_MUTATIONS,'I2_FIX2_MUTATIONS'),180000);
 test('I4 FIX1 S mutations: capture payload, swallowed metadata hash and durable screen each go red',()=>runI2Mutations(I4_FIX1_S_MUTATIONS,'I4_FIX1_S_MUTATIONS'),180000);
 test('SWITCHON S2 mutations: per-cell JSON, unsealed lines, a dropped hidden bit and a v3 header each go red',()=>runI2Mutations(S2_MUTATIONS,'S2_MUTATIONS'),180000);
+test('F1-S mutations: early watermark, discarded retry and admission while paused each go red',()=>runI2Mutations(F1_S_MUTATIONS,'F1_S_MUTATIONS'),180000);
 
 test('I2 FIX1 D12 contract probe: late B through E burst beside a borrowing A loses no row (normalRefused = 0)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-i2-d12-')),s=createProjectionStore({historyRoot:root,mode:'create'});
