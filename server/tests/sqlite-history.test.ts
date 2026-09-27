@@ -1130,21 +1130,23 @@ test('S2: D <= 1.5 x R for 6000 certified runtime-shaped rows of one pane',async
  }finally{rmSync(dir,{recursive:true,force:true});}
 },60000);
 
-test('S2: one uncertified row keeps only its own block per-line; every other complete settled block seals',async()=>{
+test('S2: an uncertified block near the head stays per-line alone; far behind it seals and a late certification patches the block',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-s2-seal-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   const rows=Array.from({length:1024},(_,i)=>s2Oracle(i+1));
   for(const [i,row] of rows.entries())await s.appendScroll({...naEvent('',i+1),physicalRow:row});
   const certify=async(ids:number[],id:string)=>s.calibrate({capture:{...naFrame(),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:ids.map(i=>rows[i]!),observedFields:['grapheme'],ambiguousRows:0,result:'exact'},
    expectedRevision:s.token(naKey).revision,checks:ids.map((lineId,k)=>({lineId,captureRow:k})),repairs:[]});
-  await certify(Array.from({length:1024},(_,i)=>i).filter(i=>i!==5),'all-but-5');
+  // Row 5 (block 0, far behind the head) and row 800 (block 768, the newest complete block) stay uncertified.
+  await certify(Array.from({length:1024},(_,i)=>i).filter(i=>i!==5 && i!==800),'bulk');
   s.flush();
-  const blocks=()=>{const db=new Database(s.file,{readonly:true});try{return {blocks:db.query('SELECT first_line_id AS f FROM na_block ORDER BY f').all().map((r:any)=>r.f),tail:(db.query('SELECT count(*) AS n FROM na_line').get() as any).n};}finally{db.close();}};
-  expect(blocks()).toEqual({blocks:[256,512,768],tail:256});
-  await certify([5],'row-5');s.flush();
-  expect(blocks()).toEqual({blocks:[0,256,512,768],tail:0});
+  const state=()=>{const db=new Database(s.file,{readonly:true});try{return {blocks:db.query('SELECT first_line_id AS f FROM na_block ORDER BY f').all().map((r:any)=>r.f),tail:(db.query('SELECT min(line_id) AS lo,count(*) AS n FROM na_line').get() as any)};}finally{db.close();}};
+  expect(state()).toEqual({blocks:[0,256,512],tail:{lo:768,n:256}});
+  await certify([5],'row-5');await certify([800],'row-800');s.flush();
+  expect(state()).toEqual({blocks:[0,256,512,768],tail:{lo:null,n:0}});
   const lines=s.readPage(s.token(naKey),0,1024).lines;
   expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
-  expect(lines[5]!.checkedCaptureId).toBe('row-5');expect(lines[6]!.checkedCaptureId).toStartWith('all-but-5:');
+  expect([lines[5]!.checkedCaptureId,lines[800]!.checkedCaptureId]).toEqual(['row-5','row-800']);
+  expect(lines[6]!.checkedCaptureId).toStartWith('bulk:');
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },60000);

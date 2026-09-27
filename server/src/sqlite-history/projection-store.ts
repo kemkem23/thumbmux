@@ -18,12 +18,15 @@ const ADMIT_MAX=PENDING_MAX-64*1024, CAPACITY_EPISODE_MS=10000;
 const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 // Disk layout (v4). Lines are sealed in aligned blocks of SEAL_LINES
 // ([k*SEAL_LINES,(k+1)*SEAL_LINES)) into one deflated na_block row once every
-// line of the block is settled: certified by a capture, marked
-// evicted-before-check, or SEAL_UNCHECKED_LAG lines behind the pane (past RAM's
-// 4500-line check window). Blocks seal independently, so one uncertified block
-// never holds the rest back. A later change to a sealed line rewrites its
-// block, so a line is never stored twice.
-const SEAL_LINES=256, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=4096, WAL_LIMIT=64*1024;
+// line of the block is settled (certified by a capture, marked
+// evicted-before-check, or SEAL_UNCHECKED_LAG lines behind the pane, past RAM's
+// 4500-line check window), or once the whole block is SEAL_LAG lines behind the
+// pane head. Blocks seal independently, so one uncertified block never holds
+// the rest back. A later change to a sealed line (a certification arriving
+// after SEAL_LAG) rewrites its block, so a line is never stored twice.
+// 2 KiB pages keep a typical line in its page (WITHOUT ROWID local limit
+// ~488 B) while halving each WAL frame and the fixed per-table pages.
+const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   /** RAM working-set cap; defaults to 256 MiB. Tests lower it to reach the cap with real rows. */
@@ -95,7 +98,7 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
       sum(check_state=0 AND check_reason<>1 AND line_id>=?) AS open FROM na_line WHERE pane_no=? GROUP BY b`).all(next-SEAL_UNCHECKED_LAG,p.pane_no) as SqlRow[];
     for(const g of groups) {
       const from=Number(g.b)*SEAL_LINES;
-      if(Number(g.n)!==SEAL_LINES || Number(g.open)!==0 || from+SEAL_LINES>next)continue;
+      if(Number(g.n)!==SEAL_LINES || from+SEAL_LINES>next || (Number(g.open)!==0 && from+SEAL_LINES>next-SEAL_LAG))continue;
       const rows=prepared(disk,'SELECT * FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<? ORDER BY line_id').all(p.pane_no,from,from+SEAL_LINES) as SqlRow[];
       prepared(disk,'INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,?,?,?)')
         .run(p.pane_no,from,SEAL_LINES,Math.max(...rows.map(r=>Number(r.revision))),encodeBlock(rows.map(blockLine)));
@@ -139,7 +142,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       parentPort!.off('message',onMessage);parentPort!.close();return;
     }
     try {
-      const timing=commitBatch(disk,workerData.fence,batch,undefined,++commits%20===0);
+      const timing=commitBatch(disk,workerData.fence,batch,undefined,++commits%CHECKPOINT_COMMITS===0);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
       Atomics.store(signal,0,1);
     }
