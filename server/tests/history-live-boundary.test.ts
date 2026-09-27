@@ -354,11 +354,12 @@ test("SWITCHON P: statistics rings keep at most the newest samples and drop old 
 
 test("SWITCHON P: RAM frames encode each unchanged row once and still round-trip exactly", () => {
   const cols = 12;
-  const row = (runs: Array<[string, string, number, string]>) => parserRowCells(runs, cols);
+  const row = (runs: Array<[string, string, number, string | string[]]>) => parserRowCells(runs, cols);
   const cells = [
-    row([["index:1", "default", 1, "bold"], ["rgb:1,2,3", "index:200", 0, " 漢😀"]]),
-    row([["default", "default", 8 | 2, "hidden dim"]]),
-    row([["default", "index:4", 0, "ไทย  "]]),
+    // Wide cells as the worker sends them: one entry per terminal cell, "" for the continuation.
+    row([["red", "default", 1, "bold"], ["0a0b0c", "brightblue", 0, [" ", "漢", "", "😀", ""]]]),
+    row([["default", "default", 8 | 2, "strike italics"]]),
+    row([["default", "blue", 0, "ไทย  "]]),
     new Array(cols).fill(BLANK_CELL),
   ];
   const frame = { paneKey: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, sourceEpoch: 1, geometryGeneration: 0, receiveSeq: 1,
