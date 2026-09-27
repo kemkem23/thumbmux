@@ -51,6 +51,7 @@ import {
   verifyPipeVtAssets,
   type PipeVtFault,
   type PipeVtRow,
+  type PipeVtUpdate,
 } from "../src/pipe-vt-worker";
 
 let roots: string[] = [];
@@ -1383,6 +1384,43 @@ for (const [name, before, after] of [
   console.log(`FIX2-T mutation ${name}: clean=PASS damaged=DETECTED (real multiplex Python)`);
 }, 20_000);
 
+for (const mutation of ["drop-final-frame", "skip-dedicated-q-ack"] as const) test(
+  `F1-Q mutation ${mutation}: clean passes and damaged dedicated parser is detected`, async () => {
+    const assert = (await import("node:assert/strict")).default;
+    const root = mkdtempSync(join(tmpdir(), "f1q-dedicated-mutation-")); roots.push(root);
+    const original = pipeVtAssets();
+    const source = readFileSync(original.worker, "utf8");
+    const qBranch = '    elif kind == b"Q":\n        return worker, True';
+    const qAck = '    send(b"B", {"workerEof": True})\n\n\nif __name__ == "__main__":';
+    const damaged = mutation === "drop-final-frame"
+      ? source.replace(qBranch, '    elif kind == b"Q":\n        worker.scrolls = []\n        worker.screen.dirty.clear()\n        worker.full = False\n        worker.emitted_seq = worker.seq_to\n        return worker, True')
+      : source.replace(qAck, '    send(b"B", {"workerEof": False})\n\n\nif __name__ == "__main__":');
+    expect(damaged).not.toBe(source);
+
+    async function witness(mutated: boolean) {
+      const dir = join(root, mutated ? "damaged" : "clean"); mkdirSync(dir);
+      const assets = pipeVtAssets(dir);
+      writeFileSync(assets.worker, mutated ? damaged : source);
+      writeFileSync(assets.vendor, readFileSync(original.vendor));
+      writeFileSync(assets.license, readFileSync(original.license));
+      const updates: PipeVtUpdate[] = [];
+      const worker = new PipeVtWorker({ assets, cols: 80, rows: 3, onFault: () => {},
+        onUpdate: (update) => { updates.push(update); } });
+      await worker.start();
+      assert.equal(worker.feed(1, encoder.encode("MUTATION-FINAL")), true);
+      const receipt = await worker.close(1_000);
+      assert.equal(updates.at(-1)?.seqTo, 1, "Q must preserve the final parser update");
+      assert.equal(rowText(updates.at(-1)!.frame.dirty["0"]!).trimEnd(), "MUTATION-FINAL");
+      assert.deepEqual(receipt, { workerEof: true, outputDrained: true, issues: [], unknownTail: false },
+        "close must wait for the ordered Q acknowledgement");
+    }
+
+    await witness(false);
+    await assert.rejects(witness(true), { name: "AssertionError" });
+    console.log(`F1-Q mutation ${mutation}: clean=PASS damaged=DETECTED`);
+  }, 20_000,
+);
+
 test("I1 profile hot 20k rows/s alongside twenty normal panes", async () => {
   const result = await measureRound({ name: "I1-hot", panes: 21, cols: 80, rows: 24,
     rate: 100, hotRate: 20_000, seconds: 10, rounds: 1, baseline: false, idleSeconds: 0, warmupSeconds: 1 }, 1, true);
@@ -2037,6 +2075,18 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
       .toEqual(fixLines("D", 80).slice(0, 80 + 1 - 3));
   });
 
+  test("F1-Q dedicated worker emits the final frame, acknowledges Q, then reaches EOF", async () => {
+    const updates: PipeVtUpdate[] = [];
+    const worker = new PipeVtWorker({ cols: 80, rows: 3, onFault: () => {},
+      onUpdate: (update) => { updates.push(update); } });
+    await worker.start();
+    expect(worker.feed(1, encoder.encode("FINAL-WITHOUT-SETTLE"))).toBe(true);
+    const receipt = await worker.close(5_000);
+    expect(updates.at(-1)?.seqTo).toBe(1);
+    expect(rowText(updates.at(-1)!.frame.dirty["0"]!).trimEnd()).toBe("FINAL-WITHOUT-SETTLE");
+    expect(receipt).toEqual({ workerEof: true, outputDrained: true, issues: [], unknownTail: false });
+  });
+
   test("I4-T consumer timeout returns an unknown sequence tail", async () => {
     const pane = await collectPane(80, 3, { closeTimeoutMs: 50, ports: {
       onScroll: () => new Promise(() => {}), onFrame: () => {}, onFault: (f) => { pane.faults.push(f); },
@@ -2048,6 +2098,20 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
     expect(receipt.unknownTail).toBe(true);
     expect(receipt.issues.join(" ")).toContain("remaining updates dropped");
     expect(pane.faults.some((f) => f.kind === "shutdown-timeout" && f.lostRows === "unknown")).toBe(true);
+  }, 15_000);
+
+  test("F1-Q consumer rejection returns an explained incomplete receipt", async () => {
+    const pane = await collectPane(80, 3, { ports: {
+      onScroll: () => ({ accepted: false, reason: "schema-violation" }),
+      onFrame: () => {}, onFault: (fault) => { pane.faults.push(fault); },
+    } });
+    pane.collector.ingest(encoder.encode("A\r\nB\r\nC\r\nD\r\n"));
+    await untilFix1(() => pane.faults.some((fault) => fault.kind === "consumer-rejected"));
+    const receipt = await pane.collector.close();
+    expect(receipt.unknownTail).toBe(true);
+    expect(receipt.lastAckedSequence).toBeLessThan(receipt.lastAdmittedSequence);
+    expect(receipt.issues.join(" ")).toContain("collector acknowledged");
+    expect(await pane.collector.close()).toEqual(receipt);
   }, 15_000);
 
   test("C-F4 resize and full-frame requests are admitted while the data queue is full", async () => {

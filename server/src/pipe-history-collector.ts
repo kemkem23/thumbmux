@@ -243,6 +243,7 @@ export class PipeHistoryCollector {
   private pressureEpisode = false;
   private pressureRetries = 0;
   private oversizeDrops = 0;
+  private closePromise: Promise<PipeCollectorDrainReceipt> | null = null;
 
   constructor(private readonly options: PipeHistoryCollectorOptions) {
     this.paneKey = options.paneKey;
@@ -481,24 +482,32 @@ export class PipeHistoryCollector {
     this.hostHandleNs = 0n;
   }
 
-  async close(): Promise<PipeCollectorDrainReceipt> {
-    if (this.healthState === "closed") return this.shutdownReceipt(["collector was already closed"]);
+  close(): Promise<PipeCollectorDrainReceipt> {
+    if (this.closePromise) return this.closePromise;
     this.closing = true;
-    await this.recovering;
-    const worker = await this.worker.close(this.options.closeTimeoutMs);
-    this.healthState = "closed";
-    for (const waiter of this.drainWaiters.splice(0)) waiter();
-    return this.shutdownReceipt(worker.issues, worker.unknownTail);
+    return this.closePromise = (async () => {
+      await this.recovering;
+      const worker = await this.worker.close(this.options.closeTimeoutMs);
+      this.healthState = "closed";
+      for (const waiter of this.drainWaiters.splice(0)) waiter();
+      return this.shutdownReceipt(worker.issues, worker.unknownTail);
+    })();
   }
 
   private shutdownReceipt(issues: string[], workerUnknown = false): PipeCollectorDrainReceipt {
+    const receiptIssues = [...issues];
+    if (this.ackedSeq !== this.receiveSeq) {
+      receiptIssues.push(`collector acknowledged ${this.ackedSeq} of ${this.receiveSeq} admitted sequences`);
+    }
+    if (this.inflightBytes !== 0) receiptIssues.push(`collector retained ${this.inflightBytes} unacknowledged bytes`);
+    if (this.held.length !== 0) receiptIssues.push(`collector retained ${this.held.length} recovery deliveries`);
     return {
       lastAdmittedSequence: this.receiveSeq,
       lastAckedSequence: this.ackedSeq,
       ramRevision: null,
       durableRevision: null,
-      issues: [...issues],
-      unknownTail: workerUnknown || this.ackedSeq !== this.receiveSeq || this.inflightBytes !== 0 || this.held.length !== 0,
+      issues: receiptIssues,
+      unknownTail: workerUnknown || receiptIssues.length > 0,
     };
   }
 
