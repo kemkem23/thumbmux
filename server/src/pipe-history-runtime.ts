@@ -420,6 +420,12 @@ const clampCursor = (cursor: { x: number; y: number; visible: boolean }, cols: n
   x: Math.max(0, Math.min(cols - 1, cursor.x)), y: Math.max(0, Math.min(rows - 1, cursor.y)), visible: cursor.visible,
 });
 
+/** A store answer already settled as a refusal (read without awaiting it; Bun only). */
+function refusedAlready(answer: Promise<ProjectionAdmission>): boolean {
+  const peek = (globalThis as { Bun?: { peek?: ((p: unknown) => unknown) & { status?: (p: unknown) => string } } }).Bun?.peek;
+  return peek?.status?.(answer) === 'fulfilled' && isProjectionRefusal(peek(answer));
+}
+
 /** tmux's screen (capture-pane -p -e -N) as bytes that paint it on a fresh parser. */
 function seedBytes(raw: string, meta: PaneTmuxMeta): Uint8Array {
   const lines = raw.split('\n');
@@ -477,6 +483,8 @@ export class PipeHistoryPane {
   private pendingIssues: Array<{ kind: string; reason: string; missingCount: number | null; recoverable: boolean }> = [];
   /** Storage-fault marker shown while the store cannot write (see StorageOverlay). */
   private overlay: ProjectionIssue | null = null;
+  /** Pending seed→pipe gap marker (see armSeedGap). */
+  private seedGap: { base: number; rows: number; seen: number } | null = null;
   readonly stats: PaneStats = {
     received: 0, published: 0, latencyMs: [], captures: 0, captureFaults: 0, captureConflicts: 0,
     screenCalibrations: 0, storeCommits: 0, skippedCommits: 0, notReady: 0, captureIntervalMaxMs: 0, captureAt: [], faults: {},
@@ -547,6 +555,7 @@ export class PipeHistoryPane {
    */
   seed(raw: string, meta: PaneTmuxMeta): void {
     if (this.received > 0) throw new Error('seed after pipe bytes');
+    this.armSeedGap(meta);
     this.ingest(seedBytes(raw, meta));
   }
   /**
@@ -555,7 +564,32 @@ export class PipeHistoryPane {
    * reset parser receives tmux's current screen before the first pipe byte.
    */
   reseed(raw: string, meta: PaneTmuxMeta): void {
+    this.armSeedGap(meta);
     this.ingest(seedBytes(raw, meta));
+  }
+
+  /**
+   * Output between the seed capture and the pipe start is never journaled.
+   * On a normal screen the seed's rows above the cursor are complete and
+   * scroll first; the first pipe byte lands on the cursor row. So the unknown
+   * run sits exactly `cursor.y` rows after the pane's next line id at seed
+   * time: the marker is placed there, just before that row is offered, not at
+   * the seed's first row (where it would sit before rows that were kept).
+   */
+  private armSeedGap(meta: PaneTmuxMeta): void {
+    const rows = meta.alternate ? 0 : clampCursor(meta.cursor, meta.cols, meta.rows).y;
+    this.seedGap = rows > 0 ? { base: this.tokenOrNull()?.nextLineId ?? 0, rows, seen: 0 } : null;
+  }
+  private recordSeedGap(gap: { base: number; rows: number }, event: PipeScrollEvent): void {
+    const reason = 'output between the seed capture and the pipe start is not journaled';
+    this.runtime.emit({ paneKey: this.paneKey, session: this.session, kind: 'seed-gap', at: this.runtime.now(), message: reason, missingCount: null });
+    const token = this.tokenOrNull();
+    if (!token) return;
+    this.runtime.store.recordIssue({
+      paneKey: this.paneKey, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration,
+      expectedRevision: token.revision, kind: 'seed-gap', reason, missingCount: null,
+      boundaryLineId: gap.base + gap.rows, recoverable: true,
+    }).then(receipt => this.notify({ source: 'issue', revision: receipt.revision }), () => { this.bump('seed-gap-unrecorded'); });
   }
 
   // ── collector ports ──
@@ -571,10 +605,14 @@ export class PipeHistoryPane {
     if (event.sourceEpoch !== this.scrollSeqEpoch) { this.scrollSeqEpoch = event.sourceEpoch; this.scrollSeq = 0; }
     const receiveSeq = Math.max(this.scrollSeq, event.receiveSeq);
     this.scrollSeq = receiveSeq;
+    const gap = this.seedGap;
+    if (gap && gap.seen >= gap.rows) { this.seedGap = null; this.recordSeedGap(gap, event); }
     const answer = this.runtime.store.appendScroll({
       paneKey: this.paneKey, sourceEpoch: event.sourceEpoch, geometryGeneration: event.geometryGeneration,
       physicalRow: toPhysicalRow(cells), softWrap: event.softWrap, receiveSeq,
     });
+    // A row refused for pressure is offered again: count each seeded row once.
+    if (this.seedGap && !refusedAlready(answer)) this.seedGap.seen++;
     // Observe the receipt without replacing it: the collector still reads the
     // store's own promise for pressure / oversize decisions.
     answer.then(receipt => {
@@ -737,6 +775,8 @@ export class PipeHistoryPane {
         // marker; recapture now so the screen follows tmux, not an empty parser.
         this.bump(event.kind);
         this.screens = {};
+        // A reseed arms its own gap after this reset; a parser restart loses the seeded screen.
+        if (event.kind === 'worker-restarted') this.seedGap = null;
         this.runtime.emit({ paneKey: this.paneKey, session: this.session, kind: event.kind, at: event.at, message: event.message, missingCount: null, receiveSeqFrom: event.receiveSeqFrom, receiveSeqTo: event.receiveSeqTo });
         this.calibrator?.event('fault');
         return;
