@@ -10,10 +10,89 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { assertContractFixturePort } from "../contract/fixtures/runtime-guard";
 
 const roots: string[] = [];
 const runner = resolve(import.meta.dir, "contract-fixtures.sh");
+
+// Parse source only; never execute the runner or its tmux lifecycle.
+function parseRunnerSource(source: string) {
+  const parsed = spawnSync("/usr/bin/python3", ["-B", "-I", "-S", "-c", `
+import json, runpy, sys
+parser = runpy.run_path(sys.argv[1])
+source = sys.stdin.read()
+shell = parser["Shell"](source)
+statements = list(shell.commands())
+def token(word):
+    value = "".join(value for kind, value in word) if all(kind == "literal" for kind, _ in word) else None
+    return {"value": value, "start": word.start, "end": word.end}
+print(json.dumps({
+    "commands": list(parser["command_argv"](source)),
+    "statements": [[token(word) for word in words] for words in statements],
+    "words": [token(word) for _, _, words in shell.recorded_commands for word in words],
+}))
+`, resolve(import.meta.dir, "../../../ops/testing/tests/command-cage-wiring.py")], {
+    input: source, encoding: "utf8",
+  });
+  expect(parsed.status).toBe(0);
+  return JSON.parse(parsed.stdout) as {
+    commands: (string | null)[][];
+    statements: { value: string | null; start: number; end: number }[][];
+    words: { value: string | null; start: number; end: number }[];
+  };
+}
+
+function assertPrivateTmuxReadyAfterLock(source: string) {
+  const { statements, words } = parseRunnerSource(source);
+  const locks = statements.filter((statement) =>
+    JSON.stringify(statement.map((word) => word.value)) === JSON.stringify(["if", "!", "flock", "-n", "9"]),
+  );
+  expect(locks).toHaveLength(1);
+  const lockIndex = statements.indexOf(locks[0]);
+  // Pin the failure branch through its closing fi: after flock alone is not
+  // enough, since setting readiness inside that branch still affects losers.
+  expect(statements.slice(lockIndex + 1, lockIndex + 5).map((statement) =>
+    statement.map((word) => word.value),
+  )).toEqual([
+    ["then"],
+    ["echo", null],
+    ["exit", "1"],
+    ["fi"],
+  ]);
+  const successPosition = statements[lockIndex + 4][0].end;
+  const readyAssignments = words.filter((word) => word.value === "PRIVATE_TMUX_READY=1");
+  expect(readyAssignments.length).toBeGreaterThan(0);
+  for (const assignment of readyAssignments) {
+    expect(assignment.start).toBeGreaterThan(successPosition);
+  }
+}
+
+// svelte-check receives a tsconfig, not a .svelte positional argument: prove
+// both copies feed that command, then prove the config selects the copied file.
+function assertSemanticProbeInput(source: string, config: string, parentConfig: string) {
+  const { commands } = parseRunnerSource(source);
+  const inputChain = [
+    ["cp", "<SCRIPT_DIR>/contract-app-host-probe.svelte", "src/ContractProbe.svelte"],
+    ["cp", "<SCRIPT_DIR>/contract-app-host-tsconfig.json", "contract-app-host-tsconfig.json"],
+    ["./node_modules/.bin/svelte-check", "--tsconfig", "./contract-app-host-tsconfig.json", "--fail-on-warnings"],
+  ];
+  expect(commands.some((_, index) => inputChain.every((argv, offset) =>
+    JSON.stringify(commands[index + offset]) === JSON.stringify(argv),
+  ))).toBe(true);
+  const selected = JSON.parse(config);
+  // The frozen parent has a leading license comment; no other JSONC is needed.
+  const parent = JSON.parse(parentConfig.replace(/^\s*\/\*[\s\S]*?\*\//, ""));
+  expect(selected.extends).toBe("./tsconfig.json");
+  expect(parent.extends).toBeUndefined();
+  for (const settings of [parent, selected]) {
+    expect(settings.exclude ?? []).toEqual([]);
+  }
+  expect(Array.isArray(selected.include)).toBe(true);
+  expect(selected.include.some((pattern: string) =>
+    new Bun.Glob(pattern).match("src/ContractProbe.svelte"),
+  )).toBe(true);
+}
 
 function untrustedHostEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env = { ...process.env } as Record<string, string>;
@@ -84,6 +163,33 @@ describe("frozen consumer runner policy", () => {
     expect(source).toContain("svelte-check");
     expect(source).toContain("contract-app-host-probe.svelte");
     expect(readFileSync(probe, "utf8")).toContain("<ThumbmuxApp {adapters} />");
+    assertSemanticProbeInput(
+      source,
+      readFileSync(resolve(import.meta.dir, "contract-app-host-tsconfig.json"), "utf8"),
+      readFileSync(resolve(import.meta.dir, "../contract/fixtures/app-host/tsconfig.json"), "utf8"),
+    );
+  });
+
+  test("semantic probe input rejects unrelated checks and excluded probe files", () => {
+    const source = readFileSync(runner, "utf8");
+    const config = readFileSync(resolve(import.meta.dir, "contract-app-host-tsconfig.json"), "utf8");
+    const parent = readFileSync(resolve(import.meta.dir, "../contract/fixtures/app-host/tsconfig.json"), "utf8");
+    const unrelated = source.replace(
+      /\.\/node_modules\/\.bin\/svelte-check \\\n\s*--tsconfig \.\/contract-app-host-tsconfig\.json \\\n\s*--fail-on-warnings/,
+      "./node_modules/.bin/svelte-check unrelated.svelte\n# contract-app-host-probe.svelte is not checked",
+    );
+    expect(unrelated).not.toBe(source);
+    expect(() => assertSemanticProbeInput(unrelated, config, parent)).toThrow();
+    const commentedCopy = source.replace(
+      '      cp "$SCRIPT_DIR/contract-app-host-probe.svelte" src/ContractProbe.svelte',
+      '      # cp "$SCRIPT_DIR/contract-app-host-probe.svelte" src/ContractProbe.svelte',
+    );
+    expect(commentedCopy).not.toBe(source);
+    expect(() => assertSemanticProbeInput(commentedCopy, config, parent)).toThrow();
+    expect(() => assertSemanticProbeInput(source,
+      JSON.stringify({ ...JSON.parse(config), include: ["type-contract.ts"] }), parent)).toThrow();
+    expect(() => assertSemanticProbeInput(source,
+      JSON.stringify({ ...JSON.parse(config), exclude: ["src/**/*.svelte"] }), parent)).toThrow();
   });
 
   test("runner uses an atomic tmux-namespace lock and never sweeps sessions", () => {
@@ -109,6 +215,29 @@ describe("frozen consumer runner policy", () => {
     expect(cleanup).toContain("/usr/bin/mv --no-copy -n -T");
     expect(cleanup).toContain("original_socket_identity");
     expect(source).not.toContain("tmux kill-session");
+  });
+
+  test("every private tmux readiness assignment follows successful lock acquisition", () => {
+    assertPrivateTmuxReadyAfterLock(readFileSync(runner, "utf8"));
+  });
+
+  test("lock ordering rejects early, duplicate, and failure-branch readiness", () => {
+    const source = readFileSync(runner, "utf8");
+    const assignment = "PRIVATE_TMUX_READY=1\n";
+    const withoutReady = source.replaceAll(assignment, "");
+    const lock = 'exec 9>"$LOCK_FILE"';
+    const failure = '  echo "contract fixtures: another runner owns $LOCK_FILE"';
+    const mutants = [
+      withoutReady.replace(lock, assignment + lock),
+      source.replace(lock, assignment + lock),
+      withoutReady.replace(failure, "  " + assignment + failure),
+      withoutReady,
+    ];
+    for (const mutant of mutants) {
+      expect(mutant).not.toBe(source);
+      expect(() => assertPrivateTmuxReadyAfterLock(mutant)).toThrow();
+    }
+    assertPrivateTmuxReadyAfterLock("# PRIVATE_TMUX_READY=1\n" + source);
   });
 
   test("consumer runtime gate binds the exact admitted Bun and Node PATH", () => {

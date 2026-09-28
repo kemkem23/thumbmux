@@ -347,3 +347,852 @@ test('stopAndDrain finishes an admitted capture before closing admission',async(
   expect(f.store.session(sid).next_line).toBe(40);await expect(co.probe(sid)).rejects.toThrow('coordinator-stopped');
  }finally{await f.cleanup();}
 });
+
+// NEWARCH-L1: v2 tests are additive; all v1 assertions above stay intact.
+import { mkdtempSync, rmSync, symlinkSync, linkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { openProjectionArchive } from '../src/sqlite-history/projection-reader';
+import { PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from '../src/sqlite-history/schema';
+import { PROJECTION_OVERSIZE } from '../src/sqlite-history/types';
+import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell } from '../src/sqlite-history/types';
+const naKey:PaneKey={serverIdentity:'fixture-server',paneId:'%1',birthGeneration:1};
+const naCell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+const naRow=(text:string):PhysicalRow=>({text,cells:[...text].map(naCell)});
+const naEvent=(text:string,receiveSeq:number,paneKey=naKey)=>({paneKey,sourceEpoch:1,geometryGeneration:1,physicalRow:naRow(text),softWrap:false,receiveSeq});
+const naFrame=()=>({paneKey:naKey,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:2,rows:1,kind:'normal' as const,cells:[[naCell('A'),naCell(' ')]],cursor:{row:0,col:0,visible:true}});
+
+test('newarch v4: metadata-only schema, new-file refusal and deny-open path spy',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-path-'));let opens=0;
+ try {
+  const store=createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++});
+  await store.appendScroll(naEvent('one',1));store.flush();await store.close();
+  const db=new Database(join(dir,'newarch-v3/history.sqlite3'),{readonly:true});
+  expect(db.query('PRAGMA user_version').get()).toEqual({user_version:4});
+  expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(6);
+  expect(db.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
+  expect(db.query('PRAGMA journal_mode').get()).toEqual({journal_mode:'wal'});db.close();
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++})).toThrow('new-file-required');
+  for(const name of ['brain.db','brain.db-wal','brain.db-shm','brain.db-journal']) {
+   const fake=join(dir,name);writeFileSync(fake,'forbidden fixture');
+   expect(()=>createProjectionStore({historyRoot:dir,file:fake,mode:'recover',beforeOpen:()=>{opens++;throw Error('deny-open');}})).toThrow('forbidden-database-path');
+  }
+  symlinkSync(join(dir,'newarch-v3'),join(dir,'alias'));
+  expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'alias/new.sqlite'),mode:'create',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
+  linkSync(join(dir,'newarch-v3/history.sqlite3'),join(dir,'hard.sqlite'));
+  expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'hard.sqlite'),mode:'recover',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
+  const v1=join(dir,'old.sqlite');const old=new Database(v1);old.exec('PRAGMA user_version=1');old.close();
+  expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v4');
+  expect(opens).toBe(1);
+  console.log('NA_PATH_PROOF',JSON.stringify({schema:4,migration:'004-newarch-compact-rows',forbiddenSqliteOpens:0,fixtureHash:createHash('sha256').update(JSON.stringify(naEvent('one',1))).digest('hex')}));
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('newarch v3: atomic CAS, exact checked receipt, repair, alternate screen and stale pages',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-cas-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('wrong',1));await s.appendScroll(naEvent('',2));
+  await s.replaceScreen(naFrame());const old=s.token(naKey);
+  const capture:ProjectionCapture={...naFrame(),receiveSeq:2,captureId:'cap-1',requestedAt:1,completedAt:2,firstHistoryRow:0,
+    history:[naRow('right'),naRow('')],observedFields:['grapheme','style','cursor'],ambiguousRows:0,result:'exact'};
+  // The strict CAS belongs to screen evidence (FIX2 M2); history-only is covered by the FIX2 M2 case.
+  const quietCas={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2};
+  await expect(s.calibrate({capture,captureEvidence:quietCas,expectedRevision:old.revision-1,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  await expect(s.calibrate({capture,expectedRevision:old.revision,checks:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
+  expect(s.token(naKey)).toEqual(old);
+  const receipt=await s.calibrate({capture,captureEvidence:{kind:'quiescent',sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2},expectedRevision:old.revision,checks:[{lineId:1,captureRow:1}],repairs:[{lineId:0,captureRow:0,physicalRow:naRow('right')}]});
+  expect(receipt.durableRevision).toBe(0);expect(receipt.nextLineId).toBe(2);
+  expect(()=>s.readPage(old,null,2)).toThrow('page-retry');
+  let rows=s.readPage(s.token(naKey),null,2).lines;
+  expect(rows.map(r=>r.text)).toEqual(['right','']);expect(rows.every(r=>r.checkState==='checked'&&r.checkedCaptureId==='cap-1')).toBe(true);
+  expect(s.screen(naKey)?.display_source).toBe('tmux-calibrated');
+  await s.replaceScreen({...naFrame(),kind:'alternate'});expect(s.token(naKey).nextLineId).toBe(2);
+  expect(s.screen(naKey,'normal')?.last_capture_id).toBe('cap-1');
+  expect(s.screen(naKey,'alternate')?.display_source).toBe('pipe');
+  s.flush();expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
+  await s.close();const recovered=createProjectionStore({historyRoot:dir,mode:'recover'});
+  try{rows=recovered.readPage(recovered.token(naKey),null,2).lines;expect(rows.map(r=>r.checkedCaptureId)).toEqual(['cap-1','cap-1']);expect(rows.map(r=>r.text)).toEqual(['right','']);}finally{await recovered.close();}
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('newarch v3: 100ms flush, byte threshold, idempotent post-commit retry, epoch isolation',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-flush-'));let fail=false;const ids:string[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',checkpoint:(phase,id)=>{if(phase==='after-disk-commit'){ids.push(id);if(fail){fail=false;throw Error('watermark fault');}}}});
+ try {
+  await s.appendScroll(naEvent('timer',1));expect(s.token(naKey).durableRevision).toBe(0);
+  const start=Date.now();while(s.token(naKey).durableRevision===0 && Date.now()-start<500)await Bun.sleep(5);
+  expect(s.token(naKey).durableRevision).toBe(1);expect(s.health().lastFlushAgeMs).toBeLessThanOrEqual(150);
+  const large='x'.repeat(270000);await s.appendScroll({...naEvent('',2),physicalRow:{text:large,cells:[]}});
+  const thresholdStart=Date.now();while(s.token(naKey).durableRevision<2&&Date.now()-thresholdStart<500)await Bun.sleep(5);
+  expect(s.token(naKey).durableRevision).toBe(2);
+  await s.appendScroll(naEvent('retry',3));fail=true;
+  expect(()=>s.flush()).toThrow('watermark fault');expect(s.token(naKey).durableRevision).toBe(2);expect(s.health().status).toBe('degraded');
+  const retryId=ids.at(-1);s.flush();expect(ids.filter(id=>id===retryId).length).toBe(2);expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
+  await s.appendScroll({...naEvent('new epoch',4),sourceEpoch:2});s.flush();
+  const page=s.readPage(s.token(naKey),null,10);expect(page.lines.map(r=>r.sourceEpoch)).toEqual([1,1,1,2]);
+  const db=new Database(s.file,{readonly:true});expect(db.query('SELECT count(*) AS n FROM na_line').get()).toEqual({n:4});
+  expect(db.query("SELECT count(*) AS n FROM na_issue WHERE kind='gap' AND missing_count IS NULL").get()).toEqual({n:1});db.close();
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('F1-S: real SQLITE_FULL pauses admission, keeps one batch id and recovers on 1s backoff without advancing watermark',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-f1s-full-'));const states:any[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
+ try {
+  await s.appendScroll(naEvent('durable',1));s.flush();const durable=s.token(naKey);
+  const disk=(s as any).disk as Database;const pages=Number((disk.query('PRAGMA page_count').get() as any).page_count);
+  disk.exec(`PRAGMA max_page_count=${pages}`);
+  const large='x'.repeat(512*1024);
+  await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
+  expect(()=>s.flush()).toThrow();
+  const paused=s.health();
+  expect(paused.storage).toMatchObject({status:'storage-paused',unknownTail:true,retry:{attempt:1,result:'failed'}});
+  expect(paused.storage.retry.batchId).not.toBeNull();
+  expect(s.token(naKey).durableRevision).toBe(durable.durableRevision);
+  expect(await s.appendScroll(naEvent('must wait',3))).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  await Bun.sleep(250);
+  expect(states.filter(state=>state.status==='storage-paused')).toHaveLength(1);
+  disk.exec('PRAGMA max_page_count=2147483646');
+  const started=Date.now();while(s.health().storage.status!=='healthy' && Date.now()-started<4000)await Bun.sleep(25);
+  const recovered=s.health();expect(recovered.storage.status).toBe('healthy');
+  expect(s.token(naKey).durableRevision).toBe(s.token(naKey).revision);
+  const recovery=states.find(state=>state.status==='recovering');
+  expect(recovery.retry.batchId).toBe(paused.storage.retry.batchId);
+  expect(recovery.eventId).toBe(paused.storage.eventId);
+  expect(s.readPage(s.token(naKey),0,10).lines.map(line=>line.text)).toEqual(['durable',large]);
+  expect(states.map(state=>state.status)).toEqual(['storage-paused','recovering','healthy']);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},10000);
+
+test('F1-S: close under real SQLITE_FULL cleans resources and reports a durable incomplete watermark',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-f1s-close-full-'));const states:any[]=[];
+ const s=createProjectionStore({historyRoot:dir,mode:'create',onStorageState:state=>states.push(structuredClone(state))});
+ try {
+  await s.appendScroll(naEvent('durable',1));s.flush();
+  const disk=(s as any).disk as Database;const pages=Number((disk.query('PRAGMA page_count').get() as any).page_count);
+  disk.exec(`PRAGMA max_page_count=${pages}`);
+  const large='y'.repeat(512*1024);await s.appendScroll({...naEvent(large,2),physicalRow:{text:large,cells:[]}});
+  const receipt=await s.close();
+  expect(receipt).toMatchObject({drained:false,unknownTail:true,storage:{status:'closed-incomplete',unknownTail:true}});
+  expect(receipt.storage.panes[0].durableRevision).toBeLessThan(receipt.storage.panes[0].revision);
+  expect(states.at(-1).status).toBe('closed-incomplete');
+  const db=new Database(s.file,{readonly:true});
+  expect(db.query('SELECT next_line_id,durable_revision,revision FROM na_pane').get()).toEqual({next_line_id:1,durable_revision:1,revision:1});db.close();
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},10000);
+
+test('newarch v3: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle mutation',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-burst-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const keys=Array.from({length:21},(_,i)=>({...naKey,paneId:`%${i}`}));
+  const jobs=keys.map((key,i)=>s.appendScroll(naEvent(`pane:${i}`,1,key)));await Promise.all(jobs);
+  expect(s.health().panes).toHaveLength(21);
+  for(let i=1;i<20000;i++)await s.appendScroll(naEvent(i%3===0?'':i%3===1?'repeat':`ไทย漢:${i}`,i+1,keys[0]));
+  s.flush();const token=s.token(keys[0]);let anchor:number|null=null;const rows:string[]=[];
+  do{const page=s.readPage(token,anchor,2000);rows.push(...page.lines.map(r=>r.text));anchor=page.hasMore?page.nextAnchor:null;}while(anchor!==null);
+  const oracle=Array.from({length:20000},(_,i)=>i===0?'pane:0':i%3===0?'':i%3===1?'repeat':`ไทย漢:${i}`);
+  expect(rows).toEqual(oracle);
+  for(let i=1;i<21;i++)expect(s.readPage(s.token(keys[i]),null,2).lines.map(r=>r.text)).toEqual([`pane:${i}`]);
+  // Line 710 is sealed into a block (unchecked rows seal 4608 behind the pane);
+  // line 19990 is a per-line tail row, also resident in RAM, so the disk-only archive reader sees its loss.
+  const db=new Database(s.file);
+  expect(db.query('SELECT count(*) AS n FROM na_block WHERE first_line_id<=710 AND first_line_id+line_count>710').get()).toEqual({n:1});
+  db.exec('DELETE FROM na_line WHERE line_id=19990');
+  db.exec('DELETE FROM na_block WHERE first_line_id<=710 AND first_line_id+line_count>710');db.close();
+  expect(()=>s.readPage(token,0,2000)).toThrow('page-seam-hole');
+  const archive=openProjectionArchive(s.file);
+  try {expect(()=>archive.readPage(archive.token(keys[0]),19000,1000)).toThrow('page-seam-hole');}finally{archive.close();}
+  console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,missing:Math.max(0,oracle.length-rows.length),extra:Math.max(0,rows.length-oracle.length),wrong:rows.filter((r,i)=>r!==oracle[i]).length,deletedLine710Detected:true,health:s.health()}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
+
+
+import { encodeCells, decodeCells, EVICT_LINES_SQL } from '../src/sqlite-history/ram-store';
+test('newarch: compact cells preserve every field while restart requires a fresh screen',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-cell-runs-'));
+ const cells:ProjectionCell[]=[{grapheme:'漢',width:2,continuation:false,fg:'#123456',bg:4,style:7},
+   {grapheme:'',width:0,continuation:true,fg:'#123456',bg:4,style:7},naCell('ก้'),naCell(' '),naCell(' ')];
+ expect(decodeCells(encodeCells(cells))).toEqual(cells);
+ expect(decodeCells(JSON.stringify(cells.map(c=>[c,1])))).toEqual(cells);
+ const s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll({...naEvent('row',1),physicalRow:{text:'row',cells}});
+  const frame={...naFrame(),cols:cells.length,cells:[cells]};await s.replaceScreen(frame);s.flush();
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual([cells]);
+  const disk=new Database(s.file,{readonly:true});
+  expect(disk.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
+  expect(disk.query("SELECT name FROM pragma_table_info('na_capture') WHERE name IN ('screen_cells_json','history_cells_json','cells_json','payload_json')").all()).toEqual([]);
+  disk.close();
+  await s.close();const r=createProjectionStore({historyRoot:dir,mode:'recover'});
+  try{expect(r.screen(naKey)).toBeNull();expect(r.readPage(r.token(naKey),null,2).lines[0].cells).toEqual(cells);}finally{await r.close();}
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: queued old writer is fenced before RAM acknowledgement and disk commit',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fence-'));
+ const old=createProjectionStore({historyRoot:dir,mode:'create'});
+ let current:ReturnType<typeof createProjectionStore>|undefined;
+ try {
+  await old.appendScroll(naEvent('durable',1));old.flush();
+  const pending=old.appendScroll(naEvent('old queued',2));
+  current=createProjectionStore({historyRoot:dir,mode:'recover'});
+  await expect(pending).rejects.toThrow('stale-writer');
+  expect(()=>old.flush()).toThrow('stale-writer');
+  await expect(old.close()).rejects.toThrow('stale-writer');
+  await current.appendScroll(naEvent('new writer',2));current.flush();
+  expect(current.readPage(current.token(naKey),null,10).lines.map(r=>r.text)).toEqual(['durable','new writer']);
+ }finally{await old.close();await current?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: eviction query plan seeks the line-id range, never the whole durable revision range',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-evict-plan-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const db=(s as any).ram.db as Database;
+  const plan=(sql:string)=>db.query('EXPLAIN QUERY PLAN '+sql).all('pane',1000,6000) as Array<{detail:string}>;
+  const actual=plan(EVICT_LINES_SQL);
+  console.log('NA_EVICT_PLAN',JSON.stringify({actual}));
+  expect(actual.some(r=>r.detail.includes('PRIMARY KEY')&&r.detail.includes('line_id<?'))).toBe(true);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: admission freezes cell content before caller mutates the original event',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-freeze-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const event=naEvent('AB',1),expected=structuredClone(event.physicalRow),key={...event.paneKey};
+  const pending=s.appendScroll(event);
+  event.physicalRow.text='changed';event.physicalRow.cells[0].grapheme='X';event.paneKey={...key,paneId:'%other'};
+  await pending;s.flush();
+  const line=s.readPage(s.token(key),null,1).lines[0];expect(line.text).toBe(expected.text);expect(line.cells).toEqual(expected.cells);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('newarch: screen generation transitions preserve accepted scroll ordering',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('seed',0));
+  const old=s.appendScroll(naEvent('accepted before resize',1));
+  const resized=s.replaceScreen({...naFrame(),geometryGeneration:2});
+  const latest=s.replaceScreen({...naFrame(),geometryGeneration:2,receiveSeq:3,cells:[[naCell('Z'),naCell(' ')]]});
+  await Promise.all([old,resized,latest]);s.flush();
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toContain('accepted before resize');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('Z');
+  await s.appendScroll({...naEvent('after resize',4),geometryGeneration:2});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('newarch: capacity rejection cannot advance generation past accepted history',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-reject-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const old=s.appendScroll(naEvent('accepted',1));
+  const rejected=s.appendScroll({...naEvent('',2),sourceEpoch:2,geometryGeneration:2,physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}});
+  await expect(rejected).rejects.toThrow('ingest-oversize');await old;s.flush();
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['accepted']);
+  expect(s.health().rejectedRows).toBe(1);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2: issue and monotonic epoch CAS survive reopen with unknown loss and archived rows',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-epoch-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('old',1));
+  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:s.token(naKey).revision,
+   kind:'reader-lost',reason:'unknown bytes after disconnect',missingCount:null,boundaryLineId:1,recoverable:false};
+  await s.recordIssue(issue);
+  await expect(s.transitionEpoch({...issue,nextEpoch:2})).rejects.toThrow('stale-revision');
+  const transition={...issue,expectedRevision:s.token(naKey).revision,nextEpoch:2};
+  await expect(s.transitionEpoch({...transition,nextEpoch:1})).rejects.toThrow('nonmonotonic-epoch');
+  await s.transitionEpoch(transition);
+  await expect(s.appendScroll(naEvent('stale',2))).rejects.toThrow('stale-generation');
+  await s.appendScroll({...naEvent('new',0),sourceEpoch:2});
+  s.flush();expect(s.health().panes[0].status).toBe('degraded');
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  const page=s.readPage(s.token(naKey),null,10);
+  expect(page.lines.map(r=>[r.text,r.sourceEpoch])).toEqual([['old',1],['new',2]]);
+  expect(page.issues).toHaveLength(2);expect(page.issues.every(i=>i.missingCount===null && i.boundaryLineId===1)).toBe(true);
+  expect(s.health().panes[0]).toMatchObject({sourceEpoch:2,status:'degraded'});
+  expect(s.health().panes[0].issues).toEqual(page.issues);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 A-B2/C-F19: quiescent capture calibrates the displayed screen in the same transaction; unfenced or moving captures never do',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fence-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('history',1));await s.replaceScreen(naFrame());
+  const capture:ProjectionCapture={...naFrame(),cells:[[naCell('Z'),naCell(' ')]],captureId:'unfenced',requestedAt:1,completedAt:2,
+   firstHistoryRow:0,history:[naRow('history')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,captureEvidence:{kind:'unfenced',reason:'bytes arrived during capture'},checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(s.screen(naKey)?.display_source).toBe('pipe');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('A');
+  expect(s.readPage(s.token(naKey),null,10).lines[0].checkState).toBe('checked');
+  // Bytes arrived while capturing: the whole calibration rolls back.
+  const token=s.token(naKey);
+  const moving={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:1,receiveSeqAfter:2};
+  await expect(s.calibrate({capture:{...capture,captureId:'moving'},expectedRevision:token.revision,captureEvidence:moving,checks:[],repairs:[]})).rejects.toThrow('capture-not-quiescent');
+  expect(s.token(naKey)).toEqual(token);
+  // A pipe frame after the caller's read is newer than the capture: CAS refuses it.
+  const read=s.token(naKey);await s.replaceScreen({...naFrame(),cells:[[naCell('P'),naCell(' ')]]});
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:3,receiveSeqAfter:3};
+  await expect(s.calibrate({capture:{...capture,captureId:'late'},expectedRevision:read.revision,captureEvidence:quiet,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('P');
+  // No receiveSeq equality with the parser is required (tmux has no byte fence).
+  const receipt=await s.calibrate({capture:{...capture,captureId:'good',receiveSeq:0},expectedRevision:s.token(naKey).revision,captureEvidence:quiet,checks:[],repairs:[]});
+  const shown=s.screen(naKey)!;
+  expect(shown).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'good',revision:receipt.revision});
+  expect(JSON.parse(String(shown.cells_json))[0][0].grapheme).toBe('Z');
+  // Display state is intentionally volatile: restart waits for a fresh frame.
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.screen(naKey)).toBeNull();
+  // The next pipe frame renders over the calibrated screen at once.
+  await s.replaceScreen({...naFrame(),cells:[[naCell('N'),naCell(' ')]]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX2 B1: null evidence checks history without touching the screen; uncertain emoji rows are drawn but kept uncertified',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-b1-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('history',1));await s.replaceScreen({...naFrame(),rows:2,cells:[[naCell('A'),naCell(' ')],[naCell('B'),naCell(' ')]]});
+  const capture:ProjectionCapture={...naFrame(),rows:2,cells:[[naCell('Z'),naCell(' ')],[naCell('Y'),naCell(' ')]],captureId:'null-evidence',requestedAt:1,completedAt:2,
+   firstHistoryRow:0,history:[naRow('history')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  // I3 sends null when bytes moved during the capture: history only, no error.
+  const before=s.token(naKey);
+  const receipt=await s.calibrate({capture,expectedRevision:before.revision,captureEvidence:null,checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(receipt.revision).toBe(before.revision+1);
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null,uncertain_rows_json:'[]'});
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[1][0].grapheme).toBe('B');
+  expect(s.readPage(s.token(naKey),null,10).lines[0]).toMatchObject({checkState:'checked',checkedCaptureId:'null-evidence'});
+  // Quiescent with an uncertain emoji row: the whole capture is drawn, the row index is kept apart.
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:4,receiveSeqAfter:4};
+  const bad=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'bad-row'},expectedRevision:bad.revision,captureEvidence:{...quiet,uncertainRows:[2]},checks:[],repairs:[]})).rejects.toThrow('invalid-uncertain-rows');
+  expect(s.token(naKey)).toEqual(bad);
+  await s.calibrate({capture:{...capture,captureId:'emoji'},expectedRevision:bad.revision,captureEvidence:{...quiet,uncertainRows:[1,1]},checks:[],repairs:[]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'tmux-calibrated',last_capture_id:'emoji',uncertain_rows_json:'[1]'});
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json)).map((r:any)=>r[0].grapheme)).toEqual(['Z','Y']);
+  // Evidence without the optional field is the plain quiescent shape: nothing uncertain.
+  await s.calibrate({capture:{...capture,captureId:'plain'},expectedRevision:s.token(naKey).revision,captureEvidence:quiet,checks:[],repairs:[]});
+  expect(s.screen(naKey)).toMatchObject({last_capture_id:'plain',uncertain_rows_json:'[]'});
+  await s.calibrate({capture:{...capture,captureId:'emoji2'},expectedRevision:s.token(naKey).revision,captureEvidence:{...quiet,uncertainRows:[0]},checks:[],repairs:[]});
+  // The receipt is durable but the screen is not; a fresh pipe frame restores readiness.
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.screen(naKey)).toBeNull();
+  await s.replaceScreen({...naFrame(),rows:2,cells:[[naCell('N'),naCell(' ')],[naCell('M'),naCell(' ')]]});
+  expect(s.screen(naKey)).toMatchObject({display_source:'pipe',last_capture_id:null,uncertain_rows_json:'[]'});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX2 M2: a history-only calibration is not refused for queued rows or a moved revision; screen evidence still is',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-m2-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('stable',1));
+  const read=s.token(naKey);
+  const capture:ProjectionCapture={...naFrame(),captureId:'busy',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:[naRow('stable')],observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  // Output keeps flowing: rows applied since the read and rows still queued behind it.
+  await s.appendScroll(naEvent('moved',2));
+  const queued=Array.from({length:50},(_,n)=>s.appendScroll(naEvent('q'+n,3+n)));
+  const quiet={kind:'quiescent' as const,sourceEpoch:1,geometryGeneration:1,receiveSeqBefore:2,receiveSeqAfter:2};
+  await expect(s.calibrate({capture,expectedRevision:read.revision,captureEvidence:quiet,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+  for(const evidence of [null,undefined,{kind:'unfenced' as const,reason:'bytes arrived'}]) {
+   const receipt=await s.calibrate({capture:{...capture,captureId:'busy-'+String(evidence?.kind??evidence)},expectedRevision:read.revision,captureEvidence:evidence,checks:[{lineId:0,captureRow:0}],repairs:[]});
+   expect(receipt.revision).toBeGreaterThan(read.revision);
+  }
+  await Promise.all(queued);
+  const lines=s.readPage(s.token(naKey),null,100).lines;
+  expect(lines.length).toBe(52);
+  expect(lines[0]).toMatchObject({checkState:'checked',checkedCaptureId:'busy-unfenced'});
+  expect(s.screen(naKey)).toBeNull(); // history only: no screen was written
+  // Rows are still compared byte for byte: a stale mapping is refused atomically, never applied.
+  const t=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'wrong'},expectedRevision:read.revision,captureEvidence:null,checks:[{lineId:1,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
+  expect(s.token(naKey)).toEqual(t);
+  // A revision the pane never had is still the one CAS error.
+  await expect(s.calibrate({capture,expectedRevision:t.revision+1,captureEvidence:null,checks:[],repairs:[]})).rejects.toThrow('stale-revision');
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX2 M1: an oversized event is ingest-oversize, never capacity-pressure, and counts once however often it is re-offered',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-fix2-m1-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const originalError=console.error;console.error=()=>{};
+ try {
+  await s.appendScroll(naEvent('kept',1));
+  const huge={...naEvent('',2),physicalRow:{text:'x'.repeat(17*1024*1024),cells:[]}};
+  for(let i=0;i<5;i++) {
+   const error=await s.appendScroll(huge).then(()=>null,e=>e);
+   expect(String(error)).toContain(PROJECTION_OVERSIZE);expect(String(error)).not.toContain('capacity');
+  }
+  expect(s.health().rejectedRows).toBe(1);
+  s.flush();
+  // A different oversized event is a second loss; re-offering it adds nothing.
+  const other={...naEvent('',3),physicalRow:{text:'y'.repeat(17*1024*1024),cells:[]}};
+  for(let i=0;i<3;i++)await expect(s.appendScroll(other)).rejects.toThrow(PROJECTION_OVERSIZE);
+  expect(s.health().rejectedRows).toBe(2);
+  // An oversized frame re-offered is refused each time, never counted as a row.
+  const bigFrame={...naFrame(),cells:[[{...naCell('z'),grapheme:'z'.repeat(17*1024*1024)},naCell(' ')]]};
+  for(let i=0;i<3;i++)await expect(s.replaceScreen(bigFrame)).rejects.toThrow(PROJECTION_OVERSIZE);
+  expect(s.health().rejectedRows).toBe(2);
+  await s.appendScroll(naEvent('after',4));s.flush();
+  const disk=new Database(s.file,{readonly:true});
+  try {
+   expect(disk.query("SELECT coalesce(sum(missing_count),0) AS n FROM na_issue WHERE kind=?").get(PROJECTION_OVERSIZE)).toEqual({n:2});
+   expect(disk.query("SELECT count(*) AS n FROM na_issue WHERE kind='ingest-capacity' OR kind LIKE '%pressure%'").get()).toEqual({n:0});
+  }finally{disk.close();}
+  expect(s.readPage(s.token(naKey),null,10).lines.map(l=>l.text)).toEqual(['kept','after']);
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.health().rejectedRows).toBe(2);
+ }finally{console.error=originalError;await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, never downgrade a checked row, and survive reopen',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-content-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  for(const [i,t] of ['$ ','unique','$ ','$ '].entries())await s.appendScroll(naEvent(t,i+1));
+  const capture:ProjectionCapture={...naFrame(),captureId:'c1',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:['$ ','unique','$ ','$ '].map(naRow),observedFields:['grapheme'],ambiguousRows:0,result:'exact-history'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,checks:[{lineId:1,captureRow:1}],contentMatches:[{lineId:0,captureRow:0},{lineId:2,captureRow:2}],repairs:[]});
+  let lines=s.readPage(s.token(naKey),null,10).lines;
+  expect(lines.map(l=>[l.checkState,l.checkReason])).toEqual([['content-matched','content-capture'],['checked','exact-capture'],['content-matched','content-capture'],['unchecked','awaiting-capture']]);
+  // Content never lies: a content match with different text is refused atomically.
+  const before=s.token(naKey);
+  await expect(s.calibrate({capture:{...capture,captureId:'c2',history:['x','unique','$ ','$ '].map(naRow)},expectedRevision:before.revision,checks:[],contentMatches:[{lineId:0,captureRow:0}],repairs:[]})).rejects.toThrow('check-not-exact');
+  expect(s.token(naKey)).toEqual(before);
+  // A later content match keeps the identity proven by anchors.
+  await s.calibrate({capture:{...capture,captureId:'c3'},expectedRevision:before.revision,checks:[],contentMatches:[{lineId:1,captureRow:1},{lineId:3,captureRow:3}],repairs:[]});
+  s.flush();await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  lines=s.readPage(s.token(naKey),null,10).lines;
+  expect(lines.map(l=>[l.checkState,l.checkedCaptureId])).toEqual([['content-matched','c1'],['checked','c1'],['content-matched','c1'],['content-matched','c3']]);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I4 FIX1: a current-version file missing receipt metadata is refused on recover',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i4-outdated-')),file=join(dir,'newarch-v3/history.sqlite3');
+ try {
+  mkdirSync(join(dir,'newarch-v3'),{recursive:true});
+  const db=new Database(file);
+  db.exec(PROJECTION_SCHEMA.replace('screen_hash BLOB NOT NULL, history_hash BLOB NOT NULL,','capture_digest TEXT NOT NULL,'));
+  db.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);db.close();
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('projection-schema-outdated');
+  // The current factory's own file passes the same check.
+  const fresh=mkdtempSync(join(tmpdir(),'na-i2-current-'));
+  try {const s=createProjectionStore({historyRoot:fresh,mode:'create'});await s.close();const r=createProjectionStore({historyRoot:fresh,mode:'recover'});await r.close();}
+  finally{rmSync(fresh,{recursive:true,force:true});}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I4 FIX1: closed v2 archive is read without attaching it or restoring its screen',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i4-v2-archive-')),file=join(dir,'archive-v2.sqlite3');
+ const key={serverIdentity:'archive-server',paneId:'%7',birthGeneration:4},id=JSON.stringify([key.serverIdentity,key.paneId,key.birthGeneration]);
+ try {
+  const db=new Database(file);
+  db.exec(`PRAGMA user_version=2;
+   CREATE TABLE na_pane(pane_key TEXT PRIMARY KEY,session_uuid TEXT,server_identity TEXT,pane_id TEXT,birth_generation INTEGER,source_epoch INTEGER,geometry_generation INTEGER,cols INTEGER,rows INTEGER,screen_kind TEXT,next_line_id INTEGER,revision INTEGER,durable_revision INTEGER,health TEXT,receive_seq INTEGER);
+   CREATE TABLE na_line(pane_key TEXT,source_epoch INTEGER,line_id INTEGER,revision INTEGER,geometry_generation INTEGER,text TEXT,cells_json TEXT,soft_wrap INTEGER,check_state TEXT,check_reason TEXT,checked_capture_id TEXT,checked_row INTEGER);
+   CREATE TABLE na_issue(issue_id TEXT,pane_key TEXT,source_epoch INTEGER,revision INTEGER,boundary_line_id INTEGER,kind TEXT,reason TEXT,missing_count INTEGER,detected_at REAL,resolved_at REAL);
+   CREATE TABLE na_screen(pane_key TEXT,cells_json TEXT);`);
+  db.query('INSERT INTO na_pane VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'legacy-session',key.serverIdentity,key.paneId,key.birthGeneration,2,3,80,24,'normal',1,7,7,'healthy',9);
+  db.query('INSERT INTO na_line VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(id,2,0,7,3,'legacy-row',encodeCells([naCell('L')]),0,'unchecked','legacy-v2',null,null);
+  db.query('INSERT INTO na_screen VALUES (?,?)').run(id,JSON.stringify([[naCell('X')]]));db.close();
+  const archive=openProjectionArchive(file);
+  try {
+   expect(archive.schemaVersion).toBe(2);const token=archive.token(key);
+   expect(archive.readPage(token,null,10).lines[0]).toMatchObject({text:'legacy-row',checkReason:'legacy-v2'});
+   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v4');
+  }finally{archive.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 A-B1: a same-generation frame is published at once, ahead of queued scrolls, with the committed history seam',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-seam-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const events:string[]=[];
+  const rows=Array.from({length:500},(_,i)=>s.appendScroll(naEvent(`row ${i}`,i+1)));
+  const a=Promise.all(rows).then(()=>events.push('scroll'));
+  const started=performance.now();
+  const b=s.replaceScreen({...naFrame(),cells:[[naCell('F'),naCell(' ')]]}).then(r=>{events.push('frame');return {r,ms:performance.now()-started};});
+  // Written to RAM synchronously: visible before any queued row was applied.
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('F');
+  expect(s.token(naKey).nextLineId).toBe(0);
+  const [{r,ms}]=await Promise.all([b,a]);
+  expect(events).toEqual(['frame','scroll']);
+  expect(r).toMatchObject({nextLineId:0});expect(ms).toBeLessThan(16);
+  expect(s.token(naKey).nextLineId).toBe(500);
+  // Queued rows never overwrite the newer screen, and every row is kept in order.
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))[0][0].grapheme).toBe('F');
+  expect(s.readPage(s.token(naKey),null,600).lines.map(l=>l.text)).toEqual(Array.from({length:500},(_,i)=>`row ${i}`));
+  console.log('I2_FIX1_FASTPATH',JSON.stringify({queuedRows:500,frameResolveMs:ms,frameNextLineId:(r as {nextLineId:number}).nextLineId}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 C-F12: issue and transition CAS is checked at admission, not after queued output of the same pane',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-cas-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('seed',1));
+  // A caller that read before a published frame is stale by definition.
+  const early=s.token(naKey);await s.replaceScreen(naFrame());
+  const issue={paneKey:naKey,sourceEpoch:1,geometryGeneration:1,expectedRevision:early.revision,kind:'reader-lost',reason:'fixture',missingCount:null,boundaryLineId:early.nextLineId,recoverable:true};
+  await expect(s.recordIssue(issue)).rejects.toThrow('stale-revision');
+  // Output keeps arriving: rows are queued ahead of the issue and the transition.
+  const rows=Array.from({length:50},(_,i)=>s.appendScroll(naEvent(`busy ${i}`,i+2)));
+  const read=s.token(naKey);
+  const recorded=s.recordIssue({...issue,expectedRevision:read.revision});
+  const transition=s.transitionEpoch({...issue,expectedRevision:read.revision,nextEpoch:2});
+  await Promise.all(rows);
+  const [r1,r2]=await Promise.all([recorded,transition]);
+  expect(r2.revision).toBeGreaterThan(r1.revision);
+  expect(s.token(naKey)).toMatchObject({sourceEpoch:2,nextLineId:51});
+  const page=s.readPage(s.token(naKey),null,100);
+  expect(page.lines.map(l=>l.text)).toEqual(['seed',...Array.from({length:50},(_,i)=>`busy ${i}`)]);
+  expect(page.issues.map(i=>i.boundaryLineId)).toEqual([1,1]);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 C-F11: transitionEpoch returns the RAM receipt while the disk is locked; durable() follows without blocking',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-async-epoch-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const lock=new Database(s.file);
+ try {
+  await s.appendScroll(naEvent('before',1));s.flush();
+  lock.exec('BEGIN IMMEDIATE');   // a real writer holds the disk: every commit waits busy_timeout then fails
+  const started=performance.now();
+  const receipt=await s.transitionEpoch({paneKey:naKey,sourceEpoch:1,nextEpoch:2,geometryGeneration:1,expectedRevision:s.token(naKey).revision,
+   boundaryLineId:1,kind:'reader-restart',reason:'fixture',missingCount:null,recoverable:true});
+  const ms=performance.now()-started;
+  expect(ms).toBeLessThan(50);expect(receipt.durableRevision).toBeLessThan(receipt.revision);
+  expect(s.token(naKey).sourceEpoch).toBe(2);
+  let durable=false;const pending=s.durable(naKey,receipt.revision).then(r=>{durable=true;return r;});
+  await Bun.sleep(400);expect(durable).toBe(false);
+  lock.exec('COMMIT');
+  const done=await pending;expect(done.durableRevision).toBeGreaterThanOrEqual(receipt.revision);
+  console.log('I2_FIX1_ASYNC_EPOCH',JSON.stringify({transitionMs:ms,durableAfterUnlock:true}));
+ }finally{try{lock.exec('ROLLBACK');}catch{}lock.close();await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('I2 FIX1 C-F13: RAM pressure clears after real eviction; freelist pages are not counted as live',async()=>{
+ // A 6 MiB cache with real ~1 KB rows (1000 characters: the v4 codec stores text plus a few bytes); no stubbed byte counter. The 5000 lines kept after eviction fit, a 6300-line burst does not.
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-freelist-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:6*1024*1024}),ram=(s as any).ram;
+ clearInterval((s as any).timer);
+ try {
+  let n=0,refusal:any=null;
+  // A pane-share refusal is flushed away (the pane may hold ~4.8 MiB); only RAM pressure ends the fill.
+  while(!refusal && n<20000){const r:any=await s.appendScroll(naEvent(`row ${n} `.padEnd(1000,'x'),n+1));if(r.accepted!==false)n++;else if(r.scope==='pane')s.flush();else refusal=r;}
+  const full=ram.bytes();
+  expect(refusal).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  expect(s.health()).toMatchObject({status:'stopped',pressure:'recoverable',rejectedRows:0});
+  s.flush();   // acknowledge evicts all but the last 5000 lines of the pane
+  const pages=(ram.db.query('PRAGMA page_count').get() as any).page_count,free=(ram.db.query('PRAGMA freelist_count').get() as any).freelist_count;
+  const after=ram.bytes();
+  const drained=await Promise.race([s.drained(naKey).then(()=>'drained'),Bun.sleep(2000).then(()=>'stuck')]);
+  console.log('I2_FIX1_FREELIST',JSON.stringify({rowsBeforePressure:n,full,after,pages,free,drained}));
+  expect(free).toBeGreaterThan(0);expect(after).toBeLessThan(full);expect(s.health().ramBytes).toBe(after);
+  expect(drained).toBe('drained');
+  expect(await s.appendScroll(naEvent(`row ${n} `.padEnd(1000,'x'),n+1))).toMatchObject({nextLineId:n+1});
+  s.flush();expect(s.health().status).not.toBe('stopped');
+  expect(s.readPage(s.token(naKey),null,10).lines[0].text).toBe('row 0 '.padEnd(1000,'x'));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},60000);
+
+test('I2: first epoch and pre-output fault persist without a fabricated initial frame',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-i2-birth-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const receipt=await s.transitionEpoch({paneKey:naKey,sourceEpoch:0,nextEpoch:1,geometryGeneration:1,expectedRevision:0,
+   boundaryLineId:0,kind:'reader-start',reason:'no prior byte boundary',missingCount:null,recoverable:false});
+  expect((await s.durable(naKey,receipt.revision)).durableRevision).toBe(receipt.revision);expect(s.screen(naKey)).toBeNull();
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  expect(s.token(naKey)).toMatchObject({sourceEpoch:1,nextLineId:0});
+  expect(s.readPage(s.token(naKey),null,1).issues[0]).toMatchObject({boundaryLineId:0,missingCount:null,sourceEpoch:1});
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+// A realistic ~1.2 KiB encoded row crosses SQLite's 4 KiB index-page overflow
+// threshold, unlike repeated-cell fixtures. Keep the same data for 10/12 panes.
+const fix2Row=():PhysicalRow=>({text:'P01 000123 color3 ไทย漢字😀 '+ 'x'.repeat(80),
+ cells:Array.from({length:120},(_,i)=>({...naCell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))});
+for(const paneCount of [10,12])test(`I4 FIX2 F1: ${paneCount} panes retain 5000 realistic rows and keep admitting`,async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-cap-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const physicalRow=fix2Row();let accepted=0;
+  const keys=Array.from({length:paneCount},(_,i)=>({...naKey,paneId:`%${i}`}));
+  for(let n=0;n<5100;n+=100) {
+   for(const key of keys)for(let i=n;i<n+100;i++) {
+    const result=await s.appendScroll({...naEvent('',i+1,key),physicalRow});
+    expect(result).not.toHaveProperty('accepted',false);accepted++;
+   }
+   s.flush();
+  }
+  expect(s.health().status).not.toBe('stopped');
+  expect(s.health().ramBytes/(paneCount*5000)).toBeLessThan(2000);
+  for(const key of keys) {
+   expect(s.token(key).nextLineId).toBe(5100);
+   expect(s.readPage(s.token(key),0,1).lines[0].text).toBe(physicalRow.text);
+  }
+  console.log('FIX2_CAP',JSON.stringify({paneCount,accepted,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},120000);
+
+test('I4 FIX2 F1: idle durable cache pressure wakes drained without another flush and preserves disk history',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-idle-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:1024*1024});
+ try {
+  let accepted=0,pressure=0;const row=fix2Row();
+  for(let i=0;i<2400;i++) {
+   const event={...naEvent('',i+1),physicalRow:row};
+   let result=await s.appendScroll(event);
+   if('accepted' in result) {
+    pressure++;
+    expect(await Promise.race([s.drained(naKey).then(()=>true),Bun.sleep(2000).then(()=>false)])).toBe(true);
+    result=await s.appendScroll(event);
+   }
+   expect(result).not.toHaveProperty('accepted',false);accepted++;
+   // Make rows durable frequently: retained rows, not pending IO, fill RAM.
+   if(i%40===39)s.flush();
+  }
+  s.flush();expect(pressure).toBeGreaterThan(0);expect(accepted).toBe(2400);
+  expect(s.readPage(s.token(naKey),0,20).lines.map(l=>l.text)).toEqual(Array(20).fill(row.text));
+  const capture:ProjectionCapture={...naFrame(),captureId:'after-eviction',requestedAt:1,completedAt:2,firstHistoryRow:0,history:[row],observedFields:[],ambiguousRows:0,result:'exact'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,checks:[{lineId:0,captureRow:0}],repairs:[]});
+  expect(s.readPage(s.token(naKey),0,1).lines[0].checkState).toBe('checked');
+  console.log('FIX2_IDLE_RECOVERY',JSON.stringify({accepted,pressure,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
+
+test('I4 FIX2 F2: 800-row calibration freezes RLE, bounds each commit to 256, and certifies every row',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-cal-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const row=fix2Row();
+  for(let i=0;i<800;i++)await s.appendScroll({...naEvent('',i+1),physicalRow:row});
+  s.flush();const revision=s.token(naKey).revision;
+  const capture:ProjectionCapture={...naFrame(),captureId:'bounded',requestedAt:1,completedAt:2,firstHistoryRow:0,
+   history:Array.from({length:800},()=>structuredClone(row)),observedFields:[],ambiguousRows:0,result:'exact'};
+  const promise=s.calibrate({capture,expectedRevision:revision,checks:Array.from({length:800},(_,i)=>({lineId:i,captureRow:i})),repairs:[]});
+  const queued=(s as any).queuedBytes;
+  expect(queued).toBeLessThan(2*1024*1024);
+  capture.history[0].cells[0].grapheme='MUTATED';
+  const receipt=await promise;expect(receipt.revision-revision).toBe(4);
+  const ram=(s as any).ram;
+  const counts=ram.db.query('SELECT compared_rows,history_count FROM na_capture').all();
+  expect(counts.length).toBe(4);
+  expect(counts.every((r:any)=>r.compared_rows<=256 && r.history_count<=256)).toBe(true);
+  const lines=s.readPage(s.token(naKey),0,800).lines;
+  expect(lines.filter(l=>l.checkState==='checked').length).toBe(800);
+  expect(lines[0].cells).toEqual(row.cells);
+  console.log('FIX2_CALIBRATION',JSON.stringify({queued,commits:counts}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
+
+
+test('I4 FIX2 F1: refused frame reserves its actual size when an idle durable cache reopens',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-fix2-frame-')),s=createProjectionStore({historyRoot:dir,mode:'create',cacheBytes:1024*1024});
+ try {
+  const row=fix2Row();let seq=0;
+  while(s.health().ramBytes<950000 && seq<1000) {
+   expect(await s.appendScroll({...naEvent('',++seq),physicalRow:row})).not.toHaveProperty('accepted',false);
+   if(seq%20===0)s.flush();
+  }
+  s.flush();expect(s.health().ramBytes).toBeGreaterThanOrEqual(950000);
+  expect(s.health().ramBytes+512).toBeLessThan(1024*1024);
+  const frame={...naFrame(),cols:120,rows:40,receiveSeq:seq+1,
+   cells:Array.from({length:40},()=>Array.from({length:120},(_,i)=>naCell(String.fromCharCode(65+i%26))))};
+  expect(await s.replaceScreen(frame)).toMatchObject({accepted:false,reason:'capacity-pressure',scope:'store'});
+  expect(await Promise.race([s.drained(naKey).then(()=>true),Bun.sleep(2000).then(()=>false)])).toBe(true);
+  expect(await s.replaceScreen(frame)).not.toHaveProperty('accepted',false);
+  expect(JSON.parse(String(s.screen(naKey)!.cells_json))).toEqual(frame.cells);
+  expect(s.readPage(s.token(naKey),0,1).lines[0].text).toBe(row.text);
+  console.log('FIX2_FRAME_RECOVERY',JSON.stringify({historyRows:seq,ramBytes:s.health().ramBytes}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},30000);
+
+// ── NEWARCH-SWITCHON S2: v4 compact rows, sealed blocks, v3 read-only ──
+import { readFileSync as readFileS2, readdirSync as readdirS2, statSync as statS2 } from 'node:fs';
+import { decodeRow, encodeRow } from '../src/sqlite-history/codec';
+import { PROJECTION_V3_SCHEMA } from '../src/sqlite-history/schema';
+import { cellsToAnsi } from '../src/pipe-history-runtime';
+// Runtime-shaped cells (pipe-history-runtime parserRowCells): canonical colours, style bits, wide + continuation.
+const s2Cell=(grapheme:string,width=1,fg:string|number|null='default',bg:string|number|null='default',style=0):ProjectionCell=>({grapheme,width,continuation:false,fg,bg,style});
+const s2Cont=(fg:string|number|null='default',bg:string|number|null='default',style=0):ProjectionCell=>({grapheme:'',width:0,continuation:true,fg,bg,style});
+const s2Row=(parts:ProjectionCell[],cols=40):PhysicalRow=>{
+ const cells=[...parts];while(cells.length<cols)cells.push(s2Cell(' '));
+ return {text:cells.filter(c=>!c.continuation).map(c=>c.grapheme).join(''),cells};
+};
+const s2Text=(text:string,fg:string|number|null='default',bg:string|number|null='default',style=0)=>[...text].map(g=>s2Cell(g,1,fg,bg,style));
+const s2Wide=(g:string,fg:string|number|null='default')=>[s2Cell(g,2,fg),s2Cont(fg)];
+// hidden=128 (SGR 8), dim=2, blink=16, bold=1, italic=4, underline=8, inverse=64, strike=256.
+const S2_CORPUS:PhysicalRow[]=[
+ s2Row([...s2Text('pass: '),...s2Text('secret',  'default','default',128),...s2Text(' shown')]),
+ s2Row([...s2Text('dim','index:7','default',2),...s2Text(' blink','index:1','default',16),...s2Text(' all','rgb:1,2,3','rgb:250,251,252',1|2|4|8|16|64|128|256)]),
+ s2Row([...s2Text('256:'),...s2Text('x','rgb:95,135,175'),...s2Text('y','index:15','index:8'),...s2Text('z','rgb:0,0,0','rgb:255,255,255')]),
+ s2Row([...s2Text('ไทย '),s2Cell('กิ่'),s2Cell('ง'),s2Cell(' '),s2Cell('น้ำ')]),
+ s2Row([...s2Wide('漢'),...s2Wide('字','index:3'),...s2Wide('😀'),...s2Wide('👩‍💻'),...s2Wide('🇹🇭'),...s2Text(' é')]),
+ s2Row([...s2Text('trailing styled blanks'),...s2Text('   ','default','index:4')]),
+ s2Row([...s2Text('   lead  mid   |(2,1,0)| 7a ')]),
+ s2Row([]),
+ s2Row([...s2Text('x'.repeat(38)),...s2Wide('界')]),
+ s2Row([...s2Text('P01 000123 '),...s2Text('color3','index:4'),...s2Text(' ไทย'),...s2Wide('漢'),...s2Wide('字'),...s2Wide('😀'),...s2Text(' xxx')],120),
+ {text:'fixture shape',cells:[...'fixture shape'].map(naCell)},
+ {text:'odd colour',cells:[...'odd colour'].map(g=>s2Cell(g,1,'index:07'))},
+ {text:'text not cells',cells:[s2Cell('?')]},
+];
+
+test('S2: every corpus row round-trips through the codec; runtime-shaped rows are compact',()=>{
+ for(const row of S2_CORPUS) {
+  const stored=encodeRow(row.text,row.cells);
+  expect(decodeRow(stored.text,stored.cells)).toEqual(row);
+  expect(JSON.stringify(decodeRow(stored.text,stored.cells))).toBe(JSON.stringify(row));
+ }
+ const compact=S2_CORPUS.slice(0,10).map(r=>encodeRow(r.text,r.cells));
+ expect(compact.every(r=>r.cells[0]!=='[')).toBe(true);
+ // The blanks at the end of a row are not stored; their styles are.
+ expect(compact[7]).toEqual({text:'',cells:'40||'});
+ expect(compact[5]!.text.endsWith('blanks')).toBe(true);
+ const legacyBytes=S2_CORPUS.slice(0,10).reduce((n,r)=>n+Buffer.byteLength(JSON.stringify(r.cells)),0);
+ const storedBytes=compact.reduce((n,r)=>n+Buffer.byteLength(r.text)+Buffer.byteLength(r.cells),0);
+ console.log('S2_CODEC',JSON.stringify({rows:10,storedBytes,perCellJsonBytes:legacyBytes,oracleRow:compact[9]}));
+});
+
+test('S2: corpus is lossless in RAM, in sealed blocks, after a patch of a sealed line, after recover and through the archive reader',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-s2-corpus-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const rows=Array.from({length:600},(_,i)=>S2_CORPUS[i%S2_CORPUS.length]!);
+ try {
+  for(const [i,row] of rows.entries())await s.appendScroll({...naEvent('',i+1),physicalRow:structuredClone(row)});
+  const read=(store:{readPage:typeof s.readPage;token:typeof s.token})=>{const t=store.token(naKey);return [...store.readPage(t,0,600).lines];};
+  expect(read(s).map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+  // Certify every row like the runtime does (one capture per <=64 rows), then flush: whole settled blocks seal.
+  for(let at=0;at<600;at+=64) {
+   const slice=rows.slice(at,at+64);
+   await s.calibrate({capture:{...naFrame(),captureId:`s2-${at}`,requestedAt:1,completedAt:2,firstHistoryRow:0,history:slice.map(r=>structuredClone(r)),observedFields:['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'],ambiguousRows:0,result:'exact'},
+    expectedRevision:s.token(naKey).revision,checks:slice.map((_,k)=>({lineId:at+k,captureRow:k})),repairs:[]});
+  }
+  s.flush();
+  const disk=new Database(s.file,{readonly:true});
+  const blocks=disk.query('SELECT first_line_id,line_count FROM na_block ORDER BY first_line_id').all();
+  const tail=disk.query('SELECT min(line_id) AS lo,count(*) AS n FROM na_line').get();
+  const observed=disk.query('SELECT DISTINCT typeof(observed_fields) AS t,observed_fields AS v FROM na_capture').all();
+  disk.close();
+  expect(blocks).toEqual([{first_line_id:0,line_count:256},{first_line_id:256,line_count:256}]);
+  expect(tail).toEqual({lo:512,n:88});
+  expect(observed).toEqual([{t:'integer',v:255}]);
+  const check=(lines:any[])=>{
+   expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+   expect(lines.every(l=>l.checkState==='checked' && l.checkReason==='exact-capture' && l.checkedCaptureId===`s2-${Math.floor(l.lineId/64)*64}`)).toBe(true);
+  };
+  check(read(s));
+  // A repair of a line inside a sealed block rewrites that block, never a second copy.
+  const repaired=s2Row([...s2Text('repaired','index:2','default',128)]);
+  const capture={...naFrame(),captureId:'s2-repair',requestedAt:3,completedAt:4,firstHistoryRow:0,history:[repaired],observedFields:['style'],ambiguousRows:0,result:'exact'};
+  await s.calibrate({capture,expectedRevision:s.token(naKey).revision,checks:[],repairs:[{lineId:3,captureRow:0,physicalRow:repaired}]});
+  s.flush();rows[3]=repaired;
+  const disk2=new Database(s.file,{readonly:true});
+  expect(disk2.query('SELECT count(*) AS n FROM na_line WHERE line_id=3').get()).toEqual({n:0});
+  expect(disk2.query("SELECT typeof(observed_fields) AS t FROM na_capture WHERE capture_id='s2-repair'").get()).toEqual({t:'integer'});
+  disk2.close();
+  const after=read(s);
+  expect(after.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+  expect(after[3]).toMatchObject({checkState:'checked',checkedCaptureId:'s2-repair',checkedRow:0});
+  await s.close();s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  const recovered=read(s);
+  expect(recovered.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+  expect(recovered[3]).toMatchObject({checkedCaptureId:'s2-repair'});
+  await s.close();
+  const archive=openProjectionArchive(join(dir,'newarch-v3/history.sqlite3'));
+  try {
+   expect(archive.schemaVersion).toBe(4);
+   const lines=archive.readPage(archive.token(naKey),0,600).lines;
+   expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+  }finally{archive.close();}
+  console.log('S2_CORPUS_STORE',JSON.stringify({rows:600,blocks,tail,repairedSealedLine:3}));
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},60000);
+
+test('S2: a v3 file is read-only through the archive reader and the v4 writer refuses it without touching it',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-s2-v3-')),file=join(dir,'newarch-v3/history.sqlite3');
+ const id=JSON.stringify([naKey.serverIdentity,naKey.paneId,naKey.birthGeneration]);
+ try {
+  mkdirSync(join(dir,'newarch-v3'),{recursive:true});
+  const db=new Database(file);
+  db.exec('PRAGMA journal_mode=DELETE;');db.exec(PROJECTION_V3_SCHEMA);db.exec('PRAGMA user_version=3');
+  db.query("INSERT INTO na_pane (pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind,next_line_id,revision,durable_revision) VALUES (?,?,?,?,?,?,?,?,?,'normal',?,?,?)")
+   .run(id,'v3-session',naKey.serverIdentity,naKey.paneId,naKey.birthGeneration,1,1,40,2,S2_CORPUS.length,S2_CORPUS.length,S2_CORPUS.length);
+  for(const [i,row] of S2_CORPUS.entries())db.query("INSERT INTO na_line VALUES (?,1,?,?,1,?,?,0,'unchecked','awaiting-capture',NULL,NULL)").run(id,i,i+1,row.text,encodeCells(row.cells));
+  db.close();
+  const sha=()=>createHash('sha256').update(readFileS2(file)).digest('hex'),before=sha();
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('not-projection-v4');
+  expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v4');
+  const archive=openProjectionArchive(file);
+  try {
+   expect(archive.schemaVersion).toBe(3);
+   const lines=archive.readPage(archive.token(naKey),null,100).lines;
+   expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(S2_CORPUS);
+   expect(lines.every(l=>l.checkState==='unchecked' && l.checkReason==='awaiting-capture')).toBe(true);
+  }finally{archive.close();}
+  expect(sha()).toBe(before);
+  expect(readdirS2(join(dir,'newarch-v3'))).toEqual(['history.sqlite3']);
+  console.log('S2_V3_READONLY',JSON.stringify({rows:S2_CORPUS.length,writerRefused:'not-projection-v4',sha256Unchanged:before}));
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('S2: a v4 file carries version 4 in its header, so every v3-era reader refuses it; its lines have no v3 columns',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-s2-v4-header-'));const s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  await s.appendScroll(naEvent('v4 row',1));s.flush();await s.close();
+  const file=join(dir,'newarch-v3/history.sqlite3'),head=readFileS2(file).subarray(0,100);
+  // The v3 writer (admitPath) and archive reader gate on this header field: 3 and {2,3}.
+  expect(head.readUInt32BE(60)).toBe(4);expect(PROJECTION_SCHEMA_VERSION).toBe(4);
+  const db=new Database(file,{readonly:true});
+  try {
+   expect(()=>db.query('SELECT cells_json FROM na_line').all()).toThrow(/no such column/);
+   expect(()=>db.query('SELECT pane_key FROM na_line').all()).toThrow(/no such column/);
+  }finally{db.close();}
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+// R = UTF-8 bytes of cellsToAnsi(row) for every row the store returns (the V
+// canary's definition, VR:147). D = every file of the database directory.
+const s2Oracle=(seq:number):PhysicalRow=>s2Row([...s2Text(`P01 ${String(seq).padStart(6,'0')} `),...s2Text(`color${seq%10}`,`index:${1+seq%7}`),
+ ...s2Text(' ไทย'),...s2Wide('漢'),...s2Wide('字'),...s2Wide('😀'),...s2Text(' '+'x'.repeat(seq%13))],120);
+async function s2DiskRatio(rows:number,dir:string) {
+ const s=createProjectionStore({historyRoot:dir,mode:'create'});
+ let R=0;
+ try {
+  for(let at=0;at<rows;at+=64) {
+   const slice=Array.from({length:Math.min(64,rows-at)},(_,k)=>s2Oracle(at+k+1));
+   for(const [k,row] of slice.entries())await s.appendScroll({...naEvent('',at+k+1),physicalRow:row});
+   await s.calibrate({capture:{...naFrame(),captureId:`nonce-${at}/1`,requestedAt:at,completedAt:at+1,firstHistoryRow:0,history:slice,observedFields:['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'],ambiguousRows:0,result:'unfenced'},
+    expectedRevision:s.token(naKey).revision,checks:slice.map((_,k)=>({lineId:at+k,captureRow:k})),repairs:[]});
+  }
+  s.flush();
+  for(let at=0;at<rows;at+=2000)for(const l of s.readPage(s.token(naKey),at,Math.min(2000,rows-at)).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells as any));
+ }finally{await s.close();}
+ const folder=join(dir,'newarch-v3'),D=readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
+ return {rows,D,R,ratio:D/R};
+}
+test('S2: D <= 1.5 x R for 6000 certified runtime-shaped rows of one pane',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-s2-ratio-'));
+ try {
+  const result=await s2DiskRatio(6000,dir);
+  console.log('S2_DISK_RATIO',JSON.stringify(result));
+  expect(result.ratio).toBeLessThanOrEqual(1.5);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+},60000);
+
+test('S2: an uncertified block near the head stays per-line alone; far behind it seals and a late certification patches the block',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-s2-seal-order-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const rows=Array.from({length:1024},(_,i)=>s2Oracle(i+1));
+  for(const [i,row] of rows.entries())await s.appendScroll({...naEvent('',i+1),physicalRow:row});
+  const certify=async(ids:number[],id:string)=>s.calibrate({capture:{...naFrame(),captureId:id,requestedAt:1,completedAt:2,firstHistoryRow:0,history:ids.map(i=>rows[i]!),observedFields:['grapheme'],ambiguousRows:0,result:'exact'},
+   expectedRevision:s.token(naKey).revision,checks:ids.map((lineId,k)=>({lineId,captureRow:k})),repairs:[]});
+  // Row 5 (block 0, far behind the head) and row 800 (block 768, the newest complete block) stay uncertified.
+  await certify(Array.from({length:1024},(_,i)=>i).filter(i=>i!==5 && i!==800),'bulk');
+  s.flush();
+  const state=()=>{const db=new Database(s.file,{readonly:true});try{return {blocks:db.query('SELECT first_line_id AS f FROM na_block ORDER BY f').all().map((r:any)=>r.f),tail:(db.query('SELECT min(line_id) AS lo,count(*) AS n FROM na_line').get() as any)};}finally{db.close();}};
+  expect(state()).toEqual({blocks:[0,256,512],tail:{lo:768,n:256}});
+  await certify([5],'row-5');await certify([800],'row-800');s.flush();
+  expect(state()).toEqual({blocks:[0,256,512,768],tail:{lo:null,n:0}});
+  const lines=s.readPage(s.token(naKey),0,1024).lines;
+  expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
+  expect([lines[5]!.checkedCaptureId,lines[800]!.checkedCaptureId]).toEqual(['row-5','row-800']);
+  expect(lines[6]!.checkedCaptureId).toStartWith('bulk:');
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},60000);

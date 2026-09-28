@@ -572,3 +572,97 @@ describe('wave 6 expansion wiring (second half)', () => {
     } finally { await f.cleanup(); }
   }, 60000);
 });
+
+import { mkdtempSync } from 'node:fs';
+import { tmpdir, cpus } from 'node:os';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import type { ProjectionCell } from '../src/sqlite-history/types';
+
+async function measureProjectionLoad(cols:number,rows:number) {
+ const root=mkdtempSync(join(tmpdir(),'na-steady-'));
+ const stats=(a:number[])=>{const x=[...a].sort((a,b)=>a-b);const at=(p:number)=>x[Math.max(0,Math.ceil(x.length*p)-1)]??null;return {n:x.length,p50:at(.5),p95:at(.95),p99:at(.99),max:x.at(-1)??null};};
+ try {
+   const s=createProjectionStore({historyRoot:join(root,`${cols}`),mode:'create'});
+   const timings:Record<string,{calls:number,totalMs:number,maxMs:number}>={};
+   const instrument=(target:any,name:string,label=name)=>{
+     const original=target[name].bind(target),t=timings[label]={calls:0,totalMs:0,maxMs:0};
+     target[name]=(...args:any[])=>{const start=performance.now();try{const result=original(...args);if(name==='acknowledge'){ages.push((s as any).lastFlushAgeMs);const d=(s as any).diskTiming;diskTotal.push(d.totalMs);diskWrite.push(d.writeMs);diskCommit.push(d.commitMs);}return result;}finally{const ms=performance.now()-start;t.calls++;t.totalMs+=ms;t.maxMs=Math.max(t.maxMs,ms);}};
+   };
+   for(const name of ['owner','appendScroll','enqueue','pump','snapshot','acknowledge','replaceScreen'])instrument(s,name);
+   for(const name of ['append','screen','bytes','evict'])instrument((s as any).ram,name,'ram.'+name);
+   const keys=Array.from({length:21},(_,i)=>({serverIdentity:'open-loop',paneId:`%${i}`,birthGeneration:1}));
+   const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+   const cells=Array.from({length:rows},()=>Array.from({length:cols},()=>cell(' ')));
+   const diskTotal:number[]=[],diskWrite:number[]=[],diskCommit:number[]=[];
+   const pending:number[]=[],ages:number[]=[],rss:number[]=[],screens:number[]=[],sampleGaps:number[]=[];
+   const active=new Set<Promise<unknown>>();let refused=0,screenRefused=0,accepted=0,produced=0,frames=0;
+   let missing=0,extra=0,wrong=0;
+   const track=(p:Promise<unknown>)=>{active.add(p);void p.finally(()=>active.delete(p));};
+   try{
+    const cpuStart=process.cpuUsage(),rssStart=process.memoryUsage().rss;
+    const start=performance.now();let sampled=start,nextSample=start;
+    const feed=(due:number)=>{
+      for(;produced<due;produced++)for(let i=0;i<keys.length;i++) {
+        const text=`${i}:${produced}`.padEnd(80,' '); // exactly 80 history columns in both screen geometries
+        track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}})
+          .then((r:any)=>{if(r?.accepted===false)refused++;else accepted++;},()=>{refused++;}));
+      }
+    };
+    while(performance.now()-start<60000) {
+      const now=performance.now(),elapsed=now-start;
+      feed(Math.min(6000,Math.floor(elapsed/10)));
+      // 10 frames/s/pane, staggered by the clock; neither producer awaits receipts.
+      const dueFrames=Math.floor(elapsed*21/100);
+      for(;frames<dueFrames;frames++) {
+        const i=frames%21,t=performance.now();
+        track(s.replaceScreen({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced,cols,rows,kind:'normal',cells,cursor:{row:frames%rows,col:0,visible:true}})
+          .then((r:any)=>{if(r?.accepted===false)screenRefused++;else screens.push(performance.now()-t);},()=>{screenRefused++;}));
+      }
+      if(now>=nextSample) {
+        const h=s.health();pending.push(h.pendingBytes);rss.push(h.rssBytes);sampleGaps.push(now-sampled);sampled=now;nextSample=now+20;
+      }
+      await Bun.sleep(1);
+    }
+    feed(6000);const producerMs=performance.now()-start;
+    await Promise.all(active);s.flush();
+    for(let i=0;i<21;i++) {
+      const token=s.token(keys[i]);let anchor:number|null=null,seen=0;
+      do {
+        const page=s.readPage(token,anchor,2000);
+        for(const line of page.lines){if(line.text!==`${i}:${seen}`.padEnd(80,' '))wrong++;seen++;}
+        anchor=page.hasMore?page.nextAnchor:null;
+      }while(anchor!==null);
+      missing+=Math.max(0,6000-seen);extra+=Math.max(0,seen-6000);
+    }
+    const cpu=process.cpuUsage(cpuStart);
+    const result={diskTotalMs:stats(diskTotal),diskWriteMs:stats(diskWrite),diskCommitMs:stats(diskCommit),timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
+      pendingBytes:stats(pending),flushAgeMs:stats(ages),screenResolveMs:stats(screens),rssBytes:stats(rss),healthSampleGapMs:stats(sampleGaps),missing,extra,wrong};
+    console.log('NA_OPEN_LOOP',JSON.stringify(result));return result;
+   }finally{await s.close();}
+ }finally{rmSync(root,{recursive:true,force:true});}
+}
+
+test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geometries',async()=>{
+ const results:any[]=[];
+ for(const [cols,rows] of [[80,24],[120,40]]) {
+  const module=join(import.meta.dir,'../src/sqlite-history/projection-store.ts');
+  const script=`import {createProjectionStore} from ${JSON.stringify(module)};
+    import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
+    await (${measureProjectionLoad.toString()})(${cols},${rows});`;
+  const child=Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'});
+  const [out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  console.log(out);if(err)console.error(err);expect(exit).toBe(0);
+  const line=out.split('\n').find(l=>l.startsWith('NA_OPEN_LOOP '));expect(line).toBeDefined();
+  results.push(JSON.parse(line!.slice('NA_OPEN_LOOP '.length)));
+ }
+  for(const r of results) {
+    expect(r.refused).toBe(0);expect(r.screenRefused).toBe(0);expect(r.accepted).toBe(126000);
+    expect(r.producerMs).toBeLessThan(61000);expect(r.healthSampleGapMs.max).toBeLessThanOrEqual(100);
+    expect(r.flushAgeMs.n).toBeGreaterThan(100);expect(r.flushAgeMs.p95).toBeLessThanOrEqual(150);
+    // FIX1 §4: frame receipt through the fast path, p95 ≤ 16 ms and p99 ≤ 50 ms (F17).
+    expect(r.screenResolveMs.p95).toBeLessThanOrEqual(16);expect(r.screenResolveMs.p99).toBeLessThanOrEqual(50);
+    expect(r.pendingBytes.max).toBeLessThan(16*1024*1024);
+    expect(r.rssBytes.max).toBeLessThanOrEqual(256*1024*1024);
+    expect(r.missing+r.extra+r.wrong).toBe(0);
+  }
+},240000);

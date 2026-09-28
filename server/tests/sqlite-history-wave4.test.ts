@@ -289,15 +289,20 @@ describe('wave 4 reader canary', () => {
     } finally { await f.cleanup(); }
   });
 
-  test('the shipping server still does not import the SQLite history package', () => {
+  test('only explicit history entry points import the SQLite history package', () => {
     const src = join(import.meta.dir, '../src');
+    // v0.20.3 intentionally ships I4's pipe-history-runtime adapter. Keep the
+    // existing opt-in sqlite-history entry, but do not exempt callers of either
+    // entry or arbitrary files with the same basename in a nested directory.
+    // Internal sqlite-history modules remain free to import their dependencies.
+    const entries = new Set([join(src, 'sqlite-history.ts'), join(src, 'pipe-history-runtime.ts')]);
     const offenders: string[] = [];
     const walk = (dir: string) => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);
-        if (entry.isDirectory()) { if (entry.name !== 'sqlite-history') walk(path); continue; }
-        if (!entry.name.endsWith('.ts') || path.endsWith('/sqlite-history.ts')) continue;
-        if (/from\s*['"][^'"]*sqlite-history/.test(readFileSync(path, 'utf8'))) offenders.push(path);
+        if (entry.isDirectory()) { if (path !== join(src, 'sqlite-history')) walk(path); continue; }
+        if (!entry.name.endsWith('.ts') || entries.has(path)) continue;
+        if (/(?:from\s*|import\s*(?:\(\s*)?|require\s*\(\s*)['"][^'"]*sqlite-history/.test(readFileSync(path, 'utf8'))) offenders.push(path);
       }
     };
     walk(src);

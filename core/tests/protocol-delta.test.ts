@@ -266,3 +266,75 @@ describe("mux delta protocol", () => {
     expect(shouldUseMuxDelta({ ...full, reset: "resize" }, delta)).toBe(false);
   });
 });
+
+// ── NEWARCH L2-I lot I4: newarch-frame-v1 ────────────────────────────────────
+import { newarchDeltaContinues, validateNewarchFrameMeta, type NewarchFrameMeta } from "../src/protocol";
+
+describe("newarch-frame-v1", () => {
+  const base: NewarchFrameMeta = {
+    v: "newarch-frame-v1", paneKey: { serverIdentity: "srv", paneId: "%3", birthGeneration: 1 },
+    sourceEpoch: 2, geometryGeneration: 1, routeGeneration: 4, metadataRevision: 7, cols: 80, rows: 24, revision: 30, durableRevision: 28,
+    nextLineId: 900, liveStartLine: 500, displaySource: "tmux-calibrated", degraded: true,
+    markers: [{ lineId: 700, kind: "history-cleared-external", missingCount: null }],
+  };
+
+  test("validates and clones; malformed descriptors are null", () => {
+    const parsed = validateNewarchFrameMeta(JSON.parse(JSON.stringify(base)));
+    expect(parsed).toEqual(base);
+    expect(parsed).not.toBe(base);
+    for (const bad of [
+      { ...base, v: "newarch-frame-v2" }, { ...base, revision: -1 }, { ...base, durableRevision: 31 },
+      { ...base, metadataRevision: -1 },
+      { ...base, liveStartLine: 901 }, { ...base, cols: 0 }, { ...base, displaySource: "guess" },
+      { ...base, paneKey: { ...base.paneKey, paneId: "" } }, { ...base, markers: new Array(17).fill(base.markers[0]) },
+      { ...base, markers: [{ lineId: -2, kind: "x", missingCount: null }] }, null, [],
+    ]) expect(validateNewarchFrameMeta(bad)).toBeNull();
+  });
+
+  test("a delta continues only the same pane, epoch, geometry, route and live window, never going back", () => {
+    expect(newarchDeltaContinues(base, { ...base, revision: 31, nextLineId: 901, durableRevision: 30 })).toBe(true);
+    expect(newarchDeltaContinues(base, { ...base })).toBe(true);
+    for (const change of [
+      { sourceEpoch: 3 }, { geometryGeneration: 2 }, { routeGeneration: 5 }, { liveStartLine: 600 },
+      { revision: 29 }, { nextLineId: 899 }, { paneKey: { ...base.paneKey, paneId: "%4" } },
+      { metadataRevision: 6 },
+      { paneKey: { ...base.paneKey, birthGeneration: 2 } },
+    ]) expect(newarchDeltaContinues(base, { ...base, ...change } as NewarchFrameMeta)).toBe(false);
+  });
+
+  test("chooseMuxOutputFrame carries the descriptor onto a delta", () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `row ${i} with some padding text`);
+    const full: MuxFullOutputFrame = { channel: "s", type: "output", data: [...lines, "tail"].join("\n"), cursor: null, newarch: base };
+    const chosen = chooseMuxOutputFrame(full, lines);
+    expect(chosen.type).toBe("delta");
+    expect(chosen.newarch).toEqual(base);
+  });
+});
+
+import { HISTORY_PAGE_MARKER_LIMIT, validateHistoryPageMarkers } from "../src/protocol";
+
+describe("history page markers (NEWARCH-SWITCHON U2)", () => {
+  test("a legacy page has none; valid markers are cloned with their row position", () => {
+    expect(validateHistoryPageMarkers(undefined)).toEqual([]);
+    const raw = [
+      { lineId: 40, kind: "worker-dead", reason: "exit 137", missingCount: null },
+      { lineId: null, kind: "respawn-observed", missingCount: 3 },
+    ];
+    const parsed = validateHistoryPageMarkers(JSON.parse(JSON.stringify(raw)));
+    expect(parsed).toEqual(raw);
+    expect(parsed![0]).not.toBe(raw[0]);
+  });
+
+  test("malformed or oversized marker lists are null, never a guessed position", () => {
+    const ok = { lineId: 1, kind: "gap", missingCount: 2 };
+    for (const bad of [
+      null, {}, "x", [null], [[]],
+      [{ ...ok, lineId: -1 }], [{ ...ok, lineId: 1.5 }], [{ ...ok, lineId: "1" }],
+      [{ ...ok, kind: "" }], [{ ...ok, kind: "k".repeat(65) }], [{ ...ok, kind: 3 }],
+      [{ ...ok, missingCount: -2 }], [{ ...ok, reason: 7 }], [{ ...ok, reason: "r".repeat(513) }],
+      Array.from({ length: HISTORY_PAGE_MARKER_LIMIT + 1 }, () => ok),
+    ]) expect(validateHistoryPageMarkers(bad)).toBeNull();
+    expect(validateHistoryPageMarkers(Array.from({ length: HISTORY_PAGE_MARKER_LIMIT }, () => ok))?.length)
+      .toBe(HISTORY_PAGE_MARKER_LIMIT);
+  });
+});

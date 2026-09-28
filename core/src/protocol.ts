@@ -77,6 +77,8 @@ export type MuxFullOutputFrame = {
   /** Durable archive/live seam paired with this exact canonical capture. */
   boundary?: MuxHistoryBoundary;
   reset?: "resize" | "resync";
+  /** newarch-frame-v1: projection identity of this snapshot (pipe-pane route only). */
+  newarch?: NewarchFrameMeta;
 };
 
 /** A replacement suffix relative to the recipient's most recent full base. */
@@ -92,7 +94,136 @@ export type MuxDeltaFrame = {
   screen?: MuxPaneScreen | null;
   /** Durable archive/live seam paired with the reconstructed capture. */
   boundary?: MuxHistoryBoundary;
+  /** newarch-frame-v1 of the reconstructed snapshot; must continue the base's. */
+  newarch?: NewarchFrameMeta;
 };
+
+/**
+ * newarch-frame-v1 — identity of a snapshot served from the pipe-pane
+ * projection (NEWARCH L2-I). A delta is valid only on a base of the same
+ * pane, source epoch, geometry generation, route generation and live-window
+ * start, with a revision that does not go backwards; anything else needs a
+ * complete frame (the client asks for a resync). `markers` are the pane's most
+ * recent loss/unverified-reset markers: `lineId` is the history row they sit
+ * before, `missingCount` null when the size of the gap is unknown.
+ */
+export type NewarchFrameMeta = {
+  v: "newarch-frame-v1";
+  paneKey: { serverIdentity: string; paneId: string; birthGeneration: number };
+  sourceEpoch: number;
+  geometryGeneration: number;
+  routeGeneration: number;
+  /** Advances for marker/health changes even when terminal cells do not. */
+  metadataRevision?: number;
+  cols: number;
+  rows: number;
+  revision: number;
+  durableRevision: number;
+  nextLineId: number;
+  liveStartLine: number;
+  displaySource: "pipe" | "tmux-calibrated";
+  degraded: boolean;
+  markers: Array<{ lineId: number | null; kind: string; missingCount: number | null }>;
+};
+
+const NEWARCH_MARKER_LIMIT = 16;
+
+/** Parse and defensively clone a newarch-frame-v1 descriptor; null when malformed. */
+export function validateNewarchFrameMeta(value: unknown): NewarchFrameMeta | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const meta = value as Record<string, unknown>;
+  const key = meta.paneKey as Record<string, unknown> | null | undefined;
+  const count = (n: unknown, min = 0) => Number.isSafeInteger(n) && (n as number) >= min;
+  if (
+    meta.v !== "newarch-frame-v1"
+    || typeof key !== "object" || key === null
+    || typeof key.serverIdentity !== "string" || key.serverIdentity.length === 0 || key.serverIdentity.length > 512
+    || typeof key.paneId !== "string" || key.paneId.length === 0 || key.paneId.length > 64
+    || !count(key.birthGeneration)
+    || !count(meta.sourceEpoch) || !count(meta.geometryGeneration) || !count(meta.routeGeneration)
+    || (meta.metadataRevision !== undefined && !count(meta.metadataRevision))
+    || !count(meta.cols, 1) || !count(meta.rows, 1)
+    || !count(meta.revision) || !count(meta.durableRevision) || !count(meta.nextLineId) || !count(meta.liveStartLine)
+    || (meta.durableRevision as number) > (meta.revision as number)
+    || (meta.liveStartLine as number) > (meta.nextLineId as number)
+    || (meta.displaySource !== "pipe" && meta.displaySource !== "tmux-calibrated")
+    || typeof meta.degraded !== "boolean"
+    || !Array.isArray(meta.markers) || meta.markers.length > NEWARCH_MARKER_LIMIT
+  ) return null;
+  const markers: NewarchFrameMeta["markers"] = [];
+  for (const raw of meta.markers as unknown[]) {
+    if (typeof raw !== "object" || raw === null) return null;
+    const marker = raw as Record<string, unknown>;
+    if ((marker.lineId !== null && !count(marker.lineId)) || typeof marker.kind !== "string" || marker.kind.length === 0
+      || marker.kind.length > 64 || (marker.missingCount !== null && !count(marker.missingCount))) return null;
+    markers.push({ lineId: marker.lineId as number | null, kind: marker.kind, missingCount: marker.missingCount as number | null });
+  }
+  return {
+    v: "newarch-frame-v1",
+    paneKey: { serverIdentity: key.serverIdentity, paneId: key.paneId, birthGeneration: key.birthGeneration as number },
+    sourceEpoch: meta.sourceEpoch as number, geometryGeneration: meta.geometryGeneration as number,
+    routeGeneration: meta.routeGeneration as number,
+    ...(meta.metadataRevision === undefined ? {} : { metadataRevision: meta.metadataRevision as number }),
+    cols: meta.cols as number, rows: meta.rows as number,
+    revision: meta.revision as number, durableRevision: meta.durableRevision as number,
+    nextLineId: meta.nextLineId as number, liveStartLine: meta.liveStartLine as number,
+    displaySource: meta.displaySource, degraded: meta.degraded, markers,
+  };
+}
+
+/**
+ * One loss / unverified-reset marker on a projection history page (additive
+ * `markers` field of a newarch `history` payload). Same coordinates as
+ * {@link NewarchFrameMeta.markers}: the gap sits before row `lineId`.
+ */
+export type MuxHistoryPageMarker = {
+  lineId: number | null;
+  kind: string;
+  reason?: string;
+  missingCount: number | null;
+};
+
+/** Most markers one history page may carry on the wire. */
+export const HISTORY_PAGE_MARKER_LIMIT = 64;
+
+/**
+ * Parse and defensively clone a history page's `markers`. `undefined` (a
+ * legacy page) is an empty list; anything malformed or over the limit is null
+ * so a caller never draws a guessed position.
+ */
+export function validateHistoryPageMarkers(value: unknown): MuxHistoryPageMarker[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > HISTORY_PAGE_MARKER_LIMIT) return null;
+  const count = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  const markers: MuxHistoryPageMarker[] = [];
+  for (const raw of value as unknown[]) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const marker = raw as Record<string, unknown>;
+    if ((marker.lineId !== null && !count(marker.lineId)) || typeof marker.kind !== "string" || marker.kind.length === 0
+      || marker.kind.length > 64 || (marker.missingCount !== null && !count(marker.missingCount))
+      || (marker.reason !== undefined && (typeof marker.reason !== "string" || marker.reason.length > 512))) return null;
+    markers.push({
+      lineId: marker.lineId as number | null, kind: marker.kind,
+      ...(marker.reason === undefined ? {} : { reason: marker.reason as string }),
+      missingCount: marker.missingCount as number | null,
+    });
+  }
+  return markers;
+}
+
+/** A delta carrying `next` may apply on a base described by `base`. */
+export function newarchDeltaContinues(base: NewarchFrameMeta, next: NewarchFrameMeta): boolean {
+  return base.paneKey.serverIdentity === next.paneKey.serverIdentity
+    && base.paneKey.paneId === next.paneKey.paneId
+    && base.paneKey.birthGeneration === next.paneKey.birthGeneration
+    && base.sourceEpoch === next.sourceEpoch
+    && base.geometryGeneration === next.geometryGeneration
+    && base.routeGeneration === next.routeGeneration
+    && (next.metadataRevision ?? 0) >= (base.metadataRevision ?? 0)
+    && base.liveStartLine === next.liveStartLine
+    && next.revision >= base.revision
+    && next.nextLineId >= base.nextLineId;
+}
 
 export type MuxOutputFrame = MuxFullOutputFrame | MuxDeltaFrame;
 
@@ -424,6 +555,7 @@ export function chooseMuxOutputFrame(
   // additive proof cannot express — for a value this call site already holds.
   if (full.screen !== undefined) delta.screen = full.screen;
   if (full.boundary !== undefined) delta.boundary = full.boundary;
+  if (full.newarch !== undefined) delta.newarch = full.newarch;
   return shouldUseMuxDelta(full, delta) ? delta : full;
 }
 

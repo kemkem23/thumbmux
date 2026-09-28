@@ -2210,4 +2210,202 @@ describe("TermView sliding archive window", () => {
       });
     }
   });
+
+  describe("newarch loss markers and archive availability (I4 FIX1 U)", () => {
+    type Marker = { lineId: number | null; kind: string; missingCount: number | null };
+    const NA_GEN = "newarch:u-marker:%0:1:r1";
+
+    function deliverNewarch(
+      lines: string[],
+      markers: Marker[],
+      metadataRevision: number,
+      delivery: { source?: "full" | "delta"; replace?: boolean } = {},
+    ): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      const meta = {
+        source: delivery.source ?? "delta",
+        replace: delivery.replace ?? false,
+        screen: { alt: false, mouseSgr: false, mouseAny: false },
+        boundary: historyBoundary(NA_GEN, 100, 7),
+        newarch: {
+          v: "newarch-frame-v1" as const,
+          paneKey: { serverIdentity: "u-fixture", paneId: "%0", birthGeneration: 1 },
+          sourceEpoch: 3, geometryGeneration: 1, routeGeneration: 1, metadataRevision,
+          cols: 40, rows: 20, revision: 7, durableRevision: 7, nextLineId: 110, liveStartLine: 100,
+          displaySource: "pipe" as const, degraded: false, markers,
+        },
+      };
+      (sessionCallback as unknown as (d: string, t: string, c: null, m: typeof meta) => void)(
+        lines.join("\n"), "output", null, meta,
+      );
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function markerFor(viewport: HTMLElement, text: string): HTMLElement | null {
+      return Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-loss-marker"))
+        .find((el) => `${el.getAttribute("data-loss-marker") ?? ""} ${el.getAttribute("data-loss-detail") ?? ""}`.includes(text)) ?? null;
+    }
+
+    function deliverPage(startLine: number, lines: string[], markers: Marker[] | undefined, hasMore = false): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      sessionCallback(JSON.stringify({
+        lines, startLine, endLine: startLine + lines.length, hasMore,
+        ...(markers === undefined ? {} : { markers }),
+      }), "history");
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function rowTexted(viewport: HTMLElement, text: string): HTMLElement | null {
+      return Array.from(viewport.querySelectorAll<HTMLElement>(".mtv-line"))
+        .find((row) => row.textContent === text) ?? null;
+    }
+
+    /** Frame at live 100..129, then scroll into history and receive rows 0..99. */
+    async function scrollIntoPage(markers: Marker[] | undefined) {
+      const mountedView = mountTermView();
+      await tick();
+      deliverNewarch(liveLines("na", 30), [], 1, { source: "full", replace: true });
+      wheel(mountedView.viewport, -84);
+      expect(historyCalls.at(-1)).toMatchObject({ direction: "before" });
+      deliverPage(0, archiveLines(0, 100), markers);
+      await settleUi();
+      // Bring the newest page rows (archive-9x) into the rendered window.
+      wheel(mountedView.viewport, -560);
+      await settleUi();
+      return mountedView;
+    }
+
+    function noteText(target: HTMLElement): string {
+      return (target.querySelector('[data-testid="mtv-loss-notes"]')?.textContent ?? "").trim();
+    }
+
+    test("a marker raised on a static screen is drawn on its row and noted until its row is seen", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      const lines = liveLines("na", 30);
+      const attach: Marker = { lineId: 100, kind: "attach", missingCount: null };
+      deliverNewarch(lines, [attach], 1, { source: "full", replace: true });
+      // Present at attach: drawn at its row, never promoted to a note.
+      const attachMarker = markerFor(viewport, "attach");
+      expect(attachMarker).not.toBeNull();
+      expect(attachMarker!.nextElementSibling?.textContent).toBe("na-0");
+      expect(noteText(target)).toBe("");
+
+      // Same cells, new metadata revision: an off-screen row gets a marker.
+      const dead: Marker = { lineId: 102, kind: "worker-dead", missingCount: null };
+      deliverNewarch(lines, [attach, dead], 2);
+      const deadMarker = markerFor(viewport, "worker-dead");
+      expect(deadMarker).not.toBeNull();
+      expect(deadMarker!.nextElementSibling?.textContent).toBe("na-2");
+      // Reader words on the rule; the internal line id is diagnostic detail only.
+      expect(deadMarker!.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · ไม่ทราบจำนวน");
+      expect(deadMarker!.textContent).not.toContain("102");
+      expect(deadMarker!.getAttribute("data-loss-detail")).toBe("worker-dead · line 102 · pane %0 · epoch 3");
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
+
+      // A visible row's marker is seen at once: row rule only, no note.
+      const loss: Marker = { lineId: 128, kind: "unknown-loss", missingCount: 5 };
+      deliverNewarch(lines, [attach, dead, loss], 3);
+      await settleUi();
+      const lossMarker = markerFor(viewport, "unknown-loss");
+      expect(lossMarker?.nextElementSibling?.textContent).toBe("na-28");
+      expect(lossMarker?.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · 5 แถว");
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
+      expect(noteText(target)).not.toContain("5 แถว");
+
+      // A marker with no line id has no row: it is noted, stating so.
+      deliverNewarch(lines, [attach, dead, loss, { lineId: null, kind: "archive-unavailable", missingCount: null }], 4);
+      expect(noteText(target)).toContain("ไม่ทราบตำแหน่ง");
+      expect(target.querySelector<HTMLButtonElement>(".mtv-loss-note-jump")?.disabled).toBe(true);
+
+      // A legacy resync (route rollback) carries no descriptor: markers go.
+      deliverOutput(lines, { alt: false, mouseSgr: false, mouseAny: false }, undefined, { replace: true });
+      expect(viewport.querySelectorAll(".mtv-loss-marker").length).toBe(0);
+      expect(noteText(target)).toBe("");
+    });
+
+    test("a history page's marker is drawn on its row after scrolling up (U2)", async () => {
+      const gap: Marker = { lineId: 99, kind: "worker-dead", missingCount: null };
+      const { target, viewport } = await scrollIntoPage([gap]);
+      const rule = markerFor(viewport, "line 99");
+      expect(rule).not.toBeNull();
+      expect(rule!.nextElementSibling?.textContent).toBe("archive-99");
+      expect(rule!.getAttribute("data-loss-marker")).toBe("ข้อมูลหายตรงนี้ · ไม่ทราบจำนวน");
+      // History, not news: no header note for a page marker.
+      expect(noteText(target)).toBe("");
+
+      // A legacy frame (route rollback) drops page markers with the route.
+      deliverOutput(liveLines("legacy", 30), { alt: false, mouseSgr: false, mouseAny: false }, undefined, { replace: true });
+      expect(viewport.querySelectorAll(".mtv-loss-marker").length).toBe(0);
+    });
+
+    test("a page marker adds no row: anchor, row count and positions match the page without it (U2)", async () => {
+      const plain = await scrollIntoPage(undefined);
+      const plainTotal = numberAttr(plain.viewport, "data-total");
+      const plainOffset = numberAttr(plain.viewport, "data-bottom-offset");
+      const plainY = projectedScreenY(plain.viewport, rowTexted(plain.viewport, "archive-99")!);
+      const plainLiveY = projectedScreenY(plain.viewport, rowTexted(plain.viewport, "na-0")!);
+      const marked = await scrollIntoPage([
+        { lineId: 99, kind: "worker-dead", missingCount: null },
+        { lineId: 98, kind: "unknown-loss", missingCount: 3 },
+      ]);
+      expect(markerFor(marked.viewport, "line 98")).not.toBeNull();
+      expect(numberAttr(marked.viewport, "data-total")).toBe(plainTotal);
+      expect(numberAttr(marked.viewport, "data-bottom-offset")).toBe(plainOffset);
+      expect(projectedScreenY(marked.viewport, rowTexted(marked.viewport, "archive-99")!)).toBe(plainY);
+      expect(projectedScreenY(marked.viewport, rowTexted(marked.viewport, "na-0")!)).toBe(plainLiveY);
+    });
+
+    test("a page whose markers are malformed is refused, never drawn without its gaps (U2)", async () => {
+      const { viewport } = mountTermView();
+      await tick();
+      deliverNewarch(liveLines("na", 30), [], 1, { source: "full", replace: true });
+      wheel(viewport, -84);
+      deliverPage(0, archiveLines(0, 100), [{ lineId: -1, kind: "worker-dead", missingCount: null }]);
+      await settleUi();
+      expect(rowTexted(viewport, "archive-99")).toBeNull();
+    });
+
+    test("tapping the note brings the marker's row onto the screen (U2)", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      const lines = liveLines("na", 30);
+      deliverNewarch(lines, [], 1, { source: "full", replace: true });
+      deliverNewarch(lines, [{ lineId: 102, kind: "worker-dead", missingCount: null }], 2);
+      expect(noteText(target)).toBe("ข้อมูลหาย · ไม่ทราบจำนวน · แตะเพื่อไปที่จุดนั้น");
+      expect(numberAttr(viewport, "data-bottom-offset")).toBe(0);
+      const note = target.querySelector<HTMLButtonElement>(".mtv-loss-note-jump");
+      expect(note?.disabled).toBe(false);
+      note!.click();
+      flushSync();
+      drainScheduledWork();
+      await settleUi();
+      expect(numberAttr(viewport, "data-bottom-offset")).toBeGreaterThan(0);
+      const rule = markerFor(viewport, "line 102");
+      expect(rule?.nextElementSibling?.textContent).toBe("na-2");
+      // Seen once on screen: the note has done its job.
+      expect(noteText(target)).toBe("");
+    });
+
+    test("a retryable archive read error is shown until a page arrives", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(
+        liveLines("na-archive", 10),
+        { alt: false, mouseSgr: false, mouseAny: false },
+        historyBoundary("g-na-archive", 10_000, 1),
+      );
+      wheel(viewport, -84);
+      expect(historyCalls.length).toBe(1);
+      deliverHistoryError();
+      expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+      wheel(viewport, -42);
+      expect(historyCalls.length).toBe(2);
+      deliverHistory(8_000, archiveLines(8_000, 2_000), true, 10_000);
+      await settleUi();
+      expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).toBeNull();
+    });
+  });
 });

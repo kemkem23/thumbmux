@@ -340,3 +340,434 @@ describe('wave 5 authoritative writer', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 15000);
 });
+
+// ── NEWARCH L2-I lot I4: runtime adapter (collector I1 -> store I2 -> calibrator I3) ──
+import { mkdtempSync as i4Tmp, rmSync as i4Rm } from 'node:fs';
+import { tmpdir as i4TmpDir } from 'node:os';
+import { join as i4Join } from 'node:path';
+import {
+  BLANK_CELL, applyFrameDelta, canonicalCaptureCells, canonicalCaptureColor, canonicalParserColor, cellsToAnsi,
+  createPipeHistoryRuntime, parserRowCells, parserStyle, rowText, screenOverlap, type PaneTmuxMeta, type RawPaneCapture,
+} from '../src/pipe-history-runtime';
+import { TmuxCaptureDecoder } from '../src/tmux-capture-normalize';
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+
+const I4_META: PaneTmuxMeta = { cols: 40, rows: 6, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 2000, panePid: 1, mouseSgr: false, mouseAny: false };
+async function i4Until(predicate: () => boolean, ms = 15_000) {
+  const end = Date.now() + ms;
+  while (!predicate()) { if (Date.now() > end) throw new Error('condition not met'); await new Promise(r => setTimeout(r, 10)); }
+}
+
+describe('NEWARCH I4 cell codec (one codec, both producers)', () => {
+  test('parser colours and styles land in the capture namespace', () => {
+    expect(canonicalParserColor('default')).toBe('default');
+    expect(canonicalParserColor('red')).toBe('index:1');
+    expect(canonicalParserColor('brown')).toBe('index:3');
+    expect(canonicalParserColor('brightblue')).toBe('index:12');
+    // 38;5;9 reaches pyte as the palette hex; the 16 base colours keep their index.
+    expect(canonicalParserColor('ff0000')).toBe('index:9');
+    // Palette 16-255 and truecolor compare as rgb on both sides.
+    expect(canonicalParserColor('5f87af')).toBe('rgb:95,135,175');
+    expect(canonicalCaptureColor('index:67')).toBe('rgb:95,135,175');
+    expect(canonicalCaptureColor('index:3')).toBe('index:3');
+    // bold, italics, underscore, strike, reverse, blink.
+    expect([1, 2, 4, 8, 16, 32].map(parserStyle)).toEqual([1, 4, 8, 256, 64, 16]);
+  });
+
+  test('cells -> ANSI -> tmux capture decoder -> canonical cells is the identity', () => {
+    const row = parserRowCells([
+      ['red', 'default', 1, 'bold red '], ['5f87af', '000000', 2 | 4, 'ital'],
+      ['brightgreen', 'default', 16, ['漢', '', '😀', '', 'ไ', 'ท', 'ย']], ['default', 'default', 8 | 32, ' x'],
+    ], 40);
+    expect(row[13]).toMatchObject({ grapheme: '漢', width: 2, continuation: false });
+    expect(row[14]).toMatchObject({ grapheme: '', width: 0, continuation: true });
+    const decoder = new TmuxCaptureDecoder(40);
+    const decoded = canonicalCaptureCells(decoder.decode(cellsToAnsi(row) + '\n')[0]!, 40);
+    expect(decoded).toEqual(row);
+    expect(rowText(decoded)).toBe(rowText(row));
+    expect(cellsToAnsi(new Array(40).fill(BLANK_CELL))).toBe('');
+  });
+
+  test('capture keeps dim, rapid blink and hidden while repeated rows are never content-deduplicated', () => {
+    const captured = canonicalCaptureCells([{
+      grapheme: 'x', width: 1, continuation: false, fg: 'default', bg: 'default', style: 2 | 32 | 128,
+    }], 1);
+    expect(captured[0]!.style).toBe(2 | 32 | 128);
+    // Overlap is a tmux counter (SWITCHON H2), never a comparison of equal rows.
+    expect(screenOverlap({ displaySource: 'tmux-calibrated', kind: 'normal', pulledBack: null })).toBe(0);
+  });
+
+  test('frame deltas: shift first, then dirty rows; a geometry change without every row is incomplete', () => {
+    const base = applyFrameDelta(undefined, { full: true, cols: 4, rows: 3, shift: 0, dirty: { 0: [['default', 'default', 0, 'aaaa']], 1: [['default', 'default', 0, 'bbbb']], 2: [['default', 'default', 0, 'cccc']] }, softWrap: {}, wrapPad: [] });
+    const next = applyFrameDelta(base.screen, { full: false, cols: 4, rows: 3, shift: 1, dirty: { 2: [['default', 'default', 0, 'dddd']] }, softWrap: {}, wrapPad: [] });
+    expect(next.complete).toBe(true);
+    expect(next.screen.cells.map(rowText)).toEqual(['bbbb', 'cccc', 'dddd']);
+    expect(base.screen.cells.map(rowText)).toEqual(['aaaa', 'bbbb', 'cccc']);
+    const resized = applyFrameDelta(next.screen, { full: false, cols: 5, rows: 3, shift: 0, dirty: { 0: [['default', 'default', 0, 'eeeee']] }, softWrap: {}, wrapPad: [] });
+    expect(resized.complete).toBe(false);
+  });
+});
+
+describe('NEWARCH I4 runtime against the real VT worker and projection store', () => {
+  test('blank rows scroll with an out-of-order worker seq and still land in order, without a parser restart', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'i4-runtime-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const faults: string[] = [];
+    const runtime = createPipeHistoryRuntime({ store, onFault: f => faults.push(f.kind) });
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 't', paneId: '%1', birthGeneration: 1 }, session: 's', meta: I4_META, calibrate: false, capture: () => Promise.reject(new Error('unused')) });
+      const enc = new TextEncoder();
+      // A blank line every 5 rows: the worker stamps the blank row with the
+      // seq that scrolled it, later than the next written row's seq.
+      for (let i = 1; i <= 60; i++) pane.ingest(enc.encode(`row ${String(i).padStart(3, '0')} \x1b[3${i % 7}mok\x1b[0m\r\n${i % 5 === 0 ? '\r\n' : ''}`));
+      await i4Until(() => pane.recentRows().some(r => rowText(r.cells).startsWith('row 055')));
+      const texts = pane.recentRows().map(r => rowText(r.cells).trimEnd());
+      const ids = texts.filter(t => t.startsWith('row ')).map(t => Number(t.slice(4, 7)));
+      expect(ids).toEqual(Array.from({ length: ids.length }, (_, i) => i + 1));
+      expect(pane.recentRows().map(r => r.lineId)).toEqual(Array.from({ length: texts.length }, (_, i) => i));
+      expect(texts.filter(t => t === '').length).toBeGreaterThanOrEqual(10);
+      expect(faults.filter(k => k === 'consumer-rejected' || k === 'worker-restarted')).toEqual([]);
+      expect(pane.stats.latencyMs.length).toBeGreaterThan(0);
+      const range = pane.readRange(0, 5)!;
+      expect(range.lines[0]).toContain('row 001');
+      expect(pane.view().displaySource).toBe('pipe');
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('calibration certifies rows against a capture, journals a capture only when it changes something, and maps stale-revision to a CAS null', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'i4-calibrate-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    let staleOnce = false;
+    const proxy = new Proxy(store, { get(target, key, receiver) {
+      if (key === 'calibrate') return (change: Parameters<typeof store.calibrate>[0]) => {
+        if (staleOnce) { staleOnce = false; return Promise.reject(new Error('stale-revision')); }
+        return target.calibrate(change);
+      };
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const faults: string[] = [];
+    const runtime = createPipeHistoryRuntime({ store: proxy, onFault: f => faults.push(f.kind) });
+    let paneRef: import('../src/pipe-history-runtime').PipeHistoryPane | null = null;
+    let calls = 0;
+    // The capture double renders exactly what tmux would show: the parser's
+    // accepted rows and its screen, through the same ANSI serialisation.
+    const capture = async (tail: number): Promise<RawPaneCapture> => {
+      calls++;
+      const pane = paneRef!;
+      const view = pane.view();
+      const history = pane.recentRows().slice(-Math.max(0, tail)).map(r => cellsToAnsi(r.cells));
+      const screen = (view.cells.length ? view.cells : Array.from({ length: I4_META.rows }, () => [])).map(r => cellsToAnsi(r as never));
+      const meta = { ...I4_META, cursor: view.cursor ?? I4_META.cursor };
+      return { captureId: `c${calls}`, requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: [...history, ...screen].join('\n') + '\n', tail };
+    };
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 't', paneId: '%2', birthGeneration: 1 }, session: 's', meta: I4_META, capture, commitIntervalMs: 50 });
+      paneRef = pane;
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 30; i++) pane.ingest(enc.encode(`line ${String(i).padStart(3, '0')} unique ${i * 7919}\r\n`));
+      await i4Until(() => pane.recentRows().length >= 24 && pane.stats.storeCommits > 0);
+      const token = store.token(pane.paneKey);
+      await i4Until(() => store.readPage(store.token(pane.paneKey), 0, 20).lines.filter(l => l.checkState !== 'unchecked').length >= 15);
+      const page = store.readPage(store.token(pane.paneKey), 0, 20);
+      expect(page.lines.filter(l => l.checkState === 'checked').length).toBeGreaterThanOrEqual(10);
+      expect(token.nextLineId).toBeGreaterThanOrEqual(24);
+      // Idle: the next captures confirm what is certified and displayed; they are not journaled.
+      const commits = pane.stats.storeCommits;
+      await i4Until(() => pane.stats.skippedCommits >= 2, 10_000);
+      expect(pane.stats.storeCommits).toBe(commits);
+      expect(pane.view().displaySource).toBe('tmux-calibrated');
+      // A CAS conflict is a null, never a capture fault.
+      staleOnce = true;
+      pane.ingest(enc.encode('after conflict\r\n'));
+      await i4Until(() => pane.stats.captureConflicts === 1 || pane.stats.captureFaults > 0, 10_000);
+      expect(pane.stats.captureConflicts).toBe(1);
+      expect(pane.stats.captureFaults).toBe(0);
+      expect(faults.filter(k => k === 'capture-fault')).toEqual([]);
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+});
+
+// ── NEWARCH-SWITCHON FIX1 F1-H: a paused store, seen from the runtime ──
+import { FRAME_PRESSURE_RETRY_MS, ProjectionLiveWindow as F1HWindow } from '../src/pipe-history-runtime';
+
+describe('NEWARCH-SWITCHON F1-H runtime under a full disk', () => {
+  test('overlay marker in frame and page, refused screens back off, drain receipt waits for the durable barrier, unstored screen shown', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'f1h-runtime-'));
+    const full = { on: false };
+    const store = createProjectionStore({ historyRoot: root, mode: 'create', checkpoint: phase => {
+      if (full.on && phase === 'before-disk-commit') throw new Error('SQLiteError: database or disk is full');
+    } });
+    let screens = 0;
+    const proxy = new Proxy(store, { get(target, key, receiver) {
+      if (key === 'replaceScreen') return (frame: Parameters<typeof store.replaceScreen>[0]) => { screens++; return target.replaceScreen(frame); };
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const runtime = createPipeHistoryRuntime({ store: proxy });
+    const window = new F1HWindow();
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 'f1h', paneId: '%1', birthGeneration: 1 }, session: 's', meta: I4_META, calibrate: false, capture: () => Promise.reject(new Error('unused')) });
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 20; i++) pane.ingest(enc.encode(`kept ${i}\r\n`));
+      await i4Until(() => pane.recentRows().some(r => rowText(r.cells).trimEnd() === 'kept 12'));
+      const clean = await pane.drainReceipt(5000);
+      expect(clean).toMatchObject({ unknownTail: false, issues: [] });
+      expect(clean.durableRevision).toBe(clean.ramRevision);
+      expect(clean.lastAckedSequence).toBe(clean.lastAdmittedSequence);
+
+      full.on = true;
+      pane.ingest(enc.encode('while full\r\n'));
+      await i4Until(() => store.health().storage.status === 'storage-paused', 5000);
+      const token = store.token(pane.paneKey);
+      pane.setStorageOverlay({ eventId: 'e-1', kind: 'storage-full', reason: 'paused', boundaryLineId: token.nextLineId, detectedAt: Date.now() });
+      expect(pane.view().degraded).toBe(true);
+      expect(pane.view().issues.at(-1)).toMatchObject({ kind: 'storage-full', boundaryLineId: token.nextLineId, revision: token.revision });
+      const frame = window.snapshot(pane, 1)!;
+      expect(frame.newarch.degraded).toBe(true);
+      expect(frame.newarch.markers.some(m => m.kind === 'storage-full' && m.lineId === token.nextLineId)).toBe(true);
+      expect(pane.readRange(0, token.nextLineId)!.issues.some(i => i.kind === 'storage-full')).toBe(true);
+
+      // A refused screen is offered again every FRAME_PRESSURE_RETRY_MS, not in a
+      // settled promise chain (which would also starve this very timer).
+      const before = screens;
+      pane.ingest(enc.encode('\x1b[1;1Hredraw'));
+      const t0 = performance.now();
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const waited = performance.now() - t0;
+      const offered = screens - before;
+      expect(waited).toBeLessThan(1500);
+      expect(offered).toBeGreaterThanOrEqual(1);
+      expect(offered).toBeLessThanOrEqual(Math.ceil(waited / FRAME_PRESSURE_RETRY_MS) + 3);
+
+      // No durable barrier while paused: an unknown tail that names it, and
+      // no durable revision claimed (a RAM revision is never reported as on disk).
+      const paused = await pane.drainReceipt(300);
+      expect(paused.unknownTail).toBe(true);
+      expect(paused.issues.some(issue => issue.includes('durable barrier'))).toBe(true);
+      expect(paused.durableRevision).toBeNull();
+      expect(store.token(pane.paneKey).durableRevision).toBeLessThan(store.token(pane.paneKey).revision);
+
+      // Unstored display only while the overlay is up.
+      const meta = { ...I4_META, cursor: { x: 0, y: 1, visible: true } };
+      pane.showUnstored({ captureId: 'u1', requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: 'SEEN ON TMUX\n\n\n\n\n\n', tail: 0 });
+      expect(rowText(pane.view().cells[0] as never).trimEnd()).toBe('SEEN ON TMUX');
+      expect(pane.view().displaySource).toBe('tmux-calibrated');
+
+      full.on = false;
+      await i4Until(() => store.health().storage.status === 'healthy', 10_000);
+      const settled = await pane.drainReceipt(5000);
+      expect(settled.unknownTail).toBe(false);
+      expect(settled.durableRevision).toBe(settled.ramRevision);
+      pane.setStorageOverlay(null);
+      expect(pane.view().issues.some(i => i.kind === 'storage-full')).toBe(false);
+      pane.showUnstored({ captureId: 'u2', requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: 'IGNORED\n', tail: 0 });
+      expect(rowText(pane.view().cells[0] as never).trimEnd()).not.toBe('IGNORED');
+      const rows = store.readPage(store.token(pane.paneKey), 0, 100).lines.map(l => l.text.trimEnd()).filter(t => t.startsWith('kept '));
+      expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => `kept ${i + 1}`));
+      console.log('F1H_RUNTIME_PAUSE', JSON.stringify({ offered, waitedMs: Math.round(waited), retryMs: FRAME_PRESSURE_RETRY_MS, pausedIssues: paused.issues.length }));
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+});
+
+// ── NEWARCH-SWITCHON H2: the last page follows tmux across resizes; receipts close on capture ──
+import { spawnSync as h2Spawn } from 'node:child_process';
+import { appendFileSync as h2Append, openSync as h2Open, readSync as h2Read, closeSync as h2Close, writeFileSync as h2Write, existsSync as h2Exists } from 'node:fs';
+import { ProjectionLiveWindow as H2LiveWindow, type PipeHistoryPane as H2Pane } from '../src/pipe-history-runtime';
+import type { HistoryCell } from '../src/history-row-matcher';
+
+const H2_META_FORMAT = ['#{pane_width}', '#{pane_height}', '#{cursor_x}', '#{cursor_y}', '#{cursor_flag}', '#{alternate_on}', '#{history_size}', '#{history_limit}', '#{pane_pid}'].join('\t');
+/** One private tmux server (never the default socket): a pane running `tail -f` on a file, its output piped to another file. */
+function h2Tmux(cols: number, rows: number) {
+  const dir = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-'));
+  const socket = i4Join(dir, 'x.sock'), input = i4Join(dir, 'in.txt'), out = i4Join(dir, 'out.bin');
+  const env = { ...process.env }; delete env.TMUX; delete env.TMUX_PANE;
+  const tmux = (...args: string[]) => {
+    const r = h2Spawn('tmux', ['-S', socket, ...args], { encoding: 'utf8', env });
+    if (r.status !== 0) throw new Error(`tmux ${args[0]}: ${r.stderr}`);
+    return r.stdout;
+  };
+  h2Write(input, ''); h2Write(out, '');
+  tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'h2', '-x', String(cols), '-y', String(rows), `sleep 0.5; exec tail -n +1 -f '${input}'`);
+  tmux('set-option', '-g', 'window-size', 'manual');
+  tmux('set-option', '-g', 'status', 'off');
+  tmux('pipe-pane', '-O', '-t', 'h2:0.0', `cat >> '${out}'`);
+  const parse = (line: string): PaneTmuxMeta => {
+    const f = line.trim().split('\t');
+    const n = (i: number) => Number(f[i]);
+    return { cols: n(0), rows: n(1), cursor: { x: n(2), y: n(3), visible: f[4] === '1' }, alternate: f[5] === '1',
+      historySize: /^\d+$/.test(f[6] ?? '') ? n(6) : Number.NaN, historyLimit: n(7), panePid: n(8), mouseSgr: false, mouseAny: false };
+  };
+  const meta = () => parse(tmux('display-message', '-p', '-t', 'h2:0.0', H2_META_FORMAT));
+  let offset = 0, captures = 0;
+  return {
+    socket, tmux, meta,
+    write(text: string) { h2Append(input, text); },
+    /** Hand every byte tmux piped out so far to the pane (the host's FIFO reader). */
+    pump(pane: H2Pane) {
+      const fd = h2Open(out, 'r');
+      try {
+        const buf = Buffer.alloc(65536);
+        for (;;) { const n = h2Read(fd, buf, 0, buf.length, offset); if (n <= 0) break; offset += n; pane.ingest(new Uint8Array(buf.subarray(0, n))); }
+      } finally { h2Close(fd); }
+    },
+    /** capture-pane bracketed by metadata, like the host's capture batch. */
+    async capture(tail: number): Promise<RawPaneCapture> {
+      const requestedAt = Date.now();
+      const before = meta();
+      const body = tmux('capture-pane', '-p', '-e', '-N', '-t', 'h2:0.0', ...(tail > 0 ? ['-S', `-${tail}`] : []));
+      const after = meta();
+      return { captureId: `h2-${++captures}`, requestedAt, completedAt: Date.now(), before, after, body, tail };
+    },
+    screenText: () => tmux('capture-pane', '-p', '-t', 'h2:0.0').replace(/\n$/, '').split('\n').map(l => l.trimEnd()),
+    close() { try { tmux('kill-server'); } catch { /* already gone */ } i4Rm(dir, { recursive: true, force: true }); return !h2Exists(socket); },
+  };
+}
+
+describe('NEWARCH-SWITCHON H2 resize against a private tmux', () => {
+  test('24 -> 37 -> 24 -> 80: the live window follows tmux, rows appear once, the journal holds each row once, receipts close', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-store-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const faults: string[] = [];
+    const runtime = createPipeHistoryRuntime({ store, onFault: f => faults.push(f.kind) });
+    const t = h2Tmux(40, 24);
+    const window = new H2LiveWindow(1000);
+    let pane: H2Pane | null = null;
+    let written = 0;
+    const pumper = setInterval(() => { if (pane) t.pump(pane); }, 10);
+    const write = (n: number) => { let text = ''; for (let i = 0; i < n; i++) text += `R-${String(++written).padStart(4, '0')} x\n`; t.write(text); };
+    const liveIds = () => {
+      const snap = window.snapshot(pane!, 1);
+      return snap ? snap.content.split('\n').map(l => /^R-(\d{4}) /.exec(l)).filter(Boolean).map(m => Number(m![1])) : [];
+    };
+    /** The screen shown is tmux's, and every written row is in the live window exactly once, in order. */
+    const settled = async (label: string) => {
+      await i4Until(() => {
+        const view = pane!.view();
+        const m = t.meta();
+        if (view.displaySource !== 'tmux-calibrated' || view.rows !== m.rows) return false;
+        const shown = view.cells.map(r => rowText(r).trimEnd());
+        const tm = t.screenText();
+        return shown.length === tm.length && shown.every((l, i) => l === tm[i]) && liveIds().at(-1) === written;
+      }, 20_000).catch(() => { throw new Error(`${label}: screen never matched tmux; view=${JSON.stringify(pane!.view().pulledBack)} ids=${liveIds().slice(-40).join(',')}`); });
+      const ids = liveIds();
+      expect({ label, ids }).toEqual({ label, ids: Array.from({ length: written }, (_, i) => i + 1) });
+      return ids;
+    };
+    try {
+      pane = await runtime.addPane({ paneKey: { serverIdentity: 'h2', paneId: '%0', birthGeneration: 1 }, session: 'h2', meta: t.meta(), capture: tail => t.capture(tail), commitIntervalMs: 50 });
+      pane.setViewers(1);
+      await Bun.sleep(700);
+      write(60);
+      await i4Until(() => t.meta().historySize === 37 && pane!.recentRows().length === 37, 20_000);
+      await settled('24 rows');
+
+      // Grow: tmux pulls 13 history rows back onto the screen.
+      const h0 = t.meta().historySize;
+      t.tmux('resize-window', '-t', 'h2', '-x', '40', '-y', '37');
+      const grown = t.meta();
+      expect(h0 - grown.historySize).toBe(13);
+      pane.observe(grown);
+      // A chunk right after the resize lands while the calibrator is latched (held pipe frame).
+      write(1);
+      await settled('37 rows');
+      const pulled = pane.view().pulledBack;
+      // By tmux's counters: 13 pulled back, minus the rows output scrolled into history since.
+      expect(pulled?.rows).toBe(13 - (t.meta().historySize - grown.historySize));
+
+      // More output scrolls pulled rows back into history first.
+      write(9);
+      await settled('37 rows + 9');
+
+      // Shrink: tmux pushes the top rows into history; the parser's overflow reaches the journal once.
+      t.tmux('resize-window', '-t', 'h2', '-x', '40', '-y', '24');
+      pane.observe(t.meta());
+      await settled('back to 24');
+
+      // Grow past the whole history: every history row comes back.
+      write(5);
+      await settled('24 + 5');
+      t.tmux('resize-window', '-t', 'h2', '-x', '40', '-y', '80');
+      pane.observe(t.meta());
+      await settled('80 rows');
+      expect(t.meta().historySize).toBe(0);
+
+      // Journal: each row that left the parser screen is stored once, in order, R-0001 first.
+      const token = store.token(pane.paneKey);
+      const journal = pane.readRange(0, token.nextLineId)!.lines.map(l => /R-(\d{4}) /.exec(l)).filter(Boolean).map(m => Number(m![1]));
+      expect(journal).toEqual(Array.from({ length: journal.length }, (_, i) => i + 1));
+      expect(journal.length).toBe(token.nextLineId);
+      // Every received chunk is on a published screen: no latency entry left open.
+      await i4Until(() => pane!.pendingReceipts() === 0, 5_000).catch(() => {});
+      expect(pane.pendingReceipts()).toBe(0);
+      expect(faults.filter(k => k === 'history-cleared-external' || k === 'worker-restarted' || k === 'consumer-rejected')).toEqual([]);
+      expect(pane.view().issues.filter(i => i.kind === 'history-cleared-external')).toEqual([]);
+      console.log('SWITCHON_H2_RESIZE', JSON.stringify({ written, journal: journal.length, pulled13: pulled, pending: pane.pendingReceipts(), faults }));
+    } finally {
+      clearInterval(pumper);
+      await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true });
+      expect(t.close()).toBe(true);
+    }
+  }, 120_000);
+
+  test('a capture that replaces a held pipe frame closes that chunk\'s latency entry (idle pane, VR:91-96)', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-receipts-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const runtime = createPipeHistoryRuntime({ store });
+    let paneRef: H2Pane | null = null;
+    let calls = 0, holdFirst = false;
+    // The capture double shows what tmux shows: the parser's screen once it has
+    // parsed every received byte. With holdFirst it waits until the pipe frame
+    // of the last chunk is held behind the latch, the sequence V measured.
+    const capture = async (tail: number): Promise<RawPaneCapture> => {
+      calls++;
+      // Private state of the pane under test, read (never written) by the double.
+      const pane = paneRef! as unknown as {
+        read(): { parserFrame: { cells: HistoryCell[][]; cursor: { x: number; y: number; visible: boolean } | null } };
+        pendingPublish: unknown; recentRows: H2Pane['recentRows']; currentMeta: H2Pane['currentMeta'];
+      };
+      if (holdFirst) { await i4Until(() => pane.pendingPublish !== null, 5_000); holdFirst = false; }
+      const frame = pane.read().parserFrame;
+      const history = pane.recentRows().slice(-Math.max(0, tail)).map(r => cellsToAnsi(r.cells));
+      const screen = (frame.cells.length ? frame.cells : Array.from({ length: I4_META.rows }, () => [])).map(r => cellsToAnsi(r as never));
+      const meta = { ...pane.currentMeta(), cursor: frame.cursor ?? I4_META.cursor };
+      return { captureId: `r${calls}`, requestedAt: Date.now(), completedAt: Date.now(), before: meta, after: meta, body: [...history, ...screen].join('\n') + '\n', tail };
+    };
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 'h2r', paneId: '%2', birthGeneration: 1 }, session: 's', meta: { ...I4_META, historySize: 10 }, capture, commitIntervalMs: 50 });
+      paneRef = pane;
+      pane.setViewers(1);
+      const enc = new TextEncoder();
+      for (let i = 1; i <= 3; i++) pane.ingest(enc.encode(`line ${i}\r\n`));
+      await i4Until(() => pane.view().displaySource === 'tmux-calibrated' && pane.stats.skippedCommits >= 1 && pane.pendingReceipts() === 0, 15_000);
+      // An external clear-history latches the calibrator; the next chunk's pipe frame is held.
+      holdFirst = true;
+      pane.observe({ ...I4_META, historySize: 5 });
+      pane.ingest(enc.encode('IDLE-TAIL'));
+      await i4Until(() => pane.view().cells.some(r => rowText(r).startsWith('IDLE-TAIL')) && pane.view().displaySource === 'tmux-calibrated', 15_000);
+      expect(holdFirst).toBe(false);
+      // No later chunk will come to close it: the capture publish must.
+      await Bun.sleep(300);
+      expect(pane.pendingReceipts()).toBe(0);
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('an unreadable history_size leaves an uncertainty marker and hides nothing', async () => {
+    const root = i4Tmp(i4Join(i4TmpDir(), 'switchon-h2-unknown-'));
+    const store = createProjectionStore({ historyRoot: root, mode: 'create' });
+    const runtime = createPipeHistoryRuntime({ store });
+    try {
+      const pane = await runtime.addPane({ paneKey: { serverIdentity: 'h2u', paneId: '%1', birthGeneration: 1 }, session: 's', meta: I4_META, calibrate: false, capture: () => Promise.reject(new Error('unused')) });
+      pane.ingest(new TextEncoder().encode('hello\r\n'));
+      await i4Until(() => { try { store.token(pane.paneKey); return true; } catch { return false; } });
+      pane.observe({ ...I4_META, rows: 12, historySize: Number.NaN });
+      await i4Until(() => pane.view().issues.some(i => i.kind === 'history-size-unknown'));
+      // The same streak marks once; a readable number ends it.
+      pane.observe({ ...I4_META, rows: 12, historySize: Number.NaN });
+      pane.observe({ ...I4_META, rows: 12, historySize: 3 });
+      await Bun.sleep(100);
+      expect(pane.view().issues.filter(i => i.kind === 'history-size-unknown')).toHaveLength(1);
+      expect(pane.view().pulledBack ?? null).toBeNull();
+    } finally { await runtime.close(); await store.close(); i4Rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+});

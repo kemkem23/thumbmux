@@ -1,7 +1,83 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.2-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.3-dist`.
+
+## v0.20.3 — 2026-09-28
+
+Patch. Additive only: six new opt-in subpaths, no barrel change, no signature
+removal, no migration of existing data. A host that never imports the new
+subpaths loads exactly what it loaded on `v0.20.2-dist` (no `bun:sqlite`, no
+worker thread, no Python VT worker). The version is a patch on purpose: every
+workspace `@thumbmux/*` caret range stays satisfiable, so the lockfile does not
+move.
+
+### Added — pipe-pane history runtime (opt-in)
+
+The runtime keeps the live screen from `tmux pipe-pane` bytes (lowest latency)
+and calibrates it against `tmux capture-pane`; rows that scroll off are stored
+once in a SQLite projection so a viewer can page back through them.
+
+| Subpath | Module | What a host takes from it |
+|---|---|---|
+| `thumbmux/pipe-history-runtime` | `git-dist/server/pipe-history-runtime.js` | `createPipeHistoryRuntime`, `PIPE_HISTORY_RUNTIME_CAPABILITY`, `ProjectionLiveWindow`, `cellsToAnsi`, `createProjectionStore`, `pipeVtAssets`, `verifyPipeVtAssets`, and the pane/view types |
+| `thumbmux/server/projection-store` | `git-dist/server/sqlite-history/projection-store.js` | `createProjectionStore`, `ProjectionStore` (the writer) |
+| `thumbmux/server/projection-reader` | `git-dist/server/sqlite-history/projection-reader.js` | `openProjectionArchive` (read-only pages of a closed archive) |
+| `thumbmux/server/projection-schema` | `git-dist/server/sqlite-history/schema.js` | `PROJECTION_SCHEMA_VERSION` (now `4`) and the schema text |
+| `thumbmux/server/projection-types` | `git-dist/server/sqlite-history/types.js` | `PaneKey`, `ProjectionToken`, `ProjectionHealth`, `ProjectionCloseReceipt`, `ProjectionStorageState` … |
+| `thumbmux/server/history-row-matcher` | `git-dist/server/history-row-matcher.js` | `HistoryCell` and the row comparison helpers |
+
+`@thumbmux/server` names the same modules as `./pipe-history-runtime`,
+`./projection-store`, `./projection-reader`, `./projection-schema`,
+`./projection-types` and `./history-row-matcher`.
+
+```ts
+import { createPipeHistoryRuntime, createProjectionStore, pipeVtAssets, verifyPipeVtAssets,
+  PIPE_HISTORY_RUNTIME_CAPABILITY } from "thumbmux/pipe-history-runtime";
+import { PROJECTION_SCHEMA_VERSION } from "thumbmux/server/projection-schema";
+
+if (PIPE_HISTORY_RUNTIME_CAPABILITY.projectionSchema !== PROJECTION_SCHEMA_VERSION) throw new Error("mixed install");
+const assets = pipeVtAssets();          // worker + pinned vendor zip + licence beside the bundle
+verifyPipeVtAssets(assets);             // throws unless the vendor archive hashes to the pinned sha256
+const store = createProjectionStore({ historyRoot, mode: "create" });
+const runtime = createPipeHistoryRuntime({ store, assets });
+const pane = await runtime.addPane({ paneKey, session, meta, capture });
+pane.ingest(bytesFromPipePane);         // then read pane.recentRows(), page the archive with openProjectionArchive
+```
+
+The VT worker (`pipe-vt-worker.py`, `pipe-vt-vendor.zip`, `pipe-vt-LICENSE.txt`)
+ships beside the bundle and is resolved from `import.meta`; the git-dist build
+refuses to finish when the runtime entry is present without them. The runtime
+needs `python3` on the host.
+
+What is inside, by lot (all in this monorepo's history):
+
+- **L2-I (I1–I4)** — collector, shared VT parser worker, projection store and
+  calibrator joined by the runtime; frames are deltas, a refused frame is
+  offered again unchanged, capture cells are never fed back to the parser.
+- **SWITCHON FIX1/FIX2 and the S2/H2/P/U2/K lots** — v4 compact projection rows
+  (`pane_no` keys, sealed deflated blocks; v2/v3 archives are read-only),
+  rows tmux pulls back on resize hidden by `history_size`, budgeted frame
+  pacing and bounded stat rings, disk-full pause with a storage overlay and a
+  durable drain receipt, one recovery transition per outage, the seed-to-pipe
+  gap marked where it is, page loss markers carried to `TermView` as row rules,
+  and SGR 8 conceal / 28 reveal in `core` `ansi-html`.
+
+### Known debts carried in this tag
+
+- **D-KILLBURST** — a kill loop of 40 pipe kills while a pane writes
+  100 rows/s loses every row produced from the first kill to the last
+  respawn: about 101.5 rows per second of kill sequence (101.4–101.6 in every
+  run). The ~1,200 rows are the total over all 40 kills, not per kill
+  (7 runs 1,192–1,232, median 1,204). The loss is one gap covering the whole
+  kill sequence and it carries a loss marker; `silent` is 0 in every run, with
+  1 order violation per run. Reducing
+  it needs the collector to replay bytes handed to a dead worker into its
+  replacement instead of cutting a gap.
+- **D-STRESS** — 21 panes × 100 rows/s still exceeds the CPU/p95/PSS targets;
+  the numbers are printed in every report, not waived.
+- **D-AUTOROLLBACK** — there is no automatic fallback when the rate exceeds
+  capacity; rolling back is a host decision.
 
 ## v0.20.2 — 2026-09-17
 

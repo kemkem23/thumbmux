@@ -604,6 +604,14 @@ export class TerminalControlWalRecorder {
   private activeRecovery: TerminalControlPauseReconcileRequest | null = null;
   private readonly settledGapIds = new Set<string>();
   private pauseTimes: number[] = [];
+  /** True until the first output, then tracks whether the last kept output ended at 0x0a. */
+  private lastOutputEndedWithNewline = true;
+  /**
+   * After a pause that cut a line, tmux continue jumps to the live tail.
+   * The first resume fragment is not the rest of that line; absorb it through
+   * the next newline so greedy readers cannot glue it across the gap.
+   */
+  private absorbResumeToNewline = false;
   private attachCommandDone = false;
   private commandBlock: { at: string; number: string; flags: string } | null = null;
   private sessionChanged: { sessionId: string; session: string } | null = null;
@@ -970,6 +978,7 @@ export class TerminalControlWalRecorder {
       if (event.kind === "pause") {
         // appendOrderedGap returns only after fsync. If it throws, fail()
         // pauses stdout and this continue command is never sent.
+        if (!this.lastOutputEndedWithNewline) this.absorbResumeToNewline = true;
         const gapId = randomUUID();
         this.degraded = true;
         const gap = this.worker.appendOrderedGap({
@@ -1008,7 +1017,8 @@ export class TerminalControlWalRecorder {
     }
     if (event.kind === "output") {
       if (event.paneId !== source.paneId) throw new Error("tmux output came from the wrong pane");
-      this.worker.appendOrderedOutput(event.bytes);
+      const bytes = this.takeCanonicalOutput(event.bytes);
+      if (bytes.byteLength > 0) this.worker.appendOrderedOutput(bytes);
       return;
     }
     if (event.windowId !== source.windowId || event.paneId !== source.paneId) {
@@ -1020,6 +1030,24 @@ export class TerminalControlWalRecorder {
       `layout:${this.layoutCounter}`,
       "tmux-control-layout",
     );
+  }
+
+  private takeCanonicalOutput(payload: Uint8Array): Uint8Array {
+    let bytes = payload;
+    if (this.absorbResumeToNewline) {
+      const newline = bytes.indexOf(0x0a);
+      if (newline < 0) return new Uint8Array();
+      bytes = bytes.subarray(newline + 1);
+      this.absorbResumeToNewline = false;
+      if (bytes.byteLength === 0) {
+        this.lastOutputEndedWithNewline = true;
+        return bytes;
+      }
+    }
+    if (bytes.byteLength > 0) {
+      this.lastOutputEndedWithNewline = bytes[bytes.byteLength - 1] === 0x0a;
+    }
+    return bytes;
   }
 
   private continuePane(request: TerminalControlPauseReconcileRequest): void {

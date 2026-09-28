@@ -143,4 +143,61 @@ describe("ansi-html", () => {
     expect(html2).toContain("color:#e6e6e6");
     expect(html2).toContain("font-weight:700");
   });
+
+  test("SGR 8 hides ink as the cell background, text stays in the DOM (copyable)", () => {
+    const st = createSgrState();
+    // Ink = default background when no bg is set; the characters remain selectable text.
+    expect(lineToHtml("[\x1b[8mSECRET\x1b[0m]", st, pal))
+      .toBe('[<span style="color:#101014">SECRET</span>]');
+    expect(st.hidden).toBe(false);
+  });
+
+  test("SGR 28 reveals, and 0 resets hidden; the state carries across lines", () => {
+    const st = createSgrState();
+    expect(lineToHtml("\x1b[8mA\x1b[28mB", st, pal))
+      .toBe('<span style="color:#101014">A</span>B');
+    lineToHtml("\x1b[8mstart hidden", st, pal);
+    expect(st.hidden).toBe(true);
+    expect(lineToHtml("next row still hidden", st, pal))
+      .toBe('<span style="color:#101014">next row still hidden</span>');
+    expect(lineToHtml("\x1b[0mvisible", st, pal)).toBe("visible");
+    // 22 (normal intensity) and 27 (inverse off) must not reveal.
+    expect(lineToHtml("\x1b[8;22;27mX", createSgrState(), pal)).toBe('<span style="color:#101014">X</span>');
+  });
+
+  test("SGR 8 + colour: ink follows the cell background, not the foreground", () => {
+    expect(lineToHtml("\x1b[31;8mX", createSgrState(), pal)).toBe('<span style="color:#101014">X</span>');
+    expect(lineToHtml("\x1b[31;44;8mX", createSgrState(), pal))
+      .toBe('<span style="color:#00f;background-color:#00f">X</span>');
+    expect(lineToHtml("\x1b[38;2;10;200;90;48;5;208;8mX", createSgrState(), pal))
+      .toBe('<span style="color:#ff8700;background-color:#ff8700">X</span>');
+    // Underline/strike ink is hidden too.
+    expect(lineToHtml("\x1b[4;9;58;5;1;8mX", createSgrState(), pal)).toBe(
+      '<span style="color:#101014;text-decoration:underline line-through;text-decoration-color:#101014">X</span>',
+    );
+  });
+
+  test("SGR 8 + inverse: ink matches the swapped background", () => {
+    // inverse with default colours → bg = defaultFg, hidden ink = that same colour
+    expect(lineToHtml("\x1b[7;8mX", createSgrState(), pal))
+      .toBe('<span style="color:#e6e6e6;background-color:#e6e6e6">X</span>');
+    expect(lineToHtml("\x1b[31;44;7;8mX", createSgrState(), pal))
+      .toBe('<span style="color:#f00;background-color:#f00">X</span>');
+    // bold must not re-brighten hidden ink
+    expect(lineToHtml("\x1b[1;31;7;8mX", createSgrState(), pal))
+      .toBe('<span style="color:#f00;background-color:#f00;font-weight:700">X</span>');
+  });
+
+  test("hidden participates in the state key and legacy literals stay visible", () => {
+    const hidden = createSgrState();
+    lineToHtml("\x1b[8m", hidden, pal);
+    expect(sgrStateKey(hidden)).not.toBe(sgrStateKey(createSgrState()));
+    expect(sgrStateKey(legacySgrState())).toBe(sgrStateKey(createSgrState()));
+    expect(lineToHtml("x", legacySgrState({ hidden: true }), pal)).toBe('<span style="color:#101014">x</span>');
+    // A hidden link is still an anchor (copy/click behaviour) but its ink is hidden.
+    const html = lineToHtml("\x1b[8mhttps://x.dev", createSgrState(), pal, [{ start: 0, end: 13, href: "https://x.dev" }]);
+    expect(html).toContain('<a href="https://x.dev"');
+    expect(html).toContain("color:#101014");
+    expect(html).not.toContain("color:inherit");
+  });
 });

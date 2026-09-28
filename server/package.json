@@ -1,6 +1,6 @@
 {
   "name": "@thumbmux/server",
-  "version": "0.20.2",
+  "version": "0.20.3",
   "description": "Server side of the thumbmux mobile terminal stack: multiplexed tmux WebSocket engine with pluggable driver and policy hooks (Bun/Node).",
   "type": "module",
   "exports": {
@@ -15,6 +15,30 @@
     "./sqlite-history": {
       "types": "./dist/sqlite-history.d.ts",
       "import": "./dist/sqlite-history.js"
+    },
+    "./pipe-history-runtime": {
+      "types": "./dist/pipe-history-runtime.d.ts",
+      "import": "./dist/pipe-history-runtime.js"
+    },
+    "./projection-store": {
+      "types": "./dist/sqlite-history/projection-store.d.ts",
+      "import": "./dist/sqlite-history/projection-store.js"
+    },
+    "./projection-reader": {
+      "types": "./dist/sqlite-history/projection-reader.d.ts",
+      "import": "./dist/sqlite-history/projection-reader.js"
+    },
+    "./projection-schema": {
+      "types": "./dist/sqlite-history/schema.d.ts",
+      "import": "./dist/sqlite-history/schema.js"
+    },
+    "./projection-types": {
+      "types": "./dist/sqlite-history/types.d.ts",
+      "import": "./dist/sqlite-history/types.js"
+    },
+    "./history-row-matcher": {
+      "types": "./dist/history-row-matcher.d.ts",
+      "import": "./dist/history-row-matcher.js"
     }
   },
   "license": "MIT",
@@ -28,10 +52,10 @@
     "!**/*.pyo"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/terminal-replay-worker-entry.ts src/recall-handler.ts src/sqlite-history.ts --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json && bun run ./scripts/copy-runtime-assets.ts"
+    "build": "rm -rf dist && bun build src/index.ts src/terminal-replay-worker-entry.ts src/recall-handler.ts src/sqlite-history.ts src/pipe-history-runtime.ts src/sqlite-history/projection-store.ts src/sqlite-history/projection-reader.ts src/sqlite-history/schema.ts src/sqlite-history/types.ts src/history-row-matcher.ts --root src --outdir dist --target node --external @thumbmux/core && tsc -p tsconfig.build.json && bun run ./scripts/copy-runtime-assets.ts"
   },
   "dependencies": {
-    "@thumbmux/core": "^0.20.2"
+    "@thumbmux/core": "^0.20.3"
   },
   "devDependencies": {
     "typescript": "^5.9.3",

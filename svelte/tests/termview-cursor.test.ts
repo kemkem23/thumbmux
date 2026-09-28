@@ -26,9 +26,11 @@ type MuxCallback = (
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
+  static all: ControlledResizeObserver[] = [];
 
   constructor(private readonly callback: ResizeObserverCallback) {
     ControlledResizeObserver.latest = this;
+    ControlledResizeObserver.all.push(this);
   }
 
   observe(): void {}
@@ -57,6 +59,7 @@ let originalWindowResizeObserver: typeof ResizeObserver;
 beforeEach(() => {
   callback = null;
   ControlledResizeObserver.latest = null;
+  ControlledResizeObserver.all = [];
   originalSubscribe = tmuxMux.subscribe;
   originalResizeObserver = globalThis.ResizeObserver;
   originalWindowResizeObserver = window.ResizeObserver;
@@ -81,7 +84,11 @@ afterEach(() => {
   window.ResizeObserver = originalWindowResizeObserver;
 });
 
-function mountView(mode: ClaudeBashMode = 'off'): HTMLElement {
+function mountView(
+  mode: ClaudeBashMode = 'off',
+  renderer: 'dom' | 'canvas' = 'dom',
+  extra: Record<string, unknown> = {},
+): HTMLElement {
   const target = document.createElement('div');
   target.style.cssText = 'position:relative;width:400px;height:320px;';
   document.body.appendChild(target);
@@ -95,7 +102,9 @@ function mountView(mode: ClaudeBashMode = 'off'): HTMLElement {
         fontPx: 13,
         claimGeometry: false,
         claudeBashMode: mode,
+        renderer,
         screen: { alt: false, mouseSgr: false, mouseAny: false },
+        ...extra,
       },
     }) as Record<string, unknown>;
   });
@@ -249,5 +258,68 @@ describe('TermView cursor grid mapping', () => {
         expect(px(cursor(viewport).style.width)).toBeCloseTo(cellWidth, 5);
       }
     }
+  });
+});
+
+
+describe('Canvas FIX1 integration', () => {
+  test('repaints an in-place row update without scrolling and preserves the cursor', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(window.HTMLCanvasElement.prototype, 'getContext');
+    const painted: string[] = [];
+    const fonts: string[] = [];
+    Object.defineProperty(window.HTMLCanvasElement.prototype, 'getContext', {
+      configurable: true,
+      value: function(this: HTMLCanvasElement) {
+        return {
+          canvas: this, font: '', measureText: (text: string) => ({ width: text.length * 8 }),
+          setTransform() {}, clearRect() {}, fillRect() {}, save() {}, restore() {}, beginPath() {}, rect() {}, clip() {},
+          fillText(text: string) { painted.push(text); fonts.push(this.font); },
+        };
+      },
+    });
+    // The canvas font must come from computed style, never a raw `var(`.
+    // happy-dom 20.11 cannot parse a var() fallback that itself holds commas
+    // (the default `var(--font-mono, ui-monospace, monospace)`), so it returned
+    // the raw string and this case was red on the H base 5d8a88680 as well.
+    // A host-defined variable with a one-family fallback still exercises the
+    // same resolution through getComputedStyle; browsers handle the default.
+    document.documentElement.style.setProperty('--font-mono', 'monospace');
+    try {
+      const viewport = mountView('off', 'canvas', { canvasFontFamily: 'var(--font-mono, monospace)' });
+      const host = viewport.querySelector<HTMLElement>('.canvas-terminal')!;
+      Object.defineProperty(host, 'clientWidth', { configurable: true, get: () => 388 });
+      for (const observer of ControlledResizeObserver.all) observer.fire();
+      await deliver(['old'], { row: 0, col: 1 });
+      expect(painted.join('')).toContain('old');
+      const top = viewport.scrollTop;
+      painted.length = 0;
+      await deliver(['new'], { row: 0, col: 2 });
+      expect(painted.join('')).toContain('new');
+      expect(painted.join('')).not.toContain('old');
+      expect(viewport.scrollTop).toBe(top);
+      expect(viewport.querySelector('.mirror-row')!.textContent).toBe('new');
+      expect(cursor(viewport).dataset.cursorCol).toBe('2');
+      expect(fonts.every(font => !font.includes('var(') && font.startsWith('13px '))).toBe(true);
+      await deliver(['\x1b]8;;https://real.example/secret\x07https://decoy.example/x\x1b]8;;\x07'], { row: 0, col: 1 });
+      const links = viewport.querySelectorAll('.link-layer a');
+      expect(links).toHaveLength(1);
+      expect(links[0]!.getAttribute('href')).toBe('https://real.example/secret');
+    } finally {
+      document.documentElement.style.removeProperty('--font-mono');
+      if (descriptor) Object.defineProperty(window.HTMLCanvasElement.prototype, 'getContext', descriptor);
+      else Reflect.deleteProperty(window.HTMLCanvasElement.prototype, 'getContext');
+    }
+  });
+
+  test('compact Bash rows share DOM presentation top and cursor geometry', async () => {
+    const lines = ['before', '● Bash(printf cursor-tail)', '  ⎿  hidden-output', '● semantic-boundary', 'last-content'];
+    const dom = mountView('hide');
+    await deliver(lines, { row: 0, col: 1 });
+    const expected = [...dom.querySelectorAll<HTMLElement>('.mtv-line')].map(row => [row.dataset.lineId, row.dataset.presentationTop, row.dataset.presentationHeight]);
+    const expectedCursor = cursor(dom).style.top;
+    const canvas = mountView('hide', 'canvas');
+    await deliver(lines, { row: 0, col: 1 });
+    expect([...canvas.querySelectorAll<HTMLElement>('.mtv-line')].map(row => [row.dataset.lineId, row.dataset.presentationTop, row.dataset.presentationHeight])).toEqual(expected);
+    expect(cursor(canvas).style.top).toBe(expectedCursor);
   });
 });

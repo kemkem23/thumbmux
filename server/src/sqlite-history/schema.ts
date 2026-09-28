@@ -149,3 +149,127 @@ CREATE TRIGGER frame_append BEFORE INSERT ON history_frame BEGIN
 END;
 CREATE TRIGGER frame_immutable BEFORE UPDATE ON history_frame BEGIN SELECT RAISE(ABORT,'immutable-frame'); END;
 `;
+
+// Separate factory and database. Do not change SCHEMA_VERSION (the v1 factory).
+// Version 4 is a new synthetic database, never an in-place migration: a v3 file
+// is read through openProjectionArchive only, and the v4 writer refuses it.
+// Capture pixels and the displayed screen deliberately have no durable
+// column/table: captures are calibration receipts and na_screen exists in RAM only.
+// v4 (004-newarch-compact-rows): lines keep their text and a compact `cells`
+// string (codec.ts encodeRow), panes are referenced by the small pane_no,
+// check state/reason are codes (CHECK_STATES/CHECK_REASONS), receipt hashes are
+// 32-byte blobs, na_commit keeps only the latest commit, and settled lines are
+// sealed into deflated na_block rows (disk only; see projection-store sealBlocks).
+export const PROJECTION_SCHEMA_MARKERS = ['pane_no INTEGER NOT NULL','screen_hash BLOB','history_hash BLOB','na_block'];
+export const PROJECTION_SCHEMA_VERSION = 4;
+export const PROJECTION_MIGRATION = '004-newarch-compact-rows';
+export const CHECK_STATES = ['unchecked','checked','content-matched'] as const;
+export const CHECK_REASONS = ['awaiting-capture','evicted-before-check','exact-capture','content-capture'] as const;
+export const PROJECTION_SCHEMA = `
+CREATE TABLE na_pane (
+ pane_no INTEGER PRIMARY KEY, pane_key TEXT NOT NULL UNIQUE, session_uuid TEXT NOT NULL, server_identity TEXT NOT NULL,
+ pane_id TEXT NOT NULL, birth_generation INTEGER NOT NULL, source_epoch INTEGER NOT NULL,
+ geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
+ screen_kind TEXT NOT NULL CHECK(screen_kind IN ('normal','alternate')),
+ next_line_id INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+ durable_revision INTEGER NOT NULL DEFAULT 0, health TEXT NOT NULL DEFAULT 'healthy',
+ receive_seq INTEGER NOT NULL DEFAULT -1,
+ CHECK(durable_revision<=revision AND next_line_id>=0)
+) STRICT;
+CREATE TABLE na_capture (
+ pane_no INTEGER NOT NULL REFERENCES na_pane(pane_no), capture_id TEXT NOT NULL,
+ revision INTEGER NOT NULL, source_epoch INTEGER NOT NULL, requested_at REAL NOT NULL,
+ completed_at REAL NOT NULL, geometry_generation INTEGER NOT NULL,
+ first_history_row INTEGER NOT NULL, history_count INTEGER NOT NULL,
+ screen_hash BLOB NOT NULL, history_hash BLOB NOT NULL,
+ observed_fields ANY NOT NULL,
+ compared_rows INTEGER NOT NULL, corrected_cells INTEGER NOT NULL, ambiguous_rows INTEGER NOT NULL,
+ result TEXT NOT NULL, PRIMARY KEY(pane_no,capture_id),
+ UNIQUE(pane_no,capture_id,source_epoch,geometry_generation)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE na_line (
+ pane_no INTEGER NOT NULL REFERENCES na_pane(pane_no), source_epoch INTEGER NOT NULL,
+ line_id INTEGER NOT NULL, revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL,
+ text TEXT NOT NULL, cells TEXT NOT NULL, soft_wrap INTEGER NOT NULL CHECK(soft_wrap IN(0,1)),
+ check_state INTEGER NOT NULL CHECK(check_state IN(0,1,2)), check_reason INTEGER NOT NULL CHECK(check_reason BETWEEN 0 AND 3),
+ checked_capture_id TEXT, checked_row INTEGER,
+ PRIMARY KEY(pane_no,line_id),
+ FOREIGN KEY(pane_no,checked_capture_id,source_epoch,geometry_generation)
+ REFERENCES na_capture(pane_no,capture_id,source_epoch,geometry_generation),
+ CHECK((check_state=0 AND checked_capture_id IS NULL AND checked_row IS NULL)
+ OR (check_state IN(1,2) AND checked_capture_id IS NOT NULL AND checked_row>=0))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE na_block (
+ block_no INTEGER PRIMARY KEY, pane_no INTEGER NOT NULL REFERENCES na_pane(pane_no),
+ first_line_id INTEGER NOT NULL, line_count INTEGER NOT NULL CHECK(line_count BETWEEN 1 AND 4096),
+ max_revision INTEGER NOT NULL, data BLOB NOT NULL, UNIQUE(pane_no,first_line_id)
+) STRICT;
+CREATE TABLE na_issue (
+ issue_id TEXT PRIMARY KEY, pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), source_epoch INTEGER NOT NULL,
+ revision INTEGER NOT NULL, boundary_line_id INTEGER, kind TEXT NOT NULL, reason TEXT NOT NULL,
+ missing_count INTEGER, detected_at REAL NOT NULL, resolved_at REAL
+) STRICT;
+CREATE TABLE na_commit (
+ commit_id TEXT PRIMARY KEY, commit_seq INTEGER NOT NULL, revision INTEGER NOT NULL, committed_at REAL NOT NULL,
+ pane_watermarks_json TEXT NOT NULL, digest TEXT NOT NULL
+) STRICT;
+`;
+
+/** The v3 layout (003-newarch-calibration-receipts), kept to read closed v3 archives and to build v3 fixtures. */
+export const PROJECTION_V3_SCHEMA = `
+CREATE TABLE na_pane (
+ pane_key TEXT PRIMARY KEY, session_uuid TEXT NOT NULL, server_identity TEXT NOT NULL,
+ pane_id TEXT NOT NULL, birth_generation INTEGER NOT NULL, source_epoch INTEGER NOT NULL,
+ geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
+ screen_kind TEXT NOT NULL CHECK(screen_kind IN ('normal','alternate')),
+ next_line_id INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+ durable_revision INTEGER NOT NULL DEFAULT 0, health TEXT NOT NULL DEFAULT 'healthy',
+ receive_seq INTEGER NOT NULL DEFAULT -1,
+ CHECK(durable_revision<=revision AND next_line_id>=0)
+) STRICT;
+CREATE TABLE na_capture (
+ pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), capture_id TEXT NOT NULL,
+ revision INTEGER NOT NULL, source_epoch INTEGER NOT NULL, requested_at REAL NOT NULL,
+ completed_at REAL NOT NULL, geometry_generation INTEGER NOT NULL,
+ first_history_row INTEGER NOT NULL, history_count INTEGER NOT NULL,
+ screen_hash TEXT NOT NULL, history_hash TEXT NOT NULL,
+ observed_fields_json TEXT NOT NULL,
+ compared_rows INTEGER NOT NULL, corrected_cells INTEGER NOT NULL, ambiguous_rows INTEGER NOT NULL,
+ result TEXT NOT NULL, PRIMARY KEY(pane_key,capture_id),
+ UNIQUE(pane_key,capture_id,source_epoch,geometry_generation)
+) STRICT;
+CREATE TABLE na_line (
+ pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), source_epoch INTEGER NOT NULL,
+ line_id INTEGER NOT NULL, revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL,
+ text TEXT NOT NULL, cells_json TEXT NOT NULL, soft_wrap INTEGER NOT NULL CHECK(soft_wrap IN(0,1)),
+ check_state TEXT NOT NULL CHECK(check_state IN('unchecked','checked','content-matched')), check_reason TEXT NOT NULL,
+ checked_capture_id TEXT, checked_row INTEGER,
+ PRIMARY KEY(pane_key,line_id),
+ FOREIGN KEY(pane_key,checked_capture_id,source_epoch,geometry_generation)
+ REFERENCES na_capture(pane_key,capture_id,source_epoch,geometry_generation),
+ CHECK((check_state='unchecked' AND checked_capture_id IS NULL AND checked_row IS NULL)
+ OR (check_state IN('checked','content-matched') AND checked_capture_id IS NOT NULL AND checked_row>=0))
+) STRICT, WITHOUT ROWID;
+CREATE TABLE na_issue (
+ issue_id TEXT PRIMARY KEY, pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), source_epoch INTEGER NOT NULL,
+ revision INTEGER NOT NULL, boundary_line_id INTEGER, kind TEXT NOT NULL, reason TEXT NOT NULL,
+ missing_count INTEGER, detected_at REAL NOT NULL, resolved_at REAL
+) STRICT;
+CREATE TABLE na_commit (
+ commit_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, committed_at REAL NOT NULL,
+ pane_watermarks_json TEXT NOT NULL, digest TEXT NOT NULL
+) STRICT;
+`;
+
+/** Volatile display state. This schema is installed only in ProjectionRam. */
+export const PROJECTION_RAM_SCREEN_SCHEMA = `
+CREATE INDEX na_line_pending_revision ON na_line(pane_no,revision);
+CREATE TABLE na_screen (
+ pane_key TEXT NOT NULL REFERENCES na_pane(pane_key), pane_no INTEGER NOT NULL, screen_kind TEXT NOT NULL,
+ revision INTEGER NOT NULL, geometry_generation INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL,
+ cells_json TEXT NOT NULL, cursor_json TEXT NOT NULL, last_capture_id TEXT, captured_at REAL,
+ display_source TEXT NOT NULL CHECK(display_source IN('pipe','tmux-calibrated')), observed_fields_json TEXT NOT NULL,
+ uncertain_rows_json TEXT NOT NULL DEFAULT '[]',
+ PRIMARY KEY(pane_key,screen_kind), FOREIGN KEY(pane_no,last_capture_id) REFERENCES na_capture(pane_no,capture_id)
+) STRICT;
+`;

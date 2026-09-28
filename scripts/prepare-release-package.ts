@@ -84,6 +84,41 @@ export function frameworkFreeWorkspaceExports(): Record<
   return out;
 }
 
+/**
+ * NEWARCH pipe-pane history runtime and the projection store/reader it writes
+ * and reads. Opt-in: none of these is re-exported from the server barrel, so a
+ * host that only imports the WebSocket engine never loads bun:sqlite, a worker
+ * thread or the VT worker. Each value is the module path under server/dist/
+ * (also the server build entry list) without extension.
+ *
+ * ./pipe-history-runtime is top-level on purpose: it is the one entry a host
+ * turns on. The projection pieces sit under ./server/ beside sqlite-history.
+ */
+export const PIPE_HISTORY_SUBPATHS = {
+  "./pipe-history-runtime": "pipe-history-runtime",
+  "./server/projection-store": "sqlite-history/projection-store",
+  "./server/projection-reader": "sqlite-history/projection-reader",
+  "./server/projection-schema": "sqlite-history/schema",
+  "./server/projection-types": "sqlite-history/types",
+  "./server/history-row-matcher": "history-row-matcher",
+} as const;
+
+export function pipeHistoryReleaseExports(): Record<string, { types: string; import: string }> {
+  const out: Record<string, { types: string; import: string }> = {};
+  for (const [key, module] of Object.entries(PIPE_HISTORY_SUBPATHS)) {
+    out[key] = { types: "./git-dist/server/" + module + ".d.ts", import: "./git-dist/server/" + module + ".js" };
+  }
+  return out;
+}
+
+export function pipeHistoryWorkspaceExports(): Record<string, { types: string; import: string }> {
+  const out: Record<string, { types: string; import: string }> = {};
+  for (const [key, module] of Object.entries(PIPE_HISTORY_SUBPATHS)) {
+    out[key] = { types: "./server/dist/" + module + ".d.ts", import: "./server/dist/" + module + ".js" };
+  }
+  return out;
+}
+
 export const RELEASE_PACKAGE_EXPORTS = {
   // Root entry: framework-free core surface. Without this, import("thumbmux")
   // throws "No exports main defined". Pointing at core (not svelte/app) keeps
@@ -117,6 +152,9 @@ export const RELEASE_PACKAGE_EXPORTS = {
     types: "./git-dist/server/sqlite-history.d.ts",
     import: "./git-dist/server/sqlite-history.js",
   },
+  // NEWARCH pipe-pane runtime plus the projection store/reader a host needs
+  // beside it. See PIPE_HISTORY_SUBPATHS.
+  ...pipeHistoryReleaseExports(),
   "./svelte": {
     types: "./git-dist/svelte/index.d.ts",
     svelte: "./git-dist/svelte/index.js",

@@ -394,6 +394,62 @@ describe("TM-24 ComposerDock DIRECT terminal key encoding", () => {
     expect(pasteEvents.every((event) => !event.defaultPrevented)).toBe(true);
     expect(keys).toEqual([]);
   });
+
+  test("commits 100 IME input events exactly once each", async () => {
+    const { ghost, texts } = mountDirectDock();
+    await tick();
+
+    for (let i = 0; i < 100; i += 1) {
+      const value = `คำ${i}`;
+      flushSync(() => {
+        ghost.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        ghost.value = value;
+        const interim = new InputEvent("input", {
+          bubbles: true,
+          data: value,
+          inputType: "insertCompositionText",
+        });
+        Object.defineProperty(interim, "isComposing", { get: () => true });
+        ghost.dispatchEvent(interim);
+        ghost.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: value }));
+        ghost.value = value;
+        ghost.dispatchEvent(new InputEvent("input", {
+          bubbles: true,
+          data: value,
+          inputType: "insertText",
+        }));
+      });
+    }
+
+    expect(texts).toHaveLength(100);
+    expect(new Set(texts).size).toBe(100);
+    expect(texts[0]).toBe("คำ0");
+    expect(texts[99]).toBe("คำ99");
+  });
+
+  test("switching modes preserves the compose draft and never submits it", async () => {
+    let mode: "compose" | "direct" = "compose";
+    let text = "draft must stay local";
+    const sent: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      get mode() { return mode; },
+      set mode(value: "compose" | "direct") { mode = value; },
+      get text() { return text; },
+      set text(value: string) { text = value; },
+      onSend: (value: string) => sent.push(value),
+      onDirectText: () => {},
+      onDirectKey: () => {},
+    });
+    await tick();
+    const buttons = target.querySelectorAll<HTMLButtonElement>(".mode-btn");
+    flushSync(() => buttons[1]!.click());
+    flushSync(() => buttons[0]!.click());
+    await tick();
+    expect(mode).toBe("compose");
+    expect(text).toBe("draft must stay local");
+    expect(sent).toEqual([]);
+  });
 });
 
 // ─── A6-4: DesktopKeys async paste must not outlive the component ───────────

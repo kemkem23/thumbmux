@@ -64,6 +64,13 @@ describe('thumbmux e2e runtime admission', () => {
     expect(guard).toBeGreaterThan(-1);
     expect(launch).toBeGreaterThan(guard);
     expect(driver).toContain('assertLocalDemoUrl(process.env.DEMO_URL)');
+    // GUARDFIX2 url-check-after-browser-launch
+    const urlCheck = driver.indexOf('assertLocalDemoUrl(process.env.DEMO_URL)');
+    const browserLaunches = [...driver.matchAll(/\bchromium\.launch\s*\(/g)];
+    expect(urlCheck).toBeGreaterThan(-1);
+    expect(browserLaunches.length).toBeGreaterThan(0);
+    for (const call of browserLaunches) expect(call.index).toBeGreaterThan(urlCheck);
+    // END GUARDFIX2
     expect(driver).not.toContain('?? "/tmp/thumbmux-media-artifacts"');
   });
 
@@ -177,6 +184,19 @@ describe('thumbmux e2e runtime admission', () => {
     );
     expect(action).not.toContain('shell: bash');
     expect(action).toContain('shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}');
+    // GUARDFIX2 action-has-one-fixed-shell-but-another-unsafe-shell
+    const parsed = Bun.YAML.parse(action) as {
+      runs?: { steps?: Array<{ run?: string; shell?: string }> };
+      steps?: Array<{ run?: string; shell?: string }>;
+    };
+    // Check every shell-bearing step too, including malformed shell-only steps.
+    const shellSteps = (parsed.runs?.steps ?? parsed.steps ?? [])
+      .filter((step) => step.run !== undefined || step.shell !== undefined);
+    expect(shellSteps.length).toBeGreaterThan(0);
+    for (const step of shellSteps) {
+      expect(step.shell).toBe('/usr/bin/bash --noprofile --norc -p -e -o pipefail {0}');
+    }
+    // END GUARDFIX2
   });
 
   test('public runners transfer committed archives and reject production ports', () => {
@@ -185,10 +205,25 @@ describe('thumbmux e2e runtime admission', () => {
     const parity = readFileSync(resolve(import.meta.dir, 'ci-parity.sh'), 'utf8');
     for (const source of [e2e, media]) {
       expect(source).toContain('thumbmux_emit_frozen_source_archive');
+      // GUARDFIX2 archive-helper-defined-but-bypassed
+      // Match the producer and Docker stdin consumer in the same pipeline;
+      // a function definition or an unrelated invocation cannot satisfy this.
+      const commands = source.replace(/\\\r?\n/g, ' ').replace(/^\s*#.*$/gm, '');
+      const transfers = [...commands.matchAll(/^\s*thumbmux_emit_frozen_source_archive\s*\|\s*docker exec -i "\$CONTAINER_ID" bash -lc 'mkdir -p \/app && tar -C \/app -xf -'/gm)];
+      expect(transfers.length).toBe(1);
+      const archiveConsumers = [...commands.matchAll(/tar -C \/app -xf -/g)];
+      expect(archiveConsumers.length).toBe(transfers.length);
+      // END GUARDFIX2
       expect(source).not.toContain('tar -C "$PACKAGE_ROOT"');
       expect(source).toContain('47779|47780)');
     }
     expect(parity).toContain('thumbmux_emit_frozen_source_archive');
+    // GUARDFIX2 parity-archive-helper-defined-but-bypassed
+    const parityCommands = parity.replace(/\\\r?\n/g, ' ').replace(/^\s*#.*$/gm, '');
+    const exports = [...parityCommands.matchAll(/^\s*thumbmux_emit_frozen_source_archive\s*\|\s*\/usr\/bin\/tar -x -C "\$work"/gm)];
+    expect(exports.length).toBe(1);
+    expect([...parityCommands.matchAll(/\/usr\/bin\/tar -x -C "\$work"/g)].length).toBe(exports.length);
+    // END GUARDFIX2
     expect(parity).toContain('THUMBMUX_PUBLIC_EXPORT_ATTESTATION');
     expect(parity).toContain('write-tree');
     expect(parity).not.toContain('mktemp -d -t thumbmux-ci-parity');
@@ -225,6 +260,14 @@ describe('thumbmux e2e runtime admission', () => {
     expect(e2e).toContain('$PACKAGE_ROOT/node_modules/.bun/@playwright+test@1.61.1/node_modules/@playwright/test/cli.js');
     expect(e2e).toContain("thumbmux_assert_attested_node || fail 'attested Node changed before Playwright launch'");
     expect(e2e).toContain('"$THUMBMUX_GUARD_NODE_BIN" "$PLAYWRIGHT_CLI" test');
+    // GUARDFIX2 node-playwright-call-before-admission
+    const commands = e2e.replace(/\\\r?\n/g, ' ').replace(/^\s*#.*$/gm, '');
+    const admission = commands.search(/^\s*thumbmux_prepare_test_runtime(?:\s|$)/m);
+    const launches = [...commands.matchAll(/"\$THUMBMUX_GUARD_NODE_BIN"\s+"\$PLAYWRIGHT_CLI"\s+test\b/g)];
+    expect(admission).toBeGreaterThan(-1);
+    expect(launches.length).toBeGreaterThan(0);
+    for (const call of launches) expect(call.index).toBeGreaterThan(admission);
+    // END GUARDFIX2
     expect(e2e).not.toContain('"$THUMBMUX_GUARD_BUN_BIN" "$PLAYWRIGHT_CLI"');
     expect(e2e).not.toContain('node_modules/.bin/playwright');
   });
@@ -241,6 +284,18 @@ describe('thumbmux e2e runtime admission', () => {
   test('every package tmux command is forced through one explicit private socket', () => {
     const shim = readFileSync(resolve(import.meta.dir, 'private-test-tmux.sh'), 'utf8');
     expect(shim).toContain('/usr/bin/env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR /usr/bin/tmux -S "$socket"');
+    // GUARDFIX2 one-pinned-call-does-not-force-every-tmux-command
+    // This shim deliberately has one executable tmux site. Remove only its
+    // binary availability test, then account for every remaining tmux token.
+    const commands = shim.replace(/\\\r?\n/g, ' ').replace(/^\s*#.*$/gm, '')
+      .replace(/\[\[ -x \/usr\/bin\/tmux && ! -L \/usr\/bin\/tmux \]\]/g, '');
+    const pinned = /^exec \/usr\/bin\/env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \/usr\/bin\/tmux -S "\$socket" "\$@"$/gm;
+    expect([...commands.matchAll(pinned)].length).toBe(1);
+    const remainder = commands.replace(pinned, '')
+      .replace(/\$\{[A-Z_]+:\?[^}]*\}/g, '')
+      .replace(/\bprintf '[^']*'/g, 'printf');
+    expect(/(?:^|[\s/;{}"'])tmux(?=[\s;"']|$)/m.test(remainder)).toBe(false);
+    // END GUARDFIX2
     expect(shim).toContain('caller socket selector -%s is forbidden');
     expect(shim).not.toContain('TMUX_TMPDIR:-');
   });
