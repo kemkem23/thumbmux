@@ -111,6 +111,13 @@ const historyBoundaryAt = (generation: string, liveStartLine: number) => ({
 const mounted: Mounted[] = [];
 let sessionCallback: MuxCallback | null = null;
 let historyRequests = 0;
+// requestIdleCallback ids this file's stub has queued and not yet run or
+// cancelled. TermView parses and commits a history page through a chain of
+// idle hops (page, parse slice, commit); each hop queues the next from inside
+// its callback. Tests wait for this set to empty instead of a wall-clock sleep:
+// a fixed 20 ms sleep raced that chain and lost under a loaded combined
+// `bun test` process (THUMBMUX-TERMVIEW-COMBINED).
+const pendingIdle = new Set<ReturnType<typeof setTimeout>>();
 let originalSubscribeDescriptor: PropertyDescriptor | undefined;
 let originalRequestHistoryDescriptor: PropertyDescriptor | undefined;
 let originalResizeObserverDescriptor: PropertyDescriptor | undefined;
@@ -129,6 +136,7 @@ function restoreProperty(
 
 beforeEach(() => {
   sessionCallback = null;
+  pendingIdle.clear();
   historyRequests = 0;
   ControlledResizeObserver.latest = null;
   originalSubscribeDescriptor = Object.getOwnPropertyDescriptor(tmuxMux, 'subscribe');
@@ -163,15 +171,22 @@ beforeEach(() => {
   Object.defineProperty(globalThis, 'requestIdleCallback', {
     configurable: true,
     writable: true,
-    value: (callback: IdleRequestCallback) => setTimeout(() => callback({
-      didTimeout: false,
-      timeRemaining: () => 50,
-    }), 0),
+    value: (callback: IdleRequestCallback) => {
+      const id = setTimeout(() => {
+        pendingIdle.delete(id);
+        callback({ didTimeout: false, timeRemaining: () => 50 });
+      }, 0);
+      pendingIdle.add(id);
+      return id;
+    },
   });
   Object.defineProperty(globalThis, 'cancelIdleCallback', {
     configurable: true,
     writable: true,
-    value: (id: number) => clearTimeout(id),
+    value: (id: ReturnType<typeof setTimeout>) => {
+      pendingIdle.delete(id);
+      clearTimeout(id);
+    },
   });
 });
 
@@ -181,6 +196,8 @@ afterEach(() => {
     try { unmount(entry.app); } catch { /* already torn down */ }
     entry.target.remove();
   }
+  for (const id of pendingIdle) clearTimeout(id);
+  pendingIdle.clear();
   restoreProperty(tmuxMux, 'subscribe', originalSubscribeDescriptor);
   restoreProperty(tmuxMux, 'requestHistory', originalRequestHistoryDescriptor);
   restoreProperty(globalThis, 'ResizeObserver', originalResizeObserverDescriptor);
@@ -274,6 +291,17 @@ async function settleUi(): Promise<void> {
   await Promise.resolve();
   await tick();
   flushSync();
+}
+
+/** Run queued idle work until none is left, then settle Svelte. Bounded by
+ * hop count, not time: a chain that never empties is a failure, not a wait. */
+async function drainIdleWork(): Promise<void> {
+  for (let hop = 0; hop < 64; hop += 1) {
+    await settleUi();
+    if (pendingIdle.size === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`idle work did not drain; ${pendingIdle.size} callback(s) still queued`);
 }
 
 async function waitForAttribute(
@@ -2276,8 +2304,7 @@ describe('TermView Claude Bash projection', () => {
       startLine: 0,
       hasMore: false,
     }), 'history');
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await settleUi();
+    await drainIdleWork();
 
     // The new semantic row occupies exactly the full row vacated when the old
     // capture-padding blank becomes a proven separator inside the marker.
@@ -2339,8 +2366,7 @@ describe('TermView Claude Bash projection', () => {
       startLine: 0,
       hasMore: false,
     }), 'history');
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await settleUi();
+    await drainIdleWork();
 
     expect(viewport.querySelector(`[data-line-id="${anchorId}"]`)).toBeNull();
     const coveringMarker = Array.from(
@@ -2385,8 +2411,7 @@ describe('TermView Claude Bash projection', () => {
       startLine: 0,
       hasMore: false,
     }), 'history');
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await settleUi();
+    await drainIdleWork();
 
     expect(viewport.getAttribute('data-history-paging')).toBe('ceiling');
     expect(viewport.getAttribute('data-raw-total')).toBe('121');
@@ -2432,8 +2457,7 @@ describe('TermView Claude Bash projection', () => {
       hasMore: false,
     }), 'history');
 
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await settleUi();
+    await drainIdleWork();
 
     expect(viewport.getAttribute('data-raw-total')).toBe('125');
     expect(viewport.getAttribute('data-total')).toBe('124');
