@@ -118,6 +118,14 @@ let historyRequests = 0;
 // a fixed 20 ms sleep raced that chain and lost under a loaded combined
 // `bun test` process (THUMBMUX-TERMVIEW-COMBINED).
 const pendingIdle = new Set<ReturnType<typeof setTimeout>>();
+// Resolved whenever a queued idle callback runs or is cancelled.
+let idleWaiters: Array<() => void> = [];
+
+function notifyIdleWaiters(): void {
+  const waiters = idleWaiters;
+  idleWaiters = [];
+  for (const resolve of waiters) resolve();
+}
 let originalSubscribeDescriptor: PropertyDescriptor | undefined;
 let originalRequestHistoryDescriptor: PropertyDescriptor | undefined;
 let originalResizeObserverDescriptor: PropertyDescriptor | undefined;
@@ -174,7 +182,11 @@ beforeEach(() => {
     value: (callback: IdleRequestCallback) => {
       const id = setTimeout(() => {
         pendingIdle.delete(id);
-        callback({ didTimeout: false, timeRemaining: () => 50 });
+        try {
+          callback({ didTimeout: false, timeRemaining: () => 50 });
+        } finally {
+          notifyIdleWaiters();
+        }
       }, 0);
       pendingIdle.add(id);
       return id;
@@ -186,6 +198,7 @@ beforeEach(() => {
     value: (id: ReturnType<typeof setTimeout>) => {
       pendingIdle.delete(id);
       clearTimeout(id);
+      notifyIdleWaiters();
     },
   });
 });
@@ -198,6 +211,7 @@ afterEach(() => {
   }
   for (const id of pendingIdle) clearTimeout(id);
   pendingIdle.clear();
+  notifyIdleWaiters();
   restoreProperty(tmuxMux, 'subscribe', originalSubscribeDescriptor);
   restoreProperty(tmuxMux, 'requestHistory', originalRequestHistoryDescriptor);
   restoreProperty(globalThis, 'ResizeObserver', originalResizeObserverDescriptor);
@@ -293,13 +307,14 @@ async function settleUi(): Promise<void> {
   flushSync();
 }
 
-/** Run queued idle work until none is left, then settle Svelte. Bounded by
- * hop count, not time: a chain that never empties is a failure, not a wait. */
+/** Wait for queued idle work to run until none is left, then settle Svelte.
+ * Each step waits for an idle callback to actually run (or be cancelled), so
+ * a slow hop cannot outrun it; the bound counts hops, not milliseconds. */
 async function drainIdleWork(): Promise<void> {
   for (let hop = 0; hop < 64; hop += 1) {
     await settleUi();
     if (pendingIdle.size === 0) return;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => idleWaiters.push(resolve));
   }
   throw new Error(`idle work did not drain; ${pendingIdle.size} callback(s) still queued`);
 }
