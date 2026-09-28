@@ -147,3 +147,66 @@ describe("NEWARCH I4 pipe-vt runtime assets", () => {
     }
   }, 60_000);
 });
+
+// ── NEWARCH R-PKG: the package exports the pipe-history runtime and its projection pieces ──
+import { existsSync as sourceExists } from "node:fs";
+import {
+  PIPE_HISTORY_SUBPATHS,
+  pipeHistoryReleaseExports,
+  pipeHistoryWorkspaceExports,
+  RELEASE_PACKAGE_EXPORTS,
+} from "../../scripts/prepare-release-package";
+
+const PACKAGE_ROOT = join(import.meta.dir, "..", "..");
+const manifest = (rel: string) => JSON.parse(readFileSync(join(PACKAGE_ROOT, rel), "utf8"));
+
+describe("NEWARCH R-PKG pipe-history package surface", () => {
+  test("the release manifest maps ./pipe-history-runtime and every projection subpath onto git-dist/server", () => {
+    const release = RELEASE_PACKAGE_EXPORTS as Record<string, unknown>;
+    expect(Object.keys(PIPE_HISTORY_SUBPATHS)).toContain("./pipe-history-runtime");
+    for (const [key, module] of Object.entries(PIPE_HISTORY_SUBPATHS)) {
+      expect(release[key], key).toEqual({ types: `./git-dist/server/${module}.d.ts`, import: `./git-dist/server/${module}.js` });
+    }
+    expect(pipeHistoryReleaseExports() as Record<string, unknown>).toEqual(
+      Object.fromEntries(Object.keys(PIPE_HISTORY_SUBPATHS).map((key) => [key, release[key]])) as Record<string, unknown>,
+    );
+  });
+
+  test("the workspace root manifest names the same subpaths (git-dist requires what it names)", () => {
+    const exportsMap = manifest("package.json").exports as Record<string, unknown>;
+    const workspace = pipeHistoryWorkspaceExports();
+    for (const key of Object.keys(PIPE_HISTORY_SUBPATHS)) expect(exportsMap[key], key).toEqual(workspace[key]);
+    // No stray pipe-history keys beyond the declared list, in either manifest.
+    const stray = (keys: string[]) => keys.filter((k) => /pipe-history-runtime|projection-|history-row-matcher/.test(k));
+    expect(stray(Object.keys(exportsMap)).sort()).toEqual(Object.keys(PIPE_HISTORY_SUBPATHS).sort());
+    expect(stray(Object.keys(RELEASE_PACKAGE_EXPORTS)).sort()).toEqual(Object.keys(PIPE_HISTORY_SUBPATHS).sort());
+  });
+
+  test("every exported module has a source file, a server build entry and a server subpath", () => {
+    const server = manifest("server/package.json");
+    const build: string = server.scripts.build;
+    // Nested entries (sqlite-history/...) keep their path only with an explicit root.
+    expect(build).toContain("--root src --outdir dist");
+    const serverTargets = Object.values(server.exports as Record<string, { import?: string }>).map((e) => e.import);
+    for (const module of Object.values(PIPE_HISTORY_SUBPATHS)) {
+      expect(sourceExists(join(PACKAGE_ROOT, "server", "src", `${module}.ts`)), module).toBe(true);
+      expect(build.split(" "), module).toContain(`src/${module}.ts`);
+      expect(serverTargets, module).toContain(`./dist/${module}.js`);
+    }
+  });
+
+  test("root, core, server and svelte ship one version and pin @thumbmux/core to it", () => {
+    // app/package.json is outside this lot's OWNS and still reads the previous
+    // version: check-release-version.ts refuses the tag until it moves too.
+    const version = manifest("package.json").version;
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+    for (const rel of ["core/package.json", "server/package.json", "svelte/package.json"]) {
+      const pkg = manifest(rel);
+      expect(pkg.version, rel).toBe(version);
+      for (const [dep, range] of Object.entries(pkg.dependencies ?? {})) {
+        if (dep.startsWith("@thumbmux/")) expect(range, `${rel} ${dep}`).toBe(`^${version}`);
+      }
+    }
+    expect(readFileSync(join(PACKAGE_ROOT, "CHANGELOG.md"), "utf8")).toContain(`## v${version} `);
+  });
+});
