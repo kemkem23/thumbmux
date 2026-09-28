@@ -593,6 +593,7 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
       requireTmux(attached, 'private client attach/detach');
       expect(attached.exitCode).toBe(0);
       await probe.waitProducerDone();
+      console.log('G0_ATTACH_BYTES', JSON.stringify({ expected: payload.toString('hex'), actual: probe.pipeBytes().toString('hex'), client: attached.stdout.toString(), stderr: attached.stderr.toString() }));
       await probe.waitPipeEquals(payload);
       await waitUntil('client detached', () => existsSync(probe.detached));
       expect(probe.pipeBytes()).toEqual(payload);

@@ -90,11 +90,33 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
       expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
+    // These source-only mutants exercise the boundary guard, not module loading.
+    // A real assertion failure is required, just as for the reader mutants.
+    const importMutants = [
+      ['ws-mux.ts', "import { HistoryStore } from './sqlite-history/store';"],
+      ['app-routes.ts', "const history = import('./sqlite-history/store');"],
+      ['nested/sqlite-history.ts', "export { HistoryStore } from '../sqlite-history/store';"],
+    ];
+    for (const [file, injected] of importMutants) {
+      const path = join(root, 'server/src', file!);
+      mkdirSync(resolve(path, '..'), { recursive: true });
+      const original = (() => { try { return readFileSync(path, 'utf8'); } catch { return null; } })();
+      try {
+        writeFileSync(path, `${original ?? ''}\n${injected}\n`);
+        const result = await run(`unauthorized-import:${file}`, 'only explicit history entry points');
+        expect(result.tests).toBeGreaterThan(0);
+        expect(result.code).not.toBe(0);
+        expect(result.failed).toBe(true);
+        expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+      } finally {
+        if (original === null) rmSync(path); else writeFileSync(path, original);
+      }
+    }
     const after = await run('clean-after');
     expect(after.code).toBe(0);
     expect(after.tests).toBe(before.tests);
     console.log('WAVE4_MUTATION_RESULT', JSON.stringify({
-      killed: mutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests,
+      killed: mutants.length + importMutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests,
     }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 180_000);
