@@ -266,7 +266,7 @@
   {
     "name": "JournalRecordV1",
     "kind": "type",
-    "signature": "7a738f0a52df6acc6241e78d542d266c6048833ac955adb2e8a221a8cf278a85",
+    "signature": "f165cf0198194817e83fc08e8dd10d7b2ebbbf827f9ae6a9e02f2a7acd717c4d",
     "tier": "F"
   },
   {
@@ -344,13 +344,13 @@
   {
     "name": "MuxDeltaFrame",
     "kind": "type",
-    "signature": "694b9236352104401b3df366b97c7cc8022279312db7a31f6b35100dba79e44e",
+    "signature": "99d64b0baddf5c1b3dd052164595b9cddf3d6fbfb8f1e0679356bfa5ca689910",
     "tier": "F"
   },
   {
     "name": "MuxFullOutputFrame",
     "kind": "type",
-    "signature": "8ea86ab9d76a60a0b08fed4169c940cd72adcc21ee98b283090119306ce8cca1",
+    "signature": "727c6556281caabc9189c974d2d0880d641148712246929aadaee9a306dae158",
     "tier": "F"
   },
   {
@@ -368,7 +368,7 @@
   {
     "name": "MuxOutputFrame",
     "kind": "type",
-    "signature": "f080db2b40b474b135c26d9d05b6f89896260b125534cc99e6a6e5583613e544",
+    "signature": "ae68b5bcd0046157a6d286a2a319f8cd406973fd69c5ad1371eeefae51dfb647",
     "tier": "F"
   },
   {
@@ -398,13 +398,13 @@
   {
     "name": "MuxServerFrame",
     "kind": "type",
-    "signature": "59b894802077376e1007cd778a58dc33a969ce121b7bb75270d04798d25c5130",
+    "signature": "913792a571af9e6bee467c525d337b18ea0d224c1a9b7cbb1ff6d4b10fa623ff",
     "tier": "S"
   },
   {
     "name": "MuxServerMessage",
     "kind": "type",
-    "signature": "42641b39793fbed6252f9ddf941c3db2ac50d4064999344f7c2280fb2057f031",
+    "signature": "bf39cc61a0734666f3e9b2cdf4b4b10807b81afaa17cdbbb1103b9a7dbcc3ec1",
     "tier": "F"
   },
   {
@@ -416,7 +416,7 @@
   {
     "name": "ParsedReplayRecord",
     "kind": "type",
-    "signature": "44dfd05a3cc9b9c7b146ab6dc54511a7a9d0c93b23e862d0649e6f46f5a7e3c4",
+    "signature": "709b75434c976ecb251c978f431a5ebed70a5364f7f2936fdaceb2641e6a0b23",
     "tier": "F"
   },
   {
@@ -446,19 +446,19 @@
   {
     "name": "ReplayFullCheckpoint",
     "kind": "type",
-    "signature": "5ad095b44c130bc1bf96304ec5c0b281905c4af80319c359abb1e354a49abf62",
+    "signature": "10f6c4fd37de597aec74c9614698c729fc99ec7cbd1b874fd3226b4ea8d48254",
     "tier": "F"
   },
   {
     "name": "ReplayJournal",
     "kind": "value",
-    "signature": "e757ec17e78074676daf6e69ead05d7684474e394ae5b9b0208a9ec975793921",
+    "signature": "69202eb5cbd24658c834f8390d58d2d9e2ff50bd0c6e4270f725d9260c3f83d9",
     "tier": "F"
   },
   {
     "name": "ReplayLookup",
     "kind": "type",
-    "signature": "be8caba201c6e4898108ef5e3d71723b46e10128456dc0a0cbc281d4c8ce8f9c",
+    "signature": "b505211ab5dd863e611528f8a9bb31cf1f0f5ae03f7c3d01151100aeef57992b",
     "tier": "F"
   },
   {
@@ -518,7 +518,7 @@
   {
     "name": "SgrState",
     "kind": "type",
-    "signature": "662969434d321c728bcf221e251ca7dc2ee532e6624baaeeaab6784e1c3c029a",
+    "signature": "ba020641fa9b6e0a65182df8d2d822c4b6c6840a42d4f1f6d86a8c16aed09ed6",
     "tier": "F"
   },
   {
@@ -728,7 +728,7 @@
   {
     "name": "chooseMuxOutputFrame",
     "kind": "value",
-    "signature": "eea556e814d9ec1ac2ddbea8db474a4db2ee99608f1df5ec6aac771f9db758fe",
+    "signature": "149b4c70fa19866e4da292301bae79bde2d29af8e9b5f428f0efdeea09c78167",
     "tier": "F"
   },
   {
@@ -746,7 +746,7 @@
   {
     "name": "cloneSgrState",
     "kind": "value",
-    "signature": "55bd791336656c9f7f4d05cdf0d9c0602878a1bdfc7e4a012d0704020d5caebb",
+    "signature": "8328df66c139d5ef24f3e351b68ad4d2e22bf4e6874ac46591ed858bbc2ba246",
     "tier": "X"
   },
   {
@@ -782,13 +782,13 @@
   {
     "name": "createMuxDeltaFrame",
     "kind": "value",
-    "signature": "df51ed890a83392d1fbb18794cf781595cc4264ad8208ade68d9588c303f68a8",
+    "signature": "3a24c2e1b29efec6299fb297404d7b9761bb46e1f47f7d4a4e7f19abcefd3aae",
     "tier": "F"
   },
   {
     "name": "createSgrState",
     "kind": "value",
-    "signature": "5e477cb6158c1c9d88efcacb4c85e9ab291a9edb0c74c65117df011a9b79cc65",
+    "signature": "025ac01125fab393aaaf2c55ea63e2243d1752b80d191b2820f9429375e5b487",
     "tier": "F"
   },
   {
@@ -926,7 +926,7 @@
   {
     "name": "lineToHtml",
     "kind": "value",
-    "signature": "c23c88b073b1ccd6f15c62fe19e9ce6166487194d594b83677bd2916ba5213f5",
+    "signature": "5c5adff3c282f4b13ac707256782304e2f3602f5246dcd6ba5ef7f4842d1ee1a",
     "tier": "F"
   },
   {
@@ -1004,7 +1004,7 @@
   {
     "name": "parseReplayJournal",
     "kind": "value",
-    "signature": "3bd9442b0b2fb501f832aee67b67e96c057d7006a2f22de6bc730e047558f010",
+    "signature": "f4cdfcacd3d2866761c3aad3608893f1083616c7421e99113993ea5fc6553fca",
     "tier": "F"
   },
   {
@@ -1028,7 +1028,7 @@
   {
     "name": "planPrepend",
     "kind": "value",
-    "signature": "ce2114cf1f279f5cbe9aa76dfeeec5bfad9cb07290d6eb934089d8f19d35bc9c",
+    "signature": "15472319a95605f88527e97f866dd067ea70fd3e47f4849ad539da84ed914488",
     "tier": "X"
   },
   {
@@ -1100,7 +1100,7 @@
   {
     "name": "serializedMuxFrameSize",
     "kind": "value",
-    "signature": "53a16fc39691eb26eee2a77513c4d255e515177ad5275cb25866fd4ec80ef932",
+    "signature": "a4a7f58b186c58819c03712d80d38cafececea7a2cc36fecd7af7301e31800dc",
     "tier": "F"
   },
   {
@@ -1118,7 +1118,7 @@
   {
     "name": "sgrStateKey",
     "kind": "value",
-    "signature": "e2f6b907853ff5ca832adcb04a7552e80bf72a6c569898be010bfc5cc276b439",
+    "signature": "ad35ac5ddaef85b502001e4a81451698df623e914be7a69326d31e77629b7654",
     "tier": "X"
   },
   {
@@ -1130,7 +1130,7 @@
   {
     "name": "shouldUseMuxDelta",
     "kind": "value",
-    "signature": "2115705ab0ed3db096a7782de77272dad34dd87d586a5c0d7bab13377face174",
+    "signature": "ba103f4d7862da214123096f13794b93be4f35b748918d501fe03fd654eed224",
     "tier": "F"
   },
   {
@@ -1178,7 +1178,7 @@
   {
     "name": "validateMuxDeltaFrame",
     "kind": "value",
-    "signature": "8a1737a74f3d2e802a6cfb0fd26c65860bc304e4df933f6b90a721e99e43f48c",
+    "signature": "a730739342fb122455b120178f18cff01f7b29b9db624e6569817a0cc7299ced",
     "tier": "F"
   },
   {
@@ -1215,6 +1215,60 @@
     "name": "writeThemeBackground",
     "kind": "value",
     "signature": "85e7943405016d8473351c6f537c01228a44c4c9467f05024f5260fbb2609ed8",
+    "tier": "S"
+  },
+  {
+    "name": "HISTORY_PAGE_MARKER_LIMIT",
+    "kind": "value",
+    "signature": "4366d178750991de38533811e6df2624dd67d1ba8c203238e41bc70e4716c7e1",
+    "tier": "S"
+  },
+  {
+    "name": "MuxHistoryPageMarker",
+    "kind": "type",
+    "signature": "bd2d2979d3720a68bdbfe79ae3eac19bcce6393d28bdcf8c4cb012f2c0cb2038",
+    "tier": "S"
+  },
+  {
+    "name": "newarchDeltaContinues",
+    "kind": "value",
+    "signature": "872fc20c8b92094328c0de7f6cfb521d8b7cd86a381cc5db627517fd95e9b601",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchFrameMeta",
+    "kind": "type",
+    "signature": "15a4c4a3643078410ed46130412d8ea3ccf815abf806bd6a05e3e34344a96764",
+    "tier": "S"
+  },
+  {
+    "name": "ReservedKeyAlternative",
+    "kind": "type",
+    "signature": "1e9bd96e44f099cb8083a6a904508848d5d44c20ffb90dfb819cf2ea911ab730",
+    "tier": "S"
+  },
+  {
+    "name": "reservedKeyAlternative",
+    "kind": "value",
+    "signature": "89faeb1bd4dfdfd53b2306fd2ef9ffa069b96b82fe082c911a9c373893fcccdb",
+    "tier": "S"
+  },
+  {
+    "name": "reservedKeyAlternatives",
+    "kind": "value",
+    "signature": "009ee0d79da4a20ab7e82c1c725380f68e17035b544727ee709d10f21cbb4b37",
+    "tier": "S"
+  },
+  {
+    "name": "validateHistoryPageMarkers",
+    "kind": "value",
+    "signature": "15a3d7ee4697323b66be49cc19f88f550fe4d8026163a1d2456ad0dd57d9975c",
+    "tier": "S"
+  },
+  {
+    "name": "validateNewarchFrameMeta",
+    "kind": "value",
+    "signature": "e96e0ee04e8bad71339e3e02bc4d2730a41a9a231e8d7dbbe2e7439179c69dd9",
     "tier": "S"
   }
 ]

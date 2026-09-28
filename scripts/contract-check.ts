@@ -1387,6 +1387,28 @@ function isV01816PatchException(
   return V01816_REVIEWED_ADDITIONS.has(reviewed);
 }
 
+/**
+ * Reviewed optional projection/newarch metadata for 0.20.2 -> 0.20.3.
+ * AppAdapters reaches client delivery metadata through its optional mux.
+ * The optional-holder dependency digests grow beyond the generic proof's
+ * model. Pin both artifact digests and versions; unrelated drift still fails.
+ * handleProjectionRouteChange stays private, outside the frozen class surface.
+ * Evidence: docs/tasks/thumbmux-contract-0203/REPORT.md in the monorepo.
+ */
+const V0203_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "app:AppAdapters:ff0496b7d15e989b9b76bf23dc55f293b46b5e3a64ef027d6e7e938b4b6acecc:5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0",
+  "app:EmbedView:c69f8218441df93163845a633976e77393d6d3cf663d32f9c92067c4b75730b0:46f7f6c8a7bef4d8ed33468c252ad22b3180d78ed6896b4db2e2e915c5e7fcb7",
+  "app:HubView:4fc5b44e79b19361b04f4c7b9b73380de5675c6b2d5cbf9a02482ba1ffb37395:e98a99dfa1891ebef3e78dd26b6485c7687ccb44808042e23aac9ac9f4e8b702",
+  "app:SessionView:9ce1975f811d2a8c9c014b43ab64574b2f41861db67c17f89d7af19eb550e7ab:e8a4c3c6399bbee28663b068d9572ece989d78ee7c89b3587fbbec40a33bbb8b",
+  "app:ThumbmuxApp:722f87982a8855cd0c866bc052a6d107f09e7fd261be46e147dbf952f6ae78f7:6f6e2591a5f4154d627d630a21302dbdc22e385dcde546d9291759017c815c18",
+  "app:createSessionsStore:a0e779ba22b195a125bddc92471833c9cda88bb551096004c5e735e37a216bc7:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc",
+  "server:AppRoutes:fe42014191714e58106a980ce7be95346ef9c3475a9baa670328606a983ee0b2:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33",
+  "server:AppRoutesOptions:77425c95e25bdfbf6d7135febdf15becb3c28e0c0e0e880b5a924ff013f2a053:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2",
+  "server:TmuxWsMux:ccce251f320b964b0ba227756d8b5fcbd5e3ef2c61b2382d1cc49927b3fd7821:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8",
+  "server:TmuxWsMuxOptions:c773fec3a455782ce9dc482157303fa0a341e29cb344ec899308951ea5f8adc1:4babcf10cd875dd8965e6afede1adce81b70be54e456e9ba9791146f1404fb57",
+  "server:createAppRoutes:f3542c4ae9ee4a2ed20e740de1d78eedce04a95419aa39e191d921be04ae82e5:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a"
+]);
+
 function isV0202PatchException(
   baselineVersion: string,
   currentVersion: string,
@@ -1398,6 +1420,19 @@ function isV0202PatchException(
   if (baselineVersion !== "0.20.1" || currentVersion !== "0.20.2") return false;
   const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
   return V0202_REVIEWED_ADDITIONS.has(reviewed);
+}
+
+function isV0203PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.20.2" || currentVersion !== "0.20.3") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0203_REVIEWED_ADDITIONS.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1615,6 +1650,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV0202PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0203PatchException(
           baselineVersion,
           currentVersion,
           subpath,
