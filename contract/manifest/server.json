@@ -14,13 +14,13 @@
   {
     "name": "AppRoutes",
     "kind": "type",
-    "signature": "fe42014191714e58106a980ce7be95346ef9c3475a9baa670328606a983ee0b2",
+    "signature": "bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33",
     "tier": "S"
   },
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "77425c95e25bdfbf6d7135febdf15becb3c28e0c0e0e880b5a924ff013f2a053",
+    "signature": "c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2",
     "tier": "S"
   },
   {
@@ -32,7 +32,7 @@
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "f3542c4ae9ee4a2ed20e740de1d78eedce04a95419aa39e191d921be04ae82e5",
+    "signature": "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a",
     "tier": "S"
   },
   {
@@ -128,7 +128,7 @@
   {
     "name": "FrameJournal",
     "kind": "value",
-    "signature": "5d8b88124684426d0a02b16726c208dc1fb2961258d2423196231ee20d9931fb",
+    "signature": "47b098cd3b773aab39544534b8c99ac3cb1ce5971f991b37931cd48b5f250ba0",
     "tier": "F"
   },
   {
@@ -146,7 +146,7 @@
   {
     "name": "FrameJournalRecordV1",
     "kind": "type",
-    "signature": "6f8477f8300e9c4f250c58971ad3739287563e59084c7ae5ec1951c46ea1fe95",
+    "signature": "84e4cc05e2c5e84f09526bb9c3c6fc38a82591a3d1771dbb8b99477a7c4d8d3a",
     "tier": "F"
   },
   {
@@ -266,7 +266,7 @@
   {
     "name": "MuxHooks",
     "kind": "type",
-    "signature": "509d38f1bbc69c0c34df7cc73f6fd9afa2e298fb332590c0b4a8a0abf2890e00",
+    "signature": "93749c831ac6e08f0c76e8cc1df4f593bddf3416167bf34162716eaa9bd12980",
     "tier": "F"
   },
   {
@@ -446,13 +446,13 @@
   {
     "name": "TmuxWsMux",
     "kind": "value",
-    "signature": "ccce251f320b964b0ba227756d8b5fcbd5e3ef2c61b2382d1cc49927b3fd7821",
+    "signature": "32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8",
     "tier": "F"
   },
   {
     "name": "TmuxWsMuxOptions",
     "kind": "type",
-    "signature": "c773fec3a455782ce9dc482157303fa0a341e29cb344ec899308951ea5f8adc1",
+    "signature": "4babcf10cd875dd8965e6afede1adce81b70be54e456e9ba9791146f1404fb57",
     "tier": "F"
   },
   {
@@ -532,5 +532,17 @@
     "kind": "type",
     "signature": "8e30dca8557d5e820580a72db3d928b7bea037fb28841d896b60fff0cb111aa0",
     "tier": "F"
+  },
+  {
+    "name": "MuxProjectionSnapshot",
+    "kind": "type",
+    "signature": "bece7bf8d9f3c58dc1e459076a8888f9361685e755110bb7ec7f3893276e59d0",
+    "tier": "S"
+  },
+  {
+    "name": "MuxProjectionSource",
+    "kind": "type",
+    "signature": "bcb893215aa602b1840e1efbc83f411efe5cec6bb4671a91a881ce5f098b127d",
+    "tier": "S"
   }
 ]

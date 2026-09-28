@@ -1178,11 +1178,15 @@ describe("declaration signatures", () => {
     const before = deriveGitDistReport(root, ["core"]).core[0]?.signature;
 
     writeCoreDeclarations(root, [
-      "export declare class PublicClass { private renamedSecret; read(): string; }",
+      "export declare class PublicClass { private renamedSecret; private handleProjectionRouteChange; read(): string; }",
     ]);
     const after = deriveGitDistReport(root, ["core"]).core[0]?.signature;
 
     expect(after).toBe(before);
+    writeCoreDeclarations(root, [
+      "export declare class PublicClass { private renamedSecret; handleProjectionRouteChange(session: string): void; read(): string; }",
+    ]);
+    expect(deriveGitDistReport(root, ["core"]).core[0]?.signature).not.toBe(before);
   });
 });
 
@@ -1291,4 +1295,86 @@ test("skipping the baseline takes a deliberate opt-out", () => {
 
 test("an empty baseline root is treated as absent rather than as a directory", () => {
   expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE_ROOT: "   " }).error).toBeTruthy();
+});
+
+// Independent digests generated from the two reviewed artifacts, not read back
+// from the authorization table. No optional-addition model: exercise the pin.
+describe("0.20.3 reviewed optional graph additions", () => {
+  const cases = [
+  {
+    "pair": "app:AppAdapters:ff0496b7d15e989b9b76bf23dc55f293b46b5e3a64ef027d6e7e938b4b6acecc:5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0",
+    "tier": "S",
+    "kind": "type"
+  },
+  {
+    "pair": "app:EmbedView:c69f8218441df93163845a633976e77393d6d3cf663d32f9c92067c4b75730b0:46f7f6c8a7bef4d8ed33468c252ad22b3180d78ed6896b4db2e2e915c5e7fcb7",
+    "tier": "S",
+    "kind": "component"
+  },
+  {
+    "pair": "app:HubView:4fc5b44e79b19361b04f4c7b9b73380de5675c6b2d5cbf9a02482ba1ffb37395:e98a99dfa1891ebef3e78dd26b6485c7687ccb44808042e23aac9ac9f4e8b702",
+    "tier": "S",
+    "kind": "component"
+  },
+  {
+    "pair": "app:SessionView:9ce1975f811d2a8c9c014b43ab64574b2f41861db67c17f89d7af19eb550e7ab:e8a4c3c6399bbee28663b068d9572ece989d78ee7c89b3587fbbec40a33bbb8b",
+    "tier": "S",
+    "kind": "component"
+  },
+  {
+    "pair": "app:ThumbmuxApp:722f87982a8855cd0c866bc052a6d107f09e7fd261be46e147dbf952f6ae78f7:6f6e2591a5f4154d627d630a21302dbdc22e385dcde546d9291759017c815c18",
+    "tier": "S",
+    "kind": "component"
+  },
+  {
+    "pair": "app:createSessionsStore:a0e779ba22b195a125bddc92471833c9cda88bb551096004c5e735e37a216bc7:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc",
+    "tier": "S",
+    "kind": "value"
+  },
+  {
+    "pair": "server:AppRoutes:fe42014191714e58106a980ce7be95346ef9c3475a9baa670328606a983ee0b2:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33",
+    "tier": "S",
+    "kind": "type"
+  },
+  {
+    "pair": "server:AppRoutesOptions:77425c95e25bdfbf6d7135febdf15becb3c28e0c0e0e880b5a924ff013f2a053:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2",
+    "tier": "S",
+    "kind": "type"
+  },
+  {
+    "pair": "server:TmuxWsMux:ccce251f320b964b0ba227756d8b5fcbd5e3ef2c61b2382d1cc49927b3fd7821:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8",
+    "tier": "F",
+    "kind": "value"
+  },
+  {
+    "pair": "server:TmuxWsMuxOptions:c773fec3a455782ce9dc482157303fa0a341e29cb344ec899308951ea5f8adc1:4babcf10cd875dd8965e6afede1adce81b70be54e456e9ba9791146f1404fb57",
+    "tier": "F",
+    "kind": "type"
+  },
+  {
+    "pair": "server:createAppRoutes:f3542c4ae9ee4a2ed20e740de1d78eedce04a95419aa39e191d921be04ae82e5:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a",
+    "tier": "S",
+    "kind": "value"
+  }
+] as const;
+  for (const { pair, tier, kind } of cases) {
+    test(pair.split(":").slice(0, 2).join(":"), () => {
+      const [subpath, name, before, after] = pair.split(":") as ["server" | "app", string, string, string];
+      const oldEntry = { name, kind, tier, signature: before, compatibilitySignature: before };
+      const newEntry = { name, kind, tier, signature: after, compatibilitySignature: after };
+      const run = (oldLive = oldEntry, newLive = newEntry, oldVersion = "0.20.2", newVersion = "0.20.3") =>
+        evaluateBaseline(subpath, [oldEntry], [newEntry], [oldLive], [newLive], oldVersion, newVersion).errors;
+      expect(run()).toEqual([]);
+      expect(run(oldEntry, { ...newEntry, compatibilitySignature: "narrowed-unreviewed-declaration" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run({ ...oldEntry, compatibilitySignature: "different-prior-artifact" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.1"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.2", "0.20.4"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(evaluateBaseline(subpath, [oldEntry], [], [oldEntry], [], "0.20.2", "0.20.3").errors)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
+    });
+  }
 });

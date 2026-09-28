@@ -698,7 +698,7 @@ export class TmuxWsMux<
    * them, stop any legacy dirty pipe, and give every viewer one complete frame
    * marked `resync` from the new route.
    */
-  handleProjectionRouteChange(session: string): void {
+  private handleProjectionRouteChange(session: string): void {
     const viewers = this.subscribers.get(session);
     this.unwatchProjection(session);
     this.lastNewarch.delete(session);
