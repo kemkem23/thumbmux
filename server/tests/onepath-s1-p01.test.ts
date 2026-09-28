@@ -633,13 +633,17 @@ describe('G0: private tmux pipe-pane source-fence experiment', () => {
   test('corpus: injected reader stall is detectable and later drains exactly', async () => {
     const payload = Buffer.alloc(512 * 1024, 0x53);
     const probe = new PrivateTmuxProbe(payload, {
-      pipeCommand: output => `sleep 0.25; cat > ${shQuote(output)}`,
+      pipeCommand: output => `: > ${shQuote(`${output}.ready`)}; while [ ! -f ${shQuote(`${output}.release`)} ]; do sleep 0.01; done; cat > ${shQuote(output)}`,
     });
     try {
       await probe.start();
-      await Bun.sleep(50);
-      const stalled = !existsSync(probe.producerDone) && probe.panePipe() === '1';
+      await waitUntil('reader waiting at explicit gate', () => existsSync(`${probe.pipeOutput}.ready`));
+      // tmux versions buffer different amounts: producer completion does not
+      // prove reader progress. Observe the gated reader against the byte oracle.
+      const stalled = probe.pipeBytes().length < payload.length && probe.panePipe() === '1';
       expect(stalled).toBe(true);
+      expect(probe.pipeBytes()).toHaveLength(0);
+      writeFileSync(`${probe.pipeOutput}.release`, 'go');
       await probe.waitProducerDone();
       await probe.waitPipeEquals(payload);
       expect(probe.pipeBytes()).toEqual(payload);
