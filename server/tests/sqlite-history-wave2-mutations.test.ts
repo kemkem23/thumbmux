@@ -52,7 +52,10 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       if(code!==0&&!failed)console.log('MUTANT_INVALID_OUTPUT',output);
       return {code,output,failed};
     };
-    expect((await run('clean-before')).code).toBe(0);
+    // This file also contains unrelated 60-second load/crash campaigns.
+    // Clean controls must run exactly the detector cases attacked below.
+    const detectorPattern = [...new Set(mutants.map(mutant => mutant.pattern))].join('|');
+    expect((await run('clean-before', detectorPattern)).code).toBe(0);
     for(const mutant of mutants){
       const originals=new Map<string,string>();
       for(const edit of mutant.edits){
@@ -64,7 +67,7 @@ test('wave2 detectors kill bridge/import/manifest/oracle mutants and clean tree 
       expect(result.code).not.toBe(0);expect(result.failed).toBe(true);
       expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
     }
-    expect((await run('clean-after')).code).toBe(0);
+    expect((await run('clean-after', detectorPattern)).code).toBe(0);
     console.log('MUTATION_RESULT',JSON.stringify({killed:mutants.length,survived:0,cleanBefore:true,cleanAfter:true}));
   }finally{rmSync(root,{recursive:true,force:true});}
 },120000);

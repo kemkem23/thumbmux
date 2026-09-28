@@ -32,10 +32,10 @@ print(json.dumps({
     "statements": [[token(word) for word in words] for words in statements],
     "words": [token(word) for _, _, words in shell.recorded_commands for word in words],
 }))
-`, resolve(import.meta.dir, "../../../ops/testing/tests/command-cage-wiring.py")], {
+`, resolve(import.meta.dir, "shell-command-parser.py")], {
     input: source, encoding: "utf8",
   });
-  expect(parsed.status).toBe(0);
+  if (parsed.status !== 0) throw new Error(`shell parser failed: ${parsed.stderr}`);
   return JSON.parse(parsed.stdout) as {
     commands: (string | null)[][];
     statements: { value: string | null; start: number; end: number }[][];

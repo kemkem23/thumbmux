@@ -838,3 +838,26 @@ describe("composite action schema", () => {
     expect(gate).toMatch(/run:\s*\/usr\/bin\/timeout\b.*run-container\.sh/);
   });
 });
+
+// Exercise the actual public-CI selection, retaining the caller's cage receipt.
+// No benchmark body may start; all six files must announce why they are held out.
+test("release CI holds out private tmux CPU campaigns with an explicit reason", async () => {
+  const files = ["active", "idle"].flatMap(mode =>
+    [1, 2, 3].map(round => `./server/tests/newarch-l2c-benchmark-${mode}-${round}.test.ts`),
+  );
+  const child = Bun.spawn([process.execPath, "test", ...files], {
+    cwd: packageRoot,
+    env: { ...process.env, CI: "true", GITHUB_ACTIONS: "true" },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ]);
+  const output = stdout + stderr;
+  expect(code).toBe(0);
+  expect(output).toMatch(/18 skip/);
+  expect(output).toMatch(/0 fail/);
+  for (const file of files) {
+    expect(output).toContain(`[benchmark held out] ${file.split("/").at(-1)}:`);
+  }
+});

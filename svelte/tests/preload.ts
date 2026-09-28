@@ -120,6 +120,7 @@ async function installHappyDom(): Promise<void> {
     "MouseEvent",
     "FocusEvent",
     "InputEvent",
+    "CompositionEvent",
     "PointerEvent",
     "WheelEvent",
     "TouchEvent",
