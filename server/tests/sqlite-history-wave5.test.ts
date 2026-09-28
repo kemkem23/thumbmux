@@ -540,10 +540,13 @@ describe('NEWARCH-SWITCHON F1-H runtime under a full disk', () => {
       expect(offered).toBeGreaterThanOrEqual(1);
       expect(offered).toBeLessThanOrEqual(Math.ceil(waited / FRAME_PRESSURE_RETRY_MS) + 3);
 
-      // No durable barrier while paused: an unknown tail that names it.
+      // No durable barrier while paused: an unknown tail that names it, and
+      // no durable revision claimed (a RAM revision is never reported as on disk).
       const paused = await pane.drainReceipt(300);
       expect(paused.unknownTail).toBe(true);
-      expect(paused.issues.join(' ')).toMatch(/durable barrier|not settled/);
+      expect(paused.issues.some(issue => issue.includes('durable barrier'))).toBe(true);
+      expect(paused.durableRevision).toBeNull();
+      expect(store.token(pane.paneKey).durableRevision).toBeLessThan(store.token(pane.paneKey).revision);
 
       // Unstored display only while the overlay is up.
       const meta = { ...I4_META, cursor: { x: 0, y: 1, visible: true } };
