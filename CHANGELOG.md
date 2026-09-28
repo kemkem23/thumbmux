@@ -65,9 +65,13 @@ What is inside, by lot (all in this monorepo's history):
 
 ### Known debts carried in this tag
 
-- **D-KILLBURST** — killing the pipe mid-burst at 1,000 rows/s (60× the real
-  peak) loses about 1,200 rows per kill (7 runs 1,192–1,232, median 1,204).
-  Every lost range carries a loss marker; `silent` is 0 in every run. Reducing
+- **D-KILLBURST** — a kill loop of 40 pipe kills while a pane writes
+  100 rows/s loses every row produced from the first kill to the last
+  respawn: about 101.5 rows per second of kill sequence (101.4–101.6 in every
+  run). The ~1,200 rows are the total over all 40 kills, not per kill
+  (7 runs 1,192–1,232, median 1,204). The loss is one gap covering the whole
+  kill sequence and it carries a loss marker; `silent` is 0 in every run, with
+  1 order violation per run. Reducing
   it needs the collector to replay bytes handed to a dead worker into its
   replacement instead of cutting a gap.
 - **D-STRESS** — 21 panes × 100 rows/s still exceeds the CPU/p95/PSS targets;
