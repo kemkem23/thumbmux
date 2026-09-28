@@ -1007,6 +1007,7 @@ test('I4 FIX2 F1: refused frame reserves its actual size when an idle durable ca
 // ── NEWARCH-SWITCHON S2: v4 compact rows, sealed blocks, v3 read-only ──
 import { readFileSync as readFileS2, readdirSync as readdirS2, statSync as statS2 } from 'node:fs';
 import { decodeRow, encodeRow } from '../src/sqlite-history/codec';
+import { decodeFrameCells, encodeFrameCells } from '../src/sqlite-history/ram-store';
 import { PROJECTION_V3_SCHEMA } from '../src/sqlite-history/schema';
 import { cellsToAnsi } from '../src/pipe-history-runtime';
 // Runtime-shaped cells (pipe-history-runtime parserRowCells): canonical colours, style bits, wide + continuation.
@@ -1196,3 +1197,61 @@ test('S2: an uncertified block near the head stays per-line alone; far behind it
   expect(lines[6]!.checkedCaptureId).toStartWith('bulk:');
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },60000);
+
+// ── NEWARCH CANARY-FIX D: v5 receipt archive + compact RAM frames ──────────
+test('CANARY-D: compact frame codec is lossless for terminal styles and at most 35% of v4 RLE',()=>{
+ const rows=Array.from({length:40},(_,i)=>s2Oracle(1000+i).cells);
+ const encoded=encodeFrameCells(rows),legacy=JSON.stringify({rle:1,rows:rows.map(encodeCells)});
+ expect(decodeFrameCells(encoded)).toEqual(rows);
+ expect(encoded).toStartWith('{"fc":2,');
+ expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(Buffer.byteLength(legacy)*0.35);
+ expect(()=>decodeFrameCells('{"fc":99,"rows":[]}')).toThrow('frame-codec-unknown');
+ console.log('CANARY_D_FRAME',JSON.stringify({encodedBytes:Buffer.byteLength(encoded),legacyBytes:Buffer.byteLength(legacy)}));
+});
+
+test('CANARY-D: v5 archives settled capture receipts losslessly and rejects the old writer',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-canary-d-archive-'));let s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const rows=Array.from({length:512},(_,i)=>s2Oracle(i+1));
+ try {
+  for(const [i,row] of rows.entries()) {
+   await s.appendScroll({...naEvent('',i+1),physicalRow:row});
+   await s.calibrate({capture:{...naFrame(),captureId:`receipt-${String(i).padStart(6,'0')}`,requestedAt:i,completedAt:i+0.25,
+    firstHistoryRow:i,history:[row],observedFields:['grapheme','width','continuation','fg','bg','style'],ambiguousRows:0,result:'exact'},
+    expectedRevision:s.token(naKey).revision,checks:[{lineId:i,captureRow:0}],repairs:[]});
+  }
+  s.flush();await s.close();
+  const file=join(dir,'newarch-v3/history.sqlite3'),db=new Database(file,{readonly:true});
+  try {
+   expect((db.query('PRAGMA user_version').get() as any).user_version).toBe(5);
+   expect((db.query('SELECT count(*) AS n FROM na_capture_archive').get() as any).n).toBeGreaterThan(0);
+   expect((db.query('SELECT count(*) AS n FROM na_capture').get() as any).n).toBeLessThan(128);
+   expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  }finally{db.close();}
+  s=createProjectionStore({historyRoot:dir,mode:'recover'});
+  const recovered=s.readPage(s.token(naKey),0,512).lines;
+  expect(recovered.map(row=>({text:row.text,cells:row.cells}))).toEqual(rows);
+  expect(recovered.every((row,i)=>row.checkedCaptureId===`receipt-${String(i).padStart(6,'0')}`)).toBe(true);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},60000);
+
+test('CANARY-D: 14-pane capture-heavy replay keeps drained DB WAL SHM at or below 1.5x raw text',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-canary-d-ratio-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ let rawTextBytes=0;
+ try {
+  for(let pane=0;pane<14;pane++) {
+   const key={serverIdentity:'canary-d',paneId:`%${pane}`,birthGeneration:1};
+   for(let i=0;i<256;i++) {
+    const row=s2Oracle(pane*256+i+1);rawTextBytes+=Buffer.byteLength(row.text);
+    await s.appendScroll({...naEvent('',i+1),paneKey:key,physicalRow:row});
+    await s.calibrate({capture:{...naFrame(),paneKey:key,captureId:`p${pane}-c${String(i).padStart(6,'0')}`,requestedAt:i,completedAt:i+0.25,
+     firstHistoryRow:i,history:[row],observedFields:['grapheme','width','continuation','fg','bg','style'],ambiguousRows:0,result:i%7?'exact':'idle-exact'},
+     expectedRevision:s.token(key).revision,checks:[{lineId:i,captureRow:0}],repairs:[]});
+   }
+  }
+  s.flush();await s.close();
+  const folder=join(dir,'newarch-v3'),files=readdirS2(folder),diskBytes=files.reduce((n,f)=>n+statS2(join(folder,f)).size,0),ratio=diskBytes/rawTextBytes;
+  console.log('CANARY_D_DISK',JSON.stringify({panes:14,captures:14*256,rawTextBytes,diskBytes,ratio,files}));
+  expect(ratio).toBeLessThanOrEqual(1.5);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},120000);
