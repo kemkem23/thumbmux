@@ -15,7 +15,7 @@ import {
   PIPE_VT_VENDOR_FILE,
   PIPE_VT_VENDOR_SHA256,
   PIPE_VT_WORKER_FILE,
-} from "../src/pipe-vt-worker";
+} from "../src/pipe-vt-assets";
 
 export const TERMINAL_PTY_WAL_PROXY_ASSET = "terminal-pty-wal-proxy.py";
 /** NEWARCH pipe-pane VT worker assets, resolved beside the bundle via import.meta. */

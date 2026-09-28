@@ -4,6 +4,7 @@ import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync, writ
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createConnection, type Socket } from "node:net";
+import { PIPE_VT_LICENSE_FILE, PIPE_VT_VENDOR_FILE, PIPE_VT_VENDOR_SHA256, PIPE_VT_WORKER_FILE } from "./pipe-vt-assets";
 
 /**
  * Host side of the NEWARCH L2-P VT worker (`pipe-vt-worker.py`).
@@ -19,10 +20,7 @@ import { createConnection, type Socket } from "node:net";
  * stdin writes/s cost ~20% of a core in the host, the FIFO ~2.6%.
  */
 
-export const PIPE_VT_VENDOR_SHA256 = "626c68240ce421066a4c915fca0ca0b44576a274fc14d89cae85e6105a79940d";
-export const PIPE_VT_WORKER_FILE = "pipe-vt-worker.py";
-export const PIPE_VT_VENDOR_FILE = "pipe-vt-vendor.zip";
-export const PIPE_VT_LICENSE_FILE = "pipe-vt-LICENSE.txt";
+export { PIPE_VT_LICENSE_FILE, PIPE_VT_VENDOR_FILE, PIPE_VT_VENDOR_SHA256, PIPE_VT_WORKER_FILE } from "./pipe-vt-assets";
 
 /**
  * [fg, bg, attrs bitmask, cells]. `cells` is a string when every cell is a

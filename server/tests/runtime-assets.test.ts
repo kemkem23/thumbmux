@@ -88,6 +88,23 @@ describe("NEWARCH I4 pipe-vt runtime assets", () => {
     expect(statSync(join(root, "dist", "pipe-vt-worker.py")).mode & 0o777).toBe(0o755);
   });
 
+  test("the build script reads asset constants from a leaf module that imports nothing", async () => {
+    // staging-policy.sh pins copy-runtime-assets.ts and pipe-vt-assets.ts by
+    // hash; the build runs their top level, so neither may pull in a module
+    // whose bytes are not pinned (review R-PKG F4).
+    const leaf = readFileSync(join(SOURCE, "pipe-vt-assets.ts"), "utf8");
+    expect(leaf).not.toMatch(/\bimport\b|\brequire\s*\(|\bfrom\s+["']/);
+    const script = readFileSync(join(import.meta.dir, "..", "scripts", "copy-runtime-assets.ts"), "utf8");
+    const specifiers = [...script.matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((m) => m[1]).sort();
+    expect(specifiers).toEqual(["../src/pipe-vt-assets", "node:crypto", "node:fs", "node:path"]);
+    const assets = await import("../src/pipe-vt-assets");
+    const worker = await import("../src/pipe-vt-worker");
+    for (const name of ["PIPE_VT_VENDOR_SHA256", "PIPE_VT_WORKER_FILE", "PIPE_VT_VENDOR_FILE", "PIPE_VT_LICENSE_FILE"] as const) {
+      expect(worker[name], name).toBe(assets[name]);
+    }
+    expect([...PIPE_VT_RUNTIME_ASSETS]).toEqual(["pipe-vt-worker.py", "pipe-vt-vendor.zip", "pipe-vt-LICENSE.txt"]);
+  });
+
   test("a vendor archive other than the pinned one is refused before anything is published", () => {
     const root = vtFixture();
     writeFileSync(join(root, "src", "pipe-vt-vendor.zip"), "not the pinned archive");
@@ -195,12 +212,11 @@ describe("NEWARCH R-PKG pipe-history package surface", () => {
     }
   });
 
-  test("root, core, server and svelte ship one version and pin @thumbmux/core to it", () => {
-    // app/package.json is outside this lot's OWNS and still reads the previous
-    // version: check-release-version.ts refuses the tag until it moves too.
+  test("root, core, server, svelte and app ship one version and pin @thumbmux/* to it", () => {
+    // The same five manifests check-release-version.ts reads before a tag.
     const version = manifest("package.json").version;
     expect(version).toMatch(/^\d+\.\d+\.\d+$/);
-    for (const rel of ["core/package.json", "server/package.json", "svelte/package.json"]) {
+    for (const rel of ["core/package.json", "server/package.json", "svelte/package.json", "app/package.json"]) {
       const pkg = manifest(rel);
       expect(pkg.version, rel).toBe(version);
       for (const [dep, range] of Object.entries(pkg.dependencies ?? {})) {
