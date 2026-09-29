@@ -930,6 +930,13 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id),false,true);
         this.acknowledge();
       }
+      // A prior asynchronous commit may have drained the final dirty batch.
+      // The explicit barrier still performs derived compaction for every pane;
+      // otherwise quiet panes keep one receipt row per capture indefinitely.
+      this.disk.transaction(()=>{
+        const panes=prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[];
+        sealBlocks(this.disk,panes,true);archiveCaptures(this.disk,panes,true);
+      }).immediate();
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
       this.disk.exec('PRAGMA incremental_vacuum');
     }catch(error){this.handleFlushFailure(error);throw error;}
