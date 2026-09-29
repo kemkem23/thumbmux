@@ -2776,10 +2776,10 @@ export class TerminalReplaySession {
           }
           expectedOffset = record.nextOffset;
         }
-        this.engine.processAll(
-          batch.records,
-          (captured) => this.history.accept(captured, "verify"),
-        );
+        // R2 MUTATION: deliberately regress recovery to per-record calls.
+        for (const record of batch.records) {
+          this.engine.process(record, (captured) => this.history.accept(captured, "verify"));
+        }
         const lastRecord = batch.records[batch.records.length - 1]!;
         this.lastOffset = lastRecord.nextOffset;
         this.lastSequence = lastRecord.sequence;
