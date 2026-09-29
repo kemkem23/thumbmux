@@ -366,12 +366,80 @@ test("SWITCHON P: RAM frames encode each unchanged row once and still round-trip
     cells, kind: "normal" as const, cols, rows: cells.length, cursor: { row: 0, col: 0, visible: true } };
   validateFrame(frame);
   const encoded = encodeFrameCells(cells);
-  expect(JSON.parse(encoded).rle).toBe(1);
+  // CANARY-FIX D: frames are written as `fc:2` (text + the durable row codec per row), never `rle:1`.
+  expect(JSON.parse(encoded).fc).toBe(2);
+  expect(JSON.parse(encoded).rle).toBeUndefined();
   expect(JSON.stringify(decodeFrameCells(encoded))).toBe(JSON.stringify(cells));
   // The same row objects encode to the same text (the per-row cache), and a new row is encoded anew.
   expect(encodeFrameCells(cells)).toBe(encoded);
   const changed = [cells[0]!, row([["default", "default", 0, "new"]]), cells[2]!, cells[3]!];
   expect(JSON.stringify(decodeFrameCells(encodeFrameCells(changed)))).toBe(JSON.stringify(changed));
-  // The stored format is the one every reader already knows (one run of 12 blanks).
-  expect(JSON.parse(encoded).rows[3]).toEqual([[" ", 1, false, "default", "default", 0, cols]]);
+  // Each row is stored as [text, cells] in the durable row codec: 12 blanks are one run and no text.
+  expect(JSON.parse(encoded).rows[3]).toEqual(["", `${cols}||`]);
+  // An `rle:1` frame an earlier release wrote still reads back cell for cell.
+  const bold = row([["red", "default", 1, "bold"]]);
+  const legacy = JSON.stringify({ rle: 1, rows: [
+    [...[..."bold"].map((grapheme) => [grapheme, 1, false, "index:1", "default", 1, 1]), [" ", 1, false, "default", "default", 0, cols - 4]],
+    [[" ", 1, false, "default", "default", 0, cols]],
+  ] });
+  expect(JSON.stringify(decodeFrameCells(legacy))).toBe(JSON.stringify([bold, cells[3]]));
+  expect(() => decodeFrameCells(JSON.stringify({ fc: 3, rows: [] }))).toThrow("frame-codec-unknown");
+});
+
+import { PipeHistoryPane, PipeHistoryRuntime } from "../src/pipe-history-runtime";
+test("CANARY-FIX M: a calibration snapshot stays as it was read across appends and ring eviction, without copying at read", async () => {
+  const runtime = new PipeHistoryRuntime({ sharedParser: false, ringRows: 8, store: { token: () => { throw new Error("no pane"); } } as never });
+  const pane = new PipeHistoryPane(runtime, {
+    paneKey: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, session: "s", calibrate: false,
+    meta: { cols: 4, rows: 2, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 100, panePid: 1, mouseSgr: false, mouseAny: false },
+    capture: async () => { throw new Error("unused"); },
+  });
+  try {
+    const p = pane as unknown as { remember(row: unknown): void; read(): { recentHistory: { lineId: number }[]; recentLastLineId?: number | null } };
+    const add = (lineId: number) => p.remember({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: [BLANK_CELL], softWrap: false });
+    for (let id = 0; id < 10; id++) add(id);
+    const snap = p.read();
+    expect(snap.recentLastLineId).toBe(9);
+    // 600 more rows: the ring passes 8 + 512 and evicts; the snapshot must not see any of it.
+    for (let id = 10; id < 610; id++) add(id);
+    expect(snap.recentHistory.map((r) => r.lineId)).toEqual(Array.from({ length: 10 }, (_, i) => i));
+    expect(snap.recentHistory).toBe(snap.recentHistory);
+    const now = p.read().recentHistory.map((r) => r.lineId);
+    expect(now[0]).toBeGreaterThan(9);
+    expect(now.at(-1)).toBe(609);
+  } finally { await runtime.close?.(); }
+});
+
+test("CANARY-FIX M: a pipe frame reaches viewers only after its RAM receipt, and its receive latency closes then", async () => {
+  let resolveWrite!: (receipt: unknown) => void; const writes: unknown[] = [];
+  const store = {
+    token: () => { throw new Error("no pane"); },
+    replaceScreen: (frame: unknown) => { writes.push(frame); return new Promise((resolve) => { resolveWrite = resolve; }); },
+  };
+  const runtime = new PipeHistoryRuntime({ sharedParser: false, store: store as never });
+  const pane = new PipeHistoryPane(runtime, {
+    paneKey: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, session: "s", calibrate: false,
+    meta: { cols: 4, rows: 2, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 100, panePid: 1, mouseSgr: false, mouseAny: false },
+    capture: async () => { throw new Error("unused"); },
+  });
+  try {
+    const p = pane as unknown as { onFrame(event: unknown): void; receiveTimes: { seq: number; at: bigint }[]; received: number };
+    const updates: string[] = []; pane.subscribe((u) => updates.push(u.source));
+    p.received = 1; p.receiveTimes.push({ seq: 1, at: runtime.nowNs() });
+    p.onFrame({ kind: "normal", receiveSeq: 1, sourceEpoch: 1, geometryGeneration: 0, cursor: { x: 1, y: 0, visible: true },
+      cells: { cols: 4, rows: 2, full: true, shift: 0, dirty: { "0": [["default", "default", 0, "hi"]] } } });
+    // Written to RAM at once, but nothing is shown and the chunk is still open until the receipt.
+    expect(writes).toHaveLength(1);
+    await Promise.resolve();
+    expect(pane.view().displaySource).toBe("none");
+    expect(updates).toEqual([]);
+    expect(pane.pendingReceipts()).toBe(1);
+    expect(pane.stats.latencyMs).toHaveLength(0);
+    resolveWrite({ accepted: true, revision: 1, durableRevision: 0, nextLineId: 0 });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(pane.view().displaySource).toBe("pipe");
+    expect(updates).toEqual(["pipe"]);
+    expect(pane.pendingReceipts()).toBe(0);
+    expect(pane.stats.latencyMs).toHaveLength(1);
+  } finally { await runtime.close(); }
 });

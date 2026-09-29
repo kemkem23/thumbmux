@@ -631,6 +631,62 @@ describe("direct child PTY durable WAL proxy", () => {
     }
   }, 20_000);
 
+  test("a child that dies under an orphan holding the pty is disconnected and every later resize is logged", async () => {
+    // SETM-FIX (ORCH17-OPEN): the login root died while its provider kept
+    // the pty slave open. The master never reached EOF, the lane stayed
+    // "ready" around a dead child, and ordered_resize dropped each resize
+    // without a word until probeProxy failed on the geometry drift.
+    const root = mkdtempSync(join(tmpdir(), "tmptywal-orphan-"));
+    roots.push(root);
+    const socket = join(root, "tmux.sock");
+    sockets.push(socket);
+    const directory = join(root, "lane");
+    const orphanPidFile = join(root, "orphan.pid");
+    const session = "sh-orphan";
+    const launch = createTerminalPtyWalProxyLaunchSpec({
+      directory,
+      identity: { session, instanceId: "orphan-proof", paneTarget: `=${session}:0.0` },
+      argv: ["/bin/bash", "--noprofile", "--norc", "-c",
+        `trap '' HUP; sleep 60 & echo $! > '${orphanPidFile}'; sleep 0.3; exit 3`],
+      tmux: { socketPath: socket }, heartbeatMs: 25, terminateGraceMs: 100,
+    }, {});
+    expect(tmux(socket, "-f", "/dev/null", "new-session", "-d", "-x", "80", "-y", "24", "-s", session,
+      "-e", `${TERMINAL_PTY_WAL_CONFIG_ENV}=${launch.env[TERMINAL_PTY_WAL_CONFIG_ENV]}`,
+      "-e", `${TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV}=${launch.env[TERMINAL_PTY_WAL_PROXY_ASSET_SHA256_ENV]}`,
+      launch.executable, ...launch.args).status).toBe(0);
+    await eventually(() => readTerminalPtyWalProxyHealth(directory).state === "armed", "orphan proxy armed");
+    const controller = new TerminalWalController({ directory, requestTimeoutMs: 10_000 });
+    let orphanPid = 0;
+    try {
+      await controller.activate(readTerminalPtyWalProxyHealth(directory).generation);
+      await eventually(() => existsSync(orphanPidFile) && readFileSync(orphanPidFile, "utf8").trim() !== "", "orphan started");
+      orphanPid = Number(readFileSync(orphanPidFile, "utf8").trim());
+      await eventually(() => readTerminalPtyWalProxyHealth(directory).childExitCode === 3, "child exit published");
+      await eventually(() => readTerminalPtyWalProxyHealth(directory).state === "disconnected", "dead child is not live");
+      // The orphan still holds the slave: this is not the ordinary EOF path.
+      expect(existsSync(`/proc/${orphanPid}`)).toBe(true);
+      const diagnostics = () => existsSync(join(directory, "pty-proxy-diagnostics.log"))
+        ? readFileSync(join(directory, "pty-proxy-diagnostics.log"), "utf8") : "";
+      expect(diagnostics()).toContain("child exited with code 3 while descendants still hold the pty");
+      for (const [index, cols] of [100, 110].entries()) {
+        expect(tmux(socket, "resize-window", "-t", `=${session}:0`, "-x", String(cols), "-y", "30").status).toBe(0);
+        await eventually(() => diagnostics().split("\n").filter(line => line.includes("resize dropped")).length === index + 1,
+          `resize ${cols} drop logged`);
+        expect(diagnostics()).toContain(`resize dropped: child exited with code 3; requested ${cols}x30, recorded geometry stays 80x24`);
+      }
+      const health = readTerminalPtyWalProxyHealth(directory);
+      expect(health.state).toBe("disconnected");
+      expect(health.geometry).toEqual({ cols: 80, rows: 24 });
+      const records = [...readOutputWal(resolveTerminalWalPaths(directory).walPath)];
+      expect(records.filter(record => record.kind === "resize")).toHaveLength(0);
+    } finally {
+      controller.close();
+      if (orphanPid > 0) {
+        try { process.kill(orphanPid, "SIGKILL"); } catch {}
+      }
+    }
+  }, 20_000);
+
   test("cgroup freezer acknowledges frozen state and thaws on timeout without stop signals", () => {
     const root = mkdtempSync(join(tmpdir(), "tmptywal-freezer-"));
     roots.push(root);

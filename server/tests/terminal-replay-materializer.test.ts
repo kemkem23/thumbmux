@@ -1,10 +1,12 @@
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -321,6 +323,265 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
       replacement.close();
     }
   }, 40_000);
+
+  /**
+   * Many small output records around the inputs a coalesced recovery must
+   * not reorder: a control record, a CSI split across records, and a Claude
+   * Code style full redraw (`CSI 2 J CSI 3 J`) after rows already scrolled.
+   * The checkpoint is produced one record at a time, as production does.
+   */
+  function produceSmallRecordLane(records: number): TerminalReplayResult {
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(24, 5)));
+    const resizeAt = Math.floor(records / 2);
+    const redrawAt = Math.floor(records / 3);
+    const splitAt = Math.floor((records * 3) / 4);
+    for (let index = 1; index <= records; index += 1) {
+      if (index === resizeAt) {
+        writer.appendJson("resize", {
+          phase: "commit",
+          changeId: "layout-mid",
+          from: geometry(24, 5),
+          to: geometry(20, 6),
+          reason: "tmux-control-layout",
+        });
+      }
+      if (index === redrawAt) writer.appendOutput(Buffer.from("\x1b[2J\x1b[3J\x1b[HREDRAW\r\n", "ascii"));
+      else if (index === splitAt) writer.appendOutput(Buffer.from("\x1b[3", "ascii"));
+      else if (index === splitAt + 1) writer.appendOutput(Buffer.from("2mG\x1b[0m\r\n", "ascii"));
+      else writer.appendOutput(numbered(index, index));
+    }
+    writer.close();
+
+    const producer = new TerminalReplayMaterializer({ walPath, stateDir }).open();
+    let produced = producer.current;
+    while (produced.hasMoreWal) produced = producer.refresh();
+    producer.close();
+    expect(produced.sequence).toBe(BigInt(records + 2)); // start + resize + outputs
+    return produced;
+  }
+
+  test("checkpoint recovery costs private tmux commands per batch, not per WAL record", () => {
+    // HP7-OPEN: a real lane with 66,754 small records needed ~12 ms of tmux
+    // round-trips per record to re-verify its checkpoint, so open() exceeded
+    // the worker's 600 s request timeout and the lane never came back.
+    const records = 600;
+    const produced = produceSmallRecordLane(records);
+    const committedHistory = readFileSync(produced.historyPath);
+    // Rows scrolled before the redraw were drained per record, so they are
+    // committed history that recovery has to reproduce, not lose to ED3.
+    expect(numberedRows(produced)).toContain(150);
+
+    const counter = join(root, "tmux-count");
+    const wrapper = join(root, "tmux-counting.sh");
+    const realTmux = Bun.which("tmux");
+    if (!realTmux) throw new Error("tmux is required");
+    writeFileSync(wrapper, `#!/bin/sh\necho x >> '${counter}'\nexec '${realTmux}' "$@"\n`, { mode: 0o700 });
+
+    const recovered = new TerminalReplayMaterializer({ walPath, stateDir, tmuxCommand: wrapper }).open();
+    try {
+      expect(recovered.current.recoveredFromCheckpoint).toBe(true);
+      expect(recovered.current.verified).toBe(true);
+      expect(recovered.current.sequence).toBe(produced.sequence);
+      expect(readFileSync(produced.historyPath)).toEqual(committedHistory);
+    } finally {
+      recovered.close();
+    }
+    const invocations = readFileSync(counter, "utf8").split("\n").filter(Boolean).length;
+    // Per-record replay makes >= 3 tmux calls for each of 600 records.
+    expect(invocations).toBeLessThan(records / 4);
+  }, 120_000);
+
+  test("coalesced recovery still rejects a committed history row whose text changed", () => {
+    const produced = produceSmallRecordLane(60);
+    const history = readFileSync(produced.historyPath);
+    const target = history.indexOf(Buffer.from("N 007"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    history[target + 4] = "8".charCodeAt(0);
+    writeFileSync(produced.historyPath, history);
+
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${history.lastIndexOf(0x0a, target) + 1}`);
+  }, 60_000);
+
+  test("coalesced recovery still rejects a checkpoint screen whose text changed", () => {
+    const produced = produceSmallRecordLane(60);
+    const checkpoint = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    const cells = Buffer.from(checkpoint.screen.cellsBase64, "base64");
+    const target = cells.indexOf(Buffer.from("N 0"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    cells[target] = "M".charCodeAt(0);
+    checkpoint.screen.cellsBase64 = cells.toString("base64");
+    writeFileSync(produced.checkpointPath, JSON.stringify(checkpoint));
+
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow("replayed terminal screen/cursor differs from checkpoint");
+  }, 60_000);
+
+  /**
+   * HP7-FIX1: output whose presentation depends on state carried across rows
+   * and records — colour set in one record and reset rows later, a coloured
+   * row that wraps at the pane width, background runs and OSC 8 hyperlinks.
+   * Produced one record at a time, then recovered as coalesced runs, so the
+   * committed bytes and the recovery captures group rows differently.
+   */
+  function produceStyledLane(records: number): TerminalReplayResult {
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(24, 5)));
+    for (let index = 1; index <= records; index += 1) {
+      const n = String(index).padStart(3, "0");
+      let text: string;
+      if (index % 9 === 0) text = `\x1b[31mRED ${n} opens\r\n`; // colour stays on
+      else if (index % 9 === 3) text = `\x1b[0mOFF ${n}\r\n`;
+      // Exactly full width: no -N padding, so a capture ending on this row
+      // ends red and the next capture's first (default) row has no codes.
+      else if (index % 9 === 4) text = `\x1b[31m${"R".repeat(21)}${n}\x1b[0m\r\n`;
+      else if (index % 9 === 5) text = `\x1b]8;;http://x.test/${n}\x1b\\LINK ${n}\x1b]8;;\x1b\\ tail\r\n`;
+      else if (index % 9 === 6) text = `\x1b[1;44mBG ${n}\x1b[0m  x\r\n`;
+      else if (index % 9 === 7) text = `\x1b[32m${"W".repeat(30)}${n}\x1b[39m\r\n`; // wraps
+      else text = `N ${n}\r\n`;
+      writer.appendOutput(Buffer.from(text, "utf8"));
+    }
+    writer.close();
+    const producer = new TerminalReplayMaterializer({ walPath, stateDir }).open();
+    let produced = producer.current;
+    while (produced.hasMoreWal) produced = producer.refresh();
+    producer.close();
+    return produced;
+  }
+
+  function rewriteHistory(produced: TerminalReplayResult, from: string, to: string): number {
+    const history = readFileSync(produced.historyPath);
+    const target = history.indexOf(Buffer.from(from, "utf8"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    writeFileSync(produced.historyPath, Buffer.concat([
+      history.subarray(0, target),
+      Buffer.from(to, "utf8"),
+      history.subarray(target + Buffer.byteLength(from)),
+    ]));
+    return history.lastIndexOf(0x0a, target) + 1;
+  }
+
+  test("coalesced recovery accepts styled rows whose escapes are grouped differently", () => {
+    const produced = produceStyledLane(120);
+    const committed = readFileSync(produced.historyPath);
+    expect(committed.includes(Buffer.from("\x1b[31m"))).toBe(true);
+    expect(committed.includes(Buffer.from("\x1b]8;;http://x.test/005"))).toBe(true);
+    const recovered = new TerminalReplayMaterializer({ walPath, stateDir }).open();
+    try {
+      expect(recovered.current.recoveredFromCheckpoint).toBe(true);
+      expect(recovered.current.verified).toBe(true);
+    } finally {
+      recovered.close();
+    }
+  }, 60_000);
+
+  test("coalesced recovery rejects a committed row whose colour changed (31m -> 32m)", () => {
+    // Codex HP7 review probe CORRUPT_SGR_ACCEPTED: same text, different colour.
+    const produced = produceStyledLane(60);
+    const rowStart = rewriteHistory(produced, "\x1b[31mRED 009", "\x1b[32mRED 009");
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${rowStart}`);
+  }, 60_000);
+
+  test("coalesced recovery rejects a committed row whose bold became dim", () => {
+    const produced = produceStyledLane(60);
+    const rowStart = rewriteHistory(produced, "\x1b[1m\x1b[44mBG 006", "\x1b[2m\x1b[44mBG 006");
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${rowStart}`);
+  }, 60_000);
+
+  test("coalesced recovery rejects a committed hyperlink whose target changed", () => {
+    const produced = produceStyledLane(60);
+    const rowStart = rewriteHistory(produced, "http://x.test/005", "http://y.test/005");
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${rowStart}`);
+  }, 60_000);
+
+  test("coalesced recovery rejects a committed history with one row missing", () => {
+    const produced = produceStyledLane(60);
+    const history = readFileSync(produced.historyPath);
+    const target = history.indexOf(Buffer.from("N 010"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    const rowStart = history.lastIndexOf(0x0a, target) + 1;
+    const rowEnd = history.indexOf(0x0a, target) + 1;
+    writeFileSync(produced.historyPath, Buffer.concat([history.subarray(0, rowStart), history.subarray(rowEnd)]));
+    const checkpoint = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    checkpoint.historyBytes -= rowEnd - rowStart;
+    writeFileSync(produced.checkpointPath, JSON.stringify(checkpoint));
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${rowStart}`);
+  }, 60_000);
+
+  test("coalesced recovery rejects a checkpoint screen whose colour changed", () => {
+    const produced = produceStyledLane(58); // screen ends on coloured rows
+    const checkpoint = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    const cells = Buffer.from(checkpoint.screen.cellsBase64, "base64");
+    const target = cells.indexOf(Buffer.from("\x1b[31m"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    cells[target + 3] = "2".charCodeAt(0);
+    checkpoint.screen.cellsBase64 = cells.toString("base64");
+    writeFileSync(produced.checkpointPath, JSON.stringify(checkpoint));
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow("replayed terminal screen/cursor differs from checkpoint");
+  }, 60_000);
+
+  test("a coalesced recovery leaves bytes a per-record runtime (0.20.2) can still verify", () => {
+    // HP7-FIX1 rollback: runtimes before the fix verify history and the
+    // checkpoint screen byte-exact. Recovery must republish the checkpoint
+    // unchanged, and refreshes after it must write what per-record replay
+    // writes, or a rollback to 0.20.2 would reject the lane.
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(24, 5)));
+    for (let index = 1; index <= 240; index += 1) {
+      const n = String(index).padStart(3, "0");
+      const text = index % 9 === 0 ? `\x1b[31mRED ${n}\r\n`
+        : index % 9 === 3 ? `\x1b[0mOFF ${n}\r\n`
+        : index % 9 === 4 ? `\x1b[31m${"R".repeat(21)}${n}\x1b[0m\r\n`
+        : index % 9 === 5 ? `\x1b]8;;http://x.test/${n}\x1b\\LINK ${n}\x1b]8;;\x1b\\ t\r\n`
+        : index % 9 === 7 ? `\x1b[32m${"W".repeat(30)}${n}\x1b[39m\r\n`
+        : `N ${n}\r\n`;
+      writer.appendOutput(Buffer.from(text, "utf8"));
+    }
+    writer.close();
+    const copyDir = join(root, "materialized-copy");
+    mkdirSync(copyDir, { mode: 0o700 });
+    const frame = { maxWalFrameBytesPerRefresh: 512 };
+    const producer = new TerminalReplayMaterializer({ walPath, stateDir, ...frame }).open();
+    let produced = producer.current;
+    for (let step = 0; step < 6 && produced.hasMoreWal; step += 1) produced = producer.refresh();
+    expect(produced.hasMoreWal).toBe(true);
+    // Re-encode the handed-off screen the way a different capture grouping
+    // would: same cells, extra escape bytes. The new verifier accepts it; a
+    // per-record runtime only accepts these exact bytes back.
+    const handoff = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    handoff.screen.cellsBase64 = Buffer.concat([
+      Buffer.from("\x1b[0m"),
+      Buffer.from(handoff.screen.cellsBase64, "base64"),
+    ]).toString("base64");
+    const handoffCheckpoint = Buffer.from(JSON.stringify(handoff));
+    writeFileSync(join(copyDir, "checkpoint.json"), handoffCheckpoint);
+    writeFileSync(join(copyDir, "history.ansi"), readFileSync(produced.historyPath));
+    while (produced.hasMoreWal) produced = producer.refresh(); // never reopened: per record
+    producer.close();
+
+    const reopened = new TerminalReplayMaterializer({ walPath, stateDir: copyDir, ...frame }).open();
+    try {
+      expect(reopened.current.recoveredFromCheckpoint).toBe(true);
+      const republished = JSON.parse(readFileSync(join(copyDir, "checkpoint.json"), "utf8"));
+      expect(JSON.stringify(republished.screen)).toBe(JSON.stringify(handoff.screen));
+      expect(republished.historyBytes).toBe(handoff.historyBytes);
+      let continued = reopened.current;
+      while (continued.hasMoreWal) continued = reopened.refresh();
+    } finally {
+      reopened.close();
+    }
+    expect(readFileSync(join(copyDir, "history.ansi"))).toEqual(readFileSync(produced.historyPath));
+    const perRecord = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    const afterRecovery = JSON.parse(readFileSync(join(copyDir, "checkpoint.json"), "utf8"));
+    expect(afterRecovery.screen).toEqual(perRecord.screen);
+    expect(afterRecovery.historyBytes).toBe(perRecord.historyBytes);
+  }, 90_000);
 
   test("drains a single burst larger than the private tmux history ring without losing a row", () => {
     const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });

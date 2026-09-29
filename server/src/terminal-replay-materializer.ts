@@ -87,6 +87,7 @@ const DEFAULT_HISTORY_CAPTURE_ROWS = 256;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DEFAULT_HISTORY_LIMIT = 65_536;
 const DEFAULT_MAX_WAL_FRAME_BYTES_PER_REFRESH = 1024 * 1024;
+const COALESCED_OUTPUT_MAX_BYTES = 1024 * 1024;
 const COMMAND_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 const MAX_COLS = 4_096;
 const MAX_ROWS = 4_096;
@@ -942,7 +943,25 @@ export function readTerminalReplayCheckpoint(path: string): TerminalReplayCheckp
 }
 
 function sameScreen(a: TerminalReplayScreen | null, b: TerminalReplayScreen | null): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  if (a === null || b === null) return a === b;
+  const { cellsBase64: cellsA, ...restA } = a;
+  const { cellsBase64: cellsB, ...restB } = b;
+  // Cursor, modes and pending parser bytes stay exact. Cells are compared
+  // by text and presentation, not by escape bytes, for the same
+  // capture-grouping reason as committed history.
+  return JSON.stringify(restA) === JSON.stringify(restB)
+    && sameStyledCapture(Buffer.from(cellsA, "base64"), Buffer.from(cellsB, "base64"));
+}
+
+function splitRows(bytes: Buffer): Buffer[] {
+  const rows: Buffer[] = [];
+  let start = 0;
+  for (let end = bytes.indexOf(0x0a, start); end >= 0; end = bytes.indexOf(0x0a, start)) {
+    rows.push(bytes.subarray(start, end + 1));
+    start = end + 1;
+  }
+  if (start < bytes.byteLength) rows.push(bytes.subarray(start));
+  return rows;
 }
 
 function sameNullableIdentity(
@@ -966,10 +985,248 @@ function sameNullableResize(
   return a === null ? b === null : b !== null && a.phase === b.phase && sameResize(a, b);
 }
 
+/**
+ * Presentation state of one tmux cell as `capture-pane -e` encodes it: SGR
+ * attributes and colours plus the OSC 8 hyperlink. `extra` keeps SGR codes
+ * this parser does not model, so they still have to match exactly.
+ */
+type CellStyle = {
+  flags: number;
+  underline: number;
+  fg: string;
+  bg: string;
+  underlineColour: string;
+  extra: string;
+  link: string;
+};
+
+type StyledRun = { key: string; link: string; text: Buffer };
+type StyledRow = { runs: StyledRun[]; end: CellStyle };
+
+const DEFAULT_CELL_STYLE: Readonly<CellStyle> = Object.freeze({
+  flags: 0,
+  underline: 0,
+  fg: "",
+  bg: "",
+  underlineColour: "",
+  extra: "",
+  link: "",
+});
+
+/**
+ * tmux closes an open hyperlink at the end of every captured row but only
+ * reopens it when the next cell's link differs from the last cell it wrote,
+ * so a link carried into the next row of the same capture is not encoded.
+ * Until a row states its link explicitly, its link is unknown.
+ */
+const LINK_UNKNOWN = "\u0000unknown";
+
+const SGR_BOLD = 1 << 0;
+const SGR_DIM = 1 << 1;
+const SGR_ITALIC = 1 << 2;
+const SGR_BLINK = 1 << 3;
+const SGR_RAPID_BLINK = 1 << 4;
+const SGR_REVERSE = 1 << 5;
+const SGR_HIDDEN = 1 << 6;
+const SGR_STRIKE = 1 << 7;
+const SGR_OVERLINE = 1 << 8;
+
+const styleKey = (style: CellStyle): string =>
+  `${style.flags}|${style.underline}|${style.fg}|${style.bg}|${style.underlineColour}|${style.extra}`;
+const DEFAULT_STYLE_KEY = styleKey({ ...DEFAULT_CELL_STYLE });
+
+function applySgr(style: CellStyle, parameters: string): void {
+  const tokens = parameters.split(";");
+  const extra = new Set(style.extra ? style.extra.split(",") : []);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const parts = tokens[index]!.split(":");
+    const code = parts[0] === "" ? 0 : Number(parts[0]);
+    const extended = (): string => {
+      if (parts.length > 1) {
+        if (parts[1] === "5") return `x${parts[2] ?? ""}`;
+        if (parts[1] === "2") return `r${(parts.length >= 6 ? parts.slice(3, 6) : parts.slice(2, 5)).join(",")}`;
+        return `?${parts.slice(1).join(":")}`;
+      }
+      if (tokens[index + 1] === "5") {
+        index += 2;
+        return `x${tokens[index] ?? ""}`;
+      }
+      if (tokens[index + 1] === "2") {
+        index += 4;
+        return `r${tokens.slice(index - 2, index + 1).join(",")}`;
+      }
+      return "?";
+    };
+    if (code === 0) {
+      Object.assign(style, { ...DEFAULT_CELL_STYLE, link: style.link });
+      extra.clear();
+    } else if (code === 1) style.flags |= SGR_BOLD;
+    else if (code === 2) style.flags |= SGR_DIM;
+    else if (code === 3) style.flags |= SGR_ITALIC;
+    else if (code === 4) style.underline = parts.length > 1 ? Number(parts[1]) : 1;
+    else if (code === 5) style.flags |= SGR_BLINK;
+    else if (code === 6) style.flags |= SGR_RAPID_BLINK;
+    else if (code === 7) style.flags |= SGR_REVERSE;
+    else if (code === 8) style.flags |= SGR_HIDDEN;
+    else if (code === 9) style.flags |= SGR_STRIKE;
+    else if (code === 21) style.underline = 2;
+    else if (code === 22) style.flags &= ~(SGR_BOLD | SGR_DIM);
+    else if (code === 23) style.flags &= ~SGR_ITALIC;
+    else if (code === 24) style.underline = 0;
+    else if (code === 25) style.flags &= ~(SGR_BLINK | SGR_RAPID_BLINK);
+    else if (code === 27) style.flags &= ~SGR_REVERSE;
+    else if (code === 28) style.flags &= ~SGR_HIDDEN;
+    else if (code === 29) style.flags &= ~SGR_STRIKE;
+    else if (code >= 30 && code <= 37) style.fg = `p${code - 30}`;
+    else if (code === 38) style.fg = extended();
+    else if (code === 39) style.fg = "";
+    else if (code >= 40 && code <= 47) style.bg = `p${code - 40}`;
+    else if (code === 48) style.bg = extended();
+    else if (code === 49) style.bg = "";
+    else if (code === 53) style.flags |= SGR_OVERLINE;
+    else if (code === 55) style.flags &= ~SGR_OVERLINE;
+    else if (code === 58) style.underlineColour = extended();
+    else if (code === 59) style.underlineColour = "";
+    else if (code >= 90 && code <= 97) style.fg = `p${code - 90 + 8}`;
+    else if (code >= 100 && code <= 107) style.bg = `p${code - 100 + 8}`;
+    else extra.add(tokens[index]!);
+  }
+  style.extra = [...extra].sort().join(",");
+}
+
+/**
+ * Parse one captured row (terminator excluded or included) into runs of
+ * bytes sharing one cell style, starting from `start`. Only SGR and OSC 8 are
+ * interpreted; any other escape stays in the text and must match byte for
+ * byte. Works on raw bytes so invalid UTF-8 and C1-looking continuation bytes
+ * (Thai "ป" is E0 B8 9B) compare exactly rather than decoded. Trailing blanks
+ * in the default style are the allocated-cell padding `-N` adds and are
+ * dropped; a blank with any colour, attribute or link is kept.
+ */
+function parseStyledRow(row: Uint8Array, start: Readonly<CellStyle>): StyledRow {
+  const style: CellStyle = { ...start, link: LINK_UNKNOWN };
+  const runs: StyledRun[] = [];
+  let pending: number[] = [];
+  let pendingKey = "";
+  let pendingLink = "";
+  const flush = () => {
+    if (pending.length > 0) runs.push({ key: pendingKey, link: pendingLink, text: Buffer.from(pending) });
+    pending = [];
+  };
+  const push = (bytes: ArrayLike<number>) => {
+    const key = styleKey(style);
+    if (pending.length > 0 && (key !== pendingKey || style.link !== pendingLink)) flush();
+    pendingKey = key;
+    pendingLink = style.link;
+    for (let index = 0; index < bytes.length; index += 1) pending.push(bytes[index]!);
+  };
+  let length = row.byteLength;
+  if (length > 0 && row[length - 1] === 0x0a) length -= 1;
+  let index = 0;
+  while (index < length) {
+    const byte = row[index]!;
+    if (byte !== 0x1b) {
+      push([byte]);
+      index += 1;
+      continue;
+    }
+    const kind = row[index + 1];
+    if (kind === 0x5b) {
+      // CSI: parameters/intermediates up to one final byte 0x40-0x7e.
+      let end = index + 2;
+      while (end < length && !(row[end]! >= 0x40 && row[end]! <= 0x7e)) end += 1;
+      const body = Buffer.from(row.subarray(index + 2, end)).toString("latin1");
+      if (row[end] === 0x6d && /^[0-9:;]*$/.test(body)) applySgr(style, body);
+      else push(row.subarray(index, Math.min(end + 1, length)));
+      index = end + 1;
+    } else if (kind === 0x5d) {
+      // OSC: terminated by BEL or ST (ESC \).
+      let end = index + 2;
+      while (end < length && row[end] !== 0x07 && !(row[end] === 0x1b && row[end + 1] === 0x5c)) end += 1;
+      const body = Buffer.from(row.subarray(index + 2, end)).toString("latin1");
+      const next = end + (row[end] === 0x07 ? 1 : 2);
+      if (body.startsWith("8;")) {
+        // OSC 8 ; params ; URI — an empty URI closes the link.
+        const uri = body.slice(body.indexOf(";", 2) + 1);
+        style.link = uri === "" ? "" : body.slice(2);
+      } else {
+        push(row.subarray(index, Math.min(next, length)));
+      }
+      index = next;
+    } else {
+      push(row.subarray(index, Math.min(index + 2, length)));
+      index += 2;
+    }
+  }
+  flush();
+  while (runs.length > 0) {
+    const last = runs[runs.length - 1]!;
+    if (last.key !== DEFAULT_STYLE_KEY || (last.link !== "" && last.link !== LINK_UNKNOWN)) break;
+    let keep = last.text.byteLength;
+    while (keep > 0 && last.text[keep - 1] === 0x20) keep -= 1;
+    if (keep > 0) {
+      last.text = last.text.subarray(0, keep);
+      break;
+    }
+    runs.pop();
+  }
+  return { runs, end: { ...style, link: style.link === LINK_UNKNOWN ? "" : style.link } };
+}
+
+/** Same bytes in the same cell styles, however either side split its runs. */
+function sameStyledRuns(a: readonly StyledRun[], b: readonly StyledRun[]): boolean {
+  let ai = 0;
+  let aOffset = 0;
+  let bi = 0;
+  let bOffset = 0;
+  while (ai < a.length && bi < b.length) {
+    const runA = a[ai]!;
+    const runB = b[bi]!;
+    if (runA.key !== runB.key) return false;
+    if (runA.link !== runB.link && runA.link !== LINK_UNKNOWN && runB.link !== LINK_UNKNOWN) return false;
+    const take = Math.min(runA.text.byteLength - aOffset, runB.text.byteLength - bOffset);
+    if (!runA.text.subarray(aOffset, aOffset + take).equals(runB.text.subarray(bOffset, bOffset + take))) {
+      return false;
+    }
+    aOffset += take;
+    bOffset += take;
+    if (aOffset === runA.text.byteLength) { ai += 1; aOffset = 0; }
+    if (bOffset === runB.text.byteLength) { bi += 1; bOffset = 0; }
+  }
+  return ai === a.length && bi === b.length;
+}
+
+/**
+ * Two single captures of a screen compare cell by cell: text, colours,
+ * attributes and hyperlinks, ignoring only escape grouping and padding.
+ */
+function sameStyledCapture(a: Buffer, b: Buffer): boolean {
+  const rowsA = splitRows(a);
+  const rowsB = splitRows(b);
+  if (rowsA.length !== rowsB.length) return false;
+  let styleA: CellStyle = { ...DEFAULT_CELL_STYLE };
+  let styleB: CellStyle = { ...DEFAULT_CELL_STYLE };
+  for (let index = 0; index < rowsA.length; index += 1) {
+    const rowA = parseStyledRow(rowsA[index]!, styleA);
+    const rowB = parseStyledRow(rowsB[index]!, styleB);
+    if (!sameStyledRuns(rowA.runs, rowB.runs)) return false;
+    styleA = rowA.end;
+    styleB = rowB.end;
+  }
+  return true;
+}
+
 class MaterializedHistoryFile {
   private fd: number;
   private readonly committedBytes: number;
   private derivedBytes = 0;
+  private verifyTail: Buffer = Buffer.alloc(0);
+  /** Style the replayed capture carries into its next row. */
+  private verifyReplayStyle: CellStyle = { ...DEFAULT_CELL_STYLE };
+  /** Styles the committed file may carry into its next row (see verifyRows). */
+  private verifyCommittedStyles: CellStyle[] = [{ ...DEFAULT_CELL_STYLE }];
+  private verifyBlock: Buffer = Buffer.alloc(0);
+  private verifyBlockStart = 0;
   private writePosition: number;
 
   constructor(
@@ -1004,16 +1261,85 @@ class MaterializedHistoryFile {
     this.writePosition = this.committedBytes;
   }
 
+  /**
+   * Committed rows are compared cell by cell — text, colours, attributes and
+   * hyperlinks — one row at a time, never by escape bytes. `capture-pane -e`
+   * encodes each row's SGR relative to the previous row of the same capture
+   * and each capture starts from the default style, so the same rows captured
+   * in different groups differ in escape bytes only. Recovery feeds whole
+   * output runs (see ReplayEngine.processAll), which groups rows differently
+   * from the incremental producer.
+   *
+   * Every accept() is one whole capture, so the replayed side is decoded
+   * exactly. The committed file does not record where its captures began, so
+   * a committed row may start from the style its previous row ended in or
+   * from the default style; a row passes only if one of those readings shows
+   * exactly the replayed cells. A changed colour, attribute, link target,
+   * character or row fails both readings.
+   */
+  private verifyRows(bytes: Uint8Array): void {
+    if (this.verifyTail.byteLength === 0) this.verifyReplayStyle = { ...DEFAULT_CELL_STYLE };
+    const data = this.verifyTail.byteLength === 0
+      ? Buffer.from(bytes)
+      : Buffer.concat([this.verifyTail, bytes]);
+    let start = 0;
+    for (let end = data.indexOf(0x0a, start); end >= 0; end = data.indexOf(0x0a, start)) {
+      const rowStart = this.derivedBytes;
+      const expected = this.readCommittedRow();
+      const replayed = parseStyledRow(data.subarray(start, end + 1), this.verifyReplayStyle);
+      this.verifyReplayStyle = replayed.end;
+      const readings = new Map<string, CellStyle>();
+      for (const candidate of [...this.verifyCommittedStyles, DEFAULT_CELL_STYLE]) {
+        const key = `${styleKey(candidate)}|${candidate.link}`;
+        if (readings.has(key)) continue;
+        readings.set(key, candidate);
+      }
+      const matched = new Map<string, CellStyle>();
+      for (const candidate of readings.values()) {
+        const committed = parseStyledRow(expected, candidate);
+        if (sameStyledRuns(committed.runs, replayed.runs)) {
+          matched.set(`${styleKey(committed.end)}|${committed.end.link}`, committed.end);
+        }
+      }
+      if (matched.size === 0) throw new Error(`replayed history differs at byte ${rowStart}`);
+      this.verifyCommittedStyles = [...matched.values()];
+      start = end + 1;
+    }
+    this.verifyTail = Buffer.from(data.subarray(start));
+  }
+
+  private readCommittedRow(): Buffer {
+    const parts: Buffer[] = [];
+    let position = this.derivedBytes;
+    while (position < this.committedBytes) {
+      const blockEnd = this.verifyBlockStart + this.verifyBlock.byteLength;
+      if (position < this.verifyBlockStart || position >= blockEnd) {
+        this.verifyBlockStart = position;
+        this.verifyBlock = readExact(
+          this.fd,
+          Math.min(256 * 1024, this.committedBytes - position),
+          position,
+        );
+      }
+      const block = this.verifyBlock.subarray(position - this.verifyBlockStart);
+      const newline = block.indexOf(0x0a);
+      if (newline >= 0) {
+        parts.push(block.subarray(0, newline + 1));
+        const row = Buffer.concat(parts);
+        this.derivedBytes += row.byteLength;
+        return row;
+      }
+      parts.push(block);
+      position += block.byteLength;
+    }
+    throw new Error("replayed history exceeds the committed checkpoint length");
+  }
+
   accept(bytes: Uint8Array, mode: HistoryMode): void {
     if (bytes.byteLength === 0) return;
     if (mode === "verify") {
-      if (this.derivedBytes + bytes.byteLength > this.committedBytes) {
-        throw new Error("replayed history exceeds the committed checkpoint length");
-      }
-      const expected = readExact(this.fd, bytes.byteLength, this.derivedBytes);
-      if (!expected.equals(Buffer.from(bytes))) {
-        throw new Error(`replayed history differs at byte ${this.derivedBytes}`);
-      }
+      this.verifyRows(bytes);
+      return;
     } else {
       if (this.derivedBytes !== this.writePosition) {
         throw new Error(
@@ -1027,6 +1353,9 @@ class MaterializedHistoryFile {
   }
 
   finishVerification(): void {
+    if (this.verifyTail.byteLength !== 0) {
+      throw new Error("replayed history ends inside an unterminated row");
+    }
     if (this.derivedBytes !== this.committedBytes) {
       throw new Error(
         `replayed history length ${this.derivedBytes} differs from committed ${this.committedBytes}`,
@@ -1803,6 +2132,7 @@ class PrivateTmuxReplay {
   get peakBoundedMirrorBytes(): number {
     return this.peakMirrorBytes;
   }
+
 }
 
 type ReplaySnapshot = {
@@ -1812,6 +2142,21 @@ type ReplaySnapshot = {
   pendingResize: TerminalReplayResize | null;
   screen: TerminalReplayScreen | null;
 };
+
+/**
+ * Whether `payload` contains ED3 (`CSI 3 J`), including one whose prefix
+ * ended the previous record. Over-matching only costs an extra tmux write.
+ */
+function erasesScrollback(previous: Uint8Array, payload: Uint8Array): boolean {
+  const tail = previous.subarray(Math.max(0, previous.byteLength - 3));
+  const window = Buffer.concat([tail, payload]);
+  for (let index = window.indexOf(0x4a, tail.byteLength); index >= 0; index = window.indexOf(0x4a, index + 1)) {
+    if (index >= 3 && window[index - 1] === 0x33 && window[index - 2] === 0x5b && window[index - 3] === 0x1b) {
+      return true;
+    }
+  }
+  return false;
+}
 
 class ReplayEngine {
   private lifecycle: LifecycleState = "none";
@@ -1972,6 +2317,68 @@ class ReplayEngine {
     }
     // abort deliberately leaves the emulator at `from`.
     this.pendingResize = null;
+  }
+
+  /**
+   * Replay records in order, feeding runs of consecutive output records to
+   * tmux as one write. Per-record feeding cost ~6 private tmux commands per
+   * record, which made checkpoint recovery O(records) round-trips and timed
+   * out on long-lived lanes (HP7-OPEN).
+   *
+   * A run must capture the same history rows as per-record feeding, which
+   * drains tmux history at every record boundary. The one input that destroys
+   * undrained history is ED3 (`CSI 3 J`, erase scrollback; Claude Code sends
+   * `CSI 2 J CSI 3 J` on a full redraw), so a record containing it always
+   * starts a new run. What still differs between groupings (SGR carry-over
+   * and blank padding in captures) is ignored by the visible-row comparison.
+   */
+  processAll(
+    records: readonly OutputWalRecord[],
+    onHistory: (captured: Uint8Array) => void,
+  ): void {
+    let run: OutputWalRecord[] = [];
+    let runBytes = 0;
+    const flushRun = () => {
+      if (run.length === 0) return;
+      const first = run[0]!;
+      const last = run[run.length - 1]!;
+      try {
+        this.requireActive(first);
+        if (this.pendingResize) {
+          throw new Error(
+            `output appears during prepared resize ${this.pendingResize.changeId}`,
+          );
+        }
+      } catch (error) {
+        throw new Error(`terminal replay failed at WAL record ${first.sequence}: ${String(error)}`);
+      }
+      if (runBytes > 0) {
+        try {
+          this.tmux.feed(Buffer.concat(run.map((record) => record.payload), runBytes), onHistory);
+        } catch (error) {
+          throw new Error(
+            `terminal replay failed at WAL records ${first.sequence}-${last.sequence}: ${String(error)}`,
+          );
+        }
+        this.hasOutputInGeneration = true;
+      }
+      this.recordsSeen += run.length;
+      run = [];
+      runBytes = 0;
+    };
+    for (const record of records) {
+      if (record.kind === "output") {
+        const previous = run[run.length - 1];
+        if (previous && erasesScrollback(previous.payload, record.payload)) flushRun();
+        run.push(record);
+        runBytes += record.payload.byteLength;
+        if (runBytes >= COALESCED_OUTPUT_MAX_BYTES) flushRun();
+        continue;
+      }
+      flushRun();
+      this.process(record, onHistory);
+    }
+    flushRun();
   }
 
   process(
@@ -2357,23 +2764,26 @@ export class TerminalReplaySession {
         if (batch.records.length === 0) {
           throw new Error(`checkpoint WAL cursor ${checkpointOffset} is beyond the readable WAL`);
         }
+        let expectedOffset = this.lastOffset;
         for (const record of batch.records) {
-          if (record.offset !== this.lastOffset) {
+          if (record.offset !== expectedOffset) {
             throw new Error(
-              `recovery WAL record begins at ${record.offset}, expected ${this.lastOffset}`,
+              `recovery WAL record begins at ${record.offset}, expected ${expectedOffset}`,
             );
           }
           if (record.nextOffset > checkpointOffset) {
             throw new Error(`checkpoint WAL cursor ${checkpointOffset} is not a record boundary`);
           }
-          this.engine.process(
-            record,
-            (captured) => this.history.accept(captured, "verify"),
-          );
-          this.lastOffset = record.nextOffset;
-          this.lastSequence = record.sequence;
-          this.lastAt = record.at;
+          expectedOffset = record.nextOffset;
         }
+        this.engine.processAll(
+          batch.records,
+          (captured) => this.history.accept(captured, "verify"),
+        );
+        const lastRecord = batch.records[batch.records.length - 1]!;
+        this.lastOffset = lastRecord.nextOffset;
+        this.lastSequence = lastRecord.sequence;
+        this.lastAt = lastRecord.at;
         if (batch.cursor.offset !== this.lastOffset
           || batch.cursor.lastSequence !== this.lastSequence
           || batch.cursor.lastAt !== this.lastAt) {
@@ -2402,7 +2812,11 @@ export class TerminalReplaySession {
         this.consumeTail();
       }
 
-      this.result = this.commitCheckpoint();
+      // Recovery republishes the verified checkpoint screen byte for byte.
+      // The grouped replay's own capture encodes the same cells with
+      // different escape grouping, and runtimes before HP7-FIX1 compare the
+      // checkpoint screen byte-exact — rewriting it would break a rollback.
+      this.result = this.commitCheckpoint(checkpoint ? checkpoint.screen : undefined);
     } catch (error) {
       try {
         this.history.close();
@@ -2414,8 +2828,11 @@ export class TerminalReplaySession {
     }
   }
 
-  private commitCheckpoint(): TerminalReplayResult {
-    const snapshot = this.engine.snapshot();
+  private commitCheckpoint(
+    verifiedScreen?: TerminalReplayScreen | null,
+  ): TerminalReplayResult {
+    const replayed = this.engine.snapshot();
+    const snapshot = verifiedScreen === undefined ? replayed : { ...replayed, screen: verifiedScreen };
     this.history.flush();
     const nextCheckpoint: TerminalReplayCheckpoint = {
       version: 1,
@@ -2513,6 +2930,8 @@ export class TerminalReplaySession {
       // the incomplete checkpoint could trail by two raw-output batches.
       ...(this.engine.hasPendingResize ? { maxRecords: 1 } : {}),
     });
+    // New derived bytes stay per-record: that is the grouping every earlier
+    // runtime wrote, so their byte-exact recovery can still verify this file.
     for (const record of batch.records) {
       if (record.offset !== this.lastOffset) {
         throw new Error(

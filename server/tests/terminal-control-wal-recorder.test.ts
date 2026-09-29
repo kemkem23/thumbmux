@@ -688,6 +688,46 @@ function naHarness(incremental = false, options: CalibratorOptions = {}) {
   };
 }
 
+test('CANARY-FIX M: a history capture copies the recent ring at most once and certifies the same rows', async () => {
+  // The runtime's ring holds up to 4,500 rows; every copy of it per capture was
+  // O(ring) garbage on the frame thread (21 panes x ~1.5 captures/s). The fence
+  // needs only its newest line id; only the post-capture read is matched.
+  const run = async (lazy: boolean) => {
+    let copies = 0, time = 0, revision = 1;
+    const paneKey = { serverIdentity: 'private', paneId: '%0', birthGeneration: 1 };
+    const texts = Array.from({ length: 300 }, (_, i) => `row-${i}`);
+    const ring = naRows(texts);
+    const frame: CalibrationFrame = { cells: [naRow('abc ').cells], cursor: { x: 0, y: 0, visible: true }, kind: 'normal', geometryGeneration: 1, receiveSeq: 0 };
+    const writes: Parameters<CalibrationPorts['calibrate']>[0][] = [];
+    const snapshot = () => {
+      const len = ring.length; let copy: HistoryRow[] | null = null;
+      const base = { revision, sourceEpoch: 1, geometryGeneration: 1, parserFrame: frame };
+      if (!lazy) { copies++; return { ...base, recentHistory: ring.slice(0, len) }; }
+      return { ...base, recentLastLineId: len ? ring[len - 1]!.lineId : null, get recentHistory() { if (!copy) { copies++; copy = ring.slice(0, len); } return copy; } };
+    };
+    const ports: CalibrationPorts = {
+      now: () => time, read: snapshot, schedule: () => {},
+      capture: async (_, limit) => {
+        const meta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 1, cols: 4, rows: 1, kind: 'normal' as const, cursor: frame.cursor };
+        const history = texts.slice(-Math.min(limit, texts.length)).map(naRow);
+        return { paneKey, captureId: `c${time}`, requestedAt: time, completedAt: time, before: meta, after: meta, frame, history, completeRetainedTail: limit >= texts.length, observedFields: ['cells', 'cursor'] };
+      },
+      calibrate: async input => { writes.push(input); return { revision: ++revision, durableRevision: 0, nextLineId: 301 }; },
+      publish: () => {}, fault: () => {},
+    };
+    const calibrator = new HistoryCalibrator(paneKey, ports, { incremental: true });
+    const captures = 20;
+    for (let i = 0; i < captures; i++) { time = i * 1000; await calibrator.runDue(); }
+    return { copies, captures, checks: writes.map(w => w.checks.map(c => c.lineId).join(',')) };
+  };
+  const eager = await run(false), lazy = await run(true);
+  console.log('CANARY_FIX_M_RING_COPIES', JSON.stringify({ eagerCopies: eager.copies, lazyCopies: lazy.copies, captures: lazy.captures }));
+  // Same certification either way; one ring copy per capture at most.
+  expect(lazy.checks).toEqual(eager.checks);
+  expect(lazy.checks[0]!.split(',').length).toBeGreaterThan(290);
+  expect(lazy.copies).toBeLessThanOrEqual(lazy.captures);
+});
+
 describe('NEWARCH L2-C matcher and calibration ports', () => {
   test('unique suffix checks exact cells and leaves bounded mismatch untouched', () => {
     const rows = naRows(['L1', 'L2', 'L3', 'bad', 'R1', 'R2', 'R3']);

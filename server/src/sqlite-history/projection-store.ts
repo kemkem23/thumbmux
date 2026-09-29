@@ -3,10 +3,10 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
+import { PROJECTION_LEGACY_FILES, PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION, PROJECTION_STORE_FILE } from './schema';
 import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
-import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
-import { decodeBlock, encodeBlock, encodeRow } from './codec';
+import { BLOCK_COLUMNS, LegacyUnderlay, lowestLine, readDiskLines, readProjectionPage, projectionIssue, type LegacyFloor } from './projection-reader';
+import { decodeBlock, decodeCaptureArchive, decodeCaptureReceipts, encodeBlock, encodeCaptureArchive, encodeCaptureReceipts, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionCloseReceipt, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionStorageState, ProjectionStorageStatus, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -29,6 +29,12 @@ const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
+  /**
+   * Files of earlier schemas, read-only, layered under panes this file
+   * continues (LegacyUnderlay). Default: the PROJECTION_LEGACY_FILES that exist
+   * under historyRoot when `file` is the default, none otherwise.
+   */
+  legacyArchives?: readonly string[];
   /** RAM working-set cap; defaults to 256 MiB. Tests lower it to reach the cap with real rows. */
   cacheBytes?: number;
   onFault?: (fault: ProjectionFault)=>void;
@@ -45,7 +51,7 @@ function isStorageFull(error:unknown):boolean {
     || /(?:SQLITE_FULL|database or disk is full|\bENOSPC\b|no space left on device)/i.test(String(error));
 }
 function admitPath(options: ProjectionOptions): string {
-  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,'newarch-v3/history.sqlite3'));
+  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,PROJECTION_STORE_FILE));
   if(file===root || !file.startsWith(root+sep) || file.split(sep).some(p=>/^brain\.db(?:$|[-.])/i.test(p))) throw new Error('forbidden-database-path');
   // Check every existing component before creating anything or calling SQLite.
   for(const candidate of [file,file+'-wal',file+'-shm',file+'-journal']) {
@@ -62,7 +68,7 @@ function admitPath(options: ProjectionOptions): string {
     const fd=openSync(file,'r');
     try {
       const head=Buffer.alloc(100); const n=readSync(fd,head,0,100,0);
-      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v4');
+      if(n!==100 || head.subarray(0,16).toString()!=='SQLite format 3\0' || head.readUInt32BE(60)!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v5');
     } finally { closeSync(fd); }
   } else {
     mkdirSync(dirname(file),{recursive:true,mode:0o700});
@@ -73,6 +79,31 @@ function admitPath(options: ProjectionOptions): string {
 
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
 const blockLine=(row:SqlRow)=>BLOCK_COLUMNS.map(column=>row[column]);
+const CAPTURE_COLUMNS=['capture_id','revision','source_epoch','requested_at','completed_at','geometry_generation','first_history_row','history_count','screen_hash','history_hash','observed_fields','compared_rows','corrected_cells','ambiguous_rows','result'] as const;
+const captureValues=(row:SqlRow)=>CAPTURE_COLUMNS.map(column=>row[column]);
+const captureRow=(paneNo:number,values:unknown[]):SqlRow=>{
+  if(values.length!==CAPTURE_COLUMNS.length)throw new Error('capture-archive-corrupt');
+  const row:SqlRow={pane_no:paneNo};
+  CAPTURE_COLUMNS.forEach((column,index)=>{row[column]=values[index] as SqlRow[string];});
+  return row;
+};
+function captureReceipt(disk:Database,paneNo:number,captureId:string):SqlRow {
+  const live=prepared(disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(paneNo,captureId) as SqlRow|null;
+  if(live)return live;
+  for(const block of prepared(disk,'SELECT catalog,data,capture_count FROM na_capture_archive WHERE pane_no=? ORDER BY archive_no DESC').all(paneNo) as SqlRow[]) {
+    const catalog=decodeCaptureArchive(block.catalog as unknown as Uint8Array);
+    if(catalog.length!==Number(block.capture_count))throw new Error('capture-archive-corrupt');
+    const ordinal=catalog.findIndex(item=>Array.isArray(item)&&item[0]===captureId);
+    if(ordinal<0)continue;
+    const data=decodeCaptureReceipts(block.data as unknown as Uint8Array);
+    if(data.length!==catalog.length)throw new Error('capture-archive-corrupt');
+    const row=captureRow(paneNo,data[ordinal]!);
+    if(row.capture_id!==captureId || row.revision!==catalog[ordinal]![1] || row.source_epoch!==catalog[ordinal]![2]
+      || row.geometry_generation!==catalog[ordinal]![3])throw new Error('capture-archive-catalog');
+    return row;
+  }
+  throw new Error('capture-receipt-missing');
+}
 /** Per-line upsert, unless a sealed block holds the line: then the block is patched. */
 function writeLines(disk:Database,rows:SqlRow[]):void {
   const patches=new Map<string,SqlRow[]>();
@@ -114,6 +145,22 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
     }
   }
 }
+/** Archive receipts only after every live FK has moved into a sealed block. */
+function archiveCaptures(disk:Database,panes:SqlRow[],force:boolean):void {
+  for(const pane of panes)for(;;) {
+    const rows=prepared(disk,`SELECT c.* FROM na_capture c WHERE c.pane_no=?
+      AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_no=c.pane_no AND l.checked_capture_id=c.capture_id)
+      AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=c.pane_no ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT 8)
+      ORDER BY c.revision,c.capture_id LIMIT 256`).all(pane.pane_no) as SqlRow[];
+    if(!rows.length || (!force && rows.length<128))break;
+    const catalog=rows.map(row=>[row.capture_id,row.revision,row.source_epoch,row.geometry_generation]);
+    prepared(disk,'INSERT INTO na_capture_archive (pane_no,first_revision,last_revision,capture_count,catalog,data) VALUES (?,?,?,?,?,?)')
+      .run(pane.pane_no,rows[0]!.revision,rows.at(-1)!.revision,rows.length,encodeCaptureArchive(catalog),encodeCaptureReceipts(rows.map(captureValues)));
+    const remove=prepared(disk,'DELETE FROM na_capture WHERE pane_no=? AND capture_id=?');
+    for(const row of rows)remove.run(pane.pane_no,row.capture_id);
+    if(rows.length<256)break;
+  }
+}
 function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false, forceSeal=false) {
   const started=performance.now();let writeMs=0;
   disk.transaction(()=>{
@@ -127,6 +174,7 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     prepared(disk,'INSERT INTO na_commit VALUES (?,coalesce((SELECT max(commit_seq) FROM na_commit),0)+1,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     prepared(disk,'DELETE FROM na_commit WHERE commit_id<>?').run(batch.id);
     sealBlocks(disk,batch.panes,forceSeal);
+    archiveCaptures(disk,batch.panes,forceSeal);
     before?.();writeMs=performance.now()-started;
   }).immediate();
   // Bound physical WAL growth without forcing a truncate into the ingest
@@ -172,6 +220,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private readonly ram=new ProjectionRam();
   private readonly disk:Database;
   readonly file:string;
+  private readonly legacy:LegacyUnderlay;
   private fence=0;
   private queues=new Map<string,Job[]>();
   private queuedBytes=0;
@@ -230,15 +279,15 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.disk=new Database(this.file,{strict:true});
     try {
       // page_size only applies to a new file, so it must precede journal_mode.
-      this.disk.exec(`PRAGMA page_size=${DISK_PAGE_SIZE}; PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
+      this.disk.exec(`PRAGMA page_size=${DISK_PAGE_SIZE}; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA busy_timeout=250; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
       this.disk.transaction(()=>{
         const version=Number(Object.values(prepared(this.disk,'PRAGMA user_version').get()!)[0]);
         if(options.mode==='create') {
           if(version!==0 || prepared(this.disk,"SELECT name FROM sqlite_master WHERE type='table'").all().length) throw new Error('new-file-required');
           this.disk.exec(PROJECTION_SCHEMA);this.disk.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);
-        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v4');
+        } else if(version!==PROJECTION_SCHEMA_VERSION) throw new Error('not-projection-v5');
         else {
-          const sql=(prepared(this.disk,"SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture','na_block')").get() as SqlRow).s;
+          const sql=(prepared(this.disk,"SELECT group_concat(sql,' ') AS s FROM sqlite_master WHERE name IN ('na_line','na_capture','na_block','na_capture_archive')").get() as SqlRow).s;
           if(PROJECTION_SCHEMA_MARKERS.some(m=>!String(sql).includes(m))) throw new Error('projection-schema-outdated');
         }
         const epoch=Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0]);
@@ -250,7 +299,12 @@ export class ProjectionStore implements ProjectionWriterPort {
       const fd=openSync(dirname(this.file),'r');try {fsyncSync(fd);}finally {closeSync(fd);}
       this.recover();
     } catch(error) { closePrepared(this.disk);closePrepared(this.ram.db);throw error; }
-    try {this.ensureWorker();}catch(error){closePrepared(this.ram.db);closePrepared(this.disk);throw error;}
+    const root=resolve(options.historyRoot);
+    this.legacy=new LegacyUnderlay((options.legacyArchives??(options.file===undefined?PROJECTION_LEGACY_FILES.map(f=>join(root,f)).filter(f=>existsSync(f)):[]))
+      .map(f=>resolve(root,f)).filter(f=>f!==this.file));
+    for(const reason of this.legacy.errors)this.reportLegacy(reason);
+    this.ram.firstLineId=key=>this.legacy.find(key)?.token.nextLineId??0;
+    try {this.ensureWorker();}catch(error){this.legacy.close();closePrepared(this.ram.db);closePrepared(this.disk);throw error;}
     this.timer=setInterval(()=>{
       try {
         if(this.stopped)this.relievePressure();
@@ -262,6 +316,24 @@ export class ProjectionStore implements ProjectionWriterPort {
     },5);
     this.timer.unref();
   }
+  private reportLegacy(reason:string):void {
+    try {this.options.onFault?.({kind:'legacy-archive-unavailable',reason,at:Date.now(),pendingBytes:0});}
+    catch {console.error('[newarch] fault sink failed');}
+  }
+  /** Legacy rows under this pane, if its numbering continues a legacy file. */
+  private underlay(key:PaneKey):LegacyFloor|null {
+    if(!this.legacy.size)return null;
+    const seen=this.legacy.errors.length;
+    const floor=this.legacy.floor(key,()=>{
+      const no=this.ram.paneNo(key);
+      const found=[lowestLine(this.disk,no),lowestLine(this.ram.db,no)].filter((v):v is number=>v!==null);
+      return found.length?Math.min(...found):this.ram.token(key).nextLineId;
+    });
+    for(const reason of this.legacy.errors.slice(seen))this.reportLegacy(reason);
+    return floor;
+  }
+  /** Legacy files layered under this store: how many opened and why the others did not. */
+  legacyArchives():{opened:number;errors:string[]} {return {opened:this.legacy.size,errors:[...this.legacy.errors]};}
   private owner():void {
     if(this.closed) throw new Error('store-closed');
     if(Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0])!==this.fence) throw new Error('stale-writer');
@@ -274,7 +346,7 @@ export class ProjectionStore implements ProjectionWriterPort {
         const floor=Math.max(0,Number(row.next_line_id)-5000);
         const lines=readDiskLines(this.disk,Number(row.pane_no),floor,Number(row.next_line_id));
         for(const id of new Set(lines.map(l=>l.checked_capture_id).filter(id=>id!==null)))
-          upsert(this.ram.db,'na_capture',prepared(this.disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(row.pane_no,id) as SqlRow);
+          upsert(this.ram.db,'na_capture',captureReceipt(this.disk,Number(row.pane_no),String(id)));
         for(const line of lines) upsert(this.ram.db,'na_line',line);
       }
     })();
@@ -762,8 +834,7 @@ export class ProjectionStore implements ProjectionWriterPort {
           for(const row of readDiskLines(this.disk,no,Math.min(...missing),Math.max(...missing)+1)) {
             if(!wanted.has(Number(row.line_id)))continue;
             if(row.checked_capture_id!==null) {
-              const receipt=prepared(this.disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(no,row.checked_capture_id) as SqlRow;
-              upsert(this.ram.db,'na_capture',receipt);
+              upsert(this.ram.db,'na_capture',captureReceipt(this.disk,no,String(row.checked_capture_id)));
             }
             upsert(this.ram.db,'na_line',row);
           }
@@ -781,7 +852,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.owner();const row=prepared(this.ram.db,'SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
     return row?{...row,cells_json:JSON.stringify(decodeFrameCells(String(row.cells_json)))}:null;
   }
-  readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
+  readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit,this.underlay(token.paneKey));}
   private snapshot():Batch|null {
     if(this.retry)return this.retry;
     this.drainLosses();
@@ -889,6 +960,14 @@ export class ProjectionStore implements ProjectionWriterPort {
         this.diskTiming=commitBatch(this.disk,this.fence,current,()=>this.options.checkpoint?.('before-disk-commit',current.id),false,true);
         this.acknowledge();
       }
+      // A prior asynchronous commit may have drained the final dirty batch.
+      // The explicit barrier still performs derived compaction for every pane;
+      // otherwise quiet panes keep one receipt row per capture indefinitely.
+      this.disk.transaction(()=>{
+        const panes=prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[];
+        sealBlocks(this.disk,panes,true);archiveCaptures(this.disk,panes,true);
+      }).immediate();
+      this.disk.exec('PRAGMA incremental_vacuum');
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     }catch(error){this.handleFlushFailure(error);throw error;}
   }
@@ -955,7 +1034,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const w of this.drainWaiters.splice(0))w.reject(new Error('store-closed'));
       this.closed=true;
       try {await this.stopWorker();}
-      finally {closePrepared(this.ram.db);closePrepared(this.disk);}
+      finally {this.legacy.close();closePrepared(this.ram.db);closePrepared(this.disk);}
     }
     return this.closeReceipt!;
   }

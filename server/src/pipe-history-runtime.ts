@@ -51,7 +51,7 @@ export const PIPE_HISTORY_RUNTIME_CAPABILITY = Object.freeze({
   wire: 'newarch-frame-v1',
   projectionSchema: PROJECTION_SCHEMA_VERSION,
   metadataRevision: true,
-  archiveReadVersions: Object.freeze([2, 3] as const),
+  archiveReadVersions: Object.freeze([2, 3, 4, 5] as const),
 });
 
 // ─── cell codec ───────────────────────────────────────────────────────────
@@ -626,7 +626,9 @@ export class PipeHistoryPane {
   private remember(row: RingRow): void {
     this.ring.push(row);
     const limit = this.runtime.options.ringRows ?? RING_ROWS;
-    if (this.ring.length > limit + 512) this.ring.splice(0, this.ring.length - limit);
+    // Evict into a new array, never in place: a calibration snapshot taken
+    // earlier (read()) is this array plus its length at that moment.
+    if (this.ring.length > limit + 512) this.ring = this.ring.slice(this.ring.length - limit);
   }
 
   /**
@@ -878,12 +880,20 @@ export class PipeHistoryPane {
       // I1 m4: the RECEIVE counter; bytes still inside the parser count as "not quiet".
       receiveSeq: this.received,
     };
+    // The ring as of now without copying it: rows are only appended to this
+    // array (eviction replaces it), so its first `length` rows stay exactly
+    // what they are now. The copy is made on first use; the calibrator reads
+    // it only for a matched history capture (3 full copies per capture before,
+    // O(4,500) each, on the frame thread).
+    const ring = this.ring, length = ring.length;
+    let copy: RingRow[] | null = null;
     return {
       revision: token?.revision ?? 0,
       sourceEpoch: token?.sourceEpoch ?? this.collector.currentSourceEpoch(),
       geometryGeneration: token?.geometryGeneration ?? this.collector.currentGeometryGeneration(),
-      // A copy: the ring keeps growing while the calibrator holds this snapshot.
-      recentHistory: this.ring.slice(), parserFrame,
+      recentLastLineId: length ? ring[length - 1]!.lineId : null,
+      get recentHistory(): RingRow[] { return copy ??= ring.slice(0, length); },
+      parserFrame,
     };
   }
 

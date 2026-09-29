@@ -348,32 +348,43 @@ function internCell(cell: TmuxObservedCell): Readonly<TmuxObservedCell> {
  * mutate them (the matcher clones what it keeps). Their cells are interned and
  * frozen, so one cell object can appear in many rows. */
 export class TmuxCaptureDecoder {
-  private cache = new Map<string, { cells: readonly Readonly<TmuxObservedCell>[]; fg: string; bg: string; style: number }>();
+  private cache = new Map<string, { cells: readonly Readonly<TmuxObservedCell>[]; fg: string; bg: string; style: number; used: number }>();
+  private generation = 0;
   hits = 0; misses = 0;
   /** Row indexes of the last decode() that are isolated as uncertain. */
   uncertainRows: number[] = [];
-  /** Retention follows the capture in use (I4-FIX1 F11): after each decode
-   * the memo keeps at most twice that capture's line count, never fewer than
-   * `minEntries` nor more than `maxEntries`. A run of full 4500-row captures
-   * stays warm; a steady incremental tail no longer pins 9000 rows per pane
-   * (21 panes x 120 cols: 278 MiB of heap at a fixed 9000, 35 MiB at 1024). */
-  constructor(readonly cols: number, private readonly maxEntries = 9000, private readonly minEntries = 1024) {
+  /** Retention follows the captures in use (I4-FIX1 F11, CANARY-FIX M): after
+   * each decode the memo keeps the rows the last two decodes returned, so a
+   * steady tail keeps the overlap it hits and a run of full 4500-row captures
+   * stays warm. A row older than both is dropped: tmux returns it again only
+   * in a later full capture, which re-decodes it once. `minEntries` is the
+   * floor of rows kept regardless (oldest dropped first), `maxEntries` the
+   * cap. The old floor of 1024 kept rows no capture returned any more; each
+   * pinned its cells plus the runtime's canonical and frame side tables
+   * (~4 KB/row): 30 MiB at 12 min of the 21-pane soak, growing all 30 min. */
+  constructor(readonly cols: number, private readonly maxEntries = 9000, private readonly minEntries = 1) {
     checkedCols(cols);
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('invalid decoder cache size');
     if (!Number.isSafeInteger(minEntries) || minEntries < 1) throw new Error('invalid decoder cache size');
   }
   get size(): number { return this.cache.size; }
-  private trim(lines: number): void {
-    const keep = Math.min(this.maxEntries, Math.max(this.minEntries, lines * 2));
+  private trim(): void {
+    const keep = this.minEntries;
     if (this.cache.size <= keep) return;
-    const keys = this.cache.keys();
-    for (let n = this.cache.size - keep; n > 0; n--) this.cache.delete(keys.next().value!);
+    // Insertion order is age order: drop the oldest rows neither of the last two decodes used.
+    const stale = this.generation - 1;
+    let excess = this.cache.size - keep;
+    for (const [key, entry] of this.cache) {
+      if (excess <= 0) break;
+      if (entry.used < stale) { this.cache.delete(key); excess--; }
+    }
   }
   decode(raw: string): (readonly Readonly<TmuxObservedCell>[])[] {
     this.uncertainRows = [];
+    this.generation++;
     const lines = raw.split('\n');
     if (lines.at(-1) === '') lines.pop();
-    try { return this.decodeLines(raw, lines); } finally { this.trim(lines.length); }
+    try { return this.decodeLines(raw, lines); } finally { this.trim(); }
   }
   private decodeLines(raw: string, lines: string[]): (readonly Readonly<TmuxObservedCell>[])[] {
     if (!lines.every(escapesCloseInLine)) {
@@ -394,6 +405,7 @@ export class TmuxCaptureDecoder {
       let entry = this.cache.get(key);
       if (entry) {
         this.hits++;
+        entry.used = this.generation;
         // No recency refresh: a delete+set per hit churned ~94k Map entries per
         // 21-pane full capture (heap 446 -> 175 MB without it). History rows
         // age in insertion order, so FIFO evicts rows that left tmux first; an
@@ -401,7 +413,7 @@ export class TmuxCaptureDecoder {
       } else {
         this.misses++;
         const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(internCell);
-        entry = { cells, fg: state.fg, bg: state.bg, style: state.style };
+        entry = { cells, fg: state.fg, bg: state.bg, style: state.style, used: this.generation };
         this.cache.set(key, entry);
         if (this.cache.size > this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
       }
