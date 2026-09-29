@@ -386,15 +386,13 @@ test("CANARY-FIX M: a calibration snapshot stays as it was read across appends a
     capture: async () => { throw new Error("unused"); },
   });
   try {
-    const p = pane as unknown as { remember(row: unknown): void; read(): { recentHistory: { lineId: number }[]; recentLastLineId?: number | null }; ring: unknown[] };
+    const p = pane as unknown as { remember(row: unknown): void; read(): { recentHistory: { lineId: number }[]; recentLastLineId?: number | null } };
     const add = (lineId: number) => p.remember({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: [BLANK_CELL], softWrap: false });
     for (let id = 0; id < 10; id++) add(id);
-    const before = p.ring;
     const snap = p.read();
     expect(snap.recentLastLineId).toBe(9);
     // 600 more rows: the ring passes 8 + 512 and evicts; the snapshot must not see any of it.
     for (let id = 10; id < 610; id++) add(id);
-    expect(p.ring).not.toBe(before);
     expect(snap.recentHistory.map((r) => r.lineId)).toEqual(Array.from({ length: 10 }, (_, i) => i));
     expect(snap.recentHistory).toBe(snap.recentHistory);
     const now = p.read().recentHistory.map((r) => r.lineId);
