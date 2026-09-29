@@ -861,7 +861,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.last!.cells.rows).toBe(24);
   }, 30_000);
 
-  test.each([0, 3, 500])("M2 releases evicted references immediately across 12,500 appends (cap %i)", (cap) => {
+  test.each([0, 3, 500])("M2 releases evicted references immediately across 15,000 appends (cap %i)", (cap) => {
     // Exercise the retention boundary without a worker or GC timing. The
     // oracle owns its own references; count only slots owned by the collector.
     type Tray = { ring: Array<PipeScrollEvent | undefined>; ringStart: number; remember(event: PipeScrollEvent): void };
@@ -883,7 +883,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     });
     const tray = collector as unknown as Tray;
     const saved: Array<{ snapshot: PipeScrollEvent[]; expected: PipeScrollEvent[] }> = [];
-    for (let i = 0; i < 12_500; i++) {
+    for (let i = 0; i < 15_000; i++) {
       const event: PipeScrollEvent = {
         paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
         physicalRow: [], softWrap: i % 2 === 0, wrapPad: false, receiveSeq: i + 1,
@@ -893,7 +893,7 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
       tray.remember(event);
       if (tray.ringStart < start) compactions++;
       maxRetained = Math.max(maxRetained, tray.ring.filter(Boolean).length);
-      if (i % 499 === 0 || i === 12_499) {
+      if (i % 499 === 0 || i === 14_999) {
         const expected = cap === 0 ? [] : history.slice(-cap);
         const snapshot = collector.ringSnapshot();
         expect(snapshot).toEqual(expected);
@@ -902,8 +902,8 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
       }
     }
     for (const { snapshot, expected } of saved) expect(snapshot).toEqual(expected);
-    expect(evictions).toBe(12_500 - cap);
-    expect(collector.stats().scrolls).toBe(12_500);
+    expect(evictions).toBe(15_000 - cap);
+    expect(collector.stats().scrolls).toBe(15_000);
     expect(compactions).toBeGreaterThanOrEqual(3);
     console.log(`M2-RETENTION ${JSON.stringify({ cap, appends: history.length, evictions, compactions, maxRetained, maxDuringEvict, finalRetained: tray.ring.filter(Boolean).length })}`);
     expect(maxRetained).toBeLessThanOrEqual(cap);
