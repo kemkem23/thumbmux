@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import select
 import struct
 import sys
@@ -58,6 +59,13 @@ VENDOR = HERE / "pipe-vt-vendor.zip"
 # Emit at least this often while input keeps arriving (one 60 Hz frame).
 MAX_COALESCE_NS = 16_000_000
 MAX_COALESCE_BYTES = 256 * 1024
+# Shared interpreter fairness (NEWARCH P2OPT): one channel turn spends at most
+# MAX_TURN_NS feeding its parser, checked after every slice of at most
+# TURN_SLICE_BYTES, so one large D frame can no longer hold every sibling for
+# the whole frame. P2 measured ~2 us/byte of pyte, 26-37 ms per noisy turn
+# with the old budget checked only between whole frames.
+MAX_TURN_NS = 2_000_000
+TURN_SLICE_BYTES = 512
 
 
 output_sink = None  # Set only during one synchronous multiplex channel turn.
@@ -123,6 +131,53 @@ class RxClock:
             del marks[:self.head]
             self.head = 0
         return mark
+
+
+CSI_FINAL = re.compile(rb"[\x40-\x7e]")
+STRING_END = re.compile(rb"\x07|\x1b\\")
+NF_FINAL = re.compile(rb"[^\x20-\x2f]")
+
+
+def slice_end(data, start, limit=TURN_SLICE_BYTES):
+    """End of the next parser slice of data[start:], at most `limit` bytes.
+
+    Walks the escape sequences from `start` (a slice boundary) and cuts before
+    the first one still open at the window end, otherwise at the window end
+    stepped back to the start of a UTF-8 sequence. The parser is incremental,
+    so the fallback for a sequence longer than the window (cut at the window
+    end) is still correct: the walk only keeps every slice self-contained.
+    """
+    end = start + limit
+    if end >= len(data):
+        return len(data)
+    pos = start
+    while True:
+        esc = data.find(b"\x1b", pos, end)
+        if esc < 0:
+            break
+        pos = escape_end(data, esc, end)
+        if pos is None:
+            end = esc
+            break
+    while end > start and 0x80 <= data[end] < 0xC0:
+        end -= 1
+    return end if end > start else start + limit
+
+
+def escape_end(data, esc, end):
+    """Offset after the escape sequence at data[esc], or None if open at `end`."""
+    if esc + 1 >= end:
+        return None
+    intro = data[esc + 1]
+    if intro == 0x5B:  # CSI: parameters/intermediates, then a final 0x40-0x7e.
+        match = CSI_FINAL.search(data, esc + 2, end)
+    elif intro in (0x5D, 0x50, 0x5F, 0x5E, 0x58):  # OSC/DCS/APC/PM/SOS: BEL or ST.
+        match = STRING_END.search(data, esc + 2, end)
+    elif 0x20 <= intro <= 0x2F:  # nF: intermediates, then a final byte.
+        match = NF_FINAL.search(data, esc + 2, end)
+    else:
+        return esc + 2
+    return None if match is None else match.end()
 
 
 def row_wrapped(row):
@@ -487,6 +542,7 @@ class Worker:
     def reset_stages(self):
         self.in_frames = 0
         self.in_bytes = 0
+        self.batch_ns = None
         self.first_rx_ns = None
         self.wait_ns = 0
         self.max_wait_ns = 0
@@ -512,13 +568,19 @@ class Worker:
             "epoch": getattr(row, "epoch", s.epoch),
         })
 
-    def feed(self, seq, epoch, data, rx=None):
+    def feed(self, seq, epoch, data, rx=None, more=False):
+        """Feed one D frame, or its first slice when `more` slices follow.
+
+        Returns False when the rest of the frame must be dropped (SIXEL).
+        """
         self.screen.epoch = epoch
         self.screen.receive_seq = seq
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
         t = time.monotonic_ns()
+        if self.batch_ns is None:
+            self.batch_ns = t
         waited = 0 if rx is None else max(0, t - rx[0])
         if self.first_rx_ns is None:
             self.first_rx_ns = t if rx is None else rx[0]
@@ -527,11 +589,23 @@ class Worker:
                 self.read_lag_ns, self.read_lag_max_ns = rx[1], rx[2]
         self.max_wait_ns = max(self.max_wait_ns, waited)
         self.in_frames += 1
+        return self.feed_more(data, t)
+
+    def feed_more(self, data, t=None):
+        """Continue the D frame begun by feed(); stage counters are per frame."""
+        if t is None:
+            t = time.monotonic_ns()
         self.in_bytes += len(data)
         data = self.filter_dcs(data)
         if data is not None:
             self.stream.feed(data)
         self.parse_ns += time.monotonic_ns() - t
+        return data is not None
+
+    def coalesce_due(self):
+        """One 60 Hz frame of parsing (or 256 KiB) since the batch began."""
+        return self.batch_ns is not None and (
+            time.monotonic_ns() - self.batch_ns >= MAX_COALESCE_NS or self.in_bytes >= MAX_COALESCE_BYTES)
 
     def filter_dcs(self, data):
         """Consume DCS without exposing its payload to pyte (which lacks DCS).
@@ -698,6 +772,11 @@ def dispatch(worker, kind, payload, rx=None):
 def multiplex(path):
     """Single-threaded fair selector; each connection owns parser and buffers.
 
+    A channel turn feeds at most MAX_TURN_NS of parser work, a D frame in
+    slices (slice_end) if need be; the unfinished frame stays in "partial" and
+    resumes first on the channel's next turn, so commands keep their order and
+    no update acknowledges a frame before all of it was fed. Updates coalesce
+    while the channel has more complete input, up to one 60 Hz frame of work.
     Slow consumers only stop reads on their own socket. No shared stdout queue
     can block healthy panes. A parser exception closes just that channel after
     an E marker; interpreter death closes ALL channels (host marks each pane).
@@ -732,7 +811,7 @@ def multiplex(path):
             for sock, c in channels.items():
                 if not c["closing"] and len(c["output"]) < high_water:
                     readable.append(sock)
-                    runnable = runnable or complete(c)
+                    runnable = runnable or c["partial"] is not None or complete(c)
                 if c["output"]:
                     writable.append(sock)
             called = time.monotonic_ns()
@@ -751,7 +830,7 @@ def multiplex(path):
                 sock, _ = server.accept()
                 sock.setblocking(False)
                 channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False,
-                                  "rx": RxClock()}
+                                  "rx": RxClock(), "partial": None}
             for sock, c in list(channels.items()):
                 output_sink = c["output"].extend
                 try:
@@ -771,29 +850,50 @@ def multiplex(path):
                         raise ValueError("pane input exceeds frame bound")
                     began = time.monotonic_ns()
                     processed = 0
-                    while not c["closing"] and len(c["output"]) < high_water and complete(c):
-                        kind = bytes(buf[:1])
-                        length = struct.unpack(">I", buf[1:5])[0]
-                        if length > max_input:
-                            raise ValueError("pane input exceeds frame bound")
-                        payload = bytes(buf[5:5 + length])
-                        del buf[:5 + length]
-                        rx = c["rx"].completed(5 + length)
-                        if c["worker"] is None:
-                            if kind != b"A":
-                                raise ValueError("pane must attach before data")
-                            cols, rows, epoch = struct.unpack(">HHQ", payload)
-                            if not (0 < cols <= 4096 and 0 < rows <= 4096):
-                                raise ValueError("invalid pane geometry")
-                            c["worker"] = Worker(cols, rows, epoch)
-                            send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
+                    while not c["closing"] and len(c["output"]) < high_water and (
+                            c["partial"] is not None or complete(c)):
+                        if c["partial"] is None:
+                            kind = bytes(buf[:1])
+                            length = struct.unpack(">I", buf[1:5])[0]
+                            if length > max_input:
+                                raise ValueError("pane input exceeds frame bound")
+                            payload = bytes(buf[5:5 + length])
+                            del buf[:5 + length]
+                            rx = c["rx"].completed(5 + length)
+                            if c["worker"] is None:
+                                if kind != b"A":
+                                    raise ValueError("pane must attach before data")
+                                cols, rows, epoch = struct.unpack(">HHQ", payload)
+                                if not (0 < cols <= 4096 and 0 < rows <= 4096):
+                                    raise ValueError("invalid pane geometry")
+                                c["worker"] = Worker(cols, rows, epoch)
+                                send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
+                            elif kind == b"D":
+                                seq, epoch = struct.unpack(">QQ", payload[:16])
+                                end = slice_end(payload, 16)
+                                more = end < len(payload)
+                                if c["worker"].feed(seq, epoch, payload[16:end], rx, more) and more:
+                                    c["partial"] = [payload, end]
+                                length = end
+                            else:
+                                c["worker"], c["closing"] = dispatch(c["worker"], kind, payload, rx)
+                            processed += length
                         else:
-                            c["worker"], c["closing"] = dispatch(c["worker"], kind, payload, rx)
-                        processed += length
-                        if processed >= 65536 or time.monotonic_ns() - began >= MAX_COALESCE_NS:
+                            payload, start = c["partial"]
+                            end = slice_end(payload, start)
+                            if c["worker"].feed_more(payload[start:end]) and end < len(payload):
+                                c["partial"][1] = end
+                            else:
+                                c["partial"] = None
+                            processed += end - start
+                        if processed >= 65536 or time.monotonic_ns() - began >= MAX_TURN_NS:
                             break
-                    if c["worker"] is not None and c["worker"].pending():
-                        c["worker"].emit()
+                        if c["partial"] is None and c["worker"] is not None and c["worker"].coalesce_due():
+                            break  # Emit at this frame boundary: a 60 Hz frame of work is due.
+                    w = c["worker"]
+                    if w is not None and c["partial"] is None and w.pending() and (
+                            c["closing"] or not complete(c) or w.coalesce_due()):
+                        w.emit()
                     if c["closing"] and not c.get("quit_ack"):
                         send(b"B", {"workerEof": True})
                         c["quit_ack"] = True
@@ -809,6 +909,7 @@ def multiplex(path):
                     c["closing"] = True
                     c["quit_ack"] = True
                     c["worker"] = None
+                    c["partial"] = None
                     c["input"].clear()
                 finally:
                     output_sink = None
