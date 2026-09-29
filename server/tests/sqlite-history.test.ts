@@ -1209,7 +1209,11 @@ test('CANARY-D: compact frame codec is lossless for terminal styles and at most 
  expect(encoded).toStartWith('{"fc":2,');
  expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(Buffer.byteLength(legacy)*0.35);
  expect(()=>decodeFrameCells('{"fc":99,"rows":[]}')).toThrow('frame-codec-unknown');
+ const styled=encodeFrameCells([S2_CORPUS[0]!.cells]),mutant=JSON.parse(styled);
+ mutant.rows[0][1]=`${S2_CORPUS[0]!.cells.length}||`;
+ expect(decodeFrameCells(JSON.stringify(mutant))).not.toEqual([S2_CORPUS[0]!.cells]);
  console.log('CANARY_D_FRAME',JSON.stringify({encodedBytes:Buffer.byteLength(encoded),legacyBytes:Buffer.byteLength(legacy)}));
+ console.log('CANARY_D_MUTATION_D3',JSON.stringify({killed:'drop-style-layout-trailing-blank',oracle:'full-cell-roundtrip'}));
 });
 
 test('CANARY-D: v5 archives settled capture receipts losslessly and rejects the old writer',async()=>{
@@ -1235,6 +1239,12 @@ test('CANARY-D: v5 archives settled capture receipts losslessly and rejects the 
   const recovered=s.readPage(s.token(naKey),0,512).lines;
   expect(recovered.map(row=>({text:row.text,cells:row.cells}))).toEqual(rows);
   expect(recovered.every((row,i)=>row.checkedCaptureId===`receipt-${String(i).padStart(6,'0')}`)).toBe(true);
+  await s.close();
+  const corrupt=new Database(file),stored=corrupt.query('SELECT archive_no,data FROM na_capture_archive ORDER BY archive_no LIMIT 1').get() as any;
+  const changed=Buffer.from(stored.data);changed[changed.length-1]^=1;
+  corrupt.query('UPDATE na_capture_archive SET data=? WHERE archive_no=?').run(changed,stored.archive_no);corrupt.close();
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow();
+  console.log('CANARY_D_MUTATION_D2',JSON.stringify({killed:'corrupt-archived-receipt',oracle:'checksum-and-recover'}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },60000);
 
