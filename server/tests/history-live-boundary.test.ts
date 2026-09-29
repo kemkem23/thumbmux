@@ -366,12 +366,22 @@ test("SWITCHON P: RAM frames encode each unchanged row once and still round-trip
     cells, kind: "normal" as const, cols, rows: cells.length, cursor: { row: 0, col: 0, visible: true } };
   validateFrame(frame);
   const encoded = encodeFrameCells(cells);
-  expect(JSON.parse(encoded).rle).toBe(1);
+  // CANARY-FIX D: frames are written as `fc:2` (text + the durable row codec per row), never `rle:1`.
+  expect(JSON.parse(encoded).fc).toBe(2);
+  expect(JSON.parse(encoded).rle).toBeUndefined();
   expect(JSON.stringify(decodeFrameCells(encoded))).toBe(JSON.stringify(cells));
   // The same row objects encode to the same text (the per-row cache), and a new row is encoded anew.
   expect(encodeFrameCells(cells)).toBe(encoded);
   const changed = [cells[0]!, row([["default", "default", 0, "new"]]), cells[2]!, cells[3]!];
   expect(JSON.stringify(decodeFrameCells(encodeFrameCells(changed)))).toBe(JSON.stringify(changed));
-  // The stored format is the one every reader already knows (one run of 12 blanks).
-  expect(JSON.parse(encoded).rows[3]).toEqual([[" ", 1, false, "default", "default", 0, cols]]);
+  // Each row is stored as [text, cells] in the durable row codec: 12 blanks are one run and no text.
+  expect(JSON.parse(encoded).rows[3]).toEqual(["", `${cols}||`]);
+  // An `rle:1` frame an earlier release wrote still reads back cell for cell.
+  const bold = row([["red", "default", 1, "bold"]]);
+  const legacy = JSON.stringify({ rle: 1, rows: [
+    [...[..."bold"].map((grapheme) => [grapheme, 1, false, "index:1", "default", 1, 1]), [" ", 1, false, "default", "default", 0, cols - 4]],
+    [[" ", 1, false, "default", "default", 0, cols]],
+  ] });
+  expect(JSON.stringify(decodeFrameCells(legacy))).toBe(JSON.stringify([bold, cells[3]]));
+  expect(() => decodeFrameCells(JSON.stringify({ fc: 3, rows: [] }))).toThrow("frame-codec-unknown");
 });
