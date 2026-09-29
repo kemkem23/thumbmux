@@ -1,5 +1,5 @@
-import { Database } from 'bun:sqlite';
-import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
+import { Database, constants } from 'bun:sqlite';
+import { closeSync, existsSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { checkReason, checkState, closePrepared, prepared, decodeCells, integer, lineRow, paneId, type ProjectionRam, type SqlRow } from './ram-store';
 import { decodeBlock } from './codec';
@@ -67,7 +67,7 @@ export class LegacyUnderlay {
     for(const file of files) {
       let reader:ProjectionArchiveReaderPort|null=null;
       try {
-        reader=openProjectionArchive(file);
+        reader=openArchive(file,[],true);
         if(reader.schemaVersion>=5)throw new Error(`schema ${reader.schemaVersion} is not a legacy file`);
         this.readers.push(reader);
       } catch(error) {reader?.close();this.errors.push(`${file}: ${String((error as Error)?.message??error)}`);}
@@ -164,6 +164,15 @@ export function readProjectionPage(ram: ProjectionRam, disk: Database, token: Pr
  * reads [0,floor) from them.
  */
 export function openProjectionArchive(input:string,legacyFiles:readonly string[]=[]):ProjectionArchiveReaderPort {
+  return openArchive(input,legacyFiles,false);
+}
+/**
+ * `sealed`: the file belongs to a release that is not running, and a rollback
+ * must find it byte for byte as it was. Without a WAL beside it, it is opened
+ * immutable, so SQLite creates no -wal/-shm next to it; with one (an unclean
+ * stop) the WAL holds rows, so it is opened read-only as it stands.
+ */
+function openArchive(input:string,legacyFiles:readonly string[],sealed:boolean):ProjectionArchiveReaderPort {
   const file=resolve(input),stat=lstatSync(file);
   if(stat.isSymbolicLink() || !stat.isFile() || stat.nlink!==1 || /^brain\.db(?:$|[-.])/i.test(basename(file)))throw new Error('unsafe-archive-path');
   const fd=openSync(file,'r');let version:number;
@@ -172,7 +181,10 @@ export function openProjectionArchive(input:string,legacyFiles:readonly string[]
     version=n===100 && head.subarray(0,16).toString()==='SQLite format 3\0'?head.readUInt32BE(60):0;
   }finally{closeSync(fd);}
   if(version!==2 && version!==3 && version!==4 && version!==5)throw new Error('unsupported-projection-archive');
-  const db=new Database(file,{readonly:true,strict:true});
+  const db=sealed && !existsSync(file+'-wal')
+    // Bun takes a URI only through the flags form; every statement here binds positionally.
+    ? new Database('file:'+file.split('/').map(encodeURIComponent).join('/')+'?immutable=1',constants.SQLITE_OPEN_READONLY|constants.SQLITE_OPEN_URI)
+    : new Database(file,{readonly:true,strict:true});
   db.exec('PRAGMA query_only=ON; PRAGMA foreign_keys=ON;');
   let closed=false;
   const legacy=version>=5 && legacyFiles.length?new LegacyUnderlay(legacyFiles):null;

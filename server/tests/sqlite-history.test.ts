@@ -1121,7 +1121,8 @@ test('S2: a v3 file is read-only through the archive reader and the v4 writer re
   for(const [i,row] of S2_CORPUS.entries())db.query("INSERT INTO na_line VALUES (?,1,?,?,1,?,?,0,'unchecked','awaiting-capture',NULL,NULL)").run(id,i,i+1,row.text,encodeCells(row.cells));
   db.close();
   const sha=()=>createHash('sha256').update(readFileS2(file)).digest('hex'),before=sha();
-  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('not-projection-v5');
+  // The v5 writer's own file (newarch-v5/) is absent: it never falls back to the older file.
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('ENOENT');
   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v5');
   const archive=openProjectionArchive(file);
   try {
