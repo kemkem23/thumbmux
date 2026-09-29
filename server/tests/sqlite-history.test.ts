@@ -368,7 +368,7 @@ test('newarch v5: compact receipt schema, new-file refusal and deny-open path sp
  try {
   const store=createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++});
   await store.appendScroll(naEvent('one',1));store.flush();await store.close();
-  const db=new Database(join(dir,'newarch-v3/history.sqlite3'),{readonly:true});
+  const db=new Database(join(dir,'newarch-v5/history.sqlite3'),{readonly:true});
   expect(db.query('PRAGMA user_version').get()).toEqual({user_version:5});
   expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(7);
   expect(db.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
@@ -378,9 +378,9 @@ test('newarch v5: compact receipt schema, new-file refusal and deny-open path sp
    const fake=join(dir,name);writeFileSync(fake,'forbidden fixture');
    expect(()=>createProjectionStore({historyRoot:dir,file:fake,mode:'recover',beforeOpen:()=>{opens++;throw Error('deny-open');}})).toThrow('forbidden-database-path');
   }
-  symlinkSync(join(dir,'newarch-v3'),join(dir,'alias'));
+  symlinkSync(join(dir,'newarch-v5'),join(dir,'alias'));
   expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'alias/new.sqlite'),mode:'create',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
-  linkSync(join(dir,'newarch-v3/history.sqlite3'),join(dir,'hard.sqlite'));
+  linkSync(join(dir,'newarch-v5/history.sqlite3'),join(dir,'hard.sqlite'));
   expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'hard.sqlite'),mode:'recover',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
   const v1=join(dir,'old.sqlite');const old=new Database(v1);old.exec('PRAGMA user_version=1');old.close();
   expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v5');
@@ -770,9 +770,9 @@ test('I2 FIX1 §2: repeated rows without unique anchors are content-matched, nev
 });
 
 test('I4 FIX1: a current-version file missing receipt metadata is refused on recover',async()=>{
- const dir=mkdtempSync(join(tmpdir(),'na-i4-outdated-')),file=join(dir,'newarch-v3/history.sqlite3');
+ const dir=mkdtempSync(join(tmpdir(),'na-i4-outdated-')),file=join(dir,'newarch-v5/history.sqlite3');
  try {
-  mkdirSync(join(dir,'newarch-v3'),{recursive:true});
+  mkdirSync(join(dir,'newarch-v5'),{recursive:true});
   const db=new Database(file);
   db.exec(PROJECTION_SCHEMA.replace('screen_hash BLOB NOT NULL, history_hash BLOB NOT NULL,','capture_digest TEXT NOT NULL,'));
   db.exec(`PRAGMA user_version=${PROJECTION_SCHEMA_VERSION}`);db.close();
@@ -1099,7 +1099,7 @@ test('S2: corpus is lossless in RAM, in sealed blocks, after a patch of a sealed
   expect(recovered.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
   expect(recovered[3]).toMatchObject({checkedCaptureId:'s2-repair'});
   await s.close();
-  const archive=openProjectionArchive(join(dir,'newarch-v3/history.sqlite3'));
+  const archive=openProjectionArchive(join(dir,'newarch-v5/history.sqlite3'));
   try {
   expect(archive.schemaVersion).toBe(5);
    const lines=archive.readPage(archive.token(naKey),0,600).lines;
@@ -1121,7 +1121,8 @@ test('S2: a v3 file is read-only through the archive reader and the v4 writer re
   for(const [i,row] of S2_CORPUS.entries())db.query("INSERT INTO na_line VALUES (?,1,?,?,1,?,?,0,'unchecked','awaiting-capture',NULL,NULL)").run(id,i,i+1,row.text,encodeCells(row.cells));
   db.close();
   const sha=()=>createHash('sha256').update(readFileS2(file)).digest('hex'),before=sha();
-  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('not-projection-v5');
+  // The v5 writer's own file (newarch-v5/) is absent: it never falls back to the older file.
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('ENOENT');
   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v5');
   const archive=openProjectionArchive(file);
   try {
@@ -1140,7 +1141,7 @@ test('S2: a v5 file carries version 5 in its header, so an old writer refuses it
  const dir=mkdtempSync(join(tmpdir(),'na-s2-v4-header-'));const s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   await s.appendScroll(naEvent('v4 row',1));s.flush();await s.close();
-  const file=join(dir,'newarch-v3/history.sqlite3'),head=readFileS2(file).subarray(0,100);
+  const file=join(dir,'newarch-v5/history.sqlite3'),head=readFileS2(file).subarray(0,100);
   // The v3 writer (admitPath) and archive reader gate on this header field: 3 and {2,3}.
   expect(head.readUInt32BE(60)).toBe(5);expect(PROJECTION_SCHEMA_VERSION).toBe(5);
   const db=new Database(file,{readonly:true});
@@ -1168,7 +1169,7 @@ async function s2DiskRatio(rows:number,dir:string) {
   s.flush();
   for(let at=0;at<rows;at+=2000)for(const l of s.readPage(s.token(naKey),at,Math.min(2000,rows-at)).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells as any));
  }finally{await s.close();}
- const folder=join(dir,'newarch-v3'),D=readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
+ const folder=join(dir,'newarch-v5'),D=readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
  return {rows,D,R,ratio:D/R};
 }
 test('S2: D <= 1.5 x R for 6000 certified runtime-shaped rows of one pane',async()=>{
@@ -1227,7 +1228,7 @@ test('CANARY-D: v5 archives settled capture receipts losslessly and rejects the 
     expectedRevision:s.token(naKey).revision,checks:[{lineId:i,captureRow:0}],repairs:[]});
   }
   s.flush();await s.close();
-  const file=join(dir,'newarch-v3/history.sqlite3'),db=new Database(file,{readonly:true});
+  const file=join(dir,'newarch-v5/history.sqlite3'),db=new Database(file,{readonly:true});
   try {
    expect((db.query('PRAGMA user_version').get() as any).user_version).toBe(5);
    expect((db.query('SELECT count(*) AS n FROM na_capture_archive').get() as any).n).toBeGreaterThan(0);
@@ -1263,8 +1264,103 @@ test('CANARY-D: 14-pane capture-heavy replay keeps drained DB WAL SHM at or belo
    }
   }
   s.flush();await s.close();
-  const folder=join(dir,'newarch-v3'),files=readdirS2(folder),diskBytes=files.reduce((n,f)=>n+statS2(join(folder,f)).size,0),ratio=diskBytes/rawTextBytes;
+  const folder=join(dir,'newarch-v5'),files=readdirS2(folder),diskBytes=files.reduce((n,f)=>n+statS2(join(folder,f)).size,0),ratio=diskBytes/rawTextBytes;
   console.log('CANARY_D_DISK',JSON.stringify({panes:14,captures:14*256,rawTextBytes,diskBytes,ratio,files}));
   expect(ratio).toBeLessThanOrEqual(1.5);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },120000);
+
+// CANARY-FIX D FIX1: upgrade from and rollback to the real 0.20.3 release (the
+// git-dist the root project pins), not a hand-made v4 file.
+import { existsSync as existsFix1, writeFileSync as writeFix1 } from 'node:fs';
+const RELEASE_0203=join(import.meta.dir,'../../../../node_modules/thumbmux');
+async function release0203() {
+ const pkg=JSON.parse(readFileS2(join(RELEASE_0203,'package.json'),'utf8'));
+ // The root pin is the only copy of 0.20.3 on the machine: a moved pin must fail here, loudly.
+ expect(pkg.version).toBe('0.20.3');
+ const store=await import(join(RELEASE_0203,'git-dist/server/sqlite-history/projection-store.js'));
+ const reader=await import(join(RELEASE_0203,'git-dist/server/sqlite-history/projection-reader.js'));
+ return {createProjectionStore:store.createProjectionStore as typeof createProjectionStore,openProjectionArchive:reader.openProjectionArchive as typeof openProjectionArchive};
+}
+const fix1Texts=(lines:{text:string}[])=>lines.map(l=>l.text);
+const fix1Sha=(file:string)=>createHash('sha256').update(readFileS2(file)).digest('hex');
+
+test('D-FIX1: v5 opens beside a real 0.20.3 (v4) root, reads its rows read-only below each pane, and 0.20.3 reopens its own file after v5 ran',async()=>{
+ const old=await release0203();
+ const dir=mkdtempSync(join(tmpdir(),'na-dfix1-'));
+ const only:PaneKey={...naKey,paneId:'%2'};
+ const v4=join(dir,'newarch-v3/history.sqlite3'),v5=join(dir,'newarch-v5/history.sqlite3');
+ const v4Rows=Array.from({length:700},(_,i)=>`v4 ${i}`),v5Rows=Array.from({length:30},(_,i)=>`v5 ${i}`);
+ try {
+  const o=old.createProjectionStore({historyRoot:dir,mode:'create'});
+  for(const [i,text] of v4Rows.entries())await o.appendScroll(naEvent(text,i+1));
+  for(let i=0;i<40;i++)await o.appendScroll(naEvent(`only ${i}`,i+1,only));
+  o.flush();await o.close();
+  expect(readFileS2(v4).readUInt32BE(60)).toBe(4);
+  const sealed=fix1Sha(v4);
+  // The host's rule: recover the file this release names if it exists, else create it.
+  // Before FIX1 that file was newarch-v3/history.sqlite3, i.e. the v4 file: 'create'
+  // refused it (new-file-required) and 'recover' refused it (not-projection-v5), forever.
+  const faults:string[]=[];
+  const s=createProjectionStore({historyRoot:dir,mode:existsFix1(v5)?'recover':'create',onFault:f=>faults.push(f.kind)});
+  try {
+   expect(s.file).toBe(v5);
+   expect(s.legacyArchives()).toEqual({opened:1,errors:[]});
+   for(const [i,text] of v5Rows.entries())await s.appendScroll(naEvent(text,i+1));
+   const t=s.token(naKey);
+   expect(t.nextLineId).toBe(730);
+   expect(fix1Texts(s.readPage(t,0,730).lines)).toEqual([...v4Rows,...v5Rows]);
+   expect(fix1Texts(s.readPage(t,650,80).lines)).toEqual([...v4Rows.slice(650),...v5Rows]);
+   expect(fix1Texts(s.readPage(t,0,100).lines)).toEqual(v4Rows.slice(0,100));
+   expect(fix1Texts(s.readPage(t,700,30).lines)).toEqual(v5Rows);
+   s.flush();
+  }finally{await s.close();}
+  expect(faults).toEqual([]);
+  // Restart: the floor is the pane's first v5 line, found again from the files alone.
+  const r=createProjectionStore({historyRoot:dir,mode:'recover'});
+  try {expect(fix1Texts(r.readPage(r.token(naKey),0,730).lines)).toEqual([...v4Rows,...v5Rows]);}finally{await r.close();}
+  // The archive route: a pane only 0.20.3 saw is read from its file; a continued pane spans both.
+  const a=openProjectionArchive(v5,[v4]);
+  try {
+   expect(fix1Texts(a.readPage(a.token(naKey),0,730).lines)).toEqual([...v4Rows,...v5Rows]);
+   expect(fix1Texts(a.readPage(a.token(only),0,40).lines)).toEqual(Array.from({length:40},(_,i)=>`only ${i}`));
+  }finally{a.close();}
+  const bare=openProjectionArchive(v5);
+  try {expect(()=>bare.token(only)).toThrow('unknown-pane');}finally{bare.close();}
+  expect(fix1Sha(v4)).toBe(sealed);
+  expect(readdirS2(join(dir,'newarch-v3'))).toEqual(['history.sqlite3']);
+
+  // Rollback to 0.20.3: its writer and reader open their own file and continue it.
+  const back=old.createProjectionStore({historyRoot:dir,mode:'recover'});
+  try {
+   expect(back.token(naKey).nextLineId).toBe(700);
+   await back.appendScroll(naEvent('rolled back',701));back.flush();
+  }finally{await back.close();}
+  const oldReader=old.openProjectionArchive(v4);
+  try {expect(fix1Texts(oldReader.readPage(oldReader.token(naKey),0,701).lines)).toEqual([...v4Rows,'rolled back']);}finally{oldReader.close();}
+  // What the rollback loses: the rows written while v5 ran (0.20.3 cannot open v5).
+  expect(()=>old.openProjectionArchive(v5)).toThrow('unsupported-projection-archive');
+  // Forward again: the floor stays at 700, so v5's rows win their ids; the
+  // rollback-window row stays in the v4 file only.
+  const again=createProjectionStore({historyRoot:dir,mode:'recover'});
+  try {expect(fix1Texts(again.readPage(again.token(naKey),0,730).lines)).toEqual([...v4Rows,...v5Rows]);}finally{await again.close();}
+  console.log('D_FIX1_UPGRADE',JSON.stringify({v4Rows:700,v5Rows:30,v4Sha256Unchanged:sealed,rollback0203:{nextLineId:700,appended:1},v5ReadableBy0203:false}));
+ }finally{rmSync(dir,{recursive:true,force:true});}
+},120000);
+
+test('D-FIX1: an unreadable legacy file is reported and skipped, never a reason for the v5 writer not to open',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-dfix1-bad-'));
+ try {
+  mkdirSync(join(dir,'newarch-v3'),{recursive:true});
+  writeFix1(join(dir,'newarch-v3/history.sqlite3'),'not a database');
+  const faults:Array<{kind:string;reason:string}>=[];
+  const s=createProjectionStore({historyRoot:dir,mode:'create',onFault:f=>faults.push(f)});
+  try {
+   expect(s.legacyArchives().opened).toBe(0);
+   expect(s.legacyArchives().errors).toEqual([expect.stringContaining('unsupported-projection-archive')]);
+   expect(faults).toEqual([expect.objectContaining({kind:'legacy-archive-unavailable'})]);
+   await s.appendScroll(naEvent('fresh',1));
+   expect(fix1Texts(s.readPage(s.token(naKey),0,1).lines)).toEqual(['fresh']);
+  }finally{await s.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

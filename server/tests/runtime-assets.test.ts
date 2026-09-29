@@ -39,7 +39,7 @@ describe("server runtime asset build", () => {
   test("advertises the exact optional pipe-history runtime capability", () => {
     expect(PIPE_HISTORY_RUNTIME_CAPABILITY).toEqual({
       // The schema number is schema.ts's, never a copy here (S2 moved it 3 -> 4).
-      wire: "newarch-frame-v1", projectionSchema: PROJECTION_SCHEMA_VERSION, metadataRevision: true, archiveReadVersions: [2, 3],
+      wire: "newarch-frame-v1", projectionSchema: PROJECTION_SCHEMA_VERSION, metadataRevision: true, archiveReadVersions: [2, 3, 4, 5],
     });
   });
   test("copies the exact Python helper beside the bundled server entrypoint", () => {
@@ -153,7 +153,7 @@ describe("NEWARCH I4 pipe-vt runtime assets", () => {
       while (pane.recentRows().length < 6 && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 20));
       expect(pane.recentRows().length).toBeGreaterThanOrEqual(6);
       store.flush();
-      const db = new Database(join(history, "newarch-v3/history.sqlite3"), { readonly: true });
+      const db = new Database(join(history, "newarch-v5/history.sqlite3"), { readonly: true });
       const rows = db.query("SELECT text FROM na_line ORDER BY line_id").all() as Array<{ text: string }>;
       db.close();
       expect(rows[0]!.text.trimEnd()).toBe("ไทย 漢字 😀 0");

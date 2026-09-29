@@ -1,7 +1,42 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.3-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.4-dist`.
+
+## v0.20.4 — 2026-09-29
+
+Patch for the opt-in pipe-history projection only; a host that never imports
+the projection subpaths loads what it loaded on `v0.20.3-dist`. Workspace caret
+ranges stay satisfiable, so the lockfile does not move.
+
+### Changed — projection schema v5 in its own file
+
+- **Schema 5** (`005-newarch-compact-capture-receipts`): capture receipts that
+  no live row references are packed into lossless, SHA-256-checked archive
+  blocks; RAM frames are stored as `fc:2` (the durable row codec per row).
+  `rle:1` frames written by 0.20.3 still decode.
+- **One file per schema.** The writer's default file is now
+  `newarch-v5/history.sqlite3` (`PROJECTION_STORE_FILE`), not
+  `newarch-v3/history.sqlite3`, where 0.20.3 kept schema 4. Upgrading never
+  opens, migrates or rewrites the 0.20.3 file.
+- **Old history stays scrollable.** `createProjectionStore` layers the files
+  of earlier releases (`PROJECTION_LEGACY_FILES`, or `legacyArchives`)
+  read-only under the panes it continues: a pane first seen by 0.20.4 starts
+  at the 0.20.3 `nextLineId`, so ids `[0, floor)` read from the 0.20.3 file
+  and the page is one contiguous range to the caller.
+  `openProjectionArchive(file, legacyFiles)` does the same for a closed file,
+  and returns a pane only the old file holds from that file. An unreadable
+  legacy file is reported (`legacy-archive-unavailable`,
+  `store.legacyArchives()`) and skipped; it never keeps the writer closed.
+- `PIPE_HISTORY_RUNTIME_CAPABILITY.archiveReadVersions` is `[2, 3, 4, 5]`
+  (what `openProjectionArchive` reads), not `[2, 3]`.
+
+### Rollback to v0.20.3
+
+Supported. The 0.20.3 file was never written by 0.20.4, so 0.20.3 reopens it
+and continues. Lost while rolled back: the rows written while 0.20.4 ran
+(0.20.3 refuses a v5 file). Going forward again keeps both files; rows 0.20.3
+wrote during the rollback stay in its file only.
 
 ## v0.20.3 — 2026-09-28
 
