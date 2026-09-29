@@ -133,10 +133,12 @@ export function createActivityPoll<T>(empty: () => T, sample: (signal: AbortSign
       void (async () => {
         try {
           const value = await sample(controller.signal);
+          if (flight !== current) return;
           latest = value;
           completedAt = performance.now();
           error = null;
         } catch (cause) {
+          if (flight !== current) return;
           error = cause instanceof Error ? cause.message : String(cause);
         } finally {
           if (flight === current) flight = null;
