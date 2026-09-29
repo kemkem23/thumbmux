@@ -449,8 +449,18 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { PipeHistoryPane as M3Pane, PipeHistoryRuntime as M3Runtime, applyFrameDelta, canonicalCaptureCells, canonicalCaptureDecoder, decodeCanonicalCapture, pipeHistoryAllocations, sharedBlankRow } from "../src/pipe-history-runtime";
-import { CACHE_BYTE_MODEL, TmuxCaptureDecoder } from "../src/tmux-capture-normalize";
+import { PipeHistoryPane as M3Pane, PipeHistoryRuntime as M3Runtime, applyFrameDelta, canonicalCaptureCells } from "../src/pipe-history-runtime";
+import { TmuxCaptureDecoder } from "../src/tmux-capture-normalize";
+// Namespace reads: on a runtime without the M3 surface only these tests fail, not the whole file.
+import * as M3 from "../src/pipe-history-runtime";
+import * as N3 from "../src/tmux-capture-normalize";
+const { canonicalCaptureDecoder, decodeCanonicalCapture, pipeHistoryAllocations, sharedBlankRow } = M3 as any as {
+  canonicalCaptureDecoder(cols: number): TmuxCaptureDecoder;
+  decodeCanonicalCapture(decoder: TmuxCaptureDecoder, body: string): Array<Array<{ grapheme: string }>>;
+  pipeHistoryAllocations(): Record<string, number>;
+  sharedBlankRow(cols: number): unknown[];
+};
+const CACHE_BYTE_MODEL = (N3 as any).CACHE_BYTE_MODEL as Record<"slot" | "arrayHeader" | "object" | "stringHeader" | "char" | "mapEntry" | "setEntry", number>;
 
 /** A real PipeHistoryPane (no parser, no calibrator timer) over a store double that assigns line ids. */
 function m3Harness(opts: { ringRows?: number; cols?: number; rows?: number } = {}) {

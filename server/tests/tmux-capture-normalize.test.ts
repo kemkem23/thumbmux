@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { CACHE_BYTE_MODEL, normalizeTmuxCaptureCells, TmuxCaptureDecoder, TMUX_STYLE_BITS } from '../src/tmux-capture-normalize';
+import { normalizeTmuxCaptureCells, TmuxCaptureDecoder, TMUX_STYLE_BITS } from '../src/tmux-capture-normalize';
 
 describe('tmux capture cell normalization', () => {
   test('removes exactly one VS16 promotion continuation cell', () => {
@@ -373,6 +373,8 @@ assert.ok(d.size<=1024,'MUTATION memo kept '+d.size+' rows');`);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// Namespace read: without the M3 surface only this test fails, not the whole file.
+import * as N3 from '../src/tmux-capture-normalize';
 test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, equal to mapping afterwards; stats count memo bytes', () => {
   const cols = 16;
   const tag = (cell: Readonly<{ grapheme: string; width: 0 | 1 | 2; continuation: boolean; fg: string; bg: string; style: number }>) =>
@@ -380,8 +382,8 @@ test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, e
   let calls = 0;
   const counted = (cell: Parameters<typeof tag>[0]) => { calls++; return tag(cell); };
   const body = ['\x1b[38;5;196mpal\x1b[0m 漢字', '', '\x1b[1;2mbd\x1b[0m ไทย', 'flag 🇹🇭🇯🇵', 'é x'].join('\n') + '\n';
-  const plain = new TmuxCaptureDecoder(cols), mapped = new TmuxCaptureDecoder(cols, 9000, 1, counted);
-  expect(plain.mapsCells).toBe(false); expect(mapped.mapsCells).toBe(true);
+  const plain = new TmuxCaptureDecoder(cols), mapped = new (TmuxCaptureDecoder as any)(cols, 9000, 1, counted) as TmuxCaptureDecoder & { mapsCells: boolean; stats(): Record<string, number> };
+  expect((plain as any).mapsCells).toBe(false); expect(mapped.mapsCells).toBe(true);
   const want = plain.decode(body).map(row => row.map(tag));
   const first = mapped.decode(body);
   const coldCalls = calls;
@@ -396,7 +398,7 @@ test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, e
   expect(first[0]![0]!.fg).toBe('rgb:255,0,0');
   const stats = mapped.stats();
   expect(stats).toMatchObject({ entries: 4, cellSlots: 4 * cols, generation: 2, hits: 4, misses: 4 });
-  const m = CACHE_BYTE_MODEL;
+  const m = (N3 as any).CACHE_BYTE_MODEL as Record<'mapEntry' | 'object' | 'arrayHeader' | 'stringHeader' | 'slot' | 'char', number>;
   expect(stats.bytes).toBe(4 * (m.mapEntry + m.object + m.arrayHeader + m.stringHeader) + 4 * cols * m.slot + stats.keyChars * m.char);
-  expect(new TmuxCaptureDecoder(cols).stats()).toMatchObject({ entries: 0, cellSlots: 0, keyChars: 0, bytes: 0 });
+  expect((new TmuxCaptureDecoder(cols) as any).stats()).toMatchObject({ entries: 0, cellSlots: 0, keyChars: 0, bytes: 0 });
 });
