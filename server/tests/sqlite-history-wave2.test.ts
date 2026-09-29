@@ -682,7 +682,7 @@ test('I4 FIX1 S: 126000 rows in 60s batch across 21 panes without capture payloa
  const root=mkdtempSync(join(tmpdir(),'na-i4-s-126k-')),s=createProjectionStore({historyRoot:root,mode:'create'});
  const keys=Array.from({length:21},(_,pane)=>({serverIdentity:'i4-s-load',paneId:`%${pane}`,birthGeneration:1}));
  const cell=(grapheme:string)=>({grapheme,width:1 as const,continuation:false,fg:null,bg:null,style:0});
- const physical=()=>readdirSync(join(root,'newarch-v3')).filter(name=>name.startsWith('history.sqlite3')).reduce((sum,name)=>sum+statSync(join(root,'newarch-v3',name)).size,0);
+ const physical=()=>readdirSync(join(root,'newarch-v5')).filter(name=>name.startsWith('history.sqlite3')).reduce((sum,name)=>sum+statSync(join(root,'newarch-v5',name)).size,0);
  let logicalBytes=0,peakIncrement=0,refused=0;
  const flushAges:number[]=[];
  try {
@@ -898,7 +898,7 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
        }
        s.flush();let R=0;
        for(let at=0;at<6000;at+=2000)for(const l of s.readPage(s.token(key),at,2000).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells));
-       const folder=data+'/newarch-v3',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
+       const folder=data+'/newarch-v5',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
        console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R}));
        assert(D<=1.5*R,'disk must stay within 1.5 x the rows it holds: D/R='+(D/R).toFixed(3));
       }
