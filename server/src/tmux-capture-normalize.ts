@@ -341,6 +341,19 @@ function internCell(cell: TmuxObservedCell): Readonly<TmuxObservedCell> {
   return shared;
 }
 
+/**
+ * Bytes a cache is counted at (NEWARCH2 M3): one pointer slot per array
+ * element, fixed headers per array / object / string / Map entry, and two
+ * bytes per string code unit (the UTF-16 upper bound). Shared cells are
+ * interned and counted nowhere per row. This is an explicit model for
+ * comparing retention, not a heap measurement.
+ */
+export const CACHE_BYTE_MODEL = Object.freeze({ slot: 8, arrayHeader: 16, object: 48, stringHeader: 16, char: 2, mapEntry: 32, setEntry: 16 });
+export interface DecoderCacheStats {
+  entries: number; cellSlots: number; keyChars: number; bytes: number;
+  generation: number; hits: number; misses: number;
+}
+
 /** Exact per-line memo for one pane's repeated overlap. The key is the raw
  * physical row plus the SGR state carried into it, so a hit returns exactly
  * what decodeTmuxCaptureRows would. Returned rows are shared between calls and
@@ -361,13 +374,29 @@ export class TmuxCaptureDecoder {
    * floor of rows kept regardless (oldest dropped first), `maxEntries` the
    * cap. The old floor of 1024 kept rows no capture returned any more; each
    * pinned its cells plus the runtime's canonical and frame side tables
-   * (~4 KB/row): 30 MiB at 12 min of the 21-pane soak, growing all 30 min. */
-  constructor(readonly cols: number, private readonly maxEntries = 9000, private readonly minEntries = 1) {
+   * (~4 KB/row): 30 MiB at 12 min of the 21-pane soak, growing all 30 min.
+   * `mapCell` (NEWARCH2 M3) maps every cell once, when its row is decoded, into
+   * the caller's namespace: the memo then holds the rows the caller uses, and
+   * the caller keeps no second array per row beside it. */
+  constructor(readonly cols: number, private readonly maxEntries = 9000, private readonly minEntries = 1,
+    private readonly mapCell?: (cell: Readonly<TmuxObservedCell>) => Readonly<TmuxObservedCell>) {
     checkedCols(cols);
     if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('invalid decoder cache size');
     if (!Number.isSafeInteger(minEntries) || minEntries < 1) throw new Error('invalid decoder cache size');
   }
   get size(): number { return this.cache.size; }
+  /** True when every row decode() returns is already mapped by `mapCell`. */
+  get mapsCells(): boolean { return this.mapCell !== undefined; }
+  /** What the memo holds now, in the bytes of CACHE_BYTE_MODEL (a model, not a heap reading). */
+  stats(): DecoderCacheStats {
+    let cellSlots = 0, keyChars = 0;
+    for (const [key, entry] of this.cache) { cellSlots += entry.cells.length; keyChars += key.length; }
+    const m = CACHE_BYTE_MODEL, entries = this.cache.size;
+    return {
+      entries, cellSlots, keyChars, generation: this.generation, hits: this.hits, misses: this.misses,
+      bytes: entries * (m.mapEntry + m.object + m.arrayHeader + m.stringHeader) + cellSlots * m.slot + keyChars * m.char,
+    };
+  }
   private trim(): void {
     const keep = this.minEntries;
     if (this.cache.size <= keep) return;
@@ -390,7 +419,8 @@ export class TmuxCaptureDecoder {
     if (!lines.every(escapesCloseInLine)) {
       const screen = decodeTmuxCaptureScreen(raw, this.cols);
       this.uncertainRows = screen.uncertainRows;
-      return screen.rows;
+      const map = this.mapCell;
+      return map ? screen.rows.map(row => row.map(map)) : screen.rows;
     }
     const state: SgrState = { fg: 'default', bg: 'default', style: 0 };
     const rows: (readonly Readonly<TmuxObservedCell>[])[] = [];
@@ -398,7 +428,8 @@ export class TmuxCaptureDecoder {
       if (AMBIGUOUS_EMOJI.test(line)) {
         // Row isolation: drawn best-effort, never cached, never certified.
         this.uncertainRows.push(rows.length);
-        rows.push(decodeUncertainLine(normalizeTmuxCaptureCells(line), this.cols, state));
+        const cells = decodeUncertainLine(normalizeTmuxCaptureCells(line), this.cols, state);
+        rows.push(this.mapCell ? cells.map(this.mapCell) : cells);
         continue;
       }
       const key = `${state.fg}\u0000${state.bg}\u0000${state.style}\u0000${line}`;
@@ -412,7 +443,8 @@ export class TmuxCaptureDecoder {
         // early eviction of a repeated row only costs one re-decode.
       } else {
         this.misses++;
-        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(internCell);
+        const map = this.mapCell;
+        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(map ? cell => map(internCell(cell)) : internCell);
         entry = { cells, fg: state.fg, bg: state.bg, style: state.style, used: this.generation };
         this.cache.set(key, entry);
         if (this.cache.size > this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
