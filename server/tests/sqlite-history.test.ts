@@ -355,12 +355,25 @@ import { createHash } from 'node:crypto';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
 import { openProjectionArchive } from '../src/sqlite-history/projection-reader';
 import { PROJECTION_SCHEMA, PROJECTION_SCHEMA_VERSION } from '../src/sqlite-history/schema';
-import { PROJECTION_OVERSIZE } from '../src/sqlite-history/types';
-import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell } from '../src/sqlite-history/types';
+import { PROJECTION_OVERSIZE, isProjectionRefusal } from '../src/sqlite-history/types';
+import type { PaneKey, PhysicalRow, ProjectionCapture, ProjectionCell, ScrollEvent } from '../src/sqlite-history/types';
 const naKey:PaneKey={serverIdentity:'fixture-server',paneId:'%1',birthGeneration:1};
 const naCell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
 const naRow=(text:string):PhysicalRow=>({text,cells:[...text].map(naCell)});
 const naEvent=(text:string,receiveSeq:number,paneKey=naKey)=>({paneKey,sourceEpoch:1,geometryGeneration:1,physicalRow:naRow(text),softWrap:false,receiveSeq});
+// FIX1 §3 caller contract: a refused row (capacity-pressure) still belongs to the caller, which awaits
+// drained() and offers the same row again, as the runtime does. A burst that outruns a slow disk (GitHub
+// runner) fills the pane quota (~4.96 MB, ~8.8k rows of ~566 B): ignoring the refusal lost every later row.
+// A drain that never comes throws; it is never a pass.
+async function naStore(s:ReturnType<typeof createProjectionStore>,event:ScrollEvent,seen?:{refused:number}) {
+ for(;;) {
+  const r=await s.appendScroll(event);if(!isProjectionRefusal(r))return r;
+  if(seen)seen.refused++;
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  const done=await Promise.race([s.drained(event.paneKey).then(()=>true),new Promise<boolean>(ok=>{timer=setTimeout(()=>ok(false),10000);})]);
+  clearTimeout(timer);if(!done)throw Error('refused row did not drain within 10 s');
+ }
+}
 const naFrame=()=>({paneKey:naKey,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:2,rows:1,kind:'normal' as const,cells:[[naCell('A'),naCell(' ')]],cursor:{row:0,col:0,visible:true}});
 
 test('newarch v5: compact receipt schema, new-file refusal and deny-open path spy',async()=>{
@@ -488,7 +501,8 @@ test('newarch v3: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
   const keys=Array.from({length:21},(_,i)=>({...naKey,paneId:`%${i}`}));
   const jobs=keys.map((key,i)=>s.appendScroll(naEvent(`pane:${i}`,1,key)));await Promise.all(jobs);
   expect(s.health().panes).toHaveLength(21);
-  for(let i=1;i<20000;i++)await s.appendScroll(naEvent(i%3===0?'':i%3===1?'repeat':`ไทย漢:${i}`,i+1,keys[0]));
+  const seen={refused:0};
+  for(let i=1;i<20000;i++)await naStore(s,naEvent(i%3===0?'':i%3===1?'repeat':`ไทย漢:${i}`,i+1,keys[0]),seen);
   s.flush();const token=s.token(keys[0]);let anchor:number|null=null;const rows:string[]=[];
   do{const page=s.readPage(token,anchor,2000);rows.push(...page.lines.map(r=>r.text));anchor=page.hasMore?page.nextAnchor:null;}while(anchor!==null);
   const oracle=Array.from({length:20000},(_,i)=>i===0?'pane:0':i%3===0?'':i%3===1?'repeat':`ไทย漢:${i}`);
@@ -503,7 +517,7 @@ test('newarch v3: 21 pane queues, 20000-row burst, disk/RAM page seam and oracle
   expect(()=>s.readPage(token,0,2000)).toThrow('page-seam-hole');
   const archive=openProjectionArchive(s.file);
   try {expect(()=>archive.readPage(archive.token(keys[0]),19000,1000)).toThrow('page-seam-hole');}finally{archive.close();}
-  console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,missing:Math.max(0,oracle.length-rows.length),extra:Math.max(0,rows.length-oracle.length),wrong:rows.filter((r,i)=>r!==oracle[i]).length,deletedLine710Detected:true,health:s.health()}));
+  console.log('NA_BURST',JSON.stringify({panes:21,rows:20000,refused:seen.refused,missing:Math.max(0,oracle.length-rows.length),extra:Math.max(0,rows.length-oracle.length),wrong:rows.filter((r,i)=>r!==oracle[i]).length,deletedLine710Detected:true,health:s.health()}));
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },30000);
 
@@ -1158,11 +1172,11 @@ const s2Oracle=(seq:number):PhysicalRow=>s2Row([...s2Text(`P01 ${String(seq).pad
  ...s2Text(' ไทย'),...s2Wide('漢'),...s2Wide('字'),...s2Wide('😀'),...s2Text(' '+'x'.repeat(seq%13))],120);
 async function s2DiskRatio(rows:number,dir:string) {
  const s=createProjectionStore({historyRoot:dir,mode:'create'});
- let R=0;
+ let R=0;const seen={refused:0};
  try {
   for(let at=0;at<rows;at+=64) {
    const slice=Array.from({length:Math.min(64,rows-at)},(_,k)=>s2Oracle(at+k+1));
-   for(const [k,row] of slice.entries())await s.appendScroll({...naEvent('',at+k+1),physicalRow:row});
+   for(const [k,row] of slice.entries())await naStore(s,{...naEvent('',at+k+1),physicalRow:row},seen);
    await s.calibrate({capture:{...naFrame(),captureId:`nonce-${at}/1`,requestedAt:at,completedAt:at+1,firstHistoryRow:0,history:slice,observedFields:['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'],ambiguousRows:0,result:'unfenced'},
     expectedRevision:s.token(naKey).revision,checks:slice.map((_,k)=>({lineId:at+k,captureRow:k})),repairs:[]});
   }
@@ -1170,7 +1184,7 @@ async function s2DiskRatio(rows:number,dir:string) {
   for(let at=0;at<rows;at+=2000)for(const l of s.readPage(s.token(naKey),at,Math.min(2000,rows-at)).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells as any));
  }finally{await s.close();}
  const folder=join(dir,'newarch-v5'),D=readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
- return {rows,D,R,ratio:D/R};
+ return {rows,D,R,ratio:D/R,refused:seen.refused};
 }
 test('S2: D <= 1.5 x R for 6000 certified runtime-shaped rows of one pane',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-s2-ratio-'));
