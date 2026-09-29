@@ -817,12 +817,12 @@ const I4_FIX2_S_MUTATIONS=[
  {name:'I4-S2 reclaim',file:'projection-store.ts',before:'this.ram.evict(panes,keep)',after:'this.ram.evict(panes,5000)'},
  {name:'I4-S2 chunk-bound',file:'projection-store.ts',before:'const chunkSize=256,',after:'const chunkSize=512,'},
 ];
-// NEWARCH-SWITCHON S2: each mutant undoes one part of the v4 compact store.
+// NEWARCH-SWITCHON S2: each mutant undoes one part of the compact store.
 const S2_MUTATIONS=[
  {name:'S2 per-cell-json',file:'codec.ts',before:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n",after:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n  return legacy(text, cells);\n"},
  {name:'S2 no-seal',file:'projection-store.ts',before:'sealBlocks(disk,batch.panes,forceSeal);',after:''},
  {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
- {name:'S2 v4-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 4;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
+ {name:'S2 v5-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 5;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
 const F1_S_MUTATIONS=[
  {name:'F1-S advance-watermark-on-full',file:'projection-store.ts',before:"if(isStorageFull(error)) {\n      this.storageEventId",after:"if(isStorageFull(error)) {\n      this.ram.db.exec('UPDATE na_pane SET durable_revision=revision');\n      this.storageEventId"},
@@ -881,11 +881,11 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
        await s.appendScroll({...row('',1),physicalRow:hidden});s.flush();
        const line=s.readPage(s.token(key),0,1).lines[0];
        assert(JSON.stringify({text:line.text,cells:line.cells})===JSON.stringify(hidden),'hidden (SGR 8) must round-trip');
-      } else if(name.includes('v4-as-v3')) {
-       await s.appendScroll(row('v4',1));s.flush();await s.close();
+      } else if(name.includes('v5-as-v3')) {
+       await s.appendScroll(row('v5',1));s.flush();await s.close();
        const {readFileSync}=await import('node:fs');
        const version=readFileSync(s.file).readUInt32BE(60);
-       assert(version!==2 && version!==3,'a v3-era reader (accepts 2 or 3) must refuse a v4 file; header says '+version);
+       assert(version!==2 && version!==3,'a v3-era reader (accepts 2 or 3) must refuse a v5 file; header says '+version);
       } else {
        const {cellsToAnsi}=await import(${JSON.stringify(join(import.meta.dir,'../src/pipe-history-runtime.ts'))});
        const {readdirSync,statSync}=await import('node:fs');
