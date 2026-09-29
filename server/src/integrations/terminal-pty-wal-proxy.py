@@ -1818,6 +1818,7 @@ class Proxy:
             return
         stopped = self.freeze_child()
         if self.child_status is not None:
+            self.drop_resize(target)
             return
         self.state = "resizing"
         self.write_health(True)
@@ -1838,6 +1839,48 @@ class Proxy:
         self.write_health(True)
         if stopped:
             self.resume_child()
+
+    def drop_resize(self, target: dict[str, int]) -> None:
+        """Record a resize that can no longer reach the recorded child.
+
+        ORCH17-OPEN: a dead child made every later resize vanish without a
+        trace while the pane and the recorded geometry drifted apart. Each
+        drop is logged, and the lane stops claiming to be live.
+        """
+        if self.log is not None:
+            self.log.write(
+                f"resize dropped: child exited with code {self.child_exit_code}; "
+                f"requested {target['cols']}x{target['rows']}, "
+                f"recorded geometry stays {self.geometry['cols']}x{self.geometry['rows']}"
+                if self.geometry is not None else
+                f"resize dropped: child exited with code {self.child_exit_code}"
+            )
+        self.disconnect_orphaned_lane()
+
+    def disconnect_orphaned_lane(self) -> None:
+        """Publish a reaped child as disconnected even if the pty stays open.
+
+        Descendants that outlive the child (an orphaned job of a login shell)
+        keep the slave open, so the master never reaches EOF and the lane used
+        to stay "ready" around a dead child. Output they still write is
+        drained by the loop; only the live claims (input, resize) stop.
+        """
+        if self.child_status is None or self.disconnected_linger or self.master_eof:
+            return
+        payload = self.pull_master_bytes()
+        if payload:
+            # Output still flowing is not proof of an orphan yet; the loop
+            # drains it and checks again.
+            self.append_output_and_display(payload)
+            return
+        if self.master_eof:
+            return
+        if self.log is not None:
+            self.log.write(
+                f"child exited with code {self.child_exit_code} while descendants still hold the pty; "
+                "lane is disconnected"
+            )
+        self.begin_disconnected_linger()
 
     def ordered_activate(self, generation: str) -> WalRecord:
         if generation != self.generation:
@@ -2080,7 +2123,7 @@ class Proxy:
 
     def run_loop(self) -> int:
         while True:
-            if self.resize_requested and self.child_status is None:
+            if self.resize_requested:
                 self.ordered_resize()
             if self.termination_signal is not None:
                 self.state = "disconnected"
@@ -2101,6 +2144,8 @@ class Proxy:
                     # logical END on delete, or deliberately replace the pane
                     # and RESUME the same lifecycle after a crash/restart.
                     self.begin_disconnected_linger()
+                else:
+                    self.disconnect_orphaned_lane()
             if self.logical_end_complete:
                 return self.child_exit_code if self.child_exit_code is not None else 0
 
