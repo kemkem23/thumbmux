@@ -168,8 +168,8 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
       to: '' },
     // Archive work leaves the commit transaction: it runs after the batch committed, in its own.
     { name: 'archive-outside-commit', pattern: 'D2:', file: store,
-      from: '    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[]);\n    archiveMs=performance.now()-archiveStarted;\n    before?.();writeMs=performance.now()-started;\n  }).immediate();\n',
-      to: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  plan=disk.transaction(()=>archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[])).immediate();\n' },
+      from: '    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))));\n    archiveMs=performance.now()-archiveStarted;\n    before?.();writeMs=performance.now()-started;\n  }).immediate();\n',
+      to: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  plan=disk.transaction(()=>archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))))).immediate();\n' },
     // The schedule advances inside the transaction, so a rolled-back commit still moves it.
     { name: 'queue-before-commit', pattern: 'D2:', file: store,
       from: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  if(plan)applyArchivePlan(disk,plan);',
