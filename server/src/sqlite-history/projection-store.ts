@@ -295,6 +295,8 @@ function applyArchivePlan(disk:Database,plan:ArchivePlan):void {
 }
 function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false, forceSeal=false) {
   const started=performance.now();let writeMs=0,archiveMs=0,plan:ArchivePlan|null=null;
+  // Receipts in the batch may push older ones past the kept few; a seal frees FKs.
+  const marks=new Map<number,boolean>();
   disk.transaction(()=>{
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
     const existing=prepared(disk,'SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
@@ -306,8 +308,6 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     prepared(disk,'INSERT INTO na_commit VALUES (?,coalesce((SELECT max(commit_seq) FROM na_commit),0)+1,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     prepared(disk,'DELETE FROM na_commit WHERE commit_id<>?').run(batch.id);
     const sealed=sealBlocks(disk,batch.panes,forceSeal);
-    // Receipts in the batch may push older ones past the kept few; a seal frees FKs.
-    const marks=new Map<number,boolean>();
     for(const row of batch.tables.get('na_capture')??[])marks.set(Number(row.pane_no),false);
     for(const paneNo of sealed)marks.set(paneNo,true);
     const archiveStarted=performance.now();
