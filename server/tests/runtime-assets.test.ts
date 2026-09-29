@@ -241,6 +241,7 @@ import {
   type PipeVtStageTrace,
   type PipeVtUpdate,
 } from "../src/pipe-vt-worker";
+import { strict as p2Assert } from "node:assert";
 
 const p2Encoder = new TextEncoder();
 const p2Sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -511,7 +512,7 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
   // In-test mutation witnesses on the real Python worker (review §6 P2 gate).
   for (const mutation of ["serialize-not-spliced", "rx-stamped-at-dispatch"] as const) test(
     `P2 mutation ${mutation}: clean passes, damaged worker is detected`, async () => {
-      const assert = (await import("node:assert/strict")).default;
+      const assert: typeof p2Assert = p2Assert;
       const original = vtAssets();
       const source = readFileSync(original.worker, "utf8");
       const [before, after] = mutation === "serialize-not-spliced"
