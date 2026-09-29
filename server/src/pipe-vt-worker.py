@@ -792,6 +792,7 @@ def multiplex(path):
     control_fd = sys.stdin.buffer.fileno()
     high_water = 1024 * 1024
     max_input = high_water + 65536 + 21
+    read_ahead = 65536
 
     def complete(c):
         b = c["input"]
@@ -810,8 +811,12 @@ def multiplex(path):
             runnable = False
             for sock, c in channels.items():
                 if not c["closing"] and len(c["output"]) < high_water:
-                    readable.append(sock)
                     runnable = runnable or c["partial"] is not None or complete(c)
+                    # Read ahead at most one recv of unparsed input (more only to
+                    # finish a frame): short turns must not pull the backlog out
+                    # of the socket, where the host's data budget bounds it.
+                    if len(c["input"]) < read_ahead or not complete(c):
+                        readable.append(sock)
                 if c["output"]:
                     writable.append(sock)
             called = time.monotonic_ns()
@@ -838,7 +843,7 @@ def multiplex(path):
                         n = sock.send(c["output"])
                         del c["output"][:n]
                     if sock in reads:
-                        data = sock.recv(65536)
+                        data = sock.recv(read_ahead)
                         if not data:
                             drop(sock)
                             continue
