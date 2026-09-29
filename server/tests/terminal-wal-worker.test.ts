@@ -882,6 +882,54 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(tray.ring.filter(Boolean)).toEqual([second]);
   });
 
+  test.each(["index-only", "release-after-callback"])("M2 mutation %s is rejected by the retention oracle", (mutation) => {
+    type Tray = {
+      ring: Array<PipeScrollEvent | undefined>;
+      remember(event: PipeScrollEvent): void;
+    };
+    // Mutate the actual runtime method, not a second implementation of the
+    // algorithm. These isolated collectors never start a worker. No source
+    // files, process globals, or production prototypes are changed.
+    const original = (PipeHistoryCollector.prototype as unknown as Tray).remember;
+    const method = original.toString();
+    const release = /this\.ring\[this\.ringStart\] = undefined;/g;
+    expect(method.match(release)?.length).toBe(1);
+    let damaged = method.replace(release, "");
+    if (mutation === "release-after-callback") {
+      const callback = "this.options.onEvict?.(evicted);";
+      expect(damaged.split(callback).length).toBe(2);
+      damaged = damaged.replace(callback, `${callback} this.ring[this.ringStart - 1] = undefined;`);
+    }
+    const mutated = new Function(`return (function ${damaged});`)() as Tray["remember"];
+    const witness = (remember: Tray["remember"]) => {
+      const collector = new PipeHistoryCollector({
+        paneKey: { serverIdentity: "m2-mutation", paneId: "%0", birthGeneration: 1 },
+        sourceEpoch: 1, cols: 80, rows: 24, ringRows: 1,
+        ports: { onScroll() {}, onFrame() {}, onFault() {} },
+        onEvict() {
+          if (mutation === "release-after-callback") throw new Error("eviction callback failed");
+        },
+      });
+      const tray = collector as unknown as Tray;
+      const first: PipeScrollEvent = {
+        paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+        physicalRow: [], softWrap: false, wrapPad: false, receiveSeq: 1,
+      };
+      const second = { ...first, receiveSeq: 2 };
+      remember.call(tray, first);
+      if (mutation === "release-after-callback") {
+        expect(() => remember.call(tray, second)).toThrow("eviction callback failed");
+      } else remember.call(tray, second);
+      expect(collector.ringSnapshot()).toEqual([second]);
+      if (tray.ring.filter(Boolean).length > 1 || tray.ring.includes(first)) {
+        throw new Error("M2 retained evicted reference");
+      }
+    };
+    witness(original);
+    expect(() => witness(mutated)).toThrow("M2 retained evicted reference");
+    console.log(`M2-MUTATION ${mutation}: clean=PASS damaged=DETECTED`);
+  });
+
   test.each([0, 3, 500])("M2 releases evicted references immediately across 15,000 appends (cap %i)", (cap) => {
     // Exercise the retention boundary without a worker or GC timing. The
     // oracle owns its own references; count only slots owned by the collector.
@@ -948,6 +996,8 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.evictedBeforeSeen).toBe(0);
     const ring = pane.collector.ringSnapshot();
     expect(ring.length).toBe(500);
+    const retained = (pane.collector as unknown as { ring: Array<PipeScrollEvent | undefined> }).ring.filter(Boolean);
+    expect(retained).toEqual(ring);
     expect(ring[0]).toBe(pane.scrolls[pane.scrolls.length - 500]!);
     expect(pane.faults).toEqual([]);
     expect(pane.collector.stats().scrolls).toBe(pane.scrolls.length);

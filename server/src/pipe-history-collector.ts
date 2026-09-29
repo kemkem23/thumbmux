@@ -213,7 +213,7 @@ export class PipeHistoryCollector {
   private ackedSeq = 0;
   private inflight: Array<{ seq: number; bytes: number; at: bigint }> = [];
   private inflightBytes = 0;
-  private readonly ring: PipeScrollEvent[] = [];
+  private readonly ring: Array<PipeScrollEvent | undefined> = [];
   private ringStart = 0;
   private readonly ringRows: number;
   private readonly queueLimit: number;
@@ -440,7 +440,8 @@ export class PipeHistoryCollector {
 
   /** Rows still held by the tray ring, oldest first. */
   ringSnapshot(): PipeScrollEvent[] {
-    return this.ring.slice(this.ringStart);
+    // Only the evicted prefix has empty slots; the active suffix is dense.
+    return this.ring.slice(this.ringStart) as PipeScrollEvent[];
   }
 
   stats() {
@@ -668,6 +669,9 @@ export class PipeHistoryCollector {
     this.ring.push(event);
     while (this.ring.length - this.ringStart > this.ringRows) {
       const evicted = this.ring[this.ringStart]!;
+      // Release ownership before user code runs, even if onEvict throws.
+      // Compacting the empty prefix later must not retain discarded rows.
+      this.ring[this.ringStart] = undefined;
       this.ringStart += 1;
       this.options.onEvict?.(evicted);
     }
