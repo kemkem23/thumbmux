@@ -1391,7 +1391,9 @@ test('D-FIX1: an unreadable legacy file is reported and skipped, never a reason 
 });
 
 // ── NEWARCH2 D2: archive scheduling off the per-commit path + boot receipt lookup ──
-import { projectionArchiveInternals as D2 } from '../src/sqlite-history/projection-store';
+import * as d2Store from '../src/sqlite-history/projection-store';
+// Namespace import: against a source without the D2 seam each D2 test fails on its own, the rest of the file still runs.
+const D2=(d2Store as any).projectionArchiveInternals as typeof d2Store.projectionArchiveInternals;
 import { encodeBlock as d2EncodeBlock, encodeCaptureArchive as d2EncodeCatalog, encodeCaptureReceipts as d2EncodeReceipts } from '../src/sqlite-history/codec';
 // The anti-join 26f25ec83 ran on every commit: the oracle for what is eligible.
 const D2_OLD_SCAN=`SELECT c.* FROM na_capture c WHERE c.pane_no=?
@@ -1574,16 +1576,18 @@ test('D2: boot resolves receipts from 300 archives by catalog, fetching data onl
   const rchar=()=>Number(/rchar: (\d+)/.exec(readFileS2('/proc/self/io','utf8'))![1]);
   const before=rchar(),started=performance.now();
   s=createProjectionStore({historyRoot:f.dir,mode:'recover'});
-  const recoverMs=performance.now()-started,read=rchar()-before,stats=s.archiveStats();
-  // 26f25ec83 read every archive's data from newest to the hit, again for each of the 384 ids (2.37 GB here).
-  expect({dataReads:stats.dataReads,catalogReads:stats.catalogReads}).toEqual({dataReads:3,catalogReads:ARCHIVES});
+  const recoverMs=performance.now()-started,read=rchar()-before;
+  console.log('D2_BOOT_READ',JSON.stringify({archives:ARCHIVES,dataBytes,recoverMs,rchar:read}));
+  // 26f25ec83 read every archive's data from newest to the hit, again for each of the 384 ids (2.37 GB in the bench).
   expect(read).toBeLessThan(dataBytes);
+  const stats=s.archiveStats();
+  expect({dataReads:stats.dataReads,catalogReads:stats.catalogReads}).toEqual({dataReads:3,catalogReads:ARCHIVES});
   const ram=(s as any).ram.db as Database;
   expect(d2Count(ram,'SELECT count(*) n FROM na_capture')).toBe(PER*targets.length);
   const lines=[0,2000,4000].flatMap(at=>s!.readPage(s!.token(key),at,Math.min(2000,LINES-at)).lines);
   expect(lines.map(l=>l.checkedCaptureId)).toEqual(Array.from({length:LINES},(_,l)=>`a${targets[l%3]}-c${l%PER}`));
   expect(d2Receipt(ram.query('SELECT * FROM na_capture WHERE capture_id=?').get('a0-c5'))).toEqual(d2Receipt(d2Capture(no,'a0-c5',6)));
-  console.log('D2_BOOT',JSON.stringify({archives:ARCHIVES,dataBytes,recoverMs,rchar:read,...stats}));
+  console.log('D2_BOOT',JSON.stringify(stats));
  }finally{await s?.close();rmSync(f.dir,{recursive:true,force:true});}
 },60000);
 
@@ -1603,13 +1607,15 @@ test('D2: capture-heavy async ingest scans archives on a small fraction of commi
   const settle=Date.now();while(s.health().pendingBytes>0 && Date.now()-settle<10000)await Bun.sleep(10);
   expect(s.health().pendingBytes).toBe(0);
   const folder=join(dir,'newarch-v5'),size=()=>readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
-  const live=size()/raw,stats=s.archiveStats();
+  const live=size()/raw;
   s.flush();const drained=size()/raw;
-  console.log('D2_LIVE_DISK',JSON.stringify({raw,live,drained,refused:seen.refused,...stats}));
+  console.log('D2_LIVE_DISK',JSON.stringify({raw,live,drained,refused:seen.refused}));
+  expect(live).toBeLessThanOrEqual(1.5);expect(drained).toBeLessThanOrEqual(1.5);
+  const stats=s.archiveStats();
+  console.log('D2_LIVE_ARCHIVE',JSON.stringify(stats));
   expect(stats.commits).toBeGreaterThan(40);
   expect(stats.scans*4).toBeLessThan(stats.commits);
   expect(stats.archived).toBeGreaterThan(0);
-  expect(live).toBeLessThanOrEqual(1.5);expect(drained).toBeLessThanOrEqual(1.5);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },120000);
 
