@@ -1068,11 +1068,21 @@ test('I2: shutdown after 2000 and 20000 accepted rows has durable receipts and i
   const root=mkdtempSync(join(tmpdir(),'na-i2-drain-')),key={serverIdentity:'drain',paneId:'%1',birthGeneration:1};
   let s=createProjectionStore({historyRoot:root,mode:'create'});
   try {
-   for(let n=0;n<count;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+   // A refused row is re-offered after drained() (FIX1 §3): 20000 rows (~10.7 MB) outrun the pane quota
+   // (~4.96 MB) when the disk is slow (GitHub runner). A drain that never comes throws, never a pass.
+   let refused=0;
+   for(let n=0;n<count;n++) {
+    const event={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}};
+    while(isProjectionRefusal(await s.appendScroll(event))) {
+     refused++;let timer:ReturnType<typeof setTimeout>|undefined;
+     const done=await Promise.race([s.drained(key).then(()=>true),new Promise<boolean>(ok=>{timer=setTimeout(()=>ok(false),10000);})]);
+     clearTimeout(timer);if(!done)throw Error('refused row did not drain within 10 s');
+    }
+   }
    const pendingAtClose=s.health().pendingBytes,started=performance.now();await s.close();const closeMs=performance.now()-started;
    s=createProjectionStore({historyRoot:root,mode:'recover'});
    expect(s.token(key).nextLineId).toBe(count);expect(s.token(key).revision).toBe(s.token(key).durableRevision);
-   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs}));
+   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs,refused}));
   }finally{await s.close();rmSync(root,{recursive:true,force:true});}
  }
 },60000);

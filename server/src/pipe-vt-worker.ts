@@ -81,6 +81,65 @@ export type PipeVtUpdate = {
   frame: PipeVtFrame;
   parseNs: number;
   encodeNs: number;
+  /** Worker stage durations (absent from workers older than P2 diagnostics). */
+  stages?: PipeVtWorkerStages;
+  /** json.dumps + UTF-8 of this update's own body, in the worker. */
+  serializeNs?: number;
+};
+
+/**
+ * Worker-side durations for the D frames acknowledged by one update, each on
+ * the worker's monotonic clock. `waitNs` is how long the oldest D frame sat
+ * complete in the worker before dispatch (fairness / budget wait), `holdNs`
+ * that frame's completion -> emit start (wait + parse of every frame + the
+ * coalescing window). Kernel socket/FIFO buffering before the worker read is
+ * outside every worker stage and lands in the host's transport residual.
+ */
+export type PipeVtWorkerStages = {
+  inFrames: number;
+  inBytes: number;
+  waitNs: number;
+  maxWaitNs: number;
+  holdNs: number;
+  /**
+   * Bounds on how late the read that completed the oldest frame came after
+   * its bytes became readable: lower = sibling channels served earlier in the
+   * same poll turn, upper = the loop-busy window since the previous poll (a
+   * blocked poll counts only its own wait). Both sit inside `transportMs`.
+   */
+  readLagNs: number;
+  readLagMaxNs: number;
+};
+
+/**
+ * One update's path, host clock (ms) for host spans, worker durations as
+ * reported. Spans nest, so the stages do not sum across different updates:
+ *   feed(seqFrom) ─ worker hold ─ encode ─ serialize ─ arrival ─ mainQueue ─ decode ─ consumer
+ * `transportMs` = feedToArrival - (hold + encode + serialize): host write
+ * buffering, kernel socket/FIFO (including `readLag*` — the shared loop busy
+ * with sibling panes), worker output buffering and event-loop delivery. It is a residual of nested durations, never a clock difference.
+ * The old driver's "parse" (ingest -> onFrame) is feedToArrival + mainQueue +
+ * decode + (part of) consumer, not parser CPU time; parser CPU is `worker.parseNs`.
+ */
+export type PipeVtStageTrace = {
+  seqFrom: number | null;
+  seqTo: number | null;
+  epoch: number;
+  /** Fed D frames whose seq this update acknowledged (0 for partial emits). */
+  matchedFeeds: number;
+  bodyBytes: number;
+  /** Host feed of the oldest / newest matched seq -> arrival of the completing chunk. */
+  feedToArrivalMs: number | null;
+  lastFeedToArrivalMs: number | null;
+  /** Arrival -> start of this update's decode: waits behind earlier consumers. */
+  mainQueueMs: number;
+  decodeMs: number;
+  /** onUpdate call until its receipt settled. */
+  consumerMs: number;
+  /** Oldest matched feed -> consumer settled (the host-visible end to end). */
+  feedToConsumedMs: number | null;
+  transportMs: number | null;
+  worker: PipeVtWorkerStages & { parseNs: number; encodeNs: number; serializeNs: number } | null;
 };
 
 export type PipeVtReady = { vendorSha256: string; cols: number; rows: number; pid: number };
@@ -133,7 +192,17 @@ export type PipeVtWorkerOptions = {
   assets?: PipeVtAssets;
   python?: string;
   now?: () => number;
+  /**
+   * Diagnostics only: called after each update's consumer settled. Without it
+   * no feed timestamps are kept. Never throws into the pipe path.
+   */
+  onStageTrace?: (trace: PipeVtStageTrace) => void;
+  /** Monotonic ms clock for stage traces (default performance.now). */
+  traceNow?: () => number;
 };
+
+/** Feed timestamps kept for tracing; older ones are dropped and counted. */
+export const PIPE_VT_TRACE_PENDING_MAX = 8192;
 
 /** Data frames share this budget; control frames (Z/F/X/C/Q) never compete for it. */
 export const PIPE_VT_DATA_QUEUE_BYTES = 1024 * 1024;
@@ -265,6 +334,11 @@ export class PipeVtWorker {
   private abandoned = false;
   private closePromise: Promise<PipeVtDrainReceipt> | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Traced feeds not yet acknowledged: parallel seq / host-time columns. */
+  private traceSeqs: number[] = [];
+  private traceTimes: number[] = [];
+  private traceHead = 0;
+  private traceDropped = 0;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
 
@@ -386,7 +460,8 @@ export class PipeVtWorker {
       this.outputPaused = true;
       (this.socket ?? this.child?.stdout)?.pause();
     }
-    this.outputTail = this.outputTail.then(() => this.onStdout(chunk)).catch((error) => {
+    const arrivedAt = this.options.onStageTrace ? this.traceClock() : 0;
+    this.outputTail = this.outputTail.then(() => this.onStdout(chunk, arrivedAt)).catch((error) => {
       this.notifyFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: String(error) });
     }).then(() => this.releaseOutput(chunk.byteLength));
   }
@@ -411,7 +486,64 @@ export class PipeVtWorker {
     return this.outputPendingBytes;
   }
 
-  private async onStdout(chunk: Buffer): Promise<void> {
+  /** Traced feeds awaiting acknowledgement, and feeds dropped from tracing. */
+  traceBacklog(): { pending: number; dropped: number; retained: number } {
+    return { pending: this.traceSeqs.length - this.traceHead, dropped: this.traceDropped, retained: this.traceSeqs.length };
+  }
+
+  private traceClock(): number {
+    return (this.options.traceNow ?? performance.now.bind(performance))();
+  }
+
+  private traceFeed(seq: number, fedAt: number): void {
+    if (this.traceSeqs.length - this.traceHead >= PIPE_VT_TRACE_PENDING_MAX) { this.traceHead++; this.traceDropped++; }
+    this.traceSeqs.push(seq);
+    this.traceTimes.push(fedAt);
+    this.compactTrace();
+  }
+
+  /** Keep both columns within twice the pending window. */
+  private compactTrace(): void {
+    if (this.traceHead > 1024 && this.traceHead * 2 > this.traceSeqs.length) {
+      this.traceSeqs = this.traceSeqs.slice(this.traceHead);
+      this.traceTimes = this.traceTimes.slice(this.traceHead);
+      this.traceHead = 0;
+    }
+  }
+
+  /** Remove every traced feed acknowledged by `seqTo`; returns [count, first, last] times. */
+  private traceAck(seqTo: number | null): [number, number | null, number | null] {
+    let n = 0, first: number | null = null, last: number | null = null;
+    if (seqTo !== null) {
+      while (this.traceHead < this.traceSeqs.length && this.traceSeqs[this.traceHead]! <= seqTo) {
+        const t = this.traceTimes[this.traceHead++]!;
+        first ??= t; last = t; n++;
+      }
+    }
+    this.compactTrace();
+    return [n, first, last];
+  }
+
+  private emitTrace(update: PipeVtUpdate, bodyBytes: number, arrivedAt: number, startedAt: number,
+    decodedAt: number, consumedAt: number): void {
+    const [matchedFeeds, first, last] = this.traceAck(update.seqTo);
+    const stages = update.stages;
+    const worker = stages ? { ...stages, parseNs: update.parseNs, encodeNs: update.encodeNs, serializeNs: update.serializeNs ?? 0 } : null;
+    const feedToArrivalMs = first === null ? null : arrivedAt - first;
+    const trace: PipeVtStageTrace = {
+      seqFrom: update.seqFrom, seqTo: update.seqTo, epoch: update.epoch, matchedFeeds, bodyBytes,
+      feedToArrivalMs, lastFeedToArrivalMs: last === null ? null : arrivedAt - last,
+      mainQueueMs: startedAt - arrivedAt, decodeMs: decodedAt - startedAt, consumerMs: consumedAt - decodedAt,
+      feedToConsumedMs: first === null ? null : consumedAt - first,
+      transportMs: feedToArrivalMs === null || worker === null ? null
+        : feedToArrivalMs - (worker.holdNs + worker.encodeNs + worker.serializeNs) / 1e6,
+      worker,
+    };
+    try { this.options.onStageTrace!(trace); }
+    catch (error) { console.error("[pipe-vt] onStageTrace callback failed:", error); }
+  }
+
+  private async onStdout(chunk: Buffer, arrivedAt = 0): Promise<void> {
     if (this.abandoned) return;
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
     let offset = 0;
@@ -424,6 +556,8 @@ export class PipeVtWorker {
         throw new Error("worker output exceeds 16 MiB frame bound");
       }
       if (this.pending.length - offset < 5 + length) break;
+      const tracing = kind === "U" && this.options.onStageTrace !== undefined;
+      const startedAt = tracing ? this.traceClock() : 0;
       const body = this.pending.subarray(offset + 5, offset + 5 + length).toString("utf8");
       offset += 5 + length;
       let message: unknown;
@@ -434,6 +568,7 @@ export class PipeVtWorker {
         continue;
       }
       if (kind === "U" || kind === "H") {
+        const decodedAt = tracing ? this.traceClock() : 0;
         try {
           const receipt = kind === "U" ? this.options.onUpdate(message as PipeVtUpdate)
             : this.options.onHistoryClear?.(message as { seq: number; epoch: number });
@@ -444,6 +579,7 @@ export class PipeVtWorker {
         } catch (error) {
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
+        if (tracing) this.emitTrace(message as PipeVtUpdate, length, arrivedAt, startedAt, decodedAt, this.traceClock());
       }
       else if (kind === "B") {
         this.quitAck = (message as { workerEof?: boolean }).workerEof === true;
@@ -535,7 +671,10 @@ export class PipeVtWorker {
     const prefix = Buffer.allocUnsafe(16);
     prefix.writeBigUInt64BE(BigInt(seq));
     prefix.writeBigUInt64BE(BigInt(epoch), 8);
-    return this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
+    const fedAt = this.options.onStageTrace ? this.traceClock() : 0;
+    const accepted = this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
+    if (accepted && this.options.onStageTrace) this.traceFeed(seq, fedAt);
+    return accepted;
   }
 
   setScrollOnClear(enabled: boolean): boolean {

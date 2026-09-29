@@ -17,10 +17,26 @@ in argv[3] (stdin when absent), output goes to stdout:
     Q  (quit after flushing)
   worker -> host
     R  JSON ready {vendorSha256, cols, rows}
-    U  JSON update {seqFrom, seqTo, gen, scrolls, frame, parseNs, encodeNs}
+    U  JSON update {seqFrom, seqTo, gen, scrolls, frame, parseNs, encodeNs,
+       stages, serializeNs}
     E  JSON error {kind, message}
 Bytes are fed through one incremental pyte.ByteStream, so UTF-8 sequences
 and escape sequences may be split at any byte.
+
+Stage diagnostics (additive U fields, worker monotonic durations only; the
+host never subtracts a worker clock from its own):
+  parseNs      DCS filter + pyte feed of the D frames in this update
+  encodeNs     dirty-row run encoding in emit()
+  serializeNs  json.dumps + UTF-8 of this U body, spliced in last
+  stages       {inFrames, inBytes, waitNs, maxWaitNs, holdNs, readLagNs,
+               readLagMaxNs} since the last acknowledged emit: waitNs is how
+               long the oldest D frame sat complete in this process before
+               dispatch, maxWaitNs the worst D frame, holdNs oldest-frame
+               completion -> emit start. readLagNs/readLagMaxNs bound how long
+               the read that completed the oldest frame came after its bytes
+               could have been read: lower = sibling channels served first in
+               the same select turn, upper = since the previous poll returned
+               (kernel buffering while this loop was busy elsewhere).
 """
 import hashlib
 import json
@@ -47,8 +63,12 @@ MAX_COALESCE_BYTES = 256 * 1024
 output_sink = None  # Set only during one synchronous multiplex channel turn.
 
 
-def send(kind, obj):
+def send(kind, obj, timed=False):
+    began = time.monotonic_ns() if timed else 0
     body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if timed:
+        # The body is a JSON object: splice its own serialization cost last.
+        body = body[:-1] + b',"serializeNs":%d}' % (time.monotonic_ns() - began)
     packet = kind + struct.pack(">I", len(body)) + body
     if output_sink is not None:
         output_sink(packet)
@@ -72,6 +92,37 @@ from pyte import modes as mo  # noqa: E402
 from wcwidth import wcwidth  # noqa: E402
 
 ALT_MODES = (47, 1047, 1049)
+
+
+class RxClock:
+    """Monotonic time at which each input byte offset arrived in this process.
+
+    One entry per read; a frame is complete when its last byte arrived, so
+    completed(end) is the time of the first read whose range reaches `end`.
+    """
+
+    def __init__(self):
+        self.marks = []
+        self.head = 0
+        self.received = 0
+        self.consumed = 0
+
+    def arrived(self, n, at, lag_lo=0, lag_hi=0):
+        if n:
+            self.received += n
+            self.marks.append((self.received, at, lag_lo, lag_hi))
+
+    def completed(self, n):
+        """(read time, read lag lower bound, upper bound) of the completing read."""
+        self.consumed += n
+        marks = self.marks
+        while marks[self.head][0] < self.consumed:
+            self.head += 1
+        mark = marks[self.head][1:]
+        if self.head > 64:
+            del marks[:self.head]
+            self.head = 0
+        return mark
 
 
 def row_wrapped(row):
@@ -425,12 +476,22 @@ class Worker:
         self.seq_to = None
         self.full = True
         self.parse_ns = 0
+        self.reset_stages()
         self.emitted_seq = None
         self.dcs_state = "ground"
         self.dcs_sixel = False
         self.dcs_intermediate = False
         self.screen.on_scroll = self._on_scroll
         self.screen.on_history_clear = self._on_history_clear
+
+    def reset_stages(self):
+        self.in_frames = 0
+        self.in_bytes = 0
+        self.first_rx_ns = None
+        self.wait_ns = 0
+        self.max_wait_ns = 0
+        self.read_lag_ns = 0
+        self.read_lag_max_ns = 0
 
     def _on_history_clear(self):
         # Publish earlier rows before the clear marker, even within one D.
@@ -451,13 +512,22 @@ class Worker:
             "epoch": getattr(row, "epoch", s.epoch),
         })
 
-    def feed(self, seq, epoch, data):
+    def feed(self, seq, epoch, data, rx=None):
         self.screen.epoch = epoch
         self.screen.receive_seq = seq
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
         t = time.monotonic_ns()
+        waited = 0 if rx is None else max(0, t - rx[0])
+        if self.first_rx_ns is None:
+            self.first_rx_ns = t if rx is None else rx[0]
+            self.wait_ns = waited
+            if rx is not None:
+                self.read_lag_ns, self.read_lag_max_ns = rx[1], rx[2]
+        self.max_wait_ns = max(self.max_wait_ns, waited)
+        self.in_frames += 1
+        self.in_bytes += len(data)
         data = self.filter_dcs(data)
         if data is not None:
             self.stream.feed(data)
@@ -572,22 +642,33 @@ class Worker:
             },
             "parseNs": self.parse_ns,
             "encodeNs": encode_ns,
-        })
+            "stages": {
+                "inFrames": self.in_frames,
+                "inBytes": self.in_bytes,
+                "waitNs": self.wait_ns,
+                "maxWaitNs": self.max_wait_ns,
+                "holdNs": 0 if self.first_rx_ns is None else max(0, t - self.first_rx_ns),
+                "readLagNs": self.read_lag_ns,
+                "readLagMaxNs": self.read_lag_max_ns,
+            },
+        }, timed=True)
         s.dirty.clear()
         s.shift = 0
         if ack:
             self.emitted_seq = self.seq_to
+            # Partial (ack=False) emits leave the D frames to the next ack.
+            self.reset_stages()
         self.scrolls = []
         self.seq_from = None
         self.full = False
         self.parse_ns = 0
 
 
-def dispatch(worker, kind, payload):
+def dispatch(worker, kind, payload, rx=None):
     """The same ordered command implementation for dedicated and shared parsers."""
     if kind == b"D":
         seq, epoch = struct.unpack(">QQ", payload[:16])
-        worker.feed(seq, epoch, payload[16:])
+        worker.feed(seq, epoch, payload[16:], rx)
     elif kind == b"C":
         worker.screen.scroll_on_clear = bool(payload[0])
     elif kind == b"X":
@@ -642,6 +723,7 @@ def multiplex(path):
         sock.close()
 
     print("MULTIPLEX_READY", flush=True)
+    polled_before = time.monotonic_ns()
     try:
         while True:
             readable = [server, control_fd]
@@ -653,13 +735,23 @@ def multiplex(path):
                     runnable = runnable or complete(c)
                 if c["output"]:
                     writable.append(sock)
+            called = time.monotonic_ns()
             reads, writes, _ = select.select(readable, writable, [], 0 if runnable else None)
+            # If select blocked, any readable channel became readable as it woke
+            # (earlier bytes would have woken it earlier). Otherwise the bytes
+            # arrived after the previous poll returned, provided the previous
+            # read drained the socket: a 64 KiB-capped read can leave older
+            # bytes behind, which this bound then understates.
+            polled = time.monotonic_ns()
+            since = polled if polled - called >= 1_000_000 else polled_before
+            polled_before = polled
             if control_fd in reads and not os.read(control_fd, 1024):
                 return  # Parent died: close all channels, leave no orphan interpreter.
             if server in reads:
                 sock, _ = server.accept()
                 sock.setblocking(False)
-                channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False}
+                channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False,
+                                  "rx": RxClock()}
             for sock, c in list(channels.items()):
                 output_sink = c["output"].extend
                 try:
@@ -672,6 +764,8 @@ def multiplex(path):
                             drop(sock)
                             continue
                         c["input"].extend(data)
+                        now = time.monotonic_ns()
+                        c["rx"].arrived(len(data), now, now - polled, now - since)
                     buf = c["input"]
                     if not c["closing"] and len(buf) >= 5 and struct.unpack(">I", buf[1:5])[0] > max_input:
                         raise ValueError("pane input exceeds frame bound")
@@ -684,6 +778,7 @@ def multiplex(path):
                             raise ValueError("pane input exceeds frame bound")
                         payload = bytes(buf[5:5 + length])
                         del buf[:5 + length]
+                        rx = c["rx"].completed(5 + length)
                         if c["worker"] is None:
                             if kind != b"A":
                                 raise ValueError("pane must attach before data")
@@ -693,7 +788,7 @@ def multiplex(path):
                             c["worker"] = Worker(cols, rows, epoch)
                             send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
                         else:
-                            c["worker"], c["closing"] = dispatch(c["worker"], kind, payload)
+                            c["worker"], c["closing"] = dispatch(c["worker"], kind, payload, rx)
                         processed += length
                         if processed >= 65536 or time.monotonic_ns() - began >= MAX_COALESCE_NS:
                             break
@@ -730,14 +825,22 @@ def main():
     send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
     fd = os.open(sys.argv[3], os.O_RDONLY) if len(sys.argv) > 3 else sys.stdin.buffer.fileno()
     buf = bytearray()
+    rx = RxClock()
     batch_started = None
     batch_bytes = 0
     eof = False
+    returned = time.monotonic_ns()
     while not eof:
+        called = time.monotonic_ns()
         chunk = os.read(fd, 1 << 16)
         if not chunk:
             eof = True
         buf.extend(chunk)
+        # A read that blocked returned as its bytes arrived; one that did not
+        # block got bytes that waited while the loop was busy since the
+        # previous read returned (same 64 KiB-cap caveat as the multiplexer).
+        previous, returned = returned, time.monotonic_ns()
+        rx.arrived(len(chunk), returned, 0, 0 if returned - called >= 1_000_000 else returned - previous)
         while len(buf) >= 5:
             kind = bytes(buf[0:1])
             length = struct.unpack(">I", buf[1:5])[0]
@@ -745,11 +848,12 @@ def main():
                 break
             payload = bytes(buf[5:5 + length])
             del buf[:5 + length]
+            rx_at = rx.completed(5 + length)
             if kind == b"D":
                 if batch_started is None:
                     batch_started = time.monotonic_ns()
                 batch_bytes += len(payload) - 16
-            worker, eof = dispatch(worker, kind, payload)
+            worker, eof = dispatch(worker, kind, payload, rx_at)
             if kind == b"X":
                 batch_started = None
                 batch_bytes = 0
