@@ -3,9 +3,9 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
+import { PROJECTION_LEGACY_FILES, PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION, PROJECTION_STORE_FILE } from './schema';
 import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
-import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
+import { BLOCK_COLUMNS, LegacyUnderlay, lowestLine, readDiskLines, readProjectionPage, projectionIssue, type LegacyFloor } from './projection-reader';
 import { decodeBlock, decodeCaptureArchive, decodeCaptureReceipts, encodeBlock, encodeCaptureArchive, encodeCaptureReceipts, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionCloseReceipt, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionStorageState, ProjectionStorageStatus, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
@@ -29,6 +29,12 @@ const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
+  /**
+   * Files of earlier schemas, read-only, layered under panes this file
+   * continues (LegacyUnderlay). Default: the PROJECTION_LEGACY_FILES that exist
+   * under historyRoot when `file` is the default, none otherwise.
+   */
+  legacyArchives?: readonly string[];
   /** RAM working-set cap; defaults to 256 MiB. Tests lower it to reach the cap with real rows. */
   cacheBytes?: number;
   onFault?: (fault: ProjectionFault)=>void;
@@ -45,7 +51,7 @@ function isStorageFull(error:unknown):boolean {
     || /(?:SQLITE_FULL|database or disk is full|\bENOSPC\b|no space left on device)/i.test(String(error));
 }
 function admitPath(options: ProjectionOptions): string {
-  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,'newarch-v3/history.sqlite3'));
+  const root=resolve(options.historyRoot), file=resolve(options.file??join(root,PROJECTION_STORE_FILE));
   if(file===root || !file.startsWith(root+sep) || file.split(sep).some(p=>/^brain\.db(?:$|[-.])/i.test(p))) throw new Error('forbidden-database-path');
   // Check every existing component before creating anything or calling SQLite.
   for(const candidate of [file,file+'-wal',file+'-shm',file+'-journal']) {
@@ -214,6 +220,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private readonly ram=new ProjectionRam();
   private readonly disk:Database;
   readonly file:string;
+  private readonly legacy:LegacyUnderlay;
   private fence=0;
   private queues=new Map<string,Job[]>();
   private queuedBytes=0;
@@ -292,7 +299,12 @@ export class ProjectionStore implements ProjectionWriterPort {
       const fd=openSync(dirname(this.file),'r');try {fsyncSync(fd);}finally {closeSync(fd);}
       this.recover();
     } catch(error) { closePrepared(this.disk);closePrepared(this.ram.db);throw error; }
-    try {this.ensureWorker();}catch(error){closePrepared(this.ram.db);closePrepared(this.disk);throw error;}
+    const root=resolve(options.historyRoot);
+    this.legacy=new LegacyUnderlay((options.legacyArchives??(options.file===undefined?PROJECTION_LEGACY_FILES.map(f=>join(root,f)).filter(f=>existsSync(f)):[]))
+      .map(f=>resolve(root,f)).filter(f=>f!==this.file));
+    for(const reason of this.legacy.errors)this.reportLegacy(reason);
+    this.ram.firstLineId=key=>this.legacy.find(key)?.token.nextLineId??0;
+    try {this.ensureWorker();}catch(error){this.legacy.close();closePrepared(this.ram.db);closePrepared(this.disk);throw error;}
     this.timer=setInterval(()=>{
       try {
         if(this.stopped)this.relievePressure();
@@ -304,6 +316,24 @@ export class ProjectionStore implements ProjectionWriterPort {
     },5);
     this.timer.unref();
   }
+  private reportLegacy(reason:string):void {
+    try {this.options.onFault?.({kind:'legacy-archive-unavailable',reason,at:Date.now(),pendingBytes:0});}
+    catch {console.error('[newarch] fault sink failed');}
+  }
+  /** Legacy rows under this pane, if its numbering continues a legacy file. */
+  private underlay(key:PaneKey):LegacyFloor|null {
+    if(!this.legacy.size)return null;
+    const seen=this.legacy.errors.length;
+    const floor=this.legacy.floor(key,()=>{
+      const no=this.ram.paneNo(key);
+      const found=[lowestLine(this.disk,no),lowestLine(this.ram.db,no)].filter((v):v is number=>v!==null);
+      return found.length?Math.min(...found):this.ram.token(key).nextLineId;
+    });
+    for(const reason of this.legacy.errors.slice(seen))this.reportLegacy(reason);
+    return floor;
+  }
+  /** Legacy files layered under this store: how many opened and why the others did not. */
+  legacyArchives():{opened:number;errors:string[]} {return {opened:this.legacy.size,errors:[...this.legacy.errors]};}
   private owner():void {
     if(this.closed) throw new Error('store-closed');
     if(Number(Object.values(prepared(this.disk,'PRAGMA application_id').get()!)[0])!==this.fence) throw new Error('stale-writer');
@@ -822,7 +852,7 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.owner();const row=prepared(this.ram.db,'SELECT * FROM na_screen WHERE pane_key=? AND screen_kind=?').get(paneId(key),kind) as SqlRow|null;
     return row?{...row,cells_json:JSON.stringify(decodeFrameCells(String(row.cells_json)))}:null;
   }
-  readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit);}
+  readPage(token:ProjectionToken,anchor:number|null,limit:number) {this.owner();return readProjectionPage(this.ram,this.disk,token,anchor,limit,this.underlay(token.paneKey));}
   private snapshot():Batch|null {
     if(this.retry)return this.retry;
     this.drainLosses();
@@ -1004,7 +1034,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       for(const w of this.drainWaiters.splice(0))w.reject(new Error('store-closed'));
       this.closed=true;
       try {await this.stopWorker();}
-      finally {closePrepared(this.ram.db);closePrepared(this.disk);}
+      finally {this.legacy.close();closePrepared(this.ram.db);closePrepared(this.disk);}
     }
     return this.closeReceipt!;
   }

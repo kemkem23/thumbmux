@@ -51,7 +51,7 @@ export const PIPE_HISTORY_RUNTIME_CAPABILITY = Object.freeze({
   wire: 'newarch-frame-v1',
   projectionSchema: PROJECTION_SCHEMA_VERSION,
   metadataRevision: true,
-  archiveReadVersions: Object.freeze([2, 3] as const),
+  archiveReadVersions: Object.freeze([2, 3, 4, 5] as const),
 });
 
 // ─── cell codec ───────────────────────────────────────────────────────────

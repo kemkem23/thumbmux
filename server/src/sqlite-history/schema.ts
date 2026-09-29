@@ -164,6 +164,15 @@ CREATE TRIGGER frame_immutable BEFORE UPDATE ON history_frame BEGIN SELECT RAISE
 export const PROJECTION_SCHEMA_MARKERS = ['pane_no INTEGER NOT NULL','screen_hash BLOB','history_hash BLOB','na_block','na_capture_archive'];
 export const PROJECTION_SCHEMA_VERSION = 5;
 export const PROJECTION_MIGRATION = '005-newarch-compact-capture-receipts';
+// Each schema owns its file under the history root. An upgrade therefore never
+// opens (or overwrites) the file an older release wrote, and a rollback to that
+// release finds its file exactly as it left it; only rows written after the
+// upgrade are missing there. 0.20.x up to 0.20.3 wrote schema v4 under the
+// historical name newarch-v3/.
+/** This writer's file, relative to the history root. */
+export const PROJECTION_STORE_FILE = 'newarch-v5/history.sqlite3';
+/** Files earlier releases wrote under the same root: read-only history below a pane's first v5 line. */
+export const PROJECTION_LEGACY_FILES: readonly string[] = Object.freeze(['newarch-v3/history.sqlite3']);
 export const CHECK_STATES = ['unchecked','checked','content-matched'] as const;
 export const CHECK_REASONS = ['awaiting-capture','evicted-before-check','exact-capture','content-capture'] as const;
 export const PROJECTION_SCHEMA = `
