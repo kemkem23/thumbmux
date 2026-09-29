@@ -249,3 +249,25 @@ test("H2 mux publishes a frame while its tmux activity child is still pending", 
     Bun.spawn = originalSpawn;
   }
 });
+
+
+test("H2 a failed pipe read kills the child before releasing the activity slot", async () => {
+  const originalSpawn = Bun.spawn;
+  let killed = false;
+  Bun.spawn = (() => ({
+    stdout: new ReadableStream({ start(controller) { controller.error(new Error("broken output pipe")); } }),
+    stderr: new Blob([]).stream(), exited: new Promise<number>(() => {}),
+    kill() { killed = true; },
+  })) as any;
+  const driver = createBunTmuxDriver();
+  try {
+    driver.getSessionActivity();
+    await driver.activityPoll.settled();
+    expect(killed).toBe(true);
+    expect(driver.activityPoll.status().pending).toBe(false);
+    expect(driver.activityPoll.status().error).toContain("broken output pipe");
+  } finally {
+    driver.activityPoll.stop();
+    Bun.spawn = originalSpawn;
+  }
+});

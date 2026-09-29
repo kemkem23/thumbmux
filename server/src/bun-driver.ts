@@ -179,6 +179,11 @@ export async function readActivityProcess(
     ]);
     if (code !== 0) throw new Error(err.trim() || `tmux activity poll failed (exit ${code})`);
     return out;
+  } catch (cause) {
+    // A pipe read can fail before exited settles. Never leave that child alive
+    // after releasing the single-flight slot (including stream/decoder errors).
+    try { process.kill(9); } catch { /* already exited */ }
+    throw cause;
   } finally {
     clearTimeout(timer);
     signal.removeEventListener("abort", abort);
