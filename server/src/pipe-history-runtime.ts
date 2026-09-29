@@ -28,7 +28,7 @@ import { PipeVtPool, pipeVtRunCells, type PipeVtAssets, type PipeVtRow } from '.
 import { HistoryCalibrator, type CalibrationCapture, type CalibrationFrame, type CaptureMetadata, type CaptureEvidence } from './history-calibrator';
 import { HistoryWatchdog } from './history-watchdog';
 import type { CapturedRow, HistoryCell, HistoryRow, RowMatch } from './history-row-matcher';
-import { TmuxCaptureDecoder, TMUX_OBSERVED_FIELDS } from './tmux-capture-normalize';
+import { CACHE_BYTE_MODEL, TmuxCaptureDecoder, TMUX_OBSERVED_FIELDS, type DecoderCacheStats } from './tmux-capture-normalize';
 import { createProjectionStore as createProjectionStoreValue } from './sqlite-history/projection-store';
 import { pipeVtAssets as pipeVtAssetsValue, verifyPipeVtAssets as verifyPipeVtAssetsValue } from './pipe-vt-worker';
 import {
@@ -105,6 +105,18 @@ export function parserStyle(attrs: number): number {
     | (attrs & 16 ? 64 : 0) | (attrs & 32 ? 16 : 0);
 }
 
+/**
+ * NEWARCH2 M3: row arrays each conversion path allocates, counted where they
+ * are made. `*Shared` counts a row handed out without a new array. Process
+ * totals, never reset; a reader takes differences.
+ */
+const allocations = {
+  parserRowArrays: 0, blankRowsShared: 0, canonicalRowArrays: 0, canonicalRowsShared: 0, ringArrayCopies: 0,
+};
+export function pipeHistoryAllocations(): typeof allocations & { blankRowWidths: number } {
+  return { ...allocations, blankRowWidths: blankRows.size };
+}
+
 // Two levels (attributes, then grapheme): a parser row looks its attribute
 // table up once per run, not a composed key string per cell (P profile).
 const interned = new Map<string, Map<string, HistoryCell>>();
@@ -119,7 +131,11 @@ function internIn(table: Map<string, HistoryCell>, grapheme: string, width: 0 | 
   let cell = table.get(grapheme);
   if (!cell) {
     // Bounding only: dropping the tables never changes a value.
-    if (internedCells >= 65536) { interned.clear(); internedCells = 0; }
+    if (internedCells >= 65536) {
+      interned.clear(); internedCells = 0;
+      // BLANK_CELL stays the one default blank (never reached while it is created: the table is empty then).
+      internTable(1, false, 'default', 'default', 0).set(' ', BLANK_CELL); internedCells++;
+    }
     // Field order equals the store's decoded cells, so JSON comparisons agree.
     cell = Object.freeze({ grapheme, width, continuation, fg, bg, style });
     table.set(grapheme, cell);
@@ -132,9 +148,35 @@ function internCell(grapheme: string, width: 0 | 1 | 2, continuation: boolean, f
 }
 export const BLANK_CELL: HistoryCell = internCell(' ', 1, false, 'default', 'default', 0);
 
+/**
+ * One frozen all-blank row per width, shared by every screen and ring row that
+ * is blank (NEWARCH2 M3). No consumer writes into a row (applyFrameDelta builds
+ * new arrays; the store encodes by row identity), and freezing makes that a
+ * rule. The table is bounded only: dropping it never changes a value.
+ */
+const blankRows = new Map<number, HistoryCell[]>();
+export function sharedBlankRow(cols: number): HistoryCell[] {
+  let row = blankRows.get(cols);
+  if (!row) {
+    if (blankRows.size >= 64) blankRows.clear();
+    row = Object.freeze(new Array<HistoryCell>(cols).fill(BLANK_CELL)) as HistoryCell[];
+    blankRows.set(cols, row);
+  }
+  allocations.blankRowsShared++;
+  return row;
+}
+const isBlankRun = (run: PipeVtRow[number]) => run[0] === 'default' && run[1] === 'default' && run[2] === 0
+  && (typeof run[3] === 'string' ? /^ *$/.test(run[3]) : run[3].every(glyph => glyph === ' '));
+
 /** One parser row (RLE runs) -> exactly `cols` canonical cells. */
 interface RunStyle { fg: string; bg: string; style: number; narrow?: Map<string, HistoryCell>; wide?: Map<string, HistoryCell>; cont?: Map<string, HistoryCell> }
 export function parserRowCells(row: PipeVtRow, cols?: number): HistoryCell[] {
+  if (row.every(isBlankRun)) {
+    let width = cols;
+    if (width === undefined) { width = 0; for (const run of row) width += run[3].length; }
+    return sharedBlankRow(width);
+  }
+  allocations.parserRowArrays++;
   const glyphs: string[] = [];
   const styles: RunStyle[] = [];
   for (const run of row) {
@@ -170,6 +212,7 @@ function canonicalCell(cell: Readonly<HistoryCell>): HistoryCell {
 export function canonicalCaptureCells(row: readonly Readonly<HistoryCell>[], cols: number): HistoryCell[] {
   const cached = canonicalRows.get(row);
   if (cached && cached.length === cols) return cached;
+  allocations.canonicalRowArrays++;
   const cells = new Array<HistoryCell>(cols);
   for (let x = 0; x < cols; x++) {
     const cell = row[x];
@@ -177,6 +220,22 @@ export function canonicalCaptureCells(row: readonly Readonly<HistoryCell>[], col
   }
   if (Object.isFrozen(row) || Array.isArray(row)) canonicalRows.set(row, cells);
   return cells;
+}
+/**
+ * A capture decoder whose memo holds canonical cells (NEWARCH2 M3). Before,
+ * each decoded row had a second, canonical array beside it for as long as the
+ * memo kept the row; now the memo row is the canonical row.
+ */
+export function canonicalCaptureDecoder(cols: number): TmuxCaptureDecoder {
+  return new TmuxCaptureDecoder(cols, undefined, undefined, canonicalCell);
+}
+/** One capture body -> canonical rows of `decoder.cols` cells; rows of a mapping decoder are used as they are. */
+export function decodeCanonicalCapture(decoder: TmuxCaptureDecoder, body: string): HistoryCell[][] {
+  const cols = decoder.cols, shared = decoder.mapsCells;
+  return decoder.decode(body).map(row => {
+    if (shared && row.length === cols) { allocations.canonicalRowsShared++; return row as HistoryCell[]; }
+    return canonicalCaptureCells(row as readonly HistoryCell[], cols);
+  });
 }
 /** Text of a physical row: a pure function of its cells (store `check-not-exact` compares it). */
 export function rowText(cells: readonly HistoryCell[]): string {
@@ -295,6 +354,12 @@ export interface PaneStats {
   captureIntervalMaxMs: number; captureAt: number[];
   faults: Record<string, number>;
 }
+export interface PaneMemoryStats {
+  ring: { rows: number; rowArrays: number; sharedRows: number; cellSlots: number; ansiRows: number; ansiChars: number; floor: number | null; bytes: number };
+  certified: { ids: number; bytes: number };
+  decoder: DecoderCacheStats | null;
+  bytes: number;
+}
 export interface PipeHistoryPaneOptions {
   paneKey: PaneKey; session: string; meta: PaneTmuxMeta;
   sourceEpoch?: number; scrollOnClear?: boolean;
@@ -379,7 +444,7 @@ export function trimStatsRing(values: unknown[], times: number[], limit: number,
 // ─── screen assembly ──────────────────────────────────────────────────────
 
 interface ParserScreen { cols: number; rows: number; cells: HistoryCell[][] }
-const blankRow = (cols: number) => new Array<HistoryCell>(cols).fill(BLANK_CELL);
+const blankRow = (cols: number) => sharedBlankRow(cols);
 function blankScreen(cols: number, rows: number): ParserScreen {
   return { cols, rows, cells: Array.from({ length: rows }, () => blankRow(cols)) };
 }
@@ -404,7 +469,8 @@ export function applyFrameDelta(screen: ParserScreen | undefined, cells: PipeFra
 
 // ─── pane ─────────────────────────────────────────────────────────────────
 
-interface RingRow extends HistoryRow { ansi?: string }
+/** Frozen once in the ring: a repair replaces the row (and the ring array), never its fields. */
+type RingRow = Readonly<HistoryRow>;
 function sameScreen(a: readonly (readonly HistoryCell[])[], b: readonly (readonly HistoryCell[])[],
   ca: { x: number; y: number; visible: boolean } | null, cb: { x: number; y: number; visible: boolean } | null): boolean {
   if (a.length !== b.length || JSON.stringify(ca) !== JSON.stringify(cb)) return false;
@@ -623,12 +689,29 @@ export class PipeHistoryPane {
     return answer;
   }
 
-  private remember(row: RingRow): void {
-    this.ring.push(row);
+  private remember(row: HistoryRow): void {
+    this.ring.push(Object.freeze(row));
     const limit = this.runtime.options.ringRows ?? RING_ROWS;
     // Evict into a new array, never in place: a calibration snapshot taken
     // earlier (read()) is this array plus its length at that moment.
-    if (this.ring.length > limit + 512) this.ring = this.ring.slice(this.ring.length - limit);
+    if (this.ring.length > limit + 512) {
+      this.ring = this.ring.slice(this.ring.length - limit);
+      allocations.ringArrayCopies++;
+      this.pruneCertified();
+    }
+  }
+
+  /**
+   * Certified ids live as long as their rows are in the ring (NEWARCH2 M3).
+   * The matcher only ever checks rows of a ring snapshot, and a snapshot is
+   * read after the last commit, so it never holds a row below today's floor:
+   * an id under it can never be filtered again. Before, ids stayed until the
+   * set passed 20,000 per pane.
+   */
+  private pruneCertified(): void {
+    const floor = this.ring[0]?.lineId;
+    if (floor === undefined) return;
+    for (const id of this.certified) if (id < floor) this.certified.delete(id);
   }
 
   /**
@@ -881,8 +964,8 @@ export class PipeHistoryPane {
       receiveSeq: this.received,
     };
     // The ring as of now without copying it: rows are only appended to this
-    // array (eviction replaces it), so its first `length` rows stay exactly
-    // what they are now. The copy is made on first use; the calibrator reads
+    // array (eviction and repair replace it, rows are frozen), so its first
+    // `length` rows stay exactly what they are now. The copy is made on first use; the calibrator reads
     // it only for a matched history capture (3 full copies per capture before,
     // O(4,500) each, on the frame thread).
     const ring = this.ring, length = ring.length;
@@ -913,10 +996,9 @@ export class PipeHistoryPane {
     this.observe(raw.after);
     this.capturedPull = !raw.after.alternate && this.pulled.rows > 0 ? { ...this.pulled } : null;
     const cols = raw.after.cols;
-    if (!this.decoder || this.decoder.cols !== cols) this.decoder = new TmuxCaptureDecoder(cols);
-    const decoded = this.decoder.decode(raw.body);
+    if (!this.decoder || this.decoder.cols !== cols) this.decoder = canonicalCaptureDecoder(cols);
+    const rows = decodeCanonicalCapture(this.decoder, raw.body);
     const uncertain = this.decoder.uncertainRows;
-    const rows = decoded.map(row => canonicalCaptureCells(row as readonly HistoryCell[], cols));
     const screenRows = rows.slice(Math.max(0, rows.length - raw.after.rows));
     const history: CapturedRow[] = rows.slice(0, rows.length - screenRows.length).map(cells => ({ cells, softWrap: false }));
     const metaAfter = this.metadata(raw.after, after);
@@ -992,17 +1074,17 @@ export class PipeHistoryPane {
       this.countCapture();
       this.lastStoreCommitAt = this.runtime.now();
       this.stats.storeCommits++;
-      for (const m of [...checks, ...contentMatches, ...input.repairs]) this.certified.add(m.lineId);
-      if (this.certified.size > 20_000) {
-        const floor = this.ring[0]?.lineId ?? 0;
-        for (const id of this.certified) if (id < floor) this.certified.delete(id);
-      }
+      // A row evicted while the store committed is below the floor: not kept (see pruneCertified).
+      const floor = this.ring[0]?.lineId ?? 0;
+      for (const m of [...checks, ...contentMatches, ...input.repairs]) if (m.lineId >= floor) this.certified.add(m.lineId);
       if (input.repairs.length) {
+        // Copy on write: a snapshot read() handed out earlier keeps its rows.
         const byId = new Map(input.repairs.map(r => [r.lineId, r.row.cells]));
-        for (const row of this.ring) {
+        this.ring = this.ring.map(row => {
           const cells = byId.get(row.lineId);
-          if (cells) { row.cells = cells; row.ansi = undefined; }
-        }
+          return cells ? Object.freeze({ ...row, cells }) : row;
+        });
+        allocations.ringArrayCopies++;
         this.ringRepairs++;
       }
       return receipt;
@@ -1105,8 +1187,8 @@ export class PipeHistoryPane {
   showUnstored(raw: RawPaneCapture): void {
     if (this.closed || !this.overlay) return;
     const cols = raw.after.cols;
-    if (!this.decoder || this.decoder.cols !== cols) this.decoder = new TmuxCaptureDecoder(cols);
-    const rows = this.decoder.decode(raw.body).map(row => canonicalCaptureCells(row as readonly HistoryCell[], cols));
+    if (!this.decoder || this.decoder.cols !== cols) this.decoder = canonicalCaptureDecoder(cols);
+    const rows = decodeCanonicalCapture(this.decoder, raw.body);
     const cells = rows.slice(Math.max(0, rows.length - raw.after.rows));
     const cursor = clampCursor(raw.after.cursor, cols, raw.after.rows);
     this.observe(raw.after);
@@ -1132,8 +1214,35 @@ export class PipeHistoryPane {
     };
   }
 
-  /** Accepted history rows still in RAM, oldest first, with their cached ANSI text. */
+  /** Accepted history rows still in RAM, oldest first (frozen; their ANSI text is cached by row). */
   recentRows(): readonly RingRow[] { return this.ring; }
+
+  /**
+   * What this pane holds in RAM, in CACHE_BYTE_MODEL bytes (NEWARCH2 M3). A row
+   * array shared by several rows (blank rows, repaired rows) is counted once.
+   * Diagnostic: walks the ring, never called on the frame path.
+   */
+  memoryStats(): PaneMemoryStats {
+    const m = CACHE_BYTE_MODEL;
+    const arrays = new Set<readonly HistoryCell[]>();
+    let cellSlots = 0, sharedRows = 0, ansiChars = 0, ansiRows = 0;
+    for (const row of this.ring) {
+      if (arrays.has(row.cells)) { sharedRows++; continue; }
+      arrays.add(row.cells);
+      cellSlots += row.cells.length;
+      const ansi = ANSI_ROWS.get(row.cells);
+      if (ansi !== undefined) { ansiRows++; ansiChars += ansi.length; }
+    }
+    const rows = this.ring.length;
+    const ring = {
+      rows, rowArrays: arrays.size, sharedRows, cellSlots, ansiRows, ansiChars, floor: this.ring[0]?.lineId ?? null,
+      bytes: m.arrayHeader + rows * (m.slot + m.object) + arrays.size * m.arrayHeader + cellSlots * m.slot
+        + ansiRows * m.stringHeader + ansiChars * m.char,
+    };
+    const certified = { ids: this.certified.size, bytes: this.certified.size * m.setEntry };
+    const decoder = this.decoder ? this.decoder.stats() : null;
+    return { ring, certified, decoder, bytes: ring.bytes + certified.bytes + (decoder?.bytes ?? 0) };
+  }
 
   /** Forward page read (L1 contract) at one token; retried while the revision moves. */
   readRange(start: number, end: number): { lines: string[]; startLine: number; issues: ProjectionIssue[]; token: ProjectionToken } | null {
@@ -1465,7 +1574,7 @@ export class ProjectionLiveWindow {
       // One join, never repeated `+`: a string built by appending stays a rope
       // one level per row, and every later hash of the frame walks it.
       const parts: string[] = from ? [text] : [];
-      for (let i = from; i < rows.length; i++) { const row = rows[i]!; parts.push(row.ansi ??= cellsToAnsi(row.cells)); }
+      for (let i = from; i < rows.length; i++) parts.push(rowAnsi(rows[i]!.cells));
       text = parts.join('\n');
     }
     this.texts.set(id, { firstId: rows[0]!.lineId, lastId: rows[rows.length - 1]!.lineId, count: rows.length, repairs, hide, text });
