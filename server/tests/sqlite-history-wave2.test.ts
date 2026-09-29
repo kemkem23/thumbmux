@@ -820,7 +820,7 @@ const I4_FIX2_S_MUTATIONS=[
 // NEWARCH-SWITCHON S2: each mutant undoes one part of the compact store.
 const S2_MUTATIONS=[
  {name:'S2 per-cell-json',file:'codec.ts',before:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n",after:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n  return legacy(text, cells);\n"},
- {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void { return;'},
+ {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> { return new Set();'},
  {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
  {name:'S2 v5-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 5;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
