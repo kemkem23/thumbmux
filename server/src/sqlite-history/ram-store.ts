@@ -50,24 +50,28 @@ export function decodeObservedFields(value:number|string):string[] {
 // from frame to frame, so a row is encoded and validated once, not once per
 // frame: the whole-screen JSON of every write was the largest frame-path cost
 // (P profile) and most of its garbage. The stored format is unchanged.
-const FRAME_ROW_JSON=new WeakMap<readonly unknown[],string>();
+const FRAME_ROW_V2=new WeakMap<readonly unknown[],readonly [string,string]>();
 const VALID_ROWS=new WeakSet<readonly unknown[]>();
-const encodeFrameRow=(row:PhysicalRow['cells']):string=>{
-  let json=FRAME_ROW_JSON.get(row);
-  if(json===undefined){json=encodeCellRuns(row);FRAME_ROW_JSON.set(row,json);}
-  return json;
+const encodeFrameRow=(row:PhysicalRow['cells']):readonly [string,string]=>{
+  let stored=FRAME_ROW_V2.get(row);
+  if(stored===undefined){
+    const text=row.filter(cell=>!cell.continuation).map(cell=>cell.grapheme).join('');
+    const encoded=encodeRow(text,row);stored=[encoded.text,encoded.cells];FRAME_ROW_V2.set(row,stored);
+  }
+  return stored;
 };
 export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
-  // One full-size string per frame: `head+join+tail` builds the join and then
-  // a rope that SQLite flattens into a second copy (P allocation probe: frame
-  // JSON is ~97% of the bytes the frame path allocates).
-  const parts=cells.map(encodeFrameRow);
-  if(!parts.length)return '{"rle":1,"rows":[]}';
-  parts[0]='{"rle":1,"rows":['+parts[0];parts[parts.length-1]+=']}';
-  return parts.join(',');
+  return JSON.stringify({fc:2,rows:cells.map(encodeFrameRow)});
 }
 export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
-  const value=JSON.parse(encoded);return value.rle===1?value.rows.map(decodeCellRuns):value;
+  const value=JSON.parse(encoded);
+  if(Array.isArray(value))return value;
+  if(value?.rle===1 && Array.isArray(value.rows))return value.rows.map(decodeCellRuns);
+  if(value?.fc===2 && Array.isArray(value.rows))return value.rows.map((row:unknown)=>{
+    if(!Array.isArray(row) || row.length!==2 || typeof row[0]!=='string' || typeof row[1]!=='string')throw new Error('frame-codec-corrupt');
+    return decodeRow(row[0],row[1]).cells;
+  });
+  throw new Error('frame-codec-unknown');
 }
 export function validateFrame(frame: ProjectionFrame): void {
   integer(frame.cols); integer(frame.rows); integer(frame.receiveSeq);

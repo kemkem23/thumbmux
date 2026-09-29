@@ -71,8 +71,8 @@ export function readProjectionPage(ram: ProjectionRam, disk: Database, token: Pr
 }
 
 /**
- * Read-only bridge for closed v2/v3 archives and v4 files (including the live
- * v4 file of a running host). It never ATTACHes the archive to a live writer
+ * Read-only bridge for closed v2/v3/v4 archives and v5 files (including the live
+ * v5 file of a running host). It never ATTACHes the archive to a live writer
  * and intentionally exposes rows/issues only: v2 capture/screen payloads are
  * legacy data, not a source for the current display. A version it does not
  * know is refused, never guessed.
@@ -85,7 +85,7 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
     const head=Buffer.alloc(100),n=readSync(fd,head,0,100,0);
     version=n===100 && head.subarray(0,16).toString()==='SQLite format 3\0'?head.readUInt32BE(60):0;
   }finally{closeSync(fd);}
-  if(version!==2 && version!==3 && version!==4)throw new Error('unsupported-projection-archive');
+  if(version!==2 && version!==3 && version!==4 && version!==5)throw new Error('unsupported-projection-archive');
   const db=new Database(file,{readonly:true,strict:true});
   db.exec('PRAGMA query_only=ON; PRAGMA foreign_keys=ON;');
   let closed=false;
@@ -104,7 +104,7 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
       || current.geometryGeneration!==expected.geometryGeneration || current.nextLineId!==expected.nextLineId)throw new Error('page-retry');
     const start=anchor===null?0:integer(anchor),end=Math.min(current.nextLineId,start+limit);
     if(start>current.nextLineId)throw new Error('page-anchor');
-    const rows=version===4?readDiskLines(db,Number((prepared(db,'SELECT pane_no FROM na_pane WHERE pane_key=?').get(paneId(expected.paneKey)) as SqlRow).pane_no),start,end)
+    const rows=version>=4?readDiskLines(db,Number((prepared(db,'SELECT pane_no FROM na_pane WHERE pane_key=?').get(paneId(expected.paneKey)) as SqlRow).pane_no),start,end)
       :prepared(db,'SELECT * FROM na_line WHERE pane_key=? AND line_id>=? AND line_id<? ORDER BY line_id').all(paneId(expected.paneKey),start,end) as SqlRow[];
     if(rows.length!==end-start || rows.some((row,index)=>Number(row.line_id)!==start+index || Number(row.revision)>expected.revision))throw new Error('page-seam-hole');
     const issues=(prepared(db,'SELECT * FROM na_issue WHERE pane_key=? AND revision<=? ORDER BY revision').all(paneId(expected.paneKey),expected.revision) as SqlRow[]).map(projectionIssue);
@@ -113,6 +113,6 @@ export function openProjectionArchive(input:string):ProjectionArchiveReaderPort 
       sourceEpoch:Number(row.source_epoch),geometryGeneration:Number(row.geometry_generation),revision:Number(row.revision),text:String(row.text),
       cells:decodeCells(String(row.cells_json)),softWrap:!!row.soft_wrap,checkState:row.check_state as ProjectionCheckState,
       checkReason:String(row.check_reason),checkedCaptureId:row.checked_capture_id as string|null,checkedRow:row.checked_row as number|null});
-    return {token:{...current},issues,nextAnchor:end,hasMore:end<current.nextLineId,lines:rows.map(version===4?projectionLine:legacy)};
+    return {token:{...current},issues,nextAnchor:end,hasMore:end<current.nextLineId,lines:rows.map(version>=4?projectionLine:legacy)};
   },close(){if(!closed){closed=true;closePrepared(db);}}};
 }

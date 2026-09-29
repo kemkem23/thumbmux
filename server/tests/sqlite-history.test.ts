@@ -363,14 +363,14 @@ const naRow=(text:string):PhysicalRow=>({text,cells:[...text].map(naCell)});
 const naEvent=(text:string,receiveSeq:number,paneKey=naKey)=>({paneKey,sourceEpoch:1,geometryGeneration:1,physicalRow:naRow(text),softWrap:false,receiveSeq});
 const naFrame=()=>({paneKey:naKey,sourceEpoch:1,geometryGeneration:1,receiveSeq:1,cols:2,rows:1,kind:'normal' as const,cells:[[naCell('A'),naCell(' ')]],cursor:{row:0,col:0,visible:true}});
 
-test('newarch v4: metadata-only schema, new-file refusal and deny-open path spy',async()=>{
+test('newarch v5: compact receipt schema, new-file refusal and deny-open path spy',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-path-'));let opens=0;
  try {
   const store=createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++});
   await store.appendScroll(naEvent('one',1));store.flush();await store.close();
   const db=new Database(join(dir,'newarch-v3/history.sqlite3'),{readonly:true});
-  expect(db.query('PRAGMA user_version').get()).toEqual({user_version:4});
-  expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(6);
+  expect(db.query('PRAGMA user_version').get()).toEqual({user_version:5});
+  expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'na_%'").all()).toHaveLength(7);
   expect(db.query("SELECT name FROM sqlite_master WHERE name='na_screen'").get()).toBeNull();
   expect(db.query('PRAGMA journal_mode').get()).toEqual({journal_mode:'wal'});db.close();
   expect(()=>createProjectionStore({historyRoot:dir,mode:'create',beforeOpen:()=>opens++})).toThrow('new-file-required');
@@ -383,9 +383,9 @@ test('newarch v4: metadata-only schema, new-file refusal and deny-open path spy'
   linkSync(join(dir,'newarch-v3/history.sqlite3'),join(dir,'hard.sqlite'));
   expect(()=>createProjectionStore({historyRoot:dir,file:join(dir,'hard.sqlite'),mode:'recover',beforeOpen:()=>opens++})).toThrow('unsafe-database-path');
   const v1=join(dir,'old.sqlite');const old=new Database(v1);old.exec('PRAGMA user_version=1');old.close();
-  expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v4');
+  expect(()=>createProjectionStore({historyRoot:dir,file:v1,mode:'recover',beforeOpen:()=>opens++})).toThrow('not-projection-v5');
   expect(opens).toBe(1);
-  console.log('NA_PATH_PROOF',JSON.stringify({schema:4,migration:'004-newarch-compact-rows',forbiddenSqliteOpens:0,fixtureHash:createHash('sha256').update(JSON.stringify(naEvent('one',1))).digest('hex')}));
+  console.log('NA_PATH_PROOF',JSON.stringify({schema:5,migration:'005-newarch-compact-capture-receipts',forbiddenSqliteOpens:0,fixtureHash:createHash('sha256').update(JSON.stringify(naEvent('one',1))).digest('hex')}));
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -801,7 +801,7 @@ test('I4 FIX1: closed v2 archive is read without attaching it or restoring its s
   try {
    expect(archive.schemaVersion).toBe(2);const token=archive.token(key);
    expect(archive.readPage(token,null,10).lines[0]).toMatchObject({text:'legacy-row',checkReason:'legacy-v2'});
-   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v4');
+   expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v5');
   }finally{archive.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
@@ -1098,7 +1098,7 @@ test('S2: corpus is lossless in RAM, in sealed blocks, after a patch of a sealed
   await s.close();
   const archive=openProjectionArchive(join(dir,'newarch-v3/history.sqlite3'));
   try {
-   expect(archive.schemaVersion).toBe(4);
+  expect(archive.schemaVersion).toBe(5);
    const lines=archive.readPage(archive.token(naKey),0,600).lines;
    expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
   }finally{archive.close();}
@@ -1118,8 +1118,8 @@ test('S2: a v3 file is read-only through the archive reader and the v4 writer re
   for(const [i,row] of S2_CORPUS.entries())db.query("INSERT INTO na_line VALUES (?,1,?,?,1,?,?,0,'unchecked','awaiting-capture',NULL,NULL)").run(id,i,i+1,row.text,encodeCells(row.cells));
   db.close();
   const sha=()=>createHash('sha256').update(readFileS2(file)).digest('hex'),before=sha();
-  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('not-projection-v4');
-  expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v4');
+  expect(()=>createProjectionStore({historyRoot:dir,mode:'recover'})).toThrow('not-projection-v5');
+  expect(()=>createProjectionStore({historyRoot:dir,file,mode:'recover'})).toThrow('not-projection-v5');
   const archive=openProjectionArchive(file);
   try {
    expect(archive.schemaVersion).toBe(3);
@@ -1129,17 +1129,17 @@ test('S2: a v3 file is read-only through the archive reader and the v4 writer re
   }finally{archive.close();}
   expect(sha()).toBe(before);
   expect(readdirS2(join(dir,'newarch-v3'))).toEqual(['history.sqlite3']);
-  console.log('S2_V3_READONLY',JSON.stringify({rows:S2_CORPUS.length,writerRefused:'not-projection-v4',sha256Unchanged:before}));
+  console.log('S2_V3_READONLY',JSON.stringify({rows:S2_CORPUS.length,writerRefused:'not-projection-v5',sha256Unchanged:before}));
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
-test('S2: a v4 file carries version 4 in its header, so every v3-era reader refuses it; its lines have no v3 columns',async()=>{
+test('S2: a v5 file carries version 5 in its header, so an old writer refuses it; its lines have no v3 columns',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-s2-v4-header-'));const s=createProjectionStore({historyRoot:dir,mode:'create'});
  try {
   await s.appendScroll(naEvent('v4 row',1));s.flush();await s.close();
   const file=join(dir,'newarch-v3/history.sqlite3'),head=readFileS2(file).subarray(0,100);
   // The v3 writer (admitPath) and archive reader gate on this header field: 3 and {2,3}.
-  expect(head.readUInt32BE(60)).toBe(4);expect(PROJECTION_SCHEMA_VERSION).toBe(4);
+  expect(head.readUInt32BE(60)).toBe(5);expect(PROJECTION_SCHEMA_VERSION).toBe(5);
   const db=new Database(file,{readonly:true});
   try {
    expect(()=>db.query('SELECT cells_json FROM na_line').all()).toThrow(/no such column/);

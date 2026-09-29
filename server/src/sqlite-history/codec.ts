@@ -181,3 +181,24 @@ export function decodeBlock(data: Uint8Array): unknown[][] {
   if (data[0] !== BLOCK_FORMAT) throw new Error('block-format-unknown');
   return JSON.parse(inflateRawSync(data.subarray(1)).toString('utf8'));
 }
+
+// Capture archives need corruption detection independent of SQLite's page
+// checks. The hash covers the exact inflated bytes and the length prevents a
+// truncated/oversized inflate from being accepted as another valid corpus.
+export const CAPTURE_ARCHIVE_FORMAT = 1;
+export function encodeCaptureArchive(rows:readonly unknown[][]):Uint8Array {
+  const raw=Buffer.from(JSON.stringify(rows)),body=deflateRawSync(raw),out=Buffer.alloc(37+body.length);
+  out[0]=CAPTURE_ARCHIVE_FORMAT;out.writeUInt32BE(raw.length,1);
+  createHash('sha256').update(raw).digest().copy(out,5);body.copy(out,37);return out;
+}
+export function decodeCaptureArchive(data:Uint8Array):unknown[][] {
+  const input=Buffer.from(data);
+  if(input.length<37 || input[0]!==CAPTURE_ARCHIVE_FORMAT)throw new Error('capture-archive-format-unknown');
+  const expected=input.readUInt32BE(1),raw=inflateRawSync(input.subarray(37));
+  if(raw.length!==expected)throw new Error('capture-archive-size');
+  const digest=createHash('sha256').update(raw).digest();
+  if(!digest.equals(input.subarray(5,37)))throw new Error('capture-archive-checksum');
+  const rows=JSON.parse(raw.toString('utf8'));
+  if(!Array.isArray(rows))throw new Error('capture-archive-corrupt');
+  return rows;
+}
