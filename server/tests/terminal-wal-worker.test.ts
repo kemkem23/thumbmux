@@ -861,6 +861,27 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.last!.cells.rows).toBe(24);
   }, 30_000);
 
+  test("M2 releases an evicted reference even when onEvict throws", () => {
+    const collector = new PipeHistoryCollector({
+      paneKey: { serverIdentity: "m2-throw", paneId: "%0", birthGeneration: 1 },
+      sourceEpoch: 1, cols: 80, rows: 24, ringRows: 1,
+      ports: { onScroll() {}, onFrame() {}, onFault() {} },
+      onEvict() { throw new Error("eviction callback failed"); },
+    });
+    const tray = collector as unknown as {
+      ring: Array<PipeScrollEvent | undefined>; remember(event: PipeScrollEvent): void;
+    };
+    const first: PipeScrollEvent = {
+      paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+      physicalRow: [], softWrap: false, wrapPad: false, receiveSeq: 1,
+    };
+    const second = { ...first, receiveSeq: 2 };
+    tray.remember(first);
+    expect(() => tray.remember(second)).toThrow("eviction callback failed");
+    expect(collector.ringSnapshot()).toEqual([second]);
+    expect(tray.ring.filter(Boolean)).toEqual([second]);
+  });
+
   test.each([0, 3, 500])("M2 releases evicted references immediately across 15,000 appends (cap %i)", (cap) => {
     // Exercise the retention boundary without a worker or GC timing. The
     // oracle owns its own references; count only slots owned by the collector.
