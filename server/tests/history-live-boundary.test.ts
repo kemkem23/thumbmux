@@ -458,7 +458,7 @@ const { canonicalCaptureDecoder, decodeCanonicalCapture, pipeHistoryAllocations,
   canonicalCaptureDecoder(cols: number): TmuxCaptureDecoder;
   decodeCanonicalCapture(decoder: TmuxCaptureDecoder, body: string): Array<Array<{ grapheme: string }>>;
   pipeHistoryAllocations(): Record<string, number>;
-  sharedBlankRow(cols: number): unknown[];
+  sharedBlankRow(cols: number): typeof BLANK_CELL[];
 };
 const CACHE_BYTE_MODEL = (N3 as any).CACHE_BYTE_MODEL as Record<"slot" | "arrayHeader" | "object" | "stringHeader" | "char" | "mapEntry" | "setEntry", number>;
 
