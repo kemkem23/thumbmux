@@ -433,6 +433,9 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
       let text: string;
       if (index % 9 === 0) text = `\x1b[31mRED ${n} opens\r\n`; // colour stays on
       else if (index % 9 === 3) text = `\x1b[0mOFF ${n}\r\n`;
+      // Exactly full width: no -N padding, so a capture ending on this row
+      // ends red and the next capture's first (default) row has no codes.
+      else if (index % 9 === 4) text = `\x1b[31m${"R".repeat(21)}${n}\x1b[0m\r\n`;
       else if (index % 9 === 5) text = `\x1b]8;;http://x.test/${n}\x1b\\LINK ${n}\x1b]8;;\x1b\\ tail\r\n`;
       else if (index % 9 === 6) text = `\x1b[1;44mBG ${n}\x1b[0m  x\r\n`;
       else if (index % 9 === 7) text = `\x1b[32m${"W".repeat(30)}${n}\x1b[39m\r\n`; // wraps
@@ -534,6 +537,7 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
       const n = String(index).padStart(3, "0");
       const text = index % 9 === 0 ? `\x1b[31mRED ${n}\r\n`
         : index % 9 === 3 ? `\x1b[0mOFF ${n}\r\n`
+        : index % 9 === 4 ? `\x1b[31m${"R".repeat(21)}${n}\x1b[0m\r\n`
         : index % 9 === 5 ? `\x1b]8;;http://x.test/${n}\x1b\\LINK ${n}\x1b]8;;\x1b\\ t\r\n`
         : index % 9 === 7 ? `\x1b[32m${"W".repeat(30)}${n}\x1b[39m\r\n`
         : `N ${n}\r\n`;
