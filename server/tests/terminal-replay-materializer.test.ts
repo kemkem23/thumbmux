@@ -578,6 +578,13 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     while (produced.hasMoreWal) produced = producer.refresh(); // never reopened: per record
     producer.close();
 
+    console.log("R2_ROLLBACK_FIXTURE", JSON.stringify({
+      wal: readFileSync(walPath).toString("base64"),
+      handoffHistory: readFileSync(join(copyDir, "history.ansi")).toString("base64"),
+      handoffCheckpoint: JSON.parse(handoffCheckpoint.toString("utf8")),
+      history: readFileSync(produced.historyPath).toString("base64"),
+      checkpoint: JSON.parse(readFileSync(produced.checkpointPath, "utf8")),
+    }));
     const reopened = new TerminalReplayMaterializer({ walPath, stateDir: copyDir, ...frame }).open();
     try {
       expect(reopened.current.recoveredFromCheckpoint).toBe(true);
