@@ -199,19 +199,21 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {
  * per-line row of the pane (no disk index on checked_capture_id). Now:
  *  - the scan is one set operation: the pane's live FKs and its newest
  *    ARCHIVE_KEEP receipts are each read once (uncorrelated IN lists);
- *  - a pane is queued only when a commit adds receipts or seals lines;
+ *  - a pane is queued when a commit adds receipts or seals lines, and a
+ *    queued pane is marked touched by every commit that writes it;
  *  - a queued pane is scanned only if its live receipt count can reach a
- *    chunk (a PK range count), and after a futile scan (receipts still pinned
- *    by per-line rows) only once a seal released lines or ARCHIVE_RETRY_MS
- *    passed;
+ *    chunk (a PK range count); after a futile scan (receipts still pinned by
+ *    per-line rows) only once a seal released lines, or once it was touched
+ *    again and ARCHIVE_RETRY_MS passed; an untouched pane is never rescanned,
+ *    since nothing that decides eligibility changed;
  *  - one commit scans at most ARCHIVE_SCANS_PER_COMMIT panes and writes at
  *    most ARCHIVE_CHUNKS_PER_COMMIT chunks; the rest stays queued, and the
- *    disk worker drains it ARCHIVE_IDLE_MS after its last commit in its own
- *    equally bounded transaction (drainArchives), so work a seal released is
- *    not left live just because ingest went quiet.
- * Archive insert and receipt delete stay inside the commit transaction, and
- * the queue changes only after that transaction committed, so a failed or
- * retried commit leaves both the file and the schedule as they were. The
+ *    disk worker drains whatever is due, at least ARCHIVE_IDLE_MS after its
+ *    last commit, in its own equally bounded transaction (drainArchives), so
+ *    work is not left live just because ingest went quiet.
+ * Archive insert and receipt delete stay inside one transaction (the commit's
+ * or the drain's), and the queue changes only after it committed, so a failed
+ * or retried commit leaves both the file and the schedule as they were. The
  * explicit flush barrier still archives every pane completely (force).
  */
 const ARCHIVE_MIN=128, ARCHIVE_MAX=256, ARCHIVE_KEEP=8, ARCHIVE_RETRY_MS=1000, ARCHIVE_SCANS_PER_COMMIT=4, ARCHIVE_CHUNKS_PER_COMMIT=4, ARCHIVE_IDLE_MS=20;
@@ -219,13 +221,26 @@ export const ARCHIVE_SCAN_SQL=`SELECT c.* FROM na_capture c WHERE c.pane_no=?
       AND c.capture_id NOT IN(SELECT l.checked_capture_id FROM na_line l WHERE l.pane_no=? AND l.checked_capture_id IS NOT NULL)
       AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=? ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT ${ARCHIVE_KEEP})
       ORDER BY c.revision,c.capture_id LIMIT ${ARCHIVE_MAX}`;
-type ArchiveEntry={scannedAt:number;released:boolean};
-type ArchivePlan={marks:Map<number,boolean>;updates:Map<number,ArchiveEntry|null>};
+type ArchiveEntry={scannedAt:number;released:boolean;touched:boolean};
+type ArchivePlan={marks:Map<number,boolean>;touched:ReadonlySet<number>;updates:Map<number,ArchiveEntry|null>};
 const archiveQueues=new WeakMap<Database,Map<number,ArchiveEntry>>();
 let archiveClock=()=>performance.now();
 function archiveQueue(disk:Database):Map<number,ArchiveEntry> {
   let queue=archiveQueues.get(disk);if(!queue){queue=new Map();archiveQueues.set(disk,queue);}
   return queue;
+}
+/** Earliest time a queued pane may be scanned; null = only a new commit can make it due. */
+function archiveDueAt(entry:ArchiveEntry):number|null {
+  if(entry.released || entry.scannedAt===-Infinity)return -Infinity;
+  return entry.touched?entry.scannedAt+ARCHIVE_RETRY_MS:null;
+}
+/** This batch's marks and writes folded into the queue (a copy inside the transaction, the queue after it). */
+function mergeArchiveMarks(queue:Map<number,ArchiveEntry>,marks:ReadonlyMap<number,boolean>,touched:ReadonlySet<number>):void {
+  for(const paneNo of touched){const entry=queue.get(paneNo);if(entry)entry.touched=true;}
+  for(const [paneNo,released] of marks) {
+    const entry=queue.get(paneNo);
+    if(entry){entry.released||=released;entry.touched=true;}else queue.set(paneNo,{scannedAt:-Infinity,released,touched:true});
+  }
 }
 /** Move eligible receipts of one pane into archive chunks; returns the chunks written and whether more remain. */
 function archivePane(disk:Database,paneNo:number,force:boolean,chunkBudget:number):{chunks:number;more:boolean} {
@@ -250,11 +265,12 @@ function liveReceipts(disk:Database,paneNo:number):number {
   return Number((prepared(disk,'SELECT count(*) AS n FROM na_capture WHERE pane_no=?').get(paneNo) as SqlRow).n);
 }
 /**
- * Inside the commit transaction: archive what the schedule says is due. The
- * returned plan is applied to the queue by applyArchivePlan after commit.
+ * Inside a commit or drain transaction: archive what the schedule says is
+ * due. The returned plan is applied to the queue by applyArchivePlan after
+ * the transaction committed.
  */
-function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[],idle=false):ArchivePlan {
-  const plan:ArchivePlan={marks,updates:new Map()};
+function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[],touched:ReadonlySet<number>=new Set()):ArchivePlan {
+  const plan:ArchivePlan={marks,touched,updates:new Map()};
   if(force) {
     // Barrier: every pane, completely; the queue forgets the panes it drained.
     for(const paneNo of panes) {
@@ -263,50 +279,54 @@ function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,p
     }
     return plan;
   }
-  const queue=archiveQueue(disk),now=archiveClock();
-  // The view this commit schedules from: the queue plus this batch's marks.
-  const view=new Map<number,ArchiveEntry>();
-  for(const [paneNo,entry] of queue)view.set(paneNo,{...entry});
-  for(const [paneNo,released] of marks) {
-    const entry=view.get(paneNo);
-    if(entry)entry.released||=released;else view.set(paneNo,{scannedAt:-Infinity,released});
-  }
+  const now=archiveClock(),view=new Map<number,ArchiveEntry>();
+  for(const [paneNo,entry] of archiveQueue(disk))view.set(paneNo,{...entry});
+  mergeArchiveMarks(view,marks,touched);
   let scans=0,chunks=0;
   for(const [paneNo,entry] of view) {
     if(scans>=ARCHIVE_SCANS_PER_COMMIT || chunks>=ARCHIVE_CHUNKS_PER_COMMIT)break;
-    if(!entry.released && now-entry.scannedAt<ARCHIVE_RETRY_MS)continue;
-    // Idle drains only released or never-scanned work; a pinned pane waits for a commit's retry age.
-    if(idle && !entry.released && entry.scannedAt!==-Infinity)continue;
+    const due=archiveDueAt(entry);
+    if(due===null || now<due)continue;
     // Below a chunk plus the kept receipts no scan can archive anything; a
     // later receipt re-queues the pane.
     if(liveReceipts(disk,paneNo)<ARCHIVE_MIN+ARCHIVE_KEEP){plan.updates.set(paneNo,null);continue;}
     scans++;
     const done=archivePane(disk,paneNo,false,ARCHIVE_CHUNKS_PER_COMMIT-chunks);chunks+=done.chunks;
-    plan.updates.set(paneNo,{scannedAt:now,released:done.more});
+    plan.updates.set(paneNo,{scannedAt:now,released:done.more,touched:false});
   }
   return plan;
 }
-/** Queued work an idle drain would take: released by a seal or a capped commit, or never scanned. */
+/** When the idle worker should drain next: the earliest due pane, null if none can become due without a commit. */
+function archiveNextDue(disk:Database):number|null {
+  let next:number|null=null;
+  for(const entry of archiveQueue(disk).values()) {
+    const due=archiveDueAt(entry);
+    if(due!==null && (next===null || due<next))next=due;
+  }
+  return next;
+}
+/** Whether a drain now would find due work. */
 function archiveBacklog(disk:Database):boolean {
-  for(const entry of archiveQueue(disk).values())if(entry.released || entry.scannedAt===-Infinity)return true;
-  return false;
+  const next=archiveNextDue(disk);return next!==null && next<=archiveClock();
 }
 /** One bounded archive transaction outside any ingest commit, under the same writer fence. */
 function drainArchives(disk:Database,fence:number):void {
   let plan:ArchivePlan|null=null;
   disk.transaction(()=>{
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
-    plan=archiveCaptures(disk,new Map(),false,[],true);
+    plan=archiveCaptures(disk,new Map(),false);
   }).immediate();
-  if(plan)applyArchivePlan(disk,plan);
+  const done=plan as ArchivePlan|null;if(!done)return;
+  applyArchivePlan(disk,done);
+  // Drains run between commits (which checkpoint every CHECKPOINT_COMMITS), so
+  // a drain that touched a pane advances the checkpoint itself: otherwise the
+  // WAL keeps every drained chunk until the next busy period.
+  if(done.updates.size)disk.exec('PRAGMA wal_checkpoint(PASSIVE)');
 }
 /** After commit only: a rolled-back transaction must not advance the schedule. */
 function applyArchivePlan(disk:Database,plan:ArchivePlan):void {
   const queue=archiveQueue(disk);
-  for(const [paneNo,released] of plan.marks) {
-    const entry=queue.get(paneNo);
-    if(entry)entry.released||=released;else queue.set(paneNo,{scannedAt:-Infinity,released});
-  }
+  mergeArchiveMarks(queue,plan.marks,plan.touched);
   // The scan already saw this commit's receipts and seals. A scanned pane
   // moves to the back, so a capped commit serves the other panes next.
   for(const [paneNo,update] of plan.updates){queue.delete(paneNo);if(update)queue.set(paneNo,update);}
@@ -330,7 +350,7 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     for(const row of batch.tables.get('na_capture')??[])marks.set(Number(row.pane_no),false);
     for(const paneNo of sealed)marks.set(paneNo,true);
     const archiveStarted=performance.now();
-    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[]);
+    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))));
     archiveMs=performance.now()-archiveStarted;
     before?.();writeMs=performance.now()-started;
   }).immediate();
@@ -358,7 +378,10 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
     catch(error){console.error('[newarch] archive drain failed',String(error));return;}
     scheduleDrain();
   };
-  const scheduleDrain=()=>{if(!drainTimer && archiveBacklog(disk))drainTimer=setTimeout(drain,ARCHIVE_IDLE_MS);};
+  const scheduleDrain=()=>{
+    const next=archiveNextDue(disk);
+    if(!drainTimer && next!==null)drainTimer=setTimeout(drain,Math.max(ARCHIVE_IDLE_MS,next-archiveClock()));
+  };
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
       if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
@@ -1258,7 +1281,7 @@ export function createProjectionStore(options:ProjectionOptions):ProjectionStore
 export { PROJECTION_MIGRATION };
 /** Test seam: the archive scheduler's internals and clock. Not a runtime API. */
 export const projectionArchiveInternals={
-  commitBatch,drainArchives,captureReceipts,archiveStatsOf,archiveQueue,archiveBacklog,ARCHIVE_SCAN_SQL,
+  commitBatch,drainArchives,captureReceipts,archiveStatsOf,archiveQueue,archiveBacklog,archiveNextDue,ARCHIVE_SCAN_SQL,
   limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT,ARCHIVE_IDLE_MS},
   setClock(clock:(()=>number)|null){archiveClock=clock??(()=>performance.now());},
 };
