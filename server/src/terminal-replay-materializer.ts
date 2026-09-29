@@ -2369,7 +2369,7 @@ class ReplayEngine {
     for (const record of records) {
       if (record.kind === "output") {
         const previous = run[run.length - 1];
-        // R2 MUTATION: deliberately omit the ED3 drain boundary.
+        if (previous && erasesScrollback(previous.payload, record.payload)) flushRun();
         run.push(record);
         runBytes += record.payload.byteLength;
         if (runBytes >= COALESCED_OUTPUT_MAX_BYTES) flushRun();
