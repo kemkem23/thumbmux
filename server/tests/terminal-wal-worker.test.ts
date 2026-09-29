@@ -861,6 +861,57 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.last!.cells.rows).toBe(24);
   }, 30_000);
 
+  test.each([0, 3, 500])("M2 releases evicted references immediately across 12,500 appends (cap %i)", (cap) => {
+    // Exercise the retention boundary without a worker or GC timing. The
+    // oracle owns its own references; count only slots owned by the collector.
+    type Tray = { ring: Array<PipeScrollEvent | undefined>; ringStart: number; remember(event: PipeScrollEvent): void };
+    const history: PipeScrollEvent[] = [];
+    let evictions = 0;
+    let maxRetained = 0;
+    let maxDuringEvict = 0;
+    let compactions = 0;
+    const collector = new PipeHistoryCollector({
+      paneKey: { serverIdentity: "m2-reference-census", paneId: "%0", birthGeneration: 1 },
+      sourceEpoch: 1, cols: 80, rows: 24,
+      ...(cap === 500 ? {} : { ringRows: cap }), // Also protect the default 500.
+      ports: { onScroll() {}, onFrame() {}, onFault() {} },
+      onEvict(event) {
+        expect(event).toBe(history[evictions++]);
+        maxDuringEvict = Math.max(maxDuringEvict, tray.ring.filter(Boolean).length);
+        expect(collector.ringSnapshot()).toEqual(history.slice(-cap || history.length));
+      },
+    });
+    const tray = collector as unknown as Tray;
+    const saved: Array<{ snapshot: PipeScrollEvent[]; expected: PipeScrollEvent[] }> = [];
+    for (let i = 0; i < 12_500; i++) {
+      const event: PipeScrollEvent = {
+        paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+        physicalRow: [], softWrap: i % 2 === 0, wrapPad: false, receiveSeq: i + 1,
+      };
+      history.push(event);
+      const start = tray.ringStart;
+      tray.remember(event);
+      if (tray.ringStart < start) compactions++;
+      maxRetained = Math.max(maxRetained, tray.ring.filter(Boolean).length);
+      if (i % 499 === 0 || i === 12_499) {
+        const expected = cap === 0 ? [] : history.slice(-cap);
+        const snapshot = collector.ringSnapshot();
+        expect(snapshot).toEqual(expected);
+        snapshot.forEach((row, index) => expect(row).toBe(expected[index]));
+        saved.push({ snapshot, expected });
+      }
+    }
+    for (const { snapshot, expected } of saved) expect(snapshot).toEqual(expected);
+    expect(evictions).toBe(12_500 - cap);
+    expect(collector.stats().scrolls).toBe(12_500);
+    expect(compactions).toBeGreaterThanOrEqual(3);
+    console.log(`M2-RETENTION ${JSON.stringify({ cap, appends: history.length, evictions, compactions, maxRetained, maxDuringEvict, finalRetained: tray.ring.filter(Boolean).length })}`);
+    expect(maxRetained).toBeLessThanOrEqual(cap);
+    // The callback itself may hold its one evicted argument, but the tray must
+    // already have released it, even if the callback throws or re-enters.
+    expect(maxDuringEvict).toBeLessThanOrEqual(cap);
+  });
+
   test("a 20,000-row burst reaches onScroll in order, each row before the ring evicts it", async () => {
     const pane = await collectPane(80, 24);
     const rows = 20_000;
