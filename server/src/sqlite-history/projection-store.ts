@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION } from './schema';
 import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
 import { BLOCK_COLUMNS, readDiskLines, readProjectionPage, projectionIssue } from './projection-reader';
-import { decodeBlock, decodeCaptureArchive, encodeBlock, encodeCaptureArchive, encodeRow } from './codec';
+import { decodeBlock, decodeCaptureArchive, decodeCaptureReceipts, encodeBlock, encodeCaptureArchive, encodeCaptureReceipts, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
 import type { PaneKey, ProjectionAdmission, ProjectionCalibration, ProjectionCloseReceipt, ProjectionIssueInput, ProjectionEpochTransition, ProjectionFault, ProjectionFrame, ProjectionHealth, ProjectionIssue, ProjectionReceipt, ProjectionRefusal, ProjectionStorageState, ProjectionStorageStatus, ProjectionToken, ProjectionWriterPort, ScrollEvent } from './types';
 
@@ -74,13 +74,11 @@ function admitPath(options: ProjectionOptions): string {
 type Batch={id:string;digest:string;panes:SqlRow[];tables:Map<string,SqlRow[]>;bytes:number;since:number;byPane:Map<string,number>};
 const blockLine=(row:SqlRow)=>BLOCK_COLUMNS.map(column=>row[column]);
 const CAPTURE_COLUMNS=['capture_id','revision','source_epoch','requested_at','completed_at','geometry_generation','first_history_row','history_count','screen_hash','history_hash','observed_fields','compared_rows','corrected_cells','ambiguous_rows','result'] as const;
-const captureValues=(row:SqlRow)=>CAPTURE_COLUMNS.map(column=>column==='screen_hash'||column==='history_hash'
-  ?Buffer.from(row[column] as unknown as Uint8Array).toString('base64'):row[column]);
+const captureValues=(row:SqlRow)=>CAPTURE_COLUMNS.map(column=>row[column]);
 const captureRow=(paneNo:number,values:unknown[]):SqlRow=>{
   if(values.length!==CAPTURE_COLUMNS.length)throw new Error('capture-archive-corrupt');
   const row:SqlRow={pane_no:paneNo};
-  CAPTURE_COLUMNS.forEach((column,index)=>{row[column]=(column==='screen_hash'||column==='history_hash'
-    ?Buffer.from(String(values[index]),'base64'):values[index]) as SqlRow[string];});
+  CAPTURE_COLUMNS.forEach((column,index)=>{row[column]=values[index] as SqlRow[string];});
   return row;
 };
 function captureReceipt(disk:Database,paneNo:number,captureId:string):SqlRow {
@@ -91,7 +89,7 @@ function captureReceipt(disk:Database,paneNo:number,captureId:string):SqlRow {
     if(catalog.length!==Number(block.capture_count))throw new Error('capture-archive-corrupt');
     const ordinal=catalog.findIndex(item=>Array.isArray(item)&&item[0]===captureId);
     if(ordinal<0)continue;
-    const data=decodeCaptureArchive(block.data as unknown as Uint8Array);
+    const data=decodeCaptureReceipts(block.data as unknown as Uint8Array);
     if(data.length!==catalog.length)throw new Error('capture-archive-corrupt');
     const row=captureRow(paneNo,data[ordinal]!);
     if(row.capture_id!==captureId || row.revision!==catalog[ordinal]![1] || row.source_epoch!==catalog[ordinal]![2]
@@ -146,12 +144,12 @@ function archiveCaptures(disk:Database,panes:SqlRow[],force:boolean):void {
   for(const pane of panes)for(;;) {
     const rows=prepared(disk,`SELECT c.* FROM na_capture c WHERE c.pane_no=?
       AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_no=c.pane_no AND l.checked_capture_id=c.capture_id)
-      AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=c.pane_no ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT 64)
+      AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=c.pane_no ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT 8)
       ORDER BY c.revision,c.capture_id LIMIT 256`).all(pane.pane_no) as SqlRow[];
     if(!rows.length || (!force && rows.length<128))break;
     const catalog=rows.map(row=>[row.capture_id,row.revision,row.source_epoch,row.geometry_generation]);
     prepared(disk,'INSERT INTO na_capture_archive (pane_no,first_revision,last_revision,capture_count,catalog,data) VALUES (?,?,?,?,?,?)')
-      .run(pane.pane_no,rows[0]!.revision,rows.at(-1)!.revision,rows.length,encodeCaptureArchive(catalog),encodeCaptureArchive(rows.map(captureValues)));
+      .run(pane.pane_no,rows[0]!.revision,rows.at(-1)!.revision,rows.length,encodeCaptureArchive(catalog),encodeCaptureReceipts(rows.map(captureValues)));
     const remove=prepared(disk,'DELETE FROM na_capture WHERE pane_no=? AND capture_id=?');
     for(const row of rows)remove.run(pane.pane_no,row.capture_id);
     if(rows.length<256)break;

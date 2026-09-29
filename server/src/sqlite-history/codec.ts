@@ -186,19 +186,51 @@ export function decodeBlock(data: Uint8Array): unknown[][] {
 // checks. The hash covers the exact inflated bytes and the length prevents a
 // truncated/oversized inflate from being accepted as another valid corpus.
 export const CAPTURE_ARCHIVE_FORMAT = 1;
-export function encodeCaptureArchive(rows:readonly unknown[][]):Uint8Array {
-  const raw=Buffer.from(JSON.stringify(rows)),body=deflateRawSync(raw),out=Buffer.alloc(37+body.length);
+function packArchive(raw:Buffer):Uint8Array {
+  const body=deflateRawSync(raw),out=Buffer.alloc(37+body.length);
   out[0]=CAPTURE_ARCHIVE_FORMAT;out.writeUInt32BE(raw.length,1);
   createHash('sha256').update(raw).digest().copy(out,5);body.copy(out,37);return out;
 }
-export function decodeCaptureArchive(data:Uint8Array):unknown[][] {
+function unpackArchive(data:Uint8Array):Buffer {
   const input=Buffer.from(data);
   if(input.length<37 || input[0]!==CAPTURE_ARCHIVE_FORMAT)throw new Error('capture-archive-format-unknown');
   const expected=input.readUInt32BE(1),raw=inflateRawSync(input.subarray(37));
   if(raw.length!==expected)throw new Error('capture-archive-size');
   const digest=createHash('sha256').update(raw).digest();
   if(!digest.equals(input.subarray(5,37)))throw new Error('capture-archive-checksum');
+  return raw;
+}
+export function encodeCaptureArchive(rows:readonly unknown[][]):Uint8Array {
+  return packArchive(Buffer.from(JSON.stringify(rows)));
+}
+export function decodeCaptureArchive(data:Uint8Array):unknown[][] {
+  const raw=unpackArchive(data);
   const rows=JSON.parse(raw.toString('utf8'));
   if(!Array.isArray(rows))throw new Error('capture-archive-corrupt');
   return rows;
+}
+/** Receipt metadata stays JSON, but the two 32-byte hashes stay binary. */
+export function encodeCaptureReceipts(rows:readonly unknown[][]):Uint8Array {
+  const metadata=rows.map(row=>{
+    if(row.length!==15)throw new Error('capture-archive-corrupt');
+    for(const at of [8,9])if(!(row[at] instanceof Uint8Array) || row[at].length!==32)throw new Error('capture-archive-hash');
+    return [...row.slice(0,8),...row.slice(10)];
+  });
+  const json=Buffer.from(JSON.stringify(metadata)),raw=Buffer.alloc(4+json.length+rows.length*64);
+  raw.writeUInt32BE(json.length);json.copy(raw,4);
+  rows.forEach((row,index)=>{Buffer.from(row[8] as Uint8Array).copy(raw,4+json.length+index*64);Buffer.from(row[9] as Uint8Array).copy(raw,36+json.length+index*64);});
+  return packArchive(raw);
+}
+export function decodeCaptureReceipts(data:Uint8Array):unknown[][] {
+  const raw=unpackArchive(data);
+  if(raw.length<4)throw new Error('capture-archive-corrupt');
+  const jsonBytes=raw.readUInt32BE(0);
+  if(jsonBytes>raw.length-4)throw new Error('capture-archive-size');
+  const metadata=JSON.parse(raw.subarray(4,4+jsonBytes).toString('utf8'));
+  if(!Array.isArray(metadata) || raw.length!==4+jsonBytes+metadata.length*64)throw new Error('capture-archive-corrupt');
+  return metadata.map((row:unknown,index:number)=>{
+    if(!Array.isArray(row) || row.length!==13)throw new Error('capture-archive-corrupt');
+    const hashes=raw.subarray(4+jsonBytes+index*64,4+jsonBytes+(index+1)*64);
+    return [...row.slice(0,8),hashes.subarray(0,32),hashes.subarray(32),...row.slice(8)];
+  });
 }
