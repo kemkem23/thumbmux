@@ -49,6 +49,10 @@ export type CaptureEvidence =
 export interface CalibrationSnapshot {
   revision: number; sourceEpoch: number; geometryGeneration: number;
   recentHistory: readonly HistoryRow[]; parserFrame: CalibrationFrame;
+  /** Line id of the newest recent row at read time (null: none). When given,
+   * the pre-capture fence never reads `recentHistory`, so a port that copies
+   * its ring lazily copies it once per capture, not per read. */
+  recentLastLineId?: number | null;
 }
 export interface CalibrationCommit { revision: number; durableRevision: number; nextLineId: number }
 export interface CalibrationPorts {
@@ -94,8 +98,8 @@ function samePane(a: PaneKey, b: PaneKey): boolean {
 const TAIL_GAP_SLACK = 256;
 /** `recent` cut at the newest row of the pre-capture snapshot. An empty
  * snapshot, or a fence evicted from the ring, leaves nothing provable. */
-function fencedHistory(recent: readonly HistoryRow[], before: readonly HistoryRow[]): readonly HistoryRow[] {
-  const last = before.at(-1)?.lineId;
+function fencedHistory(recent: readonly HistoryRow[], before: CalibrationSnapshot): readonly HistoryRow[] {
+  const last = before.recentLastLineId !== undefined ? before.recentLastLineId ?? undefined : before.recentHistory.at(-1)?.lineId;
   if (last === undefined) return [];
   for (let i = recent.length - 1; i >= 0; i--) if (recent[i]!.lineId === last) return i === recent.length - 1 ? recent : recent.slice(0, i + 1);
   return [];
@@ -274,7 +278,8 @@ export class HistoryCalibrator {
         && startedGeneration === this.eventGeneration;
       if (!stable) { this.matcher.reset(); this.forceFull = true; this.mode = 'PIPE'; this.latchAt = undefined; return; }
       const matched = historyDue && meta.kind === 'normal';
-      const recent = matched ? fencedHistory(read.recentHistory, fence.recentHistory) : read.recentHistory;
+      // Only a matched history capture reads the ring: once, after the capture.
+      const recent = matched ? fencedHistory(read.recentHistory, fence) : [];
       // The parser comparison sees certified bits only; `capture` keeps all.
       const mask = this.options.certifiedStyleMask;
       const certified = mask === undefined ? capture.history : certifiedRows(capture.history, mask);
