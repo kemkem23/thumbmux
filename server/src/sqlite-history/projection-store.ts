@@ -205,13 +205,16 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {
  *    by per-line rows) only once a seal released lines or ARCHIVE_RETRY_MS
  *    passed;
  *  - one commit scans at most ARCHIVE_SCANS_PER_COMMIT panes and writes at
- *    most ARCHIVE_CHUNKS_PER_COMMIT chunks; the rest stays queued.
+ *    most ARCHIVE_CHUNKS_PER_COMMIT chunks; the rest stays queued, and the
+ *    disk worker drains it ARCHIVE_IDLE_MS after its last commit in its own
+ *    equally bounded transaction (drainArchives), so work a seal released is
+ *    not left live just because ingest went quiet.
  * Archive insert and receipt delete stay inside the commit transaction, and
  * the queue changes only after that transaction committed, so a failed or
  * retried commit leaves both the file and the schedule as they were. The
  * explicit flush barrier still archives every pane completely (force).
  */
-const ARCHIVE_MIN=128, ARCHIVE_MAX=256, ARCHIVE_KEEP=8, ARCHIVE_RETRY_MS=1000, ARCHIVE_SCANS_PER_COMMIT=4, ARCHIVE_CHUNKS_PER_COMMIT=4;
+const ARCHIVE_MIN=128, ARCHIVE_MAX=256, ARCHIVE_KEEP=8, ARCHIVE_RETRY_MS=1000, ARCHIVE_SCANS_PER_COMMIT=4, ARCHIVE_CHUNKS_PER_COMMIT=4, ARCHIVE_IDLE_MS=20;
 export const ARCHIVE_SCAN_SQL=`SELECT c.* FROM na_capture c WHERE c.pane_no=?
       AND c.capture_id NOT IN(SELECT l.checked_capture_id FROM na_line l WHERE l.pane_no=? AND l.checked_capture_id IS NOT NULL)
       AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=? ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT ${ARCHIVE_KEEP})
@@ -250,7 +253,7 @@ function liveReceipts(disk:Database,paneNo:number):number {
  * Inside the commit transaction: archive what the schedule says is due. The
  * returned plan is applied to the queue by applyArchivePlan after commit.
  */
-function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[]):ArchivePlan {
+function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[],idle=false):ArchivePlan {
   const plan:ArchivePlan={marks,updates:new Map()};
   if(force) {
     // Barrier: every pane, completely; the queue forgets the panes it drained.
@@ -272,6 +275,8 @@ function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,p
   for(const [paneNo,entry] of view) {
     if(scans>=ARCHIVE_SCANS_PER_COMMIT || chunks>=ARCHIVE_CHUNKS_PER_COMMIT)break;
     if(!entry.released && now-entry.scannedAt<ARCHIVE_RETRY_MS)continue;
+    // Idle drains only released or never-scanned work; a pinned pane waits for a commit's retry age.
+    if(idle && !entry.released && entry.scannedAt!==-Infinity)continue;
     // Below a chunk plus the kept receipts no scan can archive anything; a
     // later receipt re-queues the pane.
     if(liveReceipts(disk,paneNo)<ARCHIVE_MIN+ARCHIVE_KEEP){plan.updates.set(paneNo,null);continue;}
@@ -280,6 +285,20 @@ function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,p
     plan.updates.set(paneNo,{scannedAt:now,released:done.more});
   }
   return plan;
+}
+/** Queued work an idle drain would take: released by a seal or a capped commit, or never scanned. */
+function archiveBacklog(disk:Database):boolean {
+  for(const entry of archiveQueue(disk).values())if(entry.released || entry.scannedAt===-Infinity)return true;
+  return false;
+}
+/** One bounded archive transaction outside any ingest commit, under the same writer fence. */
+function drainArchives(disk:Database,fence:number):void {
+  let plan:ArchivePlan|null=null;
+  disk.transaction(()=>{
+    if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
+    plan=archiveCaptures(disk,new Map(),false,[],true);
+  }).immediate();
+  if(plan)applyArchivePlan(disk,plan);
 }
 /** After commit only: a rolled-back transaction must not advance the schedule. */
 function applyArchivePlan(disk:Database,plan:ArchivePlan):void {
@@ -330,21 +349,35 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   disk.exec(`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
   let commits=0;
   const stats=archiveStatsOf(disk);
+  let reported={...stats};
+  let drainTimer:ReturnType<typeof setTimeout>|null=null;
+  const drain=()=>{
+    drainTimer=null;
+    try {drainArchives(disk,workerData.fence);}
+    // Compaction only: the receipts stay live and valid; the next commit or flush retries.
+    catch(error){console.error('[newarch] archive drain failed',String(error));return;}
+    scheduleDrain();
+  };
+  const scheduleDrain=()=>{if(!drainTimer && archiveBacklog(disk))drainTimer=setTimeout(drain,ARCHIVE_IDLE_MS);};
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
+      if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
       try {closePrepared(disk);}catch(error){console.error('[newarch] disk worker close failed',String(error));}
       // Bun keeps a worker alive while a parentPort 'message' listener is attached;
       // parentPort.close() alone does not release it, so the thread never exits.
       parentPort!.off('message',onMessage);parentPort!.close();return;
     }
     try {
-      const before={...stats};
+      if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
       const timing=commitBatch(disk,workerData.fence,batch,undefined,++commits%CHECKPOINT_COMMITS===0);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
-      // This commit's archive work, as deltas (slots 4-9; the error text shares them only on failure).
+      // Archive work since the last report (this commit plus idle drains before it), as deltas
+      // (slots 4-9; the error text shares them only on failure).
       Atomics.store(signal,4,Math.round(timing.archiveMs*1000));
-      WORKER_ARCHIVE_SLOTS.forEach((field,i)=>Atomics.store(signal,5+i,field==='scanMs'?Math.round((stats.scanMs-before.scanMs)*1000):stats[field]-before[field]));
+      WORKER_ARCHIVE_SLOTS.forEach((field,i)=>Atomics.store(signal,5+i,field==='scanMs'?Math.round((stats.scanMs-reported.scanMs)*1000):stats[field]-reported[field]));
+      reported={...stats};
       Atomics.store(signal,0,1);
+      scheduleDrain();
     }
     catch(error) {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,errors.length);
@@ -1225,7 +1258,7 @@ export function createProjectionStore(options:ProjectionOptions):ProjectionStore
 export { PROJECTION_MIGRATION };
 /** Test seam: the archive scheduler's internals and clock. Not a runtime API. */
 export const projectionArchiveInternals={
-  commitBatch,captureReceipts,archiveStatsOf,archiveQueue,ARCHIVE_SCAN_SQL,
-  limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT},
+  commitBatch,drainArchives,captureReceipts,archiveStatsOf,archiveQueue,archiveBacklog,ARCHIVE_SCAN_SQL,
+  limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT,ARCHIVE_IDLE_MS},
   setClock(clock:(()=>number)|null){archiveClock=clock??(()=>performance.now());},
 };
