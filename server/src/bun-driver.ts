@@ -124,7 +124,7 @@ export function createActivityPoll<T>(empty: () => T, sample: (signal: AbortSign
       ageMs: completedAt === null ? null : Math.max(0, performance.now() - completedAt) }),
     settled: () => flight?.done ?? Promise.resolve(),
     refresh() {
-      if (stopped) return;
+      if (stopped || flight) return;
       const controller = new AbortController();
       let release!: () => void;
       const done = new Promise<void>((resolve) => { release = resolve; });
@@ -133,12 +133,10 @@ export function createActivityPoll<T>(empty: () => T, sample: (signal: AbortSign
       void (async () => {
         try {
           const value = await sample(controller.signal);
-          if (flight !== current) return;
           latest = value;
           completedAt = performance.now();
           error = null;
         } catch (cause) {
-          if (flight !== current) return;
           error = cause instanceof Error ? cause.message : String(cause);
         } finally {
           if (flight === current) flight = null;
