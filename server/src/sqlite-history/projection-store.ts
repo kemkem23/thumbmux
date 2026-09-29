@@ -937,8 +937,8 @@ export class ProjectionStore implements ProjectionWriterPort {
         const panes=prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[];
         sealBlocks(this.disk,panes,true);archiveCaptures(this.disk,panes,true);
       }).immediate();
-      this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
       this.disk.exec('PRAGMA incremental_vacuum');
+      this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     }catch(error){this.handleFlushFailure(error);throw error;}
   }
   /**
