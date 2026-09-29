@@ -103,14 +103,111 @@ function parsePaneStatusLine(line: string): {
   };
 }
 
-export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver {
-  // Refreshed by getSessionActivity(), which the mux already calls once per
-  // poll. listSessions() reuses this sample so adding activityAt never adds a
-  // second list-windows invocation to a poll.
-  let latestActivity = new Map<string, number>();
+/** Latest completed observation, driven by the caller's existing poll cadence.
+ * Cancellation releases waiters immediately and fences completions from an old
+ * lifecycle even when the underlying runner ignores AbortSignal. */
+export function createActivityPoll<T>(empty: () => T, sample: (signal: AbortSignal) => Promise<T>) {
+  let latest = empty();
+  let completedAt: number | null = null;
+  let error: string | null = null;
+  let stopped = false;
+  let flight: { controller: AbortController; done: Promise<void>; release: () => void } | null = null;
+  const cancel = () => {
+    const previous = flight;
+    flight = null;
+    previous?.controller.abort();
+    previous?.release();
+  };
+  return {
+    peek: () => latest,
+    status: () => ({ pending: flight !== null, stopped, error,
+      ageMs: completedAt === null ? null : Math.max(0, performance.now() - completedAt) }),
+    settled: () => flight?.done ?? Promise.resolve(),
+    refresh() {
+      if (stopped || flight) return;
+      const controller = new AbortController();
+      let release!: () => void;
+      const done = new Promise<void>((resolve) => { release = resolve; });
+      const current = { controller, done, release };
+      flight = current;
+      void (async () => {
+        try {
+          const value = await sample(controller.signal);
+          if (flight !== current) return;
+          latest = value;
+          completedAt = performance.now();
+          error = null;
+        } catch (cause) {
+          if (flight !== current) return;
+          error = cause instanceof Error ? cause.message : String(cause);
+        } finally {
+          if (flight === current) flight = null;
+          release();
+        }
+      })();
+    },
+    cancel,
+    invalidate() { cancel(); latest = empty(); completedAt = null; error = null; },
+    stop() { stopped = true; cancel(); },
+    resume() { stopped = false; },
+  };
+}
+
+/** Drain both pipes concurrently; abort/timeout kill and release the poll even
+ * if a child never closes a pipe. Same 5 s budget as host pane captures. */
+export async function readActivityProcess(
+  process: { stdout: ReadableStream; stderr: ReadableStream; exited: Promise<number>; kill(signal?: number): unknown },
+  signal: AbortSignal,
+): Promise<string> {
+  let rejectAbort!: (cause: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const abort = () => {
+    try { process.kill(9); } catch { /* already exited */ }
+    rejectAbort(new Error("tmux activity poll cancelled"));
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => {
+    try { process.kill(9); } catch { /* already exited */ }
+    rejectAbort(new Error("tmux activity poll timed out after 5000ms"));
+  }, 5_000);
+  timer.unref?.();
+  try {
+    if (signal.aborted) abort();
+    const [out, err, code] = await Promise.race([
+      Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited]),
+      aborted,
+    ]);
+    if (code !== 0) throw new Error(err.trim() || `tmux activity poll failed (exit ${code})`);
+    return out;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+export type BunTmuxDriver = TmuxDriver & {
+  activityPoll: ReturnType<typeof createActivityPoll<Map<string, number>>>;
+};
+
+export function createBunTmuxDriver(options: TmuxTargetOptions = {}): BunTmuxDriver {
+  // Window activity advances for detached panes; session_activity does not.
+  const activityPoll = createActivityPoll(() => new Map<string, number>(), async (signal) => {
+    const out = await readActivityProcess(Bun.spawn([
+      "tmux", "list-windows", "-a", "-F", "#{session_name}|#{window_activity}",
+    ], { stdout: "pipe", stderr: "pipe" }), signal);
+    const map = new Map<string, number>();
+    for (const line of out.trim().split("\n")) {
+      const fields = line.split("|");
+      const at = Number(fields.pop()) || 0;
+      const name = fields.join("|");
+      if (name && at > (map.get(name) ?? 0)) map.set(name, at);
+    }
+    return map;
+  });
   const target = targetResolvers(options);
 
   return {
+    activityPoll,
     listSessions() {
       try {
         return run(["list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}"])
@@ -121,7 +218,7 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
               created,
               windows: Number(windows) || 1,
               attached: attached === "1",
-              activityAt: latestActivity.get(name!) ?? 0,
+              activityAt: activityPoll.peek().get(name!) ?? 0,
             };
           });
       } catch {
@@ -149,21 +246,10 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): TmuxDriver
       sendLargeInput(target.pane(session), bytes);
     },
     getSessionActivity() {
-      // window_activity, NOT session_activity: the session timestamp freezes
-      // for detached sessions (nobody attached = no client activity), so a
-      // pane writing output would never re-trigger the poll gate and hub
-      // thumbnails froze (fleet finding). Window activity bumps on output.
-      const map = new Map<string, number>();
-      try {
-        for (const line of run(["list-windows", "-a", "-F", "#{session_name}|#{window_activity}"]).trim().split("\n")) {
-          const [name, at] = line.split("|");
-          if (!name) continue;
-          const t = Number(at) || 0;
-          if (t > (map.get(name) ?? 0)) map.set(name, t);
-        }
-      } catch { /* no server */ }
-      latestActivity = map;
-      return map;
+      activityPoll.refresh();
+      // A failed observation is unknown to the capture gate, while the UI
+      // retains the last successful sample with explicit age/error diagnostics.
+      return activityPoll.status().error !== null ? new Map() : new Map(activityPoll.peek());
     },
     getHistoryLimit(session) {
       // `history_limit` is a PANE property, frozen when the pane is born from

@@ -110,3 +110,28 @@ describe("Bun tmux driver target resolution", () => {
     sessions.delete(sibling);
   });
 });
+
+
+test("H2 stopping an activity poll kills and reaps a genuinely slow child", async () => {
+  const originalSpawn = Bun.spawn;
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  Bun.spawn = ((command: string[], options: any) => {
+    if (command[1] !== "list-windows") throw new Error("unexpected activity command");
+    child = originalSpawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], options);
+    return child;
+  }) as typeof Bun.spawn;
+  const driver = createBunTmuxDriver();
+  try {
+    driver.getSessionActivity();
+    expect(child).toBeDefined();
+    const waiting = driver.activityPoll.settled();
+    driver.activityPoll.stop();
+    await waiting;
+    expect(driver.activityPoll.status().pending).toBe(false);
+    expect(await child!.exited).not.toBe(0);
+    expect(child!.signalCode).toBe("SIGKILL");
+  } finally {
+    driver.activityPoll.stop();
+    Bun.spawn = originalSpawn;
+  }
+});

@@ -34,6 +34,7 @@ class FakeWS {
 describe("default Bun driver session-list activity", () => {
   test("reuses the poll activity sample in __sessions without another activity call", async () => {
     const originalSpawnSync = Bun.spawnSync;
+    const originalSpawn = Bun.spawn;
     const tmuxCalls: string[][] = [];
     Bun.spawnSync = ((command: string[]) => {
       tmuxCalls.push(command);
@@ -50,6 +51,11 @@ describe("default Bun driver session-list activity", () => {
       throw new Error(`unexpected tmux call: ${command.join(" ")}`);
     }) as typeof Bun.spawnSync;
 
+    Bun.spawn = ((command: string[]) => {
+      const result = Bun.spawnSync(command);
+      return { stdout: new Blob([result.stdout.toString()]).stream(), stderr: new Blob([]).stream(),
+        exited: Promise.resolve(result.exitCode), kill() {} };
+    }) as any;
     const driver = createBunTmuxDriver();
     const getSessionActivity = driver.getSessionActivity.bind(driver);
     let activityMethodCalls = 0;
@@ -70,10 +76,17 @@ describe("default Bun driver session-list activity", () => {
     try {
       mux.subscribeSessions(ws);
       await (mux as any).poll();
+      await driver.activityPoll.settled();
+      sampledActivity = driver.activityPoll.peek();
+      mux.broadcastSessionList();
 
       expect(activityMethodCalls).toBe(1);
       expect(tmuxCalls.filter((call) => call[1] === "list-windows")).toHaveLength(1);
 
+      const count = ws.sessionListFrames().length;
+      await Bun.sleep(0);
+      mux.broadcastSessionList();
+      expect(ws.sessionListFrames()).toHaveLength(count); // age diagnostics must not break dedupe
       const frame = ws.sessionListFrames().at(-1)!;
       const items = JSON.parse(frame.data) as Array<{ name: string; activityAt?: unknown }>;
       expect(items).toHaveLength(sampledActivity.size);
@@ -82,7 +95,9 @@ describe("default Bun driver session-list activity", () => {
         expect(item.activityAt).toBe(sampledActivity.get(item.name));
       }
     } finally {
+      driver.activityPoll.stop();
       mux.stop();
+      Bun.spawn = originalSpawn;
       Bun.spawnSync = originalSpawnSync;
     }
   });
@@ -103,6 +118,8 @@ test("H2 slow activity poll leaves frame tasks runnable and coalesces ticks", as
   }) as any;
   const driver = createBunTmuxDriver() as any;
   const mux = new TmuxWsMux({ driver });
+  // Isolate the per-tick activity wiring from the separate inventory provider.
+  mux.setSessionListProvider(() => []);
   try {
     await (mux as any).poll();
     let frames = 0;
@@ -151,7 +168,7 @@ test("H2 cancel fences out-of-order completion, failure preserves last success, 
     pending[0]!.finish(0);
     await Bun.sleep(0);
     expect([...poll.peek()]).toEqual([["new", 2]]);
-    driver.getSessionActivity();
+    expect([...driver.getSessionActivity()]).toEqual([["new", 2]]);
     pending[2]!.finish(1);
     await poll.settled();
     expect([...poll.peek()]).toEqual([["new", 2]]);
@@ -161,10 +178,74 @@ test("H2 cancel fences out-of-order completion, failure preserves last success, 
     poll.stop();
     await stopped;
     expect(pending[3]!.killed).toBe(true);
+    pending[3]!.finish(0);
+    await Bun.sleep(0);
+    expect([...poll.peek()]).toEqual([["new", 2]]);
     driver.getSessionActivity();
     expect(pending).toHaveLength(4);
   } finally {
     driver.activityPoll?.stop();
+    Bun.spawn = originalSpawn;
+  }
+});
+
+
+test("H2 stale success and rejection cannot cross an invalidated generation", async () => {
+  const { createActivityPoll } = await import("../src/bun-driver");
+  const pending: Array<{ resolve: (value: string) => void; reject: (cause: Error) => void }> = [];
+  const poll = createActivityPoll(() => "", () => new Promise<string>((resolve, reject) => {
+    pending.push({ resolve, reject }); // deliberately ignores abort
+  }));
+  poll.refresh();
+  const first = poll.settled();
+  poll.invalidate();
+  await first;
+  poll.refresh();
+  pending[1]!.resolve("renamed");
+  await poll.settled();
+  pending[0]!.resolve("old-name");
+  await Bun.sleep(0);
+  expect(poll.peek()).toBe("renamed");
+  poll.refresh();
+  poll.invalidate();
+  poll.refresh();
+  pending[2]!.reject(new Error("old failure"));
+  await Bun.sleep(0);
+  expect(poll.status().pending).toBe(true);
+  expect(poll.status().error).toBeNull();
+  pending[3]!.resolve("replacement");
+  await poll.settled();
+  expect(poll.peek()).toBe("replacement");
+  poll.stop();
+});
+
+
+test("H2 mux publishes a frame while its tmux activity child is still pending", async () => {
+  const originalSpawn = Bun.spawn;
+  let calls = 0;
+  Bun.spawn = (() => {
+    calls++;
+    return { stdout: new Blob(["alpha|10"]).stream(), stderr: new Blob([]).stream(),
+      exited: new Promise<number>(() => {}), kill() {} };
+  }) as any;
+  const driver = createBunTmuxDriver();
+  driver.getHistoryLimit = () => 2000;
+  driver.captureWithCursor = async () => ({ content: "H2-FRAME\n", cursor: null, trailingBlanks: 0 });
+  const mux = new TmuxWsMux({ driver, profile: () => ({ resize: false, archive: false, currentPaneOnly: true }) });
+  const ws = new FakeWS();
+  mux.setSessionListProvider(() => []);
+  try {
+    driver.getSessionActivity();
+    mux.subscribe("alpha", ws);
+    await (mux as any).poll();
+    expect(driver.activityPoll.status().pending).toBe(true);
+    const frames = ws.sent.map((value) => JSON.parse(value)).filter((frame) => frame.type === "output");
+    expect(frames.some((frame) => frame.data.includes("H2-FRAME"))).toBe(true);
+    expect(calls).toBe(1);
+    console.log(`H2_PUBLISH framesWhilePending=${frames.length} activityChildren=${calls}`);
+  } finally {
+    mux.stop();
+    driver.activityPoll.stop();
     Bun.spawn = originalSpawn;
   }
 });
