@@ -366,7 +366,14 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     // round-trips per record to re-verify its checkpoint, so open() exceeded
     // the worker's 600 s request timeout and the lane never came back.
     const records = 600;
+    const fixtureStart = performance.now();
     const produced = produceSmallRecordLane(records);
+    console.log("R2_REFERENCE_FIXTURE", JSON.stringify({
+      fixtureMs: performance.now() - fixtureStart,
+      wal: readFileSync(walPath).toString("base64"),
+      history: readFileSync(produced.historyPath).toString("base64"),
+      checkpoint: JSON.parse(readFileSync(produced.checkpointPath, "utf8")),
+    }));
     const committedHistory = readFileSync(produced.historyPath);
     // Rows scrolled before the redraw were drained per record, so they are
     // committed history that recovery has to reproduce, not lose to ED3.
