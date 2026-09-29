@@ -1497,33 +1497,31 @@ test('D2: a pane whose receipts are still pinned is not rescanned every commit; 
  }finally{D2.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
 });
 
-test('D2: one commit writes a bounded number of archive chunks; the queued rest drains over later commits without starving a pane',async()=>{
- const f=await d2File(6);D2.setClock(()=>5e6);
+test('D2: one commit writes a bounded number of archive chunks; the worker drains the queued rest in bounded idle transactions without starving a pane',async()=>{
+ const f=await d2File(6);let now=5e6;D2.setClock(()=>now);
  try {
-  const stats=D2.archiveStatsOf(f.disk),nos=f.panes.map(p=>p.pane_no);
+  const stats=D2.archiveStatsOf(f.disk),nos=f.panes.map(p=>p.pane_no),live=(no:number)=>d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no);
   for(const no of nos)d2Receipts(f,no,600);
-  const perCommit:number[]=[];
-  const commit=(first:boolean)=>{
-   const before=stats.chunks;
-   D2.commitBatch(f.disk,f.fence,d2Batch(f,nos.map(no=>({pane:no,build:rev=>first?{captures:[d2Capture(no,`new-${no}`,rev)]}:{}}))));
-   perCommit.push(stats.chunks-before);
-  };
-  commit(true);
-  for(let i=0;i<8 && nos.some(no=>d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no)>8);i++)commit(false);
-  // 601 receipts per pane, 8 kept: 256+256+81 per pane = 18 chunks, at most 4 per commit.
-  expect(perCommit.every(n=>n<=D2.limits.ARCHIVE_CHUNKS_PER_COMMIT)).toBe(true);
-  expect(perCommit.reduce((a,b)=>a+b,0)).toBe(18);
-  expect(perCommit.length).toBeLessThanOrEqual(6);
+  const commit=(first:boolean)=>D2.commitBatch(f.disk,f.fence,d2Batch(f,nos.map(no=>({pane:no,build:rev=>first?{captures:[d2Capture(no,`new-${no}`,rev)]}:{}}))));
+  let chunks=stats.chunks;const steps:number[]=[];const step=(run:()=>void)=>{run();steps.push(stats.chunks-chunks);chunks=stats.chunks;};
+  step(()=>commit(true));
+  expect(D2.archiveBacklog(f.disk)).toBe(true);
+  expect(()=>D2.drainArchives(f.disk,f.fence+1)).toThrow('stale-writer');
+  for(let i=0;i<10 && D2.archiveBacklog(f.disk);i++)step(()=>D2.drainArchives(f.disk,f.fence));
+  // 601 receipts per pane, 8 kept: two full chunks each; the last 81 stay live (below a chunk, not forced).
+  expect(steps).toEqual([4,4,4]);
   for(const no of nos) {
-   expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no)).toBe(8);
-   const ids=(f.disk.query('SELECT capture_id FROM na_capture WHERE pane_no=?').all(no) as any[]).map(r=>r.capture_id);
+   expect(live(no)).toBe(89);
    const all=[...Array.from({length:600},(_,i)=>`u${no}-${String(i+1).padStart(5,'0')}`),`new-${no}`];
    expect(D2.captureReceipts(f.disk,no,all).size).toBe(601);
-   expect(ids).toContain(`new-${no}`);
   }
+  // Futile remainders are not idle work; after the retry age a commit finds them below a chunk and forgets them.
+  expect(D2.archiveBacklog(f.disk)).toBe(false);expect(D2.archiveQueue(f.disk).size).toBe(6);
+  now+=D2.limits.ARCHIVE_RETRY_MS;step(()=>commit(false));
   expect(D2.archiveQueue(f.disk).size).toBe(0);
+  expect(steps.at(-1)).toBe(0);
   d2Clean(f.disk);
-  console.log('D2_BOUNDED',JSON.stringify({perCommit}));
+  console.log('D2_BOUNDED',JSON.stringify({steps}));
  }finally{D2.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
 });
 
@@ -1606,6 +1604,8 @@ test('D2: capture-heavy async ingest scans archives on a small fraction of commi
   }
   const settle=Date.now();while(s.health().pendingBytes>0 && Date.now()-settle<10000)await Bun.sleep(10);
   expect(s.health().pendingBytes).toBe(0);
+  // Live = the store idle for 0.5 s after its last commit, without the flush barrier.
+  await Bun.sleep(500);
   const folder=join(dir,'newarch-v5'),size=()=>readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
   const live=size()/raw;
   s.flush();const drained=size()/raw;

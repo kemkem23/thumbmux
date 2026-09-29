@@ -170,6 +170,10 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
     { name: 'queue-before-commit', pattern: 'D2:', file: store,
       from: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  if(plan)applyArchivePlan(disk,plan);',
       to: '    applyArchivePlan(disk,plan!);before?.();writeMs=performance.now()-started;\n  }).immediate();' },
+    // Work a capped commit left queued waits for the next commit, however long ingest stays quiet.
+    { name: 'no-idle-drain', pattern: 'D2:', file: store,
+      from: '  const scheduleDrain=()=>{if(!drainTimer && archiveBacklog(disk))drainTimer=setTimeout(drain,ARCHIVE_IDLE_MS);};',
+      to: '  const scheduleDrain=()=>{};' },
     // Boot walks archives with their data blobs again.
     { name: 'boot-reads-every-data-blob', pattern: 'D2:', file: store,
       from: "'SELECT archive_no,catalog,capture_count FROM na_capture_archive WHERE pane_no=? AND archive_no<? ORDER BY archive_no DESC LIMIT 32'",
