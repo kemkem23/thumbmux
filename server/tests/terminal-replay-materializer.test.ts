@@ -353,10 +353,23 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     }
     writer.close();
 
-    const producer = new TerminalReplayMaterializer({ walPath, stateDir }).open();
+    const fixtureStart = performance.now();
+    const counter = join(root, "producer-count");
+    const wrapper = join(root, "producer-counting.sh");
+    const realTmux = Bun.which("tmux");
+    if (!realTmux) throw new Error("tmux is required");
+    writeFileSync(wrapper, `#!/bin/sh\necho x >> '${counter}'\nexec '${realTmux}' "$@"\n`, { mode: 0o700 });
+    const producer = new TerminalReplayMaterializer({ walPath, stateDir, tmuxCommand: wrapper }).open();
     let produced = producer.current;
     while (produced.hasMoreWal) produced = producer.refresh();
     producer.close();
+    console.log("R2_REFERENCE_FIXTURE", JSON.stringify({
+      records, fixtureMs: performance.now() - fixtureStart,
+      fixtureCalls: readFileSync(counter, "utf8").split("\n").filter(Boolean).length,
+      wal: readFileSync(walPath).toString("base64"),
+      history: readFileSync(produced.historyPath).toString("base64"),
+      checkpoint: JSON.parse(readFileSync(produced.checkpointPath, "utf8")),
+    }));
     expect(produced.sequence).toBe(BigInt(records + 2)); // start + resize + outputs
     return produced;
   }
@@ -366,14 +379,7 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     // round-trips per record to re-verify its checkpoint, so open() exceeded
     // the worker's 600 s request timeout and the lane never came back.
     const records = 600;
-    const fixtureStart = performance.now();
     const produced = produceSmallRecordLane(records);
-    console.log("R2_REFERENCE_FIXTURE", JSON.stringify({
-      fixtureMs: performance.now() - fixtureStart,
-      wal: readFileSync(walPath).toString("base64"),
-      history: readFileSync(produced.historyPath).toString("base64"),
-      checkpoint: JSON.parse(readFileSync(produced.checkpointPath, "utf8")),
-    }));
     const committedHistory = readFileSync(produced.historyPath);
     // Rows scrolled before the redraw were drained per record, so they are
     // committed history that recovery has to reproduce, not lose to ED3.
