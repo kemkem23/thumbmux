@@ -34,6 +34,7 @@ class FakeWS {
 describe("default Bun driver session-list activity", () => {
   test("reuses the poll activity sample in __sessions without another activity call", async () => {
     const originalSpawnSync = Bun.spawnSync;
+    const originalSpawn = Bun.spawn;
     const tmuxCalls: string[][] = [];
     Bun.spawnSync = ((command: string[]) => {
       tmuxCalls.push(command);
@@ -50,6 +51,11 @@ describe("default Bun driver session-list activity", () => {
       throw new Error(`unexpected tmux call: ${command.join(" ")}`);
     }) as typeof Bun.spawnSync;
 
+    Bun.spawn = ((command: string[]) => {
+      const result = Bun.spawnSync(command);
+      return { stdout: new Blob([result.stdout.toString()]).stream(), stderr: new Blob([]).stream(),
+        exited: Promise.resolve(result.exitCode), kill() {} };
+    }) as any;
     const driver = createBunTmuxDriver();
     const getSessionActivity = driver.getSessionActivity.bind(driver);
     let activityMethodCalls = 0;
@@ -70,10 +76,17 @@ describe("default Bun driver session-list activity", () => {
     try {
       mux.subscribeSessions(ws);
       await (mux as any).poll();
+      await driver.activityPoll.settled();
+      sampledActivity = driver.activityPoll.peek();
+      mux.broadcastSessionList();
 
       expect(activityMethodCalls).toBe(1);
       expect(tmuxCalls.filter((call) => call[1] === "list-windows")).toHaveLength(1);
 
+      const count = ws.sessionListFrames().length;
+      await Bun.sleep(0);
+      mux.broadcastSessionList();
+      expect(ws.sessionListFrames()).toHaveLength(count); // age diagnostics must not break dedupe
       const frame = ws.sessionListFrames().at(-1)!;
       const items = JSON.parse(frame.data) as Array<{ name: string; activityAt?: unknown }>;
       expect(items).toHaveLength(sampledActivity.size);
@@ -82,8 +95,179 @@ describe("default Bun driver session-list activity", () => {
         expect(item.activityAt).toBe(sampledActivity.get(item.name));
       }
     } finally {
+      driver.activityPoll.stop();
       mux.stop();
+      Bun.spawn = originalSpawn;
       Bun.spawnSync = originalSpawnSync;
     }
   });
+});
+
+// Deferred tmux completion: no real subprocess or wall-clock sleep is needed.
+test("H2 slow activity poll leaves frame tasks runnable and coalesces ticks", async () => {
+  const originalSync = Bun.spawnSync;
+  const originalSpawn = Bun.spawn;
+  let finish!: (code: number) => void;
+  let calls = 0;
+  let syncCalls = 0;
+  Bun.spawnSync = (() => { syncCalls++; return successfulProcess("alpha|10\n"); }) as any;
+  Bun.spawn = (() => {
+    calls++;
+    return { stdout: new Blob(["alpha|10\n"]).stream(), stderr: new Blob([]).stream(),
+      exited: new Promise<number>((resolve) => { finish = resolve; }), kill() {} };
+  }) as any;
+  const driver = createBunTmuxDriver() as any;
+  const mux = new TmuxWsMux({ driver });
+  // Isolate the per-tick activity wiring from the separate inventory provider.
+  mux.setSessionListProvider(() => []);
+  try {
+    await (mux as any).poll();
+    let frames = 0;
+    await new Promise<void>((resolve) => setTimeout(() => { frames++; resolve(); }, 0));
+    for (let i = 0; i < 20; i++) await (mux as any).poll();
+    console.log(`H2_FRAME sync=${syncCalls} async=${calls} framesBeforeCompletion=${frames}`);
+    expect(syncCalls).toBe(0);
+    expect(calls).toBe(1);
+    expect(frames).toBe(1);
+    expect(driver.activityPoll.status().pending).toBe(true);
+    finish(0);
+    await driver.activityPoll.settled();
+    expect(driver.activityPoll.peek().get("alpha")).toBe(10);
+    expect(driver.activityPoll.status().ageMs).toBeGreaterThanOrEqual(0);
+  } finally {
+    driver.activityPoll?.stop();
+    mux.stop();
+    Bun.spawnSync = originalSync;
+    Bun.spawn = originalSpawn;
+  }
+});
+
+test("H2 cancel fences out-of-order completion, failure preserves last success, stop settles", async () => {
+  const originalSpawn = Bun.spawn;
+  const pending: Array<{ finish: (code: number) => void; killed: boolean }> = [];
+  Bun.spawn = (() => {
+    const entry = { finish: (_code: number) => {}, killed: false };
+    pending.push(entry);
+    return { stdout: new Blob([`${pending.length === 1 ? "old" : "new"}|${pending.length}\n`]).stream(),
+      stderr: new Blob(["sample failed"]).stream(),
+      exited: new Promise<number>((resolve) => { entry.finish = resolve; }),
+      kill() { entry.killed = true; } };
+  }) as any;
+  const driver = createBunTmuxDriver() as any;
+  try {
+    const poll = driver.activityPoll;
+    expect(poll).toBeDefined();
+    driver.getSessionActivity();
+    const cancelled = poll.settled();
+    poll.cancel();
+    await cancelled;
+    expect(pending[0]!.killed).toBe(true);
+    driver.getSessionActivity();
+    pending[1]!.finish(0);
+    await poll.settled();
+    pending[0]!.finish(0);
+    await Bun.sleep(0);
+    expect([...poll.peek()]).toEqual([["new", 2]]);
+    expect([...driver.getSessionActivity()]).toEqual([["new", 2]]);
+    pending[2]!.finish(1);
+    await poll.settled();
+    expect([...poll.peek()]).toEqual([["new", 2]]);
+    expect(poll.status().error).toContain("sample failed");
+    expect(driver.getSessionActivity().size).toBe(0); // unknown forces safe capture
+    const stopped = poll.settled();
+    poll.stop();
+    await stopped;
+    expect(pending[3]!.killed).toBe(true);
+    pending[3]!.finish(0);
+    await Bun.sleep(0);
+    expect([...poll.peek()]).toEqual([["new", 2]]);
+    driver.getSessionActivity();
+    expect(pending).toHaveLength(4);
+  } finally {
+    driver.activityPoll?.stop();
+    Bun.spawn = originalSpawn;
+  }
+});
+
+
+test("H2 stale success and rejection cannot cross an invalidated generation", async () => {
+  const { createActivityPoll } = await import("../src/bun-driver");
+  const pending: Array<{ resolve: (value: string) => void; reject: (cause: Error) => void }> = [];
+  const poll = createActivityPoll(() => "", () => new Promise<string>((resolve, reject) => {
+    pending.push({ resolve, reject }); // deliberately ignores abort
+  }));
+  poll.refresh();
+  const first = poll.settled();
+  poll.invalidate();
+  await first;
+  poll.refresh();
+  pending[1]!.resolve("renamed");
+  await poll.settled();
+  pending[0]!.resolve("old-name");
+  await Bun.sleep(0);
+  expect(poll.peek()).toBe("renamed");
+  poll.refresh();
+  poll.invalidate();
+  poll.refresh();
+  pending[2]!.reject(new Error("old failure"));
+  await Bun.sleep(0);
+  expect(poll.status().pending).toBe(true);
+  expect(poll.status().error).toBeNull();
+  pending[3]!.resolve("replacement");
+  await poll.settled();
+  expect(poll.peek()).toBe("replacement");
+  poll.stop();
+});
+
+
+test("H2 mux publishes a frame while its tmux activity child is still pending", async () => {
+  const originalSpawn = Bun.spawn;
+  let calls = 0;
+  Bun.spawn = (() => {
+    calls++;
+    return { stdout: new Blob(["alpha|10"]).stream(), stderr: new Blob([]).stream(),
+      exited: new Promise<number>(() => {}), kill() {} };
+  }) as any;
+  const driver = createBunTmuxDriver();
+  driver.getHistoryLimit = () => 2000;
+  driver.captureWithCursor = async () => ({ content: "H2-FRAME\n", cursor: null, trailingBlanks: 0 });
+  const mux = new TmuxWsMux({ driver, profile: () => ({ resize: false, archive: false, currentPaneOnly: true }) });
+  const ws = new FakeWS();
+  mux.setSessionListProvider(() => []);
+  try {
+    driver.getSessionActivity();
+    mux.subscribe("alpha", ws);
+    await (mux as any).poll();
+    expect(driver.activityPoll.status().pending).toBe(true);
+    const frames = ws.sent.map((value) => JSON.parse(value)).filter((frame) => frame.type === "output");
+    expect(frames.some((frame) => frame.data.includes("H2-FRAME"))).toBe(true);
+    expect(calls).toBe(1);
+    console.log(`H2_PUBLISH framesWhilePending=${frames.length} activityChildren=${calls}`);
+  } finally {
+    mux.stop();
+    driver.activityPoll.stop();
+    Bun.spawn = originalSpawn;
+  }
+});
+
+
+test("H2 a failed pipe read kills the child before releasing the activity slot", async () => {
+  const originalSpawn = Bun.spawn;
+  let killed = false;
+  Bun.spawn = (() => ({
+    stdout: new ReadableStream({ start(controller) { controller.error(new Error("broken output pipe")); } }),
+    stderr: new Blob([]).stream(), exited: new Promise<number>(() => {}),
+    kill() { killed = true; },
+  })) as any;
+  const driver = createBunTmuxDriver();
+  try {
+    driver.getSessionActivity();
+    await driver.activityPoll.settled();
+    expect(killed).toBe(true);
+    expect(driver.activityPoll.status().pending).toBe(false);
+    expect(driver.activityPoll.status().error).toContain("broken output pipe");
+  } finally {
+    driver.activityPoll.stop();
+    Bun.spawn = originalSpawn;
+  }
 });
