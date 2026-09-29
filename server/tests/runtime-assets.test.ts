@@ -231,6 +231,7 @@ describe("NEWARCH R-PKG pipe-history package surface", () => {
 // Review §4.2: the old "parse" span (ingest -> onFrame) was queue + IPC + JSON +
 // consumer, not parser CPU. These traces split it without changing framing.
 import {
+  PIPE_VT_DATA_QUEUE_BYTES,
   PIPE_VT_TRACE_PENDING_MAX,
   PipeVtPool,
   PipeVtWorker,
@@ -583,6 +584,8 @@ const P2OPT_MUTANTS = {
   "naive-cut": [["    end = start + limit\n    if end >= len(data):\n", "    end = start + limit\n    return min(end, len(data))\n    if end >= len(data):\n"]],
   // Emit (and acknowledge) the frame whose slices are still being fed.
   "ack-mid-frame": [['if w is not None and c["partial"] is None and w.pending() and (', "if w is not None and w.pending() and ("]],
+  // Keep reading a channel whatever its unparsed backlog (pre-fix P2OPT).
+  "unbounded-read-ahead": [['if len(c["input"]) < read_ahead or not complete(c):', "if True:"]],
 } as const;
 
 function p2optAssets(mutant?: keyof typeof P2OPT_MUTANTS): PipeVtAssets {
@@ -721,6 +724,45 @@ describe("NEWARCH P2OPT shared parser fairness", () => {
     await p2Assert.rejects(p2optSlicedRun(p2optAssets("ack-mid-frame"), true), /re-acknowledges seq|hold covers wait\+parse/);
     console.log(`P2OPT mutation ack-mid-frame: clean=PASS damaged=DETECTED (real multiplex Python, ${shared.updates} clean updates)`);
   }, 90_000);
+
+  // Host budget + one 64 KiB read-ahead + a frame in flight + both kernel socket buffers.
+  const P2OPT_ACCEPT_BOUND = PIPE_VT_DATA_QUEUE_BYTES + 64 * 1024 + 2 * 1024 + 2 * 512 * 1024;
+
+  /** Bytes the host accepts before its data budget first refuses, with the consumer blocked. */
+  async function p2optBudgetRun(assets: PipeVtAssets | undefined) {
+    const pool = new PipeVtPool(assets ? { assets } : {});
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const pane = p2Pane({ pool, assets, consumer: () => gate });
+    try {
+      await pane.worker.start();
+      const chunk = p2Encoder.encode(`${"z".repeat(1000)}\r\n`);
+      const accepted = () => pane.fed * (chunk.byteLength + 21);
+      const end = Date.now() + 20_000;
+      let refused = false;
+      // Paced so a worker that reads ahead of its parser has time to pull the backlog in.
+      while (Date.now() < end && accepted() <= P2OPT_ACCEPT_BOUND) {
+        if (!p2Feed(pane, chunk)) { refused = true; break; }
+        if (pane.fed % 16 === 0) await p2Sleep(2);
+      }
+      if (!refused) return { accepted: accepted(), refused };
+      release();
+      await p2Until(() => pane.worker.traceBacklog().pending === 0, 30_000);
+      p2Assert.ok(!(await pane.worker.close(10_000)).unknownTail);
+      p2AssertTraces(pane, "read-ahead");
+      return { accepted: accepted(), refused };
+    } finally { release(); await pane.worker.close(1000); await pool.close(); }
+  }
+
+  test("short parser turns do not pull the backlog out of the socket: the host data budget still bounds it", async () => {
+    const clean = await p2optBudgetRun(undefined);
+    expect(clean.refused).toBe(true);
+    expect(clean.accepted).toBeGreaterThan(PIPE_VT_DATA_QUEUE_BYTES / 2);
+    expect(clean.accepted).toBeLessThanOrEqual(P2OPT_ACCEPT_BOUND);
+    const unbounded = await p2optBudgetRun(p2optAssets("unbounded-read-ahead"));
+    expect(unbounded.accepted).toBeGreaterThan(P2OPT_ACCEPT_BOUND);
+    console.log(`P2OPT mutation unbounded-read-ahead: DETECTED accepted before refusal clean=${clean.accepted} B damaged>${unbounded.accepted} B (refused=${unbounded.refused}) bound=${P2OPT_ACCEPT_BOUND} B`);
+  }, 120_000);
 
   test("mutation whole-frame-turns: the pre-P2OPT turn budget fails the fairness gate", async () => {
     const { phases } = await p2FairnessRun(p2optAssets("whole-frame-turns"), ["noisy"], 3000);
