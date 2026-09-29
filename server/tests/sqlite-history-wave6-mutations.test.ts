@@ -143,3 +143,75 @@ test('wave6 expansion-tooling detectors kill every injected fault and the clean 
     }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);
+
+// NEWARCH2 D2: the archive schedule and boot receipt lookup, same standard as
+// above, against the D2 tests of sqlite-history.test.ts in a throwaway copy.
+test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 test; the clean copy passes before and after', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'thumbmux-sqlite-d2-mutants-'));
+  const store = 'sqlite-history/projection-store.ts';
+  const mutants: Mutant[] = [
+    // A futile scan is retried on every commit again (the 26f25ec83 cost).
+    { name: 'scan-every-commit', pattern: 'D2:', file: store,
+      from: '    if(!entry.released && now-entry.scannedAt<ARCHIVE_RETRY_MS)continue;\n',
+      to: '' },
+    // NOT IN over a list holding NULL (an unchecked line) selects nothing: receipts never archive.
+    { name: 'null-fk-in-list', pattern: 'D2:', file: store,
+      from: ' AND l.checked_capture_id IS NOT NULL)',
+      to: ')' },
+    // One commit archives a whole backlog.
+    { name: 'unbounded-chunks', pattern: 'D2:', file: store,
+      from: '    if(!force && chunks>=chunkBudget)return {chunks,more:true};\n',
+      to: '' },
+    // Archive work leaves the commit transaction: it runs after the batch committed, in its own.
+    { name: 'archive-outside-commit', pattern: 'D2:', file: store,
+      from: '    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[]);\n    archiveMs=performance.now()-archiveStarted;\n    before?.();writeMs=performance.now()-started;\n  }).immediate();\n',
+      to: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  plan=disk.transaction(()=>archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[])).immediate();\n' },
+    // The schedule advances inside the transaction, so a rolled-back commit still moves it.
+    { name: 'queue-before-commit', pattern: 'D2:', file: store,
+      from: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  if(plan)applyArchivePlan(disk,plan);',
+      to: '    applyArchivePlan(disk,plan!);before?.();writeMs=performance.now()-started;\n  }).immediate();' },
+    // Boot walks archives with their data blobs again.
+    { name: 'boot-reads-every-data-blob', pattern: 'D2:', file: store,
+      from: "'SELECT archive_no,catalog,capture_count FROM na_capture_archive WHERE pane_no=? AND archive_no<? ORDER BY archive_no DESC LIMIT 32'",
+      to: "'SELECT archive_no,catalog,capture_count,data FROM na_capture_archive WHERE pane_no=? AND archive_no<? ORDER BY archive_no DESC LIMIT 32'" },
+  ];
+  try {
+    mkdirSync(join(root, 'server'), { recursive: true });
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history.test.ts'), join(root, 'server/tests/sqlite-history.test.ts'));
+    for (const helper of ['helpers.ts', 'crash-worker.ts']) cpSync(join(pkg, 'server/tests/sqlite-history', helper), join(root, 'server/tests/sqlite-history', helper));
+    const copiedCore = join(root, 'node_modules/@thumbmux/core'); mkdirSync(copiedCore, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(copiedCore, 'src'), { recursive: true });
+    writeFileSync(join(copiedCore, 'package.json'), '\n{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}\n');
+    writeFileSync(join(root, 'package.json'), '\n{"type":"module"}\n');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history.test.ts', '--test-name-pattern', 'D2:'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err, ran = /Ran (\d+) tests?/.exec(output), failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      const killedBy = [...output.matchAll(/\(fail\) (D2:[^\[\n]*)/g)].map(m => m[1].trim().slice(0, 60));
+      console.log('D2_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed, killedBy: [...new Set(killedBy)] }));
+      if (code !== 0 && !failed) console.log('D2_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      return { code, output, tests: Number(ran?.[1] ?? 0), failed };
+    };
+    const before = await run('clean-before');
+    expect(before.code).toBe(0);
+    expect(before.tests).toBe(7);
+    for (const mutant of mutants) {
+      const path = join(root, 'server/src', mutant.file), original = readFileSync(path, 'utf8');
+      expect(original.includes(mutant.from)).toBe(true);
+      expect(mutant.from).not.toBe(mutant.to);
+      writeFileSync(path, original.replace(mutant.from, mutant.to));
+      const result = await run(mutant.name);
+      writeFileSync(path, original);
+      expect(result.tests).toBeGreaterThan(0);
+      expect(result.code).not.toBe(0);
+      expect(result.failed).toBe(true);
+      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+    }
+    const after = await run('clean-after');
+    expect(after.code).toBe(0);
+    expect(after.tests).toBe(before.tests);
+    console.log('D2_MUTATION_RESULT', JSON.stringify({ killed: mutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 600_000);
