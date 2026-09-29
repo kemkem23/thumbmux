@@ -124,7 +124,7 @@ export function createActivityPoll<T>(empty: () => T, sample: (signal: AbortSign
       ageMs: completedAt === null ? null : Math.max(0, performance.now() - completedAt) }),
     settled: () => flight?.done ?? Promise.resolve(),
     refresh() {
-      if (stopped || flight) return;
+      if (stopped) return;
       const controller = new AbortController();
       let release!: () => void;
       const done = new Promise<void>((resolve) => { release = resolve; });
