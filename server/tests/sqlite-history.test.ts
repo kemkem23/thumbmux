@@ -1509,14 +1509,16 @@ test('D2: one commit writes a bounded number of archive chunks; the worker drain
   expect(()=>D2.drainArchives(f.disk,f.fence+1)).toThrow('stale-writer');
   for(let i=0;i<10 && D2.archiveBacklog(f.disk);i++)step(()=>D2.drainArchives(f.disk,f.fence));
   // 601 receipts per pane, 8 kept: two full chunks each; the last 81 stay live (below a chunk, not forced).
-  expect(steps).toEqual([4,4,4]);
+  // Commit: panes 1+2; drains: 3+4, 5+6, then the panes a cap cut short are counted and forgotten.
+  expect(steps).toEqual([4,4,4,0]);
+  expect(Math.max(...steps)).toBeLessThanOrEqual(D2.limits.ARCHIVE_CHUNKS_PER_COMMIT);
   for(const no of nos) {
    expect(live(no)).toBe(89);
    const all=[...Array.from({length:600},(_,i)=>`u${no}-${String(i+1).padStart(5,'0')}`),`new-${no}`];
    expect(D2.captureReceipts(f.disk,no,all).size).toBe(601);
   }
   // Futile remainders are not idle work; after the retry age a commit finds them below a chunk and forgets them.
-  expect(D2.archiveBacklog(f.disk)).toBe(false);expect(D2.archiveQueue(f.disk).size).toBe(6);
+  expect(D2.archiveBacklog(f.disk)).toBe(false);expect(D2.archiveQueue(f.disk).size).toBe(2);
   now+=D2.limits.ARCHIVE_RETRY_MS;step(()=>commit(false));
   expect(D2.archiveQueue(f.disk).size).toBe(0);
   expect(steps.at(-1)).toBe(0);
