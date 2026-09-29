@@ -892,7 +892,8 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     // files, process globals, or production prototypes are changed.
     const original = (PipeHistoryCollector.prototype as unknown as Tray).remember;
     const method = original.toString();
-    const release = /this\.ring\[this\.ringStart\] = undefined;/g;
+    // Bun prints the undefined assignment as `void 0` in Function#toString.
+    const release = /this\.ring\[this\.ringStart\] = (?:undefined|void 0);/g;
     expect(method.match(release)?.length).toBe(1);
     let damaged = method.replace(release, "");
     if (mutation === "release-after-callback") {
