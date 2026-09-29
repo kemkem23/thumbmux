@@ -330,6 +330,26 @@ describe('I4-FIX1 lot C decoder fidelity and retention', () => {
   });
 });
 
+test('CANARY-FIX M: a slowly growing pane keeps only the rows of its last two captures, with the same hits', () => {
+  // The R-CANARY soak shape: one new row per capture, tail = 128 rows + 40 screen rows.
+  // Rows that left every recent capture are never looked up again; a floor of 1024
+  // kept them anyway (21 panes: ~4 KB per row with the canonical/frame side tables).
+  const line = (i: number) => `P${String(i % 21).padStart(2, '0')} ${String(i).padStart(6, '0')} \x1b[${31 + i % 7}mcolor${i % 10}\x1b[0m ไทย漢字😀 ${'x'.repeat(i % 13)}`;
+  const capture = (end: number) => { const from = Math.max(0, end - 168); return { body: Array.from({ length: end - from }, (_, k) => line(from + k)).join('\n') + '\n', lines: end - from }; };
+  const memo = new TmuxCaptureDecoder(120), reference = new TmuxCaptureDecoder(120, 9000, 9000);
+  let worst = 0;
+  for (let end = 1; end <= 1500; end++) {
+    const { body, lines } = capture(end);
+    const rows = memo.decode(body);
+    expect(rows).toEqual(reference.decode(body));
+    worst = Math.max(worst, memo.size / Math.max(lines, 1));
+    expect(memo.size).toBeLessThanOrEqual(2 * lines);
+  }
+  console.log('CANARY_FIX_M_DECODER', JSON.stringify({ size: memo.size, worstRatio: +worst.toFixed(3), hits: memo.hits, misses: memo.misses, referenceSize: reference.size }));
+  expect(memo.hits).toBe(reference.hits);
+  expect(memo.misses).toBe(reference.misses);
+});
+
 test('I4-FIX1 C mutation control: a memo that never trims keeps 9000 rows and fails the retention bound', () => {
   const root = mkdtempSync(join(tmpdir(), 'i4c-decoder-mutation-'));
   try {
