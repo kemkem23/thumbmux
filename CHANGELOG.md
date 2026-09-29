@@ -5,11 +5,29 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.20.4-dist`.
 
 ## v0.20.4 — 2026-09-29
 
-Patch for the opt-in pipe-history projection only; a host that never imports
-the projection subpaths loads what it loaded on `v0.20.3-dist`. Workspace caret
-ranges stay satisfiable, so the lockfile does not move.
+Patch. Changes the default durable-history path (replay materializer and PTY
+WAL proxy) and the opt-in newarch pipe-history projection. The five workspace
+manifests and internal caret ranges are 0.20.4 / ^0.20.4. Consumers moving a
+pinned git dist must update their lockfiles to the new immutable dist tag.
 
-### Changed — projection schema v5 in its own file
+### Fixed — durable history (default path, HP7 and SETM)
+
+- Checkpoint recovery coalesces consecutive output records into bounded runs
+  instead of replaying every record separately. Prior HP7 measurements recovered
+  all 21 lanes in at most 38.9 seconds, including a lane that exceeded 545 seconds.
+- Recovered history and screen are checked cell by cell, including colour,
+  attributes and OSC 8 hyperlinks. Recovery preserves checkpoint screen bytes;
+  post-open refresh remains per-record for compatibility with 0.20.2.
+- PTY WAL proxy logs dropped resize requests and reports `disconnected` when
+  the recorded child has exited while descendants still hold the PTY. Input
+  stops in that state; pending output is drained and lingering orphan output
+  is polled on the heartbeat.
+- Integration note: HP7's retry backoff and shutdown drain/cancellation, and
+  SETM's launch without `set -m`, are companion host changes. The package ships
+  the materializer and proxy changes; upgrading this package alone does not
+  install those host policies.
+
+### Changed — projection schema v5 in its own file (opt-in, D + D FIX1)
 
 - **Schema 5** (`005-newarch-compact-capture-receipts`): capture receipts that
   no live row references are packed into lossless, SHA-256-checked archive
@@ -31,12 +49,45 @@ ranges stay satisfiable, so the lockfile does not move.
 - `PIPE_HISTORY_RUNTIME_CAPABILITY.archiveReadVersions` is `[2, 3, 4, 5]`
   (what `openProjectionArchive` reads), not `[2, 3]`.
 
-### Rollback to v0.20.3
+### Fixed — pipe-history memory and live boundary (opt-in, M)
 
-Supported. The 0.20.3 file was never written by 0.20.4, so 0.20.3 reopens it
-and continues. Lost while rolled back: the rows written while 0.20.4 ran
-(0.20.3 refuses a v5 file). Going forward again keeps both files; rows 0.20.3
-wrote during the rollback stay in its file only.
+- Decoder memo retains only rows used by the latest two decodes.
+- Calibration uses the same line-id fence with one lazy copy of the recent
+  ring at most; eviction replaces the array. A snapshot retains its original
+  array and length, so later appends do not change its view.
+- Live frames are published only after RAM admission. Row identity and order
+  are unchanged.
+
+### Known debt — lot V
+
+The 21-pane, 30-minute newarch soak still misses PSS and p95 targets: the
+merged run measured +109.71 MiB PSS and 41.28 ms p95; 0.20.3 measured +98.79 MiB
+and 26.21 ms. These source/dist runs are not a controlled comparison; p95
+attribution remains unresolved. Lot V must run dist-to-dist A/B at least three
+times per candidate and investigate ring byte budgets, allocation/IPC/mux poll,
+receipt compaction and frame encoding before enabling newarch in production.
+This release does not claim that soak passed. Retry/cutover and orphan-drain
+operational debts also remain.
+
+### Rollback
+
+- **To v0.20.3:** restore the previous consumer pin/runtime and keep both
+  projection files. Schema v4 was never rewritten by 0.20.4, so 0.20.3 can
+  reopen it. Rows written into v5 are temporarily invisible while rolled back,
+  not deleted; they return when moving forward again. Rows written while
+  rolled back stay in v4; rows above the original seam are not automatically
+  merged into the v5 timeline.
+- **To v0.20.2:** restore the previous consumer pin/runtime. The durable WAL
+  and checkpoint formats are unchanged. Large checkpoints can still exceed
+  0.20.2's recovery deadline (four known lanes in the HP7 rehearsal). Before
+  starting the old runtime, follow the host HP7 rollback runbook to retain those
+  checkpoints aside and rebuild from the original WAL; allow the slower rebuild.
+  Keep newarch archives intact; 0.20.2 does not provide the 0.20.3 projection API.
+- **Keep the 0.20.4 runtime/install directory until every proxy launched from
+  it has exited.** A proxy can outlive the host rollback and still reference
+  the Python asset in that directory (review F5).
+- Published tags remain immutable. Correct a faulty release with a new version
+  and new tags; never delete or move the existing source/dist tags.
 
 ## v0.20.3 — 2026-09-28
 
