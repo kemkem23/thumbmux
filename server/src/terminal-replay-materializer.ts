@@ -2369,7 +2369,7 @@ class ReplayEngine {
     for (const record of records) {
       if (record.kind === "output") {
         const previous = run[run.length - 1];
-        if (previous && erasesScrollback(previous.payload, record.payload)) flushRun();
+        // R2 MUTATION: deliberately omit the ED3 drain boundary.
         run.push(record);
         runBytes += record.payload.byteLength;
         if (runBytes >= COALESCED_OUTPUT_MAX_BYTES) flushRun();
@@ -2776,10 +2776,10 @@ export class TerminalReplaySession {
           }
           expectedOffset = record.nextOffset;
         }
-        // R2 MUTATION: deliberately regress recovery to per-record calls.
-        for (const record of batch.records) {
-          this.engine.process(record, (captured) => this.history.accept(captured, "verify"));
-        }
+        this.engine.processAll(
+          batch.records,
+          (captured) => this.history.accept(captured, "verify"),
+        );
         const lastRecord = batch.records[batch.records.length - 1]!;
         this.lastOffset = lastRecord.nextOffset;
         this.lastSequence = lastRecord.sequence;
