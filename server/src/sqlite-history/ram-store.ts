@@ -142,13 +142,19 @@ export class ProjectionRam {
     return {paneKey:{...key},sourceEpoch:Number(p.source_epoch),geometryGeneration:Number(p.geometry_generation),
       revision:Number(p.revision),durableRevision:Number(p.durable_revision),nextLineId:Number(p.next_line_id)};
   }
+  /**
+   * First line id of a pane this store has never seen. The store continues the
+   * numbering of a pane an earlier release recorded (its legacy nextLineId), so
+   * one id names one row across both files. Default 0.
+   */
+  firstLineId: (key: PaneKey) => number = () => 0;
   ensure(key: PaneKey, epoch: number, geometry: number): SqlRow {
     const id=paneId(key); integer(epoch); integer(geometry);
     const p=prepared(this.db,'SELECT * FROM na_pane WHERE pane_key=?').get(id) as SqlRow|null;
     if(!p) {
       prepared(this.db,`INSERT INTO na_pane
-        (pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind)
-        VALUES (?,?,?,?,?,?,?,0,0,'normal')`).run(id,randomUUID(),key.serverIdentity,key.paneId,key.birthGeneration,epoch,geometry);
+        (pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind,next_line_id)
+        VALUES (?,?,?,?,?,?,?,0,0,'normal',?)`).run(id,randomUUID(),key.serverIdentity,key.paneId,key.birthGeneration,epoch,geometry,integer(this.firstLineId(key)));
       return this.pane(key);
     }
     if(epoch<Number(p.source_epoch) || geometry<Number(p.geometry_generation))throw new Error('stale-generation');
