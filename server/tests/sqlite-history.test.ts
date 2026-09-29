@@ -1389,3 +1389,241 @@ test('D-FIX1: an unreadable legacy file is reported and skipped, never a reason 
   }finally{await s.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+// ── NEWARCH2 D2: archive scheduling off the per-commit path + boot receipt lookup ──
+import { projectionArchiveInternals as D2 } from '../src/sqlite-history/projection-store';
+import { encodeBlock as d2EncodeBlock, encodeCaptureArchive as d2EncodeCatalog, encodeCaptureReceipts as d2EncodeReceipts } from '../src/sqlite-history/codec';
+// The anti-join 26f25ec83 ran on every commit: the oracle for what is eligible.
+const D2_OLD_SCAN=`SELECT c.* FROM na_capture c WHERE c.pane_no=?
+ AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_no=c.pane_no AND l.checked_capture_id=c.capture_id)
+ AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=c.pane_no ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT 8)
+ ORDER BY c.revision,c.capture_id LIMIT 256`;
+const d2Hash=(seed:string)=>createHash('sha256').update(seed).digest();
+const d2Capture=(pane_no:number,capture_id:string,revision:number)=>({pane_no,capture_id,revision,source_epoch:1,requested_at:revision,completed_at:revision+0.5,
+ geometry_generation:1,first_history_row:revision%11,history_count:1+revision%3,screen_hash:d2Hash('s'+capture_id),history_hash:d2Hash('h'+capture_id),
+ observed_fields:revision%3?255:'["style","grapheme"]',compared_rows:1+revision%4,corrected_cells:revision%5,ambiguous_rows:revision%2,result:revision%7?'exact':'idle-exact'});
+const d2Line=(pane_no:number,line_id:number,revision:number,capture:string|null)=>{
+ const text=`row ${line_id}`;
+ return {pane_no,source_epoch:1,line_id,revision,geometry_generation:1,text,cells:encodeRow(text,naRow(text).cells).cells,soft_wrap:0,
+  check_state:capture?1:0,check_reason:capture?2:0,checked_capture_id:capture,checked_row:capture?0:null};
+};
+// Receipts compared field for field; hashes as hex because SQLite and the archive hand back different byte views.
+const d2Receipt=(row:any)=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k,v instanceof Uint8Array?Buffer.from(v).toString('hex'):v]));
+/** A real v5 file (schema, fence, one unchecked seed line per pane), then opened as the disk worker opens it. */
+async function d2File(panes:number) {
+ const dir=mkdtempSync(join(tmpdir(),'na-d2-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ for(let p=0;p<panes;p++)await s.appendScroll(naEvent(`seed ${p}`,1,{...naKey,paneId:`%${p}`}));
+ s.flush();await s.close();
+ const disk=new Database(join(dir,'newarch-v5/history.sqlite3'),{strict:true});
+ disk.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250;');
+ const fence=Number((disk.query('PRAGMA application_id').get() as any).application_id);
+ return {dir,disk,fence,panes:disk.query('SELECT * FROM na_pane ORDER BY pane_no').all() as any[],seq:0};
+}
+type D2Change={pane:number;next?:number;build?:(revision:number)=>{captures?:any[];lines?:any[]}};
+function d2Batch(f:Awaited<ReturnType<typeof d2File>>,changes:D2Change[]) {
+ const captures:any[]=[],lines:any[]=[];
+ const panes=changes.map(c=>{
+  const p=f.panes.find(p=>p.pane_no===c.pane)!;p.revision++;p.durable_revision=p.revision;if(c.next!==undefined)p.next_line_id=c.next;
+  const built=c.build?.(p.revision);captures.push(...built?.captures??[]);lines.push(...built?.lines??[]);
+  return {...p};
+ });
+ f.seq++;
+ return {id:`d2-${f.seq}`,digest:`d2-digest-${f.seq}`,panes,tables:new Map([['na_capture',captures],['na_line',lines],['na_issue',[]]]),bytes:0,since:0,byPane:new Map()} as any;
+}
+const d2Count=(db:Database,sql:string,...args:any[])=>Number((db.query(sql).get(...args) as any).n);
+function d2Clean(db:Database) {
+ expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+ expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+}
+/** Unpinned receipts inserted directly (no line references them), numbered from `from`. */
+function d2Receipts(f:Awaited<ReturnType<typeof d2File>>,paneNo:number,count:number,from=1) {
+ const insert=f.disk.query(`INSERT INTO na_capture VALUES (${Array(16).fill('?').join(',')})`);
+ f.disk.transaction(()=>{for(let i=from;i<from+count;i++)insert.run(...Object.values(d2Capture(paneNo,`u${paneNo}-${String(i).padStart(5,'0')}`,i)) as any);})();
+ const p=f.panes.find(p=>p.pane_no===paneNo)!;p.revision=Math.max(p.revision,from+count+10);
+}
+
+test('D2: the eligibility scan reads live FKs and kept receipts once (no correlated subquery) and selects exactly what the old anti-join selected',()=>{
+ const db=new Database(':memory:',{strict:true});
+ try {
+  db.exec(PROJECTION_SCHEMA);
+  for(const no of [1,2])db.query(`INSERT INTO na_pane (pane_no,pane_key,session_uuid,server_identity,pane_id,birth_generation,source_epoch,geometry_generation,cols,rows,screen_kind) VALUES (?,?,'u','s',?,1,1,1,120,40,'normal')`).run(no,`k${no}`,`%${no}`);
+  const cap=db.query(`INSERT INTO na_capture VALUES (${Array(16).fill('?').join(',')})`),line=db.query(`INSERT INTO na_line VALUES (${Array(12).fill('?').join(',')})`);
+  db.transaction(()=>{
+   for(const no of [1,2])for(let c=0;c<600;c++)cap.run(...Object.values(d2Capture(no,`cap-${String(c).padStart(6,'0')}`,c+1)) as any);
+   // Pane 1: 4608 per-line rows, every 16th unchecked (NULL FK), the rest pin receipts 312..599.
+   for(let l=0;l<4608;l++)line.run(...Object.values(d2Line(1,l,l+1,l%16===15?null:`cap-${String(312+Math.floor(l/16)).padStart(6,'0')}`)) as any);
+   // Pane 2 pins its own cap-000000..cap-000099: the same ids must not pin pane 1's receipts.
+   for(let l=0;l<100;l++)line.run(...Object.values(d2Line(2,l,l+1,`cap-${String(l).padStart(6,'0')}`)) as any);
+  })();
+  const plan=(db.query('EXPLAIN QUERY PLAN '+D2.ARCHIVE_SCAN_SQL).all(1,1,1) as any[]).map(r=>String(r.detail));
+  expect(plan.filter(d=>d.includes('CORRELATED'))).toEqual([]);
+  expect(plan.filter(d=>d.startsWith('SCAN '))).toEqual([]);
+  for(const no of [1,2]) {
+   const next=(db.query(D2.ARCHIVE_SCAN_SQL).all(no,no,no) as any[]).map(r=>r.capture_id),old=(db.query(D2_OLD_SCAN).all(no) as any[]).map(r=>r.capture_id);
+   expect(next).toEqual(old);expect(next.length).toBe(256);
+  }
+  expect((db.query(D2.ARCHIVE_SCAN_SQL).all(1,1,1) as any[])[0].capture_id).toBe('cap-000000');
+  console.log('D2_SCAN_PLAN',JSON.stringify({plan}));
+ }finally{db.close();}
+});
+
+test('D2: a pane whose receipts are still pinned is not rescanned every commit; a seal or the retry age scans it, and archived receipts resolve field for field',async()=>{
+ const f=await d2File(1);let now=1e6;D2.setClock(()=>now);
+ try {
+  const no=f.panes[0].pane_no,stats=D2.archiveStatsOf(f.disk);
+  const commit=(i:number)=>D2.commitBatch(f.disk,f.fence,d2Batch(f,[{pane:no,next:i+1,build:rev=>({captures:[d2Capture(no,`c${i}`,rev)],lines:[d2Line(no,i,rev,`c${i}`)]})}]));
+  for(let i=1;i<=300;i++)commit(i);
+  // One scan when the pane first could fill a chunk (136 receipts); every receipt is pinned, so 164 later commits scan nothing.
+  expect({scans:stats.scans,archives:d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive')}).toEqual({scans:1,archives:0});
+  now+=D2.limits.ARCHIVE_RETRY_MS;commit(301);
+  expect(stats.scans).toBe(2);
+  for(let i=302;i<=382;i++)commit(i);
+  expect(stats.scans).toBe(2);
+  const corpus=new Map((f.disk.query('SELECT * FROM na_capture WHERE pane_no=?').all(no) as any[]).map(r=>[r.capture_id,d2Receipt(r)]));
+  expect(corpus.size).toBe(382);
+  // Line 383 completes block 0 (lines 0-255, with the unchecked seed): the seal frees c1..c255 and the same commit archives them.
+  await Bun.sleep(220);commit(383);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_block')).toBe(1);
+  expect(stats.scans).toBe(3);
+  expect(f.disk.query('SELECT capture_count AS n FROM na_capture_archive').all()).toEqual([{n:255}]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no)).toBe(128);
+  const resolved=D2.captureReceipts(f.disk,no,corpus.keys());
+  expect(resolved.size).toBe(382);
+  for(const [id,row] of corpus)expect(d2Receipt(resolved.get(id))).toEqual(row);
+  d2Clean(f.disk);
+  console.log('D2_SCHEDULE',JSON.stringify({commits:383,scans:stats.scans,countChecks:stats.countChecks,archived:stats.archived}));
+ }finally{D2.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('D2: one commit writes a bounded number of archive chunks; the queued rest drains over later commits without starving a pane',async()=>{
+ const f=await d2File(6);D2.setClock(()=>5e6);
+ try {
+  const stats=D2.archiveStatsOf(f.disk),nos=f.panes.map(p=>p.pane_no);
+  for(const no of nos)d2Receipts(f,no,600);
+  const perCommit:number[]=[];
+  const commit=(first:boolean)=>{
+   const before=stats.chunks;
+   D2.commitBatch(f.disk,f.fence,d2Batch(f,nos.map(no=>({pane:no,build:rev=>first?{captures:[d2Capture(no,`new-${no}`,rev)]}:{}}))));
+   perCommit.push(stats.chunks-before);
+  };
+  commit(true);
+  for(let i=0;i<8 && nos.some(no=>d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no)>8);i++)commit(false);
+  // 601 receipts per pane, 8 kept: 256+256+81 per pane = 18 chunks, at most 4 per commit.
+  expect(perCommit.every(n=>n<=D2.limits.ARCHIVE_CHUNKS_PER_COMMIT)).toBe(true);
+  expect(perCommit.reduce((a,b)=>a+b,0)).toBe(18);
+  expect(perCommit.length).toBeLessThanOrEqual(6);
+  for(const no of nos) {
+   expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',no)).toBe(8);
+   const ids=(f.disk.query('SELECT capture_id FROM na_capture WHERE pane_no=?').all(no) as any[]).map(r=>r.capture_id);
+   const all=[...Array.from({length:600},(_,i)=>`u${no}-${String(i+1).padStart(5,'0')}`),`new-${no}`];
+   expect(D2.captureReceipts(f.disk,no,all).size).toBe(601);
+   expect(ids).toContain(`new-${no}`);
+  }
+  expect(D2.archiveQueue(f.disk).size).toBe(0);
+  d2Clean(f.disk);
+  console.log('D2_BOUNDED',JSON.stringify({perCommit}));
+ }finally{D2.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('D2: a commit that fails after archiving rolls archive and receipt delete back together; the retry archives once and every receipt resolves',async()=>{
+ const f=await d2File(1);D2.setClock(()=>7e6);
+ try {
+  const no=f.panes[0].pane_no;d2Receipts(f,no,300);
+  const batch=d2Batch(f,[{pane:no,build:rev=>({captures:[d2Capture(no,'crash-new',rev)]})}]);
+  const corpus=new Map((f.disk.query('SELECT * FROM na_capture WHERE pane_no=?').all(no) as any[]).map(r=>[r.capture_id,d2Receipt(r)]));
+  expect(()=>D2.commitBatch(f.disk,f.fence,batch,()=>{
+   // Inside the transaction the archive is already written: the crash point is after it.
+   expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive')).toBe(1);
+   throw new Error('crash-before-commit');
+  })).toThrow('crash-before-commit');
+  expect({archives:d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive'),live:d2Count(f.disk,'SELECT count(*) n FROM na_capture'),
+   commit:d2Count(f.disk,'SELECT count(*) n FROM na_commit WHERE commit_id=?',batch.id)}).toEqual({archives:0,live:300,commit:0});
+  expect(D2.archiveQueue(f.disk).size).toBe(0);
+  D2.commitBatch(f.disk,f.fence,batch);
+  D2.commitBatch(f.disk,f.fence,batch); // the same batch again: committed once, archived once
+  expect(f.disk.query('SELECT capture_count AS n FROM na_capture_archive').all()).toEqual([{n:256}]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture')).toBe(45);
+  const resolved=D2.captureReceipts(f.disk,no,[...corpus.keys(),'crash-new']);
+  for(const [id,row] of corpus)expect(d2Receipt(resolved.get(id))).toEqual(row);
+  expect(resolved.get('crash-new')!.capture_id).toBe('crash-new');
+  expect(()=>D2.captureReceipts(f.disk,no,['never-written'])).toThrow('capture-receipt-missing');
+  d2Clean(f.disk);
+ }finally{D2.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('D2: boot resolves receipts from 300 archives by catalog, fetching data only from the 3 archives that hold them',async()=>{
+ const f=await d2File(1),key={...naKey,paneId:'%0'},no=f.panes[0].pane_no,ARCHIVES=300,PER=128,LINES=4864,targets=[0,150,299];
+ let dataBytes=0,s:ReturnType<typeof createProjectionStore>|null=null;
+ try {
+  f.disk.transaction(()=>{
+   f.disk.query('DELETE FROM na_line').run();
+   for(let a=0;a<ARCHIVES;a++) {
+    const values=Array.from({length:PER},(_,k)=>Object.values(d2Capture(no,`a${a}-c${k}`,a*PER+k+1)).slice(1));
+    const data=d2EncodeReceipts(values);dataBytes+=data.length;
+    f.disk.query('INSERT INTO na_capture_archive (pane_no,first_revision,last_revision,capture_count,catalog,data) VALUES (?,?,?,?,?,?)')
+     .run(no,a*PER+1,a*PER+PER,PER,d2EncodeCatalog(values.map(v=>[v[0],v[1],v[2],v[5]])),data);
+   }
+   for(let b=0;b<LINES/256;b++) {
+    const lines=Array.from({length:256},(_,k)=>{const l=b*256+k,r=d2Line(no,l,ARCHIVES*PER+1,`a${targets[l%3]}-c${l%PER}`);
+     return [r.source_epoch,r.revision,r.geometry_generation,r.text,r.cells,r.soft_wrap,r.check_state,r.check_reason,r.checked_capture_id,r.checked_row];});
+    f.disk.query('INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,256,?,?)').run(no,b*256,ARCHIVES*PER+1,d2EncodeBlock(lines));
+   }
+   f.disk.query('UPDATE na_pane SET next_line_id=?,revision=?,durable_revision=?').run(LINES,ARCHIVES*PER+2,ARCHIVES*PER+2);
+  })();
+  f.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');f.disk.close();
+  const rchar=()=>Number(/rchar: (\d+)/.exec(readFileS2('/proc/self/io','utf8'))![1]);
+  const before=rchar(),started=performance.now();
+  s=createProjectionStore({historyRoot:f.dir,mode:'recover'});
+  const recoverMs=performance.now()-started,read=rchar()-before,stats=s.archiveStats();
+  // 26f25ec83 read every archive's data from newest to the hit, again for each of the 384 ids (2.37 GB here).
+  expect({dataReads:stats.dataReads,catalogReads:stats.catalogReads}).toEqual({dataReads:3,catalogReads:ARCHIVES});
+  expect(read).toBeLessThan(dataBytes);
+  const ram=(s as any).ram.db as Database;
+  expect(d2Count(ram,'SELECT count(*) n FROM na_capture')).toBe(PER*targets.length);
+  const lines=[0,2000,4000].flatMap(at=>s!.readPage(s!.token(key),at,Math.min(2000,LINES-at)).lines);
+  expect(lines.map(l=>l.checkedCaptureId)).toEqual(Array.from({length:LINES},(_,l)=>`a${targets[l%3]}-c${l%PER}`));
+  expect(d2Receipt(ram.query('SELECT * FROM na_capture WHERE capture_id=?').get('a0-c5'))).toEqual(d2Receipt(d2Capture(no,'a0-c5',6)));
+  console.log('D2_BOOT',JSON.stringify({archives:ARCHIVES,dataBytes,recoverMs,rchar:read,...stats}));
+ }finally{await s?.close();rmSync(f.dir,{recursive:true,force:true});}
+},60000);
+
+test('D2: capture-heavy async ingest scans archives on a small fraction of commits and keeps live and drained D/R at or below 1.5',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-d2-live-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const keys=Array.from({length:6},(_,p)=>({serverIdentity:'d2-live',paneId:`%${p}`,birthGeneration:1}));
+ const text=(p:number,l:number)=>`P${p} ${String(l).padStart(6,'0')} `+'y'.repeat(40+l%30);
+ let raw=0;const seen={refused:0};
+ try {
+  for(let i=0;i<1000;i++)for(const [p,key] of keys.entries()) {
+   raw+=Buffer.byteLength(text(p,i));
+   await naStore(s,{...naEvent(text(p,i),i+1,key)},seen);
+   if(i%2===1)await s.calibrate({capture:{...naFrame(),paneKey:key,captureId:`p${p}-c${i}`,requestedAt:i,completedAt:i+0.5,firstHistoryRow:0,
+    history:[i-1,i].map(l=>naRow(text(p,l))),observedFields:['grapheme'],ambiguousRows:0,result:'exact'},
+    expectedRevision:s.token(key).revision,checks:[{lineId:i-1,captureRow:0},{lineId:i,captureRow:1}],repairs:[]});
+  }
+  const settle=Date.now();while(s.health().pendingBytes>0 && Date.now()-settle<10000)await Bun.sleep(10);
+  expect(s.health().pendingBytes).toBe(0);
+  const folder=join(dir,'newarch-v5'),size=()=>readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
+  const live=size()/raw,stats=s.archiveStats();
+  s.flush();const drained=size()/raw;
+  console.log('D2_LIVE_DISK',JSON.stringify({raw,live,drained,refused:seen.refused,...stats}));
+  expect(stats.commits).toBeGreaterThan(40);
+  expect(stats.scans*4).toBeLessThan(stats.commits);
+  expect(stats.archived).toBeGreaterThan(0);
+  expect(live).toBeLessThanOrEqual(1.5);expect(drained).toBeLessThanOrEqual(1.5);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},120000);
+
+test('D2: fc:2 counters see cached rows and the fast-path RAM write time',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-d2-frame-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ try {
+  const rows=Array.from({length:40},(_,i)=>s2Oracle(5000+i).cells.slice(0,120));
+  const frame=(cells:PhysicalRow['cells'][],seq:number)=>({...naFrame(),receiveSeq:seq,cols:120,rows:40,cells});
+  const before=s.frameStats();
+  await s.replaceScreen(frame(rows,1));
+  await s.replaceScreen(frame([...rows.slice(0,39),s2Oracle(9999).cells.slice(0,120)],2));
+  const after=s.frameStats();
+  expect({frames:after.codec.frames-before.codec.frames,rows:after.codec.rows-before.codec.rows,misses:after.codec.rowMisses-before.codec.rowMisses}).toEqual({frames:2,rows:80,misses:41});
+  expect(after.writes.count).toBe(2);expect(after.writes.totalMs).toBeGreaterThan(0);
+  expect(after.codec.encodedChars).toBeGreaterThan(before.codec.encodedChars);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+});
