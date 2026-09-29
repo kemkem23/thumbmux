@@ -604,8 +604,9 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
     let prepared: ReturnType<typeof installRecoveryFixture>[];
 
     beforeEach(() => {
-      // Decode, hash and copy the archived producer output before Bun starts
-      // each test's 120 s budget. No VT materialization occurs here.
+      // Decode, hash and copy the archived producer output before the
+      // recovery measurement. Bun may include hooks in its reported test
+      // wall time; no fixture producer runs here or in the timed test.
       prepared = RECOVERY_FIXTURES.map(installRecoveryFixture);
     });
 
