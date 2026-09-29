@@ -152,8 +152,12 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
   const mutants: Mutant[] = [
     // A futile scan is retried on every commit again (the 26f25ec83 cost).
     { name: 'scan-every-commit', pattern: 'D2:', file: store,
-      from: '    if(!entry.released && now-entry.scannedAt<ARCHIVE_RETRY_MS)continue;\n',
+      from: '    if(due===null || now<due)continue;\n',
       to: '' },
+    // A pane touched after a futile scan is never retried, however long ago the scan was.
+    { name: 'no-age-retry', pattern: 'D2:', file: store,
+      from: '  return entry.touched?entry.scannedAt+ARCHIVE_RETRY_MS:null;',
+      to: '  return null;' },
     // NOT IN over a list holding NULL (an unchecked line) selects nothing: receipts never archive.
     { name: 'null-fk-in-list', pattern: 'D2:', file: store,
       from: ' AND l.checked_capture_id IS NOT NULL)',
@@ -172,8 +176,8 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
       to: '    applyArchivePlan(disk,plan!);before?.();writeMs=performance.now()-started;\n  }).immediate();' },
     // Work a capped commit left queued waits for the next commit, however long ingest stays quiet.
     { name: 'no-idle-drain', pattern: 'D2:', file: store,
-      from: '  const scheduleDrain=()=>{if(!drainTimer && archiveBacklog(disk))drainTimer=setTimeout(drain,ARCHIVE_IDLE_MS);};',
-      to: '  const scheduleDrain=()=>{};' },
+      from: '    if(!drainTimer && next!==null)drainTimer=setTimeout(drain,Math.max(ARCHIVE_IDLE_MS,next-archiveClock()));',
+      to: '    void next;' },
     // Boot walks archives with their data blobs again.
     { name: 'boot-reads-every-data-blob', pattern: 'D2:', file: store,
       from: "'SELECT archive_no,catalog,capture_count FROM na_capture_archive WHERE pane_no=? AND archive_no<? ORDER BY archive_no DESC LIMIT 32'",
@@ -200,7 +204,7 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
     };
     const before = await run('clean-before');
     expect(before.code).toBe(0);
-    expect(before.tests).toBe(7);
+    expect(before.tests).toBe(8);
     for (const mutant of mutants) {
       const path = join(root, 'server/src', mutant.file), original = readFileSync(path, 'utf8');
       expect(original.includes(mutant.from)).toBe(true);
