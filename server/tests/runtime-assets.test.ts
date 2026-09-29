@@ -231,6 +231,7 @@ describe("NEWARCH R-PKG pipe-history package surface", () => {
 // Review §4.2: the old "parse" span (ingest -> onFrame) was queue + IPC + JSON +
 // consumer, not parser CPU. These traces split it without changing framing.
 import {
+  PIPE_VT_DATA_QUEUE_BYTES,
   PIPE_VT_TRACE_PENDING_MAX,
   PipeVtPool,
   PipeVtWorker,
@@ -345,6 +346,66 @@ function p2Summary(traces: PipeVtStageTrace[]) {
   };
 }
 
+type P2Summary = ReturnType<typeof p2Summary>;
+const P2OPT_QUIET_READ_LAG_P95_MS = 12;
+const P2OPT_QUIET_FEED_TO_CONSUMED_P95_MS = 40;
+
+function p2FairnessGate(quiet: P2Summary): void {
+  expect(quiet.updates, "quiet updates measured").toBeGreaterThan(40);
+  expect(quiet.readLagMs.p95, "quiet read waits behind the noisy sibling's parser turn").toBeLessThanOrEqual(P2OPT_QUIET_READ_LAG_P95_MS);
+  expect(quiet.feedToConsumedMs.p95, "quiet feed->consumed p95 with a noisy sibling").toBeLessThanOrEqual(P2OPT_QUIET_FEED_TO_CONSUMED_P95_MS);
+}
+
+/** The P2 fairness fixture: one pool, 1 noisy + 20 quiet panes, 120x40. */
+async function p2FairnessRun(assets: PipeVtAssets | undefined, phaseNames: readonly ("quiet-only" | "noisy")[], phaseMs: number) {
+  const pool = new PipeVtPool(assets ? { assets } : {});
+  const quiet = Array.from({ length: 20 }, () => p2Pane({ pool, assets, cols: 120, rows: 40 }));
+  const noisy = p2Pane({ pool, assets, cols: 120, rows: 40 });
+  const all = [noisy, ...quiet];
+  const phases: Record<string, { quiet: P2Summary; noisy: P2Summary }> = {};
+  let noisyRejected = 0;
+  try {
+    await Promise.all(all.map((p) => p.worker.start()));
+    // One shared interpreter for every pane: fairness never costs a process per pane.
+    expect(new Set(all.map((p) => p.worker.pid)).size).toBe(1);
+    const burst = p2Encoder.encode(Array.from({ length: 64 }, (_, i) => `\x1b[3${i % 8}mnoisy ${i} ${"x".repeat(90)}\x1b[0m\r\n`).join(""));
+    let tick = 0;
+    for (const phase of phaseNames) {
+      const marks = all.map((p) => p.traces.length);
+      const end = Date.now() + phaseMs;
+      while (Date.now() < end) {
+        // 20 quiet panes at ~0.5 row/s each is too sparse for 4 s: 20 rows/s total, staggered.
+        const q = quiet[tick % quiet.length]!;
+        p2Feed(q, p2Encoder.encode(`quiet ${tick} ไทย\r\n`));
+        if (phase === "noisy") {
+          for (let i = 0; i < 8; i++) if (!p2Feed(noisy, burst)) noisyRejected++;
+        }
+        tick++;
+        await p2Sleep(50);
+      }
+      await p2Until(() => all.every((p) => p.worker.traceBacklog().pending === 0), 30_000);
+      phases[phase] = {
+        quiet: p2Summary(quiet.flatMap((p, i) => p.traces.slice(marks[i + 1]))),
+        noisy: p2Summary(noisy.traces.slice(marks[0])),
+      };
+    }
+    const receipts = await Promise.all(all.map((p) => p.worker.close(10_000)));
+    expect(receipts.every((r) => r.workerEof && r.outputDrained && !r.unknownTail)).toBe(true);
+    for (const [i, p] of all.entries()) {
+      expect(p.faults).toEqual([]);
+      p2AssertTraces(p, i === 0 ? "noisy" : `quiet ${i}`);
+    }
+    // Quiet rows arrive intact and in order despite the noisy neighbour.
+    for (const p of quiet) {
+      const rows = [...p.scrolled, ...Object.values(p.updates.at(-1)!.frame.dirty).map(p2Text)].filter((r) => r.startsWith("quiet"));
+      const ticks = rows.map((r) => Number(r.split(" ")[1]));
+      expect(ticks).toEqual([...ticks].sort((a, b) => a - b));
+    }
+    if (phaseNames.includes("noisy")) expect(noisy.fed).toBeGreaterThan(0);
+    return { phases, noisyFed: noisy.fed, noisyRejected, quietFed: quiet.reduce((sum, p) => sum + p.fed, 0) };
+  } finally { await Promise.all(all.map((p) => p.worker.close(1000))); await pool.close(); }
+}
+
 const P2_LINE = "ไทย 漢字 😀 é \x1b[1;31mred\x1b[0m \x1b]0;title\x07tail";
 const P2_EXPECT = "ไทย 漢字 😀 é red tail";
 
@@ -374,51 +435,13 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
   }, 60_000);
 
   test("fairness 1 noisy + 20 quiet on one interpreter: stage attribution per class, nothing lost", async () => {
-    const pool = new PipeVtPool();
-    const quiet = Array.from({ length: 20 }, () => p2Pane({ pool, cols: 120, rows: 40 }));
-    const noisy = p2Pane({ pool, cols: 120, rows: 40 });
-    const all = [noisy, ...quiet];
-    const phases: Record<string, unknown> = {};
-    try {
-      await Promise.all(all.map((p) => p.worker.start()));
-      expect(new Set(all.map((p) => p.worker.pid)).size).toBe(1);
-      const burst = p2Encoder.encode(Array.from({ length: 64 }, (_, i) => `\x1b[3${i % 8}mnoisy ${i} ${"x".repeat(90)}\x1b[0m\r\n`).join(""));
-      let noisyRejected = 0;
-      for (const phase of ["quiet-only", "noisy"] as const) {
-        const marks = all.map((p) => p.traces.length);
-        const end = Date.now() + 4000;
-        let tick = 0;
-        while (Date.now() < end) {
-          // 20 quiet panes at ~0.5 row/s each is too sparse for 4 s: 20 rows/s total, staggered.
-          const q = quiet[tick % quiet.length]!;
-          p2Feed(q, p2Encoder.encode(`quiet ${tick} ไทย\r\n`));
-          if (phase === "noisy") {
-            for (let i = 0; i < 8; i++) if (!p2Feed(noisy, burst)) noisyRejected++;
-          }
-          tick++;
-          await p2Sleep(50);
-        }
-        await p2Until(() => all.every((p) => p.worker.traceBacklog().pending === 0), 30_000);
-        phases[phase] = {
-          quiet: p2Summary(quiet.flatMap((p, i) => p.traces.slice(marks[i + 1]))),
-          noisy: p2Summary(noisy.traces.slice(marks[0])),
-        };
-      }
-      const receipts = await Promise.all(all.map((p) => p.worker.close(10_000)));
-      expect(receipts.every((r) => r.workerEof && r.outputDrained && !r.unknownTail)).toBe(true);
-      for (const [i, p] of all.entries()) {
-        expect(p.faults).toEqual([]);
-        p2AssertTraces(p, i === 0 ? "noisy" : `quiet ${i}`);
-      }
-      // Quiet rows arrive intact and in order despite the noisy neighbour.
-      for (const p of quiet) {
-        const rows = [...p.scrolled, ...Object.values(p.updates.at(-1)!.frame.dirty).map(p2Text)].filter((r) => r.startsWith("quiet"));
-        const ticks = rows.map((r) => Number(r.split(" ")[1]));
-        expect(ticks).toEqual([...ticks].sort((a, b) => a - b));
-      }
-      expect(noisy.fed).toBeGreaterThan(0);
-      console.log(`P2-ATTRIBUTION ${JSON.stringify({ fixture: "1 noisy (8x64 SGR rows/50ms) + 20 quiet (1 row/50ms round-robin), 120x40, one interpreter, trivial consumer", noisyFed: noisy.fed, noisyRejected, quietFed: quiet.reduce((s, p) => s + p.fed, 0), phases })}`);
-    } finally { await Promise.all(all.map((p) => p.worker.close(1000))); await pool.close(); }
+    const { phases, noisyFed, noisyRejected, quietFed } = await p2FairnessRun(undefined, ["quiet-only", "noisy"], 4000);
+    console.log(`P2-ATTRIBUTION ${JSON.stringify({ fixture: "1 noisy (8x64 SGR rows/50ms) + 20 quiet (1 row/50ms round-robin), 120x40, one interpreter, trivial consumer", noisyFed, noisyRejected, quietFed, phases })}`);
+    // P2OPT gate: a noisy sibling may cost a quiet pane one bounded parser
+    // turn, not whole noisy frames. Before P2OPT (whole-frame turns, budget
+    // checked after each frame) this fixture measured quiet readLag p95
+    // 38 ms and feed->consumed p95 92 ms in the cage.
+    p2FairnessGate(phases.noisy!.quiet);
   }, 90_000);
 
   test("consumer pressure is reported as main-queue and consumer time, not as parse, and loses nothing", async () => {
@@ -517,7 +540,7 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
       const source = readFileSync(original.worker, "utf8");
       const [before, after] = mutation === "serialize-not-spliced"
         ? ['        body = body[:-1] + b\',"serializeNs":%d}\' % (time.monotonic_ns() - began)\n', "        pass\n"]
-        : ['                        rx = c["rx"].completed(5 + length)\n', '                        c["rx"].completed(5 + length); rx = None\n'];
+        : ['                            rx = c["rx"].completed(5 + length)\n', '                            c["rx"].completed(5 + length); rx = None\n'];
       expect(source).toContain(before);
       async function witness(mutated: boolean) {
         const dir = mkdtempSync(join(tmpdir(), `p2-mutation-${mutation}-`)); roots.push(dir);
@@ -529,7 +552,7 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
         const pane = p2Pane({ pool, assets });
         try {
           await pane.worker.start();
-          // 24 x 16 KiB in one go: the 64 KiB per-turn budget makes later frames wait.
+          // 24 x 16 KiB in one go: the per-turn parser budget makes later frames wait.
           const big = p2Encoder.encode(`${"w".repeat(16 * 1024 - 2)}\r\n`);
           for (let i = 0; i < 24; i++) assert.ok(p2Feed(pane, big));
           await p2Until(() => pane.worker.traceBacklog().pending === 0, 20_000);
@@ -544,4 +567,207 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
       await assert.rejects(witness(true), { name: "AssertionError" });
       console.log(`P2 mutation ${mutation}: clean=PASS damaged=DETECTED (real multiplex Python)`);
     }, 60_000);
+});
+
+// ── NEWARCH P2OPT: shared-interpreter fairness (sliced parser turns) ──
+// P2 found quiet panes waiting 27-76 ms behind one noisy pane's 26-37 ms
+// parser turn. The worker now feeds at most MAX_TURN_NS per channel turn, a
+// D frame in slices cut at UTF-8/escape boundaries, and acknowledges a frame
+// only after every slice of it was fed.
+import { spawnSync as p2optSpawnSync } from "node:child_process";
+
+const P2OPT_MUTANTS = {
+  // Back to whole-frame turns with the budget checked after each frame (pre-P2OPT).
+  "whole-frame-turns": [["TURN_SLICE_BYTES = 512\n", "TURN_SLICE_BYTES = 1 << 30\n"],
+    ["MAX_TURN_NS = 2_000_000\n", "MAX_TURN_NS = MAX_COALESCE_NS\n"]],
+  // Cut wherever the byte budget ends.
+  "naive-cut": [["    end = start + limit\n    if end >= len(data):\n", "    end = start + limit\n    return min(end, len(data))\n    if end >= len(data):\n"]],
+  // Emit (and acknowledge) the frame whose slices are still being fed.
+  "ack-mid-frame": [['if w is not None and c["partial"] is None and w.pending() and (', "if w is not None and w.pending() and ("]],
+  // Keep reading a channel whatever its unparsed backlog (pre-fix P2OPT).
+  "unbounded-read-ahead": [['if len(c["input"]) < read_ahead or not complete(c):', "if True:"]],
+} as const;
+
+function p2optAssets(mutant?: keyof typeof P2OPT_MUTANTS): PipeVtAssets {
+  const original = vtAssets();
+  let source = readFileSync(original.worker, "utf8");
+  for (const [before, after] of mutant ? P2OPT_MUTANTS[mutant] : []) {
+    expect(source, `${mutant} anchor`).toContain(before);
+    source = source.replace(before, after);
+  }
+  const dir = mkdtempSync(join(tmpdir(), `p2opt-${mutant ?? "clean"}-`)); roots.push(dir);
+  const assets = vtAssets(dir);
+  writeFileSync(assets.worker, source);
+  writeFileSync(assets.vendor, readFileSync(original.vendor));
+  writeFileSync(assets.license, readFileSync(original.license));
+  return assets;
+}
+
+/** Independent oracle: byte offsets that end a UTF-8 character or a whole escape sequence. */
+function p2optAtomEnds(b: Uint8Array): Set<number> {
+  const ends = new Set<number>([0]);
+  const at = (k: number) => b[k] ?? -1;
+  let i = 0;
+  while (i < b.length) {
+    const c = b[i]!;
+    let n = 1;
+    if (c === 0x1b) {
+      const t = at(i + 1);
+      n = 2;
+      if (t === 0x5b) { while (i + n < b.length && !(at(i + n) >= 0x40 && at(i + n) <= 0x7e)) n++; n++; }
+      else if ([0x5d, 0x50, 0x5f, 0x5e, 0x58].includes(t)) {
+        while (i + n < b.length && at(i + n) !== 0x07 && !(at(i + n) === 0x1b && at(i + n + 1) === 0x5c)) n++;
+        n += at(i + n) === 0x07 ? 1 : 2;
+      } else if (t >= 0x20 && t <= 0x2f) { while (at(i + n) >= 0x20 && at(i + n) <= 0x2f) n++; n++; }
+    } else if (c >= 0xf0) n = 4; else if (c >= 0xe0) n = 3; else if (c >= 0xc0) n = 2;
+    i += n;
+    ends.add(i);
+  }
+  return ends;
+}
+
+/** Successive slice_end cuts from offset 0, straight from the worker module. */
+function p2optCuts(assets: PipeVtAssets, data: Uint8Array, limits: number[]): Record<string, number[]> {
+  const script = [
+    "import importlib.util, json, sys",
+    "spec = importlib.util.spec_from_file_location('pvw', sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+    "data = sys.stdin.buffer.read(); out = {}",
+    "for limit in map(int, sys.argv[2].split(',')):",
+    "    cuts, s = [], 0",
+    "    while s < len(data):",
+    "        e = m.slice_end(data, s, limit); cuts.append(e)",
+    "        if e <= s: break",
+    "        s = e",
+    "    out[limit] = cuts",
+    "sys.stdout.write('CUTS' + json.dumps(out))",
+  ].join("\n");
+  const run = p2optSpawnSync("python3", ["-B", "-c", script, assets.worker, limits.join(",")], { input: data, encoding: "utf8" });
+  expect(run.status, run.stderr).toBe(0);
+  return JSON.parse(run.stdout.slice(run.stdout.indexOf("CUTS") + 4));
+}
+
+/** Mixed UTF-8 (Thai, CJK, emoji, combining) and escapes (SGR, 256/true colour, OSC BEL/ST, DCS query, nF). */
+function p2optLine(k: number, i: number): string {
+  return `${k}:${i} ไทย 漢字 😀 é \x1b[1;38;5;196mred\x1b[0m \x1b[38;2;255;128;0mtc\x1b[0m`
+    + `\x1b]0;t${i}\x07\x1b]2;s\x1b\\\x1bP+q544e\x1b\\\x1b(B z`;
+}
+function p2optFrame(k: number): Uint8Array {
+  // Lines without LF wrap across rows, so slices must also cut away from LF.
+  const body = Array.from({ length: 70 }, (_, i) => p2optLine(k, i) + (i % 5 === 4 ? "\r\n" : " ")).join("");
+  return p2Encoder.encode(`${body}END ${k}\r\n`);
+}
+
+describe("NEWARCH P2OPT shared parser fairness", () => {
+  const p2optCutCheck = (assets: PipeVtAssets) => {
+    const data = p2optFrame(7);
+    expect(data.byteLength).toBeGreaterThan(8 * 512);
+    const atoms = p2optAtomEnds(data);
+    const cuts = p2optCuts(assets, data, [24, 32, 64, 512]);
+    let checked = 0;
+    for (const [limit, list] of Object.entries(cuts)) {
+      let start = 0;
+      for (const cut of list) {
+        p2Assert.ok(cut > start && cut <= start + Number(limit), `limit ${limit}: cut ${cut} after ${start} is bounded and advances`);
+        const boundaryInWindow = [...atoms].some((a) => a > start && a <= start + Number(limit));
+        if (boundaryInWindow) p2Assert.ok(atoms.has(cut), `limit ${limit}: cut ${cut} splits a UTF-8 or escape sequence`);
+        start = cut; checked++;
+      }
+      p2Assert.equal(start, data.byteLength, `limit ${limit}: slices cover the frame`);
+    }
+    return checked;
+  };
+
+  test("slice cuts never split a UTF-8 sequence or an escape sequence, and cover the frame", () => {
+    expect(p2optCutCheck(vtAssets())).toBeGreaterThan(300);
+    expect(() => p2optCutCheck(p2optAssets("naive-cut"))).toThrow(/splits a UTF-8 or escape/);
+    console.log("P2OPT mutation naive-cut: clean=PASS damaged=DETECTED (real worker slice_end)");
+  }, 30_000);
+
+  async function p2optSlicedRun(assets: PipeVtAssets | undefined, shared: boolean) {
+    const pool = shared ? new PipeVtPool(assets ? { assets } : {}) : undefined;
+    const pane = p2Pane({ pool, assets, cols: 80, rows: 24 });
+    try {
+      await pane.worker.start();
+      for (let k = 1; k <= 12; k++) {
+        p2Assert.ok(p2Feed(pane, p2optFrame(k)));
+        if (k % 3 === 0) await p2Sleep(15);
+      }
+      await p2Until(() => pane.worker.traceBacklog().pending === 0, 30_000);
+      p2Assert.ok(pane.worker.requestFull(pane.seq));
+      // Quit is queued straight behind the full request: nothing may be lost.
+      const receipt = await pane.worker.close(10_000);
+      p2Assert.ok(receipt.workerEof && receipt.outputDrained && !receipt.unknownTail, JSON.stringify(receipt));
+      p2Assert.deepEqual(pane.faults, []);
+      p2AssertTraces(pane, shared ? "sliced shared" : "dedicated");
+      const last = pane.updates.at(-1)!;
+      p2Assert.ok(last.frame.full && last.seqTo === pane.seq, "final full frame acknowledges the last seq");
+      // Every data update acknowledges a new frame: none before its last slice was fed.
+      const seqs = pane.updates.slice(0, -1).map((u) => u.seqTo!);
+      for (let i = 1; i < seqs.length; i++) p2Assert.ok(seqs[i]! > seqs[i - 1]!, `update ${i} re-acknowledges seq ${seqs[i]} (acked before its frame was fully fed)`);
+      return {
+        scrolls: pane.updates.flatMap((u) => u.scrolls.map((s) => JSON.stringify([s.row, s.wrap, s.pad, s.seq]))),
+        screen: JSON.stringify([last.frame.dirty, last.frame.wraps, last.frame.pads, last.frame.cursor]),
+        updates: pane.updates.length,
+      };
+    } finally { await pane.worker.close(1000); await pool?.close(); }
+  }
+
+  test("sliced frames parse exactly like whole frames, in order, acknowledged once after their last slice", async () => {
+    const dedicated = await p2optSlicedRun(undefined, false);
+    const shared = await p2optSlicedRun(undefined, true);
+    expect(shared.scrolls.length).toBeGreaterThan(100);
+    expect(shared.scrolls).toEqual(dedicated.scrolls);
+    expect(shared.screen).toEqual(dedicated.screen);
+    expect(shared.scrolls.some((row) => row.includes("END"))).toBe(true);
+    // Acknowledging mid-frame either re-acknowledges the seq or leaves the frame's
+    // later slices billed to an update whose hold never covered them.
+    await p2Assert.rejects(p2optSlicedRun(p2optAssets("ack-mid-frame"), true), /re-acknowledges seq|hold covers wait\+parse/);
+    console.log(`P2OPT mutation ack-mid-frame: clean=PASS damaged=DETECTED (real multiplex Python, ${shared.updates} clean updates)`);
+  }, 90_000);
+
+  // Host budget + one 64 KiB read-ahead + a frame in flight + both kernel socket buffers.
+  const P2OPT_ACCEPT_BOUND = PIPE_VT_DATA_QUEUE_BYTES + 64 * 1024 + 2 * 1024 + 2 * 512 * 1024;
+
+  /** Bytes the host accepts before its data budget first refuses, with the consumer blocked. */
+  async function p2optBudgetRun(assets: PipeVtAssets | undefined) {
+    const pool = new PipeVtPool(assets ? { assets } : {});
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const pane = p2Pane({ pool, assets, consumer: () => gate });
+    try {
+      await pane.worker.start();
+      const chunk = p2Encoder.encode(`${"z".repeat(1000)}\r\n`);
+      const accepted = () => pane.fed * (chunk.byteLength + 21);
+      const end = Date.now() + 20_000;
+      let refused = false;
+      // Paced so a worker that reads ahead of its parser has time to pull the backlog in.
+      while (Date.now() < end && accepted() <= P2OPT_ACCEPT_BOUND) {
+        if (!p2Feed(pane, chunk)) { refused = true; break; }
+        if (pane.fed % 16 === 0) await p2Sleep(2);
+      }
+      if (!refused) return { accepted: accepted(), refused };
+      release();
+      await p2Until(() => pane.worker.traceBacklog().pending === 0, 30_000);
+      p2Assert.ok(!(await pane.worker.close(10_000)).unknownTail);
+      p2AssertTraces(pane, "read-ahead");
+      return { accepted: accepted(), refused };
+    } finally { release(); await pane.worker.close(1000); await pool.close(); }
+  }
+
+  test("short parser turns do not pull the backlog out of the socket: the host data budget still bounds it", async () => {
+    const clean = await p2optBudgetRun(undefined);
+    expect(clean.refused).toBe(true);
+    expect(clean.accepted).toBeGreaterThan(PIPE_VT_DATA_QUEUE_BYTES / 2);
+    expect(clean.accepted).toBeLessThanOrEqual(P2OPT_ACCEPT_BOUND);
+    const unbounded = await p2optBudgetRun(p2optAssets("unbounded-read-ahead"));
+    expect(unbounded.accepted).toBeGreaterThan(P2OPT_ACCEPT_BOUND);
+    console.log(`P2OPT mutation unbounded-read-ahead: DETECTED accepted before refusal clean=${clean.accepted} B damaged>${unbounded.accepted} B (refused=${unbounded.refused}) bound=${P2OPT_ACCEPT_BOUND} B`);
+  }, 120_000);
+
+  test("mutation whole-frame-turns: the pre-P2OPT turn budget fails the fairness gate", async () => {
+    const { phases } = await p2FairnessRun(p2optAssets("whole-frame-turns"), ["noisy"], 3000);
+    const quiet = phases.noisy!.quiet;
+    expect(() => p2FairnessGate(quiet)).toThrow();
+    console.log(`P2OPT mutation whole-frame-turns: DETECTED quiet readLag p95=${quiet.readLagMs.p95} feed->consumed p95=${quiet.feedToConsumedMs.p95}`);
+  }, 90_000);
 });
