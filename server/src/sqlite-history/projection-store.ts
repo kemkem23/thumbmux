@@ -4,7 +4,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, open
 import { dirname, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { PROJECTION_LEGACY_FILES, PROJECTION_MIGRATION, PROJECTION_SCHEMA, PROJECTION_SCHEMA_MARKERS, PROJECTION_SCHEMA_VERSION, PROJECTION_STORE_FILE } from './schema';
-import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, validateFrame, validateRow, type SqlRow } from './ram-store';
+import { closePrepared, prepared, ProjectionRam, paneId, upsert, decodeCells, decodeFrameCells, encodeCells, encodeFrameCells, frameCodecStats, validateFrame, validateRow, type FrameCodecStats, type SqlRow } from './ram-store';
 import { BLOCK_COLUMNS, LegacyUnderlay, lowestLine, readDiskLines, readProjectionPage, projectionIssue, type LegacyFloor } from './projection-reader';
 import { decodeBlock, decodeCaptureArchive, decodeCaptureReceipts, encodeBlock, encodeCaptureArchive, encodeCaptureReceipts, encodeRow } from './codec';
 import { PROJECTION_OVERSIZE } from './types';
@@ -87,22 +87,67 @@ const captureRow=(paneNo:number,values:unknown[]):SqlRow=>{
   CAPTURE_COLUMNS.forEach((column,index)=>{row[column]=values[index] as SqlRow[string];});
   return row;
 };
-function captureReceipt(disk:Database,paneNo:number,captureId:string):SqlRow {
-  const live=prepared(disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(paneNo,captureId) as SqlRow|null;
-  if(live)return live;
-  for(const block of prepared(disk,'SELECT catalog,data,capture_count FROM na_capture_archive WHERE pane_no=? ORDER BY archive_no DESC').all(paneNo) as SqlRow[]) {
-    const catalog=decodeCaptureArchive(block.catalog as unknown as Uint8Array);
-    if(catalog.length!==Number(block.capture_count))throw new Error('capture-archive-corrupt');
-    const ordinal=catalog.findIndex(item=>Array.isArray(item)&&item[0]===captureId);
-    if(ordinal<0)continue;
-    const data=decodeCaptureReceipts(block.data as unknown as Uint8Array);
-    if(data.length!==catalog.length)throw new Error('capture-archive-corrupt');
-    const row=captureRow(paneNo,data[ordinal]!);
-    if(row.capture_id!==captureId || row.revision!==catalog[ordinal]![1] || row.source_epoch!==catalog[ordinal]![2]
-      || row.geometry_generation!==catalog[ordinal]![3])throw new Error('capture-archive-catalog');
-    return row;
+/**
+ * Archive work counters of one SQLite handle (D2). The disk worker reports its
+ * own through the shared signal; ProjectionStore.archiveStats() adds both.
+ */
+export interface ArchiveStats {
+  /** Commits that went through the archive scheduler. */
+  commits:number;
+  /** Eligibility scans (the anti-join) actually run, and their time. */
+  scans:number;scanMs:number;
+  /** Cheap live-receipt counts that decided whether a scan could pay off. */
+  countChecks:number;
+  /** Archive chunks written and receipts moved into them. */
+  chunks:number;archived:number;
+  /** Receipt lookups: catalogs inflated and archive data blobs fetched. */
+  catalogReads:number;dataReads:number;
+}
+const WORKER_ARCHIVE_SLOTS=['scans','scanMs','countChecks','chunks','archived'] as const;
+const emptyArchiveStats=():ArchiveStats=>({commits:0,scans:0,scanMs:0,countChecks:0,chunks:0,archived:0,catalogReads:0,dataReads:0});
+const archiveStatsByDb=new WeakMap<Database,ArchiveStats>();
+function archiveStatsOf(disk:Database):ArchiveStats {
+  let stats=archiveStatsByDb.get(disk);if(!stats){stats=emptyArchiveStats();archiveStatsByDb.set(disk,stats);}
+  return stats;
+}
+/**
+ * Every receipt `ids` names, live or archived. Archives are walked newest
+ * first by catalog only; a data blob is fetched solely for an archive whose
+ * catalog holds a wanted id, and each archive is inflated once for all ids.
+ */
+function captureReceipts(disk:Database,paneNo:number,ids:Iterable<string>):Map<string,SqlRow> {
+  const found=new Map<string,SqlRow>(),wanted=new Set<string>();
+  for(const id of ids) {
+    if(found.has(id))continue;
+    const live=prepared(disk,'SELECT * FROM na_capture WHERE pane_no=? AND capture_id=?').get(paneNo,id) as SqlRow|null;
+    if(live)found.set(id,live);else wanted.add(id);
   }
-  throw new Error('capture-receipt-missing');
+  const stats=archiveStatsOf(disk);
+  for(let below=Number.MAX_SAFE_INTEGER;wanted.size;) {
+    const page=prepared(disk,'SELECT archive_no,catalog,capture_count FROM na_capture_archive WHERE pane_no=? AND archive_no<? ORDER BY archive_no DESC LIMIT 32').all(paneNo,below) as SqlRow[];
+    if(!page.length)break;
+    for(const block of page) {
+      below=Number(block.archive_no);
+      const catalog=decodeCaptureArchive(block.catalog as unknown as Uint8Array);stats.catalogReads++;
+      if(catalog.length!==Number(block.capture_count))throw new Error('capture-archive-corrupt');
+      const hits:number[]=[];
+      catalog.forEach((item,ordinal)=>{if(Array.isArray(item) && wanted.has(item[0] as string))hits.push(ordinal);});
+      if(!hits.length)continue;
+      const stored=prepared(disk,'SELECT data FROM na_capture_archive WHERE archive_no=?').get(below) as SqlRow;stats.dataReads++;
+      const data=decodeCaptureReceipts(stored.data as unknown as Uint8Array);
+      if(data.length!==catalog.length)throw new Error('capture-archive-corrupt');
+      for(const ordinal of hits) {
+        const row=captureRow(paneNo,data[ordinal]!),id=catalog[ordinal]![0] as string;
+        if(row.capture_id!==id || row.revision!==catalog[ordinal]![1] || row.source_epoch!==catalog[ordinal]![2]
+          || row.geometry_generation!==catalog[ordinal]![3])throw new Error('capture-archive-catalog');
+        // The newest archive holding an id wins, as a live row wins over any archive.
+        if(wanted.delete(id))found.set(id,row);
+      }
+      if(!wanted.size)break;
+    }
+  }
+  if(wanted.size)throw new Error('capture-receipt-missing');
+  return found;
 }
 /** Per-line upsert, unless a sealed block holds the line: then the block is patched. */
 function writeLines(disk:Database,rows:SqlRow[]):void {
@@ -125,7 +170,8 @@ function writeLines(disk:Database,rows:SqlRow[]):void {
 }
 const sealAttempts=new WeakMap<Database,Map<SqlRow[string],number>>();
 /** Seal every complete aligned block of settled per-line rows (see SEAL_LINES). */
-function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
+function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {
+  const sealed=new Set<number>();
   let attempts=sealAttempts.get(disk);if(!attempts){attempts=new Map();sealAttempts.set(disk,attempts);}
   const now=performance.now();
   for(const p of panes) {
@@ -142,27 +188,113 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {
       prepared(disk,'INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,?,?,?)')
         .run(p.pane_no,from,SEAL_LINES,Math.max(...rows.map(r=>Number(r.revision))),encodeBlock(rows.map(blockLine)));
       prepared(disk,'DELETE FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<?').run(p.pane_no,from,from+SEAL_LINES);
+      sealed.add(Number(p.pane_no));
     }
   }
+  return sealed;
 }
-/** Archive receipts only after every live FK has moved into a sealed block. */
-function archiveCaptures(disk:Database,panes:SqlRow[],force:boolean):void {
-  for(const pane of panes)for(;;) {
-    const rows=prepared(disk,`SELECT c.* FROM na_capture c WHERE c.pane_no=?
-      AND NOT EXISTS(SELECT 1 FROM na_line l WHERE l.pane_no=c.pane_no AND l.checked_capture_id=c.capture_id)
-      AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=c.pane_no ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT 8)
-      ORDER BY c.revision,c.capture_id LIMIT 256`).all(pane.pane_no) as SqlRow[];
-    if(!rows.length || (!force && rows.length<128))break;
+/**
+ * Archive scheduling (D2). The eligibility scan used to run for every pane of
+ * every commit, and SQLite ran its anti-join once per receipt over every
+ * per-line row of the pane (no disk index on checked_capture_id). Now:
+ *  - the scan is one set operation: the pane's live FKs and its newest
+ *    ARCHIVE_KEEP receipts are each read once (uncorrelated IN lists);
+ *  - a pane is queued only when a commit adds receipts or seals lines;
+ *  - a queued pane is scanned only if its live receipt count can reach a
+ *    chunk (a PK range count), and after a futile scan (receipts still pinned
+ *    by per-line rows) only once a seal released lines or ARCHIVE_RETRY_MS
+ *    passed;
+ *  - one commit scans at most ARCHIVE_SCANS_PER_COMMIT panes and writes at
+ *    most ARCHIVE_CHUNKS_PER_COMMIT chunks; the rest stays queued.
+ * Archive insert and receipt delete stay inside the commit transaction, and
+ * the queue changes only after that transaction committed, so a failed or
+ * retried commit leaves both the file and the schedule as they were. The
+ * explicit flush barrier still archives every pane completely (force).
+ */
+const ARCHIVE_MIN=128, ARCHIVE_MAX=256, ARCHIVE_KEEP=8, ARCHIVE_RETRY_MS=1000, ARCHIVE_SCANS_PER_COMMIT=4, ARCHIVE_CHUNKS_PER_COMMIT=4;
+export const ARCHIVE_SCAN_SQL=`SELECT c.* FROM na_capture c WHERE c.pane_no=?
+      AND c.capture_id NOT IN(SELECT l.checked_capture_id FROM na_line l WHERE l.pane_no=? AND l.checked_capture_id IS NOT NULL)
+      AND c.capture_id NOT IN(SELECT recent.capture_id FROM na_capture recent WHERE recent.pane_no=? ORDER BY recent.revision DESC,recent.capture_id DESC LIMIT ${ARCHIVE_KEEP})
+      ORDER BY c.revision,c.capture_id LIMIT ${ARCHIVE_MAX}`;
+type ArchiveEntry={scannedAt:number;released:boolean};
+type ArchivePlan={marks:Map<number,boolean>;updates:Map<number,ArchiveEntry|null>};
+const archiveQueues=new WeakMap<Database,Map<number,ArchiveEntry>>();
+let archiveClock=()=>performance.now();
+function archiveQueue(disk:Database):Map<number,ArchiveEntry> {
+  let queue=archiveQueues.get(disk);if(!queue){queue=new Map();archiveQueues.set(disk,queue);}
+  return queue;
+}
+/** Move eligible receipts of one pane into archive chunks; returns the chunks written and whether more remain. */
+function archivePane(disk:Database,paneNo:number,force:boolean,chunkBudget:number):{chunks:number;more:boolean} {
+  const stats=archiveStatsOf(disk);let chunks=0;
+  for(;;) {
+    const started=performance.now();
+    const rows=prepared(disk,ARCHIVE_SCAN_SQL).all(paneNo,paneNo,paneNo) as SqlRow[];
+    stats.scans++;stats.scanMs+=performance.now()-started;
+    if(!rows.length || (!force && rows.length<ARCHIVE_MIN))return {chunks,more:false};
     const catalog=rows.map(row=>[row.capture_id,row.revision,row.source_epoch,row.geometry_generation]);
     prepared(disk,'INSERT INTO na_capture_archive (pane_no,first_revision,last_revision,capture_count,catalog,data) VALUES (?,?,?,?,?,?)')
-      .run(pane.pane_no,rows[0]!.revision,rows.at(-1)!.revision,rows.length,encodeCaptureArchive(catalog),encodeCaptureReceipts(rows.map(captureValues)));
+      .run(paneNo,rows[0]!.revision,rows.at(-1)!.revision,rows.length,encodeCaptureArchive(catalog),encodeCaptureReceipts(rows.map(captureValues)));
     const remove=prepared(disk,'DELETE FROM na_capture WHERE pane_no=? AND capture_id=?');
-    for(const row of rows)remove.run(pane.pane_no,row.capture_id);
-    if(rows.length<256)break;
+    for(const row of rows)remove.run(paneNo,row.capture_id);
+    chunks++;stats.chunks++;stats.archived+=rows.length;
+    if(rows.length<ARCHIVE_MAX)return {chunks,more:false};
+    if(!force && chunks>=chunkBudget)return {chunks,more:true};
   }
 }
+function liveReceipts(disk:Database,paneNo:number):number {
+  archiveStatsOf(disk).countChecks++;
+  return Number((prepared(disk,'SELECT count(*) AS n FROM na_capture WHERE pane_no=?').get(paneNo) as SqlRow).n);
+}
+/**
+ * Inside the commit transaction: archive what the schedule says is due. The
+ * returned plan is applied to the queue by applyArchivePlan after commit.
+ */
+function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[]):ArchivePlan {
+  const plan:ArchivePlan={marks,updates:new Map()};
+  if(force) {
+    // Barrier: every pane, completely; the queue forgets the panes it drained.
+    for(const paneNo of panes) {
+      if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,true,Infinity);
+      plan.updates.set(paneNo,null);
+    }
+    return plan;
+  }
+  const queue=archiveQueue(disk),now=archiveClock();
+  // The view this commit schedules from: the queue plus this batch's marks.
+  const view=new Map<number,ArchiveEntry>();
+  for(const [paneNo,entry] of queue)view.set(paneNo,{...entry});
+  for(const [paneNo,released] of marks) {
+    const entry=view.get(paneNo);
+    if(entry)entry.released||=released;else view.set(paneNo,{scannedAt:-Infinity,released});
+  }
+  let scans=0,chunks=0;
+  for(const [paneNo,entry] of view) {
+    if(scans>=ARCHIVE_SCANS_PER_COMMIT || chunks>=ARCHIVE_CHUNKS_PER_COMMIT)break;
+    if(!entry.released && now-entry.scannedAt<ARCHIVE_RETRY_MS)continue;
+    // Below a chunk plus the kept receipts no scan can archive anything; a
+    // later receipt re-queues the pane.
+    if(liveReceipts(disk,paneNo)<ARCHIVE_MIN+ARCHIVE_KEEP){plan.updates.set(paneNo,null);continue;}
+    scans++;
+    const done=archivePane(disk,paneNo,false,ARCHIVE_CHUNKS_PER_COMMIT-chunks);chunks+=done.chunks;
+    plan.updates.set(paneNo,{scannedAt:now,released:done.more});
+  }
+  return plan;
+}
+/** After commit only: a rolled-back transaction must not advance the schedule. */
+function applyArchivePlan(disk:Database,plan:ArchivePlan):void {
+  const queue=archiveQueue(disk);
+  for(const [paneNo,released] of plan.marks) {
+    const entry=queue.get(paneNo);
+    if(entry)entry.released||=released;else queue.set(paneNo,{scannedAt:-Infinity,released});
+  }
+  // The scan already saw this commit's receipts and seals. A scanned pane
+  // moves to the back, so a capped commit serves the other panes next.
+  for(const [paneNo,update] of plan.updates){queue.delete(paneNo);if(update)queue.set(paneNo,update);}
+  archiveStatsOf(disk).commits++;
+}
 function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void, checkpoint=false, forceSeal=false) {
-  const started=performance.now();let writeMs=0;
+  const started=performance.now();let writeMs=0,archiveMs=0,plan:ArchivePlan|null=null;
   disk.transaction(()=>{
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
     const existing=prepared(disk,'SELECT digest FROM na_commit WHERE commit_id=?').get(batch.id) as SqlRow|null;
@@ -173,15 +305,22 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     // and na_pane already holds every watermark. commit_seq counts all commits.
     prepared(disk,'INSERT INTO na_commit VALUES (?,coalesce((SELECT max(commit_seq) FROM na_commit),0)+1,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     prepared(disk,'DELETE FROM na_commit WHERE commit_id<>?').run(batch.id);
-    sealBlocks(disk,batch.panes,forceSeal);
-    archiveCaptures(disk,batch.panes,forceSeal);
+    const sealed=sealBlocks(disk,batch.panes,forceSeal);
+    // Receipts in the batch may push older ones past the kept few; a seal frees FKs.
+    const marks=new Map<number,boolean>();
+    for(const row of batch.tables.get('na_capture')??[])marks.set(Number(row.pane_no),false);
+    for(const paneNo of sealed)marks.set(paneNo,true);
+    const archiveStarted=performance.now();
+    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[]);
+    archiveMs=performance.now()-archiveStarted;
     before?.();writeMs=performance.now()-started;
   }).immediate();
+  if(plan)applyArchivePlan(disk,plan);
   // Bound physical WAL growth without forcing a truncate into the ingest
   // latency tail. Explicit durability barriers below still truncate the WAL;
   // the background path only advances the checkpoint non-blockingly.
   if(checkpoint)disk.exec('PRAGMA wal_checkpoint(PASSIVE)');
-  const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs};
+  const totalMs=performance.now()-started;return {totalMs,writeMs,commitMs:totalMs-writeMs,archiveMs};
 }
 // Same module in source and compiled distributions: no extra worker asset/factory.
 if(!isMainThread && workerData?.projectionDiskWriter===true) {
@@ -190,6 +329,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const disk=new Database(workerData.file,{strict:true});
   disk.exec(`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
   let commits=0;
+  const stats=archiveStatsOf(disk);
   const onMessage=(batch:Batch|'close')=>{
     if(batch==='close') {
       try {closePrepared(disk);}catch(error){console.error('[newarch] disk worker close failed',String(error));}
@@ -198,8 +338,12 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       parentPort!.off('message',onMessage);parentPort!.close();return;
     }
     try {
+      const before={...stats};
       const timing=commitBatch(disk,workerData.fence,batch,undefined,++commits%CHECKPOINT_COMMITS===0);
       Atomics.store(signal,2,Math.round(timing.totalMs*1000));Atomics.store(signal,3,Math.round(timing.writeMs*1000));
+      // This commit's archive work, as deltas (slots 4-9; the error text shares them only on failure).
+      Atomics.store(signal,4,Math.round(timing.archiveMs*1000));
+      WORKER_ARCHIVE_SLOTS.forEach((field,i)=>Atomics.store(signal,5+i,field==='scanMs'?Math.round((stats.scanMs-before.scanMs)*1000):stats[field]-before[field]));
       Atomics.store(signal,0,1);
     }
     catch(error) {
@@ -251,7 +395,10 @@ export class ProjectionStore implements ProjectionWriterPort {
   private worker:Worker|null=null;
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
-  private diskTiming={totalMs:0,writeMs:0,commitMs:0};
+  private diskTiming={totalMs:0,writeMs:0,commitMs:0,archiveMs:0};
+  private workerArchive=emptyArchiveStats();
+  /** Synchronous RAM transactions of the screen fast path (fc:2 write), on the ingest thread. */
+  private frameWrites={count:0,totalMs:0,maxMs:0};
   private closing=false;
   private rejectedRows=0;
   private screenBytes=new Map<string,number>();
@@ -345,8 +492,10 @@ export class ProjectionStore implements ProjectionWriterPort {
         upsert(this.ram.db,'na_pane',row);
         const floor=Math.max(0,Number(row.next_line_id)-5000);
         const lines=readDiskLines(this.disk,Number(row.pane_no),floor,Number(row.next_line_id));
-        for(const id of new Set(lines.map(l=>l.checked_capture_id).filter(id=>id!==null)))
-          upsert(this.ram.db,'na_capture',captureReceipt(this.disk,Number(row.pane_no),String(id)));
+        // One walk of the pane's archives for every receipt its tail needs.
+        const ids=new Set(lines.map(l=>l.checked_capture_id).filter(id=>id!==null).map(String));
+        for(const receipt of captureReceipts(this.disk,Number(row.pane_no),ids).values())
+          upsert(this.ram.db,'na_capture',receipt);
         for(const line of lines) upsert(this.ram.db,'na_line',line);
       }
     })();
@@ -717,7 +866,10 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(bytes>this.maxEvent())this.rejectOversize(frame.paneKey,frame,false,`frame:${frame.sourceEpoch}:${frame.receiveSeq}:${bytes}`);
       const scope=this.liveRam()+Math.max(0,delta)>this.cacheMax?'store':this.capacity(frame.paneKey,delta,true);
       if(scope!=='ok')return Promise.resolve(this.pressure(frame.paneKey,bytes,scope,false));
+      const written=performance.now();
       const receipt=this.ram.db.transaction(()=>{this.ram.screen(frame,null,null,[],encoded);return this.ram.bump(frame.paneKey);})();
+      const writeMs=performance.now()-written;
+      this.frameWrites.count++;this.frameWrites.totalMs+=writeMs;this.frameWrites.maxMs=Math.max(this.frameWrites.maxMs,writeMs);
       if(delta>0)this.ramBytesCache=-1;
       this.reserve(pane,delta,true);this.dirtyBytes+=delta;this.screenBytes.set(id,bytes);this.dirtySince??=Date.now();
       // An older frame of this kind still queued (behind a barrier that has since
@@ -831,11 +983,10 @@ export class ProjectionStore implements ProjectionWriterPort {
           .filter(lineId=>!prepared(this.ram.db,'SELECT 1 FROM na_line WHERE pane_no=? AND line_id=?').get(no,lineId));
         if(missing.length) {
           const wanted=new Set(missing);
-          for(const row of readDiskLines(this.disk,no,Math.min(...missing),Math.max(...missing)+1)) {
-            if(!wanted.has(Number(row.line_id)))continue;
-            if(row.checked_capture_id!==null) {
-              upsert(this.ram.db,'na_capture',captureReceipt(this.disk,no,String(row.checked_capture_id)));
-            }
+          const rows=readDiskLines(this.disk,no,Math.min(...missing),Math.max(...missing)+1).filter(row=>wanted.has(Number(row.line_id)));
+          const receipts=captureReceipts(this.disk,no,rows.filter(row=>row.checked_capture_id!==null).map(row=>String(row.checked_capture_id)));
+          for(const row of rows) {
+            if(row.checked_capture_id!==null)upsert(this.ram.db,'na_capture',receipts.get(String(row.checked_capture_id))!);
             upsert(this.ram.db,'na_line',row);
           }
         }
@@ -918,7 +1069,9 @@ export class ProjectionStore implements ProjectionWriterPort {
     this.inFlight=false;
     if(state===2)throw new Error(new TextDecoder().decode(new Uint8Array(this.signal.buffer,8,Atomics.load(this.signal,1))));
     const totalMs=Atomics.load(this.signal,2)/1000,writeMs=Atomics.load(this.signal,3)/1000;
-    this.diskTiming={totalMs,writeMs,commitMs:totalMs-writeMs};
+    this.diskTiming={totalMs,writeMs,commitMs:totalMs-writeMs,archiveMs:Atomics.load(this.signal,4)/1000};
+    WORKER_ARCHIVE_SLOTS.forEach((field,i)=>{const v=Atomics.load(this.signal,5+i);this.workerArchive[field]+=field==='scanMs'?v/1000:v;});
+    this.workerArchive.commits++;
     this.acknowledge();
   }
   private ensureWorker():void {
@@ -963,10 +1116,12 @@ export class ProjectionStore implements ProjectionWriterPort {
       // A prior asynchronous commit may have drained the final dirty batch.
       // The explicit barrier still performs derived compaction for every pane;
       // otherwise quiet panes keep one receipt row per capture indefinitely.
+      let plan:ArchivePlan|null=null;
       this.disk.transaction(()=>{
         const panes=prepared(this.disk,'SELECT * FROM na_pane').all() as SqlRow[];
-        sealBlocks(this.disk,panes,true);archiveCaptures(this.disk,panes,true);
+        sealBlocks(this.disk,panes,true);plan=archiveCaptures(this.disk,new Map(),true,panes.map(p=>Number(p.pane_no)));
       }).immediate();
+      if(plan)applyArchivePlan(this.disk,plan);
       this.disk.exec('PRAGMA incremental_vacuum');
       this.disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     }catch(error){this.handleFlushFailure(error);throw error;}
@@ -985,6 +1140,19 @@ export class ProjectionStore implements ProjectionWriterPort {
       if(Number(issue.revision)<=Number(p.revision))issues.set(String(issue.issue_id),issue);
     return {status:p.health==='healthy'?'healthy':'degraded',
       issues:[...issues.values()].sort((a,b)=>Number(a.revision)-Number(b.revision)).map(projectionIssue)};
+  }
+  /**
+   * Archive scheduling and receipt lookup counters (D2): the disk worker's
+   * commits plus this thread's barrier flushes and boot/calibration lookups.
+   */
+  archiveStats():ArchiveStats {
+    const own=archiveStatsOf(this.disk),sum=emptyArchiveStats();
+    for(const key of Object.keys(sum) as (keyof ArchiveStats)[])sum[key]=own[key]+this.workerArchive[key];
+    return sum;
+  }
+  /** fc:2 frame path: codec counters (process-wide) and this store's fast-path RAM writes. */
+  frameStats():{codec:FrameCodecStats;writes:{count:number;totalMs:number;maxMs:number}} {
+    return {codec:frameCodecStats(),writes:{...this.frameWrites}};
   }
   health():ProjectionHealth {
     this.owner();if(this.storageStatus==='healthy' && this.pendingAge()>1000 && !this.degraded)this.fault('flush-overdue','pending age exceeded 1s');
@@ -1055,3 +1223,9 @@ export class ProjectionStore implements ProjectionWriterPort {
 }
 export function createProjectionStore(options:ProjectionOptions):ProjectionStore {return new ProjectionStore(options);}
 export { PROJECTION_MIGRATION };
+/** Test seam: the archive scheduler's internals and clock. Not a runtime API. */
+export const projectionArchiveInternals={
+  commitBatch,captureReceipts,archiveStatsOf,archiveQueue,ARCHIVE_SCAN_SQL,
+  limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT},
+  setClock(clock:(()=>number)|null){archiveClock=clock??(()=>performance.now());},
+};
