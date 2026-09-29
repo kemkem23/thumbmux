@@ -890,16 +890,28 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
        const {cellsToAnsi}=await import(${JSON.stringify(join(import.meta.dir,'../src/pipe-history-runtime.ts'))});
        const {readdirSync,statSync}=await import('node:fs');
        const observedFields=['grapheme','width','continuation','fg','bg','style','cursor-position','cursor-visible'];
+       // Backpressure is not loss (FIX1 §3): a refused row is re-offered after its pane drains,
+       // as a real caller does. On a slow disk (GitHub runner) per-cell JSON rows fill the pane
+       // quota; ignoring the refusal left a missing line for calibrate (capture-line-generation)
+       // before the disk ratio below could judge the mutant. A drain that never comes is not MUTATION_RED.
+       let refused=0;
        for(let at=0;at<6000;at+=64) {
         const slice=Array.from({length:64},(_,k)=>oracle(at+k+1));
-        for(const [k,physical] of slice.entries())await s.appendScroll({...row('',at+k+1),physicalRow:physical});
+        for(const [k,physical] of slice.entries()) {
+         const event={...row('',at+k+1),physicalRow:physical};
+         while((await s.appendScroll(event)).accepted===false) {
+          refused++;
+          let timer;const done=await Promise.race([s.drained(key).then(()=>true),new Promise(r=>{timer=setTimeout(()=>r(false),30000);})]);clearTimeout(timer);
+          if(!done)throw Error('S2 fixture: refused row did not drain within 30 s');
+         }
+        }
         await s.calibrate({capture:{...frame('A'),captureId:'nonce-'+at+'/1',requestedAt:at,completedAt:at+1,firstHistoryRow:0,history:slice,observedFields,ambiguousRows:0,result:'unfenced'},
          expectedRevision:s.token(key).revision,checks:slice.map((_,k)=>({lineId:at+k,captureRow:k})),repairs:[]});
        }
        s.flush();let R=0;
        for(let at=0;at<6000;at+=2000)for(const l of s.readPage(s.token(key),at,2000).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells));
        const folder=data+'/newarch-v5',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
-       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R}));
+       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R,refused}));
        assert(D<=1.5*R,'disk must stay within 1.5 x the rows it holds: D/R='+(D/R).toFixed(3));
       }
      } else if(name.startsWith('I4-S2')) {

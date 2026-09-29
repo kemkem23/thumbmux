@@ -1270,16 +1270,27 @@ test('CANARY-D: 14-pane capture-heavy replay keeps drained DB WAL SHM at or belo
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 },120000);
 
-// CANARY-FIX D FIX1: upgrade from and rollback to the real 0.20.3 release (the
-// git-dist the root project pins), not a hand-made v4 file.
+// CANARY-FIX D FIX1: upgrade from and rollback to the real 0.20.3 release, not a
+// hand-made v4 file. The two self-contained bundles are copied byte for byte from
+// the public tag v0.20.3-dist (fb4da0f96) git-dist/server/sqlite-history/, so the
+// test runs the same release in the monorepo and on a fresh public clone (CI has
+// no host node_modules/thumbmux; 0.20.4 CI died on ENOENT before any assertion).
 import { existsSync as existsFix1, writeFileSync as writeFix1 } from 'node:fs';
-const RELEASE_0203=join(import.meta.dir,'../../../../node_modules/thumbmux');
+const RELEASE_0203=join(import.meta.dir,'fixtures/thumbmux-0.20.3');
+const RELEASE_0203_SHA256:Record<string,string>={
+ 'projection-store.js':'ec30339cfd87fab907c229e9a16a2cb44c0c956dffcb28325d1a38f554f6fd01', // git blob 6f0e1bd93
+ 'projection-reader.js':'edf7160504a111200244989a5fb6269805ab8cf446a80a7602d9453be6c23ffc', // git blob 70e730c6f
+};
 async function release0203() {
- const pkg=JSON.parse(readFileS2(join(RELEASE_0203,'package.json'),'utf8'));
- // The root pin is the only copy of 0.20.3 on the machine: a moved pin must fail here, loudly.
- expect(pkg.version).toBe('0.20.3');
- const store=await import(join(RELEASE_0203,'git-dist/server/sqlite-history/projection-store.js'));
- const reader=await import(join(RELEASE_0203,'git-dist/server/sqlite-history/projection-reader.js'));
+ const sha=(file:string)=>createHash('sha256').update(readFileS2(file)).digest('hex');
+ // An edited or missing fixture must fail here, loudly: it is the only 0.20.3 this test runs.
+ for(const [file,digest] of Object.entries(RELEASE_0203_SHA256))expect(sha(join(RELEASE_0203,file))).toBe(digest);
+ // Inside the monorepo the root project still pins the same release: prove the copy did not drift.
+ const pinned=join(import.meta.dir,'../../../../node_modules/thumbmux');
+ if(existsFix1(join(pinned,'package.json')) && JSON.parse(readFileS2(join(pinned,'package.json'),'utf8')).version==='0.20.3')
+  for(const [file,digest] of Object.entries(RELEASE_0203_SHA256))expect(sha(join(pinned,'git-dist/server/sqlite-history',file))).toBe(digest);
+ const store=await import(join(RELEASE_0203,'projection-store.js'));
+ const reader=await import(join(RELEASE_0203,'projection-reader.js'));
  return {createProjectionStore:store.createProjectionStore as typeof createProjectionStore,openProjectionArchive:reader.openProjectionArchive as typeof openProjectionArchive};
 }
 const fix1Texts=(lines:{text:string}[])=>lines.map(l=>l.text);
