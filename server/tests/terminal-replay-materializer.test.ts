@@ -5,6 +5,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -321,6 +322,100 @@ describe("raw WAL terminal replay materializer (private tmux)", () => {
       replacement.close();
     }
   }, 40_000);
+
+  /**
+   * Many small output records around the inputs a coalesced recovery must
+   * not reorder: a control record, a CSI split across records, and a Claude
+   * Code style full redraw (`CSI 2 J CSI 3 J`) after rows already scrolled.
+   * The checkpoint is produced one record at a time, as production does.
+   */
+  function produceSmallRecordLane(records: number): TerminalReplayResult {
+    const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });
+    writer.appendJson("lifecycle", lifecycle("start", geometry(24, 5)));
+    const resizeAt = Math.floor(records / 2);
+    const redrawAt = Math.floor(records / 3);
+    const splitAt = Math.floor((records * 3) / 4);
+    for (let index = 1; index <= records; index += 1) {
+      if (index === resizeAt) {
+        writer.appendJson("resize", {
+          phase: "commit",
+          changeId: "layout-mid",
+          from: geometry(24, 5),
+          to: geometry(20, 6),
+          reason: "tmux-control-layout",
+        });
+      }
+      if (index === redrawAt) writer.appendOutput(Buffer.from("\x1b[2J\x1b[3J\x1b[HREDRAW\r\n", "ascii"));
+      else if (index === splitAt) writer.appendOutput(Buffer.from("\x1b[3", "ascii"));
+      else if (index === splitAt + 1) writer.appendOutput(Buffer.from("2mG\x1b[0m\r\n", "ascii"));
+      else writer.appendOutput(numbered(index, index));
+    }
+    writer.close();
+
+    const producer = new TerminalReplayMaterializer({ walPath, stateDir }).open();
+    let produced = producer.current;
+    while (produced.hasMoreWal) produced = producer.refresh();
+    producer.close();
+    expect(produced.sequence).toBe(BigInt(records + 2)); // start + resize + outputs
+    return produced;
+  }
+
+  test("checkpoint recovery costs private tmux commands per batch, not per WAL record", () => {
+    // HP7-OPEN: a real lane with 66,754 small records needed ~12 ms of tmux
+    // round-trips per record to re-verify its checkpoint, so open() exceeded
+    // the worker's 600 s request timeout and the lane never came back.
+    const records = 600;
+    const produced = produceSmallRecordLane(records);
+    const committedHistory = readFileSync(produced.historyPath);
+    // Rows scrolled before the redraw were drained per record, so they are
+    // committed history that recovery has to reproduce, not lose to ED3.
+    expect(numberedRows(produced)).toContain(150);
+
+    const counter = join(root, "tmux-count");
+    const wrapper = join(root, "tmux-counting.sh");
+    const realTmux = Bun.which("tmux");
+    if (!realTmux) throw new Error("tmux is required");
+    writeFileSync(wrapper, `#!/bin/sh\necho x >> '${counter}'\nexec '${realTmux}' "$@"\n`, { mode: 0o700 });
+
+    const recovered = new TerminalReplayMaterializer({ walPath, stateDir, tmuxCommand: wrapper }).open();
+    try {
+      expect(recovered.current.recoveredFromCheckpoint).toBe(true);
+      expect(recovered.current.verified).toBe(true);
+      expect(recovered.current.sequence).toBe(produced.sequence);
+      expect(readFileSync(produced.historyPath)).toEqual(committedHistory);
+    } finally {
+      recovered.close();
+    }
+    const invocations = readFileSync(counter, "utf8").split("\n").filter(Boolean).length;
+    // Per-record replay makes >= 3 tmux calls for each of 600 records.
+    expect(invocations).toBeLessThan(records / 4);
+  }, 120_000);
+
+  test("coalesced recovery still rejects a committed history row whose text changed", () => {
+    const produced = produceSmallRecordLane(60);
+    const history = readFileSync(produced.historyPath);
+    const target = history.indexOf(Buffer.from("N 007"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    history[target + 4] = "8".charCodeAt(0);
+    writeFileSync(produced.historyPath, history);
+
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow(`replayed history differs at byte ${history.lastIndexOf(0x0a, target) + 1}`);
+  }, 60_000);
+
+  test("coalesced recovery still rejects a checkpoint screen whose text changed", () => {
+    const produced = produceSmallRecordLane(60);
+    const checkpoint = JSON.parse(readFileSync(produced.checkpointPath, "utf8"));
+    const cells = Buffer.from(checkpoint.screen.cellsBase64, "base64");
+    const target = cells.indexOf(Buffer.from("N 0"));
+    expect(target).toBeGreaterThanOrEqual(0);
+    cells[target] = "M".charCodeAt(0);
+    checkpoint.screen.cellsBase64 = cells.toString("base64");
+    writeFileSync(produced.checkpointPath, JSON.stringify(checkpoint));
+
+    expect(() => new TerminalReplayMaterializer({ walPath, stateDir }).open())
+      .toThrow("replayed terminal screen/cursor differs from checkpoint");
+  }, 60_000);
 
   test("drains a single burst larger than the private tmux history ring without losing a row", () => {
     const writer = new OutputWalWriter({ path: walPath, clock: () => 580 });

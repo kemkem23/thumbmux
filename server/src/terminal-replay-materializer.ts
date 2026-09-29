@@ -87,6 +87,7 @@ const DEFAULT_HISTORY_CAPTURE_ROWS = 256;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DEFAULT_HISTORY_LIMIT = 65_536;
 const DEFAULT_MAX_WAL_FRAME_BYTES_PER_REFRESH = 1024 * 1024;
+const COALESCED_OUTPUT_MAX_BYTES = 1024 * 1024;
 const COMMAND_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 const MAX_COLS = 4_096;
 const MAX_ROWS = 4_096;
@@ -942,7 +943,31 @@ export function readTerminalReplayCheckpoint(path: string): TerminalReplayCheckp
 }
 
 function sameScreen(a: TerminalReplayScreen | null, b: TerminalReplayScreen | null): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  if (a === null || b === null) return a === b;
+  const { cellsBase64: cellsA, ...restA } = a;
+  const { cellsBase64: cellsB, ...restB } = b;
+  // Cursor, modes and pending parser bytes stay exact. Cells are compared as
+  // visible rows for the same capture-grouping reason as committed history.
+  return JSON.stringify(restA) === JSON.stringify(restB)
+    && sameVisibleRows(Buffer.from(cellsA, "base64"), Buffer.from(cellsB, "base64"));
+}
+
+function sameVisibleRows(a: Buffer, b: Buffer): boolean {
+  const rowsA = splitRows(a);
+  const rowsB = splitRows(b);
+  return rowsA.length === rowsB.length
+    && rowsA.every((row, index) => visibleRowText(row).equals(visibleRowText(rowsB[index]!)));
+}
+
+function splitRows(bytes: Buffer): Buffer[] {
+  const rows: Buffer[] = [];
+  let start = 0;
+  for (let end = bytes.indexOf(0x0a, start); end >= 0; end = bytes.indexOf(0x0a, start)) {
+    rows.push(bytes.subarray(start, end + 1));
+    start = end + 1;
+  }
+  if (start < bytes.byteLength) rows.push(bytes.subarray(start));
+  return rows;
 }
 
 function sameNullableIdentity(
@@ -966,10 +991,54 @@ function sameNullableResize(
   return a === null ? b === null : b !== null && a.phase === b.phase && sameResize(a, b);
 }
 
+/**
+ * One captured row reduced to what it shows: ESC-introduced sequences, the
+ * row terminator and trailing blanks removed. `capture-pane -e -N` output
+ * also depends on how input reached tmux: SGR state carries between rows of
+ * one capture, and -N pads a row to its allocated cell count, which tmux's
+ * write batching varies with read boundaries. Works on raw bytes so invalid
+ * UTF-8 and C1-looking continuation bytes (Thai "ป" is E0 B8 9B) compare
+ * exactly rather than decoded.
+ */
+function visibleRowText(row: Uint8Array): Buffer {
+  const out = Buffer.allocUnsafe(row.byteLength);
+  let length = 0;
+  let index = 0;
+  while (index < row.byteLength) {
+    const byte = row[index]!;
+    if (byte !== 0x1b) {
+      out[length++] = byte;
+      index += 1;
+      continue;
+    }
+    const kind = row[index + 1];
+    if (kind === 0x5b) {
+      // CSI: parameters/intermediates up to one final byte 0x40-0x7e.
+      index += 2;
+      while (index < row.byteLength && !(row[index]! >= 0x40 && row[index]! <= 0x7e)) index += 1;
+      index += 1;
+    } else if (kind === 0x5d) {
+      // OSC (e.g. hyperlinks): terminated by BEL or ST (ESC \).
+      index += 2;
+      while (index < row.byteLength && row[index] !== 0x07
+        && !(row[index] === 0x1b && row[index + 1] === 0x5c)) index += 1;
+      index += row[index] === 0x07 ? 1 : 2;
+    } else {
+      index += 2;
+    }
+  }
+  if (length > 0 && out[length - 1] === 0x0a) length -= 1;
+  while (length > 0 && out[length - 1] === 0x20) length -= 1;
+  return out.subarray(0, length);
+}
+
 class MaterializedHistoryFile {
   private fd: number;
   private readonly committedBytes: number;
   private derivedBytes = 0;
+  private verifyTail: Buffer = Buffer.alloc(0);
+  private verifyBlock: Buffer = Buffer.alloc(0);
+  private verifyBlockStart = 0;
   private writePosition: number;
 
   constructor(
@@ -1004,16 +1073,62 @@ class MaterializedHistoryFile {
     this.writePosition = this.committedBytes;
   }
 
+  /**
+   * Committed rows are compared by visible content, one row at a time.
+   * `capture-pane -e` carries SGR state between rows of a single capture, so
+   * the same rows captured in different groups differ only in escape bytes.
+   * Recovery feeds whole output runs (see ReplayEngine.processAll), which
+   * groups rows differently from the incremental producer; comparing escapes
+   * would make every recovery depend on the producer's refresh timing.
+   */
+  private verifyRows(bytes: Uint8Array): void {
+    const data = this.verifyTail.byteLength === 0
+      ? Buffer.from(bytes)
+      : Buffer.concat([this.verifyTail, bytes]);
+    let start = 0;
+    for (let end = data.indexOf(0x0a, start); end >= 0; end = data.indexOf(0x0a, start)) {
+      const rowStart = this.derivedBytes;
+      const expected = this.readCommittedRow();
+      if (!visibleRowText(data.subarray(start, end + 1)).equals(visibleRowText(expected))) {
+        throw new Error(`replayed history differs at byte ${rowStart}`);
+      }
+      start = end + 1;
+    }
+    this.verifyTail = Buffer.from(data.subarray(start));
+  }
+
+  private readCommittedRow(): Buffer {
+    const parts: Buffer[] = [];
+    let position = this.derivedBytes;
+    while (position < this.committedBytes) {
+      const blockEnd = this.verifyBlockStart + this.verifyBlock.byteLength;
+      if (position < this.verifyBlockStart || position >= blockEnd) {
+        this.verifyBlockStart = position;
+        this.verifyBlock = readExact(
+          this.fd,
+          Math.min(256 * 1024, this.committedBytes - position),
+          position,
+        );
+      }
+      const block = this.verifyBlock.subarray(position - this.verifyBlockStart);
+      const newline = block.indexOf(0x0a);
+      if (newline >= 0) {
+        parts.push(block.subarray(0, newline + 1));
+        const row = Buffer.concat(parts);
+        this.derivedBytes += row.byteLength;
+        return row;
+      }
+      parts.push(block);
+      position += block.byteLength;
+    }
+    throw new Error("replayed history exceeds the committed checkpoint length");
+  }
+
   accept(bytes: Uint8Array, mode: HistoryMode): void {
     if (bytes.byteLength === 0) return;
     if (mode === "verify") {
-      if (this.derivedBytes + bytes.byteLength > this.committedBytes) {
-        throw new Error("replayed history exceeds the committed checkpoint length");
-      }
-      const expected = readExact(this.fd, bytes.byteLength, this.derivedBytes);
-      if (!expected.equals(Buffer.from(bytes))) {
-        throw new Error(`replayed history differs at byte ${this.derivedBytes}`);
-      }
+      this.verifyRows(bytes);
+      return;
     } else {
       if (this.derivedBytes !== this.writePosition) {
         throw new Error(
@@ -1027,6 +1142,9 @@ class MaterializedHistoryFile {
   }
 
   finishVerification(): void {
+    if (this.verifyTail.byteLength !== 0) {
+      throw new Error("replayed history ends inside an unterminated row");
+    }
     if (this.derivedBytes !== this.committedBytes) {
       throw new Error(
         `replayed history length ${this.derivedBytes} differs from committed ${this.committedBytes}`,
@@ -1803,6 +1921,7 @@ class PrivateTmuxReplay {
   get peakBoundedMirrorBytes(): number {
     return this.peakMirrorBytes;
   }
+
 }
 
 type ReplaySnapshot = {
@@ -1812,6 +1931,21 @@ type ReplaySnapshot = {
   pendingResize: TerminalReplayResize | null;
   screen: TerminalReplayScreen | null;
 };
+
+/**
+ * Whether `payload` contains ED3 (`CSI 3 J`), including one whose prefix
+ * ended the previous record. Over-matching only costs an extra tmux write.
+ */
+function erasesScrollback(previous: Uint8Array, payload: Uint8Array): boolean {
+  const tail = previous.subarray(Math.max(0, previous.byteLength - 3));
+  const window = Buffer.concat([tail, payload]);
+  for (let index = window.indexOf(0x4a, tail.byteLength); index >= 0; index = window.indexOf(0x4a, index + 1)) {
+    if (index >= 3 && window[index - 1] === 0x33 && window[index - 2] === 0x5b && window[index - 3] === 0x1b) {
+      return true;
+    }
+  }
+  return false;
+}
 
 class ReplayEngine {
   private lifecycle: LifecycleState = "none";
@@ -1972,6 +2106,68 @@ class ReplayEngine {
     }
     // abort deliberately leaves the emulator at `from`.
     this.pendingResize = null;
+  }
+
+  /**
+   * Replay records in order, feeding runs of consecutive output records to
+   * tmux as one write. Per-record feeding cost ~6 private tmux commands per
+   * record, which made checkpoint recovery O(records) round-trips and timed
+   * out on long-lived lanes (HP7-OPEN).
+   *
+   * A run must capture the same history rows as per-record feeding, which
+   * drains tmux history at every record boundary. The one input that destroys
+   * undrained history is ED3 (`CSI 3 J`, erase scrollback; Claude Code sends
+   * `CSI 2 J CSI 3 J` on a full redraw), so a record containing it always
+   * starts a new run. What still differs between groupings (SGR carry-over
+   * and blank padding in captures) is ignored by the visible-row comparison.
+   */
+  processAll(
+    records: readonly OutputWalRecord[],
+    onHistory: (captured: Uint8Array) => void,
+  ): void {
+    let run: OutputWalRecord[] = [];
+    let runBytes = 0;
+    const flushRun = () => {
+      if (run.length === 0) return;
+      const first = run[0]!;
+      const last = run[run.length - 1]!;
+      try {
+        this.requireActive(first);
+        if (this.pendingResize) {
+          throw new Error(
+            `output appears during prepared resize ${this.pendingResize.changeId}`,
+          );
+        }
+      } catch (error) {
+        throw new Error(`terminal replay failed at WAL record ${first.sequence}: ${String(error)}`);
+      }
+      if (runBytes > 0) {
+        try {
+          this.tmux.feed(Buffer.concat(run.map((record) => record.payload), runBytes), onHistory);
+        } catch (error) {
+          throw new Error(
+            `terminal replay failed at WAL records ${first.sequence}-${last.sequence}: ${String(error)}`,
+          );
+        }
+        this.hasOutputInGeneration = true;
+      }
+      this.recordsSeen += run.length;
+      run = [];
+      runBytes = 0;
+    };
+    for (const record of records) {
+      if (record.kind === "output") {
+        const previous = run[run.length - 1];
+        if (previous && erasesScrollback(previous.payload, record.payload)) flushRun();
+        run.push(record);
+        runBytes += record.payload.byteLength;
+        if (runBytes >= COALESCED_OUTPUT_MAX_BYTES) flushRun();
+        continue;
+      }
+      flushRun();
+      this.process(record, onHistory);
+    }
+    flushRun();
   }
 
   process(
@@ -2357,23 +2553,26 @@ export class TerminalReplaySession {
         if (batch.records.length === 0) {
           throw new Error(`checkpoint WAL cursor ${checkpointOffset} is beyond the readable WAL`);
         }
+        let expectedOffset = this.lastOffset;
         for (const record of batch.records) {
-          if (record.offset !== this.lastOffset) {
+          if (record.offset !== expectedOffset) {
             throw new Error(
-              `recovery WAL record begins at ${record.offset}, expected ${this.lastOffset}`,
+              `recovery WAL record begins at ${record.offset}, expected ${expectedOffset}`,
             );
           }
           if (record.nextOffset > checkpointOffset) {
             throw new Error(`checkpoint WAL cursor ${checkpointOffset} is not a record boundary`);
           }
-          this.engine.process(
-            record,
-            (captured) => this.history.accept(captured, "verify"),
-          );
-          this.lastOffset = record.nextOffset;
-          this.lastSequence = record.sequence;
-          this.lastAt = record.at;
+          expectedOffset = record.nextOffset;
         }
+        this.engine.processAll(
+          batch.records,
+          (captured) => this.history.accept(captured, "verify"),
+        );
+        const lastRecord = batch.records[batch.records.length - 1]!;
+        this.lastOffset = lastRecord.nextOffset;
+        this.lastSequence = lastRecord.sequence;
+        this.lastAt = lastRecord.at;
         if (batch.cursor.offset !== this.lastOffset
           || batch.cursor.lastSequence !== this.lastSequence
           || batch.cursor.lastAt !== this.lastAt) {
@@ -2513,6 +2712,8 @@ export class TerminalReplaySession {
       // the incomplete checkpoint could trail by two raw-output batches.
       ...(this.engine.hasPendingResize ? { maxRecords: 1 } : {}),
     });
+    // New derived bytes stay per-record: that is the grouping every earlier
+    // runtime wrote, so their byte-exact recovery can still verify this file.
     for (const record of batch.records) {
       if (record.offset !== this.lastOffset) {
         throw new Error(
