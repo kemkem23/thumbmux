@@ -1680,3 +1680,127 @@ test('D2: fc:2 counters see cached rows and the fast-path RAM write time',async(
   expect(after.codec.encodedChars).toBeGreaterThan(before.codec.encodedChars);
  }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+// ── NEWARCH-R2 D3: disk D/R of a small (soak-shaped) store — seal and archive by age, v5 format unchanged ──
+import { readDiskLines as d3ReadDiskLines } from '../src/sqlite-history/projection-reader';
+const D3=(d2Store as any).projectionArchiveInternals as typeof d2Store.projectionArchiveInternals;
+const d3Blocks=(db:Database,no:number)=>(db.query('SELECT first_line_id AS first,line_count AS count FROM na_block WHERE pane_no=? ORDER BY first_line_id').all(no) as any[]).map(b=>[b.first,b.count]);
+const d3Oracle=(db:Database,no:number,lines:Map<number,any>)=>{
+ const read=d3ReadDiskLines(db,no,0,1+Math.max(...lines.keys()));
+ expect(read.map(r=>Number(r.line_id))).toEqual([...lines.keys()].sort((a,b)=>a-b));
+ for(const r of read){const want=lines.get(Number(r.line_id));for(const k of ['text','revision','check_state','check_reason','checked_capture_id','checked_row'])expect([r.line_id,k,r[k]]).toEqual([r.line_id,k,want[k]]);}
+};
+
+test('D3: the flush barrier seals the per-line tail as a partial block, a later full block absorbs it, and repairs and late certifications patch it in place',async()=>{
+ const f=await d2File(1);
+ try {
+  const no=f.panes[0].pane_no,written=new Map<number,any>();
+  // The seed line (0, unchecked) went through close()'s barrier: already a one-line block, no per-line row.
+  expect(d3Blocks(f.disk,no)).toEqual([[0,1]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
+  written.set(0,d3ReadDiskLines(f.disk,no,0,1)[0]);
+  const commit=(i:number,capture:string|null,force=false,text?:string)=>D3.commitBatch(f.disk,f.fence,d2Batch(f,[{pane:no,next:Math.max(i+1,f.panes[0].next_line_id),build:rev=>{
+   const line={...d2Line(no,i,rev,capture),...(text?{text}:{})};written.set(i,line);return {captures:capture?[d2Capture(no,capture,rev)]:[],lines:[line]};}}]),undefined,false,force);
+  for(let i=1;i<300;i++)commit(i,`c${i}`);
+  await Bun.sleep(220);commit(300,'c300');
+  // Block 0 = the one-line block + 255 per-line rows: merged into one aligned block, never two blocks over one range.
+  expect(d3Blocks(f.disk,no)).toEqual([[0,256]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(45);
+  commit(301,null,true);
+  // Barrier: the 46-line tail (one line unchecked) is a partial block; only the kept newest receipts stay live.
+  expect(d3Blocks(f.disk,no)).toEqual([[0,256],[256,46]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture')).toBeLessThanOrEqual(D3.limits.ARCHIVE_KEEP);
+  // A repair inside the partial block and a late certification of its unchecked line patch the block.
+  commit(280,'c280r',false,'repaired 280');commit(301,'c301');
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
+  expect(d3Blocks(f.disk,no)).toEqual([[0,256],[256,46]]);
+  for(let i=302;i<512;i++)commit(i,`c${i}`);
+  await Bun.sleep(220);commit(512,'c512');
+  expect(d3Blocks(f.disk,no)).toEqual([[0,256],[256,256]]);
+  d3Oracle(f.disk,no,written);
+  const ids=[...written.values()].map(l=>l.checked_capture_id).filter(Boolean);
+  expect(D3.captureReceipts(f.disk,no,ids).size).toBe(ids.length);
+  d2Clean(f.disk);
+  console.log('D3_PARTIAL_BLOCK',JSON.stringify({blocks:d3Blocks(f.disk,no),receipts:ids.length,live:d2Count(f.disk,'SELECT count(*) n FROM na_capture')}));
+ }finally{f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('D3: a pane whose head stood still for the quiet age seals its tail once and archives the freed receipts below a full chunk',async()=>{
+ const f=await d2File(2);let now=5e6;D3.setClock(()=>now);
+ try {
+  const [a,b]=f.panes.map(p=>p.pane_no),quiet=(D3.limits as any).SEAL_QUIET_MS as number;
+  expect(quiet).toBeGreaterThanOrEqual(10000);
+  const written=new Map<number,any>();written.set(0,d3ReadDiskLines(f.disk,a,0,1)[0]);
+  const line=(no:number,i:number)=>({pane:no,next:i+1,build:(rev:number)=>{const l=d2Line(no,i,rev,`p${no}-c${i}`);if(no===a)written.set(i,l);return {captures:[d2Capture(no,`p${no}-c${i}`,rev)],lines:[l]};}});
+  const idle=(no:number,id:string)=>({pane:no,build:(rev:number)=>({captures:[d2Capture(no,id,rev)]})});
+  for(let i=1;i<=100;i++)D3.commitBatch(f.disk,f.fence,d2Batch(f,[line(a,i),line(b,i)]));
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(100);
+  // Pane a stands still (captures keep arriving, no new line); pane b keeps scrolling.
+  now+=quiet-1;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,'idle-1'),line(b,101)]));
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(100);
+  now+=1;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,'idle-2'),line(b,102)]));
+  expect(d3Blocks(f.disk,a)).toEqual([[0,101]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(0);
+  // 102 receipts, far below ARCHIVE_MIN+ARCHIVE_KEEP: archived anyway, the newest kept few stay live.
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',a)).toBe(D3.limits.ARCHIVE_KEEP);
+  expect(d2Count(f.disk,'SELECT sum(capture_count) n FROM na_capture_archive WHERE pane_no=?',a)).toBe(102-D3.limits.ARCHIVE_KEEP);
+  // Pane b moved every commit: its tail stays per-line.
+  expect(d3Blocks(f.disk,b)).toEqual([[0,1]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',b)).toBe(102);
+  // Once per quiet episode: later idle captures neither rewrite the block nor write tiny archives.
+  const blockNo=(f.disk.query('SELECT block_no FROM na_block WHERE pane_no=?').get(a) as any).block_no,archives=d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive WHERE pane_no=?',a);
+  for(let k=3;k<20;k++){now+=quiet;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,`idle-${k}`)]));}
+  expect((f.disk.query('SELECT block_no FROM na_block WHERE pane_no=?').get(a) as any).block_no).toBe(blockNo);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive WHERE pane_no=?',a)).toBe(archives);
+  // The pane scrolls again: new lines go per-line after the partial block, and a repair of a sealed line patches it.
+  D3.commitBatch(f.disk,f.fence,d2Batch(f,[line(a,101)]));
+  D3.commitBatch(f.disk,f.fence,d2Batch(f,[{pane:a,build:rev=>{const l={...d2Line(a,50,rev,`p${a}-c50r`),text:'repaired 50'};written.set(50,l);return {captures:[d2Capture(a,`p${a}-c50r`,rev)],lines:[l]};}}]));
+  expect(d3Blocks(f.disk,a)).toEqual([[0,101]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(1);
+  d3Oracle(f.disk,a,written);
+  const ids=[...written.values()].map(l=>l.checked_capture_id).filter(Boolean);
+  expect(D3.captureReceipts(f.disk,a,ids).size).toBe(ids.length);
+  d2Clean(f.disk);
+ }finally{D3.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+// Drained D/R before D3 on this shape: 2.47 (bench/soak-repro.ts, 642ccc7ed). 1.5 is out of reach in v5: see docs/tasks/newarch-r2-d3/REPORT.md.
+const D3_SOAK_DR_MAX=2.1;
+// V soak shape (v-soak-a1: 21 panes, 18,606 rows, ~1 capture per row, na_line 2478 / na_block 63 after drain, D/R 2.92).
+test('D3: a soak-shaped store (21 panes x 886 rows, one capture per row) keeps no per-line tail after the flush barrier and every row and receipt still resolves',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'na-d3-soak-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
+ const PANES=21,ROWS=886,keys=Array.from({length:PANES},(_,p)=>({serverIdentity:'d3-soak',paneId:`%${p}`,birthGeneration:1}));
+ const row=(p:number,i:number)=>s2Row([...s2Text(`P${String(p).padStart(2,'0')} ${String(i).padStart(6,'0')} `),...s2Text(`color${i%10}`,`index:${1+i%7}`),...s2Text(' '+'abcdefghij'.repeat(3).slice(0,20+i%13))],120);
+ let R=0;const seen={refused:0};
+ try {
+  for(let i=0;i<ROWS;i++)for(const [p,key] of keys.entries()) {
+   const r=row(p,i);await naStore(s,{...naEvent('',i+1,key),physicalRow:r},seen);
+   const at=1759200000000+i*2000+p*37.125;
+   // A different screen per capture, as in the runtime: both hashes are fresh 32-byte digests.
+   await s.calibrate({capture:{...naFrame(),paneKey:key,cols:10,cells:[[...`${p}/${i}`.padEnd(10,'.')].map(naCell)],captureId:`cap-${p}-${i}`,requestedAt:at,completedAt:at+12.5,
+    firstHistoryRow:40+i,history:[r],observedFields:['grapheme','width','continuation','fg','bg','style'],ambiguousRows:0,result:'exact'},expectedRevision:s.token(key).revision,checks:[{lineId:i,captureRow:0}],repairs:[]});
+  }
+  s.flush();
+  for(const [p,key] of keys.entries()) {
+   const lines=s.readPage(s.token(key),0,ROWS).lines;
+   expect(lines.map(l=>l.text)).toEqual(Array.from({length:ROWS},(_,i)=>row(p,i).text));
+   expect(lines.every(l=>l.checkState==='checked')).toBe(true);
+   for(const l of lines)R+=Buffer.byteLength(cellsToAnsi(l.cells as any));
+  }
+  const folder=join(dir,'newarch-v5'),D=readdirS2(folder).reduce((n,f)=>n+statS2(join(folder,f)).size,0);
+  const db=new Database(s.file,{readonly:true});let counts:any;
+  try {
+   counts=Object.fromEntries(['na_line','na_block','na_capture','na_capture_archive'].map(t=>[t,d2Count(db,`SELECT count(*) n FROM ${t}`)]));
+   for(const no of (db.query('SELECT pane_no FROM na_pane').all() as any[]).map(p=>p.pane_no)) {
+    const p=String((db.query('SELECT pane_id FROM na_pane WHERE pane_no=?').get(no) as any).pane_id).slice(1);
+    expect(D3.captureReceipts(db,no,Array.from({length:ROWS},(_,i)=>`cap-${p}-${i}`)).size).toBe(ROWS);
+   }
+   d2Clean(db);
+  }finally{db.close();}
+  console.log('D3_SOAK_DISK',JSON.stringify({panes:PANES,rows:ROWS,D,R,ratio:D/R,counts,refused:seen.refused}));
+  expect(counts.na_line).toBe(0);
+  expect(counts.na_capture).toBeLessThanOrEqual(PANES*D3.limits.ARCHIVE_KEEP);
+  expect(D/R).toBeLessThanOrEqual(D3_SOAK_DR_MAX);
+ }finally{await s.close();rmSync(dir,{recursive:true,force:true});}
+},180000);
