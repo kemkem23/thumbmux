@@ -531,7 +531,7 @@ export class PipeVtWorker {
     while (this.traceHead < this.traceSeqs.length) {
       const e = this.traceEpochs[this.traceHead]!;
       if (e < epoch) { this.traceHead++; this.traceEpochCensored++; continue; }
-      if (e !== epoch || seqTo === null || this.traceSeqs[this.traceHead]! > seqTo) break;
+      if (seqTo === null || this.traceSeqs[this.traceHead]! > seqTo) break;
       const seq = this.traceSeqs[this.traceHead]!;
       const t = this.traceTimes[this.traceHead++]!;
       first ??= t; last = t; seqFrom ??= seq; matchedTo = seq; n++;
