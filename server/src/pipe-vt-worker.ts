@@ -597,7 +597,6 @@ export class PipeVtWorker {
           if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") await receipt;
           if (this.abandoned) return;
         } catch (error) {
-          consumerSucceeded = false;
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
         if (tracing) this.emitTrace(message as PipeVtUpdate, length, arrivedAt, startedAt, decodedAt, this.traceClock(), consumerSucceeded);
