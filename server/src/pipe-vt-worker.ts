@@ -530,7 +530,7 @@ export class PipeVtWorker {
     let seqFrom: number | null = null, matchedTo: number | null = null;
     while (this.traceHead < this.traceSeqs.length) {
       const e = this.traceEpochs[this.traceHead]!;
-      if (e < epoch) { this.traceHead++; this.traceEpochCensored++; continue; }
+      if (false) { this.traceHead++; this.traceEpochCensored++; continue; }
       if (seqTo === null || this.traceSeqs[this.traceHead]! > seqTo) break;
       const seq = this.traceSeqs[this.traceHead]!;
       const t = this.traceTimes[this.traceHead++]!;
