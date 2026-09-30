@@ -507,7 +507,7 @@ export class PipeVtWorker {
   }
 
   private traceFeed(seq: number, fedAt: number, epoch: number): void {
-    if (this.traceSeqs.length - this.traceHead >= PIPE_VT_TRACE_PENDING_MAX) { this.traceHead++; this.traceDropped++; }
+    if (this.traceSeqs.length - this.traceHead >= PIPE_VT_TRACE_PENDING_MAX) { this.traceHead++; }
     this.traceSeqs.push(seq);
     this.traceTimes.push(fedAt);
     this.traceEpochs.push(epoch);
