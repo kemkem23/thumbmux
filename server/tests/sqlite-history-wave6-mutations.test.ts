@@ -168,8 +168,8 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
       to: '' },
     // Archive work leaves the commit transaction: it runs after the batch committed, in its own.
     { name: 'archive-outside-commit', pattern: 'D2:', file: store,
-      from: '    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))));\n    archiveMs=performance.now()-archiveStarted;\n    before?.();writeMs=performance.now()-started;\n  }).immediate();\n',
-      to: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  plan=disk.transaction(()=>archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))))).immediate();\n' },
+      from: '    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))),aged);\n    archiveMs=performance.now()-archiveStarted;\n    before?.();writeMs=performance.now()-started;\n  }).immediate();\n',
+      to: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  plan=disk.transaction(()=>archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))),aged)).immediate();\n' },
     // The schedule advances inside the transaction, so a rolled-back commit still moves it.
     { name: 'queue-before-commit', pattern: 'D2:', file: store,
       from: '    before?.();writeMs=performance.now()-started;\n  }).immediate();\n  if(plan)applyArchivePlan(disk,plan);',
@@ -221,5 +221,70 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
     expect(after.code).toBe(0);
     expect(after.tests).toBe(before.tests);
     console.log('D2_MUTATION_RESULT', JSON.stringify({ killed: mutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 600_000);
+
+// NEWARCH-R2 D3: the tail seal and quiet archive, same standard as D2, against
+// the D3 tests of sqlite-history.test.ts in a throwaway copy.
+test('D3 tail seal and quiet archive mutants are each killed by a D3 test; the clean copy passes before and after', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'thumbmux-sqlite-d3-mutants-'));
+  const store = 'sqlite-history/projection-store.ts';
+  const mutants: Mutant[] = [
+    // The flush barrier no longer seals the per-line tail (the pre-D3 layout: D/R 2.31 on the soak shape).
+    { name: 'no-barrier-tail-seal', pattern: 'D3:', file: store,
+      from: 'tail=force || quiet;', to: 'tail=quiet;' },
+    // A pane that stood still keeps its per-line tail until the next barrier.
+    { name: 'no-quiet-seal', pattern: 'D3:', file: store,
+      from: 'tail=force || quiet;', to: 'tail=force;' },
+    // A partial block is not counted toward its aligned range: the range never completes again.
+    { name: 'no-partial-merge', pattern: 'D3:', file: store,
+      from: 'const full=n+Number(part?.line_count??0)===SEAL_LINES;', to: 'const full=n===SEAL_LINES;' },
+    // Receipts freed by a quiet seal wait for a full chunk (ARCHIVE_MIN) as before D3.
+    { name: 'quiet-archive-waits-for-chunk', pattern: 'D3:', file: store,
+      from: '    if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,true,Infinity);\n    plan.updates.set(paneNo,null);\n  }\n  const now',
+      to: '    if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,false,Infinity);\n    plan.updates.set(paneNo,null);\n  }\n  const now' },
+    // The idle worker never seals a pane that went silent without another commit.
+    { name: 'no-idle-quiet-sweep', pattern: 'D3:', file: store,
+      from: "const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.aged && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);",
+      to: 'const quiet:number[]=[];void heads;' },
+  ];
+  try {
+    mkdirSync(join(root, 'server'), { recursive: true });
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history.test.ts'), join(root, 'server/tests/sqlite-history.test.ts'));
+    for (const helper of ['helpers.ts', 'crash-worker.ts']) cpSync(join(pkg, 'server/tests/sqlite-history', helper), join(root, 'server/tests/sqlite-history', helper));
+    const copiedCore = join(root, 'node_modules/@thumbmux/core'); mkdirSync(copiedCore, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(copiedCore, 'src'), { recursive: true });
+    writeFileSync(join(copiedCore, 'package.json'), '\n{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}\n');
+    writeFileSync(join(root, 'package.json'), '\n{"type":"module"}\n');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history.test.ts', '--test-name-pattern', 'D3:'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err, ran = /Ran (\d+) tests?/.exec(output), failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
+      const killedBy = [...output.matchAll(/\(fail\) (D3:[^\[\n]*)/g)].map(m => m[1].trim().slice(0, 60));
+      console.log('D3_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed, killedBy: [...new Set(killedBy)] }));
+      if (code !== 0 && !failed) console.log('D3_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      return { code, output, tests: Number(ran?.[1] ?? 0), failed };
+    };
+    const before = await run('clean-before');
+    expect(before.code).toBe(0);
+    expect(before.tests).toBe(3);
+    for (const mutant of mutants) {
+      const path = join(root, 'server/src', mutant.file), original = readFileSync(path, 'utf8');
+      expect(original.includes(mutant.from)).toBe(true);
+      expect(mutant.from).not.toBe(mutant.to);
+      writeFileSync(path, original.replace(mutant.from, mutant.to));
+      const result = await run(mutant.name);
+      writeFileSync(path, original);
+      expect(result.tests).toBeGreaterThan(0);
+      expect(result.code).not.toBe(0);
+      expect(result.failed).toBe(true);
+      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+    }
+    const after = await run('clean-after');
+    expect(after.code).toBe(0);
+    expect(after.tests).toBe(before.tests);
+    console.log('D3_MUTATION_RESULT', JSON.stringify({ killed: mutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);
