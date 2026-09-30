@@ -820,7 +820,7 @@ const I4_FIX2_S_MUTATIONS=[
 // NEWARCH-SWITCHON S2: each mutant undoes one part of the compact store.
 const S2_MUTATIONS=[
  {name:'S2 per-cell-json',file:'codec.ts',before:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n",after:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n  return legacy(text, cells);\n"},
- {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> { return new Set();'},
+ {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> { return new Set();'},
  {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
  {name:'S2 v5-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 5;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
@@ -911,8 +911,12 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
        s.flush();let R=0;
        for(let at=0;at<6000;at+=2000)for(const l of s.readPage(s.token(key),at,2000).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells));
        const folder=data+'/newarch-v5',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
-       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R,refused}));
+       // D3 seals the settled tail at the barrier, and deflate hides a bloated row codec inside blocks:
+       // the stored per-line encoding (RAM rows, the same encodeRow the disk writes) is judged directly too.
+       const stored=Number(s.ram.db.query('SELECT sum(length(CAST(text AS BLOB))+length(CAST(cells AS BLOB))) AS n FROM na_line').get().n);
+       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R,stored,storedRatio:stored/R,refused}));
        assert(D<=1.5*R,'disk must stay within 1.5 x the rows it holds: D/R='+(D/R).toFixed(3));
+       assert(stored<=1.5*R,'stored rows must stay within 1.5 x their ANSI bytes: stored/R='+(stored/R).toFixed(3));
       }
      } else if(name.startsWith('I4-S2')) {
       const physical={text:'P01 000123 color3 ไทย漢字😀 '+'x'.repeat(80),cells:Array.from({length:120},(_,i)=>({...cell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))};

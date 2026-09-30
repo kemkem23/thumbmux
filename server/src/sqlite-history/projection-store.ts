@@ -169,18 +169,21 @@ function writeLines(disk:Database,rows:SqlRow[]):void {
   }
 }
 const sealAttempts=new WeakMap<Database,Map<SqlRow[string],number>>();
-// D3: a pane's head (next_line_id) and since when it has stood still, in archiveClock time.
-type PaneHead={next:number;since:number;aged:boolean};
+// D3: a pane's head (next_line_id), since when it has stood still (archiveClock
+// time), and whether the idle worker already swept it in this quiet episode.
+type PaneHead={next:number;since:number;swept:boolean};
 const paneHeads=new WeakMap<Database,Map<SqlRow[string],PaneHead>>();
 /**
  * Seal every complete aligned block of settled per-line rows (see SEAL_LINES).
- * D3: the rest of a pane (its per-line tail) is sealed by age too — at the
- * flush barrier (force) and once per quiet episode, when the pane's head has
- * not moved for SEAL_QUIET_MS — as a partial block [start,start+n) inside its
- * aligned range. v5 already allows any line_count in 1..4096. Later lines of
- * that range stay per-line until the range completes; then the partial block
- * and the new rows are merged into the one aligned block, so a range never
- * holds two blocks. Panes whose tail was sealed by quiet age are added to `aged`.
+ * D3: a settled per-line tail is sealed by age too — at the flush barrier
+ * (force) and while the pane's head has not moved for SEAL_QUIET_MS — as a
+ * partial block [start,start+n) inside its aligned range (v5 already allows
+ * any line_count in 1..4096). A range with an unsettled line near the head
+ * stays per-line, as before, so a later certification does not rewrite a
+ * block. Later lines of the range stay per-line until it completes; then the
+ * partial block and the new rows are merged into the one aligned block, so a
+ * range never holds two blocks. Panes whose tail was sealed by quiet age are
+ * added to `aged`.
  */
 function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> {
   const sealed=new Set<number>();
@@ -190,9 +193,8 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>
   for(const p of panes) {
     const next=Number(p.next_line_id);
     let head=heads.get(p.pane_no);
-    if(!head || head.next!==next){head={next,since:clock,aged:false};heads.set(p.pane_no,head);}
-    const quiet=!head.aged && clock-head.since>=SEAL_QUIET_MS,tail=force || quiet;
-    if(quiet)head.aged=true;
+    if(!head || head.next!==next){head={next,since:clock,swept:false};heads.set(p.pane_no,head);}
+    const quiet=clock-head.since>=SEAL_QUIET_MS,tail=force || quiet;
     if(!tail && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS)continue;
     attempts.set(p.pane_no,now);
     // Per aligned block: rows present and rows not yet settled.
@@ -205,7 +207,7 @@ function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>
       const part=n<SEAL_LINES?prepared(disk,'SELECT * FROM na_block WHERE pane_no=? AND first_line_id>=? AND first_line_id<?').get(p.pane_no,from,from+SEAL_LINES) as SqlRow|null:null;
       const full=n+Number(part?.line_count??0)===SEAL_LINES;
       if(full && from+SEAL_LINES<=next && (Number(g.open)===0 || from+SEAL_LINES<=next-SEAL_LAG)){}
-      else if(!tail)continue;
+      else if(!tail || Number(g.open)!==0)continue;
       const rows=prepared(disk,'SELECT * FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<? ORDER BY line_id').all(p.pane_no,from,from+SEAL_LINES) as SqlRow[];
       const byId=new Map<number,unknown[]>();let top=Math.max(...rows.map(r=>Number(r.revision)));
       if(part) {
@@ -348,7 +350,7 @@ function archiveNextDue(disk:Database):number|null {
 /** D3: when a pane the store has seen reaches the quiet age, null if none is waiting for it. */
 function quietNextDue(disk:Database):number|null {
   let next:number|null=null;
-  for(const head of paneHeads.get(disk)?.values()??[])if(!head.aged && (next===null || head.since+SEAL_QUIET_MS<next))next=head.since+SEAL_QUIET_MS;
+  for(const head of paneHeads.get(disk)?.values()??[])if(!head.swept && (next===null || head.since+SEAL_QUIET_MS<next))next=head.since+SEAL_QUIET_MS;
   return next;
 }
 /** Whether a drain now would find due work. */
@@ -362,7 +364,9 @@ function drainArchives(disk:Database,fence:number):void {
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
     // D3: panes that went quiet without another commit seal their tail here.
     const heads=paneHeads.get(disk),now=archiveClock(),aged=new Set<number>(),marks=new Map<number,boolean>();
-    const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.aged && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);
+    const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.swept && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);
+    // Once per quiet episode: a tail that is not settled yet waits for the commit that settles it.
+    for(const paneNo of quiet)heads!.get(paneNo)!.swept=true;
     const panes=quiet.map(paneNo=>prepared(disk,'SELECT * FROM na_pane WHERE pane_no=?').get(paneNo) as SqlRow|null).filter((p):p is SqlRow=>!!p);
     for(const paneNo of sealBlocks(disk,panes,false,aged))marks.set(paneNo,true);
     plan=archiveCaptures(disk,marks,false,[],new Set(),aged);

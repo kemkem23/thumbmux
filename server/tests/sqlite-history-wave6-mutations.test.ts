@@ -239,13 +239,16 @@ test('D3 tail seal and quiet archive mutants are each killed by a D3 test; the c
     // A partial block is not counted toward its aligned range: the range never completes again.
     { name: 'no-partial-merge', pattern: 'D3:', file: store,
       from: 'const full=n+Number(part?.line_count??0)===SEAL_LINES;', to: 'const full=n===SEAL_LINES;' },
+    // The tail seal takes a range with an unsettled line: a later certification rewrites a block.
+    { name: 'tail-seals-unsettled', pattern: 'D3:', file: store,
+      from: 'else if(!tail || Number(g.open)!==0)continue;', to: 'else if(!tail)continue;' },
     // Receipts freed by a quiet seal wait for a full chunk (ARCHIVE_MIN) as before D3.
     { name: 'quiet-archive-waits-for-chunk', pattern: 'D3:', file: store,
       from: '    if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,true,Infinity);\n    plan.updates.set(paneNo,null);\n  }\n  const now',
       to: '    if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,false,Infinity);\n    plan.updates.set(paneNo,null);\n  }\n  const now' },
     // The idle worker never seals a pane that went silent without another commit.
     { name: 'no-idle-quiet-sweep', pattern: 'D3:', file: store,
-      from: "const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.aged && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);",
+      from: "const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.swept && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);",
       to: 'const quiet:number[]=[];void heads;' },
   ];
   try {

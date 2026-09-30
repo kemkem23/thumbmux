@@ -1088,8 +1088,9 @@ test('S2: corpus is lossless in RAM, in sealed blocks, after a patch of a sealed
   const tail=disk.query('SELECT min(line_id) AS lo,count(*) AS n FROM na_line').get();
   const observed=disk.query('SELECT DISTINCT typeof(observed_fields) AS t,observed_fields AS v FROM na_capture').all();
   disk.close();
-  expect(blocks).toEqual([{first_line_id:0,line_count:256},{first_line_id:256,line_count:256}]);
-  expect(tail).toEqual({lo:512,n:88});
+  // D3: the settled 88-line tail is a partial block after the barrier (it was per-line before D3).
+  expect(blocks).toEqual([{first_line_id:0,line_count:256},{first_line_id:256,line_count:256},{first_line_id:512,line_count:88}]);
+  expect(tail).toEqual({lo:null,n:0});
   expect(observed).toEqual([{t:'integer',v:255}]);
   const check=(lines:any[])=>{
    expect(lines.map(l=>({text:l.text,cells:l.cells}))).toEqual(rows);
@@ -1691,28 +1692,34 @@ const d3Oracle=(db:Database,no:number,lines:Map<number,any>)=>{
  for(const r of read){const want=lines.get(Number(r.line_id));for(const k of ['text','revision','check_state','check_reason','checked_capture_id','checked_row'])expect([r.line_id,k,r[k]]).toEqual([r.line_id,k,want[k]]);}
 };
 
-test('D3: the flush barrier seals the per-line tail as a partial block, a later full block absorbs it, and repairs and late certifications patch it in place',async()=>{
+test('D3: the flush barrier seals a settled per-line tail as a partial block, a later full block absorbs it, an unsettled tail stays per-line, and a repair patches the partial block',async()=>{
  const f=await d2File(1);
  try {
   const no=f.panes[0].pane_no,written=new Map<number,any>();
-  // The seed line (0, unchecked) went through close()'s barrier: already a one-line block, no per-line row.
-  expect(d3Blocks(f.disk,no)).toEqual([[0,1]]);
-  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
-  written.set(0,d3ReadDiskLines(f.disk,no,0,1)[0]);
+  // The seed line (0) is unchecked: close()'s barrier left it per-line.
+  expect(d3Blocks(f.disk,no)).toEqual([]);
   const commit=(i:number,capture:string|null,force=false,text?:string)=>D3.commitBatch(f.disk,f.fence,d2Batch(f,[{pane:no,next:Math.max(i+1,f.panes[0].next_line_id),build:rev=>{
    const line={...d2Line(no,i,rev,capture),...(text?{text}:{})};written.set(i,line);return {captures:capture?[d2Capture(no,capture,rev)]:[],lines:[line]};}}]),undefined,false,force);
-  for(let i=1;i<300;i++)commit(i,`c${i}`);
+  for(let i=0;i<100;i++)commit(i,`c${i}`);
+  commit(100,'c100',true);
+  // Barrier: lines 0-100 are all certified: one partial block, only the kept newest receipts stay live.
+  expect(d3Blocks(f.disk,no)).toEqual([[0,101]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture')).toBe(D3.limits.ARCHIVE_KEEP);
+  for(let i=101;i<300;i++)commit(i,`c${i}`);
   await Bun.sleep(220);commit(300,'c300');
-  // Block 0 = the one-line block + 255 per-line rows: merged into one aligned block, never two blocks over one range.
+  // Range 0 = the partial block + 155 per-line rows: merged into one aligned block, never two blocks over one range.
   expect(d3Blocks(f.disk,no)).toEqual([[0,256]]);
   expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(45);
+  // An unchecked line in the tail keeps its range per-line at the barrier, as before D3.
   commit(301,null,true);
-  // Barrier: the 46-line tail (one line unchecked) is a partial block; only the kept newest receipts stay live.
+  expect(d3Blocks(f.disk,no)).toEqual([[0,256]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(46);
+  commit(301,'c301',true);
   expect(d3Blocks(f.disk,no)).toEqual([[0,256],[256,46]]);
   expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
-  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture')).toBeLessThanOrEqual(D3.limits.ARCHIVE_KEEP);
-  // A repair inside the partial block and a late certification of its unchecked line patch the block.
-  commit(280,'c280r',false,'repaired 280');commit(301,'c301');
+  // A repair inside the partial block patches it in place.
+  commit(280,'c280r',false,'repaired 280');
   expect(d2Count(f.disk,'SELECT count(*) n FROM na_line')).toBe(0);
   expect(d3Blocks(f.disk,no)).toEqual([[0,256],[256,46]]);
   for(let i=302;i<512;i++)commit(i,`c${i}`);
@@ -1726,29 +1733,30 @@ test('D3: the flush barrier seals the per-line tail as a partial block, a later 
  }finally{f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
 });
 
-test('D3: a pane whose head stood still for the quiet age seals its tail once and archives the freed receipts below a full chunk',async()=>{
+test('D3: a pane whose head stood still for the quiet age seals its settled tail and archives the freed receipts below a full chunk',async()=>{
  const f=await d2File(2);let now=5e6;D3.setClock(()=>now);
  try {
   const [a,b]=f.panes.map(p=>p.pane_no),quiet=(D3.limits as any).SEAL_QUIET_MS as number;
   expect(quiet).toBeGreaterThanOrEqual(10000);
-  const written=new Map<number,any>();written.set(0,d3ReadDiskLines(f.disk,a,0,1)[0]);
+  const written=new Map<number,any>();
   const line=(no:number,i:number)=>({pane:no,next:i+1,build:(rev:number)=>{const l=d2Line(no,i,rev,`p${no}-c${i}`);if(no===a)written.set(i,l);return {captures:[d2Capture(no,`p${no}-c${i}`,rev)],lines:[l]};}});
   const idle=(no:number,id:string)=>({pane:no,build:(rev:number)=>({captures:[d2Capture(no,id,rev)]})});
-  for(let i=1;i<=100;i++)D3.commitBatch(f.disk,f.fence,d2Batch(f,[line(a,i),line(b,i)]));
-  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(100);
+  // Line 0 (the unchecked seed) is certified by the first commit.
+  for(let i=0;i<=100;i++)D3.commitBatch(f.disk,f.fence,d2Batch(f,[line(a,i),line(b,i)]));
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(101);
   // Pane a stands still (captures keep arriving, no new line); pane b keeps scrolling.
   now+=quiet-1;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,'idle-1'),line(b,101)]));
-  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(100);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(101);
   now+=1;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,'idle-2'),line(b,102)]));
   expect(d3Blocks(f.disk,a)).toEqual([[0,101]]);
   expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',a)).toBe(0);
-  // 102 receipts, far below ARCHIVE_MIN+ARCHIVE_KEEP: archived anyway, the newest kept few stay live.
+  // 103 receipts, far below ARCHIVE_MIN+ARCHIVE_KEEP: archived anyway, the newest kept few stay live.
   expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',a)).toBe(D3.limits.ARCHIVE_KEEP);
-  expect(d2Count(f.disk,'SELECT sum(capture_count) n FROM na_capture_archive WHERE pane_no=?',a)).toBe(102-D3.limits.ARCHIVE_KEEP);
+  expect(d2Count(f.disk,'SELECT sum(capture_count) n FROM na_capture_archive WHERE pane_no=?',a)).toBe(103-D3.limits.ARCHIVE_KEEP);
   // Pane b moved every commit: its tail stays per-line.
-  expect(d3Blocks(f.disk,b)).toEqual([[0,1]]);
-  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',b)).toBe(102);
-  // Once per quiet episode: later idle captures neither rewrite the block nor write tiny archives.
+  expect(d3Blocks(f.disk,b)).toEqual([]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_line WHERE pane_no=?',b)).toBe(103);
+  // Later idle captures of the still pane neither rewrite the block nor write tiny archives.
   const blockNo=(f.disk.query('SELECT block_no FROM na_block WHERE pane_no=?').get(a) as any).block_no,archives=d2Count(f.disk,'SELECT count(*) n FROM na_capture_archive WHERE pane_no=?',a);
   for(let k=3;k<20;k++){now+=quiet;D3.commitBatch(f.disk,f.fence,d2Batch(f,[idle(a,`idle-${k}`)]));}
   expect((f.disk.query('SELECT block_no FROM na_block WHERE pane_no=?').get(a) as any).block_no).toBe(blockNo);
