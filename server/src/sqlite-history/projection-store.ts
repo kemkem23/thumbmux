@@ -26,7 +26,7 @@ const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 // after SEAL_LAG) rewrites its block, so a line is never stored twice.
 // 2 KiB pages keep a typical line in its page (WITHOUT ROWID local limit
 // ~488 B) while halving each WAL frame and the fixed per-table pages.
-const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
+const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, SEAL_QUIET_MS=30000, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   /**
@@ -169,27 +169,61 @@ function writeLines(disk:Database,rows:SqlRow[]):void {
   }
 }
 const sealAttempts=new WeakMap<Database,Map<SqlRow[string],number>>();
-/** Seal every complete aligned block of settled per-line rows (see SEAL_LINES). */
-function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):Set<number> {
+// D3: a pane's head (next_line_id) and since when it has stood still, in archiveClock time.
+type PaneHead={next:number;since:number;aged:boolean};
+const paneHeads=new WeakMap<Database,Map<SqlRow[string],PaneHead>>();
+/**
+ * Seal every complete aligned block of settled per-line rows (see SEAL_LINES).
+ * D3: the rest of a pane (its per-line tail) is sealed by age too — at the
+ * flush barrier (force) and once per quiet episode, when the pane's head has
+ * not moved for SEAL_QUIET_MS — as a partial block [start,start+n) inside its
+ * aligned range. v5 already allows any line_count in 1..4096. Later lines of
+ * that range stay per-line until the range completes; then the partial block
+ * and the new rows are merged into the one aligned block, so a range never
+ * holds two blocks. Panes whose tail was sealed by quiet age are added to `aged`.
+ */
+function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> {
   const sealed=new Set<number>();
   let attempts=sealAttempts.get(disk);if(!attempts){attempts=new Map();sealAttempts.set(disk,attempts);}
-  const now=performance.now();
+  let heads=paneHeads.get(disk);if(!heads){heads=new Map();paneHeads.set(disk,heads);}
+  const now=performance.now(),clock=archiveClock();
   for(const p of panes) {
     const next=Number(p.next_line_id);
-    if(!force && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS)continue;
+    let head=heads.get(p.pane_no);
+    if(!head || head.next!==next){head={next,since:clock,aged:false};heads.set(p.pane_no,head);}
+    const quiet=!head.aged && clock-head.since>=SEAL_QUIET_MS,tail=force || quiet;
+    if(quiet)head.aged=true;
+    if(!tail && now-(attempts.get(p.pane_no)??-Infinity)<SEAL_RETRY_MS)continue;
     attempts.set(p.pane_no,now);
     // Per aligned block: rows present and rows not yet settled.
     const groups=prepared(disk,`SELECT line_id/${SEAL_LINES} AS b,count(*) AS n,
       sum(check_state=0 AND check_reason<>1 AND line_id>=?) AS open FROM na_line WHERE pane_no=? GROUP BY b`).all(next-SEAL_UNCHECKED_LAG,p.pane_no) as SqlRow[];
+    let tailSealed=false;
     for(const g of groups) {
-      const from=Number(g.b)*SEAL_LINES;
-      if(Number(g.n)!==SEAL_LINES || from+SEAL_LINES>next || (Number(g.open)!==0 && from+SEAL_LINES>next-SEAL_LAG))continue;
+      const from=Number(g.b)*SEAL_LINES,n=Number(g.n);
+      // A partial block this range already holds (at most one: every seal of the range merges it).
+      const part=n<SEAL_LINES?prepared(disk,'SELECT * FROM na_block WHERE pane_no=? AND first_line_id>=? AND first_line_id<?').get(p.pane_no,from,from+SEAL_LINES) as SqlRow|null:null;
+      const full=n+Number(part?.line_count??0)===SEAL_LINES;
+      if(full && from+SEAL_LINES<=next && (Number(g.open)===0 || from+SEAL_LINES<=next-SEAL_LAG)){}
+      else if(!tail)continue;
       const rows=prepared(disk,'SELECT * FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<? ORDER BY line_id').all(p.pane_no,from,from+SEAL_LINES) as SqlRow[];
+      const byId=new Map<number,unknown[]>();let top=Math.max(...rows.map(r=>Number(r.revision)));
+      if(part) {
+        const first=Number(part.first_line_id);
+        decodeBlock(part.data as unknown as Uint8Array).forEach((line,i)=>byId.set(first+i,line));
+        top=Math.max(top,Number(part.max_revision));
+      }
+      for(const row of rows)byId.set(Number(row.line_id),blockLine(row));
+      // A block has no holes: a range with a gap stays as it is.
+      const ids=[...byId.keys()].sort((a,b)=>a-b),start=ids[0]!;
+      if(ids.at(-1)!-start+1!==ids.length)continue;
+      if(part)prepared(disk,'DELETE FROM na_block WHERE block_no=?').run(Number(part.block_no));
       prepared(disk,'INSERT INTO na_block (pane_no,first_line_id,line_count,max_revision,data) VALUES (?,?,?,?,?)')
-        .run(p.pane_no,from,SEAL_LINES,Math.max(...rows.map(r=>Number(r.revision))),encodeBlock(rows.map(blockLine)));
+        .run(p.pane_no,start,ids.length,top,encodeBlock(ids.map(id=>byId.get(id)!)));
       prepared(disk,'DELETE FROM na_line WHERE pane_no=? AND line_id>=? AND line_id<?').run(p.pane_no,from,from+SEAL_LINES);
-      sealed.add(Number(p.pane_no));
+      sealed.add(Number(p.pane_no));if(!full)tailSealed=true;
     }
+    if(quiet && tailSealed)aged?.add(Number(p.pane_no));
   }
   return sealed;
 }
@@ -269,7 +303,7 @@ function liveReceipts(disk:Database,paneNo:number):number {
  * due. The returned plan is applied to the queue by applyArchivePlan after
  * the transaction committed.
  */
-function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[],touched:ReadonlySet<number>=new Set()):ArchivePlan {
+function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,panes:readonly number[]=[],touched:ReadonlySet<number>=new Set(),aged:ReadonlySet<number>=new Set()):ArchivePlan {
   const plan:ArchivePlan={marks,touched,updates:new Map()};
   if(force) {
     // Barrier: every pane, completely; the queue forgets the panes it drained.
@@ -279,8 +313,14 @@ function archiveCaptures(disk:Database,marks:Map<number,boolean>,force:boolean,p
     }
     return plan;
   }
+  // D3: a pane whose tail was just sealed by quiet age archives what it freed
+  // now, below a full chunk; once per quiet episode (see sealBlocks).
+  for(const paneNo of aged) {
+    if(liveReceipts(disk,paneNo)>ARCHIVE_KEEP)archivePane(disk,paneNo,true,Infinity);
+    plan.updates.set(paneNo,null);
+  }
   const now=archiveClock(),view=new Map<number,ArchiveEntry>();
-  for(const [paneNo,entry] of archiveQueue(disk))view.set(paneNo,{...entry});
+  for(const [paneNo,entry] of archiveQueue(disk))if(!aged.has(paneNo))view.set(paneNo,{...entry});
   mergeArchiveMarks(view,marks,touched);
   let scans=0,chunks=0;
   for(const [paneNo,entry] of view) {
@@ -305,6 +345,12 @@ function archiveNextDue(disk:Database):number|null {
   }
   return next;
 }
+/** D3: when a pane the store has seen reaches the quiet age, null if none is waiting for it. */
+function quietNextDue(disk:Database):number|null {
+  let next:number|null=null;
+  for(const head of paneHeads.get(disk)?.values()??[])if(!head.aged && (next===null || head.since+SEAL_QUIET_MS<next))next=head.since+SEAL_QUIET_MS;
+  return next;
+}
 /** Whether a drain now would find due work. */
 function archiveBacklog(disk:Database):boolean {
   const next=archiveNextDue(disk);return next!==null && next<=archiveClock();
@@ -314,7 +360,12 @@ function drainArchives(disk:Database,fence:number):void {
   let plan:ArchivePlan|null=null;
   disk.transaction(()=>{
     if(Number(Object.values(prepared(disk,'PRAGMA application_id').get()!)[0])!==fence) throw new Error('stale-writer');
-    plan=archiveCaptures(disk,new Map(),false);
+    // D3: panes that went quiet without another commit seal their tail here.
+    const heads=paneHeads.get(disk),now=archiveClock(),aged=new Set<number>(),marks=new Map<number,boolean>();
+    const quiet=[...heads?.entries()??[]].filter(([,head])=>!head.aged && now-head.since>=SEAL_QUIET_MS).map(([paneNo])=>paneNo);
+    const panes=quiet.map(paneNo=>prepared(disk,'SELECT * FROM na_pane WHERE pane_no=?').get(paneNo) as SqlRow|null).filter((p):p is SqlRow=>!!p);
+    for(const paneNo of sealBlocks(disk,panes,false,aged))marks.set(paneNo,true);
+    plan=archiveCaptures(disk,marks,false,[],new Set(),aged);
   }).immediate();
   const done=plan as ArchivePlan|null;if(!done)return;
   applyArchivePlan(disk,done);
@@ -346,11 +397,11 @@ function commitBatch(disk:Database, fence:number, batch:Batch, before?:()=>void,
     // and na_pane already holds every watermark. commit_seq counts all commits.
     prepared(disk,'INSERT INTO na_commit VALUES (?,coalesce((SELECT max(commit_seq) FROM na_commit),0)+1,?,?,?,?)').run(batch.id,Math.max(...batch.panes.map(p=>Number(p.revision))),Date.now(),JSON.stringify(batch.panes.map(p=>({paneKey:p.pane_key,revision:p.revision,nextLineId:p.next_line_id}))),batch.digest);
     prepared(disk,'DELETE FROM na_commit WHERE commit_id<>?').run(batch.id);
-    const sealed=sealBlocks(disk,batch.panes,forceSeal);
+    const aged=new Set<number>(),sealed=sealBlocks(disk,batch.panes,forceSeal,aged);
     for(const row of batch.tables.get('na_capture')??[])marks.set(Number(row.pane_no),false);
     for(const paneNo of sealed)marks.set(paneNo,true);
     const archiveStarted=performance.now();
-    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))));
+    plan=archiveCaptures(disk,marks,forceSeal,forceSeal?batch.panes.map(p=>Number(p.pane_no)):[],new Set(batch.panes.map(p=>Number(p.pane_no))),aged);
     archiveMs=performance.now()-archiveStarted;
     before?.();writeMs=performance.now()-started;
   }).immediate();
@@ -379,7 +430,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
     scheduleDrain();
   };
   const scheduleDrain=()=>{
-    const next=archiveNextDue(disk);
+    const due=[archiveNextDue(disk),quietNextDue(disk)].filter((t):t is number=>t!==null),next=due.length?Math.min(...due):null;
     if(!drainTimer && next!==null)drainTimer=setTimeout(drain,Math.max(ARCHIVE_IDLE_MS,next-archiveClock()));
   };
   const onMessage=(batch:Batch|'close')=>{
@@ -1281,7 +1332,7 @@ export function createProjectionStore(options:ProjectionOptions):ProjectionStore
 export { PROJECTION_MIGRATION };
 /** Test seam: the archive scheduler's internals and clock. Not a runtime API. */
 export const projectionArchiveInternals={
-  commitBatch,drainArchives,captureReceipts,archiveStatsOf,archiveQueue,archiveBacklog,archiveNextDue,ARCHIVE_SCAN_SQL,
-  limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT,ARCHIVE_IDLE_MS},
+  commitBatch,drainArchives,captureReceipts,archiveStatsOf,archiveQueue,archiveBacklog,archiveNextDue,quietNextDue,ARCHIVE_SCAN_SQL,
+  limits:{ARCHIVE_MIN,ARCHIVE_MAX,ARCHIVE_KEEP,ARCHIVE_RETRY_MS,ARCHIVE_SCANS_PER_COMMIT,ARCHIVE_CHUNKS_PER_COMMIT,ARCHIVE_IDLE_MS,SEAL_LINES,SEAL_QUIET_MS},
   setClock(clock:(()=>number)|null){archiveClock=clock??(()=>performance.now());},
 };

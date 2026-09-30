@@ -1761,6 +1761,12 @@ test('D3: a pane whose head stood still for the quiet age seals its tail once an
   d3Oracle(f.disk,a,written);
   const ids=[...written.values()].map(l=>l.checked_capture_id).filter(Boolean);
   expect(D3.captureReceipts(f.disk,a,ids).size).toBe(ids.length);
+  // Pane b went silent with no commit at all: the idle worker's drain seals it once its quiet age is due.
+  expect(D3.quietNextDue(f.disk)).toBeLessThanOrEqual(now);
+  D3.drainArchives(f.disk,f.fence);
+  expect(d3Blocks(f.disk,b)).toEqual([[0,103]]);
+  expect(d2Count(f.disk,'SELECT count(*) n FROM na_capture WHERE pane_no=?',b)).toBe(D3.limits.ARCHIVE_KEEP);
+  expect(d3Blocks(f.disk,a)).toEqual([[0,101]]);
   d2Clean(f.disk);
  }finally{D3.setClock(null);f.disk.close();rmSync(f.dir,{recursive:true,force:true});}
 });
