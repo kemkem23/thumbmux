@@ -771,3 +771,48 @@ describe("NEWARCH P2OPT shared parser fairness", () => {
     console.log(`P2OPT mutation whole-frame-turns: DETECTED quiet readLag p95=${quiet.readLagMs.p95} feed->consumed p95=${quiet.feedToConsumedMs.p95}`);
   }, 90_000);
 });
+
+// I2: deterministic trace accounting; no parser or scheduler timing assumptions.
+describe("NEWARCH I2 sequence trace contract", () => {
+  function fixture() {
+    const traces: PipeVtStageTrace[] = [];
+    const worker = new PipeVtWorker({ cols: 80, rows: 3, onUpdate: () => {}, onFault: () => {}, onStageTrace: t => traces.push(t) });
+    return { worker, internal: worker as any, traces };
+  }
+  test("epochs cannot acknowledge each other's feeds; superseded observations are censored", () => {
+    const { worker, internal } = fixture();
+    internal.traceFeed(7, 10, 1); internal.traceFeed(8, 11, 2);
+    expect(internal.traceAck(99, 1)).toEqual([1, 10, 10, 7, 7]);
+    expect(worker.traceBacklog().pending).toBe(1);
+    expect(internal.traceAck(8, 2)).toEqual([1, 11, 11, 8, 8]);
+    internal.traceFeed(9, 12, 2); internal.traceFeed(10, 13, 3);
+    expect(internal.traceAck(10, 3)).toEqual([1, 13, 13, 10, 10]);
+    expect(worker.traceBacklog().epochCensored).toBe(1);
+  });
+  test("bounded columns retain exact feed bounds and count dropped observations", () => {
+    const { worker, internal, traces } = fixture();
+    for (let i = 1; i <= PIPE_VT_TRACE_PENDING_MAX + 3; i++) internal.traceFeed(i, i, 1);
+    expect(worker.traceBacklog().dropped).toBe(3);
+    internal.emitTrace({ epoch: 1, seqFrom: 1, seqTo: PIPE_VT_TRACE_PENDING_MAX + 3 }, 10, 9000, 9001, 9002, 9003, true);
+    expect(traces[0]!.matchedSeqFrom).toBe(4);
+    expect(traces[0]!.matchedSeqTo).toBe(PIPE_VT_TRACE_PENDING_MAX + 3);
+    expect(traces[0]!.matchedFeeds).toBe(PIPE_VT_TRACE_PENDING_MAX);
+    expect(traces[0]!.traceDropped).toBe(3);
+    expect(worker.traceBacklog().pending).toBe(0);
+  });
+  test("consumer rejection is trace-visible, never a successful receipt", async () => {
+    const traces: PipeVtStageTrace[] = [];
+    const faults: string[] = [];
+    const worker = new PipeVtWorker({ cols: 80, rows: 3, onUpdate: async () => { throw new Error("receipt failed"); },
+      onFault: f => faults.push(f.message), onStageTrace: t => traces.push(t), traceNow: () => 20 });
+    const internal = worker as any;
+    internal.traceFeed(1, 10, 1);
+    const body = Buffer.from(JSON.stringify({ epoch: 1, seqFrom: 1, seqTo: 1 }));
+    const header = Buffer.alloc(5); header.write("U"); header.writeUInt32BE(body.length, 1);
+    await internal.onStdout(Buffer.concat([header, body]), 15);
+    expect(faults).toHaveLength(1);
+    expect(traces[0]!.consumerSucceeded).toBe(false);
+    expect(traces[0]!.clockDomain).toBe("host-performance-ms");
+    expect(traces[0]!.host).toEqual({ firstFeedAt: 10, arrivedAt: 15, decodeStartedAt: 20, decodedAt: 20, consumedAt: 20 });
+  });
+});

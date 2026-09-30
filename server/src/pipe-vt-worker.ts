@@ -127,6 +127,15 @@ export type PipeVtStageTrace = {
   epoch: number;
   /** Fed D frames whose seq this update acknowledged (0 for partial emits). */
   matchedFeeds: number;
+  /** I2: join with driver pane/session + epoch + these inclusive feed bounds. */
+  matchedSeqFrom: number | null;
+  matchedSeqTo: number | null;
+  clockDomain: "host-performance-ms";
+  host: { firstFeedAt: number | null; arrivedAt: number; decodeStartedAt: number; decodedAt: number; consumedAt: number };
+  consumerSucceeded: boolean;
+  /** Cumulative missing observations; never treat these as zero latency. */
+  traceDropped: number;
+  traceEpochCensored: number;
   bodyBytes: number;
   /** Host feed of the oldest / newest matched seq -> arrival of the completing chunk. */
   feedToArrivalMs: number | null;
@@ -337,6 +346,8 @@ export class PipeVtWorker {
   /** Traced feeds not yet acknowledged: parallel seq / host-time columns. */
   private traceSeqs: number[] = [];
   private traceTimes: number[] = [];
+  private traceEpochs: number[] = [];
+  private traceEpochCensored = 0;
   private traceHead = 0;
   private traceDropped = 0;
   readonly ready: Promise<PipeVtReady>;
@@ -487,18 +498,19 @@ export class PipeVtWorker {
   }
 
   /** Traced feeds awaiting acknowledgement, and feeds dropped from tracing. */
-  traceBacklog(): { pending: number; dropped: number; retained: number } {
-    return { pending: this.traceSeqs.length - this.traceHead, dropped: this.traceDropped, retained: this.traceSeqs.length };
+  traceBacklog(): { pending: number; dropped: number; retained: number; epochCensored: number } {
+    return { pending: this.traceSeqs.length - this.traceHead, dropped: this.traceDropped, retained: this.traceSeqs.length, epochCensored: this.traceEpochCensored };
   }
 
   private traceClock(): number {
     return (this.options.traceNow ?? performance.now.bind(performance))();
   }
 
-  private traceFeed(seq: number, fedAt: number): void {
+  private traceFeed(seq: number, fedAt: number, epoch: number): void {
     if (this.traceSeqs.length - this.traceHead >= PIPE_VT_TRACE_PENDING_MAX) { this.traceHead++; this.traceDropped++; }
     this.traceSeqs.push(seq);
     this.traceTimes.push(fedAt);
+    this.traceEpochs.push(epoch);
     this.compactTrace();
   }
 
@@ -507,31 +519,38 @@ export class PipeVtWorker {
     if (this.traceHead > 1024 && this.traceHead * 2 > this.traceSeqs.length) {
       this.traceSeqs = this.traceSeqs.slice(this.traceHead);
       this.traceTimes = this.traceTimes.slice(this.traceHead);
+      this.traceEpochs = this.traceEpochs.slice(this.traceHead);
       this.traceHead = 0;
     }
   }
 
-  /** Remove every traced feed acknowledged by `seqTo`; returns [count, first, last] times. */
-  private traceAck(seqTo: number | null): [number, number | null, number | null] {
+  /** Only the same epoch can acknowledge a feed; superseded feeds are censored. */
+  private traceAck(seqTo: number | null, epoch: number): [number, number | null, number | null, number | null, number | null] {
     let n = 0, first: number | null = null, last: number | null = null;
-    if (seqTo !== null) {
-      while (this.traceHead < this.traceSeqs.length && this.traceSeqs[this.traceHead]! <= seqTo) {
-        const t = this.traceTimes[this.traceHead++]!;
-        first ??= t; last = t; n++;
-      }
+    let seqFrom: number | null = null, matchedTo: number | null = null;
+    while (this.traceHead < this.traceSeqs.length) {
+      const e = this.traceEpochs[this.traceHead]!;
+      if (e < epoch) { this.traceHead++; this.traceEpochCensored++; continue; }
+      if (e !== epoch || seqTo === null || this.traceSeqs[this.traceHead]! > seqTo) break;
+      const seq = this.traceSeqs[this.traceHead]!;
+      const t = this.traceTimes[this.traceHead++]!;
+      first ??= t; last = t; seqFrom ??= seq; matchedTo = seq; n++;
     }
     this.compactTrace();
-    return [n, first, last];
+    return [n, first, last, seqFrom, matchedTo];
   }
 
   private emitTrace(update: PipeVtUpdate, bodyBytes: number, arrivedAt: number, startedAt: number,
-    decodedAt: number, consumedAt: number): void {
-    const [matchedFeeds, first, last] = this.traceAck(update.seqTo);
+    decodedAt: number, consumedAt: number, consumerSucceeded: boolean): void {
+    const [matchedFeeds, first, last, matchedSeqFrom, matchedSeqTo] = this.traceAck(update.seqTo, update.epoch);
     const stages = update.stages;
     const worker = stages ? { ...stages, parseNs: update.parseNs, encodeNs: update.encodeNs, serializeNs: update.serializeNs ?? 0 } : null;
     const feedToArrivalMs = first === null ? null : arrivedAt - first;
     const trace: PipeVtStageTrace = {
       seqFrom: update.seqFrom, seqTo: update.seqTo, epoch: update.epoch, matchedFeeds, bodyBytes,
+      matchedSeqFrom, matchedSeqTo, clockDomain: "host-performance-ms",
+      host: { firstFeedAt: first, arrivedAt, decodeStartedAt: startedAt, decodedAt, consumedAt },
+      consumerSucceeded, traceDropped: this.traceDropped, traceEpochCensored: this.traceEpochCensored,
       feedToArrivalMs, lastFeedToArrivalMs: last === null ? null : arrivedAt - last,
       mainQueueMs: startedAt - arrivedAt, decodeMs: decodedAt - startedAt, consumerMs: consumedAt - decodedAt,
       feedToConsumedMs: first === null ? null : consumedAt - first,
@@ -569,6 +588,7 @@ export class PipeVtWorker {
       }
       if (kind === "U" || kind === "H") {
         const decodedAt = tracing ? this.traceClock() : 0;
+        let consumerSucceeded = true;
         try {
           const receipt = kind === "U" ? this.options.onUpdate(message as PipeVtUpdate)
             : this.options.onHistoryClear?.(message as { seq: number; epoch: number });
@@ -577,9 +597,10 @@ export class PipeVtWorker {
           if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") await receipt;
           if (this.abandoned) return;
         } catch (error) {
+          consumerSucceeded = false;
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
-        if (tracing) this.emitTrace(message as PipeVtUpdate, length, arrivedAt, startedAt, decodedAt, this.traceClock());
+        if (tracing) this.emitTrace(message as PipeVtUpdate, length, arrivedAt, startedAt, decodedAt, this.traceClock(), consumerSucceeded);
       }
       else if (kind === "B") {
         this.quitAck = (message as { workerEof?: boolean }).workerEof === true;
@@ -673,7 +694,7 @@ export class PipeVtWorker {
     prefix.writeBigUInt64BE(BigInt(epoch), 8);
     const fedAt = this.options.onStageTrace ? this.traceClock() : 0;
     const accepted = this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
-    if (accepted && this.options.onStageTrace) this.traceFeed(seq, fedAt);
+    if (accepted && this.options.onStageTrace) this.traceFeed(seq, fedAt, epoch);
     return accepted;
   }
 
