@@ -1782,7 +1782,9 @@ test('D3: a pane whose head stood still for the quiet age seals its settled tail
 // Drained D/R before D3 on this shape: 2.47 (bench/soak-repro.ts, 642ccc7ed). 1.5 is out of reach in v5: see docs/tasks/newarch-r2-d3/REPORT.md.
 const D3_SOAK_DR_MAX=2.1;
 // V soak shape (v-soak-a1: 21 panes, 18,606 rows, ~1 capture per row, na_line 2478 / na_block 63 after drain, D/R 2.92).
-test('D3: a soak-shaped store (21 panes x 886 rows, one capture per row) keeps no per-line tail after the flush barrier and every row and receipt still resolves',async()=>{
+// Outside the mutation runner's 'D3:' pattern (each run would repeat this ~75 s workload in the cage); every D3 mutant is
+// killed by the two tests above. It stays in the normal suite as the lot's acceptance test.
+test('D3 soak: a soak-shaped store (21 panes x 886 rows, one capture per row) keeps no per-line tail after the flush barrier and every row and receipt still resolves',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'na-d3-soak-')),s=createProjectionStore({historyRoot:dir,mode:'create'});
  const PANES=21,ROWS=886,keys=Array.from({length:PANES},(_,p)=>({serverIdentity:'d3-soak',paneId:`%${p}`,birthGeneration:1}));
  const row=(p:number,i:number)=>s2Row([...s2Text(`P${String(p).padStart(2,'0')} ${String(i).padStart(6,'0')} `),...s2Text(`color${i%10}`,`index:${1+i%7}`),...s2Text(' '+'abcdefghij'.repeat(3).slice(0,20+i%13))],120);

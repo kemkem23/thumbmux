@@ -272,7 +272,7 @@ test('D3 tail seal and quiet archive mutants are each killed by a D3 test; the c
     };
     const before = await run('clean-before');
     expect(before.code).toBe(0);
-    expect(before.tests).toBe(3);
+    expect(before.tests).toBe(2);
     for (const mutant of mutants) {
       const path = join(root, 'server/src', mutant.file), original = readFileSync(path, 'utf8');
       expect(original.includes(mutant.from)).toBe(true);
