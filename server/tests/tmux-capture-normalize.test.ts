@@ -452,7 +452,7 @@ describe('SPIKE2 bounded prototype fixtures', () => {
   test('compact exact matcher equals original across cold duplicates, all blanks, collisions, soft-wrap and false-full', () => {
     const dir = mkdtempSync(join(tmpdir(), 'spike2-exact-'));
     const registry = new ExactRowTokens(join(dir, 'rows'), undefined, () => 'forced-collision');
-    const row = (s: string, softWrap = false): CapturedRow => ({ cells: new TmuxCaptureDecoder(8).decode(s)[0]!, softWrap });
+    const row = (s: string, softWrap = false): CapturedRow => ({ cells: new TmuxCaptureDecoder(8).decode(s + '\n')[0]!, softWrap });
     try {
       const a = [row('a'), row('b'), row('c'), row('d'), row('e'), row('f'), row('g')];
       for (const [history, captured] of [[a, a], [[...a, ...a], a], [a, [...a, ...a]],
