@@ -512,3 +512,68 @@ describe('SPIKE2 bounded prototype fixtures', () => {
     expect(released).toBe(3);
   });
 });
+
+import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { prepared as p0Prepared } from '../src/sqlite-history/ram-store';
+import { coordinator as p0Coordinator, lifetime as p0Lifetime, matchCapture as p0Match, commitChunks as p0Commit } from '../../../../docs/tasks/newarch-spike2/bundle/adapter';
+
+describe('SPIKE2 real SQLite ReadView and committed prefix', () => {
+  const key = { serverIdentity: 'spike2-fixture', paneId: '%1', birthGeneration: 1 };
+  const cell = (grapheme: string) => ({ grapheme, width: 1, continuation: false, fg: 'default', bg: 'default', style: 0 });
+  const row = (text: string) => ({ text, cells: [...text].map(cell) });
+  test('WAL snapshot keeps grant head and overlay while writer advances; cancel releases gate', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'spike2-view-'));
+    const store:any = createProjectionStore({historyRoot:root,mode:'create'}), c=p0Coordinator(store);
+    try {
+      await store.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,physicalRow:row('old'),softWrap:false,receiveSeq:1});
+      store.flush();
+      await store.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,physicalRow:row('ram'),softWrap:false,receiveSeq:2});
+      const controller=new AbortController();
+      const view=await c.open(key,performance.now()+1000,controller.signal);
+      await store.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,physicalRow:row('new'),softWrap:false,receiveSeq:3});
+      store.flush();
+      expect(view.token.end).toBe(2);
+      expect((await view.page(0,2)).map((r:any)=>r.physical.text)).toEqual(['old','ram']);
+      await expect(view.page(0,3)).rejects.toThrow('range');
+      controller.abort(); await view.release();
+      const next=await c.open(key,performance.now()+1000);
+      expect((await next.page(0,3)).map((r:any)=>r.physical.text)).toEqual(['old','ram','new']);
+      await next.release();
+      expect(c.stats.grants).toBe(c.stats.releases);
+    } finally {await store.close();rmSync(root,{recursive:true,force:true});}
+  });
+  test('real chunk1 commit survives chunk2 failure, COW hot cells/ANSI and reopen agree', async () => {
+    const root=mkdtempSync(join(tmpdir(),'spike2-prefix-'));
+    let store:any=createProjectionStore({historyRoot:root,mode:'create'});
+    const c=p0Coordinator(store);
+    try {
+      for(let i=0;i<257;i++)await store.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,physicalRow:row('old'),softWrap:false,receiveSeq:i+1});
+      store.flush();
+      const oldRing=Array.from({length:257},(_,lineId)=>Object.freeze({lineId,cells:row('old').cells,ansiCache:{text:'old'}}));
+      const pane:any={paneKey:key,runtime:{store,now:()=>Date.now()},ring:oldRing,ringRepairs:0,certified:new Set(),received:257,
+        stats:{storeCommits:0},countCapture(){}};
+      const capture:any={captureId:'fixture-capture',requestedAt:1,completedAt:2,after:{sourceEpoch:1,geometryGeneration:1,kind:'normal',cols:3,rows:1,cursor:{x:0,y:0,visible:true}},
+        frame:{cells:[row('new').cells]},observedFields:['grapheme','width','continuation','fg','bg','style'],completeRetainedTail:true};
+      await p0Lifetime(pane,new AbortController().signal,performance.now()+1000,async()=>{
+        await c.rpc('begin',{path:join(root,'capture.spool'),cols:3});
+        await c.rpc('bytes',{bytes:Buffer.from('new\n'.repeat(258))});
+        await c.rpc('end',{rows:1});
+        const token=store.token(key);
+        await p0Match(pane,capture,{recentLastLineId:256},token);
+        const enqueue=store.enqueue.bind(store);let chunks=0;
+        store.enqueue=(...args:any[])=>{if(++chunks===2)return Promise.reject(new Error('chunk2 injected'));return enqueue(...args);};
+        await expect(p0Commit(pane,{capture,expectedRevision:token.revision,captureEvidence:{kind:'unfenced',reason:'fixture'},checks:[],contentMatches:[],
+          repairs:Array.from({length:257},(_,i)=>({lineId:i,capturedRow:i}))})).rejects.toThrow('chunk2 injected');
+        store.enqueue=enqueue;
+      });
+      expect(pane.ring[0].cells).toEqual(row('new').cells);
+      expect(pane.ring[0].ansiCache).toEqual({});
+      expect(pane.ring[256].cells).toEqual(row('old').cells);
+      expect(oldRing[0]!.cells).toEqual(row('old').cells);
+      expect(pane.certified.size).toBe(256);
+      expect(store.readPage(store.token(key),0,257).lines.map((l:any)=>l.text)).toEqual([...Array(256).fill('new'),'old']);
+      await store.close();store=createProjectionStore({historyRoot:root,mode:'recover'});
+      expect(store.readPage(store.token(key),0,257).lines.map((l:any)=>l.text)).toEqual([...Array(256).fill('new'),'old']);
+    } finally {await store.close();rmSync(root,{recursive:true,force:true});}
+  },10000);
+});
