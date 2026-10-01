@@ -91,7 +91,7 @@ import { cellsToAnsi, BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOv
 /** A pane double with exactly the surface the live window reads. */
 function fakePane(cols = 20, rows = 4) {
   const paneKey = { serverIdentity: "srv", paneId: "%7", birthGeneration: 1 };
-  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof parserRowCells>; softWrap: boolean; ansi?: string }> = [];
+  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof parserRowCells>; softWrap: boolean; ansiCache: { text?: string } }> = [];
   let next = 0, revision = 0, kind: "normal" | "alternate" = "normal", sourceEpoch = 1;
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
   const pane = {
@@ -110,7 +110,7 @@ function fakePane(cols = 20, rows = 4) {
   };
   return {
     pane: pane as unknown as PipeHistoryPane,
-    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false }); next++; revision++; } },
+    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false, ansiCache: {} }); next++; revision++; } },
     alt(on: boolean) { kind = on ? "alternate" : "normal"; revision++; },
     epoch() { sourceEpoch++; revision++; },
   };
@@ -192,7 +192,7 @@ function calibratedPane(ring: string[], screen: string[], pulledBack: { rows: nu
   const cols = 12;
   const paneKey = { serverIdentity: "srv", paneId: "%9", birthGeneration: 1 };
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
-  const rows = ring.map((text, lineId) => ({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: row(text), softWrap: false }));
+  const rows = ring.map((text, lineId) => ({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: row(text), softWrap: false, ansiCache: {} }));
   const token = { paneKey, sourceEpoch: 1, geometryGeneration: 0, revision: 1, durableRevision: 1, nextLineId: ring.length };
   const pane = {
     paneKey,
@@ -260,7 +260,7 @@ import { decodeFrameCells, encodeFrameCells, validateFrame } from "../src/sqlite
 function issuePane(cols = 20, rows = 4) {
   const paneKey = { serverIdentity: "srv", paneId: "%8", birthGeneration: 1 };
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
-  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof row>; softWrap: boolean; ansi?: string }> = [];
+  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof row>; softWrap: boolean; ansiCache: { text?: string } }> = [];
   const issues: any[] = [];
   let next = 0, revision = 0;
   const pane: any = {
@@ -275,9 +275,9 @@ function issuePane(cols = 20, rows = 4) {
   };
   return {
     pane: pane as PipeHistoryPane,
-    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false }); next++; revision++; } },
+    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false, ansiCache: {} }); next++; revision++; } },
     issue(lineId: number, kind = "gap") { issues.push({ kind, reason: kind, missingCount: null, boundaryLineId: lineId, revision: ++revision }); },
-    repair(lineId: number, text: string) { const r = ring.find((x) => x.lineId === lineId)!; r.cells = row(text); r.ansi = undefined; pane.ringRepairs++; revision++; },
+    repair(lineId: number, text: string) { const r = ring.find((x) => x.lineId === lineId)!; r.cells = row(text); r.ansiCache = {}; pane.ringRepairs++; revision++; },
   };
 }
 
@@ -717,7 +717,7 @@ test("NEWARCH2 M3: memoryStats counts ring, certified and memo bytes by the expl
     await h.commit([0, 1, 2]);
     const m = CACHE_BYTE_MODEL, s = h.pane.memoryStats();
     expect(s.ring).toMatchObject({ rows: 8, rowArrays: 6, sharedRows: 2, cellSlots: 60, floor: 0 });
-    expect(s.ring.bytes).toBe(m.arrayHeader + 8 * (m.slot + m.object) + 6 * m.arrayHeader + 60 * m.slot + s.ring.ansiRows * m.stringHeader + s.ring.ansiChars * m.char);
+    expect(s.ring.bytes).toBe(m.arrayHeader + 8 * (2 * m.slot + 2 * m.object) + 6 * m.arrayHeader + 60 * m.slot + s.ring.ansiRows * m.stringHeader + s.ring.ansiChars * m.char);
     expect(s.certified).toEqual({ ids: 3, bytes: 3 * m.setEntry });
     h.setBody("abc\n\x1b[31mred\x1b[0m\n");
     await h.p.capture(0, new AbortController().signal);
@@ -777,10 +777,21 @@ const commit = (checks, repairs = []) => { const history = [...checks.map(id => 
       to: "if (this.certified.size > 20_000) for (const id of this.certified) if (id < floor) this.certified.delete(id);",
       body: `for (let s = 0; s < 40; s++) { add(20); await commit(pane.recentRows().slice(-20).map(r => r.lineId)); }
 assert.ok(pane.certified.size <= pane.recentRows().length, 'MUTATION certified ' + pane.certified.size + ' ids over a ring of ' + pane.recentRows().length);` },
-    { name: "repair-in-place", from: "this.ring = this.ring.map(row => {\n          const cells = byId.get(row.lineId);\n          return cells ? Object.freeze({ ...row, cells }) : row;\n        });",
+    { name: "repair-in-place", from: "this.ring = this.ring.map(row => {\n          const cells = byId.get(row.lineId);\n          return cells ? Object.freeze({ ...row, cells, ansiCache: {} }) : row;\n        });",
       to: "for (let i = 0; i < this.ring.length; i++) { const cells = byId.get(this.ring[i].lineId); if (cells) this.ring[i] = Object.freeze({ ...this.ring[i], cells }); }",
       body: `add(10); const snap = pane.read(); const old = pane.recentRows()[3].cells; await commit([], [[3, 'fixed']]);
 assert.equal(snap.recentHistory[3].cells, old, 'MUTATION repair changed a snapshot read before it');` },
+    { name: "ansi-repair-stale", from: "Object.freeze({ ...row, cells, ansiCache: {} }) : row", to: "Object.freeze({ ...row, cells }) : row",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100);
+assert.equal(w.historyText('m', pane.recentRows(), 0, ''), 'r0\\nr1');
+await commit([], [[0, 'fixed']]);
+assert.equal(w.historyText('m', pane.recentRows(), pane.ringRepairs, ''), 'fixed\\nr1', 'MUTATION stale ANSI after warm repair');` },
+    { name: "ansi-new-row-poison", from: "this.ring.push(Object.freeze({ ...row, ansiCache: {} }));", to: "this.ring.push(Object.freeze({ ...row, ansiCache: { text: 'stale' } }));",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100);
+assert.equal(w.historyText('m', pane.recentRows(), 0, ''), 'r0\\nr1', 'MUTATION wrong ANSI on new rows');` },
+    { name: "ansi-history-weakmap", from: "rows[i]!.ansiCache.text ??= cellsToAnsi(rows[i]!.cells)", to: "rowAnsi(rows[i]!.cells)",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100); w.historyText('m', pane.recentRows(), 0, '');
+assert.equal(pane.memoryStats().ring.ansiRows, 2, 'MUTATION history ANSI missing from row census');` },
     { name: "canonical-copy", from: "return new TmuxCaptureDecoder(cols, undefined, undefined, canonicalCell);", to: "return new TmuxCaptureDecoder(cols);",
       body: `const d = R.canonicalCaptureDecoder(6); const a = R.pipeHistoryAllocations().canonicalRowArrays; R.decodeCanonicalCapture(d, 'ab\\n\\x1b[31mc\\x1b[0m\\n');
 assert.equal(R.pipeHistoryAllocations().canonicalRowArrays - a, 0, 'MUTATION capture rows copied into second canonical arrays');` },

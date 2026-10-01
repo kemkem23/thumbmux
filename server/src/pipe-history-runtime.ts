@@ -469,8 +469,8 @@ export function applyFrameDelta(screen: ParserScreen | undefined, cells: PipeFra
 
 // ─── pane ─────────────────────────────────────────────────────────────────
 
-/** Frozen once in the ring: a repair replaces the row (and the ring array), never its fields. */
-type RingRow = Readonly<HistoryRow>;
+/** Frozen row identity; only its derived ANSI cache is mutable. Repairs own a fresh cache. */
+type RingRow = Readonly<HistoryRow> & { readonly ansiCache: { text?: string } };
 function sameScreen(a: readonly (readonly HistoryCell[])[], b: readonly (readonly HistoryCell[])[],
   ca: { x: number; y: number; visible: boolean } | null, cb: { x: number; y: number; visible: boolean } | null): boolean {
   if (a.length !== b.length || JSON.stringify(ca) !== JSON.stringify(cb)) return false;
@@ -690,7 +690,7 @@ export class PipeHistoryPane {
   }
 
   private remember(row: HistoryRow): void {
-    this.ring.push(Object.freeze(row));
+    this.ring.push(Object.freeze({ ...row, ansiCache: {} }));
     const limit = this.runtime.options.ringRows ?? RING_ROWS;
     // Evict into a new array, never in place: a calibration snapshot taken
     // earlier (read()) is this array plus its length at that moment.
@@ -1082,7 +1082,7 @@ export class PipeHistoryPane {
         const byId = new Map(input.repairs.map(r => [r.lineId, r.row.cells]));
         this.ring = this.ring.map(row => {
           const cells = byId.get(row.lineId);
-          return cells ? Object.freeze({ ...row, cells }) : row;
+          return cells ? Object.freeze({ ...row, cells, ansiCache: {} }) : row;
         });
         allocations.ringArrayCopies++;
         this.ringRepairs++;
@@ -1227,16 +1227,17 @@ export class PipeHistoryPane {
     const arrays = new Set<readonly HistoryCell[]>();
     let cellSlots = 0, sharedRows = 0, ansiChars = 0, ansiRows = 0;
     for (const row of this.ring) {
+      const ansi = row.ansiCache.text;
+      if (ansi !== undefined) { ansiRows++; ansiChars += ansi.length; }
       if (arrays.has(row.cells)) { sharedRows++; continue; }
       arrays.add(row.cells);
       cellSlots += row.cells.length;
-      const ansi = ANSI_ROWS.get(row.cells);
-      if (ansi !== undefined) { ansiRows++; ansiChars += ansi.length; }
     }
     const rows = this.ring.length;
     const ring = {
       rows, rowArrays: arrays.size, sharedRows, cellSlots, ansiRows, ansiChars, floor: this.ring[0]?.lineId ?? null,
-      bytes: m.arrayHeader + rows * (m.slot + m.object) + arrays.size * m.arrayHeader + cellSlots * m.slot
+      // One row plus its cache object and cache reference, even before encoding.
+      bytes: m.arrayHeader + rows * (2 * m.slot + 2 * m.object) + arrays.size * m.arrayHeader + cellSlots * m.slot
         + ansiRows * m.stringHeader + ansiChars * m.char,
     };
     const certified = { ids: this.certified.size, bytes: this.certified.size * m.setEntry };
@@ -1574,7 +1575,7 @@ export class ProjectionLiveWindow {
       // One join, never repeated `+`: a string built by appending stays a rope
       // one level per row, and every later hash of the frame walks it.
       const parts: string[] = from ? [text] : [];
-      for (let i = from; i < rows.length; i++) parts.push(rowAnsi(rows[i]!.cells));
+      for (let i = from; i < rows.length; i++) parts.push(rows[i]!.ansiCache.text ??= cellsToAnsi(rows[i]!.cells));
       text = parts.join('\n');
     }
     this.texts.set(id, { firstId: rows[0]!.lineId, lastId: rows[rows.length - 1]!.lineId, count: rows.length, repairs, hide, text });
