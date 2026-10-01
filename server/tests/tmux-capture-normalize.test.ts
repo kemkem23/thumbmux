@@ -577,3 +577,28 @@ describe('SPIKE2 real SQLite ReadView and committed prefix', () => {
     } finally {await store.close();rmSync(root,{recursive:true,force:true});}
   },10000);
 });
+
+// SPIKE2 round 4: admission safety is independent of performance acceptance.
+import { ScratchLedger, SCRATCH_CAPS } from '../../../../docs/tasks/newarch-spike2/bundle/scratch';
+describe('SPIKE2 shared scratch admission', () => {
+  test('worker/main share caps, reject overflow without corrupting charge, and release', () => {
+    const a=new ScratchLedger(), b=new ScratchLedger(a.shared);
+    SCRATCH_CAPS.forEach((cap,i)=>a.set(i,cap));
+    expect(b.stats.charged.reduce((a,b)=>a+b,0)).toBe(32*1024*1024);
+    expect(()=>b.set(1,SCRATCH_CAPS[1]!+1)).toThrow('scratch-budget');
+    expect(a.stats.refusals).toBe(1);expect(a.stats.charged[1]).toBe(SCRATCH_CAPS[1]);
+    SCRATCH_CAPS.forEach((_,i)=>b.set(i,0));expect(a.stats.charged.reduce((a,b)=>a+b,0)).toBe(0);
+  });
+  test('wide Unicode/SGR inventory yields bounded chunks with exact rows and releases decode charge', () => {
+    const ledger=new ScratchLedger();
+    for(const cols of [80,120,240]) {
+      const raw=('\x1b[38;2;128;64;32m'+'漢'.repeat(cols/2)+'\x1b[0m\n').repeat(520);
+      const decoder=new CaptureChunkDecoder(cols,65536,n=>ledger.set(1,n));
+      const rows:any[]=[];const bytes=Buffer.from(raw);
+      for(let i=0;i<bytes.length;i+=65536)for(const chunk of decoder.write(bytes.subarray(i,i+65536))){expect(chunk.length).toBeLessThanOrEqual(256);rows.push(...chunk.map(r=>r.cells));}
+      for(const chunk of decoder.end())rows.push(...chunk.map(r=>r.cells));
+      expect(rows).toEqual(new TmuxCaptureDecoder(cols).decode(raw));expect(ledger.stats.charged[1]).toBe(0);
+    }
+    expect(ledger.stats.high[1]).toBeLessThanOrEqual(SCRATCH_CAPS[1]);
+  });
+});
