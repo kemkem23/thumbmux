@@ -86,7 +86,7 @@ test("a throwing live boundary returns a retryable error without reading a dupli
 
 // ── NEWARCH L2-I lot I4: the projection live window and its seam ─────────────
 import { muxHistoryBoundaryTransition, validateMuxHistoryBoundary, validateNewarchFrameMeta } from "../../core/src/protocol";
-import { BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOverlap, type PipeHistoryPane } from "../src/pipe-history-runtime";
+import { cellsToAnsi, BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOverlap, type PipeHistoryPane } from "../src/pipe-history-runtime";
 
 /** A pane double with exactly the surface the live window reads. */
 function fakePane(cols = 20, rows = 4) {
