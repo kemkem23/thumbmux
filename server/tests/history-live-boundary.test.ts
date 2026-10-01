@@ -579,6 +579,41 @@ test("NEWARCH2 M3: a calibration snapshot keeps its rows across append, eviction
   } finally { await h.close(); }
 });
 
+test("NEWARCH M1: row ANSI caches survive append and isolate warm repairs, including shared cells", async () => {
+  const h = m3Harness({ ringRows: 100 });
+  try {
+    h.add(2);
+    const w = new ProjectionLiveWindow(100) as any;
+    const render = () => w.historyText("m1", h.pane.recentRows(), h.p.ringRepairs, "");
+    expect(render()).toBe("r0\nr1");
+    const old = h.pane.recentRows()[0] as any;
+    const snap = h.p.read();
+    expect(old.ansiCache?.text).toBe("r0");
+    expect(Object.isFrozen(old)).toBe(true);
+    h.add(1);
+    expect(render()).toBe("r0\nr1\nr2");
+    await h.commit([], [[0, "fixed"]]);
+    const repaired = h.pane.recentRows()[0] as any;
+    expect(repaired.ansiCache).not.toBe(old.ansiCache);
+    expect(repaired.ansiCache.text).toBeUndefined();
+    expect(render()).toBe("fixed\nr1\nr2");
+    expect(snap.recentHistory[0]).toBe(old);
+    expect(old.ansiCache.text).toBe("r0");
+    expect(repaired.ansiCache.text).toBe("fixed");
+    expect(h.pane.memoryStats().ring).toMatchObject({ ansiRows: 3, ansiChars: 9 });
+    // Two rows own separate caches even when canonical cells are shared.
+    const cells = parserRowCells([["red", "default", 1, "é"]], h.cols);
+    for (const lineId of [3, 4]) h.p.remember({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells, softWrap: false });
+    const rows = h.pane.recentRows() as any;
+    expect(rows[3].cells).toBe(rows[4].cells);
+    expect(rows[3].ansiCache).not.toBe(rows[4].ansiCache);
+    const ansi = cellsToAnsi(cells);
+    expect(ansi).toContain("\x1b[");
+    expect(render()).toBe(`fixed\nr1\nr2\n${ansi}\n${ansi}`);
+    expect(h.pane.memoryStats().ring).toMatchObject({ ansiRows: 5, ansiChars: 9 + 2 * ansi.length, sharedRows: 1 });
+  } finally { await h.close(); }
+});
+
 test("NEWARCH2 M3: blank rows share one frozen array per width; unicode, style and colour rows are converted as before", () => {
   const before = pipeHistoryAllocations();
   const a = parserRowCells([["default", "default", 0, " ".repeat(12)]], 12);
