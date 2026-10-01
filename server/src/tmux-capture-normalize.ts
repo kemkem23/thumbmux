@@ -444,11 +444,7 @@ export class TmuxCaptureDecoder {
       } else {
         this.misses++;
         const map = this.mapCell;
-        // A mapping decoder owns its cell namespace (including interning).
-        // As on the uncertain/screen paths, pass decoded cells directly: the
-        // runtime canonical mapper already interns them. Memo hits still
-        // return the same canonical row, without a second row or cell pool.
-        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(map ?? internCell);
+        const cells = decodeLine(normalizeTmuxCaptureCells(line), this.cols, state).map(map ? cell => map(internCell(cell)) : internCell);
         entry = { cells, fg: state.fg, bg: state.bg, style: state.style, used: this.generation };
         this.cache.set(key, entry);
         if (this.cache.size > this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
