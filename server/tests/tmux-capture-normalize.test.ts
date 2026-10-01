@@ -402,3 +402,113 @@ test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, e
   expect(stats.bytes).toBe(4 * (m.mapEntry + m.object + m.arrayHeader + m.stringHeader) + 4 * cols * m.slot + stats.keyChars * m.char);
   expect((new TmuxCaptureDecoder(cols) as any).stats()).toMatchObject({ entries: 0, cellSlots: 0, keyChars: 0, bytes: 0 });
 });
+
+// SPIKE2: disposable prototype modules; production imports remain unchanged.
+import { CaptureChunkDecoder } from '../../../../docs/tasks/newarch-spike2/bundle/decoder';
+import { ExactRowTokens, FullPermit, matchTokens, repairPrefix, withFrozenView, type ViewPorts } from '../../../../docs/tasks/newarch-spike2/bundle/prototype';
+import { matchHistoryRows as originalMatch, type CapturedRow } from '../src/history-row-matcher';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+describe('SPIKE2 bounded prototype fixtures', () => {
+  const fixtures = ['', '\n', '\n\n', 'a', 'a\n', 'a\n\n', '12345678\nabcdefgh\n',
+    '\x1b[31mred\ncarry\n\x1b[0mreset\n', 'A❤️ B\nไทย你😃\n',
+    '\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x07\n',
+    '\x1b[38;2;12;23;34m👩‍💻\n🇹🇭\n', '👍🏽❤️ \nplain\n',
+    '\x1b]8;;url\ncontinued\x07text\n', 'A❤️\x1b]8;;url\n B\x07x\n'];
+  const streamed = (raw: string, cut: number) => {
+    const d = new CaptureChunkDecoder(40), bytes = Buffer.from(raw), all: any[] = [];
+    for (const part of [bytes.subarray(0, cut), bytes.subarray(cut)]) for (const chunk of d.write(part)) all.push(...chunk);
+    for (const chunk of d.end()) all.push(...chunk);
+    return { rows: all.map(r => r.cells), uncertain: all.filter(r => r.uncertain).map(r => r.index) };
+  };
+  test('byte-exact legacy parity at EVERY UTF-8/SGR/OSC/LF cut; uncertain rows retain global indexes', () => {
+    for (const raw of fixtures) {
+      const d = new TmuxCaptureDecoder(40); let expected: unknown, error = false;
+      try { expected = JSON.stringify({ rows: d.decode(raw), uncertain: d.uncertainRows }); } catch { error = true; }
+      for (let cut = 0; cut <= Buffer.byteLength(raw); cut++) {
+        if (error) expect(() => streamed(raw, cut)).toThrow();
+        else expect(JSON.stringify(streamed(raw, cut))).toBe(expected);
+      }
+    }
+  });
+  test('256-row batches carry SGR, preserve row ownership, and leave hot memo identity intact', () => {
+    const hot = new TmuxCaptureDecoder(40, 1024), raw = '\x1b[31mhot\n';
+    const prior = hot.decode(raw)[0]; const stats = hot.stats();
+    const d = new CaptureChunkDecoder(40); const rows = '\x1b[31m' + Array.from({ length: 777 }, (_, i) => `row-${i}\n`).join('');
+    const chunks = [...d.write(Buffer.from(rows)), ...d.end()];
+    expect(chunks.map(c => c.length)).toEqual([256, 256, 256, 9]);
+    expect(chunks.flat().map(r => r.cells)).toEqual(new TmuxCaptureDecoder(40).decode(rows));
+    expect(chunks[0]![0]!.cells).not.toBe(chunks[1]![0]!.cells);
+    expect(hot.stats()).toEqual(stats); expect(hot.decode(raw)[0]).toBe(prior);
+  });
+  test('unsupported controls and invalid input fail, never truncate', () => {
+    for (const raw of ['\x1b[?25l', '\r', 'x'.repeat(41), '\x1b[31']) {
+      expect(() => streamed(raw, 1)).toThrow();
+    }
+    expect(() => [...new CaptureChunkDecoder(40).write(new Uint8Array(65537))]).toThrow();
+  });
+  test('compact exact matcher equals original across cold duplicates, all blanks, collisions, soft-wrap and false-full', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spike2-exact-'));
+    const registry = new ExactRowTokens(join(dir, 'rows'), undefined, () => 'forced-collision');
+    const row = (s: string, softWrap = false): CapturedRow => ({ cells: new TmuxCaptureDecoder(8).decode(s)[0]!, softWrap });
+    try {
+      const a = [row('a'), row('b'), row('c'), row('d'), row('e'), row('f'), row('g')];
+      for (const [history, captured] of [[a, a], [[...a, ...a], a], [a, [...a, ...a]],
+        [Array(8).fill(row('')), Array(8).fill(row(''))], [a, [row('a', true), ...a.slice(1)]],
+        [a, [row('wrong'), ...a.slice(1)]], [a, a.slice(-3)]] as [CapturedRow[], CapturedRow[]][]) {
+        const recent = history.map((r, i) => ({ ...r, lineId: i, sourceEpoch: 1, geometryGeneration: 2 }));
+        for (const completeRetainedTail of [true, false]) for (const uncertainCapturedRows of [new Set<number>(), new Set([2])]) {
+          const scope = { sourceEpoch: 1, geometryGeneration: 2, completeRetainedTail, uncertainCapturedRows, maxTailGap: 256 };
+          expect(matchTokens(recent.map(r => ({ ...r, token: registry.intern(r) })), captured.map(r => registry.intern(r)), scope))
+            .toEqual(originalMatch(recent, captured, scope));
+        }
+      }
+      expect(registry.intern(row('a'))).not.toBe(registry.intern(row('a', true)));
+      expect(registry.intern(row('a'))).not.toBe(registry.intern(row('b')));
+    } finally { registry.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('one permit covers the complete job including commit/hot sync, and waiting timeout does not start capture', async () => {
+    const p = new FullPermit(), signal = new AbortController().signal, events: string[] = [];
+    let release!: () => void;
+    const first = p.run('one', signal, performance.now() + 2000, async () => {
+      events.push('capture1'); await new Promise<void>(r => release = r); events.push('commit1', 'sync1');
+    });
+    await Promise.resolve();
+    const expired = p.run('expired', signal, performance.now() + 10, async () => { events.push('BAD'); }).catch(e => e);
+    const second = p.run('two', signal, performance.now() + 2000, async () => { events.push('capture2'); });
+    expect((await expired).message).toContain('deadline');
+    release(); await Promise.all([first, second]);
+    expect(events).toEqual(['capture1', 'commit1', 'sync1', 'capture2']); expect(p.highWater).toBe(1); expect(p.active).toBe(0);
+  });
+  test('committed prefix sync survives chunk2 throw and generation change; finish never runs on failure', async () => {
+    for (const fault of ['throw', 'epoch', 'resize']) {
+      let identity = 'pane/epoch1/geo1', finished = false;
+      const store = new Map([[0, 'old']]), hot = new Map(store), snapshot = new Map(hot);
+      const ansi = new Map(hot), live = new Map(hot);
+      const ports = { identity: () => identity, expectedIdentity: identity,
+        commit: async (chunk: readonly number[], i: number) => {
+          if (i === 1) { if (fault === 'throw') throw new Error('chunk2'); identity = fault; }
+          store.set(chunk[0]!, 'new'); return { revision: i + 1, ids: chunk };
+        },
+        sync: async (_: readonly number[], receipt: { ids: readonly number[] }) => { for (const id of receipt.ids) { hot.set(id, store.get(id)!); ansi.set(id, store.get(id)!); live.set(id, store.get(id)!); } },
+        onSyncFailure: () => { throw new Error('unexpected'); }, finish: async () => { finished = true; } };
+      await expect(repairPrefix([[0], [1]], ports)).rejects.toThrow();
+      expect(hot.get(0)).toBe('new'); expect(ansi.get(0)).toBe('new'); expect(live.get(0)).toBe('new');
+      expect(snapshot.get(0)).toBe('old'); expect(finished).toBe(false);
+    }
+  });
+  test('frozen overlay, range fence, fixed head, busy propagation and release on errors', async () => {
+    let released = 0; const overlay = [{ lineId: 0, revision: 3, exact: 'frozen', identity: 'pane' }];
+    const token = Object.freeze({ identity: 'pane', revision: 3, durable: 1, head: 1, start: 0, end: 1, deadline: performance.now() + 2000 });
+    const ports: ViewPorts = { grant: async () => ({ token, overlay }), readerOpen: async () => ({ identity: 'pane', fence: 2 }),
+      openAck: async () => { overlay[0]!.exact = 'later'; }, diskPage: async () => [{ lineId: 0, revision: 1, exact: 'disk', identity: 'pane' }],
+      release: async () => { released++; } };
+    await withFrozenView(ports, 0, 1, async (t, page) => { expect((await page(0, 1))[0]!.exact).toBe('frozen'); expect(t.head).toBe(1); });
+    expect(released).toBe(1);
+    await expect(withFrozenView({ ...ports, readerOpen: async () => ({ identity: 'pane', fence: 4 }) }, 0, 1, async () => {})).rejects.toThrow('fence');
+    await expect(withFrozenView({ ...ports, diskPage: async () => { throw new Error('busy'); } }, 0, 1, async (_t, page) => page(0, 1))).rejects.toThrow('busy');
+    expect(released).toBe(3);
+  });
+});
