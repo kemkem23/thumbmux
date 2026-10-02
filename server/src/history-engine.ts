@@ -60,6 +60,8 @@ type Pin = { view: ReadView; db: Database; overlay: ReadonlyMap<number, Finalize
 const pool = { pending: 0, overlays: 0, readers: 0, cache: 0, panes: new Set<string>(), paths: new Set<string>() };
 const WRITER_CACHE = 4 * 1024 * 1024, READER_CACHE = 2 * 1024 * 1024;
 export interface StreamHistoryOptions {
+  /** I streaming path: stage bounded prefixes on disk before final VT commit. */
+  stagePrefixesOnDisk?: boolean;
   path: string;
   codecVersions: readonly string[];
   /** Fault injection only: throw/exit here to probe real transaction boundaries. */
@@ -219,6 +221,16 @@ export class StreamHistoryEngine implements HistoryEngine {
       if (pool.pending + charge > B.pendingBytes) return busy();
       const owned = copy(request);
       const receipt: RamReceipt = copy({ kind: 'ram', eventId: owned.eventId, digest: owned.digest, revision, head: state.head + request.rows.length });
+      if (this.options.stagePrefixesOnDisk) {
+        // The input journal makes a partial packet replayable. durable remains
+        // at its checkpoint fence; staged rows are not a durable VT receipt.
+        this.db.transaction(() => {
+          this.writeRows(owned.rows);
+          this.db.query('INSERT INTO sh_event VALUES(?,?,?,?)').run(key, ek, owned.digest, streamCanonical(receipt));
+          this.putState({...state, revision, head: receipt.head});
+        }).immediate();
+        return ok(receipt);
+      }
       const pending = this.pending.get(key) ?? { state: { ...state }, events: new Map(), charge: 0 };
       pending.state = { ...state, revision, head: receipt.head };
       pending.events.set(ek, { request: owned, receipt }); pending.charge += charge;

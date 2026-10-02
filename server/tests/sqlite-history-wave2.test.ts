@@ -596,10 +596,14 @@ test('newarch D11: a malformed frame is refused alone; the queued frame stays li
   const q=[...internal.queues.values()][0];expect(q.length).toBe(2);
   const pendingBefore=internal.pendingBytes(),tailBytes=q[1].bytes;
   out.refusals=[];
-  for(const f of bad){try{await s.replaceScreen(f);out.refusals.push('accepted');}catch(error){out.refusals.push(String(error));}}
-  // Refused synchronously, before the queued tail or any reservation moved.
-  expect(out.refusals).toEqual(['Error: invalid-frame','Error: invalid-cursor']);
+  // Validation returns rejected promises synchronously. Inspect the reservation
+  // before yielding: awaiting a rejection also lets the independent row worker
+  // consume q, so q[1] after await is not a stable observation of refusal.
+  const rejected=bad.map(f=>s.replaceScreen(f).then(()=> 'accepted',error=>String(error)));
+  expect(q).toHaveLength(2);
   expect(q[1].bytes).toBe(tailBytes);expect(internal.pendingBytes()).toBe(pendingBefore);
+  out.refusals=await Promise.all(rejected);
+  expect(out.refusals).toEqual(['Error: invalid-frame','Error: invalid-cursor']);
   await r;out.goodReceipt=await kept.then(()=>'resolved',e=>String(e));
   expect(out.goodReceipt).toBe('resolved');
   const shown=JSON.parse(String(s.screen(key)!.cells_json));

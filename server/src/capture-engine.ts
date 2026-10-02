@@ -172,6 +172,7 @@ export function uniqueCaptureSeam(before: readonly string[], captured: readonly 
  * the live parser untouched. install is synchronous and must not throw.
  * A screen reseed is NOT an implementation of restore or checkpoint. */
 export interface CaptureVt {
+  prepareStream?(event: InputEvent, maxBytes?: number): AsyncGenerator<Result<import('./pipe-vt-worker').CaptureVtStreamStep>, void, void>;
   prepare(event: InputEvent): Promise<Result<CaptureVtTransaction>>;
   restore(state: VtState, identity?: StreamIdentity): Promise<Result<CaptureVtTransaction>>;
   snapshot(): Promise<Result<VtState>>;
@@ -350,12 +351,12 @@ export class StreamCaptureEngine implements CaptureEngine {
       // isolated candidate is reused, avoiding double parsing on the hot path.
       staging = this.ports.scratch.reserve(B.vtBytesPerPane);
       if (!staging) return busy();
-      const prepared = await this.ports.vt.prepare(event);
-      if (prepared.status !== 'ok') return prepared;
-      preflight = prepared.value;
-      if (size(preflight.scrolls) * 4 > B.vtBytesPerPane) return error('unsupported', 'VT expansion budget');
-      if (!sameIdentity(preflight.frame.identity, event.identity)
-        || preflight.scrolls.some(row => row.uncertainFields.length)) return error('integrity', 'VT preflight');
+      const prepared = this.ports.vt.prepareStream ? null : await this.ports.vt.prepare(event);
+      if (prepared && prepared.status !== 'ok') return prepared;
+      preflight = prepared?.value ?? null;
+      if (preflight && size(preflight.scrolls) * 4 > B.vtBytesPerPane) return error('unsupported', 'VT expansion budget');
+      if (preflight && (!sameIdentity(preflight.frame.identity, event.identity)
+        || preflight.scrolls.some(row => row.uncertainFields.length))) return error('integrity', 'VT preflight');
       const receipt = await this.ports.history.journalInput(event);
       if (receipt.status !== 'ok') return receipt;
       if (!samePane(receipt.value.pane, event.identity.pane) || receipt.value.through.packetSeq !== event.position.packetSeq
@@ -376,6 +377,7 @@ export class StreamCaptureEngine implements CaptureEngine {
   }
   private async flushPending(candidate: CaptureVtTransaction | null = null): Promise<Result<void>> {
     const p = this.pending; if (!p) { candidate?.discard(); return ok(undefined); }
+    if (this.ports.vt.prepareStream) return this.flushStreaming(p);
     if (this.episode) { candidate?.discard(); return error('unresolved-gap', this.episode.episodeId); }
     const release = this.ports.scratch.reserve(B.vtBytesPerPane);
     if (!release) { candidate?.discard(); return busy(); }
@@ -458,6 +460,73 @@ export class StreamCaptureEngine implements CaptureEngine {
       this.lastCheckpointInput = p.receipt;
       this.pending = null; p.release(); return ok(undefined);
     } finally { tx?.discard(); release(); }
+  }
+  /** Two bounded passes over one immutable source checkpoint. The first proves
+   * the final state before any append. The second replays provisional pages to
+   * H without retaining a packet-sized scroll array. H owns disk staging.
+   * A busy prefix is retried from the original revision/ordinal; H returns its
+   * original receipt. Only the final checkpoint permits installation/publish. */
+  private async flushStreaming(p: Pending): Promise<Result<void>> {
+    const release = this.ports.scratch.reserve(2 * B.vtBytesPerPane);
+    if (!release) return busy();
+    const first = this.ports.vt.prepareStream!(p.event);
+    let tx: CaptureVtTransaction | undefined;
+    try {
+      while (true) {
+        const next = await first.next();
+        if (next.done) break;
+        if (next.value.status !== 'ok') return next.value;
+        if (next.value.value.candidate) { tx = next.value.value.candidate; break; }
+      }
+      if (!tx?.snapshot || !sameIdentity(tx.frame.identity, p.event.identity)) return error('integrity', 'stream final candidate missing');
+      const state = await tx.snapshot();
+      if (state.status !== 'ok') return state;
+      if (size(state.value) * 2 > B.vtBytesPerPane) return busy();
+      let head = this.frame.head, revision = this.frame.revision;
+      let lastEvent: import('./stream-contract').EventId | null = null;
+      for await (const page of this.ports.vt.prepareStream!(p.event)) {
+        if (page.status !== 'ok') return page;
+        const step = page.value;
+        if (this.activeGap()) return error('unresolved-gap', 'fault during stream append');
+        // Empty final page is necessary only when the packet has no rows.
+        if (!step.scrolls.length && step.startOrdinal > 0) continue;
+        const rows: FinalizedRow[] = step.scrolls.map((row, j) => ({...row,
+          id: {pane: this.identity.pane, lineId: head + j}, revision: revision + 1,
+          source: {pane: this.identity.pane, ...p.event.position, scrollOrdinal: step.startOrdinal + j},
+          geometryGeneration: p.event.identity.geometryGeneration, geometry: tx!.frame.geometry}));
+        const body = {identity: p.event.identity,
+          eventId: {pane: this.identity.pane, ...p.event.position, scrollOrdinal: step.startOrdinal},
+          expectedRevision: revision, rows, frameDelta: tx.frame, receivedAtMonoMs: p.event.receivedAtMonoMs};
+        const request = {...body, digest: this.digest('append', body)};
+        const result = await this.ports.history.appendFinalized(request);
+        if (result.status !== 'ok') return result;
+        if (result.value.head !== head + rows.length || result.value.revision !== revision + 1
+          || result.value.digest !== request.digest || streamCanonical(result.value.eventId) !== streamCanonical(request.eventId))
+          return error('integrity', 'stream append fence');
+        head = result.value.head; revision = result.value.revision; lastEvent = body.eventId;
+      }
+      if (!lastEvent) return error('integrity', 'stream omitted empty packet');
+      const body = {kind: 'vt-recovery' as const, previousCheckpointId: this.lastCheckpoint?.checkpointId ?? null,
+        identity: p.event.identity, inputFence: p.receipt, revision, head, state: state.value,
+        stateDigest: this.digest('vt-state', {identity: p.event.identity, state: state.value})};
+      const checkpoint = immutable({...body, checkpointId: this.digest('checkpoint-id', body)});
+      const commit = {checkpoint, expectedRevision: revision, commitId: checkpoint.checkpointId};
+      const result = await this.ports.history.commitCheckpoint({...commit, digest: this.digest('checkpoint', commit)});
+      if (result.status !== 'ok') return result;
+      if (!samePane(result.value.pane, this.identity.pane) || result.value.durableRevision !== revision
+        || result.value.checkpointId !== checkpoint.checkpointId) return error('integrity', 'stream checkpoint fence');
+      if (this.activeGap()) return error('unresolved-gap', 'fault during stream checkpoint');
+      tx.install();
+      this.identity = immutable(p.event.identity); this.lastCheckpoint = checkpoint;
+      this.durable = immutable(result.value); this.lastCheckpointInput = p.receipt;
+      this.checkpointAt = this.ports.now(); this.checkpointHead = head;
+      this.tail.durable(revision);
+      this.publish({...tx.frame, head, revision, durableRevision: revision});
+      this.record({kind: 'publish', eventId: lastEvent, receivedAtMonoMs: p.event.receivedAtMonoMs,
+        ramPublishedAtMonoMs: this.ports.now(), durableAtMonoMs: this.ports.now()});
+      this.pending = null; p.release();
+      return ok(undefined);
+    } finally { tx?.discard(); await first.return(); release(); }
   }
   subscribe(pane: PaneKey, listener: (frame: LiveFrame) => void): () => void {
     if (!this.matches(pane)) throw new Error('capture subscription identity');
