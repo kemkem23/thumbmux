@@ -407,9 +407,6 @@ test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, e
 import { CaptureChunkDecoder } from '../../../../docs/tasks/newarch-spike2/bundle/decoder';
 import { ExactRowTokens, FullPermit, matchTokens, repairPrefix, withFrozenView, type ViewPorts } from '../../../../docs/tasks/newarch-spike2/bundle/prototype';
 import { matchHistoryRows as originalMatch, type CapturedRow } from '../src/history-row-matcher';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 describe('SPIKE2 bounded prototype fixtures', () => {
   const fixtures = ['', '\n', '\n\n', 'a', 'a\n', 'a\n\n', '12345678\nabcdefgh\n',
@@ -778,6 +775,7 @@ function cEngineFixture() {
     visible: async (_identity, tail) => { expect(tail).toBe(0); return { status: 'ok', value: cFrame() }; },
     repairChunks: async function* () {},
     syncRepair: async () => { throw new Error('fixture repair not implemented'); }, verifyRepair: async () => false,
+    repairedCheckpoint: async () => ({status:'error',code:'unsupported',message:'fixture has no repair checkpoint'}),
   };
   return { engine: new StreamCaptureEngine(ports), ports,
     counts: () => ({ installs, appends, journals }), pressure: (value: boolean) => { denyAppend = value; } };
@@ -861,4 +859,73 @@ test('NEWARCH C first packet with 600 finalized rows commits before bounded tail
   expect(commits).toBe(1); expect(frames.at(-1)?.head).toBe(600);
   expect(frames.at(-1)?.durableRevision).toBe(1);
   expect(f.ports.admission.heldBytes).toBe(0);
+});
+
+import { CaptureSourceContinuity, TargetedCaptureRepair, bootstrapCapture,
+  type CaptureRecoveryView } from '../src/capture-engine';
+const cEpisode = (): import('../src/stream-contract').GapEpisode => ({episodeId:'repair-fixture',pane:cPane,
+  epochBefore:1,epochAfter:null,lastDurableInput:{sourceEpoch:1,packetSeq:1},lastAdmittedRow:0,
+  firstObservedAtMonoMs:0,reason:'sequence',status:'suspected',missingCount:null});
+function cRecoveryView(rows: readonly import('../src/stream-contract').RowContent[]) {
+  let closed=0, reads=0;
+  const view:CaptureRecoveryView={identity:cIdentity,geometry:cFrame().geometry,rowCount:rows.length,
+    recoveryPosition:{sourceEpoch:1,packetSeq:2},
+    async read(start,count) {reads++; expect(count).toBeLessThanOrEqual(256);
+      return {status:'ok',value:rows.slice(start,start+count)};},
+    async verify(){return true;},async close(){closed++;}};
+  return {view,counts:()=>({closed,reads})};
+}
+test('NEWARCH C source tap detects silent drop even with identical screens', () => {
+  const faults:string[]=[]; const tap=new CaptureSourceContinuity(reason=>faults.push(reason));
+  expect(tap.observe({identity:cIdentity,sourcePacket:1,byteStart:0,byteEnd:10}).status).toBe('ok');
+  expect(tap.observe({identity:cIdentity,sourcePacket:3,byteStart:20,byteEnd:30}).status).toBe('error');
+  expect(faults).toEqual(['sequence']);
+});
+test('NEWARCH C targeted repair preserves all 600 missing rows in bounded chunks and rejects repeated anchors',async()=>{
+  const contents=Array.from({length:602},(_,i)=>({cells:cRow(i,`row-${i}`).cells,softWrap:false,wrapPad:0,uncertainFields:[]}));
+  const f=cRecoveryView(contents),scratch=new CaptureAdmission(33554432);
+  const repair=new TargetedCaptureRepair({open:async()=>({status:'ok',value:f.view})},cIdentity,scratch);
+  const chunks=[];
+  for await(const r of repair.chunks(cEpisode(),[contents[0]!],[contents[601]!],1,new AbortController().signal)) {
+    expect(r.status).toBe('ok'); if(r.status==='ok')chunks.push(r.value);
+  }
+  expect(chunks.map(c=>c.rows.length)).toEqual([256,256,88]);
+  expect(chunks.flatMap(c=>c.rows).map(r=>r.cells)).toEqual(contents.slice(1,601).map(r=>r.cells));
+  expect(chunks.at(-1)?.final).toBe(true); expect(scratch.heldBytes).toBe(0);expect(f.counts().closed).toBe(1);
+  const repeated=cRecoveryView([contents[0]!,contents[0]!,contents[601]!]);
+  const bad=new TargetedCaptureRepair({open:async()=>({status:'ok',value:repeated.view})},cIdentity,scratch);
+  const results=[];for await(const r of bad.chunks(cEpisode(),[contents[0]!],[contents[601]!],1,new AbortController().signal))results.push(r);
+  expect(results).toMatchObject([{status:'error',code:'unresolved-gap'}]);expect(scratch.heldBytes).toBe(0);
+});
+test('NEWARCH C bootstrap emits committed prefix before second chunk fails',async()=>{
+  const f=cRecoveryView(Array.from({length:600},(_,i)=>cRow(i))),scratch=new CaptureAdmission(33554432);
+  let commits=0,synced=0;
+  const history={commitRepair:async(chunk:import('../src/stream-contract').RepairChunk)=>{
+    if(++commits===2)throw Error('disk fixture failed');
+    return {status:'ok',value:{committedIds:chunk.rows.map(r=>r.id),committedRevision:2,complete:false,
+      durable:{kind:'durable',pane:cPane,commitId:'r1',digest:chunk.digest,durableRevision:2,checkpointId:'cp1'}}};
+  }} as unknown as HistoryEngine;
+  const results=[];for await(const r of bootstrapCapture(f.view,cEpisode(),history,scratch,1,async()=>{synced++;},new AbortController().signal))results.push(r);
+  expect(results.map(r=>r.status)).toEqual(['ok','error']);expect(synced).toBe(1);expect(scratch.heldBytes).toBe(0);
+});
+
+import { CaptureCadence } from '../src/capture-engine';
+test('NEWARCH C cadence retains 50ms event and 200/1000/5000ms visible intervals',async()=>{
+  let now=0; const calls:number[]=[];
+  const engine={checkVisible:async()=>{calls.push(now);return {status:'ok',value:{verdict:'equal'}};},checkpointDue:null} as unknown as StreamCaptureEngine;
+  const cadence=new CaptureCadence(engine,()=>cIdentity,()=>now);
+  await cadence.tick();now=4999;await cadence.tick();expect(calls).toEqual([0]);
+  now=5000;await cadence.tick();expect(calls).toEqual([0,5000]);
+  cadence.activity(1,true);now=5025;cadence.event();now=5050;await cadence.tick();
+  expect(calls.at(-1)).toBe(5050);now=5250;await cadence.tick();expect(calls.at(-1)).toBe(5250);
+  cadence.activity(1,false);now=5300;await cadence.tick();now=6299;await cadence.tick();expect(calls.at(-1)).toBe(5300);
+  now=6300;await cadence.tick();expect(calls.at(-1)).toBe(6300);
+});
+
+test('NEWARCH C retrying a committed repair prefix cannot duplicate hot rows',()=>{
+  const tail=new CaptureTail();tail.durable(1000);
+  const rows=Array.from({length:256},(_,i)=>cRow(i));
+  expect(tail.reconcile(rows)).toBe(true);expect(tail.reconcile(rows)).toBe(true);
+  expect(tail.rows.map(r=>r.id.lineId)).toEqual(rows.map(r=>r.id.lineId));
+  expect(tail.rows.length).toBeLessThanOrEqual(256);expect(tail.heldBytes).toBeLessThanOrEqual(1048576);
 });

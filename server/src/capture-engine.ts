@@ -1,6 +1,6 @@
-/** LOT C PARTIAL: opt-in coordinator, not a ready runtime. No concrete
- * CaptureVt checkpoint adapter or source-gap repair provider is shipped here.
- * See docs/tasks/newarch-stream-c/REPORT.md before integrating. */
+/** Opt-in stream coordinator. Concrete VT adapter: CheckpointCaptureVt.
+ * I supplies shared worker J transport and sealed source tap/spool adapters.
+ * Runtime acceptance is not established; see lot C REPORT.md. */
 import { createHash } from 'node:crypto';
 import {
   STREAM_BUDGET as B, STREAM_CONTRACT_VERSION,
@@ -70,7 +70,12 @@ export class CaptureTail {
     const result = [...this.entries];
     for (const row of rows) {
       const n = size(row) * 2 + 256 + row.cells.length * 64;
-      if (n > B.tailBytesPerPane) return null;
+      if (n > B.tailBytesPerPane) {
+        if(row.revision>this.durableRevision || result.some(r=>r.revision>this.durableRevision)) return null;
+        // A durable oversized row remains on disk. Keep only the contiguous
+        // suffix after it in the hot tail, rather than truncating the row.
+        result.length=0;bytes=0;continue;
+      }
       while (result.length && (result.length >= B.tailRowsPerPane || bytes + n > B.tailBytesPerPane)) {
         const first = result[0]!;
         if (first.revision > this.durableRevision) return null;
@@ -79,6 +84,13 @@ export class CaptureTail {
       result.push(row); bytes += n;
     }
     return { rows: result, bytes };
+  }
+  reconcile(rows: readonly FinalizedRow[]): boolean {
+    const byId=new Map(this.entries.map(row=>[row.id.lineId,row]));
+    for(const row of rows)byId.set(row.id.lineId,row);
+    const replacement=new CaptureTail();replacement.durable(this.durableRevision);
+    if(!replacement.append([...byId.values()].sort((a,b)=>a.id.lineId-b.id.lineId)))return false;
+    this.entries=replacement.entries;this.bytes=replacement.bytes;return true;
   }
   canAppend(rows: readonly FinalizedRow[]): boolean { return this.plan(rows) !== null; }
   append(rows: readonly FinalizedRow[]): boolean {
@@ -126,7 +138,7 @@ export function uniqueCaptureSeam(before: readonly string[], captured: readonly 
  * A screen reseed is NOT an implementation of restore or checkpoint. */
 export interface CaptureVt {
   prepare(event: InputEvent): Promise<Result<CaptureVtTransaction>>;
-  restore(state: VtState): Promise<Result<CaptureVtTransaction>>;
+  restore(state: VtState, identity?: StreamIdentity): Promise<Result<CaptureVtTransaction>>;
   snapshot(): Promise<Result<VtState>>;
   screen(): FrameDelta;
 }
@@ -134,6 +146,8 @@ export interface CaptureVtTransaction {
   readonly frame: FrameDelta;
   /** Only finalized NORMAL rows, even when the packet ends in alternate mode. */
   readonly scrolls: readonly RowContent[];
+  /** Snapshot of the isolated candidate, before live installation. */
+  snapshot?(): Promise<Result<VtState>>;
   install(): void;
   discard(): void;
 }
@@ -155,6 +169,8 @@ export interface CapturePorts {
   repairChunks(episode: GapEpisode, signal: AbortSignal): AsyncIterable<Result<RepairChunk>>;
   syncRepair(chunk: RepairChunk, receipt: RepairReceipt): Promise<LiveFrame>;
   verifyRepair(episode: GapEpisode, signal: AbortSignal): Promise<boolean>;
+  /** H's durable checkpoint after I seals the replay/spool and live seam. */
+  repairedCheckpoint(episode: GapEpisode, signal: AbortSignal): Promise<Result<VtCheckpoint>>;
 }
 
 type Pending = { event: InputEvent; receipt: DurableInputReceipt; release: () => void };
@@ -291,7 +307,11 @@ export class StreamCaptureEngine implements CaptureEngine {
         id: { pane: this.identity.pane, lineId: this.frame.head + scrollOrdinal }, revision: this.frame.revision + 1,
         source: { pane: this.identity.pane, ...p.event.position, scrollOrdinal },
         geometryGeneration: p.event.identity.geometryGeneration, geometry: tx!.frame.geometry }));
-      if (!this.tail.canAppend(rows)) return busy();
+      // A packet may finalize more than the hot tail can hold. Its rows must
+      // become durable before any eviction or live installation takes place.
+      const needsDurable = !this.tail.canAppend(rows);
+      if (needsDurable && !tx.snapshot) return error('unsupported', 'large packet requires candidate checkpoint');
+      if (size(rows) * 2 > B.vtBytesPerPane) return busy();
       const body = { identity: p.event.identity, eventId: { pane: this.identity.pane, ...p.event.position, scrollOrdinal: 0 },
         expectedRevision: this.frame.revision, rows, frameDelta: tx.frame, receivedAtMonoMs: p.event.receivedAtMonoMs };
       const request: AppendFinalized = immutable({ ...body, digest: this.digest(body) });
@@ -310,10 +330,31 @@ export class StreamCaptureEngine implements CaptureEngine {
         this.record({ kind: 'gap', episode: late });
         return { status: 'stale', reason: 'late-gap' };
       }
+      let durableRevision = this.frame.durableRevision;
+      if (needsDurable) {
+        const state = await tx.snapshot!();
+        if (state.status !== 'ok') return state;
+        if (size(state.value) * 2 > B.vtBytesPerPane) return busy();
+        const body = { kind: 'vt-recovery' as const, previousCheckpointId: this.lastCheckpoint?.checkpointId ?? null,
+          identity: p.event.identity, inputFence: p.receipt, revision: receipt.value.revision,
+          head: receipt.value.head, state: state.value, stateDigest: this.digest(state.value) };
+        const checkpoint = immutable({ ...body, checkpointId: this.digest(body) });
+        const commit = { checkpoint, expectedRevision: receipt.value.revision, commitId: checkpoint.checkpointId };
+        const durable = await this.ports.history.commitCheckpoint({ ...commit, digest: this.digest(commit) });
+        if (durable.status !== 'ok') return durable;
+        if (!samePane(durable.value.pane, this.identity.pane) || durable.value.durableRevision !== receipt.value.revision
+          || durable.value.checkpointId !== checkpoint.checkpointId) return error('integrity', 'batch checkpoint fence');
+        if (this.activeGap()) return error('unresolved-gap', 'fault during batch commit');
+        this.lastCheckpoint = checkpoint; this.durable = immutable(durable.value);
+        durableRevision = durable.value.durableRevision;
+        this.tail.durable(durableRevision);
+        this.checkpointAt = this.ports.now(); this.checkpointHead = receipt.value.head;
+      }
       tx.install(); tx = null;
-      this.tail.append(rows); this.identity = immutable(p.event.identity);
+      if (!this.tail.append(rows)) throw new Error('admitted tail cannot install');
+      this.identity = immutable(p.event.identity);
       this.publish({ ...request.frameDelta, revision: receipt.value.revision,
-        durableRevision: this.frame.durableRevision, head: receipt.value.head });
+        durableRevision, head: receipt.value.head });
       this.record({ kind: 'publish', eventId: request.eventId, receivedAtMonoMs: p.event.receivedAtMonoMs,
         ramPublishedAtMonoMs: this.ports.now(), durableAtMonoMs: null });
       this.lastCheckpointInput = p.receipt;
@@ -366,7 +407,7 @@ export class StreamCaptureEngine implements CaptureEngine {
     const release = this.ports.scratch.reserve(B.vtBytesPerPane); if (!release) return busy();
     this.locked = true;
     try {
-      const result = await this.ports.vt.restore(immutable(checkpoint.state));
+      const result = await this.ports.vt.restore(immutable(checkpoint.state), checkpoint.identity);
       if (result.status !== 'ok') return result;
       const tx = result.value;
       if (!sameIdentity(tx.frame.identity, checkpoint.identity) || tx.scrolls.length) { tx.discard(); return error('integrity', 'restore must not invent scrolls'); }
@@ -441,12 +482,21 @@ export class StreamCaptureEngine implements CaptureEngine {
         try {
           receipt = await this.ports.history.commitRepair(chunk);
           if (receipt.status === 'ok') {
+            const ids=receipt.value.committedIds;
+            if (ids.length!==chunk.rows.length || !ids.every((id,i)=>samePane(id.pane,this.identity.pane)
+              && id.lineId===chunk.rows[i]!.id.lineId) || receipt.value.committedRevision!==chunk.expectedRevision+1
+              || receipt.value.durable.durableRevision!==receipt.value.committedRevision) {
+              yield error('integrity','repair receipt fence'); return;
+            }
             // Sync immediately, including a prefix whose later chunk fails.
             try {
               const synced = await this.ports.syncRepair(chunk, receipt.value);
               if (!sameIdentity(synced.identity, this.identity) || synced.revision !== receipt.value.committedRevision
                 || synced.durableRevision !== receipt.value.durable.durableRevision || synced.head < this.frame.head)
                 throw new Error('repair sync fence');
+              this.tail.durable(receipt.value.durable.durableRevision);
+              if (!this.tail.reconcile(chunk.rows)) throw new Error('repair tail capacity');
+              this.durable=immutable(receipt.value.durable);
               this.publish(synced);
             } catch (cause) {
               yield receipt; yield error('unresolved-gap', `committed prefix requires sync: ${String(cause)}`); return;
@@ -456,6 +506,28 @@ export class StreamCaptureEngine implements CaptureEngine {
                 || !(await this.ports.verifyRepair(episode, controller.signal))) {
                 yield error('unresolved-gap', 'durable repair lacks exact live seam proof'); return;
               }
+              const recovered=await this.ports.repairedCheckpoint(episode,controller.signal);
+              if(recovered.status!=='ok') { yield receipt; yield recovered; return; }
+              const cp=recovered.value;
+              if(!samePane(cp.identity.pane,this.identity.pane) || cp.head!==this.frame.head
+                || cp.revision!==this.frame.revision || cp.stateDigest!==this.digest(cp.state)
+                || !samePane(cp.inputFence.pane,this.identity.pane)
+                || cp.inputFence.through.sourceEpoch!==cp.identity.sourceEpoch
+                || (this.pending && cp.identity.sourceEpoch===this.pending.event.identity.sourceEpoch
+                  && cp.inputFence.through.packetSeq<this.pending.event.position.packetSeq)) {
+                yield receipt; yield error('integrity','repair checkpoint fence'); return;
+              }
+              const restored=await this.ports.vt.restore(cp.state,cp.identity);
+              if(restored.status!=='ok') { yield receipt; yield restored; return; }
+              if(restored.value.scrolls.length || !sameIdentity(restored.value.frame.identity,cp.identity)) {
+                restored.value.discard(); yield receipt; yield error('integrity','repair VT restore fence'); return;
+              }
+              restored.value.install();
+              this.pending?.release(); this.pending=null;
+              this.identity=immutable(cp.identity); this.lastInput=immutable(cp.inputFence);
+              this.lastCheckpointInput=this.lastInput; this.lastCheckpoint=immutable(cp);
+              this.checkpointAt=this.ports.now(); this.checkpointHead=cp.head;
+              this.publish({...restored.value.frame,head:cp.head,revision:cp.revision,durableRevision:cp.revision});
               this.episode = immutable({ ...this.episode!, status: 'repaired', missingCount: 0 });
               this.record({ kind: 'gap', episode: this.episode }); this.episode = null;
             }
@@ -480,5 +552,209 @@ export class StreamCaptureEngine implements CaptureEngine {
     const result = await this.checkpoint(pane, 'handoff');
     if (result.status !== 'ok') return result;
     return this.ports.now() > deadlineMonoMs ? error('deadline', 'drain deadline') : ok(this.durable!);
+  }
+}
+
+/** I must obtain this fence upstream of the lossy pipe (durable source tap).
+ * A host receive counter is explicitly not a valid implementation. */
+export interface SourceTapFence {
+  readonly identity: StreamIdentity;
+  readonly sourcePacket: number;
+  readonly byteStart: number;
+  readonly byteEnd: number;
+}
+export class CaptureSourceContinuity {
+  private previous: SourceTapFence | null = null;
+  constructor(private readonly fault: (reason: GapEpisode['reason']) => void) {}
+  observe(fence: SourceTapFence): Result<void> {
+    if (![fence.sourcePacket, fence.byteStart, fence.byteEnd].every(counter) || fence.byteEnd < fence.byteStart)
+      return error('integrity', 'source tap counters');
+    const p = this.previous;
+    const sameSource = !p || (samePane(p.identity.pane,fence.identity.pane)
+      && p.identity.sourceEpoch===fence.identity.sourceEpoch);
+    if (p && (!sameSource || fence.sourcePacket !== p.sourcePacket + 1 || fence.byteStart !== p.byteEnd)) {
+      this.fault(sameSource ? 'sequence' : 'identity');
+      return error('unresolved-gap', 'source tap discontinuity');
+    }
+    this.previous = immutable(fence); return ok(undefined);
+  }
+  /** Only call after durable replay and seam verification, never on pipe reopen. */
+  repaired(fence: SourceTapFence): void { this.previous = immutable(fence); }
+}
+
+/** Immutable, sealed retained snapshot or bootstrap spool. I owns tmux/tap
+ * lifecycle and disk spool I/O; C never requests periodic full history.
+ * read() returns at most 256 rows / 1 MiB and may be called twice. */
+export interface CaptureRecoveryView {
+  readonly identity: StreamIdentity;
+  readonly rowCount: number;
+  readonly geometry: import('./stream-contract').Geometry;
+  /** I journals one recovery control event before opening this view. Its
+   * position is unique to this episode, never borrowed from prior input. */
+  readonly recoveryPosition: import('./stream-contract').InputPosition;
+  read(start: number, count: number, signal: AbortSignal): Promise<Result<readonly RowContent[]>>;
+  verify(signal: AbortSignal): Promise<boolean>;
+  close(): Promise<void>;
+}
+export interface CaptureRecoverySource {
+  open(episode: GapEpisode, horizonRows: number, signal: AbortSignal): Promise<Result<CaptureRecoveryView>>;
+}
+
+/** Plans repairs using BOTH exact ordered anchors. Repeated or expired anchors
+ * are unresolved. Only bounded decode chunks and the anchor window are held.
+ * A retry reopens the same sealed view; H owns chunk idempotency. */
+export class TargetedCaptureRepair {
+  constructor(private readonly source: CaptureRecoverySource, private readonly identity: StreamIdentity,
+    private readonly scratch: CaptureAdmission, private readonly digest = captureDigest) {}
+  async *chunks(episode: GapEpisode, before: readonly RowContent[], after: readonly RowContent[],
+    revision: number, signal: AbortSignal): AsyncIterable<Result<RepairChunk>> {
+    if (!before.length || !after.length || before.length + after.length > B.decodeRows
+      || [...before, ...after].some(r => r.uncertainFields.length)) {
+      yield error('unresolved-gap', 'repair requires two bounded exact anchors'); return;
+    }
+    const lease = this.scratch.reserve(B.decodeBytes * 2);
+    if (!lease) { yield busy(); return; }
+    let view: CaptureRecoveryView | null = null;
+    try {
+      const opened = await this.source.open(episode, B.repairHorizonRows, signal);
+      if (opened.status !== 'ok') { yield opened; return; }
+      view = opened.value;
+      if (!sameIdentity(view.identity, this.identity) || !counter(view.rowCount) || view.rowCount > B.repairHorizonRows
+        || view.recoveryPosition.sourceEpoch !== this.identity.sourceEpoch || !counter(view.recoveryPosition.packetSeq)
+        || view.recoveryPosition.packetSeq <= (episode.lastDurableInput?.packetSeq ?? 0)) {
+        yield error('integrity', 'repair view identity/bounds'); return;
+      }
+      const anchors = [before.map(r => JSON.stringify(r)), after.map(r => JSON.stringify(r))];
+      if (size(anchors) > B.decodeBytes) { yield busy(); return; }
+      const window: string[] = []; const hits: number[][] = [[], []];
+      for (let start = 0; start < view.rowCount;) {
+        if (signal.aborted) { yield {status:'cancelled',reason:'repair aborted'}; return; }
+        const count = Math.min(B.decodeRows,view.rowCount-start);
+        const read = await view.read(start,count,signal);
+        if (read.status !== 'ok') { yield read; return; }
+        if (read.value.length !== count || size(read.value) > B.decodeBytes || read.value.some(r=>r.uncertainFields.length)) {
+          yield error('integrity','repair decode incomplete/uncertain'); return;
+        }
+        for (const row of read.value) {
+          window.push(JSON.stringify(row));
+          if (window.length > Math.max(before.length,after.length)) window.shift();
+          for (let a=0;a<2;a++) {
+            const anchor=anchors[a]!;
+            if (window.length>=anchor.length && anchor.every((r,i)=>r===window[window.length-anchor.length+i])) {
+              hits[a]!.push(start+1-anchor.length);
+              if (hits[a]!.length>1) { yield error('unresolved-gap','ambiguous repair anchor'); return; }
+            }
+          }
+          start++;
+        }
+      }
+      if (hits[0]!.length!==1 || hits[1]!.length!==1) { yield error('unresolved-gap','expired repair anchor'); return; }
+      const from=hits[0]![0]!+before.length, end=hits[1]![0]!;
+      if (end<from || !(await view.verify(signal))) { yield error('unresolved-gap','unfenced repair seam'); return; }
+      // No rows are published while planning; IDs start exactly at the gap fence.
+      let head=(episode.lastAdmittedRow ?? -1)+1;
+      for(let offset=from;offset<end || (offset===from && from===end);) {
+        if(signal.aborted) { yield {status:'cancelled',reason:'repair aborted'}; return; }
+        const count=Math.min(B.decodeRows,end-offset);
+        const read=count ? await view.read(offset,count,signal) : ok<readonly RowContent[]>([]);
+        if(read.status!=='ok') { yield read; return; }
+        if(read.value.length!==count || size(read.value)>B.decodeBytes || read.value.some(r=>r.uncertainFields.length)) {
+          yield error('integrity','repair reread bounds'); return;
+        }
+        const rows=read.value.map((row,i):FinalizedRow=>({...row,id:{pane:this.identity.pane,lineId:head+i},
+          revision:revision+1,source:{pane:this.identity.pane,...view!.recoveryPosition,scrollOrdinal:offset-from+i},
+          geometryGeneration:this.identity.geometryGeneration,geometry:view!.geometry}));
+        const final=offset+count===end;
+        const body={episode,chunkId:`${episode.episodeId}:${offset-from}`,expectedRevision:revision,rows,final};
+        const chunk={...body,digest:this.digest(body)};
+        if(size(chunk)>B.decodeBytes) { yield busy(); return; }
+        yield ok(immutable(chunk));
+        revision++; head+=count; offset+=count;
+        if(final) return;
+      }
+    } catch(cause) { yield error('io',String(cause)); }
+    finally { await view?.close(); lease(); }
+  }
+}
+
+/** One-time bootstrap from a sealed retained-history spool while the source
+ * tap continues journaling input. I owns seam/fence acquisition; no lifetime
+ * history is accumulated in this coordinator. A failed later chunk preserves
+ * the already committed prefix and must resume the SAME view/episode. */
+export async function* bootstrapCapture(view: CaptureRecoveryView, episode: GapEpisode,
+  history: HistoryEngine, scratch: CaptureAdmission, revision: number,
+  sync: (chunk: RepairChunk, receipt: RepairReceipt) => Promise<void>,
+  signal: AbortSignal): AsyncIterable<Result<RepairReceipt>> {
+  const release=scratch.reserve(B.decodeBytes*2);
+  if(!release) { yield busy(); return; }
+  try {
+    if(!counter(view.rowCount) || !samePane(view.identity.pane,episode.pane)
+      || view.recoveryPosition.sourceEpoch!==view.identity.sourceEpoch
+      || view.recoveryPosition.packetSeq<1 || !(await view.verify(signal))) {
+      yield error('unresolved-gap','bootstrap is not sealed'); return;
+    }
+    const base=(episode.lastAdmittedRow ?? -1)+1;
+    for(let offset=0;offset<view.rowCount || (offset===0 && view.rowCount===0);) {
+      if(signal.aborted) { yield {status:'cancelled',reason:'bootstrap aborted'}; return; }
+      const count=Math.min(B.decodeRows,view.rowCount-offset);
+      const result=count ? await view.read(offset,count,signal) : ok<readonly RowContent[]>([]);
+      if(result.status!=='ok') { yield result; return; }
+      if(result.value.length!==count || size(result.value)>B.decodeBytes || result.value.some(r=>r.uncertainFields.length)) {
+        yield error('integrity','bootstrap decode bounds'); return;
+      }
+      const rows=result.value.map((row,i):FinalizedRow=>({...row,id:{pane:view.identity.pane,lineId:base+offset+i},
+        revision:revision+1,source:{pane:view.identity.pane,...view.recoveryPosition,scrollOrdinal:offset+i},
+        geometry:view.geometry,geometryGeneration:view.identity.geometryGeneration}));
+      const final=offset+count===view.rowCount;
+      const body={episode,chunkId:`${episode.episodeId}:bootstrap:${offset}`,expectedRevision:revision,rows,final};
+      const chunk=immutable({...body,digest:captureDigest(body)});
+      if(size(chunk)>B.decodeBytes) { yield busy(); return; }
+      const receipt=await history.commitRepair(chunk);
+      if(receipt.status!=='ok') { yield receipt; return; }
+      try { await sync(chunk,receipt.value); }
+      catch(cause) { yield receipt; yield error('unresolved-gap',`bootstrap prefix sync: ${String(cause)}`); return; }
+      yield receipt;
+      if(receipt.value.committedRevision!==revision+1 || receipt.value.complete!==final
+        || receipt.value.committedIds.length!==rows.length
+        || !receipt.value.committedIds.every((id,i)=>samePane(id.pane,view.identity.pane) && id.lineId===rows[i]!.id.lineId)) {
+        yield error('integrity','bootstrap receipt fence'); return;
+      }
+      revision=receipt.value.committedRevision; offset+=count;
+      if(final) return;
+    }
+  } catch(cause) { yield error('io',String(cause)); }
+  finally { await view.close(); release(); }
+}
+
+/** Host-driven cadence: I calls tick at <=50 ms, never creates a second
+ * capture timer. Event deadline is not postponed by repeated output events. */
+export class CaptureCadence {
+  private nextVisible: number;
+  private eventAt=Infinity;
+  private viewers=0;
+  private active=false;
+  private visibleRunning=false;
+  private checkpointRunning=false;
+  constructor(private readonly engine: StreamCaptureEngine, private readonly identity:()=>StreamIdentity,
+    private readonly now:()=>number) { this.nextVisible=now(); }
+  activity(viewers:number, active:boolean):void {
+    if(!counter(viewers))throw new Error('viewer count');
+    const changed=this.viewers!==viewers || this.active!==active;
+    this.viewers=viewers;this.active=active;
+    if(changed)this.event();
+  }
+  event():void { this.eventAt=Math.min(this.eventAt,this.now()+B.visibleEventMs); }
+  async tick():Promise<void> {
+    const tasks:Promise<unknown>[]=[];
+    if(!this.visibleRunning && this.now()>=Math.min(this.nextVisible,this.eventAt)) {
+      this.visibleRunning=true;this.eventAt=Infinity;
+      this.nextVisible=this.now()+(this.viewers===0 ? B.visibleNoViewerMs : this.active ? B.visibleActiveMs : B.visibleIdleMs);
+      tasks.push(this.engine.checkVisible(this.identity()).finally(()=>{this.visibleRunning=false;}));
+    }
+    if(!this.checkpointRunning && this.engine.checkpointDue) {
+      this.checkpointRunning=true;
+      tasks.push(this.engine.checkpoint(this.identity().pane,this.engine.checkpointDue).finally(()=>{this.checkpointRunning=false;}));
+    }
+    await Promise.all(tasks);
   }
 }
