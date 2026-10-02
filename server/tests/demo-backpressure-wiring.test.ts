@@ -94,17 +94,19 @@ test('stream I atomic multi-page input retries an admitted prefix without duplic
  const root=await mkdtemp(join(tmpdir(),'stream-i-prefix-'));
  const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
  try{
-  const pane=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const pane=await runtime.add(streamTestIdentity,{columns:80,rows:80},streamPorts,true);
+  await pane.ingest(Buffer.from(Array.from({length:80},(_,i)=>String.fromCharCode(65+i%26).repeat(80)).join('\r\n')));
+  const beforeHead=pane.frame.head,beforeRevision=pane.frame.revision;
   const history=runtime.history!,append=history.appendFinalized.bind(history);let calls=0;
   history.appendFinalized=async request=>{
    calls++;
    if(calls===2)return{status:'busy',reason:'pressure',retryAfterMs:1};
    return append(request);
   };
-  await pane.ingest(Buffer.from('\x1b[600S'));
+  await pane.ingest(Buffer.from('\x1b[2J'));
   expect(calls).toBeGreaterThan(3);
-  expect(pane.frame.head).toBe(600);
-  expect(pane.frame.revision).toBeGreaterThan(1);
+  expect(pane.frame.head).toBe(beforeHead+80);
+  expect(pane.frame.revision).toBeGreaterThan(beforeRevision+1);
   expect(pane.frame.durableRevision).toBe(pane.frame.revision);
   expect(history.stats().ownedPendingBytes).toBe(0);
   expect(runtime.scratch.heldBytes).toBe(0);
