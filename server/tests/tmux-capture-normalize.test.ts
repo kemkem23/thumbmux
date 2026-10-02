@@ -1024,21 +1024,22 @@ identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},
 base={'identity':identity,'geometry':{'columns':240,'rows':3},'scrollOnClear':False,'screenRevision':0}
 r=m.checkpoint_transaction(dict(base,state=None)); state=r['state']
 # Fill wide rows, then repeatedly clear (large expansion from few source bytes).
-data=(b'x'*240+b'\r\n')*600
+data=(b'x'*240+b'\r\n')*600+b'\r\n'*512
 oracle=m.Worker(240,3);oracle.screen.scroll_on_clear=False;oracle.feed(1,1,data)
 expected=[m.contract_row(x['row'],x['wrap'],x['pad']) for x in oracle.scrolls]
-actual=[];offset=0;seq=1;high=0
+actual=[];offset=0;seq=1;high=0;pressures=0
 while offset<len(data):
     count=min(512,len(data)-offset)
     while True:
         event={'identity':identity,'position':{'sourceEpoch':1,'packetSeq':seq},'payload':{'kind':'bytes','bytes':list(data[offset:offset+count])}}
         try: candidate=m.checkpoint_transaction(dict(base,state=state,event=event));break
         except m.CaptureExpansionPressure:
-            assert count>1;count//=2
+            pressures+=1;assert count>1;count//=2
     charge=len(json.dumps(candidate['scrolls']).encode())*4
     high=max(high,charge);assert charge<=524288
     actual.extend(candidate['scrolls']);state=candidate['state'];offset+=count;seq+=1
 assert actual==expected
+assert pressures>0
 print('wide rows oracle=0, source bytes=%d, peak expanded charge=%d'%(offset,high))
 `;
   const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
