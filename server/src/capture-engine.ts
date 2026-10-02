@@ -504,7 +504,7 @@ export class StreamCaptureEngine implements CaptureEngine {
             if (receipt.value.complete) {
               if (!chunk.final || cancel.isCancelled() || controller.signal.aborted
                 || !(await this.ports.verifyRepair(episode, controller.signal))) {
-                yield error('unresolved-gap', 'durable repair lacks exact live seam proof'); return;
+                yield receipt; yield error('unresolved-gap', 'durable repair lacks exact live seam proof'); return;
               }
               const recovered=await this.ports.repairedCheckpoint(episode,controller.signal);
               if(recovered.status!=='ok') { yield receipt; yield recovered; return; }
@@ -612,18 +612,33 @@ export class TargetedCaptureRepair {
     private readonly scratch: CaptureAdmission, private readonly digest = captureDigest) {}
   async *chunks(episode: GapEpisode, before: readonly RowContent[], after: readonly RowContent[],
     revision: number, signal: AbortSignal): AsyncIterable<Result<RepairChunk>> {
+    // Expand only when an anchor is outside the sealed retained window.
+    // Ambiguity/integrity/pressure must never trigger a wider guessed seam.
+    for(let horizon:number=B.decodeRows;;horizon=Math.min(B.repairHorizonRows,horizon*2)) {
+      let expand=false;
+      for await(const result of this.atHorizon(episode,before,after,revision,signal,horizon)) {
+        if(result.status==='error' && result.code==='unresolved-gap'
+          && result.message==='expired repair anchor' && horizon<B.repairHorizonRows) {expand=true;break;}
+        yield result;
+        if(result.status!=='ok')return;
+      }
+      if(!expand)return;
+    }
+  }
+  private async *atHorizon(episode: GapEpisode, before: readonly RowContent[], after: readonly RowContent[],
+    revision: number, signal: AbortSignal, horizon:number): AsyncIterable<Result<RepairChunk>> {
     if (!before.length || !after.length || before.length + after.length > B.decodeRows
       || [...before, ...after].some(r => r.uncertainFields.length)) {
       yield error('unresolved-gap', 'repair requires two bounded exact anchors'); return;
     }
-    const lease = this.scratch.reserve(B.decodeBytes * 2);
+    const lease = this.scratch.reserve(B.decodeBytes * 4);
     if (!lease) { yield busy(); return; }
     let view: CaptureRecoveryView | null = null;
     try {
-      const opened = await this.source.open(episode, B.repairHorizonRows, signal);
+      const opened = await this.source.open(episode, horizon, signal);
       if (opened.status !== 'ok') { yield opened; return; }
       view = opened.value;
-      if (!sameIdentity(view.identity, this.identity) || !counter(view.rowCount) || view.rowCount > B.repairHorizonRows
+      if (!sameIdentity(view.identity, this.identity) || !counter(view.rowCount) || view.rowCount > horizon
         || view.recoveryPosition.sourceEpoch !== this.identity.sourceEpoch || !counter(view.recoveryPosition.packetSeq)
         || view.recoveryPosition.packetSeq <= (episode.lastDurableInput?.packetSeq ?? 0)) {
         yield error('integrity', 'repair view identity/bounds'); return;
@@ -689,7 +704,7 @@ export async function* bootstrapCapture(view: CaptureRecoveryView, episode: GapE
   history: HistoryEngine, scratch: CaptureAdmission, revision: number,
   sync: (chunk: RepairChunk, receipt: RepairReceipt) => Promise<void>,
   signal: AbortSignal): AsyncIterable<Result<RepairReceipt>> {
-  const release=scratch.reserve(B.decodeBytes*2);
+  const release=scratch.reserve(B.decodeBytes*4);
   if(!release) { yield busy(); return; }
   try {
     if(!counter(view.rowCount) || !samePane(view.identity.pane,episode.pane)

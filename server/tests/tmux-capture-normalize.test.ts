@@ -894,11 +894,14 @@ test('NEWARCH C source tap detects silent drop even with identical screens', () 
 test('NEWARCH C targeted repair preserves all 600 missing rows in bounded chunks and rejects repeated anchors',async()=>{
   const contents=Array.from({length:602},(_,i)=>({cells:cRow(i,`row-${i}`).cells,softWrap:false,wrapPad:0,uncertainFields:[]}));
   const f=cRecoveryView(contents),scratch=new CaptureAdmission(33554432);
-  const repair=new TargetedCaptureRepair({open:async()=>({status:'ok',value:f.view})},cIdentity,scratch);
+  const horizons:number[]=[];
+  const repair=new TargetedCaptureRepair({open:async(_episode,horizon)=>{horizons.push(horizon);
+    return {status:'ok',value:horizon>=contents.length ? f.view : cRecoveryView(contents.slice(-horizon)).view};}},cIdentity,scratch);
   const chunks=[];
   for await(const r of repair.chunks(cEpisode(),[contents[0]!],[contents[601]!],1,new AbortController().signal)) {
     expect(r.status).toBe('ok'); if(r.status==='ok')chunks.push(r.value);
   }
+  expect(horizons).toEqual([256,512,1024]);
   expect(chunks.map(c=>c.rows.length)).toEqual([256,256,88]);
   expect(chunks.flatMap(c=>c.rows).map(r=>r.cells)).toEqual(contents.slice(1,601).map(r=>r.cells));
   expect(chunks.at(-1)?.final).toBe(true); expect(scratch.heldBytes).toBe(0);expect(f.counts().closed).toBe(1);
