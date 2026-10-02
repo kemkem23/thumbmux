@@ -198,7 +198,10 @@ export class StreamRuntime {
     this.viewerSlots.set(id, owner); return true;
   }
   releaseViewer(id: string): void { this.viewerSlots.delete(id); }
-  async add(identity: StreamIdentity, geometry: Geometry, ports: StreamPanePorts, scrollOnClear = false): Promise<StreamRuntimePane> {
+  /** `adoptRecoveredGeometry`: boot finalization replays a stored tenure and
+   * must not append a resize event that the source never produced. */
+  async add(identity: StreamIdentity, geometry: Geometry, ports: StreamPanePorts, scrollOnClear = false,
+    options: { adoptRecoveredGeometry?: boolean } = {}): Promise<StreamRuntimePane> {
     const key = paneKey(identity.pane);
     if (this.closing || this.panes.has(key) || this.panes.size >= B.panes) throw Error('stream pane admission');
     const rpc = new StreamVtTransport();
@@ -211,7 +214,7 @@ export class StreamRuntime {
       this.panes.set(key, pane);
       try {
         await pane.recover();
-        if (pane.frame.geometry.columns !== geometry.columns || pane.frame.geometry.rows !== geometry.rows) await pane.resize(geometry);
+        if (!options.adoptRecoveredGeometry && (pane.frame.geometry.columns !== geometry.columns || pane.frame.geometry.rows !== geometry.rows)) await pane.resize(geometry);
       } catch (error) { this.panes.delete(key); throw error; }
       pane.startCadence();
       return pane;
