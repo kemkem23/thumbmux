@@ -173,3 +173,120 @@ for (const completion of ['resolve','reject'] as const) {
   });
  }
 }
+
+import { StreamSourceTransport } from '../../../../src/integrations/stream-source-transport';
+import { StreamPipeHost } from '../../../../src/integrations/stream-pipe-host';
+
+test('stream I shared worker death replays full parser state for both panes',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-worker-recovery-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try {
+  const a=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const b=await runtime.add({...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%2'}},{columns:20,rows:4},streamPorts);
+  a.stopCadence();b.stopCadence();
+  await a.ingest(Buffer.from('a0\r\na1\r\na2\r\na3\r\n\x1b[3'));
+  await b.ingest(Buffer.concat([Buffer.from('b0\r\nb1\r\nb2\r\nb3\r\n'),Buffer.from('ก').subarray(0,2)]));
+  const oldPid=a.rpc.pid!;
+  expect(b.rpc.pid).toBe(oldPid);
+  const done=(a.rpc as any).lease.done as Promise<void>;
+  process.kill(oldPid,'SIGKILL');await done;
+  await a.ingest(Buffer.from('1mRED\r\n'));
+  await b.ingest(Buffer.concat([Buffer.from('ก').subarray(2),Buffer.from('\r\n')]));
+  expect(a.rpc.pid).not.toBe(oldPid);expect(b.rpc.pid).toBe(a.rpc.pid);
+  const text=(pane:typeof a)=>pane.frame.changedRows.map(r=>r.content.cells.map(c=>c.text).join('').trimEnd());
+  expect(text(a)).toEqual(['a2','a3','RED','']);
+  expect(text(b)).toEqual(['b2','b3','ก','']);
+  expect(a.frame.changedRows[2]!.content.cells[0]!.style).toContain(31);
+  expect(a.frame.head).toBe(2);expect(b.frame.head).toBe(2);
+  expect(a.frame.durableRevision).toBe(a.frame.revision);
+  expect(b.frame.durableRevision).toBe(b.frame.revision);
+  expect(runtime.history!.stats().ownedPendingBytes).toBe(0);
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},30000);
+
+test('stream I lost J reply retries the same event without duplicate durable rows',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-rpc-retry-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try {
+  const pane=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  pane.stopCadence();
+  await pane.ingest(Buffer.from('r0\r\nr1\r\nr2\r\nr3\r\n'));
+  const lease=(pane.rpc as any).lease;
+  const write=lease.socket.write.bind(lease.socket);
+  let killed=false;
+  lease.socket.write=(packet:Buffer,...rest:any[])=>{
+   const result=write(packet,...rest);
+   if(!killed&&packet[0]===74){killed=true;lease.kill('SIGKILL');}
+   return result;
+  };
+  await pane.ingest(Buffer.from('r4\r\n'));
+  expect(killed).toBe(true);expect(pane.frame.head).toBe(2);
+  const route={viewerId:'retry-reader',identity:pane.identity,routeGeneration:1};
+  expect((await pane.attach(route,()=>{})).status).toBe('ok');
+  const page=await pane.page(route,{requestId:'retry-rows',identity:pane.identity,routeGeneration:1,
+   range:{start:0,end:2},deadlineMonoMs:performance.now()+1000},null,256,{isCancelled:()=>false});
+  if(page.status!=='ok')throw Error(JSON.stringify(page));
+  expect(page.value.fragments.map(f=>f.row.cells.map(c=>c.text).join('').trimEnd())).toEqual(['r0','r1']);
+  await pane.detach(route.viewerId);
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},30000);
+
+test('stream I source retirement waits for child exit AND consumer settlement, fences reuse',async()=>{
+ let exit!: (code:number)=>void, release!:()=>void, entered!:()=>void;
+ const reached=new Promise<void>(resolve=>{entered=resolve;});
+ const consumer=new Promise<void>(resolve=>{release=resolve;});
+ let kills=0;
+ const transport=new StreamSourceTransport({tmuxSocket:'/private/test.sock',spawnCapture:()=>({
+  stdout:new ReadableStream({start(controller){controller.enqueue(Buffer.from('sealed row'));}}),
+  stderr:new ReadableStream(),exited:new Promise<number>(resolve=>{exit=resolve;}),kill:()=>{kills++;},
+ })});
+ const controller=new AbortController();
+ const read=transport.read(['capture-pane','-p','-t','%1'],controller.signal,1024,async()=>{entered();await consumer;});
+ const rejected=read.then(()=>false,()=>true);
+ await reached;controller.abort();
+ let retired=false;
+ const retirement=transport.cancelOperation(controller.signal).then(()=>{retired=true;});
+ await Promise.resolve();expect(kills).toBe(1);expect(retired).toBe(false);
+ exit(137);await Promise.resolve();await Promise.resolve();expect(retired).toBe(false);
+ release();await retirement;expect(await rejected).toBe(true);
+ expect(transport.activeOperations).toBe(0);
+ await expect(transport.read(['capture-pane','-p'],controller.signal,1024,()=>{})).rejects.toThrow('retired');
+ await transport.close();
+});
+
+test('stream I source read enforces byte budget and reaps before rejecting',async()=>{
+ let kills=0,exit!:(code:number)=>void;
+ const transport=new StreamSourceTransport({tmuxSocket:'/private/test.sock',spawnCapture:()=>({
+  stdout:new ReadableStream({start(c){c.enqueue(new Uint8Array(1025));c.close();}}),
+  stderr:new ReadableStream({start(c){c.close();}}),
+  exited:new Promise<number>(resolve=>{exit=resolve;}),kill:()=>{kills++;exit(137);},
+ })});
+ let deliveries=0;
+ await expect(transport.read(['capture-pane','-p'],new AbortController().signal,1024,()=>{deliveries++;})).rejects.toThrow('byte budget');
+ expect(deliveries).toBe(0);expect(kills).toBe(1);expect(transport.activeOperations).toBe(0);
+ await transport.close();
+});
+
+test('stream I host joins row continuations and rejects oversized wire pages, releasing viewer',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-wire-page-'));
+ const host=new StreamPipeHost({root,tmuxSocket:'/private/unused.sock'});
+ let calls=0,detaches=0,oversize=false;
+ const fake={frame:{head:1,identity:streamTestIdentity},
+  attach:async()=>({status:'ok'}),detach:async()=>{detaches++;},
+  page:async()=>{
+   const second=++calls%2===0;
+   const content=oversize?'x'.repeat(STREAM_BUDGET.pageBytesPerViewer):second?'B':'A';
+   return{status:'ok',value:{fragments:[{row:{id:{lineId:0},cells:[{text:content,width:1,style:[]}]},
+    startCell:second?1:0,endCell:second?2:1,complete:false}],
+    nextAfter:second?null:{requestId:'page',direction:'after',lineId:0,cellOffset:1}}};
+  }};
+ (host as any).entries.set('test',{pane:fake,route:'newarch',generation:1,off:()=>{}});
+ try {
+  const page=await host.projection.readBefore('test',null,20) as {lines:string[]};
+  expect(page.lines.map(x=>x.replace(/\x1b\[[0-9;]*m/g,''))).toEqual(['AB']);
+  expect(detaches).toBe(1);
+  oversize=true;
+  await expect(host.projection.readBefore('test',null,20) as Promise<unknown>).rejects.toThrow('byte budget');
+  expect(detaches).toBe(2);expect((host as any).pageBytes).toBe(0);
+ }finally{(host as any).entries.clear();await host.close();await rm(root,{recursive:true,force:true});}
+});

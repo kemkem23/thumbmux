@@ -22,19 +22,27 @@ export class StreamVtTransport implements CaptureVtRpc {
   private buffer = Buffer.alloc(0);
   private closed = false;
   private retirement: Promise<void> | null = null;
+  private resetting: Promise<void> | null = null;
+  private pool: PipeVtPool | null = null;
+  private geometry: Geometry | null = null;
+  private epoch = 0;
+  private transactionActive = false;
   get pid(): number | null { return this.lease?.pid ?? null; }
   async start(pool: PipeVtPool, geometry: Geometry, epoch: number): Promise<void> {
-    this.lease = await pool.acquire();
-    const socket = this.lease.socket;
-    socket.on('error', error => this.fail(error));
-    socket.on('close', () => this.fail(Error('stream VT channel closed')));
+    if (this.closed) throw Error('stream RPC retired');
+    this.pool = pool; this.geometry = geometry; this.epoch = epoch;
+    const lease = await pool.acquire();
+    this.lease = lease;
+    const socket = lease.socket;
+    socket.on('error', error => { if (this.lease === lease) this.fail(error); });
+    socket.on('close', () => { if (this.lease === lease) this.fail(Error('stream VT channel closed')); });
     socket.on('data', (chunk: Buffer) => {
-      if (this.closed) return;
+      if (this.closed || this.lease !== lease) return;
       this.buffer = Buffer.concat([this.buffer, chunk]);
-      if (this.buffer.length > 4 * B.vtBytesPerPane) { void this.retire(); return; }
+      if (this.buffer.length > 4 * B.vtBytesPerPane) { void this.resetGeneration(); return; }
       while (this.buffer.length >= 5) {
         const length = this.buffer.readUInt32BE(1);
-        if (length > 4 * B.vtBytesPerPane) { void this.retire(); return; }
+        if (length > 4 * B.vtBytesPerPane) { void this.resetGeneration(); return; }
         if (this.buffer.length < length + 5) return;
         const kind = this.buffer.toString('ascii', 0, 1);
         const body = this.buffer.subarray(5, length + 5);
@@ -43,7 +51,7 @@ export class StreamVtTransport implements CaptureVtRpc {
         // J replies alone own transactional state; unsolicited E remains fatal.
         if (kind === 'U' || kind === 'H') continue;
         const pending = this.pending;
-        if (!pending || pending.kind !== kind) { this.fail(Error('unexpected stream RPC reply')); void this.retire(); return; }
+        if (!pending || pending.kind !== kind) { this.fail(Error('unexpected stream RPC reply')); void this.resetGeneration(); return; }
         this.pending = null;
         try { pending.resolve(JSON.parse(body.toString('utf8'))); }
         catch (error) { pending.reject(error as Error); }
@@ -58,29 +66,52 @@ export class StreamVtTransport implements CaptureVtRpc {
     this.pending?.reject(error); this.pending = null;
   }
   private async call(kind: string, reply: string, body: Buffer): Promise<any> {
-    if (this.closed || !this.lease || this.pending) throw Error('stream RPC unavailable');
+    if (this.closed || !this.lease || this.lease.socket.destroyed || this.pending) throw Error('stream RPC unavailable');
     if (body.length > 1024 * 1024) throw Error('stream RPC input budget');
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await new Promise((resolve, reject) => {
         this.pending = { kind: reply, resolve, reject };
-        timer = setTimeout(() => { void this.retire(); }, B.recoveryMs);
+        timer = setTimeout(() => { void this.resetGeneration(); }, B.recoveryMs);
         this.lease!.socket.write(wire(kind, body), error => { if (error) this.fail(error); });
       });
     } finally { if (timer) clearTimeout(timer); }
   }
   async transaction(request: Parameters<CaptureVtRpc['transaction']>[0]): ReturnType<CaptureVtRpc['transaction']> {
-    try { return { status: 'ok', value: await this.call('J', 'J', Buffer.from(JSON.stringify(request))) }; }
-    catch (error) { return { status: 'error', code: 'io', message: String(error) }; }
+    if (this.transactionActive || this.closed) return {status:'error',code:'io',message:'stream RPC unavailable'};
+    this.transactionActive = true;
+    try {
+      // J is a pure transaction over the supplied checkpoint + event. Repeating
+      // the identical request on another worker cannot append H rows twice.
+      // Never retry an operation explicitly retired by its owner.
+      for (let attempt = 0; ; attempt++) {
+        try { return {status:'ok',value:await this.call('J','J',Buffer.from(JSON.stringify(request)))}; }
+        catch (error) {
+          if (attempt || this.closed || !this.pool || !this.geometry) throw error;
+          await this.resetGeneration();
+          if (this.closed) throw error;
+          await this.start(this.pool, this.geometry, this.epoch);
+        }
+      }
+    } catch (error) { return {status:'error',code:'io',message:String(error)}; }
+    finally { this.transactionActive = false; }
+  }
+  private resetGeneration(): Promise<void> {
+    if (this.resetting) return this.resetting;
+    const lease = this.lease;
+    this.lease = null;
+    this.fail(Error('stream RPC generation retired'));
+    this.buffer = Buffer.alloc(0);
+    const work = (async () => {
+      if (lease) { lease.kill('SIGKILL'); await lease.done; lease.socket.destroy(); await lease.release(); }
+    })();
+    this.resetting = work;
+    void work.then(() => { if (this.resetting === work) this.resetting = null; }, () => {});
+    return work;
   }
   retire(): Promise<void> {
-    return this.retirement ??= (async () => {
-      this.closed = true;
-      this.fail(Error('stream RPC retired'));
-      const lease = this.lease;
-      if (lease) { lease.kill('SIGKILL'); await lease.done; lease.socket.destroy(); await lease.release(); }
-      this.buffer = Buffer.alloc(0);
-    })();
+    this.closed = true;
+    return this.retirement ??= this.resetGeneration();
   }
   async close(): Promise<void> {
     if (this.pending) return this.retire();
@@ -209,7 +240,10 @@ export class StreamRuntimePane {
     this.capture = new StreamCaptureEngine({...this.ports, identity: this.identity, history: this.runtime.history!, vt: this.vt,
       initial: this.frame, admission: this.runtime.admission, scratch: this.runtime.scratch,
       now: () => performance.now(), observer: this.runtime.options.observer,
-      cancelOperation: async signal => { await Promise.all([this.ports.cancelOperation(signal), this.rpc.retire()]); }});
+      // C's scoped asynchronous operations are source reads/repair closeout.
+      // The source owner retires precisely those operations. Killing the shared
+      // VT here would also interrupt unrelated panes on a visible-read timeout.
+      cancelOperation: signal => this.ports.cancelOperation(signal)});
     this.capture.subscribe(this.identity.pane, frame => { this.frame = frame; this.identity = frame.identity; });
     this.display = this.runtime.displayEngine();
     this.cadence = new CaptureCadence(this.capture, () => this.identity, () => performance.now());
