@@ -191,7 +191,9 @@ export class StreamDisplayEngine implements DisplayEngine {
   private readonly pageBytes = new Map<string, number>();
   private pagePoolBytes = 0;
   private readonly wsBytes = new Map<string, number>();
-  private readonly wsEpoch = new Map<string, number>();
+  // Tokens live only while bytes are reserved. Object identity fences late callbacks
+  // without retaining viewer tombstones or wrapping a generation counter.
+  private readonly wsEpoch = new Map<string, object>();
   private wsPendingBytes = 0;
 
   constructor(options: DisplayEngineOptions) {
@@ -342,18 +344,20 @@ export class StreamDisplayEngine implements DisplayEngine {
   reserveEncodedBytes(viewerId: string, bytes: number): Release | null {
     if (!viewerId || !validCounter(bytes) || bytes > STREAM_BUDGET.wsPendingBytes
       || this.wsPendingBytes + bytes > STREAM_BUDGET.wsPendingBytes) return null;
+    if (bytes === 0) return () => {};
     this.wsPendingBytes += bytes;
     this.wsBytes.set(viewerId, (this.wsBytes.get(viewerId) ?? 0) + bytes);
-    const epoch = this.wsEpoch.get(viewerId) ?? 0;
+    const epoch = this.wsEpoch.get(viewerId) ?? {};
+    this.wsEpoch.set(viewerId, epoch);
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      if ((this.wsEpoch.get(viewerId) ?? 0) !== epoch) return;
+      if (this.wsEpoch.get(viewerId) !== epoch) return;
       this.wsPendingBytes -= bytes;
       const remaining = (this.wsBytes.get(viewerId) ?? 0) - bytes;
       if (remaining > 0) this.wsBytes.set(viewerId, remaining);
-      else this.wsBytes.delete(viewerId);
+      else { this.wsBytes.delete(viewerId); this.wsEpoch.delete(viewerId); }
     };
   }
 
@@ -516,7 +520,7 @@ export class StreamDisplayEngine implements DisplayEngine {
     const bytes = this.wsBytes.get(viewerId) ?? 0;
     this.wsPendingBytes -= bytes;
     this.wsBytes.delete(viewerId);
-    this.wsEpoch.set(viewerId, (this.wsEpoch.get(viewerId) ?? 0) + 1);
+    this.wsEpoch.delete(viewerId);
   }
 
   private recordMemory(): void {
