@@ -1156,3 +1156,44 @@ test('NEWARCH C stream adapter rejects a nonadvancing or over-budget continuatio
     expect(made.value.screen()).toEqual(cFrame());
   }
 });
+
+// Contract repair: exercise the actual C -> SQLite H boundary, never an echo H.
+import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
+for (const count of [1, 2, 600]) test(`NEWARCH contract real C-H ${count} rows survives checkpoint and reopen`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'contract-seam-'));
+  const path = join(dir, 'history.sqlite');
+  let history = new StreamHistoryEngine({ path, codecVersions: ['seam-v1'] });
+  try {
+    const f = cEngineFixture();
+    const geometry = cFrame().geometry, cursor = cFrame().cursor;
+    const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+    const state = { codecVersion: 'seam-v1', geometry, normal: buffer, alternate: buffer,
+      active: 'normal' as const, modes: {}, margins: { top: 0, bottom: geometry.rows - 1, left: 0, right: geometry.columns - 1 },
+      tabStops: [], pendingUtf8: [], pendingEscape: [], attributes: [], wrapPending: false, extensionState: '{}' };
+    const rows = Array.from({ length: count }, (_, i) => ({ cells: [{ text: `row-${i}`, width: 1 as const, style: [31] }],
+      softWrap: false, wrapPad: 0, uncertainFields: [] }));
+    f.ports.vt.prepare = async event => ({ status: 'ok', value: { frame: { ...cFrame(), identity: event.identity },
+      scrolls: rows, snapshot: async () => ({ status: 'ok', value: state }), install() {}, discard() {} } });
+    f.ports.vt.snapshot = async () => ({ status: 'ok', value: state });
+    const engine = new StreamCaptureEngine({ ...f.ports, history });
+    const frames: LiveFrame[] = []; engine.subscribe(cPane, frame => frames.push(frame));
+    expect((await engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect(frames.at(-1)?.head).toBe(count);
+    expect((await engine.checkpoint(cPane, 'handoff')).status).toBe('ok');
+    history.close(); history = new StreamHistoryEngine({ path, codecVersions: ['seam-v1'] });
+    const grant = await history.grantReadView({ requestId: `rows-${count}`, identity: cIdentity,
+      routeGeneration: 1, range: { start: 0, end: count }, deadlineMonoMs: performance.now() + 1000 });
+    if (grant.status !== 'ok') throw Error(JSON.stringify(grant));
+    const ack = await history.openReadView(grant.value);
+    if (ack.status !== 'ok') throw Error(JSON.stringify(ack));
+    const seen: string[] = []; let cursorPage = null;
+    do {
+      const page = await history.readPage(ack.value, cursorPage, 256, { isCancelled: () => false });
+      if (page.status !== 'ok') throw Error(JSON.stringify(page));
+      seen.push(...page.value.fragments.map(fragment => fragment.row.cells[0]!.text));
+      cursorPage = page.value.nextAfter;
+    } while (cursorPage);
+    expect(seen).toEqual(rows.map(row => row.cells[0]!.text));
+    await history.releaseReadView(grant.value, 'done');
+  } finally { history.close(); rmSync(dir, { recursive: true, force: true }); }
+});
