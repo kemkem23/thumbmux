@@ -321,6 +321,28 @@ test('stream I C visible cancellation reaps its real source child without killin
  }finally{await source.close();await runtime.close();await rm(root,{recursive:true,force:true});}
 },10000);
 
+test('stream I bootstrap also needs saved cursor when no escape sequence is pending',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-saved-cursor-evidence-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try {
+  const a=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const b=await runtime.add({...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%2'}},{columns:20,rows:4},streamPorts);
+  a.stopCadence();b.stopCadence();
+  // All sequences are complete. capture-pane -P cannot recover this hidden
+  // state: it exposes unfinished escape bytes, not DEC saved cursor state.
+  await a.ingest(Buffer.from('\x1b[2;2H\x1b7\x1b[HBASE'));
+  await b.ingest(Buffer.from('\x1b[3;3H\x1b7\x1b[HBASE'));
+  expect(a.frame.changedRows).toEqual(b.frame.changedRows);
+  expect(a.frame.cursor).toEqual(b.frame.cursor);
+  expect(a.frame.head).toBe(b.frame.head);
+  await a.ingest(Buffer.from('\x1b8X'));
+  await b.ingest(Buffer.from('\x1b8X'));
+  expect(a.frame.changedRows[1]!.content.cells[1]!.text).toBe('X');
+  expect(b.frame.changedRows[2]!.content.cells[2]!.text).toBe('X');
+  expect(a.frame.changedRows).not.toEqual(b.frame.changedRows);
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},10000);
+
 
 test('stream I RPC retirement waits for a late pool acquire and lease release',async()=>{
  const rpc=new StreamVtTransport();
