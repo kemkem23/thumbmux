@@ -472,6 +472,14 @@ function displayHarness() {
 
 test("NEWARCH D: 21 viewers keep independent immutable pages inside both cache caps", async () => {
   const h = displayHarness();
+  const baseReadPage = h.history.readPage.bind(h.history);
+  const oneMiB = "x".repeat(1024 * 1024);
+  h.history.readPage = async (ack, cursor, limit, cancel) => {
+    const base = await baseReadPage(ack, cursor, limit, cancel);
+    return base.status === "ok"
+      ? { status: "ok", value: displayPage(ack.view, `${ack.view.range.start}:${oneMiB}`) }
+      : base;
+  };
   const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
   const attachments = Array.from({ length: 21 }, async (_, index) => {
     const route = displayRoute(`viewer-${index}`);
@@ -491,6 +499,7 @@ test("NEWARCH D: 21 viewers keep independent immutable pages inside both cache c
   expect(h.released).toHaveLength(21);
   expect(engine.stats().pagePoolBytes).toBeLessThanOrEqual(STREAM_BUDGET.pagePoolBytes);
   expect(Math.max(...Object.values(engine.stats().pageBytesByViewer))).toBeLessThanOrEqual(STREAM_BUDGET.pageBytesPerViewer);
+  expect(Object.keys(engine.stats().pageBytesByViewer).length).toBeLessThan(21);
 });
 
 test("NEWARCH D: stale routes cannot receive frames or read pages and detach is generation-safe", async () => {
