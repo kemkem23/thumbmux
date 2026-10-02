@@ -597,6 +597,7 @@ test('stream I rollback bridge: legacy reads join the frozen sh_* interval exact
   }
 },30000);
 
+async function until(f:()=>boolean,what:string){for(let i=0;i<400&&!f();i++)await Bun.sleep(10);if(!f())throw Error(`timed out: ${what}`);}
 /** A keeper tick report for one session that proves the writer ran. */
 const writerRan={sessionsConsidered:1,caughtUp:1,linesAppended:0};
 /** Host with a real unix socket path, a fake tmux identity and a fake pipe owner.
@@ -719,6 +720,78 @@ test('stream I source EOF fails closed: no reopen, durable unresolved gap, rows 
     expect(rig2.host.archive).toBeNull();expect(existsSync(join(root2,'stream-tenure'))).toBe(false);
     expect(rig2.events).toEqual([]);
   }finally{await rig2.close();await rm(root2,{recursive:true,force:true});}
+},60000);
+
+test('stream I handoff never ends silently: no writer keeps the route, an unproven writer stays PREPARED across shutdown, an unfreezable tenure is released whole',async()=>{
+  const lines=Array.from({length:20},(_,i)=>`w${i}`);
+  // Planned switch with no legacy writer registered: nothing is touched.
+  const root=await mkdtemp(join(tmpdir(),'stream-i-r6-nowriter-'));
+  const history={size:0,limit:2000,rows:[] as string[]};
+  const rig=await r5Host(root,{},history);
+  try{
+    const pane=await rig.attach();setLegacyWriterKick(null);
+    await rig.handlers().onBytes(Buffer.from(lines.map(l=>l+'\r\n').join('')));
+    const F=(await pane.drain())!.head;history.size=F;history.rows=lines.slice(0,F);
+    const refused=await rig.host.setRoute('s','legacy');
+    expect(refused).toMatchObject({ok:false,from:'newarch',to:'newarch'});
+    expect(refused.error).toContain('no legacy writer registered');
+    expect(rig.events).toEqual(['start','route:s:true']);
+    expect(rig.host.projection.owns('s')).toBe(true);
+    expect(rig.host.archive!.catalog.pending(rig.identity.pane)).toBeNull();
+    // The failed attempt is not cached: once a writer exists the switch works.
+    setLegacyWriterKick(async s=>{rig.events.push('writer:'+s);return writerRan;});
+    expect((await rig.host.setRoute('s','legacy')).ok).toBe(true);
+    expect(rig.host.archive!.catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',localStart:F});
+  }finally{await rig.close();await rm(root,{recursive:true,force:true});}
+  // Source EOF; the writer pass does not list the session; the host stops.
+  const root2=await mkdtemp(join(tmpdir(),'stream-i-r6-unproven-'));
+  const h2={size:0,limit:2000,rows:[] as string[]};
+  const rig2=await r5Host(root2,{},h2,()=>({sessionsConsidered:0}));
+  try{
+    const pane=await rig2.attach();const h=rig2.handlers();
+    await h.onBytes(Buffer.from(lines.map(l=>l+'\r\n').join('')));
+    const F=(await pane.drain())!.head;h2.size=F;h2.rows=lines.slice(0,F);
+    h.onBroken({reason:'eof',message:'source EOF'});
+    await until(()=>rig2.host.pendingHandoffs().includes('s'),'EOF handoff waits for a proven writer');
+    const catalog=rig2.host.archive!.catalog;
+    expect(catalog.pending(rig2.identity.pane)).toMatchObject({id:'source-eof:1',phase:'PREPARED'});
+    expect(catalog.owner(rig2.identity.pane)!.route).toBe('stream');
+    // Released to legacy (the writer may run) while the catalog waits.
+    expect(rig2.host.projection.owns('s')).toBe(false);
+    expect(rig2.host.status().pendingHandoffs).toEqual(['s']);
+    const closed=await rig2.host.close();
+    expect(closed.issues).toEqual(['s: handoff left PREPARED, legacy writer not proven']);
+    expect(closed.drained).toBe(false);
+    // The next boot proves the same fence against tmux and commits it.
+    const again=new StreamPipeHost({root:root2,tmuxSocket:rig2.host.options.tmuxSocket});
+    (again as any).pipes=(rig2.host as any).pipes;(again as any).tmux=(rig2.host as any).tmux;
+    await again.start();
+    expect(again.finalize).toEqual({finalized:[],resolved:['source-eof:1'],blocked:[]});
+    expect(again.archive!.catalog.owner(rig2.identity.pane)).toMatchObject({route:'legacy',localStart:F});
+    await again.close();
+  }finally{await rig2.close().catch(()=>{});await rm(root2,{recursive:true,force:true});}
+  // Source EOF where H cannot freeze a clean interval: no row is frozen, the
+  // pane goes back to legacy whole (it re-reads every row tmux holds).
+  const root3=await mkdtemp(join(tmpdir(),'stream-i-r6-unfrozen-'));
+  const h3={size:0,limit:2000,rows:[] as string[]};
+  const rig3=await r5Host(root3,{},h3);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+  try{
+    const pane=await rig3.attach();const h=rig3.handlers();
+    await h.onBytes(Buffer.from(lines.map(l=>l+'\r\n').join('')));
+    const F=(await pane.drain())!.head;h3.size=F;h3.rows=lines.slice(0,F);
+    const rows=rig3.host.archive!.rows!,real=rows.durable.bind(rows);
+    (rows as any).durable=(k:any)=>{const d=real(k);return d&&{...d,revision:d.durable+1};};
+    h.onBroken({reason:'eof',message:'source EOF'});
+    const catalog=rig3.host.archive!.catalog;
+    await until(()=>catalog.owner(rig3.identity.pane)?.route==='legacy','unfrozen release');
+    (rows as any).durable=real;
+    expect(catalog.owner(rig3.identity.pane)).toMatchObject({route:'legacy',globalStart:0,localStart:0});
+    expect(catalog.segmentAt(rig3.identity.pane,0)).toBeNull();
+    expect(catalog.handoff(rig3.identity.pane,'source-eof:1')!.prepared!.segment.seam.reason).toContain('stream rows not frozen');
+    // Nothing frozen: the session is plain legacy again, every tmux row once.
+    legacy.lines.set('s',[...lines,'after']);
+    walk(archive,'s',[...lines,'after'],5);
+  }finally{await rig3.close();await rm(root3,{recursive:true,force:true});}
 },60000);
 
 test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARED, aborts PREPARE, and opens nothing without a catalog',async()=>{
@@ -1005,7 +1078,6 @@ async function realPipeRig(historyLimit:number,{register=true,bLines=30,cLines=2
     go:(f:string)=>writeFileSync(join(dir,f),''),keeperTick:()=>runHistoryKeeperTick(deps)};
 }
 const tmuxHistorySize=(r:{server:{t:(a:string[])=>string},paneId:string})=>Number(r.server.t(['display-message','-p','-t',r.paneId,'#{history_size}']).trim());
-const until=async(f:()=>boolean,what:string)=>{for(let i=0;i<400&&!f();i++)await Bun.sleep(10);if(!f())throw Error(`timed out: ${what}`);};
 
 test('stream I real pipe: tmux prehistory is refused at attach; a blank pane rolls back with a content-proven fence and the real writer',async()=>{
   const r=await realPipeRig(2000);
