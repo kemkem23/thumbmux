@@ -1,6 +1,6 @@
 /** Stream-first I lifecycle. This module never opens tmux or a legacy store. */
 import { PipeVtPool, CheckpointCaptureVt, type CaptureVtRpc } from './pipe-vt-worker';
-import { CaptureAdmission, StreamCaptureEngine, type CapturePorts } from './capture-engine';
+import { CaptureAdmission, CaptureCadence, StreamCaptureEngine, type CapturePorts } from './capture-engine';
 import { StreamHistoryEngine } from './history-engine';
 import { StreamDisplayEngine } from './display-engine';
 import { STREAM_BUDGET as B, streamDigest, type StreamIdentity, type Geometry, type LiveFrame,
@@ -105,9 +105,20 @@ export class StreamRuntime {
   private panes = new Map<string, StreamRuntimePane>();
   private closing = false;
   private sharedDisplay: StreamDisplayEngine | null = null;
+  private readonly timer: ReturnType<typeof setInterval>;
+  private ticks = new Map<StreamRuntimePane, Promise<void>>();
   private viewerSlots = new Map<string, StreamRuntimePane>();
   constructor(readonly options: StreamRuntimeOptions) {
     this.pool = options.pool ?? new PipeVtPool({ python: options.python });
+    this.timer = setInterval(() => {
+      for (const pane of this.panes.values()) {
+        if (this.ticks.has(pane)) continue;
+        const task = pane.tick(); this.ticks.set(pane, task);
+        const settled = () => { if (this.ticks.get(pane) === task) this.ticks.delete(pane); };
+        void task.then(settled, settled);
+      }
+    }, 25);
+    this.timer.unref?.();
   }
   displayEngine(): StreamDisplayEngine {
     if (!this.sharedDisplay) {
@@ -152,6 +163,7 @@ export class StreamRuntime {
         await pane.recover();
         if (pane.frame.geometry.columns !== geometry.columns || pane.frame.geometry.rows !== geometry.rows) await pane.resize(geometry);
       } catch (error) { this.panes.delete(key); throw error; }
+      pane.startCadence();
       return pane;
     } catch (error) { await rpc.close(); throw error; }
   }
@@ -160,9 +172,12 @@ export class StreamRuntime {
   }
   async close(): Promise<void> {
     this.closing = true;
+    clearInterval(this.timer);
+    await Promise.allSettled(this.ticks.values());
     // No finally-close: failed drain keeps H and its recovery evidence alive.
     for (const pane of this.panes.values()) await pane.close();
-    if (this.history?.stats().ownedPendingBytes) throw Error('stream close refused: undurable pending');
+    if (this.history?.stats().ownedPendingBytes || this.scratch.heldBytes || this.admission.heldBytes)
+      throw Error('stream close refused: undurable pending or quarantined operation');
     const receipt = this.history?.close();
     if (receipt?.undurableBytes) throw Error('stream close lost undurable state');
     this.panes.clear(); await this.pool.close();
@@ -180,6 +195,9 @@ export class StreamRuntimePane {
   private inputBytes = 0;
   private viewers = new Map<string, ViewerRoute>();
   private closed = false;
+  private cadence!: CaptureCadence;
+  private cadenceReady = false;
+  private receivedAt = -Infinity;
   constructor(readonly runtime: StreamRuntime, readonly rpc: StreamVtTransport,
     private readonly vt: CheckpointCaptureVt, identity: StreamIdentity, private readonly ports: StreamPanePorts) {
     this.identity = structuredClone(identity);
@@ -193,6 +211,13 @@ export class StreamRuntimePane {
       cancelOperation: async signal => { await Promise.all([this.ports.cancelOperation(signal), this.rpc.retire()]); }});
     this.capture.subscribe(this.identity.pane, frame => { this.frame = frame; this.identity = frame.identity; });
     this.display = this.runtime.displayEngine();
+    this.cadence = new CaptureCadence(this.capture, () => this.identity, () => performance.now());
+  }
+  startCadence(): void { this.cadenceReady = true; }
+  async tick(): Promise<void> {
+    if (!this.cadenceReady || this.closed) return;
+    this.cadence.activity(this.viewers.size, performance.now() - this.receivedAt < B.visibleIdleMs);
+    await this.cadence.tick();
   }
   async recover(): Promise<void> {
     const recovery = this.runtime.history!.recover(this.identity.pane, null, {isCancelled: () => false})[Symbol.asyncIterator]();
@@ -234,7 +259,7 @@ export class StreamRuntimePane {
    * partial slice as capacity-pressure (which would cause duplicate retry). */
   ingest(bytes: Uint8Array): Promise<void> {
     if (!this.accepting || bytes.length > 64 * 1024 || this.inputBytes) return Promise.reject(Error('stream input admission'));
-    this.inputBytes = bytes.length;
+    this.inputBytes = bytes.length; this.receivedAt = performance.now();
     const owned = Uint8Array.from(bytes);
     const work = this.chain.then(async () => {
       for (let offset = 0; offset < owned.length; offset += 512) {
@@ -262,6 +287,7 @@ export class StreamRuntimePane {
   }
   async resize(geometry: Geometry): Promise<void> {
     if (!this.accepting) throw Error('stream closed');
+    this.cadence.event();
     this.chain = this.chain.then(() => this.event({kind: 'resize', geometry}));
     await this.chain;
     for (const route of this.viewers.values()) await this.display.detach(route, 'geometry changed');
@@ -292,7 +318,7 @@ export class StreamRuntimePane {
   }
   async close(): Promise<void> {
     if (this.closed) return;
-    this.accepting = false;
+    this.accepting = false; this.cadenceReady = false;
     await this.drain();
     for (const id of [...this.viewers.keys()]) await this.detach(id);
     await this.rpc.close(); this.closed = true;
