@@ -520,15 +520,78 @@ def encode_cached(row, cols, default):
     return encode_row(row, cols, default)
 
 
+
+# Versioned, data-only codec. Never pickle/import executable checkpoint content.
+CHECKPOINT_CODEC = "pyte-stream-c1:" + VENDOR_SHA256
+
+def pack_state(v):
+    from collections import defaultdict
+    from pyte.screens import Cursor, StaticDefaultDict
+    if v is None or type(v) in (str, int, bool, float):
+        return v
+    if isinstance(v, Cursor):
+        return ["cursor", [pack_state(getattr(v, k)) for k in v.__slots__]]
+    if isinstance(v, tuple):
+        return [type(v).__name__, [pack_state(x) for x in v]]
+    if isinstance(v, (set, list)):
+        return [type(v).__name__, [pack_state(x) for x in (sorted(v) if isinstance(v, set) else v)]]
+    if isinstance(v, dict):
+        attrs = {k: x for k, x in getattr(v, "__dict__", {}).items() if k != "enc"}
+        kind = "buffer" if isinstance(v, defaultdict) else "row" if isinstance(v, StaticDefaultDict) else "dict"
+        return [kind, [[pack_state(k), pack_state(x)] for k, x in v.items()], pack_state(attrs) if kind != "dict" else None]
+    raise ValueError("unsupported checkpoint field " + type(v).__name__)
+
+def unpack_state(v, screen):
+    from collections import defaultdict
+    from pyte.screens import Cursor, StaticDefaultDict, Char, Margins, Savepoint
+    if not isinstance(v, list):
+        return v
+    kind, data = v[:2]
+    if kind in ("buffer", "row", "dict"):
+        out = defaultdict(lambda: StaticDefaultDict(screen.default_char)) if kind == "buffer" else StaticDefaultDict(screen.default_char) if kind == "row" else {}
+        out.update((unpack_state(k, screen), unpack_state(x, screen)) for k, x in data)
+        if kind != "dict":
+            attrs = unpack_state(v[2], screen)
+            if attrs: out.__dict__.update(attrs)
+        return out
+    data = [unpack_state(x, screen) for x in data]
+    if kind == "cursor":
+        out = Cursor(*data[:3]); out.hidden = data[3]; return out
+    factories = {"Char": Char, "Margins": Margins, "Savepoint": Savepoint}
+    if kind in factories: return factories[kind](*data)
+    if kind == "tuple": return tuple(data)
+    if kind == "set": return set(data)
+    if kind == "list": return data
+    raise ValueError("unknown checkpoint tag")
+
+class CheckpointByteStream(pyte.ByteStream):
+    csi = {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}
+    events = pyte.ByteStream.events | {"scroll_up", "scroll_down"}
+
+    def __init__(self, screen):
+        self.pending_sequence = ""
+        super().__init__(screen)
+
+    def _send_to_parser(self, data):
+        # Only the unfinished escape prefix survives. Plain text stays on the
+        # original fast path. A pathological OSC/CSI fails before unbounded RAM.
+        if len(self.pending_sequence.encode("utf-8")) + len(data.encode("utf-8")) > 65536:
+            raise ValueError("pending escape exceeds checkpoint budget")
+        self.pending_sequence += data
+        result = super()._send_to_parser(data)
+        if result: self.pending_sequence = ""
+        return result
+
+
 class Worker:
     def __init__(self, cols, rows, epoch=1):
         self.screen = Screen(cols, rows, epoch)
-        stream_type = type("TmuxByteStream", (pyte.ByteStream,), {"csi": {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}, "events": pyte.ByteStream.events | {"scroll_up", "scroll_down"}})
-        self.stream = stream_type(self.screen)
+        self.stream = CheckpointByteStream(self.screen)
         self.gen = 0
         self.packet_seq = 0
         self.scroll_ordinal = 0
         self.scrolls = []
+        self.transaction_scroll_bytes = None
         self.seq_from = None
         self.seq_to = None
         self.full = True
@@ -540,6 +603,81 @@ class Worker:
         self.dcs_intermediate = False
         self.screen.on_scroll = self._on_scroll
         self.screen.on_history_clear = self._on_history_clear
+
+    def export_checkpoint(self):
+        fields = {k: v for k, v in self.screen.__dict__.items()
+                  if k not in ("on_scroll", "on_history_clear")}
+        pending, flag = self.stream.utf8_decoder.getstate()
+        state = {"codecVersion": CHECKPOINT_CODEC,
+                 "geometry": {"columns": self.screen.columns, "rows": self.screen.lines},
+                 "screen": pack_state(fields), "utf8": [list(pending), flag],
+                 "escape": self.stream.pending_sequence, "useUtf8": self.stream.use_utf8,
+                 "worker": {k: getattr(self, k) for k in ("gen", "packet_seq", "scroll_ordinal",
+                     "dcs_state", "dcs_sixel", "dcs_intermediate")}}
+        if len(json.dumps(state).encode()) > 1024 * 1024:
+            raise ValueError("VT checkpoint exceeds 2 MiB copy budget")
+        return state
+
+    @classmethod
+    def from_checkpoint(cls, state):
+        if state.get("codecVersion") != CHECKPOINT_CODEC:
+            raise ValueError("unsupported VT checkpoint codec")
+        if len(json.dumps(state).encode()) > 1024 * 1024:
+            raise ValueError("VT checkpoint exceeds budget")
+        g = state["geometry"]
+        if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80):
+            raise ValueError("checkpoint geometry")
+        w = cls(g["columns"], g["rows"])
+        # Replay only the parser continuation on a disposable screen, then
+        # restore the full screen. CSI embedded controls are not applied twice.
+        w.screen.scroll_on_clear = False
+        pyte.Stream.feed(w.stream, state["escape"])
+        w.screen.__dict__.update(unpack_state(state["screen"], w.screen))
+        if (w.screen.columns, w.screen.lines) != (g["columns"], g["rows"]):
+            raise ValueError("checkpoint geometry mismatch")
+        w.stream.use_utf8 = state["useUtf8"]
+        w.stream.utf8_decoder.setstate((bytes(state["utf8"][0]), state["utf8"][1]))
+        for k in ("gen", "packet_seq", "scroll_ordinal", "dcs_state", "dcs_sixel", "dcs_intermediate"):
+            setattr(w, k, state["worker"][k])
+        w.screen.on_scroll = w._on_scroll
+        w.screen.on_history_clear = w._on_history_clear
+        w.scrolls = []
+        return w
+
+    def contract_state(self):
+        s = self.screen
+        def cursor(c): return {"x": c.x, "y": c.y, "visible": not c.hidden}
+        def buffer(rows, c):
+            saved = s.savepoints[-1].cursor if s.savepoints else c
+            return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char),
+                        row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],
+                    "cursor": cursor(c), "savedCursor": cursor(saved),
+                    "savedAttributes": contract_style(saved.attrs.fg, saved.attrs.bg,
+                        sum(int(getattr(saved.attrs, key)) << i for i, key in enumerate(
+                            ("bold", "italics", "underscore", "strikethrough", "reverse", "blink")))),
+                    "savedModes": {}, "wrapPending": c.x >= s.columns}
+        from collections import defaultdict
+        from pyte.screens import StaticDefaultDict, Cursor
+        empty = defaultdict(lambda: StaticDefaultDict(s.default_char))
+        current = buffer(s.buffer, s.cursor)
+        normal_cursor = s.cursor
+        if s.alt and s.saved_normal[1] is not None:
+            x, y, attrs, hidden = s.saved_normal[1]
+            normal_cursor = Cursor(x, y, attrs); normal_cursor.hidden = hidden
+        normal = buffer(s.saved_normal[0], normal_cursor) if s.alt else current
+        alternate = current if s.alt else buffer(empty, Cursor(0, 0))
+        return {"codecVersion": CHECKPOINT_CODEC, "geometry": {"columns": s.columns, "rows": s.lines},
+                "normal": normal, "alternate": alternate, "active": "alternate" if s.alt else "normal",
+                "modes": {str(m): True for m in sorted(s.mode)},
+                "margins": {"top": s.margins.top if s.margins else 0,
+                            "bottom": s.margins.bottom if s.margins else s.lines-1, "left": 0, "right": s.columns-1},
+                "tabStops": sorted(s.tabstops), "pendingUtf8": list(self.stream.utf8_decoder.getstate()[0]),
+                "pendingEscape": list(self.stream.pending_sequence.encode("utf-8")),
+                "attributes": contract_style(s.cursor.attrs.fg, s.cursor.attrs.bg,
+                    sum(int(getattr(s.cursor.attrs, key)) << i for i, key in enumerate(
+                        ("bold", "italics", "underscore", "strikethrough", "reverse", "blink")))),
+                "wrapPending": s.cursor.x >= s.columns,
+                "extensionState": json.dumps(self.export_checkpoint(), ensure_ascii=False, separators=(",", ":"))}
 
     def reset_stages(self):
         self.in_frames = 0
@@ -574,6 +712,10 @@ class Worker:
         })
 
         self.scroll_ordinal += 1
+        if self.transaction_scroll_bytes is not None:
+            self.transaction_scroll_bytes += len(json.dumps(self.scrolls[-1]).encode()) * 2
+            if self.transaction_scroll_bytes > 1024 * 1024:
+                raise ValueError("transaction scroll budget; source must segment input before admission")
 
     def feed(self, seq, epoch, data, rx=None, more=False):
         """Feed one D frame, or its first slice when `more` slices follow.
@@ -747,9 +889,82 @@ class Worker:
         self.parse_ns = 0
 
 
+def contract_style(fg, bg, attrs):
+    result = [0]
+    names = ["black", "red", "green", "brown", "blue", "magenta", "cyan", "white"]
+    for color, base in ((fg, 30), (bg, 40)):
+        if color == "default": continue
+        if color in names: result.append(base + names.index(color))
+        elif color.startswith("bright") and color[6:] in names: result.append(base + 60 + names.index(color[6:]))
+        elif re.fullmatch("[0-9a-fA-F]{6}", color):
+            result.extend([base + 8, 2] + [int(color[i:i+2], 16) for i in (0, 2, 4)])
+        else: raise ValueError("unsupported checkpoint color")
+    for bit, code in enumerate((1, 3, 4, 9, 7, 5)):
+        if attrs & (1 << bit): result.append(code)
+    return result
+
+def contract_row(runs, wrap, pad):
+    cells = []
+    for fg, bg, attrs, text in runs:
+        style = contract_style(fg, bg, attrs)
+        for ch in text:
+            cells.append({"text": ch, "width": 0 if ch == "" else 1, "style": style})
+    for i in range(len(cells)-1):
+        if cells[i]["text"] and cells[i+1]["text"] == "": cells[i]["width"] = 2
+    return {"cells": cells, "softWrap": wrap, "wrapPad": int(pad), "uncertainFields": []}
+
+def checkpoint_transaction(request):
+    state = request.get("state")
+    identity = request["identity"]
+    if state is None:
+        g = request["geometry"]
+        if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80): raise ValueError("geometry budget")
+        w = Worker(g["columns"], g["rows"], identity["sourceEpoch"])
+        w.gen = identity["geometryGeneration"]
+        w.screen.scroll_on_clear = request["scrollOnClear"]
+    else:
+        if state["codecVersion"] != CHECKPOINT_CODEC: raise ValueError("checkpoint codec")
+        w = Worker.from_checkpoint(json.loads(state["extensionState"]))
+        if w.contract_state() != state: raise ValueError("checkpoint envelope mismatch")
+    w.transaction_scroll_bytes = 0
+    event = request.get("event")
+    if event:
+        p = event["payload"]; pos = event["position"]
+        if p["kind"] == "bytes":
+            if len(p["bytes"]) > 16384: raise ValueError("input cap")
+            if not w.feed(pos["packetSeq"], pos["sourceEpoch"], bytes(p["bytes"])):
+                raise ValueError("unsupported parser input")
+        elif p["kind"] == "resize":
+            g = p["geometry"]
+            if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80): raise ValueError("resize budget")
+            w.packet_seq = pos["packetSeq"]; w.scroll_ordinal = 0
+            w.resize(p["geometry"]["columns"], p["geometry"]["rows"], identity["geometryGeneration"])
+        elif p["kind"] == "control" and p["name"] == "scroll-on-clear" and p["data"] in ("true", "false"):
+            w.screen.scroll_on_clear = p["data"] == "true"
+        else: raise ValueError("unsupported input control")
+    state = w.contract_state(); active = state[state["active"]]
+    return {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
+            "frame": {"identity": identity, "screenRevision": request["screenRevision"],
+                      "buffer": state["active"], "geometry": state["geometry"],
+                      "changedRows": [{"y": y, "content": row} for y, row in enumerate(active["rows"])],
+                      "cursor": active["cursor"], "overlap": None}}
+
+
 def dispatch(worker, kind, payload, rx=None):
     """The same ordered command implementation for dedicated and shared parsers."""
-    if kind == b"D":
+    if kind == b"J":
+        if len(payload) > 4 * 1024 * 1024: raise ValueError("transaction request cap")
+        request = json.loads(payload)
+        # Isolate speculative history-clear/update events from live consumers.
+        global output_sink
+        previous_sink = output_sink
+        try:
+            output_sink = lambda packet: None
+            result = checkpoint_transaction(request)
+        finally:
+            output_sink = previous_sink
+        send(b"J", result)
+    elif kind == b"D":
         seq, epoch = struct.unpack(">QQ", payload[:16])
         worker.feed(seq, epoch, payload[16:], rx)
     elif kind == b"C":

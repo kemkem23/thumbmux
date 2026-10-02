@@ -794,3 +794,63 @@ export class PipeVtWorker {
     if (this.lease) this.lease.kill(signal); else this.child?.kill(signal);
   }
 }
+
+/** Stateless J requests share the existing multiplex worker. I owns socket
+ * routing and cancellation; C owns the candidate state and synchronous install.
+ * The transport must reserve request/reply bytes and retire a cancelled RPC
+ * before resolving. It must never route speculative U/H to live consumers. */
+export interface CaptureVtRpc {
+  transaction(request: {
+    state: import('./stream-contract').VtState | null;
+    identity: import('./stream-contract').StreamIdentity;
+    geometry: import('./stream-contract').Geometry;
+    scrollOnClear: boolean;
+    screenRevision: number;
+    event?: import('./stream-contract').InputEvent;
+  }): Promise<import('./stream-contract').Result<{
+    state: import('./stream-contract').VtState;
+    frame: import('./stream-contract').FrameDelta;
+    scrolls: readonly import('./stream-contract').RowContent[];
+  }>>;
+}
+
+/** Concrete transactional checkpoint adapter. No process per pane, timer or
+ * socket is created here; I supplies the shared J transport once. */
+export class CheckpointCaptureVt implements importCaptureVt {
+  private state: import('./stream-contract').VtState;
+  private frame: import('./stream-contract').FrameDelta;
+  private generation = 0;
+  private constructor(private readonly rpc: CaptureVtRpc, state: import('./stream-contract').VtState,
+    frame: import('./stream-contract').FrameDelta, private readonly scrollOnClear: boolean) {
+    this.state = structuredClone(state); this.frame = structuredClone(frame);
+  }
+  static async create(rpc: CaptureVtRpc, identity: import('./stream-contract').StreamIdentity,
+    geometry: import('./stream-contract').Geometry, scrollOnClear: boolean): Promise<import('./stream-contract').Result<CheckpointCaptureVt>> {
+    const r = await rpc.transaction({state:null,identity,geometry,scrollOnClear,screenRevision:0});
+    return r.status === 'ok' ? {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)} : r;
+  }
+  screen() { return structuredClone(this.frame); }
+  async snapshot(): Promise<import('./stream-contract').Result<import('./stream-contract').VtState>> {
+    return {status:'ok',value:structuredClone(this.state)};
+  }
+  async prepare(event: import('./stream-contract').InputEvent) { return this.stage(this.state,event); }
+  async restore(state: import('./stream-contract').VtState, identity?: import('./stream-contract').StreamIdentity) { return this.stage(state,undefined,identity); }
+  private async stage(state: import('./stream-contract').VtState, event?: import('./stream-contract').InputEvent, identity?: import('./stream-contract').StreamIdentity): Promise<import('./stream-contract').Result<importCaptureVtTransaction>> {
+    const generation = this.generation;
+    const r = await this.rpc.transaction({state:structuredClone(state),identity:event?.identity ?? identity ?? this.frame.identity,
+      geometry:state.geometry,scrollOnClear:this.scrollOnClear,screenRevision:this.frame.screenRevision + (event ? 1 : 0),
+      ...(event ? {event} : {})});
+    if (r.status !== 'ok') return r;
+    const candidate=structuredClone(r.value);
+    if (Buffer.byteLength(JSON.stringify(candidate))*2 > 2*1024*1024)
+      return {status:'busy',reason:'pressure',retryAfterMs:10};
+    let finished=false;
+    return {status:'ok',value:{frame:candidate.frame,scrolls:candidate.scrolls,
+      snapshot:async()=>({status:'ok',value:structuredClone(candidate.state)}),
+      install:()=>{
+        if (finished || generation!==this.generation) throw new Error('stale VT transaction');
+        finished=true; this.generation++; this.state=candidate.state; this.frame=candidate.frame;
+      },discard:()=>{finished=true;}}};
+  }
+}
+import type { CaptureVt as importCaptureVt, CaptureVtTransaction as importCaptureVtTransaction } from './capture-engine';
