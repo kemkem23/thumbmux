@@ -705,3 +705,119 @@ describe('NEWARCH C bounded repair decoder', () => {
     expect(() => [...invalid.write(new Uint8Array([0xff])), ...invalid.end()]).toThrow();
   });
 });
+
+import { StreamCaptureWatchdog } from '../src/history-watchdog';
+import { PipeVtWorker, type PipeVtUpdate } from '../src/pipe-vt-worker';
+import { StreamCaptureEngine, type CapturePorts, type CaptureVtTransaction } from '../src/capture-engine';
+import type { HistoryEngine, InputEvent, LiveFrame } from '../src/stream-contract';
+
+describe('NEWARCH C watchdog and packet ordinals', () => {
+  test('quiet source stays healthy; pending ACK/source stall fires at 500ms, once', () => {
+    let now = 0; const reasons: string[] = [];
+    const watchdog = new StreamCaptureWatchdog(() => now, reason => reasons.push(reason));
+    now = 10000; watchdog.tick(); expect(reasons).toEqual([]);
+    watchdog.submitted(1); now += 499; watchdog.tick(); expect(reasons).toEqual([]);
+    now++; watchdog.tick(); watchdog.tick(); expect(reasons).toEqual(['ack-timeout']);
+    watchdog.ack(1); watchdog.sourceProgress(1); watchdog.sourceProgress(2);
+    now += 500; watchdog.tick(); expect(reasons).toEqual(['ack-timeout', 'stalled-input']);
+    watchdog.receive(10); watchdog.reset(); watchdog.submitted(2);
+    expect(reasons.at(-1)).toBe('sequence');
+  });
+  test('real VT worker keeps per-packet scroll ordinal across coalesced output', async () => {
+    const updates: PipeVtUpdate[] = []; const faults: string[] = [];
+    const worker = new PipeVtWorker({ cols: 8, rows: 2,
+      onUpdate: update => { updates.push(update); }, onFault: fault => faults.push(fault.message) });
+    try {
+      await worker.start(); expect(worker.setScrollOnClear(false)).toBe(true);
+      expect(worker.feed(1, Buffer.from('a\r\nb\r\nc\r\nd\r\n'))).toBe(true);
+      expect(worker.feed(2, Buffer.from('e\r\nf\r\n'))).toBe(true);
+      const drained = await worker.close(); expect(drained.unknownTail).toBe(false);
+      const scrolls = updates.flatMap(update => update.scrolls);
+      expect(scrolls.length).toBeGreaterThan(0);
+      for (const seq of [1, 2]) {
+        const rows = scrolls.filter(row => row.packetSeq === seq);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.map(row => row.scrollOrdinal)).toEqual(rows.map((_, i) => i));
+        expect(rows.every(row => row.packetEpoch === 1)).toBe(true);
+      }
+      expect(faults).toEqual([]);
+    } finally { await worker.close(); }
+  }, 10000);
+});
+
+// State-machine fixture only: this fake VT is NOT a bytecut/alt/reflow oracle
+// and fake H is NOT evidence for durable storage. Real adapters remain required.
+function cEngineFixture() {
+  let installs = 0, appends = 0, journals = 0, denyAppend = false;
+  const initial: LiveFrame = { ...cFrame(), head: 0, revision: 0, durableRevision: 0 };
+  const history = {
+    async journalInput(event: InputEvent) {
+      journals++;
+      return { status: 'ok', value: { kind: 'durable-input', pane: cPane, through: event.position,
+        digest: event.digest, segmentId: `input-${event.position.packetSeq}` } };
+    },
+    async appendFinalized(request: any) {
+      if (denyAppend) return { status: 'busy', reason: 'pressure', retryAfterMs: 10 };
+      appends++;
+      return { status: 'ok', value: { kind: 'ram', eventId: request.eventId, digest: request.digest,
+        revision: request.expectedRevision + 1, head: request.rows.at(-1).id.lineId + 1 } };
+    },
+  } as unknown as HistoryEngine;
+  const ports: CapturePorts = {
+    identity: cIdentity, initial, history, now: () => 100,
+    admission: new CaptureAdmission(), scratch: new CaptureAdmission(33554432),
+    vt: {
+      prepare: async event => ({ status: 'ok', value: {
+        frame: { ...cFrame(), identity: event.identity }, scrolls: [cRow(0)],
+        install: () => { installs++; }, discard: () => {},
+      } satisfies CaptureVtTransaction }),
+      snapshot: async () => ({ status: 'error', code: 'unsupported', message: 'fixture has no VT codec' }),
+      restore: async () => ({ status: 'error', code: 'unsupported', message: 'fixture has no VT codec' }),
+      screen: cFrame,
+    },
+    visible: async (_identity, tail) => { expect(tail).toBe(0); return { status: 'ok', value: cFrame() }; },
+    repairChunks: async function* () {},
+    syncRepair: async () => { throw new Error('fixture repair not implemented'); }, verifyRepair: async () => false,
+  };
+  return { engine: new StreamCaptureEngine(ports), ports,
+    counts: () => ({ installs, appends, journals }), pressure: (value: boolean) => { denyAppend = value; } };
+}
+function cInput(seq: number): InputEvent {
+  const body = { identity: cIdentity, position: { sourceEpoch: 1, packetSeq: seq },
+    receivedAtMonoMs: 1, payload: { kind: 'bytes' as const, bytes: [65] } };
+  return { ...body, digest: captureDigest(body) };
+}
+describe('NEWARCH C capture state machine (adapter fixture)', () => {
+  test('accepted input publishes once and retry does not replay VT', async () => {
+    const f = cEngineFixture(); const frames: LiveFrame[] = [];
+    f.engine.subscribe(cPane, frame => frames.push(frame));
+    expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect(f.counts()).toEqual({ installs: 1, appends: 1, journals: 2 });
+    expect(frames).toHaveLength(1); expect(frames[0]!.head).toBe(1);
+    expect(frames[0]!.durableRevision).toBe(0);
+    expect(f.ports.admission.heldBytes).toBe(0);
+  });
+  test('append pressure retains journaled input; next packet is refused before journal', async () => {
+    const f = cEngineFixture(); f.pressure(true);
+    expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect(f.counts()).toEqual({ installs: 0, appends: 0, journals: 1 });
+    expect((await f.engine.acceptInput(cInput(2))).status).toBe('busy');
+    expect(f.counts().journals).toBe(1);
+    expect(f.ports.admission.heldBytes).toBe(262144);
+    f.pressure(false); expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect(f.counts()).toEqual({ installs: 1, appends: 1, journals: 1 });
+    expect(f.ports.admission.heldBytes).toBe(0);
+  });
+  test('gap and bad digest prevent append; unsupported checkpoint never becomes a screen seed', async () => {
+    const f = cEngineFixture();
+    expect((await f.engine.acceptInput({ ...cInput(1), digest: 'bad' })).status).toBe('error');
+    expect(f.counts().journals).toBe(0);
+    await f.engine.acceptInput(cInput(1));
+    const checkpoint = await f.engine.checkpoint(cPane, 'handoff');
+    expect(checkpoint).toEqual({ status: 'error', code: 'unsupported', message: 'fixture has no VT codec' });
+    const episode = f.engine.fault('eof'); expect(episode.missingCount).toBeNull();
+    expect((await f.engine.acceptInput(cInput(2))).status).toBe('error');
+    expect(f.counts().appends).toBe(1);
+  });
+});
