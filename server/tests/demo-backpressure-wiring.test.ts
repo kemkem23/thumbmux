@@ -579,7 +579,7 @@ test('stream I rollback bridge: legacy reads join the frozen sh_* interval exact
     const frozen:ArchiveSegment={...seg,revision:0};
     await expect(reader.read(frozen,0,0,new AbortController().signal)).rejects.toThrow('newer than frozen');
     const realBefore=legacy.readBefore.bind(legacy);
-    legacy.readBefore=(s,b,l)=>({...realBefore(s,b,l),startLine:0}) as any;
+    legacy.readBefore=(s,b,l)=>{const p=realBefore(s,b,l);return{...p,startLine:p.startLine+1};};
     expect(()=>archive.readBefore('t',null,2)).toThrow('range fence');
     legacy.readBefore=realBefore;
     archive.dropSession!('t');expect(composite.catalog.paneForSession('t')).toBeNull();
@@ -715,11 +715,15 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
       {...owner(b),route:'legacy',generation:2,globalStart:bcp.head},{kind:'source-authoritative',reason:'tmux'},
       {kind:'source-eof',missingCount:null,reason:'eof'});
     catalogA.catalog.begin(c.identity.pane,'planned:1',1,'legacy');
-    // a: more input after its last checkpoint, then the process "dies": the
-    // copy below holds journal input with no checkpoint covering it.
-    await a.ingest(Buffer.from(Array.from({length:12},(_,i)=>`late${i}\r\n`).join('')));
+    // a: the process "dies" after H journaled input but before its checkpoint
+    // committed (injected at H's own transaction boundary). The copy below
+    // holds journal input that no checkpoint covers.
+    let crash1=true;
+    (runtime.history as any).options.boundary=(at:string)=>{if(crash1&&at==='checkpoint-before-write')throw Error('injected crash');};
+    await expect(a.ingest(Buffer.from(Array.from({length:12},(_,i)=>`late${i}\r\n`).join('')))).rejects.toThrow();
     for(const f of ['stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'])
       if(existsSync(join(root,f)))copyFileSync(join(root,f),join(crash,f));
+    crash1=false;
     const finalA=(await a.drain())!.head,oracleA=await oracleRows(a,finalA);
     catalogA.close();await runtime.close();
     const pre=new StreamArchiveRowReader(join(crash,'stream-history.sqlite'));
