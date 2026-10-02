@@ -493,3 +493,89 @@ export function decodeTmuxCaptureEvidence(raw: string, cols: number): {
   return { rows, complete: rows.every(row => row.cells !== null),
     uncertainRows: rows.flatMap((row, y) => row.cells !== null && !row.certain ? [y] : []) };
 }
+
+/** Stream-first repair decoder: state lives for ONE capture. This object never populates
+ * a pane's hot memo. Chunks transfer ownership to the consumer; the producer
+ * retains no previously yielded cell arrays. Capture-pane emits physical rows
+ * (no -J), which does not prove wrap metadata. It remains explicitly unknown. */
+export class StreamCaptureChunkDecoder {
+  private readonly utf8 = new TextDecoder('utf-8', { fatal: true });
+  private rawLine = ''; private line = '';
+  private state: SgrState = { fg: 'default', bg: 'default', style: 0 };
+  private previousWidth: 0 | 1 | 2 = 0; private promotion = false;
+  private escape: 'none' | 'intro' | 'csi' | 'osc' = 'none'; private oscEsc = false;
+  private openEscapeRow = false; private anyUncertain = false;
+  private done = false; private row = 0;
+  private chunk: { index: number; cells: readonly Readonly<TmuxObservedCell>[]; uncertain: boolean; softWrap: null; uncertainFields: readonly ['softWrap', 'wrapPad'] }[] = [];
+  private charged = 0;
+  readonly maxRows = 256;
+  constructor(readonly cols: number, readonly maxRowBytes = 65536, private charge: (bytes: number) => void = () => {}) {
+    checkedCols(cols);
+    if (cols > 240 || !Number.isSafeInteger(maxRowBytes) || maxRowBytes < 1 || maxRowBytes > 65536)
+      throw new Error('stream capture geometry/row budget');
+  }
+  private decode() {
+    if (Buffer.byteLength(this.rawLine) > this.maxRowBytes) throw new Error('stream capture row byte budget exceeded');
+    const uncertain = AMBIGUOUS_EMOJI.test(this.rawLine);
+    this.anyUncertain ||= uncertain; this.openEscapeRow ||= !escapesCloseInLine(this.rawLine);
+    if (this.anyUncertain && this.openEscapeRow) throw new Error('ambiguous tmux emoji cell boundary');
+    const cells = (uncertain ? decodeUncertainLine(this.line, this.cols, this.state)
+      : decodeLine(this.line, this.cols, this.state)).map(cell => Object.freeze(cell));
+    this.rawLine = ''; this.line = '';
+    const result = { index: this.row++, cells, uncertain, softWrap: null, uncertainFields: ['softWrap', 'wrapPad'] as const };
+    return result;
+  }
+  private normalize(unit: string): string {
+    const cp = unit.codePointAt(0)!;
+    if (this.escape !== 'none') {
+      if (this.escape === 'intro') this.escape = cp === 0x5b ? 'csi' : cp === 0x5d ? 'osc' : 'none';
+      else if (this.escape === 'csi' && cp >= 0x40 && cp <= 0x7e) this.escape = 'none';
+      else if (this.escape === 'osc') {
+        if (cp === BEL || (this.oscEsc && cp === 0x5c)) this.escape = 'none';
+        this.oscEsc = cp === ESC;
+      }
+      return unit;
+    }
+    if (cp === ESC) { this.escape = 'intro'; this.oscEsc = false; return unit; }
+    if (cp === 10) { this.previousWidth = 0; this.promotion = false; return unit; }
+    if (cp === SO || cp === SI) return unit;
+    const width = cp >= 0x20 && cp < 0x7f ? 1 : charCellWidth(cp);
+    if (this.promotion && cp === 0x20) { this.promotion = false; return ''; }
+    if (this.promotion && width > 0) this.promotion = false;
+    if (cp === VS16 && this.previousWidth === 1) { this.previousWidth = 2; this.promotion = true; }
+    else if (width > 0) this.previousWidth = width;
+    return unit;
+  }
+  private *text(text: string): Generator<typeof this.chunk> {
+    for (const unit of text) {
+      const normalized = this.normalize(unit);
+      if (unit === '\n') {
+        yield* this.admit(this.decode());
+      } else { this.rawLine += unit; this.line += normalized; }
+      // Cheap code-unit bound followed by exact byte bound at each row.
+      if (this.rawLine.length * 3 > this.maxRowBytes && Buffer.byteLength(this.rawLine) > this.maxRowBytes) throw new Error('stream capture row byte budget exceeded');
+    }
+  }
+  private *admit(row: (typeof this.chunk)[number]): Generator<typeof this.chunk> {
+    // Charge the cell objects and strings conservatively, including the raw
+    // row and one next-row decode; do not use a 4 MiB prototype threshold.
+    const bytes = 256 + row.cells.reduce((n, c) => n + 256 + 8 * (c.grapheme.length + c.fg.length + c.bg.length), 0);
+    if (bytes > 1024 * 1024) throw new Error('capture row exceeds decode budget');
+    if (this.chunk.length && (this.chunk.length >= 256 || this.charged + bytes > 1024 * 1024)) {
+      const out = this.chunk; this.chunk = []; yield out; this.charged = 0; this.charge(0);
+    }
+    this.chunk.push(row); this.charged += bytes; this.charge(this.charged);
+  }
+  *write(bytes: Uint8Array): Generator<typeof this.chunk> {
+    if (this.done) throw new Error('stream capture decoder already ended');
+    if (bytes.byteLength > 65536) throw new Error('stream capture input chunk exceeds 64 KiB');
+    yield* this.text(this.utf8.decode(bytes, { stream: true }));
+  }
+  *end(): Generator<typeof this.chunk> {
+    if (this.done) throw new Error('stream capture decoder already ended');
+    this.done = true; yield* this.text(this.utf8.decode());
+    if (this.escape !== 'none') throw new Error('incomplete capture escape');
+    if (this.rawLine.length) yield* this.admit(this.decode());
+    if (this.chunk.length) { const out = this.chunk; this.chunk = []; yield out; this.charged=0; this.charge(0); }
+  }
+}
