@@ -1255,7 +1255,7 @@ test('contract collector retains oversize rows until sink accepts the exact even
   expect((collector as any).oversizeDrops).toBe(0);
 });
 
-test('contract maximum geometry checkpoint uses compact full buffers and reuses scratch Worker', () => {
+test('contract maximum geometry checkpoint uses compact full buffers and reuses scratch Worker', async () => {
   const script = String.raw`
 import importlib.util,sys,json
 spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
@@ -1273,10 +1273,27 @@ for _ in range(10):
     assert m.checkpoint_transaction(request)==r
     assert m._transaction_scratch is scratch
 assert m.Worker.from_checkpoint(m.decode_extension(state['extensionState'])).export_checkpoint()==w.export_checkpoint()
-print('240x80 normal+alternate exact restore; one scratch Worker for repeated RPC')
+print(json.dumps({'state':state,'frame':r['frame']}))
 `;
   const r = Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
   expect(r.exitCode,r.stderr.toString()).toBe(0);
+  const native=JSON.parse(r.stdout.toString());
+  const dir=mkdtempSync(join(tmpdir(),'native-max-contract-'));
+  const path=join(dir,'history.sqlite');
+  let history=new StreamHistoryEngine({path,codecVersions:[native.state.codecVersion]});
+  try {
+    const f=cEngineFixture(), frame={...native.frame,identity:cIdentity};
+    f.ports.vt.prepare=async()=>({status:'ok',value:{frame,scrolls:[],install(){},discard(){}}});
+    f.ports.vt.snapshot=async()=>({status:'ok',value:native.state});
+    const engine=new StreamCaptureEngine({...f.ports,history,initial:{...frame,head:0,revision:0,durableRevision:0}});
+    expect((await engine.acceptInput(cInput(1))).status).toBe('ok');
+    const cp=await engine.checkpoint(cPane,'handoff');
+    expect(cp.status).toBe('ok');
+    history.close();history=new StreamHistoryEngine({path,codecVersions:[native.state.codecVersion]});
+    const recovery=history.recover(cPane,null,{isCancelled:()=>false})[Symbol.asyncIterator]();
+    expect((await recovery.next()).value).toMatchObject({status:'ok',value:{kind:'checkpoint',checkpoint:{state:native.state}}});
+    await recovery.return?.();
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('contract RPC allocation reuses a Worker across distinct packets', () => {

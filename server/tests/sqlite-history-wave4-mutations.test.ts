@@ -198,20 +198,25 @@ test('contract repair mutants go red then restored real seams go green', async (
       from:'return {"rows": [],',to:'return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char), row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],'},
   ];
   try {
-    mkdirSync(join(root,'server'),{recursive:true});
-    cpSync(join(pkg,'server/src'),join(root,'server/src'),{recursive:true});
-    cpSync(join(pkg,'server/tests'),join(root,'server/tests'),{recursive:true});
+    const target=join(root,'packages/thumbmux');
+    mkdirSync(target,{recursive:true});
+    cpSync(join(pkg,'server/src'),join(target,'server/src'),{recursive:true});
+    cpSync(join(pkg,'server/tests'),join(target,'server/tests'),{recursive:true});
+    cpSync(join(pkg,'core/src'),join(target,'core/src'),{recursive:true});
+    const bundle=join(root,'docs/tasks/newarch-spike2/bundle');
+    mkdirSync(bundle,{recursive:true});
+    cpSync(resolve(pkg,'../../docs/tasks/newarch-spike2/bundle'),bundle,{recursive:true});
     const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});
     cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
     writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root,'package.json'),'{"type":"module"}');
     for(const m of mutations) {
-      const file=join(root,'server/src',m.file),original=readFileSync(file,'utf8');
+      const file=join(target,'server/src',m.file),original=readFileSync(file,'utf8');
       expect(original.includes(m.from)).toBe(true);
       let mutant=original.replace(m.from,m.to);
       if(m.from2) {expect(mutant.includes(m.from2)).toBe(true);mutant=mutant.replace(m.from2,m.to2!);}
       const run=async()=>{
-        const child=Bun.spawn([process.execPath,'test',`./server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
+        const child=Bun.spawn([process.execPath,'test',`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
           {cwd:root,stdout:'pipe',stderr:'pipe'});
         const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
         return {exit,output:out+err};

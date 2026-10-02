@@ -759,6 +759,7 @@ test('contract final repair rows stay fenced until repaired checkpoint commits a
     const body={episode:gap,chunkId:'final',expectedRevision:1,rows:shAppend(2).rows,final:true};
     const receipt=shOk(await f.engine.commitRepair({...body,digest:streamDigest('repair',body)}));
     expect(receipt.complete).toBe(false);
+    expect(f.engine.beginGap(gap).status).toBe('ok');
     f.reopen();
     expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({status:'stale',reason:'late-gap'});
     const checkpoint={...first.checkpoint,checkpointId:'repaired',previousCheckpointId:first.checkpoint.checkpointId,
