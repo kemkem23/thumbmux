@@ -1040,7 +1040,7 @@ async function realPipeRig(historyLimit:number,{register=true,bLines=30,cLines=2
   if(register)setLegacyWriterKick(kick);
   await host.start();
   const identityOf=(name:string)=>{const [,pane,pid]=ids(name);
-    return{pane:{serverIdentity:`${server.socket}#${stamp}`,paneId:pane,birthGeneration:Number(pid)},sourceEpoch:1,geometryGeneration:0};};
+    return{pane:{serverIdentity:`${server.socket}#${stamp}`,paneId:pane!,birthGeneration:Number(pid)},sourceEpoch:1,geometryGeneration:0};};
   const identity=identityOf('s');
   const attach=async(name='s')=>{
     const pane=await host.runtime.add(identityOf(name),{columns:12,rows:3},streamPorts);pane.stopCadence();
