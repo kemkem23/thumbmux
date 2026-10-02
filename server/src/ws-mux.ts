@@ -454,6 +454,8 @@ export class TmuxWsMux<
   private projection: MuxProjectionSource | null;
   /** Projection change subscriptions of routed sessions with viewers. */
   private projectionWatches = new Map<string, () => void>();
+  /** Allocated only for async history; a rejoined socket is a new consumer. */
+  private projectedHistoryLifetimes = new WeakMap<WS, Map<string, object>>();
   /** newarch-frame-v1 of the last projected snapshot sent per session. */
   private lastNewarch = new Map<string, NewarchFrameMeta>();
   private projectionRouteOff: (() => void) | null = null;
@@ -603,6 +605,7 @@ export class TmuxWsMux<
       this.subscribers.set(session, set);
     }
 
+    this.projectedHistoryLifetimes.get(ws)?.delete(session);
     set.add(ws);
     this.projection?.setViewers?.(session, set.size);
     // Tail mode (thumbnails): stream only the last N lines to this socket.
@@ -728,6 +731,7 @@ export class TmuxWsMux<
   }
 
   unsubscribe(session: string, ws: WS, client?: unknown) {
+    this.projectedHistoryLifetimes.get(ws)?.delete(session);
     this.hooks.onUnsubscribe?.(session, ws, client);
     this.tails.get(session)?.delete(ws);
     this.forgetOutputViewer(session, ws);
@@ -744,6 +748,7 @@ export class TmuxWsMux<
   }
 
   unsubscribeAll(ws: WS) {
+    this.projectedHistoryLifetimes.delete(ws);
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
     this.sessionListClients.delete(ws);
@@ -1789,13 +1794,21 @@ export class TmuxWsMux<
   private sendProjectedHistoryAsync(session: string, ws: WS, result: PromiseLike<unknown>): void {
     const generation = this.projection?.routeGeneration(session);
     const subscribers = this.subscribers.get(session);
+    let lifetimes = this.projectedHistoryLifetimes.get(ws);
+    if (!lifetimes) this.projectedHistoryLifetimes.set(ws, lifetimes = new Map());
+    let lifetime = lifetimes.get(session);
+    if (!lifetime) lifetimes.set(session, lifetime = {});
+    const current = () => this.projection?.owns(session)
+      && this.projection.routeGeneration(session) === generation
+      && this.subscribers.get(session) === subscribers && subscribers?.has(ws)
+      && this.projectedHistoryLifetimes.get(ws)?.get(session) === lifetime;
     void Promise.resolve(result).then(page => {
-      if (!this.projection?.owns(session) || this.projection.routeGeneration(session) !== generation
-        || this.subscribers.get(session) !== subscribers || !subscribers?.has(ws)) return;
+      if (!current()) return;
       this.wsSend(ws, JSON.stringify({channel: session, type: 'history', data: JSON.stringify(boundProjectedHistoryPage(page))}));
     }).catch(error => {
+      if (!current()) return;
       this.reportArchiveReadErrorBestEffort('readBefore', session, error);
-      if (this.subscribers.get(session)?.has(ws)) this.sendHistoryReadErrorBestEffort(session, ws);
+      this.sendHistoryReadErrorBestEffort(session, ws);
     });
   }
 

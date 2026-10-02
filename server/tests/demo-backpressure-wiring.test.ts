@@ -131,3 +131,44 @@ test('stream I viewer admission is global across panes and releases on disconnec
   expect(b.stats().display.attachedViewers).toBe(STREAM_BUDGET.panes);
  }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
 },30000);
+
+
+import { TmuxWsMux as SourceMux, type TmuxDriver, type MuxProjectionSource } from '../src/ws-mux';
+for (const completion of ['resolve','reject'] as const) {
+ for (const transition of ['route','rejoin','current'] as const) {
+  test(`stream I async history ${completion} is fenced across ${transition}`, async () => {
+   let resolve!: (page: unknown) => void, reject!: (error: Error) => void;
+   const pending = new Promise<unknown>((yes,no) => { resolve=yes; reject=no; });
+   let generation=1;
+   const projection: MuxProjectionSource = {
+    owns:()=>true, ownsPipe:()=>true, snapshot:()=>null, routeGeneration:()=>generation,
+    watch:()=>()=>{}, onRouteChange:()=>()=>{}, readBefore:()=>pending, readAfter:()=>pending,
+   };
+   const driver: TmuxDriver = {
+    listSessions:()=>[], capturePane:async()=>'', sendKeys:()=>{}, getSessionActivity:()=>new Map(),
+    getHistoryLimit:()=>0, setSessionHistoryLimit:()=>{}, resizeWindow:()=>{}, hash:s=>s,
+   };
+   const messages: Array<{type:string;data:string}>=[];
+   const ws={send:(raw:string)=>{messages.push(JSON.parse(raw));return raw.length;}};
+   const keeper={send:(raw:string)=>raw.length};
+   const mux=new SourceMux({driver,projection,logError:()=>{}});
+   try {
+    mux.subscribe('pane',keeper); mux.subscribe('pane',ws);
+    mux.expandHistory('pane',ws,null,20);
+    if(transition==='route')generation++;
+    if(transition==='rejoin'){mux.unsubscribe('pane',ws);mux.subscribe('pane',ws);}
+    if(completion==='resolve')resolve({lines:['current row'],startLine:0,hasMore:false});
+    else reject(Error('history read failed'));
+    // Drain both the success callback and its rejection handler, without timers.
+    await Promise.resolve();await Promise.resolve();await Promise.resolve();
+    const replies=messages.filter(m=>m.type==='history'||m.type==='error');
+    expect(replies).toHaveLength(transition==='current'?1:0);
+    if(transition==='current') {
+     expect(replies[0]!.type).toBe(completion==='resolve'?'history':'error');
+     if(completion==='resolve')expect(JSON.parse(replies[0]!.data).lines).toEqual(['current row']);
+     else expect(replies[0]!.data).toBe('history_temporarily_unavailable');
+    }
+   } finally { mux.unsubscribeAll(ws);mux.unsubscribeAll(keeper);mux.stop(); }
+  });
+ }
+}
