@@ -402,9 +402,11 @@ test('stream I archive catalog publishes only committed intervals, resumes decis
     const first = (await pane.drain())!;
     expect(first.head).toBeGreaterThan(0);
     catalog.begin(identity,'forward',1,'stream');
-    const middle = {pane:identity,route:'stream' as const,generation:2,globalStart:first.head,localStart:first.head,root:'stream-B',schema:'sh-v1'};
+    const middle = {pane:identity,route:'stream' as const,generation:2,globalStart:first.head,localStart:0,root:'stream-B',schema:'sh-v1'};
     expect(() => catalog.prepare(identity,'forward',first,middle,'screenshot')).toThrow('full-state');
     catalog.prepare(identity,'forward',first,middle,first.stateDigest);
+    expect(() => catalog.begin(identity,'conflicting',1,'stream')).toThrow();
+    expect(catalog.pending(identity)?.id).toBe('forward');
     expect(catalog.segmentAt(identity,0)).toBeNull();
     expect(catalog.owner(identity)).toEqual(initial);
     catalog.close(); catalog = new StreamArchiveCatalog(join(root,'catalog.sqlite'));
@@ -416,12 +418,19 @@ test('stream I archive catalog publishes only committed intervals, resumes decis
     const second = (await pane.drain())!;
     catalog.begin(identity,'rollback',2,'legacy');
     const suffix = {...middle,route:'legacy' as const,generation:3,globalStart:second.head,localStart:second.head,root:'legacy-C',schema:'fixture'};
-    catalog.prepare(identity,'rollback',second,suffix,second.stateDigest);
+    // Only this backend-local head is synthetic; native VT state and the
+    // SQLite row oracle below are unchanged. This exercises a nonzero offset.
+    const localSecond = {...second,head:second.head-first.head};
+    catalog.prepare(identity,'rollback',localSecond,suffix,second.stateDigest);
     catalog.commit(identity,'rollback');
     expect(() => catalog.begin(identity,'other',2,'stream')).toThrow('CAS');
     expect(() => catalog.begin(identity,'rollback',1,'legacy')).toThrow('collision');
     expect(catalog.segmentAt(identity,first.head)?.root).toBe('stream-B');
     expect(catalog.segmentAt(identity,second.head)).toBeNull(); // live screen isn't archived
+    catalog.begin(identity,'abort-me',3,'stream'); catalog.abort(identity,'abort-me');
+    expect(catalog.pending(identity)).toBeNull();
+    expect(() => catalog.commit(identity,'abort-me')).toThrow('not prepared');
+    expect(() => catalog.abort(identity,'rollback')).toThrow('committed');
     const route = {viewerId:'archive-oracle',identity:pane.identity,routeGeneration:3};
     expect((await pane.attach(route,()=>{})).status).toBe('ok');
     const page = await pane.page(route,{requestId:'archive-oracle',identity:pane.identity,routeGeneration:3,
@@ -431,8 +440,10 @@ test('stream I archive catalog publishes only committed intervals, resumes decis
     await pane.detach(route.viewerId);
     let retired = 0;
     const reader: ArchiveRangeReader = {
-      read: async (_segment,line,cell) => {
-        const row = rows.get(line)!;
+      read: async (segment,line,cell) => {
+        const globalLine = segment.globalStart + line - segment.localStart;
+        const original = rows.get(globalLine)!;
+        const row = {...original,id:{...original.id,lineId:line}};
         const end = Math.min(cell+2,row.cells.length);
         return {fragment:{row:{...row,cells:row.cells.slice(cell,end)},startCell:cell,endCell:end,complete:cell===0&&end===row.cells.length},rowEnd:end===row.cells.length};
       },
