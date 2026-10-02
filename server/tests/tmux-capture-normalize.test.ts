@@ -1055,3 +1055,53 @@ test('NEWARCH C atomic expansion failure is explicit and never durably admitted'
   expect(f.ports.admission.heldBytes).toBe(0);
   expect(f.ports.scratch.heldBytes).toBe(0);
 });
+
+// Round 4: atomic VT output pages, independent of source-byte packetization.
+test('NEWARCH C atomic clear streams exact rows with a byte cap and replayable continuation', () => {
+  const script=String.raw`
+import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+w=m.Worker(80,80);w.screen.scroll_on_clear=True
+w.feed(1,1,b'\r\n'.join(bytes([65+y%26])*80 for y in range(80)));w.scrolls=[]
+state=w.contract_state()
+for data in [b'\x1b[2J',b'\x1b[80S',b'\x1bc']:
+    oracle=m.Worker.from_checkpoint(json.loads(state['extensionState']))
+    oracle.feed(2,1,data)
+    expected=[m.contract_row(x['row'],x['wrap'],x['pad']) for x in oracle.scrolls]
+    request={'state':state,'identity':identity,'geometry':state['geometry'],'scrollOnClear':True,'screenRevision':1,
+      'event':{'identity':identity,'position':{'sourceEpoch':1,'packetSeq':2},'payload':{'kind':'bytes','bytes':list(data)}},
+      'rowStream':{'startOrdinal':0,'maxBytes':65536}}
+    actual=[];pages=0
+    while True:
+        page=m.checkpoint_transaction(request)
+        assert page==m.checkpoint_transaction(request), 'retry must reproduce the same page'
+        assert page['startOrdinal']==len(actual)
+        assert page['nextOrdinal']==len(actual)+len(page['scrolls'])
+        assert page['chargedBytes']<=65536
+        assert len(json.dumps(page['scrolls'],ensure_ascii=False,separators=(',',':')).encode())*4<=65536
+        actual.extend(page['scrolls']);pages+=1
+        if page['complete']:
+            assert page['state']==oracle.contract_state()
+            break
+        assert 'state' not in page and 'frame' not in page
+        assert page['nextOrdinal']>request['rowStream']['startOrdinal']
+        request['rowStream']['startOrdinal']=page['nextOrdinal']
+    assert actual==expected and pages>1, (len(actual),len(expected),pages)
+    assert state==w.contract_state(), 'source checkpoint mutated'
+# The collector must bypass Worker.scrolls altogether, even inside one CSI.
+original=m.Worker._on_scroll
+m.Worker._on_scroll=lambda *args: (_ for _ in ()).throw(AssertionError('whole-packet collector called'))
+request['rowStream']['startOrdinal']=0
+assert not m.checkpoint_transaction(request)['complete']
+m.Worker._on_scroll=original
+for cap in [0,8,524289]:
+    request['rowStream']={'startOrdinal':0,'maxBytes':cap}
+    try: m.checkpoint_transaction(request)
+    except (ValueError,m.CaptureExpansionPressure): pass
+    else: raise AssertionError('invalid/undersized cap accepted')
+print('atomic clear/scroll/reset: exact rows, replay, no whole-packet collector, per-page cap=65536')
+`;
+  const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
+},30000);
