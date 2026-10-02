@@ -783,8 +783,8 @@ import { readFileSync, readdirSync, statSync, mkdirSync as mkdirSyncFs } from 'n
 import { finalizeStreamOwners, ARCHIVE_CATALOG_VERSION } from '../../../../src/integrations/stream-archive-bridge';
 const fixturePane=(id:string)=>({serverIdentity:'/fixture.sock#S1',paneId:id,birthGeneration:7});
 /** Load a catalog dumped by the real v1 code (see the fixture header). */
-function v1Catalog(dir:string,name:'pre-r5'|'r5'):string{
-  const path=join(dir,`${name}.sqlite`),db=new Database(path,{create:true});
+function v1Catalog(dir:string,name:'pre-r5'|'r5',copy='a'):string{
+  const path=join(dir,`${name}-${copy}.sqlite`),db=new Database(path,{create:true});
   db.exec(readFileSync(join(import.meta.dir,'fixtures',`stream-archive-catalog-v1-${name}.sql`),'utf8'));db.close();
   return path;
 }
@@ -832,7 +832,7 @@ test('stream I catalog v1 artifacts from round 4 and round 5 open, migrate once,
       new StreamArchiveCatalog(path).close();
     }
     // A corrupt v1 row aborts the migration and leaves the artifact as it was.
-    const path=v1Catalog(dir,'pre-r5');
+    const path=v1Catalog(dir,'pre-r5','corrupt');
     const db=new Database(path);db.query("UPDATE sa_owner SET digest='00' WHERE instr(pane,'\"%2\"')>0").run();db.close();
     const before=readFileSync(path);
     expect(()=>new StreamArchiveCatalog(path)).toThrow('checksum');
