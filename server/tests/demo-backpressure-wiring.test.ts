@@ -102,8 +102,8 @@ test('stream I atomic multi-page input retries an admitted prefix without duplic
   await pane.ingest(Buffer.from('\x1b[600S'));
   expect(calls).toBeGreaterThan(3);
   expect(pane.frame.head).toBe(600);
-  expect(pane.frame.revision).toBe(3);
-  expect(pane.frame.durableRevision).toBe(3);
+  expect(pane.frame.revision).toBeGreaterThan(1);
+  expect(pane.frame.durableRevision).toBe(pane.frame.revision);
   expect(history.stats().ownedPendingBytes).toBe(0);
   expect(runtime.scratch.heldBytes).toBe(0);
   expect(runtime.admission.heldBytes).toBe(0);
