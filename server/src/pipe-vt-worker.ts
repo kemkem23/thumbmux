@@ -46,6 +46,10 @@ export const PIPE_VT_ATTR = {
 } as const;
 
 export type PipeVtScroll = {
+  /** Event that finalized this row, distinct from its original write seq. */
+  packetEpoch?: number;
+  packetSeq?: number | null;
+  scrollOrdinal?: number | null;
   row: PipeVtRow;
   /** Row continues into the next physical row (soft wrap). */
   wrap: boolean;
@@ -715,6 +719,17 @@ export class PipeVtWorker {
     payload.writeUInt16BE(rows, 2);
     payload.writeUInt32BE(geometryGeneration >>> 0, 4);
     return this.write([header("Z", 8), payload]);
+  }
+
+  /** Stream-first resize is ordered in the SAME namespace as byte packets.
+   * Legacy resize remains available; its output is not a v1 event proof. */
+  resizePacket(seq: number, epoch: number, cols: number, rows: number, generation: number): boolean {
+    if (![seq, epoch, generation, cols, rows].every(n => Number.isSafeInteger(n) && n >= 0)
+      || seq < 1 || cols < 1 || rows < 1 || cols > 240 || rows > 80 || generation > 0xffffffff) return false;
+    const payload = Buffer.allocUnsafe(24);
+    payload.writeBigUInt64BE(BigInt(seq), 0); payload.writeBigUInt64BE(BigInt(epoch), 8);
+    payload.writeUInt16BE(cols, 16); payload.writeUInt16BE(rows, 18); payload.writeUInt32BE(generation, 20);
+    return this.write([header("V", payload.length), payload]);
   }
 
   requestFull(seq: number): boolean {

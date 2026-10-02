@@ -526,6 +526,8 @@ class Worker:
         stream_type = type("TmuxByteStream", (pyte.ByteStream,), {"csi": {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}, "events": pyte.ByteStream.events | {"scroll_up", "scroll_down"}})
         self.stream = stream_type(self.screen)
         self.gen = 0
+        self.packet_seq = 0
+        self.scroll_ordinal = 0
         self.scrolls = []
         self.seq_from = None
         self.seq_to = None
@@ -560,6 +562,9 @@ class Worker:
         # from the last emitted frame is exactly its content.
         clean = 0 not in s.dirty and not self.full
         self.scrolls.append({
+            "packetEpoch": s.epoch,
+            "packetSeq": self.packet_seq,
+            "scrollOrdinal": self.scroll_ordinal if self.packet_seq is not None else None,
             "row": encode_row(row, s.columns, s.default_char),
             "wrap": row_wrapped(row),
             "pad": row_padded(row, s.columns),
@@ -568,11 +573,15 @@ class Worker:
             "epoch": getattr(row, "epoch", s.epoch),
         })
 
+        self.scroll_ordinal += 1
+
     def feed(self, seq, epoch, data, rx=None, more=False):
         """Feed one D frame, or its first slice when `more` slices follow.
 
         Returns False when the rest of the frame must be dropped (SIXEL).
         """
+        self.packet_seq = seq
+        self.scroll_ordinal = 0
         self.screen.epoch = epoch
         self.screen.receive_seq = seq
         if self.seq_from is None:
@@ -746,6 +755,7 @@ def dispatch(worker, kind, payload, rx=None):
     elif kind == b"C":
         worker.screen.scroll_on_clear = bool(payload[0])
     elif kind == b"X":
+        worker.packet_seq = None
         worker.screen.preserve_on_clear()
         if worker.pending():
             worker.emit()
@@ -756,7 +766,21 @@ def dispatch(worker, kind, payload, rx=None):
         worker.seq_to = old.seq_to
         worker.emitted_seq = old.emitted_seq
         worker.emit()
+    elif kind == b"V":
+        seq, epoch, cols, rows, gen = struct.unpack(">QQHHI", payload)
+        if not (0 < seq <= 9007199254740991 and epoch <= 9007199254740991
+                and 0 < cols <= 240 and 0 < rows <= 80):
+            raise ValueError("stream resize identity/geometry budget")
+        worker.packet_seq = seq
+        worker.scroll_ordinal = 0
+        worker.screen.epoch = epoch
+        worker.screen.receive_seq = seq
+        if worker.seq_from is None:
+            worker.seq_from = seq
+        worker.seq_to = seq
+        worker.resize(cols, rows, gen)
     elif kind == b"Z":
+        worker.packet_seq = None
         worker.resize(*struct.unpack(">HHI", payload[:8]))
     elif kind == b"F":
         worker.full = True

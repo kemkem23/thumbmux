@@ -41,6 +41,10 @@ import {
 export type PaneKey = { serverIdentity: string; paneId: string; birthGeneration: number };
 
 export type PipeScrollEvent = {
+  /** Additive v1 event identity; absent on legacy worker output. */
+  packetEpoch?: number;
+  packetSeq?: number | null;
+  scrollOrdinal?: number | null;
   paneKey: PaneKey;
   sourceEpoch: number;
   geometryGeneration: number;
@@ -762,6 +766,7 @@ export class PipeHistoryCollector {
     try {
       const scrolls = update.scrolls.map((scroll) => ({ paneKey: this.paneKey, sourceEpoch: scroll.epoch,
         geometryGeneration: scroll.gen, physicalRow: scroll.row,
+        packetEpoch: scroll.packetEpoch, packetSeq: scroll.packetSeq, scrollOrdinal: scroll.scrollOrdinal,
         softWrap: scroll.wrap, wrapPad: scroll.pad, receiveSeq: scroll.seq ?? this.ackedSeq }));
       const receipt = this.offerScrolls(scrolls, 0);
       if (isReceipt(receipt)) return Promise.resolve(receipt).then(publish).catch(rejected);
