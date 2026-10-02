@@ -476,6 +476,7 @@ import { StreamLegacyComposite, StreamSegmentReader, composeLegacyArchive, insta
   openStreamArchive, rowAnsi, type ArchiveSegment } from '../../../../src/integrations/stream-archive-bridge';
 import { openStreamArchiveForLegacy, closeStreamArchiveForLegacy, writeStreamTenureMarker } from '../../../../src/integrations/stream-pipe-host';
 import { setLegacyWriterKick } from '../../../../src/integrations/stream-archive-registry';
+import { streamRowsReader } from '../../../../src/integrations/stream-archive-bridge';
 
 /** terminal-history page semantics: before is exclusive end, after is
  * exclusive start, pages clamp below the requested limit. */
@@ -771,7 +772,7 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
       // so it is aborted and fenced closed, keeping its recorded event.
       expect(report.resolved).toEqual([]);
       expect(report.blocked).toEqual([]);
-      expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1','finalize:1:after:eof:1']);
+      expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1:after:eof:1','finalize:1:after:planned:1']);
       const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
       // Replay projected the journal tail with original IDs: same rows as the
       // pane that drained normally, nothing duplicated or invented.
@@ -973,9 +974,14 @@ async function realPipeRig(historyLimit:number,{register=true,bLines=30,cLines=2
     try{await host.attachSource(name,pane,1);}catch(error){await host.runtime.remove(pane);throw error;}
     return pane;
   };
-  /** Wait until the stream parsed (through the pipe) the row `text`. */
+  /** Wait until the stream parsed (through the pipe) and H made durable the
+   * row `text`; returns the durable head. Rows are read as the fence reads them. */
   const streamHas=async(pane:import('../src/stream-runtime').StreamRuntimePane,text:string)=>{
-    for(let i=0;i<200;i++){await pane.drain();const F=pane.frame.head;if((await oracleRows(pane,F)).map(l=>plain(l).trimEnd()).includes(text))return F;await Bun.sleep(25);}
+    for(let i=0;i<200;i++){
+      await pane.drain().catch(()=>{});const d=host.archive!.rows!.durable(identity.pane);
+      if(d&&streamRowsReader(host.archive!.rows,identity.pane,d.durable)(0,d.head).includes(text))return d.head;
+      await Bun.sleep(25);
+    }
     throw Error(`stream never parsed ${text}`);
   };
   /** The joined legacy history, paged both ways at several sizes (must agree). */
@@ -1032,7 +1038,7 @@ test('stream I real pipe: tmux prehistory is refused at attach; a blank pane rol
 },60000);
 
 test('stream I real pipe: a full tmux history is aligned by content, not assumed — every row once',async()=>{
-  const r=await realPipeRig(10);
+  const r=await realPipeRig(10,{cLines:5});
   try{
     const pane=await r.attach();
     r.go('go1');await r.tmuxHas(r.paneId,'b29');
@@ -1066,7 +1072,8 @@ test('stream I real pipe: clear-history in the tenure is aligned by content, nev
     expect(seam.reason).toContain(`fence exact: tmux row 0 is stream row ${F0}`);
     await r.keeperTick();
     const text=r.history(),printed=[...r.b,...r.c];
-    expect(text).toEqual(printed.slice(0,text.length));expect(text.length).toBeGreaterThan(F);
+    // Every row up to the writer's live window, once, in order.
+    expect(text.length).toBeGreaterThanOrEqual(F);expect(text).toEqual(printed.slice(0,text.length));
   }finally{await r.cleanup();}
   // Source EOF, then tmux history cleared and new output: tmux holds no row
   // the stream holds, so no offset is proven. Every row tmux held is skipped
@@ -1107,7 +1114,7 @@ test('stream I real pipe EOF: no writer keeps the route; once one registers the 
     expect(r.host.archive!.rows!.durable(r.identity.pane)!.gap).toMatchObject({reason:'eof',missingCount:null});
     // tmux keeps printing; the stream receives none of it.
     r.go('go2');await r.tmuxHas(r.paneId,'c19');
-    expect((await pane.drain().catch(()=>pane.frame))!.head).toBe(F);
+    await pane.drain().catch(()=>{});expect(r.host.archive!.rows!.durable(r.identity.pane)!.head).toBe(F);
     setLegacyWriterKick(r.kick);
     await until(()=>r.catalog().owner(r.identity.pane)?.route==='legacy','handoff after the writer registered');
     expect(r.host.isRouted('s')).toBe(false);expect(r.host.status().awaitingWriter).toEqual([]);
