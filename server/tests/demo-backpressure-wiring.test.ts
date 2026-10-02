@@ -335,3 +335,31 @@ test('stream I RPC retirement waits for a late pool acquire and lease release',a
  await Promise.resolve();await Promise.resolve();expect(destroyed).toBe(true);expect(retired).toBe(false);
  release();await retirement;expect(await started).toBe(true);expect(retired).toBe(true);
 });
+
+test('stream I bootstrap cannot reconstruct pending parser state from identical visible rows',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-bootstrap-evidence-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try {
+  const a=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const b=await runtime.add({...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%2'}},{columns:20,rows:4},streamPorts);
+  a.stopCadence();b.stopCadence();
+  await a.ingest(Buffer.from('BASE\x1b[3'));
+  await b.ingest(Buffer.from('BASE\x1b[4'));
+  const visible=(pane:typeof a)=>({rows:pane.frame.changedRows,cursor:pane.frame.cursor,
+   geometry:pane.frame.geometry,buffer:pane.frame.buffer,head:pane.frame.head});
+  // A stable screenshot, cursor, geometry and retained-row count cannot
+  // distinguish these states. The differing prefix predates a newly opened
+  // pipe, so receive-side sequence numbers cannot supply it either.
+  expect(visible(a)).toEqual(visible(b));
+  const ca=await a.drain(),cb=await b.drain();
+  expect(ca).not.toBeNull();expect(cb).not.toBeNull();
+  expect(ca!.state).not.toEqual(cb!.state);
+  await a.ingest(Buffer.from('1mX'));
+  await b.ingest(Buffer.from('1mX'));
+  const cell=(pane:typeof a)=>pane.frame.changedRows[0]!.content.cells[4]!;
+  expect(cell(a).text).toBe('X');expect(cell(b).text).toBe('X');
+  expect(cell(a).style).toContain(31);
+  expect(cell(b).style).toContain(41);
+  expect(cell(a)).not.toEqual(cell(b));
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},10000);
