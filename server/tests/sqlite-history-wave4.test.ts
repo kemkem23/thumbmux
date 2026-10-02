@@ -309,3 +309,119 @@ describe('wave 4 reader canary', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+// Stream-first K v1: separate opt-in database; never mounts a production route.
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
+import type { AppendFinalized, InputEvent, Result, VtCheckpoint } from '../src/stream-contract';
+const shPane = { serverIdentity: 'stream-fixture', paneId: '%1', birthGeneration: 1 };
+const shIdentity = { pane: shPane, sourceEpoch: 1, geometryGeneration: 1 };
+function shOk<T>(result: Result<T>): T {
+  if (result.status !== 'ok') throw new Error(JSON.stringify(result));
+  return result.value;
+}
+function shInput(seq = 1): InputEvent {
+  const data = { identity: shIdentity, position: { sourceEpoch: 1, packetSeq: seq }, receivedAtMonoMs: 0,
+    payload: { kind: 'bytes' as const, bytes: [65, 10] } };
+  return { ...data, digest: streamDigest('input', data) };
+}
+function shAppend(seq = 1, text = 'ก'): AppendFinalized {
+  const eventId = { pane: shPane, sourceEpoch: 1, packetSeq: seq, scrollOrdinal: 0 };
+  const geometry = { columns: 80, rows: 24 };
+  const row = { id: { pane: shPane, lineId: seq - 1 }, source: eventId, revision: seq,
+    geometryGeneration: 1, geometry, cells: [{ text, width: 1 as const, style: [] }],
+    softWrap: false, wrapPad: 0, uncertainFields: [] };
+  const data = { identity: shIdentity, eventId, expectedRevision: seq - 1, rows: [row], receivedAtMonoMs: 0,
+    frameDelta: { identity: shIdentity, screenRevision: seq, buffer: 'normal' as const, geometry,
+      changedRows: [], cursor: { x: 0, y: 0, visible: true }, overlap: null } };
+  return { ...data, digest: streamDigest('append', data) };
+}
+async function shCheckpoint(engine: StreamHistoryEngine, seq = 1, previous: string | null = null) {
+  const inputFence = shOk(await engine.journalInput(shInput(seq)));
+  const cursor = { x: 0, y: 0, visible: true };
+  const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+  const state = { codecVersion: 'fixture-v1', geometry: { columns: 80, rows: 24 }, normal: buffer,
+    alternate: buffer, active: 'normal' as const, modes: {}, margins: { top: 0, bottom: 23, left: 0, right: 79 },
+    tabStops: [], pendingUtf8: [224], pendingEscape: [27], attributes: [], wrapPending: false, extensionState: '{}' };
+  const checkpoint: VtCheckpoint = { kind: 'vt-recovery', checkpointId: `cp-${seq}`, previousCheckpointId: previous,
+    identity: shIdentity, inputFence, revision: seq, head: seq, state,
+    stateDigest: streamDigest('vt-state', { identity: shIdentity, state }) };
+  const data = { checkpoint, expectedRevision: seq, commitId: `commit-${seq}` };
+  return engine.commitCheckpoint({ ...data, digest: streamDigest('checkpoint', data) });
+}
+function shFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'stream-h-'));
+  const path = join(dir, 'stream.sqlite');
+  let engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+  return { get engine() { return engine; }, path,
+    reopen() { engine.close(); engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] }); },
+    cleanup() { engine.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+const shCancel = { isCancelled: () => false };
+async function shView(engine: StreamHistoryEngine, end = 1, requestId = 'view') {
+  return shOk(await engine.grantReadView({ requestId, identity: shIdentity, routeGeneration: 1,
+    range: { start: 0, end }, deadlineMonoMs: performance.now() + 1000 }));
+}
+describe('stream-first H frozen contract', () => {
+  test('durable ACK survives reopen; input and append retries remain exact and unique', async () => {
+    const f = shFixture();
+    try {
+      const input = shOk(await f.engine.journalInput(shInput()));
+      const ram = shOk(await f.engine.appendFinalized(shAppend()));
+      const durable = shOk(await shCheckpoint(f.engine));
+      expect(f.engine.stats().pendingBytes).toBe(0);
+      f.reopen();
+      expect(shOk(await f.engine.journalInput(shInput()))).toEqual(input);
+      expect(shOk(await f.engine.appendFinalized(shAppend()))).toEqual(ram);
+      expect(shOk(await shCheckpoint(f.engine))).toEqual(durable);
+      const view = await shView(f.engine);
+      const ack = shOk(await f.engine.openReadView(view));
+      const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+      expect(page.fragments.map(x => x.row.cells.map(c => c.text).join(''))).toEqual(['ก']);
+      const recovered = [];
+      for await (const item of f.engine.recover(shPane, null, shCancel)) recovered.push(shOk(item));
+      expect(recovered[0]?.kind).toBe('checkpoint');
+      if (recovered[0]?.kind === 'checkpoint') expect(recovered[0].checkpoint.state.pendingUtf8).toEqual([224]);
+      expect(f.engine.stats().diskCacheConfigBytes).toBeLessThanOrEqual(12582912);
+    } finally { f.cleanup(); }
+  });
+  test('same key with changed content is integrity failure without changing head', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      expect((await f.engine.appendFinalized(shAppend(1, 'wrong'))).status).toBe('error');
+      expect((await shView(f.engine)).headAtGrant).toBe(1);
+    } finally { f.cleanup(); }
+  });
+  test('grant freezes RAM overlay across later durable commits; forged ACK rejected', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      const view = await shView(f.engine);
+      const ack = shOk(await f.engine.openReadView(view));
+      shOk(await shCheckpoint(f.engine));
+      shOk(await f.engine.journalInput(shInput(2)));
+      shOk(await f.engine.appendFinalized(shAppend(2, 'new')));
+      shOk(await shCheckpoint(f.engine, 2, 'cp-1'));
+      const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+      expect(page.fragments).toHaveLength(1);
+      expect(page.view.headAtGrant).toBe(1);
+      expect((await f.engine.readPage({ ...ack, diskSnapshotRevision: 999 }, null, 500, shCancel)).status).toBe('stale');
+    } finally { f.cleanup(); }
+  });
+  test('cancel releases pins immediately and busy never masquerades as EOF', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      const view = await shView(f.engine);
+      expect((await f.engine.grantReadView({ ...view, requestId: 'second' })).status).toBe('busy');
+      const ack = shOk(await f.engine.openReadView(view));
+      expect((await f.engine.readPage(ack, null, 500, { isCancelled: () => true })).status).toBe('cancelled');
+      expect(f.engine.stats().pins).toBe(0);
+    } finally { f.cleanup(); }
+  });
+});
