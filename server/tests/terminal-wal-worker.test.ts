@@ -2292,3 +2292,18 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
     await settle(pane);
   }, 30_000);
 });
+
+for (const terminator of ["\x07", "\x1b\\"]) test(`repair r2 OSC52 100 KiB keeps pane and surrounding rows (${JSON.stringify(terminator)})`, async () => {
+  const pane = await collectPane(80, 3);
+  const pid = pane.collector.workerPid;
+  pane.collector.ingest(encoder.encode("before\r\n\x1b]52;c;" + "A".repeat(70 * 1024)));
+  await settle(pane);
+  pane.collector.ingest(encoder.encode("A".repeat(30 * 1024) + terminator + "after\r\nlast\r\nend\r\n"));
+  await settle(pane);
+  expect(pane.collector.workerPid).toBe(pid);
+  expect(pane.collector.health()).toBe("ok");
+  expect(pane.faults).toEqual([]);
+  const text = [...pane.collector.ringSnapshot().map(e => rowText(e.physicalRow).trimEnd()), ...screenRows(pane).map(r => r.text)].join("\n");
+  expect(text).toContain("before"); expect(text).toContain("after"); expect(text).toContain("last"); expect(text).toContain("end");
+  expect(text).not.toContain("AAAA");
+});

@@ -134,10 +134,14 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
       // Same raw shape as the rainbow flag (VS16, pad, ZWJ) but tmux agrees: must still decode.
       '\u2764\ufe0f\u200d\u{1f525}x'];
     const ambiguous = new Set(['👩‍💻🇹🇭👍🏽❤️', '\u{1f1f9}\u{1f1ed}\u{1f1fa}x', '\u{1f3f3}\ufe0f\u200d\u{1f308}x', '\u{1f9d1}\u{1f3fb}\u200d\u{1f91d}\u200d\u{1f9d1}\u{1f3ff}x', '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}\u{1f3fd}x']);
+    const panes = cases.map((text, i) => {
+      const path = join(root, `text-${i}`); writeFileSync(path, text);
+      const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; tmux -S '${socket}' wait-for -S ready-${i}; sleep 5`).trim();
+      return pane;
+    });
     for (let i = 0; i < cases.length; i++) {
-      const path = join(root, `text-${i}`); writeFileSync(path, cases[i]!);
-      const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; sleep 5`).trim();
-      await new Promise(resolve => setTimeout(resolve, 100));
+      tmux('wait-for', `ready-${i}`);
+      const pane = panes[i]!;
       const raw = tmux('capture-pane', '-p', '-e', '-N', '-t', pane);
       const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
       if (ambiguous.has(cases[i]!)) {
@@ -1243,7 +1247,7 @@ test('contract collector retains oversize rows until sink accepts the exact even
   const offered: unknown[] = [];
   let allow = false;
   // Drive the real collector admission path without opening a live parser.
-  const collector = new PipeHistoryCollector({ paneKey: cPane, sourceEpoch: 1, cols: 80, rows: 24,
+  const collector = new PipeHistoryCollector({ paneKey: cPane, sourceEpoch: 1, cols: 80, rows: 24, retainOversize: true,
     ports: { onScroll(event: unknown) { offered.push(event); return allow ? undefined : {accepted:false,reason:'ingest-oversize'}; }, onFrame() {}, onFault() {} },
   } as any);
   const event = {receiveSeq:1};
@@ -1311,5 +1315,26 @@ for seq in range(1,11):
 assert r['frame']['changedRows'][0]['content']['cells'][0]['text']=='A'
 `;
   const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
+});
+
+test('repair r2 oversized OSC checkpoint resumes discard until split ST then normal text', () => {
+  const script = String.raw`
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+w=m.Worker(80,3);w.screen.scroll_on_clear=False
+w.feed(1,1,b'before\r\n\x1b]52;c;'+b'A'*(70*1024))
+assert w.stream.discard_sequence=='osc'
+assert w.stream.pending_bytes==0
+w=m.Worker.from_checkpoint(w.export_checkpoint())
+w.feed(2,1,b'A'*(30*1024)+b'\x1b')
+w=m.Worker.from_checkpoint(w.export_checkpoint())
+w.feed(3,1,b'\\after')
+assert w.stream.discard_sequence==''
+assert w.stream.discarded_sequences==1
+assert w.screen.display[0].strip()=='before'
+assert w.screen.display[1].strip()=='after'
+`;
+  const r = Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
   expect(r.exitCode,r.stderr.toString()).toBe(0);
 });

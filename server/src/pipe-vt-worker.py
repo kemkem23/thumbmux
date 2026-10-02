@@ -574,16 +574,38 @@ class CheckpointByteStream(pyte.ByteStream):
 
     def __init__(self, screen):
         self.pending_sequence = ""
+        self.pending_bytes = 0
+        self.discard_sequence = ""
+        self.discard_esc = False
+        self.discarded_sequences = 0
         super().__init__(screen)
 
     def _send_to_parser(self, data):
-        # Only the unfinished escape prefix survives. Plain text stays on the
-        # original fast path. A pathological OSC/CSI fails before unbounded RAM.
-        if len(self.pending_sequence.encode("utf-8")) + len(data.encode("utf-8")) > 65536:
-            raise ValueError("pending escape exceeds checkpoint budget")
+        # Oversized controls are ignored through their terminator, never handed
+        # back as visible text. Reset pyte to release its own partial payload.
+        if not self.discard_sequence and self.pending_bytes + len(data.encode("utf-8")) > 65536:
+            prefix = self.pending_sequence
+            self.discard_sequence = "osc" if prefix.startswith(("\x1b]", "\x9d")) else "csi"
+            self.discard_esc = prefix.endswith("\x1b")
+            self.discarded_sequences += 1
+            self.pending_sequence = ""
+            self.pending_bytes = 0
+            self._initialize_parser()
+        if self.discard_sequence:
+            done = data in ("\x18", "\x1a") or (
+                self.discard_sequence == "osc" and (data in ("\x07", "\x9c") or (self.discard_esc and data == "\\"))) or (
+                self.discard_sequence == "csi" and "@" <= data <= "~")
+            self.discard_esc = data == "\x1b"
+            if done:
+                self.discard_sequence = ""
+                self.discard_esc = False
+            return done
         self.pending_sequence += data
+        self.pending_bytes += len(data.encode("utf-8"))
         result = super()._send_to_parser(data)
-        if result: self.pending_sequence = ""
+        if result:
+            self.pending_sequence = ""
+            self.pending_bytes = 0
         return result
 
 
@@ -616,6 +638,7 @@ class Worker:
                  "geometry": {"columns": self.screen.columns, "rows": self.screen.lines},
                  "screen": pack_state(fields), "utf8": [list(pending), flag],
                  "escape": self.stream.pending_sequence, "useUtf8": self.stream.use_utf8,
+                 "discard": [self.stream.discard_sequence, self.stream.discard_esc, self.stream.discarded_sequences],
                  "worker": {k: getattr(self, k) for k in ("gen", "packet_seq", "scroll_ordinal",
                      "dcs_state", "dcs_sixel", "dcs_intermediate")}}
         if len(encode_extension(state).encode()) > 1024 * 1024:
@@ -641,6 +664,8 @@ class Worker:
         # restore the full screen. CSI embedded controls are not applied twice.
         w.screen.scroll_on_clear = False
         pyte.Stream.feed(w.stream, state["escape"])
+        w.stream.discard_sequence, w.stream.discard_esc, w.stream.discarded_sequences = state.get("discard", ["", False, 0])
+        if w.stream.discard_sequence: w.stream._taking_plain_text = False
         w.screen.__dict__.update(unpack_state(state["screen"], w.screen))
         if (w.screen.columns, w.screen.lines) != (g["columns"], g["rows"]):
             raise ValueError("checkpoint geometry mismatch")
