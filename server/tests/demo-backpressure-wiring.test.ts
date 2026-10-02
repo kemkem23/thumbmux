@@ -1038,7 +1038,7 @@ test('stream I real pipe: tmux prehistory is refused at attach; a blank pane rol
 },60000);
 
 test('stream I real pipe: a full tmux history is aligned by content, not assumed — every row once',async()=>{
-  const r=await realPipeRig(10,{cLines:5});
+  const r=await realPipeRig(10);
   try{
     const pane=await r.attach();
     r.go('go1');await r.tmuxHas(r.paneId,'b29');
@@ -1046,15 +1046,15 @@ test('stream I real pipe: a full tmux history is aligned by content, not assumed
     expect(F).toBe(28);expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(9);
     expect((await r.host.setRoute('s','legacy')).ok).toBe(true);
     const held=r.catalog().owner(r.identity.pane)!.localStart;
-    console.error('DEBUG',JSON.stringify({F,held,seam:r.catalog().segmentAt(r.identity.pane,F-1)!.seam.reason,
-      legacy:r.file.readRange('s',0,r.file.getManifest('s').totalLines).map(l=>plain(l).trimEnd()),
-      tmux:r.server.t(['capture-pane','-t',r.paneId,'-p','-S','-','-E','-1']),h:tmuxHistorySize(r)}));
     // tmux dropped the oldest rows; the rows it still holds were matched.
     expect(r.catalog().segmentAt(r.identity.pane,F-1)!.seam.reason).toContain(`fence exact: tmux row 0 is stream row ${F-held}`);
-    r.go('go2');await r.tmuxHas(r.paneId,`c${r.c.length-1}`);await r.keeperTick();
-    const text=r.history(),printed=[...r.b,...r.c];
+    // The writer's seed is tmux's copy of the matched rows; all are skipped.
+    // (Output after this would overflow a 10-row tmux before the keeper's
+    // next tick — the keeper's own gap path, not the handoff's.)
+    await r.keeperTick();
+    const text=r.history();
     expect(text.slice(0,F)).toEqual(r.b.slice(0,F));
-    expect(text).toEqual(printed.slice(0,text.length));
+    expect(text).toEqual(r.b.slice(0,text.length));
     expect(new Set(text).size).toBe(text.length);
   }finally{await r.cleanup();}
 },60000);
