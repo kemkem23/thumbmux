@@ -617,6 +617,10 @@ export class StreamHistoryEngine implements HistoryEngine {
         if (expired) { yield { status: 'error', code: 'deadline', message: 'recovery deadline' }; return; }
         if (cancelled || cancel.isCancelled()) { yield { status: 'cancelled', reason: 'recovery cancelled' }; return; }
         const row = this.readRow(reader, pane, head++);
+        // A staged prefix (I streaming mode) is above the durable fence: it is
+        // re-derived from the journal below under the same event IDs, and H
+        // returns each staged receipt again. It is not a committed repair row.
+        if (this.options.stagePrefixesOnDisk && row.revision > state.durable) break;
         const receiptRow = reader.query("SELECT receipt FROM sh_commit WHERE pane=? AND revision>=? ORDER BY revision LIMIT 1").get(key, row.revision) as SqlRow | null;
         if (!receiptRow) throw Error('row without durable receipt');
         yield ok({ kind: 'rows', rows: [row], receipt: JSON.parse(String(receiptRow.receipt)) });
