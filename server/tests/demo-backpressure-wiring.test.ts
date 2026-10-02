@@ -819,7 +819,8 @@ test('stream I catalog v1 artifacts from round 4 and round 5 open, migrate once,
         // committed, the live tenure frozen, the old interval untouched.
         const report=await finalizeStreamOwners(catalog,null,{kind:'restart',missingCount:null,reason:'boot'});
         expect(report).toEqual({finalized:['finalize:1'],resolved:['eof:1'],blocked:[]});
-        expect(catalog.segmentAt(fixturePane('%3'),0)).toMatchObject({globalEnd:4,seam:{kind:'source-eof'}});
+        expect(catalog.segmentAt(fixturePane('%3'),0)).toMatchObject({globalEnd:4,handoffId:'eof:1',
+          seam:name==='pre-r5'?{kind:'planned',missingCount:null}:{kind:'source-eof',missingCount:null}});
         expect(catalog.streamOwners()).toEqual([]);
         if(name==='r5')expect(catalog.paneForSession('s1')).toEqual(fixturePane('%1'));
       }finally{catalog.close();}
@@ -929,8 +930,8 @@ async function realLegacyRollback(historyLimit:number,afterHandoff:number){
     appendLines:(s:string,l:string[])=>file.appendLines(s,l),appendMarker:(s:string,x:string)=>file.appendLines(s,[x]),warn:()=>{},
   };
   const root=join(dir,'root');mkdirSyncFs(root);
-  const rig=await r5Host(root,{legacyLines:s=>legacyArchivedLines(s)!,
-    startLegacyWriter:async s=>{await runHistoryKeeperTick(deps,{session:s});}} as any);
+  const rig=await r5Host(root,{legacyLines:(s:string)=>legacyArchivedLines(s)!,
+    startLegacyWriter:async(s:string)=>{await runHistoryKeeperTick(deps,{session:s});}} as any);
   const fake=(rig.host as any).tmux;
   (rig.host as any).tmux=(args:string[])=>args.at(-1)==='#{history_size} #{history_limit}'
     ?{exitCode:0,stderr:'',stdout:server.t(['display-message','-p','-t',paneId,'#{history_size} #{history_limit}'])}:fake(args);
