@@ -602,3 +602,106 @@ describe('SPIKE2 shared scratch admission', () => {
     expect(ledger.stats.high[1]).toBeLessThanOrEqual(SCRATCH_CAPS[1]);
   });
 });
+
+
+// Lot C: these tests are committed before the implementation. Execute only
+// after the exclusive host lease ends; lease-deferred is NOT a red result.
+import { CaptureAdmission, CaptureTail, exactVisibleVerdict, uniqueCaptureSeam,
+  captureDigest } from '../src/capture-engine';
+import { StreamCaptureChunkDecoder } from '../src/tmux-capture-normalize';
+import type { FinalizedRow, FrameDelta } from '../src/stream-contract';
+
+const cPane = { serverIdentity: 'lot-c', paneId: '%1', birthGeneration: 1 };
+const cIdentity = { pane: cPane, sourceEpoch: 1, geometryGeneration: 1 };
+const cRow = (lineId: number, text = `row-${lineId}`): FinalizedRow => ({
+  id: { pane: cPane, lineId }, revision: lineId + 1,
+  source: { pane: cPane, sourceEpoch: 1, packetSeq: lineId + 1, scrollOrdinal: 0 },
+  geometryGeneration: 1, geometry: { columns: 80, rows: 24 },
+  cells: [{ text, width: 1, style: [] }], softWrap: false, wrapPad: 0, uncertainFields: [],
+});
+const cFrame = (): FrameDelta => ({ identity: cIdentity, screenRevision: 1,
+  buffer: 'normal', geometry: { columns: 80, rows: 24 }, cursor: { x: 0, y: 0, visible: true },
+  overlap: null, changedRows: [{ y: 0, content: cRow(0) }],
+});
+
+describe('NEWARCH C admission, immutable tail and exact evidence', () => {
+  test('reservation refuses before mutation and is released exactly once', () => {
+    const budget = new CaptureAdmission(10);
+    const release = budget.reserve(7)!;
+    expect(budget.reserve(4)).toBeNull(); expect(budget.heldBytes).toBe(7);
+    release(); release(); expect(budget.heldBytes).toBe(0);
+    expect(() => budget.reserve(NaN)).toThrow();
+  });
+  test('tail never evicts undurable rows; 257th row waits for durable ACK', () => {
+    const tail = new CaptureTail();
+    expect(tail.append(Array.from({ length: 256 }, (_, i) => cRow(i)))).toBe(true);
+    expect(tail.append([cRow(256)])).toBe(false);
+    expect(tail.rows.length).toBe(256);
+    tail.durable(256);
+    expect(tail.append([cRow(256)])).toBe(true);
+    expect(tail.rows[0]!.id.lineId).toBe(1);
+    expect(tail.heldBytes).toBeLessThanOrEqual(1048576);
+    const copy = tail.rows;
+    expect(Object.isFrozen(copy[0]!.cells)).toBe(true);
+    expect(() => { (copy[0]!.cells[0] as any).text = 'mutated'; }).toThrow();
+  });
+  test('byte cap is independent of row cap and refusal is atomic', () => {
+    const tail = new CaptureTail();
+    expect(tail.append([cRow(0)])).toBe(true);
+    expect(tail.append([cRow(1, 'x'.repeat(1048576))])).toBe(false);
+    expect(tail.rows.map(r => r.id.lineId)).toEqual([0]);
+    expect(() => tail.durable(-1)).toThrow();
+  });
+  test('exact screen check rejects uncertainty, movement, identity and wrap mismatches', () => {
+    const frame = cFrame();
+    expect(exactVisibleVerdict(frame, frame, 4, 4)).toBe('equal');
+    expect(exactVisibleVerdict(frame, frame, 4, 5)).toBe('unfenced');
+    const other = structuredClone(frame) as any;
+    other.changedRows[0].content.softWrap = true;
+    expect(exactVisibleVerdict(frame, other, 4, 4)).toBe('different');
+    other.changedRows[0].content.uncertainFields = ['wrap'];
+    expect(exactVisibleVerdict(frame, other, 4, 4)).toBe('unfenced');
+    other.identity.sourceEpoch = 2;
+    expect(exactVisibleVerdict(frame, other, 4, 4)).toBe('unfenced');
+  });
+  test('ordered anchors must be unique, never guessed from repeated rows', () => {
+    expect(uniqueCaptureSeam(['a', 'b'], ['x', 'a', 'b', 'c'])).toBe(3);
+    expect(() => uniqueCaptureSeam(['a'], ['a', 'a'])).toThrow('ambiguous');
+    expect(() => uniqueCaptureSeam(['a'], ['b'])).toThrow();
+    expect(() => uniqueCaptureSeam(['a'], Array(5013).fill('b'))).toThrow();
+  });
+  test('canonical digest includes identity and is independent of object key order', () => {
+    expect(captureDigest({ a: 1, b: 2 })).toBe(captureDigest({ b: 2, a: 1 }));
+    expect(captureDigest(cIdentity)).not.toBe(captureDigest({ ...cIdentity, sourceEpoch: 2 }));
+    expect(() => captureDigest({ a: NaN })).toThrow();
+  });
+});
+
+describe('NEWARCH C bounded repair decoder', () => {
+  test('every byte cut of UTF8/SGR matches whole capture with no missing rows', () => {
+    const raw = Buffer.from('\x1b[31mไทย 漢\nsecond\n');
+    const oracle = decodeTmuxCaptureRows(raw.toString(), 20);
+    for (let cut = 0; cut <= raw.length; cut++) {
+      const decoder = new StreamCaptureChunkDecoder(20);
+      const chunks = [...decoder.write(raw.subarray(0, cut)), ...decoder.write(raw.subarray(cut)), ...decoder.end()];
+      expect(chunks.flat().map(r => r.cells)).toEqual(oracle);
+    }
+  });
+  test('777 rows preserve order and chunks never exceed 256 rows / 1 MiB', () => {
+    const decoder = new StreamCaptureChunkDecoder(80);
+    const chunks = [...decoder.write(Buffer.from('line\n'.repeat(777))), ...decoder.end()];
+    expect(chunks.flat()).toHaveLength(777);
+    expect(chunks.flat().map(r => r.index)).toEqual(Array.from({ length: 777 }, (_, i) => i));
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(256);
+      expect(Buffer.byteLength(JSON.stringify(chunk))).toBeLessThanOrEqual(1048576);
+    }
+  });
+  test('unsupported/incomplete escape and oversized input do not become EOF', () => {
+    expect(() => [...new StreamCaptureChunkDecoder(80).write(new Uint8Array(65537))]).toThrow();
+    const decoder = new StreamCaptureChunkDecoder(80);
+    expect(() => [...decoder.write(Buffer.from('\x1b[31')), ...decoder.end()]).toThrow();
+    const invalid = new StreamCaptureChunkDecoder(80);
+    expect(() => [...invalid.write(new Uint8Array([0xff])), ...invalid.end()]).toThrow();
+  });
+});
