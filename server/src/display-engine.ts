@@ -21,6 +21,8 @@ import {
 type Release = () => void;
 
 export interface DisplayEngineOptions {
+  /** Stream runtime opt-in: contention may use the full request deadline. */
+  readonly retryUntilDeadline?: boolean;
   readonly capture: CaptureEngine;
   readonly history: HistoryEngine;
   readonly observer?: StreamObserver;
@@ -183,6 +185,7 @@ type WaitResult<T> = { readonly kind: "value"; readonly value: T }
 
 export class StreamDisplayEngine implements DisplayEngine {
   private readonly capture: CaptureEngine;
+  private readonly retryUntilDeadline: boolean;
   private readonly history: HistoryEngine;
   private readonly observer: StreamObserver | undefined;
   private readonly now: () => number;
@@ -197,6 +200,7 @@ export class StreamDisplayEngine implements DisplayEngine {
   private wsPendingBytes = 0;
 
   constructor(options: DisplayEngineOptions) {
+    this.retryUntilDeadline = options.retryUntilDeadline ?? false;
     this.capture = options.capture;
     this.history = options.history;
     this.observer = options.observer;
@@ -403,7 +407,7 @@ export class StreamDisplayEngine implements DisplayEngine {
     cancel: CancelToken,
     route: ViewerRoute,
   ): Promise<Result<T>> {
-    for (let attempt = 0; attempt <= STREAM_BUDGET.maxReadRetries; attempt++) {
+    for (let attempt = 0; this.retryUntilDeadline || attempt <= STREAM_BUDGET.maxReadRetries; attempt++) {
       if (!this.routeIsCurrent(route)) return staleRoute();
       if (cancel.isCancelled()) return cancelled();
       if (this.now() >= deadlineMonoMs) return deadline();
@@ -411,8 +415,8 @@ export class StreamDisplayEngine implements DisplayEngine {
       if (waited.kind === "failure") return waited.failure;
       if (waited.kind === "throw") return { status: "error", code: "io", message: "display history read failed" };
       const result = waited.value;
-      if (result.status !== "busy" || attempt === STREAM_BUDGET.maxReadRetries) return result;
-      const pause = Math.min(result.retryAfterMs, deadlineMonoMs - this.now());
+      if (result.status !== "busy" || (!this.retryUntilDeadline && attempt === STREAM_BUDGET.maxReadRetries)) return result;
+      const pause = Math.min(Math.max(1, result.retryAfterMs), deadlineMonoMs - this.now());
       if (pause > 0) {
         const delayed = await this.waitFor(new Promise<void>(resolve => setTimeout(resolve, pause)), deadlineMonoMs, cancel, route);
         if (delayed.kind === "failure") return delayed.failure;

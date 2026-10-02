@@ -103,9 +103,39 @@ export class StreamRuntime {
   history: StreamHistoryEngine | null = null;
   private panes = new Map<string, StreamRuntimePane>();
   private closing = false;
+  private sharedDisplay: StreamDisplayEngine | null = null;
+  private viewerSlots = new Map<string, StreamRuntimePane>();
   constructor(readonly options: StreamRuntimeOptions) {
     this.pool = options.pool ?? new PipeVtPool({ python: options.python });
   }
+  displayEngine(): StreamDisplayEngine {
+    if (!this.sharedDisplay) {
+      const lookup = (key: StreamIdentity['pane']) => {
+        const pane = this.panes.get(JSON.stringify(key));
+        if (!pane) throw Error('stream pane no longer attached'); return pane;
+      };
+      const capture: import('./stream-contract').CaptureEngine = {
+        acceptInput: event => lookup(event.identity.pane).capture.acceptInput(event),
+        checkpoint: (pane, reason) => lookup(pane).capture.checkpoint(pane, reason),
+        restore: (checkpoint, input) => lookup(checkpoint.identity.pane).capture.restore(checkpoint, input),
+        checkVisible: identity => lookup(identity.pane).capture.checkVisible(identity),
+        repair: (episode, cancel) => lookup(episode.pane).capture.repair(episode, cancel),
+        drain: (pane, deadline) => lookup(pane).capture.drain(pane, deadline),
+        subscribe: (key, listener) => {
+          const pane = lookup(key), off = pane.capture.subscribe(key, listener);
+          listener(pane.frame); return off;
+        },
+      };
+      this.sharedDisplay = new StreamDisplayEngine({capture, history: this.history!, observer: this.options.observer, retryUntilDeadline: true});
+    }
+    return this.sharedDisplay;
+  }
+  reserveViewer(id: string, owner: StreamRuntimePane): boolean {
+    if (this.viewerSlots.has(id)) return this.viewerSlots.get(id) === owner;
+    if (this.viewerSlots.size >= B.panes) return false;
+    this.viewerSlots.set(id, owner); return true;
+  }
+  releaseViewer(id: string): void { this.viewerSlots.delete(id); }
   async add(identity: StreamIdentity, geometry: Geometry, ports: StreamPanePorts, scrollOnClear = false): Promise<StreamRuntimePane> {
     const key = JSON.stringify(identity.pane);
     if (this.closing || this.panes.has(key) || this.panes.size >= B.panes) throw Error('stream pane admission');
@@ -117,7 +147,10 @@ export class StreamRuntime {
       this.history ??= new StreamHistoryEngine({ path: this.options.path, codecVersions: [state.codecVersion], stagePrefixesOnDisk: true });
       const pane = new StreamRuntimePane(this, rpc, vt, identity, ports);
       this.panes.set(key, pane);
-      try { await pane.recover(); } catch (error) { this.panes.delete(key); throw error; }
+      try {
+        await pane.recover();
+        if (pane.frame.geometry.columns !== geometry.columns || pane.frame.geometry.rows !== geometry.rows) await pane.resize(geometry);
+      } catch (error) { this.panes.delete(key); throw error; }
       return pane;
     } catch (error) { await rpc.close(); throw error; }
   }
@@ -158,14 +191,7 @@ export class StreamRuntimePane {
       now: () => performance.now(), observer: this.runtime.options.observer,
       cancelOperation: async signal => { await Promise.all([this.ports.cancelOperation(signal), this.rpc.retire()]); }});
     this.capture.subscribe(this.identity.pane, frame => { this.frame = frame; this.identity = frame.identity; });
-    // K subscribe has no snapshot call; this adapter delivers a current frame
-    // after registering, so quiet panes do not wait for the next byte.
-    const capture = this.capture;
-    const source = Object.create(capture) as StreamCaptureEngine;
-    source.subscribe = (pane, listener) => {
-      const release = capture.subscribe(pane, listener); listener(this.frame); return release;
-    };
-    this.display = new StreamDisplayEngine({ capture: source, history: this.runtime.history!, observer: this.runtime.options.observer });
+    this.display = this.runtime.displayEngine();
   }
   async recover(): Promise<void> {
     const recovery = this.runtime.history!.recover(this.identity.pane, null, {isCancelled: () => false})[Symbol.asyncIterator]();
@@ -238,13 +264,16 @@ export class StreamRuntimePane {
     this.chain = this.chain.then(() => this.event({kind: 'resize', geometry}));
     await this.chain;
     for (const route of this.viewers.values()) await this.display.detach(route, 'geometry changed');
+    for (const id of this.viewers.keys()) this.runtime.releaseViewer(id);
     this.viewers.clear();
   }
   async attach(route: ViewerRoute, onFrame: (frame: LiveFrame) => void): Promise<Result<LiveFrame>> {
-    if (!this.viewers.has(route.viewerId) && this.viewers.size >= B.panes) return {status:'busy',reason:'pressure',retryAfterMs:20};
+    if (!this.runtime.reserveViewer(route.viewerId, this)) return {status:'busy',reason:'pressure',retryAfterMs:20};
     this.viewers.set(route.viewerId, route);
-    const result = await this.display.attach(route, onFrame);
-    if (result.status !== 'ok') { await this.display.detach(route, 'attach failed'); this.viewers.delete(route.viewerId); }
+    const result = await this.display.attach(route, frame => {
+      try { onFrame(frame); } catch (error) { void this.detach(route.viewerId); throw error; }
+    });
+    if (result.status !== 'ok') { await this.display.detach(route, 'attach failed'); this.viewers.delete(route.viewerId); this.runtime.releaseViewer(route.viewerId); }
     return result;
   }
   page(route: ViewerRoute, request: ReadRequest, cursor: PageCursor | null, limit: number, cancel: CancelToken) {
@@ -252,7 +281,7 @@ export class StreamRuntimePane {
   }
   async detach(viewerId: string): Promise<void> {
     const route = this.viewers.get(viewerId); if (!route) return;
-    await this.display.detach(route, 'disconnect'); this.viewers.delete(viewerId);
+    await this.display.detach(route, 'disconnect'); this.viewers.delete(viewerId); this.runtime.releaseViewer(viewerId);
   }
   async drain(): Promise<VtCheckpoint | null> {
     await this.chain;

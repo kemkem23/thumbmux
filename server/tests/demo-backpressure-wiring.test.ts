@@ -109,3 +109,17 @@ test('stream I atomic multi-page input retries an admitted prefix without duplic
   expect(runtime.admission.heldBytes).toBe(0);
  }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
 },30000);
+
+test('stream I viewer admission is global across panes and releases on disconnect',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-viewers-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try{
+  const a=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const b=await runtime.add({...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%2'}},{columns:20,rows:4},streamPorts);
+  for(let i=0;i<STREAM_BUDGET.panes;i++)expect((await a.attach({viewerId:`v${i}`,identity:a.identity,routeGeneration:1},()=>{})).status).toBe('ok');
+  const route={viewerId:'overflow',identity:b.identity,routeGeneration:1};
+  expect((await b.attach(route,()=>{})).status).toBe('busy');
+  await a.detach('v0');expect((await b.attach(route,()=>{})).status).toBe('ok');
+  expect(b.stats().display.attachedViewers).toBe(STREAM_BUDGET.panes);
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},30000);
