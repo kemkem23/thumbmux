@@ -711,3 +711,33 @@ test('stream-first H canonical digest matches independent UTF-8 SHA-256 fixture'
   expect(streamDigest('input', { payload: input.payload, receivedAtMonoMs: input.receivedAtMonoMs,
     position: input.position, identity: input.identity })).toBe(shInput().digest);
 });
+
+// Repair regressions use the real SQLite transaction, including reopen.
+test('contract gap fences pending rows and persists them before repair', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    shOk(await f.engine.appendFinalized(shAppend()));
+    const gap = { episodeId: 'pending-gap', pane: shPane, epochBefore: 1, epochAfter: null,
+      lastDurableInput: shInput().position, lastAdmittedRow: 0, firstObservedAtMonoMs: 0,
+      reason: 'eof' as const, status: 'suspected' as const, missingCount: null };
+    expect(f.engine.beginGap(gap).status).toBe('ok');
+    shOk(await f.engine.journalInput(shInput(2)));
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({ status: 'stale', reason: 'late-gap' });
+    f.reopen();
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({ status: 'stale', reason: 'late-gap' });
+  } finally { f.cleanup(); }
+});
+
+test('contract abandoned recovery cancels its own timer without iterator return', async () => {
+  const f = shFixture(); let cancelled = false;
+  try {
+    shOk(await f.engine.journalInput(shInput())); shOk(await f.engine.appendFinalized(shAppend()));
+    shOk(await shCheckpoint(f.engine));
+    const recovery = f.engine.recover(shPane, null, { isCancelled: () => cancelled })[Symbol.asyncIterator]();
+    await recovery.next(); cancelled = true;
+    await Bun.sleep(120);
+    expect(f.engine.stats().recoveryTimers).toBe(0);
+    expect(f.engine.stats().pins).toBe(0);
+  } finally { f.cleanup(); }
+});
