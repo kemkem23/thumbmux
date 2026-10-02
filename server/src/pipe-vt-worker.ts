@@ -827,7 +827,10 @@ export class CheckpointCaptureVt implements importCaptureVt {
   static async create(rpc: CaptureVtRpc, identity: import('./stream-contract').StreamIdentity,
     geometry: import('./stream-contract').Geometry, scrollOnClear: boolean): Promise<import('./stream-contract').Result<CheckpointCaptureVt>> {
     const r = await rpc.transaction({state:null,identity,geometry,scrollOnClear,screenRevision:0});
-    return r.status === 'ok' ? {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)} : r;
+    if (r.status !== 'ok') return r;
+    if (Buffer.byteLength(JSON.stringify(r.value))*2 > 2*1024*1024)
+      return {status:'busy',reason:'pressure',retryAfterMs:10};
+    return {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)};
   }
   screen() { return structuredClone(this.frame); }
   async snapshot(): Promise<import('./stream-contract').Result<import('./stream-contract').VtState>> {
@@ -844,6 +847,10 @@ export class CheckpointCaptureVt implements importCaptureVt {
     const candidate=structuredClone(r.value);
     if (Buffer.byteLength(JSON.stringify(candidate))*2 > 2*1024*1024)
       return {status:'busy',reason:'pressure',retryAfterMs:10};
+    const freeze=(v:unknown):void=>{
+      if(v && typeof v==='object') {for(const child of Object.values(v))freeze(child);Object.freeze(v);}
+    };
+    freeze(candidate);
     let finished=false;
     return {status:'ok',value:{frame:candidate.frame,scrolls:candidate.scrolls,
       snapshot:async()=>({status:'ok',value:structuredClone(candidate.state)}),

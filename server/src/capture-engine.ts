@@ -509,7 +509,11 @@ export class StreamCaptureEngine implements CaptureEngine {
               const recovered=await this.ports.repairedCheckpoint(episode,controller.signal);
               if(recovered.status!=='ok') { yield receipt; yield recovered; return; }
               const cp=recovered.value;
-              if(!samePane(cp.identity.pane,this.identity.pane) || cp.head!==this.frame.head
+              if(controller.signal.aborted || this.ports.now()>deadline) {
+                yield receipt; yield error('deadline','repair exceeded 10000ms'); return;
+              }
+              if(cp.checkpointId!==receipt.value.durable.checkpointId
+                || !samePane(cp.identity.pane,this.identity.pane) || cp.head!==this.frame.head
                 || cp.revision!==this.frame.revision || cp.stateDigest!==this.digest(cp.state)
                 || !samePane(cp.inputFence.pane,this.identity.pane)
                 || cp.inputFence.through.sourceEpoch!==cp.identity.sourceEpoch
@@ -673,7 +677,7 @@ export class TargetedCaptureRepair {
         if(final) return;
       }
     } catch(cause) { yield error('io',String(cause)); }
-    finally { await view?.close(); lease(); }
+    finally { try { await view?.close(); } finally { lease(); } }
   }
 }
 
@@ -723,7 +727,7 @@ export async function* bootstrapCapture(view: CaptureRecoveryView, episode: GapE
       if(final) return;
     }
   } catch(cause) { yield error('io',String(cause)); }
-  finally { await view.close(); release(); }
+  finally { try { await view.close(); } finally { release(); } }
 }
 
 /** Host-driven cadence: I calls tick at <=50 ms, never creates a second

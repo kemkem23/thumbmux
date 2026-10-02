@@ -836,7 +836,17 @@ for cut in range(len(data)+1):
 try: m.Worker.from_checkpoint({'codecVersion':'wrong'})
 except ValueError: pass
 else: raise AssertionError('unsupported codec accepted')
-print('bytecut oracle=0')
+# Hidden decoder, DCS filter, margins, tab stops and resize after restore.
+for prefix in [b'\x1b[2;3r\x1bH\x1b7\x1b[31;', b'\x1bP$qignored\x1b', b'\xe4\xbd', b'\x1b[?1049hALT']:
+    a=m.Worker(12,3); a.screen.scroll_on_clear=False; a.feed(1,1,prefix); a.scrolls=[]
+    b=m.Worker.from_checkpoint(a.export_checkpoint())
+    a.resize(8,4,1); b.resize(8,4,1)
+    assert finish(a,b'!\x1b[?1049l\r\nEND')==finish(b,b'!\x1b[?1049l\r\nEND')
+identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+r=m.checkpoint_transaction({'state':None,'identity':identity,'geometry':{'columns':12,'rows':3},'scrollOnClear':False,'screenRevision':0})
+again=m.checkpoint_transaction({'state':r['state'],'identity':identity,'geometry':r['state']['geometry'],'scrollOnClear':False,'screenRevision':0})
+assert again==r
+print('bytecut/resize/alt/contract roundtrip oracle=0')
 `;
   const r = Bun.spawnSync(['python3', '-B', '-c', script, new URL('../src/pipe-vt-worker.py', import.meta.url).pathname]);
   expect(r.exitCode, r.stderr.toString()).toBe(0);
