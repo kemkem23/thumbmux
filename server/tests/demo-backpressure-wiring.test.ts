@@ -474,7 +474,7 @@ import { writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { StreamArchiveRowReader } from '../src/history-engine';
 import { StreamLegacyComposite, StreamSegmentReader, composeLegacyArchive, installStreamArchive,
   openStreamArchive, rowAnsi, type ArchiveSegment } from '../../../../src/integrations/stream-archive-bridge';
-import { openStreamArchiveForLegacy, closeStreamArchiveForLegacy } from '../../../../src/integrations/stream-pipe-host';
+import { openStreamArchiveForLegacy, closeStreamArchiveForLegacy, writeStreamTenureMarker } from '../../../../src/integrations/stream-pipe-host';
 
 /** terminal-history page semantics: before is exclusive end, after is
  * exclusive start, pages clamp below the requested limit. */
@@ -595,13 +595,16 @@ test('stream I rollback bridge: legacy reads join the frozen sh_* interval exact
   }
 },30000);
 
-/** Host with a real unix socket path, a fake tmux identity and a fake pipe owner. */
-async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={}){
+/** Host with a real unix socket path, a fake tmux identity and a fake pipe owner.
+ * `history` is what the fake tmux reports as the pane's retained history. */
+async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={},history:{size:number,limit:number}|null=null){
   const sock=join(root,'tmux.sock');const server=Bun.listen({unix:sock,socket:{data(){}}});
   writeFileSync(join(root,'allowlist.json'),JSON.stringify({server:'S1',sessions:[{sessionId:'$1'}]}));
-  const host=new StreamPipeHost({root,tmuxSocket:sock,...options});
-  (host as any).tmux=(args:string[])=>({exitCode:0,stderr:'',stdout:args.includes('-t')?'$1\t%9\t123\n':'S1\n'});
   const events:string[]=[];let handlers:any=null;
+  const host=new StreamPipeHost({root,tmuxSocket:sock,legacyLines:()=>0,startLegacyWriter:async s=>{events.push('writer:'+s);},...options});
+  (host as any).tmux=(args:string[])=>args.at(-1)==='#{history_size} #{history_limit}'
+    ?(history?{exitCode:0,stderr:'',stdout:`${history.size} ${history.limit}\n`}:{exitCode:1,stderr:'gone',stdout:''})
+    :{exitCode:0,stderr:'',stdout:args.includes('-t')?'$1\t%9\t123\n':'S1\n'};
   (host as any).pipes={
     startBinaryPipe:(_s:string,h:any)=>{handlers=h;events.push('start');return true;},
     stopPipe:async(s:string)=>{events.push('stop:'+s);return{sourceDetached:true,readerEof:true,lastAdmittedSequence:null,lastAckedSequence:null,
@@ -619,22 +622,30 @@ async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={}){
 
 test('stream I host rollback: planned route switch and shutdown commit one durable interval and release the pipe first',async()=>{
   const root=await mkdtemp(join(tmpdir(),'stream-i-r5-host-'));
-  const rig=await r5Host(root);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+  const history={size:0,limit:2000};
+  const rig=await r5Host(root,{},history);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
   try{
+    // No tenure yet: the host started without creating a catalog or marker.
+    expect(rig.host.archive).toBeNull();expect(existsSync(join(root,'stream-archive.sqlite'))).toBe(false);
     const pane=await rig.attach();
+    expect(existsSync(join(root,'stream-tenure'))).toBe(true);
     expect(rig.host.projection.owns('s')).toBe(true);
     await rig.handlers().onBytes(Buffer.from(Array.from({length:30},(_,i)=>`p${i}\r\n`).join('')));
     const F=(await pane.drain())!.head,oracle=await oracleRows(pane,F);
+    history.size=F;
     const receipt=await rig.host.setRoute('s','legacy');
     expect(receipt).toMatchObject({ok:true,from:'newarch',to:'legacy'});
     // Our writer is detached before the legacy path is told to attach its own.
-    // Exactly one route announcement, and only after the pipe was stopped.
-    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false']);
+    // Exactly one route announcement, only after the pipe was stopped, then
+    // the legacy writer is started at once (no viewer exists here).
+    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false','writer:s']);
     expect(rig.host.projection.owns('s')).toBe(false);
     const catalog=rig.host.archive!.catalog;
-    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',generation:2,globalStart:F,localStart:0});
+    // tmux still holds the F stream rows from its row 0: legacy resumes after them.
+    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',generation:2,globalStart:F,localStart:F});
     expect(catalog.segmentAt(rig.identity.pane,F-1)).toMatchObject({route:'stream',globalEnd:F,seam:{kind:'planned',missingCount:null}});
-    legacy.lines.set('s',['after-0']);
+    expect(catalog.segmentAt(rig.identity.pane,F-1)!.seam.reason).toContain('fence exact');
+    legacy.lines.set('s',[...oracle.map(l=>'tmux:'+plain(l)),'after-0']);
     walk(archive,'s',[...oracle,'after-0'],7);
     // A second switch and re-entry are refused, not faked.
     expect((await rig.host.setRoute('s','newarch')).ok).toBe(false);
@@ -656,8 +667,9 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
   }finally{await rig2.close().catch(()=>{});await rm(root2,{recursive:true,force:true});}
 },60000);
 
-test('stream I source EOF: no reopen, durable unresolved gap, rows kept, pane handed to legacy; prehistory is refused',async()=>{
+test('stream I source EOF fails closed: no reopen, durable unresolved gap, rows kept, pane handed to legacy; prehistory is refused',async()=>{
   const root=await mkdtemp(join(tmpdir(),'stream-i-r5-eof-'));
+  // tmux unreadable at the fence (pane gone): the fence assumes row 0.
   const rig=await r5Host(root);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
   try{
     const pane=await rig.attach();const h=rig.handlers();
@@ -668,22 +680,29 @@ test('stream I source EOF: no reopen, durable unresolved gap, rows kept, pane ha
     h.onBroken({reason:'eof',message:'source EOF'}); // notifyBroken after the refusal
     const catalog=rig.host.archive!.catalog;
     for(let i=0;i<200&&catalog.owner(rig.identity.pane)?.route!=='legacy';i++)await Bun.sleep(10);
-    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',globalStart:F,generation:2});
-    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false']);
+    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',globalStart:F,generation:2,localStart:F});
+    for(let i=0;i<200&&rig.events.length<5;i++)await Bun.sleep(10);
+    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false','writer:s']);
     const durable=rig.host.archive!.rows!.durable(rig.identity.pane)!;
     // C fenced the episode durably at EOF; the catalog seam is its final verdict.
     expect(durable.gap).toMatchObject({reason:'eof',missingCount:null,lastAdmittedRow:F-1});
-    expect(catalog.segmentAt(rig.identity.pane,0)!.seam).toEqual({kind:'source-eof',missingCount:null,reason:'source EOF'});
+    const seam=catalog.segmentAt(rig.identity.pane,0)!.seam;
+    expect(seam).toMatchObject({kind:'source-eof',missingCount:null});
+    expect(seam.reason.startsWith('source EOF; fence source-gone:')).toBe(true);
     expect(durable.head).toBe(F);
-    legacy.lines.set('s',['resumed']);
+    // Below the fence the legacy suffix is empty, not an error.
+    legacy.lines.set('s',Array.from({length:F-1},(_,i)=>`tmux${i}`));
+    walk(archive,'s',oracle,3);
+    legacy.lines.set('s',[...Array.from({length:F},(_,i)=>`tmux${i}`),'resumed']);
     walk(archive,'s',[...oracle,'resumed'],3);
-    expect((archive.readBefore('s',F+1,2) as any).markers).toEqual([{lineId:F,kind:'stream-source-eof',reason:'source EOF',missingCount:null}]);
+    expect((archive.readBefore('s',F+1,2) as any).markers).toEqual([{lineId:F,kind:'stream-source-eof',reason:seam.reason,missingCount:null}]);
   }finally{await rig.close();await rm(root,{recursive:true,force:true});}
   const root2=await mkdtemp(join(tmpdir(),'stream-i-r5-prehistory-'));
   const rig2=await r5Host(root2,{legacyLines:()=>3});
   try{
     await expect(rig2.attach('p')).rejects.toThrow('legacy prehistory');
-    expect(rig2.host.archive!.catalog.owner(rig2.identity.pane)).toBeNull();
+    // Refused before any tenure: no catalog, no marker.
+    expect(rig2.host.archive).toBeNull();expect(existsSync(join(root2,'stream-tenure'))).toBe(false);
     expect(rig2.events).toEqual([]);
   }finally{await rig2.close();await rm(root2,{recursive:true,force:true});}
 },60000);
@@ -695,6 +714,7 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
   await rm(empty,{recursive:true,force:true});
   const root=await mkdtemp(join(tmpdir(),'stream-i-r5-crash-')),crash=await mkdtemp(join(tmpdir(),'stream-i-r5-crash-copy-'));
   const runtime=new StreamRuntime({path:join(root,'stream-history.sqlite')});
+  writeStreamTenureMarker(root);
   const catalogA=openStreamArchive(root,true)!;
   try{
     const a=await runtime.add(streamTestIdentity,{columns:12,rows:3},streamPorts);a.stopCadence();
@@ -719,7 +739,7 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
     // was written. The copy is taken at H's own pre-checkpoint boundary (no
     // transaction open), so it holds journal input no checkpoint covers. The
     // live pane continues normally and is the oracle.
-    const files=['stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'];
+    const files=['stream-tenure','stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'];
     let armed=true;
     (runtime.history as any).options.boundary=(at:string)=>{
       if(!armed||at!=='checkpoint-before-write')return;armed=false;
@@ -757,4 +777,224 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
     try{catalogA.close();}catch{}await runtime.close().catch(()=>{});
     await rm(root,{recursive:true,force:true});await rm(crash,{recursive:true,force:true});
   }
+},60000);
+
+import { readFileSync, readdirSync, statSync, mkdirSync as mkdirSyncFs } from 'node:fs';
+import { finalizeStreamOwners, ARCHIVE_CATALOG_VERSION } from '../../../../src/integrations/stream-archive-bridge';
+const fixturePane=(id:string)=>({serverIdentity:'/fixture.sock#S1',paneId:id,birthGeneration:7});
+/** Load a catalog dumped by the real v1 code (see the fixture header). */
+function v1Catalog(dir:string,name:'pre-r5'|'r5'):string{
+  const path=join(dir,`${name}.sqlite`),db=new Database(path,{create:true});
+  db.exec(readFileSync(join(import.meta.dir,'fixtures',`stream-archive-catalog-v1-${name}.sql`),'utf8'));db.close();
+  return path;
+}
+
+test('stream I catalog v1 artifacts from round 4 and round 5 open, migrate once, and finalize with this code',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'stream-i-v1-'));
+  try{
+    for(const name of ['pre-r5','r5'] as const){
+      const path=v1Catalog(dir,name);
+      const raw=new Database(path,{readonly:true});
+      expect(raw.query('SELECT version FROM sa_format').get()).toEqual({version:1});
+      const hadRoute=(raw.query("SELECT name FROM pragma_table_info('sa_owner')").all() as any[]).some(c=>c.name==='route');
+      raw.close();
+      expect(hadRoute).toBe(name==='r5');
+      // A read-only open never migrates; it says what is needed.
+      expect(()=>new StreamArchiveCatalog(path,true)).toThrow('must be migrated');
+      const catalog=new StreamArchiveCatalog(path);
+      try{
+        expect(catalog.hasTenure()).toBe(true);
+        expect(catalog.owner(fixturePane('%1'))).toMatchObject({route:'legacy',generation:2,globalStart:10});
+        expect(catalog.streamOwners().map(o=>o.pane.paneId).sort()).toEqual(['%2','%3']);
+        const seg=catalog.segmentAt(fixturePane('%1'),9)!;
+        expect(seg).toMatchObject({route:'stream',globalStart:0,globalEnd:10});
+        // Round 4 recorded no seam: it is unknown, never promoted to 0.
+        expect(seg.seam).toEqual(name==='pre-r5'
+          ?{kind:'planned',missingCount:null,reason:'interval written by a v1 catalog; its seam was not recorded'}
+          :{kind:'planned',missingCount:null,reason:'writer detached'});
+        const pending=catalog.pending(fixturePane('%3'))!;
+        expect(pending.phase).toBe('PREPARED');
+        expect(pending.prepared!.proof.kind).toBe('vt-import');
+        // Boot finalization over the migrated file: the PREPARED rollback is
+        // committed, the live tenure frozen, the old interval untouched.
+        const report=await finalizeStreamOwners(catalog,null,{kind:'restart',missingCount:null,reason:'boot'});
+        expect(report).toEqual({finalized:['finalize:1'],resolved:['eof:1'],blocked:[]});
+        expect(catalog.segmentAt(fixturePane('%3'),0)).toMatchObject({globalEnd:4,seam:{kind:'source-eof'}});
+        expect(catalog.streamOwners()).toEqual([]);
+        if(name==='r5')expect(catalog.paneForSession('s1')).toEqual(fixturePane('%1'));
+      }finally{catalog.close();}
+      const db=new Database(path,{readonly:true});
+      expect(db.query('SELECT version FROM sa_format').get()).toEqual({version:ARCHIVE_CATALOG_VERSION});
+      expect((db.query("SELECT name FROM pragma_table_info('sa_owner')").all() as any[]).map(c=>c.name)).toEqual(['pane','route','payload','digest']);
+      db.close();
+      // Reopening a migrated catalog is a no-op.
+      new StreamArchiveCatalog(path).close();
+    }
+    // A corrupt v1 row aborts the migration and leaves the artifact as it was.
+    const path=v1Catalog(dir,'pre-r5');
+    const db=new Database(path);db.query("UPDATE sa_owner SET digest='00' WHERE instr(pane,'\"%2\"')>0").run();db.close();
+    const before=readFileSync(path);
+    expect(()=>new StreamArchiveCatalog(path)).toThrow('checksum');
+    const after=new Database(path,{readonly:true});
+    expect(after.query('SELECT version FROM sa_format').get()).toEqual({version:1});
+    expect((after.query("SELECT name FROM pragma_table_info('sa_owner')").all() as any[]).map(c=>c.name)).toEqual(['pane','payload','digest']);
+    after.close();
+    expect(readFileSync(path).equals(before)).toBe(true);
+  }finally{await rm(dir,{recursive:true,force:true});}
+},30000);
+
+/** Private tmux server (explicit -S socket, never the default server). */
+function privateTmux(dir:string,historyLimit=2000){
+  const socket=join(dir,'tmuxdir',`tmux-${process.getuid!()}`,'default');
+  mkdirSyncFs(join(dir,'tmuxdir',`tmux-${process.getuid!()}`),{recursive:true,mode:0o700});
+  const env:Record<string,string>={};
+  for(const [k,v] of Object.entries(process.env))if(v!==undefined&&k!=='TMUX'&&k!=='TMUX_PANE')env[k]=v;
+  env.TMUX_TMPDIR=join(dir,'tmuxdir');
+  const t=(args:string[])=>{
+    const r=Bun.spawnSync(['tmux','-S',socket,'-f','/dev/null',...args],{env});
+    if(r.exitCode!==0)throw Error(r.stderr.toString());return r.stdout.toString();
+  };
+  const session=(name:string,command='sleep 600',cols=12,rows=3)=>{
+    t(['start-server',';','set-option','-g','history-limit',String(historyLimit),';',
+      'new-session','-d','-s',name,'-x',String(cols),'-y',String(rows),command]);
+    return t(['display-message','-p','-t',`=${name}:0.0`,'#{pane_id}']).trim();
+  };
+  return{socket,t,session,kill:()=>Bun.spawnSync(['tmux','-S',socket,'kill-server'],{env})};
+}
+const streamFiles=(root:string)=>readdirSync(root).filter(n=>n.startsWith('stream-')).sort()
+  .map(n=>{const p=join(root,n),st=statSync(p);return[n,st.isFile()?Bun.hash(readFileSync(p)).toString(36):'dir',st.mtimeMs];});
+
+test('stream I flag off: boots run nothing of stream-first without a recorded tenure; with one, rollback runs and closes',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'stream-i-flagoff-'));const server=privateTmux(dir);
+  const {startPipeHistoryHostFromEnv,stopPipeHistoryHost}=await import('../../../../src/integrations/pipe-history-host');
+  const {activeStreamArchive}=await import('../../../../src/integrations/stream-archive-bridge');
+  try{
+    server.session('fo');
+    const root=join(dir,'root');mkdirSyncFs(root,{recursive:true});
+    // An empty catalog, as a flag-on host of the previous round created at
+    // start without any attach: no owner, no marker. It is not a tenure.
+    new StreamArchiveCatalog(join(root,'stream-archive.sqlite')).close();
+    const before=streamFiles(root);
+    expect(before.map(f=>f[0])).toEqual(['stream-archive.sqlite']);
+    for(const flag of [undefined,'0',undefined,'0']){
+      const env:Record<string,string>={CORTEX_NEWARCH_ROOT:root,CORTEX_NEWARCH_TMUX_SOCKET:server.socket};
+      if(flag)env.CORTEX_STREAM_FIRST=flag;
+      const host=await startPipeHistoryHostFromEnv(env,()=>{});
+      expect(host).not.toBeNull();expect('archive' in (host as object)).toBe(false);
+      expect(activeStreamArchive()).toBeNull();
+      await stopPipeHistoryHost();
+      // Not one stream file created, opened for write or touched.
+      expect(streamFiles(root)).toEqual(before);
+    }
+    // A recorded tenure (marker + an owner still on stream): flag-off boot
+    // freezes it before the legacy host starts, and stop uninstalls it.
+    const c=new StreamArchiveCatalog(join(root,'stream-archive.sqlite'));
+    c.initialize({pane:fixturePane('%5'),route:'stream',generation:1,globalStart:0,localStart:0,root:'sh',schema:'sh-v1'});c.close();
+    writeStreamTenureMarker(root);
+    const logs:string[]=[];
+    await startPipeHistoryHostFromEnv({CORTEX_NEWARCH_ROOT:root,CORTEX_NEWARCH_TMUX_SOCKET:server.socket},m=>logs.push(m));
+    expect(activeStreamArchive()!.catalog.owner(fixturePane('%5'))).toMatchObject({route:'legacy',generation:2});
+    expect(logs.filter(l=>l.includes('rollback blocked'))).toEqual([]);
+    await stopPipeHistoryHost();
+    expect(activeStreamArchive()).toBeNull();
+  }finally{await stopPipeHistoryHost().catch(()=>{});server.kill();await rm(dir,{recursive:true,force:true});}
+},60000);
+
+/** The real legacy writer and archive: the history keeper pass the handoff
+ * starts, appending into a TerminalHistoryArchive read through DbHistoryArchive
+ * — the same classes production composes — against a real private tmux pane
+ * that printed the same bytes the stream parsed. Nothing on the legacy side is
+ * prepared by hand. */
+async function realLegacyRollback(historyLimit:number,afterHandoff:number){
+  const dir=await mkdtemp(join(tmpdir(),'stream-i-fence-'));const server=privateTmux(dir,historyLimit);
+  const previousDir=process.env.TERMINAL_HISTORY_DIR;process.env.TERMINAL_HISTORY_DIR=join(dir,'history');
+  const {TerminalHistoryArchive}=await import('../../../../src/integrations/terminal-history');
+  const {DbHistoryArchive}=await import('../../../../src/integrations/db-history-archive');
+  const {runHistoryKeeperTick}=await import('../../../../src/integrations/history-keeper');
+  const {legacyArchivedLines}=await import('../../../../src/integrations/stream-archive-registry');
+  const before=Array.from({length:30},(_,i)=>`a${i}`),after=Array.from({length:afterHandoff},(_,i)=>`b${i}`);
+  writeFileSync(join(dir,'a.txt'),before.join('\n')+'\n');writeFileSync(join(dir,'b.txt'),after.map(l=>l+'\n').join(''));
+  const paneId=server.session('s',`sh -c 'cat ${dir}/a.txt; while [ ! -e ${dir}/go ]; do sleep 0.05; done; cat ${dir}/b.txt; exec sleep 600'`);
+  const capture=(start:number)=>{
+    const lines=server.t(['capture-pane','-t',paneId,'-p','-e','-S',String(start)]).split('\n');
+    while(lines.length&&lines.at(-1)!.trim()==='')lines.pop();return lines.join('\n');
+  };
+  const waitFor=async(text:string)=>{for(let i=0;i<200&&!capture(-historyLimit).includes(text);i++)await Bun.sleep(25);expect(capture(-historyLimit)).toContain(text);};
+  await waitFor('a29');
+  const file=new TerminalHistoryArchive(),legacyArchive=composeLegacyArchive(new DbHistoryArchive(file as any));
+  const deps={
+    listSessions:()=>[{name:'s',paneRows:3}],sampleDeadPanes:()=>new Set<string>(),historyLimit:()=>historyLimit,liveLineLimit:()=>3,
+    capture:async(_s:string,o:{startLine:number})=>capture(o.startLine),
+    archivedTail:(s:string,n:number)=>{const t=file.getManifest(s).totalLines;return t?file.readRange(s,Math.max(0,t-n),t):[];},
+    appendLines:(s:string,l:string[])=>file.appendLines(s,l),appendMarker:(s:string,x:string)=>file.appendLines(s,[x]),warn:()=>{},
+  };
+  const root=join(dir,'root');mkdirSyncFs(root);
+  const rig=await r5Host(root,{legacyLines:s=>legacyArchivedLines(s)!,
+    startLegacyWriter:async s=>{await runHistoryKeeperTick(deps,{session:s});}} as any);
+  const fake=(rig.host as any).tmux;
+  (rig.host as any).tmux=(args:string[])=>args.at(-1)==='#{history_size} #{history_limit}'
+    ?{exitCode:0,stderr:'',stdout:server.t(['display-message','-p','-t',paneId,'#{history_size} #{history_limit}'])}:fake(args);
+  const cleanup=async()=>{
+    await rig.close().catch(()=>{});server.kill();
+    if(previousDir===undefined)delete process.env.TERMINAL_HISTORY_DIR;else process.env.TERMINAL_HISTORY_DIR=previousDir;
+    await rm(dir,{recursive:true,force:true});
+  };
+  try{
+    const pane=await rig.attach();
+    await rig.handlers().onBytes(Buffer.from(before.join('\r\n')+'\r\n'));
+    const F=(await pane.drain())!.head,oracle=(await oracleRows(pane,F)).map(l=>plain(l).trimEnd());
+    expect(oracle).toEqual(before.slice(0,F));
+    const tmuxHistory=Number(server.t(['display-message','-p','-t',paneId,'#{history_size}']).trim());
+    expect((await rig.host.setRoute('s','legacy')).ok).toBe(true);
+    // No viewer anywhere: the writer already ran, and its seed is tmux's copy
+    // of the stream rows from row 0 (or of what tmux still held) — the overlap
+    // that a fence at the legacy resume point would show twice.
+    const seeded=file.getManifest('s').totalLines;
+    expect(seeded).toBeGreaterThan(0);
+    const owner=rig.host.archive!.catalog.owner(rig.identity.pane)!;
+    if(afterHandoff){
+      writeFileSync(join(dir,'go'),'');await waitFor(`b${afterHandoff-1}`);
+      await runHistoryKeeperTick(deps);
+    }
+    const back:string[]=[],fwd:string[]=[];
+    for(const limit of [1,4,500]){
+      back.length=0;fwd.length=0;let at:number|null=null;
+      for(let g=0;;g++){const p=legacyArchive.readBefore('s',at,limit) as any;back.unshift(...p.lines);if(!p.hasMore)break;at=p.startLine;if(g>500)throw Error('no progress');}
+      at=null;for(let g=0;;g++){const p=legacyArchive.readAfter!('s',at,limit) as any;fwd.push(...p.lines);if(!p.hasMore)break;at=p.endLine-1;if(g>500)throw Error('no progress');}
+      expect(fwd).toEqual(back);
+    }
+    const text=back.map(l=>plain(l).trimEnd());
+    return{F,tmuxHistory,seeded,owner,text,legacy:file.readRange('s',0,file.getManifest('s').totalLines).map(l=>plain(l).trimEnd()),
+      seam:rig.host.archive!.catalog.segmentAt(rig.identity.pane,F-1)!.seam,printed:[...before,...after],cleanup};
+  }catch(error){await cleanup();throw error;}
+}
+
+test('stream I rollback seam against the real legacy writer: tmux re-seeds the stream rows, none is shown twice or lost',async()=>{
+  const r=await realLegacyRollback(2000,20);
+  try{
+    // tmux kept every row from 0: the fence is exact at the stream head.
+    expect(r.tmuxHistory).toBe(r.F);
+    expect(r.owner).toMatchObject({route:'legacy',globalStart:r.F,localStart:r.F});
+    expect(r.seam.reason).toContain('fence exact');
+    // The real writer's archive starts with tmux's copy of the stream rows...
+    expect(r.legacy.slice(0,r.F)).toEqual(r.printed.slice(0,r.F));
+    // ...and the joined history is the printed sequence once, in order: every
+    // row up to the writer's live window, no duplicate, no hole.
+    expect(r.text.length).toBe(r.legacy.length);
+    expect(r.text).toEqual(r.printed.slice(0,r.text.length));
+    expect(r.text.length).toBeGreaterThan(r.F+10);
+    expect(new Set(r.text).size).toBe(r.text.length);
+  }finally{await r.cleanup();}
+},60000);
+
+test('stream I rollback seam fails closed when tmux history is full: every row tmux held is skipped, nothing doubled',async()=>{
+  const r=await realLegacyRollback(10,0);
+  try{
+    expect(r.tmuxHistory).toBe(10);expect(r.F).toBe(28);
+    expect(r.owner).toMatchObject({globalStart:r.F,localStart:10});
+    expect(r.seam.reason).toContain('fence unproven: tmux history reached its limit');
+    // The writer seeded what tmux still held (rows the stream already has).
+    expect(r.legacy).toEqual(r.printed.slice(r.F-10,r.F-10+r.seeded));
+    expect(r.text).toEqual(r.printed.slice(0,r.F));
+  }finally{await r.cleanup();}
 },60000);
