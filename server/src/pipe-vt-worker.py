@@ -536,7 +536,9 @@ def pack_state(v):
     if isinstance(v, (set, list)):
         return [type(v).__name__, [pack_state(x) for x in (sorted(v) if isinstance(v, set) else v)]]
     if isinstance(v, dict):
-        attrs = {k: x for k, x in getattr(v, "__dict__", {}).items() if k != "enc"}
+        # __orig_class__ is typing metadata installed by GenericAlias, not VT state.
+        # Keep semantic defaults/wrap flags; omit only metadata and the derived row cache.
+        attrs = {k: x for k, x in getattr(v, "__dict__", {}).items() if k not in ("enc", "__orig_class__")}
         kind = "buffer" if isinstance(v, defaultdict) else "row" if isinstance(v, StaticDefaultDict) else "dict"
         return [kind, [[pack_state(k), pack_state(x)] for k, x in v.items()], pack_state(attrs) if kind != "dict" else None]
     raise ValueError("unsupported checkpoint field " + type(v).__name__)

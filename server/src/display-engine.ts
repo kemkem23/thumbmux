@@ -381,8 +381,9 @@ export class StreamDisplayEngine implements DisplayEngine {
   }
 
   private validRequest(request: ReadRequest, cursor: PageCursor | null, limit: number): boolean {
-    const numbers = [request.routeGeneration, request.range.start, request.range.end, request.deadlineMonoMs, limit];
-    if (!numbers.every(validCounter) || request.range.start > request.range.end
+    const numbers = [request.routeGeneration, request.range.start, request.range.end, limit];
+    if (!Number.isFinite(request.deadlineMonoMs) || request.deadlineMonoMs < 0
+      || !numbers.every(validCounter) || request.range.start > request.range.end
       || limit < 1 || limit > STREAM_BUDGET.maxPageRows) return false;
     return cursor === null || (cursor.requestId === request.requestId && validCounter(cursor.lineId)
       && validCounter(cursor.cellOffset) && (cursor.direction === "before" || cursor.direction === "after"));
