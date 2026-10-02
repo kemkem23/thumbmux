@@ -672,7 +672,7 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
     // again against what tmux and the legacy writer hold, then commits.
     expect(rig2.host.archive).not.toBeNull();
     const again=new StreamPipeHost({root:root2,tmuxSocket:(rig2.host.options.tmuxSocket)});
-    (again as any).pipes=(rig2.host as any).pipes;
+    (again as any).pipes=(rig2.host as any).pipes;(again as any).tmux=(rig2.host as any).tmux;
     await again.start();
     expect(again.finalize).toEqual({finalized:[],resolved:['shutdown:1'],blocked:[]});
     expect(again.archive!.catalog.segmentAt(rig2.identity.pane,0)).toMatchObject({globalEnd:F,seam:{kind:'shutdown',missingCount:null}});
@@ -767,9 +767,11 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
     const logs:string[]=[];
     const report=(await openStreamArchiveForLegacy(crash,m=>logs.push(m)))!;
     try{
-      expect(report.resolved).toEqual(['eof:1']);
+      // b's PREPARED has no attach anchor: its fence cannot be proven again,
+      // so it is aborted and fenced closed, keeping its recorded event.
+      expect(report.resolved).toEqual([]);
       expect(report.blocked).toEqual([]);
-      expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1']);
+      expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1','finalize:1:after:eof:1']);
       const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
       // Replay projected the journal tail with original IDs: same rows as the
       // pane that drained normally, nothing duplicated or invented.
@@ -781,6 +783,8 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
       expect(cat.owner(c.identity.pane)).toMatchObject({route:'legacy',generation:2});
       expect(cat.handoff(c.identity.pane,'planned:1')!.phase).toBe('ABORTED');
       expect(cat.segmentAt(b.identity.pane,0)!.seam.kind).toBe('source-eof');
+      expect(cat.segmentAt(b.identity.pane,0)!.seam.reason).toContain('refenced at boot; fence source-gone: no attach anchor');
+      expect(cat.handoff(b.identity.pane,'eof:1')!.phase).toBe('ABORTED');
       expect(cat.streamOwners()).toEqual([]);
     }finally{closeStreamArchiveForLegacy();}
     // Booting again is idempotent.
@@ -828,12 +832,16 @@ test('stream I catalog v1 artifacts from round 4 and round 5 open, migrate once,
         const pending=catalog.pending(fixturePane('%3'))!;
         expect(pending.phase).toBe('PREPARED');
         expect(pending.prepared!.proof.kind).toBe('vt-import');
-        // Boot finalization over the migrated file: the PREPARED rollback is
-        // committed, the live tenure frozen, the old interval untouched.
+        // Boot finalization over the migrated file: the old PREPARED rollback
+        // carries no fence proof (its destination is the round-5 `+0`), so it
+        // is aborted and fenced closed; the live tenure is frozen, the old
+        // interval untouched.
         const report=await finalizeStreamOwners(catalog,null,{kind:'restart',missingCount:null,reason:'boot'});
-        expect(report).toEqual({finalized:['finalize:1'],resolved:['eof:1'],blocked:[]});
-        expect(catalog.segmentAt(fixturePane('%3'),0)).toMatchObject({globalEnd:4,handoffId:'eof:1',
+        expect(report).toEqual({finalized:['finalize:1','finalize:1:after:eof:1'],resolved:[],blocked:[]});
+        expect(catalog.handoff(fixturePane('%3'),'eof:1')!.phase).toBe('ABORTED');
+        expect(catalog.segmentAt(fixturePane('%3'),0)).toMatchObject({globalEnd:4,handoffId:'finalize:1:after:eof:1',
           seam:name==='pre-r5'?{kind:'planned',missingCount:null}:{kind:'source-eof',missingCount:null}});
+        expect(catalog.owner(fixturePane('%3'))).toMatchObject({route:'legacy',localStart:4});
         expect(catalog.streamOwners()).toEqual([]);
         if(name==='r5')expect(catalog.paneForSession('s1')).toEqual(fixturePane('%1'));
       }finally{catalog.close();}
@@ -967,7 +975,7 @@ async function realPipeRig(historyLimit:number,{register=true,bLines=30,cLines=2
   };
   /** Wait until the stream parsed (through the pipe) the row `text`. */
   const streamHas=async(pane:import('../src/stream-runtime').StreamRuntimePane,text:string)=>{
-    for(let i=0;i<200;i++){const F=(await pane.drain())!.head;if((await oracleRows(pane,F)).map(l=>plain(l).trimEnd()).includes(text))return F;await Bun.sleep(25);}
+    for(let i=0;i<200;i++){await pane.drain();const F=pane.frame.head;if((await oracleRows(pane,F)).map(l=>plain(l).trimEnd()).includes(text))return F;await Bun.sleep(25);}
     throw Error(`stream never parsed ${text}`);
   };
   /** The joined legacy history, paged both ways at several sizes (must agree). */
@@ -1042,28 +1050,46 @@ test('stream I real pipe: a full tmux history is aligned by content, not assumed
   }finally{await r.cleanup();}
 },60000);
 
-test('stream I real pipe: clear-history in the tenure cannot pass as exact — the fence fails closed and nothing is doubled',async()=>{
+test('stream I real pipe: clear-history in the tenure is aligned by content, never by count; unmatched tmux rows fail closed with nothing doubled',async()=>{
   const r=await realPipeRig(2000,{cLines:30});
   try{
     const pane=await r.attach();
     r.go('go1');await r.tmuxHas(r.paneId,'b29');
-    const F=await r.streamHas(pane,'b27');
+    const F0=await r.streamHas(pane,'b27');
     r.server.t(['clear-history','-t',r.paneId]);
-    r.go('go2');await r.tmuxHas(r.paneId,'c29');await r.streamHas(pane,'c27');
-    // tmux history climbed back above the stream's rows: the old count-only
-    // fence called this exact and silently skipped real rows.
-    expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(F);
+    r.go('go2');await r.tmuxHas(r.paneId,'c29');const F=await r.streamHas(pane,'c27');
+    // tmux history climbed back above the stream's first rows: a count-only
+    // fence called this exact and silently skipped real rows (review N2).
+    expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(F0);
     expect((await r.host.setRoute('s','legacy')).ok).toBe(true);
     const seam=r.catalog().segmentAt(r.identity.pane,0)!.seam;
-    expect(seam.reason).toContain('fence unproven: no source offset matches the stream rows by content');
-    expect(seam.missingCount).toBeNull();
-    const text=r.history();
-    expect(new Set(text).size).toBe(text.length);
-    // The frozen stream rows are served; every tmux row that could repeat
-    // them is skipped (the declared gap), so no b-row appears after them.
-    expect(text.slice(0,F)).toEqual(r.b.slice(0,F));
-    expect(text.slice(F).some(l=>l.startsWith('b'))).toBe(false);
+    expect(seam.reason).toContain(`fence exact: tmux row 0 is stream row ${F0}`);
+    await r.keeperTick();
+    const text=r.history(),printed=[...r.b,...r.c];
+    expect(text).toEqual(printed.slice(0,text.length));expect(text.length).toBeGreaterThan(F);
   }finally{await r.cleanup();}
+  // Source EOF, then tmux history cleared and new output: tmux holds no row
+  // the stream holds, so no offset is proven. Every row tmux held is skipped
+  // (the declared gap); no stream row is shown twice.
+  const q=await realPipeRig(2000,{register:false,cLines:30});
+  try{
+    const pane=await q.attach();
+    q.go('go1');await q.tmuxHas(q.paneId,'b29');const F=await q.streamHas(pane,'b27');
+    q.server.t(['pipe-pane','-t',q.paneId]);
+    await until(()=>q.host.status().awaitingWriter.includes('s'),'EOF reached the host');
+    q.server.t(['clear-history','-t',q.paneId]);
+    q.go('go2');await q.tmuxHas(q.paneId,'c29');
+    setLegacyWriterKick(q.kick);
+    await until(()=>q.catalog().owner(q.identity.pane)?.route==='legacy','handoff after the writer registered');
+    const seam=q.catalog().segmentAt(q.identity.pane,F-1)!.seam;
+    expect(seam).toMatchObject({kind:'source-eof',missingCount:null});
+    expect(seam.reason).toContain('fence unproven: no source offset matches the stream rows by content');
+    await q.keeperTick();
+    const text=q.history();
+    expect(text.slice(0,F)).toEqual(q.b.slice(0,F));
+    expect(new Set(text).size).toBe(text.length);
+    expect(text.slice(F).some(l=>/^b/.test(l))).toBe(false);
+  }finally{await q.cleanup();}
 },60000);
 
 test('stream I real pipe EOF: no writer keeps the route; once one registers the pane goes to legacy and output after the EOF is not lost',async()=>{
