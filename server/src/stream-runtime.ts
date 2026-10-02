@@ -289,6 +289,7 @@ export class StreamRuntimePane {
     await this.cadence.tick();
   }
   async recover(): Promise<void> {
+    unwrap(this.runtime.history!.discardStaged(this.identity.pane));
     const recovery = this.runtime.history!.recover(this.identity.pane, null, {isCancelled: () => false})[Symbol.asyncIterator]();
     try {
       const first = await recovery.next();

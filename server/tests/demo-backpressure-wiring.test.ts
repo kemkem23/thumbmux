@@ -734,7 +734,6 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
     const logs:string[]=[];
     const report=(await openStreamArchiveForLegacy(crash,m=>logs.push(m)))!;
     try{
-      {const dbg=new StreamArchiveRowReader(join(crash,'stream-history.sqlite'));console.log('DEBUG-R5',JSON.stringify({before:{...before,checkpoint:before.checkpoint&&{head:before.checkpoint.head,revision:before.checkpoint.revision,fence:before.checkpoint.inputFence.through}},after:{...dbg.durable(a.identity.pane)!,checkpoint:null},logs}));dbg.close();}
       expect(report.resolved).toEqual(['eof:1']);
       expect(report.blocked).toEqual([]);
       expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1']);

@@ -378,6 +378,32 @@ export class StreamHistoryEngine implements HistoryEngine {
     p.state = { ...p.state, durable: disk.durable, checkpoint: disk.checkpoint, gap: disk.gap };
 
   }
+  /** Crash recovery in staging mode: rows staged above the durable fence were
+   * never readable (reads wait for revision==durable) nor published. Drop them
+   * and their event receipts so the journal re-derives them under one fence;
+   * a replayed frame need not be byte-identical to the interrupted attempt. */
+  discardStaged(pane: PaneKey): Result<{ discardedRows: number }> {
+    try {
+      this.live(); const key = paneKey(pane);
+      if (!this.options.stagePrefixesOnDisk || this.pending.has(key)) return ok({ discardedRows: 0 });
+      const state = this.state(pane, this.db, false);
+      if (!state || state.revision === state.durable) return ok({ discardedRows: 0 });
+      if (state.gap) return { status: 'error', code: 'unresolved-gap', message: 'staged rows behind a gap episode' };
+      let discardedRows = 0;
+      this.db.transaction(() => {
+        const low = this.db.query('SELECT MIN(line) AS line, COUNT(*) AS n FROM sh_row WHERE pane=? AND revision>?').get(key, state.durable) as SqlRow;
+        discardedRows = Number(low.n);
+        const head = discardedRows ? Number(low.line) : state.head;
+        if (this.db.query('SELECT 1 FROM sh_row WHERE pane=? AND line>=? AND revision<=? LIMIT 1').get(key, head, state.durable))
+          throw Error('durable row above staged prefix');
+        this.db.query('DELETE FROM sh_fragment WHERE pane=? AND line>=?').run(key, head);
+        this.db.query('DELETE FROM sh_row WHERE pane=? AND line>=?').run(key, head);
+        this.db.query("DELETE FROM sh_event WHERE pane=? AND json_extract(receipt,'$.revision')>?").run(key, state.durable);
+        this.putState({ ...state, revision: state.durable, head });
+      }).immediate();
+      return ok({ discardedRows });
+    } catch (e) { return fail(e); }
+  }
   /** Persist admitted rows and gap together before acknowledging the fence. */
   beginGap(episode: GapEpisode): Result<null> {
     try {
@@ -617,10 +643,6 @@ export class StreamHistoryEngine implements HistoryEngine {
         if (expired) { yield { status: 'error', code: 'deadline', message: 'recovery deadline' }; return; }
         if (cancelled || cancel.isCancelled()) { yield { status: 'cancelled', reason: 'recovery cancelled' }; return; }
         const row = this.readRow(reader, pane, head++);
-        // A staged prefix (I streaming mode) is above the durable fence: it is
-        // re-derived from the journal below under the same event IDs, and H
-        // returns each staged receipt again. It is not a committed repair row.
-        if (this.options.stagePrefixesOnDisk && row.revision > state.durable) break;
         const receiptRow = reader.query("SELECT receipt FROM sh_commit WHERE pane=? AND revision>=? ORDER BY revision LIMIT 1").get(key, row.revision) as SqlRow | null;
         if (!receiptRow) throw Error('row without durable receipt');
         yield ok({ kind: 'rows', rows: [row], receipt: JSON.parse(String(receiptRow.receipt)) });
