@@ -668,9 +668,9 @@ describe('NEWARCH C admission, immutable tail and exact evidence', () => {
     expect(() => uniqueCaptureSeam(['a'], Array(5013).fill('b'))).toThrow();
   });
   test('canonical digest includes identity and is independent of object key order', () => {
-    expect(captureDigest({ a: 1, b: 2 })).toBe(captureDigest({ b: 2, a: 1 }));
-    expect(captureDigest(cIdentity)).not.toBe(captureDigest({ ...cIdentity, sourceEpoch: 2 }));
-    expect(() => captureDigest({ a: NaN })).toThrow();
+    expect(captureDigest('input', { a: 1, b: 2 })).toBe(captureDigest('input', { b: 2, a: 1 }));
+    expect(captureDigest('input', cIdentity)).not.toBe(captureDigest('input', { ...cIdentity, sourceEpoch: 2 }));
+    expect(() => captureDigest('input', { a: NaN })).toThrow();
   });
 });
 
@@ -748,6 +748,7 @@ function cEngineFixture() {
   let installs = 0, appends = 0, journals = 0, denyAppend = false;
   const initial: LiveFrame = { ...cFrame(), head: 0, revision: 0, durableRevision: 0 };
   const history = {
+    beginGap: () => ({status: 'ok', value: null}),
     async journalInput(event: InputEvent) {
       journals++;
       return { status: 'ok', value: { kind: 'durable-input', pane: cPane, through: event.position,
@@ -783,7 +784,7 @@ function cEngineFixture() {
 function cInput(seq: number): InputEvent {
   const body = { identity: cIdentity, position: { sourceEpoch: 1, packetSeq: seq },
     receivedAtMonoMs: 1, payload: { kind: 'bytes' as const, bytes: [65] } };
-  return { ...body, digest: captureDigest(body) };
+  return { ...body, digest: captureDigest('input', body) };
 }
 describe('NEWARCH C capture state machine (adapter fixture)', () => {
   test('accepted input publishes once and retry does not replay VT', async () => {
@@ -867,7 +868,7 @@ test('NEWARCH C first packet with 600 finalized rows commits before bounded tail
   const frames: LiveFrame[]=[]; f.engine.subscribe(cPane, frame=>frames.push(frame));
   expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
   expect(commits).toBe(1); expect(frames.at(-1)?.head).toBe(600);
-  expect(frames.at(-1)?.durableRevision).toBe(1);
+  expect(frames.at(-1)?.durableRevision).toBe(3);
   expect(f.ports.admission.heldBytes).toBe(0);
 });
 
@@ -1066,7 +1067,7 @@ w=m.Worker(80,80);w.screen.scroll_on_clear=True
 w.feed(1,1,b'\r\n'.join(bytes([65+y%26])*80 for y in range(80)));w.scrolls=[]
 state=w.contract_state()
 for data in [b'\x1b[2J',b'\x1b[80S',b'\x1bc']:
-    oracle=m.Worker.from_checkpoint(json.loads(state['extensionState']))
+    oracle=m.Worker.from_checkpoint(m.decode_extension(state['extensionState']))
     oracle.feed(2,1,data)
     expected=[m.contract_row(x['row'],x['wrap'],x['pad']) for x in oracle.scrolls]
     request={'state':state,'identity':identity,'geometry':state['geometry'],'scrollOnClear':True,'screenRevision':1,
@@ -1155,4 +1156,160 @@ test('NEWARCH C stream adapter rejects a nonadvancing or over-budget continuatio
     expect((await stream.next()).done).toBe(true);
     expect(made.value.screen()).toEqual(cFrame());
   }
+});
+
+// Contract repair: exercise the actual C -> SQLite H boundary, never an echo H.
+import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
+for (const count of [1, 2, 600]) test(`NEWARCH contract real C-H ${count} rows survives checkpoint and reopen`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'contract-seam-'));
+  const path = join(dir, 'history.sqlite');
+  let history = new StreamHistoryEngine({ path, codecVersions: ['seam-v1'] });
+  try {
+    const f = cEngineFixture();
+    const geometry = cFrame().geometry, cursor = cFrame().cursor;
+    const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+    const state = { codecVersion: 'seam-v1', geometry, normal: buffer, alternate: buffer,
+      active: 'normal' as const, modes: {}, margins: { top: 0, bottom: geometry.rows - 1, left: 0, right: geometry.columns - 1 },
+      tabStops: [], pendingUtf8: [], pendingEscape: [], attributes: [], wrapPending: false, extensionState: '{}' };
+    const rows = Array.from({ length: count }, (_, i) => ({ cells: [{ text: `row-${i}`, width: 1 as const, style: [31] }],
+      softWrap: false, wrapPad: 0, uncertainFields: [] }));
+    f.ports.vt.prepare = async event => ({ status: 'ok', value: { frame: { ...cFrame(), identity: event.identity },
+      scrolls: rows, snapshot: async () => ({ status: 'ok', value: state }), install() {}, discard() {} } });
+    f.ports.vt.snapshot = async () => ({ status: 'ok', value: state });
+    const engine = new StreamCaptureEngine({ ...f.ports, history });
+    const frames: LiveFrame[] = []; engine.subscribe(cPane, frame => frames.push(frame));
+    expect((await engine.acceptInput(cInput(1))).status).toBe('ok');
+    expect(frames.at(-1)?.head).toBe(count);
+    expect((await engine.checkpoint(cPane, 'handoff')).status).toBe('ok');
+    history.close(); history = new StreamHistoryEngine({ path, codecVersions: ['seam-v1'] });
+    const grant = await history.grantReadView({ requestId: `rows-${count}`, identity: cIdentity,
+      routeGeneration: 1, range: { start: 0, end: count }, deadlineMonoMs: performance.now() + 1000 });
+    if (grant.status !== 'ok') throw Error(JSON.stringify(grant));
+    const ack = await history.openReadView(grant.value);
+    if (ack.status !== 'ok') throw Error(JSON.stringify(ack));
+    const seen: string[] = []; let cursorPage = null;
+    do {
+      const page = await history.readPage(ack.value, cursorPage, 256, { isCancelled: () => false });
+      if (page.status !== 'ok') throw Error(JSON.stringify(page));
+      seen.push(...page.value.fragments.map(fragment => fragment.row.cells[0]!.text));
+      cursorPage = page.value.nextAfter;
+    } while (cursorPage);
+    expect(seen).toEqual(rows.map(row => row.cells[0]!.text));
+    await history.releaseReadView(grant.value, 'done');
+    if (count === 1) {
+      const recovery = history.recover(cPane,null,{isCancelled:()=>false})[Symbol.asyncIterator]();
+      const recovered = (await recovery.next()).value;
+      if(recovered?.status!=='ok' || recovered.value.kind!=='checkpoint') throw Error('missing checkpoint');
+      const oldCp = recovered.value.checkpoint; await recovery.return?.();
+      // C uses the reopened real H; no digest/receipt echo mock at this seam.
+      const metrics: any[] = [];
+      let episode: import('../src/stream-contract').GapEpisode;
+      let inputFence: import('../src/stream-contract').DurableInputReceipt;
+      const restoredFrame = {...cFrame(),head:count,revision:oldCp.revision,durableRevision:oldCp.revision};
+      const repairPorts: CapturePorts = {...f.ports,history,initial:restoredFrame,observer:{record:m=>metrics.push(m)},
+        repairChunks:async function* () {
+          const row={...rows[0]!,id:{pane:cPane,lineId:1},revision:oldCp.revision+1,
+            source:{pane:cPane,sourceEpoch:1,packetSeq:2,scrollOrdinal:0},geometry,geometryGeneration:cIdentity.geometryGeneration};
+          const body={episode,chunkId:'real-final',expectedRevision:oldCp.revision,rows:[row],final:true};
+          yield {status:'ok',value:{...body,digest:streamDigest('repair',body)}};
+        },
+        syncRepair:async (_chunk,r)=>({...cFrame(),head:2,revision:r.committedRevision,durableRevision:r.durable.durableRevision}),
+        verifyRepair:async()=>true,
+        repairedCheckpoint:async()=>({status:'ok',value:{...oldCp,checkpointId:'real-repaired',
+          previousCheckpointId:oldCp.checkpointId,revision:oldCp.revision+1,head:2,inputFence}}),
+      };
+      repairPorts.vt.restore=async()=>({status:'ok',value:{frame:cFrame(),scrolls:[],install(){},discard(){}}});
+      const repaired=new StreamCaptureEngine(repairPorts);
+      episode=repaired.fault('eof');
+      const input=await history.journalInput(cInput(2));
+      if(input.status!=='ok')throw Error(JSON.stringify(input)); inputFence=input.value;
+      const suffix={identity:cIdentity,eventId:{pane:cPane,sourceEpoch:1,packetSeq:2,scrollOrdinal:0},
+        expectedRevision:oldCp.revision,rows:[],frameDelta:cFrame(),receivedAtMonoMs:1};
+      expect(await history.appendFinalized({...suffix,digest:streamDigest('append',suffix)}))
+        .toMatchObject({status:'stale',reason:'late-gap'});
+      const results=[];for await(const r of repaired.repair(episode,{isCancelled:()=>false}))results.push(r);
+      expect(results).toHaveLength(1);expect(results[0]).toMatchObject({status:'ok',value:{complete:true}});
+      expect(metrics.find(m=>m.kind==='gap' && m.episode.status==='repaired')?.episode.missingCount).toBeNull();
+      history.close();history=new StreamHistoryEngine({path,codecVersions:['seam-v1']});
+      const replay=history.recover(cPane,null,{isCancelled:()=>false})[Symbol.asyncIterator]();
+      expect((await replay.next()).value).toMatchObject({status:'ok',value:{kind:'checkpoint',checkpoint:{checkpointId:'real-repaired',head:2}}});
+      await replay.return?.();
+    }
+  } finally { history.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('contract collector retains oversize rows until sink accepts the exact event', async () => {
+  const { PipeHistoryCollector } = await import('../src/pipe-history-collector');
+  const offered: unknown[] = [];
+  let allow = false;
+  // Drive the real collector admission path without opening a live parser.
+  const collector = new PipeHistoryCollector({ paneKey: cPane, sourceEpoch: 1, cols: 80, rows: 24,
+    ports: { onScroll(event: unknown) { offered.push(event); return allow ? undefined : {accepted:false,reason:'ingest-oversize'}; }, onFrame() {}, onFault() {} },
+  } as any);
+  const event = {receiveSeq:1};
+  const waiting = (collector as any).offerScrolls([event],0);
+  await Bun.sleep(15); expect(offered.length).toBeGreaterThan(1);
+  expect(offered.every(x => x === event)).toBe(true);
+  allow = true; await waiting;
+  expect((collector as any).scrollCount).toBe(1);
+  expect((collector as any).oversizeDrops).toBe(0);
+});
+
+test('contract maximum geometry checkpoint uses compact full buffers and reuses scratch Worker', async () => {
+  const script = String.raw`
+import importlib.util,sys,json
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+w=m.Worker(240,80); w.screen.scroll_on_clear=False
+w.feed(1,1,b'X'*(240*80)); w.feed(2,1,b'\x1b[?1049h'+b'Y'*(240*80)); w.scrolls=[]
+state=w.contract_state()
+assert len(json.dumps(state,separators=(',',':')).encode())*2 < 2*1024*1024
+identity={'pane':{'serverIdentity':'test','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+request={'state':state,'identity':identity,'geometry':state['geometry'],'scrollOnClear':False,'screenRevision':1}
+r=m.checkpoint_transaction(request); scratch=m._transaction_scratch
+assert r['state']==state
+assert len(r['frame']['changedRows'])==80
+assert all(len(row['content']['cells'])==240 for row in r['frame']['changedRows'])
+for _ in range(10):
+    assert m.checkpoint_transaction(request)==r
+    assert m._transaction_scratch is scratch
+assert m.Worker.from_checkpoint(m.decode_extension(state['extensionState'])).export_checkpoint()==w.export_checkpoint()
+print(json.dumps({'state':state,'frame':r['frame']}))
+`;
+  const r = Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
+  const native=JSON.parse(r.stdout.toString());
+  const dir=mkdtempSync(join(tmpdir(),'native-max-contract-'));
+  const path=join(dir,'history.sqlite');
+  let history=new StreamHistoryEngine({path,codecVersions:[native.state.codecVersion]});
+  try {
+    const f=cEngineFixture(), frame={...native.frame,identity:cIdentity};
+    f.ports.vt.prepare=async()=>({status:'ok',value:{frame,scrolls:[],install(){},discard(){}}});
+    f.ports.vt.snapshot=async()=>({status:'ok',value:native.state});
+    const engine=new StreamCaptureEngine({...f.ports,history,initial:{...frame,head:0,revision:0,durableRevision:0}});
+    expect((await engine.acceptInput(cInput(1))).status).toBe('ok');
+    const cp=await engine.checkpoint(cPane,'handoff');
+    expect(cp.status).toBe('ok');
+    history.close();history=new StreamHistoryEngine({path,codecVersions:[native.state.codecVersion]});
+    const recovery=history.recover(cPane,null,{isCancelled:()=>false})[Symbol.asyncIterator]();
+    expect((await recovery.next()).value).toMatchObject({status:'ok',value:{kind:'checkpoint',checkpoint:{state:native.state}}});
+    await recovery.return?.();
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('contract RPC allocation reuses a Worker across distinct packets', () => {
+  const script=String.raw`
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+request={'state':None,'identity':identity,'geometry':{'columns':12,'rows':3},'scrollOnClear':False,'screenRevision':0}
+r=m.checkpoint_transaction(request); scratch=m._transaction_scratch
+for seq in range(1,11):
+    request['state']=r['state'];request['screenRevision']=seq
+    request['event']={'identity':identity,'position':{'sourceEpoch':1,'packetSeq':seq},'payload':{'kind':'bytes','bytes':[65]}}
+    r=m.checkpoint_transaction(request)
+    assert m._transaction_scratch is scratch, 'Worker allocated for a subsequent packet'
+assert r['frame']['changedRows'][0]['content']['cells'][0]['text']=='A'
+`;
+  const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
 });

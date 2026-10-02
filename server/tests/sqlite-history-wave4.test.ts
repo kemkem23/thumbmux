@@ -675,7 +675,7 @@ test('stream-first H admits at most 256 decoded rows and rejects alternate scrol
   try {
     shOk(await f.engine.journalInput(shInput()));
     const { digest: _, ...base } = shAppend();
-    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n } }));
+    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n }, source:{...base.eventId,scrollOrdinal:n} }));
     const oversize = { ...base, rows };
     expect((await f.engine.appendFinalized({ ...oversize, digest: streamDigest('append', oversize) })).status).toBe('error');
     const alt = { ...base, frameDelta: { ...base.frameDelta, buffer: 'alternate' as const } };
@@ -710,4 +710,68 @@ test('stream-first H canonical digest matches independent UTF-8 SHA-256 fixture'
   const { digest: _, ...input } = shInput();
   expect(streamDigest('input', { payload: input.payload, receivedAtMonoMs: input.receivedAtMonoMs,
     position: input.position, identity: input.identity })).toBe(shInput().digest);
+});
+
+// Repair regressions use the real SQLite transaction, including reopen.
+test('contract gap fences pending rows and persists them before repair', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    shOk(await f.engine.appendFinalized(shAppend()));
+    const gap = { episodeId: 'pending-gap', pane: shPane, epochBefore: 1, epochAfter: null,
+      lastDurableInput: shInput().position, lastAdmittedRow: 0, firstObservedAtMonoMs: 0,
+      reason: 'eof' as const, status: 'suspected' as const, missingCount: null };
+    expect(f.engine.beginGap(gap).status).toBe('ok');
+    shOk(await f.engine.journalInput(shInput(2)));
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({ status: 'stale', reason: 'late-gap' });
+    f.reopen();
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({ status: 'stale', reason: 'late-gap' });
+  } finally { f.cleanup(); }
+});
+
+test('contract abandoned recovery cancels its own timer without iterator return', async () => {
+  const f = shFixture(); let cancelled = false;
+  try {
+    shOk(await f.engine.journalInput(shInput())); shOk(await f.engine.appendFinalized(shAppend()));
+    shOk(await shCheckpoint(f.engine));
+    const recovery = f.engine.recover(shPane, null, { isCancelled: () => cancelled })[Symbol.asyncIterator]();
+    await recovery.next(); cancelled = true;
+    await Bun.sleep(120);
+    expect(f.engine.stats().recoveryTimers).toBe(0);
+    expect(f.engine.stats().pins).toBe(0);
+  } finally { f.cleanup(); }
+});
+
+test('contract final repair rows stay fenced until repaired checkpoint commits atomically', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput())); shOk(await f.engine.appendFinalized(shAppend()));
+    shOk(await shCheckpoint(f.engine));
+    const recovery = f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
+    const first = shOk((await recovery.next()).value!);
+    if(first.kind !== 'checkpoint') throw Error('checkpoint expected');
+    await recovery.return?.();
+    const gap = {episodeId:'atomic-close',pane:shPane,epochBefore:1,epochAfter:null,
+      lastDurableInput:shInput().position,lastAdmittedRow:0,firstObservedAtMonoMs:0,
+      reason:'eof' as const,status:'suspected' as const,missingCount:null};
+    shOk(f.engine.beginGap(gap));
+    const inputFence = shOk(await f.engine.journalInput(shInput(2)));
+    const body={episode:gap,chunkId:'final',expectedRevision:1,rows:shAppend(2).rows,final:true};
+    const receipt=shOk(await f.engine.commitRepair({...body,digest:streamDigest('repair',body)}));
+    expect(receipt.complete).toBe(false);
+    expect(f.engine.beginGap(gap).status).toBe('ok');
+    f.reopen();
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({status:'stale',reason:'late-gap'});
+    const checkpoint={...first.checkpoint,checkpointId:'repaired',previousCheckpointId:first.checkpoint.checkpointId,
+      revision:2,head:2,inputFence};
+    const commit={checkpoint,expectedRevision:2,commitId:'repaired',closeGap:gap.episodeId};
+    const durable=shOk(await f.engine.commitCheckpoint({...commit,digest:streamDigest('checkpoint',commit)}));
+    expect(durable.checkpointId).toBe('repaired');
+    f.reopen();
+    const restored=f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
+    expect(shOk((await restored.next()).value!)).toEqual({kind:'checkpoint',checkpoint});
+    await restored.return?.();
+    shOk(await f.engine.journalInput(shInput(3)));
+    expect((await f.engine.appendFinalized(shAppend(3))).status).toBe('ok');
+  } finally { f.cleanup(); }
 });

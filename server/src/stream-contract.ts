@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /** Stream-first v1. Normative semantics: docs/tasks/newarch-stream/DESIGN.md.
  * No I/O here. Implementations must validate untrusted input at their boundary.
  * All counters are nonnegative safe integers; line ranges are [start, end).
@@ -28,6 +29,23 @@ export const STREAM_BUDGET = Object.freeze({
   normalMissingRows: 0, plannedMissingRows: 0, spikeFaultMissingRows: 0,
   unexpectedMarkedRowsPerPane: 5, unexpectedFaultRowsPerSecond: 2,
 } as const);
+
+/** Versioned canonical codec shared with C/D/Q. Object keys are sorted; arrays
+ * retain order; undefined/nonfinite values are rejected instead of erased.
+ * Pass the request WITHOUT its top-level digest. Nested digests are included.
+ */
+export function streamCanonical(value: unknown): string {
+  if (value === null || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'string') { if (!value.isWellFormed()) throw Error('invalid Unicode'); return JSON.stringify(value); }
+  if (typeof value === 'number') { if (!Number.isFinite(value)) throw Error('nonfinite number'); return JSON.stringify(value); }
+  if (Array.isArray(value)) return '[' + value.map(streamCanonical).join(',') + ']';
+  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) throw Error('non-JSON value');
+  const object = value as Record<string, unknown>;
+  return '{' + Object.keys(object).sort().map(k => JSON.stringify(k) + ':' + streamCanonical(object[k])).join(',') + '}';
+}
+export function streamDigest(kind: string, payload: unknown): string {
+  return createHash('sha256').update(streamCanonical({ version: STREAM_CONTRACT_VERSION, kind, payload })).digest('hex');
+}
 
 export interface PaneKey {
   readonly serverIdentity: string;
@@ -99,6 +117,8 @@ export type StreamFailure =
   | { readonly status: 'cancelled'; readonly reason: string }
   | { readonly status: 'error'; readonly code: 'integrity' | 'io' | 'unsupported' | 'unresolved-gap' | 'deadline'; readonly message: string };
 export type Result<T> = { readonly status: 'ok'; readonly value: T } | StreamFailure;
+/** eventId.scrollOrdinal is the first row ordinal of this bounded packet prefix.
+ * Row j has ordinal start+j; each prefix advances revision once. */
 export interface AppendFinalized {
   readonly identity: StreamIdentity; readonly eventId: EventId; readonly digest: Digest;
   readonly expectedRevision: number; readonly rows: readonly FinalizedRow[];
@@ -116,6 +136,9 @@ export interface VtBuffer {
  * unsupported versions must fail closed, never silently reseed a screen.
  */
 export interface VtState {
+  /** extension means rows live in the admitted codec, never interpreted as blank.
+   * C2 uses bounded zlib/base64 z1; decoded scratch <=8 MiB, VT charge unchanged. */
+  readonly bufferEncoding?: 'extension';
   readonly codecVersion: string; readonly geometry: Geometry;
   readonly normal: VtBuffer; readonly alternate: VtBuffer; readonly active: 'normal' | 'alternate';
   readonly modes: Readonly<Record<string, boolean | number>>;
@@ -141,6 +164,8 @@ export interface WalCheckpoint { readonly kind: 'sqlite-wal'; readonly busyReade
 export interface CheckpointCommit {
   readonly checkpoint: VtCheckpoint; readonly expectedRevision: number;
   readonly commitId: string; readonly digest: Digest;
+  /** Close only this fenced episode, after its final rows and verified VT restore. */
+  readonly closeGap?: string;
 }
 export interface GapEpisode {
   readonly episodeId: string; readonly pane: PaneKey; readonly epochBefore: number; readonly epochAfter: number | null;
@@ -157,6 +182,7 @@ export interface RepairChunk {
 export interface RepairReceipt {
   readonly committedIds: readonly RowId[]; readonly committedRevision: number;
   readonly durable: DurableReceipt; readonly complete: boolean;
+  readonly finalChunk?: boolean; // rows sealed; complete requires repaired checkpoint ACK
 }
 /** Yield each committed chunk immediately. Later failure cannot erase that prefix. */
 export type RecoveryChunk =
@@ -201,6 +227,8 @@ export interface CaptureEngine {
   drain(pane: PaneKey, deadlineMonoMs: number): Promise<Result<DurableReceipt>>;
 }
 export interface HistoryEngine {
+  /** Synchronous durable fence; callers must observe ACK before recovery/suffix. */
+  beginGap(episode: GapEpisode): Result<null>;
   journalInput(event: InputEvent): Promise<Result<DurableInputReceipt>>;
   /** Retry identity+digest returns original receipt; different digest is integrity error.
    * Gap fence blocks assigning IDs to suffix. Alt scroll never appends normal history.
