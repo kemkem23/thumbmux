@@ -1223,6 +1223,10 @@ for (const count of [1, 2, 600]) test(`NEWARCH contract real C-H ${count} rows s
       episode=repaired.fault('eof');
       const input=await history.journalInput(cInput(2));
       if(input.status!=='ok')throw Error(JSON.stringify(input)); inputFence=input.value;
+      const suffix={identity:cIdentity,eventId:{pane:cPane,sourceEpoch:1,packetSeq:2,scrollOrdinal:0},
+        expectedRevision:oldCp.revision,rows:[],frameDelta:cFrame(),receivedAtMonoMs:1};
+      expect(await history.appendFinalized({...suffix,digest:streamDigest('append',suffix)}))
+        .toMatchObject({status:'stale',reason:'late-gap'});
       const results=[];for await(const r of repaired.repair(episode,{isCancelled:()=>false}))results.push(r);
       expect(results).toHaveLength(1);expect(results[0]).toMatchObject({status:'ok',value:{complete:true}});
       expect(metrics.find(m=>m.kind==='gap' && m.episode.status==='repaired')?.episode.missingCount).toBeNull();
@@ -1272,5 +1276,23 @@ assert m.Worker.from_checkpoint(m.decode_extension(state['extensionState'])).exp
 print('240x80 normal+alternate exact restore; one scratch Worker for repeated RPC')
 `;
   const r = Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
+});
+
+test('contract RPC allocation reuses a Worker across distinct packets', () => {
+  const script=String.raw`
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+request={'state':None,'identity':identity,'geometry':{'columns':12,'rows':3},'scrollOnClear':False,'screenRevision':0}
+r=m.checkpoint_transaction(request); scratch=m._transaction_scratch
+for seq in range(1,11):
+    request['state']=r['state'];request['screenRevision']=seq
+    request['event']={'identity':identity,'position':{'sourceEpoch':1,'packetSeq':seq},'payload':{'kind':'bytes','bytes':[65]}}
+    r=m.checkpoint_transaction(request)
+    assert m._transaction_scratch is scratch, 'Worker allocated for a subsequent packet'
+assert r['frame']['changedRows'][0]['content']['cells'][0]['text']=='A'
+`;
+  const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
   expect(r.exitCode,r.stderr.toString()).toBe(0);
 });

@@ -169,3 +169,62 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     expect((await run('stream-first H')).exit).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120000);
+
+test('contract repair mutants go red then restored real seams go green', async () => {
+  const pkg=resolve(import.meta.dir,'../..');
+  const root=mkdtempSync(join(tmpdir(),'contract-repair-mutants-'));
+  const mutations=[
+    {name:'BLOCK-1 digest',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'(this.ports.digest ?? streamDigest)(kind, value)',to:"(this.ports.digest ?? streamDigest)('wrong-operation', value)"},
+    {name:'C3-A ordinal',file:'history-engine.ts',pattern:'real C-H 2 rows',
+      from:'{...request.eventId, scrollOrdinal: request.eventId.scrollOrdinal + j}',to:'request.eventId'},
+    {name:'BLOCK-3 batch',file:'capture-engine.ts',pattern:'real C-H 600 rows',
+      from:'chunk.length < B.decodeRows',to:'chunk.length < 600'},
+    {name:'HIGH-4 C fence',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'const fenced = this.ports.history.beginGap(this.episode);',to:"const fenced = {status:'ok' as const,value:null};"},
+    {name:'HIGH-5 oversize',file:'pipe-history-collector.ts',pattern:'collector retains oversize',
+      from:'if (refused(answer)) return {receipt:this.retryPressure(send),pressured:true};',
+      to:'if (isOversize(answer)) return {receipt:undefined,pressured:false};\n    if (refused(answer)) return {receipt:this.retryPressure(send),pressured:true};'},
+    {name:'HIGH-7 unknown',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'missingCount: this.episode!.missingCount',to:'missingCount: 0'},
+    {name:'HIGH-7 atomic',file:'history-engine.ts',test:'sqlite-history-wave4.test.ts',pattern:'final repair rows stay fenced',
+      from:'durable, complete: false, finalChunk: chunk.final',to:'durable, complete: chunk.final, finalChunk: chunk.final'},
+    {name:'timer',file:'history-engine.ts',test:'sqlite-history-wave4.test.ts',pattern:'abandoned recovery',
+      from:'if (timer) { clearInterval(timer); this.recoveryTimers.delete(timer); timer = null; }',to:'/* mutant retains the interval after cancellation */'},
+    {name:'Worker allocation',file:'pipe-vt-worker.py',pattern:'RPC allocation',
+      from:'reused = state is not None and state == _transaction_state',to:'reused = False',
+      from2:'decode_extension(state["extensionState"]), _transaction_scratch',to2:'decode_extension(state["extensionState"]), None'},
+    {name:'C3-C duplicate buffers',file:'pipe-vt-worker.py',pattern:'maximum geometry checkpoint',
+      from:'return {"rows": [],',to:'return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char), row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],'},
+  ];
+  try {
+    mkdirSync(join(root,'server'),{recursive:true});
+    cpSync(join(pkg,'server/src'),join(root,'server/src'),{recursive:true});
+    cpSync(join(pkg,'server/tests'),join(root,'server/tests'),{recursive:true});
+    const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});
+    cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
+    writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root,'package.json'),'{"type":"module"}');
+    for(const m of mutations) {
+      const file=join(root,'server/src',m.file),original=readFileSync(file,'utf8');
+      expect(original.includes(m.from)).toBe(true);
+      let mutant=original.replace(m.from,m.to);
+      if(m.from2) {expect(mutant.includes(m.from2)).toBe(true);mutant=mutant.replace(m.from2,m.to2!);}
+      const run=async()=>{
+        const child=Bun.spawn([process.execPath,'test',`./server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
+          {cwd:root,stdout:'pipe',stderr:'pipe'});
+        const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+        return {exit,output:out+err};
+      };
+      writeFileSync(file,mutant);
+      const red=await run();
+      console.log('CONTRACT_MUTANT_RED',m.name,red.exit,red.output);
+      expect(red.exit).not.toBe(0);expect(red.output).toContain('(fail)');
+      expect(red.output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      writeFileSync(file,original);
+      const green=await run();
+      console.log('CONTRACT_RESTORED_GREEN',m.name,green.exit,green.output);
+      expect(green.exit).toBe(0);expect(green.output).toContain('(pass)');
+    }
+  } finally {rmSync(root,{recursive:true,force:true});}
+},120000);

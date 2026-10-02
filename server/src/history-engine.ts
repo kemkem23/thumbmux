@@ -348,6 +348,8 @@ export class StreamHistoryEngine implements HistoryEngine {
       if (episode.lastDurableInput) { safe(episode.lastDurableInput.sourceEpoch); safe(episode.lastDurableInput.packetSeq); }
       const state = this.state(episode.pane); if (!state) return stale();
       if (episode.lastAdmittedRow !== null) safe(episode.lastAdmittedRow);
+      if (state.gap) return state.gap.episodeId === episode.episodeId && state.gap.epochBefore === episode.epochBefore
+        && state.gap.lastAdmittedRow === episode.lastAdmittedRow ? ok(null) : stale('late-gap');
       if (episode.reason === 'late-gap' || episode.lastAdmittedRow !== (state.head ? state.head - 1 : null)) {
         const gap = copy({ ...episode, reason: 'late-gap' as const, status: 'unresolved' as const });
         const disk = this.state(episode.pane, this.db, false)!;
@@ -356,8 +358,6 @@ export class StreamHistoryEngine implements HistoryEngine {
         for (const [id, pin] of this.pins) if (equal(pin.view.identity.pane, episode.pane)) this.releasePin(id);
         return stale('late-gap');
       }
-      if (state.gap) return state.gap.episodeId === episode.episodeId && state.gap.epochBefore === episode.epochBefore
-        && state.gap.lastAdmittedRow === episode.lastAdmittedRow ? ok(null) : stale('late-gap');
       const key = paneKey(episode.pane);
       this.db.transaction(() => {
         this.flushRows(key);

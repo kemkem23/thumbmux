@@ -34,8 +34,8 @@ import {
  *   but still in the parser are invisible to it.
  * - Capacity pressure (`isCapacityPressure`) is transient: the event is
  *   offered again until accepted. Oversize (`isOversize`: `ingest-oversize`,
- *   legacy `ingest-capacity`) is permanent: the event is offered once,
- *   dropped, and declared by exactly one `consumer-oversize` fault.
+ *   legacy `ingest-capacity`) also retains the event and pauses the source;
+ *   the sink must gain streaming/spool capacity before admission resumes.
  */
 
 export type PaneKey = { serverIdentity: string; paneId: string; birthGeneration: number };
@@ -166,8 +166,8 @@ export function isCapacityPressure(value: unknown): boolean {
  * A consumer answer meaning "this one event can never fit, even in an idle
  * store" (review 2 M1): reason or error message `ingest-oversize` (I2 FIX2),
  * or the legacy `ingest-capacity` message of the FIX1 store. Waiting cannot
- * help, so the event is offered once, dropped, and declared with one
- * `consumer-oversize` marker; the pane keeps flowing and the parser stays.
+ * help without a sink change; retain the event under backpressure until
+ * the sink can admit it. Never turn refusal into an acknowledged loss.
  */
 export function isOversize(value: unknown): boolean {
   if (value === null || typeof value !== "object" || isCapacityPressure(value)) return false;
@@ -180,22 +180,6 @@ export function isOversize(value: unknown): boolean {
 function isRefusal(value: unknown): boolean {
   return value !== null && typeof value === "object" && (value as { accepted?: unknown }).accepted === false
     && !isCapacityPressure(value) && !isOversize(value);
-}
-
-/** Receipt value of an event the consumer refused as oversize (dropped, declared). */
-
-
-type BunPeek = { peek?: ((promise: unknown) => unknown) & { status?: (promise: unknown) => string } };
-
-/**
- * A receipt that is already settled as "not accepted" (rejected, or fulfilled
- * with a capacity-pressure answer), read without awaiting it (Bun only).
- */
-function refusedNow(receipt: PromiseLike<unknown>): boolean {
-  const peek = (globalThis as { Bun?: BunPeek }).Bun?.peek;
-  const status = peek?.status?.(receipt);
-  if (status === "rejected") return true;
-  return status === "fulfilled" && isCapacityPressure(peek!(receipt));
 }
 
 function isReceipt(value: unknown): value is PromiseLike<unknown> {
