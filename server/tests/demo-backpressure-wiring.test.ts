@@ -385,3 +385,73 @@ test('stream I bootstrap cannot reconstruct pending parser state from identical 
   expect(cell(a)).not.toEqual(cell(b));
  }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
 },10000);
+
+import { StreamArchiveCatalog, StreamArchiveBridge, type ArchiveRangeReader } from '../../../../src/integrations/stream-archive-bridge';
+import { type FinalizedRow } from '../src/stream-contract';
+
+test('stream I archive catalog publishes only committed intervals, resumes decisions and maps fragmented rows across route changes', async () => {
+  const root = await mkdtemp(join(tmpdir(),'stream-i-archive-'));
+  const runtime = new StreamRuntime({path:join(root,'stream.sqlite')});
+  let catalog = new StreamArchiveCatalog(join(root,'catalog.sqlite'));
+  try {
+    const pane = await runtime.add(streamTestIdentity,{columns:20,rows:3},streamPorts);
+    const identity = pane.identity.pane;
+    const initial = {pane:identity,route:'legacy' as const,generation:1,globalStart:0,localStart:0,root:'legacy-A',schema:'fixture'};
+    catalog.initialize(initial);
+    await pane.ingest(Buffer.from('repeat\r\n\r\nrepeat\r\nA\r\nB\r\n'));
+    const first = (await pane.drain())!;
+    expect(first.head).toBeGreaterThan(0);
+    catalog.begin(identity,'forward',1,'stream');
+    const middle = {pane:identity,route:'stream' as const,generation:2,globalStart:first.head,localStart:first.head,root:'stream-B',schema:'sh-v1'};
+    expect(() => catalog.prepare(identity,'forward',first,middle,'screenshot')).toThrow('full-state');
+    catalog.prepare(identity,'forward',first,middle,first.stateDigest);
+    expect(catalog.segmentAt(identity,0)).toBeNull();
+    expect(catalog.owner(identity)).toEqual(initial);
+    catalog.close(); catalog = new StreamArchiveCatalog(join(root,'catalog.sqlite'));
+    expect(catalog.pending(identity)?.phase).toBe('PREPARED');
+    catalog.commit(identity,'forward'); catalog.commit(identity,'forward');
+    expect(catalog.owner(identity)).toEqual(middle);
+    expect(catalog.pending(identity)).toBeNull();
+    await pane.ingest(Buffer.from('repeat\r\n\r\nC\r\nD\r\n'));
+    const second = (await pane.drain())!;
+    catalog.begin(identity,'rollback',2,'legacy');
+    const suffix = {...middle,route:'legacy' as const,generation:3,globalStart:second.head,localStart:second.head,root:'legacy-C',schema:'fixture'};
+    catalog.prepare(identity,'rollback',second,suffix,second.stateDigest);
+    catalog.commit(identity,'rollback');
+    expect(() => catalog.begin(identity,'other',2,'stream')).toThrow('CAS');
+    expect(() => catalog.begin(identity,'rollback',1,'legacy')).toThrow('collision');
+    expect(catalog.segmentAt(identity,first.head)?.root).toBe('stream-B');
+    expect(catalog.segmentAt(identity,second.head)).toBeNull(); // live screen isn't archived
+    const route = {viewerId:'archive-oracle',identity:pane.identity,routeGeneration:3};
+    expect((await pane.attach(route,()=>{})).status).toBe('ok');
+    const page = await pane.page(route,{requestId:'archive-oracle',identity:pane.identity,routeGeneration:3,
+      range:{start:0,end:second.head},deadlineMonoMs:performance.now()+1000},null,256,{isCancelled:()=>false});
+    if (page.status !== 'ok') throw Error(JSON.stringify(page));
+    const rows = new Map(page.value.fragments.map(f => [f.row.id.lineId,f.row]));
+    await pane.detach(route.viewerId);
+    let retired = 0;
+    const reader: ArchiveRangeReader = {
+      read: async (_segment,line,cell) => {
+        const row = rows.get(line)!;
+        const end = Math.min(cell+2,row.cells.length);
+        return {fragment:{row:{...row,cells:row.cells.slice(cell,end)},startCell:cell,endCell:end,complete:cell===0&&end===row.cells.length},rowEnd:end===row.cells.length};
+      },
+      retire:async()=>{ retired++; },
+    };
+    catalog.close(); catalog = new StreamArchiveCatalog(join(root,'catalog.sqlite'),true);
+    const bridge = new StreamArchiveBridge(catalog,{legacy:reader,stream:reader});
+    const restored = new Map<number,FinalizedRow>();
+    await bridge.read(identity,0,second.head,new AbortController().signal,async fragment => {
+      const previous = restored.get(fragment.row.id.lineId);
+      restored.set(fragment.row.id.lineId,{...fragment.row,cells:[...(previous?.cells??[]),...fragment.row.cells]});
+    });
+    expect([...restored]).toEqual([...rows]);
+    expect(retired).toBe(2);
+    expect(catalog.committed(identity,'rollback')).toBe(true);
+    expect(() => catalog.initialize(initial)).toThrow();
+    const failure: ArchiveRangeReader = {...reader,read:async()=>{throw Error('archive busy');}};
+    const broken = new StreamArchiveBridge(catalog,{legacy:failure,stream:reader});
+    await expect(broken.read(identity,0,1,new AbortController().signal,async()=>{})).rejects.toThrow('archive busy');
+    expect(retired).toBe(4);
+  } finally { catalog.close(); await runtime.close(); await rm(root,{recursive:true,force:true}); }
+},30000);
