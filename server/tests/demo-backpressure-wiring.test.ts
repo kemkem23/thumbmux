@@ -475,6 +475,7 @@ import { StreamArchiveRowReader } from '../src/history-engine';
 import { StreamLegacyComposite, StreamSegmentReader, composeLegacyArchive, installStreamArchive,
   openStreamArchive, rowAnsi, type ArchiveSegment } from '../../../../src/integrations/stream-archive-bridge';
 import { openStreamArchiveForLegacy, closeStreamArchiveForLegacy, writeStreamTenureMarker } from '../../../../src/integrations/stream-pipe-host';
+import { setLegacyWriterKick } from '../../../../src/integrations/stream-archive-registry';
 
 /** terminal-history page semantics: before is exclusive end, after is
  * exclusive start, pages clamp below the requested limit. */
@@ -595,15 +596,23 @@ test('stream I rollback bridge: legacy reads join the frozen sh_* interval exact
   }
 },30000);
 
+/** A keeper tick report for one session that proves the writer ran. */
+const writerRan={sessionsConsidered:1,caughtUp:1,linesAppended:0};
 /** Host with a real unix socket path, a fake tmux identity and a fake pipe owner.
- * `history` is what the fake tmux reports as the pane's retained history. */
-async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={},history:{size:number,limit:number}|null=null){
+ * `history` is what the fake tmux reports as the pane's retained history (rows
+ * as plain text). The legacy writer kick is registered the way src/index.ts
+ * registers the keeper; `kick` replaces its report. */
+async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={},history:{size:number,limit:number,rows?:string[]}|null=null,
+  kick:(s:string)=>unknown=()=>writerRan){
   const sock=join(root,'tmux.sock');const server=Bun.listen({unix:sock,socket:{data(){}}});
   writeFileSync(join(root,'allowlist.json'),JSON.stringify({server:'S1',sessions:[{sessionId:'$1'}]}));
   const events:string[]=[];let handlers:any=null;
-  const host=new StreamPipeHost({root,tmuxSocket:sock,legacyLines:()=>0,startLegacyWriter:async s=>{events.push('writer:'+s);},...options});
-  (host as any).tmux=(args:string[])=>args.at(-1)==='#{history_size} #{history_limit}'
-    ?(history?{exitCode:0,stderr:'',stdout:`${history.size} ${history.limit}\n`}:{exitCode:1,stderr:'gone',stdout:''})
+  setLegacyWriterKick(async s=>{events.push('writer:'+s);return kick(s);});
+  const host=new StreamPipeHost({root,tmuxSocket:sock,legacyLines:()=>0,handoffRetryMs:20,...options});
+  (host as any).tmux=(args:string[])=>args.includes('#{history_size} #{history_limit}')
+    ?(history?{exitCode:0,stderr:'',stdout:`${history.size} ${history.limit}\n`+(history.rows??Array.from({length:history.size},()=>'')).map(l=>l+'\n').join('')}:{exitCode:1,stderr:'gone',stdout:''})
+    :args.includes('#{history_size} #{cursor_x} #{cursor_y} #{alternate_on} #{pane_width} #{pane_height}')
+      ?{exitCode:0,stderr:'',stdout:'0 0 0 0 12 3\n\n\n\n'}
     :{exitCode:0,stderr:'',stdout:args.includes('-t')?'$1\t%9\t123\n':'S1\n'};
   (host as any).pipes={
     startBinaryPipe:(_s:string,h:any)=>{handlers=h;events.push('start');return true;},
@@ -617,7 +626,7 @@ async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={},h
     const pane=await host.runtime.add(identity,{columns:12,rows:3},streamPorts);pane.stopCadence();
     await host.attachSource(session,pane,1);return pane;
   };
-  return{host,events,attach,handlers:()=>handlers,identity,close:async()=>{try{await host.close();}finally{server.stop(true);}}};
+  return{host,events,attach,handlers:()=>handlers,identity,close:async()=>{try{await host.close();}finally{server.stop(true);setLegacyWriterKick(null);}}};
 }
 
 test('stream I host rollback: planned route switch and shutdown commit one durable interval and release the pipe first',async()=>{
@@ -632,7 +641,8 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
     expect(rig.host.projection.owns('s')).toBe(true);
     await rig.handlers().onBytes(Buffer.from(Array.from({length:30},(_,i)=>`p${i}\r\n`).join('')));
     const F=(await pane.drain())!.head,oracle=await oracleRows(pane,F);
-    history.size=F;
+    // tmux holds the same F rows: the fence is proven by content, not count.
+    history.size=F;(history as any).rows=oracle.map(l=>plain(l).trimEnd());
     const receipt=await rig.host.setRoute('s','legacy');
     expect(receipt).toMatchObject({ok:true,from:'newarch',to:'legacy'});
     // Our writer is detached before the legacy path is told to attach its own.
@@ -644,7 +654,7 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
     // tmux still holds the F stream rows from its row 0: legacy resumes after them.
     expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',generation:2,globalStart:F,localStart:F});
     expect(catalog.segmentAt(rig.identity.pane,F-1)).toMatchObject({route:'stream',globalEnd:F,seam:{kind:'planned',missingCount:null}});
-    expect(catalog.segmentAt(rig.identity.pane,F-1)!.seam.reason).toContain('fence exact');
+    expect(catalog.segmentAt(rig.identity.pane,F-1)!.seam.reason).toContain('fence exact: tmux row 0 is stream row 0');
     legacy.lines.set('s',[...oracle.map(l=>'tmux:'+plain(l)),'after-0']);
     walk(archive,'s',[...oracle,'after-0'],7);
     // A second switch and re-entry are refused, not faked.
@@ -658,10 +668,13 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
     const pane=await rig2.attach('z');await rig2.handlers().onBytes(Buffer.from('a\r\nb\r\nc\r\nd\r\n'));
     const F=(await pane.drain())!.head;
     const closed=await rig2.host.close();expect(closed.issues).toEqual([]);expect(closed.drained).toBe(true);
+    // Shutdown leaves the handoff PREPARED: the next boot proves its fence
+    // again against what tmux and the legacy writer hold, then commits.
+    expect(rig2.host.archive).not.toBeNull();
     const again=new StreamPipeHost({root:root2,tmuxSocket:(rig2.host.options.tmuxSocket)});
     (again as any).pipes=(rig2.host as any).pipes;
     await again.start();
-    expect(again.finalize).toEqual({finalized:[],resolved:[],blocked:[]});
+    expect(again.finalize).toEqual({finalized:[],resolved:['shutdown:1'],blocked:[]});
     expect(again.archive!.catalog.segmentAt(rig2.identity.pane,0)).toMatchObject({globalEnd:F,seam:{kind:'shutdown',missingCount:null}});
     await again.close();
   }finally{await rig2.close().catch(()=>{});await rm(root2,{recursive:true,force:true});}
@@ -901,62 +914,64 @@ test('stream I flag off: boots run nothing of stream-first without a recorded te
   }finally{await stopPipeHistoryHost().catch(()=>{});server.kill();await rm(dir,{recursive:true,force:true});}
 },60000);
 
-/** The real legacy writer and archive: the history keeper pass the handoff
- * starts, appending into a TerminalHistoryArchive read through DbHistoryArchive
- * — the same classes production composes — against a real private tmux pane
- * that printed the same bytes the stream parsed. Nothing on the legacy side is
- * prepared by hand. */
-async function realLegacyRollback(historyLimit:number,afterHandoff:number){
-  const dir=await mkdtemp(join(tmpdir(),'stream-i-fence-'));const server=privateTmux(dir,historyLimit);
+/** Real stream host on a private tmux server: real allowlist and pane
+ * identity, real pipe-pane FIFO (the stream sees only bytes tmux pipes after
+ * attach), the real history keeper registered as the legacy writer kick the
+ * way src/index.ts registers it, and a real TerminalHistoryArchive read
+ * through DbHistoryArchive. Nothing on either side is fed or seeded by hand.
+ * Session `s` waits on `go1`/`go2` and then prints b*, c*; session `p` prints
+ * before anything can attach. */
+async function realPipeRig(historyLimit:number,{register=true,bLines=30,cLines=20}={}){
+  const dir=await mkdtemp(join(tmpdir(),'stream-i-pipe-'));const server=privateTmux(dir,historyLimit);
   const previousDir=process.env.TERMINAL_HISTORY_DIR;process.env.TERMINAL_HISTORY_DIR=join(dir,'history');
   const {TerminalHistoryArchive}=await import('../../../../src/integrations/terminal-history');
   const {DbHistoryArchive}=await import('../../../../src/integrations/db-history-archive');
   const {runHistoryKeeperTick}=await import('../../../../src/integrations/history-keeper');
-  const {legacyArchivedLines}=await import('../../../../src/integrations/stream-archive-registry');
-  const before=Array.from({length:30},(_,i)=>`a${i}`),after=Array.from({length:afterHandoff},(_,i)=>`b${i}`);
-  writeFileSync(join(dir,'a.txt'),before.join('\n')+'\n');writeFileSync(join(dir,'b.txt'),after.map(l=>l+'\n').join(''));
-  const paneId=server.session('s',`sh -c 'cat ${dir}/a.txt; while [ ! -e ${dir}/go ]; do sleep 0.05; done; cat ${dir}/b.txt; exec sleep 600'`);
+  const b=Array.from({length:bLines},(_,i)=>`b${i}`),c=Array.from({length:cLines},(_,i)=>`c${i}`);
+  writeFileSync(join(dir,'b.txt'),b.map(l=>l+'\n').join(''));writeFileSync(join(dir,'c.txt'),c.map(l=>l+'\n').join(''));
+  writeFileSync(join(dir,'a.txt'),Array.from({length:30},(_,i)=>`a${i}\n`).join(''));
+  const wait=(f:string)=>`while [ ! -e ${dir}/${f} ]; do sleep 0.05; done`;
+  const paneId=server.session('s',`sh -c '${wait('go1')}; cat ${dir}/b.txt; ${wait('go2')}; cat ${dir}/c.txt; exec sleep 600'`);
+  const pPane=server.session('p',`sh -c 'cat ${dir}/a.txt; exec sleep 600'`);
   const capture=(start:number)=>{
     const lines=server.t(['capture-pane','-t',paneId,'-p','-e','-S',String(start)]).split('\n');
     while(lines.length&&lines.at(-1)!.trim()==='')lines.pop();return lines.join('\n');
   };
-  const waitFor=async(text:string)=>{for(let i=0;i<200&&!capture(-historyLimit).includes(text);i++)await Bun.sleep(25);expect(capture(-historyLimit)).toContain(text);};
-  await waitFor('a29');
+  const tmuxHas=async(id:string,text:string)=>{
+    const has=()=>server.t(['capture-pane','-t',id,'-p','-S',String(-historyLimit)]).split('\n').some(l=>l.trimEnd()===text);
+    for(let i=0;i<200&&!has();i++)await Bun.sleep(25);expect(has()).toBe(true);
+  };
   const file=new TerminalHistoryArchive(),legacyArchive=composeLegacyArchive(new DbHistoryArchive(file as any));
-  const deps={
-    listSessions:()=>[{name:'s',paneRows:3}],sampleDeadPanes:()=>new Set<string>(),historyLimit:()=>historyLimit,liveLineLimit:()=>3,
-    capture:async(_s:string,o:{startLine:number})=>capture(o.startLine),
-    archivedTail:(s:string,n:number)=>{const t=file.getManifest(s).totalLines;return t?file.readRange(s,Math.max(0,t-n),t):[];},
-    appendLines:(s:string,l:string[])=>file.appendLines(s,l),appendMarker:(s:string,x:string)=>file.appendLines(s,[x]),warn:()=>{},
-  };
   const root=join(dir,'root');mkdirSyncFs(root);
-  const rig=await r5Host(root,{legacyLines:(s:string)=>legacyArchivedLines(s)!,
-    startLegacyWriter:async(s:string)=>{await runHistoryKeeperTick(deps,{session:s});}} as any);
-  const fake=(rig.host as any).tmux;
-  (rig.host as any).tmux=(args:string[])=>args.at(-1)==='#{history_size} #{history_limit}'
-    ?{exitCode:0,stderr:'',stdout:server.t(['display-message','-p','-t',paneId,'#{history_size} #{history_limit}'])}:fake(args);
-  const cleanup=async()=>{
-    await rig.close().catch(()=>{});server.kill();
-    if(previousDir===undefined)delete process.env.TERMINAL_HISTORY_DIR;else process.env.TERMINAL_HISTORY_DIR=previousDir;
-    await rm(dir,{recursive:true,force:true});
+  const stamp=server.t(['display-message','-p','#{pid}@#{start_time}']).trim();
+  const ids=(name:string)=>server.t(['display-message','-p','-t',`=${name}:0.0`,'#{session_id}\t#{pane_id}\t#{pane_pid}']).trim().split('\t');
+  writeFileSync(join(root,'allowlist.json'),JSON.stringify({server:stamp,sessions:[{sessionId:ids('s')[0]},{sessionId:ids('p')[0]}]}));
+  const host=new StreamPipeHost({root,tmuxSocket:server.socket,handoffRetryMs:30});
+  const listed={value:true};
+  const deps={
+    listSessions:()=>listed.value?[{name:'s',paneRows:3}]:[],sampleDeadPanes:()=>new Set<string>(),historyLimit:()=>historyLimit,liveLineLimit:()=>3,
+    routedAway:(name:string)=>host.isRouted(name),capture:async(_s:string,o:{startLine:number})=>capture(o.startLine),
+    archivedTail:(name:string,n:number)=>{const t=file.getManifest(name).totalLines;return t?file.readRange(name,Math.max(0,t-n),t):[];},
+    appendLines:(name:string,l:string[])=>file.appendLines(name,l),appendMarker:(name:string,x:string)=>file.appendLines(name,[x]),warn:()=>{},
   };
-  try{
-    const pane=await rig.attach();
-    await rig.handlers().onBytes(Buffer.from(before.join('\r\n')+'\r\n'));
-    const F=(await pane.drain())!.head,oracle=(await oracleRows(pane,F)).map(l=>plain(l).trimEnd());
-    expect(oracle).toEqual(before.slice(0,F));
-    const tmuxHistory=Number(server.t(['display-message','-p','-t',paneId,'#{history_size}']).trim());
-    expect((await rig.host.setRoute('s','legacy')).ok).toBe(true);
-    // No viewer anywhere: the writer already ran, and its seed is tmux's copy
-    // of the stream rows from row 0 (or of what tmux still held) — the overlap
-    // that a fence at the legacy resume point would show twice.
-    const seeded=file.getManifest('s').totalLines;
-    expect(seeded).toBeGreaterThan(0);
-    const owner=rig.host.archive!.catalog.owner(rig.identity.pane)!;
-    if(afterHandoff){
-      writeFileSync(join(dir,'go'),'');await waitFor(`b${afterHandoff-1}`);
-      await runHistoryKeeperTick(deps);
-    }
+  const kick=(name:string)=>runHistoryKeeperTick(deps,{session:name});
+  if(register)setLegacyWriterKick(kick);
+  await host.start();
+  const identityOf=(name:string)=>{const [,pane,pid]=ids(name);
+    return{pane:{serverIdentity:`${server.socket}#${stamp}`,paneId:pane,birthGeneration:Number(pid)},sourceEpoch:1,geometryGeneration:0};};
+  const identity=identityOf('s');
+  const attach=async(name='s')=>{
+    const pane=await host.runtime.add(identityOf(name),{columns:12,rows:3},streamPorts);pane.stopCadence();
+    try{await host.attachSource(name,pane,1);}catch(error){await host.runtime.remove(pane);throw error;}
+    return pane;
+  };
+  /** Wait until the stream parsed (through the pipe) the row `text`. */
+  const streamHas=async(pane:import('../src/stream-runtime').StreamRuntimePane,text:string)=>{
+    for(let i=0;i<200;i++){const F=(await pane.drain())!.head;if((await oracleRows(pane,F)).map(l=>plain(l).trimEnd()).includes(text))return F;await Bun.sleep(25);}
+    throw Error(`stream never parsed ${text}`);
+  };
+  /** The joined legacy history, paged both ways at several sizes (must agree). */
+  const history=()=>{
     const back:string[]=[],fwd:string[]=[];
     for(const limit of [1,4,500]){
       back.length=0;fwd.length=0;let at:number|null=null;
@@ -964,38 +979,147 @@ async function realLegacyRollback(historyLimit:number,afterHandoff:number){
       at=null;for(let g=0;;g++){const p=legacyArchive.readAfter!('s',at,limit) as any;fwd.push(...p.lines);if(!p.hasMore)break;at=p.endLine-1;if(g>500)throw Error('no progress');}
       expect(fwd).toEqual(back);
     }
-    const text=back.map(l=>plain(l).trimEnd());
-    return{F,tmuxHistory,seeded,owner,text,legacy:file.readRange('s',0,file.getManifest('s').totalLines).map(l=>plain(l).trimEnd()),
-      seam:rig.host.archive!.catalog.segmentAt(rig.identity.pane,F-1)!.seam,printed:[...before,...after],cleanup};
-  }catch(error){await cleanup();throw error;}
+    return back.map(l=>plain(l).trimEnd());
+  };
+  const catalog=()=>host.archive!.catalog;
+  const cleanup=async()=>{
+    setLegacyWriterKick(null);await host.close().catch(()=>{});installStreamArchive(null);server.kill();
+    if(previousDir===undefined)delete process.env.TERMINAL_HISTORY_DIR;else process.env.TERMINAL_HISTORY_DIR=previousDir;
+    await rm(dir,{recursive:true,force:true});
+  };
+  return{dir,server,host,paneId,pPane,root,identity,attach,streamHas,tmuxHas,history,catalog,file,kick,listed,b,c,cleanup,
+    go:(f:string)=>writeFileSync(join(dir,f),''),keeperTick:()=>runHistoryKeeperTick(deps)};
 }
+const tmuxHistorySize=(r:{server:{t:(a:string[])=>string},paneId:string})=>Number(r.server.t(['display-message','-p','-t',r.paneId,'#{history_size}']).trim());
+const until=async(f:()=>boolean,what:string)=>{for(let i=0;i<400&&!f();i++)await Bun.sleep(10);if(!f())throw Error(`timed out: ${what}`);};
 
-test('stream I rollback seam against the real legacy writer: tmux re-seeds the stream rows, none is shown twice or lost',async()=>{
-  const r=await realLegacyRollback(2000,20);
+test('stream I real pipe: tmux prehistory is refused at attach; a blank pane rolls back with a content-proven fence and the real writer',async()=>{
+  const r=await realPipeRig(2000);
   try{
-    // tmux kept every row from 0: the fence is exact at the stream head.
-    expect(r.tmuxHistory).toBe(r.F);
-    expect(r.owner).toMatchObject({route:'legacy',globalStart:r.F,localStart:r.F});
-    expect(r.seam.reason).toContain('fence exact');
-    // The real writer's archive starts with tmux's copy of the stream rows...
-    expect(r.legacy.slice(0,r.F)).toEqual(r.printed.slice(0,r.F));
-    // ...and the joined history is the printed sequence once, in order: every
-    // row up to the writer's live window, no duplicate, no hole.
-    expect(r.text.length).toBe(r.legacy.length);
-    expect(r.text).toEqual(r.printed.slice(0,r.text.length));
-    expect(r.text.length).toBeGreaterThan(r.F+10);
-    expect(new Set(r.text).size).toBe(r.text.length);
+    // `p` printed 30 rows before any attach. The legacy archive holds none of
+    // them, which is all the previous admission checked; tmux does.
+    await r.tmuxHas(r.pPane,'a29');
+    await expect(r.attach('p')).rejects.toThrow('tmux prehistory');
+    expect(r.host.archive).toBeNull();expect(existsSync(join(r.root,'stream-tenure'))).toBe(false);
+    // `s` is blank: the anchor is recorded and only piped bytes reach the stream.
+    const pane=await r.attach();
+    expect(r.catalog().owner(r.identity.pane)!.anchor).toMatchObject({sourceRow:0});
+    r.go('go1');await r.tmuxHas(r.paneId,'b29');
+    const F=await r.streamHas(pane,`b${r.b.length-3}`);
+    expect(F).toBe(r.b.length-2);expect(tmuxHistorySize(r)).toBe(F);
+    const receipt=await r.host.setRoute('s','legacy');
+    expect(receipt).toMatchObject({ok:true,from:'newarch',to:'legacy'});
+    expect(r.host.pendingHandoffs()).toEqual([]);
+    const seam=r.catalog().segmentAt(r.identity.pane,F-1)!.seam;
+    expect(seam.reason).toContain('fence exact: tmux row 0 is stream row 0');
+    expect(r.catalog().owner(r.identity.pane)).toMatchObject({route:'legacy',globalStart:F,localStart:F});
+    // The writer already ran (no viewer exists): proven by its own append.
+    expect(r.file.getManifest('s').totalLines).toBeGreaterThan(0);
+    r.go('go2');await r.tmuxHas(r.paneId,`c${r.c.length-1}`);await r.keeperTick();
+    const text=r.history(),printed=[...r.b,...r.c];
+    expect(text).toEqual(printed.slice(0,text.length));
+    expect(text.length).toBeGreaterThan(F+10);
+    expect(new Set(text).size).toBe(text.length);
   }finally{await r.cleanup();}
 },60000);
 
-test('stream I rollback seam fails closed when tmux history is full: every row tmux held is skipped, nothing doubled',async()=>{
-  const r=await realLegacyRollback(10,0);
+test('stream I real pipe: a full tmux history is aligned by content, not assumed — every row once',async()=>{
+  const r=await realPipeRig(10);
   try{
-    expect(r.tmuxHistory).toBe(10);expect(r.F).toBe(28);
-    expect(r.owner).toMatchObject({globalStart:r.F,localStart:10});
-    expect(r.seam.reason).toContain('fence unproven: tmux history reached its limit');
-    // The writer seeded what tmux still held (rows the stream already has).
-    expect(r.legacy).toEqual(r.printed.slice(r.F-10,r.F-10+r.seeded));
-    expect(r.text).toEqual(r.printed.slice(0,r.F));
+    const pane=await r.attach();
+    r.go('go1');await r.tmuxHas(r.paneId,'b29');
+    const F=await r.streamHas(pane,'b27');
+    expect(F).toBe(28);expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(9);
+    expect((await r.host.setRoute('s','legacy')).ok).toBe(true);
+    const held=r.catalog().owner(r.identity.pane)!.localStart;
+    // tmux dropped the oldest rows; the rows it still holds were matched.
+    expect(r.catalog().segmentAt(r.identity.pane,F-1)!.seam.reason).toContain(`fence exact: tmux row 0 is stream row ${F-held}`);
+    r.go('go2');await r.tmuxHas(r.paneId,`c${r.c.length-1}`);await r.keeperTick();
+    const text=r.history(),printed=[...r.b,...r.c];
+    expect(text.slice(0,F)).toEqual(r.b.slice(0,F));
+    expect(text).toEqual(printed.slice(0,text.length));
+    expect(new Set(text).size).toBe(text.length);
+  }finally{await r.cleanup();}
+},60000);
+
+test('stream I real pipe: clear-history in the tenure cannot pass as exact — the fence fails closed and nothing is doubled',async()=>{
+  const r=await realPipeRig(2000,{cLines:30});
+  try{
+    const pane=await r.attach();
+    r.go('go1');await r.tmuxHas(r.paneId,'b29');
+    const F=await r.streamHas(pane,'b27');
+    r.server.t(['clear-history','-t',r.paneId]);
+    r.go('go2');await r.tmuxHas(r.paneId,'c29');await r.streamHas(pane,'c27');
+    // tmux history climbed back above the stream's rows: the old count-only
+    // fence called this exact and silently skipped real rows.
+    expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(F);
+    expect((await r.host.setRoute('s','legacy')).ok).toBe(true);
+    const seam=r.catalog().segmentAt(r.identity.pane,0)!.seam;
+    expect(seam.reason).toContain('fence unproven: no source offset matches the stream rows by content');
+    expect(seam.missingCount).toBeNull();
+    const text=r.history();
+    expect(new Set(text).size).toBe(text.length);
+    // The frozen stream rows are served; every tmux row that could repeat
+    // them is skipped (the declared gap), so no b-row appears after them.
+    expect(text.slice(0,F)).toEqual(r.b.slice(0,F));
+    expect(text.slice(F).some(l=>l.startsWith('b'))).toBe(false);
+  }finally{await r.cleanup();}
+},60000);
+
+test('stream I real pipe EOF: no writer keeps the route; once one registers the pane goes to legacy and output after the EOF is not lost',async()=>{
+  const r=await realPipeRig(2000,{register:false});
+  try{
+    const pane=await r.attach();
+    r.go('go1');await r.tmuxHas(r.paneId,'b29');
+    const F=await r.streamHas(pane,'b27');
+    // A real source EOF: tmux closes the pipe; the reader sees end of file.
+    r.server.t(['pipe-pane','-t',r.paneId]);
+    await until(()=>r.host.status().awaitingWriter.includes('s'),'EOF reached the host');
+    // No legacy writer: nothing switched, the owner is still the stream.
+    expect(r.host.isRouted('s')).toBe(true);
+    expect(r.catalog().owner(r.identity.pane)!.route).toBe('stream');
+    expect(r.host.archive!.rows!.durable(r.identity.pane)!.gap).toMatchObject({reason:'eof',missingCount:null});
+    // tmux keeps printing; the stream receives none of it.
+    r.go('go2');await r.tmuxHas(r.paneId,'c19');
+    expect((await pane.drain().catch(()=>pane.frame))!.head).toBe(F);
+    setLegacyWriterKick(r.kick);
+    await until(()=>r.catalog().owner(r.identity.pane)?.route==='legacy','handoff after the writer registered');
+    expect(r.host.isRouted('s')).toBe(false);expect(r.host.status().awaitingWriter).toEqual([]);
+    const seam=r.catalog().segmentAt(r.identity.pane,F-1)!.seam;
+    expect(seam).toMatchObject({kind:'source-eof',missingCount:null});
+    expect(seam.reason).toContain('fence exact');
+    await r.keeperTick();
+    // The EOF gap is declared, but tmux kept every byte: the joined history is
+    // the printed sequence once, including what was written after the EOF.
+    const text=r.history(),printed=[...r.b,...r.c];
+    expect(text).toEqual(printed.slice(0,text.length));
+    expect(text.length).toBeGreaterThan(r.b.length+10);
+  }finally{await r.cleanup();}
+},60000);
+
+test('stream I real pipe: a legacy writer that throws or does not list the session is not a rollback — PREPARED, served without doubles, committed once proven',async()=>{
+  const r=await realPipeRig(2000);
+  try{
+    const pane=await r.attach();
+    r.go('go1');await r.tmuxHas(r.paneId,'b29');
+    const F=await r.streamHas(pane,'b27');
+    setLegacyWriterKick(()=>{throw Error('keeper exploded');});
+    const first=await r.host.setRoute('s','legacy');
+    expect(first.ok).toBe(false);expect(first.error).toContain('legacy writer not proven: legacy writer: keeper exploded');
+    expect(r.host.pendingHandoffs()).toEqual(['s']);
+    expect(r.catalog().pending(r.identity.pane)!.phase).toBe('PREPARED');
+    expect(r.catalog().owner(r.identity.pane)!.route).toBe('stream');
+    // The real writer, but the session is not listed (e.g. skipped by policy).
+    r.listed.value=false;setLegacyWriterKick(r.kick);
+    const second=await r.host.setRoute('s','legacy');
+    expect(second.error).toContain('the legacy writer does not list this session');
+    // Served as it will commit: the frozen rows, then nothing doubled.
+    expect(r.history()).toEqual(r.b.slice(0,F));
+    r.listed.value=true;
+    await until(()=>r.catalog().owner(r.identity.pane)?.route==='legacy','retry commits once the writer is proven');
+    expect(r.host.pendingHandoffs()).toEqual([]);
+    r.go('go2');await r.tmuxHas(r.paneId,'c19');await r.keeperTick();
+    const text=r.history(),printed=[...r.b,...r.c];
+    expect(text).toEqual(printed.slice(0,text.length));expect(text.length).toBeGreaterThan(F+10);
   }finally{await r.cleanup();}
 },60000);
