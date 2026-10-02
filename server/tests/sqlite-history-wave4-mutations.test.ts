@@ -194,6 +194,8 @@ test('contract repair mutants go red then restored real seams go green', async (
     {name:'Worker allocation',file:'pipe-vt-worker.py',pattern:'RPC allocation',
       from:'reused = state is not None and state == _transaction_state',to:'reused = False',
       from2:'decode_extension(state["extensionState"]), _transaction_scratch',to2:'decode_extension(state["extensionState"]), None'},
+    {name:'L1 oversized escape',file:'pipe-vt-worker.py',pattern:'oversized OSC checkpoint',
+      from:'prefix = self.pending_sequence',to:'raise ValueError("pending escape exceeds checkpoint budget")'},
     {name:'C3-C duplicate buffers',file:'pipe-vt-worker.py',pattern:'maximum geometry checkpoint',
       from:'return {"rows": [],',to:'return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char), row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],'},
   ];

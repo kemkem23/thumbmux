@@ -116,7 +116,7 @@ describe('NEWARCH L2-C observed snapshot cells', () => {
 });
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing', async () => {
@@ -136,14 +136,16 @@ test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing
     const ambiguous = new Set(['👩‍💻🇹🇭👍🏽❤️', '\u{1f1f9}\u{1f1ed}\u{1f1fa}x', '\u{1f3f3}\ufe0f\u200d\u{1f308}x', '\u{1f9d1}\u{1f3fb}\u200d\u{1f91d}\u200d\u{1f9d1}\u{1f3ff}x', '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}\u{1f3fd}x']);
     const panes = cases.map((text, i) => {
       const path = join(root, `text-${i}`); writeFileSync(path, text);
-      const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; tmux -S '${socket}' wait-for -S ready-${i}; sleep 5`).trim();
+      const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', `p${i}`, '-x', '80', '-y', '24', `cat '${path}'; touch '${path}.ready'; read hold`).trim();
       return pane;
     });
     for (let i = 0; i < cases.length; i++) {
-      tmux('wait-for', `ready-${i}`);
+      while (!existsSync(join(root, `text-${i}.ready`))) await Bun.sleep(5);
       const pane = panes[i]!;
-      const raw = tmux('capture-pane', '-p', '-e', '-N', '-t', pane);
-      const cursor = Number(tmux('display-message', '-p', '-t', pane, '#{cursor_x}').trim());
+      const captured = tmux('display-message', '-p', '-t', pane, '#{cursor_x}', ';', 'capture-pane', '-p', '-e', '-N', '-t', pane);
+      const firstNewline = captured.indexOf('\n');
+      const cursor = Number(captured.slice(0, firstNewline));
+      const raw = captured.slice(firstNewline + 1);
       if (ambiguous.has(cases[i]!)) {
         // A-M3 row isolation: the strict oracle refuses, the capture path keeps
         // the whole 24-row screen and marks only this row uncertain.
