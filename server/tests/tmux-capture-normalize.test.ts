@@ -991,3 +991,66 @@ test('NEWARCH C rejected kill acknowledgement quarantines reservation until actu
   expect(released).toBe(0);
   settle(); await new Promise(r=>setTimeout(r,0)); expect(released).toBe(1);
 });
+
+test('NEWARCH C visible hang hits deadline and keeps one slot until retirement ACK',async()=>{
+  const f=cEngineFixture(); let ack!:()=>void;
+  f.ports.visible=()=>new Promise(()=>{});
+  f.ports.cancelOperation=()=>new Promise<void>(r=>{ack=r;});
+  const result=await f.engine.checkVisible(cIdentity);
+  expect(result).toMatchObject({status:'error',code:'deadline'});
+  expect(f.ports.scratch.heldBytes).toBe(1048576);
+  expect((await f.engine.checkVisible(cIdentity)).status).toBe('busy');
+  ack(); await new Promise(r=>setTimeout(r,0));
+  expect(f.ports.scratch.heldBytes).toBe(0);
+},3000);
+test('NEWARCH C cancelled hung repair next does not await generator return',async()=>{
+  const f=cEngineFixture(); let cancelled=false,retired=0;
+  f.ports.repairChunks=()=>({[Symbol.asyncIterator]:()=>({
+    next:()=>new Promise(()=>{}),return:()=>new Promise(()=>{})
+  })});
+  f.ports.cancelOperation=async()=>{retired++;};
+  const episode=f.engine.fault('sequence');
+  const iterator=f.engine.repair(episode,{isCancelled:()=>cancelled})[Symbol.asyncIterator]();
+  const pending=iterator.next(); cancelled=true;
+  expect((await pending).value).toMatchObject({status:'cancelled'});
+  await iterator.next();
+  expect(retired).toBe(1);
+},1000);
+test('NEWARCH C native wide-row expansion is bounded before source admission',()=>{
+  const script=String.raw`
+import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+identity={'pane':{'serverIdentity':'fixture','paneId':'%1','birthGeneration':1},'sourceEpoch':1,'geometryGeneration':0}
+base={'identity':identity,'geometry':{'columns':240,'rows':3},'scrollOnClear':False,'screenRevision':0}
+r=m.checkpoint_transaction(dict(base,state=None)); state=r['state']
+# Fill wide rows, then repeatedly clear (large expansion from few source bytes).
+data=(b'x'*240+b'\r\n')*600
+oracle=m.Worker(240,3);oracle.screen.scroll_on_clear=False;oracle.feed(1,1,data)
+expected=[m.contract_row(x['row'],x['wrap'],x['pad']) for x in oracle.scrolls]
+actual=[];offset=0;seq=1;high=0
+while offset<len(data):
+    count=min(512,len(data)-offset)
+    while True:
+        event={'identity':identity,'position':{'sourceEpoch':1,'packetSeq':seq},'payload':{'kind':'bytes','bytes':list(data[offset:offset+count])}}
+        try: candidate=m.checkpoint_transaction(dict(base,state=state,event=event));break
+        except m.CaptureExpansionPressure:
+            assert count>1;count//=2
+    charge=len(json.dumps(candidate['scrolls']).encode())*4
+    high=max(high,charge);assert charge<=524288
+    actual.extend(candidate['scrolls']);state=candidate['state'];offset+=count;seq+=1
+assert actual==expected
+print('wide rows oracle=0, source bytes=%d, peak expanded charge=%d'%(offset,high))
+`;
+  const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
+  expect(r.exitCode,r.stderr.toString()).toBe(0);
+},30000);
+
+test('NEWARCH C atomic expansion failure is explicit and never durably admitted',async()=>{
+  const f=cEngineFixture();
+  f.ports.vt.prepare=async()=>({status:'error',code:'unsupported',message:'VT expansion budget'});
+  const result=await f.engine.acceptSourceBytes(new Uint8Array([65]),1,1);
+  expect(result).toEqual({status:'error',code:'unsupported',message:'VT expansion budget'});
+  expect(f.counts().journals).toBe(0);
+  expect(f.ports.admission.heldBytes).toBe(0);
+  expect(f.ports.scratch.heldBytes).toBe(0);
+});

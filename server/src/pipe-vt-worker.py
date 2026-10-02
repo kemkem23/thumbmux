@@ -713,9 +713,13 @@ class Worker:
 
         self.scroll_ordinal += 1
         if self.transaction_scroll_bytes is not None:
-            self.transaction_scroll_bytes += len(json.dumps(self.scrolls[-1]).encode()) * 2
-            if self.transaction_scroll_bytes > 1024 * 1024:
-                raise ValueError("transaction scroll budget; source must segment input before admission")
+            item = self.scrolls[-1]
+            # Charge expanded cells, not compressed runs. Stop while speculative,
+            # before any journal ACK or live parser mutation; caller bisects input.
+            expanded = contract_row(item["row"], item["wrap"], item["pad"])
+            self.transaction_scroll_bytes += len(json.dumps(expanded).encode()) * 4
+            if self.transaction_scroll_bytes > 512 * 1024:
+                raise CaptureExpansionPressure()
 
     def feed(self, seq, epoch, data, rx=None, more=False):
         """Feed one D frame, or its first slice when `more` slices follow.
@@ -913,6 +917,10 @@ def contract_row(runs, wrap, pad):
         if cells[i]["text"] and cells[i+1]["text"] == "": cells[i]["width"] = 2
     return {"cells": cells, "softWrap": wrap, "wrapPad": int(pad), "uncertainFields": []}
 
+class CaptureExpansionPressure(Exception):
+    pass
+
+
 def checkpoint_transaction(request):
     state = request.get("state")
     identity = request["identity"]
@@ -960,7 +968,10 @@ def dispatch(worker, kind, payload, rx=None):
         previous_sink = output_sink
         try:
             output_sink = lambda packet: None
-            result = checkpoint_transaction(request)
+            try:
+                result = checkpoint_transaction(request)
+            except CaptureExpansionPressure:
+                result = {"pressure": True}
         finally:
             output_sink = previous_sink
         send(b"J", result)

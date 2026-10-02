@@ -807,7 +807,7 @@ export interface CaptureVtRpc {
     scrollOnClear: boolean;
     screenRevision: number;
     event?: import('./stream-contract').InputEvent;
-  }): Promise<import('./stream-contract').Result<{
+  }): Promise<import('./stream-contract').Result<{ readonly pressure: true } | {
     state: import('./stream-contract').VtState;
     frame: import('./stream-contract').FrameDelta;
     scrolls: readonly import('./stream-contract').RowContent[];
@@ -828,6 +828,7 @@ export class CheckpointCaptureVt implements importCaptureVt {
     geometry: import('./stream-contract').Geometry, scrollOnClear: boolean): Promise<import('./stream-contract').Result<CheckpointCaptureVt>> {
     const r = await rpc.transaction({state:null,identity,geometry,scrollOnClear,screenRevision:0});
     if (r.status !== 'ok') return r;
+    if ('pressure' in r.value) return {status:'busy',reason:'pressure',retryAfterMs:10};
     if (Buffer.byteLength(JSON.stringify(r.value))*2 > 2*1024*1024)
       return {status:'busy',reason:'pressure',retryAfterMs:10};
     return {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)};
@@ -844,9 +845,10 @@ export class CheckpointCaptureVt implements importCaptureVt {
       geometry:state.geometry,scrollOnClear:this.scrollOnClear,screenRevision:this.frame.screenRevision + (event ? 1 : 0),
       ...(event ? {event} : {})});
     if (r.status !== 'ok') return r;
+    if ('pressure' in r.value) return {status:'error',code:'unsupported',message:'VT expansion budget'};
     const candidate=structuredClone(r.value);
     if (Buffer.byteLength(JSON.stringify(candidate))*2 > 2*1024*1024)
-      return {status:'busy',reason:'pressure',retryAfterMs:10};
+      return {status:'error',code:'unsupported',message:'VT expansion budget'};
     const freeze=(v:unknown):void=>{
       if(v && typeof v==='object') {for(const child of Object.values(v))freeze(child);Object.freeze(v);}
     };
