@@ -7,6 +7,7 @@ import { STREAM_BUDGET as B, streamDigest, type StreamIdentity, type Geometry, t
   type InputEvent, type Result, type VtCheckpoint, type ViewerRoute, type ReadRequest,
   type PageCursor, type CancelToken, type StreamObserver } from './stream-contract';
 
+const paneKey = (pane: StreamIdentity['pane']) => JSON.stringify([pane.serverIdentity, pane.paneId, pane.birthGeneration]);
 const unwrap = <T>(r: Result<T>): T => { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; };
 const wire = (kind: string, body: Buffer): Buffer => {
   const header = Buffer.alloc(5); header.write(kind); header.writeUInt32BE(body.length, 1);
@@ -111,7 +112,7 @@ export class StreamRuntime {
   displayEngine(): StreamDisplayEngine {
     if (!this.sharedDisplay) {
       const lookup = (key: StreamIdentity['pane']) => {
-        const pane = this.panes.get(JSON.stringify(key));
+        const pane = this.panes.get(paneKey(key));
         if (!pane) throw Error('stream pane no longer attached'); return pane;
       };
       const capture: import('./stream-contract').CaptureEngine = {
@@ -137,7 +138,7 @@ export class StreamRuntime {
   }
   releaseViewer(id: string): void { this.viewerSlots.delete(id); }
   async add(identity: StreamIdentity, geometry: Geometry, ports: StreamPanePorts, scrollOnClear = false): Promise<StreamRuntimePane> {
-    const key = JSON.stringify(identity.pane);
+    const key = paneKey(identity.pane);
     if (this.closing || this.panes.has(key) || this.panes.size >= B.panes) throw Error('stream pane admission');
     const rpc = new StreamVtTransport();
     try {
@@ -155,7 +156,7 @@ export class StreamRuntime {
     } catch (error) { await rpc.close(); throw error; }
   }
   async remove(pane: StreamRuntimePane): Promise<void> {
-    await pane.close(); this.panes.delete(JSON.stringify(pane.identity.pane));
+    await pane.close(); this.panes.delete(paneKey(pane.identity.pane));
   }
   async close(): Promise<void> {
     this.closing = true;

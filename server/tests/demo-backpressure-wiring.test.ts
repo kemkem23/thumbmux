@@ -82,6 +82,8 @@ test('stream I native C-H-D: quiet attach, bounded pages, disconnect, checkpoint
     runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
     pane=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
     expect(pane.frame.head).toBe(head);
+    expect((await pane.attach({viewerId:'reopened',identity:pane.identity,routeGeneration:2},()=>{})).status).toBe('ok');
+    await pane.detach('reopened');
     await pane.ingest(Buffer.from('after-reopen\r\n'));
     expect(pane.frame.head).toBe(head+1);
     expect(pane.frame.durableRevision).toBe(pane.frame.revision);
