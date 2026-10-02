@@ -168,6 +168,7 @@ export class StreamRuntime {
     } catch (error) { await rpc.close(); throw error; }
   }
   async remove(pane: StreamRuntimePane): Promise<void> {
+    pane.stopCadence(); await this.ticks.get(pane);
     await pane.close(); this.panes.delete(paneKey(pane.identity.pane));
   }
   async close(): Promise<void> {
@@ -214,6 +215,7 @@ export class StreamRuntimePane {
     this.cadence = new CaptureCadence(this.capture, () => this.identity, () => performance.now());
   }
   startCadence(): void { this.cadenceReady = true; }
+  stopCadence(): void { this.cadenceReady = false; }
   async tick(): Promise<void> {
     if (!this.cadenceReady || this.closed) return;
     this.cadence.activity(this.viewers.size, performance.now() - this.receivedAt < B.visibleIdleMs);
