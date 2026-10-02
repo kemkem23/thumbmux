@@ -220,6 +220,12 @@ export class StreamRuntime {
       return pane;
     } catch (error) { await rpc.close(); throw error; }
   }
+  /** Handoff release: the caller already froze the pane's durable fence (a
+   * checkpoint, or rows flushed behind a durable gap episode). No new drain. */
+  async retire(pane: StreamRuntimePane): Promise<void> {
+    pane.stopCadence(); await this.ticks.get(pane);
+    await pane.retire(); this.panes.delete(paneKey(pane.identity.pane));
+  }
   async remove(pane: StreamRuntimePane): Promise<void> {
     pane.stopCadence(); await this.ticks.get(pane);
     await pane.close(); this.panes.delete(paneKey(pane.identity.pane));
@@ -391,6 +397,15 @@ export class StreamRuntimePane {
     if (!this.sequence) return null;
     unwrap(await this.capture.drain(this.identity.pane, performance.now() + B.recoveryMs));
     return unwrap(await this.capture.checkpoint(this.identity.pane, 'handoff'));
+  }
+  /** Await the input already handed to this pane, without draining it. */
+  async settle(): Promise<void> { await this.chain.catch(() => {}); }
+  async retire(): Promise<void> {
+    if (this.closed) return;
+    this.accepting = false; this.cadenceReady = false;
+    await this.settle();
+    for (const id of [...this.viewers.keys()]) await this.detach(id);
+    await this.rpc.close(); this.closed = true;
   }
   async close(): Promise<void> {
     if (this.closed) return;
