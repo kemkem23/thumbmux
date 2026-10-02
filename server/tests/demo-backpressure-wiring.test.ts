@@ -716,14 +716,17 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
       {kind:'source-eof',missingCount:null,reason:'eof'});
     catalogA.catalog.begin(c.identity.pane,'planned:1',1,'legacy');
     // a: the process "dies" after H journaled input but before its checkpoint
-    // committed (injected at H's own transaction boundary). The copy below
-    // holds journal input that no checkpoint covers.
-    let crash1=true;
-    (runtime.history as any).options.boundary=(at:string)=>{if(crash1&&at==='checkpoint-before-write')throw Error('injected crash');};
-    await expect(a.ingest(Buffer.from(Array.from({length:12},(_,i)=>`late${i}\r\n`).join('')))).rejects.toThrow();
-    for(const f of ['stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'])
-      if(existsSync(join(root,f)))copyFileSync(join(root,f),join(crash,f));
-    crash1=false;
+    // was written. The copy is taken at H's own pre-checkpoint boundary (no
+    // transaction open), so it holds journal input no checkpoint covers. The
+    // live pane continues normally and is the oracle.
+    const files=['stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'];
+    let armed=true;
+    (runtime.history as any).options.boundary=(at:string)=>{
+      if(!armed||at!=='checkpoint-before-write')return;armed=false;
+      for(const f of files)if(existsSync(join(root,f)))copyFileSync(join(root,f),join(crash,f));
+    };
+    await a.ingest(Buffer.from(Array.from({length:12},(_,i)=>`late${i}\r\n`).join('')));
+    expect(armed).toBe(false);
     const finalA=(await a.drain())!.head,oracleA=await oracleRows(a,finalA);
     catalogA.close();await runtime.close();
     const pre=new StreamArchiveRowReader(join(crash,'stream-history.sqlite'));
