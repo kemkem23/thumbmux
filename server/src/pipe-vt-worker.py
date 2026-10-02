@@ -655,7 +655,7 @@ class Worker:
 
     def contract_state(self):
         s = self.screen
-        def cursor(c): return {"x": c.x, "y": c.y, "visible": not c.hidden}
+        def cursor(c): return {"x": min(c.x, s.columns - 1), "y": c.y, "visible": not c.hidden}
         def buffer(rows, c):
             saved = s.savepoints[-1].cursor if s.savepoints else c
             return {"rows": [],
@@ -1010,13 +1010,19 @@ def decode_extension(value):
 
 
 _transaction_scratch = None
+_transaction_state = None
 
 
 def checkpoint_transaction(request):
-    global _transaction_scratch
+    global _transaction_scratch, _transaction_state
     state = request.get("state")
     identity = request["identity"]
-    if state is None:
+    reused = state is not None and state == _transaction_state
+    if reused:
+        w = _transaction_scratch
+        w.scrolls = []
+        w.screen.on_scroll = w._on_scroll
+    elif state is None:
         g = request["geometry"]
         if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80): raise ValueError("geometry budget")
         w = Worker(g["columns"], g["rows"], identity["sourceEpoch"])
@@ -1027,6 +1033,7 @@ def checkpoint_transaction(request):
         w = Worker.from_checkpoint(decode_extension(state["extensionState"]), _transaction_scratch)
         if w.contract_state() != state: raise ValueError("checkpoint envelope mismatch")
     _transaction_scratch = w
+    _transaction_state = None  # every failure or partial page invalidates reuse
     w.transaction_scroll_bytes = 0
     page = CaptureRowPage(w, request["rowStream"]) if "rowStream" in request else None
     if page is not None:
@@ -1038,7 +1045,9 @@ def checkpoint_transaction(request):
         apply_checkpoint_event(w, event, identity)
     except CaptureRowPageFull:
         return page.result(False)
-    state = w.contract_state(); active = state[state["active"]]
+    state = state if reused and not event else w.contract_state()
+    _transaction_state = state
+    active = state[state["active"]]
     result = {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
             "frame": {"identity": identity, "screenRevision": request["screenRevision"],
                       "buffer": state["active"], "geometry": state["geometry"],

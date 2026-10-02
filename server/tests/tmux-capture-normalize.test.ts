@@ -1240,7 +1240,7 @@ test('contract collector retains oversize rows until sink accepts the exact even
   let allow = false;
   // Drive the real collector admission path without opening a live parser.
   const collector = new PipeHistoryCollector({ paneKey: cPane, sourceEpoch: 1, cols: 80, rows: 24,
-    ports: { onScroll(event: unknown) { offered.push(event); return allow ? undefined : {accepted:false,reason:'ingest-oversize'}; }, onFrame() {} },
+    ports: { onScroll(event: unknown) { offered.push(event); return allow ? undefined : {accepted:false,reason:'ingest-oversize'}; }, onFrame() {}, onFault() {} },
   } as any);
   const event = {receiveSeq:1};
   const waiting = (collector as any).offerScrolls([event],0);

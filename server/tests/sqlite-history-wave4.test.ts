@@ -675,7 +675,7 @@ test('stream-first H admits at most 256 decoded rows and rejects alternate scrol
   try {
     shOk(await f.engine.journalInput(shInput()));
     const { digest: _, ...base } = shAppend();
-    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n } }));
+    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n }, source:{...base.eventId,scrollOrdinal:n} }));
     const oversize = { ...base, rows };
     expect((await f.engine.appendFinalized({ ...oversize, digest: streamDigest('append', oversize) })).status).toBe('error');
     const alt = { ...base, frameDelta: { ...base.frameDelta, buffer: 'alternate' as const } };

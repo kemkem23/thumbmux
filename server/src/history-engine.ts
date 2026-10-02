@@ -207,7 +207,8 @@ export class StreamHistoryEngine implements HistoryEngine {
       const revision = state.revision + 1; safe(revision);
       this.validateRows(request.rows, state, revision);
       const frame = request.frameDelta;
-      if (!equal(frame.identity, request.identity) || (frame.buffer !== 'normal' && frame.buffer !== 'alternate')) throw Error('frame identity/alternate scroll');
+      if (!equal(frame.identity, request.identity) || (frame.buffer !== 'normal' && frame.buffer !== 'alternate')
+        || (frame.buffer === 'alternate' && request.rows.length)) throw Error('frame identity/alternate scroll');
       geometry(frame.geometry); safe(frame.screenRevision); safe(frame.cursor.x); safe(frame.cursor.y);
       if (frame.cursor.x >= frame.geometry.columns || frame.cursor.y >= frame.geometry.rows || typeof frame.cursor.visible !== 'boolean') throw Error('invalid frame cursor');
       if (frame.overlap) { safe(frame.overlap.start); safe(frame.overlap.end); if (frame.overlap.start > frame.overlap.end || frame.overlap.end > state.head + request.rows.length) throw Error('invalid overlap'); }
