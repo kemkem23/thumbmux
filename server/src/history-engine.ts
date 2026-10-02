@@ -352,7 +352,12 @@ export class StreamHistoryEngine implements HistoryEngine {
    */
   beginGap(episode: GapEpisode): Result<null> {
     try {
-      this.live(); nonempty(episode.episodeId);
+      this.live(); nonempty(episode.episodeId); paneKey(episode.pane); safe(episode.epochBefore);
+      if (episode.epochAfter !== null) { safe(episode.epochAfter); if (episode.epochAfter < episode.epochBefore) throw Error('gap epoch regression'); }
+      if (episode.missingCount !== null) safe(episode.missingCount);
+      if (!Number.isFinite(episode.firstObservedAtMonoMs) || episode.firstObservedAtMonoMs < 0
+        || !['suspected', 'repairing', 'unresolved'].includes(episode.status)) throw Error('invalid gap state');
+      if (episode.lastDurableInput) { safe(episode.lastDurableInput.sourceEpoch); safe(episode.lastDurableInput.packetSeq); }
       const state = this.state(episode.pane); if (!state) return stale();
       if (episode.lastAdmittedRow !== null) safe(episode.lastAdmittedRow);
       if (episode.reason === 'late-gap' || episode.lastAdmittedRow !== (state.head ? state.head - 1 : null)) {
@@ -423,7 +428,7 @@ export class StreamHistoryEngine implements HistoryEngine {
     if (streamDigest('row', row) !== meta.digest || row.id.lineId !== line || !equal(row.id.pane, pane)) throw Error('row checksum/identity');
     return row;
   }
-  private readSlot(pane: PaneKey): string { return this.options.path + '\0' + paneKey(pane); }
+  private readSlot(pane: PaneKey): string { return paneKey(pane); }
   private reader(pane: PaneKey): Database | null {
     const slot = this.readSlot(pane);
     if (pool.readers >= B.activeReadsGlobal || pool.panes.has(slot) || pool.cache + READER_CACHE > B.diskCacheBytes) return null;

@@ -703,3 +703,11 @@ test('stream-first H owns input copies and exposes frozen nested cells', async (
     expect(Object.isFrozen(page.fragments[0]!.row.cells[0])).toBe(true);
   } finally { f.cleanup(); }
 });
+
+
+test('stream-first H canonical digest matches independent UTF-8 SHA-256 fixture', () => {
+  expect(shInput().digest).toBe('3620115c0091b2fc9bd3c875d8070092ed69affd6cee4529ffcc80942efef1aa');
+  const { digest: _, ...input } = shInput();
+  expect(streamDigest('input', { payload: input.payload, receivedAtMonoMs: input.receivedAtMonoMs,
+    position: input.position, identity: input.identity })).toBe(shInput().digest);
+});
