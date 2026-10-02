@@ -32,6 +32,7 @@ export class StreamVtTransport implements CaptureVtRpc {
     if (this.closed) throw Error('stream RPC retired');
     this.pool = pool; this.geometry = geometry; this.epoch = epoch;
     const lease = await pool.acquire();
+    if (this.closed) { lease.socket.destroy(); await lease.release(); throw Error('stream RPC retired'); }
     this.lease = lease;
     const socket = lease.socket;
     socket.on('error', error => { if (this.lease === lease) this.fail(error); });
@@ -73,7 +74,10 @@ export class StreamVtTransport implements CaptureVtRpc {
       return await new Promise((resolve, reject) => {
         this.pending = { kind: reply, resolve, reject };
         timer = setTimeout(() => { void this.resetGeneration(); }, B.recoveryMs);
-        this.lease!.socket.write(wire(kind, body), error => { if (error) this.fail(error); });
+        const lease=this.lease!, pending=this.pending;
+        lease.socket.write(wire(kind, body), error => {
+          if (error && this.lease===lease && this.pending===pending) this.fail(error);
+        });
       });
     } finally { if (timer) clearTimeout(timer); }
   }
@@ -114,7 +118,7 @@ export class StreamVtTransport implements CaptureVtRpc {
     return this.retirement ??= this.resetGeneration();
   }
   async close(): Promise<void> {
-    if (this.pending) return this.retire();
+    if (this.pending || this.transactionActive || this.resetting) return this.retire();
     this.closed = true;
     this.lease?.socket.destroy(); await this.lease?.release(); this.buffer = Buffer.alloc(0);
   }
@@ -230,6 +234,11 @@ export class StreamRuntimePane {
   private cadence!: CaptureCadence;
   private cadenceReady = false;
   private receivedAt = -Infinity;
+  private liveViewers = 0;
+  setLiveViewers(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0 || count > B.panes) throw Error('stream viewer count');
+    this.liveViewers = count;
+  }
   constructor(readonly runtime: StreamRuntime, readonly rpc: StreamVtTransport,
     private readonly vt: CheckpointCaptureVt, identity: StreamIdentity, private readonly ports: StreamPanePorts) {
     this.identity = structuredClone(identity);
@@ -252,7 +261,7 @@ export class StreamRuntimePane {
   stopCadence(): void { this.cadenceReady = false; }
   async tick(): Promise<void> {
     if (!this.cadenceReady || this.closed) return;
-    this.cadence.activity(this.viewers.size, performance.now() - this.receivedAt < B.visibleIdleMs);
+    this.cadence.activity(this.viewers.size + this.liveViewers, performance.now() - this.receivedAt < B.visibleIdleMs);
     await this.cadence.tick();
   }
   async recover(): Promise<void> {

@@ -290,3 +290,33 @@ test('stream I host joins row continuations and rejects oversized wire pages, re
   expect(detaches).toBe(2);expect((host as any).pageBytes).toBe(0);
  }finally{(host as any).entries.clear();await host.close();await rm(root,{recursive:true,force:true});}
 });
+
+test('stream I C visible cancellation reaps its real source child without killing the shared VT',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-source-retire-'));
+ let child:ReturnType<typeof Bun.spawn>|undefined;
+ const source=new StreamSourceTransport({tmuxSocket:'/private/injected.sock',spawnCapture:argv=>{
+  expect(argv.slice(0,3)).toEqual(['tmux','-S','/private/injected.sock']);
+  const proc=Bun.spawn(['python3','-c','import sys,time; sys.stdout.write("ready\\n"); sys.stdout.flush(); time.sleep(60)'],{stdout:'pipe',stderr:'pipe'});
+  child=proc;return proc;
+ }});
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try {
+  const pane=await runtime.add(streamTestIdentity,{columns:20,rows:4},{...streamPorts,
+   visible:async(_identity,_tail,signal)=>{
+    await source.read(['capture-pane','-p','-t','%1'],signal,1024,()=>{});
+    return{status:'error',code:'io',message:'unexpected source completion'};
+   },cancelOperation:signal=>source.cancelOperation(signal),
+  });
+  pane.stopCadence();const pid=pane.rpc.pid;
+  const verdict=await pane.capture.checkVisible(pane.identity);
+  expect(verdict.status).toBe('error');
+  if(verdict.status==='error')expect(verdict.code).toBe('deadline');
+  await source.close();await new Promise(resolve=>setTimeout(resolve,0));
+  expect(child).toBeDefined();expect(await child!.exited).not.toBe(0);
+  expect(()=>process.kill(child!.pid,0)).toThrow();
+  expect(source.activeOperations).toBe(0);expect(runtime.scratch.heldBytes).toBe(0);
+  await pane.ingest(Buffer.from('still alive'));
+  expect(pane.rpc.pid).toBe(pid);
+  expect(pane.frame.changedRows[0]!.content.cells.map(c=>c.text).join('').trimEnd()).toBe('still alive');
+ }finally{await source.close();await runtime.close();await rm(root,{recursive:true,force:true});}
+},10000);
