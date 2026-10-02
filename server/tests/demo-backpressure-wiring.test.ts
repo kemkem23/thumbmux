@@ -1046,6 +1046,9 @@ test('stream I real pipe: a full tmux history is aligned by content, not assumed
     expect(F).toBe(28);expect(tmuxHistorySize(r)).toBeGreaterThanOrEqual(9);
     expect((await r.host.setRoute('s','legacy')).ok).toBe(true);
     const held=r.catalog().owner(r.identity.pane)!.localStart;
+    console.error('DEBUG',JSON.stringify({F,held,seam:r.catalog().segmentAt(r.identity.pane,F-1)!.seam.reason,
+      legacy:r.file.readRange('s',0,r.file.getManifest('s').totalLines).map(l=>plain(l).trimEnd()),
+      tmux:r.server.t(['capture-pane','-t',r.paneId,'-p','-S','-','-E','-1']),h:tmuxHistorySize(r)}));
     // tmux dropped the oldest rows; the rows it still holds were matched.
     expect(r.catalog().segmentAt(r.identity.pane,F-1)!.seam.reason).toContain(`fence exact: tmux row 0 is stream row ${F-held}`);
     r.go('go2');await r.tmuxHas(r.paneId,`c${r.c.length-1}`);await r.keeperTick();
