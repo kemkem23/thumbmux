@@ -799,6 +799,25 @@ export class PipeVtWorker {
  * routing and cancellation; C owns the candidate state and synchronous install.
  * The transport must reserve request/reply bytes and retire a cancelled RPC
  * before resolving. It must never route speculative U/H to live consumers. */
+export type CaptureVtRowPage = {
+  readonly scrolls: readonly import('./stream-contract').RowContent[];
+  readonly startOrdinal: number;
+  readonly nextOrdinal: number;
+  readonly chargedBytes: number;
+} & ({ readonly complete: false } | {
+  readonly complete: true;
+  readonly state: import('./stream-contract').VtState;
+  readonly frame: import('./stream-contract').FrameDelta;
+});
+export type CaptureVtStreamStep = {
+  readonly startOrdinal: number;
+  readonly nextOrdinal: number;
+  readonly chargedBytes: number;
+  readonly scrolls: readonly import('./stream-contract').RowContent[];
+  /** Only the last step has a candidate. Install AFTER the consumer has
+   * accepted all pages; dropping the iterator never mutates the live VT. */
+  readonly candidate?: importCaptureVtTransaction;
+};
 export interface CaptureVtRpc {
   transaction(request: {
     state: import('./stream-contract').VtState | null;
@@ -807,7 +826,8 @@ export interface CaptureVtRpc {
     scrollOnClear: boolean;
     screenRevision: number;
     event?: import('./stream-contract').InputEvent;
-  }): Promise<import('./stream-contract').Result<{ readonly pressure: true } | {
+    rowStream?: { readonly startOrdinal: number; readonly maxBytes: number };
+  }): Promise<import('./stream-contract').Result<{ readonly pressure: true } | CaptureVtRowPage | {
     state: import('./stream-contract').VtState;
     frame: import('./stream-contract').FrameDelta;
     scrolls: readonly import('./stream-contract').RowContent[];
@@ -829,9 +849,69 @@ export class CheckpointCaptureVt implements importCaptureVt {
     const r = await rpc.transaction({state:null,identity,geometry,scrollOnClear,screenRevision:0});
     if (r.status !== 'ok') return r;
     if ('pressure' in r.value) return {status:'busy',reason:'pressure',retryAfterMs:10};
+    if ('complete' in r.value && !r.value.complete) return {status:'error',code:'integrity',message:'unexpected VT continuation'};
     if (Buffer.byteLength(JSON.stringify(r.value))*2 > 2*1024*1024)
       return {status:'busy',reason:'pressure',retryAfterMs:10};
     return {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)};
+  }
+  /** C-local streaming API; the frozen K interfaces are unchanged. The
+   * consumer drains/spools each step before requesting the next. Cursor replay
+   * uses the SAME captured state/event, never the live state or a new packet ID.
+   * Partial output is provisional, not a checkpoint or an append ACK. */
+  async *prepareStream(event: import('./stream-contract').InputEvent, maxBytes = 512 * 1024):
+    AsyncGenerator<import('./stream-contract').Result<CaptureVtStreamStep>, void, void> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 8 || maxBytes > 512 * 1024) {
+      yield {status:'error',code:'integrity',message:'VT row page budget'}; return;
+    }
+    if ((event.payload.kind === 'bytes' && event.payload.bytes.length > 16384)
+      || Buffer.byteLength(JSON.stringify(event))*2 > 256*1024) {
+      yield {status:'busy',reason:'pressure',retryAfterMs:10}; return;
+    }
+    const generation = this.generation;
+    const request = {state:structuredClone(this.state), event:structuredClone(event), identity:structuredClone(event.identity),
+      geometry:this.state.geometry, scrollOnClear:this.scrollOnClear, screenRevision:this.frame.screenRevision+1};
+    let ordinal = 0;
+    let live = true;
+    try {
+      while (live) {
+        if (generation !== this.generation) { yield {status:'stale',reason:'identity'}; return; }
+        const reply = await this.rpc.transaction({...request,rowStream:{startOrdinal:ordinal,maxBytes}});
+        if (reply.status !== 'ok') { yield reply; return; }
+        if (generation !== this.generation) { yield {status:'stale',reason:'identity'}; return; }
+        const page = reply.value;
+        if ('pressure' in page) { yield {status:'error',code:'unsupported',message:'VT single row budget'}; return; }
+        if (!('complete' in page) || page.scrolls.length > 256 || page.startOrdinal !== ordinal || !Number.isSafeInteger(page.nextOrdinal)
+          || page.nextOrdinal !== ordinal + page.scrolls.length || (!page.complete && !page.scrolls.length)
+          || !Number.isSafeInteger(page.chargedBytes) || page.chargedBytes < Buffer.byteLength(JSON.stringify(page.scrolls))*4
+          || page.chargedBytes > maxBytes || page.scrolls.some(row=>row.uncertainFields.length)) {
+          yield {status:'error',code:'integrity',message:'VT row continuation fence'}; return;
+        }
+        const freeze=(value:unknown):void=>{
+          if(value && typeof value==='object') {for(const child of Object.values(value))freeze(child);Object.freeze(value);}
+        };
+        freeze(page);
+        ordinal = page.nextOrdinal;
+        const step = {startOrdinal:page.startOrdinal,nextOrdinal:ordinal,chargedBytes:page.chargedBytes,scrolls:page.scrolls};
+        if (!page.complete) { yield {status:'ok',value:step}; continue; }
+        // Final state has the existing, separate bounded VT-state allocation.
+        if (Buffer.byteLength(JSON.stringify([page.state,page.frame]))*2 > 2*1024*1024) {
+          yield {status:'error',code:'unsupported',message:'VT state budget'}; return;
+        }
+        if (JSON.stringify(page.frame.identity) !== JSON.stringify(request.identity)) {
+          yield {status:'error',code:'integrity',message:'VT stream identity'}; return;
+        }
+        let finished = false;
+        const candidate: importCaptureVtTransaction = {
+          frame:page.frame,scrolls:[],snapshot:async()=>({status:'ok',value:structuredClone(page.state)}),
+          install:()=>{
+            if (!live || finished || generation !== this.generation) throw new Error('stale VT stream');
+            finished=true; this.generation++; this.state=structuredClone(page.state); this.frame=structuredClone(page.frame);
+          },discard:()=>{finished=true;}
+        };
+        yield {status:'ok',value:{...step,candidate}};
+        return;
+      }
+    } finally { live=false; }
   }
   screen() { return structuredClone(this.frame); }
   async snapshot(): Promise<import('./stream-contract').Result<import('./stream-contract').VtState>> {
@@ -846,6 +926,7 @@ export class CheckpointCaptureVt implements importCaptureVt {
       ...(event ? {event} : {})});
     if (r.status !== 'ok') return r;
     if ('pressure' in r.value) return {status:'error',code:'unsupported',message:'VT expansion budget'};
+    if ('complete' in r.value && !r.value.complete) return {status:'error',code:'integrity',message:'unexpected VT continuation'};
     const candidate=structuredClone(r.value);
     if (Buffer.byteLength(JSON.stringify(candidate))*2 > 2*1024*1024)
       return {status:'error',code:'unsupported',message:'VT expansion budget'};

@@ -921,6 +921,71 @@ class CaptureExpansionPressure(Exception):
     pass
 
 
+# A cursor is an ordinal in a deterministic replay of ONE immutable request.
+# No suspended Python generator, live worker, history list or token registry is
+# retained between RPCs. Replaying skips old rows before encoding them. This
+# trades CPU for bounded memory and permits retries after worker replacement.
+class CaptureRowPageFull(Exception):
+    pass
+
+
+class CaptureRowPage:
+    def __init__(self, worker, options):
+        self.worker = worker
+        self.start = options["startOrdinal"]
+        self.cap = options["maxBytes"]
+        if type(self.start) is not int or not 0 <= self.start <= 9007199254740991:
+            raise ValueError("row cursor")
+        if type(self.cap) is not int or not 8 <= self.cap <= 512 * 1024:
+            raise ValueError("row page budget")
+        self.ordinal = 0
+        self.rows = []
+        self.peak = 8
+        self.charge = 8  # [] JSON, four copies including encoding/IPC scratch
+
+    def collect(self, row):
+        ordinal = self.ordinal
+        self.ordinal += 1
+        self.worker.scroll_ordinal += 1
+        if ordinal < self.start:
+            return
+        if len(self.rows) >= 256:
+            raise CaptureRowPageFull()
+        s = self.worker.screen
+        # Check text before encode_row/contract_row can copy an oversized cell.
+        # Geometry is capped separately; this scan retains no per-cell list.
+        row_bound = 256
+        for x in range(s.columns):
+            text = row[x].data
+            if len(text) > self.cap:
+                raise CaptureExpansionPressure()
+            # JSON escaping is at most six bytes per input byte. SGR/cell
+            # fields and runs fit the fixed overhead per column in this codec.
+            row_bound += 4 * (len(text.encode("utf-8")) * 6 + 256)
+            if row_bound > self.cap - 8:
+                raise CaptureExpansionPressure()
+        if self.charge + row_bound > self.cap:
+            raise CaptureRowPageFull()
+        self.peak = max(self.peak, self.charge + row_bound)
+        content = contract_row(encode_row(row, s.columns, s.default_char),
+                               row_wrapped(row), row_padded(row, s.columns))
+        charge = len(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()) * 4
+        charge += 4 if self.rows else 0  # comma
+        if self.charge + charge > self.cap:
+            if not self.rows:
+                raise CaptureExpansionPressure()  # single row exceeds envelope
+            raise CaptureRowPageFull()
+        self.rows.append(content)
+        self.charge += charge
+
+    def result(self, complete):
+        if complete and self.ordinal < self.start:
+            raise ValueError("row cursor past end")
+        return {"scrolls": self.rows, "startOrdinal": self.start,
+                "nextOrdinal": self.start + len(self.rows),
+                "chargedBytes": self.charge, "peakBytes": self.peak, "complete": complete}
+
+
 def checkpoint_transaction(request):
     state = request.get("state")
     identity = request["identity"]
@@ -935,7 +1000,28 @@ def checkpoint_transaction(request):
         w = Worker.from_checkpoint(json.loads(state["extensionState"]))
         if w.contract_state() != state: raise ValueError("checkpoint envelope mismatch")
     w.transaction_scroll_bytes = 0
+    page = CaptureRowPage(w, request["rowStream"]) if "rowStream" in request else None
+    if page is not None:
+        # Replace the hook BEFORE feeding even one byte. The old hook accumulates
+        # a packet and cannot pause halfway through erase/reset/scroll/reflow.
+        w.screen.on_scroll = page.collect
     event = request.get("event")
+    try:
+        apply_checkpoint_event(w, event, identity)
+    except CaptureRowPageFull:
+        return page.result(False)
+    state = w.contract_state(); active = state[state["active"]]
+    result = {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
+            "frame": {"identity": identity, "screenRevision": request["screenRevision"],
+                      "buffer": state["active"], "geometry": state["geometry"],
+                      "changedRows": [{"y": y, "content": row} for y, row in enumerate(active["rows"])],
+                      "cursor": active["cursor"], "overlap": None}}
+    if page is not None:
+        result.update(page.result(True))
+    return result
+
+
+def apply_checkpoint_event(w, event, identity):
     if event:
         p = event["payload"]; pos = event["position"]
         if p["kind"] == "bytes":
@@ -950,12 +1036,6 @@ def checkpoint_transaction(request):
         elif p["kind"] == "control" and p["name"] == "scroll-on-clear" and p["data"] in ("true", "false"):
             w.screen.scroll_on_clear = p["data"] == "true"
         else: raise ValueError("unsupported input control")
-    state = w.contract_state(); active = state[state["active"]]
-    return {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
-            "frame": {"identity": identity, "screenRevision": request["screenRevision"],
-                      "buffer": state["active"], "geometry": state["geometry"],
-                      "changedRows": [{"y": y, "content": row} for y, row in enumerate(active["rows"])],
-                      "cursor": active["cursor"], "overlap": None}}
 
 
 def dispatch(worker, kind, payload, rx=None):

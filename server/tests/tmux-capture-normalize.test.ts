@@ -1071,15 +1071,16 @@ for data in [b'\x1b[2J',b'\x1b[80S',b'\x1bc']:
     expected=[m.contract_row(x['row'],x['wrap'],x['pad']) for x in oracle.scrolls]
     request={'state':state,'identity':identity,'geometry':state['geometry'],'scrollOnClear':True,'screenRevision':1,
       'event':{'identity':identity,'position':{'sourceEpoch':1,'packetSeq':2},'payload':{'kind':'bytes','bytes':list(data)}},
-      'rowStream':{'startOrdinal':0,'maxBytes':65536}}
+      'rowStream':{'startOrdinal':0,'maxBytes':262144}}
     actual=[];pages=0
     while True:
         page=m.checkpoint_transaction(request)
         assert page==m.checkpoint_transaction(request), 'retry must reproduce the same page'
         assert page['startOrdinal']==len(actual)
         assert page['nextOrdinal']==len(actual)+len(page['scrolls'])
-        assert page['chargedBytes']<=65536
-        assert len(json.dumps(page['scrolls'],ensure_ascii=False,separators=(',',':')).encode())*4<=65536
+        assert len(page['scrolls'])<=256
+        assert page['chargedBytes']<=page['peakBytes']<=262144
+        assert len(json.dumps(page['scrolls'],ensure_ascii=False,separators=(',',':')).encode())*4<=262144
         actual.extend(page['scrolls']);pages+=1
         if page['complete']:
             assert page['state']==oracle.contract_state()
@@ -1100,8 +1101,58 @@ for cap in [0,8,524289]:
     try: m.checkpoint_transaction(request)
     except (ValueError,m.CaptureExpansionPressure): pass
     else: raise AssertionError('invalid/undersized cap accepted')
-print('atomic clear/scroll/reset: exact rows, replay, no whole-packet collector, per-page cap=65536')
+print('atomic clear/scroll/reset: exact rows, replay, no whole-packet collector, per-page cap=262144')
 `;
   const r=Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
   expect(r.exitCode,r.stderr.toString()).toBe(0);
 },30000);
+
+test('NEWARCH C stream adapter pulls one page at a time and installs only the completed candidate', async () => {
+  const {CheckpointCaptureVt}=await import('../src/pipe-vt-worker');
+  const state={geometry:cFrame().geometry} as import('../src/stream-contract').VtState;
+  const frame=cFrame();let calls=0;
+  const rpc: import('../src/pipe-vt-worker').CaptureVtRpc={transaction:async request=>{
+    if (!request.rowStream) return {status:'ok',value:{state,frame,scrolls:[]}};
+    calls++;
+    const start=request.rowStream.startOrdinal;
+    const scrolls=[cRow(start)];const page={startOrdinal:start,nextOrdinal:start+1,scrolls,
+      chargedBytes:Buffer.byteLength(JSON.stringify(scrolls))*4};
+    return {status:'ok',value:start===0 ? {...page,complete:false} : {...page,complete:true,state,
+      frame:{...frame,screenRevision:2}}};
+  }};
+  const created=await CheckpointCaptureVt.create(rpc,cIdentity,state.geometry,false);
+  if(created.status!=='ok')throw Error('create');
+  const vt=created.value;const stream=vt.prepareStream(cInput(1));
+  expect(calls).toBe(0);
+  const first=(await stream.next()).value;
+  if(!first || first.status!=='ok')throw Error('first page');
+  expect(first.value.candidate).toBeUndefined();expect(calls).toBe(1);
+  expect(vt.screen().screenRevision).toBe(1);
+  const last=(await stream.next()).value;
+  if(!last || last.status!=='ok' || !last.value.candidate)throw Error('last page');
+  expect(last.value.startOrdinal).toBe(1);expect(calls).toBe(2);
+  last.value.candidate.install();expect(vt.screen().screenRevision).toBe(2);
+  expect(()=>last.value.candidate!.install()).toThrow();
+  await stream.return();
+  const dropped=vt.prepareStream(cInput(2));await dropped.next();
+  const end=(await dropped.next()).value;
+  if(!end || end.status!=='ok' || !end.value.candidate)throw Error('drop candidate');
+  await dropped.return();expect(()=>end.value.candidate!.install()).toThrow();
+  expect(vt.screen().screenRevision).toBe(2);
+});
+
+test('NEWARCH C stream adapter rejects a nonadvancing or over-budget continuation', async () => {
+  const {CheckpointCaptureVt}=await import('../src/pipe-vt-worker');
+  for(const fault of ['cursor','bytes']){
+    const state={geometry:cFrame().geometry} as import('../src/stream-contract').VtState;
+    const rpc: import('../src/pipe-vt-worker').CaptureVtRpc={transaction:async request=>({status:'ok',value:
+      !request.rowStream ? {state,frame:cFrame(),scrolls:[]} : {complete:false,startOrdinal:0,
+        nextOrdinal:fault==='cursor'?0:1,scrolls:fault==='cursor'?[]:[cRow(0)],chargedBytes:fault==='bytes'?524289:8}})};
+    const made=await CheckpointCaptureVt.create(rpc,cIdentity,state.geometry,false);
+    if(made.status!=='ok')throw Error('create');
+    const stream=made.value.prepareStream(cInput(1));
+    expect((await stream.next()).value).toMatchObject({status:'error',code:'integrity'});
+    expect((await stream.next()).done).toBe(true);
+    expect(made.value.screen()).toEqual(cFrame());
+  }
+});
