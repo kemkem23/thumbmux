@@ -466,3 +466,287 @@ test('stream I archive catalog publishes only committed intervals, resumes decis
     expect(retired).toBe(4);
   } finally { catalog.close(); await runtime.close(); await rm(root,{recursive:true,force:true}); }
 },30000);
+
+// Lot I round 5: rollback archive handoff (DESIGN-I3 §2) and source EOF
+// (§3) through the real host, real C/H SQLite, catalog and legacy composite.
+import { Database } from 'bun:sqlite';
+import { writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { StreamArchiveRowReader } from '../src/history-engine';
+import { StreamLegacyComposite, StreamSegmentReader, composeLegacyArchive, installStreamArchive,
+  openStreamArchive, rowAnsi, type ArchiveSegment } from '../../../../src/integrations/stream-archive-bridge';
+import { openStreamArchiveForLegacy, closeStreamArchiveForLegacy } from '../../../../src/integrations/stream-pipe-host';
+
+/** terminal-history page semantics: before is exclusive end, after is
+ * exclusive start, pages clamp below the requested limit. */
+class FakeLegacyArchive {
+  lines = new Map<string,string[]>(); live = new Map<string,number>(); calls = 0;
+  readBefore(s:string,before:number|null,limit=500){
+    this.calls++; const all=this.lines.get(s)??[];
+    const end=Math.max(0,Math.min(before??all.length,all.length)),start=Math.max(0,end-Math.min(limit,7));
+    return {lines:all.slice(start,end),startLine:start,endLine:end,hasMore:start>0,totalArchivedLines:all.length};
+  }
+  readAfter(s:string,after:number|null,limit=500){
+    this.calls++; const all=this.lines.get(s)??[];
+    const start=Math.max(0,Math.min(after===null?0:after+1,all.length)),end=Math.min(start+Math.min(limit,7),all.length);
+    return {lines:all.slice(start,end),startLine:start,endLine:end,hasMore:end<all.length,totalArchivedLines:all.length};
+  }
+  liveStartLine(s:string){return this.live.get(s)??null;}
+  boundary(s:string){return this.live.has(s)?{generation:'g',liveStartLine:this.live.get(s)!,walSequence:'1',walOffset:0}:null;}
+  renameSession(a:string,b:string){const l=this.lines.get(a);this.lines.delete(a);if(l)this.lines.set(b,l);}
+  dropSession(s:string){this.lines.delete(s);}
+  ingestSnapshot(){return{liveContent:''};}
+}
+const plain=(line:string)=>line.replace(/\x1b\[[0-9;]*m/g,'');
+async function oracleRows(pane:import('../src/stream-runtime').StreamRuntimePane,end:number):Promise<string[]>{
+  const route={viewerId:`oracle-${crypto.randomUUID()}`,identity:pane.identity,routeGeneration:1};
+  expect((await pane.attach(route,()=>{})).status).toBe('ok');
+  const out:string[]=[];let cursor=null as any;
+  try{do{
+    const r=await pane.page(route,{requestId:route.viewerId,identity:pane.identity,routeGeneration:1,range:{start:0,end},
+      deadlineMonoMs:performance.now()+1000},cursor,256,{isCancelled:()=>false});
+    if(r.status!=='ok')throw Error(JSON.stringify(r));
+    for(const f of r.value.fragments){expect(f.complete).toBe(true);out[f.row.id.lineId]=rowAnsi(f.row);}
+    cursor=r.value.nextAfter;
+  }while(cursor);}finally{await pane.detach(route.viewerId);}
+  return out;
+}
+/** Every page shape, both directions, against the oracle: missing/dup/order 0. */
+function walk(archive:ReturnType<typeof composeLegacyArchive<FakeLegacyArchive>>,session:string,oracle:string[],limit:number){
+  const back:string[]=[];let before:number|null=null,guard=0;
+  for(;;){
+    const p=archive.readBefore(session,before,limit) as any;
+    expect(p.totalArchivedLines).toBe(oracle.length);expect(p.endLine-p.startLine).toBe(p.lines.length);
+    back.unshift(...p.lines);if(!p.hasMore)break;before=p.startLine;if(++guard>10_000)throw Error('no progress');
+  }
+  const fwd:string[]=[];let after:number|null=null;
+  for(;;){
+    const p=archive.readAfter!(session,after,limit) as any;
+    fwd.push(...p.lines);if(!p.hasMore)break;after=p.endLine-1;if(++guard>20_000)throw Error('no progress');
+  }
+  expect(back).toEqual(oracle);expect(fwd).toEqual(oracle);
+}
+
+test('stream I rollback bridge: legacy reads join the frozen sh_* interval exactly, seam stays unknown, base untouched',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'stream-i-r5-bridge-'));
+  const runtime=new StreamRuntime({path:join(root,'stream-history.sqlite')});
+  const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+  let composite:StreamLegacyComposite|null=null;
+  try{
+    const pane=await runtime.add(streamTestIdentity,{columns:12,rows:3},streamPorts);pane.stopCadence();
+    // Repeats, blanks, wide/combining cells, SGR and a soft-wrapped row.
+    const text=['same','','same','\x1b[31mred\x1b[0m','กข','中文字','x'.repeat(30),'',...Array.from({length:40},(_,i)=>`r${i}`)];
+    await pane.ingest(Buffer.from(text.join('\r\n')+'\r\n'));
+    const cp=(await pane.drain())!,F=cp.head,oracle=await oracleRows(pane,F);
+    expect(F).toBeGreaterThan(40);expect(oracle.filter(l=>plain(l)==='same')).toHaveLength(2);
+    // Untouched base: no composite or an unbound session forwards verbatim.
+    legacy.lines.set('s',['L0','L1']);legacy.lines.set('other',['o']);
+    expect(archive.readBefore('s',null,5)).toEqual(legacy.readBefore('s',null,5));
+    composite=openStreamArchive(root,true)!;
+    installStreamArchive(composite);
+    const page=archive.readBefore('other',null,5);expect(page).toEqual(legacy.readBefore('other',null,5));
+    const owner={pane:pane.identity.pane,route:'stream' as const,generation:1,globalStart:0,localStart:0,root:'sh',schema:'sh-v1'};
+    composite.catalog.initialize(owner);composite.catalog.bindSession('s',owner.pane);
+    composite.catalog.begin(owner.pane,'planned:1',1,'legacy');
+    expect(()=>composite!.catalog.prepareFence(owner.pane,'planned:1',{localEnd:F,revision:cp.revision,checkpoint:cp},
+      {...owner,route:'stream',generation:2,globalStart:F},{kind:'source-authoritative',reason:'tmux'},{kind:'planned',missingCount:null,reason:'x'})).toThrow();
+    // The legacy archive already holds 2 rows; legacy resumes at local 0 here
+    // because nothing legacy was frozen before the stream tenure (fresh pane).
+    composite.catalog.prepareFence(owner.pane,'planned:1',{localEnd:F,revision:cp.revision,checkpoint:cp},
+      {...owner,route:'legacy',generation:2,globalStart:F,localStart:0,root:'legacy',schema:'th'},
+      {kind:'source-authoritative',reason:'legacy capture re-reads tmux state'},{kind:'planned',missingCount:null,reason:'writer detached'});
+    composite.catalog.commit(owner.pane,'planned:1');
+    const all=[...oracle,'L0','L1'];
+    for(const limit of [1,3,7,500,2000])walk(archive,'s',all,limit);
+    const last=archive.readBefore('s',F+1,3) as any;
+    expect(last.markers).toEqual([{lineId:F,kind:'stream-planned',reason:'writer detached',missingCount:null}]);
+    expect((archive.readBefore('s',F-5,3) as any).markers).toEqual([]);
+    legacy.live.set('s',1);
+    expect(archive.liveStartLine!('s')).toBe(F+1);
+    expect((archive.boundary!('s') as any).liveStartLine).toBe(F+1);
+    expect(archive.readBefore('s',null,3)).toMatchObject({startLine:all.length-3,endLine:all.length});
+    // Rename follows the label; drop forgets it; nothing is matched by text.
+    archive.renameSession!('s','t');walk(archive,'t',all,7);
+    expect(archive.readBefore('s',null,5)).toEqual(legacy.readBefore('s',null,5));
+    // Async fragment bridge reads the same rows from the sh_* backend.
+    const seg=composite.catalog.segmentAt(owner.pane,0)!;
+    expect(seg).toMatchObject({route:'stream',globalStart:0,globalEnd:F,seam:{kind:'planned',missingCount:null}});
+    const reader=new StreamSegmentReader(composite.rows!);const got:string[]=[];
+    const {StreamArchiveBridge}=await import('../../../../src/integrations/stream-archive-bridge');
+    await new StreamArchiveBridge(composite.catalog,{stream:reader,legacy:reader}).read(owner.pane,0,F,new AbortController().signal,async f=>{got[f.row.id.lineId]=rowAnsi(f.row);});
+    expect(got).toEqual(oracle);
+    // Mutants: a frozen revision below the row, a misaligned legacy page and a
+    // tampered fragment are errors, never a short page or an EOF.
+    const frozen:ArchiveSegment={...seg,revision:0};
+    await expect(reader.read(frozen,0,0,new AbortController().signal)).rejects.toThrow('newer than frozen');
+    const realBefore=legacy.readBefore.bind(legacy);
+    legacy.readBefore=(s,b,l)=>({...realBefore(s,b,l),startLine:0}) as any;
+    expect(()=>archive.readBefore('t',null,2)).toThrow('range fence');
+    legacy.readBefore=realBefore;
+    archive.dropSession!('t');expect(composite.catalog.paneForSession('t')).toBeNull();
+    composite.catalog.bindSession('t',owner.pane);
+    await runtime.close();
+    composite.rows!.close();(composite as any).reader=null;
+    const db=new Database(join(root,'stream-history.sqlite'));
+    expect(db.query("UPDATE sh_fragment SET payload=replace(payload,'\"width\":1','\"width\":2') WHERE line=10").run().changes).toBe(1);db.close();
+    expect(()=>archive.readBefore('t',F,500)).toThrow('checksum');
+  }finally{
+    installStreamArchive(null);composite?.close();
+    await runtime.close().catch(()=>{});await rm(root,{recursive:true,force:true});
+  }
+},30000);
+
+/** Host with a real unix socket path, a fake tmux identity and a fake pipe owner. */
+async function r5Host(root:string,options:{legacyLines?:(s:string)=>number}={}){
+  const sock=join(root,'tmux.sock');const server=Bun.listen({unix:sock,socket:{data(){}}});
+  writeFileSync(join(root,'allowlist.json'),JSON.stringify({server:'S1',sessions:[{sessionId:'$1'}]}));
+  const host=new StreamPipeHost({root,tmuxSocket:sock,...options});
+  (host as any).tmux=(args:string[])=>({exitCode:0,stderr:'',stdout:args.includes('-t')?'$1\t%9\t123\n':'S1\n'});
+  const events:string[]=[];let handlers:any=null;
+  (host as any).pipes={
+    startBinaryPipe:(_s:string,h:any)=>{handlers=h;events.push('start');return true;},
+    stopPipe:async(s:string)=>{events.push('stop:'+s);return{sourceDetached:true,readerEof:true,lastAdmittedSequence:null,lastAckedSequence:null,
+      ramRevision:null,durableRevision:null,issues:[],unknownTail:false};},
+  };
+  await host.start();
+  host.projection.onRouteChange(s=>events.push('route:'+s+':'+host.projection.ownsPipe(s)));
+  const identity={pane:{serverIdentity:`${sock}#S1`,paneId:'%9',birthGeneration:123},sourceEpoch:1,geometryGeneration:0};
+  const attach=async(session='s')=>{
+    const pane=await host.runtime.add(identity,{columns:12,rows:3},streamPorts);pane.stopCadence();
+    await host.attachSource(session,pane,1);return pane;
+  };
+  return{host,events,attach,handlers:()=>handlers,identity,close:async()=>{try{await host.close();}finally{server.stop(true);}}};
+}
+
+test('stream I host rollback: planned route switch and shutdown commit one durable interval and release the pipe first',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'stream-i-r5-host-'));
+  const rig=await r5Host(root);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+  try{
+    const pane=await rig.attach();
+    expect(rig.host.projection.owns('s')).toBe(true);
+    await rig.handlers().onBytes(Buffer.from(Array.from({length:30},(_,i)=>`p${i}\r\n`).join('')));
+    const F=(await pane.drain())!.head,oracle=await oracleRows(pane,F);
+    const receipt=await rig.host.setRoute('s','legacy');
+    expect(receipt).toMatchObject({ok:true,from:'newarch',to:'legacy'});
+    // Our writer is detached before the legacy path is told to attach its own.
+    expect(rig.events.slice(-2)).toEqual(['stop:s','route:s:false']);
+    expect(rig.host.projection.owns('s')).toBe(false);
+    const catalog=rig.host.archive!.catalog;
+    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',generation:2,globalStart:F,localStart:0});
+    expect(catalog.segmentAt(rig.identity.pane,F-1)).toMatchObject({route:'stream',globalEnd:F,seam:{kind:'planned',missingCount:null}});
+    legacy.lines.set('s',['after-0']);
+    walk(archive,'s',[...oracle,'after-0'],7);
+    // A second switch and re-entry are refused, not faked.
+    expect((await rig.host.setRoute('s','newarch')).ok).toBe(false);
+    await expect(rig.attach()).rejects.toThrow('stream re-entry requires bootstrap proof');
+  }finally{await rig.close();await rm(root,{recursive:true,force:true});}
+  // Shutdown freezes every live tenure; the next boot finalizes nothing new.
+  const root2=await mkdtemp(join(tmpdir(),'stream-i-r5-shutdown-'));
+  const rig2=await r5Host(root2);
+  try{
+    const pane=await rig2.attach('z');await rig2.handlers().onBytes(Buffer.from('a\r\nb\r\nc\r\nd\r\n'));
+    const F=(await pane.drain())!.head;
+    const closed=await rig2.host.close();expect(closed.issues).toEqual([]);expect(closed.drained).toBe(true);
+    const again=new StreamPipeHost({root:root2,tmuxSocket:(rig2.host.options.tmuxSocket)});
+    (again as any).pipes=(rig2.host as any).pipes;
+    await again.start();
+    expect(again.finalize).toEqual({finalized:[],resolved:[],blocked:[]});
+    expect(again.archive!.catalog.segmentAt(rig2.identity.pane,0)).toMatchObject({globalEnd:F,seam:{kind:'shutdown',missingCount:null}});
+    await again.close();
+  }finally{await rig2.close().catch(()=>{});await rm(root2,{recursive:true,force:true});}
+},60000);
+
+test('stream I source EOF: no reopen, durable unresolved gap, rows kept, pane handed to legacy; prehistory is refused',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'stream-i-r5-eof-'));
+  const rig=await r5Host(root);const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+  try{
+    const pane=await rig.attach();const h=rig.handlers();
+    await h.onBytes(Buffer.from(Array.from({length:20},(_,i)=>`e${i}\r\n`).join('')+'\x1b[3'));
+    const F=(await pane.drain())!.head,oracle=await oracleRows(pane,F);
+    h.onBroken({reason:'eof',message:'source EOF'});
+    expect(()=>h.prepareRestart(2)).toThrow('no upstream journal');
+    h.onBroken({reason:'eof',message:'source EOF'}); // notifyBroken after the refusal
+    const catalog=rig.host.archive!.catalog;
+    for(let i=0;i<200&&catalog.owner(rig.identity.pane)?.route!=='legacy';i++)await Bun.sleep(10);
+    expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',globalStart:F,generation:2});
+    expect(rig.events.filter(e=>e==='stop:s')).toHaveLength(1);
+    expect(rig.events.at(-1)).toBe('route:s:false');
+    const durable=rig.host.archive!.rows!.durable(rig.identity.pane)!;
+    // C fenced the episode durably at EOF; the catalog seam is its final verdict.
+    expect(durable.gap).toMatchObject({reason:'eof',missingCount:null,lastAdmittedRow:F-1});
+    expect(catalog.segmentAt(rig.identity.pane,0)!.seam).toEqual({kind:'source-eof',missingCount:null,reason:'source EOF'});
+    expect(durable.head).toBe(F);
+    legacy.lines.set('s',['resumed']);
+    walk(archive,'s',[...oracle,'resumed'],3);
+    expect((archive.readBefore('s',F+1,2) as any).markers).toEqual([{lineId:F,kind:'stream-source-eof',reason:'source EOF',missingCount:null}]);
+  }finally{await rig.close();await rm(root,{recursive:true,force:true});}
+  const root2=await mkdtemp(join(tmpdir(),'stream-i-r5-prehistory-'));
+  const rig2=await r5Host(root2,{legacyLines:()=>3});
+  try{
+    await expect(rig2.attach('p')).rejects.toThrow('legacy prehistory');
+    expect(rig2.host.archive!.catalog.owner(rig2.identity.pane)).toBeNull();
+    expect(rig2.events).toEqual([]);
+  }finally{await rig2.close();await rm(root2,{recursive:true,force:true});}
+},60000);
+
+test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARED, aborts PREPARE, and opens nothing without a catalog',async()=>{
+  const empty=await mkdtemp(join(tmpdir(),'stream-i-r5-none-'));
+  expect(await openStreamArchiveForLegacy(empty,()=>{})).toBeNull();
+  expect(existsSync(join(empty,'stream-archive.sqlite'))).toBe(false);
+  await rm(empty,{recursive:true,force:true});
+  const root=await mkdtemp(join(tmpdir(),'stream-i-r5-crash-')),crash=await mkdtemp(join(tmpdir(),'stream-i-r5-crash-copy-'));
+  const runtime=new StreamRuntime({path:join(root,'stream-history.sqlite')});
+  const catalogA=openStreamArchive(root,true)!;
+  try{
+    const a=await runtime.add(streamTestIdentity,{columns:12,rows:3},streamPorts);a.stopCadence();
+    const bKey={...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%2'}};
+    const cKey={...streamTestIdentity,pane:{...streamTestIdentity.pane,paneId:'%3'}};
+    const b=await runtime.add(bKey,{columns:12,rows:3},streamPorts);b.stopCadence();
+    const c=await runtime.add(cKey,{columns:12,rows:3},streamPorts);c.stopCadence();
+    for(const [p,tag] of [[a,'a'],[b,'b'],[c,'c']] as const){
+      await p.ingest(Buffer.from(Array.from({length:12},(_,i)=>`${tag}${i}\r\n`).join('')));await p.drain();
+    }
+    const owner=(pane:typeof a)=>({pane:pane.identity.pane,route:'stream' as const,generation:1,globalStart:0,localStart:0,root:'sh',schema:'sh-v1'});
+    for(const p of [a,b,c])catalogA.catalog.initialize(owner(p));
+    catalogA.catalog.bindSession('a',a.identity.pane);
+    // b: PREPARED rollback whose commit ACK was lost; c: PREPARE without proof.
+    const bcp=(await b.drain())!;
+    catalogA.catalog.begin(b.identity.pane,'eof:1',1,'legacy');
+    catalogA.catalog.prepareFence(b.identity.pane,'eof:1',{localEnd:bcp.head,revision:bcp.revision,checkpoint:bcp},
+      {...owner(b),route:'legacy',generation:2,globalStart:bcp.head},{kind:'source-authoritative',reason:'tmux'},
+      {kind:'source-eof',missingCount:null,reason:'eof'});
+    catalogA.catalog.begin(c.identity.pane,'planned:1',1,'legacy');
+    // a: more input after its last checkpoint, then the process "dies": the
+    // copy below holds journal input with no checkpoint covering it.
+    await a.ingest(Buffer.from(Array.from({length:12},(_,i)=>`late${i}\r\n`).join('')));
+    for(const f of ['stream-history.sqlite','stream-history.sqlite-wal','stream-history.sqlite-shm','stream-archive.sqlite','stream-archive.sqlite-wal','stream-archive.sqlite-shm'])
+      if(existsSync(join(root,f)))copyFileSync(join(root,f),join(crash,f));
+    const finalA=(await a.drain())!.head,oracleA=await oracleRows(a,finalA);
+    catalogA.close();await runtime.close();
+    const pre=new StreamArchiveRowReader(join(crash,'stream-history.sqlite'));
+    const before=pre.durable(a.identity.pane)!;pre.close();
+    const logs:string[]=[];
+    const report=(await openStreamArchiveForLegacy(crash,m=>logs.push(m)))!;
+    try{
+      expect(report.resolved).toEqual(['eof:1']);
+      expect(report.blocked).toEqual([]);
+      expect(report.finalized.sort()).toEqual(['finalize:1','finalize:1']);
+      const legacy=new FakeLegacyArchive(),archive=composeLegacyArchive(legacy);
+      // Replay projected the journal tail with original IDs: same rows as the
+      // pane that drained normally, nothing duplicated or invented.
+      walk(archive,'a',oracleA,7);
+      if(before.journalAfterCheckpoint)expect(before.head).toBeLessThan(finalA);
+      const {activeStreamArchive}=await import('../../../../src/integrations/stream-archive-bridge');
+      const cat=activeStreamArchive()!.catalog;
+      expect(cat.owner(c.identity.pane)).toMatchObject({route:'legacy',generation:2});
+      expect(cat.handoff(c.identity.pane,'planned:1')!.phase).toBe('ABORTED');
+      expect(cat.segmentAt(b.identity.pane,0)!.seam.kind).toBe('source-eof');
+      expect(cat.streamOwners()).toEqual([]);
+    }finally{closeStreamArchiveForLegacy();}
+    // Booting again is idempotent.
+    const second=(await openStreamArchiveForLegacy(crash,()=>{}))!;
+    expect(second).toEqual({finalized:[],resolved:[],blocked:[]});closeStreamArchiveForLegacy();
+  }finally{
+    try{catalogA.close();}catch{}await runtime.close().catch(()=>{});
+    await rm(root,{recursive:true,force:true});await rm(crash,{recursive:true,force:true});
+  }
+},60000);
