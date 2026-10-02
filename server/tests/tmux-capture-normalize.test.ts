@@ -942,3 +942,52 @@ test('NEWARCH C retrying a committed repair prefix cannot duplicate hot rows',()
   expect(tail.rows.map(r=>r.id.lineId)).toEqual(rows.map(r=>r.id.lineId));
   expect(tail.rows.length).toBeLessThanOrEqual(256);expect(tail.heldBytes).toBeLessThanOrEqual(1048576);
 });
+
+// Round 3: source packetization happens BEFORE journal IDs/ACKs are assigned.
+import { CaptureTaskScope } from '../src/capture-engine';
+test('NEWARCH C oversized source read is packetized before durable admission', async () => {
+  const f=cEngineFixture(); const lengths:number[]=[];
+  const prepare=f.ports.vt.prepare;
+  f.ports.vt.prepare=async event=>{
+    if(event.payload.kind==='bytes' && event.payload.bytes.length>32)
+      return {status:'busy',reason:'pressure',retryAfterMs:10};
+    return prepare(event);
+  };
+  const journal=f.ports.history.journalInput;
+  f.ports.history.journalInput=async event=>{
+    if(event.payload.kind==='bytes') lengths.push(event.payload.bytes.length);
+    return journal(event);
+  };
+  let offset=0,seq=1;
+  const bytes=new Uint8Array(4097).fill(65);
+  while(offset<bytes.length) {
+    const r=await f.engine.acceptSourceBytes(bytes.subarray(offset),seq,1);
+    expect(r.status).toBe('ok');
+    if(r.status!=='ok')throw Error('packetization');
+    offset+=r.value.consumed; seq++;
+  }
+  expect(lengths.reduce((a,b)=>a+b,0)).toBe(4097);
+  expect(Math.max(...lengths)).toBeLessThanOrEqual(32);
+  expect(f.counts().installs).toBe(lengths.length);
+  expect(f.ports.admission.heldBytes).toBe(0);
+});
+test('NEWARCH C hard cancellation returns while a port hangs, retains charge until kill ACK', async()=>{
+  const controller=new AbortController(); let ack!:()=>void, released=0;
+  const scope=new CaptureTaskScope(controller.signal,()=>new Promise<void>(r=>{ack=r;}));
+  const waited=scope.wait(new Promise<void>(()=>{}));
+  controller.abort();
+  await expect(waited).rejects.toThrow('capture operation cancelled');
+  scope.finish(()=>{released++;});
+  expect(released).toBe(0);
+  ack(); await new Promise(r=>setTimeout(r,0));
+  expect(released).toBe(1);
+});
+test('NEWARCH C rejected kill acknowledgement quarantines reservation until actual completion',async()=>{
+  const controller=new AbortController(); let settle!:()=>void,released=0;
+  const scope=new CaptureTaskScope(controller.signal,async()=>{throw Error('kill failed');});
+  const waited=scope.wait(new Promise<void>(r=>{settle=r;}));
+  controller.abort(); await expect(waited).rejects.toThrow();
+  scope.finish(()=>{released++;}); await new Promise(r=>setTimeout(r,0));
+  expect(released).toBe(0);
+  settle(); await new Promise(r=>setTimeout(r,0)); expect(released).toBe(1);
+});
