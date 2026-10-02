@@ -1786,12 +1786,30 @@ export class TmuxWsMux<
     } catch {}
   }
 
+  private sendProjectedHistoryAsync(session: string, ws: WS, result: PromiseLike<unknown>): void {
+    const generation = this.projection?.routeGeneration(session);
+    const subscribers = this.subscribers.get(session);
+    void Promise.resolve(result).then(page => {
+      if (!this.projection?.owns(session) || this.projection.routeGeneration(session) !== generation
+        || this.subscribers.get(session) !== subscribers || !subscribers?.has(ws)) return;
+      this.wsSend(ws, JSON.stringify({channel: session, type: 'history', data: JSON.stringify(boundProjectedHistoryPage(page))}));
+    }).catch(error => {
+      this.reportArchiveReadErrorBestEffort('readBefore', session, error);
+      if (this.subscribers.get(session)?.has(ws)) this.sendHistoryReadErrorBestEffort(session, ws);
+    });
+  }
+
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = boundProjectedHistoryPage(this.projection.readBefore(session, beforeLine ?? null, limit));
+        const result = this.projection.readBefore(session, beforeLine ?? null, limit);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
+          return;
+        }
+        history = boundProjectedHistoryPage(result);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readBefore", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);
@@ -1849,7 +1867,12 @@ export class TmuxWsMux<
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = boundProjectedHistoryPage(this.projection.readAfter(session, afterLine, limit));
+        const result = this.projection.readAfter(session, afterLine, limit);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
+          return;
+        }
+        history = boundProjectedHistoryPage(result);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readAfter", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);

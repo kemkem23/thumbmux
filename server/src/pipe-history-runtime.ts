@@ -1614,3 +1614,6 @@ export const createProjectionStore = createProjectionStoreValue;
 /** VT worker assets beside this module (dist or source) and their pinned-hash check. */
 export const pipeVtAssets = pipeVtAssetsValue;
 export const verifyPipeVtAssets = verifyPipeVtAssetsValue;
+
+// Explicit stream entrypoint; constructing the legacy runtime remains unchanged.
+export { StreamRuntime, StreamRuntimePane, StreamVtTransport } from './stream-runtime';

@@ -38,6 +38,9 @@ export class StreamVtTransport implements CaptureVtRpc {
         const kind = this.buffer.toString('ascii', 0, 1);
         const body = this.buffer.subarray(5, length + 5);
         this.buffer = this.buffer.subarray(length + 5);
+        // A attaches an inert legacy channel, which emits its blank U once.
+        // J replies alone own transactional state; unsolicited E remains fatal.
+        if (kind === 'U' || kind === 'H') continue;
         const pending = this.pending;
         if (!pending || pending.kind !== kind) { this.fail(Error('unexpected stream RPC reply')); void this.retire(); return; }
         this.pending = null;
