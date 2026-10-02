@@ -313,15 +313,19 @@ export class StreamRuntimePane {
       this.frame = {...this.vt.screen(), identity: cp.identity, head: 0, revision: 0, durableRevision: 0};
       this.makeCapture();
       this.sequence = cp.inputFence.through.packetSeq;
-      const self = this;
-      async function* inputs(): AsyncIterable<InputEvent> {
-        while (true) {
-          const next = await recovery.next(); if (next.done) return;
-          const item = unwrap(next.value);
-          if (item.kind === 'input') { self.sequence = item.event.position.packetSeq; yield item.event; }
-        }
+      // Restore the checkpoint alone, then feed journal input one event at a
+      // time with a drain between, like the checkpoint-free path: C's restore
+      // refuses a second event while the first is still pending.
+      async function* none(): AsyncIterable<InputEvent> {}
+      this.frame = unwrap(await this.capture.restore(cp, none()));
+      for (;;) {
+        const next = await recovery.next(); if (next.done) break;
+        const item = unwrap(next.value);
+        if (item.kind !== 'input') continue;
+        unwrap(await this.capture.acceptInput(item.event));
+        unwrap(await this.capture.drain(this.identity.pane, performance.now() + B.recoveryMs));
+        this.sequence = item.event.position.packetSeq;
       }
-      this.frame = unwrap(await this.capture.restore(cp, inputs()));
     } finally { await recovery.return?.(); }
   }
   /** Whole FIFO slice is owned until the promise resolves; never acknowledge a
