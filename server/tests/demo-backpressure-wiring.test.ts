@@ -40,7 +40,7 @@ test("demo forwards Bun websocket drain events to TmuxWsMux", async () => {
 
 // Lot I: native shared Python J -> C streaming pages -> real SQLite H -> D.
 // No mock H receipts or VT frame/row arrays can conceal a seam failure here.
-import { StreamRuntime } from '../src/stream-runtime';
+import { StreamRuntime, StreamVtTransport } from '../src/stream-runtime';
 import { STREAM_BUDGET, type StreamIdentity } from '../src/stream-contract';
 const streamTestIdentity: StreamIdentity = {pane:{serverIdentity:'isolated-i',paneId:'%1',birthGeneration:1},sourceEpoch:1,geometryGeneration:0};
 const streamPorts = {
@@ -320,3 +320,18 @@ test('stream I C visible cancellation reaps its real source child without killin
   expect(pane.frame.changedRows[0]!.content.cells.map(c=>c.text).join('').trimEnd()).toBe('still alive');
  }finally{await source.close();await runtime.close();await rm(root,{recursive:true,force:true});}
 },10000);
+
+
+test('stream I RPC retirement waits for a late pool acquire and lease release',async()=>{
+ const rpc=new StreamVtTransport();
+ let acquire!:(lease:any)=>void,release!:()=>void;
+ const released=new Promise<void>(resolve=>{release=resolve;});
+ const pool={acquire:()=>new Promise<any>(resolve=>{acquire=resolve;})};
+ const started=rpc.start(pool as any,{columns:20,rows:4},1).then(()=>false,()=>true);
+ let retired=false,destroyed=false;
+ const retirement=rpc.retire().then(()=>{retired=true;});
+ await Promise.resolve();await Promise.resolve();expect(retired).toBe(false);
+ acquire({socket:{destroy:()=>{destroyed=true;}},release:()=>released});
+ await Promise.resolve();await Promise.resolve();expect(destroyed).toBe(true);expect(retired).toBe(false);
+ release();await retirement;expect(await started).toBe(true);expect(retired).toBe(true);
+});

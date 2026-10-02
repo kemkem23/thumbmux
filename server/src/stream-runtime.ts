@@ -23,12 +23,21 @@ export class StreamVtTransport implements CaptureVtRpc {
   private closed = false;
   private retirement: Promise<void> | null = null;
   private resetting: Promise<void> | null = null;
+  private starting: Promise<void> | null = null;
   private pool: PipeVtPool | null = null;
   private geometry: Geometry | null = null;
   private epoch = 0;
   private transactionActive = false;
   get pid(): number | null { return this.lease?.pid ?? null; }
-  async start(pool: PipeVtPool, geometry: Geometry, epoch: number): Promise<void> {
+  start(pool: PipeVtPool, geometry: Geometry, epoch: number): Promise<void> {
+    if (this.starting) return Promise.reject(Error('stream RPC already starting'));
+    const work=this.openChannel(pool,geometry,epoch);
+    this.starting=work;
+    const settled=()=>{if(this.starting===work)this.starting=null;};
+    void work.then(settled,settled);
+    return work;
+  }
+  private async openChannel(pool: PipeVtPool, geometry: Geometry, epoch: number): Promise<void> {
     if (this.closed) throw Error('stream RPC retired');
     this.pool = pool; this.geometry = geometry; this.epoch = epoch;
     const lease = await pool.acquire();
@@ -115,7 +124,13 @@ export class StreamVtTransport implements CaptureVtRpc {
   }
   retire(): Promise<void> {
     this.closed = true;
-    return this.retirement ??= this.resetGeneration();
+    return this.retirement ??= (async()=>{
+      await this.resetGeneration();
+      // acquire() may have started before retirement but not returned its
+      // lease yet. Its closed check must release that lease before the ACK.
+      await this.starting?.catch(()=>{});
+      await this.resetGeneration();
+    })();
   }
   async close(): Promise<void> {
     if (this.pending || this.transactionActive || this.resetting) return this.retire();
