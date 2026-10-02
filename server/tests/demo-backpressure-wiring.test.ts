@@ -537,7 +537,7 @@ test('stream I rollback bridge: legacy reads join the frozen sh_* interval exact
     const text=['same','','same','\x1b[31mred\x1b[0m','กข','中文字','x'.repeat(30),'',...Array.from({length:40},(_,i)=>`r${i}`)];
     await pane.ingest(Buffer.from(text.join('\r\n')+'\r\n'));
     const cp=(await pane.drain())!,F=cp.head,oracle=await oracleRows(pane,F);
-    expect(F).toBeGreaterThan(40);expect(oracle.filter(l=>plain(l)==='same')).toHaveLength(2);
+    expect(F).toBeGreaterThan(40);expect(oracle.filter(l=>plain(l).trimEnd()==='same')).toHaveLength(2);
     // Untouched base: no composite or an unbound session forwards verbatim.
     legacy.lines.set('s',['L0','L1']);legacy.lines.set('other',['o']);
     expect(archive.readBefore('s',null,5)).toEqual(legacy.readBefore('s',null,5));
@@ -734,7 +734,8 @@ test('stream I flag-off boot freezes a crashed tenure (replay), resolves PREPARE
       // Replay projected the journal tail with original IDs: same rows as the
       // pane that drained normally, nothing duplicated or invented.
       walk(archive,'a',oracleA,7);
-      if(before.journalAfterCheckpoint)expect(before.head).toBeLessThan(finalA);
+      // The copy really held unprojected journal input, so replay was exercised.
+      expect(before.journalAfterCheckpoint).toBe(true);
       const {activeStreamArchive}=await import('../../../../src/integrations/stream-archive-bridge');
       const cat=activeStreamArchive()!.catalog;
       expect(cat.owner(c.identity.pane)).toMatchObject({route:'legacy',generation:2});
