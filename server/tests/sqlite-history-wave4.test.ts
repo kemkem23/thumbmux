@@ -10,7 +10,7 @@ import { Database } from 'bun:sqlite';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
-import { rowsDigest } from '../src/sqlite-history/codec';
+import { rowsDigest, encodeBlock, decodeBlock, encodeCaptureArchive, decodeCaptureArchive, LEGACY_INFLATE_MAX_BYTES } from '../src/sqlite-history/codec';
 import { validateHistoryPage } from '../src/sqlite-history/detectors';
 import type { HistoryContext, HistoryRow } from '../src/sqlite-history/types';
 import { batch, fixture, ids } from './sqlite-history/helpers';
@@ -597,6 +597,7 @@ describe('stream-first H crash and continuation', () => {
         const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
         const [exit, output, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
         expect(exit).not.toBe(0);
+        expect(child.signalCode).toBe('SIGKILL');
         expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
         const engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
         try {
@@ -621,4 +622,84 @@ describe('stream-first H crash and continuation', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     }
   }, 30000);
+});
+
+
+describe('stream-first H legacy decode admission', () => {
+  test('legacy blocks and archives fail loudly on inflate pressure, never return false EOF', () => {
+    const rows = [['x'.repeat(LEGACY_INFLATE_MAX_BYTES + 1)]];
+    expect(() => decodeBlock(encodeBlock(rows))).toThrow();
+    expect(() => decodeCaptureArchive(encodeCaptureArchive(rows))).toThrow('scratch-pressure');
+    expect(decodeBlock(encodeBlock([['old', 1], ['old', 2]]))).toEqual([['old', 1], ['old', 2]]);
+  });
+});
+
+test('stream-first H repair SIGKILL keeps committed prefix exactly once at every transaction boundary', async () => {
+  for (const phase of ['repair-before-write', 'repair-before-commit', 'repair-after-commit']) {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-repair-kill-')), path = join(dir, 'stream.sqlite');
+    const episode = { episodeId: 'gap', pane: shPane, epochBefore: 1, epochAfter: 1, lastDurableInput: shInput().position,
+      lastAdmittedRow: 0, firstObservedAtMonoMs: 0, reason: 'eof' as const, status: 'repairing' as const, missingCount: null };
+    const data = { episode, chunkId: 'repair-1', expectedRevision: 1, rows: shAppend(2).rows, final: false };
+    const chunk = { ...data, digest: streamDigest('repair', data) };
+    const script = `import { StreamHistoryEngine, streamDigest } from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))};
+      const shPane=${JSON.stringify(shPane)}, shIdentity=${JSON.stringify(shIdentity)};
+      const shOk=${shOk.toString()}, shInput=${shInput.toString()}, shAppend=${shAppend.toString()}, shCheckpoint=${shCheckpoint.toString()};
+      const engine = new StreamHistoryEngine({path:${JSON.stringify(path)},codecVersions:['fixture-v1'],
+        boundary(at) { if(at===${JSON.stringify(phase)}) process.kill(process.pid,'SIGKILL'); }});
+      shOk(await engine.journalInput(shInput())); shOk(await engine.appendFinalized(shAppend()));
+      shOk(await shCheckpoint(engine)); console.log('CHECKPOINT_ACK');
+      shOk(await engine.journalInput(shInput(2))); shOk(engine.beginGap(${JSON.stringify(episode)}));
+      shOk(await engine.commitRepair(${JSON.stringify(chunk)}));`;
+    try {
+      const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
+      const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(exit).not.toBe(0); expect(child.signalCode).toBe('SIGKILL');
+      expect(stdout).toContain('CHECKPOINT_ACK'); expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+      const engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+      try {
+        const raw = new Database(path, { readonly: true });
+        try { expect((raw.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(phase === 'repair-after-commit' ? 2 : 1); }
+        finally { raw.close(); }
+        const first = shOk(await engine.commitRepair(chunk));
+        expect(shOk(await engine.commitRepair(chunk))).toEqual(first);
+        const view = await shView(engine, 2);
+        const page = shOk(await engine.readPage(shOk(await engine.openReadView(view)), null, 500, shCancel));
+        expect(page.fragments.map(f => f.row.id.lineId)).toEqual([0, 1]);
+      } finally { engine.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+}, 30000);
+
+test('stream-first H admits at most 256 decoded rows and rejects alternate scroll before mutation', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    const { digest: _, ...base } = shAppend();
+    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n } }));
+    const oversize = { ...base, rows };
+    expect((await f.engine.appendFinalized({ ...oversize, digest: streamDigest('append', oversize) })).status).toBe('error');
+    const alt = { ...base, frameDelta: { ...base.frameDelta, buffer: 'alternate' as const } };
+    expect((await f.engine.appendFinalized({ ...alt, digest: streamDigest('append', alt) })).status).toBe('error');
+    const admitted = { ...base, rows: rows.slice(0, 256) };
+    expect(shOk(await f.engine.appendFinalized({ ...admitted, digest: streamDigest('append', admitted) })).head).toBe(256);
+    const view = await shView(f.engine, 256);
+    const page = shOk(await f.engine.readPage(shOk(await f.engine.openReadView(view)), null, 2000, shCancel));
+    expect(page.fragments).toHaveLength(256);
+    expect(page.fragments.map(f => f.row.id.lineId)).toEqual(Array.from({ length: 256 }, (_, n) => n));
+  } finally { f.cleanup(); }
+});
+
+test('stream-first H owns input copies and exposes frozen nested cells', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    const request = structuredClone(shAppend());
+    shOk(await f.engine.appendFinalized(request));
+    (request.rows[0]!.cells[0]! as { text: string }).text = 'caller mutation';
+    const view = await shView(f.engine);
+    const ack = shOk(await f.engine.openReadView(view));
+    const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+    expect(page.fragments[0]!.row.cells[0]!.text).toBe('ก');
+    expect(Object.isFrozen(page.fragments[0]!.row.cells[0])).toBe(true);
+  } finally { f.cleanup(); }
 });

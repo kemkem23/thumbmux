@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS sh_input(pane TEXT NOT NULL, epoch INTEGER NOT NULL, 
 CREATE TABLE IF NOT EXISTS sh_event(pane TEXT NOT NULL, event TEXT NOT NULL, digest TEXT NOT NULL,
  receipt TEXT NOT NULL, PRIMARY KEY(pane,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sh_checkpoint(pane TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
- revision INTEGER NOT NULL, PRIMARY KEY(pane,id)) WITHOUT ROWID;
+ revision INTEGER NOT NULL, checksum TEXT NOT NULL, PRIMARY KEY(pane,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sh_commit(pane TEXT NOT NULL, id TEXT NOT NULL, digest TEXT NOT NULL,
  receipt TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(pane,id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sh_commit_revision ON sh_commit(pane,revision);
@@ -327,7 +327,7 @@ export class StreamHistoryEngine implements HistoryEngine {
         digest: request.digest, durableRevision: state.revision, checkpointId: cp.checkpointId };
       this.transaction('checkpoint', () => {
         this.flushRows(key);
-        this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision);
+        this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));
         this.db.query('INSERT INTO sh_commit VALUES(?,?,?,?,?)').run(key, request.commitId, request.digest, streamCanonical(receipt), receipt.durableRevision);
         this.putState({ ...state, durable: state.revision, checkpoint: cp.checkpointId });
       });
@@ -579,10 +579,13 @@ export class StreamHistoryEngine implements HistoryEngine {
       const key = paneKey(pane), cpId = checkpointId ?? state.checkpoint;
       let epoch = 0, seq = 0, head = 0;
       if (cpId) {
-        const stored = reader.query('SELECT payload FROM sh_checkpoint WHERE pane=? AND id=?').get(key, cpId) as SqlRow | null;
+        const stored = reader.query('SELECT payload,checksum FROM sh_checkpoint WHERE pane=? AND id=?').get(key, cpId) as SqlRow | null;
         if (!stored) throw Error('checkpoint not found');
         if (Buffer.byteLength(String(stored.payload)) > B.vtBytesPerPane) throw Error('checkpoint exceeds budget');
         const cp = JSON.parse(String(stored.payload)) as VtCheckpoint;
+        if (stored.checksum !== streamDigest('vt-checkpoint', cp) || cp.head > state.head || cp.revision > state.durable) throw Error('checkpoint envelope integrity');
+        const fence = reader.query('SELECT receipt FROM sh_input WHERE pane=? AND epoch=? AND seq=?').get(key, cp.inputFence.through.sourceEpoch, cp.inputFence.through.packetSeq) as SqlRow | null;
+        if (!fence || !equal(JSON.parse(String(fence.receipt)), cp.inputFence)) throw Error('recovery input fence integrity');
         if (!this.options.codecVersions.includes(cp.state.codecVersion)) { yield { status: 'error', code: 'unsupported', message: 'VT codec is not admitted' }; return; }
         if (!equal(cp.identity.pane, pane) || cp.stateDigest !== streamDigest('vt-state', { identity: cp.identity, state: cp.state })) throw Error('checkpoint integrity');
         epoch = cp.inputFence.through.sourceEpoch; seq = cp.inputFence.through.packetSeq; head = cp.head;
