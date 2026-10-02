@@ -125,5 +125,9 @@ test('stream I viewer admission is global across panes and releases on disconnec
   expect((await b.attach(route,()=>{})).status).toBe('busy');
   await a.detach('v0');expect((await b.attach(route,()=>{})).status).toBe('ok');
   expect(b.stats().display.attachedViewers).toBe(STREAM_BUDGET.panes);
+  expect((await a.attach({viewerId:'v1',identity:a.identity,routeGeneration:-1},()=>{})).status).toBe('error');
+  expect(b.stats().display.attachedViewers).toBe(STREAM_BUDGET.panes-1);
+  expect((await a.attach({viewerId:'v1',identity:a.identity,routeGeneration:2},()=>{})).status).toBe('ok');
+  expect(b.stats().display.attachedViewers).toBe(STREAM_BUDGET.panes);
  }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
 },30000);

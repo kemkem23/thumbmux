@@ -298,11 +298,24 @@ export class StreamRuntimePane {
   }
   async attach(route: ViewerRoute, onFrame: (frame: LiveFrame) => void): Promise<Result<LiveFrame>> {
     if (!this.runtime.reserveViewer(route.viewerId, this)) return {status:'busy',reason:'pressure',retryAfterMs:20};
-    this.viewers.set(route.viewerId, route);
-    const result = await this.display.attach(route, frame => {
-      try { onFrame(frame); } catch (error) { void this.detach(route.viewerId); throw error; }
-    });
-    if (result.status !== 'ok') { await this.display.detach(route, 'attach failed'); this.viewers.delete(route.viewerId); this.runtime.releaseViewer(route.viewerId); }
+    const previous = this.viewers.get(route.viewerId);
+    const owned = structuredClone(route);
+    this.viewers.set(route.viewerId, owned);
+    let result: Result<LiveFrame>;
+    try {
+      result = await this.display.attach(owned, frame => {
+        try { onFrame(frame); } catch (error) {
+          if (this.viewers.get(owned.viewerId) === owned) void this.detach(owned.viewerId);
+          throw error;
+        }
+      });
+    } catch (error) { result = {status: 'error', code: 'io', message: String(error)}; }
+    if (this.viewers.get(owned.viewerId) !== owned) return {status: 'stale', reason: 'route'};
+    if (result.status !== 'ok') {
+      await this.display.detach(owned, 'attach failed');
+      if (previous) await this.display.detach(previous, 'invalid replacement');
+      this.viewers.delete(owned.viewerId); this.runtime.releaseViewer(owned.viewerId);
+    }
     return result;
   }
   page(route: ViewerRoute, request: ReadRequest, cursor: PageCursor | null, limit: number, cancel: CancelToken) {
