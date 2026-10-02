@@ -93,6 +93,35 @@ CREATE TABLE IF NOT EXISTS sh_fragment(pane TEXT NOT NULL, line INTEGER NOT NULL
  PRIMARY KEY(pane,line,start_cell)) WITHOUT ROWID;
 `;
 
+/** Decode one durable row and verify every fragment, page checkpoint and row digest. */
+function readStoredRow(db: Database, pane: PaneKey, line: number): FinalizedRow {
+  const key = paneKey(pane);
+  const meta = db.query('SELECT * FROM sh_row WHERE pane=? AND line=?').get(key, line) as SqlRow | null;
+  if (!meta) throw Error('missing durable row');
+  const count = Number(meta.cell_count), cells: FinalizedRow['cells'][number][] = [];
+  safe(count); let start = 0, totalBytes = Buffer.byteLength(String(meta.metadata));
+  do {
+    const block = db.query('SELECT * FROM sh_fragment WHERE pane=? AND line=? AND start_cell=?').get(key, line, start) as SqlRow | null;
+    if (!block) throw Error('missing row continuation');
+    const payload = String(block.payload), end = Number(block.end_cell);
+    if (Buffer.byteLength(payload) > B.blockPayloadBytes || end > count || (count && end <= start)) throw Error('invalid fragment bounds');
+    totalBytes += Buffer.byteLength(payload);
+    if (totalBytes > B.decodeBytes) throw Error('row exceeds decode cap');
+    if (block.digest !== streamDigest('fragment', { pane, lineId: line, start, end, payload })) throw Error('fragment checksum');
+    const pageCheckpoint = JSON.parse(String(block.checkpoint)) as HistoryPageCheckpoint;
+    if (pageCheckpoint.kind !== 'history-page' || !equal(pageCheckpoint.pane, pane) || pageCheckpoint.first.lineId !== line
+      || pageCheckpoint.first.cellOffset !== start || pageCheckpoint.payloadBytes !== Buffer.byteLength(payload)
+      || pageCheckpoint.rowCount !== 1 || pageCheckpoint.checksum !== block.digest) throw Error('page checkpoint integrity');
+    const part = JSON.parse(payload) as FinalizedRow['cells'];
+    if (!Array.isArray(part) || part.length !== end - start) throw Error('fragment length');
+    for (const cell of part) cells.push(cell);
+    start = end;
+  } while (start < count);
+  const row = { ...JSON.parse(String(meta.metadata)), cells } as FinalizedRow;
+  if (streamDigest('row', row) !== meta.digest || row.id.lineId !== line || !equal(row.id.pane, pane)) throw Error('row checksum/identity');
+  return row;
+}
+
 export class StreamHistoryEngine implements HistoryEngine {
   private readonly db: Database;
   private readonly pending = new Map<string, Pending>();
@@ -407,33 +436,7 @@ export class StreamHistoryEngine implements HistoryEngine {
       return ok(receipt);
     } catch (e) { return fail(e); }
   }
-  private readRow(db: Database, pane: PaneKey, line: number): FinalizedRow {
-    const key = paneKey(pane);
-    const meta = db.query('SELECT * FROM sh_row WHERE pane=? AND line=?').get(key, line) as SqlRow | null;
-    if (!meta) throw Error('missing durable row');
-    const count = Number(meta.cell_count), cells: FinalizedRow['cells'][number][] = [];
-    safe(count); let start = 0, totalBytes = Buffer.byteLength(String(meta.metadata));
-    do {
-      const block = db.query('SELECT * FROM sh_fragment WHERE pane=? AND line=? AND start_cell=?').get(key, line, start) as SqlRow | null;
-      if (!block) throw Error('missing row continuation');
-      const payload = String(block.payload), end = Number(block.end_cell);
-      if (Buffer.byteLength(payload) > B.blockPayloadBytes || end > count || (count && end <= start)) throw Error('invalid fragment bounds');
-      totalBytes += Buffer.byteLength(payload);
-      if (totalBytes > B.decodeBytes) throw Error('row exceeds decode cap');
-      if (block.digest !== streamDigest('fragment', { pane, lineId: line, start, end, payload })) throw Error('fragment checksum');
-      const pageCheckpoint = JSON.parse(String(block.checkpoint)) as HistoryPageCheckpoint;
-      if (pageCheckpoint.kind !== 'history-page' || !equal(pageCheckpoint.pane, pane) || pageCheckpoint.first.lineId !== line
-        || pageCheckpoint.first.cellOffset !== start || pageCheckpoint.payloadBytes !== Buffer.byteLength(payload)
-        || pageCheckpoint.rowCount !== 1 || pageCheckpoint.checksum !== block.digest) throw Error('page checkpoint integrity');
-      const part = JSON.parse(payload) as FinalizedRow['cells'];
-      if (!Array.isArray(part) || part.length !== end - start) throw Error('fragment length');
-      for (const cell of part) cells.push(cell);
-      start = end;
-    } while (start < count);
-    const row = { ...JSON.parse(String(meta.metadata)), cells } as FinalizedRow;
-    if (streamDigest('row', row) !== meta.digest || row.id.lineId !== line || !equal(row.id.pane, pane)) throw Error('row checksum/identity');
-    return row;
-  }
+  private readRow(db: Database, pane: PaneKey, line: number): FinalizedRow { return readStoredRow(db, pane, line); }
   private readSlot(pane: PaneKey): string { return paneKey(pane); }
   private reader(pane: PaneKey): Database | null {
     const slot = this.readSlot(pane);
@@ -655,3 +658,65 @@ export class StreamHistoryEngine implements HistoryEngine {
   }
 }
 export function createHistoryEngine(options: StreamHistoryOptions): StreamHistoryEngine { return new StreamHistoryEngine(options); }
+
+/** Read-only sh_* archive reader for the rollback bridge. It opens no writer,
+ * VT, cadence, timer or pipe, never runs the schema and never sees RAM-only
+ * pending rows: only what H made durable can be published as history. The
+ * disk cache it holds is charged to the same isolate pool as H's readers.
+ */
+export class StreamArchiveRowReader {
+  private readonly db: Database;
+  private closed = false;
+  constructor(readonly path: string) {
+    if (pool.cache + READER_CACHE > B.diskCacheBytes) throw Error('disk cache pressure');
+    const db = new Database(resolve(path), { readonly: true, strict: true });
+    try {
+      db.exec('PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA busy_timeout=0;');
+      const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+      if (!tables.length || tables.some(t => !t.name.startsWith('sh_'))) throw Error('not a dedicated stream database');
+      if (Number((db.query('SELECT version FROM sh_format').get() as SqlRow).version) !== 1) throw Error('unsupported stream storage version');
+    } catch (e) { db.close(); throw e; }
+    this.db = db; pool.cache += READER_CACHE;
+  }
+  private live(): void { if (this.closed) throw Error('archive reader closed'); }
+  /** Durable fence only (sh_pane as committed). */
+  durable(pane: PaneKey): { identity: StreamIdentity; head: number; revision: number; durable: number;
+    checkpoint: VtCheckpoint | null; gap: GapEpisode | null; journalAfterCheckpoint: boolean } | null {
+    this.live();
+    const key = paneKey(pane);
+    const r = this.db.query('SELECT * FROM sh_pane WHERE pane=?').get(key) as SqlRow | null;
+    if (!r) {
+      // Input may have been journaled before the first projected state row.
+      const any = this.db.query('SELECT 1 FROM sh_input WHERE pane=? LIMIT 1').get(key);
+      return any ? { identity: { pane, sourceEpoch: 0, geometryGeneration: 0 }, head: 0, revision: 0, durable: 0,
+        checkpoint: null, gap: null, journalAfterCheckpoint: true } : null;
+    }
+    const head = Number(r.head), revision = Number(r.revision), durable = Number(r.durable);
+    [head, revision, durable].forEach(safe);
+    let checkpoint: VtCheckpoint | null = null, epoch = 0, seq = 0;
+    if (r.checkpoint !== null) {
+      const stored = this.db.query('SELECT payload,checksum FROM sh_checkpoint WHERE pane=? AND id=?').get(key, String(r.checkpoint)) as SqlRow | null;
+      if (!stored || Buffer.byteLength(String(stored.payload)) > B.vtBytesPerPane) throw Error('checkpoint missing or exceeds budget');
+      checkpoint = JSON.parse(String(stored.payload)) as VtCheckpoint;
+      if (stored.checksum !== streamDigest('vt-checkpoint', checkpoint) || !equal(checkpoint.identity.pane, pane)
+        || checkpoint.stateDigest !== streamDigest('vt-state', { identity: checkpoint.identity, state: checkpoint.state })
+        || checkpoint.head > head || checkpoint.revision > durable) throw Error('checkpoint integrity');
+      epoch = checkpoint.inputFence.through.sourceEpoch; seq = checkpoint.inputFence.through.packetSeq;
+    }
+    const tail = this.db.query('SELECT 1 FROM sh_input WHERE pane=? AND (epoch>? OR (epoch=? AND seq>?)) LIMIT 1').get(key, epoch, epoch, seq);
+    return { identity: JSON.parse(String(r.identity)), head, revision, durable, checkpoint,
+      gap: r.gap === null ? null : JSON.parse(String(r.gap)), journalAfterCheckpoint: !!tail };
+  }
+  /** One verified durable row, rejected if it changed after the frozen revision. */
+  row(pane: PaneKey, line: number, frozenRevision: number): FinalizedRow {
+    this.live(); safe(line); safe(frozenRevision);
+    const row = readStoredRow(this.db, pane, line);
+    if (row.revision > frozenRevision) throw Error('row newer than frozen archive segment');
+    return row;
+  }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    try { this.db.close(); } finally { pool.cache -= READER_CACHE; }
+  }
+}
