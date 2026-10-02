@@ -821,3 +821,44 @@ describe('NEWARCH C capture state machine (adapter fixture)', () => {
     expect(f.counts().appends).toBe(1);
   });
 });
+
+// Round 2: run only through the isolated command gate after L3e closes.
+test('NEWARCH C native checkpoint resumes every byte boundary including alt, CSI and UTF8', () => {
+  const script = String.raw`
+import importlib.util, json, sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+data=('hello\r\n\x1b[31m你\x1b7\x1b[?1049hALT\x1b[2;3H!\x1b[?1049l\x1b8\x1b[0m\r\nend').encode()
+def finish(w, suffix):
+    w.feed(2,1,suffix)
+    return w.export_checkpoint(), w.scrolls
+for cut in range(len(data)+1):
+    a=m.Worker(12,3); a.screen.scroll_on_clear=False; a.feed(1,1,data[:cut]); a.scrolls=[]
+    state=a.export_checkpoint(); b=m.Worker.from_checkpoint(json.loads(json.dumps(state)))
+    assert finish(a,data[cut:])==finish(b,data[cut:]), cut
+try: m.Worker.from_checkpoint({'codecVersion':'wrong'})
+except ValueError: pass
+else: raise AssertionError('unsupported codec accepted')
+print('bytecut oracle=0')
+`;
+  const r = Bun.spawnSync(['python3', '-B', '-c', script, new URL('../src/pipe-vt-worker.py', import.meta.url).pathname]);
+  expect(r.exitCode, r.stderr.toString()).toBe(0);
+});
+
+test('NEWARCH C first packet with 600 finalized rows commits before bounded tail installation', async () => {
+  const f = cEngineFixture(); let commits = 0;
+  const state = {} as import('../src/stream-contract').VtState;
+  f.ports.vt.prepare = async event => ({ status: 'ok', value: {
+    frame: { ...cFrame(), identity: event.identity }, scrolls: Array.from({length:600}, (_,i)=>cRow(i)),
+    snapshot: async () => ({status:'ok',value:state}), install() {}, discard() {},
+  }});
+  f.ports.history.commitCheckpoint = async req => {
+    commits++;
+    return {status:'ok',value:{kind:'durable',pane:cPane,commitId:req.commitId,digest:req.digest,
+      durableRevision:req.expectedRevision,checkpointId:req.checkpoint.checkpointId}};
+  };
+  const frames: LiveFrame[]=[]; f.engine.subscribe(cPane, frame=>frames.push(frame));
+  expect((await f.engine.acceptInput(cInput(1))).status).toBe('ok');
+  expect(commits).toBe(1); expect(frames.at(-1)?.head).toBe(600);
+  expect(frames.at(-1)?.durableRevision).toBe(1);
+  expect(f.ports.admission.heldBytes).toBe(0);
+});
