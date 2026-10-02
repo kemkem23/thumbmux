@@ -10,7 +10,7 @@ import { Database } from 'bun:sqlite';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
-import { rowsDigest } from '../src/sqlite-history/codec';
+import { rowsDigest, encodeBlock, decodeBlock, encodeCaptureArchive, decodeCaptureArchive, LEGACY_INFLATE_MAX_BYTES } from '../src/sqlite-history/codec';
 import { validateHistoryPage } from '../src/sqlite-history/detectors';
 import type { HistoryContext, HistoryRow } from '../src/sqlite-history/types';
 import { batch, fixture, ids } from './sqlite-history/helpers';
@@ -308,4 +308,406 @@ describe('wave 4 reader canary', () => {
     walk(src);
     expect(offenders).toEqual([]);
   });
+});
+
+// Stream-first K v1: separate opt-in database; never mounts a production route.
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
+import type { AppendFinalized, InputEvent, Result, VtCheckpoint } from '../src/stream-contract';
+const shPane = { serverIdentity: 'stream-fixture', paneId: '%1', birthGeneration: 1 };
+const shIdentity = { pane: shPane, sourceEpoch: 1, geometryGeneration: 1 };
+function shOk<T>(result: Result<T>): T {
+  if (result.status !== 'ok') throw new Error(JSON.stringify(result));
+  return result.value;
+}
+function shInput(seq = 1): InputEvent {
+  const data = { identity: shIdentity, position: { sourceEpoch: 1, packetSeq: seq }, receivedAtMonoMs: 0,
+    payload: { kind: 'bytes' as const, bytes: [65, 10] } };
+  return { ...data, digest: streamDigest('input', data) };
+}
+function shAppend(seq = 1, text = 'ก'): AppendFinalized {
+  const eventId = { pane: shPane, sourceEpoch: 1, packetSeq: seq, scrollOrdinal: 0 };
+  const geometry = { columns: 80, rows: 24 };
+  const row = { id: { pane: shPane, lineId: seq - 1 }, source: eventId, revision: seq,
+    geometryGeneration: 1, geometry, cells: [{ text, width: 1 as const, style: [] }],
+    softWrap: false, wrapPad: 0, uncertainFields: [] };
+  const data = { identity: shIdentity, eventId, expectedRevision: seq - 1, rows: [row], receivedAtMonoMs: 0,
+    frameDelta: { identity: shIdentity, screenRevision: seq, buffer: 'normal' as const, geometry,
+      changedRows: [], cursor: { x: 0, y: 0, visible: true }, overlap: null } };
+  return { ...data, digest: streamDigest('append', data) };
+}
+async function shCheckpoint(engine: StreamHistoryEngine, seq = 1, previous: string | null = null) {
+  const inputFence = shOk(await engine.journalInput(shInput(seq)));
+  const cursor = { x: 0, y: 0, visible: true };
+  const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+  const state = { codecVersion: 'fixture-v1', geometry: { columns: 80, rows: 24 }, normal: buffer,
+    alternate: buffer, active: 'normal' as const, modes: {}, margins: { top: 0, bottom: 23, left: 0, right: 79 },
+    tabStops: [], pendingUtf8: [224], pendingEscape: [27], attributes: [], wrapPending: false, extensionState: '{}' };
+  const checkpoint: VtCheckpoint = { kind: 'vt-recovery', checkpointId: `cp-${seq}`, previousCheckpointId: previous,
+    identity: shIdentity, inputFence, revision: seq, head: seq, state,
+    stateDigest: streamDigest('vt-state', { identity: shIdentity, state }) };
+  const data = { checkpoint, expectedRevision: seq, commitId: `commit-${seq}` };
+  return engine.commitCheckpoint({ ...data, digest: streamDigest('checkpoint', data) });
+}
+function shFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'stream-h-'));
+  const path = join(dir, 'stream.sqlite');
+  let engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+  return { get engine() { return engine; }, path,
+    reopen() { engine.close(); engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] }); },
+    cleanup() { engine.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+const shCancel = { isCancelled: () => false };
+async function shView(engine: StreamHistoryEngine, end = 1, requestId = 'view') {
+  return shOk(await engine.grantReadView({ requestId, identity: shIdentity, routeGeneration: 1,
+    range: { start: 0, end }, deadlineMonoMs: performance.now() + 1000 }));
+}
+describe('stream-first H frozen contract', () => {
+  test('durable ACK survives reopen; input and append retries remain exact and unique', async () => {
+    const f = shFixture();
+    try {
+      const input = shOk(await f.engine.journalInput(shInput()));
+      const ram = shOk(await f.engine.appendFinalized(shAppend()));
+      const durable = shOk(await shCheckpoint(f.engine));
+      expect(f.engine.stats().pendingBytes).toBe(0);
+      f.reopen();
+      expect(shOk(await f.engine.journalInput(shInput()))).toEqual(input);
+      expect(shOk(await f.engine.appendFinalized(shAppend()))).toEqual(ram);
+      expect(shOk(await shCheckpoint(f.engine))).toEqual(durable);
+      const view = await shView(f.engine);
+      const ack = shOk(await f.engine.openReadView(view));
+      const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+      expect(page.fragments.map(x => x.row.cells.map(c => c.text).join(''))).toEqual(['ก']);
+      await f.engine.releaseReadView(view, 'read-complete');
+      const recovered = [];
+      for await (const item of f.engine.recover(shPane, null, shCancel)) recovered.push(shOk(item));
+      expect(recovered[0]?.kind).toBe('checkpoint');
+      if (recovered[0]?.kind === 'checkpoint') expect(recovered[0].checkpoint.state.pendingUtf8).toEqual([224]);
+      expect(f.engine.stats().diskCacheConfigBytes).toBeLessThanOrEqual(12582912);
+    } finally { f.cleanup(); }
+  });
+  test('same key with changed content is integrity failure without changing head', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      expect((await f.engine.appendFinalized(shAppend(1, 'wrong'))).status).toBe('error');
+      expect((await shView(f.engine)).headAtGrant).toBe(1);
+    } finally { f.cleanup(); }
+  });
+  test('grant freezes RAM overlay across later durable commits; forged ACK rejected', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      const view = await shView(f.engine);
+      const ack = shOk(await f.engine.openReadView(view));
+      shOk(await shCheckpoint(f.engine));
+      shOk(await f.engine.journalInput(shInput(2)));
+      shOk(await f.engine.appendFinalized(shAppend(2, 'new')));
+      shOk(await shCheckpoint(f.engine, 2, 'cp-1'));
+      const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+      expect(page.fragments).toHaveLength(1);
+      expect(page.view.headAtGrant).toBe(1);
+      expect((await f.engine.readPage({ ...ack, diskSnapshotRevision: 999 }, null, 500, shCancel)).status).toBe('stale');
+    } finally { f.cleanup(); }
+  });
+  test('cancel releases pins immediately and busy never masquerades as EOF', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      const view = await shView(f.engine);
+      expect((await f.engine.grantReadView({ ...view, requestId: 'second' })).status).toBe('busy');
+      const ack = shOk(await f.engine.openReadView(view));
+      expect((await f.engine.readPage(ack, null, 500, { isCancelled: () => true })).status).toBe('cancelled');
+      expect(f.engine.stats().pins).toBe(0);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('stream-first H quantitative gates', () => {
+  test('journal writes cannot persist a RAM-only row head across reopen', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      shOk(await f.engine.journalInput(shInput(2)));
+      f.reopen();
+      const view = await shView(f.engine, 0);
+      expect(view.headAtGrant).toBe(0);
+      await f.engine.releaseReadView(view, 'done');
+      const inputs = [];
+      for await (const result of f.engine.recover(shPane, null, shCancel)) inputs.push(shOk(result));
+      expect(inputs.map(x => x.kind)).toEqual(['input', 'input']);
+    } finally { f.cleanup(); }
+  });
+  test('256-row chunks and 1 MiB pages continue forward and backward without duplicates', async () => {
+    const f = shFixture();
+    try {
+      for (let seq = 1; seq <= 3; seq++) {
+        shOk(await f.engine.journalInput(shInput(seq)));
+        shOk(await f.engine.appendFinalized(shAppend(seq, 'x'.repeat(120000))));
+      }
+      const view = await shView(f.engine, 3);
+      const ack = shOk(await f.engine.openReadView(view));
+      const first = shOk(await f.engine.readPage(ack, null, 2, shCancel));
+      expect(first.fragments).toHaveLength(2);
+      expect(first.payloadBytes).toBeLessThanOrEqual(1048576);
+      const next = shOk(await f.engine.readPage(ack, first.nextAfter, 2, shCancel));
+      expect(next.fragments.map(f => f.row.id.lineId)).toEqual([2]);
+      const back = shOk(await f.engine.readPage(ack, next.nextBefore, 2, shCancel));
+      expect(back.fragments.map(f => f.row.id.lineId)).toEqual([0, 1]);
+      expect(first.hasMoreAfter).toBe(true);
+      expect(next.hasMoreAfter).toBe(false);
+    } finally { f.cleanup(); }
+  });
+  test('global pending refuses before mutation at 16 MiB, retries succeed after checkpoint', async () => {
+    const f = shFixture();
+    try {
+      let refused = 0;
+      for (let seq = 1; seq <= 100; seq++) {
+        shOk(await f.engine.journalInput(shInput(seq)));
+        const result = await f.engine.appendFinalized(shAppend(seq, 'x'.repeat(100000)));
+        expect(f.engine.stats().pendingBytes).toBeLessThanOrEqual(16777216);
+        if (result.status === 'busy') { refused = seq; break; }
+        shOk(result);
+      }
+      expect(refused).toBeGreaterThan(1);
+      shOk(await shCheckpoint(f.engine, refused - 1));
+      shOk(await f.engine.appendFinalized(shAppend(refused, 'x'.repeat(100000))));
+      expect(f.engine.stats().pendingBytes).toBeLessThanOrEqual(16777216);
+    } finally { f.cleanup(); }
+  });
+  test('global active readers never exceeds 2 and each pane has at most one', async () => {
+    const f = shFixture();
+    try {
+      const inputs = [1, 2, 3].map(n => {
+        const { digest: _, ...base } = shInput();
+        const data = { ...base, identity: { ...shIdentity, pane: { ...shPane, paneId: `%${n}` } } };
+        return { ...data, digest: streamDigest('input', data) };
+      });
+      for (const input of inputs) shOk(await f.engine.journalInput(input));
+      const grants = [];
+      for (const [n, input] of inputs.entries()) grants.push(await f.engine.grantReadView({ requestId: `g${n}`, identity: input.identity,
+        routeGeneration: 1, range: { start: 0, end: 0 }, deadlineMonoMs: performance.now() + 1000 }));
+      expect(grants.map(g => g.status)).toEqual(['ok', 'ok', 'busy']);
+      expect(f.engine.stats().activeReads).toBe(2);
+      expect(f.engine.stats().diskCacheConfigBytes).toBeLessThanOrEqual(12582912);
+      for (const grant of grants) if (grant.status === 'ok') await f.engine.releaseReadView(grant.value, 'done');
+      expect(f.engine.stats().pins).toBe(0);
+    } finally { f.cleanup(); }
+  });
+  test('forgotten view and paused cancelled recovery release pins within 1000ms', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      shOk(await shCheckpoint(f.engine));
+      shOk(await f.engine.grantReadView({ requestId: 'expires', identity: shIdentity, routeGeneration: 1,
+        range: { start: 0, end: 1 }, deadlineMonoMs: performance.now() + 50 }));
+      await Bun.sleep(100);
+      expect(f.engine.stats().pins).toBe(0);
+      let cancelled = false;
+      const recovery = f.engine.recover(shPane, null, { isCancelled: () => cancelled })[Symbol.asyncIterator]();
+      await recovery.next();
+      expect(f.engine.stats().pins).toBe(1);
+      cancelled = true;
+      await Bun.sleep(100);
+      expect(f.engine.stats().pins).toBe(0);
+      await recovery.return?.();
+    } finally { f.cleanup(); }
+  });
+  test('gap commits each prefix; later chunk failure cannot erase it; late gap blocks suffix IDs', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend()));
+      shOk(await shCheckpoint(f.engine));
+      const episode = { episodeId: 'gap', pane: shPane, epochBefore: 1, epochAfter: 1, lastDurableInput: shInput().position,
+        lastAdmittedRow: 0, firstObservedAtMonoMs: 0, reason: 'eof' as const, status: 'repairing' as const, missingCount: null };
+      shOk(f.engine.beginGap(episode));
+      shOk(await f.engine.journalInput(shInput(2)));
+      expect((await f.engine.appendFinalized(shAppend(2))).status).toBe('stale');
+      const data = { episode, chunkId: 'chunk-1', expectedRevision: 1, rows: shAppend(2).rows, final: false };
+      const chunk = { ...data, digest: streamDigest('repair', data) };
+      const committed = shOk(await f.engine.commitRepair(chunk));
+      const bad = { ...data, chunkId: 'chunk-2', expectedRevision: 2, rows: shAppend(3).rows, digest: '0'.repeat(64) };
+      expect((await f.engine.commitRepair(bad)).status).toBe('error');
+      f.reopen();
+      expect(shOk(await f.engine.commitRepair(chunk))).toEqual(committed);
+      const view = await shView(f.engine, 2);
+      const page = shOk(await f.engine.readPage(shOk(await f.engine.openReadView(view)), null, 500, shCancel));
+      expect(page.fragments.map(x => x.row.id.lineId)).toEqual([0, 1]);
+      expect(f.engine.beginGap({ ...episode, episodeId: 'late', reason: 'late-gap' }).status).toBe('stale');
+      expect((await f.engine.appendFinalized(shAppend(3))).status).toBe('stale');
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('stream-first H crash and continuation', () => {
+  test('large physical row crosses disk blocks and page bytes with a real cell cursor', async () => {
+    const f = shFixture();
+    try {
+      shOk(await f.engine.journalInput(shInput()));
+      shOk(await f.engine.appendFinalized(shAppend(1, 'prefix'.repeat(16000))));
+      shOk(await f.engine.journalInput(shInput(2)));
+      const { digest: _, ...base } = shAppend(2);
+      const data = { ...base, rows: [{ ...base.rows[0]!, cells: Array.from({ length: 8 }, (_, n) => ({ text: String(n).repeat(120000), width: 1 as const, style: [] })) }] };
+      shOk(await f.engine.appendFinalized({ ...data, digest: streamDigest('append', data) }));
+      shOk(await shCheckpoint(f.engine, 2));
+      f.reopen();
+      const view = await shView(f.engine, 2);
+      const ack = shOk(await f.engine.openReadView(view));
+      const first = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+      expect(first.nextAfter?.cellOffset).toBeGreaterThan(0);
+      expect(first.fragments.at(-1)?.complete).toBe(false);
+      const second = shOk(await f.engine.readPage(ack, first.nextAfter, 500, shCancel));
+      expect(second.hasMoreAfter).toBe(false);
+      const cells = [...first.fragments.filter(x => x.row.id.lineId === 1), ...second.fragments]
+        .flatMap(x => x.row.cells.map(c => c.text));
+      expect(cells).toEqual(data.rows[0]!.cells.map(c => c.text));
+      for (const page of [first, second]) {
+        expect(page.payloadBytes).toBeLessThanOrEqual(1048576);
+        expect(page.fragments.length).toBeLessThanOrEqual(256);
+      }
+      const raw = new Database(f.path, { readonly: true });
+      try { expect((raw.query('SELECT max(length(CAST(payload AS BLOB))) AS n FROM sh_fragment').get() as { n: number }).n).toBeLessThanOrEqual(262144); }
+      finally { raw.close(); }
+    } finally { f.cleanup(); }
+  });
+  test('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement', async () => {
+    for (const phase of ['input-before-write', 'input-before-commit', 'input-after-commit',
+      'checkpoint-before-write', 'checkpoint-before-commit', 'checkpoint-after-commit']) {
+      const dir = mkdtempSync(join(tmpdir(), 'stream-kill-'));
+      const path = join(dir, 'stream.sqlite');
+      const source = join(import.meta.dir, '../src/history-engine.ts');
+      const script = `import { StreamHistoryEngine, streamDigest } from ${JSON.stringify(source)};
+        const shPane=${JSON.stringify(shPane)}, shIdentity=${JSON.stringify(shIdentity)};
+        const shOk=${shOk.toString()}, shInput=${shInput.toString()}, shAppend=${shAppend.toString()}, shCheckpoint=${shCheckpoint.toString()};
+        const engine = new StreamHistoryEngine({path:${JSON.stringify(path)},codecVersions:['fixture-v1'],
+          boundary(at) { if(at===${JSON.stringify(phase)}) process.kill(process.pid,'SIGKILL'); }});
+        shOk(await engine.journalInput(shInput()));
+        console.log('INPUT_ACK');
+        shOk(await engine.appendFinalized(shAppend()));
+        shOk(await shCheckpoint(engine));
+        console.log('CHECKPOINT_ACK');`;
+      try {
+        const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
+        const [exit, output, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+        expect(exit).not.toBe(0);
+        expect(child.signalCode).toBe('SIGKILL');
+        expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+        const engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+        try {
+          const recovered = [];
+          for await (const result of engine.recover(shPane, null, shCancel)) recovered.push(result);
+          const raw = new Database(path, { readonly: true });
+          try {
+            const inputs = (raw.query('SELECT count(*) AS n FROM sh_input').get() as { n: number }).n;
+            const rows = (raw.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n;
+            expect(inputs).toBe(phase.startsWith('input-before') ? 0 : 1);
+            expect(rows).toBe(phase === 'checkpoint-after-commit' ? 1 : 0);
+            if (output.includes('INPUT_ACK')) expect(inputs).toBe(1);
+          } finally { raw.close(); }
+          shOk(await engine.journalInput(shInput()));
+          const retry = shOk(await engine.appendFinalized(shAppend()));
+          expect(retry.head).toBe(1);
+          shOk(await shCheckpoint(engine));
+          const rawAfter = new Database(path, { readonly: true });
+          try { expect((rawAfter.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(1); }
+          finally { rawAfter.close(); }
+        } finally { engine.close(); }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  }, 30000);
+});
+
+
+describe('stream-first H legacy decode admission', () => {
+  test('legacy blocks and archives fail loudly on inflate pressure, never return false EOF', () => {
+    const rows = [['x'.repeat(LEGACY_INFLATE_MAX_BYTES + 1)]];
+    expect(() => decodeBlock(encodeBlock(rows))).toThrow();
+    expect(() => decodeCaptureArchive(encodeCaptureArchive(rows))).toThrow('scratch-pressure');
+    expect(decodeBlock(encodeBlock([['old', 1], ['old', 2]]))).toEqual([['old', 1], ['old', 2]]);
+  });
+});
+
+test('stream-first H repair SIGKILL keeps committed prefix exactly once at every transaction boundary', async () => {
+  for (const phase of ['repair-before-write', 'repair-before-commit', 'repair-after-commit']) {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-repair-kill-')), path = join(dir, 'stream.sqlite');
+    const episode = { episodeId: 'gap', pane: shPane, epochBefore: 1, epochAfter: 1, lastDurableInput: shInput().position,
+      lastAdmittedRow: 0, firstObservedAtMonoMs: 0, reason: 'eof' as const, status: 'repairing' as const, missingCount: null };
+    const data = { episode, chunkId: 'repair-1', expectedRevision: 1, rows: shAppend(2).rows, final: false };
+    const chunk = { ...data, digest: streamDigest('repair', data) };
+    const script = `import { StreamHistoryEngine, streamDigest } from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))};
+      const shPane=${JSON.stringify(shPane)}, shIdentity=${JSON.stringify(shIdentity)};
+      const shOk=${shOk.toString()}, shInput=${shInput.toString()}, shAppend=${shAppend.toString()}, shCheckpoint=${shCheckpoint.toString()};
+      const engine = new StreamHistoryEngine({path:${JSON.stringify(path)},codecVersions:['fixture-v1'],
+        boundary(at) { if(at===${JSON.stringify(phase)}) process.kill(process.pid,'SIGKILL'); }});
+      shOk(await engine.journalInput(shInput())); shOk(await engine.appendFinalized(shAppend()));
+      shOk(await shCheckpoint(engine)); console.log('CHECKPOINT_ACK');
+      shOk(await engine.journalInput(shInput(2))); shOk(engine.beginGap(${JSON.stringify(episode)}));
+      shOk(await engine.commitRepair(${JSON.stringify(chunk)}));`;
+    try {
+      const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
+      const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(exit).not.toBe(0); expect(child.signalCode).toBe('SIGKILL');
+      expect(stdout).toContain('CHECKPOINT_ACK'); expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+      const engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+      try {
+        const raw = new Database(path, { readonly: true });
+        try { expect((raw.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(phase === 'repair-after-commit' ? 2 : 1); }
+        finally { raw.close(); }
+        const first = shOk(await engine.commitRepair(chunk));
+        expect(shOk(await engine.commitRepair(chunk))).toEqual(first);
+        const view = await shView(engine, 2);
+        const page = shOk(await engine.readPage(shOk(await engine.openReadView(view)), null, 500, shCancel));
+        expect(page.fragments.map(f => f.row.id.lineId)).toEqual([0, 1]);
+      } finally { engine.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+}, 30000);
+
+test('stream-first H admits at most 256 decoded rows and rejects alternate scroll before mutation', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    const { digest: _, ...base } = shAppend();
+    const rows = Array.from({ length: 257 }, (_, n) => ({ ...base.rows[0]!, id: { pane: shPane, lineId: n } }));
+    const oversize = { ...base, rows };
+    expect((await f.engine.appendFinalized({ ...oversize, digest: streamDigest('append', oversize) })).status).toBe('error');
+    const alt = { ...base, frameDelta: { ...base.frameDelta, buffer: 'alternate' as const } };
+    expect((await f.engine.appendFinalized({ ...alt, digest: streamDigest('append', alt) })).status).toBe('error');
+    const admitted = { ...base, rows: rows.slice(0, 256) };
+    expect(shOk(await f.engine.appendFinalized({ ...admitted, digest: streamDigest('append', admitted) })).head).toBe(256);
+    const view = await shView(f.engine, 256);
+    const page = shOk(await f.engine.readPage(shOk(await f.engine.openReadView(view)), null, 2000, shCancel));
+    expect(page.fragments).toHaveLength(256);
+    expect(page.fragments.map(f => f.row.id.lineId)).toEqual(Array.from({ length: 256 }, (_, n) => n));
+  } finally { f.cleanup(); }
+});
+
+test('stream-first H owns input copies and exposes frozen nested cells', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput()));
+    const request = structuredClone(shAppend());
+    shOk(await f.engine.appendFinalized(request));
+    (request.rows[0]!.cells[0]! as { text: string }).text = 'caller mutation';
+    const view = await shView(f.engine);
+    const ack = shOk(await f.engine.openReadView(view));
+    const page = shOk(await f.engine.readPage(ack, null, 500, shCancel));
+    expect(page.fragments[0]!.row.cells[0]!.text).toBe('ก');
+    expect(Object.isFrozen(page.fragments[0]!.row.cells[0])).toBe(true);
+  } finally { f.cleanup(); }
+});
+
+
+test('stream-first H canonical digest matches independent UTF-8 SHA-256 fixture', () => {
+  expect(shInput().digest).toBe('3620115c0091b2fc9bd3c875d8070092ed69affd6cee4529ffcc80942efef1aa');
+  const { digest: _, ...input } = shInput();
+  expect(streamDigest('input', { payload: input.payload, receivedAtMonoMs: input.receivedAtMonoMs,
+    position: input.position, identity: input.identity })).toBe(shInput().digest);
 });

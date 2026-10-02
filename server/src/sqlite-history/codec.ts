@@ -177,9 +177,19 @@ export function encodeBlock(lines: readonly unknown[][]): Uint8Array {
   const out = new Uint8Array(body.length + 1); out[0] = BLOCK_FORMAT; out.set(body, 1);
   return out;
 }
+// Legacy blocks are not stream chunks: reserve up to 8 MiB encoded output
+// inside the 32 MiB decode/scratch envelope for buffer, UTF-16 text and JSON.
+// The process-tree memory gate still needs Q's measurement of object overhead.
+export const LEGACY_INFLATE_MAX_BYTES = 8 * 1024 * 1024;
 export function decodeBlock(data: Uint8Array): unknown[][] {
   if (data[0] !== BLOCK_FORMAT) throw new Error('block-format-unknown');
-  return JSON.parse(inflateRawSync(data.subarray(1)).toString('utf8'));
+  if (data.byteLength > LEGACY_INFLATE_MAX_BYTES) throw new Error('legacy-block-scratch-pressure');
+  let raw: Buffer;
+  try { raw = inflateRawSync(data.subarray(1), { maxOutputLength: LEGACY_INFLATE_MAX_BYTES }); }
+  catch (error) { throw new Error('legacy-block-decode-failed-or-scratch-pressure', { cause: error }); }
+  const rows = JSON.parse(raw.toString('utf8'));
+  if (!Array.isArray(rows) || rows.length > 4096 || rows.some(row => !Array.isArray(row))) throw new Error('block-corrupt');
+  return rows;
 }
 
 // Capture archives need corruption detection independent of SQLite's page
@@ -194,7 +204,9 @@ function packArchive(raw:Buffer):Uint8Array {
 function unpackArchive(data:Uint8Array):Buffer {
   const input=Buffer.from(data);
   if(input.length<37 || input[0]!==CAPTURE_ARCHIVE_FORMAT)throw new Error('capture-archive-format-unknown');
-  const expected=input.readUInt32BE(1),raw=inflateRawSync(input.subarray(37));
+  const expected=input.readUInt32BE(1);
+  if(expected>LEGACY_INFLATE_MAX_BYTES || input.length>LEGACY_INFLATE_MAX_BYTES)throw new Error('capture-archive-scratch-pressure');
+  const raw=inflateRawSync(input.subarray(37),{maxOutputLength:LEGACY_INFLATE_MAX_BYTES});
   if(raw.length!==expected)throw new Error('capture-archive-size');
   const digest=createHash('sha256').update(raw).digest();
   if(!digest.equals(input.subarray(5,37)))throw new Error('capture-archive-checksum');

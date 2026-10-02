@@ -120,3 +120,52 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
     }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 180_000);
+
+// Stream mutations use a throwaway source tree exactly like the legacy probes.
+// They must reach a failed assertion; a missing import never counts as a kill.
+test('stream H mutants cannot acknowledge volatile data or falsify frozen reads', async () => {
+  const pkg = resolve(import.meta.dir, '../..');
+  const root = mkdtempSync(join(tmpdir(), 'stream-h-mutants-'));
+  const mutations = [
+    { name: 'omit-durable-rows', pattern: 'durable ACK survives reopen',
+      from: '        this.flushRows(key);', to: '        // mutant: rows omitted from durable transaction' },
+    { name: 'false-eof', pattern: 'chunks and 1 MiB pages',
+      from: 'const hasMoreAfter = right.lineId < end;', to: 'const hasMoreAfter = false;' },
+    { name: 'ignore-cancel', pattern: 'cancel releases pins immediately',
+      from: "if (cancel.isCancelled()) { this.releasePin(id); return { status: 'cancelled', reason: 'reader cancelled' }; }",
+      to: 'if (false) { this.releasePin(id); }' },
+    { name: 'omit-retry-integrity', pattern: 'same key with changed content',
+      from: "if (prior.request.digest !== request.digest) throw Error('event identity collision');",
+      to: '/* mutant: accepts divergent retry */' },
+  ];
+  try {
+    mkdirSync(join(root, 'server'), { recursive: true });
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (pattern: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { exit, output: out + err };
+    };
+    expect((await run('stream-first H')).exit).toBe(0);
+    for (const mutation of mutations) {
+      expect(original.includes(mutation.from)).toBe(true);
+      writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
+      const result = await run(mutation.pattern);
+      console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
+      expect(result.exit).not.toBe(0);
+      expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
+      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+      writeFileSync(file, original);
+    }
+    expect((await run('stream-first H')).exit).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120000);

@@ -16,7 +16,7 @@ const BLOCK_MAX=4096;
  */
 export function readDiskLines(disk:Database,paneNo:number,start:number,end:number):SqlRow[] {
   const byId=new Map<number,SqlRow>();
-  for(const block of prepared(disk,'SELECT first_line_id,line_count,data FROM na_block WHERE pane_no=? AND first_line_id<? AND first_line_id>? ORDER BY first_line_id').all(paneNo,end,start-BLOCK_MAX) as SqlRow[]) {
+  for(const block of prepared(disk,'SELECT first_line_id,line_count,data FROM na_block WHERE pane_no=? AND first_line_id<? AND first_line_id>? ORDER BY first_line_id').iterate(paneNo,end,start-BLOCK_MAX) as Iterable<SqlRow>) {
     const first=Number(block.first_line_id),lines=decodeBlock(block.data as unknown as Uint8Array);
     if(lines.length!==Number(block.line_count))throw new Error('block-corrupt');
     for(let i=Math.max(0,start-first);i<lines.length && first+i<end;i++) {
