@@ -575,3 +575,43 @@ test("NEWARCH D: a page at line one million never asks capture for historical ta
   expect(h.readLines).toEqual([999_999]);
   expect(subscriptions).toBe(1);
 });
+
+
+test("NEWARCH D growth: 10000 viewer identities leave no retained bookkeeping", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const sizes = () => Object.values(engine).filter(v => v instanceof Map).map(v => v.size);
+  let early: number[] = [];
+  for (let i = 0; i < 10000; i++) {
+    const route = displayRoute(`churn-${i}`);
+    const ready = engine.attach(route, () => {});
+    for (const listener of h.listeners) listener(displayFrame());
+    await ready;
+    const lateRelease = engine.reserveEncodedBytes(route.viewerId, 10)!;
+    await engine.detach(route, "churn");
+    lateRelease(); lateRelease();
+    if (i === 999) early = sizes();
+  }
+  expect(sizes()).toEqual(early);
+  expect(sizes().every(n => n === 0)).toBe(true);
+  expect(h.listeners.size).toBe(0);
+  expect(engine.stats().wsPendingBytes).toBe(0);
+});
+
+test("NEWARCH D growth: late release cannot debit a reused viewer or a fresh reservation", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("reused");
+  const ready = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await ready;
+  const old = engine.reserveEncodedBytes(route.viewerId, 10)!;
+  await engine.detach(route, "old socket discarded");
+  const fresh = engine.reserveEncodedBytes(route.viewerId, 30)!;
+  old(); old();
+  expect(engine.stats().wsPendingBytes).toBe(30);
+  fresh(); fresh();
+  expect(engine.stats().wsPendingBytes).toBe(0);
+  for (let i = 0; i < 10000; i++) engine.reserveEncodedBytes(`empty-${i}`, 0);
+  expect(Object.values(engine).filter(v => v instanceof Map).every(v => v.size === 0)).toBe(true);
+});
