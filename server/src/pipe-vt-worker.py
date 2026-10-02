@@ -38,6 +38,8 @@ host never subtracts a worker clock from its own):
                the same select turn, upper = since the previous poll returned
                (kernel buffering while this loop was busy elsewhere).
 """
+import base64
+import zlib
 import hashlib
 import json
 import os
@@ -522,7 +524,7 @@ def encode_cached(row, cols, default):
 
 
 # Versioned, data-only codec. Never pickle/import executable checkpoint content.
-CHECKPOINT_CODEC = "pyte-stream-c1:" + VENDOR_SHA256
+CHECKPOINT_CODEC = "pyte-stream-c2:" + VENDOR_SHA256
 
 def pack_state(v):
     from collections import defaultdict
@@ -616,20 +618,25 @@ class Worker:
                  "escape": self.stream.pending_sequence, "useUtf8": self.stream.use_utf8,
                  "worker": {k: getattr(self, k) for k in ("gen", "packet_seq", "scroll_ordinal",
                      "dcs_state", "dcs_sixel", "dcs_intermediate")}}
-        if len(json.dumps(state).encode()) > 1024 * 1024:
+        if len(encode_extension(state).encode()) > 1024 * 1024:
             raise ValueError("VT checkpoint exceeds 2 MiB copy budget")
         return state
 
     @classmethod
-    def from_checkpoint(cls, state):
+    def from_checkpoint(cls, state, reuse=None):
         if state.get("codecVersion") != CHECKPOINT_CODEC:
             raise ValueError("unsupported VT checkpoint codec")
-        if len(json.dumps(state).encode()) > 1024 * 1024:
+        if len(encode_extension(state).encode()) > 1024 * 1024:
             raise ValueError("VT checkpoint exceeds budget")
         g = state["geometry"]
         if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80):
             raise ValueError("checkpoint geometry")
-        w = cls(g["columns"], g["rows"])
+        w = reuse if reuse is not None else cls(g["columns"], g["rows"])
+        if reuse is not None:
+            # One disposable scratch Worker per RPC transport. Never a live pane.
+            w.stream = CheckpointByteStream(w.screen)
+            w.seq_from = w.seq_to = None
+            w.full = True; w.parse_ns = 0; w.reset_stages(); w.emitted_seq = None
         # Replay only the parser continuation on a disposable screen, then
         # restore the full screen. CSI embedded controls are not applied twice.
         w.screen.scroll_on_clear = False
@@ -651,8 +658,7 @@ class Worker:
         def cursor(c): return {"x": c.x, "y": c.y, "visible": not c.hidden}
         def buffer(rows, c):
             saved = s.savepoints[-1].cursor if s.savepoints else c
-            return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char),
-                        row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],
+            return {"rows": [],
                     "cursor": cursor(c), "savedCursor": cursor(saved),
                     "savedAttributes": contract_style(saved.attrs.fg, saved.attrs.bg,
                         sum(int(getattr(saved.attrs, key)) << i for i, key in enumerate(
@@ -669,7 +675,7 @@ class Worker:
         normal = buffer(s.saved_normal[0], normal_cursor) if s.alt else current
         alternate = current if s.alt else buffer(empty, Cursor(0, 0))
         return {"codecVersion": CHECKPOINT_CODEC, "geometry": {"columns": s.columns, "rows": s.lines},
-                "normal": normal, "alternate": alternate, "active": "alternate" if s.alt else "normal",
+                "bufferEncoding": "extension", "normal": normal, "alternate": alternate, "active": "alternate" if s.alt else "normal",
                 "modes": {str(m): True for m in sorted(s.mode)},
                 "margins": {"top": s.margins.top if s.margins else 0,
                             "bottom": s.margins.bottom if s.margins else s.lines-1, "left": 0, "right": s.columns-1},
@@ -679,7 +685,7 @@ class Worker:
                     sum(int(getattr(s.cursor.attrs, key)) << i for i, key in enumerate(
                         ("bold", "italics", "underscore", "strikethrough", "reverse", "blink")))),
                 "wrapPending": s.cursor.x >= s.columns,
-                "extensionState": json.dumps(self.export_checkpoint(), ensure_ascii=False, separators=(",", ":"))}
+                "extensionState": encode_extension(self.export_checkpoint())}
 
     def reset_stages(self):
         self.in_frames = 0
@@ -988,7 +994,26 @@ class CaptureRowPage:
                 "chargedBytes": self.charge, "peakBytes": self.peak, "complete": complete}
 
 
+def encode_extension(state):
+    raw = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(raw) > 8 * 1024 * 1024: raise ValueError("decoded checkpoint scratch budget")
+    return "z1:" + base64.b64encode(zlib.compress(raw)).decode("ascii")
+
+
+def decode_extension(value):
+    if not value.startswith("z1:"): raise ValueError("checkpoint extension codec")
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(base64.b64decode(value[3:], validate=True), 8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024 or not decoder.eof or decoder.unused_data:
+        raise ValueError("decoded checkpoint scratch budget")
+    return json.loads(raw)
+
+
+_transaction_scratch = None
+
+
 def checkpoint_transaction(request):
+    global _transaction_scratch
     state = request.get("state")
     identity = request["identity"]
     if state is None:
@@ -999,8 +1024,9 @@ def checkpoint_transaction(request):
         w.screen.scroll_on_clear = request["scrollOnClear"]
     else:
         if state["codecVersion"] != CHECKPOINT_CODEC: raise ValueError("checkpoint codec")
-        w = Worker.from_checkpoint(json.loads(state["extensionState"]))
+        w = Worker.from_checkpoint(decode_extension(state["extensionState"]), _transaction_scratch)
         if w.contract_state() != state: raise ValueError("checkpoint envelope mismatch")
+    _transaction_scratch = w
     w.transaction_scroll_bytes = 0
     page = CaptureRowPage(w, request["rowStream"]) if "rowStream" in request else None
     if page is not None:
@@ -1016,7 +1042,10 @@ def checkpoint_transaction(request):
     result = {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
             "frame": {"identity": identity, "screenRevision": request["screenRevision"],
                       "buffer": state["active"], "geometry": state["geometry"],
-                      "changedRows": [{"y": y, "content": row} for y, row in enumerate(active["rows"])],
+                      "changedRows": [{"y": y, "content": contract_row(
+                          encode_row(w.screen.buffer[y], w.screen.columns, w.screen.default_char),
+                          row_wrapped(w.screen.buffer[y]), row_padded(w.screen.buffer[y], w.screen.columns))}
+                          for y in range(w.screen.lines)],
                       "cursor": active["cursor"], "overlap": None}}
     if page is not None:
         result.update(page.result(True))

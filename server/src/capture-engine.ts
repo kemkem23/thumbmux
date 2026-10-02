@@ -1,9 +1,8 @@
 /** Opt-in stream coordinator. Concrete VT adapter: CheckpointCaptureVt.
  * I supplies shared worker J transport and sealed source tap/spool adapters.
  * Runtime acceptance is not established; see lot C REPORT.md. */
-import { createHash } from 'node:crypto';
 import {
-  STREAM_BUDGET as B, STREAM_CONTRACT_VERSION,
+  STREAM_BUDGET as B, streamDigest, streamCanonical,
   type AppendFinalized, type CancelToken, type CaptureEngine, type DurableInputReceipt,
   type DurableReceipt, type FinalizedRow, type FrameDelta, type GapEpisode,
   type HistoryEngine, type InputEvent, type LiveFrame, type PaneKey,
@@ -27,19 +26,8 @@ function immutable<T>(value: T): T {
   }
   freeze(copy); return copy;
 }
-/** Proposed C codec. H must use the same codec or supply its canonical digest
- * through CapturePorts.digest. No claim of inter-lot codec agreement yet. */
-export function captureDigest(value: unknown): string {
-  function canonical(v: unknown): unknown {
-    if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
-    if (Array.isArray(v)) return v.map(canonical);
-    if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype)
-      return Object.fromEntries(Object.entries(v).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, x]) => [k, canonical(x)]));
-    throw new Error('non-canonical capture payload');
-  }
-  return createHash('sha256').update(JSON.stringify([STREAM_CONTRACT_VERSION, canonical(value)])).digest('hex');
-}
+/** Compatibility export; callers must name the operation kind explicitly. */
+export const captureDigest = streamDigest;
 
 /** Logical allocation accounting, not heap/PSS. Reservations have one owner. */
 export class CaptureAdmission {
@@ -207,7 +195,7 @@ export interface CapturePorts {
   readonly admission: CaptureAdmission; // shared across every pane in the host
   readonly scratch: CaptureAdmission; // separate global 32 MiB ledger
   readonly now: () => number;
-  readonly digest?: (value: unknown) => string;
+  readonly digest?: (kind: string, value: unknown) => string;
   /** tail is literally zero: implementations cannot quietly request history. */
   /** Hard retirement of all resources for this signal, including iterator reads,
    * H commit, RPC and close. Resolve only once no late mutation is possible.
@@ -253,7 +241,7 @@ export class StreamCaptureEngine implements CaptureEngine {
     this.checkpointAt = ports.now(); this.checkpointHead = this.frame.head;
   }
   private activeGap(): GapEpisode | null { return this.episode; }
-  private digest(value: unknown): string { return (this.ports.digest ?? captureDigest)(value); }
+  private digest(kind: string, value: unknown): string { return (this.ports.digest ?? streamDigest)(kind, value); }
   private matches(pane: PaneKey): boolean { return samePane(this.identity.pane, pane); }
   private record(metric: Parameters<StreamObserver['record']>[0]): void {
     try { this.ports.observer?.record(metric); } catch { /* observer cannot change admission */ }
@@ -270,6 +258,9 @@ export class StreamCaptureEngine implements CaptureEngine {
       pane: this.identity.pane, epochBefore: this.identity.sourceEpoch, epochAfter: null,
       lastDurableInput: this.lastInput?.through ?? null, lastAdmittedRow: this.frame.head ? this.frame.head - 1 : null,
       firstObservedAtMonoMs: this.ports.now(), reason, status: reason === 'late-gap' ? 'unresolved' : 'suspected', missingCount: null });
+    const fenced = this.ports.history.beginGap(this.episode);
+    if (fenced.status !== 'ok') this.episode = immutable({...this.episode,
+      status: 'unresolved', ...(fenced.status === 'stale' && fenced.reason === 'late-gap' ? {reason: 'late-gap' as const} : {})});
     this.record({ kind: 'gap', episode: this.episode }); return this.episode;
   }
   get checkpointDue(): 'periodic' | 'row-limit' | null {
@@ -292,7 +283,7 @@ export class StreamCaptureEngine implements CaptureEngine {
     if (event.payload.kind === 'bytes' && (!event.payload.bytes.every(n => Number.isInteger(n) && n >= 0 && n <= 255)))
       return error('integrity', 'invalid byte');
     const { digest: _, ...payload } = event;
-    if (event.digest !== this.digest(payload)) return error('integrity', 'input checksum');
+    if (event.digest !== this.digest('input', payload)) return error('integrity', 'input checksum');
     return null;
   }
   /** I calls this on a source-owned read/spool BEFORE assigning journal packet
@@ -316,7 +307,7 @@ export class StreamCaptureEngine implements CaptureEngine {
     for (let count = Math.min(512, bytes.length); count >= 1; count = Math.floor(count / 2)) {
       const body = { identity: this.identity, position: { sourceEpoch: this.identity.sourceEpoch, packetSeq },
         receivedAtMonoMs, payload: { kind: 'bytes' as const, bytes: Array.from(bytes.subarray(0, count)) } };
-      const result = await this.acceptInput({ ...body, digest: this.digest(body) });
+      const result = await this.acceptInput({ ...body, digest: this.digest('input', body) });
       if (result.status === 'ok') return ok({ consumed: count, receipt: result.value });
       const expansion = result.status === 'error' && result.code === 'unsupported'
         && result.message === 'VT expansion budget';
@@ -398,24 +389,36 @@ export class StreamCaptureEngine implements CaptureEngine {
       if (!sameIdentity(tx.frame.identity, p.event.identity) || tx.scrolls.some(row => row.uncertainFields.length))
         return error('integrity', 'VT identity or uncertain scroll');
       if (!counter(this.frame.head + tx.scrolls.length) || !counter(this.frame.revision + 1)) return error('integrity', 'counter exhausted');
-      const rows: FinalizedRow[] = tx.scrolls.map((row, scrollOrdinal) => ({ ...row,
-        id: { pane: this.identity.pane, lineId: this.frame.head + scrollOrdinal }, revision: this.frame.revision + 1,
-        source: { pane: this.identity.pane, ...p.event.position, scrollOrdinal },
-        geometryGeneration: p.event.identity.geometryGeneration, geometry: tx!.frame.geometry }));
-      // A packet may finalize more than the hot tail can hold. Its rows must
-      // become durable before any eviction or live installation takes place.
+      const rows: FinalizedRow[] = [];
+      let offset = 0, revision = this.frame.revision, head = this.frame.head;
+      let request!: AppendFinalized;
+      let receipt!: Extract<Result<import('./stream-contract').RamReceipt>, {status:'ok'}>;
+      do {
+        const chunk: FinalizedRow[] = [];
+        while (offset + chunk.length < tx.scrolls.length && chunk.length < B.decodeRows) {
+          const ordinal = offset + chunk.length;
+          const row: FinalizedRow = {...tx.scrolls[ordinal]!,
+            id:{pane:this.identity.pane,lineId:head+chunk.length}, revision:revision+1,
+            source:{pane:this.identity.pane,...p.event.position,scrollOrdinal:ordinal},
+            geometryGeneration:p.event.identity.geometryGeneration,geometry:tx.frame.geometry};
+          if (size([...chunk,row]) > B.decodeBytes) break;
+          chunk.push(row);
+        }
+        if (!chunk.length && offset < tx.scrolls.length) return error('unsupported','single row decode budget');
+        const body = {identity:p.event.identity,eventId:{pane:this.identity.pane,...p.event.position,scrollOrdinal:offset},
+          expectedRevision:revision,rows:chunk,frameDelta:tx.frame,receivedAtMonoMs:p.event.receivedAtMonoMs};
+        request=immutable({...body,digest:this.digest('append',body)});
+        const appended=await this.ports.history.appendFinalized(request);
+        if(appended.status!=='ok')return appended;
+        receipt=appended;
+        if(receipt.value.head!==head+chunk.length || receipt.value.revision!==revision+1
+          || receipt.value.digest!==request.digest || streamCanonical(receipt.value.eventId)!==streamCanonical(request.eventId)) {
+          this.fault('checksum');return error('integrity','append receipt fence');
+        }
+        rows.push(...chunk); offset+=chunk.length; head=receipt.value.head;revision=receipt.value.revision;
+      } while(offset<tx.scrolls.length);
       const needsDurable = !this.tail.canAppend(rows);
-      if (needsDurable && !tx.snapshot) return error('unsupported', 'large packet requires candidate checkpoint');
-      if (size(rows) * 2 > B.vtBytesPerPane) return busy();
-      const body = { identity: p.event.identity, eventId: { pane: this.identity.pane, ...p.event.position, scrollOrdinal: 0 },
-        expectedRevision: this.frame.revision, rows, frameDelta: tx.frame, receivedAtMonoMs: p.event.receivedAtMonoMs };
-      const request: AppendFinalized = immutable({ ...body, digest: this.digest(body) });
-      const receipt = await this.ports.history.appendFinalized(request);
-      if (receipt.status !== 'ok') return receipt;
-      if (receipt.value.head !== this.frame.head + rows.length || receipt.value.revision !== this.frame.revision + 1
-        || receipt.value.digest !== request.digest || this.digest(receipt.value.eventId) !== this.digest(request.eventId)) {
-        this.fault('checksum'); return error('integrity', 'append receipt fence');
-      }
+      if (needsDurable && !tx.snapshot) return error('unsupported','large packet requires candidate checkpoint');
       const commitGap = this.activeGap();
       if (commitGap) {
         // A commit may have landed during source failure. Do not publish its
@@ -432,10 +435,10 @@ export class StreamCaptureEngine implements CaptureEngine {
         if (size(state.value) * 2 > B.vtBytesPerPane) return busy();
         const body = { kind: 'vt-recovery' as const, previousCheckpointId: this.lastCheckpoint?.checkpointId ?? null,
           identity: p.event.identity, inputFence: p.receipt, revision: receipt.value.revision,
-          head: receipt.value.head, state: state.value, stateDigest: this.digest(state.value) };
-        const checkpoint = immutable({ ...body, checkpointId: this.digest(body) });
+          head: receipt.value.head, state: state.value, stateDigest: this.digest('vt-state', {identity: p.event.identity, state: state.value}) };
+        const checkpoint = immutable({ ...body, checkpointId: this.digest('checkpoint-id', body) });
         const commit = { checkpoint, expectedRevision: receipt.value.revision, commitId: checkpoint.checkpointId };
-        const durable = await this.ports.history.commitCheckpoint({ ...commit, digest: this.digest(commit) });
+        const durable = await this.ports.history.commitCheckpoint({ ...commit, digest: this.digest('checkpoint', commit) });
         if (durable.status !== 'ok') return durable;
         if (!samePane(durable.value.pane, this.identity.pane) || durable.value.durableRevision !== receipt.value.revision
           || durable.value.checkpointId !== checkpoint.checkpointId) return error('integrity', 'batch checkpoint fence');
@@ -474,12 +477,12 @@ export class StreamCaptureEngine implements CaptureEngine {
       if (!fence) return error('unsupported', 'no admitted durable input fence');
       const state = await this.ports.vt.snapshot(); if (state.status !== 'ok') return state;
       if (size(state.value) * 2 > B.vtBytesPerPane) return busy();
-      const stateDigest = this.digest(state.value);
+      const stateDigest = this.digest('vt-state', {identity: this.identity, state: state.value});
       const body = { kind: 'vt-recovery' as const, previousCheckpointId: this.lastCheckpoint?.checkpointId ?? null,
         identity: this.identity, inputFence: fence, revision: this.frame.revision, head: this.frame.head, state: state.value, stateDigest };
-      const checkpoint = immutable({ ...body, checkpointId: this.digest(body) });
+      const checkpoint = immutable({ ...body, checkpointId: this.digest('checkpoint-id', body) });
       const commit = { checkpoint, expectedRevision: this.frame.revision, commitId: checkpoint.checkpointId };
-      const result = await this.ports.history.commitCheckpoint({ ...commit, digest: this.digest(commit) });
+      const result = await this.ports.history.commitCheckpoint({ ...commit, digest: this.digest('checkpoint', commit) });
       if (result.status !== 'ok') return result;
       if (!samePane(result.value.pane, pane) || result.value.durableRevision !== this.frame.revision
         || result.value.checkpointId !== checkpoint.checkpointId) return error('integrity', 'checkpoint receipt fence');
@@ -495,7 +498,7 @@ export class StreamCaptureEngine implements CaptureEngine {
   async restore(checkpoint: VtCheckpoint, input: AsyncIterable<InputEvent>): Promise<Result<LiveFrame>> {
     if (this.locked || this.pending || this.restoring || this.episode) return busy();
     if (!sameIdentity(checkpoint.identity, this.identity)) return { status: 'stale', reason: 'identity' };
-    if (checkpoint.stateDigest !== this.digest(checkpoint.state)) return error('integrity', 'VT checkpoint checksum');
+    if (checkpoint.stateDigest !== this.digest('vt-state', {identity: checkpoint.identity, state: checkpoint.state})) return error('integrity', 'VT checkpoint checksum');
     // Restoring over a newer live stream would reuse IDs or hide a late gap.
     if (this.frame.head > checkpoint.head || this.frame.revision > checkpoint.revision) return { status: 'stale', reason: 'late-gap' };
     if (size(checkpoint.state) * 2 > B.vtBytesPerPane) return busy();
@@ -575,6 +578,8 @@ export class StreamCaptureEngine implements CaptureEngine {
       if (controller.signal.aborted) {
         yield cancel.isCancelled() ? {status:'cancelled',reason:'repair cancelled'} : error('deadline','repair exceeded 10000ms'); return;
       }
+      const fenced = this.ports.history.beginGap(this.episode);
+      if (fenced.status !== 'ok') { yield fenced; return; }
       iterator = this.ports.repairChunks(this.episode, controller.signal)[Symbol.asyncIterator]();
       while (true) {
         if (controller.signal.aborted) throw new Error('capture operation cancelled');
@@ -614,7 +619,7 @@ export class StreamCaptureEngine implements CaptureEngine {
             } catch (cause) {
               yield receipt; yield error('unresolved-gap', `committed prefix requires sync: ${String(cause)}`); return;
             }
-            if (receipt.value.complete) {
+            if (chunk.final) {
               if (!chunk.final || cancel.isCancelled() || controller.signal.aborted
                 || !(await scope.wait(this.ports.verifyRepair(episode, controller.signal)))) {
                 yield receipt; yield error('unresolved-gap', 'durable repair lacks exact live seam proof'); return;
@@ -625,9 +630,8 @@ export class StreamCaptureEngine implements CaptureEngine {
               if(controller.signal.aborted || this.ports.now()>deadline) {
                 yield receipt; yield error('deadline','repair exceeded 10000ms'); return;
               }
-              if(cp.checkpointId!==receipt.value.durable.checkpointId
-                || !samePane(cp.identity.pane,this.identity.pane) || cp.head!==this.frame.head
-                || cp.revision!==this.frame.revision || cp.stateDigest!==this.digest(cp.state)
+              if(!samePane(cp.identity.pane,this.identity.pane) || cp.head!==this.frame.head
+                || cp.revision!==this.frame.revision || cp.stateDigest!==this.digest('vt-state', {identity: cp.identity, state: cp.state})
                 || !samePane(cp.inputFence.pane,this.identity.pane)
                 || cp.inputFence.through.sourceEpoch!==cp.identity.sourceEpoch
                 || (this.pending && cp.identity.sourceEpoch===this.pending.event.identity.sourceEpoch
@@ -642,13 +646,18 @@ export class StreamCaptureEngine implements CaptureEngine {
               if(restored.value.scrolls.length || !sameIdentity(restored.value.frame.identity,cp.identity)) {
                 restored.value.discard(); yield receipt; yield error('integrity','repair VT restore fence'); return;
               }
+              const commit = {checkpoint:cp,expectedRevision:cp.revision,commitId:cp.checkpointId,closeGap:episode.episodeId};
+              const closed = await scope.wait(this.ports.history.commitCheckpoint({...commit,digest:this.digest('checkpoint',commit)}));
+              if(closed.status!=='ok') { restored.value.discard(); yield receipt; yield closed; return; }
+              receipt = ok({...receipt.value,durable:closed.value,complete:true});
+              this.durable = immutable(closed.value);
               restored.value.install();
               this.pending?.release(); this.pending=null;
               this.identity=immutable(cp.identity); this.lastInput=immutable(cp.inputFence);
               this.lastCheckpointInput=this.lastInput; this.lastCheckpoint=immutable(cp);
               this.checkpointAt=this.ports.now(); this.checkpointHead=cp.head;
               this.publish({...restored.value.frame,head:cp.head,revision:cp.revision,durableRevision:cp.revision});
-              this.episode = immutable({ ...this.episode!, status: 'repaired', missingCount: 0 });
+              this.episode = immutable({ ...this.episode!, status: 'repaired', missingCount: this.episode!.missingCount });
               this.record({ kind: 'gap', episode: this.episode }); this.episode = null;
             }
           }
@@ -827,7 +836,7 @@ export class TargetedCaptureRepair {
           geometryGeneration:this.identity.geometryGeneration,geometry:view!.geometry}));
         const final=offset+count===end;
         const body={episode,chunkId:`${episode.episodeId}:${offset-from}`,expectedRevision:revision,rows,final};
-        const chunk={...body,digest:this.digest(body)};
+        const chunk={...body,digest:this.digest('repair', body)};
         if(size(chunk)>B.decodeBytes) { yield busy(); return; }
         yield ok(immutable(chunk));
         revision++; head+=count; offset+=count;
@@ -879,14 +888,14 @@ export async function* bootstrapCapture(view: CaptureRecoveryView, episode: GapE
         geometry:view.geometry,geometryGeneration:view.identity.geometryGeneration}));
       const final=offset+count===view.rowCount;
       const body={episode,chunkId:`${episode.episodeId}:bootstrap:${offset}`,expectedRevision:revision,rows,final};
-      const chunk=immutable({...body,digest:captureDigest(body)});
+      const chunk=immutable({...body,digest:captureDigest('repair', body)});
       if(size(chunk)>B.decodeBytes) { yield busy(); return; }
       const receipt=await scope.wait(history.commitRepair(chunk));
       if(receipt.status!=='ok') { yield receipt; return; }
       try { await scope.wait(sync(chunk,receipt.value)); }
       catch(cause) { yield receipt; yield error('unresolved-gap',`bootstrap prefix sync: ${String(cause)}`); return; }
       yield receipt;
-      if(receipt.value.committedRevision!==revision+1 || receipt.value.complete!==final
+      if(receipt.value.committedRevision!==revision+1 || (receipt.value.finalChunk ?? receipt.value.complete)!==final
         || receipt.value.committedIds.length!==rows.length
         || !receipt.value.committedIds.every((id,i)=>samePane(id.pane,view.identity.pane) && id.lineId===rows[i]!.id.lineId)) {
         yield error('integrity','bootstrap receipt fence'); return;

@@ -741,3 +741,36 @@ test('contract abandoned recovery cancels its own timer without iterator return'
     expect(f.engine.stats().pins).toBe(0);
   } finally { f.cleanup(); }
 });
+
+test('contract final repair rows stay fenced until repaired checkpoint commits atomically', async () => {
+  const f = shFixture();
+  try {
+    shOk(await f.engine.journalInput(shInput())); shOk(await f.engine.appendFinalized(shAppend()));
+    shOk(await shCheckpoint(f.engine));
+    const recovery = f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
+    const first = shOk((await recovery.next()).value!);
+    if(first.kind !== 'checkpoint') throw Error('checkpoint expected');
+    await recovery.return?.();
+    const gap = {episodeId:'atomic-close',pane:shPane,epochBefore:1,epochAfter:null,
+      lastDurableInput:shInput().position,lastAdmittedRow:0,firstObservedAtMonoMs:0,
+      reason:'eof' as const,status:'suspected' as const,missingCount:null};
+    shOk(f.engine.beginGap(gap));
+    const inputFence = shOk(await f.engine.journalInput(shInput(2)));
+    const body={episode:gap,chunkId:'final',expectedRevision:1,rows:shAppend(2).rows,final:true};
+    const receipt=shOk(await f.engine.commitRepair({...body,digest:streamDigest('repair',body)}));
+    expect(receipt.complete).toBe(false);
+    f.reopen();
+    expect(await f.engine.appendFinalized(shAppend(2))).toMatchObject({status:'stale',reason:'late-gap'});
+    const checkpoint={...first.checkpoint,checkpointId:'repaired',previousCheckpointId:first.checkpoint.checkpointId,
+      revision:2,head:2,inputFence};
+    const commit={checkpoint,expectedRevision:2,commitId:'repaired',closeGap:gap.episodeId};
+    const durable=shOk(await f.engine.commitCheckpoint({...commit,digest:streamDigest('checkpoint',commit)}));
+    expect(durable.checkpointId).toBe('repaired');
+    f.reopen();
+    const restored=f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
+    expect(shOk((await restored.next()).value!)).toEqual({kind:'checkpoint',checkpoint});
+    await restored.return?.();
+    shOk(await f.engine.journalInput(shInput(3)));
+    expect((await f.engine.appendFinalized(shAppend(3))).status).toBe('ok');
+  } finally { f.cleanup(); }
+});

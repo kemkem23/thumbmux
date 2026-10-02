@@ -3,30 +3,15 @@
  * or timer is created until the explicit constructor is called.
  */
 import { Database } from 'bun:sqlite';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
-import { STREAM_BUDGET as B, eventKey, validReadOpen } from './stream-contract';
+import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical, streamDigest } from './stream-contract';
 import type { AppendFinalized, CancelToken, CheckpointCommit, DurableInputReceipt, DurableReceipt,
   FinalizedRow, GapEpisode, HistoryEngine, HistoryPage, HistoryPageCheckpoint, InputEvent, PaneKey, PageCursor,
   RamReceipt, ReadOpenAck, ReadRequest, ReadView, RecoveryChunk, RepairChunk, RepairReceipt,
   Result, RowContent, RowFragment, StreamFailure, StreamIdentity, VtCheckpoint } from './stream-contract';
 
-/** Versioned canonical codec shared with C/D/Q. Object keys are sorted; arrays
- * retain order; undefined/nonfinite values are rejected instead of erased.
- * Pass the request WITHOUT its top-level digest. Nested digests are included.
- */
-export function streamCanonical(value: unknown): string {
-  if (value === null || typeof value === 'boolean') return JSON.stringify(value);
-  if (typeof value === 'string') { if (!value.isWellFormed()) throw Error('invalid Unicode'); return JSON.stringify(value); }
-  if (typeof value === 'number') { if (!Number.isFinite(value)) throw Error('nonfinite number'); return JSON.stringify(value); }
-  if (Array.isArray(value)) return '[' + value.map(streamCanonical).join(',') + ']';
-  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) throw Error('non-JSON value');
-  const object = value as Record<string, unknown>;
-  return '{' + Object.keys(object).sort().map(k => JSON.stringify(k) + ':' + streamCanonical(object[k])).join(',') + '}';
-}
-export function streamDigest(kind: string, payload: unknown): string {
-  return createHash('sha256').update(streamCanonical({ version: 1, kind, payload })).digest('hex');
-}
+export { streamCanonical, streamDigest } from './stream-contract';
 function frozen<T>(value: T): T {
   if (value && typeof value === 'object') { for (const item of Object.values(value)) frozen(item); Object.freeze(value); }
   return value;
@@ -222,14 +207,13 @@ export class StreamHistoryEngine implements HistoryEngine {
       const revision = state.revision + 1; safe(revision);
       this.validateRows(request.rows, state, revision);
       const frame = request.frameDelta;
-      if (!equal(frame.identity, request.identity) || (frame.buffer !== 'normal' && frame.buffer !== 'alternate')
-        || (frame.buffer === 'alternate' && request.rows.length)) throw Error('frame identity/alternate scroll');
+      if (!equal(frame.identity, request.identity) || (frame.buffer !== 'normal' && frame.buffer !== 'alternate')) throw Error('frame identity/alternate scroll');
       geometry(frame.geometry); safe(frame.screenRevision); safe(frame.cursor.x); safe(frame.cursor.y);
       if (frame.cursor.x >= frame.geometry.columns || frame.cursor.y >= frame.geometry.rows || typeof frame.cursor.visible !== 'boolean') throw Error('invalid frame cursor');
       if (frame.overlap) { safe(frame.overlap.start); safe(frame.overlap.end); if (frame.overlap.start > frame.overlap.end || frame.overlap.end > state.head + request.rows.length) throw Error('invalid overlap'); }
       const ys = new Set<number>();
       for (const changed of frame.changedRows) { safe(changed.y); if (changed.y >= frame.geometry.rows || ys.has(changed.y)) throw Error('invalid changed row'); ys.add(changed.y); content(changed.content); }
-      for (const row of request.rows) if (!equal(row.source, request.eventId) || !equal(row.geometry, frame.geometry)) throw Error('row source/frame mismatch');
+      for (const [j, row] of request.rows.entries()) if (!equal(row.source, {...request.eventId, scrollOrdinal: request.eventId.scrollOrdinal + j}) || !equal(row.geometry, frame.geometry)) throw Error('row source/frame mismatch');
       const charge = bytes(request) * 4;
       if (pool.pending + charge > B.pendingBytes) return busy();
       const owned = copy(request);
@@ -307,7 +291,12 @@ export class StreamHistoryEngine implements HistoryEngine {
       }
       const state = this.state(cp.identity.pane); if (!state) return stale();
       const mismatch = this.match(state, cp.identity); if (mismatch) return mismatch;
-      if (state.gap) return { status: 'error', code: 'unresolved-gap', message: 'checkpoint behind unresolved gap' };
+      if (state.gap) {
+        if (request.closeGap !== state.gap.episodeId || state.gap.reason === 'late-gap')
+          return { status: 'error', code: 'unresolved-gap', message: 'checkpoint behind unresolved gap' };
+        const final = this.db.query("SELECT 1 FROM sh_repair WHERE pane=? AND episode=? AND json_extract(receipt,'$.finalChunk')=1 LIMIT 1").get(key, request.closeGap);
+        if (!final) throw Error('repair rows not sealed');
+      } else if (request.closeGap) throw Error('repair episode is not active');
       if (request.expectedRevision !== state.revision || cp.revision !== state.revision || cp.head !== state.head) return stale();
       if (cp.previousCheckpointId !== state.checkpoint) throw Error('checkpoint chain');
       if (this.db.query('SELECT 1 FROM sh_checkpoint WHERE pane=? AND id=?').get(key, cp.checkpointId)) throw Error('checkpoint ID reused');
@@ -329,7 +318,7 @@ export class StreamHistoryEngine implements HistoryEngine {
         this.flushRows(key);
         this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));
         this.db.query('INSERT INTO sh_commit VALUES(?,?,?,?,?)').run(key, request.commitId, request.digest, streamCanonical(receipt), receipt.durableRevision);
-        this.putState({ ...state, durable: state.revision, checkpoint: cp.checkpointId });
+        this.putState({ ...state, durable: state.revision, checkpoint: cp.checkpointId, gap: null });
       });
       this.dropPending(key); return ok(receipt);
     } catch (e) { return fail(e); }
@@ -347,9 +336,7 @@ export class StreamHistoryEngine implements HistoryEngine {
     p.state = { ...p.state, durable: disk.durable, checkpoint: disk.checkpoint, gap: disk.gap };
 
   }
-  /** Supplemental lifecycle seam, pending K amendment: the frozen HistoryEngine
-   * interface has no begin-gap method. C/I must call this before suffix admission.
-   */
+  /** Persist admitted rows and gap together before acknowledging the fence. */
   beginGap(episode: GapEpisode): Result<null> {
     try {
       this.live(); nonempty(episode.episodeId); paneKey(episode.pane); safe(episode.epochBefore);
@@ -368,9 +355,14 @@ export class StreamHistoryEngine implements HistoryEngine {
         for (const [id, pin] of this.pins) if (equal(pin.view.identity.pane, episode.pane)) this.releasePin(id);
         return stale('late-gap');
       }
-      if (state.gap) return equal(state.gap, episode) ? ok(null) : stale('late-gap');
-      if (this.pending.has(paneKey(episode.pane))) return { status: 'busy', reason: 'snapshot-gate', retryAfterMs: 20 };
-      this.db.transaction(() => this.putState({ ...state, gap: copy(episode) })).immediate(); return ok(null);
+      if (state.gap) return state.gap.episodeId === episode.episodeId && state.gap.epochBefore === episode.epochBefore
+        && state.gap.lastAdmittedRow === episode.lastAdmittedRow ? ok(null) : stale('late-gap');
+      const key = paneKey(episode.pane);
+      this.db.transaction(() => {
+        this.flushRows(key);
+        this.putState({ ...state, durable: state.revision, gap: copy(episode) });
+      }).immediate();
+      this.dropPending(key); return ok(null);
     } catch (e) { return fail(e); }
   }
   async commitRepair(chunk: RepairChunk): Promise<Result<RepairReceipt>> {
@@ -385,18 +377,19 @@ export class StreamHistoryEngine implements HistoryEngine {
       if (state.gap.reason === 'late-gap' || chunk.episode.reason === 'late-gap') return stale('late-gap');
       if (chunk.episode.epochBefore !== state.gap.epochBefore || chunk.episode.epochAfter !== state.gap.epochAfter
         || chunk.episode.lastAdmittedRow !== state.gap.lastAdmittedRow || typeof chunk.final !== 'boolean') throw Error('repair episode mismatch');
+      if (this.db.query("SELECT 1 FROM sh_repair WHERE pane=? AND episode=? AND json_extract(receipt,'$.finalChunk')=1 LIMIT 1").get(key,chunk.episode.episodeId)) throw Error('repair rows already sealed');
       const revision = state.revision + 1; this.validateRows(chunk.rows, state, revision);
       const n = bytes(chunk) * 4; if (pool.pending + n > B.pendingBytes) return busy();
       const durable: DurableReceipt = { kind: 'durable', pane: chunk.episode.pane,
         commitId: streamDigest('repair-id', { pane: chunk.episode.pane, episode: chunk.episode.episodeId, chunk: chunk.chunkId }),
         digest: chunk.digest, durableRevision: revision, checkpointId: state.checkpoint };
-      const receipt: RepairReceipt = { committedIds: chunk.rows.map(r => r.id), committedRevision: revision, durable, complete: chunk.final };
+      const receipt: RepairReceipt = { committedIds: chunk.rows.map(r => r.id), committedRevision: revision, durable, complete: false, finalChunk: chunk.final };
       pool.pending += n;
       try { this.transaction('repair', () => {
         this.writeRows(chunk.rows);
         this.db.query('INSERT INTO sh_repair VALUES(?,?,?,?,?)').run(key, chunk.episode.episodeId, chunk.chunkId, chunk.digest, streamCanonical(receipt));
         this.db.query('INSERT INTO sh_commit VALUES(?,?,?,?,?)').run(key, durable.commitId, durable.digest, streamCanonical(durable), durable.durableRevision);
-        this.putState({ ...state, revision, durable: revision, head: state.head + chunk.rows.length, gap: chunk.final ? null : state.gap });
+        this.putState({ ...state, revision, durable: revision, head: state.head + chunk.rows.length, gap: state.gap });
       }); } finally { pool.pending -= n; }
       return ok(receipt);
     } catch (e) { return fail(e); }
@@ -475,7 +468,7 @@ export class StreamHistoryEngine implements HistoryEngine {
       const ack: ReadOpenAck = copy({ view, diskSnapshotRevision: disk.durable, snapshotHandle: randomUUID() });
       if (!validReadOpen(ack)) throw Error('read fence violation');
       const timer = setTimeout(() => { this.releasePin(view.requestId); }, Math.min(B.readDeadlineMs, request.deadlineMonoMs - performance.now()));
-      timer.unref?.();
+      this.recoveryTimers.add(timer); timer.unref?.();
       this.pins.set(view.requestId, { view, db, overlay, charge, ack, opened: false, timer });
       pool.overlays += charge; db = null; return ok(view);
     } catch (e) { return fail(e); }
@@ -567,6 +560,7 @@ export class StreamHistoryEngine implements HistoryEngine {
     const pin = this.pins.get(view.requestId);
     if (pin && equal(pin.view, view)) this.releasePin(view.requestId);
   }
+  private recoveryTimers = new Set<ReturnType<typeof setInterval>>();
   async *recover(pane: PaneKey, checkpointId: string | null, cancel: CancelToken): AsyncIterable<Result<RecoveryChunk>> {
     let db: Database | null = null, timer: ReturnType<typeof setTimeout> | null = null;
     let expired = false, cancelled = false;
@@ -577,9 +571,12 @@ export class StreamHistoryEngine implements HistoryEngine {
       const deadline = performance.now() + B.recoveryMs;
       timer = setInterval(() => {
         cancelled = cancel.isCancelled(); expired = performance.now() >= deadline;
-        if ((cancelled || expired || this.closed) && db) { this.closeReader(db, pane); db = null; }
+        if (cancelled || expired || this.closed) {
+          if (db) { this.closeReader(db, pane); db = null; }
+          if (timer) { clearInterval(timer); this.recoveryTimers.delete(timer); timer = null; }
+        }
       }, 50);
-      timer.unref?.();
+      this.recoveryTimers.add(timer); timer.unref?.();
       const state = this.state(pane, reader); if (!state) { yield stale(); return; }
       const key = paneKey(pane), cpId = checkpointId ?? state.checkpoint;
       let epoch = 0, seq = 0, head = 0;
@@ -622,9 +619,9 @@ export class StreamHistoryEngine implements HistoryEngine {
         yield ok({ kind: 'input', event });
       }
     } catch (e) { yield fail(e); }
-    finally { if (timer) clearInterval(timer); if (db) this.closeReader(db, pane); }
+    finally { if (timer) { clearInterval(timer); this.recoveryTimers.delete(timer); } if (db) this.closeReader(db, pane); }
   }
-  stats() { return { pendingBytes: pool.pending, ownedPendingBytes: this.ownPending, overlayBytes: pool.overlays,
+  stats() { return { recoveryTimers: this.recoveryTimers.size, pendingBytes: pool.pending, ownedPendingBytes: this.ownPending, overlayBytes: pool.overlays,
     activeReads: pool.readers, pins: this.readers.size, diskCacheConfigBytes: pool.cache }; }
   /** Close never upgrades undurable RAM to durable without a full VT checkpoint.
    * Caller must drain Capture first; returned pending bytes make omission visible.
@@ -632,6 +629,8 @@ export class StreamHistoryEngine implements HistoryEngine {
   close(): { undurableBytes: number } {
     if (this.closed) return { undurableBytes: 0 };
     const undurableBytes = this.ownPending;
+    for (const timer of this.recoveryTimers) clearInterval(timer);
+    this.recoveryTimers.clear();
     for (const id of [...this.pins.keys()]) this.releasePin(id);
     for (const [db, pane] of this.readers) this.closeReader(db, pane);
     this.db.close(); this.closed = true; pool.cache -= WRITER_CACHE; pool.paths.delete(this.options.path);

@@ -183,7 +183,7 @@ function isRefusal(value: unknown): boolean {
 }
 
 /** Receipt value of an event the consumer refused as oversize (dropped, declared). */
-const DROPPED = Symbol("pipe-history-dropped");
+
 
 type BunPeek = { peek?: ((promise: unknown) => unknown) & { status?: (promise: unknown) => string } };
 
@@ -579,85 +579,43 @@ export class PipeHistoryCollector {
     }
   }
 
-  /**
-   * Offer one event to a consumer port. Accepted synchronously -> undefined;
-   * refused as oversize synchronously -> DROPPED (declared once via `drop`);
-   * pending -> a Promise that settles (undefined or DROPPED) once decided.
-   * Capacity pressure retries the same event (bounded backoff, forever until
-   * close); oversize is never retried; any other refusal rejects and becomes
-   * a parser-independent fault.
-   */
-  private deliver(send: () => unknown, drop: () => void): { receipt: unknown; pressured: boolean } {
-    const dropped = (): typeof DROPPED => { drop(); return DROPPED; };
+  /** Refusal retains the exact event and pauses input. Oversize requires the
+   * sink to stream/spool it; it is never permission to discard history. */
+  private deliver(send: () => unknown): { receipt: unknown; pressured: boolean } {
+    const refused = (v: unknown) => isCapacityPressure(v) || isOversize(v);
     let answer: unknown;
     try { answer = send(); }
-    catch (error) {
-      if (isCapacityPressure(error)) return { receipt: this.retryPressure(send, dropped), pressured: true };
-      if (isOversize(error)) return { receipt: dropped(), pressured: false };
-      throw error;
+    catch (e) {
+      if (refused(e)) return {receipt:this.retryPressure(send),pressured:true};
+      throw e;
     }
-    if (isReceipt(answer)) {
-      // A store that decides admission synchronously answers with an already
-      // rejected Promise: stop the batch there so later rows cannot pass it.
-      const pressured = refusedNow(answer);
-      const receipt = Promise.resolve(answer).then(
-        (value) => {
-          if (isCapacityPressure(value)) return this.retryPressure(send, dropped);
-          if (isOversize(value)) return dropped();
-          if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
-        },
-        (error) => {
-          if (isCapacityPressure(error)) return this.retryPressure(send, dropped);
-          if (isOversize(error)) return dropped();
-          throw error;
-        },
-      );
-      return { receipt, pressured };
-    }
-    if (isCapacityPressure(answer)) return { receipt: this.retryPressure(send, dropped), pressured: true };
-    if (isOversize(answer)) return { receipt: dropped(), pressured: false };
+    if (isReceipt(answer)) return {pressured:true, receipt:Promise.resolve(answer).then(
+      value => {
+        if (refused(value)) return this.retryPressure(send);
+        if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
+      }, e => { if (refused(e)) return this.retryPressure(send); throw e; })};
+    if (refused(answer)) return {receipt:this.retryPressure(send),pressured:true};
     if (isRefusal(answer)) throw new Error(`consumer refused: ${JSON.stringify(answer)}`);
-    return { receipt: undefined, pressured: false };
+    return {receipt:undefined,pressured:false};
   }
-
-  /** One declared loss per event the consumer can never admit; never retried. */
-  private declareOversize(droppedEvent: "scroll" | "frame", receiveSeq: number, full = false): void {
-    this.oversizeDrops += 1;
-    this.notifyFault({ kind: "consumer-oversize", at: this.now(), droppedEvent,
-      receiveSeqFrom: receiveSeq, receiveSeqTo: receiveSeq,
-      ...(droppedEvent === "scroll" ? { lostRows: 1, missingCount: 1 } : {}),
-      message: droppedEvent === "scroll"
-        ? "consumer can never admit this scrolled row (oversize); dropped once, not retried"
-        : `consumer can never admit this ${full ? "full " : ""}frame (oversize); screen stale until a later frame is accepted` });
-    // A dropped delta leaves the consumer's screen behind: ask once for a
-    // full frame. A dropped full frame is not re-requested (it would loop).
-    if (droppedEvent === "frame" && !full) this.requestFullFrame();
-  }
-
-  private async retryPressure(send: () => unknown, dropped: () => typeof DROPPED): Promise<void | typeof DROPPED> {
+  private async retryPressure(send: () => unknown): Promise<void> {
     if (!this.pressureEpisode) {
       this.pressureEpisode = true;
       if (this.healthState === "ok") this.healthState = "degraded";
-      this.notifyFault({ kind: "consumer-pressure", at: this.now(),
-        message: "consumer at capacity; parser output held and pipe reads paused until it accepts" });
+      this.notifyFault({kind:"consumer-pressure",at:this.now(),
+        message:"consumer refused; exact output retained and input paused until accepted"});
     }
     let delay = this.options.pressureRetryMs ?? 2;
     for (;;) {
-      if (this.closing || this.healthState === "closed") throw new Error("collector closed while the consumer was under capacity pressure");
-      if (this.healthState === "broken") throw new Error("parser broke while the consumer was under capacity pressure");
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 2, 100);
-      this.pressureRetries += 1;
-      let value: unknown;
-      try { value = await send(); }
-      catch (error) {
-        if (isCapacityPressure(error)) continue;
-        if (isOversize(error)) return dropped();
-        throw error;
-      }
-      if (isCapacityPressure(value)) continue;
-      if (isOversize(value)) return dropped();
-      if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
+      if (this.closing || this.healthState === "closed" || this.healthState === "broken")
+        throw new Error("collector closed with unacknowledged consumer output");
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 100); this.pressureRetries++;
+      let answer: unknown;
+      try { answer = await send(); }
+      catch(e) { if (isCapacityPressure(e) || isOversize(e)) continue; throw e; }
+      if (isCapacityPressure(answer) || isOversize(answer)) continue;
+      if (isRefusal(answer)) throw new Error(`consumer refused: ${JSON.stringify(answer)}`);
       return;
     }
   }
@@ -698,9 +656,8 @@ export class PipeHistoryCollector {
     let stop = events.length;
     for (let i = index; i < events.length; i++) {
       const event = events[i]!;
-      const { receipt, pressured } = this.deliver(() => this.options.ports.onScroll(event),
-        () => this.declareOversize("scroll", event.receiveSeq));
-      if ((receipt === undefined || receipt === DROPPED) && pending.length === 0) {
+      const { receipt, pressured } = this.deliver(() => this.options.ports.onScroll(event));
+      if ((receipt === undefined) && pending.length === 0) {
         if (receipt === undefined) this.remember(event);
         accepted = i + 1;
         continue;
@@ -710,8 +667,8 @@ export class PipeHistoryCollector {
     }
     if (pending.length === 0) return;
     return Promise.all(pending).then((answers) => {
-      // A dropped row never enters the tray ring: only accepted rows do.
-      for (let i = accepted; i < stop; i++) if (answers[i - accepted] !== DROPPED) this.remember(events[i]!);
+      // All receipts have acknowledged these exact rows.
+      for (let i = accepted; i < stop; i++) this.remember(events[i]!);
       if (stop < events.length) return this.offerScrolls(events, stop);
     });
   }
@@ -755,8 +712,7 @@ export class PipeHistoryCollector {
         cursor: update.frame.cursor, kind: update.frame.kind,
         geometryGeneration: update.gen, receiveSeq: seqTo,
       };
-      const { receipt } = this.deliver(() => this.options.ports.onFrame(frame),
-        () => this.declareOversize("frame", seqTo, frame.cells.full));
+      const { receipt } = this.deliver(() => this.options.ports.onFrame(frame));
       if (isReceipt(receipt)) return receipt.then(complete);
       complete();
     };
