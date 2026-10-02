@@ -458,6 +458,7 @@ export class StreamHistoryEngine implements HistoryEngine {
       const state = this.state(request.identity.pane); if (!state) return stale();
       const mismatch = this.match(state, request.identity); if (mismatch) return mismatch;
       if (state.gap?.reason === 'late-gap') return stale('late-gap');
+      if (this.options.stagePrefixesOnDisk && state.revision !== state.durable) return busy();
       if (request.range.start > request.range.end || request.range.end > state.head) throw Error('range outside frozen head');
       if (this.pins.has(request.requestId)) return stale('route');
       const overlay = new Map<number, FinalizedRow>(); let charge = 0;
@@ -641,6 +642,8 @@ export class StreamHistoryEngine implements HistoryEngine {
    */
   close(): { undurableBytes: number } {
     if (this.closed) return { undurableBytes: 0 };
+    if (this.options.stagePrefixesOnDisk && this.db.query('SELECT 1 FROM sh_pane WHERE revision != durable LIMIT 1').get())
+      throw Error('stream close refused: staged packet lacks final checkpoint');
     const undurableBytes = this.ownPending;
     for (const timer of this.recoveryTimers) clearInterval(timer);
     this.recoveryTimers.clear();

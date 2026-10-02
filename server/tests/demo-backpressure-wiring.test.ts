@@ -87,3 +87,25 @@ test('stream I native C-H-D: quiet attach, bounded pages, disconnect, checkpoint
     expect(pane.frame.durableRevision).toBe(pane.frame.revision);
   }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
 },30000);
+
+test('stream I atomic multi-page input retries an admitted prefix without duplicate rows',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'stream-i-prefix-'));
+ const runtime=new StreamRuntime({path:join(root,'stream.sqlite')});
+ try{
+  const pane=await runtime.add(streamTestIdentity,{columns:20,rows:4},streamPorts);
+  const history=runtime.history!,append=history.appendFinalized.bind(history);let calls=0;
+  history.appendFinalized=async request=>{
+   calls++;
+   if(calls===2)return{status:'busy',reason:'pressure',retryAfterMs:1};
+   return append(request);
+  };
+  await pane.ingest(Buffer.from('\x1b[600S'));
+  expect(calls).toBeGreaterThan(3);
+  expect(pane.frame.head).toBe(600);
+  expect(pane.frame.revision).toBe(3);
+  expect(pane.frame.durableRevision).toBe(3);
+  expect(history.stats().ownedPendingBytes).toBe(0);
+  expect(runtime.scratch.heldBytes).toBe(0);
+  expect(runtime.admission.heldBytes).toBe(0);
+ }finally{await runtime.close();await rm(root,{recursive:true,force:true});}
+},30000);
