@@ -628,7 +628,8 @@ test('stream I host rollback: planned route switch and shutdown commit one durab
     const receipt=await rig.host.setRoute('s','legacy');
     expect(receipt).toMatchObject({ok:true,from:'newarch',to:'legacy'});
     // Our writer is detached before the legacy path is told to attach its own.
-    expect(rig.events.slice(-2)).toEqual(['stop:s','route:s:false']);
+    // Exactly one route announcement, and only after the pipe was stopped.
+    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false']);
     expect(rig.host.projection.owns('s')).toBe(false);
     const catalog=rig.host.archive!.catalog;
     expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',generation:2,globalStart:F,localStart:0});
@@ -668,8 +669,7 @@ test('stream I source EOF: no reopen, durable unresolved gap, rows kept, pane ha
     const catalog=rig.host.archive!.catalog;
     for(let i=0;i<200&&catalog.owner(rig.identity.pane)?.route!=='legacy';i++)await Bun.sleep(10);
     expect(catalog.owner(rig.identity.pane)).toMatchObject({route:'legacy',globalStart:F,generation:2});
-    expect(rig.events.filter(e=>e==='stop:s')).toHaveLength(1);
-    expect(rig.events.at(-1)).toBe('route:s:false');
+    expect(rig.events).toEqual(['start','route:s:true','stop:s','route:s:false']);
     const durable=rig.host.archive!.rows!.durable(rig.identity.pane)!;
     // C fenced the episode durably at EOF; the catalog seam is its final verdict.
     expect(durable.gap).toMatchObject({reason:'eof',missingCount:null,lastAdmittedRow:F-1});
