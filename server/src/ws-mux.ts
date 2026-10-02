@@ -1184,6 +1184,7 @@ export class TmuxWsMux<
    * immediate captures, pipe debounces) and stop active pipes. For hosts
    * that create short-lived muxes (tests, per-request servers). */
   stop() {
+    this.projectedHistoryLifetimes = new WeakMap();
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
     if (this.burstTimer) { clearTimeout(this.burstTimer); this.burstTimer = null; }

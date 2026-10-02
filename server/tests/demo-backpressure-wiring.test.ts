@@ -135,7 +135,7 @@ test('stream I viewer admission is global across panes and releases on disconnec
 
 import { TmuxWsMux as SourceMux, type TmuxDriver, type MuxProjectionSource } from '../src/ws-mux';
 for (const completion of ['resolve','reject'] as const) {
- for (const transition of ['route','rejoin','current'] as const) {
+ for (const transition of ['route','rejoin','stop','current'] as const) {
   test(`stream I async history ${completion} is fenced across ${transition}`, async () => {
    let resolve!: (page: unknown) => void, reject!: (error: Error) => void;
    const pending = new Promise<unknown>((yes,no) => { resolve=yes; reject=no; });
@@ -156,6 +156,7 @@ for (const completion of ['resolve','reject'] as const) {
     mux.subscribe('pane',keeper); mux.subscribe('pane',ws);
     mux.expandHistory('pane',ws,null,20);
     if(transition==='route')generation++;
+    if(transition==='stop')mux.stop();
     if(transition==='rejoin'){mux.unsubscribe('pane',ws);mux.subscribe('pane',ws);}
     if(completion==='resolve')resolve({lines:['current row'],startLine:0,hasMore:false});
     else reject(Error('history read failed'));
