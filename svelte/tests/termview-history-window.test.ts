@@ -2408,4 +2408,164 @@ describe("TermView sliding archive window", () => {
       expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).toBeNull();
     });
   });
+  describe("NEWARCH D flag-on history states", () => {
+    const PANE = { serverIdentity: "srv-d", paneId: "%7", birthGeneration: 1 };
+    const CURSOR = { version: 1, token: "opaque-h" };
+    const CAPS = { extensionVersion: 1, supported: ["history-states-v1"], required: ["history-states-v1"] };
+    const UNKNOWN_GAP = {
+      version: 1, episodeId: "ep-ui", parentEpisodeId: null, pane: PANE,
+      leftRowId: { pane: PANE, segmentId: "seg-1", rowOrdinal: 4 }, rightSegmentId: "seg-2",
+      reason: "collector-exit", countKind: "unknown", missingCount: null, withheldRows: 0, lowerBound: 0,
+      openedAt: 1, closedAt: null, clockEpoch: "clock-ui", quality: "degraded",
+    };
+    const PENDING_BLOCK = { kind: "blocked", cursor: CURSOR, state: { kind: "pending", operationId: "op-ui", retryAfterMs: 100 } };
+
+    function deliverFlagOnHistory(
+      startLine: number | null,
+      lines: string[],
+      hasMore: boolean,
+      flagOn: unknown,
+      totalArchivedLines?: number,
+    ): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      sessionCallback(JSON.stringify({
+        lines,
+        startLine,
+        endLine: startLine === null ? null : startLine + lines.length,
+        hasMore,
+        ...(totalArchivedLines === undefined ? {} : { totalArchivedLines }),
+        flagOn,
+      }), "history");
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function statusNotes(target: HTMLElement): Array<{ kind: string | null; text: string }> {
+      return [...target.querySelectorAll<HTMLElement>('[data-testid="mtv-history-status"]')]
+        .map(note => ({ kind: note.getAttribute("data-history-state"), text: note.textContent?.trim() ?? "" }));
+    }
+
+    test("RD-01/UI: an empty pending page is not EOF; the note shows and the same cursor is asked again", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(viewport.getAttribute("data-history-states")).toBe("pending");
+      expect(statusNotes(target)).toEqual([{ kind: "pending", text: "กำลังกู้ประวัติช่วงนี้ — ยังไม่ใช่จุดสิ้นสุด" }]);
+
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([
+        { direction: "before", cursor: null, limit: 2_000 },
+        { direction: "before", cursor: null, limit: 2_000 },
+      ]);
+      // A clean page replaces this edge's states: the pending note is gone.
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS, states: [{ kind: "exact" }],
+        before: { kind: "more", cursor: CURSOR }, after: { kind: "end" },
+      });
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      expect(statusNotes(target)).toEqual([]);
+      expect(viewport.getAttribute("data-history-states")).toBeNull();
+    });
+
+    test("UI: gap/remote/pressure states render as notes; unknown is words, not 0, and never enter copy or rows", async () => {
+      const { app, target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS,
+        states: [
+          { kind: "gap", gap: UNKNOWN_GAP },
+          { kind: "remote-required", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui" },
+          { kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 9 },
+          { kind: "degraded", episodeId: "ep-ui", uncertainFields: ["savedCursor"] },
+        ],
+        before: { kind: "blocked", cursor: CURSOR, state: { kind: "remote-unavailable", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui", retryAfterMs: 1000, reason: "offline" } },
+        after: { kind: "end" },
+      });
+      await settleUi();
+      const notes = statusNotes(target);
+      expect(notes.map(note => note.kind)).toEqual(["gap", "remote-required", "pressure", "degraded", "remote-unavailable"]);
+      expect(notes[0]!.text).toBe("ช่วงนี้เก็บประวัติไม่ครบ — จำนวนไม่ทราบ");
+      expect(notes[0]!.text).not.toMatch(/\d/);
+      expect(notes[1]!.text).toBe("ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน");
+      expect(notes[2]!.text).toBe("หยุดเก็บประวัติ — พื้นที่ไม่พอ");
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      // Notes live outside every terminal row.
+      for (const note of target.querySelectorAll('[data-testid="mtv-history-status"]')) {
+        expect(note.closest(".mtv-line")).toBeNull();
+        expect(note.closest(".mtv-loss-notes")).not.toBeNull();
+      }
+      const rowText = [...target.querySelectorAll(".mtv-line")].map(row => row.textContent ?? "").join("\n");
+      // Copy-all is built from terminal rows only.
+      const copied: string[] = [];
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text: string) => { copied.push(text); } },
+      });
+      try {
+        expect(await (app.copyAll as () => Promise<boolean>)()).toBe(true);
+      } finally {
+        if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+        else Reflect.deleteProperty(navigator, "clipboard");
+      }
+      expect(copied).toHaveLength(1);
+      expect(copied[0]).toContain("archive-18000");
+      const lastLines = deliveredLines.at(-1) ?? [];
+      for (const note of notes) {
+        expect(rowText).not.toContain(note.text);
+        expect(copied[0]).not.toContain(note.text);
+        expect(lastLines.join("\n")).not.toContain(note.text);
+      }
+    });
+
+    test("pages whose states cannot be read, or that contradict hasMore, are refused (not EOF, not drawn)", async () => {
+      const lying: Array<[string, boolean, unknown]> = [
+        ["unknown count as 0", true, { version: 1, capabilities: CAPS, states: [{ kind: "gap", gap: { ...UNKNOWN_GAP, missingCount: 0 } }], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["blocked but hasMore false", false, { version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["end but hasMore true", true, { version: 1, capabilities: CAPS, states: [], before: { kind: "end" }, after: { kind: "end" } }],
+        ["unknown capability", true, { version: 1, capabilities: { ...CAPS, supported: ["history-states-v1", "x-v9"] }, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+      ];
+      for (const [name, hasMore, flagOn] of lying) {
+        const { target, viewport } = mountTermView();
+        await tick();
+        deliverOutput(liveLines());
+        wheel(viewport, -1_000_000);
+        deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), hasMore, flagOn);
+        expect([name, viewport.getAttribute("data-history-window-start")]).toEqual([name, null]);
+        expect([name, viewport.getAttribute("data-history-stop")]).toEqual([name, "none"]);
+        expect([name, statusNotes(target)]).toEqual([name, []]);
+        for (const entry of mounted.splice(0)) {
+          unmount(entry.app);
+          entry.target.remove();
+        }
+      }
+    });
+
+    test("ceiling paging: a blocked empty page keeps the archive open instead of exhausted", async () => {
+      const { target, viewport } = mountTermView({ historyPaging: "ceiling" });
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(1);
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      await settleUi();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(statusNotes(target).map(note => note.kind)).toEqual(["pending"]);
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(2);
+    });
+  });
 });
