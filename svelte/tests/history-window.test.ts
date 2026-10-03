@@ -579,3 +579,170 @@ describe('NEWARCH D flag-on state labels and wire validation', () => {
     expect(parseNewarchHistoryExtension(flagExtension()) as NewarchHistoryExtension | null).not.toBeNull();
   });
 });
+
+// ── NEWARCH D-fix R13/R18: repair incident + opaque cursor across remote ──
+// Literal fixtures. The code under test must not be the source of expected values.
+
+const REPAIR_CAPS = {
+  revision: 2,
+  supported: ['incident-r2', 'timeline-replay-r2'],
+  required: ['incident-r2'],
+};
+const INCIDENT_WALL_MS = 1_700_000_000_123;
+const INCIDENT_ID = 'incident-storage-7';
+const INCIDENT_ROW = { pane: FLAG_PANE, segmentId: 'seg-9', rowOrdinal: 41 };
+function pressureIncident(overrides: Record<string, unknown> = {}) {
+  return {
+    revision: 2,
+    incidentId: INCIDENT_ID,
+    pane: FLAG_PANE,
+    leftRowId: INCIDENT_ROW,
+    openedAtWallMs: INCIDENT_WALL_MS,
+    openedAtMonoMs: 80,
+    clockEpoch: 'clock-d',
+    collecting: false,
+    reason: 'storage-outage',
+    quality: 'degraded',
+    resolvedAtWallMs: null,
+    ...overrides,
+  };
+}
+function repairEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return flagExtension({
+    repair: REPAIR_CAPS,
+    states: [{
+      kind: 'pressure',
+      level: 'emergency',
+      collecting: false,
+      sinceMonoMs: 5,
+      repair: pressureIncident(),
+    }],
+    before: {
+      kind: 'blocked',
+      cursor: { version: 1, token: 'opaque-remote-T' },
+      state: { kind: 'remote-required', range: FLAG_RANGE, bundleId: 'bundle-0' },
+    },
+    ...overrides,
+  });
+}
+
+describe('NEWARCH D-fix R18 pressure incident from the backend', () => {
+  test('a repair envelope without a real incident is refused, never drawn as a v1 pressure', () => {
+    const refused: Array<[string, Record<string, unknown>]> = [
+      ['pressure has no incident', { states: [{ kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5 }] }],
+      ['leftRowId is 0', { states: [{ kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5, repair: pressureIncident({ leftRowId: 0 }) }] }],
+      ['wall time missing', { states: [{ kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5, repair: pressureIncident({ openedAtWallMs: undefined }) }] }],
+      ['collecting disagrees', { states: [{ kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5, repair: pressureIncident({ collecting: true }) }] }],
+      ['unknown repair capability', { repair: { revision: 2, supported: ['telepathy-r2'], required: [] } }],
+      ['repair revision 1', { repair: { ...REPAIR_CAPS, revision: 1 } }],
+    ];
+    for (const [name, overrides] of refused) {
+      expect([name, parseNewarchHistoryExtension(repairEnvelope(overrides))]).toEqual([name, null]);
+    }
+    // A v1 page that never claimed repair still parses. Boot keeps old records.
+    expect(parseNewarchHistoryExtension(flagExtension())).not.toBeNull();
+  });
+
+  test('the note keeps backend wall time and leftRowId beside the sentence, never inside row text', () => {
+    const extension = parseNewarchHistoryExtension(repairEnvelope());
+    expect(extension).not.toBeNull();
+    const note = historyStatusNotes(extension!).find(item => item.kind === 'pressure') as {
+      text: string;
+      openedAtWallMs?: number;
+      incidentId?: string;
+      leftRowId?: { segmentId: string; rowOrdinal: number } | null;
+    };
+    expect(note.text).toBe('หยุดเก็บประวัติ — พื้นที่ไม่พอ');
+    expect(note.text).not.toContain(String(INCIDENT_WALL_MS));
+    expect(note.text).not.toContain(INCIDENT_ID);
+    expect(note.openedAtWallMs).toBe(INCIDENT_WALL_MS);
+    expect(note.openedAtWallMs).not.toBe(5);
+    expect(note.incidentId).toBe(INCIDENT_ID);
+    expect(note.leftRowId).toEqual(INCIDENT_ROW);
+
+    const beforeFirstRow = parseNewarchHistoryExtension(repairEnvelope({
+      states: [{
+        kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5,
+        repair: pressureIncident({ leftRowId: null }),
+      }],
+    }));
+    const nullNote = historyStatusNotes(beforeFirstRow!).find(item => item.kind === 'pressure') as {
+      leftRowId?: { rowOrdinal: number } | null;
+    };
+    expect(nullNote.leftRowId).toBeNull();
+
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    const applied = applyHistoryWindowPage(state, {
+      direction: 'before', anchorLine: 100, startLine: 98, lines: rows(98, 2),
+      hasMore: true, continuation: 'blocked',
+    }, { anchor: anchor(101) });
+    if (applied.kind === 'rejected') throw new Error(applied.message);
+    const banned = [note.text, INCIDENT_ID, String(INCIDENT_WALL_MS), 'seg-9'];
+    for (const line of applied.state.lines) {
+      for (const piece of banned) expect(line).not.toContain(piece);
+    }
+  });
+});
+
+describe('NEWARCH D-fix R13 cursor across a local/remote seam', () => {
+  test('the opaque cursor is copied unchanged and an empty remote page does not reseed', () => {
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    const handed = { version: 1 as const, token: 'opaque-remote-T' };
+    const local = applyHistoryWindowPage(state, {
+      direction: 'before',
+      anchorLine: 100,
+      startLine: 98,
+      lines: rows(98, 2),
+      hasMore: true,
+      continuation: 'more',
+      flagOnCursor: handed,
+    } as Parameters<typeof applyHistoryWindowPage>[1], { anchor: anchor(101) });
+    if (local.kind === 'rejected') throw new Error(local.message);
+    handed.token = 'mutated-by-caller';
+    const stored = (local.state as { flagOnCursorBefore?: { version: number; token: string } | null }).flagOnCursorBefore;
+    expect(stored).toEqual({ version: 1, token: 'opaque-remote-T' });
+    expect(local.state.startLine).toBe(98);
+    expect(local.anchor.line).toBe(101);
+
+    const remote = applyHistoryWindowPage(local.state, {
+      direction: 'before',
+      anchorLine: 98,
+      startLine: null,
+      lines: [],
+      hasMore: true,
+      continuation: 'blocked',
+      flagOnCursor: { version: 1, token: 'opaque-remote-T' },
+    } as Parameters<typeof applyHistoryWindowPage>[1], { anchor: anchor(101) });
+    if (remote.kind === 'rejected') throw new Error(remote.message);
+    expect(remote.kind).toBe('blocked');
+    expect(remote.state.startLine).toBe(98);
+    expect(remote.state.lines).toEqual(rows(98, 5));
+    expect(remote.state.hasOlder).toBe(true);
+    expect(remote.anchor.line).toBe(101);
+    expect((remote.state as { flagOnCursorBefore?: { token: string } }).flagOnCursorBefore?.token).toBe('opaque-remote-T');
+    expect(historyWindowRequestCursor(remote.state, 'before')).toEqual({
+      direction: 'before',
+      beforeLine: 98,
+      flagOnCursor: { version: 1, token: 'opaque-remote-T' },
+    });
+  });
+
+  test('a blocked page with a cursor D cannot read is refused, not stored as a new timeline', () => {
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    const bad = applyHistoryWindowPage(state, {
+      direction: 'before',
+      anchorLine: 100,
+      startLine: null,
+      lines: [],
+      hasMore: true,
+      continuation: 'blocked',
+      flagOnCursor: { version: 2, token: 'not-this-revision' },
+    } as Parameters<typeof applyHistoryWindowPage>[1], { anchor: anchor(101) });
+    expect(bad.kind).toBe('rejected');
+    if (bad.kind === 'rejected') {
+      expect(bad.reason).toBe('invalid-page');
+      expect(bad.state.startLine).toBe(100);
+      expect(bad.state.lines).toEqual(rows(100, 3));
+    }
+  });
+});
