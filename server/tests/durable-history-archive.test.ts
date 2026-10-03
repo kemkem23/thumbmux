@@ -19,8 +19,8 @@ import {
   archiveInventoryMatches, streamCanonical, streamDigest,
 } from "../src/stream-contract";
 import type {
-  ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, CommittedStreamRow, Coverage, FlagOnHistoryPort, Gap, PaneKey,
-  RemoteObject, RowsAndGapsCommit, SealedExport, SpoolAck, SpoolRecord, StoragePressure, VtCheckpoint,
+  ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, CommittedStreamRow, Coverage, FlagOnHistoryPort, Gap, LogicalSealR2, PaneKey,
+  RemoteAuthorizationR2, RemoteObject, RowsAndGapsCommit, SealedExport, SpoolAck, SpoolRecord, StoragePressure, VtCheckpoint,
 } from "../src/stream-contract";
 
 let root = "";
@@ -549,69 +549,156 @@ function oJournal(hist: string) {
   });
 }
 
-test("R19 real H and real A re-read the owner generation at commit and keep the seal generation", async () => {
+/** Real A behind a recorder: the test sees the exact authorization O sent. */
+function recordingCatalog(catalog: StreamArchiveCatalog, requests: RemoteAuthorizationR2[]) {
+  return { async commitRemoteIndex(req: RemoteAuthorizationR2) { requests.push(req); return catalog.commitRemoteIndex(req); } };
+}
+function logicalSeal(sealed: SealedExport, rawEnd: number): LogicalSealR2 {
+  return { revision: 2, sealCommitId: sealed.sealCommitId, sealGeneration: sealed.generation, pane: sealed.pane, segmentId: sealed.segmentId,
+    coverage: sealed.coverage, rawRanges: [{ epoch: { pane: OP, attachId: "attach-O", collectorIncarnation: "collector-O" }, start: 0, end: rawEnd }],
+    checkpointIds: ["cp-O"], timelineIndexCommitId: "timeline-O", replayIndexCommitId: "replay-O" };
+}
+const O_RAW_BYTES = Buffer.byteLength("แถว O\nแถว O\n");
+// Until A-fix/H-fix land R2 commit/reclaim, real A refuses the R2 inventory at its v1
+// identity check; either way the local seal must stay until A committed AND H reclaimed.
+function failClosed(result: { status: string }, state: string | undefined, kept: boolean) {
+  return result.status === "ok" ? { state } : { state, kept };
+}
+
+test("R19 real H and real A: the owner generation is re-read at commit and the seal keeps its own generation", async () => {
   let store: FlagOnHistoryStore | undefined;
   let catalog: StreamArchiveCatalog | undefined;
   try {
     const opened = await oHistory();
     store = opened.store;
+    store.setGeneration(OP, 0, 1);
     const catalogPath = join(root, "catalog.sqlite");
     catalog = new StreamArchiveCatalog(catalogPath);
     catalog.initialize(oOwner(opened.hist, 1));
     const remoteDir = join(root, "remote");
     mkdirSync(remoteDir, { recursive: true });
-    const remote = new RecordingRemote(new RcloneRemote({ location: `:local:${remoteDir}`, cacheDir: join(root, "rclone-cache") }), () => writeOwner(catalogPath, oOwner(opened.hist, 2)));
+    // The owner moves G=1 → G+1=2 while the bundle uploads; A and H learn it together.
+    const remote = new RecordingRemote(new RcloneRemote({ location: `:local:${remoteDir}`, cacheDir: join(root, "rclone-cache") }), () => {
+      if (catalog!.owner(OP)?.generation === 1) { writeOwner(catalogPath, oOwner(opened.hist, 2)); store!.setGeneration(OP, 1, 2); }
+    });
+    const requests: RemoteAuthorizationR2[] = [];
     const worker = new ArchiveWorker({
-      root: opened.hist, storeUUID: store.storeUUID, remote, history: store, catalog,
-      candidates: { async listEligible() { return { status: "ok" as const, value: [{ pane: OP, segmentId: opened.ack.segmentId, generation: 0, pinned: false }] }; } },
+      root: opened.hist, storeUUID: store.storeUUID, remote, history: store, catalog: recordingCatalog(catalog, requests),
+      candidates: { async listEligible() { return { status: "ok" as const, value: [{ pane: OP, segmentId: opened.ack.segmentId, generation: 1, pinned: false }] }; } },
+      currentGeneration: async (pane) => ({ status: "ok" as const, value: catalog!.owner(pane)?.generation ?? 0 }),
       random: () => 0.5,
     });
     const result = await worker.archiveOnce(HIGH, NEVER);
     const record = oJournal(opened.hist)[0];
     const message = result.status === "error" ? result.message : "";
-    expect({
-      ownerGeneration: catalog.owner(OP)?.generation ?? null,
-      status: result.status,
-      identity: message.includes("remote verification identity"),
-      cas: message.includes("catalog owner CAS"),
-      repair: record?.bundle?.repair?.revision ?? null,
-      sealGeneration: record?.bundle?.repair?.inventory.sealGeneration ?? null,
-      checkpoints: record?.bundle?.checkpointIds ?? [],
-      rawRanges: record?.bundle?.rawRanges?.length ?? 0,
-      kept: existsSync(join(opened.hist, `${opened.ack.segmentId}.jsonl`)),
-    }).toEqual({
-      ownerGeneration: 2, status: "error", identity: true, cas: false, repair: 2, sealGeneration: 0,
-      checkpoints: ["cp-O"], rawRanges: 1, kept: true,
-    });
+    expect(requests.map((r) => ({ expected: r.expectedGeneration, revision: r.revision, seal: r.inventory?.sealGeneration ?? null,
+      sealed: r.sealed.generation, matches: r.inventory ? archiveInventoryMatches(r.sealed, r.verified.bundle, r.inventory) : false })))
+      .toEqual([{ expected: 2, revision: 2, seal: 1, sealed: 1, matches: true }]);
+    expect(message.includes("catalog owner CAS")).toBe(false);
+    // rawRanges/checkpointIds come out of H's own sealed payload, not [] placeholders.
+    expect({ checkpoints: record?.bundle?.checkpointIds ?? [], rawRanges: (record?.bundle?.rawRanges ?? []).map((r) => [r.start, r.end]),
+      source: (record?.bundle as { repair?: { metadataSource?: string } } | null)?.repair?.metadataSource ?? null })
+      .toEqual({ checkpoints: ["cp-O"], rawRanges: [[0, O_RAW_BYTES]], source: "payload-scan" });
+    expect(failClosed(result, record?.state, existsSync(join(opened.hist, `${opened.ack.segmentId}.jsonl`))))
+      .toEqual(result.status === "ok" ? { state: "LOCAL_RECLAIMED" } : { state: "VERIFIED_REMOTE", kept: true });
   } finally { store?.close(); catalog?.close(); }
 });
 
-test("R19 a sealed pane that listEligible omits is still archived from the durable seal files", async () => {
+test("R19 a sealed pane that listEligible omits is archived from H's durable listSealed, page by page", async () => {
   let store: FlagOnHistoryStore | undefined;
   let catalog: StreamArchiveCatalog | undefined;
   try {
     const opened = await oHistory();
     store = opened.store;
-    const sealed = oAck(await store.sealExport({ operationId: "seal-direct", pane: OP, expectedGeneration: 0, segmentId: opened.ack.segmentId }));
+    store.setGeneration(OP, 0, 1);
+    const sealed = oAck(await store.sealExport({ operationId: "seal-direct", pane: OP, expectedGeneration: 1, segmentId: opened.ack.segmentId }));
     catalog = new StreamArchiveCatalog(join(root, "catalog.sqlite"));
+    catalog.initialize(oOwner(opened.hist, 1));
     const remoteDir = join(root, "remote");
     mkdirSync(remoteDir, { recursive: true });
     const remote = new RcloneRemote({ location: `:local:${remoteDir}`, cacheDir: join(root, "rclone-cache") });
+    const cursors: (string | null)[] = [];
+    const requests: RemoteAuthorizationR2[] = [];
+    const h = store;
     const worker = new ArchiveWorker({
-      root: opened.hist, storeUUID: store.storeUUID, remote, history: store, catalog,
+      root: opened.hist, storeUUID: store.storeUUID, remote, catalog: recordingCatalog(catalog, requests),
+      history: {
+        sealExport: (r) => h.sealExport(r), reclaimVerified: (r) => h.reclaimVerified(r),
+        // The pane is no longer live: only H's durable sealed list still names it.
+        listSealed: (cursor) => { cursors.push(cursor); return { status: "ok" as const, value: cursor === null
+          ? { seals: [], next: "page-2" } : { seals: [logicalSeal(sealed, O_RAW_BYTES)], next: null } }; },
+      },
       candidates: { async listEligible() { return { status: "ok" as const, value: [] }; } },
       random: () => 0.5,
     });
     const result = await worker.archiveOnce(HIGH, NEVER);
-    const message = result.status === "error" ? result.message : "";
-    const idle = result.status === "ok" && "state" in result.value && result.value.state === "idle" ? (result.value as { reason: string }).reason : null;
-    expect({
-      status: result.status, idle, ops: oJournal(opened.hist).length,
-      identity: message.includes("remote verification identity"),
-      cas: message.includes("catalog owner CAS"),
-      kept: existsSync(sealed.files[0]!.path),
-    }).toEqual({ status: "error", idle: null, ops: 1, identity: true, cas: false, kept: true });
+    const journal = oJournal(opened.hist);
+    const record = journal[0] as (typeof journal)[number] & { candidate?: { seal?: LogicalSealR2 } };
+    expect({ cursors, ops: journal.length, seal: record?.candidate?.seal?.sealCommitId ?? null,
+      source: (record?.bundle as { repair?: { metadataSource?: string } } | null)?.repair?.metadataSource ?? null,
+      checkpoints: record?.bundle?.checkpointIds ?? [], committed: requests.map((r) => r.sealed.sealCommitId) })
+      .toEqual({ cursors: [null, "page-2"], ops: 1, seal: sealed.sealCommitId, source: "seal-index", checkpoints: ["cp-O"], committed: [sealed.sealCommitId] });
+    expect(failClosed(result, record?.state, existsSync(sealed.files[0]!.path)))
+      .toEqual(result.status === "ok" ? { state: "LOCAL_RECLAIMED" } : { state: "VERIFIED_REMOTE", kept: true });
   } finally { store?.close(); catalog?.close(); }
+});
+
+test("R13 empty-root restore of a real H export reads rows, RowIds, gaps, raw ranges, checkpoint and index back; tamper is corrupt", async () => {
+  let store: FlagOnHistoryStore | undefined;
+  try {
+    const opened = await oHistory();
+    store = opened.store;
+    const remoteDir = join(root, "remote");
+    mkdirSync(remoteDir, { recursive: true });
+    const location = `:local:${remoteDir}`;
+    const remote = new RcloneRemote({ location, cacheDir: join(root, "rclone-cache") });
+    const committed: string[] = [];
+    const worker = new ArchiveWorker({
+      root: opened.hist, storeUUID: store.storeUUID, remote, history: store,
+      catalog: { async commitRemoteIndex(req: RemoteAuthorizationR2) { committed.push(req.sealed.segmentId); return { status: "ok" as const, value: {
+        kind: "remote-index-committed" as const, catalogVersion: 3 as const, commitId: "remote-O", generation: req.expectedGeneration, verified: req.verified, coverage: req.sealed.coverage } }; } },
+      candidates: { async listEligible() { return { status: "ok" as const, value: [{ pane: OP, segmentId: opened.ack.segmentId, generation: 0, pinned: false }] }; } },
+      random: () => 0.5,
+    });
+    await worker.archiveOnce(HIGH, NEVER);
+    expect(committed).toEqual([opened.ack.segmentId]);
+    const original = oJournal(opened.hist)[0]!.sealed!;
+    store.close(); store = undefined;
+
+    // A brand-new root: no H store, no catalog, no journal — only the remote.
+    const fresh = emptyRoot("fresh-root");
+    const range = { pane: OP, segmentId: opened.ack.segmentId, start: 0, end: 2 };
+    const common = ["--root", fresh, "--pane", JSON.stringify(OP), "--segment", range.segmentId, "--start", "0", "--end", "2"];
+    const restored = Bun.spawnSync([process.execPath, CLI, "restore", "--store", original.storeUUID, "--remote", location, ...common]);
+    expect(restored.exitCode).toBe(0);
+    const restoredOut = JSON.parse(restored.stdout.toString()) as { contents: { rows: number; gaps: number; checkpointIds: string[] } };
+    expect(restoredOut.contents).toMatchObject({ rows: 2, gaps: 1, checkpointIds: ["cp-O"] });
+
+    const read = Bun.spawnSync([process.execPath, CLI, "read", ...common]);
+    expect(read.exitCode).toBe(0);
+    const out = JSON.parse(read.stdout.toString()) as {
+      cacheId: string; rowText: string[]; rowIds: unknown[]; gapList: Gap[]; rawRanges: { start: number; end: number }[];
+      checkpointIds: string[]; index: { coverage: unknown };
+    };
+    expect({ rowText: out.rowText, rowIds: out.rowIds, gaps: out.gapList.map((g) => g.episodeId),
+      raw: out.rawRanges.map((r) => [r.start, r.end]), checkpoints: out.checkpointIds, coverage: out.index.coverage })
+      .toEqual({ rowText: ["แถว O", "แถว O"], rowIds: [0, 1].map((rowOrdinal) => ({ pane: OP, segmentId: range.segmentId, rowOrdinal })),
+        gaps: ["rows-O-gap"], raw: [[0, O_RAW_BYTES]], checkpoints: ["cp-O"], coverage: original.coverage });
+
+    // Durable pins survive the process; a released pin cannot be released twice.
+    const pinned = Bun.spawnSync([process.execPath, CLI, "pin", "--root", fresh, "--cache-id", out.cacheId, "--reason", "reader"]);
+    expect(pinned.exitCode).toBe(0);
+    const pin = (JSON.parse(pinned.stdout.toString()) as { pin: { pinId: string } }).pin;
+    expect(Bun.spawnSync([process.execPath, CLI, "release", "--root", fresh, "--pin", JSON.stringify(pin)]).exitCode).toBe(0);
+    expect(Bun.spawnSync([process.execPath, CLI, "release", "--root", fresh, "--pin", JSON.stringify(pin)]).exitCode).toBe(5);
+
+    // A changed cache byte is corrupt (exit 5), never a quietly empty read.
+    const member = join(fresh, "restore-cache", out.cacheId, `${range.segmentId}.jsonl`);
+    chmodSync(join(fresh, "restore-cache", out.cacheId), 0o700); chmodSync(member, 0o600);
+    writeFileSync(member, readFileSync(member, "utf8").replace("แถว O", "แถว X"));
+    const tampered = Bun.spawnSync([process.execPath, CLI, "read", ...common]);
+    expect(tampered.exitCode).toBe(5);
+  } finally { store?.close(); }
 });
 
 test("R19 a symlink seal member is refused before any remote put", async () => {

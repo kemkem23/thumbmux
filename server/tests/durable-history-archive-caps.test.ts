@@ -11,8 +11,8 @@ import {
 import type {
   ArchiveCandidate, ArchiveCandidateSource, RemoteResult, RemoteStore,
 } from "../../../../src/integrations/stream-history-offload";
-import { archiveInventoryMatches } from "../src/stream-contract";
-import type { ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, FlagOnHistoryPort, PaneKey, SealedExport, StoragePressure } from "../src/stream-contract";
+import { archiveInventoryDigest, archiveInventoryMatches } from "../src/stream-contract";
+import type { ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, FlagOnHistoryPort, PaneKey, RemoteAuthorizationR2, SealedExport, StoragePressure } from "../src/stream-contract";
 
 let root = "";
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "thumbmux-caps-")); });
@@ -212,6 +212,12 @@ class Synthetic implements Pick<FlagOnHistoryPort, "sealExport" | "reclaimVerifi
   events: string[] = [];
   crash: { commit?: boolean; reclaim?: boolean } = {};
   lostAck: { ids: string[] } | null = null;
+  /** Current owner generation; R2 receipts name it, v1 receipts only the seal generation. */
+  current = 1;
+  r2 = false;
+  bumpAfterCommit = false;
+  readonly commits: RemoteAuthorizationR2[] = [];
+  readonly reclaimFences: number[] = [];
   readonly original: Record<string, string> = {};
   constructor(readonly base: string, readonly remoteDir: string, readonly segments: string[], bytes = 3000) {
     for (const id of segments) {
@@ -244,12 +250,21 @@ class Synthetic implements Pick<FlagOnHistoryPort, "sealExport" | "reclaimVerifi
         return { status: "error" as const, code: "integrity" as const, message: "catalog remote retry readback mismatch" };
     }
     if (this.crash.commit) { this.crash.commit = false; throw new Error("injected crash before catalog commit"); }
+    const auth = req as RemoteAuthorizationR2;
+    this.commits.push(auth);
+    if (auth.expectedGeneration !== this.current) return { status: "error" as const, code: "integrity" as const, message: "catalog owner CAS" };
     this.events.push(`commit:${req.sealed.segmentId}`);
-    return { status: "ok" as const, value: { kind: "remote-index-committed" as const, catalogVersion: 3 as const, commitId: `c-${req.sealed.segmentId}`,
-      generation: 1, verified: req.verified, coverage: req.sealed.coverage } };
+    const base = { kind: "remote-index-committed" as const, catalogVersion: 3 as const, commitId: `c-${req.sealed.segmentId}`,
+      generation: this.current, verified: req.verified, coverage: req.sealed.coverage };
+    if (this.bumpAfterCommit) this.current++;
+    if (!this.r2) return { status: "ok" as const, value: base };
+    return { status: "ok" as const, value: { ...base, repair: { revision: 2 as const, sealCommitId: auth.sealed.sealCommitId,
+      sealGeneration: auth.inventory.sealGeneration, inventoryDigest: archiveInventoryDigest(auth.inventory), authorizationGeneration: auth.expectedGeneration } } };
   }
   async reclaimVerified(req: Parameters<FlagOnHistoryPort["reclaimVerified"]>[0]) {
     if (this.crash.reclaim) { this.crash.reclaim = false; throw new Error("injected crash before unlink"); }
+    this.reclaimFences.push(req.expectedGeneration);
+    if (req.expectedGeneration !== this.current) return { status: "error" as const, code: "integrity" as const, message: "owner generation mismatch" };
     // Independent check at the moment of deletion: every remote object exists and hashes to its name.
     for (const o of [...req.remote.verified.bundle.objects, req.remote.verified.bundle.manifest]) {
       const there = join(this.remoteDir, o.objectKey);
@@ -268,7 +283,8 @@ function setup(faults: { put?: Fault[]; get?: Fault[] } = {}, segments = ["seg-a
   const remote = new FaultyRemote(new RcloneRemote({ location: `:local:${remoteDir}` }), remoteDir, faults);
   const clock = { now: 0 };
   const make = () => new ArchiveWorker({ root: store, storeUUID: STORE, remote, history: syn, catalog: syn, candidates: syn,
-    monoMs: () => clock.now, random: () => 0.5, scratchBytes: extra.scratchBytes });
+    monoMs: () => clock.now, random: () => 0.5, scratchBytes: extra.scratchBytes,
+    currentGeneration: async () => ({ status: "ok" as const, value: syn.current }) });
   return { store, remoteDir, syn, remote, clock, make, worker: make() };
 }
 function state(r: Awaited<ReturnType<ArchiveWorker["archiveOnce"]>>): string {
@@ -429,4 +445,36 @@ test("DS-01 a lost catalog ACK retries the same verification instead of minting 
   expect(state(await make().archiveOnce(pressure(), NEVER))).toBe("LOCAL_RECLAIMED");
   expect(syn.lostAck.ids).toHaveLength(2);
   expect(syn.lostAck.ids[0]).toBe(syn.lostAck.ids[1]);
+});
+
+test("R19 seal G archived under owner G+1: the CAS fence is re-read at commit, the seal generation stays G", async () => {
+  const { syn, worker, remote } = setup();
+  syn.r2 = true;
+  // The owner moves on while the bundle is uploading; the seal does not.
+  const put = remote.put.bind(remote);
+  remote.put = async (local, key) => { const r = await put(local, key); syn.current = 2; return r; };
+  expect(state(await worker.archiveOnce(HIGH, NEVER))).toBe("LOCAL_RECLAIMED");
+  expect(syn.commits.map((c) => ({ expected: c.expectedGeneration, seal: c.inventory.sealGeneration, revision: c.revision,
+    matches: archiveInventoryMatches(c.sealed, c.verified.bundle, c.inventory) })))
+    .toEqual([{ expected: 2, seal: 1, revision: 2, matches: true }]);
+  expect(syn.reclaimFences).toEqual([2]);
+  expect(syn.localIntact("seg-a")).toBe(false);
+});
+
+test("R19 a v1 receipt cannot reauthorize an older seal, and an owner change after commit blocks reclaim", async () => {
+  const v1 = setup();
+  v1.syn.current = 2; // sealed by H at 1 in this synthetic, owner already at 2
+  const first = await v1.worker.archiveOnce(HIGH, NEVER);
+  expect(first.status === "error" ? first.message : state(first)).toBe("seal generation 1 under owner 2 needs an R2 remote index receipt");
+  expect(v1.syn.reclaimFences).toEqual([]);
+  expect(v1.syn.localIntact("seg-a")).toBe(true);
+  rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true });
+
+  const moved = setup();
+  moved.syn.r2 = true; moved.syn.bumpAfterCommit = true;
+  const second = await moved.worker.archiveOnce(HIGH, NEVER);
+  expect(second.status === "error" ? second.message : state(second)).toBe("owner generation 1→2 after remote commit; reauthorize before reclaim");
+  expect(moved.syn.reclaimFences).toEqual([]);
+  expect(moved.syn.localIntact("seg-a")).toBe(true);
+  expect(moved.worker.status().open.map((o) => o.state)).toEqual(["REMOTE_COMMITTED"]);
 });
