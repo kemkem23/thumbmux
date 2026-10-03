@@ -1349,6 +1349,7 @@ import {
   StreamStitcher, KnownStateTracker, captureStitchRows, stitchRowKey, baselineCellOrigins,
 } from '../src/stream-stitch';
 import type * as SC from '../src/stream-contract';
+import { cellToSemanticCell, gapIdentity, semanticStyleToSgr } from '../src/stream-contract';
 import { STITCH_ORACLE_VECTORS } from '../../../../docs/tasks/newarch-stream/contract-fixture';
 
 const stPane: SC.PaneKey = { serverIdentity: 'st-server', paneId: '%7', birthGeneration: 3 };
@@ -1685,8 +1686,96 @@ describe('NEWARCH C stitch v1 ST-02 seams, origin tags and known state', () => {
     expect(rows.map(r => [r.finalized, r.wrapStatus, r.cells.map(c => c.text).join('')])).toEqual([
       [true, 'unknown', 'h1        '], [true, 'unknown', 'X         '], [false, 'unknown', 'scr       '],
     ]);
-    expect(rows[1]!.cells[0]!.style).toEqual([1, 1, -1]);
+    expect(rows[1]!.cells[0]!.style).toEqual([1, 31]);
+    expect(rows[0]!.cells[0]!.style).toEqual([]);
     expect(rows[2]!.origin).toEqual(capOrigin(2));
     expect(rows[2]!.cellOrigins).toEqual(Array(10).fill(capOrigin(2)));
+  });
+});
+
+describe('NEWARCH C-fix codec, gap identity and quiet recovery', () => {
+  test('canonical colors, default and SGR round-trip; wide text is not trimmed', () => {
+    const packet = stPacket({ historySize: 4, geometry: { columns: 4, rows: 1 } });
+    const rows = captureStitchRows(packet, '    \n\x1b[1;31mX\x1b[0m\n\x1b[38;2;1;2;3mA\x1b[0m\n界\n');
+    const cells = rows.map(row => row.cells[0]!);
+    expect(cells[0]!.style).toEqual([]);
+    expect(cellToSemanticCell(cells[0]!).style).toEqual({ attrs: 0, fg: -1, bg: -1 });
+    expect(cells[1]!.text).toBe('X');
+    expect(cells[1]!.style).toEqual(semanticStyleToSgr({ attrs: 1, fg: 1, bg: -1 }));
+    expect(cellToSemanticCell(cells[1]!)).toEqual({ text: 'X', width: 1, style: { attrs: 1, fg: 1, bg: -1 } });
+    expect(cells[2]!.style).toEqual([38, 2, 1, 2, 3]);
+    expect(cellToSemanticCell(cells[2]!).style).toEqual({ attrs: 0, fg: 256 + 0x010203, bg: -1 });
+    expect(cells[3]).toMatchObject({ text: '界', width: 2, style: [] });
+    expect(cellToSemanticCell(cells[3]!).text).toBe('界');
+  });
+
+  test('quiet recovery: rows in T and empty C/P get one positioned gap and accept nothing', async () => {
+    const r = await new StreamStitcher().stitch(tailOf(letters.slice(0, 8)), captureOf([]), pipeOf([]), stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('content-only');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(r.acceptedRowMap).toEqual([]);
+    expect(r.gaps).toHaveLength(1);
+    expect(r.gaps[0]).toMatchObject({
+      episodeId: 'ep-st', leftRowId: durableId(7), reason: 'unproven-overlap',
+      countKind: 'unknown', missingCount: null, withheldRows: 0,
+    });
+    expect(r.gaps[0]!.missingCount).toBeNull();
+    expect('repair' in r.gaps[0]!).toBe(true);
+    expect(gapIdentity(r.gaps[0]!)).toContain('gap-r2');
+  });
+
+  test('two withheld intervals in one episode have distinct gap identities', async () => {
+    const cap = captureOf([...letters.slice(0, 8), 'n']);
+    const P = pipeOf([
+      pipeRow('x', 100, { uncertain: ['sgr'] }),
+      pipeRow('y', CAPTURE_END),
+      pipeRow('z', CAPTURE_END + 4, { uncertain: ['cursor'] }),
+    ]);
+    const r = await new StreamStitcher().stitch(tailOf(letters.slice(0, 8)), cap, P, stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('unknown-state');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(r.gaps).toHaveLength(2);
+    expect(r.gaps.every(gap => gap.episodeId === 'ep-st')).toBe(true);
+    expect(gapIdentity(r.gaps[0]!)).not.toBe(gapIdentity(r.gaps[1]!));
+    const repairs = r.gaps.map(gap => 'repair' in gap ? (gap as SC.GapR2).repair : null);
+    expect(repairs.map(repair => repair?.sequence)).toEqual([0, 1]);
+    expect(repairs[0]?.gapId).not.toBe(repairs[1]?.gapId);
+    expect(repairs.every(repair => repair?.revision === 2 && repair.update === 0 && repair.state === 'open')).toBe(true);
+    expect(r.gaps.every(gap => gap.missingCount === null && gap.countKind === 'unknown')).toBe(true);
+  });
+
+  test('quiet source shorter than the horizon is opened once', async () => {
+    const short = [0, 1].map(i => ({ cells: [{ text: `q${i}`, width: 1 as const, style: [] as number[] }], softWrap: false, wrapPad: 0, uncertainFields: [] as string[] }));
+    const missing = { cells: [{ text: 'missing', width: 1 as const, style: [] as number[] }], softWrap: false, wrapPad: 0, uncertainFields: [] as string[] };
+    let opens = 0;
+    const repair = new TargetedCaptureRepair({
+      open: async (_episode, horizon) => {
+        opens += 1;
+        expect(horizon).toBeGreaterThan(short.length);
+        return { status: 'ok', value: cRecoveryView(short).view };
+      },
+    }, cIdentity, new CaptureAdmission(33554432));
+    const results = [];
+    for await (const result of repair.chunks(cEpisode(), [missing], [missing], 1, new AbortController().signal)) results.push(result);
+    expect(opens).toBe(1);
+    expect(results).toMatchObject([{ status: 'error', code: 'unresolved-gap', message: 'quiet source has no further rows' }]);
+  });
+
+  test('VT worker emits canonical SGR: default is empty, attrs precede colors, no reset', () => {
+    const script = String.raw`
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('vt',sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+w=m.Worker(4,1)
+assert w.contract_state()['attributes']==[], w.contract_state()['attributes']
+w.feed(1,1,b'\x1b[1;31mX')
+assert w.contract_state()['attributes']==[1,31], w.contract_state()['attributes']
+row=m.contract_row(m.encode_row(w.screen.buffer[0], w.screen.columns, w.screen.default_char), False, False)
+assert row['cells'][0]=={'text':'X','width':1,'style':[1,31]}, row['cells'][0]
+w.feed(2,1,b'\x1b[0m\x1b[48;2;1;2;3m ')
+assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attributes']
+`;
+    const r = Bun.spawnSync(['python3', '-B', '-c', script, new URL('../src/pipe-vt-worker.py', import.meta.url).pathname]);
+    expect(r.exitCode, r.stderr.toString()).toBe(0);
   });
 });
