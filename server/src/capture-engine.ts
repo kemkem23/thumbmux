@@ -887,7 +887,12 @@ export class TargetedCaptureRepair {
           start++;
         }
       }
-      if (hits[0]!.length!==1 || hits[1]!.length!==1) { yield error('unresolved-gap','expired repair anchor'); return; }
+      if (hits[0]!.length!==1 || hits[1]!.length!==1) {
+        // A view shorter than the horizon already returned every retained row.
+        // Opening a wider capture cannot add rows, so a quiet source stops here.
+        yield error('unresolved-gap', view.rowCount < horizon ? 'quiet source has no further rows' : 'expired repair anchor');
+        return;
+      }
       const from=hits[0]![0]!+before.length, end=hits[1]![0]!;
       if (end<from || !(await scope.wait(view.verify(signal)))) { yield error('unresolved-gap','unfenced repair seam'); return; }
       // No rows are published while planning; IDs start exactly at the gap fence.
