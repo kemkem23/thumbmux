@@ -906,7 +906,7 @@ export function replayOrderedControls(request: OrderedControlReadR2, page: Order
     if (!sameContract(event.position.epoch, w.through.epoch)) throw Error('control entry epoch');
     if (event.decoderVersion !== w.decoderVersion) throw Error('control entry decoder version');
     const off = event.position.byteOffset;
-    if (false && (off < prev || (off === prev && event.order <= prevOrder))) throw Error('control entry not after watermark/previous');
+    if (off < prev || (off === prev && event.order <= prevOrder)) throw Error('control entry not after watermark/previous');
     if (event.payload.kind === 'geometry') {
       const { before, after } = event.payload;
       for (const n of [before.columns, before.rows, after.columns, after.rows]) if (!Number.isSafeInteger(n) || n < 1) throw Error('control geometry');
