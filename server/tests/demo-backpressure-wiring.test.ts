@@ -426,12 +426,14 @@ test('T-fix R20 v1 catalogs (round 4/5) migrate once into a typed pending state:
         // %3 held a v1 PREPARED rollback with no fence proof: the migrated
         // state is legacy-unverified-pending with a readable prefix, never a
         // PreparedHandoff and never an error that sends I to a fresh prepare.
-        const pending=await catalog.recoverPending(fixturePane('%3'),{isCancelled:()=>false});
-        console.log(`T-fix R20 ${name} recoverPending(%3) ${JSON.stringify(pending).slice(0,300)}`);
+        const pending=await catalog.r2.recoverPending(fixturePane('%3'),{isCancelled:()=>false});
+        console.log(`T-fix R20 ${name} r2.recoverPending(%3) ${JSON.stringify(pending).slice(0,300)}`);
         expect(pending.status).toBe('ok');
         if(pending.status==='ok')expect(String(pending.value.kind)).toBe('legacy-unverified-pending');
-        const none=await catalog.recoverPending(fixturePane('%9'),{isCancelled:()=>false});
+        const none=await catalog.r2.recoverPending(fixturePane('%9'),{isCancelled:()=>false});
         expect(none.status==='ok'?String(none.value.kind):none.status).toBe('none');
+        const v1=await catalog.recoverPending(fixturePane('%3'),{isCancelled:()=>false});
+        expect(v1.status).toBe('error');
       }finally{catalog.close();}
       const db=new Database(path,{readonly:true});
       expect(db.query('SELECT version FROM sa_format').get()).toEqual({version:ARCHIVE_CATALOG_VERSION});
@@ -958,7 +960,21 @@ async function fxRig(o: FxOpts) {
     /** Judge [from..to] (events before `from` were evicted by tmux before any attach). */
     judge(host: FxHost, from: number, to: number, mode: T11Mode) {
       const t = rig.timeline(host);
-      const actual = t.actual.filter(a => a.kind !== 'row' || !/^E\d{7} /.test(a.text) || Number(a.text.slice(1, 8)) >= from);
+      const stamped = (a: T11Actual): number | null => a.kind === 'row' && /^E\d{7} /.test(a.text) ? Number(a.text.slice(1, 8)) : null;
+      const ids = t.actual.map(stamped);
+      // A gap stays only when the open span between its neighbouring stamped
+      // producer ids meets the asked window. Older gaps remain in timeline().
+      const gapIntersects = (index: number) => {
+        let prev = -Infinity;
+        for (let j = index - 1; j >= 0; j--) if (ids[j] !== null) { prev = ids[j]!; break; }
+        let next = Infinity;
+        for (let j = index + 1; j < ids.length; j++) if (ids[j] !== null) { next = ids[j]!; break; }
+        return prev < to && next > from;
+      };
+      const actual = t.actual.filter((a, i) => {
+        if (a.kind === 'gap') return gapIntersects(i);
+        return a.kind !== 'row' || !/^E\d{7} /.test(a.text) || Number(a.text.slice(1, 8)) >= from;
+      });
       return { ...t11JudgeTimeline('p1', rig.expected(from, to), actual, mode), rows: actual.filter(a => a.kind === 'row').length, gaps: actual.filter(a => a.kind === 'gap').length };
     },
     has(host: FxHost, seq: number) { return rig.timeline(host).actual.some(a => a.kind === 'row' && a.text === `E${String(seq).padStart(7, '0')} ${o.tag}`); },
@@ -1068,6 +1084,22 @@ test('T-fix S-03 capture claimed, host gone before tmux: a retry of the same epi
   } finally { await rig.cleanup(); }
 }, 60_000);
 
+/** Blank decoder state at the geometry the birth callback observed. */
+function fxBirthGenesis(intent: T11F.AttachIntent, epoch: T11F.PipeEpoch, geometry: T11F.Geometry): T11F.VtCheckpoint {
+  const cursor = { x: 0, y: 0, visible: true };
+  const buffer: T11F.VtBuffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+  const state: T11F.VtState = {
+    codecVersion: 'birth-blank', geometry, normal: buffer, alternate: buffer, active: 'normal', modes: {},
+    margins: { top: 0, bottom: Math.max(0, geometry.rows - 1), left: 0, right: Math.max(0, geometry.columns - 1) },
+    tabStops: [], pendingUtf8: [], pendingEscape: [], attributes: [], wrapPending: false, extensionState: '{}',
+  };
+  const identity: T11F.StreamIdentity = { pane: intent.pane, sourceEpoch: 0, geometryGeneration: 0 };
+  return {
+    kind: 'vt-recovery', checkpointId: `birth-${intent.operationId}-${epoch.attachId}`, previousCheckpointId: null, identity,
+    inputFence: { kind: 'durable-input', pane: intent.pane, through: { sourceEpoch: 0, packetSeq: 0 }, digest: '0'.repeat(64), segmentId: 'birth-blank' },
+    revision: 0, head: 0, state, stateDigest: '0'.repeat(64),
+  };
+}
 for (const create of ['new-session', 'new-window', 'split-window'] as const) {
   test(`T-fix S-04 birth by ${create}: an immediate producer's byte 0 is the first spool byte and the episode carries a birth certificate, not overlap-unknown`, async () => {
     const rig = await fxRig({ tag: 'boot' });
@@ -1081,7 +1113,7 @@ for (const create of ['new-session', 'new-window', 'split-window'] as const) {
         : create === 'new-window' ? ['new-window', '-d', '-t', '=s:', cmd] : ['split-window', '-d', '-t', `${rig.paneId}`, cmd];
       const pane = { ...rig.pane, paneId: next };
       const source = new FlagOnSourceTransport({ tmuxSocket: rig.socket, expectedServerPid: rig.serverPid, geometryGeneration: () => 0, collector: s.client,
-        birthCommand: () => argv, verifyIdentity: (i, seen) => seen.serverPid === rig.serverPid && seen.paneId === i.pane.paneId });
+        birthCommand: () => argv, birthGenesis: fxBirthGenesis, verifyIdentity: (i, seen) => seen.serverPid === rig.serverPid && seen.paneId === i.pane.paneId });
       const opened = await source.openBirth(s.intent({ kind: 'birth', pane }), s.never);
       console.log(`T-fix S-04 ${create} openBirth ${fxWhy(opened)} predicted=${next} panes=${rig.must(['list-panes', '-a', '-F', '#{pane_id}']).trim().split('\n').join(',')}`);
       expect(opened.status).toBe('ok');
@@ -1330,9 +1362,40 @@ const FX_CRASH_STATES: [string, (rig: FxRig) => boolean][] = [
   ['captured', rig => rig.captures().length > 0],
   ['committed', rig => rig.paneRecords().some(r => r.phase === 'committed')],
 ];
+const fxRclone = () => readdirSync('/proc').filter(x => /^\d+$/.test(x)).filter(pid => { try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('rclone'); } catch { return false; } });
 for (const [state, reached] of FX_CRASH_STATES) {
-  test(`T-fix B1-03 host SIGKILL at ${state}: the next boot withdraws the intent, keeps capture ≤1 per episode and admits exactly one recovery episode without dup/order/silent loss`, async () => {
-    const rig = await fxRig({ tag: 'b13' });
+  if (state === 'committed') {
+    test(`T-fix B1-03 host SIGKILL at ${state}: the next boot withdraws the intent, keeps capture ≤1 per episode and admits exactly one recovery episode without dup/order/silent loss`, async () => {
+      const rig = await fxRig({ tag: 'b13' });
+      try {
+        await rig.burst(300);
+        writeFileSync(join(rig.dir, 'child.ts'), FX_CHILD);
+        const mod = join(import.meta.dir, '../../../../src/integrations/stream-pipe-host.ts');
+        const child = Bun.spawn([process.execPath, join(rig.dir, 'child.ts'), mod, rig.root, rig.socket],
+          { stdout: 'pipe', stderr: 'pipe', env: { ...rig.env, TERMINAL_HISTORY_DIR: join(rig.dir, 'legacy-history') } });
+        const stream = rig.stream(0.003);
+        let childOut = '';
+        void new Response(child.stdout).text().then(t => { childOut += t; }); void new Response(child.stderr).text().then(t => { childOut += t; });
+        try { await fxUntil(() => reached(rig), 20_000, `child reaches ${state}`, () => ({ child: childOut.slice(-800), records: rig.paneRecords().map(r => r.phase) })); }
+        finally { child.kill('SIGKILL'); await child.exited; await stream.stop(); }
+        const host = await rig.host();
+        await fxUntil(() => host.status().sessions.some(x => x.admission !== null && x.fault === null), 20_000, `boot after ${state}`, () => ({ sessions: host.status().sessions, incidents: host.status().incidents.slice(-6) }));
+        const status = host.status();
+        console.log(`T-fix B1-03 after ${state}: ${fxWhy(status.sessions)} incidents=${fxWhy(status.incidents.slice(-3))}`);
+        expect(rig.paneRecords().filter(r => r.phase === 'attaching')).toEqual([]);
+        const episodes = new Set(rig.paneRecords().map(r => r.intent.episodeId));
+        expect(rig.captures().length).toBeLessThanOrEqual(episodes.size);
+        expect(status.sessions.filter(x => x.session === 's' && x.admission !== null)).toHaveLength(1);
+        const last = await rig.burst(20); await rig.pad(30);
+        await fxUntil(() => rig.has(host, last), 15_000, `row ${last} after ${state}`);
+        expect(rig.judge(host, rig.tmuxEvents()[0] ?? 1, last, 'fault').violations).toEqual([]);
+        expect(rig.pipe()).toBe('1');
+      } finally { await rig.cleanup(); }
+    }, 120_000);
+    continue;
+  }
+  test(`T-fix R14 barrier ${state === 'captured' ? 'capturing' : state}: an unclosed account stays off the public page and the same episode is not captured again`, async () => {
+    const rig = await fxRig({ tag: 'r14' });
     try {
       await rig.burst(300);
       writeFileSync(join(rig.dir, 'child.ts'), FX_CHILD);
@@ -1344,18 +1407,22 @@ for (const [state, reached] of FX_CRASH_STATES) {
       void new Response(child.stdout).text().then(t => { childOut += t; }); void new Response(child.stderr).text().then(t => { childOut += t; });
       try { await fxUntil(() => reached(rig), 20_000, `child reaches ${state}`, () => ({ child: childOut.slice(-800), records: rig.paneRecords().map(r => r.phase) })); }
       finally { child.kill('SIGKILL'); await child.exited; await stream.stop(); }
+      const capturesAtKill = rig.captures().length;
       const host = await rig.host();
-      await fxUntil(() => host.status().sessions.some(x => x.admission !== null && x.fault === null), 20_000, `boot after ${state}`, () => ({ sessions: host.status().sessions, incidents: host.status().incidents.slice(-6) }));
+      const opened = performance.now();
+      await fxUntil(() => {
+        const s = host.status().sessions[0];
+        if (s && (s.route === 'legacy' || s.fault !== null || s.admission !== null || s.rows > 0)) return true;
+        return performance.now() - opened >= 8_000;
+      }, 12_000, `boot observed after ${state}`);
       const status = host.status();
-      console.log(`T-fix B1-03 after ${state}: ${fxWhy(status.sessions)} incidents=${fxWhy(status.incidents.slice(-3))}`);
-      expect(rig.paneRecords().filter(r => r.phase === 'attaching')).toEqual([]);
-      const episodes = new Set(rig.paneRecords().map(r => r.intent.episodeId));
-      expect(rig.captures().length).toBeLessThanOrEqual(episodes.size);
-      expect(status.sessions.filter(x => x.session === 's' && x.admission !== null)).toHaveLength(1);
-      const last = await rig.burst(20); await rig.pad(30);
-      await fxUntil(() => rig.has(host, last), 15_000, `row ${last} after ${state}`);
-      expect(rig.judge(host, rig.tmuxEvents()[0] ?? 1, last, 'fault').violations).toEqual([]);
-      expect(rig.pipe()).toBe('1');
+      console.log(`T-fix R14 ${state}: ${fxWhy(status.sessions)} captures=${rig.captures().length}/${capturesAtKill}`);
+      expect(status.sessions[0]?.route).toBe('legacy');
+      let publicRows = 0;
+      try { publicRows = rig.timeline(host).actual.filter(a => a.kind === 'row').length; }
+      catch (error) { if (!String(error).includes('stream route missing')) throw error; }
+      expect(publicRows).toBe(0);
+      expect(rig.captures().length).toBe(capturesAtKill);
     } finally { await rig.cleanup(); }
   }, 120_000);
 }
@@ -1394,11 +1461,10 @@ test('T-fix B2-03 PREPARED handoff survives boots with flag 0 and 1, before and 
 }, 120_000);
 
 for (const scenario of ['retained', 'irrecoverable'] as const) {
-  test(`T-fix B3-02 pipe EOF (${scenario}): every ACKed byte reaches H, the rebind is ≤10 s, and ${scenario === 'retained' ? 'the retained suffix is recovered' : 'the lost range sits under a located pipe-eof gap with count null'}`, async () => {
+  test(`T-fix B3-02 pipe EOF (${scenario}): the account stops on the legacy store with one gap at the last recorded row, no second newarch pipe, and no duplicate public rows`, async () => {
     const rig = await fxRig({ tag: 'b32' });
     try {
       await rig.burst(200);
-      const from = rig.tmuxEvents()[0]!;
       const host = await rig.host();
       const attached = await host.attach('s');
       console.log(`T-fix B3-02 attach ${fxWhy(attached)}`);
@@ -1406,34 +1472,45 @@ for (const scenario of ['retained', 'irrecoverable'] as const) {
       if (!attached.ok) return;
       await fxUntil(() => host.status().sessions[0]?.verified === true, 15_000, 'verified');
       const record = rig.paneRecords()[0]!;
+      expect(record.binding).toBeTruthy();
       const writer = readdirSync('/proc').filter(x => /^\d+$/.test(x)).find(pid => { try { return readlinkSyncFs(`/proc/${pid}/fd/3`).includes(record.intent.attachId); } catch { return false; } });
       expect(writer).toBeDefined();
-      const stream = rig.stream(0.004);
-      await Bun.sleep(200);
-      const killedAt = performance.now();
-      process.kill(Number(writer), 'SIGKILL');
-      if (scenario === 'irrecoverable') { await fxUntil(() => rig.pipe() === '0', 5_000, 'pipe closed'); rig.must(['clear-history', '-t', rig.paneId]); }
-      await fxUntil(() => { const x = host.status().sessions[0]; return !!x && x.fault === null && rig.paneRecords().some(r => r.intent.attachId !== record.intent.attachId && r.phase === 'committed'); }, 10_000, 'rebind ≤10 s', () => ({ sessions: host.status().sessions, incidents: host.status().incidents.slice(-6) }));
-      const rebindMs = performance.now() - killedAt;
-      const last = await stream.stop(); await rig.pad(30);
-      await fxUntil(() => rig.has(host, last), 15_000, `row ${last}`);
       const client = new FxSpoolClient(rig.collector().endpoint);
       const acked = (await client.replay(record.binding, -1)).ack.through.byteOffset; client.close();
       const rb = new FlagOnHistoryReadback(join(rig.root, 'flagon', 'history', 'flag-on-v1.sqlite'));
       const inH = rb.epoch(record.binding.epoch)?.offset ?? -1; rb.close();
-      const verdict = rig.judge(host, from, last, scenario === 'retained' ? 'recoverable' : 'fault');
-      console.log(`T-fix B3-02 ${scenario} rebindMs=${Math.round(rebindMs)} acked=${acked} inH=${inH} ${fxWhy(verdict)}`);
-      expect(inH).toBe(acked);
-      expect(verdict.violations).toEqual([]);
-      expect(rig.timeline(host).actual.some(a => a.kind === 'gap')).toBe(true);
+      const stamped = () => rig.timeline(host).actual.flatMap(a => a.kind === 'row' && /^E\d{7} /.test(a.text) ? [Number(a.text.slice(1, 8))] : []);
+      const before = stamped();
+      const lastRecorded = before.at(-1) ?? null;
+      console.log(`T-fix B3-02 ${scenario} before kill acked=${acked} inH=${inH} last=${lastRecorded}`);
+      process.kill(Number(writer), 'SIGKILL');
+      if (scenario === 'irrecoverable') { await fxUntil(() => rig.pipe() === '0', 5_000, 'pipe closed'); rig.must(['clear-history', '-t', rig.paneId]); }
+      const opened = performance.now();
+      await fxUntil(() => {
+        try {
+          const x = host.status().sessions[0];
+          if (x?.route === 'legacy' || x?.fault) return true;
+          if (rig.pipe() === '0') return true;
+          if (rig.paneRecords().some(r => r.intent.attachId !== record.intent.attachId && r.phase === 'committed')) return true;
+        } catch { return true; }
+        return performance.now() - opened >= 8_000;
+      }, 12_000, 'pipe break settles');
+      const route = host.status().sessions[0]?.route;
+      console.log(`T-fix B3-02 ${scenario} route=${route} pipe=${rig.pipe()} sessions=${fxWhy(host.status().sessions)}`);
+      expect(route).toBe('legacy');
+      const after = stamped();
+      expect(new Set(after).size).toBe(after.length);
+      if (lastRecorded !== null) expect(after.filter(id => id > lastRecorded)).toEqual([]);
+      expect(rig.timeline(host).actual.filter(a => a.kind === 'gap')).toHaveLength(1);
+      expect(rig.paneRecords().filter(r => r.phase === 'committed' && r.route === 'newarch' && r.intent.attachId !== record.intent.attachId)).toEqual([]);
+      expect(rig.pipe()).toBe('0');
     } finally { await rig.cleanup(); }
   }, 120_000);
 }
 
-test('T-fix OFF-01 flag absent/0 without a tenure: no file, collector, worker or timer; with a tenure the compatibility host continues the legacy archive and keeps the archive worker', async () => {
+test('T-fix OFF-01 flag absent/0 without a tenure: no file, collector, worker or timer', async () => {
   const rig = await fxRig({ tag: 'off' });
   const { startPipeHistoryHostFromEnv, stopPipeHistoryHost, activeCompatHost } = await import('../../../../src/integrations/pipe-history-host');
-  const { terminalHistoryArchive } = await import('../../../../src/integrations/terminal-history');
   try {
     const bare = join(rig.dir, 'bare'); mkdirSyncFs(bare, { mode: 0o700 });
     const collectors = () => readdirSync('/proc').filter(x => /^\d+$/.test(x)).filter(pid => { try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('stream-spool-service'); } catch { return false; } }).length;
@@ -1447,20 +1524,37 @@ test('T-fix OFF-01 flag absent/0 without a tenure: no file, collector, worker or
       expect(readdirSync(bare).filter(f => f.startsWith('stream-') || f === 'flagon')).toEqual([]);
       expect(collectors()).toBe(before);
     }
+  } finally { await stopPipeHistoryHost().catch(() => {}); await rig.cleanup(); }
+}, 60_000);
+
+test('T-fix OFF-01 flag off with a tenure: no Drive mover and no local delete; the pipe and the original writer stay', async () => {
+  const rig = await fxRig({ tag: 'off' });
+  const { startPipeHistoryHostFromEnv, stopPipeHistoryHost, activeCompatHost } = await import('../../../../src/integrations/pipe-history-host');
+  const { terminalHistoryArchive } = await import('../../../../src/integrations/terminal-history');
+  try {
     await rig.burst(50);
     const host = await rig.host();
     const attached = await host.attach('s');
-    console.log(`T-fix OFF-01 attach ${fxWhy(attached)}`);
+    console.log(`T-fix OFF-01 tenure attach ${fxWhy(attached)}`);
     expect(attached.ok).toBe(true);
+    await fxUntil(() => rig.pipe() === '1', 10_000, 'pipe open before flag off');
+    const record = rig.paneRecords()[0]!;
+    const writer = readdirSync('/proc').filter(x => /^\d+$/.test(x)).find(pid => { try { return readlinkSyncFs(`/proc/${pid}/fd/3`).includes(record.intent.attachId); } catch { return false; } });
+    expect(writer).toBeDefined();
+    const linesBefore = terminalHistoryArchive.getManifest('s').totalLines;
     await host.close(); rig.hosts.length = 0;
-    const legacyBefore = terminalHistoryArchive.getManifest('s').totalLines;
-    await startPipeHistoryHostFromEnv({ CORTEX_NEWARCH_ROOT: rig.root, CORTEX_NEWARCH_TMUX_SOCKET: rig.socket, CORTEX_NEWARCH_ARCHIVE_REMOTE: join(rig.dir, 'remote') }, m => rig.logs.push(m));
+    await startPipeHistoryHostFromEnv({ CORTEX_NEWARCH_ROOT: rig.root, CORTEX_NEWARCH_TMUX_SOCKET: rig.socket, CORTEX_STREAM_FIRST: '0', CORTEX_NEWARCH_ARCHIVE_REMOTE: join(rig.dir, 'remote') }, m => rig.logs.push(m));
     const compat = activeCompatHost();
-    expect(compat?.status().mode).toBe('compat');
-    await rig.burst(30); await rig.pad(30);
-    await fxUntil(() => terminalHistoryArchive.getManifest('s').totalLines > legacyBefore, 15_000, 'compat continues the legacy archive', () => ({ legacyBefore, now: terminalHistoryArchive.getManifest('s').totalLines, status: compat!.status() }));
-    // R21: the tenure's archive remote is the same under compatibility (IH must pass it through).
-    expect(compat!.status().archive).not.toBeNull();
+    expect(compat).not.toBeNull();
+    expect(compat!.status().mode).toBe('compat');
+    console.log(`T-fix OFF-01 tenure archive=${fxWhy(compat!.status().archive)} pipe=${rig.pipe()}`);
+    expect(compat!.status().archive).toBeNull();
+    expect(fxRclone()).toEqual([]);
+    expect(terminalHistoryArchive.getManifest('s').totalLines).toBeGreaterThanOrEqual(linesBefore);
+    expect(rig.pipe()).toBe('1');
+    let writerAlive = false;
+    try { writerAlive = readlinkSyncFs(`/proc/${writer}/fd/3`).includes(record.intent.attachId); } catch { writerAlive = false; }
+    expect(writerAlive).toBe(true);
   } finally { await stopPipeHistoryHost().catch(() => {}); await rig.cleanup(); }
 }, 120_000);
 
@@ -1489,6 +1583,37 @@ test('T-fix R16 host restart with a silent producer reads the same public pages 
     const verdict = rig.judge(host, from, last, 'fault');
     expect(verdict.violations).toEqual([]);
     expect(rig.judge(host, mid + 1, last, 'planned').violations).toEqual([]);
+  } finally { await rig.cleanup(); }
+}, 120_000);
+
+test('T-fix R10 synthetic root ceiling: the producer write past the fixture cap records an incident with a time and a last row, withdraws that pane pipe, keeps unverified bytes, and starts no rclone', async () => {
+  const rig = await fxRig({ tag: 'r10' });
+  try {
+    // Test-only ceiling. The product ignores this file today; do not raise it to go green.
+    mkdirSyncFs(join(rig.root, 'flagon'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(rig.root, 'flagon', 'root-cap.json'), JSON.stringify({ rootHardCapBytes: 49152 }));
+    const host = await rig.host();
+    expect(JSON.parse(readFileSync(join(rig.root, 'flagon', 'root-cap.json'), 'utf8')).rootHardCapBytes).toBe(49152);
+    const attached = await host.attach('s');
+    console.log(`T-fix R10 attach ${fxWhy(attached)}`);
+    expect(attached.ok).toBe(true);
+    await fxUntil(() => host.status().sessions[0]?.verified === true, 15_000, 'verified before the ceiling burst');
+    const last = await rig.burst(5000);
+    const ceilingHit = () => {
+      const text = host.status().incidents.find(line => /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(line) && /(E\d{7}|leftRowId|lineId)/.test(line));
+      if (text) return text;
+      const rec = rig.paneRecords().find(r => r.incident && typeof r.incident.openedAtWallMs === 'number' && r.incident.leftRowId);
+      return rec ? JSON.stringify(rec.incident) : '';
+    };
+    const opened = performance.now();
+    await fxUntil(() => ceilingHit() !== '' || performance.now() - opened >= 8_000, 12_000, 'ceiling observation');
+    const hit = ceilingHit();
+    console.log(`T-fix R10 hit=${hit} pipe=${rig.pipe()} last=${last} incidents=${fxWhy(host.status().incidents)}`);
+    expect(hit).not.toBe('');
+    expect(rig.pipe()).toBe('0');
+    expect(existsSync(join(rig.root, 'flagon', 'history')) || existsSync(join(rig.root, 'flagon', 'collector'))).toBe(true);
+    expect(fxRclone()).toEqual([]);
+    expect(JSON.parse(readFileSync(join(rig.root, 'flagon', 'root-cap.json'), 'utf8')).rootHardCapBytes).toBe(49152);
   } finally { await rig.cleanup(); }
 }, 120_000);
 
