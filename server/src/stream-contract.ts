@@ -698,7 +698,6 @@ export function cellToSemanticCell(cell: Cell): SemanticCell {
 /** Normalized projection uses W's existing v1 formula; old H receipts retain
  * their original digest. H emits a separately stored CoverageProjectionR2. */
 export function normalizedRowsDigest(range: SegmentRowRange, rows: readonly CommittedStreamRow[]): Digest {
-  return streamDigest('rows', rows);
   return streamDigest('newarch-legacy-coverage-rows', { range, rows: rows.map(row => ({
     id: row.id, cells: row.cells, wrapStatus: row.wrapStatus, wrapPad: row.wrapPad, buffer: row.buffer,
   })) });
