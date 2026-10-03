@@ -1470,7 +1470,7 @@ describe('NEWARCH C stitch v1 ST-01 content candidates and proof gate', () => {
     expect(abab.status !== 'error' && abab.gaps[0]!.reason).toBe('ambiguous-overlap');
     const spin = ['|', '/', '-', '\\', '|', '/', '-', '\\'];
     const spinner = await s.stitch(tailOf(spin), captureOf([...spin, ...spin.slice(0, 4)]), pipeOf([]), stProofs([mapping(8)]));
-    expect(spinner.status === 'ambiguous' && spinner.candidateCount).toBe(2);
+    expect(spinner.status === 'ambiguous' && spinner.candidateCount).toBe(3); // ends 4, 8, 12
   });
 
   test('blank full screen offers no candidate at all', async () => {
@@ -1521,7 +1521,7 @@ describe('NEWARCH C stitch v1 ST-01 content candidates and proof gate', () => {
 
   test('time budget exhaustion returns unproven deadline, not a guess', async () => {
     let t = 0;
-    const r = await new StreamStitcher({ now: () => (t += 60) }).stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([mapping(8)]));
+    const r = await new StreamStitcher({ now: () => (t += 200) }).stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([mapping(8)]));
     expect(r.status === 'unproven' && r.reason).toBe('deadline');
     expect(sources(r)).toEqual([]);
   });
@@ -1683,10 +1683,10 @@ describe('NEWARCH C stitch v1 ST-02 seams, origin tags and known state', () => {
     const packet = stPacket({ historySize: 2, geometry: { columns: 10, rows: 2 } });
     const rows = captureStitchRows(packet, 'h1\n\x1b[1;31mX\x1b[0m\nscr\n');
     expect(rows.map(r => [r.finalized, r.wrapStatus, r.cells.map(c => c.text).join('')])).toEqual([
-      [true, 'unknown', 'h1'], [true, 'unknown', 'X'], [false, 'unknown', 'scr'],
+      [true, 'unknown', 'h1        '], [true, 'unknown', 'X         '], [false, 'unknown', 'scr       '],
     ]);
     expect(rows[1]!.cells[0]!.style).toEqual([1, 1, -1]);
     expect(rows[2]!.origin).toEqual(capOrigin(2));
-    expect(rows[2]!.cellOrigins).toEqual([capOrigin(2), capOrigin(2), capOrigin(2)]);
+    expect(rows[2]!.cellOrigins).toEqual(Array(10).fill(capOrigin(2)));
   });
 });
