@@ -959,7 +959,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
         fhAssert(last ? last.offset === range.start && Number(last.sequence)+1 === record.sequence && last.digest === record.previousDigest
           : range.start === 0 && record.sequence === 0 && record.previousDigest === null, 'raw sequence/offset/digest discontinuity');
         let segmentId = last ? String(last.segment) : streamDigest('flag-on-segment',{epoch,first:record.operationId});
-        if (last && this.segment(segmentId,range.epoch.pane).state !== 'open') segmentId = streamDigest('flag-on-segment',{epoch,first:record.operationId});
+        if (last && this.segment(segmentId,range.epoch.pane).state !== 'open') segmentId = this.rotate({operationId:'resume-rotate:'+record.operationId,pane:range.epoch.pane,expectedGeneration:Number(pane.generation),segmentId,boundary:{epoch:range.epoch,byteOffset:range.start}}).successor;
         this.db.query("INSERT OR IGNORE INTO fh_segment(id,pane,state) VALUES(?,?,'open')").run(segmentId,key);
         const current = this.segment(segmentId,range.epoch.pane);
         if (Number(current.bytes)+bytes(record)+2048 > FH_SEGMENT_MAX && last) {
@@ -1157,6 +1157,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
         this.fence(r); const s = this.segment(r.segmentId,r.pane);
         if (s.sealed) return JSON.parse(String(s.sealed)) as SealedExport;
         fhAssert(s.state === 'open' || s.state === 'sealed-local', 'segment not sealable'); this.unpinned(r.segmentId);
+        fhAssert(!this.db.query("SELECT 1 FROM fh_event WHERE segment=? AND kind='candidate'").get(r.segmentId),'attach candidate not published');
         // An interrupted seal can leave only a duplicate export, while all
         // source events remain in SQLite. Reap those known open-segment copies
         // before staging another one; repeated crashes cannot grow scratch.
@@ -1329,15 +1330,16 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     const start=this.position(r.pane,r.cursor,back?head.entryCount:0);fhAssert(start<=head.entryCount,'cursor outside timeline');
     const slots=this.db.query(`SELECT * FROM fh_timeline WHERE pane=? AND n${back?'<':'>='}? ORDER BY n ${back?'DESC':'ASC'} LIMIT ?`).all(key,start,r.maxEntries) as SqlRow[];
     const entries:(CommittedStreamRow|Gap)[]=[];let payloadBytes=0,lo=start,hi=start,blocked:NewarchHistoryContinuation|null=null;
+    let cachedOp='',cachedEntries:(CommittedStreamRow|Gap)[]=[];
     for(const slot of slots){
-      const s=this.segment(String(slot.segment),r.pane),event=this.event(String(slot.op));
+      const s=this.segment(String(slot.segment),r.pane);
       if(s.state==='remote'||s.state==='reclaiming'){
         const remote=JSON.parse(String(s.remote)) as RemoteIndexReceipt;
         const at=back?Number(slot.n)+1:Number(slot.n);
         blocked={kind:'blocked',cursor:this.cursor(r.pane,at),state:{kind:'remote-required',range:{pane:r.pane,segmentId:String(s.id),start:0,end:Number(s.next_row)},bundleId:remote.verified.bundle.bundleId}};break;
       }
-      fhAssert(event,'timeline payload missing');this.checkEvent(event);fhAssert(event.kind==='committed','unpublished timeline');
-      const entry=this.entries(JSON.parse(String(event.payload)))[Number(slot.item)];fhAssert(entry,'timeline entry missing');
+      if(cachedOp!==slot.op){const event=this.event(String(slot.op));fhAssert(event,'timeline payload missing');this.checkEvent(event);fhAssert(event.kind==='committed','unpublished timeline');cachedOp=String(slot.op);cachedEntries=this.entries(JSON.parse(String(event.payload)));}
+      const entry=cachedEntries[Number(slot.item)];fhAssert(entry,'timeline entry missing');
       const size=bytes(entry);fhAssert(size<=r.maxBytes||entries.length>0,'single entry exceeds read budget');if(payloadBytes+size>r.maxBytes)break;
       payloadBytes+=size;entries.push(entry);lo=Math.min(lo,Number(slot.n));hi=Math.max(hi,Number(slot.n)+1);
     }
@@ -1392,10 +1394,10 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
   private logical(r:OperationFence&{segmentId:string}):LogicalSealR2 {
     const key=this.fence(r),s=this.segment(r.segmentId,r.pane),old=this.load<LogicalSealR2>('logical',r.segmentId);if(old)return old;
     fhAssert(s.state==='open'||s.state==='sealed','segment not sealable');
-    fhAssert(!this.db.query("SELECT 1 FROM fh_event WHERE segment=? AND kind='candidate'").get(r.segmentId),'attach candidate not published');
+    // Candidate payload may rotate; export remains blocked until publication.
     const coverage:Coverage[number][]=[],rawRanges:SpoolRecord['range'][]=[],checkpointIds:string[]=[];let seq=0;
     for(;;){const e=this.db.query('SELECT * FROM fh_event WHERE segment=? AND seq>? ORDER BY seq LIMIT 1').get(r.segmentId,seq) as SqlRow|null;if(!e)break;this.checkEvent(e);seq=Number(e.seq);
-      const p=JSON.parse(String(e.payload));if(e.kind==='committed')coverage.push(...p.coverage);else if(e.kind==='input'){
+      const p=JSON.parse(String(e.payload));if(e.kind==='committed'||e.kind==='candidate')coverage.push(...p.coverage);else if(e.kind==='input'){
         const range=p.range as SpoolRecord['range'],last=rawRanges.at(-1);if(last&&equal(last.epoch,range.epoch)&&last.end===range.start)rawRanges[rawRanges.length-1]={...last,end:range.end};else rawRanges.push(range);
       }else if(e.kind==='checkpoint')checkpointIds.push(p.checkpointId);
       fhAssert(bytes({coverage,rawRanges,checkpointIds})<=B.decodeBytes,'logical seal bound');
@@ -1462,7 +1464,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     fhAssert(d.revision===2&&this.options.catalogAuthority,'catalog attach authority unavailable');
     const authority=this.value(this.options.catalogAuthority.attach(d.attachId));fhAssert(authority&&equal(authority,d),'catalog attach decision mismatch');
     const m=this.load<AttachReceiptSetR2>('attach-set',d.transactionId);fhAssert(m&&m.epoch.attachId===d.attachId&&m.aggregateDigest===d.receiptSetDigest,'attach decision manifest mismatch');
-    fhAssert(d.generation===m.expectedGeneration+1,'attach generation mismatch');return m;
+    fhAssert(d.generation===m.expectedGeneration+(d.state==='COMMITTED'?1:0),'attach generation mismatch');return m;
   }
   private publish(d:AttachDecisionR2):TimelineHeadR2 {
     const m=this.attachDecision(d);fhAssert(d.state==='COMMITTED','attach not committed');

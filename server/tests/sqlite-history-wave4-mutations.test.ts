@@ -249,7 +249,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
     {name:'replay-remote-prefix',pattern:'replay from current durable cursor',from:".all(key,segmentFloor) as SqlRow[];",to:".all(key,0) as SqlRow[];"},
     {name:'delete-without-vacuum',pattern:'verified reclaim really',from:"this.db.exec('PRAGMA incremental_vacuum(256)');",to:'/* mutant: DELETE without returning source DB pages */'},
     {name:'swallow-gap',pattern:'ACK then reopen',from:"gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))",to:"gaps:[],receipt:JSON.parse(String(e.receipt))"},
-    {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
+    {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),staged?'candidate':'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
     {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);",to:'/* ACK without durable input */'},
     {name:'upload-is-verification',pattern:'upload exit zero',from:"fhAssert(this.options.validateRemoteIndex?.(remote,sealed) === true, 'remote catalog authority not validated');",to:'/* delete after untrusted upload receipt */'},
     {name:'pin-bypass',pattern:'pins survive restart',from:"fhAssert(!this.db.query('SELECT 1 FROM fh_pin WHERE segment=? AND released=0 LIMIT 1').get(segment), 'segment pinned');",to:'/* ignore active reader/handoff pin */'},
