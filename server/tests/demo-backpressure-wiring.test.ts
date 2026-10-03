@@ -1111,6 +1111,7 @@ test('T-fix S-05 a foreign pipe before the guarded list stays unchanged; refusal
     const refused = await s.source().openRecovery(intent, s.never);
     console.log(`T-fix S-05 refused ${fxWhy(refused)}`);
     expect(refused.status).not.toBe('ok');
+    expect(fxWhy(refused)).toContain('FOREIGN-PIPE-REFUSED'); // refused by the same-turn guard, not by any other failure
     const last = await rig.burst(25);
     await fxUntil(() => existsSync(foreign) && fxIds(readFileSync(foreign), 's05').includes(last), 10_000, 'foreign keeps receiving');
     expect(rig.pipe()).toBe('1');
