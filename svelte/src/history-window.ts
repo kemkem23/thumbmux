@@ -7,6 +7,14 @@
  * while the resident range slides in either direction.
  */
 
+import {
+  NEWARCH_FLAGON_CAPABILITIES,
+  type NewarchGap,
+  type NewarchHistoryContinuation,
+  type NewarchHistoryExtension,
+  type NewarchHistoryState,
+} from '@thumbmux/core';
+
 export const HISTORY_WINDOW_MAX_ROWS = 10_000;
 export const HISTORY_WINDOW_MAX_BYTES = 8 * 1024 * 1024;
 export const HISTORY_WINDOW_ROW_OVERHEAD_BYTES = 64;
@@ -85,7 +93,15 @@ export type HistoryWindowPage = Readonly<{
   lineBytes?: readonly number[];
   /** Direction-relative server continuation flag. */
   hasMore: boolean;
+  /**
+   * Flag-on continuation for this direction. `blocked` (pending, gap,
+   * remote-required, ...) keeps the edge pageable: it is never EOF, even when
+   * the page carries no rows. Absent = legacy page, `hasMore` alone decides.
+   */
+  continuation?: HistoryWindowContinuation;
 }>;
+
+export type HistoryWindowContinuation = NewarchHistoryContinuation['kind'];
 
 export type ApplyHistoryWindowOptions = Readonly<{
   anchor: HistoryWindowAnchor;
@@ -98,7 +114,8 @@ export type ApplyHistoryWindowOptions = Readonly<{
 }>;
 
 export type HistoryWindowApplySuccess = Readonly<{
-  kind: 'committed' | 'boundary';
+  /** `blocked`: an empty page whose edge stays open (not EOF). */
+  kind: 'committed' | 'boundary' | 'blocked';
   state: HistoryWindowState;
   anchor: HistoryWindowAnchorCommit;
   /** Portion of the incoming page retained in state; null for an empty page. */
@@ -417,6 +434,35 @@ export function applyHistoryWindowPage(
     return rejected(state, 'invalid-page', 'history page lineBytes do not align with its lines');
   }
 
+  if (
+    page.continuation !== undefined
+    && (
+      (page.continuation !== 'end' && page.continuation !== 'more' && page.continuation !== 'blocked')
+      || (page.continuation === 'end') === page.hasMore
+    )
+  ) {
+    return rejected(state, 'invalid-page', 'flag-on continuation disagrees with hasMore');
+  }
+
+  if (page.lines.length === 0 && page.continuation === 'blocked') {
+    // Pending/gap/remote: nothing to merge, and the edge must stay pageable.
+    const next: HistoryWindowState = {
+      ...state,
+      lines: Array.from(state.lines),
+      lineBytes: Array.from(state.lineBytes),
+      hasOlder: page.direction === 'before' ? true : state.hasOlder,
+      hasNewer: page.direction === 'after' ? true : state.hasNewer,
+    };
+    return {
+      kind: 'blocked',
+      state: next,
+      anchor: anchorCommit(state, next, anchor),
+      acceptedPage: null,
+      evictedOpposite: null,
+      discardedIncoming: null,
+    };
+  }
+
   if (page.lines.length === 0) {
     if (page.hasMore) {
       return rejected(state, 'empty-page-with-more', 'an empty page cannot make directional progress while hasMore is true');
@@ -572,4 +618,225 @@ export function applyHistoryWindowPage(
     evictedOpposite,
     discardedIncoming,
   };
+}
+
+// ── NEWARCH flag-on history states (display lot D) ─────────────────────────
+//
+// Status is never terminal text. These notes live beside the resident rows,
+// not inside `lines`, so copy/search over rows can never pick up a label, and
+// an unknown count renders as words, never as 0.
+
+export type HistoryStatusKind = Exclude<NewarchHistoryState['kind'], 'exact'>;
+
+export type HistoryStatusNote = Readonly<{
+  /** Stable identity from what the state names, never from row text. */
+  key: string;
+  kind: HistoryStatusKind;
+  /** Thai sentence for a reader. */
+  text: string;
+  /** Diagnostic detail (reason, range, bundle); not shown as row text. */
+  detail: string;
+  /** Present for states that a later read may clear. */
+  retryAfterMs: number | null;
+}>;
+
+function gapCountText(gap: NewarchGap): string {
+  if (gap.countKind === 'unknown') return 'จำนวนไม่ทราบ';
+  if (gap.countKind === 'estimate') return `ประมาณ ${gap.missingCount} แถว`;
+  return `${gap.missingCount} แถว`;
+}
+
+/** Reader-facing words for one state; `exact` has nothing to say. */
+export function historyStateLabel(state: NewarchHistoryState): string | null {
+  switch (state.kind) {
+    case 'exact':
+      return null;
+    case 'gap':
+      return `ช่วงนี้เก็บประวัติไม่ครบ — ${gapCountText(state.gap)}`;
+    case 'pending':
+      return 'กำลังกู้ประวัติช่วงนี้ — ยังไม่ใช่จุดสิ้นสุด';
+    case 'remote-required':
+      return 'ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน';
+    case 'remote-unavailable':
+      if (state.reason === 'offline') return 'ดึงประวัติจากคลังสำรองไม่ได้ตอนนี้ (ออฟไลน์) — ลองใหม่ภายหลัง';
+      if (state.reason === 'missing') return 'ไม่พบประวัติช่วงนี้ในคลังสำรอง';
+      return 'ประวัติช่วงนี้ในคลังสำรองเสียหาย อ่านไม่ได้';
+    case 'degraded':
+      return 'จอช่วงนี้ยังยืนยันไม่ครบ — แสดงเฉพาะส่วนที่ตรวจแล้ว';
+    case 'pressure':
+      if (!state.collecting) return 'หยุดเก็บประวัติ — พื้นที่ไม่พอ';
+      if (state.level === 'emergency') return 'พื้นที่เก็บประวัติวิกฤต — อาจหยุดเก็บเร็วๆ นี้';
+      if (state.level === 'critical') return 'พื้นที่เก็บประวัติใกล้เต็ม';
+      return 'พื้นที่เก็บประวัติเริ่มเต็ม — กำลังย้ายไปคลังสำรอง';
+  }
+}
+
+function rangeText(range: { segmentId: string; start: number; end: number }): string {
+  return `${range.segmentId}[${range.start},${range.end})`;
+}
+
+function stateKey(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): string {
+  switch (state.kind) {
+    case 'gap': {
+      const left = state.gap.leftRowId;
+      return `gap|${state.gap.episodeId}|${state.gap.reason}|${left ? `${left.segmentId}:${left.rowOrdinal}` : 'start'}`;
+    }
+    case 'pending':
+      return `pending|${state.operationId}`;
+    case 'remote-required':
+      return `remote-required|${state.bundleId}|${rangeText(state.range)}`;
+    case 'remote-unavailable':
+      return `remote-unavailable|${state.reason}|${state.bundleId}|${rangeText(state.range)}`;
+    case 'degraded':
+      return `degraded|${state.episodeId}`;
+    case 'pressure':
+      return `pressure|${state.level}|${state.collecting ? 'collecting' : 'stopped'}`;
+  }
+}
+
+function stateDetail(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): string {
+  switch (state.kind) {
+    case 'gap':
+      return `gap · ${state.gap.reason} · ${state.gap.countKind}`
+        + ` · withheld ${state.gap.withheldRows} · ${state.gap.quality}`;
+    case 'pending':
+      return `pending · ${state.operationId}`;
+    case 'remote-required':
+      return `remote-required · ${state.bundleId} · ${rangeText(state.range)}`;
+    case 'remote-unavailable':
+      return `remote-unavailable · ${state.reason} · ${state.bundleId} · ${rangeText(state.range)}`;
+    case 'degraded':
+      return `degraded · ${state.uncertainFields.join(',') || 'unknown fields'}`;
+    case 'pressure':
+      return `pressure · ${state.level} · ${state.collecting ? 'collecting' : 'stopped'}`;
+  }
+}
+
+function retryAfter(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): number | null {
+  return state.kind === 'pending' || state.kind === 'remote-unavailable' ? state.retryAfterMs : null;
+}
+
+/** One note per distinct state, including the states that block an edge. */
+export function historyStatusNotes(extension: NewarchHistoryExtension): HistoryStatusNote[] {
+  const notes = new Map<string, HistoryStatusNote>();
+  const add = (state: NewarchHistoryState) => {
+    if (state.kind === 'exact') return;
+    const key = stateKey(state);
+    if (notes.has(key)) return;
+    notes.set(key, {
+      key,
+      kind: state.kind,
+      text: historyStateLabel(state)!,
+      detail: stateDetail(state),
+      retryAfterMs: retryAfter(state),
+    });
+  };
+  for (const state of extension.states) add(state);
+  if (extension.before.kind === 'blocked') add(extension.before.state);
+  if (extension.after.kind === 'blocked') add(extension.after.state);
+  return [...notes.values()];
+}
+
+export function historyContinuationFor(
+  extension: NewarchHistoryExtension,
+  direction: HistoryWindowDirection,
+): HistoryWindowContinuation {
+  return (direction === 'before' ? extension.before : extension.after).kind;
+}
+
+// ── wire validation: a page whose states cannot be read is refused, never
+// treated as an empty (EOF) page.
+
+type Obj = Record<string, unknown>;
+const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_FLAGON_CAPABILITIES);
+const GAP_REASONS: ReadonlySet<string> = new Set([
+  'pipe-eof', 'collector-exit', 'ambiguous-overlap', 'unproven-overlap', 'unknown-vt-state',
+  'interrupted-capture', 'storage-outage', 'corruption', 'identity-change', 'geometry-change',
+  'ownership-lost', 'visible-divergence',
+]);
+
+function isObj(value: unknown): value is Obj {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+function isText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+function validPane(value: unknown): boolean {
+  return isObj(value) && typeof value.serverIdentity === 'string' && typeof value.paneId === 'string'
+    && isCount(value.birthGeneration);
+}
+function validRowRange(value: unknown): boolean {
+  return isObj(value) && validPane(value.pane) && typeof value.segmentId === 'string'
+    && isCount(value.start) && isCount(value.end) && value.start <= value.end;
+}
+function validCursor(value: unknown): boolean {
+  return isObj(value) && value.version === 1 && isText(value.token);
+}
+function validGap(value: unknown): boolean {
+  if (!isObj(value) || value.version !== 1 || !isText(value.episodeId) || !validPane(value.pane)) return false;
+  if (value.parentEpisodeId !== null && !isText(value.parentEpisodeId)) return false;
+  if (value.rightSegmentId !== null && typeof value.rightSegmentId !== 'string') return false;
+  const left = value.leftRowId;
+  if (left !== null && !(isObj(left) && validPane(left.pane) && typeof left.segmentId === 'string' && isCount(left.rowOrdinal))) return false;
+  if (typeof value.reason !== 'string' || !GAP_REASONS.has(value.reason)) return false;
+  // unknown is null, never 0; exact/estimate carry a real count.
+  if (value.countKind === 'unknown') { if (value.missingCount !== null) return false; }
+  else if (value.countKind === 'exact' || value.countKind === 'estimate') { if (!isCount(value.missingCount)) return false; }
+  else return false;
+  return isCount(value.withheldRows) && isCount(value.lowerBound)
+    && typeof value.openedAt === 'number' && Number.isFinite(value.openedAt)
+    && (value.closedAt === null || (typeof value.closedAt === 'number' && Number.isFinite(value.closedAt)))
+    && typeof value.clockEpoch === 'string'
+    && (value.quality === 'degraded' || value.quality === 'resolved');
+}
+function validState(value: unknown): value is NewarchHistoryState {
+  if (!isObj(value)) return false;
+  switch (value.kind) {
+    case 'exact': return true;
+    case 'gap': return validGap(value.gap);
+    case 'pending': return isText(value.operationId) && isCount(value.retryAfterMs);
+    case 'remote-required': return validRowRange(value.range) && isText(value.bundleId);
+    case 'remote-unavailable':
+      return validRowRange(value.range) && isText(value.bundleId) && isCount(value.retryAfterMs)
+        && (value.reason === 'offline' || value.reason === 'missing' || value.reason === 'corrupt');
+    case 'degraded':
+      return isText(value.episodeId) && Array.isArray(value.uncertainFields)
+        && value.uncertainFields.every(field => typeof field === 'string');
+    case 'pressure':
+      return (value.level === 'archive' || value.level === 'critical' || value.level === 'emergency')
+        && typeof value.collecting === 'boolean'
+        && typeof value.sinceMonoMs === 'number' && Number.isFinite(value.sinceMonoMs) && value.sinceMonoMs >= 0;
+    default: return false;
+  }
+}
+function validContinuation(value: unknown): boolean {
+  if (!isObj(value)) return false;
+  if (value.kind === 'end') return true;
+  if (value.kind === 'more') return validCursor(value.cursor);
+  if (value.kind === 'blocked') {
+    return validCursor(value.cursor) && validState(value.state) && (value.state as Obj).kind !== 'exact';
+  }
+  return false;
+}
+
+/**
+ * Parse the optional `flagOn` envelope of a history page. Returns null for
+ * anything unreadable or for capabilities this display does not know; the
+ * caller must then refuse the page (not draw rows without their states).
+ */
+export function parseNewarchHistoryExtension(value: unknown): NewarchHistoryExtension | null {
+  if (!isObj(value) || value.version !== 1) return null;
+  const caps = value.capabilities;
+  if (!isObj(caps) || caps.extensionVersion !== 1
+    || !Array.isArray(caps.supported) || !Array.isArray(caps.required)) return null;
+  const supported = caps.supported as unknown[];
+  const required = caps.required as unknown[];
+  if (![...supported, ...required].every(cap => typeof cap === 'string' && KNOWN_CAPABILITIES.has(cap))) return null;
+  if (!supported.includes('history-states-v1') || !required.every(cap => supported.includes(cap))) return null;
+  if (!Array.isArray(value.states) || !value.states.every(validState)) return null;
+  if (!validContinuation(value.before) || !validContinuation(value.after)) return null;
+  return value as unknown as NewarchHistoryExtension;
 }

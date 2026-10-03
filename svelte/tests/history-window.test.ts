@@ -9,10 +9,15 @@ import {
   historyWindowEndLine,
   historyWindowRange,
   historyWindowRequestCursor,
+  historyContinuationFor,
+  historyStateLabel,
+  historyStatusNotes,
+  parseNewarchHistoryExtension,
   type HistoryWindowAnchor,
   type HistoryWindowRejectReason,
   type HistoryWindowState,
 } from '../src/history-window';
+import type { NewarchHistoryExtension, NewarchHistoryState } from '@thumbmux/core';
 
 function rows(startLine: number, count: number, payload = ''): string[] {
   return Array.from(
@@ -430,5 +435,147 @@ describe('boundary and malformed-page handling', () => {
       state,
     });
     expect(historyWindowRange(state)).toEqual({ startLine: 10, endLine: 11 });
+  });
+});
+
+// ── NEWARCH flag-on lot D: typed history states are never EOF or row text ──
+// Literal fixtures written by hand (not produced by the code under test).
+
+const FLAG_PANE = { serverIdentity: 'srv-d', paneId: '%7', birthGeneration: 3 };
+const FLAG_CAPS = { extensionVersion: 1, supported: ['history-states-v1', 'catalog-v3'], required: ['history-states-v1'] };
+const FLAG_CURSOR = { version: 1, token: 'opaque-h-cursor' };
+function flagGap(countKind: 'unknown' | 'estimate' | 'exact', missingCount: number | null) {
+  return {
+    version: 1, episodeId: `ep-${countKind}`, parentEpisodeId: null, pane: FLAG_PANE,
+    leftRowId: { pane: FLAG_PANE, segmentId: 'seg-1', rowOrdinal: 41 }, rightSegmentId: 'seg-2',
+    reason: 'pipe-eof', countKind, missingCount, withheldRows: 2, lowerBound: 0,
+    openedAt: 10, closedAt: null, clockEpoch: 'clock-d', quality: 'degraded',
+  };
+}
+const FLAG_RANGE = { pane: FLAG_PANE, segmentId: 'seg-0', start: 0, end: 512 };
+function flagExtension(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    capabilities: FLAG_CAPS,
+    states: [
+      { kind: 'exact' },
+      { kind: 'gap', gap: flagGap('unknown', null) },
+      { kind: 'remote-required', range: FLAG_RANGE, bundleId: 'bundle-0' },
+      { kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5 },
+    ],
+    before: { kind: 'blocked', cursor: FLAG_CURSOR, state: { kind: 'pending', operationId: 'op-1', retryAfterMs: 250 } },
+    after: { kind: 'end' },
+    ...overrides,
+  };
+}
+
+describe('NEWARCH D flag-on continuation in the window model', () => {
+  test('RD-01: an empty blocked (pending) page keeps the edge pageable instead of EOF', () => {
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    const blocked = applyHistoryWindowPage(state, {
+      direction: 'before', anchorLine: 100, startLine: null, lines: [], hasMore: true, continuation: 'blocked',
+    }, { anchor: anchor(101) });
+    expect(blocked.kind).toBe('blocked');
+    if (blocked.kind === 'rejected') throw new Error(blocked.message);
+    expect(blocked.state.hasOlder).toBe(true);
+    expect(blocked.state.lines).toEqual(rows(100, 3));
+    expect(historyWindowRequestCursor(blocked.state, 'before')).toEqual({ direction: 'before', beforeLine: 100 });
+
+    // Control: the same empty page with a real end continuation is EOF.
+    const ended = applyHistoryWindowPage(state, {
+      direction: 'before', anchorLine: 100, startLine: null, lines: [], hasMore: false, continuation: 'end',
+    }, { anchor: anchor(101) });
+    expect(ended.kind).toBe('boundary');
+    expect(ended.state.hasOlder).toBe(false);
+  });
+
+  test('RD-01: a blocked after-edge stays open and a blocked page with rows keeps more', () => {
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: false, hasNewer: true });
+    const blocked = applyHistoryWindowPage(state, {
+      direction: 'after', anchorLine: 102, startLine: null, lines: [], hasMore: true, continuation: 'blocked',
+    }, { anchor: anchor(101) });
+    expect(blocked.kind).toBe('blocked');
+    expect(blocked.state.hasNewer).toBe(true);
+    const withRows = committed(applyHistoryWindowPage(state, {
+      direction: 'after', anchorLine: 102, startLine: 103, lines: rows(103, 2), hasMore: true, continuation: 'blocked',
+    }, { anchor: anchor(101) }));
+    expect(withRows.state.hasNewer).toBe(true);
+    expect(withRows.state.lines).toEqual(rows(100, 5));
+  });
+
+  test('a continuation that disagrees with hasMore is refused, never trusted either way', () => {
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    for (const [continuation, hasMore] of [['end', true], ['blocked', false], ['more', false]] as const) {
+      const result = applyHistoryWindowPage(state, {
+        direction: 'before', anchorLine: 100, startLine: null, lines: [], hasMore, continuation,
+      }, { anchor: anchor(101) });
+      expect(result).toMatchObject({ kind: 'rejected', reason: 'invalid-page', state });
+    }
+  });
+});
+
+describe('NEWARCH D flag-on state labels and wire validation', () => {
+  test('unknown counts read as words, never 0; estimates say ประมาณ', () => {
+    const unknown = historyStateLabel({ kind: 'gap', gap: flagGap('unknown', null) } as NewarchHistoryState)!;
+    expect(unknown).toBe('ช่วงนี้เก็บประวัติไม่ครบ — จำนวนไม่ทราบ');
+    expect(unknown).not.toMatch(/\d/);
+    expect(historyStateLabel({ kind: 'gap', gap: flagGap('estimate', 37) } as NewarchHistoryState))
+      .toBe('ช่วงนี้เก็บประวัติไม่ครบ — ประมาณ 37 แถว');
+    expect(historyStateLabel({ kind: 'gap', gap: flagGap('exact', 4) } as NewarchHistoryState))
+      .toBe('ช่วงนี้เก็บประวัติไม่ครบ — 4 แถว');
+    expect(historyStateLabel({ kind: 'exact' })).toBeNull();
+    expect(historyStateLabel({ kind: 'remote-required', range: FLAG_RANGE, bundleId: 'b' }))
+      .toBe('ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน');
+    expect(historyStateLabel({ kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 1 }))
+      .toBe('หยุดเก็บประวัติ — พื้นที่ไม่พอ');
+    expect(historyStateLabel({ kind: 'pending', operationId: 'op', retryAfterMs: 1 })).toContain('ยังไม่ใช่จุดสิ้นสุด');
+  });
+
+  test('every non-exact state, including blocking ones, yields exactly one note', () => {
+    const extension = parseNewarchHistoryExtension(flagExtension());
+    expect(extension).not.toBeNull();
+    const notes = historyStatusNotes(extension!);
+    expect(notes.map(note => note.kind)).toEqual(['gap', 'remote-required', 'pressure', 'pending']);
+    expect(notes.find(note => note.kind === 'pending')!.retryAfterMs).toBe(250);
+    expect(historyContinuationFor(extension!, 'before')).toBe('blocked');
+    expect(historyContinuationFor(extension!, 'after')).toBe('end');
+    // Duplicated state names one note, not two.
+    const doubled = parseNewarchHistoryExtension(flagExtension({
+      states: [{ kind: 'gap', gap: flagGap('unknown', null) }, { kind: 'gap', gap: flagGap('unknown', null) }],
+    }))!;
+    expect(historyStatusNotes(doubled)).toHaveLength(2);
+    expect(historyStatusNotes(doubled).filter(note => note.kind === 'gap')).toHaveLength(1);
+  });
+
+  test('labels stay outside resident rows (copy/search see only terminal output)', () => {
+    const extension = parseNewarchHistoryExtension(flagExtension())!;
+    const state = createHistoryWindow({ startLine: 100, lines: rows(100, 3), hasOlder: true });
+    const applied = applyHistoryWindowPage(state, {
+      direction: 'before', anchorLine: 100, startLine: 98, lines: rows(98, 2), hasMore: true, continuation: 'blocked',
+    }, { anchor: anchor(101) });
+    if (applied.kind === 'rejected') throw new Error(applied.message);
+    const labels = historyStatusNotes(extension).map(note => note.text);
+    expect(applied.state.lines).toEqual(rows(98, 5));
+    for (const line of applied.state.lines) for (const label of labels) expect(line).not.toContain(label);
+  });
+
+  test('unreadable envelopes are refused (null), so the page is never drawn as EOF', () => {
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['unknown count as 0', { states: [{ kind: 'gap', gap: { ...flagGap('unknown', null), missingCount: 0 } }] }],
+      ['estimate without count', { states: [{ kind: 'gap', gap: flagGap('estimate', null) }] }],
+      ['blocked by exact', { before: { kind: 'blocked', cursor: FLAG_CURSOR, state: { kind: 'exact' } } }],
+      ['blocked without cursor', { before: { kind: 'blocked', state: { kind: 'pending', operationId: 'o', retryAfterMs: 1 } } }],
+      ['unknown capability', { capabilities: { ...FLAG_CAPS, supported: [...FLAG_CAPS.supported, 'telepathy-v9'] } }],
+      ['required not supported', { capabilities: { ...FLAG_CAPS, required: ['stitch-v1'] } }],
+      ['no history-states', { capabilities: { extensionVersion: 1, supported: ['catalog-v3'], required: [] } }],
+      ['unknown state kind', { states: [{ kind: 'eof' }] }],
+      ['bad remote reason', { states: [{ kind: 'remote-unavailable', range: FLAG_RANGE, bundleId: 'b', retryAfterMs: 1, reason: 'gone' }] }],
+      ['version 2', { version: 2 }],
+    ];
+    for (const [name, overrides] of bad) {
+      expect([name, parseNewarchHistoryExtension(flagExtension(overrides))]).toEqual([name, null]);
+    }
+    expect(parseNewarchHistoryExtension(null)).toBeNull();
+    expect(parseNewarchHistoryExtension(flagExtension()) as NewarchHistoryExtension | null).not.toBeNull();
   });
 });

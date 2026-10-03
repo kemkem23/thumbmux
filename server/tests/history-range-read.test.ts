@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { MuxClientMessage, SessionListItem } from "../../core/src/protocol";
 import { FileHistoryArchive } from "../src/history-archive";
 import { StreamDisplayEngine } from "../src/display-engine";
+import type { NewarchGap, NewarchHistoryExtension } from "../../core/src/protocol";
 import { STREAM_BUDGET, type CaptureEngine, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type ViewerRoute } from "../src/stream-contract";
 import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
 
@@ -614,4 +615,122 @@ test("NEWARCH D growth: late release cannot debit a reused viewer or a fresh res
   expect(engine.stats().wsPendingBytes).toBe(0);
   for (let i = 0; i < 10000; i++) engine.reserveEncodedBytes(`empty-${i}`, 0);
   expect(Object.values(engine).filter(v => v instanceof Map).every(v => v.size === 0)).toBe(true);
+});
+
+// ── NEWARCH flag-on lot D: typed history states survive the display engine ──
+
+const FLAG_CAPS = { extensionVersion: 1 as const, supported: ["history-states-v1", "catalog-v3"] as const, required: ["history-states-v1"] as const };
+const FLAG_CURSOR = { version: 1 as const, token: "opaque-from-h" };
+function flagGap(pane: { serverIdentity: string; paneId: string; birthGeneration: number } = DISPLAY_PANE, countKind: "unknown" | "exact" = "unknown", missingCount: number | null = null) {
+  return {
+    version: 1 as const, episodeId: "ep-d", parentEpisodeId: null, pane,
+    leftRowId: { pane, segmentId: "seg-1", rowOrdinal: 9 }, rightSegmentId: "seg-2",
+    reason: "pipe-eof" as const, countKind, missingCount, withheldRows: 1, lowerBound: 0,
+    openedAt: 1, closedAt: null, clockEpoch: "clock-d", quality: "degraded" as const,
+  } as unknown as NewarchGap;
+}
+function flagOnExtension(overrides: Partial<NewarchHistoryExtension> = {}): NewarchHistoryExtension {
+  return {
+    version: 1,
+    capabilities: { ...FLAG_CAPS, supported: [...FLAG_CAPS.supported], required: [...FLAG_CAPS.required] },
+    states: [
+      { kind: "gap", gap: flagGap() },
+      { kind: "remote-required", range: { pane: DISPLAY_PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-0" },
+      { kind: "pressure", level: "critical", collecting: true, sinceMonoMs: 3 },
+    ],
+    before: { kind: "blocked", cursor: FLAG_CURSOR, state: { kind: "pending", operationId: "op-d", retryAfterMs: 50 } },
+    after: { kind: "end" },
+    ...overrides,
+  };
+}
+
+async function flagOnHarness(
+  page: (view: ReadView) => HistoryPage,
+  // null = a display that was never negotiated for flag-on.
+  flagOn: ConstructorParameters<typeof StreamDisplayEngine>[0]["flagOn"] | null = { supported: ["history-states-v1", "catalog-v3"], required: true },
+) {
+  const h = displayHarness();
+  h.history.readPage = async ack => ({ status: "ok", value: page(ack.view) });
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history, ...(flagOn ? { flagOn } : {}) });
+  const route = displayRoute("flag-viewer");
+  const attached = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await attached;
+  const result = await engine.page(route, displayView(route, "flag-request", 5), null, 10, { isCancelled: () => false });
+  return { h, result };
+}
+
+test("NEWARCH D RD-01: a pending (blocked) page keeps its prefix and typed states, frozen, never EOF", async () => {
+  const { h, result } = await flagOnHarness(view => ({
+    ...displayPage(view, "prefix-row"), hasMoreBefore: true, flagOn: flagOnExtension(),
+  }));
+  expect(result.status).toBe("ok");
+  if (result.status !== "ok") return;
+  expect(result.value.fragments.map(f => f.row.cells[0]!.text)).toEqual(["prefix-row"]);
+  expect(result.value.hasMoreBefore).toBe(true);
+  expect(result.value.flagOn?.before).toEqual(flagOnExtension().before);
+  expect(result.value.flagOn?.states.map(s => s.kind)).toEqual(["gap", "remote-required", "pressure"]);
+  const gap = result.value.flagOn!.states[0]!;
+  expect(gap.kind === "gap" && gap.gap.missingCount).toBeNull();
+  expect(Object.isFrozen(result.value.flagOn!.states)).toBe(true);
+  // Labels/states never ride inside row cells.
+  expect(JSON.stringify(result.value.fragments)).not.toContain("pending");
+  expect(h.released).toEqual([{ requestId: "flag-request", reason: "page-complete" }]);
+});
+
+test("NEWARCH D RD-01: an empty blocked page is ok with more-before, not an empty EOF page", async () => {
+  const { result } = await flagOnHarness(view => ({
+    ...displayPage(view, "x"), fragments: [], payloadBytes: 0, hasMoreBefore: true, flagOn: flagOnExtension(),
+  }));
+  expect(result.status).toBe("ok");
+  if (result.status === "ok") {
+    expect(result.value.fragments).toHaveLength(0);
+    expect(result.value.hasMoreBefore).toBe(true);
+    expect(result.value.flagOn?.before.kind).toBe("blocked");
+  }
+});
+
+test("NEWARCH D: pages that would read as false EOF or hide states are refused with the pin released", async () => {
+  const cases: Array<[string, (view: ReadView) => HistoryPage, "integrity" | "unsupported"]> = [
+    ["blocked edge but legacy hasMoreBefore=false", view => ({ ...displayPage(view, "r"), flagOn: flagOnExtension() }), "integrity"],
+    ["end edge but legacy hasMoreAfter=true", view => ({ ...displayPage(view, "r"), hasMoreBefore: true, hasMoreAfter: true, flagOn: flagOnExtension() }), "integrity"],
+    ["required flag-on but bare page", view => displayPage(view, "r"), "integrity"],
+    ["unknown count rendered as 0", view => ({ ...displayPage(view, "r"), hasMoreBefore: true,
+      flagOn: flagOnExtension({ states: [{ kind: "gap", gap: { ...flagGap(), missingCount: 0 } as unknown as NewarchGap }] }) }), "integrity"],
+    ["gap of another pane", view => ({ ...displayPage(view, "r"), hasMoreBefore: true,
+      flagOn: flagOnExtension({ states: [{ kind: "gap", gap: flagGap({ ...DISPLAY_PANE, paneId: "%99" }) }] }) }), "integrity"],
+    ["blocked by exact", view => ({ ...displayPage(view, "r"), hasMoreBefore: true,
+      flagOn: flagOnExtension({ before: { kind: "blocked", cursor: FLAG_CURSOR, state: { kind: "exact" } as never } }) }), "integrity"],
+    ["unknown state kind", view => ({ ...displayPage(view, "r"), hasMoreBefore: true,
+      flagOn: flagOnExtension({ states: [{ kind: "eof" } as never] }) }), "integrity"],
+    ["required capability not negotiated", view => ({ ...displayPage(view, "r"), hasMoreBefore: true,
+      flagOn: flagOnExtension({ capabilities: { extensionVersion: 1, supported: ["history-states-v1", "stitch-v1"], required: ["stitch-v1"] } }) }), "unsupported"],
+  ];
+  for (const [name, page, code] of cases) {
+    const { h, result } = await flagOnHarness(page);
+    expect([name, result.status, result.status === "error" ? result.code : null]).toEqual([name, "error", code]);
+    expect([name, h.released.length]).toEqual([name, 1]);
+  }
+});
+
+test("NEWARCH D: a display not negotiated for flag-on refuses an envelope instead of dropping it", async () => {
+  const { result } = await flagOnHarness(view => ({
+    ...displayPage(view, "r"), hasMoreBefore: true, flagOn: flagOnExtension(),
+  }), null);
+  expect(result).toEqual({ status: "error", code: "unsupported", message: "display was not negotiated for flag-on history states" });
+});
+
+test("NEWARCH D: a history that stays busy returns busy, never an empty EOF page", async () => {
+  const h = displayHarness();
+  let calls = 0;
+  h.history.readPage = async () => { calls++; return { status: "busy", retryAfterMs: 1, reason: "queue" }; };
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("busy-viewer");
+  const attached = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await attached;
+  const result = await engine.page(route, displayView(route, "busy", 0), null, 10, { isCancelled: () => false });
+  expect(result.status).toBe("busy");
+  expect(calls).toBe(STREAM_BUDGET.maxReadRetries + 1);
+  expect(h.released).toEqual([{ requestId: "busy", reason: "busy" }]);
 });

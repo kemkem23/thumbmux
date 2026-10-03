@@ -35,8 +35,12 @@
   import {
     applyHistoryWindowPage,
     createHistoryWindow,
+    historyContinuationFor,
+    historyStatusNotes,
     historyWindowEndLine,
     historyWindowRequestCursor,
+    parseNewarchHistoryExtension,
+    type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
     type HistoryWindowState,
@@ -75,6 +79,7 @@
     validateHistoryPageMarkers,
     type MuxHistoryBoundary,
     type NewarchFrameMeta,
+    type NewarchHistoryExtension,
     isClaudeActivityStatusLine,
     detectClaudeBashBlocks,
     detectClaudeBashBlocksWithActivityEvidence,
@@ -531,11 +536,24 @@
   let pageLossMarkers = $state.raw<readonly LossMarker[]>([]);
   let lossMarkerPaneIdentity = '';
   const PAGE_LOSS_MARKER_LIMIT = 256;
+  const HISTORY_STATUS_NOTE_LIMIT = 6;
   /** Markers raised while this view watched; noted until their row is seen. */
   let freshLossKeys = $state.raw<ReadonlySet<string>>(new Set());
   const seenFreshLossKeys = new Set<string>();
   /** A history page read failed and nothing replaced it yet (CX M7). */
   let archiveUnavailable = $state(false);
+  // NEWARCH flag-on history states (gap/pending/remote/degraded/pressure) of
+  // the newest page per direction. Shown as notes beside the rows, never as
+  // row text, so copy and search cannot pick a label up as terminal output.
+  let historyStatusBefore = $state.raw<readonly HistoryStatusNote[]>([]);
+  let historyStatusAfter = $state.raw<readonly HistoryStatusNote[]>([]);
+  const historyStatus = $derived.by(() => {
+    const seen = new Map<string, HistoryStatusNote>();
+    for (const note of [...historyStatusBefore, ...historyStatusAfter]) {
+      if (!seen.has(note.key)) seen.set(note.key, note);
+    }
+    return [...seen.values()].slice(-HISTORY_STATUS_NOTE_LIMIT);
+  });
 
   // --- search + matching overlay ---
   let searchOpen = $state(false);
@@ -4068,6 +4086,7 @@
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       archiveUnavailable = false;
+      clearHistoryStatus();
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
       return unchanged;
     }
@@ -4861,6 +4880,8 @@
     totalArchivedLines: number;
     hasMore: boolean;
     markers: LossMarker[];
+    /** Flag-on states; null on a legacy page. */
+    flagOn: NewarchHistoryExtension | null;
   };
 
   function parseHistoryPage(data: string): ParsedHistoryPage | null {
@@ -4917,6 +4938,9 @@
     // drawing its rows without their gaps would hide a loss.
     const markers = validateHistoryPageMarkers(candidate.markers);
     if (markers === null) return null;
+    // Same rule for flag-on states: unreadable states refuse the page.
+    const flagOn = parseHistoryPageFlagOn(payload);
+    if (flagOn === undefined) return null;
     return {
       lines: [...lines],
       startLine,
@@ -4924,7 +4948,42 @@
       totalArchivedLines,
       hasMore: candidate.hasMore,
       markers: markers.map(marker => ({ lineId: marker.lineId, kind: marker.kind, missingCount: marker.missingCount })),
+      flagOn,
     };
+  }
+
+  /** undefined = present but unreadable (refuse the page); null = legacy. */
+  function parseHistoryPageFlagOn(payload: object): NewarchHistoryExtension | null | undefined {
+    if (!('flagOn' in payload) || (payload as { flagOn?: unknown }).flagOn === undefined) return null;
+    return parseNewarchHistoryExtension((payload as { flagOn: unknown }).flagOn) ?? undefined;
+  }
+
+  /**
+   * Flag-on continuation for the requested direction, checked against the
+   * legacy flag. `end` with hasMore, or blocked/more without it, is a lying
+   * page: refuse it rather than draw a false EOF or a false "more".
+   */
+  function flagOnContinuation(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+    hasMore: boolean,
+  ): 'end' | 'more' | 'blocked' | null | undefined {
+    if (flagOn === null) return null;
+    const continuation = historyContinuationFor(flagOn, direction);
+    return (continuation === 'end') === hasMore ? undefined : continuation;
+  }
+
+  function recordHistoryStatus(flagOn: NewarchHistoryExtension | null, direction: HistoryWindowDirection): void {
+    const notes = flagOn ? historyStatusNotes(flagOn) : [];
+    const held = direction === 'before' ? historyStatusBefore : historyStatusAfter;
+    if (held.length === 0 && notes.length === 0) return;
+    if (direction === 'before') historyStatusBefore = notes;
+    else historyStatusAfter = notes;
+  }
+
+  function clearHistoryStatus(): void {
+    if (historyStatusBefore.length) historyStatusBefore = [];
+    if (historyStatusAfter.length) historyStatusAfter = [];
   }
 
   function seedSlidingHistoryWindow(history: ParsedHistoryPage): {
@@ -5332,12 +5391,19 @@
       return;
     }
     const history = parseHistoryPage(data);
-    if (!history || (history.lines.length === 0 && history.hasMore)) {
+    const continuation = history ? flagOnContinuation(history.flagOn, direction, history.hasMore) : undefined;
+    if (
+      !history
+      || continuation === undefined
+      // Only a blocked edge may arrive empty with more to read.
+      || (history.lines.length === 0 && history.hasMore && continuation !== 'blocked')
+    ) {
       finishArchiveRequest('malformed');
       return;
     }
     archiveTotalHint = Math.max(archiveTotalHint, history.totalArchivedLines);
     recordPageLossMarkers(history.markers);
+    recordHistoryStatus(history.flagOn, direction);
     if (archiveWindow && isAwayFromLiveTail()) {
       detachSlidingArchiveFromLive(archiveTotalHint);
     }
@@ -5401,6 +5467,9 @@
                 : history.endLine < archiveTotalHint
             )
           : history.hasMore,
+        // The after-edge hasMore above may be widened by the live boundary,
+        // so only the blocked state is passed through (it never means EOF).
+        ...(continuation === 'blocked' ? { continuation } : {}),
       },
       { anchor: reader.anchor, protectedRange: reader.protectedRange },
     );
@@ -5519,6 +5588,13 @@
     }
 
     const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
+    const flagOn = parseHistoryPageFlagOn(payload as object);
+    const continuation = flagOn === undefined ? undefined : flagOnContinuation(flagOn, 'before', history.hasMore);
+    if (continuation === undefined) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    recordHistoryStatus(flagOn, 'before');
     const lines = history.lines;
     const historyStartLine = typeof history.startLine === 'number' ? history.startLine : null;
     if (
@@ -5530,8 +5606,11 @@
     }
     // A nonempty page without a numeric cursor can be rendered once, but it
     // cannot be advanced safely: requesting before null would duplicate it.
-    const serverSaysEnd =
-      historyStartLine === null || !history.hasMore || lines.length === 0;
+    // A blocked edge (pending/gap/remote) is never the end; only a nonempty
+    // cursorless page still cannot be advanced from.
+    const serverSaysEnd = continuation === 'blocked'
+      ? historyStartLine === null && lines.length > 0
+      : historyStartLine === null || !history.hasMore || lines.length === 0;
     if (lines.length === 0) {
       // An empty page contributes no resident bytes, even if a custom host
       // sends a numeric cursor with it. Keep the last resident floor; only the
@@ -5674,6 +5753,7 @@
     if (identity !== lossMarkerPaneIdentity) {
       lossMarkerPaneIdentity = identity;
       if (pageLossMarkers.length) pageLossMarkers = [];
+      clearHistoryStatus();
     }
     lossMarkerFrame = { liveStartLine: newarch.liveStartLine, lines: frameLines };
     lossMarkers = newarch.markers.map(marker => ({ ...marker }));
@@ -6898,6 +6978,7 @@
    * Live pane content stays.
    */
   function discardArchiveForAltScreen(): void {
+    clearHistoryStatus();
     cancelScheduledPrependWork();
     pendingPrependWork = null;
     prependParseSeq++;
@@ -7254,6 +7335,7 @@
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
   data-history-stop={historyStopReason}
+  data-history-states={historyStatus.length ? historyStatus.map(note => note.kind).join(' ') : undefined}
   data-history-paging={historyPaging}
   data-history-ceiling={historyPaging === 'ceiling' && historyStopReason === 'ceiling' ? '1' : undefined}
   data-history-window-start={archiveWindow?.startLine}
@@ -7469,7 +7551,7 @@
       <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
     </div>
   {/if}
-  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable}
+  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable || historyStatus.length > 0}
     <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
       {#if lossMarkerPlacement.notes.length > 0}
         {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]!}
@@ -7486,6 +7568,19 @@
           <span class="mtv-signpost-text">{note}</span>
         </button>
       {/if}
+      {#each historyStatus as note (note.key)}
+        <div
+          class="mtv-loss-note mtv-history-status"
+          role="note"
+          data-testid="mtv-history-status"
+          data-history-state={note.kind}
+          data-history-state-detail={note.detail}
+          aria-label={note.text}
+          title={note.detail}
+        >
+          <span class="mtv-signpost-text">{note.text}</span>
+        </div>
+      {/each}
       {#if archiveUnavailable}
         <div class="mtv-loss-note" role="note" data-testid="mtv-archive-unavailable"
           aria-label="อ่านประวัติส่วนนี้ไม่ได้ตอนนี้ · เลื่อนอีกครั้งเพื่อลองใหม่">
