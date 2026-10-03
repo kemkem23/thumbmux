@@ -11,7 +11,8 @@ import {
 import type {
   ArchiveCandidate, ArchiveCandidateSource, RemoteResult, RemoteStore,
 } from "../../../../src/integrations/stream-history-offload";
-import type { ArchiveCatalogPort, FlagOnHistoryPort, PaneKey, SealedExport, StoragePressure } from "../src/stream-contract";
+import { archiveInventoryMatches } from "../src/stream-contract";
+import type { ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, FlagOnHistoryPort, PaneKey, SealedExport, StoragePressure } from "../src/stream-contract";
 
 let root = "";
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "thumbmux-caps-")); });
@@ -210,6 +211,7 @@ class FaultyRemote implements RemoteStore {
 class Synthetic implements Pick<FlagOnHistoryPort, "sealExport" | "reclaimVerified">, Pick<ArchiveCatalogPort, "commitRemoteIndex">, ArchiveCandidateSource {
   events: string[] = [];
   crash: { commit?: boolean; reclaim?: boolean } = {};
+  lostAck: { ids: string[] } | null = null;
   readonly original: Record<string, string> = {};
   constructor(readonly base: string, readonly remoteDir: string, readonly segments: string[], bytes = 3000) {
     for (const id of segments) {
@@ -235,6 +237,12 @@ class Synthetic implements Pick<FlagOnHistoryPort, "sealExport" | "reclaimVerifi
     return { status: "ok" as const, value };
   }
   async commitRemoteIndex(req: Parameters<ArchiveCatalogPort["commitRemoteIndex"]>[0]) {
+    if (this.lostAck) {
+      this.lostAck.ids.push(req.verified.verificationId);
+      if (this.lostAck.ids.length === 1) throw new Error("lost ack after durable commit");
+      if (this.lostAck.ids[0] !== req.verified.verificationId)
+        return { status: "error" as const, code: "integrity" as const, message: "catalog remote retry readback mismatch" };
+    }
     if (this.crash.commit) { this.crash.commit = false; throw new Error("injected crash before catalog commit"); }
     this.events.push(`commit:${req.sealed.segmentId}`);
     return { status: "ok" as const, value: { kind: "remote-index-committed" as const, catalogVersion: 3 as const, commitId: `c-${req.sealed.segmentId}`,
@@ -358,12 +366,20 @@ test("DS-01 offline and quota errors back off with jitter, alert, keep local dat
 });
 
 test("DS-01 ENOSPC is an emergency that still archives verified data and closes admission", async () => {
-  const { syn, worker } = setup();
+  const { syn, worker, store } = setup();
   const r = await worker.archiveOnce(pressure({ ioError: "ENOSPC" }), NEVER);
   expect(state(r)).toBe("LOCAL_RECLAIMED");
   expect(worker.status().level).toBe("emergency");
   expect(worker.status().alerts.map((a) => a.kind)).toContain("pressure-emergency");
   expect(syn.events).toEqual(["seal:seg-a", "commit:seg-a", "reclaim:seg-a"]);
+  const names = readdirSync(join(store, "archive", "ops")).filter((name) => name.endsWith(".json"));
+  expect(names).toHaveLength(1);
+  const record = JSON.parse(readFileSync(join(store, "archive", "ops", names[0]!), "utf8")) as {
+    sealed: SealedExport; bundle: ArchiveBundle & { repair?: { revision: number; inventory: ArchiveInventoryR2 } };
+  };
+  expect(record.bundle.repair?.revision).toBe(2);
+  expect(archiveInventoryMatches(record.sealed, record.bundle, record.bundle.repair!.inventory)).toBe(true);
+  expect(record.bundle.manifest.sha256).not.toBe(record.sealed.manifest.sha256);
 });
 
 test("DS-01 a crash at every archive state resumes from the journal and never unlinks before the remote commit", async () => {
@@ -404,4 +420,13 @@ test("DS-01 concurrency stays locked while remote upload awaits, and successful 
     expect(syn.events).toEqual(["seal:seg-a"]);
   } finally { release(); await running; }
   expect(readdirSync(join(store, "archive", "staging"))).toEqual([]);
+});
+
+test("DS-01 a lost catalog ACK retries the same verification instead of minting a new id", async () => {
+  const { syn, make, worker } = setup();
+  syn.lostAck = { ids: [] };
+  await expect(worker.archiveOnce(HIGH, NEVER)).rejects.toThrow(/lost ack after durable commit/);
+  expect(state(await make().archiveOnce(pressure(), NEVER))).toBe("LOCAL_RECLAIMED");
+  expect(syn.lostAck.ids).toHaveLength(2);
+  expect(syn.lostAck.ids[0]).toBe(syn.lostAck.ids[1]);
 });
