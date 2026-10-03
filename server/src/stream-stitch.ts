@@ -292,9 +292,11 @@ const colorCode = (color: string): number => {
   const [r, g, b] = color.slice(4).split(',').map(Number);
   return 256 + ((r! << 16) | (g! << 8) | b!);
 };
-/** MUTANT M1: Cell.style is the old [bits, fg, bg] tuple, including -1. */
-const observedCell = (cell: TmuxObservedCell): Cell =>
-  ({ text: cell.grapheme, width: cell.width, style: [cell.style, colorCode(cell.fg), colorCode(cell.bg)] });
+/** Decoder bits stay on TmuxObservedCell. Durable Cell.style is canonical SGR. */
+const observedCell = (cell: TmuxObservedCell): Cell => semanticCellToCell({
+  text: cell.grapheme, width: cell.width,
+  style: { attrs: cell.style, fg: colorCode(cell.fg), bg: colorCode(cell.bg) },
+});
 
 /** Rows of one `capture-pane -p -e -C -N -S - -E -` payload. History rows
  * (index < historySize) are finalized; screen rows are not. Capture never
