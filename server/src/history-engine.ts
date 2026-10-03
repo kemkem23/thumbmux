@@ -1467,17 +1467,21 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     for(const id of ids){const d=this.load<ReplayDecisionR2>('decision',String(id.id))!;if(size+bytes(d)>r.maxBytes){fhAssert(entries.length,'decision exceeds page budget');break;}size+=bytes(d);entries.push(d);}
     const next=r.direction==='before'?from:from+entries.length;return {entries,next:(r.direction==='before'?next>0:next<all)?this.cursor(r.pane,next):null};
   }
-  private controlCursor(pane:PaneKey,w:ReplayWatermarkR2,n:number):NewarchHistoryCursor {
-    const body={store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,n};
+  private controlCursor(pane:PaneKey,w:ReplayWatermarkR2,last:{byteOffset:number;order:number;eventId:string}):NewarchHistoryCursor {
+    const body={store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,last};
     return {version:1,token:Buffer.from(streamCanonical({...body,hash:streamDigest('history-control-cursor-r2',body)})).toString('base64url')};
   }
-  private controlAt(pane:PaneKey,w:ReplayWatermarkR2,cursor:NewarchHistoryCursor|null):number {
-    if(!cursor)return 0;
+  /** Scan start: the watermark itself, or the last entry a previous page returned. */
+  private controlAt(pane:PaneKey,w:ReplayWatermarkR2,cursor:NewarchHistoryCursor|null):{off:number;order:number;id:string|null} {
+    if(!cursor)return {off:w.through.byteOffset,order:w.controlOrder,id:null};
     fhAssert(cursor.version===1&&cursor.token.length>0&&cursor.token.length<=4096,'cursor bound/version');
-    const {hash,...body}=JSON.parse(Buffer.from(cursor.token,'base64url').toString()) as {hash:string;n:number};
+    const {hash,...body}=JSON.parse(Buffer.from(cursor.token,'base64url').toString()) as {hash:string;last:{byteOffset:number;order:number;eventId:string}};
     fhAssert(hash===streamDigest('history-control-cursor-r2',body),'control cursor identity');
-    fhAssert(equal(body,{store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,n:body.n}),'control cursor identity');
-    safe(body.n);return body.n;
+    const last=body.last;fhAssert(last&&typeof last==='object','control cursor identity');
+    fhAssert(equal(body,{store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,last}),'control cursor identity');
+    safe(last.byteOffset);safe(last.order);nonempty(last.eventId);
+    fhAssert(last.byteOffset>w.through.byteOffset||last.byteOffset===w.through.byteOffset&&last.order>w.controlOrder,'control cursor before watermark');
+    return {off:last.byteOffset,order:last.order,id:last.eventId};
   }
   /** Read controls already stored under kind `control`. Does not apply them. */
   private readControls(r:OrderedControlReadR2):OrderedControlPageR2 {
@@ -1488,15 +1492,17 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     safe(w.through.byteOffset);safe(w.controlOrder);nonempty(w.checkpointId);nonempty(w.decoderVersion);
     const stored=this.load<ReplayWatermarkR2>('watermark',paneKey(r.pane));
     fhAssert(stored&&equal(stored,w),'control watermark mismatch');
-    const start=this.controlAt(r.pane,w,r.cursor),key=paneKey(r.pane),epochKey=streamCanonical(w.through.epoch);
+    const key=paneKey(r.pane),epochKey=streamCanonical(w.through.epoch);
+    // Start at the watermark (or the cursor), never at the head of the journal: control rows are
+    // never deleted, so a long-lived pane would otherwise exhaust the scan bound before reaching them.
+    let {off,order,id}=this.controlAt(r.pane,w,r.cursor),examined=0;
     const matches:OrderedControlEntryR2[]=[];
-    let off=-1,order=-1,id='',examined=0;
-    while(matches.length<=start+r.maxEntries){
-      const row=this.db.query(`SELECT id FROM fh_r2 WHERE kind='control' AND pane=? AND (
+    while(matches.length<=r.maxEntries){
+      const row=this.db.query(`SELECT id FROM fh_r2 WHERE kind='control' AND pane=? AND json_extract(payload,'$.position.epoch.attachId')=? AND (
         json_extract(payload,'$.position.byteOffset')>?
         OR (json_extract(payload,'$.position.byteOffset')=? AND json_extract(payload,'$.order')>?)
-        OR (json_extract(payload,'$.position.byteOffset')=? AND json_extract(payload,'$.order')=? AND id>?)
-      ) ORDER BY json_extract(payload,'$.position.byteOffset'), json_extract(payload,'$.order'), id LIMIT 1`).get(key,off,off,order,off,order,id) as SqlRow|null;
+        OR (json_extract(payload,'$.position.byteOffset')=? AND json_extract(payload,'$.order')=? AND ? IS NOT NULL AND id>?)
+      ) ORDER BY json_extract(payload,'$.position.byteOffset'), json_extract(payload,'$.order'), id LIMIT 1`).get(key,w.through.epoch.attachId,off,off,order,off,order,id,id) as SqlRow|null;
       if(!row)break;
       examined++;fhAssert(examined<=1024,'control journal bound');
       const nextId=String(row.id),event=this.load<OrderedControlR2>('control',nextId);
@@ -1504,21 +1510,20 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
       const {digest:d,...body}=event;
       fhAssert(event.revision===2&&event.eventId===nextId&&orderedControlDigest(body)===d,'control digest');
       safe(event.position.byteOffset);safe(event.order);
-      fhAssert(event.position.byteOffset>off||event.position.byteOffset===off&&(event.order>order||event.order===order&&nextId>id),'control scan stalled');
+      fhAssert(event.position.byteOffset>off||event.position.byteOffset===off&&(event.order>order||event.order===order&&id!==null&&nextId>id),'control scan stalled');
       off=event.position.byteOffset;order=event.order;id=nextId;
       if(streamCanonical(event.position.epoch)!==epochKey)continue;
-      if(!(event.position.byteOffset>w.through.byteOffset||event.position.byteOffset===w.through.byteOffset&&event.order>w.controlOrder))continue;
       matches.push({commitId:nextId,event});
     }
-    fhAssert(start<=matches.length,'control cursor outside journal');
-    const rest=matches.slice(start),entries:OrderedControlEntryR2[]=[];
-    for(const entry of rest){
+    const entries:OrderedControlEntryR2[]=[];
+    for(const entry of matches){
       if(entries.length===r.maxEntries)break;
       const candidate=[...entries,entry];
       if(bytes(candidate)>r.maxBytes){fhAssert(entries.length>0,'control entry exceeds page budget');break;}
       entries.push(entry);
     }
-    const atDurableHead=rest.length===entries.length,next=atDurableHead?null:this.controlCursor(r.pane,w,start+entries.length);
+    const atDurableHead=matches.length===entries.length,last=entries.at(-1)?.event;
+    const next=atDurableHead||!last?null:this.controlCursor(r.pane,w,{byteOffset:last.position.byteOffset,order:last.order,eventId:last.eventId});
     return {revision:2,pane:r.pane,checkpointId:w.checkpointId,entries,payloadBytes:bytes(entries),next,atDurableHead};
   }
   private logical(r:OperationFence&{segmentId:string}):LogicalSealR2 {
