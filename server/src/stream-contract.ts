@@ -796,7 +796,7 @@ export function attachCoverage(set: AttachReceiptSetR2, receipts: readonly RowsA
     if (rows !== entry.rows) throw Error('attach row coverage');
   }
   if (set.terminalCommitId !== set.entries[set.entries.length - 1]!.commitId) throw Error('attach terminal receipt');
-  return receipts[receipts.length - 1]!.coverage;
+  return coverage;
 }
 export interface StagedRowsR2 extends RowsAndGapsCommit {
   readonly repair: { readonly revision: 2; readonly transactionId: string; readonly epoch: PipeEpoch;
