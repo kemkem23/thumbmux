@@ -1231,3 +1231,414 @@ test('stream I real pipe: a legacy writer that throws or does not list the sessi
     expect(text).toEqual(printed.slice(0,text.length));expect(text.length).toBeGreaterThan(F+10);
   }finally{await r.cleanup();}
 },60000);
+
+// ---------------------------------------------------------------------------
+// T11 (NEWARCH flag-on lot 11-T) — independent oracle + adversarial fixtures.
+// The oracle never calls matcher/stitch/product code: expected timelines are
+// literal producer events; verdicts are literal violation codes. Product-side
+// integration (B1-02/B1-03/B2-03/B3-02/OFF-01 against S/C/H/A/W wired by I) is
+// NOT claimed here — those cases are registered below as pending until I lands.
+// The region between the markers is self-contained so MUTATION runs can copy it.
+// ---------------------------------------------------------------------------
+// T11-ORACLE-BEGIN
+type T11Expected = { readonly text: string; readonly epoch: string };
+type T11Actual =
+  | { readonly kind: 'row'; readonly pane: string; readonly epoch: string; readonly text: string }
+  | { readonly kind: 'gap'; readonly pane: string; readonly positioned: boolean;
+      readonly countKind: 'exact' | 'estimate' | 'unknown'; readonly missingCount: number | null; readonly lowerBound: number };
+type T11Mode = 'normal' | 'planned' | 'fault' | 'recoverable';
+type T11Verdict = { readonly violations: readonly string[]; readonly matched: number; readonly missing: number; readonly covered: number };
+
+/** Longest strictly increasing subsequence; returns the kept positions. */
+function t11Lis(values: readonly number[]): Set<number> {
+  const tails: number[] = []; const prev = new Array<number>(values.length).fill(-1);
+  for (let i = 0; i < values.length; i++) {
+    let lo = 0, hi = tails.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (values[tails[mid]!]! < values[i]!) lo = mid + 1; else hi = mid; }
+    if (lo > 0) prev[i] = tails[lo - 1]!;
+    tails[lo] = i;
+  }
+  const kept = new Set<number>();
+  for (let i = tails.length ? tails[tails.length - 1]! : -1; i >= 0; i = prev[i]!) kept.add(i);
+  return kept;
+}
+
+/** Judge one pane's product timeline against the producer's literal events. */
+function t11JudgeTimeline(pane: string, expected: readonly T11Expected[], actual: readonly T11Actual[], mode: T11Mode): T11Verdict {
+  const v = new Set<string>();
+  const occurrences = new Map<string, number[]>();
+  expected.forEach((e, i) => occurrences.set(e.text, [...(occurrences.get(e.text) ?? []), i]));
+  const matchOf = new Array<number>(actual.length).fill(-1); // actual index -> expected index
+  const misplaced = new Set<number>(); // expected events present but out of order
+  const rowIdx: number[] = [];
+  actual.forEach((a, i) => {
+    if (a.pane !== pane) { v.add('cross-pane'); return; }
+    if (a.kind === 'row') rowIdx.push(i);
+    else if (!a.positioned) v.add('unpositioned-gap');
+  });
+  // 1. Unique texts are anchors (producer-stamped IDs); order = LIS over expected index.
+  const anchors = rowIdx.filter(i => (occurrences.get((actual[i] as { text: string }).text)?.length ?? 0) === 1);
+  const anchorExp = anchors.map(i => occurrences.get((actual[i] as { text: string }).text)![0]!);
+  const kept = t11Lis(anchorExp);
+  const usedExp = new Set<number>();
+  anchors.forEach((ai, k) => { if (kept.has(k)) { matchOf[ai] = anchorExp[k]!; usedExp.add(anchorExp[k]!); } });
+  // 2. Repeated (unstamped) texts: count-preserving in-order match between anchors.
+  const boundaries = [-1, ...anchors.filter((_, k) => kept.has(k)), actual.length];
+  for (let b = 0; b + 1 < boundaries.length; b++) {
+    const lo = boundaries[b]!, hi = boundaries[b + 1]!;
+    const eLo = lo < 0 ? -1 : matchOf[lo]!, eHi = hi >= actual.length ? expected.length : matchOf[hi]!;
+    let cursor = eLo + 1;
+    for (let i = lo + 1; i < hi; i++) {
+      const a = actual[i]!;
+      if (a.kind !== 'row' || a.pane !== pane || (occurrences.get(a.text)?.length ?? 0) < 2) continue;
+      let e = cursor;
+      while (e < eHi && (expected[e]!.text !== a.text || usedExp.has(e))) e++;
+      if (e < eHi) { matchOf[i] = e; usedExp.add(e); cursor = e + 1; }
+    }
+  }
+  // 3. Every unmatched row is a duplicate, an order violation or an extra.
+  for (const i of rowIdx) {
+    if (matchOf[i]! >= 0) { if ((actual[i] as { epoch: string }).epoch !== expected[matchOf[i]!]!.epoch) v.add('wrong-epoch'); continue; }
+    const owners = occurrences.get((actual[i] as { text: string }).text);
+    if (!owners) v.add('extra');
+    else if (owners.every(e => usedExp.has(e))) v.add('duplicate');
+    else { v.add('order'); misplaced.add(owners.find(e => !usedExp.has(e))!); }
+  }
+  // 4. Missing runs need a positioned gap strictly between their matched neighbours.
+  const posOfExp = new Map<number, number>();
+  matchOf.forEach((e, i) => { if (e >= 0) posOfExp.set(e, i); });
+  const gapAt = (lo: number, hi: number) => actual.some((a, i) => i > lo && i < hi && a.kind === 'gap' && a.pane === pane && a.positioned);
+  const present = (e: number) => usedExp.has(e) || misplaced.has(e);
+  let missing = 0, covered = 0;
+  for (let e = 0; e < expected.length; e++) {
+    if (present(e)) continue;
+    let end = e; while (end + 1 < expected.length && !present(end + 1)) end++;
+    const run = end - e + 1; missing += run;
+    const lo = e === 0 ? -1 : posOfExp.get(e - 1)!;
+    const hi = end + 1 >= expected.length ? actual.length : posOfExp.get(end + 1)!;
+    if (gapAt(lo, hi)) covered += run; else v.add('silent-missing');
+    e = end;
+  }
+  // 5. Count claims: grouped per interval between matched rows.
+  const matchedPos = [...posOfExp.values()].sort((a, b) => a - b);
+  const groups = new Map<string, { gaps: Extract<T11Actual, { kind: 'gap' }>[]; missing: number }>();
+  actual.forEach((a, i) => {
+    if (a.kind !== 'gap' || a.pane !== pane || !a.positioned) return;
+    const lo = [...matchedPos].reverse().find(p => p < i) ?? -1;
+    const hi = matchedPos.find(p => p > i) ?? actual.length;
+    const eLo = lo < 0 ? -1 : matchOf[lo]!, eHi = hi >= actual.length ? expected.length : matchOf[hi]!;
+    let m = 0; for (let e = eLo + 1; e < eHi; e++) if (!present(e)) m++;
+    const key = `${lo}:${hi}`;
+    const g = groups.get(key) ?? { gaps: [], missing: m }; g.gaps.push(a); groups.set(key, g);
+  });
+  for (const { gaps, missing: m } of groups.values()) {
+    for (const g of gaps) {
+      if (g.countKind === 'unknown' && g.missingCount !== null) v.add('unknown-as-number');
+      if (g.countKind !== 'unknown' && g.missingCount === null) v.add('known-count-null');
+    }
+    if (gaps.every(g => g.countKind === 'exact') && gaps.reduce((s, g) => s + (g.missingCount ?? 0), 0) !== m) v.add('exact-count-wrong');
+    if (gaps.reduce((s, g) => s + g.lowerBound, 0) > m) v.add('lower-bound-exceeds');
+  }
+  // 6. Mode: normal/planned allow no gap and no loss; a recoverable fixture must recover.
+  if (mode === 'normal' || mode === 'planned') {
+    if (actual.some(a => a.kind === 'gap')) v.add('gap-in-normal');
+    if (missing) v.add('missing-in-normal');
+  }
+  if (mode === 'recoverable' && missing) v.add('not-recovered');
+  return { violations: [...v].sort(), matched: usedExp.size, missing, covered };
+}
+
+/** Raw spool replay judge: exact bytes, one epoch, contiguous offsets from 0. */
+function t11JudgeRawReplay(oracle: Uint8Array, epoch: string,
+  records: readonly { readonly epoch: string; readonly start: number; readonly end: number; readonly bytes: Uint8Array }[]): string[] {
+  const v = new Set<string>(); let offset = 0;
+  for (const r of records) {
+    if (r.epoch !== epoch) { v.add('wrong-epoch'); continue; }
+    if (r.end - r.start !== r.bytes.length) v.add('length-mismatch');
+    if (r.start > offset) v.add('offset-hole');
+    if (r.start < offset) v.add('offset-overlap');
+    for (let i = 0; i < r.bytes.length; i++) if (oracle[r.start + i] !== r.bytes[i]) { v.add('byte-mismatch'); break; }
+    offset = Math.max(offset, r.end);
+  }
+  if (offset < oracle.length) v.add('short');
+  if (offset > oracle.length) v.add('long');
+  return [...v].sort();
+}
+
+/** S's independent raw oracle (02-S evidence/fixture-vectors.json), regenerated. */
+function t11RawOracle(): Uint8Array {
+  const parts: string[] = ['\x1b[31m'];
+  for (let i = 0; i < 4608; i++) parts.push((i === 101 || i === 102 ? 'REPEATED' : `${String(i).padStart(5, '0')}: กข界 é`) + '\r\n');
+  parts.push('\x1b[0mEND');
+  const text = new TextEncoder().encode(parts.join(''));
+  const out = new Uint8Array(text.length + 2); out.set(text); out.set([0x00, 0xff], text.length);
+  return out;
+}
+
+const t11Ev = (n: number, epoch = 'e1') => ({ text: `EV${String(n).padStart(5, '0')}`, epoch });
+const t11Row = (n: number, epoch = 'e1', pane = 'p1'): T11Actual => ({ kind: 'row', pane, epoch, text: `EV${String(n).padStart(5, '0')}` });
+const t11Gap = (countKind: 'exact' | 'estimate' | 'unknown', missingCount: number | null, lowerBound = 0, positioned = true): T11Actual =>
+  ({ kind: 'gap', pane: 'p1', positioned, countKind, missingCount, lowerBound });
+const t11Range = (a: number, b: number, epoch = 'e1') => Array.from({ length: b - a + 1 }, (_, i) => t11Row(a + i, epoch));
+
+/** Adversarial timelines with literal verdicts. Expected codes are hand-written. */
+function t11TimelineFixtures(): { name: string; mode: T11Mode; expected: T11Expected[]; actual: T11Actual[]; violations: string[] }[] {
+  const base = Array.from({ length: 100 }, (_, i) => t11Ev(i + 1));
+  // Two identical adjacent events (101,102 in S's raw oracle) carry no stamp.
+  const rep: T11Expected[] = [t11Ev(1), t11Ev(2), { text: 'REPEATED', epoch: 'e1' }, { text: 'REPEATED', epoch: 'e1' }, t11Ev(3)];
+  const r = (text: string): T11Actual => ({ kind: 'row', pane: 'p1', epoch: 'e1', text });
+  return [
+    { name: 'clean exact timeline', mode: 'normal', expected: base, actual: t11Range(1, 100), violations: [] },
+    { name: 'duplicate stamped row', mode: 'fault', expected: base, actual: [...t11Range(1, 50), t11Row(50), ...t11Range(51, 100)], violations: ['duplicate'] },
+    { name: 'two rows swapped', mode: 'fault', expected: base, actual: [...t11Range(1, 49), t11Row(51), t11Row(50), ...t11Range(52, 100)], violations: ['order'] },
+    { name: 'prefix exact, suffix reordered (no prefix-only check)', mode: 'fault', expected: base, actual: [...t11Range(1, 60), t11Row(99), ...t11Range(61, 98), t11Row(100)], violations: ['order'] },
+    { name: 'one row silently dropped', mode: 'fault', expected: base, actual: [...t11Range(1, 40), ...t11Range(42, 100)], violations: ['silent-missing'] },
+    { name: 'Q21: 13 lost under an unknown positioned gap', mode: 'fault', expected: base, actual: [...t11Range(1, 40), t11Gap('unknown', null), ...t11Range(54, 100)], violations: [] },
+    { name: 'Q21: exact 13 (>5) accepted', mode: 'fault', expected: base, actual: [...t11Range(1, 40), t11Gap('exact', 13, 13), ...t11Range(54, 100)], violations: [] },
+    { name: 'gap drawn at the wrong place', mode: 'fault', expected: base, actual: [...t11Range(1, 40), ...t11Range(54, 70), t11Gap('unknown', null), ...t11Range(71, 100)], violations: ['silent-missing'] },
+    { name: 'unknown encoded as 0', mode: 'fault', expected: base, actual: [...t11Range(1, 40), t11Gap('unknown', 0), ...t11Range(54, 100)], violations: ['unknown-as-number'] },
+    { name: 'exact count off by one', mode: 'fault', expected: base, actual: [...t11Range(1, 40), t11Gap('exact', 12, 12), ...t11Range(54, 100)], violations: ['exact-count-wrong'] },
+    { name: 'estimate lower bound above real loss', mode: 'fault', expected: base, actual: [...t11Range(1, 40), t11Gap('estimate', 20, 20), ...t11Range(54, 100)], violations: ['lower-bound-exceeds'] },
+    { name: 'session-wide marker without position', mode: 'fault', expected: base, actual: [t11Gap('unknown', null, 0, false), ...t11Range(1, 40), ...t11Range(54, 100)], violations: ['silent-missing', 'unpositioned-gap'] },
+    { name: 'EOF tail dropped silently', mode: 'fault', expected: base, actual: t11Range(1, 80), violations: ['silent-missing'] },
+    { name: 'EOF tail dropped behind a trailing gap', mode: 'fault', expected: base, actual: [...t11Range(1, 80), t11Gap('unknown', null)], violations: [] },
+    { name: 'normal path may not use a gap even with nothing lost', mode: 'normal', expected: base, actual: [...t11Range(1, 50), t11Gap('unknown', null), ...t11Range(51, 100)], violations: ['gap-in-normal'] },
+    { name: 'planned switch loss hidden behind a gap', mode: 'planned', expected: base, actual: [...t11Range(1, 50), t11Gap('exact', 2, 2), ...t11Range(53, 100)], violations: ['gap-in-normal', 'missing-in-normal'] },
+    { name: 'recoverable fixture answered with a gap', mode: 'recoverable', expected: base, actual: [...t11Range(1, 50), t11Gap('unknown', null), ...t11Range(60, 100)], violations: ['not-recovered'] },
+    { name: 'cross-pane row leaked in', mode: 'fault', expected: base, actual: [...t11Range(1, 50), t11Row(51, 'e1', 'p2'), ...t11Range(51, 100)], violations: ['cross-pane'] },
+    { name: 'old-epoch callback row accepted', mode: 'fault', expected: base, actual: [...t11Range(1, 50), t11Row(51, 'e0'), ...t11Range(52, 100)], violations: ['wrong-epoch'] },
+    { name: 'foreign text appended', mode: 'fault', expected: base, actual: [...t11Range(1, 100), r('ghost')], violations: ['extra'] },
+    { name: 'identical adjacent events both kept', mode: 'normal', expected: rep, actual: [r('EV00001'), r('EV00002'), r('REPEATED'), r('REPEATED'), r('EV00003')], violations: [] },
+    { name: 'identical adjacent events collapsed (Set(text) dedup)', mode: 'fault', expected: rep, actual: [r('EV00001'), r('EV00002'), r('REPEATED'), r('EV00003')], violations: ['silent-missing'] },
+    { name: 'identical adjacent events tripled', mode: 'fault', expected: rep, actual: [r('EV00001'), r('EV00002'), r('REPEATED'), r('REPEATED'), r('REPEATED'), r('EV00003')], violations: ['duplicate'] },
+  ];
+}
+
+/** Raw replay adversaries cut at S's split points. */
+function t11RawFixtures(oracle: Uint8Array) {
+  const cuts = [0, 1, 2, 7, 16383, 16384, 32769, oracle.length - 1, oracle.length];
+  const clean = cuts.slice(0, -1).map((start, i) => ({ epoch: 'E1', start, end: cuts[i + 1]!, bytes: oracle.slice(start, cuts[i + 1]!) }));
+  const flipped = clean.map(r => ({ ...r, bytes: r.bytes.slice() })); flipped[5]!.bytes[0]! ^= 0x01;
+  return [
+    { name: 'clean split replay', records: clean, violations: [] as string[] },
+    { name: 'dropped chunk', records: clean.filter((_, i) => i !== 4), violations: ['offset-hole'] },
+    { name: 'duplicated chunk', records: [...clean.slice(0, 5), clean[4]!, ...clean.slice(5)], violations: ['offset-overlap'] },
+    { name: 'reordered chunks', records: [clean[0]!, clean[2]!, clean[1]!, ...clean.slice(3)], violations: ['offset-hole', 'offset-overlap'] },
+    { name: 'flipped byte', records: flipped, violations: ['byte-mismatch'] },
+    { name: 'chunk from another epoch', records: clean.map((r, i) => i === 3 ? { ...r, epoch: 'E0' } : r), violations: ['offset-hole', 'wrong-epoch'] },
+    { name: 'truncated tail (no fake EOF)', records: clean.slice(0, -1), violations: ['short'] },
+    { name: 'length field lies', records: clean.map((r, i) => i === 6 ? { ...r, end: r.end + 1 } : r), violations: ['length-mismatch', 'offset-overlap'] },
+  ];
+}
+
+/** Throws on the first verdict that differs from its literal expectation. */
+function t11OracleSelfTest(): string[] {
+  const names: string[] = [];
+  for (const f of t11TimelineFixtures()) {
+    const got = t11JudgeTimeline('p1', f.expected, f.actual, f.mode).violations.join(',');
+    if (got !== f.violations.join(',')) throw new Error(`T11 timeline fixture "${f.name}": expected [${f.violations}] got [${got}]`);
+    names.push(f.name);
+  }
+  const oracle = t11RawOracle();
+  for (const f of t11RawFixtures(oracle)) {
+    const got = t11JudgeRawReplay(oracle, 'E1', f.records).join(',');
+    if (got !== f.violations.join(',')) throw new Error(`T11 raw fixture "${f.name}": expected [${f.violations}] got [${got}]`);
+    names.push(f.name);
+  }
+  return names;
+}
+// T11-ORACLE-END
+
+import { createHash as t11Hash } from 'node:crypto';
+import { spawnSync as t11Spawn } from 'node:child_process';
+import { mkdtempSync as t11Mkdtemp, rmSync as t11Rm } from 'node:fs';
+import { streamDigest as t11Digest } from '../src/stream-contract';
+import type * as T11F from '../src/stream-contract';
+
+test('T11 oracle: S raw-byte oracle regenerates byte-identical (02-S fixture-vectors sha256)', () => {
+  const oracle = t11RawOracle();
+  // Literals copied from 02-S evidence/fixture-vectors.json, not computed here.
+  expect(oracle.length).toBe(101366);
+  expect(t11Hash('sha256').update(oracle).digest('hex')).toBe('a6f1410f58b27671f03a10dbf359514983318b02c9a7f87201e7cb55d1c3b2b8');
+  const lines = Buffer.from(oracle).toString('utf8').split('\r\n');
+  expect(lines[101]).toBe('REPEATED');
+  expect(lines[102]).toBe('REPEATED');
+  expect(lines.length - 1).toBe(4608);
+});
+
+test('T11 oracle: every adversarial timeline and raw replay gets its literal verdict', () => {
+  const names = t11OracleSelfTest();
+  expect(names.length).toBe(23 + 8);
+});
+
+test('T11 oracle: Q21 >5 loss is accepted only when located; unknown stays null; normal path stays loss 0', () => {
+  const base = Array.from({ length: 30 }, (_, i) => t11Ev(i + 1));
+  const lost = [...t11Range(1, 5), t11Gap('unknown', null), ...t11Range(26, 30)];
+  const verdict = t11JudgeTimeline('p1', base, lost, 'fault');
+  expect(verdict).toEqual({ violations: [], matched: 10, missing: 20, covered: 20 });
+  expect(t11JudgeTimeline('p1', base, lost, 'normal').violations).toEqual(['gap-in-normal', 'missing-in-normal']);
+});
+
+// Oracle mutants: each damages one rule in an isolated copy of the region above;
+// the self-test must exit 1 (instrument proven able to see the failure class).
+const T11_ORACLE_MUTANTS: Record<string, [string, string]> = {
+  'order-blind (accept every anchor)': ['const kept = t11Lis(anchorExp);', 'const kept = new Set(anchorExp.map((_, k) => k));'],
+  'gap-anywhere covers any loss': ['if (gapAt(lo, hi)) covered += run;', 'if (gapAt(-1, actual.length)) covered += run;'],
+  'unknown may be 0': ["if (g.countKind === 'unknown' && g.missingCount !== null)", "if (g.countKind === 'unknown' && g.missingCount !== null && g.missingCount !== 0)"],
+  'Set(text) presence instead of event identity': ['const present = (e: number) => usedExp.has(e) || misplaced.has(e);', 'const present = (e: number) => rowIdx.some(i => (actual[i] as { text: string }).text === expected[e]!.text);'],
+  'normal mode tolerates gaps': ["if (mode === 'normal' || mode === 'planned') {", "if (false) {"],
+  'raw replay ignores epoch': ["if (r.epoch !== epoch) { v.add('wrong-epoch'); continue; }", ''],
+  'raw replay accepts a short spool as EOF': ["if (offset < oracle.length) v.add('short');", ''],
+};
+for (const [mutation, [from, to]] of Object.entries(T11_ORACLE_MUTANTS)) {
+  test(`T11 MUTATION oracle "${mutation}" turns the self-test red in an isolated copy`, () => {
+    const self = readFileSync(import.meta.path, 'utf8');
+    const begin = self.indexOf('// T11-ORACLE-BEGIN'), end = self.indexOf('// T11-ORACLE-END');
+    expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin);
+    const region = self.slice(begin, end);
+    expect(region.split(from).length).toBe(2);
+    const dir = t11Mkdtemp(join(tmpdir(), 't11-oracle-mutant-'));
+    try {
+      for (const damaged of [false, true]) {
+        const script = join(dir, `scenario-${damaged}.ts`);
+        writeFileSync(script, `${damaged ? region.replace(from, to) : region}\nt11OracleSelfTest();\n`);
+        const r = t11Spawn(process.execPath, [script], { encoding: 'utf8', timeout: 30_000 });
+        console.log(`T11 MUTATION oracle ${mutation} damaged=${damaged} exit=${r.status} ${(r.stderr ?? '').split('\n').find(l => l.startsWith('error:')) ?? ''}`);
+        expect(r.status).toBe(damaged ? 1 : 0);
+      }
+    } finally { t11Rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+// ---- Pending integration (I). Cases S and A handed to T (02-S/05-A REPORT
+// "งานที่ยังไม่ครบ"). They run only when the API exists on the tree under test;
+// on the K base they are skipped/todo and are reported INCOMPLETE, never PASS.
+const t11Pane: T11F.PaneKey = { serverIdentity: 't11-server', paneId: '%7', birthGeneration: 1 };
+const t11Sha = (s: string) => t11Hash('sha256').update(s).digest('hex');
+const t11Epoch: T11F.PipeEpoch = { pane: t11Pane, attachId: 't11-attach', collectorIncarnation: 't11-collector' };
+const t11File = (path: string, body: string): T11F.EvidenceFile => ({ path, bytes: Buffer.byteLength(body), sha256: t11Sha(body) });
+const t11Intent: T11F.AttachIntent = { operationId: 't11-op', pane: t11Pane, expectedGeneration: 0, attachId: 't11-attach', episodeId: 't11-episode', parentEpisodeId: null, kind: 'recovery', rootUUID: 't11-root' };
+const t11UnknownGap: T11F.Gap = { version: 1, episodeId: 't11-episode', parentEpisodeId: null, pane: t11Pane, leftRowId: { pane: t11Pane, segmentId: 't11-seg', rowOrdinal: 7 }, rightSegmentId: 't11-seg-2', reason: 'unproven-overlap', countKind: 'unknown', missingCount: null, withheldRows: 3, lowerBound: 0, openedAt: 10, closedAt: null, clockEpoch: 't11-clock', quality: 'degraded' };
+const t11Coverage: T11F.Coverage = [
+  { kind: 'rows', range: { pane: t11Pane, segmentId: 't11-seg', start: 0, end: 8 }, digest: t11Sha('rows-0-8') },
+  { kind: 'gap', gap: t11UnknownGap, digest: t11Sha('gap-unknown') },
+];
+const t11Commit: T11F.CommitAttachRequest = {
+  operationId: 't11-op', pane: t11Pane, expectedGeneration: 0, attachId: 't11-attach', admission: 'active-degraded',
+  binding: { kind: 'collector-binding', epoch: t11Epoch, attachId: 't11-attach', rootUUID: 't11-root', bootNonce: 't11-collector', ownerGeneration: 0, process: { pid: 4242, startTime: '777', bootId: 't11-boot' }, peerUid: 1000, fifoId: 't11-fifo', handshakeId: 't11-handshake', artifactSha256: t11Sha('artifact') },
+  packet: { version: 1, snapshotId: 't11-snap', episodeId: 't11-episode', captureCount: 1, complete: true, pane: t11Pane, geometry: { columns: 80, rows: 24 }, geometryGeneration: 1, historySize: 4500, historyLimit: 4500, cursor: { x: 0, y: 23, visible: true }, activeBuffer: 'normal', mainHistory: 'available', snapshot: t11File('snap.bin', 'snap'), commandTranscript: t11File('transcript.txt', 'pipe-open;capture-start;capture-end'), rawRange: { epoch: t11Epoch, start: 0, end: 64 }, boundary: { kind: 'overlap-unknown', reason: 'split-command' }, startedAtMonoMs: 1, endedAtMonoMs: 2, clockEpoch: 't11-clock', stateKnown: { savedCursor: false } },
+  durable: { kind: 'rows-gaps-durable', operationId: 't11-op', commitId: 't11-rows-commit', generation: 1, coverage: t11Coverage, digest: t11Sha('rows-gaps') },
+};
+
+/** Synthetic authority adapter: answers from an evidence store and a lease
+ * registry on disk, never by echoing the request (05-A MUTATION.md demand). */
+function t11Authorities(root: string) {
+  const read = (name: string) => {
+    const path = join(root, 'evidence', name);
+    if (!existsSync(path)) throw new Error(`T11 authority: no evidence ${name}`);
+    return JSON.parse(readFileSync(path, 'utf8'));
+  };
+  const same = <T>(kind: string, stored: T, offered: unknown): T => {
+    if (t11Digest(kind, stored) !== t11Digest(kind, offered)) throw new Error(`T11 authority: ${kind} differs from durable evidence`);
+    return stored;
+  };
+  return {
+    attach: (r: T11F.CommitAttachRequest) => same('attach', read(`attach-${r.attachId}.json`), r),
+    prefix: (i: T11F.HandoffIntent) => read(`prefix-${i.handoffId}.json`) as T11F.Coverage,
+    suffix: (p: T11F.SuffixPin) => same('suffix', read(`suffix-${p.pin.pinId}.json`), p),
+    receipt: (r: T11F.CommitHandoffRequest) => same('receipt', read(`receipt-${r.receipt.receipt.handoffId}.json`), r.receipt),
+    writer: (b: T11F.WriterBinding) => {
+      if (!(read('leases.json').live as string[]).includes(b.bindingId)) throw new Error('T11 authority: writer lease not live');
+      return same('writer', read(`writer-${b.bindingId}.json`), b);
+    },
+    remote: (_s: T11F.SealedExport, v: T11F.VerifiedBundle) => same('remote', read(`remote-${v.bundle.bundleId}.json`), v),
+    location: (r: T11F.SegmentRowRange) => read(`location-${r.segmentId}.json`) as T11F.SegmentLocation,
+  };
+}
+
+const t11CatalogV3 = typeof (StreamArchiveCatalog.prototype as unknown as Record<string, unknown>).beginAttach === 'function';
+test.skipIf(!t11CatalogV3)('T11 PENDING-I 05-A catalog v3: intent never publishes owner; stale CAS/handshake refused; lost ACK idempotent; abort cannot delete a committed owner; unknown gap stays null', async () => {
+  const root = t11Mkdtemp(join(tmpdir(), 't11-catalog-'));
+  try {
+    mkdirSyncFs(join(root, 'evidence'), { recursive: true });
+    writeFileSync(join(root, 'evidence', 'attach-t11-attach.json'), JSON.stringify(t11Commit));
+    writeFileSync(join(root, 'evidence', 'leases.json'), JSON.stringify({ live: [] }));
+    const path = join(root, 'catalog-v3.sqlite');
+    const Catalog = StreamArchiveCatalog as unknown as new (path: string, readOnly: boolean, authorities: unknown) => any;
+    let catalog = new Catalog(path, false, t11Authorities(root));
+    const first = await catalog.beginAttach(t11Intent);
+    expect(first.status).toBe('ok');
+    expect(catalog.owner(t11Pane)).toBeNull();
+    expect(await catalog.beginAttach(t11Intent)).toEqual(first);
+    expect((await catalog.beginAttach({ ...t11Intent, attachId: 'competing' })).status).toBe('error');
+    expect((await catalog.commitAttach({ ...t11Commit, expectedGeneration: 999 })).status).toBe('error');
+    expect((await catalog.commitAttach({ ...t11Commit, binding: { ...t11Commit.binding, handshakeId: '' } })).status).toBe('error');
+    // The adapter reads evidence: a request whose capture differs from what was durable is refused.
+    expect((await catalog.commitAttach({ ...t11Commit, packet: { ...t11Commit.packet, snapshotId: 'forged' } })).status).toBe('error');
+    expect(catalog.owner(t11Pane)).toBeNull();
+    const committed = await catalog.commitAttach(t11Commit);
+    expect(committed.status).toBe('ok');
+    const owner = catalog.owner(t11Pane);
+    expect(owner?.generation).toBe(t11Intent.expectedGeneration + 1);
+    catalog.close(); catalog = new Catalog(path, false, t11Authorities(root));
+    expect(await catalog.commitAttach(t11Commit)).toEqual(committed);
+    expect(await catalog.abortAttach({ ...t11Intent, reason: 'lost-ACK' })).toEqual(committed);
+    expect(catalog.owner(t11Pane)).toEqual(owner);
+    // Same operation id, different request digest = collision, not a silent retry.
+    expect((await catalog.commitAttach({ ...t11Commit, admission: 'active-exact' })).status).toBe('error');
+    const retry = { ...t11Intent, operationId: 'recovery', attachId: 'recovery', episodeId: 'recovery', expectedGeneration: owner.generation };
+    expect((await catalog.beginAttach(retry)).status).toBe('ok');
+    const aborted = await catalog.abortAttach({ ...retry, reason: 'pipe-refused' });
+    expect(aborted.status).toBe('ok');
+    expect(catalog.owner(t11Pane)).toEqual(owner);
+    expect(await catalog.abortAttach({ ...retry, reason: 'duplicate-callback' })).toEqual(aborted);
+    const coverage = catalog.readCoverage(t11Pane).coverage as T11F.Coverage;
+    expect(coverage).toEqual(t11Coverage);
+    const gap = coverage.find(c => c.kind === 'gap');
+    expect(gap?.kind === 'gap' && gap.gap.missingCount).toBeNull();
+    catalog.close();
+  } finally { t11Rm(root, { recursive: true, force: true }); }
+});
+
+test.skipIf(!t11CatalogV3)('T11 PENDING-I 05-A remote index: upload exit 0 without verified readback is refused; offline location is remote-unavailable, never EOF', async () => {
+  const root = t11Mkdtemp(join(tmpdir(), 't11-remote-'));
+  try {
+    mkdirSyncFs(join(root, 'evidence'), { recursive: true });
+    const range: T11F.SegmentRowRange = { pane: t11Pane, segmentId: 't11-seg', start: 0, end: 8 };
+    const offline: T11F.SegmentLocation = { kind: 'remote-unavailable', range, bundleId: 't11-bundle', reason: 'offline', retryAfterMs: 1000 };
+    writeFileSync(join(root, 'evidence', 'location-t11-seg.json'), JSON.stringify(offline));
+    const Catalog = StreamArchiveCatalog as unknown as new (path: string, readOnly: boolean, authorities: unknown) => any;
+    const catalog = new Catalog(join(root, 'catalog-v3.sqlite'), false, t11Authorities(root));
+    const location = await catalog.getLocation(range);
+    expect(location.status === 'ok' ? location.value.kind : location.status).not.toBe('local');
+    if (location.status === 'ok') expect(location.value).toEqual(offline);
+    const bundle = { version: 1, bundleId: 't11-bundle-unverified' } as unknown as T11F.ArchiveBundle;
+    const unverified = await Promise.resolve().then(() => catalog.commitRemoteIndex({ operationId: 't11-remote', pane: t11Pane, expectedGeneration: 1, sealed: {} as T11F.SealedExport, verified: { bundle } as T11F.VerifiedBundle })).catch((error: unknown) => ({ status: 'thrown', error }));
+    expect(unverified.status).not.toBe('ok');
+    catalog.close();
+  } finally { t11Rm(root, { recursive: true, force: true }); }
+});
+
+// 02-S fixture-vectors.json cases: need S's collector + I's wiring. Every replay
+// must be judged with t11JudgeRawReplay(t11RawOracle(), epoch, records).
+for (const [id, action] of [
+  ['S-01', 'foreground collector + actual FIFO writer; second host client after closing first → same collector identity, payload once, offsets from 0'],
+  ['S-02', 'SIGKILL collector after observed ACK; restart same root; replay old binding → every ACKed byte survives; old epoch fault=collector-restart'],
+  ['S-03', 'claim capture; host disconnects before tmux; retry same episode before/after deadline → no second claim; interrupted-capture'],
+  ['S-04', 'new-session/new-window/split-window producers write byte 0 immediately; delayed catalog commit → all bytes; genesis certificate before exact birth'],
+  ['S-05', 'foreign pipe before and raced with the guarded list → foreign unchanged; refusal has zero capture; own sender/FIFO retired'],
+  ['S-06', '4500 retained history + screen; producer writes across pipe/capture/commit barriers → one capture, complete file/hash, overlap-unknown until certified'],
+  ['S-07', 'lost finish ACK then same-intent retry from a new client → identical OpenCapture, zero pipe reopens, zero captures'],
+  ['S-08', 'mutated epoch/rootUUID/nonce/ownerGeneration/peer UID, forged ACK/evidence digest → refused, watermark unchanged'],
+  ['S-09', 'flood >256KiB frame, >32 connections, short writes, FIFO EOF, producer silence → bounded; silence does not reopen; EOF exposes last offset'],
+  ['S-10', 'synthetic ENOSPC/fsync faults at cap → no ACK for failed transaction; reserve used for incident; unverified raw retained'],
+  ['S-11', 'host shutdown/restart vs collector close with live pipes → client close keeps reader; planned close refused'],
+  ['S-12', 'after all fixtures → no socket/FIFO/sender/collector left; store removed only by its owner'],
+] as const) test.todo(`T11 PENDING-I 02-S ${id}: ${action}`);
+
+for (const [id, behaviour] of [
+  ['B1-03', 'crash in every attach state / refused / duplicate callback / lost ACK → intent withdrawn, foreign owner intact, capture-count ≤1 per episode'],
+  ['B2-03', 'PREPARED boot with flag 0/1 before/after registration, receipt+dead binding, spool overflow before seed, keeper interleaving, migrated v2'],
+  ['B3-02', 'retained case recovers the whole suffix; irrecoverable missing all under located gaps (t11JudgeTimeline fault mode), count unknown = null'],
+  ['OFF-01', 'flag absent/0 without tenure → no I/O, worker, timer or Drive job; with tenure → compatibility continues, receipt before handoff'],
+] as const) test.todo(`T11 PENDING-I ${id}: ${behaviour}`);
