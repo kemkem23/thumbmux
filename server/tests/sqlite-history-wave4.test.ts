@@ -775,3 +775,196 @@ test('contract final repair rows stay fenced until repaired checkpoint commits a
     expect((await f.engine.appendFinalized(shAppend(3))).status).toBe('ok');
   } finally { f.cleanup(); }
 });
+
+// Lot H: the flag-on store is exercised only with disposable synthetic roots.
+import { existsSync, symlinkSync } from 'node:fs';
+import { FlagOnHistoryStore, type FlagOnHistoryOptions } from '../src/history-engine';
+import type { SpoolRecord, SpoolAck, PaneKey, RowsAndGapsCommit, CommittedStreamRow, Gap, SealedExport, RemoteIndexReceipt } from '../src/stream-contract';
+
+const hp: PaneKey = {serverIdentity:'synthetic-H',paneId:'%0',birthGeneration:1};
+function hvalue<T>(r: Result<T>): T { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; }
+function hrecord(op = 'raw-0', previous: SpoolRecord | null = null, text = 'same\nsame\n'): SpoolRecord {
+  const start = previous?.range.end ?? 0;
+  const value = {version:1 as const,operationId:op,range:{epoch:previous?.range.epoch ?? {pane:hp,attachId:'attach-H',collectorIncarnation:'collector-H'},start,end:start+Buffer.byteLength(text)},sequence:previous ? previous.sequence+1 : 0,previousDigest:previous?.digest ?? null,payload:{kind:'bytes' as const,bytes:[...Buffer.from(text)]}};
+  return {...value,digest:streamDigest('spool',value)};
+}
+function hrows(ack: SpoolAck, op = 'rows-0', start = 0, texts = ['same','same']): RowsAndGapsCommit {
+  const rows: CommittedStreamRow[] = texts.map((text,i) => ({id:{pane:hp,segmentId:ack.segmentId,rowOrdinal:start+i},origin:{kind:'pipe',range:{epoch:ack.through.epoch,start:0,end:ack.through.byteOffset},ordinal:i},cells:[{text,width:1,style:[]}],geometry:{columns:80,rows:24},buffer:'normal',wrapStatus:'unwrapped',wrapPad:0,finalized:true,uncertainFields:[],cellOrigins:[]}));
+  const gap: Gap = {version:1,episodeId:op+'-gap',parentEpisodeId:null,pane:hp,leftRowId:null,rightSegmentId:ack.segmentId,reason:'pipe-eof',countKind:'unknown',missingCount:null,withheldRows:3,lowerBound:0,openedAt:1,closedAt:null,clockEpoch:'test',quality:'degraded'};
+  const value = {operationId:op,pane:hp,expectedGeneration:0,rows,coverage:[{kind:'gap' as const,gap,digest:streamDigest('gap',gap)},...(rows.length ? [{kind:'rows' as const,range:{pane:hp,segmentId:ack.segmentId,start,end:start+rows.length},digest:streamDigest('rows',rows)}] : [])],decision:{decisionId:op,acceptedRowMap:rows.map(row=>({source:row.origin,target:row.id})),withheldRanges:[],gaps:[gap]},inputAck:ack,checkpointId:null};
+  return {...value,digest:streamDigest('rows-gaps',value)};
+}
+function hfixture(options: Partial<FlagOnHistoryOptions> = {}) {
+  const root = mkdtempSync(join(tmpdir(),'flagon-H-'));
+  let store = new FlagOnHistoryStore({root,mode:'create',codecVersions:['test-v1'],...options}); store.setGeneration(hp,null,0);
+  return {root,get store(){return store;},reopen(){store.close();store=new FlagOnHistoryStore({root,mode:'recover',codecVersions:['test-v1'],...options});return store;},cleanup(){store.close();rmSync(root,{recursive:true,force:true});}};
+}
+async function hreplay(store: FlagOnHistoryStore, after: SpoolAck['through'] | null = null) {
+  const result = []; for await (const chunk of store.recover(hp,after,{isCancelled:()=>false})) result.push(hvalue(chunk)); return result;
+}
+function hremote(sealed: SealedExport): RemoteIndexReceipt {
+  const object = {objectKey:'synthetic/bundle',bytes:sealed.files[0]!.bytes,sha256:sealed.files[0]!.sha256};
+  return {kind:'remote-index-committed',catalogVersion:3,commitId:'catalog-commit',generation:0,coverage:sealed.coverage,verified:{kind:'verified-remote',bundle:{version:1,bundleId:'bundle',storeUUID:sealed.storeUUID,pane:hp,segmentId:sealed.segmentId,coverage:sealed.coverage,schemaVersions:{history:1,spool:1},objects:[object],manifest:object,members:[...sealed.files,sealed.manifest],compression:'tar.zst',encryption:'none',checkpointIds:[],rawRanges:[]},verificationId:'verify',method:'download-sha256',verifiedAtMonoMs:2,clockEpoch:'test',inventoryDigest:'synthetic-inventory',evidence:[sealed.manifest],toolVersion:'synthetic',command:['synthetic-check'],stdout:sealed.manifest,stderr:sealed.manifest,exitCode:0}};
+}
+
+describe('flag-on H durable rows gaps and sealed reclaim', () => {
+  test('ACK then reopen preserves every input, repeated row, gap and decision without duplicate retry', async () => {
+    const f = hfixture();
+    try {
+      const input=hrecord(),ack=hvalue(await f.store.appendInput(input)),request=hrows(ack),receipt=hvalue(await f.store.commitRowsAndGaps(request));
+      f.reopen(); expect(hvalue(await f.store.appendInput(input))).toEqual(ack); expect(hvalue(await f.store.commitRowsAndGaps(request))).toEqual(receipt);
+      const chunks=await hreplay(f.store); expect(chunks.length).toBe(2);
+      expect(chunks[0]).toEqual({kind:'input',record:input,ack});
+      expect(chunks[1]).toEqual({kind:'committed',rows:request.rows,gaps:request.decision.gaps,receipt});
+      expect((await hreplay(f.store,ack.through)).map(x=>x.kind)).toEqual(['committed']);
+      expect(f.store.setGeneration.bind(f.store,hp,4,5)).toThrow();
+      f.store.setGeneration(hp,0,1);
+      expect((await f.store.commitRowsAndGaps(hrows(ack,'stale'))).status).toBe('error');
+    } finally {f.cleanup();}
+  });
+  test('rollback at write/commit boundaries and lost ACK recover atomically', async () => {
+    for (const kind of ['input','rows']) for (const phase of ['before-write','before-commit','after-commit']) {
+      let armed=false; const f=hfixture({boundary(at){if(armed && at===kind+'-'+phase) throw Error('injected '+at);}});
+      try {
+        const input=hrecord(); let ack:SpoolAck;
+        if(kind==='rows') ack=hvalue(await f.store.appendInput(input));
+        armed=true;
+        const result=kind==='input' ? await f.store.appendInput(input) : await f.store.commitRowsAndGaps(hrows(ack!));
+        expect(result.status).toBe('error'); armed=false;f.reopen();
+        expect((await hreplay(f.store)).length).toBe((kind==='rows'?1:0)+(phase==='after-commit'?1:0));
+        ack=hvalue(await f.store.appendInput(input));hvalue(await f.store.commitRowsAndGaps(hrows(ack)));
+        expect((await hreplay(f.store)).length).toBe(2);
+      } finally {f.cleanup();}
+    }
+  });
+  test('rejects forged ACK, discontinuous raw, unknown-zero and omitted gaps', async () => {
+    const f=hfixture();
+    try {
+      const record=hrecord(),ack=hvalue(await f.store.appendInput(record));
+      const next=hrecord('next',record),{digest:_,...broken}=next;
+      expect((await f.store.appendInput({...broken,range:{...broken.range,start:0},digest:streamDigest('spool',{...broken,range:{...broken.range,start:0}})})).status).toBe('error');
+      const request=hrows(ack),{digest:__,...body}=request;
+      for (const changed of [
+        {...body,inputAck:{...ack,commitId:'fake'}},
+        {...body,coverage:body.coverage.filter(c=>c.kind!=='gap')},
+        {...body,decision:{...body.decision,gaps:[]}},
+        {...body,expectedGeneration:8},
+      ]) expect((await f.store.commitRowsAndGaps({...changed,digest:streamDigest('rows-gaps',changed)})).status).toBe('error');
+      const badgap={...request.decision.gaps[0]!,missingCount:0};
+      const changed={...body,coverage:[{kind:'gap',gap:badgap,digest:streamDigest('gap',badgap)},body.coverage[1]],decision:{...body.decision,gaps:[badgap]}};
+      expect((await f.store.commitRowsAndGaps({...changed,digest:streamDigest('rows-gaps',changed)} as RowsAndGapsCommit)).status).toBe('error');
+      expect((await hreplay(f.store)).length).toBe(1);
+    } finally {f.cleanup();}
+  });
+  test('corrupt durable payload is an error, never empty EOF', async () => {
+    const f=hfixture();
+    try {
+      hvalue(await f.store.appendInput(hrecord()));f.store.close();
+      const db=new Database(join(f.root,'flag-on-v1.sqlite'));db.exec("UPDATE fh_event SET payload='{}'");db.close();f.reopen();
+      const chunks=[];for await(const x of f.store.recover(hp,null,{isCancelled:()=>false}))chunks.push(x);
+      expect(chunks.length).toBe(1);expect(chunks[0]!.status).toBe('error');
+    } finally {f.cleanup();}
+  });
+  test('pins survive restart, reject forged release and block seal and reclaim', async () => {
+    const f=hfixture({validateRemoteIndex:()=>true});
+    try {
+      const ack=hvalue(await f.store.appendInput(hrecord()));hvalue(await f.store.commitRowsAndGaps(hrows(ack)));
+      const request={operationId:'seal',pane:hp,expectedGeneration:0,segmentId:ack.segmentId};
+      const pin=hvalue(await f.store.pinSegment({...request,operationId:'pin',reason:'handoff'}));f.reopen();
+      expect((await f.store.sealExport(request)).status).toBe('error');
+      expect((await f.store.releasePin({...pin,durableCommitId:'forged'})).status).toBe('error');hvalue(await f.store.releasePin(pin));
+      const sealed=hvalue(await f.store.sealExport(request));
+      const reader=hvalue(await f.store.pinSegment({...request,operationId:'reader',reason:'reader'}));
+      expect((await f.store.reclaimVerified({...request,sealed,remote:hremote(sealed)})).status).toBe('error');
+      expect(existsSync(sealed.files[0]!.path)).toBe(true);hvalue(await f.store.releasePin(reader));
+    } finally {f.cleanup();}
+  });
+  test('upload exit zero and unvalidated catalog never permit early unlink', async () => {
+    const f=hfixture();
+    try {
+      const ack=hvalue(await f.store.appendInput(hrecord())),request={operationId:'seal',pane:hp,expectedGeneration:0,segmentId:ack.segmentId};
+      const sealed=hvalue(await f.store.sealExport(request));
+      expect((await f.store.reclaimVerified({...request,sealed,remote:hremote(sealed)})).status).toBe('error');
+      expect(existsSync(sealed.files[0]!.path)).toBe(true);expect((await hreplay(f.store)).length).toBe(1);
+    } finally {f.cleanup();}
+  });
+  test('sealed inventory retains all rows gaps raw; verified reclaim really reduces allocated blocks', async () => {
+    const f=hfixture({validateRemoteIndex:(r)=>r.commitId==='catalog-commit'});
+    try {
+      let record:SpoolRecord|null=null,ack:SpoolAck|undefined;
+      for(let i=0;i<8;i++){record=hrecord('raw-'+i,record,'x'.repeat(32000));ack=hvalue(await f.store.appendInput(record));}
+      const request=hrows(ack!);hvalue(await f.store.commitRowsAndGaps(request));
+      const fence={operationId:'seal',pane:hp,expectedGeneration:0,segmentId:ack!.segmentId},sealed=hvalue(await f.store.sealExport(fence));
+      const inventory=readFileSync(sealed.files[0]!.path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(inventory.length).toBe(9);expect(JSON.parse(inventory[8].payload).rows).toEqual(request.rows);expect(JSON.parse(inventory[8].payload).decision.gaps[0].missingCount).toBe(null);
+      expect(hvalue(await f.store.sealExport(fence))).toEqual(sealed);
+      const corrupt=hremote(sealed);const bad={...corrupt,coverage:[]};
+      expect((await f.store.reclaimVerified({...fence,sealed,remote:bad})).status).toBe('error');
+      const result=hvalue(await f.store.reclaimVerified({...fence,sealed,remote:hremote(sealed)}));
+      expect(result.allocatedBytesAfter).toBeLessThan(result.allocatedBytesBefore);expect(result.blockBytes).toBeGreaterThan(0);
+      expect(existsSync(sealed.files[0]!.path)).toBe(false);expect(existsSync(sealed.manifest.path)).toBe(false);
+      f.reopen();const replay=[];for await(const x of f.store.recover(hp,null,{isCancelled:()=>false}))replay.push(x);
+      expect(replay[0]!.status).toBe('error');expect(JSON.stringify(replay)).toContain('remote-required');
+      const next=hrecord('after-seal',record,'suffix\n');expect(hvalue(await f.store.appendInput(next)).segmentId).not.toBe(ack!.segmentId);
+    } finally {f.cleanup();}
+  });
+  test('seal and reclaim interrupted boundaries retry without early loss', async () => {
+    for(const phase of ['seal-before-fsync','seal-before-rename','seal-before-commit','seal-after-commit','reclaim-before-commit','reclaim-after-commit','reclaim-before-unlink','reclaim-after-unlink','reclaim-rows-before-commit','reclaim-rows-after-commit']) {
+      let armed=false,hit=false;const f=hfixture({validateRemoteIndex:()=>true,boundary(at){if(armed&&!hit&&at===phase){hit=true;throw Error('injected '+at);}}});
+      try {
+        const ack=hvalue(await f.store.appendInput(hrecord()));hvalue(await f.store.commitRowsAndGaps(hrows(ack)));
+        const request={operationId:'seal',pane:hp,expectedGeneration:0,segmentId:ack.segmentId};
+        let sealed:SealedExport;
+        if(phase.startsWith('seal')){armed=true;expect((await f.store.sealExport(request)).status).toBe('error');armed=false;f.reopen();sealed=hvalue(await f.store.sealExport(request));}
+        else {sealed=hvalue(await f.store.sealExport(request));armed=true;expect((await f.store.reclaimVerified({...request,sealed,remote:hremote(sealed)})).status).toBe('error');armed=false;f.reopen();}
+        expect(hit).toBe(true);hvalue(await f.store.reclaimVerified({...request,sealed,remote:hremote(sealed)}));expect(existsSync(sealed.files[0]!.path)).toBe(false);
+      } finally {f.cleanup();}
+    }
+  });
+  test('raw bound, row batch bound, traversal/symlink and cancellation are fail closed', async () => {
+    const f=hfixture();
+    try {
+      expect((await f.store.appendInput(hrecord('huge',null,'x'.repeat(256*1024+1)))).status).toBe('error');
+      const ack=hvalue(await f.store.appendInput(hrecord()));
+      expect((await f.store.commitRowsAndGaps(hrows(ack,'many',0,Array(257).fill('row')))).status).toBe('error');
+      const cancelled=[];for await(const c of f.store.recover(hp,null,{isCancelled:()=>true}))cancelled.push(c);expect(cancelled[0]!.status).toBe('cancelled');
+      const path=join(f.root,'alias');symlinkSync(f.root,path);expect(()=>new FlagOnHistoryStore({root:path,mode:'recover',codecVersions:[]})).toThrow();
+      expect((await f.store.sealExport({operationId:'escape',pane:hp,expectedGeneration:0,segmentId:'../../escape'})).status).toBe('error');
+    } finally {f.cleanup();}
+  });
+});
+
+test('flag-on H process SIGKILL on real transaction boundaries preserves ACK and atomic gaps', async () => {
+  for (const phase of ['input-before-write','input-before-commit','input-after-commit','rows-before-write','rows-before-commit','rows-after-commit']) {
+    const f=hfixture();
+    try {
+      const record=hrecord();let request:RowsAndGapsCommit|undefined;
+      if(phase.startsWith('rows'))request=hrows(hvalue(await f.store.appendInput(record)));
+      f.store.close();
+      const script=`import {FlagOnHistoryStore} from ${JSON.stringify(join(import.meta.dir,'../src/history-engine.ts'))};
+        const store=new FlagOnHistoryStore({root:${JSON.stringify(f.root)},mode:'recover',codecVersions:['test-v1'],boundary(at){if(at===${JSON.stringify(phase)})process.kill(process.pid,'SIGKILL');}});
+        const answer=await store.${request?'commitRowsAndGaps':'appendInput'}(${JSON.stringify(request??record)});
+        console.log(JSON.stringify(answer));store.close();`;
+      const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe'});
+      const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+      expect(child.signalCode).toBe('SIGKILL');expect(exit).not.toBe(0);expect(stdout).not.toContain('"status":"ok"');expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+      f.reopen();const chunks=await hreplay(f.store);expect(chunks.length).toBe((request?1:0)+(phase.endsWith('after-commit')?1:0));
+      const ack=hvalue(await f.store.appendInput(record));hvalue(await f.store.commitRowsAndGaps(request??hrows(ack)));expect((await hreplay(f.store)).length).toBe(2);
+    }finally{f.cleanup();}
+  }
+});
+
+test('flag-on H checkpoint is durable and its reference cannot point at a missing checkpoint', async () => {
+  const f=hfixture();
+  try {
+    const ack=hvalue(await f.store.appendInput(hrecord())),identity={pane:hp,sourceEpoch:0,geometryGeneration:0};
+    const cursor={x:0,y:0,visible:true},buffer={rows:[],cursor,savedCursor:cursor,savedAttributes:[],savedModes:{},wrapPending:false};
+    const state={codecVersion:'test-v1',geometry:{columns:80,rows:24},normal:buffer,alternate:buffer,active:'normal' as const,modes:{},margins:{top:0,bottom:23,left:0,right:79},tabStops:[],pendingUtf8:[224],pendingEscape:[27],attributes:[],wrapPending:false,extensionState:'{}'};
+    const checkpoint:VtCheckpoint={kind:'vt-recovery',checkpointId:'cp-H',previousCheckpointId:null,identity,inputFence:{kind:'durable-input',pane:hp,through:{sourceEpoch:0,packetSeq:0},digest:ack.recordDigest,segmentId:ack.segmentId},revision:0,head:0,state,stateDigest:streamDigest('vt-state',{identity,state})};
+    const {digest:_,...request}=hrows(ack),body={...request,checkpointId:'cp-H'};
+    expect((await f.store.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)})).status).toBe('error');
+    hvalue(f.store.persistCheckpoint({operationId:'checkpoint',pane:hp,expectedGeneration:0,inputAck:ack,checkpoint}));
+    hvalue(await f.store.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)}));f.reopen();
+    const chunks=await hreplay(f.store);expect(chunks.map(x=>x.kind)).toEqual(['input','checkpoint','committed']);expect(chunks[1]).toEqual({kind:'checkpoint',checkpoint});
+  }finally{f.cleanup();}
+});
