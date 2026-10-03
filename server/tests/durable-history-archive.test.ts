@@ -10,7 +10,7 @@ import { Database } from "bun:sqlite";
 import { FlagOnHistoryStore } from "../src/history-engine";
 import { StreamArchiveCatalog, type ArchiveOwner } from "../../../../src/integrations/stream-archive-bridge";
 import {
-  ArchiveWorker, findInventoryEntry, paneDigest, RcloneRemote, readLatestInventory, restoreFailureReason, restoreRangeFromRemote,
+  ArchiveWorker, findInventoryEntry, lookupRestored, paneDigest, RcloneRemote, readLatestInventory, restoreFailureReason, restoreRangeFromRemote,
 } from "../../../../src/integrations/stream-history-offload";
 import type {
   ArchiveCandidate, ArchiveCandidateSource, RemoteStore,
@@ -698,6 +698,9 @@ test("R13 empty-root restore of a real H export reads rows, RowIds, gaps, raw ra
     writeFileSync(member, readFileSync(member, "utf8").replace("แถว O", "แถว X"));
     const tampered = Bun.spawnSync([process.execPath, CLI, "read", ...common]);
     expect(tampered.exitCode).toBe(5);
+    // The lookup itself refuses it, for readers that only need the location.
+    const looked = lookupRestored(fresh, range);
+    expect(looked.status === "error" ? [looked.code, looked.message.includes("restore cache member changed")] : looked.status).toEqual(["integrity", true]);
   } finally { store?.close(); }
 });
 
