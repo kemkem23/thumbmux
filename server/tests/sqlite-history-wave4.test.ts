@@ -1284,6 +1284,34 @@ test('H-r2 authority.controls reads journaled controls after reopen inside the w
     expect(hvalue(resumed.authority.head(hp)).rowCount).toBe(0);
   }finally{f.cleanup();}
 });
+test('H-r2 authority.controls starts at the watermark when older controls exceed the scan bound',async()=>{
+  const f=hfixture();
+  try{
+    const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord())),at=ack.through,older=1100;
+    const journal=async(order:number,payload:OrderedControlR2['payload'])=>{
+      const body={revision:2 as const,eventId:'bulk-'+String(order).padStart(5,'0'),position:at,order,decoderVersion:'test-v1',payload};
+      const event={...body,digest:orderedControlDigest(body)};
+      hvalue(await port.journalControl({pane:hp,expectedGeneration:0,operationId:'bulk-op-'+order,event}));
+      return event;
+    };
+    for(let order=1;order<=older;order++)await journal(order,{kind:'control',name:'DECSET',data:'?25'});
+    const afterA=await journal(older+1,{kind:'control',name:'DECSET',data:'?1049'});
+    const afterB=await journal(older+2,{kind:'geometry',before:{columns:41,rows:30},after:{columns:100,rows:40}});
+    const cp=hcheckpoint(ack,'bulk-cp'),watermark={...hwatermark(f,ack,cp),controlOrder:older};
+    hvalue(await port.commitReplayCheckpoint({pane:hp,expectedGeneration:0,operationId:watermark.durableCommitId,checkpoint:cp,watermark}));
+    f.reopen();
+    const resumed=hr2(f.store),stored=hvalue(resumed.authority.watermark(hp))!;
+    const read=(cursor:NewarchHistoryCursor|null)=>resumed.authority.controls({pane:hp,after:stored,cursor,maxEntries:1,maxBytes:1024*1024});
+    const first=read(null);
+    expect(first.status).toBe('ok');
+    const page=hvalue(first);
+    expect(page.entries.map(entry=>entry.event)).toEqual([afterA]);
+    expect(page.atDurableHead).toBe(false);
+    const second=hvalue(read(page.next));
+    expect(second.entries.map(entry=>entry.event)).toEqual([afterB]);
+    expect(second.atDurableHead).toBe(true);expect(second.next).toBeNull();
+  }finally{f.cleanup();}
+},60000);
 test('H-r2 canonical SGR survives durable reopen and rejects semantic tuples; source bytes require readback',async()=>{
  const base=hrecord(),{digest:_,...body}=base,source={...body,digest:sourceSpoolDigest(body)};
  const f=hfixture({readSourceRecords:()=>({status:'ok',value:[source]})});
