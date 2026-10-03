@@ -1127,6 +1127,7 @@ for (const create of ['new-session', 'new-window', 'split-window'] as const) {
       const certify = (source as unknown as { certifyBirth?: (id: string, b: T11F.Binding) => Promise<T11F.Result<T11F.BirthCertificateR2>> }).certifyBirth;
       expect(typeof certify).toBe('function');
       const cert = await certify!.call(source, opened.value.packet.snapshotId, opened.value.binding);
+      console.log(`T-fix S-04 ${create} boundary=${opened.value.packet.boundary.kind} certify ${fxWhy(cert)}`);
       expect(cert.status).toBe('ok');
       if (cert.status === 'ok') { expect(cert.value.command).toBe(create); expect(cert.value.rawStart.byteOffset).toBe(0); }
     } finally { await rig.cleanup(); }
@@ -1484,7 +1485,12 @@ for (const scenario of ['retained', 'irrecoverable'] as const) {
       const lastRecorded = before.at(-1) ?? null;
       console.log(`T-fix B3-02 ${scenario} before kill acked=${acked} inH=${inH} last=${lastRecorded}`);
       process.kill(Number(writer), 'SIGKILL');
-      if (scenario === 'irrecoverable') { await fxUntil(() => rig.pipe() === '0', 5_000, 'pipe closed'); rig.must(['clear-history', '-t', rig.paneId]); }
+      if (scenario === 'irrecoverable') {
+        // pane_pipe can return to 1 before a poll sees 0. Clear the history either way, then judge the route.
+        const pipeWait = performance.now();
+        await fxUntil(() => rig.pipe() === '0' || performance.now() - pipeWait >= 2_000, 4_000, 'pipe observation');
+        rig.must(['clear-history', '-t', rig.paneId]);
+      }
       const opened = performance.now();
       await fxUntil(() => {
         try {
