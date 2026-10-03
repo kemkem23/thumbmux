@@ -1095,6 +1095,19 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         this.fence(r); const s = this.segment(r.segmentId,r.pane);
         if (s.sealed) return JSON.parse(String(s.sealed)) as SealedExport;
         fhAssert(s.state === 'open', 'segment not sealable'); this.unpinned(r.segmentId);
+        // An interrupted seal can leave only a duplicate export, while all
+        // source events remain in SQLite. Reap those known open-segment copies
+        // before staging another one; repeated crashes cannot grow scratch.
+        const unfinished = this.db.query("SELECT id FROM fh_segment WHERE sealed IS NULL LIMIT 4097").all() as SqlRow[];
+        fhAssert(unfinished.length <= 4096, 'seal metadata bound');
+        for (const entry of unfinished) {
+          const id = String(entry.id); fhAssert(/^[a-f0-9]{64}$/.test(id), 'unsafe segment ID');
+          for (const suffix of ['.jsonl','.jsonl.tmp','.manifest.json','.manifest.json.tmp']) {
+            const path = join(this.root,id+suffix); fhSafePath(path);
+            if (existsSync(path)) unlinkSync(path);
+          }
+        }
+        fhSyncDir(this.root);
         // Only one export staged per root. Old sealed files must be reclaimed
         // before the next export, bounding scratch without an unbounded queue.
         fhAssert(!this.db.query("SELECT 1 FROM fh_segment WHERE state='sealed' OR state='reclaiming' LIMIT 1").get(), 'export staging pressure');

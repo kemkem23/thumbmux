@@ -1006,3 +1006,20 @@ test('flag-on H SIGKILL during seal and reclaim retains verifiable inventory and
     }finally{f.cleanup();}
   }
 });
+
+
+test('flag-on H interrupted seals do not accumulate unbounded staging across epochs', async () => {
+  let armed=true;const f=hfixture({boundary(at){if(armed && at==='seal-before-commit')throw Error('lost seal');}});
+  try {
+    const ack=hvalue(await f.store.appendInput(hrecord()));
+    const fence={operationId:'seal-old',pane:hp,expectedGeneration:0,segmentId:ack.segmentId};
+    expect((await f.store.sealExport(fence)).status).toBe('error');
+    expect(existsSync(join(f.root,ack.segmentId+'.jsonl'))).toBe(true);
+    const {digest:_,...body}=hrecord('new');const changed={...body,range:{...body.range,epoch:{...body.range.epoch,attachId:'next'}}};
+    const next=hvalue(await f.store.appendInput({...changed,digest:streamDigest('spool',changed)}));armed=false;
+    hvalue(await f.store.sealExport({...fence,operationId:'seal-next',segmentId:next.segmentId}));
+    expect(existsSync(join(f.root,ack.segmentId+'.jsonl'))).toBe(false);
+    expect((await hreplay(f.store)).length).toBe(2);
+    expect(readdirSync(f.root).filter(p=>p.endsWith('.jsonl')).length).toBe(1);
+  }finally{f.cleanup();}
+});
