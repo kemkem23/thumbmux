@@ -4,7 +4,11 @@
  */
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { resolve, dirname, join, sep } from 'node:path';
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { FLAGON_BUDGET as FB } from './stream-contract';
+import type { FlagOnHistoryPort, SpoolRecord, SpoolAck, RowsAndGapsCommit, RowsAndGapsReceipt, FlagOnRecoveryChunk, RawPosition, OperationFence, PinRequest, SegmentPin, SealedExport, RemoteIndexReceipt, ReclaimReceipt, EvidenceFile, Coverage, CommittedStreamRow } from './stream-contract';
 import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical, streamDigest } from './stream-contract';
 import type { AppendFinalized, CancelToken, CheckpointCommit, DurableInputReceipt, DurableReceipt,
   FinalizedRow, GapEpisode, HistoryEngine, HistoryPage, HistoryPageCheckpoint, InputEvent, PaneKey, PageCursor,
@@ -744,5 +748,476 @@ export class StreamArchiveRowReader {
     if (this.closed) return;
     this.closed = true;
     try { this.db.close(); } finally { pool.cache -= READER_CACHE; }
+  }
+}
+
+
+/** Separate opt-in flag-on database; never migrate/open the projection or legacy DB. */
+
+const FLAGON_HISTORY_SCHEMA = `
+CREATE TABLE fh_meta(version INTEGER NOT NULL CHECK(version=1), uuid TEXT NOT NULL);
+CREATE TABLE fh_pane(pane TEXT PRIMARY KEY, generation INTEGER NOT NULL, active_epoch TEXT) STRICT;
+CREATE TABLE fh_segment(id TEXT PRIMARY KEY, pane TEXT NOT NULL, state TEXT NOT NULL,
+ bytes INTEGER NOT NULL DEFAULT 0, next_row INTEGER NOT NULL DEFAULT 0, sealed TEXT, remote TEXT) STRICT;
+CREATE TABLE fh_epoch(epoch TEXT PRIMARY KEY, pane TEXT NOT NULL, offset INTEGER NOT NULL,
+ sequence INTEGER NOT NULL, digest TEXT NOT NULL, segment TEXT NOT NULL) STRICT;
+CREATE TABLE fh_event(seq INTEGER PRIMARY KEY AUTOINCREMENT, pane TEXT NOT NULL, segment TEXT NOT NULL,
+ kind TEXT NOT NULL, op TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload TEXT NOT NULL,
+ receipt TEXT NOT NULL, checksum TEXT NOT NULL) STRICT;
+CREATE INDEX fh_event_pane ON fh_event(pane,seq);
+CREATE INDEX fh_event_segment ON fh_event(segment,seq);
+CREATE INDEX fh_input_cursor ON fh_event(pane,kind,json_extract(payload,'$.range.epoch.attachId'),
+ json_extract(payload,'$.range.epoch.collectorIncarnation'),json_extract(payload,'$.range.end'));
+CREATE TABLE fh_row_id(pane TEXT NOT NULL, segment TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ PRIMARY KEY(pane,segment,ordinal)) WITHOUT ROWID;
+CREATE TABLE fh_pin(id TEXT PRIMARY KEY, operation TEXT NOT NULL UNIQUE, segment TEXT NOT NULL,
+ payload TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE fh_checkpoint(id TEXT PRIMARY KEY, pane TEXT NOT NULL, segment TEXT NOT NULL,
+ ack TEXT NOT NULL, payload TEXT NOT NULL, checksum TEXT NOT NULL) STRICT;
+`;
+
+/** Flag-on v1 persistence. One synchronous FULL transaction is the ACK boundary.
+ * No worker, queue or timer; construction is explicit (flag-off remains inert).
+ * The catalog authority is injected by I/A: an object supplied by a caller is
+ * never itself proof that the remote index is durable. No verifier => no unlink.
+ */
+export interface FlagOnHistoryOptions {
+  root: string;
+  mode: 'create' | 'recover';
+  codecVersions: readonly string[];
+  validateRemoteIndex?: (receipt: RemoteIndexReceipt, sealed: SealedExport) => boolean;
+  boundary?: (phase: string) => void;
+}
+const FH_RECORD_MAX = B.decodeBytes;
+const FH_SEGMENT_MAX = FB.archiveChunkBytes / 2;
+const fhPaths = new Set<string>();
+const fhReaders = new Set<string>();
+function fhAssert(test: unknown, message: string): asserts test { if (!test) throw Error(message); }
+function fhSafePath(path: string): void {
+  let current: string = sep;
+  for (const part of resolve(path).split(sep).filter(Boolean)) {
+    fhAssert(!/^brain\.db(?:$|[-.])/i.test(part), 'forbidden database path');
+    current = join(current, part);
+    if (!existsSync(current)) {
+      // existsSync follows symlinks, including dangling links. lstat does not.
+      try { fhAssert(!lstatSync(current).isSymbolicLink(), 'unsafe symlink'); }
+      catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+      continue;
+    }
+    const st = lstatSync(current);
+    fhAssert(!st.isSymbolicLink() && (st.isDirectory() || (st.isFile() && st.nlink === 1)), 'unsafe history path');
+  }
+}
+function fhSyncDir(path: string): void { const fd = openSync(path, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function fhEvidence(path: string): EvidenceFile {
+  fhSafePath(path);
+  const fd = openSync(path, 'r'), hash = createHash('sha256'), buffer = Buffer.alloc(64 * 1024);
+  let total = 0;
+  try { for (;;) { const n = readSync(fd, buffer, 0, buffer.length, null); if (!n) break; hash.update(buffer.subarray(0,n)); total += n; } }
+  finally { closeSync(fd); }
+  return { path, bytes: total, sha256: hash.digest('hex') };
+}
+function fhWrite(fd: number, text: string): void {
+  const buffer = Buffer.from(text); let offset = 0;
+  while (offset < buffer.length) { const n = writeSync(fd, buffer, offset); fhAssert(n > 0, 'short write'); offset += n; }
+}
+
+export class FlagOnHistoryStore implements FlagOnHistoryPort {
+  private readonly db: Database;
+  private readonly writerLock: Database;
+  readonly root: string;
+  readonly storeUUID: string;
+  private closed = false;
+  private readonly replayReleases = new Set<() => void>();
+  constructor(private readonly options: FlagOnHistoryOptions) {
+    this.root = resolve(options.root);
+    fhSafePath(this.root);
+    fhAssert(!fhPaths.has(this.root), 'one flag-on writer per root');
+    fhAssert((fhPaths.size+1)*(2*1024*1024+64*1024) <= B.diskCacheBytes, 'flag-on SQLite cache pool pressure');
+    const path = join(this.root, 'flag-on-v1.sqlite');
+    for (const p of [path, path+'-wal', path+'-shm', path+'-journal']) fhSafePath(p);
+    fhAssert(options.mode === 'create' ? !existsSync(path) : existsSync(path), 'explicit create/recover required');
+    mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    // An OS-backed SQLite exclusive lock survives across our data commits and
+    // is released by the kernel on process death. It fences other host writers
+    // and proves old ephemeral replay pins have no live owner at reopen.
+    const lockPath = join(this.root,'flag-on-writer.sqlite');
+    for (const p of [lockPath,lockPath+'-journal',lockPath+'-wal',lockPath+'-shm']) fhSafePath(p);
+    const writerLock = new Database(lockPath,{create:true,strict:true});
+    let db: Database | undefined;
+    try {
+      writerLock.exec('PRAGMA busy_timeout=0; PRAGMA cache_size=-64; PRAGMA mmap_size=0; PRAGMA journal_mode=DELETE; PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE IF NOT EXISTS fh_lock(id INTEGER PRIMARY KEY); BEGIN EXCLUSIVE; COMMIT;');
+      chmodSync(lockPath,0o600);
+      db = new Database(path, { create: options.mode === 'create', strict: true });
+      if (options.mode === 'create') {
+        db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
+        db.transaction(() => {
+          db!.exec(FLAGON_HISTORY_SCHEMA);
+          db!.query('INSERT INTO fh_meta VALUES(1,?)').run(randomUUID());
+        }).immediate();
+      }
+      const meta = db.query('SELECT * FROM fh_meta').get() as SqlRow;
+      fhAssert(meta?.version === 1 && typeof meta.uuid === 'string', 'unsupported flag-on format');
+      fhAssert((db.query('PRAGMA quick_check').get() as SqlRow).quick_check === 'ok', 'corrupt history database');
+      db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA busy_timeout=0; PRAGMA journal_size_limit=0;');
+      // DB + WAL growth is bounded; exported scratch is separately <=16 MiB.
+      db.exec(`PRAGMA max_page_count=${Math.floor((FB.canaryRootCapBytes-FB.reserveBytes-FB.scratchBytes)/4096)};`);
+      db.query("DELETE FROM fh_pin WHERE payload='replay'").run();
+      this.db = db; this.writerLock = writerLock; this.storeUUID = meta.uuid;
+      chmodSync(path, 0o600); fhSyncDir(this.root); fhSyncDir(dirname(this.root));
+      fhPaths.add(this.root);
+    } catch (error) { db?.close(); writerLock.close(); throw error; }
+  }
+  close(): void { if (!this.closed) { for (const release of this.replayReleases) release(); this.db.close(); this.writerLock.close(); this.closed = true; fhPaths.delete(this.root); } }
+  private live(): void { fhAssert(!this.closed, 'flag-on store closed'); }
+  private tx<T>(kind: string, fn: () => T): T {
+    this.live(); this.options.boundary?.(kind+'-before-write');
+    const result = this.db.transaction(() => {
+      const value = fn(); this.options.boundary?.(kind+'-before-commit'); return value;
+    }).immediate();
+    this.options.boundary?.(kind+'-after-commit');
+    return result;
+  }
+  /** A/I installs owner generation explicitly; no inference from incoming ACKs. */
+  setGeneration(pane: PaneKey, expected: number | null, next: number): void {
+    const key = paneKey(pane); safe(next); if (expected !== null) safe(expected);
+    this.tx('generation', () => {
+      const old = this.db.query('SELECT generation FROM fh_pane WHERE pane=?').get(key) as SqlRow | null;
+      fhAssert(!this.db.query("SELECT 1 FROM fh_segment WHERE pane=? AND state='reclaiming'").get(key), 'reclaim in progress');
+      fhAssert(old ? old.generation === expected && next > Number(old.generation) : expected === null, 'owner generation CAS');
+      if (old) this.db.query('UPDATE fh_pane SET generation=? WHERE pane=?').run(next,key);
+      else this.db.query('INSERT INTO fh_pane VALUES(?,?,NULL)').run(key,next);
+    });
+  }
+  private fence(r: OperationFence): string {
+    nonempty(r.operationId); safe(r.expectedGeneration); const key = paneKey(r.pane);
+    const state = this.db.query('SELECT generation FROM fh_pane WHERE pane=?').get(key) as SqlRow | null;
+    fhAssert(state?.generation === r.expectedGeneration, 'owner generation mismatch'); return key;
+  }
+  private segment(id: string, pane: PaneKey): SqlRow {
+    nonempty(id); const s = this.db.query('SELECT * FROM fh_segment WHERE id=?').get(id) as SqlRow | null;
+    fhAssert(s && s.pane === paneKey(pane), 'segment identity mismatch'); return s;
+  }
+  private event(op: string): SqlRow | null { return this.db.query('SELECT * FROM fh_event WHERE op=?').get(op) as SqlRow | null; }
+  private checkEvent(e: SqlRow): void {
+    fhAssert(e.checksum === streamDigest('flag-on-event', { kind:e.kind, op:e.op, digest:e.digest, payload:e.payload, receipt:e.receipt, segment:e.segment, pane:e.pane }), 'corrupt durable event');
+  }
+  private putEvent(pane: string, segment: string, kind: string, op: string, hash: string, payload: unknown, receipt: unknown): void {
+    const p = streamCanonical(payload), r = streamCanonical(receipt);
+    const size = Buffer.byteLength(p)+Buffer.byteLength(r);
+    fhAssert(size <= FH_RECORD_MAX*2, 'record exceeds bounded decode');
+    const s = this.db.query('SELECT bytes,state FROM fh_segment WHERE id=?').get(segment) as SqlRow;
+    fhAssert(s.state === 'open' && Number(s.bytes)+size <= FH_SEGMENT_MAX, 'segment full or sealed; seal and rotate');
+    const checksum = streamDigest('flag-on-event', { kind,op,digest:hash,payload:p,receipt:r,segment,pane });
+    this.db.query('INSERT INTO fh_event(pane,segment,kind,op,digest,payload,receipt,checksum) VALUES(?,?,?,?,?,?,?,?)').run(pane,segment,kind,op,hash,p,r,checksum);
+    this.db.query('UPDATE fh_segment SET bytes=bytes+? WHERE id=?').run(size,segment);
+  }
+  private acknowledged(ack: SpoolAck, pane: PaneKey): void {
+    fhAssert(ack.kind === 'synced-spool' && ack.version === 1 && equal(ack.through.epoch.pane,pane), 'ACK identity');
+    const event = this.db.query("SELECT * FROM fh_event WHERE op=? AND kind='input'").get(ack.commitId) as SqlRow | null;
+    fhAssert(event, 'ACK not durable in this store'); this.checkEvent(event);
+    fhAssert(equal(JSON.parse(String(event.receipt)),ack), 'forged ACK');
+  }
+  async appendInput(record: SpoolRecord): Promise<Result<SpoolAck>> {
+    try {
+      this.live(); nonempty(record.operationId);
+      fhAssert(record.version === 1, 'unsupported spool version');
+      const range = record.range, key = paneKey(range.epoch.pane), epoch = streamCanonical(range.epoch);
+      nonempty(range.epoch.attachId); nonempty(range.epoch.collectorIncarnation);
+      [range.start,range.end,record.sequence].forEach(safe);
+      fhAssert(range.end >= range.start, 'raw range order');
+      if (record.payload.kind === 'bytes') {
+        fhAssert(record.payload.bytes.length <= FB.rawBytesPerPane && range.end-range.start === record.payload.bytes.length, 'raw payload bound');
+        fhAssert(record.payload.bytes.every(n => Number.isInteger(n) && n >= 0 && n <= 255), 'invalid byte');
+      } else {
+        fhAssert(range.start === range.end, 'control consumes no raw bytes');
+        if (record.payload.kind === 'resize') geometry(record.payload.geometry);
+        else fhAssert(record.payload.kind === 'control' && typeof record.payload.data === 'string', 'invalid control');
+      }
+      fhAssert(bytes(record) <= FH_RECORD_MAX, 'raw encoded record bound'); digest('spool',record);
+      return ok(this.tx('input', () => {
+        const prior = this.event(record.operationId);
+        if (prior) { this.checkEvent(prior); fhAssert(prior.kind === 'input' && prior.digest === record.digest, 'operation collision'); return JSON.parse(String(prior.receipt)) as SpoolAck; }
+        const pane = this.db.query('SELECT * FROM fh_pane WHERE pane=?').get(key) as SqlRow | null;
+        fhAssert(pane, 'pane generation not registered');
+        const last = this.db.query('SELECT * FROM fh_epoch WHERE epoch=?').get(epoch) as SqlRow | null;
+        fhAssert(!last || pane.active_epoch === epoch, 'stale pipe epoch');
+        fhAssert(last ? last.offset === range.start && Number(last.sequence)+1 === record.sequence && last.digest === record.previousDigest
+          : range.start === 0 && record.sequence === 0 && record.previousDigest === null, 'raw sequence/offset/digest discontinuity');
+        let segmentId = last ? String(last.segment) : streamDigest('flag-on-segment',{epoch,first:record.operationId});
+        if (last && this.segment(segmentId,range.epoch.pane).state !== 'open') segmentId = streamDigest('flag-on-segment',{epoch,first:record.operationId});
+        this.db.query("INSERT OR IGNORE INTO fh_segment(id,pane,state) VALUES(?,?,'open')").run(segmentId,key);
+        const ack: SpoolAck = { kind:'synced-spool',version:1,through:{epoch:range.epoch,byteOffset:range.end},recordDigest:record.digest,commitId:record.operationId,segmentId };
+        this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);
+        this.db.query('INSERT OR REPLACE INTO fh_epoch VALUES(?,?,?,?,?,?)').run(epoch,key,range.end,record.sequence,record.digest,segmentId);
+        this.db.query('UPDATE fh_pane SET active_epoch=? WHERE pane=?').run(epoch,key);
+        return ack;
+      }));
+    } catch(e) { return fail(e); }
+  }
+  async commitRowsAndGaps(r: RowsAndGapsCommit): Promise<Result<RowsAndGapsReceipt>> {
+    try {
+      fhAssert(r.rows.length <= B.decodeRows && bytes(r) <= FH_RECORD_MAX, 'rows batch bound'); digest('rows-gaps',r);
+      return ok(this.tx('rows', () => {
+        const key = this.fence(r), old = this.event(r.operationId);
+        if (old) { this.checkEvent(old); fhAssert(old.kind === 'committed' && old.digest === r.digest, 'operation collision'); return JSON.parse(String(old.receipt)) as RowsAndGapsReceipt; }
+        this.acknowledged(r.inputAck,r.pane);
+        const segment = this.segment(r.inputAck.segmentId,r.pane);
+        fhAssert(segment.state === 'open', 'sealed segment is immutable');
+        if (r.checkpointId !== null) {
+          const cp = this.db.query('SELECT * FROM fh_checkpoint WHERE id=?').get(r.checkpointId) as SqlRow | null;
+          fhAssert(cp && cp.pane === key && cp.segment === segment.id, 'checkpoint missing or outside segment');
+          const cpAck = JSON.parse(String(cp.ack)) as SpoolAck;
+          fhAssert(equal(cpAck.through.epoch,r.inputAck.through.epoch) && cpAck.through.byteOffset <= r.inputAck.through.byteOffset && cp.checksum === streamDigest('checkpoint-payload',JSON.parse(String(cp.payload))), 'checkpoint reference integrity');
+        }
+        let ordinal = Number(segment.next_row);
+        for (const row of r.rows) {
+          fhAssert(equal(row.id.pane,r.pane) && row.id.segmentId === segment.id && row.id.rowOrdinal === ordinal++, 'row identity/order');
+          geometry(row.geometry); content({ cells:row.cells,softWrap:row.wrapStatus==='wrapped',wrapPad:row.wrapPad,uncertainFields:row.uncertainFields });
+          fhAssert(row.finalized && row.uncertainFields.length === 0, 'unverified row');
+          if (row.origin.kind === 'pipe') {
+            [row.origin.range.start,row.origin.range.end,row.origin.ordinal].forEach(safe);
+            fhAssert(equal(row.origin.range.epoch,r.inputAck.through.epoch) && row.origin.range.end >= row.origin.range.start && row.origin.range.end <= r.inputAck.through.byteOffset, 'row outside acknowledged input');
+          }
+        }
+        let covered = 0; const gaps: unknown[] = [];
+        for (const c of r.coverage) {
+          if (c.kind === 'rows') {
+            const range = c.range; safe(range.start); safe(range.end);
+            fhAssert(equal(range.pane,r.pane) && range.segmentId === segment.id && range.start === Number(segment.next_row)+covered && range.end > range.start, 'coverage order');
+            const rows = r.rows.slice(covered,covered+range.end-range.start);
+            fhAssert(rows.length === range.end-range.start && c.digest === streamDigest('rows',rows), 'row coverage digest'); covered += rows.length;
+          } else {
+            const g = c.gap; safe(g.withheldRows); safe(g.lowerBound);
+            nonempty(g.episodeId); nonempty(g.clockEpoch);
+            fhAssert(Number.isFinite(g.openedAt) && g.openedAt >= 0 && (g.closedAt === null || Number.isFinite(g.closedAt) && g.closedAt >= g.openedAt), 'gap time range');
+            fhAssert(g.leftRowId === null || equal(g.leftRowId.pane,r.pane), 'gap left pane');
+            fhAssert(g.version === 1 && equal(g.pane,r.pane) && (g.rightSegmentId === null || g.rightSegmentId === segment.id), 'gap identity');
+            fhAssert(g.countKind === 'unknown' ? g.missingCount === null : (g.countKind === 'exact' || g.countKind === 'estimate') && Number.isSafeInteger(g.missingCount) && g.missingCount >= 0, 'unknown is not zero');
+            fhAssert(c.digest === streamDigest('gap',g), 'gap digest'); gaps.push(g);
+          }
+        }
+        fhAssert(covered === r.rows.length && equal(gaps,r.decision.gaps), 'rows/gaps coverage incomplete');
+        fhAssert(r.decision.acceptedRowMap.length === r.rows.length && r.rows.every((row,i) => equal(r.decision.acceptedRowMap[i],{source:row.origin,target:row.id})), 'decision row mapping');
+        const receipt: RowsAndGapsReceipt = {kind:'rows-gaps-durable',operationId:r.operationId,commitId:r.operationId,generation:r.expectedGeneration,coverage:r.coverage,digest:r.digest};
+        this.putEvent(key,String(segment.id),'committed',r.operationId,r.digest,r,receipt);
+        for (const row of r.rows) this.db.query('INSERT INTO fh_row_id VALUES(?,?,?)').run(key,String(segment.id),row.id.rowOrdinal);
+        this.db.query('UPDATE fh_segment SET next_row=? WHERE id=?').run(ordinal,String(segment.id));
+        return receipt;
+      }));
+    } catch(e) { return fail(e); }
+  }
+  /** Supplemental persistence hook: K's FlagOnHistoryPort has no checkpoint
+   * writer. I supplies the exact raw ACK; legacy numeric inputFence is not
+   * interpreted as a flag-on raw coordinate. */
+  persistCheckpoint(r: OperationFence & { checkpoint: VtCheckpoint; inputAck: SpoolAck }): Result<null> {
+    try {
+      this.tx('checkpoint', () => {
+        const key = this.fence(r), cp = r.checkpoint; this.acknowledged(r.inputAck,r.pane);
+        fhAssert(equal(cp.identity.pane,r.pane) && cp.kind === 'vt-recovery' && this.options.codecVersions.includes(cp.state.codecVersion), 'checkpoint identity/codec');
+        fhAssert(cp.stateDigest === streamDigest('vt-state',{identity:cp.identity,state:cp.state}) && bytes(cp) <= B.vtBytesPerPane, 'checkpoint digest/bound');
+        const old = this.db.query('SELECT * FROM fh_checkpoint WHERE id=?').get(cp.checkpointId) as SqlRow | null;
+        if (old) { fhAssert(old.payload === streamCanonical(cp) && old.ack === streamCanonical(r.inputAck), 'checkpoint collision'); return; }
+        if (cp.previousCheckpointId !== null) fhAssert(this.db.query('SELECT 1 FROM fh_checkpoint WHERE id=? AND pane=?').get(cp.previousCheckpointId,key), 'checkpoint chain missing');
+        this.putEvent(key,r.inputAck.segmentId,'checkpoint',r.operationId,streamDigest('checkpoint',r),cp,null);
+        this.db.query('INSERT INTO fh_checkpoint VALUES(?,?,?,?,?,?)').run(cp.checkpointId,key,r.inputAck.segmentId,streamCanonical(r.inputAck),streamCanonical(cp),streamDigest('checkpoint-payload',cp));
+      }); return ok(null);
+    } catch(e) { return fail(e); }
+  }
+  async *recover(pane: PaneKey, after: RawPosition | null, cancel: CancelToken): AsyncIterable<Result<FlagOnRecoveryChunk>> {
+    let pinIds: string[] = []; let release: (() => void) | undefined;
+    try {
+      this.live(); const key = paneKey(pane), readerKey = this.root+'|'+key;
+      fhAssert(this.db.query('SELECT 1 FROM fh_pane WHERE pane=?').get(key), 'unknown replay pane');
+      if (fhReaders.size >= B.activeReadsGlobal || fhReaders.has(readerKey)) { yield busy(); return; }
+      fhReaders.add(readerKey);
+      let released = false;
+      release = () => {
+        if (released) return;
+        this.db.transaction(() => { for (const id of pinIds) this.db.query('DELETE FROM fh_pin WHERE id=?').run(id); }).immediate();
+        released = true; fhReaders.delete(readerKey); this.replayReleases.delete(release!); pinIds = [];
+      };
+      this.replayReleases.add(release);
+      // A durable raw cursor identifies the segment needed for recovery. Older
+      // remote segments belong to the read overlay, not to this replay suffix.
+      // Keep rows/checkpoints in the cursor's segment, including rows committed
+      // after that raw ACK. Reject arbitrary/forgotten offsets rather than skip.
+      let segmentFloor = 0;
+      if (after) {
+        fhAssert(equal(after.epoch.pane,pane), 'replay cursor pane'); safe(after.byteOffset);
+        const cursor = this.db.query("SELECT segment FROM fh_event WHERE pane=? AND kind='input' AND json_extract(payload,'$.range.epoch.attachId')=? AND json_extract(payload,'$.range.epoch.collectorIncarnation')=? AND json_extract(payload,'$.range.end')=? ORDER BY seq DESC LIMIT 1")
+          .get(key,after.epoch.attachId,after.epoch.collectorIncarnation,after.byteOffset) as SqlRow | null;
+        fhAssert(cursor, 'remote-required or unknown durable replay cursor');
+        segmentFloor = Number((this.db.query('SELECT rowid AS n FROM fh_segment WHERE id=?').get(String(cursor.segment)) as SqlRow).n);
+      }
+      // Freeze a finite read boundary and durably pin all its segments in one
+      // transaction. Yielding never holds a SQLite cursor/WAL reader open.
+      const snapshot = this.tx('replay-pin', () => {
+        const segments = this.db.query('SELECT id,state FROM fh_segment WHERE pane=? AND rowid>=? LIMIT 4097').all(key,segmentFloor) as SqlRow[];
+        fhAssert(segments.length <= 4096, 'replay metadata bound');
+        for (const s of segments) fhAssert(s.state !== 'reclaiming' && s.state !== 'remote', 'remote-required: restore segment before replay');
+        for (const s of segments) {
+          const id = randomUUID(); pinIds.push(id);
+          this.db.query('INSERT INTO fh_pin VALUES(?,?,?,?,0)').run(id,id,String(s.id),'replay');
+        }
+        return Number((this.db.query('SELECT COALESCE(MAX(seq),0) AS n FROM fh_event WHERE pane=?').get(key) as SqlRow).n);
+      });
+      let cursor = 0, firstEpochSeq = 0;
+      if (after) {
+        fhAssert(equal(after.epoch.pane,pane), 'replay cursor pane'); safe(after.byteOffset);
+        const epoch = this.db.query('SELECT * FROM fh_epoch WHERE epoch=?').get(streamCanonical(after.epoch)) as SqlRow | null;
+        fhAssert(epoch && Number(epoch.offset) >= after.byteOffset, 'unknown replay cursor');
+        const first = this.db.query("SELECT MIN(seq) AS n FROM fh_event WHERE pane=? AND kind='input' AND json_extract(payload,'$.range.epoch.attachId')=? AND json_extract(payload,'$.range.epoch.collectorIncarnation')=?").get(key,after.epoch.attachId,after.epoch.collectorIncarnation) as SqlRow;
+        fhAssert(first.n !== null, 'replay cursor no longer local'); firstEpochSeq = Number(first.n);
+        // A raw cursor only skips input; rows/checkpoints still replay so that
+        // a crash after raw ACK but before row publication cannot hide rows.
+      }
+      for (;;) {
+        this.live();
+        if (cancel.isCancelled()) { yield {status:'cancelled',reason:'replay cancelled'}; return; }
+        const e = this.db.query('SELECT * FROM fh_event WHERE pane=? AND seq>? AND seq<=? AND segment IN (SELECT id FROM fh_segment WHERE pane=? AND rowid>=?) ORDER BY seq LIMIT 1').get(key,cursor,snapshot,key,segmentFloor) as SqlRow | null;
+        if (!e) break; cursor = Number(e.seq); this.checkEvent(e);
+        const payload = JSON.parse(String(e.payload));
+        if (e.kind === 'input') {
+          const record = payload as SpoolRecord; digest('spool',record);
+          if (after && (cursor < firstEpochSeq || (equal(record.range.epoch,after.epoch) && (record.range.end < after.byteOffset || record.payload.kind === 'bytes' && record.range.end === after.byteOffset)))) continue;
+          yield ok({kind:'input',record,ack:JSON.parse(String(e.receipt))});
+        } else if (e.kind === 'committed') {
+          const r = payload as RowsAndGapsCommit; digest('rows-gaps',r);
+          yield ok({kind:'committed',rows:r.rows,gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))});
+        } else if (e.kind === 'checkpoint') yield ok({kind:'checkpoint',checkpoint:payload as VtCheckpoint});
+        else throw Error('unknown durable event');
+      }
+    } catch(e) { yield fail(e); }
+    finally {
+      release?.();
+    }
+  }
+  async pinSegment(r: PinRequest): Promise<Result<SegmentPin>> {
+    try { return ok(this.tx('pin', () => {
+      this.fence(r); const s = this.segment(r.segmentId,r.pane);
+      fhAssert(s.state !== 'remote' && s.state !== 'reclaiming', 'segment no longer local');
+      const old = this.db.query('SELECT * FROM fh_pin WHERE operation=?').get(r.operationId) as SqlRow | null;
+      if (old) { const pin = JSON.parse(String(old.payload)) as SegmentPin; const {pinId,durableCommitId,...request} = pin;
+        fhAssert(equal(request,r) && old.released === 0, 'pin operation collision/released'); return pin; }
+      const pin: SegmentPin = {...r,pinId:randomUUID(),durableCommitId:randomUUID()};
+      this.db.query('INSERT INTO fh_pin VALUES(?,?,?,?,0)').run(pin.pinId,r.operationId,r.segmentId,streamCanonical(pin)); return pin;
+    })); } catch(e) { return fail(e); }
+  }
+  async releasePin(pin: SegmentPin): Promise<Result<null>> {
+    try { this.tx('release', () => {
+      const p = this.db.query('SELECT * FROM fh_pin WHERE id=?').get(pin.pinId) as SqlRow | null;
+      fhAssert(p && p.payload === streamCanonical(pin), 'pin token mismatch');
+      this.db.query('UPDATE fh_pin SET released=1 WHERE id=?').run(pin.pinId);
+    }); return ok(null); } catch(e) { return fail(e); }
+  }
+  private unpinned(segment: string): void {
+    fhAssert(!this.db.query('SELECT 1 FROM fh_pin WHERE segment=? AND released=0 LIMIT 1').get(segment), 'segment pinned');
+  }
+  async sealExport(r: OperationFence & {segmentId:string}): Promise<Result<SealedExport>> {
+    try {
+      const result = this.tx('seal', () => {
+        this.fence(r); const s = this.segment(r.segmentId,r.pane);
+        if (s.sealed) return JSON.parse(String(s.sealed)) as SealedExport;
+        fhAssert(s.state === 'open', 'segment not sealable'); this.unpinned(r.segmentId);
+        // An interrupted seal can leave only a duplicate export, while all
+        // source events remain in SQLite. Reap those known open-segment copies
+        // before staging another one; repeated crashes cannot grow scratch.
+        const unfinished = this.db.query("SELECT id FROM fh_segment WHERE sealed IS NULL LIMIT 4097").all() as SqlRow[];
+        fhAssert(unfinished.length <= 4096, 'seal metadata bound');
+        for (const entry of unfinished) {
+          const id = String(entry.id); fhAssert(/^[a-f0-9]{64}$/.test(id), 'unsafe segment ID');
+          for (const suffix of ['.jsonl','.jsonl.tmp','.manifest.json','.manifest.json.tmp']) {
+            const path = join(this.root,id+suffix); fhSafePath(path);
+            if (existsSync(path)) unlinkSync(path);
+          }
+        }
+        fhSyncDir(this.root);
+        // Only one export staged per root. Old sealed files must be reclaimed
+        // before the next export, bounding scratch without an unbounded queue.
+        fhAssert(!this.db.query("SELECT 1 FROM fh_segment WHERE state='sealed' OR state='reclaiming' LIMIT 1").get(), 'export staging pressure');
+        const path = join(this.root,r.segmentId+'.jsonl'), temp = path+'.tmp';
+        fhSafePath(temp); fhSafePath(path);
+        const fd = openSync(temp,'w',0o600), coverage: Coverage[number][] = [];
+        let size = 0, cursor = 0;
+        try {
+          for (;;) {
+            const e = this.db.query('SELECT * FROM fh_event WHERE segment=? AND seq>? ORDER BY seq LIMIT 1').get(r.segmentId,cursor) as SqlRow | null;
+            if (!e) break; cursor = Number(e.seq); this.checkEvent(e);
+            const line = streamCanonical(e)+'\n'; size += Buffer.byteLength(line);
+            fhAssert(size <= FB.archiveChunkBytes && bytes(coverage) <= B.decodeBytes, 'export bound'); fhWrite(fd,line);
+            if (e.kind === 'committed') coverage.push(...(JSON.parse(String(e.payload)) as RowsAndGapsCommit).coverage);
+          }
+          this.options.boundary?.('seal-before-fsync'); fsyncSync(fd);
+        } finally { closeSync(fd); }
+        this.options.boundary?.('seal-before-rename'); renameSync(temp,path); chmodSync(path,0o400); fhSyncDir(this.root);
+        const file = fhEvidence(path), manifestPath = join(this.root,r.segmentId+'.manifest.json');
+        const manifestText = streamCanonical({version:1,storeUUID:this.storeUUID,pane:r.pane,segmentId:r.segmentId,schemaVersions:{history:1,spool:1},coverage,files:[file]});
+        fhAssert(Buffer.byteLength(manifestText) <= B.decodeBytes, 'manifest bound'); fhSafePath(manifestPath+'.tmp'); fhSafePath(manifestPath);
+        const mf = openSync(manifestPath+'.tmp','w',0o600);
+        try { fhWrite(mf,manifestText); fsyncSync(mf); } finally { closeSync(mf); }
+        renameSync(manifestPath+'.tmp',manifestPath); chmodSync(manifestPath,0o400); fhSyncDir(this.root);
+        const sealed: SealedExport = {kind:'sealed-export',operationId:r.operationId,storeUUID:this.storeUUID,pane:r.pane,segmentId:r.segmentId,generation:r.expectedGeneration,coverage,files:[file],manifest:fhEvidence(manifestPath),sealCommitId:randomUUID()};
+        this.db.query("UPDATE fh_segment SET state='sealed',sealed=? WHERE id=?").run(streamCanonical(sealed),r.segmentId);
+        return sealed;
+      }); return ok(result);
+    } catch(e) { return fail(e); }
+  }
+  async reclaimVerified(r: OperationFence & {sealed:SealedExport;remote:RemoteIndexReceipt}): Promise<Result<ReclaimReceipt>> {
+    try {
+      this.live(); const sealed = r.sealed, remote = r.remote;
+      const before = this.physical();
+      this.tx('reclaim', () => {
+        this.fence(r); const s = this.segment(sealed.segmentId,r.pane);
+        fhAssert(s.sealed === streamCanonical(sealed) && equal(sealed.pane,r.pane) && sealed.storeUUID === this.storeUUID, 'seal mismatch');
+        this.unpinned(sealed.segmentId);
+        fhAssert(remote.kind === 'remote-index-committed' && remote.catalogVersion === 3 && remote.generation === r.expectedGeneration && equal(remote.coverage,sealed.coverage), 'remote index coverage/generation');
+        const v = remote.verified, b = v.bundle;
+        fhAssert(v.kind === 'verified-remote' && v.exitCode === 0 && (v.method === 'download-sha256' || v.method === 'rclone-check-download') && v.evidence.length > 0, 'upload is not verification');
+        fhAssert(b.version === 1 && b.storeUUID === this.storeUUID && b.segmentId === sealed.segmentId && equal(b.pane,r.pane) && equal(b.coverage,sealed.coverage) && equal(b.members,[...sealed.files,sealed.manifest]), 'verified inventory mismatch');
+        fhAssert(this.options.validateRemoteIndex?.(remote,sealed) === true, 'remote catalog authority not validated');
+        if (s.remote) fhAssert(s.remote === streamCanonical(remote), 'remote receipt changed during reclaim');
+        this.db.query("UPDATE fh_segment SET state='reclaiming',remote=? WHERE id=?").run(streamCanonical(remote),sealed.segmentId);
+      });
+      // 'reclaiming' is durable before any unlink; pinSegment rejects it. Retry
+      // after interruption revalidates catalog authority and the same inventory.
+      for (const file of [...sealed.files,sealed.manifest]) {
+        fhAssert(dirname(file.path) === this.root && [sealed.segmentId+'.jsonl',sealed.segmentId+'.manifest.json'].includes(file.path.slice(this.root.length+1)), 'unsafe reclaim path');
+        if (existsSync(file.path)) {
+          fhAssert(equal(fhEvidence(file.path),file), 'sealed file changed');
+          this.options.boundary?.('reclaim-before-unlink'); unlinkSync(file.path);
+          this.options.boundary?.('reclaim-after-unlink');
+        }
+      }
+      fhSyncDir(this.root);
+      this.tx('reclaim-rows', () => {
+        this.fence(r); this.unpinned(sealed.segmentId);
+        this.db.query('DELETE FROM fh_event WHERE segment=?').run(sealed.segmentId);
+        this.db.query('DELETE FROM fh_checkpoint WHERE segment=?').run(sealed.segmentId);
+        this.db.query('DELETE FROM fh_row_id WHERE segment=?').run(sealed.segmentId);
+        this.db.query("UPDATE fh_segment SET state='remote',bytes=0 WHERE id=?").run(sealed.segmentId);
+      });
+      // DELETE alone does not release filesystem blocks. Drain WAL, then each
+      // incremental-vacuum step releases a tail page without a full DB copy.
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      for (;;) {
+        const n = Number((this.db.query('PRAGMA freelist_count').get() as SqlRow).freelist_count);
+        if (!n) break;
+        this.db.exec('PRAGMA incremental_vacuum(256)');
+        const left = Number((this.db.query('PRAGMA freelist_count').get() as SqlRow).freelist_count);
+        if (left >= n) break;
+      }
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      const after = this.physical();
+      return ok({kind:'local-reclaimed',remote,removed:[...sealed.files,sealed.manifest],allocatedBytesBefore:before.allocated,allocatedBytesAfter:after.allocated,freeBlocksBefore:before.free,freeBlocksAfter:after.free,blockBytes:after.block});
+    } catch(e) { return fail(e); }
+  }
+  private physical(): {allocated:number;free:number;block:number} {
+    let allocated = 0;
+    for (const suffix of ['', '-wal','-shm']) { const p = join(this.root,'flag-on-v1.sqlite'+suffix); if (existsSync(p)) allocated += statSync(p).blocks*512; }
+    const list = this.db.query("SELECT sealed FROM fh_segment WHERE sealed IS NOT NULL AND state!='remote'").all() as SqlRow[];
+    for (const s of list) { const seal = JSON.parse(String(s.sealed)) as SealedExport; for (const f of [...seal.files,seal.manifest]) if (existsSync(f.path)) allocated += statSync(f.path).blocks*512; }
+    const lockPath = join(this.root,'flag-on-writer.sqlite'); if (existsSync(lockPath)) allocated += statSync(lockPath).blocks*512;
+    const fs = statfsSync(this.root); return {allocated,free:fs.bfree,block:fs.bsize};
   }
 }
