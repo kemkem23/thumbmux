@@ -890,7 +890,7 @@ export class TargetedCaptureRepair {
       if (hits[0]!.length!==1 || hits[1]!.length!==1) {
         // A view shorter than the horizon already returned every retained row.
         // Opening a wider capture cannot add rows, so a quiet source stops here.
-        yield error('unresolved-gap', 'expired repair anchor');
+        yield error('unresolved-gap', view.rowCount < horizon ? 'quiet source has no further rows' : 'expired repair anchor');
         return;
       }
       const from=hits[0]![0]!+before.length, end=hits[1]![0]!;
