@@ -1205,12 +1205,12 @@ function hcheckpoint(ack:SpoolAck,id:string,previous:string|null=null):VtCheckpo
  return {kind:'vt-recovery',checkpointId:id,previousCheckpointId:previous,identity,inputFence:{kind:'durable-input',pane:hp,through:{sourceEpoch:0,packetSeq:0},digest:ack.recordDigest,segmentId:ack.segmentId},revision:0,head:0,state,stateDigest:streamDigest('vt-state',{identity,state})};
 }
 function hwatermark(f:ReturnType<typeof hfixture>,ack:SpoolAck,checkpoint:VtCheckpoint,index?:string):ReplayWatermarkR2 {
- return {revision:2,pane:hp,checkpointId:checkpoint.checkpointId,through:ack.through,controlOrder:1,decoderVersion:'test-v1',stateDigest:checkpoint.stateDigest,known:{geometry:true,attributes:false},decisionIndexCommitId:index??'empty:'+f.store.storeUUID,snapshotDependencies:[],durableCommitId:'watermark-'+checkpoint.checkpointId};
+ return {revision:2,pane:hp,checkpointId:checkpoint.checkpointId,through:ack.through,controlOrder:1,decoderVersion:'test-v1',stateDigest:checkpoint.stateDigest,known:{geometry:true,attributes:false},decisionIndexCommitId:index??'empty:'+f.store.storeUUID,snapshotDependencies:[],durableCommitId:'cp-'+checkpoint.checkpointId};
 }
 function hrremote(sealed:SealedExport,seal:import('../src/stream-contract').LogicalSealR2):{remote:RemoteIndexR2;inventory:ArchiveInventoryR2}{
  const old=hremote(sealed),members=[...sealed.files,sealed.manifest].map(f=>({...f,path:f.path.split('/').at(-1)!}));
  const inventory:ArchiveInventoryR2={revision:2,sealGeneration:sealed.generation,sealCommitId:sealed.sealCommitId,sealManifestSha256:sealed.manifest.sha256,bundleManifestSha256:old.verified.bundle.manifest.sha256,members:[...sealed.files,sealed.manifest].map((f,i)=>({sourcePath:f.path,relativePath:members[i]!.path,bytes:f.bytes,sha256:f.sha256}))};
- return {inventory,remote:{...old,verified:{...old.verified,bundle:{...old.verified.bundle,members,rawRanges:seal.rawRanges,checkpointIds:seal.checkpointIds}},repair:{revision:2,sealCommitId:sealed.sealCommitId,sealGeneration:sealed.generation,inventoryDigest:archiveInventoryDigest(inventory),authorizationGeneration:0}}};
+ return {inventory,remote:{...old,verified:{...old.verified,bundle:{...old.verified.bundle,members,rawRanges:seal.rawRanges,checkpointIds:seal.checkpointIds,...{repair:{revision:2,inventory,timelineIndex:members.find(f=>f.path.endsWith('.timeline.jsonl'))!,replayIndex:members.find(f=>f.path.endsWith('.replay.jsonl'))!}}}},repair:{revision:2,sealCommitId:sealed.sealCommitId,sealGeneration:sealed.generation,inventoryDigest:archiveInventoryDigest(inventory),authorizationGeneration:0}}};
 }
 test('H-r2 checkpoint pins block reclaim; successor preserves resize state decisions and stable remote timeline',async()=>{
  let remote:RemoteIndexR2|null=null;const f=hfixture({catalogAuthority:hcatalog(undefined,()=>remote)});
@@ -1230,6 +1230,12 @@ test('H-r2 checkpoint pins block reclaim; successor preserves resize state decis
    const next=hvalue(await port.appendInput(hrecord('successor',input,'suffix'))),cp2=hcheckpoint(next,'second','first'),watermark2=hwatermark(f,next,cp2,'decision-commit');
    hvalue(await port.commitReplayCheckpoint({pane:hp,expectedGeneration:0,operationId:'cp-second',checkpoint:cp2,watermark:watermark2}));
    const logical=hvalue(port.listSealed(null,256)).seals[0]!,sealed=hvalue(await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'export',sealCommitId:seam.sealCommitId}));
+   expect(logical.checkpointIds).toContain('first');
+   const replayFile=sealed.files.find(f=>f.path.endsWith('.replay.jsonl'))!;
+   const exported=readFileSync(replayFile.path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+   expect(exported.find(e=>e.kind==='control').value).toEqual(event);
+   expect(exported.find(e=>e.kind==='replay-checkpoint').value).toEqual(cp);
+   expect(exported.find(e=>e.kind==='decision').value).toEqual(decision);
    const candidate=hrremote(sealed,logical),request={pane:hp,expectedGeneration:0,operationId:'reclaim',sealed,...candidate};
    expect((await port.reclaimR2(request)).status).toBe('error');expect(existsSync(sealed.files[0]!.path)).toBe(true);
    remote=candidate.remote;const reclaimed=hvalue(await port.reclaimR2(request));expect(reclaimed.allocatedBytesAfter).toBeLessThan(reclaimed.allocatedBytesBefore);
@@ -1244,8 +1250,9 @@ test('H-r2 canonical SGR survives durable reopen and rejects semantic tuples; so
  const base=hrecord(),{digest:_,...body}=base,source={...body,digest:sourceSpoolDigest(body)};
  const f=hfixture({readSourceRecords:()=>({status:'ok',value:[source]})});
  try{const port=hr2(f.store),value={revision:2 as const,record:base,historyDomain:'spool' as const,source:[{range:source.range,firstSequence:0,lastSequence:0,previousDigest:null,terminalDigest:source.digest,sourceDomain:'spool-record' as const,recordsDigest:sourceRecordsDigest([source])}]};
-   const request:CoalescedInputR2={...value,provenanceDigest:inputProvenanceDigest(value)},ack=hvalue(await port.appendVerifiedInput(request));
-   const changed={...value,record:hrecord('forged',null,'different')};expect((await port.appendVerifiedInput({...changed,provenanceDigest:inputProvenanceDigest(changed)})).status).toBe('error');
+   const request:CoalescedInputR2={...value,provenanceDigest:inputProvenanceDigest(value)};
+   const changed={...value,record:hrecord('forged',null,'DIFF\nDIFF\n')};expect((await port.appendVerifiedInput({...changed,provenanceDigest:inputProvenanceDigest(changed)})).status).toBe('error');
+   const ack=hvalue(await port.appendVerifiedInput(request));
    const {digest:__,...rows}=hplain(ack,'styled');
    const cells=[{text:'e\u0301',width:1 as const,style:[1,31,48,5,200]},{text:'界',width:2 as const,style:[38,2,17,34,51]},{text:'',width:0 as const,style:[]}];
    const styled=rows.rows.map(row=>({...row,cells})),coverage=[{...rows.coverage[0]!,digest:streamDigest('rows',styled)}];
@@ -1253,5 +1260,27 @@ test('H-r2 canonical SGR survives durable reopen and rejects semantic tuples; so
    hvalue(await port.commitRowsAndGaps({...good,digest:streamDigest('rows-gaps',good)}));f.reopen();expect((await hreplay(f.store)).find(c=>c.kind==='committed')).toMatchObject({rows:[{cells}]});
    const invalidRows=hplain(ack,'invalid',1).rows.map(row=>({...row,cells:[{text:'bad',width:1 as const,style:[0,-1,-1]}]}));
    const invalid={...hplain(ack,'invalid',1),rows:invalidRows};const {digest:___,...bad}=invalid;expect((await f.store.commitRowsAndGaps({...bad,digest:streamDigest('rows-gaps',bad)})).status).toBe('error');
+ }finally{f.cleanup();}
+});
+
+test('H-r2 tail pins every local segment and releases all with its visible token',async()=>{
+ const f=hfixture();try{const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));hvalue(await port.commitRowsAndGaps(hplain(ack,'left')));
+ const seam=hvalue(await port.rotateSegment({pane:hp,expectedGeneration:0,operationId:'tail-rotate',segmentId:ack.segmentId,boundary:ack.through}));
+ const {digest:_,...body}=hplain(ack,'right');const rows=body.rows.map(row=>({...row,id:{...row.id,segmentId:seam.successor}}));const value={...body,rows,coverage:[{kind:'rows' as const,range:{pane:hp,segmentId:seam.successor,start:0,end:1},digest:streamDigest('rows',rows)}],decision:{...body.decision,acceptedRowMap:rows.map(row=>({source:row.origin,target:row.id}))}};
+ hvalue(await port.commitRowsAndGaps({...value,digest:streamDigest('rows-gaps',value)}));
+ const tail=hvalue(port.authority.tail(hp,512,1024*1024));expect(tail.kind).toBe('local');if(tail.kind!=='local')throw Error('local tail required');expect(tail.rows).toHaveLength(2);
+ expect((await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'pinned-export',sealCommitId:seam.sealCommitId})).status).toBe('error');
+ hvalue(await port.releasePin(tail.pin));expect((await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'released-export',sealCommitId:seam.sealCommitId})).status).toBe('ok');
+ }finally{f.cleanup();}
+});
+test('H-r2 distinct gaps in one episode retain positions across durable close updates',async()=>{
+ const f=hfixture();try{const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));
+ const base=hrows(ack,'gaps',0,[]).decision.gaps[0]!;
+ const a={...base,episodeId:'one-episode',repair:{revision:2 as const,gapId:'a',sequence:0,update:0,state:'open' as const}},b={...a,repair:{...a.repair,gapId:'b',sequence:1}};
+ const commit=async(op:string,gaps:readonly import('../src/stream-contract').GapR2[])=>{const {digest:_,...body}=hrows(ack,op,0,[]),value={...body,coverage:gaps.map(gap=>({kind:'gap' as const,gap,digest:streamDigest('gap',gap)})),decision:{...body.decision,gaps}};return port.commitRowsAndGaps({...value,digest:streamDigest('rows-gaps',value)});};
+ hvalue(await commit('two-gaps',[a,b]));const closed={...a,closedAt:2,repair:{...a.repair,update:1,state:'closed' as const}};hvalue(await commit('close-first',[closed]));
+ expect(hvalue(port.authority.head(hp)).entryCount).toBe(2);
+ expect((await commit('reopen-closed',[{...a,repair:{...a.repair,update:2}}])).status).toBe('error');
+ f.reopen();const page=hvalue(hr2(f.store).authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));expect(page.entries).toEqual([closed,b]);
  }finally{f.cleanup();}
 });

@@ -246,11 +246,16 @@ test('contract repair mutants go red then restored real seams go green', async (
 test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin bypass', async () => {
   const pkg=resolve(import.meta.dir,'../..'),root=mkdtempSync(join(tmpdir(),'flagon-H-mutants-'));
   const mutations=[
+    {name:'r2-dangling-left-row',pattern:'H-r2 rejects a gap',from:'if(g.leftRowId) fhAssert(this.visibleRow',to:'if(false && g.leftRowId) fhAssert(this.visibleRow'},
+    {name:'r2-publish-candidate-early',pattern:'H-r2 staged attach',from:"staged?'candidate':'committed',r.operationId,r.digest,r,receipt",to:"'committed',r.operationId,r.digest,r,receipt"},
+    {name:'r2-drop-timeline-on-reclaim',pattern:'H-r2 checkpoint pins',from:'// Stable row IDs and timeline slots survive payload reclaim.',to:"this.db.query('DELETE FROM fh_timeline WHERE segment=?').run(sealed.segmentId);"},
+    {name:'r2-omit-geometry-journal',pattern:'H-r2 checkpoint pins',from:"this.save('control',event.eventId,key,event);return {commitId:r.operationId,event};",to:'return {commitId:r.operationId,event};'},
+    {name:'r2-source-bytes-unchecked',pattern:'H-r2 canonical SGR',from:"offset===record.range.end&&(record.payload.kind!=='bytes'||equal(raw,record.payload.bytes))",to:'offset===record.range.end'},
     {name:'replay-remote-prefix',pattern:'replay from current durable cursor',from:".all(key,segmentFloor) as SqlRow[];",to:".all(key,0) as SqlRow[];"},
     {name:'delete-without-vacuum',pattern:'verified reclaim really',from:"this.db.exec('PRAGMA incremental_vacuum(256)');",to:'/* mutant: DELETE without returning source DB pages */'},
     {name:'swallow-gap',pattern:'ACK then reopen',from:"gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))",to:"gaps:[],receipt:JSON.parse(String(e.receipt))"},
     {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),staged?'candidate':'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
-    {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);",to:'/* ACK without durable input */'},
+    {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack,encoded);",to:'/* ACK without durable input */'},
     {name:'upload-is-verification',pattern:'upload exit zero',from:"fhAssert(this.options.validateRemoteIndex?.(remote,sealed) === true, 'remote catalog authority not validated');",to:'/* delete after untrusted upload receipt */'},
     {name:'pin-bypass',pattern:'pins survive restart',from:"fhAssert(!this.db.query('SELECT 1 FROM fh_pin WHERE segment=? AND released=0 LIMIT 1').get(segment), 'segment pinned');",to:'/* ignore active reader/handoff pin */'},
     {name:'remote-to-empty-eof',pattern:'verified reclaim really',from:"for (const s of segments) fhAssert(s.state !== 'reclaiming' && s.state !== 'remote', 'remote-required: restore segment before replay');",to:'/* remote treated as empty local */'},
@@ -269,12 +274,13 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
       const child=Bun.spawn([process.execPath,'test','./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);return {exit,output:out+err};
     };
-    const clean=await run('flag-on H');expect(clean.exit,clean.output).toBe(0);expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+    const clean=await run('flag-on H|H-r2');expect(clean.exit,clean.output).toBe(0);expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
     for(const mutation of mutations){
       expect(original.split(mutation.from).length).toBe(2);writeFileSync(file,original.replace(mutation.from,mutation.to));
       const result=await run(mutation.pattern);console.log('FLAGON_H_MUTANT',mutation.name,result.exit,result.output);
-      expect(result.exit).not.toBe(0);expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);writeFileSync(file,original);
+      expect(result.exit).not.toBe(0);expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);writeFileSync(file,original);
+      const restored=await run(mutation.pattern);console.log('FLAGON_H_RESTORED',mutation.name,restored.exit,restored.output);expect(restored.exit,restored.output).toBe(0);
     }
-    expect((await run('flag-on H')).exit).toBe(0);
+    expect((await run('flag-on H|H-r2')).exit).toBe(0);
   }finally{rmSync(root,{recursive:true,force:true});}
 },120000);
