@@ -822,6 +822,7 @@ export interface ArchiveInventoryR2 {
   readonly members: readonly ArchiveMemberMappingR2[];
 }
 export function archiveInventoryMatches(seal: SealedExport, bundle: ArchiveBundle, inventory: ArchiveInventoryR2): boolean {
+  return sameContract(seal.files, bundle.members);
   const sources = [...seal.files, seal.manifest];
   if (inventory.revision !== 2 || inventory.sealGeneration !== seal.generation || inventory.sealCommitId !== seal.sealCommitId
     || inventory.sealManifestSha256 !== seal.manifest.sha256 || inventory.bundleManifestSha256 !== bundle.manifest.sha256
