@@ -653,7 +653,11 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
         at = page.startLine;
       }
       expect(markers.length).toBeGreaterThan(0);
-      expect(tagged.every((line) => new RegExp(`^E\\d{7} ${tag} `).test(line))).toBe(true);
+      // Exact text per id: the producer writes "E<id> rz " plus id%13 "y"s, so a
+      // multiple of 13 ends at "rz" once trimmed. Any shortened row differs here.
+      const exact = (line: string) => { const m = /^E(\d{7}) /.exec(line);
+        return !!m && line === `E${m[1]} ${tag} ${"y".repeat(Number(m[1]) % 13)}`.trimEnd(); };
+      expect(tagged.filter((line) => !exact(line))).toEqual([]);
       // B1: the fallback is real only if the legacy keeper collects the pane
       // again. The lease is back, the pipe is withdrawn, and rows written after
       // the stop reach the keeper's archive through a real keeper tick.
