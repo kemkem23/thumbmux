@@ -315,6 +315,11 @@ test("DS-02 synthetic remote → verify → local delete → empty-root restore 
   const second = await restoreRangeFromRemote(req, NEVER, { remote });
   if (second.status !== "ok") throw new Error(JSON.stringify(second));
   expect(rowsOf(second.value.files)).toEqual(DS_ROWS["seg-0002"]!);
+  for (const ev of second.value.verified.evidence) {
+    expect(existsSync(ev.path)).toBe(true);
+    expect(sha(readFileSync(ev.path))).toBe(ev.sha256);
+  }
+  expect(statSync(join(target, "restore-cache", second.value.cacheId)).mode & 0o222).toBe(0);
   const again = await restoreRangeFromRemote(req, NEVER, { remote });
   expect(again.status === "ok" && again.value.cacheId).toBe(second.value.cacheId);
   // A range the bundle does not cover is refused rather than answered with an empty page.

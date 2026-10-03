@@ -387,3 +387,21 @@ test("DS-01 a crash at every archive state resumes from the journal and never un
     expect([at, states.indexOf("UPLOADED_UNVERIFIED") < states.indexOf("VERIFIED_REMOTE")]).toEqual([at, true]);
   }
 });
+
+
+test("DS-01 concurrency stays locked while remote upload awaits, and successful reclaim clears staging", async () => {
+  const { worker, remote, syn, store } = setup();
+  let release!: () => void;
+  let entered!: () => void;
+  const barrier = new Promise<void>(r => { release = r; });
+  const started = new Promise<void>(r => { entered = r; });
+  const put = remote.put.bind(remote);
+  remote.put = async (local, key) => { entered(); await barrier; return put(local, key); };
+  const running = worker.archiveOnce(HIGH, NEVER);
+  await started;
+  try {
+    expect(await worker.archiveOnce(HIGH, NEVER)).toEqual({ status: "busy", retryAfterMs: 1000, reason: "queue" });
+    expect(syn.events).toEqual(["seal:seg-a"]);
+  } finally { release(); await running; }
+  expect(readdirSync(join(store, "archive", "staging"))).toEqual([]);
+});
