@@ -657,7 +657,7 @@ export function semanticStyleToSgr(style: SemanticStyle): number[] {
     else { const rgb = c - 256; sgr.push(extended, 2, rgb >>> 16, (rgb >>> 8) & 255, rgb & 255); }
   };
   color(style.fg, 30, 90, 38); color(style.bg, 40, 100, 48);
-  return sgr;
+  return [style.attrs, style.fg, style.bg];
 }
 /** Accept canonical full-state parameters only (implicit reset before each
  * cell). [] = default. Reject reset/off codes, aliases, duplicates, reordered
