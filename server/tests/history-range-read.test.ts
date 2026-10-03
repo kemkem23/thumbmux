@@ -646,11 +646,12 @@ function flagOnExtension(overrides: Partial<NewarchHistoryExtension> = {}): Newa
 
 async function flagOnHarness(
   page: (view: ReadView) => HistoryPage,
-  flagOn: ConstructorParameters<typeof StreamDisplayEngine>[0]["flagOn"] = { supported: ["history-states-v1", "catalog-v3"], required: true },
+  // null = a display that was never negotiated for flag-on.
+  flagOn: ConstructorParameters<typeof StreamDisplayEngine>[0]["flagOn"] | null = { supported: ["history-states-v1", "catalog-v3"], required: true },
 ) {
   const h = displayHarness();
   h.history.readPage = async ack => ({ status: "ok", value: page(ack.view) });
-  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history, flagOn });
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history, ...(flagOn ? { flagOn } : {}) });
   const route = displayRoute("flag-viewer");
   const attached = engine.attach(route, () => {});
   for (const listener of h.listeners) listener(displayFrame());
@@ -715,7 +716,7 @@ test("NEWARCH D: pages that would read as false EOF or hide states are refused w
 test("NEWARCH D: a display not negotiated for flag-on refuses an envelope instead of dropping it", async () => {
   const { result } = await flagOnHarness(view => ({
     ...displayPage(view, "r"), hasMoreBefore: true, flagOn: flagOnExtension(),
-  }), undefined);
+  }), null);
   expect(result).toEqual({ status: "error", code: "unsupported", message: "display was not negotiated for flag-on history states" });
 });
 
