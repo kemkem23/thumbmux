@@ -333,7 +333,14 @@ test("DS-02 synthetic remote → verify → local delete → empty-root restore 
     expect(f.path.startsWith(join(target, "restore-cache") + "/")).toBe(true);
     expect(statSync(f.path).mode & 0o222).toBe(0);
   }
+});
 
+// Split from the round trip above so each half has its own per-test budget: every
+// assertion is kept, the library half archives only the segment it restores.
+test("DS-02 library restore keeps repeated rows with their count, is idempotent, and refuses an uncovered range", async () => {
+  const { remoteDir, worker } = dsSetup(["seg-0002"]);
+  await archiveAll(worker, 1);
+  const target = emptyRoot();
   // The second segment through the library, repeated rows kept with their count; a repeat restore is idempotent.
   const remote = new RcloneRemote({ location: `:local:${remoteDir}` });
   const req = { operationId: "r2", storeUUID: DS_STORE, range: { pane: DS_PANE, segmentId: "seg-0002", start: 0, end: 5 },
