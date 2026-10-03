@@ -860,6 +860,63 @@ export interface OrderedControlR2 {
 export function orderedControlDigest(value: Omit<OrderedControlR2, 'digest'>): Digest {
   return streamDigest('ordered-control-r2', value);
 }
+/** R12: bounded read of the durable control journal strictly after a replay
+ * watermark, in (byteOffset, order) order within the watermark's epoch. Opaque
+ * cursor continues the same read; it never re-derives order from a decoder. */
+export interface OrderedControlReadR2 {
+  readonly pane: PaneKey; readonly after: ReplayWatermarkR2;
+  readonly cursor: NewarchHistoryCursor | null; readonly maxEntries: number; readonly maxBytes: number;
+}
+export interface OrderedControlEntryR2 { readonly commitId: string; readonly event: OrderedControlR2 }
+/** payloadBytes = UTF-8 bytes of streamCanonical(entries). next === null iff
+ * atDurableHead; a non-head page with no entries is a stalled read, not EOF. */
+export interface OrderedControlPageR2 {
+  readonly revision: 2; readonly pane: PaneKey; readonly checkpointId: string;
+  readonly entries: readonly OrderedControlEntryR2[]; readonly payloadBytes: number;
+  readonly next: NewarchHistoryCursor | null; readonly atDurableHead: boolean;
+}
+/** Replay position carried between pages: last applied control (null before
+ * the first page) and the geometry in force, seeded from checkpoint.state. */
+export interface OrderedControlReplayR2 { readonly last: OrderedControlR2 | null; readonly geometry: Geometry }
+/** Structural conformance of one page against the request and the carried
+ * replay position. Returns the events to apply and the geometry after them.
+ * Not durability proof: H answers from its journal, I applies before bytes. */
+export function replayOrderedControls(request: OrderedControlReadR2, page: OrderedControlPageR2,
+  carried: OrderedControlReplayR2): OrderedControlReplayR2 & { readonly events: readonly OrderedControlR2[] } {
+  const w = request.after;
+  contractUint(request.maxEntries); contractUint(request.maxBytes);
+  if (request.maxEntries < 1 || request.maxEntries > FLAGON_REPAIR_LIMITS.readEntries
+    || request.maxBytes < 1 || request.maxBytes > FLAGON_REPAIR_LIMITS.readBytes) throw Error('control read bound');
+  if (w.revision !== 2 || !sameContract(w.pane, request.pane) || !sameContract(w.through.epoch.pane, request.pane)
+    || page.revision !== 2 || !sameContract(page.pane, request.pane) || page.checkpointId !== w.checkpointId) throw Error('control read identity');
+  if ((request.cursor === null) !== (carried.last === null)) throw Error('control read cursor/carried mismatch');
+  if (page.entries.length > request.maxEntries || page.payloadBytes > request.maxBytes
+    || page.payloadBytes !== Buffer.byteLength(streamCanonical(page.entries))) throw Error('control page bound');
+  if (page.atDurableHead !== (page.next === null) || (!page.atDurableHead && page.entries.length === 0)) throw Error('control page continuation');
+  contractUint(w.through.byteOffset); contractUint(w.controlOrder);
+  let prev = carried.last ? carried.last.position.byteOffset : w.through.byteOffset;
+  let prevOrder = carried.last ? carried.last.order : w.controlOrder;
+  let geometry = carried.geometry;
+  const ids = new Set<string>(), events: OrderedControlR2[] = [];
+  for (const { commitId, event } of page.entries) {
+    const { digest, ...body } = event;
+    contractUint(event.position.byteOffset); contractUint(event.order); contractHash(digest);
+    if (!commitId || ids.has(commitId) || event.revision !== 2 || !event.eventId
+      || orderedControlDigest(body) !== digest) throw Error('control entry identity/digest');
+    if (!sameContract(event.position.epoch, w.through.epoch)) throw Error('control entry epoch');
+    if (event.decoderVersion !== w.decoderVersion) throw Error('control entry decoder version');
+    const off = event.position.byteOffset;
+    if (off < prev || (off === prev && event.order <= prevOrder)) throw Error('control entry not after watermark/previous');
+    if (event.payload.kind === 'geometry') {
+      const { before, after } = event.payload;
+      for (const n of [before.columns, before.rows, after.columns, after.rows]) if (!Number.isSafeInteger(n) || n < 1) throw Error('control geometry');
+      if (!sameContract(before, geometry)) throw Error('control geometry chain');
+      geometry = after;
+    } else if (!event.payload.name) throw Error('control name');
+    ids.add(commitId); events.push(event); prev = off; prevOrder = event.order;
+  }
+  return { events, geometry, last: events.length ? events[events.length - 1]! : carried.last };
+}
 export interface ReplayWatermarkR2 {
   readonly revision: 2; readonly pane: PaneKey; readonly checkpointId: string;
   readonly through: RawPosition; readonly controlOrder: number; readonly decoderVersion: string;
@@ -907,6 +964,8 @@ export interface HistoryAuthorityR2 {
   page(request: BoundedReadR2): Result<TimelinePageR2>;
   watermark(pane: PaneKey): Result<ReplayWatermarkR2 | null>;
   decisions(request: BoundedReadR2): Result<{ readonly entries: readonly ReplayDecisionR2[]; readonly next: NewarchHistoryCursor | null }>;
+  /** R12: journaled controls after `request.after`, survives restart/reclaim. */
+  controls(request: OrderedControlReadR2): Result<OrderedControlPageR2>;
 }
 export interface ConsumerCheckpointR2 extends OperationFence {
   readonly revision: 2; readonly consumerId: string; readonly through: SpoolAck;
