@@ -1340,3 +1340,353 @@ assert w.screen.display[1].strip()=='after'
   const r = Bun.spawnSync(['python3','-B','-c',script,new URL('../src/pipe-vt-worker.py',import.meta.url).pathname]);
   expect(r.exitCode,r.stderr.toString()).toBe(0);
 });
+
+// ---------------------------------------------------------------------------
+// NEWARCH flag-on C: stitch v1 (ST-01 / ST-02). Expected decisions are written
+// by hand from the synthetic producer events below, never computed by the
+// stitcher. Rows are separate events even when their cells repeat.
+import {
+  StreamStitcher, KnownStateTracker, captureStitchRows, stitchRowKey, baselineCellOrigins,
+} from '../src/stream-stitch';
+import type * as SC from '../src/stream-contract';
+import { STITCH_ORACLE_VECTORS } from '../../../../docs/tasks/newarch-stream/contract-fixture';
+
+const stPane: SC.PaneKey = { serverIdentity: 'st-server', paneId: '%7', birthGeneration: 3 };
+const stEpoch: SC.PipeEpoch = { pane: stPane, attachId: 'attach-st', collectorIncarnation: 'collector-st' };
+const stHex = 'a'.repeat(64);
+const stFile: SC.EvidenceFile = { path: 'synthetic/st.bin', bytes: 1, sha256: stHex };
+const stGeometry = { columns: 80, rows: 24 } as const;
+const stPolicy: SC.StitchPolicy = { version: 1, minAnchorRows: 8, minDistinctKeys: 4, minNonblankRows: 2, maxCandidates: 4096, deadlineMs: 100 };
+const CAPTURE_START = 100; const CAPTURE_END = 140;
+const certified: SC.BoundaryEvidence = {
+  kind: 'certified-same-turn', pane: stPane, epoch: stEpoch, geometry: stGeometry, binarySha256: stHex, hookConfigSha256: stHex,
+  transcript: stFile, eventCoverage: stFile, pipeOpenEvent: 'e1', captureStartEvent: 'e2', captureEndEvent: 'e3',
+  rawStart: { epoch: stEpoch, byteOffset: CAPTURE_START }, certificateId: 'cert-st',
+};
+const unknownBoundary: SC.BoundaryEvidence = { kind: 'overlap-unknown', reason: 'split-command' };
+const genesis = { kind: 'vt-recovery' } as unknown as SC.VtCheckpoint;
+const birthBoundary: SC.BoundaryEvidence = { kind: 'birth', pane: stPane, epoch: stEpoch, genesis, firstByteOffset: 0, transcript: stFile };
+function stPacket(over: Partial<SC.CapturePacket> = {}): SC.CapturePacket {
+  return {
+    version: 1, snapshotId: 'snap-st', episodeId: 'ep-st', captureCount: 1, complete: true, pane: stPane,
+    geometry: stGeometry, geometryGeneration: 1, historySize: 4500, historyLimit: 4500,
+    cursor: { x: 0, y: 0, visible: true }, activeBuffer: 'normal', mainHistory: 'available',
+    snapshot: stFile, commandTranscript: stFile, rawRange: { epoch: stEpoch, start: CAPTURE_START, end: CAPTURE_END },
+    boundary: certified, startedAtMonoMs: 10, endedAtMonoMs: 11, clockEpoch: 'clock-st', stateKnown: {}, ...over,
+  };
+}
+type RowOpts = { finalized?: boolean; wrap?: SC.StitchRow['wrapStatus']; style?: number[]; uncertain?: string[]; columns?: number; cellOrigins?: SC.RowOrigin[] };
+function stRow(text: string, origin: SC.RowOrigin, o: RowOpts = {}): SC.StitchRow {
+  const cells = Array.from(text, ch => ({ text: ch, width: 1 as const, style: o.style ?? [] }));
+  return {
+    origin, cells, geometry: { columns: o.columns ?? 80, rows: 24 }, buffer: 'normal', wrapStatus: o.wrap ?? 'unwrapped',
+    wrapPad: 0, finalized: o.finalized ?? true, uncertainFields: o.uncertain ?? [], cellOrigins: o.cellOrigins ?? cells.map(() => origin),
+  };
+}
+const durableId = (i: number): SC.SegmentRowId => ({ pane: stPane, segmentId: 'seg-old', rowOrdinal: i });
+const tailOf = (texts: readonly string[], o: RowOpts = {}): SC.StitchWindow =>
+  ({ pane: stPane, rows: texts.map((t, i) => stRow(t, { kind: 'durable', rowId: durableId(i) }, o)) });
+const capOrigin = (i: number): SC.RowOrigin => ({ kind: 'capture', snapshotId: 'snap-st', rowIndex: i });
+function captureOf(texts: readonly string[], packet = stPacket(), screen = 0): SC.CaptureWindow {
+  return { pane: stPane, packet, rows: texts.map((t, i) => stRow(t, capOrigin(i), { finalized: i < texts.length - screen })) };
+}
+const pipeOrigin = (start: number, end = start + 1, ordinal = 0): SC.RowOrigin => ({ kind: 'pipe', range: { epoch: stEpoch, start, end }, ordinal });
+function pipeOf(rows: readonly SC.StitchRow[], start = CAPTURE_START): SC.PipeWindow {
+  return { pane: stPane, rawRange: { epoch: stEpoch, start, end: 10_000 }, rows };
+}
+const pipeRow = (text: string, offset: number, o: RowOpts = {}) => stRow(text, pipeOrigin(offset, offset + text.length + 1), o);
+const mapping = (tailLen: number): SC.SeamProof => ({
+  kind: 'recorded-mapping', range: { epoch: stEpoch, start: 0, end: CAPTURE_START }, checkpointId: 'ck-st', mapping: stFile,
+  coverage: [{ kind: 'rows', range: { pane: stPane, segmentId: 'seg-old', start: 0, end: tailLen }, digest: stHex }],
+});
+const pipeMapping: SC.SeamProof = { kind: 'recorded-mapping', range: { epoch: stEpoch, start: 0, end: CAPTURE_END + 10 }, checkpointId: 'ck-p', mapping: stFile, coverage: [] };
+function stProofs(tailToCapture: SC.SeamProof[], captureToPipe: SC.SeamProof[] = [{ kind: 'independent-boundary', boundary: certified as Exclude<SC.BoundaryEvidence, { kind: 'overlap-unknown' }> }]): SC.StitchProofs {
+  return { policy: stPolicy, episodeId: 'ep-st', tailToCapture, captureToPipe };
+}
+const sources = (r: SC.StitchResult) => r.status === 'error' ? [] : r.acceptedRowMap.map(a =>
+  a.source.kind === 'capture' ? `C${a.source.rowIndex}` : a.source.kind === 'pipe' ? `P${a.source.range.start}` : 'T');
+const letters = 'abcdefghijklmnop'.split('');
+
+describe('NEWARCH C stitch v1 ST-01 content candidates and proof gate', () => {
+  test('K literal oracle vectors give the K literal decisions', async () => {
+    const stitcher = new StreamStitcher();
+    const seen: Record<string, string> = {};
+    for (const v of STITCH_ORACLE_VECTORS) {
+      let result: SC.StitchResult;
+      if (v.proof === 'genesis-byte-zero') {
+        const packet = stPacket({ boundary: birthBoundary, rawRange: { epoch: stEpoch, start: 0, end: 0 }, historySize: 0 });
+        result = await stitcher.stitch(tailOf(v.tail), captureOf(v.capture, packet), pipeOf([pipeRow('first', 0)], 0),
+          stProofs([], [{ kind: 'independent-boundary', boundary: birthBoundary as Exclude<SC.BoundaryEvidence, { kind: 'overlap-unknown' }> }]));
+      } else {
+        const proofs = v.proof === 'recorded-mapping-and-boundary' ? [mapping(v.tail.length)] : [];
+        result = await stitcher.stitch(tailOf(v.tail), captureOf(v.capture), pipeOf([]), stProofs(proofs));
+      }
+      seen[v.id] = result.status;
+    }
+    expect(seen).toEqual({
+      'ST-short-7': 'unproven', 'ST-unique-reprinted-8': 'unproven', 'ST-multiple': 'ambiguous',
+      'ST-blank': 'unproven', 'ST-proven-8': 'matched', 'ST-zero-birth': 'matched',
+    });
+  });
+
+  test('7 proven rows are a short anchor; 8 proven rows stitch and keep only the new capture row', async () => {
+    const s = new StreamStitcher();
+    const seven = await s.stitch(tailOf(letters.slice(0, 7)), captureOf([...letters.slice(0, 7), 'x']), pipeOf([]), stProofs([mapping(7)]));
+    expect(seven.status === 'unproven' && seven.reason).toBe('short-anchor');
+    expect(sources(seven)).toEqual([]);
+    const eight = await s.stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([mapping(8)]));
+    expect(eight.status).toBe('matched');
+    expect(sources(eight)).toEqual(['C8']);
+    expect(eight.status !== 'error' && eight.gaps).toEqual([]);
+    expect(eight.status !== 'error' && eight.acceptedRowMap[0]!.target.rowOrdinal).toBe(0);
+  });
+
+  test('unique reprinted block without proof is a gap after T, never matched', async () => {
+    const r = await new StreamStitcher().stitch(tailOf(letters.slice(0, 8)), captureOf(letters.slice(0, 10)), pipeOf([]), stProofs([]));
+    expect(r.status === 'unproven' && r.reason).toBe('content-only');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(r.acceptedRowMap).toEqual([]);
+    expect(r.withheldRanges).toEqual([{ source: 'capture', start: 0, end: 10, reason: 'unproven' }]);
+    expect(r.gaps.length).toBe(1);
+    expect(r.gaps[0]).toMatchObject({ leftRowId: durableId(7), reason: 'unproven-overlap', countKind: 'unknown', missingCount: null, withheldRows: 10 });
+  });
+
+  test('fewer than 4 distinct keys or fewer than 2 nonblank rows never anchor, even with a proof', async () => {
+    const s = new StreamStitcher();
+    const three = ['x', 'a', 'a', 'a', 'a', 'a', 'a', 'b'];
+    const lowDistinct = await s.stitch(tailOf(three), captureOf([...three, 'n']), pipeOf([]), stProofs([mapping(8)]));
+    expect(lowDistinct.status === 'unproven' && lowDistinct.reason).toBe('content-only');
+    const blanks = ['', ' ', '  ', '   ', '    ', '     ', '      ', 'a'];
+    const oneNonblank = await s.stitch(tailOf(blanks), captureOf([...blanks, 'z']), pipeOf([]), stProofs([mapping(8)]));
+    expect(oneNonblank.status === 'unproven' && oneNonblank.reason).toBe('content-only');
+  });
+
+  test('ABAB and spinner screens have several alignments: ambiguous even with a valid proof', async () => {
+    const s = new StreamStitcher();
+    const abab = await s.stitch(tailOf('abababab'.split('')), captureOf('ababababab'.split('')), pipeOf([]), stProofs([mapping(8)]));
+    expect(abab.status).toBe('ambiguous');
+    expect(abab.status === 'ambiguous' && [abab.reason, abab.candidateCount]).toEqual(['multiple-alignments', 5]);
+    expect(sources(abab)).toEqual([]);
+    expect(abab.status !== 'error' && abab.gaps[0]!.reason).toBe('ambiguous-overlap');
+    const spin = ['|', '/', '-', '\\', '|', '/', '-', '\\'];
+    const spinner = await s.stitch(tailOf(spin), captureOf([...spin, ...spin.slice(0, 4)]), pipeOf([]), stProofs([mapping(8)]));
+    expect(spinner.status === 'ambiguous' && spinner.candidateCount).toBe(2);
+  });
+
+  test('blank full screen offers no candidate at all', async () => {
+    const blank = Array(8).fill('');
+    const r = await new StreamStitcher().stitch(tailOf(blank), captureOf([...blank, ...blank]), pipeOf([]), stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('content-only');
+  });
+
+  test('a constant hash cannot make different rows equal, nor equal rows ambiguous', async () => {
+    const s = new StreamStitcher({ hash: () => 'collide' });
+    const proven = await s.stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([mapping(8)]));
+    expect(proven.status).toBe('matched');
+    expect(sources(proven)).toEqual(['C8']);
+    const changed = await s.stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 7), 'H', 'x']), pipeOf([]), stProofs([mapping(8)]));
+    expect(changed.status === 'unproven' && changed.reason).toBe('content-only');
+  });
+
+  test('row keys keep spaces, combining marks, CJK width, style and wrap; nothing is normalized', () => {
+    const o = capOrigin(0);
+    const key = (r: SC.StitchRow) => stitchRowKey(r);
+    const base = stRow('h', o);
+    expect(key(stRow('h ', o))).not.toBe(key(base));
+    expect(key(stRow('é', o))).not.toBe(key({ ...stRow('e', o), cells: [{ text: 'é', width: 1, style: [] }] }));
+    expect(key({ ...base, cells: [{ text: '你', width: 2, style: [] }] })).not.toBe(key({ ...base, cells: [{ text: '你', width: 1, style: [] }] }));
+    expect(key(stRow('h', o, { style: [1] }))).not.toBe(key(base));
+    expect(key(stRow('h', o, { wrap: 'wrapped' }))).not.toBe(key(base));
+    expect(key(stRow('h', o, { columns: 81 }))).not.toBe(key(base));
+    expect(key(stRow('ก่', o))).toBe(key(stRow('ก่', capOrigin(5))));
+    expect(key(base)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('trailing-space difference breaks the overlap; unknown wrap still finds the candidate', async () => {
+    const s = new StreamStitcher();
+    const t = tailOf(letters.slice(0, 8));
+    const spaced = await s.stitch(t, captureOf([...letters.slice(0, 7), 'h ', 'x']), pipeOf([]), stProofs([mapping(8)]));
+    expect(spaced.status === 'unproven' && spaced.reason).toBe('content-only');
+    const cap = captureOf([...letters.slice(0, 8), 'x']);
+    const unknownWrap = { ...cap, rows: cap.rows.map(r => ({ ...r, wrapStatus: 'unknown' as const })) };
+    const r = await s.stitch(t, unknownWrap, pipeOf([]), stProofs([mapping(8)]));
+    expect(r.status).toBe('matched');
+    expect(sources(r)).toEqual(['C8']);
+  });
+
+  test('more than 4096 candidates stops the search as ambiguity', async () => {
+    const r = await new StreamStitcher().stitch(tailOf(['a']), captureOf(Array(5000).fill('a')), pipeOf([]), stProofs([mapping(1)]));
+    expect(r.status === 'ambiguous' && [r.reason, r.candidateCount]).toEqual(['candidate-limit', 4097]);
+  });
+
+  test('time budget exhaustion returns unproven deadline, not a guess', async () => {
+    let t = 0;
+    const r = await new StreamStitcher({ now: () => (t += 60) }).stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('deadline');
+    expect(sources(r)).toEqual([]);
+  });
+
+  test('a mapping from another epoch or not covering the last durable row is not a proof', async () => {
+    const s = new StreamStitcher();
+    const other = { ...mapping(8), range: { epoch: { ...stEpoch, collectorIncarnation: 'old' }, start: 0, end: CAPTURE_START } } as SC.SeamProof;
+    const short = mapping(7);
+    for (const proof of [other, short]) {
+      const r = await s.stitch(tailOf(letters.slice(0, 8)), captureOf([...letters.slice(0, 8), 'x']), pipeOf([]), stProofs([proof]));
+      expect(r.status === 'unproven' && r.reason).toBe('content-only');
+    }
+  });
+
+  test('a weakened runtime policy is rejected as integrity error', async () => {
+    const weak = { ...stProofs([mapping(8)]), policy: { ...stPolicy, minAnchorRows: 1 } as unknown as SC.StitchPolicy };
+    const r = await new StreamStitcher().stitch(tailOf(letters.slice(0, 8)), captureOf(letters.slice(0, 9)), pipeOf([]), weak);
+    expect(r.status === 'error' && r.code).toBe('integrity');
+  });
+});
+
+describe('NEWARCH C stitch v1 ST-02 seams, origin tags and known state', () => {
+  const T8 = tailOf(letters.slice(0, 8));
+  const C12 = () => captureOf([...letters.slice(0, 8), 'i', 'j', 'k', 'l'], stPacket(), 2); // k,l are screen rows
+
+  test('certified same-turn boundary: zero byte overlap, baseline cells finalize once', async () => {
+    const P = pipeOf([
+      stRow('k', pipeOrigin(100), { cellOrigins: baselineCellOrigins('snap-st', 10, 1) }), // screen row k scrolls
+      stRow('k', pipeOrigin(101), { cellOrigins: baselineCellOrigins('snap-st', 10, 1) }), // same baseline row again
+      stRow('l!', pipeOrigin(102, 104), { cellOrigins: [capOrigin(11), pipeOrigin(102, 104)] }), // edited screen row
+      stRow('j', pipeOrigin(104), { cellOrigins: baselineCellOrigins('snap-st', 9, 1) }), // already accepted history row
+      pipeRow('new', 105),
+      pipeRow('tail', 109, { finalized: false }),
+    ]);
+    const r = await new StreamStitcher().stitch(T8, C12(), P, stProofs([mapping(8)]));
+    expect(r.status).toBe('matched');
+    expect(sources(r)).toEqual(['C8', 'C9', 'P100', 'P102', 'P105']);
+    expect(r.status !== 'error' && r.acceptedRowMap.map(a => a.target.rowOrdinal)).toEqual([0, 1, 2, 3, 4]);
+    expect(r.status !== 'error' && [r.gaps, r.withheldRanges]).toEqual([[], []]);
+  });
+
+  test('normal repeated rows keep their real count', async () => {
+    const P = pipeOf([pipeRow('ok', 100), pipeRow('ok', 103), pipeRow('ok', 106)]);
+    const cap = captureOf([...letters.slice(0, 8), 'ok', 'ok']);
+    const r = await new StreamStitcher().stitch(T8, cap, P, stProofs([mapping(8)]));
+    expect(r.status).toBe('matched');
+    expect(sources(r)).toEqual(['C8', 'C9', 'P100', 'P103', 'P106']);
+  });
+
+  test('split attach without proof withholds the pipe prefix and resumes on the verified suffix', async () => {
+    const packet = stPacket({ boundary: unknownBoundary });
+    const P = pipeOf([pipeRow('i', 100), pipeRow('j', 120), pipeRow('m', CAPTURE_END), pipeRow('n', CAPTURE_END + 2)]);
+    const r = await new StreamStitcher().stitch(T8, captureOf([...letters.slice(0, 8), 'i', 'j'], packet), P, stProofs([mapping(8)], []));
+    expect(r.status === 'unproven' && r.reason).toBe('content-only');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(sources(r)).toEqual(['C8', 'C9', `P${CAPTURE_END}`, `P${CAPTURE_END + 2}`]);
+    expect(r.withheldRanges).toEqual([{ source: 'pipe', start: 0, end: 2, reason: 'unproven' }]);
+    expect(r.gaps).toHaveLength(1);
+    expect(r.gaps[0]).toMatchObject({ leftRowId: r.acceptedRowMap[1]!.target, withheldRows: 2, countKind: 'unknown', missingCount: null });
+  });
+
+  test('split attach with a mapping proof removes exactly the proven overlap', async () => {
+    const packet = stPacket({ boundary: unknownBoundary });
+    const hist = [...letters.slice(0, 8), ...'qrstuvwx'.split('')];
+    const P = pipeOf([...'qrstuvwx'.split('').map((c, i) => pipeRow(c, 100 + i * 2)), pipeRow('y', 130), pipeRow('z', 132)]);
+    const r = await new StreamStitcher().stitch(T8, captureOf(hist, packet), P, stProofs([mapping(8)], [pipeMapping]));
+    expect(r.status).toBe('matched');
+    expect(sources(r)).toEqual(['C8', 'C9', 'C10', 'C11', 'C12', 'C13', 'C14', 'C15', 'P130', 'P132']);
+  });
+
+  test('split attach with a periodic overlap is ambiguous and keeps the prefix withheld', async () => {
+    const packet = stPacket({ boundary: unknownBoundary });
+    const hist = [...letters.slice(0, 8), ...'abababab'.split('')];
+    const P = pipeOf([...'ababababab'.split('').map((c, i) => pipeRow(c, 100 + i * 2)), pipeRow('z', CAPTURE_END)]);
+    const r = await new StreamStitcher().stitch(T8, captureOf(hist, packet), P, stProofs([mapping(8)], [pipeMapping]));
+    expect(r.status === 'ambiguous' && r.reason).toBe('multiple-alignments');
+    expect(sources(r).slice(-1)).toEqual([`P${CAPTURE_END}`]);
+    expect(r.status !== 'error' && r.withheldRanges).toEqual([{ source: 'pipe', start: 0, end: 10, reason: 'unproven' }]);
+  });
+
+  test('rows depending on unknown VT state are withheld under a gap; later certain rows resume', async () => {
+    const P = pipeOf([pipeRow('x', 100, { uncertain: ['sgr'] }), pipeRow('y', 102, { uncertain: ['savedCursor'] }), pipeRow('z', 104)]);
+    const r = await new StreamStitcher().stitch(T8, captureOf(letters.slice(0, 9)), P, stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('unknown-state');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(sources(r)).toEqual(['C8', 'P104']);
+    expect(r.withheldRanges).toEqual([{ source: 'pipe', start: 0, end: 2, reason: 'unknown-state' }]);
+    expect(r.gaps.map(g => [g.reason, g.withheldRows, g.leftRowId?.rowOrdinal])).toEqual([['unknown-vt-state', 2, 0]]);
+  });
+
+  test('alternate screen capture cannot seam history; baseline-tainted pipe rows are quarantined', async () => {
+    const packet = stPacket({ activeBuffer: 'alternate' });
+    const P = pipeOf([stRow('k', pipeOrigin(100), { cellOrigins: baselineCellOrigins('snap-st', 9, 1) }), pipeRow('fresh', 102)]);
+    const r = await new StreamStitcher().stitch(T8, captureOf(letters.slice(0, 10), packet, 1), P, stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('unknown-state');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(sources(r)).toEqual(['P102']);
+    expect(r.withheldRanges).toEqual([{ source: 'capture', start: 0, end: 10, reason: 'unknown-state' }, { source: 'pipe', start: 0, end: 1, reason: 'unknown-state' }]);
+    expect(r.gaps.map(g => [g.reason, g.withheldRows, g.leftRowId])).toEqual([['unknown-vt-state', 11, durableId(7)]]);
+  });
+
+  test('geometry change without mapping rejects the overlap with a geometry gap', async () => {
+    const r = await new StreamStitcher().stitch(tailOf(letters.slice(0, 8), { columns: 100 }), captureOf(letters.slice(0, 9)), pipeOf([]), stProofs([mapping(8)]));
+    expect(r.status === 'unproven' && r.reason).toBe('geometry');
+    expect(r.status !== 'error' && r.gaps[0]!.reason).toBe('geometry-change');
+  });
+
+  test('empty durable tail without birth proof starts with an unknown leading gap', async () => {
+    const r = await new StreamStitcher().stitch({ pane: stPane, rows: [] }, captureOf(['a', 'b']), pipeOf([pipeRow('c', 100)]), stProofs([]));
+    expect(r.status === 'unproven' && r.reason).toBe('content-only');
+    if (r.status === 'error') throw new Error('unexpected');
+    expect(r.gaps[0]).toMatchObject({ leftRowId: null, countKind: 'unknown', missingCount: null });
+    expect(sources(r)).toEqual(['C0', 'C1', 'P100']);
+  });
+
+  test('identity and origin violations are errors, not decisions', async () => {
+    const s = new StreamStitcher();
+    const otherEpoch = { ...pipeOf([]), rawRange: { epoch: { ...stEpoch, attachId: 'x' }, start: 100, end: 200 } };
+    expect((await s.stitch(T8, C12(), otherEpoch, stProofs([mapping(8)]))).status === 'error').toBe(true);
+    const cap = C12();
+    const badIndex = { ...cap, rows: [stRow('a', capOrigin(3)), ...cap.rows.slice(1)] };
+    const bad = await s.stitch(T8, badIndex, pipeOf([]), stProofs([mapping(8)]));
+    expect(bad.status === 'error' && bad.code).toBe('integrity');
+    const foreign = pipeOf([stRow('k', pipeOrigin(100), { cellOrigins: [{ kind: 'capture', snapshotId: 'other', rowIndex: 10 }] })]);
+    const f = await s.stitch(T8, C12(), foreign, stProofs([mapping(8)]));
+    expect(f.status === 'error' && f.code).toBe('integrity');
+  });
+
+  test('known state: partial UTF-8/CSI stay unknown until a sync byte; SGR only via explicit reset', () => {
+    const k = new KnownStateTracker({});
+    expect(k.unknownFields()).toEqual(['sgr', 'cursor', 'savedCursor', 'margins', 'charset', 'pendingUtf8', 'pendingEscape', 'wrap']);
+    k.feed([0x80, 0x80]);
+    expect(k.uncertainFor(['pendingUtf8'])).toEqual(['pendingUtf8']);
+    k.feed([0x41]);
+    expect(k.uncertainFor(['pendingUtf8', 'pendingEscape'])).toEqual(['pendingEscape']);
+    k.feed([0x0a]);
+    expect(k.uncertainFor(['pendingEscape'])).toEqual([]);
+    k.feed([...Buffer.from('\x1b[1m')]);
+    expect(k.uncertainFor(['sgr'])).toEqual(['sgr']);
+    k.feed([...Buffer.from('\x1b[0m')]);
+    expect(k.uncertainFor(['sgr'])).toEqual([]);
+  });
+
+  test('known state: restoring a cursor saved while unknown makes the cursor unknown again', () => {
+    const k = new KnownStateTracker({ pendingUtf8: true, pendingEscape: true });
+    k.feed([...Buffer.from('\x1b[5;5H')]);
+    expect(k.uncertainFor(['cursor', 'savedCursor'])).toEqual(['savedCursor']);
+    k.feed([...Buffer.from('\x1b8')]);
+    expect(k.uncertainFor(['cursor'])).toEqual(['cursor']);
+    k.feed([...Buffer.from('\x1b[H\x1b7\x1b[9;9H\x1b8')]);
+    expect(k.uncertainFor(['cursor', 'savedCursor'])).toEqual([]);
+    k.feed([...Buffer.from('\n\n\n')]);
+    expect(k.uncertainFor(['sgr', 'margins'])).toEqual(['sgr', 'margins']);
+    k.feed([...Buffer.from('\x1bc')]);
+    expect(k.unknownFields()).toEqual([]);
+  });
+
+  test('capture rows: history finalized, screen open, wrap unknown, styled cells, baseline origins', () => {
+    const packet = stPacket({ historySize: 2, geometry: { columns: 10, rows: 2 } });
+    const rows = captureStitchRows(packet, 'h1\n\x1b[1;31mX\x1b[0m\nscr\n');
+    expect(rows.map(r => [r.finalized, r.wrapStatus, r.cells.map(c => c.text).join('')])).toEqual([
+      [true, 'unknown', 'h1'], [true, 'unknown', 'X'], [false, 'unknown', 'scr'],
+    ]);
+    expect(rows[1]!.cells[0]!.style).toEqual([1, 1, -1]);
+    expect(rows[2]!.origin).toEqual(capOrigin(2));
+    expect(rows[2]!.cellOrigins).toEqual([capOrigin(2), capOrigin(2), capOrigin(2)]);
+  });
+});
