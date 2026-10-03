@@ -6,7 +6,7 @@ import {
   type NewarchHistoryContinuation,
   type NewarchHistoryState,
   type NewarchPaneKey,
-} from "../../core/src/protocol";
+} from "@thumbmux/core";
 import {
   STREAM_BUDGET,
   validReadOpen,
