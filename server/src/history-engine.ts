@@ -15,8 +15,8 @@ import type { AppendFinalized, CancelToken, CheckpointCommit, DurableInputReceip
   RamReceipt, ReadOpenAck, ReadRequest, ReadView, RecoveryChunk, RepairChunk, RepairReceipt,
   Result, RowContent, RowFragment, StreamFailure, StreamIdentity, VtCheckpoint } from './stream-contract';
 
-import type { FlagOnHistoryR2, HistoryAuthorityR2, CatalogAuthorityR2, CoalescedInputR2, SourceChainSliceR2, StagedRowsR2, StagedReceiptR2, AttachReceiptSetR2, AttachDecisionR2, SegmentContinuityR2, OrderedControlR2, ReplayWatermarkR2, ReplayDecisionR2, TimelineHeadR2, TimelinePageR2, TailAnchorR2, BoundedReadR2, LogicalSealR2, RemoteIndexR2, ArchiveInventoryR2, CoverageProjectionR2, Gap, GapR2, SegmentRowId } from './stream-contract';
-import type { NewarchHistoryCursor, NewarchHistoryContinuation, NewarchHistoryState } from '../../core/src/protocol';
+import type { FlagOnHistoryR2, HistoryAuthorityR2, CatalogAuthorityR2, CoalescedInputR2, SourceChainSliceR2, StagedRowsR2, StagedReceiptR2, AttachReceiptSetR2, AttachDecisionR2, SegmentContinuityR2, OrderedControlR2, OrderedControlReadR2, OrderedControlPageR2, OrderedControlEntryR2, ReplayWatermarkR2, ReplayDecisionR2, TimelineHeadR2, TimelinePageR2, TailAnchorR2, BoundedReadR2, LogicalSealR2, RemoteIndexR2, ArchiveInventoryR2, CoverageProjectionR2, Gap, GapR2, SegmentRowId } from './stream-contract';
+import type { NewarchHistoryCursor, NewarchHistoryContinuation, NewarchHistoryState } from '@thumbmux/core';
 
 export { streamCanonical, streamDigest } from './stream-contract';
 function frozen<T>(value: T): T {
@@ -1456,6 +1456,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     page:r=>this.read(()=>this.page(r)),
     watermark:pane=>this.read(()=>this.load<ReplayWatermarkR2>('watermark',paneKey(pane))),
     decisions:r=>this.read(()=>this.readDecisions(r)),
+    controls:r=>this.read(()=>this.readControls(r)),
   };
   private readDecisions(r:BoundedReadR2):{entries:ReplayDecisionR2[];next:NewarchHistoryCursor|null} {
     this.bounded(r);const pane=paneKey(r.pane),all=Number((this.db.query("SELECT COUNT(*) AS n FROM fh_r2 WHERE kind='decision' AND pane=?").get(pane) as SqlRow).n);
@@ -1465,6 +1466,60 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
     const entries:ReplayDecisionR2[]=[];let size=0;
     for(const id of ids){const d=this.load<ReplayDecisionR2>('decision',String(id.id))!;if(size+bytes(d)>r.maxBytes){fhAssert(entries.length,'decision exceeds page budget');break;}size+=bytes(d);entries.push(d);}
     const next=r.direction==='before'?from:from+entries.length;return {entries,next:(r.direction==='before'?next>0:next<all)?this.cursor(r.pane,next):null};
+  }
+  private controlCursor(pane:PaneKey,w:ReplayWatermarkR2,n:number):NewarchHistoryCursor {
+    const body={store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,n};
+    return {version:1,token:Buffer.from(streamCanonical({...body,hash:streamDigest('history-control-cursor-r2',body)})).toString('base64url')};
+  }
+  private controlAt(pane:PaneKey,w:ReplayWatermarkR2,cursor:NewarchHistoryCursor|null):number {
+    if(!cursor)return 0;
+    fhAssert(cursor.version===1&&cursor.token.length>0&&cursor.token.length<=4096,'cursor bound/version');
+    const {hash,...body}=JSON.parse(Buffer.from(cursor.token,'base64url').toString()) as {hash:string;n:number};
+    fhAssert(hash===streamDigest('history-control-cursor-r2',body),'control cursor identity');
+    fhAssert(equal(body,{store:this.storeUUID,pane,checkpointId:w.checkpointId,through:w.through,controlOrder:w.controlOrder,n:body.n}),'control cursor identity');
+    safe(body.n);return body.n;
+  }
+  /** Read controls already stored under kind `control`. Does not apply them. */
+  private readControls(r:OrderedControlReadR2):OrderedControlPageR2 {
+    safe(r.maxEntries);safe(r.maxBytes);
+    fhAssert(r.maxEntries>=1&&r.maxEntries<=256&&r.maxBytes>=1&&r.maxBytes<=B.decodeBytes,'control read bound');
+    const w=r.after;
+    fhAssert(w.revision===2&&equal(w.pane,r.pane)&&equal(w.through.epoch.pane,r.pane),'control read identity');
+    safe(w.through.byteOffset);safe(w.controlOrder);nonempty(w.checkpointId);nonempty(w.decoderVersion);
+    const stored=this.load<ReplayWatermarkR2>('watermark',paneKey(r.pane));
+    fhAssert(stored&&equal(stored,w),'control watermark mismatch');
+    const start=this.controlAt(r.pane,w,r.cursor),key=paneKey(r.pane),epochKey=streamCanonical(w.through.epoch);
+    const matches:OrderedControlEntryR2[]=[];
+    let off=-1,order=-1,id='',examined=0;
+    while(matches.length<=start+r.maxEntries){
+      const row=this.db.query(`SELECT id FROM fh_r2 WHERE kind='control' AND pane=? AND (
+        json_extract(payload,'$.position.byteOffset')>?
+        OR (json_extract(payload,'$.position.byteOffset')=? AND json_extract(payload,'$.order')>?)
+        OR (json_extract(payload,'$.position.byteOffset')=? AND json_extract(payload,'$.order')=? AND id>?)
+      ) ORDER BY json_extract(payload,'$.position.byteOffset'), json_extract(payload,'$.order'), id LIMIT 1`).get(key,off,off,order,off,order,id) as SqlRow|null;
+      if(!row)break;
+      examined++;fhAssert(examined<=1024,'control journal bound');
+      const nextId=String(row.id),event=this.load<OrderedControlR2>('control',nextId);
+      fhAssert(event,'control payload missing');
+      const {digest:d,...body}=event;
+      fhAssert(event.revision===2&&event.eventId===nextId&&orderedControlDigest(body)===d,'control digest');
+      safe(event.position.byteOffset);safe(event.order);
+      fhAssert(event.position.byteOffset>off||event.position.byteOffset===off&&(event.order>order||event.order===order&&nextId>id),'control scan stalled');
+      off=event.position.byteOffset;order=event.order;id=nextId;
+      if(streamCanonical(event.position.epoch)!==epochKey)continue;
+      if(!(event.position.byteOffset>w.through.byteOffset||event.position.byteOffset===w.through.byteOffset&&event.order>w.controlOrder))continue;
+      matches.push({commitId:nextId,event});
+    }
+    fhAssert(start<=matches.length,'control cursor outside journal');
+    const rest=matches.slice(start),entries:OrderedControlEntryR2[]=[];
+    for(const entry of rest){
+      if(entries.length===r.maxEntries)break;
+      const candidate=[...entries,entry];
+      if(bytes(candidate)>r.maxBytes){fhAssert(entries.length>0,'control entry exceeds page budget');break;}
+      entries.push(entry);
+    }
+    const atDurableHead=rest.length===entries.length,next=atDurableHead?null:this.controlCursor(r.pane,w,start+entries.length);
+    return {revision:2,pane:r.pane,checkpointId:w.checkpointId,entries,payloadBytes:bytes(entries),next,atDurableHead};
   }
   private logical(r:OperationFence&{segmentId:string}):LogicalSealR2 {
     const key=this.fence(r),s=this.segment(r.segmentId,r.pane),old=this.load<LogicalSealR2>('logical',r.segmentId);if(old)return old;
