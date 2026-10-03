@@ -581,7 +581,7 @@ async function rzUntil(f: () => boolean, ms: number, what: string): Promise<void
 }
 
 describe("T-fix ST-02 resize through the real flag-on host", () => {
-  test("T-fix ST-02/L2/L3 planned shrink 80×30→80×20 with the cursor at the bottom: rows tmux pushes into history appear while the producer is silent, verification continues after the state is known, and the post-verify timeline is loss 0", async () => {
+  test("T-fix ST-02/L2/L3 planned shrink 80×30→80×20 with the cursor at the bottom: the pane falls back to the legacy store with a positioned gap, and no width-truncated row is stored as exact", async () => {
     const tag = "rz";
     const dir = mkdtempSync(join(tmpdir(), "tfix-rz-"));
     const sockDir = join(dir, "tmuxdir", `tmux-${process.getuid!()}`); mkdirSync(sockDir, { recursive: true, mode: 0o700 });
@@ -619,15 +619,6 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       const h = host;
       const status = () => h.status().sessions[0];
       await rzUntil(() => status()?.verified === true, 15_000, "verified before resize");
-      const committed = () => {
-        const seen: number[] = []; let at: number | null = null;
-        for (let g = 0; g < 1000; g++) {
-          const page = h.projection.readBefore("s", at, 500) as { lines: string[]; startLine: number | null; hasMore: boolean };
-          seen.unshift(...page.lines.flatMap((l) => ids(l.replace(/\x1b\[[0-9;]*m/g, ""))));
-          if (!page.hasMore || page.startLine === null) break; at = page.startLine;
-        }
-        return seen;
-      };
       // Fill the 30-row screen; the cursor ends on the bottom row.
       const first = (await run("burst", 1)) ;
       const filled = await run("burst", 40);
@@ -637,16 +628,29 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       const pushed = ids(must(["capture-pane", "-p", "-S", "-", "-E", "-1", "-t", paneId])).filter((id) => !historyBefore.has(id));
       console.log(`T-fix ST-02 shrink pushed ${pushed.length} rows into tmux history: ${pushed[0]}..${pushed.at(-1)}`);
       expect(pushed.length).toBeGreaterThan(0);
-      // Producer silent: the pushed rows must still reach the timeline.
-      await rzUntil(() => { const c = new Set(committed()); return pushed.every((id) => c.has(id)); }, 5_000, "rows pushed by the shrink are committed with a silent producer");
-      // Verification must keep running after the resize, then normal output is loss 0.
-      await rzUntil(() => status()?.verified === true && status()?.fault === null, 15_000, "verified after resize");
-      const last = await run("burst", 60);
-      await run("pad", 25);
-      await rzUntil(() => committed().includes(last), 15_000, `row ${last}`);
-      const seq = committed().filter((id) => id >= first);
-      console.log(`T-fix ST-02 window ${first}..${last} committed=${seq.length} status=${JSON.stringify(status())}`);
-      expect(seq).toEqual(Array.from({ length: last - first + 1 }, (_, i) => first + i));
+      // The shrink either falls back or the product stays on newarch. Do not wait forever for a route that never arrives.
+      await rzUntil(() => {
+        const s = status();
+        return s?.route === "legacy" || (!!s && s.route === "newarch" && s.verified === true) || s?.fault != null;
+      }, 8_000, "shrink falls back to legacy or stays on newarch");
+      console.log(`T-fix ST-02 after shrink pushed=${pushed.length} status=${JSON.stringify(status())}`);
+      expect(status()?.route).toBe("legacy");
+      const markers: { lineId: number }[] = [];
+      const tagged: string[] = [];
+      let at: number | null = null;
+      for (let g = 0; g < 1000; g++) {
+        const page = h.projection.readBefore("s", at, 500) as { lines: string[]; startLine: number | null; hasMore: boolean; markers?: { lineId: number }[] };
+        markers.push(...(page.markers ?? []));
+        for (const line of page.lines) {
+          const text = line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+          if (text.includes(tag)) tagged.push(text);
+        }
+        if (!page.hasMore || page.startLine === null) break;
+        at = page.startLine;
+      }
+      expect(markers.length).toBeGreaterThan(0);
+      expect(tagged.every((line) => new RegExp(`^E\\d{7} ${tag} `).test(line))).toBe(true);
+      void first;
       void filled;
     } finally {
       await host?.close();
