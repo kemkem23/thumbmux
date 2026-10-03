@@ -242,6 +242,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
   const pkg=resolve(import.meta.dir,'../..'),root=mkdtempSync(join(tmpdir(),'flagon-H-mutants-'));
   const mutations=[
     {name:'replay-remote-prefix',pattern:'replay from current durable cursor',from:".all(key,segmentFloor) as SqlRow[];",to:".all(key,0) as SqlRow[];"},
+    {name:'delete-without-vacuum',pattern:'verified reclaim really',from:"this.db.exec('PRAGMA incremental_vacuum(256)');",to:'/* mutant: DELETE without returning source DB pages */'},
     {name:'swallow-gap',pattern:'ACK then reopen',from:"gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))",to:"gaps:[],receipt:JSON.parse(String(e.receipt))"},
     {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
     {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);",to:'/* ACK without durable input */'},

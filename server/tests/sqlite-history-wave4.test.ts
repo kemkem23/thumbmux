@@ -777,7 +777,7 @@ test('contract final repair rows stay fenced until repaired checkpoint commits a
 });
 
 // Lot H: the flag-on store is exercised only with disposable synthetic roots.
-import { existsSync, symlinkSync } from 'node:fs';
+import { existsSync, symlinkSync, statSync } from 'node:fs';
 import { FlagOnHistoryStore, type FlagOnHistoryOptions } from '../src/history-engine';
 import type { SpoolRecord, SpoolAck, PaneKey, RowsAndGapsCommit, CommittedStreamRow, Gap, SealedExport, RemoteIndexReceipt } from '../src/stream-contract';
 
@@ -900,7 +900,16 @@ describe('flag-on H durable rows gaps and sealed reclaim', () => {
       expect(hvalue(await f.store.sealExport(fence))).toEqual(sealed);
       const corrupt=hremote(sealed);const bad={...corrupt,coverage:[]};
       expect((await f.store.reclaimVerified({...fence,sealed,remote:bad})).status).toBe('error');
+      // Measure the source DB separately: deleting the export copy alone must
+      // not masquerade as SQLite page reclamation.
+      const disk=new Database(join(f.root,'flag-on-v1.sqlite'));
+      disk.exec('PRAGMA wal_checkpoint(TRUNCATE)');disk.close();
+      const sourceBlocksBefore=statSync(join(f.root,'flag-on-v1.sqlite')).blocks;
       const result=hvalue(await f.store.reclaimVerified({...fence,sealed,remote:hremote(sealed)}));
+      const sourceBlocksAfter=statSync(join(f.root,'flag-on-v1.sqlite')).blocks;
+      console.log('FLAGON_H_SOURCE_DB_BLOCKS',JSON.stringify({sourceBlocksBefore,sourceBlocksAfter,blockBytes:512}));
+      expect(sourceBlocksAfter).toBeLessThan(sourceBlocksBefore);
+      expect(result.freeBlocksAfter).toBeGreaterThan(result.freeBlocksBefore);
       console.log('FLAGON_H_RECLAIM_BLOCKS',JSON.stringify(result));
       expect(result.allocatedBytesAfter).toBeLessThan(result.allocatedBytesBefore);expect(result.blockBytes).toBeGreaterThan(0);
       expect(existsSync(sealed.files[0]!.path)).toBe(false);expect(existsSync(sealed.manifest.path)).toBe(false);
@@ -1059,4 +1068,33 @@ test('flag-on H kernel writer lock refuses another process and releases orphan r
     f.reopen();expect((await hreplay(f.store)).length).toBe(1);
     hvalue(await f.store.sealExport({operationId:'after-kill',pane:hp,expectedGeneration:0,segmentId:ack.segmentId}));
   }finally{f.cleanup();}
+});
+
+test('flag-on H SIGKILL covers checkpoint pin release and generation transaction boundaries', async () => {
+  for(const kind of ['checkpoint','pin','release','generation'])for(const when of ['before-write','before-commit','after-commit']){
+    const f=hfixture();
+    try{
+      const ack=hvalue(await f.store.appendInput(hrecord())),identity={pane:hp,sourceEpoch:0,geometryGeneration:0};
+      const cursor={x:0,y:0,visible:true},buffer={rows:[],cursor,savedCursor:cursor,savedAttributes:[],savedModes:{},wrapPending:false};
+      const state={codecVersion:'test-v1',geometry:{columns:80,rows:24},normal:buffer,alternate:buffer,active:'normal' as const,modes:{},margins:{top:0,bottom:23,left:0,right:79},tabStops:[],pendingUtf8:[],pendingEscape:[],attributes:[],wrapPending:false,extensionState:'{}'};
+      const checkpoint:VtCheckpoint={kind:'vt-recovery',checkpointId:'cp-kill',previousCheckpointId:null,identity,inputFence:{kind:'durable-input',pane:hp,through:{sourceEpoch:0,packetSeq:0},digest:ack.recordDigest,segmentId:ack.segmentId},revision:0,head:0,state,stateDigest:streamDigest('vt-state',{identity,state})};
+      const pinRequest={operationId:'pin-kill',pane:hp,expectedGeneration:0,segmentId:ack.segmentId,reason:'handoff' as const};
+      const pin=kind==='release'?hvalue(await f.store.pinSegment(pinRequest)):null;
+      const action=kind==='checkpoint'?`store.persistCheckpoint(${JSON.stringify({operationId:'cp-kill',pane:hp,expectedGeneration:0,inputAck:ack,checkpoint})})`
+        :kind==='pin'?`await store.pinSegment(${JSON.stringify(pinRequest)})`
+        :kind==='release'?`await store.releasePin(${JSON.stringify(pin)})`
+        :`store.setGeneration(${JSON.stringify(hp)},0,1)`;
+      f.store.close();
+      const script=`import {FlagOnHistoryStore} from ${JSON.stringify(join(import.meta.dir,'../src/history-engine.ts'))};
+        const store=new FlagOnHistoryStore({root:${JSON.stringify(f.root)},mode:'recover',codecVersions:['test-v1'],boundary(at){if(at===${JSON.stringify(kind+'-'+when)})process.kill(process.pid,'SIGKILL');}});${action};store.close();`;
+      const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe'});
+      const [,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);expect(child.signalCode).toBe('SIGKILL');expect(out).toBe('');expect(err).toBe('');
+      f.reopen();const db=new Database(join(f.root,'flag-on-v1.sqlite'),{readonly:true});
+      try{
+        const sql=kind==='checkpoint'?'SELECT count(*) AS n FROM fh_checkpoint':kind==='pin'?'SELECT count(*) AS n FROM fh_pin':kind==='release'?'SELECT released AS n FROM fh_pin':'SELECT generation AS n FROM fh_pane';
+        expect((db.query(sql).get() as {n:number}).n).toBe(when==='after-commit'?1:0);
+        expect((db.query("SELECT count(*) AS n FROM fh_event WHERE kind='input'").get() as {n:number}).n).toBe(1);
+      }finally{db.close();}
+    }finally{f.cleanup();}
+  }
 });
