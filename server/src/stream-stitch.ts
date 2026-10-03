@@ -436,7 +436,6 @@ export class StreamStitcher implements StitchPort {
       asm.accept(row.origin);
     });
 
-    if (failure) asm.ensurePositioned(gapReason(failure));
     const decision = asm.finish();
     if (tailEmptyStart && !failure) return { ...decision, status: 'unproven', reason: 'content-only' };
     if (!failure) {
