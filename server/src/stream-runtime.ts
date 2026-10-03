@@ -482,6 +482,13 @@ export class FlagOnVtDecoder {
   private readonly scrollOnClear: boolean;
   /** Finalized rows waiting for `take()`. */
   private out: FlagOnStitchRow[] = [];
+  /** tmux's visible screen read while bytes were still in flight: compared at
+   * every line feed and feed end until it matches or expires (see verifyVisible). */
+  private target: { visible: Parameters<FlagOnVtDecoder['verifyVisible']>[0]; until: number; done: (r: { verified: boolean; reason: string | null; at: number }) => void } | null = null;
+  /** Byte offsets where an earlier run proved this exact state (replay after a
+   * host restart re-applies them; the parser is deterministic). */
+  private proven: number[] = [];
+  replayProven(offsets: readonly number[]): void { this.proven = [...offsets].filter(o => o >= this.offset).sort((a, b) => a - b); }
   constructor(options: FlagOnDecoderOptions) {
     this.epoch = options.epoch; this.geometry = options.geometry; this.scrollOnClear = options.scrollOnClear;
     this.bottom = options.geometry.rows - 1;
@@ -522,8 +529,26 @@ export class FlagOnVtDecoder {
   /** Feed acknowledged raw bytes starting at collector offset `start`. */
   feed(bytes: ArrayLike<number>, start: number): void {
     if (start !== this.offset) throw Error(`decoder offset ${this.offset} fed ${start}`);
-    for (let i = 0; i < bytes.length; i++) { this.byte(bytes[i]!, start + i); }
+    if (this.proven[0] === start) { this.proven.shift(); this.clearProven(); }
+    for (let i = 0; i < bytes.length; i++) {
+      this.byte(bytes[i]!, start + i);
+      if (this.proven.length && this.proven[0] === start + i + 1) { this.proven.shift(); this.clearProven(); }
+      if (this.target && bytes[i] === 0x0a) this.tryTarget(start + i + 1);
+    }
     this.offset = start + bytes.length;
+    if (this.target) this.tryTarget(this.offset);
+  }
+  /** Verify against a visible read taken at an unknown byte position at or
+   * after the current one (output kept flowing). The first parser state that
+   * reproduces it exactly — checked at line feeds and feed ends, up to
+   * `withinBytes` further bytes — proves the state; none expires unverified. */
+  verifyLater(visible: Parameters<FlagOnVtDecoder['verifyVisible']>[0], withinBytes: number): Promise<{ verified: boolean; reason: string | null; at: number }> {
+    this.target?.done({ verified: false, reason: 'superseded', at: this.offset });
+    return new Promise(done => { this.target = { visible, until: this.offset + withinBytes, done }; this.tryTarget(this.offset); });
+  }
+  private tryTarget(at: number): void {
+    const t = this.target!; const r = this.verifyVisible(t.visible);
+    if (r.verified || at >= t.until) { this.target = null; t.done(r.verified ? { ...r, at } : { verified: false, reason: r.reason ?? 'expired', at }); }
   }
   /** Rows that scrolled into history since the last call, oldest first. */
   take(): FlagOnStitchRow[] { const rows = this.out; this.out = []; return rows; }
@@ -842,11 +867,14 @@ export class FlagOnVtDecoder {
           return { verified: false, reason: `row ${y} cell ${x}` };
       }
     }
-    // The pen itself is not visible; a verified screen still leaves it as the
-    // style the parser holds, which tmux just rendered identically.
-    for (const field of ['cursor', 'margins', 'charset', 'pendingUtf8', 'pendingEscape', 'wrap', 'unsupported-sequence', 'geometry', 'sgr'] as const) this.unknown.delete(field);
-    for (const line of mine) line.uncertain.clear();
+    this.clearProven();
     return { verified: true, reason: null };
+  }
+  /** The pen itself is not visible; a verified screen still leaves it as the
+   * style the parser holds, which tmux just rendered identically. */
+  private clearProven(): void {
+    for (const field of ['cursor', 'margins', 'charset', 'pendingUtf8', 'pendingEscape', 'wrap', 'unsupported-sequence', 'geometry', 'sgr'] as const) this.unknown.delete(field);
+    for (const line of this.screen.lines) line.uncertain.clear();
   }
   /** Geometry changed without a mapping: rows keep their cells but become unknown. */
   resize(geometry: Geometry): void {
