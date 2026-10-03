@@ -282,8 +282,8 @@ export function validReadOpen(ack: ReadOpenAck): boolean {
 import type {
   NewarchCapabilities, NewarchGap, NewarchHistoryCursor, NewarchHistoryExtension,
   NewarchHistoryState, NewarchRowId, NewarchRowRange,
-} from '../../core/src/protocol';
-export type { NewarchCapabilities, NewarchHistoryCursor, NewarchHistoryState } from '../../core/src/protocol';
+} from '@thumbmux/core';
+export type { NewarchCapabilities, NewarchHistoryCursor, NewarchHistoryState } from '@thumbmux/core';
 export const FLAGON_VERSIONS = Object.freeze({ stitch: 1, capture: 1, spool: 1, receipt: 1, bundle: 1, catalog: 3, history: 1 } as const);
 /** Fixed budgets; fault loss has no numerical ceiling under Q21. Legacy B's
  * spikeFaultMissingRows/unexpectedMarkedRowsPerPane are NOT flag-on gates. */
@@ -885,8 +885,8 @@ export type TailAnchorR2 =
   | { readonly kind: 'blocked'; readonly head: TimelineHeadR2; readonly state: NewarchHistoryState };
 export interface TimelinePageR2 {
   readonly head: TimelineHeadR2; readonly entries: readonly (CommittedStreamRow | Gap)[];
-  readonly payloadBytes: number; readonly before: import('../../core/src/protocol').NewarchHistoryContinuation;
-  readonly after: import('../../core/src/protocol').NewarchHistoryContinuation;
+  readonly payloadBytes: number; readonly before: import('@thumbmux/core').NewarchHistoryContinuation;
+  readonly after: import('@thumbmux/core').NewarchHistoryContinuation;
 }
 export interface BoundedReadR2 {
   readonly pane: PaneKey; readonly cursor: NewarchHistoryCursor | null;
@@ -943,7 +943,7 @@ export interface BirthCertificateR2 {
 }
 export interface ReadyRetirementR2 extends OperationFence {
   readonly revision: 2; readonly binding: Binding; readonly attachId: string;
-  readonly decision: AttachDecisionR2; readonly incident: import('../../core/src/protocol').NewarchIncidentR2;
+  readonly decision: AttachDecisionR2; readonly incident: import('@thumbmux/core').NewarchIncidentR2;
 }
 export interface SourceTransportR2 extends SourceTransportPort {
   negotiate(request: CollectorNegotiationR2): Promise<Result<CollectorArtifactR2>>;
@@ -1031,7 +1031,7 @@ export interface RestoreAuthorityR2 {
   release(pin: SegmentPin): Promise<Result<null>>;
 }
 
-export type GapR2 = import('../../core/src/protocol').NewarchGapR2;
+export type GapR2 = import('@thumbmux/core').NewarchGapR2;
 /** Legacy identity is isolated in its own namespace; never add an r2 identity
  * to an old serialized gap or recalculate its durable digest during migration. */
 export function gapIdentity(gap: Gap | GapR2): string {
