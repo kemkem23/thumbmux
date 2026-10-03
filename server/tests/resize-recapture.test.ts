@@ -603,7 +603,7 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
     process.env.TERMINAL_HISTORY_DIR = join(dir, "legacy-history"); mkdirSync(process.env.TERMINAL_HISTORY_DIR);
     let host: FlagOnPipeHost | null = null;
     try {
-      must(["start-server", ";", "set-option", "-g", "history-limit", "4500", ";", "set-option", "-g", "window-size", "manual", ";",
+      must(["start-server", ";", "set-option", "-g", "history-limit", "4500", ";",
         "new-session", "-d", "-s", "s", "-x", "80", "-y", "30", `exec python3 -B ${dir}/producer.py ${prod} ${tag}`]);
       const paneId = must(["list-panes", "-t", "=s", "-F", "#{pane_id}"]).trim();
       const stamp = must(["display-message", "-p", "#{pid}@#{start_time}"]).trim();
