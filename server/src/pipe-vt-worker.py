@@ -927,12 +927,8 @@ class Worker:
 
 
 def contract_style(fg, bg, attrs):
-    """Canonical full-state SGR. Implicit reset, so 0 is absent and [] is default.
-    Attrs 1..9 precede fg then bg. This is not a semantic [bits, fg, bg] tuple."""
-    result = []
-    for bit, code in enumerate((1, 3, 4, 9, 7, 5)):
-        if attrs & (1 << bit): result.append(code)
-    result.sort()
+    """MUTANT M6: leading reset 0, then colors, then attrs."""
+    result = [0]
     names = ["black", "red", "green", "brown", "blue", "magenta", "cyan", "white"]
     for color, base in ((fg, 30), (bg, 40)):
         if color == "default": continue
@@ -941,6 +937,8 @@ def contract_style(fg, bg, attrs):
         elif re.fullmatch("[0-9a-fA-F]{6}", color):
             result.extend([base + 8, 2] + [int(color[i:i+2], 16) for i in (0, 2, 4)])
         else: raise ValueError("unsupported checkpoint color")
+    for bit, code in enumerate((1, 3, 4, 9, 7, 5)):
+        if attrs & (1 << bit): result.append(code)
     return result
 
 def contract_row(runs, wrap, pad):
