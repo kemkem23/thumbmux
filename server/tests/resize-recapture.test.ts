@@ -551,6 +551,8 @@ describe('T11 ST-01/ST-02 independent stitch oracle (no product stitch on this b
 // tmux's own history read independently. No full-capture polling is involved.
 // ---------------------------------------------------------------------------
 import { FlagOnPipeHost } from "../../../../src/integrations/stream-pipe-host";
+import { runHistoryKeeperTick, type HistoryKeeperDeps } from "../../../../src/integrations/history-keeper";
+import { legacyCaptureAppendAllowed } from "../../../../src/integrations/stream-archive-registry";
 import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 
 const RZ_PRODUCER = String.raw`import os, sys, time
@@ -619,6 +621,8 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       const h = host;
       const status = () => h.status().sessions[0];
       await rzUntil(() => status()?.verified === true, 15_000, "verified before resize");
+      // The stream writer holds the keeper/mux lease while the pane is on newarch.
+      expect(legacyCaptureAppendAllowed("s")).toBe(false);
       // Fill the 30-row screen; the cursor ends on the bottom row.
       const first = (await run("burst", 1)) ;
       const filled = await run("burst", 40);
@@ -650,6 +654,49 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       }
       expect(markers.length).toBeGreaterThan(0);
       expect(tagged.every((line) => new RegExp(`^E\\d{7} ${tag} `).test(line))).toBe(true);
+      // B1: the fallback is real only if the legacy keeper collects the pane
+      // again. The lease is back, the pipe is withdrawn, and rows written after
+      // the stop reach the keeper's archive through a real keeper tick.
+      expect(legacyCaptureAppendAllowed("s")).toBe(true);
+      expect(must(["display-message", "-p", "-t", paneId, "#{pane_pipe}"]).trim()).toBe("0");
+      const archive: string[] = [];
+      const keeper = (routed: () => FlagOnPipeHost): HistoryKeeperDeps => ({
+        listSessions: () => [{ name: "s", paneRows: 20 }],
+        sampleDeadPanes: () => new Set(),
+        routedAway: (name) => routed().isRouted(name),
+        historyLimit: () => 4500,
+        liveLineLimit: () => 20,
+        capture: async (_name, opts) => must(["capture-pane", "-p", "-S", String(opts.startLine), "-t", paneId]).replace(/\n+$/, ""),
+        archivedTail: (_name, n) => archive.slice(-n),
+        appendLines: (_name, lines) => { archive.push(...lines); },
+        appendMarker: (_name, text) => { archive.push(text); },
+        warn: () => {},
+      });
+      const seeded = await runHistoryKeeperTick(keeper(() => h));
+      expect(seeded.skippedLeased + seeded.skippedRouted).toBe(0);
+      const afterStop = await run("burst", 60);
+      const tick = await runHistoryKeeperTick(keeper(() => h));
+      console.log(`T-fix ST-02 keeper after stop ${JSON.stringify(tick)} archived=${archive.length}`);
+      expect(tick.skippedLeased + tick.skippedRouted).toBe(0);
+      const archivedIds = new Set(ids(archive.join("\n")));
+      // Rows past the live window (the last 20) are archived; they were written after the stop.
+      for (let id = filled + 1; id <= afterStop - 20; id++) expect(archivedIds.has(id)).toBe(true);
+      // B2: a restart keeps the stop. No replay, no second gap, no lease re-announced.
+      await host.close();
+      host = new FlagOnPipeHost({ root, tmuxSocket: socket, mode: "flag-on", tickMs: 50, healthMs: 100 });
+      await host.start();
+      const h2 = host;
+      expect(h2.status().sessions[0]?.route).toBe("legacy");
+      expect(h2.status().incidents.filter((i) => /resume failed|rebind/.test(i))).toEqual([]);
+      expect(legacyCaptureAppendAllowed("s")).toBe(true);
+      expect(h2.isRouted("s")).toBe(false);
+      expect(must(["display-message", "-p", "-t", paneId, "#{pane_pipe}"]).trim()).toBe("0");
+      const afterBoot = await run("burst", 40);
+      await new Promise((r) => setTimeout(r, 300));
+      const bootTick = await runHistoryKeeperTick(keeper(() => h2));
+      expect(bootTick.skippedLeased + bootTick.skippedRouted).toBe(0);
+      const bootIds = new Set(ids(archive.join("\n")));
+      for (let id = afterStop + 1; id <= afterBoot - 20; id++) expect(bootIds.has(id)).toBe(true);
       void first;
       void filled;
     } finally {
