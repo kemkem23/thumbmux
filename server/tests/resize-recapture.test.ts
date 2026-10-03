@@ -551,7 +551,7 @@ describe('T11 ST-01/ST-02 independent stitch oracle (no product stitch on this b
 // tmux's own history read independently. No full-capture polling is involved.
 // ---------------------------------------------------------------------------
 import { FlagOnPipeHost } from "../../../../src/integrations/stream-pipe-host";
-import { runHistoryKeeperTick, type HistoryKeeperDeps } from "../../../../src/integrations/history-keeper";
+import { isHistoryMarker, runHistoryKeeperTick, type HistoryKeeperDeps } from "../../../../src/integrations/history-keeper";
 import { legacyCaptureAppendAllowed } from "../../../../src/integrations/stream-archive-registry";
 import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 
@@ -623,6 +623,8 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       await rzUntil(() => status()?.verified === true, 15_000, "verified before resize");
       // The stream writer holds the keeper/mux lease while the pane is on newarch.
       expect(legacyCaptureAppendAllowed("s")).toBe(false);
+      const stopNotices: string[] = [];
+      h.onStop((session, marker) => { if (session === "s") stopNotices.push(marker); });
       // Fill the 30-row screen; the cursor ends on the bottom row.
       const first = (await run("burst", 1)) ;
       const filled = await run("burst", 40);
@@ -676,6 +678,12 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
         appendMarker: (_name, text) => { archive.push(text); },
         warn: () => {},
       });
+      // M2: one stop notice with a time and the last newarch row, written the way
+      // the orchestrator writes it: one legacy line the keeper's anchor steps over.
+      expect(stopNotices).toHaveLength(1);
+      expect(isHistoryMarker(stopNotices[0]!)).toBe(true);
+      expect(stopNotices[0]).toMatch(/geometry-change.* last newarch row [^ ]+#\d+ · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      archive.push(stopNotices[0]!);
       const seeded = await runHistoryKeeperTick(keeper(() => h));
       expect(seeded.skippedLeased + seeded.skippedRouted).toBe(0);
       const afterStop = await run("burst", 60);
