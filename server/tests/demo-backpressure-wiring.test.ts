@@ -1483,7 +1483,10 @@ for (const scenario of ['retained', 'irrecoverable'] as const) {
       const stamped = () => rig.timeline(host).actual.flatMap(a => a.kind === 'row' && /^E\d{7} /.test(a.text) ? [Number(a.text.slice(1, 8))] : []);
       const before = stamped();
       const lastRecorded = before.at(-1) ?? null;
-      console.log(`T-fix B3-02 ${scenario} before kill acked=${acked} inH=${inH} last=${lastRecorded}`);
+      // Gaps already on the page (the attach seam of a degraded admission) are
+      // not this incident's. The pipe break adds exactly one, after the last row.
+      const gapsBeforeKill = rig.timeline(host).actual.filter(a => a.kind === 'gap').length;
+      console.log(`T-fix B3-02 ${scenario} before kill acked=${acked} inH=${inH} last=${lastRecorded} gaps=${gapsBeforeKill}`);
       process.kill(Number(writer), 'SIGKILL');
       if (scenario === 'irrecoverable') {
         // pane_pipe can return to 1 before a poll sees 0. Clear the history either way, then judge the route.
@@ -1507,7 +1510,11 @@ for (const scenario of ['retained', 'irrecoverable'] as const) {
       const after = stamped();
       expect(new Set(after).size).toBe(after.length);
       if (lastRecorded !== null) expect(after.filter(id => id > lastRecorded)).toEqual([]);
-      expect(rig.timeline(host).actual.filter(a => a.kind === 'gap')).toHaveLength(1);
+      const line = rig.timeline(host).actual;
+      expect(line.filter(a => a.kind === 'gap')).toHaveLength(gapsBeforeKill + 1);
+      const lastGap = line.map(a => a.kind).lastIndexOf('gap');
+      const lastRow = lastRecorded === null ? -1 : line.findIndex(a => a.kind === 'row' && a.text.startsWith(`E${String(lastRecorded).padStart(7, '0')} `));
+      expect(lastGap).toBeGreaterThan(lastRow);
       expect(rig.paneRecords().filter(r => r.phase === 'committed' && r.route === 'newarch' && r.intent.attachId !== record.intent.attachId)).toEqual([]);
       expect(rig.pipe()).toBe('0');
     } finally { await rig.cleanup(); }
