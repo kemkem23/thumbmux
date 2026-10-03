@@ -644,3 +644,44 @@ export interface NewarchHistoryExtension {
   readonly states: readonly NewarchHistoryState[];
   readonly before: NewarchHistoryContinuation; readonly after: NewarchHistoryContinuation;
 }
+
+/** Repair capabilities are a separate tagged envelope. Do not advertise them
+ * in the v1 list: an old consumer must reject r2, not reinterpret old bytes. */
+export const NEWARCH_REPAIR_CAPABILITIES = [
+  'cell-sgr-r2', 'digest-provenance-r2', 'attach-receipt-set-r2', 'timeline-replay-r2',
+  'spool-retention-r2', 'archive-inventory-r2', 'same-pipe-return-r2', 'incident-r2',
+] as const;
+export type NewarchRepairCapability = typeof NEWARCH_REPAIR_CAPABILITIES[number];
+export interface NewarchRepairCapabilities {
+  readonly revision: 2; readonly supported: readonly NewarchRepairCapability[];
+  readonly required: readonly NewarchRepairCapability[];
+}
+/** Unknown revision/capability is unsupported. Both peers' requirements count. */
+export function supportsNewarchRepair(local: NewarchRepairCapabilities, peer: {
+  readonly revision: number; readonly supported: readonly string[]; readonly required: readonly string[];
+}): boolean {
+  const known: readonly string[] = NEWARCH_REPAIR_CAPABILITIES;
+  return local.revision === 2 && peer.revision === 2
+    && [...local.supported, ...local.required, ...peer.required].every(c => known.includes(c))
+    && local.required.every(c => local.supported.includes(c) && peer.supported.includes(c))
+    && peer.required.every(c => peer.supported.includes(c) && local.supported.some(s => s === c));
+}
+export interface NewarchGapIdentityR2 {
+  readonly revision: 2; readonly gapId: string; readonly sequence: number;
+  readonly update: number; readonly state: 'open' | 'closed';
+}
+export type NewarchGapR2 = NewarchGap & { readonly repair: NewarchGapIdentityR2 };
+export interface NewarchIncidentR2 {
+  readonly revision: 2; readonly incidentId: string; readonly pane: NewarchPaneKey;
+  readonly leftRowId: NewarchRowId | null;
+  readonly openedAtWallMs: number; readonly openedAtMonoMs: number; readonly clockEpoch: string;
+  readonly collecting: boolean; readonly reason: 'storage-outage' | 'collector-stalled' | 'collector-exit' | 'io';
+  readonly quality: 'degraded' | 'resolved'; readonly resolvedAtWallMs: number | null;
+}
+export type NewarchPressureR2 = Extract<NewarchHistoryState, { readonly kind: 'pressure' }>
+  & { readonly repair: NewarchIncidentR2 };
+export interface NewarchHistoryRepairR2 extends NewarchHistoryExtension {
+  readonly repair: NewarchRepairCapabilities;
+  readonly states: readonly (Exclude<NewarchHistoryState, { readonly kind: 'pressure' } | { readonly kind: 'gap' }>
+    | NewarchPressureR2 | { readonly kind: 'gap'; readonly gap: NewarchGapR2 })[];
+}

@@ -69,6 +69,9 @@ export interface Geometry { readonly columns: number; readonly rows: number }
 export interface StyleRun {
   readonly startCell: number; readonly endCell: number; readonly sgr: readonly number[];
 }
+/** Durable/legacy style is canonical full-state SGR parameters, with implicit
+ * reset before each cell. Never [attrs, fg, bg]. Text retains combining codepoints;
+ * width 0 is a continuation slot, not permission to drop text during conversion. */
 export interface Cell {
   readonly text: string; readonly width: 0 | 1 | 2; readonly style: readonly number[];
 }
@@ -618,4 +621,463 @@ export interface FlagOnObserver {
 /** Non-operational placeholder only. There is deliberately no default runtime. */
 export function flagOnNotImplemented(port: string): never {
   throw new Error(`NEWARCH flag-on implementation required: ${port}`);
+}
+
+// K-r2 repair extension. v1 records, hashes and ports above are immutable.
+// New implementations explicitly implement the R2 ports; no optional-method
+// fallback may turn an unsupported operation into success.
+export const FLAGON_REPAIR_REVISION = 2 as const;
+export const FLAGON_REPAIR_LIMITS = Object.freeze({ receiptSetEntries: 256, chunkRows: 256,
+  chunkBytes: MiB, receiptSetBytes: MiB, readEntries: 256, readBytes: MiB } as const);
+const sameContract = (a: unknown, b: unknown): boolean => streamCanonical(a) === streamCanonical(b);
+function contractUint(n: number): void {
+  if (!Number.isSafeInteger(n) || n < 0) throw Error('contract unsafe counter');
+}
+function contractHash(hash: string): void {
+  if (!/^[a-f0-9]{64}$/.test(hash)) throw Error('contract invalid SHA-256');
+}
+
+/** Semantic decoder style, NEVER Cell.style. attrs bits 0..8 = SGR 1..9,
+ * bit 9 = SGR 21. fg/bg: -1 default, 0..255 index, 256+0xRRGGBB RGB.
+ * Unsupported attributes fail, they are never silently discarded. */
+export interface SemanticStyle { readonly attrs: number; readonly fg: number; readonly bg: number }
+export interface SemanticCell { readonly text: string; readonly width: 0 | 1 | 2; readonly style: SemanticStyle }
+export function semanticStyleToSgr(style: SemanticStyle): number[] {
+  contractUint(style.attrs);
+  if (style.attrs > 1023) throw Error('unsupported semantic attributes');
+  const sgr: number[] = [];
+  for (let n = 1; n <= 9; n++) if (style.attrs & (1 << (n - 1))) sgr.push(n);
+  if (style.attrs & 512) sgr.push(21);
+  const color = (c: number, base: number, bright: number, extended: number) => {
+    if (!Number.isSafeInteger(c) || c < -1 || c > 0xffffff + 256) throw Error('unsupported semantic color');
+    if (c === -1) return;
+    if (c < 8) sgr.push(base + c);
+    else if (c < 16) sgr.push(bright + c - 8);
+    else if (c < 256) sgr.push(extended, 5, c);
+    else { const rgb = c - 256; sgr.push(extended, 2, rgb >>> 16, (rgb >>> 8) & 255, rgb & 255); }
+  };
+  color(style.fg, 30, 90, 38); color(style.bg, 40, 100, 48);
+  return sgr;
+}
+/** Accept canonical full-state parameters only (implicit reset before each
+ * cell). [] = default. Reject reset/off codes, aliases, duplicates, reordered
+ * params and unknown SGR; parsing arbitrary ANSI is the decoder's job. */
+export function sgrToSemanticStyle(sgr: readonly number[]): SemanticStyle {
+  let attrs = 0, fg = -1, bg = -1;
+  for (let i = 0; i < sgr.length; i++) {
+    const n = sgr[i]!; contractUint(n);
+    if (n >= 1 && n <= 9) attrs |= 1 << (n - 1);
+    else if (n === 21) attrs |= 512;
+    else if (n >= 30 && n <= 37) fg = n - 30;
+    else if (n >= 90 && n <= 97) fg = n - 90 + 8;
+    else if (n >= 40 && n <= 47) bg = n - 40;
+    else if (n >= 100 && n <= 107) bg = n - 100 + 8;
+    else if (n === 38 || n === 48) {
+      const mode = sgr[++i];
+      const byte = () => { const v = sgr[++i]!; contractUint(v); if (v > 255) throw Error('SGR color byte'); return v; };
+      let c: number;
+      if (mode === 5) c = byte();
+      else if (mode === 2) c = 256 + byte() * 65536 + byte() * 256 + byte();
+      else throw Error('unsupported SGR color mode');
+      if (n === 38) fg = c; else bg = c;
+    } else throw Error('noncanonical SGR');
+  }
+  const style = { attrs, fg, bg };
+  if (!sameContract(semanticStyleToSgr(style), sgr)) throw Error('noncanonical SGR order/alias');
+  return style;
+}
+export function semanticCellToCell(cell: SemanticCell): Cell {
+  if (![0, 1, 2].includes(cell.width) || !cell.text.isWellFormed()) throw Error('invalid cell');
+  return { text: cell.text, width: cell.width, style: semanticStyleToSgr(cell.style) };
+}
+export function cellToSemanticCell(cell: Cell): SemanticCell {
+  if (![0, 1, 2].includes(cell.width) || !cell.text.isWellFormed()) throw Error('invalid cell');
+  return { text: cell.text, width: cell.width, style: sgrToSemanticStyle(cell.style) };
+}
+
+/** Normalized projection uses W's existing v1 formula; old H receipts retain
+ * their original digest. H emits a separately stored CoverageProjectionR2. */
+export function normalizedRowsDigest(range: SegmentRowRange, rows: readonly CommittedStreamRow[]): Digest {
+  return streamDigest('newarch-legacy-coverage-rows', { range, rows: rows.map(row => ({
+    id: row.id, cells: row.cells, wrapStatus: row.wrapStatus, wrapPad: row.wrapPad, buffer: row.buffer,
+  })) });
+}
+export function normalizedGapDigest(gap: Gap): Digest { return streamDigest('newarch-legacy-coverage-gap', gap); }
+export function normalizedCoverageDigest(coverage: Coverage): Digest { return streamDigest('newarch-legacy-receipt-coverage', coverage); }
+export interface CoverageProjectionR2 {
+  readonly revision: 2; readonly sourceCommitId: string; readonly sourceDigest: Digest;
+  readonly sourceDomain: 'rows-gaps-v1'; readonly coverage: Coverage; readonly coverageDigest: Digest;
+  readonly projectionDigest: Digest;
+}
+export function coverageProjectionDigest(proof: Omit<CoverageProjectionR2, 'projectionDigest'>): Digest {
+  return streamDigest('coverage-projection-r2', proof);
+}
+export interface LegacyReadbackR2 {
+  readonly kind: 'legacy-readback-r2'; readonly revision: 2; readonly receiptCommitId: string;
+  readonly coverageDigest: Digest; readonly readbackDigest: Digest;
+}
+export interface PhysicalReadbackR2 {
+  readonly durableCommitId: string; readonly coverageDigest: Digest;
+  readonly files: readonly EvidenceFile[]; readonly physicalIndexMap: readonly PhysicalIndexEntry[];
+  /** SHA-256(JSON.stringify(lines)) per ordered coverage entry, after disk read. */
+  readonly lineSha: readonly Digest[];
+}
+export function physicalReadbackDigest(readback: PhysicalReadbackR2): Digest {
+  return streamDigest('legacy-physical-readback-r2', readback);
+}
+/** Equality of a claimed proof and W's authoritative synchronous disk read.
+ * NOT an authority by itself: passing the claim twice proves nothing. A must
+ * additionally validate receipt identity/coverage/current binding/suffix pin. */
+export function legacyReadbackMatches(claimed: LegacyReadbackR2, authority: LegacyReadbackR2): boolean {
+  return claimed.kind === 'legacy-readback-r2' && authority.kind === claimed.kind
+    && claimed.revision === 2 && authority.revision === 2 && claimed.receiptCommitId.length > 0
+    && /^[a-f0-9]{64}$/.test(claimed.coverageDigest) && /^[a-f0-9]{64}$/.test(claimed.readbackDigest)
+    && sameContract(claimed, authority);
+}
+export interface SourceChainSliceR2 {
+  readonly range: RawRange; readonly firstSequence: number; readonly lastSequence: number;
+  readonly previousDigest: Digest | null; readonly terminalDigest: Digest;
+  readonly sourceDomain: 'spool-record'; readonly recordsDigest: Digest;
+}
+export interface CoalescedInputR2 {
+  readonly revision: 2; readonly record: SpoolRecord; readonly historyDomain: 'spool';
+  readonly source: readonly SourceChainSliceR2[]; readonly provenanceDigest: Digest;
+}
+export function sourceSpoolDigest(record: Omit<SpoolRecord, 'digest'>): Digest { return streamDigest('spool-record', record); }
+export function historySpoolDigest(record: Omit<SpoolRecord, 'digest'>): Digest { return streamDigest('spool', record); }
+export function inputProvenanceDigest(input: Omit<CoalescedInputR2, 'provenanceDigest'>): Digest {
+  return streamDigest('input-provenance-r2', input);
+}
+
+export interface AttachReceiptEntryR2 {
+  readonly ordinal: number; readonly operationId: string; readonly commitId: string;
+  readonly digest: Digest; readonly rows: number; readonly payloadBytes: number;
+}
+export interface AttachReceiptSetR2 {
+  readonly revision: 2; readonly transactionId: string; readonly pane: PaneKey;
+  readonly epoch: PipeEpoch; readonly decisionId: string; readonly expectedGeneration: number;
+  readonly entries: readonly AttachReceiptEntryR2[]; readonly terminalCommitId: string;
+  readonly aggregateDigest: Digest;
+}
+export function attachReceiptSetDigest(entries: readonly AttachReceiptEntryR2[]): Digest {
+  return streamDigest('attach-receipt-set-r2', entries);
+}
+/** Structural conformance only. A MUST resolve every receipt through H's
+ * read authority and compare staged transaction/epoch/decision before publish.
+ * Bound entire set and return in order, never select one terminal/gap receipt. */
+export function attachCoverage(set: AttachReceiptSetR2, receipts: readonly RowsAndGapsReceipt[]): Coverage {
+  if (set.revision !== 2 || !set.transactionId || !set.decisionId || !sameContract(set.pane, set.epoch.pane)
+    || set.entries.length === 0 || set.entries.length > FLAGON_REPAIR_LIMITS.receiptSetEntries
+    || receipts.length !== set.entries.length || Buffer.byteLength(streamCanonical(set)) > MiB
+    || Buffer.byteLength(streamCanonical(receipts)) > MiB) throw Error('attach manifest bound/identity');
+  contractUint(set.expectedGeneration);
+  if (set.aggregateDigest !== attachReceiptSetDigest(set.entries)) throw Error('attach aggregate digest');
+  const ids = new Set<string>(), ops = new Set<string>();
+  const coverage: Coverage[number][] = [];
+  for (const [i, entry] of set.entries.entries()) {
+    const receipt = receipts[i]!;
+    contractUint(entry.rows); contractUint(entry.payloadBytes); contractHash(entry.digest);
+    if (entry.ordinal !== i || entry.rows > 256 || entry.payloadBytes > MiB || !entry.commitId || !entry.operationId
+      || ids.has(entry.commitId) || ops.has(entry.operationId) || receipt.kind !== 'rows-gaps-durable'
+      || receipt.commitId !== entry.commitId || receipt.operationId !== entry.operationId
+      || receipt.digest !== entry.digest || receipt.generation !== set.expectedGeneration) throw Error('attach receipt order/identity');
+    ids.add(entry.commitId); ops.add(entry.operationId);
+    let rows = 0;
+    for (const part of receipt.coverage) {
+      const pane = part.kind === 'rows' ? part.range.pane : part.gap.pane;
+      if (!sameContract(pane, set.pane)) throw Error('attach cross-pane coverage');
+      if (part.kind === 'rows') {
+        contractUint(part.range.start); contractUint(part.range.end);
+        if (part.range.end < part.range.start) throw Error('attach inverted coverage');
+        rows += part.range.end - part.range.start;
+      }
+      coverage.push(part);
+    }
+    if (rows !== entry.rows) throw Error('attach row coverage');
+  }
+  if (set.terminalCommitId !== set.entries[set.entries.length - 1]!.commitId) throw Error('attach terminal receipt');
+  return coverage;
+}
+export interface StagedRowsR2 extends RowsAndGapsCommit {
+  readonly repair: { readonly revision: 2; readonly transactionId: string; readonly epoch: PipeEpoch;
+    readonly decisionId: string; readonly chunkOrdinal: number; readonly visibility: 'candidate' };
+}
+export interface StagedReceiptR2 {
+  readonly request: StagedRowsR2['repair']; readonly receipt: RowsAndGapsReceipt;
+  readonly projection: CoverageProjectionR2;
+}
+export interface CommitAttachR2 extends Omit<CommitAttachRequest, 'durable'> {
+  readonly receiptSet: AttachReceiptSetR2;
+}
+export interface AttachDecisionR2 extends AttachDecision {
+  readonly revision: 2; readonly transactionId: string; readonly receiptSetDigest: Digest;
+}
+
+export interface ArchiveMemberMappingR2 {
+  readonly sourcePath: string; readonly relativePath: string; readonly bytes: number; readonly sha256: Digest;
+}
+export interface ArchiveInventoryR2 {
+  readonly revision: 2; readonly sealGeneration: number; readonly sealCommitId: string;
+  readonly sealManifestSha256: Digest; readonly bundleManifestSha256: Digest;
+  readonly members: readonly ArchiveMemberMappingR2[];
+}
+export function archiveInventoryMatches(seal: SealedExport, bundle: ArchiveBundle, inventory: ArchiveInventoryR2): boolean {
+  const sources = [...seal.files, seal.manifest];
+  if (inventory.revision !== 2 || inventory.sealGeneration !== seal.generation || inventory.sealCommitId !== seal.sealCommitId
+    || inventory.sealManifestSha256 !== seal.manifest.sha256 || inventory.bundleManifestSha256 !== bundle.manifest.sha256
+    || bundle.storeUUID !== seal.storeUUID || bundle.segmentId !== seal.segmentId || !sameContract(bundle.pane, seal.pane)
+    || !sameContract(bundle.coverage, seal.coverage) || sources.length !== inventory.members.length
+    || bundle.members.length !== sources.length || sources.length > 256) return false;
+  const usedSource = new Set<string>(), usedRelative = new Set<string>();
+  for (const m of inventory.members) {
+    if (!m.relativePath || m.relativePath.includes('\\') || m.relativePath.split('/').some(p => !p || p === '.' || p === '..')
+      || /[\x00-\x1f\x7f:]/.test(m.relativePath) || usedSource.has(m.sourcePath) || usedRelative.has(m.relativePath)
+      || !Number.isSafeInteger(m.bytes) || m.bytes < 0 || !/^[a-f0-9]{64}$/.test(m.sha256)) return false;
+    usedSource.add(m.sourcePath); usedRelative.add(m.relativePath);
+    const source = sources.find(f => f.path === m.sourcePath), member = bundle.members.find(f => f.path === m.relativePath);
+    if (!source || !member || source.bytes !== m.bytes || member.bytes !== m.bytes || source.sha256 !== m.sha256 || member.sha256 !== m.sha256) return false;
+  }
+  return true;
+}
+
+export interface SegmentContinuityR2 {
+  readonly revision: 2; readonly pane: PaneKey; readonly epoch: PipeEpoch;
+  readonly predecessor: string; readonly successor: string; readonly boundary: RawPosition;
+  readonly lastRow: SegmentRowId | null; readonly firstSuccessorOrdinal: 0;
+  readonly sealCommitId: string; readonly rotationCommitId: string; readonly digest: Digest;
+}
+export function segmentContinuityDigest(value: Omit<SegmentContinuityR2, 'digest'>): Digest {
+  return streamDigest('segment-continuity-r2', value);
+}
+export interface OrderedControlR2 {
+  readonly revision: 2; readonly eventId: string; readonly position: RawPosition;
+  /** Strictly increasing at the same raw offset; bytes after it use new state. */
+  readonly order: number; readonly decoderVersion: string;
+  readonly payload: { readonly kind: 'geometry'; readonly before: Geometry; readonly after: Geometry }
+    | { readonly kind: 'control'; readonly name: string; readonly data: string };
+  readonly digest: Digest;
+}
+export function orderedControlDigest(value: Omit<OrderedControlR2, 'digest'>): Digest {
+  return streamDigest('ordered-control-r2', value);
+}
+export interface ReplayWatermarkR2 {
+  readonly revision: 2; readonly pane: PaneKey; readonly checkpointId: string;
+  readonly through: RawPosition; readonly controlOrder: number; readonly decoderVersion: string;
+  readonly stateDigest: Digest; readonly known: Readonly<Record<string, boolean>>;
+  readonly decisionIndexCommitId: string; readonly snapshotDependencies: readonly EvidenceFile[];
+  readonly durableCommitId: string;
+}
+/** Persistent interval decisions, never regenerated from a resized decoder's
+ * scroll ordinal. Keep metadata after payload reclaim; page it in <=256 items. */
+export interface ReplayDecisionR2 {
+  readonly decisionId: string; readonly raw: RawRange; readonly controlStart: number; readonly controlEnd: number;
+  readonly disposition: 'consumed' | 'withheld'; readonly coverage: Coverage;
+  readonly checkpointId: string; readonly decoderVersion: string;
+}
+export interface TimelineHeadR2 {
+  readonly pane: PaneKey; readonly generation: number; readonly indexCommitId: string;
+  readonly entryCount: number; readonly rowCount: number; readonly lastRow: SegmentRowId | null;
+  readonly cursor: NewarchHistoryCursor;
+}
+export type TailAnchorR2 =
+  | { readonly kind: 'genesis'; readonly birth: BirthCertificateR2 }
+  | { readonly kind: 'local'; readonly head: TimelineHeadR2; readonly rows: readonly CommittedStreamRow[]; readonly pin: SegmentPin }
+  | { readonly kind: 'blocked'; readonly head: TimelineHeadR2; readonly state: NewarchHistoryState };
+export interface TimelinePageR2 {
+  readonly head: TimelineHeadR2; readonly entries: readonly (CommittedStreamRow | Gap)[];
+  readonly payloadBytes: number; readonly before: import('../../core/src/protocol').NewarchHistoryContinuation;
+  readonly after: import('../../core/src/protocol').NewarchHistoryContinuation;
+}
+export interface BoundedReadR2 {
+  readonly pane: PaneKey; readonly cursor: NewarchHistoryCursor | null;
+  readonly direction: 'before' | 'after'; readonly maxEntries: number; readonly maxBytes: number;
+}
+/** Synchronous calls return bounded durable data from H, not host SQL. H must
+ * coordinate retention pins/read views; Result failure is never a missing row.
+ * `null` is a successful authoritative absence, distinct from I/O failure. */
+export interface HistoryAuthorityR2 {
+  generation(pane: PaneKey): Result<number>;
+  staged(transactionId: string, ordinal: number): Result<StagedReceiptR2 | null>;
+  receipt(commitId: string): Result<RowsAndGapsReceipt | null>;
+  pin(pinId: string): Result<SegmentPin | null>;
+  seal(sealCommitId: string): Result<SealedExport | null>;
+  continuity(rotationCommitId: string): Result<SegmentContinuityR2 | null>;
+  head(pane: PaneKey): Result<TimelineHeadR2>;
+  tail(pane: PaneKey, maxRows: number, maxBytes: number): Result<TailAnchorR2>;
+  page(request: BoundedReadR2): Result<TimelinePageR2>;
+  watermark(pane: PaneKey): Result<ReplayWatermarkR2 | null>;
+  decisions(request: BoundedReadR2): Result<{ readonly entries: readonly ReplayDecisionR2[]; readonly next: NewarchHistoryCursor | null }>;
+}
+export interface ConsumerCheckpointR2 extends OperationFence {
+  readonly revision: 2; readonly consumerId: string; readonly through: SpoolAck;
+  readonly replayFloor: RawPosition; readonly watermark: ReplayWatermarkR2;
+  readonly pins: readonly SegmentPin[];
+  readonly recovery: { readonly kind: 'successor-checkpoint'; readonly checkpoint: ReplayWatermarkR2; readonly retentionCommitId: string }
+    | { readonly kind: 'verified-archive'; readonly remote: RemoteIndexReceipt };
+}
+export interface TrimReceiptR2 {
+  readonly revision: 2; readonly commitId: string; readonly epoch: PipeEpoch;
+  readonly floor: RawPosition; readonly lastSequence: number; readonly lastDigest: Digest;
+  readonly checkpoint: ConsumerCheckpointR2; readonly allocatedBytesBefore: number; readonly allocatedBytesAfter: number;
+}
+export type SpoolReadR2 =
+  | { readonly kind: 'records'; readonly records: readonly SpoolRecord[]; readonly next: RawPosition; readonly atDurableHead: boolean }
+  | { readonly kind: 'below-floor'; readonly requested: RawPosition; readonly retained: TrimReceiptR2 };
+export interface CollectorArtifactR2 {
+  readonly artifactSha256: Digest; readonly protocolVersion: number; readonly schemaVersion: number;
+  readonly capabilities: readonly string[]; readonly runtimeProof: EvidenceFile;
+}
+export interface CollectorNegotiationR2 {
+  readonly revision: 2; readonly binding: Binding; readonly running: CollectorArtifactR2;
+  readonly allowed: readonly CollectorArtifactR2[];
+}
+/** Hash alone is insufficient. Candidate allowlist and live runtime identity
+ * are checked by S/I; unknown required capabilities refuse before pipe change. */
+export interface BirthCertificateR2 {
+  readonly revision: 2; readonly creationId: string; readonly pane: PaneKey; readonly epoch: PipeEpoch;
+  readonly command: 'new-session' | 'new-window' | 'split-window';
+  readonly binarySha256: Digest; readonly hooksSha256: Digest;
+  readonly transcript: EvidenceFile; readonly eventCoverage: EvidenceFile;
+  readonly nonWaitingCommandEvents: readonly string[]; readonly rawStart: RawPosition;
+  readonly genesis: VtCheckpoint;
+}
+export interface ReadyRetirementR2 extends OperationFence {
+  readonly revision: 2; readonly binding: Binding; readonly attachId: string;
+  readonly decision: AttachDecisionR2; readonly incident: import('../../core/src/protocol').NewarchIncidentR2;
+}
+export interface SourceTransportR2 extends SourceTransportPort {
+  negotiate(request: CollectorNegotiationR2): Promise<Result<CollectorArtifactR2>>;
+  acknowledgeConsumer(request: ConsumerCheckpointR2): Promise<Result<ConsumerCheckpointR2>>;
+  trim(request: ConsumerCheckpointR2): Promise<Result<TrimReceiptR2>>;
+  replayBounded(binding: Binding, after: RawPosition, maxRecords: number, maxBytes: number): Promise<Result<SpoolReadR2>>;
+  retireReady(request: ReadyRetirementR2): Promise<Result<{ readonly commitId: string; readonly binding: Binding }>>;
+  rearmReserve(request: OperationFence & { readonly incidentId: string; readonly resolvedCommitId: string }): Promise<Result<{ readonly commitId: string; readonly physicalFreeBytes: number }>>;
+  certifyBirth(creationId: string, binding: Binding): Promise<Result<BirthCertificateR2>>;
+}
+export interface FlagOnHistoryR2 extends FlagOnHistoryPort {
+  readonly authority: HistoryAuthorityR2;
+  appendVerifiedInput(input: CoalescedInputR2): Promise<Result<SpoolAck>>;
+  stageRows(request: StagedRowsR2): Promise<Result<StagedReceiptR2>>;
+  /** H reconciles catalog decision before exposing rows. This is idempotent
+   * finalization, not a second owner decision. Lost ACK queries A first. */
+  publishAttach(decision: AttachDecisionR2): Promise<Result<TimelineHeadR2>>;
+  discardAttach(decision: AttachDecisionR2): Promise<Result<null>>;
+  rotateSegment(request: OperationFence & { readonly segmentId: string; readonly boundary: RawPosition }): Promise<Result<SegmentContinuityR2>>;
+  /** Separate bounded scratch export from logical seal/rotation. */
+  materializeExport(request: OperationFence & { readonly sealCommitId: string }): Promise<Result<SealedExport>>;
+  journalControl(request: OperationFence & { readonly event: OrderedControlR2 }): Promise<Result<{ readonly commitId: string; readonly event: OrderedControlR2 }>>;
+  commitReplayCheckpoint(request: OperationFence & { readonly checkpoint: VtCheckpoint; readonly watermark: ReplayWatermarkR2 }): Promise<Result<ReplayWatermarkR2>>;
+  commitReplayDecision(request: OperationFence & { readonly decision: ReplayDecisionR2 }): Promise<Result<{ readonly commitId: string }>>;
+}
+export interface FrozenLegacyIntervalR2 extends OperationFence {
+  readonly revision: 2; readonly intervalId: string; readonly from: FiniteCut; readonly cut: FiniteCut;
+  readonly receipt: LegacyRangeReceipt; readonly readback: LegacyReadbackR2;
+  readonly binding: WriterBinding; readonly suffix: SuffixPin; readonly freezeCommitId: string;
+}
+export interface SamePipeSwitchR2 extends OperationFence {
+  readonly revision: 2; readonly switchId: string; readonly interval: FrozenLegacyIntervalR2;
+  readonly binding: Binding; readonly to: 'newarch';
+}
+export interface SamePipeDecisionR2 {
+  readonly revision: 2; readonly switchId: string; readonly commitId: string;
+  readonly generation: number; readonly cut: FiniteCut; readonly binding: Binding;
+}
+export type PendingRecoveryR2 =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'legacy-unverified-pending'; readonly sourceVersion: 1 | 2;
+      readonly pendingId: string; readonly pane: PaneKey; readonly original: EvidenceFile;
+      readonly readablePrefix: Coverage; readonly cursor: NewarchHistoryCursor }
+  | { readonly kind: 'prepared'; readonly prepared: PreparedHandoff; readonly reason: 'unverified-receipt' | 'writer-unbound' | 'suffix-unpinned' | 'storage' }
+  | { readonly kind: 'committed'; readonly decision: HandoffDecision }
+  | { readonly kind: 'error'; readonly code: 'integrity' | 'io' | 'unsupported'; readonly message: string };
+export interface RemoteAuthorizationR2 extends OperationFence {
+  readonly revision: 2; readonly sealed: SealedExport; readonly inventory: ArchiveInventoryR2;
+  readonly verified: VerifiedBundle;
+}
+export interface RemoteIndexR2 extends RemoteIndexReceipt {
+  readonly repair: { readonly revision: 2; readonly sealCommitId: string; readonly sealGeneration: number;
+    readonly inventoryDigest: Digest; readonly authorizationGeneration: number };
+}
+/** H consults this synchronously INSIDE its reclaim transaction and rechecks
+ * its current generation/pins. O's journal is never a substitute for A. */
+export interface CatalogAuthorityR2 {
+  attach(attachId: string): Result<AttachDecisionR2 | null>;
+  remote(commitId: string): Result<RemoteIndexR2 | null>;
+}
+export interface ArchiveCatalogR2 extends Omit<ArchiveCatalogPort, 'commitAttach' | 'recoverPending' | 'commitRemoteIndex'> {
+  readonly authority: CatalogAuthorityR2;
+  commitAttach(request: CommitAttachR2): Promise<Result<AttachDecisionR2>>;
+  recoverPending(pane: PaneKey, cancel: CancelToken): Promise<Result<PendingRecoveryR2>>;
+  commitHandoffR2(request: CommitHandoffRequest & { readonly readback: LegacyReadbackR2 }): Promise<Result<HandoffDecision>>;
+  switchSamePipe(request: SamePipeSwitchR2): Promise<Result<SamePipeDecisionR2>>;
+  commitRemoteIndex(request: RemoteAuthorizationR2): Promise<Result<RemoteIndexR2>>;
+  resolveLegacyPending(request: OperationFence & { readonly pendingId: string; readonly handoff: CommitHandoffRequest; readonly readback: LegacyReadbackR2 }): Promise<Result<HandoffDecision>>;
+}
+export interface LegacyWriterR2 extends LegacyWriterPort {
+  /** Must read actual durable commit/files/index/lines, independently of claim. */
+  readback(receipt: LegacyRangeReceipt): Result<LegacyReadbackR2>;
+  projection(commitId: string): Result<CoverageProjectionR2 | null>;
+  freezeInterval(request: OperationFence & { readonly intervalId: string; readonly from: FiniteCut; readonly cut: FiniteCut; readonly binding: WriterBinding; readonly suffix: SuffixPin }): Promise<Result<FrozenLegacyIntervalR2>>;
+  appendContinuous(request: ExactBatch & { readonly continuity: readonly SegmentContinuityR2[] }): Promise<Result<LegacyRangeReceipt>>;
+}
+export interface ArchiveBundleR2 extends ArchiveBundle {
+  readonly repair: { readonly revision: 2; readonly inventory: ArchiveInventoryR2;
+    readonly timelineIndex: EvidenceFile; readonly replayIndex: EvidenceFile };
+}
+export interface RestoreAuthorityR2 {
+  lookup(range: SegmentRowRange): Result<SegmentLocation>;
+  page(request: BoundedReadR2): Result<TimelinePageR2>;
+  pin(request: PinRequest): Promise<Result<SegmentPin>>;
+  release(pin: SegmentPin): Promise<Result<null>>;
+}
+
+export type GapR2 = import('../../core/src/protocol').NewarchGapR2;
+/** Legacy identity is isolated in its own namespace; never add an r2 identity
+ * to an old serialized gap or recalculate its durable digest during migration. */
+export function gapIdentity(gap: Gap | GapR2): string {
+  if ('repair' in gap) {
+    if (gap.repair.revision !== 2 || !gap.repair.gapId) throw Error('unsupported gap identity');
+    contractUint(gap.repair.sequence); contractUint(gap.repair.update);
+    return streamCanonical(['gap-r2', gap.pane, gap.episodeId, gap.repair.gapId, gap.repair.sequence]);
+  }
+  return streamCanonical(['gap-v1', gap.pane, gap.episodeId]);
+}
+export function validGapUpdate(previous: GapR2, next: GapR2): boolean {
+  return gapIdentity(previous) === gapIdentity(next) && previous.repair.state === 'open'
+    && next.repair.update === previous.repair.update + 1
+    && sameContract(previous.leftRowId, next.leftRowId) && previous.openedAt === next.openedAt
+    && previous.clockEpoch === next.clockEpoch && next.withheldRows >= previous.withheldRows
+    && (next.countKind !== 'unknown' || next.missingCount === null)
+    && (next.repair.state === 'closed' ? next.closedAt !== null : next.closedAt === null);
+}
+export interface LogicalSealR2 {
+  readonly revision: 2; readonly sealCommitId: string; readonly sealGeneration: number;
+  readonly pane: PaneKey; readonly segmentId: string; readonly coverage: Coverage;
+  readonly rawRanges: readonly RawRange[]; readonly checkpointIds: readonly string[];
+  readonly timelineIndexCommitId: string; readonly replayIndexCommitId: string;
+}
+export interface FlagOnHistoryR2 {
+  sealSegment(request: OperationFence & { readonly segmentId: string }): Promise<Result<LogicalSealR2>>;
+  listSealed(cursor: string | null, limit: number): Result<{ readonly seals: readonly LogicalSealR2[]; readonly next: string | null }>;
+  /** Verify remote via CatalogAuthorityR2 inside the transaction, together with
+   * current generation and all pins; never trust the passed receipt alone. */
+  reclaimR2(request: OperationFence & { readonly sealed: SealedExport; readonly remote: RemoteIndexR2; readonly inventory: ArchiveInventoryR2 }): Promise<Result<ReclaimReceipt>>;
+}
+export function archiveInventoryDigest(inventory: ArchiveInventoryR2): Digest {
+  return streamDigest('archive-inventory-r2', inventory);
+}
+
+export interface HistoryAuthorityR2 {
+  /** Present only after sealAttachSet verifies every staged chunk and prevents
+   * further staging. A compares this durable manifest with its request. */
+  attachSet(transactionId: string): Result<AttachReceiptSetR2 | null>;
+}
+export interface FlagOnHistoryR2 {
+  sealAttachSet(request: OperationFence & { readonly manifest: AttachReceiptSetR2 }): Promise<Result<AttachReceiptSetR2>>;
+}
+export interface CatalogAuthorityR2 {
+  switchDecision(switchId: string): Result<SamePipeDecisionR2 | null>;
+}
+export function sourceRecordsDigest(records: readonly SpoolRecord[]): Digest {
+  return streamDigest('source-records-r2', records);
 }
