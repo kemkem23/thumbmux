@@ -846,7 +846,6 @@ test('T-fix 05-A remote index: upload exit 0 without verified readback is refuse
 import { FlagOnPipeHost, FlagOnCollectorSupervisor, FlagOnHistoryReadback } from '../../../../src/integrations/stream-pipe-host';
 import { FlagOnSourceTransport } from '../../../../src/integrations/stream-source-transport';
 import { StreamSpoolClient as FxSpoolClient } from '../../../../src/integrations/stream-spool-client';
-import { connect as fxConnect } from 'node:net';
 import { openSync as fxOpen, writeSync as fxWrite, closeSync as fxClose, renameSync as renameSyncFs, readlinkSync as readlinkSyncFs } from 'node:fs';
 
 const FX_PRODUCER = String.raw`import os, sys, time
@@ -1084,7 +1083,7 @@ for (const create of ['new-session', 'new-window', 'split-window'] as const) {
       const source = new FlagOnSourceTransport({ tmuxSocket: rig.socket, expectedServerPid: rig.serverPid, geometryGeneration: () => 0, collector: s.client,
         birthCommand: () => argv, verifyIdentity: (i, seen) => seen.serverPid === rig.serverPid && seen.paneId === i.pane.paneId });
       const opened = await source.openBirth(s.intent({ kind: 'birth', pane }), s.never);
-      console.log(`T-fix S-04 ${create} openBirth ${fxWhy(opened)}`);
+      console.log(`T-fix S-04 ${create} openBirth ${fxWhy(opened)} predicted=${next} panes=${rig.must(['list-panes', '-a', '-F', '#{pane_id}']).trim().split('\n').join(',')}`);
       expect(opened.status).toBe('ok');
       if (opened.status !== 'ok') return;
       await fxUntil(async () => fxIds(await s.durableBytes(s.client, opened.value.binding), 's04').includes(50), 10_000, 'birth bytes');
@@ -1183,13 +1182,31 @@ function fxFifoWriter(fifo: string, handshake: string) {
   fxWrite(fd, `${handshake} ${pid}\n`);
   return { write: (s: string) => fxWrite(fd, s), close: () => fxClose(fd) };
 }
-function fxRaw(path: string, payload: string, wait = 300): Promise<string> {
-  return new Promise(resolve => {
-    const socket = fxConnect(path); let out = '';
-    socket.on('connect', () => socket.write(payload)); socket.on('data', d => { out += d.toString(); });
-    socket.on('error', () => resolve(`error:${out}`)); socket.on('close', () => resolve(out));
-    setTimeout(() => { socket.destroy(); resolve(`timeout:${out}`); }, wait);
-  });
+/** Raw socket abuse from a separate python process (Bun's node:net is not the subject). */
+const FX_FLOOD = String.raw`import socket, sys, time
+path, mode = sys.argv[1], sys.argv[2]
+if mode == 'frame':
+    s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(path)
+    out = b''
+    try:
+        s.sendall(b'x' * (300 * 1024) + b'\n'); out = s.recv(65536)
+    except Exception as e:
+        out = ('closed:%s' % type(e).__name__).encode()
+    print(out.decode(errors='replace')[:200])
+else:
+    held = []
+    for _ in range(int(mode)):
+        try:
+            c = socket.socket(socket.AF_UNIX); c.setblocking(False); c.connect_ex(path); held.append(c)
+        except Exception:
+            pass
+    time.sleep(0.3)
+    print(len(held))
+`;
+function fxFlood(dir: string, sock: string, mode: string): string {
+  writeFileSync(join(dir, 'flood.py'), FX_FLOOD);
+  const r = t11Spawn('python3', ['-B', join(dir, 'flood.py'), sock, mode], { encoding: 'utf8', timeout: 10_000 });
+  return `${r.status}:${(r.stdout ?? '').trim()}:${(r.stderr ?? '').trim().slice(0, 200)}`;
 }
 
 test('T-fix S-08 mutated epoch/rootUUID/nonce/ownerGeneration/peer and forged ACK/evidence are refused and the watermark does not move', async () => {
@@ -1225,10 +1242,13 @@ test('T-fix S-09 oversized frame, >32 connections, short writes, FIFO EOF and pr
   try {
     const s = await fxSource(rig);
     const sock = join(rig.root, 'flagon', 'collector', 'collector.sock');
-    expect(await fxRaw(sock, 'x'.repeat(300 * 1024) + '\n', 1500)).not.toContain('"ok":true');
-    const held = Array.from({ length: 40 }, () => fxConnect(sock));
-    await Bun.sleep(300);
-    for (const h of held) h.destroy();
+    const frame = fxFlood(rig.dir, sock, 'frame');
+    console.log(`T-fix S-09 oversized frame -> ${frame} collectorAlive=${s.supervisor.alive()}`);
+    expect(frame).not.toContain('"ok":true');
+    expect(s.supervisor.alive()).toBe(true);
+    const flood = fxFlood(rig.dir, sock, '40');
+    console.log(`T-fix S-09 40 connections -> ${flood} collectorAlive=${s.supervisor.alive()}`);
+    expect(s.supervisor.alive()).toBe(true);
     const prepared = await s.client.prepare(s.intent());
     const w = fxFifoWriter(join(prepared.directory, 'input.fifo'), prepared.binding.handshakeId);
     let bytes = 0;

@@ -542,3 +542,120 @@ describe('T11 ST-01/ST-02 independent stitch oracle (no product stitch on this b
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// T-fix (NEWARCH flag-on repair round 1, REPAIR-PLAN §6 resize-recapture row):
+// ST-02 through the real host. FlagOnVtDecoder is reached only via
+// FlagOnPipeHost on a private tmux socket with the real collector; the oracle
+// is the producer's event log (written before each line, outside the PTY) and
+// tmux's own history read independently. No full-capture polling is involved.
+// ---------------------------------------------------------------------------
+import { FlagOnPipeHost } from "../../../../src/integrations/stream-pipe-host";
+import { existsSync, mkdirSync, readdirSync, renameSync } from "node:fs";
+
+const RZ_PRODUCER = String.raw`import os, sys, time
+d, tag = sys.argv[1], sys.argv[2]
+log = open(os.path.join(d, 'events.log'), 'a', buffering=1)
+seq, step = 0, 0
+while True:
+    step += 1
+    cmd = os.path.join(d, 'cmd%d' % step)
+    while not os.path.exists(cmd):
+        time.sleep(0.002)
+    kind, n = open(cmd).read().split()
+    for _ in range(int(n)):
+        if kind == 'burst':
+            seq += 1
+            log.write('%d\n' % seq)
+            os.write(1, ('E%07d %s %s\n' % (seq, tag, 'y' * (seq % 13))).encode())
+        else:
+            os.write(1, b'~pad~\n')
+    tmp = os.path.join(d, 'done%d.tmp' % step)
+    open(tmp, 'w').write(str(seq))
+    os.rename(tmp, os.path.join(d, 'done%d' % step))
+`;
+async function rzUntil(f: () => boolean, ms: number, what: string): Promise<void> {
+  const end = performance.now() + ms;
+  while (performance.now() < end) { if (f()) return; await new Promise((r) => setTimeout(r, 25)); }
+  if (!f()) throw new Error(`T-fix timed out (${ms}ms): ${what}`);
+}
+
+describe("T-fix ST-02 resize through the real flag-on host", () => {
+  test("T-fix ST-02/L2/L3 planned shrink 80×30→80×20 with the cursor at the bottom: rows tmux pushes into history appear while the producer is silent, verification continues after the state is known, and the post-verify timeline is loss 0", async () => {
+    const tag = "rz";
+    const dir = mkdtempSync(join(tmpdir(), "tfix-rz-"));
+    const sockDir = join(dir, "tmuxdir", `tmux-${process.getuid!()}`); mkdirSync(sockDir, { recursive: true, mode: 0o700 });
+    const socket = join(sockDir, "default");
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "TMUX" && k !== "TMUX_PANE") env[k] = v;
+    const must = (args: string[]) => { const r = spawnSync("tmux", ["-S", socket, "-f", "/dev/null", ...args], { encoding: "utf8", env });
+      if (r.status) throw new Error(`T-fix tmux ${args[0]}: ${r.stderr}`); return r.stdout; };
+    const prod = join(dir, "prod"); mkdirSync(prod);
+    writeFileSync(join(dir, "producer.py"), RZ_PRODUCER);
+    let step = 0;
+    const run = async (kind: "burst" | "pad", n: number) => {
+      const k = ++step; writeFileSync(join(prod, `cmd${k}.tmp`), `${kind} ${n}`); renameSync(join(prod, `cmd${k}.tmp`), join(prod, `cmd${k}`));
+      await rzUntil(() => existsSync(join(prod, `done${k}`)), 30_000, `producer step ${k}`);
+      return Number(readFileSync(join(prod, `done${k}`), "utf8"));
+    };
+    const ids = (text: string) => [...text.matchAll(new RegExp(`E(\\d{7}) ${tag}`, "g"))].map((m) => Number(m[1]));
+    const previousHistory = process.env.TERMINAL_HISTORY_DIR;
+    process.env.TERMINAL_HISTORY_DIR = join(dir, "legacy-history"); mkdirSync(process.env.TERMINAL_HISTORY_DIR);
+    let host: FlagOnPipeHost | null = null;
+    try {
+      must(["start-server", ";", "set-option", "-g", "history-limit", "4500", ";", "set-option", "-g", "window-size", "manual", ";",
+        "new-session", "-d", "-s", "s", "-x", "80", "-y", "30", `exec python3 -B ${dir}/producer.py ${prod} ${tag}`]);
+      const paneId = must(["list-panes", "-t", "=s", "-F", "#{pane_id}"]).trim();
+      const stamp = must(["display-message", "-p", "#{pid}@#{start_time}"]).trim();
+      const sessionId = must(["display-message", "-p", "-t", paneId, "#{session_id}"]).trim();
+      const root = join(dir, "root"); mkdirSync(root, { mode: 0o700 });
+      writeFileSync(join(root, "allowlist.json"), JSON.stringify({ version: 1, server: stamp, sessions: [{ sessionId }] }));
+      await run("burst", 100);
+      host = new FlagOnPipeHost({ root, tmuxSocket: socket, mode: "flag-on", tickMs: 50, healthMs: 100 });
+      await host.start();
+      const attached = await host.attach("s");
+      console.log(`T-fix ST-02 attach ${JSON.stringify(attached)}`);
+      expect(attached.ok).toBe(true);
+      const h = host;
+      const status = () => h.status().sessions[0];
+      await rzUntil(() => status()?.verified === true, 15_000, "verified before resize");
+      const committed = () => {
+        const seen: number[] = []; let at: number | null = null;
+        for (let g = 0; g < 1000; g++) {
+          const page = h.projection.readBefore("s", at, 500) as { lines: string[]; startLine: number | null; hasMore: boolean };
+          seen.unshift(...page.lines.flatMap((l) => ids(l.replace(/\x1b\[[0-9;]*m/g, ""))));
+          if (!page.hasMore || page.startLine === null) break; at = page.startLine;
+        }
+        return seen;
+      };
+      // Fill the 30-row screen; the cursor ends on the bottom row.
+      const first = (await run("burst", 1)) ;
+      const filled = await run("burst", 40);
+      expect(Number(must(["display-message", "-p", "-t", paneId, "#{cursor_y}"]).trim())).toBe(29);
+      const historyBefore = new Set(ids(must(["capture-pane", "-p", "-S", "-", "-E", "-1", "-t", paneId])));
+      must(["resize-window", "-t", "=s", "-x", "80", "-y", "20"]);
+      const pushed = ids(must(["capture-pane", "-p", "-S", "-", "-E", "-1", "-t", paneId])).filter((id) => !historyBefore.has(id));
+      console.log(`T-fix ST-02 shrink pushed ${pushed.length} rows into tmux history: ${pushed[0]}..${pushed.at(-1)}`);
+      expect(pushed.length).toBeGreaterThan(0);
+      // Producer silent: the pushed rows must still reach the timeline.
+      await rzUntil(() => { const c = new Set(committed()); return pushed.every((id) => c.has(id)); }, 5_000, "rows pushed by the shrink are committed with a silent producer");
+      // Verification must keep running after the resize, then normal output is loss 0.
+      await rzUntil(() => status()?.verified === true && status()?.fault === null, 15_000, "verified after resize");
+      const last = await run("burst", 60);
+      await run("pad", 25);
+      await rzUntil(() => committed().includes(last), 15_000, `row ${last}`);
+      const seq = committed().filter((id) => id >= first);
+      console.log(`T-fix ST-02 window ${first}..${last} committed=${seq.length} status=${JSON.stringify(status())}`);
+      expect(seq).toEqual(Array.from({ length: last - first + 1 }, (_, i) => first + i));
+      void filled;
+    } finally {
+      await host?.close();
+      spawnSync("tmux", ["-S", socket, "kill-server"], { env });
+      for (const pid of readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
+        try { if (readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").some((a) => a.startsWith(dir + "/"))) process.kill(Number(pid), "SIGKILL"); } catch { /* gone */ }
+      }
+      if (previousHistory === undefined) delete process.env.TERMINAL_HISTORY_DIR; else process.env.TERMINAL_HISTORY_DIR = previousHistory;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
