@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  FLAGON_BUDGET, streamCanonical, streamDigest,
-  type AcceptedRowMap, type CaptureWindow, type Cell, type Gap, type PaneKey, type PipeWindow,
+  FLAGON_BUDGET, semanticCellToCell, streamCanonical, streamDigest,
+  type AcceptedRowMap, type CaptureWindow, type Cell, type Gap, type GapR2, type PaneKey, type PipeWindow,
   type RawRange, type RowOrigin, type SeamProof, type SegmentRowId, type StitchDecision,
   type StitchPort, type StitchProofs, type StitchResult, type StitchRow, type StitchWindow,
   type WithheldRange, type CapturePacket,
@@ -292,8 +292,11 @@ const colorCode = (color: string): number => {
   const [r, g, b] = color.slice(4).split(',').map(Number);
   return 256 + ((r! << 16) | (g! << 8) | b!);
 };
-const observedCell = (cell: TmuxObservedCell): Cell =>
-  ({ text: cell.grapheme, width: cell.width, style: [cell.style, colorCode(cell.fg), colorCode(cell.bg)] });
+/** Decoder bits stay on TmuxObservedCell. Durable Cell.style is canonical SGR. */
+const observedCell = (cell: TmuxObservedCell): Cell => semanticCellToCell({
+  text: cell.grapheme, width: cell.width,
+  style: { attrs: cell.style, fg: colorCode(cell.fg), bg: colorCode(cell.bg) },
+});
 
 /** Rows of one `capture-pane -p -e -C -N -S - -E -` payload. History rows
  * (index < historySize) are finalized; screen rows are not. Capture never
@@ -390,6 +393,9 @@ export class StreamStitcher implements StitchPort {
     }
     const pipeTrusted = pipe.kind === 'certified' || pipe.kind === 'birth' || pipeSeamOutcome?.status === 'ok';
 
+    const failure = [tailSeam, pipeSeamOutcome].find((s): s is Failure => !!s && s.status === 'ambiguous')
+      ?? [tailSeam, pipeSeamOutcome].find((s): s is Failure => !!s && s.status === 'unproven');
+
     // Assemble: T kept whole → C finalized rows beyond T → P suffix.
     const segmentId = (this.options.segmentIdFor ?? defaultSegmentId)(proofs.episodeId, packet.snapshotId);
     const asm = new Assembly(P.pane, segmentId, packet, proofs.episodeId, lastDurable(T));
@@ -430,9 +436,8 @@ export class StreamStitcher implements StitchPort {
       asm.accept(row.origin);
     });
 
+    if (failure) asm.ensurePositioned(gapReason(failure));
     const decision = asm.finish();
-    const failure = [tailSeam, pipeSeamOutcome].find((s): s is Failure => !!s && s.status === 'ambiguous')
-      ?? [tailSeam, pipeSeamOutcome].find((s): s is Failure => !!s && s.status === 'unproven');
     if (tailEmptyStart && !failure) return { ...decision, status: 'unproven', reason: 'content-only' };
     if (!failure) {
       if (decision.withheldRanges.some(r => r.reason === 'unknown-state')) return { ...decision, status: 'unproven', reason: 'unknown-state' };
@@ -485,7 +490,8 @@ const withheldReason = (reason: Gap['reason']): WithheldRange['reason'] =>
 class Assembly {
   private readonly accepted: AcceptedRowMap[] = [];
   private readonly withheld: WithheldRange[] = [];
-  private readonly gaps: Gap[] = [];
+  private readonly gaps: GapR2[] = [];
+  private sequence = 0;
   private run: { reason: Gap['reason']; rows: number } | null = null;
   private left: SegmentRowId | null;
   constructor(private readonly pane: PaneKey, private readonly segmentId: string,
@@ -493,6 +499,12 @@ class Assembly {
     this.left = tail;
   }
   leadingGap(): void { this.gaps.push(this.gap('unproven-overlap', 0, null)); }
+  /** A non-match with nothing withheld still needs a gap at the last durable row.
+   * Quiet T with empty C/P used to return unproven and invite another capture. */
+  ensurePositioned(reason: Gap['reason']): void {
+    this.close();
+    if (this.gaps.length === 0) this.gaps.push(this.gap(reason, 0, this.left));
+  }
   accept(source: RowOrigin): void {
     this.close();
     const target = { pane: this.pane, segmentId: this.segmentId, rowOrdinal: this.accepted.length };
@@ -513,12 +525,18 @@ class Assembly {
     this.gaps.push(this.gap(this.run.reason, this.run.rows, this.left));
     this.run = null;
   }
-  private gap(reason: Gap['reason'], withheldRows: number, left: SegmentRowId | null): Gap {
+  private gap(reason: Gap['reason'], withheldRows: number, left: SegmentRowId | null): GapR2 {
+    const sequence = this.sequence++;
+    const leftMark = left ? `${left.segmentId}:${left.rowOrdinal}` : 'none';
     return {
       version: 1, episodeId: this.episodeId, parentEpisodeId: null, pane: this.pane,
       leftRowId: left, rightSegmentId: this.segmentId, reason,
       countKind: 'unknown', missingCount: null, withheldRows, lowerBound: 0,
       openedAt: this.packet.startedAtMonoMs, closedAt: null, clockEpoch: this.packet.clockEpoch, quality: 'degraded',
+      repair: {
+        revision: 2, gapId: `c-${this.episodeId}-${sequence}-${reason}-${leftMark}`,
+        sequence, update: 0, state: 'open',
+      },
     };
   }
   finish(): StitchDecision {
