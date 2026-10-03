@@ -207,6 +207,9 @@ test('contract repair mutants go red then restored real seams go green', async (
     cpSync(join(pkg,'server/src'),join(target,'server/src'),{recursive:true});
     cpSync(join(pkg,'server/tests'),join(target,'server/tests'),{recursive:true});
     cpSync(join(pkg,'core/src'),join(target,'core/src'),{recursive:true});
+    const fixture=join(root,'docs/tasks/newarch-stream');
+    mkdirSync(fixture,{recursive:true});
+    cpSync(resolve(pkg,'../../docs/tasks/newarch-stream/contract-fixture.ts'),join(fixture,'contract-fixture.ts'));
     const bundle=join(root,'docs/tasks/newarch-spike2/bundle');
     mkdirSync(bundle,{recursive:true});
     cpSync(resolve(pkg,'../../docs/tasks/newarch-spike2/bundle'),bundle,{recursive:true});
@@ -225,6 +228,8 @@ test('contract repair mutants go red then restored real seams go green', async (
         const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
         return {exit,output:out+err};
       };
+      const clean=await run();
+      expect(clean.exit,clean.output).toBe(0);expect(clean.output).toContain('(pass)');
       writeFileSync(file,mutant);
       const red=await run();
       console.log('CONTRACT_MUTANT_RED',m.name,red.exit,red.output);
