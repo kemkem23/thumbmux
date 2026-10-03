@@ -384,9 +384,9 @@ test("DS-02 path traversal, symlink members and a decompression bomb are rejecte
   const remote = new RcloneRemote({ location: `:local:${remoteDir}` });
   const evil = new TextEncoder().encode("owned");
   const cases = [
-    { seg: "seg-trav", tar: rawTar([{ name: "../../escaped.txt", type: "0", data: evil }]), member: "../../escaped.txt" },
-    { seg: "seg-link", tar: rawTar([{ name: "rows.jsonl", type: "2", data: new Uint8Array() }]), member: "rows.jsonl" },
-    { seg: "seg-bomb", tar: rawTar([{ name: "rows.jsonl", type: "0", data: new Uint8Array(40 * 1024 * 1024) }]), member: "rows.jsonl" },
+    { seg: "seg-trav", tar: rawTar([{ name: "../../escaped.txt", type: "0", data: evil }]), member: "../../escaped.txt", why: /unsafe archive member name|escapes/ },
+    { seg: "seg-link", tar: rawTar([{ name: "rows.jsonl", type: "2", data: new Uint8Array() }]), member: "rows.jsonl", why: /type 2 refused/ },
+    { seg: "seg-bomb", tar: rawTar([{ name: "rows.jsonl", type: "0", data: new Uint8Array(40 * 1024 * 1024) }]), member: "rows.jsonl", why: /zstd/ },
   ];
   for (const c of cases) {
     const target = emptyRoot(`root-${c.seg}`);
@@ -395,7 +395,8 @@ test("DS-02 path traversal, symlink members and a decompression bomb are rejecte
       inventory: manifest, allowedRoot: target }, NEVER, { remote });
     expect([c.seg, r.status]).toEqual([c.seg, "error"]);
     expect([c.seg, restoreFailureReason(r)]).toEqual([c.seg, "corrupt"]);
-    expect(existsSync(join(root, "escaped.txt")) || existsSync(join(target, "escaped.txt"))).toBe(false);
+    expect([c.seg, r.status === "error" && c.why.test(r.message)]).toEqual([c.seg, true]);
+    expect(remoteFiles(root).filter((f) => f.endsWith("escaped.txt"))).toEqual([]);
     expect(readdirSync(join(target, "restore-cache"))).toEqual([]);
   }
 });
