@@ -1,9 +1,11 @@
 import {
   NEWARCH_FLAGON_CAPABILITIES,
+  NEWARCH_REPAIR_CAPABILITIES,
   type NewarchCapabilities,
   type NewarchFlagOnCapability,
   type NewarchGap,
   type NewarchHistoryContinuation,
+  type NewarchHistoryExtension,
   type NewarchHistoryState,
   type NewarchPaneKey,
 } from "@thumbmux/core";
@@ -204,6 +206,10 @@ function encodedBytes(value: unknown): number {
 }
 
 const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_FLAGON_CAPABILITIES);
+const REPAIR_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_REPAIR_CAPABILITIES);
+const INCIDENT_REASONS: ReadonlySet<string> = new Set([
+  "storage-outage", "collector-stalled", "collector-exit", "io",
+]);
 const GAP_REASONS: ReadonlySet<string> = new Set<NewarchGap["reason"]>([
   "pipe-eof", "collector-exit", "ambiguous-overlap", "unproven-overlap", "unknown-vt-state",
   "interrupted-capture", "storage-outage", "corruption", "identity-change", "geometry-change",
@@ -259,6 +265,41 @@ function validHistoryState(state: NewarchHistoryState, pane: NewarchPaneKey): bo
         && typeof state.collecting === "boolean" && Number.isFinite(state.sinceMonoMs) && state.sinceMonoMs >= 0;
     default: return false;
   }
+}
+
+function validRepairCapabilities(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const repair = value as { revision?: unknown; supported?: unknown; required?: unknown };
+  if (repair.revision !== 2 || !Array.isArray(repair.supported) || !Array.isArray(repair.required)) return false;
+  const names = [...repair.supported, ...repair.required];
+  if (!names.every(cap => typeof cap === "string" && REPAIR_CAPABILITIES.has(cap))) return false;
+  return repair.required.every(cap => (repair.supported as readonly unknown[]).includes(cap));
+}
+
+function validIncident(value: unknown, collecting: boolean, pane: NewarchPaneKey): boolean {
+  if (!value || typeof value !== "object") return false;
+  const incident = value as Record<string, unknown>;
+  if (incident.revision !== 2 || !validText(incident.incidentId) || !samePane(incident.pane as NewarchPaneKey, pane)) return false;
+  if (!("leftRowId" in incident)) return false;
+  if (incident.leftRowId !== null) {
+    const left = incident.leftRowId as { pane?: NewarchPaneKey; segmentId?: unknown; rowOrdinal?: unknown };
+    if (!samePane(left?.pane, pane) || !validText(left?.segmentId) || !validCounter(left?.rowOrdinal as number)) return false;
+  }
+  if (!validCounter(incident.openedAtWallMs as number) || !validCounter(incident.openedAtMonoMs as number)) return false;
+  if (!validText(incident.clockEpoch)) return false;
+  if (incident.collecting !== collecting) return false;
+  if (typeof incident.reason !== "string" || !INCIDENT_REASONS.has(incident.reason)) return false;
+  if (incident.quality !== "degraded" && incident.quality !== "resolved") return false;
+  if (!("resolvedAtWallMs" in incident)) return false;
+  return incident.resolvedAtWallMs === null || validCounter(incident.resolvedAtWallMs as number);
+}
+
+/** A repair claim without incident id, wall time, and last row is not a stop label. */
+function validPressureStop(state: NewarchHistoryState, pane: NewarchPaneKey, repairClaimed: boolean): boolean {
+  if (state.kind !== "pressure") return true;
+  const incident = (state as { repair?: unknown }).repair;
+  if (!repairClaimed) return incident === undefined;
+  return validIncident(incident, state.collecting, pane);
 }
 
 function validContinuation(continuation: NewarchHistoryContinuation, pane: NewarchPaneKey): boolean {
@@ -591,12 +632,23 @@ export class StreamDisplayEngine implements DisplayEngine {
     if (!capabilities.required.every(cap => this.flagOn!.supported.includes(cap))) {
       return { status: "error", code: "unsupported", message: "flag-on page requires an unsupported capability" };
     }
+    const repair = (extension as NewarchHistoryExtension & { repair?: unknown }).repair;
+    if (repair !== undefined && !validRepairCapabilities(repair)) return integrity("flag-on repair envelope is unreadable");
+    const repairClaimed = repair !== undefined;
+    const pane = view.identity.pane;
+    const pressureOk = (state: NewarchHistoryState) => validPressureStop(state, pane, repairClaimed);
     if (extension.version !== 1 || !Array.isArray(extension.states)
-      || !extension.states.every(state => validHistoryState(state, view.identity.pane))) {
+      || !extension.states.every(state => validHistoryState(state, pane) && pressureOk(state))) {
       return integrity("flag-on page has invalid history states");
     }
-    if (!validContinuation(extension.before, view.identity.pane) || !validContinuation(extension.after, view.identity.pane)) {
+    if (!validContinuation(extension.before, pane) || !validContinuation(extension.after, pane)) {
       return integrity("flag-on page has an invalid continuation");
+    }
+    if (extension.before.kind === "blocked" && !pressureOk(extension.before.state)) {
+      return integrity("flag-on page has invalid history states");
+    }
+    if (extension.after.kind === "blocked" && !pressureOk(extension.after.state)) {
+      return integrity("flag-on page has invalid history states");
     }
     if ((extension.before.kind === "end") === page.hasMoreBefore || (extension.after.kind === "end") === page.hasMoreAfter) {
       return integrity("flag-on continuation disagrees with hasMore");

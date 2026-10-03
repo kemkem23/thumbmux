@@ -10,6 +10,7 @@ import {
   historyWindowRange,
   historyWindowRequestCursor,
   historyContinuationFor,
+  historyIncidentStopLabel,
   historyStateLabel,
   historyStatusNotes,
   parseNewarchHistoryExtension,
@@ -681,6 +682,39 @@ describe('NEWARCH D-fix R18 pressure incident from the backend', () => {
     for (const line of applied.state.lines) {
       for (const piece of banned) expect(line).not.toContain(piece);
     }
+  });
+});
+
+describe('NEWARCH D-fix R18 stop label the reader can see', () => {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const local = new Date(INCIDENT_WALL_MS);
+  const clock = `${pad(local.getHours())}:${pad(local.getMinutes())}:${pad(local.getSeconds())}`;
+  const day = `${pad(local.getDate())}/${pad(local.getMonth() + 1)}`;
+
+  test('a repair stop shows its local time and last row, without the raw ms or the incident id', () => {
+    const extension = parseNewarchHistoryExtension(repairEnvelope());
+    const note = historyStatusNotes(extension!).find(item => item.kind === 'pressure')!;
+    const label = historyIncidentStopLabel(note);
+    expect(label).toBe(`หยุดเมื่อ ${day} ${clock} · แถวสุดท้าย seg-9:41`);
+    expect(label).not.toContain(String(INCIDENT_WALL_MS));
+    expect(label).not.toContain(INCIDENT_ID);
+  });
+
+  test('a stop before the first row says so, and a v1 pressure has no stop label', () => {
+    const beforeFirstRow = parseNewarchHistoryExtension(repairEnvelope({
+      states: [{
+        kind: 'pressure', level: 'emergency', collecting: false, sinceMonoMs: 5,
+        repair: pressureIncident({ leftRowId: null }),
+      }],
+    }));
+    const note = historyStatusNotes(beforeFirstRow!).find(item => item.kind === 'pressure')!;
+    expect(historyIncidentStopLabel(note)).toBe(`หยุดเมื่อ ${day} ${clock} · ก่อนแถวแรก`);
+
+    const v1Extension = parseNewarchHistoryExtension(flagExtension());
+    expect(v1Extension).not.toBeNull();
+    const v1 = historyStatusNotes(v1Extension!).find(item => item.kind === 'pressure');
+    expect(v1).toBeDefined();
+    expect(historyIncidentStopLabel(v1!)).toBeUndefined();
   });
 });
 

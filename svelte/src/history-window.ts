@@ -9,10 +9,12 @@
 
 import {
   NEWARCH_FLAGON_CAPABILITIES,
+  NEWARCH_REPAIR_CAPABILITIES,
   type NewarchGap,
   type NewarchHistoryContinuation,
   type NewarchHistoryExtension,
   type NewarchHistoryState,
+  type NewarchRowId,
 } from '@thumbmux/core';
 
 export const HISTORY_WINDOW_MAX_ROWS = 10_000;
@@ -638,6 +640,14 @@ export type HistoryStatusNote = Readonly<{
   detail: string;
   /** Present for states that a later read may clear. */
   retryAfterMs: number | null;
+  /**
+   * Repair stop only. These sit beside the sentence: the sentence itself
+   * stays free of the incident id, the wall time, and the row coordinate.
+   * `leftRowId === null` means the stop happened before the first row.
+   */
+  openedAtWallMs?: number;
+  incidentId?: string;
+  leftRowId?: NewarchRowId | null;
 }>;
 
 function gapCountText(gap: NewarchGap): string {
@@ -689,8 +699,11 @@ function stateKey(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): strin
       return `remote-unavailable|${state.reason}|${state.bundleId}|${rangeText(state.range)}`;
     case 'degraded':
       return `degraded|${state.episodeId}`;
-    case 'pressure':
-      return `pressure|${state.level}|${state.collecting ? 'collecting' : 'stopped'}`;
+    case 'pressure': {
+      const incident = pressureIncidentFields(state);
+      const id = incident ? `|${incident.incidentId}` : '';
+      return `pressure|${state.level}|${state.collecting ? 'collecting' : 'stopped'}${id}`;
+    }
   }
 }
 
@@ -716,6 +729,62 @@ function retryAfter(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): num
   return state.kind === 'pending' || state.kind === 'remote-unavailable' ? state.retryAfterMs : null;
 }
 
+const REPAIR_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_REPAIR_CAPABILITIES);
+const INCIDENT_REASONS: ReadonlySet<string> = new Set([
+  'storage-outage', 'collector-stalled', 'collector-exit', 'io',
+]);
+
+/** `seg:ordinal` for a real row, `none` before the first row, absent on a v1 note. */
+export function historyIncidentLeftRowLabel(note: HistoryStatusNote): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(note, 'leftRowId')) return undefined;
+  if (note.leftRowId == null) return 'none';
+  return `${note.leftRowId.segmentId}:${note.leftRowId.rowOrdinal}`;
+}
+
+/**
+ * What the reader sees beside a repair stop: local wall time and the last row
+ * kept. Undefined on a v1 note. Never carries the raw ms or the incident id.
+ */
+export function historyIncidentStopLabel(note: HistoryStatusNote): string | undefined {
+  const row = historyIncidentLeftRowLabel(note);
+  if (row === undefined || note.openedAtWallMs === undefined) return undefined;
+  const at = new Date(note.openedAtWallMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const when = `${pad(at.getDate())}/${pad(at.getMonth() + 1)} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+  return `หยุดเมื่อ ${when} · ${row === 'none' ? 'ก่อนแถวแรก' : `แถวสุดท้าย ${row}`}`;
+}
+
+function copyRowId(value: Obj): NewarchRowId {
+  const pane = value.pane as Obj;
+  return {
+    pane: {
+      serverIdentity: String(pane.serverIdentity),
+      paneId: String(pane.paneId),
+      birthGeneration: pane.birthGeneration as number,
+    },
+    segmentId: String(value.segmentId),
+    rowOrdinal: value.rowOrdinal as number,
+  };
+}
+
+/** Incident carried on a pressure state. Absent when this stop never claimed one. */
+function pressureIncidentFields(state: NewarchHistoryState): {
+  incidentId: string;
+  openedAtWallMs: number;
+  leftRowId: NewarchRowId | null;
+} | null {
+  if (state.kind !== 'pressure') return null;
+  const repair = (state as { repair?: unknown }).repair;
+  if (!isObj(repair) || typeof repair.incidentId !== 'string' || typeof repair.openedAtWallMs !== 'number') return null;
+  const left = repair.leftRowId;
+  if (left !== null && !isObj(left)) return null;
+  return {
+    incidentId: repair.incidentId,
+    openedAtWallMs: repair.openedAtWallMs,
+    leftRowId: left === null ? null : copyRowId(left),
+  };
+}
+
 /** One note per distinct state, including the states that block an edge. */
 export function historyStatusNotes(extension: NewarchHistoryExtension): HistoryStatusNote[] {
   const notes = new Map<string, HistoryStatusNote>();
@@ -723,12 +792,20 @@ export function historyStatusNotes(extension: NewarchHistoryExtension): HistoryS
     if (state.kind === 'exact') return;
     const key = stateKey(state);
     if (notes.has(key)) return;
+    const incident = pressureIncidentFields(state);
     notes.set(key, {
       key,
       kind: state.kind,
       text: historyStateLabel(state)!,
       detail: stateDetail(state),
       retryAfterMs: retryAfter(state),
+      ...(incident
+        ? {
+            openedAtWallMs: incident.openedAtWallMs,
+            incidentId: incident.incidentId,
+            leftRowId: incident.leftRowId,
+          }
+        : {}),
     });
   };
   for (const state of extension.states) add(state);
@@ -792,7 +869,26 @@ function validGap(value: unknown): boolean {
     && typeof value.clockEpoch === 'string'
     && (value.quality === 'degraded' || value.quality === 'resolved');
 }
-function validState(value: unknown): value is NewarchHistoryState {
+function validRepairCaps(value: unknown): boolean {
+  if (!isObj(value) || value.revision !== 2 || !Array.isArray(value.supported) || !Array.isArray(value.required)) return false;
+  const supported = value.supported as unknown[];
+  const required = value.required as unknown[];
+  if (![...supported, ...required].every(cap => typeof cap === 'string' && REPAIR_CAPABILITIES.has(cap))) return false;
+  return required.every(cap => supported.includes(cap));
+}
+function validIncident(value: unknown, collecting: boolean): boolean {
+  if (!isObj(value) || value.revision !== 2 || !isText(value.incidentId) || !validPane(value.pane)) return false;
+  if (!('leftRowId' in value)) return false;
+  const left = value.leftRowId;
+  if (left !== null && !(isObj(left) && validPane(left.pane) && isText(left.segmentId) && isCount(left.rowOrdinal))) return false;
+  if (!isCount(value.openedAtWallMs) || !isCount(value.openedAtMonoMs) || !isText(value.clockEpoch)) return false;
+  if (value.collecting !== collecting) return false;
+  if (typeof value.reason !== 'string' || !INCIDENT_REASONS.has(value.reason)) return false;
+  if (value.quality !== 'degraded' && value.quality !== 'resolved') return false;
+  if (!('resolvedAtWallMs' in value)) return false;
+  return value.resolvedAtWallMs === null || isCount(value.resolvedAtWallMs);
+}
+function validState(value: unknown, repairClaimed: boolean): value is NewarchHistoryState {
   if (!isObj(value)) return false;
   switch (value.kind) {
     case 'exact': return true;
@@ -805,19 +901,24 @@ function validState(value: unknown): value is NewarchHistoryState {
     case 'degraded':
       return isText(value.episodeId) && Array.isArray(value.uncertainFields)
         && value.uncertainFields.every(field => typeof field === 'string');
-    case 'pressure':
-      return (value.level === 'archive' || value.level === 'critical' || value.level === 'emergency')
-        && typeof value.collecting === 'boolean'
-        && typeof value.sinceMonoMs === 'number' && Number.isFinite(value.sinceMonoMs) && value.sinceMonoMs >= 0;
+    case 'pressure': {
+      if (!(value.level === 'archive' || value.level === 'critical' || value.level === 'emergency')) return false;
+      if (typeof value.collecting !== 'boolean') return false;
+      if (typeof value.sinceMonoMs !== 'number' || !Number.isFinite(value.sinceMonoMs) || value.sinceMonoMs < 0) return false;
+      // A v1 page that never claimed repair still parses. A repair claim
+      // without an incident id, wall time, and last row is not a stop label.
+      if (!repairClaimed) return value.repair === undefined;
+      return validIncident(value.repair, value.collecting);
+    }
     default: return false;
   }
 }
-function validContinuation(value: unknown): boolean {
+function validContinuation(value: unknown, repairClaimed: boolean): boolean {
   if (!isObj(value)) return false;
   if (value.kind === 'end') return true;
   if (value.kind === 'more') return validCursor(value.cursor);
   if (value.kind === 'blocked') {
-    return validCursor(value.cursor) && validState(value.state) && (value.state as Obj).kind !== 'exact';
+    return validCursor(value.cursor) && validState(value.state, repairClaimed) && (value.state as Obj).kind !== 'exact';
   }
   return false;
 }
@@ -836,7 +937,9 @@ export function parseNewarchHistoryExtension(value: unknown): NewarchHistoryExte
   const required = caps.required as unknown[];
   if (![...supported, ...required].every(cap => typeof cap === 'string' && KNOWN_CAPABILITIES.has(cap))) return null;
   if (!supported.includes('history-states-v1') || !required.every(cap => supported.includes(cap))) return null;
-  if (!Array.isArray(value.states) || !value.states.every(validState)) return null;
-  if (!validContinuation(value.before) || !validContinuation(value.after)) return null;
+  const repairClaimed = value.repair !== undefined;
+  if (repairClaimed && !validRepairCaps(value.repair)) return null;
+  if (!Array.isArray(value.states) || !value.states.every(state => validState(state, repairClaimed))) return null;
+  if (!validContinuation(value.before, repairClaimed) || !validContinuation(value.after, repairClaimed)) return null;
   return value as unknown as NewarchHistoryExtension;
 }

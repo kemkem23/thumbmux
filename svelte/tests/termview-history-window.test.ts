@@ -2611,6 +2611,15 @@ describe("TermView sliding archive window", () => {
       expect(pressure!.getAttribute("data-history-left-row")).toBe("seg-9:41");
       expect(pressure!.getAttribute("data-incident-id")).toBe(INCIDENT_ID);
       expect(pressure!.closest(".mtv-line")).toBeNull();
+      // The reader sees when collection stopped and the last row kept, not only a data-* attribute.
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const stoppedAt = new Date(WALL_MS);
+      const shownTime = `${pad(stoppedAt.getDate())}/${pad(stoppedAt.getMonth() + 1)} ${pad(stoppedAt.getHours())}:${pad(stoppedAt.getMinutes())}:${pad(stoppedAt.getSeconds())}`;
+      const stopLine = pressure!.querySelector<HTMLElement>('[data-testid="mtv-history-stop"]');
+      expect(stopLine).not.toBeNull();
+      expect(stopLine!.textContent).toBe(`หยุดเมื่อ ${shownTime} · แถวสุดท้าย seg-9:41`);
+      expect(pressure!.getAttribute("aria-label")).toContain(shownTime);
+      expect(pressure!.getAttribute("aria-label")).toContain("seg-9:41");
 
       const copied: string[] = [];
       const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
@@ -2626,7 +2635,7 @@ describe("TermView sliding archive window", () => {
       }
       expect(copied).toHaveLength(1);
       expect(copied[0]).toContain("archive-18000");
-      for (const piece of ["หยุดเก็บประวัติ — พื้นที่ไม่พอ", "ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน", INCIDENT_ID, String(WALL_MS)]) {
+      for (const piece of ["หยุดเก็บประวัติ — พื้นที่ไม่พอ", "ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน", INCIDENT_ID, String(WALL_MS), "หยุดเมื่อ", "แถวสุดท้าย"]) {
         expect(copied[0]).not.toContain(piece);
       }
 
@@ -2667,6 +2676,7 @@ describe("TermView sliding archive window", () => {
       const pressure = viewport.ownerDocument.querySelector<HTMLElement>('[data-history-state="pressure"]');
       expect(pressure?.getAttribute("data-history-left-row")).toBe("none");
       expect(pressure?.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
+      expect(pressure?.querySelector('[data-testid="mtv-history-stop"]')?.textContent).toContain("ก่อนแถวแรก");
     });
   });
 });
