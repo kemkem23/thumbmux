@@ -741,6 +741,19 @@ export function historyIncidentLeftRowLabel(note: HistoryStatusNote): string | u
   return `${note.leftRowId.segmentId}:${note.leftRowId.rowOrdinal}`;
 }
 
+/**
+ * What the reader sees beside a repair stop: local wall time and the last row
+ * kept. Undefined on a v1 note. Never carries the raw ms or the incident id.
+ */
+export function historyIncidentStopLabel(note: HistoryStatusNote): string | undefined {
+  const row = historyIncidentLeftRowLabel(note);
+  if (row === undefined || note.openedAtWallMs === undefined) return undefined;
+  const at = new Date(note.openedAtWallMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const when = `${pad(at.getDate())}/${pad(at.getMonth() + 1)} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+  return `หยุดเมื่อ ${when} · ${row === 'none' ? 'ก่อนแถวแรก' : `แถวสุดท้าย ${row}`}`;
+}
+
 function copyRowId(value: Obj): NewarchRowId {
   const pane = value.pane as Obj;
   return {

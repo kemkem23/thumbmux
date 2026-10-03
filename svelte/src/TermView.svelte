@@ -37,6 +37,7 @@
     createHistoryWindow,
     historyContinuationFor,
     historyIncidentLeftRowLabel,
+    historyIncidentStopLabel,
     historyStatusNotes,
     historyWindowEndLine,
     historyWindowRequestCursor,
@@ -7570,6 +7571,7 @@
         </button>
       {/if}
       {#each historyStatus as note (note.key)}
+        {@const stopLabel = historyIncidentStopLabel(note)}
         <div
           class="mtv-loss-note mtv-history-status"
           role="note"
@@ -7579,10 +7581,13 @@
           data-history-opened-at={note.openedAtWallMs === undefined ? undefined : String(note.openedAtWallMs)}
           data-history-left-row={historyIncidentLeftRowLabel(note)}
           data-incident-id={note.incidentId}
-          aria-label={note.text}
+          aria-label={stopLabel ? `${note.text} · ${stopLabel}` : note.text}
           title={note.detail}
         >
           <span class="mtv-signpost-text">{note.text}</span>
+          {#if stopLabel}
+            <span class="mtv-signpost-text" data-testid="mtv-history-stop">{stopLabel}</span>
+          {/if}
         </div>
       {/each}
       {#if archiveUnavailable}
