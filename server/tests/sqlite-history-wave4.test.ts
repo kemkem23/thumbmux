@@ -905,7 +905,7 @@ describe('flag-on H durable rows gaps and sealed reclaim', () => {
       expect(result.allocatedBytesAfter).toBeLessThan(result.allocatedBytesBefore);expect(result.blockBytes).toBeGreaterThan(0);
       expect(existsSync(sealed.files[0]!.path)).toBe(false);expect(existsSync(sealed.manifest.path)).toBe(false);
       f.reopen();const replay=[];for await(const x of f.store.recover(hp,null,{isCancelled:()=>false}))replay.push(x);
-      expect(replay[0]!.status).toBe('error');expect(JSON.stringify(replay)).toContain('remote-required');
+      expect(replay).toHaveLength(1);expect(replay[0]!.status).toBe('error');expect(JSON.stringify(replay)).toContain('remote-required');
       const next=hrecord('after-seal',record,'suffix\n');expect(hvalue(await f.store.appendInput(next)).segmentId).not.toBe(ack!.segmentId);
     } finally {f.cleanup();}
   });
@@ -1021,5 +1021,42 @@ test('flag-on H interrupted seals do not accumulate unbounded staging across epo
     expect(existsSync(join(f.root,ack.segmentId+'.jsonl'))).toBe(false);
     expect((await hreplay(f.store)).length).toBe(2);
     expect(readdirSync(f.root).filter(p=>p.endsWith('.jsonl')).length).toBe(1);
+  }finally{f.cleanup();}
+});
+
+
+test('flag-on H replay from current durable cursor ignores older remote history and retains same-offset controls', async () => {
+  const f=hfixture({validateRemoteIndex:()=>true});
+  try {
+    const old=hrecord(),first=hvalue(await f.store.appendInput(old));hvalue(await f.store.commitRowsAndGaps(hrows(first)));
+    const fence={operationId:'seal-old',pane:hp,expectedGeneration:0,segmentId:first.segmentId};
+    const sealed=hvalue(await f.store.sealExport(fence));hvalue(await f.store.reclaimVerified({...fence,sealed,remote:hremote(sealed)}));
+    const next=hrecord('local-suffix',old,'new suffix\n'),ack=hvalue(await f.store.appendInput(next));
+    const rawControl={version:1 as const,operationId:'resize',sequence:next.sequence+1,previousDigest:next.digest,range:{...next.range,start:next.range.end},payload:{kind:'resize' as const,geometry:{columns:100,rows:24}}};
+    hvalue(await f.store.appendInput({...rawControl,digest:streamDigest('spool',rawControl)}));
+    const request=hrows(ack,'suffix-rows',0,['new suffix']);hvalue(await f.store.commitRowsAndGaps(request));f.reopen();
+    const replay=await hreplay(f.store,ack.through);expect(replay.map(x=>x.kind)).toEqual(['input','committed']);
+    expect(replay[0]).toMatchObject({kind:'input',record:{payload:{kind:'resize'}}});
+    expect(replay[1]).toMatchObject({kind:'committed',rows:request.rows});
+    const full=[];for await(const item of f.store.recover(hp,null,{isCancelled:()=>false}))full.push(item);expect(full).toHaveLength(1);expect(full[0]!.status).toBe('error');
+  }finally{f.cleanup();}
+});
+
+test('flag-on H kernel writer lock refuses another process and releases orphan replay pins after SIGKILL', async () => {
+  const f=hfixture();
+  try {
+    const ack=hvalue(await f.store.appendInput(hrecord()));
+    const source=JSON.stringify(join(import.meta.dir,'../src/history-engine.ts'));
+    const script=`import {FlagOnHistoryStore} from ${source};
+      try{const s=new FlagOnHistoryStore({root:${JSON.stringify(f.root)},mode:'recover',codecVersions:['test-v1']});s.close();process.exit(0);}
+      catch(e){console.error(String(e));process.exit(42);}`;
+    const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe'});
+    const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);expect(exit).toBe(42);expect(err).toMatch(/locked|busy/i);expect(out).toBe('');
+    f.store.close();
+    const kill=`import {FlagOnHistoryStore} from ${source};const s=new FlagOnHistoryStore({root:${JSON.stringify(f.root)},mode:'recover',codecVersions:['test-v1'],boundary(at){if(at==='replay-pin-after-commit')process.kill(process.pid,'SIGKILL');}});await s.recover(${JSON.stringify(hp)},null,{isCancelled:()=>false})[Symbol.asyncIterator]().next();`;
+    const killed=Bun.spawn([process.execPath,'-e',kill],{stdout:'pipe',stderr:'pipe'});
+    const [,ko,ke]=await Promise.all([killed.exited,new Response(killed.stdout).text(),new Response(killed.stderr).text()]);expect(killed.signalCode).toBe('SIGKILL');expect(ko).toBe('');expect(ke).toBe('');
+    f.reopen();expect((await hreplay(f.store)).length).toBe(1);
+    hvalue(await f.store.sealExport({operationId:'after-kill',pane:hp,expectedGeneration:0,segmentId:ack.segmentId}));
   }finally{f.cleanup();}
 });

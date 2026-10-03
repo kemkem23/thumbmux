@@ -761,11 +761,13 @@ CREATE TABLE fh_segment(id TEXT PRIMARY KEY, pane TEXT NOT NULL, state TEXT NOT 
  bytes INTEGER NOT NULL DEFAULT 0, next_row INTEGER NOT NULL DEFAULT 0, sealed TEXT, remote TEXT) STRICT;
 CREATE TABLE fh_epoch(epoch TEXT PRIMARY KEY, pane TEXT NOT NULL, offset INTEGER NOT NULL,
  sequence INTEGER NOT NULL, digest TEXT NOT NULL, segment TEXT NOT NULL) STRICT;
-CREATE TABLE fh_event(seq INTEGER PRIMARY KEY, pane TEXT NOT NULL, segment TEXT NOT NULL,
+CREATE TABLE fh_event(seq INTEGER PRIMARY KEY AUTOINCREMENT, pane TEXT NOT NULL, segment TEXT NOT NULL,
  kind TEXT NOT NULL, op TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload TEXT NOT NULL,
  receipt TEXT NOT NULL, checksum TEXT NOT NULL) STRICT;
 CREATE INDEX fh_event_pane ON fh_event(pane,seq);
 CREATE INDEX fh_event_segment ON fh_event(segment,seq);
+CREATE INDEX fh_input_cursor ON fh_event(pane,kind,json_extract(payload,'$.range.epoch.attachId'),
+ json_extract(payload,'$.range.epoch.collectorIncarnation'),json_extract(payload,'$.range.end'));
 CREATE TABLE fh_row_id(pane TEXT NOT NULL, segment TEXT NOT NULL, ordinal INTEGER NOT NULL,
  PRIMARY KEY(pane,segment,ordinal)) WITHOUT ROWID;
 CREATE TABLE fh_pin(id TEXT PRIMARY KEY, operation TEXT NOT NULL UNIQUE, segment TEXT NOT NULL,
@@ -822,6 +824,7 @@ function fhWrite(fd: number, text: string): void {
 
 export class FlagOnHistoryStore implements FlagOnHistoryPort {
   private readonly db: Database;
+  private readonly writerLock: Database;
   readonly root: string;
   readonly storeUUID: string;
   private closed = false;
@@ -830,18 +833,27 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
     this.root = resolve(options.root);
     fhSafePath(this.root);
     fhAssert(!fhPaths.has(this.root), 'one flag-on writer per root');
-    fhAssert((fhPaths.size+1)*2*1024*1024 <= B.diskCacheBytes, 'flag-on SQLite cache pool pressure');
+    fhAssert((fhPaths.size+1)*(2*1024*1024+64*1024) <= B.diskCacheBytes, 'flag-on SQLite cache pool pressure');
     const path = join(this.root, 'flag-on-v1.sqlite');
     for (const p of [path, path+'-wal', path+'-shm', path+'-journal']) fhSafePath(p);
     fhAssert(options.mode === 'create' ? !existsSync(path) : existsSync(path), 'explicit create/recover required');
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const db = new Database(path, { create: options.mode === 'create', strict: true });
+    // An OS-backed SQLite exclusive lock survives across our data commits and
+    // is released by the kernel on process death. It fences other host writers
+    // and proves old ephemeral replay pins have no live owner at reopen.
+    const lockPath = join(this.root,'flag-on-writer.sqlite');
+    for (const p of [lockPath,lockPath+'-journal',lockPath+'-wal',lockPath+'-shm']) fhSafePath(p);
+    const writerLock = new Database(lockPath,{create:true,strict:true});
+    let db: Database | undefined;
     try {
+      writerLock.exec('PRAGMA busy_timeout=0; PRAGMA cache_size=-64; PRAGMA mmap_size=0; PRAGMA journal_mode=DELETE; PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE IF NOT EXISTS fh_lock(id INTEGER PRIMARY KEY); BEGIN EXCLUSIVE; COMMIT;');
+      chmodSync(lockPath,0o600);
+      db = new Database(path, { create: options.mode === 'create', strict: true });
       if (options.mode === 'create') {
         db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
         db.transaction(() => {
-          db.exec(FLAGON_HISTORY_SCHEMA);
-          db.query('INSERT INTO fh_meta VALUES(1,?)').run(randomUUID());
+          db!.exec(FLAGON_HISTORY_SCHEMA);
+          db!.query('INSERT INTO fh_meta VALUES(1,?)').run(randomUUID());
         }).immediate();
       }
       const meta = db.query('SELECT * FROM fh_meta').get() as SqlRow;
@@ -850,12 +862,13 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
       db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA busy_timeout=0; PRAGMA journal_size_limit=0;');
       // DB + WAL growth is bounded; exported scratch is separately <=16 MiB.
       db.exec(`PRAGMA max_page_count=${Math.floor((FB.canaryRootCapBytes-FB.reserveBytes-FB.scratchBytes)/4096)};`);
-      this.db = db; this.storeUUID = meta.uuid;
+      db.query("DELETE FROM fh_pin WHERE payload='replay'").run();
+      this.db = db; this.writerLock = writerLock; this.storeUUID = meta.uuid;
       chmodSync(path, 0o600); fhSyncDir(this.root); fhSyncDir(dirname(this.root));
       fhPaths.add(this.root);
-    } catch (error) { db.close(); throw error; }
+    } catch (error) { db?.close(); writerLock.close(); throw error; }
   }
-  close(): void { if (!this.closed) { for (const release of this.replayReleases) release(); this.db.close(); this.closed = true; fhPaths.delete(this.root); } }
+  close(): void { if (!this.closed) { for (const release of this.replayReleases) release(); this.db.close(); this.writerLock.close(); this.closed = true; fhPaths.delete(this.root); } }
   private live(): void { fhAssert(!this.closed, 'flag-on store closed'); }
   private tx<T>(kind: string, fn: () => T): T {
     this.live(); this.options.boundary?.(kind+'-before-write');
@@ -1025,10 +1038,22 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         released = true; fhReaders.delete(readerKey); this.replayReleases.delete(release!); pinIds = [];
       };
       this.replayReleases.add(release);
+      // A durable raw cursor identifies the segment needed for recovery. Older
+      // remote segments belong to the read overlay, not to this replay suffix.
+      // Keep rows/checkpoints in the cursor's segment, including rows committed
+      // after that raw ACK. Reject arbitrary/forgotten offsets rather than skip.
+      let segmentFloor = 0;
+      if (after) {
+        fhAssert(equal(after.epoch.pane,pane), 'replay cursor pane'); safe(after.byteOffset);
+        const cursor = this.db.query("SELECT segment FROM fh_event WHERE pane=? AND kind='input' AND json_extract(payload,'$.range.epoch.attachId')=? AND json_extract(payload,'$.range.epoch.collectorIncarnation')=? AND json_extract(payload,'$.range.end')=? ORDER BY seq DESC LIMIT 1")
+          .get(key,after.epoch.attachId,after.epoch.collectorIncarnation,after.byteOffset) as SqlRow | null;
+        fhAssert(cursor, 'remote-required or unknown durable replay cursor');
+        segmentFloor = Number((this.db.query('SELECT rowid AS n FROM fh_segment WHERE id=?').get(String(cursor.segment)) as SqlRow).n);
+      }
       // Freeze a finite read boundary and durably pin all its segments in one
       // transaction. Yielding never holds a SQLite cursor/WAL reader open.
       const snapshot = this.tx('replay-pin', () => {
-        const segments = this.db.query('SELECT id,state FROM fh_segment WHERE pane=? LIMIT 4097').all(key) as SqlRow[];
+        const segments = this.db.query('SELECT id,state FROM fh_segment WHERE pane=? AND rowid>=? LIMIT 4097').all(key,segmentFloor) as SqlRow[];
         fhAssert(segments.length <= 4096, 'replay metadata bound');
         for (const s of segments) fhAssert(s.state !== 'reclaiming' && s.state !== 'remote', 'remote-required: restore segment before replay');
         for (const s of segments) {
@@ -1050,12 +1075,12 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
       for (;;) {
         this.live();
         if (cancel.isCancelled()) { yield {status:'cancelled',reason:'replay cancelled'}; return; }
-        const e = this.db.query('SELECT * FROM fh_event WHERE pane=? AND seq>? AND seq<=? ORDER BY seq LIMIT 1').get(key,cursor,snapshot) as SqlRow | null;
+        const e = this.db.query('SELECT * FROM fh_event WHERE pane=? AND seq>? AND seq<=? AND segment IN (SELECT id FROM fh_segment WHERE pane=? AND rowid>=?) ORDER BY seq LIMIT 1').get(key,cursor,snapshot,key,segmentFloor) as SqlRow | null;
         if (!e) break; cursor = Number(e.seq); this.checkEvent(e);
         const payload = JSON.parse(String(e.payload));
         if (e.kind === 'input') {
           const record = payload as SpoolRecord; digest('spool',record);
-          if (after && (cursor < firstEpochSeq || (equal(record.range.epoch,after.epoch) && record.range.end <= after.byteOffset))) continue;
+          if (after && (cursor < firstEpochSeq || (equal(record.range.epoch,after.epoch) && (record.range.end < after.byteOffset || record.payload.kind === 'bytes' && record.range.end === after.byteOffset)))) continue;
           yield ok({kind:'input',record,ack:JSON.parse(String(e.receipt))});
         } else if (e.kind === 'committed') {
           const r = payload as RowsAndGapsCommit; digest('rows-gaps',r);
@@ -1192,6 +1217,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
     for (const suffix of ['', '-wal','-shm']) { const p = join(this.root,'flag-on-v1.sqlite'+suffix); if (existsSync(p)) allocated += statSync(p).blocks*512; }
     const list = this.db.query("SELECT sealed FROM fh_segment WHERE sealed IS NOT NULL AND state!='remote'").all() as SqlRow[];
     for (const s of list) { const seal = JSON.parse(String(s.sealed)) as SealedExport; for (const f of [...seal.files,seal.manifest]) if (existsSync(f.path)) allocated += statSync(f.path).blocks*512; }
+    const lockPath = join(this.root,'flag-on-writer.sqlite'); if (existsSync(lockPath)) allocated += statSync(lockPath).blocks*512;
     const fs = statfsSync(this.root); return {allocated,free:fs.bfree,block:fs.bsize};
   }
 }

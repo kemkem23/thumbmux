@@ -241,6 +241,7 @@ test('contract repair mutants go red then restored real seams go green', async (
 test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin bypass', async () => {
   const pkg=resolve(import.meta.dir,'../..'),root=mkdtempSync(join(tmpdir(),'flagon-H-mutants-'));
   const mutations=[
+    {name:'replay-remote-prefix',pattern:'replay from current durable cursor',from:".all(key,segmentFloor) as SqlRow[];",to:".all(key,0) as SqlRow[];"},
     {name:'swallow-gap',pattern:'ACK then reopen',from:"gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))",to:"gaps:[],receipt:JSON.parse(String(e.receipt))"},
     {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
     {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);",to:'/* ACK without durable input */'},
