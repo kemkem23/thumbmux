@@ -433,6 +433,7 @@ export class StreamRuntimePane {
 // that depend on unknown state carry `uncertainFields` and are withheld by the
 // caller under a gap; nothing here invents cells or guesses a seam.
 
+import { semanticStyleToSgr, sgrToSemanticStyle } from './stream-contract';
 import type { Cell as FlagOnCell, PipeEpoch as FlagOnEpoch, RowOrigin as FlagOnOrigin,
   StitchRow as FlagOnStitchRow, Cursor as FlagOnCursor } from './stream-contract';
 
@@ -501,7 +502,7 @@ export class FlagOnVtDecoder {
       seed.screen.slice(0, options.geometry.rows).forEach((row, y) => {
         const line = screen.lines[y]!;
         line.cells = row.cells.slice(0, options.geometry.columns).map((cell, x) => ({ text: cell.text, width: cell.width,
-          style: [cell.style[0] ?? 0, cell.style[1] ?? -1, cell.style[2] ?? -1] as [number, number, number],
+          style: (() => { const s = sgrToSemanticStyle(cell.style); return [s.attrs, s.fg, s.bg] as [number, number, number]; })(),
           origin: row.cellOrigins[x] ?? row.cellOrigins[0] ?? row.origin }));
         // A blank captured row still is that row: tag it so its scroll-out is recognised.
         if (!line.cells.length && row.origin.kind === 'capture') line.cells = [];
@@ -659,7 +660,7 @@ export class FlagOnVtDecoder {
     const uncertain = new Set<string>([...line.uncertain, ...extra]);
     this.out.push({
       origin: { kind: 'pipe', range: { epoch: this.epoch, start: Math.min(start, at), end: at + 1 }, ordinal: this.ordinal++ },
-      cells: cells.filter(c => c.width !== 0).map(c => ({ text: c.text, width: c.width, style: c.style }) as FlagOnCell),
+      cells: cells.filter(c => c.width !== 0).map(c => ({ text: c.text, width: c.width, style: semanticStyleToSgr({ attrs: c.style[0], fg: c.style[1], bg: c.style[2] }) }) as FlagOnCell),
       geometry: this.geometry, buffer: 'normal', wrapStatus: line.wrapped ? 'wrapped' : 'unwrapped', wrapPad: 0,
       finalized: true, uncertainFields: [...uncertain].sort(),
       cellOrigins: cells.filter(c => c.width !== 0).map(c => c.origin),
@@ -835,7 +836,7 @@ export class FlagOnVtDecoder {
   screenRows(): FlagOnStitchRow[] {
     return this.screen.lines.map((line, y) => ({
       origin: { kind: 'pipe', range: { epoch: this.epoch, start: this.offset, end: this.offset }, ordinal: -1 - y },
-      cells: line.cells.filter(c => c.width !== 0).map(c => ({ text: c.text, width: c.width, style: c.style }) as FlagOnCell),
+      cells: line.cells.filter(c => c.width !== 0).map(c => ({ text: c.text, width: c.width, style: semanticStyleToSgr({ attrs: c.style[0], fg: c.style[1], bg: c.style[2] }) }) as FlagOnCell),
       geometry: this.geometry, buffer: this.alt ? 'alternate' : 'normal', wrapStatus: line.wrapped ? 'wrapped' : 'unwrapped',
       wrapPad: 0, finalized: false, uncertainFields: [...line.uncertain].sort(), cellOrigins: line.cells.filter(c => c.width !== 0).map(c => c.origin),
     }));
@@ -854,7 +855,7 @@ export class FlagOnVtDecoder {
     if (visible.regionTop !== this.top || visible.regionBottom !== this.bottom) return { verified: false, reason: 'margins' };
     const mine = this.screen.lines;
     for (let y = 0; y < this.geometry.rows; y++) {
-      const want = [...(visible.rows[y] ?? [])];
+      const want = (visible.rows[y] ?? []).map(c => { const s = sgrToSemanticStyle(c.style); return { ...c, style: [s.attrs, s.fg, s.bg] }; });
       const have = (mine[y]?.cells ?? []).filter(c => c.width !== 0);
       const trim = (cells: { text: string; style: readonly number[] }[]) => {
         const out = [...cells]; while (out.length && out.at(-1)!.text === ' ' && out.at(-1)!.style[0] === 0 && (out.at(-1)!.style[2] ?? -1) === -1) out.pop(); return out;
