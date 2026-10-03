@@ -531,7 +531,7 @@ class Assembly {
     return {
       version: 1, episodeId: this.episodeId, parentEpisodeId: null, pane: this.pane,
       leftRowId: left, rightSegmentId: this.segmentId, reason,
-      countKind: 'exact', missingCount: 0, withheldRows, lowerBound: 0,
+      countKind: 'unknown', missingCount: null, withheldRows, lowerBound: 0,
       openedAt: this.packet.startedAtMonoMs, closedAt: null, clockEpoch: this.packet.clockEpoch, quality: 'degraded',
       repair: {
         revision: 2, gapId: `c-${this.episodeId}-${sequence}-${reason}-${leftMark}`,
