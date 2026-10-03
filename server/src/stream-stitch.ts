@@ -534,8 +534,8 @@ class Assembly {
       countKind: 'unknown', missingCount: null, withheldRows, lowerBound: 0,
       openedAt: this.packet.startedAtMonoMs, closedAt: null, clockEpoch: this.packet.clockEpoch, quality: 'degraded',
       repair: {
-        revision: 2, gapId: `c-${this.episodeId}-same`,
-        sequence: 0, update: 0, state: 'open',
+        revision: 2, gapId: `c-${this.episodeId}-${sequence}-${reason}-${leftMark}`,
+        sequence, update: 0, state: 'open',
       },
     };
   }
