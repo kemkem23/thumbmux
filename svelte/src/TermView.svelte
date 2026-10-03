@@ -36,6 +36,7 @@
     applyHistoryWindowPage,
     createHistoryWindow,
     historyContinuationFor,
+    historyIncidentLeftRowLabel,
     historyStatusNotes,
     historyWindowEndLine,
     historyWindowRequestCursor,
@@ -7575,6 +7576,9 @@
           data-testid="mtv-history-status"
           data-history-state={note.kind}
           data-history-state-detail={note.detail}
+          data-history-opened-at={note.openedAtWallMs === undefined ? undefined : String(note.openedAtWallMs)}
+          data-history-left-row={historyIncidentLeftRowLabel(note)}
+          data-incident-id={note.incidentId}
           aria-label={note.text}
           title={note.detail}
         >
