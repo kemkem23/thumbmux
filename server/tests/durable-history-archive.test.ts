@@ -18,7 +18,15 @@ import type {
 
 let root = "";
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "thumbmux-durable-")); });
-afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  const writable = (dir: string) => {
+    chmodSync(dir, 0o700);
+    for (const entry of readdirSync(dir, { withFileTypes: true }))
+      if (entry.isDirectory()) writable(join(dir, entry.name));
+  };
+  writable(root);
+  rmSync(root, { recursive: true, force: true });
+});
 
 const SCREEN = ["+--+", "| >", "+--+", "hints", "tokens"];
 const OPTS = { paneRows: SCREEN.length, liveLineLimit: 10 };
