@@ -1098,3 +1098,70 @@ test('flag-on H SIGKILL covers checkpoint pin release and generation transaction
     }finally{f.cleanup();}
   }
 });
+
+// Repair H-r2: missing methods are reported as contract-conformance assertions,
+// never an import failure masquerading as a behavioral red.
+import type { FlagOnHistoryR2 } from '../src/stream-contract';
+function hr2(store: FlagOnHistoryStore): FlagOnHistoryR2 {
+  expect(typeof (store as unknown as FlagOnHistoryR2).rotateSegment).toBe('function');
+  return store as unknown as FlagOnHistoryR2;
+}
+function hplain(ack: SpoolAck, op: string, start = 0, texts = ['row']): RowsAndGapsCommit {
+  const {digest:_,...value}=hrows(ack,op,start,texts);
+  const body={...value,coverage:value.coverage.filter(c=>c.kind==='rows'),decision:{...value.decision,gaps:[]}};
+  return {...body,digest:streamDigest('rows-gaps',body)};
+}
+test('H-r2 rejects a gap whose left row never committed and accepts earlier same-transaction rows', async()=>{
+  const f=hfixture();try{
+    const ack=hvalue(await f.store.appendInput(hrecord()));
+    const {digest:_,...request}=hrows(ack,'dangling',0,[]);
+    const gap={...request.decision.gaps[0]!,leftRowId:{pane:hp,segmentId:ack.segmentId,rowOrdinal:42}};
+    const body={...request,coverage:[{kind:'gap' as const,gap,digest:streamDigest('gap',gap)}],decision:{...request.decision,gaps:[gap]}};
+    expect((await f.store.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)})).status).toBe('error');
+    const {digest:__,...positive}=hrows(ack,'same-tx');
+    const good={...gap,episodeId:'same-tx-gap',leftRowId:positive.rows[1]!.id};
+    const valid={...positive,coverage:[positive.coverage[1]!,{kind:'gap' as const,gap:good,digest:streamDigest('gap',good)}],decision:{...positive.decision,gaps:[good]}};
+    expect((await f.store.commitRowsAndGaps({...valid,digest:streamDigest('rows-gaps',valid)})).status).toBe('ok');
+  }finally{f.cleanup();}
+});
+test('H-r2 full 4501-row capture rotates without new input or a fabricated gap while remote is offline',async()=>{
+  const f=hfixture();try{
+    const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));let segment=ack.segmentId,start=0;
+    for(let n=0;n<4501;n+=128){
+      if(n && n%512===0){
+        const seam=hvalue(await port.rotateSegment({operationId:'rotate-'+n,pane:hp,expectedGeneration:0,segmentId:segment,boundary:ack.through}));
+        expect(seam.predecessor).toBe(segment);expect(seam.epoch).toEqual(ack.through.epoch);
+        segment=seam.successor;start=0;
+      }
+      const count=Math.min(128,4501-n),request=hplain(ack,'capture-'+n,start,Array.from({length:count},(_,i)=>'capture-'+(n+i)));
+      const {digest:_,...base}=request;
+      const rows=base.rows.map((row,i)=>({...row,id:{...row.id,segmentId:segment},origin:{kind:'capture' as const,snapshotId:'one-capture',rowIndex:n+i}}));
+      const coverage=[{kind:'rows' as const,range:{pane:hp,segmentId:segment,start,end:start+count},digest:streamDigest('rows',rows)}];
+      const body={...base,rows,coverage,decision:{...base.decision,acceptedRowMap:rows.map(row=>({source:row.origin,target:row.id}))}};
+      hvalue(await port.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)}));start+=count;
+    }
+    expect(hvalue(port.authority.head(hp)).rowCount).toBe(4501);
+    expect(hvalue(port.listSealed(null,256)).seals).toHaveLength(8);
+    f.reopen();const reopened=hr2(f.store);expect(hvalue(reopened.authority.head(hp)).entryCount).toBe(4501);
+    let cursor=null as import('../../core/src/protocol').NewarchHistoryCursor|null;const texts:string[]=[];
+    for(;;){const page=hvalue(reopened.authority.page({pane:hp,cursor,direction:'after',maxEntries:256,maxBytes:1024*1024}));
+      texts.push(...page.entries.map(e=>'cells' in e?e.cells.map(c=>c.text).join(''):'GAP'));
+      if(page.after.kind==='end')break;expect(page.after.kind).toBe('more');cursor=page.after.cursor;
+    }
+    expect(texts).toEqual(Array.from({length:4501},(_,i)=>'capture-'+i));
+  }finally{f.cleanup();}
+});
+test('H-r2 backlog larger than a segment rotates with continuous source offsets',async()=>{
+  const f=hfixture();try{const port=hr2(f.store);let previous:SpoolRecord|null=null;const segments=new Set<string>();
+    for(let i=0;i<80;i++){previous=hrecord('backlog-'+i,previous,'x'.repeat(60000));segments.add(hvalue(await port.appendInput(previous)).segmentId);}
+    expect(segments.size).toBeGreaterThan(1);
+    const records=(await hreplay(f.store)).filter(c=>c.kind==='input');expect(records).toHaveLength(80);
+    expect(records.map(c=>c.kind==='input'?c.record.range.start:-1)).toEqual(Array.from({length:80},(_,i)=>i*60000));
+  }finally{f.cleanup();}
+});
+test('H-r2 exposes bounded durable read checkpoint attach and reclaim ports',()=>{
+ const f=hfixture();try{const port=hr2(f.store);
+ for(const method of ['stageRows','sealAttachSet','publishAttach','discardAttach','journalControl','commitReplayCheckpoint','commitReplayDecision','sealSegment','materializeExport','reclaimR2','appendVerifiedInput'])expect(typeof (port as any)[method]).toBe('function');
+ for(const method of ['head','tail','page','watermark','decisions','receipt','staged','attachSet','generation','pin','seal','continuity'])expect(typeof (port.authority as any)[method]).toBe('function');
+ }finally{f.cleanup();}
+});
