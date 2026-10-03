@@ -455,15 +455,12 @@ export class StreamStitcher implements StitchPort {
     if (search.kind === 'limit') return { status: 'ambiguous', reason: 'candidate-limit', count: search.count };
     const { candidates } = search;
     if (candidates.length === 0) return { status: 'unproven', reason: 'content-only' };
-    if (candidates.length > 1) {
-      const longest = candidates.reduce((best, item) => item.overlap > best.overlap ? item : best);
-      return { status: 'ok', end: longest.end };
-    }
+    if (candidates.length > 1) return { status: 'ambiguous', reason: 'multiple-alignments', count: candidates.length };
     const only = candidates[0]!;
     const verdict = anchorVerdict(left, right, only, proofs.policy);
     if (verdict !== 'ok') return { status: 'unproven', reason: verdict };
-    // MUTANT M5: a unique reprint is accepted without a seam proof.
-    if (!proven()) return { status: 'ok', end: only.end };
+    // Unique content is a proposal, never proof of the same event (§4.2.4).
+    if (!proven()) return { status: 'unproven', reason: 'content-only' };
     return { status: 'ok', end: only.end };
   }
 }
