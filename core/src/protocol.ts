@@ -680,8 +680,17 @@ export interface NewarchIncidentR2 {
 }
 export type NewarchPressureR2 = Extract<NewarchHistoryState, { readonly kind: 'pressure' }>
   & { readonly repair: NewarchIncidentR2 };
+export type NewarchHistoryStateR2 =
+  | Exclude<NewarchHistoryState, { readonly kind: 'pressure' } | { readonly kind: 'gap' }>
+  | NewarchPressureR2 | { readonly kind: 'gap'; readonly gap: NewarchGapR2 };
+export type NewarchHistoryContinuationR2 =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchHistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchHistoryCursor;
+      readonly state: Exclude<NewarchHistoryStateR2, { readonly kind: 'exact' }> };
 export interface NewarchHistoryRepairR2 extends NewarchHistoryExtension {
   readonly repair: NewarchRepairCapabilities;
-  readonly states: readonly (Exclude<NewarchHistoryState, { readonly kind: 'pressure' } | { readonly kind: 'gap' }>
-    | NewarchPressureR2 | { readonly kind: 'gap'; readonly gap: NewarchGapR2 })[];
+  readonly states: readonly NewarchHistoryStateR2[];
+  readonly before: NewarchHistoryContinuationR2;
+  readonly after: NewarchHistoryContinuationR2;
 }
