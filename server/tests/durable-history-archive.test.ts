@@ -286,11 +286,10 @@ async function manifestFor(remote: RcloneRemote, segmentId: string): Promise<Rem
 }
 
 test("DS-02 synthetic remote → verify → local delete → empty-root restore reads every row, gap and hash back", async () => {
-  const T0 = performance.now(); const mark = (l: string) => console.error(`PROFILE ${l} ${(performance.now() - T0).toFixed(0)}ms`);
   const { store, remoteDir, h, worker } = dsSetup();
   const before = Object.fromEntries(["seg-0001", "seg-0002"].flatMap((id) =>
     ["rows.jsonl", "gaps.jsonl", "export.json"].map((n) => [`${id}/${n}`, sha(readFileSync(join(h.segDir(id), n)))])));
-  mark("setup"); await archiveAll(worker, 2); mark("archiveAll");
+  await archiveAll(worker, 2);
 
   // K inventory: relative members, repair revision 2, and a bundle manifest that is not the seal manifest.
   const journals = readdirSync(join(store, "archive", "ops")).filter((name) => name.endsWith(".json")).map((name) =>
@@ -318,7 +317,7 @@ test("DS-02 synthetic remote → verify → local delete → empty-root restore 
   expect(files.filter((f) => f.startsWith(`${DS_STORE}/inventory/`)).length).toBe(2);
 
   // Restore with the real CLI into an empty root, finding the bundle from the remote inventory only.
-  mark("asserts"); const target = emptyRoot();
+  const target = emptyRoot();
   const cli = Bun.spawnSync([process.execPath, CLI, "restore", "--remote", `:local:${remoteDir}`, "--store", DS_STORE, "--root", target,
     "--pane", JSON.stringify(DS_PANE), "--segment", "seg-0001", "--start", "0", "--end", "5"], { stdout: "pipe", stderr: "pipe" });
   expect(cli.stderr.toString()).toBe("");
@@ -336,7 +335,7 @@ test("DS-02 synthetic remote → verify → local delete → empty-root restore 
   }
 
   // The second segment through the library, repeated rows kept with their count; a repeat restore is idempotent.
-  mark("cli+asserts"); const remote = new RcloneRemote({ location: `:local:${remoteDir}` });
+  const remote = new RcloneRemote({ location: `:local:${remoteDir}` });
   const req = { operationId: "r2", storeUUID: DS_STORE, range: { pane: DS_PANE, segmentId: "seg-0002", start: 0, end: 5 },
     inventory: await manifestFor(remote, "seg-0002"), allowedRoot: target };
   const second = await restoreRangeFromRemote(req, NEVER, { remote });
@@ -347,7 +346,7 @@ test("DS-02 synthetic remote → verify → local delete → empty-root restore 
     expect(sha(readFileSync(ev.path))).toBe(ev.sha256);
   }
   expect(statSync(join(target, "restore-cache", second.value.cacheId)).mode & 0o222).toBe(0);
-  mark("library-restore"); const again = await restoreRangeFromRemote(req, NEVER, { remote }); mark("again");
+  const again = await restoreRangeFromRemote(req, NEVER, { remote });
   expect(again.status === "ok" && again.value.cacheId).toBe(second.value.cacheId);
   // A range the bundle does not cover is refused rather than answered with an empty page.
   const outside = await restoreRangeFromRemote({ ...req, range: { ...req.range, start: 4, end: 9 } }, NEVER, { remote });
