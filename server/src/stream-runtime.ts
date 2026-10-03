@@ -480,6 +480,9 @@ export class FlagOnVtDecoder {
   private esc: { kind: 'esc' | 'csi' | 'osc' | 'str' | 'charset'; buf: number[]; start: number } | null = null;
   private ordinal = 0;
   private offset = 0;
+  /** A geometry break has no exact mapping. Further bytes advance the offset
+   * so the next pull does not throw, and they never become rows. */
+  private halted = false;
   private readonly scrollOnClear: boolean;
   /** Finalized rows waiting for `take()`. */
   private out: FlagOnStitchRow[] = [];
@@ -530,6 +533,7 @@ export class FlagOnVtDecoder {
   /** Feed acknowledged raw bytes starting at collector offset `start`. */
   feed(bytes: ArrayLike<number>, start: number): void {
     if (start !== this.offset) throw Error(`decoder offset ${this.offset} fed ${start}`);
+    if (this.halted) { this.offset = start + bytes.length; return; }
     if (this.proven[0] === start) { this.proven.shift(); this.clearProven(); }
     for (let i = 0; i < bytes.length; i++) {
       this.byte(bytes[i]!, start + i);
@@ -877,15 +881,12 @@ export class FlagOnVtDecoder {
     for (const field of ['cursor', 'margins', 'charset', 'pendingUtf8', 'pendingEscape', 'wrap', 'unsupported-sequence', 'geometry', 'sgr'] as const) this.unknown.delete(field);
     for (const line of this.screen.lines) line.uncertain.clear();
   }
-  /** Geometry changed without a mapping: rows keep their cells but become unknown. */
+  /** Geometry changed without a mapping. Do not shift or truncate: a shortened
+   * row must not be committed as exact. The caller falls back to legacy. */
   resize(geometry: Geometry): void {
-    const resizeScreen = (s: Screen) => {
-      while (s.lines.length > geometry.rows) { s.lines.shift(); }
-      while (s.lines.length < geometry.rows) s.lines.push(this.blankLine());
-      for (const line of s.lines) { line.cells.length = Math.min(line.cells.length, geometry.columns); line.uncertain.add('geometry'); }
-      s.cursor = { x: Math.min(s.cursor.x, geometry.columns - 1), y: Math.min(s.cursor.y, geometry.rows - 1) };
-    };
-    this.geometry = geometry; resizeScreen(this.normal); if (this.alt) resizeScreen(this.alt);
-    this.top = 0; this.bottom = geometry.rows - 1; this.unknown.add('geometry'); this.unknown.add('cursor');
+    this.halted = true;
+    this.geometry = geometry;
+    this.unknown.add('geometry');
+    this.unknown.add('cursor');
   }
 }
