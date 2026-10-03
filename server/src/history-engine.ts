@@ -756,7 +756,7 @@ export class StreamArchiveRowReader {
 
 const FLAGON_HISTORY_SCHEMA = `
 CREATE TABLE fh_meta(version INTEGER NOT NULL CHECK(version=1), uuid TEXT NOT NULL);
-CREATE TABLE fh_pane(pane TEXT PRIMARY KEY, generation INTEGER NOT NULL) STRICT;
+CREATE TABLE fh_pane(pane TEXT PRIMARY KEY, generation INTEGER NOT NULL, active_epoch TEXT) STRICT;
 CREATE TABLE fh_segment(id TEXT PRIMARY KEY, pane TEXT NOT NULL, state TEXT NOT NULL,
  bytes INTEGER NOT NULL DEFAULT 0, next_row INTEGER NOT NULL DEFAULT 0, sealed TEXT, remote TEXT) STRICT;
 CREATE TABLE fh_epoch(epoch TEXT PRIMARY KEY, pane TEXT NOT NULL, offset INTEGER NOT NULL,
@@ -789,6 +789,7 @@ export interface FlagOnHistoryOptions {
 const FH_RECORD_MAX = B.decodeBytes;
 const FH_SEGMENT_MAX = FB.archiveChunkBytes / 2;
 const fhPaths = new Set<string>();
+const fhReaders = new Set<string>();
 function fhAssert(test: unknown, message: string): asserts test { if (!test) throw Error(message); }
 function fhSafePath(path: string): void {
   let current: string = sep;
@@ -824,10 +825,12 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
   readonly root: string;
   readonly storeUUID: string;
   private closed = false;
+  private readonly replayReleases = new Set<() => void>();
   constructor(private readonly options: FlagOnHistoryOptions) {
     this.root = resolve(options.root);
     fhSafePath(this.root);
     fhAssert(!fhPaths.has(this.root), 'one flag-on writer per root');
+    fhAssert((fhPaths.size+1)*2*1024*1024 <= B.diskCacheBytes, 'flag-on SQLite cache pool pressure');
     const path = join(this.root, 'flag-on-v1.sqlite');
     for (const p of [path, path+'-wal', path+'-shm', path+'-journal']) fhSafePath(p);
     fhAssert(options.mode === 'create' ? !existsSync(path) : existsSync(path), 'explicit create/recover required');
@@ -852,7 +855,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
       fhPaths.add(this.root);
     } catch (error) { db.close(); throw error; }
   }
-  close(): void { if (!this.closed) { this.db.close(); this.closed = true; fhPaths.delete(this.root); } }
+  close(): void { if (!this.closed) { for (const release of this.replayReleases) release(); this.db.close(); this.closed = true; fhPaths.delete(this.root); } }
   private live(): void { fhAssert(!this.closed, 'flag-on store closed'); }
   private tx<T>(kind: string, fn: () => T): T {
     this.live(); this.options.boundary?.(kind+'-before-write');
@@ -869,7 +872,8 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
       const old = this.db.query('SELECT generation FROM fh_pane WHERE pane=?').get(key) as SqlRow | null;
       fhAssert(!this.db.query("SELECT 1 FROM fh_segment WHERE pane=? AND state='reclaiming'").get(key), 'reclaim in progress');
       fhAssert(old ? old.generation === expected && next > Number(old.generation) : expected === null, 'owner generation CAS');
-      this.db.query('INSERT OR REPLACE INTO fh_pane VALUES(?,?)').run(key,next);
+      if (old) this.db.query('UPDATE fh_pane SET generation=? WHERE pane=?').run(next,key);
+      else this.db.query('INSERT INTO fh_pane VALUES(?,?,NULL)').run(key,next);
     });
   }
   private fence(r: OperationFence): string {
@@ -903,7 +907,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
   }
   async appendInput(record: SpoolRecord): Promise<Result<SpoolAck>> {
     try {
-      this.live(); nonempty(record.operationId); digest('spool',record);
+      this.live(); nonempty(record.operationId);
       fhAssert(record.version === 1, 'unsupported spool version');
       const range = record.range, key = paneKey(range.epoch.pane), epoch = streamCanonical(range.epoch);
       nonempty(range.epoch.attachId); nonempty(range.epoch.collectorIncarnation);
@@ -917,12 +921,14 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         if (record.payload.kind === 'resize') geometry(record.payload.geometry);
         else fhAssert(record.payload.kind === 'control' && typeof record.payload.data === 'string', 'invalid control');
       }
-      fhAssert(bytes(record) <= FH_RECORD_MAX, 'raw encoded record bound');
+      fhAssert(bytes(record) <= FH_RECORD_MAX, 'raw encoded record bound'); digest('spool',record);
       return ok(this.tx('input', () => {
         const prior = this.event(record.operationId);
         if (prior) { this.checkEvent(prior); fhAssert(prior.kind === 'input' && prior.digest === record.digest, 'operation collision'); return JSON.parse(String(prior.receipt)) as SpoolAck; }
-        fhAssert(this.db.query('SELECT 1 FROM fh_pane WHERE pane=?').get(key), 'pane generation not registered');
+        const pane = this.db.query('SELECT * FROM fh_pane WHERE pane=?').get(key) as SqlRow | null;
+        fhAssert(pane, 'pane generation not registered');
         const last = this.db.query('SELECT * FROM fh_epoch WHERE epoch=?').get(epoch) as SqlRow | null;
+        fhAssert(!last || pane.active_epoch === epoch, 'stale pipe epoch');
         fhAssert(last ? last.offset === range.start && Number(last.sequence)+1 === record.sequence && last.digest === record.previousDigest
           : range.start === 0 && record.sequence === 0 && record.previousDigest === null, 'raw sequence/offset/digest discontinuity');
         let segmentId = last ? String(last.segment) : streamDigest('flag-on-segment',{epoch,first:record.operationId});
@@ -931,13 +937,14 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         const ack: SpoolAck = { kind:'synced-spool',version:1,through:{epoch:range.epoch,byteOffset:range.end},recordDigest:record.digest,commitId:record.operationId,segmentId };
         this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack);
         this.db.query('INSERT OR REPLACE INTO fh_epoch VALUES(?,?,?,?,?,?)').run(epoch,key,range.end,record.sequence,record.digest,segmentId);
+        this.db.query('UPDATE fh_pane SET active_epoch=? WHERE pane=?').run(epoch,key);
         return ack;
       }));
     } catch(e) { return fail(e); }
   }
   async commitRowsAndGaps(r: RowsAndGapsCommit): Promise<Result<RowsAndGapsReceipt>> {
     try {
-      digest('rows-gaps',r); fhAssert(bytes(r) <= FH_RECORD_MAX && r.rows.length <= B.decodeRows, 'rows batch bound');
+      fhAssert(r.rows.length <= B.decodeRows && bytes(r) <= FH_RECORD_MAX, 'rows batch bound'); digest('rows-gaps',r);
       return ok(this.tx('rows', () => {
         const key = this.fence(r), old = this.event(r.operationId);
         if (old) { this.checkEvent(old); fhAssert(old.kind === 'committed' && old.digest === r.digest, 'operation collision'); return JSON.parse(String(old.receipt)) as RowsAndGapsReceipt; }
@@ -947,13 +954,18 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         if (r.checkpointId !== null) {
           const cp = this.db.query('SELECT * FROM fh_checkpoint WHERE id=?').get(r.checkpointId) as SqlRow | null;
           fhAssert(cp && cp.pane === key && cp.segment === segment.id, 'checkpoint missing or outside segment');
+          const cpAck = JSON.parse(String(cp.ack)) as SpoolAck;
+          fhAssert(equal(cpAck.through.epoch,r.inputAck.through.epoch) && cpAck.through.byteOffset <= r.inputAck.through.byteOffset && cp.checksum === streamDigest('checkpoint-payload',JSON.parse(String(cp.payload))), 'checkpoint reference integrity');
         }
         let ordinal = Number(segment.next_row);
         for (const row of r.rows) {
           fhAssert(equal(row.id.pane,r.pane) && row.id.segmentId === segment.id && row.id.rowOrdinal === ordinal++, 'row identity/order');
           geometry(row.geometry); content({ cells:row.cells,softWrap:row.wrapStatus==='wrapped',wrapPad:row.wrapPad,uncertainFields:row.uncertainFields });
           fhAssert(row.finalized && row.uncertainFields.length === 0, 'unverified row');
-          if (row.origin.kind === 'pipe') fhAssert(equal(row.origin.range.epoch,r.inputAck.through.epoch) && row.origin.range.start >= 0 && row.origin.range.end <= r.inputAck.through.byteOffset, 'row outside acknowledged input');
+          if (row.origin.kind === 'pipe') {
+            [row.origin.range.start,row.origin.range.end,row.origin.ordinal].forEach(safe);
+            fhAssert(equal(row.origin.range.epoch,r.inputAck.through.epoch) && row.origin.range.end >= row.origin.range.start && row.origin.range.end <= r.inputAck.through.byteOffset, 'row outside acknowledged input');
+          }
         }
         let covered = 0; const gaps: unknown[] = [];
         for (const c of r.coverage) {
@@ -964,6 +976,9 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
             fhAssert(rows.length === range.end-range.start && c.digest === streamDigest('rows',rows), 'row coverage digest'); covered += rows.length;
           } else {
             const g = c.gap; safe(g.withheldRows); safe(g.lowerBound);
+            nonempty(g.episodeId); nonempty(g.clockEpoch);
+            fhAssert(Number.isFinite(g.openedAt) && g.openedAt >= 0 && (g.closedAt === null || Number.isFinite(g.closedAt) && g.closedAt >= g.openedAt), 'gap time range');
+            fhAssert(g.leftRowId === null || equal(g.leftRowId.pane,r.pane), 'gap left pane');
             fhAssert(g.version === 1 && equal(g.pane,r.pane) && (g.rightSegmentId === null || g.rightSegmentId === segment.id), 'gap identity');
             fhAssert(g.countKind === 'unknown' ? g.missingCount === null : (g.countKind === 'exact' || g.countKind === 'estimate') && Number.isSafeInteger(g.missingCount) && g.missingCount >= 0, 'unknown is not zero');
             fhAssert(c.digest === streamDigest('gap',g), 'gap digest'); gaps.push(g);
@@ -997,9 +1012,19 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
     } catch(e) { return fail(e); }
   }
   async *recover(pane: PaneKey, after: RawPosition | null, cancel: CancelToken): AsyncIterable<Result<FlagOnRecoveryChunk>> {
-    let pinIds: string[] = [];
+    let pinIds: string[] = []; let release: (() => void) | undefined;
     try {
-      this.live(); const key = paneKey(pane);
+      this.live(); const key = paneKey(pane), readerKey = this.root+'|'+key;
+      fhAssert(this.db.query('SELECT 1 FROM fh_pane WHERE pane=?').get(key), 'unknown replay pane');
+      if (fhReaders.size >= B.activeReadsGlobal || fhReaders.has(readerKey)) { yield busy(); return; }
+      fhReaders.add(readerKey);
+      let released = false;
+      release = () => {
+        if (released) return;
+        this.db.transaction(() => { for (const id of pinIds) this.db.query('DELETE FROM fh_pin WHERE id=?').run(id); }).immediate();
+        released = true; fhReaders.delete(readerKey); this.replayReleases.delete(release!); pinIds = [];
+      };
+      this.replayReleases.add(release);
       // Freeze a finite read boundary and durably pin all its segments in one
       // transaction. Yielding never holds a SQLite cursor/WAL reader open.
       const snapshot = this.tx('replay-pin', () => {
@@ -1023,6 +1048,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
         // a crash after raw ACK but before row publication cannot hide rows.
       }
       for (;;) {
+        this.live();
         if (cancel.isCancelled()) { yield {status:'cancelled',reason:'replay cancelled'}; return; }
         const e = this.db.query('SELECT * FROM fh_event WHERE pane=? AND seq>? AND seq<=? ORDER BY seq LIMIT 1').get(key,cursor,snapshot) as SqlRow | null;
         if (!e) break; cursor = Number(e.seq); this.checkEvent(e);
@@ -1039,8 +1065,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryPort {
       }
     } catch(e) { yield fail(e); }
     finally {
-      if (!this.closed) this.db.transaction(() => { for (const id of pinIds) this.db.query('DELETE FROM fh_pin WHERE id=?').run(id); }).immediate();
-      pinIds = [];
+      release?.();
     }
   }
   async pinSegment(r: PinRequest): Promise<Result<SegmentPin>> {

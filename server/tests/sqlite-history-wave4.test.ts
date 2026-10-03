@@ -901,6 +901,7 @@ describe('flag-on H durable rows gaps and sealed reclaim', () => {
       const corrupt=hremote(sealed);const bad={...corrupt,coverage:[]};
       expect((await f.store.reclaimVerified({...fence,sealed,remote:bad})).status).toBe('error');
       const result=hvalue(await f.store.reclaimVerified({...fence,sealed,remote:hremote(sealed)}));
+      console.log('FLAGON_H_RECLAIM_BLOCKS',JSON.stringify(result));
       expect(result.allocatedBytesAfter).toBeLessThan(result.allocatedBytesBefore);expect(result.blockBytes).toBeGreaterThan(0);
       expect(existsSync(sealed.files[0]!.path)).toBe(false);expect(existsSync(sealed.manifest.path)).toBe(false);
       f.reopen();const replay=[];for await(const x of f.store.recover(hp,null,{isCancelled:()=>false}))replay.push(x);
@@ -967,4 +968,41 @@ test('flag-on H checkpoint is durable and its reference cannot point at a missin
     hvalue(await f.store.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)}));f.reopen();
     const chunks=await hreplay(f.store);expect(chunks.map(x=>x.kind)).toEqual(['input','checkpoint','committed']);expect(chunks[1]).toEqual({kind:'checkpoint',checkpoint});
   }finally{f.cleanup();}
+});
+
+test('flag-on H stale epoch cannot append after rebind and readers have a fixed global budget', async () => {
+  const f=hfixture();
+  try {
+    const old=hrecord(),ack=hvalue(await f.store.appendInput(old));
+    const {digest:_,...value}=hrecord('new-epoch');const next={...value,range:{...value.range,epoch:{...value.range.epoch,attachId:'new-attach'}}};
+    hvalue(await f.store.appendInput({...next,digest:streamDigest('spool',next)}));
+    expect((await f.store.appendInput(hrecord('late-callback',old))).status).toBe('error');
+    expect(hvalue(await f.store.appendInput(old))).toEqual(ack);
+    const read=f.store.recover(hp,null,{isCancelled:()=>false})[Symbol.asyncIterator]();expect((await read.next()).done).toBe(false);
+    const concurrent=f.store.recover(hp,null,{isCancelled:()=>false})[Symbol.asyncIterator]();expect((await concurrent.next()).value).toMatchObject({status:'busy'});await concurrent.return?.();
+    f.reopen();await read.return?.();expect((await hreplay(f.store)).length).toBe(2);
+  }finally{f.cleanup();}
+});
+
+test('flag-on H SIGKILL during seal and reclaim retains verifiable inventory and retry state', async () => {
+  for (const phase of ['seal-before-write','seal-before-fsync','seal-before-rename','seal-before-commit','seal-after-commit',
+    'reclaim-before-write','reclaim-before-commit','reclaim-after-commit','reclaim-before-unlink','reclaim-after-unlink',
+    'reclaim-rows-before-write','reclaim-rows-before-commit','reclaim-rows-after-commit']) {
+    const f=hfixture({validateRemoteIndex:()=>true});
+    try {
+      const ack=hvalue(await f.store.appendInput(hrecord()));hvalue(await f.store.commitRowsAndGaps(hrows(ack)));
+      const request={operationId:'seal',pane:hp,expectedGeneration:0,segmentId:ack.segmentId};
+      const sealed=phase.startsWith('reclaim')?hvalue(await f.store.sealExport(request)):null;
+      const argument=sealed?{...request,sealed,remote:hremote(sealed)}:request;f.store.close();
+      const script=`import {FlagOnHistoryStore} from ${JSON.stringify(join(import.meta.dir,'../src/history-engine.ts'))};
+        const store=new FlagOnHistoryStore({root:${JSON.stringify(f.root)},mode:'recover',codecVersions:['test-v1'],validateRemoteIndex:()=>true,boundary(at){if(at===${JSON.stringify(phase)})process.kill(process.pid,'SIGKILL');}});
+        console.log(JSON.stringify(await store.${sealed?'reclaimVerified':'sealExport'}(${JSON.stringify(argument)})));store.close();`;
+      const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe'});
+      const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+      expect(child.signalCode).toBe('SIGKILL');expect(exit).not.toBe(0);expect(stdout).not.toContain('"status":"ok"');expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+      f.reopen();const recoveredSeal=sealed??hvalue(await f.store.sealExport(request));
+      if(!sealed){const data=readFileSync(recoveredSeal.files[0]!.path,'utf8');expect(data).toContain('rows-0');expect(data).toContain('missingCount');}
+      hvalue(await f.store.reclaimVerified({...request,sealed:recoveredSeal,remote:hremote(recoveredSeal)}));expect(existsSync(recoveredSeal.files[0]!.path)).toBe(false);
+    }finally{f.cleanup();}
+  }
 });
