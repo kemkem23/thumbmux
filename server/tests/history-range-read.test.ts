@@ -720,6 +720,96 @@ test("NEWARCH D: a display not negotiated for flag-on refuses an envelope instea
   expect(result).toEqual({ status: "error", code: "unsupported", message: "display was not negotiated for flag-on history states" });
 });
 
+test("NEWARCH D-fix R18/R13: repair pressure keeps backend time and row, and remote is not EOF", async () => {
+  const wallMs = 1_700_000_000_123;
+  const incidentId = "incident-storage-7";
+  const leftRow = { pane: DISPLAY_PANE, segmentId: "seg-9", rowOrdinal: 41 };
+  const repairCaps = { revision: 2, supported: ["incident-r2", "timeline-replay-r2"], required: ["incident-r2"] };
+  const incident = {
+    revision: 2 as const, incidentId, pane: DISPLAY_PANE, leftRowId: leftRow,
+    openedAtWallMs: wallMs, openedAtMonoMs: 80, clockEpoch: "clock-d",
+    collecting: false as const, reason: "storage-outage" as const, quality: "degraded" as const,
+    resolvedAtWallMs: null,
+  };
+  const remoteCursor = { version: 1 as const, token: "opaque-remote-T" };
+  const repairPage = (pressure: Record<string, unknown>): NewarchHistoryExtension => ({
+    ...flagOnExtension(),
+    states: [pressure as never],
+    before: {
+      kind: "blocked",
+      cursor: remoteCursor,
+      state: { kind: "remote-required", range: { pane: DISPLAY_PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-0" },
+    },
+    repair: repairCaps,
+  } as NewarchHistoryExtension);
+
+  const missing = await flagOnHarness(view => ({
+    ...displayPage(view, "prefix-row"),
+    hasMoreBefore: true,
+    flagOn: repairPage({ kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 5 }),
+  }));
+  expect(missing.result.status).toBe("error");
+  if (missing.result.status === "error") expect(missing.result.code).toBe("integrity");
+  expect(missing.h.released).toEqual([{ requestId: "flag-request", reason: "invalid-flag-on" }]);
+
+  const zeroRow = await flagOnHarness(view => ({
+    ...displayPage(view, "prefix-row"),
+    hasMoreBefore: true,
+    flagOn: repairPage({
+      kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 5,
+      repair: { ...incident, leftRowId: 0 },
+    }),
+  }));
+  expect(zeroRow.result.status).toBe("error");
+
+  const kept = await flagOnHarness(view => ({
+    ...displayPage(view, "prefix-row"),
+    hasMoreBefore: true,
+    flagOn: repairPage({
+      kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 5, repair: incident,
+    }),
+  }));
+  expect(kept.result.status).toBe("ok");
+  if (kept.result.status !== "ok") return;
+  expect(kept.result.value.hasMoreBefore).toBe(true);
+  expect(kept.result.value.flagOn?.before).toEqual({
+    kind: "blocked",
+    cursor: remoteCursor,
+    state: { kind: "remote-required", range: { pane: DISPLAY_PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-0" },
+  });
+  const pressure = kept.result.value.flagOn?.states.find(state => state.kind === "pressure") as {
+    repair?: { openedAtWallMs?: number; leftRowId?: unknown; incidentId?: string };
+  };
+  expect(pressure.repair?.openedAtWallMs).toBe(wallMs);
+  expect(pressure.repair?.leftRowId).toEqual(leftRow);
+  expect(pressure.repair?.incidentId).toBe(incidentId);
+  expect(Object.isFrozen(kept.result.value.flagOn)).toBe(true);
+  const dumped = JSON.stringify(kept.result.value.fragments);
+  expect(dumped).not.toContain(incidentId);
+  expect(dumped).not.toContain(String(wallMs));
+  expect(dumped).not.toContain("หยุดเก็บประวัติ");
+  expect(dumped).not.toContain("ประวัติช่วงนี้อยู่ในคลังสำรอง");
+
+  const beforeFirst = await flagOnHarness(view => ({
+    ...displayPage(view, "prefix-row"),
+    fragments: [],
+    payloadBytes: 0,
+    hasMoreBefore: true,
+    flagOn: repairPage({
+      kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 5,
+      repair: { ...incident, leftRowId: null },
+    }),
+  }));
+  expect(beforeFirst.result.status).toBe("ok");
+  if (beforeFirst.result.status !== "ok") return;
+  const nullPressure = beforeFirst.result.value.flagOn?.states.find(state => state.kind === "pressure") as {
+    repair?: { leftRowId?: unknown };
+  };
+  expect(nullPressure.repair?.leftRowId).toBeNull();
+  expect(beforeFirst.result.value.hasMoreBefore).toBe(true);
+  expect(beforeFirst.result.value.flagOn?.before.kind).toBe("blocked");
+});
+
 test("NEWARCH D: a history that stays busy returns busy, never an empty EOF page", async () => {
   const h = displayHarness();
   let calls = 0;
