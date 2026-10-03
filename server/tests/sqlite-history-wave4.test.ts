@@ -1167,7 +1167,7 @@ test('H-r2 exposes bounded durable read checkpoint attach and reclaim ports',()=
 });
 
 import { streamCanonical, attachReceiptSetDigest, orderedControlDigest, archiveInventoryDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest } from '../src/stream-contract';
-import type { AttachDecisionR2, AttachReceiptSetR2, StagedRowsR2, CatalogAuthorityR2, ReplayWatermarkR2, ArchiveInventoryR2, RemoteIndexR2, CoalescedInputR2 } from '../src/stream-contract';
+import type { AttachDecisionR2, AttachReceiptSetR2, StagedRowsR2, CatalogAuthorityR2, ReplayWatermarkR2, ArchiveInventoryR2, RemoteIndexR2, CoalescedInputR2, OrderedControlR2, NewarchHistoryCursor } from '../src/stream-contract';
 const hcatalog=(attach:()=>AttachDecisionR2|null=()=>null,remote:()=>RemoteIndexR2|null=()=>null):CatalogAuthorityR2=>({attach:()=>({status:'ok',value:attach()}),remote:()=>({status:'ok',value:remote()}),switchDecision:()=>({status:'ok',value:null})});
 function hstage(ack:SpoolAck,n:number):StagedRowsR2 {
   const {digest:_,...base}=hplain(ack,'stage-'+n,n*2,['candidate-'+n+'a','candidate-'+n+'b']);
@@ -1245,6 +1245,44 @@ test('H-r2 checkpoint pins block reclaim; successor preserves resize state decis
    const page=hvalue(recovered.authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));expect(page.after.kind).toBe('blocked');if(page.after.kind==='blocked')expect(page.after.state.kind).toBe('remote-required');
    expect(hvalue(recovered.authority.tail(hp,512,1024*1024)).kind).toBe('blocked');
  }finally{f.cleanup();}
+});
+test('H-r2 authority.controls reads journaled controls after reopen inside the watermark bound',async()=>{
+  const f=hfixture();
+  try{
+    const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord())),at=ack.through;
+    const journal=async(operationId:string,eventId:string,order:number,payload:OrderedControlR2['payload'])=>{
+      const body={revision:2 as const,eventId,position:at,order,decoderVersion:'test-v1',payload};
+      const event={...body,digest:orderedControlDigest(body)};
+      hvalue(await port.journalControl({pane:hp,expectedGeneration:0,operationId,event}));
+      return event;
+    };
+    const atWatermark=await journal('control-at','resize-at-watermark',1,{kind:'geometry',before:{columns:80,rows:24},after:{columns:41,rows:30}});
+    const afterA=await journal('control-a','mode-after',2,{kind:'control',name:'DECSET',data:'?1049'});
+    const afterB=await journal('control-b','resize-after',3,{kind:'geometry',before:{columns:41,rows:30},after:{columns:100,rows:40}});
+    const cp=hcheckpoint(ack,'controls-cp'),watermark=hwatermark(f,ack,cp);
+    expect(watermark.controlOrder).toBe(1);
+    hvalue(await port.commitReplayCheckpoint({pane:hp,expectedGeneration:0,operationId:watermark.durableCommitId,checkpoint:cp,watermark}));
+    f.reopen();
+    const resumed=hr2(f.store),stored=hvalue(resumed.authority.watermark(hp));
+    expect(stored).toEqual(watermark);
+    expect(typeof resumed.authority.controls).toBe('function');
+    const read=(cursor:NewarchHistoryCursor|null,maxEntries=1,maxBytes=1024*1024)=>resumed.authority.controls({pane:hp,after:stored!,cursor,maxEntries,maxBytes});
+    const first=hvalue(read(null));
+    expect(first.revision).toBe(2);expect(first.checkpointId).toBe(cp.checkpointId);
+    expect(first.entries.map(entry=>entry.event)).toEqual([afterA]);
+    expect(first.entries.map(entry=>entry.commitId)).toEqual([afterA.eventId]);
+    expect(first.entries.some(entry=>entry.event.eventId===atWatermark.eventId)).toBe(false);
+    expect(first.payloadBytes).toBe(Buffer.byteLength(streamCanonical(first.entries)));
+    expect(first.atDurableHead).toBe(false);expect(first.next).not.toBeNull();
+    const second=hvalue(read(first.next));
+    expect(second.entries.map(entry=>entry.event)).toEqual([afterB]);
+    expect(second.atDurableHead).toBe(true);expect(second.next).toBeNull();
+    expect(second.payloadBytes).toBe(Buffer.byteLength(streamCanonical(second.entries)));
+    expect(hvalue(read(null))).toEqual(first);
+    expect(read(null,1,1).status).toBe('error');
+    expect(resumed.authority.controls({pane:hp,after:{...stored!,controlOrder:0},cursor:null,maxEntries:1,maxBytes:1024*1024}).status).toBe('error');
+    expect(hvalue(resumed.authority.head(hp)).rowCount).toBe(0);
+  }finally{f.cleanup();}
 });
 test('H-r2 canonical SGR survives durable reopen and rejects semantic tuples; source bytes require readback',async()=>{
  const base=hrecord(),{digest:_,...body}=base,source={...body,digest:sourceSpoolDigest(body)};
