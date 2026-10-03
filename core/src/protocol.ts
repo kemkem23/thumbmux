@@ -580,3 +580,67 @@ export type MuxClientInfo = {
     devicePixelRatio?: number;
   };
 };
+
+/** Opt-in flag-on extension; legacy frame/page payloads keep their v1 meaning.
+ * Negotiate every required capability before sending this envelope. Unknown
+ * versions are unsupported, never an empty page. Counts/offsets are safe uints.
+ */
+export const NEWARCH_HISTORY_EXTENSION_VERSION = 1 as const;
+export const NEWARCH_FLAGON_CAPABILITIES = [
+  'stitch-v1', 'capture-v1', 'spool-v1', 'receipt-v1', 'bundle-v1',
+  'catalog-v3', 'history-states-v1',
+] as const;
+export type NewarchFlagOnCapability = typeof NEWARCH_FLAGON_CAPABILITIES[number];
+export interface NewarchCapabilities {
+  readonly extensionVersion: 1;
+  readonly supported: readonly NewarchFlagOnCapability[];
+  readonly required: readonly NewarchFlagOnCapability[];
+}
+export interface NewarchPaneKey {
+  readonly serverIdentity: string; readonly paneId: string; readonly birthGeneration: number;
+}
+/** Segment coordinates are NOT legacy global lineId or capture rowIndex. */
+export interface NewarchRowId {
+  readonly pane: NewarchPaneKey; readonly segmentId: string; readonly rowOrdinal: number;
+}
+export interface NewarchRowRange {
+  readonly pane: NewarchPaneKey; readonly segmentId: string;
+  readonly start: number; readonly end: number;
+}
+export type NewarchMissingCount =
+  | { readonly countKind: 'unknown'; readonly missingCount: null }
+  | { readonly countKind: 'exact' | 'estimate'; readonly missingCount: number };
+export type NewarchGap = NewarchMissingCount & {
+  readonly version: 1; readonly episodeId: string; readonly parentEpisodeId: string | null;
+  readonly pane: NewarchPaneKey; readonly leftRowId: NewarchRowId | null;
+  readonly rightSegmentId: string | null;
+  readonly reason: 'pipe-eof' | 'collector-exit' | 'ambiguous-overlap' | 'unproven-overlap'
+    | 'unknown-vt-state' | 'interrupted-capture' | 'storage-outage' | 'corruption'
+    | 'identity-change' | 'geometry-change' | 'ownership-lost' | 'visible-divergence';
+  readonly withheldRows: number; readonly lowerBound: number;
+  readonly openedAt: number; readonly closedAt: number | null;
+  readonly clockEpoch: string; readonly quality: 'degraded' | 'resolved';
+};
+/** Opaque serialized token. Only H/A mint/validate it; D must not do arithmetic. */
+export interface NewarchHistoryCursor { readonly version: 1; readonly token: string }
+export type NewarchHistoryState =
+  | { readonly kind: 'exact' }
+  | { readonly kind: 'gap'; readonly gap: NewarchGap }
+  | { readonly kind: 'pending'; readonly operationId: string; readonly retryAfterMs: number }
+  | { readonly kind: 'remote-required'; readonly range: NewarchRowRange; readonly bundleId: string }
+  | { readonly kind: 'remote-unavailable'; readonly range: NewarchRowRange; readonly bundleId: string; readonly retryAfterMs: number; readonly reason: 'offline' | 'missing' | 'corrupt' }
+  | { readonly kind: 'degraded'; readonly episodeId: string; readonly uncertainFields: readonly string[] }
+  | { readonly kind: 'pressure'; readonly level: 'archive' | 'critical' | 'emergency'; readonly collecting: boolean; readonly sinceMonoMs: number };
+/** Status is separate from terminal text: copy/search must never include labels.
+ * Only end proves EOF. blocked always retains a continuation and readable prefix.
+ */
+export type NewarchHistoryContinuation =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchHistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchHistoryCursor;
+      readonly state: Exclude<NewarchHistoryState, { readonly kind: 'exact' }> };
+export interface NewarchHistoryExtension {
+  readonly version: 1; readonly capabilities: NewarchCapabilities;
+  readonly states: readonly NewarchHistoryState[];
+  readonly before: NewarchHistoryContinuation; readonly after: NewarchHistoryContinuation;
+}
