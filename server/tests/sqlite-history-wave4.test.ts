@@ -1098,3 +1098,189 @@ test('flag-on H SIGKILL covers checkpoint pin release and generation transaction
     }finally{f.cleanup();}
   }
 });
+
+// Repair H-r2: missing methods are reported as contract-conformance assertions,
+// never an import failure masquerading as a behavioral red.
+import type { FlagOnHistoryR2 } from '../src/stream-contract';
+function hr2(store: FlagOnHistoryStore): FlagOnHistoryR2 {
+  expect(typeof (store as unknown as FlagOnHistoryR2).rotateSegment).toBe('function');
+  return store as unknown as FlagOnHistoryR2;
+}
+function hplain(ack: SpoolAck, op: string, start = 0, texts = ['row']): RowsAndGapsCommit {
+  const {digest:_,...value}=hrows(ack,op,start,texts);
+  const body={...value,coverage:value.coverage.filter(c=>c.kind==='rows'),decision:{...value.decision,gaps:[]}};
+  return {...body,digest:streamDigest('rows-gaps',body)};
+}
+test('H-r2 rejects a gap whose left row never committed and accepts earlier same-transaction rows', async()=>{
+  const f=hfixture();try{
+    const ack=hvalue(await f.store.appendInput(hrecord()));
+    const {digest:_,...request}=hrows(ack,'dangling',0,[]);
+    const gap={...request.decision.gaps[0]!,leftRowId:{pane:hp,segmentId:ack.segmentId,rowOrdinal:42}};
+    const body={...request,coverage:[{kind:'gap' as const,gap,digest:streamDigest('gap',gap)}],decision:{...request.decision,gaps:[gap]}};
+    expect((await f.store.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)})).status).toBe('error');
+    const {digest:__,...positive}=hrows(ack,'same-tx');
+    const good={...gap,episodeId:'same-tx-gap',leftRowId:positive.rows[1]!.id};
+    const valid={...positive,coverage:[positive.coverage[1]!,{kind:'gap' as const,gap:good,digest:streamDigest('gap',good)}],decision:{...positive.decision,gaps:[good]}};
+    expect((await f.store.commitRowsAndGaps({...valid,digest:streamDigest('rows-gaps',valid)})).status).toBe('ok');
+  }finally{f.cleanup();}
+});
+test('H-r2 full 4501-row capture rotates without new input or a fabricated gap while remote is offline',async()=>{
+  const f=hfixture();try{
+    const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));let segment=ack.segmentId,start=0;
+    for(let n=0;n<4501;n+=128){
+      if(n && n%512===0){
+        const seam=hvalue(await port.rotateSegment({operationId:'rotate-'+n,pane:hp,expectedGeneration:0,segmentId:segment,boundary:ack.through}));
+        expect(seam.predecessor).toBe(segment);expect(seam.epoch).toEqual(ack.through.epoch);
+        segment=seam.successor;start=0;
+      }
+      const count=Math.min(128,4501-n),request=hplain(ack,'capture-'+n,start,Array.from({length:count},(_,i)=>'capture-'+(n+i)));
+      const {digest:_,...base}=request;
+      const rows=base.rows.map((row,i)=>({...row,id:{...row.id,segmentId:segment},origin:{kind:'capture' as const,snapshotId:'one-capture',rowIndex:n+i}}));
+      const coverage=[{kind:'rows' as const,range:{pane:hp,segmentId:segment,start,end:start+count},digest:streamDigest('rows',rows)}];
+      const body={...base,rows,coverage,decision:{...base.decision,acceptedRowMap:rows.map(row=>({source:row.origin,target:row.id}))}};
+      hvalue(await port.commitRowsAndGaps({...body,digest:streamDigest('rows-gaps',body)}));start+=count;
+    }
+    expect(hvalue(port.authority.head(hp)).rowCount).toBe(4501);
+    expect(hvalue(port.listSealed(null,256)).seals).toHaveLength(8);
+    f.reopen();const reopened=hr2(f.store);expect(hvalue(reopened.authority.head(hp)).entryCount).toBe(4501);
+    let cursor=null as import('../../core/src/protocol').NewarchHistoryCursor|null;const texts:string[]=[];
+    for(;;){const page=hvalue(reopened.authority.page({pane:hp,cursor,direction:'after',maxEntries:256,maxBytes:1024*1024}));
+      texts.push(...page.entries.map(e=>'cells' in e?e.cells.map(c=>c.text).join(''):'GAP'));
+      if(page.after.kind==='end')break;expect(page.after.kind).toBe('more');cursor=page.after.cursor;
+    }
+    expect(texts).toEqual(Array.from({length:4501},(_,i)=>'capture-'+i));
+  }finally{f.cleanup();}
+});
+test('H-r2 backlog larger than a segment rotates with continuous source offsets',async()=>{
+  const f=hfixture();try{const port=hr2(f.store);let previous:SpoolRecord|null=null;const segments=new Set<string>();
+    for(let i=0;i<37;i++){previous=hrecord('backlog-'+i,previous,'x'.repeat(60000));segments.add(hvalue(await port.appendInput(previous)).segmentId);}
+    expect(segments.size).toBeGreaterThan(1);
+    const records=(await hreplay(f.store)).filter(c=>c.kind==='input');expect(records).toHaveLength(37);
+    expect(records.map(c=>c.kind==='input'?c.record.range.start:-1)).toEqual(Array.from({length:37},(_,i)=>i*60000));
+  }finally{f.cleanup();}
+});
+test('H-r2 exposes bounded durable read checkpoint attach and reclaim ports',()=>{
+ const f=hfixture();try{const port=hr2(f.store);
+ for(const method of ['stageRows','sealAttachSet','publishAttach','discardAttach','journalControl','commitReplayCheckpoint','commitReplayDecision','sealSegment','materializeExport','reclaimR2','appendVerifiedInput'])expect(typeof (port as any)[method]).toBe('function');
+ for(const method of ['head','tail','page','watermark','decisions','receipt','staged','attachSet','generation','pin','seal','continuity'])expect(typeof (port.authority as any)[method]).toBe('function');
+ }finally{f.cleanup();}
+});
+
+import { streamCanonical, attachReceiptSetDigest, orderedControlDigest, archiveInventoryDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest } from '../src/stream-contract';
+import type { AttachDecisionR2, AttachReceiptSetR2, StagedRowsR2, CatalogAuthorityR2, ReplayWatermarkR2, ArchiveInventoryR2, RemoteIndexR2, CoalescedInputR2 } from '../src/stream-contract';
+const hcatalog=(attach:()=>AttachDecisionR2|null=()=>null,remote:()=>RemoteIndexR2|null=()=>null):CatalogAuthorityR2=>({attach:()=>({status:'ok',value:attach()}),remote:()=>({status:'ok',value:remote()}),switchDecision:()=>({status:'ok',value:null})});
+function hstage(ack:SpoolAck,n:number):StagedRowsR2 {
+  const {digest:_,...base}=hplain(ack,'stage-'+n,n*2,['candidate-'+n+'a','candidate-'+n+'b']);
+  const body={...base,decision:{...base.decision,decisionId:'attach-decision'}};
+  return {...body,digest:streamDigest('rows-gaps',body),repair:{revision:2,transactionId:'transaction-H',epoch:ack.through.epoch,decisionId:'attach-decision',chunkOrdinal:n,visibility:'candidate'}};
+}
+function hset(requests:StagedRowsR2[]):AttachReceiptSetR2 {
+ const entries=requests.map(({repair,...r},ordinal)=>({ordinal,operationId:r.operationId,commitId:r.operationId,digest:r.digest,rows:r.rows.length,payloadBytes:Buffer.byteLength(streamCanonical(r))}));
+ return {revision:2,transactionId:'transaction-H',pane:hp,epoch:requests[0]!.repair.epoch,decisionId:'attach-decision',expectedGeneration:0,entries,terminalCommitId:entries.at(-1)!.commitId,aggregateDigest:attachReceiptSetDigest(entries)};
+}
+test('H-r2 staged attach stays invisible until catalog decision and lost publish ACK reconciles on restart',async()=>{
+ let decision:AttachDecisionR2|null=null;const f=hfixture({catalogAuthority:hcatalog(()=>decision)});
+ try{const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord())),requests=[hstage(ack,0),hstage(ack,1)];
+   for(const r of requests)hvalue(await port.stageRows(r));
+   expect(hvalue(port.authority.head(hp)).entryCount).toBe(0);
+   expect(hvalue(port.authority.receipt(requests[0]!.operationId))).toBe(null);
+   expect((await hreplay(f.store)).filter(c=>c.kind==='committed')).toHaveLength(0);
+   expect((await port.sealAttachSet({pane:hp,expectedGeneration:0,operationId:'seal-incomplete',manifest:hset([requests[0]!])})).status).toBe('error');
+   const manifest=hset(requests);hvalue(await port.sealAttachSet({pane:hp,expectedGeneration:0,operationId:'attach-seal',manifest}));
+   expect((await port.stageRows(hstage(ack,2))).status).toBe('error');
+   const committed:AttachDecisionR2={revision:2,transactionId:manifest.transactionId,receiptSetDigest:manifest.aggregateDigest,attachId:ack.through.epoch.attachId,generation:1,commitId:'catalog-attach',state:'COMMITTED',admission:'active-exact'};
+   expect((await port.publishAttach(committed)).status).toBe('error');
+   decision=committed;f.reopen();const resumed=hr2(f.store);
+   expect(hvalue(resumed.authority.head(hp)).rowCount).toBe(4);
+   expect(hvalue(await resumed.publishAttach(committed)).rowCount).toBe(4);
+   expect((await resumed.discardAttach(committed)).status).toBe('error');
+   const page=hvalue(resumed.authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));
+   expect(page.entries.map(e=>'cells' in e?e.cells[0]!.text:'gap')).toEqual(['candidate-0a','candidate-0b','candidate-1a','candidate-1b']);
+   expect(hvalue(resumed.authority.staged(manifest.transactionId,0))!.projection.sourceDigest).toBe(requests[0]!.digest);
+ }finally{f.cleanup();}
+});
+function hcheckpoint(ack:SpoolAck,id:string,previous:string|null=null):VtCheckpoint {
+ const identity={pane:hp,sourceEpoch:0,geometryGeneration:1},cursor={x:0,y:0,visible:true},buffer={rows:[],cursor,savedCursor:cursor,savedAttributes:[],savedModes:{},wrapPending:false};
+ const state={codecVersion:'test-v1',geometry:{columns:41,rows:30},normal:buffer,alternate:buffer,active:'normal' as const,modes:{},margins:{top:0,bottom:29,left:0,right:40},tabStops:[],pendingUtf8:[224],pendingEscape:[27],attributes:[],wrapPending:false,extensionState:JSON.stringify({known:{geometry:true,attributes:false}})};
+ return {kind:'vt-recovery',checkpointId:id,previousCheckpointId:previous,identity,inputFence:{kind:'durable-input',pane:hp,through:{sourceEpoch:0,packetSeq:0},digest:ack.recordDigest,segmentId:ack.segmentId},revision:0,head:0,state,stateDigest:streamDigest('vt-state',{identity,state})};
+}
+function hwatermark(f:ReturnType<typeof hfixture>,ack:SpoolAck,checkpoint:VtCheckpoint,index?:string):ReplayWatermarkR2 {
+ return {revision:2,pane:hp,checkpointId:checkpoint.checkpointId,through:ack.through,controlOrder:1,decoderVersion:'test-v1',stateDigest:checkpoint.stateDigest,known:{geometry:true,attributes:false},decisionIndexCommitId:index??'empty:'+f.store.storeUUID,snapshotDependencies:[],durableCommitId:'cp-'+checkpoint.checkpointId};
+}
+function hrremote(sealed:SealedExport,seal:import('../src/stream-contract').LogicalSealR2):{remote:RemoteIndexR2;inventory:ArchiveInventoryR2}{
+ const old=hremote(sealed),members=[...sealed.files,sealed.manifest].map(f=>({...f,path:f.path.split('/').at(-1)!}));
+ const inventory:ArchiveInventoryR2={revision:2,sealGeneration:sealed.generation,sealCommitId:sealed.sealCommitId,sealManifestSha256:sealed.manifest.sha256,bundleManifestSha256:old.verified.bundle.manifest.sha256,members:[...sealed.files,sealed.manifest].map((f,i)=>({sourcePath:f.path,relativePath:members[i]!.path,bytes:f.bytes,sha256:f.sha256}))};
+ return {inventory,remote:{...old,verified:{...old.verified,bundle:{...old.verified.bundle,members,rawRanges:seal.rawRanges,checkpointIds:seal.checkpointIds,...{repair:{revision:2,inventory,timelineIndex:members.find(f=>f.path.endsWith('.timeline.jsonl'))!,replayIndex:members.find(f=>f.path.endsWith('.replay.jsonl'))!}}}},repair:{revision:2,sealCommitId:sealed.sealCommitId,sealGeneration:sealed.generation,inventoryDigest:archiveInventoryDigest(inventory),authorizationGeneration:0}}};
+}
+test('H-r2 checkpoint pins block reclaim; successor preserves resize state decisions and stable remote timeline',async()=>{
+ let remote:RemoteIndexR2|null=null;const f=hfixture({catalogAuthority:hcatalog(undefined,()=>remote)});
+ try{const port=hr2(f.store),input=hrecord('large',null,'x'.repeat(60000)),ack=hvalue(await port.appendInput(input));
+   hvalue(await port.commitRowsAndGaps(hplain(ack,'durable-prefix')));
+   const before=hvalue(port.authority.head(hp));
+   const controlBody={revision:2 as const,eventId:'resize',position:ack.through,order:1,decoderVersion:'test-v1',payload:{kind:'geometry' as const,before:{columns:80,rows:24},after:{columns:41,rows:30}}};
+   const event={...controlBody,digest:orderedControlDigest(controlBody)};
+   hvalue(await port.journalControl({pane:hp,expectedGeneration:0,operationId:'control',event}));
+   const bad={...controlBody,eventId:'resize-out-of-order',order:0};expect((await port.journalControl({pane:hp,expectedGeneration:0,operationId:'bad-control',event:{...bad,digest:orderedControlDigest(bad)}})).status).toBe('error');
+   const cp=hcheckpoint(ack,'first'),watermark=hwatermark(f,ack,cp);
+   hvalue(await port.commitReplayCheckpoint({pane:hp,expectedGeneration:0,operationId:'cp-first',checkpoint:cp,watermark}));
+   const decision={decisionId:'consumed-prefix',raw:input.range,controlStart:0,controlEnd:1,disposition:'consumed' as const,coverage:hplain(ack,'durable-prefix').coverage,checkpointId:cp.checkpointId,decoderVersion:'test-v1'};
+   hvalue(await port.commitReplayDecision({pane:hp,expectedGeneration:0,operationId:'decision-commit',decision}));
+   const seam=hvalue(await port.rotateSegment({pane:hp,expectedGeneration:0,operationId:'rotate-pinned',segmentId:ack.segmentId,boundary:ack.through}));
+   expect((await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'pinned-export',sealCommitId:seam.sealCommitId})).status).toBe('error');
+   const next=hvalue(await port.appendInput(hrecord('successor',input,'suffix'))),cp2=hcheckpoint(next,'second','first'),watermark2=hwatermark(f,next,cp2,'decision-commit');
+   hvalue(await port.commitReplayCheckpoint({pane:hp,expectedGeneration:0,operationId:'cp-second',checkpoint:cp2,watermark:watermark2}));
+   const logical=hvalue(port.listSealed(null,256)).seals[0]!,sealed=hvalue(await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'export',sealCommitId:seam.sealCommitId}));
+   expect(logical.checkpointIds).toContain('first');
+   const replayFile=sealed.files.find(f=>f.path.endsWith('.replay.jsonl'))!;
+   const exported=readFileSync(replayFile.path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+   expect(exported.find(e=>e.kind==='control').value).toEqual(event);
+   expect(exported.find(e=>e.kind==='replay-checkpoint').value).toEqual(cp);
+   expect(exported.find(e=>e.kind==='decision').value).toEqual(decision);
+   const candidate=hrremote(sealed,logical),request={pane:hp,expectedGeneration:0,operationId:'reclaim',sealed,...candidate};
+   expect((await port.reclaimR2(request)).status).toBe('error');expect(existsSync(sealed.files[0]!.path)).toBe(true);
+   remote=candidate.remote;const reclaimed=hvalue(await port.reclaimR2(request));expect(reclaimed.allocatedBytesAfter).toBeLessThan(reclaimed.allocatedBytesBefore);
+   f.reopen();const recovered=hr2(f.store);expect(hvalue(recovered.authority.head(hp))).toEqual(before);
+   expect(hvalue(recovered.authority.watermark(hp))).toEqual(watermark2);
+   expect(hvalue(recovered.authority.decisions({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024})).entries).toEqual([decision]);
+   const page=hvalue(recovered.authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));expect(page.after.kind).toBe('blocked');if(page.after.kind==='blocked')expect(page.after.state.kind).toBe('remote-required');
+   expect(hvalue(recovered.authority.tail(hp,512,1024*1024)).kind).toBe('blocked');
+ }finally{f.cleanup();}
+});
+test('H-r2 canonical SGR survives durable reopen and rejects semantic tuples; source bytes require readback',async()=>{
+ const base=hrecord(),{digest:_,...body}=base,source={...body,digest:sourceSpoolDigest(body)};
+ const f=hfixture({readSourceRecords:()=>({status:'ok',value:[source]})});
+ try{const port=hr2(f.store),value={revision:2 as const,record:base,historyDomain:'spool' as const,source:[{range:source.range,firstSequence:0,lastSequence:0,previousDigest:null,terminalDigest:source.digest,sourceDomain:'spool-record' as const,recordsDigest:sourceRecordsDigest([source])}]};
+   const request:CoalescedInputR2={...value,provenanceDigest:inputProvenanceDigest(value)};
+   const changed={...value,record:hrecord('forged',null,'DIFF\nDIFF\n')};expect((await port.appendVerifiedInput({...changed,provenanceDigest:inputProvenanceDigest(changed)})).status).toBe('error');
+   const ack=hvalue(await port.appendVerifiedInput(request));
+   const {digest:__,...rows}=hplain(ack,'styled');
+   const cells=[{text:'e\u0301',width:1 as const,style:[1,31,48,5,200]},{text:'界',width:2 as const,style:[38,2,17,34,51]},{text:'',width:0 as const,style:[]}];
+   const styled=rows.rows.map(row=>({...row,cells})),coverage=[{...rows.coverage[0]!,digest:streamDigest('rows',styled)}];
+   const good={...rows,rows:styled,coverage,decision:{...rows.decision,acceptedRowMap:styled.map(row=>({source:row.origin,target:row.id}))}};
+   hvalue(await port.commitRowsAndGaps({...good,digest:streamDigest('rows-gaps',good)}));f.reopen();expect((await hreplay(f.store)).find(c=>c.kind==='committed')).toMatchObject({rows:[{cells}]});
+   const invalidRows=hplain(ack,'invalid',1).rows.map(row=>({...row,cells:[{text:'bad',width:1 as const,style:[0,-1,-1]}]}));
+   const invalid={...hplain(ack,'invalid',1),rows:invalidRows};const {digest:___,...bad}=invalid;expect((await f.store.commitRowsAndGaps({...bad,digest:streamDigest('rows-gaps',bad)})).status).toBe('error');
+ }finally{f.cleanup();}
+});
+
+test('H-r2 tail pins every local segment and releases all with its visible token',async()=>{
+ const f=hfixture();try{const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));hvalue(await port.commitRowsAndGaps(hplain(ack,'left')));
+ const seam=hvalue(await port.rotateSegment({pane:hp,expectedGeneration:0,operationId:'tail-rotate',segmentId:ack.segmentId,boundary:ack.through}));
+ const {digest:_,...body}=hplain(ack,'right');const rows=body.rows.map(row=>({...row,id:{...row.id,segmentId:seam.successor}}));const value={...body,rows,coverage:[{kind:'rows' as const,range:{pane:hp,segmentId:seam.successor,start:0,end:1},digest:streamDigest('rows',rows)}],decision:{...body.decision,acceptedRowMap:rows.map(row=>({source:row.origin,target:row.id}))}};
+ hvalue(await port.commitRowsAndGaps({...value,digest:streamDigest('rows-gaps',value)}));
+ const tail=hvalue(port.authority.tail(hp,512,1024*1024));expect(tail.kind).toBe('local');if(tail.kind!=='local')throw Error('local tail required');expect(tail.rows).toHaveLength(2);
+ expect((await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'pinned-export',sealCommitId:seam.sealCommitId})).status).toBe('error');
+ hvalue(await port.releasePin(tail.pin));expect((await port.materializeExport({pane:hp,expectedGeneration:0,operationId:'released-export',sealCommitId:seam.sealCommitId})).status).toBe('ok');
+ }finally{f.cleanup();}
+});
+test('H-r2 distinct gaps in one episode retain positions across durable close updates',async()=>{
+ const f=hfixture();try{const port=hr2(f.store),ack=hvalue(await port.appendInput(hrecord()));
+ const base=hrows(ack,'gaps',0,[]).decision.gaps[0]!;
+ const a={...base,episodeId:'one-episode',repair:{revision:2 as const,gapId:'a',sequence:0,update:0,state:'open' as const}},b={...a,repair:{...a.repair,gapId:'b',sequence:1}};
+ const commit=async(op:string,gaps:readonly import('../src/stream-contract').GapR2[])=>{const {digest:_,...body}=hrows(ack,op,0,[]),value={...body,coverage:gaps.map(gap=>({kind:'gap' as const,gap,digest:streamDigest('gap',gap)})),decision:{...body.decision,gaps}};return port.commitRowsAndGaps({...value,digest:streamDigest('rows-gaps',value)});};
+ hvalue(await commit('two-gaps',[a,b]));const closed={...a,closedAt:2,repair:{...a.repair,update:1,state:'closed' as const}};hvalue(await commit('close-first',[closed]));
+ expect(hvalue(port.authority.head(hp)).entryCount).toBe(2);
+ expect((await commit('reopen-closed',[{...a,repair:{...a.repair,update:2}}])).status).toBe('error');
+ f.reopen();const page=hvalue(hr2(f.store).authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));expect(page.entries).toEqual([closed,b]);
+ }finally{f.cleanup();}
+});
