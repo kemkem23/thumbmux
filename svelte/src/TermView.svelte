@@ -4986,6 +4986,21 @@
     return (continuation === 'end') === hasMore ? undefined : continuation;
   }
 
+  /** The opaque cursor the server handed for this edge; `end` has none. */
+  function flagOnCursorFor(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+  ): { version: 1; token: string } | null {
+    const edge = flagOn === null ? null : direction === 'before' ? flagOn.before : flagOn.after;
+    return edge === null || edge.kind === 'end' ? null : { version: 1, token: edge.cursor.token };
+  }
+
+  /** A seeded window keeps the older-edge cursor of the page that seeded it. */
+  function withFlagOnCursorBefore(state: HistoryWindowState, flagOn: NewarchHistoryExtension | null): HistoryWindowState {
+    const cursor = flagOnCursorFor(flagOn, 'before');
+    return cursor ? { ...state, flagOnCursorBefore: cursor } : state;
+  }
+
   function recordHistoryStatus(flagOn: NewarchHistoryExtension | null, direction: HistoryWindowDirection): void {
     const notes = flagOn ? historyStatusNotes(flagOn) : [];
     const held = direction === 'before' ? historyStatusBefore : historyStatusAfter;
@@ -5088,7 +5103,7 @@
         }
       }
       return {
-        state: createHistoryWindow({
+        state: withFlagOnCursorBefore(createHistoryWindow({
           startLine: normalizedStartLine + keepFrom,
           lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
@@ -5101,7 +5116,7 @@
             ? history.endLine !== liveBoundary.liveStartLine
             : history.endLine < history.totalArchivedLines,
           limits,
-        }),
+        }), history.flagOn),
         live,
         livePrefixDropped,
         entryState,
@@ -5483,6 +5498,7 @@
         // The after-edge hasMore above may be widened by the live boundary,
         // so only the blocked state is passed through (it never means EOF).
         ...(continuation === 'blocked' ? { continuation } : {}),
+        flagOnCursor: flagOnCursorFor(history.flagOn, direction),
       },
       { anchor: reader.anchor, protectedRange: reader.protectedRange },
     );
