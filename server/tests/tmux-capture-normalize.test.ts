@@ -1945,7 +1945,15 @@ test('Q22 mutation controls: stale audit, content dedupe and renewed deadline ar
       const original=readFileSync(source,'utf8').replace(/from '(\.\/[^']+)'/g,(_,path)=>`from ${JSON.stringify(new URL(path+'.ts',source).pathname)}`)
         .replace("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
       expect(original.split(c.from)).toHaveLength(2);
-      writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';\n${c.code}`);
+      const importEnd=c.code.indexOf(';')+1;
+      // Bun's uncaught formatter can lose pipe output while printing a huge
+      // single-line JSON fixture. Emit the actual assertion synchronously,
+      // below PIPE_BUF, instead of depending on the formatted source/caret.
+      writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';
+import {writeSync} from 'node:fs';
+${c.code.slice(0,importEnd)}
+try { ${c.code.slice(importEnd)} }
+catch(cause) { writeSync(2,String(cause)+'\\n'); process.exit(1); }`);
       for(const mutated of [false,true]){
         writeFileSync(join(root,'subject.ts'),mutated?original.replace(c.from,c.to):original);
         const r=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
