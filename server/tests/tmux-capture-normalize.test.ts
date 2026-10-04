@@ -1949,7 +1949,7 @@ test('Q22 mutation controls: stale audit, content dedupe and renewed deadline ar
       for(const mutated of [false,true]){
         writeFileSync(join(root,'subject.ts'),mutated?original.replace(c.from,c.to):original);
         const r=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
-        console.log('Q22_C_MUTATION',JSON.stringify({name:c.name,mutated,exit:r.status,stderr:r.stderr.slice(0,1800)}));
+        console.log('Q22_C_MUTATION',JSON.stringify({name:c.name,mutated,exit:r.status,stderr:r.stderr.slice(-1800)}));
         expect(r.status).toBe(mutated?1:0);
         if(mutated)expect(r.stderr).toContain('MUTATION');
       }
@@ -1991,4 +1991,9 @@ test('Q22 V2-13 physical 100x40 oracle on a private tmux socket',async()=>{
       console.log('Q22_PRIVATE_ORACLE',JSON.stringify({caseId:index,geometry:pane.geometry,rows:result.rows.length,cursor}));
     }
   }finally{spawnSync('tmux',['-S',socket,'kill-server'],{env});rmSync(root,{recursive:true,force:true});}
+});
+
+test('Q22 audit rejects geometry and grapheme allocations before decode',()=>{
+  expect(()=>normalizeV2Capture('x\n',{columns:1000000000,rows:1})).toThrow();
+  expect(()=>normalizeV2Capture('A'+'\u0301'.repeat(2100)+'\n',{columns:10,rows:1})).toThrow();
 });
