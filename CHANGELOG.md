@@ -1,7 +1,117 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.4-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
+
+## v0.20.5 — 2026-10-04
+
+Patch. Ships the low-resolution screen layout (UI-COMPACT lot D), the
+newarch/pipe-history work merged since 0.20.4, and the NEWARCH v2 public
+surface (stability tier S, opt-in). The default terminal path (legacy route,
+replay materializer, PTY WAL proxy) is unchanged apart from the async activity
+poll in `createBunTmuxDriver`; everything under `./pipe-history-runtime` stays
+opt-in, the stream-first entry is constructed only by a host that asks for it,
+and NEWARCH v2 behaviour is reached only through the new optional
+`TmuxWsMuxOptions.newarchV2` hook. Flag-on (stream-first / NEWARCH v2) is not
+production-ready. The five workspace manifests and internal caret ranges are
+0.20.5 / ^0.20.5. Consumers moving a pinned git dist must update their
+lockfiles to the new immutable dist tag.
+
+### Changed — low-resolution screens (UI-COMPACT lot D)
+
+CSS-first, no prop or export changes. Measured on a canary build with the same
+Playwright audit before and after.
+
+- **ActionFab** — on screens up to 900px tall the slots lay out in two columns
+  (same order, row by row, 8px gap both ways), so all 15 /m/t actions are on
+  screen at 1366×768, 1280×720, 1024×600, 800×600, 390×844, 375×667 and
+  360×640 (was 8–13 of 15). A mouse gets 36px slots on those screens (touch
+  keeps 46). When even two columns cannot fit, the edge the list can still
+  scroll past fades. 1920×1080 keeps the single 46px column.
+- **TermHud (dense)** — at ≤480px wide the name and the note share one row,
+  each cut with …; the note no longer takes a second row. Phone HUD 93 → 49px.
+  An activity slot, if the host passes one, keeps one line on the row below.
+  Host seams that restyle the slot still win (selectors stay at the slot's
+  own specificity).
+- **SessionGrid (dense)** — a mouse on a ≤820px-tall screen gets a 44px card
+  header (two-line note/summary, 36×44 ×); between 768 and 1039px wide two
+  square cards share the width instead of one 500px card. Touch filter chips,
+  search and group toggle are at least 44×44.
+- **ComposerDock** — at ≤620px tall (and ≥481px wide) the mode buttons, field,
+  SEND and ✕ share one row: dock 122 → 62px. The mode hint shows only in
+  DIRECT. The sheet carries `data-mode="compose|direct"`.
+
+### Changed — tmux driver (default path)
+
+- `createBunTmuxDriver` polls pane activity asynchronously: one poll in flight
+  at a time, results fenced by generation so a late sample never overwrites a
+  newer one, and the `tmux` child is reaped when reading its pipe fails. The
+  return type is `BunTmuxDriver` (`TmuxDriver` plus the poll handle), a
+  subtype of `TmuxDriver`, so existing callers keep compiling.
+- The server barrel lists the `bun-driver` exports by name instead of
+  `export *`. `createActivityPoll` and `readActivityProcess` are **not** part
+  of the public API (they were never released); everything 0.20.4 exported
+  from that module is still exported.
+
+### Added — NEWARCH v2 surface (tier S, opt-in)
+
+- `@thumbmux/core` exports the NEWARCH v2 protocol types and helpers
+  (`NEWARCH_V2_SCHEMA`, `NEWARCH_V2_CAPABILITIES`, `supportsNewarchV2`,
+  `NewarchV2PaneDescriptor`, `NewarchV2PaneSelection`, `NewarchV2GeometryReply`,
+  `NewarchV2HistoryCursor`, `NewarchV2Incident` and related names). They are
+  stability tier S: covered by the contract check, not frozen like tier F.
+- `TmuxWsMuxOptions.newarchV2?` (optional) lets the host name the owner of a
+  session. When set, session-list rows carry the owner's selection, and an
+  owned pane keeps its birth geometry: `handleResize` / `applyGeometry` do not
+  resize it and return the fixed geometry. Without the option nothing changes.
+- **Compatibility note:** `TmuxWsMux.handleResize` and `applyGeometry` now
+  return `NewarchV2GeometryReply | null` (was `void`). Callers that ignore the
+  result, store the method in a `void`-returning slot, or subclass without
+  overriding still compile (`server/tests/session-row-type.fixture.ts`). A
+  subclass that overrides either method with a `: void` return type no longer
+  type-checks and must return `null`.
+- `TermView` gains optional `fixedGeometry`, `fitWidth` and `v2StatusText`
+  props: a fixed-size pane is scaled to the viewport instead of resized, and an
+  incident sentence can be shown without a live pane. `SessionView` does not
+  claim geometry for a pane whose owner is fixed or could not be resolved.
+- The history window keeps flag-on edges pageable while a read is pending,
+  gapped or remote, and shows flag-on states as notes beside the rows, never as
+  terminal text.
+
+### Added — stream-first entry (opt-in, default off)
+
+- `./pipe-history-runtime` exports `StreamRuntime`, `StreamRuntimePane` and
+  `StreamVtTransport`. Importing the subpath still opens no database and starts
+  no timer; nothing constructs the stream runtime unless the host does.
+  Flag-off behaviour is unchanged (reviewed by two providers). Flag-on is not
+  production-ready.
+- The stream path brings capture/display/history engines, a history watchdog,
+  crash recovery that re-derives never-readable staged rows from the journal,
+  a read-only `sh_*` archive reader for the rollback bridge, and fenced late
+  RPC/history callbacks. `TmuxWsMux` accepts an async `readBefore`/`readAfter`
+  from the projection route and drops the reply if the viewer left or rejoined.
+
+### Changed — pipe-history projection (opt-in)
+
+- Shared VT worker feeds at most 2 ms per channel turn, in slices cut at
+  UTF-8/escape boundaries, and reads ahead at most 64 KiB of unparsed input per
+  channel. Optional `onStageTrace` reports per-update stage stamps
+  (wait/hold/read-lag/serialize); worker trace accounting is epoch-safe.
+- Receipt archiving is scheduled off the per-commit path; the idle disk worker
+  drains queued archive work and age-due seals. The per-line tail of a quiet
+  pane is sealed by age as a partial v5 block once its range is settled.
+- Ring rows are frozen and shared (copy-on-write repair, one canonical row per
+  capture row, certified ids at the ring floor); the ANSI cache is bound to each
+  immutable ring row, fixing the history render regression from the decoder
+  memo change. The collector releases rows before eviction callbacks run.
+
+### Tests
+
+- Public CI fixes from 0.20.4: D-FIX1 runs against a committed 0.20.3 fixture
+  (no host pin needed on the runner) and the S2 wave-2 fixture re-offers rows
+  refused under backpressure. The 600-record replay recovery test measures the
+  recovery boundary instead of fixture setup (136.6 s → 2.0 s, no timeout
+  raised).
 
 ## v0.20.4 — 2026-09-29
 

@@ -1378,3 +1378,59 @@ describe("0.20.3 reviewed optional graph additions", () => {
     });
   }
 });
+
+describe("0.20.5 reviewed createBunTmuxDriver return widening", () => {
+  // Pair copied from the two artifacts (v0.20.4-dist baseline, 0.20.5 git-dist),
+  // not read back from V0205_REVIEWED_ADDITIONS, so the gate and this test hold
+  // separate copies.
+  const pair = "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b";
+  test(pair.split(":").slice(0, 2).join(":"), () => {
+    const [subpath, name, before, after] = pair.split(":") as ["server", string, string, string];
+    const oldEntry = { name, kind: "value" as const, tier: "F" as const, signature: before, compatibilitySignature: before };
+    const newEntry = { name, kind: "value" as const, tier: "F" as const, signature: after, compatibilitySignature: after };
+    const run = (oldLive = oldEntry, newLive = newEntry, oldVersion = "0.20.4", newVersion = "0.20.5") =>
+      evaluateBaseline(subpath, [oldEntry], [newEntry], [oldLive], [newLive], oldVersion, newVersion).errors;
+    expect(run()).toEqual([]);
+    expect(run(oldEntry, { ...newEntry, compatibilitySignature: "narrowed-unreviewed-declaration" }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run({ ...oldEntry, compatibilitySignature: "different-prior-artifact" }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run(oldEntry, newEntry, "0.20.3"))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run(oldEntry, newEntry, "0.20.4", "0.20.6"))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(evaluateBaseline(subpath, [oldEntry], [], [oldEntry], [], "0.20.4", "0.20.5").errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
+  });
+});
+
+describe("0.20.5 reviewed NEWARCH v2 TmuxWsMux graph", () => {
+  // Pairs copied from the two artifacts (v0.20.4-dist baseline, 0.20.5 git-dist
+  // with lot I), not read back from V0205_REVIEWED_ADDITIONS.
+  const cases = [
+    { pair: "server:AppRoutes:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:0cee4584b304111af833cf65a34d7205cdd27e714d815411d9ca1ad137d054e3", tier: "S", kind: "type" },
+    { pair: "server:AppRoutesOptions:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:413b5cbbaada29e23a00e522f4dcd30c9990dd926048df394ebf004fb2d66ce7", tier: "S", kind: "type" },
+    { pair: "server:createAppRoutes:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:dcd3b01f07acdc453c2cf3cd977c44478d384beb6b592e7431b58e2700ec700e", tier: "S", kind: "value" },
+    { pair: "server:TmuxWsMux:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:24d3a6f011af24425930aec4c32d0707f4e5264776d26bba3ab26791186f0ebb", tier: "F", kind: "value" },
+  ] as const;
+  for (const { pair, tier, kind } of cases) {
+    test(pair.split(":").slice(0, 2).join(":"), () => {
+      const [subpath, name, before, after] = pair.split(":") as ["server", string, string, string];
+      const oldEntry = { name, kind, tier, signature: before, compatibilitySignature: before };
+      const newEntry = { name, kind, tier, signature: after, compatibilitySignature: after };
+      const run = (oldLive = oldEntry, newLive = newEntry, oldVersion = "0.20.4", newVersion = "0.20.5") =>
+        evaluateBaseline(subpath, [oldEntry], [newEntry], [oldLive], [newLive], oldVersion, newVersion).errors;
+      expect(run()).toEqual([]);
+      expect(run(oldEntry, { ...newEntry, compatibilitySignature: "narrowed-unreviewed-declaration" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run({ ...oldEntry, compatibilitySignature: "different-prior-artifact" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.3"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.4", "0.20.6"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(evaluateBaseline(subpath, [oldEntry], [], [oldEntry], [], "0.20.4", "0.20.5").errors)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
+    });
+  }
+});
