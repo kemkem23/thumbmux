@@ -582,8 +582,12 @@ async function rzUntil(f: () => boolean, ms: number, what: string): Promise<void
   if (!f()) throw new Error(`T-fix timed out (${ms}ms): ${what}`);
 }
 
-describe("T-fix ST-02 resize through the real flag-on host", () => {
-  test("T-fix ST-02/L2/L3 planned shrink 80×30→80×20 with the cursor at the bottom: the pane falls back to the legacy store with a positioned gap, and no width-truncated row is stored as exact", async () => {
+// PLAN-v2 §2/§8 (R11/R12/F2): "resize succeeded, back to legacy" is no longer
+// an expectation. The same real resize now has to stop the pane under its
+// capture owner with a positioned gap; no legacy writer, no reflow, no rebind.
+// Red on the K base (it falls back to legacy); lot I owns the fix.
+describe("T-V2 V2-03 (was T-fix ST-02) resize through the real flag-on host", () => {
+  test("T-V2 V2-03 planned shrink 80×30→80×20 with the cursor at the bottom: geometry violation stops the pane under its capture owner with a positioned gap, no width-truncated exact row, and the keeper never collects it, also after restart", async () => {
     const tag = "rz";
     const dir = mkdtempSync(join(tmpdir(), "tfix-rz-"));
     const sockDir = join(dir, "tmuxdir", `tmux-${process.getuid!()}`); mkdirSync(sockDir, { recursive: true, mode: 0o700 });
@@ -640,31 +644,35 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
         return s?.route === "legacy" || (!!s && s.route === "newarch" && s.verified === true) || s?.fault != null;
       }, 8_000, "shrink falls back to legacy or stays on newarch");
       console.log(`T-fix ST-02 after shrink pushed=${pushed.length} status=${JSON.stringify(status())}`);
-      expect(status()?.route).toBe("legacy");
-      const markers: { lineId: number }[] = [];
-      const tagged: string[] = [];
-      let at: number | null = null;
-      for (let g = 0; g < 1000; g++) {
-        const page = h.projection.readBefore("s", at, 500) as { lines: string[]; startLine: number | null; hasMore: boolean; markers?: { lineId: number }[] };
-        markers.push(...(page.markers ?? []));
-        for (const line of page.lines) {
-          const text = line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
-          if (text.includes(tag)) tagged.push(text);
+      expect(status()?.route).not.toBe("legacy");
+      const read = (hh: FlagOnPipeHost) => {
+        const markers: { lineId: number }[] = [];
+        const tagged: string[] = [];
+        let at: number | null = null;
+        for (let g = 0; g < 1000; g++) {
+          const page = hh.projection.readBefore("s", at, 500) as { lines: string[]; startLine: number | null; hasMore: boolean; markers?: { lineId: number }[] };
+          markers.push(...(page.markers ?? []));
+          for (const line of page.lines) {
+            const text = line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+            if (text.includes(tag)) tagged.push(text);
+          }
+          if (!page.hasMore || page.startLine === null) break;
+          at = page.startLine;
         }
-        if (!page.hasMore || page.startLine === null) break;
-        at = page.startLine;
-      }
-      expect(markers.length).toBeGreaterThan(0);
+        return { markers, tagged };
+      };
+      const seen = read(h);
+      expect(seen.markers.length).toBeGreaterThan(0);
       // Exact text per id: the producer writes "E<id> rz " plus id%13 "y"s, so a
       // multiple of 13 ends at "rz" once trimmed. Any shortened row differs here.
       const exact = (line: string) => { const m = /^E(\d{7}) /.exec(line);
         return !!m && line === `E${m[1]} ${tag} ${"y".repeat(Number(m[1]) % 13)}`.trimEnd(); };
-      expect(tagged.filter((line) => !exact(line))).toEqual([]);
-      // B1: the fallback is real only if the legacy keeper collects the pane
-      // again. The lease is back, the pipe is withdrawn, and rows written after
-      // the stop reach the keeper's archive through a real keeper tick.
-      expect(legacyCaptureAppendAllowed("s")).toBe(true);
+      expect(seen.tagged.filter((line) => !exact(line))).toEqual([]);
+      // Single owner: the pipe is withdrawn, the owner stays, no legacy marker or fallback.
       expect(must(["display-message", "-p", "-t", paneId, "#{pane_pipe}"]).trim()).toBe("0");
+      expect(legacyCaptureAppendAllowed("s")).toBe(false);
+      expect(h.isRouted("s")).toBe(true);
+      expect(stopNotices).toEqual([]);
       const archive: string[] = [];
       const keeper = (routed: () => FlagOnPipeHost): HistoryKeeperDeps => ({
         listSessions: () => [{ name: "s", paneRows: 20 }],
@@ -678,37 +686,24 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
         appendMarker: (_name, text) => { archive.push(text); },
         warn: () => {},
       });
-      // M2: one stop notice with a time and the last newarch row, written the way
-      // the orchestrator writes it: one legacy line the keeper's anchor steps over.
-      expect(stopNotices).toHaveLength(1);
-      expect(isHistoryMarker(stopNotices[0]!)).toBe(true);
-      expect(stopNotices[0]).toMatch(/geometry-change.* last newarch row [^ ]+#\d+ · \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
-      archive.push(stopNotices[0]!);
-      const seeded = await runHistoryKeeperTick(keeper(() => h));
-      expect(seeded.skippedLeased + seeded.skippedRouted).toBe(0);
       const afterStop = await run("burst", 60);
       const tick = await runHistoryKeeperTick(keeper(() => h));
-      console.log(`T-fix ST-02 keeper after stop ${JSON.stringify(tick)} archived=${archive.length}`);
-      expect(tick.skippedLeased + tick.skippedRouted).toBe(0);
-      const archivedIds = new Set(ids(archive.join("\n")));
-      // Rows past the live window (the last 20) are archived; they were written after the stop.
-      for (let id = filled + 1; id <= afterStop - 20; id++) expect(archivedIds.has(id)).toBe(true);
-      // B2: a restart keeps the stop. No replay, no second gap, no lease re-announced.
+      console.log(`T-V2 V2-03 keeper after stop ${JSON.stringify(tick)} archived=${archive.length} afterStop=${afterStop}`);
+      expect(tick.skippedLeased + tick.skippedRouted).toBe(1);
+      expect(archive).toEqual([]);
+      // Restart keeps the stop and the owner: no replay, no rebind, the label is still read back.
       await host.close();
       host = new FlagOnPipeHost({ root, tmuxSocket: socket, mode: "flag-on", tickMs: 50, healthMs: 100 });
       await host.start();
       const h2 = host;
-      expect(h2.status().sessions[0]?.route).toBe("legacy");
+      expect(h2.status().sessions[0]?.route).not.toBe("legacy");
       expect(h2.status().incidents.filter((i) => /resume failed|rebind/.test(i))).toEqual([]);
-      expect(legacyCaptureAppendAllowed("s")).toBe(true);
-      expect(h2.isRouted("s")).toBe(false);
+      expect(h2.isRouted("s")).toBe(true);
       expect(must(["display-message", "-p", "-t", paneId, "#{pane_pipe}"]).trim()).toBe("0");
-      const afterBoot = await run("burst", 40);
-      await new Promise((r) => setTimeout(r, 300));
+      expect(read(h2).markers.length).toBe(seen.markers.length);
       const bootTick = await runHistoryKeeperTick(keeper(() => h2));
-      expect(bootTick.skippedLeased + bootTick.skippedRouted).toBe(0);
-      const bootIds = new Set(ids(archive.join("\n")));
-      for (let id = afterStop + 1; id <= afterBoot - 20; id++) expect(bootIds.has(id)).toBe(true);
+      expect(bootTick.skippedLeased + bootTick.skippedRouted).toBe(1);
+      expect(archive).toEqual([]);
       void first;
       void filled;
     } finally {
@@ -721,4 +716,105 @@ describe("T-fix ST-02 resize through the real flag-on host", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// PLAN-v2 §3 V2-02/V2-03 runtime proof on a private tmux server (explicit -S,
+// never the default server). No product code: this pins what tmux 3.x itself
+// guarantees for the fixed 100×40 window, and what it does NOT (manual is not
+// an ACL; before/after polling misses 100→120→100 and short-lived splits).
+// ---------------------------------------------------------------------------
+function tv2PrivateTmux() {
+  const dir = mkdtempSync(join(tmpdir(), "tv2-fixed-"));
+  const socket = join(dir, "s");
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "TMUX" && k !== "TMUX_PANE") env[k] = v;
+  const t = (...args: string[]) => { const r = spawnSync("tmux", ["-S", socket, "-f", "/dev/null", ...args], { encoding: "utf8", env });
+    if (r.status) throw new Error(`T-V2 tmux ${args[0]}: ${r.stderr}`); return r.stdout.trim(); };
+  t("new-session", "-d", "-s", "v2", "-x", "100", "-y", "40", "sleep 1000");
+  const window = t("display-message", "-p", "-t", "v2", "#{window_id}");
+  const pane = t("display-message", "-p", "-t", "v2", "#{pane_id}");
+  t("set-option", "-w", "-t", window, "window-size", "manual");
+  t("resize-window", "-t", window, "-x", "100", "-y", "40");
+  const clients: { proc: ReturnType<typeof Bun.spawn>; out: { text: string } }[] = [];
+  return {
+    t, window, pane,
+    geometry: () => t("display-message", "-p", "-t", pane, "#{window_width}x#{window_height} #{pane_width}x#{pane_height}"),
+    /** Control-mode client: its size request and the %layout-change notifications it receives. */
+    control(size: string) {
+      const proc = Bun.spawn(["tmux", "-S", socket, "-f", "/dev/null", "-C", "attach", "-t", "v2"], { env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+      const out = { text: "" };
+      const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+      void (async () => { for (;;) { const { value, done } = await reader.read(); if (done) return; out.text += Buffer.from(value).toString(); } })();
+      const send = (line: string) => { (proc.stdin as import("bun").FileSink).write(`${line}\n`); (proc.stdin as import("bun").FileSink).flush(); };
+      send(`refresh-client -C ${size}`);
+      clients.push({ proc, out });
+      return { send, layouts: () => (out.text.match(/^%layout-change /gm) ?? []).length, out };
+    },
+    async cleanup() {
+      for (const c of clients) c.proc.kill();
+      spawnSync("tmux", ["-S", socket, "kill-server"], { env });
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+const tv2Settle = () => new Promise((r) => setTimeout(r, 300));
+
+describe("T-V2 V2-02/V2-03 fixed 100×40 window on a private tmux server", () => {
+  test("T-V2 V2-02 window-size manual keeps 100×40 against a 50×20 and a 200×60 client and after both detach; window-size latest is the negative control", async () => {
+    const x = tv2PrivateTmux();
+    try {
+      expect(x.geometry()).toBe("100x40 100x40");
+      const narrow = x.control("50,20"), wide = x.control("200,60");
+      await tv2Settle();
+      expect(x.t("list-clients", "-F", "#{client_control_mode}").split("\n")).toEqual(["1", "1"]);
+      expect(x.geometry()).toBe("100x40 100x40");
+      // negative control: the same clients do resize a window that is not manual
+      x.t("set-option", "-w", "-t", x.window, "window-size", "latest");
+      narrow.send("refresh-client -C 60,25"); await tv2Settle();
+      const latest = x.geometry();
+      console.log(`T-V2 V2-02 latest with a 60×25 control client: ${latest}`);
+      expect(latest).not.toBe("100x40 100x40");
+      x.t("set-option", "-w", "-t", x.window, "window-size", "manual");
+      x.t("resize-window", "-t", x.window, "-x", "100", "-y", "40");
+      narrow.send("refresh-client -C 30,10"); wide.send("refresh-client -C 240,80"); await tv2Settle();
+      expect(x.geometry()).toBe("100x40 100x40");
+      narrow.send("detach"); wide.send("detach"); await tv2Settle();
+      expect(x.geometry()).toBe("100x40 100x40");
+    } finally { await x.cleanup(); }
+  }, 30_000);
+
+  test("T-V2 V2-03 manual is not an ACL: direct resize-window and a short-lived split still change the window; 100→120→100 between two polls is invisible to polling but each change is a %layout-change", async () => {
+    const x = tv2PrivateTmux();
+    try {
+      const watcher = x.control("100,40"); await tv2Settle();
+      const before = x.geometry(), layouts0 = watcher.layouts();
+      x.t("resize-window", "-t", x.window, "-x", "120", "-y", "40");
+      expect(x.geometry()).toBe("120x40 120x40");
+      x.t("resize-window", "-t", x.window, "-x", "100", "-y", "40");
+      const after = x.geometry(); await tv2Settle();
+      const layouts1 = watcher.layouts();
+      console.log(`T-V2 V2-03 poll ${before} -> ${after}; %layout-change +${layouts1 - layouts0}`);
+      expect(after).toBe(before);
+      expect(layouts1 - layouts0).toBeGreaterThanOrEqual(2);
+      x.t("split-window", "-d", "-t", x.pane, "true"); await tv2Settle();
+      const panes = x.t("list-panes", "-t", x.window, "-F", "#{pane_id}").split("\n");
+      const split = watcher.out.text.split("\n").filter((l) => l.startsWith("%layout-change") && l.includes("["));
+      console.log(`T-V2 V2-03 short split: list-panes=${panes.join(",")} layout=${split.at(-1)}`);
+      expect(panes).toEqual([x.pane]);
+      expect(split.length).toBeGreaterThanOrEqual(1);
+      expect(x.geometry()).toBe("100x40 100x40");
+    } finally { await x.cleanup(); }
+  }, 30_000);
+
+  test("T-V2 V2-03 CSI 100G at width 100 writes the last column without wrapping", async () => {
+    const x = tv2PrivateTmux();
+    try {
+      x.t("respawn-pane", "-k", "-t", x.pane, "printf 'A\\033[100GZ\\nnext\\n'; sleep 1000"); await tv2Settle();
+      const rows = x.t("capture-pane", "-p", "-t", x.pane).split("\n");
+      expect(rows[0]).toBe(`A${" ".repeat(98)}Z`);
+      expect(rows[1]).toBe("next");
+      expect(x.geometry()).toBe("100x40 100x40");
+    } finally { await x.cleanup(); }
+  }, 30_000);
 });

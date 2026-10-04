@@ -1630,6 +1630,45 @@ test('T-fix R10 synthetic root ceiling: the producer write past the fixture cap 
   } finally { await rig.cleanup(); }
 }, 120_000);
 
+// ── PLAN-v2 V2-01 on the real rig (red on the K base; I owns the fix) ──
+// The base can only own an existing pane through attach (v2 has births only);
+// the assertion that matters is the writer: the legacy archive of an owned
+// session never grows (PLAN-v2 §2 cuts W/ContinuousLegacyWriter from the
+// NEWARCH path), and after the flag goes off the capture owner keeps B in H.
+test('T-V2 V2-01 real rig: an owned session gets no legacy write while flag-on (A) or after the flag goes off (B); B reaches the NEWARCH store once', async () => {
+  const rig = await fxRig({ tag: 'v201' });
+  const { startPipeHistoryHostFromEnv, stopPipeHistoryHost } = await import('../../../../src/integrations/pipe-history-host');
+  const { terminalHistoryArchive } = await import('../../../../src/integrations/terminal-history');
+  const legacy = () => terminalHistoryArchive.getManifest('s').totalLines;
+  try {
+    await rig.burst(40);
+    const legacy0 = legacy();
+    let host = await rig.host();
+    const attached = await host.attach('s');
+    console.log(`T-V2 V2-01 attach ${fxWhy(attached)}`);
+    expect(attached.ok).toBe(true);
+    await fxUntil(() => host.status().sessions[0]?.verified === true, 15_000, 'verified before A');
+    const lastA = await rig.burst(20); await rig.pad(30);
+    await fxUntil(() => rig.has(host, lastA), 15_000, `A row ${lastA}`);
+    await host.close(); rig.hosts.length = 0;
+    const legacyA = legacy();
+    await startPipeHistoryHostFromEnv({ CORTEX_NEWARCH_ROOT: rig.root, CORTEX_NEWARCH_TMUX_SOCKET: rig.socket, CORTEX_STREAM_FIRST: '0' }, m => rig.logs.push(m));
+    const lastB = await rig.burst(30); await rig.pad(30);
+    const opened = performance.now();
+    await fxUntil(() => legacy() > legacyA || performance.now() - opened > 4_000, 8_000, 'flag-off settle');
+    const legacyB = legacy();
+    await stopPipeHistoryHost();
+    host = await rig.host();
+    let bStored = true;
+    await fxUntil(() => rig.has(host, lastB), 15_000, `B row ${lastB} in the NEWARCH store`).catch(() => { bStored = false; });
+    const verdict = bStored ? rig.judge(host, lastA + 1, lastB, 'fault').violations : ['B-not-stored'];
+    console.log(`T-V2 V2-01 legacy lines before=${legacy0} flag-on A=${legacyA} flag-off B=${legacyB} lastA=${lastA} lastB=${lastB} store=${verdict.join(',') || 'ok'}`);
+    expect(legacyA - legacy0).toBe(0);
+    expect(legacyB - legacyA).toBe(0);
+    expect(verdict).toEqual([]);
+  } finally { await stopPipeHistoryHost().catch(() => {}); await rig.cleanup(); }
+}, 120_000);
+
 // ── cleanup proof (runs last in this file) ──
 test('T-fix S-12 after every fixture: no socket, FIFO, sender, collector or tmux server of these rigs is left', async () => {
   expect(fxRoots.length).toBeGreaterThan(0);
@@ -1640,3 +1679,725 @@ test('T-fix S-12 after every fixture: no socket, FIFO, sender, collector or tmux
   expect(left).toEqual([]);
   for (const d of fxRoots) expect(existsSync(d)).toBe(false);
 });
+
+// ---------------------------------------------------------------------------
+// NEWARCH v2 lot T (PLAN-v2 §8 V2-01…19 rows owned by T, §9 sampler contract).
+// The reference composition above is the executable spec I/H/S plug into; the
+// mutants prove each judge sees its failure class (§8 minimal mutant list).
+// ---------------------------------------------------------------------------
+import * as TV2K from '../src/stream-contract';
+// T-V2-HARNESS-BEGIN
+// PLAN-v2 §8 lot T: reference composition of the K-v2 contract + independent
+// judges. One capture engine owns H for every NEWARCH pane for life. The model
+// uses K's pure guards (TV2K) at the points where I/H/S must use them; real
+// lots plug their composition into the same scenarios. Mutants below damage
+// one invariant each in an isolated copy and must turn their scenarios red.
+type TV2Key = string;
+type TV2Event = { readonly seq: number; readonly writer: string; readonly holder: string | null;
+  readonly pane: TV2Key | null; readonly kind: string; readonly detail: string };
+interface TV2Row { readonly text: string; readonly ordinal: number }
+interface TV2PaneDisk {
+  desc: TV2K.NewarchV2PaneDescriptor; epoch: string; revision: number; rows: TV2Row[];
+  incidents: Map<string, TV2K.NewarchV2Incident>; receipts: Map<string, TV2K.V2Receipt>;
+  checkpoint: { id: string; through: number; replayFloor: number; revision: number } | null;
+  stopped: boolean; lastAudit: string | null; auditedRevision: number | null; resizesSeen: number;
+}
+interface TV2Disk {
+  lock: { engineId: string; alive: boolean } | null; generation: number; corrupt: boolean;
+  sessions: Map<string, { state: 'reserved' | 'active' | 'closed'; birthOp: string }>;
+  panes: Map<TV2Key, TV2PaneDisk>;
+  journal: Map<string, { pane: TV2K.PaneKey; attachId: string; sessionId: string; activated: boolean }>;
+  raw: Map<TV2Key, { epoch: string; records: string[]; trimmed: number; acked: number; resizes: number }>;
+  emergency: Map<string, TV2K.NewarchV2Incident>; reserveUsed: number; reserveCap: number;
+  legacy: Map<string, string[]>; files: string[]; timers: number; events: TV2Event[];
+  space: { capRows: number };
+}
+interface TV2TmuxPane {
+  id: string; name: string; sessionId: string; window: string; cols: number; rows: number;
+  program: 'held' | 'running' | 'dead'; pipe: string | null; screen: string[]; born: 'gate' | 'raw';
+}
+interface TV2World {
+  disk: TV2Disk; tmux: { serverId: string; next: number; windows: number; panes: Map<string, TV2TmuxPane> };
+  emitted: Map<TV2Key, string[]>; collectorEpoch: string; collectorUp: boolean;
+  flagBirth: boolean; audit: TV2K.V2AuditConfig; captures: number; seq: number;
+  killAt: string | null;
+}
+class TV2Kill extends Error {}
+const tv2Assert = (ok: unknown, msg: string): void => { if (!ok) throw new Error(`T-V2 ${msg}`); };
+const tv2Yield = () => new Promise<void>(r => setTimeout(r, 0));
+const TV2_GEOMETRY = TV2K.v2BirthGeometry(TV2K.NEWARCH_V2_DEFAULT_CONFIG);
+/** Engine-side pane index. PLAN-v2 §2: stable identity -> PaneKey set, never a session name. */
+const tv2Index = (desc: TV2K.NewarchV2PaneDescriptor): TV2Key => TV2K.v2PaneKey(desc.pane);
+
+function tv2World(over: Partial<Pick<TV2World, 'flagBirth' | 'audit'>> & { capRows?: number; reserveCap?: number } = {}): TV2World {
+  return {
+    disk: { lock: null, generation: 0, corrupt: false, sessions: new Map(), panes: new Map(), journal: new Map(),
+      raw: new Map(), emergency: new Map(), reserveUsed: 0, reserveCap: over.reserveCap ?? 4, legacy: new Map(),
+      files: [], timers: 0, events: [], space: { capRows: over.capRows ?? 1_000_000 } },
+    tmux: { serverId: 'srv@1', next: 0, windows: 0, panes: new Map() }, emitted: new Map(),
+    collectorEpoch: 'collector-1', collectorUp: true, flagBirth: over.flagBirth ?? true,
+    audit: over.audit ?? TV2K.NEWARCH_V2_DEFAULT_CONFIG.audit, captures: 0, seq: 0, killAt: null,
+  };
+}
+function tv2PaneOf(w: TV2World, k: TV2Key): TV2TmuxPane | undefined {
+  for (const p of w.tmux.panes.values()) if (TV2K.v2PaneKey({ serverIdentity: w.tmux.serverId, paneId: p.id, birthGeneration: 1 }) === k) return p;
+  return undefined;
+}
+/** Producer output. Bytes reach the spool only through the pane's current pipe. */
+function tv2Emit(w: TV2World, paneId: string, text: string): void {
+  const p = w.tmux.panes.get(paneId); tv2Assert(p && p.program === 'running', `emit on ${paneId} that is not running`);
+  const k = TV2K.v2PaneKey({ serverIdentity: w.tmux.serverId, paneId, birthGeneration: 1 });
+  p!.screen.push(text); if (p!.screen.length > p!.rows) p!.screen.shift();
+  w.emitted.set(k, [...(w.emitted.get(k) ?? []), text]);
+  const raw = w.disk.raw.get(k);
+  if (p!.pipe && raw && w.collectorUp && p!.pipe === raw.epoch) raw.records.push(text);
+}
+/** Raw tmux command outside the gate (split/new-window/resize). */
+function tv2RawSplit(w: TV2World, paneId: string): string {
+  const src = w.tmux.panes.get(paneId)!; const id = `%${w.tmux.next++}`;
+  src.cols = Math.floor((src.cols - 1) / 2);
+  w.tmux.panes.set(id, { id, name: src.name, sessionId: src.sessionId, window: src.window, cols: src.cols, rows: src.rows,
+    program: 'running', pipe: null, screen: [], born: 'raw' });
+  return id;
+}
+/** Any resize (product or raw). A live collector journals the layout change (S's hook). */
+function tv2Resize(w: TV2World, paneId: string, cols: number): void {
+  const p = w.tmux.panes.get(paneId)!; p.cols = cols;
+  const raw = w.disk.raw.get(TV2K.v2PaneKey({ serverIdentity: w.tmux.serverId, paneId, birthGeneration: 1 }));
+  if (raw && w.collectorUp) raw.resizes++;
+}
+function tv2Keeper(w: TV2World): void {
+  for (const p of w.tmux.panes.values()) {
+    if (p.program !== 'running') continue;
+    const session: TV2K.NewarchV2SessionKey = { serverIdentity: w.tmux.serverId, sessionId: p.sessionId };
+    const owner: TV2K.V2OwnerLookup = w.disk.corrupt ? { kind: 'unknown', reason: 'corrupt' }
+      : w.disk.sessions.has(p.sessionId) ? { kind: 'capture-engine', pane: tv2Descriptor(w, p, 'lookup') }
+      : { kind: 'legacy', session };
+    if (!TV2K.v2LegacyAppendAllowed(owner, session)) continue;
+    const old = w.disk.legacy.get(p.name) ?? [];
+    const fresh = p.screen.filter(t => !old.includes(t));
+    if (!fresh.length) continue;
+    w.disk.legacy.set(p.name, [...old, ...fresh]);
+    w.disk.events.push({ seq: w.seq++, writer: 'legacy', holder: w.disk.lock?.engineId ?? null, pane: null, kind: 'legacy-append', detail: `${p.sessionId}:${fresh.length}` });
+  }
+}
+function tv2Descriptor(w: TV2World, p: TV2TmuxPane, birthOp: string, state: TV2K.NewarchV2PaneDescriptor['state'] = 'active'): TV2K.NewarchV2PaneDescriptor {
+  return { schema: 'newarch-v2', session: { serverIdentity: w.tmux.serverId, sessionId: p.sessionId },
+    pane: { serverIdentity: w.tmux.serverId, paneId: p.id, birthGeneration: 1 }, windowId: p.window,
+    owner: 'capture-engine', birthOperationId: birthOp, geometry: TV2_GEOMETRY, state };
+}
+function tv2Incident(pane: TV2PaneDisk, reason: TV2K.NewarchV2Incident['reason'], op: string, stop: boolean,
+  after: number | null = pane.rows.at(-1)?.ordinal ?? null): TV2K.NewarchV2Incident {
+  const row = (n: number | null) => n === null ? null : { pane: pane.desc.pane, segmentId: 'seg', rowOrdinal: n };
+  const incident: TV2K.NewarchV2Incident = { schema: 'newarch-v2', incidentId: TV2K.v2IncidentId(pane.desc.pane, op),
+    pane: pane.desc.pane, reason, frontier: row(pane.rows.at(-1)?.ordinal ?? null), affected: { after: row(after), through: null },
+    openedAtWallMs: 1, openedAtMonoMs: 1, clockEpoch: 'tv2', collecting: !stop, missing: { countKind: 'unknown', missingCount: null },
+    ruleVersion: '1', configVersion: TV2_GEOMETRY.configVersion, geometry: TV2_GEOMETRY, revision: pane.revision,
+    sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+    action: stop ? 'gap-and-stop' : 'annotate', evidence: null };
+  TV2K.validateV2Incident(incident);
+  return incident;
+}
+
+function tv2Engine(w: TV2World, engineId: string) {
+  const d = w.disk;
+  if (d.corrupt) return { opened: false as const, reason: 'owner-store-corrupt' };
+  if (d.lock?.alive) return { opened: false as const, reason: 'locked' };
+  d.lock = { engineId, alive: true }; d.generation++;
+  const generation = d.generation; let dead = false; let closed = false;
+  const queues = new Map<string, Promise<unknown>>();
+  const serial = <T>(key: string, f: () => Promise<T>): Promise<T> => {
+    const next = (queues.get(key) ?? Promise.resolve()).then(f);
+    queues.set(key, next.catch(() => {})); return next;
+  };
+  const live = () => !dead && d.lock?.engineId === engineId && d.lock.alive && d.generation === generation;
+  const barrier = (at: string) => { if (w.killAt === at) { w.killAt = null; kill(); throw new TV2Kill(at); } };
+  /** H transaction: capability + lock + generation checked inside every write. */
+  async function write(pane: TV2Key | null, kind: string, apply: () => void, detail = '', writer = `engine:${engineId}`): Promise<void> {
+    await tv2Yield();
+    if (!live()) throw new Error(`T-V2 capability refused for ${engineId}`);
+    apply();
+    d.events.push({ seq: w.seq++, writer, holder: d.lock?.engineId ?? null, pane, kind, detail });
+  }
+  function kill(): void { dead = true; if (d.lock?.engineId === engineId) d.lock.alive = false; }
+  async function incident(k: TV2Key, reason: TV2K.NewarchV2Incident['reason'], op: string, stop: boolean, after?: number | null): Promise<void> {
+    const p = d.panes.get(k)!; const i = tv2Incident(p, reason, op, stop, after);
+    if (p.incidents.has(i.incidentId)) return;
+    await write(k, stop ? 'stop' : 'incident', () => { p.incidents.set(i.incidentId, i); if (stop) p.stopped = true; }, reason);
+    if (stop) retire(k);
+  }
+  function retire(k: TV2Key): void {
+    const p = tv2PaneOf(w, k); const raw = d.raw.get(k);
+    if (p && raw && p.pipe === raw.epoch) p.pipe = null;
+  }
+  function observe(k: TV2Key): TV2K.V2GeometryObservation | null {
+    const p = tv2PaneOf(w, k); if (!p || p.program === 'dead') return null;
+    const inWindow = [...w.tmux.panes.values()].filter(x => x.window === p.window && x.program !== 'dead').length;
+    return { pane: { serverIdentity: w.tmux.serverId, paneId: p.id, birthGeneration: 1 }, windowId: p.window,
+      window: { columns: p.cols, rows: p.rows }, terminal: { columns: p.cols, rows: p.rows }, panesInWindow: inWindow };
+  }
+  async function pumpNow(k: TV2Key): Promise<void> {
+    const p = d.panes.get(k); const raw = d.raw.get(k);
+    if (!p || !raw || p.stopped) return;
+    const seen = observe(k);
+    if (!seen || !TV2K.v2GeometryMatches(p.desc, seen) || raw.resizes !== p.resizesSeen) {
+      await incident(k, 'geometry-violation', `geometry:${raw.acked}`, true, p.checkpoint ? p.rows.at(-1)?.ordinal ?? null : null);
+      return;
+    }
+    if (raw.epoch !== p.epoch) { await incident(k, 'collector-epoch-changed', `epoch:${raw.epoch}`, true); return; }
+    const end = raw.records.length; if (end <= raw.acked) return;
+    const batch = raw.records.slice(raw.acked, end);
+    if (batch.some(t => t.startsWith('\u0000'))) { await incident(k, 'decoder-anomaly', `protocol:${raw.acked}`, true); return; }
+    const op = `batch:${raw.acked}:${end}`;
+    if (p.rows.length + batch.length > d.space.capRows) {
+      // SQLITE_FULL: H cannot write. S journals the incident in the engine's reserve, no ACK.
+      const i = tv2Incident(p, 'budget-exhausted', `full:${raw.acked}`, true);
+      if (!d.emergency.has(i.incidentId)) {
+        if (d.reserveUsed >= d.reserveCap) throw new Error('T-V2 reserve exhausted: intake must stop, durability gate fails');
+        d.emergency.set(i.incidentId, i); d.reserveUsed++;
+      }
+      retire(k); return;
+    }
+    barrier('before-commit');
+    const digest = TV2K.v2Digest('tv2-batch', { k, op, batch });
+    const fence: TV2K.V2WriteFence = { operationId: op, pane: p.desc.pane, expectedGeneration: generation, expectedRevision: p.revision, digest };
+    const disposition = TV2K.v2WriteDisposition(fence, d.generation, p.revision, p.receipts.get(op) ?? null);
+    if (disposition === 'integrity' || disposition === 'stale') throw new Error(`T-V2 write ${disposition}`);
+    if (disposition === 'commit') {
+      await write(k, 'batch', () => {
+        const base = p.rows.length;
+        p.rows.push(...batch.map((text, j) => ({ text, ordinal: base + j })));
+        p.revision++;
+        p.checkpoint = { id: `ck-${p.revision}`, through: end, replayFloor: end, revision: p.revision };
+        p.receipts.set(op, { schema: 'newarch-v2', kind: 'ssot-durable', operationId: op, pane: p.desc.pane, digest,
+          commitId: `c-${p.revision}`, generation, revision: p.revision, frontier: null, checkpointId: p.checkpoint.id });
+      }, op);
+    }
+    barrier('commit-before-ack');
+    const receipt = p.receipts.get(op)!;
+    tv2Assert(receipt.checkpointId === p.checkpoint?.id || disposition === 'retry', 'receipt/checkpoint mismatch');
+    raw.acked = end;
+    barrier('ack-before-trim');
+    const trimThrough = Math.min(p.checkpoint!.replayFloor, raw.acked);
+    raw.trimmed = Math.max(raw.trimmed, trimThrough);
+    d.events.push({ seq: w.seq++, writer: `spool:${engineId}`, holder: d.lock?.engineId ?? null, pane: k, kind: 'trim', detail: `${trimThrough}/${p.checkpoint!.replayFloor}/${raw.acked}` });
+  }
+  const engine = {
+    opened: true as const, engineId, generation,
+    get dead() { return dead; }, kill,
+    pump: (k: TV2Key) => serial(k, () => pumpNow(k)),
+    pumpAll: async () => { for (const k of [...d.panes.keys()]) await engine.pump(k); },
+    /** PLAN-v2 §3 birth order. Errors before release return a typed failure; never legacy. */
+    async birth(name: string, sessionId: string, opts: { window?: 'new-session' | 'new-window'; failAt?: string } = {}) {
+      const op = `birth:${sessionId}:${w.tmux.next}`;
+      if (!w.flagBirth) return { status: 'rejected' as const, reason: 'disabled', programReleased: false };
+      if (!d.sessions.has(sessionId)) await write(null, 'reserve', () => d.sessions.set(sessionId, { state: 'reserved', birthOp: op }), sessionId);
+      const id = `%${w.tmux.next++}`; const window = `@${w.tmux.windows++}`;
+      const p: TV2TmuxPane = { id, name, sessionId, window, cols: 80, rows: 24, program: 'held', pipe: null, screen: [], born: 'gate' };
+      w.tmux.panes.set(id, p);
+      const desc = tv2Descriptor(w, p, op); const k = tv2Index(desc);
+      p.cols = TV2_GEOMETRY.columns; p.rows = TV2_GEOMETRY.rows;
+      if (opts.failAt === 'geometry') { p.cols = 99; }
+      const attachId = `${w.collectorEpoch}:${id}`;
+      d.raw.set(TV2K.v2PaneKey(desc.pane), { epoch: attachId, records: [], trimmed: 0, acked: 0, resizes: 0 }); p.pipe = attachId;
+      d.journal.set(op, { pane: desc.pane, attachId, sessionId, activated: false });
+      const seen = observe(TV2K.v2PaneKey(desc.pane));
+      if (!seen || !TV2K.v2GeometryMatches(desc, seen) || opts.failAt === 'binding') {
+        p.pipe = null; p.program = 'dead'; w.tmux.panes.delete(id); d.raw.delete(TV2K.v2PaneKey(desc.pane));
+        await write(null, 'cancel-birth', () => d.journal.delete(op), op);
+        return { status: 'rejected' as const, reason: seen ? 'geometry' : 'binding', programReleased: false, cleanup: 'complete' };
+      }
+      barrier('ready-before-binding');
+      await write(k, 'activate', () => {
+        d.panes.set(k, { desc, epoch: attachId, revision: 0, rows: [], incidents: new Map(), receipts: new Map(),
+          checkpoint: null, stopped: false, lastAudit: null, auditedRevision: null, resizesSeen: 0 });
+        d.sessions.get(sessionId)!.state = 'active'; d.journal.get(op)!.activated = true;
+      }, op);
+      p.program = 'running';
+      return { status: 'active' as const, paneId: id, key: k };
+    },
+    /** Boot/resume: recover journal bindings, then prove continuity before replay. */
+    async resume(): Promise<void> {
+      for (const [op, j] of d.journal) {
+        if (j.activated) continue;
+        const k = TV2K.v2PaneKey(j.pane); const p = w.tmux.panes.get(j.pane.paneId);
+        if (p && p.pipe === j.attachId) p.pipe = null;
+        if (p && p.program === 'held') { p.program = 'dead'; w.tmux.panes.delete(p.id); }
+        await write(k, 'unrecorded-birth', () => {
+          const desc = { ...tv2Descriptor(w, p ?? { id: j.pane.paneId, name: '', sessionId: j.sessionId, window: '@?', cols: 0, rows: 0, program: 'dead', pipe: null, screen: [], born: 'gate' }, op), state: 'stopped' as const };
+          const pd: TV2PaneDisk = { desc, epoch: j.attachId, revision: 0, rows: [], incidents: new Map(), receipts: new Map(),
+            checkpoint: null, stopped: true, lastAudit: null, auditedRevision: null, resizesSeen: 0 };
+          const i = tv2Incident(pd, 'birth-failed', `recover:${op}`, true, null);
+          pd.incidents.set(i.incidentId, i); d.panes.set(k, pd); j.activated = true;
+        }, op);
+      }
+      for (const [id, i] of [...d.emergency]) {
+        const k = TV2K.v2PaneKey(i.pane); const p = d.panes.get(k)!;
+        if (p.rows.length >= d.space.capRows) continue;
+        await write(k, 'materialize', () => { p.incidents.set(id, i); p.stopped = true; d.emergency.delete(id); }, i.incidentId);
+        d.reserveUsed--;
+      }
+      for (const [k, p] of d.panes) {
+        if (p.stopped) continue;
+        const tp = tv2PaneOf(w, k); const raw = d.raw.get(k);
+        const proof: TV2K.V2ResumeProof['kind'] | string = !tp || tp.program === 'dead' ? 'identity'
+          : !raw || raw.epoch !== p.epoch || tp.pipe !== raw.epoch ? 'collector-epoch'
+          : raw.trimmed > raw.acked ? 'raw' : raw.resizes !== p.resizesSeen ? 'geometry' : 'continuous';
+        if (proof === 'continuous') { await engine.pump(k); continue; }
+        if (tp && raw && tp.pipe === raw.epoch) tp.pipe = null;
+        await incident(k, proof === 'collector-epoch' ? 'collector-epoch-changed' : 'unverified-restart', `resume:${proof}:${p.revision}`, true);
+      }
+    },
+    /** Topology inventory: panes in a v2 session that the gate did not create. */
+    async inventory(): Promise<void> {
+      for (const tp of w.tmux.panes.values()) {
+        const k = TV2K.v2PaneKey({ serverIdentity: w.tmux.serverId, paneId: tp.id, birthGeneration: 1 });
+        if (!d.sessions.has(tp.sessionId) || d.panes.has(k) || tp.born !== 'raw') continue;
+        await write(k, 'unrecorded-birth', () => {
+          const pd: TV2PaneDisk = { desc: tv2Descriptor(w, tp, `raw:${tp.id}`, 'unrecorded'), epoch: '', revision: 0, rows: [],
+            incidents: new Map(), receipts: new Map(), checkpoint: null, stopped: true, lastAudit: null, auditedRevision: null, resizesSeen: 0 };
+          const i = tv2Incident(pd, 'unrecorded-birth', `raw:${tp.id}`, true, null); pd.incidents.set(i.incidentId, i); d.panes.set(k, pd);
+        }, tp.id);
+      }
+    },
+    incident: (k: TV2Key, reason: TV2K.NewarchV2Incident['reason'], op: string, stop = true) => serial(k, () => incident(k, reason, op, stop)),
+    /** Auditor: capture-pane visible screen, compare against the DB projection at one revision. */
+    async audit(k: TV2Key, between?: () => Promise<void>): Promise<string> {
+      if (!w.audit.enabled) return 'disabled';
+      const p = d.panes.get(k)!; const raw = d.raw.get(k)!; const tp = tv2PaneOf(w, k);
+      if (!tp || tp.program === 'dead') return 'pane-dead';
+      w.captures++;
+      const revision = p.revision, acked = raw.acked, snapshot = [...tp.screen];
+      if (between) await between();
+      return serial(k, async () => {
+        if (raw.records.length !== raw.acked || raw.acked !== acked || p.revision !== revision) {
+          await write(k, 'audit-status', () => { p.lastAudit = 'inconclusive:racing'; }, 'racing');
+          return 'inconclusive';
+        }
+        const stored = p.rows.slice(-snapshot.length).map(r => r.text);
+        if (stored.join('\n') === snapshot.join('\n')) {
+          await write(k, 'audit-status', () => { p.lastAudit = 'match'; p.auditedRevision = revision; }, `match@${revision}`);
+          return 'match';
+        }
+        const first = stored.findIndex((t, j) => t !== snapshot[j]);
+        const after = first <= 0 ? (p.rows.length > stored.length ? p.rows[p.rows.length - stored.length - 1]!.ordinal : null) : p.rows[p.rows.length - stored.length + first - 1]!.ordinal;
+        await write(k, 'audit-annotate', () => {
+          const i = tv2Incident(p, 'audit-mismatch', `audit:${revision}`, false, after);
+          p.incidents.set(i.incidentId, i); p.lastAudit = 'annotate';
+        }, `expected=${revision} revision=${p.revision}`);
+        return 'annotate';
+      });
+    },
+    async close(): Promise<void> {
+      closed = true;
+      await Promise.all([...queues.values()]);
+      if (live()) d.lock = null;
+    },
+    get closed() { return closed; },
+  };
+  return engine;
+}
+function tv2Open(w: TV2World, id: string): Extract<ReturnType<typeof tv2Engine>, { opened: true }> {
+  const e = tv2Engine(w, id); tv2Assert(e.opened, `engine ${id} did not open: ${(e as { reason?: string }).reason}`);
+  return e as Extract<ReturnType<typeof tv2Engine>, { opened: true }>;
+}
+
+/** Independent judge over the disk log and the producer oracle. */
+function tv2Judge(w: TV2World, opts: { normal?: boolean } = {}): string[] {
+  const v = new Set<string>(); const d = w.disk;
+  const v2Sessions = new Set(d.events.filter(e => e.kind === 'reserve').map(e => e.detail));
+  for (const e of d.events) {
+    if (e.kind === 'trim') { const [t, floor, acked] = e.detail.split('/').map(Number); if (t! > floor! || t! > acked!) v.add('early-trim'); continue; }
+    if (e.writer === 'legacy') { if (v2Sessions.has(e.detail.split(':')[0]!)) v.add('legacy-write-v2'); continue; }
+    if (e.writer !== `engine:${e.holder}`) v.add('second-writer');
+    if (e.kind === 'audit-annotate' || e.kind === 'audit-repair') {
+      const m = /expected=(\d+) revision=(\d+)/.exec(e.detail); if (m && m[1] !== m[2]) v.add('stale-audit');
+    }
+  }
+  for (const [sid, s] of d.sessions) if (!['reserved', 'active', 'closed'].includes(s.state)) v.add(`owner-state:${sid}`);
+  for (const [k, p] of d.panes) {
+    const stops = d.events.filter(e => e.pane === k && e.kind === 'stop');
+    const stopAt = stops[0]?.seq ?? Infinity;
+    if (d.events.some(e => e.pane === k && e.kind === 'batch' && e.seq > stopAt)) v.add('commit-after-stop');
+    // resume must prove continuity BEFORE replaying: no batch of that engine precedes its unproven-resume stop
+    for (const s of stops.filter(e => e.detail === 'unverified-restart' || e.detail === 'collector-epoch-changed')) {
+      const since = d.events.find(e => e.holder === s.holder)?.seq ?? s.seq;
+      if (d.events.some(e => e.pane === k && e.kind === 'batch' && e.holder === s.holder && e.seq >= since && e.seq < s.seq)) v.add('replay-before-proof');
+    }
+    const texts = p.rows.map(r => r.text);
+    if (new Set(texts).size !== texts.length) v.add('duplicate');
+    const emitted = w.emitted.get(k) ?? [];
+    const pos = texts.map(t => emitted.indexOf(t));
+    if (pos.some((x, i) => x < 0 || (i > 0 && x <= pos[i - 1]!))) v.add('order-or-foreign');
+    const incidents = [...p.incidents.values(), ...[...d.emergency.values()].filter(i => TV2K.v2PaneKey(i.pane) === k)];
+    const gaps = incidents.filter(i => i.action === 'gap-and-stop');
+    if (opts.normal && incidents.length) v.add('incident-in-normal');
+    // every emitted event is stored once, or lies after a positioned stop gap
+    let last: number | null = null;
+    for (const t of emitted) {
+      const at = texts.indexOf(t);
+      if (at >= 0) { last = p.rows[at]!.ordinal; continue; }
+      const covered = gaps.some(g => g.affected.through === null
+        && (g.affected.after === null || (last !== null && g.affected.after.rowOrdinal <= last)));
+      if (!covered) { v.add('silent-loss'); break; }
+    }
+    const tp = tv2PaneOf(w, k); const raw = d.raw.get(k);
+    if (p.stopped && tp && raw && tp.pipe === raw.epoch) v.add('stopped-pipe-left-open');
+  }
+  for (const p of w.tmux.panes.values()) if (p.born === 'gate' && p.program === 'running' && !p.pipe) {
+    const k = TV2K.v2PaneKey({ serverIdentity: w.tmux.serverId, paneId: p.id, birthGeneration: 1 });
+    const pending = [...d.emergency.values()].some(i => TV2K.v2PaneKey(i.pane) === k);
+    if (!d.panes.get(k)?.stopped && !pending) v.add('running-without-pipe');
+  }
+  return [...v].sort();
+}
+const tv2Lines = (n: number, from = 1, tag = 'A') => Array.from({ length: n }, (_, i) => `E${String(from + i).padStart(5, '0')} ${tag}`);
+const tv2Rows = (w: TV2World, k: TV2Key) => w.disk.panes.get(k)?.rows.map(r => r.text) ?? [];
+const tv2Expect = (w: TV2World, want: string[], opts: { normal?: boolean } = {}) => {
+  const got = tv2Judge(w, opts); tv2Assert(got.join(',') === want.join(','), `judge expected [${want}] got [${got}]`);
+};
+
+/** §9 sampler contract (Q): online sums only, PID+startTime identity, missing read invalidates. */
+function tv2Sampler() {
+  const s = { n: 0, st: 0, sy: 0, stt: 0, sty: 0, max: 0, valid: true, reason: '', windows: [0, 0, 0, 0, 0, 0] as number[],
+    tree: new Map<number, string>() };
+  return {
+    add(tMin: number, procs: readonly { pid: number; startTime: string; pss: number | null; product: boolean }[]): void {
+      let y = 0;
+      for (const p of procs) {
+        if (!p.product) continue;
+        const known = s.tree.get(p.pid);
+        if (known !== undefined && known !== p.startTime) { s.valid = false; s.reason = 'pid-reuse'; }
+        s.tree.set(p.pid, p.startTime);
+        if (p.pss === null) { s.valid = false; s.reason = 'missing-sample'; continue; }
+        y += p.pss;
+      }
+      s.max = Math.max(s.max, y);
+      for (const [i, [a, b]] of ([[10, 20], [30, 40], [50, 60]] as const).entries()) if (tMin >= a && tMin < b) { s.windows[i * 2]! += y; s.windows[i * 2 + 1]!++; }
+      if (tMin < 10) return;
+      const t = tMin / 60; s.n++; s.st += t; s.sy += y; s.stt += t * t; s.sty += t * y;
+    },
+    verdict() {
+      const slope = (s.n * s.sty - s.st * s.sy) / (s.n * s.stt - s.st * s.st);
+      const mean = (i: number) => s.windows[i * 2]! / Math.max(1, s.windows[i * 2 + 1]!);
+      const pass = s.valid && s.max <= 1536 && slope <= 10 && mean(1) - mean(0) <= 10 && mean(2) - mean(0) <= 10;
+      return { pass, valid: s.valid, reason: s.reason, slope, max: s.max, means: [mean(0), mean(1), mean(2)] };
+    },
+    /** Retained slots: arrays/maps count their entries, scalars count one. */
+    stateBytes: () => Object.values(s).reduce((n: number, x) => n + (Array.isArray(x) ? x.length : x instanceof Map ? x.size : 1), 0),
+  };
+}
+
+const tv2Scenarios: Record<string, () => Promise<void>> = {
+  /** V2-01 Codex F1: A, flag off, B (live and across restart). */
+  async 'V2-01 flag off closes the birth gate only: B lands in H once, no legacy write, cap still enforced'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const born = await e.birth('work', 'S1'); tv2Assert(born.status === 'active', 'birth');
+    const { paneId, key } = born as { paneId: string; key: string };
+    for (const t of tv2Lines(5)) tv2Emit(w, paneId, t); await e.pumpAll();
+    w.flagBirth = false;
+    for (const t of tv2Lines(5, 6)) tv2Emit(w, paneId, t); await e.pumpAll(); tv2Keeper(w);
+    tv2Assert(tv2Rows(w, key).length === 10, `live flag-off rows ${tv2Rows(w, key).length}`);
+    tv2Assert((await e.birth('next', 'S2')).status === 'rejected', 'flag off still admits births');
+    e.kill();
+    for (const t of tv2Lines(5, 11)) tv2Emit(w, paneId, t);
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); tv2Keeper(w);
+    tv2Assert(tv2Rows(w, key).length === 15, `restart flag-off rows ${tv2Rows(w, key).length}`);
+    tv2Expect(w, [], { normal: true });
+    w.disk.space.capRows = 16; for (const t of tv2Lines(5, 16)) tv2Emit(w, paneId, t); await e2.pumpAll();
+    tv2Assert(w.disk.emergency.size === 1, 'cap did not stop the pane while the flag is off');
+    tv2Keeper(w); tv2Expect(w, []);
+  },
+  /** V2-04 Codex F3/R14: collector READY, host killed before persisting activation. */
+  async 'V2-04 kill after collector READY before binding: journal recovery retires own pipe, foreign pipe untouched, no candidate rows'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const foreign = await e.birth('other', 'S0'); tv2Assert(foreign.status === 'active', 'first birth');
+    const f = w.tmux.panes.get((foreign as { paneId: string }).paneId)!; f.pipe = 'someone-else';
+    w.killAt = 'ready-before-binding';
+    let killed = false; try { await e.birth('work', 'S1'); } catch (err) { killed = err instanceof TV2Kill; }
+    tv2Assert(killed, 'barrier not reached');
+    const held = [...w.tmux.panes.values()].find(p => p.name === 'work')!;
+    tv2Assert(held.program === 'held' && held.pipe !== null, 'program released before activation');
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); tv2Keeper(w);
+    tv2Assert(!w.tmux.panes.has(held.id) || w.tmux.panes.get(held.id)!.pipe === null, 'own pipe not retired');
+    tv2Assert(f.pipe === 'someone-else', 'foreign pipe changed');
+    const rec = [...w.disk.panes.values()].find(p => p.desc.pane.paneId === held.id)!;
+    tv2Assert(rec && rec.stopped && rec.rows.length === 0, 'recovered pane published rows or is not stopped');
+    tv2Assert([...rec.incidents.values()].some(i => i.frontier === null && i.reason === 'birth-failed'), 'no frontier=null incident');
+    tv2Assert(w.disk.sessions.get('S1')?.state !== undefined, 'owner tombstone lost');
+    tv2Expect(w, []);
+  },
+  /** V2-05: storage fault before the first ACK, restart with flag off. */
+  async 'V2-05 incident before first ACK survives restart and flag-off with frontier=null'() {
+    const w = tv2World({ capRows: 0 }); const e = tv2Open(w, 'e1');
+    const { paneId, key } = await e.birth('work', 'S1') as { paneId: string; key: string };
+    tv2Emit(w, paneId, 'E00001 A'); await e.pumpAll();
+    tv2Assert(w.disk.raw.get(key)!.acked === 0, 'ACK after failed write');
+    const pending = [...w.disk.emergency.values()];
+    tv2Assert(pending.length === 1 && pending[0]!.frontier === null, 'no pending incident with frontier=null');
+    e.kill(); w.flagBirth = false; w.disk.space.capRows = 100;
+    const e2 = tv2Open(w, 'e2'); await e2.resume();
+    const p = w.disk.panes.get(key)!;
+    const durable = [...p.incidents.values()];
+    tv2Assert(durable.length === 1 && durable[0]!.incidentId === pending[0]!.incidentId && durable[0]!.frontier === null, 'incident not materialized once with same id');
+    tv2Assert(w.disk.emergency.size === 0 && w.disk.reserveUsed === 0, 'reserve not rearmed');
+    tv2Expect(w, []);
+  },
+  /** V2-06 F5/M-FINAL-1/R10: first burst committed, then fill. */
+  async 'V2-06 burst commits first, the fill stops with a positioned incident and keeps unconfirmed raw'() {
+    const w = tv2World({ capRows: 30 }); const e = tv2Open(w, 'e1');
+    const { paneId, key } = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(20)) tv2Emit(w, paneId, t); await e.pumpAll();
+    tv2Assert(tv2Rows(w, key).length === 20, 'first burst not admitted');
+    for (const t of tv2Lines(20, 21)) tv2Emit(w, paneId, t); await e.pumpAll();
+    const raw = w.disk.raw.get(key)!;
+    tv2Assert(raw.acked === 20 && raw.records.length === 40 && raw.trimmed <= 20, 'unconfirmed raw trimmed or ACKed');
+    const i = [...w.disk.emergency.values()][0];
+    tv2Assert(i && i.frontier?.rowOrdinal === 19, `incident frontier ${JSON.stringify(i?.frontier)}`);
+    tv2Assert(w.tmux.panes.get(paneId)!.pipe === null, 'pipe still open after full');
+    tv2Expect(w, []);
+  },
+  /** V2-07 B-FINAL-1: two windows, stop one, rename, reuse the name. */
+  async 'V2-07 two windows keep separate PaneKeys; stop one, rename, reuse the name: keeper never writes v2'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    const b = await e.birth('work', 'S1', { window: 'new-window' }) as { paneId: string; key: string };
+    tv2Assert(a.key !== b.key && w.disk.panes.size === 2, 'two windows share one record');
+    for (const t of tv2Lines(3, 1, 'a')) tv2Emit(w, a.paneId, t);
+    for (const t of tv2Lines(3, 1, 'b')) tv2Emit(w, b.paneId, t);
+    await e.pumpAll();
+    await e.incident(a.key, 'identity-change', 'stop-a');
+    for (const t of tv2Lines(3, 4, 'b')) tv2Emit(w, b.paneId, t); await e.pumpAll();
+    tv2Assert(tv2Rows(w, b.key).length === 6 && tv2Rows(w, a.key).length === 3, 'stopping one window stopped the other');
+    for (const p of w.tmux.panes.values()) if (p.sessionId === 'S1') p.name = 'renamed';
+    w.tmux.panes.set('%90', { id: '%90', name: 'work', sessionId: 'L1', window: '@90', cols: 80, rows: 24, program: 'running', pipe: null, screen: ['plain'], born: 'raw' });
+    for (const t of tv2Lines(2, 7, 'b')) tv2Emit(w, b.paneId, t);
+    tv2Keeper(w); await e.pumpAll();
+    tv2Assert(JSON.stringify(w.disk.legacy.get('work')) === '["plain"]', `legacy store ${JSON.stringify([...w.disk.legacy])}`);
+    tv2Assert(tv2Rows(w, b.key).length === 8, 'renamed v2 pane stopped collecting');
+    tv2Expect(w, []);
+  },
+  /** V2-08 B-FINAL-1: raw split outside the gate. */
+  async 'V2-08 raw split: no legacy fallback, the original pane stops with geometry-violation, the new pane is not adopted'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(4)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+    const raw = tv2RawSplit(w, a.paneId);
+    tv2Emit(w, a.paneId, 'E00005 A'); tv2Emit(w, raw, 'raw-pane');
+    await e.pumpAll(); await e.inventory(); tv2Keeper(w);
+    const p = w.disk.panes.get(a.key)!;
+    tv2Assert(p.stopped && [...p.incidents.values()].some(i => i.reason === 'geometry-violation' && i.affected.after?.rowOrdinal === 3), 'geometry violation not positioned');
+    tv2Assert(tv2Rows(w, a.key).length === 4, 'a batch after the violation was published');
+    const unrecorded = [...w.disk.panes.values()].find(x => x.desc.pane.paneId === raw);
+    tv2Assert(unrecorded && unrecorded.desc.state === 'unrecorded' && unrecorded.rows.length === 0 && !w.disk.raw.has(TV2K.v2PaneKey(unrecorded.desc.pane))
+      && [...unrecorded.incidents.values()].some(i => i.reason === 'unrecorded-birth' && i.frontier === null), 'raw pane adopted or not listed as unrecorded');
+    tv2Assert(!w.disk.legacy.size, 'legacy fallback for a v2 session');
+    tv2Expect(w, []);
+  },
+  /** V2-09 M-FINAL-2/R15: collector changes while the host is down. */
+  async 'V2-09 collector epoch change during downtime: gap + stop under the same owner, no rebind, no capture'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(4)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+    e.kill(); w.collectorUp = false; tv2Emit(w, a.paneId, 'E00005 A');
+    w.collectorEpoch = 'collector-2'; w.collectorUp = true;
+    w.disk.raw.get(a.key)!.epoch = `collector-2:${a.paneId}`;
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); tv2Keeper(w);
+    const p = w.disk.panes.get(a.key)!;
+    tv2Assert(p.stopped && [...p.incidents.values()].some(i => i.reason === 'collector-epoch-changed' && i.action === 'gap-and-stop'), 'epoch change not a stop gap');
+    tv2Assert(w.captures === 0 && w.tmux.panes.get(a.paneId)!.pipe !== `collector-2:${a.paneId}`, 'rebind or recovery capture');
+    tv2Assert(w.disk.sessions.get('S1')!.state === 'active', 'owner changed');
+    tv2Expect(w, []);
+    // a foreign pipe replaced ours while the host was down: no rebind, no replay before the proof
+    const v = tv2World(); const f = tv2Open(v, 'e1');
+    const b = await f.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(3)) tv2Emit(v, b.paneId, t); await f.pumpAll(); f.kill();
+    tv2Emit(v, b.paneId, 'E00004 A'); v.tmux.panes.get(b.paneId)!.pipe = 'foreign'; tv2Emit(v, b.paneId, 'E00005 A');
+    await tv2Open(v, 'e2').resume();
+    tv2Assert(v.disk.panes.get(b.key)!.stopped && v.tmux.panes.get(b.paneId)!.pipe === 'foreign', 'foreign pipe replaced or pane kept collecting');
+    tv2Expect(v, []);
+  },
+  /** V2-10 M-FINAL-3/R09: refusal before release. */
+  async 'V2-10 birth refused before release: typed failure, cleanup, program never ran, no fallback'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const r = await e.birth('work', 'S1', { failAt: 'geometry' });
+    tv2Assert(r.status === 'rejected' && r.programReleased === false && (r as { cleanup?: string }).cleanup === 'complete', `result ${JSON.stringify(r)}`);
+    tv2Assert(![...w.tmux.panes.values()].some(p => p.program === 'running'), 'program ran without a pipe');
+    const ok = await e.birth('work', 'S1') as { paneId: string; key: string };
+    tv2Emit(w, ok.paneId, 'E00001 A'); await e.pumpAll();
+    tv2Assert(tv2Rows(w, ok.key)[0] === 'E00001 A', 'byte0 not first row');
+    tv2Keeper(w); tv2Expect(w, [], { normal: true });
+  },
+  /** V2-11 T1/m-final-1: lost ACK, generation right/wrong. */
+  async 'V2-11 lost ACK: retry with a new generation returns the original receipt; a wrong digest is integrity'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(3)) tv2Emit(w, a.paneId, t);
+    w.killAt = 'commit-before-ack'; await e.pump(a.key).catch((err: unknown) => { if (!(err instanceof TV2Kill)) throw err; });
+    const p = w.disk.panes.get(a.key)!; const receipt = [...p.receipts.values()][0]!;
+    const e2 = tv2Open(w, 'e2'); await e2.resume();
+    tv2Assert(tv2Rows(w, a.key).length === 3 && p.receipts.size === 1 && [...p.receipts.values()][0] === receipt, 'retry duplicated');
+    const fence: TV2K.V2WriteFence = { operationId: receipt.operationId, pane: receipt.pane, expectedGeneration: w.disk.generation, expectedRevision: p.revision, digest: '1'.repeat(64) };
+    tv2Assert(TV2K.v2WriteDisposition(fence, w.disk.generation, p.revision, receipt) === 'integrity', 'wrong digest accepted');
+    tv2Assert(TV2K.v2WriteDisposition({ ...fence, digest: receipt.digest, expectedGeneration: 1 }, w.disk.generation, p.revision, receipt) === 'stale', 'old generation accepted');
+    tv2Expect(w, [], { normal: true });
+  },
+  /** V2-12 T2/m-final-2: protocol vs storage fault, kill mid rearm. */
+  async 'V2-12 protocol fault does not spend reserve; storage fault is durable once; failed writes never ACK'() {
+    const w = tv2World({ capRows: 2, reserveCap: 1 }); const e = tv2Open(w, 'e1');
+    const a = await e.birth('a', 'S1') as { paneId: string; key: string };
+    const b = await e.birth('b', 'S2') as { paneId: string; key: string };
+    tv2Emit(w, a.paneId, '\u0000bad-sequence'); await e.pump(a.key);
+    tv2Assert(w.disk.reserveUsed === 0 && w.disk.panes.get(a.key)!.stopped, 'protocol fault spent reserve or kept going');
+    for (const t of tv2Lines(3, 1, 'b')) tv2Emit(w, b.paneId, t); await e.pump(b.key);
+    tv2Assert(w.disk.reserveUsed === 1 && w.disk.raw.get(b.key)!.acked === 0, 'storage fault ACKed or skipped reserve');
+    await e.pump(b.key); tv2Assert(w.disk.reserveUsed === 1, 'rearm/retry spent reserve twice');
+    e.kill(); w.disk.space.capRows = 10;
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); await e2.resume();
+    tv2Assert(w.disk.reserveUsed === 0 && [...w.disk.panes.get(b.key)!.incidents.values()].length === 1, 'materialized twice or reserve not rearmed');
+    tv2Expect(w, []);
+  },
+  /** V2-14: auditor outcomes through the single writer. */
+  async 'V2-14 auditor: match records a watermark, racing is inconclusive, finalized mismatch annotates, disabled captures nothing'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(50)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+    tv2Assert(await e.audit(a.key) === 'match', 'match');
+    const p = w.disk.panes.get(a.key)!; const rev = p.revision;
+    tv2Assert(await e.audit(a.key, async () => { tv2Emit(w, a.paneId, 'E00051 A'); await e.pump(a.key); }) === 'inconclusive', 'stale snapshot applied');
+    tv2Assert(p.rows.length === 51 && p.revision === rev + 1 && p.auditedRevision === rev, 'inconclusive changed rows/auditedRevision');
+    p.rows[45] = { ...p.rows[45]!, text: 'garbled' };
+    tv2Assert(await e.audit(a.key) === 'annotate', 'mismatch not annotated');
+    tv2Assert(p.rows[45]!.text === 'garbled', 'finalized row overwritten from one screen');
+    tv2Assert([...p.incidents.values()].some(i => i.reason === 'audit-mismatch' && i.affected.after?.rowOrdinal === 44 && i.action === 'annotate'), 'annotation range');
+    const off = tv2World({ audit: { ...TV2K.NEWARCH_V2_DEFAULT_CONFIG.audit, enabled: false } }); const eo = tv2Open(off, 'e1');
+    const o = await eo.birth('work', 'S1') as { paneId: string; key: string };
+    tv2Emit(off, o.paneId, 'E00001 A'); await eo.pumpAll();
+    tv2Assert(await eo.audit(o.key) === 'disabled' && off.captures === 0 && off.disk.timers === 0, 'disabled auditor captured');
+    tv2Assert(!w.disk.events.some(x => x.kind.startsWith('audit') && x.writer !== 'engine:e1'), 'auditor used another writer');
+    p.rows[45] = { ...p.rows[45]!, text: 'E00046 A' };
+    const judged = tv2Judge(w); tv2Assert(judged.join(',') === '', `judge ${judged}`);
+  },
+  /** V2-14 stale: a commit lands between capture and apply. */
+  async 'V2-14 stale audit evidence is dropped, never applied at a newer revision'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(10)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+    const p = w.disk.panes.get(a.key)!; p.rows[9] = { ...p.rows[9]!, text: 'garbled' };
+    const r = await e.audit(a.key, async () => { p.rows[9] = { ...p.rows[9]!, text: 'E00010 A' }; tv2Emit(w, a.paneId, 'E00011 A'); await e.pump(a.key); });
+    tv2Assert(r === 'inconclusive' && ![...p.incidents.values()].length, `stale audit result ${r}`);
+    tv2Expect(w, [], { normal: true });
+  },
+  /** V2-16: kill at every checkpoint/ACK/trim barrier; two engines on one root. */
+  async 'V2-16 kill at each commit/ACK/trim barrier replays once without trimming needed raw; a second engine cannot open'() {
+    for (const at of ['before-commit', 'commit-before-ack', 'ack-before-trim']) {
+      const w = tv2World(); const e = tv2Open(w, 'e1');
+      const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+      for (const t of tv2Lines(3)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+      for (const t of tv2Lines(3, 4)) tv2Emit(w, a.paneId, t);
+      w.killAt = at; await e.pump(a.key).catch((err: unknown) => { if (!(err instanceof TV2Kill)) throw err; });
+      tv2Assert(e.dead, `${at} barrier not reached`);
+      await tv2Open(w, 'e2').resume();
+      tv2Assert(tv2Rows(w, a.key).join() === tv2Lines(6).join(), `${at}: rows ${tv2Rows(w, a.key)}`);
+      tv2Expect(w, [], { normal: true });
+    }
+    const w = tv2World(); tv2Open(w, 'e1');
+    tv2Assert(!tv2Engine(w, 'e2').opened, 'second engine opened the same root');
+    tv2Assert(w.disk.generation === 1, 'refused open bumped generation');
+  },
+  /** V2-03 F2 + m-final-4: actual resize during pump/close, and 100->120->100 while the host is down. */
+  async 'V2-03 resize during pump stops before commit and close waits; 100-120-100 in downtime is never exact'() {
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(5)) tv2Emit(w, a.paneId, t); await e.pumpAll();
+    for (const t of tv2Lines(5, 6)) tv2Emit(w, a.paneId, t);
+    tv2Resize(w, a.paneId, 120);
+    const pumping = e.pump(a.key);
+    await e.close();
+    const p = w.disk.panes.get(a.key)!;
+    tv2Assert(p.stopped && [...p.incidents.values()].some(i => i.reason === 'geometry-violation' && i.affected.after?.rowOrdinal === 4), 'close returned before the durable stop');
+    tv2Assert(tv2Rows(w, a.key).length === 5, 'batch across the violation published as exact');
+    await pumping; tv2Expect(w, []);
+    const v = tv2World(); const f = tv2Open(v, 'e1');
+    const b = await f.birth('work', 'S1') as { paneId: string; key: string };
+    for (const t of tv2Lines(3)) tv2Emit(v, b.paneId, t); await f.pumpAll(); f.kill();
+    tv2Resize(v, b.paneId, 120); tv2Emit(v, b.paneId, 'E00004 A'); tv2Resize(v, b.paneId, 100); tv2Emit(v, b.paneId, 'E00005 A');
+    await tv2Open(v, 'e2').resume();
+    const q = v.disk.panes.get(b.key)!;
+    tv2Assert(q.stopped && tv2Rows(v, b.key).length === 3, `100-120-100 replayed as exact: ${tv2Rows(v, b.key)}`);
+    tv2Assert([...q.incidents.values()].some(i => i.reason === 'unverified-restart' && i.affected.after?.rowOrdinal === 2), 'downtime resize not labelled');
+    tv2Expect(v, []);
+  },
+  /** V2-19 OFF-01/R16: empty root vs owned root with the flag off. */
+  async 'V2-19 empty root flag-off creates nothing; an owned root keeps serving its pane'() {
+    const empty = tv2World({ flagBirth: false });
+    tv2Assert(empty.disk.files.length === 0 && empty.disk.timers === 0 && empty.disk.lock === null, 'empty root touched');
+    const w = tv2World(); const e = tv2Open(w, 'e1');
+    const a = await e.birth('work', 'S1') as { paneId: string; key: string };
+    tv2Emit(w, a.paneId, 'E00001 A'); await e.pumpAll(); await e.close();
+    w.flagBirth = false; tv2Emit(w, a.paneId, 'E00002 A');
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); tv2Keeper(w);
+    tv2Assert(tv2Rows(w, a.key).length === 2 && w.disk.sessions.get('S1')!.state === 'active', 'flag off dropped the owner');
+    tv2Expect(w, [], { normal: true });
+  },
+  /** §9 sampler (Q contract): fixed state, PID reuse and missing reads invalidate. */
+  async 'PSS sampler rejects +250 MiB/h, mid growth, missing reads and PID reuse with fixed state'() {
+    const run = (f: (t: number) => number, mutate?: (t: number) => { pid: number; startTime: string; pss: number | null; product: boolean }[]) => {
+      const s = tv2Sampler(); const sizes: number[] = [];
+      for (let i = 0; i <= 3600; i++) { const t = i / 60; s.add(t, mutate?.(t) ?? [{ pid: 10, startTime: 'a', pss: f(t), product: true }, { pid: 11, startTime: 'b', pss: 20, product: true }]); if (i % 900 === 0) sizes.push(s.stateBytes()); }
+      return { ...s.verdict(), sizes };
+    };
+    const flat = run(() => 340);
+    tv2Assert(flat.pass && Math.abs(flat.slope) < 0.001, `flat ${JSON.stringify(flat)}`);
+    tv2Assert(new Set(flat.sizes.slice(1)).size === 1, `sampler state grows ${flat.sizes}`);
+    tv2Assert(!run(t => 340 + 250 * t / 60).pass, '+250 MiB/h passed');
+    tv2Assert(!run(t => 340 + (t > 25 && t < 45 ? 80 : t >= 45 ? 80 - (t - 45) * 5 : 0)).pass, 'mid growth then drop passed');
+    tv2Assert(!run(() => 340, t => [{ pid: 10, startTime: 'a', pss: t > 30 && t < 30.05 ? null : 340, product: true }]).valid, 'missing read counted as valid');
+    tv2Assert(run(() => 340, t => [{ pid: 10, startTime: t > 40 ? 'reused' : 'a', pss: t > 40 ? 5 : 340 + t, product: true }]).valid === false, 'PID reuse passed');
+  },
+};
+// T-V2-HARNESS-END
+
+// Each mutant damages one PLAN-v2 §8 invariant in an isolated copy of the
+// harness region; every listed scenario must go red, the clean copy green.
+const TV2_MUTANTS: Record<string, { from: string; to: string; red: readonly string[] }> = {
+  'flag-off stops the pump': { from: "    if (!p || !raw || p.stopped) return;\n", to: "    if (!p || !raw || p.stopped || !w.flagBirth) return;\n", red: ['V2-01', 'V2-19'] },
+  'keeper may write a NEWARCH session': { from: 'if (!TV2K.v2LegacyAppendAllowed(owner, session)) continue;', to: "if (owner.kind === 'unknown') continue;", red: ['V2-01', 'V2-07'] },
+  'pane index keyed by session name': { from: 'const tv2Index = (desc: TV2K.NewarchV2PaneDescriptor): TV2Key => TV2K.v2PaneKey(desc.pane);', to: 'const tv2Index = (desc: TV2K.NewarchV2PaneDescriptor): TV2Key => desc.session.sessionId;', red: ['V2-07'] },
+  'geometry guard skipped': { from: '    if (!seen || !TV2K.v2GeometryMatches(p.desc, seen) || raw.resizes !== p.resizesSeen) {', to: '    if (!seen) {', red: ['V2-03', 'V2-08'] },
+  'resume replays before the continuity proof': { from: "        if (p.stopped) continue;\n        const tp = tv2PaneOf(w, k); const raw = d.raw.get(k);", to: "        if (p.stopped) continue;\n        await pumpNow(k);\n        const tp = tv2PaneOf(w, k); const raw = d.raw.get(k);", red: ['V2-09'] },
+  'close does not wait for the pane queue': { from: '      await Promise.all([...queues.values()]);', to: '', red: ['V2-03'] },
+  'incident needs an input ACK': { from: '        if (p.rows.length >= d.space.capRows) continue;', to: '        if (p.rows.length >= d.space.capRows || d.raw.get(k)!.acked === 0) continue;', red: ['V2-05'] },
+  'auditor writes through its own connection': { from: "        }, `expected=${revision} revision=${p.revision}`);", to: "        }, `expected=${revision} revision=${p.revision}`, 'auditor');", red: ['V2-14 auditor'] },
+  'stale audit revision accepted': { from: '        if (raw.records.length !== raw.acked || raw.acked !== acked || p.revision !== revision) {', to: '        if (raw.records.length !== raw.acked) {', red: ['V2-14 stale'] },
+  'raw trimmed before the checkpoint commits': { from: "    barrier('before-commit');", to: "    raw.trimmed = end; barrier('before-commit');", red: ['V2-16'] },
+  'stop hands the session back to legacy': { from: '() => { p.incidents.set(i.incidentId, i); if (stop) p.stopped = true; }', to: '() => { p.incidents.set(i.incidentId, i); if (stop) { p.stopped = true; d.sessions.delete(p.desc.session.sessionId); } }', red: ['V2-07'] },
+  'second engine opens a live root': { from: "  if (d.lock?.alive) return { opened: false as const, reason: 'locked' };", to: '', red: ['V2-16'] },
+  'sampler keeps every sample': { from: '      s.max = Math.max(s.max, y);', to: '      s.max = Math.max(s.max, y); (s as unknown as { kept: number[] }).kept = [...((s as unknown as { kept?: number[] }).kept ?? []), y];', red: ['PSS sampler'] },
+};
+
+for (const [name, run] of Object.entries(tv2Scenarios)) test(`T-V2 ${name}`, run, 30_000);
+
+for (const [mutation, m] of Object.entries(TV2_MUTANTS)) {
+  test(`T-V2 MUTATION "${mutation}" turns ${m.red.join(' + ')} red in an isolated copy`, () => {
+    const self = readFileSync(import.meta.path, 'utf8');
+    const begin = self.indexOf('// T-V2-HARNESS-' + 'BEGIN'), end = self.indexOf('// T-V2-HARNESS-' + 'END');
+    expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin);
+    const region = self.slice(begin, end);
+    expect(region.split(m.from).length).toBe(2);
+    const targets = Object.keys(tv2Scenarios).filter(n => m.red.some(r => n.startsWith(r)));
+    expect(targets.length).toBeGreaterThanOrEqual(m.red.length);
+    const contract = new URL('../src/stream-contract.ts', import.meta.url).pathname;
+    const dir = t11Mkdtemp(join(tmpdir(), 'tv2-mutant-'));
+    try {
+      for (const damaged of [false, true]) {
+        const script = join(dir, `scenario-${damaged}.ts`);
+        writeFileSync(script, `import * as TV2K from ${JSON.stringify(contract)};\n${damaged ? region.replace(m.from, m.to) : region}\n`
+          + `for (const name of ${JSON.stringify(targets)}) await tv2Scenarios[name]!();\n`);
+        const r = t11Spawn(process.execPath, [script], { encoding: 'utf8', timeout: 60_000 });
+        console.log(`T-V2 MUTATION ${mutation} damaged=${damaged} exit=${r.status} ${(r.stderr ?? '').split('\n').find(l => l.startsWith('error:')) ?? ''}`);
+        expect(r.status).toBe(damaged ? 1 : 0);
+      }
+    } finally { t11Rm(dir, { recursive: true, force: true }); }
+  }, 120_000);
+}
