@@ -1483,7 +1483,7 @@ export function v2TrimWithinCheckpoint(a: V2TrimAuthorization): boolean {
     && v2PaneKey(r.pane) === v2PaneKey(c.pane)
     && positions.every(p => Number.isSafeInteger(p.byteOffset) && p.byteOffset >= 0
       && sameContract(p.epoch, c.through.epoch) && v2PaneKey(p.epoch.pane) === v2PaneKey(c.pane))
-    && a.trimThrough.byteOffset <= c.replayFloor.byteOffset && c.replayFloor.byteOffset <= c.through.byteOffset
+    && a.trimThrough.byteOffset <= c.through.byteOffset && c.replayFloor.byteOffset <= c.through.byteOffset
     && c.through.byteOffset === a.consumerAck.through.byteOffset;
 }
 
