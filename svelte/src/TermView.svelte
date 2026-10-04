@@ -6993,6 +6993,31 @@
     lastFontPx = fontPx;
   });
 
+  // Birth geometry usually lands after mount: SessionView mounts this view
+  // while the inventory is pending, and no viewport change follows the row.
+  // Refit on the prop itself, or the first legacy-style measure (e.g. 48 cols
+  // at 13px) stays on screen until the phone is rotated.
+  let lastFixedKey: string | null | undefined = undefined;
+  $effect(() => {
+    const key = fixedGeometry ? `${fixedGeometry.columns}x${fixedGeometry.rows}` : null;
+    if (lastFixedKey !== undefined && key !== lastFixedKey) {
+      untrack(() => {
+        if (key === null) {
+          // Became a legacy pane: drop the fit and measure the old way, which
+          // re-claims only if this host claims (canSendResize).
+          fitFontPx = null;
+          lastFontFit = null;
+          lastPushedCols = 0;
+          pushGeometry({ force: true });
+        } else {
+          measureGeometry();
+        }
+        refreshVisualLayout();
+      });
+    }
+    lastFixedKey = key;
+  });
+
   // auto ⇄ manual, or a new floor: refit only (no resize — fixed panes only).
   let lastFontFitKey: string | null = null;
   $effect(() => {
