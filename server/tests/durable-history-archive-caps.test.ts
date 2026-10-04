@@ -1,22 +1,33 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DurableHistoryArchive } from "../src/durable-history-archive";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import {
-  ArchiveWorker, decideArchivePressure, RcloneRemote,
+  ArchiveWorker, decideArchivePressure, RcloneRemote, V2ArchiveOffload,
 } from "../../../../src/integrations/stream-history-offload";
 import type {
   ArchiveCandidate, ArchiveCandidateSource, RemoteResult, RemoteStore,
 } from "../../../../src/integrations/stream-history-offload";
-import { archiveInventoryDigest, archiveInventoryMatches } from "../src/stream-contract";
-import type { ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, FlagOnHistoryPort, PaneKey, RemoteAuthorizationR2, SealedExport, StoragePressure } from "../src/stream-contract";
+import { archiveInventoryDigest, archiveInventoryMatches, NEWARCH_V2_DEFAULT_CONFIG, streamDigest, v2WriteDisposition } from "../src/stream-contract";
+import type {
+  ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, CommittedStreamRow, Coverage, FlagOnHistoryPort, LogicalSealR2, NewarchV2HistoryRequest,
+  NewarchV2Incident, PaneKey, RemoteAuthorizationR2, SealedExport, SegmentRowId, StoragePressure, V2HistoryPage, V2Receipt, V2WriteRequest,
+} from "../src/stream-contract";
 
 let root = "";
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "thumbmux-caps-")); });
-afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  if (!existsSync(root)) return;
+  const writable = (dir: string) => {
+    chmodSync(dir, 0o700);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) if (entry.isDirectory()) writable(join(dir, entry.name));
+  };
+  writable(root);
+  rmSync(root, { recursive: true, force: true });
+});
 
 const SCREEN = ["+--+", "| >", "+--+", "hints", "tokens"];
 const OPTS = { paneRows: SCREEN.length, liveLineLimit: 10 };
@@ -477,4 +488,205 @@ test("R19 a v1 receipt cannot reauthorize an older seal, and an owner change aft
   expect(moved.syn.reclaimFences).toEqual([]);
   expect(moved.syn.localIntact("seg-a")).toBe(true);
   expect(moved.worker.status().open.map((o) => o.state)).toEqual(["REMOTE_COMMITTED"]);
+});
+
+// ───────────── V2-06 · a full disk stops with a durable label and keeps uncertified bytes ─────────────
+
+const CAP_PANE: PaneKey = { serverIdentity: "srv-v2-cap", paneId: "p-cap", birthGeneration: 1 };
+const CAP_SEGMENT = "seg-cap";
+const CAP_STORE = "storev2cap";
+const CAP_WALL = 1_725_916_800_000;
+const CAP_BYTES = NEWARCH_V2_DEFAULT_CONFIG.storage.stagingCapBytes;
+
+function capSha(data: Uint8Array | string): string { return createHash("sha256").update(data).digest("hex"); }
+function capRow(): CommittedStreamRow {
+  return {
+    id: { pane: CAP_PANE, segmentId: CAP_SEGMENT, rowOrdinal: 0 },
+    origin: { kind: "pipe", range: { epoch: { pane: CAP_PANE, attachId: "a", collectorIncarnation: "c" }, start: 0, end: 1 }, ordinal: 0 },
+    cells: [{ text: "แถวเดียว", width: 1, style: [] }], geometry: { columns: 100, rows: 40 },
+    buffer: "normal", wrapStatus: "unwrapped", wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [],
+  };
+}
+class CapEngine {
+  revision = 0;
+  readonly commands: string[] = [];
+  readonly incidents: NewarchV2Incident[] = [];
+  readonly puts: string[] = [];
+  failIncident = false;
+  failLocator = false;
+  private logical: LogicalSealR2 | null = null;
+  private sealed: SealedExport | null = null;
+  private exportOp: string | null = null;
+  private readonly receipts = new Map<string, V2Receipt>();
+  constructor(private readonly planted: { sealed: SealedExport; logical: Omit<LogicalSealR2, "sealCommitId">; frontier: SegmentRowId }, readonly segmentDir: string) {}
+  async submit(request: V2WriteRequest): Promise<{ status: "ok"; value: V2Receipt } | { status: "error"; code: "io" | "integrity"; message: string } | { status: "stale"; reason: "epoch" }> {
+    this.commands.push(request.command.kind);
+    const previous = this.receipts.get(request.fence.operationId) ?? null;
+    const disposition = v2WriteDisposition(request.fence, 1, this.revision, previous);
+    if (disposition === "stale") return { status: "stale", reason: "epoch" };
+    if (disposition === "integrity") return { status: "error", code: "integrity", message: "digest mismatch" };
+    if (disposition === "retry" && previous) return { status: "ok", value: previous };
+    if (this.failIncident && request.command.kind === "incident") return { status: "error", code: "io", message: "SQLITE_FULL: incident journal" };
+    if (this.failLocator && request.command.kind === "locator") return { status: "error", code: "io", message: "EDQUOT: locator quota" };
+    const receipt: V2Receipt = {
+      schema: "newarch-v2", kind: "ssot-durable", operationId: request.fence.operationId, pane: request.fence.pane,
+      digest: request.fence.digest, commitId: `c${this.revision + 1}`, generation: 1, revision: this.revision + 1,
+      frontier: this.planted.frontier, checkpointId: null,
+    };
+    if (request.command.kind === "seal") {
+      this.logical = { ...this.planted.logical, sealCommitId: receipt.commitId };
+      this.sealed = { ...this.planted.sealed, sealCommitId: receipt.commitId, operationId: request.fence.operationId };
+    } else if (request.command.kind === "materialize-export") this.exportOp = request.fence.operationId;
+    else if (request.command.kind === "incident") this.incidents.push(request.command.incident);
+    else if (request.command.kind === "reclaim") rmSync(this.segmentDir, { recursive: true, force: true });
+    this.receipts.set(receipt.operationId, receipt);
+    this.revision += 1;
+    return { status: "ok", value: receipt };
+  }
+  ports() {
+    const empty = async (request: NewarchV2HistoryRequest): Promise<{ status: "ok"; value: V2HistoryPage }> => ({
+      status: "ok", value: { schema: "newarch-v2", pane: request.pane, revision: this.revision, entries: [], payloadBytes: 0,
+        states: [{ kind: "exact", auditedRevision: null }], before: { kind: "end" }, after: { kind: "end" } },
+    });
+    return {
+      submit: (request: V2WriteRequest) => this.submit(request),
+      reader: {
+        sealed: (_pane: PaneKey, id: string) => ({ status: "ok" as const, value: this.logical && this.logical.sealCommitId === id ? this.logical : null }),
+        export: (_pane: PaneKey, op: string) => ({ status: "ok" as const, value: this.exportOp === op ? this.sealed : null }),
+        locator: () => ({ status: "ok" as const, value: null }),
+        receipt: (_pane: PaneKey, op: string) => ({ status: "ok" as const, value: this.receipts.get(op) ?? null }),
+        page: empty,
+      },
+      pins: () => ({ status: "ok" as const, value: [] as readonly string[] }),
+      generation: () => ({ status: "ok" as const, value: 1 }),
+      revision: () => ({ status: "ok" as const, value: this.revision }),
+    };
+  }
+}
+function capEvidence(path: string) {
+  const data = readFileSync(path);
+  return { path, bytes: data.byteLength, sha256: capSha(data) };
+}
+function capPlant(huge: boolean) {
+  const segmentDir = join(root, "segments", CAP_SEGMENT);
+  mkdirSync(segmentDir, { recursive: true });
+  const row = capRow();
+  const rowsPath = join(segmentDir, "rows.jsonl");
+  const manifestPath = join(segmentDir, "export.json");
+  if (huge) {
+    writeFileSync(rowsPath, "");
+    truncateSync(rowsPath, CAP_BYTES + 1);
+  } else {
+    const body = { pane: JSON.stringify(CAP_PANE), segment: CAP_SEGMENT, kind: "committed", op: "op-cap", digest: "d".repeat(64), payload: JSON.stringify({ rows: [row], coverage: [] }), receipt: "receipt-cap" };
+    writeFileSync(rowsPath, `${JSON.stringify({ ...body, checksum: streamDigest("flag-on-event", body) })}\n`);
+  }
+  writeFileSync(manifestPath, "{}\n");
+  const rowsEv = huge ? { path: rowsPath, bytes: statSync(rowsPath).size, sha256: "ab".repeat(32) } : capEvidence(rowsPath);
+  const coverage: Coverage = [{ kind: "rows", range: { pane: CAP_PANE, segmentId: CAP_SEGMENT, start: 0, end: 1 }, digest: capSha("cap-rows") }];
+  const sealed: SealedExport = {
+    kind: "sealed-export", operationId: "pending", storeUUID: CAP_STORE, pane: CAP_PANE, segmentId: CAP_SEGMENT, generation: 1,
+    coverage, files: [rowsEv], manifest: capEvidence(manifestPath), sealCommitId: "pending",
+  };
+  const logical: Omit<LogicalSealR2, "sealCommitId"> = {
+    revision: 2, sealGeneration: 1, pane: CAP_PANE, segmentId: CAP_SEGMENT, coverage, rawRanges: [], checkpointIds: [],
+    timelineIndexCommitId: "timeline-cap", replayIndexCommitId: "replay-cap",
+  };
+  return { segmentDir, sealed, logical, frontier: row.id, rowsPath };
+}
+function capOffload(engine: CapEngine, storage?: () => { status: "ok"; value: { cause: "SQLITE_FULL" | "EDQUOT" | "ENOSPC" | null; availableDataBytes: number } }) {
+  const remoteDir = join(root, "remote");
+  mkdirSync(remoteDir, { recursive: true });
+  const inner = new RcloneRemote({ location: `:local:${remoteDir}`, cacheDir: join(root, "rclone-cache") });
+  const remote = {
+    location: inner.location,
+    version: () => inner.version(),
+    list: (prefix: string) => inner.list(prefix),
+    get: (key: string, local: string) => inner.get(key, local),
+    put: async (local: string, key: string) => { engine.puts.push(key); return inner.put(local, key); },
+  };
+  return new V2ArchiveOffload({
+    root, storeUUID: CAP_STORE, remote, ports: engine.ports(), storage, wallMs: () => CAP_WALL, monoMs: () => 40, clockEpoch: "v2-cap",
+  });
+}
+const CAP_CANCEL = { isCancelled: () => false };
+function capResetArchive(): void {
+  const dir = join(root, "v2-archive");
+  if (!existsSync(dir)) return;
+  const writable = (current: string) => {
+    chmodSync(current, 0o700);
+    for (const name of readdirSync(current)) {
+      const path = join(current, name);
+      if (statSync(path).isDirectory()) writable(path);
+    }
+  };
+  writable(dir);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+test("V2-06 SQLITE_FULL and an empty data budget stop before reclaim and keep the source file", async () => {
+  writeFileSync(join(root, "keep.txt"), "keep");
+  const fullPlant = capPlant(false);
+  const full = new CapEngine(fullPlant, fullPlant.segmentDir);
+  const fullOffload = capOffload(full, () => ({ status: "ok", value: { cause: "SQLITE_FULL", availableDataBytes: 0 } }));
+  const fullStopped = await fullOffload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  const fullStatus = fullOffload.status(CAP_PANE, CAP_SEGMENT);
+  expect(fullStopped).toEqual({ status: "error", code: "io", message: `storage-stopped:SQLITE_FULL: incident ${fullStatus.incidentId}` });
+  expect(full.incidents.map((incident) => ({ reason: incident.reason, frontier: incident.frontier, wall: incident.openedAtWallMs, collecting: incident.collecting, action: incident.action, geometry: incident.geometry.columns }))).toEqual([
+    { reason: "storage-outage", frontier: null, wall: CAP_WALL, collecting: false, action: "gap-and-stop", geometry: 100 },
+  ]);
+  expect(full.commands).toEqual(["incident"]);
+  expect(readFileSync(join(root, "keep.txt"), "utf8")).toBe("keep");
+  expect(existsSync(fullPlant.rowsPath)).toBe(true);
+  const again = await fullOffload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  expect(again.status === "error" && full.incidents).toHaveLength(1);
+
+  capResetArchive();
+  const budgetPlant = capPlant(false);
+  const budget = new CapEngine(budgetPlant, budgetPlant.segmentDir);
+  const budgetOffload = capOffload(budget, () => ({ status: "ok", value: { cause: null, availableDataBytes: 0 } }));
+  const budgetStopped = await budgetOffload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  expect(budgetStopped.status === "error" && budgetStopped.message.startsWith("storage-stopped:budget:")).toBe(true);
+  expect(budget.incidents.map((incident) => incident.reason)).toEqual(["budget-exhausted"]);
+  expect(budget.commands.includes("reclaim")).toBe(false);
+  expect(existsSync(budgetPlant.rowsPath)).toBe(true);
+});
+
+test("V2-06 an EDQUOT locator keeps the sealed bytes and a failed incident does not pretend the stop was durable", async () => {
+  const planted = capPlant(false);
+  const engine = new CapEngine(planted, planted.segmentDir);
+  engine.failLocator = true;
+  const offload = capOffload(engine);
+  const stopped = await offload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  const status = offload.status(CAP_PANE, CAP_SEGMENT);
+  expect(stopped).toEqual({ status: "error", code: "io", message: `storage-stopped:EDQUOT: incident ${status.incidentId}` });
+  expect(engine.incidents[0]).toMatchObject({ reason: "storage-outage", frontier: planted.frontier, openedAtWallMs: CAP_WALL, collecting: false, action: "gap-and-stop" });
+  expect(engine.commands.includes("reclaim")).toBe(false);
+  expect(existsSync(planted.rowsPath)).toBe(true);
+  expect(statSync(planted.rowsPath).size).toBeGreaterThan(0);
+
+  capResetArchive();
+  const failed = capPlant(false);
+  const failing = new CapEngine(failed, failed.segmentDir);
+  failing.failIncident = true;
+  const failedOffload = capOffload(failing, () => ({ status: "ok", value: { cause: "SQLITE_FULL", availableDataBytes: 0 } }));
+  const result = await failedOffload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  expect(result).toEqual({ status: "error", code: "io", message: "durability-failed:SQLITE_FULL: incident not durable" });
+  expect(failedOffload.status(CAP_PANE, CAP_SEGMENT).durabilityFailed).toBe(true);
+  expect(failing.incidents).toEqual([]);
+  expect(failing.commands.includes("reclaim")).toBe(false);
+  expect(readFileSync(failed.rowsPath).byteLength).toBeGreaterThan(0);
+});
+
+test("V2-06 a member above the real staging cap stops before upload and does not raise the cap", async () => {
+  const planted = capPlant(true);
+  expect(statSync(planted.rowsPath).size).toBe(CAP_BYTES + 1);
+  const engine = new CapEngine(planted, planted.segmentDir);
+  const offload = capOffload(engine);
+  const stopped = await offload.advance(CAP_PANE, CAP_SEGMENT, CAP_CANCEL);
+  expect(stopped.status === "error" && stopped.message.startsWith("storage-stopped:budget:")).toBe(true);
+  expect(engine.incidents.map((incident) => incident.reason)).toEqual(["budget-exhausted"]);
+  expect(engine.incidents[0]?.frontier).toEqual(planted.frontier);
+  expect(engine.puts).toEqual([]);
+  expect(engine.commands.includes("reclaim")).toBe(false);
+  expect(statSync(planted.rowsPath).size).toBe(CAP_BYTES + 1);
 });
