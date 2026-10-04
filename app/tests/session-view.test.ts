@@ -2299,3 +2299,226 @@ describe('mountable terminal views', () => {
     expect(compose!.classList.contains('on')).toBe(true);
   });
 });
+
+// PLAN-v2 V2-02 / V2-18 (lot U). A NEWARCH v2 pane keeps the geometry it was
+// born with; the shell must not turn a phone viewport, a desktop window, a font
+// tap or a keyboard inset into a resize request, and it must not guess before
+// the session inventory says who owns the pane.
+describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
+  type V2Descriptor = Record<string, unknown>;
+
+  function v2Pane(paneId: string, columns = 100, rows = 40): V2Descriptor {
+    return {
+      schema: 'newarch-v2',
+      session: { serverIdentity: 'srv-u', sessionId: 'sess-u' },
+      pane: { serverIdentity: 'srv-u', paneId, birthGeneration: 1 },
+      windowId: `@${paneId.slice(1)}`,
+      owner: 'capture-engine',
+      birthOperationId: `birth-${paneId}`,
+      geometry: { policy: 'fixed-at-birth', columns, rows, configVersion: 'cfg-1', panesPerWindow: 1 },
+      state: 'active',
+    };
+  }
+
+  type SessionsFeed = { push(rows: unknown[]): void; delivered: boolean };
+
+  /** Singleton session feed that only delivers when the test pushes. */
+  function controlledSessionsFeed(initial?: unknown[]): SessionsFeed {
+    const callbacks = new Set<(rows: unknown[]) => void>();
+    let latest = initial;
+    const feed: SessionsFeed = {
+      delivered: initial !== undefined,
+      push(rows) {
+        latest = rows;
+        feed.delivered = true;
+        for (const callback of callbacks) callback(rows);
+      },
+    };
+    tmuxMux.onSessions = ((callback: (rows: unknown[]) => void) => {
+      callbacks.add(callback);
+      if (latest !== undefined) callback(latest);
+      return () => { callbacks.delete(callback); };
+    }) as typeof tmuxMux.onSessions;
+    return feed;
+  }
+
+  function captureResizes(): Array<{ session: string; cols: number; rows: number }> {
+    const frames: Array<{ session: string; cols: number; rows: number }> = [];
+    tmuxMux.sendResize = ((session: string, cols: number, rows: number) => {
+      frames.push({ session, cols, rows });
+    }) as typeof tmuxMux.sendResize;
+    return frames;
+  }
+
+  function installObserver(): void {
+    ControlledResizeObserver.latest = null;
+    globalThis.ResizeObserver = ControlledResizeObserver;
+    window.ResizeObserver = ControlledResizeObserver;
+  }
+
+  async function resizeViewport(target: HTMLElement, width: number, height: number): Promise<void> {
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+    Object.defineProperties(terminal, {
+      clientWidth: { configurable: true, value: width },
+      clientHeight: { configurable: true, value: height },
+    });
+    const observer = ControlledResizeObserver.latest;
+    if (!observer) throw new Error('TermView did not observe its viewport');
+    observer.fire();
+    await tick();
+  }
+
+  // 320/390 px phones, a phone rotated to landscape, and a desktop window.
+  const VIEWPORTS: ReadonlyArray<readonly [number, number]> = [
+    [320, 560], [390, 700], [700, 390], [1440, 900],
+  ];
+
+  async function exerciseGeometryInputs(target: HTMLElement): Promise<void> {
+    for (const [width, height] of VIEWPORTS) await resizeViewport(target, width, height);
+    // A+ and A− from the stock FAB: font changes are presentation only.
+    await openFab(target);
+    for (const testid of ['demo-font-up', 'demo-font-down', 'demo-font-up']) {
+      const button = target.querySelector<HTMLButtonElement>(`[data-testid="${testid}"]`);
+      if (!button) throw new Error(`stock ${testid} missing from the FAB`);
+      flushSync(() => button.click());
+      await tick();
+    }
+    // The settle timer for font-driven resizes is 220 ms.
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    // Keyboard / composer inset: opening the composer docks a sheet below.
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('SessionView did not render TermView');
+    flushSync(() => terminal.click());
+    await tick();
+    if (!target.querySelector('[data-testid="input-sheet"].open')) throw new Error('composer did not open');
+    await resizeViewport(target, 390, 420);
+  }
+
+  test('a selected v2 pane sends no resize for phone, rotation, desktop, font or keyboard even when the host asks to claim', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'cc-newarch-v2-selected';
+    controlledSessionsFeed([
+      { name: session, newarchV2: { kind: 'selected', pane: v2Pane('%7') } },
+    ]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await exerciseGeometryInputs(target);
+
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+    const host = target.querySelector<HTMLElement>('.mtv-host');
+    expect(host?.dataset.geometryPolicy).toBe('fixed');
+    expect(host?.dataset.fixedCols).toBe('100');
+    expect(host?.dataset.fixedRows).toBe('40');
+  });
+
+  test('an ambiguous v2 session (two windows) keeps both panes fixed and claims nothing', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'cc-newarch-v2-two-windows';
+    controlledSessionsFeed([
+      {
+        name: session,
+        newarchV2: { kind: 'ambiguous', panes: [v2Pane('%1'), v2Pane('%2')], next: null },
+      },
+    ]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    for (const [width, height] of VIEWPORTS) await resizeViewport(target, width, height);
+
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+    const host = target.querySelector<HTMLElement>('.mtv-host');
+    expect(host?.dataset.geometryPolicy).toBe('fixed');
+    expect(host?.dataset.fixedCols).toBe('100');
+    expect(host?.dataset.fixedRows).toBe('40');
+  });
+
+  test.each([
+    ['owner-unavailable', { kind: 'owner-unavailable', retryAfterMs: 500 }],
+    ['malformed descriptor', { kind: 'selected', pane: { ...v2Pane('%3'), owner: 'legacy' } }],
+    ['unknown selection kind', { kind: 'lease', pane: v2Pane('%4') }],
+    ['geometry that is not fixed-at-birth', {
+      kind: 'selected',
+      pane: { ...v2Pane('%5'), geometry: { policy: 'viewer', columns: 100, rows: 40, configVersion: 'c', panesPerWindow: 1 } },
+    }],
+  ] as const)('an unresolved owner (%s) fails closed instead of resizing', async (_label, newarchV2) => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'cc-newarch-v2-unknown-owner';
+    controlledSessionsFeed([{ name: session, newarchV2 }]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    for (const [width, height] of VIEWPORTS) await resizeViewport(target, width, height);
+
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('unknown-owner');
+  });
+
+  test('no resize leaves before the inventory is known; a legacy row then claims as before', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'sh-legacy-after-inventory';
+    const feed = controlledSessionsFeed();
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(target, 390, 700);
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('pending');
+
+    // Legacy rows: no newarchV2, or a v2 lookup that says the session is not NEWARCH.
+    flushSync(() => feed.push([{ name: session }, { name: 'other', newarchV2: { kind: 'selected', pane: v2Pane('%9') } }]));
+    await flushPromises();
+    await resizeViewport(target, 640, 320);
+    const owned = frames.filter((frame) => frame.session === session);
+    expect(owned.length).toBeGreaterThan(0);
+    expect(owned.every((frame) => frame.cols > 0 && frame.rows > 0)).toBe(true);
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('viewer');
+  });
+
+  test('a v2 "missing" lookup is a legacy session and still follows the host claim', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'sh-v2-missing-is-legacy';
+    controlledSessionsFeed([{ name: session, newarchV2: { kind: 'missing' } }]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(target, 640, 320);
+    expect(frames.filter((frame) => frame.session === session).length).toBeGreaterThan(0);
+  });
+
+  test('a session that becomes v2 stops claiming geometry on the live row update', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'cc-becomes-v2';
+    const feed = controlledSessionsFeed([{ name: session }]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(target, 640, 320);
+    expect(frames.filter((frame) => frame.session === session).length).toBeGreaterThan(0);
+
+    flushSync(() => feed.push([{ name: session, newarchV2: { kind: 'selected', pane: v2Pane('%11') } }]));
+    await flushPromises();
+    const before = frames.length;
+    for (const [width, height] of VIEWPORTS) await resizeViewport(target, width, height);
+    expect(frames.slice(before).filter((frame) => frame.session === session)).toEqual([]);
+  });
+});
