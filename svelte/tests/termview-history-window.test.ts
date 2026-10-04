@@ -2922,6 +2922,78 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     }
   });
 
+  // REVIEW-grok BLOCK 1: `.mtv` is touch-action: none, so a manual pane that
+  // runs past the box only pans sideways if TermView applies the motion.
+  function finger(viewport: HTMLElement, path: Array<[number, number]>): void {
+    const ev = (type: string, pts: Array<[number, number]>) => {
+      const list = pts.map(([clientX, clientY]) => ({ clientX, clientY, identifier: 1 }));
+      const touchList = Object.assign([...list], { item: (i: number) => list[i] ?? null });
+      const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+      Object.defineProperties(event, {
+        touches: { value: type === "touchend" ? Object.assign([], { item: () => null }) : touchList },
+        changedTouches: { value: touchList },
+      });
+      viewport.dispatchEvent(event);
+      flushSync();
+    };
+    ev("touchstart", [path[0]!]);
+    for (const point of path.slice(1)) ev("touchmove", [point]);
+    ev("touchend", [path.at(-1)!]);
+    drainScheduledWork();
+  }
+
+  function wideBox(viewport: HTMLElement, scrollWidth: number): void {
+    Object.defineProperty(viewport, "scrollWidth", { configurable: true, get: () => scrollWidth });
+  }
+
+  test("manual: a sideways swipe pans the pane, a vertical one does not", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    wideBox(view.viewport, 622);
+    expect(view.viewport.scrollLeft).toBe(0);
+    finger(view.viewport, [[320, 100], [300, 101], [250, 102], [150, 103], [100, 104]]);
+    expect(view.viewport.scrollLeft).toBe(220);
+    finger(view.viewport, [[200, 40], [201, 80], [202, 160], [203, 200]]);
+    expect(view.viewport.scrollLeft).toBe(220);
+    finger(view.viewport, [[100, 100], [140, 101], [330, 102]]);
+    expect(view.viewport.scrollLeft).toBeLessThanOrEqual(0);
+  });
+
+  test("manual: deltaX and shift+wheel pan sideways, a plain wheel does not", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    wideBox(view.viewport, 622);
+    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, deltaY: 3, bubbles: true, cancelable: true }));
+    expect(view.viewport.scrollLeft).toBe(40);
+    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, shiftKey: true, bubbles: true, cancelable: true }));
+    expect(view.viewport.scrollLeft).toBe(70);
+    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, bubbles: true, cancelable: true }));
+    expect(view.viewport.scrollLeft).toBe(70);
+  });
+
+  test("manual: box-pinned notes follow the pan instead of scrolling away", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    view.viewport.scrollLeft = 120;
+    view.viewport.dispatchEvent(new Event("scroll"));
+    flushSync();
+    expect(view.viewport.style.getPropertyValue("--mtv-pan-x")).toBe("120px");
+  });
+
+  test("auto and legacy panes never pan sideways from a swipe or wheel", async () => {
+    for (const options of [
+      { fixedGeometry: BIRTH, viewportWidth: 390 },
+      { viewportWidth: 390 },
+    ]) {
+      const view = mountTermView(options);
+      await settleUi();
+      wideBox(view.viewport, 622);
+      finger(view.viewport, [[320, 100], [300, 101], [150, 103], [100, 104]]);
+      view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, bubbles: true, cancelable: true }));
+      expect(view.viewport.scrollLeft).toBe(0);
+    }
+  });
+
   test("a legacy pane (no birth geometry) is untouched: user size, and it still claims", async () => {
     const resizes = captureResizes();
     try {
