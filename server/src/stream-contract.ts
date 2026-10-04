@@ -1151,11 +1151,11 @@ import type {
   NewarchV2PaneDescriptor, NewarchV2SessionKey, NewarchV2FixedGeometry,
   NewarchV2Incident, NewarchV2HistoryCursor, NewarchV2HistoryRequest,
   NewarchV2ReadState, NewarchV2Continuation,
-} from '../../core/src/protocol';
+} from '@thumbmux/core';
 export type {
   NewarchV2PaneDescriptor, NewarchV2SessionKey, NewarchV2FixedGeometry,
   NewarchV2Incident, NewarchV2HistoryCursor, NewarchV2HistoryRequest,
-} from '../../core/src/protocol';
+} from '@thumbmux/core';
 export const NEWARCH_V2_VERSION = 'newarch-v2' as const;
 export const NEWARCH_V2_LIMITS = Object.freeze({
   maxColumns: 240, maxRows: 80, maxActivePanes: 21, maxIdentityBytes: 256,
