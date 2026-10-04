@@ -1194,11 +1194,14 @@ export interface V2StorageBudget {
 export interface V2Config {
   readonly schema: typeof NEWARCH_V2_VERSION; readonly configVersion: string;
   readonly geometry: Geometry; readonly maxActivePanes: number;
+  readonly rules: readonly { readonly ruleId: string; readonly version: string }[];
   readonly audit: V2AuditConfig; readonly storage: V2StorageBudget;
 }
 export const NEWARCH_V2_DEFAULT_CONFIG: V2Config = Object.freeze({
   schema: NEWARCH_V2_VERSION, configVersion: 'q22-default-1',
   geometry: Object.freeze({ columns: 100, rows: 40 }), maxActivePanes: 21,
+  rules: Object.freeze([Object.freeze({ ruleId: 'ordered-scroll', version: '1' }),
+    Object.freeze({ ruleId: 'bounded-tail', version: '1' }), Object.freeze({ ruleId: 'explicit-gap', version: '1' })]),
   audit: Object.freeze({ enabled: true, intervalMs: 300_000, jitterFraction: 0.2,
     triggers: NEWARCH_V2_AUDIT_TRIGGERS, minGapMs: 30_000, maxConcurrent: 1,
     timeoutMs: 2000, maxCaptureBytes: 262144, maxRetries: 1 }),
@@ -1227,6 +1230,9 @@ export function validateV2Config(c: V2Config): void {
   if (c.schema !== NEWARCH_V2_VERSION) throw Error('v2 schema');
   v2Text(c.configVersion); v2Int(c.geometry.columns, 1, 240); v2Int(c.geometry.rows, 1, 80);
   v2Int(c.maxActivePanes, 1, 21);
+  if (!Array.isArray(c.rules) || c.rules.length < 1 || c.rules.length > 32) throw Error('v2 rules bound');
+  const ruleKeys = c.rules.map(r => { v2Text(r.ruleId); v2Text(r.version); return streamCanonical([r.ruleId, r.version]); });
+  if (new Set(ruleKeys).size !== ruleKeys.length) throw Error('v2 duplicate rule');
   const a = c.audit, s = c.storage;
   if (typeof a.enabled !== 'boolean' || !Number.isFinite(a.jitterFraction)
     || a.jitterFraction < 0 || a.jitterFraction > 0.2) throw Error('v2 audit config');
@@ -1688,3 +1694,22 @@ export function v2IncidentId(pane: PaneKey, operationId: string): string {
  * I/C must validate that evidence, not merely accept this structural guard.
  * A quiet-looking pair of captures or pipe drain is not a source certificate.
  */
+
+/** C startup rejects allowlisted IDs/versions absent from its compiled registry
+ * (no dynamic code loading). Default priority 10 ordered-scroll: accept only
+ * proven ordered retirement; 20 bounded-tail: defer uncertain live/pending;
+ * 30 explicit-gap: close unresolved range when tail/deadline exhausted. No
+ * matching rule also means explicit gap, never accept/drop. Adding a rule
+ * requires a deterministic redacted caseId/anomalyId fixture first.
+ * Remaining unchanged RAM/latency/page/read concurrency budgets are exactly
+ * STREAM_BUDGET; NEWARCH_V2_LIMITS overrides only explicitly named v2 fields.
+ */
+export function v2DeferWithinBudget(result: Extract<V2RuleResult, { readonly kind: 'defer' }>,
+  firstDeferredAtMonoMs: number, nowMonoMs: number): boolean {
+  return [result.pendingRows, result.pendingBytes, result.deadlineMonoMs, firstDeferredAtMonoMs, nowMonoMs]
+    .every(n => Number.isSafeInteger(n) && n >= 0)
+    && result.pendingRows <= NEWARCH_V2_LIMITS.pendingRowsPerPane
+    && result.pendingBytes <= NEWARCH_V2_LIMITS.pendingBytesPerPane
+    && firstDeferredAtMonoMs <= nowMonoMs && nowMonoMs < result.deadlineMonoMs
+    && result.deadlineMonoMs - firstDeferredAtMonoMs <= NEWARCH_V2_LIMITS.pendingDeadlineMs;
+}
