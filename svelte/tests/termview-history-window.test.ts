@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import type { ComponentProps } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -205,7 +206,7 @@ function mountTermView(options: {
     onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
   });
   flushSync(() => {
-    app = mount(TermView, { target, props }) as Record<string, unknown>;
+    app = mount(TermView, { target, props: props as ComponentProps<typeof TermView> }) as Record<string, unknown>;
   });
 
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
@@ -2948,7 +2949,7 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     expect(caretBottom).toBeLessThanOrEqual(VIEW_HEIGHT + 0.5);
     expect(caretBottom).toBeGreaterThan(VIEW_HEIGHT - lineH);
     // The rows above the prompt are on screen, the blank rows 41-119 are not.
-    const shown = [...view.viewport.querySelectorAll(".mtv-line")].map(node => node.textContent ?? "");
+    const shown = Array.from(view.viewport.querySelectorAll(".mtv-line"), node => node.textContent ?? "");
     expect(shown).toContain("row-39");
   });
 

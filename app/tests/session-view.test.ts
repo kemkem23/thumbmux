@@ -98,7 +98,9 @@ function diagnosticText(value: unknown): string {
 }
 
 function mountView(
-  component: Component,
+  // Any shell component; each case passes that component's own props.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  component: Component<any>,
   props: Record<string, unknown>,
 ): Mounted {
   const target = document.createElement('div');
@@ -459,9 +461,9 @@ describe('mountable terminal views', () => {
         clientWidth: { configurable: true, value: width },
         clientHeight: { configurable: true, value: 600 },
       });
-      const observer = ControlledResizeObserver.latest;
-      if (!observer) throw new Error('TermView did not observe its viewport');
-      observer.fire();
+      if (ControlledResizeObserver.fireFor(terminal) === 0) {
+        throw new Error('TermView did not observe its viewport');
+      }
       await tick();
       expect(terminal.dataset.lastCols).toBe('78');
       expect(terminal.dataset.fontFit).toBe('auto');
