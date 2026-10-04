@@ -1274,7 +1274,7 @@ export type V2OwnerLookup = { readonly kind: 'legacy'; readonly session: Newarch
   | { readonly kind: 'capture-engine'; readonly pane: NewarchV2PaneDescriptor }
   | { readonly kind: 'unknown'; readonly reason: 'unloaded' | 'io' | 'corrupt' | 'identity' };
 export function v2LegacyAppendAllowed(owner: V2OwnerLookup, current: NewarchV2SessionKey): boolean {
-  return owner.kind !== 'unknown';
+  return owner.kind === 'legacy' && v2SessionKey(owner.session) === v2SessionKey(current);
 }
 export interface V2OwnerRecord {
   readonly pane: NewarchV2PaneDescriptor; readonly generation: number;
