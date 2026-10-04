@@ -1424,7 +1424,7 @@ export type V2WriteCommand =
   | { readonly kind: 'batch'; readonly batch: V2Batch }
   | { readonly kind: 'stage'; readonly transactionId: string; readonly ordinal: number; readonly rows: readonly CommittedStreamRow[] }
   | { readonly kind: 'incident'; readonly incident: NewarchV2Incident }
-  | { readonly kind: 'audit'; readonly result: Exclude<V2AuditResult, { readonly kind: 'inconclusive' }> }
+  | { readonly kind: 'audit'; readonly result: V2AuditResult }
   | { readonly kind: 'checkpoint'; readonly checkpoint: V2LiveCheckpoint }
   | { readonly kind: 'stop'; readonly incident: NewarchV2Incident }
   | { readonly kind: 'close' }
@@ -1712,4 +1712,10 @@ export function v2DeferWithinBudget(result: Extract<V2RuleResult, { readonly kin
     && result.pendingBytes <= NEWARCH_V2_LIMITS.pendingBytesPerPane
     && firstDeferredAtMonoMs <= nowMonoMs && nowMonoMs < result.deadlineMonoMs
     && result.deadlineMonoMs - firstDeferredAtMonoMs <= NEWARCH_V2_LIMITS.pendingDeadlineMs;
+}
+
+export interface V2HistoryReader {
+  /** One bounded latest result per pane. Inconclusive updates this status only,
+   * never rows/checkpoint or auditedRevision. disabled never starts a timer. */
+  lastAudit(pane: PaneKey): Result<V2AuditResult | null>;
 }
