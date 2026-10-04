@@ -37,17 +37,37 @@ type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
+  /** Every live observer with what it watches. `latest` alone is not the
+   *  terminal's: SessionView mounts ActionFab after TermView, and the FAB
+   *  observes its own slots — firing `latest` there never reached TermView. */
+  static live = new Set<ControlledResizeObserver>();
+  readonly targets = new Set<Element>();
 
   constructor(private readonly callback: ResizeObserverCallback) {
     ControlledResizeObserver.latest = this;
+    ControlledResizeObserver.live.add(this);
   }
 
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
+  observe(target: Element): void { this.targets.add(target); }
+  unobserve(target: Element): void { this.targets.delete(target); }
+  disconnect(): void {
+    this.targets.clear();
+    ControlledResizeObserver.live.delete(this);
+  }
 
   fire(): void {
     this.callback([], this);
+  }
+
+  /** Fire exactly the observers watching `element`; how many fired. */
+  static fireFor(element: Element): number {
+    let fired = 0;
+    for (const observer of [...ControlledResizeObserver.live]) {
+      if (!observer.targets.has(element)) continue;
+      observer.fire();
+      fired += 1;
+    }
+    return fired;
   }
 }
 
@@ -2392,6 +2412,7 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
 
   function installObserver(): void {
     ControlledResizeObserver.latest = null;
+    ControlledResizeObserver.live.clear();
     globalThis.ResizeObserver = ControlledResizeObserver;
     window.ResizeObserver = ControlledResizeObserver;
   }
@@ -2403,9 +2424,9 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
       clientWidth: { configurable: true, value: width },
       clientHeight: { configurable: true, value: height },
     });
-    const observer = ControlledResizeObserver.latest;
-    if (!observer) throw new Error('TermView did not observe its viewport');
-    observer.fire();
+    if (ControlledResizeObserver.fireFor(terminal) === 0) {
+      throw new Error('TermView did not observe its viewport');
+    }
     await tick();
   }
 
