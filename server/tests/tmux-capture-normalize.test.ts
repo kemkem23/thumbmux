@@ -277,7 +277,8 @@ test('I3 mutation control: certifying ambiguous cells fails and original stays i
   const root = mkdtempSync(join(tmpdir(), 'i3-decoder-mutation-'));
   try {
     const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
-      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`)
+      .replace("from './stream-contract'", `from ${JSON.stringify(new URL('../src/stream-contract.ts', import.meta.url).pathname)}`);
     const from = "certain: false, reason: 'ambiguous-cell-boundary' }";
     expect(original.split(from)).toHaveLength(2);
     writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
@@ -360,7 +361,8 @@ test('I4-FIX1 C mutation control: a memo that never trims keeps 9000 rows and fa
   const root = mkdtempSync(join(tmpdir(), 'i4c-decoder-mutation-'));
   try {
     const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
-      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`)
+      .replace("from './stream-contract'", `from ${JSON.stringify(new URL('../src/stream-contract.ts', import.meta.url).pathname)}`);
     const from = 'if (this.cache.size <= keep) return;';
     expect(original.split(from)).toHaveLength(2);
     writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
@@ -1777,5 +1779,305 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
 `;
     const r = Bun.spawnSync(['python3', '-B', '-c', script, new URL('../src/pipe-vt-worker.py', import.meta.url).pathname]);
     expect(r.exitCode, r.stderr.toString()).toBe(0);
+  });
+});
+
+import { v2BirthCheckpoint, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
+import { V2Jigsaw } from '../src/stream-runtime';
+import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
+import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, v2BirthGeometry, v2Digest, validateV2Incident,
+  type NewarchV2PaneDescriptor, type V2AuditEvidence, type V2LiveCheckpoint } from '../src/stream-contract';
+const v2Pane:NewarchV2PaneDescriptor={schema:'newarch-v2',session:{serverIdentity:'c-private',sessionId:'s'},
+  pane:{serverIdentity:'c-private',paneId:'%1',birthGeneration:1},windowId:'@1',owner:'capture-engine',
+  birthOperationId:'birth-C',geometry:{...v2BirthGeometry(v2Config),columns:10,rows:3},state:'active'};
+const v2Epoch={pane:v2Pane.pane,attachId:'byte0',collectorIncarnation:'collector-C'};
+const v2Genesis=()=>v2BirthCheckpoint(v2Pane,{epoch:v2Epoch,byteOffset:0});
+const v2Clock={wallMs:123,clockEpoch:'test-clock'};
+function v2Replay(text:string,cuts:number[]=[]){
+  const bytes=[...Buffer.from(text)],engine=new V2Jigsaw(v2Genesis(),v2Pane);
+  const rows:SC.CommittedStreamRow[]=[];let start=0;
+  for(const end of [...cuts,bytes.length]){
+    const result=engine.evaluate({epoch:v2Epoch,start,end},bytes.slice(start,end),10,v2Clock);
+    expect(result.kind).not.toBe('gap');
+    if(result.kind==='accept'){rows.push(...result.rows);engine.committed(result.checkpoint.checkpointId);}
+    start=end;
+  }
+  expect(engine.pendingBytes).toBe(0);
+  return {rows,cp:engine.liveCheckpoint};
+}
+const v2Text=(row:SC.RowContent)=>row.cells.map(c=>c.text).join('');
+describe('Q22 V2-13 byte-zero jigsaw (anomaly fixtures C-001..C-008)',()=>{
+  test('C-001 every UTF8/escape partition has identical VT, row IDs and ordered scroll provenance',()=>{
+    const text='ซ้ำ😃\r\nซ้ำ😃\r\n\x1b[31m界\x1b[0m\r\nprogress 1\r\x1b[Kdone\r\n1234567890X\r\nก้❤️\r\n';
+    const full=v2Replay(text);
+    expect(full.rows.slice(0,2).map(v2Text)).toEqual(['ซ้ำ😃      ','ซ้ำ😃      ']);
+    for(let cut=1;cut<Buffer.byteLength(text);cut++){
+      const split=v2Replay(text,[cut]);
+      expect(split.rows).toEqual(full.rows);expect(split.cp.state).toEqual(full.cp.state);
+    }
+    const bytewise=v2Replay(text,Array.from({length:Buffer.byteLength(text)-1},(_,i)=>i+1));
+    expect(bytewise.rows).toEqual(full.rows);expect(bytewise.cp.state).toEqual(full.cp.state);
+  });
+  test('C-002 CR/backspace/erase/cursor redraw and alternate screen do not invent history',()=>{
+    const r=v2Replay('wrong\rOK\x1b[K\b!\x1b[2;1Hlower\x1b[?1049hALT\r\nX\r\nY\r\nZ\x1b[?1049l');
+    expect(r.rows).toEqual([]);expect(r.cp.state.active).toBe('normal');
+    expect(r.cp.state.normal.rows.map(v2Text)).toEqual(['O!        ','lower     ','          ']);
+    expect(r.cp.state.normal.cursor).toMatchObject({x:5,y:1});
+  });
+  test('C-003 soft wrap, scroll regions and wide overwrite retain physical boundaries',()=>{
+    const r=v2Replay('1234567890X\r\nZ\r\n');
+    expect(r.rows.map(v2Text)).toEqual(['1234567890']);expect(r.rows[0]!.wrapStatus).toBe('wrapped');
+    const wide=v2Replay('界X\rA');expect(v2Text(wide.cp.state.normal.rows[0]!)).toBe('A X       ');
+    const region=v2Replay('top\x1b[2;3r\x1b[3;1Ha\n\n');expect(region.rows).toEqual([]);
+    expect(v2Text(region.cp.state.normal.rows[0]!)).toBe('top       ');
+  });
+  test('C-004 partial sequence deadline is fixed, durable state not advanced, incident repeatable',()=>{
+    const engine=new V2Jigsaw(v2Genesis(),v2Pane);
+    expect(engine.evaluate({epoch:v2Epoch,start:0,end:2},[27,91],10,v2Clock).kind).toBe('defer');
+    expect(engine.deadlineMonoMs).toBe(1010);expect(engine.liveCheckpoint.through.byteOffset).toBe(0);
+    expect(engine.evaluate({epoch:v2Epoch,start:2,end:3},[51],500,v2Clock).kind).toBe('defer');
+    expect(engine.deadlineMonoMs).toBe(1010);
+    const result=engine.expire(1010,v2Clock);expect(result?.kind).toBe('gap');
+    if(result?.kind==='gap'){validateV2Incident(result.incident);expect(result.incident.frontier).toBeNull();}
+    expect(engine.pendingBytes).toBe(0);expect(()=>engine.evaluate({epoch:v2Epoch,start:3,end:3},[],1011,v2Clock)).toThrow();
+    const cp=v2Genesis(),input={pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:1},bytes:[255],observedAtMonoMs:10,pendingSinceMonoMs:null};
+    expect(evaluateV2Rules(input)).toEqual(evaluateV2Rules(input));
+  });
+  test('C-005 epoch/identity/geometry/offset/unknown control fail closed; no guessed acceptance',()=>{
+    const cp=v2Genesis(),input={pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:1},bytes:[65],observedAtMonoMs:10,pendingSinceMonoMs:null};
+    for(const change of [
+      {raw:{...input.raw,start:1,end:2}},
+      {raw:{...input.raw,epoch:{...v2Epoch,collectorIncarnation:'next'}}},
+      {pane:{...v2Pane,geometry:{...v2Pane.geometry,columns:11}}},
+      {bytes:[255]},
+    ])expect(evaluateV2Rules({...input,...change}).kind).toBe('gap');
+    const bytes=[...Buffer.from('\x1bPunknown')];
+    expect(evaluateV2Rules({...input,bytes,raw:{...input.raw,end:bytes.length}}).kind).toBe('gap');
+    expect(()=>v2RuleTable({...v2Config,rules:[{ruleId:'eval(log)',version:'1'}]})).toThrow();
+  });
+  test('C-006 checkpoint restart and rule version only at committed boundary',()=>{
+    const first=v2Replay('A\x1b[31mB');const e=new V2Jigsaw(first.cp,v2Pane);
+    e.configure({...v2Config,configVersion:'rules-next'});
+    const start=first.cp.through.byteOffset,bytes=[...Buffer.from('C\r\nD\r\nE\r\n')];
+    const r=e.evaluate({epoch:v2Epoch,start,end:start+bytes.length},bytes,20,v2Clock);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.stamp.configVersion).toBe('rules-next');expect(first.cp.rule.configVersion).toBe(v2Config.configVersion);
+    expect(()=>e.configure(v2Config)).toThrow();expect(()=>e.committed('wrong')).toThrow();
+    e.committed(r.checkpoint.checkpointId);
+    expect(r.checkpoint.state).toEqual(v2Replay('A\x1b[31mBC\r\nD\r\nE\r\n').cp.state);
+  });
+  test('C-007 bounds: candidate rows, raw bytes and combining sequence are finite',()=>{
+    const cp=v2Genesis();
+    for(const text of ['X\r\n'.repeat(270),'A'+'\u0301'.repeat(2100),'\x1b['+'1'.repeat(4100)]){
+      const bytes=[...Buffer.from(text)];expect(evaluateV2Rules({pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:0,pendingSinceMonoMs:null}).kind).toBe('gap');
+    }
+  });
+});
+function v2AuditFixture(){
+  const cp=v2Replay('A\x1b[31mB').cp;
+  const current={pane:cp.pane,through:cp.through,revision:cp.revision,geometry:cp.geometry,checkpointId:cp.checkpointId};
+  const rawCapture='A\x1b[31mB\x1b[0m        \n          \n          \n';
+  const evidence:V2AuditEvidence={before:current,after:current,snapshot:current,
+    ordering:{kind:'certified-source-fence',certificateId:'C-proof',proof:{path:'redacted-proof',bytes:1,sha256:'a'.repeat(64)}},
+    expectedDigest:v2ScreenDigest(cp.state.normal.rows),actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,cp.geometry)),
+    captureBytes:Buffer.byteLength(rawCapture),elapsedMs:1};
+  const incident=v2DecisionIncident({pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:cp.through.byteOffset,end:cp.through.byteOffset},bytes:[],observedAtMonoMs:10,pendingSinceMonoMs:null},cp.rule,v2Clock,'audit-mismatch','C-008');
+  return {checkpoint:cp,current,rawCapture,evidence,paneAlive:true,attempt:0,incident,
+    verifiedCertificate:{certificateId:'C-proof',sha256:'a'.repeat(64)}};
+}
+describe('Q22 V2-14/15 pure auditor (C-008)',()=>{
+  test('same revision compares actual live cells and mismatch annotates without repairing history',()=>{
+    const f=v2AuditFixture();expect(evaluateV2Audit(f).kind).toBe('match');
+    const rawCapture=f.rawCapture.replace('A','Z'),actualDigest=v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry));
+    const r=evaluateV2Audit({...f,rawCapture,evidence:{...f.evidence,actualDigest}});
+    expect(r.kind).toBe('annotate');if(r.kind==='annotate')validateV2Incident(r.incident);
+    expect(f.checkpoint.state.normal.rows[0]!.cells[0]!.text).toBe('A');
+  });
+  test('disabled, timeout, dead pane, stale revision, changed identity and unproven fence cannot apply',()=>{
+    const f=v2AuditFixture();
+    expect(evaluateV2Audit({...f,config:{...v2Config,audit:{...v2Config.audit,enabled:false}}})).toMatchObject({kind:'inconclusive',reason:'disabled',retry:false});
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,elapsedMs:3000}})).toMatchObject({kind:'inconclusive',reason:'timeout'});
+    expect(evaluateV2Audit({...f,paneAlive:false})).toMatchObject({kind:'inconclusive',reason:'pane-dead'});
+    expect(evaluateV2Audit({...f,current:{...f.current,revision:99}})).toMatchObject({kind:'inconclusive',reason:'stale'});
+    expect(evaluateV2Audit({...f,current:{...f.current,pane:{...f.current.pane,birthGeneration:2}}})).toMatchObject({kind:'inconclusive',reason:'identity'});
+    expect(evaluateV2Audit({...f,verifiedCertificate:null})).toMatchObject({kind:'inconclusive',reason:'racing'});
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,ordering:{kind:'unproven'}}})).toMatchObject({kind:'inconclusive',reason:'racing'});
+    expect(evaluateV2Audit({...f,attempt:1,evidence:{...f.evidence,elapsedMs:3000}})).toMatchObject({retry:false});
+  });
+  test('100 repeated mismatches reuse incident identity; snapshot row count and digest are checked',()=>{
+    const f=v2AuditFixture(),rawCapture=f.rawCapture.replace('A','Z');
+    const evidence={...f.evidence,actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry))};
+    for(let n=0;n<100;n++){const r=evaluateV2Audit({...f,rawCapture,evidence});expect(r.kind).toBe('annotate');if(r.kind==='annotate')expect(r.incident.incidentId).toBe(f.incident.incidentId);}
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,actualDigest:'0'.repeat(64)}}).kind).toBe('inconclusive');
+    expect(()=>normalizeV2Capture('A\n',f.checkpoint.geometry)).toThrow();
+  });
+});
+
+test('Q22 C-009 terminal modes, cell edits, cursor visibility and reset',()=>{
+  const r=v2Replay('\x1b[?2004h\x1b[?1004h\x1b[?2026h\x1b[?25l\x1b[?1049hX');
+  expect(r.cp.state.alternate.cursor.visible).toBe(false);
+  const edited=v2Replay('abcd\x1b[1;2H\x1b[@Z\x1b[P');
+  expect(v2Text(edited.cp.state.normal.rows[0]!)).toBe('aZcd      ');
+  const reset=v2Replay('abc\x1bcZ');expect(v2Text(reset.cp.state.normal.rows[0]!)).toBe('Z         ');
+  expect(reset.rows).toEqual([]);
+});
+
+test('Q22 mutation controls: stale audit, content dedupe and renewed deadline are behavioral failures',()=>{
+  const root=mkdtempSync(join(tmpdir(),'q22-c-mutants-'));
+  const input=(text:string,now=10,since:number|null=null)=>({pane:v2Pane,checkpoint:v2Genesis(),
+    raw:{epoch:v2Epoch,start:0,end:Buffer.byteLength(text)},bytes:[...Buffer.from(text)],observedAtMonoMs:now,pendingSinceMonoMs:since});
+  const f=v2AuditFixture();
+  const cases=[
+    {name:'stale-audit',file:'tmux-capture-normalize.ts',
+      from:"if(e.snapshot.revision!==input.current.revision||e.snapshot.checkpointId!==input.current.checkpointId)return inconclusive('stale');",
+      to:"if(e.snapshot.revision!==input.current.revision||e.snapshot.checkpointId!==input.current.checkpointId)return {kind:'match',evidence:e,rule:input.checkpoint.rule};",
+      code:`import {evaluateV2Audit} from './subject.ts'; const result=evaluateV2Audit(${JSON.stringify({...f,current:{...f.current,revision:99}})}); assert.equal(result.kind,'inconclusive','MUTATION stale audit accepted');`},
+    {name:'content-dedupe',file:'capture-engine.ts',from:'out.push(removed);offsets.push(offset);',
+      to:'if(!out.length || JSON.stringify(out.at(-1))!==JSON.stringify(removed)){out.push(removed);offsets.push(offset);}',
+      code:`import {evaluateV2Rules} from './subject.ts'; const result=evaluateV2Rules(${JSON.stringify(input('same\r\nsame\r\nx\r\ny\r\n'))}); assert.equal(result.kind,'accept'); assert.equal(result.rows.length,2,'MUTATION actual repeated row deleted');`},
+    {name:'renewed-deadline',file:'capture-engine.ts',from:'(input.pendingSinceMonoMs??input.observedAtMonoMs)+V2L.pendingDeadlineMs',
+      to:'input.observedAtMonoMs+V2L.pendingDeadlineMs',
+      code:`import {evaluateV2Rules} from './subject.ts'; const result=evaluateV2Rules(${JSON.stringify(input('\x1b[',1010,10))}); assert.equal(result.kind,'gap','MUTATION pending deadline extended');`},
+  ];
+  try{
+    for(const c of cases){
+      const source=new URL(`../src/${c.file}`,import.meta.url);
+      const original=readFileSync(source,'utf8').replace(/from '(\.\/[^']+)'/g,(_,path)=>`from ${JSON.stringify(new URL(path+'.ts',source).pathname)}`)
+        .replace("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      expect(original.split(c.from)).toHaveLength(2);
+      const importEnd=c.code.indexOf(';')+1;
+      // Bun's uncaught formatter can lose pipe output while printing a huge
+      // single-line JSON fixture. Emit the actual assertion synchronously,
+      // below PIPE_BUF, instead of depending on the formatted source/caret.
+      writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';
+import {writeSync} from 'node:fs';
+${c.code.slice(0,importEnd)}
+try { ${c.code.slice(importEnd)} }
+catch(cause) { writeSync(2,String(cause)+'\\n'); process.exit(1); }`);
+      for(const mutated of [false,true]){
+        writeFileSync(join(root,'subject.ts'),mutated?original.replace(c.from,c.to):original);
+        const r=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
+        console.log('Q22_C_MUTATION',JSON.stringify({name:c.name,mutated,exit:r.status,stderr:r.stderr.slice(-1800)}));
+        expect(r.status).toBe(mutated?1:0);
+        if(mutated)expect(r.stderr).toContain('MUTATION');
+      }
+      // Restore before the next mutation; never install a mutant in the repo.
+      writeFileSync(join(root,'subject.ts'),original);
+    }
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('Q22 V2-13 physical 100x40 oracle on a private tmux socket',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'q22-c-oracle-')),socket=join(root,'x.sock');
+  const env={...process.env};delete env.TMUX;delete env.TMUX_PANE;
+  const tmux=(...args:string[])=>{const r=spawnSync('tmux',['-S',socket,...args],{env,encoding:'utf8'});expect(r.status,r.stderr).toBe(0);return r.stdout;};
+  const cases=[
+    'ไทย น้ำ 😃 ❤️\r\n'+'same\r\n'.repeat(42)+'\x1b[31mred\x1b[0m',
+    'wrong\rOK\x1b[K\b!\x1b[3;4H界\x1b[3;4HX',
+    'N'.repeat(100)+'\x1b[?25lX',
+    '\x1b[1;31;44m\x1b[2J\x1b[3;1HZ',
+    'N'.repeat(101)+'\r\nZ\x1b[?25l\x1b[?1049hALT\r\nsecond\x1b[?1049l',
+    '\x1b[2;4r\x1b[4;1Hbottom\n\n\x1b[r\x1b[1;1Htop',
+    '\x1b[1;38;2;1;2;3mcolor\x1b[0m\r\nabc\x1b[2;2H\x1b[@Z\x1b[P',
+  ];
+  try{
+    for(let index=0;index<cases.length;index++){
+      const body=cases[index]!,path=join(root,`body-${index}`);writeFileSync(path,body);
+      const paneId=tmux('-f','/dev/null','new-session','-d','-P','-F','#{pane_id}','-s',`oracle${index}`,'-x','100','-y','40',`stty -onlcr; cat '${path}'; touch '${path}.ready'; read hold`).trim();
+      const deadline=Date.now()+3000;
+      while(!existsSync(path+'.ready')&&Date.now()<deadline)await Bun.sleep(5);
+      expect(existsSync(path+'.ready')).toBe(true);
+      const captured=tmux('capture-pane','-p','-e','-N','-t',paneId);
+      const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)};
+      const cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0}),bytes=[...Buffer.from(body)];
+      const result=evaluateV2Rules({pane,checkpoint:cp,bytes,raw:{epoch:v2Epoch,start:0,end:bytes.length},observedAtMonoMs:1,pendingSinceMonoMs:null});
+      expect(result.kind).toBe('accept');if(result.kind!=='accept')throw Error(JSON.stringify(result));
+      const state=result.checkpoint.state;
+      expect(v2ScreenDigest(state[state.active].rows)).toBe(v2ScreenDigest(normalizeV2Capture(captured,pane.geometry)));
+      const cursor=tmux('display-message','-p','-t',paneId,'#{cursor_x} #{cursor_y} #{cursor_flag}').trim().split(' ').map(Number);
+      expect([state[state.active].cursor.x,state[state.active].cursor.y,Number(state[state.active].cursor.visible)]).toEqual(cursor);
+      console.log('Q22_PRIVATE_ORACLE',JSON.stringify({caseId:index,geometry:pane.geometry,rows:result.rows.length,cursor}));
+    }
+  }finally{spawnSync('tmux',['-S',socket,'kill-server'],{env});rmSync(root,{recursive:true,force:true});}
+});
+
+test('Q22 audit rejects geometry and grapheme allocations before decode',()=>{
+  expect(()=>normalizeV2Capture('x\n',{columns:1000000000,rows:1})).toThrow();
+  expect(()=>normalizeV2Capture('A'+'\u0301'.repeat(2100)+'\n',{columns:10,rows:1})).toThrow();
+});
+
+describe('Q22 C/H durable revision and segment seams (C-010..016)',()=>{
+  const nextInput=(cp:V2LiveCheckpoint,text:string)=>({pane:v2Pane,checkpoint:cp,
+    raw:{epoch:v2Epoch,start:cp.through.byteOffset,end:cp.through.byteOffset+Buffer.byteLength(text)},
+    bytes:[...Buffer.from(text)],observedAtMonoMs:20,pendingSinceMonoMs:null});
+  test('C-010 activation checkpoint uses the first durable pane revision',()=>{
+    expect(v2Genesis().revision).toBe(1);
+  });
+  test('C-011 metadata-only H commits advance revision without replacing the live checkpoint',()=>{
+    const context={...v2Clock,durableRevision:7};
+    const r=evaluateV2Rules(nextInput(v2Genesis(),'A'),v2Config,context);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.checkpoint.revision).toBe(8);
+  });
+  test('C-012 rows after a seal target a fresh segment and restart its ordinal at zero',()=>{
+    const first=v2Replay('a\r\nb\r\nc\r\nd\r\n');
+    const context={...v2Clock,durableRevision:first.cp.revision+1,rowTarget:{segmentId:'C-after-seal',nextRowOrdinal:0}};
+    const r=evaluateV2Rules(nextInput(first.cp,'e\r\n'),v2Config,context);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0]!.id).toEqual({pane:v2Pane.pane,segmentId:'C-after-seal',rowOrdinal:0});
+    expect(r.checkpoint.frontier).toEqual(r.rows[0]!.id);
+    const next=evaluateV2Rules(nextInput(r.checkpoint,'f\r\n'),v2Config,{...v2Clock,durableRevision:r.checkpoint.revision});
+    expect(next.kind).toBe('accept');if(next.kind==='accept')expect(next.rows[0]!.id).toEqual({pane:v2Pane.pane,segmentId:'C-after-seal',rowOrdinal:1});
+  });
+  test('C-013 an older durable revision is rejected instead of minting a stale write',()=>{
+    const cp=v2Replay('A').cp,context={...v2Clock,durableRevision:cp.revision-1};
+    expect(evaluateV2Rules(nextInput(cp,'B'),v2Config,context).kind).toBe('gap');
+  });
+  test('C-014 checkpoints without new raw still have distinct commit identities',()=>{
+    const first=evaluateV2Rules(nextInput(v2Genesis(),''));
+    expect(first.kind).toBe('accept');if(first.kind!=='accept')return;
+    const second=evaluateV2Rules(nextInput(first.checkpoint,''));
+    expect(second.kind).toBe('accept');if(second.kind!=='accept')return;
+    expect(second.checkpoint.checkpointId).not.toBe(first.checkpoint.checkpointId);
+  });
+  test('C-015 audit pairs a retained live checkpoint with the current metadata revision',()=>{
+    const f=v2AuditFixture(),current={...f.current,revision:f.current.revision+2};
+    const evidence={...f.evidence,before:current,after:current,snapshot:current};
+    expect(evaluateV2Audit({...f,current,evidence}).kind).toBe('match');
+    const rawCapture=f.rawCapture.replace('A','Z');
+    const mismatch=evaluateV2Audit({...f,current,rawCapture,evidence:{...evidence,actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry))}});
+    expect(mismatch.kind).toBe('annotate');if(mismatch.kind==='annotate')expect(mismatch.incident.revision).toBe(current.revision);
+    expect(evaluateV2Audit({...f,current,evidence,checkpoint:{...f.checkpoint,revision:current.revision+1}}).kind).toBe('inconclusive');
+  });
+  test('C-016 serialized row provenance fits H batch bytes, not only decoded cell bytes',()=>{
+    const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)},cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0});
+    const bytes=[...Buffer.from('\r\n'.repeat(200))];
+    const r=evaluateV2Rules({pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null});
+    expect(r.kind).toBe('gap');if(r.kind==='gap')expect(r.incident.reason).toBe('budget-exhausted');
+  });
+});
+
+describe('Q22 C definite rejection and proposal isolation',()=>{
+  test('only a definitively rejected proposal can be replanned from the durable raw frontier',()=>{
+    const cp=v2Genesis(),engine=new V2Jigsaw(cp,v2Pane),bytes=[...Buffer.from('a\r\nb\r\nc\r\nd\r\n')];
+    const raw={epoch:structuredClone(v2Epoch),start:0,end:bytes.length};
+    const first=engine.evaluate(raw,bytes,1,{...v2Clock,rowTarget:{segmentId:'rejected-A',nextRowOrdinal:0}});
+    expect(first.kind).toBe('accept');if(first.kind!=='accept')return;
+    expect(()=>engine.rejected('wrong')).toThrow();
+    expect(engine.rejected(first.checkpoint.checkpointId)).toEqual(cp.through);
+    const second=engine.evaluate(raw,bytes,2,{...v2Clock,rowTarget:{segmentId:'accepted-B',nextRowOrdinal:0}});
+    expect(second.kind).toBe('accept');if(second.kind!=='accept')return;
+    engine.committed(second.checkpoint.checkpointId);
+    expect(engine.liveCheckpoint.frontier?.segmentId).toBe('accepted-B');
+    expect(()=>engine.rejected(second.checkpoint.checkpointId)).toThrow();
+  });
+  test('caller mutation cannot alter a pending durable proposal',()=>{
+    const engine=new V2Jigsaw(v2Genesis(),v2Pane),epoch=structuredClone(v2Epoch);
+    const result=engine.evaluate({epoch,start:0,end:1},[65],1,v2Clock);
+    expect(result.kind).toBe('accept');if(result.kind!=='accept')return;
+    epoch.attachId='caller-mutated';
+    engine.committed(result.checkpoint.checkpointId);
+    expect(engine.liveCheckpoint.through.epoch.attachId).toBe(v2Epoch.attachId);
   });
 });

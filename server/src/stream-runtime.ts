@@ -890,3 +890,69 @@ export class FlagOnVtDecoder {
     this.unknown.add('cursor');
   }
 }
+
+// Q22 pure coordinator. I owns admission/serial queue/sole write facade and
+// installs a checkpoint ONLY after H returns its durable receipt.
+import { evaluateV2Rules, type V2DecisionContext } from './capture-engine';
+import { NEWARCH_V2_DEFAULT_CONFIG, NEWARCH_V2_LIMITS, streamCanonical, type V2Config, type V2RuleInput,
+  type V2RuleResult, type V2LiveCheckpoint, type NewarchV2PaneDescriptor, type RawRange } from './stream-contract';
+export class V2Jigsaw {
+  private pending: number[]=[];
+  private since: number|null=null;
+  private end: number;
+  private stopped=false;
+  private proposed: V2RuleResult|null=null;
+  constructor(private checkpoint: V2LiveCheckpoint, private readonly pane: NewarchV2PaneDescriptor,
+    private config: V2Config=NEWARCH_V2_DEFAULT_CONFIG) {
+    v2RuleTable(config);this.checkpoint=structuredClone(checkpoint);this.pane=structuredClone(pane);
+    this.config=structuredClone(config);this.end=checkpoint.through.byteOffset;
+  }
+  get pendingBytes():number{return this.pending.length;}
+  get deadlineMonoMs():number|null{return this.since===null?null:this.since+NEWARCH_V2_LIMITS.pendingDeadlineMs;}
+  get liveCheckpoint():V2LiveCheckpoint{return structuredClone(this.checkpoint);}
+  evaluate(raw:RawRange,bytes:readonly number[],now:number,context:V2DecisionContext):V2RuleResult {
+    if(this.stopped||this.proposed)throw Error('v2 stopped or waiting for durable commit');
+    // Never conceal a discontinuity by concatenating it to the pending prefix.
+    const contiguous=raw.start===this.end&&raw.end-raw.start===bytes.length
+      &&streamCanonical(raw.epoch)===streamCanonical(this.checkpoint.through.epoch);
+    const overflow=this.pending.length+bytes.length>NEWARCH_V2_LIMITS.pendingBytesPerPane;
+    const input:V2RuleInput={pane:this.pane,checkpoint:this.checkpoint,
+      raw:contiguous?{...raw,start:this.checkpoint.through.byteOffset}:raw,
+      bytes:contiguous&&!overflow?[...this.pending,...bytes]:bytes,
+      observedAtMonoMs:now,pendingSinceMonoMs:this.since};
+    let result=evaluateV2Rules(input,this.config,context);
+    if(overflow||!contiguous){
+      // Force the evaluator's continuity failure without retaining excess raw.
+      result=evaluateV2Rules({...input,raw:{...raw,start:this.checkpoint.through.byteOffset+1,end:raw.end}},this.config,context);
+    }
+    if(result.kind==='defer'){
+      this.pending=[...input.bytes];this.since??=now;this.end=raw.end;
+    }else{this.proposed=structuredClone(result);this.pending=[];this.since=null;if(result.kind==='gap')this.stopped=true;}
+    return structuredClone(result);
+  }
+  expire(now:number,context:V2DecisionContext):V2RuleResult|null {
+    if(this.since===null||now<this.since+NEWARCH_V2_LIMITS.pendingDeadlineMs)return null;
+    return this.evaluate({epoch:this.checkpoint.through.epoch,start:this.end,end:this.end},[],now,context);
+  }
+  /** Receipt verification belongs to the engine/H boundary; this requires the
+   * exact proposed checkpoint, never a caller-created screen snapshot. */
+  committed(checkpointId:string):void {
+    if(this.proposed?.kind!=='accept'||this.proposed.checkpoint.checkpointId!==checkpointId)throw Error('v2 commit checkpoint mismatch');
+    this.checkpoint=structuredClone(this.proposed.checkpoint);this.end=this.checkpoint.through.byteOffset;this.proposed=null;
+  }
+  /** Only after H has definitively rejected/rolled back the transaction.
+   * A timeout or lost ACK is NOT rejection: reconcile/retry the same decision.
+   * S still owns the unACKed bytes; reread from the returned durable frontier. */
+  rejected(checkpointId:string):import('./stream-contract').RawPosition {
+    if(this.proposed?.kind!=='accept'||this.proposed.checkpoint.checkpointId!==checkpointId)
+      throw Error('v2 rejected checkpoint mismatch');
+    this.proposed=null;this.end=this.checkpoint.through.byteOffset;
+    return structuredClone(this.checkpoint.through);
+  }
+  configure(config:V2Config):void {
+    if(this.pending.length||this.proposed||this.stopped)throw Error('v2 config only at committed boundary');
+    // Validate compiled registry without interpreting or rewriting old state.
+    v2RuleTable(config);this.config=structuredClone(config);
+  }
+}
+import { v2RuleTable } from './capture-engine';
