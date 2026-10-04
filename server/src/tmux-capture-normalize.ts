@@ -592,7 +592,7 @@ const v2Color = (value: string): number => value==='default'?-1:value.startsWith
 const observedStyle = (s: SgrState) => ({attrs:s.style,fg:v2Color(s.fg),bg:v2Color(s.bg)});
 /** Reject decorations the durable Cell contract cannot represent. */
 export function v2ApplySgr(attributes: readonly number[], body: string): number[] {
-  if(/(?:^|;)(?:21|53|55|58|59)(?:;|$)|(?:^|;)4:/.test(body))throw Error('unrepresented SGR decoration');
+  if(/(?:^|;)(?:53|55|58|59)(?:;|$)|(?:^|;)4:/.test(body))throw Error('unrepresented SGR decoration');
   const state:SgrState={fg:'default',bg:'default',style:0};
   applySgr(state,attributes.join(';'));applySgr(state,body);
   return semanticStyleToSgr(observedStyle(state));

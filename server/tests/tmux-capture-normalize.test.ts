@@ -277,7 +277,8 @@ test('I3 mutation control: certifying ambiguous cells fails and original stays i
   const root = mkdtempSync(join(tmpdir(), 'i3-decoder-mutation-'));
   try {
     const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
-      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`)
+      .replace("from './stream-contract'", `from ${JSON.stringify(new URL('../src/stream-contract.ts', import.meta.url).pathname)}`);
     const from = "certain: false, reason: 'ambiguous-cell-boundary' }";
     expect(original.split(from)).toHaveLength(2);
     writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
@@ -360,7 +361,8 @@ test('I4-FIX1 C mutation control: a memo that never trims keeps 9000 rows and fa
   const root = mkdtempSync(join(tmpdir(), 'i4c-decoder-mutation-'));
   try {
     const original = readFileSync(new URL('../src/tmux-capture-normalize.ts', import.meta.url), 'utf8')
-      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      .replace("from '@thumbmux/core'", `from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`)
+      .replace("from './stream-contract'", `from ${JSON.stringify(new URL('../src/stream-contract.ts', import.meta.url).pathname)}`);
     const from = 'if (this.cache.size <= keep) return;';
     expect(original.split(from)).toHaveLength(2);
     writeFileSync(join(root, 'runner.ts'), `import assert from 'node:assert/strict';
@@ -1808,7 +1810,7 @@ describe('Q22 V2-13 byte-zero jigsaw (anomaly fixtures C-001..C-008)',()=>{
   test('C-001 every UTF8/escape partition has identical VT, row IDs and ordered scroll provenance',()=>{
     const text='ซ้ำ😃\r\nซ้ำ😃\r\n\x1b[31m界\x1b[0m\r\nprogress 1\r\x1b[Kdone\r\n1234567890X\r\nก้❤️\r\n';
     const full=v2Replay(text);
-    expect(full.rows.slice(0,2).map(v2Text)).toEqual(['ซ้ำ😃     ','ซ้ำ😃     ']);
+    expect(full.rows.slice(0,2).map(v2Text)).toEqual(['ซ้ำ😃      ','ซ้ำ😃      ']);
     for(let cut=1;cut<Buffer.byteLength(text);cut++){
       const split=v2Replay(text,[cut]);
       expect(split.rows).toEqual(full.rows);expect(split.cp.state).toEqual(full.cp.state);
@@ -1909,4 +1911,50 @@ describe('Q22 V2-14/15 pure auditor (C-008)',()=>{
     expect(evaluateV2Audit({...f,evidence:{...f.evidence,actualDigest:'0'.repeat(64)}}).kind).toBe('inconclusive');
     expect(()=>normalizeV2Capture('A\n',f.checkpoint.geometry)).toThrow();
   });
+});
+
+test('Q22 C-009 terminal modes, cell edits, cursor visibility and reset',()=>{
+  const r=v2Replay('\x1b[?2004h\x1b[?1004h\x1b[?2026h\x1b[?25l\x1b[?1049hX');
+  expect(r.cp.state.alternate.cursor.visible).toBe(false);
+  const edited=v2Replay('abcd\x1b[1;2H\x1b[@Z\x1b[P');
+  expect(v2Text(edited.cp.state.normal.rows[0]!)).toBe('aZcd      ');
+  const reset=v2Replay('abc\x1bcZ');expect(v2Text(reset.cp.state.normal.rows[0]!)).toBe('Z         ');
+  expect(reset.rows).toEqual([]);
+});
+
+test('Q22 mutation controls: stale audit, content dedupe and renewed deadline are behavioral failures',()=>{
+  const root=mkdtempSync(join(tmpdir(),'q22-c-mutants-'));
+  const input=(text:string,now=10,since:number|null=null)=>({pane:v2Pane,checkpoint:v2Genesis(),
+    raw:{epoch:v2Epoch,start:0,end:Buffer.byteLength(text)},bytes:[...Buffer.from(text)],observedAtMonoMs:now,pendingSinceMonoMs:since});
+  const f=v2AuditFixture();
+  const cases=[
+    {name:'stale-audit',file:'tmux-capture-normalize.ts',
+      from:"if(e.snapshot.revision!==input.current.revision||e.snapshot.checkpointId!==input.current.checkpointId)return inconclusive('stale');",
+      to:"if(e.snapshot.revision!==input.current.revision||e.snapshot.checkpointId!==input.current.checkpointId)return {kind:'match',evidence:e,rule:input.checkpoint.rule};",
+      code:`import {evaluateV2Audit} from './subject.ts'; const result=evaluateV2Audit(${JSON.stringify({...f,current:{...f.current,revision:99}})}); assert.equal(result.kind,'inconclusive','MUTATION stale audit accepted');`},
+    {name:'content-dedupe',file:'capture-engine.ts',from:'out.push(removed);offsets.push(offset);',
+      to:'if(!out.length || JSON.stringify(out.at(-1))!==JSON.stringify(removed)){out.push(removed);offsets.push(offset);}',
+      code:`import {evaluateV2Rules} from './subject.ts'; const result=evaluateV2Rules(${JSON.stringify(input('same\r\nsame\r\nx\r\ny\r\n'))}); assert.equal(result.kind,'accept'); assert.equal(result.rows.length,2,'MUTATION actual repeated row deleted');`},
+    {name:'renewed-deadline',file:'capture-engine.ts',from:'(input.pendingSinceMonoMs??input.observedAtMonoMs)+V2L.pendingDeadlineMs',
+      to:'input.observedAtMonoMs+V2L.pendingDeadlineMs',
+      code:`import {evaluateV2Rules} from './subject.ts'; const result=evaluateV2Rules(${JSON.stringify(input('\x1b[',1010,10))}); assert.equal(result.kind,'gap','MUTATION pending deadline extended');`},
+  ];
+  try{
+    for(const c of cases){
+      const source=new URL(`../src/${c.file}`,import.meta.url);
+      const original=readFileSync(source,'utf8').replace(/from '(\.\/[^']+)'/g,(_,path)=>`from ${JSON.stringify(new URL(path+'.ts',source).pathname)}`)
+        .replace("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+      expect(original.split(c.from)).toHaveLength(2);
+      writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';\n${c.code}`);
+      for(const mutated of [false,true]){
+        writeFileSync(join(root,'subject.ts'),mutated?original.replace(c.from,c.to):original);
+        const r=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
+        console.log('Q22_C_MUTATION',JSON.stringify({name:c.name,mutated,exit:r.status,stderr:r.stderr.slice(0,1800)}));
+        expect(r.status).toBe(mutated?1:0);
+        if(mutated)expect(r.stderr).toContain('MUTATION');
+      }
+      // Restore before the next mutation; never install a mutant in the repo.
+      writeFileSync(join(root,'subject.ts'),original);
+    }
+  }finally{rmSync(root,{recursive:true,force:true});}
 });

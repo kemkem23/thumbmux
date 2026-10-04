@@ -1023,11 +1023,11 @@ export class CaptureCadence {
 // capture command or writer capability is available in this implementation.
 import { charCellWidth } from '@thumbmux/core';
 import {
-  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest, v2PaneKey,
-  v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest,
+  v2IncidentId, validateV2Checkpoint, validateV2Config,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
   type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
-  type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer, type Cell,
+  type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer,
 } from './stream-contract';
 import { v2ApplySgr } from './tmux-capture-normalize';
 
@@ -1093,6 +1093,11 @@ export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): reado
 function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scrolls:RowContent[];offsets:number[]} {
   if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
   const s=structuredClone(state) as Writable<VtState>, {columns,rows}=s.geometry;
+  for(const b of [s.normal,s.alternate]) {
+    if(b.rows.length!==rows || b.rows.some(r=>r.cells.length!==columns || r.uncertainFields.length)
+      || !counter(b.cursor.x)||b.cursor.x>=columns||!counter(b.cursor.y)||b.cursor.y>=rows)
+      throw Error('invalid VT buffer');
+  }
   const out:RowContent[]=[],offsets:number[]=[];
   let offset=0;
   const active=()=>s[s.active];
@@ -1144,7 +1149,7 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
       row().softWrap=true;row().wrapPad=1;lf();cursor().x=0;
     }
     cancelWrap();const x=cursor().x,r=row();
-    if(s.modes.insert){r.cells.splice(x,0,...Array.from({length:width},()=>({text:' ',width:1 as const,style:[...s.attributes]})));r.cells.length=columns;}
+    if(s.modes.insert){if(r.cells.some(c=>c.width!==1))throw Error('insert across wide glyph');r.cells.splice(x,0,...Array.from({length:width},()=>({text:' ',width:1 as const,style:[...s.attributes]})));r.cells.length=columns;}
     clearCell(r,x);if(width===2)clearCell(r,x+1);
     r.cells[x]={text,width,style:[...s.attributes]};
     if(width===2)r.cells[x+1]={text:'',width:0,style:[...s.attributes]};
@@ -1162,9 +1167,10 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
       for(const mode of args){
         if(privateMode && mode===25){s.normal.cursor.visible=s.alternate.cursor.visible=on;}
         else if(privateMode && mode===7)s.modes.autowrap=on;
+        else if(privateMode && [1,12,1000,1002,1003,1004,1005,1006,1015,2004,2026].includes(mode))s.modes[`private-${mode}`]=on;
         else if(privateMode && mode===6){s.modes.origin=on;cursor().x=0;cursor().y=on?s.margins.top:0;}
         else if(privateMode && [47,1047,1049].includes(mode)){
-          if(on && s.active==='normal'){if(mode===1049)save();s.alternate=v2Buffer(columns,rows);s.active='alternate';}
+          if(on && s.active==='normal'){if(mode===1049)save();s.alternate=v2Buffer(columns,rows);s.alternate.cursor.visible=s.normal.cursor.visible;s.active='alternate';}
           else if(!on && s.active==='alternate'){s.active='normal';if(mode===1049)restore();}
         } else if(!privateMode && mode===4)s.modes.insert=on;
         else throw Error('unsupported terminal mode');
@@ -1186,7 +1192,21 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
       if(args[0]===0){erase(row(),cursor().x,columns-1);for(let y=cursor().y+1;y<rows;y++)active().rows[y]=blank();}
       else if(args[0]===1){for(let y=0;y<cursor().y;y++)active().rows[y]=blank();erase(row(),0,cursor().x);}
       else active().rows=Array.from({length:rows},blank);
-    } else if(final==='S')scroll(n);
+    } else if(final==='@'||final==='P'){
+      const r=row(),count=Math.min(n,columns-cursor().x);
+      if(r.cells.some(c=>c.width!==1))throw Error('edit across wide glyph');
+      const blanks=blank().cells.slice(0,count);
+      if(final==='@'){r.cells.splice(cursor().x,0,...blanks);r.cells.length=columns;}
+      else {r.cells.splice(cursor().x,count);r.cells.push(...blanks);}
+    } else if(final==='L'||final==='M'){
+      if(cursor().y>=s.margins.top&&cursor().y<=s.margins.bottom){
+        for(let k=0;k<Math.min(n,s.margins.bottom-cursor().y+1);k++){
+          if(final==='L'){active().rows.splice(s.margins.bottom,1);active().rows.splice(cursor().y,0,blank());}
+          else {active().rows.splice(cursor().y,1);active().rows.splice(s.margins.bottom,0,blank());}
+        }
+      }
+    } else if(final==='n'||final==='c'){ /* terminal query, no visible mutation */ }
+    else if(final==='S')scroll(n);
     else if(final==='T')scroll(n,true);
     else if(final==='r'){
       const top=n-1,bottom=(args[1]||rows)-1;if(top>=bottom || bottom>=rows)throw Error('invalid margins');
@@ -1213,6 +1233,11 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
       } else if(p.length===2){
         if(byte===0x37)save();else if(byte===0x38)restore();else if(byte===0x44)lf();
         else if(byte===0x45){lf();cursor().x=0;}else if(byte===0x4d){if(cursor().y===s.margins.top)scroll(1,true);else cursor().y=Math.max(0,cursor().y-1);}
+        else if(byte===0x63){
+          const fresh=v2Buffer(columns,rows);s.normal=fresh;s.alternate=v2Buffer(columns,rows);s.active='normal';
+          s.attributes=[];s.modes={autowrap:true,origin:false,insert:false};s.margins={top:0,bottom:rows-1,left:0,right:columns-1};
+          s.tabStops=Array.from({length:Math.floor((columns-1)/8)},(_,i)=>(i+1)*8);
+        }
         else if(byte===0x48){if(!s.tabStops.includes(cursor().x))s.tabStops.push(cursor().x);s.tabStops.sort((a,b)=>a-b);}
         else throw Error('unsupported escape');
       }

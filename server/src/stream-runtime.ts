@@ -894,7 +894,7 @@ export class FlagOnVtDecoder {
 // Q22 pure coordinator. I owns admission/serial queue/sole write facade and
 // installs a checkpoint ONLY after H returns its durable receipt.
 import { evaluateV2Rules, type V2DecisionContext } from './capture-engine';
-import { NEWARCH_V2_DEFAULT_CONFIG, NEWARCH_V2_LIMITS, type V2Config, type V2RuleInput,
+import { NEWARCH_V2_DEFAULT_CONFIG, NEWARCH_V2_LIMITS, streamCanonical, type V2Config, type V2RuleInput,
   type V2RuleResult, type V2LiveCheckpoint, type NewarchV2PaneDescriptor, type RawRange } from './stream-contract';
 export class V2Jigsaw {
   private pending: number[]=[];
@@ -903,7 +903,10 @@ export class V2Jigsaw {
   private stopped=false;
   private proposed: V2RuleResult|null=null;
   constructor(private checkpoint: V2LiveCheckpoint, private readonly pane: NewarchV2PaneDescriptor,
-    private config: V2Config=NEWARCH_V2_DEFAULT_CONFIG) {this.end=checkpoint.through.byteOffset;}
+    private config: V2Config=NEWARCH_V2_DEFAULT_CONFIG) {
+    v2RuleTable(config);this.checkpoint=structuredClone(checkpoint);this.pane=structuredClone(pane);
+    this.config=structuredClone(config);this.end=checkpoint.through.byteOffset;
+  }
   get pendingBytes():number{return this.pending.length;}
   get deadlineMonoMs():number|null{return this.since===null?null:this.since+NEWARCH_V2_LIMITS.pendingDeadlineMs;}
   get liveCheckpoint():V2LiveCheckpoint{return structuredClone(this.checkpoint);}
@@ -911,7 +914,7 @@ export class V2Jigsaw {
     if(this.stopped||this.proposed)throw Error('v2 stopped or waiting for durable commit');
     // Never conceal a discontinuity by concatenating it to the pending prefix.
     const contiguous=raw.start===this.end&&raw.end-raw.start===bytes.length
-      &&JSON.stringify(raw.epoch)===JSON.stringify(this.checkpoint.through.epoch);
+      &&streamCanonical(raw.epoch)===streamCanonical(this.checkpoint.through.epoch);
     const overflow=this.pending.length+bytes.length>NEWARCH_V2_LIMITS.pendingBytesPerPane;
     const input:V2RuleInput={pane:this.pane,checkpoint:this.checkpoint,
       raw:contiguous?{...raw,start:this.checkpoint.through.byteOffset}:raw,
