@@ -153,9 +153,16 @@ function mountTermView(options: {
   mode?: ClaudeBashMode;
   onSummary?: SummaryHandler;
   historyPaging?: "ceiling" | "sliding";
+  claimGeometry?: boolean;
+  fixedGeometry?: { columns: number; rows: number } | null;
+  fitWidth?: boolean;
+  v2StatusText?: string | null;
+  onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
+  viewportWidth?: number;
 } = {}): Mounted {
+  const width = options.viewportWidth ?? 320;
   const target = document.createElement("div");
-  target.style.cssText = "position:relative;width:320px;height:240px;";
+  target.style.cssText = `position:relative;width:${width}px;height:240px;`;
   document.body.appendChild(target);
 
   let app!: Record<string, unknown>;
@@ -165,7 +172,11 @@ function mountTermView(options: {
       props: {
         session: SESSION,
         palette,
-        claimGeometry: false,
+        claimGeometry: options.claimGeometry ?? false,
+        ...(options.fixedGeometry ? { fixedGeometry: options.fixedGeometry } : {}),
+        ...(options.fitWidth ? { fitWidth: true } : {}),
+        ...(options.v2StatusText ? { v2StatusText: options.v2StatusText } : {}),
+        ...(options.onGeometryChange ? { onGeometryChange: options.onGeometryChange } : {}),
         fontPx: 13,
         ...(options.mode && options.mode !== "off"
           ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
@@ -183,7 +194,7 @@ function mountTermView(options: {
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
   if (!viewport) throw new Error("TermView root not found");
   Object.defineProperties(viewport, {
-    clientWidth: { configurable: true, get: () => 320 },
+    clientWidth: { configurable: true, get: () => width },
     clientHeight: { configurable: true, get: () => VIEW_HEIGHT },
   });
   viewport.getBoundingClientRect = () => ({
@@ -191,9 +202,9 @@ function mountTermView(options: {
     y: 0,
     left: 0,
     top: 0,
-    right: 320,
+    right: width,
     bottom: VIEW_HEIGHT,
-    width: 320,
+    width,
     height: VIEW_HEIGHT,
     toJSON: () => ({}),
   }) as DOMRect;
@@ -2678,5 +2689,71 @@ describe("TermView sliding archive window", () => {
       expect(pressure?.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
       expect(pressure?.querySelector('[data-testid="mtv-history-stop"]')?.textContent).toContain("ก่อนแถวแรก");
     });
+  });
+});
+
+describe("NEWARCH v2 fixed geometry on the screen", () => {
+  const status = "ท่อเก็บขาด — 04/10 08:02:03 — ก่อนแถวแรก — หยุดเก็บแล้ว";
+
+  async function mountFixed(options: {
+    viewportWidth: number;
+    fitWidth?: boolean;
+  }) {
+    const calls: Array<{ cols: number; rows: number }> = [];
+    const geometryCalls: Array<{ cols: number; rows: number }> = [];
+    const original = tmuxMux.sendResize.bind(tmuxMux);
+    tmuxMux.sendResize = (session, cols, rows) => {
+      calls.push({ cols, rows });
+      void session;
+    };
+    try {
+      const mountedView = mountTermView({
+        claimGeometry: true,
+        fixedGeometry: { columns: 100, rows: 40 },
+        fitWidth: options.fitWidth ?? false,
+        v2StatusText: status,
+        onGeometryChange: geometry => geometryCalls.push(geometry),
+        viewportWidth: options.viewportWidth,
+      });
+      await settleUi();
+      return { ...mountedView, calls, geometryCalls };
+    } finally {
+      tmuxMux.sendResize = original;
+    }
+  }
+
+  test("a phone shows the stopped incident with no live pane and does not resize", async () => {
+    for (const viewportWidth of [320, 390]) {
+      const view = await mountFixed({ viewportWidth });
+      expect(view.calls).toEqual([]);
+      expect(view.geometryCalls).toEqual([]);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("100");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("40");
+      const label = view.viewport.querySelector(".mtv-v2-status-text");
+      expect(label?.textContent).toContain("ก่อนแถวแรก");
+      expect(label?.textContent).toContain("หยุดเก็บแล้ว");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")?.textContent).toBe("เลื่อนข้างได้");
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeGreaterThan(viewportWidth);
+      const copied = [...view.viewport.querySelectorAll(".mtv-line")].map(node => node.textContent ?? "").join("\n");
+      expect(copied.includes("หยุดเก็บแล้ว")).toBe(false);
+    }
+  });
+
+  test("fit-width and a wide desktop keep 100 columns and write no resize", async () => {
+    const fit = await mountFixed({ viewportWidth: 320, fitWidth: true });
+    expect(fit.calls).toEqual([]);
+    expect(fit.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(fit.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+    expect(fit.viewport.querySelector(".mtv-v2-status-text")?.textContent).toContain("หยุดเก็บแล้ว");
+    const fitLayer = fit.viewport.querySelector<HTMLElement>(".mtv-layer");
+    expect(parseFloat(fitLayer?.style.width ?? "0")).toBeGreaterThan(320);
+    expect(fitLayer?.style.transform ?? "").toContain("scale(");
+
+    const desktop = await mountFixed({ viewportWidth: 1280 });
+    expect(desktop.calls).toEqual([]);
+    expect(desktop.geometryCalls).toEqual([]);
+    expect(desktop.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(desktop.viewport.getAttribute("data-last-rows")).toBe("40");
   });
 });

@@ -15,6 +15,12 @@ import {
   type NewarchHistoryExtension,
   type NewarchHistoryState,
   type NewarchRowId,
+  type NewarchV2FixedGeometry,
+  type NewarchV2Incident,
+  type NewarchV2IncidentReason,
+  type NewarchV2PaneDescriptor,
+  type NewarchV2PaneSelection,
+  type NewarchV2ReadState,
 } from '@thumbmux/core';
 
 export const HISTORY_WINDOW_MAX_ROWS = 10_000;
@@ -53,6 +59,10 @@ export type HistoryWindowState = Readonly<{
   hasOlder: boolean;
   hasNewer: boolean;
   limits: HistoryWindowLimits;
+  /** Opaque flag-on cursor for the older edge. Copied, never aliased to the caller. */
+  flagOnCursorBefore?: Readonly<{ version: 1; token: string }>;
+  /** Opaque flag-on cursor for the newer edge. */
+  flagOnCursorAfter?: Readonly<{ version: 1; token: string }>;
 }>;
 
 export type CreateHistoryWindowOptions = Readonly<{
@@ -101,6 +111,8 @@ export type HistoryWindowPage = Readonly<{
    * the page carries no rows. Absent = legacy page, `hasMore` alone decides.
    */
   continuation?: HistoryWindowContinuation;
+  /** Version 1 is readable. Any other shape is an unreadable cursor and refuses the page. */
+  flagOnCursor?: { readonly version: number; readonly token: string } | null;
 }>;
 
 export type HistoryWindowContinuation = NewarchHistoryContinuation['kind'];
@@ -153,8 +165,8 @@ export type HistoryWindowApplyResult =
   | HistoryWindowApplyRejected;
 
 export type HistoryWindowRequestCursor =
-  | Readonly<{ direction: 'before'; beforeLine: number }>
-  | Readonly<{ direction: 'after'; afterLine: number }>;
+  | Readonly<{ direction: 'before'; beforeLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>
+  | Readonly<{ direction: 'after'; afterLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>;
 
 function finiteInteger(value: number): boolean {
   return Number.isFinite(value) && Number.isSafeInteger(value);
@@ -313,11 +325,39 @@ export function historyWindowRequestCursor(
   direction: HistoryWindowDirection,
 ): HistoryWindowRequestCursor | null {
   if (direction === 'before') {
-    return state.hasOlder ? { direction, beforeLine: state.startLine } : null;
+    if (!state.hasOlder) return null;
+    return state.flagOnCursorBefore
+      ? { direction, beforeLine: state.startLine, flagOnCursor: state.flagOnCursorBefore }
+      : { direction, beforeLine: state.startLine };
   }
-  return state.hasNewer
-    ? { direction, afterLine: historyWindowEndLine(state) - 1 }
-    : null;
+  if (!state.hasNewer) return null;
+  return state.flagOnCursorAfter
+    ? { direction, afterLine: historyWindowEndLine(state) - 1, flagOnCursor: state.flagOnCursorAfter }
+    : { direction, afterLine: historyWindowEndLine(state) - 1 };
+}
+
+type StoredFlagCursor = Readonly<{ version: 1; token: string }>;
+
+function copyFlagCursor(value: HistoryWindowPage['flagOnCursor']): StoredFlagCursor | null | 'bad' {
+  if (value == null) return null;
+  if (value.version !== 1 || typeof value.token !== 'string' || value.token.length === 0) return 'bad';
+  return { version: 1, token: value.token };
+}
+
+function attachFlagCursor(
+  next: HistoryWindowState,
+  state: HistoryWindowState,
+  direction: HistoryWindowDirection,
+  cursor: StoredFlagCursor | null,
+): HistoryWindowState {
+  const before = direction === 'before' && cursor ? cursor : state.flagOnCursorBefore;
+  const after = direction === 'after' && cursor ? cursor : state.flagOnCursorAfter;
+  if (!before && !after) return next;
+  return {
+    ...next,
+    ...(before ? { flagOnCursorBefore: before } : {}),
+    ...(after ? { flagOnCursorAfter: after } : {}),
+  };
 }
 
 function rejected(
@@ -445,6 +485,10 @@ export function applyHistoryWindowPage(
   ) {
     return rejected(state, 'invalid-page', 'flag-on continuation disagrees with hasMore');
   }
+  const flagCursor = copyFlagCursor(page.flagOnCursor);
+  if (flagCursor === 'bad') {
+    return rejected(state, 'invalid-page', 'flag-on cursor is not readable');
+  }
 
   if (page.lines.length === 0 && page.continuation === 'blocked') {
     // Pending/gap/remote: nothing to merge, and the edge must stay pageable.
@@ -457,7 +501,7 @@ export function applyHistoryWindowPage(
     };
     return {
       kind: 'blocked',
-      state: next,
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
       anchor: anchorCommit(state, next, anchor),
       acceptedPage: null,
       evictedOpposite: null,
@@ -478,7 +522,7 @@ export function applyHistoryWindowPage(
     };
     return {
       kind: 'boundary',
-      state: next,
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
       anchor: anchorCommit(state, next, anchor),
       acceptedPage: null,
       evictedOpposite: null,
@@ -614,7 +658,7 @@ export function applyHistoryWindowPage(
 
   return {
     kind: 'committed',
-    state: next,
+    state: attachFlagCursor(next, state, page.direction, flagCursor),
     anchor: anchorCommit(state, next, anchor),
     acceptedPage,
     evictedOpposite,
@@ -921,6 +965,184 @@ function validContinuation(value: unknown, repairClaimed: boolean): boolean {
     return validCursor(value.cursor) && validState(value.state, repairClaimed) && (value.state as Obj).kind !== 'exact';
   }
   return false;
+}
+
+export const NEWARCH_V2_NOTE_CAP = 64;
+
+const V2_INCIDENT_REASON: Record<NewarchV2IncidentReason, string> = {
+  'geometry-violation': 'ขนาดจอถูกเปลี่ยนระหว่างเก็บ',
+  'unverified-restart': 'เครื่องดับแล้วพิสูจน์ความต่อเนื่องไม่ได้',
+  'unrecorded-birth': 'มี pane ที่ไม่ได้บันทึกตั้งแต่เกิด',
+  'birth-failed': 'เปิดเซสชันไม่สำเร็จ',
+  'pipe-eof': 'ท่อเก็บขาด',
+  'collector-epoch-changed': 'ตัวเก็บเปลี่ยนรุ่น',
+  'storage-outage': 'พื้นที่เก็บใช้ไม่ได้',
+  'budget-exhausted': 'พื้นที่เก็บเต็ม',
+  'audit-mismatch': 'ภาพจอไม่ตรงกับที่บันทึก',
+  'decoder-anomaly': 'ถอดรหัสจอไม่สมบูรณ์',
+  'identity-change': 'ตัวตนของ pane เปลี่ยน',
+};
+
+function v2WallClock(openedAtWallMs: number): string {
+  const at = new Date(openedAtWallMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(at.getDate())}/${pad(at.getMonth() + 1)} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+}
+
+/** Visible sentence for one incident. Frontier null is before the first row. */
+export function newarchV2IncidentLabel(incident: NewarchV2Incident): string {
+  const reason = V2_INCIDENT_REASON[incident.reason];
+  const row = incident.frontier
+    ? `แถวสุดท้าย ${incident.frontier.segmentId}:${incident.frontier.rowOrdinal}`
+    : 'ก่อนแถวแรก';
+  const stopped = incident.collecting ? '' : ' — หยุดเก็บแล้ว';
+  return `${reason} — ${v2WallClock(incident.openedAtWallMs)} — ${row}${stopped}`;
+}
+
+/** Exact history has no label. A blocked store is never described as the end. */
+export function newarchV2StateLabel(state: NewarchV2ReadState): string | null {
+  switch (state.kind) {
+    case 'exact':
+      return null;
+    case 'incident':
+      return newarchV2IncidentLabel(state.incident);
+    case 'storage-unavailable':
+      return 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — ยังไม่ใช่จุดสิ้นสุด';
+    case 'remote-unavailable':
+      if (state.reason === 'offline') return 'ดึงประวัติจากคลังสำรองไม่ได้ตอนนี้ (ออฟไลน์) — ยังไม่ใช่จุดสิ้นสุด';
+      if (state.reason === 'missing') return 'ไม่พบประวัติช่วงนี้ในคลังสำรอง — ยังไม่ใช่จุดสิ้นสุด';
+      return 'ประวัติช่วงนี้ในคลังสำรองเสียหาย อ่านไม่ได้ — ยังไม่ใช่จุดสิ้นสุด';
+  }
+}
+
+export type NewarchV2StatusNote = Readonly<{ key: string; text: string }>;
+
+/** Labels stay outside row text. The list is capped so a storm cannot grow without bound. */
+export function newarchV2StatusNotes(input: {
+  readonly entries: readonly ({ readonly kind: 'incident'; readonly incident: NewarchV2Incident } | { readonly kind: 'row' })[];
+  readonly states: readonly NewarchV2ReadState[];
+}): NewarchV2StatusNote[] {
+  const notes: NewarchV2StatusNote[] = [];
+  const push = (key: string, text: string | null) => {
+    if (!text || notes.some(note => note.key === key) || notes.length >= NEWARCH_V2_NOTE_CAP) return;
+    notes.push({ key, text });
+  };
+  for (const entry of input.entries) {
+    if (entry.kind !== 'incident') continue;
+    push(`incident|${entry.incident.incidentId}`, newarchV2IncidentLabel(entry.incident));
+  }
+  for (const state of input.states) {
+    const text = newarchV2StateLabel(state);
+    const key = state.kind === 'incident'
+      ? `state|${state.incident.incidentId}`
+      : state.kind === 'remote-unavailable'
+        ? `state|remote-unavailable|${state.reason}|${state.bundleId}`
+        : state.kind === 'storage-unavailable'
+          ? `state|storage-unavailable|${state.pendingIncidentId ?? ''}`
+          : 'state|exact';
+    push(key, text);
+  }
+  return notes;
+}
+
+/** Terminal rows only. Status sentences are not part of copy or search. */
+export function newarchV2RowCopy(rows: readonly string[]): string {
+  return rows.join('\n');
+}
+
+export interface NewarchV2GeometryIntent {
+  readonly source: 'viewport' | 'font' | 'fit-width' | 'rotation' | 'keyboard-inset' | 'apply-geometry';
+  readonly columns: number;
+  readonly rows: number;
+}
+
+/** Every viewer intent gets the birth geometry back. Nothing here is a resize write. */
+export function answerNewarchV2Geometry(
+  geometry: NewarchV2FixedGeometry,
+  _intent: NewarchV2GeometryIntent,
+): { readonly status: 'fixed'; readonly geometry: NewarchV2FixedGeometry; readonly resize: null } {
+  return { status: 'fixed', geometry, resize: null };
+}
+
+/** One pane is selected. Two or more stay a list, including a display-name collision. */
+export function selectNewarchV2Panes(
+  panes: readonly NewarchV2PaneDescriptor[],
+  next: string | null,
+): NewarchV2PaneSelection {
+  if (panes.length === 0 && next === null) return { kind: 'missing' };
+  if (panes.length === 1 && next === null) return { kind: 'selected', pane: panes[0]! };
+  return { kind: 'ambiguous', panes: [...panes], next };
+}
+
+export interface NewarchV2Viewport {
+  readonly widthPx: number;
+  readonly heightPx: number;
+  readonly cellWidthPx: number;
+  readonly cellHeightPx: number;
+  readonly keyboardInsetPx: number;
+  readonly fitWidth: boolean;
+  readonly scrollXPx: number;
+}
+
+export interface NewarchV2Presentation {
+  readonly columns: number;
+  readonly rows: number;
+  readonly scale: number;
+  readonly contentWidthPx: number;
+  readonly contentHeightPx: number;
+  readonly visibleHeightPx: number;
+  readonly maxScrollXPx: number;
+  readonly scrollXPx: number;
+  readonly horizontalScroll: boolean;
+  readonly resize: null;
+}
+
+/**
+ * Viewport, font, fit-width, rotation, and keyboard inset change only this
+ * picture. Terminal columns and rows stay on the birth geometry.
+ */
+export function presentNewarchV2(
+  terminal: { readonly columns: number; readonly rows: number },
+  viewport: NewarchV2Viewport,
+): NewarchV2Presentation {
+  const columns = terminal.columns;
+  const rows = terminal.rows;
+  const naturalWidth = columns * viewport.cellWidthPx;
+  const naturalHeight = rows * viewport.cellHeightPx;
+  const scale = viewport.fitWidth && naturalWidth > 0 ? viewport.widthPx / naturalWidth : 1;
+  const contentWidthPx = naturalWidth * scale;
+  const contentHeightPx = naturalHeight * scale;
+  const maxScrollXPx = viewport.fitWidth ? 0 : Math.max(0, naturalWidth - viewport.widthPx);
+  const scrollXPx = viewport.fitWidth ? 0 : Math.min(Math.max(0, viewport.scrollXPx), maxScrollXPx);
+  const inset = Math.max(0, viewport.keyboardInsetPx);
+  return {
+    columns,
+    rows,
+    scale,
+    contentWidthPx,
+    contentHeightPx,
+    visibleHeightPx: Math.max(0, viewport.heightPx - inset),
+    maxScrollXPx,
+    scrollXPx,
+    horizontalScroll: maxScrollXPx > 0,
+    resize: null,
+  };
+}
+
+/** Map a viewport point through scroll and fit-width scale onto the fixed grid. */
+export function hitNewarchV2Cell(
+  presentation: NewarchV2Presentation,
+  point: { readonly clientX: number; readonly clientY: number; readonly originX: number; readonly originY: number },
+  cell: { readonly widthPx: number; readonly heightPx: number },
+): { readonly col: number; readonly row: number } | null {
+  if (!(presentation.scale > 0) || !(cell.widthPx > 0) || !(cell.heightPx > 0)) return null;
+  const localX = (point.clientX - point.originX + presentation.scrollXPx) / presentation.scale;
+  const localY = (point.clientY - point.originY) / presentation.scale;
+  if (!Number.isFinite(localX) || !Number.isFinite(localY) || localX < 0 || localY < 0) return null;
+  const col = Math.floor(localX / cell.widthPx);
+  const row = Math.floor(localY / cell.heightPx);
+  if (col < 0 || col >= presentation.columns || row < 0 || row >= presentation.rows) return null;
+  return { col, row };
 }
 
 /**

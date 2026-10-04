@@ -42,6 +42,7 @@
     historyWindowEndLine,
     historyWindowRequestCursor,
     parseNewarchHistoryExtension,
+    presentNewarchV2,
     type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
@@ -203,6 +204,12 @@
      * newest completed group. Return summaries by id; rejection/missing ids
      * settle to a deterministic fallback. Active groups are never sent. */
     onClaudeBashSummaryRequest = undefined,
+    /** Birth geometry of a NEWARCH pane. Viewport changes must not resize it. */
+    fixedGeometry = null,
+    /** Shrink the picture to the viewport. Does not change terminal columns. */
+    fitWidth = false,
+    /** Incident sentence drawn even when this view has no live pane. */
+    v2StatusText = null,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -250,6 +257,9 @@
     onClaudeBashSummaryRequest?: (
       requests: readonly ClaudeBashSummaryRequest[],
     ) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
+    fixedGeometry?: { columns: number; rows: number } | null;
+    fitWidth?: boolean;
+    v2StatusText?: string | null;
   } = $props();
 
   /**
@@ -351,6 +361,7 @@
   let viewportBottom: number | null = null;
   let cursor = $state<{ row: number; col: number } | null>(null);
   let charW = $state(0);
+  let viewportWidthPx = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
   let viewH = $state(0);
   let lineH = $derived(Math.round(fontPx * LINE_RATIO));
@@ -6100,7 +6111,14 @@
 
     if (layerEl) {
       const y = presentationRowTopPx(winStart) - scrollTop - (overshoot * 0.35);
-      layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      const translate = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      // Fit-width scales the picture only. Birth columns stay on the grid.
+      if (fixedGeometry && fitWidth && fixedPresentation && fixedPresentation.scale > 0) {
+        layerEl.style.transformOrigin = 'top left';
+        layerEl.style.transform = `${translate} scale(${fixedPresentation.scale})`;
+      } else {
+        layerEl.style.transform = translate;
+      }
     }
     emitScrollState();
     if (!busy()) settledBottomOffsetPx = reportedBottomOffset();
@@ -6199,6 +6217,20 @@
     if (!bounds) return null;
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     const cellW = Math.max(1, charW || measureCharWidth());
+    if (fixedGeometry) {
+      const naturalW = geom.cols * cellW;
+      const scale = fitWidth && naturalW > 0 ? Math.max(bounds.width, 1) / naturalW : 1;
+      const scrollX = fitWidth ? 0 : viewportEl.scrollLeft;
+      return {
+        rect: {
+          left: bounds.left - scrollX,
+          top: bounds.top,
+          width: naturalW * scale,
+          height: Math.max(1, geom.rows * lineH * scale),
+        },
+        geom,
+      };
+    }
     const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
     // contentCellFromPoint scales the rect across geom.rows, so the rect it gets
     // must be the box those rows actually occupy — rows * lineH — not the box the
@@ -6769,6 +6801,7 @@
   }
 
   function canSendResize(): boolean {
+    if (fixedGeometry) return false;
     return !!(
       claimGeometry &&
       typeof document !== 'undefined' &&
@@ -6790,6 +6823,13 @@
     if (w <= 0 || visibleH <= 0 || h <= 0) return null;
     const cw = measureCharWidth();
     charW = cw;
+    if (fixedGeometry) {
+      viewportWidthPx = w;
+      lastPushedCols = fixedGeometry.columns;
+      lastPushedRows = fixedGeometry.rows;
+      applyScroll();
+      return { cols: lastPushedCols, rows: lastPushedRows, changed: false };
+    }
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
     const rows = Math.max(minRows, Math.min(maxRows, Math.floor(h / lineH)));
     const changed = !!opts.force || cols !== lastPushedCols || rows !== lastPushedRows;
@@ -7308,12 +7348,34 @@
     });
   }
 
+  const fixedPresentation = $derived(
+    fixedGeometry && charW > 0 && viewportWidthPx > 0
+      ? presentNewarchV2(
+          { columns: fixedGeometry.columns, rows: fixedGeometry.rows },
+          {
+            widthPx: viewportWidthPx,
+            heightPx: viewportEl?.clientHeight ?? 0,
+            cellWidthPx: charW,
+            cellHeightPx: lineH,
+            keyboardInsetPx: bottomInsetPx,
+            fitWidth,
+            scrollXPx: 0,
+          },
+        )
+      : null,
+  );
+  const fixedLayerWidth = $derived(
+    fixedGeometry && charW > 0 ? `${fixedGeometry.columns * charW + 12}px` : undefined,
+  );
+
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   bind:this={viewportEl}
   class="mtv"
+  class:mtv-fixed={fixedGeometry != null}
+  class:mtv-fit={fixedGeometry != null && fitWidth}
   data-testid="mtv"
   data-total={total}
   data-raw-total={rawLines.length}
@@ -7400,7 +7462,22 @@
       />
     </div>
   {/if}
-  <div bind:this={layerEl} class="mtv-layer">
+  {#if v2StatusText}
+    <div class="mtv-v2-status" role="note">
+      <span class="mtv-v2-status-text">{v2StatusText}</span>
+    </div>
+  {/if}
+  {#if fixedPresentation?.horizontalScroll}
+    <div class="mtv-hscroll" role="note">
+      <span class="mtv-hscroll-text">เลื่อนข้างได้</span>
+    </div>
+  {/if}
+  <div
+    bind:this={layerEl}
+    class="mtv-layer"
+    class:mtv-layer-fixed={fixedGeometry != null}
+    style:width={fixedLayerWidth}
+  >
     {#if renderer === 'canvas'}
       <CanvasTerminal
         lines={canvasWindowLines()}
@@ -7739,10 +7816,42 @@
     max-width: min(24rem, calc(100% - 0.9rem));
     pointer-events: auto;
   }
+  .mtv-fixed {
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .mtv-fixed.mtv-fit {
+    overflow-x: hidden;
+  }
+  .mtv-v2-status,
+  .mtv-hscroll {
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 6;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mtv-v2-status { top: 0; }
+  .mtv-hscroll { bottom: 0; }
+  .mtv-v2-status-text,
+  .mtv-hscroll-text {
+    display: inline-block;
+    max-width: 100%;
+    padding: 2px 6px;
+    box-sizing: border-box;
+    font: 600 12px / 1.35 var(--font-mono, ui-monospace, monospace);
+    color: #141414;
+    background: #E0A020;
+  }
   .mtv-layer {
     position: absolute; left: 0; right: 0; top: 0;
     will-change: transform;
     padding: 0 6px;
+  }
+  .mtv-fixed .mtv-layer-fixed {
+    right: auto;
   }
   .mtv-line {
     white-space: pre;

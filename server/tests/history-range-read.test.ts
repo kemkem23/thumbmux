@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MuxClientMessage, SessionListItem } from "../../core/src/protocol";
 import { FileHistoryArchive } from "../src/history-archive";
-import { StreamDisplayEngine } from "../src/display-engine";
-import type { NewarchGap, NewarchHistoryExtension } from "../../core/src/protocol";
-import { STREAM_BUDGET, type CaptureEngine, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type ViewerRoute } from "../src/stream-contract";
+import { NewarchV2Display, StreamDisplayEngine } from "../src/display-engine";
+import type { NewarchGap, NewarchHistoryExtension, NewarchV2HistoryCursor, NewarchV2HistoryRequest, NewarchV2Incident, NewarchV2PaneDescriptor } from "../../core/src/protocol";
+import { STREAM_BUDGET, type CaptureEngine, type CommittedStreamRow, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type V2HistoryPage, type V2HistoryReader, type V2SessionOwnerRecord, type ViewerRoute } from "../src/stream-contract";
 import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "range-read";
@@ -823,4 +823,234 @@ test("NEWARCH D: a history that stays busy returns busy, never an empty EOF page
   expect(result.status).toBe("busy");
   expect(calls).toBe(STREAM_BUDGET.maxReadRetries + 1);
   expect(h.released).toEqual([{ requestId: "busy", reason: "busy" }]);
+});
+
+const V2_GEOMETRY = {
+  policy: "fixed-at-birth" as const, columns: 100, rows: 40,
+  configVersion: "q22-default-1", panesPerWindow: 1 as const,
+};
+const V2_PANE = { serverIdentity: "srv", paneId: "pane-a", birthGeneration: 1 };
+const V2_SESSION = { serverIdentity: "srv", sessionId: "sess-1" };
+
+function v2Descriptor(paneId: string): NewarchV2PaneDescriptor {
+  return {
+    schema: "newarch-v2", session: V2_SESSION,
+    pane: { serverIdentity: "srv", paneId, birthGeneration: 1 },
+    windowId: `win-${paneId}`, owner: "capture-engine", birthOperationId: `birth-${paneId}`,
+    geometry: V2_GEOMETRY, state: "active",
+  };
+}
+
+function v2Owner(): V2SessionOwnerRecord {
+  return {
+    schema: "newarch-v2", session: V2_SESSION, owner: "capture-engine",
+    birthOperationId: "birth-sess", state: "active", generation: 1,
+  };
+}
+
+function v2Row(ordinal: number, segmentId = "seg"): CommittedStreamRow {
+  const id = { pane: V2_PANE, segmentId, rowOrdinal: ordinal };
+  const origin = { kind: "durable" as const, rowId: id };
+  return {
+    id, origin, cells: [{ text: `r${ordinal}`, width: 1, style: [] }],
+    geometry: { columns: 100, rows: 40 }, buffer: "normal", wrapStatus: "unwrapped",
+    wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [origin],
+  };
+}
+
+function v2Cursor(storeId: string): NewarchV2HistoryCursor {
+  return { schema: "newarch-v2", pane: V2_PANE, storeId, timelineRevision: 3, token: "cursor-token-1" };
+}
+
+function v2Incident(collecting: boolean): NewarchV2Incident {
+  return {
+    schema: "newarch-v2", incidentId: "incident-before-first", pane: V2_PANE, reason: "pipe-eof",
+    frontier: null, affected: { after: null, through: null },
+    openedAtWallMs: Date.UTC(2026, 9, 4, 1, 2, 3), openedAtMonoMs: 10, clockEpoch: "epoch-1",
+    collecting, missing: { countKind: "unknown", missingCount: null },
+    ruleVersion: "explicit-gap@1", configVersion: "q22-default-1", geometry: V2_GEOMETRY,
+    revision: 1, sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+    action: collecting ? "annotate" : "gap-and-stop", evidence: null,
+  };
+}
+
+function v2Page(input: Pick<V2HistoryPage, "entries" | "states" | "before" | "after"> & { payloadBytes?: number }): V2HistoryPage {
+  return {
+    schema: "newarch-v2", pane: V2_PANE, revision: 3, payloadBytes: input.payloadBytes ?? 2,
+    entries: input.entries, states: input.states, before: input.before, after: input.after,
+  };
+}
+
+function v2Request(cursor: NewarchV2HistoryCursor | null = null): NewarchV2HistoryRequest {
+  return { schema: "newarch-v2", pane: V2_PANE, cursor, direction: "after", maxEntries: 20, maxBytes: 4096 };
+}
+
+function v2Reader(overrides: Partial<V2HistoryReader>): V2HistoryReader {
+  const unused = () => ({ status: "error" as const, code: "integrity" as const, message: "unused v2 port" });
+  return {
+    owner: unused, receipt: unused, checkpoint: unused, page: async () => unused(),
+    panes: () => ({ status: "ok", value: { panes: [], next: null } }),
+    sessionOwner: () => ({ status: "ok", value: null }),
+    sealed: unused, export: unused, locator: unused, lastAudit: unused,
+    ...overrides,
+  };
+}
+
+test("NEWARCH v2 D: several panes stay a list and the last pane is not chosen", () => {
+  const panes = [v2Descriptor("pane-a"), v2Descriptor("pane-b")];
+  const display = new NewarchV2Display(v2Reader({
+    sessionOwner: () => ({ status: "ok", value: v2Owner() }),
+    panes: () => ({ status: "ok", value: { panes, next: null } }),
+  }));
+  const selected = display.select(V2_SESSION);
+  expect(selected.status).toBe("ok");
+  if (selected.status !== "ok") return;
+  expect(selected.value.kind).toBe("ambiguous");
+  if (selected.value.kind !== "ambiguous") return;
+  expect(selected.value.panes.map(pane => pane.pane.paneId)).toEqual(["pane-a", "pane-b"]);
+  const only = new NewarchV2Display(v2Reader({
+    sessionOwner: () => ({ status: "ok", value: v2Owner() }),
+    panes: () => ({ status: "ok", value: { panes: [panes[0]!], next: null } }),
+  })).select(V2_SESSION);
+  expect(only.status === "ok" && only.value.kind).toBe("selected");
+  const unknown = new NewarchV2Display(v2Reader({
+    sessionOwner: () => ({ status: "error", code: "io", message: "owner store unreadable" }),
+  })).select(V2_SESSION);
+  expect(unknown.status === "ok" && unknown.value.kind).toBe("owner-unavailable");
+  const absent = new NewarchV2Display(v2Reader({
+    sessionOwner: () => ({ status: "ok", value: null }),
+  })).select(V2_SESSION);
+  expect(absent.status === "ok" && absent.value.kind).toBe("missing");
+});
+
+test("NEWARCH v2 D: viewer geometry never resizes a fixed pane", () => {
+  const display = new NewarchV2Display(v2Reader({}));
+  for (const intent of [
+    { source: "viewport" as const, columns: 40, rows: 20 },
+    { source: "font" as const, columns: 80, rows: 30 },
+    { source: "rotation" as const, columns: 70, rows: 20 },
+    { source: "keyboard-inset" as const, columns: 40, rows: 12 },
+    { source: "fit-width" as const, columns: 100, rows: 40 },
+    { source: "apply-geometry" as const, columns: 120, rows: 50 },
+  ]) {
+    const answer = display.geometry(v2Descriptor("pane-a"), intent);
+    expect(answer.resize).toBeNull();
+    expect(answer.reply.status).toBe("fixed");
+    expect(answer.reply.geometry).toEqual(V2_GEOMETRY);
+  }
+});
+
+test("NEWARCH v2 D: one cursor walks local to remote to local and each row once", async () => {
+  const seen: string[] = [];
+  const pages = new Map<string, V2HistoryPage>([
+    ["", v2Page({
+      entries: [{ kind: "row", row: v2Row(1) }, { kind: "row", row: v2Row(2) }],
+      states: [{ kind: "exact", auditedRevision: 3 }],
+      before: { kind: "end" }, after: { kind: "more", cursor: v2Cursor("local") },
+    })],
+    ["local", v2Page({
+      entries: [{ kind: "row", row: v2Row(3) }],
+      states: [{ kind: "exact", auditedRevision: 3 }],
+      before: { kind: "more", cursor: v2Cursor("local") },
+      after: { kind: "more", cursor: v2Cursor("remote") },
+    })],
+    ["remote", v2Page({
+      entries: [{ kind: "row", row: v2Row(4) }],
+      states: [{ kind: "exact", auditedRevision: 3 }],
+      before: { kind: "more", cursor: v2Cursor("remote") },
+      after: { kind: "more", cursor: v2Cursor("local-restored") },
+    })],
+    ["local-restored", v2Page({
+      entries: [{ kind: "row", row: v2Row(5) }],
+      states: [{ kind: "exact", auditedRevision: 3 }],
+      before: { kind: "more", cursor: v2Cursor("local-restored") },
+      after: { kind: "end" },
+    })],
+  ]);
+  const display = new NewarchV2Display(v2Reader({
+    page: async request => {
+      const storeId = request.cursor?.storeId ?? "";
+      seen.push(`${storeId}:${request.cursor?.token ?? ""}`);
+      const page = pages.get(storeId);
+      if (!page) return { status: "error", code: "integrity", message: "missing page" };
+      return { status: "ok", value: page };
+    },
+  }));
+  const span = await display.readSpan(v2Request(), 8);
+  expect(span.status).toBe("ok");
+  if (span.status !== "ok") return;
+  expect(span.value.ended).toBe(true);
+  expect(span.value.blocked).toBeNull();
+  expect(span.value.entries.map(entry => entry.kind === "row" ? entry.row.id.rowOrdinal : null)).toEqual([1, 2, 3, 4, 5]);
+  expect(seen).toEqual([":", "local:cursor-token-1", "remote:cursor-token-1", "local-restored:cursor-token-1"]);
+});
+
+test("NEWARCH v2 D: a missing remote is blocked, not an empty end, and the pin is held across the read", async () => {
+  const log: string[] = [];
+  const blocked = v2Page({
+    entries: [],
+    states: [{ kind: "remote-unavailable", bundleId: "bundle-1", reason: "missing", retryAfterMs: 1000 }],
+    before: { kind: "end" },
+    after: {
+      kind: "blocked", cursor: v2Cursor("remote"),
+      state: { kind: "remote-unavailable", bundleId: "bundle-1", reason: "missing", retryAfterMs: 1000 },
+    },
+  });
+  const display = new NewarchV2Display(v2Reader({
+    page: async () => {
+      log.push("read");
+      expect(log).toEqual(["pin", "read"]);
+      return { status: "ok", value: blocked };
+    },
+  }), {
+    submit: async command => {
+      log.push(command.kind);
+      expect(command.kind === "pin" || command.kind === "release-pin").toBe(true);
+      return { status: "ok", value: null };
+    },
+  });
+  const span = await display.readSpan(v2Request(v2Cursor("remote")), 4, "seg");
+  expect(log).toEqual(["pin", "read", "release-pin"]);
+  expect(span.status).toBe("ok");
+  if (span.status !== "ok") return;
+  expect(span.value.entries).toEqual([]);
+  expect(span.value.ended).toBe(false);
+  expect(span.value.blocked?.kind).toBe("remote-unavailable");
+});
+
+test("NEWARCH v2 D: a blocking state reported as the end is refused, and a candidate row is not history", async () => {
+  const falseEnd = v2Page({
+    entries: [],
+    states: [{ kind: "storage-unavailable", pendingIncidentId: "pending-1", retryAfterMs: 1000 }],
+    before: { kind: "end" }, after: { kind: "end" },
+  });
+  const display = new NewarchV2Display(v2Reader({
+    page: async () => ({ status: "ok", value: falseEnd }),
+  }));
+  const refused = await display.page(v2Request());
+  expect(refused.status).toBe("error");
+  if (refused.status === "error") expect(refused.message).toContain("end of history");
+  const candidate = v2Row(1);
+  const leaked = v2Page({
+    entries: [{ kind: "row", row: { ...candidate, finalized: false } }],
+    states: [{ kind: "exact", auditedRevision: 3 }],
+    before: { kind: "end" }, after: { kind: "end" },
+  });
+  const hidden = await new NewarchV2Display(v2Reader({
+    page: async () => ({ status: "ok", value: leaked }),
+  })).page(v2Request());
+  expect(hidden.status).toBe("error");
+  if (hidden.status === "error") expect(hidden.message).toContain("candidate");
+  const incident = v2Incident(false);
+  const kept = await new NewarchV2Display(v2Reader({
+    page: async () => ({ status: "ok", value: v2Page({
+      entries: [{ kind: "incident", incident }],
+      states: [{ kind: "incident", incident }],
+      before: { kind: "end" }, after: { kind: "end" },
+    }) }),
+  })).page(v2Request());
+  expect(kept.status).toBe("ok");
+  if (kept.status === "ok") {
+    expect(kept.value.entries[0]).toMatchObject({ kind: "incident", incident: { frontier: null, collecting: false } });
+  }
 });

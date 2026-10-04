@@ -13,12 +13,26 @@ import {
   historyIncidentStopLabel,
   historyStateLabel,
   historyStatusNotes,
+  answerNewarchV2Geometry,
+  hitNewarchV2Cell,
+  newarchV2IncidentLabel,
+  newarchV2RowCopy,
+  newarchV2StateLabel,
+  newarchV2StatusNotes,
+  presentNewarchV2,
+  selectNewarchV2Panes,
   parseNewarchHistoryExtension,
   type HistoryWindowAnchor,
   type HistoryWindowRejectReason,
   type HistoryWindowState,
 } from '../src/history-window';
-import type { NewarchHistoryExtension, NewarchHistoryState } from '@thumbmux/core';
+import type {
+  NewarchHistoryExtension,
+  NewarchHistoryState,
+  NewarchV2FixedGeometry,
+  NewarchV2Incident,
+  NewarchV2PaneDescriptor,
+} from '@thumbmux/core';
 
 function rows(startLine: number, count: number, payload = ''): string[] {
   return Array.from(
@@ -777,6 +791,137 @@ describe('NEWARCH D-fix R13 cursor across a local/remote seam', () => {
       expect(bad.reason).toBe('invalid-page');
       expect(bad.state.startLine).toBe(100);
       expect(bad.state.lines).toEqual(rows(100, 3));
+    }
+  });
+});
+
+const V2_GEOMETRY = {
+  policy: 'fixed-at-birth' as const,
+  columns: 100,
+  rows: 40,
+  configVersion: 'q22-default-1',
+  panesPerWindow: 1 as const,
+};
+const V2_CELL = { widthPx: 8, heightPx: 16 };
+
+function v2Incident(id: string, frontier: NewarchV2Incident['frontier'], collecting: boolean): NewarchV2Incident {
+  return {
+    schema: 'newarch-v2', incidentId: id,
+    pane: { serverIdentity: 'srv', paneId: 'pane-a', birthGeneration: 1 },
+    reason: 'pipe-eof', frontier,
+    affected: { after: frontier, through: frontier },
+    openedAtWallMs: Date.UTC(2026, 9, 4, 1, 2, 3), openedAtMonoMs: 10, clockEpoch: 'epoch-1',
+    collecting, missing: { countKind: 'unknown', missingCount: null },
+    ruleVersion: 'explicit-gap@1', configVersion: 'q22-default-1', geometry: V2_GEOMETRY,
+    revision: 1, sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+    action: collecting ? 'annotate' : 'gap-and-stop', evidence: null,
+  };
+}
+
+function v2Pane(paneId: string): NewarchV2PaneDescriptor {
+  return {
+    schema: 'newarch-v2',
+    session: { serverIdentity: 'srv', sessionId: 'sess-1' },
+    pane: { serverIdentity: 'srv', paneId, birthGeneration: 1 },
+    windowId: `win-${paneId}`, owner: 'capture-engine', birthOperationId: `birth-${paneId}`,
+    geometry: V2_GEOMETRY, state: 'active',
+  };
+}
+
+describe('NEWARCH v2 fixed picture, labels, and pane choice', () => {
+  test('320 and 390 px reach column 100 by scrolling, with no resize', () => {
+    for (const widthPx of [320, 390]) {
+      const picture = presentNewarchV2(
+        { columns: 100, rows: 40 },
+        { widthPx, heightPx: 700, cellWidthPx: 8, cellHeightPx: 16, keyboardInsetPx: 0, fitWidth: false, scrollXPx: 10_000 },
+      );
+      expect(picture.columns).toBe(100);
+      expect(picture.rows).toBe(40);
+      expect(picture.resize).toBeNull();
+      expect(picture.scale).toBe(1);
+      expect(picture.horizontalScroll).toBe(true);
+      const hit = hitNewarchV2Cell(picture, { clientX: widthPx - 1, clientY: 8, originX: 0, originY: 0 }, V2_CELL);
+      expect(hit).toEqual({ col: 99, row: 0 });
+    }
+  });
+
+  test('fit-width, a wide desktop, rotation, and a keyboard inset keep the 100x40 grid', () => {
+    const fit = presentNewarchV2(
+      { columns: 100, rows: 40 },
+      { widthPx: 320, heightPx: 700, cellWidthPx: 8, cellHeightPx: 16, keyboardInsetPx: 280, fitWidth: true, scrollXPx: 400 },
+    );
+    expect(fit.scale).toBeCloseTo(320 / 800);
+    expect(fit.scrollXPx).toBe(0);
+    expect(fit.horizontalScroll).toBe(false);
+    expect(fit.rows).toBe(40);
+    expect(fit.visibleHeightPx).toBe(420);
+    expect(fit.resize).toBeNull();
+    expect(hitNewarchV2Cell(fit, { clientX: 319, clientY: 0, originX: 0, originY: 0 }, V2_CELL)?.col).toBe(99);
+
+    const desktop = presentNewarchV2(
+      { columns: 100, rows: 40 },
+      { widthPx: 1280, heightPx: 800, cellWidthPx: 8, cellHeightPx: 16, keyboardInsetPx: 0, fitWidth: false, scrollXPx: 50 },
+    );
+    expect(desktop.horizontalScroll).toBe(false);
+    expect(desktop.scrollXPx).toBe(0);
+    expect(desktop.columns).toBe(100);
+
+    const portrait = presentNewarchV2(
+      { columns: 100, rows: 40 },
+      { widthPx: 390, heightPx: 844, cellWidthPx: 8, cellHeightPx: 16, keyboardInsetPx: 0, fitWidth: false, scrollXPx: 0 },
+    );
+    const landscape = presentNewarchV2(
+      { columns: 100, rows: 40 },
+      { widthPx: 844, heightPx: 390, cellWidthPx: 8, cellHeightPx: 16, keyboardInsetPx: 0, fitWidth: false, scrollXPx: 0 },
+    );
+    expect(portrait.columns).toBe(landscape.columns);
+    expect(portrait.rows).toBe(landscape.rows);
+    expect(portrait.resize).toBeNull();
+  });
+
+  test('a stopped incident before the first row is a sentence outside the copied rows', () => {
+    const incident = v2Incident('before-first', null, false);
+    const text = newarchV2IncidentLabel(incident);
+    expect(text).toContain('ก่อนแถวแรก');
+    expect(text).toContain('หยุดเก็บแล้ว');
+    expect(text).toContain('ท่อเก็บขาด');
+    const notes = newarchV2StatusNotes({
+      entries: [{ kind: 'incident', incident }],
+      states: [{ kind: 'incident', incident }],
+    });
+    expect(notes.some(note => note.text.includes('หยุดเก็บแล้ว'))).toBe(true);
+    const copy = newarchV2RowCopy(['hello']);
+    expect(copy).toBe('hello');
+    expect(copy.includes('หยุดเก็บแล้ว')).toBe(false);
+    expect(newarchV2StateLabel({
+      kind: 'remote-unavailable', bundleId: 'bundle-1', reason: 'corrupt', retryAfterMs: 1000,
+    })).toContain('ยังไม่ใช่จุดสิ้นสุด');
+  });
+
+  test('status notes stay inside a fixed cap', () => {
+    const notes = newarchV2StatusNotes({
+      entries: Array.from({ length: 80 }, (_, index) => ({
+        kind: 'incident' as const,
+        incident: v2Incident(`inc-${index}`, null, false),
+      })),
+      states: [],
+    });
+    expect(notes).toHaveLength(64);
+  });
+
+  test('two panes stay a list and every geometry intent writes nothing', () => {
+    const selection = selectNewarchV2Panes([v2Pane('a'), v2Pane('b')], null);
+    expect(selection.kind).toBe('ambiguous');
+    if (selection.kind === 'ambiguous') expect(selection.panes.map(pane => pane.pane.paneId)).toEqual(['a', 'b']);
+    const geometry: NewarchV2FixedGeometry = V2_GEOMETRY;
+    for (const intent of [
+      { source: 'viewport' as const, columns: 40, rows: 20 },
+      { source: 'apply-geometry' as const, columns: 120, rows: 50 },
+      { source: 'font' as const, columns: 90, rows: 30 },
+    ]) {
+      const answer = answerNewarchV2Geometry(geometry, intent);
+      expect(answer.resize).toBeNull();
+      expect(answer.geometry).toEqual(V2_GEOMETRY);
     }
   });
 });
