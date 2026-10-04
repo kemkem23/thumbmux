@@ -5,6 +5,8 @@
  * pixel anchoring, signposts, and alt-screen teardown to that model.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -16,6 +18,14 @@ import type {
   ClaudeBashSummaryRequest,
   MuxHistoryBoundary,
 } from "@thumbmux/core";
+
+const svelteClientInternals = join(
+  dirname(createRequire(import.meta.url).resolve("svelte/package.json")),
+  "src/internal/client/index.js",
+);
+const { proxy } = (await import(svelteClientInternals)) as {
+  proxy: <T extends object>(value: T) => T;
+};
 
 type ScreenMode = { alt: boolean; mouseSgr: boolean; mouseAny: boolean };
 type MuxCallback = (
@@ -45,6 +55,7 @@ type HistoryPrependDetail = {
 };
 type Mounted = {
   app: Record<string, unknown>;
+  props: Record<string, unknown>;
   target: HTMLElement;
   viewport: HTMLElement;
 };
@@ -159,6 +170,10 @@ function mountTermView(options: {
   v2StatusText?: string | null;
   onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
   viewportWidth?: number;
+  fontPx?: number;
+  fontFit?: "auto" | "manual";
+  tailClearancePx?: number;
+  onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
 } = {}): Mounted {
   const width = options.viewportWidth ?? 320;
   const target = document.createElement("div");
@@ -166,29 +181,31 @@ function mountTermView(options: {
   document.body.appendChild(target);
 
   let app!: Record<string, unknown>;
+  // A proxy, like the compiler's $state, so a case can change a prop live.
+  const props = proxy<Record<string, unknown>>({
+    session: SESSION,
+    palette,
+    claimGeometry: options.claimGeometry ?? false,
+    ...(options.fixedGeometry ? { fixedGeometry: options.fixedGeometry } : {}),
+    ...(options.fitWidth ? { fitWidth: true } : {}),
+    ...(options.v2StatusText ? { v2StatusText: options.v2StatusText } : {}),
+    ...(options.onGeometryChange ? { onGeometryChange: options.onGeometryChange } : {}),
+    fontPx: options.fontPx ?? 13,
+    ...(options.fontFit ? { fontFit: options.fontFit } : {}),
+    ...(options.tailClearancePx !== undefined ? { tailClearancePx: options.tailClearancePx } : {}),
+    ...(options.onFontFit ? { onFontFit: options.onFontFit } : {}),
+    ...(options.mode && options.mode !== "off"
+      ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
+      : {}),
+    claudeBashMode: options.mode ?? "off",
+    onClaudeBashSummaryRequest: options.onSummary,
+    // Omit unless a test explicitly exercises the legacy ceiling mode;
+    // the rest of this file therefore continues to verify the default.
+    ...(options.historyPaging ? { historyPaging: options.historyPaging } : {}),
+    onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
+  });
   flushSync(() => {
-    app = mount(TermView, {
-      target,
-      props: {
-        session: SESSION,
-        palette,
-        claimGeometry: options.claimGeometry ?? false,
-        ...(options.fixedGeometry ? { fixedGeometry: options.fixedGeometry } : {}),
-        ...(options.fitWidth ? { fitWidth: true } : {}),
-        ...(options.v2StatusText ? { v2StatusText: options.v2StatusText } : {}),
-        ...(options.onGeometryChange ? { onGeometryChange: options.onGeometryChange } : {}),
-        fontPx: 13,
-        ...(options.mode && options.mode !== "off"
-          ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
-          : {}),
-        claudeBashMode: options.mode ?? "off",
-        onClaudeBashSummaryRequest: options.onSummary,
-        // Omit unless a test explicitly exercises the legacy ceiling mode;
-        // the rest of this file therefore continues to verify the default.
-        ...(options.historyPaging ? { historyPaging: options.historyPaging } : {}),
-        onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
-      },
-    }) as Record<string, unknown>;
+    app = mount(TermView, { target, props }) as Record<string, unknown>;
   });
 
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
@@ -214,7 +231,7 @@ function mountTermView(options: {
   flushSync();
   drainScheduledWork();
 
-  const entry = { app, target, viewport };
+  const entry = { app, props, target, viewport };
   mounted.push(entry);
   return entry;
 }
@@ -2698,6 +2715,7 @@ describe("NEWARCH v2 fixed geometry on the screen", () => {
   async function mountFixed(options: {
     viewportWidth: number;
     fitWidth?: boolean;
+    fontFit?: "auto" | "manual";
   }) {
     const calls: Array<{ cols: number; rows: number }> = [];
     const geometryCalls: Array<{ cols: number; rows: number }> = [];
@@ -2711,6 +2729,7 @@ describe("NEWARCH v2 fixed geometry on the screen", () => {
         claimGeometry: true,
         fixedGeometry: { columns: 100, rows: 40 },
         fitWidth: options.fitWidth ?? false,
+        ...(options.fontFit ? { fontFit: options.fontFit } : {}),
         v2StatusText: status,
         onGeometryChange: geometry => geometryCalls.push(geometry),
         viewportWidth: options.viewportWidth,
@@ -2723,8 +2742,9 @@ describe("NEWARCH v2 fixed geometry on the screen", () => {
   }
 
   test("a phone shows the stopped incident with no live pane and does not resize", async () => {
+    // manual: the user's size as-is, so 100 columns scroll sideways.
     for (const viewportWidth of [320, 390]) {
-      const view = await mountFixed({ viewportWidth });
+      const view = await mountFixed({ viewportWidth, fontFit: "manual" });
       expect(view.calls).toEqual([]);
       expect(view.geometryCalls).toEqual([]);
       expect(view.viewport.getAttribute("data-last-cols")).toBe("100");
@@ -2741,7 +2761,8 @@ describe("NEWARCH v2 fixed geometry on the screen", () => {
   });
 
   test("fit-width and a wide desktop keep 100 columns and write no resize", async () => {
-    const fit = await mountFixed({ viewportWidth: 320, fitWidth: true });
+    // fitWidth scales the picture only in manual; auto shrinks the font instead.
+    const fit = await mountFixed({ viewportWidth: 320, fitWidth: true, fontFit: "manual" });
     expect(fit.calls).toEqual([]);
     expect(fit.viewport.getAttribute("data-last-cols")).toBe("100");
     expect(fit.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
@@ -2755,5 +2776,179 @@ describe("NEWARCH v2 fixed geometry on the screen", () => {
     expect(desktop.geometryCalls).toEqual([]);
     expect(desktop.viewport.getAttribute("data-last-cols")).toBe("100");
     expect(desktop.viewport.getAttribute("data-last-rows")).toBe("40");
+  });
+});
+
+describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
+  const BIRTH = { columns: 78, rows: 120 };
+
+  function captureResizes() {
+    const calls: Array<{ cols: number; rows: number }> = [];
+    const original = tmuxMux.sendResize.bind(tmuxMux);
+    tmuxMux.sendResize = (session, cols, rows) => {
+      void session;
+      calls.push({ cols, rows });
+    };
+    return { calls, restore: () => { tmuxMux.sendResize = original; } };
+  }
+
+  function shownFontPx(viewport: HTMLElement): number {
+    return parseFloat(viewport.style.fontSize);
+  }
+
+  function setWidth(viewport: HTMLElement, width: number): void {
+    Object.defineProperty(viewport, "clientWidth", { configurable: true, get: () => width });
+    ControlledResizeObserver.latest?.fire();
+    flushSync();
+    drainScheduledWork();
+  }
+
+  /** A pane born 120 rows tall with the agent's prompt on row `cursorRow`;
+   * every row below it is blank, as tmux sends a tall, mostly empty pane. */
+  function tallPane(cursorRow: number): { lines: string[]; cursor: { row: number; col: number } } {
+    const lines = Array.from({ length: BIRTH.rows }, (_, index) => index <= cursorRow ? `row-${index}` : "");
+    // Protocol: row counts up from the last content line.
+    return { lines, cursor: { row: 0, col: 3 } };
+  }
+
+  test("78 columns on a 390px phone: fractional font, every column drawn, no resize ever", async () => {
+    const resizes = captureResizes();
+    const fits: Array<{ fontPx: number; fits: boolean }> = [];
+    try {
+      const view = mountTermView({
+        claimGeometry: true,
+        fixedGeometry: BIRTH,
+        viewportWidth: 390,
+        fontPx: 13,
+        onFontFit: fit => fits.push(fit),
+      });
+      await settleUi();
+      const font = shownFontPx(view.viewport);
+      expect(font).toBeGreaterThanOrEqual(8);
+      expect(font).toBeLessThan(8.1);
+      expect(Number.isInteger(font)).toBe(false);
+      expect(78 * font * 0.6).toBeLessThanOrEqual(378 + 1e-6);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("120");
+      expect(view.viewport.getAttribute("data-font-fit")).toBe("auto");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeLessThanOrEqual(390);
+      expect(layer?.style.transform ?? "").not.toContain("scale(");
+      expect(fits.at(-1)?.fits).toBe(true);
+      expect(fits.at(-1)?.fontPx).toBe(font);
+
+      // Rotate to landscape: wide enough, so the user's size comes back.
+      setWidth(view.viewport, 844);
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+
+      // And back to portrait.
+      setWidth(view.viewport, 390);
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(font);
+
+      // A+ raises the ceiling; the phone still cannot show more than the fit.
+      view.props.fontPx = 14;
+      flushSync();
+      await settleUi();
+      await new Promise(resolve => setTimeout(resolve, 260));
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(font);
+
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("fitWidth together with auto never scales the picture — one shrink only", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, fixedGeometry: BIRTH, fitWidth: true, viewportWidth: 390 });
+      await settleUi();
+      expect(view.viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform ?? "").not.toContain("scale(");
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("manual keeps the user's size on a phone and scrolls sideways — still no resize", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-font-fit")).toBe("manual");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")?.textContent).toBe("เลื่อนข้างได้");
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeGreaterThan(390);
+
+      // Switch back to auto live.
+      view.props.fontFit = "auto";
+      flushSync();
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("a legacy pane (no birth geometry) is untouched: user size, and it still claims", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, viewportWidth: 390 });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-font-fit")).toBeNull();
+      expect(resizes.calls.length).toBeGreaterThan(0);
+      expect(resizes.calls.at(-1)?.cols).toBe(Math.floor((390 - 12) / (13 * 0.6)));
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("the live tail ends at the prompt row, not at the blank bottom of a 120-row pane", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390 });
+    await settleUi();
+    const pane = tallPane(39);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    const lineH = Math.round(shownFontPx(view.viewport) * 1.6);
+    const caret = view.viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(caret).not.toBeNull();
+    const caretBottom = layerTranslateY(view.viewport) + parseFloat(caret?.style.top ?? "NaN") + lineH;
+    expect(caretBottom).toBeLessThanOrEqual(VIEW_HEIGHT + 0.5);
+    expect(caretBottom).toBeGreaterThan(VIEW_HEIGHT - lineH);
+    // The rows above the prompt are on screen, the blank rows 41-119 are not.
+    const shown = [...view.viewport.querySelectorAll(".mtv-line")].map(node => node.textContent ?? "");
+    expect(shown).toContain("row-39");
+  });
+
+  test("the tail clears the ❯ button: tailClearancePx lifts the prompt row above it", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, tailClearancePx: 72 });
+    await settleUi();
+    const pane = tallPane(39);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    const lineH = Math.round(shownFontPx(view.viewport) * 1.6);
+    const caret = view.viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    const caretBottom = layerTranslateY(view.viewport) + parseFloat(caret?.style.top ?? "NaN") + lineH;
+    expect(caretBottom).toBeLessThanOrEqual(VIEW_HEIGHT - 72 + 0.5);
+    expect(caretBottom).toBeGreaterThan(VIEW_HEIGHT - 72 - lineH);
+  });
+
+  test("a short screen stays top-aligned: no blank gap is invented above the content", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, tailClearancePx: 72 });
+    await settleUi();
+    const pane = tallPane(4);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    expect(layerTranslateY(view.viewport)).toBe(0);
   });
 });
