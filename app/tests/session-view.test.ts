@@ -2389,8 +2389,12 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
     // Keyboard / composer inset: opening the composer docks a sheet below.
     const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
     if (!terminal) throw new Error('SessionView did not render TermView');
-    flushSync(() => terminal.click());
-    await tick();
+    // The stock FAB stays open after A+/A−, and the first terminal tap only
+    // dismisses it; the next tap opens the composer.
+    for (let tap = 0; tap < 2 && !target.querySelector('[data-testid="input-sheet"].open'); tap += 1) {
+      flushSync(() => terminal.click());
+      await tick();
+    }
     if (!target.querySelector('[data-testid="input-sheet"].open')) throw new Error('composer did not open');
     await resizeViewport(target, 390, 420);
   }
