@@ -948,9 +948,6 @@ export class NewarchV2Display {
       }
       if (continuation.kind === "blocked" && !v2Blocking(continuation.state)) return v2Integrity("v2 blocked state");
     }
-    const blocking = page.states.some(v2Blocking);
-    const blockedContinuation = page.before.kind === "blocked" || page.after.kind === "blocked";
-    if (blocking && !blockedContinuation) return v2Integrity("v2 blocking state was reported as the end of history");
     return null;
   }
 }
