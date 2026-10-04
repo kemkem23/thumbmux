@@ -30,6 +30,8 @@ import {
   type MuxPaneScreen,
   type MuxServerMessage,
   type NewarchFrameMeta,
+  type NewarchV2GeometryReply,
+  type NewarchV2PaneSelection,
   type SessionListItem,
   type SessionListRow,
 } from "@thumbmux/core";
@@ -387,6 +389,11 @@ export type TmuxWsMuxOptions<
   archive?: HistoryArchiveLike | null;
   /** NEWARCH projection for routed sessions (default none: every session polls). */
   projection?: MuxProjectionSource | null;
+  /** NEWARCH v2 owner account (PLAN-v2 §3/§6). `null` = a legacy session.
+   * Any selection (selected / ambiguous / owner-unavailable / missing) is
+   * published on the session row as `newarchV2`; every kind except `missing`
+   * makes the window fixed: no resize reaches the driver, whoever asks. */
+  newarchV2?: ((session: string) => NewarchV2PaneSelection | null) | null;
   hooks?: MuxHooks<WS, SessionRow>;
   profile?: (session: string) => SessionProfile;
   /** live scrollback window (lines) kept in the fast path */
@@ -515,6 +522,7 @@ export class TmuxWsMux<
   private lastReconcileCapture = new Map<string, number>();
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
   private sessionListProvider: () => readonly SessionRow[];
+  private readonly newarchV2: ((session: string) => NewarchV2PaneSelection | null) | null;
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
   /** Per-session viewers whose latest subscription opted into delta output frames. */
@@ -562,6 +570,7 @@ export class TmuxWsMux<
     this.pipes = opts.pipes ?? null;
     this.archive = opts.archive ?? null;
     this.projection = opts.projection ?? null;
+    this.newarchV2 = opts.newarchV2 ?? null;
     this.projectionRouteOff = this.projection?.onRouteChange((session) => this.handleProjectionRouteChange(session)) ?? null;
     this.projectionDirtyOff = this.projection?.onLegacyDirty?.((session) => {
       if (this.projection?.owns(session)) return;
@@ -582,7 +591,7 @@ export class TmuxWsMux<
     this.currentRate = this.POLL_NORMAL;
     this.log = opts.log ?? (() => {});
     this.logError = opts.logError ?? console.error;
-    this.sessionListProvider = () => this.driver.listSessions();
+    this.sessionListProvider = this.withNewarchV2(() => this.driver.listSessions());
     const bp = opts.backpressure ?? {};
     this.bpEnabled = bp.enabled !== false;
     this.bpMaxBufferedBytes = bp.maxBufferedBytes ?? 8 * 1024 * 1024;
@@ -592,8 +601,37 @@ export class TmuxWsMux<
   }
 
   setSessionListProvider(provider?: () => readonly SessionRow[]) {
-    this.sessionListProvider = provider ?? (() => this.driver.listSessions());
+    this.sessionListProvider = this.withNewarchV2(provider ?? (() => this.driver.listSessions()));
     this.lastSessionsJson = "";
+  }
+
+  /** A row without `newarchV2` reads as legacy on the client (U), so an owned
+   * or unreadable session must always carry the field. */
+  private withNewarchV2(provider: () => readonly SessionRow[]): () => readonly SessionRow[] {
+    const lookup = this.newarchV2;
+    if (!lookup) return provider;
+    return () => provider().map((row) => {
+      let selection: NewarchV2PaneSelection | null;
+      try { selection = lookup(row.name); }
+      catch { selection = { kind: "owner-unavailable", retryAfterMs: 1000 }; }
+      return selection ? { ...row, newarchV2: selection } : row;
+    });
+  }
+
+  /** PLAN-v2 §3: the fixed geometry an owned window keeps, or null for a
+   * legacy session. An unreadable owner account is fixed too (no geometry to
+   * report, but no resize either). */
+  private newarchV2Fixed(session: string): { reply: NewarchV2GeometryReply | null } | null {
+    if (!this.newarchV2) return null;
+    let selection: NewarchV2PaneSelection | null;
+    try { selection = this.newarchV2(session); }
+    catch { return { reply: null }; }
+    if (!selection || selection.kind === "missing") return null;
+    if (selection.kind === "selected") {
+      const pane = selection.pane;
+      return { reply: { schema: pane.schema, pane: pane.pane, status: "fixed", geometry: pane.geometry } };
+    }
+    return { reply: null };
   }
 
   subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number; delta?: boolean } = {}) {
@@ -1704,22 +1742,28 @@ export class TmuxWsMux<
   /** Handle resize. Browser-authoritative geometry for resizable profiles;
    * the host's onResizeRequest hook may suppress the request (e.g. a
    * mobile-first size arbiter). */
-  handleResize(session: string, cols: number, rows: number, ws?: WS, client?: unknown) {
+  handleResize(session: string, cols: number, rows: number, ws?: WS, client?: unknown): NewarchV2GeometryReply | null {
     this.hooks.onResizeTelemetry?.(session, ws ?? null, { cols, rows }, client);
-    if (!this.profileOf(session).resize) return;
+    const fixed = this.newarchV2Fixed(session);
+    if (fixed) return fixed.reply;
+    if (!this.profileOf(session).resize) return null;
 
     const verdict = this.hooks.onResizeRequest?.(session, ws ?? null, { cols, rows }, client) ?? { apply: true };
-    if (!verdict.apply) return;
+    if (!verdict.apply) return null;
 
-    this.applyGeometry(session, cols, rows, ws);
+    return this.applyGeometry(session, cols, rows, ws);
   }
 
   /** Actually resize tmux + refresh captures. Also used by host policy (size
    * arbiter) to re-apply a surviving viewer's geometry after a hold releases. */
-  applyGeometry(session: string, cols: number, rows: number, ws?: WS) {
+  applyGeometry(session: string, cols: number, rows: number, ws?: WS): NewarchV2GeometryReply | null {
+    // Host policy (size arbiter) calls this directly: the NEWARCH gate has to
+    // sit here too, not only in handleResize. Returns the fixed geometry.
+    const fixed = this.newarchV2Fixed(session);
+    if (fixed) return fixed.reply;
     try {
       const last = this.lastAppliedGeometry.get(session);
-      if (last?.cols === cols && last.rows === rows) return;
+      if (last?.cols === cols && last.rows === rows) return null;
       this.driver.resizeWindow(session, cols, rows);
       this.lastAppliedGeometry.set(session, { cols, rows });
       try { this.projection?.noteResize?.(session); } catch {}
@@ -1750,6 +1794,7 @@ export class TmuxWsMux<
         } satisfies MuxServerMessage));
       } catch {}
     }
+    return null;
   }
 
   handleKeys(session: string, data: string, ws?: WS, client?: unknown) {
