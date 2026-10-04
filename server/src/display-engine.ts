@@ -1,6 +1,7 @@
 import {
   NEWARCH_FLAGON_CAPABILITIES,
   NEWARCH_REPAIR_CAPABILITIES,
+  NEWARCH_V2_SCHEMA,
   type NewarchCapabilities,
   type NewarchFlagOnCapability,
   type NewarchGap,
@@ -8,12 +9,23 @@ import {
   type NewarchHistoryExtension,
   type NewarchHistoryState,
   type NewarchPaneKey,
+  type NewarchV2FixedGeometry,
+  type NewarchV2GeometryReply,
+  type NewarchV2HistoryRequest,
+  type NewarchV2PaneDescriptor,
+  type NewarchV2PaneSelection,
+  type NewarchV2ReadState,
+  type NewarchV2SessionKey,
 } from "@thumbmux/core";
 import {
+  NEWARCH_V2_VERSION,
   STREAM_BUDGET,
   validReadOpen,
+  validateV2Incident,
+  validateV2ReadRequest,
   type CancelToken,
   type CaptureEngine,
+  type CommittedStreamRow,
   type DisplayEngine,
   type HistoryEngine,
   type HistoryPage,
@@ -26,6 +38,9 @@ import {
   type StreamFailure,
   type StreamIdentity,
   type StreamObserver,
+  type V2HistoryPage,
+  type V2HistoryReader,
+  type V2WriteCommand,
   type ViewerRoute,
 } from "./stream-contract";
 
@@ -736,5 +751,206 @@ export class StreamDisplayEngine implements DisplayEngine {
   private failureReason(failure: StreamFailure): string {
     if (failure.status === "error" && failure.code === "deadline") return "deadline";
     return failure.status;
+  }
+}
+
+/** Queued pin/release only. This is not a writer and cannot commit rows. */
+export type NewarchV2DisplayPin = Extract<V2WriteCommand, { readonly kind: "pin" | "release-pin" }>;
+
+export interface NewarchV2DisplayPinSink {
+  submit(command: NewarchV2DisplayPin): Promise<Result<unknown>>;
+}
+
+export interface NewarchV2GeometryIntent {
+  readonly source: "viewport" | "font" | "fit-width" | "rotation" | "keyboard-inset" | "apply-geometry";
+  readonly columns: number;
+  readonly rows: number;
+}
+
+export interface NewarchV2Span {
+  readonly entries: V2HistoryPage["entries"];
+  readonly blocked: NewarchV2ReadState | null;
+  readonly ended: boolean;
+}
+
+const V2_OWNER_RETRY_MS = 1000;
+const V2_SPAN_PAGE_CAP = 64;
+
+function v2PaneEqual(a: NewarchPaneKey, b: NewarchPaneKey): boolean {
+  return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
+}
+
+function v2Integrity(message: string): StreamFailure {
+  return { status: "error", code: "integrity", message };
+}
+
+/** One pane is a selection. Any longer list stays a list. The last pane is not a tie-break. */
+export function selectNewarchV2Panes(
+  panes: readonly NewarchV2PaneDescriptor[],
+  next: string | null,
+): NewarchV2PaneSelection {
+  if (panes.length === 0 && next === null) return { kind: "missing" };
+  if (panes.length === 1 && next === null) return { kind: "selected", pane: panes[0]! };
+  return { kind: "ambiguous", panes: [...panes], next };
+}
+
+function v2EntryOrder(entry: V2HistoryPage["entries"][number]): readonly [string, number, number] {
+  if (entry.kind === "row") return [entry.row.id.segmentId, entry.row.id.rowOrdinal, 1];
+  if (!entry.incident.frontier) return ["", -1, 0];
+  return [entry.incident.frontier.segmentId, entry.incident.frontier.rowOrdinal, 0];
+}
+
+function v2OrderBefore(left: readonly [string, number, number], right: readonly [string, number, number]): boolean {
+  if (left[0] !== right[0]) return left[0] < right[0];
+  if (left[1] !== right[1]) return left[1] < right[1];
+  return left[2] < right[2];
+}
+
+function v2Blocking(state: NewarchV2ReadState): boolean {
+  return state.kind === "storage-unavailable" || state.kind === "remote-unavailable";
+}
+
+function v2RowKey(row: CommittedStreamRow): string {
+  return `${row.id.pane.serverIdentity}\0${row.id.pane.paneId}\0${row.id.pane.birthGeneration}\0${row.id.segmentId}\0${row.id.rowOrdinal}`;
+}
+
+/**
+ * Read-only NEWARCH display. It never holds a writer capability, never
+ * returns a legacy writer, and never turns a blocked remote into end-of-history.
+ */
+export class NewarchV2Display {
+  private pinSerial = 0;
+
+  constructor(
+    private readonly reader: V2HistoryReader,
+    private readonly pins: NewarchV2DisplayPinSink | null = null,
+  ) {}
+
+  select(session: NewarchV2SessionKey): Result<NewarchV2PaneSelection> {
+    const owner = this.reader.sessionOwner(session);
+    if (owner.status !== "ok") return ok({ kind: "owner-unavailable", retryAfterMs: V2_OWNER_RETRY_MS });
+    if (owner.value === null) return ok({ kind: "missing" });
+    const listed = this.reader.panes(session, null);
+    if (listed.status !== "ok") return ok({ kind: "owner-unavailable", retryAfterMs: V2_OWNER_RETRY_MS });
+    return ok(selectNewarchV2Panes(listed.value.panes, listed.value.next));
+  }
+
+  /** Viewer size, font, rotation, and applyGeometry never change the birth geometry. */
+  geometry(
+    pane: NewarchV2PaneDescriptor,
+    _intent: NewarchV2GeometryIntent,
+  ): { readonly reply: NewarchV2GeometryReply; readonly resize: null } {
+    const geometry: NewarchV2FixedGeometry = pane.geometry;
+    return {
+      reply: { schema: NEWARCH_V2_SCHEMA, pane: pane.pane, status: "fixed", geometry },
+      resize: null,
+    };
+  }
+
+  async page(request: NewarchV2HistoryRequest, pinSegmentId: string | null = null): Promise<Result<V2HistoryPage>> {
+    try {
+      validateV2ReadRequest(request);
+    } catch (error) {
+      return v2Integrity(error instanceof Error ? error.message : "invalid v2 read");
+    }
+    const pinId = pinSegmentId && this.pins ? `display-pin-${++this.pinSerial}` : null;
+    if (pinId && pinSegmentId && this.pins) {
+      const pinned = await this.pins.submit({ kind: "pin", pinId, segmentId: pinSegmentId });
+      if (pinned.status !== "ok") return pinned;
+    }
+    try {
+      const read = await this.reader.page(request);
+      if (read.status !== "ok") return read;
+      const failure = this.pageFailure(request, read.value);
+      if (failure) return failure;
+      return ok(deepFreeze(structuredClone(read.value)));
+    } catch {
+      return { status: "error", code: "io", message: "v2 display read failed" };
+    } finally {
+      if (pinId && this.pins) await this.pins.submit({ kind: "release-pin", pinId });
+    }
+  }
+
+  /**
+   * Follow one cursor across local and remote stores. The same row id is kept
+   * once. A blocked continuation stops the walk; it is not an empty end.
+   */
+  async readSpan(request: NewarchV2HistoryRequest, maxPages: number, pinSegmentId: string | null = null): Promise<Result<NewarchV2Span>> {
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1) return v2Integrity("v2 span page cap");
+    const cap = Math.min(maxPages, V2_SPAN_PAGE_CAP);
+    const seen = new Set<string>();
+    const entries: V2HistoryPage["entries"][number][] = [];
+    let cursor = request.cursor;
+    let blocked: NewarchV2ReadState | null = null;
+    let ended = false;
+    for (let index = 0; index < cap; index++) {
+      const read = await this.page({ ...request, cursor }, pinSegmentId);
+      if (read.status !== "ok") return read;
+      const page = read.value;
+      for (const entry of page.entries) {
+        if (entry.kind !== "row") {
+          entries.push(entry);
+          continue;
+        }
+        const key = v2RowKey(entry.row);
+        if (seen.has(key)) return v2Integrity("duplicate v2 row in span");
+        seen.add(key);
+        entries.push(entry);
+      }
+      const continuation = request.direction === "before" ? page.before : page.after;
+      if (continuation.kind === "blocked") {
+        blocked = continuation.state;
+        ended = false;
+        break;
+      }
+      if (continuation.kind === "end") {
+        ended = blocked === null;
+        break;
+      }
+      cursor = continuation.cursor;
+    }
+    return ok(deepFreeze({ entries, blocked, ended }));
+  }
+
+  private pageFailure(request: NewarchV2HistoryRequest, page: V2HistoryPage): StreamFailure | null {
+    if (page.schema !== NEWARCH_V2_VERSION || !v2PaneEqual(page.pane, request.pane)) {
+      return v2Integrity("v2 page pane");
+    }
+    if (!validCounter(page.revision) || !validCounter(page.payloadBytes)
+      || page.payloadBytes > request.maxBytes || page.entries.length > request.maxEntries) {
+      return v2Integrity("v2 page bound");
+    }
+    let previous: readonly [string, number, number] | null = null;
+    const seen = new Set<string>();
+    for (const entry of page.entries) {
+      if (entry.kind === "row") {
+        if (!entry.row.finalized) return v2Integrity("v2 candidate row is not durable history");
+        if (!v2PaneEqual(entry.row.id.pane, request.pane)) return v2Integrity("v2 row pane");
+        const key = v2RowKey(entry.row);
+        if (seen.has(key)) return v2Integrity("duplicate v2 row");
+        seen.add(key);
+      } else {
+        try {
+          validateV2Incident(entry.incident);
+        } catch (error) {
+          return v2Integrity(error instanceof Error ? error.message : "invalid v2 incident");
+        }
+        if (!v2PaneEqual(entry.incident.pane, request.pane)) return v2Integrity("v2 incident pane");
+      }
+      const order = v2EntryOrder(entry);
+      if (previous && !v2OrderBefore(previous, order)) return v2Integrity("v2 page order");
+      previous = order;
+    }
+    for (const continuation of [page.before, page.after]) {
+      if (continuation.kind === "end") continue;
+      if (!v2PaneEqual(continuation.cursor.pane, request.pane) || continuation.cursor.schema !== NEWARCH_V2_SCHEMA) {
+        return v2Integrity("v2 continuation cursor");
+      }
+      if (continuation.kind === "blocked" && !v2Blocking(continuation.state)) return v2Integrity("v2 blocked state");
+    }
+    const blocking = page.states.some(v2Blocking);
+    const blockedContinuation = page.before.kind === "blocked" || page.after.kind === "blocked";
+    if (blocking && !blockedContinuation) return v2Integrity("v2 blocking state was reported as the end of history");
+    return null;
   }
 }
