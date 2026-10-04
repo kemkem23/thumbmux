@@ -936,7 +936,6 @@ export class NewarchV2Display {
           return v2Integrity(error instanceof Error ? error.message : "invalid v2 incident");
         }
         if (!v2PaneEqual(entry.incident.pane, request.pane)) return v2Integrity("v2 incident pane");
-        if (!entry.incident.frontier) return v2Integrity("v2 incident before the first row is hidden");
       }
       const order = v2EntryOrder(entry);
       if (previous && !v2OrderBefore(previous, order)) return v2Integrity("v2 page order");
