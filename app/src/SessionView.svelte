@@ -239,7 +239,7 @@
   let resolvedTermProps = $derived({
     ...configuredTermProps,
     // Not overridable by the host: a fixed or unresolved pane never claims.
-    claimGeometry: true
+    claimGeometry: geometryPolicy.kind === 'viewer'
       ? configuredTermProps.claimGeometry ?? true
       : false,
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
