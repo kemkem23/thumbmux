@@ -2411,9 +2411,9 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
 
     expect(frames.filter((frame) => frame.session === session)).toEqual([]);
     const host = target.querySelector<HTMLElement>('.mtv-host');
-    expect(host?.dataset.geometryPolicy).toBe('fixed');
-    expect(host?.dataset.fixedCols).toBe('100');
-    expect(host?.dataset.fixedRows).toBe('40');
+    expect(host?.dataset.mtvGeometryPolicy).toBe('fixed');
+    expect(host?.dataset.mtvFixedCols).toBe('100');
+    expect(host?.dataset.mtvFixedRows).toBe('40');
   });
 
   test('an ambiguous v2 session (two windows) keeps both panes fixed and claims nothing', async () => {
@@ -2435,9 +2435,9 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
 
     expect(frames.filter((frame) => frame.session === session)).toEqual([]);
     const host = target.querySelector<HTMLElement>('.mtv-host');
-    expect(host?.dataset.geometryPolicy).toBe('fixed');
-    expect(host?.dataset.fixedCols).toBe('100');
-    expect(host?.dataset.fixedRows).toBe('40');
+    expect(host?.dataset.mtvGeometryPolicy).toBe('fixed');
+    expect(host?.dataset.mtvFixedCols).toBe('100');
+    expect(host?.dataset.mtvFixedRows).toBe('40');
   });
 
   test.each([
@@ -2461,7 +2461,7 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
     for (const [width, height] of VIEWPORTS) await resizeViewport(target, width, height);
 
     expect(frames.filter((frame) => frame.session === session)).toEqual([]);
-    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('unknown-owner');
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.mtvGeometryPolicy).toBe('unknown-owner');
   });
 
   test('no resize leaves before the inventory is known; a legacy row then claims as before', async () => {
@@ -2476,7 +2476,7 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
     await flushPromises();
     await resizeViewport(target, 390, 700);
     expect(frames.filter((frame) => frame.session === session)).toEqual([]);
-    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('pending');
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.mtvGeometryPolicy).toBe('pending');
 
     // Legacy rows: no newarchV2, or a v2 lookup that says the session is not NEWARCH.
     flushSync(() => feed.push([{ name: session }, { name: 'other', newarchV2: { kind: 'selected', pane: v2Pane('%9') } }]));
@@ -2485,7 +2485,7 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
     const owned = frames.filter((frame) => frame.session === session);
     expect(owned.length).toBeGreaterThan(0);
     expect(owned.every((frame) => frame.cols > 0 && frame.rows > 0)).toBe(true);
-    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.geometryPolicy).toBe('viewer');
+    expect(target.querySelector<HTMLElement>('.mtv-host')?.dataset.mtvGeometryPolicy).toBe('viewer');
   });
 
   test('a v2 "missing" lookup is a legacy session and still follows the host claim', async () => {
