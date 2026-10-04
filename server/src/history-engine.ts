@@ -34,9 +34,12 @@ function digest(kind: string, r: { digest: string }): void {
   const { digest: d, ...payload } = r;
   if (!/^[a-f0-9]{64}$/.test(d) || streamDigest(kind, payload) !== d) throw Error('digest mismatch');
 }
+// H stores rows of both stream-first v1 panes and NEWARCH v2 panes, so its
+// envelope admits the larger of the two contracts' bounds.
 function geometry(g: { columns: number; rows: number }): void {
   safe(g.columns); safe(g.rows);
-  if (!g.columns || !g.rows || g.columns > B.maxColumns || g.rows > B.maxRows) throw Error('geometry outside admitted envelope');
+  if (!g.columns || !g.rows || g.columns > Math.max(B.maxColumns, V2L.maxColumns)
+    || g.rows > Math.max(B.maxRows, V2L.maxRows)) throw Error('geometry outside admitted envelope');
 }
 function content(row: RowContent): void {
   if (!Array.isArray(row.cells) || typeof row.softWrap !== 'boolean') throw Error('invalid row');

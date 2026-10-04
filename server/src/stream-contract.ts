@@ -1158,7 +1158,7 @@ export type {
 } from '@thumbmux/core';
 export const NEWARCH_V2_VERSION = 'newarch-v2' as const;
 export const NEWARCH_V2_LIMITS = Object.freeze({
-  maxColumns: 240, maxRows: 80, maxActivePanes: 21, maxIdentityBytes: 256,
+  maxColumns: 240, maxRows: 120, maxActivePanes: 21, maxIdentityBytes: 256,
   pendingRowsPerPane: 256, pendingBytesPerPane: MiB, pendingDeadlineMs: 1000,
   vtBytesPerPane: 2 * MiB, checkpointBytesPerPane: 4 * MiB,
   auditQueueEntries: 21, diagnosticEventBytes: 64 * 1024, diagnosticTotalBytes: 64 * MiB,
@@ -1198,8 +1198,10 @@ export interface V2Config {
   readonly audit: V2AuditConfig; readonly storage: V2StorageBudget;
 }
 export const NEWARCH_V2_DEFAULT_CONFIG: V2Config = Object.freeze({
-  schema: NEWARCH_V2_VERSION, configVersion: 'q22-default-1',
-  geometry: Object.freeze({ columns: 100, rows: 40 }), maxActivePanes: 21,
+  // kem 2026-10-04: 78 columns (widest that fits an iPhone at 8px) x 120 rows
+  // (tall for capture/debug). New sessions only; a born pane keeps its geometry.
+  schema: NEWARCH_V2_VERSION, configVersion: 'q22-default-2',
+  geometry: Object.freeze({ columns: 78, rows: 120 }), maxActivePanes: 21,
   rules: Object.freeze([Object.freeze({ ruleId: 'ordered-scroll', version: '1' }),
     Object.freeze({ ruleId: 'bounded-tail', version: '1' }), Object.freeze({ ruleId: 'explicit-gap', version: '1' })]),
   audit: Object.freeze({ enabled: true, intervalMs: 300_000, jitterFraction: 0.2,
@@ -1228,7 +1230,7 @@ export function v2Digest(kind: string, payload: unknown): Digest {
 }
 export function validateV2Config(c: V2Config): void {
   if (c.schema !== NEWARCH_V2_VERSION) throw Error('v2 schema');
-  v2Text(c.configVersion); v2Int(c.geometry.columns, 1, 240); v2Int(c.geometry.rows, 1, 80);
+  v2Text(c.configVersion); v2Int(c.geometry.columns, 1, NEWARCH_V2_LIMITS.maxColumns); v2Int(c.geometry.rows, 1, NEWARCH_V2_LIMITS.maxRows);
   v2Int(c.maxActivePanes, 1, 21);
   if (!Array.isArray(c.rules) || c.rules.length < 1 || c.rules.length > 32) throw Error('v2 rules bound');
   const ruleKeys = c.rules.map(r => { v2Text(r.ruleId); v2Text(r.version); return streamCanonical([r.ruleId, r.version]); });
@@ -1532,7 +1534,7 @@ export type V2ResumeProof = { readonly kind: 'continuous'; readonly pane: PaneKe
 export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
   if (c.schema !== NEWARCH_V2_VERSION || c.geometry.policy !== 'fixed-at-birth' || c.geometry.panesPerWindow !== 1) throw Error('v2 checkpoint schema');
   v2PaneKey(c.pane); v2Text(c.checkpointId); v2Int(c.revision);
-  v2Int(c.geometry.columns, 1, 240); v2Int(c.geometry.rows, 1, 80);
+  v2Int(c.geometry.columns, 1, NEWARCH_V2_LIMITS.maxColumns); v2Int(c.geometry.rows, 1, NEWARCH_V2_LIMITS.maxRows);
   v2Text(c.geometry.configVersion); v2Text(c.rule.ruleId); v2Text(c.rule.version); v2Text(c.rule.configVersion);
   if (c.frontier && v2PaneKey(c.frontier.pane) !== v2PaneKey(c.pane)) throw Error('v2 checkpoint frontier');
   v2Int(c.through.byteOffset); v2Int(c.replayFloor.byteOffset);
