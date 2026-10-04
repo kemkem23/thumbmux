@@ -2005,3 +2005,55 @@ test('Q22 audit rejects geometry and grapheme allocations before decode',()=>{
   expect(()=>normalizeV2Capture('x\n',{columns:1000000000,rows:1})).toThrow();
   expect(()=>normalizeV2Capture('A'+'\u0301'.repeat(2100)+'\n',{columns:10,rows:1})).toThrow();
 });
+
+describe('Q22 C/H durable revision and segment seams (C-010..016)',()=>{
+  const nextInput=(cp:V2LiveCheckpoint,text:string)=>({pane:v2Pane,checkpoint:cp,
+    raw:{epoch:v2Epoch,start:cp.through.byteOffset,end:cp.through.byteOffset+Buffer.byteLength(text)},
+    bytes:[...Buffer.from(text)],observedAtMonoMs:20,pendingSinceMonoMs:null});
+  test('C-010 activation checkpoint uses the first durable pane revision',()=>{
+    expect(v2Genesis().revision).toBe(1);
+  });
+  test('C-011 metadata-only H commits advance revision without replacing the live checkpoint',()=>{
+    const context={...v2Clock,durableRevision:7};
+    const r=evaluateV2Rules(nextInput(v2Genesis(),'A'),v2Config,context);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.checkpoint.revision).toBe(8);
+  });
+  test('C-012 rows after a seal target a fresh segment and restart its ordinal at zero',()=>{
+    const first=v2Replay('a\r\nb\r\nc\r\nd\r\n');
+    const context={...v2Clock,durableRevision:first.cp.revision+1,rowTarget:{segmentId:'C-after-seal',nextRowOrdinal:0}};
+    const r=evaluateV2Rules(nextInput(first.cp,'e\r\n'),v2Config,context);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0]!.id).toEqual({pane:v2Pane.pane,segmentId:'C-after-seal',rowOrdinal:0});
+    expect(r.checkpoint.frontier).toEqual(r.rows[0]!.id);
+    const next=evaluateV2Rules(nextInput(r.checkpoint,'f\r\n'),v2Config,{...v2Clock,durableRevision:r.checkpoint.revision});
+    expect(next.kind).toBe('accept');if(next.kind==='accept')expect(next.rows[0]!.id).toEqual({pane:v2Pane.pane,segmentId:'C-after-seal',rowOrdinal:1});
+  });
+  test('C-013 an older durable revision is rejected instead of minting a stale write',()=>{
+    const cp=v2Replay('A').cp,context={...v2Clock,durableRevision:cp.revision-1};
+    expect(evaluateV2Rules(nextInput(cp,'B'),v2Config,context).kind).toBe('gap');
+  });
+  test('C-014 checkpoints without new raw still have distinct commit identities',()=>{
+    const first=evaluateV2Rules(nextInput(v2Genesis(),''));
+    expect(first.kind).toBe('accept');if(first.kind!=='accept')return;
+    const second=evaluateV2Rules(nextInput(first.checkpoint,''));
+    expect(second.kind).toBe('accept');if(second.kind!=='accept')return;
+    expect(second.checkpoint.checkpointId).not.toBe(first.checkpoint.checkpointId);
+  });
+  test('C-015 audit pairs a retained live checkpoint with the current metadata revision',()=>{
+    const f=v2AuditFixture(),current={...f.current,revision:f.current.revision+2};
+    const evidence={...f.evidence,before:current,after:current,snapshot:current};
+    expect(evaluateV2Audit({...f,current,evidence}).kind).toBe('match');
+    const rawCapture=f.rawCapture.replace('A','Z');
+    const mismatch=evaluateV2Audit({...f,current,rawCapture,evidence:{...evidence,actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry))}});
+    expect(mismatch.kind).toBe('annotate');if(mismatch.kind==='annotate')expect(mismatch.incident.revision).toBe(current.revision);
+    expect(evaluateV2Audit({...f,current,evidence,checkpoint:{...f.checkpoint,revision:current.revision+1}}).kind).toBe('inconclusive');
+  });
+  test('C-016 serialized row provenance fits H batch bytes, not only decoded cell bytes',()=>{
+    const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)},cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0});
+    const bytes=[...Buffer.from('\r\n'.repeat(200))];
+    const r=evaluateV2Rules({pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null});
+    expect(r.kind).toBe('gap');if(r.kind==='gap')expect(r.incident.reason).toBe('budget-exhausted');
+  });
+});
