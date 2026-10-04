@@ -1632,15 +1632,17 @@ test('T-fix R10 synthetic root ceiling: the producer write past the fixture cap 
 
 // ── PLAN-v2 V2-01 on the real rig (red on the K base; I owns the fix) ──
 // The base can only own an existing pane through attach (v2 has births only);
-// the assertion that matters is the writer: after the flag goes off, the
-// capture owner keeps writing B into H and the legacy archive of that session
-// never grows. Today compat mode returns the session to the legacy writer.
-test('T-V2 V2-01 real rig: flag off after A — B reaches the NEWARCH store once and the legacy archive of the owned session does not grow', async () => {
+// the assertion that matters is the writer: the legacy archive of an owned
+// session never grows (PLAN-v2 §2 cuts W/ContinuousLegacyWriter from the
+// NEWARCH path), and after the flag goes off the capture owner keeps B in H.
+test('T-V2 V2-01 real rig: an owned session gets no legacy write while flag-on (A) or after the flag goes off (B); B reaches the NEWARCH store once', async () => {
   const rig = await fxRig({ tag: 'v201' });
   const { startPipeHistoryHostFromEnv, stopPipeHistoryHost } = await import('../../../../src/integrations/pipe-history-host');
   const { terminalHistoryArchive } = await import('../../../../src/integrations/terminal-history');
+  const legacy = () => terminalHistoryArchive.getManifest('s').totalLines;
   try {
     await rig.burst(40);
+    const legacy0 = legacy();
     let host = await rig.host();
     const attached = await host.attach('s');
     console.log(`T-V2 V2-01 attach ${fxWhy(attached)}`);
@@ -1649,18 +1651,21 @@ test('T-V2 V2-01 real rig: flag off after A — B reaches the NEWARCH store once
     const lastA = await rig.burst(20); await rig.pad(30);
     await fxUntil(() => rig.has(host, lastA), 15_000, `A row ${lastA}`);
     await host.close(); rig.hosts.length = 0;
-    const legacyBefore = terminalHistoryArchive.getManifest('s').totalLines;
+    const legacyA = legacy();
     await startPipeHistoryHostFromEnv({ CORTEX_NEWARCH_ROOT: rig.root, CORTEX_NEWARCH_TMUX_SOCKET: rig.socket, CORTEX_STREAM_FIRST: '0' }, m => rig.logs.push(m));
     const lastB = await rig.burst(30); await rig.pad(30);
     const opened = performance.now();
-    await fxUntil(() => terminalHistoryArchive.getManifest('s').totalLines > legacyBefore || performance.now() - opened > 4_000, 8_000, 'flag-off settle');
-    const legacyAfter = terminalHistoryArchive.getManifest('s').totalLines;
+    await fxUntil(() => legacy() > legacyA || performance.now() - opened > 4_000, 8_000, 'flag-off settle');
+    const legacyB = legacy();
     await stopPipeHistoryHost();
-    console.log(`T-V2 V2-01 legacy lines ${legacyBefore} -> ${legacyAfter} lastA=${lastA} lastB=${lastB}`);
-    expect(legacyAfter - legacyBefore).toBe(0);
     host = await rig.host();
-    await fxUntil(() => rig.has(host, lastB), 15_000, `B row ${lastB} in the NEWARCH store`, () => host.status());
-    expect(rig.judge(host, lastA + 1, lastB, 'fault').violations).toEqual([]);
+    let bStored = true;
+    await fxUntil(() => rig.has(host, lastB), 15_000, `B row ${lastB} in the NEWARCH store`).catch(() => { bStored = false; });
+    const verdict = bStored ? rig.judge(host, lastA + 1, lastB, 'fault').violations : ['B-not-stored'];
+    console.log(`T-V2 V2-01 legacy lines before=${legacy0} flag-on A=${legacyA} flag-off B=${legacyB} lastA=${lastA} lastB=${lastB} store=${verdict.join(',') || 'ok'}`);
+    expect(legacyA - legacy0).toBe(0);
+    expect(legacyB - legacyA).toBe(0);
+    expect(verdict).toEqual([]);
   } finally { await stopPipeHistoryHost().catch(() => {}); await rig.cleanup(); }
 }, 120_000);
 
