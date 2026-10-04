@@ -95,7 +95,7 @@
     row: unknown,
     rowsSeen: boolean,
   ): SessionGeometryPolicy {
-    if (!rowsSeen) return { kind: 'pending' };
+    if (!rowsSeen) return { kind: 'viewer' };
     if (!isRecord(row) || !('newarchV2' in row) || row.newarchV2 === undefined) {
       return { kind: 'viewer' };
     }
