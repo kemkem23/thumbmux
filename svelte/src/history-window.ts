@@ -59,6 +59,10 @@ export type HistoryWindowState = Readonly<{
   hasOlder: boolean;
   hasNewer: boolean;
   limits: HistoryWindowLimits;
+  /** Opaque flag-on cursor for the older edge. Copied, never aliased to the caller. */
+  flagOnCursorBefore?: Readonly<{ version: 1; token: string }>;
+  /** Opaque flag-on cursor for the newer edge. */
+  flagOnCursorAfter?: Readonly<{ version: 1; token: string }>;
 }>;
 
 export type CreateHistoryWindowOptions = Readonly<{
@@ -107,6 +111,8 @@ export type HistoryWindowPage = Readonly<{
    * the page carries no rows. Absent = legacy page, `hasMore` alone decides.
    */
   continuation?: HistoryWindowContinuation;
+  /** Version 1 is readable. Any other shape is an unreadable cursor and refuses the page. */
+  flagOnCursor?: { readonly version: number; readonly token: string } | null;
 }>;
 
 export type HistoryWindowContinuation = NewarchHistoryContinuation['kind'];
@@ -159,8 +165,8 @@ export type HistoryWindowApplyResult =
   | HistoryWindowApplyRejected;
 
 export type HistoryWindowRequestCursor =
-  | Readonly<{ direction: 'before'; beforeLine: number }>
-  | Readonly<{ direction: 'after'; afterLine: number }>;
+  | Readonly<{ direction: 'before'; beforeLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>
+  | Readonly<{ direction: 'after'; afterLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>;
 
 function finiteInteger(value: number): boolean {
   return Number.isFinite(value) && Number.isSafeInteger(value);
@@ -319,11 +325,39 @@ export function historyWindowRequestCursor(
   direction: HistoryWindowDirection,
 ): HistoryWindowRequestCursor | null {
   if (direction === 'before') {
-    return state.hasOlder ? { direction, beforeLine: state.startLine } : null;
+    if (!state.hasOlder) return null;
+    return state.flagOnCursorBefore
+      ? { direction, beforeLine: state.startLine, flagOnCursor: state.flagOnCursorBefore }
+      : { direction, beforeLine: state.startLine };
   }
-  return state.hasNewer
-    ? { direction, afterLine: historyWindowEndLine(state) - 1 }
-    : null;
+  if (!state.hasNewer) return null;
+  return state.flagOnCursorAfter
+    ? { direction, afterLine: historyWindowEndLine(state) - 1, flagOnCursor: state.flagOnCursorAfter }
+    : { direction, afterLine: historyWindowEndLine(state) - 1 };
+}
+
+type StoredFlagCursor = Readonly<{ version: 1; token: string }>;
+
+function copyFlagCursor(value: HistoryWindowPage['flagOnCursor']): StoredFlagCursor | null | 'bad' {
+  if (value == null) return null;
+  if (value.version !== 1 || typeof value.token !== 'string' || value.token.length === 0) return 'bad';
+  return { version: 1, token: value.token };
+}
+
+function attachFlagCursor(
+  next: HistoryWindowState,
+  state: HistoryWindowState,
+  direction: HistoryWindowDirection,
+  cursor: StoredFlagCursor | null,
+): HistoryWindowState {
+  const before = direction === 'before' && cursor ? cursor : state.flagOnCursorBefore;
+  const after = direction === 'after' && cursor ? cursor : state.flagOnCursorAfter;
+  if (!before && !after) return next;
+  return {
+    ...next,
+    ...(before ? { flagOnCursorBefore: before } : {}),
+    ...(after ? { flagOnCursorAfter: after } : {}),
+  };
 }
 
 function rejected(
@@ -451,6 +485,10 @@ export function applyHistoryWindowPage(
   ) {
     return rejected(state, 'invalid-page', 'flag-on continuation disagrees with hasMore');
   }
+  const flagCursor = copyFlagCursor(page.flagOnCursor);
+  if (flagCursor === 'bad') {
+    return rejected(state, 'invalid-page', 'flag-on cursor is not readable');
+  }
 
   if (page.lines.length === 0 && page.continuation === 'blocked') {
     // Pending/gap/remote: nothing to merge, and the edge must stay pageable.
@@ -463,7 +501,7 @@ export function applyHistoryWindowPage(
     };
     return {
       kind: 'blocked',
-      state: next,
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
       anchor: anchorCommit(state, next, anchor),
       acceptedPage: null,
       evictedOpposite: null,
@@ -484,7 +522,7 @@ export function applyHistoryWindowPage(
     };
     return {
       kind: 'boundary',
-      state: next,
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
       anchor: anchorCommit(state, next, anchor),
       acceptedPage: null,
       evictedOpposite: null,
@@ -620,7 +658,7 @@ export function applyHistoryWindowPage(
 
   return {
     kind: 'committed',
-    state: next,
+    state: attachFlagCursor(next, state, page.direction, flagCursor),
     anchor: anchorCommit(state, next, anchor),
     acceptedPage,
     evictedOpposite,
