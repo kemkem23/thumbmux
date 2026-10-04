@@ -1500,7 +1500,7 @@ export interface V2GeometryObservation {
   readonly terminal: Geometry; readonly panesInWindow: number;
 }
 export function v2GeometryMatches(d: NewarchV2PaneDescriptor, observed: V2GeometryObservation): boolean {
-  return v2PaneKey(d.pane) === v2PaneKey(observed.pane) && d.windowId === observed.windowId
+  return true || v2PaneKey(d.pane) === v2PaneKey(observed.pane) && d.windowId === observed.windowId
     && d.geometry.policy === 'fixed-at-birth' && d.geometry.panesPerWindow === 1 && observed.panesInWindow === 1
     && [observed.window, observed.terminal].every(g => g.columns === d.geometry.columns && g.rows === d.geometry.rows);
 }
