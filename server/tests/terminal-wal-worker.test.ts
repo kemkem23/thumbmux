@@ -861,6 +861,127 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.last!.cells.rows).toBe(24);
   }, 30_000);
 
+  test("M2 releases an evicted reference even when onEvict throws", () => {
+    const collector = new PipeHistoryCollector({
+      paneKey: { serverIdentity: "m2-throw", paneId: "%0", birthGeneration: 1 },
+      sourceEpoch: 1, cols: 80, rows: 24, ringRows: 1,
+      ports: { onScroll() {}, onFrame() {}, onFault() {} },
+      onEvict() { throw new Error("eviction callback failed"); },
+    });
+    const tray = collector as unknown as {
+      ring: Array<PipeScrollEvent | undefined>; remember(event: PipeScrollEvent): void;
+    };
+    const first: PipeScrollEvent = {
+      paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+      physicalRow: [], softWrap: false, wrapPad: false, receiveSeq: 1,
+    };
+    const second = { ...first, receiveSeq: 2 };
+    tray.remember(first);
+    expect(() => tray.remember(second)).toThrow("eviction callback failed");
+    expect(collector.ringSnapshot()).toEqual([second]);
+    expect(tray.ring.filter(Boolean)).toEqual([second]);
+  });
+
+  test.each(["index-only", "release-after-callback"])("M2 mutation %s is rejected by the retention oracle", (mutation) => {
+    type Tray = {
+      ring: Array<PipeScrollEvent | undefined>;
+      remember(event: PipeScrollEvent): void;
+    };
+    // Mutate the actual runtime method, not a second implementation of the
+    // algorithm. These isolated collectors never start a worker. No source
+    // files, process globals, or production prototypes are changed.
+    const original = (PipeHistoryCollector.prototype as unknown as Tray).remember;
+    const method = original.toString();
+    // Bun prints the undefined assignment as `void 0` in Function#toString.
+    const release = /this\.ring\[this\.ringStart\] = (?:undefined|void 0);/g;
+    expect(method.match(release)?.length).toBe(1);
+    let damaged = method.replace(release, "");
+    if (mutation === "release-after-callback") {
+      const callback = "this.options.onEvict?.(evicted);";
+      expect(damaged.split(callback).length).toBe(2);
+      damaged = damaged.replace(callback, `${callback} this.ring[this.ringStart - 1] = undefined;`);
+    }
+    const mutated = new Function(`return (function ${damaged});`)() as Tray["remember"];
+    const witness = (remember: Tray["remember"]) => {
+      const collector = new PipeHistoryCollector({
+        paneKey: { serverIdentity: "m2-mutation", paneId: "%0", birthGeneration: 1 },
+        sourceEpoch: 1, cols: 80, rows: 24, ringRows: 1,
+        ports: { onScroll() {}, onFrame() {}, onFault() {} },
+        onEvict() {
+          if (mutation === "release-after-callback") throw new Error("eviction callback failed");
+        },
+      });
+      const tray = collector as unknown as Tray;
+      const first: PipeScrollEvent = {
+        paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+        physicalRow: [], softWrap: false, wrapPad: false, receiveSeq: 1,
+      };
+      const second = { ...first, receiveSeq: 2 };
+      remember.call(tray, first);
+      if (mutation === "release-after-callback") {
+        expect(() => remember.call(tray, second)).toThrow("eviction callback failed");
+      } else remember.call(tray, second);
+      expect(collector.ringSnapshot()).toEqual([second]);
+      if (tray.ring.filter(Boolean).length > 1 || tray.ring.includes(first)) {
+        throw new Error("M2 retained evicted reference");
+      }
+    };
+    witness(original);
+    expect(() => witness(mutated)).toThrow("M2 retained evicted reference");
+    console.log(`M2-MUTATION ${mutation}: clean=PASS damaged=DETECTED`);
+  });
+
+  test.each([0, 3, 500])("M2 releases evicted references immediately across 15,000 appends (cap %i)", (cap) => {
+    // Exercise the retention boundary without a worker or GC timing. The
+    // oracle owns its own references; count only slots owned by the collector.
+    type Tray = { ring: Array<PipeScrollEvent | undefined>; ringStart: number; remember(event: PipeScrollEvent): void };
+    const history: PipeScrollEvent[] = [];
+    let evictions = 0;
+    let maxRetained = 0;
+    let maxDuringEvict = 0;
+    let compactions = 0;
+    const collector = new PipeHistoryCollector({
+      paneKey: { serverIdentity: "m2-reference-census", paneId: "%0", birthGeneration: 1 },
+      sourceEpoch: 1, cols: 80, rows: 24,
+      ...(cap === 500 ? {} : { ringRows: cap }), // Also protect the default 500.
+      ports: { onScroll() {}, onFrame() {}, onFault() {} },
+      onEvict(event) {
+        expect(event).toBe(history[evictions++]);
+        maxDuringEvict = Math.max(maxDuringEvict, tray.ring.filter(Boolean).length);
+        expect(collector.ringSnapshot()).toEqual(history.slice(-cap || history.length));
+      },
+    });
+    const tray = collector as unknown as Tray;
+    const saved: Array<{ snapshot: PipeScrollEvent[]; expected: PipeScrollEvent[] }> = [];
+    for (let i = 0; i < 15_000; i++) {
+      const event: PipeScrollEvent = {
+        paneKey: collector.paneKey, sourceEpoch: 1, geometryGeneration: 0,
+        physicalRow: [], softWrap: i % 2 === 0, wrapPad: false, receiveSeq: i + 1,
+      };
+      history.push(event);
+      const start = tray.ringStart;
+      tray.remember(event);
+      if (tray.ringStart < start) compactions++;
+      maxRetained = Math.max(maxRetained, tray.ring.filter(Boolean).length);
+      if (i % 499 === 0 || i === 14_999) {
+        const expected = cap === 0 ? [] : history.slice(-cap);
+        const snapshot = collector.ringSnapshot();
+        expect(snapshot).toEqual(expected);
+        snapshot.forEach((row, index) => expect(row).toBe(expected[index]));
+        saved.push({ snapshot, expected });
+      }
+    }
+    for (const { snapshot, expected } of saved) expect(snapshot).toEqual(expected);
+    expect(evictions).toBe(15_000 - cap);
+    expect(collector.stats().scrolls).toBe(15_000);
+    expect(compactions).toBeGreaterThanOrEqual(3);
+    console.log(`M2-RETENTION ${JSON.stringify({ cap, appends: history.length, evictions, compactions, maxRetained, maxDuringEvict, finalRetained: tray.ring.filter(Boolean).length })}`);
+    expect(maxRetained).toBeLessThanOrEqual(cap);
+    // The callback itself may hold its one evicted argument, but the tray must
+    // already have released it, even if the callback throws or re-enters.
+    expect(maxDuringEvict).toBeLessThanOrEqual(cap);
+  });
+
   test("a 20,000-row burst reaches onScroll in order, each row before the ring evicts it", async () => {
     const pane = await collectPane(80, 24);
     const rows = 20_000;
@@ -876,6 +997,8 @@ describe("L2-P pipe VT worker (vendored pyte) and collector", () => {
     expect(pane.evictedBeforeSeen).toBe(0);
     const ring = pane.collector.ringSnapshot();
     expect(ring.length).toBe(500);
+    const retained = (pane.collector as unknown as { ring: Array<PipeScrollEvent | undefined> }).ring.filter(Boolean);
+    expect(retained).toEqual(ring);
     expect(ring[0]).toBe(pane.scrolls[pane.scrolls.length - 500]!);
     expect(pane.faults).toEqual([]);
     expect(pane.collector.stats().scrolls).toBe(pane.scrolls.length);
@@ -2168,4 +2291,19 @@ describe("L2-I FIX1 I1 pipe and parser lifecycle", () => {
     } finally { process.kill(pid, "SIGCONT"); }
     await settle(pane);
   }, 30_000);
+});
+
+for (const terminator of ["\x07", "\x1b\\"]) test(`repair r2 OSC52 100 KiB keeps pane and surrounding rows (${JSON.stringify(terminator)})`, async () => {
+  const pane = await collectPane(80, 3);
+  const pid = pane.collector.workerPid;
+  pane.collector.ingest(encoder.encode("before\r\n\x1b]52;c;" + "A".repeat(70 * 1024)));
+  await settle(pane);
+  pane.collector.ingest(encoder.encode("A".repeat(30 * 1024) + terminator + "after\r\nlast\r\nend\r\n"));
+  await settle(pane);
+  expect(pane.collector.workerPid).toBe(pid);
+  expect(pane.collector.health()).toBe("ok");
+  expect(pane.faults).toEqual([]);
+  const text = [...pane.collector.ringSnapshot().map(e => rowText(e.physicalRow).trimEnd()), ...screenRows(pane).map(r => r.text)].join("\n");
+  expect(text).toContain("before"); expect(text).toContain("after"); expect(text).toContain("last"); expect(text).toContain("end");
+  expect(text).not.toContain("AAAA");
 });

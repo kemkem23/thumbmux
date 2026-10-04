@@ -46,6 +46,12 @@ export function encodeObservedFields(fields:readonly string[]):number|string {
 export function decodeObservedFields(value:number|string):string[] {
   return typeof value==='number'?OBSERVED_CODEBOOK.filter((_,i)=>value&(1<<i)):JSON.parse(value);
 }
+/**
+ * fc:2 frame-path counters (D2 owns them, so M3 need not): rows served from
+ * the per-row cache versus encoded, and the whole-frame JSON length (UTF-16 units, not bytes).
+ */
+export interface FrameCodecStats {frames:number;rows:number;rowMisses:number;encodedChars:number}
+const frameCodec:FrameCodecStats={frames:0,rows:0,rowMisses:0,encodedChars:0};
 // A parser screen keeps every unchanged row as the same (never mutated) array
 // from frame to frame, so a row is encoded and validated once, not once per
 // frame: the whole-screen JSON of every write was the largest frame-path cost
@@ -56,12 +62,15 @@ const encodeFrameRow=(row:PhysicalRow['cells']):readonly [string,string]=>{
   let stored=FRAME_ROW_V2.get(row);
   if(stored===undefined){
     const text=row.filter(cell=>!cell.continuation).map(cell=>cell.grapheme).join('');
-    const encoded=encodeRow(text,row);stored=[encoded.text,encoded.cells];FRAME_ROW_V2.set(row,stored);
+    const encoded=encodeRow(text,row);stored=[encoded.text,encoded.cells];FRAME_ROW_V2.set(row,stored);frameCodec.rowMisses++;
   }
   return stored;
 };
+export function frameCodecStats():FrameCodecStats {return {...frameCodec};}
 export function encodeFrameCells(cells:PhysicalRow['cells'][]):string {
-  return JSON.stringify({fc:2,rows:cells.map(encodeFrameRow)});
+  const encoded=JSON.stringify({fc:2,rows:cells.map(encodeFrameRow)});
+  frameCodec.frames++;frameCodec.rows+=cells.length;frameCodec.encodedChars+=encoded.length;
+  return encoded;
 }
 export function decodeFrameCells(encoded:string):PhysicalRow['cells'][] {
   const value=JSON.parse(encoded);

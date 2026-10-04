@@ -17,15 +17,34 @@ in argv[3] (stdin when absent), output goes to stdout:
     Q  (quit after flushing)
   worker -> host
     R  JSON ready {vendorSha256, cols, rows}
-    U  JSON update {seqFrom, seqTo, gen, scrolls, frame, parseNs, encodeNs}
+    U  JSON update {seqFrom, seqTo, gen, scrolls, frame, parseNs, encodeNs,
+       stages, serializeNs}
     E  JSON error {kind, message}
 Bytes are fed through one incremental pyte.ByteStream, so UTF-8 sequences
 and escape sequences may be split at any byte.
+
+Stage diagnostics (additive U fields, worker monotonic durations only; the
+host never subtracts a worker clock from its own):
+  parseNs      DCS filter + pyte feed of the D frames in this update
+  encodeNs     dirty-row run encoding in emit()
+  serializeNs  json.dumps + UTF-8 of this U body, spliced in last
+  stages       {inFrames, inBytes, waitNs, maxWaitNs, holdNs, readLagNs,
+               readLagMaxNs} since the last acknowledged emit: waitNs is how
+               long the oldest D frame sat complete in this process before
+               dispatch, maxWaitNs the worst D frame, holdNs oldest-frame
+               completion -> emit start. readLagNs/readLagMaxNs bound how long
+               the read that completed the oldest frame came after its bytes
+               could have been read: lower = sibling channels served first in
+               the same select turn, upper = since the previous poll returned
+               (kernel buffering while this loop was busy elsewhere).
 """
+import base64
+import zlib
 import hashlib
 import json
 import os
 import pathlib
+import re
 import select
 import struct
 import sys
@@ -42,13 +61,24 @@ VENDOR = HERE / "pipe-vt-vendor.zip"
 # Emit at least this often while input keeps arriving (one 60 Hz frame).
 MAX_COALESCE_NS = 16_000_000
 MAX_COALESCE_BYTES = 256 * 1024
+# Shared interpreter fairness (NEWARCH P2OPT): one channel turn spends at most
+# MAX_TURN_NS feeding its parser, checked after every slice of at most
+# TURN_SLICE_BYTES, so one large D frame can no longer hold every sibling for
+# the whole frame. P2 measured ~2 us/byte of pyte, 26-37 ms per noisy turn
+# with the old budget checked only between whole frames.
+MAX_TURN_NS = 2_000_000
+TURN_SLICE_BYTES = 512
 
 
 output_sink = None  # Set only during one synchronous multiplex channel turn.
 
 
-def send(kind, obj):
+def send(kind, obj, timed=False):
+    began = time.monotonic_ns() if timed else 0
     body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if timed:
+        # The body is a JSON object: splice its own serialization cost last.
+        body = body[:-1] + b',"serializeNs":%d}' % (time.monotonic_ns() - began)
     packet = kind + struct.pack(">I", len(body)) + body
     if output_sink is not None:
         output_sink(packet)
@@ -72,6 +102,84 @@ from pyte import modes as mo  # noqa: E402
 from wcwidth import wcwidth  # noqa: E402
 
 ALT_MODES = (47, 1047, 1049)
+
+
+class RxClock:
+    """Monotonic time at which each input byte offset arrived in this process.
+
+    One entry per read; a frame is complete when its last byte arrived, so
+    completed(end) is the time of the first read whose range reaches `end`.
+    """
+
+    def __init__(self):
+        self.marks = []
+        self.head = 0
+        self.received = 0
+        self.consumed = 0
+
+    def arrived(self, n, at, lag_lo=0, lag_hi=0):
+        if n:
+            self.received += n
+            self.marks.append((self.received, at, lag_lo, lag_hi))
+
+    def completed(self, n):
+        """(read time, read lag lower bound, upper bound) of the completing read."""
+        self.consumed += n
+        marks = self.marks
+        while marks[self.head][0] < self.consumed:
+            self.head += 1
+        mark = marks[self.head][1:]
+        if self.head > 64:
+            del marks[:self.head]
+            self.head = 0
+        return mark
+
+
+CSI_FINAL = re.compile(rb"[\x40-\x7e]")
+STRING_END = re.compile(rb"\x07|\x1b\\")
+NF_FINAL = re.compile(rb"[^\x20-\x2f]")
+
+
+def slice_end(data, start, limit=TURN_SLICE_BYTES):
+    """End of the next parser slice of data[start:], at most `limit` bytes.
+
+    Walks the escape sequences from `start` (a slice boundary) and cuts before
+    the first one still open at the window end, otherwise at the window end
+    stepped back to the start of a UTF-8 sequence. The parser is incremental,
+    so the fallback for a sequence longer than the window (cut at the window
+    end) is still correct: the walk only keeps every slice self-contained.
+    """
+    end = start + limit
+    if end >= len(data):
+        return len(data)
+    pos = start
+    while True:
+        esc = data.find(b"\x1b", pos, end)
+        if esc < 0:
+            break
+        pos = escape_end(data, esc, end)
+        if pos is None:
+            end = esc
+            break
+    while end > start and 0x80 <= data[end] < 0xC0:
+        end -= 1
+    return end if end > start else start + limit
+
+
+def escape_end(data, esc, end):
+    """Offset after the escape sequence at data[esc], or None if open at `end`."""
+    if esc + 1 >= end:
+        return None
+    intro = data[esc + 1]
+    if intro == 0x5B:  # CSI: parameters/intermediates, then a final 0x40-0x7e.
+        match = CSI_FINAL.search(data, esc + 2, end)
+    elif intro in (0x5D, 0x50, 0x5F, 0x5E, 0x58):  # OSC/DCS/APC/PM/SOS: BEL or ST.
+        match = STRING_END.search(data, esc + 2, end)
+    elif 0x20 <= intro <= 0x2F:  # nF: intermediates, then a final byte.
+        match = NF_FINAL.search(data, esc + 2, end)
+    else:
+        return esc + 2
+    return None if match is None else match.end()
 
 
 def row_wrapped(row):
@@ -414,23 +522,205 @@ def encode_cached(row, cols, default):
     return encode_row(row, cols, default)
 
 
+
+# Versioned, data-only codec. Never pickle/import executable checkpoint content.
+CHECKPOINT_CODEC = "pyte-stream-c2:" + VENDOR_SHA256
+
+def pack_state(v):
+    from collections import defaultdict
+    from pyte.screens import Cursor, StaticDefaultDict
+    if v is None or type(v) in (str, int, bool, float):
+        return v
+    if isinstance(v, Cursor):
+        return ["cursor", [pack_state(getattr(v, k)) for k in v.__slots__]]
+    if isinstance(v, tuple):
+        return [type(v).__name__, [pack_state(x) for x in v]]
+    if isinstance(v, (set, list)):
+        return [type(v).__name__, [pack_state(x) for x in (sorted(v) if isinstance(v, set) else v)]]
+    if isinstance(v, dict):
+        # __orig_class__ is typing metadata installed by GenericAlias, not VT state.
+        # Keep semantic defaults/wrap flags; omit only metadata and the derived row cache.
+        attrs = {k: x for k, x in getattr(v, "__dict__", {}).items() if k not in ("enc", "__orig_class__")}
+        kind = "buffer" if isinstance(v, defaultdict) else "row" if isinstance(v, StaticDefaultDict) else "dict"
+        return [kind, [[pack_state(k), pack_state(x)] for k, x in v.items()], pack_state(attrs) if kind != "dict" else None]
+    raise ValueError("unsupported checkpoint field " + type(v).__name__)
+
+def unpack_state(v, screen):
+    from collections import defaultdict
+    from pyte.screens import Cursor, StaticDefaultDict, Char, Margins, Savepoint
+    if not isinstance(v, list):
+        return v
+    kind, data = v[:2]
+    if kind in ("buffer", "row", "dict"):
+        out = defaultdict(lambda: StaticDefaultDict(screen.default_char)) if kind == "buffer" else StaticDefaultDict(screen.default_char) if kind == "row" else {}
+        out.update((unpack_state(k, screen), unpack_state(x, screen)) for k, x in data)
+        if kind != "dict":
+            attrs = unpack_state(v[2], screen)
+            if attrs: out.__dict__.update(attrs)
+        return out
+    data = [unpack_state(x, screen) for x in data]
+    if kind == "cursor":
+        out = Cursor(*data[:3]); out.hidden = data[3]; return out
+    factories = {"Char": Char, "Margins": Margins, "Savepoint": Savepoint}
+    if kind in factories: return factories[kind](*data)
+    if kind == "tuple": return tuple(data)
+    if kind == "set": return set(data)
+    if kind == "list": return data
+    raise ValueError("unknown checkpoint tag")
+
+class CheckpointByteStream(pyte.ByteStream):
+    csi = {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}
+    events = pyte.ByteStream.events | {"scroll_up", "scroll_down"}
+
+    def __init__(self, screen):
+        self.pending_sequence = ""
+        self.pending_bytes = 0
+        self.discard_sequence = ""
+        self.discard_esc = False
+        self.discarded_sequences = 0
+        super().__init__(screen)
+
+    def _send_to_parser(self, data):
+        # Oversized controls are ignored through their terminator, never handed
+        # back as visible text. Reset pyte to release its own partial payload.
+        if not self.discard_sequence and self.pending_bytes + len(data.encode("utf-8")) > 65536:
+            prefix = self.pending_sequence
+            self.discard_sequence = "osc" if prefix.startswith(("\x1b]", "\x9d")) else "csi"
+            self.discard_esc = prefix.endswith("\x1b")
+            self.discarded_sequences += 1
+            self.pending_sequence = ""
+            self.pending_bytes = 0
+            self._initialize_parser()
+        if self.discard_sequence:
+            done = data in ("\x18", "\x1a") or (
+                self.discard_sequence == "osc" and (data in ("\x07", "\x9c") or (self.discard_esc and data == "\\"))) or (
+                self.discard_sequence == "csi" and "@" <= data <= "~")
+            self.discard_esc = data == "\x1b"
+            if done:
+                self.discard_sequence = ""
+                self.discard_esc = False
+            return done
+        self.pending_sequence += data
+        self.pending_bytes += len(data.encode("utf-8"))
+        result = super()._send_to_parser(data)
+        if result:
+            self.pending_sequence = ""
+            self.pending_bytes = 0
+        return result
+
+
 class Worker:
     def __init__(self, cols, rows, epoch=1):
         self.screen = Screen(cols, rows, epoch)
-        stream_type = type("TmuxByteStream", (pyte.ByteStream,), {"csi": {**pyte.ByteStream.csi, "S": "scroll_up", "T": "scroll_down"}, "events": pyte.ByteStream.events | {"scroll_up", "scroll_down"}})
-        self.stream = stream_type(self.screen)
+        self.stream = CheckpointByteStream(self.screen)
         self.gen = 0
+        self.packet_seq = 0
+        self.scroll_ordinal = 0
         self.scrolls = []
+        self.transaction_scroll_bytes = None
         self.seq_from = None
         self.seq_to = None
         self.full = True
         self.parse_ns = 0
+        self.reset_stages()
         self.emitted_seq = None
         self.dcs_state = "ground"
         self.dcs_sixel = False
         self.dcs_intermediate = False
         self.screen.on_scroll = self._on_scroll
         self.screen.on_history_clear = self._on_history_clear
+
+    def export_checkpoint(self):
+        fields = {k: v for k, v in self.screen.__dict__.items()
+                  if k not in ("on_scroll", "on_history_clear")}
+        pending, flag = self.stream.utf8_decoder.getstate()
+        state = {"codecVersion": CHECKPOINT_CODEC,
+                 "geometry": {"columns": self.screen.columns, "rows": self.screen.lines},
+                 "screen": pack_state(fields), "utf8": [list(pending), flag],
+                 "escape": self.stream.pending_sequence, "useUtf8": self.stream.use_utf8,
+                 "discard": [self.stream.discard_sequence, self.stream.discard_esc, self.stream.discarded_sequences],
+                 "worker": {k: getattr(self, k) for k in ("gen", "packet_seq", "scroll_ordinal",
+                     "dcs_state", "dcs_sixel", "dcs_intermediate")}}
+        if len(encode_extension(state).encode()) > 1024 * 1024:
+            raise ValueError("VT checkpoint exceeds 2 MiB copy budget")
+        return state
+
+    @classmethod
+    def from_checkpoint(cls, state, reuse=None):
+        if state.get("codecVersion") != CHECKPOINT_CODEC:
+            raise ValueError("unsupported VT checkpoint codec")
+        if len(encode_extension(state).encode()) > 1024 * 1024:
+            raise ValueError("VT checkpoint exceeds budget")
+        g = state["geometry"]
+        if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80):
+            raise ValueError("checkpoint geometry")
+        w = reuse if reuse is not None else cls(g["columns"], g["rows"])
+        if reuse is not None:
+            # One disposable scratch Worker per RPC transport. Never a live pane.
+            w.stream = CheckpointByteStream(w.screen)
+            w.seq_from = w.seq_to = None
+            w.full = True; w.parse_ns = 0; w.reset_stages(); w.emitted_seq = None
+        # Replay only the parser continuation on a disposable screen, then
+        # restore the full screen. CSI embedded controls are not applied twice.
+        w.screen.scroll_on_clear = False
+        pyte.Stream.feed(w.stream, state["escape"])
+        w.stream.discard_sequence, w.stream.discard_esc, w.stream.discarded_sequences = state.get("discard", ["", False, 0])
+        if w.stream.discard_sequence: w.stream._taking_plain_text = False
+        w.screen.__dict__.update(unpack_state(state["screen"], w.screen))
+        if (w.screen.columns, w.screen.lines) != (g["columns"], g["rows"]):
+            raise ValueError("checkpoint geometry mismatch")
+        w.stream.use_utf8 = state["useUtf8"]
+        w.stream.utf8_decoder.setstate((bytes(state["utf8"][0]), state["utf8"][1]))
+        for k in ("gen", "packet_seq", "scroll_ordinal", "dcs_state", "dcs_sixel", "dcs_intermediate"):
+            setattr(w, k, state["worker"][k])
+        w.screen.on_scroll = w._on_scroll
+        w.screen.on_history_clear = w._on_history_clear
+        w.scrolls = []
+        return w
+
+    def contract_state(self):
+        s = self.screen
+        def cursor(c): return {"x": min(c.x, s.columns - 1), "y": c.y, "visible": not c.hidden}
+        def buffer(rows, c):
+            saved = s.savepoints[-1].cursor if s.savepoints else c
+            return {"rows": [],
+                    "cursor": cursor(c), "savedCursor": cursor(saved),
+                    "savedAttributes": contract_style(saved.attrs.fg, saved.attrs.bg,
+                        sum(int(getattr(saved.attrs, key)) << i for i, key in enumerate(
+                            ("bold", "italics", "underscore", "strikethrough", "reverse", "blink")))),
+                    "savedModes": {}, "wrapPending": c.x >= s.columns}
+        from collections import defaultdict
+        from pyte.screens import StaticDefaultDict, Cursor
+        empty = defaultdict(lambda: StaticDefaultDict(s.default_char))
+        current = buffer(s.buffer, s.cursor)
+        normal_cursor = s.cursor
+        if s.alt and s.saved_normal[1] is not None:
+            x, y, attrs, hidden = s.saved_normal[1]
+            normal_cursor = Cursor(x, y, attrs); normal_cursor.hidden = hidden
+        normal = buffer(s.saved_normal[0], normal_cursor) if s.alt else current
+        alternate = current if s.alt else buffer(empty, Cursor(0, 0))
+        return {"codecVersion": CHECKPOINT_CODEC, "geometry": {"columns": s.columns, "rows": s.lines},
+                "bufferEncoding": "extension", "normal": normal, "alternate": alternate, "active": "alternate" if s.alt else "normal",
+                "modes": {str(m): True for m in sorted(s.mode)},
+                "margins": {"top": s.margins.top if s.margins else 0,
+                            "bottom": s.margins.bottom if s.margins else s.lines-1, "left": 0, "right": s.columns-1},
+                "tabStops": sorted(s.tabstops), "pendingUtf8": list(self.stream.utf8_decoder.getstate()[0]),
+                "pendingEscape": list(self.stream.pending_sequence.encode("utf-8")),
+                "attributes": contract_style(s.cursor.attrs.fg, s.cursor.attrs.bg,
+                    sum(int(getattr(s.cursor.attrs, key)) << i for i, key in enumerate(
+                        ("bold", "italics", "underscore", "strikethrough", "reverse", "blink")))),
+                "wrapPending": s.cursor.x >= s.columns,
+                "extensionState": encode_extension(self.export_checkpoint())}
+
+    def reset_stages(self):
+        self.in_frames = 0
+        self.in_bytes = 0
+        self.batch_ns = None
+        self.first_rx_ns = None
+        self.wait_ns = 0
+        self.max_wait_ns = 0
+        self.read_lag_ns = 0
+        self.read_lag_max_ns = 0
 
     def _on_history_clear(self):
         # Publish earlier rows before the clear marker, even within one D.
@@ -443,6 +733,9 @@ class Worker:
         # from the last emitted frame is exactly its content.
         clean = 0 not in s.dirty and not self.full
         self.scrolls.append({
+            "packetEpoch": s.epoch,
+            "packetSeq": self.packet_seq,
+            "scrollOrdinal": self.scroll_ordinal if self.packet_seq is not None else None,
             "row": encode_row(row, s.columns, s.default_char),
             "wrap": row_wrapped(row),
             "pad": row_padded(row, s.columns),
@@ -451,17 +744,56 @@ class Worker:
             "epoch": getattr(row, "epoch", s.epoch),
         })
 
-    def feed(self, seq, epoch, data):
+        self.scroll_ordinal += 1
+        if self.transaction_scroll_bytes is not None:
+            item = self.scrolls[-1]
+            # Charge expanded cells, not compressed runs. Stop while speculative,
+            # before any journal ACK or live parser mutation; caller bisects input.
+            expanded = contract_row(item["row"], item["wrap"], item["pad"])
+            self.transaction_scroll_bytes += len(json.dumps(expanded).encode()) * 4
+            if self.transaction_scroll_bytes > 512 * 1024:
+                raise CaptureExpansionPressure()
+
+    def feed(self, seq, epoch, data, rx=None, more=False):
+        """Feed one D frame, or its first slice when `more` slices follow.
+
+        Returns False when the rest of the frame must be dropped (SIXEL).
+        """
+        self.packet_seq = seq
+        self.scroll_ordinal = 0
         self.screen.epoch = epoch
         self.screen.receive_seq = seq
         if self.seq_from is None:
             self.seq_from = seq
         self.seq_to = seq
         t = time.monotonic_ns()
+        if self.batch_ns is None:
+            self.batch_ns = t
+        waited = 0 if rx is None else max(0, t - rx[0])
+        if self.first_rx_ns is None:
+            self.first_rx_ns = t if rx is None else rx[0]
+            self.wait_ns = waited
+            if rx is not None:
+                self.read_lag_ns, self.read_lag_max_ns = rx[1], rx[2]
+        self.max_wait_ns = max(self.max_wait_ns, waited)
+        self.in_frames += 1
+        return self.feed_more(data, t)
+
+    def feed_more(self, data, t=None):
+        """Continue the D frame begun by feed(); stage counters are per frame."""
+        if t is None:
+            t = time.monotonic_ns()
+        self.in_bytes += len(data)
         data = self.filter_dcs(data)
         if data is not None:
             self.stream.feed(data)
         self.parse_ns += time.monotonic_ns() - t
+        return data is not None
+
+    def coalesce_due(self):
+        """One 60 Hz frame of parsing (or 256 KiB) since the batch began."""
+        return self.batch_ns is not None and (
+            time.monotonic_ns() - self.batch_ns >= MAX_COALESCE_NS or self.in_bytes >= MAX_COALESCE_BYTES)
 
     def filter_dcs(self, data):
         """Consume DCS without exposing its payload to pyte (which lacks DCS).
@@ -572,25 +904,229 @@ class Worker:
             },
             "parseNs": self.parse_ns,
             "encodeNs": encode_ns,
-        })
+            "stages": {
+                "inFrames": self.in_frames,
+                "inBytes": self.in_bytes,
+                "waitNs": self.wait_ns,
+                "maxWaitNs": self.max_wait_ns,
+                "holdNs": 0 if self.first_rx_ns is None else max(0, t - self.first_rx_ns),
+                "readLagNs": self.read_lag_ns,
+                "readLagMaxNs": self.read_lag_max_ns,
+            },
+        }, timed=True)
         s.dirty.clear()
         s.shift = 0
         if ack:
             self.emitted_seq = self.seq_to
+            # Partial (ack=False) emits leave the D frames to the next ack.
+            self.reset_stages()
         self.scrolls = []
         self.seq_from = None
         self.full = False
         self.parse_ns = 0
 
 
-def dispatch(worker, kind, payload):
+def contract_style(fg, bg, attrs):
+    result = [0]
+    names = ["black", "red", "green", "brown", "blue", "magenta", "cyan", "white"]
+    for color, base in ((fg, 30), (bg, 40)):
+        if color == "default": continue
+        if color in names: result.append(base + names.index(color))
+        elif color.startswith("bright") and color[6:] in names: result.append(base + 60 + names.index(color[6:]))
+        elif re.fullmatch("[0-9a-fA-F]{6}", color):
+            result.extend([base + 8, 2] + [int(color[i:i+2], 16) for i in (0, 2, 4)])
+        else: raise ValueError("unsupported checkpoint color")
+    for bit, code in enumerate((1, 3, 4, 9, 7, 5)):
+        if attrs & (1 << bit): result.append(code)
+    return result
+
+def contract_row(runs, wrap, pad):
+    cells = []
+    for fg, bg, attrs, text in runs:
+        style = contract_style(fg, bg, attrs)
+        for ch in text:
+            cells.append({"text": ch, "width": 0 if ch == "" else 1, "style": style})
+    for i in range(len(cells)-1):
+        if cells[i]["text"] and cells[i+1]["text"] == "": cells[i]["width"] = 2
+    return {"cells": cells, "softWrap": wrap, "wrapPad": int(pad), "uncertainFields": []}
+
+class CaptureExpansionPressure(Exception):
+    pass
+
+
+# A cursor is an ordinal in a deterministic replay of ONE immutable request.
+# No suspended Python generator, live worker, history list or token registry is
+# retained between RPCs. Replaying skips old rows before encoding them. This
+# trades CPU for bounded memory and permits retries after worker replacement.
+class CaptureRowPageFull(Exception):
+    pass
+
+
+class CaptureRowPage:
+    def __init__(self, worker, options):
+        self.worker = worker
+        self.start = options["startOrdinal"]
+        self.cap = options["maxBytes"]
+        if type(self.start) is not int or not 0 <= self.start <= 9007199254740991:
+            raise ValueError("row cursor")
+        if type(self.cap) is not int or not 8 <= self.cap <= 512 * 1024:
+            raise ValueError("row page budget")
+        self.ordinal = 0
+        self.rows = []
+        self.peak = 8
+        self.charge = 8  # [] JSON, four copies including encoding/IPC scratch
+
+    def collect(self, row):
+        ordinal = self.ordinal
+        self.ordinal += 1
+        self.worker.scroll_ordinal += 1
+        if ordinal < self.start:
+            return
+        if len(self.rows) >= 256:
+            raise CaptureRowPageFull()
+        s = self.worker.screen
+        # Check text before encode_row/contract_row can copy an oversized cell.
+        # Geometry is capped separately; this scan retains no per-cell list.
+        row_bound = 256
+        for x in range(s.columns):
+            text = row[x].data
+            if len(text) > self.cap:
+                raise CaptureExpansionPressure()
+            # JSON escaping is at most six bytes per input byte. SGR/cell
+            # fields and runs fit the fixed overhead per column in this codec.
+            row_bound += 4 * (len(text.encode("utf-8")) * 6 + 256)
+            if row_bound > self.cap - 8:
+                raise CaptureExpansionPressure()
+        if self.charge + row_bound > self.cap:
+            raise CaptureRowPageFull()
+        self.peak = max(self.peak, self.charge + row_bound)
+        content = contract_row(encode_row(row, s.columns, s.default_char),
+                               row_wrapped(row), row_padded(row, s.columns))
+        charge = len(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()) * 4
+        charge += 4 if self.rows else 0  # comma
+        if self.charge + charge > self.cap:
+            if not self.rows:
+                raise CaptureExpansionPressure()  # single row exceeds envelope
+            raise CaptureRowPageFull()
+        self.rows.append(content)
+        self.charge += charge
+
+    def result(self, complete):
+        if complete and self.ordinal < self.start:
+            raise ValueError("row cursor past end")
+        return {"scrolls": self.rows, "startOrdinal": self.start,
+                "nextOrdinal": self.start + len(self.rows),
+                "chargedBytes": self.charge, "peakBytes": self.peak, "complete": complete}
+
+
+def encode_extension(state):
+    raw = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(raw) > 8 * 1024 * 1024: raise ValueError("decoded checkpoint scratch budget")
+    return "z1:" + base64.b64encode(zlib.compress(raw)).decode("ascii")
+
+
+def decode_extension(value):
+    if not value.startswith("z1:"): raise ValueError("checkpoint extension codec")
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(base64.b64decode(value[3:], validate=True), 8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024 or not decoder.eof or decoder.unused_data:
+        raise ValueError("decoded checkpoint scratch budget")
+    return json.loads(raw)
+
+
+_transaction_scratch = None
+_transaction_state = None
+
+
+def checkpoint_transaction(request):
+    global _transaction_scratch, _transaction_state
+    state = request.get("state")
+    identity = request["identity"]
+    reused = state is not None and state == _transaction_state
+    if reused:
+        w = _transaction_scratch
+        w.scrolls = []
+        w.screen.on_scroll = w._on_scroll
+    elif state is None:
+        g = request["geometry"]
+        if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80): raise ValueError("geometry budget")
+        w = Worker(g["columns"], g["rows"], identity["sourceEpoch"])
+        w.gen = identity["geometryGeneration"]
+        w.screen.scroll_on_clear = request["scrollOnClear"]
+    else:
+        if state["codecVersion"] != CHECKPOINT_CODEC: raise ValueError("checkpoint codec")
+        w = Worker.from_checkpoint(decode_extension(state["extensionState"]), _transaction_scratch)
+        if w.contract_state() != state: raise ValueError("checkpoint envelope mismatch")
+    _transaction_scratch = w
+    _transaction_state = None  # every failure or partial page invalidates reuse
+    w.transaction_scroll_bytes = 0
+    page = CaptureRowPage(w, request["rowStream"]) if "rowStream" in request else None
+    if page is not None:
+        # Replace the hook BEFORE feeding even one byte. The old hook accumulates
+        # a packet and cannot pause halfway through erase/reset/scroll/reflow.
+        w.screen.on_scroll = page.collect
+    event = request.get("event")
+    try:
+        apply_checkpoint_event(w, event, identity)
+    except CaptureRowPageFull:
+        return page.result(False)
+    state = state if reused and not event else w.contract_state()
+    _transaction_state = state
+    active = state[state["active"]]
+    result = {"state": state, "scrolls": [contract_row(r["row"], r["wrap"], r["pad"]) for r in w.scrolls],
+            "frame": {"identity": identity, "screenRevision": request["screenRevision"],
+                      "buffer": state["active"], "geometry": state["geometry"],
+                      "changedRows": [{"y": y, "content": contract_row(
+                          encode_row(w.screen.buffer[y], w.screen.columns, w.screen.default_char),
+                          row_wrapped(w.screen.buffer[y]), row_padded(w.screen.buffer[y], w.screen.columns))}
+                          for y in range(w.screen.lines)],
+                      "cursor": active["cursor"], "overlap": None}}
+    if page is not None:
+        result.update(page.result(True))
+    return result
+
+
+def apply_checkpoint_event(w, event, identity):
+    if event:
+        p = event["payload"]; pos = event["position"]
+        if p["kind"] == "bytes":
+            if len(p["bytes"]) > 16384: raise ValueError("input cap")
+            if not w.feed(pos["packetSeq"], pos["sourceEpoch"], bytes(p["bytes"])):
+                raise ValueError("unsupported parser input")
+        elif p["kind"] == "resize":
+            g = p["geometry"]
+            if not (0 < g["columns"] <= 240 and 0 < g["rows"] <= 80): raise ValueError("resize budget")
+            w.packet_seq = pos["packetSeq"]; w.scroll_ordinal = 0
+            w.resize(p["geometry"]["columns"], p["geometry"]["rows"], identity["geometryGeneration"])
+        elif p["kind"] == "control" and p["name"] == "scroll-on-clear" and p["data"] in ("true", "false"):
+            w.screen.scroll_on_clear = p["data"] == "true"
+        else: raise ValueError("unsupported input control")
+
+
+def dispatch(worker, kind, payload, rx=None):
     """The same ordered command implementation for dedicated and shared parsers."""
-    if kind == b"D":
+    if kind == b"J":
+        if len(payload) > 4 * 1024 * 1024: raise ValueError("transaction request cap")
+        request = json.loads(payload)
+        # Isolate speculative history-clear/update events from live consumers.
+        global output_sink
+        previous_sink = output_sink
+        try:
+            output_sink = lambda packet: None
+            try:
+                result = checkpoint_transaction(request)
+            except CaptureExpansionPressure:
+                result = {"pressure": True}
+        finally:
+            output_sink = previous_sink
+        send(b"J", result)
+    elif kind == b"D":
         seq, epoch = struct.unpack(">QQ", payload[:16])
-        worker.feed(seq, epoch, payload[16:])
+        worker.feed(seq, epoch, payload[16:], rx)
     elif kind == b"C":
         worker.screen.scroll_on_clear = bool(payload[0])
     elif kind == b"X":
+        worker.packet_seq = None
         worker.screen.preserve_on_clear()
         if worker.pending():
             worker.emit()
@@ -601,7 +1137,21 @@ def dispatch(worker, kind, payload):
         worker.seq_to = old.seq_to
         worker.emitted_seq = old.emitted_seq
         worker.emit()
+    elif kind == b"V":
+        seq, epoch, cols, rows, gen = struct.unpack(">QQHHI", payload)
+        if not (0 < seq <= 9007199254740991 and epoch <= 9007199254740991
+                and 0 < cols <= 240 and 0 < rows <= 80):
+            raise ValueError("stream resize identity/geometry budget")
+        worker.packet_seq = seq
+        worker.scroll_ordinal = 0
+        worker.screen.epoch = epoch
+        worker.screen.receive_seq = seq
+        if worker.seq_from is None:
+            worker.seq_from = seq
+        worker.seq_to = seq
+        worker.resize(cols, rows, gen)
     elif kind == b"Z":
+        worker.packet_seq = None
         worker.resize(*struct.unpack(">HHI", payload[:8]))
     elif kind == b"F":
         worker.full = True
@@ -617,6 +1167,11 @@ def dispatch(worker, kind, payload):
 def multiplex(path):
     """Single-threaded fair selector; each connection owns parser and buffers.
 
+    A channel turn feeds at most MAX_TURN_NS of parser work, a D frame in
+    slices (slice_end) if need be; the unfinished frame stays in "partial" and
+    resumes first on the channel's next turn, so commands keep their order and
+    no update acknowledges a frame before all of it was fed. Updates coalesce
+    while the channel has more complete input, up to one 60 Hz frame of work.
     Slow consumers only stop reads on their own socket. No shared stdout queue
     can block healthy panes. A parser exception closes just that channel after
     an E marker; interpreter death closes ALL channels (host marks each pane).
@@ -632,6 +1187,7 @@ def multiplex(path):
     control_fd = sys.stdin.buffer.fileno()
     high_water = 1024 * 1024
     max_input = high_water + 65536 + 21
+    read_ahead = 65536
 
     def complete(c):
         b = c["input"]
@@ -642,6 +1198,7 @@ def multiplex(path):
         sock.close()
 
     print("MULTIPLEX_READY", flush=True)
+    polled_before = time.monotonic_ns()
     try:
         while True:
             readable = [server, control_fd]
@@ -649,17 +1206,31 @@ def multiplex(path):
             runnable = False
             for sock, c in channels.items():
                 if not c["closing"] and len(c["output"]) < high_water:
-                    readable.append(sock)
-                    runnable = runnable or complete(c)
+                    runnable = runnable or c["partial"] is not None or complete(c)
+                    # Read ahead at most one recv of unparsed input (more only to
+                    # finish a frame): short turns must not pull the backlog out
+                    # of the socket, where the host's data budget bounds it.
+                    if len(c["input"]) < read_ahead or not complete(c):
+                        readable.append(sock)
                 if c["output"]:
                     writable.append(sock)
+            called = time.monotonic_ns()
             reads, writes, _ = select.select(readable, writable, [], 0 if runnable else None)
+            # If select blocked, any readable channel became readable as it woke
+            # (earlier bytes would have woken it earlier). Otherwise the bytes
+            # arrived after the previous poll returned, provided the previous
+            # read drained the socket: a 64 KiB-capped read can leave older
+            # bytes behind, which this bound then understates.
+            polled = time.monotonic_ns()
+            since = polled if polled - called >= 1_000_000 else polled_before
+            polled_before = polled
             if control_fd in reads and not os.read(control_fd, 1024):
                 return  # Parent died: close all channels, leave no orphan interpreter.
             if server in reads:
                 sock, _ = server.accept()
                 sock.setblocking(False)
-                channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False}
+                channels[sock] = {"input": bytearray(), "output": bytearray(), "worker": None, "closing": False,
+                                  "rx": RxClock(), "partial": None}
             for sock, c in list(channels.items()):
                 output_sink = c["output"].extend
                 try:
@@ -667,38 +1238,62 @@ def multiplex(path):
                         n = sock.send(c["output"])
                         del c["output"][:n]
                     if sock in reads:
-                        data = sock.recv(65536)
+                        data = sock.recv(read_ahead)
                         if not data:
                             drop(sock)
                             continue
                         c["input"].extend(data)
+                        now = time.monotonic_ns()
+                        c["rx"].arrived(len(data), now, now - polled, now - since)
                     buf = c["input"]
                     if not c["closing"] and len(buf) >= 5 and struct.unpack(">I", buf[1:5])[0] > max_input:
                         raise ValueError("pane input exceeds frame bound")
                     began = time.monotonic_ns()
                     processed = 0
-                    while not c["closing"] and len(c["output"]) < high_water and complete(c):
-                        kind = bytes(buf[:1])
-                        length = struct.unpack(">I", buf[1:5])[0]
-                        if length > max_input:
-                            raise ValueError("pane input exceeds frame bound")
-                        payload = bytes(buf[5:5 + length])
-                        del buf[:5 + length]
-                        if c["worker"] is None:
-                            if kind != b"A":
-                                raise ValueError("pane must attach before data")
-                            cols, rows, epoch = struct.unpack(">HHQ", payload)
-                            if not (0 < cols <= 4096 and 0 < rows <= 4096):
-                                raise ValueError("invalid pane geometry")
-                            c["worker"] = Worker(cols, rows, epoch)
-                            send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
+                    while not c["closing"] and len(c["output"]) < high_water and (
+                            c["partial"] is not None or complete(c)):
+                        if c["partial"] is None:
+                            kind = bytes(buf[:1])
+                            length = struct.unpack(">I", buf[1:5])[0]
+                            if length > max_input:
+                                raise ValueError("pane input exceeds frame bound")
+                            payload = bytes(buf[5:5 + length])
+                            del buf[:5 + length]
+                            rx = c["rx"].completed(5 + length)
+                            if c["worker"] is None:
+                                if kind != b"A":
+                                    raise ValueError("pane must attach before data")
+                                cols, rows, epoch = struct.unpack(">HHQ", payload)
+                                if not (0 < cols <= 4096 and 0 < rows <= 4096):
+                                    raise ValueError("invalid pane geometry")
+                                c["worker"] = Worker(cols, rows, epoch)
+                                send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
+                            elif kind == b"D":
+                                seq, epoch = struct.unpack(">QQ", payload[:16])
+                                end = slice_end(payload, 16)
+                                more = end < len(payload)
+                                if c["worker"].feed(seq, epoch, payload[16:end], rx, more) and more:
+                                    c["partial"] = [payload, end]
+                                length = end
+                            else:
+                                c["worker"], c["closing"] = dispatch(c["worker"], kind, payload, rx)
+                            processed += length
                         else:
-                            c["worker"], c["closing"] = dispatch(c["worker"], kind, payload)
-                        processed += length
-                        if processed >= 65536 or time.monotonic_ns() - began >= MAX_COALESCE_NS:
+                            payload, start = c["partial"]
+                            end = slice_end(payload, start)
+                            if c["worker"].feed_more(payload[start:end]) and end < len(payload):
+                                c["partial"][1] = end
+                            else:
+                                c["partial"] = None
+                            processed += end - start
+                        if processed >= 65536 or time.monotonic_ns() - began >= MAX_TURN_NS:
                             break
-                    if c["worker"] is not None and c["worker"].pending():
-                        c["worker"].emit()
+                        if c["partial"] is None and c["worker"] is not None and c["worker"].coalesce_due():
+                            break  # Emit at this frame boundary: a 60 Hz frame of work is due.
+                    w = c["worker"]
+                    if w is not None and c["partial"] is None and w.pending() and (
+                            c["closing"] or not complete(c) or w.coalesce_due()):
+                        w.emit()
                     if c["closing"] and not c.get("quit_ack"):
                         send(b"B", {"workerEof": True})
                         c["quit_ack"] = True
@@ -714,6 +1309,7 @@ def multiplex(path):
                     c["closing"] = True
                     c["quit_ack"] = True
                     c["worker"] = None
+                    c["partial"] = None
                     c["input"].clear()
                 finally:
                     output_sink = None
@@ -730,14 +1326,22 @@ def main():
     send(b"R", {"vendorSha256": VENDOR_DIGEST, "cols": cols, "rows": rows, "pid": os.getpid()})
     fd = os.open(sys.argv[3], os.O_RDONLY) if len(sys.argv) > 3 else sys.stdin.buffer.fileno()
     buf = bytearray()
+    rx = RxClock()
     batch_started = None
     batch_bytes = 0
     eof = False
+    returned = time.monotonic_ns()
     while not eof:
+        called = time.monotonic_ns()
         chunk = os.read(fd, 1 << 16)
         if not chunk:
             eof = True
         buf.extend(chunk)
+        # A read that blocked returned as its bytes arrived; one that did not
+        # block got bytes that waited while the loop was busy since the
+        # previous read returned (same 64 KiB-cap caveat as the multiplexer).
+        previous, returned = returned, time.monotonic_ns()
+        rx.arrived(len(chunk), returned, 0, 0 if returned - called >= 1_000_000 else returned - previous)
         while len(buf) >= 5:
             kind = bytes(buf[0:1])
             length = struct.unpack(">I", buf[1:5])[0]
@@ -745,11 +1349,12 @@ def main():
                 break
             payload = bytes(buf[5:5 + length])
             del buf[:5 + length]
+            rx_at = rx.completed(5 + length)
             if kind == b"D":
                 if batch_started is None:
                     batch_started = time.monotonic_ns()
                 batch_bytes += len(payload) - 16
-            worker, eof = dispatch(worker, kind, payload)
+            worker, eof = dispatch(worker, kind, payload, rx_at)
             if kind == b"X":
                 batch_started = None
                 batch_bytes = 0

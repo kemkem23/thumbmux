@@ -103,9 +103,28 @@ beforeAll(async () => {
 import { mount, createRawSnippet } from "svelte";
 import TermHud from ${JSON.stringify(join(here, "../src/TermHud.svelte"))};
 import SessionGridHost from ${JSON.stringify(join(here, "./SessionGridHost.svelte"))};
+import ActionFab from ${JSON.stringify(join(here, "../src/ActionFab.svelte"))};
 
 const cfg = window.__hudProps ?? {};
-if (cfg.component === "grid") {
+if (cfg.component === "fab") {
+  // The 15 actions /m/t composes for a Claude session (3 preset sends, font,
+  // shortcuts, d-pad, type, upload, 2 copies, fork, clear, kill, settings).
+  const labels = ["ไปต่อ", "ลุย", "อธิบาย", "A+ ตัวหนังสือใหญ่ขึ้น", "A− ตัวหนังสือเล็กลง",
+    "⚡ จัดการ shortcuts", "✚ ลูกศร", "⌨ พิมพ์", "📎 อัปโหลดไฟล์", "⧉ คัดลอก",
+    "⧉ คัดลอกทั้งจอ", "⑂ fork", "CLEAR CONTEXT", "KILL SESSION", "⚙ ตั้งค่า session"];
+  mount(ActionFab, {
+    target: document.getElementById("app"),
+    props: {
+      open: true,
+      active: true,
+      actions: labels.map((label, index) => ({
+        id: "a" + index, label, testid: "fab-a" + index, primary: index < 3,
+        tag: index < 3 ? "SEND" : undefined, onTap() {},
+      })),
+      onFab() {},
+    },
+  });
+} else if (cfg.component === "grid") {
   const palette = {
     defaultFg: "#eeeeee",
     defaultBg: "#111111",
@@ -127,6 +146,7 @@ if (cfg.component === "grid") {
       onNew() {},
       cardLayout: "dense",
       showNew: false,
+      controls: !!cfg.controls,
     },
   });
   window.__replaceDenseSessions = (next) => gridHost.replaceSessions(next);
@@ -403,7 +423,10 @@ async function focusRingPixels(page: Page, png: Uint8Array): Promise<{
   }, src);
 }
 
-async function renderDenseGrid(context: BrowserContext): Promise<Page> {
+async function renderDenseGrid(
+  context: BrowserContext,
+  opts: { controls?: boolean } = {},
+): Promise<Page> {
   const page = await context.newPage();
   await page.setContent(
     `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>
@@ -416,7 +439,7 @@ async function renderDenseGrid(context: BrowserContext): Promise<Page> {
         --hub-ink: #1a1a1a; --hub-ink2: #6b6560; --hub-accent: #c45200;
       }
     </style></head><body><div id="app"></div>
-    <script>window.__hudProps = { component: "grid" }; window.__hudReady = false;</script>
+    <script>window.__hudProps = ${JSON.stringify({ component: "grid", controls: !!opts.controls })}; window.__hudReady = false;</script>
     <script type="module">${bundle.replaceAll("</script", "<\\/script")}</script>
     </body></html>`,
     { waitUntil: "load" },
@@ -573,7 +596,10 @@ describe("dense HUD browser layout", () => {
   test(
     "wraps all metadata without collapsing activity or overflowing the narrow bar",
     async () => {
-      const page = await browser.newPage({ viewport: { width: 320, height: 500 } });
+      // A narrow HUD inside a wider window (split pane, side panel). The phone
+      // breakpoint is viewport-based (≤480px) and has its own case below;
+      // this one pins the wrap contract everywhere else.
+      const page = await browser.newPage({ viewport: { width: 600, height: 500 } });
       try {
         const measurement = await renderDense(page, {
           width: 280,
@@ -994,6 +1020,368 @@ describe("dense SessionGrid browser layout", () => {
       expect(metrics.openHeight).toBe(metrics.cardHeight - metrics.headHeight - 2);
       expect(metrics.thumbBackground).toBe("rgb(102, 102, 102)");
       expect(metrics.pageWidth).toBeLessThanOrEqual(metrics.viewportWidth);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+});
+
+// ─── UI-COMPACT lot D: phone HUD, short-screen grid, ActionFab ───────────────
+
+type PhoneHud = {
+  hudHeight: number;
+  hudClientWidth: number;
+  hudScrollWidth: number;
+  titleTop: number;
+  titleBottom: number;
+  titleRight: number;
+  titleClientWidth: number;
+  titleScrollWidth: number;
+  noteTop: number;
+  noteBottom: number;
+  noteLeft: number;
+  noteClientHeight: number;
+  noteScrollWidth: number;
+  noteClientWidth: number;
+  noteLineHeight: number;
+  noteTextOverflow: string;
+  expandTop: number;
+  expandRight: number;
+  hudRight: number;
+  adornTop: number | null;
+  adornClientHeight: number | null;
+  adornLineHeight: number | null;
+  adornVisibility: string | null;
+};
+
+async function renderPhoneHud(
+  page: Page,
+  opts: { width: number; title: string; note: string; adorn?: string },
+): Promise<PhoneHud> {
+  await page.setContent(
+    `<!doctype html><html><head><style>
+       * { box-sizing: border-box; }
+       body { margin: 0; ${HUD_VARS} }
+       #app { position: relative; width: ${opts.width}px; }
+       .host-chip { font: inherit; }
+     </style></head><body><div id="app"></div>
+     <script>window.__hudProps = ${JSON.stringify({
+       title: opts.title,
+       note: opts.note,
+       adorn: opts.adorn ?? "",
+       layout: "dense",
+     })}; window.__hudReady = false;</script>
+     <script type="module">${bundle.replaceAll("</script", "<\\/script")}</script>
+     </body></html>`,
+    { waitUntil: "load" },
+  );
+  await page.waitForFunction(() => (window as unknown as { __hudReady?: boolean }).__hudReady);
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  return page.evaluate(() => {
+    const hud = document.querySelector<HTMLElement>(".hud-top")!;
+    const title = document.querySelector<HTMLElement>('[data-testid="hud-copy-title"]')!;
+    const note = document.querySelector<HTMLElement>(".hud-note-dense")!;
+    const expand = document.querySelector<HTMLElement>('[data-testid="hud-expand"]')!;
+    const adorn = document.querySelector<HTMLElement>('[data-testid="hud-title-adornment"]');
+    const hudRect = hud.getBoundingClientRect();
+    const titleRect = title.getBoundingClientRect();
+    const noteRect = note.getBoundingClientRect();
+    const noteStyle = getComputedStyle(note);
+    const lineHeight = (style: CSSStyleDeclaration) =>
+      Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.7;
+    return {
+      hudHeight: hudRect.height,
+      hudClientWidth: hud.clientWidth,
+      hudScrollWidth: hud.scrollWidth,
+      titleTop: titleRect.top,
+      titleBottom: titleRect.bottom,
+      titleRight: titleRect.right,
+      titleClientWidth: title.clientWidth,
+      titleScrollWidth: title.scrollWidth,
+      noteTop: noteRect.top,
+      noteBottom: noteRect.bottom,
+      noteLeft: noteRect.left,
+      noteClientHeight: note.clientHeight,
+      noteScrollWidth: note.scrollWidth,
+      noteClientWidth: note.clientWidth,
+      noteLineHeight: lineHeight(noteStyle),
+      noteTextOverflow: noteStyle.textOverflow,
+      expandTop: expand.getBoundingClientRect().top,
+      expandRight: expand.getBoundingClientRect().right,
+      hudRight: hudRect.right,
+      adornTop: adorn ? adorn.getBoundingClientRect().top : null,
+      adornClientHeight: adorn ? adorn.clientHeight : null,
+      adornLineHeight: adorn ? lineHeight(getComputedStyle(adorn)) : null,
+      adornVisibility: adorn ? getComputedStyle(adorn).visibility : null,
+    };
+  });
+}
+
+const PHONE_NOTE = "fixture note — ไม่ใช่ session จริง และยังมีรายละเอียดต่อท้ายอีกยาวพอให้เกินหนึ่งบรรทัดของจอโทรศัพท์";
+
+describe("UI-COMPACT phone HUD (≤480px)", () => {
+  for (const width of [360, 375, 390]) {
+    test(`${width}px: name and note share one 44px row, HUD ≤ 49px`, async () => {
+      const page = await browser.newPage({ viewport: { width, height: 700 } });
+      try {
+        const m = await renderPhoneHud(page, { width, title: "uic-fixture-cc-1", note: PHONE_NOTE });
+        // Same row: the note sits inside the title's 44px band, beside it.
+        expect(m.noteTop).toBeGreaterThanOrEqual(m.titleTop - 1);
+        expect(m.noteBottom).toBeLessThanOrEqual(m.titleBottom + 1);
+        expect(m.noteLeft).toBeGreaterThan(m.titleRight);
+        expect(Math.abs(m.expandTop - m.titleTop)).toBeLessThanOrEqual(1);
+        // One line, cut with an ellipsis rather than wrapped.
+        expect(m.noteClientHeight).toBeLessThanOrEqual(m.noteLineHeight + 1);
+        expect(m.noteScrollWidth).toBeGreaterThan(m.noteClientWidth);
+        expect(m.noteTextOverflow).toBe("ellipsis");
+        // The name is not the casualty: a short name is shown whole.
+        expect(m.titleClientWidth).toBeGreaterThanOrEqual(m.titleScrollWidth);
+        expect(m.hudHeight).toBeLessThanOrEqual(49);
+        expect(m.hudScrollWidth).toBeLessThanOrEqual(m.hudClientWidth + 1);
+        expect(m.expandRight).toBeLessThanOrEqual(m.hudRight + 1);
+      } finally {
+        await page.close();
+      }
+    }, 120_000);
+  }
+
+  test("a long name is cut with … and still leaves the note a share of the row", async () => {
+    const page = await browser.newPage({ viewport: { width: 360, height: 700 } });
+    try {
+      const m = await renderPhoneHud(page, {
+        width: 360,
+        title: "codex-example-very-long-session-name-20260819",
+        note: PHONE_NOTE,
+      });
+      expect(m.titleScrollWidth).toBeGreaterThan(m.titleClientWidth);
+      expect(m.noteClientWidth).toBeGreaterThanOrEqual(44);
+      expect(m.hudHeight).toBeLessThanOrEqual(49);
+      expect(m.hudScrollWidth).toBeLessThanOrEqual(m.hudClientWidth + 1);
+    } finally {
+      await page.close();
+    }
+  }, 120_000);
+
+  test("activity keeps one visible line on the row below the name", async () => {
+    const page = await browser.newPage({ viewport: { width: 360, height: 700 } });
+    try {
+      const m = await renderPhoneHud(page, {
+        width: 360,
+        title: "uic-fixture-cc-1",
+        note: PHONE_NOTE,
+        adorn: "กำลังรัน browser integration tests ชุดใหญ่ พร้อมตรวจ responsive layout และ regression cases อีกหลายรายการ",
+      });
+      expect(m.adornVisibility).toBe("visible");
+      expect(m.adornTop!).toBeGreaterThanOrEqual(m.titleBottom - 1);
+      expect(m.adornClientHeight!).toBeLessThanOrEqual(m.adornLineHeight! + 1);
+      expect(m.noteBottom).toBeLessThanOrEqual(m.titleBottom + 1);
+      // 49px row + one activity line, against 93px+ before.
+      expect(m.hudHeight).toBeLessThanOrEqual(49 + m.adornLineHeight! + 1);
+    } finally {
+      await page.close();
+    }
+  }, 120_000);
+});
+
+type DenseHeadMetrics = {
+  headHeight: number;
+  killWidth: number;
+  killHeight: number;
+  noteLineClamp: string;
+  noteHeight: number;
+  noteLineHeight: number;
+};
+
+async function denseHead(page: Page): Promise<DenseHeadMetrics> {
+  return page.locator('[data-testid="grid-card"]').first().evaluate((card) => {
+    const head = card.querySelector<HTMLElement>('[data-testid="grid-dense-head"]')!;
+    const kill = card.querySelector<HTMLElement>('[data-testid="grid-kill"]')!;
+    const note = card.querySelector<HTMLElement>('[data-testid="grid-note"]')!;
+    const noteStyle = getComputedStyle(note);
+    return {
+      headHeight: head.getBoundingClientRect().height,
+      killWidth: kill.getBoundingClientRect().width,
+      killHeight: kill.getBoundingClientRect().height,
+      noteLineClamp: noteStyle.getPropertyValue("-webkit-line-clamp"),
+      noteHeight: note.clientHeight,
+      noteLineHeight: Number.parseFloat(noteStyle.lineHeight),
+    };
+  });
+}
+
+describe("UI-COMPACT dense SessionGrid on short / narrow screens", () => {
+  test("mouse on a ≤820px-tall window: 44px header, × stays ≥ 24px, 500px cards kept", async () => {
+    const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    try {
+      const page = await renderDenseGrid(context);
+      const head = await denseHead(page);
+      expect(head.headHeight).toBe(44);
+      expect(head.killHeight).toBe(44);
+      expect(head.killWidth).toBe(36);
+      expect(head.noteLineClamp).toBe("2");
+      expect(head.noteHeight).toBeLessThanOrEqual(head.noteLineHeight * 2 + 1);
+      const cards = await gridMetrics(page);
+      expect(cards.map((card) => card.width)).toEqual([500, 500]);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("800×600 mouse: two square cards share the width instead of one 500px card", async () => {
+    const context = await browser.newContext({ viewport: { width: 800, height: 600 } });
+    try {
+      const page = await renderDenseGrid(context);
+      const cards = await gridMetrics(page);
+      expect(cards).toHaveLength(2);
+      expect(Math.abs(cards[0]!.top - cards[1]!.top)).toBeLessThan(1);
+      expect(cards[0]!.width).toBeGreaterThan(380);
+      expect(Math.abs(cards[0]!.width - cards[1]!.width)).toBeLessThan(1);
+      expect(Math.abs(cards[0]!.height - cards[0]!.width)).toBeLessThan(1);
+      expect(cards[1]!.left + cards[1]!.width).toBeLessThanOrEqual(800);
+      expect(cards[0]!.pageWidth).toBeLessThanOrEqual(cards[0]!.viewportWidth);
+      expect((await denseHead(page)).headHeight).toBe(44);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("touch keeps the 72px header and gets 44px filter / search / group controls", async () => {
+    const context = await browser.newContext({
+      viewport: { width: 360, height: 640 },
+      isMobile: true,
+      hasTouch: true,
+    });
+    try {
+      const page = await renderDenseGrid(context, { controls: true });
+      expect((await denseHead(page)).headHeight).toBe(72);
+      const heights = await page.locator(
+        '[data-testid="grid-controls"] button, [data-testid="grid-controls"] input',
+      ).evaluateAll((elements) => elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return Math.min(rect.width, rect.height);
+      }));
+      expect(heights.length).toBeGreaterThanOrEqual(4);
+      for (const side of heights) expect(side).toBeGreaterThanOrEqual(44);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+});
+
+type FabMetrics = {
+  display: string;
+  total: number;
+  fullyVisible: number;
+  minHeight: number;
+  minGap: number;
+  moreAbove: boolean;
+  moreBelow: boolean;
+  maskImage: string;
+  pageWidth: number;
+};
+
+async function renderFab(context: BrowserContext): Promise<FabMetrics> {
+  const page = await context.newPage();
+  await page.setContent(
+    `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      body { ${HUD_VARS} }
+      #app { position: relative; width: 100vw; height: 100dvh; }
+    </style></head><body><div id="app"></div>
+    <script>window.__hudProps = { component: "fab" }; window.__hudReady = false;</script>
+    <script type="module">${bundle.replaceAll("</script", "<\\/script")}</script>
+    </body></html>`,
+    { waitUntil: "load" },
+  );
+  await page.waitForFunction(() => (window as unknown as { __hudReady?: boolean }).__hudReady);
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  return page.evaluate(() => {
+    const slots = document.querySelector<HTMLElement>('[data-testid="fab-slots"]')!;
+    const box = slots.getBoundingClientRect();
+    const rects = Array.from(slots.querySelectorAll<HTMLElement>(".slot")).map((slot) => slot.getBoundingClientRect());
+    const inside = (r: DOMRect) => r.top >= Math.max(0, box.top) - 0.5
+      && r.bottom <= Math.min(window.innerHeight, box.bottom) + 0.5
+      && r.left >= Math.max(0, box.left) - 0.5
+      && r.right <= Math.min(window.innerWidth, box.right) + 0.5;
+    let minGap = Infinity;
+    for (const a of rects) {
+      for (const b of rects) {
+        if (a === b) continue;
+        const dx = Math.max(0, Math.max(a.left, b.left) - Math.min(a.right, b.right));
+        const dy = Math.max(0, Math.max(a.top, b.top) - Math.min(a.bottom, b.bottom));
+        minGap = Math.min(minGap, Math.hypot(dx, dy));
+      }
+    }
+    const style = getComputedStyle(slots);
+    return {
+      display: style.display,
+      total: rects.length,
+      fullyVisible: rects.filter(inside).length,
+      minHeight: Math.min(...rects.map((r) => r.height)),
+      minGap,
+      moreAbove: slots.classList.contains("more-above"),
+      moreBelow: slots.classList.contains("more-below"),
+      maskImage: style.maskImage || style.getPropertyValue("-webkit-mask-image"),
+      pageWidth: document.documentElement.scrollWidth,
+    };
+  });
+}
+
+describe("UI-COMPACT ActionFab: every action on screen", () => {
+  const SHORT: Array<{ name: string; width: number; height: number; touch: boolean; minHeight: number }> = [
+    { name: "1366×768 mouse", width: 1366, height: 768, touch: false, minHeight: 36 },
+    { name: "1024×600 mouse", width: 1024, height: 600, touch: false, minHeight: 36 },
+    { name: "800×600 mouse", width: 800, height: 600, touch: false, minHeight: 36 },
+    { name: "390×844 phone", width: 390, height: 844, touch: true, minHeight: 44 },
+    { name: "375×667 phone", width: 375, height: 667, touch: true, minHeight: 44 },
+    { name: "360×640 phone", width: 360, height: 640, touch: true, minHeight: 44 },
+  ];
+  for (const vp of SHORT) {
+    test(`${vp.name}: 15/15 visible in two columns, no scroll cue needed`, async () => {
+      const context = await browser.newContext({
+        viewport: { width: vp.width, height: vp.height },
+        isMobile: vp.touch,
+        hasTouch: vp.touch,
+      });
+      try {
+        const m = await renderFab(context);
+        expect(m.display).toBe("grid");
+        expect(m.total).toBe(15);
+        expect(m.fullyVisible).toBe(15);
+        expect(m.minHeight).toBeGreaterThanOrEqual(vp.minHeight);
+        expect(m.minGap).toBeGreaterThanOrEqual(8 - 0.5);
+        expect(m.moreAbove || m.moreBelow).toBe(false);
+        expect(m.pageWidth).toBeLessThanOrEqual(vp.width);
+      } finally {
+        await context.close();
+      }
+    }, 120_000);
+  }
+
+  test("1920×1080 keeps the single 46px column", async () => {
+    const context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
+    try {
+      const m = await renderFab(context);
+      expect(m.display).toBe("flex");
+      expect(m.fullyVisible).toBe(15);
+      expect(m.minHeight).toBeGreaterThanOrEqual(46);
+    } finally {
+      await context.close();
+    }
+  }, 120_000);
+
+  test("a window too short even for two columns fades the edge it can scroll past", async () => {
+    const context = await browser.newContext({ viewport: { width: 1024, height: 360 } });
+    try {
+      const m = await renderFab(context);
+      expect(m.fullyVisible).toBeLessThan(15);
+      expect(m.moreAbove || m.moreBelow).toBe(true);
+      expect(m.maskImage).toContain("linear-gradient");
     } finally {
       await context.close();
     }

@@ -454,6 +454,8 @@ export class TmuxWsMux<
   private projection: MuxProjectionSource | null;
   /** Projection change subscriptions of routed sessions with viewers. */
   private projectionWatches = new Map<string, () => void>();
+  /** Allocated only for async history; a rejoined socket is a new consumer. */
+  private projectedHistoryLifetimes = new WeakMap<WS, Map<string, object>>();
   /** newarch-frame-v1 of the last projected snapshot sent per session. */
   private lastNewarch = new Map<string, NewarchFrameMeta>();
   private projectionRouteOff: (() => void) | null = null;
@@ -603,6 +605,7 @@ export class TmuxWsMux<
       this.subscribers.set(session, set);
     }
 
+    this.projectedHistoryLifetimes.get(ws)?.delete(session);
     set.add(ws);
     this.projection?.setViewers?.(session, set.size);
     // Tail mode (thumbnails): stream only the last N lines to this socket.
@@ -728,6 +731,7 @@ export class TmuxWsMux<
   }
 
   unsubscribe(session: string, ws: WS, client?: unknown) {
+    this.projectedHistoryLifetimes.get(ws)?.delete(session);
     this.hooks.onUnsubscribe?.(session, ws, client);
     this.tails.get(session)?.delete(ws);
     this.forgetOutputViewer(session, ws);
@@ -744,6 +748,7 @@ export class TmuxWsMux<
   }
 
   unsubscribeAll(ws: WS) {
+    this.projectedHistoryLifetimes.delete(ws);
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
     this.sessionListClients.delete(ws);
@@ -1179,6 +1184,7 @@ export class TmuxWsMux<
    * immediate captures, pipe debounces) and stop active pipes. For hosts
    * that create short-lived muxes (tests, per-request servers). */
   stop() {
+    this.projectedHistoryLifetimes = new WeakMap();
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
     if (this.burstTimer) { clearTimeout(this.burstTimer); this.burstTimer = null; }
@@ -1786,12 +1792,38 @@ export class TmuxWsMux<
     } catch {}
   }
 
+  private sendProjectedHistoryAsync(session: string, ws: WS, result: PromiseLike<unknown>): void {
+    const generation = this.projection?.routeGeneration(session);
+    const subscribers = this.subscribers.get(session);
+    let lifetimes = this.projectedHistoryLifetimes.get(ws);
+    if (!lifetimes) this.projectedHistoryLifetimes.set(ws, lifetimes = new Map());
+    let lifetime = lifetimes.get(session);
+    if (!lifetime) lifetimes.set(session, lifetime = {});
+    const current = () => this.projection?.owns(session)
+      && this.projection.routeGeneration(session) === generation
+      && this.subscribers.get(session) === subscribers && subscribers?.has(ws)
+      && this.projectedHistoryLifetimes.get(ws)?.get(session) === lifetime;
+    void Promise.resolve(result).then(page => {
+      if (!current()) return;
+      this.wsSend(ws, JSON.stringify({channel: session, type: 'history', data: JSON.stringify(boundProjectedHistoryPage(page))}));
+    }).catch(error => {
+      if (!current()) return;
+      this.reportArchiveReadErrorBestEffort('readBefore', session, error);
+      this.sendHistoryReadErrorBestEffort(session, ws);
+    });
+  }
+
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = boundProjectedHistoryPage(this.projection.readBefore(session, beforeLine ?? null, limit));
+        const result = this.projection.readBefore(session, beforeLine ?? null, limit);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
+          return;
+        }
+        history = boundProjectedHistoryPage(result);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readBefore", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);
@@ -1849,7 +1881,12 @@ export class TmuxWsMux<
     let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        history = boundProjectedHistoryPage(this.projection.readAfter(session, afterLine, limit));
+        const result = this.projection.readAfter(session, afterLine, limit);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
+          return;
+        }
+        history = boundProjectedHistoryPage(result);
       } catch (e: unknown) {
         this.reportArchiveReadErrorBestEffort("readAfter", session, e);
         this.sendHistoryReadErrorBestEffort(session, ws);

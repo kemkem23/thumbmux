@@ -86,12 +86,12 @@ test("a throwing live boundary returns a retryable error without reading a dupli
 
 // ── NEWARCH L2-I lot I4: the projection live window and its seam ─────────────
 import { muxHistoryBoundaryTransition, validateMuxHistoryBoundary, validateNewarchFrameMeta } from "../../core/src/protocol";
-import { BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOverlap, type PipeHistoryPane } from "../src/pipe-history-runtime";
+import { cellsToAnsi, BLANK_CELL, ProjectionLiveWindow, parserRowCells, screenOverlap, type PipeHistoryPane } from "../src/pipe-history-runtime";
 
 /** A pane double with exactly the surface the live window reads. */
 function fakePane(cols = 20, rows = 4) {
   const paneKey = { serverIdentity: "srv", paneId: "%7", birthGeneration: 1 };
-  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof parserRowCells>; softWrap: boolean; ansi?: string }> = [];
+  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof parserRowCells>; softWrap: boolean; ansiCache: { text?: string } }> = [];
   let next = 0, revision = 0, kind: "normal" | "alternate" = "normal", sourceEpoch = 1;
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
   const pane = {
@@ -110,7 +110,7 @@ function fakePane(cols = 20, rows = 4) {
   };
   return {
     pane: pane as unknown as PipeHistoryPane,
-    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false }); next++; revision++; } },
+    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false, ansiCache: {} }); next++; revision++; } },
     alt(on: boolean) { kind = on ? "alternate" : "normal"; revision++; },
     epoch() { sourceEpoch++; revision++; },
   };
@@ -192,7 +192,7 @@ function calibratedPane(ring: string[], screen: string[], pulledBack: { rows: nu
   const cols = 12;
   const paneKey = { serverIdentity: "srv", paneId: "%9", birthGeneration: 1 };
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
-  const rows = ring.map((text, lineId) => ({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: row(text), softWrap: false }));
+  const rows = ring.map((text, lineId) => ({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells: row(text), softWrap: false, ansiCache: {} }));
   const token = { paneKey, sourceEpoch: 1, geometryGeneration: 0, revision: 1, durableRevision: 1, nextLineId: ring.length };
   const pane = {
     paneKey,
@@ -260,7 +260,7 @@ import { decodeFrameCells, encodeFrameCells, validateFrame } from "../src/sqlite
 function issuePane(cols = 20, rows = 4) {
   const paneKey = { serverIdentity: "srv", paneId: "%8", birthGeneration: 1 };
   const row = (text: string) => parserRowCells([["default", "default", 0, text.padEnd(cols).slice(0, cols)]], cols);
-  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof row>; softWrap: boolean; ansi?: string }> = [];
+  const ring: Array<{ lineId: number; sourceEpoch: number; geometryGeneration: number; cells: ReturnType<typeof row>; softWrap: boolean; ansiCache: { text?: string } }> = [];
   const issues: any[] = [];
   let next = 0, revision = 0;
   const pane: any = {
@@ -275,9 +275,9 @@ function issuePane(cols = 20, rows = 4) {
   };
   return {
     pane: pane as PipeHistoryPane,
-    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false }); next++; revision++; } },
+    append(n: number) { for (let i = 0; i < n; i++) { ring.push({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row(`row ${next}`), softWrap: false, ansiCache: {} }); next++; revision++; } },
     issue(lineId: number, kind = "gap") { issues.push({ kind, reason: kind, missingCount: null, boundaryLineId: lineId, revision: ++revision }); },
-    repair(lineId: number, text: string) { const r = ring.find((x) => x.lineId === lineId)!; r.cells = row(text); r.ansi = undefined; pane.ringRepairs++; revision++; },
+    repair(lineId: number, text: string) { const r = ring.find((x) => x.lineId === lineId)!; r.cells = row(text); r.ansiCache = {}; pane.ringRepairs++; revision++; },
   };
 }
 
@@ -442,4 +442,374 @@ test("CANARY-FIX M: a pipe frame reaches viewers only after its RAM receipt, and
     expect(pane.pendingReceipts()).toBe(0);
     expect(pane.stats.latencyMs).toHaveLength(1);
   } finally { await runtime.close(); }
+});
+
+// ── NEWARCH2 M3: row ownership — frozen shared rows, certified ids on the ring floor, one canonical row per capture row ──
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { PipeHistoryPane as M3Pane, PipeHistoryRuntime as M3Runtime, applyFrameDelta, canonicalCaptureCells } from "../src/pipe-history-runtime";
+import { TmuxCaptureDecoder } from "../src/tmux-capture-normalize";
+// Namespace reads: on a runtime without the M3 surface only these tests fail, not the whole file.
+import * as M3 from "../src/pipe-history-runtime";
+import * as N3 from "../src/tmux-capture-normalize";
+const { canonicalCaptureDecoder, decodeCanonicalCapture, pipeHistoryAllocations, sharedBlankRow } = M3 as any as {
+  canonicalCaptureDecoder(cols: number): TmuxCaptureDecoder;
+  decodeCanonicalCapture(decoder: TmuxCaptureDecoder, body: string): Array<Array<{ grapheme: string }>>;
+  pipeHistoryAllocations(): Record<string, number>;
+  sharedBlankRow(cols: number): typeof BLANK_CELL[];
+};
+const CACHE_BYTE_MODEL = (N3 as any).CACHE_BYTE_MODEL as Record<"slot" | "arrayHeader" | "object" | "stringHeader" | "char" | "mapEntry" | "setEntry", number>;
+
+/** A real PipeHistoryPane (no parser, no calibrator timer) over a store double that assigns line ids. */
+function m3Harness(opts: { ringRows?: number; cols?: number; rows?: number } = {}) {
+  const cols = opts.cols ?? 12, rows = opts.rows ?? 2;
+  const paneKey = { serverIdentity: "m3", paneId: "%3", birthGeneration: 1 };
+  let next = 0, revision = 0, hold: Promise<void> | null = null, body = "";
+  let meta = { cols, rows, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 100, panePid: 1, mouseSgr: false, mouseAny: false };
+  const calibrations: any[] = [];
+  const store = {
+    token: () => ({ paneKey, sourceEpoch: 1, geometryGeneration: 0, revision, durableRevision: 0, nextLineId: next }),
+    calibrate: async (input: unknown) => { calibrations.push(input); if (hold) await hold; return { revision: ++revision, durableRevision: 0, nextLineId: next }; },
+    replaceScreen: async () => ({ accepted: true, revision: ++revision, durableRevision: 0, nextLineId: next }),
+    recordIssue: async () => ({ revision }),
+    health: () => ({ panes: [] }),
+  };
+  const runtime = new M3Runtime({ sharedParser: false, ringRows: opts.ringRows ?? 8, store: store as never });
+  const pane = new M3Pane(runtime, {
+    paneKey, session: "m3", calibrate: false, commitIntervalMs: 0, meta,
+    capture: async () => ({ captureId: `c${revision}`, requestedAt: 0, completedAt: 0, before: meta, after: meta, body, tail: 0 }),
+  });
+  const p = pane as any;
+  const row = (text: string, width = cols) => parserRowCells([["default", "default", 0, text.padEnd(width).slice(0, width)]], width);
+  const h = {
+    runtime, pane, p, calibrations, cols, row,
+    async close() { await pane.close(); await runtime.close(); },
+    add(n: number, sourceEpoch = 1, geometryGeneration = 0) {
+      for (let i = 0; i < n; i++) { p.remember({ lineId: next, sourceEpoch, geometryGeneration, cells: row(`r${next}`), softWrap: false }); next++; revision++; }
+    },
+    certified: () => p.certified as Set<number>,
+    setBody(value: string) { body = value; },
+    setMeta(value: Partial<typeof meta>) { meta = { ...meta, ...value }; },
+    hold(value: Promise<void> | null) { hold = value; },
+    /** One calibration commit: a captured row per check id and per repaired id. */
+    commit(checks: number[], repairs: Array<[number, string]> = []) {
+      const history = [...checks.map((id) => ({ cells: row(`r${id}`), softWrap: false })), ...repairs.map(([, text]) => ({ cells: row(text), softWrap: false }))];
+      const cmeta = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 0, cols, rows, kind: "normal" as const, cursor: { x: 0, y: 0, visible: true } };
+      const capture = { paneKey, captureId: `k${revision}`, requestedAt: 0, completedAt: 0, before: cmeta, after: cmeta,
+        frame: { cells: [], cursor: cmeta.cursor, kind: "normal", geometryGeneration: 0, receiveSeq: -1 }, history, completeRetainedTail: true, observedFields: [] };
+      return p.commitCalibration({
+        capture, expectedRevision: revision, captureEvidence: { kind: "unfenced", reason: "m3" }, contentMatches: [],
+        checks: checks.map((lineId, capturedRow) => ({ lineId, capturedRow })),
+        repairs: repairs.map(([lineId], i) => ({ lineId, capturedRow: checks.length + i, row: history[checks.length + i] })),
+      });
+    },
+  };
+  return h;
+}
+const m3Floor = (h: ReturnType<typeof m3Harness>) => h.pane.recentRows()[0]?.lineId ?? 0;
+
+test("NEWARCH2 M3: certified ids follow the ring floor through append and eviction, and certified rows are never journaled twice", async () => {
+  const h = m3Harness({ ringRows: 8 });
+  try {
+    let worst = 0, evictions = 0, lastFloor = 0;
+    for (let step = 0; step < 150; step++) {
+      h.add(20);
+      await h.commit(h.pane.recentRows().slice(-20).map((r) => r.lineId));
+      const ring = h.pane.recentRows(), certified = h.certified();
+      if (m3Floor(h) !== lastFloor) { evictions++; lastFloor = m3Floor(h); }
+      worst = Math.max(worst, certified.size - ring.length);
+      // The bound: never more ids than ring rows, none below the floor.
+      expect(certified.size).toBeLessThanOrEqual(ring.length);
+      for (const id of certified) expect(id).toBeGreaterThanOrEqual(m3Floor(h));
+    }
+    expect(evictions).toBeGreaterThan(4);
+    // Every row still in the ring that was committed stays certified: a second commit of them writes nothing.
+    const inRing = h.pane.recentRows().map((r) => r.lineId).filter((id) => h.certified().has(id));
+    expect(inRing.length).toBeGreaterThan(0);
+    const writes = h.calibrations.length;
+    await h.commit(inRing);
+    expect(h.calibrations.length).toBe(writes);
+    // Rows evicted while the store commits are not kept either.
+    let release!: () => void; h.hold(new Promise<void>((resolve) => { release = resolve; }));
+    const pending = h.commit(h.pane.recentRows().slice(-5).map((r) => r.lineId));
+    const heldIds = h.calibrations.at(-1).checks.map((c: { lineId: number }) => c.lineId);
+    h.add(600);
+    release(); h.hold(null); await pending;
+    for (const id of heldIds) expect(h.certified().has(id)).toBe(false);
+    expect(h.certified().size).toBeLessThanOrEqual(h.pane.recentRows().length);
+    console.log("NEWARCH2_M3_CERTIFIED", JSON.stringify({ steps: 150, rows: 3000 + 600, evictions, worstExcessOverRing: worst, ring: h.pane.recentRows().length, certified: h.certified().size }));
+  } finally { await h.close(); }
+});
+
+test("NEWARCH2 M3: a calibration snapshot keeps its rows across append, eviction and a repair; ring rows are frozen", async () => {
+  const h = m3Harness({ ringRows: 8 });
+  try {
+    h.add(10);
+    const snap = h.p.read();
+    const original = h.pane.recentRows().map((r) => r.cells);
+    expect(h.pane.recentRows().every((r) => Object.isFrozen(r))).toBe(true);
+    // Repair line 3 before the snapshot is first read (its copy is lazy).
+    await h.commit([], [[3, "fixed"]]);
+    expect(snap.recentHistory.map((r: { cells: unknown }) => r.cells)).toEqual(original);
+    expect(snap.recentHistory[3].cells).toBe(original[3]);
+    expect(h.pane.recentRows()[3]!.cells.map((c) => c.grapheme).join("").trimEnd()).toBe("fixed");
+    expect(Object.isFrozen(h.pane.recentRows()[3])).toBe(true);
+    expect(h.p.ringRepairs).toBe(1);
+    // A snapshot across a repair and an eviction: still the rows it was read with.
+    const snap2 = h.p.read();
+    await h.commit([], [[5, "again"]]);
+    h.add(600);
+    expect(snap2.recentHistory.map((r: { lineId: number }) => r.lineId)).toEqual(Array.from({ length: 10 }, (_, i) => i));
+    expect(snap2.recentHistory[5].cells).toBe(original[5]);
+    expect(snap2.recentHistory[3].cells.map((c: { grapheme: string }) => c.grapheme).join("").trimEnd()).toBe("fixed");
+    // The live window shows the repaired text (the ANSI cache follows the row's cells).
+    h.p.onFrame({ kind: "normal", receiveSeq: 0, sourceEpoch: 1, geometryGeneration: 0, cursor: { x: 0, y: 0, visible: true },
+      cells: { cols: h.cols, rows: 2, full: true, shift: 0, dirty: { "0": [["default", "default", 0, "screen"]] } } });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    const g = m3Harness({ ringRows: 8 });
+    g.add(4); await g.commit([], [[2, "repaired"]]);
+    g.p.onFrame({ kind: "normal", receiveSeq: 0, sourceEpoch: 1, geometryGeneration: 0, cursor: { x: 0, y: 0, visible: true },
+      cells: { cols: g.cols, rows: 2, full: true, shift: 0, dirty: { "0": [["default", "default", 0, "screen"]] } } });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    const content = new ProjectionLiveWindow(100).snapshot(g.pane, 1)!.content.split("\n");
+    expect(content.slice(0, 4)).toEqual(["r0", "r1", "repaired", "r3"]);
+    await g.close();
+  } finally { await h.close(); }
+});
+
+test("NEWARCH M1: row ANSI caches survive append and isolate warm repairs, including shared cells", async () => {
+  const h = m3Harness({ ringRows: 100 });
+  try {
+    h.add(2);
+    const w = new ProjectionLiveWindow(100) as any;
+    const render = () => w.historyText("m1", h.pane.recentRows(), h.p.ringRepairs, "");
+    expect(render()).toBe("r0\nr1");
+    const old = h.pane.recentRows()[0] as any;
+    const snap = h.p.read();
+    expect(old.ansiCache?.text).toBe("r0");
+    expect(Object.isFrozen(old)).toBe(true);
+    h.add(1);
+    expect(render()).toBe("r0\nr1\nr2");
+    await h.commit([], [[0, "fixed"]]);
+    const repaired = h.pane.recentRows()[0] as any;
+    expect(repaired.ansiCache).not.toBe(old.ansiCache);
+    expect(repaired.ansiCache.text).toBeUndefined();
+    expect(render()).toBe("fixed\nr1\nr2");
+    expect(snap.recentHistory[0]).toBe(old);
+    expect(old.ansiCache.text).toBe("r0");
+    expect(repaired.ansiCache.text).toBe("fixed");
+    expect(h.pane.memoryStats().ring).toMatchObject({ ansiRows: 3, ansiChars: 9 });
+    // Two rows own separate caches even when canonical cells are shared.
+    const cells = parserRowCells([["red", "default", 1, "é"]], h.cols);
+    for (const lineId of [3, 4]) h.p.remember({ lineId, sourceEpoch: 1, geometryGeneration: 0, cells, softWrap: false });
+    const rows = h.pane.recentRows() as any;
+    expect(rows[3].cells).toBe(rows[4].cells);
+    expect(rows[3].ansiCache).not.toBe(rows[4].ansiCache);
+    const ansi = cellsToAnsi(cells);
+    expect(ansi).toContain("\x1b[");
+    expect(render()).toBe(`fixed\nr1\nr2\n${ansi}\n${ansi}`);
+    expect(h.pane.memoryStats().ring).toMatchObject({ ansiRows: 5, ansiChars: 9 + 2 * ansi.length, sharedRows: 1 });
+  } finally { await h.close(); }
+});
+
+test("NEWARCH2 M3: blank rows share one frozen array per width; unicode, style and colour rows are converted as before", () => {
+  const before = pipeHistoryAllocations();
+  const a = parserRowCells([["default", "default", 0, " ".repeat(12)]], 12);
+  const b = parserRowCells([["default", "default", 0, [" ", " "]], ["default", "default", 0, " ".repeat(10)]]);
+  const empty = parserRowCells([], 12);
+  expect(a).toBe(b); expect(a).toBe(empty); expect(a).toBe(sharedBlankRow(12));
+  expect(Object.isFrozen(a)).toBe(true);
+  expect(a).toEqual(new Array(12).fill(BLANK_CELL));
+  expect(sharedBlankRow(20)).not.toBe(a); expect(sharedBlankRow(20)).toHaveLength(20);
+  // Blank-looking rows that carry a style or a colour are not blank.
+  const bold = parserRowCells([["default", "default", 1, "  "]], 12);
+  expect(bold).not.toBe(a); expect(bold[0]!.style).toBe(1); expect(bold[5]).toBe(BLANK_CELL);
+  expect(parserRowCells([["default", "red", 0, "  "]], 12)[0]!.bg).toBe("index:1");
+  expect(parserRowCells([["default", "default", 0, "  x"]], 12)).not.toBe(a);
+  // Wide, continuation, combining and Thai cells.
+  const wide = parserRowCells([["default", "default", 0, ["漢", "", "é", "ไ", "ท", "ย"]], ["0a0b0c", "default", 2, "i"]], 8);
+  expect(wide.map((c) => [c.grapheme, c.width, c.continuation])).toEqual([["漢", 2, false], ["", 0, true], ["é", 1, false], ["ไ", 1, false], ["ท", 1, false], ["ย", 1, false], ["i", 1, false], [" ", 1, false]]);
+  expect(wide[6]!.fg).toBe("rgb:10,11,12"); expect(wide[6]!.style).toBe(4); expect(wide[7]).toBe(BLANK_CELL);
+  const after = pipeHistoryAllocations();
+  // Four non-blank rows took arrays; the blank ones took none.
+  expect(after.parserRowArrays - before.parserRowArrays).toBe(4);
+  // Frame assembly: new and shifted-in blank rows are the shared row; a resize moves to that width's row.
+  const s0 = applyFrameDelta(undefined, { cols: 12, rows: 3, full: true, shift: 0, dirty: { "0": [["default", "default", 0, "top"]] } } as never).screen;
+  expect(s0.cells[1]).toBe(a); expect(s0.cells[2]).toBe(a);
+  const s1 = applyFrameDelta(s0, { cols: 12, rows: 3, full: false, shift: 1, dirty: {} } as never).screen;
+  expect(s1.cells[0]).toBe(a); expect(s1.cells[2]).toBe(a);
+  const s2 = applyFrameDelta(s1, { cols: 20, rows: 2, full: false, shift: 0, dirty: {} } as never).screen;
+  expect(s2.cells[0]).toBe(sharedBlankRow(20));
+});
+
+test("NEWARCH2 M3: a capture row is decoded to one canonical array (the memo's), equal to the two-step path for unicode/style/blank", async () => {
+  const cols = 24;
+  const body = [
+    "\x1b[38;5;196mpalette\x1b[0m plain", "\x1b[1;2mbold dim\x1b[0m 漢字 ไทย", "", "   ",
+    "\x1b[48;2;1;2;3mrgb\x1b[0m", "flag 🇹🇭🇯🇵 row", "\x1b[31mred", "still red\x1b[0m", "é combining", "\x1b[7;9mrev strike\x1b[0m",
+  ].join("\n") + "\n";
+  const plain = new TmuxCaptureDecoder(cols);
+  const reference = plain.decode(body).map((r) => canonicalCaptureCells(r as never, cols));
+  const decoder = canonicalCaptureDecoder(cols);
+  const before = pipeHistoryAllocations();
+  const first = decodeCanonicalCapture(decoder, body), second = decodeCanonicalCapture(decoder, body);
+  const after = pipeHistoryAllocations();
+  expect(JSON.stringify(first)).toBe(JSON.stringify(reference));
+  expect(JSON.stringify(second)).toBe(JSON.stringify(reference));
+  expect(decoder.uncertainRows).toEqual(plain.uncertainRows);
+  expect(plain.uncertainRows.length).toBeGreaterThan(0);
+  // Same interned cells as the two-step path (identity comparisons such as sameScreen still hold).
+  first.forEach((row, y) => row.forEach((cell, x) => expect(cell).toBe(reference[y]![x]!)));
+  // No second array per row; a memo hit is the same row.
+  expect(after.canonicalRowArrays - before.canonicalRowArrays).toBe(0);
+  expect(after.canonicalRowsShared - before.canonicalRowsShared).toBe(2 * first.length);
+  expect(second[0]).toBe(first[0]);
+  // Through the pane's capture port: the capture frame's rows are the decoder memo's rows.
+  const h = m3Harness({ cols, rows: 3 });
+  try {
+    h.add(1);
+    h.setBody(body);
+    const capture = await h.p.capture(0, new AbortController().signal);
+    const memoRows = new Set([...h.p.decoder.cache.values()].map((e: { cells: unknown }) => e.cells));
+    expect(capture.frame.cells.length).toBe(3);
+    for (const row of [...capture.frame.cells, ...capture.history.map((r: { cells: unknown }) => r.cells)]) {
+      if (!h.p.decoder.uncertainRows.length || row !== capture.history[5]?.cells) expect(memoRows.has(row) || row === capture.history[5]?.cells).toBe(true);
+    }
+    expect(JSON.stringify([...capture.history.map((r: { cells: unknown }) => r.cells), ...capture.frame.cells])).toBe(JSON.stringify(reference));
+    console.log("NEWARCH2_M3_CANONICAL", JSON.stringify({ rows: first.length, canonicalArraysBefore: reference.length, canonicalArraysAfter: after.canonicalRowArrays - before.canonicalRowArrays }));
+  } finally { await h.close(); }
+});
+
+test("NEWARCH2 M3: epoch and resize keep the ring floor rule, and a width change replaces the decoder with rows of the new width", async () => {
+  const h = m3Harness({ ringRows: 8, cols: 12, rows: 2 });
+  try {
+    h.add(300, 1, 0);
+    await h.commit(h.pane.recentRows().slice(-40).map((r) => r.lineId));
+    h.add(300, 2, 1);
+    await h.commit(h.pane.recentRows().slice(-40).map((r) => r.lineId));
+    for (const id of h.certified()) expect(id).toBeGreaterThanOrEqual(m3Floor(h));
+    expect(h.certified().size).toBeLessThanOrEqual(h.pane.recentRows().length);
+    expect(new Set(h.pane.recentRows().map((r) => r.sourceEpoch))).toEqual(new Set([2]));
+    h.setBody("a\nb\n\n");
+    await h.p.capture(0, new AbortController().signal);
+    expect(h.p.decoder.cols).toBe(12);
+    const narrow = h.p.decoder;
+    h.setMeta({ cols: 20 });
+    h.setBody("wide row\n\n\n");
+    const capture = await h.p.capture(0, new AbortController().signal);
+    expect(h.p.decoder).not.toBe(narrow);
+    expect(h.p.decoder.cols).toBe(20);
+    expect(capture.frame.cells.every((r: unknown[]) => r.length === 20)).toBe(true);
+    const stats = h.pane.memoryStats();
+    expect(stats.decoder!.cellSlots % 20).toBe(0);
+    expect(stats.decoder!.entries).toBeGreaterThan(0);
+  } finally { await h.close(); }
+});
+
+test("NEWARCH2 M3: memoryStats counts ring, certified and memo bytes by the explicit model; shared rows once", async () => {
+  const h = m3Harness({ ringRows: 100, cols: 10 });
+  try {
+    expect(h.pane.memoryStats()).toEqual({ ring: { rows: 0, rowArrays: 0, sharedRows: 0, cellSlots: 0, ansiRows: 0, ansiChars: 0, floor: null, bytes: CACHE_BYTE_MODEL.arrayHeader }, certified: { ids: 0, bytes: 0 }, decoder: null, bytes: CACHE_BYTE_MODEL.arrayHeader });
+    h.add(5);
+    for (let i = 0; i < 3; i++) h.p.remember({ lineId: 5 + i, sourceEpoch: 1, geometryGeneration: 0, cells: parserRowCells([], 10), softWrap: false });
+    await h.commit([0, 1, 2]);
+    const m = CACHE_BYTE_MODEL, s = h.pane.memoryStats();
+    expect(s.ring).toMatchObject({ rows: 8, rowArrays: 6, sharedRows: 2, cellSlots: 60, floor: 0 });
+    expect(s.ring.bytes).toBe(m.arrayHeader + 8 * (2 * m.slot + 2 * m.object) + 6 * m.arrayHeader + 60 * m.slot + s.ring.ansiRows * m.stringHeader + s.ring.ansiChars * m.char);
+    expect(s.certified).toEqual({ ids: 3, bytes: 3 * m.setEntry });
+    h.setBody("abc\n\x1b[31mred\x1b[0m\n");
+    await h.p.capture(0, new AbortController().signal);
+    const d = h.pane.memoryStats().decoder!;
+    expect(d.entries).toBe(2); expect(d.cellSlots).toBe(20);
+    expect(d.bytes).toBe(2 * (m.mapEntry + m.object + m.arrayHeader + m.stringHeader) + 20 * m.slot + d.keyChars * m.char);
+    expect(h.pane.memoryStats().bytes).toBe(h.pane.memoryStats().ring.bytes + 3 * m.setEntry + d.bytes);
+  } finally { await h.close(); }
+});
+
+test("NEWARCH2 M3: attach-close churn leaves no per-pane state behind and allocates no canonical copies", async () => {
+  const before = pipeHistoryAllocations();
+  const excess: number[] = [];
+  for (let cycle = 0; cycle < 40; cycle++) {
+    const h = m3Harness({ ringRows: 8, cols: 10 + (cycle % 5) });
+    try {
+      expect(h.pane.memoryStats().bytes).toBe(CACHE_BYTE_MODEL.arrayHeader);
+      h.add(560);
+      await h.commit(h.pane.recentRows().slice(-8).map((r) => r.lineId));
+      h.setBody(`cycle ${cycle}\n\x1b[32mgreen\x1b[0m\n\n`);
+      await h.p.capture(0, new AbortController().signal);
+      h.p.onFrame({ kind: "normal", receiveSeq: 0, sourceEpoch: 1, geometryGeneration: 0, cursor: { x: 0, y: 0, visible: true },
+        cells: { cols: h.cols, rows: 2, full: true, shift: 0, dirty: { "0": [["default", "default", 0, `c${cycle}`]] } } });
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      excess.push(h.certified().size - h.pane.recentRows().length);
+    } finally { await h.close(); }
+  }
+  const after = pipeHistoryAllocations();
+  expect(Math.max(...excess)).toBeLessThanOrEqual(0);
+  expect(after.canonicalRowArrays - before.canonicalRowArrays).toBe(0);
+  expect(after.blankRowWidths).toBeLessThanOrEqual(64);
+  console.log("NEWARCH2_M3_CHURN", JSON.stringify({ cycles: 40, maxCertifiedExcess: Math.max(...excess), canonicalArrays: after.canonicalRowArrays - before.canonicalRowArrays, blankWidths: after.blankRowWidths }));
+});
+
+test("NEWARCH2 M3 mutation controls: threshold pruning, in-place repair, canonical copy and fresh blank rows each fail", () => {
+  const root = mkdtempSync(join(tmpdir(), "m3-mutation-"));
+  const src = new URL("../src/", import.meta.url).pathname;
+  const prelude = `import assert from 'node:assert/strict';
+const R = await import('./subject.ts');
+const key = { serverIdentity: 'm', paneId: '%1', birthGeneration: 1 };
+let next = 0, rev = 0;
+const store = { token: () => ({ paneKey: key, sourceEpoch: 1, geometryGeneration: 0, revision: rev, durableRevision: 0, nextLineId: next }),
+  calibrate: async () => ({ revision: ++rev, durableRevision: 0, nextLineId: next }), recordIssue: async () => ({ revision: rev }) };
+const meta = { cols: 6, rows: 2, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 100, panePid: 1, mouseSgr: false, mouseAny: false };
+const runtime = new R.PipeHistoryRuntime({ sharedParser: false, ringRows: 8, store });
+const pane = new R.PipeHistoryPane(runtime, { paneKey: key, session: 'm', calibrate: false, commitIntervalMs: 0, meta, capture: async () => { throw new Error('unused'); } });
+const row = t => R.parserRowCells([['default', 'default', 0, t.padEnd(6)]], 6);
+const add = n => { for (let i = 0; i < n; i++) { pane.remember({ lineId: next, sourceEpoch: 1, geometryGeneration: 0, cells: row('r' + next), softWrap: false }); next++; rev++; } };
+const cm = { historyEpoch: 1, sourceEpoch: 1, geometryGeneration: 0, cols: 6, rows: 2, kind: 'normal', cursor: { x: 0, y: 0, visible: true } };
+const commit = (checks, repairs = []) => { const history = [...checks.map(id => ({ cells: row('r' + id), softWrap: false })), ...repairs.map(([, t]) => ({ cells: row(t), softWrap: false }))];
+  return pane.commitCalibration({ capture: { paneKey: key, captureId: 'k', requestedAt: 0, completedAt: 0, before: cm, after: cm, frame: { cells: [], cursor: cm.cursor, kind: 'normal', geometryGeneration: 0, receiveSeq: -1 }, history, completeRetainedTail: true, observedFields: [] },
+    expectedRevision: rev, captureEvidence: { kind: 'unfenced', reason: 'm' }, contentMatches: [], checks: checks.map((lineId, capturedRow) => ({ lineId, capturedRow })),
+    repairs: repairs.map(([lineId], i) => ({ lineId, capturedRow: checks.length + i, row: history[checks.length + i] })) }); };
+`;
+  const cases = [
+    { name: "certified-threshold", from: "for (const id of this.certified) if (id < floor) this.certified.delete(id);",
+      to: "if (this.certified.size > 20_000) for (const id of this.certified) if (id < floor) this.certified.delete(id);",
+      body: `for (let s = 0; s < 40; s++) { add(20); await commit(pane.recentRows().slice(-20).map(r => r.lineId)); }
+assert.ok(pane.certified.size <= pane.recentRows().length, 'MUTATION certified ' + pane.certified.size + ' ids over a ring of ' + pane.recentRows().length);` },
+    { name: "repair-in-place", from: "this.ring = this.ring.map(row => {\n          const cells = byId.get(row.lineId);\n          return cells ? Object.freeze({ ...row, cells, ansiCache: {} }) : row;\n        });",
+      to: "for (let i = 0; i < this.ring.length; i++) { const cells = byId.get(this.ring[i].lineId); if (cells) this.ring[i] = Object.freeze({ ...this.ring[i], cells }); }",
+      body: `add(10); const snap = pane.read(); const old = pane.recentRows()[3].cells; await commit([], [[3, 'fixed']]);
+assert.equal(snap.recentHistory[3].cells, old, 'MUTATION repair changed a snapshot read before it');` },
+    { name: "ansi-repair-stale", from: "Object.freeze({ ...row, cells, ansiCache: {} }) : row", to: "Object.freeze({ ...row, cells }) : row",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100);
+assert.equal(w.historyText('m', pane.recentRows(), 0, ''), 'r0\\nr1');
+await commit([], [[0, 'fixed']]);
+assert.equal(w.historyText('m', pane.recentRows(), pane.ringRepairs, ''), 'fixed\\nr1', 'MUTATION stale ANSI after warm repair');` },
+    { name: "ansi-new-row-poison", from: "this.ring.push(Object.freeze({ ...row, ansiCache: {} }));", to: "this.ring.push(Object.freeze({ ...row, ansiCache: { text: 'stale' } }));",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100);
+assert.equal(w.historyText('m', pane.recentRows(), 0, ''), 'r0\\nr1', 'MUTATION wrong ANSI on new rows');` },
+    { name: "ansi-history-weakmap", from: "rows[i]!.ansiCache.text ??= cellsToAnsi(rows[i]!.cells)", to: "rowAnsi(rows[i]!.cells)",
+      body: `add(2); const w = new R.ProjectionLiveWindow(100); w.historyText('m', pane.recentRows(), 0, '');
+assert.equal(pane.memoryStats().ring.ansiRows, 2, 'MUTATION history ANSI missing from row census');` },
+    { name: "canonical-copy", from: "return new TmuxCaptureDecoder(cols, undefined, undefined, canonicalCell);", to: "return new TmuxCaptureDecoder(cols);",
+      body: `const d = R.canonicalCaptureDecoder(6); const a = R.pipeHistoryAllocations().canonicalRowArrays; R.decodeCanonicalCapture(d, 'ab\\n\\x1b[31mc\\x1b[0m\\n');
+assert.equal(R.pipeHistoryAllocations().canonicalRowArrays - a, 0, 'MUTATION capture rows copied into second canonical arrays');` },
+    { name: "fresh-blank-rows", from: "if (row.every(isBlankRun)) {", to: "if (false) {",
+      body: `assert.equal(R.parserRowCells([['default', 'default', 0, '      ']], 6), R.parserRowCells([], 6), 'MUTATION blank rows are separate arrays');` },
+  ];
+  try {
+    const original = readFileSync(new URL("../src/pipe-history-runtime.ts", import.meta.url), "utf8").replaceAll("from './", `from '${src}`);
+    for (const item of cases) {
+      expect(original.split(item.from)).toHaveLength(2);
+      writeFileSync(join(root, "runner.ts"), prelude + item.body + "\nawait runtime.close();\n");
+      for (const mutated of [false, true]) {
+        writeFileSync(join(root, "subject.ts"), mutated ? original.replace(item.from, item.to) : original);
+        const result = spawnSync(process.execPath, [join(root, "runner.ts")], { encoding: "utf8", timeout: 20000 });
+        console.log("NEWARCH2_M3_MUTATION", JSON.stringify({ name: item.name, mutated, exit: result.status, stderr: result.stderr.slice(0, 300) }));
+        expect(result.status).toBe(mutated ? 1 : 0);
+        if (mutated) expect(result.stderr).toContain("MUTATION");
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

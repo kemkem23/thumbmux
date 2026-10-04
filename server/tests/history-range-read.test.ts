@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MuxClientMessage, SessionListItem } from "../../core/src/protocol";
 import { FileHistoryArchive } from "../src/history-archive";
+import { StreamDisplayEngine } from "../src/display-engine";
+import { STREAM_BUDGET, type CaptureEngine, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type ViewerRoute } from "../src/stream-contract";
 import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
 
 const SESSION = "range-read";
@@ -397,3 +399,219 @@ for (const direction of ["before", "after"] as const) {
     }
   });
 }
+
+// ── NEWARCH stream-first lot D: bounded immutable display reads ────────────
+
+const DISPLAY_PANE = { serverIdentity: "display-server", paneId: "%21", birthGeneration: 1 } as const;
+
+function displayIdentity(sourceEpoch = 1, geometryGeneration = 1): StreamIdentity {
+  return { pane: DISPLAY_PANE, sourceEpoch, geometryGeneration };
+}
+
+function displayFrame(identity = displayIdentity(), revision = 1): LiveFrame {
+  return {
+    identity, revision, durableRevision: revision, head: 1, screenRevision: revision,
+    buffer: "normal", geometry: { columns: 80, rows: 24 }, cursor: { x: 0, y: 0, visible: true },
+    overlap: null,
+    changedRows: [{
+      y: 0,
+      content: { cells: [{ text: `frame-${revision}`, width: 1, style: [] }], softWrap: false, wrapPad: 0, uncertainFields: [] },
+    }],
+  };
+}
+
+function displayRoute(viewerId: string, routeGeneration = 1): ViewerRoute {
+  return { viewerId, identity: displayIdentity(), routeGeneration };
+}
+
+function displayView(route: ViewerRoute, requestId: string, lineId: number): ReadView {
+  return {
+    requestId, identity: route.identity, routeGeneration: route.routeGeneration,
+    range: { start: lineId, end: lineId + 1 }, deadlineMonoMs: performance.now() + 1_000,
+    grantRevision: lineId + 1, durableAtGrant: lineId + 1, headAtGrant: lineId + 1,
+    overlayHandle: `overlay-${requestId}`,
+  };
+}
+
+function displayPage(view: ReadView, text: string): HistoryPage {
+  const row = {
+    id: { pane: view.identity.pane, lineId: view.range.start }, revision: view.grantRevision,
+    source: { pane: view.identity.pane, sourceEpoch: view.identity.sourceEpoch, packetSeq: view.range.start + 1, scrollOrdinal: 0 },
+    geometryGeneration: view.identity.geometryGeneration, geometry: { columns: 80, rows: 24 },
+    cells: [{ text, width: 1 as const, style: [] }], softWrap: false, wrapPad: 0, uncertainFields: [],
+  };
+  return {
+    view, fragments: [{ row, startCell: 0, endCell: 1, complete: true }], payloadBytes: Buffer.byteLength(text),
+    nextBefore: null, nextAfter: null, hasMoreBefore: false, hasMoreAfter: false,
+  };
+}
+
+function displayHarness() {
+  const listeners = new Set<(frame: LiveFrame) => void>();
+  const released: Array<{ requestId: string; reason: string }> = [];
+  const readLines: number[] = [];
+  const capture = {
+    subscribe: (_pane, listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+  } as Pick<CaptureEngine, "subscribe"> as CaptureEngine;
+  const history = {
+    grantReadView: async request => ({ status: "ok", value: {
+      ...request, grantRevision: request.range.end, durableAtGrant: request.range.end,
+      headAtGrant: request.range.end, overlayHandle: `overlay-${request.requestId}`,
+    } }),
+    openReadView: async view => ({ status: "ok", value: {
+      view, diskSnapshotRevision: view.durableAtGrant, snapshotHandle: `snapshot-${view.requestId}`,
+    } }),
+    readPage: async ack => {
+      readLines.push(ack.view.range.start);
+      return { status: "ok", value: displayPage(ack.view, `row-${ack.view.range.start}`) };
+    },
+    releaseReadView: async (view, reason) => { released.push({ requestId: view.requestId, reason }); },
+  } as Pick<HistoryEngine, "grantReadView" | "openReadView" | "readPage" | "releaseReadView"> as HistoryEngine;
+  return { capture, history, listeners, released, readLines };
+}
+
+test("NEWARCH D: 21 viewers keep independent immutable pages inside both cache caps", async () => {
+  const h = displayHarness();
+  const baseReadPage = h.history.readPage.bind(h.history);
+  const oneMiB = "x".repeat(1024 * 1024);
+  h.history.readPage = async (ack, cursor, limit, cancel) => {
+    const base = await baseReadPage(ack, cursor, limit, cancel);
+    return base.status === "ok"
+      ? { status: "ok", value: displayPage(ack.view, `${ack.view.range.start}:${oneMiB}`) }
+      : base;
+  };
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const attachments = Array.from({ length: 21 }, async (_, index) => {
+    const route = displayRoute(`viewer-${index}`);
+    const attached = engine.attach(route, () => {});
+    for (const listener of h.listeners) listener(displayFrame());
+    expect((await attached).status).toBe("ok");
+    const request = displayView(route, `request-${index}`, index);
+    const page = await engine.page(route, request, null, 500, { isCancelled: () => false });
+    expect(page.status).toBe("ok");
+    if (page.status === "ok") {
+      expect(page.value.fragments[0]!.row.id.lineId).toBe(index);
+      expect(Object.isFrozen(page.value.fragments[0]!.row.cells)).toBe(true);
+    }
+  });
+  await Promise.all(attachments);
+  expect(h.readLines.slice().sort((a, b) => a - b)).toEqual(Array.from({ length: 21 }, (_, i) => i));
+  expect(h.released).toHaveLength(21);
+  expect(engine.stats().pagePoolBytes).toBeLessThanOrEqual(STREAM_BUDGET.pagePoolBytes);
+  expect(Math.max(...Object.values(engine.stats().pageBytesByViewer))).toBeLessThanOrEqual(STREAM_BUDGET.pageBytesPerViewer);
+  expect(Object.keys(engine.stats().pageBytesByViewer).length).toBeLessThan(21);
+});
+
+test("NEWARCH D: stale routes cannot receive frames or read pages and detach is generation-safe", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const oldRoute = displayRoute("same-viewer", 1);
+  const newRoute = displayRoute("same-viewer", 2);
+  let oldFrames = 0;
+  let newFrames = 0;
+  const oldAttach = engine.attach(oldRoute, () => { oldFrames++; });
+  for (const listener of h.listeners) listener(displayFrame());
+  await oldAttach;
+  const newAttach = engine.attach(newRoute, () => { newFrames++; });
+  for (const listener of h.listeners) listener(displayFrame(displayIdentity(), 2));
+  await newAttach;
+  await engine.detach(oldRoute, "late old disconnect");
+  for (const listener of h.listeners) listener(displayFrame(displayIdentity(), 3));
+  expect(oldFrames).toBe(1);
+  expect(newFrames).toBe(2);
+  const stale = await engine.page(oldRoute, displayView(oldRoute, "stale", 0), null, 1, { isCancelled: () => false });
+  expect(stale).toEqual({ status: "stale", reason: "route" });
+});
+
+test("NEWARCH D: timeout and cancellation are errors, never false EOF, and always release the pin", async () => {
+  const h = displayHarness();
+  h.history.readPage = async () => await new Promise(() => {});
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("slow-viewer");
+  const attached = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await attached;
+  const request = { ...displayView(route, "deadline", 0), deadlineMonoMs: performance.now() + 20 };
+  const result = await engine.page(route, request, null, 500, { isCancelled: () => false });
+  expect(result).toEqual({ status: "error", code: "deadline", message: "display page deadline exceeded" });
+  expect(h.released).toEqual([{ requestId: "deadline", reason: "deadline" }]);
+
+  const cancelled = await engine.page(route, displayView(route, "cancelled", 0), null, 500, { isCancelled: () => true });
+  expect(cancelled).toEqual({ status: "cancelled", reason: "cancelled" });
+  expect(h.released).toHaveLength(1);
+});
+
+test("NEWARCH D: WebSocket reservations stop at 8 MiB and a detached generation cannot double-release", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("backpressured");
+  const attached = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await attached;
+  const release = engine.reserveEncodedBytes(route.viewerId, STREAM_BUDGET.wsPendingBytes)!;
+  expect(engine.reserveEncodedBytes("another-viewer", 1)).toBeNull();
+  expect(engine.stats().wsPendingBytes).toBe(STREAM_BUDGET.wsPendingBytes);
+  await engine.detach(route, "socket closed");
+  expect(engine.stats().wsPendingBytes).toBe(0);
+  release();
+  expect(engine.stats().wsPendingBytes).toBe(0);
+});
+
+test("NEWARCH D: a page at line one million never asks capture for historical tail", async () => {
+  const h = displayHarness();
+  let subscriptions = 0;
+  h.capture.subscribe = (_pane, listener) => {
+    subscriptions++;
+    h.listeners.add(listener);
+    return () => { h.listeners.delete(listener); };
+  };
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("deep-scrollback");
+  const attached = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await attached;
+  const result = await engine.page(route, displayView(route, "million", 999_999), null, 500, { isCancelled: () => false });
+  expect(result.status).toBe("ok");
+  expect(h.readLines).toEqual([999_999]);
+  expect(subscriptions).toBe(1);
+});
+
+
+test("NEWARCH D growth: 10000 viewer identities leave no retained bookkeeping", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const sizes = () => Object.values(engine).filter(v => v instanceof Map).map(v => v.size);
+  let early: number[] = [];
+  for (let i = 0; i < 10000; i++) {
+    const route = displayRoute(`churn-${i}`);
+    const ready = engine.attach(route, () => {});
+    for (const listener of h.listeners) listener(displayFrame());
+    await ready;
+    const lateRelease = engine.reserveEncodedBytes(route.viewerId, 10)!;
+    await engine.detach(route, "churn");
+    lateRelease(); lateRelease();
+    if (i === 999) early = sizes();
+  }
+  expect(sizes()).toEqual(early);
+  expect(sizes().every(n => n === 0)).toBe(true);
+  expect(h.listeners.size).toBe(0);
+  expect(engine.stats().wsPendingBytes).toBe(0);
+});
+
+test("NEWARCH D growth: late release cannot debit a reused viewer or a fresh reservation", async () => {
+  const h = displayHarness();
+  const engine = new StreamDisplayEngine({ capture: h.capture, history: h.history });
+  const route = displayRoute("reused");
+  const ready = engine.attach(route, () => {});
+  for (const listener of h.listeners) listener(displayFrame());
+  await ready;
+  const old = engine.reserveEncodedBytes(route.viewerId, 10)!;
+  await engine.detach(route, "old socket discarded");
+  const fresh = engine.reserveEncodedBytes(route.viewerId, 30)!;
+  old(); old();
+  expect(engine.stats().wsPendingBytes).toBe(30);
+  fresh(); fresh();
+  expect(engine.stats().wsPendingBytes).toBe(0);
+  for (let i = 0; i < 10000; i++) engine.reserveEncodedBytes(`empty-${i}`, 0);
+  expect(Object.values(engine).filter(v => v instanceof Map).every(v => v.size === 0)).toBe(true);
+});

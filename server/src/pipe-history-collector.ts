@@ -41,6 +41,10 @@ import {
 export type PaneKey = { serverIdentity: string; paneId: string; birthGeneration: number };
 
 export type PipeScrollEvent = {
+  /** Additive v1 event identity; absent on legacy worker output. */
+  packetEpoch?: number;
+  packetSeq?: number | null;
+  scrollOrdinal?: number | null;
   paneKey: PaneKey;
   sourceEpoch: number;
   geometryGeneration: number;
@@ -143,6 +147,8 @@ export type PipeHistoryCollectorOptions = {
   closeTimeoutMs?: number;
   /** First retry delay after a capacity-pressure receipt; doubles to 100 ms. */
   pressureRetryMs?: number;
+  /** Opt-in for stream/spool consumers only; legacy production drops with a marker. */
+  retainOversize?: boolean;
 };
 
 /**
@@ -213,7 +219,7 @@ export class PipeHistoryCollector {
   private ackedSeq = 0;
   private inflight: Array<{ seq: number; bytes: number; at: bigint }> = [];
   private inflightBytes = 0;
-  private readonly ring: PipeScrollEvent[] = [];
+  private readonly ring: Array<PipeScrollEvent | undefined> = [];
   private ringStart = 0;
   private readonly ringRows: number;
   private readonly queueLimit: number;
@@ -440,7 +446,8 @@ export class PipeHistoryCollector {
 
   /** Rows still held by the tray ring, oldest first. */
   ringSnapshot(): PipeScrollEvent[] {
-    return this.ring.slice(this.ringStart);
+    // Only the evicted prefix has empty slots; the active suffix is dense.
+    return this.ring.slice(this.ringStart) as PipeScrollEvent[];
   }
 
   stats() {
@@ -587,7 +594,7 @@ export class PipeHistoryCollector {
     let answer: unknown;
     try { answer = send(); }
     catch (error) {
-      if (isCapacityPressure(error)) return { receipt: this.retryPressure(send, dropped), pressured: true };
+      if (isCapacityPressure(error) || (this.options.retainOversize && isOversize(error))) return { receipt: this.retryPressure(send, dropped), pressured: true };
       if (isOversize(error)) return { receipt: dropped(), pressured: false };
       throw error;
     }
@@ -597,19 +604,19 @@ export class PipeHistoryCollector {
       const pressured = refusedNow(answer);
       const receipt = Promise.resolve(answer).then(
         (value) => {
-          if (isCapacityPressure(value)) return this.retryPressure(send, dropped);
+          if (isCapacityPressure(value) || (this.options.retainOversize && isOversize(value))) return this.retryPressure(send, dropped);
           if (isOversize(value)) return dropped();
           if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
         },
         (error) => {
-          if (isCapacityPressure(error)) return this.retryPressure(send, dropped);
+          if (isCapacityPressure(error) || (this.options.retainOversize && isOversize(error))) return this.retryPressure(send, dropped);
           if (isOversize(error)) return dropped();
           throw error;
         },
       );
       return { receipt, pressured };
     }
-    if (isCapacityPressure(answer)) return { receipt: this.retryPressure(send, dropped), pressured: true };
+    if (isCapacityPressure(answer) || (this.options.retainOversize && isOversize(answer))) return { receipt: this.retryPressure(send, dropped), pressured: true };
     if (isOversize(answer)) return { receipt: dropped(), pressured: false };
     if (isRefusal(answer)) throw new Error(`consumer refused: ${JSON.stringify(answer)}`);
     return { receipt: undefined, pressured: false };
@@ -646,11 +653,11 @@ export class PipeHistoryCollector {
       let value: unknown;
       try { value = await send(); }
       catch (error) {
-        if (isCapacityPressure(error)) continue;
+        if (isCapacityPressure(error) || (this.options.retainOversize && isOversize(error))) continue;
         if (isOversize(error)) return dropped();
         throw error;
       }
-      if (isCapacityPressure(value)) continue;
+      if (isCapacityPressure(value) || (this.options.retainOversize && isOversize(value))) continue;
       if (isOversize(value)) return dropped();
       if (isRefusal(value)) throw new Error(`consumer refused: ${JSON.stringify(value)}`);
       return;
@@ -668,6 +675,9 @@ export class PipeHistoryCollector {
     this.ring.push(event);
     while (this.ring.length - this.ringStart > this.ringRows) {
       const evicted = this.ring[this.ringStart]!;
+      // Release ownership before user code runs, even if onEvict throws.
+      // Compacting the empty prefix later must not retain discarded rows.
+      this.ring[this.ringStart] = undefined;
       this.ringStart += 1;
       this.options.onEvict?.(evicted);
     }
@@ -758,6 +768,7 @@ export class PipeHistoryCollector {
     try {
       const scrolls = update.scrolls.map((scroll) => ({ paneKey: this.paneKey, sourceEpoch: scroll.epoch,
         geometryGeneration: scroll.gen, physicalRow: scroll.row,
+        packetEpoch: scroll.packetEpoch, packetSeq: scroll.packetSeq, scrollOrdinal: scroll.scrollOrdinal,
         softWrap: scroll.wrap, wrapPad: scroll.pad, receiveSeq: scroll.seq ?? this.ackedSeq }));
       const receipt = this.offerScrolls(scrolls, 0);
       if (isReceipt(receipt)) return Promise.resolve(receipt).then(publish).catch(rejected);

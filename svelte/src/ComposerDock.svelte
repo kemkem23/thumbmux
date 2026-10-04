@@ -291,7 +291,7 @@
   });
 </script>
 
-<div class="sheet dock" class:open class:kb={kbInset > 0} bind:offsetHeight={sheetH} data-testid="input-sheet" style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}>
+<div class="sheet dock" class:open class:kb={kbInset > 0} bind:offsetHeight={sheetH} data-testid="input-sheet" data-mode={mode} style:--kb-inset={kbInset > 0 ? `${kbInset}px` : null}>
   <div class="modes">
     <button class="mode-btn" class:on={mode === 'compose'} onclick={() => switchMode('compose')}>{labels.compose}</button>
     <button class="mode-btn" class:on={mode === 'direct'} onclick={() => switchMode('direct')}>{labels.direct}</button>
@@ -383,6 +383,28 @@
     min-width: 64px; min-height: 46px; border: 1px solid var(--agent); border-left: none;
     background: var(--agent); color: var(--tstage);
     font: 700 11px var(--font-mono); letter-spacing: .05em; touch-action: manipulation;
+  }
+  /* Short screens (1024×600, 800×600, phones in landscape): the mode row and
+     the field stacked to 122-147px and left the terminal ~2/3 of the window.
+     One row instead — [COMPOSE][DIRECT] [field][SEND] [✕] — about 66px.
+     The modes wrapper dissolves (display: contents) so its buttons and the
+     field share one flex line; the hint only shows in DIRECT, where there is
+     no field to take its place. Below 481px wide a field squeezed beside
+     five buttons would be narrower than a word, so narrow phones keep two rows. */
+  @media (max-height: 620px) and (min-width: 481px) {
+    .sheet.dock {
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+      padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    }
+    .sheet.dock.kb { padding-bottom: 6px; }
+    .modes { display: contents; }
+    .mode-btn { order: 0; flex: 0 0 auto; padding: 0 10px; }
+    .mode-hint { order: 1; flex: 1 1 auto; align-self: center; margin-left: 4px; }
+    .sheet.dock[data-mode='compose'] .mode-hint { display: none; }
+    .crow { order: 1; flex: 1 1 auto; min-width: 0; }
+    .close { order: 2; margin-left: 0; flex: 0 0 auto; }
   }
   /* DIRECT's focus target: invisible but focusable (opacity — never
      display:none, iOS refuses focus). 16px font blocks Safari's zoom-on-focus. */

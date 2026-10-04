@@ -120,3 +120,117 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
     }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 180_000);
+
+// Stream mutations use a throwaway source tree exactly like the legacy probes.
+// They must reach a failed assertion; a missing import never counts as a kill.
+test('stream H mutants cannot acknowledge volatile data or falsify frozen reads', async () => {
+  const pkg = resolve(import.meta.dir, '../..');
+  const root = mkdtempSync(join(tmpdir(), 'stream-h-mutants-'));
+  const mutations = [
+    { name: 'omit-durable-rows', pattern: 'durable ACK survives reopen',
+      from: '        this.flushRows(key);', to: '        // mutant: rows omitted from durable transaction' },
+    { name: 'false-eof', pattern: 'chunks and 1 MiB pages',
+      from: 'const hasMoreAfter = right.lineId < end;', to: 'const hasMoreAfter = false;' },
+    { name: 'ignore-cancel', pattern: 'cancel releases pins immediately',
+      from: "if (cancel.isCancelled()) { this.releasePin(id); return { status: 'cancelled', reason: 'reader cancelled' }; }",
+      to: 'if (false) { this.releasePin(id); }' },
+    { name: 'omit-retry-integrity', pattern: 'same key with changed content',
+      from: "if (prior.request.digest !== request.digest) throw Error('event identity collision');",
+      to: '/* mutant: accepts divergent retry */' },
+  ];
+  try {
+    mkdirSync(join(root, 'server'), { recursive: true });
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (pattern: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { exit, output: out + err };
+    };
+    expect((await run('stream-first H')).exit).toBe(0);
+    for (const mutation of mutations) {
+      expect(original.includes(mutation.from)).toBe(true);
+      writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
+      const result = await run(mutation.pattern);
+      console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
+      expect(result.exit).not.toBe(0);
+      expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
+      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+      writeFileSync(file, original);
+    }
+    expect((await run('stream-first H')).exit).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120000);
+
+test('contract repair mutants go red then restored real seams go green', async () => {
+  const pkg=resolve(import.meta.dir,'../..');
+  const root=mkdtempSync(join(tmpdir(),'contract-repair-mutants-'));
+  const mutations=[
+    {name:'BLOCK-1 digest',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'(this.ports.digest ?? streamDigest)(kind, value)',to:"(this.ports.digest ?? streamDigest)('wrong-operation', value)"},
+    {name:'C3-A ordinal',file:'history-engine.ts',pattern:'real C-H 2 rows',
+      from:'{...request.eventId, scrollOrdinal: request.eventId.scrollOrdinal + j}',to:'request.eventId'},
+    {name:'BLOCK-3 batch',file:'capture-engine.ts',pattern:'real C-H 600 rows',
+      from:'chunk.length < B.decodeRows',to:'chunk.length < 600'},
+    {name:'HIGH-4 C fence',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'const fenced = this.ports.history.beginGap(this.episode);',to:"const fenced = {status:'ok' as const,value:null};"},
+    {name:'HIGH-5 oversize',file:'pipe-history-collector.ts',pattern:'collector retains oversize',
+      from:'this.options.retainOversize && isOversize(answer)',
+      to:'false && isOversize(answer)'},
+    {name:'HIGH-7 unknown',file:'capture-engine.ts',pattern:'real C-H 1 rows',
+      from:'missingCount: this.episode!.missingCount',to:'missingCount: 0'},
+    {name:'HIGH-7 atomic',file:'history-engine.ts',test:'sqlite-history-wave4.test.ts',pattern:'final repair rows stay fenced',
+      from:'durable, complete: false, finalChunk: chunk.final',to:'durable, complete: chunk.final, finalChunk: chunk.final'},
+    {name:'timer',file:'history-engine.ts',test:'sqlite-history-wave4.test.ts',pattern:'abandoned recovery',
+      from:'if (timer) { clearInterval(timer); this.recoveryTimers.delete(timer); timer = null; }',to:'/* mutant retains the interval after cancellation */'},
+    {name:'Worker allocation',file:'pipe-vt-worker.py',pattern:'RPC allocation',
+      from:'reused = state is not None and state == _transaction_state',to:'reused = False',
+      from2:'decode_extension(state["extensionState"]), _transaction_scratch',to2:'decode_extension(state["extensionState"]), None'},
+    {name:'L1 oversized escape',file:'pipe-vt-worker.py',pattern:'oversized OSC checkpoint',
+      from:'prefix = self.pending_sequence',to:'raise ValueError("pending escape exceeds checkpoint budget")'},
+    {name:'C3-C duplicate buffers',file:'pipe-vt-worker.py',pattern:'maximum geometry checkpoint',
+      from:'return {"rows": [],',to:'return {"rows": [contract_row(encode_row(rows[y], s.columns, s.default_char), row_wrapped(rows[y]), row_padded(rows[y], s.columns)) for y in range(s.lines)],'},
+  ];
+  try {
+    const target=join(root,'packages/thumbmux');
+    mkdirSync(target,{recursive:true});
+    cpSync(join(pkg,'server/src'),join(target,'server/src'),{recursive:true});
+    cpSync(join(pkg,'server/tests'),join(target,'server/tests'),{recursive:true});
+    cpSync(join(pkg,'core/src'),join(target,'core/src'),{recursive:true});
+    // The spike2 bundle rides along in server/tests/fixtures: nothing outside
+    // the package is read, so a public clone runs this unchanged.
+    const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});
+    cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
+    writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root,'package.json'),'{"type":"module"}');
+    for(const m of mutations) {
+      const file=join(target,'server/src',m.file),original=readFileSync(file,'utf8');
+      expect(original.includes(m.from)).toBe(true);
+      let mutant=original.replace(m.from,m.to);
+      if(m.from2) {expect(mutant.includes(m.from2)).toBe(true);mutant=mutant.replace(m.from2,m.to2!);}
+      const run=async()=>{
+        const child=Bun.spawn([process.execPath,'test',`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
+          {cwd:root,stdout:'pipe',stderr:'pipe'});
+        const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+        return {exit,output:out+err};
+      };
+      writeFileSync(file,mutant);
+      const red=await run();
+      console.log('CONTRACT_MUTANT_RED',m.name,red.exit,red.output);
+      expect(red.exit).not.toBe(0);expect(red.output).toContain('(fail)');
+      expect(red.output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      writeFileSync(file,original);
+      const green=await run();
+      console.log('CONTRACT_RESTORED_GREEN',m.name,green.exit,green.output);
+      expect(green.exit).toBe(0);expect(green.output).toContain('(pass)');
+    }
+  } finally {rmSync(root,{recursive:true,force:true});}
+},120000);

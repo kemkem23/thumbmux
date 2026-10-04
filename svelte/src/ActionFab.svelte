@@ -55,6 +55,38 @@
 
   let expandedActionId = $state<string | null>(null);
   let fabElement = $state<HTMLButtonElement | null>(null);
+  let slotsElement = $state<HTMLDivElement | null>(null);
+  /** Whether the open list still has rows hidden past its top / bottom edge.
+   * A list that scrolls with nothing saying so is how 4–7 of 15 actions went
+   * unseen on 1024×600 and phone screens — the edge fades instead. */
+  // Measured again when the open animation ends: slots fly in with a
+  // translateY, which counts as overflow while it runs and would otherwise
+  // leave a fade on a list that fits.
+  let moreAbove = $state(false);
+  let moreBelow = $state(false);
+
+  function measureOverflow(): void {
+    const el = slotsElement;
+    if (!el || !open || el.clientHeight <= 0) {
+      moreAbove = false;
+      moreBelow = false;
+      return;
+    }
+    moreAbove = el.scrollTop > 1;
+    moreBelow = el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+  }
+
+  $effect(() => {
+    const el = slotsElement;
+    void open;
+    void actions.length;
+    if (!el) return;
+    measureOverflow();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => measureOverflow());
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
 
   function flyoutFor(actionId: string): FabActionFlyout | undefined {
     return flyouts.find((flyout) => flyout.actionId === actionId);
@@ -117,7 +149,18 @@
   }
 </script>
 
-<div class="slots" class:open aria-hidden={!open}>
+<svelte:window onresize={measureOverflow} />
+<div
+  bind:this={slotsElement}
+  class="slots"
+  class:open
+  class:more-above={moreAbove}
+  class:more-below={moreBelow}
+  aria-hidden={!open}
+  onscroll={measureOverflow}
+  ontransitionend={measureOverflow}
+  data-testid="fab-slots"
+>
   {#each actions as a (a.id)}
     {@const flyout = flyoutFor(a.id)}
     {@const hasChoices = (flyout?.choices.length ?? 0) > 0}
@@ -288,4 +331,55 @@
   /* No per-slot transition-delay: profiling showed staggered delays were the
      ENTIRE perceived button lag — slots start animating on the tap's frame. */
   .slots.open .slot { opacity: 1; transform: none; pointer-events: auto; }
+
+  /* Rows hidden past an edge: fade that edge so the list reads as "more this
+     way" instead of ending at whatever button the viewport happened to cut. */
+  .slots.more-above {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 28px);
+  }
+  .slots.more-below {
+    -webkit-mask-image: linear-gradient(to top, transparent 0, #000 28px);
+    mask-image: linear-gradient(to top, transparent 0, #000 28px);
+  }
+  .slots.more-above.more-below {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%);
+  }
+
+  /* Short screens (1366×768 down to 360×640): one 54px row per action needs
+     ~810px for 15 actions, so the list ran off the top and hid the last 2–7.
+     Two columns halve the stack — 8 rows × 54 = 432px fits the 462px a
+     1024×600 window leaves and the 502px of a 360×640 phone. Order is
+     unchanged (row by row), the gap stays 8px both ways so destructive
+     actions keep their distance from their neighbours. */
+  @media (max-height: 900px) {
+    .slots {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, max-content));
+      justify-content: end;
+      justify-items: stretch;
+      /* `safe`: when even two columns do not fit, plain `end` pushes the
+         overflow past the top edge, where a scroll container cannot reach it
+         (1024×360: first row at -76px, scrollHeight == clientHeight, so the
+         top actions were unreachable and no edge fade could show). `safe`
+         falls back to start on overflow; the plain `end` line stays for
+         browsers without the keyword. */
+      align-content: end;
+      align-content: safe end;
+      gap: 8px;
+    }
+    /* Each column as wide as its widest label, so the menu reads as two
+       tidy columns rather than a ragged scatter. */
+    .slot { flex: 1 1 auto; }
+    /* A row with a flyout grows sideways when expanded; spanning both
+       columns keeps that growth from re-flowing every other button. */
+    .slot-row.has-choices { grid-column: 1 / -1; }
+  }
+  /* Mouse on a short screen: 46px is a thumb size. 36px still clears the
+     24px WCAG floor with room, and keeps 8 rows inside an 800×600 window. */
+  @media (max-height: 900px) and (pointer: fine) {
+    .slot,
+    .choice { min-height: 36px; }
+  }
 </style>

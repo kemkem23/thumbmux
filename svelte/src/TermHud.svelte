@@ -382,6 +382,43 @@
     -webkit-line-clamp: 3;
     line-clamp: 3;
   }
+  /* Phone width: name and note share ONE row, each cut with … — the note used
+     to wrap onto a second 44px row of its own, so the HUD took 93px (14-15%
+     of a phone screen) to show a line the expanded HUD already shows in full.
+     The activity slot, when a host passes one, keeps a single line on the row
+     below instead of three. Selectors stay at the slot's own specificity so a
+     host seam that restyles the slot (e.g. a full-width rail) still wins. */
+  @media (max-width: 480px) {
+    .hud-dense-fields {
+      flex-wrap: wrap;
+    }
+    .hud-copy-title {
+      flex: 0 1 auto;
+      max-width: 60%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      overflow-wrap: normal;
+    }
+    .hud-note.hud-note-dense {
+      flex: 1 1 0;
+      display: block;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow-wrap: normal;
+      -webkit-line-clamp: unset;
+      line-clamp: none;
+    }
+    .hud-dense-adornment {
+      order: 1;
+      flex: 1 0 100%;
+      -webkit-line-clamp: 1;
+      line-clamp: 1;
+    }
+    .hud-separator:has(+ .hud-dense-adornment) {
+      display: none;
+    }
+  }
   .nm { display: block; font: 700 12px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Slotted variant — only reached when `titleAdornment` is passed, so a row
      without one keeps the block layout above byte for byte. */

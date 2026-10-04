@@ -596,10 +596,14 @@ test('newarch D11: a malformed frame is refused alone; the queued frame stays li
   const q=[...internal.queues.values()][0];expect(q.length).toBe(2);
   const pendingBefore=internal.pendingBytes(),tailBytes=q[1].bytes;
   out.refusals=[];
-  for(const f of bad){try{await s.replaceScreen(f);out.refusals.push('accepted');}catch(error){out.refusals.push(String(error));}}
-  // Refused synchronously, before the queued tail or any reservation moved.
-  expect(out.refusals).toEqual(['Error: invalid-frame','Error: invalid-cursor']);
+  // Validation returns rejected promises synchronously. Inspect the reservation
+  // before yielding: awaiting a rejection also lets the independent row worker
+  // consume q, so q[1] after await is not a stable observation of refusal.
+  const rejected=bad.map(f=>s.replaceScreen(f).then(()=> 'accepted',error=>String(error)));
+  expect(q).toHaveLength(2);
   expect(q[1].bytes).toBe(tailBytes);expect(internal.pendingBytes()).toBe(pendingBefore);
+  out.refusals=await Promise.all(rejected);
+  expect(out.refusals).toEqual(['Error: invalid-frame','Error: invalid-cursor']);
   await r;out.goodReceipt=await kept.then(()=>'resolved',e=>String(e));
   expect(out.goodReceipt).toBe('resolved');
   const shown=JSON.parse(String(s.screen(key)!.cells_json));
@@ -820,7 +824,7 @@ const I4_FIX2_S_MUTATIONS=[
 // NEWARCH-SWITCHON S2: each mutant undoes one part of the compact store.
 const S2_MUTATIONS=[
  {name:'S2 per-cell-json',file:'codec.ts',before:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n",after:"export function encodeRow(text: string, cells: readonly Cell[]): { text: string; cells: string } {\n  return legacy(text, cells);\n"},
- {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean):void { return;'},
+ {name:'S2 no-seal',file:'projection-store.ts',before:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> {',after:'function sealBlocks(disk:Database,panes:SqlRow[],force:boolean,aged?:Set<number>):Set<number> { return new Set();'},
  {name:'S2 hidden-flag',file:'codec.ts',before:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${style || ''}`",after:"`${count}:${colourToken(fg)}:${colourToken(bg)}:${(style & ~128) || ''}`"},
  {name:'S2 v5-as-v3',file:'schema.ts',before:'export const PROJECTION_SCHEMA_VERSION = 5;',after:'export const PROJECTION_SCHEMA_VERSION = 3;'},
 ];
@@ -911,8 +915,12 @@ async function runI2Mutations(cases:typeof I2_FIX1_MUTATIONS,label:string) {
        s.flush();let R=0;
        for(let at=0;at<6000;at+=2000)for(const l of s.readPage(s.token(key),at,2000).lines)R+=Buffer.byteLength(cellsToAnsi(l.cells));
        const folder=data+'/newarch-v5',D=readdirSync(folder).reduce((n,f)=>n+statSync(folder+'/'+f).size,0);
-       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R,refused}));
+       // D3 seals the settled tail at the barrier, and deflate hides a bloated row codec inside blocks:
+       // the stored per-line encoding (RAM rows, the same encodeRow the disk writes) is judged directly too.
+       const stored=Number(s.ram.db.query('SELECT sum(length(CAST(text AS BLOB))+length(CAST(cells AS BLOB))) AS n FROM na_line').get().n);
+       console.log('S2_MUTATION_RATIO',JSON.stringify({name,D,R,ratio:D/R,stored,storedRatio:stored/R,refused}));
        assert(D<=1.5*R,'disk must stay within 1.5 x the rows it holds: D/R='+(D/R).toFixed(3));
+       assert(stored<=1.5*R,'stored rows must stay within 1.5 x their ANSI bytes: stored/R='+(stored/R).toFixed(3));
       }
      } else if(name.startsWith('I4-S2')) {
       const physical={text:'P01 000123 color3 ไทย漢字😀 '+'x'.repeat(80),cells:Array.from({length:120},(_,i)=>({...cell(i<34?String.fromCharCode(65+i%26):'x'),fg:i<34?i%7:null}))};
@@ -1068,11 +1076,21 @@ test('I2: shutdown after 2000 and 20000 accepted rows has durable receipts and i
   const root=mkdtempSync(join(tmpdir(),'na-i2-drain-')),key={serverIdentity:'drain',paneId:'%1',birthGeneration:1};
   let s=createProjectionStore({historyRoot:root,mode:'create'});
   try {
-   for(let n=0;n<count;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
+   // A refused row is re-offered after drained() (FIX1 §3): 20000 rows (~10.7 MB) outrun the pane quota
+   // (~4.96 MB) when the disk is slow (GitHub runner). A drain that never comes throws, never a pass.
+   let refused=0;
+   for(let n=0;n<count;n++) {
+    const event={paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}};
+    while(isProjectionRefusal(await s.appendScroll(event))) {
+     refused++;let timer:ReturnType<typeof setTimeout>|undefined;
+     const done=await Promise.race([s.drained(key).then(()=>true),new Promise<boolean>(ok=>{timer=setTimeout(()=>ok(false),10000);})]);
+     clearTimeout(timer);if(!done)throw Error('refused row did not drain within 10 s');
+    }
+   }
    const pendingAtClose=s.health().pendingBytes,started=performance.now();await s.close();const closeMs=performance.now()-started;
    s=createProjectionStore({historyRoot:root,mode:'recover'});
    expect(s.token(key).nextLineId).toBe(count);expect(s.token(key).revision).toBe(s.token(key).durableRevision);
-   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs}));
+   console.log('I2_DRAIN',JSON.stringify({count,pendingAtClose,closeMs,refused}));
   }finally{await s.close();rmSync(root,{recursive:true,force:true});}
  }
 },60000);

@@ -46,6 +46,10 @@ export const PIPE_VT_ATTR = {
 } as const;
 
 export type PipeVtScroll = {
+  /** Event that finalized this row, distinct from its original write seq. */
+  packetEpoch?: number;
+  packetSeq?: number | null;
+  scrollOrdinal?: number | null;
   row: PipeVtRow;
   /** Row continues into the next physical row (soft wrap). */
   wrap: boolean;
@@ -81,6 +85,74 @@ export type PipeVtUpdate = {
   frame: PipeVtFrame;
   parseNs: number;
   encodeNs: number;
+  /** Worker stage durations (absent from workers older than P2 diagnostics). */
+  stages?: PipeVtWorkerStages;
+  /** json.dumps + UTF-8 of this update's own body, in the worker. */
+  serializeNs?: number;
+};
+
+/**
+ * Worker-side durations for the D frames acknowledged by one update, each on
+ * the worker's monotonic clock. `waitNs` is how long the oldest D frame sat
+ * complete in the worker before dispatch (fairness / budget wait), `holdNs`
+ * that frame's completion -> emit start (wait + parse of every frame + the
+ * coalescing window). Kernel socket/FIFO buffering before the worker read is
+ * outside every worker stage and lands in the host's transport residual.
+ */
+export type PipeVtWorkerStages = {
+  inFrames: number;
+  inBytes: number;
+  waitNs: number;
+  maxWaitNs: number;
+  holdNs: number;
+  /**
+   * Bounds on how late the read that completed the oldest frame came after
+   * its bytes became readable: lower = sibling channels served earlier in the
+   * same poll turn, upper = the loop-busy window since the previous poll (a
+   * blocked poll counts only its own wait). Both sit inside `transportMs`.
+   */
+  readLagNs: number;
+  readLagMaxNs: number;
+};
+
+/**
+ * One update's path, host clock (ms) for host spans, worker durations as
+ * reported. Spans nest, so the stages do not sum across different updates:
+ *   feed(seqFrom) ─ worker hold ─ encode ─ serialize ─ arrival ─ mainQueue ─ decode ─ consumer
+ * `transportMs` = feedToArrival - (hold + encode + serialize): host write
+ * buffering, kernel socket/FIFO (including `readLag*` — the shared loop busy
+ * with sibling panes), worker output buffering and event-loop delivery. It is a residual of nested durations, never a clock difference.
+ * The old driver's "parse" (ingest -> onFrame) is feedToArrival + mainQueue +
+ * decode + (part of) consumer, not parser CPU time; parser CPU is `worker.parseNs`.
+ */
+export type PipeVtStageTrace = {
+  seqFrom: number | null;
+  seqTo: number | null;
+  epoch: number;
+  /** Fed D frames whose seq this update acknowledged (0 for partial emits). */
+  matchedFeeds: number;
+  /** I2: join with driver pane/session + epoch + these inclusive feed bounds. */
+  matchedSeqFrom: number | null;
+  matchedSeqTo: number | null;
+  clockDomain: "host-performance-ms";
+  host: { firstFeedAt: number | null; arrivedAt: number; decodeStartedAt: number; decodedAt: number; consumedAt: number };
+  consumerSucceeded: boolean;
+  /** Cumulative missing observations; never treat these as zero latency. */
+  traceDropped: number;
+  traceEpochCensored: number;
+  bodyBytes: number;
+  /** Host feed of the oldest / newest matched seq -> arrival of the completing chunk. */
+  feedToArrivalMs: number | null;
+  lastFeedToArrivalMs: number | null;
+  /** Arrival -> start of this update's decode: waits behind earlier consumers. */
+  mainQueueMs: number;
+  decodeMs: number;
+  /** onUpdate call until its receipt settled. */
+  consumerMs: number;
+  /** Oldest matched feed -> consumer settled (the host-visible end to end). */
+  feedToConsumedMs: number | null;
+  transportMs: number | null;
+  worker: PipeVtWorkerStages & { parseNs: number; encodeNs: number; serializeNs: number } | null;
 };
 
 export type PipeVtReady = { vendorSha256: string; cols: number; rows: number; pid: number };
@@ -133,7 +205,17 @@ export type PipeVtWorkerOptions = {
   assets?: PipeVtAssets;
   python?: string;
   now?: () => number;
+  /**
+   * Diagnostics only: called after each update's consumer settled. Without it
+   * no feed timestamps are kept. Never throws into the pipe path.
+   */
+  onStageTrace?: (trace: PipeVtStageTrace) => void;
+  /** Monotonic ms clock for stage traces (default performance.now). */
+  traceNow?: () => number;
 };
+
+/** Feed timestamps kept for tracing; older ones are dropped and counted. */
+export const PIPE_VT_TRACE_PENDING_MAX = 8192;
 
 /** Data frames share this budget; control frames (Z/F/X/C/Q) never compete for it. */
 export const PIPE_VT_DATA_QUEUE_BYTES = 1024 * 1024;
@@ -265,6 +347,13 @@ export class PipeVtWorker {
   private abandoned = false;
   private closePromise: Promise<PipeVtDrainReceipt> | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Traced feeds not yet acknowledged: parallel seq / host-time columns. */
+  private traceSeqs: number[] = [];
+  private traceTimes: number[] = [];
+  private traceEpochs: number[] = [];
+  private traceEpochCensored = 0;
+  private traceHead = 0;
+  private traceDropped = 0;
   readonly ready: Promise<PipeVtReady>;
   pid: number | null = null;
 
@@ -386,7 +475,8 @@ export class PipeVtWorker {
       this.outputPaused = true;
       (this.socket ?? this.child?.stdout)?.pause();
     }
-    this.outputTail = this.outputTail.then(() => this.onStdout(chunk)).catch((error) => {
+    const arrivedAt = this.options.onStageTrace ? this.traceClock() : 0;
+    this.outputTail = this.outputTail.then(() => this.onStdout(chunk, arrivedAt)).catch((error) => {
       this.notifyFault({ kind: "protocol", at: (this.options.now ?? Date.now)(), message: String(error) });
     }).then(() => this.releaseOutput(chunk.byteLength));
   }
@@ -411,7 +501,72 @@ export class PipeVtWorker {
     return this.outputPendingBytes;
   }
 
-  private async onStdout(chunk: Buffer): Promise<void> {
+  /** Traced feeds awaiting acknowledgement, and feeds dropped from tracing. */
+  traceBacklog(): { pending: number; dropped: number; retained: number; epochCensored: number } {
+    return { pending: this.traceSeqs.length - this.traceHead, dropped: this.traceDropped, retained: this.traceSeqs.length, epochCensored: this.traceEpochCensored };
+  }
+
+  private traceClock(): number {
+    return (this.options.traceNow ?? performance.now.bind(performance))();
+  }
+
+  private traceFeed(seq: number, fedAt: number, epoch: number): void {
+    if (this.traceSeqs.length - this.traceHead >= PIPE_VT_TRACE_PENDING_MAX) { this.traceHead++; this.traceDropped++; }
+    this.traceSeqs.push(seq);
+    this.traceTimes.push(fedAt);
+    this.traceEpochs.push(epoch);
+    this.compactTrace();
+  }
+
+  /** Keep both columns within twice the pending window. */
+  private compactTrace(): void {
+    if (this.traceHead > 1024 && this.traceHead * 2 > this.traceSeqs.length) {
+      this.traceSeqs = this.traceSeqs.slice(this.traceHead);
+      this.traceTimes = this.traceTimes.slice(this.traceHead);
+      this.traceEpochs = this.traceEpochs.slice(this.traceHead);
+      this.traceHead = 0;
+    }
+  }
+
+  /** Only the same epoch can acknowledge a feed; superseded feeds are censored. */
+  private traceAck(seqTo: number | null, epoch: number): [number, number | null, number | null, number | null, number | null] {
+    let n = 0, first: number | null = null, last: number | null = null;
+    let seqFrom: number | null = null, matchedTo: number | null = null;
+    while (this.traceHead < this.traceSeqs.length) {
+      const e = this.traceEpochs[this.traceHead]!;
+      if (e < epoch) { this.traceHead++; this.traceEpochCensored++; continue; }
+      if (e !== epoch || seqTo === null || this.traceSeqs[this.traceHead]! > seqTo) break;
+      const seq = this.traceSeqs[this.traceHead]!;
+      const t = this.traceTimes[this.traceHead++]!;
+      first ??= t; last = t; seqFrom ??= seq; matchedTo = seq; n++;
+    }
+    this.compactTrace();
+    return [n, first, last, seqFrom, matchedTo];
+  }
+
+  private emitTrace(update: PipeVtUpdate, bodyBytes: number, arrivedAt: number, startedAt: number,
+    decodedAt: number, consumedAt: number, consumerSucceeded: boolean): void {
+    const [matchedFeeds, first, last, matchedSeqFrom, matchedSeqTo] = this.traceAck(update.seqTo, update.epoch);
+    const stages = update.stages;
+    const worker = stages ? { ...stages, parseNs: update.parseNs, encodeNs: update.encodeNs, serializeNs: update.serializeNs ?? 0 } : null;
+    const feedToArrivalMs = first === null ? null : arrivedAt - first;
+    const trace: PipeVtStageTrace = {
+      seqFrom: update.seqFrom, seqTo: update.seqTo, epoch: update.epoch, matchedFeeds, bodyBytes,
+      matchedSeqFrom, matchedSeqTo, clockDomain: "host-performance-ms",
+      host: { firstFeedAt: first, arrivedAt, decodeStartedAt: startedAt, decodedAt, consumedAt },
+      consumerSucceeded, traceDropped: this.traceDropped, traceEpochCensored: this.traceEpochCensored,
+      feedToArrivalMs, lastFeedToArrivalMs: last === null ? null : arrivedAt - last,
+      mainQueueMs: startedAt - arrivedAt, decodeMs: decodedAt - startedAt, consumerMs: consumedAt - decodedAt,
+      feedToConsumedMs: first === null ? null : consumedAt - first,
+      transportMs: feedToArrivalMs === null || worker === null ? null
+        : feedToArrivalMs - (worker.holdNs + worker.encodeNs + worker.serializeNs) / 1e6,
+      worker,
+    };
+    try { this.options.onStageTrace!(trace); }
+    catch (error) { console.error("[pipe-vt] onStageTrace callback failed:", error); }
+  }
+
+  private async onStdout(chunk: Buffer, arrivedAt = 0): Promise<void> {
     if (this.abandoned) return;
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
     let offset = 0;
@@ -424,6 +579,8 @@ export class PipeVtWorker {
         throw new Error("worker output exceeds 16 MiB frame bound");
       }
       if (this.pending.length - offset < 5 + length) break;
+      const tracing = kind === "U" && this.options.onStageTrace !== undefined;
+      const startedAt = tracing ? this.traceClock() : 0;
       const body = this.pending.subarray(offset + 5, offset + 5 + length).toString("utf8");
       offset += 5 + length;
       let message: unknown;
@@ -434,6 +591,8 @@ export class PipeVtWorker {
         continue;
       }
       if (kind === "U" || kind === "H") {
+        const decodedAt = tracing ? this.traceClock() : 0;
+        let consumerSucceeded = true;
         try {
           const receipt = kind === "U" ? this.options.onUpdate(message as PipeVtUpdate)
             : this.options.onHistoryClear?.(message as { seq: number; epoch: number });
@@ -442,8 +601,10 @@ export class PipeVtWorker {
           if (receipt && typeof (receipt as PromiseLike<unknown>).then === "function") await receipt;
           if (this.abandoned) return;
         } catch (error) {
+          consumerSucceeded = false;
           this.notifyFault({ kind: "worker-error", at: (this.options.now ?? Date.now)(), message: `consumer failed: ${String(error)}` });
         }
+        if (tracing) this.emitTrace(message as PipeVtUpdate, length, arrivedAt, startedAt, decodedAt, this.traceClock(), consumerSucceeded);
       }
       else if (kind === "B") {
         this.quitAck = (message as { workerEof?: boolean }).workerEof === true;
@@ -535,7 +696,10 @@ export class PipeVtWorker {
     const prefix = Buffer.allocUnsafe(16);
     prefix.writeBigUInt64BE(BigInt(seq));
     prefix.writeBigUInt64BE(BigInt(epoch), 8);
-    return this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
+    const fedAt = this.options.onStageTrace ? this.traceClock() : 0;
+    const accepted = this.write([header("D", 16 + bytes.byteLength), prefix, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)], false);
+    if (accepted && this.options.onStageTrace) this.traceFeed(seq, fedAt, epoch);
+    return accepted;
   }
 
   setScrollOnClear(enabled: boolean): boolean {
@@ -555,6 +719,17 @@ export class PipeVtWorker {
     payload.writeUInt16BE(rows, 2);
     payload.writeUInt32BE(geometryGeneration >>> 0, 4);
     return this.write([header("Z", 8), payload]);
+  }
+
+  /** Stream-first resize is ordered in the SAME namespace as byte packets.
+   * Legacy resize remains available; its output is not a v1 event proof. */
+  resizePacket(seq: number, epoch: number, cols: number, rows: number, generation: number): boolean {
+    if (![seq, epoch, generation, cols, rows].every(n => Number.isSafeInteger(n) && n >= 0)
+      || seq < 1 || cols < 1 || rows < 1 || cols > 240 || rows > 80 || generation > 0xffffffff) return false;
+    const payload = Buffer.allocUnsafe(24);
+    payload.writeBigUInt64BE(BigInt(seq), 0); payload.writeBigUInt64BE(BigInt(epoch), 8);
+    payload.writeUInt16BE(cols, 16); payload.writeUInt16BE(rows, 18); payload.writeUInt32BE(generation, 20);
+    return this.write([header("V", payload.length), payload]);
   }
 
   requestFull(seq: number): boolean {
@@ -619,3 +794,153 @@ export class PipeVtWorker {
     if (this.lease) this.lease.kill(signal); else this.child?.kill(signal);
   }
 }
+
+/** Stateless J requests share the existing multiplex worker. I owns socket
+ * routing and cancellation; C owns the candidate state and synchronous install.
+ * The transport must reserve request/reply bytes and retire a cancelled RPC
+ * before resolving. It must never route speculative U/H to live consumers. */
+export type CaptureVtRowPage = {
+  readonly scrolls: readonly import('./stream-contract').RowContent[];
+  readonly startOrdinal: number;
+  readonly nextOrdinal: number;
+  readonly chargedBytes: number;
+} & ({ readonly complete: false } | {
+  readonly complete: true;
+  readonly state: import('./stream-contract').VtState;
+  readonly frame: import('./stream-contract').FrameDelta;
+});
+export type CaptureVtStreamStep = {
+  readonly startOrdinal: number;
+  readonly nextOrdinal: number;
+  readonly chargedBytes: number;
+  readonly scrolls: readonly import('./stream-contract').RowContent[];
+  /** Only the last step has a candidate. Install AFTER the consumer has
+   * accepted all pages; dropping the iterator never mutates the live VT. */
+  readonly candidate?: importCaptureVtTransaction;
+};
+export interface CaptureVtRpc {
+  transaction(request: {
+    state: import('./stream-contract').VtState | null;
+    identity: import('./stream-contract').StreamIdentity;
+    geometry: import('./stream-contract').Geometry;
+    scrollOnClear: boolean;
+    screenRevision: number;
+    event?: import('./stream-contract').InputEvent;
+    rowStream?: { readonly startOrdinal: number; readonly maxBytes: number };
+  }): Promise<import('./stream-contract').Result<{ readonly pressure: true } | CaptureVtRowPage | {
+    state: import('./stream-contract').VtState;
+    frame: import('./stream-contract').FrameDelta;
+    scrolls: readonly import('./stream-contract').RowContent[];
+  }>>;
+}
+
+/** Concrete transactional checkpoint adapter. No process per pane, timer or
+ * socket is created here; I supplies the shared J transport once. */
+export class CheckpointCaptureVt implements importCaptureVt {
+  private state: import('./stream-contract').VtState;
+  private frame: import('./stream-contract').FrameDelta;
+  private generation = 0;
+  private constructor(private readonly rpc: CaptureVtRpc, state: import('./stream-contract').VtState,
+    frame: import('./stream-contract').FrameDelta, private readonly scrollOnClear: boolean) {
+    this.state = structuredClone(state); this.frame = structuredClone(frame);
+  }
+  static async create(rpc: CaptureVtRpc, identity: import('./stream-contract').StreamIdentity,
+    geometry: import('./stream-contract').Geometry, scrollOnClear: boolean): Promise<import('./stream-contract').Result<CheckpointCaptureVt>> {
+    const r = await rpc.transaction({state:null,identity,geometry,scrollOnClear,screenRevision:0});
+    if (r.status !== 'ok') return r;
+    if ('pressure' in r.value) return {status:'busy',reason:'pressure',retryAfterMs:10};
+    if ('complete' in r.value && !r.value.complete) return {status:'error',code:'integrity',message:'unexpected VT continuation'};
+    if (Buffer.byteLength(JSON.stringify(r.value))*2 > 2*1024*1024)
+      return {status:'busy',reason:'pressure',retryAfterMs:10};
+    return {status:'ok',value:new CheckpointCaptureVt(rpc,r.value.state,r.value.frame,scrollOnClear)};
+  }
+  /** C-local streaming API; the frozen K interfaces are unchanged. The
+   * consumer drains/spools each step before requesting the next. Cursor replay
+   * uses the SAME captured state/event, never the live state or a new packet ID.
+   * Partial output is provisional, not a checkpoint or an append ACK. */
+  async *prepareStream(event: import('./stream-contract').InputEvent, maxBytes = 512 * 1024):
+    AsyncGenerator<import('./stream-contract').Result<CaptureVtStreamStep>, void, void> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 8 || maxBytes > 512 * 1024) {
+      yield {status:'error',code:'integrity',message:'VT row page budget'}; return;
+    }
+    if ((event.payload.kind === 'bytes' && event.payload.bytes.length > 16384)
+      || Buffer.byteLength(JSON.stringify(event))*2 > 256*1024) {
+      yield {status:'busy',reason:'pressure',retryAfterMs:10}; return;
+    }
+    const generation = this.generation;
+    const request = {state:structuredClone(this.state), event:structuredClone(event), identity:structuredClone(event.identity),
+      geometry:this.state.geometry, scrollOnClear:this.scrollOnClear, screenRevision:this.frame.screenRevision+1};
+    let ordinal = 0;
+    let live = true;
+    try {
+      while (live) {
+        if (generation !== this.generation) { yield {status:'stale',reason:'identity'}; return; }
+        const reply = await this.rpc.transaction({...request,rowStream:{startOrdinal:ordinal,maxBytes}});
+        if (reply.status !== 'ok') { yield reply; return; }
+        if (generation !== this.generation) { yield {status:'stale',reason:'identity'}; return; }
+        const page = reply.value;
+        if ('pressure' in page) { yield {status:'error',code:'unsupported',message:'VT single row budget'}; return; }
+        if (!('complete' in page) || page.scrolls.length > 256 || page.startOrdinal !== ordinal || !Number.isSafeInteger(page.nextOrdinal)
+          || page.nextOrdinal !== ordinal + page.scrolls.length || (!page.complete && !page.scrolls.length)
+          || !Number.isSafeInteger(page.chargedBytes) || page.chargedBytes < Buffer.byteLength(JSON.stringify(page.scrolls))*4
+          || page.chargedBytes > maxBytes || page.scrolls.some(row=>row.uncertainFields.length)) {
+          yield {status:'error',code:'integrity',message:'VT row continuation fence'}; return;
+        }
+        const freeze=(value:unknown):void=>{
+          if(value && typeof value==='object') {for(const child of Object.values(value))freeze(child);Object.freeze(value);}
+        };
+        freeze(page);
+        ordinal = page.nextOrdinal;
+        const step = {startOrdinal:page.startOrdinal,nextOrdinal:ordinal,chargedBytes:page.chargedBytes,scrolls:page.scrolls};
+        if (!page.complete) { yield {status:'ok',value:step}; continue; }
+        // Final state has the existing, separate bounded VT-state allocation.
+        if (Buffer.byteLength(JSON.stringify([page.state,page.frame]))*2 > 2*1024*1024) {
+          yield {status:'error',code:'unsupported',message:'VT state budget'}; return;
+        }
+        if (JSON.stringify(page.frame.identity) !== JSON.stringify(request.identity)) {
+          yield {status:'error',code:'integrity',message:'VT stream identity'}; return;
+        }
+        let finished = false;
+        const candidate: importCaptureVtTransaction = {
+          frame:page.frame,scrolls:[],snapshot:async()=>({status:'ok',value:structuredClone(page.state)}),
+          install:()=>{
+            if (!live || finished || generation !== this.generation) throw new Error('stale VT stream');
+            finished=true; this.generation++; this.state=structuredClone(page.state); this.frame=structuredClone(page.frame);
+          },discard:()=>{finished=true;}
+        };
+        yield {status:'ok',value:{...step,candidate}};
+        return;
+      }
+    } finally { live=false; }
+  }
+  screen() { return structuredClone(this.frame); }
+  async snapshot(): Promise<import('./stream-contract').Result<import('./stream-contract').VtState>> {
+    return {status:'ok',value:structuredClone(this.state)};
+  }
+  async prepare(event: import('./stream-contract').InputEvent) { return this.stage(this.state,event); }
+  async restore(state: import('./stream-contract').VtState, identity?: import('./stream-contract').StreamIdentity) { return this.stage(state,undefined,identity); }
+  private async stage(state: import('./stream-contract').VtState, event?: import('./stream-contract').InputEvent, identity?: import('./stream-contract').StreamIdentity): Promise<import('./stream-contract').Result<importCaptureVtTransaction>> {
+    const generation = this.generation;
+    const r = await this.rpc.transaction({state:structuredClone(state),identity:event?.identity ?? identity ?? this.frame.identity,
+      geometry:state.geometry,scrollOnClear:this.scrollOnClear,screenRevision:this.frame.screenRevision + (event ? 1 : 0),
+      ...(event ? {event} : {})});
+    if (r.status !== 'ok') return r;
+    if ('pressure' in r.value) return {status:'error',code:'unsupported',message:'VT expansion budget'};
+    if ('complete' in r.value && !r.value.complete) return {status:'error',code:'integrity',message:'unexpected VT continuation'};
+    const candidate=structuredClone(r.value);
+    if (Buffer.byteLength(JSON.stringify(candidate))*2 > 2*1024*1024)
+      return {status:'error',code:'unsupported',message:'VT expansion budget'};
+    const freeze=(v:unknown):void=>{
+      if(v && typeof v==='object') {for(const child of Object.values(v))freeze(child);Object.freeze(v);}
+    };
+    freeze(candidate);
+    let finished=false;
+    return {status:'ok',value:{frame:candidate.frame,scrolls:candidate.scrolls,
+      snapshot:async()=>({status:'ok',value:structuredClone(candidate.state)}),
+      install:()=>{
+        if (finished || generation!==this.generation) throw new Error('stale VT transaction');
+        finished=true; this.generation++; this.state=candidate.state; this.frame=candidate.frame;
+      },discard:()=>{finished=true;}}};
+  }
+}
+import type { CaptureVt as importCaptureVt, CaptureVtTransaction as importCaptureVtTransaction } from './capture-engine';
