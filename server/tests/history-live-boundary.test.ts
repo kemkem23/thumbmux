@@ -444,6 +444,25 @@ test("CANARY-FIX M: a pipe frame reaches viewers only after its RAM receipt, and
   } finally { await runtime.close(); }
 });
 
+// NEWARCH native-growth: settled receive stamps are dropped as they settle, not after 4096 per pane.
+// At 0.5 chunks/s the old 4096 floor kept every stamp for ~2.3 h: 21 panes grew the heap for hours.
+test("NEWARCH native-growth: settled receive stamps do not accumulate per pane", async () => {
+  const store = { token: () => { throw new Error("no pane"); }, replaceScreen: async () => ({ accepted: true, revision: 1, durableRevision: 0, nextLineId: 0 }) };
+  const runtime = new PipeHistoryRuntime({ sharedParser: false, store: store as never });
+  const pane = new PipeHistoryPane(runtime, {
+    paneKey: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, session: "s", calibrate: false,
+    meta: { cols: 4, rows: 2, alternate: false, cursor: { x: 0, y: 0, visible: true }, historySize: 0, historyLimit: 100, panePid: 1, mouseSgr: false, mouseAny: false },
+    capture: async () => { throw new Error("unused"); },
+  });
+  try {
+    const p = pane as unknown as { receiveTimes: { seq: number; at: bigint }[]; settleReceipts(seq: number): void };
+    for (let seq = 1; seq <= 1000; seq++) { p.receiveTimes.push({ seq, at: runtime.nowNs() }); p.settleReceipts(seq); }
+    expect(pane.pendingReceipts()).toBe(0);
+    expect(pane.stats.latencyMs.length).toBeGreaterThan(0);
+    expect(p.receiveTimes.length).toBeLessThanOrEqual(128);
+  } finally { await runtime.close(); }
+});
+
 // ── NEWARCH2 M3: row ownership — frozen shared rows, certified ids on the ring floor, one canonical row per capture row ──
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
