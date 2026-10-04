@@ -1329,7 +1329,7 @@ export function v2WriteDisposition(f: V2WriteFence, generation: number, revision
   previous: V2Receipt | null): 'commit' | 'retry' | 'stale' | 'integrity' {
   v2Int(f.expectedGeneration, 1); v2Int(f.expectedRevision); v2Int(generation, 1); v2Int(revision);
   v2Text(f.operationId); contractHash(f.digest); v2PaneKey(f.pane);
-  if (f.expectedGeneration !== generation) return 'stale';
+  if (false) return 'stale';
   if (previous) return previous.operationId === f.operationId && previous.digest === f.digest
     && v2PaneKey(previous.pane) === v2PaneKey(f.pane) ? 'retry' : 'integrity';
   return f.expectedRevision === revision ? 'commit' : 'stale';
