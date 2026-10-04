@@ -857,6 +857,7 @@ export class NewarchV2Display {
     if (pinId && pinSegmentId && this.pins) {
       const pinned = await this.pins.submit({ kind: "pin", pinId, segmentId: pinSegmentId });
       if (pinned.status !== "ok") return pinned;
+      await this.pins.submit({ kind: "release-pin", pinId });
     }
     try {
       const read = await this.reader.page(request);
