@@ -582,7 +582,7 @@ export class StreamCaptureChunkDecoder {
 
 // Q22 shares a single SGR/cell projection between pipe and visible capture.
 import { cellToSemanticCell, semanticStyleToSgr, v2Digest, v2AuditComparable,
-  v2PaneKey, streamCanonical, validateV2Checkpoint, NEWARCH_V2_DEFAULT_CONFIG,
+  v2PaneKey, streamCanonical, validateV2Checkpoint, NEWARCH_V2_DEFAULT_CONFIG, NEWARCH_V2_LIMITS,
   type V2AuditEvidence, type V2AuditResult, type V2AuditWatermark, type V2Config,
   type V2LiveCheckpoint, type V2RuleStamp, type NewarchV2Incident, type RowContent,
 } from './stream-contract';
@@ -599,7 +599,12 @@ export function v2ApplySgr(attributes: readonly number[], body: string): number[
 }
 export const V2_AUDIT_CAPTURE_FLAGS = Object.freeze(['capture-pane','-p','-e','-N'] as const);
 export function normalizeV2Capture(raw: string, geometry: {columns:number;rows:number}, maxBytes=262144): readonly RowContent[] {
+  if(!Number.isSafeInteger(geometry.columns)||geometry.columns<1||geometry.columns>NEWARCH_V2_LIMITS.maxColumns
+    ||!Number.isSafeInteger(geometry.rows)||geometry.rows<1||geometry.rows>NEWARCH_V2_LIMITS.maxRows
+    ||!Number.isSafeInteger(maxBytes)||maxBytes<1||maxBytes>NEWARCH_V2_DEFAULT_CONFIG.audit.maxCaptureBytes)
+    throw Error('audit geometry/byte limit');
   if(Buffer.byteLength(raw)>maxBytes)throw Error('audit capture bytes');
+  for(const {segment} of SEGMENTER.segment(raw))if(Buffer.byteLength(segment)>4096)throw Error('audit grapheme budget');
   // -N preserves trailing cells; never -J or -S - (history is not a screen).
   const lines=raw.split('\n');if(lines.at(-1)==='')lines.pop();
   if(lines.length!==geometry.rows)throw Error('audit visible row count');

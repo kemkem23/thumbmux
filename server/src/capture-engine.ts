@@ -1024,7 +1024,7 @@ export class CaptureCadence {
 import { charCellWidth } from '@thumbmux/core';
 import {
   NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest,
-  v2IncidentId, validateV2Checkpoint, validateV2Config,
+  v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
   type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
   type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer,
@@ -1079,7 +1079,7 @@ export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): reado
   const definitions: V2RuleDefinition[]=([
     ['ordered-scroll',10,'accept'],['bounded-tail',20,'defer'],['explicit-gap',30,'gap'],
   ] as const).map(([ruleId,priority,action])=>({stamp:{ruleId,version:'1',configVersion:config.configVersion},priority,
-    preconditions:['identity','fixed-geometry','contiguous-bytes','known-vt','ordered-evidence'],
+    preconditions:action==='gap'?[]:['identity','fixed-geometry','contiguous-bytes','known-vt','ordered-evidence'],
     maxInputBytes:V2L.pendingBytesPerPane,maxInputRows:V2L.pendingRowsPerPane,action}));
   for(const requested of config.rules) if(!definitions.some(d=>d.stamp.ruleId===requested.ruleId && d.stamp.version===requested.version))
     throw Error('v2 rule is not compiled into allowlist');
@@ -1103,7 +1103,8 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
   const active=()=>s[s.active];
   const cursor=()=>active().cursor;
   const row=()=>active().rows[cursor().y]!;
-  const blank=()=>v2Blank(columns,s.attributes);
+  const eraseStyle=()=>semanticStyleToSgr({...sgrToSemanticStyle(s.attributes),attrs:0,fg:-1});
+  const blank=()=>v2Blank(columns,eraseStyle());
   const cancelWrap=()=>{active().wrapPending=false;s.wrapPending=false;};
   const save=()=>{const b=active();b.savedCursor={...b.cursor};b.savedAttributes=[...s.attributes];b.savedModes={...s.modes};};
   const restore=()=>{const b=active();b.cursor={...b.savedCursor};s.attributes=[...b.savedAttributes];s.modes={...b.savedModes};cancelWrap();};
@@ -1120,9 +1121,9 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
   };
   const lf=()=>{cancelWrap();if(cursor().y===s.margins.bottom)scroll(1);else cursor().y=Math.min(rows-1,cursor().y+1);};
   const clearCell=(r:Writable<RowContent>,x:number)=>{
-    if(r.cells[x]?.width===0 && x>0)r.cells[x-1]={text:' ',width:1,style:[...s.attributes]};
-    if(r.cells[x]?.width===2 && x+1<columns)r.cells[x+1]={text:' ',width:1,style:[...s.attributes]};
-    r.cells[x]={text:' ',width:1,style:[...s.attributes]};
+    if(r.cells[x]?.width===0 && x>0)r.cells[x-1]={text:' ',width:1,style:eraseStyle()};
+    if(r.cells[x]?.width===2 && x+1<columns)r.cells[x+1]={text:' ',width:1,style:eraseStyle()};
+    r.cells[x]={text:' ',width:1,style:eraseStyle()};
   };
   const erase=(r:Writable<RowContent>,from:number,to:number)=>{for(let x=from;x<=to;x++)clearCell(r,x);r.softWrap=false;r.wrapPad=0;};
   const print=(text:string)=>{
@@ -1130,6 +1131,7 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     // Ambiguous cluster shaping is explicitly withheld, never silently shifted.
     if(cp===0x200d || cp>=0x1f3fb && cp<=0x1f3ff || cp>=0x1f1e6 && cp<=0x1f1ff)throw Error('ambiguous emoji shaping');
     const width=charCellWidth(cp);
+    if(width>columns)throw Error('glyph wider than pane');
     if(width===0 || cp===0xfe0f) {
       let x=active().wrapPending ? cursor().x : cursor().x-1;
       if(row().cells[x]?.width===0)x--;
@@ -1168,13 +1170,13 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
         if(privateMode && mode===25){s.normal.cursor.visible=s.alternate.cursor.visible=on;}
         else if(privateMode && mode===7)s.modes.autowrap=on;
         else if(privateMode && [1,12,1000,1002,1003,1004,1005,1006,1015,2004,2026].includes(mode))s.modes[`private-${mode}`]=on;
-        else if(privateMode && mode===6){s.modes.origin=on;cursor().x=0;cursor().y=on?s.margins.top:0;}
+        else if(privateMode && mode===6){s.modes.origin=on;cursor().x=0;cursor().y=on?s.margins.top:0;cancelWrap();}
         else if(privateMode && [47,1047,1049].includes(mode)){
           if(on && s.active==='normal'){if(mode===1049)save();s.alternate=v2Buffer(columns,rows);s.alternate.cursor.visible=s.normal.cursor.visible;s.active='alternate';}
           else if(!on && s.active==='alternate'){s.active='normal';if(mode===1049)restore();}
         } else if(!privateMode && mode===4)s.modes.insert=on;
         else throw Error('unsupported terminal mode');
-      }cancelWrap();return;
+      }return;
     }
     if(privateMode)throw Error('unsupported private CSI');
     const yMin=s.modes.origin?s.margins.top:0,yMax=s.modes.origin?s.margins.bottom:rows-1;
@@ -1205,7 +1207,7 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
           else {active().rows.splice(cursor().y,1);active().rows.splice(s.margins.bottom,0,blank());}
         }
       }
-    } else if(final==='n'||final==='c'){ /* terminal query, no visible mutation */ }
+    } else if(final==='n'||final==='c'){ return; /* terminal query, no visible mutation */ }
     else if(final==='S')scroll(n);
     else if(final==='T')scroll(n,true);
     else if(final==='r'){
@@ -1267,7 +1269,7 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
 export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
   context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2RuleResult {
   const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
-  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,bytes:input.bytes}),
+  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
     checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
   const gap=(reason:NewarchV2Incident['reason'],detail:string):V2RuleResult=>{
     const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
@@ -1299,7 +1301,7 @@ export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V
     const segmentId=v2Digest('birth-segment',cp.pane),base=cp.frontier?cp.frontier.rowOrdinal+1:0;
     if(cp.frontier&&cp.frontier.segmentId!==segmentId)return gap('decoder-anomaly','row frontier');
     const rows:CommittedStreamRow[]=decoded.scrolls.map((r,i)=>{
-      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:raw.start+decoded.offsets[i]!-1,end:raw.start+decoded.offsets[i]!},ordinal:base+i};
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+decoded.offsets[i]!},ordinal:base+i};
       return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
         buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
         uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};

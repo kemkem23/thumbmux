@@ -1958,3 +1958,37 @@ test('Q22 mutation controls: stale audit, content dedupe and renewed deadline ar
     }
   }finally{rmSync(root,{recursive:true,force:true});}
 });
+
+test('Q22 V2-13 physical 100x40 oracle on a private tmux socket',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'q22-c-oracle-')),socket=join(root,'x.sock');
+  const env={...process.env};delete env.TMUX;delete env.TMUX_PANE;
+  const tmux=(...args:string[])=>{const r=spawnSync('tmux',['-S',socket,...args],{env,encoding:'utf8'});expect(r.status,r.stderr).toBe(0);return r.stdout;};
+  const cases=[
+    'ไทย น้ำ 😃 ❤️\r\n'+'same\r\n'.repeat(42)+'\x1b[31mred\x1b[0m',
+    'wrong\rOK\x1b[K\b!\x1b[3;4H界\x1b[3;4HX',
+    'N'.repeat(100)+'\x1b[?25lX',
+    '\x1b[1;31;44m\x1b[2J\x1b[3;1HZ',
+    'N'.repeat(101)+'\r\nZ\x1b[?25l\x1b[?1049hALT\r\nsecond\x1b[?1049l',
+    '\x1b[2;4r\x1b[4;1Hbottom\n\n\x1b[r\x1b[1;1Htop',
+    '\x1b[1;38;2;1;2;3mcolor\x1b[0m\r\nabc\x1b[2;2H\x1b[@Z\x1b[P',
+  ];
+  try{
+    for(let index=0;index<cases.length;index++){
+      const body=cases[index]!,path=join(root,`body-${index}`);writeFileSync(path,body);
+      const paneId=tmux('-f','/dev/null','new-session','-d','-P','-F','#{pane_id}','-s',`oracle${index}`,'-x','100','-y','40',`stty -onlcr; cat '${path}'; touch '${path}.ready'; read hold`).trim();
+      const deadline=Date.now()+3000;
+      while(!existsSync(path+'.ready')&&Date.now()<deadline)await Bun.sleep(5);
+      expect(existsSync(path+'.ready')).toBe(true);
+      const captured=tmux('capture-pane','-p','-e','-N','-t',paneId);
+      const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)};
+      const cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0}),bytes=[...Buffer.from(body)];
+      const result=evaluateV2Rules({pane,checkpoint:cp,bytes,raw:{epoch:v2Epoch,start:0,end:bytes.length},observedAtMonoMs:1,pendingSinceMonoMs:null});
+      expect(result.kind).toBe('accept');if(result.kind!=='accept')throw Error(JSON.stringify(result));
+      const state=result.checkpoint.state;
+      expect(v2ScreenDigest(state[state.active].rows)).toBe(v2ScreenDigest(normalizeV2Capture(captured,pane.geometry)));
+      const cursor=tmux('display-message','-p','-t',paneId,'#{cursor_x} #{cursor_y} #{cursor_flag}').trim().split(' ').map(Number);
+      expect([state[state.active].cursor.x,state[state.active].cursor.y,Number(state[state.active].cursor.visible)]).toEqual(cursor);
+      console.log('Q22_PRIVATE_ORACLE',JSON.stringify({caseId:index,geometry:pane.geometry,rows:result.rows.length,cursor}));
+    }
+  }finally{spawnSync('tmux',['-S',socket,'kill-server'],{env});rmSync(root,{recursive:true,force:true});}
+});
