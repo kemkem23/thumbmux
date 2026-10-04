@@ -410,8 +410,8 @@ test('NEWARCH2 M3: a mapping decoder maps each decoded row once into its memo, e
 });
 
 // SPIKE2: disposable prototype modules; production imports remain unchanged.
-import { CaptureChunkDecoder } from '../../../../docs/tasks/newarch-spike2/bundle/decoder';
-import { ExactRowTokens, FullPermit, matchTokens, repairPrefix, withFrozenView, type ViewPorts } from '../../../../docs/tasks/newarch-spike2/bundle/prototype';
+import { CaptureChunkDecoder } from './fixtures/spike2/decoder';
+import { ExactRowTokens, FullPermit, matchTokens, repairPrefix, withFrozenView, type ViewPorts } from './fixtures/spike2/prototype';
 import { matchHistoryRows as originalMatch, type CapturedRow } from '../src/history-row-matcher';
 
 describe('SPIKE2 bounded prototype fixtures', () => {
@@ -518,7 +518,7 @@ describe('SPIKE2 bounded prototype fixtures', () => {
 
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
 import { prepared as p0Prepared } from '../src/sqlite-history/ram-store';
-import { coordinator as p0Coordinator, lifetime as p0Lifetime, matchCapture as p0Match, commitChunks as p0Commit } from '../../../../docs/tasks/newarch-spike2/bundle/adapter';
+import { coordinator as p0Coordinator, lifetime as p0Lifetime, matchCapture as p0Match, commitChunks as p0Commit } from './fixtures/spike2/adapter';
 
 describe('SPIKE2 real SQLite ReadView and committed prefix', () => {
   const key = { serverIdentity: 'spike2-fixture', paneId: '%1', birthGeneration: 1 };
@@ -582,7 +582,7 @@ describe('SPIKE2 real SQLite ReadView and committed prefix', () => {
 });
 
 // SPIKE2 round 4: admission safety is independent of performance acceptance.
-import { ScratchLedger, SCRATCH_CAPS } from '../../../../docs/tasks/newarch-spike2/bundle/scratch';
+import { ScratchLedger, SCRATCH_CAPS } from './fixtures/spike2/scratch';
 describe('SPIKE2 shared scratch admission', () => {
   test('worker/main share caps, reject overflow without corrupting charge, and release', () => {
     const a=new ScratchLedger(), b=new ScratchLedger(a.shared);
