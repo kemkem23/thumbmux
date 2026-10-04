@@ -694,3 +694,101 @@ export interface NewarchHistoryRepairR2 extends NewarchHistoryExtension {
   readonly before: NewarchHistoryContinuationR2;
   readonly after: NewarchHistoryContinuationR2;
 }
+
+/** Q22 / PLAN-v2. This is NOT the repair-r2 envelope above. Never infer v2
+ * support from flag-on/repair support. D/U negotiate before sending these
+ * messages; old clients may read legacy panes but cannot resize v2 panes. */
+export const NEWARCH_V2_SCHEMA = 'newarch-v2' as const;
+export const NEWARCH_V2_CAPABILITIES = Object.freeze([
+  'permanent-capture-owner', 'fixed-geometry', 'pane-history-cursor',
+  'durable-incidents', 'live-checkpoint', 'bounded-audit',
+] as const);
+export interface NewarchV2Capabilities {
+  readonly schema: typeof NEWARCH_V2_SCHEMA;
+  readonly supported: readonly string[]; readonly required: readonly string[];
+}
+export function supportsNewarchV2(local: NewarchV2Capabilities, peer: NewarchV2Capabilities): boolean {
+  const known: readonly string[] = NEWARCH_V2_CAPABILITIES;
+  return local.schema === NEWARCH_V2_SCHEMA && peer.schema === NEWARCH_V2_SCHEMA
+    && [...local.required, ...peer.required].every(c => known.includes(c)
+      && local.supported.includes(c) && peer.supported.includes(c))
+    && known.every(c => local.required.includes(c) && peer.required.includes(c));
+}
+/** Session UUID is minted and persisted before birth, never a display name,
+ * tmux numeric session id or PID. serverIdentity changes on server recreation. */
+export interface NewarchV2SessionKey { readonly serverIdentity: string; readonly sessionId: string }
+export interface NewarchV2FixedGeometry {
+  readonly policy: 'fixed-at-birth'; readonly columns: number; readonly rows: number;
+  readonly configVersion: string; readonly panesPerWindow: 1;
+}
+export type NewarchV2PaneState = 'reserved' | 'active' | 'stopped' | 'closed' | 'unrecorded';
+export interface NewarchV2PaneDescriptor {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly session: NewarchV2SessionKey;
+  readonly pane: NewarchPaneKey; readonly windowId: string;
+  readonly owner: 'capture-engine'; readonly birthOperationId: string;
+  readonly geometry: NewarchV2FixedGeometry; readonly state: NewarchV2PaneState;
+}
+export type NewarchV2PaneSelection =
+  | { readonly kind: 'selected'; readonly pane: NewarchV2PaneDescriptor }
+  | { readonly kind: 'ambiguous'; readonly panes: readonly NewarchV2PaneDescriptor[]; readonly next: string | null }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'owner-unavailable'; readonly retryAfterMs: number };
+export type NewarchV2IncidentReason = 'geometry-violation' | 'unverified-restart'
+  | 'unrecorded-birth' | 'birth-failed' | 'pipe-eof' | 'collector-epoch-changed'
+  | 'storage-outage' | 'budget-exhausted' | 'audit-mismatch' | 'decoder-anomaly' | 'identity-change';
+/** Timeline positions, not legacy line numbers. null is before the first row.
+ * affected.to=null is open-ended; annotate published rows from last proof,
+ * not merely the tail at detection time. Unknown loss is never zero. */
+export interface NewarchV2Incident {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly incidentId: string;
+  readonly pane: NewarchPaneKey; readonly reason: NewarchV2IncidentReason;
+  readonly frontier: NewarchRowId | null;
+  readonly affected: { readonly after: NewarchRowId | null; readonly through: NewarchRowId | null };
+  readonly openedAtWallMs: number; readonly openedAtMonoMs: number; readonly clockEpoch: string;
+  readonly collecting: boolean; readonly missing: NewarchMissingCount;
+  readonly ruleVersion: string; readonly configVersion: string;
+  readonly geometry: NewarchV2FixedGeometry; readonly revision: number;
+  readonly sourceOffset: number | null; readonly expectedDigest: string | null; readonly actualDigest: string | null;
+  readonly action: 'gap-and-stop' | 'annotate' | 'repair-pending';
+  readonly evidence: { readonly digest: string; readonly bytes: number; readonly redacted: true } | null;
+}
+/** H mints/validates token and binds it to pane/store/timeline revision. Token
+ * is opaque, <=4096 UTF-8 bytes. Segment migration MUST NOT change coordinates.
+ * Same cursor survives restart; missing/corrupt remote is blocked, never end. */
+export interface NewarchV2HistoryCursor {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly storeId: string; readonly timelineRevision: number; readonly token: string;
+}
+export type NewarchV2ReadState =
+  | { readonly kind: 'exact'; readonly auditedRevision: number | null }
+  | { readonly kind: 'incident'; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'storage-unavailable'; readonly pendingIncidentId: string | null; readonly retryAfterMs: number }
+  | { readonly kind: 'remote-unavailable'; readonly bundleId: string; readonly reason: 'offline' | 'missing' | 'corrupt'; readonly retryAfterMs: number };
+export type NewarchV2Continuation =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchV2HistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchV2HistoryCursor;
+      readonly state: Extract<NewarchV2ReadState, { readonly kind: 'storage-unavailable' | 'remote-unavailable' }> };
+/** No server resize request is implied by viewport/font/fit-to-width changes.
+ * D/U use horizontal scrolling by default, no history rewrap. Labels are UI
+ * text outside copy/search content, including incidents when no live pane. */
+export interface NewarchV2FrameMeta {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchV2PaneDescriptor;
+  readonly revision: number; readonly durableRevision: number; readonly sourceEpoch: string;
+  readonly state: NewarchV2ReadState;
+}
+export interface NewarchV2HistoryRequest {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly cursor: NewarchV2HistoryCursor | null; readonly direction: 'before' | 'after';
+  readonly maxEntries: number; readonly maxBytes: number;
+}
+export interface NewarchV2GeometryReply {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly status: 'fixed'; readonly geometry: NewarchV2FixedGeometry;
+}
+
+/** D/I add these to the negotiated transport; v1 frames are not reinterpreted.
+ * Delta bases must match pane, sourceEpoch, fixed geometry and not regress
+ * revision. Identity/geometry changes require a full reset. */
+export type NewarchV2OutputFrame = (Omit<MuxFullOutputFrame, 'newarch'> | Omit<MuxDeltaFrame, 'newarch'>)
+  & { readonly newarchV2: NewarchV2FrameMeta };

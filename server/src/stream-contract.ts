@@ -1140,3 +1140,496 @@ export interface CatalogAuthorityR2 {
 export function sourceRecordsDigest(records: readonly SpoolRecord[]): Digest {
   return streamDigest('source-records-r2', records);
 }
+
+// -------------------------------------------------------------------------
+// Q22 NEWARCH v2 (K). Normative ports for C/S/H/D/U/O/Q/I, independent of all
+// legacy/flag-on/r2 ports above. Do not implement these by extending their
+// handoff/attach/resize interfaces. No DB, timer, process lock or I/O here.
+// H implements durability + exclusive root lock; C owns the sole write facade;
+// I orders lifecycle/pump/stop/audit/close on the same per-pane queue.
+import type {
+  NewarchV2PaneDescriptor, NewarchV2SessionKey, NewarchV2FixedGeometry,
+  NewarchV2Incident, NewarchV2HistoryCursor, NewarchV2HistoryRequest,
+  NewarchV2ReadState, NewarchV2Continuation,
+} from '../../core/src/protocol';
+export type {
+  NewarchV2PaneDescriptor, NewarchV2SessionKey, NewarchV2FixedGeometry,
+  NewarchV2Incident, NewarchV2HistoryCursor, NewarchV2HistoryRequest,
+} from '../../core/src/protocol';
+export const NEWARCH_V2_VERSION = 'newarch-v2' as const;
+export const NEWARCH_V2_LIMITS = Object.freeze({
+  maxColumns: 240, maxRows: 80, maxActivePanes: 21, maxIdentityBytes: 256,
+  pendingRowsPerPane: 256, pendingBytesPerPane: MiB, pendingDeadlineMs: 1000,
+  vtBytesPerPane: 2 * MiB, checkpointBytesPerPane: 4 * MiB,
+  auditQueueEntries: 21, diagnosticEventBytes: 64 * 1024, diagnosticTotalBytes: 64 * MiB,
+  pageEntries: 256, pageBytes: 2 * MiB, cursorBytes: 4096,
+  processTreePssHardBytes: 1536 * MiB, plateauMinMs: 180 * 60_000,
+  pssWindowMs: 60 * 60_000, pssWarmupMs: 10 * 60_000, pssSampleMs: 1000,
+  pssTransientSampleMs: 100, pssSlopeMiBPerHour: 10, pssMeanDeltaMiB: 10,
+  pssMeanWindowsMinutes: Object.freeze([Object.freeze([10, 20]), Object.freeze([30, 40]), Object.freeze([50, 60])]),
+  rowRates: Object.freeze([0.5, 2]), normalMissingRows: 0,
+} as const);
+export const NEWARCH_V2_AUDIT_TRIGGERS = Object.freeze([
+  'uncertain-rule', 'decoder-anomaly', 'checkpoint-mismatch', 'resume',
+] as const);
+export type V2AuditTrigger = typeof NEWARCH_V2_AUDIT_TRIGGERS[number];
+export interface V2AuditConfig {
+  readonly enabled: boolean; readonly intervalMs: number; readonly jitterFraction: number;
+  readonly triggers: readonly V2AuditTrigger[]; readonly minGapMs: number;
+  readonly maxConcurrent: number; readonly timeoutMs: number; readonly maxCaptureBytes: number;
+  readonly maxRetries: number;
+}
+/** rootCap includes reserve; dataBudget = rootCap-reserve. Scratch/staging and
+ * diagnostic allocations are DATA, not extra deductions from this budget.
+ * Measure allocated filesystem bytes (DB+WAL+SHM, raw+journals, staging/restore,
+ * diagnostics); count each inode once, including temp files. All producers
+ * reserve allocation in the SAME ledger before write, even while host is down.
+ * Defaults are the existing 256 MiB canary cap, not a 21-pane sizing claim.
+ * S/H/O must share the same config digest. Test caps are fixed before admission. */
+export interface V2StorageBudget {
+  readonly rootCapBytes: number; readonly emergencyReserveBytes: number;
+  readonly reservePerPaneBytes: number; readonly reserveSharedBytes: number;
+  readonly diagnosticCapBytes: number; readonly stagingCapBytes: number;
+}
+export interface V2Config {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly configVersion: string;
+  readonly geometry: Geometry; readonly maxActivePanes: number;
+  readonly audit: V2AuditConfig; readonly storage: V2StorageBudget;
+}
+export const NEWARCH_V2_DEFAULT_CONFIG: V2Config = Object.freeze({
+  schema: NEWARCH_V2_VERSION, configVersion: 'q22-default-1',
+  geometry: Object.freeze({ columns: 100, rows: 40 }), maxActivePanes: 21,
+  audit: Object.freeze({ enabled: true, intervalMs: 300_000, jitterFraction: 0.2,
+    triggers: NEWARCH_V2_AUDIT_TRIGGERS, minGapMs: 30_000, maxConcurrent: 1,
+    timeoutMs: 2000, maxCaptureBytes: 262144, maxRetries: 1 }),
+  storage: Object.freeze({ rootCapBytes: 256 * MiB, emergencyReserveBytes: 16 * MiB,
+    reservePerPaneBytes: 256 * 1024, reserveSharedBytes: 8 * MiB,
+    diagnosticCapBytes: 64 * MiB, stagingCapBytes: 32 * MiB }),
+});
+function v2Int(n: number, min = 0, max = Number.MAX_SAFE_INTEGER): void {
+  if (!Number.isSafeInteger(n) || n < min || n > max) throw Error('v2 integer bound');
+}
+function v2Text(text: string, max: number = NEWARCH_V2_LIMITS.maxIdentityBytes): void {
+  if (typeof text !== 'string' || !text || !text.isWellFormed() || Buffer.byteLength(text) > max) throw Error('v2 text bound');
+}
+export function v2PaneKey(p: PaneKey): string {
+  v2Text(p.serverIdentity); v2Text(p.paneId); v2Int(p.birthGeneration, 1);
+  return streamCanonical([p.serverIdentity, p.paneId, p.birthGeneration]);
+}
+export function v2SessionKey(s: NewarchV2SessionKey): string {
+  v2Text(s.serverIdentity); v2Text(s.sessionId);
+  return streamCanonical([s.serverIdentity, s.sessionId]);
+}
+export function v2Digest(kind: string, payload: unknown): Digest {
+  return createHash('sha256').update(streamCanonical({ schema: NEWARCH_V2_VERSION, kind, payload })).digest('hex');
+}
+export function validateV2Config(c: V2Config): void {
+  if (c.schema !== NEWARCH_V2_VERSION) throw Error('v2 schema');
+  v2Text(c.configVersion); v2Int(c.geometry.columns, 1, 240); v2Int(c.geometry.rows, 1, 80);
+  v2Int(c.maxActivePanes, 1, 21);
+  const a = c.audit, s = c.storage;
+  if (typeof a.enabled !== 'boolean' || !Number.isFinite(a.jitterFraction)
+    || a.jitterFraction < 0 || a.jitterFraction > 0.2) throw Error('v2 audit config');
+  v2Int(a.intervalMs, 0, 86_400_000);
+  if (a.intervalMs !== 0 && a.intervalMs < 1000) throw Error('v2 audit interval');
+  v2Int(a.minGapMs, 1000, 86_400_000); v2Int(a.maxConcurrent, 1, 1);
+  v2Int(a.timeoutMs, 1, 10_000); v2Int(a.maxCaptureBytes, 1, 262144); v2Int(a.maxRetries, 0, 1);
+  if (new Set(a.triggers).size !== a.triggers.length
+    || a.triggers.some(t => !NEWARCH_V2_AUDIT_TRIGGERS.includes(t))) throw Error('v2 audit trigger');
+  for (const n of Object.values(s)) v2Int(n, 1);
+  if (s.emergencyReserveBytes >= s.rootCapBytes
+    || s.reservePerPaneBytes < NEWARCH_V2_LIMITS.diagnosticEventBytes
+    || s.reserveSharedBytes > s.emergencyReserveBytes
+    || c.maxActivePanes > Math.floor((s.emergencyReserveBytes - s.reserveSharedBytes) / s.reservePerPaneBytes)
+    || s.diagnosticCapBytes > NEWARCH_V2_LIMITS.diagnosticTotalBytes
+    || s.diagnosticCapBytes + s.stagingCapBytes > s.rootCapBytes - s.emergencyReserveBytes) throw Error('v2 storage budget');
+}
+/** Return a detached immutable birth geometry. Editing config only affects new
+ * births; no reflow or geometry epoch migration exists in v2. */
+export function v2BirthGeometry(c: V2Config): NewarchV2FixedGeometry {
+  validateV2Config(c);
+  return Object.freeze({ policy: 'fixed-at-birth', columns: c.geometry.columns,
+    rows: c.geometry.rows, panesPerWindow: 1, configVersion: c.configVersion });
+}
+export interface V2StorageUsage {
+  readonly databaseBytes: number; readonly rawBytes: number;
+  readonly stagingBytes: number; readonly diagnosticBytes: number;
+  readonly reservedDataBytes: number; readonly reserveAllocatedBytes: number;
+}
+export function v2StorageAllowance(c: V2Config, u: V2StorageUsage): {
+  readonly dataBudgetBytes: number; readonly dataUsedBytes: number; readonly availableDataBytes: number;
+} {
+  validateV2Config(c); for (const n of Object.values(u)) v2Int(n);
+  const dataBudgetBytes = c.storage.rootCapBytes - c.storage.emergencyReserveBytes;
+  const dataUsedBytes = u.databaseBytes + u.rawBytes + u.stagingBytes + u.diagnosticBytes + u.reservedDataBytes;
+  v2Int(dataUsedBytes);
+  if (u.reserveAllocatedBytes > c.storage.emergencyReserveBytes) throw Error('v2 reserve overflow');
+  return { dataBudgetBytes, dataUsedBytes, availableDataBytes: Math.max(0, dataBudgetBytes - dataUsedBytes) };
+}
+
+/** unknown = owner store unreadable/incomplete OR identity not revalidated
+ * after await. Never treat it as absence. legacy requires authoritative proof
+ * of exclusion from the NEWARCH session account, including raw-created panes. */
+export type V2OwnerLookup = { readonly kind: 'legacy'; readonly session: NewarchV2SessionKey }
+  | { readonly kind: 'capture-engine'; readonly pane: NewarchV2PaneDescriptor }
+  | { readonly kind: 'unknown'; readonly reason: 'unloaded' | 'io' | 'corrupt' | 'identity' };
+export function v2LegacyAppendAllowed(owner: V2OwnerLookup, current: NewarchV2SessionKey): boolean {
+  return owner.kind === 'legacy' && v2SessionKey(owner.session) === v2SessionKey(current);
+}
+export interface V2OwnerRecord {
+  readonly pane: NewarchV2PaneDescriptor; readonly generation: number;
+  readonly durableRevision: number; readonly frontier: SegmentRowId | null;
+  readonly incidentId: string | null; readonly binding: Binding | null;
+}
+export interface V2BirthIntent {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly operationId: string;
+  readonly session: NewarchV2SessionKey; readonly geometry: NewarchV2FixedGeometry;
+  readonly command: 'new-session' | 'new-window'; readonly owner: 'capture-engine';
+}
+/** S persists journal before READY. The program is held until H activation
+ * commits. I recovers journal binding even if host's record still has null.
+ * Raw-created panes are unrecorded + incident, never adopted/rebound later. */
+export interface V2BirthReady {
+  readonly intent: V2BirthIntent; readonly pane: NewarchV2PaneDescriptor;
+  readonly binding: Binding; readonly byte0: RawPosition; readonly journal: EvidenceFile;
+  readonly geometryReadback: Geometry; readonly paneCountInWindow: 1;
+  readonly programHeld: true;
+}
+export type V2BirthResult = { readonly status: 'active'; readonly owner: V2OwnerRecord; readonly receipt: V2Receipt }
+  | { readonly status: 'rejected'; readonly operationId: string;
+      readonly reason: 'disabled' | 'capacity' | 'identity' | 'geometry' | 'binding' | 'storage' | 'unsupported-topology';
+      readonly programReleased: false; readonly cleanup: 'not-created' | 'complete' | 'pending';
+      readonly incidentId: string | null };
+
+/** Compile-time opaque only. H MUST mint after acquiring exclusive OS process
+ * lock on canonical root and checking DB generation. Keep in C closure, never
+ * serialize/export to auditor/S/O/D/keeper/mux. H rechecks object identity in
+ * its private registry + held lock + generation INSIDE every transaction.
+ * A structurally forged/copy/deserialized token is not authority. No lease,
+ * timeout, flag change or pane stop transfers ownership to legacy. */
+declare const v2WriterBrand: unique symbol;
+export interface V2WriterCapability {
+  readonly [v2WriterBrand]: true; readonly owner: 'capture-engine';
+  readonly rootId: string; readonly engineId: string; readonly generation: number;
+}
+export interface V2WriteFence {
+  readonly operationId: string; readonly pane: PaneKey; readonly expectedGeneration: number;
+  readonly expectedRevision: number; readonly digest: Digest;
+}
+export interface V2Receipt {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'ssot-durable';
+  readonly operationId: string; readonly pane: PaneKey; readonly digest: Digest;
+  readonly commitId: string; readonly generation: number; readonly revision: number;
+  readonly frontier: SegmentRowId | null; readonly checkpointId: string | null;
+}
+/** H first checks live capability/generation. An existing operation with same
+ * payload digest returns original receipt before checking expectedRevision;
+ * different digest is integrity failure. This ordering handles lost ACK. */
+export function v2WriteDisposition(f: V2WriteFence, generation: number, revision: number,
+  previous: V2Receipt | null): 'commit' | 'retry' | 'stale' | 'integrity' {
+  v2Int(f.expectedGeneration, 1); v2Int(f.expectedRevision); v2Int(generation, 1); v2Int(revision);
+  v2Text(f.operationId); contractHash(f.digest); v2PaneKey(f.pane);
+  if (f.expectedGeneration !== generation) return 'stale';
+  if (previous) return previous.operationId === f.operationId && previous.digest === f.digest
+    && v2PaneKey(previous.pane) === v2PaneKey(f.pane) ? 'retry' : 'integrity';
+  return f.expectedRevision === revision ? 'commit' : 'stale';
+}
+export interface V2RuleStamp { readonly ruleId: string; readonly version: string; readonly configVersion: string }
+export interface V2RuleDefinition {
+  readonly stamp: V2RuleStamp; readonly priority: number;
+  readonly preconditions: readonly ('identity' | 'fixed-geometry' | 'contiguous-bytes' | 'known-vt' | 'ordered-evidence')[];
+  readonly maxInputBytes: number; readonly maxInputRows: number;
+  readonly action: 'accept' | 'defer' | 'gap';
+}
+/** Lower priority number first; ties by ruleId UTF-8 lexical order. Allowlist
+ * selects registered pure functions, never eval/log-supplied code. Persist
+ * rule/config stamp per decision; changes apply to NEW raw ranges only. */
+export interface V2RuleEvidence {
+  readonly raw: RawRange; readonly digest: Digest; readonly checkpointId: string;
+  readonly caseId: string; readonly anomalyId: string | null;
+}
+export type V2RuleResult =
+  | { readonly kind: 'accept'; readonly stamp: V2RuleStamp; readonly evidence: V2RuleEvidence;
+      readonly rows: readonly CommittedStreamRow[]; readonly checkpoint: V2LiveCheckpoint }
+  | { readonly kind: 'defer'; readonly stamp: V2RuleStamp; readonly evidence: V2RuleEvidence;
+      readonly pendingRows: number; readonly pendingBytes: number; readonly deadlineMonoMs: number }
+  | { readonly kind: 'gap'; readonly stamp: V2RuleStamp; readonly evidence: V2RuleEvidence;
+      readonly incident: NewarchV2Incident };
+/** Both VT buffers/cursor/modes and partial UTF8/escape are in state. H stores
+ * one current durable projection per pane, plus pinned recovery checkpoints.
+ * The live rows are not finalized history. Byte floor is decoder replay floor,
+ * not the last raw read/upload position. Size is canonical UTF-8 including VT. */
+export interface V2LiveCheckpoint {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly checkpointId: string; readonly pane: PaneKey;
+  readonly geometry: NewarchV2FixedGeometry; readonly through: RawPosition;
+  readonly replayFloor: RawPosition; readonly revision: number; readonly frontier: SegmentRowId | null;
+  readonly rule: V2RuleStamp; readonly state: VtState; readonly stateDigest: Digest;
+  readonly pending: { readonly rows: readonly RowContent[]; readonly bytes: number; readonly deadlineMonoMs: number | null };
+}
+export interface V2AuditWatermark {
+  readonly pane: PaneKey; readonly through: RawPosition; readonly revision: number;
+  readonly geometry: NewarchV2FixedGeometry; readonly checkpointId: string;
+}
+/** Transport must prove snapshot ordering, not just drain pipe. Non-quiescent
+ * captures without independent same-source evidence are inconclusive. */
+export interface V2AuditEvidence {
+  readonly before: V2AuditWatermark; readonly after: V2AuditWatermark;
+  readonly snapshot: V2AuditWatermark; readonly ordered: boolean;
+  readonly expectedDigest: Digest; readonly actualDigest: Digest;
+  readonly captureBytes: number; readonly elapsedMs: number;
+}
+export type V2AuditResult =
+  | { readonly kind: 'match'; readonly evidence: V2AuditEvidence; readonly rule: V2RuleStamp }
+  | { readonly kind: 'repair-pending'; readonly evidence: V2AuditEvidence; readonly rule: V2RuleStamp;
+      readonly expectedRevision: number; readonly checkpoint: V2LiveCheckpoint; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'annotate'; readonly evidence: V2AuditEvidence; readonly rule: V2RuleStamp; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'inconclusive'; readonly reason: 'disabled' | 'timeout' | 'bytes' | 'pane-dead' | 'identity' | 'racing' | 'stale';
+      readonly retry: boolean };
+/** Pure admission predicate; C performs actual normalization/evaluation. Even a
+ * true result must be rechecked in H under expectedRevision before repair. */
+export function v2AuditComparable(e: V2AuditEvidence, current: V2AuditWatermark, c: V2AuditConfig): boolean {
+  if (!c.enabled || !e.ordered || !Number.isSafeInteger(e.captureBytes) || e.captureBytes < 0
+    || e.captureBytes > c.maxCaptureBytes || !Number.isFinite(e.elapsedMs) || e.elapsedMs < 0
+    || e.elapsedMs > c.timeoutMs) return false;
+  return sameContract(e.before, e.after) && sameContract(e.after, e.snapshot) && sameContract(e.snapshot, current);
+}
+export interface V2Batch {
+  readonly rows: readonly CommittedStreamRow[]; readonly decisions: readonly V2RuleResult[];
+  readonly incidents: readonly NewarchV2Incident[]; readonly checkpoint: V2LiveCheckpoint;
+  readonly input: SpoolAck;
+}
+export interface V2RemoteLocator {
+  readonly pane: PaneKey; readonly segmentId: string; readonly sealed: LogicalSealR2;
+  readonly verified: VerifiedBundle; readonly inventory: ArchiveInventoryR2;
+  /** Successful bounded PUBLIC reader readback, not upload success. */
+  readonly readerProof: { readonly digest: Digest; readonly verifiedAtWallMs: number; readonly first: SegmentRowId | null; readonly last: SegmentRowId | null };
+}
+/** All persistent mutations, including owner/birth/staging/stop/locator/pins,
+ * traverse C's one queue. O and S submit requests/evidence, never get H/cap.
+ * Pin/release from D are also queued commands, not a second DB writer. */
+export type V2WriteCommand =
+  | { readonly kind: 'activate'; readonly ready: V2BirthReady; readonly checkpoint: V2LiveCheckpoint }
+  | { readonly kind: 'batch'; readonly batch: V2Batch }
+  | { readonly kind: 'stage'; readonly transactionId: string; readonly ordinal: number; readonly rows: readonly CommittedStreamRow[] }
+  | { readonly kind: 'incident'; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'audit'; readonly result: Exclude<V2AuditResult, { readonly kind: 'inconclusive' }> }
+  | { readonly kind: 'checkpoint'; readonly checkpoint: V2LiveCheckpoint }
+  | { readonly kind: 'stop'; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'close' }
+  | { readonly kind: 'seal'; readonly segmentId: string }
+  | { readonly kind: 'locator'; readonly locator: V2RemoteLocator }
+  | { readonly kind: 'reclaim'; readonly locatorCommitId: string; readonly segmentId: string }
+  | { readonly kind: 'pin'; readonly pinId: string; readonly segmentId: string }
+  | { readonly kind: 'release-pin'; readonly pinId: string };
+export interface V2WriteRequest { readonly fence: V2WriteFence; readonly command: V2WriteCommand }
+/** Digest covers entire fence except digest plus command. Capability never
+ * enters hashes or serialization. Stage rows are never visible to readers. */
+export function v2WriteDigest(request: { readonly fence: Omit<V2WriteFence, 'digest'>; readonly command: V2WriteCommand }): Digest {
+  return v2Digest('write', request);
+}
+export interface V2HistoryWriter {
+  commit(capability: V2WriterCapability, request: V2WriteRequest): Promise<Result<V2Receipt>>;
+  /** H closes only after queued transactions settle, then releases OS lock. */
+  close(capability: V2WriterCapability): Promise<Result<null>>;
+}
+export interface V2CaptureWriteFacade {
+  submit(request: V2WriteRequest): Promise<Result<V2Receipt>>;
+  /** Stop intake, drain pump/audit/stop, persist incident and retire own pipe.
+   * Full shutdown closes H only after ALL pane queues settle. */
+  close(): Promise<Result<null>>;
+}
+export interface V2HistoryPage {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly pane: PaneKey; readonly revision: number;
+  readonly entries: readonly ({ readonly kind: 'row'; readonly row: CommittedStreamRow }
+    | { readonly kind: 'incident'; readonly incident: NewarchV2Incident })[];
+  readonly payloadBytes: number; readonly states: readonly NewarchV2ReadState[];
+  readonly before: NewarchV2Continuation; readonly after: NewarchV2Continuation;
+}
+export interface V2HistoryReader {
+  owner(pane: PaneKey): Result<V2OwnerRecord | null>;
+  receipt(pane: PaneKey, operationId: string): Result<V2Receipt | null>;
+  checkpoint(pane: PaneKey): Result<V2LiveCheckpoint | null>;
+  page(request: NewarchV2HistoryRequest): Promise<Result<V2HistoryPage>>;
+}
+export interface V2TrimAuthorization {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly checkpoint: V2LiveCheckpoint;
+  readonly receipt: V2Receipt; readonly consumerAck: SpoolAck; readonly trimThrough: RawPosition;
+}
+/** Structural guard only: S resolves receipt/checkpoint from H authority and
+ * validates durable raw digest/contiguity/pins before applying. No boolean from
+ * host or O substitutes for receipt readback. No ACK on failed H commit. */
+export function v2TrimWithinCheckpoint(a: V2TrimAuthorization): boolean {
+  const c = a.checkpoint, r = a.receipt;
+  const positions = [c.through, c.replayFloor, a.consumerAck.through, a.trimThrough];
+  return a.schema === NEWARCH_V2_VERSION && r.schema === NEWARCH_V2_VERSION
+    && r.kind === 'ssot-durable' && r.checkpointId === c.checkpointId && r.revision === c.revision
+    && v2PaneKey(r.pane) === v2PaneKey(c.pane)
+    && positions.every(p => Number.isSafeInteger(p.byteOffset) && p.byteOffset >= 0
+      && sameContract(p.epoch, c.through.epoch) && v2PaneKey(p.epoch.pane) === v2PaneKey(c.pane))
+    && a.trimThrough.byteOffset <= c.replayFloor.byteOffset && c.replayFloor.byteOffset <= c.through.byteOffset
+    && c.through.byteOffset === a.consumerAck.through.byteOffset;
+}
+
+/** Reservation precedes tmux creation, so no pane id exists yet. It is a
+ * root-queue operation, distinct from pane writes. Session reservation is
+ * durable before S creates anything; future panes inherit this owner. */
+export interface V2SessionReservation {
+  readonly intent: V2BirthIntent; readonly expectedGeneration: number; readonly digest: Digest;
+}
+export interface V2SessionReservationReceipt {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly session: NewarchV2SessionKey;
+  readonly operationId: string; readonly commitId: string; readonly digest: Digest;
+  readonly generation: number; readonly owner: 'capture-engine';
+}
+export interface V2HistoryWriter {
+  reserveBirth(capability: V2WriterCapability, request: V2SessionReservation): Promise<Result<V2SessionReservationReceipt>>;
+}
+export interface V2CaptureWriteFacade {
+  reserveBirth(request: V2SessionReservation): Promise<Result<V2SessionReservationReceipt>>;
+}
+/** Only capture-engine composition calls open; host receives facade+reader,
+ * not this factory or capability. H canonicalizes root, holds an OS lock for
+ * its process lifetime and atomically increments generation on exclusive open.
+ * An unreadable owner/schema store fails closed before ANY writer starts. */
+export interface V2HistoryFactory {
+  openForCapture(request: { readonly rootId: string; readonly engineId: string; readonly config: V2Config }):
+    Promise<Result<{ readonly capability: V2WriterCapability; readonly writer: V2HistoryWriter; readonly reader: V2HistoryReader }>>;
+}
+export interface V2GeometryObservation {
+  readonly pane: PaneKey; readonly windowId: string; readonly window: Geometry;
+  readonly terminal: Geometry; readonly panesInWindow: number;
+}
+export function v2GeometryMatches(d: NewarchV2PaneDescriptor, observed: V2GeometryObservation): boolean {
+  return v2PaneKey(d.pane) === v2PaneKey(observed.pane) && d.windowId === observed.windowId
+    && d.geometry.policy === 'fixed-at-birth' && d.geometry.panesPerWindow === 1 && observed.panesInWindow === 1
+    && [observed.window, observed.terminal].every(g => g.columns === d.geometry.columns && g.rows === d.geometry.rows);
+}
+/** This proves only an observation, not continuity between observations.
+ * I must gate before each commit and at resume even with audit disabled.
+ * No continuity proof across downtime => unverified-restart + STOP before
+ * replay, including 100->120->100. Epoch change likewise stops, no rebind. */
+export type V2ResumeProof = { readonly kind: 'continuous'; readonly pane: PaneKey;
+  readonly from: RawPosition; readonly through: RawPosition; readonly geometry: NewarchV2FixedGeometry;
+  readonly sourceEvidence: EvidenceFile }
+  | { readonly kind: 'unverified'; readonly reason: 'geometry' | 'raw' | 'collector-epoch' | 'identity' };
+export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
+  if (c.schema !== NEWARCH_V2_VERSION || c.geometry.policy !== 'fixed-at-birth' || c.geometry.panesPerWindow !== 1) throw Error('v2 checkpoint schema');
+  v2PaneKey(c.pane); v2Text(c.checkpointId); v2Int(c.revision);
+  v2Int(c.geometry.columns, 1, 240); v2Int(c.geometry.rows, 1, 80);
+  v2Text(c.geometry.configVersion); v2Text(c.rule.ruleId); v2Text(c.rule.version); v2Text(c.rule.configVersion);
+  if (c.frontier && v2PaneKey(c.frontier.pane) !== v2PaneKey(c.pane)) throw Error('v2 checkpoint frontier');
+  v2Int(c.through.byteOffset); v2Int(c.replayFloor.byteOffset);
+  if (!sameContract(c.through.epoch, c.replayFloor.epoch) || v2PaneKey(c.through.epoch.pane) !== v2PaneKey(c.pane)
+    || c.replayFloor.byteOffset > c.through.byteOffset) throw Error('v2 checkpoint raw');
+  if (c.state.geometry.columns !== c.geometry.columns || c.state.geometry.rows !== c.geometry.rows
+    || v2Digest('vt-state', c.state) !== c.stateDigest) throw Error('v2 checkpoint state');
+  v2Int(c.pending.bytes, 0, NEWARCH_V2_LIMITS.pendingBytesPerPane);
+  if (c.pending.rows.length > NEWARCH_V2_LIMITS.pendingRowsPerPane
+    || (c.pending.rows.length > 0 || c.pending.bytes > 0) && c.pending.deadlineMonoMs === null) throw Error('v2 checkpoint pending');
+  if (c.pending.deadlineMonoMs !== null) v2Int(c.pending.deadlineMonoMs);
+  if (Buffer.byteLength(streamCanonical(c.state)) > NEWARCH_V2_LIMITS.vtBytesPerPane
+    || Buffer.byteLength(streamCanonical(c)) > NEWARCH_V2_LIMITS.checkpointBytesPerPane) throw Error('v2 checkpoint bytes');
+}
+export function validateV2Incident(i: NewarchV2Incident): void {
+  if (i.schema !== NEWARCH_V2_VERSION) throw Error('v2 incident schema');
+  v2Text(i.incidentId); v2PaneKey(i.pane); v2Text(i.clockEpoch);
+  for (const n of [i.openedAtWallMs, i.openedAtMonoMs, i.revision]) v2Int(n);
+  if (i.sourceOffset !== null) v2Int(i.sourceOffset);
+  for (const row of [i.frontier, i.affected.after, i.affected.through]) {
+    if (row) { v2Text(row.segmentId); v2Int(row.rowOrdinal); if (v2PaneKey(row.pane) !== v2PaneKey(i.pane)) throw Error('v2 incident pane'); }
+  }
+  if (i.missing.countKind === 'unknown') { if (i.missing.missingCount !== null) throw Error('v2 unknown count'); }
+  else v2Int(i.missing.missingCount);
+  if (i.action === 'gap-and-stop' && i.collecting) throw Error('v2 stopped incident');
+  for (const hash of [i.expectedDigest, i.actualDigest]) if (hash !== null) contractHash(hash);
+  if (i.evidence) {
+    v2Int(i.evidence.bytes, 0, NEWARCH_V2_LIMITS.diagnosticEventBytes); contractHash(i.evidence.digest);
+    if (i.evidence.redacted !== true) throw Error('v2 diagnostic redaction');
+  }
+}
+export function validateV2ReadRequest(r: NewarchV2HistoryRequest): void {
+  if (r.schema !== NEWARCH_V2_VERSION || !['before', 'after'].includes(r.direction)) throw Error('v2 read schema');
+  v2PaneKey(r.pane); v2Int(r.maxEntries, 1, NEWARCH_V2_LIMITS.pageEntries); v2Int(r.maxBytes, 1, NEWARCH_V2_LIMITS.pageBytes);
+  if (r.cursor) {
+    if (r.cursor.schema !== NEWARCH_V2_VERSION || v2PaneKey(r.cursor.pane) !== v2PaneKey(r.pane)) throw Error('v2 cursor pane');
+    v2Text(r.cursor.storeId); v2Text(r.cursor.token, NEWARCH_V2_LIMITS.cursorBytes); v2Int(r.cursor.timelineRevision);
+  }
+}
+/** S emergency journal is a transport for C, NOT a parallel SSOT writer.
+ * Use the SAME incident id/digest on materialization; pending is visible to D.
+ * Protocol faults do not consume reserve. If reserve write fails, stop intake,
+ * return unavailable and mark durability gate FAILED (never a durable receipt).
+ * Rearm only after engine confirms materialization/resolution + physical space. */
+export interface V2EmergencyIncident {
+  readonly incident: NewarchV2Incident; readonly digest: Digest;
+  readonly cause: 'ENOSPC' | 'EDQUOT' | 'SQLITE_FULL';
+}
+export interface V2SourceTransport {
+  prepareBirth(intent: V2BirthIntent, reservation: V2SessionReservationReceipt): Promise<Result<V2BirthReady>>;
+  releaseProgram(ready: V2BirthReady, activation: V2Receipt): Promise<Result<null>>;
+  retireOwnPipe(binding: Binding, operationId: string): Promise<Result<null>>;
+  acknowledgeAndTrim(authorization: V2TrimAuthorization): Promise<Result<TrimReceiptR2>>;
+  journalEmergency(request: V2EmergencyIncident): Promise<Result<{ readonly journal: EvidenceFile; readonly incidentId: string }>>;
+}
+/** Audit scheduling policy (I): enabled=false creates NO capture/timer. Interval
+ * 0 disables periodic work only; empty triggers disables event work. Stable
+ * pane-hash jitter in +/- jitterFraction; minGap applies to retries too. One
+ * queued job/pane (max21), coalesce trigger storms, no unbounded backlog. One
+ * retry maximum; reset retry budget on a NEW eligible event, not on timeout.
+ * capture-pane -p visible screen ONLY (no -S -, no -J), shared C normalizer.
+ * Keep one latest watermark per pane; diagnostics rotate, incidents persist.
+ * Geometry/storage guards run independently of audit settings.
+ *
+ * Rule policy (C): defer <=1000 ms and <=256 rows/1MiB; expiry emits gap or
+ * stop, never silently drops bytes. Pending repair uses expectedRevision and
+ * may change live/pending ONLY. Finalized rows are immutable: append annotation
+ * covering affected range instead. For conflicting evidence choose gap, not
+ * content-only deduplication. Unknown loss stays null, no numerical fault cap.
+ *
+ * Lifecycle (I/H): reserved->active->stopped->closed or reserved->stopped;
+ * unrecorded->closed. No transition back to active. Stop/close do not delete
+ * owner. Incidents dedupe by (PaneKey, incidentId), conflict digest rejected.
+ * Reclaim (O/H): seal, upload, readback hash, queued locator commit, public
+ * reader proof, then queued reclaim with zero pins + generation recheck in H.
+ * Local deletion retries idempotently; never delete final verified copy.
+ *
+ * Q gate: online counters only, census PID+startTime, missing sample invalid;
+ * sampler/oracle outside product tree reported separately; no slope subtraction.
+ * 21 active panes and both fixed rates, sample startup/audit/restore transients,
+ * max <=1536MiB, slope10..60 <=10MiB/hour, mid/late means <=early+10MiB.
+ * This 60min gate does NOT replace the existing 180min plateau gate. Native
+ * growth +22.7MiB/hour in premeasure is unresolved by a contract-only change.
+ */
+
+export interface V2RuleInput {
+  readonly pane: NewarchV2PaneDescriptor; readonly checkpoint: V2LiveCheckpoint;
+  readonly raw: RawRange; readonly bytes: readonly number[];
+  readonly observedAtMonoMs: number; readonly pendingSinceMonoMs: number | null;
+}
+export type V2RuleEvaluator = (input: V2RuleInput) => V2RuleResult;
+export interface V2SourceTransport {
+  /** Raw durable reads are bounded at ingress; invalid sequence/digest/epoch
+   * is a gap-and-stop request to C, never recovery capture. */
+  readRaw(binding: Binding, after: RawPosition, maxRecords: number, maxBytes: number): Promise<Result<SpoolReadR2>>;
+}
+export interface V2CancelBirth {
+  readonly session: NewarchV2SessionKey; readonly birthOperationId: string;
+  readonly operationId: string; readonly expectedGeneration: number; readonly digest: Digest;
+  readonly reason: 'disabled' | 'capacity' | 'identity' | 'geometry' | 'binding' | 'storage';
+}
+export interface V2HistoryWriter {
+  /** Retain owner tombstone; this cancels pending birth, never returns legacy.
+   * If pane was created, persist incident/retire via its pane queue as well. */
+  cancelBirth(capability: V2WriterCapability, request: V2CancelBirth): Promise<Result<V2SessionReservationReceipt>>;
+}
+export interface V2CaptureWriteFacade {
+  cancelBirth(request: V2CancelBirth): Promise<Result<V2SessionReservationReceipt>>;
+}
+/** H lists owner records from disk, <=256 entries/2MiB; never materialize all
+ * historical panes/incidents in RAM. Display name lookup is advisory and must
+ * resolve to a stable session before this port; I rechecks after every await. */
+export interface V2HistoryReader {
+  panes(session: NewarchV2SessionKey, cursor: string | null): Result<{
+    readonly panes: readonly NewarchV2PaneDescriptor[]; readonly next: string | null;
+  }>;
+}
