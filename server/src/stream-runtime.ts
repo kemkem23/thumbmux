@@ -927,7 +927,7 @@ export class V2Jigsaw {
     }
     if(result.kind==='defer'){
       this.pending=[...input.bytes];this.since??=now;this.end=raw.end;
-    }else{this.proposed=result;this.pending=[];this.since=null;if(result.kind==='gap')this.stopped=true;}
+    }else{this.proposed=structuredClone(result);this.pending=[];this.since=null;if(result.kind==='gap')this.stopped=true;}
     return structuredClone(result);
   }
   expire(now:number,context:V2DecisionContext):V2RuleResult|null {
@@ -939,6 +939,15 @@ export class V2Jigsaw {
   committed(checkpointId:string):void {
     if(this.proposed?.kind!=='accept'||this.proposed.checkpoint.checkpointId!==checkpointId)throw Error('v2 commit checkpoint mismatch');
     this.checkpoint=structuredClone(this.proposed.checkpoint);this.end=this.checkpoint.through.byteOffset;this.proposed=null;
+  }
+  /** Only after H has definitively rejected/rolled back the transaction.
+   * A timeout or lost ACK is NOT rejection: reconcile/retry the same decision.
+   * S still owns the unACKed bytes; reread from the returned durable frontier. */
+  rejected(checkpointId:string):import('./stream-contract').RawPosition {
+    if(this.proposed?.kind!=='accept'||this.proposed.checkpoint.checkpointId!==checkpointId)
+      throw Error('v2 rejected checkpoint mismatch');
+    this.proposed=null;this.end=this.checkpoint.through.byteOffset;
+    return structuredClone(this.checkpoint.through);
   }
   configure(config:V2Config):void {
     if(this.pending.length||this.proposed||this.stopped)throw Error('v2 config only at committed boundary');

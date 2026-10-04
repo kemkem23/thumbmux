@@ -1055,21 +1055,29 @@ export function v2BirthCheckpoint(pane: NewarchV2PaneDescriptor, through: RawPos
     pendingUtf8:[],pendingEscape:[],attributes:[],wrapPending:false,extensionState:''};
   const rule={ruleId:'ordered-scroll',version:'1',configVersion:config.configVersion};
   const cp: V2LiveCheckpoint={schema:'newarch-v2',checkpointId:v2Digest('genesis',{pane:pane.pane,through}),
-    pane:pane.pane,geometry:pane.geometry,through,replayFloor:through,revision:0,frontier:null,rule,state,
+    pane:pane.pane,geometry:pane.geometry,through,replayFloor:through,revision:1,frontier:null,rule,state,
     stateDigest:v2Digest('vt-state',state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
   validateV2Checkpoint(cp); return immutable(cp);
 }
 /** Clocks are explicit: replay uses the original observation, never Date.now(). */
-export interface V2DecisionContext { readonly wallMs: number; readonly clockEpoch: string }
+export interface V2DecisionContext {
+  readonly wallMs: number; readonly clockEpoch: string;
+  /** H owner.durableRevision read under the sole writer's pane queue. Incident,
+   * seal and audit commits can advance it while the live checkpoint stays old. */
+  readonly durableRevision?: number;
+  /** I plans this from H's open segment/capacity before writing. Retain exactly
+   * this target and decision on an unknown commit outcome / lost receipt. */
+  readonly rowTarget?: {readonly segmentId:string; readonly nextRowOrdinal:number};
+}
 export function v2DecisionIncident(input: V2RuleInput, stamp: V2RuleStamp, context: V2DecisionContext,
   reason: NewarchV2Incident['reason'], detail: string): NewarchV2Incident {
-  const cp=input.checkpoint;
+  const cp=input.checkpoint,revision=context.durableRevision??input.checkpoint.revision;
   return {schema:'newarch-v2',incidentId:v2IncidentId(cp.pane,v2Digest('decoder-cause',{
     checkpoint:cp.checkpointId,offset:input.raw.start,reason,detail})),pane:cp.pane,reason,
     frontier:cp.frontier,affected:{after:cp.frontier,through:null},openedAtWallMs:context.wallMs,
     openedAtMonoMs:input.observedAtMonoMs,clockEpoch:context.clockEpoch,collecting:false,
     missing:{countKind:'unknown',missingCount:null},ruleVersion:`${stamp.ruleId}@${stamp.version}`,
-    configVersion:stamp.configVersion,geometry:cp.geometry,revision:cp.revision,
+    configVersion:stamp.configVersion,geometry:cp.geometry,revision:counter(revision)&&revision>=cp.revision?revision:cp.revision,
     sourceEpoch:{attachId:cp.through.epoch.attachId,collectorIncarnation:cp.through.epoch.collectorIncarnation},
     sourceOffset:cp.through.byteOffset,expectedDigest:null,actualDigest:null,action:'gap-and-stop',
     evidence:{digest:v2Digest('decoder-diagnostic',detail),bytes:0,redacted:true}};
@@ -1278,6 +1286,9 @@ export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V
   const cp=input.checkpoint,raw=input.raw;
   try {
     validateV2Checkpoint(cp);
+    const durableRevision=context.durableRevision??cp.revision;
+    if(!counter(durableRevision)||durableRevision<cp.revision)
+      return gap('decoder-anomaly','durable revision regression');
     if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
       ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
     if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
@@ -1298,17 +1309,23 @@ export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V
     if(input.pendingSinceMonoMs!==null&&input.observedAtMonoMs>=input.pendingSinceMonoMs+V2L.pendingDeadlineMs)
       return gap('decoder-anomaly','pending deadline');
     const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
-    const segmentId=v2Digest('birth-segment',cp.pane),base=cp.frontier?cp.frontier.rowOrdinal+1:0;
-    if(cp.frontier&&cp.frontier.segmentId!==segmentId)return gap('decoder-anomaly','row frontier');
+    const segmentId=context.rowTarget?.segmentId??cp.frontier?.segmentId??v2Digest('birth-segment',cp.pane);
+    const sameSegment=cp.frontier?.segmentId===segmentId;
+    const base=context.rowTarget?.nextRowOrdinal??(sameSegment?cp.frontier!.rowOrdinal+1:0);
+    if(typeof segmentId!=='string'||!segmentId||!segmentId.isWellFormed()
+      ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
+      ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
     const rows:CommittedStreamRow[]=decoded.scrolls.map((r,i)=>{
       const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+decoded.offsets[i]!},ordinal:base+i};
       return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
         buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
         uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
     });
-    const through={epoch:raw.epoch,byteOffset:raw.end};
-    const checkpoint:V2LiveCheckpoint={...cp,checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule}),through,
-      replayFloor:through,revision:cp.revision+1,frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,
+    if(Buffer.byteLength(streamCanonical(rows))>V2L.pageBytes)
+      return gap('budget-exhausted','committed row bytes');
+    const through={epoch:raw.epoch,byteOffset:raw.end},revision=durableRevision+1;
+    const checkpoint:V2LiveCheckpoint={...cp,checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,
+      replayFloor:through,revision,frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,
       stateDigest:v2Digest('vt-state',decoded.state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
     validateV2Checkpoint(checkpoint);
     return {kind:'accept',stamp:rule,evidence,rows,checkpoint};

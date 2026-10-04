@@ -644,7 +644,11 @@ export function evaluateV2Audit(input: V2AuditEvaluation): V2AuditResult {
   const cp=input.checkpoint;
   try{
     validateV2Checkpoint(cp);
-    const watermark={pane:cp.pane,through:cp.through,revision:cp.revision,geometry:cp.geometry,checkpointId:cp.checkpointId};
+    // H keeps the projection when a metadata-only write advances the DB.
+    // The certificate/current fence names that DB revision; checkpoint ID and
+    // raw watermark still have to identify the current durable projection.
+    if(cp.revision>input.current.revision)return inconclusive('stale');
+    const watermark={pane:cp.pane,through:cp.through,revision:input.current.revision,geometry:cp.geometry,checkpointId:cp.checkpointId};
     if(streamCanonical(watermark)!==streamCanonical(input.current))return inconclusive('stale');
     if(cp.state.bufferEncoding||cp.state[cp.state.active].rows.length!==cp.geometry.rows)return inconclusive('racing');
     const expected=v2ScreenDigest(cp.state[cp.state.active].rows);
@@ -656,7 +660,7 @@ export function evaluateV2Audit(input: V2AuditEvaluation): V2AuditResult {
     // A single screenshot cannot reconstruct cursor/modes or a lost finalized
     // row. Conservative annotation is the only supported mismatch action.
     const incident:NewarchV2Incident={...input.incident,pane:cp.pane,reason:'audit-mismatch',frontier:cp.frontier,
-      revision:cp.revision,geometry:cp.geometry,expectedDigest:expected,actualDigest:actual,
+      revision:input.current.revision,geometry:cp.geometry,expectedDigest:expected,actualDigest:actual,
       ruleVersion:`${rule.ruleId}@${rule.version}`,configVersion:rule.configVersion,action:'annotate'};
     return {kind:'annotate',evidence:e,rule,incident};
   }catch{return inconclusive('racing');}

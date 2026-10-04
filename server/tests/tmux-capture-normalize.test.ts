@@ -2057,3 +2057,27 @@ describe('Q22 C/H durable revision and segment seams (C-010..016)',()=>{
     expect(r.kind).toBe('gap');if(r.kind==='gap')expect(r.incident.reason).toBe('budget-exhausted');
   });
 });
+
+describe('Q22 C definite rejection and proposal isolation',()=>{
+  test('only a definitively rejected proposal can be replanned from the durable raw frontier',()=>{
+    const cp=v2Genesis(),engine=new V2Jigsaw(cp,v2Pane),bytes=[...Buffer.from('a\r\nb\r\nc\r\nd\r\n')];
+    const raw={epoch:structuredClone(v2Epoch),start:0,end:bytes.length};
+    const first=engine.evaluate(raw,bytes,1,{...v2Clock,rowTarget:{segmentId:'rejected-A',nextRowOrdinal:0}});
+    expect(first.kind).toBe('accept');if(first.kind!=='accept')return;
+    expect(()=>engine.rejected('wrong')).toThrow();
+    expect(engine.rejected(first.checkpoint.checkpointId)).toEqual(cp.through);
+    const second=engine.evaluate(raw,bytes,2,{...v2Clock,rowTarget:{segmentId:'accepted-B',nextRowOrdinal:0}});
+    expect(second.kind).toBe('accept');if(second.kind!=='accept')return;
+    engine.committed(second.checkpoint.checkpointId);
+    expect(engine.liveCheckpoint.frontier?.segmentId).toBe('accepted-B');
+    expect(()=>engine.rejected(second.checkpoint.checkpointId)).toThrow();
+  });
+  test('caller mutation cannot alter a pending durable proposal',()=>{
+    const engine=new V2Jigsaw(v2Genesis(),v2Pane),epoch=structuredClone(v2Epoch);
+    const result=engine.evaluate({epoch,start:0,end:1},[65],1,v2Clock);
+    expect(result.kind).toBe('accept');if(result.kind!=='accept')return;
+    epoch.attachId='caller-mutated';
+    engine.committed(result.checkpoint.checkpointId);
+    expect(engine.liveCheckpoint.through.epoch.attachId).toBe(v2Epoch.attachId);
+  });
+});
