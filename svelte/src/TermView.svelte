@@ -7409,6 +7409,7 @@
   data-history-window-attached={archiveWindow ? (archiveWindowAttachedToLive ? '1' : '0') : undefined}
   data-history-window-has-older={archiveWindow ? (archiveWindow.hasOlder ? '1' : '0') : undefined}
   data-history-window-has-newer={archiveWindow ? (archiveWindow.hasNewer ? '1' : '0') : undefined}
+  data-history-flag-cursor={archiveWindow?.flagOnCursorBefore?.token}
   data-history-live-start={liveBoundary?.liveStartLine}
   data-history-generation={liveBoundary?.generation}
   data-history-total-hint={archiveTotalHint}
