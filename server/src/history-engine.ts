@@ -2122,8 +2122,14 @@ class V2Storage {
     }
     const back = r.direction === 'before', entries: V2HistoryPage['entries'][number][] = [];
     let lo = boundary, hi = boundary, blocked: NewarchV2Continuation | null = null;
-    const query = `SELECT * FROM fh_v2_timeline WHERE pane=? AND revision<=? AND n${back ? '<=' : '>'}? ORDER BY n ${back ? 'DESC' : 'ASC'} LIMIT ?`;
-    for (const item of this.#db.query(query).iterate(key, revision, boundary, r.maxEntries) as Iterable<SqlRow>) {
+    const query = `SELECT * FROM fh_v2_timeline WHERE pane=? AND revision<=? AND n${back ? '<=' : '>'}? ORDER BY n ${back ? 'DESC' : 'ASC'} LIMIT 1`;
+    let scan = boundary;
+    // Fetch one bounded record at a time. A blocked/byte-limited page must not
+    // leave Bun's cached SQLite iterator suspended for the next read.
+    for (let count = 0; count < r.maxEntries; count++) {
+      const item = this.#db.query(query).get(key, revision, scan) as SqlRow | null;
+      if (!item) break;
+      scan = back ? Number(item.n) - 1 : Number(item.n);
       let decoded: V2HistoryPage['entries'][number] | null = null;
       if (item.payload === null) {
         const locator = this.get<V2RemoteLocator>('remote-segment', key, String(item.segment)); fhAssert(locator, 'v2 missing remote locator');
