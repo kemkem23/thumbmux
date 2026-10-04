@@ -115,7 +115,7 @@
         if (!Array.isArray(panes) || panes.length === 0 || !panes.every(isNewarchV2PaneDescriptor)) {
           return { kind: 'unknown-owner', reason: 'malformed' };
         }
-        return { kind: 'viewer' };
+        return fixedPolicy(panes);
       }
       default:
         return { kind: 'unknown-owner', reason: 'malformed' };
