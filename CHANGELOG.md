@@ -3,6 +3,33 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.20.4-dist`.
 
+## Unreleased — low-resolution screens (UI-COMPACT lot D)
+
+CSS-first, no prop or export changes. Rides the next release (0.20.5 if it is
+cut together with NEWARCH, otherwise 0.20.6). Measured on a canary build with
+the same Playwright audit before and after.
+
+### Changed
+
+- **ActionFab** — on screens up to 900px tall the slots lay out in two columns
+  (same order, row by row, 8px gap both ways), so all 15 /m/t actions are on
+  screen at 1366×768, 1280×720, 1024×600, 800×600, 390×844, 375×667 and
+  360×640 (was 8–13 of 15). A mouse gets 36px slots on those screens (touch
+  keeps 46). When even two columns cannot fit, the edge the list can still
+  scroll past fades. 1920×1080 keeps the single 46px column.
+- **TermHud (dense)** — at ≤480px wide the name and the note share one row,
+  each cut with …; the note no longer takes a second row. Phone HUD 93 → 49px.
+  An activity slot, if the host passes one, keeps one line on the row below.
+  Host seams that restyle the slot still win (selectors stay at the slot's
+  own specificity).
+- **SessionGrid (dense)** — a mouse on a ≤820px-tall screen gets a 44px card
+  header (two-line note/summary, 36×44 ×); between 768 and 1039px wide two
+  square cards share the width instead of one 500px card. Touch filter chips,
+  search and group toggle are at least 44×44.
+- **ComposerDock** — at ≤620px tall (and ≥481px wide) the mode buttons, field,
+  SEND and ✕ share one row: dock 122 → 62px. The mode hint shows only in
+  DIRECT. The sheet carries `data-mode="compose|direct"`.
+
 ## v0.20.4 — 2026-09-29
 
 Patch. Changes the default durable-history path (replay materializer and PTY
