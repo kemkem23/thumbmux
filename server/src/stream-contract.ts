@@ -1397,7 +1397,7 @@ export function v2AuditComparable(e: V2AuditEvidence, current: V2AuditWatermark,
     || e.ordering.proof.bytes > NEWARCH_V2_LIMITS.diagnosticEventBytes || !Number.isSafeInteger(e.captureBytes) || e.captureBytes < 0
     || e.captureBytes > c.maxCaptureBytes || !Number.isFinite(e.elapsedMs) || e.elapsedMs < 0
     || e.elapsedMs > c.timeoutMs) return false;
-  return sameContract(e.before, e.after) && sameContract(e.after, e.snapshot);
+  return sameContract(e.before, e.after) && sameContract(e.after, e.snapshot) && sameContract(e.snapshot, current);
 }
 export interface V2Batch {
   readonly rows: readonly CommittedStreamRow[]; readonly decisions: readonly V2RuleResult[];
