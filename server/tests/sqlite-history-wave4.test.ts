@@ -1350,3 +1350,189 @@ test('H-r2 distinct gaps in one episode retain positions across durable close up
  f.reopen();const page=hvalue(hr2(f.store).authority.page({pane:hp,cursor:null,direction:'after',maxEntries:256,maxBytes:1024*1024}));expect(page.entries).toEqual([closed,b]);
  }finally{f.cleanup();}
 });
+
+// H/Q22: real transactions on synthetic roots. New API, so mutation barriers
+// below prove behavioral red; a missing export/import is never the red oracle.
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createV2HistoryFactory, FlagOnHistoryStore } from '../src/history-engine';
+import * as H2 from '../src/stream-contract';
+import type { NewarchV2Incident, NewarchV2PaneDescriptor } from '@thumbmux/core';
+function h2value<T>(r: H2.Result<T>): T { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; }
+async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'newarch-h2-'));
+  const factory = createV2HistoryFactory({ inputReceipt: ack => ({ status: 'ok', value: ack }), ...hooks });
+  const open = () => factory.openForCapture({ rootId: root, engineId: 'test-capture', config: H2.NEWARCH_V2_DEFAULT_CONFIG });
+  let port = h2value(await open());
+  const pane = { serverIdentity: 'private-server', paneId: '%1', birthGeneration: 1 };
+  const session = { serverIdentity: pane.serverIdentity, sessionId: 'stable-1' };
+  const geometry = H2.v2BirthGeometry(H2.NEWARCH_V2_DEFAULT_CONFIG);
+  const epoch = { pane, attachId: 'birth-1', collectorIncarnation: 'collector-1' };
+  const descriptor: NewarchV2PaneDescriptor = { schema: 'newarch-v2', session, pane, windowId: '@1', owner: 'capture-engine', birthOperationId: 'birth-1', geometry, state: 'active' };
+  const cursor = { x: 0, y: 0, visible: true };
+  const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
+  const state: H2.VtState = { codecVersion: 'test-v2', geometry: { columns: 100, rows: 40 }, normal: buffer, alternate: buffer,
+    active: 'normal', modes: {}, margins: { top: 0, bottom: 40, left: 0, right: 100 }, tabStops: [], pendingUtf8: [224], pendingEscape: [27, 91], attributes: [], wrapPending: false, extensionState: '{}' };
+  const cp = (revision: number, offset = 0, frontier: H2.SegmentRowId | null = null): H2.V2LiveCheckpoint => ({ schema: 'newarch-v2', checkpointId: 'cp-' + revision, pane, geometry,
+    through: { epoch, byteOffset: offset }, replayFloor: { epoch, byteOffset: Math.max(0, offset - 1) }, revision, frontier,
+    rule: { ruleId: 'ordered-scroll', version: '1', configVersion: 'q22-default-1' }, state, stateDigest: H2.v2Digest('vt-state', state), pending: { rows: [], bytes: 0, deadlineMonoMs: null } });
+  const request = (command: H2.V2WriteCommand, operationId: string, revision?: number): H2.V2WriteRequest => {
+    const fence = { pane, operationId, expectedGeneration: port.capability.generation,
+      expectedRevision: revision ?? h2value(port.reader.owner(pane))?.durableRevision ?? 0 };
+    return { fence: { ...fence, digest: H2.v2WriteDigest({ fence, command }) }, command };
+  };
+  const commit = async (command: H2.V2WriteCommand, id: string) => h2value(await port.writer.commit(port.capability, request(command, id)));
+  const intent: H2.V2BirthIntent = { schema: 'newarch-v2', operationId: 'birth-1', session, geometry, command: 'new-session', owner: 'capture-engine' };
+  const reserve = async () => h2value(await port.writer.reserveBirth(port.capability, { intent, expectedGeneration: port.capability.generation, digest: H2.v2Digest('birth-reservation', { intent }) }));
+  const ready: H2.V2BirthReady = { intent, pane: descriptor,
+    binding: { kind: 'collector-binding', epoch, attachId: epoch.attachId, rootUUID: 'root-1', bootNonce: 'boot', ownerGeneration: 1,
+      process: { pid: 123, startTime: '1234', bootId: 'private-boot' }, peerUid: 1000, fifoId: 'fifo-1', handshakeId: 'h1', artifactSha256: 'a'.repeat(64) },
+    byte0: { epoch, byteOffset: 0 }, journal: { path: '/synthetic/birth', bytes: 12, sha256: 'a'.repeat(64) }, geometryReadback: { columns: 100, rows: 40 }, paneCountInWindow: 1, programHeld: true };
+  const activate = async () => { await reserve(); return commit({ kind: 'activate', ready, checkpoint: cp(1) }, 'activate-1'); };
+  const incident = (id: string, revision: number, frontier: H2.SegmentRowId | null = null): NewarchV2Incident => ({ schema: 'newarch-v2', incidentId: id, pane, reason: 'storage-outage', frontier,
+    affected: { after: null, through: frontier }, openedAtWallMs: 100, openedAtMonoMs: 10, clockEpoch: 'test-clock', collecting: false,
+    missing: { countKind: 'unknown', missingCount: null }, ruleVersion: '1', configVersion: 'q22-default-1', geometry, revision,
+    sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null, action: 'gap-and-stop', evidence: null });
+  const row = (n: number, text = 'ซ้ำ'): H2.CommittedStreamRow => ({ id: { pane, segmentId: 'segment-1', rowOrdinal: n },
+    origin: { kind: 'pipe', range: { epoch, start: n, end: n + 1 }, ordinal: n }, cells: [{ text, width: 1, style: [] }],
+    geometry: { columns: 100, rows: 40 }, buffer: 'normal', wrapStatus: 'unwrapped', wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [] });
+  const batch = (rows: readonly H2.CommittedStreamRow[], revision = 2): H2.V2WriteCommand => {
+    const checkpoint = cp(revision, rows.length, rows.at(-1)?.id ?? null);
+    return { kind: 'batch', batch: { rows, decisions: [], incidents: [], checkpoint,
+      input: { kind: 'synced-spool', version: 1, through: checkpoint.through, recordDigest: 'b'.repeat(64), commitId: 'input-1', segmentId: 'raw-1' } } };
+  };
+  const page = (maxEntries = 256, cursor: H2.NewarchV2HistoryCursor | null = null, direction: 'after' | 'before' = 'after', maxBytes = 2 * 1024 * 1024) =>
+    port.reader.page({ schema: 'newarch-v2', pane, cursor, direction, maxEntries, maxBytes });
+  return { root, pane, session, geometry, descriptor, cp, request, commit, ready, reserve, activate, incident, row, batch, page, open,
+    get port() { return port; },
+    async reopen() { h2value(await port.writer.close(port.capability)); port = h2value(await open()); return port; },
+    async cleanup() { await port.writer.close(port.capability); rmSync(root, { recursive: true, force: true }); } };
+}
+
+describe('H v2 capture-only storage', () => {
+  test('capability cannot be copied; same root has one OS writer and legacy cannot reopen', async () => {
+    const f = await h2fixture();
+    try {
+      await f.activate();
+      expect((await f.port.writer.commit({ ...f.port.capability }, f.request({ kind: 'close' }, 'forged'))).status).toBe('error');
+      expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(1);
+      expect((await f.open()).status).not.toBe('ok');
+      const child = Bun.spawn([process.execPath, '-e', `import {createV2HistoryFactory} from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))}; import {NEWARCH_V2_DEFAULT_CONFIG as config} from ${JSON.stringify(join(import.meta.dir, '../src/stream-contract.ts'))}; const r=await createV2HistoryFactory().openForCapture({rootId:process.argv[1],engineId:'second',config}); console.log(JSON.stringify(r.status)); if(r.status==='ok'){await r.value.writer.close(r.value.capability);process.exit(3);}` , f.root], { stdout: 'pipe', stderr: 'pipe' });
+      const [exit, output, errors] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect({ exit, errors }).toEqual({ exit: 0, errors: '' }); expect(output).not.toContain('"ok"');
+      h2value(await f.port.writer.close(f.port.capability));
+      expect(() => new FlagOnHistoryStore({ root: f.root, mode: 'recover', codecVersions: ['test-v2'] })).toThrow('v2 owner excludes legacy');
+    } finally { await f.cleanup(); }
+  });
+  test('incident before first ACK is durable, idempotent, owner never becomes legacy', async () => {
+    const f = await h2fixture();
+    try {
+      await f.reserve();
+      const gap = { ...f.incident('unrecorded', 1), reason: 'unrecorded-birth' as const };
+      const command: H2.V2WriteCommand = { kind: 'unrecorded-birth', pane: f.descriptor, incident: gap };
+      const request = f.request(command, 'unrecorded');
+      const first = h2value(await f.port.writer.commit(f.port.capability, request));
+      expect(first.frontier).toBeNull(); expect(first.checkpointId).toBeNull();
+      expect(h2value(await f.port.writer.commit(f.port.capability, request))).toEqual(first);
+      await f.reopen();
+      const retry = f.request(command, 'unrecorded', 0);
+      expect(h2value(await f.port.writer.commit(f.port.capability, retry))).toEqual(first);
+      expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident: gap }]);
+      expect(h2value(f.port.reader.owner(f.pane))!.pane.state).toBe('unrecorded');
+      expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'activate', ready: f.ready, checkpoint: f.cp(2) }, 'adoption'))).status).toBe('error');
+      expect(h2value(f.port.reader.sessionOwner(f.session))!.owner).toBe('capture-engine');
+    } finally { await f.cleanup(); }
+  });
+  test('rows checkpoint and receipt commit together; lost ACK retry never duplicates', async () => {
+    let fault = '';
+    const f = await h2fixture({ boundary: at => { if (at === fault) throw Error('injected boundary'); } });
+    try {
+      await f.activate(); const command = f.batch([f.row(0), f.row(1)]), req = f.request(command, 'rows-1');
+      fault = 'v2-batch-before-commit';
+      expect((await f.port.writer.commit(f.port.capability, req)).status).toBe('error');
+      expect(h2value(await f.page()).entries).toHaveLength(0);
+      expect(h2value(f.port.reader.receipt(f.pane, 'rows-1'))).toBeNull();
+      expect(h2value(f.port.reader.checkpoint(f.pane))!.revision).toBe(1);
+      fault = 'v2-batch-after-commit';
+      expect((await f.port.writer.commit(f.port.capability, req)).status).toBe('error');
+      fault = ''; await f.reopen();
+      const retry = { ...req, fence: { ...req.fence, expectedGeneration: f.port.capability.generation } };
+      const receipt = h2value(await f.port.writer.commit(f.port.capability, retry));
+      expect(receipt).toEqual(h2value(f.port.reader.receipt(f.pane, 'rows-1')));
+      expect(h2value(await f.page()).entries.map(e => e.kind === 'row' && e.row.id.rowOrdinal)).toEqual([0, 1]);
+      const checkpoint = h2value(f.port.reader.checkpoint(f.pane))!;
+      expect(checkpoint.state.pendingUtf8).toEqual([224]); expect(checkpoint.state.pendingEscape).toEqual([27, 91]);
+      expect(checkpoint.revision).toBe(receipt.revision); expect(checkpoint.frontier).toEqual(receipt.frontier);
+      const stale = { ...retry, fence: { ...retry.fence, expectedGeneration: 1 } };
+      expect((await f.port.writer.commit(f.port.capability, stale)).status).toBe('error');
+      expect((await f.port.writer.commit(f.port.capability, f.request(f.batch([f.row(0, 'changed')]), 'rows-1'))).status).toBe('error');
+    } finally { await f.cleanup(); }
+  });
+  test('candidate rows stay invisible and stopped pane cannot publish', async () => {
+    const f = await h2fixture();
+    try {
+      await f.activate(); await f.commit({ kind: 'stage', transactionId: 'candidate', ordinal: 0, rows: [f.row(0)] }, 'stage');
+      expect(h2value(await f.page()).entries).toEqual([]);
+      await f.commit({ kind: 'stop', incident: f.incident('stop-before-rows', 3) }, 'stop');
+      expect((await f.port.writer.commit(f.port.capability, f.request(f.batch([f.row(0)], 4), 'late-pump'))).status).toBe('error');
+      await f.reopen(); expect(h2value(f.port.reader.owner(f.pane))!.pane.state).toBe('stopped');
+      expect(h2value(await f.page()).entries).toHaveLength(1);
+    } finally { await f.cleanup(); }
+  });
+  test('stale audit cannot repair live checkpoint; inconclusive replaces bounded latest status', async () => {
+    const f = await h2fixture();
+    try {
+      await f.activate(); const cp = f.cp(1);
+      const watermark = { pane: f.pane, through: cp.through, revision: 0, geometry: f.geometry, checkpointId: cp.checkpointId };
+      const evidence: H2.V2AuditEvidence = { before: watermark, after: watermark, snapshot: watermark,
+        ordering: { kind: 'certified-source-fence', certificateId: 'test-cert', proof: { path: 'synthetic-proof', bytes: 10, sha256: 'a'.repeat(64) } },
+        expectedDigest: 'a'.repeat(64), actualDigest: 'b'.repeat(64), captureBytes: 40, elapsedMs: 1 };
+      const result: H2.V2AuditResult = { kind: 'repair-pending', evidence, rule: cp.rule, expectedRevision: 1, checkpoint: f.cp(2),
+        incident: { ...f.incident('repair', 2), collecting: true, action: 'repair-pending', reason: 'audit-mismatch' } };
+      expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'audit', result }, 'stale-audit'))).status).toBe('error');
+      expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
+      await f.commit({ kind: 'audit', result: { kind: 'inconclusive', reason: 'timeout', retry: true } }, 'audit-timeout');
+      await f.commit({ kind: 'audit', result: { kind: 'inconclusive', reason: 'racing', retry: false } }, 'audit-race');
+      await f.reopen(); expect(h2value(f.port.reader.lastAudit(f.pane))).toEqual({ kind: 'inconclusive', reason: 'racing', retry: false });
+      expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
+    } finally { await f.cleanup(); }
+  });
+  test('bounded cursor is authenticated, restart stable and revision pinned', async () => {
+    const f = await h2fixture();
+    try {
+      await f.activate(); await f.commit(f.batch([f.row(0), f.row(1), f.row(2)]), 'rows');
+      const first = h2value(await f.page(1)); expect(first.entries).toHaveLength(1); expect(first.after.kind).toBe('more');
+      if (first.after.kind !== 'more') throw Error('missing cursor'); const cursor = first.after.cursor;
+      await f.reopen(); const second = h2value(await f.page(1, cursor));
+      expect(second.entries[0]!.kind === 'row' && second.entries[0]!.row.id.rowOrdinal).toBe(1);
+      expect((await f.page(1, { ...cursor, token: cursor.token + '0' })).status).toBe('error');
+      expect((await f.page(1, { ...cursor, timelineRevision: 9000 })).status).toBe('error');
+      expect((await f.page(1, null, 'after', 3)).status).toBe('error');
+      const back = h2value(await f.page(2, null, 'before'));
+      expect(back.entries.map(e => e.kind === 'row' && e.row.id.rowOrdinal)).toEqual([1, 2]);
+      expect(h2value(f.port.reader.panes(f.session, null)).panes).toEqual([f.descriptor]);
+    } finally { await f.cleanup(); }
+  });
+  test('missing source authority and mismatched geometry fail before publication', async () => {
+    const f = await h2fixture({ inputReceipt: () => ({ status: 'ok', value: null }) });
+    try {
+      await f.reserve();
+      expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'activate', ready: { ...f.ready, geometryReadback: { columns: 99, rows: 40 } }, checkpoint: f.cp(1) }, 'bad-geometry'))).status).toBe('error');
+      await f.commit({ kind: 'activate', ready: f.ready, checkpoint: f.cp(1) }, 'activate');
+      expect((await f.port.writer.commit(f.port.capability, f.request(f.batch([f.row(0)]), 'forged-ack'))).status).toBe('error');
+      expect(h2value(await f.page()).entries).toEqual([]);
+    } finally { await f.cleanup(); }
+  });
+  test('cancelled birth keeps session exclusion and cannot activate', async () => {
+    const f = await h2fixture();
+    try {
+      await f.reserve();
+      const body = { session: f.session, birthOperationId: 'birth-1', operationId: 'cancel-1', reason: 'binding' as const };
+      const req = { ...body, expectedGeneration: f.port.capability.generation, digest: H2.v2Digest('birth-cancel', body) };
+      const receipt = h2value(await f.port.writer.cancelBirth(f.port.capability, req));
+      expect(h2value(await f.port.writer.cancelBirth(f.port.capability, req))).toEqual(receipt);
+      expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'activate', ready: f.ready, checkpoint: f.cp(1) }, 'bad-activate'))).status).toBe('error');
+      await f.reopen(); expect(h2value(f.port.reader.sessionOwner(f.session))!.owner).toBe('capture-engine');
+    } finally { await f.cleanup(); }
+  });
+});
