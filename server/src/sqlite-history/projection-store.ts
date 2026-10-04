@@ -26,7 +26,7 @@ const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 // after SEAL_LAG) rewrites its block, so a line is never stored twice.
 // 2 KiB pages keep a typical line in its page (WITHOUT ROWID local limit
 // ~488 B) while halving each WAL frame and the fixed per-table pages.
-const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, SEAL_QUIET_MS=30000, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
+const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, SEAL_QUIET_MS=30000, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5, WORKER_GC_COMMITS=32;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   /**
@@ -423,6 +423,13 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const disk=new Database(workerData.file,{strict:true});
   disk.exec(`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
   let commits=0;
+  // Bun does not collect this worker's own heap at the host's commit rate: every
+  // batch cloned into it stayed as garbage (+30-45 MiB/h at 21 panes, collected
+  // about once an hour) and the host's heapUsed never shows it (NEWARCH
+  // native-growth). Live heap here is ~1.5 MiB, so a full collection costs ~2 ms
+  // on this thread; it runs after the ack, off the commit's latency path.
+  let sinceCollect=0;
+  const collect=()=>{if(++sinceCollect>=WORKER_GC_COMMITS){sinceCollect=0;Bun.gc(true);}};
   const stats=archiveStatsOf(disk);
   let reported={...stats};
   let drainTimer:ReturnType<typeof setTimeout>|null=null;
@@ -431,7 +438,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
     try {drainArchives(disk,workerData.fence);}
     // Compaction only: the receipts stay live and valid; the next commit or flush retries.
     catch(error){console.error('[newarch] archive drain failed',String(error));return;}
-    scheduleDrain();
+    collect();scheduleDrain();
   };
   const scheduleDrain=()=>{
     const due=[archiveNextDue(disk),quietNextDue(disk)].filter((t):t is number=>t!==null),next=due.length?Math.min(...due):null;
@@ -464,6 +471,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
     }
     Atomics.notify(signal,0);parentPort!.postMessage(batch.id);
+    collect();
   };
   parentPort!.on('message',onMessage);
 }
