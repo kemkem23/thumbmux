@@ -579,3 +579,80 @@ export class StreamCaptureChunkDecoder {
     if (this.chunk.length) { const out = this.chunk; this.chunk = []; yield out; this.charged=0; this.charge(0); }
   }
 }
+
+// Q22 shares a single SGR/cell projection between pipe and visible capture.
+import { cellToSemanticCell, semanticStyleToSgr, v2Digest, v2AuditComparable,
+  v2PaneKey, streamCanonical, validateV2Checkpoint, NEWARCH_V2_DEFAULT_CONFIG,
+  type V2AuditEvidence, type V2AuditResult, type V2AuditWatermark, type V2Config,
+  type V2LiveCheckpoint, type V2RuleStamp, type NewarchV2Incident, type RowContent,
+} from './stream-contract';
+
+const v2Color = (value: string): number => value==='default'?-1:value.startsWith('index:')
+  ?Number(value.slice(6)):256+value.slice(4).split(',').reduce((n,x)=>n*256+Number(x),0);
+const observedStyle = (s: SgrState) => ({attrs:s.style,fg:v2Color(s.fg),bg:v2Color(s.bg)});
+/** Reject decorations the durable Cell contract cannot represent. */
+export function v2ApplySgr(attributes: readonly number[], body: string): number[] {
+  if(/(?:^|;)(?:21|53|55|58|59)(?:;|$)|(?:^|;)4:/.test(body))throw Error('unrepresented SGR decoration');
+  const state:SgrState={fg:'default',bg:'default',style:0};
+  applySgr(state,attributes.join(';'));applySgr(state,body);
+  return semanticStyleToSgr(observedStyle(state));
+}
+export const V2_AUDIT_CAPTURE_FLAGS = Object.freeze(['capture-pane','-p','-e','-N'] as const);
+export function normalizeV2Capture(raw: string, geometry: {columns:number;rows:number}, maxBytes=262144): readonly RowContent[] {
+  if(Buffer.byteLength(raw)>maxBytes)throw Error('audit capture bytes');
+  // -N preserves trailing cells; never -J or -S - (history is not a screen).
+  const lines=raw.split('\n');if(lines.at(-1)==='')lines.pop();
+  if(lines.length!==geometry.rows)throw Error('audit visible row count');
+  for(const match of raw.matchAll(/\x1b\[([0-9;:]*)m/g))v2ApplySgr([],match[1]!);
+  const decoded=decodeTmuxCaptureScreen(raw,geometry.columns);
+  if(decoded.uncertainRows.length)throw Error('audit ambiguous cell boundary');
+  return decoded.rows.map(cells=>({cells:cells.map(c=>({text:c.grapheme,width:c.width,
+    style:semanticStyleToSgr(observedStyle(c))})),softWrap:false,wrapPad:0,uncertainFields:[]}));
+}
+/** Capture cannot prove hidden modes, wraps or cursor. Compare only physical
+ * cells, preserving meaningful spaces/styles; hidden state is never repaired. */
+export function v2ScreenDigest(rows: readonly RowContent[]): string {
+  return v2Digest('visible-cells',rows.map(row=>row.cells.map(cell=>cellToSemanticCell(cell))));
+}
+export interface V2AuditEvaluation {
+  readonly config?: V2Config; readonly current: V2AuditWatermark;
+  readonly checkpoint: V2LiveCheckpoint; readonly evidence: V2AuditEvidence;
+  readonly rawCapture: string; readonly paneAlive: boolean; readonly attempt: number;
+  /** I verifies the bounded certificate artifact; presence of a path is not proof. */
+  readonly verifiedCertificate: {readonly certificateId:string;readonly sha256:string} | null;
+  /** Stable cause/clocks supplied by I; never manufactured from snapshot text. */
+  readonly incident: NewarchV2Incident;
+}
+export function evaluateV2Audit(input: V2AuditEvaluation): V2AuditResult {
+  const config=input.config??NEWARCH_V2_DEFAULT_CONFIG,c=config.audit,e=input.evidence;
+  const inconclusive=(reason:Extract<V2AuditResult,{kind:'inconclusive'}>['reason']):V2AuditResult=>({kind:'inconclusive',reason,
+    retry:c.enabled&&input.attempt<c.maxRetries&&['racing','timeout','bytes'].includes(reason)});
+  if(!c.enabled)return inconclusive('disabled');
+  if(!input.paneAlive)return inconclusive('pane-dead');
+  if(!Number.isFinite(e.elapsedMs)||e.elapsedMs<0||e.elapsedMs>c.timeoutMs)return inconclusive('timeout');
+  if(e.captureBytes!==Buffer.byteLength(input.rawCapture)||e.captureBytes>c.maxCaptureBytes)return inconclusive('bytes');
+  if([e.before,e.after,e.snapshot].some(w=>v2PaneKey(w.pane)!==v2PaneKey(input.current.pane)))return inconclusive('identity');
+  if(e.snapshot.revision!==input.current.revision||e.snapshot.checkpointId!==input.current.checkpointId)return inconclusive('stale');
+  if(!v2AuditComparable(e,input.current,c)||e.ordering.kind!=='certified-source-fence'
+    ||!input.verifiedCertificate||input.verifiedCertificate.certificateId!==e.ordering.certificateId
+    ||input.verifiedCertificate.sha256!==e.ordering.proof.sha256)return inconclusive('racing');
+  const cp=input.checkpoint;
+  try{
+    validateV2Checkpoint(cp);
+    const watermark={pane:cp.pane,through:cp.through,revision:cp.revision,geometry:cp.geometry,checkpointId:cp.checkpointId};
+    if(streamCanonical(watermark)!==streamCanonical(input.current))return inconclusive('stale');
+    if(cp.state.bufferEncoding||cp.state[cp.state.active].rows.length!==cp.geometry.rows)return inconclusive('racing');
+    const expected=v2ScreenDigest(cp.state[cp.state.active].rows);
+    const actual=v2ScreenDigest(normalizeV2Capture(input.rawCapture,cp.geometry,c.maxCaptureBytes));
+    // Digests supplied by a caller must agree with what was actually decoded.
+    if(expected!==e.expectedDigest||actual!==e.actualDigest)return inconclusive('racing');
+    const rule:V2RuleStamp=cp.rule;
+    if(expected===actual)return {kind:'match',evidence:e,rule};
+    // A single screenshot cannot reconstruct cursor/modes or a lost finalized
+    // row. Conservative annotation is the only supported mismatch action.
+    const incident:NewarchV2Incident={...input.incident,pane:cp.pane,reason:'audit-mismatch',frontier:cp.frontier,
+      revision:cp.revision,geometry:cp.geometry,expectedDigest:expected,actualDigest:actual,
+      ruleVersion:`${rule.ruleId}@${rule.version}`,configVersion:rule.configVersion,action:'annotate'};
+    return {kind:'annotate',evidence:e,rule,incident};
+  }catch{return inconclusive('racing');}
+}

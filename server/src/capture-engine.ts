@@ -1018,3 +1018,272 @@ export class CaptureCadence {
     await Promise.all(tasks);
   }
 }
+
+// Q22: byte-zero decoder and pure rule evaluator. No history/legacy port, timer,
+// capture command or writer capability is available in this implementation.
+import { charCellWidth } from '@thumbmux/core';
+import {
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest, v2PaneKey,
+  v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
+  type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
+  type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
+  type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer, type Cell,
+} from './stream-contract';
+import { v2ApplySgr } from './tmux-capture-normalize';
+
+type Writable<T> = { -readonly [P in keyof T]: T[P] extends readonly (infer U)[] ? Writable<U>[]
+  : T[P] extends object ? Writable<T[P]> : T[P] };
+const V2_CODEC = 'q22-vt-1';
+const v2Equal = (a: unknown, b: unknown) => streamCanonical(a) === streamCanonical(b);
+const v2Blank = (columns: number, style: readonly number[] = []): Writable<RowContent> => ({
+  cells: Array.from({length: columns}, () => ({text:' ',width:1,style:[...style]})),
+  softWrap:false,wrapPad:0,uncertainFields:[],
+});
+function v2Buffer(columns: number, rows: number): Writable<VtBuffer> {
+  return {rows:Array.from({length:rows},()=>v2Blank(columns)),cursor:{x:0,y:0,visible:true},
+    savedCursor:{x:0,y:0,visible:true},savedAttributes:[],savedModes:{},wrapPending:false};
+}
+export function v2BirthCheckpoint(pane: NewarchV2PaneDescriptor, through: RawPosition,
+  config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): V2LiveCheckpoint {
+  validateV2Config(config);
+  if (through.byteOffset !== 0 || !samePane(pane.pane,through.epoch.pane) || pane.owner !== 'capture-engine'
+    || !['reserved','active'].includes(pane.state)) throw Error('v2 requires byte-zero owned birth');
+  const {columns,rows}=pane.geometry;
+  const state: VtState = {codecVersion:V2_CODEC,geometry:{columns,rows},normal:v2Buffer(columns,rows),
+    alternate:v2Buffer(columns,rows),active:'normal',modes:{autowrap:true,origin:false,insert:false},
+    margins:{top:0,bottom:rows-1,left:0,right:columns-1},tabStops:Array.from({length:Math.floor((columns-1)/8)},(_,i)=>(i+1)*8),
+    pendingUtf8:[],pendingEscape:[],attributes:[],wrapPending:false,extensionState:''};
+  const rule={ruleId:'ordered-scroll',version:'1',configVersion:config.configVersion};
+  const cp: V2LiveCheckpoint={schema:'newarch-v2',checkpointId:v2Digest('genesis',{pane:pane.pane,through}),
+    pane:pane.pane,geometry:pane.geometry,through,replayFloor:through,revision:0,frontier:null,rule,state,
+    stateDigest:v2Digest('vt-state',state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+  validateV2Checkpoint(cp); return immutable(cp);
+}
+/** Clocks are explicit: replay uses the original observation, never Date.now(). */
+export interface V2DecisionContext { readonly wallMs: number; readonly clockEpoch: string }
+export function v2DecisionIncident(input: V2RuleInput, stamp: V2RuleStamp, context: V2DecisionContext,
+  reason: NewarchV2Incident['reason'], detail: string): NewarchV2Incident {
+  const cp=input.checkpoint;
+  return {schema:'newarch-v2',incidentId:v2IncidentId(cp.pane,v2Digest('decoder-cause',{
+    checkpoint:cp.checkpointId,offset:input.raw.start,reason,detail})),pane:cp.pane,reason,
+    frontier:cp.frontier,affected:{after:cp.frontier,through:null},openedAtWallMs:context.wallMs,
+    openedAtMonoMs:input.observedAtMonoMs,clockEpoch:context.clockEpoch,collecting:false,
+    missing:{countKind:'unknown',missingCount:null},ruleVersion:`${stamp.ruleId}@${stamp.version}`,
+    configVersion:stamp.configVersion,geometry:cp.geometry,revision:cp.revision,
+    sourceEpoch:{attachId:cp.through.epoch.attachId,collectorIncarnation:cp.through.epoch.collectorIncarnation},
+    sourceOffset:cp.through.byteOffset,expectedDigest:null,actualDigest:null,action:'gap-and-stop',
+    evidence:{digest:v2Digest('decoder-diagnostic',detail),bytes:0,redacted:true}};
+}
+export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): readonly V2RuleDefinition[] {
+  validateV2Config(config);
+  const definitions: V2RuleDefinition[]=([
+    ['ordered-scroll',10,'accept'],['bounded-tail',20,'defer'],['explicit-gap',30,'gap'],
+  ] as const).map(([ruleId,priority,action])=>({stamp:{ruleId,version:'1',configVersion:config.configVersion},priority,
+    preconditions:['identity','fixed-geometry','contiguous-bytes','known-vt','ordered-evidence'],
+    maxInputBytes:V2L.pendingBytesPerPane,maxInputRows:V2L.pendingRowsPerPane,action}));
+  for(const requested of config.rules) if(!definitions.some(d=>d.stamp.ruleId===requested.ruleId && d.stamp.version===requested.version))
+    throw Error('v2 rule is not compiled into allowlist');
+  // A selection must retain a safe terminal action; no eval or fallback to legacy.
+  if(!config.rules.some(r=>r.ruleId==='explicit-gap')) throw Error('v2 explicit-gap required');
+  return immutable(definitions.filter(d=>config.rules.some(r=>r.ruleId===d.stamp.ruleId)));
+}
+
+/** One bounded transaction over a detached state. A failure discards EVERY
+ * candidate, including scrolls preceding an unsupported control in this input. */
+function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scrolls:RowContent[];offsets:number[]} {
+  if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
+  const s=structuredClone(state) as Writable<VtState>, {columns,rows}=s.geometry;
+  const out:RowContent[]=[],offsets:number[]=[];
+  let offset=0;
+  const active=()=>s[s.active];
+  const cursor=()=>active().cursor;
+  const row=()=>active().rows[cursor().y]!;
+  const blank=()=>v2Blank(columns,s.attributes);
+  const cancelWrap=()=>{active().wrapPending=false;s.wrapPending=false;};
+  const save=()=>{const b=active();b.savedCursor={...b.cursor};b.savedAttributes=[...s.attributes];b.savedModes={...s.modes};};
+  const restore=()=>{const b=active();b.cursor={...b.savedCursor};s.attributes=[...b.savedAttributes];s.modes={...b.savedModes};cancelWrap();};
+  const scroll=(n:number,down=false)=>{
+    const b=active(),{top,bottom}=s.margins;
+    for(let k=0;k<Math.min(n,bottom-top+1);k++) {
+      if(down){b.rows.splice(bottom,1);b.rows.splice(top,0,blank());}
+      else {
+        const removed=b.rows.splice(top,1)[0]!; b.rows.splice(bottom,0,blank());
+        if(s.active==='normal' && top===0 && bottom===rows-1){out.push(removed);offsets.push(offset);
+          if(out.length>V2L.pendingRowsPerPane || size(out)>V2L.pendingBytesPerPane) throw Error('decoded row budget');}
+      }
+    }
+  };
+  const lf=()=>{cancelWrap();if(cursor().y===s.margins.bottom)scroll(1);else cursor().y=Math.min(rows-1,cursor().y+1);};
+  const clearCell=(r:Writable<RowContent>,x:number)=>{
+    if(r.cells[x]?.width===0 && x>0)r.cells[x-1]={text:' ',width:1,style:[...s.attributes]};
+    if(r.cells[x]?.width===2 && x+1<columns)r.cells[x+1]={text:' ',width:1,style:[...s.attributes]};
+    r.cells[x]={text:' ',width:1,style:[...s.attributes]};
+  };
+  const erase=(r:Writable<RowContent>,from:number,to:number)=>{for(let x=from;x<=to;x++)clearCell(r,x);r.softWrap=false;r.wrapPad=0;};
+  const print=(text:string)=>{
+    const cp=text.codePointAt(0)!;
+    // Ambiguous cluster shaping is explicitly withheld, never silently shifted.
+    if(cp===0x200d || cp>=0x1f3fb && cp<=0x1f3ff || cp>=0x1f1e6 && cp<=0x1f1ff)throw Error('ambiguous emoji shaping');
+    const width=charCellWidth(cp);
+    if(width===0 || cp===0xfe0f) {
+      let x=active().wrapPending ? cursor().x : cursor().x-1;
+      if(row().cells[x]?.width===0)x--;
+      const previous=row().cells[x];if(!previous)throw Error('orphan combining character');
+      if(Buffer.byteLength(previous.text)+Buffer.byteLength(text)>4096)throw Error('grapheme budget');
+      previous.text+=text;
+      if(cp===0xfe0f && previous.width===1){
+        if(x+1>=columns)throw Error('VS16 at right boundary');
+        clearCell(row(),x+1);previous.width=2;row().cells[x+1]={text:'',width:0,style:[...previous.style]};
+        cursor().x=Math.min(columns-1,x+2);active().wrapPending=x+2>=columns;
+      }
+      return;
+    }
+    if(active().wrapPending && s.modes.autowrap){row().softWrap=true;lf();cursor().x=0;}
+    if(width===2 && cursor().x===columns-1){
+      if(!s.modes.autowrap)throw Error('wide glyph without wrap');
+      row().softWrap=true;row().wrapPad=1;lf();cursor().x=0;
+    }
+    cancelWrap();const x=cursor().x,r=row();
+    if(s.modes.insert){r.cells.splice(x,0,...Array.from({length:width},()=>({text:' ',width:1 as const,style:[...s.attributes]})));r.cells.length=columns;}
+    clearCell(r,x);if(width===2)clearCell(r,x+1);
+    r.cells[x]={text,width,style:[...s.attributes]};
+    if(width===2)r.cells[x+1]={text:'',width:0,style:[...s.attributes]};
+    if(x+width>=columns){cursor().x=columns-1;active().wrapPending=Boolean(s.modes.autowrap);}
+    else cursor().x+=width;
+  };
+  const csi=(sequence:string)=>{
+    const m=/^\x1b\[(\??)([0-9;:]*)([A-Za-z@`])$/.exec(sequence);if(!m)throw Error('unsupported CSI');
+    const [,privateMode,body,final]=m;
+    const args=body!.split(';').map(x=>x===''?0:Number(x)),n=args[0]||1;
+    if(args.some(x=>!Number.isSafeInteger(x)||x<0||x>65535) && final!=='m')throw Error('CSI parameter');
+    if(final==='m' && !privateMode){s.attributes=v2ApplySgr(s.attributes,body!);return;}
+    if(final==='h'||final==='l'){
+      const on=final==='h';
+      for(const mode of args){
+        if(privateMode && mode===25){s.normal.cursor.visible=s.alternate.cursor.visible=on;}
+        else if(privateMode && mode===7)s.modes.autowrap=on;
+        else if(privateMode && mode===6){s.modes.origin=on;cursor().x=0;cursor().y=on?s.margins.top:0;}
+        else if(privateMode && [47,1047,1049].includes(mode)){
+          if(on && s.active==='normal'){if(mode===1049)save();s.alternate=v2Buffer(columns,rows);s.active='alternate';}
+          else if(!on && s.active==='alternate'){s.active='normal';if(mode===1049)restore();}
+        } else if(!privateMode && mode===4)s.modes.insert=on;
+        else throw Error('unsupported terminal mode');
+      }cancelWrap();return;
+    }
+    if(privateMode)throw Error('unsupported private CSI');
+    const yMin=s.modes.origin?s.margins.top:0,yMax=s.modes.origin?s.margins.bottom:rows-1;
+    if(final==='A')cursor().y=Math.max(yMin,cursor().y-n);
+    else if(final==='B'||final==='e')cursor().y=Math.min(yMax,cursor().y+n);
+    else if(final==='C'||final==='a')cursor().x=Math.min(columns-1,cursor().x+n);
+    else if(final==='D')cursor().x=Math.max(0,cursor().x-n);
+    else if(final==='G'||final==='`')cursor().x=Math.min(columns-1,n-1);
+    else if(final==='d')cursor().y=Math.min(yMax,yMin+n-1);
+    else if(final==='H'||final==='f'){cursor().y=Math.min(yMax,yMin+n-1);cursor().x=Math.min(columns-1,(args[1]||1)-1);}
+    else if(final==='E'||final==='F'){cursor().y=Math.max(yMin,Math.min(yMax,cursor().y+(final==='E'?n:-n)));cursor().x=0;}
+    else if(final==='K'){if(args[0]!>2)throw Error('erase mode');erase(row(),args[0]===0?cursor().x:0,args[0]===1?cursor().x:columns-1);}
+    else if(final==='J'){
+      if(args[0]!>2)throw Error('erase history unsupported');
+      if(args[0]===0){erase(row(),cursor().x,columns-1);for(let y=cursor().y+1;y<rows;y++)active().rows[y]=blank();}
+      else if(args[0]===1){for(let y=0;y<cursor().y;y++)active().rows[y]=blank();erase(row(),0,cursor().x);}
+      else active().rows=Array.from({length:rows},blank);
+    } else if(final==='S')scroll(n);
+    else if(final==='T')scroll(n,true);
+    else if(final==='r'){
+      const top=n-1,bottom=(args[1]||rows)-1;if(top>=bottom || bottom>=rows)throw Error('invalid margins');
+      s.margins.top=top;s.margins.bottom=bottom;cursor().x=0;cursor().y=s.modes.origin?top:0;
+    } else if(final==='s')save();
+    else if(final==='u')restore();
+    else if(final==='X')erase(row(),cursor().x,Math.min(columns-1,cursor().x+n-1));
+    else if(final==='g'){if(args[0]===0)s.tabStops=s.tabStops.filter(x=>x!==cursor().x);else if(args[0]===3)s.tabStops=[];else throw Error('tab mode');}
+    else throw Error('unsupported CSI action');
+    cancelWrap();
+  };
+  for(let i=0;i<bytes.length;i++){
+    const byte=bytes[i]!;offset=i+1;
+    if(s.pendingEscape.length){
+      s.pendingEscape.push(byte);if(s.pendingEscape.length>4096)throw Error('escape budget');
+      const p=s.pendingEscape;
+      if(p.length===2 && byte===0x5b)continue;
+      if(p.length===2 && byte===0x5d)continue;
+      if(p[1]===0x5b){if(byte<0x40||byte>0x7e)continue;csi(String.fromCharCode(...p));}
+      else if(p[1]===0x5d){
+        if(byte!==7 && !(byte===0x5c&&p.at(-2)===0x1b))continue;
+        const osc=String.fromCharCode(...p);
+        if(!/^\x1b\](0|1|2);/.test(osc))throw Error('unsupported OSC semantics');
+      } else if(p.length===2){
+        if(byte===0x37)save();else if(byte===0x38)restore();else if(byte===0x44)lf();
+        else if(byte===0x45){lf();cursor().x=0;}else if(byte===0x4d){if(cursor().y===s.margins.top)scroll(1,true);else cursor().y=Math.max(0,cursor().y-1);}
+        else if(byte===0x48){if(!s.tabStops.includes(cursor().x))s.tabStops.push(cursor().x);s.tabStops.sort((a,b)=>a-b);}
+        else throw Error('unsupported escape');
+      }
+      s.pendingEscape=[];continue;
+    }
+    if(s.pendingUtf8.length || byte>=0x80){
+      s.pendingUtf8.push(byte);const first=s.pendingUtf8[0]!;
+      const needed=first>=0xc2&&first<=0xdf?2:first>=0xe0&&first<=0xef?3:first>=0xf0&&first<=0xf4?4:0;
+      if(!needed || s.pendingUtf8.slice(1).some(b=>(b&0xc0)!==0x80))throw Error('invalid UTF-8');
+      if(s.pendingUtf8.length<needed)continue;
+      print(new TextDecoder('utf-8',{fatal:true}).decode(Uint8Array.from(s.pendingUtf8)));s.pendingUtf8=[];continue;
+    }
+    if(byte===0x1b){s.pendingEscape=[byte];continue;}
+    if(byte===13){cursor().x=0;cancelWrap();}
+    else if(byte===10||byte===11||byte===12)lf();
+    else if(byte===8){cursor().x=Math.max(0,cursor().x-1);cancelWrap();}
+    else if(byte===9){cursor().x=s.tabStops.find(x=>x>cursor().x)??columns-1;cancelWrap();}
+    else if(byte===0||byte===7){} else if(byte<32||byte===127)throw Error('unsupported control');
+    else print(String.fromCharCode(byte));
+  }
+  s.wrapPending=active().wrapPending;
+  return {state:s,scrolls:out,offsets};
+}
+
+/** Call again with the SAME checkpoint and accumulated raw after defer. A
+ * coordinator must not ACK/trim defer, and must call at its original deadline. */
+export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
+  context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2RuleResult {
+  const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
+  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,bytes:input.bytes}),
+    checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+  const gap=(reason:NewarchV2Incident['reason'],detail:string):V2RuleResult=>{
+    const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
+    return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
+  };
+  const cp=input.checkpoint,raw=input.raw;
+  try {
+    validateV2Checkpoint(cp);
+    if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
+      ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
+    if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
+    if(!v2Equal(cp.through.epoch,raw.epoch))return gap('collector-epoch-changed','epoch');
+    if(!counter(raw.start)||!counter(raw.end)||raw.start!==cp.through.byteOffset||raw.end-raw.start!==input.bytes.length)
+      return gap('decoder-anomaly','raw continuity');
+    if(!counter(input.observedAtMonoMs)||input.pendingSinceMonoMs!==null&&(!counter(input.pendingSinceMonoMs)||input.pendingSinceMonoMs>input.observedAtMonoMs))
+      return gap('decoder-anomaly','clock');
+    if(input.bytes.length>V2L.pendingBytesPerPane)return gap('budget-exhausted','input bytes');
+    if(input.bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return gap('decoder-anomaly','invalid byte');
+    const decoded=v2Decode(cp.state,input.bytes);
+    if(decoded.state.pendingUtf8.length||decoded.state.pendingEscape.length){
+      const deadline=(input.pendingSinceMonoMs??input.observedAtMonoMs)+V2L.pendingDeadlineMs;
+      if(!stamp('bounded-tail')||input.observedAtMonoMs>=deadline)return gap('decoder-anomaly','pending deadline');
+      return {kind:'defer',stamp:stamp('bounded-tail')!,evidence,pendingRows:decoded.scrolls.length,
+        pendingBytes:input.bytes.length,deadlineMonoMs:deadline};
+    }
+    if(input.pendingSinceMonoMs!==null&&input.observedAtMonoMs>=input.pendingSinceMonoMs+V2L.pendingDeadlineMs)
+      return gap('decoder-anomaly','pending deadline');
+    const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
+    const segmentId=v2Digest('birth-segment',cp.pane),base=cp.frontier?cp.frontier.rowOrdinal+1:0;
+    if(cp.frontier&&cp.frontier.segmentId!==segmentId)return gap('decoder-anomaly','row frontier');
+    const rows:CommittedStreamRow[]=decoded.scrolls.map((r,i)=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:raw.start+decoded.offsets[i]!-1,end:raw.start+decoded.offsets[i]!},ordinal:base+i};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
+        buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
+        uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
+    });
+    const through={epoch:raw.epoch,byteOffset:raw.end};
+    const checkpoint:V2LiveCheckpoint={...cp,checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule}),through,
+      replayFloor:through,revision:cp.revision+1,frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,
+      stateDigest:v2Digest('vt-state',decoded.state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+    validateV2Checkpoint(checkpoint);
+    return {kind:'accept',stamp:rule,evidence,rows,checkpoint};
+  }catch(cause){return gap('decoder-anomaly',String(cause));}
+}

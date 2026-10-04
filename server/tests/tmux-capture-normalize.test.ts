@@ -1779,3 +1779,134 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
     expect(r.exitCode, r.stderr.toString()).toBe(0);
   });
 });
+
+import { v2BirthCheckpoint, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
+import { V2Jigsaw } from '../src/stream-runtime';
+import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
+import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, v2BirthGeometry, v2Digest, validateV2Incident,
+  type NewarchV2PaneDescriptor, type V2AuditEvidence, type V2LiveCheckpoint } from '../src/stream-contract';
+const v2Pane:NewarchV2PaneDescriptor={schema:'newarch-v2',session:{serverIdentity:'c-private',sessionId:'s'},
+  pane:{serverIdentity:'c-private',paneId:'%1',birthGeneration:1},windowId:'@1',owner:'capture-engine',
+  birthOperationId:'birth-C',geometry:{...v2BirthGeometry(v2Config),columns:10,rows:3},state:'active'};
+const v2Epoch={pane:v2Pane.pane,attachId:'byte0',collectorIncarnation:'collector-C'};
+const v2Genesis=()=>v2BirthCheckpoint(v2Pane,{epoch:v2Epoch,byteOffset:0});
+const v2Clock={wallMs:123,clockEpoch:'test-clock'};
+function v2Replay(text:string,cuts:number[]=[]){
+  const bytes=[...Buffer.from(text)],engine=new V2Jigsaw(v2Genesis(),v2Pane);
+  const rows:SC.CommittedStreamRow[]=[];let start=0;
+  for(const end of [...cuts,bytes.length]){
+    const result=engine.evaluate({epoch:v2Epoch,start,end},bytes.slice(start,end),10,v2Clock);
+    expect(result.kind).not.toBe('gap');
+    if(result.kind==='accept'){rows.push(...result.rows);engine.committed(result.checkpoint.checkpointId);}
+    start=end;
+  }
+  expect(engine.pendingBytes).toBe(0);
+  return {rows,cp:engine.liveCheckpoint};
+}
+const v2Text=(row:SC.RowContent)=>row.cells.map(c=>c.text).join('');
+describe('Q22 V2-13 byte-zero jigsaw (anomaly fixtures C-001..C-008)',()=>{
+  test('C-001 every UTF8/escape partition has identical VT, row IDs and ordered scroll provenance',()=>{
+    const text='ซ้ำ😃\r\nซ้ำ😃\r\n\x1b[31m界\x1b[0m\r\nprogress 1\r\x1b[Kdone\r\n1234567890X\r\nก้❤️\r\n';
+    const full=v2Replay(text);
+    expect(full.rows.slice(0,2).map(v2Text)).toEqual(['ซ้ำ😃     ','ซ้ำ😃     ']);
+    for(let cut=1;cut<Buffer.byteLength(text);cut++){
+      const split=v2Replay(text,[cut]);
+      expect(split.rows).toEqual(full.rows);expect(split.cp.state).toEqual(full.cp.state);
+    }
+    const bytewise=v2Replay(text,Array.from({length:Buffer.byteLength(text)-1},(_,i)=>i+1));
+    expect(bytewise.rows).toEqual(full.rows);expect(bytewise.cp.state).toEqual(full.cp.state);
+  });
+  test('C-002 CR/backspace/erase/cursor redraw and alternate screen do not invent history',()=>{
+    const r=v2Replay('wrong\rOK\x1b[K\b!\x1b[2;1Hlower\x1b[?1049hALT\r\nX\r\nY\r\nZ\x1b[?1049l');
+    expect(r.rows).toEqual([]);expect(r.cp.state.active).toBe('normal');
+    expect(r.cp.state.normal.rows.map(v2Text)).toEqual(['O!        ','lower     ','          ']);
+    expect(r.cp.state.normal.cursor).toMatchObject({x:5,y:1});
+  });
+  test('C-003 soft wrap, scroll regions and wide overwrite retain physical boundaries',()=>{
+    const r=v2Replay('1234567890X\r\nZ\r\n');
+    expect(r.rows.map(v2Text)).toEqual(['1234567890']);expect(r.rows[0]!.wrapStatus).toBe('wrapped');
+    const wide=v2Replay('界X\rA');expect(v2Text(wide.cp.state.normal.rows[0]!)).toBe('A X       ');
+    const region=v2Replay('top\x1b[2;3r\x1b[3;1Ha\n\n');expect(region.rows).toEqual([]);
+    expect(v2Text(region.cp.state.normal.rows[0]!)).toBe('top       ');
+  });
+  test('C-004 partial sequence deadline is fixed, durable state not advanced, incident repeatable',()=>{
+    const engine=new V2Jigsaw(v2Genesis(),v2Pane);
+    expect(engine.evaluate({epoch:v2Epoch,start:0,end:2},[27,91],10,v2Clock).kind).toBe('defer');
+    expect(engine.deadlineMonoMs).toBe(1010);expect(engine.liveCheckpoint.through.byteOffset).toBe(0);
+    expect(engine.evaluate({epoch:v2Epoch,start:2,end:3},[51],500,v2Clock).kind).toBe('defer');
+    expect(engine.deadlineMonoMs).toBe(1010);
+    const result=engine.expire(1010,v2Clock);expect(result?.kind).toBe('gap');
+    if(result?.kind==='gap'){validateV2Incident(result.incident);expect(result.incident.frontier).toBeNull();}
+    expect(engine.pendingBytes).toBe(0);expect(()=>engine.evaluate({epoch:v2Epoch,start:3,end:3},[],1011,v2Clock)).toThrow();
+    const cp=v2Genesis(),input={pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:1},bytes:[255],observedAtMonoMs:10,pendingSinceMonoMs:null};
+    expect(evaluateV2Rules(input)).toEqual(evaluateV2Rules(input));
+  });
+  test('C-005 epoch/identity/geometry/offset/unknown control fail closed; no guessed acceptance',()=>{
+    const cp=v2Genesis(),input={pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:1},bytes:[65],observedAtMonoMs:10,pendingSinceMonoMs:null};
+    for(const change of [
+      {raw:{...input.raw,start:1,end:2}},
+      {raw:{...input.raw,epoch:{...v2Epoch,collectorIncarnation:'next'}}},
+      {pane:{...v2Pane,geometry:{...v2Pane.geometry,columns:11}}},
+      {bytes:[255]},
+    ])expect(evaluateV2Rules({...input,...change}).kind).toBe('gap');
+    const bytes=[...Buffer.from('\x1bPunknown')];
+    expect(evaluateV2Rules({...input,bytes,raw:{...input.raw,end:bytes.length}}).kind).toBe('gap');
+    expect(()=>v2RuleTable({...v2Config,rules:[{ruleId:'eval(log)',version:'1'}]})).toThrow();
+  });
+  test('C-006 checkpoint restart and rule version only at committed boundary',()=>{
+    const first=v2Replay('A\x1b[31mB');const e=new V2Jigsaw(first.cp,v2Pane);
+    e.configure({...v2Config,configVersion:'rules-next'});
+    const start=first.cp.through.byteOffset,bytes=[...Buffer.from('C\r\nD\r\nE\r\n')];
+    const r=e.evaluate({epoch:v2Epoch,start,end:start+bytes.length},bytes,20,v2Clock);
+    expect(r.kind).toBe('accept');if(r.kind!=='accept')return;
+    expect(r.stamp.configVersion).toBe('rules-next');expect(first.cp.rule.configVersion).toBe(v2Config.configVersion);
+    expect(()=>e.configure(v2Config)).toThrow();expect(()=>e.committed('wrong')).toThrow();
+    e.committed(r.checkpoint.checkpointId);
+    expect(r.checkpoint.state).toEqual(v2Replay('A\x1b[31mBC\r\nD\r\nE\r\n').cp.state);
+  });
+  test('C-007 bounds: candidate rows, raw bytes and combining sequence are finite',()=>{
+    const cp=v2Genesis();
+    for(const text of ['X\r\n'.repeat(270),'A'+'\u0301'.repeat(2100),'\x1b['+'1'.repeat(4100)]){
+      const bytes=[...Buffer.from(text)];expect(evaluateV2Rules({pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:0,pendingSinceMonoMs:null}).kind).toBe('gap');
+    }
+  });
+});
+function v2AuditFixture(){
+  const cp=v2Replay('A\x1b[31mB').cp;
+  const current={pane:cp.pane,through:cp.through,revision:cp.revision,geometry:cp.geometry,checkpointId:cp.checkpointId};
+  const rawCapture='A\x1b[31mB\x1b[0m        \n          \n          \n';
+  const evidence:V2AuditEvidence={before:current,after:current,snapshot:current,
+    ordering:{kind:'certified-source-fence',certificateId:'C-proof',proof:{path:'redacted-proof',bytes:1,sha256:'a'.repeat(64)}},
+    expectedDigest:v2ScreenDigest(cp.state.normal.rows),actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,cp.geometry)),
+    captureBytes:Buffer.byteLength(rawCapture),elapsedMs:1};
+  const incident=v2DecisionIncident({pane:v2Pane,checkpoint:cp,raw:{epoch:v2Epoch,start:cp.through.byteOffset,end:cp.through.byteOffset},bytes:[],observedAtMonoMs:10,pendingSinceMonoMs:null},cp.rule,v2Clock,'audit-mismatch','C-008');
+  return {checkpoint:cp,current,rawCapture,evidence,paneAlive:true,attempt:0,incident,
+    verifiedCertificate:{certificateId:'C-proof',sha256:'a'.repeat(64)}};
+}
+describe('Q22 V2-14/15 pure auditor (C-008)',()=>{
+  test('same revision compares actual live cells and mismatch annotates without repairing history',()=>{
+    const f=v2AuditFixture();expect(evaluateV2Audit(f).kind).toBe('match');
+    const rawCapture=f.rawCapture.replace('A','Z'),actualDigest=v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry));
+    const r=evaluateV2Audit({...f,rawCapture,evidence:{...f.evidence,actualDigest}});
+    expect(r.kind).toBe('annotate');if(r.kind==='annotate')validateV2Incident(r.incident);
+    expect(f.checkpoint.state.normal.rows[0]!.cells[0]!.text).toBe('A');
+  });
+  test('disabled, timeout, dead pane, stale revision, changed identity and unproven fence cannot apply',()=>{
+    const f=v2AuditFixture();
+    expect(evaluateV2Audit({...f,config:{...v2Config,audit:{...v2Config.audit,enabled:false}}})).toMatchObject({kind:'inconclusive',reason:'disabled',retry:false});
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,elapsedMs:3000}})).toMatchObject({kind:'inconclusive',reason:'timeout'});
+    expect(evaluateV2Audit({...f,paneAlive:false})).toMatchObject({kind:'inconclusive',reason:'pane-dead'});
+    expect(evaluateV2Audit({...f,current:{...f.current,revision:99}})).toMatchObject({kind:'inconclusive',reason:'stale'});
+    expect(evaluateV2Audit({...f,current:{...f.current,pane:{...f.current.pane,birthGeneration:2}}})).toMatchObject({kind:'inconclusive',reason:'identity'});
+    expect(evaluateV2Audit({...f,verifiedCertificate:null})).toMatchObject({kind:'inconclusive',reason:'racing'});
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,ordering:{kind:'unproven'}}})).toMatchObject({kind:'inconclusive',reason:'racing'});
+    expect(evaluateV2Audit({...f,attempt:1,evidence:{...f.evidence,elapsedMs:3000}})).toMatchObject({retry:false});
+  });
+  test('100 repeated mismatches reuse incident identity; snapshot row count and digest are checked',()=>{
+    const f=v2AuditFixture(),rawCapture=f.rawCapture.replace('A','Z');
+    const evidence={...f.evidence,actualDigest:v2ScreenDigest(normalizeV2Capture(rawCapture,f.checkpoint.geometry))};
+    for(let n=0;n<100;n++){const r=evaluateV2Audit({...f,rawCapture,evidence});expect(r.kind).toBe('annotate');if(r.kind==='annotate')expect(r.incident.incidentId).toBe(f.incident.incidentId);}
+    expect(evaluateV2Audit({...f,evidence:{...f.evidence,actualDigest:'0'.repeat(64)}}).kind).toBe('inconclusive');
+    expect(()=>normalizeV2Capture('A\n',f.checkpoint.geometry)).toThrow();
+  });
+});
