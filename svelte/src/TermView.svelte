@@ -7981,6 +7981,9 @@
   }
   .mtv-fixed .mtv-layer-fixed {
     right: auto;
+    /* fixedLayerWidth already counts the 6+6 gutter; content-box would add
+       the padding again and scroll a fitted pane sideways by 12px. */
+    box-sizing: border-box;
   }
   .mtv-line {
     white-space: pre;
