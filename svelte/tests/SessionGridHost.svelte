@@ -2,7 +2,7 @@
   /** Test host — replaces SessionGrid snapshots without remounting the grid. */
   import SessionGrid from '../src/SessionGrid.svelte';
   import type { AnsiPalette } from '@thumbmux/core';
-  import type { GridSession } from '../src/session-grid';
+  import type { GridFilterOption, GridSession } from '../src/session-grid';
 
   let {
     palette,
@@ -12,6 +12,7 @@
     onKill,
     cardLayout = 'default',
     showNew = true,
+    controls = false,
   }: {
     palette: AnsiPalette;
     initialSessions: GridSession[];
@@ -20,7 +21,14 @@
     onKill?: (name: string) => void;
     cardLayout?: 'default' | 'dense';
     showNew?: boolean;
+    /** Render the search / filter / group row (as /m/hub does). */
+    controls?: boolean;
   } = $props();
+
+  const filterOptions: GridFilterOption[] = [
+    { value: 'cc', label: 'CC' },
+    { value: 'codex', label: 'CDX' },
+  ];
 
   let sessions = $state(initialSessions);
 
@@ -29,4 +37,9 @@
   }
 </script>
 
-<SessionGrid {sessions} {palette} {onOpen} {onNew} {onKill} {cardLayout} {showNew} />
+<SessionGrid
+  {sessions} {palette} {onOpen} {onNew} {onKill} {cardLayout} {showNew}
+  searchable={controls}
+  groupable={controls}
+  filterOptions={controls ? filterOptions : []}
+/>

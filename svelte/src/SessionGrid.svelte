@@ -911,6 +911,20 @@
       aspect-ratio: auto;
     }
   }
+  /* Below ~1040px two 500px cards do not fit beside each other, so an 800px
+     window got one 500px card and a 280px empty strip, and 1024 got a single
+     column whose second row showed 4%. Two square cards that share the width
+     instead; from 1040px up the fixed 500px cards are unchanged. */
+  @media (min-width: 768px) and (max-width: 1039px) and (pointer: fine) {
+    .grid.dense {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .grid.dense .card {
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1 / 1;
+    }
+  }
   .controls,
   .group-heading,
   .empty {
@@ -964,6 +978,15 @@
   }
   .group-toggle {
     margin-left: auto;
+  }
+  /* Fingers get 44px whatever the screen; the 34/36px filter row and search
+     field were sized for a mouse. */
+  @media (pointer: coarse) {
+    .filters button,
+    .group-toggle,
+    .search input {
+      min-height: 44px;
+    }
   }
   .group-heading {
     display: flex;
@@ -1104,6 +1127,35 @@
     font: 400 24px/1 var(--font-mono, ui-monospace, monospace);
     cursor: pointer;
     touch-action: manipulation;
+  }
+  /* Mouse on a short screen: a 72px header is three lines of metadata on
+     every card and pushes the second row of cards under the fold. 44px keeps
+     two lines of note/summary (12px × 1.5 × 2 + 8px padding) and the name;
+     the full text is one click away in the session itself. */
+  @media (pointer: fine) and (max-height: 820px) {
+    .dense-head {
+      height: 44px;
+      line-height: 1.5;
+    }
+    .dense-note,
+    .dense-summary {
+      line-height: 1.5;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+    }
+    .dense-name {
+      min-height: 0;
+      line-height: 1.3;
+      overflow: hidden;
+    }
+    .dense-head.has-kill .dense-summary-section {
+      padding-inline-end: 40px;
+    }
+    .dense-kill {
+      width: 36px;
+      height: 44px;
+      font-size: 20px;
+    }
   }
   .dense-kill:hover,
   .dense-kill:active {
