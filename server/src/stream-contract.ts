@@ -1548,7 +1548,6 @@ export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
     || Buffer.byteLength(streamCanonical(c)) > NEWARCH_V2_LIMITS.checkpointBytesPerPane) throw Error('v2 checkpoint bytes');
 }
 export function validateV2Incident(i: NewarchV2Incident): void {
-  if (i.frontier === null) throw Error('mutant incident needs prior ACK');
   if (i.schema !== NEWARCH_V2_VERSION) throw Error('v2 incident schema');
   v2Text(i.incidentId); v2PaneKey(i.pane); v2Text(i.clockEpoch);
   for (const n of [i.openedAtWallMs, i.openedAtMonoMs, i.revision]) v2Int(n);
