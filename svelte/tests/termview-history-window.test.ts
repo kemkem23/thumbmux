@@ -2863,6 +2863,28 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     }
   });
 
+  test("birth geometry that arrives after mount (inventory comes late) refits at once, no resize", async () => {
+    // SessionView mounts TermView while the policy is still pending (no claim,
+    // no geometry); the inventory row lands later. No viewport change follows,
+    // so the prop change itself must trigger the refit. (Caught by Playwright.)
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: false, viewportWidth: 390, fontPx: 13 });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      view.props.fixedGeometry = BIRTH;
+      flushSync();
+      await settleUi();
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("120");
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
   test("fitWidth together with auto never scales the picture — one shrink only", async () => {
     const resizes = captureResizes();
     try {
