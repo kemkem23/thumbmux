@@ -924,6 +924,7 @@ export class NewarchV2Display {
     const seen = new Set<string>();
     for (const entry of page.entries) {
       if (entry.kind === "row") {
+        if (!entry.row.finalized) return v2Integrity("v2 candidate row is not durable history");
         if (!v2PaneEqual(entry.row.id.pane, request.pane)) return v2Integrity("v2 row pane");
         const key = v2RowKey(entry.row);
         if (seen.has(key)) return v2Integrity("duplicate v2 row");
