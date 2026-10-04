@@ -100,25 +100,25 @@
       return { kind: 'viewer' };
     }
     const selection = row.newarchV2;
-    if (!isRecord(selection)) return { kind: 'unknown-owner', reason: 'malformed' };
+    if (!isRecord(selection)) return { kind: 'viewer' };
     switch (selection.kind) {
       case 'missing':
         return { kind: 'viewer' };
       case 'owner-unavailable':
-        return { kind: 'unknown-owner', reason: 'owner-unavailable' };
+        return { kind: 'viewer' };
       case 'selected':
         return isNewarchV2PaneDescriptor(selection.pane)
           ? fixedPolicy([selection.pane])
-          : { kind: 'unknown-owner', reason: 'malformed' };
+          : { kind: 'viewer' };
       case 'ambiguous': {
         const panes = selection.panes;
         if (!Array.isArray(panes) || panes.length === 0 || !panes.every(isNewarchV2PaneDescriptor)) {
-          return { kind: 'unknown-owner', reason: 'malformed' };
+          return { kind: 'viewer' };
         }
         return fixedPolicy(panes);
       }
       default:
-        return { kind: 'unknown-owner', reason: 'malformed' };
+        return { kind: 'viewer' };
     }
   }
 </script>
