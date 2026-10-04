@@ -437,7 +437,9 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
     const due=[archiveNextDue(disk),quietNextDue(disk)].filter((t):t is number=>t!==null),next=due.length?Math.min(...due):null;
     if(!drainTimer && next!==null)drainTimer=setTimeout(drain,Math.max(ARCHIVE_IDLE_MS,next-archiveClock()));
   };
-  const onMessage=(batch:Batch|'close')=>{
+  const onMessage=(batch:Batch|'close'|'heap')=>{
+    // The worker's JS heap is its own VM: the host's process.memoryUsage() never sees it.
+    if(batch==='heap'){parentPort!.postMessage({heap:process.memoryUsage().heapUsed,commits});return;}
     if(batch==='close') {
       if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
       try {closePrepared(disk);}catch(error){console.error('[newarch] disk worker close failed',String(error));}
@@ -504,6 +506,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private storageBatchId:string|null=null;
   private closeReceipt:ProjectionCloseReceipt|null=null;
   private worker:Worker|null=null;
+  private heapWaiters:Array<(r:{heap:number;commits:number}|null)=>void>=[];
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
   private diskTiming={totalMs:0,writeMs:0,commitMs:0,archiveMs:0};
@@ -1193,7 +1196,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
       new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
     };
-    this.worker.on('message',(id:string)=>{
+    this.worker.on('message',(id:string|{heap:number;commits:number})=>{
+      if(typeof id!=='string'){for(const resolve of this.heapWaiters.splice(0))resolve(id);return;}
       if(this.closed || !this.inFlight || this.retry?.id!==id)return;
       try {
         this.finishWorker();
@@ -1201,7 +1205,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       }catch(error){this.handleFlushFailure(error);}
     });
     this.worker.on('error',failed);
-    this.worker.on('exit',code=>{this.worker=null;if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
+    this.worker.on('exit',code=>{this.worker=null;for(const resolve of this.heapWaiters.splice(0))resolve(null);if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
     this.worker.unref();
   }
   private flushAsync():void {
@@ -1256,6 +1260,11 @@ export class ProjectionStore implements ProjectionWriterPort {
    * Archive scheduling and receipt lookup counters (D2): the disk worker's
    * commits plus this thread's barrier flushes and boot/calibration lookups.
    */
+  /** Heap of the disk worker's own JS VM (bytes in use, garbage included) and its commit count; null without a worker. */
+  diskWorkerHeap():Promise<{heap:number;commits:number}|null> {
+    const worker=this.worker;if(!worker)return Promise.resolve(null);
+    return new Promise(resolve=>{this.heapWaiters.push(resolve);worker.postMessage('heap');});
+  }
   archiveStats():ArchiveStats {
     const own=archiveStatsOf(this.disk),sum=emptyArchiveStats();
     for(const key of Object.keys(sum) as (keyof ArchiveStats)[])sum[key]=own[key]+this.workerArchive[key];
