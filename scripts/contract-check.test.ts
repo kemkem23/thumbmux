@@ -1378,3 +1378,28 @@ describe("0.20.3 reviewed optional graph additions", () => {
     });
   }
 });
+
+describe("0.20.5 reviewed createBunTmuxDriver return widening", () => {
+  // Pair copied from the two artifacts (v0.20.4-dist baseline, 0.20.5 git-dist),
+  // not read back from V0205_REVIEWED_ADDITIONS, so the gate and this test hold
+  // separate copies.
+  const pair = "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b";
+  test(pair.split(":").slice(0, 2).join(":"), () => {
+    const [subpath, name, before, after] = pair.split(":") as ["server", string, string, string];
+    const oldEntry = { name, kind: "value" as const, tier: "F" as const, signature: before, compatibilitySignature: before };
+    const newEntry = { name, kind: "value" as const, tier: "F" as const, signature: after, compatibilitySignature: after };
+    const run = (oldLive = oldEntry, newLive = newEntry, oldVersion = "0.20.4", newVersion = "0.20.5") =>
+      evaluateBaseline(subpath, [oldEntry], [newEntry], [oldLive], [newLive], oldVersion, newVersion).errors;
+    expect(run()).toEqual([]);
+    expect(run(oldEntry, { ...newEntry, compatibilitySignature: "narrowed-unreviewed-declaration" }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run({ ...oldEntry, compatibilitySignature: "different-prior-artifact" }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run(oldEntry, newEntry, "0.20.3"))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(run(oldEntry, newEntry, "0.20.4", "0.20.6"))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+    expect(evaluateBaseline(subpath, [oldEntry], [], [oldEntry], [], "0.20.4", "0.20.5").errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
+  });
+});

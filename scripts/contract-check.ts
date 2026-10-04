@@ -1435,6 +1435,32 @@ function isV0203PatchException(
   return V0203_REVIEWED_ADDITIONS.has(reviewed);
 }
 
+/**
+ * Reviewed return-type widening for 0.20.4 -> 0.20.5. createBunTmuxDriver now
+ * returns BunTmuxDriver (= TmuxDriver & { activityPoll }), a subtype every
+ * existing TmuxDriver binding still accepts (server/tests/session-row-type.fixture.ts
+ * assigns it to TmuxDriver). The generic proof cannot model the intersection.
+ * Pin both artifact digests and versions; unrelated drift still fails.
+ * createActivityPoll / readActivityProcess left the barrel instead of freezing.
+ * Evidence: orchestrator-runs/20260923/newarch-v2/tmxfix/REPORT.md.
+ */
+const V0205_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b"
+]);
+
+function isV0205PatchException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.20.4" || currentVersion !== "0.20.5") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0205_REVIEWED_ADDITIONS.has(reviewed);
+}
+
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1658,6 +1684,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV0203PatchException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0205PatchException(
           baselineVersion,
           currentVersion,
           subpath,
