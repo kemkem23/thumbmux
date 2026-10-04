@@ -1447,7 +1447,9 @@ function isV0203PatchException(
  * NewarchV2GeometryReply | null instead of void. Callers that ignore the result
  * still compile; AppRoutes / AppRoutesOptions / createAppRoutes change only
  * through that TmuxWsMux graph (app-routes.d.ts is byte-identical).
- * Evidence: orchestrator-runs/20260923/newarch-v2/tmxfix/REPORT.md.
+ * Evidence: server/tests/session-row-type.fixture.ts compiles 0.20.4-shaped
+ * callers (discarded result, void callback, non-overriding subclass). A
+ * subclass that overrides either method as `: void` no longer compiles.
  */
 const V0205_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b",
