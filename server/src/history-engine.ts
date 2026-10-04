@@ -5,7 +5,7 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolve, dirname, join, sep } from 'node:path';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
+import { closeSync, existsSync, readdirSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { FLAGON_BUDGET as FB, cellToSemanticCell, normalizedRowsDigest, normalizedGapDigest, normalizedCoverageDigest, coverageProjectionDigest, attachCoverage, archiveInventoryMatches, archiveInventoryDigest, segmentContinuityDigest, orderedControlDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest, gapIdentity, validGapUpdate } from './stream-contract';
 import type { FlagOnHistoryPort, SpoolRecord, SpoolAck, RowsAndGapsCommit, RowsAndGapsReceipt, FlagOnRecoveryChunk, RawPosition, OperationFence, PinRequest, SegmentPin, SealedExport, RemoteIndexReceipt, ReclaimReceipt, EvidenceFile, Coverage, CommittedStreamRow } from './stream-contract';
@@ -1760,6 +1760,15 @@ import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapabi
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
   NewarchV2HistoryRequest, NewarchV2HistoryCursor } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
+function v2Failure(error: unknown): StreamFailure {
+  const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
+  if (/^SQLITE_(BUSY|LOCKED)/.test(code) || /database is locked/i.test(String(error)))
+    return { status: 'busy', reason: 'snapshot-gate', retryAfterMs: 20 };
+  if (/^(ENOSPC|EDQUOT|EIO|EROFS|SQLITE_(FULL|IOERR|CANTOPEN|READONLY))/.test(code)
+    || /database or disk is full|disk I\/O error/i.test(String(error)))
+    return { status: 'error', code: 'io', message: String(error) };
+  return fail(error);
+}
 type V2Opened = { capability: V2WriterCapability; writer: V2HistoryWriter; reader: V2HistoryReader };
 export interface V2HistoryOptions {
   /** Tests kill/throw at real transaction boundaries. Never an alternate writer. */
@@ -1777,11 +1786,13 @@ export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2HistoryF
     try {
       validateV2Config(request.config); nonempty(request.engineId); nonempty(request.rootId);
       const root = resolve(request.rootId); fhSafePath(root);
+      fhAssert(existsSync(join(root, 'flag-on-v1.sqlite')) || !existsSync(root) || readdirSync(root).length === 0,
+        'v2 missing owner database in existing root');
       store = new FlagOnHistoryStore({ root, mode: existsSync(join(root, 'flag-on-v1.sqlite')) ? 'recover' : 'create',
         codecVersions: ['newarch-v2'], [V2_STORE]: true });
       // Do not pass capabilities through ok(): it serializes/copies the token.
       return { status: 'ok', value: store.openV2(V2_STORE, request, hooks) };
-    } catch (e) { store?.close(); return fail(e); }
+    } catch (e) { store?.close(); return v2Failure(e); }
   } });
 }
 const V2_SCHEMA = `
@@ -1824,7 +1835,7 @@ class V2Storage {
       reserveBirth: (c: V2WriterCapability, r: V2SessionReservation) => this.reserve(c, r),
       cancelBirth: (c: V2WriterCapability, r: V2CancelBirth) => this.cancel(c, r),
       close: async (c: V2WriterCapability): Promise<Result<null>> => {
-        try { this.authorize(c); this.#closed = true; this.release(); return ok(null); } catch (e) { return fail(e); }
+        try { this.authorize(c); this.#closed = true; this.release(); return ok(null); } catch (e) { return v2Failure(e); }
       },
     });
     const reader: V2HistoryReader = Object.freeze({
@@ -1847,7 +1858,7 @@ class V2Storage {
     const row = this.#db.query('SELECT generation FROM fh_v2_meta WHERE id=1').get() as SqlRow;
     fhAssert(row.generation === c.generation, 'v2 stale generation');
   }
-  private read<T>(f: () => T): Result<T> { try { this.live(); return ok(f()); } catch (e) { return fail(e); } }
+  private read<T>(f: () => T): Result<T> { try { this.live(); return ok(f()); } catch (e) { return v2Failure(e); } }
   private tx<T>(cap: V2WriterCapability, phase: string, f: () => T): Result<T> {
     try {
       this.live();
@@ -1857,7 +1868,7 @@ class V2Storage {
         const value = f(); this.hooks.boundary?.(phase + '-before-commit'); return value;
       }).immediate();
       this.hooks.boundary?.(phase + '-after-commit'); return ok(result);
-    } catch (e) { return fail(e); }
+    } catch (e) { return v2Failure(e); }
   }
   private get<T>(kind: string, pane: string, id: string): T | null {
     const r = this.#db.query('SELECT payload,checksum FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, pane, id) as SqlRow | null;
@@ -2072,13 +2083,14 @@ class V2Storage {
           this.put('pin', key, command.pinId, { ...pin, released: true }); break;
         }
         case 'reclaim': this.reclaim(r.fence.pane, command.locatorCommitId, command.segmentId); break;
+        default: throw Error('v2 unsupported command');
       }
       this.putOwner(next);
       const completed = { ...receipt, frontier: next.frontier };
       this.put('receipt', key, r.fence.operationId, completed); return completed;
     });
     if (result.status === 'ok' && r.command.kind === 'reclaim') {
-      try { this.cleanupReclaim(cap, r.fence.pane, r.command.segmentId); } catch (e) { return fail(e); }
+      try { this.cleanupReclaim(cap, r.fence.pane, r.command.segmentId); } catch (e) { return v2Failure(e); }
     }
     return result;
   }
@@ -2202,10 +2214,27 @@ class V2Storage {
     const coverage: Coverage = [{ kind: 'rows', range, digest: normalizedRowsDigest(range, rows) }];
     const cp = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
     const seal: LogicalSealR2 = { revision: 2, sealCommitId: receipt.commitId, sealGeneration: receipt.generation, pane, segmentId: segment,
-      coverage, rawRanges: cp ? [{ epoch: cp.through.epoch, start: cp.replayFloor.byteOffset, end: cp.through.byteOffset }] : [],
+      // Raw lives in S, not this export. Never advertise unexported replay bytes.
+      coverage, rawRanges: [],
       checkpointIds: cp ? [cp.checkpointId] : [], timelineIndexCommitId: receipt.commitId, replayIndexCommitId: receipt.commitId };
     this.put('seal', key, receipt.commitId, seal); this.put('segment-seal', key, segment, seal);
     if (cp) this.put('sealed-checkpoint', key, receipt.commitId, cp);
+  }
+  private cleanupUncommittedExports(): void {
+    // File creation precedes the DB receipt. If that transaction died, all
+    // rows are still local and no public export exists. Reap only names
+    // derived from our durable seals, never arbitrary files in the root.
+    for (const row of this.#db.query("SELECT pane,id FROM fh_v2_object WHERE kind='seal'").iterate() as Iterable<SqlRow>) {
+      const seal = this.get<LogicalSealR2>('seal', String(row.pane), String(row.id));
+      fhAssert(seal, 'v2 missing seal');
+      if (this.get('segment-export', String(row.pane), seal.segmentId)) continue;
+      const stem = v2Digest('export-path', { pane: seal.pane, sealId: seal.sealCommitId });
+      for (const suffix of ['.v2.jsonl', '.v2.jsonl.tmp', '.v2.manifest.json', '.v2.manifest.json.tmp']) {
+        const path = join(this.root, stem + suffix); fhSafePath(path);
+        if (existsSync(path)) unlinkSync(path);
+      }
+    }
+    fhSyncDir(this.root);
   }
   private materialize(pane: PaneKey, sealId: string, operationId: string): void {
     const key = v2PaneKey(pane), seal = this.get<LogicalSealR2>('seal', key, sealId); fhAssert(seal, 'v2 unknown seal');
@@ -2215,6 +2244,7 @@ class V2Storage {
       for (const f of [...previous.files, previous.manifest]) fhAssert(equal(fhEvidence(f.path), f), 'v2 export changed');
       this.put('export', key, operationId, { ...previous, operationId }); return;
     }
+    this.cleanupUncommittedExports();
     fhAssert(!this.#db.query("SELECT 1 FROM fh_v2_object e WHERE e.kind='segment-export' AND NOT EXISTS(SELECT 1 FROM fh_v2_object r WHERE r.kind='remote-segment' AND r.pane=e.pane AND r.id=e.id) LIMIT 1").get(), 'v2 export staging pressure');
     const name = v2Digest('export-path', { pane, sealId }), path = join(this.root, name + '.v2.jsonl'), manifest = join(this.root, name + '.v2.manifest.json');
     const write = (file: string, records: Iterable<unknown>, cap: number) => {
@@ -2223,7 +2253,7 @@ class V2Storage {
       finally { closeSync(fd); }
       renameSync(file + '.tmp', file); fhSyncDir(this.root); return fhEvidence(file);
     };
-    const data = write(path, this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n').iterate(key, seal.segmentId), FB.archiveChunkBytes);
+    const data = write(path, this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n').iterate(key, seal.segmentId), Math.min(FB.archiveChunkBytes, this.#config.storage.stagingCapBytes));
     const cp = this.get('sealed-checkpoint', key, sealId);
     const meta = write(manifest, [{ schema: 'newarch-v2', storeId: this.storeId, seal, checkpoint: cp, files: [data] }], Math.min(V2L.checkpointBytesPerPane + V2L.pageBytes, this.#config.storage.stagingCapBytes - data.bytes));
     const exported: SealedExport = { kind: 'sealed-export', operationId, storeUUID: this.storeId, pane, segmentId: seal.segmentId,

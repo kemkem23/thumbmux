@@ -291,6 +291,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
 test('H v2 mutations reject forged writers, lost incidents, stale audits and non-atomic checkpoints', async () => {
   const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'h-v2-mutants-'));
   const mutations = [
+    { name: 'v2-unbounded-export-scratch', from: '    this.cleanupUncommittedExports();', to: '    /* mutant leaves unpublished exports behind */' },
     { name: 'v2-second-process-writer', from: 'PRAGMA locking_mode=EXCLUSIVE;', to: 'PRAGMA locking_mode=NORMAL;' },
     { name: 'v2-reclaim-with-pin', from: "fhAssert(pin?.segmentId !== segment || pin.released, 'v2 segment pinned');", to: '/* mutant ignores persistent pins */' },
     { name: 'v2-locator-without-readback', from: "&& this.hooks.remoteReadback?.(locator, exported) === true, 'v2 public reader proof required'", to: "&& true, 'v2 public reader proof required'" },

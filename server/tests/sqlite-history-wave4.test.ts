@@ -1414,6 +1414,7 @@ describe('H v2 capture-only storage', () => {
     const f = await h2fixture();
     try {
       await f.activate();
+      expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'unknown' } as unknown as H2.V2WriteCommand, 'unsupported'))).status).toBe('error');
       expect((await f.port.writer.commit({ ...f.port.capability }, f.request({ kind: 'close' }, 'forged'))).status).toBe('error');
       expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(1);
       expect((await f.open()).status).not.toBe('ok');
@@ -1589,6 +1590,7 @@ test('H v2 seal locator pin reclaim use one writer and interrupted cleanup retri
     const cursorPage = h2value(await f.page(1)); if (cursorPage.after.kind !== 'more') throw Error('cursor missing');
     const sealReceipt = await f.commit({ kind: 'seal', segmentId: 'segment-1' }, 'seal');
     const seal = h2value(f.port.reader.sealed(f.pane, sealReceipt.commitId))!;
+    expect(seal.rawRanges).toEqual([]); // H does not possess/export S's raw bytes.
     await f.commit({ kind: 'materialize-export', sealCommitId: sealReceipt.commitId }, 'export');
     const exported = h2value(f.port.reader.export(f.pane, 'export'))!;
     const sources = [...exported.files, exported.manifest];
@@ -1681,5 +1683,67 @@ test('H v2 ordered audit repairs only pending and disabled or stale evidence nev
     expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'audit', result }, 'late-repair'))).status).toBe('error');
     await f.commit({ kind: 'audit', result: { kind: 'inconclusive', reason: 'disabled', retry: false } }, 'disabled');
     expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
+  } finally { await f.cleanup(); }
+});
+
+
+test('H v2 storage failures are IO without ACK and emergency incident materializes once', async () => {
+  let storageFault: string | null = null;
+  const f = await h2fixture({ boundary: at => {
+    if (storageFault && at === 'v2-batch-before-commit') throw Object.assign(new Error('injected storage failure'), { code: storageFault });
+  } });
+  try {
+    await f.activate();
+    for (const code of ['ENOSPC', 'EDQUOT', 'SQLITE_FULL', 'SQLITE_IOERR_WRITE']) {
+      storageFault = code;
+      const result = await f.port.writer.commit(f.port.capability, f.request(f.batch([f.row(0)]), 'storage-' + code));
+      expect(result).toMatchObject({ status: 'error', code: 'io' });
+      expect(h2value(f.port.reader.receipt(f.pane, 'storage-' + code))).toBeNull();
+      expect(h2value(f.port.reader.checkpoint(f.pane))!.revision).toBe(1);
+      expect(h2value(await f.page()).entries).toEqual([]);
+    }
+    storageFault = null;
+    const incident = f.incident('emergency-stable-id', 2);
+    const receipt = await f.commit({ kind: 'incident', incident }, 'materialize-emergency');
+    await f.reopen();
+    expect(await f.commit({ kind: 'incident', incident }, 'materialize-emergency')).toEqual(receipt);
+    expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
+  } finally { await f.cleanup(); }
+});
+
+
+test('H v2 missing owner database in an existing root is unknown, never an empty new store', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate(); h2value(await f.port.writer.close(f.port.capability));
+    rmSync(join(f.root, 'flag-on-v1.sqlite'));
+    expect((await f.open()).status).toBe('error');
+    expect(existsSync(join(f.root, 'flag-on-v1.sqlite'))).toBe(false);
+    expect(f.port.reader.sessionOwner(f.session).status).toBe('error');
+  } finally { await f.cleanup(); }
+});
+
+
+test('H v2 export rollback reaps only unpublished scratch before exporting another segment', async () => {
+  let failExport = false;
+  const f = await h2fixture({ boundary: at => { if (failExport && at === 'v2-materialize-export-before-commit') throw Error('export interrupted'); } });
+  try {
+    await f.activate(); await f.commit(f.batch([f.row(0)]), 'first-rows');
+    const firstSeal = await f.commit({ kind: 'seal', segmentId: 'segment-1' }, 'seal-one');
+    const row = { ...f.row(0), id: { ...f.row(0).id, segmentId: 'segment-2' },
+      origin: { kind: 'pipe' as const, range: { epoch: f.cp(1).through.epoch, start: 1, end: 2 }, ordinal: 0 } };
+    const cp = f.cp(4, 2, row.id);
+    await f.commit({ kind: 'batch', batch: { rows: [row], decisions: [], incidents: [], checkpoint: cp,
+      input: { kind: 'synced-spool', version: 1, through: cp.through, recordDigest: 'c'.repeat(64), commitId: 'input-two', segmentId: 'raw-1' } } }, 'second-rows');
+    const secondSeal = await f.commit({ kind: 'seal', segmentId: 'segment-2' }, 'seal-two');
+    failExport = true;
+    expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'materialize-export', sealCommitId: firstSeal.commitId }, 'failed-export'))).status).toBe('error');
+    expect(h2value(f.port.reader.export(f.pane, 'failed-export'))).toBeNull();
+    expect(readdirSync(f.root).filter(name => name.includes('.v2.'))).toHaveLength(2);
+    failExport = false; await f.reopen();
+    await f.commit({ kind: 'materialize-export', sealCommitId: secondSeal.commitId }, 'good-export');
+    expect(readdirSync(f.root).filter(name => name.includes('.v2.'))).toHaveLength(2);
+    expect(h2value(await f.page()).entries).toHaveLength(2);
+    expect(h2value(f.port.reader.export(f.pane, 'good-export'))!.segmentId).toBe('segment-2');
   } finally { await f.cleanup(); }
 });
