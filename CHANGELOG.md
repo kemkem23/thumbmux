@@ -5,15 +5,17 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
 
 ## v0.20.5 — 2026-10-04
 
-Patch. Ships the low-resolution screen layout (UI-COMPACT lot D) and the
-newarch/pipe-history work merged since 0.20.4. The default terminal path
-(legacy route, replay materializer, PTY WAL proxy) is unchanged apart from the
-async activity poll in `createBunTmuxDriver`; everything under
-`./pipe-history-runtime` stays opt-in and the stream-first entry is constructed
-only by a host that asks for it. The five workspace manifests and internal
-caret ranges are 0.20.5 / ^0.20.5. Consumers moving a pinned git dist must
-update their lockfiles to the new immutable dist tag. NEWARCH v2 (round-2
-integration) is **not** in this release.
+Patch. Ships the low-resolution screen layout (UI-COMPACT lot D), the
+newarch/pipe-history work merged since 0.20.4, and the NEWARCH v2 public
+surface (stability tier S, opt-in). The default terminal path (legacy route,
+replay materializer, PTY WAL proxy) is unchanged apart from the async activity
+poll in `createBunTmuxDriver`; everything under `./pipe-history-runtime` stays
+opt-in, the stream-first entry is constructed only by a host that asks for it,
+and NEWARCH v2 behaviour is reached only through the new optional
+`TmuxWsMuxOptions.newarchV2` hook. Flag-on (stream-first / NEWARCH v2) is not
+production-ready. The five workspace manifests and internal caret ranges are
+0.20.5 / ^0.20.5. Consumers moving a pinned git dist must update their
+lockfiles to the new immutable dist tag.
 
 ### Changed — low-resolution screens (UI-COMPACT lot D)
 
@@ -45,9 +47,36 @@ Playwright audit before and after.
   at a time, results fenced by generation so a late sample never overwrites a
   newer one, and the `tmux` child is reaped when reading its pipe fails. The
   return type is `BunTmuxDriver` (`TmuxDriver` plus the poll handle), a
-  subtype of `TmuxDriver`, so existing callers keep compiling;
-  `createActivityPoll` and
-  `readActivityProcess` are exported for hosts that drive their own poll.
+  subtype of `TmuxDriver`, so existing callers keep compiling.
+- The server barrel lists the `bun-driver` exports by name instead of
+  `export *`. `createActivityPoll` and `readActivityProcess` are **not** part
+  of the public API (they were never released); everything 0.20.4 exported
+  from that module is still exported.
+
+### Added — NEWARCH v2 surface (tier S, opt-in)
+
+- `@thumbmux/core` exports the NEWARCH v2 protocol types and helpers
+  (`NEWARCH_V2_SCHEMA`, `NEWARCH_V2_CAPABILITIES`, `supportsNewarchV2`,
+  `NewarchV2PaneDescriptor`, `NewarchV2PaneSelection`, `NewarchV2GeometryReply`,
+  `NewarchV2HistoryCursor`, `NewarchV2Incident` and related names). They are
+  stability tier S: covered by the contract check, not frozen like tier F.
+- `TmuxWsMuxOptions.newarchV2?` (optional) lets the host name the owner of a
+  session. When set, session-list rows carry the owner's selection, and an
+  owned pane keeps its birth geometry: `handleResize` / `applyGeometry` do not
+  resize it and return the fixed geometry. Without the option nothing changes.
+- **Compatibility note:** `TmuxWsMux.handleResize` and `applyGeometry` now
+  return `NewarchV2GeometryReply | null` (was `void`). Callers that ignore the
+  result, store the method in a `void`-returning slot, or subclass without
+  overriding still compile (`server/tests/session-row-type.fixture.ts`). A
+  subclass that overrides either method with a `: void` return type no longer
+  type-checks and must return `null`.
+- `TermView` gains optional `fixedGeometry`, `fitWidth` and `v2StatusText`
+  props: a fixed-size pane is scaled to the viewport instead of resized, and an
+  incident sentence can be shown without a live pane. `SessionView` does not
+  claim geometry for a pane whose owner is fixed or could not be resolved.
+- The history window keeps flag-on edges pageable while a read is pending,
+  gapped or remote, and shows flag-on states as notes beside the rows, never as
+  terminal text.
 
 ### Added — stream-first entry (opt-in, default off)
 
@@ -55,7 +84,7 @@ Playwright audit before and after.
   `StreamVtTransport`. Importing the subpath still opens no database and starts
   no timer; nothing constructs the stream runtime unless the host does.
   Flag-off behaviour is unchanged (reviewed by two providers). Flag-on is not
-  production-ready: three loss paths are open and tracked for NEWARCH v2.
+  production-ready.
 - The stream path brings capture/display/history engines, a history watchdog,
   crash recovery that re-derives never-readable staged rows from the journal,
   a read-only `sh_*` archive reader for the rollback bridge, and fenced late
