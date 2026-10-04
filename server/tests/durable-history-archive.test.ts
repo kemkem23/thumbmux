@@ -11,16 +11,18 @@ import { FlagOnHistoryStore } from "../src/history-engine";
 import { StreamArchiveCatalog, type ArchiveOwner } from "../../../../src/integrations/stream-archive-bridge";
 import {
   ArchiveWorker, findInventoryEntry, lookupRestored, paneDigest, RcloneRemote, readLatestInventory, restoreFailureReason, restoreRangeFromRemote,
+  V2ArchiveOffload,
 } from "../../../../src/integrations/stream-history-offload";
 import type {
   ArchiveCandidate, ArchiveCandidateSource, RemoteStore,
 } from "../../../../src/integrations/stream-history-offload";
 import {
-  archiveInventoryMatches, streamCanonical, streamDigest,
+  archiveInventoryMatches, streamCanonical, streamDigest, v2Digest, v2WriteDigest, v2WriteDisposition,
 } from "../src/stream-contract";
 import type {
   ArchiveBundle, ArchiveCatalogPort, ArchiveInventoryR2, CommittedStreamRow, Coverage, FlagOnHistoryPort, Gap, LogicalSealR2, PaneKey,
-  RemoteAuthorizationR2, RemoteObject, RowsAndGapsCommit, SealedExport, SpoolAck, SpoolRecord, StoragePressure, VtCheckpoint,
+  RemoteAuthorizationR2, RemoteObject, RowsAndGapsCommit, SealedExport, SegmentPin, SpoolAck, SpoolRecord, StoragePressure, VtCheckpoint,
+  NewarchV2HistoryRequest, NewarchV2Incident, SegmentRowId, V2HistoryPage, V2Receipt, V2WriteRequest,
 } from "../src/stream-contract";
 
 let root = "";
@@ -543,6 +545,14 @@ async function oHistory(): Promise<{ hist: string; store: FlagOnHistoryStore; ac
     store.setGeneration(OP, null, 0);
     const ack = oAck(await store.appendInput(oRecord()));
     oAck(store.persistCheckpoint({ operationId: "cp-O", pane: OP, expectedGeneration: 0, inputAck: ack, checkpoint: oCheckpoint(ack) }));
+    // H 52e1c83c8 leaves a checkpoint pin on this segment, and sealExport refuses
+    // every unreleased pin. The checkpoint event stays. Pin policy belongs to H.
+    const checkpointKey = `checkpoint:${streamCanonical(OP)}`;
+    const checkpointPin: SegmentPin = {
+      pane: OP, expectedGeneration: 0, operationId: checkpointKey, segmentId: ack.segmentId,
+      reason: "checkpoint", pinId: checkpointKey, durableCommitId: "cp-O",
+    };
+    oAck(await store.releasePin(checkpointPin));
     oAck(await store.commitRowsAndGaps(oRows(ack, "cp-O")));
     return { hist, store, ack };
   } catch (error) { store.close(); throw error; }
@@ -742,4 +752,385 @@ test("R19 a symlink seal member is refused before any remote put", async () => {
   const result = await worker.archiveOnce(HIGH, NEVER);
   const message = result.status === "error" ? result.message : "";
   expect({ status: result.status, refused: /symlink refused/.test(message), puts: remote.puts }).toEqual({ status: "error", refused: true, puts: [] });
+});
+
+// ───────────── V2-17 · readback and reclaim through the capture engine only ─────────────
+
+const V2_PANE: PaneKey = { serverIdentity: "srv-v2-o", paneId: "p-v2", birthGeneration: 1 };
+const V2_SEGMENT = "seg-v2";
+const V2_STORE = "storev2o";
+const V2_WALL = 1_725_916_800_000;
+const V2_ORDER = ["seal", "materialize-export", "locator", "reclaim"];
+
+function v2Row(segmentId: string): CommittedStreamRow {
+  return {
+    id: { pane: V2_PANE, segmentId, rowOrdinal: 0 },
+    origin: { kind: "pipe", range: { epoch: { pane: V2_PANE, attachId: "attach-v2", collectorIncarnation: "collector-v2" }, start: 0, end: 4 }, ordinal: 0 },
+    cells: [{ text: "แถวเดียว", width: 1, style: [] }],
+    geometry: { columns: 100, rows: 40 }, buffer: "normal", wrapStatus: "unwrapped", wrapPad: 0,
+    finalized: true, uncertainFields: [], cellOrigins: [],
+  };
+}
+function v2EventLine(segmentId: string, row: CommittedStreamRow): string {
+  const body = {
+    pane: JSON.stringify(V2_PANE), segment: segmentId, kind: "committed", op: "op-v2",
+    digest: "d".repeat(64), payload: JSON.stringify({ rows: [row], coverage: [] }), receipt: "receipt-v2",
+  };
+  return JSON.stringify({ ...body, checksum: streamDigest("flag-on-event", body) });
+}
+class V2GateRemote implements RemoteStore {
+  readonly location: string;
+  readonly puts: string[] = [];
+  fail: "offline" | null = null;
+  throwGet = 0;
+  constructor(private readonly inner: RcloneRemote) { this.location = inner.location; }
+  version() { return this.inner.version(); }
+  list(prefix: string) { return this.inner.list(prefix); }
+  async put(local: string, key: string) {
+    this.puts.push(key);
+    return this.inner.put(local, key);
+  }
+  async get(key: string, local: string) {
+    if (this.throwGet > 0) { this.throwGet -= 1; throw new Error("injected get crash"); }
+    if (this.fail) return { ok: false as const, kind: this.fail, argv: ["get", key], stdout: "", stderr: "connection refused", exitCode: 1 };
+    return this.inner.get(key, local);
+  }
+}
+class V2Engine {
+  generation = 1;
+  revision = 0;
+  pins: string[] = [];
+  readonly commands: string[] = [];
+  readonly requests: V2WriteRequest[] = [];
+  readonly receipts = new Map<string, V2Receipt>();
+  readonly locators = new Map<string, import("../src/stream-contract").V2RemoteLocator>();
+  readonly incidents: NewarchV2Incident[] = [];
+  throwOn: string | null = null;
+  lostAck = false;
+  failCommand: { readonly kind: string; readonly message: string } | null = null;
+  legacyCalls = 0;
+  private logical: LogicalSealR2 | null = null;
+  private sealed: SealedExport | null = null;
+  private exportOp: string | null = null;
+  readonly frontier: SegmentRowId;
+  constructor(
+    readonly store: string,
+    readonly segmentDir: string,
+    private readonly planted: { readonly sealed: SealedExport; readonly logical: Omit<LogicalSealR2, "sealCommitId">; readonly row: CommittedStreamRow },
+  ) { this.frontier = planted.row.id; }
+
+  async submit(request: V2WriteRequest): Promise<{ status: "ok"; value: V2Receipt } | { status: "stale"; reason: "epoch" } | { status: "error"; code: "integrity" | "io"; message: string }> {
+    this.requests.push(request);
+    this.commands.push(request.command.kind);
+    const previous = this.receipts.get(request.fence.operationId) ?? null;
+    const disposition = v2WriteDisposition(request.fence, this.generation, this.revision, previous);
+    if (disposition === "stale") return { status: "stale", reason: "epoch" };
+    if (disposition === "integrity") return { status: "error", code: "integrity", message: "digest mismatch" };
+    if (disposition === "retry") {
+      if (!previous) return { status: "error", code: "integrity", message: "retry without a receipt" };
+      return { status: "ok", value: previous };
+    }
+    if (this.failCommand?.kind === request.command.kind) return { status: "error", code: "io", message: this.failCommand.message };
+    if (this.throwOn === request.command.kind) { this.throwOn = null; throw new Error(`injected kill ${request.command.kind}`); }
+    if (request.command.kind === "reclaim" && (!this.locators.has(request.command.locatorCommitId) || this.pins.length > 0)) {
+      return { status: "error", code: "integrity", message: "reclaim without locator or with pins" };
+    }
+    const receipt: V2Receipt = {
+      schema: "newarch-v2", kind: "ssot-durable", operationId: request.fence.operationId, pane: request.fence.pane,
+      digest: request.fence.digest, commitId: `c${this.revision + 1}`, generation: this.generation, revision: this.revision + 1,
+      frontier: this.frontier, checkpointId: null,
+    };
+    if (request.command.kind === "seal") {
+      this.logical = { ...this.planted.logical, sealCommitId: receipt.commitId };
+      this.sealed = { ...this.planted.sealed, sealCommitId: receipt.commitId, operationId: request.fence.operationId };
+    } else if (request.command.kind === "materialize-export") this.exportOp = request.fence.operationId;
+    else if (request.command.kind === "locator") this.locators.set(receipt.commitId, request.command.locator);
+    else if (request.command.kind === "incident") this.incidents.push(request.command.incident);
+    else if (request.command.kind === "reclaim") rmSync(this.segmentDir, { recursive: true, force: true });
+    if (this.lostAck && request.command.kind === "locator") {
+      this.receipts.set(receipt.operationId, receipt);
+      this.lostAck = false;
+      throw new Error("lost ack");
+    }
+    this.receipts.set(receipt.operationId, receipt);
+    this.revision += 1;
+    return { status: "ok", value: receipt };
+  }
+  private cursor(request: NewarchV2HistoryRequest) {
+    return {
+      schema: "newarch-v2" as const, pane: request.pane, storeId: this.store, timelineRevision: 0,
+      token: v2Digest("v2-located-cursor", { store: this.store, pane: request.pane, timelineRevision: 0 }),
+    };
+  }
+  async page(request: NewarchV2HistoryRequest): Promise<{ status: "ok"; value: V2HistoryPage }> {
+    const cursor = this.cursor(request);
+    if (existsSync(this.segmentDir)) {
+      return { status: "ok", value: {
+        schema: "newarch-v2", pane: request.pane, revision: 0, entries: [{ kind: "row", row: this.planted.row }],
+        payloadBytes: 1, states: [{ kind: "exact", auditedRevision: null }], before: { kind: "more", cursor }, after: { kind: "end" },
+      } };
+    }
+    return { status: "ok", value: {
+      schema: "newarch-v2", pane: request.pane, revision: this.revision, entries: [], payloadBytes: 0,
+      states: [{ kind: "exact", auditedRevision: null }], before: { kind: "end" }, after: { kind: "end" },
+    } };
+  }
+  ports() {
+    return {
+      submit: (request: V2WriteRequest) => this.submit(request),
+      reader: {
+        sealed: (_pane: PaneKey, id: string) => ({ status: "ok" as const, value: this.logical?.sealCommitId === id ? this.logical : null }),
+        export: (_pane: PaneKey, op: string) => ({ status: "ok" as const, value: this.exportOp === op ? this.sealed : null }),
+        locator: (_pane: PaneKey, id: string) => ({ status: "ok" as const, value: this.locators.get(id) ?? null }),
+        receipt: (_pane: PaneKey, op: string) => ({ status: "ok" as const, value: this.receipts.get(op) ?? null }),
+        page: (request: NewarchV2HistoryRequest) => this.page(request),
+      },
+      pins: () => ({ status: "ok" as const, value: this.pins }),
+      generation: () => ({ status: "ok" as const, value: this.generation }),
+      revision: () => ({ status: "ok" as const, value: this.revision }),
+    };
+  }
+}
+function v2Plant(at: string, segmentId = V2_SEGMENT): { segmentDir: string; sealed: SealedExport; logical: Omit<LogicalSealR2, "sealCommitId">; row: CommittedStreamRow } {
+  const segmentDir = join(at, "segments", segmentId);
+  mkdirSync(segmentDir, { recursive: true });
+  const row = v2Row(segmentId);
+  const rowsPath = join(segmentDir, "rows.jsonl");
+  const manifestPath = join(segmentDir, "export.json");
+  writeFileSync(rowsPath, `${v2EventLine(segmentId, row)}\n`);
+  writeFileSync(manifestPath, "{}\n");
+  const evidence = (path: string) => { const data = readFileSync(path); return { path, bytes: data.byteLength, sha256: sha(data) }; };
+  const coverage: Coverage = [{ kind: "rows", range: { pane: V2_PANE, segmentId, start: 0, end: 1 }, digest: sha("v2-rows") }];
+  return {
+    segmentDir, row, coverage, sealed: {
+      kind: "sealed-export", operationId: "pending", storeUUID: V2_STORE, pane: V2_PANE, segmentId, generation: 1,
+      coverage, files: [evidence(rowsPath)], manifest: evidence(manifestPath), sealCommitId: "pending",
+    }, logical: {
+      revision: 2, sealGeneration: 1, pane: V2_PANE, segmentId, coverage, rawRanges: [], checkpointIds: [],
+      timelineIndexCommitId: "timeline-v2", replayIndexCommitId: "replay-v2",
+    },
+  } as { segmentDir: string; sealed: SealedExport; logical: Omit<LogicalSealR2, "sealCommitId">; row: CommittedStreamRow };
+}
+function v2Open(at: string, engine: V2Engine, remote: RemoteStore) {
+  return new V2ArchiveOffload({
+    root: at, storeUUID: V2_STORE, remote, ports: engine.ports(), wallMs: () => V2_WALL, monoMs: () => 40, clockEpoch: "v2-test",
+  });
+}
+function v2Remote(at: string): { remoteDir: string; remote: V2GateRemote } {
+  const remoteDir = join(at, "remote");
+  mkdirSync(remoteDir, { recursive: true });
+  return { remoteDir, remote: new V2GateRemote(new RcloneRemote({ location: `:local:${remoteDir}`, cacheDir: join(at, "rclone-cache") })) };
+}
+function v2Case(name: string): string {
+  const at = join(root, name);
+  mkdirSync(at, { recursive: true });
+  return at;
+}
+function v2Request(cursor: NewarchV2HistoryRequest["cursor"] = null): NewarchV2HistoryRequest {
+  return { schema: "newarch-v2", pane: V2_PANE, cursor, direction: "after", maxEntries: 10, maxBytes: 100_000 };
+}
+function v2CursorOf(page: V2HistoryPage) {
+  const at = page.before.kind === "end" ? page.after : page.before;
+  if (at.kind === "end") throw new Error("page has no cursor");
+  return { token: at.cursor.token, storeId: at.cursor.storeId, timelineRevision: at.cursor.timelineRevision };
+}
+function v2RowId(page: V2HistoryPage): string {
+  const entry = page.entries[0];
+  if (!entry || entry.kind !== "row") throw new Error(`expected one row, got ${page.entries.length}`);
+  return streamCanonical(entry.row.id);
+}
+async function v2Page(offload: V2ArchiveOffload, allowed: string, cursor: NewarchV2HistoryRequest["cursor"] = null) {
+  const result = await offload.readPage(v2Request(cursor), allowed);
+  if (result.status !== "ok") throw new Error(JSON.stringify(result));
+  return result.value;
+}
+function v2Files(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) out.push(...v2Files(path));
+    else out.push(path);
+  }
+  return out;
+}
+
+test("V2-17 remote readback reclaims only after a public proof and keeps one row across local, remote and cache", async () => {
+  const at = v2Case("happy");
+  const planted = v2Plant(at);
+  const engine = new V2Engine(V2_STORE, planted.segmentDir, planted);
+  const { remoteDir, remote } = v2Remote(at);
+  const offload = v2Open(at, engine, remote);
+  const readRoot = join(at, "read");
+  mkdirSync(readRoot);
+  const advanced = await offload.advance(V2_PANE, V2_SEGMENT, NEVER);
+  if (advanced.status !== "ok") throw new Error(JSON.stringify(advanced));
+  const seal = engine.requests.find((request) => request.command.kind === "seal");
+  if (!seal) throw new Error("no seal");
+  const { digest, ...fence } = seal.fence;
+  expect(digest).toBe(v2WriteDigest({ fence, command: seal.command }));
+  expect(engine.commands).toEqual(V2_ORDER);
+  expect(engine.legacyCalls).toBe(0);
+  expect(existsSync(planted.segmentDir)).toBe(false);
+  expect(readdirSync(join(at, "v2-archive", "staging"))).toEqual([]);
+  expect(advanced.value).toMatchObject({ phase: "reclaimed", reclaimSubmitted: true, localIntact: false });
+  const local = await v2Page(offload, readRoot);
+  const remotePage = await v2Page(offload, readRoot);
+  for (const file of v2Files(remoteDir)) writeFileSync(file, "not-the-bundle");
+  const cached = await v2Page(offload, readRoot);
+  expect(new Set([v2RowId(local), v2RowId(remotePage), v2RowId(cached)]).size).toBe(1);
+  expect(v2CursorOf(local)).toEqual(v2CursorOf(remotePage));
+  expect(v2CursorOf(remotePage)).toEqual(v2CursorOf(cached));
+  const again = await offload.advance(V2_PANE, V2_SEGMENT, NEVER);
+  expect(again.status === "ok" && engine.commands).toEqual(V2_ORDER);
+  const fresh = join(at, "fresh-corrupt");
+  mkdirSync(fresh);
+  const held = v2CursorOf(local);
+  const blocked = await v2Page(offload, fresh, { schema: "newarch-v2", pane: V2_PANE, storeId: held.storeId, timelineRevision: held.timelineRevision, token: held.token });
+  expect(blocked.entries).toEqual([]);
+  expect(blocked.after.kind).toBe("blocked");
+  if (blocked.after.kind === "blocked") expect(blocked.after.state).toMatchObject({ kind: "remote-unavailable", reason: "corrupt", retryAfterMs: 30_000 });
+  expect(v2CursorOf(blocked)).toEqual(v2CursorOf(local));
+});
+
+test("V2-17 pins block reclaim until they are released, and missing or offline remotes stay blocked", async () => {
+  const at = v2Case("pins");
+  const planted = v2Plant(at);
+  const engine = new V2Engine(V2_STORE, planted.segmentDir, planted);
+  engine.pins = ["pin-reader"];
+  const { remoteDir, remote } = v2Remote(at);
+  const offload = v2Open(at, engine, remote);
+  const held = await offload.advance(V2_PANE, V2_SEGMENT, NEVER);
+  expect(held).toEqual({ status: "busy", retryAfterMs: 1000, reason: "queue" });
+  expect(engine.commands).toEqual(["seal", "materialize-export", "locator"]);
+  expect(existsSync(planted.segmentDir)).toBe(true);
+  const readRoot = join(at, "read");
+  mkdirSync(readRoot);
+  const whilePinned = await v2Page(offload, readRoot);
+  expect(v2RowId(whilePinned)).toBe(streamCanonical(planted.row.id));
+  const pinnedCursor = v2CursorOf(whilePinned);
+  engine.pins = [];
+  const released = await offload.advance(V2_PANE, V2_SEGMENT, NEVER);
+  expect(released.status === "ok" && existsSync(planted.segmentDir)).toBe(false);
+  expect(engine.commands).toEqual(V2_ORDER);
+  const seen = await v2Page(offload, readRoot);
+  expect(v2RowId(seen)).toBe(v2RowId(whilePinned));
+  expect(v2CursorOf(seen)).toEqual(pinnedCursor);
+  const cursor = { schema: "newarch-v2" as const, pane: V2_PANE, storeId: V2_STORE, timelineRevision: pinnedCursor.timelineRevision, token: pinnedCursor.token };
+  remote.fail = "offline";
+  const offlineRoot = join(at, "fresh-offline");
+  mkdirSync(offlineRoot);
+  const offline = await v2Page(offload, offlineRoot, cursor);
+  expect(offline.entries).toEqual([]);
+  expect(offline.after.kind).toBe("blocked");
+  if (offline.after.kind === "blocked") expect(offline.after.state).toMatchObject({ reason: "offline" });
+  expect(v2CursorOf(offline)).toEqual(v2CursorOf(seen));
+  remote.fail = null;
+  for (const file of v2Files(remoteDir)) unlinkSync(file);
+  const missingRoot = join(at, "fresh-missing");
+  mkdirSync(missingRoot);
+  const missing = await v2Page(offload, missingRoot, cursor);
+  expect(missing.after.kind).toBe("blocked");
+  if (missing.after.kind === "blocked") expect(missing.after.state).toMatchObject({ reason: "missing" });
+  expect(missing.entries).toEqual([]);
+  expect(v2CursorOf(missing)).toEqual(v2CursorOf(seen));
+});
+
+test("V2-17 a killed readback or locator submit keeps the local segment and the same journal resumes", async () => {
+  const getAt = v2Case("kill-get");
+  const killedGet = v2Plant(getAt);
+  const getEngine = new V2Engine(V2_STORE, killedGet.segmentDir, killedGet);
+  const getRemote = v2Remote(getAt).remote;
+  getRemote.throwGet = 1;
+  const first = v2Open(getAt, getEngine, getRemote);
+  await expect(first.advance(V2_PANE, V2_SEGMENT, NEVER)).rejects.toThrow(/injected get crash/);
+  expect(getEngine.commands).toEqual(["seal", "materialize-export"]);
+  expect(getEngine.locators.size).toBe(0);
+  expect(existsSync(killedGet.segmentDir)).toBe(true);
+  const resumedGet = await v2Open(getAt, getEngine, getRemote).advance(V2_PANE, V2_SEGMENT, NEVER);
+  expect(resumedGet.status === "ok" && getEngine.commands).toEqual(V2_ORDER);
+
+  const putAt = v2Case("kill-locator");
+  const killedPut = v2Plant(putAt, "seg-v2b");
+  const putEngine = new V2Engine(V2_STORE, killedPut.segmentDir, killedPut);
+  putEngine.throwOn = "locator";
+  const putRemote = v2Remote(putAt).remote;
+  const putOffload = v2Open(putAt, putEngine, putRemote);
+  await expect(putOffload.advance(V2_PANE, "seg-v2b", NEVER)).rejects.toThrow(/injected kill locator/);
+  expect(putEngine.locators.size).toBe(0);
+  expect(existsSync(killedPut.segmentDir)).toBe(true);
+  const resumedPut = await v2Open(putAt, putEngine, putRemote).advance(V2_PANE, "seg-v2b", NEVER);
+  expect(resumedPut.status === "ok" && existsSync(killedPut.segmentDir)).toBe(false);
+  expect(putEngine.commands.filter((kind) => kind === "locator")).toEqual(["locator", "locator"]);
+  expect(putEngine.commands.filter((kind) => kind === "reclaim")).toEqual(["reclaim"]);
+});
+
+test("V2-17 a lost locator acknowledgement retries the same commit id", async () => {
+  const at = v2Case("lost-ack");
+  const planted = v2Plant(at);
+  const engine = new V2Engine(V2_STORE, planted.segmentDir, planted);
+  engine.lostAck = true;
+  const remote = v2Remote(at).remote;
+  await expect(v2Open(at, engine, remote).advance(V2_PANE, V2_SEGMENT, NEVER)).rejects.toThrow(/lost ack/);
+  expect(engine.revision).toBe(2);
+  const locator = [...engine.receipts.values()].find((receipt) => engine.requests.some((request) => request.command.kind === "locator" && request.fence.operationId === receipt.operationId));
+  if (!locator) throw new Error("locator receipt was not stored");
+  const revisionAfterLoss = engine.revision;
+  const resumed = await v2Open(at, engine, remote).advance(V2_PANE, V2_SEGMENT, NEVER);
+  expect(resumed.status === "ok" && resumed.value.locatorCommitId).toBe(locator.commitId);
+  expect(engine.revision).toBe(revisionAfterLoss + 1);
+  expect(engine.commands.filter((kind) => kind === "reclaim")).toEqual(["reclaim"]);
+});
+
+test("V2-17 the restore CLI refuses reclaim, lease and toLegacy without deleting a planted segment", () => {
+  const planted = v2Plant(v2Case("cli"));
+  const before = sha(readFileSync(join(planted.segmentDir, "rows.jsonl")));
+  for (const command of ["reclaim", "lease", "toLegacy"]) {
+    const ran = Bun.spawnSync([process.execPath, CLI, command, "--root", root], { stdout: "pipe", stderr: "pipe" });
+    const stdout = ran.stdout.toString();
+    expect({ command, exit: ran.exitCode, stderr: ran.stderr.toString(), ok: stdout.includes('"ok": false') }).toEqual({
+      command, exit: 2, stderr: expect.stringContaining("capture engine"), ok: true,
+    });
+  }
+  expect(sha(readFileSync(join(planted.segmentDir, "rows.jsonl")))).toBe(before);
+  expect(existsSync(planted.segmentDir)).toBe(true);
+});
+
+test("V2-17 the fence retries one digest, and a refused key cannot construct a second writer", async () => {
+  const at = v2Case("fence");
+  const planted = v2Plant(at);
+  const engine = new V2Engine(V2_STORE, planted.segmentDir, planted);
+  const command = { kind: "seal" as const, segmentId: V2_SEGMENT };
+  const fence = { operationId: "op-fence", pane: V2_PANE, expectedGeneration: 1, expectedRevision: 0 };
+  const request: V2WriteRequest = { fence: { ...fence, digest: v2WriteDigest({ fence, command }) }, command };
+  const first = await engine.submit(request);
+  const second = await engine.submit(request);
+  if (first.status !== "ok" || second.status !== "ok") throw new Error(JSON.stringify([first, second]));
+  expect(second.value.commitId).toBe(first.value.commitId);
+  expect(engine.revision).toBe(1);
+  const changed = await engine.submit({ ...request, fence: { ...request.fence, digest: "ab".repeat(32) } });
+  expect(changed.status).toBe("error");
+  expect(engine.revision).toBe(1);
+  const staleRevision = await engine.submit({
+    fence: { operationId: "op-other", pane: V2_PANE, expectedGeneration: 1, expectedRevision: 9, digest: "cd".repeat(32) },
+    command,
+  });
+  expect(staleRevision.status).toBe("stale");
+  const staleGeneration = await engine.submit({
+    fence: { operationId: "op-gen", pane: V2_PANE, expectedGeneration: 9, expectedRevision: 1, digest: "ef".repeat(32) },
+    command,
+  });
+  expect(staleGeneration.status).toBe("stale");
+  const early = await engine.submit({
+    fence: { operationId: "op-early", pane: V2_PANE, expectedGeneration: 1, expectedRevision: 1, digest: "12".repeat(32) },
+    command: { kind: "reclaim", locatorCommitId: "before-readback", segmentId: V2_SEGMENT },
+  });
+  expect(early.status === "error" && early.message).toBe("reclaim without locator or with pins");
+  expect(existsSync(planted.segmentDir)).toBe(true);
+  const remote = { location: "mem", version: async () => { throw new Error("unused"); }, put: async () => { throw new Error("unused"); }, get: async () => { throw new Error("unused"); }, list: async () => { throw new Error("unused"); } };
+  const base = { root: at, storeUUID: V2_STORE, remote, ports: engine.ports() };
+  for (const key of ["history", "catalog", "capability", "writer", "reclaimVerified", "commitRemoteIndex"]) {
+    expect(() => new V2ArchiveOffload({ ...base, [key]: {} })).toThrow(new RegExp(`refuses ${key}`));
+  }
+  expect(v2WriteDisposition(request.fence, 1, 0, first.value)).toBe("retry");
 });
