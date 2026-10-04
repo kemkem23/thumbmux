@@ -1366,15 +1366,16 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
   const pane = { serverIdentity: 'private-server', paneId: '%1', birthGeneration: 1 };
   const session = { serverIdentity: pane.serverIdentity, sessionId: 'stable-1' };
   const geometry = H2.v2BirthGeometry(H2.NEWARCH_V2_DEFAULT_CONFIG);
+  const size = { columns: geometry.columns, rows: geometry.rows }, configVersion = geometry.configVersion;
   const epoch = { pane, attachId: 'birth-1', collectorIncarnation: 'collector-1' };
   const descriptor: NewarchV2PaneDescriptor = { schema: 'newarch-v2', session, pane, windowId: '@1', owner: 'capture-engine', birthOperationId: 'birth-1', geometry, state: 'active' };
   const cursor = { x: 0, y: 0, visible: true };
   const buffer = { rows: [], cursor, savedCursor: cursor, savedAttributes: [], savedModes: {}, wrapPending: false };
-  const state: H2.VtState = { codecVersion: 'test-v2', geometry: { columns: 100, rows: 40 }, normal: buffer, alternate: buffer,
-    active: 'normal', modes: {}, margins: { top: 0, bottom: 40, left: 0, right: 100 }, tabStops: [], pendingUtf8: [224], pendingEscape: [27, 91], attributes: [], wrapPending: false, extensionState: '{}' };
+  const state: H2.VtState = { codecVersion: 'test-v2', geometry: { ...size }, normal: buffer, alternate: buffer,
+    active: 'normal', modes: {}, margins: { top: 0, bottom: size.rows, left: 0, right: size.columns }, tabStops: [], pendingUtf8: [224], pendingEscape: [27, 91], attributes: [], wrapPending: false, extensionState: '{}' };
   const cp = (revision: number, offset = 0, frontier: H2.SegmentRowId | null = null): H2.V2LiveCheckpoint => ({ schema: 'newarch-v2', checkpointId: 'cp-' + revision, pane, geometry,
     through: { epoch, byteOffset: offset }, replayFloor: { epoch, byteOffset: Math.max(0, offset - 1) }, revision, frontier,
-    rule: { ruleId: 'ordered-scroll', version: '1', configVersion: 'q22-default-1' }, state, stateDigest: H2.v2Digest('vt-state', state), pending: { rows: [], bytes: 0, deadlineMonoMs: null } });
+    rule: { ruleId: 'ordered-scroll', version: '1', configVersion: configVersion }, state, stateDigest: H2.v2Digest('vt-state', state), pending: { rows: [], bytes: 0, deadlineMonoMs: null } });
   const request = (command: H2.V2WriteCommand, operationId: string, revision?: number): H2.V2WriteRequest => {
     const fence = { pane, operationId, expectedGeneration: port.capability.generation,
       expectedRevision: revision ?? h2value(port.reader.owner(pane))?.durableRevision ?? 0 };
@@ -1386,15 +1387,15 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
   const ready: H2.V2BirthReady = { intent, pane: descriptor,
     binding: { kind: 'collector-binding', epoch, attachId: epoch.attachId, rootUUID: 'root-1', bootNonce: 'boot', ownerGeneration: 1,
       process: { pid: 123, startTime: '1234', bootId: 'private-boot' }, peerUid: 1000, fifoId: 'fifo-1', handshakeId: 'h1', artifactSha256: 'a'.repeat(64) },
-    byte0: { epoch, byteOffset: 0 }, journal: { path: '/synthetic/birth', bytes: 12, sha256: 'a'.repeat(64) }, geometryReadback: { columns: 100, rows: 40 }, paneCountInWindow: 1, programHeld: true };
+    byte0: { epoch, byteOffset: 0 }, journal: { path: '/synthetic/birth', bytes: 12, sha256: 'a'.repeat(64) }, geometryReadback: { ...size }, paneCountInWindow: 1, programHeld: true };
   const activate = async () => { await reserve(); return commit({ kind: 'activate', ready, checkpoint: cp(1) }, 'activate-1'); };
   const incident = (id: string, revision: number, frontier: H2.SegmentRowId | null = null): NewarchV2Incident => ({ schema: 'newarch-v2', incidentId: id, pane, reason: 'storage-outage', frontier,
     affected: { after: null, through: frontier }, openedAtWallMs: 100, openedAtMonoMs: 10, clockEpoch: 'test-clock', collecting: false,
-    missing: { countKind: 'unknown', missingCount: null }, ruleVersion: '1', configVersion: 'q22-default-1', geometry, revision,
+    missing: { countKind: 'unknown', missingCount: null }, ruleVersion: '1', configVersion: configVersion, geometry, revision,
     sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null, action: 'gap-and-stop', evidence: null });
   const row = (n: number, text = 'ซ้ำ'): H2.CommittedStreamRow => ({ id: { pane, segmentId: 'segment-1', rowOrdinal: n },
     origin: { kind: 'pipe', range: { epoch, start: n, end: n + 1 }, ordinal: n }, cells: [{ text, width: 1, style: [] }],
-    geometry: { columns: 100, rows: 40 }, buffer: 'normal', wrapStatus: 'unwrapped', wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [] });
+    geometry: { ...size }, buffer: 'normal', wrapStatus: 'unwrapped', wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [] });
   const batch = (rows: readonly H2.CommittedStreamRow[], revision = 2): H2.V2WriteCommand => {
     const checkpoint = cp(revision, rows.length, rows.at(-1)?.id ?? null);
     return { kind: 'batch', batch: { rows, decisions: [], incidents: [], checkpoint,
