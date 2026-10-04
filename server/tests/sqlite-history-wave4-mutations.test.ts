@@ -284,3 +284,49 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
     expect((await run('flag-on H|H-r2')).exit).toBe(0);
   }finally{rmSync(root,{recursive:true,force:true});}
 },120000);
+
+
+// Q22 new API: real behavioral red on broken implementations, followed by a
+// restored full-file run. Mutants live only in a private copy INSIDE the cage.
+test('H v2 mutations reject forged writers, lost incidents, stale audits and non-atomic checkpoints', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'h-v2-mutants-'));
+  const mutations = [
+    { name: 'v2-unbounded-export-scratch', from: '    this.cleanupUncommittedExports();', to: '    /* mutant leaves unpublished exports behind */' },
+    { name: 'v2-second-process-writer', from: 'PRAGMA locking_mode=EXCLUSIVE;', to: 'PRAGMA locking_mode=NORMAL;' },
+    { name: 'v2-reclaim-with-pin', from: "fhAssert(pin?.segmentId !== segment || pin.released, 'v2 segment pinned');", to: '/* mutant ignores persistent pins */' },
+    { name: 'v2-locator-without-readback', from: "&& this.hooks.remoteReadback?.(locator, exported) === true, 'v2 public reader proof required'", to: "&& true, 'v2 public reader proof required'" },
+    { name: 'v2-forged-capability', from: "fhAssert(c === this.#cap, 'v2 forged capability');", to: '/* mutant accepts copied capability */' },
+    { name: 'v2-incident-needs-ack', from: 'validateV2Incident(incident);', to: "validateV2Incident(incident); fhAssert(next.frontier !== null, 'mutant requires first ACK');" },
+    { name: 'v2-forget-checkpoint', from: "this.put('checkpoint', key, 'live', cp);", to: '/* mutant acknowledges without checkpoint */' },
+    { name: 'v2-ignore-current-generation', from: 'v2WriteDisposition(r.fence, cap.generation, owner?.durableRevision ?? 0, previous)', to: 'v2WriteDisposition({ ...r.fence, expectedGeneration: cap.generation }, cap.generation, owner?.durableRevision ?? 0, previous)' },
+    { name: 'v2-accept-stale-audit', from: "}, this.#config.audit), 'v2 stale/unordered audit');", to: "}, this.#config.audit) || true, 'v2 stale/unordered audit');" },
+    { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);", to: '/* mutant loses rows behind durable receipt */' },
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (name: string, failed: boolean) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      if (failed) { expect(exit).not.toBe(0); expect(output).toMatch(/\(fail\) H v2/); }
+      else expect(exit, output).toBe(0);
+    };
+    await run('clean-before', false);
+    for (const mutant of mutations) {
+      expect(original.split(mutant.from).length).toBe(2);
+      try { writeFileSync(file, original.replace(mutant.from, mutant.to)); await run(mutant.name, true); }
+      finally { writeFileSync(file, original); }
+    }
+    await run('clean-after', false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 300000);
