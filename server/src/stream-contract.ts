@@ -1374,7 +1374,9 @@ export interface V2AuditWatermark {
  * captures without independent same-source evidence are inconclusive. */
 export interface V2AuditEvidence {
   readonly before: V2AuditWatermark; readonly after: V2AuditWatermark;
-  readonly snapshot: V2AuditWatermark; readonly ordered: boolean;
+  readonly snapshot: V2AuditWatermark;
+  readonly ordering: { readonly kind: 'certified-source-fence'; readonly certificateId: string; readonly proof: EvidenceFile }
+    | { readonly kind: 'unproven' };
   readonly expectedDigest: Digest; readonly actualDigest: Digest;
   readonly captureBytes: number; readonly elapsedMs: number;
 }
@@ -1388,7 +1390,11 @@ export type V2AuditResult =
 /** Pure admission predicate; C performs actual normalization/evaluation. Even a
  * true result must be rechecked in H under expectedRevision before repair. */
 export function v2AuditComparable(e: V2AuditEvidence, current: V2AuditWatermark, c: V2AuditConfig): boolean {
-  if (!c.enabled || !e.ordered || !Number.isSafeInteger(e.captureBytes) || e.captureBytes < 0
+  if (!c.enabled || e.ordering.kind !== 'certified-source-fence'
+    || !e.ordering.certificateId || !e.ordering.proof.path
+    || !/^[a-f0-9]{64}$/.test(e.ordering.proof.sha256)
+    || !Number.isSafeInteger(e.ordering.proof.bytes) || e.ordering.proof.bytes < 1
+    || e.ordering.proof.bytes > NEWARCH_V2_LIMITS.diagnosticEventBytes || !Number.isSafeInteger(e.captureBytes) || e.captureBytes < 0
     || e.captureBytes > c.maxCaptureBytes || !Number.isFinite(e.elapsedMs) || e.elapsedMs < 0
     || e.elapsedMs > c.timeoutMs) return false;
   return sameContract(e.before, e.after) && sameContract(e.after, e.snapshot) && sameContract(e.snapshot, current);
@@ -1417,15 +1423,20 @@ export type V2WriteCommand =
   | { readonly kind: 'stop'; readonly incident: NewarchV2Incident }
   | { readonly kind: 'close' }
   | { readonly kind: 'seal'; readonly segmentId: string }
+  | { readonly kind: 'materialize-export'; readonly sealCommitId: string }
+  | { readonly kind: 'unrecorded-birth'; readonly pane: NewarchV2PaneDescriptor; readonly incident: NewarchV2Incident }
   | { readonly kind: 'locator'; readonly locator: V2RemoteLocator }
   | { readonly kind: 'reclaim'; readonly locatorCommitId: string; readonly segmentId: string }
   | { readonly kind: 'pin'; readonly pinId: string; readonly segmentId: string }
   | { readonly kind: 'release-pin'; readonly pinId: string };
 export interface V2WriteRequest { readonly fence: V2WriteFence; readonly command: V2WriteCommand }
-/** Digest covers entire fence except digest plus command. Capability never
- * enters hashes or serialization. Stage rows are never visible to readers. */
+/** Digest covers semantic payload: pane + operationId + command. Outer
+ * generation/revision are concurrency preconditions, excluded so a restarted
+ * engine can retry with its current generation and get the original receipt.
+ * Audit expectedRevision INSIDE its command remains hashed. Capability never
+ * enters hashes/serialization. Stage rows never become visible by staging. */
 export function v2WriteDigest(request: { readonly fence: Omit<V2WriteFence, 'digest'>; readonly command: V2WriteCommand }): Digest {
-  return v2Digest('write', request);
+  return v2Digest('write', { pane: request.fence.pane, operationId: request.fence.operationId, command: request.command });
 }
 export interface V2HistoryWriter {
   commit(capability: V2WriterCapability, request: V2WriteRequest): Promise<Result<V2Receipt>>;
@@ -1534,7 +1545,9 @@ export function validateV2Incident(i: NewarchV2Incident): void {
   if (i.schema !== NEWARCH_V2_VERSION) throw Error('v2 incident schema');
   v2Text(i.incidentId); v2PaneKey(i.pane); v2Text(i.clockEpoch);
   for (const n of [i.openedAtWallMs, i.openedAtMonoMs, i.revision]) v2Int(n);
+  if ((i.sourceOffset === null) !== (i.sourceEpoch === null)) throw Error('v2 incident source');
   if (i.sourceOffset !== null) v2Int(i.sourceOffset);
+  if (i.sourceEpoch) { v2Text(i.sourceEpoch.attachId); v2Text(i.sourceEpoch.collectorIncarnation); }
   for (const row of [i.frontier, i.affected.after, i.affected.through]) {
     if (row) { v2Text(row.segmentId); v2Int(row.rowOrdinal); if (v2PaneKey(row.pane) !== v2PaneKey(i.pane)) throw Error('v2 incident pane'); }
   }
@@ -1633,3 +1646,45 @@ export interface V2HistoryReader {
     readonly panes: readonly NewarchV2PaneDescriptor[]; readonly next: string | null;
   }>;
 }
+
+export interface V2SessionOwnerRecord {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly session: NewarchV2SessionKey;
+  readonly owner: 'capture-engine'; readonly birthOperationId: string;
+  readonly state: 'reserved' | 'active' | 'closed'; readonly generation: number;
+}
+export interface V2HistoryReader {
+  /** null means authoritative absence, error means UNKNOWN, never legacy. */
+  sessionOwner(session: NewarchV2SessionKey): Result<V2SessionOwnerRecord | null>;
+  sealed(pane: PaneKey, sealCommitId: string): Result<LogicalSealR2 | null>;
+  export(pane: PaneKey, operationId: string): Result<SealedExport | null>;
+  locator(pane: PaneKey, locatorCommitId: string): Result<V2RemoteLocator | null>;
+}
+export interface V2SourceTransport {
+  rearmReserve(request: { readonly incidentId: string; readonly resolved: V2Receipt }):
+    Promise<Result<{ readonly physicalFreeBytes: number; readonly reserveAllocatedBytes: number }>>;
+}
+/** H root generation increments only on exclusive engine open. Each successful
+ * NEW pane transaction advances its revision once; retry preserves receipt.
+ * Reservation/cancel use v2Digest('birth-reservation'|'birth-cancel', request
+ * without digest/expectedGeneration). Incident ID uses this stable function BEFORE any write;
+ * persist operationId with the cause/barrier, reuse after ACK loss/restart.
+ * Wall/mono clocks and diagnostics never influence incident identity. */
+export function v2IncidentId(pane: PaneKey, operationId: string): string {
+  v2PaneKey(pane); v2Text(operationId);
+  return v2Digest('incident-id', { pane, operationId });
+}
+/** Reader paging: entries stay in ascending timeline order in either direction.
+ * payloadBytes is canonical UTF-8 entries size; both entry/byte limits apply.
+ * Before/after null cursor starts at tail/head respectively. Oversized single
+ * entry returns an explicit bounded-read error, never an empty success page.
+ * H authenticates opaque cursor against store + pane + retained timeline, and
+ * rejects future revisions. Segment movement alone never expires a cursor.
+ * Revision is a grant fence; new entries do not retroactively enter that page.
+ * For raw-created panes, unrecorded-birth inserts owner+incident atomically,
+ * state=unrecorded and no collector binding. It NEVER enables later adoption.
+ * The reservation tombstone excludes legacy even when creation was cancelled.
+ *
+ * Audit certificates reference bounded, redacted source ordering evidence;
+ * I/C must validate that evidence, not merely accept this structural guard.
+ * A quiet-looking pair of captures or pipe drain is not a source certificate.
+ */

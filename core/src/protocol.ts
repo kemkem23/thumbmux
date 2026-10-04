@@ -748,7 +748,7 @@ export interface NewarchV2Incident {
   readonly collecting: boolean; readonly missing: NewarchMissingCount;
   readonly ruleVersion: string; readonly configVersion: string;
   readonly geometry: NewarchV2FixedGeometry; readonly revision: number;
-  readonly sourceOffset: number | null; readonly expectedDigest: string | null; readonly actualDigest: string | null;
+  readonly sourceEpoch: NewarchV2SourceEpoch | null; readonly sourceOffset: number | null; readonly expectedDigest: string | null; readonly actualDigest: string | null;
   readonly action: 'gap-and-stop' | 'annotate' | 'repair-pending';
   readonly evidence: { readonly digest: string; readonly bytes: number; readonly redacted: true } | null;
 }
@@ -774,7 +774,7 @@ export type NewarchV2Continuation =
  * text outside copy/search content, including incidents when no live pane. */
 export interface NewarchV2FrameMeta {
   readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchV2PaneDescriptor;
-  readonly revision: number; readonly durableRevision: number; readonly sourceEpoch: string;
+  readonly revision: number; readonly durableRevision: number; readonly sourceEpoch: NewarchV2SourceEpoch;
   readonly state: NewarchV2ReadState;
 }
 export interface NewarchV2HistoryRequest {
@@ -792,3 +792,6 @@ export interface NewarchV2GeometryReply {
  * revision. Identity/geometry changes require a full reset. */
 export type NewarchV2OutputFrame = (Omit<MuxFullOutputFrame, 'newarch'> | Omit<MuxDeltaFrame, 'newarch'>)
   & { readonly newarchV2: NewarchV2FrameMeta };
+
+/** Immutable collector incarnation + attachment, never host receive order. */
+export interface NewarchV2SourceEpoch { readonly attachId: string; readonly collectorIncarnation: string }
