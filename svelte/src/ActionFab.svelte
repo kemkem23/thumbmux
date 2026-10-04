@@ -59,6 +59,9 @@
   /** Whether the open list still has rows hidden past its top / bottom edge.
    * A list that scrolls with nothing saying so is how 4–7 of 15 actions went
    * unseen on 1024×600 and phone screens — the edge fades instead. */
+  // Measured again when the open animation ends: slots fly in with a
+  // translateY, which counts as overflow while it runs and would otherwise
+  // leave a fade on a list that fits.
   let moreAbove = $state(false);
   let moreBelow = $state(false);
 
@@ -155,6 +158,7 @@
   class:more-below={moreBelow}
   aria-hidden={!open}
   onscroll={measureOverflow}
+  ontransitionend={measureOverflow}
   data-testid="fab-slots"
 >
   {#each actions as a (a.id)}
@@ -354,10 +358,13 @@
       display: grid;
       grid-template-columns: repeat(2, minmax(0, max-content));
       justify-content: end;
-      justify-items: end;
+      justify-items: stretch;
       align-content: end;
       gap: 8px;
     }
+    /* Each column as wide as its widest label, so the menu reads as two
+       tidy columns rather than a ragged scatter. */
+    .slot { flex: 1 1 auto; }
     /* A row with a flyout grows sideways when expanded; spanning both
        columns keeps that growth from re-flowing every other button. */
     .slot-row.has-choices { grid-column: 1 / -1; }
