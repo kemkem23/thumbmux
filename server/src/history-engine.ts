@@ -861,6 +861,10 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
         db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
         db.transaction(() => {
           db!.exec(FLAGON_HISTORY_SCHEMA);
+          if (options[V2_STORE]) {
+            db!.exec(V2_SCHEMA);
+            db!.query('INSERT INTO fh_v2_meta VALUES(1,0,?,?)').run(randomUUID(), 'newarch-v2');
+          }
           db!.query('INSERT INTO fh_meta VALUES(1,?)').run(randomUUID());
         }).immediate();
       }
@@ -1890,7 +1894,7 @@ class V2Storage {
       const old = this.get<V2SessionReservationReceipt>('reservation', session, intent.operationId);
       if (old) { fhAssert(old.digest === digest, 'v2 reservation collision'); return old; }
       const account = this.get<V2SessionOwnerRecord>('session', '', session);
-      fhAssert(!account || intent.command === 'new-window' && account.state !== 'closed', 'v2 session already reserved');
+      fhAssert(intent.command === 'new-session' ? !account : account && account.state !== 'closed', 'v2 session already reserved or missing');
       const receipt: V2SessionReservationReceipt = { schema: 'newarch-v2', session: intent.session, operationId: intent.operationId,
         commitId: randomUUID(), digest, generation: cap.generation, owner: 'capture-engine' };
       if (!account) this.put('session', '', session, { schema: 'newarch-v2', session: intent.session, owner: 'capture-engine',
@@ -1972,6 +1976,12 @@ class V2Storage {
         validateV2Incident(incident);
         fhAssert(equal(incident.pane, r.fence.pane) && equal(incident.geometry, owner!.pane.geometry)
           && incident.revision === revision && equal(incident.frontier, next.frontier), 'v2 incident fence');
+        const positions = [incident.affected.after, incident.affected.through].map(id => {
+          if (!id) return null;
+          const row = this.#db.query("SELECT n FROM fh_v2_timeline WHERE pane=? AND kind='row' AND id=?").get(key, streamCanonical(id)) as SqlRow | null;
+          fhAssert(row, 'v2 incident affected row absent'); return Number(row.n);
+        });
+        fhAssert(positions[0] === null || positions[1] === null || positions[0]! <= positions[1]!, 'v2 incident reversed interval');
         const old = this.get<NewarchV2Incident>('incident', key, incident.incidentId);
         if (old) fhAssert(equal(old, incident), 'v2 incident collision');
         else { this.put('incident', key, incident.incidentId, incident); this.append(key, revision, 'incident', incident.incidentId, '', incident); }
@@ -1990,7 +2000,8 @@ class V2Storage {
       };
       switch (command.kind) {
         case 'activate':
-          fhAssert(command.checkpoint.through.byteOffset === 0 && command.checkpoint.frontier === null, 'v2 activation checkpoint');
+          fhAssert(equal(command.checkpoint.through, command.ready.byte0) && equal(command.checkpoint.replayFloor, command.ready.byte0)
+            && command.checkpoint.frontier === null, 'v2 activation checkpoint');
           setCheckpoint(command.checkpoint); break;
         case 'unrecorded-birth': addIncident(command.incident); break;
         case 'incident': addIncident(command.incident); break;
@@ -2009,10 +2020,13 @@ class V2Storage {
             content({ ...row, softWrap: row.wrapStatus === 'wrapped' }); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
             nonempty(row.id.segmentId); safe(row.id.rowOrdinal);
             fhAssert(!this.get('segment-seal', key, row.id.segmentId), 'v2 sealed segment');
-            const prior = this.#db.query("SELECT id FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n DESC LIMIT 1").get(key, row.id.segmentId) as SqlRow | null;
-            const ordinal = prior ? (JSON.parse(String(prior.id)) as SegmentRowId).rowOrdinal + 1 : 0;
-            fhAssert(row.id.rowOrdinal === ordinal, 'v2 row order');
+            const metrics = this.get<{ bytes: number; rows: number }>('segment-stats', key, row.id.segmentId)
+              ?? this.#db.query("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))+1),0) AS bytes,COUNT(*) AS rows FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row'").get(key, row.id.segmentId) as { bytes: number; rows: number };
+            const rowBytes = metrics.bytes + bytes(row) + 1;
+            fhAssert(rowBytes <= FB.archiveChunkBytes / 2 && metrics.rows < 65536, 'v2 segment full; seal and rotate');
+            fhAssert(row.id.rowOrdinal === metrics.rows, 'v2 row order');
             this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);
+            this.put('segment-stats', key, row.id.segmentId, { bytes: rowBytes, rows: metrics.rows + 1 });
             next = { ...next, frontier: row.id };
           }
           for (const incident of b.incidents) addIncident(incident);
@@ -2096,7 +2110,7 @@ class V2Storage {
       token: this.token({ kind: 'page', pane: v2PaneKey(pane), store: this.storeId, revision, n }) };
   }
   private page(r: NewarchV2HistoryRequest): V2HistoryPage {
-    validateV2ReadRequest(r); const owner = this.owner(r.pane); fhAssert(owner, 'v2 pane missing');
+    validateV2ReadRequest(r); fhAssert(r.maxBytes >= 2, 'v2 bounded-read envelope'); const owner = this.owner(r.pane); fhAssert(owner, 'v2 pane missing');
     const key = v2PaneKey(r.pane), revision = r.cursor?.timelineRevision ?? owner.durableRevision;
     fhAssert(revision <= owner.durableRevision, 'v2 future cursor');
     const max = Number((this.#db.query('SELECT COALESCE(MAX(n),0) AS n FROM fh_v2_timeline WHERE pane=? AND revision<=?').get(key, revision) as SqlRow).n);
@@ -2172,10 +2186,10 @@ class V2Storage {
   }
   private seal(pane: PaneKey, segment: string, receipt: V2Receipt): void {
     const key = v2PaneKey(pane); nonempty(segment); fhAssert(!this.get('segment-seal', key, segment), 'v2 segment already sealed');
-    const rows: CommittedStreamRow[] = [];
+    const rows: CommittedStreamRow[] = []; let rowBytes = 2;
     for (const row of this.#db.query("SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n").iterate(key, segment) as Iterable<SqlRow>) {
-      const entry = this.timeline(row); if (entry.kind === 'row') rows.push(entry.row);
-      fhAssert(bytes(rows) <= FB.archiveChunkBytes / 2 && rows.length <= 65536, 'v2 segment seal bound');
+      const entry = this.timeline(row); if (entry.kind === 'row') { rows.push(entry.row); rowBytes += bytes(entry.row) + 1; }
+      fhAssert(rowBytes <= FB.archiveChunkBytes / 2 + 2 && rows.length <= 65536, 'v2 segment seal bound');
     }
     fhAssert(rows.length > 0, 'v2 empty segment');
     const range = { pane, segmentId: segment, start: rows[0]!.id.rowOrdinal, end: rows[rows.length - 1]!.id.rowOrdinal + 1 };

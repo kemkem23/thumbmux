@@ -314,7 +314,7 @@ describe('wave 4 reader canary', () => {
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
-import type { AppendFinalized, InputEvent, Result, VtCheckpoint } from '../src/stream-contract';
+import type { AppendFinalized, InputEvent, Result, VtCheckpoint, RecoveryChunk } from '../src/stream-contract';
 const shPane = { serverIdentity: 'stream-fixture', paneId: '%1', birthGeneration: 1 };
 const shIdentity = { pane: shPane, sourceEpoch: 1, geometryGeneration: 1 };
 function shOk<T>(result: Result<T>): T {
@@ -748,7 +748,7 @@ test('contract final repair rows stay fenced until repaired checkpoint commits a
     shOk(await f.engine.journalInput(shInput())); shOk(await f.engine.appendFinalized(shAppend()));
     shOk(await shCheckpoint(f.engine));
     const recovery = f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
-    const first = shOk((await recovery.next()).value!);
+    const first = shOk<RecoveryChunk>((await recovery.next()).value!);
     if(first.kind !== 'checkpoint') throw Error('checkpoint expected');
     await recovery.return?.();
     const gap = {episodeId:'atomic-close',pane:shPane,epochBefore:1,epochAfter:null,
@@ -769,7 +769,7 @@ test('contract final repair rows stay fenced until repaired checkpoint commits a
     expect(durable.checkpointId).toBe('repaired');
     f.reopen();
     const restored=f.engine.recover(shPane,null,shCancel)[Symbol.asyncIterator]();
-    expect(shOk((await restored.next()).value!)).toEqual({kind:'checkpoint',checkpoint});
+    expect(shOk<RecoveryChunk>((await restored.next()).value!)).toEqual({kind:'checkpoint',checkpoint});
     await restored.return?.();
     shOk(await f.engine.journalInput(shInput(3)));
     expect((await f.engine.appendFinalized(shAppend(3))).status).toBe('ok');
@@ -1626,5 +1626,60 @@ test('H v2 seal locator pin reclaim use one writer and interrupted cleanup retri
     expect(restored.entries).toEqual([{ kind: 'row', row: restore }]); expect(restored.after.kind).toBe('end');
     restore = f.row(1, 'corrupt'); const corrupt = h2value(await f.page(1, cursorPage.after.cursor));
     expect(corrupt.after.kind).toBe('blocked'); expect(corrupt.states).toContainEqual({ kind: 'remote-unavailable', bundleId: 'remote-test', reason: 'corrupt', retryAfterMs: 1000 });
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 two windows in one session have distinct owners, checkpoints and timelines', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate();
+    const remap = <T>(x: T): T => JSON.parse(JSON.stringify(x).replaceAll('%1', '%2').replaceAll('@1', '@2').replaceAll('birth-1', 'birth-2'));
+    const ready = remap(f.ready), cp = remap(f.cp(1));
+    const intent = { ...ready.intent, command: 'new-window' as const };
+    h2value(await f.port.writer.reserveBirth(f.port.capability, { intent, expectedGeneration: f.port.capability.generation, digest: H2.v2Digest('birth-reservation', { intent }) }));
+    const command: H2.V2WriteCommand = { kind: 'activate', ready: { ...ready, intent }, checkpoint: cp };
+    const fence = { pane: ready.pane.pane, operationId: 'activate-2', expectedGeneration: f.port.capability.generation, expectedRevision: 0 };
+    h2value(await f.port.writer.commit(f.port.capability, { fence: { ...fence, digest: H2.v2WriteDigest({ fence, command }) }, command }));
+    await f.commit({ kind: 'stop', incident: f.incident('pane-one-stopped', 2) }, 'stop-1');
+    await f.reopen();
+    const panes = h2value(f.port.reader.panes(f.session, null)).panes;
+    expect(panes.map(p => [p.pane.paneId, p.state])).toEqual([['%1', 'stopped'], ['%2', 'active']]);
+    expect(h2value(f.port.reader.checkpoint(ready.pane.pane))!.pane).toEqual(ready.pane.pane);
+    expect(h2value(await f.port.reader.page({ schema: 'newarch-v2', pane: ready.pane.pane, cursor: null, direction: 'after', maxEntries: 10, maxBytes: 10240 })).entries).toEqual([]);
+    expect(h2value(await f.page()).entries).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 new-window cannot adopt a legacy session and activation binds the exact source epoch', async () => {
+  const f = await h2fixture();
+  try {
+    const intent = { ...f.ready.intent, command: 'new-window' as const };
+    expect((await f.port.writer.reserveBirth(f.port.capability, { intent, expectedGeneration: f.port.capability.generation, digest: H2.v2Digest('birth-reservation', { intent }) })).status).toBe('error');
+    expect(h2value(f.port.reader.sessionOwner(f.session))).toBeNull();
+    await f.reserve(); const cp = f.cp(1), epoch = { ...cp.through.epoch, collectorIncarnation: 'foreign-collector' };
+    const bad = { ...cp, through: { epoch, byteOffset: 0 }, replayFloor: { epoch, byteOffset: 0 } };
+    expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'activate', ready: f.ready, checkpoint: bad }, 'wrong-epoch'))).status).toBe('error');
+    expect(h2value(f.port.reader.owner(f.pane))).toBeNull();
+    await f.commit({ kind: 'activate', ready: f.ready, checkpoint: cp }, 'right-epoch');
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 ordered audit repairs only pending and disabled or stale evidence never writes', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate(); const old = f.cp(1), cp = f.cp(2);
+    const watermark = { pane: f.pane, through: old.through, revision: 1, geometry: f.geometry, checkpointId: old.checkpointId };
+    const evidence: H2.V2AuditEvidence = { before: watermark, after: watermark, snapshot: watermark,
+      ordering: { kind: 'certified-source-fence', certificateId: 'ordered', proof: { path: '/synthetic/proof', bytes: 1, sha256: 'a'.repeat(64) } },
+      expectedDigest: 'a'.repeat(64), actualDigest: 'b'.repeat(64), captureBytes: 1, elapsedMs: 1 };
+    const incident = { ...f.incident('pending-repair', 2), action: 'repair-pending' as const, collecting: true, reason: 'audit-mismatch' as const };
+    const result: H2.V2AuditResult = { kind: 'repair-pending', evidence, rule: old.rule, expectedRevision: 1, checkpoint: cp, incident };
+    await f.commit({ kind: 'audit', result }, 'repair');
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
+    expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
+    expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'audit', result }, 'late-repair'))).status).toBe('error');
+    await f.commit({ kind: 'audit', result: { kind: 'inconclusive', reason: 'disabled', retry: false } }, 'disabled');
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(cp);
   } finally { await f.cleanup(); }
 });
