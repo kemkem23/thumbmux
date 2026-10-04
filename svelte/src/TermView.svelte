@@ -7500,6 +7500,7 @@
   data-last-rows={lastPushedRows}
   data-font-fit={fixedGeometry ? (autoFit ? 'auto' : 'manual') : undefined}
   data-font-px={fixedGeometry ? renderFontPx : undefined}
+  data-tail-clearance={fixedGeometry ? tailClearancePx : undefined}
   data-history-stop={historyStopReason}
   data-history-states={historyStatus.length ? historyStatus.map(note => note.kind).join(' ') : undefined}
   data-history-paging={historyPaging}

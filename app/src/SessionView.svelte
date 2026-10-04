@@ -165,7 +165,9 @@
     DEFAULT_FONT_PX,
     clampFontPx,
     resolveFontBounds,
+    resolveFontFitMode,
     stepFontPx,
+    type FontFitMode,
   } from './font-range';
   import {
     nextStageOverlay,
@@ -236,6 +238,31 @@
     ),
   );
   let fixedGeometry = $derived(geometryPolicy.kind === 'fixed' ? geometryPolicy.geometry : null);
+  // NEWARCH fit-font: `auto` (default) shrinks the drawn font until the birth
+  // columns fit; `manual` keeps the user's size and scrolls sideways. Stored
+  // in prefs under `fontFit` (ThumbmuxPrefs carries host extras); the drawn
+  // size itself is never stored — `fontPx` stays the user's ceiling.
+  let fontFitMode = $state<FontFitMode>('auto');
+  let shownFontFit = $state<{ fontPx: number; fits: boolean } | null>(null);
+  let stageEl = $state<HTMLDivElement | null>(null);
+  // Space kept under a fixed pane's live tail so the ❯ button never covers
+  // the prompt row. Measured from the real button; the fallback is its stock
+  // footprint (52px + 14px offset + a little air) until layout exists.
+  const FAB_TAIL_FALLBACK_PX = 72;
+  let tailClearance = $state(FAB_TAIL_FALLBACK_PX);
+  function measureTailClearance(): number {
+    const host = stageEl?.querySelector<HTMLElement>('.mtv-host')?.getBoundingClientRect();
+    const fab = stageEl?.querySelector<HTMLElement>('.fab')?.getBoundingClientRect();
+    if (!host || !fab || host.height <= 0 || fab.height <= 0) return FAB_TAIL_FALLBACK_PX;
+    return Math.max(0, Math.ceil(host.bottom - fab.top + 6));
+  }
+  $effect(() => {
+    if (!fixedGeometry || !stageEl) return;
+    const measure = () => { tailClearance = measureTailClearance(); };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  });
   let resolvedTermProps = $derived({
     ...configuredTermProps,
     // Not overridable by the host: a fixed or unresolved pane never claims.
@@ -245,6 +272,12 @@
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
     palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
     fontPx: configuredTermProps.fontPx ?? effectiveFontPx,
+    // Not overridable either: the inventory row owns the pane size.
+    fixedGeometry,
+    fontFit: fontFitMode,
+    fontFitFloorPx: fontBounds.min,
+    tailClearancePx: fixedGeometry ? tailClearance : 0,
+    onFontFit: (fit: { fontPx: number; fits: boolean }) => { shownFontFit = fit; },
   });
   let unpinNarrowCells = $derived(adapters.sessionPresentation?.pinNarrowCells === false);
   let themeMode = $derived(
@@ -359,6 +392,7 @@
     if (Array.isArray(snapshot.shortcuts)) {
       shortcuts = snapshot.shortcuts.map((shortcut) => ({ ...shortcut }));
     }
+    if (snapshot.fontFit !== undefined) fontFitMode = resolveFontFitMode(snapshot.fontFit);
     claudeBashMode = CLAUDE_BASH_MODES.includes(snapshot.claudeBashMode as ClaudeBashMode)
       ? snapshot.claudeBashMode as ClaudeBashMode
       : 'off';
@@ -377,6 +411,11 @@
   function setFont(next: number): void {
     storedFontPx = clampFontPx(next, currentFontBounds());
     savePrefs({ fontPx: storedFontPx });
+  }
+
+  function setFontFit(next: FontFitMode): void {
+    fontFitMode = next;
+    savePrefs({ fontFit: next });
   }
 
   function setShortcuts(next: Shortcut[]): void {
@@ -774,6 +813,19 @@
         onTap: () => setFont(stepFontPx(storedFontPx, -1)),
       },
     );
+    if (fixedGeometry) {
+      // Fixed panes only: a legacy pane resizes tmux instead, nothing to fit.
+      stock.push({
+        id: 'font-fit',
+        label: 'FIT',
+        tag: fontFitMode === 'manual'
+          ? 'MANUAL'
+          : shownFontFit ? `AUTO ${shownFontFit.fontPx.toFixed(1)}` : 'AUTO',
+        testid: 'demo-font-fit',
+        // Stays open like A+/A− so the user can flip back after a look.
+        onTap: () => setFontFit(fontFitMode === 'manual' ? 'auto' : 'manual'),
+      });
+    }
     const extras = (adapters.extraActions?.(session, legacyActionContext) ?? [])
       .map(dismissingHostAction);
     const defaults = [...stock, ...extras];
@@ -972,6 +1024,7 @@
 {/snippet}
 
 <div
+  bind:this={stageEl}
   class="stage"
   data-testid="session-view"
   data-state={currentMeta?.state}
