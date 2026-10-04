@@ -1,5 +1,5 @@
-// Copied from docs/tasks/newarch-stream/contract-fixture.ts so the public package
-// suite does not import host docs. Keep in sync with that source when it changes.
+// Vendored stitch contract vectors: the package suite reads only files inside
+// the package. Keep in sync with the host's NEWARCH stream contract fixture.
 // Independent expected vectors for C/T. IDs denote separate producer events,
 // even where cells repeat. Expected decisions are literals, never matcher output.
 export const STITCH_ORACLE_VECTORS = [
