@@ -30,6 +30,12 @@
     "tier": "S"
   },
   {
+    "name": "BunTmuxDriver",
+    "kind": "type",
+    "signature": "9b0a2b09b027d5cd0444221c11dc4cd7ece18e655cc160f0b86c2a68347f1c03",
+    "tier": "S"
+  },
+  {
     "name": "createAppRoutes",
     "kind": "value",
     "signature": "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a",
@@ -38,7 +44,7 @@
   {
     "name": "createBunTmuxDriver",
     "kind": "value",
-    "signature": "5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06",
+    "signature": "3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b",
     "tier": "F"
   },
   {

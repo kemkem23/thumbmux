@@ -359,7 +359,14 @@
       grid-template-columns: repeat(2, minmax(0, max-content));
       justify-content: end;
       justify-items: stretch;
+      /* `safe`: when even two columns do not fit, plain `end` pushes the
+         overflow past the top edge, where a scroll container cannot reach it
+         (1024×360: first row at -76px, scrollHeight == clientHeight, so the
+         top actions were unreachable and no edge fade could show). `safe`
+         falls back to start on overflow; the plain `end` line stays for
+         browsers without the keyword. */
       align-content: end;
+      align-content: safe end;
       gap: 8px;
     }
     /* Each column as wide as its widest label, so the menu reads as two

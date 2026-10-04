@@ -43,7 +43,16 @@ export const TERMINAL_PTY_WAL_CONFIG_ENV = TERMINAL_PTY_WAL_CONFIG_ENV_VALUE;
 export type { TerminalPtyWalProxyHealth } from './integrations/terminal-pty-wal-proxy';
 
 export * from './ws-mux';
-export * from './bun-driver';
+// Explicit list: createActivityPoll / readActivityProcess stay module-internal
+// (the host imports them from the source file); they are not public API.
+export type { TmuxTargetMode, TmuxTargetOptions, BunTmuxDriver } from './bun-driver';
+export {
+  exactTmuxTarget,
+  exactTmuxPaneTarget,
+  createBunTmuxDriver,
+  spawnTmuxSession,
+  killTmuxSession,
+} from './bun-driver';
 export * from './spawn-handler';
 export * from './upload-handler';
 export * from "./prefs-handler";

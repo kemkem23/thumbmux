@@ -205,9 +205,8 @@ test('contract repair mutants go red then restored real seams go green', async (
     cpSync(join(pkg,'server/src'),join(target,'server/src'),{recursive:true});
     cpSync(join(pkg,'server/tests'),join(target,'server/tests'),{recursive:true});
     cpSync(join(pkg,'core/src'),join(target,'core/src'),{recursive:true});
-    const bundle=join(root,'docs/tasks/newarch-spike2/bundle');
-    mkdirSync(bundle,{recursive:true});
-    cpSync(resolve(pkg,'../../docs/tasks/newarch-spike2/bundle'),bundle,{recursive:true});
+    // The spike2 bundle rides along in server/tests/fixtures: nothing outside
+    // the package is read, so a public clone runs this unchanged.
     const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});
     cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
     writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
