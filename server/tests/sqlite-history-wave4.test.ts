@@ -1353,9 +1353,8 @@ test('H-r2 distinct gaps in one episode retain positions across durable close up
 
 // H/Q22: real transactions on synthetic roots. New API, so mutation barriers
 // below prove behavioral red; a missing export/import is never the red oracle.
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { createV2HistoryFactory, FlagOnHistoryStore } from '../src/history-engine';
+import { writeFileSync } from 'node:fs';
+import { createV2HistoryFactory } from '../src/history-engine';
 import * as H2 from '../src/stream-contract';
 import type { NewarchV2Incident, NewarchV2PaneDescriptor } from '@thumbmux/core';
 function h2value<T>(r: H2.Result<T>): T { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; }
@@ -1406,6 +1405,7 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
   return { root, pane, session, geometry, descriptor, cp, request, commit, ready, reserve, activate, incident, row, batch, page, open,
     get port() { return port; },
     async reopen() { h2value(await port.writer.close(port.capability)); port = h2value(await open()); return port; },
+    async reload() { port = h2value(await open()); return port; },
     async cleanup() { await port.writer.close(port.capability); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -1458,7 +1458,7 @@ describe('H v2 capture-only storage', () => {
       fault = ''; await f.reopen();
       const retry = { ...req, fence: { ...req.fence, expectedGeneration: f.port.capability.generation } };
       const receipt = h2value(await f.port.writer.commit(f.port.capability, retry));
-      expect(receipt).toEqual(h2value(f.port.reader.receipt(f.pane, 'rows-1')));
+      expect(receipt).toEqual(h2value(f.port.reader.receipt(f.pane, 'rows-1'))!);
       expect(h2value(await f.page()).entries.map(e => e.kind === 'row' && e.row.id.rowOrdinal)).toEqual([0, 1]);
       const checkpoint = h2value(f.port.reader.checkpoint(f.pane))!;
       expect(checkpoint.state.pendingUtf8).toEqual([224]); expect(checkpoint.state.pendingEscape).toEqual([27, 91]);
@@ -1535,4 +1535,96 @@ describe('H v2 capture-only storage', () => {
       await f.reopen(); expect(h2value(f.port.reader.sessionOwner(f.session))!.owner).toBe('capture-engine');
     } finally { await f.cleanup(); }
   });
+});
+
+
+test('H v2 SIGKILL before and after transaction keeps rows checkpoint receipt in one boundary', async () => {
+  for (const phase of ['v2-batch-before-write', 'v2-batch-before-commit', 'v2-batch-after-commit']) {
+    const f = await h2fixture();
+    try {
+      await f.activate(); const command = f.batch([f.row(0)]);
+      h2value(await f.port.writer.close(f.port.capability));
+      const script = `import {createV2HistoryFactory} from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))};
+        import {NEWARCH_V2_DEFAULT_CONFIG as config,v2WriteDigest} from ${JSON.stringify(join(import.meta.dir, '../src/stream-contract.ts'))};
+        const r=await createV2HistoryFactory({inputReceipt:ack=>({status:'ok',value:ack}),boundary:at=>{if(at===${JSON.stringify(phase)})process.kill(process.pid,'SIGKILL')}}).openForCapture({rootId:process.argv[1],engineId:'kill-capture',config});
+        if(r.status!=='ok')throw Error(JSON.stringify(r)); const {writer,capability}=r.value;
+        const command=${JSON.stringify(command)},fence={pane:${JSON.stringify(f.pane)},operationId:'kill-batch',expectedGeneration:capability.generation,expectedRevision:1};
+        const result=await writer.commit(capability,{fence:{...fence,digest:v2WriteDigest({fence,command})},command}); console.error(JSON.stringify(result));process.exit(9);`;
+      const child = Bun.spawn([process.execPath, '-e', script, f.root], { stdout: 'pipe', stderr: 'pipe' });
+      const [exit, output] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(output).toBe(''); expect(exit).not.toBe(0); expect(exit).not.toBe(9);
+      await f.reload();
+      const committed = phase.endsWith('after-commit');
+      expect(h2value(await f.page()).entries.length).toBe(committed ? 1 : 0);
+      expect(h2value(f.port.reader.checkpoint(f.pane))!.revision).toBe(committed ? 2 : 1);
+      expect(h2value(f.port.reader.receipt(f.pane, 'kill-batch')) !== null).toBe(committed);
+      await f.commit(command, 'kill-batch');
+      expect(h2value(await f.page()).entries.length).toBe(1);
+      console.log('H_V2_KILL_BARRIER', JSON.stringify({ phase, committed, rowsAfterRetry: 1 }));
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('H v2 quality annotation covers published rows even through an older cursor', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate(); await f.commit(f.batch([f.row(0), f.row(1)]), 'rows');
+    const first = h2value(await f.page(1)); if (first.after.kind !== 'more') throw Error('cursor missing');
+    const incident = { ...f.incident('geometry-quality', 3, f.row(1).id), reason: 'geometry-violation' as const };
+    await f.commit({ kind: 'stop', incident }, 'geometry-stop');
+    await f.reopen(); const page = h2value(await f.page(1, first.after.cursor));
+    expect(page.entries).toHaveLength(1);
+    expect(page.states).toContainEqual({ kind: 'incident', incident });
+    expect(page.states.some(s => s.kind === 'exact')).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 seal locator pin reclaim use one writer and interrupted cleanup retries safely', async () => {
+  let verified = false, killCleanup = false, restore: H2.CommittedStreamRow | null = null;
+  const f = await h2fixture({ remoteReadback: () => verified, remoteRow: () => ({ status: 'ok', value: restore }), boundary: at => {
+    if (killCleanup && at === 'v2-reclaim-after-unlink') throw Error('injected cleanup interruption');
+  } });
+  try {
+    await f.activate(); await f.commit(f.batch([f.row(0), f.row(1)]), 'rows');
+    const cursorPage = h2value(await f.page(1)); if (cursorPage.after.kind !== 'more') throw Error('cursor missing');
+    const sealReceipt = await f.commit({ kind: 'seal', segmentId: 'segment-1' }, 'seal');
+    const seal = h2value(f.port.reader.sealed(f.pane, sealReceipt.commitId))!;
+    await f.commit({ kind: 'materialize-export', sealCommitId: sealReceipt.commitId }, 'export');
+    const exported = h2value(f.port.reader.export(f.pane, 'export'))!;
+    const sources = [...exported.files, exported.manifest];
+    const members = sources.map((file, i) => ({ ...file, path: 'member-' + i }));
+    const manifest = { objectKey: 'synthetic/manifest', bytes: 20, sha256: 'a'.repeat(64) };
+    const inventory: H2.ArchiveInventoryR2 = { revision: 2, sealGeneration: seal.sealGeneration, sealCommitId: seal.sealCommitId,
+      sealManifestSha256: exported.manifest.sha256, bundleManifestSha256: manifest.sha256,
+      members: sources.map((file, i) => ({ sourcePath: file.path, relativePath: members[i]!.path, bytes: file.bytes, sha256: file.sha256 })) };
+    const bundle: H2.ArchiveBundle = { version: 1, bundleId: 'remote-test', storeUUID: exported.storeUUID, pane: f.pane,
+      segmentId: 'segment-1', coverage: seal.coverage, schemaVersions: { newarch: 2 }, objects: [manifest], manifest, members,
+      compression: 'tar.zst', encryption: 'none', checkpointIds: seal.checkpointIds, rawRanges: seal.rawRanges };
+    const locator: H2.V2RemoteLocator = { pane: f.pane, segmentId: 'segment-1', sealed: seal, inventory,
+      readerProof: { digest: seal.coverage[0]!.digest, verifiedAtWallMs: 123, first: f.row(0).id, last: f.row(1).id },
+      verified: { kind: 'verified-remote', bundle, verificationId: 'verified-1', method: 'download-sha256', verifiedAtMonoMs: 100,
+        clockEpoch: 'test', inventoryDigest: H2.archiveInventoryDigest(inventory), evidence: [exported.manifest], toolVersion: 'test',
+        command: ['simulated-readback'], stdout: exported.manifest, stderr: exported.manifest, exitCode: 0 } };
+    expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'locator', locator }, 'unverified'))).status).toBe('error');
+    expect(h2value(await f.page()).entries).toHaveLength(2);
+    verified = true; const located = await f.commit({ kind: 'locator', locator }, 'locator');
+    await f.commit({ kind: 'pin', pinId: 'reader-pin', segmentId: 'segment-1' }, 'pin');
+    const reclaim: H2.V2WriteCommand = { kind: 'reclaim', locatorCommitId: located.commitId, segmentId: 'segment-1' };
+    expect((await f.port.writer.commit(f.port.capability, f.request(reclaim, 'reclaim'))).status).toBe('error');
+    expect(h2value(await f.page()).entries).toHaveLength(2);
+    await f.commit({ kind: 'release-pin', pinId: 'reader-pin' }, 'release');
+    killCleanup = true;
+    expect((await f.port.writer.commit(f.port.capability, f.request(reclaim, 'reclaim'))).status).toBe('error');
+    expect(h2value(f.port.reader.receipt(f.pane, 'reclaim'))).not.toBeNull();
+    killCleanup = false; await f.reopen(); await f.commit(reclaim, 'reclaim');
+    expect(sources.every(file => !existsSync(file.path))).toBe(true);
+    const remote = h2value(await f.page(1, cursorPage.after.cursor));
+    expect(remote.entries).toEqual([]); expect(remote.after.kind).toBe('blocked');
+    expect(remote.states[0]!.kind).toBe('remote-unavailable');
+    expect(h2value(f.port.reader.locator(f.pane, located.commitId))).toEqual(locator);
+    restore = f.row(1); const restored = h2value(await f.page(1, cursorPage.after.cursor));
+    expect(restored.entries).toEqual([{ kind: 'row', row: restore }]); expect(restored.after.kind).toBe('end');
+    restore = f.row(1, 'corrupt'); const corrupt = h2value(await f.page(1, cursorPage.after.cursor));
+    expect(corrupt.after.kind).toBe('blocked'); expect(corrupt.states).toContainEqual({ kind: 'remote-unavailable', bundleId: 'remote-test', reason: 'corrupt', retryAfterMs: 1000 });
+  } finally { await f.cleanup(); }
 });
