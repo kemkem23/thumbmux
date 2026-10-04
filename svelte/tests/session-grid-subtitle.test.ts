@@ -239,8 +239,13 @@ describe("dense grid card metadata", () => {
       expect(openPreview.contains(inertPreview)).toBe(false);
       expect(kill.textContent).toBe("×");
       expect(head.contains(kill)).toBe(true);
-      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
-      expect(getComputedStyle(summary).getPropertyValue("-webkit-line-clamp").trim()).toBe("3");
+      // happy-dom's window is 1024×768 with a fine pointer, so UI-COMPACT lot
+      // D's short-screen mouse rule applies: a 44px header with a two-line
+      // note/summary. The premise is asserted so a different test window
+      // fails here by name instead of as a clamp mismatch.
+      expect(window.matchMedia("(pointer: fine) and (max-height: 820px)").matches).toBe(true);
+      expect(getComputedStyle(note).getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
+      expect(getComputedStyle(summary).getPropertyValue("-webkit-line-clamp").trim()).toBe("2");
 
       flushSync(() => {
         copy.click();

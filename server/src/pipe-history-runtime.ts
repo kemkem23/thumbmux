@@ -821,8 +821,9 @@ export class PipeHistoryPane {
     this.compactReceipts();
   }
 
+  /** Drop settled stamps as they settle: a 4096 floor held ~2.3 h of stamps per pane at 0.5 chunks/s. */
   private compactReceipts(): void {
-    if (this.receiveHead > 4096 && this.receiveHead * 2 > this.receiveTimes.length) {
+    if (this.receiveHead > 64 && this.receiveHead * 2 > this.receiveTimes.length) {
       this.receiveTimes.splice(0, this.receiveHead);
       this.receiveHead = 0;
     }
