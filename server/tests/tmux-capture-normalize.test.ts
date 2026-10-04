@@ -1988,9 +1988,12 @@ test('Q22 V2-13 physical 100x40 oracle on a private tmux socket',async()=>{
       while(!existsSync(path+'.ready')&&Date.now()<deadline)await Bun.sleep(5);
       expect(existsSync(path+'.ready')).toBe(true);
       const captured=tmux('capture-pane','-p','-e','-N','-t',paneId);
-      const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)};
-      const cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0}),bytes=[...Buffer.from(body)];
-      const result=evaluateV2Rules({pane,checkpoint:cp,bytes,raw:{epoch:v2Epoch,start:0,end:bytes.length},observedAtMonoMs:1,pendingSinceMonoMs:null});
+      // The cases are cut for 100 columns x 40 rows, so the oracle runs on that geometry,
+      // not on the default config (78x120 since 2026-10-04).
+      const config100={...v2Config,configVersion:'oracle-100x40',geometry:{columns:100,rows:40}};
+      const pane={...v2Pane,geometry:v2BirthGeometry(config100)};
+      const cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config100),bytes=[...Buffer.from(body)];
+      const result=evaluateV2Rules({pane,checkpoint:cp,bytes,raw:{epoch:v2Epoch,start:0,end:bytes.length},observedAtMonoMs:1,pendingSinceMonoMs:null},config100);
       expect(result.kind).toBe('accept');if(result.kind!=='accept')throw Error(JSON.stringify(result));
       const state=result.checkpoint.state;
       expect(v2ScreenDigest(state[state.active].rows)).toBe(v2ScreenDigest(normalizeV2Capture(captured,pane.geometry)));
@@ -2052,7 +2055,7 @@ describe('Q22 C/H durable revision and segment seams (C-010..016)',()=>{
   });
   test('C-016 serialized row provenance fits H batch bytes, not only decoded cell bytes',()=>{
     const pane={...v2Pane,geometry:v2BirthGeometry(v2Config)},cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0});
-    const bytes=[...Buffer.from('\r\n'.repeat(200))];
+    const bytes=[...Buffer.from('\r\n'.repeat(v2Config.geometry.rows+160))];
     const r=evaluateV2Rules({pane,checkpoint:cp,raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null});
     expect(r.kind).toBe('gap');if(r.kind==='gap')expect(r.incident.reason).toBe('budget-exhausted');
   });
