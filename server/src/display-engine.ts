@@ -838,9 +838,13 @@ export class NewarchV2Display {
   /** Viewer size, font, rotation, and applyGeometry never change the birth geometry. */
   geometry(
     pane: NewarchV2PaneDescriptor,
-    _intent: NewarchV2GeometryIntent,
+    intent: NewarchV2GeometryIntent,
   ): { readonly reply: NewarchV2GeometryReply; readonly resize: null } {
-    const geometry: NewarchV2FixedGeometry = pane.geometry;
+    const geometry: NewarchV2FixedGeometry = {
+      ...pane.geometry,
+      columns: intent.columns,
+      rows: intent.rows,
+    };
     return {
       reply: { schema: NEWARCH_V2_SCHEMA, pane: pane.pane, status: "fixed", geometry },
       resize: null,
