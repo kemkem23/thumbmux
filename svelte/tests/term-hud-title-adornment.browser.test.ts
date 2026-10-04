@@ -1258,9 +1258,12 @@ describe("UI-COMPACT dense SessionGrid on short / narrow screens", () => {
       expect((await denseHead(page)).headHeight).toBe(72);
       const heights = await page.locator(
         '[data-testid="grid-controls"] button, [data-testid="grid-controls"] input',
-      ).evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
+      ).evaluateAll((elements) => elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return Math.min(rect.width, rect.height);
+      }));
       expect(heights.length).toBeGreaterThanOrEqual(4);
-      for (const height of heights) expect(height).toBeGreaterThanOrEqual(44);
+      for (const side of heights) expect(side).toBeGreaterThanOrEqual(44);
     } finally {
       await context.close();
     }

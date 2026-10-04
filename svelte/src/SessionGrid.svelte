@@ -987,6 +987,9 @@
     .search input {
       min-height: 44px;
     }
+    .filters button {
+      min-width: 44px;
+    }
   }
   .group-heading {
     display: flex;
