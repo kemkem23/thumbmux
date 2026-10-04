@@ -1442,7 +1442,8 @@ function isV0203PatchException(
  * assigns it to TmuxDriver). The generic proof cannot model the intersection.
  * Pin both artifact digests and versions; unrelated drift still fails.
  * createActivityPoll / readActivityProcess left the barrel instead of freezing.
- * Evidence: orchestrator-runs/20260923/newarch-v2/tmxfix/REPORT.md.
+ * Evidence: server/tests/session-row-type.fixture.ts (`bundledDriver`)
+ * compiles createBunTmuxDriver() into a plain TmuxDriver binding.
  */
 const V0205_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
   "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b"
