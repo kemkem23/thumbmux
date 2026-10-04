@@ -790,7 +790,7 @@ export function selectNewarchV2Panes(
   next: string | null,
 ): NewarchV2PaneSelection {
   if (panes.length === 0 && next === null) return { kind: "missing" };
-  if (next === null && panes.length >= 1) return { kind: "selected", pane: panes[panes.length - 1]! };
+  if (panes.length === 1 && next === null) return { kind: "selected", pane: panes[0]! };
   return { kind: "ambiguous", panes: [...panes], next };
 }
 
