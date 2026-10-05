@@ -1342,8 +1342,6 @@ export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'ga
  * retains the unconsumed suffix; the decoder never scans it in advance. */
 export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
   context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
-  let last=performance.now(); const timings:Record<string,number>={};
-  const mark=(name:string)=>{const now=performance.now();timings[name]=now-last;last=now;};
   const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
   const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
     // Evidence belongs to a gap, not each successful prefix of the same offer.
@@ -1353,10 +1351,9 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
     const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
     return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
   };
-  mark('inputDigest');
   const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
   try {
-    validateV2Checkpoint(cp);mark('validateInput');
+    validateV2Checkpoint(cp);
     const durableRevision=context.durableRevision??cp.revision;
     if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
     if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
@@ -1375,7 +1372,6 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
       ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
     const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
-    mark('preflight');
     const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
       const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
       return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
@@ -1384,20 +1380,15 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
     };
     const probeRows:CommittedStreamRow[]=[],serializedEnds:number[]=[2];
     let serializedBoundary=false,probeSerializedBytes=2;
-    let materializeMs=0;
     const decoded=v2Decode(cp.state,input.bytes,rawCap,L.maxRows,(r,offset,index)=>{
-      const materializeStart=performance.now();
       const row=materializeOne(r,offset,index);
       const originBytes=Buffer.byteLength(streamCanonical(row.origin)),cells=row.cellOrigins.length;
       const rowBytes=Buffer.byteLength(streamCanonical({...row,cellOrigins:[]}))
         +cells*originBytes+Math.max(0,cells-1);
       const candidate=probeSerializedBytes+(index===0?0:1)+rowBytes;
-      materializeMs+=performance.now()-materializeStart;
       if(candidate>L.maxSerializedBytes){serializedBoundary=true;return false;}
       probeRows.push(row);probeSerializedBytes=candidate;serializedEnds.push(candidate);return true;
     });
-    mark('probeDecode');timings.probeDecode!-=materializeMs;timings.probeMaterialize=materializeMs;
-    timings.finalDecode=0;
     const consumed=decoded.rowBoundary??rawCap;
     const stop:V2PrefixStop=decoded.rowBoundary!==null?(serializedBoundary?'serialized-bytes':'rows')
       :input.bytes.length>rawCap?'raw-bytes':'complete';
@@ -1407,20 +1398,16 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
     const rows=probeRows.slice(0,decoded.scrolls.length);
     const serializedBytes=serializedEnds[rows.length]!;
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
-    mark('finalMaterialize');
     const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
     const checkpoint:V2LiveCheckpoint={...cp,
       checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,replayFloor:through,revision,
       frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
       pending:{rows:[],bytes:0,deadlineMonoMs:null}};
-    mark('checkpointDigest');
-    validateV2Checkpoint(checkpoint);mark('validateOutput');
+    validateV2Checkpoint(checkpoint);
     const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
     const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
       serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
-    const result=v2Immutable(prefix);mark('immutable');
-    console.log('B1_PROFILE',JSON.stringify({offered:input.bytes.length,readBytes:consumed+(decoded.rowBoundary===null?0:1),consumed,rows:rows.length,timings}));
-    return result;
+    return v2Immutable(prefix);
   }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
 

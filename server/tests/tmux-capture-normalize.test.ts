@@ -2243,7 +2243,10 @@ test('B1c decoder reads only consumed bytes plus one boundary byte and detaches 
 // the fixtures. Their exit statuses are printed separately from bun test.
 test('B1c strict contract types and repository typecheck gates',()=>{
   const root=new URL('../../../../',import.meta.url).pathname;
-  const commands=[['node_modules/.bin/tsc','--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
+  // The cage snapshots tracked sources, so regenerate the core package's
+  // declaration output in its disposable COW tree before resolving exports.
+  const commands=[['node_modules/.bin/tsc','-p','packages/thumbmux/core/tsconfig.build.json'],
+    ['node_modules/.bin/tsc','--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
     '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions',
     'docs/tasks/newarch-stream/contract-fixture.ts'],[process.execPath,'run','typecheck']];
   for(const command of commands){
