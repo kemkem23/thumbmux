@@ -2041,18 +2041,23 @@ export class TmuxWsMux<
     const finish = (result: unknown) => {
       // An async read may outlive the pane it was asked for (rebirth, new
       // server): its rows belong to nobody this socket is looking at now.
-      if (this.newarchV2Readable(session, pane).kind !== "selected") return fail("wrong-pane");
-      const reply = v2ReplyFromRead(message, result);
+      const now = this.newarchV2Readable(session, pane);
+      if (now.kind === "unavailable") return fail("owner-unavailable", now.retryAfterMs);
+      if (now.kind === "none") return fail("unsupported");
+      if (now.kind !== "selected") return fail("wrong-pane");
+      let reply: NewarchV2HistoryReply;
+      try { reply = v2ReplyFromRead(message, result); } catch { return fail("owner-unavailable", V2_HISTORY_RETRY_MS); }
       this.sendV2Reply(ws, reply);
     };
     let result: Result<V2HistoryPage> | PromiseLike<Result<V2HistoryPage>>;
+    const method = request.direction === "after" ? "readAfter" : "readBefore";
     try { result = reader(session, request); } catch (error) {
-      this.reportArchiveReadErrorBestEffort("readBefore", session, error);
+      this.reportArchiveReadErrorBestEffort(method, session, error);
       return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
     }
     if (result && typeof (result as PromiseLike<unknown>).then === "function") {
       void Promise.resolve(result).then(finish, (error: unknown) => {
-        this.reportArchiveReadErrorBestEffort("readBefore", session, error);
+        this.reportArchiveReadErrorBestEffort(method, session, error);
         fail("owner-unavailable", V2_HISTORY_RETRY_MS);
       });
       return;
@@ -2905,18 +2910,26 @@ export class TmuxWsMux<
 
 const V2_HISTORY_RETRY_MS = 1_000;
 const V2_REQUEST_ID_MAX = 128;
+/** Same bound as stream-contract v2Text (NEWARCH_V2_LIMITS.maxIdentityBytes). */
+const V2_IDENTITY_BYTES = 256;
 const v2Utf8 = new TextEncoder();
 
 function v2IntIn(value: unknown, min: number, max: number): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
+/** Non-empty, well-formed and at most V2_IDENTITY_BYTES of UTF-8. */
+function v2IdentityText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.isWellFormed()
+    && v2Utf8.encode(value).length <= V2_IDENTITY_BYTES;
+}
+
+/** Same rules as stream-contract v2PaneKey: bounded identity, birth >= 1. */
 function v2PaneKeyValid(value: unknown): value is NewarchPaneKey {
   if (!value || typeof value !== "object") return false;
   const pane = value as Partial<NewarchPaneKey>;
-  return typeof pane.serverIdentity === "string" && pane.serverIdentity.length > 0
-    && typeof pane.paneId === "string" && pane.paneId.length > 0
-    && v2IntIn(pane.birthGeneration, 0, Number.MAX_SAFE_INTEGER);
+  return v2IdentityText(pane.serverIdentity) && v2IdentityText(pane.paneId)
+    && v2IntIn(pane.birthGeneration, 1, Number.MAX_SAFE_INTEGER);
 }
 
 function v2PaneCopy(pane: NewarchPaneKey): NewarchPaneKey {
@@ -2924,7 +2937,7 @@ function v2PaneCopy(pane: NewarchPaneKey): NewarchPaneKey {
 }
 
 function v2CursorBounded(cursor: { readonly storeId?: unknown; readonly token?: unknown; readonly timelineRevision?: unknown }): boolean {
-  return typeof cursor.storeId === "string" && cursor.storeId.length > 0
+  return v2IdentityText(cursor.storeId)
     && typeof cursor.token === "string" && cursor.token.length > 0
     && v2Utf8.encode(cursor.token).length <= NEWARCH_V2_WIRE_LIMITS.cursorBytes
     && v2IntIn(cursor.timelineRevision, 0, Number.MAX_SAFE_INTEGER);
@@ -2939,8 +2952,12 @@ function v2ContinuationBounded(continuation: NewarchV2Continuation): boolean {
 
 /** Screen projection of one committed row: provenance stays server-side. */
 function v2WireEntry(entry: V2HistoryPage["entries"][number]): NewarchV2WireEntry | null {
-  if (entry?.kind === "incident") return { kind: "incident", incident: entry.incident };
+  if (entry?.kind === "incident") {
+    return entry.incident && v2PaneKeyValid(entry.incident.pane) ? { kind: "incident", incident: entry.incident } : null;
+  }
   if (entry?.kind !== "row" || !entry.row || !Array.isArray(entry.row.cells)) return null;
+  // Only committed history travels; a live (unfinalized) row is not history.
+  if (entry.row.finalized !== true) return null;
   const { id, cells, wrapStatus, wrapPad } = entry.row;
   if (!id || !v2PaneKeyValid(id.pane)) return null;
   return {
