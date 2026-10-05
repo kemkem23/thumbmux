@@ -471,3 +471,59 @@ test("D2a real tmux: the driver reads a control-mode watcher alone as detached, 
     rmSync(dir, { recursive: true, force: true });
   }
 }, 60_000);
+
+// ── D2a debt: a session name containing "|" ──
+// The trailing created/windows/attached fields are numeric, so they are taken
+// off the END of the row and the rest is the name — the same rule as
+// parseMuxSampleLine in tmux-mux.ts and the window-activity poll above.
+function expectPipeNameDriverRows(create: typeof createBunTmuxDriver = createBunTmuxDriver) {
+  withListSessionsOutput([
+    "a|b|1700000000|2|1",
+    "a|1700000001|1|1",
+    "x||y|1700000002|3|0",
+    "client:0|a|b",
+    "client:1|a",
+    "",
+  ].join("\n"), (driver) => {
+    expect(driver.listSessions()).toEqual([
+      { name: "a|b", created: "1700000000", windows: 2, attached: true, activityAt: 0 },
+      { name: "a", created: "1700000001", windows: 1, attached: false, activityAt: 0 },
+      { name: "x||y", created: "1700000002", windows: 3, attached: false, activityAt: 0 },
+    ]);
+  }, create);
+}
+
+describe("D2a debt: bun driver listSessions with '|' in a session name", () => {
+  test("name, created, windows and attached are read whole; a control client of 'a|b' never detaches 'a'", () => {
+    expectPipeNameDriverRows();
+  });
+
+  test("activityAt is looked up under the whole name", async () => {
+    const originalSpawnSync = Bun.spawnSync;
+    const originalSpawn = Bun.spawn;
+    Bun.spawnSync = ((command: string[]) => {
+      if (command[1] === "list-sessions") {
+        return successfulProcess("a|b|1700000000|1|1\na|1700000001|1|0\nclient:0|a|b\n");
+      }
+      throw new Error(`unexpected tmux call: ${command.join(" ")}`);
+    }) as typeof Bun.spawnSync;
+    Bun.spawn = ((command: string[]) => {
+      if (command[1] !== "list-windows") throw new Error(`unexpected tmux call: ${command.join(" ")}`);
+      return { stdout: new Blob(["a|b|1700000500\na|1700000400\n"]).stream(), stderr: new Blob([]).stream(),
+        exited: Promise.resolve(0), kill() {} };
+    }) as any;
+    const driver = createBunTmuxDriver();
+    try {
+      driver.getSessionActivity();
+      await driver.activityPoll.settled();
+      expect(driver.listSessions().map((row) => [row.name, row.created, row.attached, row.activityAt])).toEqual([
+        ["a|b", "1700000000", true, 1700000500],
+        ["a", "1700000001", false, 1700000400],
+      ]);
+    } finally {
+      driver.activityPoll.stop();
+      Bun.spawn = originalSpawn;
+      Bun.spawnSync = originalSpawnSync;
+    }
+  });
+});
