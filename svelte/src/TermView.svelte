@@ -44,6 +44,16 @@
     parseNewarchHistoryExtension,
     presentNewarchV2,
     fitNewarchFontPx,
+    applyNewarchV2PagerReply,
+    createNewarchV2Pager,
+    historyWindowRange,
+    newarchV2PagerAsk,
+    newarchV2PagerRetain,
+    newarchV2PaneStateLabel,
+    NEWARCH_V2_PAGER_BASE_LINE,
+    type NewarchV2PagerAsk,
+    type NewarchV2PagerState,
+    type NewarchV2StatusNote,
     type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
@@ -103,7 +113,11 @@
     projectToolLines,
     reconcileToolBlockIds,
     type ToolCollapseBlock,
+    NEWARCH_V2_WIRE_LIMITS,
+    newarchV2SamePane,
+    type NewarchV2PaneDescriptor,
   } from '@thumbmux/core';
+  import type { NewarchV2HistoryResult } from './ws-mux.svelte';
 
   type CodexToolMode = 'off' | 'hide';
   type CodexToolProjection = ReturnType<typeof coalesceAdjacentToolProjection>;
@@ -225,6 +239,10 @@
     onFontFit = undefined,
     /** Incident sentence drawn even when this view has no live pane. */
     v2StatusText = null,
+    /** NEWARCH v2 pane of this session. History then pages by the pane's own
+     * cursors (`history_expand_v2`), never by line numbers. Defaults to the
+     * pane the mux learned from the session list. */
+    newarchV2Pane = null,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -279,6 +297,7 @@
     tailClearancePx?: number;
     onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
     v2StatusText?: string | null;
+    newarchV2Pane?: NewarchV2PaneDescriptor | null;
   } = $props();
 
   /**
@@ -589,6 +608,17 @@
   // row text, so copy and search cannot pick a label up as terminal output.
   let historyStatusBefore = $state.raw<readonly HistoryStatusNote[]>([]);
   let historyStatusAfter = $state.raw<readonly HistoryStatusNote[]>([]);
+  // NEWARCH v2 (D3): cursor pager + the incident/pending/stopped sentences it
+  // collected. Drawn as visible notes beside the rows, never as row text.
+  let v2Pager: NewarchV2PagerState | null = null;
+  let v2PagerNotes = $state.raw<readonly NewarchV2StatusNote[]>([]);
+  const v2Notes = $derived.by(() => {
+    const notes: NewarchV2StatusNote[] = [];
+    const paneLabel = newarchV2Pane ? newarchV2PaneStateLabel(newarchV2Pane) : null;
+    if (paneLabel && newarchV2Pane) notes.push({ key: `pane|${newarchV2Pane.state}`, text: paneLabel });
+    for (const note of v2PagerNotes) if (!notes.some(held => held.key === note.key)) notes.push(note);
+    return notes.slice(-HISTORY_STATUS_NOTE_LIMIT);
+  });
   const historyStatus = $derived.by(() => {
     const seen = new Map<string, HistoryStatusNote>();
     for (const note of [...historyStatusBefore, ...historyStatusAfter]) {
@@ -4428,7 +4458,7 @@
       // same wire. Retire that wire first; all mux subscriptions re-arm on the
       // replacement connection and the next eligible scroll can retry safely.
       try {
-        tmuxMux.recoverHistoryRequest(requestSession);
+        if (!tmuxMux.cancelHistoryV2(requestSession)) tmuxMux.recoverHistoryRequest(requestSession);
       } catch {
         // Recovery detaches the ambiguous wire before it attempts a new
         // connection. A host URL/socket failure must not strand local state.
@@ -4454,7 +4484,18 @@
     // Mux rejection (another request owns this session, no open socket, or a
     // failed send) must not leave a phantom request that consumes another
     // caller's broadcast history reply or waits through a pointless timeout.
-    const accepted = direction === 'before'
+    const v2Pane = currentV2Pane();
+    const accepted = v2Pane
+      ? requestV2Page(
+          v2Pane,
+          direction,
+          requestId,
+          requestSession,
+          direction === 'before'
+            ? (historyPaging === 'sliding' ? cursorLine : archiveBeforeLine)
+            : (cursorLine === null ? null : cursorLine + 1),
+        )
+      : direction === 'before'
       ? tmuxMux.requestHistory(
           requestSession,
           historyPaging === 'sliding' ? cursorLine : archiveBeforeLine,
@@ -4473,6 +4514,125 @@
       return false;
     }
     return true;
+  }
+
+  function currentV2Pane(): NewarchV2PaneDescriptor | null {
+    try {
+      return newarchV2Pane ?? tmuxMux.newarchV2Pane(session);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Another pane (or a new timeline) owns this view now: no old cursor or
+   * resident row of the previous pane survives. */
+  function resetV2History(): void {
+    v2Pager = null;
+    v2PagerNotes = [];
+    discardArchiveForAltScreen();
+  }
+
+  function requestV2Page(
+    pane: NewarchV2PaneDescriptor,
+    direction: HistoryWindowDirection,
+    requestId: number,
+    requestSession: string,
+    edgeLine: number | null,
+  ): boolean {
+    if (v2Pager && !newarchV2SamePane(v2Pager.pane.pane, pane.pane)) resetV2History();
+    if (!v2Pager) {
+      v2Pager = createNewarchV2Pager(pane, liveBoundary?.liveStartLine ?? NEWARCH_V2_PAGER_BASE_LINE);
+      if (archiveWindow) {
+        // Rows paged before this pane was known carry no v2 cursor.
+        discardArchiveForAltScreen();
+        edgeLine = null;
+      }
+    } else if (v2Pager.pane !== pane) {
+      v2Pager = { ...v2Pager, pane };
+    }
+    if (archiveWindow) v2Pager = newarchV2PagerRetain(v2Pager, historyWindowRange(archiveWindow));
+    const ask = newarchV2PagerAsk(v2Pager, direction, edgeLine);
+    if (ask.kind === 'end') {
+      if (direction === 'before') {
+        archiveExhausted = true;
+        historyStopReason = 'exhausted';
+      }
+      return false;
+    }
+    if (ask.kind !== 'ask') return false;
+    const pending = tmuxMux.requestHistoryV2(requestSession, pane, {
+      cursor: ask.cursor,
+      direction,
+      maxEntries: NEWARCH_V2_WIRE_LIMITS.pageEntries,
+      maxBytes: NEWARCH_V2_WIRE_LIMITS.pageBytes,
+    });
+    if (!pending) return false;
+    void pending.then(
+      result => receiveV2Result(requestId, requestSession, ask, result),
+      () => receiveV2Result(requestId, requestSession, ask, { kind: 'cancelled' }),
+    );
+    return true;
+  }
+
+  function receiveV2Result(
+    requestId: number,
+    requestSession: string,
+    ask: Extract<NewarchV2PagerAsk, { kind: 'ask' }>,
+    result: NewarchV2HistoryResult,
+  ): void {
+    // Superseded, timed out, or a reply for a session this view left.
+    if (destroyed || archiveInflightRequestId !== requestId || !archiveRequestActive) return;
+    if (requestSession !== session) return;
+    if (result.kind === 'disconnected') {
+      // Same cursor is asked again after reconnect; never an EOF.
+      applyArchiveReadError();
+      return;
+    }
+    if (result.kind === 'cancelled') {
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (result.kind === 'pane-changed') {
+      resetV2History();
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (result.kind === 'mismatch' || !v2Pager) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    const applied = applyNewarchV2PagerReply(v2Pager, ask, result.reply);
+    if (applied.kind === 'reset') {
+      resetV2History();
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (applied.kind === 'refused') {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    v2Pager = applied.state;
+    v2PagerNotes = applied.state.notes;
+    if (applied.kind === 'retry') {
+      applyArchiveReadError();
+      return;
+    }
+    if (applied.lines.length === 0 && applied.hasMore) {
+      // Blocked (pending storage / remote) or incident-only page: the edge
+      // stays open and its sentence is on screen; nothing to draw yet.
+      if (applied.blocked) archiveUnavailable = true;
+      finishArchiveRequest('empty');
+      return;
+    }
+    const startLine = applied.startLine;
+    const endLine = startLine === null ? null : startLine + applied.lines.length;
+    applyArchivedHistory(JSON.stringify({
+      lines: applied.lines,
+      startLine,
+      endLine,
+      hasMore: applied.hasMore,
+      totalArchivedLines: Math.max(v2Pager.baseLine, endLine ?? 0),
+    }));
   }
 
   function requestOlderHistory(): boolean {
@@ -7832,7 +7992,7 @@
       <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
     </div>
   {/if}
-  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable || historyStatus.length > 0}
+  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable || historyStatus.length > 0 || v2Notes.length > 0}
     <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
       {#if lossMarkerPlacement.notes.length > 0}
         {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]!}
@@ -7867,6 +8027,17 @@
           {#if stopLabel}
             <span class="mtv-signpost-text" data-testid="mtv-history-stop">{stopLabel}</span>
           {/if}
+        </div>
+      {/each}
+      {#each v2Notes as note (note.key)}
+        <div
+          class="mtv-loss-note mtv-history-status"
+          role="note"
+          data-testid="mtv-v2-history-note"
+          data-v2-note={note.key}
+          aria-label={note.text}
+        >
+          <span class="mtv-signpost-text">{note.text}</span>
         </div>
       {/each}
       {#if archiveUnavailable}

@@ -5,8 +5,13 @@
 // itself is part of the thumbmux protocol.
 
 import {
+  NEWARCH_V2_SCHEMA,
+  NEWARCH_V2_WIRE_LIMITS,
   muxHistoryBoundaryTransition,
   newarchDeltaContinues,
+  newarchV2CursorFor,
+  newarchV2ReplyMatches,
+  newarchV2SamePane,
   splitMuxOutputData,
   validateMuxHistoryBoundary,
   validateNewarchFrameMeta,
@@ -17,7 +22,39 @@ import {
   type MuxOutputType as OutputType,
   type MuxPaneScreen,
   type MuxServerMessage,
+  type NewarchV2HistoryExpandMessage,
+  type NewarchV2HistoryReply,
+  type NewarchV2HistoryRequest,
+  type NewarchV2PaneDescriptor,
 } from '@thumbmux/core';
+
+/**
+ * Outcome of one v2 history request (K protocol, D3). A reply is delivered
+ * only when it answers exactly the request that was sent on the same socket
+ * (`newarchV2ReplyMatches`). `disconnected` keeps the caller's cursor usable:
+ * the same cursor survives a reconnect; `cancelled` ends with the viewer.
+ */
+export type NewarchV2HistoryResult =
+  | { readonly kind: 'reply'; readonly reply: NewarchV2HistoryReply }
+  | { readonly kind: 'mismatch' }
+  | { readonly kind: 'disconnected' }
+  | { readonly kind: 'cancelled' }
+  /** The session's current pane (from the session list) is another pane. */
+  | { readonly kind: 'pane-changed'; readonly pane: NewarchV2PaneDescriptor };
+
+export type NewarchV2HistoryAsk = Readonly<{
+  cursor: NewarchV2HistoryRequest['cursor'];
+  direction: NewarchV2HistoryRequest['direction'];
+  maxEntries?: number;
+  maxBytes?: number;
+}>;
+
+type V2Inflight = {
+  session: string;
+  socket: WebSocket;
+  message: NewarchV2HistoryExpandMessage;
+  resolve: (result: NewarchV2HistoryResult) => void;
+};
 
 export type MuxDeliveryMeta = {
   source: 'full' | 'delta';
@@ -232,6 +269,11 @@ export class TmuxMux {
    * flush-before-history ordering stays intact.
    */
   private historyFenced = new Set<string>();
+  /** v2 requests by requestId; at most one per session (bounded like legacy). */
+  private v2Inflight = new Map<string, V2Inflight>();
+  private v2RequestSeq = 0;
+  /** Selected v2 pane per session, learned from the session list. */
+  private v2Panes = new Map<string, NewarchV2PaneDescriptor>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -956,6 +998,7 @@ export class TmuxMux {
         }
         if (msg.channel === '__sessions' && msg.type === 'sessions') {
           const sessions = JSON.parse(msg.data);
+          this.learnV2Panes(sessions);
           for (const cb of this.sessionCallbacks) {
             cb(sessions);
           }
@@ -969,6 +1012,10 @@ export class TmuxMux {
         // historyFenced drops late replies so they cannot land on a later
         // subscriber. Unsolicited history (no fence) still delivers — the
         // deferred-queue flush-before-history contract depends on that.
+        if ((msg as { type?: unknown }).type === 'history_v2') {
+          this.receiveHistoryV2(socket, msg as unknown as NewarchV2HistoryReply);
+          return;
+        }
         const retryableHistoryError = isRetryableHistoryErrorFrame(msg);
         if ((msg.type === 'history' || retryableHistoryError) && typeof msg.channel === 'string') {
           const wasInflight = this.historyInflight.get(msg.channel) === socket;
@@ -1147,6 +1194,8 @@ export class TmuxMux {
       this.ws = null;
       this.invalidateAllOutputBases();
     }
+    // A reply can only arrive on the socket that carried its request.
+    this.settleV2Inflight(entry => entry.socket === socket, { kind: 'disconnected' });
     if (close) this.closeSocket(socket);
   }
 
@@ -1238,6 +1287,8 @@ export class TmuxMux {
     this.deferredDeltas.clear();
     this.historyInflight.clear();
     this.historyFenced.clear();
+    this.settleV2Inflight(() => true, { kind: 'cancelled' });
+    this.v2Panes.clear();
     this.opts = {};
   }
 
@@ -1291,6 +1342,7 @@ export class TmuxMux {
           this.historyFenced.add(session);
         }
         this.historyInflight.delete(session);
+        this.settleV2Inflight(entry => entry.session === session, { kind: 'cancelled' });
         this.send(this.ws, { type: 'unsubscribe', session });
       } else {
         this.refreshSubscription(session);
@@ -1374,6 +1426,100 @@ export class TmuxMux {
   /** Page archived capture history forward from an exclusive line anchor. */
   requestHistoryAfter(session: string, afterLine: number | null, limit?: number): boolean {
     return this.sendHistoryRequest(session, { afterLine }, limit);
+  }
+
+  /** The v2 pane the session list last selected for this session, if any. */
+  newarchV2Pane(session: string): NewarchV2PaneDescriptor | null {
+    return this.v2Panes.get(session) ?? null;
+  }
+
+  /**
+   * Ask for one v2 history page of `pane` by its own cursor (K protocol).
+   * A cursor of another pane identity (new session, reused pane id, new
+   * server) is dropped here and never sent. Returns null when nothing was
+   * sent: disposed, no open socket, or a v2 request of this session is
+   * already outstanding.
+   */
+  requestHistoryV2(
+    session: string,
+    pane: NewarchV2PaneDescriptor,
+    ask: NewarchV2HistoryAsk,
+  ): Promise<NewarchV2HistoryResult> | null {
+    if (this.disposed) return null;
+    const known = this.v2Panes.get(session);
+    if (known && !newarchV2SamePane(known.pane, pane.pane)) {
+      return Promise.resolve({ kind: 'pane-changed', pane: known });
+    }
+    for (const entry of this.v2Inflight.values()) if (entry.session === session) return null;
+    const socket = this.ws;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return null;
+    const clamp = (value: number | undefined, max: number) =>
+      typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? Math.min(value, max) : max;
+    const requestId = `v2-${++this.v2RequestSeq}`;
+    const message: NewarchV2HistoryExpandMessage = {
+      type: 'history_expand_v2',
+      session,
+      requestId,
+      request: {
+        schema: NEWARCH_V2_SCHEMA,
+        pane: { ...pane.pane },
+        cursor: newarchV2CursorFor(pane, ask.cursor),
+        direction: ask.direction,
+        maxEntries: clamp(ask.maxEntries, NEWARCH_V2_WIRE_LIMITS.pageEntries),
+        maxBytes: clamp(ask.maxBytes, NEWARCH_V2_WIRE_LIMITS.pageBytes),
+      },
+    };
+    let resolve!: (result: NewarchV2HistoryResult) => void;
+    const settled = new Promise<NewarchV2HistoryResult>(done => { resolve = done; });
+    // Register before send: a synchronous test double may answer inside send.
+    this.v2Inflight.set(requestId, { session, socket, message, resolve });
+    if (!this.send(socket, message)) {
+      this.v2Inflight.delete(requestId);
+      return null;
+    }
+    return settled;
+  }
+
+  /** Settle this session's outstanding v2 request as cancelled (caller timed
+   * out). A late reply then matches no request and is dropped. */
+  cancelHistoryV2(session: string): boolean {
+    const before = this.v2Inflight.size;
+    this.settleV2Inflight(entry => entry.session === session, { kind: 'cancelled' });
+    return this.v2Inflight.size !== before;
+  }
+
+  private receiveHistoryV2(socket: WebSocket, reply: NewarchV2HistoryReply): void {
+    const requestId = typeof reply?.requestId === 'string' ? reply.requestId : null;
+    const entry = requestId === null ? undefined : this.v2Inflight.get(requestId);
+    // Unknown, settled or other-socket request ids are dropped: no late
+    // reply can land on a later request or a later subscriber.
+    if (!entry || entry.socket !== socket) return;
+    this.v2Inflight.delete(requestId!);
+    // Same ordering promise as legacy history: queued screen deltas first.
+    if (this.deferredDeltas.has(entry.session)) this.flushDeferred(entry.session);
+    let matches = false;
+    try { matches = newarchV2ReplyMatches(entry.message, reply); } catch { matches = false; }
+    entry.resolve(matches ? { kind: 'reply', reply } : { kind: 'mismatch' });
+  }
+
+  private settleV2Inflight(pick: (entry: V2Inflight) => boolean, result: NewarchV2HistoryResult): void {
+    for (const [requestId, entry] of [...this.v2Inflight]) {
+      if (!pick(entry)) continue;
+      this.v2Inflight.delete(requestId);
+      entry.resolve(result);
+    }
+  }
+
+  private learnV2Panes(sessions: unknown): void {
+    if (!Array.isArray(sessions)) return;
+    const next = new Map<string, NewarchV2PaneDescriptor>();
+    for (const row of sessions) {
+      const name = (row as { name?: unknown })?.name;
+      const selection = (row as { newarchV2?: { kind?: unknown; pane?: NewarchV2PaneDescriptor } })?.newarchV2;
+      if (typeof name !== 'string' || selection?.kind !== 'selected' || !selection.pane?.pane) continue;
+      next.set(name, selection.pane);
+    }
+    this.v2Panes = next;
   }
 
   /**
