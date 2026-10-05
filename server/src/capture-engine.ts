@@ -1125,6 +1125,7 @@ function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.lengt
   acceptScroll?: (row:RowContent, offset:number, index:number)=>boolean):
   {state:VtState;scrolls:RowContent[];offsets:number[];rowBoundary:number|null} {
   if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
+  state=v2Immutable(state);
   const cloneBuffer=(b:VtBuffer)=>({...b,rows:[...b.rows],cursor:{...b.cursor},savedCursor:{...b.savedCursor},
     savedAttributes:[...b.savedAttributes],savedModes:{...b.savedModes}});
   const s={...state,normal:cloneBuffer(state.normal),alternate:cloneBuffer(state.alternate),
@@ -1145,7 +1146,7 @@ function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.lengt
   const row=()=>{
     const b=active(),y=cursor().y,r=b.rows[y]!;
     if(writableRows.has(r))return r;
-    const copy={...r,cells:r.cells.map(c=>({...c,style:[...c.style]})),uncertainFields:[...r.uncertainFields]};
+    const copy={...r,cells:[...r.cells],uncertainFields:[...r.uncertainFields]};
     writableRows.add(copy);b.rows[y]=copy;return copy;
   };
   const eraseStyle=()=>semanticStyleToSgr({...sgrToSemanticStyle(s.attributes),attrs:0,fg:-1});
@@ -1188,7 +1189,8 @@ function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.lengt
     if(width===0 || cp===0xfe0f) {
       let x=active().wrapPending ? cursor().x : cursor().x-1;
       if(row().cells[x]?.width===0)x--;
-      const previous=row().cells[x];if(!previous)throw Error('orphan combining character');
+      const r=row(),cell=r.cells[x];if(!cell)throw Error('orphan combining character');
+      const previous={...cell,style:[...cell.style]};r.cells[x]=previous;
       if(Buffer.byteLength(previous.text)+Buffer.byteLength(text)>4096)throw Error('grapheme budget');
       previous.text+=text;
       if(cp===0xfe0f && previous.width===1){
