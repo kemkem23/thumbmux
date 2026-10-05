@@ -1785,7 +1785,8 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
 import { v2BirthCheckpoint, evaluateV2Prefix, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
 import { V2Jigsaw } from '../src/stream-runtime';
 import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
-import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, v2BirthGeometry, v2Digest, validateV2Incident,
+import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, NEWARCH_V2_PREFIX_LIMITS, streamCanonical,
+  v2BirthGeometry, v2DecodePrefixValid, v2Digest, v2RowsSerializedBytes, validateV2Incident,
   type NewarchV2PaneDescriptor, type V2AuditEvidence, type V2LiveCheckpoint } from '../src/stream-contract';
 const v2Pane:NewarchV2PaneDescriptor={schema:'newarch-v2',session:{serverIdentity:'c-private',sessionId:'s'},
   pane:{serverIdentity:'c-private',paneId:'%1',birthGeneration:1},windowId:'@1',owner:'capture-engine',
@@ -2087,7 +2088,7 @@ describe('Q22 C definite rejection and proposal isolation',()=>{
 
 describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
   const config78={...v2Config,geometry:{columns:78,rows:120}};
-  const geometry=SC.v2BirthGeometry(config78);
+  const geometry=v2BirthGeometry(config78);
   const pane={...v2Pane,geometry};
   const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config78);
   const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
@@ -2102,11 +2103,11 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
           bytes:[...raw.subarray(offeredStart,packetEnd)],observedAtMonoMs:1,pendingSinceMonoMs:null};
         const result=evaluateV2Prefix(input,config78,v2Clock);
         if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
-        expect(SC.v2DecodePrefixValid(result,cp)).toBe(true);
-        expect(result.rows.length).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxRows);
-        expect(result.serializedBytes).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
-        expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
-        expect(Buffer.byteLength(SC.streamCanonical(result.checkpoint))).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
+        expect(v2DecodePrefixValid(result,cp)).toBe(true);
+        expect(result.rows.length).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRows);
+        expect(result.serializedBytes).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
+        expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
+        expect(Buffer.byteLength(streamCanonical(result.checkpoint))).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
         for(const row of result.rows) expect(row.cellOrigins).toHaveLength(row.cells.length);
         prefixes.push(result);rows.push(...result.rows);cp=result.checkpoint;offeredStart=result.consumed.end;
       }
@@ -2130,7 +2131,7 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
   test('newline-only, full-width and repeated content use canonical size without losing provenance',()=>{
     for(const raw of [Buffer.from('\n'.repeat(1024)+'SENTINEL-B1\r\n'),numbered(1024,()=> '界'.repeat(39)),numbered(1024,()=> 'same')]) {
       const decoded=decodePackets(raw);
-      expect(decoded.prefixes.every(prefix=>prefix.serializedBytes===SC.v2RowsSerializedBytes(prefix.rows))).toBe(true);
+      expect(decoded.prefixes.every(prefix=>prefix.serializedBytes===v2RowsSerializedBytes(prefix.rows))).toBe(true);
       expect(decoded.prefixes.flatMap(prefix=>prefix.rows).every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
     }
   });
