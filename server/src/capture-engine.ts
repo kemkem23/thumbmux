@@ -1131,7 +1131,8 @@ function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.lengt
       else {
         const removed=b.rows.splice(top,1)[0]!; b.rows.splice(bottom,0,blank());
         if(s.active==='normal' && top===0 && bottom===rows-1){out.push(removed);offsets.push(offset);
-          if(out.length>V2L.pendingRowsPerPane || size(out)>V2L.pendingBytesPerPane) throw Error('decoded row budget');}
+          if(out.length>V2L.pendingRowsPerPane || maxScrollRows===Infinity && size(out)>V2L.pendingBytesPerPane)
+            throw Error('decoded row budget');}
       }
     }
   };
@@ -1328,16 +1329,17 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
         uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
     });
     const probeRows=materialize(probe.scrolls,probe.offsets);
-    let serializedBoundary:number|null=null;
-    for(let count=1;count<=probeRows.length;count++) if(v2RowsSerializedBytes(probeRows.slice(0,count))>L.maxSerializedBytes) {
-      const trigger=probe.offsets[count-1]!;
-      serializedBoundary=trigger-1;break;
+    let serializedBoundary:number|null=null,probeSerializedBytes=2;
+    for(let index=0;index<probeRows.length;index++) {
+      const candidate=probeSerializedBytes+(index===0?0:1)+Buffer.byteLength(streamCanonical(probeRows[index]!));
+      if(candidate>L.maxSerializedBytes){serializedBoundary=probe.offsets[index]!-1;break;}
+      probeSerializedBytes=candidate;
     }
     let consumed=rawCap,stop:V2PrefixStop=input.bytes.length>rawCap?'raw-bytes':'complete';
     if(probe.rowBoundary!==null && probe.rowBoundary<=consumed){consumed=probe.rowBoundary;stop='rows';}
     if(serializedBoundary!==null && serializedBoundary<=consumed){consumed=serializedBoundary;stop='serialized-bytes';}
     if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
-    const decoded=v2Decode(cp.state,input.bytes,consumed);
+    const decoded=v2Decode(cp.state,input.bytes,consumed,L.maxRows);
     if(decoded.rowBoundary!==null)throw Error('materialized prefix row boundary');
     const rows=materialize(decoded.scrolls,decoded.offsets),serializedBytes=v2RowsSerializedBytes(rows);
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');

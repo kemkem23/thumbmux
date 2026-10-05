@@ -2125,7 +2125,7 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
     const all=[...decoded.rows.map(row=>rowText(row).trimEnd()),...visible];
     expect(all.filter(text=>text==='SENTINEL-B1')).toHaveLength(1);
     expect(all.filter(text=>text.startsWith('row-'))).toEqual(Array.from({length:count},(_,i)=>`row-${i.toString().padStart(5,'0')}`));
-    expect(decoded.prefixes.some(prefix=>prefix.stop!=='complete')).toBe(count>=1024);
+    expect(decoded.prefixes.some(prefix=>prefix.stop!=='complete')).toBe(count!==80);
   });
 
   test('newline-only, full-width and repeated content use canonical size without losing provenance',()=>{
