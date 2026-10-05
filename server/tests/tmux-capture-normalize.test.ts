@@ -2140,6 +2140,13 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
     }
   });
 
+  test('a page boundary before a multi-row CSI keeps only replayed scrolls',()=>{
+    const decoded=decodePackets(Buffer.from('\x1b[20S'.repeat(10)));
+    expect(decoded.rows).toHaveLength(200);
+    expect(decoded.rows.map(row=>row.id.rowOrdinal)).toEqual(Array.from({length:200},(_,i)=>i));
+    expect(decoded.stopCount).toBeGreaterThan(0);
+  });
+
   test('Thai, emoji, ANSI and CR agree for one packet and every split boundary',()=>{
     const lead='lead\r\n'.repeat(120);
     const tail='ไทยก้😃\r\n\x1b[31mแดง界\x1b[0m\rprogress\rDONE\x1b[K\r\nSENTINEL-B1\r\n';

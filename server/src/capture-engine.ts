@@ -21,8 +21,11 @@ const sameIdentity = (a: StreamIdentity, b: StreamIdentity): boolean => samePane
 const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
 function immutable<T>(value: T): T {
   const copy = structuredClone(value);
+  const seen=new WeakSet<object>();
   function freeze(v: unknown): void {
-    if (v && typeof v === 'object') { for (const child of Object.values(v)) freeze(child); Object.freeze(v); }
+    if (v && typeof v === 'object' && !seen.has(v)) {
+      seen.add(v); for (const child of Object.values(v)) freeze(child); Object.freeze(v);
+    }
   }
   freeze(copy); return copy;
 }
@@ -1024,7 +1027,7 @@ export class CaptureCadence {
 import { charCellWidth } from '@thumbmux/core';
 import {
   NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG,
-  v2Digest, v2RowsSerializedBytes,
+  v2Digest,
   v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
   type V2DecodePrefix, type V2PrefixStop, type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
@@ -1291,20 +1294,18 @@ export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'ga
  * caller keeps the unconsumed suffix in its durable spool. */
 export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
   context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
-  let last=performance.now(); const timings:Record<string,number>={};
-  const mark=(name:string)=>{const now=performance.now();timings[name]=now-last;last=now;};
   const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
-  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
-    bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
-    checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
-  mark('inputDigest');
   const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
+    // Evidence belongs to a gap, not each successful prefix of the same offer.
+    const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
+      bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
+      checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
     const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
     return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
   };
   const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
   try {
-    validateV2Checkpoint(cp);mark('validateInput');
+    validateV2Checkpoint(cp);
     const durableRevision=context.durableRevision??cp.revision;
     if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
     if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
@@ -1324,51 +1325,50 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
       ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
     const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
-    mark('preflight');
     const probe=v2Decode(cp.state,input.bytes,rawCap,L.maxRows);
-    mark('probeDecode');
     const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
       const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
       return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
         buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
         uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
     };
-    const materialize=(scrolls:readonly RowContent[],offsets:readonly number[]):CommittedStreamRow[]=>
-      scrolls.map((r,i)=>materializeOne(r,offsets[i]!,i));
-    const probeRows:CommittedStreamRow[]=[];
+    const probeRows:CommittedStreamRow[]=[],serializedEnds:number[]=[2];
     let serializedBoundary:number|null=null,probeSerializedBytes=2;
     for(let index=0;index<probe.scrolls.length;index++) {
       const row=materializeOne(probe.scrolls[index]!,probe.offsets[index]!,index);
-      const candidate=probeSerializedBytes+(index===0?0:1)+Buffer.byteLength(streamCanonical(row));
+      // Every cell has this exact origin; count its canonical encoding once,
+      // but retain all origins in the returned row and on the wire.
+      const originBytes=Buffer.byteLength(streamCanonical(row.origin)),cells=row.cellOrigins.length;
+      const rowBytes=Buffer.byteLength(streamCanonical({...row,cellOrigins:[]}))
+        +cells*originBytes+Math.max(0,cells-1);
+      const candidate=probeSerializedBytes+(index===0?0:1)+rowBytes;
       if(candidate>L.maxSerializedBytes){serializedBoundary=probe.offsets[index]!-1;break;}
-      probeRows.push(row);probeSerializedBytes=candidate;
+      probeRows.push(row);probeSerializedBytes=candidate;serializedEnds.push(candidate);
     }
-    mark('probeMaterialize');
     let consumed=rawCap,stop:V2PrefixStop=input.bytes.length>rawCap?'raw-bytes':'complete';
     if(probe.rowBoundary!==null && probe.rowBoundary<=consumed){consumed=probe.rowBoundary;stop='rows';}
     if(serializedBoundary!==null && serializedBoundary<=consumed){consumed=serializedBoundary;stop='serialized-bytes';}
     if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
     const decoded=consumed===rawCap && probe.rowBoundary===null && serializedBoundary===null
       ? probe:v2Decode(cp.state,input.bytes,consumed,L.maxRows);
-    mark('finalDecode');
     if(decoded.rowBoundary!==null)throw Error('materialized prefix row boundary');
-    const rows=decoded===probe?probeRows:materialize(decoded.scrolls,decoded.offsets);
-    const serializedBytes=decoded===probe?probeSerializedBytes:v2RowsSerializedBytes(rows);
+    // Re-decoding certifies the state at the boundary. Its scrolls are the
+    // same ordered prefix, so reuse the already materialized rows and sizes.
+    // A multi-row CSI can put several scrolls at one offset: keep only those
+    // actually present after replay, not all rows provisionally sized above.
+    const rows=probeRows.slice(0,decoded.scrolls.length);
+    const serializedBytes=serializedEnds[rows.length]!;
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
-    mark('finalMaterialize');
     const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
     const checkpoint:V2LiveCheckpoint={...cp,
       checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,replayFloor:through,revision,
       frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
       pending:{rows:[],bytes:0,deadlineMonoMs:null}};
-    mark('checkpointDigest');
-    validateV2Checkpoint(checkpoint);mark('validateOutput');
+    validateV2Checkpoint(checkpoint);
     const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
     const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
       serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
-    const result=immutable(prefix);mark('immutable');
-    console.log('B1_PROFILE',JSON.stringify({offered:input.bytes.length,consumed,rows:rows.length,timings}));
-    return result;
+    return immutable(prefix);
   }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
 
