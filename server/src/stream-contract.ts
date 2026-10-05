@@ -1436,7 +1436,7 @@ export function v2AuditComparable(e: V2AuditEvidence, current: V2AuditWatermark,
 export interface V2Batch {
   readonly rows: readonly CommittedStreamRow[]; readonly decisions: readonly V2RuleResult[];
   readonly incidents: readonly NewarchV2Incident[]; readonly checkpoint: V2LiveCheckpoint;
-  readonly input: SpoolAck;
+  readonly input: V2BatchInput;
 }
 export interface V2RemoteLocator {
   readonly pane: PaneKey; readonly segmentId: string; readonly sealed: LogicalSealR2;
@@ -1507,6 +1507,7 @@ export function v2TrimWithinCheckpoint(a: V2TrimAuthorization): boolean {
   const c = a.checkpoint, r = a.receipt;
   const positions = [c.through, c.replayFloor, a.consumerAck.through, a.trimThrough];
   return a.schema === NEWARCH_V2_VERSION && r.schema === NEWARCH_V2_VERSION
+    && a.consumerAck.kind === 'synced-spool' && a.consumerAck.version === 1
     && r.kind === 'ssot-durable' && r.checkpointId === c.checkpointId && r.revision === c.revision
     && v2PaneKey(r.pane) === v2PaneKey(c.pane)
     && positions.every(p => Number.isSafeInteger(p.byteOffset) && p.byteOffset >= 0
@@ -1864,6 +1865,124 @@ export interface V2SourcePrefixReceipt {
 export function v2SourcePrefixReceiptDigest(r: Omit<V2SourcePrefixReceipt, 'digest'>): Digest {
   return v2Digest('source-prefix-receipt', r);
 }
+/** Batch evidence is independent of consumer ACK. Only S issues either arm.
+ * H reads the exact issued object synchronously INSIDE its write transaction.
+ * No public note/set API: the S-owned bounded cache is populated only by a
+ * successful collector RPC; retain pending inputs until commit/retry settles.
+ * Missing/evicted/error is refusal, never permission to re-hash host input. */
+export type V2BatchInput = SpoolAck | V2SourcePrefixReceipt;
+export interface V2IssuedInputAuthority {
+  inputReceipt(input: V2BatchInput): Result<V2BatchInput | null>;
+}
+/** Pure exact-input check, not authentication. `issued` must be read directly
+ * from S's authority, never supplied by the host or inferred from a digest.
+ * H still checks capability, revision, row/frontier/budgets and atomicity.
+ * The record branch retains the old exact-ACK/checkpoint semantics. */
+export function v2BatchInputMatchesIssued(input: V2BatchInput, issued: V2BatchInput | null,
+  previous: V2LiveCheckpoint, checkpoint: V2LiveCheckpoint): boolean {
+  return v2Guard(() => {
+    if (issued === null || !sameContract(input, issued)) return false;
+    const epoch = checkpoint.through.epoch;
+    if (input.kind === 'synced-spool') {
+      return input.version === 1 && sameContract(input.through, checkpoint.through);
+    }
+    if (input.kind !== 'source-prefix' || input.schema !== NEWARCH_V2_VERSION) return false;
+    validateV2Checkpoint(previous); validateV2Checkpoint(checkpoint);
+    const { digest, ...unsigned } = input;
+    if (digest !== v2SourcePrefixReceiptDigest(unsigned)) return false;
+    v2Text(input.receiptId); contractHash(input.lastRecordDigest);
+    for (const n of [input.certified.start, input.certified.end, input.firstSequence,
+      input.lastSequence, input.lastRecordEnd]) v2Int(n);
+    return v2PaneKey(previous.pane) === v2PaneKey(checkpoint.pane)
+      && v2SameEpoch(previous.through.epoch, epoch) && v2SameEpoch(input.certified.epoch, epoch)
+      && sameContract(input.sourceEpoch, v2SourceEpochOf(epoch))
+      && input.certified.start === previous.through.byteOffset
+      && input.certified.end === checkpoint.through.byteOffset
+      && input.certified.end > input.certified.start
+      && input.certified.end - input.certified.start <= NEWARCH_V2_PREFIX_LIMITS.maxRawBytes
+      && input.lastRecordEnd >= input.certified.end && input.firstSequence <= input.lastSequence;
+  });
+}
+
+/** V2 indexed replay includes the WHOLE containing record in every budget.
+ * These caps fit the existing 256 KiB collector RPC frame (4 KiB envelope
+ * reserve). No first-record exception. BS must measure before materializing,
+ * seek with the (id,start) index, and verify length/digest/chain/pane/epoch
+ * including bytes before requested. Only then may the adapter slice at
+ * requested.byteOffset - record.range.start; the slice is NOT a SpoolRecord.
+ * The complete record ACK is collector-issued, never reconstructed by host. */
+export const V2_CONTAINING_REPLAY_LIMITS = Object.freeze({
+  recordBytes: 16 * 1024, maxRecords: 16, maxRawBytes: 64 * 1024,
+  maxSerializedBytes: 256 * 1024 - 4096,
+} as const);
+export interface V2ContainingReplayBudget {
+  readonly maxRecords: number; readonly maxRawBytes: number; readonly maxSerializedBytes: number;
+}
+export interface V2ContainingRecord {
+  readonly record: SpoolRecord; readonly ack: SpoolAck;
+}
+export type V2ContainingReplay =
+  | { readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'records'; readonly requested: RawPosition;
+      readonly records: readonly V2ContainingRecord[]; readonly next: RawPosition; readonly atDurableHead: boolean }
+  | { readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'below-floor'; readonly requested: RawPosition;
+      readonly retained: TrimReceiptR2 }
+  | { readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'budget-required'; readonly requested: RawPosition;
+      /** Minimum for one complete record, within the hard caps. Above-hard-cap
+       * data is an integrity error, not an invitation to increase limits. */
+      readonly minimum: V2ContainingReplayBudget };
+export interface V2ContainingReplayPort {
+  replayContaining(binding: Binding, requested: RawPosition,
+    budget: V2ContainingReplayBudget): Promise<Result<V2ContainingReplay>>;
+}
+export function v2ContainingReplayBudgetValid(b: V2ContainingReplayBudget): boolean {
+  return v2Guard(() => {
+    v2Int(b.maxRecords, 1, V2_CONTAINING_REPLAY_LIMITS.maxRecords);
+    v2Int(b.maxRawBytes, 1, V2_CONTAINING_REPLAY_LIMITS.maxRawBytes);
+    v2Int(b.maxSerializedBytes, 1, V2_CONTAINING_REPLAY_LIMITS.maxSerializedBytes);
+    return true;
+  });
+}
+
+/** Client-side verification of a bounded records reply before slicing. Does
+ * not authenticate ACK origin: BS must receive this reply from its collector.
+ * Service must enforce the same bounds BEFORE allocation/query materialization.
+ * Typed below-floor/budget-required are refusals, not successful EOF. */
+export function v2ContainingReplayRecordsValid(reply: V2ContainingReplay,
+  requested: RawPosition, budget: V2ContainingReplayBudget): boolean {
+  return v2Guard(() => {
+    if (!v2ContainingReplayBudgetValid(budget) || reply.schema !== NEWARCH_V2_VERSION
+      || reply.kind !== 'records' || !sameContract(reply.requested, requested)
+      || !v2SameEpoch(reply.next.epoch, requested.epoch)
+      || reply.records.length > budget.maxRecords) return false;
+    v2Int(requested.byteOffset); v2Int(reply.next.byteOffset);
+    v2PaneKey(requested.epoch.pane);
+    let previous: SpoolRecord | null = null, bytes = 0, next = requested.byteOffset;
+    for (const entry of reply.records) {
+      const r = entry.record, a = entry.ack;
+      if (r.version !== 1 || r.payload.kind !== 'bytes' || !v2SameEpoch(r.range.epoch, requested.epoch)) return false;
+      v2Int(r.range.start); v2Int(r.range.end); v2Int(r.sequence);
+      v2Text(r.operationId); v2Text(a.segmentId);
+      const count = r.range.end - r.range.start;
+      if (count < 1 || count > V2_CONTAINING_REPLAY_LIMITS.recordBytes || r.payload.bytes.length !== count
+        || r.payload.bytes.some(b => !Number.isInteger(b) || b < 0 || b > 255)) return false;
+      bytes += count;
+      if (bytes > budget.maxRawBytes) return false;
+      const { digest, ...unsigned } = r;
+      contractHash(digest); if (r.previousDigest !== null) contractHash(r.previousDigest);
+      if (digest !== sourceSpoolDigest(unsigned)) return false;
+      if (previous === null) {
+        if (r.range.start > requested.byteOffset || r.range.end <= requested.byteOffset) return false;
+      } else if (r.range.start !== previous.range.end || r.sequence !== previous.sequence + 1
+        || r.previousDigest !== previous.digest) return false;
+      if (a.kind !== 'synced-spool' || a.version !== 1 || a.commitId !== r.operationId
+        || a.recordDigest !== digest || !sameContract(a.through, { epoch: r.range.epoch, byteOffset: r.range.end })) return false;
+      previous = r; next = r.range.end;
+    }
+    return reply.next.byteOffset === next && (reply.records.length > 0 || reply.atDurableHead === true)
+      && Buffer.byteLength(JSON.stringify(reply)) <= budget.maxSerializedBytes;
+  });
+}
+
 /** What the host sends back after H committed a prefix. through is EXACTLY the
  * committed checkpoint.through: never the record end, never beyond. A prefix
  * that stops mid-record is recordComplete=false and S keeps the record tail. */
@@ -2068,6 +2187,36 @@ export function v2IncidentResolvedBy(r: V2IncidentResolution | null, incidentId:
     && sameContract(r.receipt, receipt) && receipt.kind === 'ssot-durable'
     && r.writerGeneration === current && receipt.generation === current);
 }
+/** Read-only observation from the CURRENT H engine, not a new durable
+ * receipt, ACK, trim authorization or resume proof. The original resolution
+ * and receipt remain unchanged even when authorizedGeneration has advanced. */
+export interface V2ReserveRearmObservation {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly purpose: 'reserve-rearm';
+  readonly pane: PaneKey; readonly incidentId: string; readonly incidentDigest: Digest;
+  readonly resolvedReceipt: V2Receipt; readonly authorizedGeneration: V2WriterGeneration;
+}
+/** Structural check only. Transport must read reserveRearm AND the exact
+ * receipt directly from live H on EVERY attempt under the pane queue; no await
+ * may release the writer lifetime between generation check and RPC dispatch.
+ * Null/error/closed authority refuses. A cached observation or true callback
+ * cannot substitute for those reads. Old ACK/trim guards remain unchanged. */
+export function v2ReserveRearmAllowed(observation: V2ReserveRearmObservation | null,
+  pane: PaneKey, incidentId: string, incidentDigest: Digest, receipt: V2Receipt,
+  current: V2WriterGeneration): boolean {
+  return v2Guard(() => {
+    if (observation === null) return false;
+    v2Int(current, 1); v2Int(receipt.generation, 1); v2Int(receipt.revision);
+    v2Text(incidentId); contractHash(incidentDigest); contractHash(receipt.digest);
+    v2Text(receipt.operationId); v2Text(receipt.commitId);
+    return observation.schema === NEWARCH_V2_VERSION && observation.purpose === 'reserve-rearm'
+      && v2PaneKey(observation.pane) === v2PaneKey(pane) && v2PaneKey(receipt.pane) === v2PaneKey(pane)
+      && observation.incidentId === incidentId && observation.incidentDigest === incidentDigest
+      && sameContract(observation.resolvedReceipt, receipt)
+      && observation.authorizedGeneration === current
+      && receipt.schema === NEWARCH_V2_VERSION && receipt.kind === 'ssot-durable'
+      && receipt.generation <= current;
+  });
+}
 /** Raw pins are readers of raw spool bytes (replay, decoder checkpoint, audit,
  * export). Row/segment pins are counted separately and never block raw trim. */
 export type V2RawPinHolder = 'replay' | 'decoder-checkpoint' | 'audit' | 'export';
@@ -2090,6 +2239,13 @@ export function v2RawTrimUnpinned(a: V2TrimAuthorization, census: V2RawPinCensus
  * V2SourceOptions.trimUnpinned / incidentResolved callbacks. */
 export interface V2HistoryAuthority {
   writerGeneration(): Result<V2WriterGeneration>;
+  /** Read transaction checks live internal cap/expectedGeneration, stored
+   * resolved incident id/digest/revision and exact receipt readback/checksum.
+   * stored writerGeneration must equal the ORIGINAL receipt generation.
+   * No write/refresh/no-op commit. Missing resolution returns null; errors
+   * refuse. Consumers must never turn null/error into an armed reserve. */
+  reserveRearm(pane: PaneKey, incidentId: string,
+    expectedGeneration: V2WriterGeneration): Result<V2ReserveRearmObservation | null>;
   incidentResolution(pane: PaneKey, incidentId: string): Result<V2IncidentResolution | null>;
   rawPins(pane: PaneKey, epoch: PipeEpoch): Result<V2RawPinCensus>;
 }
