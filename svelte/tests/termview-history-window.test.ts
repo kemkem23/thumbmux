@@ -175,6 +175,7 @@ function mountTermView(options: {
   fontFit?: "auto" | "manual";
   tailClearancePx?: number;
   onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
+  newarchV2Pane?: unknown;
 } = {}): Mounted {
   const width = options.viewportWidth ?? 320;
   const target = document.createElement("div");
@@ -195,6 +196,7 @@ function mountTermView(options: {
     ...(options.fontFit ? { fontFit: options.fontFit } : {}),
     ...(options.tailClearancePx !== undefined ? { tailClearancePx: options.tailClearancePx } : {}),
     ...(options.onFontFit ? { onFontFit: options.onFontFit } : {}),
+    ...(options.newarchV2Pane ? { newarchV2Pane: options.newarchV2Pane } : {}),
     ...(options.mode && options.mode !== "off"
       ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
       : {}),
@@ -3049,5 +3051,344 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
     await settleUi();
     expect(layerTranslateY(view.viewport)).toBe(0);
+  });
+});
+
+// --- D3 (flag-on 2026-10-05): the v2 cursor walks all the way to the screen ---
+
+describe("NEWARCH v2 cursor history on the screen (D3)", () => {
+  type V2Pane = { serverIdentity: string; paneId: string; birthGeneration: number };
+  type V2Call = { session: string; pane: V2Pane; cursor: { token: string; pane: V2Pane } | null; direction: "before" | "after"; maxEntries?: number; settle: (result: unknown) => void };
+  const PANE_A: V2Pane = { serverIdentity: "srv-1", paneId: "%1", birthGeneration: 1 };
+  const PANE_B: V2Pane = { serverIdentity: "srv-1", paneId: "%2", birthGeneration: 1 };
+  const GEOMETRY = { policy: "fixed-at-birth", columns: 78, rows: 120, configVersion: "q22-default-1", panesPerWindow: 1 };
+  const WIDE = "x".repeat(12_000);
+  let calls: V2Call[] = [];
+  let cancels = 0;
+  let original: Record<string, unknown> = {};
+
+  function descriptor(pane: V2Pane, state = "active") {
+    return {
+      schema: "newarch-v2", session: { serverIdentity: pane.serverIdentity, sessionId: `s-${pane.paneId}` }, pane,
+      windowId: `@${pane.paneId}`, owner: "capture-engine", birthOperationId: `birth-${pane.paneId}`, geometry: GEOMETRY, state,
+    };
+  }
+
+  function cursor(pane: V2Pane, token: string) {
+    return { schema: "newarch-v2", pane, storeId: "local", timelineRevision: 2, token };
+  }
+
+  function row(pane: V2Pane, ordinal: number, wide = true) {
+    return { kind: "row", id: { pane, segmentId: "seg", rowOrdinal: ordinal }, cells: [{ text: `r${ordinal}-${wide ? WIDE : ""}`, width: 1, style: [] }], wrapStatus: "unwrapped", wrapPad: 0 };
+  }
+
+  function incident(pane: V2Pane, collecting: boolean) {
+    return {
+      schema: "newarch-v2", incidentId: "inc-first", pane, reason: "pipe-eof", frontier: null,
+      affected: { after: null, through: null }, openedAtWallMs: Date.UTC(2026, 9, 4, 1, 2, 3), openedAtMonoMs: 1, clockEpoch: "e",
+      collecting, missing: { countKind: "unknown", missingCount: null }, ruleVersion: "r@1", configVersion: "q22-default-1",
+      geometry: GEOMETRY, revision: 1, sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+      action: collecting ? "annotate" : "gap-and-stop", evidence: null,
+    };
+  }
+
+  /** Server-side store of rows 1..total; cursors name an ordinal boundary. */
+  function storeReply(call: V2Call, total: number, pageRows = 256, wide = true) {
+    let first: number;
+    let last: number;
+    if (call.direction === "before") {
+      const bound = call.cursor ? Number(call.cursor.token.slice(2)) : total + 1;
+      last = bound - 1;
+      first = Math.max(1, bound - pageRows);
+    } else {
+      const bound = Number(call.cursor!.token.slice(2));
+      first = bound + 1;
+      last = Math.min(total, bound + pageRows);
+    }
+    const ordinals = Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => first + i);
+    return {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: call.pane,
+        revision: 2, entries: ordinals.map(n => row(call.pane, n, wide)), payloadBytes: 1, states: [{ kind: "exact", auditedRevision: 2 }],
+        before: first > 1 ? { kind: "more", cursor: cursor(call.pane, `b:${first}`) } : { kind: "end" },
+        after: last < total ? { kind: "more", cursor: cursor(call.pane, `a:${last}`) } : { kind: "end" },
+      },
+    };
+  }
+
+  async function answer(call: V2Call, result: unknown) {
+    call.settle(result);
+    await settleUi();
+    await settleUi();
+  }
+
+  function ordinalsOnScreen(): number[] {
+    const lines = deliveredLines.at(-1) ?? [];
+    return lines.map(line => /^r(\d+)-/.exec(line)?.[1]).filter((m): m is string => m !== undefined).map(Number);
+  }
+
+  function noteTexts(target: HTMLElement): string[] {
+    return Array.from(target.querySelectorAll('[data-testid="mtv-v2-history-note"]')).map(node => node.textContent ?? "");
+  }
+
+  beforeEach(() => {
+    calls = [];
+    cancels = 0;
+    const mux = tmuxMux as unknown as Record<string, unknown>;
+    original = { requestHistoryV2: mux.requestHistoryV2, newarchV2Pane: mux.newarchV2Pane, cancelHistoryV2: mux.cancelHistoryV2 };
+    mux.requestHistoryV2 = (session: string, pane: { pane: V2Pane }, ask: { cursor: V2Call["cursor"]; direction: "before" | "after"; maxEntries?: number }) => {
+      // the real mux drops a cursor of another pane; the fake records what TermView asked
+      return new Promise(settle => calls.push({ session, pane: pane.pane, cursor: ask.cursor, direction: ask.direction, maxEntries: ask.maxEntries, settle }));
+    };
+    mux.newarchV2Pane = () => null;
+    mux.cancelHistoryV2 = () => { cancels++; return true; };
+  });
+
+  afterEach(() => {
+    Object.assign(tmuxMux as unknown as Record<string, unknown>, original);
+  });
+
+  test("scrolls back across three v2 pages and forward again; each row once, in order, by the pane's own cursors", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    const total = 900;
+    for (let page = 0; page < 3; page++) {
+      wheel(viewport, -1_000_000);
+      const call = calls.at(-1)!;
+      expect(calls).toHaveLength(page + 1);
+      expect(call.direction).toBe("before");
+      expect(call.maxEntries).toBe(256);
+      expect(call.cursor?.token ?? null).toBe(page === 0 ? null : `b:${total + 1 - 256 * page}`);
+      await answer(call, storeReply(call, total));
+    }
+    expect(historyCalls).toEqual([]);
+    // 3 x 256 wide rows cross the 8 MiB resident budget: the newer side was evicted.
+    expect(viewport.getAttribute("data-history-window-has-newer")).toBe("1");
+    const back = ordinalsOnScreen();
+    expect(back[0]).toBe(133);
+    expect(back).toEqual(Array.from({ length: back.length }, (_, i) => 133 + i));
+    const residentEnd = back.at(-1)!;
+    expect(residentEnd).toBeLessThan(900);
+
+    // forward: the newer edge sits inside an evicted page, so the pager asks from the
+    // nearest boundary it holds a cursor for and the repeated rows must match.
+    wheel(viewport, 1_000_000);
+    const forward = calls.at(-1)!;
+    expect(forward.direction).toBe("after");
+    // which boundary depends on how many wide rows the byte budget kept; it is
+    // always a server cursor at a page edge, never a line number
+    expect(forward.cursor?.token).toMatch(/^a:(388|644)$/);
+    await answer(forward, storeReply(forward, total));
+    const after = ordinalsOnScreen();
+    expect(after).toEqual(Array.from({ length: after.length }, (_, i) => after[0]! + i));
+    expect(after.at(-1)!).toBeGreaterThan(residentEnd);
+    expect(new Set(after).size).toBe(after.length);
+  });
+
+  test("a reconnect is not the end: the same cursor is asked again and the rows land once", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    wheel(viewport, -1_000_000);
+    const lost = calls.at(-1)!;
+    expect(lost.cursor?.token).toBe("b:345");
+    await answer(lost, { kind: "disconnected" });
+    expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+    expect(viewport.getAttribute("data-history-exhausted")).not.toBe("1");
+    wheel(viewport, -1_000_000);
+    const retry = calls.at(-1)!;
+    expect(retry).not.toBe(lost);
+    expect(retry.cursor?.token).toBe("b:345");
+    await answer(retry, storeReply(retry, 600, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(89);
+    expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => 89 + i));
+  });
+
+  test("two panes: switching the view's pane drops the old cursor and rows; the new pane starts from its own tail", async () => {
+    const { viewport, props } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    expect(call.pane).toEqual(PANE_B);
+    expect(call.cursor).toBeNull();
+    await answer(call, storeReply(call, 40, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+    expect(calls.every(c => c.cursor === null || c.cursor.pane.paneId === c.pane.paneId)).toBe(true);
+  });
+
+  test("an incident before the first row, a pending storage fault and a stopped pane are sentences on screen", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A, "stopped") });
+    await tick();
+    deliverOutput(liveLines());
+    expect(noteTexts(target).join("|")).toContain("หยุดเก็บแล้ว");
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const pending = { kind: "storage-unavailable", pendingIncidentId: "pend-1", retryAfterMs: 500 };
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [{ kind: "incident", incident: incident(PANE_A, false) }, row(PANE_A, 1, false), row(PANE_A, 2, false)],
+        payloadBytes: 1, states: [{ kind: "incident", incident: incident(PANE_A, false) }, pending],
+        before: { kind: "blocked", cursor: cursor(PANE_A, "b:1"), state: pending }, after: { kind: "end" },
+      },
+    });
+    const notes = noteTexts(target).join("|");
+    expect(notes).toContain("ก่อนแถวแรก");
+    expect(notes).toContain("ท่อเก็บขาด");
+    expect(notes).toContain("มีเหตุรอบันทึก");
+    expect(notes).toContain("ยังไม่ใช่จุดสิ้นสุด");
+    expect(ordinalsOnScreen()).toEqual([1, 2]);
+    // sentences are outside the rows: copy/search never pick them up
+    const copied = Array.from(viewport.querySelectorAll(".mtv-line")).map(node => node.textContent ?? "").join("\n");
+    expect(copied.includes("ก่อนแถวแรก")).toBe(false);
+    // blocked is not EOF: the next scroll asks again with the blocked cursor
+    wheel(viewport, -1_000_000);
+    expect(calls.at(-1)!.cursor?.token).toBe("b:1");
+  });
+
+  test("a remote/owner fault shows a sentence and keeps the edge open; a stale cursor restarts from the tail", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const remote = { kind: "remote-unavailable", bundleId: "bundle-9", reason: "offline", retryAfterMs: 1000 };
+    let call = calls.at(-1)!;
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [], payloadBytes: 0, states: [remote], before: { kind: "blocked", cursor: cursor(PANE_A, "b:50"), state: remote }, after: { kind: "end" },
+      },
+    });
+    expect(noteTexts(target).join("|")).toContain("ออฟไลน์");
+    expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+    wheel(viewport, -1_000_000);
+    call = calls.at(-1)!;
+    await answer(call, { kind: "reply", reply: { schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "error", pane: PANE_A, code: "owner-unavailable", retryAfterMs: 300 } });
+    expect(noteTexts(target).join("|")).toContain("เจ้าของประวัติยังไม่พร้อม");
+    wheel(viewport, -1_000_000);
+    call = calls.at(-1)!;
+    await answer(call, { kind: "reply", reply: { schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "error", pane: PANE_A, code: "stale-cursor", retryAfterMs: null } });
+    wheel(viewport, -1_000_000);
+    expect(calls.at(-1)!.cursor).toBeNull();
+  });
+
+  test("a page that would duplicate a resident row is refused, not drawn", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const dup = storeReply(call, 600, 256, false) as { reply: { entries: unknown[] } };
+    dup.reply.entries.push(row(PANE_A, 400, false));
+    await answer(call, dup);
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(345);
+    expect(new Set(rows).size).toBe(rows.length);
+  });
+
+  // --- D3-r1 (review agy 2026-10-05) ---
+
+  test("a young session whose live seam is near line 0 still scrolls back through every v2 page", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-young", 0));
+    wheel(viewport, -1_000_000);
+    const first = calls.at(-1)!;
+    expect(first.cursor).toBeNull();
+    await answer(first, storeReply(first, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, -1_000_000);
+    const second = calls.at(-1)!;
+    expect(second.cursor?.token).toBe("b:345");
+    await answer(second, storeReply(second, 600, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(89);
+    expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => 89 + i));
+  });
+
+  test("back at the live tail the old pages are gone: the next scroll back starts from the tail again", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-tail", 1000));
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, 1_000_000);
+    // the seam moves while the reader sits at the tail: the resident archive is cleared
+    deliverOutput(liveLines("live2"), undefined, historyBoundary("g-tail", 1010));
+    expect(ordinalsOnScreen()).toEqual([]);
+    const asked = calls.length;
+    wheel(viewport, -1_000_000);
+    expect(calls.length).toBe(asked + 1);
+    expect(calls.at(-1)!.cursor).toBeNull();
+  });
+
+  test("a pane change clears the old pane's rows and sentences at once, before any scroll", async () => {
+    const { viewport, target, props } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [{ kind: "incident", incident: incident(PANE_A, false) }, row(PANE_A, 1, false), row(PANE_A, 2, false)],
+        payloadBytes: 1, states: [{ kind: "incident", incident: incident(PANE_A, false) }], before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    expect(ordinalsOnScreen()).toEqual([1, 2]);
+    expect(noteTexts(target).join("|")).toContain("ท่อเก็บขาด");
+    expect(viewport.getAttribute("data-history-window-rows")).toBe("2");
+    const asked = calls.length;
+    flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
+    await settleUi();
+    expect(calls.length).toBe(asked);
+    // no resident row of pane A is left in the window, and its sentence is gone
+    expect(viewport.getAttribute("data-history-window-rows")).toBeNull();
+    expect(noteTexts(target).join("|")).not.toContain("ท่อเก็บขาด");
+  });
+
+  test("the pane learned from the session list (no prop) still shows its stopped sentence", async () => {
+    (tmuxMux as unknown as Record<string, unknown>).newarchV2Pane = () => descriptor(PANE_A, "stopped");
+    const { target } = mountTermView();
+    await tick();
+    deliverOutput(liveLines());
+    expect(noteTexts(target).join("|")).toContain("หยุดเก็บแล้ว");
+  });
+
+  test("many incident sentences never push the pane's own stopped sentence off the screen", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A, "stopped") });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const many = Array.from({ length: 8 }, (_, i) => ({ ...incident(PANE_A, false), incidentId: `inc-${i}` }));
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [...many.map(inc => ({ kind: "incident", incident: inc })), row(PANE_A, 1, false)],
+        payloadBytes: 1, states: many.map(inc => ({ kind: "incident", incident: inc })), before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    const notes = noteTexts(target);
+    expect(notes.length).toBeLessThanOrEqual(6);
+    expect(notes.join("|")).toContain("หยุดเก็บแล้ว");
   });
 });

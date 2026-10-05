@@ -34,7 +34,20 @@ import {
   type NewarchV2PaneSelection,
   type SessionListItem,
   type SessionListRow,
+  NEWARCH_V2_SCHEMA,
+  NEWARCH_V2_WIRE_LIMITS,
+  newarchV2ReplyMatches,
+  newarchV2SamePane,
+  type NewarchPaneKey,
+  type NewarchV2Continuation,
+  type NewarchV2HistoryErrorCode,
+  type NewarchV2HistoryExpandMessage,
+  type NewarchV2HistoryReply,
+  type NewarchV2HistoryRequest,
+  type NewarchV2PaneDescriptor,
+  type NewarchV2WireEntry,
 } from "@thumbmux/core";
+import type { Result, V2HistoryPage } from "./stream-contract";
 
 export type WsLike = {
   send(data: string): unknown;
@@ -394,6 +407,11 @@ export type TmuxWsMuxOptions<
    * published on the session row as `newarchV2`; every kind except `missing`
    * makes the window fixed: no resize reaches the driver, whoever asks. */
   newarchV2?: ((session: string) => NewarchV2PaneSelection | null) | null;
+  /** NEWARCH v2 history reader (D1 answers through NewarchV2Display.page).
+   * Serves `history_expand_v2` with the pane's own cursors; legacy
+   * `history_expand` line anchors never reach it. Absent = `unsupported`. */
+  newarchV2History?: ((session: string, request: NewarchV2HistoryRequest) =>
+    Result<V2HistoryPage> | PromiseLike<Result<V2HistoryPage>>) | null;
   hooks?: MuxHooks<WS, SessionRow>;
   profile?: (session: string) => SessionProfile;
   /** live scrollback window (lines) kept in the fast path */
@@ -523,6 +541,7 @@ export class TmuxWsMux<
   private lastAppliedGeometry = new Map<string, { cols: number; rows: number }>();
   private sessionListProvider: () => readonly SessionRow[];
   private readonly newarchV2: ((session: string) => NewarchV2PaneSelection | null) | null;
+  private readonly newarchV2History: TmuxWsMuxOptions<WS, SessionRow>["newarchV2History"];
   /** per-session, per-socket tail preference (undefined = full snapshots) */
   private tails = new Map<string, Map<WS, number>>();
   /** Per-session viewers whose latest subscription opted into delta output frames. */
@@ -571,6 +590,7 @@ export class TmuxWsMux<
     this.archive = opts.archive ?? null;
     this.projection = opts.projection ?? null;
     this.newarchV2 = opts.newarchV2 ?? null;
+    this.newarchV2History = opts.newarchV2History ?? null;
     this.projectionRouteOff = this.projection?.onRouteChange((session) => this.handleProjectionRouteChange(session)) ?? null;
     this.projectionDirtyOff = this.projection?.onLegacyDirty?.((session) => {
       if (this.projection?.owns(session)) return;
@@ -1965,11 +1985,99 @@ export class TmuxWsMux<
     } catch {}
   }
 
+  /** The v2 pane a request may read now, from the same owner account that
+   * fixes the window. `none` is a legacy session or one without a reader. */
+  private newarchV2Readable(session: string, pane: NewarchPaneKey):
+    { kind: "selected"; pane: NewarchV2PaneDescriptor } | { kind: "unavailable"; retryAfterMs: number }
+    | { kind: "wrong-pane" } | { kind: "none" } {
+    if (!this.newarchV2) return { kind: "none" };
+    let selection: NewarchV2PaneSelection | null;
+    try { selection = this.newarchV2(session); } catch { return { kind: "unavailable", retryAfterMs: V2_HISTORY_RETRY_MS }; }
+    if (!selection || selection.kind === "missing") return { kind: "none" };
+    if (selection.kind === "owner-unavailable") return { kind: "unavailable", retryAfterMs: selection.retryAfterMs };
+    const panes = selection.kind === "selected" ? [selection.pane] : selection.panes;
+    const match = panes.find(candidate => newarchV2SamePane(candidate.pane, pane));
+    return match ? { kind: "selected", pane: match } : { kind: "wrong-pane" };
+  }
+
+  /**
+   * D3: one v2 history page addressed by the pane's own cursor (K protocol).
+   * Every refusal is a typed error frame correlated by requestId, never an
+   * empty ok page; a cursor never becomes a line number on this path.
+   */
+  expandHistoryV2(msg: NewarchV2HistoryExpandMessage, ws: WS): void {
+    const session = typeof msg?.session === "string" && msg.session.length > 0 ? msg.session : null;
+    const requestId = typeof msg?.requestId === "string" && msg.requestId.length > 0
+      && msg.requestId.length <= V2_REQUEST_ID_MAX ? msg.requestId : null;
+    const raw = msg?.request as Partial<NewarchV2HistoryRequest> | undefined;
+    // Without a session, request id and pane there is nobody to answer.
+    if (!session || !requestId || !raw || typeof raw !== "object" || !v2PaneKeyValid(raw.pane)) return;
+    const pane = v2PaneCopy(raw.pane);
+    const fail = (code: NewarchV2HistoryErrorCode, retryAfterMs: number | null = null) => this.sendV2Reply(ws, {
+      schema: NEWARCH_V2_SCHEMA, type: "history_v2", channel: session, requestId,
+      status: "error", pane, code, retryAfterMs,
+    });
+    const reader = this.newarchV2History;
+    const readable = this.newarchV2Readable(session, pane);
+    if (!reader || readable.kind === "none" || raw.schema !== NEWARCH_V2_SCHEMA) return fail("unsupported");
+    if (readable.kind === "unavailable") return fail("owner-unavailable", readable.retryAfterMs);
+    if (readable.kind === "wrong-pane") return fail("wrong-pane");
+    const cursor = raw.cursor ?? null;
+    if (cursor !== null && (typeof cursor !== "object" || cursor.schema !== NEWARCH_V2_SCHEMA
+      || !v2PaneKeyValid(cursor.pane) || !newarchV2SamePane(cursor.pane, pane))) return fail("wrong-pane");
+    if ((raw.direction !== "before" && raw.direction !== "after")
+      || !v2IntIn(raw.maxEntries, 1, NEWARCH_V2_WIRE_LIMITS.pageEntries)
+      || !v2IntIn(raw.maxBytes, 1, NEWARCH_V2_WIRE_LIMITS.pageBytes)) return fail("bounded-read");
+    if (cursor !== null && !v2CursorBounded(cursor)) return fail("bounded-read");
+    const request: NewarchV2HistoryRequest = {
+      schema: NEWARCH_V2_SCHEMA, pane, direction: raw.direction,
+      maxEntries: raw.maxEntries!, maxBytes: raw.maxBytes!,
+      cursor: cursor === null ? null : {
+        schema: NEWARCH_V2_SCHEMA, pane: v2PaneCopy(cursor.pane), storeId: cursor.storeId,
+        timelineRevision: cursor.timelineRevision, token: cursor.token,
+      },
+    };
+    const message: NewarchV2HistoryExpandMessage = { type: "history_expand_v2", session, requestId, request };
+    const finish = (result: unknown) => {
+      // An async read may outlive the pane it was asked for (rebirth, new
+      // server): its rows belong to nobody this socket is looking at now.
+      const now = this.newarchV2Readable(session, pane);
+      if (now.kind === "unavailable") return fail("owner-unavailable", now.retryAfterMs);
+      if (now.kind === "none") return fail("unsupported");
+      if (now.kind !== "selected") return fail("wrong-pane");
+      let reply: NewarchV2HistoryReply;
+      try { reply = v2ReplyFromRead(message, result); } catch { return fail("owner-unavailable", V2_HISTORY_RETRY_MS); }
+      this.sendV2Reply(ws, reply);
+    };
+    let result: Result<V2HistoryPage> | PromiseLike<Result<V2HistoryPage>>;
+    const method = request.direction === "after" ? "readAfter" : "readBefore";
+    try { result = reader(session, request); } catch (error) {
+      this.reportArchiveReadErrorBestEffort(method, session, error);
+      return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+    }
+    if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+      void Promise.resolve(result).then(finish, (error: unknown) => {
+        this.reportArchiveReadErrorBestEffort(method, session, error);
+        fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+      });
+      return;
+    }
+    finish(result);
+  }
+
+  private sendV2Reply(ws: WS, reply: NewarchV2HistoryReply): void {
+    try { this.wsSend(ws, JSON.stringify(reply)); } catch {}
+  }
+
   /** Route a parsed client message. Convenience for hosts whose WS handler
    * is a thin switch — hosts with richer routing keep their own switch instead.
    * Answers client keepalive pings: the thumbmux/svelte client closes the
    * connection when a ping goes unanswered for 8s. */
   handleMessage(msg: MuxClientMessage, ws: WS) {
+    if (msg.type === "history_expand_v2") {
+      this.expandHistoryV2(msg, ws);
+      return;
+    }
     switch (msg.type) {
       case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
       case "client_info": this.hooks.onClientInfo?.(ws, msg.client); break;
@@ -2796,4 +2904,124 @@ export class TmuxWsMux<
       this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);
     }
   }
+}
+
+// --- D3: v2 history on the mux socket (K protocol) ---
+
+const V2_HISTORY_RETRY_MS = 1_000;
+const V2_REQUEST_ID_MAX = 128;
+/** Same bound as stream-contract v2Text (NEWARCH_V2_LIMITS.maxIdentityBytes). */
+const V2_IDENTITY_BYTES = 256;
+const v2Utf8 = new TextEncoder();
+
+function v2IntIn(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+/** Non-empty, well-formed and at most V2_IDENTITY_BYTES of UTF-8. */
+function v2IdentityText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.isWellFormed()
+    && v2Utf8.encode(value).length <= V2_IDENTITY_BYTES;
+}
+
+/** Same rules as stream-contract v2PaneKey: bounded identity, birth >= 1. */
+function v2PaneKeyValid(value: unknown): value is NewarchPaneKey {
+  if (!value || typeof value !== "object") return false;
+  const pane = value as Partial<NewarchPaneKey>;
+  return v2IdentityText(pane.serverIdentity) && v2IdentityText(pane.paneId)
+    && v2IntIn(pane.birthGeneration, 1, Number.MAX_SAFE_INTEGER);
+}
+
+function v2PaneCopy(pane: NewarchPaneKey): NewarchPaneKey {
+  return { serverIdentity: pane.serverIdentity, paneId: pane.paneId, birthGeneration: pane.birthGeneration };
+}
+
+function v2CursorBounded(cursor: { readonly storeId?: unknown; readonly token?: unknown; readonly timelineRevision?: unknown }): boolean {
+  return v2IdentityText(cursor.storeId)
+    && typeof cursor.token === "string" && cursor.token.length > 0
+    && v2Utf8.encode(cursor.token).length <= NEWARCH_V2_WIRE_LIMITS.cursorBytes
+    && v2IntIn(cursor.timelineRevision, 0, Number.MAX_SAFE_INTEGER);
+}
+
+function v2ContinuationBounded(continuation: NewarchV2Continuation): boolean {
+  if (!continuation || typeof continuation !== "object") return false;
+  if (continuation.kind === "end") return true;
+  if (continuation.kind !== "more" && continuation.kind !== "blocked") return false;
+  return !!continuation.cursor && v2CursorBounded(continuation.cursor);
+}
+
+/** Screen projection of one committed row: provenance stays server-side. */
+function v2WireEntry(entry: V2HistoryPage["entries"][number]): NewarchV2WireEntry | null {
+  if (entry?.kind === "incident") {
+    return entry.incident && v2PaneKeyValid(entry.incident.pane) ? { kind: "incident", incident: entry.incident } : null;
+  }
+  if (entry?.kind !== "row" || !entry.row || !Array.isArray(entry.row.cells)) return null;
+  // Only committed history travels; a live (unfinalized) row is not history.
+  if (entry.row.finalized !== true) return null;
+  const { id, cells, wrapStatus, wrapPad } = entry.row;
+  if (!id || !v2PaneKeyValid(id.pane)) return null;
+  return {
+    kind: "row",
+    id: { pane: v2PaneCopy(id.pane), segmentId: id.segmentId, rowOrdinal: id.rowOrdinal },
+    cells: cells.map(cell => ({ text: cell.text, width: cell.width, style: [...cell.style] })),
+    wrapStatus, wrapPad,
+  };
+}
+
+function v2ErrorReply(message: NewarchV2HistoryExpandMessage, code: NewarchV2HistoryErrorCode, retryAfterMs: number | null = null): NewarchV2HistoryReply {
+  return {
+    schema: NEWARCH_V2_SCHEMA, type: "history_v2", channel: message.session, requestId: message.requestId,
+    status: "error", pane: message.request.pane, code, retryAfterMs,
+  };
+}
+
+/** Reader result -> wire reply. A failure is a typed error, never an empty page. */
+function v2ReplyFromRead(message: NewarchV2HistoryExpandMessage, result: unknown): NewarchV2HistoryReply {
+  const read = result as Result<V2HistoryPage> | null | undefined;
+  if (!read || typeof read !== "object") return v2ErrorReply(message, "owner-unavailable", V2_HISTORY_RETRY_MS);
+  switch (read.status) {
+    case "ok": break;
+    case "busy": return v2ErrorReply(message, "owner-unavailable",
+      v2IntIn(read.retryAfterMs, 0, Number.MAX_SAFE_INTEGER) ? read.retryAfterMs : V2_HISTORY_RETRY_MS);
+    case "stale": return v2ErrorReply(message, read.reason === "identity" || read.reason === "route" ? "wrong-pane" : "stale-cursor");
+    case "cancelled": return v2ErrorReply(message, "owner-unavailable", V2_HISTORY_RETRY_MS);
+    case "error":
+      if (read.code === "unsupported") return v2ErrorReply(message, "unsupported");
+      if (read.code === "integrity" || read.code === "unresolved-gap") return v2ErrorReply(message, "stale-cursor");
+      return v2ErrorReply(message, "owner-unavailable", V2_HISTORY_RETRY_MS);
+    default: return v2ErrorReply(message, "owner-unavailable", V2_HISTORY_RETRY_MS);
+  }
+  const page = read.value;
+  const request = message.request;
+  if (!page || page.schema !== NEWARCH_V2_SCHEMA || !Array.isArray(page.entries) || !Array.isArray(page.states)) {
+    return v2ErrorReply(message, "unsupported");
+  }
+  if (!v2PaneKeyValid(page.pane) || !newarchV2SamePane(page.pane, request.pane)) return v2ErrorReply(message, "wrong-pane");
+  if (!v2IntIn(page.revision, 0, Number.MAX_SAFE_INTEGER)
+    || (request.cursor !== null && page.revision < request.cursor.timelineRevision)) {
+    return v2ErrorReply(message, "stale-cursor");
+  }
+  if (page.entries.length > request.maxEntries) return v2ErrorReply(message, "bounded-read");
+  const entries: NewarchV2WireEntry[] = [];
+  for (const entry of page.entries) {
+    const wire = v2WireEntry(entry);
+    if (!wire) return v2ErrorReply(message, "unsupported");
+    entries.push(wire);
+  }
+  if (!v2ContinuationBounded(page.before) || !v2ContinuationBounded(page.after)) return v2ErrorReply(message, "bounded-read");
+  // Storage/remote down is not the end of the pane: an ok page whose requested
+  // edge says `end` would stop the reader for good. Restart from the tail.
+  const ahead = request.direction === "before" ? page.before : page.after;
+  if (ahead.kind === "end" && page.states.some(state => state?.kind === "storage-unavailable" || state?.kind === "remote-unavailable")) {
+    return v2ErrorReply(message, "stale-cursor");
+  }
+  const payloadBytes = v2Utf8.encode(JSON.stringify(entries)).length;
+  if (payloadBytes > request.maxBytes) return v2ErrorReply(message, "bounded-read");
+  const reply: NewarchV2HistoryReply = {
+    schema: NEWARCH_V2_SCHEMA, type: "history_v2", channel: message.session, requestId: message.requestId,
+    status: "ok", pane: request.pane, revision: page.revision, entries, payloadBytes,
+    states: page.states, before: page.before, after: page.after,
+  };
+  // Same guard the client runs: every row, incident and cursor on this pane.
+  return newarchV2ReplyMatches(message, reply) ? reply : v2ErrorReply(message, "wrong-pane");
 }

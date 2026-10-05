@@ -15,8 +15,14 @@ import {
   type NewarchHistoryExtension,
   type NewarchHistoryState,
   type NewarchRowId,
+  NEWARCH_V2_WIRE_LIMITS,
+  newarchV2SamePane,
+  type NewarchV2Continuation,
   type NewarchV2FixedGeometry,
+  type NewarchV2HistoryCursor,
+  type NewarchV2HistoryReply,
   type NewarchV2Incident,
+  type NewarchV2WireRow,
   type NewarchV2IncidentReason,
   type NewarchV2PaneDescriptor,
   type NewarchV2PaneSelection,
@@ -1007,7 +1013,9 @@ export function newarchV2StateLabel(state: NewarchV2ReadState): string | null {
     case 'incident':
       return newarchV2IncidentLabel(state.incident);
     case 'storage-unavailable':
-      return 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — ยังไม่ใช่จุดสิ้นสุด';
+      return state.pendingIncidentId
+        ? 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — มีเหตุรอบันทึก — ยังไม่ใช่จุดสิ้นสุด'
+        : 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — ยังไม่ใช่จุดสิ้นสุด';
     case 'remote-unavailable':
       if (state.reason === 'offline') return 'ดึงประวัติจากคลังสำรองไม่ได้ตอนนี้ (ออฟไลน์) — ยังไม่ใช่จุดสิ้นสุด';
       if (state.reason === 'missing') return 'ไม่พบประวัติช่วงนี้ในคลังสำรอง — ยังไม่ใช่จุดสิ้นสุด';
@@ -1043,6 +1051,274 @@ export function newarchV2StatusNotes(input: {
     push(key, text);
   }
   return notes;
+}
+
+/** Visible sentence for a pane that no longer collects. Active panes have none. */
+export function newarchV2PaneStateLabel(pane: NewarchV2PaneDescriptor): string | null {
+  switch (pane.state) {
+    case 'stopped': return 'pane นี้หยุดเก็บแล้ว — ไม่มีแถวใหม่เข้าประวัติ';
+    case 'closed': return 'pane นี้ปิดแล้ว — ประวัติที่เห็นคือทั้งหมดที่บันทึกไว้';
+    case 'unrecorded': return 'pane นี้ไม่ได้บันทึกประวัติ';
+    default: return null;
+  }
+}
+
+// --- D3: v2 cursor pager over the existing bounded line window ---
+//
+// The resident window (above) stays line-addressed and bounded. A v2 pane has
+// no line numbers on the wire, so the pager numbers rows locally, keeps the
+// server's own cursor at every page boundary, and never turns a cursor into a
+// line. Bookkeeping is bounded: pages wholly outside the resident window are
+// dropped (`newarchV2PagerRetain`).
+
+/** Local line the newest v2 row ends at when the window has no live seam. */
+export const NEWARCH_V2_PAGER_BASE_LINE = 1_000_000_000;
+
+export type NewarchV2PagerPage = Readonly<{
+  startLine: number;
+  /** One stable row key per line, `segmentId:rowOrdinal`. */
+  keys: readonly string[];
+  /** Server cursor at this page's older edge; null = none known at this boundary. */
+  before: NewarchV2Continuation | null;
+  /** Server cursor at this page's newer edge; null = none known at this boundary. */
+  after: NewarchV2Continuation | null;
+}>;
+
+export type NewarchV2PagerState = Readonly<{
+  pane: NewarchV2PaneDescriptor;
+  baseLine: number;
+  /** Highest timeline revision a reply carried; an older reply is stale. */
+  revision: number;
+  /** Ascending, contiguous local line ranges. */
+  pages: readonly NewarchV2PagerPage[];
+  notes: readonly NewarchV2StatusNote[];
+}>;
+
+export type NewarchV2PagerAsk =
+  | Readonly<{ kind: 'ask'; direction: HistoryWindowDirection; cursor: NewarchV2HistoryCursor | null; edgeLine: number; overlap: number }>
+  | Readonly<{ kind: 'end' }>
+  /** The edge has no known cursor (window outside the pager's pages). */
+  | Readonly<{ kind: 'unknown' }>;
+
+export type NewarchV2PagerApply =
+  | Readonly<{
+      kind: 'page';
+      state: NewarchV2PagerState;
+      direction: HistoryWindowDirection;
+      /** Local line of lines[0]; null for a page without new rows. */
+      startLine: number | null;
+      lines: readonly string[];
+      /** The edge stays pageable: `more` or `blocked`. */
+      hasMore: boolean;
+      /** Storage/remote fault at this edge: never EOF. */
+      blocked: boolean;
+    }>
+  /** Pane or timeline changed under the cursor: drop every cursor and restart. */
+  | Readonly<{ kind: 'reset'; reason: 'wrong-pane' | 'stale-cursor' }>
+  | Readonly<{ kind: 'retry'; retryAfterMs: number | null; state: NewarchV2PagerState }>
+  | Readonly<{ kind: 'refused'; reason: string }>;
+
+export function createNewarchV2Pager(pane: NewarchV2PaneDescriptor, baseLine = NEWARCH_V2_PAGER_BASE_LINE): NewarchV2PagerState {
+  if (!validAbsoluteLine(baseLine)) throw new RangeError('v2 pager base line must be a non-negative safe integer');
+  // The pane-state sentence is drawn from the live descriptor, not kept here.
+  return { pane, baseLine, revision: 0, pages: [], notes: [] };
+}
+
+function v2PagerKey(row: NewarchV2WireRow): string {
+  return `${row.id.segmentId}:${row.id.rowOrdinal}`;
+}
+
+function v2PagerEnd(page: NewarchV2PagerPage): number {
+  return page.startLine + page.keys.length;
+}
+
+function v2CursorOf(continuation: NewarchV2Continuation | null): NewarchV2PagerAsk | null {
+  if (continuation === null) return null;
+  if (continuation.kind === 'end') return { kind: 'end' };
+  return { kind: 'ask', direction: 'before', cursor: continuation.cursor, edgeLine: 0, overlap: 0 };
+}
+
+/**
+ * The request for one edge of the resident window. `edgeLine` is the window's
+ * first line (before) or its exclusive end (after). When the edge falls inside
+ * a page, the pager asks from that page's nearest known boundary and reports
+ * how many already-resident rows the reply must repeat (`overlap`).
+ */
+export function newarchV2PagerAsk(
+  state: NewarchV2PagerState,
+  direction: HistoryWindowDirection,
+  edgeLine: number | null,
+): NewarchV2PagerAsk {
+  const pages = state.pages;
+  if (pages.length === 0) {
+    return direction === 'before'
+      ? { kind: 'ask', direction, cursor: null, edgeLine: state.baseLine, overlap: 0 }
+      : { kind: 'end' };
+  }
+  const edge = edgeLine ?? (direction === 'before' ? pages[0]!.startLine : v2PagerEnd(pages.at(-1)!));
+  const limit = NEWARCH_V2_WIRE_LIMITS.pageEntries;
+  const finish = (found: NewarchV2PagerAsk | null, overlap: number): NewarchV2PagerAsk => {
+    if (found === null || overlap >= limit) return { kind: 'unknown' };
+    if (found.kind !== 'ask') return overlap === 0 ? found : { kind: 'unknown' };
+    return { kind: 'ask', direction, cursor: found.cursor, edgeLine: edge, overlap };
+  };
+  // A page edge cut by eviction has no cursor (null): resume from the
+  // neighbouring page's edge and let the reply repeat the rows in between.
+  if (direction === 'before') {
+    const index = pages.findIndex(page => page.startLine <= edge && edge < v2PagerEnd(page));
+    if (index < 0) return { kind: 'unknown' };
+    const page = pages[index]!;
+    if (page.startLine === edge && page.before !== null) return finish(v2CursorOf(page.before), 0);
+    const next = pages[index + 1];
+    return finish(next ? v2CursorOf(next.before) : null, v2PagerEnd(page) - edge);
+  }
+  const index = pages.findIndex(page => page.startLine < edge && edge <= v2PagerEnd(page));
+  if (index < 0) return { kind: 'unknown' };
+  const page = pages[index]!;
+  if (v2PagerEnd(page) === edge && page.after !== null) return finish(v2CursorOf(page.after), 0);
+  const previous = pages[index - 1];
+  return finish(previous ? v2CursorOf(previous.after) : null, edge - page.startLine);
+}
+
+function v2PagerKeysAt(state: NewarchV2PagerState, from: number, to: number): string[] | null {
+  const keys: string[] = [];
+  for (let line = from; line < to; line++) {
+    const page = state.pages.find(candidate => candidate.startLine <= line && line < v2PagerEnd(candidate));
+    const key = page?.keys[line - page.startLine];
+    if (key === undefined) return null;
+    keys.push(key);
+  }
+  return keys;
+}
+
+function v2SgrText(row: NewarchV2WireRow): string {
+  let out = '';
+  let current = '';
+  let last = row.cells.length;
+  // Trailing unstyled blanks are padding, not text a reader copies.
+  while (last > 0 && row.cells[last - 1]!.text === ' ' && row.cells[last - 1]!.style.length === 0) last--;
+  for (let index = 0; index < last; index++) {
+    const cell = row.cells[index]!;
+    if (cell.width === 0 && cell.text === '') continue;
+    const style = cell.style.join(';');
+    if (style !== current) {
+      out += style ? `\u001b[0;${style}m` : '\u001b[0m';
+      current = style;
+    }
+    out += cell.text;
+  }
+  return current ? `${out}\u001b[0m` : out;
+}
+
+function v2MergeNotes(held: readonly NewarchV2StatusNote[], fresh: readonly NewarchV2StatusNote[]): NewarchV2StatusNote[] {
+  const notes = [...held];
+  for (const note of fresh) {
+    if (notes.length >= NEWARCH_V2_NOTE_CAP) break;
+    // One incident arrives both as an entry and as a state: one sentence.
+    if (!notes.some(existing => existing.key === note.key || existing.text === note.text)) notes.push(note);
+  }
+  return notes;
+}
+
+/**
+ * Apply one reply to the ask that produced it. Rows already resident (the
+ * overlap) must come back identical, and no other row may repeat: a page
+ * that would lose, duplicate, or reorder a row is refused, never drawn.
+ */
+export function applyNewarchV2PagerReply(
+  state: NewarchV2PagerState,
+  ask: Extract<NewarchV2PagerAsk, { kind: 'ask' }>,
+  reply: NewarchV2HistoryReply,
+): NewarchV2PagerApply {
+  if (!newarchV2SamePane(reply.pane, state.pane.pane)) return { kind: 'reset', reason: 'wrong-pane' };
+  if (reply.status === 'error') {
+    switch (reply.code) {
+      case 'wrong-pane': return { kind: 'reset', reason: 'wrong-pane' };
+      case 'stale-cursor': return { kind: 'reset', reason: 'stale-cursor' };
+      case 'owner-unavailable': return {
+        kind: 'retry', retryAfterMs: reply.retryAfterMs,
+        state: { ...state, notes: v2MergeNotes(state.notes, [{ key: 'owner-unavailable', text: 'เจ้าของประวัติยังไม่พร้อม — ยังไม่ใช่จุดสิ้นสุด' }]) },
+      };
+      default: return { kind: 'refused', reason: reply.code };
+    }
+  }
+  if (reply.revision < state.revision) return { kind: 'reset', reason: 'stale-cursor' };
+  const rows = reply.entries.filter((entry): entry is NewarchV2WireRow => entry.kind === 'row');
+  const keys = rows.map(v2PagerKey);
+  if (new Set(keys).size !== keys.length) return { kind: 'refused', reason: 'duplicate-row' };
+  const { direction, edgeLine, overlap } = ask;
+  if (rows.length < overlap) return { kind: 'refused', reason: 'overlap-short' };
+  const expected = direction === 'before'
+    ? v2PagerKeysAt(state, edgeLine, edgeLine + overlap)
+    : v2PagerKeysAt(state, edgeLine - overlap, edgeLine);
+  const repeated = direction === 'before' ? keys.slice(keys.length - overlap) : keys.slice(0, overlap);
+  if (expected === null || expected.join('\n') !== repeated.join('\n')) return { kind: 'refused', reason: 'overlap-mismatch' };
+  const freshRows = direction === 'before' ? rows.slice(0, rows.length - overlap) : rows.slice(overlap);
+  const freshKeys = direction === 'before' ? keys.slice(0, keys.length - overlap) : keys.slice(overlap);
+  const resident = new Set(state.pages.flatMap(page => page.keys));
+  if (freshKeys.some(key => resident.has(key))) return { kind: 'refused', reason: 'duplicate-row' };
+  const continuation = direction === 'before' ? reply.before : reply.after;
+  const notes = v2MergeNotes(state.notes, newarchV2StatusNotes({ entries: reply.entries, states: reply.states }));
+  let pages = [...state.pages];
+  let startLine: number | null = null;
+  if (freshRows.length > 0) {
+    startLine = direction === 'before' ? edgeLine - freshRows.length : edgeLine;
+    if (startLine < 0 || !Number.isSafeInteger(startLine + freshRows.length)) return { kind: 'refused', reason: 'line-range' };
+    const page: NewarchV2PagerPage = {
+      startLine,
+      keys: freshKeys,
+      // A cursor is kept only where it sits exactly on this record's edge.
+      before: direction === 'before' || overlap === 0 ? reply.before : null,
+      after: direction === 'after' || overlap === 0 ? reply.after : null,
+    };
+    if (direction === 'before') pages.unshift(page);
+    else pages.push(page);
+  } else if (pages.length > 0 && overlap === 0) {
+    // An incident-only or blocked page still moves this edge's cursor.
+    if (direction === 'before') pages[0] = { ...pages[0]!, before: continuation };
+    else pages[pages.length - 1] = { ...pages.at(-1)!, after: continuation };
+  }
+  return {
+    kind: 'page',
+    state: { ...state, revision: Math.max(state.revision, reply.revision), pages, notes },
+    direction,
+    startLine,
+    lines: freshRows.map(v2SgrText),
+    hasMore: continuation.kind !== 'end',
+    blocked: continuation.kind === 'blocked',
+  };
+}
+
+/**
+ * Keep exactly the resident rows: pages outside the window are dropped and a
+ * page cut by eviction keeps only its resident keys. A cut edge loses its
+ * cursor (that position is no longer a page boundary), so a row that left the
+ * window can come back once and is never mistaken for a duplicate.
+ */
+export function newarchV2PagerRetain(state: NewarchV2PagerState, range: HistoryWindowRange): NewarchV2PagerState {
+  let changed = false;
+  const pages: NewarchV2PagerPage[] = [];
+  for (const page of state.pages) {
+    const end = v2PagerEnd(page);
+    const from = Math.max(page.startLine, range.startLine);
+    const to = Math.min(end, range.endLine);
+    if (to <= from) {
+      changed = true;
+      continue;
+    }
+    if (from === page.startLine && to === end) {
+      pages.push(page);
+      continue;
+    }
+    changed = true;
+    pages.push({
+      startLine: from,
+      keys: page.keys.slice(from - page.startLine, to - page.startLine),
+      before: from === page.startLine ? page.before : null,
+      after: to === end ? page.after : null,
+    });
+  }
+  return changed ? { ...state, pages } : state;
 }
 
 /** Terminal rows only. Status sentences are not part of copy or search. */
