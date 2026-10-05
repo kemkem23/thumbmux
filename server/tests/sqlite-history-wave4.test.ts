@@ -1756,3 +1756,59 @@ test('H v2 export rollback reaps only unpublished scratch before exporting anoth
     expect(h2value(f.port.reader.export(f.pane, 'good-export'))!.segmentId).toBe('segment-2');
   } finally { await f.cleanup(); }
 });
+
+test('H v2 authority resolves only the durable incident receipt and survives replay exactly once', async () => {
+  const f = await h2fixture();
+  try {
+    const activation = await f.activate();
+    const authority = (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
+    expect(authority).toBeDefined();
+    const current = h2value(authority.writerGeneration());
+    expect(current).toBe(H2.v2WriterGeneration(f.port.capability.generation));
+    expect(h2value(authority.incidentResolution(f.pane, 'still-pending'))).toBeNull();
+
+    const incident = f.incident('durable-null-frontier', 2);
+    const resolvedReceipt = await f.commit({ kind: 'incident', incident }, 'resolve-null-frontier');
+    expect(resolvedReceipt.frontier).toBeNull();
+    const resolution = h2value(authority.incidentResolution(f.pane, incident.incidentId));
+    expect(resolution).toEqual({ schema: 'newarch-v2', pane: f.pane, incidentId: incident.incidentId,
+      state: 'resolved', receipt: resolvedReceipt, writerGeneration: current });
+    expect(H2.v2IncidentResolvedBy(resolution, incident.incidentId, resolvedReceipt, current)).toBe(true);
+    expect(H2.v2IncidentResolvedBy(resolution, 'foreign-incident', resolvedReceipt, current)).toBe(false);
+    expect(H2.v2IncidentResolvedBy(resolution, incident.incidentId, activation, current)).toBe(false);
+
+    await f.reopen();
+    const nextAuthority = (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
+    const nextGeneration = h2value(nextAuthority.writerGeneration());
+    const staleResolution = h2value(nextAuthority.incidentResolution(f.pane, incident.incidentId));
+    expect(nextGeneration).not.toBe(current);
+    expect(H2.v2IncidentResolvedBy(staleResolution, incident.incidentId, resolvedReceipt, nextGeneration)).toBe(false);
+    expect(await f.commit({ kind: 'incident', incident }, 'resolve-null-frontier')).toEqual(resolvedReceipt);
+    expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 authority snapshots checkpoint raw pins separately from active row pins', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate();
+    await f.commit(f.batch([f.row(0)]), 'rows-for-authority');
+    const authority = (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
+    const generation = h2value(authority.writerGeneration());
+    const checkpoint = h2value(f.port.reader.checkpoint(f.pane))!;
+    const initial = h2value(authority.rawPins(f.pane, checkpoint.through.epoch));
+    expect(initial).toEqual({ schema: 'newarch-v2', pane: f.pane, epoch: checkpoint.through.epoch,
+      revision: checkpoint.revision, writerGeneration: generation,
+      rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`, holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins: 0 });
+
+    await f.commit({ kind: 'pin', pinId: 'active-row-pin', segmentId: 'segment-1' }, 'pin-for-authority');
+    const pinned = h2value(authority.rawPins(f.pane, checkpoint.through.epoch));
+    expect(pinned.rawPins).toEqual(initial.rawPins);
+    expect(pinned.rowPins).toBe(1);
+    await f.commit({ kind: 'release-pin', pinId: 'active-row-pin' }, 'release-authority-pin');
+    expect(h2value(authority.rawPins(f.pane, checkpoint.through.epoch)).rowPins).toBe(0);
+
+    const foreignEpoch = { ...checkpoint.through.epoch, collectorIncarnation: 'foreign' };
+    expect(authority.rawPins(f.pane, foreignEpoch).status).toBe('error');
+  } finally { await f.cleanup(); }
+});
