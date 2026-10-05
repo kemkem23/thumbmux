@@ -1291,17 +1291,20 @@ export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'ga
  * caller keeps the unconsumed suffix in its durable spool. */
 export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
   context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
+  let last=performance.now(); const timings:Record<string,number>={};
+  const mark=(name:string)=>{const now=performance.now();timings[name]=now-last;last=now;};
   const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
   const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
     bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
     checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+  mark('inputDigest');
   const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
     const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
     return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
   };
   const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
   try {
-    validateV2Checkpoint(cp);
+    validateV2Checkpoint(cp);mark('validateInput');
     const durableRevision=context.durableRevision??cp.revision;
     if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
     if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
@@ -1321,7 +1324,9 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
       ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
     const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
+    mark('preflight');
     const probe=v2Decode(cp.state,input.bytes,rawCap,L.maxRows);
+    mark('probeDecode');
     const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
       const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
       return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
@@ -1338,26 +1343,32 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       if(candidate>L.maxSerializedBytes){serializedBoundary=probe.offsets[index]!-1;break;}
       probeRows.push(row);probeSerializedBytes=candidate;
     }
+    mark('probeMaterialize');
     let consumed=rawCap,stop:V2PrefixStop=input.bytes.length>rawCap?'raw-bytes':'complete';
     if(probe.rowBoundary!==null && probe.rowBoundary<=consumed){consumed=probe.rowBoundary;stop='rows';}
     if(serializedBoundary!==null && serializedBoundary<=consumed){consumed=serializedBoundary;stop='serialized-bytes';}
     if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
     const decoded=consumed===rawCap && probe.rowBoundary===null && serializedBoundary===null
       ? probe:v2Decode(cp.state,input.bytes,consumed,L.maxRows);
+    mark('finalDecode');
     if(decoded.rowBoundary!==null)throw Error('materialized prefix row boundary');
     const rows=decoded===probe?probeRows:materialize(decoded.scrolls,decoded.offsets);
     const serializedBytes=decoded===probe?probeSerializedBytes:v2RowsSerializedBytes(rows);
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
+    mark('finalMaterialize');
     const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
     const checkpoint:V2LiveCheckpoint={...cp,
       checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,replayFloor:through,revision,
       frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
       pending:{rows:[],bytes:0,deadlineMonoMs:null}};
-    validateV2Checkpoint(checkpoint);
+    mark('checkpointDigest');
+    validateV2Checkpoint(checkpoint);mark('validateOutput');
     const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
     const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
       serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
-    return immutable(prefix);
+    const result=immutable(prefix);mark('immutable');
+    console.log('B1_PROFILE',JSON.stringify({offered:input.bytes.length,consumed,rows:rows.length,timings}));
+    return result;
   }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
 
