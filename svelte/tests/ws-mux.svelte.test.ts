@@ -1070,9 +1070,14 @@ describe('TmuxMux v2 history cursor (D3)', () => {
     ]) });
     expect(mux.newarchV2Pane('work')?.pane).toEqual(D3_PANE_B);
     expect(mux.newarchV2Pane('other')).toBeNull();
-    const result = await mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: d3Cursor(D3_PANE_A, 'old'), direction: 'before' })!;
-    expect(result.kind).toBe('pane-changed');
+    let result: { kind: string } | null = null;
+    void mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: d3Cursor(D3_PANE_A, 'old'), direction: 'before' })
+      ?.then(settled => { result = settled; });
+    await Promise.resolve();
+    await Promise.resolve();
     expect(d3Requests(socket)).toEqual([]);
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe('pane-changed');
   });
 
   test('reconnect settles the request as disconnected, and the same cursor is asked again on the new socket', async () => {
@@ -1082,8 +1087,13 @@ describe('TmuxMux v2 history cursor (D3)', () => {
     const cursor = d3Cursor(D3_PANE_A, 'keep-me');
     const pending = mux.requestHistoryV2('work', pane, { cursor, direction: 'before' });
     const first = d3Requests(socket).at(-1)!;
+    // settle-or-fail without a wall-clock wait (fake timers are installed)
+    let settled: unknown = 'still-pending';
+    void pending!.then(result => { settled = result; });
     socket.finishClose();
-    expect(await pending!).toEqual({ kind: 'disconnected' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toEqual({ kind: 'disconnected' });
     // a late reply on the dead socket is not delivered anywhere
     socket.receive(d3Reply(first, [1], { kind: 'end' }));
     jest.advanceTimersByTime(30_000);
