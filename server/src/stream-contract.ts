@@ -60,8 +60,13 @@ function canonicalOperation(): (value: unknown) => string {
   };
   return encode;
 }
-export function streamCanonical(value: unknown): string {
-  return canonicalOperation()(value);
+/** A fresh encoder. Share it only inside one synchronous call: the next call
+ * must see mutations of objects the previous call already encoded. */
+export function streamCanonicalEncoder(): (value: unknown) => string {
+  return canonicalOperation();
+}
+export function streamCanonical(value: unknown, encode?: (value: unknown) => string): string {
+  return (typeof encode === 'function' ? encode : canonicalOperation())(value);
 }
 export function streamDigest(kind: string, payload: unknown): string {
   return createHash('sha256').update(streamCanonical({ version: STREAM_CONTRACT_VERSION, kind, payload })).digest('hex');
@@ -1245,8 +1250,9 @@ export function v2SessionKey(s: NewarchV2SessionKey): string {
   v2Text(s.serverIdentity); v2Text(s.sessionId);
   return streamCanonical([s.serverIdentity, s.sessionId]);
 }
-export function v2Digest(kind: string, payload: unknown): Digest {
-  return createHash('sha256').update(streamCanonical({ schema: NEWARCH_V2_VERSION, kind, payload })).digest('hex');
+export function v2Digest(kind: string, payload: unknown, encode?: (value: unknown) => string): Digest {
+  const canonical = typeof encode === 'function' ? encode : canonicalOperation();
+  return createHash('sha256').update(canonical({ schema: NEWARCH_V2_VERSION, kind, payload })).digest('hex');
 }
 export function validateV2Config(c: V2Config): void {
   if (c.schema !== NEWARCH_V2_VERSION) throw Error('v2 schema');
@@ -1551,8 +1557,8 @@ export type V2ResumeProof = { readonly kind: 'continuous'; readonly pane: PaneKe
   readonly from: RawPosition; readonly through: RawPosition; readonly geometry: NewarchV2FixedGeometry;
   readonly sourceEvidence: EvidenceFile }
   | { readonly kind: 'unverified'; readonly reason: 'geometry' | 'raw' | 'collector-epoch' | 'identity' };
-export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
-  validateCheckpointCanonical(c, canonicalOperation());
+export function validateV2Checkpoint(c: V2LiveCheckpoint, encode?: (value: unknown) => string): void {
+  validateCheckpointCanonical(c, typeof encode === 'function' ? encode : canonicalOperation());
 }
 function validateCheckpointCanonical(c: V2LiveCheckpoint, canonical: (value: unknown) => string): void {
   if (c.schema !== NEWARCH_V2_VERSION || c.geometry.policy !== 'fixed-at-birth' || c.geometry.panesPerWindow !== 1) throw Error('v2 checkpoint schema');
@@ -1803,8 +1809,8 @@ export interface V2DecodePrefix {
   readonly checkpoint: V2LiveCheckpoint; readonly stop: V2PrefixStop;
   readonly suffix: RawRange | null;
 }
-export function v2RowsSerializedBytes(rows: readonly CommittedStreamRow[]): number {
-  return Buffer.byteLength(streamCanonical(rows));
+export function v2RowsSerializedBytes(rows: readonly CommittedStreamRow[], encode?: (value: unknown) => string): number {
+  return Buffer.byteLength(streamCanonical(rows, encode));
 }
 /** Zero progress on non-empty input is not a prefix: C must emit a gap. */
 export function v2DecodePrefixValid(p: V2DecodePrefix, base: V2LiveCheckpoint): boolean {

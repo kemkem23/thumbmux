@@ -2,7 +2,7 @@
  * I supplies shared worker J transport and sealed source tap/spool adapters.
  * Runtime acceptance is not established; see lot C REPORT.md. */
 import {
-  STREAM_BUDGET as B, streamDigest, streamCanonical,
+  STREAM_BUDGET as B, streamDigest, streamCanonical, streamCanonicalEncoder,
   type AppendFinalized, type CancelToken, type CaptureEngine, type DurableInputReceipt,
   type DurableReceipt, type FinalizedRow, type FrameDelta, type GapEpisode,
   type HistoryEngine, type InputEvent, type LiveFrame, type PaneKey,
@@ -1353,7 +1353,10 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
   };
   const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
   try {
-    validateV2Checkpoint(cp);
+    // One encoder for the input check, the per-row size probe, both digests
+    // and the output check. A later call still builds its own.
+    const encode = streamCanonicalEncoder();
+    validateV2Checkpoint(cp, encode);
     const durableRevision=context.durableRevision??cp.revision;
     if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
     if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
@@ -1382,8 +1385,8 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
     let serializedBoundary=false,probeSerializedBytes=2;
     const decoded=v2Decode(cp.state,input.bytes,rawCap,L.maxRows,(r,offset,index)=>{
       const row=materializeOne(r,offset,index);
-      const originBytes=Buffer.byteLength(streamCanonical(row.origin)),cells=row.cellOrigins.length;
-      const rowBytes=Buffer.byteLength(streamCanonical({...row,cellOrigins:[]}))
+      const originBytes=Buffer.byteLength(encode(row.origin)),cells=row.cellOrigins.length;
+      const rowBytes=Buffer.byteLength(encode({...row,cellOrigins:[]}))
         +cells*originBytes+Math.max(0,cells-1);
       const candidate=probeSerializedBytes+(index===0?0:1)+rowBytes;
       if(candidate>L.maxSerializedBytes){serializedBoundary=true;return false;}
@@ -1400,10 +1403,10 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
     const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
     const checkpoint:V2LiveCheckpoint={...cp,
-      checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,replayFloor:through,revision,
-      frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
+      checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision},encode),through,replayFloor:through,revision,
+      frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state,encode),
       pending:{rows:[],bytes:0,deadlineMonoMs:null}};
-    validateV2Checkpoint(checkpoint);
+    validateV2Checkpoint(checkpoint, encode);
     const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
     const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
       serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
