@@ -273,7 +273,8 @@ export class TmuxMux {
   private v2Inflight = new Map<string, V2Inflight>();
   private v2RequestSeq = 0;
   /** Selected v2 pane per session, learned from the session list. */
-  private v2Panes = new Map<string, NewarchV2PaneDescriptor>();
+  // Reactive so a view that defaults to the session-list pane follows it.
+  private v2Panes = $state.raw(new Map<string, NewarchV2PaneDescriptor>());
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1288,7 +1289,7 @@ export class TmuxMux {
     this.historyInflight.clear();
     this.historyFenced.clear();
     this.settleV2Inflight(() => true, { kind: 'cancelled' });
-    this.v2Panes.clear();
+    this.v2Panes = new Map();
     this.opts = {};
   }
 

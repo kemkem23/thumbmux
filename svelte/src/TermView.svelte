@@ -613,12 +613,24 @@
   let v2Pager: NewarchV2PagerState | null = null;
   let v2PagerNotes = $state.raw<readonly NewarchV2StatusNote[]>([]);
   const v2Notes = $derived.by(() => {
+    const pane = currentV2Pane();
+    const paneLabel = pane ? newarchV2PaneStateLabel(pane) : null;
+    const paneNote = paneLabel && pane ? { key: `pane|${pane.state}`, text: paneLabel } : null;
     const notes: NewarchV2StatusNote[] = [];
-    const paneLabel = newarchV2Pane ? newarchV2PaneStateLabel(newarchV2Pane) : null;
-    if (paneLabel && newarchV2Pane) notes.push({ key: `pane|${newarchV2Pane.state}`, text: paneLabel });
-    for (const note of v2PagerNotes) if (!notes.some(held => held.key === note.key)) notes.push(note);
-    return notes.slice(-HISTORY_STATUS_NOTE_LIMIT);
+    for (const note of v2PagerNotes) {
+      if (note.key !== paneNote?.key && !notes.some(held => held.key === note.key)) notes.push(note);
+    }
+    // The pane's own state stays on screen; incident sentences share the rest.
+    const kept = notes.slice(-(HISTORY_STATUS_NOTE_LIMIT - (paneNote ? 1 : 0)));
+    return paneNote ? [paneNote, ...kept] : kept;
   });
+  // D3-r1: a v2 view counts lines from NEWARCH_V2_PAGER_BASE_LINE above the
+  // server's live seam. The v2 archive can hold more rows than the legacy
+  // liveStartLine counts (a young pane starts near 0), so pager lines would go
+  // negative; every boundary this view stores is shifted by the same amount,
+  // which keeps archive/live adjacency an exact equality. Legacy views: 0.
+  let v2LineShift = 0;
+  let v2ViewKey: string | null = null;
   const historyStatus = $derived.by(() => {
     const seen = new Map<string, HistoryStatusNote>();
     for (const note of [...historyStatusBefore, ...historyStatusAfter]) {
@@ -4045,6 +4057,8 @@
   }
 
   function clearSlidingArchiveAtBoundary(liveStartLine: number, resetReader: boolean): void {
+    v2Pager = null;
+    v2PagerNotes = [];
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
@@ -4148,6 +4162,7 @@
       liveBoundaryProvesCurrentCapture = false;
       return unchanged;
     }
+    boundary = v2ViewBoundary(boundary);
     const previous = liveBoundary;
     if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
       // A reconnecting transport can race a cached full frame behind the last
@@ -4527,10 +4542,36 @@
   /** Another pane (or a new timeline) owns this view now: no old cursor or
    * resident row of the previous pane survives. */
   function resetV2History(): void {
-    v2Pager = null;
-    v2PagerNotes = [];
     discardArchiveForAltScreen();
   }
+
+  function v2ViewBoundary(boundary: MuxHistoryBoundary): MuxHistoryBoundary {
+    return v2LineShift === 0 ? boundary : { ...boundary, liveStartLine: boundary.liveStartLine + v2LineShift };
+  }
+
+  /** agy MAJOR 3: follow the pane this view reads. A different pane drops the
+   * old pane's rows, cursors and sentences at once (not at the next scroll);
+   * entering or leaving v2 restarts the boundary in the new line space. */
+  function syncV2View(): void {
+    const current = currentV2Pane();
+    const key = current
+      ? `${current.pane.serverIdentity}\u0000${current.pane.paneId}\u0000${current.pane.birthGeneration}`
+      : null;
+    if (key === v2ViewKey) return;
+    v2ViewKey = key;
+    if (v2Pager !== null || archiveWindow !== null || v2PagerNotes.length > 0) resetV2History();
+    const shift = key === null ? 0 : NEWARCH_V2_PAGER_BASE_LINE;
+    if (shift === v2LineShift) return;
+    v2LineShift = shift;
+    liveBoundary = null;
+    liveBoundaryProvesCurrentCapture = false;
+    liveBoundaryAdmission = createLiveBoundaryAdmission();
+  }
+
+  $effect(() => {
+    currentV2Pane();
+    untrack(syncV2View);
+  });
 
   function requestV2Page(
     pane: NewarchV2PaneDescriptor,
@@ -4539,14 +4580,15 @@
     requestSession: string,
     edgeLine: number | null,
   ): boolean {
+    syncV2View();
     if (v2Pager && !newarchV2SamePane(v2Pager.pane.pane, pane.pane)) resetV2History();
     if (!v2Pager) {
-      v2Pager = createNewarchV2Pager(pane, liveBoundary?.liveStartLine ?? NEWARCH_V2_PAGER_BASE_LINE);
       if (archiveWindow) {
         // Rows paged before this pane was known carry no v2 cursor.
         discardArchiveForAltScreen();
         edgeLine = null;
       }
+      v2Pager = createNewarchV2Pager(pane, liveBoundary ? liveBoundary.liveStartLine : NEWARCH_V2_PAGER_BASE_LINE);
     } else if (v2Pager.pane !== pane) {
       v2Pager = { ...v2Pager, pane };
     }
@@ -5926,7 +5968,7 @@
   function admitLiveDelivery(meta?: MuxDeliveryMeta): boolean {
     const boundary = meta?.boundary;
     if (!boundary || historyPaging !== 'sliding') return true;
-    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, boundary);
+    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, v2ViewBoundary(boundary));
     liveBoundaryAdmission = result.admission;
     return result.accepted;
   }
@@ -7381,6 +7423,8 @@
    * Live pane content stays.
    */
   function discardArchiveForAltScreen(): void {
+    v2Pager = null;
+    v2PagerNotes = [];
     clearHistoryStatus();
     cancelScheduledPrependWork();
     pendingPrependWork = null;
