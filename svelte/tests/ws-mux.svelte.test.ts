@@ -957,3 +957,166 @@ describe('TmuxMux newarch-frame-v1', () => {
     mux.dispose();
   });
 });
+
+// --- D3 (flag-on 2026-10-05): v2 cursor request/reply, both directions ---
+
+const D3_PANE_A = { serverIdentity: 'srv-1', paneId: '%1', birthGeneration: 1 };
+const D3_PANE_B = { serverIdentity: 'srv-1', paneId: '%2', birthGeneration: 1 };
+const D3_GEOMETRY = { policy: 'fixed-at-birth', columns: 78, rows: 120, configVersion: 'q22-default-1', panesPerWindow: 1 } as const;
+
+function d3Descriptor(pane: typeof D3_PANE_A, sessionId = 'sess-a') {
+  return {
+    schema: 'newarch-v2' as const, session: { serverIdentity: pane.serverIdentity, sessionId },
+    pane, windowId: `@${pane.paneId}`, owner: 'capture-engine' as const, birthOperationId: `birth-${pane.paneId}`,
+    geometry: D3_GEOMETRY, state: 'active' as const,
+  };
+}
+
+function d3Cursor(pane: typeof D3_PANE_A, token: string, timelineRevision = 4) {
+  return { schema: 'newarch-v2' as const, pane, storeId: 'local', timelineRevision, token };
+}
+
+function d3Row(pane: typeof D3_PANE_A, ordinal: number) {
+  return { kind: 'row', id: { pane, segmentId: 'seg-1', rowOrdinal: ordinal }, cells: [{ text: `r${ordinal}`, width: 1, style: [] }], wrapStatus: 'unwrapped', wrapPad: 0 };
+}
+
+function d3Reply(request: { session: string; requestId: string; request: { pane: typeof D3_PANE_A } }, rows: number[], before: unknown, after: unknown = { kind: 'end' }) {
+  return {
+    schema: 'newarch-v2', type: 'history_v2', channel: request.session, requestId: request.requestId,
+    status: 'ok', pane: request.request.pane, revision: 4, entries: rows.map(n => d3Row(request.request.pane, n)),
+    payloadBytes: 10, states: [{ kind: 'exact', auditedRevision: 4 }], before, after,
+  };
+}
+
+function d3Open() {
+  const mux = new TmuxMux();
+  mux.subscribe('work', () => {});
+  mux.subscribe('other', () => {});
+  const socket = FakeWebSocket.instances.at(-1)!;
+  socket.open();
+  return { mux, socket };
+}
+
+function d3Requests(socket: FakeWebSocket) {
+  return socket.frames().filter(frame => frame.type === 'history_expand_v2');
+}
+
+describe('TmuxMux v2 history cursor (D3)', () => {
+  test('sends the v2 pane and cursor on the wire and resolves only the matching reply, three pages back and forward', async () => {
+    const { mux, socket } = d3Open();
+    const pane = d3Descriptor(D3_PANE_A);
+    let cursor: ReturnType<typeof d3Cursor> | null = null;
+    for (let page = 0; page < 3; page++) {
+      const pending = mux.requestHistoryV2('work', pane, { cursor, direction: 'before', maxEntries: 256 });
+      expect(pending).not.toBeNull();
+      const sent = d3Requests(socket).at(-1)!;
+      expect(sent.session).toBe('work');
+      expect(sent.request).toEqual({
+        schema: 'newarch-v2', pane: D3_PANE_A, cursor, direction: 'before', maxEntries: 256, maxBytes: 2 * 1024 * 1024,
+      });
+      expect('beforeLine' in sent || 'afterLine' in sent).toBe(false);
+      // a stray reply (wrong request id) and a reply on the wrong channel never resolve it
+      socket.receive({ ...d3Reply(sent, [1], { kind: 'end' }), requestId: 'v2-nope' });
+      const next = d3Cursor(D3_PANE_A, `before-${page}`);
+      socket.receive(d3Reply(sent, [30 - page * 2, 31 - page * 2], { kind: 'more', cursor: next }, { kind: 'more', cursor: d3Cursor(D3_PANE_A, `after-${page}`) }));
+      const result = await pending!;
+      expect(result.kind).toBe('reply');
+      if (result.kind !== 'reply' || result.reply.status !== 'ok') throw new Error('no ok reply');
+      expect(result.reply.entries.map(e => e.kind === 'row' ? e.id.rowOrdinal : -1)).toEqual([30 - page * 2, 31 - page * 2]);
+      cursor = result.reply.before.kind === 'more' ? result.reply.before.cursor : null;
+    }
+    const forward = mux.requestHistoryV2('work', pane, { cursor: d3Cursor(D3_PANE_A, 'after-2'), direction: 'after' });
+    const sent = d3Requests(socket).at(-1)!;
+    expect(sent.request.direction).toBe('after');
+    expect(sent.request.cursor.token).toBe('after-2');
+    socket.receive(d3Reply(sent, [28], { kind: 'more', cursor: d3Cursor(D3_PANE_A, 'b') }));
+    expect((await forward!).kind).toBe('reply');
+    expect(d3Requests(socket).map(f => f.request.cursor?.token ?? null)).toEqual([null, 'before-0', 'before-1', 'after-2']);
+  });
+
+  test('a reply carrying another pane, or an answer to another request, is a mismatch, never delivered rows', async () => {
+    const { mux, socket } = d3Open();
+    const pending = mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: null, direction: 'before' });
+    const sent = d3Requests(socket).at(-1)!;
+    const foreign = d3Reply(sent, [], { kind: 'end' });
+    foreign.entries = [d3Row(D3_PANE_B, 9)];
+    socket.receive(foreign);
+    expect(await pending!).toEqual({ kind: 'mismatch' });
+  });
+
+  test('a cursor of another pane identity is never sent: new pane, reused pane id, restarted server', () => {
+    const { mux, socket } = d3Open();
+    const reborn = { ...D3_PANE_A, birthGeneration: 2 };
+    const restarted = { ...D3_PANE_A, serverIdentity: 'srv-2' };
+    for (const pane of [D3_PANE_B, reborn, restarted]) {
+      expect(mux.requestHistoryV2('work', d3Descriptor(pane), { cursor: d3Cursor(D3_PANE_A, 'stale'), direction: 'before' })).not.toBeNull();
+      const sent = d3Requests(socket).at(-1)!;
+      expect(sent.request.pane).toEqual(pane);
+      expect(sent.request.cursor).toBeNull();
+      socket.receive({ schema: 'newarch-v2', type: 'history_v2', channel: 'work', requestId: sent.requestId, status: 'error', pane, code: 'stale-cursor', retryAfterMs: null });
+    }
+    expect(JSON.stringify(socket.sent)).not.toContain('stale');
+  });
+
+  test('the session list selects the pane: a caller holding the old pane gets pane-changed and nothing is sent', async () => {
+    const { mux, socket } = d3Open();
+    socket.receive({ channel: '__sessions', type: 'sessions', data: JSON.stringify([
+      { name: 'work', newarchV2: { kind: 'selected', pane: d3Descriptor(D3_PANE_B) } },
+      { name: 'other' },
+    ]) });
+    expect(mux.newarchV2Pane('work')?.pane).toEqual(D3_PANE_B);
+    expect(mux.newarchV2Pane('other')).toBeNull();
+    const result = await mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: d3Cursor(D3_PANE_A, 'old'), direction: 'before' })!;
+    expect(result.kind).toBe('pane-changed');
+    expect(d3Requests(socket)).toEqual([]);
+  });
+
+  test('reconnect settles the request as disconnected, and the same cursor is asked again on the new socket', async () => {
+    jest.useFakeTimers();
+    const { mux, socket } = d3Open();
+    const pane = d3Descriptor(D3_PANE_A);
+    const cursor = d3Cursor(D3_PANE_A, 'keep-me');
+    const pending = mux.requestHistoryV2('work', pane, { cursor, direction: 'before' });
+    const first = d3Requests(socket).at(-1)!;
+    socket.finishClose();
+    expect(await pending!).toEqual({ kind: 'disconnected' });
+    // a late reply on the dead socket is not delivered anywhere
+    socket.receive(d3Reply(first, [1], { kind: 'end' }));
+    jest.advanceTimersByTime(30_000);
+    const replacement = FakeWebSocket.instances.at(-1)!;
+    expect(replacement).not.toBe(socket);
+    replacement.open();
+    const again = mux.requestHistoryV2('work', pane, { cursor, direction: 'before' });
+    const second = d3Requests(replacement).at(-1)!;
+    expect(second.request.cursor).toEqual(cursor);
+    expect(second.requestId).not.toBe(first.requestId);
+    replacement.receive(d3Reply(second, [5], { kind: 'end' }));
+    expect((await again!).kind).toBe('reply');
+  });
+
+  test('two panes in two sessions keep separate requests; one request per session at a time', async () => {
+    const { mux, socket } = d3Open();
+    const a = mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: null, direction: 'before' });
+    const b = mux.requestHistoryV2('other', d3Descriptor(D3_PANE_B, 'sess-b'), { cursor: null, direction: 'before' });
+    expect(mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: null, direction: 'after' })).toBeNull();
+    const [sentA, sentB] = d3Requests(socket);
+    socket.receive(d3Reply(sentB!, [2], { kind: 'end' }));
+    socket.receive(d3Reply(sentA!, [1], { kind: 'end' }));
+    const [ra, rb] = await Promise.all([a!, b!]);
+    if (ra.kind !== 'reply' || rb.kind !== 'reply' || ra.reply.status !== 'ok' || rb.reply.status !== 'ok') throw new Error('expected replies');
+    expect(ra.reply.entries.map(e => e.kind === 'row' && e.id.pane.paneId)).toEqual(['%1']);
+    expect(rb.reply.entries.map(e => e.kind === 'row' && e.id.pane.paneId)).toEqual(['%2']);
+  });
+
+  test('the last viewer leaving cancels its request and a late reply goes nowhere', async () => {
+    const mux = new TmuxMux();
+    const off = mux.subscribe('work', () => {});
+    const socket = FakeWebSocket.instances.at(-1)!;
+    socket.open();
+    const pending = mux.requestHistoryV2('work', d3Descriptor(D3_PANE_A), { cursor: null, direction: 'before' });
+    const sent = d3Requests(socket).at(-1)!;
+    off();
+    expect(await pending!).toEqual({ kind: 'cancelled' });
+    socket.receive(d3Reply(sent, [1], { kind: 'end' }));
+  });
+});

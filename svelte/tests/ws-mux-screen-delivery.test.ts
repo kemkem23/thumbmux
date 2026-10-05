@@ -299,3 +299,59 @@ describe('NEWARCH v2 fixed geometry across viewers', () => {
     }
   });
 });
+
+// --- D3: a v2 history reply never disturbs screen delivery (no loss / no duplicate) ---
+
+const D3_PANE = { serverIdentity: 'srv-1', paneId: '%7', birthGeneration: 1 };
+const D3_DESCRIPTOR = {
+  schema: 'newarch-v2' as const, session: { serverIdentity: 'srv-1', sessionId: 'sess-7' }, pane: D3_PANE,
+  windowId: '@7', owner: 'capture-engine' as const, birthOperationId: 'birth-7',
+  geometry: { policy: 'fixed-at-birth' as const, columns: 78, rows: 120, configVersion: 'q22-default-1', panesPerWindow: 1 as const },
+  state: 'active' as const,
+};
+
+function d3ReplyFor(socket: FakeWebSocket) {
+  const sent = socket.sent.map(data => JSON.parse(data)).filter(frame => frame.type === 'history_expand_v2').at(-1);
+  return {
+    schema: 'newarch-v2', type: 'history_v2', channel: sent.session, requestId: sent.requestId, status: 'ok', pane: D3_PANE,
+    revision: 1, entries: [{ kind: 'row', id: { pane: D3_PANE, segmentId: 's', rowOrdinal: 1 }, cells: [{ text: 'old', width: 1, style: [] }], wrapStatus: 'unwrapped', wrapPad: 0 }],
+    payloadBytes: 10, states: [{ kind: 'exact', auditedRevision: null }], before: { kind: 'end' }, after: { kind: 'end' },
+  };
+}
+
+describe('TmuxMux v2 history beside screen frames (D3)', () => {
+  test('a v2 reply is not pane data and keeps the output base: the next delta applies without a resync', async () => {
+    const { mux, socket, deliveries, unsubscribe } = openMux();
+    socket.receive({ channel: 'terminal', type: 'output', data: 'one\ntwo\n', screen: SCREEN_LOCAL });
+    const pending = mux.requestHistoryV2('terminal', D3_DESCRIPTOR, { cursor: null, direction: 'before' });
+    socket.receive(d3ReplyFor(socket));
+    expect((await pending!).kind).toBe('reply');
+    socket.receive(createMuxDeltaFrame('terminal', splitMuxOutputData('one\ntwo\n'), splitMuxOutputData('one\ntwo\nthree\n'), { row: 2, col: 0 }));
+    expect(deliveries.map(d => [d.type, d.data])).toEqual([['output', 'one\ntwo\n'], ['output', 'one\ntwo\nthree\n']]);
+    expect(socket.sent.some(data => JSON.parse(data).type === 'resync')).toBe(false);
+    unsubscribe();
+    socket.finishClose();
+  });
+
+  test('screen deltas queued while busy are delivered before the v2 reply settles, once each', async () => {
+    const mux = new TmuxMux();
+    const deliveries: string[] = [];
+    let busy = true;
+    const unsubscribe = mux.subscribe('terminal', (data, type) => { if (type === 'output') deliveries.push(data); }, { deferWhileBusy: () => busy });
+    const socket = FakeWebSocket.instances.at(-1)!;
+    socket.open();
+    socket.receive({ channel: 'terminal', type: 'output', data: 'a\n' });
+    socket.receive(createMuxDeltaFrame('terminal', splitMuxOutputData('a\n'), splitMuxOutputData('a\nb\n'), null));
+    expect(deliveries).toEqual(['a\n']);
+    const pending = mux.requestHistoryV2('terminal', D3_DESCRIPTOR, { cursor: null, direction: 'before' });
+    let seenAtSettle: string[] = [];
+    void pending!.then(() => { seenAtSettle = [...deliveries]; });
+    socket.receive(d3ReplyFor(socket));
+    await pending;
+    expect(seenAtSettle).toEqual(['a\n', 'a\nb\n']);
+    busy = false;
+    expect(deliveries).toEqual(['a\n', 'a\nb\n']);
+    unsubscribe();
+    socket.finishClose();
+  });
+});
