@@ -329,3 +329,102 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     await run('clean-after', false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 300000);
+
+// BH (B2-replan §3 BH + E-rearm §4): source-prefix input and reserve-rearm
+// authority. Each mutant must fail the NAMED acceptance test with an assertion,
+// in a private copy inside the cage; the clean copy passes before and after.
+//
+// The two H authority mutants below were removed from the H v2 list above in
+// 3c251afff / 80967d7c9 as "equivalent". Reasoning recorded (H review claude
+// MINOR-2, agy MAJOR):
+// - v2-authority-refreshes-stale-generation: v2IncidentResolvedBy also requires
+//   receipt.generation === current, and the stored receipt keeps generation g,
+//   so after reopen the guard was false with or without the refresh: equivalent
+//   for THAT guard only. It is not equivalent for the authority contract
+//   (stored writerGeneration must stay the original one, E-rearm §3), so the
+//   acceptance test now asserts staleResolution.writerGeneration === g and kills it.
+// - v2-authority-rematerializes-incident: a replayed incident under a new
+//   operation id is refused earlier by the revision fence ('v2 incident fence'),
+//   and the same id returns the stored receipt before addIncident, so the `!old`
+//   line is reachable only by the same incident id twice inside ONE commit.
+//   There the mutant silently deduplicates instead of refusing: not equivalent.
+//   The same-batch duplicate test now kills it.
+test('BH mutants: issued prefix readback, durable start/end fence, atomic refusal and reserve-rearm authority', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'bh-mutants-'));
+  const prefix = /\(fail\) H v2 batch commits an issued mid-record source-prefix/;
+  const rearm = /\(fail\) H v2 reserve rearm reads the original receipt/;
+  const tamper = /\(fail\) H v2 reserve rearm refuses pending, tampered/;
+  const H = 'history-engine.ts', C = 'stream-contract.ts';
+  const mutations: { name: string; file: string; kills: RegExp; from: string; to: string; from2?: string; to2?: string }[] = [
+    { name: 'bh-prefix-skip-readback', file: H, kills: prefix,
+      from: 'v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint)', to: 'v2BatchInputMatchesIssued(b.input, b.input, durable, b.checkpoint)' },
+    { name: 'bh-prefix-start-from-caller', file: H, kills: prefix,
+      from: 'v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint)',
+      to: "v2BatchInputMatchesIssued(b.input, issued.value, { ...durable, through: { ...durable.through, byteOffset: b.input.kind === 'source-prefix' ? b.input.certified.start : durable.through.byteOffset } }, b.checkpoint)" },
+    { name: 'bh-prefix-nonatomic-checkpoint', file: H, kills: prefix,
+      from: "          fhAssert(durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint),\n            'v2 durable input authority');",
+      to: "          const inputOk = !!durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint);",
+      from2: 'setCheckpoint(b.checkpoint); break;', to2: 'if (inputOk) setCheckpoint(b.checkpoint); break;' },
+    { name: 'bh-prefix-end-equality', file: C, kills: prefix,
+      from: '      && input.certified.end === checkpoint.through.byteOffset\n', to: '' },
+    { name: 'bh-prefix-start-equality', file: C, kills: prefix,
+      from: '      && input.certified.start === previous.through.byteOffset\n', to: '' },
+    { name: 'bh-rearm-skip-current-cap', file: H, kills: rearm,
+      from: "this.authorize(this.#cap); fhAssert(expectedGeneration === this.#cap.generation, 'v2 rearm generation');", to: '' },
+    { name: 'bh-rearm-refresh-receipt-generation', file: H, kills: rearm,
+      from: 'resolvedReceipt: receipt,', to: 'resolvedReceipt: { ...receipt, generation: this.#cap.generation },' },
+    { name: 'bh-rearm-wrong-incident-digest', file: H, kills: rearm,
+      from: 'incidentDigest: v2EmergencyIncidentDigest(incident),', to: 'incidentDigest: receipt.digest,' },
+    { name: 'bh-rearm-cached-observation', file: H, kills: rearm,
+      from: '    return observation;\n',
+      to: '    const cache = ((globalThis as { bhRearm?: Map<string, V2ReserveRearmObservation> }).bhRearm ??= new Map());\n    if (!cache.has(key + incidentId)) cache.set(key + incidentId, observation);\n    return cache.get(key + incidentId)!;\n' },
+    { name: 'bh-rearm-skip-receipt-readback', file: H, kills: tamper,
+      from: '&& receipt && equal(receipt, resolution.receipt)', to: '&& receipt' },
+    { name: 'bh-rearm-refreshed-stored-generation', file: H, kills: tamper,
+      from: 'resolution.writerGeneration === receipt.generation && ', to: '' },
+    { name: 'bh-rearm-accept-pending', file: H, kills: tamper,
+      from: "resolution.state === 'resolved' && ", to: '' },
+    { name: 'bh-rearm-foreign-resolution', file: H, kills: tamper,
+      from: '\n      && resolution.incidentId === incidentId && v2PaneKey(resolution.pane) === key', to: '' },
+    { name: 'bh-rearm-skip-incident-revision', file: H, kills: tamper,
+      from: ' && incident.revision === receipt.revision', to: '' },
+    { name: 'v2-authority-refreshes-stale-generation', file: H, kills: /\(fail\) H v2 authority resolves only the durable incident receipt/,
+      from: 'if (resolved) return resolved;', to: 'if (resolved) return { ...resolved, writerGeneration: this.currentGeneration() };' },
+    { name: 'v2-authority-rematerializes-incident', file: H, kills: /\(fail\) H v2 incident listed twice in one batch/,
+      from: "        fhAssert(!old, old && equal(old, incident) ? 'v2 incident already materialized' : 'v2 incident collision');\n        this.put('incident', key, incident.incidentId, incident);\n        this.append(key, revision, 'incident', incident.incidentId, '', incident);\n        resolvedIncidents.push(incident.incidentId);",
+      to: "        if (old) fhAssert(equal(old, incident), 'v2 incident collision');\n        else { this.put('incident', key, incident.incidentId, incident); this.append(key, revision, 'incident', incident.incidentId, '', incident); resolvedIncidents.push(incident.incidentId); }" },
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'H v2'],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('BH_MUTANT', JSON.stringify({ name, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [], summary: output.slice(-600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      return { exit, output };
+    };
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+    for (const m of mutations) {
+      const file = join(root, 'server/src', m.file), original = readFileSync(file, 'utf8');
+      expect(original.split(m.from).length).toBe(2);
+      let mutant = original.replace(m.from, m.to);
+      if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
+      try {
+        writeFileSync(file, mutant);
+        const red = await run(m.name);
+        expect(red.exit).not.toBe(0);
+        expect(red.output).toMatch(m.kills);
+      } finally { writeFileSync(file, original); }
+    }
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 300000);
