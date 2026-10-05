@@ -954,6 +954,16 @@ describe('fitNewarchFontPx', () => {
     expect(FONT_FIT_GUTTER_PX).toBe(12);
   });
 
+  // REVIEW-grok debt: a cell that is not proportional to the font (hinting
+  // adds a fixed 0.6px) makes the first guess 0.45px too big. Stepping 0.05px
+  // ran out of probes and fell to the 4px floor while 7.05px fits.
+  test('a non-proportional cell still finds the largest fitting size, not the floor', () => {
+    const hinted = (px: number) => px * 0.6 + 0.6;
+    const out = fit(78, PHONE, { measureCellPx: hinted });
+    expect(out).toEqual({ fontPx: 7.05, fits: true });
+    expect(78 * hinted(7.1)).toBeGreaterThan(378);
+  });
+
   test('a wide box keeps the ceiling exactly — never grows past the user size', () => {
     const out = fit(76, 1280);
     expect(out).toEqual({ fontPx: 13, fits: true });
