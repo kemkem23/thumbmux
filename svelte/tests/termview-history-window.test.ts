@@ -3354,11 +3354,13 @@ describe("NEWARCH v2 cursor history on the screen (D3)", () => {
     });
     expect(ordinalsOnScreen()).toEqual([1, 2]);
     expect(noteTexts(target).join("|")).toContain("ท่อเก็บขาด");
+    expect(viewport.getAttribute("data-history-window-rows")).toBe("2");
     const asked = calls.length;
     flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
     await settleUi();
     expect(calls.length).toBe(asked);
-    expect(ordinalsOnScreen()).toEqual([]);
+    // no resident row of pane A is left in the window, and its sentence is gone
+    expect(viewport.getAttribute("data-history-window-rows")).toBeNull();
     expect(noteTexts(target).join("|")).not.toContain("ท่อเก็บขาด");
   });
 

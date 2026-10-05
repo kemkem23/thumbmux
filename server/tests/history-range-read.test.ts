@@ -1320,6 +1320,7 @@ const D3_SERVER_MUTANTS: ReadonlyArray<{ id: string; from: string; to: string; k
   { id: "cursor-unbounded", from: "&& v2Utf8.encode(cursor.token).length <= NEWARCH_V2_WIRE_LIMITS.cursorBytes", to: "", killer: "oversized cursor are typed errors" },
   { id: "late-reply-after-pane-change", from: 'if (this.newarchV2Readable(session, pane).kind !== "selected") return fail("wrong-pane");', to: "", killer: "pane changes before it lands" },
   { id: "reply-unchecked", from: 'return newarchV2ReplyMatches(message, reply) ? reply : v2ErrorReply(message, "wrong-pane");', to: "return reply;", killer: "another pane's row or cursor is refused" },
+  { id: "unavailable-end-ok", from: 'if (ahead.kind === "end" && page.states.some(', to: "if (false && page.states.some(", killer: "never an ok page whose requested direction is end" },
   { id: "payload-unbounded", from: 'if (payloadBytes > request.maxBytes) return v2ErrorReply(message, "bounded-read");', to: "", killer: "exceed the wire page bound" },
 ];
 
