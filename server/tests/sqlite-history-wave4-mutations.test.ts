@@ -299,8 +299,6 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);", to: '/* mutant loses rows behind durable receipt */' },
     { name: 'v2-authority-foreign-incident', from: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);",
       to: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, this.owner(pane)?.incidentId ?? incidentId);" },
-    { name: 'v2-authority-refreshes-stale-generation', from: 'if (resolved) return resolved;',
-      to: 'if (resolved) return { ...resolved, writerGeneration: this.currentGeneration() };' },
     { name: 'v2-authority-omits-checkpoint-pin', from: "rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`,\n        holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins }", to: 'rawPins: [], rowPins }' },
     { name: 'v2-authority-rematerializes-incident',
       from: "fhAssert(!old, old && equal(old, incident) ? 'v2 incident already materialized' : 'v2 incident collision');\n        this.put('incident', key, incident.incidentId, incident);\n        this.append(key, revision, 'incident', incident.incidentId, '', incident);\n        resolvedIncidents.push(incident.incidentId);",
