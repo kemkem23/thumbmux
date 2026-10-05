@@ -1776,6 +1776,10 @@ test('H v2 authority resolves only the durable incident receipt and survives rep
     expect(H2.v2IncidentResolvedBy(resolution, incident.incidentId, resolvedReceipt, current)).toBe(true);
     expect(H2.v2IncidentResolvedBy(resolution, 'foreign-incident', resolvedReceipt, current)).toBe(false);
     expect(H2.v2IncidentResolvedBy(resolution, incident.incidentId, activation, current)).toBe(false);
+    expect(h2value(authority.incidentResolution(f.pane, 'foreign-incident'))).toBeNull();
+    expect((await f.port.writer.commit(f.port.capability,
+      f.request({ kind: 'incident', incident }, 'duplicate-incident-operation'))).status).toBe('error');
+    expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
 
     await f.reopen();
     const nextAuthority = (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
