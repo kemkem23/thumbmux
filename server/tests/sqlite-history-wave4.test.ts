@@ -311,7 +311,7 @@ describe('wave 4 reader canary', () => {
 });
 
 // Stream-first K v1: separate opt-in database; never mounts a production route.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { StreamHistoryEngine, streamDigest } from '../src/history-engine';
 import type { AppendFinalized, InputEvent, Result, VtCheckpoint } from '../src/stream-contract';
@@ -599,7 +599,15 @@ describe('stream-first H crash and continuation', () => {
         expect(exit).not.toBe(0);
         expect(child.signalCode).toBe('SIGKILL');
         expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
-        const engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+        let engine: StreamHistoryEngine;
+        try { engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] }); }
+        catch (e) {
+          // One GitHub run failed this open with SQLITE_IOERR_SHORT_READ and no local stress reproduced it:
+          // print what the killed writer left so a recurrence carries its own evidence.
+          const sizes = Object.fromEntries(['', '-wal', '-shm', '-journal'].map(s => [s || 'db', existsSync(path + s) ? statSync(path + s).size : null]));
+          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify({ phase, sizes, output, stderr: stderr.slice(-2000), error: String(e) }));
+          throw e;
+        }
         try {
           const recovered = [];
           for await (const result of engine.recover(shPane, null, shCancel)) recovered.push(result);
