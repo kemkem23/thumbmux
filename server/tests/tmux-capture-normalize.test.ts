@@ -2086,9 +2086,10 @@ describe('Q22 C definite rejection and proposal isolation',()=>{
 });
 
 describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
-  const geometry={columns:78,rows:120} as const;
+  const config78={...v2Config,geometry:{columns:78,rows:120}};
+  const geometry=SC.v2BirthGeometry(config78);
   const pane={...v2Pane,geometry};
-  const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},{...v2Config,geometry});
+  const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config78);
   const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
   function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length]) {
     let cp=birth(), offeredStart=0;
@@ -2099,7 +2100,7 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
       while(offeredStart<packetEnd) {
         const input={pane,checkpoint:cp,raw:{epoch:v2Epoch,start:offeredStart,end:packetEnd},
           bytes:[...raw.subarray(offeredStart,packetEnd)],observedAtMonoMs:1,pendingSinceMonoMs:null};
-        const result=evaluateV2Prefix(input,v2Config,v2Clock);
+        const result=evaluateV2Prefix(input,config78,v2Clock);
         if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
         expect(SC.v2DecodePrefixValid(result,cp)).toBe(true);
         expect(result.rows.length).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxRows);
