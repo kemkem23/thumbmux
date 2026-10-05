@@ -1721,3 +1721,312 @@ export interface V2HistoryReader {
    * never rows/checkpoint or auditedRevision. disabled never starts a timer. */
   lastAudit(pane: PaneKey): Result<V2AuditResult | null>;
 }
+
+// -------------------------------------------------------------------------
+// Q22 flag-on seams (K, 2026-10-05). Frozen API for B1/S1/B2/S2/J/H/E/D1-D3.
+// Additive only: no existing v2 port gains a required member, geometry 78x120
+// and every NEWARCH_V2_LIMITS number are unchanged. Guards are pure; they never
+// replace H/S readback of the same objects inside the authoritative transaction.
+//
+// Three counters that MUST NOT substitute for each other (branded below):
+//  - writer generation: H root generation minted on exclusive engine open
+//    (V2Receipt.generation, V2WriterCapability.generation).
+//  - source epoch: immutable collector incarnation + attachment
+//    (NewarchV2SourceEpoch / PipeEpoch), never a number.
+//  - continuity generation: S2 topology/geometry watch generation that only
+//    the collector-side witness advances; a restart of H does not touch it.
+import type { NewarchV2SourceEpoch } from '@thumbmux/core';
+export type { NewarchV2SourceEpoch } from '@thumbmux/core';
+declare const v2WriterGenerationBrand: unique symbol;
+declare const v2ContinuityGenerationBrand: unique symbol;
+export type V2WriterGeneration = number & { readonly [v2WriterGenerationBrand]: 'writer' };
+export type V2ContinuityGeneration = number & { readonly [v2ContinuityGenerationBrand]: 'continuity' };
+export function v2WriterGeneration(n: number): V2WriterGeneration { v2Int(n, 1); return n as V2WriterGeneration; }
+export function v2ContinuityGeneration(n: number): V2ContinuityGeneration { v2Int(n, 1); return n as V2ContinuityGeneration; }
+export function v2SourceEpochOf(epoch: PipeEpoch): NewarchV2SourceEpoch {
+  return { attachId: epoch.attachId, collectorIncarnation: epoch.collectorIncarnation };
+}
+function v2SameEpoch(a: PipeEpoch, b: PipeEpoch): boolean {
+  return sameContract(a, b) && v2PaneKey(a.pane) === v2PaneKey(b.pane);
+}
+function v2Guard(check: () => boolean): boolean {
+  try { return check(); } catch { return false; }
+}
+
+/** Bounded decode prefix (B1). Exactly the existing per-pane budgets; a burst
+ * larger than one prefix is several prefixes, never a larger budget or a gap. */
+export const NEWARCH_V2_PREFIX_LIMITS = Object.freeze({
+  maxRawBytes: NEWARCH_V2_LIMITS.pendingBytesPerPane, maxRows: NEWARCH_V2_LIMITS.pendingRowsPerPane,
+  maxSerializedBytes: NEWARCH_V2_LIMITS.pageBytes, checkpointBytes: NEWARCH_V2_LIMITS.checkpointBytesPerPane,
+} as const);
+export type V2PrefixStop = 'complete' | 'raw-bytes' | 'rows' | 'serialized-bytes';
+/** offered = raw the decoder was handed, starting at base checkpoint.through.
+ * consumed = the decoded prefix; checkpoint.through is consumed.end and carries
+ * partial UTF-8/escape. suffix = [consumed.end, offered.end), NOT certified and
+ * NOT acknowledged; it stays in the spool and is re-offered from checkpoint.
+ * serializedBytes = canonical UTF-8 of rows (cellOrigins included, not trimmed). */
+export interface V2DecodePrefix {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly pane: PaneKey;
+  readonly offered: RawRange; readonly consumed: RawRange;
+  readonly rows: readonly CommittedStreamRow[]; readonly serializedBytes: number;
+  readonly checkpoint: V2LiveCheckpoint; readonly stop: V2PrefixStop;
+  readonly suffix: RawRange | null;
+}
+export function v2RowsSerializedBytes(rows: readonly CommittedStreamRow[]): number {
+  return Buffer.byteLength(streamCanonical(rows));
+}
+/** Zero progress on non-empty input is not a prefix: C must emit a gap. */
+export function v2DecodePrefixValid(p: V2DecodePrefix, base: V2LiveCheckpoint): boolean {
+  return v2Guard(() => {
+    validateV2Checkpoint(base); validateV2Checkpoint(p.checkpoint);
+    const L = NEWARCH_V2_PREFIX_LIMITS, c = p.checkpoint, key = v2PaneKey(p.pane);
+    const epoch = base.through.epoch;
+    if (p.schema !== NEWARCH_V2_VERSION || key !== v2PaneKey(base.pane) || key !== v2PaneKey(c.pane)) return false;
+    if (![p.offered.epoch, p.consumed.epoch, c.through.epoch, ...(p.suffix ? [p.suffix.epoch] : [])]
+      .every(e => v2SameEpoch(e, epoch))) return false;
+    for (const n of [p.offered.start, p.offered.end, p.consumed.start, p.consumed.end, p.serializedBytes]) v2Int(n);
+    if (p.offered.start !== base.through.byteOffset || p.consumed.start !== p.offered.start
+      || p.consumed.end < p.consumed.start || p.consumed.end > p.offered.end) return false;
+    if (p.offered.end > p.offered.start && p.consumed.end === p.consumed.start) return false;
+    if (p.consumed.end - p.consumed.start > L.maxRawBytes || p.rows.length > L.maxRows
+      || p.serializedBytes !== v2RowsSerializedBytes(p.rows) || p.serializedBytes > L.maxSerializedBytes) return false;
+    if (c.through.byteOffset !== p.consumed.end || c.revision <= base.revision
+      || c.replayFloor.byteOffset < base.replayFloor.byteOffset
+      || !sameContract(c.geometry, base.geometry)) return false;
+    if (p.rows.some(r => v2PaneKey(r.id.pane) !== key)) return false;
+    const last = p.rows.length ? p.rows[p.rows.length - 1]!.id : base.frontier;
+    if (!sameContract(c.frontier, last)) return false;
+    if (p.consumed.end === p.offered.end) return p.stop === 'complete' && p.suffix === null;
+    return p.stop !== 'complete' && p.suffix !== null && p.suffix.start === p.consumed.end
+      && p.suffix.end === p.offered.end;
+  });
+}
+
+/** Collector-issued (S1): S read back this durable raw subrange, its record
+ * chain and digests. lastRecordEnd is the byte end of the last spool record the
+ * range touches and may exceed certified.end when the prefix ends mid-record.
+ * The host never mints this; digest = v2SourcePrefixReceiptDigest(rest). */
+export interface V2SourcePrefixReceipt {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'source-prefix'; readonly receiptId: string;
+  readonly sourceEpoch: NewarchV2SourceEpoch; readonly certified: RawRange;
+  readonly firstSequence: number; readonly lastSequence: number; readonly lastRecordDigest: Digest;
+  readonly lastRecordEnd: number; readonly digest: Digest;
+}
+export function v2SourcePrefixReceiptDigest(r: Omit<V2SourcePrefixReceipt, 'digest'>): Digest {
+  return v2Digest('source-prefix-receipt', r);
+}
+/** What the host sends back after H committed a prefix. through is EXACTLY the
+ * committed checkpoint.through: never the record end, never beyond. A prefix
+ * that stops mid-record is recordComplete=false and S keeps the record tail. */
+export interface V2PrefixAck {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'prefix-ack'; readonly pane: PaneKey;
+  readonly through: RawPosition; readonly recordComplete: boolean;
+  readonly source: V2SourcePrefixReceipt; readonly receipt: V2Receipt;
+  readonly writerGeneration: V2WriterGeneration; readonly continuityGeneration: V2ContinuityGeneration;
+  readonly sourceEpoch: NewarchV2SourceEpoch;
+}
+export function v2PrefixAckValid(ack: V2PrefixAck, checkpoint: V2LiveCheckpoint, expected: {
+  readonly writerGeneration: V2WriterGeneration; readonly continuityGeneration: V2ContinuityGeneration;
+}): boolean {
+  return v2Guard(() => {
+    validateV2Checkpoint(checkpoint);
+    const s = ack.source, r = ack.receipt, epoch = checkpoint.through.epoch, at = ack.through.byteOffset;
+    const { digest, ...unsigned } = s;
+    if (ack.schema !== NEWARCH_V2_VERSION || ack.kind !== 'prefix-ack' || s.schema !== NEWARCH_V2_VERSION
+      || s.kind !== 'source-prefix' || digest !== v2SourcePrefixReceiptDigest(unsigned)) return false;
+    v2Text(s.receiptId); contractHash(s.lastRecordDigest);
+    for (const n of [s.certified.start, s.certified.end, s.firstSequence, s.lastSequence, s.lastRecordEnd, at]) v2Int(n);
+    const key = v2PaneKey(checkpoint.pane);
+    if (v2PaneKey(ack.pane) !== key || v2PaneKey(r.pane) !== key) return false;
+    if (!v2SameEpoch(ack.through.epoch, epoch) || !v2SameEpoch(s.certified.epoch, epoch)
+      || !sameContract(s.sourceEpoch, v2SourceEpochOf(epoch)) || !sameContract(ack.sourceEpoch, s.sourceEpoch)) return false;
+    if (r.schema !== NEWARCH_V2_VERSION || r.kind !== 'ssot-durable' || r.checkpointId !== checkpoint.checkpointId
+      || r.revision !== checkpoint.revision || !sameContract(r.frontier, checkpoint.frontier)) return false;
+    if (r.generation !== ack.writerGeneration || ack.writerGeneration !== expected.writerGeneration
+      || ack.continuityGeneration !== expected.continuityGeneration) return false;
+    if (at !== checkpoint.through.byteOffset || s.certified.start > at || at > s.certified.end
+      || s.certified.start > s.certified.end || s.lastRecordEnd < s.certified.end
+      || s.firstSequence > s.lastSequence) return false;
+    return ack.recordComplete === (at === s.lastRecordEnd);
+  });
+}
+
+/** S1 implements; the host may only forward collector receipts. */
+export interface V2PrefixSourcePort {
+  certifyPrefix(binding: Binding, range: RawRange): Promise<Result<V2SourcePrefixReceipt>>;
+  /** S re-validates with v2PrefixAckValid AND reads receipt/checkpoint back from
+   * H before advancing its consumer ACK; no ACK when the H commit failed. */
+  acknowledgePrefix(ack: V2PrefixAck): Promise<Result<{ readonly through: RawPosition; readonly recordComplete: boolean }>>;
+}
+
+/** Continuity witness (S2/J). Only evidence kind 'collector-witness' can prove
+ * continuity; the other variants exist so callers can carry what they have and
+ * get an explicit refusal instead of an accidental pass. */
+export const V2_CONTINUITY_REQUIRED_EVENTS = Object.freeze([
+  'resize', 'layout', 'split', 'window', 'pipe', 'server-exit',
+] as const);
+export type V2TopologyEventKind = typeof V2_CONTINUITY_REQUIRED_EVENTS[number];
+/** covers lists event kinds whose hook/notification coverage was PROVEN on the
+ * installed tmux (coverageProof), not hooks that merely have a fitting name.
+ * fromSeq..throughSeq is the validity watermark that survives journal rotation;
+ * overflow or lostEvents>0 invalidates the witness. topologyEvents counts every
+ * resize/layout/split/window event inside the interval, INCLUDING ones that
+ * return to the same size (78->80->78 is not exact). */
+export interface V2EventWatch {
+  readonly kind: 'tmux-event-journal'; readonly journal: EvidenceFile; readonly coverageProof: EvidenceFile;
+  readonly covers: readonly V2TopologyEventKind[];
+  readonly fromSeq: number; readonly throughSeq: number; readonly watermarkDigest: Digest;
+  readonly overflow: boolean; readonly lostEvents: number; readonly topologyEvents: number;
+}
+/** Durable witness owned by the collector/service that survives the host. The
+ * collector unit/cgroup must differ from the host's. raw = contiguous durable
+ * interval (records firstSequence..lastSequence, no hole) observed while the
+ * host was down. digest = v2ContinuityWitnessDigest(rest). */
+export interface V2ContinuityWitness {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly witnessId: string;
+  readonly pane: PaneKey; readonly windowId: string;
+  readonly server: { readonly serverIdentity: string; readonly process: ProcessIdentity };
+  readonly collector: { readonly incarnation: string; readonly process: ProcessIdentity; readonly unit: string };
+  readonly sourceEpoch: NewarchV2SourceEpoch; readonly raw: RawRange;
+  readonly records: { readonly firstSequence: number; readonly lastSequence: number; readonly chainDigest: Digest };
+  readonly continuityGeneration: V2ContinuityGeneration; readonly geometry: NewarchV2FixedGeometry;
+  readonly watch: V2EventWatch; readonly digest: Digest;
+}
+export function v2ContinuityWitnessDigest(w: Omit<V2ContinuityWitness, 'digest'>): Digest {
+  return v2Digest('continuity-witness', w);
+}
+export type V2ContinuityEvidence =
+  | { readonly kind: 'collector-witness'; readonly witness: V2ContinuityWitness }
+  /** Same-size captures at two times. NOT continuity evidence. */
+  | { readonly kind: 'snapshot-pair'; readonly before: V2GeometryObservation; readonly after: V2GeometryObservation }
+  /** #{pane_pipe}=1 cannot prove the pipe was never replaced. NOT evidence. */
+  | { readonly kind: 'pipe-flag'; readonly panePipe: 1 }
+  /** Liveness at a point in time. NOT evidence. */
+  | { readonly kind: 'heartbeat'; readonly lastSeenWallMs: number };
+export type V2ResumeRefusal = 'not-a-witness' | 'witness-digest' | 'identity' | 'collector-epoch'
+  | 'collector-with-host' | 'raw' | 'geometry' | 'event-coverage' | 'event-overflow' | 'topology-changed';
+export type V2ResumeDecision = Extract<V2ResumeProof, { readonly kind: 'continuous' }>
+  | { readonly kind: 'unverified'; readonly reason: V2ResumeRefusal };
+/** Everything J observes now, after host restart, from S and tmux (not from
+ * the witness itself). durableRawThrough = S durable head for the epoch. */
+export interface V2ResumeContext {
+  readonly checkpoint: V2LiveCheckpoint; readonly descriptor: NewarchV2PaneDescriptor;
+  readonly server: { readonly serverIdentity: string; readonly process: ProcessIdentity };
+  readonly collector: { readonly incarnation: string; readonly process: ProcessIdentity };
+  readonly sourceEpoch: NewarchV2SourceEpoch; readonly continuityGeneration: V2ContinuityGeneration;
+  readonly hostUnit: string; readonly durableRawThrough: RawPosition;
+}
+/** Pure decision. continuous => J may replay from checkpoint without rebind;
+ * anything else => unverified-restart + labelled stop (fail-safe kept). */
+export function v2ResumeDecision(e: V2ContinuityEvidence, ctx: V2ResumeContext): V2ResumeDecision {
+  const no = (reason: V2ResumeRefusal): V2ResumeDecision => ({ kind: 'unverified', reason });
+  if (e.kind !== 'collector-witness') return no('not-a-witness');
+  const w = e.witness, c = ctx.checkpoint, epoch = c.through.epoch;
+  try {
+    validateV2Checkpoint(c);
+    const { digest, ...unsigned } = w;
+    if (w.schema !== NEWARCH_V2_VERSION || digest !== v2ContinuityWitnessDigest(unsigned)) return no('witness-digest');
+    const key = v2PaneKey(c.pane);
+    if (v2PaneKey(w.pane) !== key || v2PaneKey(ctx.descriptor.pane) !== key
+      || w.windowId !== ctx.descriptor.windowId || !sameContract(w.server, ctx.server)) return no('identity');
+    if (w.collector.incarnation !== ctx.collector.incarnation || !sameContract(w.collector.process, ctx.collector.process)
+      || !sameContract(w.sourceEpoch, ctx.sourceEpoch) || !sameContract(w.sourceEpoch, v2SourceEpochOf(epoch))
+      || w.sourceEpoch.collectorIncarnation !== w.collector.incarnation) return no('collector-epoch');
+    if (w.collector.unit === ctx.hostUnit) return no('collector-with-host');
+    if (!sameContract(w.geometry, ctx.descriptor.geometry) || !sameContract(w.geometry, c.geometry)) return no('geometry');
+    const watch = w.watch;
+    if (watch.kind !== 'tmux-event-journal'
+      || !V2_CONTINUITY_REQUIRED_EVENTS.every(k => watch.covers.includes(k))) return no('event-coverage');
+    for (const n of [watch.fromSeq, watch.throughSeq, watch.lostEvents, watch.topologyEvents]) v2Int(n);
+    if (watch.overflow || watch.lostEvents > 0 || watch.throughSeq < watch.fromSeq) return no('event-overflow');
+    if (watch.topologyEvents > 0 || w.continuityGeneration !== ctx.continuityGeneration) return no('topology-changed');
+    for (const n of [w.raw.start, w.raw.end, w.records.firstSequence, w.records.lastSequence]) v2Int(n);
+    if (!v2SameEpoch(w.raw.epoch, epoch) || !v2SameEpoch(ctx.durableRawThrough.epoch, epoch)
+      || w.raw.start > c.through.byteOffset || w.raw.end !== ctx.durableRawThrough.byteOffset
+      || w.raw.end < c.through.byteOffset || w.records.firstSequence > w.records.lastSequence) return no('raw');
+    return { kind: 'continuous', pane: c.pane, from: c.through, through: ctx.durableRawThrough,
+      geometry: ctx.descriptor.geometry, sourceEvidence: watch.journal };
+  } catch { return no('identity'); }
+}
+/** S2 implements on the collector side; the host only reads. */
+export interface V2ContinuityWitnessPort {
+  witness(binding: Binding, from: RawPosition): Promise<Result<V2ContinuityEvidence>>;
+}
+
+/** Pending storage incident (E). S journals it before H can write; D shows it
+ * as storage-unavailable with pendingIncidentId; C later materializes the SAME
+ * incident (same id, same digest) exactly once. */
+export function v2EmergencyIncidentDigest(incident: NewarchV2Incident): Digest {
+  return v2Digest('emergency-incident', incident);
+}
+export interface V2PendingStorageIncident {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'pending-storage';
+  readonly pane: PaneKey; readonly incidentId: string; readonly incidentDigest: Digest;
+  readonly cause: V2EmergencyIncident['cause']; readonly journal: EvidenceFile;
+}
+export function v2PendingFromEmergency(e: V2EmergencyIncident, journal: EvidenceFile): V2PendingStorageIncident {
+  validateV2Incident(e.incident);
+  if (e.digest !== v2EmergencyIncidentDigest(e.incident) || e.incident.reason !== 'storage-outage') throw Error('v2 emergency digest');
+  return { schema: NEWARCH_V2_VERSION, kind: 'pending-storage', pane: e.incident.pane,
+    incidentId: e.incident.incidentId, incidentDigest: e.digest, cause: e.cause, journal };
+}
+export function v2PendingReadState(p: V2PendingStorageIncident, retryAfterMs: number): NewarchV2ReadState {
+  v2Int(retryAfterMs, 1);
+  return { kind: 'storage-unavailable', pendingIncidentId: p.incidentId, retryAfterMs };
+}
+export function v2MaterializesPending(p: V2PendingStorageIncident, incident: NewarchV2Incident): boolean {
+  return v2Guard(() => {
+    validateV2Incident(incident);
+    return p.schema === NEWARCH_V2_VERSION && p.kind === 'pending-storage' && incident.reason === 'storage-outage'
+      && p.incidentId === incident.incidentId && v2PaneKey(p.pane) === v2PaneKey(incident.pane)
+      && p.incidentDigest === v2EmergencyIncidentDigest(incident);
+  });
+}
+
+/** Reader authority (H). Answered from H's CURRENT transaction; receipt is the
+ * durable receipt that materialized/resolved this incident (null while pending). */
+export interface V2IncidentResolution {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly pane: PaneKey; readonly incidentId: string;
+  readonly state: 'pending' | 'resolved'; readonly receipt: V2Receipt | null;
+  readonly writerGeneration: V2WriterGeneration;
+}
+/** True only for: resolved, same pane + incident id, the same receipt, and the
+ * current writer generation. Pending, other id, stale generation => false. */
+export function v2IncidentResolvedBy(r: V2IncidentResolution | null, incidentId: string, receipt: V2Receipt,
+  current: V2WriterGeneration): boolean {
+  return v2Guard(() => r !== null && r.schema === NEWARCH_V2_VERSION && r.state === 'resolved' && r.receipt !== null
+    && r.incidentId === incidentId && v2PaneKey(r.pane) === v2PaneKey(receipt.pane)
+    && sameContract(r.receipt, receipt) && receipt.kind === 'ssot-durable'
+    && r.writerGeneration === current && receipt.generation === current);
+}
+/** Raw pins are readers of raw spool bytes (replay, decoder checkpoint, audit,
+ * export). Row/segment pins are counted separately and never block raw trim. */
+export type V2RawPinHolder = 'replay' | 'decoder-checkpoint' | 'audit' | 'export';
+export interface V2RawPinCensus {
+  readonly schema: typeof NEWARCH_V2_VERSION; readonly pane: PaneKey; readonly epoch: PipeEpoch;
+  readonly revision: number; readonly writerGeneration: V2WriterGeneration;
+  readonly rawPins: readonly { readonly pinId: string; readonly holder: V2RawPinHolder; readonly from: RawPosition }[];
+  readonly rowPins: number;
+}
+/** Structural trim guard + census taken at the checkpoint revision: no raw pin
+ * may start below trimThrough. Replaces the trimUnpinned=true constant. */
+export function v2RawTrimUnpinned(a: V2TrimAuthorization, census: V2RawPinCensus, current: V2WriterGeneration): boolean {
+  return v2Guard(() => v2TrimWithinCheckpoint(a) && census.schema === NEWARCH_V2_VERSION
+    && v2PaneKey(census.pane) === v2PaneKey(a.checkpoint.pane) && v2SameEpoch(census.epoch, a.trimThrough.epoch)
+    && census.revision === a.checkpoint.revision && census.writerGeneration === current
+    && a.receipt.generation === current
+    && census.rawPins.every(p => v2SameEpoch(p.from.epoch, census.epoch) && p.from.byteOffset >= a.trimThrough.byteOffset));
+}
+/** H implements (read-only, no write capability). Maps 1:1 onto S's existing
+ * V2SourceOptions.trimUnpinned / incidentResolved callbacks. */
+export interface V2HistoryAuthority {
+  writerGeneration(): Result<V2WriterGeneration>;
+  incidentResolution(pane: PaneKey, incidentId: string): Result<V2IncidentResolution | null>;
+  rawPins(pane: PaneKey, epoch: PipeEpoch): Result<V2RawPinCensus>;
+}
+
+/** Cursor scope (D1/D3): a cursor is usable only for the pane it was minted for. */
+export function v2CursorForPane(pane: PaneKey, cursor: NewarchV2HistoryCursor | null): NewarchV2HistoryCursor | null {
+  if (cursor === null) return null;
+  return v2Guard(() => cursor.schema === NEWARCH_V2_VERSION && v2PaneKey(cursor.pane) === v2PaneKey(pane)) ? cursor : null;
+}
