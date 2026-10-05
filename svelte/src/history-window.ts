@@ -1129,6 +1129,132 @@ export function presentNewarchV2(
   };
 }
 
+// --- NEWARCH fit-font (plan §6): font that fits birth columns, never a resize ---
+
+/** Horizontal padding TermView puts around the line: 6px each side. */
+export const FONT_FIT_GUTTER_PX = 12;
+
+/** Granularity of the fit search, in CSS pixels. */
+export const FONT_FIT_STEP_PX = 0.05;
+
+/** Upper bound on cell measurements after the first guess. */
+export const FONT_FIT_MAX_PROBES = 8;
+
+/**
+ * Cell-to-font ratio used **only** when the measure returns nothing usable
+ * (canvas not ready, font not loaded). It is a stand-in until the caller
+ * re-measures — never the answer on a real screen, because installed fonts
+ * give different cells.
+ */
+export const FONT_FIT_FALLBACK_CELL_RATIO = 0.6;
+
+export type NewarchFontFitInput = {
+  /** Birth columns of the fixed-geometry pane. */
+  columns: number;
+  /** Width of the terminal box in CSS pixels, gutter included. */
+  containerWidthPx: number;
+  /** Padding subtracted from the box. Defaults to `FONT_FIT_GUTTER_PX`. */
+  gutterPx?: number;
+  /** The user's size — the result never exceeds it. */
+  ceilingPx: number;
+  /** Lower and upper limits in CSS pixels (the shell's `fontPxMin` / `fontPxMax`). */
+  bounds: { readonly min: number; readonly max: number };
+  /** Width of one cell at a given font size, as measured by the renderer. */
+  measureCellPx: (fontPx: number) => number;
+  /** Defaults to `auto`. */
+  mode?: 'auto' | 'manual';
+};
+
+export type NewarchFontFitResult = {
+  /** Size to render, at most two decimals. */
+  fontPx: number;
+  /** Whether `columns` cells fit the usable width at that size (no sideways scroll). */
+  fits: boolean;
+};
+
+/** Clamp without rounding; non-finite falls back to the stock 13px. */
+function clampExact(value: number, bounds: { readonly min: number; readonly max: number }): number {
+  const fallback = Number.isFinite(value) ? value : 13;
+  if (fallback < bounds.min) return bounds.min;
+  if (fallback > bounds.max) return bounds.max;
+  return fallback;
+}
+
+/** Floor to two decimals, tolerating float noise just under a hundredth. */
+function floor2(value: number): number {
+  return Math.floor(value * 100 + 1e-6) / 100;
+}
+
+/**
+ * Font size that makes a fixed-geometry pane's columns fit its box.
+ *
+ * Pure: it returns a size and whether it fits — never a resize. tmux keeps the
+ * geometry the pane was born with; only the browser's font changes.
+ *
+ * - `manual`, or no usable geometry/width yet (columns ≤ 0, box not laid out):
+ *   the ceiling as-is. An unlaid box does not collapse the font to the floor.
+ * - Wide box: the ceiling exactly — the desktop never grows past the user size.
+ * - Narrow box: the largest size on the 0.05px grid whose `columns × cell`
+ *   fits, starting from the proportional guess and probing at most
+ *   `FONT_FIT_MAX_PROBES` times. Never below `bounds.min`; if the floor still
+ *   overflows, `fits` is false and the caller scrolls sideways.
+ */
+export function fitNewarchFontPx(input: NewarchFontFitInput): NewarchFontFitResult {
+  const { columns, containerWidthPx, bounds } = input;
+  const gutter = typeof input.gutterPx === 'number' && Number.isFinite(input.gutterPx)
+    ? input.gutterPx
+    : FONT_FIT_GUTTER_PX;
+  const ceiling = floor2(clampExact(input.ceilingPx, bounds));
+  const usable = containerWidthPx - gutter;
+
+  const cellAt = (px: number): number => {
+    const measured = input.measureCellPx(px);
+    return Number.isFinite(measured) && measured > 0
+      ? measured
+      : px * FONT_FIT_FALLBACK_CELL_RATIO;
+  };
+  // 1e-6 absorbs float noise such as 70 × 9 × 0.6 = 378.00000000000006.
+  const fitsAt = (px: number): boolean => columns * cellAt(px) <= usable + 1e-6;
+
+  if (!Number.isFinite(columns) || columns <= 0 || !Number.isFinite(usable) || usable <= 0) {
+    return { fontPx: ceiling, fits: false };
+  }
+  if (input.mode === 'manual') {
+    return { fontPx: ceiling, fits: fitsAt(ceiling) };
+  }
+  if (fitsAt(ceiling)) {
+    return { fontPx: ceiling, fits: true };
+  }
+
+  const floor = bounds.min;
+  const snap = (px: number): number => {
+    const grid = Math.floor(px / FONT_FIT_STEP_PX + 1e-6) * FONT_FIT_STEP_PX;
+    return Math.min(ceiling, Math.max(floor, floor2(grid)));
+  };
+
+  let candidate = snap(ceiling * usable / (columns * cellAt(ceiling)));
+  let best: number | null = null;
+  for (let probe = 0; probe < FONT_FIT_MAX_PROBES; probe++) {
+    if (fitsAt(candidate)) {
+      if (best === null || candidate > best) best = candidate;
+      const up = snap(candidate + FONT_FIT_STEP_PX);
+      // Converged: the next step overflows (it is known not to fit at the ceiling).
+      if (up <= candidate || !fitsAt(up)) break;
+      candidate = up;
+    } else {
+      if (candidate <= floor) break;
+      // Re-aim from the cell measured at this size: a cell that is not
+      // proportional to the font can leave the first guess many steps high,
+      // and stepping down 0.05px would run out of probes and fall to the floor.
+      const aimed = snap(candidate * usable / (columns * cellAt(candidate)));
+      candidate = aimed < candidate ? aimed : snap(candidate - FONT_FIT_STEP_PX);
+    }
+  }
+
+  if (best !== null) return { fontPx: best, fits: true };
+  return { fontPx: floor, fits: fitsAt(floor) };
+}
+
 /** Map a viewport point through scroll and fit-width scale onto the fixed grid. */
 export function hitNewarchV2Cell(
   presentation: NewarchV2Presentation,

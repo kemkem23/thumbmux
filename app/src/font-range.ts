@@ -72,3 +72,38 @@ export function stepFontPx(from: number, dir: 1 | -1): number {
   const inc = size >= 32 ? 4 : size >= 20 ? 2 : 1;
   return from + dir * inc;
 }
+
+/**
+ * Clamp a **computed** size into bounds without rounding it to a whole pixel.
+ *
+ * `clampFontPx` rounds because it gates A+/A− and stored preferences, which
+ * stay whole numbers. A size that the fit formula derived from a measured cell
+ * must keep its fraction: on a 378px line, 76 columns fit at ~8.29px, and
+ * rounding that to 8 leaves room for 78 (sweep table, NEWARCH fit-font plan
+ * §2). Non-finite input falls back to the stock default, then clamps.
+ */
+export function clampFontPxExact(value: number, bounds: FontBounds): number {
+  const fallback = Number.isFinite(value) ? value : DEFAULT_FONT_PX;
+  if (fallback < bounds.min) return bounds.min;
+  if (fallback > bounds.max) return bounds.max;
+  return fallback;
+}
+
+/**
+ * `auto` shrinks the font so a fixed-geometry pane's columns fit the box;
+ * `manual` shows the user's size as-is and lets the line scroll sideways.
+ */
+export type FontFitMode = 'auto' | 'manual';
+
+/**
+ * Read a stored `fontFit` preference. Only the literal `'manual'` opts out —
+ * a missing, mistyped, or foreign value is `auto`, the default for NEWARCH
+ * panes.
+ */
+export function resolveFontFitMode(value: unknown): FontFitMode {
+  return value === 'manual' ? 'manual' : 'auto';
+}
+
+// The fit formula itself lives with TermView in @thumbmux/svelte
+// (`fitNewarchFontPx` in history-window.ts): the app package depends on svelte,
+// so a copy here could only drift from the one the screen actually uses.

@@ -43,6 +43,7 @@
     historyWindowRequestCursor,
     parseNewarchHistoryExtension,
     presentNewarchV2,
+    fitNewarchFontPx,
     type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
@@ -206,8 +207,22 @@
     onClaudeBashSummaryRequest = undefined,
     /** Birth geometry of a NEWARCH pane. Viewport changes must not resize it. */
     fixedGeometry = null,
-    /** Shrink the picture to the viewport. Does not change terminal columns. */
+    /** Shrink the picture to the viewport. Does not change terminal columns.
+     * Only in `fontFit: 'manual'` — `auto` already fits by font, and scaling
+     * on top would shrink twice. */
     fitWidth = false,
+    /** Fixed-geometry panes only. `auto` shrinks the font (never below
+     * `fontFitFloorPx`, never above `fontPx`) until the birth columns fit the
+     * box; `manual` shows `fontPx` and scrolls sideways. No resize either way. */
+    fontFit = 'auto',
+    /** Lower bound of the `auto` font — the shell's `fontPxMin`. */
+    fontFitFloorPx = 4,
+    /** Fixed-geometry panes only: px kept clear under the live tail for a
+     * floating control (the ❯ button), so the prompt row is not covered. */
+    tailClearancePx = 0,
+    /** Size actually drawn on a fixed-geometry pane, and whether the birth
+     * columns fit without sideways scrolling. */
+    onFontFit = undefined,
     /** Incident sentence drawn even when this view has no live pane. */
     v2StatusText = null,
   }: {
@@ -259,6 +274,10 @@
     ) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
     fixedGeometry?: { columns: number; rows: number } | null;
     fitWidth?: boolean;
+    fontFit?: 'auto' | 'manual';
+    fontFitFloorPx?: number;
+    tailClearancePx?: number;
+    onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
     v2StatusText?: string | null;
   } = $props();
 
@@ -364,7 +383,17 @@
   let viewportWidthPx = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
   let viewH = $state(0);
-  let lineH = $derived(Math.round(fontPx * LINE_RATIO));
+  // NEWARCH fit-font: the size the fit formula chose for a fixed pane. `fontPx`
+  // stays the user's ceiling; this is never written back to prefs.
+  let fitFontPx = $state<number | null>(null);
+  // How far a manual fixed pane is panned sideways. Box-pinned overlays are
+  // children of the scrolling `.mtv`, so they shift back by this much.
+  let panX = $state(0);
+  let autoFit = $derived(fixedGeometry != null && fontFit !== 'manual');
+  let renderFontPx = $derived(autoFit && fitFontPx !== null ? fitFontPx : fontPx);
+  // A picture scale only exists in manual; auto fits by font (one shrink).
+  let scaleToWidth = $derived(fitWidth && !autoFit);
+  let lineH = $derived(Math.round(renderFontPx * LINE_RATIO));
 
   // --- content model ---
   let rawLines: string[] = [];
@@ -594,6 +623,10 @@
   let springFrame: number | null = null;
   let momentumWindowFrozen = false;
   let touchY = 0;
+  let touchX = 0;
+  // Axis a one-finger gesture locked to. Only a manual fixed pane wider than
+  // the box can lock 'x'; everything else is 'y' from the first move.
+  let touchAxis: 'x' | 'y' | null = null;
   let touchVel = 0;
   let touchAt = 0;
   let pendingDragPx = 0;
@@ -2595,8 +2628,26 @@
     return true;
   }
 
+  /** Fixed pane: blank rows below both the last content line and the caret.
+   * A NEWARCH pane is born taller than a phone shows (120 rows vs ~59), and
+   * tmux sends those rows; following the pane's real bottom would park the
+   * reader on an empty screen while the prompt sits far above. */
+  function fixedBlankTailPx(contentHeight: number): number {
+    if (!fixedGeometry || rawLines.length === 0) return 0;
+    const lastContent = lastContentLine(contentEpoch);
+    const caretBelow = cursor && cursor.row < 0 ? -cursor.row : 0;
+    const keepRaw = Math.min(rawLines.length, lastContent + 1 + caretBelow);
+    if (keepRaw >= rawLines.length) return 0;
+    return Math.max(0, contentHeight - presentationRowTopPx(visualRowForRaw(keepRaw)));
+  }
+
   function maxOffset(): number {
-    const contentHeight = presentationContentHeightPx();
+    const fullHeight = presentationContentHeightPx();
+    const contentHeight = fullHeight - fixedBlankTailPx(fullHeight);
+    // The live tail ends tailClearancePx above the box bottom (fixed panes).
+    const viewEff = fixedGeometry
+      ? Math.max(1, viewH - Math.max(0, Number.isFinite(tailClearancePx) ? tailClearancePx : 0))
+      : Math.max(1, viewH);
     if (
       historyPaging === 'sliding'
       && archiveWindow !== null
@@ -2612,9 +2663,9 @@
       const liveStart = visualRowForRaw(archivedLines.length);
       const liveTop = presentationRowTopPx(liveStart);
       const liveHeight = Math.max(0, contentHeight - liveTop);
-      return Math.max(0, liveTop + Math.max(0, liveHeight - Math.max(1, viewH)));
+      return Math.max(0, liveTop + Math.max(0, liveHeight - viewEff));
     }
-    return Math.max(0, contentHeight - Math.max(1, viewH));
+    return Math.max(0, contentHeight - viewEff);
   }
 
   /** Preserve an off-bottom row's physical screen position across layout.
@@ -6129,7 +6180,7 @@
       const y = presentationRowTopPx(winStart) - scrollTop - (overshoot * 0.35);
       const translate = `translate3d(0, ${y.toFixed(2)}px, 0)`;
       // Fit-width scales the picture only. Birth columns stay on the grid.
-      if (fixedGeometry && fitWidth && fixedPresentation && fixedPresentation.scale > 0) {
+      if (fixedGeometry && scaleToWidth && fixedPresentation && fixedPresentation.scale > 0) {
         layerEl.style.transformOrigin = 'top left';
         layerEl.style.transform = `${translate} scale(${fixedPresentation.scale})`;
       } else {
@@ -6172,10 +6223,31 @@
     return e.deltaY;
   }
 
+  // Sideways wheel on a manual fixed pane: a trackpad's deltaX, or shift+wheel
+  // where the browser still reports deltaY. Vertical-dominant wheels fall
+  // through to history scrolling untouched.
+  function panWheelX(e: WheelEvent): boolean {
+    if (!canPanX() || !viewportEl) return false;
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+    if (dx === 0 || Math.abs(dx) <= Math.abs(dy)) return false;
+    const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? Math.max(1, charW || 8)
+      : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? viewportEl.clientWidth : 1;
+    viewportEl.scrollLeft += dx * unit;
+    return true;
+  }
+
   function onWheel(e: WheelEvent) {
     updateSelectionActive();
     if (selectionActive) return;
 
+    if (panWheelX(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (useSgrMouse) {
       forwardAltWheel(e);
       return;
@@ -6235,8 +6307,8 @@
     const cellW = Math.max(1, charW || measureCharWidth());
     if (fixedGeometry) {
       const naturalW = geom.cols * cellW;
-      const scale = fitWidth && naturalW > 0 ? Math.max(bounds.width, 1) / naturalW : 1;
-      const scrollX = fitWidth ? 0 : viewportEl.scrollLeft;
+      const scale = scaleToWidth && naturalW > 0 ? Math.max(bounds.width, 1) / naturalW : 1;
+      const scrollX = scaleToWidth ? 0 : viewportEl.scrollLeft;
       return {
         rect: {
           left: bounds.left - scrollX,
@@ -6371,6 +6443,16 @@
     flushPendingContent();
   }
 
+  // A manual fixed pane draws its birth columns at the user's size and lets
+  // them run past the box (`.mtv-fixed` overflow-x). `.mtv` is touch-action:
+  // none, so the browser never pans it — the sideways motion is ours to apply.
+  function canPanX(): boolean {
+    return !!viewportEl && fixedGeometry != null && !autoFit && !scaleToWidth
+      && viewportEl.scrollWidth - viewportEl.clientWidth > 0.5;
+  }
+
+  const AXIS_LOCK_PX = 6;
+
   // --- gesture physics (px-true, no quantization, iOS decel curve) ---
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
@@ -6388,6 +6470,8 @@
         return;
       }
       altTouchY = touch.clientY;
+      touchX = touch.clientX;
+      touchAxis = canPanX() ? null : 'y';
       altTouchHitArea = contentHitArea();
       return;
     }
@@ -6401,6 +6485,8 @@
     pendingDragPx = 0;
     tapStart = { x: touch.clientX, y: touch.clientY, t: performance.now() };
     touchY = touch.clientY;
+    touchX = touch.clientX;
+    touchAxis = canPanX() ? null : 'y';
     touchAt = performance.now();
     touchVel = 0;
   }
@@ -6430,6 +6516,21 @@
       }
       e.stopPropagation();
       if (e.cancelable) e.preventDefault();
+      if (touchAxis === null) {
+        const ax = Math.abs(touch.clientX - touchX);
+        const ay = Math.abs(touch.clientY - altTouchY);
+        if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+        touchAxis = ax > ay ? 'x' : 'y';
+      }
+      if (touchAxis === 'x') {
+        const dx = touch.clientX - touchX;
+        touchX = touch.clientX;
+        if (dx !== 0 && viewportEl) {
+          altTouchMoved = true; // a pan is not a tap on touchend
+          viewportEl.scrollLeft -= dx;
+        }
+        return;
+      }
       const dy = touch.clientY - altTouchY;
       altTouchY = touch.clientY;
       if (dy !== 0) {
@@ -6457,6 +6558,20 @@
     e.preventDefault();
     const touch = e.touches.item(0);
     if (!touch) return;
+    if (touchAxis === null) {
+      // Hold still until the finger shows a direction; the held distance is
+      // applied on the locked axis, so nothing is lost.
+      const ax = Math.abs(touch.clientX - touchX);
+      const ay = Math.abs(touch.clientY - touchY);
+      if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+      touchAxis = ax > ay ? 'x' : 'y';
+    }
+    if (touchAxis === 'x') {
+      const dx = touch.clientX - touchX;
+      touchX = touch.clientX;
+      if (dx !== 0 && viewportEl) viewportEl.scrollLeft -= dx;
+      return;
+    }
     const y = touch.clientY;
     const dy = y - touchY;
     touchY = y;
@@ -6752,18 +6867,39 @@
 
   let measureCtx: CanvasRenderingContext2D | null = null;
 
-  function measureFontSpec(): string {
+  function measureFontSpec(px: number = renderFontPx): string {
     // Measure the font the DOM actually renders — hardcoding a family drifts
     // the col math when that font isn't installed (issue #1).
     const fam = (viewportEl && getComputedStyle(viewportEl).fontFamily) || "'JetBrains Mono', monospace";
-    return `${fontPx}px ${fam}`;
+    return `${px}px ${fam}`;
   }
 
-  function measureCharWidth(): number {
+  function measureCharWidth(px: number = renderFontPx): number {
     if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
-    if (!measureCtx) return fontPx * 0.6;
-    measureCtx.font = measureFontSpec();
+    if (!measureCtx) return px * 0.6;
+    measureCtx.font = measureFontSpec(px);
     return measureCtx.measureText('MMMMMMMMMM').width / 10;
+  }
+
+  let lastFontFit: { fontPx: number; fits: boolean } | null = null;
+  /** Fixed pane: choose the drawn size from the box width. Pure presentation —
+   * tmux keeps its birth geometry, so nothing here can reach sendResize. */
+  function fitFixedFont(geometry: { columns: number; rows: number }, widthPx: number): number {
+    const floor = Number.isFinite(fontFitFloorPx) && fontFitFloorPx > 0 ? fontFitFloorPx : 4;
+    const fit = fitNewarchFontPx({
+      columns: geometry.columns,
+      containerWidthPx: widthPx,
+      ceilingPx: fontPx,
+      bounds: { min: Math.min(floor, fontPx), max: Math.max(floor, fontPx) },
+      measureCellPx: (px) => measureCharWidth(px),
+      mode: fontFit === 'manual' ? 'manual' : 'auto',
+    });
+    fitFontPx = fit.fontPx;
+    if (!lastFontFit || lastFontFit.fontPx !== fit.fontPx || lastFontFit.fits !== fit.fits) {
+      lastFontFit = fit;
+      onFontFit?.(fit);
+    }
+    return measureCharWidth(autoFit ? fit.fontPx : fontPx);
   }
 
   // Caret column on the terminal grid. Dual-width glyphs (CJK/emoji) are
@@ -6774,7 +6910,7 @@
   let cursorPosCache = { key: '', left: 0, width: 0 };
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
-    const key = `${col}|${fontPx}|${charW}|${raw}`;
+    const key = `${col}|${renderFontPx}|${charW}|${raw}`;
     if (cursorPosCache.key === key) return cursorPosCache;
     const left = col * charW;
     let width = charW;
@@ -6837,15 +6973,16 @@
     // docked composer shrinks what's visible, not the pane the agent runs in.
     const h = visibleH + Math.max(0, bottomInsetPx);
     if (w <= 0 || visibleH <= 0 || h <= 0) return null;
-    const cw = measureCharWidth();
-    charW = cw;
     if (fixedGeometry) {
+      charW = fitFixedFont(fixedGeometry, w);
       viewportWidthPx = w;
       lastPushedCols = fixedGeometry.columns;
       lastPushedRows = fixedGeometry.rows;
       applyScroll();
       return { cols: lastPushedCols, rows: lastPushedRows, changed: false };
     }
+    const cw = measureCharWidth();
+    charW = cw;
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
     const rows = Math.max(minRows, Math.min(maxRows, Math.floor(h / lineH)));
     const changed = !!opts.force || cols !== lastPushedCols || rows !== lastPushedRows;
@@ -6912,12 +7049,55 @@
   let lastFontPx: number | null = null;
   $effect(() => {
     if (lastFontPx !== null && fontPx !== lastFontPx) {
-      // Paint on every tap. Only the tmux resize is deferred — a burst of
-      // A+ must not reprint the agent header N times (BRIEF-H).
-      refreshVisualLayout();
-      scheduleFontResize();
+      if (untrack(() => fixedGeometry) != null) {
+        // A fixed pane never resizes, so there is nothing to debounce: refit
+        // the drawn size against the new ceiling right away.
+        untrack(() => measureGeometry());
+        refreshVisualLayout();
+      } else {
+        // Paint on every tap. Only the tmux resize is deferred — a burst of
+        // A+ must not reprint the agent header N times (BRIEF-H).
+        refreshVisualLayout();
+        scheduleFontResize();
+      }
     }
     lastFontPx = fontPx;
+  });
+
+  // Birth geometry usually lands after mount: SessionView mounts this view
+  // while the inventory is pending, and no viewport change follows the row.
+  // Refit on the prop itself, or the first legacy-style measure (e.g. 48 cols
+  // at 13px) stays on screen until the phone is rotated.
+  let lastFixedKey: string | null | undefined = undefined;
+  $effect(() => {
+    const key = fixedGeometry ? `${fixedGeometry.columns}x${fixedGeometry.rows}` : null;
+    if (lastFixedKey !== undefined && key !== lastFixedKey) {
+      untrack(() => {
+        if (key === null) {
+          // Became a legacy pane: drop the fit and measure the old way, which
+          // re-claims only if this host claims (canSendResize).
+          fitFontPx = null;
+          lastFontFit = null;
+          lastPushedCols = 0;
+          pushGeometry({ force: true });
+        } else {
+          measureGeometry();
+        }
+        refreshVisualLayout();
+      });
+    }
+    lastFixedKey = key;
+  });
+
+  // auto ⇄ manual, or a new floor: refit only (no resize — fixed panes only).
+  let lastFontFitKey: string | null = null;
+  $effect(() => {
+    const key = `${fontFit}|${fontFitFloorPx}`;
+    if (lastFontFitKey !== null && key !== lastFontFitKey && untrack(() => fixedGeometry) != null) {
+      untrack(() => measureGeometry());
+      refreshVisualLayout();
+    }
+    lastFontFitKey = key;
   });
 
   const warnedBottomInsetValues = new Set<number>();
@@ -7374,7 +7554,7 @@
             cellWidthPx: charW,
             cellHeightPx: lineH,
             keyboardInsetPx: bottomInsetPx,
-            fitWidth,
+            fitWidth: scaleToWidth,
             scrollXPx: 0,
           },
         )
@@ -7391,7 +7571,7 @@
   bind:this={viewportEl}
   class="mtv"
   class:mtv-fixed={fixedGeometry != null}
-  class:mtv-fit={fixedGeometry != null && fitWidth}
+  class:mtv-fit={fixedGeometry != null && scaleToWidth}
   data-testid="mtv"
   data-total={total}
   data-raw-total={rawLines.length}
@@ -7414,6 +7594,9 @@
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
+  data-font-fit={fixedGeometry ? (autoFit ? 'auto' : 'manual') : undefined}
+  data-font-px={fixedGeometry ? renderFontPx : undefined}
+  data-tail-clearance={fixedGeometry ? tailClearancePx : undefined}
   data-history-stop={historyStopReason}
   data-history-states={historyStatus.length ? historyStatus.map(note => note.kind).join(' ') : undefined}
   data-history-paging={historyPaging}
@@ -7440,10 +7623,11 @@
   data-live-cursor-col={cursor?.col}
   data-content-update-busy={busy() ? '1' : '0'}
   data-content-update-selection={selectionActive ? '1' : '0'}
-  style:font-size={`${fontPx}px`}
+  style:font-size={`${renderFontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
   style:--mtv-cw={charW > 0 ? `${charW}px` : '1ch'}
+  style:--mtv-pan-x={fixedGeometry && panX ? `${panX}px` : undefined}
   style:--tfg={palette.defaultFg}
   style:--tbg={palette.defaultBg}
   ontouchstart={onTouchStart}
@@ -7453,6 +7637,7 @@
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
   onwheel={onWheel}
+  onscroll={() => { panX = fixedGeometry && viewportEl ? viewportEl.scrollLeft : 0; }}
   onclick={onClick}
 >
   {#if searchOpen}
@@ -7504,7 +7689,7 @@
         cols={Math.max(1, lastPushedCols)}
         cellWidth={charW}
         lineHeight={lineH}
-        fontSize={fontPx}
+        fontSize={renderFontPx}
         fontFamily={canvasFontFamily}
         vectorFont={canvasVectorFont}
         strokeWidth={canvasStrokeWidth}
@@ -7840,6 +8025,14 @@
   .mtv-fixed.mtv-fit {
     overflow-x: hidden;
   }
+  .mtv-fixed > .mtv-search,
+  .mtv-fixed > .mtv-v2-status,
+  .mtv-fixed > .mtv-hscroll,
+  .mtv-fixed > .mtv-wait,
+  .mtv-fixed > .mtv-no-scrollback,
+  .mtv-fixed > .mtv-loss-notes {
+    translate: var(--mtv-pan-x, 0px) 0;
+  }
   .mtv-v2-status,
   .mtv-hscroll {
     position: absolute;
@@ -7869,6 +8062,9 @@
   }
   .mtv-fixed .mtv-layer-fixed {
     right: auto;
+    /* fixedLayerWidth already counts the 6+6 gutter; content-box would add
+       the padding again and scroll a fitted pane sideways by 12px. */
+    box-sizing: border-box;
   }
   .mtv-line {
     white-space: pre;

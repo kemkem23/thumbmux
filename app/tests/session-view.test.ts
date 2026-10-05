@@ -37,17 +37,37 @@ type Mounted = { app: Record<string, unknown>; target: HTMLElement };
 
 class ControlledResizeObserver implements ResizeObserver {
   static latest: ControlledResizeObserver | null = null;
+  /** Every live observer with what it watches. `latest` alone is not the
+   *  terminal's: SessionView mounts ActionFab after TermView, and the FAB
+   *  observes its own slots — firing `latest` there never reached TermView. */
+  static live = new Set<ControlledResizeObserver>();
+  readonly targets = new Set<Element>();
 
   constructor(private readonly callback: ResizeObserverCallback) {
     ControlledResizeObserver.latest = this;
+    ControlledResizeObserver.live.add(this);
   }
 
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
+  observe(target: Element): void { this.targets.add(target); }
+  unobserve(target: Element): void { this.targets.delete(target); }
+  disconnect(): void {
+    this.targets.clear();
+    ControlledResizeObserver.live.delete(this);
+  }
 
   fire(): void {
     this.callback([], this);
+  }
+
+  /** Fire exactly the observers watching `element`; how many fired. */
+  static fireFor(element: Element): number {
+    let fired = 0;
+    for (const observer of [...ControlledResizeObserver.live]) {
+      if (!observer.targets.has(element)) continue;
+      observer.fire();
+      fired += 1;
+    }
+    return fired;
   }
 }
 
@@ -78,7 +98,9 @@ function diagnosticText(value: unknown): string {
 }
 
 function mountView(
-  component: Component,
+  // Any shell component; each case passes that component's own props.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  component: Component<any>,
   props: Record<string, unknown>,
 ): Mounted {
   const target = document.createElement('div');
@@ -410,6 +432,46 @@ describe('mountable terminal views', () => {
     const ownedFrames = resizeFrames.filter((frame) => frame.session === session);
     expect(ownedFrames.length).toBeGreaterThan(0);
     expect(ownedFrames.every((frame) => frame.cols > 0 && frame.rows > 0)).toBe(true);
+  });
+
+  test('EmbedView with a birth geometry fits the font, never resizes, and keeps ?font= as the ceiling', async () => {
+    ControlledResizeObserver.latest = null;
+    globalThis.ResizeObserver = ControlledResizeObserver;
+    window.ResizeObserver = ControlledResizeObserver;
+
+    const resizeFrames: Array<{ session: string; cols: number; rows: number }> = [];
+    tmuxMux.sendResize = ((session: string, cols: number, rows: number) => {
+      resizeFrames.push({ session, cols, rows });
+    }) as typeof tmuxMux.sendResize;
+
+    const session = 'cc-embed-fixed-geometry';
+    const { target } = mountView(EmbedView, {
+      session,
+      adapters: {} satisfies AppAdapters,
+      claimGeometry: true,
+      fontPx: 11,
+      fixedGeometry: { columns: 78, rows: 120 },
+    });
+    await tick();
+
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    if (!terminal) throw new Error('EmbedView did not render TermView');
+    for (const width of [390, 1280]) {
+      Object.defineProperties(terminal, {
+        clientWidth: { configurable: true, value: width },
+        clientHeight: { configurable: true, value: 600 },
+      });
+      if (ControlledResizeObserver.fireFor(terminal) === 0) {
+        throw new Error('TermView did not observe its viewport');
+      }
+      await tick();
+      expect(terminal.dataset.lastCols).toBe('78');
+      expect(terminal.dataset.fontFit).toBe('auto');
+      const shown = Number(terminal.dataset.fontPx);
+      if (width === 390) expect(shown).toBeLessThan(8.1);
+      else expect(shown).toBe(11);
+    }
+    expect(resizeFrames.filter((frame) => frame.session === session)).toEqual([]);
   });
 
   test('sessionMeta gets the host mux and millisecond timestamps, exactly as the hub does', async () => {
@@ -2352,6 +2414,7 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
 
   function installObserver(): void {
     ControlledResizeObserver.latest = null;
+    ControlledResizeObserver.live.clear();
     globalThis.ResizeObserver = ControlledResizeObserver;
     window.ResizeObserver = ControlledResizeObserver;
   }
@@ -2363,9 +2426,9 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
       clientWidth: { configurable: true, value: width },
       clientHeight: { configurable: true, value: height },
     });
-    const observer = ControlledResizeObserver.latest;
-    if (!observer) throw new Error('TermView did not observe its viewport');
-    observer.fire();
+    if (ControlledResizeObserver.fireFor(terminal) === 0) {
+      throw new Error('TermView did not observe its viewport');
+    }
     await tick();
   }
 
@@ -2504,6 +2567,105 @@ describe('NEWARCH v2 fixed geometry reaches the real terminal', () => {
     await flushPromises();
     await resizeViewport(target, 640, 320);
     expect(frames.filter((frame) => frame.session === session).length).toBeGreaterThan(0);
+  });
+
+  // NEWARCH fit-font (plan §5 / §8 F-SHELL): the birth geometry must reach
+  // TermView itself — a data attribute on the wrapper fits nothing.
+  test('a selected 78x120 pane hands fixedGeometry to TermView, which fits the font and clears the FAB', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const session = 'cc-newarch-fitfont-selected';
+    controlledSessionsFeed([
+      { name: session, newarchV2: { kind: 'selected', pane: v2Pane('%21', 78, 120) } },
+    ]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: { termProps: () => ({ claimGeometry: true }) } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(target, 390, 700);
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    expect(terminal?.classList.contains('mtv-fixed')).toBe(true);
+    expect(terminal?.dataset.lastCols).toBe('78');
+    expect(terminal?.dataset.lastRows).toBe('120');
+    expect(terminal?.dataset.fontFit).toBe('auto');
+    const shown = Number(terminal?.dataset.fontPx);
+    expect(shown).toBeGreaterThanOrEqual(8);
+    expect(shown).toBeLessThan(8.1);
+    expect(Number(terminal?.dataset.tailClearance)).toBeGreaterThan(0);
+
+    await resizeViewport(target, 844, 390);
+    expect(Number(terminal?.dataset.fontPx)).toBe(13);
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+  });
+
+  test('the font-fit switch saves fontFit only, keeps the ceiling, and shows the drawn size', async () => {
+    installObserver();
+    const frames = captureResizes();
+    const saved: Array<Partial<ThumbmuxPrefs>> = [];
+    const session = 'cc-newarch-fitfont-switch';
+    controlledSessionsFeed([
+      { name: session, newarchV2: { kind: 'selected', pane: v2Pane('%22', 78, 120) } },
+    ]);
+    const { target } = mountView(SessionView, {
+      session,
+      adapters: {
+        termProps: () => ({ claimGeometry: true }),
+        prefs: {
+          load: async () => ({ fontPx: 13 }),
+          save: async (patch) => { saved.push(patch); },
+        },
+      } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(target, 390, 700);
+    await openFab(target);
+    const toggle = () => target.querySelector<HTMLButtonElement>('[data-testid="demo-font-fit"]');
+    expect(toggle()?.textContent?.replace(/\s+/g, ' ').trim()).toMatch(/^FIT AUTO 8\.\d$/);
+
+    flushSync(() => toggle()?.click());
+    await tick();
+    expect(saved.at(-1)).toEqual({ fontFit: 'manual' });
+    expect(saved.some((patch) => 'fontPx' in patch)).toBe(false);
+    const terminal = target.querySelector<HTMLElement>('[data-testid="mtv"]');
+    expect(terminal?.dataset.fontFit).toBe('manual');
+    expect(Number(terminal?.dataset.fontPx)).toBe(13);
+    // The FAB stays open for a quick switch back, like A+/A−.
+    expect(target.querySelector('.slots')?.classList.contains('open')).toBe(true);
+    expect(toggle()?.textContent?.replace(/\s+/g, ' ').trim()).toBe('FIT MANUAL');
+
+    flushSync(() => toggle()?.click());
+    await tick();
+    expect(saved.at(-1)).toEqual({ fontFit: 'auto' });
+    expect(terminal?.dataset.fontFit).toBe('auto');
+    expect(frames.filter((frame) => frame.session === session)).toEqual([]);
+  });
+
+  test('a stored fontFit "manual" is honoured, and a legacy pane gets no font-fit switch', async () => {
+    installObserver();
+    captureResizes();
+    const session = 'cc-newarch-fitfont-stored';
+    controlledSessionsFeed([
+      { name: session, newarchV2: { kind: 'selected', pane: v2Pane('%23', 78, 120) } },
+      { name: 'sh-legacy-no-fit' },
+    ]);
+    const prefs = { load: async () => ({ fontFit: 'manual' }), save: async () => {} };
+    const fixed = mountView(SessionView, {
+      session,
+      adapters: { prefs } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await resizeViewport(fixed.target, 390, 700);
+    expect(fixed.target.querySelector<HTMLElement>('[data-testid="mtv"]')?.dataset.fontFit).toBe('manual');
+
+    const legacy = mountView(SessionView, {
+      session: 'sh-legacy-no-fit',
+      adapters: { prefs } satisfies AppAdapters,
+    });
+    await flushPromises();
+    await openFab(legacy.target);
+    expect(legacy.target.querySelector('[data-testid="demo-font-fit"]')).toBeNull();
+    expect(legacy.target.querySelector<HTMLElement>('[data-testid="mtv"]')?.dataset.fontFit).toBeUndefined();
   });
 
   test('a session that becomes v2 stops claiming geometry on the live row update', async () => {
