@@ -34,14 +34,39 @@ export const STREAM_BUDGET = Object.freeze({
  * retain order; undefined/nonfinite values are rejected instead of erased.
  * Pass the request WITHOUT its top-level digest. Nested digests are included.
  */
-export function streamCanonical(value: unknown): string {
-  if (value === null || typeof value === 'boolean') return JSON.stringify(value);
-  if (typeof value === 'string') { if (!value.isWellFormed()) throw Error('invalid Unicode'); return JSON.stringify(value); }
-  if (typeof value === 'number') { if (!Number.isFinite(value)) throw Error('nonfinite number'); return JSON.stringify(value); }
-  if (Array.isArray(value)) return '[' + value.map(streamCanonical).join(',') + ']';
-  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) throw Error('non-JSON value');
-  const object = value as Record<string, unknown>;
-  return '{' + Object.keys(object).sort().map(k => JSON.stringify(k) + ':' + streamCanonical(object[k])).join(',') + '}';
+/** Memo belongs to one synchronous operation only: frozen inputs can still
+ * contain mutable descendants, so no validation result survives a call. */
+function canonicalOperation(): (value: unknown) => string {
+  const objects = new WeakMap<object, string>();
+  const strings = new Map<string, string>();
+  const encode = (value: unknown): string => {
+    if (value === null || typeof value === 'boolean') return JSON.stringify(value);
+    if (typeof value === 'string') {
+      const prior = strings.get(value); if (prior !== undefined) return prior;
+      if (!value.isWellFormed()) throw Error('invalid Unicode');
+      const encoded = JSON.stringify(value); strings.set(value, encoded); return encoded;
+    }
+    if (typeof value === 'number') { if (!Number.isFinite(value)) throw Error('nonfinite number'); return JSON.stringify(value); }
+    if (typeof value !== 'object') throw Error('non-JSON value');
+    const prior = objects.get(value); if (prior !== undefined) return prior;
+    let encoded: string;
+    if (Array.isArray(value)) encoded = '[' + value.map(encode).join(',') + ']';
+    else {
+      if (Object.getPrototypeOf(value) !== Object.prototype) throw Error('non-JSON value');
+      const object = value as Record<string, unknown>;
+      encoded = '{' + Object.keys(object).sort().map(k => JSON.stringify(k) + ':' + encode(object[k])).join(',') + '}';
+    }
+    objects.set(value, encoded); return encoded;
+  };
+  return encode;
+}
+/** A fresh encoder. Share it only inside one synchronous call: the next call
+ * must see mutations of objects the previous call already encoded. */
+export function streamCanonicalEncoder(): (value: unknown) => string {
+  return canonicalOperation();
+}
+export function streamCanonical(value: unknown, encode?: (value: unknown) => string): string {
+  return (typeof encode === 'function' ? encode : canonicalOperation())(value);
 }
 export function streamDigest(kind: string, payload: unknown): string {
   return createHash('sha256').update(streamCanonical({ version: STREAM_CONTRACT_VERSION, kind, payload })).digest('hex');
@@ -1225,8 +1250,9 @@ export function v2SessionKey(s: NewarchV2SessionKey): string {
   v2Text(s.serverIdentity); v2Text(s.sessionId);
   return streamCanonical([s.serverIdentity, s.sessionId]);
 }
-export function v2Digest(kind: string, payload: unknown): Digest {
-  return createHash('sha256').update(streamCanonical({ schema: NEWARCH_V2_VERSION, kind, payload })).digest('hex');
+export function v2Digest(kind: string, payload: unknown, encode?: (value: unknown) => string): Digest {
+  const canonical = typeof encode === 'function' ? encode : canonicalOperation();
+  return createHash('sha256').update(canonical({ schema: NEWARCH_V2_VERSION, kind, payload })).digest('hex');
 }
 export function validateV2Config(c: V2Config): void {
   if (c.schema !== NEWARCH_V2_VERSION) throw Error('v2 schema');
@@ -1531,7 +1557,10 @@ export type V2ResumeProof = { readonly kind: 'continuous'; readonly pane: PaneKe
   readonly from: RawPosition; readonly through: RawPosition; readonly geometry: NewarchV2FixedGeometry;
   readonly sourceEvidence: EvidenceFile }
   | { readonly kind: 'unverified'; readonly reason: 'geometry' | 'raw' | 'collector-epoch' | 'identity' };
-export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
+export function validateV2Checkpoint(c: V2LiveCheckpoint, encode?: (value: unknown) => string): void {
+  validateCheckpointCanonical(c, typeof encode === 'function' ? encode : canonicalOperation());
+}
+function validateCheckpointCanonical(c: V2LiveCheckpoint, canonical: (value: unknown) => string): void {
   if (c.schema !== NEWARCH_V2_VERSION || c.geometry.policy !== 'fixed-at-birth' || c.geometry.panesPerWindow !== 1) throw Error('v2 checkpoint schema');
   v2PaneKey(c.pane); v2Text(c.checkpointId); v2Int(c.revision);
   v2Int(c.geometry.columns, 1, NEWARCH_V2_LIMITS.maxColumns); v2Int(c.geometry.rows, 1, NEWARCH_V2_LIMITS.maxRows);
@@ -1541,13 +1570,13 @@ export function validateV2Checkpoint(c: V2LiveCheckpoint): void {
   if (!sameContract(c.through.epoch, c.replayFloor.epoch) || v2PaneKey(c.through.epoch.pane) !== v2PaneKey(c.pane)
     || c.replayFloor.byteOffset > c.through.byteOffset) throw Error('v2 checkpoint raw');
   if (c.state.geometry.columns !== c.geometry.columns || c.state.geometry.rows !== c.geometry.rows
-    || v2Digest('vt-state', c.state) !== c.stateDigest) throw Error('v2 checkpoint state');
+    || createHash('sha256').update(canonical({schema: NEWARCH_V2_VERSION, kind: 'vt-state', payload: c.state})).digest('hex') !== c.stateDigest) throw Error('v2 checkpoint state');
   v2Int(c.pending.bytes, 0, NEWARCH_V2_LIMITS.pendingBytesPerPane);
   if (c.pending.rows.length > NEWARCH_V2_LIMITS.pendingRowsPerPane
     || (c.pending.rows.length > 0 || c.pending.bytes > 0) && c.pending.deadlineMonoMs === null) throw Error('v2 checkpoint pending');
   if (c.pending.deadlineMonoMs !== null) v2Int(c.pending.deadlineMonoMs);
-  if (Buffer.byteLength(streamCanonical(c.state)) > NEWARCH_V2_LIMITS.vtBytesPerPane
-    || Buffer.byteLength(streamCanonical(c)) > NEWARCH_V2_LIMITS.checkpointBytesPerPane) throw Error('v2 checkpoint bytes');
+  if (Buffer.byteLength(canonical(c.state)) > NEWARCH_V2_LIMITS.vtBytesPerPane
+    || Buffer.byteLength(canonical(c)) > NEWARCH_V2_LIMITS.checkpointBytesPerPane) throw Error('v2 checkpoint bytes');
 }
 export function validateV2Incident(i: NewarchV2Incident): void {
   if (i.schema !== NEWARCH_V2_VERSION) throw Error('v2 incident schema');
@@ -1780,13 +1809,14 @@ export interface V2DecodePrefix {
   readonly checkpoint: V2LiveCheckpoint; readonly stop: V2PrefixStop;
   readonly suffix: RawRange | null;
 }
-export function v2RowsSerializedBytes(rows: readonly CommittedStreamRow[]): number {
-  return Buffer.byteLength(streamCanonical(rows));
+export function v2RowsSerializedBytes(rows: readonly CommittedStreamRow[], encode?: (value: unknown) => string): number {
+  return Buffer.byteLength(streamCanonical(rows, encode));
 }
 /** Zero progress on non-empty input is not a prefix: C must emit a gap. */
 export function v2DecodePrefixValid(p: V2DecodePrefix, base: V2LiveCheckpoint): boolean {
   return v2Guard(() => {
-    validateV2Checkpoint(base); validateV2Checkpoint(p.checkpoint);
+    const canonical = canonicalOperation();
+    validateCheckpointCanonical(base, canonical); validateCheckpointCanonical(p.checkpoint, canonical);
     const L = NEWARCH_V2_PREFIX_LIMITS, c = p.checkpoint, key = v2PaneKey(p.pane);
     const epoch = base.through.epoch;
     if (p.schema !== NEWARCH_V2_VERSION || key !== v2PaneKey(base.pane) || key !== v2PaneKey(c.pane)) return false;

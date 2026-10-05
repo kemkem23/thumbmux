@@ -2,7 +2,7 @@
  * I supplies shared worker J transport and sealed source tap/spool adapters.
  * Runtime acceptance is not established; see lot C REPORT.md. */
 import {
-  STREAM_BUDGET as B, streamDigest, streamCanonical,
+  STREAM_BUDGET as B, streamDigest, streamCanonical, streamCanonicalEncoder,
   type AppendFinalized, type CancelToken, type CaptureEngine, type DurableInputReceipt,
   type DurableReceipt, type FinalizedRow, type FrameDelta, type GapEpisode,
   type HistoryEngine, type InputEvent, type LiveFrame, type PaneKey,
@@ -21,8 +21,11 @@ const sameIdentity = (a: StreamIdentity, b: StreamIdentity): boolean => samePane
 const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
 function immutable<T>(value: T): T {
   const copy = structuredClone(value);
+  const seen=new WeakSet<object>();
   function freeze(v: unknown): void {
-    if (v && typeof v === 'object') { for (const child of Object.values(v)) freeze(child); Object.freeze(v); }
+    if (v && typeof v === 'object' && !seen.has(v)) {
+      seen.add(v); for (const child of Object.values(v)) freeze(child); Object.freeze(v);
+    }
   }
   freeze(copy); return copy;
 }
@@ -1023,24 +1026,41 @@ export class CaptureCadence {
 // capture command or writer capability is available in this implementation.
 import { charCellWidth } from '@thumbmux/core';
 import {
-  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest,
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG,
+  v2Digest,
   v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
-  type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
+  type V2DecodePrefix, type V2PrefixStop, type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
   type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer,
 } from './stream-contract';
 import { v2ApplySgr } from './tmux-capture-normalize';
 
 type Writable<T> = { -readonly [P in keyof T]: T[P] extends readonly (infer U)[] ? Writable<U>[]
   : T[P] extends object ? Writable<T[P]> : T[P] };
+// Only objects recursively detached and frozen here may be shared. Merely
+// Object.isFrozen(input) is insufficient: its children could remain mutable.
+const ownedImmutable = new WeakSet<object>();
+function v2Immutable<T>(value: T): T {
+  const copies = new WeakMap<object, object>();
+  function copy(v: any): any {
+    if (!v || typeof v !== 'object' || ownedImmutable.has(v)) return v;
+    const prior = copies.get(v); if (prior) return prior;
+    const out: any = Array.isArray(v) ? [] : {};
+    copies.set(v, out);
+    for (const key of Object.keys(v)) out[key] = copy(v[key]);
+    Object.freeze(out); ownedImmutable.add(out); return out;
+  }
+  return copy(value);
+}
 const V2_CODEC = 'q22-vt-1';
 const v2Equal = (a: unknown, b: unknown) => streamCanonical(a) === streamCanonical(b);
-const v2Blank = (columns: number, style: readonly number[] = []): Writable<RowContent> => ({
-  cells: Array.from({length: columns}, () => ({text:' ',width:1,style:[...style]})),
-  softWrap:false,wrapPad:0,uncertainFields:[],
-});
+const v2Blank = (columns: number, style: readonly number[] = []): Writable<RowContent> => {
+  const cell = v2Immutable({text:' ',width:1 as const,style});
+  return {cells: Array(columns).fill(cell),softWrap:false,wrapPad:0,uncertainFields:[]};
+};
 function v2Buffer(columns: number, rows: number): Writable<VtBuffer> {
-  return {rows:Array.from({length:rows},()=>v2Blank(columns)),cursor:{x:0,y:0,visible:true},
+  const blank = v2Immutable(v2Blank(columns));
+  return {rows:Array(rows).fill(blank),cursor:{x:0,y:0,visible:true},
     savedCursor:{x:0,y:0,visible:true},savedAttributes:[],savedModes:{},wrapPending:false};
 }
 export function v2BirthCheckpoint(pane: NewarchV2PaneDescriptor, through: RawPosition,
@@ -1057,7 +1077,7 @@ export function v2BirthCheckpoint(pane: NewarchV2PaneDescriptor, through: RawPos
   const cp: V2LiveCheckpoint={schema:'newarch-v2',checkpointId:v2Digest('genesis',{pane:pane.pane,through}),
     pane:pane.pane,geometry:pane.geometry,through,replayFloor:through,revision:1,frontier:null,rule,state,
     stateDigest:v2Digest('vt-state',state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
-  validateV2Checkpoint(cp); return immutable(cp);
+  validateV2Checkpoint(cp); return v2Immutable(cp);
 }
 /** Clocks are explicit: replay uses the original observation, never Date.now(). */
 export interface V2DecisionContext {
@@ -1093,14 +1113,27 @@ export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): reado
     throw Error('v2 rule is not compiled into allowlist');
   // A selection must retain a safe terminal action; no eval or fallback to legacy.
   if(!config.rules.some(r=>r.ruleId==='explicit-gap')) throw Error('v2 explicit-gap required');
-  return immutable(definitions.filter(d=>config.rules.some(r=>r.ruleId===d.stamp.ruleId)));
+  return v2Immutable(definitions.filter(d=>config.rules.some(r=>r.ruleId===d.stamp.ruleId)));
 }
 
 /** One bounded transaction over a detached state. A failure discards EVERY
  * candidate, including scrolls preceding an unsupported control in this input. */
-function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scrolls:RowContent[];offsets:number[]} {
+class V2RowBoundary extends Error {
+  constructor(readonly byteOffset:number) { super('bounded row prefix'); }
+}
+function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.length, maxScrollRows=Infinity,
+  acceptScroll?: (row:RowContent, offset:number, index:number)=>boolean):
+  {state:VtState;scrolls:RowContent[];offsets:number[];rowBoundary:number|null} {
   if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
-  const s=structuredClone(state) as Writable<VtState>, {columns,rows}=s.geometry;
+  state=v2Immutable(state);
+  const cloneBuffer=(b:VtBuffer)=>({...b,rows:[...b.rows],cursor:{...b.cursor},savedCursor:{...b.savedCursor},
+    savedAttributes:[...b.savedAttributes],savedModes:{...b.savedModes}});
+  const s={...state,normal:cloneBuffer(state.normal),alternate:cloneBuffer(state.alternate),
+    geometry:{...state.geometry},modes:{...state.modes},margins:{...state.margins},tabStops:[...state.tabStops],
+    attributes:[...state.attributes],pendingUtf8:[...state.pendingUtf8],pendingEscape:[...state.pendingEscape]} as Writable<VtState>;
+  const {columns,rows}=s.geometry;
+  let writableRows=new WeakSet<object>();
+  let beforeByte:Writable<VtState>|null=null;
   for(const b of [s.normal,s.alternate]) {
     if(b.rows.length!==rows || b.rows.some(r=>r.cells.length!==columns || r.uncertainFields.length)
       || !counter(b.cursor.x)||b.cursor.x>=columns||!counter(b.cursor.y)||b.cursor.y>=rows)
@@ -1110,7 +1143,12 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
   let offset=0;
   const active=()=>s[s.active];
   const cursor=()=>active().cursor;
-  const row=()=>active().rows[cursor().y]!;
+  const row=()=>{
+    const b=active(),y=cursor().y,r=b.rows[y]!;
+    if(writableRows.has(r))return r;
+    const copy={...r,cells:[...r.cells],uncertainFields:[...r.uncertainFields]};
+    writableRows.add(copy);b.rows[y]=copy;return copy;
+  };
   const eraseStyle=()=>semanticStyleToSgr({...sgrToSemanticStyle(s.attributes),attrs:0,fg:-1});
   const blank=()=>v2Blank(columns,eraseStyle());
   const cancelWrap=()=>{active().wrapPending=false;s.wrapPending=false;};
@@ -1118,12 +1156,20 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
   const restore=()=>{const b=active();b.cursor={...b.savedCursor};s.attributes=[...b.savedAttributes];s.modes={...b.savedModes};cancelWrap();};
   const scroll=(n:number,down=false)=>{
     const b=active(),{top,bottom}=s.margins;
-    for(let k=0;k<Math.min(n,bottom-top+1);k++) {
+    const count=Math.min(n,bottom-top+1);
+    if(!down && s.active==='normal' && top===0 && bottom===rows-1 && out.length+count>maxScrollRows)
+      throw new V2RowBoundary(offset-1);
+    if(!down && s.active==='normal' && top===0 && bottom===rows-1 && acceptScroll) {
+      for(let k=0;k<count;k++)if(!acceptScroll(b.rows[top+k]!,offset,out.length+k))
+        throw new V2RowBoundary(offset-1);
+    }
+    for(let k=0;k<count;k++) {
       if(down){b.rows.splice(bottom,1);b.rows.splice(top,0,blank());}
       else {
         const removed=b.rows.splice(top,1)[0]!; b.rows.splice(bottom,0,blank());
         if(s.active==='normal' && top===0 && bottom===rows-1){out.push(removed);offsets.push(offset);
-          if(out.length>V2L.pendingRowsPerPane || size(out)>V2L.pendingBytesPerPane) throw Error('decoded row budget');}
+          if(out.length>V2L.pendingRowsPerPane || maxScrollRows===Infinity && size(out)>V2L.pendingBytesPerPane)
+            throw Error('decoded row budget');}
       }
     }
   };
@@ -1143,7 +1189,8 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     if(width===0 || cp===0xfe0f) {
       let x=active().wrapPending ? cursor().x : cursor().x-1;
       if(row().cells[x]?.width===0)x--;
-      const previous=row().cells[x];if(!previous)throw Error('orphan combining character');
+      const r=row(),cell=r.cells[x];if(!cell)throw Error('orphan combining character');
+      const previous={...cell,style:[...cell.style]};r.cells[x]=previous;
       if(Buffer.byteLength(previous.text)+Buffer.byteLength(text)>4096)throw Error('grapheme budget');
       previous.text+=text;
       if(cp===0xfe0f && previous.width===1){
@@ -1228,8 +1275,17 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     else throw Error('unsupported CSI action');
     cancelWrap();
   };
-  for(let i=0;i<bytes.length;i++){
+  try { for(let i=0;i<Math.min(bytes.length,maxBytes);i++){
     const byte=bytes[i]!;offset=i+1;
+    if(!Number.isInteger(byte)||byte<0||byte>255)throw Error('invalid byte');
+    // Only a scrolling byte can hit a boundary. Snapshot its small metadata
+    // and row vectors; subsequent cell edits use copy-on-write.
+    if(maxScrollRows!==Infinity && (byte===10||byte===11||byte===12||s.pendingEscape.length>0||active().wrapPending||cursor().x===columns-1)) {
+      beforeByte={...s,normal:cloneBuffer(s.normal),alternate:cloneBuffer(s.alternate),
+        modes:{...s.modes},margins:{...s.margins},tabStops:[...s.tabStops],attributes:[...s.attributes],
+        pendingUtf8:[...s.pendingUtf8],pendingEscape:[...s.pendingEscape]} as Writable<VtState>;
+      writableRows=new WeakSet<object>();
+    }
     if(s.pendingEscape.length){
       s.pendingEscape.push(byte);if(s.pendingEscape.length>4096)throw Error('escape budget');
       const p=s.pendingEscape;
@@ -1267,9 +1323,95 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     else if(byte===9){cursor().x=s.tabStops.find(x=>x>cursor().x)??columns-1;cancelWrap();}
     else if(byte===0||byte===7){} else if(byte<32||byte===127)throw Error('unsupported control');
     else print(String.fromCharCode(byte));
+  }} catch(cause) {
+    if(cause instanceof V2RowBoundary){
+      if(!beforeByte)throw Error('missing byte boundary snapshot');
+      beforeByte.wrapPending=beforeByte[beforeByte.active].wrapPending;
+      return {state:beforeByte,scrolls:out,offsets,rowBoundary:cause.byteOffset};
+    }
+    throw cause;
   }
   s.wrapPending=active().wrapPending;
-  return {state:s,scrolls:out,offsets};
+  return {state:s,scrolls:out,offsets,rowBoundary:null};
+}
+
+export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'gap'}>;
+
+/** Decode a bounded prefix once. A scrolling byte is transactional: either
+ * all its rows fit or its pre-byte snapshot becomes the checkpoint. The caller
+ * retains the unconsumed suffix; the decoder never scans it in advance. */
+export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
+  context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
+  const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
+  const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
+    // Evidence belongs to a gap, not each successful prefix of the same offer.
+    const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
+      bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
+      checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+    const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
+    return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
+  };
+  const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
+  try {
+    // One encoder for the input check, the per-row size probe, both digests
+    // and the output check. A later call still builds its own.
+    const encode = streamCanonicalEncoder();
+    validateV2Checkpoint(cp, encode);
+    const durableRevision=context.durableRevision??cp.revision;
+    if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
+    if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
+      ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
+    if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
+    if(!v2Equal(cp.through.epoch,raw.epoch))return gap('collector-epoch-changed','epoch');
+    if(!counter(raw.start)||!counter(raw.end)||raw.start!==cp.through.byteOffset||raw.end-raw.start!==input.bytes.length)
+      return gap('decoder-anomaly','raw continuity');
+    if(!counter(input.observedAtMonoMs)||input.pendingSinceMonoMs!==null&&(!counter(input.pendingSinceMonoMs)
+      ||input.pendingSinceMonoMs>input.observedAtMonoMs))return gap('decoder-anomaly','clock');
+    const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
+    const segmentId=context.rowTarget?.segmentId??cp.frontier?.segmentId??v2Digest('birth-segment',cp.pane);
+    const sameSegment=cp.frontier?.segmentId===segmentId;
+    const base=context.rowTarget?.nextRowOrdinal??(sameSegment?cp.frontier!.rowOrdinal+1:0);
+    if(typeof segmentId!=='string'||!segmentId||!segmentId.isWellFormed()
+      ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
+      ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
+    const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
+    const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
+        buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
+        uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
+    };
+    const probeRows:CommittedStreamRow[]=[],serializedEnds:number[]=[2];
+    let serializedBoundary=false,probeSerializedBytes=2;
+    const decoded=v2Decode(cp.state,input.bytes,rawCap,L.maxRows,(r,offset,index)=>{
+      const row=materializeOne(r,offset,index);
+      const originBytes=Buffer.byteLength(encode(row.origin)),cells=row.cellOrigins.length;
+      const rowBytes=Buffer.byteLength(encode({...row,cellOrigins:[]}))
+        +cells*originBytes+Math.max(0,cells-1);
+      const candidate=probeSerializedBytes+(index===0?0:1)+rowBytes;
+      if(candidate>L.maxSerializedBytes){serializedBoundary=true;return false;}
+      probeRows.push(row);probeSerializedBytes=candidate;serializedEnds.push(candidate);return true;
+    });
+    const consumed=decoded.rowBoundary??rawCap;
+    const stop:V2PrefixStop=decoded.rowBoundary!==null?(serializedBoundary?'serialized-bytes':'rows')
+      :input.bytes.length>rawCap?'raw-bytes':'complete';
+    if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
+    // A CSI may propose multiple rows in one byte; none are certified if that
+    // byte exceeds the budget. Keep exactly the scrolls actually committed.
+    const rows=probeRows.slice(0,decoded.scrolls.length);
+    const serializedBytes=serializedEnds[rows.length]!;
+    if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
+    const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
+    const checkpoint:V2LiveCheckpoint={...cp,
+      checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision},encode),through,replayFloor:through,revision,
+      frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state,encode),
+      pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+    validateV2Checkpoint(checkpoint, encode);
+    const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
+    const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
+      serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
+    return v2Immutable(prefix);
+  }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
 
 /** Call again with the SAME checkpoint and accumulated raw after defer. A
