@@ -350,6 +350,26 @@ function expectD2aDriverUnreadableRows(create: typeof createBunTmuxDriver = crea
 }
 
 describe("D2a bun driver listSessions attachment", () => {
+  test("incomplete session rows are skipped without inventing field values", () => {
+    withListSessionsOutput([
+      "name-only",
+      "missing-counts|1700000000",
+      "missing-attached|1700000000|2",
+      "missing-created||2|1",
+      "missing-windows|1700000000||1",
+      "empty-attached|1700000000|2|",
+      "|1700000000|2|1",
+      "kept|with|pipes|1700000001|2|1",
+      "client:1|kept|with|pipes",
+      "last|1700000002|1|0",
+    ].join("\n"), (driver) => {
+      expect(driver.listSessions()).toEqual([
+        { name: "kept|with|pipes", created: "1700000001", windows: 2, attached: false, activityAt: 0 },
+        { name: "last", created: "1700000002", windows: 1, attached: false, activityAt: 0 },
+      ]);
+    });
+  });
+
   test("two real clients, real+control, control-only and none — one tmux call", () => {
     expectD2aDriverClientMix();
   });
