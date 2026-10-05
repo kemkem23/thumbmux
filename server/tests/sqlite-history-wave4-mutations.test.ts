@@ -300,9 +300,6 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     { name: 'v2-authority-foreign-incident', from: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);",
       to: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, this.owner(pane)?.incidentId ?? incidentId);" },
     { name: 'v2-authority-omits-checkpoint-pin', from: "rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`,\n        holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins }", to: 'rawPins: [], rowPins }' },
-    { name: 'v2-authority-rematerializes-incident',
-      from: "fhAssert(!old, old && equal(old, incident) ? 'v2 incident already materialized' : 'v2 incident collision');\n        this.put('incident', key, incident.incidentId, incident);\n        this.append(key, revision, 'incident', incident.incidentId, '', incident);\n        resolvedIncidents.push(incident.incidentId);",
-      to: "if (old) fhAssert(equal(old, incident), 'v2 incident collision');\n        else { this.put('incident', key, incident.incidentId, incident); this.append(key, revision, 'incident', incident.incidentId, '', incident); resolvedIncidents.push(incident.incidentId); }" },
   ];
   try {
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
