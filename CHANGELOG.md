@@ -3,6 +3,36 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
 
+## Unreleased
+
+NEWARCH v2 (merged on the newarch-v2 integration branch; ships with the
+next release, not with 0.20.5). Flag-on is not production-ready.
+
+### Added — NEWARCH v2 surface (tier S, opt-in; not in 0.20.5)
+
+- `@thumbmux/core` exports the NEWARCH v2 protocol types and helpers
+  (`NEWARCH_V2_SCHEMA`, `NEWARCH_V2_CAPABILITIES`, `supportsNewarchV2`,
+  `NewarchV2PaneDescriptor`, `NewarchV2PaneSelection`, `NewarchV2GeometryReply`,
+  `NewarchV2HistoryCursor`, `NewarchV2Incident` and related names). They are
+  stability tier S: covered by the contract check, not frozen like tier F.
+- `TmuxWsMuxOptions.newarchV2?` (optional) lets the host name the owner of a
+  session. When set, session-list rows carry the owner's selection, and an
+  owned pane keeps its birth geometry: `handleResize` / `applyGeometry` do not
+  resize it and return the fixed geometry. Without the option nothing changes.
+- **Compatibility note:** `TmuxWsMux.handleResize` and `applyGeometry` now
+  return `NewarchV2GeometryReply | null` (was `void`). Callers that ignore the
+  result, store the method in a `void`-returning slot, or subclass without
+  overriding still compile (`server/tests/session-row-type.fixture.ts`). A
+  subclass that overrides either method with a `: void` return type no longer
+  type-checks and must return `null`.
+- `TermView` gains optional `fixedGeometry`, `fitWidth` and `v2StatusText`
+  props: a fixed-size pane is scaled to the viewport instead of resized, and an
+  incident sentence can be shown without a live pane. `SessionView` does not
+  claim geometry for a pane whose owner is fixed or could not be resolved.
+- The history window keeps flag-on edges pageable while a read is pending,
+  gapped or remote, and shows flag-on states as notes beside the rows, never as
+  terminal text.
+
 ## v0.20.5 — 2026-10-04
 
 Patch. Ships the low-resolution screen layout (UI-COMPACT lot D) and the

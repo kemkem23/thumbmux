@@ -1,8 +1,31 @@
 import {
+  NEWARCH_FLAGON_CAPABILITIES,
+  NEWARCH_REPAIR_CAPABILITIES,
+  NEWARCH_V2_SCHEMA,
+  type NewarchCapabilities,
+  type NewarchFlagOnCapability,
+  type NewarchGap,
+  type NewarchHistoryContinuation,
+  type NewarchHistoryExtension,
+  type NewarchHistoryState,
+  type NewarchPaneKey,
+  type NewarchV2FixedGeometry,
+  type NewarchV2GeometryReply,
+  type NewarchV2HistoryRequest,
+  type NewarchV2PaneDescriptor,
+  type NewarchV2PaneSelection,
+  type NewarchV2ReadState,
+  type NewarchV2SessionKey,
+} from "@thumbmux/core";
+import {
+  NEWARCH_V2_VERSION,
   STREAM_BUDGET,
   validReadOpen,
+  validateV2Incident,
+  validateV2ReadRequest,
   type CancelToken,
   type CaptureEngine,
+  type CommittedStreamRow,
   type DisplayEngine,
   type HistoryEngine,
   type HistoryPage,
@@ -15,6 +38,9 @@ import {
   type StreamFailure,
   type StreamIdentity,
   type StreamObserver,
+  type V2HistoryPage,
+  type V2HistoryReader,
+  type V2WriteCommand,
   type ViewerRoute,
 } from "./stream-contract";
 
@@ -27,6 +53,18 @@ export interface DisplayEngineOptions {
   readonly history: HistoryEngine;
   readonly observer?: StreamObserver;
   readonly now?: () => number;
+  /**
+   * Flag-on display negotiation. Absent: a page carrying a flag-on envelope is
+   * refused as unsupported (never shown as a legacy page that ends in EOF).
+   * `required`: every page must carry the envelope; a bare page is an
+   * integrity error because its missing states would read as EOF.
+   */
+  readonly flagOn?: DisplayFlagOnOptions;
+}
+
+export interface DisplayFlagOnOptions {
+  readonly supported: readonly NewarchFlagOnCapability[];
+  readonly required: boolean;
 }
 
 export interface DisplayEngineStats {
@@ -71,8 +109,8 @@ const staleRoute = (): StreamFailure => ({ status: "stale", reason: "route" });
 const cancelled = (): StreamFailure => ({ status: "cancelled", reason: "cancelled" });
 const deadline = (): StreamFailure => ({ status: "error", code: "deadline", message: "display page deadline exceeded" });
 
-function samePane(a: StreamIdentity["pane"], b: StreamIdentity["pane"]): boolean {
-  return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
+function samePane(a: StreamIdentity["pane"] | undefined, b: StreamIdentity["pane"]): boolean {
+  return !!a && a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
 }
 
 function sameIdentity(a: StreamIdentity, b: StreamIdentity): boolean {
@@ -141,6 +179,7 @@ function immutableView(view: ReadView): ReadView {
     durableAtGrant: view.durableAtGrant,
     headAtGrant: view.headAtGrant,
     overlayHandle: view.overlayHandle,
+    ...(view.flagOn ? { flagOn: structuredClone(view.flagOn) } : {}),
   });
 }
 
@@ -172,11 +211,119 @@ function immutablePage(page: HistoryPage): HistoryPage {
     nextAfter: page.nextAfter ? { ...page.nextAfter } : null,
     hasMoreBefore: page.hasMoreBefore,
     hasMoreAfter: page.hasMoreAfter,
+    // Status travels beside the rows, never inside a fragment's cells.
+    ...(page.flagOn ? { flagOn: structuredClone(page.flagOn) } : {}),
   });
 }
 
 function encodedBytes(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_FLAGON_CAPABILITIES);
+const REPAIR_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_REPAIR_CAPABILITIES);
+const INCIDENT_REASONS: ReadonlySet<string> = new Set([
+  "storage-outage", "collector-stalled", "collector-exit", "io",
+]);
+const GAP_REASONS: ReadonlySet<string> = new Set<NewarchGap["reason"]>([
+  "pipe-eof", "collector-exit", "ambiguous-overlap", "unproven-overlap", "unknown-vt-state",
+  "interrupted-capture", "storage-outage", "corruption", "identity-change", "geometry-change",
+  "ownership-lost", "visible-divergence",
+]);
+
+function validText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function validCapabilities(value: NewarchCapabilities): NewarchCapabilities | null {
+  if (value?.extensionVersion !== 1 || !Array.isArray(value.supported) || !Array.isArray(value.required)) return null;
+  const all = [...value.supported, ...value.required];
+  if (!all.every(cap => typeof cap === "string" && KNOWN_CAPABILITIES.has(cap))) return null;
+  if (!value.supported.includes("history-states-v1") || !value.required.every(cap => value.supported.includes(cap))) return null;
+  return value;
+}
+
+function validRange(range: { pane: NewarchPaneKey; segmentId: string; start: number; end: number }, pane: NewarchPaneKey): boolean {
+  return samePane(range?.pane, pane) && typeof range.segmentId === "string"
+    && validCounter(range.start) && validCounter(range.end) && range.start <= range.end;
+}
+
+/** Unknown is null, never 0; a gap names this pane only. */
+function validGap(gap: NewarchGap, pane: NewarchPaneKey): boolean {
+  if (gap?.version !== 1 || !validText(gap.episodeId) || !samePane(gap.pane, pane) || !GAP_REASONS.has(gap.reason)) return false;
+  if (gap.parentEpisodeId !== null && !validText(gap.parentEpisodeId)) return false;
+  if (gap.rightSegmentId !== null && typeof gap.rightSegmentId !== "string") return false;
+  if (gap.leftRowId !== null && (!samePane(gap.leftRowId.pane, pane) || typeof gap.leftRowId.segmentId !== "string"
+    || !validCounter(gap.leftRowId.rowOrdinal))) return false;
+  if (gap.countKind === "unknown") { if (gap.missingCount !== null) return false; }
+  else if (gap.countKind === "exact" || gap.countKind === "estimate") { if (!validCounter(gap.missingCount)) return false; }
+  else return false;
+  return validCounter(gap.withheldRows) && validCounter(gap.lowerBound)
+    && Number.isFinite(gap.openedAt) && (gap.closedAt === null || Number.isFinite(gap.closedAt))
+    && typeof gap.clockEpoch === "string" && (gap.quality === "degraded" || gap.quality === "resolved");
+}
+
+function validHistoryState(state: NewarchHistoryState, pane: NewarchPaneKey): boolean {
+  switch (state?.kind) {
+    case "exact": return true;
+    case "gap": return validGap(state.gap, pane);
+    case "pending": return validText(state.operationId) && validCounter(state.retryAfterMs);
+    case "remote-required": return validRange(state.range, pane) && validText(state.bundleId);
+    case "remote-unavailable":
+      return validRange(state.range, pane) && validText(state.bundleId) && validCounter(state.retryAfterMs)
+        && (state.reason === "offline" || state.reason === "missing" || state.reason === "corrupt");
+    case "degraded":
+      return validText(state.episodeId) && Array.isArray(state.uncertainFields)
+        && state.uncertainFields.every(field => typeof field === "string");
+    case "pressure":
+      return (state.level === "archive" || state.level === "critical" || state.level === "emergency")
+        && typeof state.collecting === "boolean" && Number.isFinite(state.sinceMonoMs) && state.sinceMonoMs >= 0;
+    default: return false;
+  }
+}
+
+function validRepairCapabilities(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const repair = value as { revision?: unknown; supported?: unknown; required?: unknown };
+  if (repair.revision !== 2 || !Array.isArray(repair.supported) || !Array.isArray(repair.required)) return false;
+  const names = [...repair.supported, ...repair.required];
+  if (!names.every(cap => typeof cap === "string" && REPAIR_CAPABILITIES.has(cap))) return false;
+  return repair.required.every(cap => (repair.supported as readonly unknown[]).includes(cap));
+}
+
+function validIncident(value: unknown, collecting: boolean, pane: NewarchPaneKey): boolean {
+  if (!value || typeof value !== "object") return false;
+  const incident = value as Record<string, unknown>;
+  if (incident.revision !== 2 || !validText(incident.incidentId) || !samePane(incident.pane as NewarchPaneKey, pane)) return false;
+  if (!("leftRowId" in incident)) return false;
+  if (incident.leftRowId !== null) {
+    const left = incident.leftRowId as { pane?: NewarchPaneKey; segmentId?: unknown; rowOrdinal?: unknown };
+    if (!samePane(left?.pane, pane) || !validText(left?.segmentId) || !validCounter(left?.rowOrdinal as number)) return false;
+  }
+  if (!validCounter(incident.openedAtWallMs as number) || !validCounter(incident.openedAtMonoMs as number)) return false;
+  if (!validText(incident.clockEpoch)) return false;
+  if (incident.collecting !== collecting) return false;
+  if (typeof incident.reason !== "string" || !INCIDENT_REASONS.has(incident.reason)) return false;
+  if (incident.quality !== "degraded" && incident.quality !== "resolved") return false;
+  if (!("resolvedAtWallMs" in incident)) return false;
+  return incident.resolvedAtWallMs === null || validCounter(incident.resolvedAtWallMs as number);
+}
+
+/** A repair claim without incident id, wall time, and last row is not a stop label. */
+function validPressureStop(state: NewarchHistoryState, pane: NewarchPaneKey, repairClaimed: boolean): boolean {
+  if (state.kind !== "pressure") return true;
+  const incident = (state as { repair?: unknown }).repair;
+  if (!repairClaimed) return incident === undefined;
+  return validIncident(incident, state.collecting, pane);
+}
+
+function validContinuation(continuation: NewarchHistoryContinuation, pane: NewarchPaneKey): boolean {
+  if (continuation?.kind === "end") return true;
+  if (continuation?.kind !== "more" && continuation?.kind !== "blocked") return false;
+  // Opaque: only H/A mint and read it; D checks shape, never does arithmetic.
+  if (continuation.cursor?.version !== 1 || !validText(continuation.cursor.token)) return false;
+  return continuation.kind === "more"
+    || (continuation.state?.kind !== ("exact" as string) && validHistoryState(continuation.state, pane));
 }
 
 type WaitResult<T> = { readonly kind: "value"; readonly value: T }
@@ -189,6 +336,7 @@ export class StreamDisplayEngine implements DisplayEngine {
   private readonly history: HistoryEngine;
   private readonly observer: StreamObserver | undefined;
   private readonly now: () => number;
+  private readonly flagOn: DisplayFlagOnOptions | undefined;
   private readonly attachments = new Map<string, Attachment>();
   private readonly pages = new Map<string, PageEntry[]>();
   private readonly pageBytes = new Map<string, number>();
@@ -205,6 +353,9 @@ export class StreamDisplayEngine implements DisplayEngine {
     this.history = options.history;
     this.observer = options.observer;
     this.now = options.now ?? (() => performance.now());
+    this.flagOn = options.flagOn
+      ? deepFreeze({ supported: [...options.flagOn.supported], required: options.flagOn.required })
+      : undefined;
   }
 
   async attach(route: ViewerRoute, onFrame: (frame: LiveFrame) => void): Promise<Result<LiveFrame>> {
@@ -316,8 +467,17 @@ export class StreamDisplayEngine implements DisplayEngine {
         this.recordRequest(request, "error", this.now());
         return failure;
       }
+      const flagOnFailure = this.flagOnFailure(read.value, view);
+      if (flagOnFailure) {
+        releaseReason = flagOnFailure.code === "unsupported" ? "flag-on-unsupported" : "invalid-flag-on";
+        this.recordRequest(request, "error", this.now());
+        return flagOnFailure;
+      }
       const frozen = immutablePage(read.value);
-      const charge = Math.max(frozen.payloadBytes, encodedBytes(frozen.fragments));
+      const charge = Math.max(
+        frozen.payloadBytes,
+        encodedBytes(frozen.flagOn ? [frozen.fragments, frozen.flagOn] : frozen.fragments),
+      );
       if (charge > STREAM_BUDGET.pageBytesPerViewer) {
         releaseReason = "page-byte-cap";
         const failure: StreamFailure = { status: "error", code: "unsupported", message: "history page exceeds the display byte cap" };
@@ -470,6 +630,47 @@ export class StreamDisplayEngine implements DisplayEngine {
     return true;
   }
 
+  /**
+   * A flag-on page is shown only with its states intact. Blocked/more must
+   * stay pageable on the legacy flags too, so no consumer that reads only
+   * hasMore* can mistake pending/gap/remote for the end of history.
+   */
+  private flagOnFailure(page: HistoryPage, view: ReadView): (StreamFailure & { readonly code: "integrity" | "unsupported" }) | null {
+    const extension = page.flagOn;
+    const integrity = (message: string) => ({ status: "error", code: "integrity", message } as const);
+    if (!extension) {
+      return this.flagOn?.required ? integrity("flag-on page arrived without history states") : null;
+    }
+    if (!this.flagOn) return { status: "error", code: "unsupported", message: "display was not negotiated for flag-on history states" };
+    const capabilities = validCapabilities(extension.capabilities);
+    if (capabilities === null) return integrity("flag-on page has invalid capabilities");
+    if (!capabilities.required.every(cap => this.flagOn!.supported.includes(cap))) {
+      return { status: "error", code: "unsupported", message: "flag-on page requires an unsupported capability" };
+    }
+    const repair = (extension as NewarchHistoryExtension & { repair?: unknown }).repair;
+    if (repair !== undefined && !validRepairCapabilities(repair)) return integrity("flag-on repair envelope is unreadable");
+    const repairClaimed = repair !== undefined;
+    const pane = view.identity.pane;
+    const pressureOk = (state: NewarchHistoryState) => validPressureStop(state, pane, repairClaimed);
+    if (extension.version !== 1 || !Array.isArray(extension.states)
+      || !extension.states.every(state => validHistoryState(state, pane) && pressureOk(state))) {
+      return integrity("flag-on page has invalid history states");
+    }
+    if (!validContinuation(extension.before, pane) || !validContinuation(extension.after, pane)) {
+      return integrity("flag-on page has an invalid continuation");
+    }
+    if (extension.before.kind === "blocked" && !pressureOk(extension.before.state)) {
+      return integrity("flag-on page has invalid history states");
+    }
+    if (extension.after.kind === "blocked" && !pressureOk(extension.after.state)) {
+      return integrity("flag-on page has invalid history states");
+    }
+    if ((extension.before.kind === "end") === page.hasMoreBefore || (extension.after.kind === "end") === page.hasMoreAfter) {
+      return integrity("flag-on continuation disagrees with hasMore");
+    }
+    return null;
+  }
+
   private pageKey(ack: ReadOpenAck, cursor: PageCursor | null, limit: number): string {
     return JSON.stringify([ack.view.requestId, ack.view.grantRevision, ack.diskSnapshotRevision, cursor, limit]);
   }
@@ -550,5 +751,206 @@ export class StreamDisplayEngine implements DisplayEngine {
   private failureReason(failure: StreamFailure): string {
     if (failure.status === "error" && failure.code === "deadline") return "deadline";
     return failure.status;
+  }
+}
+
+/** Queued pin/release only. This is not a writer and cannot commit rows. */
+export type NewarchV2DisplayPin = Extract<V2WriteCommand, { readonly kind: "pin" | "release-pin" }>;
+
+export interface NewarchV2DisplayPinSink {
+  submit(command: NewarchV2DisplayPin): Promise<Result<unknown>>;
+}
+
+export interface NewarchV2GeometryIntent {
+  readonly source: "viewport" | "font" | "fit-width" | "rotation" | "keyboard-inset" | "apply-geometry";
+  readonly columns: number;
+  readonly rows: number;
+}
+
+export interface NewarchV2Span {
+  readonly entries: V2HistoryPage["entries"];
+  readonly blocked: NewarchV2ReadState | null;
+  readonly ended: boolean;
+}
+
+const V2_OWNER_RETRY_MS = 1000;
+const V2_SPAN_PAGE_CAP = 64;
+
+function v2PaneEqual(a: NewarchPaneKey, b: NewarchPaneKey): boolean {
+  return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
+}
+
+function v2Integrity(message: string): StreamFailure {
+  return { status: "error", code: "integrity", message };
+}
+
+/** One pane is a selection. Any longer list stays a list. The last pane is not a tie-break. */
+export function selectNewarchV2Panes(
+  panes: readonly NewarchV2PaneDescriptor[],
+  next: string | null,
+): NewarchV2PaneSelection {
+  if (panes.length === 0 && next === null) return { kind: "missing" };
+  if (panes.length === 1 && next === null) return { kind: "selected", pane: panes[0]! };
+  return { kind: "ambiguous", panes: [...panes], next };
+}
+
+function v2EntryOrder(entry: V2HistoryPage["entries"][number]): readonly [string, number, number] {
+  if (entry.kind === "row") return [entry.row.id.segmentId, entry.row.id.rowOrdinal, 1];
+  if (!entry.incident.frontier) return ["", -1, 0];
+  return [entry.incident.frontier.segmentId, entry.incident.frontier.rowOrdinal, 0];
+}
+
+function v2OrderBefore(left: readonly [string, number, number], right: readonly [string, number, number]): boolean {
+  if (left[0] !== right[0]) return left[0] < right[0];
+  if (left[1] !== right[1]) return left[1] < right[1];
+  return left[2] < right[2];
+}
+
+function v2Blocking(state: NewarchV2ReadState): boolean {
+  return state.kind === "storage-unavailable" || state.kind === "remote-unavailable";
+}
+
+function v2RowKey(row: CommittedStreamRow): string {
+  return `${row.id.pane.serverIdentity}\0${row.id.pane.paneId}\0${row.id.pane.birthGeneration}\0${row.id.segmentId}\0${row.id.rowOrdinal}`;
+}
+
+/**
+ * Read-only NEWARCH display. It never holds a writer capability, never
+ * returns a legacy writer, and never turns a blocked remote into end-of-history.
+ */
+export class NewarchV2Display {
+  private pinSerial = 0;
+
+  constructor(
+    private readonly reader: V2HistoryReader,
+    private readonly pins: NewarchV2DisplayPinSink | null = null,
+  ) {}
+
+  select(session: NewarchV2SessionKey): Result<NewarchV2PaneSelection> {
+    const owner = this.reader.sessionOwner(session);
+    if (owner.status !== "ok") return ok({ kind: "owner-unavailable", retryAfterMs: V2_OWNER_RETRY_MS });
+    if (owner.value === null) return ok({ kind: "missing" });
+    const listed = this.reader.panes(session, null);
+    if (listed.status !== "ok") return ok({ kind: "owner-unavailable", retryAfterMs: V2_OWNER_RETRY_MS });
+    return ok(selectNewarchV2Panes(listed.value.panes, listed.value.next));
+  }
+
+  /** Viewer size, font, rotation, and applyGeometry never change the birth geometry. */
+  geometry(
+    pane: NewarchV2PaneDescriptor,
+    _intent: NewarchV2GeometryIntent,
+  ): { readonly reply: NewarchV2GeometryReply; readonly resize: null } {
+    const geometry: NewarchV2FixedGeometry = pane.geometry;
+    return {
+      reply: { schema: NEWARCH_V2_SCHEMA, pane: pane.pane, status: "fixed", geometry },
+      resize: null,
+    };
+  }
+
+  async page(request: NewarchV2HistoryRequest, pinSegmentId: string | null = null): Promise<Result<V2HistoryPage>> {
+    try {
+      validateV2ReadRequest(request);
+    } catch (error) {
+      return v2Integrity(error instanceof Error ? error.message : "invalid v2 read");
+    }
+    const pinId = pinSegmentId && this.pins ? `display-pin-${++this.pinSerial}` : null;
+    if (pinId && pinSegmentId && this.pins) {
+      const pinned = await this.pins.submit({ kind: "pin", pinId, segmentId: pinSegmentId });
+      if (pinned.status !== "ok") return pinned;
+    }
+    try {
+      const read = await this.reader.page(request);
+      if (read.status !== "ok") return read;
+      const failure = this.pageFailure(request, read.value);
+      if (failure) return failure;
+      return ok(deepFreeze(structuredClone(read.value)));
+    } catch {
+      return { status: "error", code: "io", message: "v2 display read failed" };
+    } finally {
+      if (pinId && this.pins) await this.pins.submit({ kind: "release-pin", pinId });
+    }
+  }
+
+  /**
+   * Follow one cursor across local and remote stores. The same row id is kept
+   * once. A blocked continuation stops the walk; it is not an empty end.
+   */
+  async readSpan(request: NewarchV2HistoryRequest, maxPages: number, pinSegmentId: string | null = null): Promise<Result<NewarchV2Span>> {
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1) return v2Integrity("v2 span page cap");
+    const cap = Math.min(maxPages, V2_SPAN_PAGE_CAP);
+    const seen = new Set<string>();
+    const entries: V2HistoryPage["entries"][number][] = [];
+    let cursor = request.cursor;
+    let blocked: NewarchV2ReadState | null = null;
+    let ended = false;
+    for (let index = 0; index < cap; index++) {
+      const read = await this.page({ ...request, cursor }, pinSegmentId);
+      if (read.status !== "ok") return read;
+      const page = read.value;
+      for (const entry of page.entries) {
+        if (entry.kind !== "row") {
+          entries.push(entry);
+          continue;
+        }
+        const key = v2RowKey(entry.row);
+        if (seen.has(key)) return v2Integrity("duplicate v2 row in span");
+        seen.add(key);
+        entries.push(entry);
+      }
+      const continuation = request.direction === "before" ? page.before : page.after;
+      if (continuation.kind === "blocked") {
+        blocked = continuation.state;
+        ended = false;
+        break;
+      }
+      if (continuation.kind === "end") {
+        ended = blocked === null;
+        break;
+      }
+      cursor = continuation.cursor;
+    }
+    return ok(deepFreeze({ entries, blocked, ended }));
+  }
+
+  private pageFailure(request: NewarchV2HistoryRequest, page: V2HistoryPage): StreamFailure | null {
+    if (page.schema !== NEWARCH_V2_VERSION || !v2PaneEqual(page.pane, request.pane)) {
+      return v2Integrity("v2 page pane");
+    }
+    if (!validCounter(page.revision) || !validCounter(page.payloadBytes)
+      || page.payloadBytes > request.maxBytes || page.entries.length > request.maxEntries) {
+      return v2Integrity("v2 page bound");
+    }
+    let previous: readonly [string, number, number] | null = null;
+    const seen = new Set<string>();
+    for (const entry of page.entries) {
+      if (entry.kind === "row") {
+        if (!entry.row.finalized) return v2Integrity("v2 candidate row is not durable history");
+        if (!v2PaneEqual(entry.row.id.pane, request.pane)) return v2Integrity("v2 row pane");
+        const key = v2RowKey(entry.row);
+        if (seen.has(key)) return v2Integrity("duplicate v2 row");
+        seen.add(key);
+      } else {
+        try {
+          validateV2Incident(entry.incident);
+        } catch (error) {
+          return v2Integrity(error instanceof Error ? error.message : "invalid v2 incident");
+        }
+        if (!v2PaneEqual(entry.incident.pane, request.pane)) return v2Integrity("v2 incident pane");
+      }
+      const order = v2EntryOrder(entry);
+      if (previous && !v2OrderBefore(previous, order)) return v2Integrity("v2 page order");
+      previous = order;
+    }
+    for (const continuation of [page.before, page.after]) {
+      if (continuation.kind === "end") continue;
+      if (!v2PaneEqual(continuation.cursor.pane, request.pane) || continuation.cursor.schema !== NEWARCH_V2_SCHEMA) {
+        return v2Integrity("v2 continuation cursor");
+      }
+      if (continuation.kind === "blocked" && !v2Blocking(continuation.state)) return v2Integrity("v2 blocked state");
+    }
+    const blocking = page.states.some(v2Blocking);
+    const blockedContinuation = page.before.kind === "blocked" || page.after.kind === "blocked";
+    if (blocking && !blockedContinuation) return v2Integrity("v2 blocking state was reported as the end of history");
+    return null;
   }
 }

@@ -53,6 +53,7 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
   try {
     mkdirSync(join(root, 'server'), { recursive: true });
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(root, 'core/src'), { recursive: true });
     mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
     cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
     cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
@@ -141,6 +142,7 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
   try {
     mkdirSync(join(root, 'server'), { recursive: true });
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(root, 'core/src'), { recursive: true });
     mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
     cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
     cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
@@ -205,8 +207,8 @@ test('contract repair mutants go red then restored real seams go green', async (
     cpSync(join(pkg,'server/src'),join(target,'server/src'),{recursive:true});
     cpSync(join(pkg,'server/tests'),join(target,'server/tests'),{recursive:true});
     cpSync(join(pkg,'core/src'),join(target,'core/src'),{recursive:true});
-    // The spike2 bundle rides along in server/tests/fixtures: nothing outside
-    // the package is read, so a public clone runs this unchanged.
+    // The spike2 bundle and stitch vectors ride along in server/tests/fixtures:
+    // nothing outside the package is read, so a public clone runs this unchanged.
     const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});
     cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
     writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
@@ -222,6 +224,8 @@ test('contract repair mutants go red then restored real seams go green', async (
         const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
         return {exit,output:out+err};
       };
+      const clean=await run();
+      expect(clean.exit,clean.output).toBe(0);expect(clean.output).toContain('(pass)');
       writeFileSync(file,mutant);
       const red=await run();
       console.log('CONTRACT_MUTANT_RED',m.name,red.exit,red.output);
@@ -234,3 +238,91 @@ test('contract repair mutants go red then restored real seams go green', async (
     }
   } finally {rmSync(root,{recursive:true,force:true});}
 },120000);
+
+test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin bypass', async () => {
+  const pkg=resolve(import.meta.dir,'../..'),root=mkdtempSync(join(tmpdir(),'flagon-H-mutants-'));
+  const mutations=[
+    {name:'r2-dangling-left-row',pattern:'H-r2 rejects a gap',from:'if(g.leftRowId) fhAssert(this.visibleRow',to:'if(false && g.leftRowId) fhAssert(this.visibleRow'},
+    {name:'r2-publish-candidate-early',pattern:'H-r2 staged attach',from:"staged?'candidate':'committed',r.operationId,r.digest,r,receipt",to:"'committed',r.operationId,r.digest,r,receipt"},
+    {name:'r2-drop-timeline-on-reclaim',pattern:'H-r2 checkpoint pins',from:'// Stable row IDs and timeline slots survive payload reclaim.',to:"this.db.query('DELETE FROM fh_timeline WHERE segment=?').run(sealed.segmentId);"},
+    {name:'r2-omit-geometry-journal',pattern:'H-r2 checkpoint pins',from:"this.save('control',event.eventId,key,event);return {commitId:r.operationId,event};",to:'return {commitId:r.operationId,event};'},
+    {name:'r2-source-bytes-unchecked',pattern:'H-r2 canonical SGR',from:"offset===record.range.end&&(record.payload.kind!=='bytes'||equal(raw,record.payload.bytes))",to:'offset===record.range.end'},
+    {name:'replay-remote-prefix',pattern:'replay from current durable cursor',from:".all(key,segmentFloor) as SqlRow[];",to:".all(key,0) as SqlRow[];"},
+    {name:'delete-without-vacuum',pattern:'verified reclaim really',from:"this.db.exec('PRAGMA incremental_vacuum(256)');",to:'/* mutant: DELETE without returning source DB pages */'},
+    {name:'swallow-gap',pattern:'ACK then reopen',from:"gaps:r.decision.gaps,receipt:JSON.parse(String(e.receipt))",to:"gaps:[],receipt:JSON.parse(String(e.receipt))"},
+    {name:'omit-rows-transaction',pattern:'ACK then reopen',from:"this.putEvent(key,String(segment.id),staged?'candidate':'committed',r.operationId,r.digest,r,receipt);",to:'/* omit durable rows + gaps */'},
+    {name:'ack-before-sync',pattern:'rollback at write/commit',from:"this.putEvent(key,segmentId,'input',record.operationId,record.digest,record,ack,encoded);",to:'/* ACK without durable input */'},
+    {name:'upload-is-verification',pattern:'upload exit zero',from:"fhAssert(this.options.validateRemoteIndex?.(remote,sealed) === true, 'remote catalog authority not validated');",to:'/* delete after untrusted upload receipt */'},
+    {name:'pin-bypass',pattern:'pins survive restart',from:"fhAssert(!this.db.query('SELECT 1 FROM fh_pin WHERE segment=? AND released=0 LIMIT 1').get(segment), 'segment pinned');",to:'/* ignore active reader/handoff pin */'},
+    {name:'remote-to-empty-eof',pattern:'verified reclaim really',from:"for (const s of segments) fhAssert(s.state !== 'reclaiming' && s.state !== 'remote', 'remote-required: restore segment before replay');",to:'/* remote treated as empty local */'},
+  ];
+  try {
+    cpSync(join(pkg,'server/src'),join(root,'server/src'),{recursive:true});
+    cpSync(join(pkg,'core/src'),join(root,'core/src'),{recursive:true});
+    mkdirSync(join(root,'server/tests/sqlite-history'),{recursive:true});
+    cpSync(join(pkg,'server/tests/sqlite-history-wave4.test.ts'),join(root,'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg,'server/tests/sqlite-history/helpers.ts'),join(root,'server/tests/sqlite-history/helpers.ts'));
+    const core=join(root,'node_modules/@thumbmux/core');mkdirSync(core,{recursive:true});cpSync(join(pkg,'core/src'),join(core,'src'),{recursive:true});
+    writeFileSync(join(core,'package.json'),'{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root,'package.json'),'{"type":"module"}');
+    const file=join(root,'server/src/history-engine.ts'),original=readFileSync(file,'utf8');
+    const run=async(pattern:string)=>{
+      const child=Bun.spawn([process.execPath,'test','./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
+      const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);return {exit,output:out+err};
+    };
+    const clean=await run('flag-on H|H-r2');expect(clean.exit,clean.output).toBe(0);expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+    for(const mutation of mutations){
+      expect(original.split(mutation.from).length).toBe(2);writeFileSync(file,original.replace(mutation.from,mutation.to));
+      const result=await run(mutation.pattern);console.log('FLAGON_H_MUTANT',mutation.name,result.exit,result.output);
+      expect(result.exit).not.toBe(0);expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);writeFileSync(file,original);
+      const restored=await run(mutation.pattern);console.log('FLAGON_H_RESTORED',mutation.name,restored.exit,restored.output);expect(restored.exit,restored.output).toBe(0);
+    }
+    expect((await run('flag-on H|H-r2')).exit).toBe(0);
+  }finally{rmSync(root,{recursive:true,force:true});}
+},120000);
+
+
+// Q22 new API: real behavioral red on broken implementations, followed by a
+// restored full-file run. Mutants live only in a private copy INSIDE the cage.
+test('H v2 mutations reject forged writers, lost incidents, stale audits and non-atomic checkpoints', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'h-v2-mutants-'));
+  const mutations = [
+    { name: 'v2-unbounded-export-scratch', from: '    this.cleanupUncommittedExports();', to: '    /* mutant leaves unpublished exports behind */' },
+    { name: 'v2-second-process-writer', from: 'PRAGMA locking_mode=EXCLUSIVE;', to: 'PRAGMA locking_mode=NORMAL;' },
+    { name: 'v2-reclaim-with-pin', from: "fhAssert(pin?.segmentId !== segment || pin.released, 'v2 segment pinned');", to: '/* mutant ignores persistent pins */' },
+    { name: 'v2-locator-without-readback', from: "&& this.hooks.remoteReadback?.(locator, exported) === true, 'v2 public reader proof required'", to: "&& true, 'v2 public reader proof required'" },
+    { name: 'v2-forged-capability', from: "fhAssert(c === this.#cap, 'v2 forged capability');", to: '/* mutant accepts copied capability */' },
+    { name: 'v2-incident-needs-ack', from: 'validateV2Incident(incident);', to: "validateV2Incident(incident); fhAssert(next.frontier !== null, 'mutant requires first ACK');" },
+    { name: 'v2-forget-checkpoint', from: "this.put('checkpoint', key, 'live', cp);", to: '/* mutant acknowledges without checkpoint */' },
+    { name: 'v2-ignore-current-generation', from: 'v2WriteDisposition(r.fence, cap.generation, owner?.durableRevision ?? 0, previous)', to: 'v2WriteDisposition({ ...r.fence, expectedGeneration: cap.generation }, cap.generation, owner?.durableRevision ?? 0, previous)' },
+    { name: 'v2-accept-stale-audit', from: "}, this.#config.audit), 'v2 stale/unordered audit');", to: "}, this.#config.audit) || true, 'v2 stale/unordered audit');" },
+    { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);", to: '/* mutant loses rows behind durable receipt */' },
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (name: string, failed: boolean) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      if (failed) { expect(exit).not.toBe(0); expect(output).toMatch(/\(fail\) H v2/); }
+      else expect(exit, output).toBe(0);
+    };
+    await run('clean-before', false);
+    for (const mutant of mutations) {
+      expect(original.split(mutant.from).length).toBe(2);
+      try { writeFileSync(file, original.replace(mutant.from, mutant.to)); await run(mutant.name, true); }
+      finally { writeFileSync(file, original); }
+    }
+    await run('clean-after', false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 300000);

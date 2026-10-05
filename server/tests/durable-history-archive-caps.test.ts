@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DurableHistoryArchive } from "../src/durable-history-archive";
+import { existsSync } from "node:fs";
 
 let root = "";
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), "thumbmux-caps-")); });
-afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  if (!existsSync(root)) return;
+  const writable = (dir: string) => {
+    chmodSync(dir, 0o700);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) if (entry.isDirectory()) writable(join(dir, entry.name));
+  };
+  writable(root);
+  rmSync(root, { recursive: true, force: true });
+});
 
 const SCREEN = ["+--+", "| >", "+--+", "hints", "tokens"];
 const OPTS = { paneRows: SCREEN.length, liveLineLimit: 10 };

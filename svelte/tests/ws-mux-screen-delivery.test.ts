@@ -7,7 +7,9 @@ import {
   createMuxDeltaFrame,
   splitMuxOutputData,
   type MuxPaneScreen,
+  type NewarchV2FixedGeometry,
 } from '@thumbmux/core';
+import { answerNewarchV2Geometry } from '../src/history-window';
 
 const originalState = Object.getOwnPropertyDescriptor(globalThis, '$state');
 Object.defineProperty(globalThis, '$state', {
@@ -268,5 +270,32 @@ describe('TmuxMux MuxDeliveryMeta.screen (FS5)', () => {
 
     second.unsubscribe();
     second.socket.finishClose();
+  });
+});
+
+describe('NEWARCH v2 fixed geometry across viewers', () => {
+  const geometry: NewarchV2FixedGeometry = {
+    policy: 'fixed-at-birth', columns: 100, rows: 40,
+    configVersion: 'q22-default-1', panesPerWindow: 1,
+  };
+
+  test('narrow, wide, font, rotation, keyboard, and applyGeometry all stay 100x40', () => {
+    const intents = [
+      { source: 'viewport' as const, columns: 40, rows: 24 },
+      { source: 'viewport' as const, columns: 180, rows: 50 },
+      { source: 'font' as const, columns: 70, rows: 30 },
+      { source: 'rotation' as const, columns: 36, rows: 80 },
+      { source: 'keyboard-inset' as const, columns: 40, rows: 18 },
+      { source: 'fit-width' as const, columns: 100, rows: 40 },
+      { source: 'apply-geometry' as const, columns: 120, rows: 50 },
+    ];
+    for (const intent of intents) {
+      const answer = answerNewarchV2Geometry(geometry, intent);
+      expect(answer.resize).toBeNull();
+      expect(answer.status).toBe('fixed');
+      expect(answer.geometry.columns).toBe(100);
+      expect(answer.geometry.rows).toBe(40);
+      expect(answer.geometry).toBe(geometry);
+    }
   });
 });

@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import type { NewarchV2HistoryCursor, NewarchV2Incident } from "../../core/src/protocol";
+import { NewarchV2Display } from "../src/display-engine";
+import type { CommittedStreamRow, V2HistoryPage, V2HistoryReader } from "../src/stream-contract";
 import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
 
 function driver(): TmuxDriver {
@@ -831,4 +834,95 @@ assert.equal(R.pipeHistoryAllocations().canonicalRowArrays - a, 0, 'MUTATION cap
       }
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+const V2_PANE = { serverIdentity: "srv", paneId: "pane-a", birthGeneration: 1 };
+const V2_GEOMETRY = {
+  policy: "fixed-at-birth" as const, columns: 100, rows: 40,
+  configVersion: "q22-default-1", panesPerWindow: 1 as const,
+};
+
+function v2Cursor(storeId: string): NewarchV2HistoryCursor {
+  return { schema: "newarch-v2", pane: V2_PANE, storeId, timelineRevision: 4, token: "same-token" };
+}
+
+function v2Row(ordinal: number): CommittedStreamRow {
+  const id = { pane: V2_PANE, segmentId: "seg", rowOrdinal: ordinal };
+  const origin = { kind: "durable" as const, rowId: id };
+  return {
+    id, origin, cells: [{ text: `row-${ordinal}`, width: 1, style: [] }],
+    geometry: { columns: 100, rows: 40 }, buffer: "normal", wrapStatus: "unwrapped",
+    wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [origin],
+  };
+}
+
+function v2Page(ordinal: number, afterStore: string | null): V2HistoryPage {
+  return {
+    schema: "newarch-v2", pane: V2_PANE, revision: 4, payloadBytes: 4,
+    entries: [{ kind: "row", row: v2Row(ordinal) }],
+    states: [{ kind: "exact", auditedRevision: 4 }],
+    before: { kind: "end" },
+    after: afterStore ? { kind: "more", cursor: v2Cursor(afterStore) } : { kind: "end" },
+  };
+}
+
+test("NEWARCH v2 D: the same cursor survives a remote outage and the row is not read twice", async () => {
+  let remoteOpen = false;
+  const seen: string[] = [];
+  const display = new NewarchV2Display({
+    owner: () => ({ status: "error", code: "integrity", message: "unused" }),
+    receipt: () => ({ status: "error", code: "integrity", message: "unused" }),
+    checkpoint: () => ({ status: "error", code: "integrity", message: "unused" }),
+    panes: () => ({ status: "ok", value: { panes: [], next: null } }),
+    sessionOwner: () => ({ status: "ok", value: null }),
+    sealed: () => ({ status: "error", code: "integrity", message: "unused" }),
+    export: () => ({ status: "error", code: "integrity", message: "unused" }),
+    locator: () => ({ status: "error", code: "integrity", message: "unused" }),
+    lastAudit: () => ({ status: "error", code: "integrity", message: "unused" }),
+    page: async request => {
+      const store = request.cursor?.storeId ?? "head";
+      seen.push(`${store}:${request.cursor?.token ?? "-"}`);
+      if (store === "head") return { status: "ok", value: v2Page(1, "remote") };
+      if (!remoteOpen) {
+        const incident: NewarchV2Incident = {
+          schema: "newarch-v2", incidentId: "remote-down", pane: V2_PANE, reason: "storage-outage",
+          frontier: { pane: V2_PANE, segmentId: "seg", rowOrdinal: 1 },
+          affected: { after: { pane: V2_PANE, segmentId: "seg", rowOrdinal: 1 }, through: null },
+          openedAtWallMs: 1, openedAtMonoMs: 1, clockEpoch: "epoch-1", collecting: true,
+          missing: { countKind: "unknown", missingCount: null }, ruleVersion: "explicit-gap@1",
+          configVersion: "q22-default-1", geometry: V2_GEOMETRY, revision: 4,
+          sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+          action: "annotate", evidence: null,
+        };
+        return { status: "ok", value: {
+          schema: "newarch-v2", pane: V2_PANE, revision: 4, payloadBytes: 1,
+          entries: [],
+          states: [{ kind: "storage-unavailable", pendingIncidentId: incident.incidentId, retryAfterMs: 500 }],
+          before: { kind: "more", cursor: v2Cursor("remote") },
+          after: {
+            kind: "blocked", cursor: v2Cursor("remote"),
+            state: { kind: "storage-unavailable", pendingIncidentId: incident.incidentId, retryAfterMs: 500 },
+          },
+        } };
+      }
+      return { status: "ok", value: v2Page(2, null) };
+    },
+  } satisfies V2HistoryReader);
+  const first = await display.readSpan({
+    schema: "newarch-v2", pane: V2_PANE, cursor: null, direction: "after", maxEntries: 10, maxBytes: 1000,
+  }, 4);
+  expect(first.status).toBe("ok");
+  if (first.status !== "ok") return;
+  expect(first.value.ended).toBe(false);
+  expect(first.value.blocked?.kind).toBe("storage-unavailable");
+  expect(first.value.entries.map(entry => entry.kind === "row" ? entry.row.id.rowOrdinal : "incident")).toEqual([1]);
+  remoteOpen = true;
+  const second = await display.readSpan({
+    schema: "newarch-v2", pane: V2_PANE, cursor: v2Cursor("remote"), direction: "after", maxEntries: 10, maxBytes: 1000,
+  }, 4);
+  expect(second.status).toBe("ok");
+  if (second.status !== "ok") return;
+  expect(second.value.ended).toBe(true);
+  expect(second.value.entries.map(entry => entry.kind === "row" ? entry.row.id.rowOrdinal : "incident")).toEqual([2]);
+  expect(seen.filter(item => item.startsWith("remote:")).every(item => item.endsWith(":same-token"))).toBe(true);
 });

@@ -153,9 +153,16 @@ function mountTermView(options: {
   mode?: ClaudeBashMode;
   onSummary?: SummaryHandler;
   historyPaging?: "ceiling" | "sliding";
+  claimGeometry?: boolean;
+  fixedGeometry?: { columns: number; rows: number } | null;
+  fitWidth?: boolean;
+  v2StatusText?: string | null;
+  onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
+  viewportWidth?: number;
 } = {}): Mounted {
+  const width = options.viewportWidth ?? 320;
   const target = document.createElement("div");
-  target.style.cssText = "position:relative;width:320px;height:240px;";
+  target.style.cssText = `position:relative;width:${width}px;height:240px;`;
   document.body.appendChild(target);
 
   let app!: Record<string, unknown>;
@@ -165,7 +172,11 @@ function mountTermView(options: {
       props: {
         session: SESSION,
         palette,
-        claimGeometry: false,
+        claimGeometry: options.claimGeometry ?? false,
+        ...(options.fixedGeometry ? { fixedGeometry: options.fixedGeometry } : {}),
+        ...(options.fitWidth ? { fitWidth: true } : {}),
+        ...(options.v2StatusText ? { v2StatusText: options.v2StatusText } : {}),
+        ...(options.onGeometryChange ? { onGeometryChange: options.onGeometryChange } : {}),
         fontPx: 13,
         ...(options.mode && options.mode !== "off"
           ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
@@ -183,7 +194,7 @@ function mountTermView(options: {
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
   if (!viewport) throw new Error("TermView root not found");
   Object.defineProperties(viewport, {
-    clientWidth: { configurable: true, get: () => 320 },
+    clientWidth: { configurable: true, get: () => width },
     clientHeight: { configurable: true, get: () => VIEW_HEIGHT },
   });
   viewport.getBoundingClientRect = () => ({
@@ -191,9 +202,9 @@ function mountTermView(options: {
     y: 0,
     left: 0,
     top: 0,
-    right: 320,
+    right: width,
     bottom: VIEW_HEIGHT,
-    width: 320,
+    width,
     height: VIEW_HEIGHT,
     toJSON: () => ({}),
   }) as DOMRect;
@@ -2407,5 +2418,342 @@ describe("TermView sliding archive window", () => {
       await settleUi();
       expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).toBeNull();
     });
+  });
+  describe("NEWARCH D flag-on history states", () => {
+    const PANE = { serverIdentity: "srv-d", paneId: "%7", birthGeneration: 1 };
+    const CURSOR = { version: 1, token: "opaque-h" };
+    const CAPS = { extensionVersion: 1, supported: ["history-states-v1"], required: ["history-states-v1"] };
+    const UNKNOWN_GAP = {
+      version: 1, episodeId: "ep-ui", parentEpisodeId: null, pane: PANE,
+      leftRowId: { pane: PANE, segmentId: "seg-1", rowOrdinal: 4 }, rightSegmentId: "seg-2",
+      reason: "collector-exit", countKind: "unknown", missingCount: null, withheldRows: 0, lowerBound: 0,
+      openedAt: 1, closedAt: null, clockEpoch: "clock-ui", quality: "degraded",
+    };
+    const PENDING_BLOCK = { kind: "blocked", cursor: CURSOR, state: { kind: "pending", operationId: "op-ui", retryAfterMs: 100 } };
+
+    function deliverFlagOnHistory(
+      startLine: number | null,
+      lines: string[],
+      hasMore: boolean,
+      flagOn: unknown,
+      totalArchivedLines?: number,
+    ): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      sessionCallback(JSON.stringify({
+        lines,
+        startLine,
+        endLine: startLine === null ? null : startLine + lines.length,
+        hasMore,
+        ...(totalArchivedLines === undefined ? {} : { totalArchivedLines }),
+        flagOn,
+      }), "history");
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function statusNotes(target: HTMLElement): Array<{ kind: string | null; text: string }> {
+      return [...target.querySelectorAll<HTMLElement>('[data-testid="mtv-history-status"]')]
+        .map(note => ({ kind: note.getAttribute("data-history-state"), text: note.textContent?.trim() ?? "" }));
+    }
+
+    test("RD-01/UI: an empty pending page is not EOF; the note shows and the same cursor is asked again", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(viewport.getAttribute("data-history-states")).toBe("pending");
+      expect(statusNotes(target)).toEqual([{ kind: "pending", text: "กำลังกู้ประวัติช่วงนี้ — ยังไม่ใช่จุดสิ้นสุด" }]);
+
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([
+        { direction: "before", cursor: null, limit: 2_000 },
+        { direction: "before", cursor: null, limit: 2_000 },
+      ]);
+      // A clean page replaces this edge's states: the pending note is gone.
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS, states: [{ kind: "exact" }],
+        before: { kind: "more", cursor: CURSOR }, after: { kind: "end" },
+      });
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      expect(statusNotes(target)).toEqual([]);
+      expect(viewport.getAttribute("data-history-states")).toBeNull();
+    });
+
+    test("UI: gap/remote/pressure states render as notes; unknown is words, not 0, and never enter copy or rows", async () => {
+      const { app, target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS,
+        states: [
+          { kind: "gap", gap: UNKNOWN_GAP },
+          { kind: "remote-required", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui" },
+          { kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 9 },
+          { kind: "degraded", episodeId: "ep-ui", uncertainFields: ["savedCursor"] },
+        ],
+        before: { kind: "blocked", cursor: CURSOR, state: { kind: "remote-unavailable", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui", retryAfterMs: 1000, reason: "offline" } },
+        after: { kind: "end" },
+      });
+      await settleUi();
+      const notes = statusNotes(target);
+      expect(notes.map(note => note.kind)).toEqual(["gap", "remote-required", "pressure", "degraded", "remote-unavailable"]);
+      expect(notes[0]!.text).toBe("ช่วงนี้เก็บประวัติไม่ครบ — จำนวนไม่ทราบ");
+      expect(notes[0]!.text).not.toMatch(/\d/);
+      expect(notes[1]!.text).toBe("ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน");
+      expect(notes[2]!.text).toBe("หยุดเก็บประวัติ — พื้นที่ไม่พอ");
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      // Notes live outside every terminal row.
+      for (const note of target.querySelectorAll('[data-testid="mtv-history-status"]')) {
+        expect(note.closest(".mtv-line")).toBeNull();
+        expect(note.closest(".mtv-loss-notes")).not.toBeNull();
+      }
+      const rowText = [...target.querySelectorAll(".mtv-line")].map(row => row.textContent ?? "").join("\n");
+      // Copy-all is built from terminal rows only.
+      const copied: string[] = [];
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text: string) => { copied.push(text); } },
+      });
+      try {
+        expect(await (app.copyAll as () => Promise<boolean>)()).toBe(true);
+      } finally {
+        if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+        else Reflect.deleteProperty(navigator, "clipboard");
+      }
+      expect(copied).toHaveLength(1);
+      expect(copied[0]).toContain("archive-18000");
+      const lastLines = deliveredLines.at(-1) ?? [];
+      for (const note of notes) {
+        expect(rowText).not.toContain(note.text);
+        expect(copied[0]).not.toContain(note.text);
+        expect(lastLines.join("\n")).not.toContain(note.text);
+      }
+    });
+
+    test("pages whose states cannot be read, or that contradict hasMore, are refused (not EOF, not drawn)", async () => {
+      const lying: Array<[string, boolean, unknown]> = [
+        ["unknown count as 0", true, { version: 1, capabilities: CAPS, states: [{ kind: "gap", gap: { ...UNKNOWN_GAP, missingCount: 0 } }], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["blocked but hasMore false", false, { version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["end but hasMore true", true, { version: 1, capabilities: CAPS, states: [], before: { kind: "end" }, after: { kind: "end" } }],
+        ["unknown capability", true, { version: 1, capabilities: { ...CAPS, supported: ["history-states-v1", "x-v9"] }, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+      ];
+      for (const [name, hasMore, flagOn] of lying) {
+        const { target, viewport } = mountTermView();
+        await tick();
+        deliverOutput(liveLines());
+        wheel(viewport, -1_000_000);
+        deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), hasMore, flagOn);
+        expect([name, viewport.getAttribute("data-history-window-start")]).toEqual([name, null]);
+        expect([name, viewport.getAttribute("data-history-stop")]).toEqual([name, "none"]);
+        expect([name, statusNotes(target)]).toEqual([name, []]);
+        for (const entry of mounted.splice(0)) {
+          unmount(entry.app);
+          entry.target.remove();
+        }
+      }
+    });
+
+    test("ceiling paging: a blocked empty page keeps the archive open instead of exhausted", async () => {
+      const { target, viewport } = mountTermView({ historyPaging: "ceiling" });
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(1);
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      await settleUi();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(statusNotes(target).map(note => note.kind)).toEqual(["pending"]);
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(2);
+    });
+
+    const WALL_MS = 1_700_000_000_123;
+    const INCIDENT_ID = "incident-storage-7";
+    const REMOTE_TOKEN = "opaque-remote-T";
+    const REPAIR = { revision: 2, supported: ["incident-r2", "timeline-replay-r2"], required: ["incident-r2"] };
+    function incident(leftRowId: unknown) {
+      return {
+        revision: 2, incidentId: INCIDENT_ID, pane: PANE, leftRowId,
+        openedAtWallMs: WALL_MS, openedAtMonoMs: 80, clockEpoch: "clock-ui",
+        collecting: false, reason: "storage-outage", quality: "degraded", resolvedAtWallMs: null,
+      };
+    }
+    function repairFlagOn(leftRowId: unknown) {
+      return {
+        version: 1, capabilities: CAPS, repair: REPAIR,
+        states: [{
+          kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 9,
+          repair: incident(leftRowId),
+        }],
+        before: {
+          kind: "blocked",
+          cursor: { version: 1, token: REMOTE_TOKEN },
+          state: { kind: "remote-required", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui" },
+        },
+        after: { kind: "end" },
+      };
+    }
+
+    test("R18/UI: mounted pressure note shows backend time and row, and copy/search stay on terminal rows", async () => {
+      const { app, target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, repairFlagOn({ pane: PANE, segmentId: "seg-9", rowOrdinal: 41 }));
+      await settleUi();
+      const pressure = target.querySelector<HTMLElement>('[data-history-state="pressure"]');
+      expect(pressure).not.toBeNull();
+      expect(pressure!.textContent).toContain("หยุดเก็บประวัติ — พื้นที่ไม่พอ");
+      expect(pressure!.textContent).not.toContain(String(WALL_MS));
+      expect(pressure!.textContent).not.toContain(INCIDENT_ID);
+      expect(pressure!.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
+      expect(pressure!.getAttribute("data-history-left-row")).toBe("seg-9:41");
+      expect(pressure!.getAttribute("data-incident-id")).toBe(INCIDENT_ID);
+      expect(pressure!.closest(".mtv-line")).toBeNull();
+      // The reader sees when collection stopped and the last row kept, not only a data-* attribute.
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const stoppedAt = new Date(WALL_MS);
+      const shownTime = `${pad(stoppedAt.getDate())}/${pad(stoppedAt.getMonth() + 1)} ${pad(stoppedAt.getHours())}:${pad(stoppedAt.getMinutes())}:${pad(stoppedAt.getSeconds())}`;
+      const stopLine = pressure!.querySelector<HTMLElement>('[data-testid="mtv-history-stop"]');
+      expect(stopLine).not.toBeNull();
+      expect(stopLine!.textContent).toBe(`หยุดเมื่อ ${shownTime} · แถวสุดท้าย seg-9:41`);
+      expect(pressure!.getAttribute("aria-label")).toContain(shownTime);
+      expect(pressure!.getAttribute("aria-label")).toContain("seg-9:41");
+
+      const copied: string[] = [];
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text: string) => { copied.push(text); } },
+      });
+      try {
+        expect(await (app.copyAll as () => Promise<boolean>)()).toBe(true);
+      } finally {
+        if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+        else Reflect.deleteProperty(navigator, "clipboard");
+      }
+      expect(copied).toHaveLength(1);
+      expect(copied[0]).toContain("archive-18000");
+      for (const piece of ["หยุดเก็บประวัติ — พื้นที่ไม่พอ", "ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน", INCIDENT_ID, String(WALL_MS), "หยุดเมื่อ", "แถวสุดท้าย"]) {
+        expect(copied[0]).not.toContain(piece);
+      }
+
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true }));
+      await settleUi();
+      const input = target.querySelector<HTMLInputElement>('[data-testid="term-search-input"]');
+      expect(input).not.toBeNull();
+      input!.value = INCIDENT_ID;
+      input!.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await settleUi();
+      expect(target.querySelector('[data-testid="term-search-match"]')?.textContent).toContain("0 matches");
+      expect(target.querySelector(".mtv-line .search-match, .mtv-line .search-active")).toBeNull();
+      input!.value = "หยุดเก็บประวัติ";
+      input!.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await settleUi();
+      expect(target.querySelector('[data-testid="term-search-match"]')?.textContent).toContain("0 matches");
+      const rowText = [...target.querySelectorAll(".mtv-line")].map(row => row.textContent ?? "").join("\n");
+      expect(rowText).not.toContain("หยุดเก็บประวัติ");
+      expect(rowText).not.toContain(INCIDENT_ID);
+    });
+
+    test("R13/UI: the same opaque cursor and line anchor survive an empty remote page", async () => {
+      const { viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, repairFlagOn({ pane: PANE, segmentId: "seg-9", rowOrdinal: 41 }));
+      await settleUi();
+      expect(viewport.getAttribute("data-history-flag-cursor")).toBe(REMOTE_TOKEN);
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(null, [], true, repairFlagOn(null));
+      await settleUi();
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      expect(viewport.getAttribute("data-history-flag-cursor")).toBe(REMOTE_TOKEN);
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(viewport.getAttribute("data-history-window-has-older")).toBe("1");
+      const pressure = viewport.ownerDocument.querySelector<HTMLElement>('[data-history-state="pressure"]');
+      expect(pressure?.getAttribute("data-history-left-row")).toBe("none");
+      expect(pressure?.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
+      expect(pressure?.querySelector('[data-testid="mtv-history-stop"]')?.textContent).toContain("ก่อนแถวแรก");
+    });
+  });
+});
+
+describe("NEWARCH v2 fixed geometry on the screen", () => {
+  const status = "ท่อเก็บขาด — 04/10 08:02:03 — ก่อนแถวแรก — หยุดเก็บแล้ว";
+
+  async function mountFixed(options: {
+    viewportWidth: number;
+    fitWidth?: boolean;
+  }) {
+    const calls: Array<{ cols: number; rows: number }> = [];
+    const geometryCalls: Array<{ cols: number; rows: number }> = [];
+    const original = tmuxMux.sendResize.bind(tmuxMux);
+    tmuxMux.sendResize = (session, cols, rows) => {
+      calls.push({ cols, rows });
+      void session;
+    };
+    try {
+      const mountedView = mountTermView({
+        claimGeometry: true,
+        fixedGeometry: { columns: 100, rows: 40 },
+        fitWidth: options.fitWidth ?? false,
+        v2StatusText: status,
+        onGeometryChange: geometry => geometryCalls.push(geometry),
+        viewportWidth: options.viewportWidth,
+      });
+      await settleUi();
+      return { ...mountedView, calls, geometryCalls };
+    } finally {
+      tmuxMux.sendResize = original;
+    }
+  }
+
+  test("a phone shows the stopped incident with no live pane and does not resize", async () => {
+    for (const viewportWidth of [320, 390]) {
+      const view = await mountFixed({ viewportWidth });
+      expect(view.calls).toEqual([]);
+      expect(view.geometryCalls).toEqual([]);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("100");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("40");
+      const label = view.viewport.querySelector(".mtv-v2-status-text");
+      expect(label?.textContent).toContain("ก่อนแถวแรก");
+      expect(label?.textContent).toContain("หยุดเก็บแล้ว");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")?.textContent).toBe("เลื่อนข้างได้");
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeGreaterThan(viewportWidth);
+      const copied = [...view.viewport.querySelectorAll(".mtv-line")].map(node => node.textContent ?? "").join("\n");
+      expect(copied.includes("หยุดเก็บแล้ว")).toBe(false);
+    }
+  });
+
+  test("fit-width and a wide desktop keep 100 columns and write no resize", async () => {
+    const fit = await mountFixed({ viewportWidth: 320, fitWidth: true });
+    expect(fit.calls).toEqual([]);
+    expect(fit.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(fit.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+    expect(fit.viewport.querySelector(".mtv-v2-status-text")?.textContent).toContain("หยุดเก็บแล้ว");
+    const fitLayer = fit.viewport.querySelector<HTMLElement>(".mtv-layer");
+    expect(parseFloat(fitLayer?.style.width ?? "0")).toBeGreaterThan(320);
+    expect(fitLayer?.style.transform ?? "").toContain("scale(");
+
+    const desktop = await mountFixed({ viewportWidth: 1280 });
+    expect(desktop.calls).toEqual([]);
+    expect(desktop.geometryCalls).toEqual([]);
+    expect(desktop.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(desktop.viewport.getAttribute("data-last-rows")).toBe("40");
   });
 });

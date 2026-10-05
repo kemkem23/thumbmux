@@ -35,8 +35,15 @@
   import {
     applyHistoryWindowPage,
     createHistoryWindow,
+    historyContinuationFor,
+    historyIncidentLeftRowLabel,
+    historyIncidentStopLabel,
+    historyStatusNotes,
     historyWindowEndLine,
     historyWindowRequestCursor,
+    parseNewarchHistoryExtension,
+    presentNewarchV2,
+    type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
     type HistoryWindowState,
@@ -75,6 +82,7 @@
     validateHistoryPageMarkers,
     type MuxHistoryBoundary,
     type NewarchFrameMeta,
+    type NewarchHistoryExtension,
     isClaudeActivityStatusLine,
     detectClaudeBashBlocks,
     detectClaudeBashBlocksWithActivityEvidence,
@@ -196,6 +204,12 @@
      * newest completed group. Return summaries by id; rejection/missing ids
      * settle to a deterministic fallback. Active groups are never sent. */
     onClaudeBashSummaryRequest = undefined,
+    /** Birth geometry of a NEWARCH pane. Viewport changes must not resize it. */
+    fixedGeometry = null,
+    /** Shrink the picture to the viewport. Does not change terminal columns. */
+    fitWidth = false,
+    /** Incident sentence drawn even when this view has no live pane. */
+    v2StatusText = null,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -243,6 +257,9 @@
     onClaudeBashSummaryRequest?: (
       requests: readonly ClaudeBashSummaryRequest[],
     ) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
+    fixedGeometry?: { columns: number; rows: number } | null;
+    fitWidth?: boolean;
+    v2StatusText?: string | null;
   } = $props();
 
   /**
@@ -344,6 +361,7 @@
   let viewportBottom: number | null = null;
   let cursor = $state<{ row: number; col: number } | null>(null);
   let charW = $state(0);
+  let viewportWidthPx = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
   let viewH = $state(0);
   let lineH = $derived(Math.round(fontPx * LINE_RATIO));
@@ -531,11 +549,24 @@
   let pageLossMarkers = $state.raw<readonly LossMarker[]>([]);
   let lossMarkerPaneIdentity = '';
   const PAGE_LOSS_MARKER_LIMIT = 256;
+  const HISTORY_STATUS_NOTE_LIMIT = 6;
   /** Markers raised while this view watched; noted until their row is seen. */
   let freshLossKeys = $state.raw<ReadonlySet<string>>(new Set());
   const seenFreshLossKeys = new Set<string>();
   /** A history page read failed and nothing replaced it yet (CX M7). */
   let archiveUnavailable = $state(false);
+  // NEWARCH flag-on history states (gap/pending/remote/degraded/pressure) of
+  // the newest page per direction. Shown as notes beside the rows, never as
+  // row text, so copy and search cannot pick a label up as terminal output.
+  let historyStatusBefore = $state.raw<readonly HistoryStatusNote[]>([]);
+  let historyStatusAfter = $state.raw<readonly HistoryStatusNote[]>([]);
+  const historyStatus = $derived.by(() => {
+    const seen = new Map<string, HistoryStatusNote>();
+    for (const note of [...historyStatusBefore, ...historyStatusAfter]) {
+      if (!seen.has(note.key)) seen.set(note.key, note);
+    }
+    return [...seen.values()].slice(-HISTORY_STATUS_NOTE_LIMIT);
+  });
 
   // --- search + matching overlay ---
   let searchOpen = $state(false);
@@ -4068,6 +4099,7 @@
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       archiveUnavailable = false;
+      clearHistoryStatus();
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
       return unchanged;
     }
@@ -4861,6 +4893,8 @@
     totalArchivedLines: number;
     hasMore: boolean;
     markers: LossMarker[];
+    /** Flag-on states; null on a legacy page. */
+    flagOn: NewarchHistoryExtension | null;
   };
 
   function parseHistoryPage(data: string): ParsedHistoryPage | null {
@@ -4917,6 +4951,9 @@
     // drawing its rows without their gaps would hide a loss.
     const markers = validateHistoryPageMarkers(candidate.markers);
     if (markers === null) return null;
+    // Same rule for flag-on states: unreadable states refuse the page.
+    const flagOn = parseHistoryPageFlagOn(payload);
+    if (flagOn === undefined) return null;
     return {
       lines: [...lines],
       startLine,
@@ -4924,7 +4961,57 @@
       totalArchivedLines,
       hasMore: candidate.hasMore,
       markers: markers.map(marker => ({ lineId: marker.lineId, kind: marker.kind, missingCount: marker.missingCount })),
+      flagOn,
     };
+  }
+
+  /** undefined = present but unreadable (refuse the page); null = legacy. */
+  function parseHistoryPageFlagOn(payload: object): NewarchHistoryExtension | null | undefined {
+    if (!('flagOn' in payload) || (payload as { flagOn?: unknown }).flagOn === undefined) return null;
+    return parseNewarchHistoryExtension((payload as { flagOn: unknown }).flagOn) ?? undefined;
+  }
+
+  /**
+   * Flag-on continuation for the requested direction, checked against the
+   * legacy flag. `end` with hasMore, or blocked/more without it, is a lying
+   * page: refuse it rather than draw a false EOF or a false "more".
+   */
+  function flagOnContinuation(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+    hasMore: boolean,
+  ): 'end' | 'more' | 'blocked' | null | undefined {
+    if (flagOn === null) return null;
+    const continuation = historyContinuationFor(flagOn, direction);
+    return (continuation === 'end') === hasMore ? undefined : continuation;
+  }
+
+  /** The opaque cursor the server handed for this edge; `end` has none. */
+  function flagOnCursorFor(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+  ): { version: 1; token: string } | null {
+    const edge = flagOn === null ? null : direction === 'before' ? flagOn.before : flagOn.after;
+    return edge === null || edge.kind === 'end' ? null : { version: 1, token: edge.cursor.token };
+  }
+
+  /** A seeded window keeps the older-edge cursor of the page that seeded it. */
+  function withFlagOnCursorBefore(state: HistoryWindowState, flagOn: NewarchHistoryExtension | null): HistoryWindowState {
+    const cursor = flagOnCursorFor(flagOn, 'before');
+    return cursor ? { ...state, flagOnCursorBefore: cursor } : state;
+  }
+
+  function recordHistoryStatus(flagOn: NewarchHistoryExtension | null, direction: HistoryWindowDirection): void {
+    const notes = flagOn ? historyStatusNotes(flagOn) : [];
+    const held = direction === 'before' ? historyStatusBefore : historyStatusAfter;
+    if (held.length === 0 && notes.length === 0) return;
+    if (direction === 'before') historyStatusBefore = notes;
+    else historyStatusAfter = notes;
+  }
+
+  function clearHistoryStatus(): void {
+    if (historyStatusBefore.length) historyStatusBefore = [];
+    if (historyStatusAfter.length) historyStatusAfter = [];
   }
 
   function seedSlidingHistoryWindow(history: ParsedHistoryPage): {
@@ -5016,7 +5103,7 @@
         }
       }
       return {
-        state: createHistoryWindow({
+        state: withFlagOnCursorBefore(createHistoryWindow({
           startLine: normalizedStartLine + keepFrom,
           lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
@@ -5029,7 +5116,7 @@
             ? history.endLine !== liveBoundary.liveStartLine
             : history.endLine < history.totalArchivedLines,
           limits,
-        }),
+        }), history.flagOn),
         live,
         livePrefixDropped,
         entryState,
@@ -5332,12 +5419,19 @@
       return;
     }
     const history = parseHistoryPage(data);
-    if (!history || (history.lines.length === 0 && history.hasMore)) {
+    const continuation = history ? flagOnContinuation(history.flagOn, direction, history.hasMore) : undefined;
+    if (
+      !history
+      || continuation === undefined
+      // Only a blocked edge may arrive empty with more to read.
+      || (history.lines.length === 0 && history.hasMore && continuation !== 'blocked')
+    ) {
       finishArchiveRequest('malformed');
       return;
     }
     archiveTotalHint = Math.max(archiveTotalHint, history.totalArchivedLines);
     recordPageLossMarkers(history.markers);
+    recordHistoryStatus(history.flagOn, direction);
     if (archiveWindow && isAwayFromLiveTail()) {
       detachSlidingArchiveFromLive(archiveTotalHint);
     }
@@ -5401,6 +5495,10 @@
                 : history.endLine < archiveTotalHint
             )
           : history.hasMore,
+        // The after-edge hasMore above may be widened by the live boundary,
+        // so only the blocked state is passed through (it never means EOF).
+        ...(continuation === 'blocked' ? { continuation } : {}),
+        flagOnCursor: flagOnCursorFor(history.flagOn, direction),
       },
       { anchor: reader.anchor, protectedRange: reader.protectedRange },
     );
@@ -5519,6 +5617,13 @@
     }
 
     const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
+    const flagOn = parseHistoryPageFlagOn(payload as object);
+    const continuation = flagOn === undefined ? undefined : flagOnContinuation(flagOn, 'before', history.hasMore);
+    if (continuation === undefined) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    recordHistoryStatus(flagOn, 'before');
     const lines = history.lines;
     const historyStartLine = typeof history.startLine === 'number' ? history.startLine : null;
     if (
@@ -5530,8 +5635,11 @@
     }
     // A nonempty page without a numeric cursor can be rendered once, but it
     // cannot be advanced safely: requesting before null would duplicate it.
-    const serverSaysEnd =
-      historyStartLine === null || !history.hasMore || lines.length === 0;
+    // A blocked edge (pending/gap/remote) is never the end; only a nonempty
+    // cursorless page still cannot be advanced from.
+    const serverSaysEnd = continuation === 'blocked'
+      ? historyStartLine === null && lines.length > 0
+      : historyStartLine === null || !history.hasMore || lines.length === 0;
     if (lines.length === 0) {
       // An empty page contributes no resident bytes, even if a custom host
       // sends a numeric cursor with it. Keep the last resident floor; only the
@@ -5674,6 +5782,7 @@
     if (identity !== lossMarkerPaneIdentity) {
       lossMarkerPaneIdentity = identity;
       if (pageLossMarkers.length) pageLossMarkers = [];
+      clearHistoryStatus();
     }
     lossMarkerFrame = { liveStartLine: newarch.liveStartLine, lines: frameLines };
     lossMarkers = newarch.markers.map(marker => ({ ...marker }));
@@ -6018,7 +6127,14 @@
 
     if (layerEl) {
       const y = presentationRowTopPx(winStart) - scrollTop - (overshoot * 0.35);
-      layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      const translate = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      // Fit-width scales the picture only. Birth columns stay on the grid.
+      if (fixedGeometry && fitWidth && fixedPresentation && fixedPresentation.scale > 0) {
+        layerEl.style.transformOrigin = 'top left';
+        layerEl.style.transform = `${translate} scale(${fixedPresentation.scale})`;
+      } else {
+        layerEl.style.transform = translate;
+      }
     }
     emitScrollState();
     if (!busy()) settledBottomOffsetPx = reportedBottomOffset();
@@ -6117,6 +6233,20 @@
     if (!bounds) return null;
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     const cellW = Math.max(1, charW || measureCharWidth());
+    if (fixedGeometry) {
+      const naturalW = geom.cols * cellW;
+      const scale = fitWidth && naturalW > 0 ? Math.max(bounds.width, 1) / naturalW : 1;
+      const scrollX = fitWidth ? 0 : viewportEl.scrollLeft;
+      return {
+        rect: {
+          left: bounds.left - scrollX,
+          top: bounds.top,
+          width: naturalW * scale,
+          height: Math.max(1, geom.rows * lineH * scale),
+        },
+        geom,
+      };
+    }
     const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
     // contentCellFromPoint scales the rect across geom.rows, so the rect it gets
     // must be the box those rows actually occupy — rows * lineH — not the box the
@@ -6687,6 +6817,7 @@
   }
 
   function canSendResize(): boolean {
+    if (fixedGeometry) return false;
     return !!(
       claimGeometry &&
       typeof document !== 'undefined' &&
@@ -6708,6 +6839,13 @@
     if (w <= 0 || visibleH <= 0 || h <= 0) return null;
     const cw = measureCharWidth();
     charW = cw;
+    if (fixedGeometry) {
+      viewportWidthPx = w;
+      lastPushedCols = fixedGeometry.columns;
+      lastPushedRows = fixedGeometry.rows;
+      applyScroll();
+      return { cols: lastPushedCols, rows: lastPushedRows, changed: false };
+    }
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
     const rows = Math.max(minRows, Math.min(maxRows, Math.floor(h / lineH)));
     const changed = !!opts.force || cols !== lastPushedCols || rows !== lastPushedRows;
@@ -6898,6 +7036,7 @@
    * Live pane content stays.
    */
   function discardArchiveForAltScreen(): void {
+    clearHistoryStatus();
     cancelScheduledPrependWork();
     pendingPrependWork = null;
     prependParseSeq++;
@@ -7225,12 +7364,34 @@
     });
   }
 
+  const fixedPresentation = $derived(
+    fixedGeometry && charW > 0 && viewportWidthPx > 0
+      ? presentNewarchV2(
+          { columns: fixedGeometry.columns, rows: fixedGeometry.rows },
+          {
+            widthPx: viewportWidthPx,
+            heightPx: viewportEl?.clientHeight ?? 0,
+            cellWidthPx: charW,
+            cellHeightPx: lineH,
+            keyboardInsetPx: bottomInsetPx,
+            fitWidth,
+            scrollXPx: 0,
+          },
+        )
+      : null,
+  );
+  const fixedLayerWidth = $derived(
+    fixedGeometry && charW > 0 ? `${fixedGeometry.columns * charW + 12}px` : undefined,
+  );
+
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   bind:this={viewportEl}
   class="mtv"
+  class:mtv-fixed={fixedGeometry != null}
+  class:mtv-fit={fixedGeometry != null && fitWidth}
   data-testid="mtv"
   data-total={total}
   data-raw-total={rawLines.length}
@@ -7254,6 +7415,7 @@
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
   data-history-stop={historyStopReason}
+  data-history-states={historyStatus.length ? historyStatus.map(note => note.kind).join(' ') : undefined}
   data-history-paging={historyPaging}
   data-history-ceiling={historyPaging === 'ceiling' && historyStopReason === 'ceiling' ? '1' : undefined}
   data-history-window-start={archiveWindow?.startLine}
@@ -7263,6 +7425,7 @@
   data-history-window-attached={archiveWindow ? (archiveWindowAttachedToLive ? '1' : '0') : undefined}
   data-history-window-has-older={archiveWindow ? (archiveWindow.hasOlder ? '1' : '0') : undefined}
   data-history-window-has-newer={archiveWindow ? (archiveWindow.hasNewer ? '1' : '0') : undefined}
+  data-history-flag-cursor={archiveWindow?.flagOnCursorBefore?.token}
   data-history-live-start={liveBoundary?.liveStartLine}
   data-history-generation={liveBoundary?.generation}
   data-history-total-hint={archiveTotalHint}
@@ -7316,7 +7479,22 @@
       />
     </div>
   {/if}
-  <div bind:this={layerEl} class="mtv-layer">
+  {#if v2StatusText}
+    <div class="mtv-v2-status" role="note">
+      <span class="mtv-v2-status-text">{v2StatusText}</span>
+    </div>
+  {/if}
+  {#if fixedPresentation?.horizontalScroll}
+    <div class="mtv-hscroll" role="note">
+      <span class="mtv-hscroll-text">เลื่อนข้างได้</span>
+    </div>
+  {/if}
+  <div
+    bind:this={layerEl}
+    class="mtv-layer"
+    class:mtv-layer-fixed={fixedGeometry != null}
+    style:width={fixedLayerWidth}
+  >
     {#if renderer === 'canvas'}
       <CanvasTerminal
         lines={canvasWindowLines()}
@@ -7469,7 +7647,7 @@
       <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
     </div>
   {/if}
-  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable}
+  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable || historyStatus.length > 0}
     <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
       {#if lossMarkerPlacement.notes.length > 0}
         {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]!}
@@ -7486,6 +7664,26 @@
           <span class="mtv-signpost-text">{note}</span>
         </button>
       {/if}
+      {#each historyStatus as note (note.key)}
+        {@const stopLabel = historyIncidentStopLabel(note)}
+        <div
+          class="mtv-loss-note mtv-history-status"
+          role="note"
+          data-testid="mtv-history-status"
+          data-history-state={note.kind}
+          data-history-state-detail={note.detail}
+          data-history-opened-at={note.openedAtWallMs === undefined ? undefined : String(note.openedAtWallMs)}
+          data-history-left-row={historyIncidentLeftRowLabel(note)}
+          data-incident-id={note.incidentId}
+          aria-label={stopLabel ? `${note.text} · ${stopLabel}` : note.text}
+          title={note.detail}
+        >
+          <span class="mtv-signpost-text">{note.text}</span>
+          {#if stopLabel}
+            <span class="mtv-signpost-text" data-testid="mtv-history-stop">{stopLabel}</span>
+          {/if}
+        </div>
+      {/each}
       {#if archiveUnavailable}
         <div class="mtv-loss-note" role="note" data-testid="mtv-archive-unavailable"
           aria-label="อ่านประวัติส่วนนี้ไม่ได้ตอนนี้ · เลื่อนอีกครั้งเพื่อลองใหม่">
@@ -7635,10 +7833,42 @@
     max-width: min(24rem, calc(100% - 0.9rem));
     pointer-events: auto;
   }
+  .mtv-fixed {
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .mtv-fixed.mtv-fit {
+    overflow-x: hidden;
+  }
+  .mtv-v2-status,
+  .mtv-hscroll {
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 6;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mtv-v2-status { top: 0; }
+  .mtv-hscroll { bottom: 0; }
+  .mtv-v2-status-text,
+  .mtv-hscroll-text {
+    display: inline-block;
+    max-width: 100%;
+    padding: 2px 6px;
+    box-sizing: border-box;
+    font: 600 12px / 1.35 var(--font-mono, ui-monospace, monospace);
+    color: #141414;
+    background: #E0A020;
+  }
   .mtv-layer {
     position: absolute; left: 0; right: 0; top: 0;
     will-change: transform;
     padding: 0 6px;
+  }
+  .mtv-fixed .mtv-layer-fixed {
+    right: auto;
   }
   .mtv-line {
     white-space: pre;

@@ -1442,11 +1442,21 @@ function isV0203PatchException(
  * assigns it to TmuxDriver). The generic proof cannot model the intersection.
  * Pin both artifact digests and versions; unrelated drift still fails.
  * createActivityPoll / readActivityProcess left the barrel instead of freezing.
- * Evidence: server/tests/session-row-type.fixture.ts (`bundledDriver`)
- * compiles createBunTmuxDriver() into a plain TmuxDriver binding.
+ * NEWARCH v2 (lot I) adds, on the same graph: TmuxWsMuxOptions.newarchV2?
+ * (optional), private members, and handleResize/applyGeometry now return
+ * NewarchV2GeometryReply | null instead of void. Callers that ignore the result
+ * still compile; AppRoutes / AppRoutesOptions / createAppRoutes change only
+ * through that TmuxWsMux graph (app-routes.d.ts is byte-identical).
+ * Evidence: server/tests/session-row-type.fixture.ts compiles 0.20.4-shaped
+ * callers (discarded result, void callback, non-overriding subclass). A
+ * subclass that overrides either method as `: void` no longer compiles.
  */
 const V0205_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
-  "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b"
+  "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b",
+  "server:AppRoutes:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:0cee4584b304111af833cf65a34d7205cdd27e714d815411d9ca1ad137d054e3",
+  "server:AppRoutesOptions:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:413b5cbbaada29e23a00e522f4dcd30c9990dd926048df394ebf004fb2d66ce7",
+  "server:createAppRoutes:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:dcd3b01f07acdc453c2cf3cd977c44478d384beb6b592e7431b58e2700ec700e",
+  "server:TmuxWsMux:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:24d3a6f011af24425930aec4c32d0707f4e5264776d26bba3ab26791186f0ebb"
 ]);
 
 function isV0205PatchException(
