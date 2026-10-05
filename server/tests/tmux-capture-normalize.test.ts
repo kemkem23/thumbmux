@@ -2197,3 +2197,47 @@ assert.ok(result.consumed.end<result.offered.end);`);
     rmSync(root,{recursive:true,force:true});
   }
 });
+
+
+test('B1c decoder reads only consumed bytes plus one boundary byte and detaches mutable input',()=>{
+  const config={...v2Config,geometry:{columns:78,rows:120}};
+  const pane={...v2Pane,geometry:v2BirthGeometry(config)};
+  let cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config);
+  const original=streamCanonical(cp);
+  const bytes=Array.from(Buffer.from('row\r\n'.repeat(1024)));
+  let start=0,reads=0,prefixes=0;
+  while(start<bytes.length){
+    const view=new Proxy(bytes.slice(start),{get(target,key,receiver){
+      if(typeof key==='string' && /^(0|[1-9][0-9]*)$/.test(key))reads++;
+      return Reflect.get(target,key,receiver);
+    }});
+    const result=evaluateV2Prefix({pane,checkpoint:cp,raw:{epoch:v2Epoch,start,end:bytes.length},
+      bytes:view,observedAtMonoMs:1,pendingSinceMonoMs:null},config,v2Clock);
+    if('kind' in result)throw Error(result.incident.reason);
+    if(prefixes===0)expect(streamCanonical(cp)).toBe(original);
+    cp=result.checkpoint;start=result.consumed.end;prefixes++;
+  }
+  expect(reads).toBeLessThanOrEqual(bytes.length+prefixes);
+  const mutable=structuredClone(cp),before=streamCanonical(mutable);
+  const result=evaluateV2Prefix({pane,checkpoint:mutable,raw:{epoch:v2Epoch,start,end:start+1},
+    bytes:[65],observedAtMonoMs:1,pendingSinceMonoMs:null},config,v2Clock);
+  if('kind' in result)throw Error(result.incident.reason);
+  expect(streamCanonical(mutable)).toBe(before);
+  const output=streamCanonical(result);
+  (mutable.state.alternate.rows[0]!.cells[0]! as {text:string}).text='changed';
+  expect(streamCanonical(result)).toBe(output);
+});
+
+// Run the two requested compiler gates inside the same isolation boundary as
+// the fixtures. Their exit statuses are printed separately from bun test.
+test('B1c strict contract types and repository typecheck gates',()=>{
+  const root=new URL('../../../../',import.meta.url).pathname;
+  const commands=[['node_modules/.bin/tsc','--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
+    '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions',
+    'docs/tasks/newarch-stream/contract-fixture.ts'],[process.execPath,'run','typecheck']];
+  for(const command of commands){
+    const run=spawnSync(command[0]!,command.slice(1),{cwd:root,encoding:'utf8',timeout:120000});
+    console.log('B1C_GATE',JSON.stringify({command,exit:run.status,stdout:run.stdout,stderr:run.stderr}));
+    expect(run.status).toBe(0);
+  }
+},240000);
