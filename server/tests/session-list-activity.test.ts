@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBunTmuxDriver } from "../src/bun-driver";
@@ -282,6 +282,7 @@ test("H2 a failed pipe read kills the child before releasing the activity slot",
 function withListSessionsOutput(
   stdout: string,
   run: (driver: ReturnType<typeof createBunTmuxDriver>, calls: string[][]) => void,
+  create: typeof createBunTmuxDriver = createBunTmuxDriver,
 ) {
   const originalSpawnSync = Bun.spawnSync;
   const calls: string[][] = [];
@@ -290,7 +291,7 @@ function withListSessionsOutput(
     if (command[1] === "list-sessions") return successfulProcess(stdout);
     throw new Error(`unexpected tmux call: ${command.join(" ")}`);
   }) as typeof Bun.spawnSync;
-  const driver = createBunTmuxDriver();
+  const driver = create();
   try {
     run(driver, calls);
   } finally {
@@ -299,34 +300,58 @@ function withListSessionsOutput(
   }
 }
 
+function expectD2aDriverClientMix(create: typeof createBunTmuxDriver = createBunTmuxDriver) {
+  withListSessionsOutput([
+    "two-real|1700000000|1|2",
+    "watch-only|1700000001|1|1",
+    "both|1700000002|2|2",
+    "nobody|1700000003|1|0",
+    "client:0|two-real",
+    "client:0|two-real",
+    "client:1|watch-only",
+    "client:0|both",
+    "client:1|both",
+    "",
+  ].join("\n"), (driver, calls) => {
+    const rows = driver.listSessions();
+    console.log("D2A_DRIVER_SPAWNS_PER_LIST", calls.length, JSON.stringify(calls[0]));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual([
+      "tmux", "list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}",
+      ";", "list-clients", "-F", "client:#{client_control_mode}|#{client_session}",
+    ]);
+    expect(rows.map((row) => [row.name, row.attached])).toEqual([
+      ["two-real", true],
+      ["watch-only", false],
+      ["both", true],
+      ["nobody", false],
+    ]);
+  }, create);
+}
+
+function expectD2aDriverUnreadableRows(create: typeof createBunTmuxDriver = createBunTmuxDriver) {
+  withListSessionsOutput([
+    "kept|1700000000|1|1",
+    "over|1700000001|1|1",
+    "client:",
+    "client:1",
+    "client:1|",
+    "client:x|kept",
+    "client:|kept",
+    "client:1|ghost",
+    "client:1|over",
+    "client:1|over",
+  ].join("\n"), (driver) => {
+    expect(driver.listSessions().map((row) => [row.name, row.attached])).toEqual([
+      ["kept", true],
+      ["over", false],
+    ]);
+  }, create);
+}
+
 describe("D2a bun driver listSessions attachment", () => {
   test("two real clients, real+control, control-only and none — one tmux call", () => {
-    withListSessionsOutput([
-      "two-real|1700000000|1|2",
-      "watch-only|1700000001|1|1",
-      "both|1700000002|2|2",
-      "nobody|1700000003|1|0",
-      "client:0|two-real",
-      "client:0|two-real",
-      "client:1|watch-only",
-      "client:0|both",
-      "client:1|both",
-      "",
-    ].join("\n"), (driver, calls) => {
-      const rows = driver.listSessions();
-      console.log("D2A_DRIVER_SPAWNS_PER_LIST", calls.length, JSON.stringify(calls[0]));
-      expect(calls).toHaveLength(1);
-      expect(calls[0]).toEqual([
-        "tmux", "list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}",
-        ";", "list-clients", "-F", "client:#{client_control_mode}|#{client_session}",
-      ]);
-      expect(rows.map((row) => [row.name, row.attached])).toEqual([
-        ["two-real", true],
-        ["watch-only", false],
-        ["both", true],
-        ["nobody", false],
-      ]);
-    });
+    expectD2aDriverClientMix();
   });
 
   test("with no client rows the rows keep their shape and every field", () => {
@@ -339,23 +364,43 @@ describe("D2a bun driver listSessions attachment", () => {
   });
 
   test("unreadable, empty and foreign client rows never fail the list", () => {
-    withListSessionsOutput([
-      "kept|1700000000|1|1",
-      "over|1700000001|1|1",
-      "client:",
-      "client:1",
-      "client:1|",
-      "client:x|kept",
-      "client:|kept",
-      "client:1|ghost",
-      "client:1|over",
-      "client:1|over",
-    ].join("\n"), (driver) => {
-      expect(driver.listSessions().map((row) => [row.name, row.attached])).toEqual([
-        ["kept", true],
-        ["over", false],
-      ]);
-    });
+    expectD2aDriverUnreadableRows();
+  });
+
+  // Each mutant removes one control-mode condition in a copy of bun-driver.ts
+  // written next to the source inside the cage's own checkout, deleted in `finally`.
+  test("mutation: every control-mode condition in listSessions is load-bearing", async () => {
+    const source = join(import.meta.dir, "../src/bun-driver.ts");
+    const original = readFileSync(source, "utf8");
+    const mutants = [
+      { name: "no-subtract", from: " - (controlClients.get(name!) ?? 0) > 0,", to: " > 0," },
+      { name: "every-client-is-control", from: ' || rest.slice(0, separator) !== "1"', to: "" },
+      { name: "client-rows-as-sessions", from: "rows.filter((line) => !line.startsWith(clientPrefix)).map(", to: "rows.map(" },
+      { name: "no-list-clients", from: '          ";", "list-clients", "-F", `${clientPrefix}#{client_control_mode}|#{client_session}`,\n', to: "" },
+      { name: "pre-d2a-equals-one", from: "(Number(attached) || 0) - (controlClients.get(name!) ?? 0) > 0,", to: 'attached === "1",' },
+    ];
+    const results: Array<{ mutant: string; killedBy: string[] }> = [];
+    for (const mutant of mutants) {
+      expect(original.split(mutant.from)).toHaveLength(2);
+      const copy = join(import.meta.dir, `../src/bun-driver.d2a-mutant-${mutant.name}.ts`);
+      writeFileSync(copy, original.replace(mutant.from, mutant.to));
+      try {
+        const mod = await import(copy) as typeof import("../src/bun-driver");
+        const killedBy: string[] = [];
+        const checks: Array<[string, () => void]> = [
+          ["client-mix", () => expectD2aDriverClientMix(mod.createBunTmuxDriver)],
+          ["unreadable-rows", () => expectD2aDriverUnreadableRows(mod.createBunTmuxDriver)],
+        ];
+        for (const [label, check] of checks) {
+          try { check(); } catch { killedBy.push(label); }
+        }
+        results.push({ mutant: mutant.name, killedBy });
+      } finally {
+        rmSync(copy, { force: true });
+      }
+    }
+    console.log("D2A_DRIVER_MUTANTS", JSON.stringify(results));
+    expect(results.filter((result) => result.killedBy.length === 0)).toEqual([]);
   });
 });
 
@@ -375,6 +420,8 @@ test("D2a real tmux: the driver reads a control-mode watcher alone as detached, 
   const children: Array<{ kill(signal?: number): void; exited: Promise<number> }> = [];
   const clientModes = () => t(["list-clients", "-t", `=${name}`, "-F", "#{client_control_mode}"])
     .trim().split("\n").filter(Boolean).sort().join(",");
+  const rawAttached = () => t(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
+    .split("\n").find((row) => row.startsWith(`${name}|`))?.slice(name.length + 1);
   const waitForModes = async (want: string) => {
     const started = Date.now();
     while (clientModes() !== want) {
@@ -396,8 +443,10 @@ test("D2a real tmux: the driver reads a control-mode watcher alone as detached, 
     children.push(watcher);
     void new Response(watcher.stdout).arrayBuffer().catch(() => {});
     await waitForModes("1");
+    const rawControlOnly = rawAttached();
     const controlOnly = driver.listSessions().find((row) => row.name === name);
-    console.log("D2A_DRIVER_REAL_CONTROL_ONLY", JSON.stringify(controlOnly));
+    console.log("D2A_DRIVER_REAL_CONTROL_ONLY", JSON.stringify({ sessionAttached: rawControlOnly, row: controlOnly }));
+    expect(rawControlOnly).toBe("1");
     expect(controlOnly?.attached).toBe(false);
 
     const viewer = nativeSpawn([
@@ -406,7 +455,7 @@ test("D2a real tmux: the driver reads a control-mode watcher alone as detached, 
     children.push(viewer);
     void new Response(viewer.stdout).arrayBuffer().catch(() => {});
     await waitForModes("0,1");
-    const raw = t(["display-message", "-p", "-t", `=${name}`, "#{session_attached}"]).trim();
+    const raw = rawAttached();
     const withViewer = driver.listSessions().find((row) => row.name === name);
     console.log("D2A_DRIVER_REAL_CONTROL_PLUS_REAL", JSON.stringify({ sessionAttached: raw, row: withViewer }));
     expect(raw).toBe("2");
