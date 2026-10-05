@@ -605,7 +605,8 @@ describe('stream-first H crash and continuation', () => {
           // One GitHub run failed this open with SQLITE_IOERR_SHORT_READ and no local stress reproduced it:
           // print what the killed writer left so a recurrence carries its own evidence.
           const sizes = Object.fromEntries(['', '-wal', '-shm', '-journal'].map(s => [s || 'db', existsSync(path + s) ? statSync(path + s).size : null]));
-          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify({ phase, sizes, output, stderr: stderr.slice(-2000), error: String(e) }));
+          const dbIno = existsSync(path) ? Number(statSync(path).ino) : null;
+          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify({ phase, sizes, dbIno, output, stderr: stderr.slice(-2000), error: String(e) }));
           throw e;
         }
         try {

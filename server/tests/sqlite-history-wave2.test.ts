@@ -153,6 +153,7 @@ test('default package barrel still has no sqlite import and the opt-in entry has
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createProjectionStore } from '../src/sqlite-history/projection-store';
+import { PROJECTION_STORE_FILE } from '../src/sqlite-history/schema';
 import { encodeCells } from '../src/sqlite-history/ram-store';
 import { isProjectionRefusal, type ScrollEvent } from '../src/sqlite-history/types';
 // FIX1 §3 caller contract: a refused row still belongs to the caller, which
@@ -420,24 +421,68 @@ test('newarch FIX2: close leaves no fixture fds and immediate reopen never needs
 },60000);
 
 test('newarch DEBT: a disk worker that never exits is terminated without throwing at close',async()=>{
+ // terminate() never sqlite3_close, so the SQLite inode table of this process would
+ // keep the worker's -shm mapping after the directory is removed. ext4 can then hand
+ // that inode to a later file in the same process. The scene runs in a child; this
+ // process deletes the directory only after that child has exited.
  const root=mkdtempSync(join(tmpdir(),'na-close-stuck-'));
- const key={serverIdentity:'close-stuck',paneId:'%1',birthGeneration:1};
- const s=createProjectionStore({historyRoot:root,mode:'create'});
- try {
+ const dbFile=join(root,PROJECTION_STORE_FILE);
+ const shmFile=dbFile+'-shm';
+ const modulePath=join(import.meta.dir,'../src/sqlite-history/projection-store.ts');
+ const schemaPath=join(import.meta.dir,'../src/sqlite-history/schema.ts');
+ const scriptPath=join(root,'debt-stuck-scene.ts');
+ writeFileSync(scriptPath,`import {createProjectionStore} from ${JSON.stringify(modulePath)};
+import {PROJECTION_STORE_FILE} from ${JSON.stringify(schemaPath)};
+import {readdirSync,readFileSync,readlinkSync,statSync} from 'node:fs';
+import {join} from 'node:path';
+const root=${JSON.stringify(root)};
+const key={serverIdentity:'close-stuck',paneId:'%1',birthGeneration:1};
+const file=join(root,PROJECTION_STORE_FILE);
+const s=createProjectionStore({historyRoot:root,mode:'create'});
+try {
   for(let n=0;n<200;n++)await s.appendScroll({paneKey:key,sourceEpoch:1,geometryGeneration:1,receiveSeq:n,softWrap:false,physicalRow:{text:String(n),cells:[]}});
   s.flush();
-  // Swallow the close request: from the store's side the worker is alive and never exits.
-  const worker=(s as any).worker;expect(worker).toBeTruthy();worker.postMessage=()=>{};
+  const worker=s.worker;if(!worker) throw new Error('missing-worker');
+  worker.postMessage=()=>{};
   const started=performance.now();await s.close();const closeMs=performance.now()-started;
-  expect((s as any).worker).toBeNull();expect(closeMs).toBeLessThan(10000);
+  if(s.worker!==null) throw new Error('worker-not-cleared');
+  if(!(closeMs<10000)) throw new Error('closeMs '+closeMs);
   const fds=readdirSync('/proc/self/fd').filter(fd=>{try{return readlinkSync('/proc/self/fd/'+fd).startsWith(root+'/');}catch{return false;}});
-  // Normal close proves fd=0 above. A terminated worker cannot finalize its own
-  // SQLite handle; only that bounded set may remain, and it must not block reopen.
-  expect(fds.length).toBeLessThanOrEqual(4);
+  if(fds.length>4) throw new Error('fds '+fds.length);
+  const shm=file+'-shm';
+  const shmMapLines=readFileSync('/proc/self/maps','utf8').split(String.fromCharCode(10)).filter(line=>line.includes(shm)).length;
+  const dbIno=Number(statSync(file).ino);
   const again=createProjectionStore({historyRoot:root,mode:'recover'});
-  try {expect(again.token(key).nextLineId).toBe(200);}finally{await again.close();}
-  console.log('NA_DEBT_STUCK_CLOSE',JSON.stringify({closeMs:Math.round(closeMs),fdsAfterClose:fds.length}));
- }finally{await s.close();rmSync(root,{recursive:true,force:true});}
+  let nextLineId;
+  try {nextLineId=again.token(key).nextLineId;} finally {await again.close();}
+  if(nextLineId!==200) throw new Error('nextLineId '+nextLineId);
+  console.log('NA_DEBT_STUCK_RESULT '+JSON.stringify({closeMs,fdsAfterClose:fds.length,dbIno,shmMapLines,nextLineId}));
+} finally {await s.close();}
+`);
+ let child:ReturnType<typeof Bun.spawn>|undefined;
+ try {
+  child=Bun.spawn([process.execPath,scriptPath],{stdout:'pipe',stderr:'pipe'});
+  const [exitCode,output,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
+  const line=output.split('\n').find(row=>row.startsWith('NA_DEBT_STUCK_RESULT '));
+  expect(exitCode,stderr.slice(-2000)).toBe(0);
+  expect(line,output.slice(-2000)).toBeTruthy();
+  const result=JSON.parse(line!.slice('NA_DEBT_STUCK_RESULT '.length)) as {closeMs:number;fdsAfterClose:number;dbIno:number;shmMapLines:number;nextLineId:number};
+  // Same ceilings as the in-process scene: close under 10s, at most 4 leftover fds.
+  expect(result.closeMs).toBeLessThan(10000);
+  expect(result.fdsAfterClose).toBeLessThanOrEqual(4);
+  expect(result.nextLineId).toBe(200);
+  const parentShmMapLines=readFileSync('/proc/self/maps','utf8').split('\n').filter(row=>row.includes(shmFile)).length;
+  const parentFds=readdirSync('/proc/self/fd').filter(fd=>{try{return readlinkSync('/proc/self/fd/'+fd).startsWith(root+'/');}catch{return false;}});
+  expect(parentShmMapLines).toBe(0);
+  expect(parentFds).toHaveLength(0);
+  const dbIno=Number(statSync(dbFile).ino);
+  expect(dbIno).toBe(result.dbIno);
+  console.log('NA_DEBT_STUCK_CLOSE',JSON.stringify({closeMs:Math.round(result.closeMs),fdsAfterClose:result.fdsAfterClose,dbIno,shmMapLines:result.shmMapLines,parentShmMapLines}));
+ }finally{
+  if(child && child.exitCode===null) child.kill('SIGKILL');
+  if(child) await child.exited;
+  rmSync(root,{recursive:true,force:true});
+ }
 },30000);
 
 test('newarch FIX2: open loop hot pane 1000 per second plus twenty panes at 100',async()=>{
