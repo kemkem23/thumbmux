@@ -341,6 +341,7 @@ function expectD2aDriverUnreadableRows(create: typeof createBunTmuxDriver = crea
     "client:1|ghost",
     "client:1|over",
     "client:1|over",
+    "client:0|foreign|1700000004|1|1",
   ].join("\n"), (driver) => {
     expect(driver.listSessions().map((row) => [row.name, row.attached])).toEqual([
       ["kept", true],
@@ -393,11 +394,11 @@ describe("D2a bun driver listSessions attachment", () => {
     const source = join(import.meta.dir, "../src/bun-driver.ts");
     const original = readFileSync(source, "utf8");
     const mutants = [
-      { name: "no-subtract", from: " - (controlClients.get(name!) ?? 0) > 0,", to: " > 0," },
+      { name: "no-subtract", from: " - (controlClients.get(name) ?? 0) > 0,", to: " > 0," },
       { name: "every-client-is-control", from: ' || rest.slice(0, separator) !== "1"', to: "" },
-      { name: "client-rows-as-sessions", from: "rows.filter((line) => !line.startsWith(clientPrefix)).map(", to: "rows.map(" },
+      { name: "client-rows-as-sessions", from: "rows.filter((line) => !line.startsWith(clientPrefix)).flatMap(", to: "rows.flatMap(" },
       { name: "no-list-clients", from: '          ";", "list-clients", "-F", `${clientPrefix}#{client_control_mode}|#{client_session}`,\n', to: "" },
-      { name: "pre-d2a-equals-one", from: "(Number(attached) || 0) - (controlClients.get(name!) ?? 0) > 0,", to: 'attached === "1",' },
+      { name: "pre-d2a-equals-one", from: "(Number(attached) || 0) - (controlClients.get(name) ?? 0) > 0,", to: 'attached === "1",' },
     ];
     const results: Array<{ mutant: string; killedBy: string[] }> = [];
     for (const mutant of mutants) {

@@ -234,7 +234,7 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): BunTmuxDri
           const session = rest.slice(separator + 1);
           if (session) controlClients.set(session, (controlClients.get(session) ?? 0) + 1);
         }
-        return rows.filter((line) => !line.startsWith(clientPrefix)).map((line) => {
+        return rows.filter((line) => !line.startsWith(clientPrefix)).flatMap((line) => {
             // The trailing fields are numeric: take them off the END so a "|"
             // in the session name stays in the name (as parseMuxSampleLine).
             const fields = line.split("|");
@@ -246,15 +246,18 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): BunTmuxDri
               created = fields.pop();
               name = fields.join("|");
             } else {
-              [name, created, windows, attached] = fields;
+              return [];
             }
-            return {
+            // Incomplete inventory rows are unknown, not sessions with invented
+            // defaults. This also narrows created to the protocol's string type.
+            if (!name || !created || !windows || !attached) return [];
+            return [{
               name,
               created,
               windows: Number(windows) || 1,
-              attached: (Number(attached) || 0) - (controlClients.get(name!) ?? 0) > 0,
-              activityAt: activityPoll.peek().get(name!) ?? 0,
-            };
+              attached: (Number(attached) || 0) - (controlClients.get(name) ?? 0) > 0,
+              activityAt: activityPoll.peek().get(name) ?? 0,
+            }];
           });
       } catch {
         return []; // no server running yet
