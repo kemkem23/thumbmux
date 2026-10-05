@@ -1741,8 +1741,16 @@ declare const v2WriterGenerationBrand: unique symbol;
 declare const v2ContinuityGenerationBrand: unique symbol;
 export type V2WriterGeneration = number & { readonly [v2WriterGenerationBrand]: 'writer' };
 export type V2ContinuityGeneration = number & { readonly [v2ContinuityGenerationBrand]: 'continuity' };
-export function v2WriterGeneration(n: number): V2WriterGeneration { v2Int(n, 1); return n as V2WriterGeneration; }
-export function v2ContinuityGeneration(n: number): V2ContinuityGeneration { v2Int(n, 1); return n as V2ContinuityGeneration; }
+/** Each constructor refuses the OTHER brand (review K-r1 B1): a bare number
+ * (e.g. V2Receipt.generation) names its role here, a continuity value cannot be
+ * re-minted as a writer value and vice versa. A cast through `unknown` is
+ * invisible to the type system; runtime role checks stay with the callers. */
+export function v2WriterGeneration(n: number & { readonly [v2ContinuityGenerationBrand]?: never }): V2WriterGeneration {
+  v2Int(n, 1); return n as V2WriterGeneration;
+}
+export function v2ContinuityGeneration(n: number & { readonly [v2WriterGenerationBrand]?: never }): V2ContinuityGeneration {
+  v2Int(n, 1); return n as V2ContinuityGeneration;
+}
 export function v2SourceEpochOf(epoch: PipeEpoch): NewarchV2SourceEpoch {
   return { attachId: epoch.attachId, collectorIncarnation: epoch.collectorIncarnation };
 }
@@ -1794,6 +1802,13 @@ export function v2DecodePrefixValid(p: V2DecodePrefix, base: V2LiveCheckpoint): 
       || c.replayFloor.byteOffset < base.replayFloor.byteOffset
       || !sameContract(c.geometry, base.geometry)) return false;
     if (p.rows.some(r => v2PaneKey(r.id.pane) !== key)) return false;
+    // Within one segment rows strictly ascend from the base frontier (no repeat,
+    // no swap). Gaps across segments and decoder continuity stay B1's tests.
+    let prev = base.frontier;
+    for (const r of p.rows) {
+      if (prev && prev.segmentId === r.id.segmentId && r.id.rowOrdinal <= prev.rowOrdinal) return false;
+      prev = r.id;
+    }
     const last = p.rows.length ? p.rows[p.rows.length - 1]!.id : base.frontier;
     if (!sameContract(c.frontier, last)) return false;
     if (p.consumed.end === p.offered.end) return p.stop === 'complete' && p.suffix === null;
@@ -1803,9 +1818,13 @@ export function v2DecodePrefixValid(p: V2DecodePrefix, base: V2LiveCheckpoint): 
 }
 
 /** Collector-issued (S1): S read back this durable raw subrange, its record
- * chain and digests. lastRecordEnd is the byte end of the last spool record the
- * range touches and may exceed certified.end when the prefix ends mid-record.
- * The host never mints this; digest = v2SourcePrefixReceiptDigest(rest). */
+ * chain and digests. certified is the committed prefix range (certifyPrefix is
+ * asked for prefix.consumed), so certified.end === checkpoint.through.
+ * lastRecordEnd is the byte end of the last spool record the range touches and
+ * may exceed certified.end when the prefix ends mid-record. The host never
+ * mints this; digest = v2SourcePrefixReceiptDigest(rest). The digest is public,
+ * so it proves integrity, not origin: S compares with what it issued
+ * (v2PrefixAckMatchesIssued). */
 export interface V2SourcePrefixReceipt {
   readonly schema: typeof NEWARCH_V2_VERSION; readonly kind: 'source-prefix'; readonly receiptId: string;
   readonly sourceEpoch: NewarchV2SourceEpoch; readonly certified: RawRange;
@@ -1845,17 +1864,37 @@ export function v2PrefixAckValid(ack: V2PrefixAck, checkpoint: V2LiveCheckpoint,
     if (r.generation !== ack.writerGeneration || ack.writerGeneration !== expected.writerGeneration
       || ack.continuityGeneration !== expected.continuityGeneration) return false;
     if (at !== checkpoint.through.byteOffset || s.certified.start > at || at > s.certified.end
-      || s.certified.start > s.certified.end || s.lastRecordEnd < s.certified.end
+      || s.certified.start > s.certified.end || s.certified.end !== at || s.lastRecordEnd < s.certified.end
       || s.firstSequence > s.lastSequence) return false;
     return ack.recordComplete === (at === s.lastRecordEnd);
   });
 }
 
+/** Structural check PLUS identity with the receipt S itself issued for this
+ * prefix (review K-r1 B2). v2PrefixAckValid alone accepts a receipt the host
+ * re-signed (e.g. lastRecordEnd moved onto the commit point to claim
+ * recordComplete); only the byte-for-byte comparison with the issued receipt
+ * (all fields, digest included) refuses it. issued must itself be well-signed. */
+export function v2PrefixAckMatchesIssued(ack: V2PrefixAck, issued: V2SourcePrefixReceipt, checkpoint: V2LiveCheckpoint, expected: {
+  readonly writerGeneration: V2WriterGeneration; readonly continuityGeneration: V2ContinuityGeneration;
+}): boolean {
+  return v2Guard(() => {
+    const { digest, ...unsigned } = issued;
+    if (issued.schema !== NEWARCH_V2_VERSION || issued.kind !== 'source-prefix'
+      || digest !== v2SourcePrefixReceiptDigest(unsigned)) return false;
+    return sameContract(ack.source, issued) && v2PrefixAckValid(ack, checkpoint, expected);
+  });
+}
+
 /** S1 implements; the host may only forward collector receipts. */
 export interface V2PrefixSourcePort {
+  /** range = the committed prefix (V2DecodePrefix.consumed); the receipt
+   * certifies exactly that range. S keeps what it issued, keyed by receiptId. */
   certifyPrefix(binding: Binding, range: RawRange): Promise<Result<V2SourcePrefixReceipt>>;
-  /** S re-validates with v2PrefixAckValid AND reads receipt/checkpoint back from
-   * H before advancing its consumer ACK; no ACK when the H commit failed. */
+  /** S MUST look up the receipt it issued (ack.source.receiptId) and accept only
+   * if v2PrefixAckMatchesIssued(ack, issued, ...) — v2PrefixAckValid alone is not
+   * enough — AND read receipt/checkpoint back from H before advancing its
+   * consumer ACK; no ACK when the H commit failed or the receipt is unknown. */
   acknowledgePrefix(ack: V2PrefixAck): Promise<Result<{ readonly through: RawPosition; readonly recordComplete: boolean }>>;
 }
 
