@@ -297,6 +297,9 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     { name: 'v2-ignore-current-generation', from: 'v2WriteDisposition(r.fence, cap.generation, owner?.durableRevision ?? 0, previous)', to: 'v2WriteDisposition({ ...r.fence, expectedGeneration: cap.generation }, cap.generation, owner?.durableRevision ?? 0, previous)' },
     { name: 'v2-accept-stale-audit', from: "}, this.#config.audit), 'v2 stale/unordered audit');", to: "}, this.#config.audit) || true, 'v2 stale/unordered audit');" },
     { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);", to: '/* mutant loses rows behind durable receipt */' },
+    { name: 'v2-authority-foreign-incident', from: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);",
+      to: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, this.owner(pane)?.incidentId ?? incidentId);" },
+    { name: 'v2-authority-omits-checkpoint-pin', from: "rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`,\n        holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins }", to: 'rawPins: [], rowPins }' },
   ];
   try {
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
