@@ -1756,13 +1756,13 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
 // it does not expose the backing store or a legacy write port to its callers.
 import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint, validateV2Incident,
   validateV2ReadRequest, v2Digest, v2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
-  v2AuditComparable, v2WriterGeneration } from './stream-contract';
+  v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
   V2WriteRequest, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
   V2SessionReservationReceipt, V2CancelBirth, V2LiveCheckpoint, V2AuditResult, V2HistoryPage,
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
   NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
-  V2RawPinCensus, V2WriterGeneration, PipeEpoch } from './stream-contract';
+  V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
 function v2Failure(error: unknown): StreamFailure {
   const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
@@ -1781,8 +1781,9 @@ export type V2FactoryWithAuthority = Omit<V2HistoryFactory, 'openForCapture'> & 
 export interface V2HistoryOptions {
   /** Tests kill/throw at real transaction boundaries. Never an alternate writer. */
   boundary?: (phase: string) => void;
-  /** S's durable authority, checked inside H's transaction, not a caller boolean. */
-  inputReceipt?: (ack: SpoolAck) => Result<SpoolAck | null>;
+  /** S's issued-input authority (record ACK or source-prefix receipt), read
+   * back synchronously inside H's write transaction; never a caller boolean. */
+  inputReceipt?: V2IssuedInputAuthority['inputReceipt'];
   /** O provides verified readback evidence; C owns this validator and the writer. */
   remoteReadback?: (locator: V2RemoteLocator, exported: SealedExport) => boolean;
   /** O's bounded restore cache. Null/missing stays blocked, never becomes EOF. */
@@ -1862,6 +1863,8 @@ class V2Storage {
       writerGeneration: () => this.authorityRead(() => this.currentGeneration()),
       incidentResolution: (pane: PaneKey, incidentId: string) => this.authorityRead(() => this.incidentResolution(pane, incidentId)),
       rawPins: (pane: PaneKey, epoch: PipeEpoch) => this.authorityRead(() => this.rawPins(pane, epoch)),
+      reserveRearm: (pane: PaneKey, incidentId: string, expectedGeneration: V2WriterGeneration) =>
+        this.authorityRead(() => this.reserveRearm(pane, incidentId, expectedGeneration)),
     });
     return { capability: this.#cap, writer, reader, authority };
   }
@@ -1887,6 +1890,25 @@ class V2Storage {
     if (!incident) return null;
     return { schema: 'newarch-v2', pane, incidentId, state: 'pending', receipt: null,
       writerGeneration: this.currentGeneration() };
+  }
+  /** E-rearm A: the live engine re-reads the ORIGINAL durable resolution and
+   * authorizes at its own generation. Read-only; the stored resolution and
+   * receipt keep the generation they were committed under. */
+  private reserveRearm(pane: PaneKey, incidentId: string, expectedGeneration: V2WriterGeneration): V2ReserveRearmObservation | null {
+    nonempty(incidentId); const key = v2PaneKey(pane);
+    this.authorize(this.#cap); fhAssert(expectedGeneration === this.#cap.generation, 'v2 rearm generation');
+    const resolution = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);
+    if (!resolution) return null; // pending or never durable: no authority, never synthesized
+    fhAssert(resolution.schema === 'newarch-v2' && resolution.state === 'resolved' && resolution.receipt
+      && resolution.incidentId === incidentId && v2PaneKey(resolution.pane) === key, 'v2 rearm resolution');
+    const incident = this.get<NewarchV2Incident>('incident', key, incidentId);
+    const receipt = this.get<V2Receipt>('receipt', key, resolution.receipt.operationId);
+    fhAssert(incident && incident.incidentId === incidentId && receipt && equal(receipt, resolution.receipt), 'v2 rearm receipt readback');
+    fhAssert(receipt.kind === 'ssot-durable' && v2PaneKey(receipt.pane) === key && incident.revision === receipt.revision, 'v2 rearm revision');
+    fhAssert(resolution.writerGeneration === receipt.generation && receipt.generation <= this.#cap.generation, 'v2 rearm stored generation');
+    const observation: V2ReserveRearmObservation = { schema: 'newarch-v2', purpose: 'reserve-rearm', pane: resolution.pane, incidentId,
+      incidentDigest: v2EmergencyIncidentDigest(incident), resolvedReceipt: receipt, authorizedGeneration: v2WriterGeneration(this.#cap.generation) };
+    return observation;
   }
   private rawPins(pane: PaneKey, epoch: PipeEpoch): V2RawPinCensus {
     const key = v2PaneKey(pane), checkpoint = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
@@ -2068,9 +2090,13 @@ class V2Storage {
           const b = command.batch;
           fhAssert(b.rows.length <= V2L.pendingRowsPerPane && b.decisions.length <= V2L.pendingRowsPerPane
             && b.incidents.length <= V2L.pageEntries && bytes(b.rows) <= V2L.pageBytes, 'v2 batch bound');
-          const ack = this.hooks.inputReceipt?.(b.input);
-          fhAssert(ack?.status === 'ok' && equal(ack.value, b.input) && b.input.kind === 'synced-spool'
-            && equal(b.input.through, b.checkpoint.through), 'v2 durable input authority');
+          // Record ACK keeps its exact-through branch; a source-prefix must start at
+          // the DURABLE checkpoint and end at the new one. Both compare against
+          // what S issued, read back here inside this transaction.
+          const durable = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
+          const issued = this.hooks.inputReceipt?.(b.input);
+          fhAssert(durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint),
+            'v2 durable input authority');
           for (const row of b.rows) {
             content({ ...row, softWrap: row.wrapStatus === 'wrapped' }); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
             nonempty(row.id.segmentId); safe(row.id.rowOrdinal);

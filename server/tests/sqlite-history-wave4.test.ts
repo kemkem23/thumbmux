@@ -1369,7 +1369,14 @@ import type { NewarchV2Incident, NewarchV2PaneDescriptor } from '@thumbmux/core'
 function h2value<T>(r: H2.Result<T>): T { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; }
 async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {}) {
   const root = mkdtempSync(join(tmpdir(), 'newarch-h2-'));
-  const factory = createV2HistoryFactory({ inputReceipt: ack => ({ status: 'ok', value: ack }), ...hooks });
+  // S-owned issued-input stub, separate from the caller: only `issue` (the
+  // collector RPC side) fills it, and H reads back the exact object S issued.
+  // It never echoes the caller's input, so a host-minted input is refused.
+  const issued = new Map<string, H2.V2BatchInput>();
+  const inputKey = (i: H2.V2BatchInput) => i.kind === 'source-prefix' ? 'prefix:' + i.receiptId
+    : 'record:' + i.commitId + ':' + i.through.byteOffset;
+  const issue = <T extends H2.V2BatchInput>(input: T): T => { issued.set(inputKey(input), structuredClone(input)); return input; };
+  const factory = createV2HistoryFactory({ inputReceipt: input => ({ status: 'ok', value: issued.get(inputKey(input)) ?? null }), ...hooks });
   const open = () => factory.openForCapture({ rootId: root, engineId: 'test-capture', config: H2.NEWARCH_V2_DEFAULT_CONFIG });
   let port = h2value(await open());
   const pane = { serverIdentity: 'private-server', paneId: '%1', birthGeneration: 1 };
@@ -1408,11 +1415,24 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
   const batch = (rows: readonly H2.CommittedStreamRow[], revision = 2): H2.V2WriteCommand => {
     const checkpoint = cp(revision, rows.length, rows.at(-1)?.id ?? null);
     return { kind: 'batch', batch: { rows, decisions: [], incidents: [], checkpoint,
-      input: { kind: 'synced-spool', version: 1, through: checkpoint.through, recordDigest: 'b'.repeat(64), commitId: 'input-1', segmentId: 'raw-1' } } };
+      input: issue({ kind: 'synced-spool', version: 1, through: checkpoint.through, recordDigest: 'b'.repeat(64), commitId: 'input-1', segmentId: 'raw-1' }) } };
   };
+  // A collector receipt for [start,end) of one spool record ending at recordEnd.
+  const sourcePrefix = (start: number, end: number, patch: Partial<Omit<H2.V2SourcePrefixReceipt, 'digest'>> = {}): H2.V2SourcePrefixReceipt => {
+    const unsigned = { schema: 'newarch-v2' as const, kind: 'source-prefix' as const, receiptId: `prefix-${start}-${end}`,
+      sourceEpoch: H2.v2SourceEpochOf(epoch), certified: { epoch, start, end }, firstSequence: 1, lastSequence: 1,
+      lastRecordDigest: 'd'.repeat(64), lastRecordEnd: 12, ...patch };
+    return { ...unsigned, digest: H2.v2SourcePrefixReceiptDigest(unsigned) };
+  };
+  const recordAck = (through: number, commitId = 'record-' + through): H2.SpoolAck =>
+    ({ kind: 'synced-spool', version: 1, through: { epoch, byteOffset: through }, recordDigest: 'e'.repeat(64), commitId, segmentId: 'raw-1' });
+  const inputBatch = (rows: readonly H2.CommittedStreamRow[], input: H2.V2BatchInput, revision: number, through: number,
+    frontier: H2.SegmentRowId | null = rows.at(-1)?.id ?? null, incidents: readonly NewarchV2Incident[] = []): H2.V2WriteCommand =>
+    ({ kind: 'batch', batch: { rows, decisions: [], incidents, checkpoint: cp(revision, through, frontier), input } });
   const page = (maxEntries = 256, cursor: H2.NewarchV2HistoryCursor | null = null, direction: 'after' | 'before' = 'after', maxBytes = 2 * 1024 * 1024) =>
     port.reader.page({ schema: 'newarch-v2', pane, cursor, direction, maxEntries, maxBytes });
   return { root, pane, session, geometry, descriptor, cp, request, commit, ready, reserve, activate, incident, row, batch, page, open,
+    issue, sourcePrefix, recordAck, inputBatch,
     get port() { return port; },
     async reopen() { h2value(await port.writer.close(port.capability)); port = h2value(await open()); return port; },
     async reload() { port = h2value(await open()); return port; },
@@ -1744,7 +1764,7 @@ test('H v2 export rollback reaps only unpublished scratch before exporting anoth
       origin: { kind: 'pipe' as const, range: { epoch: f.cp(1).through.epoch, start: 1, end: 2 }, ordinal: 0 } };
     const cp = f.cp(4, 2, row.id);
     await f.commit({ kind: 'batch', batch: { rows: [row], decisions: [], incidents: [], checkpoint: cp,
-      input: { kind: 'synced-spool', version: 1, through: cp.through, recordDigest: 'c'.repeat(64), commitId: 'input-two', segmentId: 'raw-1' } } }, 'second-rows');
+      input: f.issue({ kind: 'synced-spool', version: 1, through: cp.through, recordDigest: 'c'.repeat(64), commitId: 'input-two', segmentId: 'raw-1' }) } }, 'second-rows');
     const secondSeal = await f.commit({ kind: 'seal', segmentId: 'segment-2' }, 'seal-two');
     failExport = true;
     expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'materialize-export', sealCommitId: firstSeal.commitId }, 'failed-export'))).status).toBe('error');
@@ -1788,6 +1808,7 @@ test('H v2 authority resolves only the durable incident receipt and survives rep
     const staleResolution = h2value(nextAuthority.incidentResolution(f.pane, incident.incidentId));
     expect(nextGeneration).not.toBe(current);
     expect(H2.v2IncidentResolvedBy(staleResolution, incident.incidentId, resolvedReceipt, nextGeneration)).toBe(false);
+    expect(staleResolution!.writerGeneration).toBe(current);
     expect(await f.commit({ kind: 'incident', incident }, 'resolve-null-frontier')).toEqual(resolvedReceipt);
     expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
   } finally { await f.cleanup(); }
@@ -1816,4 +1837,163 @@ test('H v2 authority snapshots checkpoint raw pins separately from active row pi
     const foreignEpoch = { ...checkpoint.through.epoch, collectorIncarnation: 'foreign' };
     expect(authority.rawPins(f.pane, foreignEpoch).status).toBe('error');
   } finally { await f.cleanup(); }
+});
+
+// BH: a source-prefix receipt S issued for a mid-record range commits through
+// the same public writer, in the same transaction as rows+checkpoint+receipt.
+test('H v2 batch commits an issued mid-record source-prefix and refuses forged or misaligned prefixes atomically', async () => {
+  let fault = '';
+  const f = await h2fixture({ boundary: at => { if (at === fault) throw Error('injected boundary'); } });
+  try {
+    await f.activate();
+    const durable = async () => ({ entries: h2value(await f.page()).entries, checkpoint: h2value(f.port.reader.checkpoint(f.pane)),
+      owner: h2value(f.port.reader.owner(f.pane)) });
+    // [0,5) of a record that ends at 12: the prefix ends mid-record.
+    const first = f.issue(f.sourcePrefix(0, 5)), firstCommand = f.inputBatch([f.row(0), f.row(1)], first, 2, 5);
+    const firstRequest = f.request(firstCommand, 'prefix-1');
+    fault = 'v2-batch-before-commit';
+    expect((await f.port.writer.commit(f.port.capability, firstRequest)).status).toBe('error');
+    expect((await durable()).checkpoint!.revision).toBe(1);
+    expect(h2value(f.port.reader.receipt(f.pane, 'prefix-1'))).toBeNull();
+    fault = 'v2-batch-after-commit'; // durable, but the reply is lost
+    expect((await f.port.writer.commit(f.port.capability, firstRequest)).status).toBe('error');
+    fault = '';
+    const firstReceipt = h2value(await f.port.writer.commit(f.port.capability, firstRequest));
+    expect(firstReceipt).toEqual(h2value(f.port.reader.receipt(f.pane, 'prefix-1'))!);
+    expect(firstReceipt.revision).toBe(2);
+    expect((await f.port.writer.commit(f.port.capability,
+      f.request(f.inputBatch([f.row(0, 'changed'), f.row(1)], first, 2, 5), 'prefix-1'))).status).toBe('error');
+    const base = await durable();
+    expect(base.entries.map(e => e.kind === 'row' && e.row.id.rowOrdinal)).toEqual([0, 1]);
+    expect(base.checkpoint!.through.byteOffset).toBe(5);
+    expect(base.checkpoint!.checkpointId).toBe(firstReceipt.checkpointId!);
+
+    const next = f.sourcePrefix(5, 9), rows = [f.row(2)];
+    const refused: [string, H2.V2BatchInput, number][] = [
+      ['unknown-source', f.sourcePrefix(5, 9, { receiptId: 'never-issued' }), 9],
+      ['forged-digest', { ...f.issue(next), lastRecordEnd: 13 }, 9],
+      ['re-signed', f.sourcePrefix(5, 9, { lastRecordEnd: 13 }), 9],
+      ['range-hole', f.issue(f.sourcePrefix(6, 9)), 9],
+      ['end-past-checkpoint', f.issue(f.sourcePrefix(5, 9, { receiptId: 'past' })), 7],
+      ['end-short-of-checkpoint', f.issue(f.sourcePrefix(5, 7, { receiptId: 'short' })), 9],
+      ['foreign-source-epoch', f.issue(f.sourcePrefix(5, 9, { receiptId: 'foreign',
+        sourceEpoch: { ...H2.v2SourceEpochOf(f.cp(1).through.epoch), collectorIncarnation: 'old-collector' } })), 9],
+      ['record-ack-past-checkpoint', f.issue(f.recordAck(12)), 9],
+    ];
+    for (const [name, input, through] of refused) {
+      const result = await f.port.writer.commit(f.port.capability, f.request(f.inputBatch(rows, input, 3, through), 'bad-' + name));
+      expect({ name, status: result.status }).toEqual({ name, status: 'error' });
+      expect(await durable()).toEqual(base);
+      expect(h2value(f.port.reader.receipt(f.pane, 'bad-' + name))).toBeNull();
+    }
+
+    const second = h2value(await f.port.writer.commit(f.port.capability, f.request(f.inputBatch(rows, f.issue(next), 3, 9), 'prefix-2')));
+    expect(h2value(f.port.reader.checkpoint(f.pane))!.through.byteOffset).toBe(9);
+    // The record end keeps the old exact SpoolAck branch.
+    const end = await f.commit(f.inputBatch([f.row(3)], f.issue(f.recordAck(12)), 4, 12), 'record-end');
+    expect(end.revision).toBe(4);
+    await f.reopen();
+    for (const [id, request] of [['prefix-1', firstRequest]] as const) {
+      const retry = { ...request, fence: { ...request.fence, expectedGeneration: f.port.capability.generation } };
+      expect(h2value(await f.port.writer.commit(f.port.capability, retry))).toEqual(h2value(f.port.reader.receipt(f.pane, id))!);
+    }
+    expect(h2value(f.port.reader.receipt(f.pane, 'prefix-2'))).toEqual(second);
+    expect(h2value(await f.page()).entries.map(e => e.kind === 'row' && e.row.id.rowOrdinal)).toEqual([0, 1, 2, 3]);
+    expect(h2value(f.port.reader.checkpoint(f.pane))!.through.byteOffset).toBe(12);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 incident listed twice in one batch is refused, never deduplicated into a commit', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate();
+    const incident = f.incident('twice', 2, f.row(0).id);
+    const command = f.inputBatch([f.row(0)], f.issue(f.recordAck(1)), 2, 1, f.row(0).id, [incident, incident]);
+    expect((await f.port.writer.commit(f.port.capability, f.request(command, 'twice'))).status).toBe('error');
+    expect(h2value(await f.page()).entries).toEqual([]);
+    expect(h2value(f.port.reader.receipt(f.pane, 'twice'))).toBeNull();
+    expect(h2value(f.port.reader.checkpoint(f.pane))!.revision).toBe(1);
+  } finally { await f.cleanup(); }
+});
+
+// BH/E-rearm A: after reopen the CURRENT engine re-reads the original durable
+// resolution and authorizes reserve rearm at its own generation, writing nothing.
+test('H v2 reserve rearm reads the original receipt at the current generation after reopen', async () => {
+  const f = await h2fixture();
+  try {
+    await f.activate();
+    const authorityOf = () => (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
+    // Red-before harness: an engine without the port has no observation to give.
+    const rearm = (a: H2.V2HistoryAuthority, id: string, g: H2.V2WriterGeneration): H2.Result<H2.V2ReserveRearmObservation | null> =>
+      a.reserveRearm?.(f.pane, id, g) ?? { status: 'ok', value: null };
+    const incident = f.incident('rearm-after-restart', 2);
+    const digest = H2.v2EmergencyIncidentDigest(incident);
+    const receipt = await f.commit({ kind: 'incident', incident }, 'resolve-rearm');
+    const before = authorityOf(), g = h2value(before.writerGeneration());
+    const atG = h2value(rearm(before, incident.incidentId, g));
+    expect(atG).toEqual({ schema: 'newarch-v2', purpose: 'reserve-rearm', pane: f.pane, incidentId: incident.incidentId,
+      incidentDigest: digest, resolvedReceipt: receipt, authorizedGeneration: g });
+    const snapshot = async () => ({ entries: h2value(await f.page()).entries, owner: h2value(f.port.reader.owner(f.pane)),
+      checkpoint: h2value(f.port.reader.checkpoint(f.pane)), receipt: h2value(f.port.reader.receipt(f.pane, 'resolve-rearm')),
+      resolution: h2value(authorityOf().incidentResolution(f.pane, incident.incidentId)) });
+    const durable = await snapshot();
+
+    await f.reopen();
+    const after = authorityOf(), next = h2value(after.writerGeneration());
+    expect(next).toBe(H2.v2WriterGeneration(g + 1));
+    expect(rearm(before, incident.incidentId, g).status).toBe('error'); // closed engine cannot authorize
+    expect(rearm(after, incident.incidentId, g).status).toBe('error'); // stale expected generation
+    const resolution = h2value(after.incidentResolution(f.pane, incident.incidentId));
+    expect(H2.v2IncidentResolvedBy(resolution, incident.incidentId, receipt, next)).toBe(false); // old guard unchanged
+    for (let i = 0; i < 2; i++) {
+      const observation = h2value(rearm(after, incident.incidentId, next));
+      expect(observation).toEqual({ ...atG, authorizedGeneration: next });
+      expect(observation!.resolvedReceipt.generation).toBe(g);
+      expect(H2.v2ReserveRearmAllowed(observation, f.pane, incident.incidentId, digest, receipt, next)).toBe(true);
+    }
+    expect(await snapshot()).toEqual({ ...durable, owner: { ...durable.owner!, generation: f.port.capability.generation } });
+    expect(h2value(rearm(after, 'never-durable', next))).toBeNull();
+    expect(await f.commit({ kind: 'incident', incident }, 'resolve-rearm')).toEqual(receipt);
+    expect((await f.port.writer.commit(f.port.capability, f.request({ kind: 'incident', incident }, 'rearm-duplicate'))).status).toBe('error');
+    expect(h2value(await f.page()).entries).toEqual([{ kind: 'incident', incident }]);
+  } finally { await f.cleanup(); }
+});
+
+test('H v2 reserve rearm refuses pending, tampered, foreign and stale-stamped stored resolutions', async () => {
+  type Stored = Record<string, unknown> & { receipt?: Record<string, unknown> };
+  const cases: [string, 'null' | 'error', (db: Database, key: string, incidentId: string) => void][] = [];
+  const rewrite = (db: Database, kind: string, key: string, id: string, edit: (v: Stored) => Stored | null) => {
+    const row = db.query('SELECT payload FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, key, id) as { payload: string };
+    const value = edit(JSON.parse(row.payload));
+    if (value === null) { db.query('DELETE FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').run(kind, key, id); return; }
+    const payload = H2.streamCanonical(value); // checksum recomputed: only the semantic checks can refuse
+    db.query('UPDATE fh_v2_object SET payload=?,checksum=? WHERE kind=? AND pane=? AND id=?')
+      .run(payload, H2.v2Digest('stored-object', { kind, pane: key, id, payload }), kind, key, id);
+  };
+  cases.push(['legacy-pending-without-resolution', 'null', (db, key, id) => rewrite(db, 'incident-resolution', key, id, () => null)]);
+  cases.push(['stored-state-pending', 'error', (db, key, id) => rewrite(db, 'incident-resolution', key, id, v => ({ ...v, state: 'pending' }))]);
+  cases.push(['receipt-not-readback', 'error', (db, key, id) => rewrite(db, 'incident-resolution', key, id, v => ({ ...v, receipt: { ...v.receipt, commitId: 'minted' } }))]);
+  cases.push(['stored-generation-refreshed', 'error', (db, key, id) => rewrite(db, 'incident-resolution', key, id, v => ({ ...v, writerGeneration: Number(v.writerGeneration) + 1 }))]);
+  cases.push(['foreign-incident-id', 'error', (db, key, id) => rewrite(db, 'incident-resolution', key, id, v => ({ ...v, incidentId: 'foreign' }))]);
+  cases.push(['incident-revision', 'error', (db, key, id) => rewrite(db, 'incident', key, id, v => ({ ...v, revision: Number(v.revision) + 1 }))]);
+  cases.push(['incident-row-missing', 'error', (db, key, id) => rewrite(db, 'incident', key, id, () => null)]);
+  for (const [name, expected, tamper] of cases) {
+    const f = await h2fixture();
+    try {
+      await f.activate();
+      const incident = f.incident('tampered-' + name, 2);
+      const receipt = await f.commit({ kind: 'incident', incident }, 'resolve');
+      h2value(await f.port.writer.close(f.port.capability));
+      const db = new Database(join(f.root, 'flag-on-v1.sqlite'));
+      try { tamper(db, H2.v2PaneKey(f.pane), incident.incidentId); } finally { db.close(); }
+      await f.reload();
+      const authority = (f.port as typeof f.port & { authority: H2.V2HistoryAuthority }).authority;
+      const current = h2value(authority.writerGeneration());
+      const result = authority.reserveRearm?.(f.pane, incident.incidentId, current) ?? { status: 'ok' as const, value: null };
+      expect({ name, status: result.status, value: result.status === 'ok' ? result.value : 'refused' })
+        .toEqual({ name, status: expected === 'null' ? 'ok' : 'error', value: expected === 'null' ? null : 'refused' });
+      expect(H2.v2ReserveRearmAllowed(result.status === 'ok' ? result.value : null, f.pane, incident.incidentId,
+        H2.v2EmergencyIncidentDigest(incident), receipt, current)).toBe(false);
+    } finally { await f.cleanup(); }
+  }
 });
