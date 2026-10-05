@@ -2151,3 +2151,42 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
     }
   });
 });
+
+test('B1 ACK suffix mutation is rejected by the prefix fixture',()=>{
+  const root=mkdtempSync(join(tmpdir(),'b1-ack-suffix-'));
+  const subject=join(root,'subject.ts');
+  const original=readFileSync(new URL('../src/capture-engine.ts',import.meta.url),'utf8')
+    .replaceAll("from './stream-contract'",`from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)}`)
+    .replaceAll("from './tmux-capture-normalize'",`from ${JSON.stringify(new URL('../src/tmux-capture-normalize.ts',import.meta.url).pathname)}`)
+    .replaceAll("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+  const needle='consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset}';
+  expect(original.split(needle)).toHaveLength(2);
+  try {
+    writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';
+import {v2BirthCheckpoint,evaluateV2Prefix} from './subject.ts';
+import {v2DecodePrefixValid,v2BirthGeometry} from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)};
+const config=${JSON.stringify({...v2Config,geometry:{columns:78,rows:120}})};
+const pane={...${JSON.stringify(v2Pane)},geometry:v2BirthGeometry(config)};
+const epoch=${JSON.stringify(v2Epoch)};
+const cp=v2BirthCheckpoint(pane,{epoch,byteOffset:0},config);
+const bytes=[...Buffer.from('row\\r\\n'.repeat(256)+'SENTINEL-B1\\r\\n')];
+const result=evaluateV2Prefix({pane,checkpoint:cp,raw:{epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null},config);
+assert.ok(!('kind' in result),'fixture must decode a valid prefix');
+assert.ok(result.suffix!==null,'fixture must leave an uncommitted suffix');
+assert.ok(v2DecodePrefixValid(result,cp),'B1 ACK suffix certified past checkpoint');
+assert.equal(result.consumed.end,result.checkpoint.through.byteOffset,'B1 ACK suffix passed checkpoint');
+assert.equal(result.suffix.start,result.consumed.end);
+assert.ok(result.consumed.end<result.offered.end);`);
+    for(const mutated of [false,true]) {
+      writeFileSync(subject,mutated?original.replace(needle,'consumedRange={epoch:raw.epoch,start:raw.start,end:raw.end}'):original);
+      const result=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
+      console.log('B1_ACK_MUTANT',JSON.stringify({mutated,exit:result.status,stderr:result.stderr}));
+      expect(result.status).toBe(mutated?1:0);
+      if(mutated)expect(result.stderr).toContain('B1 ACK suffix certified past checkpoint');
+    }
+  } finally {
+    writeFileSync(subject,original);
+    expect(readFileSync(subject,'utf8')).toBe(original);
+    rmSync(root,{recursive:true,force:true});
+  }
+});
