@@ -1322,26 +1322,31 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
     const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
     const probe=v2Decode(cp.state,input.bytes,rawCap,L.maxRows);
-    const materialize=(scrolls:readonly RowContent[],offsets:readonly number[]):CommittedStreamRow[]=>scrolls.map((r,i)=>{
-      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offsets[i]!},ordinal:base+i};
-      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
+    const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
         buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
         uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
-    });
-    const probeRows=materialize(probe.scrolls,probe.offsets);
+    };
+    const materialize=(scrolls:readonly RowContent[],offsets:readonly number[]):CommittedStreamRow[]=>
+      scrolls.map((r,i)=>materializeOne(r,offsets[i]!,i));
+    const probeRows:CommittedStreamRow[]=[];
     let serializedBoundary:number|null=null,probeSerializedBytes=2;
-    for(let index=0;index<probeRows.length;index++) {
-      const candidate=probeSerializedBytes+(index===0?0:1)+Buffer.byteLength(streamCanonical(probeRows[index]!));
+    for(let index=0;index<probe.scrolls.length;index++) {
+      const row=materializeOne(probe.scrolls[index]!,probe.offsets[index]!,index);
+      const candidate=probeSerializedBytes+(index===0?0:1)+Buffer.byteLength(streamCanonical(row));
       if(candidate>L.maxSerializedBytes){serializedBoundary=probe.offsets[index]!-1;break;}
-      probeSerializedBytes=candidate;
+      probeRows.push(row);probeSerializedBytes=candidate;
     }
     let consumed=rawCap,stop:V2PrefixStop=input.bytes.length>rawCap?'raw-bytes':'complete';
     if(probe.rowBoundary!==null && probe.rowBoundary<=consumed){consumed=probe.rowBoundary;stop='rows';}
     if(serializedBoundary!==null && serializedBoundary<=consumed){consumed=serializedBoundary;stop='serialized-bytes';}
     if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
-    const decoded=v2Decode(cp.state,input.bytes,consumed,L.maxRows);
+    const decoded=consumed===rawCap && probe.rowBoundary===null && serializedBoundary===null
+      ? probe:v2Decode(cp.state,input.bytes,consumed,L.maxRows);
     if(decoded.rowBoundary!==null)throw Error('materialized prefix row boundary');
-    const rows=materialize(decoded.scrolls,decoded.offsets),serializedBytes=v2RowsSerializedBytes(rows);
+    const rows=decoded===probe?probeRows:materialize(decoded.scrolls,decoded.offsets);
+    const serializedBytes=decoded===probe?probeSerializedBytes:v2RowsSerializedBytes(rows);
     if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
     const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
     const checkpoint:V2LiveCheckpoint={...cp,
