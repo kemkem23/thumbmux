@@ -238,7 +238,7 @@ export type MuxResyncRequest = { type: "resync"; session: string };
  * validates required fields per op. Prefer {@link MuxStrictClientMessage} for
  * new typed clients.
  */
-export type MuxClientMessage = MuxResyncRequest | {
+export type MuxClientMessage = MuxResyncRequest | NewarchV2HistoryExpandMessage | {
   type:
     | "ping"
     | "client_info"
@@ -272,6 +272,8 @@ export type MuxClientMessage = MuxResyncRequest | {
  */
 export type MuxStrictClientMessage =
   | MuxResyncRequest
+  /** NEWARCH v2 history read (Q22 flag-on K-r1, additive); legacy `history_expand` is unchanged. */
+  | NewarchV2HistoryExpandMessage
   | { type: "ping"; client?: unknown }
   | { type: "client_info"; client?: unknown }
   | { type: "subscribe" | "unsubscribe"; session: string; tail?: number; delta?: boolean; client?: unknown }
@@ -844,25 +846,47 @@ export function newarchV2CursorFor(pane: NewarchV2PaneDescriptor, cursor: Newarc
 function newarchV2EntryPane(e: NewarchV2WireEntry): NewarchPaneKey {
   return e.kind === 'row' ? e.id.pane : e.incident.pane;
 }
-function newarchV2ContinuationPane(c: NewarchV2Continuation): NewarchPaneKey | null {
-  return c.kind === 'end' ? null : c.cursor.pane;
+function newarchV2Utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+/** Same rules as server validateV2ReadRequest for a cursor: same pane, non-empty
+ * store/token, token at most NEWARCH_V2_WIRE_LIMITS.cursorBytes UTF-8 bytes. */
+function newarchV2CursorInBounds(c: NewarchV2HistoryCursor, pane: NewarchPaneKey): boolean {
+  return c.schema === NEWARCH_V2_SCHEMA && newarchV2SamePane(c.pane, pane)
+    && typeof c.storeId === 'string' && c.storeId.length > 0 && typeof c.token === 'string' && c.token.length > 0
+    && newarchV2Utf8Bytes(c.token) <= NEWARCH_V2_WIRE_LIMITS.cursorBytes
+    && Number.isSafeInteger(c.timelineRevision) && c.timelineRevision >= 0;
+}
+/** Same bounds as server validateV2ReadRequest: 1..wire cap for both limits. */
+function newarchV2RequestInBounds(r: NewarchV2HistoryRequest): boolean {
+  const L = NEWARCH_V2_WIRE_LIMITS;
+  return r.schema === NEWARCH_V2_SCHEMA && (r.direction === 'before' || r.direction === 'after')
+    && Number.isSafeInteger(r.maxEntries) && r.maxEntries >= 1 && r.maxEntries <= L.pageEntries
+    && Number.isSafeInteger(r.maxBytes) && r.maxBytes >= 1 && r.maxBytes <= L.pageBytes
+    && (r.cursor === null || newarchV2CursorInBounds(r.cursor, r.pane));
 }
 /** Both sides check a reply against the request it answers: same request id,
- * channel and pane; every entry/cursor on that pane; within the request bounds;
- * revision not behind the cursor it was asked with. */
+ * channel and pane. An ok page additionally needs a request within the wire
+ * caps; at most min(request, wire cap) entries/bytes; every entry/cursor on that
+ * pane with cursor tokens <= cursorBytes; revision not behind the cursor it was
+ * asked with; and storage/remote unavailable is never `end` in the requested
+ * direction (it is `blocked`). An error reply may answer an out-of-bounds
+ * request (that is what `bounded-read` is for). */
 export function newarchV2ReplyMatches(message: NewarchV2HistoryExpandMessage, reply: NewarchV2HistoryReply): boolean {
   const req = message.request;
   if (reply.schema !== NEWARCH_V2_SCHEMA || reply.type !== 'history_v2' || req.schema !== NEWARCH_V2_SCHEMA
     || reply.requestId !== message.requestId || reply.channel !== message.session
     || !newarchV2SamePane(reply.pane, req.pane)) return false;
   if (reply.status === 'error') return true;
-  const minRevision = req.cursor ? req.cursor.timelineRevision : 0;
+  if (!newarchV2RequestInBounds(req)) return false;
+  const L = NEWARCH_V2_WIRE_LIMITS, minRevision = req.cursor ? req.cursor.timelineRevision : 0;
+  const ahead = req.direction === 'before' ? reply.before : reply.after;
+  const unavailable = reply.states.some(s => s.kind === 'storage-unavailable' || s.kind === 'remote-unavailable');
   return Number.isSafeInteger(reply.revision) && reply.revision >= minRevision
     && Number.isSafeInteger(reply.payloadBytes) && reply.payloadBytes >= 0
-    && reply.entries.length <= req.maxEntries && reply.payloadBytes <= req.maxBytes
+    && reply.entries.length <= Math.min(req.maxEntries, L.pageEntries)
+    && reply.payloadBytes <= Math.min(req.maxBytes, L.pageBytes)
     && reply.entries.every(e => newarchV2SamePane(newarchV2EntryPane(e), req.pane))
-    && [reply.before, reply.after].every(c => {
-      const p = newarchV2ContinuationPane(c);
-      return p === null || newarchV2SamePane(p, req.pane);
-    });
+    && [reply.before, reply.after].every(c => c.kind === 'end' || newarchV2CursorInBounds(c.cursor, req.pane))
+    && !(unavailable && ahead.kind === 'end');
 }
