@@ -2966,7 +2966,10 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     wideBox(view.viewport, 622);
     view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, deltaY: 3, bubbles: true, cancelable: true }));
     expect(view.viewport.scrollLeft).toBe(40);
-    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, shiftKey: true, bubbles: true, cancelable: true }));
+    // happy-dom drops shiftKey from the init dict; a browser keeps it.
+    const shifted = new WheelEvent("wheel", { deltaY: 30, bubbles: true, cancelable: true });
+    Object.defineProperty(shifted, "shiftKey", { value: true });
+    view.viewport.dispatchEvent(shifted);
     expect(view.viewport.scrollLeft).toBe(70);
     view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, bubbles: true, cancelable: true }));
     expect(view.viewport.scrollLeft).toBe(70);
@@ -2981,19 +2984,19 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     expect(view.viewport.style.getPropertyValue("--mtv-pan-x")).toBe("120px");
   });
 
-  test("auto and legacy panes never pan sideways from a swipe or wheel", async () => {
-    for (const options of [
-      { fixedGeometry: BIRTH, viewportWidth: 390 },
-      { viewportWidth: 390 },
-    ]) {
+  for (const [name, options] of [
+    ["auto", { fixedGeometry: BIRTH, viewportWidth: 390 }],
+    ["legacy", { viewportWidth: 390 }],
+  ] as const) {
+    test(`a ${name} pane never pans sideways from a swipe or wheel`, async () => {
       const view = mountTermView(options);
       await settleUi();
       wideBox(view.viewport, 622);
       finger(view.viewport, [[320, 100], [300, 101], [150, 103], [100, 104]]);
       view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, bubbles: true, cancelable: true }));
       expect(view.viewport.scrollLeft).toBe(0);
-    }
-  });
+    });
+  }
 
   test("a legacy pane (no birth geometry) is untouched: user size, and it still claims", async () => {
     const resizes = captureResizes();
