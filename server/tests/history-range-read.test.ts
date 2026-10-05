@@ -1300,6 +1300,65 @@ test("D3-r1: storage or remote unavailable is never an ok page whose requested d
   ]);
 });
 
+test("D3-r1: identity text over 256 bytes or a birth below 1 never reaches the reader, and is never echoed", async () => {
+  let reads = 0;
+  const empty = () => { reads++; return { status: "ok", value: v2Page({ entries: [], states: [], before: { kind: "end" }, after: { kind: "end" } }) }; };
+  const mux = d3Mux({ page: empty });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("s1", d3Cursor("s".repeat(257), "tok")) as never, ws);
+  mux.handleMessage(d3Expand("s2", d3Cursor("\u0e01".repeat(86), "tok")) as never, ws);
+  mux.handleMessage(d3Expand("s3", null, { pane: { ...V2_PANE, paneId: "p".repeat(300) } }) as never, ws);
+  mux.handleMessage(d3Expand("s4", d3Cursor("s".repeat(256), "tok")) as never, ws);
+  // a selected pane born at generation 0 is outside the contract (birth >= 1)
+  const zero = { ...V2_PANE, birthGeneration: 0 };
+  const unborn = d3Mux({ page: empty, selection: () => ({ kind: "selected", pane: { ...v2Descriptor("pane-a"), pane: zero } }) });
+  unborn.handleMessage(d3Expand("s5", null, { pane: zero }) as never, ws);
+  await d3Settle();
+  expect(reads).toBe(1);
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code ?? null])).toEqual([
+    ["s1", "error", "bounded-read"],
+    ["s2", "error", "bounded-read"],
+    ["s4", "ok", null],
+  ]);
+  expect(ws.sent.some(data => data.includes("p".repeat(300)))).toBe(false);
+});
+
+test("D3-r1: a row that is not finalized never travels as history", async () => {
+  const live = { ...v2Row(9), finalized: false, cells: [{ text: "secret", width: 1 as const, style: [] }] };
+  const mux = d3Mux({
+    page: () => ({ status: "ok", value: v2Page({ entries: [{ kind: "row", row: v2Row(8) }, { kind: "row", row: live }], states: [], before: { kind: "end" }, after: { kind: "end" } }) }),
+  });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("nf", null) as never, ws);
+  await d3Settle();
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code ?? null])).toEqual([["nf", "error", "unsupported"]]);
+  expect(ws.sent.some(data => data.includes("secret"))).toBe(false);
+});
+
+test("D3-r1: an incident without a valid pane is an error frame, never a throw", async () => {
+  const { pane: _drop, ...paneless } = v2Incident(false);
+  const mux = d3Mux({
+    page: () => ({ status: "ok", value: v2Page({ entries: [{ kind: "incident", incident: paneless as never }], states: [], before: { kind: "end" }, after: { kind: "end" } }) }),
+  });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("np", null) as never, ws);
+  await d3Settle();
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code ?? null])).toEqual([["np", "error", "unsupported"]]);
+});
+
+test("D3-r1: an owner that turns unavailable during the read answers owner-unavailable with its retry, not wrong-pane", async () => {
+  let release!: (value: unknown) => void;
+  type Selection = ReturnType<NonNullable<ConstructorParameters<typeof TmuxWsMux>[0]["newarchV2"]>>;
+  let selection: Selection = { kind: "selected", pane: v2Descriptor("pane-a") };
+  const mux = d3Mux({ selection: () => selection, page: () => new Promise(resolve => { release = resolve; }) });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("ou", null) as never, ws);
+  selection = { kind: "owner-unavailable", retryAfterMs: 750 };
+  release({ status: "ok", value: v2Page({ entries: [{ kind: "row", row: v2Row(1) }], states: [], before: { kind: "end" }, after: { kind: "end" } }) });
+  await d3Settle();
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code, frame.retryAfterMs])).toEqual([["ou", "error", "owner-unavailable", 750]]);
+});
+
 test("D3 gate: a fixed v2 window refuses every resize and answers the birth geometry", () => {
   const resized: Array<{ cols: number; rows: number }> = [];
   const mux = d3Mux({ resized });
