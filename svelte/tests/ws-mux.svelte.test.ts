@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
 import { createMuxDeltaFrame } from '@thumbmux/core';
+import { spawnSync } from 'node:child_process';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 const originalState = Object.getOwnPropertyDescriptor(globalThis, '$state');
 Object.defineProperty(globalThis, '$state', {
@@ -7,7 +9,9 @@ Object.defineProperty(globalThis, '$state', {
   value: <T>(value: T) => value,
 });
 
-const { TmuxMux } = await import('../src/ws-mux.svelte');
+// D3 mutation controls re-run this file against a mutant sibling module
+// written only inside the cage's copy (never the worktree, never HEAD).
+const { TmuxMux } = (await import(process.env.D3_MUTANT_MUX_CLIENT ?? '../src/ws-mux.svelte')) as typeof import('../src/ws-mux.svelte');
 
 type Listener = (event?: unknown) => void;
 
@@ -1119,4 +1123,44 @@ describe('TmuxMux v2 history cursor (D3)', () => {
     expect(await pending!).toEqual({ kind: 'cancelled' });
     socket.receive(d3Reply(sent, [1], { kind: 'end' }));
   });
+});
+
+describe('TmuxMux v2 mutation controls (D3)', () => {
+  const MUTANTS: ReadonlyArray<{ id: string; from: string; to: string; killer: string }> = [
+    { id: 'send-foreign-cursor', from: 'cursor: newarchV2CursorFor(pane, ask.cursor),', to: 'cursor: ask.cursor,', killer: 'a cursor of another pane identity is never sent' },
+    { id: 'deliver-unmatched-reply', from: "entry.resolve(matches ? { kind: 'reply', reply } : { kind: 'mismatch' });", to: "entry.resolve({ kind: 'reply', reply });", killer: 'is a mismatch, never delivered rows' },
+    { id: 'disconnect-leaves-request', from: "this.settleV2Inflight(entry => entry.socket === socket, { kind: 'disconnected' });", to: '', killer: 'reconnect settles the request as disconnected' },
+    { id: 'ignore-session-list-pane', from: '      return Promise.resolve({ kind: \'pane-changed\', pane: known });', to: '', killer: 'caller holding the old pane gets pane-changed' },
+    { id: 'unbounded-inflight', from: '    for (const entry of this.v2Inflight.values()) if (entry.session === session) return null;', to: '', killer: 'one request per session at a time' },
+  ];
+
+  test.skipIf(process.env.D3_MUTANT_MUX_CLIENT !== undefined)('every client mutant is killed by its own case', () => {
+    const source = new URL('../src/ws-mux.svelte.ts', import.meta.url).pathname;
+    const mutant = new URL('../src/ws-mux.d3mutant.svelte.ts', import.meta.url).pathname;
+    const original = readFileSync(source, 'utf8');
+    const run = (module: string) => spawnSync(process.execPath, ['test', new URL(import.meta.url).pathname, '-t', 'D3'], {
+      env: { ...process.env, D3_MUTANT_MUX_CLIENT: module }, encoding: 'utf8', timeout: 120_000,
+    });
+    const lines: string[] = [];
+    try {
+      writeFileSync(mutant, original);
+      const control = run(mutant);
+      lines.push(`D3-MUTANT control exit=${control.status}`);
+      expect(control.status).toBe(0);
+      for (const m of MUTANTS) {
+        expect(original.split(m.from).length - 1).toBe(1);
+        writeFileSync(mutant, original.replace(m.from, m.to));
+        const result = run(mutant);
+        const out = `${result.stdout}${result.stderr}`;
+        const killed = out.split('\n').filter(line => line.startsWith('(fail)')).map(line => line.replace(/ \[[^\]]*\]$/, ''));
+        lines.push(`D3-MUTANT ${m.id} exit=${result.status} killed=${JSON.stringify(killed)}`);
+        expect(result.status).toBe(1);
+        expect(out).not.toContain('SyntaxError');
+        expect(killed.some(line => line.includes(m.killer))).toBe(true);
+      }
+    } finally {
+      rmSync(mutant, { force: true });
+      console.log(lines.join('\n'));
+    }
+  }, 900_000);
 });

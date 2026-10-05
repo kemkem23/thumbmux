@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +9,11 @@ import { FileHistoryArchive } from "../src/history-archive";
 import { NewarchV2Display, StreamDisplayEngine } from "../src/display-engine";
 import type { NewarchGap, NewarchHistoryExtension, NewarchV2HistoryCursor, NewarchV2HistoryRequest, NewarchV2Incident, NewarchV2PaneDescriptor } from "../../core/src/protocol";
 import { STREAM_BUDGET, type CaptureEngine, type CommittedStreamRow, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type V2HistoryPage, type V2HistoryReader, type V2SessionOwnerRecord, type ViewerRoute } from "../src/stream-contract";
-import { TmuxWsMux, type HistoryArchiveLike, type TmuxDriver } from "../src/ws-mux";
+import type { HistoryArchiveLike, TmuxDriver } from "../src/ws-mux";
+// D3 mutation controls re-run this file against a mutant sibling module
+// written only inside the cage's copy (never the worktree, never HEAD).
+const { TmuxWsMux } = (await import(process.env.D3_MUTANT_WS_MUX ?? "../src/ws-mux")) as typeof import("../src/ws-mux");
+type TmuxWsMux = InstanceType<typeof TmuxWsMux>;
 
 const SESSION = "range-read";
 
@@ -1277,3 +1283,44 @@ test("D3 gate: a fixed v2 window refuses every resize and answers the birth geom
   }
   expect(resized).toEqual([]);
 });
+
+// --- D3 mutation controls: each mutant must turn a named D3 case red ---
+
+const D3_SERVER_MUTANTS: ReadonlyArray<{ id: string; from: string; to: string; killer: string }> = [
+  { id: "read-any-pane", from: 'if (readable.kind === "wrong-pane") return fail("wrong-pane");', to: "", killer: "is wrong-pane and never reaches the reader" },
+  { id: "wire-keeps-provenance", from: 'if (entry?.kind !== "row" || !entry.row || !Array.isArray(entry.row.cells)) return null;', to: 'if (entry?.kind === "row") return entry as never;', killer: "walks three pages back" },
+  { id: "cursor-unbounded", from: "&& v2Utf8.encode(cursor.token).length <= NEWARCH_V2_WIRE_LIMITS.cursorBytes", to: "", killer: "oversized cursor are typed errors" },
+  { id: "late-reply-after-pane-change", from: 'if (this.newarchV2Readable(session, pane).kind !== "selected") return fail("wrong-pane");', to: "", killer: "pane changes before it lands" },
+  { id: "reply-unchecked", from: 'return newarchV2ReplyMatches(message, reply) ? reply : v2ErrorReply(message, "wrong-pane");', to: "return reply;", killer: "another pane's row or cursor is refused" },
+  { id: "payload-unbounded", from: 'if (payloadBytes > request.maxBytes) return v2ErrorReply(message, "bounded-read");', to: "", killer: "exceed the wire page bound" },
+];
+
+test.skipIf(process.env.D3_MUTANT_WS_MUX !== undefined)("D3 mutation controls: every server mutant is killed by its own case", () => {
+  const source = new URL("../src/ws-mux.ts", import.meta.url).pathname;
+  const mutant = new URL("../src/ws-mux.d3mutant.ts", import.meta.url).pathname;
+  const original = readFileSync(source, "utf8");
+  const run = (module: string) => spawnSync(process.execPath, ["test", new URL(import.meta.url).pathname, "-t", "D3"], {
+    env: { ...process.env, D3_MUTANT_WS_MUX: module }, encoding: "utf8", timeout: 120_000,
+  });
+  const lines: string[] = [];
+  try {
+    writeFileSync(mutant, original);
+    const control = run(mutant);
+    lines.push(`D3-MUTANT control exit=${control.status}`);
+    expect(control.status).toBe(0);
+    for (const m of D3_SERVER_MUTANTS) {
+      expect(original.split(m.from).length - 1).toBe(1);
+      writeFileSync(mutant, original.replace(m.from, m.to));
+      const result = run(mutant);
+      const out = `${result.stdout}${result.stderr}`;
+      const killed = out.split("\n").filter(line => line.startsWith("(fail)")).map(line => line.replace(/ \[[^\]]*\]$/, ""));
+      lines.push(`D3-MUTANT ${m.id} exit=${result.status} killed=${JSON.stringify(killed)}`);
+      expect(result.status).toBe(1);
+      expect(out).not.toContain("SyntaxError");
+      expect(killed.some(line => line.includes(m.killer))).toBe(true);
+    }
+  } finally {
+    rmSync(mutant, { force: true });
+    console.log(lines.join("\n"));
+  }
+}, 900_000);
