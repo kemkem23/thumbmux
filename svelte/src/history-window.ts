@@ -1162,18 +1162,20 @@ export function newarchV2PagerAsk(
     if (found.kind !== 'ask') return overlap === 0 ? found : { kind: 'unknown' };
     return { kind: 'ask', direction, cursor: found.cursor, edgeLine: edge, overlap };
   };
+  // A page edge cut by eviction has no cursor (null): resume from the
+  // neighbouring page's edge and let the reply repeat the rows in between.
   if (direction === 'before') {
     const index = pages.findIndex(page => page.startLine <= edge && edge < v2PagerEnd(page));
     if (index < 0) return { kind: 'unknown' };
     const page = pages[index]!;
-    if (page.startLine === edge) return finish(v2CursorOf(page.before), 0);
+    if (page.startLine === edge && page.before !== null) return finish(v2CursorOf(page.before), 0);
     const next = pages[index + 1];
     return finish(next ? v2CursorOf(next.before) : null, v2PagerEnd(page) - edge);
   }
   const index = pages.findIndex(page => page.startLine < edge && edge <= v2PagerEnd(page));
   if (index < 0) return { kind: 'unknown' };
   const page = pages[index]!;
-  if (v2PagerEnd(page) === edge) return finish(v2CursorOf(page.after), 0);
+  if (v2PagerEnd(page) === edge && page.after !== null) return finish(v2CursorOf(page.after), 0);
   const previous = pages[index - 1];
   return finish(previous ? v2CursorOf(previous.after) : null, edge - page.startLine);
 }
@@ -1287,10 +1289,36 @@ export function applyNewarchV2PagerReply(
   };
 }
 
-/** Keep only pages that still touch the resident window; cursor memory stays bounded. */
+/**
+ * Keep exactly the resident rows: pages outside the window are dropped and a
+ * page cut by eviction keeps only its resident keys. A cut edge loses its
+ * cursor (that position is no longer a page boundary), so a row that left the
+ * window can come back once and is never mistaken for a duplicate.
+ */
 export function newarchV2PagerRetain(state: NewarchV2PagerState, range: HistoryWindowRange): NewarchV2PagerState {
-  const pages = state.pages.filter(page => v2PagerEnd(page) > range.startLine && page.startLine < range.endLine);
-  return pages.length === state.pages.length ? state : { ...state, pages };
+  let changed = false;
+  const pages: NewarchV2PagerPage[] = [];
+  for (const page of state.pages) {
+    const end = v2PagerEnd(page);
+    const from = Math.max(page.startLine, range.startLine);
+    const to = Math.min(end, range.endLine);
+    if (to <= from) {
+      changed = true;
+      continue;
+    }
+    if (from === page.startLine && to === end) {
+      pages.push(page);
+      continue;
+    }
+    changed = true;
+    pages.push({
+      startLine: from,
+      keys: page.keys.slice(from - page.startLine, to - page.startLine),
+      before: from === page.startLine ? page.before : null,
+      after: to === end ? page.after : null,
+    });
+  }
+  return changed ? { ...state, pages } : state;
 }
 
 /** Terminal rows only. Status sentences are not part of copy or search. */

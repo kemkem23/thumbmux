@@ -4559,7 +4559,12 @@
       }
       return false;
     }
-    if (ask.kind !== 'ask') return false;
+    if (ask.kind !== 'ask') {
+      // No cursor is known for this edge: start over from the pane's tail
+      // rather than guess a position (never a line number on the wire).
+      resetV2History();
+      return false;
+    }
     const pending = tmuxMux.requestHistoryV2(requestSession, pane, {
       cursor: ask.cursor,
       direction,
