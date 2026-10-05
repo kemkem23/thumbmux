@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createBunTmuxDriver } from "../src/bun-driver";
 import { TmuxWsMux } from "../src/ws-mux";
 
@@ -271,3 +274,151 @@ test("H2 a failed pipe read kills the child before releasing the activity slot",
     Bun.spawn = originalSpawn;
   }
 });
+
+// ── NEWARCH D2a: "attached" counts only real (non-control-mode) clients ──
+// `#{session_attached}` is a client count that includes the S2 watcher's
+// `tmux -C` control client. listSessions chains `list-clients` onto the same
+// tmux call and subtracts only rows that are provably control clients.
+function withListSessionsOutput(
+  stdout: string,
+  run: (driver: ReturnType<typeof createBunTmuxDriver>, calls: string[][]) => void,
+) {
+  const originalSpawnSync = Bun.spawnSync;
+  const calls: string[][] = [];
+  Bun.spawnSync = ((command: string[]) => {
+    calls.push(command);
+    if (command[1] === "list-sessions") return successfulProcess(stdout);
+    throw new Error(`unexpected tmux call: ${command.join(" ")}`);
+  }) as typeof Bun.spawnSync;
+  const driver = createBunTmuxDriver();
+  try {
+    run(driver, calls);
+  } finally {
+    driver.activityPoll.stop();
+    Bun.spawnSync = originalSpawnSync;
+  }
+}
+
+describe("D2a bun driver listSessions attachment", () => {
+  test("two real clients, real+control, control-only and none — one tmux call", () => {
+    withListSessionsOutput([
+      "two-real|1700000000|1|2",
+      "watch-only|1700000001|1|1",
+      "both|1700000002|2|2",
+      "nobody|1700000003|1|0",
+      "client:0|two-real",
+      "client:0|two-real",
+      "client:1|watch-only",
+      "client:0|both",
+      "client:1|both",
+      "",
+    ].join("\n"), (driver, calls) => {
+      const rows = driver.listSessions();
+      console.log("D2A_DRIVER_SPAWNS_PER_LIST", calls.length, JSON.stringify(calls[0]));
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual([
+        "tmux", "list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}",
+        ";", "list-clients", "-F", "client:#{client_control_mode}|#{client_session}",
+      ]);
+      expect(rows.map((row) => [row.name, row.attached])).toEqual([
+        ["two-real", true],
+        ["watch-only", false],
+        ["both", true],
+        ["nobody", false],
+      ]);
+    });
+  });
+
+  test("with no client rows the rows keep their shape and every field", () => {
+    withListSessionsOutput("alpha|1700000000|2|1\nbeta|1700000001|1|0\n", (driver) => {
+      expect(driver.listSessions()).toEqual([
+        { name: "alpha", created: "1700000000", windows: 2, attached: true, activityAt: 0 },
+        { name: "beta", created: "1700000001", windows: 1, attached: false, activityAt: 0 },
+      ]);
+    });
+  });
+
+  test("unreadable, empty and foreign client rows never fail the list", () => {
+    withListSessionsOutput([
+      "kept|1700000000|1|1",
+      "over|1700000001|1|1",
+      "client:",
+      "client:1",
+      "client:1|",
+      "client:x|kept",
+      "client:|kept",
+      "client:1|ghost",
+      "client:1|over",
+      "client:1|over",
+    ].join("\n"), (driver) => {
+      expect(driver.listSessions().map((row) => [row.name, row.attached])).toEqual([
+        ["kept", true],
+        ["over", false],
+      ]);
+    });
+  });
+});
+
+test("D2a real tmux: the driver reads a control-mode watcher alone as detached, a real client beside it as attached", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "d2a-driver-"));
+  const socket = join(dir, "d2a-driver.sock");
+  const env: Record<string, string> = { TERM: "xterm-256color" };
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && key !== "TMUX" && key !== "TMUX_PANE") env[key] = value;
+  const nativeSpawn = Bun.spawn;
+  const nativeSpawnSync = Bun.spawnSync;
+  const t = (args: string[]) => {
+    const result = nativeSpawnSync(["tmux", "-S", socket, "-f", "/dev/null", ...args], { env });
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    return result.stdout.toString();
+  };
+  const name = "d2a-watch";
+  const children: Array<{ kill(signal?: number): void; exited: Promise<number> }> = [];
+  const clientModes = () => t(["list-clients", "-t", `=${name}`, "-F", "#{client_control_mode}"])
+    .trim().split("\n").filter(Boolean).sort().join(",");
+  const waitForModes = async (want: string) => {
+    const started = Date.now();
+    while (clientModes() !== want) {
+      if (Date.now() - started > 10_000) throw new Error(`clients never reached ${want}: ${clientModes()}`);
+      await Bun.sleep(50);
+    }
+  };
+  const driver = createBunTmuxDriver();
+  try {
+    t(["new-session", "-d", "-s", name, "-x", "80", "-y", "24", "env -i HOME=/tmp TERM=xterm-256color PS1='$ ' bash --norc --noprofile"]);
+    // Route only the driver's list-sessions call to the private server.
+    Bun.spawnSync = ((command: string[], options?: any) => command[1] === "list-sessions"
+      ? nativeSpawnSync(["tmux", "-S", socket, ...command.slice(1)], { ...options, env })
+      : nativeSpawnSync(command, options)) as typeof Bun.spawnSync;
+
+    const watcher = nativeSpawn([
+      "tmux", "-S", socket, "-C", "attach-session", "-t", `=${name}`, "-f", "ignore-size,read-only,no-output",
+    ], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env });
+    children.push(watcher);
+    void new Response(watcher.stdout).arrayBuffer().catch(() => {});
+    await waitForModes("1");
+    const controlOnly = driver.listSessions().find((row) => row.name === name);
+    console.log("D2A_DRIVER_REAL_CONTROL_ONLY", JSON.stringify(controlOnly));
+    expect(controlOnly?.attached).toBe(false);
+
+    const viewer = nativeSpawn([
+      "script", "-qfec", `tmux -S '${socket}' attach-session -t '=${name}'`, "/dev/null",
+    ], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env });
+    children.push(viewer);
+    void new Response(viewer.stdout).arrayBuffer().catch(() => {});
+    await waitForModes("0,1");
+    const raw = t(["display-message", "-p", "-t", `=${name}`, "#{session_attached}"]).trim();
+    const withViewer = driver.listSessions().find((row) => row.name === name);
+    console.log("D2A_DRIVER_REAL_CONTROL_PLUS_REAL", JSON.stringify({ sessionAttached: raw, row: withViewer }));
+    expect(raw).toBe("2");
+    expect(withViewer?.attached).toBe(true);
+  } finally {
+    Bun.spawnSync = nativeSpawnSync;
+    driver.activityPoll.stop();
+    for (const child of children) {
+      try { child.kill(9); } catch { /* already exited */ }
+      await child.exited.catch(() => {});
+    }
+    nativeSpawnSync(["tmux", "-S", socket, "kill-server"], { env });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
