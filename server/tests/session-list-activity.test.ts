@@ -527,3 +527,30 @@ describe("D2a debt: bun driver listSessions with '|' in a session name", () => {
     }
   });
 });
+
+// Each mutant removes one part of the "|" fix in a copy of bun-driver.ts
+// written next to the source inside the cage's own checkout, deleted in `finally`.
+test("D2a debt mutation: every part of the '|' name fix in listSessions is load-bearing", async () => {
+  const source = join(import.meta.dir, "../src/bun-driver.ts");
+  const original = readFileSync(source, "utf8");
+  const mutants = [
+    { name: "naive-split", from: "            if (fields.length >= 4) {", to: "            if (false) {" },
+    { name: "name-is-first-field", from: '              name = fields.join("|");', to: "              name = fields[0];" },
+  ];
+  const results: Array<{ mutant: string; killedBy: string[] }> = [];
+  for (const mutant of mutants) {
+    expect(original.split(mutant.from)).toHaveLength(2);
+    const copy = join(import.meta.dir, `../src/bun-driver.d2a-debt-mutant-${mutant.name}.ts`);
+    writeFileSync(copy, original.replace(mutant.from, mutant.to));
+    try {
+      const mod = await import(copy) as typeof import("../src/bun-driver");
+      const killedBy: string[] = [];
+      try { expectPipeNameDriverRows(mod.createBunTmuxDriver); } catch { killedBy.push("pipe-names"); }
+      results.push({ mutant: mutant.name, killedBy });
+    } finally {
+      rmSync(copy, { force: true });
+    }
+  }
+  console.log("D2A_DEBT_DRIVER_MUTANTS", JSON.stringify(results));
+  expect(results.filter((result) => result.killedBy.length === 0)).toEqual([]);
+});

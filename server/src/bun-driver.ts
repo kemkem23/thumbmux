@@ -235,7 +235,19 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): BunTmuxDri
           if (session) controlClients.set(session, (controlClients.get(session) ?? 0) + 1);
         }
         return rows.filter((line) => !line.startsWith(clientPrefix)).map((line) => {
-            const [name, created, windows, attached] = line.split("|");
+            // The trailing fields are numeric: take them off the END so a "|"
+            // in the session name stays in the name (as parseMuxSampleLine).
+            const fields = line.split("|");
+            let name: string | undefined, created: string | undefined;
+            let windows: string | undefined, attached: string | undefined;
+            if (fields.length >= 4) {
+              attached = fields.pop();
+              windows = fields.pop();
+              created = fields.pop();
+              name = fields.join("|");
+            } else {
+              [name, created, windows, attached] = fields;
+            }
             return {
               name,
               created,
