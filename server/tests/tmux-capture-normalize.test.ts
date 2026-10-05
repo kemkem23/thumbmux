@@ -1782,7 +1782,7 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
   });
 });
 
-import { v2BirthCheckpoint, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
+import { v2BirthCheckpoint, evaluateV2Prefix, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
 import { V2Jigsaw } from '../src/stream-runtime';
 import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
 import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, v2BirthGeometry, v2Digest, validateV2Incident,
@@ -2082,5 +2082,64 @@ describe('Q22 C definite rejection and proposal isolation',()=>{
     epoch.attachId='caller-mutated';
     engine.committed(result.checkpoint.checkpointId);
     expect(engine.liveCheckpoint.through.epoch.attachId).toBe(v2Epoch.attachId);
+  });
+});
+
+describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
+  const geometry={columns:78,rows:120} as const;
+  const pane={...v2Pane,geometry};
+  const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},{...v2Config,geometry});
+  const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
+  function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length]) {
+    let cp=birth(), offeredStart=0;
+    const rows:SC.CommittedStreamRow[]=[];
+    const prefixes:SC.V2DecodePrefix[]=[];
+    for(const packetEnd of packetEnds) {
+      expect(packetEnd).toBeGreaterThanOrEqual(offeredStart);
+      while(offeredStart<packetEnd) {
+        const input={pane,checkpoint:cp,raw:{epoch:v2Epoch,start:offeredStart,end:packetEnd},
+          bytes:[...raw.subarray(offeredStart,packetEnd)],observedAtMonoMs:1,pendingSinceMonoMs:null};
+        const result=evaluateV2Prefix(input,v2Config,v2Clock);
+        if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
+        expect(SC.v2DecodePrefixValid(result,cp)).toBe(true);
+        expect(result.rows.length).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxRows);
+        expect(result.serializedBytes).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
+        expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
+        expect(Buffer.byteLength(SC.streamCanonical(result.checkpoint))).toBeLessThanOrEqual(SC.NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
+        for(const row of result.rows) expect(row.cellOrigins).toHaveLength(row.cells.length);
+        prefixes.push(result);rows.push(...result.rows);cp=result.checkpoint;offeredStart=result.consumed.end;
+      }
+    }
+    return {rows,prefixes,checkpoint:cp};
+  }
+  const numbered=(count:number,body=(i:number)=>`row-${i.toString().padStart(5,'0')}`)=
+    Buffer.from(Array.from({length:count},(_,i)=>body(i)+'\r\n').join('')+'SENTINEL-B1\r\n');
+
+  for(const count of [80,256,1024,10000]) test(`78x120 burst ${count} rows is lossless and sentinel remains reachable`,()=>{
+    const raw=numbered(count),decoded=decodePackets(raw);
+    const visible=decoded.checkpoint.state[decoded.checkpoint.state.active].rows.map(row=>row.cells.map(cell=>cell.text).join('').trimEnd());
+    const all=[...decoded.rows.map(row=>rowText(row).trimEnd()),...visible];
+    expect(all.filter(text=>text==='SENTINEL-B1')).toHaveLength(1);
+    expect(all.filter(text=>text.startsWith('row-'))).toEqual(Array.from({length:count},(_,i)=>`row-${i.toString().padStart(5,'0')}`));
+    expect(decoded.prefixes.some(prefix=>prefix.stop!=='complete')).toBe(count>=1024);
+  });
+
+  test('newline-only, full-width and repeated content use canonical size without losing provenance',()=>{
+    for(const raw of [Buffer.from('\n'.repeat(1024)+'SENTINEL-B1\r\n'),numbered(1024,()=> '界'.repeat(39)),numbered(1024,()=> 'same')]) {
+      const decoded=decodePackets(raw);
+      expect(decoded.prefixes.every(prefix=>prefix.serializedBytes===SC.v2RowsSerializedBytes(prefix.rows))).toBe(true);
+      expect(decoded.prefixes.flatMap(prefix=>prefix.rows).every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
+    }
+  });
+
+  test('Thai, emoji, ANSI and CR agree for one packet and every split boundary',()=>{
+    const lead='lead\r\n'.repeat(120);
+    const tail='ไทยก้😃\r\n\x1b[31mแดง界\x1b[0m\rprogress\rDONE\x1b[K\r\nSENTINEL-B1\r\n';
+    const raw=Buffer.from(lead+tail),one=decodePackets(raw);
+    const start=Buffer.byteLength(lead),want=one.rows.map(row=>({id:row.id,text:rowText(row),origins:row.cellOrigins}));
+    for(let cut=start+1;cut<raw.length;cut++) {
+      const split=decodePackets(raw,[cut,raw.length]);
+      expect(split.rows.map(row=>({id:row.id,text:rowText(row),origins:row.cellOrigins}))).toEqual(want);
+    }
   });
 });
