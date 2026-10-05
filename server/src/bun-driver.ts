@@ -215,14 +215,32 @@ export function createBunTmuxDriver(options: TmuxTargetOptions = {}): BunTmuxDri
     activityPoll,
     listSessions() {
       try {
-        return run(["list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}"])
-          .trim().split("\n").filter(Boolean).map((line) => {
+        // `session_attached` counts every client, including control-mode
+        // (`tmux -C`) watchers, so the same tmux call lists clients after a
+        // `;`. tmux rewrites ":" in a session name, so no session row can
+        // start with the client-row prefix. Only a row that is provably
+        // control mode is subtracted; an unreadable row subtracts nothing.
+        const clientPrefix = "client:";
+        const rows = run([
+          "list-sessions", "-F", "#{session_name}|#{session_created}|#{session_windows}|#{session_attached}",
+          ";", "list-clients", "-F", `${clientPrefix}#{client_control_mode}|#{client_session}`,
+        ]).trim().split("\n").filter(Boolean);
+        const controlClients = new Map<string, number>();
+        for (const row of rows) {
+          if (!row.startsWith(clientPrefix)) continue;
+          const rest = row.slice(clientPrefix.length);
+          const separator = rest.indexOf("|");
+          if (separator < 0 || rest.slice(0, separator) !== "1") continue;
+          const session = rest.slice(separator + 1);
+          if (session) controlClients.set(session, (controlClients.get(session) ?? 0) + 1);
+        }
+        return rows.filter((line) => !line.startsWith(clientPrefix)).map((line) => {
             const [name, created, windows, attached] = line.split("|");
             return {
               name,
               created,
               windows: Number(windows) || 1,
-              attached: attached === "1",
+              attached: (Number(attached) || 0) - (controlClients.get(name!) ?? 0) > 0,
               activityAt: activityPoll.peek().get(name!) ?? 0,
             };
           });
