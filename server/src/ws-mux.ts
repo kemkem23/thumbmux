@@ -2068,7 +2068,7 @@ export class TmuxWsMux<
    * is a thin switch — hosts with richer routing keep their own switch instead.
    * Answers client keepalive pings: the thumbmux/svelte client closes the
    * connection when a ping goes unanswered for 8s. */
-  handleMessage(msg: MuxClientMessage | NewarchV2HistoryExpandMessage, ws: WS) {
+  handleMessage(msg: MuxClientMessage, ws: WS) {
     if (msg.type === "history_expand_v2") {
       this.expandHistoryV2(msg, ws);
       return;
@@ -2992,6 +2992,12 @@ function v2ReplyFromRead(message: NewarchV2HistoryExpandMessage, result: unknown
     entries.push(wire);
   }
   if (!v2ContinuationBounded(page.before) || !v2ContinuationBounded(page.after)) return v2ErrorReply(message, "bounded-read");
+  // Storage/remote down is not the end of the pane: an ok page whose requested
+  // edge says `end` would stop the reader for good. Restart from the tail.
+  const ahead = request.direction === "before" ? page.before : page.after;
+  if (ahead.kind === "end" && page.states.some(state => state?.kind === "storage-unavailable" || state?.kind === "remote-unavailable")) {
+    return v2ErrorReply(message, "stale-cursor");
+  }
   const payloadBytes = v2Utf8.encode(JSON.stringify(entries)).length;
   if (payloadBytes > request.maxBytes) return v2ErrorReply(message, "bounded-read");
   const reply: NewarchV2HistoryReply = {
