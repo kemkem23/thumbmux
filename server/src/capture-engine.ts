@@ -1023,10 +1023,11 @@ export class CaptureCadence {
 // capture command or writer capability is available in this implementation.
 import { charCellWidth } from '@thumbmux/core';
 import {
-  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_DEFAULT_CONFIG, v2Digest,
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG, v2DecodePrefixValid,
+  v2Digest, v2RowsSerializedBytes,
   v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
-  type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
+  type V2DecodePrefix, type V2PrefixStop, type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
   type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer,
 } from './stream-contract';
 import { v2ApplySgr } from './tmux-capture-normalize';
@@ -1098,7 +1099,11 @@ export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): reado
 
 /** One bounded transaction over a detached state. A failure discards EVERY
  * candidate, including scrolls preceding an unsupported control in this input. */
-function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scrolls:RowContent[];offsets:number[]} {
+class V2RowBoundary extends Error {
+  constructor(readonly byteOffset:number) { super('bounded row prefix'); }
+}
+function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.length, maxScrollRows=Infinity):
+  {state:VtState;scrolls:RowContent[];offsets:number[];rowBoundary:number|null} {
   if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
   const s=structuredClone(state) as Writable<VtState>, {columns,rows}=s.geometry;
   for(const b of [s.normal,s.alternate]) {
@@ -1118,7 +1123,10 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
   const restore=()=>{const b=active();b.cursor={...b.savedCursor};s.attributes=[...b.savedAttributes];s.modes={...b.savedModes};cancelWrap();};
   const scroll=(n:number,down=false)=>{
     const b=active(),{top,bottom}=s.margins;
-    for(let k=0;k<Math.min(n,bottom-top+1);k++) {
+    const count=Math.min(n,bottom-top+1);
+    if(!down && s.active==='normal' && top===0 && bottom===rows-1 && out.length+count>maxScrollRows)
+      throw new V2RowBoundary(offset-1);
+    for(let k=0;k<count;k++) {
       if(down){b.rows.splice(bottom,1);b.rows.splice(top,0,blank());}
       else {
         const removed=b.rows.splice(top,1)[0]!; b.rows.splice(bottom,0,blank());
@@ -1228,7 +1236,7 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     else throw Error('unsupported CSI action');
     cancelWrap();
   };
-  for(let i=0;i<bytes.length;i++){
+  try { for(let i=0;i<Math.min(bytes.length,maxBytes);i++){
     const byte=bytes[i]!;offset=i+1;
     if(s.pendingEscape.length){
       s.pendingEscape.push(byte);if(s.pendingEscape.length>4096)throw Error('escape budget');
@@ -1267,9 +1275,85 @@ function v2Decode(state: VtState, bytes: readonly number[]): {state:VtState;scro
     else if(byte===9){cursor().x=s.tabStops.find(x=>x>cursor().x)??columns-1;cancelWrap();}
     else if(byte===0||byte===7){} else if(byte<32||byte===127)throw Error('unsupported control');
     else print(String.fromCharCode(byte));
+  }} catch(cause) {
+    if(cause instanceof V2RowBoundary)return {state:s,scrolls:out,offsets,rowBoundary:cause.byteOffset};
+    throw cause;
   }
   s.wrapPending=active().wrapPending;
-  return {state:s,scrolls:out,offsets};
+  return {state:s,scrolls:out,offsets,rowBoundary:null};
+}
+
+export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'gap'}>;
+
+/** Decode only a durable candidate prefix. The probe retains at most the row
+ * budget and the materializing pass repeats only the selected raw prefix. The
+ * caller keeps the unconsumed suffix in its durable spool. */
+export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
+  context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
+  const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
+  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
+    bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
+    checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+  const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
+    const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
+    return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
+  };
+  const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
+  try {
+    validateV2Checkpoint(cp);
+    const durableRevision=context.durableRevision??cp.revision;
+    if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
+    if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
+      ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
+    if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
+    if(!v2Equal(cp.through.epoch,raw.epoch))return gap('collector-epoch-changed','epoch');
+    if(!counter(raw.start)||!counter(raw.end)||raw.start!==cp.through.byteOffset||raw.end-raw.start!==input.bytes.length)
+      return gap('decoder-anomaly','raw continuity');
+    if(!counter(input.observedAtMonoMs)||input.pendingSinceMonoMs!==null&&(!counter(input.pendingSinceMonoMs)
+      ||input.pendingSinceMonoMs>input.observedAtMonoMs))return gap('decoder-anomaly','clock');
+    if(input.bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return gap('decoder-anomaly','invalid byte');
+    const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
+    const segmentId=context.rowTarget?.segmentId??cp.frontier?.segmentId??v2Digest('birth-segment',cp.pane);
+    const sameSegment=cp.frontier?.segmentId===segmentId;
+    const base=context.rowTarget?.nextRowOrdinal??(sameSegment?cp.frontier!.rowOrdinal+1:0);
+    if(typeof segmentId!=='string'||!segmentId||!segmentId.isWellFormed()
+      ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
+      ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
+    const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
+    const probe=v2Decode(cp.state,input.bytes,rawCap,L.maxRows);
+    const materialize=(scrolls:readonly RowContent[],offsets:readonly number[]):CommittedStreamRow[]=>scrolls.map((r,i)=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offsets[i]!},ordinal:base+i};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
+        buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
+        uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
+    });
+    const probeRows=materialize(probe.scrolls,probe.offsets);
+    let serializedBoundary:number|null=null;
+    for(let count=1;count<=probeRows.length;count++) if(v2RowsSerializedBytes(probeRows.slice(0,count))>L.maxSerializedBytes) {
+      const trigger=probe.offsets[count-1]!;
+      serializedBoundary=trigger-1;break;
+    }
+    let consumed=rawCap,stop:V2PrefixStop=input.bytes.length>rawCap?'raw-bytes':'complete';
+    if(probe.rowBoundary!==null && probe.rowBoundary<=consumed){consumed=probe.rowBoundary;stop='rows';}
+    if(serializedBoundary!==null && serializedBoundary<=consumed){consumed=serializedBoundary;stop='serialized-bytes';}
+    if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
+    const decoded=v2Decode(cp.state,input.bytes,consumed);
+    if(decoded.rowBoundary!==null)throw Error('materialized prefix row boundary');
+    const rows=materialize(decoded.scrolls,decoded.offsets),serializedBytes=v2RowsSerializedBytes(rows);
+    if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
+    const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
+    const checkpoint:V2LiveCheckpoint={...cp,
+      checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,replayFloor:through,revision,
+      frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
+      pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+    validateV2Checkpoint(checkpoint);
+    if(Buffer.byteLength(streamCanonical(checkpoint))>L.checkpointBytes)return gap('budget-exhausted','checkpoint bytes');
+    const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
+    const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
+      serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
+    if(!v2DecodePrefixValid(prefix,cp))throw Error('invalid bounded prefix');
+    return immutable(prefix);
+  }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
 
 /** Call again with the SAME checkpoint and accumulated raw after defer. A
