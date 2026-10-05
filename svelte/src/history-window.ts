@@ -1243,7 +1243,11 @@ export function fitNewarchFontPx(input: NewarchFontFitInput): NewarchFontFitResu
       candidate = up;
     } else {
       if (candidate <= floor) break;
-      candidate = snap(candidate - FONT_FIT_STEP_PX);
+      // Re-aim from the cell measured at this size: a cell that is not
+      // proportional to the font can leave the first guess many steps high,
+      // and stepping down 0.05px would run out of probes and fall to the floor.
+      const aimed = snap(candidate * usable / (columns * cellAt(candidate)));
+      candidate = aimed < candidate ? aimed : snap(candidate - FONT_FIT_STEP_PX);
     }
   }
 
