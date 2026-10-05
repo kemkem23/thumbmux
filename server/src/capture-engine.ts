@@ -1280,7 +1280,7 @@ function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.lengt
     if(!Number.isInteger(byte)||byte<0||byte>255)throw Error('invalid byte');
     // Only a scrolling byte can hit a boundary. Snapshot its small metadata
     // and row vectors; subsequent cell edits use copy-on-write.
-    if(maxScrollRows!==Infinity && (byte===10||byte===11||byte===12||s.pendingEscape.length>0||active().wrapPending)) {
+    if(maxScrollRows!==Infinity && (byte===10||byte===11||byte===12||s.pendingEscape.length>0||active().wrapPending||cursor().x===columns-1)) {
       beforeByte={...s,normal:cloneBuffer(s.normal),alternate:cloneBuffer(s.alternate),
         modes:{...s.modes},margins:{...s.margins},tabStops:[...s.tabStops],attributes:[...s.attributes],
         pendingUtf8:[...s.pendingUtf8],pendingEscape:[...s.pendingEscape]} as Writable<VtState>;

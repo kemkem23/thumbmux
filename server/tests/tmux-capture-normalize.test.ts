@@ -2147,6 +2147,17 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
     expect(decoded.stopCount).toBeGreaterThan(0);
   });
 
+  test('wide glyph at the last column restores the exact pre-byte prefix state',()=>{
+    const raw=Buffer.from(('x'.repeat(77)+'界\r\n').repeat(256)+'SENTINEL-B1\r\n');
+    const decoded=decodePackets(raw);
+    const visible=decoded.checkpoint.state.normal.rows.map(r=>r.cells.map(c=>c.text).join('').trimEnd());
+    const text=[...decoded.rows.map(r=>r.text.trimEnd()),...visible];
+    expect(text.filter(t=>t==='x'.repeat(77))).toHaveLength(256);
+    expect(text.filter(t=>t==='界')).toHaveLength(256);
+    expect(text.filter(t=>t==='SENTINEL-B1')).toHaveLength(1);
+    expect(decoded.stopCount).toBeGreaterThan(0);
+  });
+
   test('Thai, emoji, ANSI and CR agree for one packet and every split boundary',()=>{
     const lead='lead\r\n'.repeat(120);
     const tail='ไทยก้😃\r\n\x1b[31mแดง界\x1b[0m\rprogress\rDONE\x1b[K\r\nSENTINEL-B1\r\n';
