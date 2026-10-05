@@ -1782,10 +1782,11 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
   });
 });
 
-import { v2BirthCheckpoint, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
+import { v2BirthCheckpoint, evaluateV2Prefix, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
 import { V2Jigsaw } from '../src/stream-runtime';
 import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
-import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, v2BirthGeometry, v2Digest, validateV2Incident,
+import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, NEWARCH_V2_PREFIX_LIMITS, streamCanonical,
+  v2BirthGeometry, v2DecodePrefixValid, v2Digest, v2RowsSerializedBytes, validateV2Incident,
   type NewarchV2PaneDescriptor, type V2AuditEvidence, type V2LiveCheckpoint } from '../src/stream-contract';
 const v2Pane:NewarchV2PaneDescriptor={schema:'newarch-v2',session:{serverIdentity:'c-private',sessionId:'s'},
   pane:{serverIdentity:'c-private',paneId:'%1',birthGeneration:1},windowId:'@1',owner:'capture-engine',
@@ -2084,3 +2085,206 @@ describe('Q22 C definite rejection and proposal isolation',()=>{
     expect(engine.liveCheckpoint.through.epoch.attachId).toBe(v2Epoch.attachId);
   });
 });
+
+describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
+  const config78={...v2Config,geometry:{columns:78,rows:120}};
+  const geometry=v2BirthGeometry(config78);
+  const pane={...v2Pane,geometry};
+  const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config78);
+  const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
+  function checkpointTextBytes(cp:V2LiveCheckpoint): number {
+    // through.byteOffset only grows, so it would hide a later shorter screen
+    // such as CR overwriting "progress" with "DONE". These fixtures put no
+    // JSON escape into cell text, so the UTF-8 text weight tracks the
+    // canonical body. The expect below is still the real 4 MiB ceiling.
+    let weight=cp.state.pendingUtf8.length+cp.state.pendingEscape.length;
+    for(const buffer of [cp.state.normal,cp.state.alternate])
+      for(const row of buffer.rows) for(const cell of row.cells) weight+=Buffer.byteLength(cell.text);
+    return weight;
+  }
+  function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length],initial=birth()) {
+    let cp=initial, offeredStart=initial.through.byteOffset,stopCount=0,prefixCount=0;
+    let heaviest=cp, heaviestWeight=checkpointTextBytes(cp);
+    const rows:{id:SC.CommittedStreamRow['id'];text:string;originCount:number;originEnd:number}[]=[];
+    for(const packetEnd of packetEnds) {
+      expect(packetEnd).toBeGreaterThanOrEqual(offeredStart);
+      while(offeredStart<packetEnd) {
+        const input={pane,checkpoint:cp,raw:{epoch:v2Epoch,start:offeredStart,end:packetEnd},
+          bytes:raw.subarray(offeredStart,packetEnd) as unknown as readonly number[],observedAtMonoMs:1,pendingSinceMonoMs:null};
+        const result=evaluateV2Prefix(input,config78,v2Clock);
+        if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
+        if(prefixCount===0)expect(v2DecodePrefixValid(result,cp)).toBe(true);
+        expect(result.rows.length).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRows);
+        expect(result.serializedBytes).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
+        expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
+        const weight=checkpointTextBytes(result.checkpoint);
+        if(weight>=heaviestWeight){heaviest=result.checkpoint;heaviestWeight=weight;}
+        expect(result.rows.every(row=>row.cellOrigins.length===row.cells.length)).toBe(true);
+        expect(result.rows.every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
+        // A fresh canonical of every page was ~0.9s on 90 prefixes and ate the
+        // margin under bun's 5s limit. The formula is pure, so the first page
+        // (also inside v2DecodePrefixValid) and the last page are enough to
+        // catch a drift against an encoder that did not build the probe.
+        const lastPage=result.consumed.end===packetEnds[packetEnds.length-1];
+        if(prefixCount===0 || lastPage) expect(result.serializedBytes).toBe(v2RowsSerializedBytes(result.rows));
+        if(result.stop!=='complete')stopCount++;
+        prefixCount++;
+        rows.push(...result.rows.map(row=>({id:row.id,text:rowText(row),originCount:row.cellOrigins.length,
+          originEnd:row.origin.kind==='pipe'?row.origin.range.end:-1})));
+        cp=result.checkpoint;offeredStart=result.consumed.end;
+      }
+    }
+    expect(Buffer.byteLength(streamCanonical(heaviest))).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
+    return {rows,stopCount,prefixCount,checkpoint:cp};
+  }
+  function chronology(decoded:ReturnType<typeof decodePackets>): string[] {
+    const visible=decoded.checkpoint.state[decoded.checkpoint.state.active].rows
+      .map(row=>row.cells.map(cell=>cell.text).join('').trimEnd());
+    return [...decoded.rows.map(row=>row.text.trimEnd()),...visible];
+  }
+  function numbered(count:number,body?: (i:number)=>string): Buffer {
+    const make=body??((i:number)=>`row-${i.toString().padStart(5,'0')}`);
+    return Buffer.from(Array.from({length:count},(_,i)=>make(i)+'\r\n').join('')+'SENTINEL-B1\r\n');
+  }
+
+  for(const count of [80,256,1024,10000]) test(`78x120 burst ${count} rows is lossless and sentinel remains reachable`,()=>{
+    const raw=numbered(count),decoded=decodePackets(raw);
+    const visible=decoded.checkpoint.state[decoded.checkpoint.state.active].rows.map(row=>row.cells.map(cell=>cell.text).join('').trimEnd());
+    const all=[...decoded.rows.map(row=>row.text.trimEnd()),...visible];
+    expect(all.filter(text=>text==='SENTINEL-B1')).toHaveLength(1);
+    expect(all.filter(text=>text.startsWith('row-'))).toEqual(Array.from({length:count},(_,i)=>`row-${i.toString().padStart(5,'0')}`));
+    expect(decoded.stopCount>0).toBe(count!==80);
+  });
+
+  test('newline-only, full-width and repeated content use canonical size without losing provenance',()=>{
+    const scenes:[Buffer,string[]][]=[
+      [Buffer.from('\n'.repeat(256)+'SENTINEL-B1\r\n'),Array(256).fill('')],
+      [numbered(256,()=> '界'.repeat(39)),Array(256).fill('界'.repeat(39))],
+      [numbered(256,()=> 'same'),Array(256).fill('same')],
+    ];
+    for(const [raw,lines] of scenes) {
+      const decoded=decodePackets(raw),all=chronology(decoded);
+      expect(all.filter(text=>text==='SENTINEL-B1')).toHaveLength(1);
+      expect(all).toEqual([...lines,'SENTINEL-B1','']);
+      expect(decoded.rows.map(row=>row.id.rowOrdinal)).toEqual(decoded.rows.map((_,index)=>index));
+      expect(decoded.rows.every(row=>row.originCount===78)).toBe(true);
+      expect(decoded.stopCount).toBeGreaterThan(0);
+    }
+  });
+
+  test('a page boundary before a multi-row CSI keeps only replayed scrolls',()=>{
+    const decoded=decodePackets(Buffer.from('\x1b[20S'.repeat(10)));
+    expect(decoded.rows).toHaveLength(200);
+    expect(decoded.rows.map(row=>row.id.rowOrdinal)).toEqual(Array.from({length:200},(_,i)=>i));
+    expect(decoded.stopCount).toBeGreaterThan(0);
+  });
+
+  test('wide glyph at the last column restores the exact pre-byte prefix state',()=>{
+    const raw=Buffer.from(('x'.repeat(77)+'界\r\n').repeat(256)+'SENTINEL-B1\r\n');
+    const decoded=decodePackets(raw),text=chronology(decoded);
+    const want:string[]=[];
+    for(let i=0;i<256;i++)want.push('x'.repeat(77),'界');
+    want.push('SENTINEL-B1','');
+    expect(text).toEqual(want);
+    expect(text.filter(t=>t==='SENTINEL-B1')).toHaveLength(1);
+    expect(decoded.rows.map(row=>row.id.rowOrdinal)).toEqual(decoded.rows.map((_,index)=>index));
+    expect(decoded.stopCount).toBeGreaterThan(0);
+  });
+
+  test('Thai, emoji, ANSI and CR agree for one packet and every split boundary',()=>{
+    const lead='lead\r\n'.repeat(120);
+    const tail='ไทยก้😃\r\n\x1b[31mแดง界\x1b[0m\rprogress\rDONE\x1b[K\r\nSENTINEL-B1\r\n';
+    const raw=Buffer.from(lead+tail),start=Buffer.byteLength(lead),base=decodePackets(Buffer.from(lead)).checkpoint;
+    const one=decodePackets(raw,[raw.length],base),want=one.rows;
+    for(let cut=start+1;cut<raw.length;cut++) {
+      const split=decodePackets(raw,[cut,raw.length],base);
+      expect(split.rows).toEqual(want);
+    }
+  });
+});
+
+test('B1 ACK suffix mutation is rejected by the prefix fixture',()=>{
+  const root=mkdtempSync(join(tmpdir(),'b1-ack-suffix-'));
+  const subject=join(root,'subject.ts');
+  const original=readFileSync(new URL('../src/capture-engine.ts',import.meta.url),'utf8')
+    .replaceAll("from './stream-contract'",`from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)}`)
+    .replaceAll("from './tmux-capture-normalize'",`from ${JSON.stringify(new URL('../src/tmux-capture-normalize.ts',import.meta.url).pathname)}`)
+    .replaceAll("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+  const needle='consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset}';
+  expect(original.split(needle)).toHaveLength(2);
+  try {
+    writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';
+import {v2BirthCheckpoint,evaluateV2Prefix} from './subject.ts';
+import {v2DecodePrefixValid,v2BirthGeometry} from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)};
+const config=${JSON.stringify({...v2Config,geometry:{columns:78,rows:120}})};
+const pane={...${JSON.stringify(v2Pane)},geometry:v2BirthGeometry(config)};
+const epoch=${JSON.stringify(v2Epoch)};
+const cp=v2BirthCheckpoint(pane,{epoch,byteOffset:0},config);
+const bytes=[...Buffer.from('row\\r\\n'.repeat(256)+'SENTINEL-B1\\r\\n')];
+const result=evaluateV2Prefix({pane,checkpoint:cp,raw:{epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null},config);
+assert.ok(!('kind' in result),'fixture must decode a valid prefix');
+assert.ok(result.suffix!==null,'fixture must leave an uncommitted suffix');
+assert.ok(v2DecodePrefixValid(result,cp),'B1 ACK suffix certified past checkpoint');
+assert.equal(result.consumed.end,result.checkpoint.through.byteOffset,'B1 ACK suffix passed checkpoint');
+assert.equal(result.suffix.start,result.consumed.end);
+assert.ok(result.consumed.end<result.offered.end);`);
+    for(const mutated of [false,true]) {
+      writeFileSync(subject,mutated?original.replace(needle,'consumedRange={epoch:raw.epoch,start:raw.start,end:raw.end}'):original);
+      const result=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
+      console.log('B1_ACK_MUTANT',JSON.stringify({mutated,exit:result.status,stderr:result.stderr}));
+      expect(result.status).toBe(mutated?1:0);
+      if(mutated)expect(result.stderr).toContain('B1 ACK suffix certified past checkpoint');
+    }
+  } finally {
+    writeFileSync(subject,original);
+    expect(readFileSync(subject,'utf8')).toBe(original);
+    rmSync(root,{recursive:true,force:true});
+  }
+});
+
+
+test('B1c decoder reads only consumed bytes plus one boundary byte and detaches mutable input',()=>{
+  const config={...v2Config,geometry:{columns:78,rows:120}};
+  const pane={...v2Pane,geometry:v2BirthGeometry(config)};
+  let cp=v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config);
+  const original=streamCanonical(cp);
+  const bytes=Array.from(Buffer.from('row\r\n'.repeat(1024)));
+  let start=0,reads=0,prefixes=0;
+  while(start<bytes.length){
+    const view=new Proxy(bytes.slice(start),{get(target,key,receiver){
+      if(typeof key==='string' && /^(0|[1-9][0-9]*)$/.test(key))reads++;
+      return Reflect.get(target,key,receiver);
+    }});
+    const result=evaluateV2Prefix({pane,checkpoint:cp,raw:{epoch:v2Epoch,start,end:bytes.length},
+      bytes:view,observedAtMonoMs:1,pendingSinceMonoMs:null},config,v2Clock);
+    if('kind' in result)throw Error(result.incident.reason);
+    if(prefixes===0)expect(streamCanonical(cp)).toBe(original);
+    cp=result.checkpoint;start=result.consumed.end;prefixes++;
+  }
+  expect(reads).toBeLessThanOrEqual(bytes.length+prefixes);
+  const mutable=structuredClone(cp),before=streamCanonical(mutable);
+  const result=evaluateV2Prefix({pane,checkpoint:mutable,raw:{epoch:v2Epoch,start,end:start+1},
+    bytes:[65],observedAtMonoMs:1,pendingSinceMonoMs:null},config,v2Clock);
+  if('kind' in result)throw Error(result.incident.reason);
+  expect(streamCanonical(mutable)).toBe(before);
+  const output=streamCanonical(result);
+  (mutable.state.alternate.rows[0]!.cells[0]! as {text:string}).text='changed';
+  expect(streamCanonical(result)).toBe(output);
+});
+
+// Run the two requested compiler gates inside the same isolation boundary as
+// the fixtures. Their exit statuses are printed separately from bun test.
+test('B1c strict contract types and repository typecheck gates',()=>{
+  const root=new URL('../../../../',import.meta.url).pathname;
+  // The cage snapshots tracked sources, so regenerate the core package's
+  // declaration output in its disposable COW tree before resolving exports.
+  const commands=[['node_modules/.bin/tsc','-p','packages/thumbmux/core/tsconfig.build.json'],
+    ['node_modules/.bin/tsc','--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
+    '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions',
+    'docs/tasks/newarch-stream/contract-fixture.ts'],[process.execPath,'run','typecheck']];
+  for(const command of commands){
+    const run=spawnSync(command[0]!,command.slice(1),{cwd:root,encoding:'utf8',timeout:120000});
+    console.log('B1C_GATE',JSON.stringify({command,exit:run.status,stdout:run.stdout,stderr:run.stderr}));
+    expect(run.status).toBe(0);
+  }
+},240000);
