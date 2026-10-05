@@ -1272,6 +1272,34 @@ test("D3: an async reply is dropped when the session's pane changes before it la
   expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code])).toEqual([["late", "error", "wrong-pane"]]);
 });
 
+test("D3-r1: storage or remote unavailable is never an ok page whose requested direction is end", async () => {
+  const pending = { kind: "storage-unavailable" as const, pendingIncidentId: "pending-1", retryAfterMs: 500 };
+  const remote = { kind: "remote-unavailable" as const, bundleId: "bundle-9", reason: "offline" as const, retryAfterMs: 1000 };
+  const blocked = (state: typeof pending | typeof remote) => ({ kind: "blocked" as const, cursor: d3Cursor("p0", "blocked-tok"), state });
+  const pages = [
+    v2Page({ entries: [], states: [pending], before: { kind: "end" }, after: { kind: "end" } }),
+    v2Page({ entries: [{ kind: "row", row: v2Row(1) }], states: [pending], before: { kind: "end" }, after: blocked(pending) }),
+    v2Page({ entries: [], states: [remote], before: blocked(remote), after: { kind: "end" } }),
+    // control: the requested direction is blocked, so the page is legal
+    v2Page({ entries: [{ kind: "row", row: v2Row(2) }], states: [pending], before: blocked(pending), after: { kind: "end" } }),
+  ];
+  let call = 0;
+  const mux = d3Mux({ page: () => ({ status: "ok", value: pages[call++] }) });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("u0", null) as never, ws);
+  mux.handleMessage(d3Expand("u1", null) as never, ws);
+  mux.handleMessage(d3Expand("u2", d3Cursor("p1", "tok-after"), { direction: "after" }) as never, ws);
+  mux.handleMessage(d3Expand("u3", null) as never, ws);
+  await d3Settle();
+  // stale-cursor (restart from the tail), never wrong-pane (which drops the pane) and never ok
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code ?? null])).toEqual([
+    ["u0", "error", "stale-cursor"],
+    ["u1", "error", "stale-cursor"],
+    ["u2", "error", "stale-cursor"],
+    ["u3", "ok", null],
+  ]);
+});
+
 test("D3 gate: a fixed v2 window refuses every resize and answers the birth geometry", () => {
   const resized: Array<{ cols: number; rows: number }> = [];
   const mux = d3Mux({ resized });

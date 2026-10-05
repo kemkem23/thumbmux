@@ -3300,4 +3300,93 @@ describe("NEWARCH v2 cursor history on the screen (D3)", () => {
     expect(rows[0]).toBe(345);
     expect(new Set(rows).size).toBe(rows.length);
   });
+
+  // --- D3-r1 (review agy 2026-10-05) ---
+
+  test("a young session whose live seam is near line 0 still scrolls back through every v2 page", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-young", 0));
+    wheel(viewport, -1_000_000);
+    const first = calls.at(-1)!;
+    expect(first.cursor).toBeNull();
+    await answer(first, storeReply(first, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, -1_000_000);
+    const second = calls.at(-1)!;
+    expect(second.cursor?.token).toBe("b:345");
+    await answer(second, storeReply(second, 600, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(89);
+    expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => 89 + i));
+  });
+
+  test("back at the live tail the old pages are gone: the next scroll back starts from the tail again", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-tail", 1000));
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, 1_000_000);
+    // the seam moves while the reader sits at the tail: the resident archive is cleared
+    deliverOutput(liveLines("live2"), undefined, historyBoundary("g-tail", 1010));
+    expect(ordinalsOnScreen()).toEqual([]);
+    const asked = calls.length;
+    wheel(viewport, -1_000_000);
+    expect(calls.length).toBe(asked + 1);
+    expect(calls.at(-1)!.cursor).toBeNull();
+  });
+
+  test("a pane change clears the old pane's rows and sentences at once, before any scroll", async () => {
+    const { viewport, target, props } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [{ kind: "incident", incident: incident(PANE_A, false) }, row(PANE_A, 1, false), row(PANE_A, 2, false)],
+        payloadBytes: 1, states: [{ kind: "incident", incident: incident(PANE_A, false) }], before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    expect(ordinalsOnScreen()).toEqual([1, 2]);
+    expect(noteTexts(target).join("|")).toContain("ท่อเก็บขาด");
+    const asked = calls.length;
+    flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
+    await settleUi();
+    expect(calls.length).toBe(asked);
+    expect(ordinalsOnScreen()).toEqual([]);
+    expect(noteTexts(target).join("|")).not.toContain("ท่อเก็บขาด");
+  });
+
+  test("the pane learned from the session list (no prop) still shows its stopped sentence", async () => {
+    (tmuxMux as unknown as Record<string, unknown>).newarchV2Pane = () => descriptor(PANE_A, "stopped");
+    const { target } = mountTermView();
+    await tick();
+    deliverOutput(liveLines());
+    expect(noteTexts(target).join("|")).toContain("หยุดเก็บแล้ว");
+  });
+
+  test("many incident sentences never push the pane's own stopped sentence off the screen", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A, "stopped") });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const many = Array.from({ length: 8 }, (_, i) => ({ ...incident(PANE_A, false), incidentId: `inc-${i}` }));
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [...many.map(inc => ({ kind: "incident", incident: inc })), row(PANE_A, 1, false)],
+        payloadBytes: 1, states: many.map(inc => ({ kind: "incident", incident: inc })), before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    const notes = noteTexts(target);
+    expect(notes.length).toBeLessThanOrEqual(6);
+    expect(notes.join("|")).toContain("หยุดเก็บแล้ว");
+  });
 });
