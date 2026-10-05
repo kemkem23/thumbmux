@@ -2112,7 +2112,7 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
     }
     return {rows,prefixes,checkpoint:cp};
   }
-  const numbered=(count:number,body=(i:number)=>`row-${i.toString().padStart(5,'0')}`)=
+  const numbered=(count:number,body:(i:number)=>string=(i:number)=>`row-${i.toString().padStart(5,'0')}`)=
     Buffer.from(Array.from({length:count},(_,i)=>body(i)+'\r\n').join('')+'SENTINEL-B1\r\n');
 
   for(const count of [80,256,1024,10000]) test(`78x120 burst ${count} rows is lossless and sentinel remains reachable`,()=>{
