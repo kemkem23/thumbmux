@@ -1054,3 +1054,226 @@ test("NEWARCH v2 D: a blocking state reported as the end is refused, and a candi
     expect(kept.value.entries[0]).toMatchObject({ kind: "incident", incident: { frontier: null, collecting: false } });
   }
 });
+
+// --- D3 (flag-on, 2026-10-05): v2 cursor request/reply on the mux socket ---
+
+type V2Frame = Record<string, unknown> & { type: string; requestId?: string; status?: string; code?: string };
+
+function v2Frames(ws: FakeWS): V2Frame[] {
+  return ws.sent.map(data => JSON.parse(data) as V2Frame).filter(frame => frame.type === "history_v2");
+}
+
+function d3Cursor(storeId: string, token: string, pane = V2_PANE, timelineRevision = 3): NewarchV2HistoryCursor {
+  return { schema: "newarch-v2", pane, storeId, timelineRevision, token };
+}
+
+function d3Expand(requestId: string, cursor: NewarchV2HistoryCursor | null, overrides: Partial<NewarchV2HistoryRequest> = {}) {
+  return {
+    type: "history_expand_v2" as const, session: SESSION, requestId,
+    request: { schema: "newarch-v2" as const, pane: V2_PANE, cursor, direction: "before" as const, maxEntries: 256, maxBytes: 2 * 1024 * 1024, ...overrides },
+  };
+}
+
+function d3Mux(options: {
+  page?: (session: string, request: NewarchV2HistoryRequest) => unknown;
+  selection?: () => ReturnType<NonNullable<ConstructorParameters<typeof TmuxWsMux>[0]["newarchV2"]>>;
+  resized?: Array<{ cols: number; rows: number }>;
+}) {
+  const driver = fakeDriver();
+  if (options.resized) driver.resizeWindow = (_session, cols, rows) => { options.resized!.push({ cols, rows }); };
+  const ctor = TmuxWsMux as unknown as new (opts: Record<string, unknown>) => TmuxWsMux;
+  return new ctor({
+    driver,
+    newarchV2: (session: string) => session === SESSION
+      ? (options.selection ? options.selection() : { kind: "selected", pane: v2Descriptor("pane-a") })
+      : null,
+    ...(options.page ? { newarchV2History: options.page } : {}),
+  });
+}
+
+async function d3Settle(): Promise<void> {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+}
+
+test("D3: history_expand_v2 walks three pages back and forward again with the server's own v2 cursors", async () => {
+  const seen: Array<{ direction: string; store: string | null; token: string | null }> = [];
+  const page = (_s: string, request: NewarchV2HistoryRequest) => {
+    seen.push({ direction: request.direction, store: request.cursor?.storeId ?? null, token: request.cursor?.token ?? null });
+    const at = request.cursor ? Number(request.cursor.storeId.slice(1)) : 3;
+    const index = request.direction === "before" ? at - 1 : at + 1;
+    const rows = [1, 2].map(k => ({ kind: "row" as const, row: v2Row(index * 10 + k) }));
+    return {
+      status: "ok",
+      value: v2Page({
+        entries: rows, states: [{ kind: "exact", auditedRevision: 3 }],
+        before: index > 0 ? { kind: "more", cursor: d3Cursor(`p${index}`, `tok-before-${index}`) } : { kind: "end" },
+        after: index < 3 ? { kind: "more", cursor: d3Cursor(`p${index}`, `tok-after-${index}`) } : { kind: "end" },
+      }),
+    };
+  };
+  const mux = d3Mux({ page });
+  const ws = new FakeWS();
+  let cursor: NewarchV2HistoryCursor | null = null;
+  for (let step = 0; step < 3; step++) {
+    mux.handleMessage(d3Expand(`b${step}`, cursor) as never, ws);
+    await d3Settle();
+    const reply = v2Frames(ws).at(-1)!;
+    expect(reply.requestId).toBe(`b${step}`);
+    expect(reply.status).toBe("ok");
+    expect(reply.channel).toBe(SESSION);
+    const entries = reply.entries as Array<{ kind: string; id: { rowOrdinal: number }; cells: unknown[] } & Record<string, unknown>>;
+    expect(entries.map(entry => entry.id.rowOrdinal)).toEqual([(2 - step) * 10 + 1, (2 - step) * 10 + 2]);
+    // provenance stays on the server: the wire row is a screen projection only
+    expect(entries.every(entry => !("cellOrigins" in entry) && !("origin" in entry) && !("row" in entry))).toBe(true);
+    cursor = (reply.before as { kind: string; cursor: NewarchV2HistoryCursor }).cursor ?? null;
+  }
+  expect((v2Frames(ws).at(-1)!.before as { kind: string }).kind).toBe("end");
+  // ...and back: the after cursor of the oldest page reads the next page forward.
+  const oldest = v2Frames(ws).at(-1)!;
+  const forward = (oldest.after as { cursor: NewarchV2HistoryCursor }).cursor;
+  mux.handleMessage(d3Expand("f0", forward, { direction: "after" }) as never, ws);
+  await d3Settle();
+  const back = v2Frames(ws).at(-1)!;
+  expect(back.status).toBe("ok");
+  expect((back.entries as Array<{ id: { rowOrdinal: number } }>).map(e => e.id.rowOrdinal)).toEqual([11, 12]);
+  // the reader received each v2 cursor verbatim, never a flattened line number
+  expect(seen).toEqual([
+    { direction: "before", store: null, token: null },
+    { direction: "before", store: "p2", token: "tok-before-2" },
+    { direction: "before", store: "p1", token: "tok-before-1" },
+    { direction: "after", store: "p0", token: "tok-after-0" },
+  ]);
+  expect(ws.sent.some(data => JSON.parse(data).type === "history")).toBe(false);
+});
+
+test("D3: a request for another pane, or with another pane's cursor, is wrong-pane and never reaches the reader", async () => {
+  let reads = 0;
+  const mux = d3Mux({ page: () => { reads++; return { status: "ok", value: v2Page({ entries: [], states: [], before: { kind: "end" }, after: { kind: "end" } }) }; } });
+  const ws = new FakeWS();
+  const otherPane = { serverIdentity: "srv", paneId: "pane-b", birthGeneration: 1 };
+  mux.handleMessage(d3Expand("x1", null, { pane: otherPane }) as never, ws);
+  mux.handleMessage(d3Expand("x2", d3Cursor("p1", "tok", otherPane)) as never, ws);
+  // same pane id, but a recreated server / reborn pane is a different pane
+  mux.handleMessage(d3Expand("x3", d3Cursor("p1", "tok", { ...V2_PANE, birthGeneration: 2 })) as never, ws);
+  await d3Settle();
+  const frames = v2Frames(ws);
+  expect(frames.map(frame => [frame.requestId, frame.status, frame.code])).toEqual([
+    ["x1", "error", "wrong-pane"], ["x2", "error", "wrong-pane"], ["x3", "error", "wrong-pane"],
+  ]);
+  expect(reads).toBe(0);
+});
+
+test("D3: legacy, unavailable owner, oversized request and oversized cursor are typed errors, not empty pages", async () => {
+  const ws = new FakeWS();
+  const legacy = new TmuxWsMux({ driver: fakeDriver() });
+  legacy.handleMessage(d3Expand("l1", null) as never, ws);
+  const unavailable = d3Mux({ selection: () => ({ kind: "owner-unavailable", retryAfterMs: 750 }), page: () => { throw new Error("must not read"); } });
+  unavailable.handleMessage(d3Expand("u1", null) as never, ws);
+  const mux = d3Mux({ page: () => { throw new Error("must not read"); } });
+  mux.handleMessage(d3Expand("o1", null, { maxEntries: 257 }) as never, ws);
+  mux.handleMessage(d3Expand("o2", null, { maxBytes: 2 * 1024 * 1024 + 1 }) as never, ws);
+  mux.handleMessage(d3Expand("o3", d3Cursor("p1", "x".repeat(4097))) as never, ws);
+  await d3Settle();
+  const frames = v2Frames(ws);
+  expect(frames.map(frame => [frame.requestId, frame.status, frame.code, frame.retryAfterMs])).toEqual([
+    ["l1", "error", "unsupported", null],
+    ["u1", "error", "owner-unavailable", 750],
+    ["o1", "error", "bounded-read", null],
+    ["o2", "error", "bounded-read", null],
+    ["o3", "error", "bounded-read", null],
+  ]);
+  expect(frames.every(frame => !("entries" in frame))).toBe(true);
+});
+
+test("D3: a reader page with another pane's row or cursor is refused, and reader faults map to typed errors", async () => {
+  const foreignPane = { serverIdentity: "srv", paneId: "pane-b", birthGeneration: 1 };
+  const foreignRow = { ...v2Row(7), id: { pane: foreignPane, segmentId: "seg", rowOrdinal: 7 } };
+  const answers: unknown[] = [
+    { status: "ok", value: v2Page({ entries: [{ kind: "row", row: foreignRow }], states: [], before: { kind: "end" }, after: { kind: "end" } }) },
+    { status: "ok", value: v2Page({ entries: [], states: [], before: { kind: "more", cursor: d3Cursor("p1", "t", foreignPane) }, after: { kind: "end" } }) },
+    { status: "busy", retryAfterMs: 400, reason: "queue" },
+    { status: "stale", reason: "epoch" },
+    { status: "error", code: "io", message: "disk" },
+    Promise.reject(new Error("reader threw")),
+  ];
+  let call = 0;
+  const mux = d3Mux({ page: () => answers[call++] });
+  const ws = new FakeWS();
+  for (let i = 0; i < answers.length; i++) mux.handleMessage(d3Expand(`r${i}`, null) as never, ws);
+  await d3Settle();
+  const frames = v2Frames(ws);
+  expect(frames.map(frame => [frame.requestId, frame.status, frame.code])).toEqual([
+    ["r0", "error", "wrong-pane"],
+    ["r1", "error", "wrong-pane"],
+    ["r2", "error", "owner-unavailable"],
+    ["r3", "error", "stale-cursor"],
+    ["r4", "error", "owner-unavailable"],
+    ["r5", "error", "owner-unavailable"],
+  ]);
+  expect(frames[2]!.retryAfterMs).toBe(400);
+  expect(ws.sent.some(data => JSON.stringify(JSON.parse(data)).includes("disk"))).toBe(false);
+});
+
+test("D3: an incident before the first row and a pending storage state travel to the client intact", async () => {
+  const pending = { kind: "storage-unavailable" as const, pendingIncidentId: "pending-1", retryAfterMs: 500 };
+  const mux = d3Mux({
+    page: () => ({
+      status: "ok",
+      value: v2Page({
+        entries: [{ kind: "incident", incident: v2Incident(false) }, { kind: "row", row: v2Row(1) }],
+        states: [{ kind: "incident", incident: v2Incident(false) }, pending],
+        before: { kind: "blocked", cursor: d3Cursor("p0", "blocked-tok"), state: pending },
+        after: { kind: "end" },
+      }),
+    }),
+  });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("i1", null) as never, ws);
+  await d3Settle();
+  const reply = v2Frames(ws).at(-1)!;
+  expect(reply.status).toBe("ok");
+  const entries = reply.entries as Array<Record<string, unknown>>;
+  expect(entries[0]).toEqual({ kind: "incident", incident: v2Incident(false) });
+  expect((entries[0]!.incident as NewarchV2Incident).frontier).toBeNull();
+  expect(reply.states).toEqual([{ kind: "incident", incident: v2Incident(false) }, pending]);
+  expect((reply.before as { kind: string }).kind).toBe("blocked");
+  expect(reply.payloadBytes).toBeGreaterThan(0);
+});
+
+test("D3: a v2 reply that would exceed the wire page bound is refused as bounded-read", async () => {
+  const wide = { ...v2Row(1), cells: Array.from({ length: 100 }, () => ({ text: "x".repeat(100), width: 1 as const, style: [] })) };
+  const mux = d3Mux({
+    page: () => ({ status: "ok", value: v2Page({ entries: [{ kind: "row", row: wide }], states: [], before: { kind: "end" }, after: { kind: "end" } }) }),
+  });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("big", null, { maxBytes: 4096 }) as never, ws);
+  await d3Settle();
+  expect(v2Frames(ws).map(frame => [frame.status, frame.code])).toEqual([["error", "bounded-read"]]);
+});
+
+test("D3: an async reply is dropped when the session's pane changes before it lands", async () => {
+  let release!: (value: unknown) => void;
+  let current = v2Descriptor("pane-a");
+  const mux = d3Mux({
+    selection: () => ({ kind: "selected", pane: current }),
+    page: () => new Promise(resolve => { release = resolve; }),
+  });
+  const ws = new FakeWS();
+  mux.handleMessage(d3Expand("late", null) as never, ws);
+  current = v2Descriptor("pane-b");
+  release({ status: "ok", value: v2Page({ entries: [{ kind: "row", row: v2Row(1) }], states: [], before: { kind: "end" }, after: { kind: "end" } }) });
+  await d3Settle();
+  expect(v2Frames(ws).map(frame => [frame.requestId, frame.status, frame.code])).toEqual([["late", "error", "wrong-pane"]]);
+});
+
+test("D3 gate: a fixed v2 window refuses every resize and answers the birth geometry", () => {
+  const resized: Array<{ cols: number; rows: number }> = [];
+  const mux = d3Mux({ resized });
+  for (const [cols, rows] of [[40, 20], [80, 24], [120, 50]] as const) {
+    const reply = mux.handleResize(SESSION, cols, rows);
+    expect(reply?.status).toBe("fixed");
+    expect(reply?.geometry).toEqual(V2_GEOMETRY);
+    expect(mux.applyGeometry(SESSION, cols, rows)?.status).toBe("fixed");
+  }
+  expect(resized).toEqual([]);
+});
