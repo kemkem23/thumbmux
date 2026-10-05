@@ -2939,7 +2939,8 @@ describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
     ev("touchstart", [path[0]!]);
     for (const point of path.slice(1)) ev("touchmove", [point]);
     ev("touchend", [path.at(-1)!]);
-    drainScheduledWork();
+    // Momentum frames are left queued (afterEach drops them): they move the
+    // pane vertically only, and a fling never settles under this scheduler.
   }
 
   function wideBox(viewport: HTMLElement, scrollWidth: number): void {

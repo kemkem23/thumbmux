@@ -386,6 +386,9 @@
   // NEWARCH fit-font: the size the fit formula chose for a fixed pane. `fontPx`
   // stays the user's ceiling; this is never written back to prefs.
   let fitFontPx = $state<number | null>(null);
+  // How far a manual fixed pane is panned sideways. Box-pinned overlays are
+  // children of the scrolling `.mtv`, so they shift back by this much.
+  let panX = $state(0);
   let autoFit = $derived(fixedGeometry != null && fontFit !== 'manual');
   let renderFontPx = $derived(autoFit && fitFontPx !== null ? fitFontPx : fontPx);
   // A picture scale only exists in manual; auto fits by font (one shrink).
@@ -620,6 +623,10 @@
   let springFrame: number | null = null;
   let momentumWindowFrozen = false;
   let touchY = 0;
+  let touchX = 0;
+  // Axis a one-finger gesture locked to. Only a manual fixed pane wider than
+  // the box can lock 'x'; everything else is 'y' from the first move.
+  let touchAxis: 'x' | 'y' | null = null;
   let touchVel = 0;
   let touchAt = 0;
   let pendingDragPx = 0;
@@ -6216,10 +6223,31 @@
     return e.deltaY;
   }
 
+  // Sideways wheel on a manual fixed pane: a trackpad's deltaX, or shift+wheel
+  // where the browser still reports deltaY. Vertical-dominant wheels fall
+  // through to history scrolling untouched.
+  function panWheelX(e: WheelEvent): boolean {
+    if (!canPanX() || !viewportEl) return false;
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+    if (dx === 0 || Math.abs(dx) <= Math.abs(dy)) return false;
+    const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? Math.max(1, charW || 8)
+      : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? viewportEl.clientWidth : 1;
+    viewportEl.scrollLeft += dx * unit;
+    return true;
+  }
+
   function onWheel(e: WheelEvent) {
     updateSelectionActive();
     if (selectionActive) return;
 
+    if (panWheelX(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (useSgrMouse) {
       forwardAltWheel(e);
       return;
@@ -6415,6 +6443,16 @@
     flushPendingContent();
   }
 
+  // A manual fixed pane draws its birth columns at the user's size and lets
+  // them run past the box (`.mtv-fixed` overflow-x). `.mtv` is touch-action:
+  // none, so the browser never pans it — the sideways motion is ours to apply.
+  function canPanX(): boolean {
+    return !!viewportEl && fixedGeometry != null && !autoFit && !scaleToWidth
+      && viewportEl.scrollWidth - viewportEl.clientWidth > 0.5;
+  }
+
+  const AXIS_LOCK_PX = 6;
+
   // --- gesture physics (px-true, no quantization, iOS decel curve) ---
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
@@ -6432,6 +6470,8 @@
         return;
       }
       altTouchY = touch.clientY;
+      touchX = touch.clientX;
+      touchAxis = canPanX() ? null : 'y';
       altTouchHitArea = contentHitArea();
       return;
     }
@@ -6445,6 +6485,8 @@
     pendingDragPx = 0;
     tapStart = { x: touch.clientX, y: touch.clientY, t: performance.now() };
     touchY = touch.clientY;
+    touchX = touch.clientX;
+    touchAxis = canPanX() ? null : 'y';
     touchAt = performance.now();
     touchVel = 0;
   }
@@ -6474,6 +6516,21 @@
       }
       e.stopPropagation();
       if (e.cancelable) e.preventDefault();
+      if (touchAxis === null) {
+        const ax = Math.abs(touch.clientX - touchX);
+        const ay = Math.abs(touch.clientY - altTouchY);
+        if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+        touchAxis = ax > ay ? 'x' : 'y';
+      }
+      if (touchAxis === 'x') {
+        const dx = touch.clientX - touchX;
+        touchX = touch.clientX;
+        if (dx !== 0 && viewportEl) {
+          altTouchMoved = true; // a pan is not a tap on touchend
+          viewportEl.scrollLeft -= dx;
+        }
+        return;
+      }
       const dy = touch.clientY - altTouchY;
       altTouchY = touch.clientY;
       if (dy !== 0) {
@@ -6501,6 +6558,20 @@
     e.preventDefault();
     const touch = e.touches.item(0);
     if (!touch) return;
+    if (touchAxis === null) {
+      // Hold still until the finger shows a direction; the held distance is
+      // applied on the locked axis, so nothing is lost.
+      const ax = Math.abs(touch.clientX - touchX);
+      const ay = Math.abs(touch.clientY - touchY);
+      if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+      touchAxis = ax > ay ? 'x' : 'y';
+    }
+    if (touchAxis === 'x') {
+      const dx = touch.clientX - touchX;
+      touchX = touch.clientX;
+      if (dx !== 0 && viewportEl) viewportEl.scrollLeft -= dx;
+      return;
+    }
     const y = touch.clientY;
     const dy = y - touchY;
     touchY = y;
@@ -7556,6 +7627,7 @@
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
   style:--mtv-cw={charW > 0 ? `${charW}px` : '1ch'}
+  style:--mtv-pan-x={fixedGeometry && panX ? `${panX}px` : undefined}
   style:--tfg={palette.defaultFg}
   style:--tbg={palette.defaultBg}
   ontouchstart={onTouchStart}
@@ -7565,6 +7637,7 @@
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
   onwheel={onWheel}
+  onscroll={() => { panX = fixedGeometry && viewportEl ? viewportEl.scrollLeft : 0; }}
   onclick={onClick}
 >
   {#if searchOpen}
@@ -7951,6 +8024,14 @@
   }
   .mtv-fixed.mtv-fit {
     overflow-x: hidden;
+  }
+  .mtv-fixed > .mtv-search,
+  .mtv-fixed > .mtv-v2-status,
+  .mtv-fixed > .mtv-hscroll,
+  .mtv-fixed > .mtv-wait,
+  .mtv-fixed > .mtv-no-scrollback,
+  .mtv-fixed > .mtv-loss-notes {
+    translate: var(--mtv-pan-x, 0px) 0;
   }
   .mtv-v2-status,
   .mtv-hscroll {
