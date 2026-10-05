@@ -1785,7 +1785,7 @@ assert w.contract_state()['attributes']==[48,2,1,2,3], w.contract_state()['attri
 import { v2BirthCheckpoint, evaluateV2Prefix, evaluateV2Rules, v2RuleTable, v2DecisionIncident } from '../src/capture-engine';
 import { V2Jigsaw } from '../src/stream-runtime';
 import { evaluateV2Audit, normalizeV2Capture, v2ScreenDigest } from '../src/tmux-capture-normalize';
-import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, NEWARCH_V2_PREFIX_LIMITS, streamCanonical,
+import { NEWARCH_V2_DEFAULT_CONFIG as v2Config, NEWARCH_V2_PREFIX_LIMITS, streamCanonical, streamCanonicalEncoder,
   v2BirthGeometry, v2DecodePrefixValid, v2Digest, v2RowsSerializedBytes, validateV2Incident,
   type NewarchV2PaneDescriptor, type V2AuditEvidence, type V2LiveCheckpoint } from '../src/stream-contract';
 const v2Pane:NewarchV2PaneDescriptor={schema:'newarch-v2',session:{serverIdentity:'c-private',sessionId:'s'},
@@ -2092,33 +2092,39 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
   const pane={...v2Pane,geometry};
   const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config78);
   const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
-  function checkpointTextBytes(cp:V2LiveCheckpoint): number {
-    // through.byteOffset only grows, so it would hide a later shorter screen
-    // such as CR overwriting "progress" with "DONE". These fixtures put no
-    // JSON escape into cell text, so the UTF-8 text weight tracks the
-    // canonical body. The expect below is still the real 4 MiB ceiling.
-    let weight=cp.state.pendingUtf8.length+cp.state.pendingEscape.length;
-    for(const buffer of [cp.state.normal,cp.state.alternate])
-      for(const row of buffer.rows) for(const cell of row.cells) weight+=Buffer.byteLength(cell.text);
-    return weight;
+  // Every checkpoint a prefix returns is measured against the real 4 MiB
+  // ceiling, once. Results are deep-frozen by v2Immutable, so this one
+  // test-side encoder may keep its memo across prefixes: rows a page did not
+  // touch are the same frozen objects and are encoded once instead of a fresh
+  // ~650 KB canonical per page. Only frozen checkpoints may reach it (the
+  // tripwire); the product still builds one encoder per call.
+  const frozenEncode=streamCanonicalEncoder();
+  const measured=new WeakSet<V2LiveCheckpoint>();
+  function measureCheckpoint(cp:V2LiveCheckpoint): number {
+    if(measured.has(cp))return 0;
+    for(const object of [cp,cp.state,cp.state.normal,cp.state.normal.rows,cp.state.alternate,cp.state.alternate.rows])
+      expect(Object.isFrozen(object)).toBe(true);
+    expect(Buffer.byteLength(streamCanonical(cp,frozenEncode))).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
+    measured.add(cp);return 1;
   }
   function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length],initial=birth()) {
-    let cp=initial, offeredStart=initial.through.byteOffset,stopCount=0,prefixCount=0;
-    let heaviest=cp, heaviestWeight=checkpointTextBytes(cp);
+    let cp=initial, offeredStart=initial.through.byteOffset,stopCount=0,prefixCount=0,measuredCount=0;
+    // The contract input is number[]: convert once per burst, slice per prefix.
+    const bytes:number[]=Array.from(raw);
+    measureCheckpoint(initial);
     const rows:{id:SC.CommittedStreamRow['id'];text:string;originCount:number;originEnd:number}[]=[];
     for(const packetEnd of packetEnds) {
       expect(packetEnd).toBeGreaterThanOrEqual(offeredStart);
       while(offeredStart<packetEnd) {
         const input={pane,checkpoint:cp,raw:{epoch:v2Epoch,start:offeredStart,end:packetEnd},
-          bytes:raw.subarray(offeredStart,packetEnd) as unknown as readonly number[],observedAtMonoMs:1,pendingSinceMonoMs:null};
+          bytes:bytes.slice(offeredStart,packetEnd),observedAtMonoMs:1,pendingSinceMonoMs:null};
         const result=evaluateV2Prefix(input,config78,v2Clock);
         if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
         if(prefixCount===0)expect(v2DecodePrefixValid(result,cp)).toBe(true);
         expect(result.rows.length).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRows);
         expect(result.serializedBytes).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
         expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
-        const weight=checkpointTextBytes(result.checkpoint);
-        if(weight>=heaviestWeight){heaviest=result.checkpoint;heaviestWeight=weight;}
+        measuredCount+=measureCheckpoint(result.checkpoint);
         expect(result.rows.every(row=>row.cellOrigins.length===row.cells.length)).toBe(true);
         expect(result.rows.every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
         // A fresh canonical of every page was ~0.9s on 90 prefixes and ate the
@@ -2134,7 +2140,7 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
         cp=result.checkpoint;offeredStart=result.consumed.end;
       }
     }
-    expect(Buffer.byteLength(streamCanonical(heaviest))).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
+    expect(measuredCount).toBe(prefixCount);
     return {rows,stopCount,prefixCount,checkpoint:cp};
   }
   function chronology(decoded:ReturnType<typeof decodePackets>): string[] {
@@ -2201,6 +2207,23 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
       expect(split.rows).toEqual(want);
     }
   });
+
+  test('a checkpoint edited after an earlier call is re-encoded by the next call',()=>{
+    // The shared encoder lives for one evaluateV2Prefix call. A caller that
+    // edits a cell of a mutable checkpoint it already passed in, without a new
+    // stateDigest, must get a gap next time, never a memo from the last call.
+    const bytes=[...Buffer.from('row\r\n'.repeat(4))];
+    const cp=structuredClone(birth()),run=()=>evaluateV2Prefix({pane,checkpoint:cp,
+      raw:{epoch:v2Epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null},config78,v2Clock);
+    expect(Object.isFrozen(cp)).toBe(false);
+    const first=run();
+    expect('kind' in first).toBe(false);
+    expect(streamCanonical(run())).toBe(streamCanonical(first));
+    (cp.state.normal.rows[0]!.cells as {text:string}[])[0]={...cp.state.normal.rows[0]!.cells[0]!,text:'X'};
+    const second=run();
+    expect('kind' in second && second.kind).toBe('gap');
+    if('kind' in second && second.kind==='gap')expect(second.incident.reason).toBe('decoder-anomaly');
+  });
 });
 
 test('B1 ACK suffix mutation is rejected by the prefix fixture',()=>{
@@ -2238,6 +2261,44 @@ assert.ok(result.consumed.end<result.offered.end);`);
   } finally {
     writeFileSync(subject,original);
     expect(readFileSync(subject,'utf8')).toBe(original);
+    rmSync(root,{recursive:true,force:true});
+  }
+});
+
+test('B1 encoder made a cross-call singleton is caught by the per-call regression',()=>{
+  // Review MINOR-4 mutant: someone hoists the per-call encoder to a module
+  // singleton for speed. The edited-after-call checkpoint must then be
+  // accepted (memo from the previous call), which the real code refuses.
+  const root=mkdtempSync(join(tmpdir(),'b1-encoder-singleton-'));
+  const subject=join(root,'subject.ts');
+  const original=readFileSync(new URL('../src/capture-engine.ts',import.meta.url),'utf8')
+    .replaceAll("from './stream-contract'",`from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)}`)
+    .replaceAll("from './tmux-capture-normalize'",`from ${JSON.stringify(new URL('../src/tmux-capture-normalize.ts',import.meta.url).pathname)}`)
+    .replaceAll("from '@thumbmux/core'",`from ${JSON.stringify(import.meta.resolve('@thumbmux/core'))}`);
+  const needle='const encode = streamCanonicalEncoder();';
+  expect(original.split(needle)).toHaveLength(2);
+  try {
+    writeFileSync(join(root,'runner.ts'),`import assert from 'node:assert/strict';
+import {v2BirthCheckpoint,evaluateV2Prefix} from './subject.ts';
+import {v2BirthGeometry} from ${JSON.stringify(new URL('../src/stream-contract.ts',import.meta.url).pathname)};
+const config=${JSON.stringify({...v2Config,geometry:{columns:78,rows:120}})};
+const pane={...${JSON.stringify(v2Pane)},geometry:v2BirthGeometry(config)};
+const epoch=${JSON.stringify(v2Epoch)};
+const cp=structuredClone(v2BirthCheckpoint(pane,{epoch,byteOffset:0},config));
+const bytes=[...Buffer.from('row\\r\\n'.repeat(4))];
+const run=()=>evaluateV2Prefix({pane,checkpoint:cp,raw:{epoch,start:0,end:bytes.length},bytes,observedAtMonoMs:1,pendingSinceMonoMs:null},config);
+assert.ok(!('kind' in run()),'fixture must decode the untouched checkpoint');
+cp.state.normal.rows[0].cells[0]={...cp.state.normal.rows[0].cells[0],text:'X'};
+assert.equal(run().kind,'gap','B1 encoder memo crossed calls');`);
+    for(const mutated of [false,true]) {
+      writeFileSync(subject,mutated?original.replace(needle,
+        'const encode = ((globalThis as {b1Encode?: (value: unknown) => string}).b1Encode ??= streamCanonicalEncoder());'):original);
+      const result=spawnSync(process.execPath,[join(root,'runner.ts')],{encoding:'utf8',timeout:10000});
+      console.log('B1_ENCODER_MUTANT',JSON.stringify({mutated,exit:result.status,stderr:result.stderr.slice(0,400)}));
+      expect(result.status).toBe(mutated?1:0);
+      if(mutated)expect(result.stderr).toContain('B1 encoder memo crossed calls');
+    }
+  } finally {
     rmSync(root,{recursive:true,force:true});
   }
 });
