@@ -896,7 +896,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
   close(): void { if (!this.closed) { for (const release of this.replayReleases) release(); this.db.close(); this.writerLock.close(); this.closed = true; fhPaths.delete(this.root); } }
   private live(): void { fhAssert(!this.closed, 'flag-on store closed'); fhAssert(!this.options[V2_STORE], 'v2 requires capture capability'); }
   /** Internal factory hook; the backing store is never exposed to consumers. */
-  openV2(key: symbol, request: Parameters<V2HistoryFactory['openForCapture']>[0], hooks: V2HistoryOptions): V2Opened {
+  openV2(key: symbol, request: Parameters<V2HistoryFactory['openForCapture']>[0], hooks: V2HistoryOptions): V2OpenedWithAuthority {
     fhAssert(key === V2_STORE && this.options[V2_STORE] && !this.closed, 'v2 factory only');
     return new V2Storage(this.db, this.root, this.storeUUID, request, hooks, () => this.close()).ports();
   }
@@ -1756,12 +1756,13 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
 // it does not expose the backing store or a legacy write port to its callers.
 import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint, validateV2Incident,
   validateV2ReadRequest, v2Digest, v2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
-  v2AuditComparable } from './stream-contract';
+  v2AuditComparable, v2WriterGeneration } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
   V2WriteRequest, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
   V2SessionReservationReceipt, V2CancelBirth, V2LiveCheckpoint, V2AuditResult, V2HistoryPage,
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
-  NewarchV2HistoryRequest, NewarchV2HistoryCursor } from './stream-contract';
+  NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
+  V2RawPinCensus, V2WriterGeneration, PipeEpoch } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
 function v2Failure(error: unknown): StreamFailure {
   const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
@@ -1772,7 +1773,11 @@ function v2Failure(error: unknown): StreamFailure {
     return { status: 'error', code: 'io', message: String(error) };
   return fail(error);
 }
-type V2Opened = { capability: V2WriterCapability; writer: V2HistoryWriter; reader: V2HistoryReader };
+export type V2OpenedWithAuthority = { capability: V2WriterCapability; writer: V2HistoryWriter;
+  reader: V2HistoryReader; authority: V2HistoryAuthority };
+export type V2FactoryWithAuthority = Omit<V2HistoryFactory, 'openForCapture'> & {
+  openForCapture(request: Parameters<V2HistoryFactory['openForCapture']>[0]): Promise<Result<V2OpenedWithAuthority>>;
+};
 export interface V2HistoryOptions {
   /** Tests kill/throw at real transaction boundaries. Never an alternate writer. */
   boundary?: (phase: string) => void;
@@ -1783,8 +1788,8 @@ export interface V2HistoryOptions {
   /** O's bounded restore cache. Null/missing stays blocked, never becomes EOF. */
   remoteRow?: (locator: V2RemoteLocator, row: SegmentRowId) => Result<CommittedStreamRow | null>;
 }
-export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2HistoryFactory {
-  return Object.freeze({ async openForCapture(request: Parameters<V2HistoryFactory['openForCapture']>[0]): Promise<Result<V2Opened>> {
+export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryWithAuthority {
+  return Object.freeze({ async openForCapture(request: Parameters<V2HistoryFactory['openForCapture']>[0]): Promise<Result<V2OpenedWithAuthority>> {
     let store: FlagOnHistoryStore | undefined;
     try {
       validateV2Config(request.config); nonempty(request.engineId); nonempty(request.rootId);
@@ -1832,7 +1837,7 @@ class V2Storage {
     const allowance = this.#config.storage.rootCapBytes - this.#config.storage.emergencyReserveBytes;
     db.exec(`PRAGMA max_page_count=${Math.floor(allowance / 8192)};`); // includes room for WAL
   }
-  ports(): V2Opened {
+  ports(): V2OpenedWithAuthority {
     const writer: V2HistoryWriter = Object.freeze({
       commit: (c: V2WriterCapability, r: V2WriteRequest) => this.commit(c, r),
       reserveBirth: (c: V2WriterCapability, r: V2SessionReservation) => this.reserve(c, r),
@@ -1853,7 +1858,12 @@ class V2Storage {
       panes: (s: NewarchV2SessionKey, cursor: string | null) => this.read(() => this.panes(s, cursor)),
       page: async (r: NewarchV2HistoryRequest) => this.read(() => this.page(r)),
     });
-    return { capability: this.#cap, writer, reader };
+    const authority: V2HistoryAuthority = Object.freeze({
+      writerGeneration: () => this.authorityRead(() => this.currentGeneration()),
+      incidentResolution: (pane: PaneKey, incidentId: string) => this.authorityRead(() => this.incidentResolution(pane, incidentId)),
+      rawPins: (pane: PaneKey, epoch: PipeEpoch) => this.authorityRead(() => this.rawPins(pane, epoch)),
+    });
+    return { capability: this.#cap, writer, reader, authority };
   }
   private live(): void { fhAssert(!this.#closed, 'v2 store closed'); }
   private authorize(c: V2WriterCapability): void {
@@ -1862,6 +1872,34 @@ class V2Storage {
     fhAssert(row.generation === c.generation, 'v2 stale generation');
   }
   private read<T>(f: () => T): Result<T> { try { this.live(); return ok(f()); } catch (e) { return v2Failure(e); } }
+  private authorityRead<T>(f: () => T): Result<T> {
+    try { this.live(); return ok(this.#db.transaction(f)()); } catch (e) { return v2Failure(e); }
+  }
+  private currentGeneration(): V2WriterGeneration {
+    const row = this.#db.query('SELECT generation FROM fh_v2_meta WHERE id=1').get() as SqlRow;
+    return v2WriterGeneration(Number(row.generation));
+  }
+  private incidentResolution(pane: PaneKey, incidentId: string): V2IncidentResolution | null {
+    nonempty(incidentId); const key = v2PaneKey(pane);
+    const resolved = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);
+    if (resolved) return resolved;
+    const incident = this.get<NewarchV2Incident>('incident', key, incidentId);
+    if (!incident) return null;
+    return { schema: 'newarch-v2', pane, incidentId, state: 'pending', receipt: null,
+      writerGeneration: this.currentGeneration() };
+  }
+  private rawPins(pane: PaneKey, epoch: PipeEpoch): V2RawPinCensus {
+    const key = v2PaneKey(pane), checkpoint = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
+    fhAssert(checkpoint && equal(checkpoint.through.epoch, epoch), 'v2 raw pin epoch/checkpoint');
+    let rowPins = 0;
+    for (const row of this.#db.query("SELECT id FROM fh_v2_object WHERE kind='pin' AND pane=?").iterate(key) as Iterable<SqlRow>) {
+      const pin = this.get<{ segmentId: string; released: boolean }>('pin', key, String(row.id));
+      if (pin && !pin.released) rowPins++;
+    }
+    return { schema: 'newarch-v2', pane, epoch: checkpoint.through.epoch, revision: checkpoint.revision,
+      writerGeneration: this.currentGeneration(), rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`,
+        holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins };
+  }
   private tx<T>(cap: V2WriterCapability, phase: string, f: () => T): Result<T> {
     try {
       this.live();
@@ -1986,6 +2024,7 @@ class V2Storage {
         pane: r.fence.pane, digest: r.fence.digest, commitId, generation: cap.generation, revision,
         frontier: owner.frontier, checkpointId: this.get<V2LiveCheckpoint>('checkpoint', key, 'live')?.checkpointId ?? null };
       let next = { ...owner, durableRevision: revision, generation: cap.generation };
+      const resolvedIncidents: string[] = [];
       const addIncident = (incident: NewarchV2Incident) => {
         validateV2Incident(incident);
         fhAssert(equal(incident.pane, r.fence.pane) && equal(incident.geometry, owner!.pane.geometry)
@@ -1997,8 +2036,10 @@ class V2Storage {
         });
         fhAssert(positions[0] === null || positions[1] === null || positions[0]! <= positions[1]!, 'v2 incident reversed interval');
         const old = this.get<NewarchV2Incident>('incident', key, incident.incidentId);
-        if (old) fhAssert(equal(old, incident), 'v2 incident collision');
-        else { this.put('incident', key, incident.incidentId, incident); this.append(key, revision, 'incident', incident.incidentId, '', incident); }
+        fhAssert(!old, old && equal(old, incident) ? 'v2 incident already materialized' : 'v2 incident collision');
+        this.put('incident', key, incident.incidentId, incident);
+        this.append(key, revision, 'incident', incident.incidentId, '', incident);
+        resolvedIncidents.push(incident.incidentId);
         next = { ...next, incidentId: incident.incidentId,
           pane: { ...next.pane, state: incident.action === 'gap-and-stop' && next.pane.state !== 'unrecorded' ? 'stopped' : next.pane.state } };
       };
@@ -2090,7 +2131,12 @@ class V2Storage {
       }
       this.putOwner(next);
       const completed = { ...receipt, frontier: next.frontier };
-      this.put('receipt', key, r.fence.operationId, completed); return completed;
+      this.put('receipt', key, r.fence.operationId, completed);
+      for (const incidentId of resolvedIncidents) this.put('incident-resolution', key, incidentId, {
+        schema: 'newarch-v2', pane: r.fence.pane, incidentId, state: 'resolved', receipt: completed,
+        writerGeneration: v2WriterGeneration(cap.generation),
+      } satisfies V2IncidentResolution);
+      return completed;
     });
     if (result.status === 'ok' && r.command.kind === 'reclaim') {
       try { this.cleanupReclaim(cap, r.fence.pane, r.command.segmentId); } catch (e) { return v2Failure(e); }
