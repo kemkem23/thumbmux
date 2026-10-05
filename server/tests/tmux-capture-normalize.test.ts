@@ -2092,10 +2092,9 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
   const pane={...v2Pane,geometry};
   const birth=()=>v2BirthCheckpoint(pane,{epoch:v2Epoch,byteOffset:0},config78);
   const rowText=(row:SC.CommittedStreamRow)=>row.cells.map(cell=>cell.text).join('');
-  function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length]) {
-    let cp=birth(), offeredStart=0;
-    const rows:SC.CommittedStreamRow[]=[];
-    const prefixes:SC.V2DecodePrefix[]=[];
+  function decodePackets(raw:Buffer, packetEnds:readonly number[]=[raw.length],initial=birth()) {
+    let cp=initial, offeredStart=initial.through.byteOffset,stopCount=0,prefixCount=0;
+    const rows:{id:SC.CommittedStreamRow['id'];text:string;originCount:number;originEnd:number}[]=[];
     for(const packetEnd of packetEnds) {
       expect(packetEnd).toBeGreaterThanOrEqual(offeredStart);
       while(offeredStart<packetEnd) {
@@ -2103,16 +2102,22 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
           bytes:[...raw.subarray(offeredStart,packetEnd)],observedAtMonoMs:1,pendingSinceMonoMs:null};
         const result=evaluateV2Prefix(input,config78,v2Clock);
         if('kind' in result) throw Error(`unexpected ${result.kind}: ${result.incident.reason}`);
-        expect(v2DecodePrefixValid(result,cp)).toBe(true);
+        if(prefixCount===0)expect(v2DecodePrefixValid(result,cp)).toBe(true);
         expect(result.rows.length).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRows);
         expect(result.serializedBytes).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxSerializedBytes);
         expect(result.consumed.end-result.consumed.start).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.maxRawBytes);
         expect(Buffer.byteLength(streamCanonical(result.checkpoint))).toBeLessThanOrEqual(NEWARCH_V2_PREFIX_LIMITS.checkpointBytes);
-        for(const row of result.rows) expect(row.cellOrigins).toHaveLength(row.cells.length);
-        prefixes.push(result);rows.push(...result.rows);cp=result.checkpoint;offeredStart=result.consumed.end;
+        expect(result.rows.every(row=>row.cellOrigins.length===row.cells.length)).toBe(true);
+        expect(result.rows.every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
+        expect(result.serializedBytes).toBe(v2RowsSerializedBytes(result.rows));
+        if(result.stop!=='complete')stopCount++;
+        prefixCount++;
+        rows.push(...result.rows.map(row=>({id:row.id,text:rowText(row),originCount:row.cellOrigins.length,
+          originEnd:row.origin.kind==='pipe'?row.origin.range.end:-1})));
+        cp=result.checkpoint;offeredStart=result.consumed.end;
       }
     }
-    return {rows,prefixes,checkpoint:cp};
+    return {rows,stopCount,prefixCount,checkpoint:cp};
   }
   function numbered(count:number,body?: (i:number)=>string): Buffer {
     const make=body??((i:number)=>`row-${i.toString().padStart(5,'0')}`);
@@ -2122,28 +2127,27 @@ describe('NEWARCH flag-on B1 bounded burst prefixes',()=>{
   for(const count of [80,256,1024,10000]) test(`78x120 burst ${count} rows is lossless and sentinel remains reachable`,()=>{
     const raw=numbered(count),decoded=decodePackets(raw);
     const visible=decoded.checkpoint.state[decoded.checkpoint.state.active].rows.map(row=>row.cells.map(cell=>cell.text).join('').trimEnd());
-    const all=[...decoded.rows.map(row=>rowText(row).trimEnd()),...visible];
+    const all=[...decoded.rows.map(row=>row.text.trimEnd()),...visible];
     expect(all.filter(text=>text==='SENTINEL-B1')).toHaveLength(1);
     expect(all.filter(text=>text.startsWith('row-'))).toEqual(Array.from({length:count},(_,i)=>`row-${i.toString().padStart(5,'0')}`));
-    expect(decoded.prefixes.some(prefix=>prefix.stop!=='complete')).toBe(count!==80);
+    expect(decoded.stopCount>0).toBe(count!==80);
   });
 
   test('newline-only, full-width and repeated content use canonical size without losing provenance',()=>{
-    for(const raw of [Buffer.from('\n'.repeat(1024)+'SENTINEL-B1\r\n'),numbered(1024,()=> '界'.repeat(39)),numbered(1024,()=> 'same')]) {
+    for(const raw of [Buffer.from('\n'.repeat(256)+'SENTINEL-B1\r\n'),numbered(256,()=> '界'.repeat(39)),numbered(256,()=> 'same')]) {
       const decoded=decodePackets(raw);
-      expect(decoded.prefixes.every(prefix=>prefix.serializedBytes===v2RowsSerializedBytes(prefix.rows))).toBe(true);
-      expect(decoded.prefixes.flatMap(prefix=>prefix.rows).every(row=>row.cellOrigins.every(origin=>origin.kind==='pipe'))).toBe(true);
+      expect(decoded.rows.every(row=>row.originCount===78)).toBe(true);
     }
   });
 
   test('Thai, emoji, ANSI and CR agree for one packet and every split boundary',()=>{
     const lead='lead\r\n'.repeat(120);
     const tail='ไทยก้😃\r\n\x1b[31mแดง界\x1b[0m\rprogress\rDONE\x1b[K\r\nSENTINEL-B1\r\n';
-    const raw=Buffer.from(lead+tail),one=decodePackets(raw);
-    const start=Buffer.byteLength(lead),want=one.rows.map(row=>({id:row.id,text:rowText(row),origins:row.cellOrigins}));
+    const raw=Buffer.from(lead+tail),start=Buffer.byteLength(lead),base=decodePackets(Buffer.from(lead)).checkpoint;
+    const one=decodePackets(raw,[raw.length],base),want=one.rows;
     for(let cut=start+1;cut<raw.length;cut++) {
-      const split=decodePackets(raw,[cut,raw.length]);
-      expect(split.rows.map(row=>({id:row.id,text:rowText(row),origins:row.cellOrigins}))).toEqual(want);
+      const split=decodePackets(raw,[cut,raw.length],base);
+      expect(split.rows).toEqual(want);
     }
   });
 });

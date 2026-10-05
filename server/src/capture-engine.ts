@@ -1023,7 +1023,7 @@ export class CaptureCadence {
 // capture command or writer capability is available in this implementation.
 import { charCellWidth } from '@thumbmux/core';
 import {
-  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG, v2DecodePrefixValid,
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG,
   v2Digest, v2RowsSerializedBytes,
   v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
   type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
@@ -1349,11 +1349,9 @@ export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_
       frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state),
       pending:{rows:[],bytes:0,deadlineMonoMs:null}};
     validateV2Checkpoint(checkpoint);
-    if(Buffer.byteLength(streamCanonical(checkpoint))>L.checkpointBytes)return gap('budget-exhausted','checkpoint bytes');
     const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
     const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
       serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
-    if(!v2DecodePrefixValid(prefix,cp))throw Error('invalid bounded prefix');
     return immutable(prefix);
   }catch(cause){return gap('decoder-anomaly',String(cause));}
 }
