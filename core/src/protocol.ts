@@ -795,3 +795,74 @@ export type NewarchV2OutputFrame = (Omit<MuxFullOutputFrame, 'newarch'> | Omit<M
 
 /** Immutable collector incarnation + attachment, never host receive order. */
 export interface NewarchV2SourceEpoch { readonly attachId: string; readonly collectorIncarnation: string }
+
+/** Q22 flag-on (K, 2026-10-05): v2 history request/reply on the mux socket.
+ * Additive and separate from `history_expand`/`history` (legacy line anchors):
+ * legacy clients never see these frames and a v2 cursor is never flattened to
+ * a line number. D3 wires them; D1 answers from H through NewarchV2Display.
+ * Numbers mirror NEWARCH_V2_LIMITS (server) and are asserted equal by K. */
+export const NEWARCH_V2_WIRE_LIMITS = Object.freeze({
+  pageEntries: 256, pageBytes: 2 * 1024 * 1024, cursorBytes: 4096,
+} as const);
+/** Screen projection of a committed row: provenance (cellOrigins) stays server-side. */
+export interface NewarchV2WireCell {
+  readonly text: string; readonly width: 0 | 1 | 2; readonly style: readonly number[];
+}
+export interface NewarchV2WireRow {
+  readonly kind: 'row'; readonly id: NewarchRowId; readonly cells: readonly NewarchV2WireCell[];
+  readonly wrapStatus: 'wrapped' | 'unwrapped' | 'unknown'; readonly wrapPad: number;
+}
+export type NewarchV2WireEntry = NewarchV2WireRow
+  | { readonly kind: 'incident'; readonly incident: NewarchV2Incident };
+/** Client -> server. requestId is client-chosen, echoed verbatim. */
+export interface NewarchV2HistoryExpandMessage {
+  readonly type: 'history_expand_v2'; readonly session: string; readonly requestId: string;
+  readonly request: NewarchV2HistoryRequest;
+}
+export type NewarchV2HistoryErrorCode = 'wrong-pane' | 'stale-cursor' | 'bounded-read'
+  | 'owner-unavailable' | 'unsupported';
+/** Server -> client. Entries are ascending timeline order in either direction.
+ * An error is never an empty ok page; blocked continuation is never `end`. */
+export type NewarchV2HistoryReply =
+  | { readonly schema: typeof NEWARCH_V2_SCHEMA; readonly type: 'history_v2'; readonly channel: string;
+      readonly requestId: string; readonly status: 'ok'; readonly pane: NewarchPaneKey; readonly revision: number;
+      readonly entries: readonly NewarchV2WireEntry[]; readonly payloadBytes: number;
+      readonly states: readonly NewarchV2ReadState[];
+      readonly before: NewarchV2Continuation; readonly after: NewarchV2Continuation }
+  | { readonly schema: typeof NEWARCH_V2_SCHEMA; readonly type: 'history_v2'; readonly channel: string;
+      readonly requestId: string; readonly status: 'error'; readonly pane: NewarchPaneKey;
+      readonly code: NewarchV2HistoryErrorCode; readonly retryAfterMs: number | null };
+export function newarchV2SamePane(a: NewarchPaneKey, b: NewarchPaneKey): boolean {
+  return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
+}
+/** Client-side invalidation: keep a cursor only for the SAME pane identity
+ * (server lifetime + pane id + birth generation). A new session/pane, a reused
+ * pane id or a restarted server drops it; never send a stale cursor. */
+export function newarchV2CursorFor(pane: NewarchV2PaneDescriptor, cursor: NewarchV2HistoryCursor | null): NewarchV2HistoryCursor | null {
+  return cursor && cursor.schema === NEWARCH_V2_SCHEMA && newarchV2SamePane(cursor.pane, pane.pane) ? cursor : null;
+}
+function newarchV2EntryPane(e: NewarchV2WireEntry): NewarchPaneKey {
+  return e.kind === 'row' ? e.id.pane : e.incident.pane;
+}
+function newarchV2ContinuationPane(c: NewarchV2Continuation): NewarchPaneKey | null {
+  return c.kind === 'end' ? null : c.cursor.pane;
+}
+/** Both sides check a reply against the request it answers: same request id,
+ * channel and pane; every entry/cursor on that pane; within the request bounds;
+ * revision not behind the cursor it was asked with. */
+export function newarchV2ReplyMatches(message: NewarchV2HistoryExpandMessage, reply: NewarchV2HistoryReply): boolean {
+  const req = message.request;
+  if (reply.schema !== NEWARCH_V2_SCHEMA || reply.type !== 'history_v2' || req.schema !== NEWARCH_V2_SCHEMA
+    || reply.requestId !== message.requestId || reply.channel !== message.session
+    || !newarchV2SamePane(reply.pane, req.pane)) return false;
+  if (reply.status === 'error') return true;
+  const minRevision = req.cursor ? req.cursor.timelineRevision : 0;
+  return Number.isSafeInteger(reply.revision) && reply.revision >= minRevision
+    && Number.isSafeInteger(reply.payloadBytes) && reply.payloadBytes >= 0
+    && reply.entries.length <= req.maxEntries && reply.payloadBytes <= req.maxBytes
+    && reply.entries.every(e => newarchV2SamePane(newarchV2EntryPane(e), req.pane))
+    && [reply.before, reply.after].every(c => {
+      const p = newarchV2ContinuationPane(c);
+      return p === null || newarchV2SamePane(p, req.pane);
+    });
+}
