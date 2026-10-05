@@ -1601,12 +1601,19 @@ test('D2: capture-heavy async ingest scans archives on a small fraction of commi
  let raw=0;const seen={refused:0};
  try {
   // Six panes in lockstep: their blocks seal in the same commits, more than one commit's archive cap.
-  for(let i=0;i<1000;i++)for(const [p,key] of keys.entries()) {
+  for(let i=0;i<1000;i++) {
+  for(const [p,key] of keys.entries()) {
    raw+=Buffer.byteLength(text(p,i));
    await naStore(s,{...naEvent(text(p,i),i+1,key)},seen);
    if(i%2===1)await s.calibrate({capture:{...naFrame(),paneKey:key,captureId:`p${p}-c${i}`,requestedAt:i,completedAt:i+0.5,firstHistoryRow:0,
     history:[i-1,i].map(l=>naRow(text(p,l))),observedFields:['grapheme'],ambiguousRows:0,result:'exact'},
     expectedRevision:s.token(key).revision,checks:[{lineId:i-1,captureRow:0},{lineId:i,captureRow:1}],repairs:[]});
+  }
+  // Pace on the async durable ACK after each calibrated round. Unpaced, the worker folds however many rounds
+  // thread scheduling and fsync latency let pile up into one commit: the live-DB high-water then ranged
+  // 1.21-1.48 (GitHub runner; bound 1.5) and the commit count 51-706 against ~30 scans. Paced, every commit
+  // carries at most two rounds: >= 500 commits, and a live DB of 1.22-1.27 over 12 local runs.
+  if(i%2===1)await Promise.all(keys.map(key=>s.durable(key,s.token(key).revision)));
   }
   const settle=Date.now();while(s.health().pendingBytes>0 && Date.now()-settle<10000)await Bun.sleep(10);
   expect(s.health().pendingBytes).toBe(0);

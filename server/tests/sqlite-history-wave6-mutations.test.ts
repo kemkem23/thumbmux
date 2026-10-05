@@ -200,6 +200,8 @@ test('D2 archive scheduling and receipt lookup mutants are each killed by a D2 t
       const killedBy = [...output.matchAll(/\(fail\) (D2:[^\[\n]*)/g)].map(m => m[1].trim().slice(0, 60));
       console.log('D2_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed, killedBy: [...new Set(killedBy)] }));
       if (code !== 0 && !failed) console.log('D2_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      // A red clean copy is the harness's own failure: print why, or CI shows only the test name.
+      if (code !== 0 && name.startsWith('clean')) console.log('D2_CLEAN_COPY_OUTPUT', output.slice(-4000));
       return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
     const before = await run('clean-before');
@@ -268,6 +270,8 @@ test('D3 tail seal and quiet archive mutants are each killed by a D3 test; the c
       const killedBy = [...output.matchAll(/\(fail\) (D3:[^\[\n]*)/g)].map(m => m[1].trim().slice(0, 60));
       console.log('D3_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed, killedBy: [...new Set(killedBy)] }));
       if (code !== 0 && !failed) console.log('D3_MUTANT_INVALID_OUTPUT', output.slice(-4000));
+      // A red clean copy is the harness's own failure: print why, or CI shows only the test name.
+      if (code !== 0 && name.startsWith('clean')) console.log('D3_CLEAN_COPY_OUTPUT', output.slice(-4000));
       return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
     const before = await run('clean-before');
