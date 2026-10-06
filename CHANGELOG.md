@@ -1,9 +1,9 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.21.0-dist`.
 
-## Unreleased
+## v0.21.0 — 2026-10-07
 
 ### Added — exact COMPOSE submit and structured prompt history (WRAPJOINED WJ-A)
 
