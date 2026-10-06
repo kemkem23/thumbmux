@@ -2498,9 +2498,12 @@ test('HS2 page limit follows the real page size', async () => {
     reserveSharedBytes: 512 * 1024, diagnosticCapBytes: 64 * 1024, stagingCapBytes: 512 * 1024 };
   const f = await h2fixture({}, { config: { ...H2.NEWARCH_V2_DEFAULT_CONFIG, maxActivePanes: 1, storage } });
   try {
-    await f.activate(); h2value(await f.port.writer.close(f.port.capability));
+    // Convert before the first commit: on Bun 1.3.11 a closed H connection
+    // that has committed still holds its WAL lock (journal_mode switch = BUSY).
+    h2value(await f.port.writer.close(f.port.capability));
     hs1Db(f.root, db => db.exec('PRAGMA journal_mode=DELETE; PRAGMA page_size=8192; VACUUM; PRAGMA journal_mode=WAL;'));
-    await f.reload();
+    expect(hs1Db(f.root, db => (db.query('PRAGMA page_size').get() as { page_size: number }).page_size)).toBe(8192);
+    await f.reload(); await f.activate();
     let through = 0, ordinal = 0, segment = 0, committed = 0, failed: H2.Result<H2.V2Receipt> | null = null;
     for (let n = 0; n < 400 && !failed; n++) {
       if (ordinal >= 200) { segment++; ordinal = 0; }
