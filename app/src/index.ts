@@ -8,8 +8,10 @@ export type {
   AppAdapters,
   AppLabels,
   HubPresentationOptions,
+  PromptEntry,
   SessionActionContext,
   SessionPresentationOptions,
+  SubmissionReceipt,
   SubmissionTransport,
 } from './config';
 export {
