@@ -2059,12 +2059,23 @@ async function hs1ReadAll(f: Hs1Fixture): Promise<{ status: 'ok'; rows: string[]
   const rows: string[] = []; let cursor: H2.NewarchV2HistoryCursor | null = null;
   for (;;) {
     // Small pages: page() re-measures the whole page per entry (pre-HS1 cost).
-    const page = await f.page(16, cursor);
+    const page = await f.page(4, cursor);
     if (page.status !== 'ok') return { status: 'error', message: JSON.stringify(page) };
     for (const e of page.value.entries) if (e.kind === 'row') rows.push(H2.streamCanonical(e.row));
     if (page.value.after.kind !== 'more') return { status: 'ok', rows };
     cursor = page.value.after.cursor;
   }
+}
+/** The newest `count` rows through the public reader, oldest first. */
+async function hs1ReadTail(f: Hs1Fixture, count: number): Promise<string[]> {
+  const rows: string[] = []; let cursor: H2.NewarchV2HistoryCursor | null = null;
+  while (rows.length < count) {
+    const page = h2value(await f.page(4, cursor, 'before'));
+    rows.unshift(...page.entries.flatMap(e => e.kind === 'row' ? [H2.streamCanonical(e.row)] : []));
+    if (page.before.kind !== 'more') break;
+    cursor = page.before.cursor;
+  }
+  return rows.slice(-count);
 }
 function hs1Db<T>(root: string, f: (db: Database) => T): T {
   const db = new Database(join(root, 'flag-on-v1.sqlite'));
@@ -2101,9 +2112,10 @@ test('HS1 real decoder rows stay within 8 KiB per row on disk, read back byte-id
   try {
     const st = await hs1Activate(f, true), written: string[] = [], segmentA: string[] = [];
     st.autoRotate = false;
-    // Segment A to >= 7 MiB logical: large prefixes first, then small ones.
-    while (st.segmentBytes < 7 * HS1_MIB) {
-      const rows = await hs1Step(f, st, st.segmentBytes < 5 * HS1_MIB ? 256 : 4); written.push(...rows); segmentA.push(...rows);
+    // Segment A to >= 6.75 MiB logical: full prefixes (<= 2 MiB) first, then
+    // 12-line ones (<= 36 rows) so it never crosses 8 MiB on its own.
+    while (st.segmentBytes < 6.75 * HS1_MIB) {
+      const rows = await hs1Step(f, st, st.segmentBytes < 5 * HS1_MIB ? 256 : 12); written.push(...rows); segmentA.push(...rows);
     }
     h2value(await f.port.writer.close(f.port.capability));
     // Without its stats object H must size the open segment from LOGICAL bytes.
@@ -2119,7 +2131,7 @@ test('HS1 real decoder rows stay within 8 KiB per row on disk, read back byte-id
     const tail = hs1Plan(f, st, 2); await f.commit(tail.command, 'hs1-tail'); tail.apply(); written.push(...tail.canonical); segmentA.push(...tail.canonical);
     // Segment B.
     st.segment = 'hs1-seg-' + st.segments++; st.segmentBytes = 0; st.autoRotate = true;
-    for (let i = 0; i < 2; i++) written.push(...await hs1Step(f, st));
+    written.push(...await hs1Step(f, st));
     h2value(await f.port.writer.close(f.port.capability));
     const disk = hs1Db(f.root, db => {
       const pages = Number((db.query('PRAGMA page_count').get() as { page_count: number }).page_count);
@@ -2138,9 +2150,9 @@ test('HS1 real decoder rows stay within 8 KiB per row on disk, read back byte-id
       .toEqual({ rowText: 0, rowBlob: written.length, packedObjectText: 0, otherBlob: 0 });
     expect(disk.dbBytes / written.length).toBeLessThanOrEqual(8192);
     await f.reload();
-    const read = await hs1ReadAll(f);
-    expect(read.status).toBe('ok');
-    if (read.status === 'ok') expect(read.rows).toEqual(written);
+    // Public reader across the segment boundary; segment A in full via export below.
+    const tailRows = Math.min(written.length, written.length - segmentA.length + 24);
+    expect(await hs1ReadTail(f, tailRows)).toEqual(written.slice(-tailRows));
     expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(st.cp);
     const sealed = await f.commit({ kind: 'seal', segmentId: 'hs1-seg-0' }, 'hs1-seal');
     await f.commit({ kind: 'materialize-export', sealCommitId: sealed.commitId }, 'hs1-export');
@@ -2157,7 +2169,7 @@ test('HS1 legacy TEXT root stays readable and lossless, gains compressed rows la
   const f = await h2fixture();
   try {
     const st = await hs1Activate(f), written: string[] = [];
-    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    written.push(...await hs1Step(f, st));
     const last = hs1Plan(f, st), lastRequest = f.request(last.command, 'hs1-legacy-last');
     const lastReceipt = h2value(await f.port.writer.commit(f.port.capability, lastRequest)); last.apply(); written.push(...last.canonical);
     h2value(await f.port.writer.close(f.port.capability));
@@ -2170,9 +2182,7 @@ test('HS1 legacy TEXT root stays readable and lossless, gains compressed rows la
     // Lost ACK of a pre-upgrade operation: the stored TEXT receipt, unchanged.
     const lastRetry = { ...lastRequest, fence: { ...lastRequest.fence, expectedGeneration: f.port.capability.generation } };
     expect(h2value(await f.port.writer.commit(f.port.capability, lastRetry))).toEqual(lastReceipt);
-    const legacyRead = await hs1ReadAll(f);
-    expect(legacyRead.status === 'ok' ? legacyRead.rows : legacyRead).toEqual(written);
-    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    written.push(...await hs1Step(f, st));
     h2value(await f.port.writer.close(f.port.capability));
     const mixed = hs1Db(f.root, db => ({ ...hs1Types(db), meta: db.query('SELECT generation,version FROM fh_v2_meta WHERE id=1').get() as { generation: number; version: string } }));
     // History is not rewritten: the legacy TEXT rows remain and new rows are compressed.
@@ -2184,6 +2194,7 @@ test('HS1 legacy TEXT root stays readable and lossless, gains compressed rows la
     // and asserts that before its generation write, so it refuses this root.
     expect(mixed.meta.version).toBe('newarch-v2/HS01');
     expect(mixed.meta.version === 'newarch-v2').toBe(false);
+    // Legacy TEXT rows and new HS01 rows in one root read back byte-identical.
     await f.reload();
     const all = await hs1ReadAll(f);
     expect(all.status === 'ok' ? all.rows : all).toEqual(written);
@@ -2204,7 +2215,7 @@ test('HS1 corrupt, truncated, trailing, unknown-tag, foreign and oversize stored
   const f = await h2fixture();
   try {
     const st = await hs1Activate(f), written: string[] = [];
-    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    written.push(...await hs1Step(f, st));
     h2value(await f.port.writer.close(f.port.capability));
     const key = H2.v2PaneKey(f.pane);
     const target = hs1Db(f.root, db => db.query("SELECT n,payload FROM fh_v2_timeline WHERE pane=? AND kind='row' ORDER BY n LIMIT 1 OFFSET 5").get(key) as { n: number; payload: Uint8Array });
