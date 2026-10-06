@@ -2370,6 +2370,7 @@ test('HS1 row shape refuses invalid writes atomically and objects require canoni
 
 // HS2 (PLAN §2 / §3.1): abandoned scans, durable storage profile, real page
 // size and the WAL allocation. Each named part reports its own outcome.
+import { chmodSync } from 'node:fs';
 const hs2MiB = 1024 * 1024;
 type H2Fixture = Awaited<ReturnType<typeof h2fixture>>;
 let hs2Seed = 7;
@@ -2449,7 +2450,7 @@ test('HS2 abandoned scans leave the store usable', async () => {
     parts.exportAfterRefusedExport = hs2Outcome(await c.port.writer.commit(c.port.capability,
       c.request({ kind: 'materialize-export', sealCommitId: second.commitId }, 'export-2')));
   } finally { await c.cleanup(); }
-  expect(parts).toEqual({ pinCensusAfterRefusedReclaim: 'ok', reclaimAfterRelease: 'ok', appendAfterRefusedSeal: 'ok', exportAfterRefusedExport: 'ok' });
+  expect(parts, 'HS2-ASSERT scans-usable').toEqual({ pinCensusAfterRefusedReclaim: 'ok', reclaimAfterRelease: 'ok', appendAfterRefusedSeal: 'ok', exportAfterRefusedExport: 'ok' });
 }, 60_000);
 
 // A small R-shaped profile: 64 MiB root, reserve 16 MiB, every class allocated.
@@ -2472,9 +2473,11 @@ test('HS2 storage profile is durable and a mismatched reopen refuses before any 
     await f.activate();
     const born = f.port.capability.generation;
     h2value(await f.port.writer.close(f.port.capability));
+    // The first open persisted A: the row exists before any reopen is tried.
+    expect(profiles(), 'HS2-ASSERT profile-row').toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(A) }]);
     for (const other of [{ config: hs2SmallConfig, storageProfile: B }, { config: hs2SmallConfig }]) {
-      expect(await attempt(other)).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
-      expect(generation()).toBe(born);
+      expect(await attempt(other), 'HS2-ASSERT mismatch-refused').toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
+      expect(generation(), 'HS2-ASSERT generation-unchanged').toBe(born);
     }
     expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(A) }]);
     // A profile whose budget is not the config's budget never opens anything.
@@ -2490,6 +2493,39 @@ test('HS2 storage profile is durable and a mismatched reopen refuses before any 
     expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(B) }]);
     expect(await attempt({ config: hs2SmallConfig, storageProfile: A })).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
     expect(generation()).toBe(born + 2);
+  } finally { await f.cleanup(); }
+}, 60_000);
+
+// Review M1: the profile fence runs before the open's first write. A root
+// with a removed index, a removed migration marker and a wider file mode makes
+// the open's own repairs visible; a refused open must leave all three as found.
+test('HS2 a mismatched profile is refused before the open writes outside the generation', async () => {
+  const A = hs2Profile(256 * 1024), B = hs2Profile(512 * 1024);
+  const f = await h2fixture({}, { config: hs2SmallConfig, storageProfile: A });
+  const path = join(f.root, 'flag-on-v1.sqlite');
+  const outside = () => ({ mode: statSync(path).mode & 0o777, ...hs1Db(f.root, db => ({
+    schema: (db.query('SELECT type,name FROM sqlite_master ORDER BY type,name').all() as { type: string; name: string }[]).map(r => r.type + ':' + r.name),
+    marker: Number((db.query("SELECT COUNT(*) AS n FROM fh_r2 WHERE kind='migration' AND id='timeline-v2'").get() as { n: number }).n),
+    generation: Number((db.query('SELECT generation FROM fh_v2_meta WHERE id=1').get() as { generation: number }).generation),
+    profile: (db.query("SELECT payload FROM fh_v2_object WHERE kind='storage-profile'").all() as { payload: string }[]).map(r => JSON.parse(r.payload).digest),
+  })) });
+  try {
+    await f.activate();
+    h2value(await f.port.writer.close(f.port.capability));
+    hs1Db(f.root, db => { db.exec('DROP INDEX fh_timeline_op'); db.query("DELETE FROM fh_r2 WHERE kind='migration' AND id='timeline-v2'").run(); });
+    chmodSync(path, 0o640);
+    const before = outside();
+    expect(before).toMatchObject({ mode: 0o640, marker: 0, profile: [H2.v2StorageProfileDigest(A)] });
+    expect(before.schema).not.toContain('index:fh_timeline_op');
+    expect(await f.openWith({ config: hs2SmallConfig, storageProfile: B }))
+      .toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
+    expect(outside(), 'HS2-ASSERT outside-state-unchanged').toEqual(before);
+    // The root's own profile still opens, and that open repairs all three.
+    await f.reload();
+    h2value(await f.port.writer.close(f.port.capability));
+    const after = outside();
+    expect(after).toMatchObject({ mode: 0o600, marker: 1, generation: before.generation + 1 });
+    expect(after.schema).toContain('index:fh_timeline_op');
   } finally { await f.cleanup(); }
 }, 60_000);
 
@@ -2524,7 +2560,7 @@ test('HS2 page limit follows the real page size', async () => {
     const limit = Math.floor(Math.floor((storage.rootCapBytes - storage.emergencyReserveBytes) / 2) / 8192);
     console.log('HS2_PAGE_LIMIT', JSON.stringify({ bun: Bun.version, ...disk, limit, committed }));
     expect(disk.pageSize).toBe(8192);
-    expect(disk.pages).toBeLessThanOrEqual(limit);
+    expect(disk.pages, 'HS2-ASSERT page-limit').toBeLessThanOrEqual(limit);
     expect(disk.rows).toBe(committed);
     expect(H2.v2DatabasePageLimit(H2.v2LegacyStorageProfile(storage), 8192)).toBe(limit);
     await f.reload();
@@ -2543,8 +2579,11 @@ test('HS2 WAL stays inside the allocation after every commit', async () => {
       h2value(await f.port.writer.commit(f.port.capability, hs2Batch(f, rows(through), through + 20, 'wal-' + n)));
       through += 20; sizes.push(walSize());
     }
+    // Measured after commit() returned, i.e. after H's post-commit checkpoint.
+    // This is the threshold H enforces, NOT a peak bound: inside a transaction
+    // the WAL may grow past walBytes before the check runs (HS2 r1, review M2).
     console.log('HS2_WAL_SIZES', JSON.stringify(sizes));
-    expect(sizes.filter(size => size > walBytes)).toEqual([]);
+    expect(sizes.filter(size => size > walBytes), 'HS2-ASSERT wal-after-commit').toEqual([]);
     // An outside reader pins the WAL: once it is over budget the next commit
     // is refused before any mutation, then retries exactly once after release.
     const reader = new Database(join(f.root, 'flag-on-v1.sqlite'));
