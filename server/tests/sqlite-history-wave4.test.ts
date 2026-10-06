@@ -2281,3 +2281,77 @@ test('HS1 receipts and checkpoints are stored compressed and a lost-ACK retry af
     expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(st.cp);
   } finally { await f.cleanup(); }
 }, 60_000);
+
+
+// Valid checksums are deliberate: integrity hashes cannot replace contract validation.
+test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01 on read, seal and export', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f);
+    await hs1Step(f, st, 40);
+    const sealed = await f.commit({ kind: 'seal', segmentId: st.segment }, 'shape-seal');
+    const key = H2.v2PaneKey(f.pane);
+    const target = hs1Db(f.root, db => db.query("SELECT * FROM fh_v2_timeline WHERE kind='row' ORDER BY n LIMIT 1").get() as Record<string, any>);
+    const original = inflateSync(target.payload.subarray(4)).toString('utf8');
+    const cases: [string, (r: any) => void][] = [
+      ['cell count', r => r.cells.pop()],
+      ['width pair', r => r.cells[0].width = 2],
+      ['orphan continuation', r => r.cells[0].width = 0],
+      ['origin count', r => r.cellOrigins.pop()],
+      ['origin kind', r => r.origin.kind = 'unknown'],
+      ['origin range', r => r.cellOrigins[0].range.end = -1],
+      ['origin pane', r => r.origin.range.epoch.pane.paneId = '%foreign'],
+      ['row id', r => r.id.rowOrdinal = -1],
+      ['geometry', r => r.geometry.rows = 0],
+      ['wrap pad', r => r.wrapPad = r.geometry.columns + 1],
+      ['buffer', r => r.buffer = 'bad'],
+      ['finalized', r => r.finalized = false],
+    ];
+    const outcomes: Record<string, string[]> = {};
+    for (const packed of [false, true]) for (const [name, change] of [...cases, ['canonical', (_: any) => {}] as [string, (r: any) => void]]) {
+      const row = JSON.parse(original); change(row);
+      const payload = H2.streamCanonical(row) + (name === 'canonical' ? ' ' : '');
+      const stored = packed ? Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(payload))]) : payload;
+      const checksum = H2.v2Digest('timeline', { pane: target.pane, n: target.n, revision: target.revision, kind: target.kind, id: target.id, segment: target.segment, payload });
+      hs1Db(f.root, db => db.query('UPDATE fh_v2_timeline SET payload=?,checksum=? WHERE pane=? AND n=?').run(stored, checksum, key, target.n));
+      const read = await hs1ReadAll(f);
+      const exported = await f.port.writer.commit(f.port.capability, f.request({ kind: 'materialize-export', sealCommitId: sealed.commitId }, `bad-export-${packed}-${name}`));
+      h2value(await f.port.writer.close(f.port.capability)); await f.reload();
+      const reopened = await hs1ReadAll(f);
+      // Remove only the synthetic seal so the same damaged segment also exercises seal().
+      hs1Db(f.root, db => db.query("DELETE FROM fh_v2_object WHERE kind='segment-seal' AND pane=? AND id=?").run(key, st.segment));
+      const seal = await f.port.writer.commit(f.port.capability, f.request({ kind: 'seal', segmentId: st.segment }, `bad-seal-${packed}-${name}`));
+      outcomes[`${packed}:${name}`] = [read.status, exported.status, reopened.status, seal.status];
+      for (const result of [read, exported, reopened, seal]) if (result.status === 'error') expect(JSON.stringify(result)).toMatch(/v2 row|v2 storage canonical/);
+    }
+    console.log('HS1_SHAPE_OUTCOMES', JSON.stringify(outcomes));
+    expect(outcomes).toEqual(Object.fromEntries(Object.keys(outcomes).map(k => [k, ['error', 'error', 'error', 'error']])));
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HS1 row shape refuses invalid writes atomically and objects require canonical equality', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f), plan = hs1Plan(f, st, 40);
+    if (plan.command.kind !== 'batch') throw Error('batch');
+    const malformed = structuredClone(plan.command);
+    (malformed.batch.rows[0]!.cells as unknown[]).pop();
+    const result = await f.port.writer.commit(f.port.capability, f.request(malformed, 'bad-shape'));
+    expect(result.status).toBe('error');
+    expect(JSON.stringify(result)).toContain('v2 row');
+    expect(h2value(f.port.reader.receipt(f.pane, 'bad-shape'))).toBeNull();
+    expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(1);
+    expect((await hs1ReadAll(f))).toEqual({ status: 'ok', rows: [] });
+    await f.commit(plan.command, 'good-shape'); plan.apply();
+    const key = H2.v2PaneKey(f.pane), payload = H2.streamCanonical(st.cp) + ' ';
+    for (const packed of [false, true]) {
+      hs1Db(f.root, db => db.query("UPDATE fh_v2_object SET payload=?,checksum=? WHERE kind='checkpoint' AND pane=? AND id='live'").run(
+        packed ? Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(payload))]) : payload,
+        H2.v2Digest('stored-object', { kind: 'checkpoint', pane: key, id: 'live', payload }), key));
+      const result = f.port.reader.checkpoint(f.pane);
+      expect(result.status).toBe('error'); expect(JSON.stringify(result)).toContain('v2 storage canonical');
+      h2value(await f.port.writer.close(f.port.capability)); await f.reload();
+      expect(f.port.reader.checkpoint(f.pane).status).toBe('error');
+    }
+  } finally { await f.cleanup(); }
+});
