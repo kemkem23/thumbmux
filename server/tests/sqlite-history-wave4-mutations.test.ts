@@ -314,7 +314,7 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     const run = async (name: string, failed: boolean) => {
       // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1/HS2 storage
       // cases (seconds each) have their own mutant runners below.
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] |HPERF )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
@@ -688,5 +688,56 @@ test('HS2 mutants: cached iterate, profile not persisted or not checked or check
       } finally { writeFileSync(file, original); }
     }
     const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b5 pass\b/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 600_000);
+
+// H-PERF lot A (PLAN §4.4): only the `HPERF ` cases of the wave4 file, in the
+// same copied-tree runner, once per gate (the runners above exclude them by
+// name). Each mutant must fail its NAMED case at its LABELLED assertion
+// (`error: HPERF-ASSERT <label>`), never by a compile/import error, a timeout
+// or a TypeError/ReferenceError on the way there. Anchors exist only in code
+// H-PERF added; a missing or repeated anchor fails the runner.
+test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or module memo, trusted caller input, early receipt memo, non-atomic checkpoint', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'hperf-mutants-'));
+  const assertion = (label: string) => new RegExp('^error: HPERF-ASSERT ' + label + '$', 'm');
+  const budget = /\(fail\) HPERF work budget: a full decoder page/;
+  const mutations: { name: string; file: string; kills: RegExp; assert: RegExp; from: string; to: string; from2?: string; to2?: string }[] = [
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^HPERF '],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('HPERF_MUTANT', JSON.stringify({ name, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [],
+        asserted: output.match(/^error: HPERF-ASSERT .*$/gm) ?? [], thrown: output.match(/^(?:\d+ \| .*)?\b(?:TypeError|ReferenceError)\b.*$/gm) ?? [], summary: output.slice(-600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      return { exit, output };
+    };
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b7 pass\b/);
+    for (const m of mutations) {
+      const file = join(root, 'server/src', m.file), original = readFileSync(file, 'utf8');
+      expect(original.split(m.from).length).toBe(2);
+      let mutant = original.replace(m.from, m.to);
+      if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
+      try {
+        writeFileSync(file, mutant);
+        const red = await run(m.name);
+        expect(red.exit).not.toBe(0);
+        expect(red.output).toMatch(m.kills);
+        expect(red.output).toMatch(m.assert);
+        expect(red.output).not.toMatch(/\b(?:TypeError|ReferenceError)\b/);
+      } finally { writeFileSync(file, original); }
+    }
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b7 pass\b/);
+    void budget; void assertion;
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);

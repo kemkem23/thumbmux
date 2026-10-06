@@ -2033,7 +2033,7 @@ async function hs1Activate(f: Hs1Fixture, long = false): Promise<Hs1State> {
   return { cp, pending: [], line: 0, segment: 'hs1-seg-0', segments: 1, segmentBytes: 0, rows: 0, commits: 0, long, autoRotate: true };
 }
 /** One decoder prefix as a batch command; state advances only via apply(). */
-function hs1Plan(f: Hs1Fixture, st: Hs1State, maxLines = 256) {
+function hs1Plan(f: Hs1Fixture, st: Hs1State, maxLines = 256, issue: Hs1Fixture['issue'] = f.issue) {
   // Rotate before a full prefix (<= 2 MiB serialized) could cross H's 8 MiB segment.
   if (st.autoRotate && st.segmentBytes + 2 * HS1_MIB + 4096 > 8 * HS1_MIB) { st.segment = 'hs1-seg-' + st.segments++; st.segmentBytes = 0; }
   const newlines = () => st.pending.reduce((n, b) => n + (b === 10 ? 1 : 0), 0);
@@ -2050,7 +2050,7 @@ function hs1Plan(f: Hs1Fixture, st: Hs1State, maxLines = 256) {
     durableRevision: owner.durableRevision, rowTarget: { segmentId: st.segment,
       nextRowOrdinal: st.cp.frontier?.segmentId === st.segment ? st.cp.frontier.rowOrdinal + 1 : 0 } });
   if ('kind' in r) throw Error('decoder gap ' + JSON.stringify(r).slice(0, 400));
-  const input = f.issue({ kind: 'synced-spool' as const, version: 1 as const, through: r.checkpoint.through, recordDigest: 'b'.repeat(64),
+  const input = issue({ kind: 'synced-spool' as const, version: 1 as const, through: r.checkpoint.through, recordDigest: 'b'.repeat(64),
     commitId: 'hs1-input-' + st.commits + '-' + start, segmentId: 'raw-1' });
   const command: H2.V2WriteCommand = { kind: 'batch', batch: { rows: r.rows, decisions: [], incidents: [], checkpoint: r.checkpoint, input } };
   const canonical = r.rows.map(row => H2.streamCanonical(row));
@@ -2605,5 +2605,243 @@ test('HS2 WAL stays inside the allocation after every commit', async () => {
     expect(walSize()).toBeLessThanOrEqual(walBytes);
     const stored = hs1Db(f.root, db => Number((db.query("SELECT COUNT(*) AS n FROM fh_v2_timeline WHERE kind='row'").get() as { n: number }).n));
     expect(stored).toBe(through);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+// ---------------------------------------------------------------------------
+// H-PERF lot A (NEWARCH): H reuses its own work inside ONE commit. Every case
+// here is small (at most 4 full decoder pages) and asserts work counters and
+// correctness only, never wall time; timing lives in tests/hperf-measure.ts.
+// Names start with `HPERF ` and carry none of the strings older mutant runners
+// select by, so only the HPERF runner in the mutation file re-runs them.
+// The `observe` hook of H only counts (C2); it never picks a path. Budgets and
+// timeouts below were fixed in commit C1, before any change to H or SC.
+type HperfEvent = { readonly kind: string; readonly rows?: number };
+const HPERF_BUDGET = Object.freeze({
+  /** Live checkpoint SELECT+inflate+digest+parse+canonical-equality per batch command. */
+  checkpointDecodesPerBatch: 1,
+  /** A checkpoint command: one binding read plus the B2 fence block's own read,
+   * whose text H-PERF may not change. */
+  checkpointDecodesPerCheckpointCommand: 2,
+  /** Full canonical traversals of row data per row: the caller's command once
+   * (digest + bound) and at most once more for H's private snapshot. */
+  rowEncodesPerRow: 2,
+  /** S's issued-input authority is still asked inside every batch. */
+  authorityCallsPerBatch: 1,
+});
+type HperfRun = { f: H2Fixture; events: HperfEvent[]; calls: { authority: number }; issue: H2Fixture['issue'] };
+async function hperfOpen(observe: boolean, hooks: { boundary?: (at: string) => void; duringAuthority?: () => void } = {}): Promise<HperfRun> {
+  const events: HperfEvent[] = [], calls = { authority: 0 }, issued = new Map<string, H2.V2BatchInput>();
+  // S-owned issued inputs, filled only by `issue`; H reads back the exact object.
+  const issue = <T extends H2.V2BatchInput>(input: T): T => { issued.set(H2.streamCanonical(input), structuredClone(input)); return input; };
+  const f = await h2fixture({ ...(hooks.boundary ? { boundary: hooks.boundary } : {}),
+    inputReceipt: input => { calls.authority++; hooks.duringAuthority?.(); return { status: 'ok', value: issued.get(H2.streamCanonical(input)) ?? null }; },
+    ...(observe ? { observe: (event: HperfEvent) => { events.push(event); } } : {}) } as Parameters<typeof createV2HistoryFactory>[0]);
+  return { f, events, calls, issue };
+}
+function hperfWork(events: readonly HperfEvent[]) {
+  return { checkpointDecodes: events.filter(e => e.kind === 'checkpoint-decode').length,
+    rowEncodes: events.reduce((n, e) => n + (e.kind === 'row-encode' ? e.rows ?? 0 : 0), 0) };
+}
+/** Every stored row through the public reader, canonical, oldest first. */
+async function hperfRows(f: H2Fixture): Promise<string[]> {
+  const rows: string[] = []; let cursor: H2.NewarchV2HistoryCursor | null = null;
+  for (;;) {
+    const page = h2value(await f.page(64, cursor));
+    for (const e of page.entries) if (e.kind === 'row') rows.push(H2.streamCanonical(e.row));
+    if (page.after.kind !== 'more') return rows;
+    cursor = page.after.cursor;
+  }
+}
+const hperfBatch = (command: H2.V2WriteCommand) => (command as Extract<H2.V2WriteCommand, { kind: 'batch' }>).batch;
+
+test('HPERF work budget: a full decoder page decodes the live checkpoint once, encodes each row at most twice and still asks S once', async () => {
+  const runs: Record<string, unknown> = {};
+  for (const mode of ['observed', 'unobserved'] as const) {
+    const run = await hperfOpen(mode === 'observed'), { f } = run;
+    try {
+      const st = await hs1Activate(f), receipts: H2.V2Receipt[] = [], planned: string[] = [];
+      for (let page = 0; page < 2; page++) {
+        const p = hs1Plan(f, st, 256, run.issue), id = 'hperf-page-' + page;
+        run.events.length = 0; run.calls.authority = 0;
+        const receipt = h2value(await f.port.writer.commit(f.port.capability, f.request(p.command, id))); p.apply();
+        receipts.push(receipt); planned.push(...p.canonical);
+        expect(p.rows.length, 'HPERF-ASSERT full-page').toBeGreaterThanOrEqual(64);
+        expect(run.calls.authority, 'HPERF-ASSERT authority').toBe(HPERF_BUDGET.authorityCallsPerBatch);
+        if (mode === 'observed') {
+          const work = hperfWork(run.events);
+          expect(work.checkpointDecodes, 'HPERF-ASSERT checkpoint-decode').toBe(HPERF_BUDGET.checkpointDecodesPerBatch);
+          expect(work.rowEncodes, 'HPERF-ASSERT row-encode-seen').toBeGreaterThanOrEqual(p.rows.length);
+          expect(work.rowEncodes, 'HPERF-ASSERT row-encode').toBeLessThanOrEqual(HPERF_BUDGET.rowEncodesPerRow * p.rows.length);
+        }
+        expect(receipt.checkpointId, 'HPERF-ASSERT receipt-checkpoint').toBe(h2value(f.port.reader.checkpoint(f.pane))!.checkpointId);
+        expect(h2value(f.port.reader.receipt(f.pane, id)), 'HPERF-ASSERT receipt-readback').toEqual(receipt);
+      }
+      const live = h2value(f.port.reader.checkpoint(f.pane))!;
+      run.events.length = 0;
+      const cpReceipt = h2value(await f.port.writer.commit(f.port.capability, f.request({ kind: 'checkpoint',
+        checkpoint: { ...live, checkpointId: live.checkpointId + '-hperf', revision: live.revision + 1 } }, 'hperf-checkpoint')));
+      if (mode === 'observed') {
+        const decodes = hperfWork(run.events).checkpointDecodes;
+        expect(decodes, 'HPERF-ASSERT checkpoint-command-decode-seen').toBeGreaterThanOrEqual(1);
+        expect(decodes, 'HPERF-ASSERT checkpoint-command-decode').toBeLessThanOrEqual(HPERF_BUDGET.checkpointDecodesPerCheckpointCommand);
+      }
+      const rows = await hperfRows(f);
+      expect(rows, 'HPERF-ASSERT rows-readback').toEqual(planned);
+      runs[mode] = { rows, checkpoint: H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))),
+        receipts: [...receipts, cpReceipt].map(r => H2.streamCanonical({ ...r, commitId: null })) };
+    } finally { await f.cleanup(); }
+  }
+  // The observer counts; it never changes what H stores or answers.
+  expect(runs.unobserved, 'HPERF-ASSERT observer-off-identical').toEqual(runs.observed);
+}, 120_000);
+
+test('HPERF caller edits after the digest never reach disk: rows and checkpoint are the snapshot H checked', async () => {
+  let duringAuthority: (() => void) | null = null, beforeWrite: (() => void) | null = null;
+  const run = await hperfOpen(false, { duringAuthority: () => duringAuthority?.(),
+    boundary: at => { if (at === 'v2-batch-before-write') beforeWrite?.(); } }), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    // The decoder freezes its output; the caller here holds a mutable deep copy
+    // (structuredClone keeps the shared cells and origins shared).
+    const p = hs1Plan(f, st, 256, run.issue), command = structuredClone(p.command), batch = hperfBatch(command);
+    const checkpoint = H2.streamCanonical(batch.checkpoint), checkpointId = batch.checkpoint.checkpointId;
+    // Inside the transaction, after H checked the digest, the caller rewrites
+    // descendants of a row and of the checkpoint it already handed over.
+    duringAuthority = () => {
+      (batch.rows[0]!.cells[0] as { text: string }).text = 'Z';
+      (batch.checkpoint as { checkpointId: string }).checkpointId = 'hperf-edited-checkpoint';
+    };
+    const receipt = h2value(await f.port.writer.commit(f.port.capability, f.request(command, 'hperf-snapshot')));
+    duringAuthority = null; p.apply();
+    expect((await hperfRows(f))[0], 'HPERF-ASSERT snapshot-row').toBe(p.canonical[0]);
+    expect(H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))), 'HPERF-ASSERT snapshot-checkpoint').toBe(checkpoint);
+    expect(receipt.checkpointId, 'HPERF-ASSERT snapshot-receipt').toBe(checkpointId);
+    // An edit BEFORE H read the request is refused by the digest, atomically.
+    const next = hs1Plan(f, st, 256, run.issue), early = structuredClone(next.command), request = f.request(early, 'hperf-early-edit');
+    const before = { owner: h2value(f.port.reader.owner(f.pane))!.durableRevision, checkpoint: H2.streamCanonical(st.cp), rows: (await hperfRows(f)).length };
+    beforeWrite = () => { (hperfBatch(early).rows[0]!.cells[0] as { text: string }).text = 'Y'; };
+    expect(await f.port.writer.commit(f.port.capability, request), 'HPERF-ASSERT early-edit-refused')
+      .toMatchObject({ status: 'error', message: expect.stringContaining('v2 write digest') });
+    beforeWrite = null;
+    expect({ owner: h2value(f.port.reader.owner(f.pane))!.durableRevision, checkpoint: H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))),
+      rows: (await hperfRows(f)).length }, 'HPERF-ASSERT early-edit-unchanged').toEqual(before);
+    expect(h2value(f.port.reader.receipt(f.pane, 'hperf-early-edit')), 'HPERF-ASSERT early-edit-receipt').toBeNull();
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF a throw before COMMIT rolls the live checkpoint back for readers and the same operation retries', async () => {
+  let fault = '';
+  const run = await hperfOpen(true, { boundary: at => { if (at === fault) throw Error('hperf injected ' + at); } }), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    const first = hs1Plan(f, st, 256, run.issue);
+    h2value(await f.port.writer.commit(f.port.capability, f.request(first.command, 'hperf-first'))); first.apply();
+    const before = { checkpoint: H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))),
+      owner: h2value(f.port.reader.owner(f.pane))!.durableRevision, rows: (await hperfRows(f)).length };
+    const p = hs1Plan(f, st, 256, run.issue), request = f.request(p.command, 'hperf-rollback');
+    fault = 'v2-batch-before-commit';
+    expect((await f.port.writer.commit(f.port.capability, request)).status, 'HPERF-ASSERT rollback-error').toBe('error');
+    fault = '';
+    expect(H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))), 'HPERF-ASSERT rollback-checkpoint').toBe(before.checkpoint);
+    expect(h2value(f.port.reader.receipt(f.pane, 'hperf-rollback')), 'HPERF-ASSERT rollback-receipt').toBeNull();
+    expect({ owner: h2value(f.port.reader.owner(f.pane))!.durableRevision, rows: (await hperfRows(f)).length }, 'HPERF-ASSERT rollback-state')
+      .toEqual({ owner: before.owner, rows: before.rows });
+    const receipt = h2value(await f.port.writer.commit(f.port.capability, request)); p.apply();
+    const live = h2value(f.port.reader.checkpoint(f.pane))!;
+    expect(H2.streamCanonical(live), 'HPERF-ASSERT retry-checkpoint').toBe(H2.streamCanonical(hperfBatch(p.command).checkpoint));
+    expect(receipt.checkpointId, 'HPERF-ASSERT retry-receipt').toBe(live.checkpointId);
+    const after = hs1Plan(f, st, 256, run.issue);
+    expect((await f.port.writer.commit(f.port.capability, f.request(after.command, 'hperf-after'))).status, 'HPERF-ASSERT next-page').toBe('ok');
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF a descendant edited between two commits is encoded fresh by the next one', async () => {
+  const run = await hperfOpen(false), { f } = run;
+  try {
+    await f.activate();
+    // One cell object shared by every row of both batches; edited in between.
+    const shared = { text: 'A', width: 1 as const, style: [] as number[] };
+    const rowWith = (n: number): H2.CommittedStreamRow => { const row = f.row(n); return { ...row, cells: row.cells.map((c, i) => i === 1 ? shared : c) }; };
+    const command = (rows: H2.CommittedStreamRow[], revision: number, through: number) => f.inputBatch(rows, run.issue(f.recordAck(through)), revision, through);
+    h2value(await f.port.writer.commit(f.port.capability, f.request(command([rowWith(0), rowWith(1)], 2, 2), 'hperf-edit-a')));
+    shared.text = 'B';
+    const second = await f.port.writer.commit(f.port.capability, f.request(command([rowWith(2), rowWith(3)], 3, 4), 'hperf-edit-b'));
+    expect(second.status, 'HPERF-ASSERT fresh-commit').toBe('ok');
+    const texts = (await hperfRows(f)).map(text => (JSON.parse(text) as H2.CommittedStreamRow).cells[1]!.text);
+    expect(texts, 'HPERF-ASSERT fresh-readback').toEqual(['A', 'A', 'B', 'B']);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF a lost ACK after COMMIT returns, after reopen, the persisted receipt that names the live checkpoint', async () => {
+  let fault = '';
+  const run = await hperfOpen(false, { boundary: at => { if (at === fault) throw Error('hperf injected ' + at); } }), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    const p = hs1Plan(f, st, 256, run.issue), request = f.request(p.command, 'hperf-lost-ack');
+    fault = 'v2-batch-after-commit';
+    expect((await f.port.writer.commit(f.port.capability, request)).status, 'HPERF-ASSERT lost-ack-error').toBe('error');
+    fault = ''; p.apply();
+    await f.reopen();
+    const retry = { ...request, fence: { ...request.fence, expectedGeneration: f.port.capability.generation } };
+    const receipt = h2value(await f.port.writer.commit(f.port.capability, retry));
+    const live = h2value(f.port.reader.checkpoint(f.pane))!;
+    expect(live.checkpointId, 'HPERF-ASSERT lost-ack-live').toBe(st.cp.checkpointId);
+    expect(receipt.checkpointId, 'HPERF-ASSERT lost-ack-checkpoint-id').toBe(live.checkpointId);
+    expect(receipt.frontier, 'HPERF-ASSERT lost-ack-frontier').toEqual(live.frontier);
+    expect(h2value(f.port.reader.receipt(f.pane, 'hperf-lost-ack')), 'HPERF-ASSERT lost-ack-receipt').toEqual(receipt);
+    // The answered path names the live checkpoint as well.
+    const next = hs1Plan(f, st, 256, run.issue);
+    const answered = h2value(await f.port.writer.commit(f.port.capability, f.request(next.command, 'hperf-answered'))); next.apply();
+    expect(answered.checkpointId, 'HPERF-ASSERT ack-checkpoint-id').toBe(h2value(f.port.reader.checkpoint(f.pane))!.checkpointId);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF checkpoint command keeps the B2 raw-position fence and commits unchanged positions', async () => {
+  const run = await hperfOpen(true), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    const p = hs1Plan(f, st, 256, run.issue);
+    h2value(await f.port.writer.commit(f.port.capability, f.request(p.command, 'hperf-page'))); p.apply();
+    const live = h2value(f.port.reader.checkpoint(f.pane))!, before = H2.streamCanonical(live);
+    const next = (patch: Partial<H2.V2LiveCheckpoint>, id: string): H2.V2WriteCommand =>
+      ({ kind: 'checkpoint', checkpoint: { ...live, checkpointId: live.checkpointId + '-' + id, revision: live.revision + 1, ...patch } });
+    for (const [id, patch] of [['through', { through: { ...live.through, byteOffset: live.through.byteOffset + 1 } }],
+      ['floor', { replayFloor: { ...live.replayFloor, byteOffset: live.replayFloor.byteOffset - 1 } }]] as const) {
+      expect(await f.port.writer.commit(f.port.capability, f.request(next(patch, id), 'hperf-moved-' + id)), 'HPERF-ASSERT moved-' + id)
+        .toMatchObject({ status: 'error', message: expect.stringContaining('v2 checkpoint requires unchanged raw positions') });
+      expect(H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))), 'HPERF-ASSERT moved-' + id + '-unchanged').toBe(before);
+    }
+    run.events.length = 0;
+    h2value(await f.port.writer.commit(f.port.capability, f.request(next({}, 'same'), 'hperf-same')));
+    expect(h2value(f.port.reader.checkpoint(f.pane))!.checkpointId, 'HPERF-ASSERT same-committed').toBe(live.checkpointId + '-same');
+    expect(hperfWork(run.events).checkpointDecodes, 'HPERF-ASSERT same-decode').toBeLessThanOrEqual(HPERF_BUDGET.checkpointDecodesPerCheckpointCommand);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF trust: a forged digest, an altered row or checkpoint and a host-minted or stale input refuse with nothing written', async () => {
+  const run = await hperfOpen(false), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    const p = hs1Plan(f, st, 256, run.issue), request = f.request(p.command, 'hperf-trust'), batch = hperfBatch(p.command);
+    const state = async () => ({ owner: h2value(f.port.reader.owner(f.pane))!.durableRevision, checkpoint: H2.streamCanonical(h2value(f.port.reader.checkpoint(f.pane))),
+      receipt: h2value(f.port.reader.receipt(f.pane, 'hperf-trust')), rows: (await hperfRows(f)).length });
+    const before = await state();
+    const refuse = async (r: H2.V2WriteRequest, message: string, label: string) => {
+      expect(await f.port.writer.commit(f.port.capability, r), 'HPERF-ASSERT ' + label).toMatchObject({ status: 'error', message: expect.stringContaining(message) });
+      expect(await state(), 'HPERF-ASSERT ' + label + '-unchanged').toEqual(before);
+    };
+    const withBatch = (patch: Partial<typeof batch>): H2.V2WriteCommand => ({ kind: 'batch', batch: { ...batch, ...patch } });
+    const row0 = batch.rows[0]!, altered = { ...row0, cells: [{ ...row0.cells[0]!, text: 'Q' }, ...row0.cells.slice(1)] };
+    // Digest of the original request, different content.
+    await refuse({ ...request, command: withBatch({ rows: [altered, ...batch.rows.slice(1)] }) }, 'v2 write digest', 'trust-row');
+    await refuse({ ...request, command: withBatch({ checkpoint: { ...batch.checkpoint, checkpointId: 'hperf-other' } }) }, 'v2 write digest', 'trust-checkpoint');
+    await refuse({ ...request, fence: { ...request.fence, digest: 'f'.repeat(64) } }, 'v2 write digest', 'trust-digest');
+    // Correct digests; only S's authority can refuse these.
+    const input = batch.input as H2.SpoolAck;
+    await refuse(f.request(withBatch({ input: { ...input, commitId: 'hperf-minted' } }), 'hperf-trust'), 'v2 durable input authority', 'trust-minted');
+    const stale = run.issue({ ...input, commitId: 'hperf-stale', through: { ...input.through, byteOffset: input.through.byteOffset - 1 } });
+    await refuse(f.request(withBatch({ input: stale }), 'hperf-trust'), 'v2 durable input authority', 'trust-stale');
+    expect((await f.port.writer.commit(f.port.capability, request)).status, 'HPERF-ASSERT trust-original').toBe('ok');
   } finally { await f.cleanup(); }
 }, 120_000);
