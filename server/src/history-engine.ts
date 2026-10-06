@@ -2,7 +2,7 @@
  * WAL/FULL transactions are the durable acknowledgement boundary. No database
  * or timer is created until the explicit constructor is called.
  */
-import { Database } from 'bun:sqlite';
+import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolve, dirname, join, sep } from 'node:path';
 import { closeSync, existsSync, readdirSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
@@ -789,8 +789,13 @@ CREATE TABLE fh_checkpoint(id TEXT PRIMARY KEY, pane TEXT NOT NULL, segment TEXT
  * never itself proof that the remote index is durable. No verifier => no unlink.
  */
 const V2_STORE = Symbol('capture-engine-only');
+/** HS2 r1 (review M1): the v2 factory's storage-profile fence. It runs on the
+ * owner connection under the writer lock, after read-only inspection and
+ * BEFORE the constructor's first write to the root. */
+const V2_PROFILE_FENCE = Symbol('v2-storage-profile-fence');
 export interface FlagOnHistoryOptions {
   [V2_STORE]?: true;
+  [V2_PROFILE_FENCE]?: (db: Database) => void;
   root: string;
   mode: 'create' | 'recover';
   codecVersions: readonly string[];
@@ -805,6 +810,18 @@ const FH_SEGMENT_MAX = FB.archiveChunkBytes / 2;
 const fhPaths = new Set<string>();
 const fhReaders = new Set<string>();
 function fhAssert(test: unknown, message: string): asserts test { if (!test) throw Error(message); }
+/** Scan rows through a statement this call owns (TMX-TRIAGE #1). A `query()`
+ * statement is cached and shared by SQL text: leaving its iterate() early
+ * (throw/return/break) left it mid-step, and the next caller of the same SQL
+ * got SQLITE_MISUSE once Bun 1.4's LRU cache handed that object back.
+ * for...of calls the generator's return() on every early exit, so finalize
+ * always runs. Dropping finalize() alone is not a behavioural mutant: a
+ * prepare()d statement is never handed to anyone else; the cost is a leak
+ * until GC, not a wrong result. */
+function* fhRows(db: Database, sql: string, ...params: SQLQueryBindings[]): Generator<SqlRow> {
+  const statement = db.prepare(sql);
+  try { yield* statement.iterate(...params) as Iterable<SqlRow>; } finally { statement.finalize(); }
+}
 function fhSafePath(path: string): void {
   let current: string = sep;
   for (const part of resolve(path).split(sep).filter(Boolean)) {
@@ -879,6 +896,9 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
       const meta = db.query('SELECT * FROM fh_meta').get() as SqlRow;
       fhAssert(meta?.version === 1 && typeof meta.uuid === 'string', 'unsupported flag-on format');
       fhAssert((db.query('PRAGMA quick_check').get() as SqlRow).quick_check === 'ok', 'corrupt history database');
+      // Everything above only reads an existing root; everything below may write it
+      // (journal mode, replay-pin sweep, schema/index, migration marker, mode).
+      options[V2_PROFILE_FENCE]?.(db);
       db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA busy_timeout=0; PRAGMA journal_size_limit=0;');
       // DB + WAL growth is bounded; exported scratch is separately <=16 MiB.
       db.exec(`PRAGMA max_page_count=${Math.floor((FB.canaryRootCapBytes-FB.reserveBytes-FB.scratchBytes)/4096)};`);
@@ -1226,7 +1246,7 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
         const file = fhEvidence(path), files:EvidenceFile[]=[file], manifestPath = join(this.root,r.segmentId+'.manifest.json');
         const logical=this.load<LogicalSealR2>('logical',r.segmentId);
         if(logical){
-          files.push(this.writeIndex(r.segmentId,'timeline',this.db.query('SELECT * FROM fh_timeline WHERE segment=? ORDER BY n').iterate(r.segmentId),FB.archiveChunkBytes-files.reduce((sum,f)=>sum+f.bytes,0)));
+          files.push(this.writeIndex(r.segmentId,'timeline',fhRows(this.db,'SELECT * FROM fh_timeline WHERE segment=? ORDER BY n',r.segmentId),FB.archiveChunkBytes-files.reduce((sum,f)=>sum+f.bytes,0)));
           files.push(this.writeIndex(r.segmentId,'replay',this.replayIndex(r.pane,logical),FB.archiveChunkBytes-files.reduce((sum,f)=>sum+f.bytes,0)));
           fhAssert(files.reduce((sum,f)=>sum+f.bytes,0)<=FB.archiveChunkBytes,'export total payload bound');
         }
@@ -1757,13 +1777,14 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
 // it does not expose the backing store or a legacy write port to its callers.
 import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint, validateV2Incident,
   validateV2ReadRequest, v2Digest, v2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
-  v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest } from './stream-contract';
+  v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest,
+  v2LegacyStorageProfile, validateV2StorageProfile, v2StorageProfileDigest, v2DatabasePageLimit } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
   V2WriteRequest, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
   V2SessionReservationReceipt, V2CancelBirth, V2LiveCheckpoint, V2AuditResult, V2HistoryPage,
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
   NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
-  V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation } from './stream-contract';
+  V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation, V2StorageProfile } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
 function v2Failure(error: unknown): StreamFailure {
   const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
@@ -1795,15 +1816,36 @@ export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryW
     let store: FlagOnHistoryStore | undefined;
     try {
       validateV2Config(request.config); nonempty(request.engineId); nonempty(request.rootId);
+      const profile = v2RequestProfile(request); validateV2StorageProfile(profile, request.config);
+      fhAssert(equal(profile.storage, request.config.storage), 'v2 storage profile config');
       const root = resolve(request.rootId); fhSafePath(root);
       fhAssert(existsSync(join(root, 'flag-on-v1.sqlite')) || !existsSync(root) || readdirSync(root).length === 0,
         'v2 missing owner database in existing root');
+      const digest = v2StorageProfileDigest(profile);
       store = new FlagOnHistoryStore({ root, mode: existsSync(join(root, 'flag-on-v1.sqlite')) ? 'recover' : 'create',
-        codecVersions: ['newarch-v2'], [V2_STORE]: true });
+        codecVersions: ['newarch-v2'], [V2_STORE]: true, [V2_PROFILE_FENCE]: db => { v2ProfileFence(db, digest); } });
       // Do not pass capabilities through ok(): it serializes/copies the token.
       return { status: 'ok', value: store.openV2(V2_STORE, request, hooks) };
     } catch (e) { store?.close(); return v2Failure(e); }
   } });
+}
+/** HS2: the root's stored profile digest must equal `digest`. Read-only; the
+ * row is decoded and checksummed exactly like V2Storage.get(). Returns false
+ * for a root with no row (pre-HS2, or a fresh root): it adopts lazily. */
+function v2ProfileFence(db: Database, digest: string): boolean {
+  if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fh_v2_object'").get()) return false;
+  const kind = 'storage-profile', pane = '*', id = 'root';
+  const r = db.query('SELECT payload,checksum FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, pane, id) as SqlRow | null;
+  if (!r) return false;
+  const payload = v2Unpack(r.payload, V2L.checkpointBytesPerPane + V2L.pageBytes);
+  fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload }), 'v2 corrupt object');
+  const stored = v2CanonicalValue(payload) as { digest: string };
+  fhAssert(stored.digest === digest, 'v2 storage profile mismatch');
+  return true;
+}
+/** HS2: no profile = the legacy shared budget of config.storage (pre-HS2). */
+function v2RequestProfile(request: Parameters<V2HistoryFactory['openForCapture']>[0]): V2StorageProfile {
+  return request.storageProfile ?? v2LegacyStorageProfile(request.config.storage);
 }
 const V2_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fh_v2_meta(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,secret TEXT NOT NULL,version TEXT NOT NULL);
@@ -1891,27 +1933,59 @@ class V2Storage {
   readonly #db: Database;
   readonly #cap: V2WriterCapability;
   readonly #config: V2Config;
+  readonly #profile: V2StorageProfile;
   readonly #secret: string;
   #closed = false;
   constructor(db: Database, readonly root: string, readonly storeId: string,
     request: Parameters<V2HistoryFactory['openForCapture']>[0], readonly hooks: V2HistoryOptions,
     readonly release: () => void) {
-    this.#db = db; this.#config = copy(request.config);
+    this.#db = db; this.#config = copy(request.config); this.#profile = copy(v2RequestProfile(request));
     const generation = db.transaction(() => {
       db.exec(V2_SCHEMA);
       db.query('INSERT OR IGNORE INTO fh_v2_meta VALUES(1,0,?,?)').run(randomUUID(), 'newarch-v2');
       const meta = db.query('SELECT * FROM fh_v2_meta WHERE id=1').get() as SqlRow;
       fhAssert(meta.version === 'newarch-v2' || meta.version === V2_STORAGE_FORMAT, 'unsupported v2 storage');
+      this.bindStorageProfile();
       const next = Number(meta.generation) + 1; safe(next);
       db.query('UPDATE fh_v2_meta SET generation=?,version=? WHERE id=1').run(next, V2_STORAGE_FORMAT);
       return next;
     }).immediate();
     this.#secret = String((db.query('SELECT secret FROM fh_v2_meta WHERE id=1').get() as SqlRow).secret);
     this.#cap = Object.freeze({ owner: 'capture-engine', rootId: root, engineId: request.engineId, generation }) as V2WriterCapability;
-    // Cache stays 2 MiB, independent of history size. Config bounds DB growth;
+    // Cache stays 2 MiB, independent of history size. The profile bounds DB
+    // growth at the page size the file really has (a VACUUMed root may differ);
     // I/S's common root ledger additionally accounts raw/reserve/diagnostics.
-    const allowance = this.#config.storage.rootCapBytes - this.#config.storage.emergencyReserveBytes;
-    db.exec(`PRAGMA max_page_count=${Math.floor(allowance / 8192)};`); // includes room for WAL
+    const pageSize = Number((db.query('PRAGMA page_size').get() as SqlRow).page_size);
+    db.exec(`PRAGMA max_page_count=${v2DatabasePageLimit(this.#profile, pageSize)};`);
+  }
+  /** HS2: the root keeps the profile it was first opened with. The factory's
+   * fence already refused a mismatch before the constructor's first write
+   * (review M1); this re-check runs inside the open transaction BEFORE the
+   * generation moves, and roots without a row (pre-HS2) adopt lazily here.
+   * Still not "the open writes nothing at all": opening a WAL root may create
+   * -shm/run WAL recovery, the writer lock file is opened, and close() of a
+   * refused open checkpoints the WAL (content unchanged). */
+  private bindStorageProfile(): void {
+    const digest = v2StorageProfileDigest(this.#profile);
+    if (!v2ProfileFence(this.#db, digest)) this.put('storage-profile', '*', 'root', { schema: 'newarch-v2', digest, name: this.#profile.name,
+      storage: this.#profile.storage, allocation: this.#profile.allocation });
+  }
+  /** HS2: with an allocation manifest, `walBytes` is a checkpoint THRESHOLD,
+   * not a hard peak cap (review M2). Over it, try a TRUNCATE checkpoint;
+   * true = still over (a reader pins the WAL). tx() checks before a write
+   * (refusing it) and checkpoints after commit, so one transaction that starts
+   * under the threshold may still grow the WAL past it by its own full size;
+   * nothing reserves that growth. Writes outside tx() are not gated at all:
+   * the open transaction (constructor) and cleanupReclaim's incremental
+   * vacuum. The whole root-shared 1,024 MiB of r-canary-8g is H's alone here;
+   * splitting WAL between H/S/ledger and a peak bound are HS3's. */
+  private walOverBudget(): boolean {
+    const allocation = this.#profile.allocation;
+    if (!allocation) return false;
+    const wal = join(this.root, 'flag-on-v1.sqlite-wal'), size = () => existsSync(wal) ? statSync(wal).size : 0;
+    if (size() <= allocation.walBytes) return false;
+    try { this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* busy/pinned: the size below decides */ }
+    return size() > allocation.walBytes;
   }
   ports(): V2OpenedWithAuthority {
     const writer: V2HistoryWriter = Object.freeze({
@@ -1989,7 +2063,7 @@ class V2Storage {
     const key = v2PaneKey(pane), checkpoint = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
     fhAssert(checkpoint && equal(checkpoint.through.epoch, epoch), 'v2 raw pin epoch/checkpoint');
     let rowPins = 0;
-    for (const row of this.#db.query("SELECT id FROM fh_v2_object WHERE kind='pin' AND pane=?").iterate(key) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT id FROM fh_v2_object WHERE kind='pin' AND pane=?", key)) {
       const pin = this.get<{ segmentId: string; released: boolean }>('pin', key, String(row.id));
       if (pin && !pin.released) rowPins++;
     }
@@ -2000,11 +2074,17 @@ class V2Storage {
   private tx<T>(cap: V2WriterCapability, phase: string, f: () => T): Result<T> {
     try {
       this.live();
+      // A WAL still over its threshold refuses this write before it mutates; the
+      // same operationId retries exactly once after the pinning reader is gone.
+      fhAssert(!this.walOverBudget(), 'v2 storage wal budget');
       const result = this.#db.transaction(() => {
         this.authorize(cap); // The registry/generation check is inside EVERY write transaction.
         this.hooks.boundary?.(phase + '-before-write');
         const value = f(); this.hooks.boundary?.(phase + '-before-commit'); return value;
       }).immediate();
+      // Committed: checkpoint now. Best effort and AFTER the growth, so this is
+      // not a peak bound; the check above refuses the next write.
+      try { this.walOverBudget(); } catch { /* next write refuses */ }
       this.hooks.boundary?.(phase + '-after-commit'); return ok(result);
     } catch (e) { return v2Failure(e); }
   }
@@ -2281,16 +2361,14 @@ class V2Storage {
    * SUM(length(payload)) measured before HS1, never the physical BLOB size. */
   private segmentMetrics(pane: string, segment: string): { bytes: number; rows: number } {
     const metrics = { bytes: 0, rows: 0 };
-    for (const row of this.#db.query("SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n")
-      .iterate(pane, segment) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n", pane, segment)) {
       metrics.bytes += Buffer.byteLength(this.logicalTimeline(row).payload) + 1;
       metrics.rows++;
     }
     return metrics;
   }
   private *exportRecords(pane: string, segment: string): Iterable<V2StoredRow> {
-    for (const row of this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n')
-      .iterate(pane, segment) as Iterable<SqlRow>) yield this.logicalTimeline(row);
+    for (const row of fhRows(this.#db, 'SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n', pane, segment)) yield this.logicalTimeline(row);
   }
   private token(payload: unknown): string {
     const data = Buffer.from(streamCanonical(payload)).toString('base64url');
@@ -2358,7 +2436,7 @@ class V2Storage {
     // old cursor grants. A marker at the tail does not make old rows exact.
     const ids = new Set(states.flatMap(s => s.kind === 'incident' ? [s.incident.incidentId] : []));
     const rowPositions = entries.flatMap(e => e.kind === 'row' ? [Number((this.#db.query("SELECT n FROM fh_v2_timeline WHERE pane=? AND kind='row' AND id=?").get(key, streamCanonical(e.row.id)) as SqlRow).n)] : []);
-    for (const row of this.#db.query("SELECT * FROM fh_v2_timeline WHERE pane=? AND kind='incident' ORDER BY n DESC").iterate(key) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT * FROM fh_v2_timeline WHERE pane=? AND kind='incident' ORDER BY n DESC", key)) {
       const e = this.timeline(row); if (e.kind !== 'incident' || ids.has(e.incident.incidentId)) continue;
       const i = e.incident;
       const position = (id: SegmentRowId | null, fallback: number) => {
@@ -2380,7 +2458,7 @@ class V2Storage {
     const key = v2SessionKey(session); let after = '';
     if (cursor) { const c = this.untoken(cursor); fhAssert(c.kind === 'panes' && c.session === key && c.store === this.storeId, 'v2 pane cursor'); after = c.after; }
     const panes: NewarchV2PaneDescriptor[] = []; let last = after;
-    for (const row of this.#db.query('SELECT pane FROM fh_v2_pane WHERE session=? AND pane>? ORDER BY pane LIMIT 257').iterate(key, after) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, 'SELECT pane FROM fh_v2_pane WHERE session=? AND pane>? ORDER BY pane LIMIT 257', key, after)) {
       if (panes.length === 256) return { panes, next: this.token({ kind: 'panes', session: key, store: this.storeId, after: last }) };
       const parts = JSON.parse(String(row.pane)); const owner = this.owner({ serverIdentity: parts[0], paneId: parts[1], birthGeneration: parts[2] });
       fhAssert(owner, 'v2 missing indexed owner'); fhAssert(bytes(panes) + bytes(owner.pane) < V2L.pageBytes, 'v2 pane page bound');
@@ -2391,7 +2469,7 @@ class V2Storage {
   private seal(pane: PaneKey, segment: string, receipt: V2Receipt): void {
     const key = v2PaneKey(pane); nonempty(segment); fhAssert(!this.get('segment-seal', key, segment), 'v2 segment already sealed');
     const rows: CommittedStreamRow[] = []; let rowBytes = 2;
-    for (const row of this.#db.query("SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n").iterate(key, segment) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n", key, segment)) {
       const entry = this.timeline(row); if (entry.kind === 'row') { rows.push(entry.row); rowBytes += bytes(entry.row) + 1; }
       fhAssert(rowBytes <= FB.archiveChunkBytes / 2 + 2 && rows.length <= 65536, 'v2 segment seal bound');
     }
@@ -2410,7 +2488,7 @@ class V2Storage {
     // File creation precedes the DB receipt. If that transaction died, all
     // rows are still local and no public export exists. Reap only names
     // derived from our durable seals, never arbitrary files in the root.
-    for (const row of this.#db.query("SELECT pane,id FROM fh_v2_object WHERE kind='seal'").iterate() as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT pane,id FROM fh_v2_object WHERE kind='seal'")) {
       const seal = this.get<LogicalSealR2>('seal', String(row.pane), String(row.id));
       fhAssert(seal, 'v2 missing seal');
       if (this.get('segment-export', String(row.pane), seal.segmentId)) continue;
@@ -2478,7 +2556,7 @@ class V2Storage {
     fhAssert(locator && locator.segmentId === segment, 'v2 reclaim locator');
     const exported = this.get<SealedExport>('segment-export', key, segment); fhAssert(exported, 'v2 reclaim export');
     fhAssert(this.hooks.remoteReadback?.(locator, exported) === true, 'v2 reclaim readback unavailable');
-    for (const row of this.#db.query("SELECT id FROM fh_v2_object WHERE kind='pin' AND pane=?").iterate(key) as Iterable<SqlRow>) {
+    for (const row of fhRows(this.#db, "SELECT id FROM fh_v2_object WHERE kind='pin' AND pane=?", key)) {
       const pin = this.get<{ segmentId: string; released: boolean }>('pin', key, String(row.id));
       fhAssert(pin?.segmentId !== segment || pin.released, 'v2 segment pinned');
     }
