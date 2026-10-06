@@ -7,10 +7,10 @@ import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolve, dirname, join, sep } from 'node:path';
 import { closeSync, existsSync, readdirSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { deflateSync as zlibDeflateSync, inflateSync } from 'node:zlib';
 import { FLAGON_BUDGET as FB, cellToSemanticCell, normalizedRowsDigest, normalizedGapDigest, normalizedCoverageDigest, coverageProjectionDigest, attachCoverage, archiveInventoryMatches, archiveInventoryDigest, segmentContinuityDigest, orderedControlDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest, gapIdentity, validGapUpdate } from './stream-contract';
 import type { FlagOnHistoryPort, SpoolRecord, SpoolAck, RowsAndGapsCommit, RowsAndGapsReceipt, FlagOnRecoveryChunk, RawPosition, OperationFence, PinRequest, SegmentPin, SealedExport, RemoteIndexReceipt, ReclaimReceipt, EvidenceFile, Coverage, CommittedStreamRow } from './stream-contract';
-import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical, streamDigest } from './stream-contract';
+import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical as scStreamCanonical, streamDigest } from './stream-contract';
 import type { AppendFinalized, CancelToken, CheckpointCommit, DurableInputReceipt, DurableReceipt,
   FinalizedRow, GapEpisode, HistoryEngine, HistoryPage, HistoryPageCheckpoint, InputEvent, PaneKey, PageCursor,
   RamReceipt, ReadOpenAck, ReadRequest, ReadView, RecoveryChunk, RepairChunk, RepairReceipt,
@@ -20,6 +20,33 @@ import type { FlagOnHistoryR2, HistoryAuthorityR2, CatalogAuthorityR2, Coalesced
 import type { NewarchHistoryCursor, NewarchHistoryContinuation, NewarchHistoryState } from '@thumbmux/core';
 
 export { streamCanonical, streamDigest } from './stream-contract';
+// H-PERF profile probe: exclusive milliseconds per bucket of the ONE V2 commit
+// in progress. Set only while an `observe` hook is attached, for the span of
+// one synchronous commit; null otherwise, so each wrapped call below costs one
+// null check. It records time and never chooses a path or skips work. Time
+// outside every bucket is SQL+other. A decode span keeps the canonical/hash
+// work it does itself; the commit span is COMMIT and SQLite's return, not fsync alone.
+type V2ProfileBucket = 'canonical' | 'decode' | 'pack' | 'commit';
+let v2Probe: { at: number; stack: V2ProfileBucket[]; ms: Record<V2ProfileBucket, number> } | null = null;
+function v2Enter(bucket: V2ProfileBucket): boolean {
+  const p = v2Probe, top = p?.stack.at(-1);
+  if (!p || top === 'decode') return false;
+  const now = performance.now(); if (top) p.ms[top] += now - p.at; p.at = now; p.stack.push(bucket); return true;
+}
+function v2Leave(bucket: V2ProfileBucket): void {
+  const p = v2Probe; if (!p || p.stack.at(-1) !== bucket) return;
+  const now = performance.now(); p.ms[bucket] += now - p.at; p.at = now; p.stack.pop();
+}
+function v2Span<T>(bucket: V2ProfileBucket, f: () => T): T {
+  if (!v2Enter(bucket)) return f();
+  try { return f(); } finally { v2Leave(bucket); }
+}
+function streamCanonical(value: unknown, encode?: (value: unknown) => string): string {
+  return v2Probe ? v2Span('canonical', () => scStreamCanonical(value, encode)) : scStreamCanonical(value, encode);
+}
+function deflateSync(data: Buffer, options: { level: number }): Buffer {
+  return v2Probe ? v2Span('pack', () => zlibDeflateSync(data, options)) : zlibDeflateSync(data, options);
+}
 function frozen<T>(value: T): T {
   if (value && typeof value === 'object') { for (const item of Object.values(value)) frozen(item); Object.freeze(value); }
   return value;
@@ -1775,8 +1802,8 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
 
 // Q22 storage adapter. Uses the existing H database and its lifetime OS lock;
 // it does not expose the backing store or a legacy write port to its callers.
-import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint, validateV2Incident,
-  validateV2ReadRequest, v2Digest, v2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
+import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint as scValidateV2Checkpoint, validateV2Incident,
+  validateV2ReadRequest, v2Digest as scV2Digest, v2WriteDigest as scV2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
   v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest,
   v2LegacyStorageProfile, validateV2StorageProfile, v2StorageProfileDigest, v2DatabasePageLimit } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
@@ -1786,6 +1813,27 @@ import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapabi
   NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
   V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation, V2StorageProfile } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
+// Profiled names of the SC calls H makes (see v2Probe); same arguments, same result.
+const v2Digest: typeof scV2Digest = (kind, payload, encode) =>
+  v2Probe ? v2Span('canonical', () => scV2Digest(kind, payload, encode)) : scV2Digest(kind, payload, encode);
+const v2WriteDigest: typeof scV2WriteDigest = request =>
+  v2Probe ? v2Span('canonical', () => scV2WriteDigest(request)) : scV2WriteDigest(request);
+const validateV2Checkpoint: typeof scValidateV2Checkpoint = (c, encode) =>
+  v2Probe ? v2Span('canonical', () => scValidateV2Checkpoint(c, encode)) : scValidateV2Checkpoint(c, encode);
+/** H-PERF: what one V2 commit did, for tests and the profile run only. An
+ * observer: nothing in H reads it back or picks a path by it. */
+export type V2WorkEvent =
+  /** The live checkpoint was read, inflated, checksummed, parsed and canonical-checked (in get()). */
+  | { readonly kind: 'checkpoint-decode' }
+  /** A full canonical traversal over `rows` rows of command data. */
+  | { readonly kind: 'row-encode'; readonly rows: number }
+  /** Exclusive ms of the commit's spans; the caller's outer clock minus their sum is SQL+other. */
+  | { readonly kind: 'commit-profile'; readonly canonicalMs: number; readonly decodeMs: number; readonly packMs: number; readonly commitMs: number };
+/** Rows of a batch command, without trusting its shape (observer counting only). */
+function v2BatchRows(command: unknown): number {
+  const c = command as { kind?: unknown; batch?: { rows?: unknown } } | null;
+  return c?.kind === 'batch' && Array.isArray(c.batch?.rows) ? c.batch.rows.length : 0;
+}
 function v2Failure(error: unknown): StreamFailure {
   const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
   if (/^SQLITE_(BUSY|LOCKED)/.test(code) || /database is locked/i.test(String(error)))
@@ -1810,6 +1858,8 @@ export interface V2HistoryOptions {
   remoteReadback?: (locator: V2RemoteLocator, exported: SealedExport) => boolean;
   /** O's bounded restore cache. Null/missing stays blocked, never becomes EOF. */
   remoteRow?: (locator: V2RemoteLocator, row: SegmentRowId) => Result<CommittedStreamRow | null>;
+  /** H-PERF observer: work counters and the profile spans of each commit. */
+  observe?: (event: V2WorkEvent) => void;
 }
 export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryWithAuthority {
   return Object.freeze({ async openForCapture(request: Parameters<V2HistoryFactory['openForCapture']>[0]): Promise<Result<V2OpenedWithAuthority>> {
@@ -1927,6 +1977,7 @@ function v2RowShape(row: CommittedStreamRow): void {
 function v2CanonicalValue(payload: string): unknown {
   const value: unknown = JSON.parse(payload);
   fhAssert(streamCanonical(value) === payload, 'v2 storage canonical equality');
+  v2Leave('decode'); // closes get()'s checkpoint decode span; a no-op otherwise
   return value;
 }
 class V2Storage {
@@ -1989,7 +2040,7 @@ class V2Storage {
   }
   ports(): V2OpenedWithAuthority {
     const writer: V2HistoryWriter = Object.freeze({
-      commit: (c: V2WriterCapability, r: V2WriteRequest) => this.commit(c, r),
+      commit: (c: V2WriterCapability, r: V2WriteRequest) => this.profiled(() => this.commit(c, r)),
       reserveBirth: (c: V2WriterCapability, r: V2SessionReservation) => this.reserve(c, r),
       cancelBirth: (c: V2WriterCapability, r: V2CancelBirth) => this.cancel(c, r),
       close: async (c: V2WriterCapability): Promise<Result<null>> => {
@@ -2018,6 +2069,18 @@ class V2Storage {
     return { capability: this.#cap, writer, reader, authority };
   }
   private live(): void { fhAssert(!this.#closed, 'v2 store closed'); }
+  private observeRows(rows: number): void { if (rows > 0) this.hooks.observe?.({ kind: 'row-encode', rows }); }
+  /** Runs one commit with the profile probe on when an observer is attached;
+   * its synchronous part (the whole transaction) ends before this returns. */
+  private profiled<T>(f: () => T): T {
+    const observe = this.hooks.observe;
+    if (!observe) return f();
+    const probe = v2Probe = { at: performance.now(), stack: [] as V2ProfileBucket[], ms: { canonical: 0, decode: 0, pack: 0, commit: 0 } };
+    try { return f(); } finally {
+      const ms = probe.ms; v2Probe = null;
+      observe({ kind: 'commit-profile', canonicalMs: ms.canonical, decodeMs: ms.decode, packMs: ms.pack, commitMs: ms.commit });
+    }
+  }
   private authorize(c: V2WriterCapability): void {
     this.live(); fhAssert(c === this.#cap, 'v2 forged capability');
     const row = this.#db.query('SELECT generation FROM fh_v2_meta WHERE id=1').get() as SqlRow;
@@ -2080,8 +2143,10 @@ class V2Storage {
       const result = this.#db.transaction(() => {
         this.authorize(cap); // The registry/generation check is inside EVERY write transaction.
         this.hooks.boundary?.(phase + '-before-write');
-        const value = f(); this.hooks.boundary?.(phase + '-before-commit'); return value;
+        const value = f(); this.hooks.boundary?.(phase + '-before-commit');
+        v2Enter('commit'); return value;
       }).immediate();
+      v2Leave('commit');
       // Committed: checkpoint now. Best effort and AFTER the growth, so this is
       // not a peak bound; the check above refuses the next write.
       try { this.walOverBudget(); } catch { /* next write refuses */ }
@@ -2091,7 +2156,9 @@ class V2Storage {
   private get<T>(kind: string, pane: string, id: string): T | null {
     const r = this.#db.query('SELECT payload,checksum FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, pane, id) as SqlRow | null;
     if (!r) return null;
+    if (kind === 'checkpoint') v2Enter('decode');
     const payload = v2Unpack(r.payload, V2L.checkpointBytesPerPane + V2L.pageBytes);
+    if (kind === 'checkpoint') this.hooks.observe?.({ kind: 'checkpoint-decode' });
     fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload }), 'v2 corrupt object');
     return v2CanonicalValue(payload) as T;
   }
@@ -2160,6 +2227,7 @@ class V2Storage {
   private async commit(cap: V2WriterCapability, r: V2WriteRequest): Promise<Result<V2Receipt>> {
     const result = this.tx(cap, 'v2-' + r.command.kind, () => {
       const key = v2PaneKey(r.fence.pane), command = r.command;
+      if (this.hooks.observe) this.observeRows(2 * v2BatchRows(command)); // bytes(command) and v2WriteDigest(r)
       fhAssert(bytes(command) <= V2L.checkpointBytesPerPane + V2L.pageBytes, 'v2 command bound');
       fhAssert(v2WriteDigest(r) === r.fence.digest, 'v2 write digest');
       let owner = this.owner(r.fence.pane);
@@ -2251,6 +2319,7 @@ class V2Storage {
         case 'batch': {
           fhAssert(next.pane.state === 'active', 'v2 stopped capture');
           const b = command.batch;
+          if (this.hooks.observe) this.observeRows(v2BatchRows(command)); // bytes(b.rows)
           fhAssert(b.rows.length <= V2L.pendingRowsPerPane && b.decisions.length <= V2L.pendingRowsPerPane
             && b.incidents.length <= V2L.pageEntries && bytes(b.rows) <= V2L.pageBytes, 'v2 batch bound');
           // Record ACK keeps its exact-through branch; a source-prefix must start at
@@ -2266,6 +2335,7 @@ class V2Storage {
             fhAssert(!this.get('segment-seal', key, row.id.segmentId), 'v2 sealed segment');
             const metrics = this.get<{ bytes: number; rows: number }>('segment-stats', key, row.id.segmentId)
               ?? this.segmentMetrics(key, row.id.segmentId);
+            this.observeRows(1); // bytes(row)
             const rowBytes = metrics.bytes + bytes(row) + 1;
             fhAssert(rowBytes <= FB.archiveChunkBytes / 2 && metrics.rows < 65536, 'v2 segment full; seal and rotate');
             fhAssert(row.id.rowOrdinal === metrics.rows, 'v2 row order');
@@ -2334,6 +2404,7 @@ class V2Storage {
   }
   private append(pane: string, revision: number, kind: string, id: string, segment: string, value: unknown): void {
     const n = Number((this.#db.query('SELECT COALESCE(MAX(n),0)+1 AS n FROM fh_v2_timeline WHERE pane=?').get(pane) as SqlRow).n);
+    if (kind === 'row') this.observeRows(1);
     const payload = streamCanonical(value); fhAssert(Buffer.byteLength(payload) <= V2L.pageBytes - 64, 'v2 timeline entry bound');
     this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, kind === 'row' ? v2Pack(payload) : payload,
       v2Digest('timeline', { pane, n, revision, kind, id, segment, payload }));
