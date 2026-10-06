@@ -1300,6 +1300,107 @@ export function v2StorageAllowance(c: V2Config, u: V2StorageUsage): {
   if (u.reserveAllocatedBytes > c.storage.emergencyReserveBytes) throw Error('v2 reserve overflow');
   return { dataBudgetBytes, dataUsedBytes, availableDataBytes: Math.max(0, dataBudgetBytes - dataUsedBytes) };
 }
+/** HS2: a named storage profile is the budget a root is born with. The
+ * allocation manifest splits the data budget (rootCap-reserve) per class for
+ * the WHOLE root (all panes share it); null keeps the legacy shared budget
+ * where the database gets half of the data budget. V2StorageBudget itself is
+ * unchanged: validateV2Config walks its values, so a new field there breaks. */
+export type V2AllocationClass = 'database' | 'wal' | 'raw' | 'staging' | 'diagnostic' | 'other';
+export interface V2AllocationManifest {
+  readonly databaseBytes: number; readonly walBytes: number; readonly rawBytes: number;
+  readonly stagingBytes: number; readonly diagnosticBytes: number; readonly otherBytes: number;
+}
+export interface V2StorageProfile {
+  readonly name: string; readonly storage: V2StorageBudget;
+  readonly allocation: V2AllocationManifest | null;
+}
+const V2_ALLOCATION_FIELDS: Readonly<Record<V2AllocationClass, keyof V2AllocationManifest>> = Object.freeze({
+  database: 'databaseBytes', wal: 'walBytes', raw: 'rawBytes', staging: 'stagingBytes',
+  diagnostic: 'diagnosticBytes', other: 'otherBytes' });
+export const NEWARCH_V2_STORAGE_PROFILES: { readonly 'default-256m': V2StorageProfile; readonly 'r-canary-8g': V2StorageProfile } = Object.freeze({
+  // The default config's own budget object, not a copy: one source of truth.
+  'default-256m': Object.freeze({ name: 'default-256m', storage: NEWARCH_V2_DEFAULT_CONFIG.storage, allocation: null }),
+  // kem/orchestrator 2026-10-06: R canary = 8 GiB per root for all 21 panes,
+  // reserve unchanged. 5,400 MiB allocated + 16 MiB reserve = 5,416 MiB; the
+  // remaining 2,776 MiB is headroom nobody may allocate.
+  'r-canary-8g': Object.freeze({ name: 'r-canary-8g',
+    storage: Object.freeze({ rootCapBytes: 8192 * MiB, emergencyReserveBytes: 16 * MiB,
+      reservePerPaneBytes: 256 * 1024, reserveSharedBytes: 8 * MiB,
+      diagnosticCapBytes: 64 * MiB, stagingCapBytes: 32 * MiB }),
+    allocation: Object.freeze({ databaseBytes: 4088 * MiB, walBytes: 1024 * MiB, rawBytes: 128 * MiB,
+      stagingBytes: 32 * MiB, diagnosticBytes: 64 * MiB, otherBytes: 64 * MiB }) }),
+});
+/** Callers that pass no profile keep exactly the pre-HS2 budget. */
+export function v2LegacyStorageProfile(storage: V2StorageBudget): V2StorageProfile {
+  return Object.freeze({ name: 'legacy', storage, allocation: null });
+}
+export function validateV2StorageProfile(p: V2StorageProfile, c: V2Config): void {
+  try {
+    v2Text(p.name, 64); validateV2Config({ ...c, storage: p.storage });
+    const s = p.storage, a = p.allocation;
+    if (a === null) return;
+    const fields = Object.values(V2_ALLOCATION_FIELDS);
+    if (Object.keys(a).length !== fields.length) throw Error('allocation fields');
+    let total = 0;
+    for (const field of fields) { v2Int(a[field], 1); total += a[field]; }
+    v2Int(total);
+    if (a.databaseBytes < MiB || a.stagingBytes !== s.stagingCapBytes || a.diagnosticBytes !== s.diagnosticCapBytes
+      || total > s.rootCapBytes - s.emergencyReserveBytes) throw Error('allocation bound');
+  } catch (error) { throw Error('v2 storage profile: ' + String(error)); }
+}
+/** Binds what a root may hold (storage + allocation), not its name and not
+ * geometry/rules/configVersion: editing those must still reopen the root. */
+export function v2StorageProfileDigest(p: V2StorageProfile): Digest {
+  const s = p.storage, a = p.allocation;
+  return v2Digest('storage-profile', {
+    storage: { rootCapBytes: s.rootCapBytes, emergencyReserveBytes: s.emergencyReserveBytes,
+      reservePerPaneBytes: s.reservePerPaneBytes, reserveSharedBytes: s.reserveSharedBytes,
+      diagnosticCapBytes: s.diagnosticCapBytes, stagingCapBytes: s.stagingCapBytes },
+    allocation: a && { databaseBytes: a.databaseBytes, walBytes: a.walBytes, rawBytes: a.rawBytes,
+      stagingBytes: a.stagingBytes, diagnosticBytes: a.diagnosticBytes, otherBytes: a.otherBytes } });
+}
+/** SQLite max_page_count for H at the root's REAL page size. Legacy keeps
+ * half of the data budget for the database so DB + WAL fit (default at
+ * 4096 B pages: 30,720 pages, the pre-HS2 value). */
+export function v2DatabasePageLimit(p: V2StorageProfile, pageSize: number): number {
+  v2Int(pageSize, 512, 65536);
+  if ((pageSize & (pageSize - 1)) !== 0) throw Error('v2 page size');
+  const s = p.storage;
+  const databaseBytes = p.allocation ? p.allocation.databaseBytes : Math.floor((s.rootCapBytes - s.emergencyReserveBytes) / 2);
+  return Math.floor(databaseBytes / pageSize);
+}
+/** One ledger per ROOT. Pure admission only: making it durable and shared by
+ * S and H across processes (host down included) belongs to HS3. */
+export interface V2AllocationLedger {
+  readonly version: number; readonly used: Readonly<Record<V2AllocationClass, number>>;
+  readonly reserveUsedBytes: number;
+}
+export type V2AllocationRequest = { readonly expectedVersion: number; readonly cls: V2AllocationClass | 'emergency'; readonly bytes: number };
+export function v2AllocationReserve(p: V2StorageProfile, l: V2AllocationLedger, r: V2AllocationRequest):
+  { readonly ok: true; readonly ledger: V2AllocationLedger }
+  | { readonly ok: false; readonly reason: 'stale-ledger' | 'class-cap' | 'data-budget' | 'reserve' } {
+  if (r.expectedVersion !== l.version) return { ok: false, reason: 'stale-ledger' };
+  v2Int(l.version); v2Int(r.bytes, 1); v2Int(l.reserveUsedBytes);
+  const s = p.storage, dataBudget = s.rootCapBytes - s.emergencyReserveBytes;
+  const classes = Object.keys(V2_ALLOCATION_FIELDS) as V2AllocationClass[];
+  let used = 0;
+  for (const cls of classes) { v2Int(l.used[cls]); used += l.used[cls]; }
+  if (r.cls === 'emergency') {
+    // Only an emergency may spend the reserve; it never counts as data.
+    if (l.reserveUsedBytes + r.bytes > s.emergencyReserveBytes) return { ok: false, reason: 'reserve' };
+    return { ok: true, ledger: Object.freeze({ version: l.version + 1, used: Object.freeze({ ...l.used }),
+      reserveUsedBytes: l.reserveUsedBytes + r.bytes }) };
+  }
+  if (!classes.includes(r.cls)) throw Error('v2 allocation class');
+  const a = p.allocation;
+  const cap = a ? a[V2_ALLOCATION_FIELDS[r.cls]]
+    : r.cls === 'database' ? Math.floor(dataBudget / 2)
+    : r.cls === 'staging' ? s.stagingCapBytes : r.cls === 'diagnostic' ? s.diagnosticCapBytes : dataBudget;
+  if (l.used[r.cls] + r.bytes > cap) return { ok: false, reason: 'class-cap' };
+  if (used + r.bytes > dataBudget) return { ok: false, reason: 'data-budget' };
+  return { ok: true, ledger: Object.freeze({ version: l.version + 1,
+    used: Object.freeze({ ...l.used, [r.cls]: l.used[r.cls] + r.bytes }), reserveUsedBytes: l.reserveUsedBytes }) };
+}
 
 /** unknown = owner store unreadable/incomplete OR identity not revalidated
  * after await. Never treat it as absence. legacy requires authoritative proof
@@ -1538,7 +1639,10 @@ export interface V2CaptureWriteFacade {
  * its process lifetime and atomically increments generation on exclusive open.
  * An unreadable owner/schema store fails closed before ANY writer starts. */
 export interface V2HistoryFactory {
-  openForCapture(request: { readonly rootId: string; readonly engineId: string; readonly config: V2Config }):
+  openForCapture(request: { readonly rootId: string; readonly engineId: string; readonly config: V2Config;
+    /** HS2: omitted = v2LegacyStorageProfile(config.storage). Its storage must
+     * equal config.storage; the root keeps the digest it was first opened with. */
+    readonly storageProfile?: V2StorageProfile }):
     Promise<Result<{ readonly capability: V2WriterCapability; readonly writer: V2HistoryWriter; readonly reader: V2HistoryReader }>>;
 }
 export interface V2GeometryObservation {
