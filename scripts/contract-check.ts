@@ -1462,6 +1462,36 @@ function isV0205PatchException(
   return V0205_REVIEWED_ADDITIONS.has(reviewed);
 }
 
+/**
+ * Reviewed optional additions for 0.20.5 -> 0.21.0 (WJ-A semantic submit).
+ * - svelte PromptsPanel (F): new optional `entries?` prop, and its optional
+ *   `labels?` inline object gained optional `sourceUi?` `sourceScreen?`
+ *   `uncertain?`. The generic proof sees only direct optional members, so the
+ *   changed hash of the `labels` member reads as a removal.
+ * - app DEFAULT_APP_LABELS (S): the frozen default object gained the four
+ *   0.21.0 label strings; every existing key keeps its value and type.
+ * The four keys are optional on `AppLabels`, so AppLabels, AppAdapters and the
+ * shells pass the generic proof and need no row. Pin both artifact digests and
+ * versions; unrelated drift still fails.
+ */
+const V0210_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
+  "svelte:PromptsPanel:a01d69dc347c3a26ab42fe661d95bbcd9fc74387a88c9b7dcb204feaa5f39a8e:62ff18e2aa2b7c89a0e0086e4700a7a2310856060ff16a7aa4e90fb48786bdf5",
+  "app:DEFAULT_APP_LABELS:fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0:96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
+]);
+
+function isV0210MinorException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.20.5" || currentVersion !== "0.21.0") return false;
+  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
+  return V0210_REVIEWED_ADDITIONS.has(reviewed);
+}
+
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1645,6 +1675,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV0190MinorException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0210MinorException(
           baselineVersion,
           currentVersion,
           subpath,

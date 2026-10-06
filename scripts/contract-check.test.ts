@@ -1403,3 +1403,34 @@ describe("0.20.5 reviewed createBunTmuxDriver return widening", () => {
       .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
   });
 });
+
+describe("0.21.0 reviewed WJ-A optional additions", () => {
+  // Pairs copied from the two artifacts (v0.20.5-dist baseline, 0.21.0 git-dist),
+  // not read back from V0210_REVIEWED_ADDITIONS, so the gate and this test hold
+  // separate copies.
+  const pairs = [
+    "svelte:PromptsPanel:a01d69dc347c3a26ab42fe661d95bbcd9fc74387a88c9b7dcb204feaa5f39a8e:62ff18e2aa2b7c89a0e0086e4700a7a2310856060ff16a7aa4e90fb48786bdf5",
+    "app:DEFAULT_APP_LABELS:fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0:96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
+  ];
+  for (const pair of pairs) {
+    test(pair.split(":").slice(0, 2).join(":"), () => {
+      const [subpath, name, before, after] = pair.split(":") as ["svelte" | "app", string, string, string];
+      const tier = subpath === "svelte" ? "F" as const : "S" as const;
+      const oldEntry = { name, kind: "value" as const, tier, signature: before, compatibilitySignature: before };
+      const newEntry = { name, kind: "value" as const, tier, signature: after, compatibilitySignature: after };
+      const run = (oldLive = oldEntry, newLive = newEntry, oldVersion = "0.20.5", newVersion = "0.21.0") =>
+        evaluateBaseline(subpath, [oldEntry], [newEntry], [oldLive], [newLive], oldVersion, newVersion).errors;
+      expect(run()).toEqual([]);
+      expect(run(oldEntry, { ...newEntry, compatibilitySignature: "narrowed-unreviewed-declaration" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run({ ...oldEntry, compatibilitySignature: "different-prior-artifact" }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.4"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(run(oldEntry, newEntry, "0.20.5", "0.22.0"))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-signature-change" })]));
+      expect(evaluateBaseline(subpath, [oldEntry], [], [oldEntry], [], "0.20.5", "0.21.0").errors)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
+    });
+  }
+});
