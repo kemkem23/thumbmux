@@ -1812,7 +1812,7 @@ import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint as scV
   v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest,
   v2LegacyStorageProfile, validateV2StorageProfile, v2StorageProfileDigest, v2DatabasePageLimit } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
-  V2WriteRequest, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
+  V2WriteRequest, V2WriteCommand, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
   V2SessionReservationReceipt, V2CancelBirth, V2LiveCheckpoint, V2AuditResult, V2HistoryPage,
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
   NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
