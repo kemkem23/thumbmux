@@ -2312,12 +2312,14 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
       ['finalized', r => r.finalized = false],
     ];
     const outcomes: Record<string, string[]> = {}, reasons: string[] = [];
+    h2value(await f.port.writer.close(f.port.capability));
     for (const packed of [false, true]) for (const [name, change] of [...cases, ['canonical', (_: any) => {}] as [string, (r: any) => void]]) {
       const row = JSON.parse(original); change(row);
       const payload = H2.streamCanonical(row) + (name === 'canonical' ? ' ' : '');
       const stored = packed ? Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(payload))]) : payload;
       const checksum = H2.v2Digest('timeline', { pane: target.pane, n: target.n, revision: target.revision, kind: target.kind, id: target.id, segment: target.segment, payload });
       hs1Db(f.root, db => db.query('UPDATE fh_v2_timeline SET payload=?,checksum=? WHERE pane=? AND n=?').run(stored, checksum, key, target.n));
+      await f.reload();
       const read = await hs1ReadAll(f);
       const exported = await f.port.writer.commit(f.port.capability, f.request({ kind: 'materialize-export', sealCommitId: sealed.commitId }, `bad-export-${packed}-${name}`));
       h2value(await f.port.writer.close(f.port.capability)); await f.reload();
@@ -2326,6 +2328,7 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
       hs1Db(f.root, db => db.query("DELETE FROM fh_v2_object WHERE kind='segment-seal' AND pane=? AND id=?").run(key, st.segment));
       const seal = await f.port.writer.commit(f.port.capability, f.request({ kind: 'seal', segmentId: st.segment }, `bad-seal-${packed}-${name}`));
       outcomes[`${packed}:${name}`] = [read.status, exported.status, reopened.status, seal.status];
+      h2value(await f.port.writer.close(f.port.capability));
       for (const result of [read, exported, reopened, seal]) if (result.status === 'error') reasons.push(JSON.stringify(result));
     }
     console.log('HS1_SHAPE_OUTCOMES', JSON.stringify(outcomes));
