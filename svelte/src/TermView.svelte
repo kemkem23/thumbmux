@@ -5877,7 +5877,9 @@
     const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
     const flagOn = parseHistoryPageFlagOn(payload as object);
     const continuation = flagOn === undefined ? undefined : flagOnContinuation(flagOn, 'before', history.hasMore);
-    if (continuation === undefined) {
+    // flagOn === undefined always yields continuation === undefined; the
+    // explicit check narrows flagOn for recordHistoryStatus.
+    if (flagOn === undefined || continuation === undefined) {
       finishArchiveRequest('malformed');
       return;
     }
