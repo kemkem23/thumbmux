@@ -1842,6 +1842,51 @@ function v2Unpack(stored: unknown, limit: number): string {
   fhAssert(decoded.engine.bytesWritten === compressed.byteLength, 'v2 storage trailing data');
   return new TextDecoder('utf-8', { fatal: true }).decode(decoded.buffer);
 }
+/** Validate the logical row independently of its disk checksum. Also used before ACK. */
+function v2RowShape(row: CommittedStreamRow): void {
+  try {
+    const key = (text: string) => {
+      nonempty(text);
+      fhAssert(text.isWellFormed() && Buffer.byteLength(text) <= V2L.maxIdentityBytes, 'identity bound');
+    };
+    const pane = (p: PaneKey) => { paneKey(p); key(p.serverIdentity); key(p.paneId); };
+    const rowId = (id: SegmentRowId) => {
+      pane(id.pane); key(id.segmentId); safe(id.rowOrdinal);
+      fhAssert(equal(id.pane, row.id.pane), 'origin pane');
+    };
+    rowId(row.id); geometry(row.geometry);
+    fhAssert(row.geometry.columns <= V2L.maxColumns && row.geometry.rows <= V2L.maxRows, 'geometry');
+    content({ ...row, softWrap: row.wrapStatus === 'wrapped' });
+    fhAssert(row.cells.length === row.geometry.columns, 'cell count');
+    fhAssert(row.finalized === true && ['normal', 'alternate'].includes(row.buffer)
+      && ['wrapped', 'unwrapped', 'unknown'].includes(row.wrapStatus), 'row metadata');
+    fhAssert(row.wrapPad <= 1 && (row.wrapPad === 0 || row.wrapStatus === 'wrapped'), 'wrap pad');
+    for (let i = 0; i < row.cells.length; i++) {
+      const cell = row.cells[i]!;
+      fhAssert(cell.width !== 2 || row.cells[i + 1]?.width === 0, 'wide cell continuation');
+      fhAssert(cell.width !== 0 || (i > 0 && row.cells[i - 1]!.width === 2 && cell.text === ''), 'orphan continuation');
+    }
+    const origin = (o: CommittedStreamRow['origin']) => {
+      switch (o.kind) {
+        case 'durable': rowId(o.rowId); break;
+        case 'capture': key(o.snapshotId); safe(o.rowIndex); break;
+        case 'pipe':
+          pane(o.range.epoch.pane); key(o.range.epoch.attachId); key(o.range.epoch.collectorIncarnation);
+          safe(o.range.start); safe(o.range.end); safe(o.ordinal);
+          fhAssert(o.range.start <= o.range.end && equal(o.range.epoch.pane, row.id.pane), 'origin range/pane'); break;
+        default: throw Error('origin kind');
+      }
+    };
+    origin(row.origin);
+    fhAssert(Array.isArray(row.cellOrigins) && row.cellOrigins.length === row.cells.length, 'origin count');
+    row.cellOrigins.forEach(origin);
+  } catch (error) { throw Error('v2 row shape: ' + String(error)); }
+}
+function v2CanonicalValue(payload: string): unknown {
+  const value: unknown = JSON.parse(payload);
+  fhAssert(streamCanonical(value) === payload, 'v2 storage canonical equality');
+  return value;
+}
 class V2Storage {
   readonly #db: Database;
   readonly #cap: V2WriterCapability;
@@ -1968,7 +2013,7 @@ class V2Storage {
     if (!r) return null;
     const payload = v2Unpack(r.payload, V2L.checkpointBytesPerPane + V2L.pageBytes);
     fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload }), 'v2 corrupt object');
-    return JSON.parse(payload) as T;
+    return v2CanonicalValue(payload) as T;
   }
   private put(kind: string, pane: string, id: string, value: unknown): void {
     nonempty(id); const payload = streamCanonical(value);
@@ -2130,7 +2175,7 @@ class V2Storage {
           fhAssert(durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint),
             'v2 durable input authority');
           for (const row of b.rows) {
-            content({ ...row, softWrap: row.wrapStatus === 'wrapped' }); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
+            v2RowShape(row); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
             nonempty(row.id.segmentId); safe(row.id.rowOrdinal);
             fhAssert(!this.get('segment-seal', key, row.id.segmentId), 'v2 sealed segment');
             const metrics = this.get<{ bytes: number; rows: number }>('segment-stats', key, row.id.segmentId)
@@ -2213,6 +2258,13 @@ class V2Storage {
     const payload = v2Unpack(r.payload, V2L.pageBytes - 64);
     fhAssert(r.checksum === v2Digest('timeline', { pane: r.pane, n: r.n, revision: r.revision,
       kind: r.kind, id: r.id, segment: r.segment, payload }), 'v2 corrupt timeline');
+    const value = v2CanonicalValue(payload);
+    if (r.kind === 'row') {
+      const row = value as CommittedStreamRow;
+      v2RowShape(row);
+      fhAssert(v2PaneKey(row.id.pane) === r.pane && streamCanonical(row.id) === r.id
+        && row.id.segmentId === r.segment, 'v2 row storage identity');
+    }
     return { ...r, payload };
   }
   private timeline(r: V2StoredRow): V2HistoryPage['entries'][number] {
