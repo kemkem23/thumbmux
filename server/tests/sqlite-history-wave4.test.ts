@@ -2472,11 +2472,11 @@ test('HS2 storage profile is durable and a mismatched reopen refuses before any 
     await f.activate();
     const born = f.port.capability.generation;
     h2value(await f.port.writer.close(f.port.capability));
-    expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(A) }]);
     for (const other of [{ config: hs2SmallConfig, storageProfile: B }, { config: hs2SmallConfig }]) {
       expect(await attempt(other)).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
       expect(generation()).toBe(born);
     }
+    expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(A) }]);
     // A profile whose budget is not the config's budget never opens anything.
     expect(await attempt({ storageProfile: A })).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile') });
     expect(generation()).toBe(born);
