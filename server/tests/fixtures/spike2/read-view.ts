@@ -3,6 +3,8 @@ import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import { prepared } from '../../../src/sqlite-history/ram-store';
 
+const RPC_DEADLINE_MS = 5000;
+
 /** Disposable spike adapter. The store's existing coordinator owns all grants.
  * Only encoded immutable SQL rows cross to the single read/match worker. */
 export class ReadViewCoordinator {
@@ -29,10 +31,17 @@ export class ReadViewCoordinator {
     worker.on('exit', code => { if (this.worker === worker) this.worker = null; fail(new Error(`read worker exited ${code}`)); });
     worker.unref(); return worker;
   }
+  /** Every reply has a deadline: a reply that never arrives fails the caller
+   * instead of leaving it, and the test's cleanup behind it, waiting forever. */
   rpc(op: string, input: any): Promise<any> {
     this.stats.operations[op]=(this.stats.operations[op]??0)+1;
     const worker = this.ensureWorker(), id = ++this.sequence;
-    return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); worker.postMessage({ id, op, input: op === 'begin' ? {...input, scratch:this.scratch.shared} : input }); });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`read worker ${op} reply missed ${RPC_DEADLINE_MS}ms deadline`)); }, RPC_DEADLINE_MS);
+      const settle = <T>(f: (value: T) => void) => (value: T) => { clearTimeout(timer); f(value); };
+      this.pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
+      worker.postMessage({ id, op, input: op === 'begin' ? {...input, scratch:this.scratch.shared} : input });
+    });
   }
   async open(key: any, deadline: number, signal?: AbortSignal) {
     if (this.active) throw new Error('read-view-busy');
@@ -82,7 +91,9 @@ export class ReadViewCoordinator {
   }
   async close() {
     const worker = this.worker;
-    if (worker) { await this.rpc('close', {}); this.worker = null; await worker.terminate(); }
-    this.gate = false; this.active = null;
+    // The thread is ended even when the close reply never comes: no worker
+    // outlives its coordinator, so a failed test cannot hold the process open.
+    try { if (worker) await this.rpc('close', {}); }
+    finally { if (worker) { this.worker = null; await worker.terminate(); } this.gate = false; this.active = null; }
   }
 }

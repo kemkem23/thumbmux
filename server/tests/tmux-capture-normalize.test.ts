@@ -567,8 +567,17 @@ describe('SPIKE2 real SQLite ReadView and committed prefix', () => {
         await p0Match(pane,capture,{recentLastLineId:256},token);
         const enqueue=store.enqueue.bind(store);let chunks=0;
         store.enqueue=(...args:any[])=>{if(++chunks===2)return Promise.reject(new Error('chunk2 injected'));return enqueue(...args);};
-        await expect(p0Commit(pane,{capture,expectedRevision:token.revision,captureEvidence:{kind:'unfenced',reason:'fixture'},checks:[],contentMatches:[],
-          repairs:Array.from({length:257},(_,i)=>({lineId:i,capturedRow:i}))})).rejects.toThrow('chunk2 injected');
+        // Not `expect(...).rejects`: on Bun 1.4.2 a `.rejects` awaited after the
+        // test already resumed from a worker reply never receives the next one
+        // (the worker posts it, the main thread never dispatches it), so the
+        // commit's first `rows` RPC hung. Same claim, asserted on the caught error.
+        let commitError:unknown=null;
+        try {
+          await p0Commit(pane,{capture,expectedRevision:token.revision,captureEvidence:{kind:'unfenced',reason:'fixture'},checks:[],contentMatches:[],
+            repairs:Array.from({length:257},(_,i)=>({lineId:i,capturedRow:i}))});
+        } catch(error) {commitError=error;}
+        expect(commitError).toBeInstanceOf(Error);
+        expect((commitError as Error).message).toContain('chunk2 injected');
         store.enqueue=enqueue;
       });
       expect(pane.ring[0].cells).toEqual(row('new').cells);
