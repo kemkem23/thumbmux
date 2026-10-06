@@ -2084,7 +2084,13 @@ class V2Storage {
         case 'incident': addIncident(command.incident); break;
         case 'stop': fhAssert(command.incident.action === 'gap-and-stop', 'v2 stop requires durable incident'); addIncident(command.incident); break;
         case 'close': next = { ...next, pane: { ...next.pane, state: 'closed' } }; break;
-        case 'checkpoint': fhAssert(next.pane.state === 'active', 'v2 stopped capture'); setCheckpoint(command.checkpoint); break;
+        case 'checkpoint': {
+          fhAssert(next.pane.state === 'active', 'v2 stopped capture');
+          const durable = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
+          fhAssert(durable && equal(command.checkpoint.through, durable.through)
+            && equal(command.checkpoint.replayFloor, durable.replayFloor), 'v2 checkpoint requires unchanged raw positions');
+          setCheckpoint(command.checkpoint); break;
+        }
         case 'batch': {
           fhAssert(next.pane.state === 'active', 'v2 stopped capture');
           const b = command.batch;
