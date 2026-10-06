@@ -519,11 +519,15 @@ cannot be trusted to have the lines the user typed. Both adapters are optional;
 omitting them keeps every earlier behavior.
 
 ```ts
-import type { PromptEntry, SubmissionReceipt } from '@thumbmux/app/config';
+import type { PromptEntry, SubmissionReceipt } from "thumbmux/app";
+```
 
+```ts
 // AppAdapters (both optional; absent = previous behavior)
-submitText?: (session: string, text: string) => Promise<SubmissionReceipt>;
-promptEntries?: (session: string) => Promise<PromptEntry[] | null>;
+interface AppAdapters {
+  submitText?: (session: string, text: string) => Promise<SubmissionReceipt>;
+  promptEntries?: (session: string) => Promise<PromptEntry[] | null>;
+}
 
 interface SubmissionReceipt {
   status: 'sent' | 'rejected' | 'uncertain';
@@ -538,8 +542,8 @@ interface PromptEntry {
 }
 ```
 
-The two types are exported from `@thumbmux/app/config` (the package barrel
-re-exports `AppAdapters`, which names them).
+The two types are exported from `thumbmux/app` (the package barrel, beside
+`AppAdapters`) and from `thumbmux/app/config`.
 
 **Receipt statuses** — what the shell does with each:
 

@@ -24,7 +24,7 @@ v0.20.5 behavior byte for byte.
   labelled "from screen — check line breaks before sending"; empty sections
   have no heading; labels and the uncertain badge are separate elements, so a
   pick returns `entry.text` byte for byte. The `prompts` prop is unchanged.
-- **Types** `SubmissionReceipt` and `PromptEntry` from `@thumbmux/app/config`.
+- **Types** `SubmissionReceipt` and `PromptEntry` from `thumbmux/app` (barrel) and `thumbmux/app/config`.
 - **Labels** `promptSourceUi`, `promptSourceScreen`, `promptUncertain`,
   `submissionUncertain` (English defaults).
 
