@@ -139,4 +139,23 @@ describe('app config contract', () => {
     expect(DEFAULT_APP_LABELS.terminalAria('build-pane')).toBe('Terminal build-pane');
     expect(DEFAULT_APP_LABELS.uploadFailed('network down')).toBe('Upload failed: network down');
   });
+
+  test('a host that declares the full v0.20.5 AppLabels set still compiles and gets the 0.21.0 defaults', () => {
+    // The four 0.21.0 keys are optional: a host that typed `AppLabels` in
+    // full against v0.20.5 must keep compiling (minor release, no breakage).
+    const {
+      promptSourceUi: _promptSourceUi,
+      promptSourceScreen: _promptSourceScreen,
+      promptUncertain: _promptUncertain,
+      submissionUncertain: _submissionUncertain,
+      ...v0205Labels
+    } = DEFAULT_APP_LABELS;
+    const hostLabels: AppLabels = { ...v0205Labels, hubTitle: 'Host' };
+    const resolved = { ...DEFAULT_APP_LABELS, ...hostLabels };
+    expect(resolved.hubTitle).toBe('Host');
+    expect(resolved.promptSourceUi).toBe(DEFAULT_APP_LABELS.promptSourceUi);
+    expect(resolved.promptSourceScreen).toBe(DEFAULT_APP_LABELS.promptSourceScreen);
+    expect(resolved.promptUncertain).toBe(DEFAULT_APP_LABELS.promptUncertain);
+    expect(resolved.submissionUncertain).toBe(DEFAULT_APP_LABELS.submissionUncertain);
+  });
 });
