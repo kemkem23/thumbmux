@@ -2814,8 +2814,10 @@ test('HPERF checkpoint command keeps the B2 raw-position fence and commits uncha
     }
     run.events.length = 0;
     h2value(await f.port.writer.commit(f.port.capability, f.request(next({}, 'same'), 'hperf-same')));
+    // Counted before any reader call: reader.checkpoint() decodes too.
+    const decodes = hperfWork(run.events).checkpointDecodes;
     expect(h2value(f.port.reader.checkpoint(f.pane))!.checkpointId, 'HPERF-ASSERT same-committed').toBe(live.checkpointId + '-same');
-    expect(hperfWork(run.events).checkpointDecodes, 'HPERF-ASSERT same-decode').toBeLessThanOrEqual(HPERF_BUDGET.checkpointDecodesPerCheckpointCommand);
+    expect(decodes, 'HPERF-ASSERT same-decode').toBeLessThanOrEqual(HPERF_BUDGET.checkpointDecodesPerCheckpointCommand);
   } finally { await f.cleanup(); }
 }, 120_000);
 
