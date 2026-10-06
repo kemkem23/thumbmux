@@ -1769,13 +1769,14 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
 // it does not expose the backing store or a legacy write port to its callers.
 import { NEWARCH_V2_LIMITS as V2L, validateV2Config, validateV2Checkpoint, validateV2Incident,
   validateV2ReadRequest, v2Digest, v2WriteDigest, v2WriteDisposition, v2PaneKey, v2SessionKey,
-  v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest } from './stream-contract';
+  v2AuditComparable, v2WriterGeneration, v2BatchInputMatchesIssued, v2EmergencyIncidentDigest,
+  v2LegacyStorageProfile, validateV2StorageProfile, v2StorageProfileDigest, v2DatabasePageLimit } from './stream-contract';
 import type { V2HistoryFactory, V2HistoryWriter, V2HistoryReader, V2WriterCapability, V2Config,
   V2WriteRequest, V2Receipt, V2OwnerRecord, V2SessionOwnerRecord, V2SessionReservation,
   V2SessionReservationReceipt, V2CancelBirth, V2LiveCheckpoint, V2AuditResult, V2HistoryPage,
   V2RemoteLocator, NewarchV2PaneDescriptor, NewarchV2Incident, NewarchV2SessionKey,
   NewarchV2HistoryRequest, NewarchV2HistoryCursor, V2HistoryAuthority, V2IncidentResolution,
-  V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation } from './stream-contract';
+  V2RawPinCensus, V2WriterGeneration, PipeEpoch, V2IssuedInputAuthority, V2ReserveRearmObservation, V2StorageProfile } from './stream-contract';
 import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
 function v2Failure(error: unknown): StreamFailure {
   const code = typeof error === 'object' && error ? String((error as { code?: unknown }).code ?? '') : '';
@@ -1807,6 +1808,8 @@ export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryW
     let store: FlagOnHistoryStore | undefined;
     try {
       validateV2Config(request.config); nonempty(request.engineId); nonempty(request.rootId);
+      const profile = v2RequestProfile(request); validateV2StorageProfile(profile, request.config);
+      fhAssert(equal(profile.storage, request.config.storage), 'v2 storage profile config');
       const root = resolve(request.rootId); fhSafePath(root);
       fhAssert(existsSync(join(root, 'flag-on-v1.sqlite')) || !existsSync(root) || readdirSync(root).length === 0,
         'v2 missing owner database in existing root');
@@ -1816,6 +1819,10 @@ export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryW
       return { status: 'ok', value: store.openV2(V2_STORE, request, hooks) };
     } catch (e) { store?.close(); return v2Failure(e); }
   } });
+}
+/** HS2: no profile = the legacy shared budget of config.storage (pre-HS2). */
+function v2RequestProfile(request: Parameters<V2HistoryFactory['openForCapture']>[0]): V2StorageProfile {
+  return request.storageProfile ?? v2LegacyStorageProfile(request.config.storage);
 }
 const V2_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fh_v2_meta(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,secret TEXT NOT NULL,version TEXT NOT NULL);
@@ -1903,27 +1910,50 @@ class V2Storage {
   readonly #db: Database;
   readonly #cap: V2WriterCapability;
   readonly #config: V2Config;
+  readonly #profile: V2StorageProfile;
   readonly #secret: string;
   #closed = false;
   constructor(db: Database, readonly root: string, readonly storeId: string,
     request: Parameters<V2HistoryFactory['openForCapture']>[0], readonly hooks: V2HistoryOptions,
     readonly release: () => void) {
-    this.#db = db; this.#config = copy(request.config);
+    this.#db = db; this.#config = copy(request.config); this.#profile = copy(v2RequestProfile(request));
     const generation = db.transaction(() => {
       db.exec(V2_SCHEMA);
       db.query('INSERT OR IGNORE INTO fh_v2_meta VALUES(1,0,?,?)').run(randomUUID(), 'newarch-v2');
       const meta = db.query('SELECT * FROM fh_v2_meta WHERE id=1').get() as SqlRow;
       fhAssert(meta.version === 'newarch-v2' || meta.version === V2_STORAGE_FORMAT, 'unsupported v2 storage');
+      this.bindStorageProfile();
       const next = Number(meta.generation) + 1; safe(next);
       db.query('UPDATE fh_v2_meta SET generation=?,version=? WHERE id=1').run(next, V2_STORAGE_FORMAT);
       return next;
     }).immediate();
     this.#secret = String((db.query('SELECT secret FROM fh_v2_meta WHERE id=1').get() as SqlRow).secret);
     this.#cap = Object.freeze({ owner: 'capture-engine', rootId: root, engineId: request.engineId, generation }) as V2WriterCapability;
-    // Cache stays 2 MiB, independent of history size. Config bounds DB growth;
+    // Cache stays 2 MiB, independent of history size. The profile bounds DB
+    // growth at the page size the file really has (a VACUUMed root may differ);
     // I/S's common root ledger additionally accounts raw/reserve/diagnostics.
-    const allowance = this.#config.storage.rootCapBytes - this.#config.storage.emergencyReserveBytes;
-    db.exec(`PRAGMA max_page_count=${Math.floor(allowance / 8192)};`); // includes room for WAL
+    const pageSize = Number((db.query('PRAGMA page_size').get() as SqlRow).page_size);
+    db.exec(`PRAGMA max_page_count=${v2DatabasePageLimit(this.#profile, pageSize)};`);
+  }
+  /** HS2: the root keeps the profile it was first opened with. Runs inside the
+   * open transaction BEFORE the generation moves, so a mismatch writes nothing.
+   * Roots from before HS2 have no row and adopt the profile lazily. */
+  private bindStorageProfile(): void {
+    const digest = v2StorageProfileDigest(this.#profile);
+    const stored = this.get<{ digest: string }>('storage-profile', '*', 'root');
+    if (!stored) this.put('storage-profile', '*', 'root', { schema: 'newarch-v2', digest, name: this.#profile.name,
+      storage: this.#profile.storage, allocation: this.#profile.allocation });
+    else fhAssert(stored.digest === digest, 'v2 storage profile mismatch');
+  }
+  /** HS2: with an allocation manifest, WAL is a budgeted class. Over budget,
+   * try a TRUNCATE checkpoint; true = still over (a reader pins the WAL). */
+  private walOverBudget(): boolean {
+    const allocation = this.#profile.allocation;
+    if (!allocation) return false;
+    const wal = join(this.root, 'flag-on-v1.sqlite-wal'), size = () => existsSync(wal) ? statSync(wal).size : 0;
+    if (size() <= allocation.walBytes) return false;
+    try { this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* busy/pinned: the size below decides */ }
+    return size() > allocation.walBytes;
   }
   ports(): V2OpenedWithAuthority {
     const writer: V2HistoryWriter = Object.freeze({
@@ -2012,11 +2042,16 @@ class V2Storage {
   private tx<T>(cap: V2WriterCapability, phase: string, f: () => T): Result<T> {
     try {
       this.live();
+      // A WAL still over its allocation refuses before any mutation; the same
+      // operationId retries exactly once after the pinning reader is gone.
+      fhAssert(!this.walOverBudget(), 'v2 storage wal budget');
       const result = this.#db.transaction(() => {
         this.authorize(cap); // The registry/generation check is inside EVERY write transaction.
         this.hooks.boundary?.(phase + '-before-write');
         const value = f(); this.hooks.boundary?.(phase + '-before-commit'); return value;
       }).immediate();
+      // Committed: bound the WAL now. Best effort; the check above is the gate.
+      try { this.walOverBudget(); } catch { /* next write refuses */ }
       this.hooks.boundary?.(phase + '-after-commit'); return ok(result);
     } catch (e) { return v2Failure(e); }
   }
