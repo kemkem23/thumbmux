@@ -296,7 +296,8 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     { name: 'v2-forget-checkpoint', from: "this.put('checkpoint', key, 'live', cp);", to: '/* mutant acknowledges without checkpoint */' },
     { name: 'v2-ignore-current-generation', from: 'v2WriteDisposition(r.fence, cap.generation, owner?.durableRevision ?? 0, previous)', to: 'v2WriteDisposition({ ...r.fence, expectedGeneration: cap.generation }, cap.generation, owner?.durableRevision ?? 0, previous)' },
     { name: 'v2-accept-stale-audit', from: "}, this.#config.audit), 'v2 stale/unordered audit');", to: "}, this.#config.audit) || true, 'v2 stale/unordered audit');" },
-    { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);", to: '/* mutant loses rows behind durable receipt */' },
+    // H-PERF: append() now takes the row text H already made (MUTATION.md row 1).
+    { name: 'v2-omit-atomic-rows', from: "this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row, rowText[i]);", to: '/* mutant loses rows behind durable receipt */' },
     { name: 'v2-authority-foreign-incident', from: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, incidentId);",
       to: "const resolved = this.get<V2IncidentResolution>('incident-resolution', key, this.owner(pane)?.incidentId ?? incidentId);" },
     { name: 'v2-authority-omits-checkpoint-pin', from: "rawPins: [{ pinId: `checkpoint:${checkpoint.checkpointId}`,\n        holder: 'decoder-checkpoint', from: checkpoint.replayFloor }], rowPins }", to: 'rawPins: [], rowPins }' },
@@ -701,7 +702,43 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
   const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'hperf-mutants-'));
   const assertion = (label: string) => new RegExp('^error: HPERF-ASSERT ' + label + '$', 'm');
   const budget = /\(fail\) HPERF work budget: a full decoder page/;
+  const H = 'history-engine.ts';
+  const rollback = /\(fail\) HPERF a throw before COMMIT rolls/, trust = /\(fail\) HPERF trust:/;
   const mutations: { name: string; file: string; kills: RegExp; assert: RegExp; from: string; to: string; from2?: string; to2?: string }[] = [
+    // Rows encoded again, 32 fresh traversals each, results thrown away: data unchanged, work counter red.
+    { name: 'PERF-REPEAT', file: H, kills: budget, assert: assertion('row-encode'),
+      from: 'const rowText = b.rows.map(row => snapshot(row));',
+      to: 'const rowText = b.rows.map(row => { const text = snapshot(row); for (let n = 0; n < 32; n++) this.encoder()(row, 1); return text; });' },
+    // The binding is dropped: every use reads and verifies the live checkpoint again.
+    { name: 'PERF-CP', file: H, kills: budget, assert: assertion('checkpoint-decode'),
+      from: "const durableCheckpoint = () => live === undefined ? (live = this.get<V2LiveCheckpoint>('checkpoint', key, 'live')) : live;",
+      to: "const durableCheckpoint = () => this.get<V2LiveCheckpoint>('checkpoint', key, 'live');" },
+    // An instance-level checkpoint cache updated when the checkpoint is written, never cleared on rollback, read by get().
+    { name: 'PERF-STALE-a', file: H, kills: rollback, assert: assertion('rollback-checkpoint'),
+      from: "    if (kind === 'checkpoint') v2Enter('decode');\n",
+      to: "    const stale = (this as unknown as { hperfStale?: Map<string, unknown> }).hperfStale;\n    if (kind === 'checkpoint' && id === 'live' && stale?.has(pane)) return stale.get(pane) as T;\n    if (kind === 'checkpoint') v2Enter('decode');\n",
+      from2: '        live = undefined; // written: a later read in this command reads the new row\n',
+      to2: '        live = undefined; ((this as unknown as { hperfStale?: Map<string, unknown> }).hperfStale ??= new Map()).set(key, cp);\n' },
+    // One module-level encoder shared by every call: an edited descendant keeps its old text.
+    { name: 'PERF-STALE-b', file: H, kills: /\(fail\) HPERF a descendant edited between two commits/, assert: assertion('fresh-commit'),
+      from: '    const inner = streamCanonicalEncoder();',
+      to: '    const inner = ((globalThis as { hperfEncoder?: (value: unknown) => string }).hperfEncoder ??= streamCanonicalEncoder());' },
+    // H stops checking the write digest itself.
+    { name: 'PERF-TRUST-digest', file: H, kills: trust, assert: assertion('trust-row'),
+      from: "fhAssert(v2WriteDigest({ fence: r.fence, command: caller }, encode) === r.fence.digest, 'v2 write digest');",
+      to: 'void v2WriteDigest; void encode;' },
+    // H takes the caller's input as what S issued.
+    { name: 'PERF-TRUST-issued', file: H, kills: trust, assert: assertion('trust-minted'),
+      from: "const issued = this.hooks.inputReceipt?.((caller as Extract<V2WriteCommand, { kind: 'batch' }>).batch.input);",
+      to: "const issued = { status: 'ok' as const, value: b.input };" },
+    // The receipt is taken from a memo made before its checkpointId was set (the :2233 assignment no longer lands).
+    { name: 'PERF-OUTPUT', file: H, kills: /\(fail\) HPERF a lost ACK after COMMIT/, assert: assertion('lost-ack-checkpoint-id'),
+      from: '        live = undefined; // written: a later read in this command reads the new row\n',
+      to: "        live = undefined; const memo = JSON.parse(snapshot(receipt)) as V2Receipt;\n        Object.defineProperty(receipt, 'checkpointId', { get: () => memo.checkpointId, set: () => {}, enumerable: true });\n" },
+    // The checkpoint write leaves the transaction: it lands after the tx, even when the tx rolled back.
+    { name: 'PERF-ATOMIC', file: H, kills: rollback, assert: assertion('rollback-checkpoint'),
+      from: '        live = undefined; // written: a later read in this command reads the new row\n',
+      to: "        live = undefined; queueMicrotask(() => { try { this.put('checkpoint', key, 'live', cp); } catch { /* closed */ } });\n" },
   ];
   try {
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
@@ -738,6 +775,5 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
       } finally { writeFileSync(file, original); }
     }
     const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b7 pass\b/);
-    void budget; void assertion;
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);
